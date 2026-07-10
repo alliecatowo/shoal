@@ -1,0 +1,16 @@
+[package]
+name="shoal-doctor"
+version="0.1.0"
+edition="2024"
+[dependencies]
+serde={version="1",features=["derive"]}
+serde_json="1"
+toml="1"
+tempfile="3"
+libc="0.2"
+shoal-leash={path="../shoal-leash"}
+shoal-adapters={path="../shoal-adapters"}
+shoal-journal={path="../shoal-journal"}
+[[bin]]
+name="shoal-doctor"
+path="src/main.rs"
