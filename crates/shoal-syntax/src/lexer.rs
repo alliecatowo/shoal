@@ -219,6 +219,10 @@ impl<'s> Lexer<'s> {
             b')' => Ok((Tok::RParen, Span::new(pos, pos + 1))),
             b'{' => Ok((Tok::LBrace, Span::new(pos, pos + 1))),
             b'}' => Ok((Tok::RBrace, Span::new(pos, pos + 1))),
+            // A `[` beginning a word is a glob character class when a matching
+            // `]` closes within the same whitespace-delimited run (`[abc].txt`,
+            // §2.2). A lone unclosed `[` keeps the teaching error.
+            b'[' if self.bracket_class_closes(pos) => self.cmd_word(pos),
             b'[' => Err(LexError::new(
                 "`[` cannot start a command argument",
                 Span::new(pos, pos + 1),
@@ -252,6 +256,21 @@ impl<'s> Lexer<'s> {
         }
     }
 
+    /// Does a `[` at `pos` open a glob character class that closes with a `]`
+    /// before the whitespace-delimited run ends (D10)?
+    fn bracket_class_closes(&self, pos: usize) -> bool {
+        let mut p = pos + 1;
+        while p < self.bytes.len() {
+            match self.at(p) {
+                b' ' | b'\t' | b'\r' | b'\n' | b'(' | b')' | b'{' | b'}' | b'"' | b'\'' | b';'
+                | b'&' | b'<' | b'>' | b'|' => return false,
+                b']' => return true,
+                _ => p += 1,
+            }
+        }
+        false
+    }
+
     /// Scan a CMD-mode word and classify it by shape (TDD §2.2).
     fn cmd_word(&self, start: usize) -> LexResult {
         let mut pos = start;
@@ -261,9 +280,10 @@ impl<'s> Lexer<'s> {
             match c {
                 b' ' | b'\t' | b'\r' | b'\n' | b'(' | b')' | b'{' | b'}' | b'"' | b'\'' | b';'
                 | b'&' | b'<' | b'>' | b'|' => break,
-                // `[`/`]` break words at word start only; mid-word they are
-                // glob character classes.
-                b'[' | b']' if pos == start => break,
+                // A `]` breaks a word at word start; a leading `[` is only
+                // reached here when `cmd_token` has already confirmed a matching
+                // `]` closes the run, so it is a glob class (D10).
+                b']' if pos == start => break,
                 b'$' => {
                     return Err(LexError::new(
                         "shoal variables have no sigil",
@@ -593,6 +613,15 @@ impl<'s> Lexer<'s> {
         }
         let unit = &self.src[unit_start..upos];
         if !unit.is_empty() {
+            // Units are lowercase (§2.2). Reject non-canonical case rather than
+            // silently folding `KB`→`kb` (decimal footgun) (D12).
+            if unit.bytes().any(|b| b.is_ascii_uppercase()) {
+                return Err(LexError::new(
+                    format!("unit `{unit}` must be lowercase"),
+                    Span::new(start, upos),
+                )
+                .hint("sizes: b kb mb gb tb kib mib gib tib; durations: ns us ms s m h d w"));
+            }
             let lower = unit.to_ascii_lowercase();
             const SIZE_UNITS: &[&str] = &["b", "kb", "mb", "gb", "tb", "kib", "mib", "gib", "tib"];
             const DUR_UNITS: &[&str] = &["ns", "us", "ms", "s", "m", "h", "d", "w"];

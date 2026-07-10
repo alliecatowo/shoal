@@ -1,8 +1,9 @@
 //! Long-lived Unix-socket host for the shoal evaluator (TDD §10).
 
 use serde_json::{Value as Json, json};
+use shoal_ast::{Program, Stmt};
 use shoal_auth::TokenStore;
-use shoal_eval::Evaluator;
+use shoal_eval::{Evaluator, Position};
 use shoal_journal::{EntryRecord, Journal, JournalQuery};
 use shoal_leash::{Effect, Estimates, Plan, Policy, Reversibility, Verdict};
 use shoal_proto::*;
@@ -304,16 +305,16 @@ impl Kernel {
                     return encode(json!({"task":task_ref}));
                 }
                 if params.mode == "plan" {
-                    shoal_syntax::parse(&params.src).map_err(|e| RpcError {
+                    let ast = shoal_syntax::parse(&params.src).map_err(|e| RpcError {
                         code: -32001,
                         message: e.msg,
                         data: Some(json!({"span":e.span,"hint":e.hint})),
                     })?;
-                    let plan = Plan::new(
-                        vec![Effect::Opaque],
-                        Reversibility::Unknown,
-                        Estimates::default(),
-                    );
+                    let ast_json = serde_json::to_string(&ast).map_err(internal)?;
+                    let plan = {
+                        let mut evaluator = session.evaluator.lock().unwrap();
+                        derive_plan(&mut evaluator, &ast, &ast_json)
+                    };
                     let verdict = self.policy.evaluate_plan(&actor, &plan);
                     let result = PlanResult {
                         plan_ref: plan.plan_ref.clone(),
@@ -344,38 +345,40 @@ impl Kernel {
                         data: None,
                     });
                 }
+                let ast = shoal_syntax::parse(&params.src).map_err(|e| RpcError {
+                    code: -32001,
+                    message: e.msg,
+                    data: Some(json!({"span":e.span,"hint":e.hint})),
+                })?;
+                let ast_json = serde_json::to_string(&ast).map_err(internal)?;
+                let mut evaluator = session.evaluator.lock().unwrap();
+                let run_plan = derive_plan(&mut evaluator, &ast, &ast_json);
                 if params.mode == "run" {
-                    let direct_plan = Plan::new(
-                        vec![Effect::Opaque],
-                        Reversibility::Unknown,
-                        Estimates::default(),
-                    );
-                    match self.policy.evaluate_plan(&actor, &direct_plan) {
+                    match self.policy.evaluate_plan(&actor, &run_plan) {
                         Verdict::Deny => {
                             return Err(RpcError {
                                 code: -32010,
-                                message: "leash denied opaque execution".into(),
-                                data: None,
+                                message: "leash denied execution".into(),
+                                data: Some(json!({"effects":run_plan.effects})),
                             });
                         }
                         Verdict::ApprovalRequired => {
                             return Err(RpcError {
                                 code: -32011,
                                 message: "approval required; plan first".into(),
-                                data: None,
+                                data: Some(json!({"effects":run_plan.effects})),
                             });
                         }
                         Verdict::Allow => {}
                     }
                 }
-                let ast = shoal_syntax::parse(&params.src).map_err(|e| RpcError {
-                    code: -32001,
-                    message: e.msg,
-                    data: Some(json!({"span":e.span,"hint":e.hint})),
-                })?;
-                let mut evaluator = session.evaluator.lock().unwrap();
                 evaluator.interactive = false;
                 let started = Instant::now();
+                let opaque = run_plan
+                    .effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::Opaque));
+                let effects_json = serde_json::to_string(&run_plan.effects).map_err(internal)?;
                 let entry_id = self
                     .journal
                     .lock()
@@ -386,12 +389,12 @@ impl Kernel {
                         ts_ns: now_ns(),
                         cwd: evaluator.cwd().as_os_str().as_bytes().to_vec(),
                         src: params.src.clone(),
-                        ast_json: serde_json::to_string(&ast).map_err(internal)?,
-                        effects_json: "[\"opaque\"]".into(),
-                        opaque: true,
+                        ast_json: ast_json.clone(),
+                        effects_json,
+                        opaque,
                     })
                     .map_err(internal)?;
-                let value = evaluator.eval_program(&ast).map_err(|e| {
+                let value = eval_with_position(&mut evaluator, &ast, &params.position).map_err(|e| {
                     let journal = self.journal.lock().unwrap();
                     let _ = journal.finish(entry_id, e.status, false, elapsed_ns(started));
                     if let Some(stderr) = &e.stderr { let _ = journal.record_output(entry_id, "stderr", stderr.as_bytes()); }
@@ -453,7 +456,17 @@ impl Kernel {
                     message: "unknown value ref".into(),
                     data: None,
                 })?;
-                let mut wire = wire_value(value);
+                let resolved = match params.path.as_deref() {
+                    Some(path) if !path.is_empty() => {
+                        resolve_value_path(value, path).map_err(|message| RpcError {
+                            code: -32005,
+                            message,
+                            data: Some(json!({"ref":params.r#ref,"path":path})),
+                        })?
+                    }
+                    _ => value.clone(),
+                };
+                let mut wire = wire_value(&resolved);
                 if let (Some([start, end]), WireValue::List { v: items }) =
                     (params.slice, &mut wire)
                 {
@@ -763,11 +776,62 @@ fn elapsed_ns(start: Instant) -> i64 {
     start.elapsed().as_nanos().min(i64::MAX as u128) as i64
 }
 fn permissive_policy() -> Policy {
+    let who = principal();
     Policy::from_toml(&format!(
-        "[principal.\"{}\"]\nopaque='allow'\nauto_apply='in-grant'\njournal_read=true\n",
-        principal()
+        "[principal.\"{who}\"]\nopaque='allow'\nauto_apply='in-grant'\njournal_read=true\n\
+         env_read=[\"*\"]\nenv_write=[\"*\"]\nsession_write=true\ntime=true\n\n\
+         [principal.\"{who}\".fs]\nread=[\"/**\"]\nwrite=[\"/**\"]\ndelete=[\"/**\"]\n"
     ))
     .expect("built-in policy")
+}
+
+/// Derive a plan's real effects (TDD §8) and give it a source-anchored
+/// `plan_ref`. Two distinct programs never collide, even when both derive to
+/// the same coarse effect set (e.g. two different `sh { }` blocks, both
+/// opaque) — the ref is a blake3 hash over the AST JSON *and* the effects,
+/// not effects alone. Falls back to a conservative opaque plan if effect
+/// derivation itself errors (arg-shape errors etc.); that must never block
+/// real execution, which is the authority on whether the command runs.
+fn derive_plan(evaluator: &mut Evaluator, ast: &Program, ast_json: &str) -> Plan {
+    let mut plan = evaluator.plan_program(ast).unwrap_or_else(|_| {
+        Plan::new(
+            vec![Effect::Opaque],
+            Reversibility::Unknown,
+            Estimates::default(),
+        )
+    });
+    plan.plan_ref = canonical_plan_ref(ast_json, &plan.effects);
+    plan
+}
+
+fn canonical_plan_ref(ast_json: &str, effects: &[Effect]) -> String {
+    let effects_json = serde_json::to_string(effects).unwrap_or_default();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(ast_json.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(effects_json.as_bytes());
+    format!("plan:{}", &hasher.finalize().to_hex()[..16])
+}
+
+/// `position: "value"` (TDD §1.2/§4.5): evaluate the sole top-level command
+/// expression without statement-position's raise-on-non-ok, binding `it` to
+/// whatever comes back (including a failed outcome). Anything shaped other
+/// than a single bare expression statement has no meaningful non-statement
+/// reading (`let`/`fn`/`for`/… are already position-agnostic), so it falls
+/// back to ordinary statement evaluation.
+fn eval_with_position(
+    evaluator: &mut Evaluator,
+    ast: &Program,
+    position: &str,
+) -> shoal_value::VResult<Value> {
+    if position == "value"
+        && let [Stmt::Expr { expr, .. }] = ast.stmts.as_slice()
+    {
+        let value = evaluator.eval_expr(expr, Position::Value)?;
+        evaluator.it = value.clone();
+        return Ok(value);
+    }
+    evaluator.eval_program(ast)
 }
 fn verdict_name(v: Verdict) -> &'static str {
     match v {
@@ -781,6 +845,139 @@ unsafe fn libc_geteuid() -> u32 {
         fn geteuid() -> u32;
     }
     unsafe { geteuid() }
+}
+
+/// `value.get`'s `path` grammar (TDD §7): dot fields and `[n]` indexes,
+/// e.g. `rows[3].name`, `out.lines[0]`. Structural fields on non-`Record`
+/// values (outcome/error/range/task/table) are synthesized so an agent can
+/// walk into them the same way it would a plain record.
+#[derive(Debug, Clone)]
+enum PathSeg {
+    Field(String),
+    Index(usize),
+}
+
+fn parse_value_path(path: &str) -> Result<Vec<PathSeg>, String> {
+    let mut segs = Vec::new();
+    let bytes = path.as_bytes();
+    let n = bytes.len();
+    let mut i = 0;
+    while i < n {
+        match bytes[i] {
+            b'.' => {
+                i += 1;
+                continue;
+            }
+            b'[' => {
+                let close = path[i + 1..]
+                    .find(']')
+                    .map(|p| p + i + 1)
+                    .ok_or_else(|| format!("unterminated `[` in path `{path}`"))?;
+                let digits = &path[i + 1..close];
+                let idx = digits
+                    .parse::<usize>()
+                    .map_err(|_| format!("bad index `{digits}` in path `{path}`"))?;
+                segs.push(PathSeg::Index(idx));
+                i = close + 1;
+                continue;
+            }
+            _ => {}
+        }
+        let start = i;
+        while i < n && bytes[i] != b'.' && bytes[i] != b'[' {
+            i += 1;
+        }
+        if i == start {
+            return Err(format!("empty path segment in `{path}`"));
+        }
+        segs.push(PathSeg::Field(path[start..i].to_string()));
+    }
+    Ok(segs)
+}
+
+fn path_field(value: &Value, name: &str) -> Result<Value, String> {
+    match value {
+        Value::Record(rec) => rec
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("record has no field `{name}`")),
+        Value::Outcome(o) => Ok(match name {
+            "status" => o.status.map(|s| Value::Int(s as i64)).unwrap_or(Value::Null),
+            "ok" => Value::Bool(o.ok),
+            "signal" => o.signal.clone().map(Value::Str).unwrap_or(Value::Null),
+            "out" => o.out_value(),
+            "stdout" => Value::Bytes(o.stdout.clone()),
+            "stderr" => Value::Bytes(o.stderr.clone()),
+            "dur_ns" => Value::Duration(o.dur_ns),
+            "pid" => Value::Int(o.pid as i64),
+            "cmd" => Value::Str(o.cmd.clone()),
+            _ => return Err(format!("outcome has no field `{name}`")),
+        }),
+        Value::Error(e) => Ok(match name {
+            "code" => Value::Str(e.code.clone()),
+            "msg" => Value::Str(e.msg.clone()),
+            "hint" => e.hint.clone().map(Value::Str).unwrap_or(Value::Null),
+            "stderr" => e.stderr.clone().map(Value::Str).unwrap_or(Value::Null),
+            "status" => e.status.map(|s| Value::Int(s as i64)).unwrap_or(Value::Null),
+            _ => return Err(format!("error has no field `{name}`")),
+        }),
+        Value::Range(r) => Ok(match name {
+            "start" => Value::Int(r.start),
+            "end" => Value::Int(r.end),
+            "inclusive" => Value::Bool(r.inclusive),
+            _ => return Err(format!("range has no field `{name}`")),
+        }),
+        Value::Task(t) => Ok(match name {
+            "id" => Value::Int(t.id as i64),
+            "done" => Value::Bool(t.is_done()),
+            _ => return Err(format!("task has no field `{name}`")),
+        }),
+        Value::Table(rows) => {
+            if name == "rows" {
+                Ok(Value::List(
+                    rows.iter().cloned().map(Value::Record).collect(),
+                ))
+            } else if rows.iter().any(|r| r.contains_key(name)) {
+                Ok(Value::List(
+                    rows.iter()
+                        .map(|r| r.get(name).cloned().unwrap_or(Value::Null))
+                        .collect(),
+                ))
+            } else {
+                Err(format!("table has no column `{name}`"))
+            }
+        }
+        other => Err(format!(
+            "cannot access field `{name}` on {}",
+            other.type_name()
+        )),
+    }
+}
+
+fn path_index(value: &Value, idx: usize) -> Result<Value, String> {
+    match value {
+        Value::List(items) => items
+            .get(idx)
+            .cloned()
+            .ok_or_else(|| format!("index [{idx}] out of bounds (len {})", items.len())),
+        Value::Table(rows) => rows
+            .get(idx)
+            .cloned()
+            .map(Value::Record)
+            .ok_or_else(|| format!("index [{idx}] out of bounds (len {})", rows.len())),
+        other => Err(format!("cannot index {} with [{idx}]", other.type_name())),
+    }
+}
+
+fn resolve_value_path(value: &Value, path: &str) -> Result<Value, String> {
+    let mut current = value.clone();
+    for seg in parse_value_path(path)? {
+        current = match seg {
+            PathSeg::Field(name) => path_field(&current, &name)?,
+            PathSeg::Index(idx) => path_index(&current, idx)?,
+        };
+    }
+    Ok(current)
 }
 
 fn wire_value(value: &Value) -> WireValue {
@@ -797,17 +994,92 @@ fn wire_value(value: &Value) -> WireValue {
                 raw: p.raw,
             }
         }
+        Value::Glob(g) => WireValue::Glob {
+            pattern: g.pattern.clone(),
+        },
+        Value::Regex(r) => WireValue::Regex { src: r.src.clone() },
         Value::Size(v) => WireValue::Size { v: *v },
         Value::Duration(v) => WireValue::Duration { v: *v },
+        Value::DateTime(z) => WireValue::DateTime {
+            v: z.timestamp().to_string(),
+        },
+        Value::Time(t) => WireValue::Time {
+            v: format!("{:02}:{:02}:{:02}", t.hour, t.min, t.sec),
+        },
         Value::Bytes(v) => WireValue::Bytes {
             v: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &**v),
         },
         Value::List(v) => WireValue::List {
             v: v.iter().map(wire_value).collect(),
         },
-        _ => WireValue::Str {
-            v: shoal_value::render::render_inline(value),
+        Value::Record(rec) => WireValue::Record {
+            v: rec.iter().map(|(k, v)| (k.clone(), wire_value(v))).collect(),
         },
+        Value::Table(rows) => {
+            let mut names: Vec<&String> = Vec::new();
+            for row in rows {
+                for k in row.keys() {
+                    if !names.contains(&k) {
+                        names.push(k);
+                    }
+                }
+            }
+            let cols = names
+                .into_iter()
+                .map(|name| {
+                    let col = rows
+                        .iter()
+                        .map(|row| row.get(name).map(wire_value).unwrap_or(WireValue::Null))
+                        .collect();
+                    (name.clone(), col)
+                })
+                .collect();
+            WireValue::Table {
+                cols,
+                n: rows.len(),
+            }
+        }
+        Value::Range(r) => WireValue::Range {
+            start: r.start,
+            end: r.end,
+            inclusive: r.inclusive,
+        },
+        Value::Stream(s) => WireValue::Stream {
+            label: s.label.clone(),
+        },
+        Value::Error(e) => WireValue::Error {
+            code: e.code.clone(),
+            msg: e.msg.clone(),
+            span: e.span.map(|s| WireSpan {
+                start: s.start,
+                end: s.end,
+            }),
+            hint: e.hint.clone(),
+            stderr: e.stderr.clone(),
+        },
+        Value::Outcome(o) => WireValue::Outcome {
+            status: o.status,
+            ok: o.ok,
+            signal: o.signal.clone(),
+            out: Box::new(wire_value(&o.out_value())),
+            err: String::from_utf8_lossy(&o.stderr).into_owned(),
+            dur_ns: o.dur_ns,
+            pid: o.pid,
+            cmd: o.cmd.clone(),
+        },
+        Value::Task(t) => WireValue::Task {
+            id: t.id,
+            done: t.is_done(),
+        },
+        Value::Closure(_) | Value::CmdRef(_) => {
+            let repr = shoal_value::render::render_inline(value);
+            if matches!(value, Value::Closure(_)) {
+                WireValue::Closure { repr }
+            } else {
+                WireValue::Cmd { repr }
+            }
+        }
+        Value::Secret(s) => WireValue::Secret { name: s.name.clone() },
     }
 }
 
@@ -883,6 +1155,10 @@ mod tests {
         let entries = journal.result.unwrap();
         assert_eq!(entries[0]["src"], "1 + 2");
         assert_eq!(entries[0]["ok"], true);
+        assert_eq!(
+            entries[0]["opaque"], false,
+            "pure arithmetic must not be journaled opaque:true"
+        );
         assert!(
             entries[0]["outputs"]
                 .as_array()
@@ -940,10 +1216,11 @@ mod tests {
                 &mut reader,
                 2,
                 "exec",
-                json!({"src":"1 + 2","mode":"plan","position":"stmt"}),
+                json!({"src":"sh { echo hi }","mode":"plan","position":"stmt"}),
             );
             let result = planned.result.unwrap();
             assert_eq!(result["verdict"], expected);
+            assert_eq!(result["effects"], json!([{"kind":"opaque"}]));
             let plan_ref = result["plan_ref"].as_str().unwrap();
             assert!(
                 call(
@@ -972,7 +1249,9 @@ mod tests {
                     "plan.apply",
                     json!({"plan_ref":plan_ref}),
                 );
-                assert_eq!(applied.result.unwrap()["value"]["v"], 3);
+                let value = applied.result.unwrap()["value"].clone();
+                assert_eq!(value["$"], "outcome");
+                assert_eq!(value["ok"], true);
             } else {
                 assert!(grant.error.is_some());
             }
@@ -980,6 +1259,217 @@ mod tests {
             drop(reader);
             thread.join().unwrap();
         }
+    }
+
+    /// Regression for the plan_ref collision (Plan identity used to hash only
+    /// effects/reversibility/estimates, so any two opaque `sh { }` plans
+    /// collided and `apply` silently ran whichever plan was last inserted).
+    #[test]
+    fn plan_refs_are_unique_per_source_and_apply_targets_the_right_one() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        let kernel = Kernel::new();
+        let server_kernel = kernel.clone();
+        let thread = std::thread::spawn(move || server_kernel.handle_stream(server).unwrap());
+        call(
+            &mut client,
+            &mut reader,
+            1,
+            "session.attach",
+            json!({"client":{"kind":"agent","tty":false}}),
+        );
+        let plan_a = call(
+            &mut client,
+            &mut reader,
+            2,
+            "exec",
+            json!({"src":"sh { echo FIRST }","mode":"plan"}),
+        )
+        .result
+        .unwrap();
+        let plan_b = call(
+            &mut client,
+            &mut reader,
+            3,
+            "exec",
+            json!({"src":"sh { echo SECOND }","mode":"plan"}),
+        )
+        .result
+        .unwrap();
+        let ref_a = plan_a["plan_ref"].as_str().unwrap().to_owned();
+        let ref_b = plan_b["plan_ref"].as_str().unwrap().to_owned();
+        assert_ne!(ref_a, ref_b, "distinct sources must not share a plan_ref");
+        // Both plans are opaque (`sh { }`), so both need cap.request before
+        // apply under the default permissive-but-opaque='allow' policy —
+        // plan mode always requires explicit approval regardless of opaque
+        // mode; grant both, then apply A and confirm it — not B — ran.
+        call(
+            &mut client,
+            &mut reader,
+            4,
+            "cap.request",
+            json!({"plan_ref":ref_a}),
+        );
+        call(
+            &mut client,
+            &mut reader,
+            5,
+            "cap.request",
+            json!({"plan_ref":ref_b}),
+        );
+        let applied = call(
+            &mut client,
+            &mut reader,
+            6,
+            "plan.apply",
+            json!({"plan_ref":ref_a}),
+        );
+        let out = applied.result.unwrap()["value"]["out"].clone();
+        assert_eq!(out["$"], "str");
+        assert_eq!(out["v"], "FIRST");
+        drop(client);
+        drop(reader);
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn real_effects_not_opaque_for_pure_builtins() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        let kernel = Kernel::new();
+        let server_kernel = kernel.clone();
+        let thread = std::thread::spawn(move || server_kernel.handle_stream(server).unwrap());
+        call(
+            &mut client,
+            &mut reader,
+            1,
+            "session.attach",
+            json!({"client":{"kind":"agent","tty":false}}),
+        );
+        for src in ["1 + 2", "ls"] {
+            let planned = call(&mut client, &mut reader, 2, "exec", json!({"src":src,"mode":"plan"}))
+                .result
+                .unwrap();
+            assert_ne!(
+                planned["effects"],
+                json!([{"kind":"opaque"}]),
+                "`{src}` must derive real effects, not the opaque fallback"
+            );
+            let exec = call(&mut client, &mut reader, 3, "exec", json!({"src":src}));
+            let value_ref = exec.result.unwrap()["ref"].as_str().unwrap().to_owned();
+            let journal = call(&mut client, &mut reader, 4, "journal.query", json!({"limit":1}))
+                .result
+                .unwrap();
+            assert_eq!(journal[0]["src"], src);
+            assert_eq!(
+                journal[0]["opaque"], false,
+                "`{src}` must not be journaled opaque:true"
+            );
+            let _ = value_ref;
+        }
+        drop(client);
+        drop(reader);
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn value_get_path_traversal() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        let kernel = Kernel::new();
+        let server_kernel = kernel.clone();
+        let thread = std::thread::spawn(move || server_kernel.handle_stream(server).unwrap());
+        call(
+            &mut client,
+            &mut reader,
+            1,
+            "session.attach",
+            json!({"client":{"kind":"agent","tty":false}}),
+        );
+        let exec = call(
+            &mut client,
+            &mut reader,
+            2,
+            "exec",
+            json!({"src":"sh { echo hello world }"}),
+        );
+        let value_ref = exec.result.unwrap()["ref"].as_str().unwrap().to_owned();
+        let out = call(
+            &mut client,
+            &mut reader,
+            3,
+            "value.get",
+            json!({"ref":value_ref,"path":"out"}),
+        );
+        assert_eq!(out.result.unwrap()["value"], json!({"$":"str","v":"hello world"}));
+        let ok = call(
+            &mut client,
+            &mut reader,
+            4,
+            "value.get",
+            json!({"ref":value_ref,"path":"ok"}),
+        );
+        assert_eq!(ok.result.unwrap()["value"], json!({"$":"bool","v":true}));
+        let bad = call(
+            &mut client,
+            &mut reader,
+            5,
+            "value.get",
+            json!({"ref":value_ref,"path":"nope"}),
+        );
+        assert_eq!(bad.error.unwrap().code, -32005);
+
+        let ls_exec = call(&mut client, &mut reader, 6, "exec", json!({"src":"ls"}));
+        let ls_ref = ls_exec.result.unwrap()["ref"].as_str().unwrap().to_owned();
+        let rows0 = call(
+            &mut client,
+            &mut reader,
+            7,
+            "value.get",
+            json!({"ref":ls_ref,"path":"rows[0].name"}),
+        );
+        assert!(rows0.error.is_none(), "{:?}", rows0.error);
+        drop(client);
+        drop(reader);
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn exec_position_stmt_raises_value_does_not() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        let kernel = Kernel::new();
+        let server_kernel = kernel.clone();
+        let thread = std::thread::spawn(move || server_kernel.handle_stream(server).unwrap());
+        call(
+            &mut client,
+            &mut reader,
+            1,
+            "session.attach",
+            json!({"client":{"kind":"agent","tty":false}}),
+        );
+        let stmt = call(
+            &mut client,
+            &mut reader,
+            2,
+            "exec",
+            json!({"src":"sh { exit 7 }","position":"stmt"}),
+        );
+        assert_eq!(stmt.error.unwrap().code, -32002);
+        let value = call(
+            &mut client,
+            &mut reader,
+            3,
+            "exec",
+            json!({"src":"sh { exit 7 }","position":"value"}),
+        );
+        let result = value.result.unwrap();
+        assert_eq!(result["value"]["$"], "outcome");
+        assert_eq!(result["value"]["ok"], false);
+        assert_eq!(result["value"]["status"], 7);
+        drop(client);
+        drop(reader);
+        thread.join().unwrap();
     }
 
     #[test]

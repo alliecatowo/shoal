@@ -3,6 +3,7 @@
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::io::{self, BufRead, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -138,11 +139,90 @@ pub enum WireValue {
         v: Vec<WireValue>,
     },
     Record {
-        v: serde_json::Map<String, Value>,
+        v: BTreeMap<String, WireValue>,
+    },
+    /// Columnar per TDD §7: every row contributes to every column (missing
+    /// cells encode as `null`), so `cols[c].len() == n` for every column.
+    Table {
+        cols: BTreeMap<String, Vec<WireValue>>,
+        n: usize,
+    },
+    Outcome {
+        status: Option<i32>,
+        ok: bool,
+        signal: Option<String>,
+        out: Box<WireValue>,
+        /// Lossy UTF-8 of stderr — not a CAS ref; large payloads are still
+        /// truncated at the journal layer, this is the live wire copy.
+        err: String,
+        dur_ns: i64,
+        pid: u32,
+        cmd: String,
+    },
+    Error {
+        code: String,
+        msg: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        span: Option<WireSpan>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hint: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stderr: Option<String>,
+    },
+    #[serde(rename = "datetime")]
+    DateTime {
+        /// RFC 3339.
+        v: String,
+    },
+    Time {
+        /// `HH:MM:SS`, 24h.
+        v: String,
+    },
+    Glob {
+        pattern: String,
+    },
+    Regex {
+        src: String,
+    },
+    Range {
+        start: i64,
+        end: i64,
+        inclusive: bool,
+    },
+    Task {
+        id: u64,
+        done: bool,
+    },
+    Closure {
+        /// Display form; closures are not wire-invocable in v0.1.
+        repr: String,
+    },
+    /// Stream chunks are deferred (TDD §7 promises "ref + chunks"); today a
+    /// stream only wires its label — pulling chunks needs a follow-up
+    /// protocol method that does not exist yet.
+    Stream {
+        label: String,
+    },
+    /// Redaction by construction (TDD §9): never the secret material.
+    Secret {
+        name: String,
+    },
+    /// Alias / partial command application (`Value::CmdRef`). Not further
+    /// structural in v0.1 — just its display form.
+    Cmd {
+        repr: String,
     },
     Ref {
         v: Ref,
     },
+}
+
+/// Byte-offset span into source, mirrors `shoal_ast::Span` on the wire
+/// without pulling in an AST dependency here.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct WireSpan {
+    pub start: u32,
+    pub end: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

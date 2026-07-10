@@ -8,6 +8,14 @@ effects = ["fs.read(cwd)"]
 params = { short = "bool", branch = "bool", untracked_files = "str?" }
 flags = { short = { s = "short", b = "branch" } }
 invoke = ["status", "--porcelain=v2"]
+# `--short`/`-s` and `--branch`/`-b` remain valid, recognized flags (users
+# can still type `git status -s`) but must never reach git's argv: git's
+# format flags are last-wins, so appending `--short` after the pinned
+# `--porcelain=v2` silently switches git to short-format output, which the
+# porcelain-v2 parser then misreads (see shoal-adapters module docs on the
+# "consumed" rule). The porcelain-v2 table already carries everything
+# `--short`/`--branch` would otherwise reveal.
+consumed = ["short", "branch"]
 output = { parse = "porcelain-v2", type = "table<{status: str, path: path, orig: path?}>" }
 effects = ["fs.read(cwd)"]
 

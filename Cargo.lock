@@ -2154,6 +2154,7 @@ dependencies = [
  "shoal-eval",
  "shoal-syntax",
  "shoal-value",
+ "signal-hook",
  "tempfile",
  "toml 1.1.2+spec-1.1.0",
 ]
@@ -2276,9 +2277,11 @@ name = "shoal-kernel"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "blake3",
  "ctrlc",
  "serde",
  "serde_json",
+ "shoal-ast",
  "shoal-auth",
  "shoal-eval",
  "shoal-exec",
@@ -2345,7 +2348,9 @@ name = "shoal-reef"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "libc",
  "serde",
+ "tempfile",
  "toml 1.1.2+spec-1.1.0",
 ]
 

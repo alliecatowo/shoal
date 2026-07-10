@@ -1,0 +1,132 @@
+# Ranges, membership (`in`), coalesce (`??`), safe-nav (`?.`), comparisons,
+# logical &&/|| (incl. command outcomes per TDD §1.10/§4.5), catch/try.
+
+[[case]]
+name = "op-range-in-loop-sum"
+src = "var s = 0\nfor i in 2..=5 { s += i }\ns"
+value = "14"
+
+[[case]]
+name = "op-in-list-true"
+src = "2 in [1, 2, 3]"
+value = "true"
+[[case]]
+name = "op-in-list-false"
+src = "9 in [1, 2, 3]"
+value = "false"
+[[case]]
+name = "op-in-string-substring"
+src = '"ell" in "hello"'
+value = "true"
+[[case]]
+name = "op-in-record-key"
+src = '"a" in {a: 1, b: 2}'
+value = "true"
+[[case]]
+name = "op-in-range"
+src = "3 in 1..5"
+value = "true"
+[[case]]
+name = "op-in-range-exclusive-end-not-contained"
+src = "5 in 1..5"
+value = "false"
+
+[[case]]
+name = "op-coalesce-chain-both-null"
+src = "null ?? null ?? 5"
+value = "5"
+[[case]]
+name = "op-coalesce-does-not-evaluate-rhs-on-value"
+src = "3 ?? (1 / 0)"
+value = "3"
+
+[[case]]
+name = "op-safenav-null-short-circuits"
+src = "let x = null\nx?.foo"
+value = "null"
+[[case]]
+name = "op-safenav-nonnull-accesses-field"
+src = "let x = {a: 5}\nx?.a"
+value = "5"
+[[case]]
+name = "op-safenav-chained-through-null"
+src = "let x = null\nx?.a?.b"
+value = "null"
+
+[[case]]
+name = "op-cmp-le-equal"
+src = "2 <= 2"
+value = "true"
+[[case]]
+name = "op-cmp-ge-equal"
+src = "3 >= 3"
+value = "true"
+[[case]]
+name = "op-cmp-chain-le-lt-is-error"
+src = "1 <= 2 < 3"
+parse_error = true
+parse_error_contains = "do not chain"
+[[case]]
+name = "op-cmp-str-lt-int-is-error"
+src = '"a" < 1'
+error = "type_error"
+[[case]]
+name = "op-cmp-bool-lt-bool"
+src = "false < true"
+value = "true"
+
+[[case]]
+name = "op-and-both-true"
+src = "true && true"
+value = "true"
+[[case]]
+name = "op-and-short-circuits-on-false"
+src = "false && (1 / 0 == 0)"
+value = "false"
+[[case]]
+name = "op-or-short-circuits-on-true"
+src = "true || (1 / 0 == 0)"
+value = "true"
+[[case]]
+name = "op-and-int-operand-is-error"
+# &&/|| admit only bool or command outcomes (TDD §1.10).
+src = "1 && true"
+error = "type_error"
+[[case]]
+name = "op-not-bool"
+src = "!true"
+value = "false"
+[[case]]
+name = "op-not-int-is-error"
+src = "!5"
+error = "type_error"
+
+[[case]]
+name = "op-cmd-and-and-runs-both-on-success"
+# CMD-mode `&&`/`||` chaining (TDD §2.2); `^` forces command interpretation
+# since `true`/`false` are reserved literal tokens, not identifiers.
+src = "^true && ^true\n1 + 1"
+value = "2"
+[[case]]
+name = "op-cmd-or-or-short-circuits-on-success"
+src = "^true || ^false\n1 + 1"
+value = "2"
+
+[[case]]
+name = "op-catch-bound-name"
+src = "(1 / 0) catch e { \"caught\" }"
+value = '"caught"'
+[[case]]
+name = "op-catch-passthrough-on-no-error"
+src = "(1 + 1) catch \"fallback\""
+value = "2"
+[[case]]
+name = "op-try-catch-binds-error-value"
+# The bound error is a first-class `error` value; CONTRACTS §3 pins its
+# render form as `error(<code>: <msg>)`.
+src = "try { 1 / 0 } catch e { e }"
+value = "error(div_zero: division by zero)"
+[[case]]
+name = "op-try-no-error-yields-block-value"
+src = "try { 1 + 1 } catch { 0 }"
+value = "2"

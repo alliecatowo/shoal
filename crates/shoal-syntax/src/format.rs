@@ -156,6 +156,15 @@ fn quote(s: &str) -> String {
         s.chars().flat_map(char::escape_default).collect::<String>()
     )
 }
+/// Record keys re-quote when they are not identifier-shaped, so the printed
+/// record re-parses as a record and not a block (D11).
+fn record_key(name: &str) -> String {
+    if crate::lexer::is_ident(name) {
+        name.to_string()
+    } else {
+        quote(name)
+    }
+}
 fn expr(e: &Expr) -> String {
     match e {
         Expr::Null { .. } => "null".into(),
@@ -223,7 +232,7 @@ fn expr(e: &Expr) -> String {
             "{{{}}}",
             fields
                 .iter()
-                .map(|f| format!("{}: {}", f.name, expr(&f.value)))
+                .map(|f| format!("{}: {}", record_key(&f.name), expr(&f.value)))
                 .collect::<Vec<_>>()
                 .join(", ")
         ),

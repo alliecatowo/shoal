@@ -8,6 +8,10 @@ effects = ["proc.spawn(docker)", "net.connect(docker-daemon)"]
 params = { all = "bool", quiet = "bool", filter = "str?" }
 flags = { short = { a = "all", q = "quiet", f = "filter" } }
 invoke = ["ps", "--format", "table {{.ID}}\t{{.Image}}\t{{.Status}}\t{{.Names}}"]
+# `quiet`/`-q` remains a valid flag but must not reach argv: it requests an
+# alternate (IDs-only) output shape that would compete with the pinned
+# `--format` table, and the tsv table already contains the ID column.
+consumed = ["quiet"]
 output = { parse = "tsv", type = "table<{CONTAINER ID: str, IMAGE: str, STATUS: str, NAMES: str}>" }
 effects = ["net.connect(docker-daemon)"]
 
@@ -15,6 +19,8 @@ effects = ["net.connect(docker-daemon)"]
 params = { all = "bool", quiet = "bool" }
 flags = { short = { a = "all", q = "quiet" } }
 invoke = ["images", "--format", "table {{.Repository}}\t{{.Tag}}\t{{.ID}}\t{{.Size}}"]
+# Same "consumed" rationale as docker.sub.ps: quiet must not reach argv.
+consumed = ["quiet"]
 output = { parse = "tsv", type = "table<{REPOSITORY: str, TAG: str, IMAGE ID: str, SIZE: str}>" }
 effects = ["net.connect(docker-daemon)"]
 

@@ -16,7 +16,9 @@ mod parser;
 
 pub use format::{canonical_equivalent, format_program};
 pub use lexer::{LexError, Lexer, Mode, Seg, Tok};
-pub use parser::{ParseError, ParseResult, Parser, parse, parse_with_scope};
+pub use parser::{
+    ParseCtx, ParseError, ParseResult, Parser, parse, parse_with_ctx, parse_with_scope,
+};
 
 #[derive(Debug)]
 pub enum ParseStatus {

@@ -1,4 +1,4 @@
-use crate::lexer::{LexError, Lexer, Mode, Seg, Tok};
+use crate::lexer::{LexError, Lexer, Mode, RESERVED, Seg, Tok};
 use shoal_ast::*;
 use std::collections::HashSet;
 
@@ -38,6 +38,17 @@ impl std::fmt::Display for ParseError {
 impl std::error::Error for ParseError {}
 pub type ParseResult<T> = Result<T, ParseError>;
 
+/// Parse context carrying the dispatch inputs the parser cannot infer from the
+/// source alone (TDD §3.1): whether we are at a REPL prompt (so `it`/`out` are
+/// legal and a leading `.` chains on `it`), plus the pre-seeded value-bindings
+/// (`let`/`var`/params) and command-bindings (session `fn`s/aliases).
+#[derive(Debug, Clone, Default)]
+pub struct ParseCtx {
+    pub repl: bool,
+    pub value_bound: Vec<String>,
+    pub cmd_bound: Vec<String>,
+}
+
 pub fn parse(src: &str) -> ParseResult<Program> {
     Parser::new(src).parse_program()
 }
@@ -50,10 +61,31 @@ pub fn parse_with_scope(src: &str, bound: impl IntoIterator<Item = String>) -> P
     parser.parse_program()
 }
 
+/// The full-fidelity entry point (TDD §3.1): dispatch honours the two scope
+/// categories and the REPL context. `parse`/`parse_with_scope` are compat shims
+/// mapping onto this with `repl: false` and no command bindings.
+pub fn parse_with_ctx(src: &str, ctx: ParseCtx) -> ParseResult<Program> {
+    let mut parser = Parser::new(src);
+    parser.repl = ctx.repl;
+    for name in ctx.value_bound {
+        parser.bind(name);
+    }
+    for name in ctx.cmd_bound {
+        parser.bind_cmd(name);
+    }
+    parser.parse_program()
+}
+
 pub struct Parser<'s> {
     lx: Lexer<'s>,
     pos: usize,
+    /// Value bindings — `let`/`var`/params. A name here dispatches EXPR.
     scopes: Vec<HashSet<String>>,
+    /// Command bindings — user `fn`s and aliases. A name here (and not also a
+    /// value binding) dispatches CMD.
+    cmd_scopes: Vec<HashSet<String>>,
+    /// REPL context: `it`/`out` are legal and a leading `.` chains on `it`.
+    repl: bool,
 }
 
 impl<'s> Parser<'s> {
@@ -66,6 +98,8 @@ impl<'s> Parser<'s> {
             lx: Lexer::new(src),
             pos: 0,
             scopes: vec![builtins],
+            cmd_scopes: vec![HashSet::new()],
+            repl: false,
         }
     }
     fn peek(&self, m: Mode) -> ParseResult<(Tok, Span)> {
@@ -94,10 +128,17 @@ impl<'s> Parser<'s> {
         })
     }
     fn term(&mut self) -> ParseResult<()> {
-        while matches!(self.peek(Mode::Expr)?.0, Tok::Newline | Tok::Semi) {
+        // Non-fatal: a head that lex-errors in EXPR mode (e.g. a `~/…` path
+        // command) is not a terminator, so stop and let `statement()` dispatch.
+        while let Ok((Tok::Newline | Tok::Semi, _)) = self.peek(Mode::Expr) {
             self.bump(Mode::Expr)?;
         }
         Ok(())
+    }
+    /// Peek the next EXPR token and test it; a lex error counts as "no match"
+    /// so a CMD-only next head never aborts a statement loop's guard.
+    fn peek_is(&self, f: impl Fn(&Tok) -> bool) -> bool {
+        matches!(self.peek(Mode::Expr), Ok((t, _)) if f(&t))
     }
     fn bound(&self, n: &str) -> bool {
         self.scopes.iter().rev().any(|s| s.contains(n))
@@ -105,24 +146,163 @@ impl<'s> Parser<'s> {
     fn bind(&mut self, n: String) {
         self.scopes.last_mut().unwrap().insert(n);
     }
+    fn bind_cmd(&mut self, n: String) {
+        self.cmd_scopes.last_mut().unwrap().insert(n);
+    }
+    fn byte(&self, i: usize) -> u8 {
+        self.lx.src.as_bytes().get(i).copied().unwrap_or(0)
+    }
+    /// Does the raw text at `start` begin a path literal (`./ ../ ~ ~/ /…`)?
+    /// Such a head dispatches CMD (TDD §2.2 / §3.1 rule 2 is for EXPR starters,
+    /// path words are command heads).
+    fn is_path_head(&self, start: usize) -> bool {
+        match self.byte(start) {
+            b'/' => true,
+            b'~' => {
+                let n = self.byte(start + 1);
+                n == b'/' || matches!(n, 0 | b' ' | b'\t' | b'\r' | b'\n' | b';')
+            }
+            b'.' => {
+                let n = self.byte(start + 1);
+                n == b'/' || (n == b'.' && self.byte(start + 2) == b'/')
+            }
+            _ => false,
+        }
+    }
+    /// True when the token immediately after an identifier abuts it (no
+    /// whitespace) and is a postfix opener `.`/`?.`/`(`/`[` — the §3.1
+    /// ident-adjacency refinement forcing an EXPR statement.
+    fn adjacent_postfix_after_ident(&self, ident_span: Span) -> ParseResult<bool> {
+        Ok(match self.lx.token(ident_span.end as usize, Mode::Expr) {
+            Ok((t, s)) => {
+                s.start == ident_span.end
+                    && matches!(
+                        t,
+                        Tok::Dot | Tok::QuestionDot | Tok::LParen | Tok::LBracket
+                    )
+            }
+            Err(_) => false,
+        })
+    }
+    /// Would the token stream at the current position dispatch as a COMMAND
+    /// (used for `&&`/`||` operands and parenthesised command substitution)?
+    fn at_command_head(&self) -> ParseResult<bool> {
+        let start = self.lx.skip_trivia(self.pos);
+        if self.byte(start) == b'^' {
+            return Ok(true);
+        }
+        if self.is_path_head(start) {
+            return Ok(true);
+        }
+        Ok(match self.peek(Mode::Expr) {
+            Ok((Tok::Ident(name), s)) => {
+                if RESERVED.contains(&name.as_str())
+                    || matches!(name.as_str(), "with" | "spawn" | "sh")
+                {
+                    false
+                } else if self.adjacent_postfix_after_ident(s)? {
+                    false
+                } else {
+                    // value-bound → EXPR (Var); cmd-bound or unbound → command.
+                    !self.bound(&name)
+                }
+            }
+            _ => false,
+        })
+    }
+    /// Consume a run of `Newline` tokens (delimiter-interior continuation, §2.1).
+    fn skip_newlines(&mut self) -> ParseResult<()> {
+        while matches!(self.peek(Mode::Expr)?.0, Tok::Newline) {
+            self.bump(Mode::Expr)?;
+        }
+        Ok(())
+    }
+    /// Look past a run of newlines; if the next significant token satisfies
+    /// `pred`, advance to just before it and return true (leading-`.`/`catch`/
+    /// `else` cross-newline continuation, §2.1). Otherwise leave `pos` intact.
+    fn continue_if<F: Fn(&Tok) -> bool>(&mut self, pred: F) -> ParseResult<bool> {
+        let mut p = self.pos;
+        loop {
+            let (t, s) = match self.lx.token(p, Mode::Expr) {
+                Ok(x) => x,
+                Err(_) => return Ok(false),
+            };
+            match t {
+                Tok::Newline => p = s.end as usize,
+                _ if pred(&t) => {
+                    self.pos = p;
+                    return Ok(true);
+                }
+                _ => return Ok(false),
+            }
+        }
+    }
+    /// Parse a command operand (`Expr::Cmd`) when the head dispatches CMD,
+    /// otherwise a normal expression. Used for `&&`/`||` operands and inside
+    /// `(` … `)` group / command-substitution positions.
+    fn expr_or_command(&mut self, min: u8) -> ParseResult<Expr> {
+        if self.at_command_head()? {
+            let call = self.command()?;
+            let span = call.span;
+            let e = Expr::Cmd {
+                call: Box::new(call),
+                span,
+            };
+            self.expr_tail(e, min)
+        } else {
+            self.expr(min)
+        }
+    }
+    /// Dispatch and parse a COMMAND statement, then absorb any trailing
+    /// `&&`/`||` command/expr operands (eval-audit #6).
+    fn command_stmt(&mut self) -> ParseResult<Stmt> {
+        let call = self.command()?;
+        let cspan = call.span;
+        let e = Expr::Cmd {
+            call: Box::new(call),
+            span: cspan,
+        };
+        let e = self.expr_tail(e, 0)?;
+        let span = e.span();
+        Ok(Stmt::Expr { expr: e, span })
+    }
 
     pub fn parse_program(mut self) -> ParseResult<Program> {
         let mut stmts = vec![];
         self.term()?;
-        while !matches!(self.peek(Mode::Expr)?.0, Tok::Eof) {
-            stmts.push(self.statement()?);
-            if !matches!(self.peek(Mode::Expr)?.0, Tok::Eof | Tok::RBrace) {
-                self.term()?;
-            } else {
-                self.term()?;
-            }
+        while !self.peek_is(|t| matches!(t, Tok::Eof)) {
+            let stmt = self.statement()?;
+            self.require_term(&stmt)?;
+            stmts.push(stmt);
         }
         Ok(Program { stmts })
     }
 
     fn statement(&mut self) -> ParseResult<Stmt> {
         let start = self.lx.skip_trivia(self.pos);
+
+        // REPL leading-`.` line: a postfix chain on `it` (§3.4). Excludes the
+        // `./`…`../` path forms, which are command heads.
+        if self.repl && self.byte(start) == b'.' && !self.is_path_head(start) {
+            let seed = Expr::Var {
+                name: "it".into(),
+                span: Span::new(start, start),
+            };
+            let e = self.postfix(seed)?;
+            let e = self.expr_tail(e, 0)?;
+            let span = e.span();
+            return Ok(Stmt::Expr { expr: e, span });
+        }
+
+        // Path-head command (`./deploy.sh`, `/bin/ls`, `~/x`). Detected from
+        // raw bytes so EXPR-starters never reach a fatal CMD probe (D1).
+        if self.is_path_head(start) {
+            return self.command_stmt();
+        }
+
         let (t, s) = self.peek(Mode::Expr)?;
+
+        // §3.1 rule 1 — reserved-word constructs.
         if let Tok::Ident(k) = &t {
             match k.as_str() {
                 "let" | "var" => return self.let_stmt(false),
@@ -155,7 +335,9 @@ impl<'s> Parser<'s> {
                 _ => {}
             }
         }
+
         if let Tok::Ident(name) = t.clone() {
+            // Keyword-headed expressions (`if`, `match`, literals, …) → EXPR.
             if matches!(
                 name.as_str(),
                 "true" | "false" | "null" | "if" | "match" | "try" | "with" | "spawn" | "sh"
@@ -166,27 +348,25 @@ impl<'s> Parser<'s> {
             }
 
             // `NAME=value cmd` is an environment prefix, while a standalone
-            // `NAME=value` remains ordinary assignment. CMD lexing can see
-            // the whole prefix without compromising expression dispatch.
-            if let (Tok::EnvAssign(_, _), env_span) = self.peek(Mode::Cmd)? {
+            // `NAME=value` remains ordinary assignment. The CMD peek is made
+            // non-fatal so a head that errors in CMD mode never propagates (D1).
+            if let Ok((Tok::EnvAssign(_, _), env_span)) = self.peek(Mode::Cmd) {
                 if !matches!(
-                    self.lx.token(env_span.end as usize, Mode::Cmd)?.0,
+                    self.lx
+                        .token(env_span.end as usize, Mode::Cmd)
+                        .map(|x| x.0)
+                        .unwrap_or(Tok::Eof),
                     Tok::Newline | Tok::Semi | Tok::Eof
                 ) {
-                    let call = self.command()?;
-                    let span = call.span;
-                    return Ok(Stmt::Expr {
-                        expr: Expr::Cmd {
-                            call: Box::new(call),
-                            span,
-                        },
-                        span,
-                    });
+                    return self.command_stmt();
                 }
             }
+
+            // Assignment lookahead — tolerant of CMD-only tokens after the head
+            // (e.g. a lone `&`, eval-audit #7): a peek error means "not `=`".
             let save = self.pos;
             self.bump(Mode::Expr)?;
-            let next = self.peek(Mode::Expr)?.0;
+            let next = self.peek(Mode::Expr).map(|x| x.0).unwrap_or(Tok::Eof);
             self.pos = save;
             if matches!(
                 next,
@@ -202,43 +382,67 @@ impl<'s> Parser<'s> {
                     span: Span::new(start, self.pos),
                 });
             }
-            if !self.bound(&name) {
-                let call = self.command()?;
-                let span = call.span;
-                return Ok(Stmt::Expr {
-                    expr: Expr::Cmd {
-                        call: Box::new(call),
-                        span,
-                    },
-                    span,
-                });
+
+            // Ident-adjacency refinement (D3): `ls.where(…)` / `run("x", …)` —
+            // an abutting `.`/`?.`/`(`/`[` forces an EXPR statement (the bare
+            // command head desugars to `Var(name)` as the receiver; the
+            // evaluator resolves an unbound `Var` to a zero-arg command).
+            if self.adjacent_postfix_after_ident(s)? {
+                let e = self.expr(0)?;
+                let span = e.span();
+                return Ok(Stmt::Expr { expr: e, span });
             }
+
+            // Two-scope dispatch (D2): value-bound → EXPR; cmd-bound or unbound
+            // → COMMAND.
+            if self.bound(&name) {
+                let e = self.expr(0)?;
+                let span = e.span();
+                return Ok(Stmt::Expr { expr: e, span });
+            }
+            return self.command_stmt();
         }
+
+        // `^head …` forces command interpretation past shadowing.
         if matches!(t, Tok::Caret) {
-            let call = self.command()?;
-            let span = call.span;
-            return Ok(Stmt::Expr {
-                expr: Expr::Cmd {
-                    call: Box::new(call),
-                    span,
-                },
-                span,
-            });
+            return self.command_stmt();
         }
-        if let (Tok::PathWord(_), _) = self.peek(Mode::Cmd)? {
-            let call = self.command()?;
-            let span = call.span;
-            return Ok(Stmt::Expr {
-                expr: Expr::Cmd {
-                    call: Box::new(call),
-                    span,
-                },
-                span,
-            });
-        }
+
+        // §3.1 rule 2 — a non-identifier head is always an EXPR statement.
         let e = self.expr(0)?;
         let sp = e.span();
         Ok(Stmt::Expr { expr: e, span: sp })
+    }
+    /// After a statement, require a terminator (newline/`;`) unless the next
+    /// token closes the enclosing scope (EBNF `{ statement TERM }`, D7). A
+    /// stray bare word after a value expression gets the curated `^x` hint.
+    fn require_term(&mut self, prev: &Stmt) -> ParseResult<()> {
+        // The peek is tolerant of a CMD-only next head that lex-errors in EXPR
+        // mode — that too is a missing terminator, not a fatal lex error.
+        match self.peek(Mode::Expr) {
+            Ok((Tok::Newline | Tok::Semi, _)) => {
+                self.term()?;
+                Ok(())
+            }
+            Ok((Tok::Eof | Tok::RBrace, _)) => Ok(()),
+            other => {
+                let s = match other {
+                    Ok((_, s)) => s,
+                    Err(e) => e.span,
+                };
+                let mut err = ParseError::new("expected newline or `;` between statements", s);
+                if let Stmt::Expr {
+                    expr: Expr::Var { name, .. },
+                    ..
+                } = prev
+                {
+                    err = err.hint(format!(
+                        "did you mean the command? force it with `^{name}`"
+                    ));
+                }
+                Err(err)
+            }
+        }
     }
     fn at_end_stmt(&self) -> ParseResult<bool> {
         Ok(matches!(
@@ -375,7 +579,7 @@ impl<'s> Parser<'s> {
         }
         let body = self.block()?;
         self.scopes.pop();
-        self.bind(name.clone());
+        self.bind_cmd(name.clone());
         Ok(Stmt::Fn {
             decl: FnDecl {
                 name,
@@ -394,7 +598,7 @@ impl<'s> Parser<'s> {
         let (name, _) = self.ident()?;
         self.expect(Mode::Expr, Tok::Eq, "`=`")?;
         let target = self.command()?;
-        self.bind(name.clone());
+        self.bind_cmd(name.clone());
         Ok(Stmt::Alias {
             name,
             target,
@@ -453,14 +657,17 @@ impl<'s> Parser<'s> {
     fn block(&mut self) -> ParseResult<Block> {
         let open = self.expect(Mode::Expr, Tok::LBrace, "`{`")?;
         self.scopes.push(HashSet::new());
+        self.cmd_scopes.push(HashSet::new());
         self.term()?;
         let mut stmts = vec![];
-        while !matches!(self.peek(Mode::Expr)?.0, Tok::RBrace | Tok::Eof) {
-            stmts.push(self.statement()?);
-            self.term()?;
+        while !self.peek_is(|t| matches!(t, Tok::RBrace | Tok::Eof)) {
+            let stmt = self.statement()?;
+            self.require_term(&stmt)?;
+            stmts.push(stmt);
         }
         self.expect(Mode::Expr, Tok::RBrace, "`}`")?;
         self.scopes.pop();
+        self.cmd_scopes.pop();
         Ok(Block {
             stmts,
             span: Span::new(open.start as usize, self.pos),
@@ -485,8 +692,9 @@ impl<'s> Parser<'s> {
             }
         }
         let forced = self.eat(Mode::Cmd, &Tok::Caret)?.is_some();
+        // A path literal (`./x.sh`, `/bin/ls`, `~/x`) is a valid command head.
         let (head, _) = match self.bump(Mode::Cmd)? {
-            (Tok::Word(x), s) => (x, s),
+            (Tok::Word(x), s) | (Tok::PathWord(x), s) => (x, s),
             (x, s) => {
                 return Err(ParseError::new(
                     format!("expected command head, found {x:?}"),
@@ -500,7 +708,7 @@ impl<'s> Parser<'s> {
         let mut trailing = None;
         loop {
             let (t, s) = self.peek(Mode::Cmd)?;
-            match t{Tok::Newline|Tok::Semi|Tok::Eof|Tok::RBrace|Tok::AndAnd|Tok::OrOr=>break,Tok::Pipe=>return Err(ParseError::new("shoal has no pipe operator",s).hint("data composes with `.`; raw byte plumbing is `.feed(cmd)`; verbatim POSIX lives in `sh { … }`")),Tok::Amp=>{self.bump(Mode::Cmd)?;background=true;break},Tok::LBrace=>{trailing=Some(self.block()?);break},Tok::RedirOut|Tok::RedirAppend|Tok::RedirIn=>{let kind=match self.bump(Mode::Cmd)?.0{Tok::RedirOut=>RedirectKind::Out,Tok::RedirAppend=>RedirectKind::Append,_=>RedirectKind::In};let target=self.cmd_arg()?;redirects.push(Redirect{kind,span:Span::new(s.start as usize,target.span().end as usize),target})},_=>args.push(self.cmd_arg()?)}
+            match t{Tok::Newline|Tok::Semi|Tok::Eof|Tok::RBrace|Tok::RParen|Tok::AndAnd|Tok::OrOr=>break,Tok::Pipe=>return Err(ParseError::new("shoal has no pipe operator",s).hint("data composes with `.`; raw byte plumbing is `.feed(cmd)`; verbatim POSIX lives in `sh { … }`")),Tok::Amp=>{self.bump(Mode::Cmd)?;background=true;break},Tok::LBrace=>{trailing=Some(self.block()?);break},Tok::RedirOut|Tok::RedirAppend|Tok::RedirIn=>{let kind=match self.bump(Mode::Cmd)?.0{Tok::RedirOut=>RedirectKind::Out,Tok::RedirAppend=>RedirectKind::Append,_=>RedirectKind::In};let target=self.cmd_arg()?;redirects.push(Redirect{kind,span:Span::new(s.start as usize,target.span().end as usize),target})},_=>args.push(self.cmd_arg()?)}
         }
         Ok(CmdCall {
             head,
@@ -528,7 +736,7 @@ impl<'s> Parser<'s> {
                 span: s,
             },
             Tok::LParen => {
-                let e = self.expr(0)?;
+                let e = self.expr_or_command(0)?;
                 self.expect(Mode::Expr, Tok::RParen, "`)`")?;
                 CmdArg::Expr {
                     expr: e,
@@ -566,7 +774,17 @@ impl<'s> Parser<'s> {
     }
     fn expr_tail(&mut self, mut lhs: Expr, min: u8) -> ParseResult<Expr> {
         loop {
-            let (t, _) = self.peek(Mode::Expr)?;
+            let (mut t, _) = self.peek(Mode::Expr)?;
+            // Cross-newline continuation (§2.1): a trailing binary operator (the
+            // newline is already inside an open subexpression) never reaches
+            // here, but a `catch` on the *next* line must still attach.
+            if min == 0 && matches!(t, Tok::Newline) {
+                if self.continue_if(|t| matches!(t, Tok::Ident(x) if x == "catch"))? {
+                    t = self.peek(Mode::Expr)?.0;
+                } else {
+                    break;
+                }
+            }
             if min == 0 && matches!(&t, Tok::Ident(x) if x == "catch") {
                 self.bump(Mode::Expr)?;
                 let binder = if let (Tok::Ident(name), _) = self.peek(Mode::Expr)? {
@@ -619,7 +837,14 @@ impl<'s> Parser<'s> {
                 .hint("combine comparisons explicitly with `&&`"));
             }
             self.bump(Mode::Expr)?;
-            let rhs = self.expr(bp + 1)?;
+            // A trailing binary operator continues the statement across newlines
+            // (§2.1); `&&`/`||` operands may be commands (eval-audit #6).
+            self.skip_newlines()?;
+            let rhs = if matches!(op, Some(BinOp::And) | Some(BinOp::Or)) {
+                self.expr_or_command(bp + 1)?
+            } else {
+                self.expr(bp + 1)?
+            };
             let span = Span::new(lhs.span().start as usize, rhs.span().end as usize);
             lhs = if matches!(t, Tok::DotDot | Tok::DotDotEq) {
                 Expr::Range {
@@ -660,17 +885,41 @@ impl<'s> Parser<'s> {
     }
     fn primary(&mut self) -> ParseResult<Expr> {
         let (t, s) = self.bump(Mode::Expr)?;
-        Ok(match t{Tok::Int(value)=>Expr::Int{value,span:s},Tok::Float(value)=>Expr::Float{value,span:s},Tok::Size(bytes)=>Expr::Size{bytes,span:s},Tok::Duration(ns)=>Expr::Duration{ns,span:s},Tok::Time{hour,min,sec}=>Expr::Time{hour,min,sec,span:s},Tok::Str(value)=>Expr::Str{value,span:s},Tok::StrInterp(parts)=>self.interp(parts,s)?,Tok::Regex(src)=>Expr::Regex{src,span:s},Tok::DateTime(iso)=>Expr::DateTime{iso,span:s},Tok::Ident(x)if x=="true"||x=="false"=>Expr::Bool{value:x=="true",span:s},Tok::Ident(x)if x=="null"=>Expr::Null{span:s},Tok::Ident(x)if x=="if"=>return self.if_expr(s.start as usize),Tok::Ident(x)if x=="try"=>return self.try_expr(s.start as usize),Tok::Ident(x)if x=="match"=>return self.match_expr(s.start as usize),Tok::Ident(x)if x=="with"=>return self.with_expr(s.start as usize),Tok::Ident(x)if x=="spawn"=>{let body=self.block()?;Expr::Spawn{body,span:Span::new(s.start as usize,self.pos)}},Tok::Ident(x)if x=="sh"=>{let open=self.expect(Mode::Expr,Tok::LBrace,"`{`")?;let(src,end)=self.lx.raw_brace_block(open.start as usize)?;self.pos=end;Expr::ShRaw{src,span:Span::new(s.start as usize,end as usize)}},Tok::Ident(name)=>{if matches!(self.peek(Mode::Expr)?.0,Tok::FatArrow){self.bump(Mode::Expr)?;let body=self.expr(0)?;let end=body.span().end;Expr::Lambda{params:vec![Param{name,ty:None,default:None,span:s}],body:Box::new(body),span:Span::new(s.start as usize,end as usize)}}else{Expr::Var{name,span:s}}},Tok::LParen=>return self.paren_or_lambda(s.start as usize),Tok::LBracket=>{let mut items=vec![];if self.eat(Mode::Expr,&Tok::RBracket)?.is_none(){loop{items.push(self.expr(0)?);if self.eat(Mode::Expr,&Tok::Comma)?.is_none(){self.expect(Mode::Expr,Tok::RBracket,"`]`")?;break}if self.eat(Mode::Expr,&Tok::RBracket)?.is_some(){break}}}Expr::List{items,span:Span::new(s.start as usize,self.pos)}},Tok::LBrace=>return self.record_or_block(s.start as usize),Tok::Pipe=>return Err(ParseError::new("shoal has no pipe operator",s).hint("data composes with `.`; raw byte plumbing is `.feed(cmd)`; verbatim POSIX lives in `sh { … }`")),_=>return Err(ParseError::new(format!("expected expression, found {t:?}"),s))})
+        Ok(match t{Tok::Int(value)=>Expr::Int{value,span:s},Tok::Float(value)=>Expr::Float{value,span:s},Tok::Size(bytes)=>Expr::Size{bytes,span:s},Tok::Duration(ns)=>Expr::Duration{ns,span:s},Tok::Time{hour,min,sec}=>Expr::Time{hour,min,sec,span:s},Tok::Str(value)=>Expr::Str{value,span:s},Tok::StrInterp(parts)=>self.interp(parts,s)?,Tok::Regex(src)=>Expr::Regex{src,span:s},Tok::DateTime(iso)=>Expr::DateTime{iso,span:s},Tok::Ident(x)if x=="true"||x=="false"=>Expr::Bool{value:x=="true",span:s},Tok::Ident(x)if x=="null"=>Expr::Null{span:s},Tok::Ident(x)if x=="if"=>return self.if_expr(s.start as usize),Tok::Ident(x)if x=="try"=>return self.try_expr(s.start as usize),Tok::Ident(x)if x=="match"=>return self.match_expr(s.start as usize),Tok::Ident(x)if x=="with"=>return self.with_expr(s.start as usize),Tok::Ident(x)if x=="spawn"=>{let body=self.block()?;Expr::Spawn{body,span:Span::new(s.start as usize,self.pos)}},Tok::Ident(x)if x=="sh"=>{if self.byte(self.pos)==b'\''{let(rt,rs)=self.bump(Mode::Expr)?;match rt{Tok::Str(src)=>Expr::ShRaw{src,span:Span::new(s.start as usize,rs.end as usize)},_=>return Err(ParseError::new("expected sh payload after `sh'`",rs))}}else{let open=self.expect(Mode::Expr,Tok::LBrace,"`{` or `'''…'''`")?;let(src,end)=self.lx.raw_brace_block(open.start as usize)?;self.pos=end;Expr::ShRaw{src,span:Span::new(s.start as usize,end as usize)}}},Tok::Ident(name)=>{if matches!(self.peek(Mode::Expr)?.0,Tok::FatArrow){self.bump(Mode::Expr)?;let body=self.expr(0)?;let end=body.span().end;Expr::Lambda{params:vec![Param{name,ty:None,default:None,span:s}],body:Box::new(body),span:Span::new(s.start as usize,end as usize)}}else{if !self.repl&&matches!(name.as_str(),"it"|"out"){return Err(ParseError::new(format!("`{name}` is REPL-only"),s).hint("bind a variable to reuse a previous result"))}Expr::Var{name,span:s}}},Tok::LParen=>return self.paren_or_lambda(s.start as usize),Tok::LBracket=>{let mut items=vec![];self.skip_newlines()?;if self.eat(Mode::Expr,&Tok::RBracket)?.is_none(){loop{items.push(self.expr(0)?);self.skip_newlines()?;if self.eat(Mode::Expr,&Tok::Comma)?.is_none(){self.expect(Mode::Expr,Tok::RBracket,"`]`")?;break}self.skip_newlines()?;if self.eat(Mode::Expr,&Tok::RBracket)?.is_some(){break}}}Expr::List{items,span:Span::new(s.start as usize,self.pos)}},Tok::LBrace=>return self.record_or_block(s.start as usize),Tok::Pipe=>return Err(ParseError::new("shoal has no pipe operator",s).hint("data composes with `.`; raw byte plumbing is `.feed(cmd)`; verbatim POSIX lives in `sh { … }`")),_=>return Err(ParseError::new(format!("expected expression, found {t:?}"),s))})
     }
     fn postfix(&mut self, mut e: Expr) -> ParseResult<Expr> {
         loop {
             let (t, _) = self.peek(Mode::Expr)?;
             match t {
+                // Leading-`.` on the next line continues this postfix chain
+                // (§2.1). A `[`/`(` on the next line does *not* continue.
+                Tok::Newline => {
+                    if self.continue_if(|t| matches!(t, Tok::Dot | Tok::QuestionDot))? {
+                        continue;
+                    }
+                    break;
+                }
                 Tok::Dot | Tok::QuestionDot => {
                     let optional = matches!(self.bump(Mode::Expr)?.0, Tok::QuestionDot);
                     let (name, _) = self.ident()?;
                     if self.eat(Mode::Expr, &Tok::LParen)?.is_some() {
-                        let args = self.args_after_open()?;
+                        let mut args = self.args_after_open()?;
+                        // Trailing block after a method call (§3.4 `f(a){…}`).
+                        if matches!(self.peek(Mode::Expr)?.0, Tok::LBrace) {
+                            args.pos.push(self.trailing_block_lambda()?);
+                        }
+                        let span = Span::new(e.span().start as usize, self.pos);
+                        e = Expr::MethodCall {
+                            recv: Box::new(e),
+                            name,
+                            args,
+                            optional,
+                            span,
+                        }
+                    } else if !optional && matches!(self.peek(Mode::Expr)?.0, Tok::LBrace) {
+                        // `xs.each { … }` — method call with only a thunk arg.
+                        let mut args = Args::empty();
+                        args.pos.push(self.trailing_block_lambda()?);
                         let span = Span::new(e.span().start as usize, self.pos);
                         e = Expr::MethodCall {
                             recv: Box::new(e),
@@ -702,7 +951,11 @@ impl<'s> Parser<'s> {
                 }
                 Tok::LParen => {
                     self.bump(Mode::Expr)?;
-                    let args = self.args_after_open()?;
+                    let mut args = self.args_after_open()?;
+                    // Trailing block after a call (§3.4 `f(a){…}`).
+                    if matches!(self.peek(Mode::Expr)?.0, Tok::LBrace) {
+                        args.pos.push(self.trailing_block_lambda()?);
+                    }
                     let span = Span::new(e.span().start as usize, self.pos);
                     match e {
                         Expr::Var { name, .. } => e = Expr::FnCall { name, args, span },
@@ -719,8 +972,20 @@ impl<'s> Parser<'s> {
         }
         Ok(e)
     }
+    /// Parse a trailing `{ … }` block as a zero-argument lambda thunk
+    /// (`() => { … }`), per the §3.4 `f(a){…}` desugar.
+    fn trailing_block_lambda(&mut self) -> ParseResult<Expr> {
+        let block = self.block()?;
+        let span = block.span;
+        Ok(Expr::Lambda {
+            params: vec![],
+            body: Box::new(Expr::Block { block, span }),
+            span,
+        })
+    }
     fn args_after_open(&mut self) -> ParseResult<Args> {
         let mut a = Args::empty();
+        self.skip_newlines()?;
         if self.eat(Mode::Expr, &Tok::RParen)?.is_some() {
             return Ok(a);
         }
@@ -762,10 +1027,12 @@ impl<'s> Parser<'s> {
                     a.pos.push(self.expr(0)?)
                 }
             }
+            self.skip_newlines()?;
             if self.eat(Mode::Expr, &Tok::Comma)?.is_none() {
                 self.expect(Mode::Expr, Tok::RParen, "`)`")?;
                 break;
             }
+            self.skip_newlines()?;
             if self.eat(Mode::Expr, &Tok::RParen)?.is_some() {
                 break;
             }
@@ -780,6 +1047,8 @@ impl<'s> Parser<'s> {
                 Seg::Expr { start, end } => {
                     let mut parser = Parser::new(&self.lx.src[start as usize..end as usize]);
                     parser.scopes = self.scopes.clone();
+                    parser.cmd_scopes = self.cmd_scopes.clone();
+                    parser.repl = self.repl;
                     let mut e = parser.parse_program()?;
                     if e.stmts.len() != 1 {
                         return Err(ParseError::new(
@@ -849,7 +1118,11 @@ impl<'s> Parser<'s> {
             });
         }
         self.pos = save;
-        let expr = self.expr(0)?;
+        // Not a lambda: a parenthesised group. Apply the same two-mode dispatch
+        // as `statement()` so `(echo hi)` runs the command (substitution, D4).
+        self.skip_newlines()?;
+        let expr = self.expr_or_command(0)?;
+        self.skip_newlines()?;
         self.expect(Mode::Expr, Tok::RParen, "`)`")?;
         Ok(expr)
     }
@@ -883,6 +1156,11 @@ impl<'s> Parser<'s> {
         let mut arms = Vec::new();
         while !matches!(self.peek(Mode::Expr)?.0, Tok::RBrace | Tok::Eof) {
             let arm_start = self.peek(Mode::Expr)?.1.start as usize;
+            // A stray leading `|` gets the curated alternation teaching (D13).
+            if let (Tok::Pipe, ps) = self.peek(Mode::Expr)? {
+                return Err(ParseError::new("unexpected `|` at the start of a match arm", ps)
+                    .hint("alternation is `a | b => …`; drop the leading `|`"));
+            }
             let mut patterns = vec![self.match_pattern()?];
             while self.eat(Mode::Expr, &Tok::Pipe)?.is_some() {
                 patterns.push(self.match_pattern()?);
@@ -957,7 +1235,9 @@ impl<'s> Parser<'s> {
                     value: self.expr(0)?,
                     span: s,
                 }];
+                self.skip_newlines()?;
                 while self.eat(Mode::Expr, &Tok::Comma)?.is_some() {
+                    self.skip_newlines()?;
                     if self.eat(Mode::Expr, &Tok::RBrace)?.is_some() {
                         return Ok(Expr::Record {
                             fields,
@@ -973,7 +1253,8 @@ impl<'s> Parser<'s> {
                         name: n,
                         value: self.expr(0)?,
                         span: ns,
-                    })
+                    });
+                    self.skip_newlines()?;
                 }
                 self.expect(Mode::Expr, Tok::RBrace, "`}`")?;
                 return Ok(Expr::Record {
@@ -984,14 +1265,17 @@ impl<'s> Parser<'s> {
         }
         self.pos = save;
         self.scopes.push(HashSet::new());
+        self.cmd_scopes.push(HashSet::new());
         let mut stmts = vec![];
         self.term()?;
-        while !matches!(self.peek(Mode::Expr)?.0, Tok::RBrace | Tok::Eof) {
-            stmts.push(self.statement()?);
-            self.term()?
+        while !self.peek_is(|t| matches!(t, Tok::RBrace | Tok::Eof)) {
+            let stmt = self.statement()?;
+            self.require_term(&stmt)?;
+            stmts.push(stmt);
         }
         self.expect(Mode::Expr, Tok::RBrace, "`}`")?;
         self.scopes.pop();
+        self.cmd_scopes.pop();
         Ok(Expr::Block {
             block: Block {
                 stmts,
@@ -1003,6 +1287,10 @@ impl<'s> Parser<'s> {
     fn if_expr(&mut self, start: usize) -> ParseResult<Expr> {
         let cond = self.expr(0)?;
         let then = self.block()?;
+        // `else` may appear on the next line (§2.1 continuation).
+        if matches!(self.peek(Mode::Expr)?.0, Tok::Newline) {
+            self.continue_if(|t| matches!(t, Tok::Ident(x) if x == "else"))?;
+        }
         let els = if let (Tok::Ident(x), _) = self.peek(Mode::Expr)? {
             if x == "else" {
                 self.bump(Mode::Expr)?;

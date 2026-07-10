@@ -207,3 +207,52 @@ name = "lit-path-constructor-render"
 # path renders lossy, unquoted when it contains no spaces (CONTRACTS §3).
 src = 'path("a.txt")'
 value = "a.txt"
+
+[[case]]
+name = "lit-int-zero"
+src = "0"
+value = "0"
+
+[[case]]
+name = "lit-size-zero-bytes"
+# "0b" alone collides with the 0b<binary-digits> integer prefix (§2.1); use an
+# unambiguous zero-size literal and check the render is still the bytes unit.
+src = "0kb"
+value = "0b"
+
+[[case]]
+name = "lit-duration-negative"
+# unary `-` on a duration literal (EBNF: unary = ("!"|"-") unary).
+src = "-90s"
+value = "-1m30s"
+
+[[case]]
+name = "lit-time-single-digit-hour"
+# \d{1,2}:\d{2} — a single leading digit is legal; render always zero-pads (CONTRACTS §3).
+src = "0:00"
+value = "00:00"
+
+[[case]]
+name = "lit-glob-ctor-hidden-flag-still-renders-pattern"
+# TDD §4.3: glob("…", hidden: true, follow: false) is the explicit constructor;
+# render is always just the pattern regardless of hidden/follow (CONTRACTS §3).
+src = 'glob("*.rs", hidden: true)'
+value = "*.rs"
+
+[[case]]
+name = "lit-regex-render-escaped-dot"
+# regex is raw/verbatim inside the tag — the backslash is preserved as-is.
+src = 're"a\.b"'
+value = 're"a\.b"'
+
+[[case]]
+name = "lit-size-mib-frac-renders-decimal"
+# 4mib = 4*2^20 = 4194304 bytes = 4.194304mb -> two decimals -> 4.19mb.
+src = "4mib"
+value = "4.19mb"
+
+[[case]]
+name = "lit-size-gib-frac-renders-decimal"
+# 1gib = 2^30 = 1073741824 bytes = 1.073741824gb -> 1.07gb.
+src = "1gib"
+value = "1.07gb"

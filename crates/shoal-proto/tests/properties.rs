@@ -1,5 +1,6 @@
 use proptest::prelude::*;
-use shoal_proto::{JSONRPC, Request, WirePath, WireValue};
+use shoal_proto::{JSONRPC, Request, WirePath, WireSpan, WireValue};
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
@@ -15,12 +16,77 @@ fn leaf() -> impl Strategy<Value = WireValue> {
         any::<bool>().prop_map(|v| WireValue::Bool { v }),
         any::<i64>().prop_map(|v| WireValue::Int { v }),
         any::<u64>().prop_map(|v| WireValue::Size { v }),
-        any::<String>().prop_map(|v| WireValue::Str { v })
+        any::<String>().prop_map(|v| WireValue::Str { v }),
+        any::<String>().prop_map(|v| WireValue::DateTime { v }),
+        any::<String>().prop_map(|v| WireValue::Time { v }),
+        any::<String>().prop_map(|pattern| WireValue::Glob { pattern }),
+        any::<String>().prop_map(|src| WireValue::Regex { src }),
+        any::<String>().prop_map(|repr| WireValue::Closure { repr }),
+        any::<String>().prop_map(|label| WireValue::Stream { label }),
+        any::<String>().prop_map(|name| WireValue::Secret { name }),
+        any::<String>().prop_map(|repr| WireValue::Cmd { repr }),
+        (any::<i64>(), any::<i64>(), any::<bool>())
+            .prop_map(|(start, end, inclusive)| WireValue::Range { start, end, inclusive }),
+        (any::<u64>(), any::<bool>()).prop_map(|(id, done)| WireValue::Task { id, done }),
+        error_strategy(),
     ]
+}
+fn error_strategy() -> impl Strategy<Value = WireValue> {
+    (
+        any::<String>(),
+        any::<String>(),
+        proptest::option::of((any::<u32>(), any::<u32>())),
+        proptest::option::of(any::<String>()),
+        proptest::option::of(any::<String>()),
+    )
+        .prop_map(|(code, msg, span, hint, stderr)| WireValue::Error {
+            code,
+            msg,
+            span: span.map(|(start, end)| WireSpan { start, end }),
+            hint,
+            stderr,
+        })
 }
 fn wire_value() -> impl Strategy<Value = WireValue> {
     leaf().prop_recursive(3, 64, 8, |inner| {
-        prop::collection::vec(inner, 0..8).prop_map(|v| WireValue::List { v })
+        prop_oneof![
+            prop::collection::vec(inner.clone(), 0..8).prop_map(|v| WireValue::List { v }),
+            prop::collection::btree_map(prop::string::string_regex("[a-z]{1,6}").unwrap(), inner.clone(), 0..4)
+                .prop_map(|v| WireValue::Record { v }),
+            (
+                inner.clone(),
+                any::<Option<i32>>(),
+                any::<bool>(),
+                any::<Option<String>>(),
+                any::<String>(),
+                any::<i64>(),
+                any::<u32>(),
+                any::<String>(),
+            )
+                .prop_map(|(out, status, ok, signal, err, dur_ns, pid, cmd)| {
+                    WireValue::Outcome {
+                        status,
+                        ok,
+                        signal,
+                        out: Box::new(out),
+                        err,
+                        dur_ns,
+                        pid,
+                        cmd,
+                    }
+                }),
+            prop::collection::vec(
+                (prop::string::string_regex("[a-z]{1,6}").unwrap(), prop::collection::vec(inner.clone(), 0..3)),
+                0..3
+            )
+            .prop_map(|cols| {
+                let n = cols.first().map(|(_, v)| v.len()).unwrap_or(0);
+                WireValue::Table {
+                    cols: cols.into_iter().collect::<BTreeMap<_, _>>(),
+                    n,
+                }
+            }),
+        ]
     })
 }
 #[test]

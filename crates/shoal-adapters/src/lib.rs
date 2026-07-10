@@ -1,4 +1,29 @@
 //! Declarative command adapters and structured output parsers (TDD §6).
+//!
+//! ## The "consumed" rule (pinned-format subs)
+//!
+//! When a `[cmd.<x>.sub.<y>]` entry sets a fixed `invoke` argv template that
+//! pins the child process's *output format* (e.g. `git status`'s
+//! `--porcelain=v2`, `docker ps`'s `--format ...`), any declared `params`
+//! whose forwarded flag would itself change that output format must be
+//! listed in that sub's `consumed = [...]`.
+//!
+//! Argv is built as `invoke-template ++ user-supplied flags` (last flag
+//! wins for most CLIs' format switches), so a forwardable flag that also
+//! selects an output format silently overrides the pinned one downstream —
+//! the parser then reads bytes in the wrong shape and can bake corruption
+//! straight into a structured value (see `git status --porcelain=v2
+//! --short`: git's short format inserts an extra status character before
+//! the separating space, so the porcelain-v2 parser's fixed `line[2..]`
+//! path slice lands one byte too early and every path gets a leading
+//! space). `consumed` params stay declared (so the flag is still
+//! recognized/valid and short/long forms keep working for the user) but
+//! must never be pushed onto argv — the evaluator that builds argv from a
+//! `SubSpec` is expected to skip any param named in `consumed`. This is
+//! honest, not silently degrading UX, precisely because the pinned
+//! structured output already contains a superset of what the consumed
+//! flag would otherwise reveal (e.g. porcelain-v2 conveys everything
+//! `--short` shows, plus more).
 
 use shoal_value::{Record, Value, json_to_value};
 use std::collections::HashMap;
@@ -24,6 +49,9 @@ pub struct SubSpec {
     pub positional: Vec<String>,
     pub short_flags: HashMap<String, String>,
     pub invoke: Option<Vec<String>>,
+    /// Param names that must be recognized as valid flags but never
+    /// forwarded into argv. See the module-level "consumed" rule doc.
+    pub consumed: Vec<String>,
     pub parse: String,
     pub output_type: Option<String>,
     pub effects: Vec<String>,
@@ -180,6 +208,7 @@ fn parse_sub(t: &toml::Table) -> Result<SubSpec, String> {
         }
     }
     s.invoke = strings(t.get("invoke"));
+    s.consumed = strings(t.get("consumed")).unwrap_or_default();
     if let Some(out) = t.get("output").and_then(toml::Value::as_table) {
         s.parse = string(out.get("parse")).unwrap_or("none").into();
         if !matches!(
@@ -217,6 +246,11 @@ fn parse_sub(t: &toml::Table) -> Result<SubSpec, String> {
             return Err(format!(
                 "short flag targets undeclared parameter {target:?}"
             ));
+        }
+    }
+    for consumed in &s.consumed {
+        if !names.contains(consumed.as_str()) {
+            return Err(format!("consumed names undeclared parameter {consumed:?}"));
         }
     }
     Ok(s)
@@ -389,9 +423,22 @@ fn parse_z_records(bytes: &[u8], hint: Option<&str>) -> Option<Value> {
     if fields.is_empty() {
         return None;
     }
+    // No output at all (e.g. `git log -z` on a path with no history) is a
+    // valid, empty table, not a parse failure.
+    if bytes.is_empty() {
+        return Some(Value::Table(Vec::new()));
+    }
     let mut cells = bytes.split(|b| *b == 0).collect::<Vec<_>>();
-    if cells.last().is_some_and(|x| x.is_empty()) {
+    // A well-formed NUL-terminated stream ends with a separator, which
+    // splits into one trailing empty cell. Tolerate any number of stray
+    // trailing separators (and thus trailing empty cells) rather than
+    // only ever popping exactly one -- an extra trailing separator should
+    // not make otherwise well-formed records degrade to unparsed bytes.
+    while cells.last().is_some_and(|x| x.is_empty()) {
         cells.pop();
+    }
+    if cells.is_empty() {
+        return Some(Value::Table(Vec::new()));
     }
     if cells.len() % fields.len() != 0 {
         return None;
@@ -410,28 +457,68 @@ fn parse_z_records(bytes: &[u8], hint: Option<&str>) -> Option<Value> {
     Some(Value::Table(rows))
 }
 
+/// Parses `git status --porcelain=v2` records (see git-status(1)):
+///
+///   `? <path>`                                                     untracked
+///   `! <path>`                                                     ignored
+///   `1 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <path>`                  ordinary (9 fields)
+///   `2 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <X><score> <path>\t<orig>` renamed/copied (10 fields)
+///
+/// Every shape is validated exactly, not assumed: a line that merely starts
+/// with the right marker byte but doesn't match the rest of the shape
+/// (including the *real* bug this guards against — short-format `"?? path"`
+/// lines, which put a second marker character where porcelain v2 puts a
+/// space, silently shifting the path slice by one byte) degrades the whole
+/// parse to `None` instead of emitting a `path` with corrupted bytes baked
+/// in. Unmerged (`u`) records and any other unrecognized non-comment line
+/// degrade the same way, since this adapter does not model their shape and
+/// silently dropping them would misrepresent the status as complete. Per
+/// TDD §6: "mismatch degrades to bytes + warning rather than lying."
 fn parse_porcelain_v2(bytes: &[u8]) -> Option<Value> {
     let mut rows = Vec::new();
     for line in text(bytes)?.lines() {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
+        let raw = line.as_bytes();
         let mut r = Record::new();
-        match line.as_bytes()[0] {
+        match raw[0] {
             b'?' | b'!' => {
+                // Must be exactly `<marker><space><path>`. A short-format
+                // line has a second marker byte at index 1 instead of a
+                // space, which is exactly how a leading space used to get
+                // baked into the path -- refuse to slice unless the
+                // separator is genuinely there.
+                if raw.get(1) != Some(&b' ') || line.len() < 3 {
+                    return None;
+                }
                 r.insert("status".into(), Value::Str(line[..1].into()));
                 r.insert("path".into(), Value::Path(line[2..].into()));
             }
-            b'1' | b'2' => {
-                let parts: Vec<&str> = line.splitn(10, ' ').collect();
-                if parts.len() < 9 {
+            b'1' => {
+                let parts: Vec<&str> = line.splitn(9, ' ').collect();
+                if parts.len() != 9 {
                     return None;
                 }
                 r.insert("status".into(), Value::Str(parts[1].into()));
-                let path = parts.last()?;
-                r.insert("path".into(), Value::Path((*path).into()));
+                r.insert("path".into(), Value::Path(parts[8].into()));
             }
-            _ => continue,
+            b'2' => {
+                let parts: Vec<&str> = line.splitn(10, ' ').collect();
+                if parts.len() != 10 {
+                    return None;
+                }
+                r.insert("status".into(), Value::Str(parts[1].into()));
+                let (path, orig) = match parts[9].split_once('\t') {
+                    Some((p, o)) => (p, Some(o)),
+                    None => (parts[9], None),
+                };
+                r.insert("path".into(), Value::Path(path.into()));
+                if let Some(orig) = orig {
+                    r.insert("orig".into(), Value::Path(orig.into()));
+                }
+            }
+            _ => return None,
         }
         rows.push(r);
     }
@@ -536,6 +623,104 @@ output={parse="porcelain-v2", type="table<{status: str, path: path}>"}
         assert!(parse_output("z-records", b"a\0", None).is_none());
     }
 
+    // Regression for Real bug #1: `git status --porcelain=v2 --short` used
+    // to have its `?`/`!` lines parsed as if they were still porcelain v2,
+    // baking a leading space into `path` (short format has a second marker
+    // byte where porcelain v2 has a separating space). The parser must now
+    // refuse to slice a shape it hasn't validated and degrade instead.
+    #[test]
+    fn porcelain_v2_short_format_corruption_degrades_instead_of_lying() {
+        // `git status --porcelain=v2 --short` for an untracked file emits
+        // short-format `"?? scratch/"`, not true porcelain v2's `"? scratch/"`.
+        let short_format_bytes = b"?? scratch/\n";
+        let out = parse_output("porcelain-v2", short_format_bytes, None);
+        assert_eq!(out, None, "must degrade, not bake a corrupted path");
+
+        // Sanity: genuine porcelain v2 for the same file still parses cleanly
+        // with no leading-space corruption.
+        let real_porcelain_bytes = b"? scratch/\n";
+        let out = parse_output("porcelain-v2", real_porcelain_bytes, None).unwrap();
+        assert!(matches!(&out, Value::Table(t) if t.len() == 1));
+        if let Value::Table(t) = out {
+            assert_eq!(t[0]["path"], Value::Path("scratch/".into()));
+        }
+    }
+
+    #[test]
+    fn porcelain_v2_rejects_malformed_and_unknown_records() {
+        // '?'/'!' line with no separating space at all.
+        assert_eq!(parse_output("porcelain-v2", b"?nofile\n", None), None);
+        // '1' ordinary-change line missing fields.
+        assert_eq!(
+            parse_output("porcelain-v2", b"1 .M N... 100644 100644 a b\n", None),
+            None
+        );
+        // A path containing spaces is legitimate (git allows unquoted
+        // filenames with embedded spaces in porcelain v2) and must parse
+        // cleanly rather than being mistaken for a shape violation -- the
+        // metadata fields are bounded and the final field absorbs the rest.
+        assert_eq!(
+            parse_output(
+                "porcelain-v2",
+                b"1 .M N... 100644 100644 100644 a b my file.txt\n",
+                None
+            )
+            .map(|v| matches!(v, Value::Table(t) if t[0]["path"] == Value::Path("my file.txt".into()))),
+            Some(true)
+        );
+        // Unmerged 'u' records and other unrecognized markers are not
+        // modeled by this adapter and must not be silently dropped from an
+        // otherwise "successful" table.
+        assert_eq!(
+            parse_output(
+                "porcelain-v2",
+                b"u UU N... 100644 100644 100644 100644 aaa bbb ccc conflict.rs\n",
+                None
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn porcelain_v2_renamed_entry_populates_orig() {
+        let bytes =
+            b"2 R100 N... 100644 100644 100644 aaaa1111 bbbb2222 R100 new_name.rs\told_name.rs\n";
+        let v = parse_output("porcelain-v2", bytes, None).unwrap();
+        let Value::Table(rows) = v else {
+            panic!("expected table")
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["status"], Value::Str("R100".into()));
+        assert_eq!(rows[0]["path"], Value::Path("new_name.rs".into()));
+        assert_eq!(rows[0]["orig"], Value::Path("old_name.rs".into()));
+    }
+
+    #[test]
+    fn z_records_empty_output_is_empty_table() {
+        let h = "table<{hash: str, author: str, path: path}>";
+        assert_eq!(
+            parse_output("z-records", b"", Some(h)),
+            Some(Value::Table(vec![]))
+        );
+    }
+
+    #[test]
+    fn z_records_tolerates_trailing_separators() {
+        let h = "table<{hash: str, author: str, path: path}>";
+        // A single trailing NUL (the normal `-z`-terminated shape).
+        let single = parse_output("z-records", b"abc\0Allie\0a.rs\0", Some(h)).unwrap();
+        assert!(matches!(&single, Value::Table(t) if t.len() == 1));
+        // A stray extra trailing NUL must not make an otherwise well-formed
+        // stream degrade to unparsed bytes.
+        let double = parse_output("z-records", b"abc\0Allie\0a.rs\0\0", Some(h)).unwrap();
+        assert!(matches!(&double, Value::Table(t) if t.len() == 1));
+        // Pure separator noise with no records at all is an empty table.
+        assert_eq!(
+            parse_output("z-records", b"\0\0", Some(h)),
+            Some(Value::Table(vec![]))
+        );
+    }
+
     #[test]
     fn bundled_adapter_pack_loads_without_warnings() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../adapters");
@@ -560,6 +745,29 @@ output={parse="porcelain-v2", type="table<{status: str, path: path}>"}
             catalog.lookup("docker").unwrap().class,
             AdapterClass::Daemon
         );
+        // The porcelain-corruption fix: `short`/`branch` stay valid,
+        // declared flags but must never reach git's argv alongside the
+        // pinned `--porcelain=v2` invoke template.
+        let git_status = &catalog.lookup("git").unwrap().subs["status"];
+        assert!(git_status.params.iter().any(|p| p.name == "short"));
+        assert!(git_status.short_flags.contains_key("s"));
+        assert_eq!(
+            git_status.consumed,
+            vec!["short".to_string(), "branch".to_string()]
+        );
+        // Same class of fix, swept into docker's format-pinned subs.
+        let docker = catalog.lookup("docker").unwrap();
+        assert_eq!(docker.subs["ps"].consumed, vec!["quiet".to_string()]);
+        assert_eq!(docker.subs["images"].consumed, vec!["quiet".to_string()]);
+        // kubectl's `get` and rg's top-level command pin an output format
+        // too, but declare no forwardable param that could override it, so
+        // there is nothing to consume there.
+        assert!(
+            catalog.lookup("kubectl").unwrap().subs["get"]
+                .consumed
+                .is_empty()
+        );
+        assert!(catalog.lookup("rg").unwrap().top.consumed.is_empty());
     }
 
     #[test]
@@ -586,5 +794,26 @@ positional=["missing"]
         assert!(catalog.lookup("bad_parser").is_none());
         assert!(catalog.lookup("bad_binding").is_none());
         assert_eq!(warnings.len(), 3);
+    }
+
+    #[test]
+    fn consumed_targeting_undeclared_param_warns_without_poisoning_siblings() {
+        let d = tempfile::tempdir().unwrap();
+        fs::write(
+            d.path().join("pack.toml"),
+            r#"
+[cmd.good]
+params={path="path"}
+[cmd.bad_consumed]
+params={x="str"}
+consumed=["missing"]
+"#,
+        )
+        .unwrap();
+        let (catalog, warnings) = AdapterCatalog::load_dir(d.path());
+        assert!(catalog.lookup("good").is_some());
+        assert!(catalog.lookup("bad_consumed").is_none());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("consumed"), "{warnings:?}");
     }
 }

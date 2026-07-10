@@ -92,8 +92,10 @@ src="'a\\nb'"
 value='"a\\nb"'
 [[case]]
 name="string-escape"
-src='"a\\nb"'
-value='"a\\nb"'
+# One backslash-n escape in an interpolating string is a real newline char;
+# render_inline re-escapes it back to the two-character `\n` form (CONTRACTS §3).
+src='"a\nb"'
+value='"a\nb"'
 [[case]]
 name="string-interp"
 src='"answer {6 * 7}"'
@@ -234,3 +236,32 @@ name="fixture-path"
 src="let p = path(\"nested/a.txt\")\np.display()"
 value='"nested/a.txt"'
 fixture=["nested/a.txt"]
+
+[[case]]
+name="for-range-sum"
+src="var s = 0\nfor i in 1..4 { s += i }\ns"
+value="6"
+[[case]]
+name="while-basic"
+src="var i = 0\nwhile i < 5 { i += 1 }\ni"
+value="5"
+[[case]]
+name="catch-unbound-fallback"
+src="1/0 catch \"fallback\""
+value='"fallback"'
+[[case]]
+name="try-catch-block-basic"
+src="try { 1/0 } catch e { \"handled\" }"
+value='"handled"'
+[[case]]
+name="string-concat"
+src='"a" + "b"'
+value='"ab"'
+[[case]]
+name="list-concat"
+src="[1, 2] + [3]"
+value="[1, 2, 3]"
+[[case]]
+name="record-nested-list-field"
+src='{name: "shoal", tags: [1, 2]}'
+value='{name: "shoal", tags: [1, 2]}'

@@ -15,6 +15,21 @@ pub(super) fn is_builtin(name: &str) -> bool {
     NAMES.contains(&name)
 }
 
+/// A builtin signature (defect #12): scalar param types by index, plus an
+/// optional variadic type applied to any remaining positional words. `None`
+/// leaves words verbatim (→ str). The same word→type coercion machinery user
+/// fns use (see `coerce_word`) is applied here so `sleep 1` and `sleep 10ms`
+/// both bind.
+fn builtin_variadic_ty(name: &str) -> Option<&'static str> {
+    match name {
+        "ls" | "cat" | "mkdir" | "touch" | "cp" | "mv" | "rm" | "stat" => Some("path"),
+        "sleep" => Some("duration"),
+        "which" | "env" => Some("str"),
+        // `echo` takes any values verbatim (rendered on display).
+        _ => None,
+    }
+}
+
 pub(super) fn run(ev: &mut Evaluator, call: &CmdCall) -> VResult<Value> {
     let mut args = Vec::new();
     let mut flags = Vec::new();
@@ -25,6 +40,13 @@ pub(super) fn run(ev: &mut Evaluator, call: &CmdCall) -> VResult<Value> {
             CmdArg::DashDash { .. } => {}
             _ => args.extend(ev.expand_arg(arg)?),
         }
+    }
+    if let Some(ty) = builtin_variadic_ty(&call.head) {
+        args = args
+            .into_iter()
+            .map(|v| super::coerce_word(v, ty))
+            .collect::<VResult<Vec<_>>>()
+            .map_err(|e| e.or_span(call.span))?;
     }
     dispatch(&call.head, &ev.cwd, &ev.process_env, args, &flags).map_err(|e| e.or_span(call.span))
 }
@@ -37,11 +59,10 @@ fn dispatch(
     flags: &[String],
 ) -> VResult<Value> {
     match name {
+        // echo renders every value (lists/records/tables/null included), strings
+        // unquoted at top level (pty §8).
         "echo" => Ok(Value::Str(
-            args.iter()
-                .map(display)
-                .collect::<VResult<Vec<_>>>()?
-                .join(" "),
+            args.iter().map(echo_display).collect::<Vec<_>>().join(" "),
         )),
         "ls" => ls(cwd, args, has(flags, &["a", "all"])),
         "cat" => cat(cwd, args),
@@ -68,6 +89,16 @@ fn dispatch(
 
 fn has(flags: &[String], names: &[&str]) -> bool {
     flags.iter().any(|f| names.contains(&f.as_str()))
+}
+/// Top-level display for `echo`: scalars/paths unquoted, everything else via
+/// `render_inline` (pty §8 — lists/records/tables all printable).
+fn echo_display(v: &Value) -> String {
+    match v {
+        Value::Str(s) => s.clone(),
+        Value::Path(p) => p.to_string_lossy().into_owned(),
+        Value::Null => String::new(),
+        other => shoal_value::render::render_inline(other),
+    }
 }
 fn display(v: &Value) -> VResult<String> {
     match v {
@@ -128,11 +159,13 @@ fn metadata_record(p: PathBuf) -> VResult<Record> {
         ),
     );
     r.insert("size".into(), Value::Size(m.len()));
+    // `modified` is a real DateTime (defect #4), built from the UNIX epoch.
     let modified = m
         .modified()
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| Value::Int(d.as_nanos().min(i64::MAX as u128) as i64))
+        .and_then(|d| jiff::Timestamp::from_nanosecond(d.as_nanos() as i128).ok())
+        .map(|ts| Value::DateTime(Box::new(ts.to_zoned(jiff::tz::TimeZone::system()))))
         .unwrap_or(Value::Null);
     r.insert("modified".into(), modified);
     Ok(r)

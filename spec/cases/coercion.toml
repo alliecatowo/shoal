@@ -1,0 +1,255 @@
+# The complete coercion matrix of TDD §4.2 / CONTRACTS §3 (shoal-value's
+# ops.rs is the authoritative reference for the arithmetic-promotion site;
+# it is explicitly documented as the complete matrix and is stable/pinned,
+# unlike shoal-eval/shoal-syntax which are mid-repair in this cycle).
+# Site 1: arithmetic promotion (allow + error cells).
+# Site 2: word binding (CMD-mode word -> declared param type at call-bind).
+
+# --- site 1: int/float mixed arithmetic (both orders, all four ops) ---
+[[case]]
+name = "coerce-float-plus-int"
+src = "0.5 + 2"
+value = "2.5"
+[[case]]
+name = "coerce-int-minus-float"
+src = "9 - 0.5"
+value = "8.5"
+[[case]]
+name = "coerce-float-minus-int"
+src = "0.5 - 9"
+value = "-8.5"
+[[case]]
+name = "coerce-int-times-float"
+src = "3 * 0.5"
+value = "1.5"
+[[case]]
+name = "coerce-float-times-int"
+src = "0.5 * 3"
+value = "1.5"
+[[case]]
+name = "coerce-int-div-float"
+src = "5 / 2.0"
+value = "2.5"
+[[case]]
+name = "coerce-float-div-int"
+src = "2.0 / 5"
+value = "0.4"
+[[case]]
+name = "coerce-int-rem-float"
+src = "5 % 2.0"
+value = "1"
+[[case]]
+name = "coerce-float-rem-int"
+src = "5.5 % 2"
+value = "1.5"
+
+# --- site 1: size ---
+[[case]]
+name = "coerce-size-minus-size"
+src = "2kb - 500b"
+value = "1.5kb"
+[[case]]
+name = "coerce-size-minus-size-negative-is-error"
+src = "1kb - 2kb"
+error = "type_error"
+error_contains = "negative"
+[[case]]
+name = "coerce-size-div-size-fraction"
+src = "10kb / 4kb"
+value = "2.5"
+[[case]]
+name = "coerce-size-times-int-alt"
+src = "3kb * 4"
+value = "12kb"
+[[case]]
+name = "coerce-int-times-size"
+src = "4 * 3kb"
+value = "12kb"
+[[case]]
+name = "coerce-size-div-int-exact"
+src = "10kb / 4"
+value = "2.5kb"
+[[case]]
+name = "coerce-size-div-int-truncates"
+src = "10kb / 3"
+value = "3.33kb"
+[[case]]
+name = "coerce-size-times-float"
+src = "2kb * 1.5"
+value = "3kb"
+[[case]]
+name = "coerce-float-times-size"
+src = "1.5 * 2kb"
+value = "3kb"
+[[case]]
+name = "coerce-size-times-negative-int-is-error"
+src = "10kb * -1"
+error = "type_error"
+error_contains = "negative"
+[[case]]
+name = "coerce-size-div-negative-int-is-error"
+src = "10kb / -1"
+error = "type_error"
+error_contains = "negative"
+[[case]]
+name = "coerce-size-div-int-zero"
+src = "10kb / 0"
+error = "div_zero"
+[[case]]
+name = "coerce-size-div-size-zero"
+src = "10kb / 0b"
+error = "div_zero"
+[[case]]
+name = "coerce-size-div-float-is-error"
+src = "10kb / 2.0"
+error = "type_error"
+[[case]]
+name = "coerce-size-plus-int-is-error"
+src = "1b + 1"
+error = "type_error"
+[[case]]
+name = "coerce-int-plus-size-is-error"
+src = "1 + 1b"
+error = "type_error"
+[[case]]
+name = "coerce-size-plus-duration-is-error"
+src = "1b + 1s"
+error = "type_error"
+
+# --- site 1: duration ---
+[[case]]
+name = "coerce-duration-minus-duration"
+src = "2h - 30m"
+value = "1h30m"
+[[case]]
+name = "coerce-duration-div-duration-whole"
+src = "90s / 30s"
+value = "3"
+[[case]]
+name = "coerce-duration-div-duration-fraction"
+src = "90s / 60s"
+value = "1.5"
+[[case]]
+name = "coerce-duration-times-int"
+src = "30m * 2"
+value = "1h"
+[[case]]
+name = "coerce-int-times-duration"
+src = "2 * 30m"
+value = "1h"
+[[case]]
+name = "coerce-duration-div-int"
+src = "90s / 3"
+value = "30s"
+[[case]]
+name = "coerce-duration-times-float"
+src = "30s * 1.5"
+value = "45s"
+[[case]]
+name = "coerce-float-times-duration"
+src = "1.5 * 30s"
+value = "45s"
+[[case]]
+name = "coerce-duration-div-int-zero"
+src = "30s / 0"
+error = "div_zero"
+[[case]]
+name = "coerce-duration-div-duration-zero"
+src = "30s / 0s"
+error = "div_zero"
+[[case]]
+name = "coerce-duration-plus-int-is-error"
+src = "1s + 1"
+error = "type_error"
+[[case]]
+name = "coerce-duration-minus-datetime-is-error"
+# (Duration, DateTime) only supports Add; the reverse Sub direction is undefined.
+src = "let d = 1s\nd - t\"2026-07-09T14:00Z\""
+error = "type_error"
+
+# --- site 1: datetime ---
+[[case]]
+name = "coerce-duration-plus-datetime-commutative"
+src = "let dt = 1h + t\"2026-07-09T14:00Z\"\ndt"
+value = "2026-07-09T15:00:00Z"
+[[case]]
+name = "coerce-datetime-minus-duration"
+src = 't"2026-07-09T14:00Z" - 1h'
+value = "2026-07-09T13:00:00Z"
+[[case]]
+name = "coerce-datetime-minus-datetime-partial-hour"
+src = 't"2026-07-09T14:00Z" - t"2026-07-09T12:30Z"'
+value = "1h30m"
+[[case]]
+name = "coerce-datetime-plus-datetime-is-error"
+src = 't"2026-07-09T14:00Z" + t"2026-07-09T15:00Z"'
+error = "type_error"
+[[case]]
+name = "coerce-datetime-times-int-is-error"
+src = 't"2026-07-09T14:00Z" * 2'
+error = "type_error"
+
+# --- site 1: non-coercive overloads and other-type errors ---
+[[case]]
+name = "coerce-list-plus-int-is-error"
+src = "[1, 2] + 1"
+error = "type_error"
+[[case]]
+name = "coerce-bool-plus-bool-is-error"
+src = "true + false"
+error = "type_error"
+
+# --- site 2: word binding (CMD-mode words coerced at call-bind, TDD §4.2.2) ---
+[[case]]
+name = "word-bind-int-positional"
+src = "fn addn(a: int, b: int) { a + b }\naddn 2 3"
+value = "5"
+[[case]]
+name = "word-bind-int-parse-failure-is-arg-error"
+src = "fn addn(a: int, b: int) { a + b }\naddn 2 notanumber"
+error = "arg_error"
+[[case]]
+name = "word-bind-float"
+src = "fn showfloat(f: float) { f }\nshowfloat 3.5"
+value = "3.5"
+[[case]]
+name = "word-bind-size"
+src = "fn showsize(s: size) { s }\nshowsize 4kb"
+value = "4kb"
+[[case]]
+name = "word-bind-duration"
+src = "fn waitfor(d: duration) { d }\nwaitfor 250ms"
+value = "250ms"
+[[case]]
+name = "word-bind-path"
+src = "fn showpath(p: path) { p.display() }\nshowpath a.txt"
+value = '"a.txt"'
+[[case]]
+name = "word-bind-glob-not-expanded"
+# a `glob`-typed param receives the compiled pattern, unexpanded (TDD §4.3).
+src = "fn showglob(g: glob) { g }\nshowglob *.txt"
+value = "*.txt"
+[[case]]
+name = "word-bind-bool-flag-presence"
+src = "fn showbool(b: bool = false) { b }\nshowbool --b"
+value = "true"
+[[case]]
+name = "word-bind-bool-default-false-absent"
+src = "fn showbool(b: bool = false) { b }\nshowbool"
+value = "false"
+[[case]]
+name = "word-bind-list-int-variadic-accumulates"
+src = "fn sumall(...nums: list<int>) { nums.sum() }\nsumall 1 2 3"
+value = "6"
+[[case]]
+name = "word-bind-datetime"
+src = "fn showdt(d: datetime) { d }\nshowdt 2026-07-09T14:00Z"
+value = "2026-07-09T14:00:00Z"
+[[case]]
+name = "word-bind-time"
+src = "fn showtime(t: time) { t }\nshowtime 10:00am"
+value = "10:00"
+[[case]]
+name = "word-bind-str-identity"
+src = "fn showstr(s: str) { s }\nshowstr hello"
+value = '"hello"'

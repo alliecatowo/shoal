@@ -104,6 +104,10 @@ fn dispatch(ctx: &mut dyn CallCtx, recv: Value, name: &str, args: CallArgs) -> V
         "ceil" => float_unary(recv, f64::ceil),
         "save" => save(ctx, recv, arg(&args, 0)?, false),
         "append" => save(ctx, recv, arg(&args, 0)?, true),
+        // Task lifecycle methods (defect #14).
+        "await" | "wait" => no_args(&args).and_then(|_| task_await(recv)),
+        "cancel" => no_args(&args).and_then(|_| task_cancel(recv)),
+        "is_done" => no_args(&args).and_then(|_| task_is_done(recv)),
         _ => Err(ErrorVal::new(
             "field_missing",
             format!("unknown method `.{name}` on {}", recv.type_name()),
@@ -557,6 +561,36 @@ fn float_unary(v: Value, f: fn(f64) -> f64) -> VResult<Value> {
         ))),
     }
 }
+fn task_await(recv: Value) -> VResult<Value> {
+    match recv {
+        Value::Task(t) => t.wait(),
+        v => Err(ErrorVal::type_error(format!(
+            ".await expects a task, found {}",
+            v.type_name()
+        ))),
+    }
+}
+fn task_cancel(recv: Value) -> VResult<Value> {
+    match recv {
+        Value::Task(t) => {
+            t.cancel();
+            Ok(Value::Null)
+        }
+        v => Err(ErrorVal::type_error(format!(
+            ".cancel expects a task, found {}",
+            v.type_name()
+        ))),
+    }
+}
+fn task_is_done(recv: Value) -> VResult<Value> {
+    match recv {
+        Value::Task(t) => Ok(Value::Bool(t.is_done())),
+        v => Err(ErrorVal::type_error(format!(
+            ".is_done expects a task, found {}",
+            v.type_name()
+        ))),
+    }
+}
 fn save(ctx: &mut dyn CallCtx, v: Value, path: &Value, append: bool) -> VResult<Value> {
     let p = match path {
         Value::Path(p) => p.clone(),
@@ -707,6 +741,29 @@ mod tests {
             Value::List(vec![Value::Int(1), Value::Int(2)])
         );
     }
+    #[test]
+    fn task_lifecycle_methods() {
+        let t = crate::TaskVal::new("t");
+        t.finish(Ok(Value::Int(42)));
+        assert_eq!(
+            call(Value::Task(t.clone()), "is_done", vec![]).unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            call(Value::Task(t.clone()), "await", vec![]).unwrap(),
+            Value::Int(42)
+        );
+        assert_eq!(
+            call(Value::Task(t), "cancel", vec![]).unwrap(),
+            Value::Null
+        );
+        // Wrong receiver type is a type error.
+        assert_eq!(
+            call(Value::Int(1), "await", vec![]).unwrap_err().code,
+            "type_error"
+        );
+    }
+
     #[test]
     fn save_and_append() {
         let d = std::env::temp_dir().join(format!("shoal-methods-{}", std::process::id()));

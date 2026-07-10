@@ -16,6 +16,8 @@ shoal-adapters = { path = "../shoal-adapters" }
 shoal-doctor = { path = "../shoal-doctor" }
 serde_json = "1"
 nu-ansi-term = "0.50.3"
+toml = "1"
+signal-hook = "0.3"
 
 [dev-dependencies]
 serde = "1.0.228"

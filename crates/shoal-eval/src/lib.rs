@@ -9,15 +9,19 @@ use shoal_leash::{Effect, Estimates, Plan, Reversibility};
 use shoal_value::{
     CallArgs, CallCtx, ClosureVal, Env, ErrorVal, OutcomeVal, Record, VResult, Value,
 };
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Position {
     Statement,
     Value,
 }
+
+/// Host renderer for statement-position outcomes (defect #1).
+pub type StatementSink = Box<dyn FnMut(&Value) + Send>;
 
 pub struct Evaluator {
     pub env: Env,
@@ -27,6 +31,14 @@ pub struct Evaluator {
     pub it: Value,
     cancel: CancelToken,
     adapters: AdapterCatalog,
+    /// Host renderer for statement-position outcomes (TDD §4.5, defect #1).
+    sink: Option<StatementSink>,
+    /// Runtime call-stack depth guard (defect #9).
+    call_depth: usize,
+    /// Nesting depth inside `fn` bodies — gates `cd`/env writes (defect #10).
+    in_fn_body: usize,
+    /// Live task registry backing the `jobs` builtin (defect #14).
+    jobs: Vec<shoal_value::TaskVal>,
 }
 
 enum Flow {
@@ -54,7 +66,68 @@ impl Evaluator {
             it: Value::Null,
             cancel: CancelToken::new(),
             adapters: AdapterCatalog::empty(),
+            sink: None,
+            call_depth: 0,
+            in_fn_body: 0,
+            jobs: Vec::new(),
         }
+    }
+
+    /// Install the host's statement renderer (defect #1). Every statement-position
+    /// command outcome (and every non-final top-level value) is routed here.
+    /// When unset, a built-in default prints to real stdout so scripts behave
+    /// without host wiring.
+    pub fn set_statement_sink(&mut self, f: StatementSink) {
+        self.sink = Some(f);
+    }
+
+    /// Bind `it` and append to the session `out` transcript list (REPL hook).
+    /// `Var("it")` / `Var("out")` then resolve from the environment normally.
+    pub fn record_transcript(&mut self, v: &Value) {
+        self.env.declare("it", v.clone(), true);
+        let mut out = match self.env.get("out") {
+            Some(Value::List(xs)) => xs,
+            _ => Vec::new(),
+        };
+        out.push(v.clone());
+        self.env.declare("out", Value::List(out), true);
+    }
+
+    /// Route a value to the statement sink (or the default stdout renderer).
+    fn emit(&mut self, v: &Value) {
+        if let Some(sink) = self.sink.as_mut() {
+            sink(v);
+        } else {
+            default_render(v);
+        }
+    }
+
+    /// Route a statement value to the sink, skipping nulls and skipping
+    /// interactive external outcomes (already streamed via PtyTee, defect #1).
+    fn sink_value(&mut self, v: &Value) {
+        if *v == Value::Null {
+            return;
+        }
+        if self.interactive && matches!(v, Value::Outcome(_)) {
+            return;
+        }
+        self.emit(v);
+    }
+
+    /// The task table backing the `jobs` builtin (defect #14).
+    fn jobs_table(&self) -> Value {
+        let rows = self
+            .jobs
+            .iter()
+            .map(|t| {
+                let mut r = Record::new();
+                r.insert("id".into(), Value::Int(t.id as i64));
+                r.insert("desc".into(), Value::Str(t.shared.desc.clone()));
+                r.insert("done".into(), Value::Bool(t.is_done()));
+                r
+            })
+            .collect();
+        Value::Table(rows)
     }
 
     pub fn cwd(&self) -> &Path {
@@ -115,11 +188,19 @@ impl Evaluator {
 
     pub fn eval_program(&mut self, program: &Program) -> VResult<Value> {
         let mut last = Value::Null;
-        for stmt in &program.stmts {
+        let n = program.stmts.len();
+        for (i, stmt) in program.stmts.iter().enumerate() {
+            let is_last = i + 1 == n;
             match self.eval_stmt(stmt, true)? {
                 Flow::Value(v) => {
-                    last = v.clone();
-                    self.it = v;
+                    self.it = v.clone();
+                    if is_last {
+                        last = v;
+                    } else {
+                        // Non-final statement values pass through to the sink
+                        // (defect #1a); the final value is returned to the host.
+                        self.sink_value(&v);
+                    }
                 }
                 Flow::Return(_) => {
                     return Err(
@@ -176,6 +257,30 @@ impl Evaluator {
                 span,
             } => {
                 let rhs = self.eval_expr(value, Position::Value)?;
+                // `env.NAME = v` — session environment write (defect #11, §4.6).
+                if let Expr::Field { recv, name, .. } = target
+                    && matches!(&**recv, Expr::Var { name, .. } if name == "env")
+                {
+                    if *op != AssignOp::Set {
+                        return Err(ErrorVal::new(
+                            "type_error",
+                            "compound assignment is not allowed on env.NAME",
+                        )
+                        .with_span(*span));
+                    }
+                    if self.in_fn_body > 0 {
+                        return Err(ErrorVal::new(
+                            "custom",
+                            "env writes are only allowed at session top level; use `with env:` inside a fn body",
+                        )
+                        .with_span(*span));
+                    }
+                    let val = self.argv_value(rhs.clone()).map_err(|e| e.or_span(*span))?;
+                    self.process_env
+                        .retain(|(k, _)| k != &OsString::from(name.clone()));
+                    self.process_env.push((OsString::from(name.clone()), val));
+                    return Ok(Flow::Value(rhs));
+                }
                 let Expr::Var { name, .. } = target else {
                     return Err(ErrorVal::new(
                         "type_error",
@@ -266,6 +371,18 @@ impl Evaluator {
         self.env = old.child();
         let mut last = Flow::Value(Value::Null);
         for stmt in &block.stmts {
+            // Inside executed blocks/loop bodies only *bare command* statements
+            // route their outcome to the sink; other intermediate expression
+            // values stay silent and the trailing expr is the block value that
+            // is never sunk here (defect #1b).
+            if let Stmt::Expr { expr, .. } = stmt
+                && is_command_expr(expr)
+            {
+                let v = self.eval_expr(expr, Position::Statement)?;
+                self.sink_value(&v);
+                last = Flow::Value(v);
+                continue;
+            }
             last = self.eval_stmt(stmt, false)?;
             if !matches!(last, Flow::Value(_)) {
                 break;
@@ -294,9 +411,30 @@ impl Evaluator {
                 Ok(Value::Regex(Arc::new(shoal_value::RegexVal::compile(src)?)))
             }
             Expr::DateTime { iso, .. } => parse_datetime(iso).map(|z| Value::DateTime(Box::new(z))),
-            Expr::Var { name, .. } => self.env.get(name).ok_or_else(|| {
-                ErrorVal::new("undefined_var", format!("undefined variable `{name}`"))
-            }),
+            Expr::Var { name, span } => {
+                // A name that isn't a variable but *is* a command resolves by
+                // invoking it zero-arg in value position (defect #5, §3.4).
+                if let Some(v) = self.env.get(name) {
+                    Ok(v)
+                } else if self.is_command_name(name) {
+                    let call = CmdCall {
+                        head: name.clone(),
+                        forced: false,
+                        args: vec![],
+                        redirects: vec![],
+                        env_prefix: vec![],
+                        background: false,
+                        trailing: None,
+                        span: *span,
+                    };
+                    self.eval_command(&call, Position::Value)
+                } else {
+                    Err(ErrorVal::new(
+                        "undefined_var",
+                        format!("undefined variable `{name}`"),
+                    ))
+                }
+            }
             Expr::StrInterp { parts, .. } => {
                 let mut out = String::new();
                 for p in parts {
@@ -477,20 +615,77 @@ impl Evaluator {
                 let v = self.eval_expr(recv, Position::Value)?;
                 if *optional && v == Value::Null {
                     Ok(Value::Null)
+                } else if name == "pick" {
+                    // Wired to shoal-picker here (not methods.rs) to avoid a
+                    // shoal-value → shoal-picker dependency cycle.
+                    let a = self.eval_args(args)?;
+                    self.pick(v, &a).map_err(|e| e.or_span(span))
                 } else {
                     let args = self.eval_args(args)?;
                     shoal_value::methods::call_method(self, v, name, args, span)
                 }
             }
             Expr::FnCall { name, args, .. } => {
+                // Structured builtins that take closures/thunks (§5).
+                match name.as_str() {
+                    "parallel" => return self.builtin_parallel(args),
+                    "retry" => return self.builtin_retry(args),
+                    "run" => {
+                        let mut a = self.eval_args(args)?;
+                        if a.pos.is_empty() {
+                            return Err(ErrorVal::arg_error(
+                                "run expects a path or command name",
+                            ));
+                        }
+                        let target = a.pos.remove(0);
+                        return self.run_poly(target, a.pos, position);
+                    }
+                    "save" => {
+                        let a = self.eval_args(args)?;
+                        return self.builtin_save(a.pos);
+                    }
+                    "open" => {
+                        let a = self.eval_args(args)?;
+                        return self.builtin_open(a.pos);
+                    }
+                    _ => {}
+                }
                 let a = self.eval_args(args)?;
                 if let Some(value) = self.call_constructor(name, &a)? {
                     return Ok(value);
                 }
-                let f = self.env.get(name).ok_or_else(|| {
-                    ErrorVal::new("undefined_var", format!("undefined function `{name}`"))
-                })?;
-                self.call_value(&f, a)
+                if let Some(f) = self.env.get(name) {
+                    return self.call_value(&f, a);
+                }
+                // A name that isn't a fn but *is* a command resolves by invoking
+                // it with the given args in value position (defect #5).
+                if self.is_command_name(name) {
+                    let mut call = CmdCall {
+                        head: name.clone(),
+                        forced: false,
+                        args: vec![],
+                        redirects: vec![],
+                        env_prefix: vec![],
+                        background: false,
+                        trailing: None,
+                        span,
+                    };
+                    for v in a.pos {
+                        call.args.push(self.value_cmd_arg(v, span)?);
+                    }
+                    for (n, v) in a.named {
+                        call.args.push(CmdArg::FlagLong {
+                            name: n,
+                            value: Some(Box::new(self.value_cmd_arg(v, span)?)),
+                            span,
+                        });
+                    }
+                    return self.eval_command(&call, Position::Value);
+                }
+                Err(ErrorVal::new(
+                    "undefined_var",
+                    format!("undefined function `{name}`"),
+                ))
             }
             Expr::Lambda { params, body, .. } => Ok(Value::Closure(Arc::new(ClosureVal {
                 name: None,
@@ -605,6 +800,22 @@ impl Evaluator {
     }
 
     fn call_value(&mut self, f: &Value, args: CallArgs) -> VResult<Value> {
+        // Runtime recursion guard (defect #9): unbounded native recursion aborts
+        // the process, so cap the interpreter call stack well below that.
+        self.call_depth += 1;
+        if self.call_depth > 10_000 {
+            self.call_depth -= 1;
+            return Err(ErrorVal::new(
+                "recursion_limit",
+                "recursion limit exceeded (10000 nested calls)",
+            ));
+        }
+        let r = self.call_value_inner(f, args);
+        self.call_depth -= 1;
+        r
+    }
+
+    fn call_value_inner(&mut self, f: &Value, args: CallArgs) -> VResult<Value> {
         match f {
             Value::Closure(c) => {
                 let old = self.env.clone();
@@ -636,7 +847,10 @@ impl Evaluator {
                         false,
                     );
                 }
+                // Track fn-body nesting so `cd`/env writes can be rejected (#10).
+                self.in_fn_body += 1;
                 let out = self.eval_expr(&c.body, Position::Value);
+                self.in_fn_body -= 1;
                 self.env = old;
                 out
             }
@@ -714,10 +928,22 @@ impl Evaluator {
     }
 
     fn eval_command(&mut self, call: &CmdCall, position: Position) -> VResult<Value> {
+        // Session callables (fns/aliases) resolve as commands even when `^`-forced
+        // (defect #3): `^` bypasses only non-callable let/var shadows.
         if let Some(bound) = self.env.get(&call.head)
-            && !call.forced
             && bound.is_callable()
         {
+            // `deploy --help` synthesises the signature + doc (§4.4, defect #12).
+            if let Value::Closure(c) = &bound
+                && call
+                    .args
+                    .iter()
+                    .any(|a| matches!(a, CmdArg::FlagLong { name, .. } if name == "help"))
+            {
+                let help = closure_help(c);
+                self.emit(&Value::Str(help));
+                return Ok(Value::Null);
+            }
             let mut pos = Vec::new();
             let mut named = Vec::new();
             for a in &call.args {
@@ -732,12 +958,50 @@ impl Evaluator {
                     _ => pos.extend(self.expand_arg(a)?),
                 }
             }
+            // Coerce CMD words to the callee's declared param types (defect #12).
+            if let Value::Closure(c) = &bound {
+                coerce_call_args(&c.params, &mut pos, &mut named)?;
+            }
             return self.call_value(&bound, CallArgs { pos, named });
         }
+        // A bare word bound to a non-callable value (e.g. `it`, `out`, or any
+        // `let`) resolves to that value — bound names dispatch as EXPR (§3.1.3).
+        if let Some(bound) = self.env.get(&call.head)
+            && !call.forced
+            && !bound.is_callable()
+            && call.args.is_empty()
+            && call.redirects.is_empty()
+            && call.env_prefix.is_empty()
+        {
+            return Ok(bound);
+        }
+        if call.head == "jobs" {
+            return Ok(self.jobs_table());
+        }
+        if call.head == "interact" {
+            return self.builtin_interact(call);
+        }
+        if call.head == "open" {
+            let vs = self.collect_cmd_values(call)?;
+            return self.builtin_open(vs);
+        }
+        if call.head == "save" {
+            let vs = self.collect_cmd_values(call)?;
+            return self.builtin_save(vs);
+        }
         if builtins::is_builtin(&call.head) {
-            return builtins::run(self, call);
+            let value = builtins::run(self, call)?;
+            // Redirects apply to builtin results too (defect #8).
+            return self.apply_builtin_redirects(call, value);
         }
         if call.head == "cd" {
+            if self.in_fn_body > 0 {
+                return Err(ErrorVal::new(
+                    "custom",
+                    "cd is only allowed at session top level; use `with cwd:` inside a fn body",
+                )
+                .with_span(call.span));
+            }
             let p = call
                 .args
                 .first()
@@ -759,15 +1023,25 @@ impl Evaluator {
         if call.head == "pwd" {
             return Ok(Value::Path(self.cwd.clone()));
         }
-        if call.head == "source" || call.head == "run" || call.head.ends_with(".shl") {
+        // `run` is the poly runner + dynamic form (pty §8): dispatch by extension
+        // or, for a non-path name, invoke dynamically as a command.
+        if call.head == "run" {
+            let mut vs = self.collect_cmd_values(call)?;
+            if vs.is_empty() {
+                return Err(ErrorVal::arg_error("run expects a path or command name"));
+            }
+            let target = vs.remove(0);
+            return self.run_poly(target, vs, position);
+        }
+        if call.head == "source" || call.head.ends_with(".shl") {
             let is_source = call.head == "source";
-            let script_path = if call.head == "source" || call.head == "run" {
+            let script_path = if is_source {
                 let p = call
                     .args
                     .first()
                     .map(|a| self.cmd_arg_value(a))
                     .transpose()?
-                    .ok_or_else(|| ErrorVal::new("arg_error", format!("{} expects script path", call.head)))?;
+                    .ok_or_else(|| ErrorVal::new("arg_error", "source expects script path"))?;
                 match p {
                     Value::Path(p) => p,
                     Value::Str(s) => PathBuf::from(s),
@@ -776,7 +1050,7 @@ impl Evaluator {
             } else {
                 PathBuf::from(&call.head)
             };
-            
+
             let path = if script_path.is_absolute() {
                 script_path
             } else {
@@ -786,7 +1060,7 @@ impl Evaluator {
                 .map_err(|e| ErrorVal::new("io_error", format!("cannot read script: {e}")))?;
             let program = shoal_syntax::parse(&src)
                 .map_err(|e| ErrorVal::new("parse_error", e.to_string()))?;
-                
+
             if is_source {
                 return self.eval_program(&program);
             } else {
@@ -1356,6 +1630,11 @@ impl Evaluator {
                 .map(Value::Path)
                 .collect::<Vec<_>>();
             paths.sort_by_key(shoal_value::render::render_inline);
+            // Zero-match glob lint (defect #16, §1.5): nullglob still yields zero
+            // argv, but a statement-level miss is worth a diagnostic.
+            if paths.is_empty() {
+                eprintln!("shoal: no matches for {}", g.pattern);
+            }
             Ok(paths)
         } else {
             Ok(vec![v])
@@ -1610,17 +1889,566 @@ impl Evaluator {
     }
     fn spawn_block(&mut self, body: Block) -> VResult<Value> {
         let task = shoal_value::TaskVal::new("spawn block");
+        // Structured cancellation: cancelling the task cancels the child's exec
+        // tokens (defect #14).
+        let child_cancel = CancelToken::new();
+        let hook_cancel = child_cancel.clone();
+        task.on_cancel(Box::new(move || hook_cancel.cancel()));
         let worker = task.clone();
         let env = self.env.clone();
         let cwd = self.cwd.clone();
         let penv = self.process_env.clone();
+        let adapters = self.adapters.clone();
         std::thread::spawn(move || {
             let mut ev = Evaluator::new(cwd);
             ev.env = env;
             ev.process_env = penv;
+            ev.adapters = adapters;
+            ev.cancel = child_cancel;
             worker.finish(ev.block_value(&body));
         });
+        self.jobs.push(task.clone());
         Ok(Value::Task(task))
+    }
+
+    /// True when `name` resolves as a command (builtin, special head, adapter,
+    /// or an executable on `PATH`) — drives command-in-expression (defect #5).
+    fn is_command_name(&self, name: &str) -> bool {
+        if builtins::is_builtin(name)
+            || matches!(
+                name,
+                "cd" | "pwd" | "source" | "run" | "jobs" | "interact" | "open" | "save"
+            )
+        {
+            return true;
+        }
+        if name.contains('/') || name.contains('.') {
+            return false;
+        }
+        if self.adapters.lookup(name).is_some() {
+            return true;
+        }
+        let path = self
+            .process_env
+            .iter()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| v.as_os_str());
+        shoal_exec::which(OsStr::new(name), path).is_some()
+    }
+
+    /// Collect a command's positional (non-flag) argument values.
+    fn collect_cmd_values(&mut self, call: &CmdCall) -> VResult<Vec<Value>> {
+        let mut vs = Vec::new();
+        for a in &call.args {
+            match a {
+                CmdArg::FlagLong { .. } | CmdArg::FlagShort { .. } | CmdArg::DashDash { .. } => {}
+                _ => vs.extend(self.expand_arg(a)?),
+            }
+        }
+        Ok(vs)
+    }
+
+    fn apply_builtin_redirects(&mut self, call: &CmdCall, value: Value) -> VResult<Value> {
+        for r in &call.redirects {
+            match r.kind {
+                RedirectKind::Out => {
+                    let p = self.arg_path(&r.target)?;
+                    std::fs::write(&p, value_bytes(&value))
+                        .map_err(|e| ErrorVal::new("custom", e.to_string()))?;
+                }
+                RedirectKind::Append => {
+                    use std::io::Write;
+                    let p = self.arg_path(&r.target)?;
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&p)
+                        .and_then(|mut f| f.write_all(&value_bytes(&value)))
+                        .map_err(|e| ErrorVal::new("custom", e.to_string()))?;
+                }
+                RedirectKind::In => {}
+            }
+        }
+        Ok(value)
+    }
+
+    /// Force a real PTY for `interact <cmd…>` (§5).
+    fn builtin_interact(&mut self, call: &CmdCall) -> VResult<Value> {
+        let vs = self.collect_cmd_values(call)?;
+        if vs.is_empty() {
+            return Err(ErrorVal::arg_error("interact expects a command"));
+        }
+        let mut argv = Vec::new();
+        for v in vs {
+            argv.push(self.argv_value(v)?);
+        }
+        let saved = self.interactive;
+        self.interactive = true;
+        let r = self.run_argv(
+            argv,
+            Position::Statement,
+            StdinSpec::Inherit,
+            &[],
+            call.span,
+            None,
+        );
+        self.interactive = saved;
+        r
+    }
+
+    /// `open <path>` — detached `xdg-open` (§5).
+    fn builtin_open(&mut self, pos: Vec<Value>) -> VResult<Value> {
+        if pos.len() != 1 {
+            return Err(ErrorVal::arg_error("open expects exactly one path"));
+        }
+        let p = match &pos[0] {
+            Value::Path(p) => p.clone(),
+            Value::Str(s) => PathBuf::from(s),
+            v => {
+                return Err(ErrorVal::type_error(format!(
+                    "open expects a path, found {}",
+                    v.type_name()
+                )));
+            }
+        };
+        let p = if p.is_absolute() { p } else { self.cwd.join(p) };
+        std::process::Command::new("xdg-open")
+            .arg(&p)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| ErrorVal::new("custom", format!("open: {e}")))?;
+        Ok(Value::Null)
+    }
+
+    /// `save(path, value)` builtin form (§5) — delegates to the value method.
+    fn builtin_save(&mut self, pos: Vec<Value>) -> VResult<Value> {
+        if pos.len() != 2 {
+            return Err(ErrorVal::arg_error("save expects (path, value)"));
+        }
+        let path = pos[0].clone();
+        let value = pos[1].clone();
+        shoal_value::methods::call_method(
+            self,
+            value,
+            "save",
+            CallArgs {
+                pos: vec![path],
+                named: vec![],
+            },
+            Span::default(),
+        )
+    }
+
+    /// `parallel(...closures)` — fail-fast by default; `settle: true` collects all
+    /// outcomes (§5).
+    fn builtin_parallel(&mut self, args: &Args) -> VResult<Value> {
+        let a = self.eval_args(args)?;
+        let settle = a
+            .named
+            .iter()
+            .find(|(n, _)| n == "settle")
+            .map(|(_, v)| matches!(v, Value::Bool(true)))
+            .unwrap_or(false);
+        let mut handles = Vec::new();
+        for f in a.pos {
+            let env = self.env.clone();
+            let cwd = self.cwd.clone();
+            let penv = self.process_env.clone();
+            let adapters = self.adapters.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut ev = Evaluator::new(cwd);
+                ev.env = env;
+                ev.process_env = penv;
+                ev.adapters = adapters;
+                ev.call_value(&f, CallArgs::default())
+            }));
+        }
+        let mut results = Vec::new();
+        let mut first_err: Option<ErrorVal> = None;
+        for h in handles {
+            match h.join() {
+                Ok(Ok(v)) => results.push(v),
+                Ok(Err(e)) => {
+                    first_err.get_or_insert_with(|| e.clone());
+                    results.push(Value::Error(Arc::new(e)));
+                }
+                Err(_) => {
+                    let e = ErrorVal::new("custom", "parallel task panicked");
+                    first_err.get_or_insert_with(|| e.clone());
+                    results.push(Value::Error(Arc::new(e)));
+                }
+            }
+        }
+        if let Some(e) = first_err
+            && !settle
+        {
+            return Err(e);
+        }
+        Ok(Value::List(results))
+    }
+
+    /// `retry(n, thunk, delay: duration?)` — retry a thunk until it succeeds (§5).
+    fn builtin_retry(&mut self, args: &Args) -> VResult<Value> {
+        let a = self.eval_args(args)?;
+        let n = match a.pos.first() {
+            Some(Value::Int(i)) if *i > 0 => *i as usize,
+            _ => return Err(ErrorVal::arg_error("retry expects a positive attempt count")),
+        };
+        let thunk = a
+            .pos
+            .get(1)
+            .cloned()
+            .ok_or_else(|| ErrorVal::arg_error("retry expects a thunk"))?;
+        let delay = a.named.iter().find(|(k, _)| k == "delay").and_then(|(_, v)| {
+            if let Value::Duration(ns) = v {
+                Some(*ns)
+            } else {
+                None
+            }
+        });
+        let mut last = ErrorVal::new("custom", "retry: no attempts made");
+        for attempt in 0..n {
+            match self.call_value(&thunk, CallArgs::default()) {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    last = e;
+                    if attempt + 1 < n
+                        && let Some(ns) = delay
+                        && ns > 0
+                    {
+                        std::thread::sleep(Duration::from_nanos(ns as u64));
+                    }
+                }
+            }
+        }
+        Err(last)
+    }
+
+    /// `run(<path>, …)` / `run(<name>, …)` — the poly runner + dynamic form.
+    fn run_poly(&mut self, target: Value, args: Vec<Value>, position: Position) -> VResult<Value> {
+        let name = match &target {
+            Value::Str(s) => s.clone(),
+            Value::Path(p) => p.to_string_lossy().into_owned(),
+            v => {
+                return Err(ErrorVal::type_error(format!(
+                    "run expects a str or path, found {}",
+                    v.type_name()
+                )));
+            }
+        };
+        let is_path =
+            name.contains('/') || name.starts_with('.') || name.starts_with('~');
+        let resolved = {
+            let p = self.resolve_path(&name);
+            if p.is_absolute() { p } else { self.cwd.join(p) }
+        };
+        let ext = Path::new(&name)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        let scripty = matches!(ext.as_deref(), Some("shl" | "sh" | "py" | "js" | "rs"));
+        if is_path || (scripty && resolved.exists()) {
+            return self.run_script_file(&resolved, ext.as_deref(), args, position);
+        }
+        // Dynamic command invocation (value semantics like any command).
+        let mut argv = vec![OsString::from(&name)];
+        for v in args {
+            argv.push(self.argv_value(v)?);
+        }
+        self.run_argv(argv, position, StdinSpec::Null, &[], Span::default(), None)
+    }
+
+    fn run_script_file(
+        &mut self,
+        path: &Path,
+        ext: Option<&str>,
+        args: Vec<Value>,
+        position: Position,
+    ) -> VResult<Value> {
+        match ext {
+            Some("shl") | None => {
+                let src = std::fs::read_to_string(path)
+                    .map_err(|e| ErrorVal::new("io_error", format!("cannot read script: {e}")))?;
+                let program = shoal_syntax::parse(&src)
+                    .map_err(|e| ErrorVal::new("parse_error", e.to_string()))?;
+                let mut child = Evaluator::new(self.cwd.clone());
+                child.env = self.env.clone();
+                child.process_env = self.process_env.clone();
+                child.adapters = self.adapters.clone();
+                child.env.declare("args", Value::List(args), false);
+                child.eval_program(&program)
+            }
+            Some("sh") => self.run_interp("sh", path, args, position),
+            Some("py") => self.run_interp("python3", path, args, position),
+            Some("js") => self.run_interp("node", path, args, position),
+            Some("rs") => self.run_rust_script(path, args, position),
+            Some(_) => {
+                let mut argv = vec![path.as_os_str().to_owned()];
+                for v in args {
+                    argv.push(self.argv_value(v)?);
+                }
+                self.run_argv(argv, position, StdinSpec::Null, &[], Span::default(), None)
+            }
+        }
+    }
+
+    fn run_interp(
+        &mut self,
+        interp: &str,
+        path: &Path,
+        args: Vec<Value>,
+        position: Position,
+    ) -> VResult<Value> {
+        let mut argv = vec![OsString::from(interp), path.as_os_str().to_owned()];
+        for v in args {
+            argv.push(self.argv_value(v)?);
+        }
+        self.run_argv(argv, position, StdinSpec::Null, &[], Span::default(), None)
+    }
+
+    fn run_rust_script(
+        &mut self,
+        path: &Path,
+        args: Vec<Value>,
+        position: Position,
+    ) -> VResult<Value> {
+        let path_env = self
+            .process_env
+            .iter()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| v.as_os_str());
+        if shoal_exec::which(OsStr::new("rust-script"), path_env).is_some() {
+            return self.run_interp("rust-script", path, args, position);
+        }
+        // Fall back to compiling with rustc into a temp binary, then exec it.
+        let bin = std::env::temp_dir().join(format!(
+            "shoal-rs-{}-{}",
+            std::process::id(),
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("script")
+        ));
+        let compile = self.run_argv(
+            vec![
+                OsString::from("rustc"),
+                path.as_os_str().to_owned(),
+                OsString::from("-o"),
+                bin.clone().into_os_string(),
+            ],
+            Position::Value,
+            StdinSpec::Null,
+            &[],
+            Span::default(),
+            None,
+        )?;
+        if let Value::Outcome(o) = &compile
+            && !o.ok
+        {
+            return Err(ErrorVal::new(
+                "cmd_failed",
+                format!(
+                    "rustc failed to compile {}: {}",
+                    path.display(),
+                    String::from_utf8_lossy(&o.stderr).trim()
+                ),
+            ));
+        }
+        let mut argv = vec![bin.into_os_string()];
+        for v in args {
+            argv.push(self.argv_value(v)?);
+        }
+        self.run_argv(argv, position, StdinSpec::Null, &[], Span::default(), None)
+    }
+
+    /// `.pick()` — interactive fuzzy selection via shoal-picker, gated on a tty.
+    fn pick(&self, recv: Value, args: &CallArgs) -> VResult<Value> {
+        let multi = args
+            .named
+            .iter()
+            .find(|(n, _)| n == "multi")
+            .map(|(_, v)| matches!(v, Value::Bool(true)))
+            .unwrap_or(false);
+        let prompt = args
+            .named
+            .iter()
+            .find(|(n, _)| n == "prompt")
+            .and_then(|(_, v)| match v {
+                Value::Str(s) => Some(s.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| "> ".into());
+        let options = shoal_picker::Options {
+            multi,
+            prompt,
+            ..Default::default()
+        };
+        let selected = shoal_picker::pick(recv, options).map_err(|e| match e.kind() {
+            std::io::ErrorKind::Unsupported => ErrorVal::arg_error("pick needs a terminal"),
+            std::io::ErrorKind::Interrupted => ErrorVal::new("custom", "pick cancelled"),
+            _ => ErrorVal::new("custom", e.to_string()),
+        })?;
+        if multi {
+            Ok(Value::List(selected))
+        } else {
+            Ok(selected.into_iter().next().unwrap_or(Value::Null))
+        }
+    }
+}
+
+/// Render a value to bytes for a builtin redirect target (defect #8).
+fn value_bytes(v: &Value) -> Vec<u8> {
+    match v {
+        Value::Bytes(b) => (**b).clone(),
+        Value::Str(s) => {
+            let mut b = s.clone().into_bytes();
+            if !s.ends_with('\n') {
+                b.push(b'\n');
+            }
+            b
+        }
+        Value::Outcome(o) => (*o.stdout).clone(),
+        Value::Null => Vec::new(),
+        other => {
+            let mut b = display_top(other).into_bytes();
+            b.push(b'\n');
+            b
+        }
+    }
+}
+
+/// A statement is a "bare command" when its root is a command invocation
+/// (or a boolean composition of commands) — defect #1b / WP1's Binary{And,Cmd,Cmd}.
+fn is_command_expr(e: &Expr) -> bool {
+    match e {
+        Expr::Cmd { .. } | Expr::ShRaw { .. } => true,
+        Expr::Binary {
+            op: BinOp::And | BinOp::Or,
+            lhs,
+            rhs,
+            ..
+        } => is_command_expr(lhs) && is_command_expr(rhs),
+        _ => false,
+    }
+}
+
+/// Top-level display of a value for the default statement sink and for `echo`:
+/// strings/paths are unquoted at the top level; nested values use `render_inline`.
+fn display_top(v: &Value) -> String {
+    match v {
+        Value::Str(s) => s.clone(),
+        Value::Path(p) => p.to_string_lossy().into_owned(),
+        Value::Null => String::new(),
+        other => shoal_value::render::render_inline(other),
+    }
+}
+
+/// Coerce a single CMD word value to a declared parameter type (TDD §4.2 site 2,
+/// defect #12). Non-string values pass through unchanged; unknown types keep the
+/// value verbatim (→ str).
+fn coerce_word(v: Value, ty: &str) -> VResult<Value> {
+    let ty = ty.trim_end_matches('?');
+    let Value::Str(s) = &v else {
+        return Ok(v);
+    };
+    let s = s.clone();
+    match ty {
+        "str" => Ok(Value::Str(s)),
+        "int" => s
+            .parse::<i64>()
+            .map(Value::Int)
+            .map_err(|_| ErrorVal::arg_error(format!("expected int, found {s:?}"))),
+        "float" => s
+            .parse::<f64>()
+            .map(Value::Float)
+            .map_err(|_| ErrorVal::arg_error(format!("expected float, found {s:?}"))),
+        "size" => shoal_value::parse_size(&s)
+            .map(Value::Size)
+            .ok_or_else(|| ErrorVal::arg_error(format!("expected size, found {s:?}"))),
+        "duration" => {
+            // Accept bare integers as seconds so `sleep 1` and `sleep 10ms` both work.
+            if let Some(ns) = shoal_value::parse_duration(&s) {
+                Ok(Value::Duration(ns))
+            } else if let Ok(secs) = s.parse::<i64>() {
+                Ok(Value::Int(secs))
+            } else {
+                Err(ErrorVal::arg_error(format!(
+                    "expected duration, found {s:?}"
+                )))
+            }
+        }
+        "time" => shoal_value::parse_time(&s)
+            .map(Value::Time)
+            .ok_or_else(|| ErrorVal::arg_error(format!("expected time, found {s:?}"))),
+        "bool" => match s.as_str() {
+            "true" => Ok(Value::Bool(true)),
+            "false" => Ok(Value::Bool(false)),
+            _ => Err(ErrorVal::arg_error(format!("expected bool, found {s:?}"))),
+        },
+        "path" => Ok(Value::Path(PathBuf::from(s))),
+        _ => Ok(Value::Str(s)),
+    }
+}
+
+/// Coerce positional + named CMD-word arguments against a function's parameters.
+fn coerce_call_args(
+    params: &[Param],
+    pos: &mut [Value],
+    named: &mut [(String, Value)],
+) -> VResult<()> {
+    for (i, p) in params.iter().enumerate() {
+        let Some(ty) = &p.ty else { continue };
+        // list<T> accumulation is not yet handled here; leave those verbatim.
+        if ty.name == "list" {
+            continue;
+        }
+        if let Some(slot) = named.iter_mut().find(|(n, _)| n == &p.name) {
+            slot.1 = coerce_word(std::mem::replace(&mut slot.1, Value::Null), &ty.name)?;
+        } else if let Some(slot) = pos.get_mut(i) {
+            *slot = coerce_word(std::mem::replace(slot, Value::Null), &ty.name)?;
+        }
+    }
+    Ok(())
+}
+
+/// Synthesised `--help` text for a user fn (§4.4).
+fn closure_help(c: &shoal_value::ClosureVal) -> String {
+    let name = c.name.clone().unwrap_or_else(|| "fn".into());
+    let mut params: Vec<String> = c
+        .params
+        .iter()
+        .map(|p| match &p.ty {
+            Some(t) => format!("{}: {}", p.name, t.name),
+            None => p.name.clone(),
+        })
+        .collect();
+    if let Some(rest) = &c.rest {
+        params.push(format!("...{}", rest.name));
+    }
+    let mut out = format!("{name}({})", params.join(", "));
+    if let Some(ret) = &c.ret {
+        out.push_str(&format!(" -> {}", ret.name));
+    }
+    if let Some(doc) = &c.doc {
+        out.push('\n');
+        out.push_str(doc);
+    }
+    out
+}
+
+/// Default statement sink (no host wired): print command output to real stdout.
+fn default_render(v: &Value) {
+    use std::io::Write;
+    let stdout = std::io::stdout();
+    let mut lock = stdout.lock();
+    match v {
+        Value::Outcome(o) => {
+            let _ = lock.write_all(&o.stdout);
+        }
+        other => {
+            let _ = writeln!(lock, "{}", display_top(other));
+        }
     }
 }
 
@@ -1811,6 +2639,284 @@ mod tests {
     fn run(src: &str) -> VResult<Value> {
         let program = shoal_syntax::parse(src).unwrap_or_else(|e| panic!("parse failed: {e}"));
         eval(&program, std::env::current_dir().unwrap())
+    }
+
+    /// Evaluate `src` capturing everything routed to the statement sink.
+    fn run_capturing(src: &str) -> (VResult<Value>, Vec<Value>) {
+        use std::sync::{Arc, Mutex};
+        let program = shoal_syntax::parse(src).unwrap_or_else(|e| panic!("parse failed: {e}"));
+        let mut ev = Evaluator::new(std::env::current_dir().unwrap());
+        let sink: Arc<Mutex<Vec<Value>>> = Arc::default();
+        let sink2 = sink.clone();
+        ev.set_statement_sink(Box::new(move |v: &Value| sink2.lock().unwrap().push(v.clone())));
+        let out = ev.eval_program(&program);
+        drop(ev); // release the sink's Arc clone before unwrapping
+        let captured = Arc::try_unwrap(sink).unwrap().into_inner().unwrap();
+        (out, captured)
+    }
+
+    fn run_in(src: &str, cwd: &Path) -> VResult<Value> {
+        let program = shoal_syntax::parse(src).unwrap_or_else(|e| panic!("parse failed: {e}"));
+        eval(&program, cwd)
+    }
+
+    #[test]
+    fn defect1_nonfinal_and_block_commands_reach_sink() {
+        // Non-final top-level statement values pass through to the sink; the
+        // final value is returned.
+        let (out, captured) = run_capturing("echo hi\necho bye");
+        assert_eq!(out.unwrap(), Value::Str("bye".into()));
+        assert_eq!(captured, vec![Value::Str("hi".into())]);
+
+        // Every iteration of a loop body's bare command reaches the sink.
+        let (_out, captured) = run_capturing("for x in [1,2,3] { echo (x) }");
+        assert_eq!(
+            captured,
+            vec![
+                Value::Str("1".into()),
+                Value::Str("2".into()),
+                Value::Str("3".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn defect3_forced_command_still_resolves_session_fn() {
+        assert_eq!(
+            run("fn greet(n:str){ (n) }\n^greet world").unwrap(),
+            Value::Str("world".into())
+        );
+    }
+
+    #[test]
+    fn defect4_stat_modified_is_datetime() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a"), b"x").unwrap();
+        let v = run_in("stat a", dir.path()).unwrap();
+        let Value::Record(r) = v else { panic!("stat should be a record") };
+        assert!(
+            matches!(r.get("modified"), Some(Value::DateTime(_))),
+            "modified must be a DateTime, got {:?}",
+            r.get("modified")
+        );
+    }
+
+    #[test]
+    fn defect5_command_resolves_in_value_position() {
+        // `let r = ls` invokes the builtin zero-arg in value position.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a"), b"x").unwrap();
+        let v = run_in("let r = ls\nr", dir.path()).unwrap();
+        assert!(matches!(v, Value::Table(rows) if rows.len() == 1));
+    }
+
+    #[test]
+    fn defect5_env_field_read_via_command() {
+        // `env.PATH` reads by invoking the `env` builtin then projecting.
+        unsafe { std::env::set_var("SHOAL_TEST_VAR", "hello") };
+        let v = run("env.SHOAL_TEST_VAR").unwrap();
+        assert_eq!(v, Value::Str("hello".into()));
+    }
+
+    #[test]
+    fn defect8_redirect_applies_to_builtin() {
+        let dir = tempfile::tempdir().unwrap();
+        run_in("echo hi > b.txt", dir.path()).unwrap();
+        let body = std::fs::read_to_string(dir.path().join("b.txt")).unwrap();
+        assert_eq!(body, "hi\n");
+    }
+
+    #[test]
+    fn defect9_recursion_guard_returns_error() {
+        // Run on a large stack so the depth guard fires before the native stack
+        // overflows (the real binary evaluates on a big main-thread stack).
+        let code = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024 * 1024)
+            .spawn(|| run("fn rec(n:int){ rec(n) }\nrec(1)").unwrap_err().code)
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(code, "recursion_limit");
+    }
+
+    #[test]
+    fn defect10_cd_inside_fn_body_is_rejected() {
+        let err = run("fn f(){ cd / }\nf()").unwrap_err();
+        assert_eq!(err.code, "custom");
+        assert!(err.msg.contains("with cwd:"), "{}", err.msg);
+    }
+
+    #[test]
+    fn defect11_env_assignment_writes_session_env() {
+        use shoal_ast::*;
+        let s = Span::default();
+        let target = Expr::Field {
+            recv: Box::new(Expr::Var {
+                name: "env".into(),
+                span: s,
+            }),
+            name: "SHOAL_ASSIGNED".into(),
+            optional: false,
+            span: s,
+        };
+        let program = Program {
+            stmts: vec![
+                Stmt::Assign {
+                    target,
+                    op: AssignOp::Set,
+                    value: Expr::Str {
+                        value: "bar".into(),
+                        span: s,
+                    },
+                    span: s,
+                },
+                Stmt::Expr {
+                    expr: Expr::Field {
+                        recv: Box::new(Expr::Var {
+                            name: "env".into(),
+                            span: s,
+                        }),
+                        name: "SHOAL_ASSIGNED".into(),
+                        optional: false,
+                        span: s,
+                    },
+                    span: s,
+                },
+            ],
+        };
+        let v = eval(&program, std::env::current_dir().unwrap()).unwrap();
+        assert_eq!(v, Value::Str("bar".into()));
+    }
+
+    #[test]
+    fn defect11_env_assignment_rejected_in_fn_body() {
+        use shoal_ast::*;
+        let s = Span::default();
+        let assign = Stmt::Assign {
+            target: Expr::Field {
+                recv: Box::new(Expr::Var {
+                    name: "env".into(),
+                    span: s,
+                }),
+                name: "X".into(),
+                optional: false,
+                span: s,
+            },
+            op: AssignOp::Set,
+            value: Expr::Str {
+                value: "1".into(),
+                span: s,
+            },
+            span: s,
+        };
+        // fn f() { env.X = "1" }  then  f()
+        let decl = FnDecl {
+            name: "f".into(),
+            params: vec![],
+            rest: None,
+            ret: None,
+            body: Block {
+                stmts: vec![assign],
+                span: s,
+            },
+            doc: None,
+            exported: false,
+            span: s,
+        };
+        let program = Program {
+            stmts: vec![
+                Stmt::Fn { decl },
+                Stmt::Expr {
+                    expr: Expr::FnCall {
+                        name: "f".into(),
+                        args: Args::empty(),
+                        span: s,
+                    },
+                    span: s,
+                },
+            ],
+        };
+        let err = eval(&program, std::env::current_dir().unwrap()).unwrap_err();
+        assert!(err.msg.contains("with env:"), "{}", err.msg);
+    }
+
+    #[test]
+    fn defect12_builtin_word_coercion() {
+        // `sleep 0ms` binds the word to a duration; `sleep 0` to seconds.
+        assert_eq!(run("sleep 0ms").unwrap(), Value::Null);
+        assert_eq!(run("sleep 0").unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn defect12_fn_param_word_coercion() {
+        // A bare CMD word binds to a typed fn param.
+        let v = run("fn add1(n: int) { n + 1 }\nadd1 41").unwrap();
+        assert_eq!(v, Value::Int(42));
+    }
+
+    #[test]
+    fn defect12_help_synthesis_returns_null() {
+        let (out, captured) = run_capturing("fn deploy(env: str) { (env) }\ndeploy --help");
+        assert_eq!(out.unwrap(), Value::Null);
+        assert!(
+            matches!(captured.last(), Some(Value::Str(s)) if s.contains("deploy") && s.contains("env")),
+            "{captured:?}"
+        );
+    }
+
+    #[test]
+    fn defect14_task_methods_and_jobs() {
+        assert_eq!(
+            run("let t = spawn { 2 + 3 }\nt.await()").unwrap(),
+            Value::Int(5)
+        );
+        let is_done = run("let t = spawn { 7 }\nt.await()\nt.is_done()").unwrap();
+        assert_eq!(is_done, Value::Bool(true));
+        // `jobs` returns the registry table.
+        let jobs = run("spawn { 1 }\njobs").unwrap();
+        assert!(matches!(jobs, Value::Table(rows) if !rows.is_empty()));
+    }
+
+    #[test]
+    fn echo_renders_non_scalar_values() {
+        let v = run("let items = [1,2,3]\necho (items)").unwrap();
+        assert_eq!(v, Value::Str("[1, 2, 3]".into()));
+    }
+
+    #[test]
+    fn record_transcript_binds_it_and_out() {
+        let mut ev = Evaluator::new(std::env::current_dir().unwrap());
+        ev.record_transcript(&Value::Int(7));
+        ev.record_transcript(&Value::Str("hi".into()));
+        let it = ev
+            .eval_program(&shoal_syntax::parse("it").unwrap())
+            .unwrap();
+        assert_eq!(it, Value::Str("hi".into()));
+        let out = ev
+            .eval_program(&shoal_syntax::parse("out").unwrap())
+            .unwrap();
+        assert_eq!(out, Value::List(vec![Value::Int(7), Value::Str("hi".into())]));
+    }
+
+    #[test]
+    fn builtin_retry_and_parallel_and_save() {
+        assert_eq!(run("retry(3, () => 42)").unwrap(), Value::Int(42));
+        assert_eq!(
+            run("parallel(() => 1, () => 2)").unwrap(),
+            Value::List(vec![Value::Int(1), Value::Int(2)])
+        );
+        let dir = tempfile::tempdir().unwrap();
+        run_in("save(\"out.txt\", \"payload\")", dir.path()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("out.txt")).unwrap(),
+            "payload"
+        );
+    }
+
+    #[test]
+    fn builtin_retry_eventually_surfaces_error() {
+        let err = run("retry(2, () => missing_command_xyz)").unwrap_err();
+        assert!(err.code == "undefined_var" || err.code == "not_found", "{}", err.code);
     }
 
     #[test]

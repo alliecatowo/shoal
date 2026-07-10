@@ -1,0 +1,111 @@
+# String literal forms: interpolating "…" escapes, raw '…' (no escapes),
+# triple """…"""/'''…''' multiline dedent, interpolation nesting.
+# Render expectations per CONTRACTS.md §3 (render_inline double-quotes,
+# escaping control chars back to their two-char form).
+
+[[case]]
+name = "str-escape-newline-alt"
+src = '"x\ny"'
+value = '"x\ny"'
+
+[[case]]
+name = "str-escape-tab"
+src = '"a\tb"'
+value = '"a\tb"'
+
+[[case]]
+name = "str-escape-carriage-return"
+src = '"a\rb"'
+value = '"a\rb"'
+
+[[case]]
+name = "str-escape-null"
+src = '"a\0b"'
+value = '"a\0b"'
+
+[[case]]
+name = "str-escape-backslash"
+src = '"a\\b"'
+value = '"a\\b"'
+
+[[case]]
+name = "str-escape-quote"
+src = '"say \"hi\""'
+value = '"say \"hi\""'
+
+[[case]]
+name = "str-escape-braces-suppress-interp"
+# \{ \} escape braces so they are literal text, not interpolation.
+src = '"a\{b\}"'
+value = '"a{b}"'
+
+[[case]]
+name = "str-escape-unicode-crab"
+src = '"\u{1F980}"'
+value = "\"🦀\""
+
+[[case]]
+name = "str-raw-no-escapes"
+src = "'a\\nb'"
+value = '"a\\nb"'
+
+[[case]]
+name = "str-raw-preserves-tab-text"
+src = "'a\\tb'"
+value = '"a\\tb"'
+
+[[case]]
+name = "str-interp-arith"
+src = '"answer {6 * 7}"'
+value = '"answer 42"'
+
+[[case]]
+name = "str-interp-two-holes"
+src = '"{1} and {2}"'
+value = '"1 and 2"'
+
+[[case]]
+name = "str-interp-nested-method-call"
+src = "let name = \"shoal\"\n\"hi {name.upper()}\""
+value = '"hi SHOAL"'
+
+[[case]]
+name = "str-interp-list-value"
+src = '"xs = {[1, 2]}"'
+value = '"xs = [1, 2]"'
+
+[[case]]
+name = "str-triple-double-dedent"
+src = "let s = \"\"\"\n    hello\n    world\n    \"\"\"\ns"
+value = '"hello\nworld"'
+
+[[case]]
+name = "str-triple-raw-dedent"
+src = "let s = '''\n    plain text\n    line two\n    '''\ns"
+value = '"plain text\nline two"'
+
+[[case]]
+name = "str-len-counts-chars"
+src = '"hello".len()'
+value = "5"
+
+[[case]]
+name = "str-lines-strips-crlf"
+# CONTRACTS/TDD §13.10: .lines() strips \r?\n.
+src = "\"a\\r\\nb\".lines()"
+value = '["a", "b"]'
+
+[[case]]
+name = "str-plus-int-is-type-error"
+src = '"a" + 1'
+error = "type_error"
+
+[[case]]
+name = "str-empty-len-is-zero"
+src = '"".len()'
+value = "0"
+
+[[case]]
+name = "str-compare-lexicographic"
+src = '"apple" < "banana"'
+value = "true"

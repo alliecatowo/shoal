@@ -226,6 +226,13 @@ fn map_tool(name: &str, args: Value) -> Result<(&'static str, Value), String> {
             json!({"ref":required_str(object,"ref")?,"path":object.get("path"),"slice":object.get("slice")}),
         ),
         "shoal_journal" => ("journal.query", args),
+        // Escalation path for a plan stuck at `approval_pending` (TDD §7's
+        // `cap.request`): without this an agent that hits a stricter-than-
+        // default leash policy has no MCP-reachable way to move forward.
+        "shoal_cap_request" => (
+            "cap.request",
+            json!({"plan_ref":required_str(object,"plan_ref")?,"effects":object.get("effects").cloned().unwrap_or_else(||json!([]))}),
+        ),
         _ => return Err(format!("unknown tool {name:?}")),
     })
 }
@@ -268,6 +275,11 @@ pub fn tools() -> Vec<Value> {
             "shoal_journal",
             "Query the structured execution journal",
             json!({"type":"object","properties":{"since":{"type":"integer"},"until":{"type":"integer"},"principal":{"type":"string"},"effects":{"type":"array","items":{"type":"string"}},"head":{"type":"string"},"limit":{"type":"integer","minimum":1}},"additionalProperties":false}),
+        ),
+        tool(
+            "shoal_cap_request",
+            "Request grant/approval for a plan stuck at approval_pending",
+            json!({"type":"object","properties":{"plan_ref":{"type":"string"},"effects":{"type":"array"}},"required":["plan_ref"],"additionalProperties":false}),
         ),
     ]
 }
@@ -336,8 +348,8 @@ mod tests {
         (d, c, h)
     }
     #[test]
-    fn lists_five_tools() {
-        assert_eq!(tools().len(), 5);
+    fn lists_six_tools() {
+        assert_eq!(tools().len(), 6);
         for t in tools() {
             assert_eq!(t["inputSchema"]["type"], "object")
         }
@@ -374,6 +386,19 @@ mod tests {
             map_tool("shoal_journal", json!({"limit":2})).unwrap().0,
             "journal.query"
         );
+        assert_eq!(
+            map_tool("shoal_cap_request", json!({"plan_ref":"plan:x"}))
+                .unwrap()
+                .0,
+            "cap.request"
+        );
+    }
+    #[test]
+    fn cap_request_forwards_plan_ref() {
+        let (method, params) = map_tool("shoal_cap_request", json!({"plan_ref":"plan:x"})).unwrap();
+        assert_eq!(method, "cap.request");
+        assert_eq!(params["plan_ref"], "plan:x");
+        assert_eq!(params["effects"], json!([]));
     }
     #[test]
     fn protocol_errors_are_structured() {
