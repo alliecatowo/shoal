@@ -1,0 +1,13 @@
+[package]
+name = "shoal-value"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+glob = "0.3.3"
+indexmap = { version = "2.14.0", features = ["serde"] }
+jiff = "0.2.32"
+regex = "1.13.0"
+serde_json = "1.0.150"
+shoal-ast = { version = "0.1.0", path = "../shoal-ast" }
+unicode-width = "0.2.2"

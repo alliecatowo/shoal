@@ -1,0 +1,11 @@
+[package]
+name = "shoal-adapters"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+serde = "1.0.228"
+serde_json = "1.0.150"
+shoal-ast = { version = "0.1.0", path = "../shoal-ast" }
+shoal-value = { version = "0.1.0", path = "../shoal-value" }
+toml = "1.1.2"

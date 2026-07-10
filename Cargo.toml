@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/allie/shoal"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[workspace.dependencies]
+shoal-ast = { path = "crates/shoal-ast" }
+shoal-value = { path = "crates/shoal-value" }
+shoal-syntax = { path = "crates/shoal-syntax" }
+shoal-exec = { path = "crates/shoal-exec" }
+shoal-journal = { path = "crates/shoal-journal" }
+shoal-adapters = { path = "crates/shoal-adapters" }
+shoal-eval = { path = "crates/shoal-eval" }
