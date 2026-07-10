@@ -63,7 +63,13 @@ unsafe extern "C" {
     fn kill(pid: i32, signal: i32) -> i32;
 }
 
-fn call(stream: &mut UnixStream, reader: &mut BufReader<UnixStream>, id: i64, method: &str, params: serde_json::Value) -> Response {
+fn call(
+    stream: &mut UnixStream,
+    reader: &mut BufReader<UnixStream>,
+    id: i64,
+    method: &str,
+    params: serde_json::Value,
+) -> Response {
     write_frame(
         stream,
         &Request {
@@ -150,16 +156,28 @@ fn live_kernel_elides_a_big_table_over_the_wire() {
     // `cols` map every column name to a 150-long array of tagged cells —
     // easily tens of KB for a directory listing with name/size/modified.
     // AFTER (what actually arrives): shape only.
-    assert_eq!(out["$"], "ref", "150 rows over the wire, live, must arrive elided: {out}");
+    assert_eq!(
+        out["$"], "ref",
+        "150 rows over the wire, live, must arrive elided: {out}"
+    );
     assert_eq!(out["of"], "table");
-    assert_eq!(out["n"], 150, "the full count still travels even though the rows don't");
-    assert_eq!(out["cols"]["name"], "path", "column *schema* travels (name -> type)");
+    assert_eq!(
+        out["n"], 150,
+        "the full count still travels even though the rows don't"
+    );
+    assert_eq!(
+        out["cols"]["name"], "path",
+        "column *schema* travels (name -> type)"
+    );
     assert!(
         out["cols"].get("size").is_some(),
         "every table column's type is in the shape, not just the ones previewed"
     );
     assert_eq!(out["preview"]["$"], "table");
-    assert_eq!(out["preview"]["n"], 5, "preview is capped at 5 rows, not 150");
+    assert_eq!(
+        out["preview"]["n"], 5,
+        "preview is capped at 5 rows, not 150"
+    );
     let preview_names_len = out["preview"]["cols"]["name"].as_array().unwrap().len();
     assert_eq!(preview_names_len, 5);
     assert!(!out["render_head"].as_str().unwrap().is_empty());

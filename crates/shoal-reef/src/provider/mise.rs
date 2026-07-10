@@ -34,7 +34,11 @@ impl MiseProvider {
 
     /// Path to the tool binary for an installed version, if present.
     fn binary_for(&self, tool: &str, version_dir: &str) -> Option<PathBuf> {
-        let bin = self.installs_dir(tool).join(version_dir).join("bin").join(tool);
+        let bin = self
+            .installs_dir(tool)
+            .join(version_dir)
+            .join("bin")
+            .join(tool);
         is_executable(&bin).then_some(bin)
     }
 }
@@ -78,7 +82,10 @@ impl Provider for MiseProvider {
             Constraint::Any | Constraint::Latest => format!("{tool}@latest"),
             other => format!("{tool}@{other}"),
         };
-        let status = std::process::Command::new("mise").arg("install").arg(&spec).status();
+        let status = std::process::Command::new("mise")
+            .arg("install")
+            .arg(&spec)
+            .status();
         match status {
             Ok(s) if s.success() => {
                 // Re-discover to pick up the freshly installed candidate.
@@ -99,7 +106,10 @@ impl Provider for MiseProvider {
                 "mise",
                 format!("mise install {spec} failed with status {s}"),
             ))),
-            Err(e) => Some(Err(ProviderError::new("mise", format!("mise install: {e}")))),
+            Err(e) => Some(Err(ProviderError::new(
+                "mise",
+                format!("mise install: {e}"),
+            ))),
         }
     }
 }

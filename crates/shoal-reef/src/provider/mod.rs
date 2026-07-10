@@ -46,7 +46,13 @@ impl Candidate {
         path: PathBuf,
         provider: &'static str,
     ) -> Candidate {
-        Candidate { tool: tool.into(), version, path, provider, ambient: false }
+        Candidate {
+            tool: tool.into(),
+            version,
+            path,
+            provider,
+            ambient: false,
+        }
     }
 }
 
@@ -71,7 +77,10 @@ pub struct ProviderError {
 
 impl ProviderError {
     pub fn new(provider: &'static str, msg: impl Into<String>) -> ProviderError {
-        ProviderError { provider, msg: msg.into() }
+        ProviderError {
+            provider,
+            msg: msg.into(),
+        }
     }
 }
 

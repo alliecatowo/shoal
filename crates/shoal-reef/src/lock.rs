@@ -34,16 +34,17 @@ impl Lockfile {
 
     /// The conventional lockfile path next to a manifest file: `<dir>/reef.lock`.
     pub fn path_next_to(manifest: &Path) -> PathBuf {
-        manifest.parent().unwrap_or(Path::new(".")).join("reef.lock")
+        manifest
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join("reef.lock")
     }
 
     /// Load a lockfile from disk. A missing file yields an empty lockfile;
     /// malformed TOML is an error.
     pub fn load(path: &Path) -> Result<Lockfile, LockError> {
         match std::fs::read_to_string(path) {
-            Ok(text) => {
-                toml::from_str(&text).map_err(|e| LockError { msg: e.to_string() })
-            }
+            Ok(text) => toml::from_str(&text).map_err(|e| LockError { msg: e.to_string() }),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Lockfile::new()),
             Err(e) => Err(LockError { msg: e.to_string() }),
         }

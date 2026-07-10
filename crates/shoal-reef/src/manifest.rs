@@ -23,7 +23,10 @@ pub struct ToolReq {
 
 impl ToolReq {
     pub fn new(constraint: Constraint) -> ToolReq {
-        ToolReq { constraint, provider: None }
+        ToolReq {
+            constraint,
+            provider: None,
+        }
     }
 }
 
@@ -101,7 +104,11 @@ impl ReefManifest {
                 tools.insert(name, ToolReq::new(constraint));
             }
         }
-        Ok(ReefManifest { tools, runners: RunnerTable::default(), hermetic: false })
+        Ok(ReefManifest {
+            tools,
+            runners: RunnerTable::default(),
+            hermetic: false,
+        })
     }
 
     /// Adapt a foreign `.tool-versions` file (read-only). Each non-comment line
@@ -119,7 +126,11 @@ impl ReefManifest {
             };
             tools.insert(name.to_string(), ToolReq::new(Constraint::parse(ver)));
         }
-        Ok(ReefManifest { tools, runners: RunnerTable::default(), hermetic: false })
+        Ok(ReefManifest {
+            tools,
+            runners: RunnerTable::default(),
+            hermetic: false,
+        })
     }
 }
 
@@ -161,9 +172,13 @@ impl RawToolSpec {
         match self {
             RawToolSpec::Str(s) => ToolReq::new(Constraint::parse(&s)),
             RawToolSpec::Table { version, provider } => {
-                let constraint =
-                    version.map(|v| Constraint::parse(&v)).unwrap_or(Constraint::Any);
-                ToolReq { constraint, provider }
+                let constraint = version
+                    .map(|v| Constraint::parse(&v))
+                    .unwrap_or(Constraint::Any);
+                ToolReq {
+                    constraint,
+                    provider,
+                }
             }
         }
     }
@@ -183,20 +198,34 @@ enum RawRunnerSpec {
 impl RawRunnerSpec {
     fn into_invocation(self) -> Invocation {
         match self {
-            RawRunnerSpec::Str(tool) => Invocation { tool, args_template: Vec::new() },
-            RawRunnerSpec::Table { tool, args } => Invocation { tool, args_template: args },
+            RawRunnerSpec::Str(tool) => Invocation {
+                tool,
+                args_template: Vec::new(),
+            },
+            RawRunnerSpec::Table { tool, args } => Invocation {
+                tool,
+                args_template: args,
+            },
         }
     }
 }
 
 impl RawReef {
     fn into_manifest(self) -> ReefManifest {
-        let tools = self.tools.into_iter().map(|(k, v)| (k, v.into_req())).collect();
+        let tools = self
+            .tools
+            .into_iter()
+            .map(|(k, v)| (k, v.into_req()))
+            .collect();
         let mut runners = RunnerTable::empty();
         for (ext, spec) in self.runners {
             runners.insert(ext, spec.into_invocation());
         }
-        ReefManifest { tools, runners, hermetic: self.options.hermetic }
+        ReefManifest {
+            tools,
+            runners,
+            hermetic: self.options.hermetic,
+        }
     }
 }
 

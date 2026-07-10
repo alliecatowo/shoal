@@ -46,7 +46,10 @@ fn main() {
         .stack_size(1 << 30)
         .spawn(|| {
             if let Err(error) = run() {
-                eprintln!("{}", maybe_strip(format!("\x1b[31;1merror:\x1b[0m {error}")));
+                eprintln!(
+                    "{}",
+                    maybe_strip(format!("\x1b[31;1merror:\x1b[0m {error}"))
+                );
                 std::process::exit(1);
             }
         })
@@ -338,7 +341,10 @@ fn repl() -> Result<i32, String> {
     let cwd = std::env::current_dir().map_err(|e| format!("cannot determine cwd: {e}"))?;
     let loaded = shoal_config::load(&shoal_config::LoadOptions::discover(&cwd))?;
     for warning in &loaded.warnings {
-        eprintln!("{}", maybe_strip(format!("\x1b[33;1mwarning:\x1b[0m config error: {warning}")));
+        eprintln!(
+            "{}",
+            maybe_strip(format!("\x1b[33;1mwarning:\x1b[0m config error: {warning}"))
+        );
     }
     let config = loaded.config;
     let mut evaluator = Evaluator::new(cwd.clone());
@@ -353,7 +359,9 @@ fn repl() -> Result<i32, String> {
         for warning in warnings {
             eprintln!(
                 "{}",
-                maybe_strip(format!("\x1b[33;1mwarning:\x1b[0m failed to load adapter: {warning}"))
+                maybe_strip(format!(
+                    "\x1b[33;1mwarning:\x1b[0m failed to load adapter: {warning}"
+                ))
             );
         }
         evaluator.set_adapters(catalog.clone());

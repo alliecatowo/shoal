@@ -115,10 +115,7 @@ fn d3_ident_adjacency_forces_expr() {
 fn d4_command_substitution_in_parens() {
     // value position
     let p = parse("let x = (echo hi)").unwrap();
-    assert!(matches!(
-        last(&p),
-        Stmt::Expr { .. } | Stmt::Let { .. }
-    ));
+    assert!(matches!(last(&p), Stmt::Expr { .. } | Stmt::Let { .. }));
     match last(&p) {
         Stmt::Let {
             init: Expr::Cmd { call, .. },
@@ -235,10 +232,7 @@ fn d7_command_logical_operators() {
     assert!(matches!(
         last(&p),
         Stmt::Expr {
-            expr: Expr::Binary {
-                op: BinOp::And,
-                ..
-            },
+            expr: Expr::Binary { op: BinOp::And, .. },
             ..
         }
     ));
@@ -300,8 +294,26 @@ fn d9_it_out_rejected_in_scripts() {
     assert!(parse("let x = it").is_err());
     assert!(parse("let x = out[0]").is_err());
     // …but allowed in REPL context.
-    assert!(parse_with_ctx("let x = it", ParseCtx { repl: true, ..vb(&[]) }).is_ok());
-    assert!(parse_with_ctx("let x = out[0]", ParseCtx { repl: true, ..vb(&[]) }).is_ok());
+    assert!(
+        parse_with_ctx(
+            "let x = it",
+            ParseCtx {
+                repl: true,
+                ..vb(&[])
+            }
+        )
+        .is_ok()
+    );
+    assert!(
+        parse_with_ctx(
+            "let x = out[0]",
+            ParseCtx {
+                repl: true,
+                ..vb(&[])
+            }
+        )
+        .is_ok()
+    );
 }
 
 // ---------------------------------------------------------------- D10
@@ -345,7 +357,14 @@ fn d13_leading_pipe_in_match_arm() {
 // ---------------------------------------------------------------- REPL leading-`.`
 #[test]
 fn repl_leading_dot_chains_on_it() {
-    let p = parse_with_ctx(".first()", ParseCtx { repl: true, ..vb(&[]) }).unwrap();
+    let p = parse_with_ctx(
+        ".first()",
+        ParseCtx {
+            repl: true,
+            ..vb(&[])
+        },
+    )
+    .unwrap();
     match last(&p) {
         Stmt::Expr {
             expr: Expr::MethodCall { recv, name, .. },

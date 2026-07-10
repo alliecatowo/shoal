@@ -56,12 +56,22 @@ impl Version {
                 }
             }
         }
-        Version { parts, pre, raw, unknown: false }
+        Version {
+            parts,
+            pre,
+            raw,
+            unknown: false,
+        }
     }
 
     /// A version we could not determine (cargo bins). Compares below everything.
     pub fn unknown() -> Version {
-        Version { parts: Vec::new(), pre: None, raw: String::new(), unknown: true }
+        Version {
+            parts: Vec::new(),
+            pre: None,
+            raw: String::new(),
+            unknown: true,
+        }
     }
 
     /// `true` when no numeric information is available.
@@ -235,10 +245,18 @@ impl Constraint {
             (Any | Latest, _) => other,
             (_, Any | Latest) => self,
             (Prefix(a), Prefix(b)) => {
-                if b.len() > a.len() { other } else { self }
+                if b.len() > a.len() {
+                    other
+                } else {
+                    self
+                }
             }
             (RawPrefix(a), RawPrefix(b)) => {
-                if b.len() > a.len() { other } else { self }
+                if b.len() > a.len() {
+                    other
+                } else {
+                    self
+                }
             }
             _ => self,
         }
@@ -311,8 +329,14 @@ mod tests {
         assert_eq!(Constraint::parse("*"), Constraint::Any);
         assert_eq!(Constraint::parse("latest"), Constraint::Latest);
         assert_eq!(Constraint::parse("22"), Constraint::Prefix(vec![22]));
-        assert_eq!(Constraint::parse("3.12.4"), Constraint::Prefix(vec![3, 12, 4]));
-        assert_eq!(Constraint::parse("nightly"), Constraint::RawPrefix("nightly".into()));
+        assert_eq!(
+            Constraint::parse("3.12.4"),
+            Constraint::Prefix(vec![3, 12, 4])
+        );
+        assert_eq!(
+            Constraint::parse("nightly"),
+            Constraint::RawPrefix("nightly".into())
+        );
     }
 
     #[test]

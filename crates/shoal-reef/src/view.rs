@@ -23,7 +23,10 @@ pub struct Binding {
 
 impl Binding {
     pub fn new(name: impl Into<String>, path: impl Into<PathBuf>) -> Binding {
-        Binding { name: name.into(), path: path.into() }
+        Binding {
+            name: name.into(),
+            path: path.into(),
+        }
     }
 }
 
@@ -65,14 +68,19 @@ pub fn default_view_root() -> PathBuf {
     if let Some(rt) = std::env::var_os("XDG_RUNTIME_DIR") {
         return PathBuf::from(rt).join("shoal/views");
     }
-    let tmp = std::env::var_os("TMPDIR").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/tmp"));
+    let tmp = std::env::var_os("TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
     let uid = unsafe { libc::getuid() };
     tmp.join(format!("shoal-views-{uid}"))
 }
 
 /// The canonical system roots as a PATH tail.
 pub fn default_system_tail() -> Vec<PathBuf> {
-    ["/usr/local/bin", "/usr/bin", "/bin"].iter().map(PathBuf::from).collect()
+    ["/usr/local/bin", "/usr/bin", "/bin"]
+        .iter()
+        .map(PathBuf::from)
+        .collect()
 }
 
 /// A stable content hash of a binding set (order-independent).
@@ -237,7 +245,11 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let node = fake_bin(src.path(), "node");
         let py = fake_bin(src.path(), "python");
-        let v1 = synth_path(&[Binding::new("node", node.clone())], &cfg(root.path(), false)).unwrap();
+        let v1 = synth_path(
+            &[Binding::new("node", node.clone())],
+            &cfg(root.path(), false),
+        )
+        .unwrap();
         let v2 = synth_path(
             &[Binding::new("node", node), Binding::new("python", py)],
             &cfg(root.path(), false),

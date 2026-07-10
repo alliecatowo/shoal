@@ -64,7 +64,13 @@ impl Evaluator {
     /// scope. The single gate that keeps the no-manifest world untouched.
     fn reef_manifest_in_scope(&mut self) -> bool {
         self.ensure_reef_chain();
-        !self.reef_chain.as_ref().expect("ensured").1.scopes.is_empty()
+        !self
+            .reef_chain
+            .as_ref()
+            .expect("ensured")
+            .1
+            .scopes
+            .is_empty()
     }
 
     /// Persist the in-memory lock next to its manifest, best-effort. A failure
@@ -338,7 +344,10 @@ impl Evaluator {
             r.insert("name".into(), Value::Str(name.clone()));
             match resolver.resolve(&name, &chain, &mut lock, Policy::Interactive, &mut |_| {}) {
                 Ok(res) => {
-                    r.insert("constraint".into(), Value::Str(res.report.constraint.clone()));
+                    r.insert(
+                        "constraint".into(),
+                        Value::Str(res.report.constraint.clone()),
+                    );
                     r.insert("version".into(), Value::Str(res.version.to_string()));
                     r.insert("hash8".into(), Value::Str(short_hash(&res.hash)));
                     r.insert("provider".into(), Value::Str(res.provider.clone()));
@@ -353,7 +362,10 @@ impl Evaluator {
                     r.insert("version".into(), Value::Null);
                     r.insert("hash8".into(), Value::Null);
                     r.insert("provider".into(), Value::Null);
-                    r.insert("scope".into(), Value::Str(format!("unresolved: {}", e.code_str())));
+                    r.insert(
+                        "scope".into(),
+                        Value::Str(format!("unresolved: {}", e.code_str())),
+                    );
                 }
             }
             rows.push(r);
@@ -557,10 +569,7 @@ fn report_to_record(report: &ResolutionReport) -> Value {
             row.insert("source".into(), Value::Path(d.source.clone()));
             row.insert(
                 "constraint".into(),
-                d.constraint
-                    .clone()
-                    .map(Value::Str)
-                    .unwrap_or(Value::Null),
+                d.constraint.clone().map(Value::Str).unwrap_or(Value::Null),
             );
             row.insert("outcome".into(), Value::Str(d.outcome.clone()));
             row

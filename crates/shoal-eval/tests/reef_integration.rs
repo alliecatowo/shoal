@@ -70,7 +70,8 @@ fn constrained_tool_resolves_to_fixture_and_spawns() {
     assert!(stdout.contains("faketool-ran"), "stdout was {stdout:?}");
     // argv[0] was rewritten to the resolved absolute fixture path.
     assert!(
-        o.cmd.contains(bindir.join("faketool").to_string_lossy().as_ref()),
+        o.cmd
+            .contains(bindir.join("faketool").to_string_lossy().as_ref()),
         "resolved cmd was {:?}",
         o.cmd
     );
@@ -85,7 +86,9 @@ fn which_shows_the_resolution_chain() {
     ev.interactive = true;
     ev.set_reef_resolver(fixture_resolver(&bindir));
 
-    let out = ev.eval_program(&parse("which faketool")).expect("which runs");
+    let out = ev
+        .eval_program(&parse("which faketool"))
+        .expect("which runs");
     let Value::Outcome(o) = out else {
         panic!("expected outcome");
     };
@@ -167,7 +170,10 @@ fn reef_builtin_lists_bindings() {
 #[test]
 fn reef_add_writes_manifest_and_locks() {
     // Start with a project that has a manifest for one tool; add a second.
-    let (dir, bindir) = project("[tools]\nfaketool = \"*\"\n", &[("faketool", "1"), ("other", "2")]);
+    let (dir, bindir) = project(
+        "[tools]\nfaketool = \"*\"\n",
+        &[("faketool", "1"), ("other", "2")],
+    );
     let mut ev = Evaluator::new(dir.path().to_path_buf());
     ev.interactive = true;
     ev.set_reef_resolver(fixture_resolver(&bindir));
@@ -265,5 +271,8 @@ fn unmentioned_tool_is_passthrough_even_under_script_policy() {
     );
     // The reef resolver was never engaged for it, so no lock entry was written.
     let lock = std::fs::read_to_string(dir.path().join("reef.lock")).unwrap_or_default();
-    assert!(!lock.contains("othertool"), "unmentioned tool must not be locked");
+    assert!(
+        !lock.contains("othertool"),
+        "unmentioned tool must not be locked"
+    );
 }

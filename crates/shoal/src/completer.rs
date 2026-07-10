@@ -31,8 +31,8 @@ use shoal_value::{Env, Value};
 /// `source` heads special-cased in `eval_command`). Kept in sync by hand:
 /// shoal-eval doesn't expose this list publicly (see api_changes).
 const SHOAL_BUILTINS: &[&str] = &[
-    "echo", "ls", "cat", "mkdir", "touch", "cp", "mv", "rm", "stat", "which", "env", "sleep",
-    "cd", "pwd", "run", "source",
+    "echo", "ls", "cat", "mkdir", "touch", "cp", "mv", "rm", "stat", "which", "env", "sleep", "cd",
+    "pwd", "run", "source",
 ];
 
 /// Cursor context, resolved from the raw buffer text alone (no full parse —
@@ -383,7 +383,11 @@ fn classify(env: &Env, line: &str, pos: usize) -> Ctx {
                 Ctx::Expr { start, word }
             } else {
                 match cmd_word_at(&lx, e0, pos, line) {
-                    Some((start, word)) => Ctx::Arg { start, word, head: name },
+                    Some((start, word)) => Ctx::Arg {
+                        start,
+                        word,
+                        head: name,
+                    },
                     None => Ctx::None,
                 }
             }
@@ -602,7 +606,11 @@ mod tests {
         names2.sort();
         assert_eq!(
             names2,
-            vec!["alpha.txt".to_string(), "beta/".to_string(), "gamma.txt".to_string()]
+            vec![
+                "alpha.txt".to_string(),
+                "beta/".to_string(),
+                "gamma.txt".to_string()
+            ]
         );
     }
 

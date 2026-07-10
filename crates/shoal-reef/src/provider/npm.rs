@@ -71,6 +71,9 @@ mod tests {
     fn absent_when_no_node_modules() {
         let root = tempfile::tempdir().unwrap();
         let p = NpmLocalProvider::new();
-        assert!(p.discover("eslint", &ProviderCtx::new(root.path())).is_empty());
+        assert!(
+            p.discover("eslint", &ProviderCtx::new(root.path()))
+                .is_empty()
+        );
     }
 }

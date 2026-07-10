@@ -51,7 +51,11 @@ pub struct ReefError {
 
 impl ReefError {
     pub fn new(code: ReefCode, msg: impl Into<String>) -> ReefError {
-        ReefError { code, msg: msg.into(), hint: None }
+        ReefError {
+            code,
+            msg: msg.into(),
+            hint: None,
+        }
     }
 
     /// Attach a fix-it hint.

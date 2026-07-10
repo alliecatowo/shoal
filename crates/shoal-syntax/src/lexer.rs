@@ -549,9 +549,7 @@ impl<'s> Lexer<'s> {
         // radix actually follows — otherwise `0b` is the size literal `0` +
         // unit `b` (zero bytes), and `0x`/`0o` likewise fall through to the
         // decimal/size path rather than erroring on missing digits.
-        let radix_digit_follows = |b: u8, radix: u32| -> bool {
-            (b as char).is_digit(radix)
-        };
+        let radix_digit_follows = |b: u8, radix: u32| -> bool { (b as char).is_digit(radix) };
         if self.at(pos) == b'0'
             && matches!(self.at(pos + 1), b'x' | b'X' | b'o' | b'O' | b'b' | b'B')
             && {

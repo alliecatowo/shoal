@@ -17,7 +17,10 @@ pub struct Invocation {
 
 impl Invocation {
     pub fn tool(tool: impl Into<String>) -> Invocation {
-        Invocation { tool: tool.into(), args_template: Vec::new() }
+        Invocation {
+            tool: tool.into(),
+            args_template: Vec::new(),
+        }
     }
 }
 
@@ -31,7 +34,9 @@ pub struct RunnerTable {
 impl RunnerTable {
     /// An empty table (no defaults).
     pub fn empty() -> RunnerTable {
-        RunnerTable { map: BTreeMap::new() }
+        RunnerTable {
+            map: BTreeMap::new(),
+        }
     }
 
     /// The default runner table shipped with reef: `py js ts sh shl rb lua`.
@@ -40,7 +45,13 @@ impl RunnerTable {
         let mut t = RunnerTable::empty();
         t.insert("py", Invocation::tool("python"));
         t.insert("js", Invocation::tool("node"));
-        t.insert("ts", Invocation { tool: "deno".into(), args_template: vec!["run".into()] });
+        t.insert(
+            "ts",
+            Invocation {
+                tool: "deno".into(),
+                args_template: vec!["run".into()],
+            },
+        );
         t.insert("sh", Invocation::tool("sh"));
         t.insert("shl", Invocation::tool("self"));
         t.insert("rb", Invocation::tool("ruby"));

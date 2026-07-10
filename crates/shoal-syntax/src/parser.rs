@@ -53,7 +53,10 @@ pub fn parse(src: &str) -> ParseResult<Program> {
     Parser::new(src).parse_program()
 }
 
-pub fn parse_with_scope(src: &str, bound: impl IntoIterator<Item = String>) -> ParseResult<Program> {
+pub fn parse_with_scope(
+    src: &str,
+    bound: impl IntoIterator<Item = String>,
+) -> ParseResult<Program> {
     let mut parser = Parser::new(src);
     for name in bound {
         parser.bind(name);
@@ -176,10 +179,7 @@ impl<'s> Parser<'s> {
         Ok(match self.lx.token(ident_span.end as usize, Mode::Expr) {
             Ok((t, s)) => {
                 s.start == ident_span.end
-                    && matches!(
-                        t,
-                        Tok::Dot | Tok::QuestionDot | Tok::LParen | Tok::LBracket
-                    )
+                    && matches!(t, Tok::Dot | Tok::QuestionDot | Tok::LParen | Tok::LBracket)
             }
             Err(_) => false,
         })
@@ -436,9 +436,7 @@ impl<'s> Parser<'s> {
                     ..
                 } = prev
                 {
-                    err = err.hint(format!(
-                        "did you mean the command? force it with `^{name}`"
-                    ));
+                    err = err.hint(format!("did you mean the command? force it with `^{name}`"));
                 }
                 Err(err)
             }
@@ -1143,24 +1141,22 @@ impl<'s> Parser<'s> {
             // type pattern requires the type name to be *followed by a binder
             // identifier* (before `=>`/`|`/`if`). `int n` → Type; `int`, `n`,
             // and `n if …` → Bind.
-            Tok::Ident(name) if is_type_name(&name) => {
-                match self.peek(Mode::Expr) {
-                    Ok((Tok::Ident(b), bs)) if b != "if" => {
-                        self.bump(Mode::Expr)?;
-                        Pattern::Type {
-                            ty: Type {
-                                name,
-                                args: vec![],
-                                optional: false,
-                                span: s,
-                            },
-                            name: Some(b),
-                            span: Span::new(s.start as usize, bs.end as usize),
-                        }
+            Tok::Ident(name) if is_type_name(&name) => match self.peek(Mode::Expr) {
+                Ok((Tok::Ident(b), bs)) if b != "if" => {
+                    self.bump(Mode::Expr)?;
+                    Pattern::Type {
+                        ty: Type {
+                            name,
+                            args: vec![],
+                            optional: false,
+                            span: s,
+                        },
+                        name: Some(b),
+                        span: Span::new(s.start as usize, bs.end as usize),
                     }
-                    _ => Pattern::Bind { name, span: s },
                 }
-            }
+                _ => Pattern::Bind { name, span: s },
+            },
             Tok::Ident(name) => Pattern::Bind { name, span: s },
             // Record pattern `{ field, field: subpat, … }` (open matching:
             // extra scrutinee fields are ignored).
@@ -1243,7 +1239,7 @@ impl<'s> Parser<'s> {
                             return Err(ParseError::new(
                                 "expected an integer after `..` in a range pattern",
                                 es,
-                            ))
+                            ));
                         }
                     };
                     Pattern::Range {
@@ -1275,8 +1271,10 @@ impl<'s> Parser<'s> {
             let arm_start = self.peek(Mode::Expr)?.1.start as usize;
             // A stray leading `|` gets the curated alternation teaching (D13).
             if let (Tok::Pipe, ps) = self.peek(Mode::Expr)? {
-                return Err(ParseError::new("unexpected `|` at the start of a match arm", ps)
-                    .hint("alternation is `a | b => …`; drop the leading `|`"));
+                return Err(
+                    ParseError::new("unexpected `|` at the start of a match arm", ps)
+                        .hint("alternation is `a | b => …`; drop the leading `|`"),
+                );
             }
             let mut patterns = vec![self.match_pattern()?];
             while self.eat(Mode::Expr, &Tok::Pipe)?.is_some() {
@@ -1512,9 +1510,7 @@ fn is_type_name(name: &str) -> bool {
 fn collect_pattern_binders(p: &Pattern, f: &mut impl FnMut(String)) {
     match p {
         Pattern::Bind { name, .. } => f(name.clone()),
-        Pattern::Type {
-            name: Some(n), ..
-        } => f(n.clone()),
+        Pattern::Type { name: Some(n), .. } => f(n.clone()),
         Pattern::Record { fields, .. } => {
             for field in fields {
                 match &field.pattern {

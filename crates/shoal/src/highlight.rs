@@ -7,8 +7,23 @@ pub struct ShoalHighlighter;
 fn is_keyword(name: &str) -> bool {
     matches!(
         name,
-        "let" | "var" | "fn" | "if" | "else" | "match" | "for" | "in" | "while" | "return"
-            | "break" | "continue" | "try" | "catch" | "alias" | "use" | "export"
+        "let"
+            | "var"
+            | "fn"
+            | "if"
+            | "else"
+            | "match"
+            | "for"
+            | "in"
+            | "while"
+            | "return"
+            | "break"
+            | "continue"
+            | "try"
+            | "catch"
+            | "alias"
+            | "use"
+            | "export"
     )
 }
 
@@ -42,7 +57,10 @@ fn push(styled: &mut StyledText, style: Style, text: &str, plain: bool) {
     if text.is_empty() {
         return;
     }
-    styled.push((if plain { Style::default() } else { style }, text.to_string()));
+    styled.push((
+        if plain { Style::default() } else { style },
+        text.to_string(),
+    ));
 }
 
 /// True when a lex failure is specifically an in-progress (unterminated)
@@ -109,13 +127,23 @@ impl Highlighter for ShoalHighlighter {
             // styling as the one bare word the parser will actually run.
             if let Tok::Ident(name) = &tok {
                 if is_keyword(name) {
-                    push(&mut styled, Style::new().fg(Color::Green).bold(), &line[start..end], plain);
+                    push(
+                        &mut styled,
+                        Style::new().fg(Color::Green).bold(),
+                        &line[start..end],
+                        plain,
+                    );
                     pos = end;
                     expect_cmd = false;
                     continue;
                 }
                 if matches!(name.as_str(), "true" | "false" | "null") {
-                    push(&mut styled, Style::new().fg(Color::LightCyan), &line[start..end], plain);
+                    push(
+                        &mut styled,
+                        Style::new().fg(Color::LightCyan),
+                        &line[start..end],
+                        plain,
+                    );
                     pos = end;
                     expect_cmd = false;
                     continue;
@@ -146,7 +174,12 @@ impl Highlighter for ShoalHighlighter {
                 }
                 // Assignment target, or a plain identifier reference in expr
                 // position (not a command head) — both read the same way.
-                push(&mut styled, Style::new().fg(Color::LightBlue), &line[start..end], plain);
+                push(
+                    &mut styled,
+                    Style::new().fg(Color::LightBlue),
+                    &line[start..end],
+                    plain,
+                );
                 pos = end;
                 expect_cmd = false;
                 continue;
@@ -249,7 +282,12 @@ fn highlight_cmd_tail(
             | Tok::FlagShort(_)
             | Tok::Dash
             | Tok::DashDash => {
-                push(styled, Style::new().fg(Color::Cyan), &line[start..end], plain);
+                push(
+                    styled,
+                    Style::new().fg(Color::Cyan),
+                    &line[start..end],
+                    plain,
+                );
             }
             Tok::PathWord(_) => {
                 push(
@@ -260,16 +298,36 @@ fn highlight_cmd_tail(
                 );
             }
             Tok::GlobWord(_) => {
-                push(styled, Style::new().fg(Color::LightMagenta), &line[start..end], plain);
+                push(
+                    styled,
+                    Style::new().fg(Color::LightMagenta),
+                    &line[start..end],
+                    plain,
+                );
             }
             Tok::Str(_) | Tok::StrInterp(_) => {
-                push(styled, Style::new().fg(Color::Yellow), &line[start..end], plain);
+                push(
+                    styled,
+                    Style::new().fg(Color::Yellow),
+                    &line[start..end],
+                    plain,
+                );
             }
             Tok::RedirOut | Tok::RedirAppend | Tok::RedirIn | Tok::Amp => {
-                push(styled, Style::new().fg(Color::DarkGray), &line[start..end], plain);
+                push(
+                    styled,
+                    Style::new().fg(Color::DarkGray),
+                    &line[start..end],
+                    plain,
+                );
             }
             Tok::EnvAssign(_, _) => {
-                push(styled, Style::new().fg(Color::LightBlue), &line[start..end], plain);
+                push(
+                    styled,
+                    Style::new().fg(Color::LightBlue),
+                    &line[start..end],
+                    plain,
+                );
             }
             _ => {
                 push(styled, Style::default(), &line[start..end], plain);

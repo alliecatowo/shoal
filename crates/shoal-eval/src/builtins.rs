@@ -49,8 +49,15 @@ pub(super) fn run(ev: &mut Evaluator, call: &CmdCall) -> VResult<Value> {
             .collect::<VResult<Vec<_>>>()
             .map_err(|e| e.or_span(call.span))?;
     }
-    dispatch(&call.head, &ev.cwd, &ev.process_env, args, &flags, &ev.cancel)
-        .map_err(|e| e.or_span(call.span))
+    dispatch(
+        &call.head,
+        &ev.cwd,
+        &ev.process_env,
+        args,
+        &flags,
+        &ev.cancel,
+    )
+    .map_err(|e| e.or_span(call.span))
 }
 
 fn dispatch(
@@ -441,8 +448,7 @@ mod tests {
             &[],
             &CancelToken::new(),
         )
-        .unwrap()
-        else {
+        .unwrap() else {
             panic!()
         };
         assert!(!d.path().join("x").exists());
@@ -488,10 +494,7 @@ mod tests {
         let cancel = CancelToken::new();
         cancel.cancel();
         let start = Instant::now();
-        assert_eq!(
-            sleep(vec![Value::Int(30)], &cancel).unwrap(),
-            Value::Null
-        );
+        assert_eq!(sleep(vec![Value::Int(30)], &cancel).unwrap(), Value::Null);
         assert!(
             start.elapsed() < Duration::from_secs(1),
             "cancelled sleep should return promptly, took {:?}",

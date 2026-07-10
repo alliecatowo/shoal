@@ -813,7 +813,11 @@ mod tests {
             dur_ns: 0,
             pid: 0,
             cmd: "x".into(),
-            parsed: Some(Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)])),
+            parsed: Some(Value::List(vec![
+                Value::Int(1),
+                Value::Int(2),
+                Value::Int(3),
+            ])),
         }));
         assert_eq!(call(outcome.clone(), "len", vec![]).unwrap(), Value::Int(3));
         assert_eq!(
@@ -834,10 +838,7 @@ mod tests {
             call(Value::Task(t.clone()), "await", vec![]).unwrap(),
             Value::Int(42)
         );
-        assert_eq!(
-            call(Value::Task(t), "cancel", vec![]).unwrap(),
-            Value::Null
-        );
+        assert_eq!(call(Value::Task(t), "cancel", vec![]).unwrap(), Value::Null);
         // Wrong receiver type is a type error.
         assert_eq!(
             call(Value::Int(1), "await", vec![]).unwrap_err().code,

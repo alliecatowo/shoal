@@ -25,8 +25,13 @@ fn leaf() -> impl Strategy<Value = WireValue> {
         any::<String>().prop_map(|label| WireValue::Stream { label }),
         any::<String>().prop_map(|name| WireValue::Secret { name }),
         any::<String>().prop_map(|repr| WireValue::Cmd { repr }),
-        (any::<i64>(), any::<i64>(), any::<bool>())
-            .prop_map(|(start, end, inclusive)| WireValue::Range { start, end, inclusive }),
+        (any::<i64>(), any::<i64>(), any::<bool>()).prop_map(|(start, end, inclusive)| {
+            WireValue::Range {
+                start,
+                end,
+                inclusive,
+            }
+        }),
         (any::<u64>(), any::<bool>()).prop_map(|(id, done)| WireValue::Task { id, done }),
         error_strategy(),
     ]
@@ -51,8 +56,12 @@ fn wire_value() -> impl Strategy<Value = WireValue> {
     leaf().prop_recursive(3, 64, 8, |inner| {
         prop_oneof![
             prop::collection::vec(inner.clone(), 0..8).prop_map(|v| WireValue::List { v }),
-            prop::collection::btree_map(prop::string::string_regex("[a-z]{1,6}").unwrap(), inner.clone(), 0..4)
-                .prop_map(|v| WireValue::Record { v }),
+            prop::collection::btree_map(
+                prop::string::string_regex("[a-z]{1,6}").unwrap(),
+                inner.clone(),
+                0..4
+            )
+            .prop_map(|v| WireValue::Record { v }),
             (
                 inner.clone(),
                 any::<Option<i32>>(),
@@ -76,7 +85,10 @@ fn wire_value() -> impl Strategy<Value = WireValue> {
                     }
                 }),
             prop::collection::vec(
-                (prop::string::string_regex("[a-z]{1,6}").unwrap(), prop::collection::vec(inner.clone(), 0..3)),
+                (
+                    prop::string::string_regex("[a-z]{1,6}").unwrap(),
+                    prop::collection::vec(inner.clone(), 0..3)
+                ),
                 0..3
             )
             .prop_map(|cols| {

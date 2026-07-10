@@ -21,7 +21,11 @@ pub struct SystemProvider {
 impl SystemProvider {
     /// Explicit roots + ambient dirs (tests pass fixture dirs here).
     pub fn new(roots: Vec<PathBuf>, ambient: Vec<PathBuf>) -> SystemProvider {
-        SystemProvider { roots, ambient, cache: Mutex::new(HashMap::new()) }
+        SystemProvider {
+            roots,
+            ambient,
+            cache: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Canonical roots plus the ambient dirs parsed from `$PATH` (dirs that are
@@ -66,7 +70,10 @@ impl Provider for SystemProvider {
             return v.clone();
         }
         let v = probe_version(&cand.path);
-        self.cache.lock().unwrap().insert(cand.path.clone(), v.clone());
+        self.cache
+            .lock()
+            .unwrap()
+            .insert(cand.path.clone(), v.clone());
         v
     }
 }

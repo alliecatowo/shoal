@@ -715,9 +715,7 @@ impl Evaluator {
                     "run" => {
                         let mut a = self.eval_args(args)?;
                         if a.pos.is_empty() {
-                            return Err(ErrorVal::arg_error(
-                                "run expects a path or command name",
-                            ));
+                            return Err(ErrorVal::arg_error("run expects a path or command name"));
                         }
                         let target = a.pos.remove(0);
                         return self.run_poly(target, a.pos, position);
@@ -2228,11 +2226,7 @@ impl Evaluator {
         // `cmd > file` / `>> file` sends the output to the file — it must not
         // also be rendered to the statement sink (defect #8). Yield Null so the
         // redirected statement stays silent on stdout.
-        if captured {
-            Ok(Value::Null)
-        } else {
-            Ok(value)
-        }
+        if captured { Ok(Value::Null) } else { Ok(value) }
     }
 
     /// Force a real PTY for `interact <cmd…>` (§5).
@@ -2357,20 +2351,28 @@ impl Evaluator {
         let a = self.eval_args(args)?;
         let n = match a.pos.first() {
             Some(Value::Int(i)) if *i > 0 => *i as usize,
-            _ => return Err(ErrorVal::arg_error("retry expects a positive attempt count")),
+            _ => {
+                return Err(ErrorVal::arg_error(
+                    "retry expects a positive attempt count",
+                ));
+            }
         };
         let thunk = a
             .pos
             .get(1)
             .cloned()
             .ok_or_else(|| ErrorVal::arg_error("retry expects a thunk"))?;
-        let delay = a.named.iter().find(|(k, _)| k == "delay").and_then(|(_, v)| {
-            if let Value::Duration(ns) = v {
-                Some(*ns)
-            } else {
-                None
-            }
-        });
+        let delay = a
+            .named
+            .iter()
+            .find(|(k, _)| k == "delay")
+            .and_then(|(_, v)| {
+                if let Value::Duration(ns) = v {
+                    Some(*ns)
+                } else {
+                    None
+                }
+            });
         let mut last = ErrorVal::new("custom", "retry: no attempts made");
         for attempt in 0..n {
             match self.call_value(&thunk, CallArgs::default()) {
@@ -2401,8 +2403,7 @@ impl Evaluator {
                 )));
             }
         };
-        let is_path =
-            name.contains('/') || name.starts_with('.') || name.starts_with('~');
+        let is_path = name.contains('/') || name.starts_with('.') || name.starts_with('~');
         let resolved = {
             let p = self.resolve_path(&name);
             if p.is_absolute() { p } else { self.cwd.join(p) }
@@ -2453,7 +2454,14 @@ impl Evaluator {
                     for v in args {
                         argv.push(self.argv_value(v)?);
                     }
-                    return self.run_argv(argv, position, StdinSpec::Null, &[], Span::default(), None);
+                    return self.run_argv(
+                        argv,
+                        position,
+                        StdinSpec::Null,
+                        &[],
+                        Span::default(),
+                        None,
+                    );
                 }
                 match ext {
                     Some("sh") => self.run_interp("sh", path, args, position),
@@ -2987,7 +2995,9 @@ mod tests {
         let mut ev = Evaluator::new(std::env::current_dir().unwrap());
         let sink: Arc<Mutex<Vec<Value>>> = Arc::default();
         let sink2 = sink.clone();
-        ev.set_statement_sink(Box::new(move |v: &Value| sink2.lock().unwrap().push(v.clone())));
+        ev.set_statement_sink(Box::new(move |v: &Value| {
+            sink2.lock().unwrap().push(v.clone())
+        }));
         let out = ev.eval_program(&program);
         drop(ev); // release the sink's Arc clone before unwrapping
         let captured = Arc::try_unwrap(sink).unwrap().into_inner().unwrap();
@@ -3046,7 +3056,10 @@ mod tests {
         // `echo a && echo b` prints BOTH (P1d): `a` via the sink, `b` returned.
         let (out, captured) = run_capturing("echo a && echo b");
         assert_eq!(out_of(&out.unwrap()), Value::Str("b".into()));
-        assert_eq!(captured.iter().map(out_of).collect::<Vec<_>>(), vec![Value::Str("a".into())]);
+        assert_eq!(
+            captured.iter().map(out_of).collect::<Vec<_>>(),
+            vec![Value::Str("a".into())]
+        );
         // A three-stage chain prints every stage.
         let (out, captured) = run_capturing("echo a && echo b && echo c");
         assert_eq!(out_of(&out.unwrap()), Value::Str("c".into()));
@@ -3080,7 +3093,10 @@ mod tests {
         // trailing command is the block value, not also sunk (P1 dbl-echo).
         let (out, captured) = run_capturing("fn g(){ echo hi }\ng()");
         assert_eq!(out_of(&out.unwrap()), Value::Str("hi".into()));
-        assert!(captured.is_empty(), "trailing command must not double-print: {captured:?}");
+        assert!(
+            captured.is_empty(),
+            "trailing command must not double-print: {captured:?}"
+        );
         // Bare `echo` emits a blank line: its outcome stdout is "\n".
         let (_out, captured) = run_capturing("echo\n42");
         assert_eq!(captured.len(), 1);
@@ -3097,8 +3113,14 @@ mod tests {
         std::fs::write(dir.path().join("only"), b"x").unwrap();
         let v = run_in("ls", dir.path()).unwrap();
         let rendered = shoal_value::render::render_block(&v, 80);
-        assert!(rendered.contains("name"), "ls should render a table: {rendered:?}");
-        assert!(rendered.contains("only"), "ls table should list the file: {rendered:?}");
+        assert!(
+            rendered.contains("name"),
+            "ls should render a table: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("only"),
+            "ls table should list the file: {rendered:?}"
+        );
     }
 
     #[test]
@@ -3114,7 +3136,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a"), b"x").unwrap();
         let v = run_in("stat a", dir.path()).unwrap();
-        let Value::Record(r) = out_of(&v) else { panic!("stat should be a record") };
+        let Value::Record(r) = out_of(&v) else {
+            panic!("stat should be a record")
+        };
         assert!(
             matches!(r.get("modified"), Some(Value::DateTime(_))),
             "modified must be a DateTime, got {:?}",
@@ -3318,7 +3342,10 @@ mod tests {
         let out = ev
             .eval_program(&shoal_syntax::parse("out").unwrap())
             .unwrap();
-        assert_eq!(out, Value::List(vec![Value::Int(7), Value::Str("hi".into())]));
+        assert_eq!(
+            out,
+            Value::List(vec![Value::Int(7), Value::Str("hi".into())])
+        );
     }
 
     #[test]
@@ -3339,7 +3366,11 @@ mod tests {
     #[test]
     fn builtin_retry_eventually_surfaces_error() {
         let err = run("retry(2, () => missing_command_xyz)").unwrap_err();
-        assert!(err.code == "undefined_var" || err.code == "not_found", "{}", err.code);
+        assert!(
+            err.code == "undefined_var" || err.code == "not_found",
+            "{}",
+            err.code
+        );
     }
 
     #[test]
@@ -3574,7 +3605,10 @@ consumed = ["short", "branch"]
             Value::Str("str:hi".into())
         );
         // A bare type name with no binder is a plain bind (matches anything).
-        assert_eq!(run(r#"match 5 { int => 1; _ => 0 }"#).unwrap(), Value::Int(1));
+        assert_eq!(
+            run(r#"match 5 { int => 1; _ => 0 }"#).unwrap(),
+            Value::Int(1)
+        );
     }
 
     #[test]

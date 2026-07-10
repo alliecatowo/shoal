@@ -374,10 +374,7 @@ impl Kernel {
                 }
                 evaluator.interactive = false;
                 let started = Instant::now();
-                let opaque = run_plan
-                    .effects
-                    .iter()
-                    .any(|e| matches!(e, Effect::Opaque));
+                let opaque = run_plan.effects.iter().any(|e| matches!(e, Effect::Opaque));
                 let effects_json = serde_json::to_string(&run_plan.effects).map_err(internal)?;
                 let entry_id = self
                     .journal
@@ -911,7 +908,10 @@ fn path_field(value: &Value, name: &str) -> Result<Value, String> {
             .cloned()
             .ok_or_else(|| format!("record has no field `{name}`")),
         Value::Outcome(o) => Ok(match name {
-            "status" => o.status.map(|s| Value::Int(s as i64)).unwrap_or(Value::Null),
+            "status" => o
+                .status
+                .map(|s| Value::Int(s as i64))
+                .unwrap_or(Value::Null),
             "ok" => Value::Bool(o.ok),
             "signal" => o.signal.clone().map(Value::Str).unwrap_or(Value::Null),
             "out" => o.out_value(),
@@ -929,7 +929,10 @@ fn path_field(value: &Value, name: &str) -> Result<Value, String> {
             "msg" => Value::Str(e.msg.clone()),
             "hint" => e.hint.clone().map(Value::Str).unwrap_or(Value::Null),
             "stderr" => e.stderr.clone().map(Value::Str).unwrap_or(Value::Null),
-            "status" => e.status.map(|s| Value::Int(s as i64)).unwrap_or(Value::Null),
+            "status" => e
+                .status
+                .map(|s| Value::Int(s as i64))
+                .unwrap_or(Value::Null),
             _ => return Err(format!("error has no field `{name}`")),
         }),
         Value::Range(r) => Ok(match name {
@@ -1024,7 +1027,10 @@ fn wire_value(value: &Value) -> WireValue {
             v: v.iter().map(wire_value).collect(),
         },
         Value::Record(rec) => WireValue::Record {
-            v: rec.iter().map(|(k, v)| (k.clone(), wire_value(v))).collect(),
+            v: rec
+                .iter()
+                .map(|(k, v)| (k.clone(), wire_value(v)))
+                .collect(),
         },
         Value::Table(rows) => {
             let mut names: Vec<&String> = Vec::new();
@@ -1090,7 +1096,9 @@ fn wire_value(value: &Value) -> WireValue {
                 WireValue::Cmd { repr }
             }
         }
-        Value::Secret(s) => WireValue::Secret { name: s.name.clone() },
+        Value::Secret(s) => WireValue::Secret {
+            name: s.name.clone(),
+        },
     }
 }
 
@@ -1170,13 +1178,15 @@ fn short_ref_to_uri(r: &Ref, path: Option<&str>) -> String {
 /// through unchanged).
 fn preview_value(value: &Value) -> Value {
     match value {
-        Value::Table(rows) => Value::Table(rows.iter().take(ELIDE_PREVIEW_ITEMS).cloned().collect()),
+        Value::Table(rows) => {
+            Value::Table(rows.iter().take(ELIDE_PREVIEW_ITEMS).cloned().collect())
+        }
         Value::List(items) => {
             Value::List(items.iter().take(ELIDE_PREVIEW_ITEMS).cloned().collect())
         }
-        Value::Bytes(b) => {
-            Value::Bytes(std::sync::Arc::new(b.iter().take(ELIDE_PREVIEW_BYTES).copied().collect()))
-        }
+        Value::Bytes(b) => Value::Bytes(std::sync::Arc::new(
+            b.iter().take(ELIDE_PREVIEW_BYTES).copied().collect(),
+        )),
         Value::Str(s) => Value::Str(s.chars().take(ELIDE_PREVIEW_BYTES).collect()),
         Value::Record(rec) => Value::Record(
             rec.keys()
@@ -1193,7 +1203,8 @@ fn table_cols(rows: &[shoal_value::Record]) -> std::collections::BTreeMap<String
     let mut cols = std::collections::BTreeMap::new();
     for row in rows {
         for (k, v) in row {
-            cols.entry(k.clone()).or_insert_with(|| v.type_name().to_string());
+            cols.entry(k.clone())
+                .or_insert_with(|| v.type_name().to_string());
         }
     }
     cols
@@ -1238,7 +1249,9 @@ fn elide_wire_value(value: &Value, uri: &str, budget: &ElideBudget) -> WireValue
         };
     }
     let wire = wire_value(value);
-    let encoded_len = serde_json::to_vec(&wire).map(|b| b.len()).unwrap_or(usize::MAX);
+    let encoded_len = serde_json::to_vec(&wire)
+        .map(|b| b.len())
+        .unwrap_or(usize::MAX);
     let too_big = encoded_len > budget.max_bytes
         || matches!(value, Value::Table(rows) if rows.len() > budget.max_rows)
         || matches!(value, Value::List(items) if items.len() > budget.max_items)
@@ -1538,9 +1551,15 @@ mod tests {
             json!({"client":{"kind":"agent","tty":false}}),
         );
         for src in ["1 + 2", "ls"] {
-            let planned = call(&mut client, &mut reader, 2, "exec", json!({"src":src,"mode":"plan"}))
-                .result
-                .unwrap();
+            let planned = call(
+                &mut client,
+                &mut reader,
+                2,
+                "exec",
+                json!({"src":src,"mode":"plan"}),
+            )
+            .result
+            .unwrap();
             assert_ne!(
                 planned["effects"],
                 json!([{"kind":"opaque"}]),
@@ -1548,9 +1567,15 @@ mod tests {
             );
             let exec = call(&mut client, &mut reader, 3, "exec", json!({"src":src}));
             let value_ref = exec.result.unwrap()["ref"].as_str().unwrap().to_owned();
-            let journal = call(&mut client, &mut reader, 4, "journal.query", json!({"limit":1}))
-                .result
-                .unwrap();
+            let journal = call(
+                &mut client,
+                &mut reader,
+                4,
+                "journal.query",
+                json!({"limit":1}),
+            )
+            .result
+            .unwrap();
             assert_eq!(journal[0]["src"], src);
             assert_eq!(
                 journal[0]["opaque"], false,
@@ -1592,7 +1617,10 @@ mod tests {
             "value.get",
             json!({"ref":value_ref,"path":"out"}),
         );
-        assert_eq!(out.result.unwrap()["value"], json!({"$":"str","v":"hello world"}));
+        assert_eq!(
+            out.result.unwrap()["value"],
+            json!({"$":"str","v":"hello world"})
+        );
         let ok = call(
             &mut client,
             &mut reader,
@@ -1862,7 +1890,10 @@ mod tests {
             "a single drilled row must not be elided: {drilled}"
         );
         assert_eq!(drilled["$"], "record");
-        assert!(drilled["v"]["name"].is_object(), "drilled row keeps its fields: {drilled}");
+        assert!(
+            drilled["v"]["name"].is_object(),
+            "drilled row keeps its fields: {drilled}"
+        );
 
         drop(client);
         drop(reader);
@@ -1883,9 +1914,18 @@ mod tests {
             "session.attach",
             json!({"client":{"kind":"agent","tty":false}}),
         );
-        let exec = call(&mut client, &mut reader, 2, "exec", json!({"src":"[1,2,3]"}));
+        let exec = call(
+            &mut client,
+            &mut reader,
+            2,
+            "exec",
+            json!({"src":"[1,2,3]"}),
+        );
         let value = exec.result.unwrap()["value"].clone();
-        assert_eq!(value["$"], "list", "a 3-item list is nowhere near any threshold");
+        assert_eq!(
+            value["$"], "list",
+            "a 3-item list is nowhere near any threshold"
+        );
         assert_eq!(
             value["v"],
             json!([{"$":"int","v":1},{"$":"int","v":2},{"$":"int","v":3}])
@@ -1974,7 +2014,10 @@ mod tests {
             json!({"ref": value_ref, "path": null, "slice": null, "elide": {"max_items": 5}}),
         );
         let value = get.result.unwrap()["value"].clone();
-        assert_eq!(value["$"], "ref", "a tightened per-call budget must elide: {value}");
+        assert_eq!(
+            value["$"], "ref",
+            "a tightened per-call budget must elide: {value}"
+        );
         assert_eq!(value["n"], 10);
         drop(client);
         drop(reader);

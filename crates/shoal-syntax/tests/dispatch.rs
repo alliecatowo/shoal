@@ -141,11 +141,11 @@ fn dispatch_matrix() {
             cmd_bound: &[],
             repl: false,
         },
-        row("ls", "cmd:ls"),                       // unbound → command
-        row("cat nope.txt", "cmd:cat"),            // unbound with args
-        row("FOO=bar ls", "cmd:ls"),               // env-prefix → command
-        row("ls.where(.x==1)", "expr:method"),     // adjacency → EXPR
-        row("run(\"a\", \"b\")", "expr:fncall"),   // dynamic call form
+        row("ls", "cmd:ls"),                     // unbound → command
+        row("cat nope.txt", "cmd:cat"),          // unbound with args
+        row("FOO=bar ls", "cmd:ls"),             // env-prefix → command
+        row("ls.where(.x==1)", "expr:method"),   // adjacency → EXPR
+        row("run(\"a\", \"b\")", "expr:fncall"), // dynamic call form
         Row {
             src: "deploy staging --dry",
             value_bound: &[],

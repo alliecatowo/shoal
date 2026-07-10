@@ -79,19 +79,28 @@ impl ScopeChain {
                 manifest,
             });
         }
-        ScopeChain { cwd: cwd.to_path_buf(), scopes }
+        ScopeChain {
+            cwd: cwd.to_path_buf(),
+            scopes,
+        }
     }
 
     /// The cache key for this chain (paths + mtimes).
     pub fn key(&self) -> ChainKey {
         ChainKey {
-            entries: self.scopes.iter().map(|s| (s.source.clone(), s.mtime)).collect(),
+            entries: self
+                .scopes
+                .iter()
+                .map(|s| (s.source.clone(), s.mtime))
+                .collect(),
         }
     }
 
     /// The nearest scope that constrains `tool`, if any.
     pub fn nearest_for(&self, tool: &str) -> Option<&ScopeEntry> {
-        self.scopes.iter().find(|s| s.manifest.tools.contains_key(tool))
+        self.scopes
+            .iter()
+            .find(|s| s.manifest.tools.contains_key(tool))
     }
 
     /// Merge every scope's runner table (farthest first so nearest wins), atop
@@ -167,7 +176,10 @@ mod tests {
         write(&base.join("a/b/.reef.toml"), "[tools]\nnode = \"22\"\n");
         let chain = ScopeChain::discover(&base.join("a/b/c"), None);
         let near = chain.nearest_for("node").unwrap();
-        assert_eq!(near.manifest.tools["node"].constraint, crate::version::Constraint::parse("22"));
+        assert_eq!(
+            near.manifest.tools["node"].constraint,
+            crate::version::Constraint::parse("22")
+        );
     }
 
     #[test]
@@ -180,7 +192,10 @@ mod tests {
         // The reef entry appears before the mise entry, so nearest_for returns it.
         let near = chain.nearest_for("node").unwrap();
         assert_eq!(near.kind, ManifestKind::Reef);
-        assert_eq!(near.manifest.tools["node"].constraint, crate::version::Constraint::parse("22"));
+        assert_eq!(
+            near.manifest.tools["node"].constraint,
+            crate::version::Constraint::parse("22")
+        );
     }
 
     #[test]
@@ -203,8 +218,16 @@ mod tests {
         let chain = ScopeChain::discover(base, Some(&user));
         assert!(chain.nearest_for("python").unwrap().kind == ManifestKind::ShoalUser);
         // Project scope is nearer than user scope.
-        let idx_proj = chain.scopes.iter().position(|s| s.kind == ManifestKind::Reef).unwrap();
-        let idx_user = chain.scopes.iter().position(|s| s.kind == ManifestKind::ShoalUser).unwrap();
+        let idx_proj = chain
+            .scopes
+            .iter()
+            .position(|s| s.kind == ManifestKind::Reef)
+            .unwrap();
+        let idx_user = chain
+            .scopes
+            .iter()
+            .position(|s| s.kind == ManifestKind::ShoalUser)
+            .unwrap();
         assert!(idx_proj < idx_user);
     }
 
@@ -213,7 +236,10 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let base = root.path();
         // Farther scope overrides `py`; nearer scope overrides it again.
-        write(&base.join(".reef.toml"), "[tools]\nnode = \"22\"\n[runners]\npy = \"python2\"\n");
+        write(
+            &base.join(".reef.toml"),
+            "[tools]\nnode = \"22\"\n[runners]\npy = \"python2\"\n",
+        );
         let sub = base.join("proj");
         write(
             &sub.join(".reef.toml"),
@@ -235,7 +261,10 @@ mod tests {
         let base = root.path();
         write(&base.join(".reef.toml"), "[tools]\nnode = \"22\"\n");
         let sub = base.join("proj");
-        write(&sub.join(".reef.toml"), "[tools]\npython = \"3\"\n[options]\nhermetic = true\n");
+        write(
+            &sub.join(".reef.toml"),
+            "[tools]\npython = \"3\"\n[options]\nhermetic = true\n",
+        );
         let chain = ScopeChain::discover(&sub, None);
         assert!(chain.hermetic(), "any scope requesting hermetic wins");
     }
@@ -277,7 +306,10 @@ mod tests {
     fn filetime_set(p: &Path, t: SystemTime) {
         use std::os::unix::ffi::OsStrExt;
         let secs = t.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs() as libc::time_t;
-        let tv = libc::timeval { tv_sec: secs, tv_usec: 0 };
+        let tv = libc::timeval {
+            tv_sec: secs,
+            tv_usec: 0,
+        };
         let times = [tv, tv];
         let cpath = std::ffi::CString::new(p.as_os_str().as_bytes()).unwrap();
         unsafe {

@@ -83,4 +83,7 @@ pub use resolve::{LockNotice, Policy, Resolution, Resolver};
 pub use runner::{Invocation, RunnerTable, resolve_runner, sniff_shebang};
 pub use scope::{ChainKey, ScopeChain, ScopeEntry};
 pub use version::{Constraint, Version};
-pub use view::{Binding, SynthView, ViewConfig, bindings_hash, default_system_tail, default_view_root, synth_path};
+pub use view::{
+    Binding, SynthView, ViewConfig, bindings_hash, default_system_tail, default_view_root,
+    synth_path,
+};

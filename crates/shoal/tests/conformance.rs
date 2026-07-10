@@ -71,15 +71,16 @@ fn load_cases(dir: &Path) -> Vec<Case> {
     let mut out = Vec::new();
     for path in paths {
         let file_name = path.file_name().unwrap().to_string_lossy().into_owned();
-        let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-        let doc: toml::Value = toml::from_str(&text)
-            .unwrap_or_else(|e| panic!("parse toml {}: {e}", path.display()));
+        let text =
+            fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let doc: toml::Value =
+            toml::from_str(&text).unwrap_or_else(|e| panic!("parse toml {}: {e}", path.display()));
         let Some(cases) = doc.get("case").and_then(toml::Value::as_array) else {
             continue;
         };
         for c in cases {
-            let name = toml_str(c, "name")
-                .unwrap_or_else(|| panic!("case missing `name` in {file_name}"));
+            let name =
+                toml_str(c, "name").unwrap_or_else(|| panic!("case missing `name` in {file_name}"));
             let src = toml_str(c, "src")
                 .unwrap_or_else(|| panic!("case `{name}` missing `src` in {file_name}"));
             out.push(Case {
@@ -138,7 +139,10 @@ fn run_case(case: &Case) -> Result<(), String> {
                     _ => Ok(()),
                 }
             } else {
-                Err(format!("unexpected parse error: {} (span {:?})", e.msg, e.span))
+                Err(format!(
+                    "unexpected parse error: {} (span {:?})",
+                    e.msg, e.span
+                ))
             };
         }
     };
@@ -231,7 +235,10 @@ fn conformance_corpus() {
     for case in &cases {
         if let Some(reason) = &case.skip {
             skipped += 1;
-            println!("conformance: SKIP {} [{}] ({})", case.name, case.file, reason);
+            println!(
+                "conformance: SKIP {} [{}] ({})",
+                case.name, case.file, reason
+            );
             continue;
         }
         match run_case(case) {

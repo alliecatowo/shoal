@@ -25,7 +25,12 @@ impl ScopeDecision {
         constraint: Option<String>,
         outcome: &str,
     ) -> ScopeDecision {
-        ScopeDecision { scope: scope.into(), source, constraint, outcome: outcome.into() }
+        ScopeDecision {
+            scope: scope.into(),
+            source,
+            constraint,
+            outcome: outcome.into(),
+        }
     }
 }
 

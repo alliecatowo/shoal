@@ -12,7 +12,9 @@ use crate::scope::ScopeChain;
 use crate::timestamp::now_rfc3339;
 use crate::version::{Constraint, Version};
 
-use crate::provider::{CargoProvider, MiseProvider, NpmLocalProvider, SystemProvider, VenvProvider};
+use crate::provider::{
+    CargoProvider, MiseProvider, NpmLocalProvider, SystemProvider, VenvProvider,
+};
 
 /// Lock policy at resolve time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,7 +68,10 @@ pub struct Resolver {
 impl Resolver {
     /// Build a resolver from an explicit, ordered provider list.
     pub fn new(providers: Vec<Box<dyn Provider>>) -> Resolver {
-        Resolver { providers, hashes: HashCache::new() }
+        Resolver {
+            providers,
+            hashes: HashCache::new(),
+        }
     }
 
     /// The default provider stack, in tiebreak-precedence order:
@@ -206,7 +211,9 @@ impl Resolver {
         {
             return false;
         }
-        decision.constraint.satisfies(&Version::parse(&entry.version))
+        decision
+            .constraint
+            .satisfies(&Version::parse(&entry.version))
     }
 
     fn resolution_from_lock(
@@ -218,8 +225,11 @@ impl Resolver {
     ) -> ReefResult<Resolution> {
         // Drift check: re-hash the on-disk binary.
         let current = self.hashes.hash_file(&entry.path).map_err(|e| {
-            ReefError::not_found(format!("locked binary {} unreadable: {e}", entry.path.display()))
-                .with_hint("run `reef lock --refresh`")
+            ReefError::not_found(format!(
+                "locked binary {} unreadable: {e}",
+                entry.path.display()
+            ))
+            .with_hint("run `reef lock --refresh`")
         })?;
         if current != entry.blake3 {
             return Err(ReefError::drift(format!(
@@ -263,7 +273,12 @@ impl Resolver {
     ) -> ReefResult<Resolution> {
         let ctx = ProviderCtx::new(chain.cwd.clone());
         let chosen = self
-            .best_candidate(name, &decision.constraint, decision.provider_pin.as_deref(), &ctx)
+            .best_candidate(
+                name,
+                &decision.constraint,
+                decision.provider_pin.as_deref(),
+                &ctx,
+            )
             .ok_or_else(|| {
                 ReefError::not_found(format!(
                     "no candidate for {name} satisfying {}",
@@ -272,9 +287,10 @@ impl Resolver {
                 .with_hint(format!("try `reef fetch {name}`"))
             })?;
 
-        let hash = self.hashes.hash_file(&chosen.path).map_err(|e| {
-            ReefError::provider(format!("hashing {}: {e}", chosen.path.display()))
-        })?;
+        let hash = self
+            .hashes
+            .hash_file(&chosen.path)
+            .map_err(|e| ReefError::provider(format!("hashing {}: {e}", chosen.path.display())))?;
 
         // Report scope: manifest scope when constrained, else system/ambient.
         let scope_label = if decision.constrained {
@@ -360,9 +376,7 @@ impl Resolver {
             .into_iter()
             .max_by(|a, b| {
                 // Higher version wins; then lower provider index; then lower path.
-                a.0.cmp(&b.0)
-                    .then(b.1.cmp(&a.1))
-                    .then(b.2.cmp(&a.2))
+                a.0.cmp(&b.0).then(b.1.cmp(&a.1)).then(b.2.cmp(&a.2))
             })
             .map(|(_, _, _, c)| c)
     }
@@ -434,7 +448,11 @@ mod tests {
             self.name
         }
         fn discover(&self, tool: &str, _ctx: &ProviderCtx) -> Vec<Candidate> {
-            self.cands.iter().filter(|c| c.tool == tool).cloned().collect()
+            self.cands
+                .iter()
+                .filter(|c| c.tool == tool)
+                .cloned()
+                .collect()
         }
         fn fetch(
             &self,
@@ -476,7 +494,12 @@ mod tests {
         let chain = chain_with("[tools]\nnode = \"22\"\n", dir.path());
         let r = resolver_with(vec![(
             "mise",
-            vec![Candidate::new("node", Version::parse("22.3.0"), bin.clone(), "mise")],
+            vec![Candidate::new(
+                "node",
+                Version::parse("22.3.0"),
+                bin.clone(),
+                "mise",
+            )],
         )]);
         let mut lock = Lockfile::new();
         let mut notices = Vec::new();
@@ -498,7 +521,12 @@ mod tests {
         let chain = chain_with("[tools]\nnode = \"22\"\n", dir.path());
         let r = resolver_with(vec![(
             "mise",
-            vec![Candidate::new("node", Version::parse("22.3.0"), bin, "mise")],
+            vec![Candidate::new(
+                "node",
+                Version::parse("22.3.0"),
+                bin,
+                "mise",
+            )],
         )]);
         let mut lock = Lockfile::new();
         let err = r
@@ -514,7 +542,12 @@ mod tests {
         let chain = chain_with("[tools]\nnode = \"22\"\n", dir.path());
         let r = resolver_with(vec![(
             "mise",
-            vec![Candidate::new("node", Version::parse("22.3.0"), bin.clone(), "mise")],
+            vec![Candidate::new(
+                "node",
+                Version::parse("22.3.0"),
+                bin.clone(),
+                "mise",
+            )],
         )]);
         // Pre-lock interactively, then resolve under script policy.
         let mut lock = Lockfile::new();
@@ -534,7 +567,12 @@ mod tests {
         let chain = chain_with("[tools]\nnode = \"22\"\n", dir.path());
         let r = resolver_with(vec![(
             "mise",
-            vec![Candidate::new("node", Version::parse("22.3.0"), bin.clone(), "mise")],
+            vec![Candidate::new(
+                "node",
+                Version::parse("22.3.0"),
+                bin.clone(),
+                "mise",
+            )],
         )]);
         let mut lock = Lockfile::new();
         r.resolve("node", &chain, &mut lock, Policy::Interactive, &mut |_| {})
@@ -551,9 +589,20 @@ mod tests {
         let old_hash = short(&crate::hashcache::hash_bytes(b"node-22-orig"));
         let new_hash = short(&crate::hashcache::hash_bytes(b"node-22-TAMPERED"));
         assert_ne!(old_hash, new_hash);
-        assert!(msg.contains(&old_hash), "message {msg:?} missing old hash {old_hash}");
-        assert!(msg.contains(&new_hash), "message {msg:?} missing new hash {new_hash}");
-        assert!(err.hint.as_deref().unwrap_or("").contains("reef lock --refresh"));
+        assert!(
+            msg.contains(&old_hash),
+            "message {msg:?} missing old hash {old_hash}"
+        );
+        assert!(
+            msg.contains(&new_hash),
+            "message {msg:?} missing new hash {new_hash}"
+        );
+        assert!(
+            err.hint
+                .as_deref()
+                .unwrap_or("")
+                .contains("reef lock --refresh")
+        );
     }
 
     #[test]
@@ -563,7 +612,12 @@ mod tests {
         let chain = chain_with("[tools]\nnode = \"22\"\n", dir.path());
         let r = resolver_with(vec![(
             "mise",
-            vec![Candidate::new("node", Version::parse("22.3.0"), bin.clone(), "mise")],
+            vec![Candidate::new(
+                "node",
+                Version::parse("22.3.0"),
+                bin.clone(),
+                "mise",
+            )],
         )]);
         let mut lock = Lockfile::new();
         r.resolve("node", &chain, &mut lock, Policy::Interactive, &mut |_| {})
@@ -577,8 +631,12 @@ mod tests {
             "reef_drift"
         );
         // …refresh heals it.
-        r.refresh_lock("node", &chain, &mut lock, &mut |_| {}).unwrap();
-        assert!(r.resolve("node", &chain, &mut lock, Policy::Script, &mut |_| {}).is_ok());
+        r.refresh_lock("node", &chain, &mut lock, &mut |_| {})
+            .unwrap();
+        assert!(
+            r.resolve("node", &chain, &mut lock, Policy::Script, &mut |_| {})
+                .is_ok()
+        );
     }
 
     #[test]
@@ -609,10 +667,18 @@ mod tests {
     fn conflicting_provider_pins_across_scopes() {
         let root = tempfile::tempdir().unwrap();
         let base = root.path();
-        std::fs::write(base.join(".reef.toml"), "[tools]\ngo = { provider = \"mise\" }\n").unwrap();
+        std::fs::write(
+            base.join(".reef.toml"),
+            "[tools]\ngo = { provider = \"mise\" }\n",
+        )
+        .unwrap();
         let sub = base.join("proj");
         std::fs::create_dir_all(&sub).unwrap();
-        std::fs::write(sub.join(".reef.toml"), "[tools]\ngo = { provider = \"system\" }\n").unwrap();
+        std::fs::write(
+            sub.join(".reef.toml"),
+            "[tools]\ngo = { provider = \"system\" }\n",
+        )
+        .unwrap();
         let chain = ScopeChain::discover(&sub, None);
         let r = resolver_with(vec![("mise", vec![]), ("system", vec![])]);
         let mut lock = Lockfile::new();
@@ -637,7 +703,12 @@ mod tests {
         let chain = ScopeChain::discover(&sub, None);
         let r = resolver_with(vec![(
             "mise",
-            vec![Candidate::new("node", Version::parse("22.3.9"), bin, "mise")],
+            vec![Candidate::new(
+                "node",
+                Version::parse("22.3.9"),
+                bin,
+                "mise",
+            )],
         )]);
         let mut lock = Lockfile::new();
         let res = r
@@ -655,11 +726,24 @@ mod tests {
         let chain = ScopeChain::discover(dir.path(), None);
         // Same version from two providers → provider order (index 0) wins.
         let r = resolver_with(vec![
-            ("mise", vec![Candidate::new("t", Version::parse("1.0.0"), a.clone(), "mise")]),
-            ("system", vec![Candidate::new("t", Version::parse("1.0.0"), b, "system")]),
+            (
+                "mise",
+                vec![Candidate::new(
+                    "t",
+                    Version::parse("1.0.0"),
+                    a.clone(),
+                    "mise",
+                )],
+            ),
+            (
+                "system",
+                vec![Candidate::new("t", Version::parse("1.0.0"), b, "system")],
+            ),
         ]);
         let mut lock = Lockfile::new();
-        let res = r.resolve("t", &chain, &mut lock, Policy::Interactive, &mut |_| {}).unwrap();
+        let res = r
+            .resolve("t", &chain, &mut lock, Policy::Interactive, &mut |_| {})
+            .unwrap();
         assert_eq!(res.provider, "mise");
         assert_eq!(res.path, a);
     }
@@ -678,7 +762,9 @@ mod tests {
             ],
         )]);
         let mut lock = Lockfile::new();
-        let res = r.resolve("t", &chain, &mut lock, Policy::Interactive, &mut |_| {}).unwrap();
+        let res = r
+            .resolve("t", &chain, &mut lock, Policy::Interactive, &mut |_| {})
+            .unwrap();
         assert_eq!(res.path, hi);
         assert_eq!(res.version.raw(), "1.10.0");
     }
@@ -694,7 +780,9 @@ mod tests {
         )]);
         let mut lock = Lockfile::new();
         // Even under Script policy, unconstrained tools resolve fine.
-        let res = r.resolve("ls", &chain, &mut lock, Policy::Script, &mut |_| {}).unwrap();
+        let res = r
+            .resolve("ls", &chain, &mut lock, Policy::Script, &mut |_| {})
+            .unwrap();
         assert!(!res.constrained);
         assert!(!res.locked_now);
         assert!(lock.get("ls").is_none());
@@ -720,11 +808,24 @@ mod tests {
         let s = write_exe(dir.path(), "s", "s");
         let chain = chain_with("[tools]\ngo = { provider = \"mise\" }\n", dir.path());
         let r = resolver_with(vec![
-            ("system", vec![Candidate::new("go", Version::unknown(), s, "system")]),
-            ("mise", vec![Candidate::new("go", Version::parse("1.21"), m.clone(), "mise")]),
+            (
+                "system",
+                vec![Candidate::new("go", Version::unknown(), s, "system")],
+            ),
+            (
+                "mise",
+                vec![Candidate::new(
+                    "go",
+                    Version::parse("1.21"),
+                    m.clone(),
+                    "mise",
+                )],
+            ),
         ]);
         let mut lock = Lockfile::new();
-        let res = r.resolve("go", &chain, &mut lock, Policy::Interactive, &mut |_| {}).unwrap();
+        let res = r
+            .resolve("go", &chain, &mut lock, Policy::Interactive, &mut |_| {})
+            .unwrap();
         assert_eq!(res.provider, "mise");
         assert_eq!(res.path, m);
     }
@@ -736,11 +837,23 @@ mod tests {
         let chain = chain_with("[tools]\nnode = \"22\"\nother = \"1\"\n", dir.path());
         let r = resolver_with(vec![(
             "mise",
-            vec![Candidate::new("node", Version::parse("22.0.0"), bin, "mise")],
+            vec![Candidate::new(
+                "node",
+                Version::parse("22.0.0"),
+                bin,
+                "mise",
+            )],
         )]);
         let mut lock = Lockfile::new();
-        let res = r.resolve("node", &chain, &mut lock, Policy::Interactive, &mut |_| {}).unwrap();
-        let sel = res.report.chain.iter().find(|d| d.outcome == "selected").unwrap();
+        let res = r
+            .resolve("node", &chain, &mut lock, Policy::Interactive, &mut |_| {})
+            .unwrap();
+        let sel = res
+            .report
+            .chain
+            .iter()
+            .find(|d| d.outcome == "selected")
+            .unwrap();
         assert_eq!(sel.constraint.as_deref(), Some("22"));
     }
 }

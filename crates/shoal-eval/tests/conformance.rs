@@ -69,7 +69,10 @@ fn normative_conformance_corpus() {
 
     let ran = passed + failures.len();
     let failed = failures.len();
-    println!("conformance: {passed} passed, {failed} failed, {skipped} skipped (of {} total cases)", ran + skipped);
+    println!(
+        "conformance: {passed} passed, {failed} failed, {skipped} skipped (of {} total cases)",
+        ran + skipped
+    );
 
     assert!(
         ran >= 75,
@@ -96,7 +99,8 @@ fn run_case(file: &Path, case: &Case) -> Result<(), String> {
         if fixture.ends_with('/') {
             fs::create_dir_all(&path).map_err(|e| format!("fixture mkdir: {e}"))?;
         } else {
-            fs::create_dir_all(path.parent().unwrap()).map_err(|e| format!("fixture mkdir: {e}"))?;
+            fs::create_dir_all(path.parent().unwrap())
+                .map_err(|e| format!("fixture mkdir: {e}"))?;
             fs::write(path, []).map_err(|e| format!("fixture write: {e}"))?;
         }
     }
