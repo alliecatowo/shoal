@@ -38,7 +38,11 @@ pub fn render_duration(ns: i64) -> String {
     if ns == 0 {
         return "0s".to_string();
     }
-    let (sign, mut rest) = if ns < 0 { ("-", ns.unsigned_abs()) } else { ("", ns.unsigned_abs()) };
+    let (sign, mut rest) = if ns < 0 {
+        ("-", ns.unsigned_abs())
+    } else {
+        ("", ns.unsigned_abs())
+    };
     const UNITS: [(&str, u64); 8] = [
         ("w", 604_800_000_000_000),
         ("d", 86_400_000_000_000),
@@ -87,7 +91,9 @@ fn escape_str(s: &str) -> String {
 
 fn ident_shaped(s: &str) -> bool {
     !s.is_empty()
-        && s.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && s.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
         && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
@@ -95,7 +101,11 @@ fn render_record_inline(r: &Record) -> String {
     let fields: Vec<String> = r
         .iter()
         .map(|(k, v)| {
-            let key = if ident_shaped(k) { k.clone() } else { format!("\"{}\"", escape_str(k)) };
+            let key = if ident_shaped(k) {
+                k.clone()
+            } else {
+                format!("\"{}\"", escape_str(k))
+            };
             format!("{key}: {}", render_inline(v))
         })
         .collect();
@@ -112,7 +122,11 @@ pub fn render_inline(v: &Value) -> String {
             if f.is_nan() {
                 "nan".into()
             } else if f.is_infinite() {
-                if *f > 0.0 { "inf".into() } else { "-inf".into() }
+                if *f > 0.0 {
+                    "inf".into()
+                } else {
+                    "-inf".into()
+                }
             } else {
                 format!("{f}")
             }
@@ -120,7 +134,11 @@ pub fn render_inline(v: &Value) -> String {
         Value::Str(s) => format!("\"{}\"", escape_str(s)),
         Value::Path(p) => {
             let d = p.to_string_lossy();
-            if d.contains(' ') { format!("\"{d}\"") } else { d.into_owned() }
+            if d.contains(' ') {
+                format!("\"{d}\"")
+            } else {
+                d.into_owned()
+            }
         }
         Value::Glob(g) => g.pattern.clone(),
         Value::Regex(r) => format!("re\"{}\"", r.src),
@@ -139,7 +157,12 @@ pub fn render_inline(v: &Value) -> String {
             format!("[{}]", items.join(", "))
         }
         Value::Range(r) => {
-            format!("{}{}{}", r.start, if r.inclusive { "..=" } else { ".." }, r.end)
+            format!(
+                "{}{}{}",
+                r.start,
+                if r.inclusive { "..=" } else { ".." },
+                r.end
+            )
         }
         Value::Stream(s) => format!("stream<{}>", s.label),
         Value::Error(e) => format!("error({}: {})", e.code, e.msg),
@@ -195,7 +218,11 @@ fn truncate_display(s: &str, max: usize) -> String {
 
 fn pad_to(s: &str, width: usize) -> String {
     let w = s.width();
-    if w >= width { s.to_string() } else { format!("{s}{}", " ".repeat(width - w)) }
+    if w >= width {
+        s.to_string()
+    } else {
+        format!("{s}{}", " ".repeat(width - w))
+    }
 }
 
 /// Pretty table for `list<record>`-shaped data.
@@ -279,14 +306,20 @@ pub fn render_block(v: &Value, width: usize) -> String {
         }
         Value::Record(r) => {
             let keyw = r.keys().map(|k| k.width()).max().unwrap_or(0);
-            let lines: Vec<String> =
-                r.iter().map(|(k, v)| format!("{}  {}", pad_to(k, keyw), render_cell(v))).collect();
+            let lines: Vec<String> = r
+                .iter()
+                .map(|(k, v)| format!("{}  {}", pad_to(k, keyw), render_cell(v)))
+                .collect();
             lines.join("\n")
         }
         Value::Outcome(o) => {
             let text = String::from_utf8_lossy(&o.stdout);
             let text = text.strip_suffix('\n').unwrap_or(&text);
-            if text.is_empty() { render_inline(v) } else { text.to_string() }
+            if text.is_empty() {
+                render_inline(v)
+            } else {
+                text.to_string()
+            }
         }
         Value::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
         Value::Error(e) => {

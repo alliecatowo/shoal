@@ -265,7 +265,10 @@ pub fn unop(op: shoal_ast::UnOp, v: &Value) -> VResult<Value> {
         shoal_ast::UnOp::Not => match v {
             Bool(b) => Ok(Bool(!b)),
             Outcome(o) => Ok(Bool(!o.ok)),
-            other => Err(ErrorVal::type_error(format!("cannot negate {}", other.type_name()))),
+            other => Err(ErrorVal::type_error(format!(
+                "cannot negate {}",
+                other.type_name()
+            ))),
         },
         shoal_ast::UnOp::Neg => match v {
             Int(i) => i
@@ -289,7 +292,10 @@ mod tests {
 
     #[test]
     fn matrix() {
-        assert_eq!(binop(Add, &Value::Int(2), &Value::Int(3)).unwrap(), Value::Int(5));
+        assert_eq!(
+            binop(Add, &Value::Int(2), &Value::Int(3)).unwrap(),
+            Value::Int(5)
+        );
         assert_eq!(
             binop(Add, &Value::Int(1), &Value::Float(0.5)).unwrap(),
             Value::Float(1.5)
@@ -312,14 +318,21 @@ mod tests {
             binop(Add, &Value::Str("a".into()), &Value::Str("b".into())).unwrap(),
             Value::Str("ab".into())
         );
-        assert_eq!(binop(Div, &Value::Int(7), &Value::Int(2)).unwrap(), Value::Int(3));
+        assert_eq!(
+            binop(Div, &Value::Int(7), &Value::Int(2)).unwrap(),
+            Value::Int(3)
+        );
         assert_eq!(
             binop(Div, &Value::Int(1), &Value::Int(0)).unwrap_err().code,
             "div_zero"
         );
         assert_eq!(
-            binop(Sub, &Value::Duration(90_000_000_000), &Value::Duration(30_000_000_000))
-                .unwrap(),
+            binop(
+                Sub,
+                &Value::Duration(90_000_000_000),
+                &Value::Duration(30_000_000_000)
+            )
+            .unwrap(),
             Value::Duration(60_000_000_000)
         );
     }

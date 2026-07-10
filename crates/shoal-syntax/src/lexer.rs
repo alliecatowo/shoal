@@ -24,7 +24,11 @@ pub enum Tok {
     Float(f64),
     Size(u64),
     Duration(i64),
-    Time { hour: u8, min: u8, sec: u8 },
+    Time {
+        hour: u8,
+        min: u8,
+        sec: u8,
+    },
     /// Fully-unescaped non-interpolating string.
     Str(String),
     /// Interpolating string: literal segments and embedded expression sources.
@@ -105,7 +109,10 @@ pub enum Tok {
 pub enum Seg {
     Lit(String),
     /// Embedded `{expr}` — byte range of the expression source.
-    Expr { start: u32, end: u32 },
+    Expr {
+        start: u32,
+        end: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -117,7 +124,11 @@ pub struct LexError {
 
 impl LexError {
     fn new(msg: impl Into<String>, span: Span) -> LexError {
-        LexError { msg: msg.into(), span, hint: None }
+        LexError {
+            msg: msg.into(),
+            span,
+            hint: None,
+        }
     }
     fn hint(mut self, h: impl Into<String>) -> LexError {
         self.hint = Some(h.into());
@@ -139,11 +150,18 @@ pub const RESERVED: &[&str] = &[
 
 impl<'s> Lexer<'s> {
     pub fn new(src: &'s str) -> Lexer<'s> {
-        Lexer { src, bytes: src.as_bytes() }
+        Lexer {
+            src,
+            bytes: src.as_bytes(),
+        }
     }
 
     fn at(&self, pos: usize) -> u8 {
-        if pos < self.bytes.len() { self.bytes[pos] } else { 0 }
+        if pos < self.bytes.len() {
+            self.bytes[pos]
+        } else {
+            0
+        }
     }
 
     /// Skip spaces/tabs (not newlines), comments, and `\`-newline continuations.
@@ -179,8 +197,10 @@ impl<'s> Lexer<'s> {
             b';' => Ok((Tok::Semi, Span::new(pos, pos + 1))),
             b'"' => self.string(pos),
             b'\'' => self.raw_string(pos),
-            b'`' => Err(LexError::new("backtick is not shoal syntax", Span::new(pos, pos + 1))
-                .hint("command substitution is (cmd …); verbatim POSIX lives in sh { … }")),
+            b'`' => Err(
+                LexError::new("backtick is not shoal syntax", Span::new(pos, pos + 1))
+                    .hint("command substitution is (cmd …); verbatim POSIX lives in sh { … }"),
+            ),
             _ => match mode {
                 Mode::Cmd => self.cmd_token(pos),
                 Mode::Expr => self.expr_token(pos),
@@ -252,8 +272,11 @@ impl<'s> Lexer<'s> {
                     .hint("write `name`, not `$name`; environment variables are `env.NAME`"));
                 }
                 b'`' => {
-                    return Err(LexError::new("backtick is not shoal syntax", Span::new(pos, pos + 1))
-                        .hint("command substitution is (cmd …); verbatim POSIX lives in sh { … }"));
+                    return Err(LexError::new(
+                        "backtick is not shoal syntax",
+                        Span::new(pos, pos + 1),
+                    )
+                    .hint("command substitution is (cmd …); verbatim POSIX lives in sh { … }"));
                 }
                 b'*' | b'?' => {
                     has_glob = true;
@@ -268,7 +291,10 @@ impl<'s> Lexer<'s> {
         }
         let text = &self.src[start..pos];
         if text.is_empty() {
-            return Err(LexError::new("unexpected character", Span::new(start, start + 1)));
+            return Err(LexError::new(
+                "unexpected character",
+                Span::new(start, start + 1),
+            ));
         }
         let span = Span::new(start, pos);
         // Shape classification, in priority order.
@@ -399,8 +425,10 @@ impl<'s> Lexer<'s> {
                 if self.at(pos + 1) == b'&' {
                     two(Tok::AndAnd)
                 } else {
-                    Err(LexError::new("`&` is not an operator here", Span::new(pos, pos + 1))
-                        .hint("backgrounding with & is command syntax; logical and is &&"))
+                    Err(
+                        LexError::new("`&` is not an operator here", Span::new(pos, pos + 1))
+                            .hint("backgrounding with & is command syntax; logical and is &&"),
+                    )
                 }
             }
             b'|' => {
@@ -429,14 +457,19 @@ impl<'s> Lexer<'s> {
                 }
             }
             b'^' => one(Tok::Caret),
-            b'$' => Err(LexError::new("shoal variables have no sigil", Span::new(pos, pos + 1))
-                .hint("write `name`, not `$name`; environment variables are `env.NAME`")),
+            b'$' => Err(
+                LexError::new("shoal variables have no sigil", Span::new(pos, pos + 1))
+                    .hint("write `name`, not `$name`; environment variables are `env.NAME`"),
+            ),
             b'0'..=b'9' => self.number(pos),
             c if c == b'_' || c.is_ascii_alphabetic() => self.ident_or_tagged(pos),
             _ => {
                 // Non-ASCII identifier start? Keep identifiers ASCII per TDD §2.3.
                 Err(LexError::new(
-                    format!("unexpected character `{}`", &self.src[pos..].chars().next().unwrap()),
+                    format!(
+                        "unexpected character `{}`",
+                        &self.src[pos..].chars().next().unwrap()
+                    ),
                     Span::new(pos, pos + 1),
                 ))
             }
@@ -475,9 +508,15 @@ impl<'s> Lexer<'s> {
             pos += 1;
         }
         if pos >= self.bytes.len() {
-            return Err(LexError::new("unterminated tagged literal", Span::new(start, pos)));
+            return Err(LexError::new(
+                "unterminated tagged literal",
+                Span::new(start, pos),
+            ));
         }
-        Ok((Tok::Regex(self.src[quote + 1..pos].to_string()), Span::new(start, pos + 1)))
+        Ok((
+            Tok::Regex(self.src[quote + 1..pos].to_string()),
+            Span::new(start, pos + 1),
+        ))
     }
 
     fn number(&self, start: usize) -> LexResult {
@@ -498,11 +537,12 @@ impl<'s> Lexer<'s> {
             {
                 pos += 1;
             }
-            let digits: String =
-                self.src[digits_start..pos].chars().filter(|&c| c != '_').collect();
-            let v = i64::from_str_radix(&digits, radix).map_err(|_| {
-                LexError::new("invalid numeric literal", Span::new(start, pos))
-            })?;
+            let digits: String = self.src[digits_start..pos]
+                .chars()
+                .filter(|&c| c != '_')
+                .collect();
+            let v = i64::from_str_radix(&digits, radix)
+                .map_err(|_| LexError::new("invalid numeric literal", Span::new(start, pos)))?;
             return Ok((Tok::Int(v), Span::new(start, pos)));
         }
 
@@ -554,9 +594,8 @@ impl<'s> Lexer<'s> {
             const DUR_UNITS: &[&str] = &["ns", "us", "ms", "s", "m", "h", "d", "w"];
             if SIZE_UNITS.contains(&lower.as_str()) {
                 let word = format!("{num_text}{lower}");
-                let v = shoal_value_parse_size(&word).ok_or_else(|| {
-                    LexError::new("invalid size literal", Span::new(start, upos))
-                })?;
+                let v = shoal_value_parse_size(&word)
+                    .ok_or_else(|| LexError::new("invalid size literal", Span::new(start, upos)))?;
                 return Ok((Tok::Size(v), Span::new(start, upos)));
             }
             if DUR_UNITS.contains(&lower.as_str()) {
@@ -579,9 +618,9 @@ impl<'s> Lexer<'s> {
                 .map_err(|_| LexError::new("invalid float literal", Span::new(start, pos)))?;
             Ok((Tok::Float(v), Span::new(start, pos)))
         } else {
-            let v: i64 = num_text
-                .parse()
-                .map_err(|_| LexError::new("integer literal out of range", Span::new(start, pos)))?;
+            let v: i64 = num_text.parse().map_err(|_| {
+                LexError::new("integer literal out of range", Span::new(start, pos))
+            })?;
             Ok((Tok::Int(v), Span::new(start, pos)))
         }
     }
@@ -634,7 +673,10 @@ impl<'s> Lexer<'s> {
             }
         }
         if hour > 23 || min > 59 || sec > 59 {
-            return Some(Err(LexError::new("invalid time literal", Span::new(start, pos))));
+            return Some(Err(LexError::new(
+                "invalid time literal",
+                Span::new(start, pos),
+            )));
         }
         Some(Ok((Tok::Time { hour, min, sec }, Span::new(start, pos))))
     }
@@ -679,7 +721,10 @@ impl<'s> Lexer<'s> {
                     if !lit.is_empty() {
                         segs.push(Seg::Lit(std::mem::take(&mut lit)));
                     }
-                    segs.push(Seg::Expr { start: expr_start as u32, end: expr_end as u32 });
+                    segs.push(Seg::Expr {
+                        start: expr_start as u32,
+                        end: expr_end as u32,
+                    });
                     pos = expr_end + 1;
                 }
                 b'\n' if !triple => {
@@ -799,13 +844,18 @@ impl<'s> Lexer<'s> {
         let mut pos = start + open_len;
         while pos < self.bytes.len() && !self.src[pos..].starts_with(close) {
             if !triple && self.at(pos) == b'\n' {
-                return Err(LexError::new("unterminated string (newline)", Span::new(start, pos))
-                    .hint("use '''…''' for multiline raw strings"));
+                return Err(
+                    LexError::new("unterminated string (newline)", Span::new(start, pos))
+                        .hint("use '''…''' for multiline raw strings"),
+                );
             }
             pos += 1;
         }
         if pos >= self.bytes.len() {
-            return Err(LexError::new("unterminated raw string", Span::new(start, pos)));
+            return Err(LexError::new(
+                "unterminated raw string",
+                Span::new(start, pos),
+            ));
         }
         let mut text = self.src[start + open_len..pos].to_string();
         if triple {
@@ -849,8 +899,10 @@ impl<'s> Lexer<'s> {
             }
             pos += 1;
         }
-        Err(LexError::new("unterminated sh { … } block", Span::new(open, pos))
-            .hint("for payloads with unbalanced braces use sh''' … '''"))
+        Err(
+            LexError::new("unterminated sh { … } block", Span::new(open, pos))
+                .hint("for payloads with unbalanced braces use sh''' … '''"),
+        )
     }
 }
 
@@ -878,7 +930,13 @@ fn dedent(text: &str) -> String {
         .min()
         .unwrap_or(0);
     text.lines()
-        .map(|l| if l.len() >= indent { &l[indent..] } else { l.trim_start() })
+        .map(|l| {
+            if l.len() >= indent {
+                &l[indent..]
+            } else {
+                l.trim_start()
+            }
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -1006,8 +1064,22 @@ mod tests {
         assert_eq!(tok("1.5gb", Mode::Expr), Tok::Size(1_500_000_000));
         assert_eq!(tok("4kib", Mode::Expr), Tok::Size(4096));
         assert_eq!(tok("250ms", Mode::Expr), Tok::Duration(250_000_000));
-        assert_eq!(tok("10:00am", Mode::Expr), Tok::Time { hour: 10, min: 0, sec: 0 });
-        assert_eq!(tok("23:15", Mode::Expr), Tok::Time { hour: 23, min: 15, sec: 0 });
+        assert_eq!(
+            tok("10:00am", Mode::Expr),
+            Tok::Time {
+                hour: 10,
+                min: 0,
+                sec: 0
+            }
+        );
+        assert_eq!(
+            tok("23:15", Mode::Expr),
+            Tok::Time {
+                hour: 23,
+                min: 15,
+                sec: 0
+            }
+        );
     }
 
     #[test]
@@ -1033,24 +1105,42 @@ mod tests {
             other => panic!("expected interp, got {other:?}"),
         }
         assert_eq!(tok(r#"re"\d+""#, Mode::Expr), Tok::Regex("\\d+".into()));
-        assert_eq!(tok(r#"t"2026-07-09""#, Mode::Expr), Tok::DateTime("2026-07-09".into()));
+        assert_eq!(
+            tok(r#"t"2026-07-09""#, Mode::Expr),
+            Tok::DateTime("2026-07-09".into())
+        );
     }
 
     #[test]
     fn cmd_words() {
         assert_eq!(tok("push", Mode::Cmd), Tok::Word("push".into()));
-        assert_eq!(tok("./deploy.sh", Mode::Cmd), Tok::PathWord("./deploy.sh".into()));
+        assert_eq!(
+            tok("./deploy.sh", Mode::Cmd),
+            Tok::PathWord("./deploy.sh".into())
+        );
         assert_eq!(tok("~/x", Mode::Cmd), Tok::PathWord("~/x".into()));
         assert_eq!(tok("*.rs", Mode::Cmd), Tok::GlobWord("*.rs".into()));
-        assert_eq!(tok("src/**/*.rs", Mode::Cmd), Tok::GlobWord("src/**/*.rs".into()));
-        assert_eq!(tok("file[0-9].txt", Mode::Cmd), Tok::GlobWord("file[0-9].txt".into()));
+        assert_eq!(
+            tok("src/**/*.rs", Mode::Cmd),
+            Tok::GlobWord("src/**/*.rs".into())
+        );
+        assert_eq!(
+            tok("file[0-9].txt", Mode::Cmd),
+            Tok::GlobWord("file[0-9].txt".into())
+        );
         assert_eq!(tok("--release", Mode::Cmd), Tok::FlagLong("release".into()));
-        assert_eq!(tok("--jobs=4", Mode::Cmd), Tok::FlagLongEq("jobs".into(), "4".into()));
+        assert_eq!(
+            tok("--jobs=4", Mode::Cmd),
+            Tok::FlagLongEq("jobs".into(), "4".into())
+        );
         assert_eq!(tok("--dry-run", Mode::Cmd), Tok::FlagLong("dry_run".into()));
         assert_eq!(tok("-rf", Mode::Cmd), Tok::FlagShort("rf".into()));
         assert_eq!(tok("--", Mode::Cmd), Tok::DashDash);
         assert_eq!(tok("-", Mode::Cmd), Tok::Dash);
-        assert_eq!(tok("NAME=v", Mode::Cmd), Tok::EnvAssign("NAME".into(), "v".into()));
+        assert_eq!(
+            tok("NAME=v", Mode::Cmd),
+            Tok::EnvAssign("NAME".into(), "v".into())
+        );
         assert_eq!(tok("ver#2", Mode::Cmd), Tok::Word("ver#2".into()));
     }
 

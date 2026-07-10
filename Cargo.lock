@@ -950,6 +950,7 @@ dependencies = [
  "serde_json",
  "shoal-ast",
  "shoal-value",
+ "tempfile",
  "toml",
 ]
 
@@ -981,6 +982,7 @@ dependencies = [
 name = "shoal-exec"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "libc",
  "portable-pty",
 ]

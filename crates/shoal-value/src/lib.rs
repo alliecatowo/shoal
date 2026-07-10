@@ -130,7 +130,10 @@ pub struct RegexVal {
 impl RegexVal {
     pub fn compile(src: &str) -> VResult<RegexVal> {
         regex::Regex::new(src)
-            .map(|re| RegexVal { src: src.to_string(), re })
+            .map(|re| RegexVal {
+                src: src.to_string(),
+                re,
+            })
             .map_err(|e| ErrorVal::new("arg_error", format!("invalid regex: {e}")))
     }
 }
@@ -152,18 +155,35 @@ pub struct RangeVal {
 impl RangeVal {
     pub fn iter(&self) -> impl Iterator<Item = i64> + Send + use<> {
         let (start, end, inclusive) = (self.start, self.end, self.inclusive);
-        let last = if inclusive { end } else { end.saturating_sub(1) };
+        let last = if inclusive {
+            end
+        } else {
+            end.saturating_sub(1)
+        };
         start..=last
     }
     pub fn len(&self) -> usize {
-        let last = if self.inclusive { self.end } else { self.end - 1 };
-        if last < self.start { 0 } else { (last - self.start + 1) as usize }
+        let last = if self.inclusive {
+            self.end
+        } else {
+            self.end - 1
+        };
+        if last < self.start {
+            0
+        } else {
+            (last - self.start + 1) as usize
+        }
     }
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
     pub fn contains(&self, v: i64) -> bool {
-        v >= self.start && (if self.inclusive { v <= self.end } else { v < self.end })
+        v >= self.start
+            && (if self.inclusive {
+                v <= self.end
+            } else {
+                v < self.end
+            })
     }
 }
 
@@ -190,10 +210,10 @@ impl OutcomeVal {
         let text = String::from_utf8_lossy(&self.stdout);
         let trimmed = text.strip_suffix('\n').unwrap_or(&text);
         let first = trimmed.trim_start().chars().next();
-        if matches!(first, Some('{') | Some('[')) {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                return json_to_value(&json);
-            }
+        if matches!(first, Some('{') | Some('['))
+            && let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed)
+        {
+            return json_to_value(&json);
         }
         Value::Str(trimmed.to_string())
     }
@@ -227,9 +247,11 @@ pub fn json_to_value(j: &serde_json::Value) -> Value {
                 Value::List(vals)
             }
         }
-        serde_json::Value::Object(m) => {
-            Value::Record(m.iter().map(|(k, v)| (k.clone(), json_to_value(v))).collect())
-        }
+        serde_json::Value::Object(m) => Value::Record(
+            m.iter()
+                .map(|(k, v)| (k.clone(), json_to_value(v)))
+                .collect(),
+        ),
     }
 }
 
@@ -250,14 +272,18 @@ pub fn value_to_json(v: &Value) -> serde_json::Value {
         Value::Time(t) => json!(render::render_time(t)),
         Value::Bytes(b) => json!(String::from_utf8_lossy(b)),
         Value::List(xs) => serde_json::Value::Array(xs.iter().map(value_to_json).collect()),
-        Value::Record(r) => {
-            serde_json::Value::Object(r.iter().map(|(k, v)| (k.clone(), value_to_json(v))).collect())
-        }
+        Value::Record(r) => serde_json::Value::Object(
+            r.iter()
+                .map(|(k, v)| (k.clone(), value_to_json(v)))
+                .collect(),
+        ),
         Value::Table(rows) => serde_json::Value::Array(
             rows.iter()
                 .map(|r| {
                     serde_json::Value::Object(
-                        r.iter().map(|(k, v)| (k.clone(), value_to_json(v))).collect(),
+                        r.iter()
+                            .map(|(k, v)| (k.clone(), value_to_json(v)))
+                            .collect(),
                     )
                 })
                 .collect(),
@@ -308,8 +334,10 @@ impl StreamVal {
         let mut g = self.inner.lock().unwrap();
         match std::mem::replace(&mut *g, StreamState::Consumed) {
             StreamState::Ready(it) => Ok(it),
-            StreamState::Consumed => Err(ErrorVal::new("stream_consumed", "stream already consumed")
-                .with_hint("collect first (`.collect()`), or `.tee(2)` to split")),
+            StreamState::Consumed => {
+                Err(ErrorVal::new("stream_consumed", "stream already consumed")
+                    .with_hint("collect first (`.collect()`), or `.tee(2)` to split"))
+            }
         }
     }
 
@@ -443,11 +471,20 @@ pub struct ErrorVal {
     pub span: Option<Span>,
     pub hint: Option<String>,
     pub stderr: Option<String>,
+    /// External process exit status when this error originated from a command.
+    pub status: Option<i32>,
 }
 
 impl ErrorVal {
     pub fn new(code: impl Into<String>, msg: impl Into<String>) -> ErrorVal {
-        ErrorVal { code: code.into(), msg: msg.into(), span: None, hint: None, stderr: None }
+        ErrorVal {
+            code: code.into(),
+            msg: msg.into(),
+            span: None,
+            hint: None,
+            stderr: None,
+            status: None,
+        }
     }
     pub fn with_span(mut self, span: Span) -> ErrorVal {
         self.span = Some(span);
@@ -460,6 +497,14 @@ impl ErrorVal {
     }
     pub fn with_hint(mut self, hint: impl Into<String>) -> ErrorVal {
         self.hint = Some(hint.into());
+        self
+    }
+    pub fn with_stderr(mut self, stderr: impl Into<String>) -> ErrorVal {
+        self.stderr = Some(stderr.into());
+        self
+    }
+    pub fn with_status(mut self, status: Option<i32>) -> ErrorVal {
+        self.status = status;
         self
     }
     pub fn type_error(msg: impl Into<String>) -> ErrorVal {
@@ -507,7 +552,12 @@ pub enum AssignError {
 
 impl Env {
     pub fn root() -> Env {
-        Env { inner: Arc::new(Mutex::new(EnvInner { vars: HashMap::new(), parent: None })) }
+        Env {
+            inner: Arc::new(Mutex::new(EnvInner {
+                vars: HashMap::new(),
+                parent: None,
+            })),
+        }
     }
 
     pub fn child(&self) -> Env {
@@ -520,7 +570,11 @@ impl Env {
     }
 
     pub fn declare(&self, name: impl Into<String>, value: Value, mutable: bool) {
-        self.inner.lock().unwrap().vars.insert(name.into(), Binding { value, mutable });
+        self.inner
+            .lock()
+            .unwrap()
+            .vars
+            .insert(name.into(), Binding { value, mutable });
     }
 
     pub fn get(&self, name: &str) -> Option<Value> {
@@ -691,7 +745,9 @@ pub fn parse_duration(word: &str) -> Option<i64> {
             return None;
         }
         let (num, tail) = cur.split_at(split);
-        let unit_end = tail.find(|c: char| !c.is_ascii_alphabetic()).unwrap_or(tail.len());
+        let unit_end = tail
+            .find(|c: char| !c.is_ascii_alphabetic())
+            .unwrap_or(tail.len());
         let (unit, next) = tail.split_at(unit_end);
         let num: f64 = num.parse().ok()?;
         let ns: f64 = match unit {
@@ -732,7 +788,11 @@ pub fn parse_time(word: &str) -> Option<TimeVal> {
     }
     let mut hour: u8 = parts[0].parse().ok()?;
     let min: u8 = parts[1].parse().ok()?;
-    let sec: u8 = if parts.len() == 3 { parts[2].parse().ok()? } else { 0 };
+    let sec: u8 = if parts.len() == 3 {
+        parts[2].parse().ok()?
+    } else {
+        0
+    };
     match meridiem {
         Some(pm) => {
             if hour == 0 || hour > 12 {
@@ -792,10 +852,38 @@ mod tests {
         assert_eq!(parse_duration("250ms"), Some(250_000_000));
         assert_eq!(parse_duration("1m30s"), Some(90_000_000_000));
         assert_eq!(parse_duration("1.5h"), Some(5_400_000_000_000));
-        assert_eq!(parse_time("10:00am"), Some(TimeVal { hour: 10, min: 0, sec: 0 }));
-        assert_eq!(parse_time("12:15pm"), Some(TimeVal { hour: 12, min: 15, sec: 0 }));
-        assert_eq!(parse_time("12:15am"), Some(TimeVal { hour: 0, min: 15, sec: 0 }));
-        assert_eq!(parse_time("23:15"), Some(TimeVal { hour: 23, min: 15, sec: 0 }));
+        assert_eq!(
+            parse_time("10:00am"),
+            Some(TimeVal {
+                hour: 10,
+                min: 0,
+                sec: 0
+            })
+        );
+        assert_eq!(
+            parse_time("12:15pm"),
+            Some(TimeVal {
+                hour: 12,
+                min: 15,
+                sec: 0
+            })
+        );
+        assert_eq!(
+            parse_time("12:15am"),
+            Some(TimeVal {
+                hour: 0,
+                min: 15,
+                sec: 0
+            })
+        );
+        assert_eq!(
+            parse_time("23:15"),
+            Some(TimeVal {
+                hour: 23,
+                min: 15,
+                sec: 0
+            })
+        );
     }
 
     #[test]

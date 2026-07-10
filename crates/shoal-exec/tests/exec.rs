@@ -18,7 +18,10 @@ impl TempDir {
         let path = std::env::temp_dir().join(format!(
             "shoal-exec-test-{}-{}-{tag}",
             std::process::id(),
-            std::thread::current().name().unwrap_or("t").replace(':', "_"),
+            std::thread::current()
+                .name()
+                .unwrap_or("t")
+                .replace(':', "_"),
         ));
         std::fs::create_dir_all(&path).expect("create temp dir");
         TempDir(path)
@@ -232,8 +235,11 @@ fn streaming_child_can_be_drained_then_waited() {
 #[test]
 fn streaming_child_cancel_unblocks_a_draining_reader() {
     let token = CancelToken::new();
-    let mut child = spawn_capture(sh("printf start; sleep 30; printf end", ExecMode::Capture), &token)
-        .expect("spawn");
+    let mut child = spawn_capture(
+        sh("printf start; sleep 30; printf end", ExecMode::Capture),
+        &token,
+    )
+    .expect("spawn");
     cancel_after(&token, Duration::from_millis(300));
     let start = Instant::now();
     let mut buf = Vec::new();
@@ -248,8 +254,8 @@ fn streaming_child_cancel_unblocks_a_draining_reader() {
 #[test]
 fn streaming_child_wait_honors_a_different_token() {
     let spawn_token = CancelToken::new();
-    let child = spawn_capture(spec(&["/bin/sleep", "30"], ExecMode::Capture), &spawn_token)
-        .expect("spawn");
+    let child =
+        spawn_capture(spec(&["/bin/sleep", "30"], ExecMode::Capture), &spawn_token).expect("spawn");
     let wait_token = CancelToken::new();
     cancel_after(&wait_token, Duration::from_millis(100));
     let start = Instant::now();
@@ -259,9 +265,21 @@ fn streaming_child_wait_honors_a_different_token() {
 }
 
 #[test]
+fn spawn_capture_rejects_pty_mode() {
+    let err = match spawn_capture(sh("true", ExecMode::PtyTee), &CancelToken::new()) {
+        Ok(_) => panic!("PTY mode must not be accepted by the capture-only API"),
+        Err(err) => err,
+    };
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+}
+
+#[test]
 fn dropping_a_streaming_child_reaps_it() {
-    let child = spawn_capture(spec(&["/bin/sleep", "30"], ExecMode::Capture), &CancelToken::new())
-        .expect("spawn");
+    let child = spawn_capture(
+        spec(&["/bin/sleep", "30"], ExecMode::Capture),
+        &CancelToken::new(),
+    )
+    .expect("spawn");
     let pid = child.pid as i32;
     drop(child); // must SIGKILL and reap — no zombie left behind
     // SAFETY: probing with signal 0 never delivers a signal.
@@ -381,7 +399,11 @@ fn pty_child_sees_a_tty_on_all_std_fds() {
 
 #[test]
 fn pty_tee_captures_output_bytes() {
-    let res = run(sh("printf hello-from-pty", ExecMode::PtyTee), &CancelToken::new()).expect("run");
+    let res = run(
+        sh("printf hello-from-pty", ExecMode::PtyTee),
+        &CancelToken::new(),
+    )
+    .expect("run");
     assert_eq!(res.status, Some(0));
     assert_eq!(res.stdout, b"hello-from-pty");
     assert!(res.stderr.is_empty(), "pty result never carries stderr");
@@ -389,7 +411,11 @@ fn pty_tee_captures_output_bytes() {
 
 #[test]
 fn pty_merges_stderr_into_the_teed_stream() {
-    let res = run(sh("printf err-on-pty >&2", ExecMode::PtyTee), &CancelToken::new()).expect("run");
+    let res = run(
+        sh("printf err-on-pty >&2", ExecMode::PtyTee),
+        &CancelToken::new(),
+    )
+    .expect("run");
     assert_eq!(res.status, Some(0));
     assert_eq!(res.stdout, b"err-on-pty");
     assert!(res.stderr.is_empty());
@@ -441,4 +467,15 @@ fn pty_not_found_still_errors_cleanly() {
     )
     .expect_err("must fail");
     assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+}
+
+#[test]
+fn pty_e2big_preserves_the_os_error() {
+    let huge = "x".repeat(200_000);
+    let err = run(
+        spec(&["/bin/true", &huge], ExecMode::PtyTee),
+        &CancelToken::new(),
+    )
+    .expect_err("must fail");
+    assert_eq!(err.raw_os_error(), Some(libc::E2BIG));
 }

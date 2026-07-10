@@ -14,7 +14,7 @@ use crate::cancel::CancelToken;
 use crate::status::decode_wait_status;
 use crate::watcher::spawn_cancel_watcher;
 use crate::which::resolve_program;
-use crate::{ExecResult, ExecSpec, StdinSpec};
+use crate::{ExecMode, ExecResult, ExecSpec, StdinSpec};
 
 /// A capture-mode child spawned for streaming consumption (background tasks,
 /// `tail -f`, …). The caller drains [`StreamingChild::stdout`] /
@@ -130,6 +130,12 @@ impl Drop for StreamInner {
 /// Program resolution failures ([`io::ErrorKind::NotFound`]), stdin-file open
 /// failures, and spawn errors (including `E2BIG`) surface here.
 pub fn spawn_capture(spec: ExecSpec, cancel: &CancelToken) -> io::Result<StreamingChild> {
+    if spec.mode != ExecMode::Capture {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "spawn_capture requires ExecMode::Capture",
+        ));
+    }
     let program = resolve_program(&spec.argv, &spec.env)?;
     let mut cmd = Command::new(&program);
     cmd.args(&spec.argv[1..]);

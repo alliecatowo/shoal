@@ -1,11 +1,12 @@
 //! PtyTee mode: the child runs on a real PTY as session leader; output
 //! streams raw to the real terminal and is teed into the result buffer.
 
-use std::fmt::Display;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::mem;
 use std::os::fd::{FromRawFd, RawFd};
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -27,8 +28,13 @@ const WINSIZE_EVERY_N_POLLS: u32 = 4;
 /// EOF before abandoning it (it exits on its own once the pty closes).
 const PUMP_DRAIN_GRACE: Duration = Duration::from_millis(500);
 
-fn pty_err(e: impl Display) -> io::Error {
-    io::Error::other(e.to_string())
+fn pty_err(e: anyhow::Error) -> io::Error {
+    // portable-pty wraps operating-system failures in anyhow. Preserve the
+    // original io::Error so callers can reliably distinguish ENOENT/E2BIG/etc.
+    match e.downcast::<io::Error>() {
+        Ok(error) => error,
+        Err(error) => io::Error::other(error.to_string()),
+    }
 }
 
 /// Restores the original termios of `fd` on drop — including on panic, so
@@ -130,7 +136,7 @@ fn forward_stdin_and_resize(
     let mut ticks: u32 = 0;
     while !done.load(Ordering::SeqCst) {
         ticks = ticks.wrapping_add(1);
-        if ticks % WINSIZE_EVERY_N_POLLS == 0
+        if ticks.is_multiple_of(WINSIZE_EVERY_N_POLLS)
             && let Some(sz) = tty_winsize(0)
         {
             let changed = last.is_none_or(|l| l.rows != sz.rows || l.cols != sz.cols);
@@ -174,6 +180,18 @@ pub(crate) fn run_pty(spec: ExecSpec, cancel: &CancelToken) -> io::Result<ExecRe
     } = spec;
     let program = resolve_program(&argv, &env)?;
 
+    // portable-pty's Unix fork helper currently aborts in the child when its
+    // exec-error report itself cannot be written after E2BIG. Reject Linux's
+    // fixed per-string limit up front so E2BIG remains an ordinary io error.
+    #[cfg(target_os = "linux")]
+    if argv.iter().any(|arg| arg.as_bytes().len() >= 131_072)
+        || env
+            .iter()
+            .any(|(key, value)| key.as_bytes().len() + value.as_bytes().len() + 1 >= 131_072)
+    {
+        return Err(io::Error::from_raw_os_error(libc::E2BIG));
+    }
+
     // SAFETY: isatty is a trivial fd query.
     let stdin_is_tty = unsafe { libc::isatty(0) } == 1;
     let stdout_is_tty = unsafe { libc::isatty(1) } == 1;
@@ -194,6 +212,15 @@ pub(crate) fn run_pty(spec: ExecSpec, cancel: &CancelToken) -> io::Result<ExecRe
         });
     let pty = native_pty_system();
     let pair = pty.openpty(size).map_err(pty_err)?;
+
+    // Perform every fallible master-side setup step before spawning. Once a
+    // child exists, returning early here would leak a running child/zombie.
+    let mut reader = pair.master.try_clone_reader().map_err(pty_err)?;
+    let needs_input_writer = matches!(stdin, StdinSpec::Bytes(_) | StdinSpec::File(_))
+        || (stdin_is_tty && matches!(stdin, StdinSpec::Inherit));
+    let mut input_writer = needs_input_writer
+        .then(|| dup_master_writer(pair.master.as_ref()))
+        .transpose()?;
 
     let mut cmd = CommandBuilder::new(&program);
     for a in &argv[1..] {
@@ -219,7 +246,6 @@ pub(crate) fn run_pty(spec: ExecSpec, cancel: &CancelToken) -> io::Result<ExecRe
     let watcher = spawn_cancel_watcher(pid, vec![cancel.clone()], claimed, done.clone());
 
     let master = pair.master;
-    let mut reader = master.try_clone_reader().map_err(pty_err)?;
 
     // Raw mode only when we are actually forwarding a real terminal; the
     // guard restores cooked mode on every exit path, panics included.
@@ -235,14 +261,14 @@ pub(crate) fn run_pty(spec: ExecSpec, cancel: &CancelToken) -> io::Result<ExecRe
     let mut _master_keep: Option<Box<dyn MasterPty + Send>> = None;
     match stdin {
         StdinSpec::Inherit if stdin_is_tty => {
-            let w = dup_master_writer(master.as_ref())?;
+            let w = input_writer.take().expect("prepared pty input writer");
             let d = done.clone();
             input_threads.push(thread::spawn(move || {
                 forward_stdin_and_resize(w, master, &d);
             }));
         }
         StdinSpec::Bytes(bytes) => {
-            let mut w = dup_master_writer(master.as_ref())?;
+            let mut w = input_writer.take().expect("prepared pty input writer");
             _master_keep = Some(master);
             input_threads.push(thread::spawn(move || {
                 let _ = w.write_all(&bytes);
@@ -250,7 +276,7 @@ pub(crate) fn run_pty(spec: ExecSpec, cancel: &CancelToken) -> io::Result<ExecRe
             }));
         }
         StdinSpec::File(_) => {
-            let mut w = dup_master_writer(master.as_ref())?;
+            let mut w = input_writer.take().expect("prepared pty input writer");
             _master_keep = Some(master);
             let mut f = stdin_file.expect("opened above for StdinSpec::File");
             input_threads.push(thread::spawn(move || {

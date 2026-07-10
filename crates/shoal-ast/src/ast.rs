@@ -27,22 +27,55 @@ pub enum Stmt {
         span: Span,
     },
     /// `fn name(params) -> ty { body }`
-    Fn { decl: FnDecl },
+    Fn {
+        decl: FnDecl,
+    },
     /// `alias gs = git status` — AST-level partial application (TDD §1.8).
-    Alias { name: String, target: CmdCall, span: Span },
+    Alias {
+        name: String,
+        target: CmdCall,
+        span: Span,
+    },
     /// `use ./lib/deploy`
-    Use { path: String, span: Span },
+    Use {
+        path: String,
+        span: Span,
+    },
     /// `x = e`, `x += e`, `rec.field = e`, `xs[0] = e`
-    Assign { target: Expr, op: AssignOp, value: Expr, span: Span },
-    Return { value: Option<Expr>, span: Span },
-    Break { span: Span },
-    Continue { span: Span },
-    For { pattern: Pattern, iter: Expr, body: Block, span: Span },
-    While { cond: Expr, body: Block, span: Span },
+    Assign {
+        target: Expr,
+        op: AssignOp,
+        value: Expr,
+        span: Span,
+    },
+    Return {
+        value: Option<Expr>,
+        span: Span,
+    },
+    Break {
+        span: Span,
+    },
+    Continue {
+        span: Span,
+    },
+    For {
+        pattern: Pattern,
+        iter: Expr,
+        body: Block,
+        span: Span,
+    },
+    While {
+        cond: Expr,
+        body: Block,
+        span: Span,
+    },
     /// Everything else, including command statements (root `Expr::Cmd`).
     /// Statement-position semantics (PTY passthrough, `it` binding, raise on
     /// non-ok) key off this being a top-level statement — see TDD §1.2, §4.5.
-    Expr { expr: Expr, span: Span },
+    Expr {
+        expr: Expr,
+        span: Span,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,59 +138,175 @@ pub struct Block {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Expr {
-    Null { span: Span },
-    Bool { value: bool, span: Span },
-    Int { value: i64, span: Span },
-    Float { value: f64, span: Span },
+    Null {
+        span: Span,
+    },
+    Bool {
+        value: bool,
+        span: Span,
+    },
+    Int {
+        value: i64,
+        span: Span,
+    },
+    Float {
+        value: f64,
+        span: Span,
+    },
     /// Fully-resolved string literal (raw, or escaped with no interpolation).
-    Str { value: String, span: Span },
+    Str {
+        value: String,
+        span: Span,
+    },
     /// `"text {expr} more"` — interpolating string.
-    StrInterp { parts: Vec<StrPart>, span: Span },
+    StrInterp {
+        parts: Vec<StrPart>,
+        span: Span,
+    },
     /// `1.5gb` → bytes.
-    Size { bytes: u64, span: Span },
+    Size {
+        bytes: u64,
+        span: Span,
+    },
     /// `250ms` → nanoseconds.
-    Duration { ns: i64, span: Span },
+    Duration {
+        ns: i64,
+        span: Span,
+    },
     /// `10:00am`, `23:15`.
-    Time { hour: u8, min: u8, sec: u8, span: Span },
+    Time {
+        hour: u8,
+        min: u8,
+        sec: u8,
+        span: Span,
+    },
     /// `t"2026-07-09T14:00Z"` — parsed/validated at eval.
-    DateTime { iso: String, span: Span },
+    DateTime {
+        iso: String,
+        span: Span,
+    },
     /// `re"…"` — compiled at eval.
-    Regex { src: String, span: Span },
-    Var { name: String, span: Span },
+    Regex {
+        src: String,
+        span: Span,
+    },
+    Var {
+        name: String,
+        span: Span,
+    },
     /// `recv.name` / `recv?.name`
-    Field { recv: Box<Expr>, name: String, optional: bool, span: Span },
+    Field {
+        recv: Box<Expr>,
+        name: String,
+        optional: bool,
+        span: Span,
+    },
     /// `recv[index]`
-    Index { recv: Box<Expr>, index: Box<Expr>, span: Span },
+    Index {
+        recv: Box<Expr>,
+        index: Box<Expr>,
+        span: Span,
+    },
     /// `recv.name(args)` / `recv?.name(args)`
-    MethodCall { recv: Box<Expr>, name: String, args: Args, optional: bool, span: Span },
+    MethodCall {
+        recv: Box<Expr>,
+        name: String,
+        args: Args,
+        optional: bool,
+        span: Span,
+    },
     /// `name(args)` — user fn, builtin fn, or closure-in-variable call.
-    FnCall { name: String, args: Args, span: Span },
+    FnCall {
+        name: String,
+        args: Args,
+        span: Span,
+    },
     /// External/builtin command call, any position (TDD §1.2 position rule
     /// is decided by the evaluator from context, not stored here).
-    Cmd { call: Box<CmdCall>, span: Span },
+    Cmd {
+        call: Box<CmdCall>,
+        span: Span,
+    },
     /// `x => e` / `(a, b: int) => { … }`
-    Lambda { params: Vec<Param>, body: Box<Expr>, span: Span },
-    List { items: Vec<Expr>, span: Span },
-    Record { fields: Vec<RecordField>, span: Span },
+    Lambda {
+        params: Vec<Param>,
+        body: Box<Expr>,
+        span: Span,
+    },
+    List {
+        items: Vec<Expr>,
+        span: Span,
+    },
+    Record {
+        fields: Vec<RecordField>,
+        span: Span,
+    },
     /// `{ stmts; trailing-expr }` in expression position.
-    Block { block: Block, span: Span },
-    If { cond: Box<Expr>, then: Block, r#else: Option<Box<Expr>>, span: Span },
-    Match { scrutinee: Box<Expr>, arms: Vec<MatchArm>, span: Span },
+    Block {
+        block: Block,
+        span: Span,
+    },
+    If {
+        cond: Box<Expr>,
+        then: Block,
+        r#else: Option<Box<Expr>>,
+        span: Span,
+    },
+    Match {
+        scrutinee: Box<Expr>,
+        arms: Vec<MatchArm>,
+        span: Span,
+    },
     /// `try { … } catch p { … }`
-    Try { body: Block, pattern: Option<Pattern>, handler: Block, span: Span },
+    Try {
+        body: Block,
+        pattern: Option<Pattern>,
+        handler: Block,
+        span: Span,
+    },
     /// Postfix `e catch h` / `e catch err h` (sugar for Try; kept distinct for
     /// lossless formatting).
-    Catch { expr: Box<Expr>, binder: Option<String>, handler: Box<Expr>, span: Span },
+    Catch {
+        expr: Box<Expr>,
+        binder: Option<String>,
+        handler: Box<Expr>,
+        span: Span,
+    },
     /// `with cwd: p, env: {…} { body }`
-    With { cwd: Option<Box<Expr>>, env: Option<Box<Expr>>, body: Block, span: Span },
+    With {
+        cwd: Option<Box<Expr>>,
+        env: Option<Box<Expr>>,
+        body: Block,
+        span: Span,
+    },
     /// `spawn { … }` → task.
-    Spawn { body: Block, span: Span },
+    Spawn {
+        body: Block,
+        span: Span,
+    },
     /// `sh { verbatim POSIX }` / `sh''' … '''`
-    ShRaw { src: String, span: Span },
-    Binary { op: BinOp, lhs: Box<Expr>, rhs: Box<Expr>, span: Span },
-    Unary { op: UnOp, expr: Box<Expr>, span: Span },
+    ShRaw {
+        src: String,
+        span: Span,
+    },
+    Binary {
+        op: BinOp,
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
+        span: Span,
+    },
+    Unary {
+        op: UnOp,
+        expr: Box<Expr>,
+        span: Span,
+    },
     /// `a..b` / `a..=b`
-    Range { start: Box<Expr>, end: Box<Expr>, inclusive: bool, span: Span },
+    Range {
+        start: Box<Expr>,
+        end: Box<Expr>,
+        inclusive: bool,
+        span: Span,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -182,7 +331,10 @@ pub struct Args {
 
 impl Args {
     pub fn empty() -> Self {
-        Args { pos: Vec::new(), named: Vec::new() }
+        Args {
+            pos: Vec::new(),
+            named: Vec::new(),
+        }
     }
     pub fn is_empty(&self) -> bool {
         self.pos.is_empty() && self.named.is_empty()
@@ -238,17 +390,41 @@ pub enum UnOp {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Pattern {
-    Wildcard { span: Span },
-    Bind { name: String, span: Span },
+    Wildcard {
+        span: Span,
+    },
+    Bind {
+        name: String,
+        span: Span,
+    },
     /// Literal pattern (restricted to literal `Expr` kinds, incl. negatives).
-    Lit { expr: Box<Expr>, span: Span },
-    Range { start: Box<Expr>, end: Box<Expr>, inclusive: bool, span: Span },
+    Lit {
+        expr: Box<Expr>,
+        span: Span,
+    },
+    Range {
+        start: Box<Expr>,
+        end: Box<Expr>,
+        inclusive: bool,
+        span: Span,
+    },
     /// `int n` / `str s` — type test + bind.
-    Type { ty: Type, name: Option<String>, span: Span },
+    Type {
+        ty: Type,
+        name: Option<String>,
+        span: Span,
+    },
     /// `{name, size: s}` — field destructure; `None` sub-pattern binds the field name.
-    Record { fields: Vec<FieldPat>, span: Span },
+    Record {
+        fields: Vec<FieldPat>,
+        span: Span,
+    },
     /// `[a, b, ...rest]`
-    List { items: Vec<Pattern>, rest: Option<String>, span: Span },
+    List {
+        items: Vec<Pattern>,
+        rest: Option<String>,
+        span: Span,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -302,7 +478,11 @@ pub enum CmdArg {
     Expr { expr: Expr, span: Span },
     /// `--name` / `--name=value`. Space-separated values arrive as a
     /// following positional arg and are merged at bind time.
-    FlagLong { name: String, value: Option<Box<CmdArg>>, span: Span },
+    FlagLong {
+        name: String,
+        value: Option<Box<CmdArg>>,
+        span: Span,
+    },
     /// `-abc` — exploded per adapter short-flag table at bind time.
     FlagShort { chars: String, span: Span },
     /// `--` end-of-flags marker.
@@ -423,12 +603,21 @@ mod tests {
     fn ast_json_roundtrip() {
         let prog = Program {
             stmts: vec![Stmt::Let {
-                pattern: Pattern::Bind { name: "x".into(), span: Span::new(4, 5) },
+                pattern: Pattern::Bind {
+                    name: "x".into(),
+                    span: Span::new(4, 5),
+                },
                 ty: None,
                 init: Expr::Binary {
                     op: BinOp::Add,
-                    lhs: Box::new(Expr::Int { value: 2, span: Span::new(8, 9) }),
-                    rhs: Box::new(Expr::Size { bytes: 1500, span: Span::new(12, 17) }),
+                    lhs: Box::new(Expr::Int {
+                        value: 2,
+                        span: Span::new(8, 9),
+                    }),
+                    rhs: Box::new(Expr::Size {
+                        bytes: 1500,
+                        span: Span::new(12, 17),
+                    }),
                     span: Span::new(8, 17),
                 },
                 mutable: false,
@@ -448,8 +637,15 @@ mod tests {
             head: "git".into(),
             forced: false,
             args: vec![
-                CmdArg::Word { text: "push".into(), span: Span::new(4, 8) },
-                CmdArg::FlagLong { name: "force".into(), value: None, span: Span::new(9, 16) },
+                CmdArg::Word {
+                    text: "push".into(),
+                    span: Span::new(4, 8),
+                },
+                CmdArg::FlagLong {
+                    name: "force".into(),
+                    value: None,
+                    span: Span::new(9, 16),
+                },
             ],
             redirects: vec![],
             env_prefix: vec![],

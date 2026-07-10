@@ -162,7 +162,11 @@ impl Journal {
         conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         Self::init_schema(&conn)?;
-        Ok(Journal { conn, cas_root, _cas_tempdir: None })
+        Ok(Journal {
+            conn,
+            cas_root,
+            _cas_tempdir: None,
+        })
     }
 
     /// Open a throwaway journal: in-memory SQLite database, CAS in a fresh
@@ -173,7 +177,11 @@ impl Journal {
         fs::create_dir_all(&cas_root).map_err(io_to_sql)?;
         let conn = Connection::open_in_memory()?;
         Self::init_schema(&conn)?;
-        Ok(Journal { conn, cas_root, _cas_tempdir: Some(tempdir) })
+        Ok(Journal {
+            conn,
+            cas_root,
+            _cas_tempdir: Some(tempdir),
+        })
     }
 
     /// Create tables and indexes (idempotent). Schema per TDD §9.
@@ -240,7 +248,13 @@ impl Journal {
     ///
     /// `status` is `None` for signal deaths (TDD §13.6: never 128+n encoded).
     /// Errors with `StatementChangedRows(0)` if `id` does not exist.
-    pub fn finish(&self, id: i64, status: Option<i32>, ok: bool, dur_ns: i64) -> rusqlite::Result<()> {
+    pub fn finish(
+        &self,
+        id: i64,
+        status: Option<i32>,
+        ok: bool,
+        dur_ns: i64,
+    ) -> rusqlite::Result<()> {
         let changed = self.conn.execute(
             "UPDATE entry SET status = ?1, ok = ?2, dur_ns = ?3 WHERE id = ?4",
             params![status, ok, dur_ns, id],
@@ -301,7 +315,11 @@ impl Journal {
     /// `limit == 0` means the default of 100. The `head` filter matches entries
     /// whose `src`'s first whitespace-separated word equals `head` exactly.
     pub fn query(&self, q: &JournalQuery) -> rusqlite::Result<Vec<EntryRow>> {
-        let limit = if q.limit == 0 { DEFAULT_QUERY_LIMIT } else { q.limit };
+        let limit = if q.limit == 0 {
+            DEFAULT_QUERY_LIMIT
+        } else {
+            q.limit
+        };
         let limit_i64 = limit as i64;
 
         let mut sql = String::from(
@@ -371,7 +389,11 @@ impl Journal {
             entry.outputs = out_stmt
                 .query_map([entry.id], |r| {
                     let raw: Vec<u8> = r.get(1)?;
-                    Ok(OutputRow { kind: r.get(0)?, hash: hex_string(&raw), len: r.get(2)? })
+                    Ok(OutputRow {
+                        kind: r.get(0)?,
+                        hash: hex_string(&raw),
+                        len: r.get(2)?,
+                    })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
         }
@@ -401,7 +423,10 @@ impl Journal {
     /// Absolute path of the CAS blob for a hex hash:
     /// `<cas>/<hex[0..2]>/<hex[2..4]>/<hex>.zst`.
     fn blob_path(&self, hex: &str) -> PathBuf {
-        self.cas_root.join(&hex[0..2]).join(&hex[2..4]).join(format!("{hex}.zst"))
+        self.cas_root
+            .join(&hex[0..2])
+            .join(&hex[2..4])
+            .join(format!("{hex}.zst"))
     }
 }
 
@@ -508,7 +533,9 @@ mod tests {
         assert!(state.join("cas").is_dir());
         // WAL mode is persisted in the database header.
         let conn = Connection::open(state.join("journal.db")).unwrap();
-        let mode: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap();
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(mode.to_lowercase(), "wal");
     }
 
@@ -527,8 +554,12 @@ mod tests {
         // Same bytes twice -> exactly one file in the CAS.
         assert_eq!(count_files(&dir.path().join("cas")), 1);
         // Sharded layout: cas/<hex[0..2]>/<hex[2..4]>/<hex>.zst
-        let blob =
-            dir.path().join("cas").join(&h1[0..2]).join(&h1[2..4]).join(format!("{h1}.zst"));
+        let blob = dir
+            .path()
+            .join("cas")
+            .join(&h1[0..2])
+            .join(&h1[2..4])
+            .join(format!("{h1}.zst"));
         assert!(blob.is_file());
         // Stored compressed, not raw.
         let on_disk = fs::read(&blob).unwrap();
@@ -544,7 +575,10 @@ mod tests {
         assert_eq!(outs.len(), 2);
         assert_eq!(outs[0].kind, "stdout");
         assert_eq!(outs[1].kind, "stderr");
-        assert!(outs.iter().all(|o| o.hash == h1 && o.len == payload.len() as i64));
+        assert!(
+            outs.iter()
+                .all(|o| o.hash == h1 && o.len == payload.len() as i64)
+        );
     }
 
     #[test]
@@ -585,12 +619,17 @@ mod tests {
     #[test]
     fn query_head_filter() {
         let j = Journal::in_memory().unwrap();
-        j.append(&rec("s", "human", 1, "git push origin main")).unwrap();
-        j.append(&rec("s", "human", 2, "cargo build --release")).unwrap();
+        j.append(&rec("s", "human", 1, "git push origin main"))
+            .unwrap();
+        j.append(&rec("s", "human", 2, "cargo build --release"))
+            .unwrap();
         j.append(&rec("s", "human", 3, "gitk --all")).unwrap();
         j.append(&rec("s", "human", 4, "  git   status")).unwrap(); // leading whitespace ok
 
-        let q = JournalQuery { head: Some("git".to_string()), ..JournalQuery::default() };
+        let q = JournalQuery {
+            head: Some("git".to_string()),
+            ..JournalQuery::default()
+        };
         let rows = j.query(&q).unwrap();
         assert_eq!(rows.len(), 2, "prefix match ('gitk') must not count");
         assert_eq!(rows[0].src, "  git   status"); // newest first
@@ -601,7 +640,8 @@ mod tests {
     fn query_principal_filter() {
         let j = Journal::in_memory().unwrap();
         j.append(&rec("s", "human", 1, "ls")).unwrap();
-        j.append(&rec("s", "agent:refactor", 2, "cargo test")).unwrap();
+        j.append(&rec("s", "agent:refactor", 2, "cargo test"))
+            .unwrap();
         j.append(&rec("s", "human", 3, "pwd")).unwrap();
 
         let q = JournalQuery {
@@ -622,12 +662,18 @@ mod tests {
         j.finish(ok_id, Some(0), true, 10).unwrap();
         j.finish(bad_id, Some(1), false, 20).unwrap();
 
-        let q_ok = JournalQuery { ok: Some(true), ..JournalQuery::default() };
+        let q_ok = JournalQuery {
+            ok: Some(true),
+            ..JournalQuery::default()
+        };
         let rows = j.query(&q_ok).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, ok_id);
 
-        let q_bad = JournalQuery { ok: Some(false), ..JournalQuery::default() };
+        let q_bad = JournalQuery {
+            ok: Some(false),
+            ..JournalQuery::default()
+        };
         let rows = j.query(&q_bad).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, bad_id);
@@ -643,7 +689,10 @@ mod tests {
         j.append(&rec("s", "human", 200, "mid")).unwrap();
         j.append(&rec("s", "human", 300, "new")).unwrap();
 
-        let q = JournalQuery { since_ts_ns: Some(200), ..JournalQuery::default() };
+        let q = JournalQuery {
+            since_ts_ns: Some(200),
+            ..JournalQuery::default()
+        };
         let rows = j.query(&q).unwrap();
         assert_eq!(rows.len(), 2, "since is inclusive");
         assert_eq!(rows[0].src, "new");
@@ -656,7 +705,10 @@ mod tests {
         for i in 0..5 {
             j.append(&rec("s", "human", i, &format!("cmd{i}"))).unwrap();
         }
-        let q = JournalQuery { limit: 2, ..JournalQuery::default() };
+        let q = JournalQuery {
+            limit: 2,
+            ..JournalQuery::default()
+        };
         let rows = j.query(&q).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].src, "cmd4"); // ORDER BY id DESC
@@ -679,10 +731,15 @@ mod tests {
     fn head_filter_respects_limit() {
         let j = Journal::in_memory().unwrap();
         for i in 0..4 {
-            j.append(&rec("s", "human", i * 2, &format!("git commit -m {i}"))).unwrap();
+            j.append(&rec("s", "human", i * 2, &format!("git commit -m {i}")))
+                .unwrap();
             j.append(&rec("s", "human", i * 2 + 1, "ls -la")).unwrap();
         }
-        let q = JournalQuery { head: Some("git".to_string()), limit: 2, ..JournalQuery::default() };
+        let q = JournalQuery {
+            head: Some("git".to_string()),
+            limit: 2,
+            ..JournalQuery::default()
+        };
         let rows = j.query(&q).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].src, "git commit -m 3");
@@ -717,7 +774,8 @@ mod tests {
         let other = j.append(&rec("s", "human", 2, "ls")).unwrap();
 
         let inv1 = serde_json::json!({"trash": "/home/user/.trash/build"}).to_string();
-        let inv2 = serde_json::json!({"restore_bytes": {"path": "a.txt", "hash": "ab"}}).to_string();
+        let inv2 =
+            serde_json::json!({"restore_bytes": {"path": "a.txt", "hash": "ab"}}).to_string();
         j.record_undo(id, "trash", &inv1).unwrap();
         j.record_undo(id, "restore_bytes", &inv2).unwrap();
 

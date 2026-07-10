@@ -14,3 +14,8 @@ shoal-exec = { version = "0.1.0", path = "../shoal-exec" }
 shoal-journal = { version = "0.1.0", path = "../shoal-journal" }
 shoal-syntax = { version = "0.1.0", path = "../shoal-syntax" }
 shoal-value = { version = "0.1.0", path = "../shoal-value" }
+
+[dev-dependencies]
+tempfile = "3.20"
+toml = "0.9"
+serde = { version = "1", features = ["derive"] }

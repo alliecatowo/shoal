@@ -9,15 +9,22 @@ pub struct Span {
 
 impl Span {
     pub fn new(start: usize, end: usize) -> Self {
-        Span { start: start as u32, end: end as u32 }
+        Span {
+            start: start as u32,
+            end: end as u32,
+        }
     }
 
     /// Smallest span covering both.
     pub fn join(self, other: Span) -> Span {
-        Span { start: self.start.min(other.start), end: self.end.max(other.end) }
+        Span {
+            start: self.start.min(other.start),
+            end: self.end.max(other.end),
+        }
     }
 
     pub fn slice<'a>(&self, src: &'a str) -> &'a str {
-        src.get(self.start as usize..self.end as usize).unwrap_or("")
+        src.get(self.start as usize..self.end as usize)
+            .unwrap_or("")
     }
 }
