@@ -5,12 +5,15 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
 use reedline::{
-    DefaultCompleter, DefaultHinter, DefaultPrompt, DefaultPromptSegment, ExampleHighlighter,
+    DefaultCompleter, DefaultHinter, DefaultPrompt, DefaultPromptSegment,
     FileBackedHistory, Reedline, Signal, ValidationResult, Validator,
 };
 use shoal_eval::Evaluator;
 use shoal_syntax::{ParseError, parse};
 use shoal_value::{ErrorVal, Value};
+
+mod highlight;
+use highlight::ShoalHighlighter;
 
 const USAGE: &str = "shoal 0.1.0\n\nUsage: shoal [OPTIONS] [SCRIPT]\n       shoal <fmt|doctor|lsp|mcp|completions> ...\n\nOptions:\n  -c, --command <SOURCE>  Evaluate source and exit\n  -h, --help              Print help\n  -V, --version           Print version\n\nDeveloper commands:\n  fmt [--check] [FILES]   Format .shl source (stdin when no files)\n  doctor [--json]         Diagnose the installation\n  lsp                     Run the language server companion\n  mcp                     Run the MCP companion\n  completions SHELL       Print bash, zsh, or fish completions";
 
@@ -308,7 +311,7 @@ fn repl() -> Result<i32, String> {
             completions.clone(),
             1,
         )))
-        .with_highlighter(Box::new(ExampleHighlighter::new(completions)))
+        .with_highlighter(Box::new(ShoalHighlighter))
         .with_hinter(Box::new(DefaultHinter::default()));
     if config.history.enabled
         && let Some(path) = config.history.path.clone().or_else(history_path)
