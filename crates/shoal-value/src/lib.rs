@@ -304,6 +304,53 @@ pub fn value_to_json(v: &Value) -> serde_json::Value {
     }
 }
 
+/// Serialize a value to the bytes `.feed` writes to a command's stdin
+/// (IO.md §1.2). The mapping is exhaustive over feedable types; anything else
+/// is an error — `feed_error` (with a specialized message) for the types that
+/// are *deliberately* never feedable, plain `type_error` otherwise.
+pub fn feed_bytes(v: &Value) -> Result<Vec<u8>, ErrorVal> {
+    match v {
+        // str → its UTF-8 bytes, verbatim (no trailing newline added).
+        Value::Str(s) => Ok(s.clone().into_bytes()),
+        // bytes → raw.
+        Value::Bytes(b) => Ok(b.as_ref().clone()),
+        // path → its bytes.
+        Value::Path(p) => Ok(p.to_string_lossy().into_owned().into_bytes()),
+        // list<str> → each element joined with `\n`, plus one trailing `\n`.
+        Value::List(xs) if xs.iter().all(|x| matches!(x, Value::Str(_))) => {
+            let mut out = String::new();
+            for x in xs {
+                if let Value::Str(s) = x {
+                    out.push_str(s);
+                    out.push('\n');
+                }
+            }
+            Ok(out.into_bytes())
+        }
+        // table / record / list-of-records (and any other list) → compact JSON.
+        Value::Record(_) | Value::Table(_) | Value::List(_) => {
+            Ok(serde_json::to_vec(&value_to_json(v)).unwrap_or_default())
+        }
+        // Deliberately never feedable (IO.md §1.2 / §5) → `feed_error`.
+        Value::Secret(_) => Err(ErrorVal::new(
+            "feed_error",
+            "a secret cannot be fed as stdin data",
+        )
+        .with_hint("secrets are injected at spawn time, not fed as data")),
+        Value::Task(_) | Value::Closure(_) | Value::Error(_) | Value::Glob(_) | Value::Regex(_) => {
+            Err(ErrorVal::new(
+                "feed_error",
+                format!("a {} cannot be fed as stdin data", v.type_name()),
+            ))
+        }
+        // Anything else has no pinned serialization yet → generic type_error.
+        other => Err(ErrorVal::type_error(format!(
+            "cannot feed a {} to a command's stdin",
+            other.type_name()
+        ))),
+    }
+}
+
 /// Single-consumption stream (TDD §1.9). Identity equality.
 #[derive(Clone)]
 pub struct StreamVal {
@@ -829,6 +876,58 @@ pub fn parse_time(word: &str) -> Option<TimeVal> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn feed_bytes_serialization() {
+        // str → verbatim UTF-8, no trailing newline.
+        assert_eq!(feed_bytes(&Value::Str("hi".into())).unwrap(), b"hi");
+        // bytes → raw.
+        assert_eq!(
+            feed_bytes(&Value::Bytes(Arc::new(vec![1, 2, 3]))).unwrap(),
+            vec![1, 2, 3]
+        );
+        // list<str> → newline-joined + trailing newline.
+        assert_eq!(
+            feed_bytes(&Value::List(vec![
+                Value::Str("a".into()),
+                Value::Str("b".into())
+            ]))
+            .unwrap(),
+            b"a\nb\n"
+        );
+        // record → compact JSON, no trailing newline.
+        let mut rec = Record::new();
+        rec.insert("n".into(), Value::Int(2));
+        assert_eq!(feed_bytes(&Value::Record(rec)).unwrap(), br#"{"n":2}"#);
+        // table → row-major JSON.
+        let mut row = Record::new();
+        row.insert("x".into(), Value::Int(1));
+        assert_eq!(
+            feed_bytes(&Value::Table(vec![row])).unwrap(),
+            br#"[{"x":1}]"#
+        );
+        // non-str list → JSON array.
+        assert_eq!(
+            feed_bytes(&Value::List(vec![Value::Int(3), Value::Int(1)])).unwrap(),
+            b"[3,1]"
+        );
+    }
+
+    #[test]
+    fn feed_bytes_never_feedable_is_feed_error() {
+        let e = feed_bytes(&Value::Secret(SecretVal {
+            name: "tok".into(),
+            value: Arc::from("x"),
+        }))
+        .unwrap_err();
+        assert_eq!(e.code, "feed_error");
+        assert!(e.hint.unwrap().contains("injected at spawn time"));
+    }
+
+    #[test]
+    fn feed_bytes_unfeedable_scalar_is_type_error() {
+        assert_eq!(feed_bytes(&Value::Int(4)).unwrap_err().code, "type_error");
+    }
 
     #[test]
     fn env_scoping() {

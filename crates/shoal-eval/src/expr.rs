@@ -166,6 +166,9 @@ impl Evaluator {
                 optional,
                 ..
             } => {
+                if name == "feed" {
+                    return self.eval_feed(recv, args, position, span);
+                }
                 if matches!(&**recv, Expr::Var { name, .. } if name == "secret") && name == "get" {
                     let args = self.eval_args(args)?;
                     let [Value::Str(secret_name)] = args.pos.as_slice() else {
@@ -339,18 +342,9 @@ impl Evaluator {
                 }
             },
             Expr::Cmd { call, .. } => self.eval_command(call, position),
-            Expr::ShRaw { src, .. } => self.run_argv(
-                vec![
-                    OsString::from("sh"),
-                    OsString::from("-c"),
-                    OsString::from(src),
-                ],
-                position,
-                StdinSpec::Null,
-                &[],
-                span,
-                None,
-            ),
+            Expr::LangBlock { tool, src, .. } => {
+                self.eval_lang_block(tool, src, StdinSpec::Null, position, span)
+            }
             Expr::With {
                 cwd,
                 env,
@@ -488,5 +482,182 @@ impl Evaluator {
             Value::Stream(s) => s.take()?.collect(),
             _ => Err(ErrorVal::new("type_error", "value is not iterable")),
         }
+    }
+
+    /// Evaluate an interpreter block (IO.md §2.6): resolve `tool` as a command
+    /// and hand it `src` as its program via the tool's inline-eval convention
+    /// (`lang_block_invocation`). `stdin` is whatever `.feed` supplies (or
+    /// `Null` for a bare block) — it stays a separate channel from the program,
+    /// so `.feed` composes with the block.
+    pub(crate) fn eval_lang_block(
+        &mut self,
+        tool: &str,
+        src: &str,
+        stdin: StdinSpec,
+        position: Position,
+        span: Span,
+    ) -> VResult<Value> {
+        let (tail, stdin_src) = lang_block_invocation(tool, src);
+        // A tool whose convention is "program on stdin" cannot also accept fed
+        // bytes — the two would collide on the single stdin channel.
+        let stdin = match (stdin_src, &stdin) {
+            (Some(_), StdinSpec::Bytes(_) | StdinSpec::File(_)) => {
+                return Err(ErrorVal::type_error(format!(
+                    "`{tool}` takes its program on stdin, so it cannot also be fed data"
+                ))
+                .with_span(span));
+            }
+            (Some(bytes), _) => StdinSpec::Bytes(bytes),
+            (None, _) => stdin,
+        };
+        let mut argv = vec![OsString::from(tool)];
+        argv.extend(tail);
+        self.run_argv(argv, position, stdin, &[], span, None)
+    }
+
+    /// `.feed` (IO.md §1): pipe a value's serialized bytes into a command's
+    /// stdin, returning the command's outcome. Handles both spellings —
+    /// `value.feed(cmd)` (canonical) and `cmd.feed(value)` (inverted) — by
+    /// classifying which operand is the command node.
+    fn eval_feed(
+        &mut self,
+        recv: &Expr,
+        args: &Args,
+        position: Position,
+        span: Span,
+    ) -> VResult<Value> {
+        if args.pos.len() != 1 || !args.named.is_empty() {
+            return Err(ErrorVal::arg_error(
+                ".feed expects exactly one command argument",
+            ));
+        }
+        let arg = &args.pos[0];
+        // Inverted `cmd.feed(value)`: the receiver is the command node, the
+        // argument the value. Canonical `value.feed(cmd)`: the other way round.
+        let (value_expr, cmd_expr) = if self.is_command_expr(recv) {
+            (arg, recv)
+        } else {
+            (recv, arg)
+        };
+        let value = self.eval_expr(value_expr, Position::Value)?;
+        let bytes = shoal_value::feed_bytes(&value).map_err(|e| e.or_span(span))?;
+        match cmd_expr {
+            Expr::LangBlock { tool, src, span } => {
+                self.eval_lang_block(tool, src, StdinSpec::Bytes(bytes), position, *span)
+            }
+            Expr::Cmd { call, .. } => {
+                let mut argv = vec![OsString::from(&call.head)];
+                for a in &call.args {
+                    for v in self.expand_arg(a)? {
+                        argv.push(self.argv_value(v)?);
+                    }
+                }
+                self.run_argv(
+                    argv,
+                    position,
+                    StdinSpec::Bytes(bytes),
+                    &call.env_prefix,
+                    call.span,
+                    None,
+                )
+            }
+            Expr::Var { name, .. } => self.run_argv(
+                vec![OsString::from(name)],
+                position,
+                StdinSpec::Bytes(bytes),
+                &[],
+                span,
+                None,
+            ),
+            other => Err(ErrorVal::type_error(format!(
+                ".feed's argument must be a command, not {}",
+                expr_noun(other)
+            ))
+            .with_span(span)),
+        }
+    }
+
+    /// Is `e` a command-shaped node — an interpreter block, an explicit command
+    /// call, or a bare name that is not a bound variable (a command head)? Used
+    /// by `.feed` to tell `cmd.feed(value)` from `value.feed(cmd)`.
+    fn is_command_expr(&self, e: &Expr) -> bool {
+        match e {
+            Expr::LangBlock { .. } | Expr::Cmd { .. } => true,
+            Expr::Var { name, .. } => self.env.get(name).is_none(),
+            _ => false,
+        }
+    }
+}
+
+/// Map an interpreter-class tool to how its `src` program reaches it (IO.md
+/// §2.6 step 3): the argv tail after the resolved binary, plus `Some(bytes)`
+/// when the program must instead go on stdin (the default for an
+/// interpreter-classed tool with no inline-eval flag). This is the *only* place
+/// a `-c`-shaped flag is spelled, and it is data, never typed by the user.
+pub fn lang_block_invocation(tool: &str, src: &str) -> (Vec<OsString>, Option<Vec<u8>>) {
+    let flag = |f: &str| (vec![OsString::from(f), OsString::from(src)], None);
+    match tool {
+        "sh" | "bash" | "zsh" | "fish" | "python" | "python3" => flag("-c"),
+        "node" | "ruby" | "perl" | "lua" | "Rscript" | "osascript" => flag("-e"),
+        "php" => flag("-r"),
+        "deno" => (vec![OsString::from("eval"), OsString::from(src)], None),
+        "jq" => (vec![OsString::from(src)], None),
+        _ => (vec![], Some(src.as_bytes().to_vec())),
+    }
+}
+
+/// A short noun for an expression, for `.feed`'s diagnostic.
+fn expr_noun(e: &Expr) -> &'static str {
+    match e {
+        Expr::Str { .. } | Expr::StrInterp { .. } => "a string",
+        Expr::Int { .. } | Expr::Float { .. } => "a number",
+        Expr::List { .. } => "a list",
+        Expr::Record { .. } => "a record",
+        _ => "that value",
+    }
+}
+
+#[cfg(test)]
+mod lang_block_tests {
+    use super::lang_block_invocation;
+    use std::ffi::OsString;
+
+    fn os(v: &[&str]) -> Vec<OsString> {
+        v.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn c_flag_family() {
+        for tool in ["sh", "bash", "zsh", "fish", "python", "python3"] {
+            let (tail, stdin) = lang_block_invocation(tool, "BODY");
+            assert_eq!(tail, os(&["-c", "BODY"]), "{tool}");
+            assert!(stdin.is_none(), "{tool}");
+        }
+    }
+
+    #[test]
+    fn e_flag_family() {
+        for tool in ["node", "ruby", "perl", "lua", "Rscript", "osascript"] {
+            assert_eq!(
+                lang_block_invocation(tool, "X").0,
+                os(&["-e", "X"]),
+                "{tool}"
+            );
+        }
+    }
+
+    #[test]
+    fn special_forms() {
+        assert_eq!(lang_block_invocation("php", "X").0, os(&["-r", "X"]));
+        assert_eq!(lang_block_invocation("deno", "X").0, os(&["eval", "X"]));
+        // jq: filter as the sole arg, data left for stdin.
+        assert_eq!(lang_block_invocation("jq", ".a").0, os(&[".a"]));
+    }
+
+    #[test]
+    fn unmapped_interpreter_feeds_program_on_stdin() {
+        let (tail, stdin) = lang_block_invocation("wat", "prog");
+        assert!(tail.is_empty());
+        assert_eq!(stdin.as_deref(), Some(b"prog".as_slice()));
     }
 }

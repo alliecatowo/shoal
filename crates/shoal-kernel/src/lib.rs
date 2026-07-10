@@ -61,6 +61,11 @@ struct Subscriber {
     writer: SharedWriter,
 }
 
+/// Wire version of the AST node-kind vocabulary (TDD §7, IO.md §2.5). Bumped
+/// from 1 to 2 when `sh_raw` was retired in favor of the general
+/// `lang_block` node — a breaking rename to the AST-kind enum.
+const AST_VERSION: u32 = 2;
+
 /// Ring depth per channel (AGENT-SURFACE §4 requires ≥1024).
 const EVENT_RING_CAP: usize = 1024;
 
@@ -400,7 +405,7 @@ impl Kernel {
                     caps: json!({"enforced":caps_enforced,"tier":tier,"available_tier":tier,"policy_principal":who,"profile":profile,"token_caps":token_caps,"opaque":verdict_name(self.policy.evaluate_effect(&who, &Effect::Opaque))}),
                     cwd: WirePath::encode(&cwd),
                     env_hash: "local".into(),
-                    ast_version: 1,
+                    ast_version: AST_VERSION,
                     caps_enforced,
                     elide_defaults: elide_defaults_json(),
                     channels: STATIC_CHANNELS.iter().map(|s| s.to_string()).collect(),
@@ -413,7 +418,7 @@ impl Kernel {
                     message: e.msg,
                     data: Some(json!({"span":e.span,"hint":e.hint})),
                 })?;
-                encode(json!({"ast_version":1,"ast":ast}))
+                encode(json!({"ast_version":AST_VERSION,"ast":ast}))
             }
             "exec" => {
                 let attachment = attached.as_ref().ok_or_else(not_attached)?;
@@ -1150,7 +1155,7 @@ impl Kernel {
                     derive_plan(&mut evaluator, &ast, &ast_json)
                 };
                 encode(json!({
-                    "ast_version": 1,
+                    "ast_version": AST_VERSION,
                     "ast": ast,
                     "effects": plan.effects,
                     "reversibility": reversibility_from_effects(&plan.effects),

@@ -287,8 +287,11 @@ pub enum Expr {
         body: Block,
         span: Span,
     },
-    /// `sh { verbatim POSIX }` / `sh''' … '''`
-    ShRaw {
+    /// Interpreter block (IO.md §2): `tool { verbatim source }` /
+    /// `tool ''' … '''`. `sh { … }` is just `tool: "sh"`. `tool` is resolved as
+    /// a command at eval time; `src` is handed to it as its program.
+    LangBlock {
+        tool: String,
         src: String,
         span: Span,
     },
@@ -558,7 +561,7 @@ impl Expr {
             | Expr::Catch { span, .. }
             | Expr::With { span, .. }
             | Expr::Spawn { span, .. }
-            | Expr::ShRaw { span, .. }
+            | Expr::LangBlock { span, .. }
             | Expr::Binary { span, .. }
             | Expr::Unary { span, .. }
             | Expr::Range { span, .. } => *span,

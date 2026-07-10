@@ -311,7 +311,7 @@ fn expr(e: &Expr) -> String {
             block(body)
         ),
         Expr::Spawn { body, .. } => format!("spawn {}", block(body)),
-        Expr::ShRaw { src, .. } => format!("sh {{ {src} }}"),
+        Expr::LangBlock { tool, src, .. } => format!("{tool} {{ {src} }}"),
         Expr::Binary { op, lhs, rhs, .. } => format!("({} {} {})", expr(lhs), bop(*op), expr(rhs)),
         Expr::Unary { op, expr: e, .. } => {
             format!("{}{}", if *op == UnOp::Not { "!" } else { "-" }, atom(e))

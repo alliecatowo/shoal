@@ -34,6 +34,15 @@ fn dispatch(ctx: &mut dyn CallCtx, recv: Value, name: &str, args: CallArgs) -> V
         }
     }
     match name {
+        // `.feed(cmd)` (IO.md §1) spawns a child, which a pure value method
+        // cannot do — the evaluator intercepts `.feed` in its method-call path
+        // (shoal-eval `expr.rs::eval_feed`) before `call_method` is ever
+        // reached, building an `ExecSpec` with the value's `feed_bytes` as
+        // stdin. Reaching here means `.feed` was called through a path that
+        // bypassed that bridge; surface a clear error rather than "no method".
+        "feed" => Err(ErrorVal::type_error(
+            ".feed must be evaluated by the interpreter, not as a pure value method",
+        )),
         "len" | "count" => no_args(&args).and_then(|_| len(recv)),
         "is_empty" => no_args(&args)
             .and_then(|_| len(recv))

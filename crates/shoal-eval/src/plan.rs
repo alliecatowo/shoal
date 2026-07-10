@@ -83,7 +83,7 @@ impl Evaluator {
     ) -> VResult<()> {
         match expr {
             Expr::Cmd { call, .. } => self.plan_call(call, functions, aliases, out, depth),
-            Expr::ShRaw { .. } => {
+            Expr::LangBlock { .. } => {
                 push_effect(out, Effect::Opaque);
                 Ok(())
             }

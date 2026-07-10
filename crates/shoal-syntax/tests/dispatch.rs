@@ -27,7 +27,7 @@ fn ekind(e: &Expr) -> String {
         Expr::Null { .. } => "expr:null".into(),
         Expr::If { .. } => "expr:if".into(),
         Expr::Match { .. } => "expr:match".into(),
-        Expr::ShRaw { .. } => "expr:sh".into(),
+        Expr::LangBlock { .. } => "expr:sh".into(),
         Expr::Spawn { .. } => "expr:spawn".into(),
         Expr::Lambda { .. } => "expr:lambda".into(),
         other => panic!("unclassified expr {other:?}"),

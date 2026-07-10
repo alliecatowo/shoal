@@ -274,7 +274,7 @@ fn d8_sh_triple_raw_form() {
     assert!(matches!(
         last(&p),
         Stmt::Expr {
-            expr: Expr::ShRaw { .. },
+            expr: Expr::LangBlock { .. },
             ..
         }
     ));
@@ -282,7 +282,7 @@ fn d8_sh_triple_raw_form() {
     assert!(matches!(
         last(&parse("sh'echo hi'").unwrap()),
         Stmt::Expr {
-            expr: Expr::ShRaw { .. },
+            expr: Expr::LangBlock { .. },
             ..
         }
     ));

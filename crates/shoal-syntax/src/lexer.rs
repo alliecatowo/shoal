@@ -949,8 +949,14 @@ impl<'s> Lexer<'s> {
             pos += 1;
         }
         Err(
-            LexError::new("unterminated sh { … } block", Span::new(open, pos))
-                .hint("for payloads with unbalanced braces use sh''' … '''"),
+            // IO.md §5 `lang_block_unbalanced`: brace scan hit EOF with a
+            // still-open `{`. Message stays tool-agnostic (the scanner is shared
+            // across every interpreter block, `sh`/`python`/`jq`/…).
+            LexError::new(
+                "unbalanced braces in interpreter block `{ … }`",
+                Span::new(open, pos),
+            )
+            .hint("for payloads with unbalanced braces use the triple-raw form: tool ''' … '''"),
         )
     }
 }

@@ -1,0 +1,113 @@
+# IO.md conformance: interpreter blocks (§2) and `.feed` (§1).
+#
+# Host-safety: every non-skipped case uses only tools guaranteed on the CI
+# runners *and* the dev host — `sh` and `sort` (POSIX) always, plus `python3`
+# (preinstalled on GitHub ubuntu+macos runners and the dev host) for the one
+# structured-`.out` payoff case. Tools that are NOT universally present
+# (`node`, `jq`) are asserted only in `skip`ped cases documenting the intended
+# behavior, per spec/README's rule against environment-dependent expectations.
+
+# --- Interpreter blocks -----------------------------------------------------
+
+[[case]]
+name = "io-sh-block-out"
+# The generalized `sh { … }` (now `LangBlock{tool:"sh"}`) behaves exactly as
+# before: `sh -c 'printf "hi"'`, captured, `.out` is the trimmed stdout text.
+src = 'sh { printf "hi" }.out'
+value = '"hi"'
+
+[[case]]
+name = "io-sh-block-value-position"
+# Bare block at value position captures an outcome; `.status` is 0.
+src = '(sh { printf ok }).status'
+value = "0"
+
+[[case]]
+name = "io-sh-block-triple-raw"
+# The triple-raw form bypasses brace scanning — a payload with a lone `{`
+# inside a string would defeat the scanner, so `'''…'''` hands bytes verbatim.
+# The `'''` abuts the head, mirroring `sh`'s legacy raw spelling.
+src = "sh''' printf hey '''.out"
+value = '"hey"'
+
+[[case]]
+name = "io-sh-block-json-out-is-structured"
+# `.out` lazily parses JSON stdout into structured data with no adapter: a
+# block that emits a JSON object is field-addressable.
+src = '''sh { printf '{"n": 4}' }.out.n'''
+value = "4"
+
+[[case]]
+name = "io-python-block-structured-out"
+# The IO.md §2.7 payoff: an interpreter block that emits JSON has a structured
+# `.out`, navigable by field path — zero text-scraping. `python3` ships on the
+# GitHub ubuntu+macos runners and the dev host; the program reaches python via
+# `-c` (baked invocation map), so this is not string-smuggling at the call
+# site.
+src = 'python3 { import json; print(json.dumps({"n": 2 + 2})) }.out.n'
+value = "4"
+
+[[case]]
+name = "io-python-block-feed-composes"
+# `.feed` composes with a block: the program arrives via `-c`, so stdin stays
+# free for the fed value. Here the record is fed as JSON on stdin and python
+# reads+sums it. Uses python3 (see above).
+src = '{a: 2, b: 3}.feed(python3 { import sys, json; d = json.load(sys.stdin); print(d["a"] + d["b"]) }).out'
+value = '"5"'
+
+[[case]]
+name = "io-node-block-out"
+# node is not guaranteed on every host (absent on the dev box); documented as
+# a skip. Intended: `node -e 'console.log(41 + 1)'` → `.out` == "42".
+src = 'node { console.log(41 + 1) }.out'
+value = '"42"'
+skip = "node is not guaranteed present on all CI/dev hosts"
+
+# --- `.feed` (values as stdin) ---------------------------------------------
+
+[[case]]
+name = "io-feed-str-to-sort"
+# str → its UTF-8 bytes, fed as sort's complete stdin. `sort` is POSIX.
+src = '"b\na\nc".feed(sort).out'
+value = '"a\nb\nc"'
+
+[[case]]
+name = "io-feed-list-str-to-sort"
+# list<str> → newline-joined with a trailing newline, so each element is its
+# own line for the line-oriented tool.
+src = '["b", "a", "c"].feed(sort).out'
+value = '"a\nb\nc"'
+
+[[case]]
+name = "io-feed-list-str-numbers-to-sort"
+# list<str> of numeric strings → newline-joined; sort orders them lexically.
+src = '["3", "1", "2"].feed(sort).out'
+value = '"1\n2\n3"'
+
+[[case]]
+name = "io-feed-inverted-spelling"
+# `cmd.feed(value)` is exactly `value.feed(cmd)` — same spawn, same result.
+src = 'sort.feed("b\na\nc").out'
+value = '"a\nb\nc"'
+
+[[case]]
+name = "io-feed-record-json-to-sh"
+# record → compact JSON on stdin; `cat` echoes the exact bytes fed, and `.out`
+# lazily re-parses that JSON, so the record round-trips through the pipe.
+src = '{n: 2}.feed(cat).out'
+value = "{n: 2}"
+
+[[case]]
+name = "io-feed-regex-is-feed-error"
+# A regex is deliberately never feedable (IO.md §1.2 / §5) → `feed_error`.
+src = 're"x".feed(sort)'
+error = "feed_error"
+
+[[case]]
+name = "io-feed-jq-composition"
+# jq gets its filter as the sole arg (invocation map) and the fed JSON on
+# stdin — the classic anti-heredoc composition. jq is not universally present
+# on CI, so this documents intent via skip.
+src = '[{"a": 1}, {"a": 2}].feed(jq { .[].a }).out'
+value = "[1, 2]"
+skip = "jq is not guaranteed present on all CI/dev hosts"

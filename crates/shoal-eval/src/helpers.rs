@@ -8,7 +8,7 @@ use super::*;
 /// (or a boolean composition of commands) — defect #1b / WP1's Binary{And,Cmd,Cmd}.
 pub(crate) fn is_command_expr(e: &Expr) -> bool {
     match e {
-        Expr::Cmd { .. } | Expr::ShRaw { .. } => true,
+        Expr::Cmd { .. } | Expr::LangBlock { .. } => true,
         Expr::Binary {
             op: BinOp::And | BinOp::Or,
             lhs,

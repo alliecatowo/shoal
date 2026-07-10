@@ -2,6 +2,30 @@ use crate::lexer::{LexError, Lexer, Mode, RESERVED, Seg, Tok};
 use shoal_ast::*;
 use std::collections::HashSet;
 
+/// Interpreter-class tools (IO.md §2.2): a head in this set, immediately
+/// followed by `{` (or the triple-raw `'''`/`'` form), lexes a raw balanced-
+/// brace block and produces `Expr::LangBlock` — the parse-time trigger. A head
+/// *not* in this set keeps `{` as a trailing block/thunk (TDD §13.14). This is
+/// the static parser-side gate; the eval side maps each tool to its inline-eval
+/// invocation (shoal-eval `expr.rs`).
+pub const INTERPRETERS: &[&str] = &[
+    "sh",
+    "bash",
+    "python",
+    "python3",
+    "node",
+    "deno",
+    "ruby",
+    "jq",
+    "perl",
+    "php",
+    "lua",
+    "Rscript",
+    "osascript",
+    "fish",
+    "zsh",
+];
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParseError {
     pub msg: String,
@@ -172,6 +196,19 @@ impl<'s> Parser<'s> {
             _ => false,
         }
     }
+    /// True when an interpreter-class head (`INTERPRETERS`) at `ident_span` is
+    /// followed by a raw block: either an immediately-adjacent `'` (the
+    /// `tool'''…'''` / `tool'…'` raw form, matching `sh`'s legacy spelling) or a
+    /// `{` open brace (whitespace permitted, as `sh { … }` allows). This is the
+    /// IO.md §2.3 parse-time trigger — checked *before* the brace is consumed so
+    /// the parser knows to switch the lexer into raw mode.
+    fn interp_block_follows(&self, ident_span: Span) -> bool {
+        let end = ident_span.end as usize;
+        if self.byte(end) == b'\'' {
+            return true;
+        }
+        matches!(self.lx.token(end, Mode::Expr), Ok((Tok::LBrace, _)))
+    }
     /// True when the token immediately after an identifier abuts it (no
     /// whitespace) and is a postfix opener `.`/`?.`/`(`/`[` — the §3.1
     /// ident-adjacency refinement forcing an EXPR statement.
@@ -196,9 +233,11 @@ impl<'s> Parser<'s> {
         }
         Ok(match self.peek(Mode::Expr) {
             Ok((Tok::Ident(name), s)) => {
-                if RESERVED.contains(&name.as_str())
-                    || matches!(name.as_str(), "with" | "spawn" | "sh")
-                {
+                if RESERVED.contains(&name.as_str()) || matches!(name.as_str(), "with" | "spawn") {
+                    false
+                } else if INTERPRETERS.contains(&name.as_str()) && self.interp_block_follows(s) {
+                    // `tool { … }` / `tool ''' … '''` is an interpreter block
+                    // expression, not a command — dispatch EXPR.
                     false
                 } else if self.adjacent_postfix_after_ident(s)? {
                     false
@@ -340,8 +379,19 @@ impl<'s> Parser<'s> {
             // Keyword-headed expressions (`if`, `match`, literals, …) → EXPR.
             if matches!(
                 name.as_str(),
-                "true" | "false" | "null" | "if" | "match" | "try" | "with" | "spawn" | "sh"
+                "true" | "false" | "null" | "if" | "match" | "try" | "with" | "spawn"
             ) {
+                let expr = self.expr(0)?;
+                let span = expr.span();
+                return Ok(Stmt::Expr { expr, span });
+            }
+
+            // Interpreter block (IO.md §2.3): an interpreter-class head
+            // immediately followed by `{`/`'''` is a `LangBlock` expression, not
+            // a command. A head in the set *without* a following block falls
+            // through to normal command dispatch (`python script.py` still runs
+            // as a command).
+            if INTERPRETERS.contains(&name.as_str()) && self.interp_block_follows(s) {
                 let expr = self.expr(0)?;
                 let span = expr.span();
                 return Ok(Stmt::Expr { expr, span });
@@ -924,7 +974,7 @@ impl<'s> Parser<'s> {
     }
     fn primary(&mut self) -> ParseResult<Expr> {
         let (t, s) = self.bump(Mode::Expr)?;
-        Ok(match t{Tok::Int(value)=>Expr::Int{value,span:s},Tok::Float(value)=>Expr::Float{value,span:s},Tok::Size(bytes)=>Expr::Size{bytes,span:s},Tok::Duration(ns)=>Expr::Duration{ns,span:s},Tok::Time{hour,min,sec}=>Expr::Time{hour,min,sec,span:s},Tok::Str(value)=>Expr::Str{value,span:s},Tok::StrInterp(parts)=>self.interp(parts,s)?,Tok::Regex(src)=>Expr::Regex{src,span:s},Tok::DateTime(iso)=>Expr::DateTime{iso,span:s},Tok::Ident(x)if x=="true"||x=="false"=>Expr::Bool{value:x=="true",span:s},Tok::Ident(x)if x=="null"=>Expr::Null{span:s},Tok::Ident(x)if x=="if"=>return self.if_expr(s.start as usize),Tok::Ident(x)if x=="try"=>return self.try_expr(s.start as usize),Tok::Ident(x)if x=="match"=>return self.match_expr(s.start as usize),Tok::Ident(x)if x=="with"=>return self.with_expr(s.start as usize),Tok::Ident(x)if x=="spawn"=>{let body=self.block()?;Expr::Spawn{body,span:Span::new(s.start as usize,self.pos)}},Tok::Ident(x)if x=="sh"=>{if self.byte(self.pos)==b'\''{let(rt,rs)=self.bump(Mode::Expr)?;match rt{Tok::Str(src)=>Expr::ShRaw{src,span:Span::new(s.start as usize,rs.end as usize)},_=>return Err(ParseError::new("expected sh payload after `sh'`",rs))}}else{let open=self.expect(Mode::Expr,Tok::LBrace,"`{` or `'''…'''`")?;let(src,end)=self.lx.raw_brace_block(open.start as usize)?;self.pos=end;Expr::ShRaw{src,span:Span::new(s.start as usize,end as usize)}}},Tok::Ident(name)=>{if matches!(self.peek(Mode::Expr)?.0,Tok::FatArrow){self.bump(Mode::Expr)?;let body=self.expr(0)?;let end=body.span().end;Expr::Lambda{params:vec![Param{name,ty:None,default:None,span:s}],body:Box::new(body),span:Span::new(s.start as usize,end as usize)}}else{if !self.repl&&matches!(name.as_str(),"it"|"out"){return Err(ParseError::new(format!("`{name}` is REPL-only"),s).hint("bind a variable to reuse a previous result"))}Expr::Var{name,span:s}}},Tok::LParen=>return self.paren_or_lambda(s.start as usize),Tok::LBracket=>{let mut items=vec![];self.skip_newlines()?;if self.eat(Mode::Expr,&Tok::RBracket)?.is_none(){loop{items.push(self.expr(0)?);self.skip_newlines()?;if self.eat(Mode::Expr,&Tok::Comma)?.is_none(){self.expect(Mode::Expr,Tok::RBracket,"`]`")?;break}self.skip_newlines()?;if self.eat(Mode::Expr,&Tok::RBracket)?.is_some(){break}}}Expr::List{items,span:Span::new(s.start as usize,self.pos)}},Tok::LBrace=>return self.record_or_block(s.start as usize),Tok::Pipe=>return Err(ParseError::new("shoal has no pipe operator",s).hint("data composes with `.`; raw byte plumbing is `.feed(cmd)`; verbatim POSIX lives in `sh { … }`")),_=>return Err(ParseError::new(format!("expected expression, found {t:?}"),s))})
+        Ok(match t{Tok::Int(value)=>Expr::Int{value,span:s},Tok::Float(value)=>Expr::Float{value,span:s},Tok::Size(bytes)=>Expr::Size{bytes,span:s},Tok::Duration(ns)=>Expr::Duration{ns,span:s},Tok::Time{hour,min,sec}=>Expr::Time{hour,min,sec,span:s},Tok::Str(value)=>Expr::Str{value,span:s},Tok::StrInterp(parts)=>self.interp(parts,s)?,Tok::Regex(src)=>Expr::Regex{src,span:s},Tok::DateTime(iso)=>Expr::DateTime{iso,span:s},Tok::Ident(x)if x=="true"||x=="false"=>Expr::Bool{value:x=="true",span:s},Tok::Ident(x)if x=="null"=>Expr::Null{span:s},Tok::Ident(x)if x=="if"=>return self.if_expr(s.start as usize),Tok::Ident(x)if x=="try"=>return self.try_expr(s.start as usize),Tok::Ident(x)if x=="match"=>return self.match_expr(s.start as usize),Tok::Ident(x)if x=="with"=>return self.with_expr(s.start as usize),Tok::Ident(x)if x=="spawn"=>{let body=self.block()?;Expr::Spawn{body,span:Span::new(s.start as usize,self.pos)}},Tok::Ident(ref x)if INTERPRETERS.contains(&x.as_str())&&self.interp_block_follows(s)=>{let tool=x.clone();if self.byte(self.pos)==b'\''{let(rt,rs)=self.bump(Mode::Expr)?;match rt{Tok::Str(src)=>Expr::LangBlock{tool,src,span:Span::new(s.start as usize,rs.end as usize)},_=>return Err(ParseError::new(format!("expected {tool} payload after `{tool}'`"),rs))}}else{let open=self.expect(Mode::Expr,Tok::LBrace,"`{` or `'''…'''`")?;let(src,end)=self.lx.raw_brace_block(open.start as usize)?;self.pos=end;Expr::LangBlock{tool,src,span:Span::new(s.start as usize,end as usize)}}},Tok::Ident(name)=>{if matches!(self.peek(Mode::Expr)?.0,Tok::FatArrow){self.bump(Mode::Expr)?;let body=self.expr(0)?;let end=body.span().end;Expr::Lambda{params:vec![Param{name,ty:None,default:None,span:s}],body:Box::new(body),span:Span::new(s.start as usize,end as usize)}}else{if !self.repl&&matches!(name.as_str(),"it"|"out"){return Err(ParseError::new(format!("`{name}` is REPL-only"),s).hint("bind a variable to reuse a previous result"))}Expr::Var{name,span:s}}},Tok::LParen=>return self.paren_or_lambda(s.start as usize),Tok::LBracket=>{let mut items=vec![];self.skip_newlines()?;if self.eat(Mode::Expr,&Tok::RBracket)?.is_none(){loop{items.push(self.expr(0)?);self.skip_newlines()?;if self.eat(Mode::Expr,&Tok::Comma)?.is_none(){self.expect(Mode::Expr,Tok::RBracket,"`]`")?;break}self.skip_newlines()?;if self.eat(Mode::Expr,&Tok::RBracket)?.is_some(){break}}}Expr::List{items,span:Span::new(s.start as usize,self.pos)}},Tok::LBrace=>return self.record_or_block(s.start as usize),Tok::Pipe=>return Err(ParseError::new("shoal has no pipe operator",s).hint("data composes with `.`; raw byte plumbing is `.feed(cmd)`; verbatim POSIX lives in `sh { … }`")),_=>return Err(ParseError::new(format!("expected expression, found {t:?}"),s))})
     }
     fn postfix(&mut self, mut e: Expr) -> ParseResult<Expr> {
         loop {
