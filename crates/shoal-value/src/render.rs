@@ -225,6 +225,18 @@ fn pad_to(s: &str, width: usize) -> String {
     }
 }
 
+fn color_for_value(v: &Value) -> &'static str {
+    match v {
+        Value::Int(_) | Value::Float(_) | Value::Size(_) | Value::Duration(_) | Value::DateTime(_) | Value::Time(_) => "\x1b[36m",
+        Value::Bool(_) | Value::Null => "\x1b[96m",
+        Value::Str(_) => "\x1b[32m",
+        Value::Path(p) => if p.is_dir() { "\x1b[34;1m" } else { "\x1b[39m" },
+        Value::Glob(_) | Value::Regex(_) => "\x1b[95m",
+        Value::Error(_) => "\x1b[31m",
+        _ => "",
+    }
+}
+
 /// Pretty table for `list<record>`-shaped data.
 fn render_table(rows: &[Record], max_width: usize) -> String {
     if rows.is_empty() {
@@ -241,14 +253,16 @@ fn render_table(rows: &[Record], max_width: usize) -> String {
     }
     let cell_cap = 60usize;
     let mut widths: Vec<usize> = cols.iter().map(|c| c.width()).collect();
-    let mut cells: Vec<Vec<String>> = Vec::with_capacity(rows.len());
+    let mut cells: Vec<Vec<(String, &'static str)>> = Vec::with_capacity(rows.len());
     for r in rows {
         let mut line = Vec::with_capacity(cols.len());
         for (i, c) in cols.iter().enumerate() {
-            let cell = r.get(c).map(render_cell).unwrap_or_default();
+            let val = r.get(c);
+            let cell = val.map(render_cell).unwrap_or_default();
+            let color = val.map(color_for_value).unwrap_or("");
             let cell = truncate_display(&cell, cell_cap);
             widths[i] = widths[i].max(cell.width());
-            line.push(cell);
+            line.push((cell, color));
         }
         cells.push(line);
     }
@@ -275,7 +289,14 @@ fn render_table(rows: &[Record], max_width: usize) -> String {
         let row: Vec<String> = line
             .iter()
             .enumerate()
-            .map(|(i, c)| pad_to(&truncate_display(c, widths[i]), widths[i]))
+            .map(|(i, (c, color))| {
+                let padded = pad_to(&truncate_display(c, widths[i]), widths[i]);
+                if color.is_empty() {
+                    padded
+                } else {
+                    format!("{color}{padded}\x1b[0m")
+                }
+            })
             .collect();
         out.push_str(row.join("  ").trim_end());
         out.push('\n');

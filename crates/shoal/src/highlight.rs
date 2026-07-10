@@ -37,7 +37,7 @@ impl Highlighter for ShoalHighlighter {
                             match s.as_str() {
                                 "let" | "var" | "fn" | "if" | "else" | "match" | "for" | "in" | "while" | "return" | "break" | "continue" | "try" | "catch" | "alias" | "use" | "export" => Style::new().fg(Color::Green).bold(),
                                 "true" | "false" | "null" => Style::new().fg(Color::LightCyan),
-                                _ => Style::default(),
+                                _ => Style::new().fg(Color::LightBlue),
                             }
                         }
                         Tok::Eq | Tok::PlusEq | Tok::MinusEq | Tok::StarEq | Tok::SlashEq => Style::new().fg(Color::Red),
