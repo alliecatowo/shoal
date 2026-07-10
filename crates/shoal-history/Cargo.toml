@@ -1,0 +1,17 @@
+[package]
+name = "shoal-history"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde_json = "1.0.150"
+shoal-journal = { path = "../shoal-journal" }
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[[bin]]
+name = "shoal-history"
+path = "src/main.rs"
