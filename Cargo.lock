@@ -1015,6 +1015,8 @@ dependencies = [
  "serde",
  "serde_json",
  "shoal-eval",
+ "shoal-journal",
+ "shoal-leash",
  "shoal-proto",
  "shoal-syntax",
  "shoal-value",
@@ -1033,6 +1035,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "shoal-mcp"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "shoal-proto"
 version = "0.1.0"
 dependencies = [
@@ -1046,6 +1056,7 @@ name = "shoal-syntax"
 version = "0.1.0"
 dependencies = [
  "pretty_assertions",
+ "serde_json",
  "shoal-ast",
 ]
 
