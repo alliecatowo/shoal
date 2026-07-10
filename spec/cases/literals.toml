@@ -1,0 +1,210 @@
+# Literal forms: ints (dec/hex/octal/binary, underscores), floats, bools, null,
+# size units (decimal + binary), duration units, time literals, regex, glob/path
+# constructors. Render expectations per CONTRACTS.md §3.
+
+[[case]]
+name = "lit-int-decimal"
+src = "42"
+value = "42"
+
+[[case]]
+name = "lit-int-underscores"
+src = "1_000_000"
+value = "1000000"
+
+[[case]]
+name = "lit-int-hex"
+src = "0xFF"
+value = "255"
+
+[[case]]
+name = "lit-int-hex-underscore"
+src = "0xFF_FF"
+value = "65535"
+
+[[case]]
+name = "lit-int-octal"
+src = "0o755"
+value = "493"
+
+[[case]]
+name = "lit-int-binary"
+src = "0b1010"
+value = "10"
+
+[[case]]
+name = "lit-int-negative"
+src = "-7"
+value = "-7"
+
+[[case]]
+name = "lit-float-simple"
+src = "3.14"
+value = "3.14"
+
+[[case]]
+name = "lit-float-exponent"
+src = "1e9"
+value = "1000000000"
+
+[[case]]
+name = "lit-float-fraction"
+src = "0.5"
+value = "0.5"
+
+[[case]]
+name = "lit-bool-true"
+src = "true"
+value = "true"
+
+[[case]]
+name = "lit-bool-false"
+src = "false"
+value = "false"
+
+[[case]]
+name = "lit-null"
+src = "null"
+value = "null"
+
+[[case]]
+name = "lit-size-bytes"
+src = "237b"
+value = "237b"
+
+[[case]]
+name = "lit-size-kb"
+src = "1kb"
+value = "1kb"
+
+[[case]]
+name = "lit-size-render-two-decimals"
+src = "1020b"
+value = "1.02kb"
+
+[[case]]
+name = "lit-size-mb-frac"
+src = "1.5mb"
+value = "1.5mb"
+
+[[case]]
+name = "lit-size-gb-frac"
+src = "1.5gb"
+value = "1.5gb"
+
+[[case]]
+name = "lit-size-tb"
+src = "2tb"
+value = "2tb"
+
+[[case]]
+name = "lit-size-underscore-unit"
+src = "1_000kb"
+value = "1mb"
+
+[[case]]
+name = "lit-size-kib-binary-renders-decimal"
+# kib family renders in decimal units in v1 (CONTRACTS §3): 1024 bytes = 1.024kb -> 1.02kb.
+src = "1kib"
+value = "1.02kb"
+
+[[case]]
+name = "lit-size-kib-4096"
+# 4096 bytes = 4.096kb -> two decimals, trailing zeros trimmed -> 4.1kb.
+src = "4kib"
+value = "4.1kb"
+
+[[case]]
+name = "lit-size-sub-unit-fraction"
+# 0.5kb = 500 bytes; largest unit with integer part >= 1 is bytes.
+src = "0.5kb"
+value = "500b"
+
+[[case]]
+name = "lit-duration-ms"
+src = "250ms"
+value = "250ms"
+
+[[case]]
+name = "lit-duration-zero"
+src = "0s"
+value = "0s"
+
+[[case]]
+name = "lit-duration-compound-seconds"
+src = "90s"
+value = "1m30s"
+
+[[case]]
+name = "lit-duration-frac-hour"
+src = "1.5h"
+value = "1h30m"
+
+[[case]]
+name = "lit-duration-frac-second"
+src = "1.5s"
+value = "1s500ms"
+
+[[case]]
+name = "lit-duration-weeks"
+# 30d = 4 weeks + 2 days; render uses w d h m s ms us ns, nonzero parts only.
+src = "30d"
+value = "4w2d"
+
+[[case]]
+name = "lit-duration-minutes"
+src = "90m"
+value = "1h30m"
+
+[[case]]
+name = "lit-duration-micros"
+src = "1500us"
+value = "1ms500us"
+
+[[case]]
+name = "lit-duration-day-hour"
+src = "36h"
+value = "1d12h"
+
+[[case]]
+name = "lit-time-am"
+src = "10:00am"
+value = "10:00"
+
+[[case]]
+name = "lit-time-24h"
+src = "23:15"
+value = "23:15"
+
+[[case]]
+name = "lit-time-pm-with-seconds"
+src = "10:30:15pm"
+value = "22:30:15"
+
+[[case]]
+name = "lit-time-pad-hour"
+src = "9:05am"
+value = "09:05"
+
+[[case]]
+name = "lit-regex-render"
+src = 're"\d+"'
+value = 're"\d+"'
+
+[[case]]
+name = "lit-datetime-render"
+src = 't"2026-07-09T14:00Z"'
+value = "2026-07-09T14:00:00Z"
+skip = "RFC3339 rendering detail not pinned: Z vs +00:00 and whether :00 seconds are emitted"
+
+[[case]]
+name = "lit-glob-constructor-render"
+# glob renders as its pattern (CONTRACTS §3).
+src = 'glob("*.rs")'
+value = "*.rs"
+
+[[case]]
+name = "lit-path-constructor-render"
+# path renders lossy, unquoted when it contains no spaces (CONTRACTS §3).
+src = 'path("a.txt")'
+value = "a.txt"
