@@ -229,10 +229,8 @@ parse_error_contains="backtick"
 name="parse-comparison-chain"
 src="1 < 2 < 3"
 parse_error=true
-skip="comparison non-associativity diagnostic not implemented"
 [[case]]
 name="fixture-path"
 src="let p = path(\"nested/a.txt\")\np.display()"
 value='"nested/a.txt"'
 fixture=["nested/a.txt"]
-skip="path constructor is not implemented by the evaluator"

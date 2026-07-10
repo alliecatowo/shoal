@@ -50,10 +50,14 @@ pub struct Parser<'s> {
 
 impl<'s> Parser<'s> {
     pub fn new(src: &'s str) -> Self {
+        let builtins = ["path", "glob", "regex"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
         Self {
             lx: Lexer::new(src),
             pos: 0,
-            scopes: vec![HashSet::new()],
+            scopes: vec![builtins],
         }
     }
     fn peek(&self, m: Mode) -> ParseResult<(Tok, Span)> {
@@ -573,6 +577,27 @@ impl<'s> Parser<'s> {
             if bp < min {
                 break;
             }
+            if is_comparison_token(&t)
+                && matches!(
+                    lhs,
+                    Expr::Binary {
+                        op: BinOp::Eq
+                            | BinOp::Ne
+                            | BinOp::Lt
+                            | BinOp::Le
+                            | BinOp::Gt
+                            | BinOp::Ge
+                            | BinOp::In,
+                        ..
+                    }
+                )
+            {
+                return Err(ParseError::new(
+                    "comparison operators do not chain",
+                    self.peek(Mode::Expr)?.1,
+                )
+                .hint("combine comparisons explicitly with `&&`"));
+            }
             self.bump(Mode::Expr)?;
             let rhs = self.expr(bp + 1)?;
             let span = Span::new(lhs.span().start as usize, rhs.span().end as usize);
@@ -1039,6 +1064,14 @@ fn binop(t: &Tok) -> Option<(u8, Option<BinOp>)> {
         Tok::Percent => (7, Some(BinOp::Rem)),
         _ => return None,
     })
+}
+
+fn is_comparison_token(t: &Tok) -> bool {
+    matches!(
+        t,
+        Tok::EqEq | Tok::NotEq | Tok::Lt | Tok::Le | Tok::Gt | Tok::Ge
+    )
+        || matches!(t, Tok::Ident(x) if x == "in")
 }
 
 #[cfg(test)]

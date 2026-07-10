@@ -293,10 +293,7 @@ impl Evaluator {
             Expr::Regex { src, .. } => {
                 Ok(Value::Regex(Arc::new(shoal_value::RegexVal::compile(src)?)))
             }
-            Expr::DateTime { iso, .. } => iso
-                .parse::<jiff::Zoned>()
-                .map(|z| Value::DateTime(Box::new(z)))
-                .map_err(|e| ErrorVal::new("arg_error", format!("invalid datetime: {e}"))),
+            Expr::DateTime { iso, .. } => parse_datetime(iso).map(|z| Value::DateTime(Box::new(z))),
             Expr::Var { name, .. } => self.env.get(name).ok_or_else(|| {
                 ErrorVal::new("undefined_var", format!("undefined variable `{name}`"))
             }),
@@ -451,10 +448,13 @@ impl Evaluator {
                 }
             }
             Expr::FnCall { name, args, .. } => {
+                let a = self.eval_args(args)?;
+                if let Some(value) = self.call_constructor(name, &a)? {
+                    return Ok(value);
+                }
                 let f = self.env.get(name).ok_or_else(|| {
                     ErrorVal::new("undefined_var", format!("undefined function `{name}`"))
                 })?;
-                let a = self.eval_args(args)?;
                 self.call_value(&f, a)
             }
             Expr::Lambda { params, body, .. } => Ok(Value::Closure(Arc::new(ClosureVal {
@@ -616,6 +616,65 @@ impl Evaluator {
                 "type_error",
                 format!("{} is not callable", f.type_name()),
             )),
+        }
+    }
+
+    fn call_constructor(&self, name: &str, args: &CallArgs) -> VResult<Option<Value>> {
+        let one = || {
+            if !args.named.is_empty() || args.pos.len() != 1 {
+                Err(ErrorVal::new(
+                    "arg_error",
+                    format!("{name} expects exactly one positional argument"),
+                ))
+            } else {
+                Ok(&args.pos[0])
+            }
+        };
+        match name {
+            "path" => match one()? {
+                Value::Str(s) => Ok(Some(Value::Path(PathBuf::from(s)))),
+                Value::Path(p) => Ok(Some(Value::Path(p.clone()))),
+                v => Err(ErrorVal::new(
+                    "type_error",
+                    format!("path expects str, found {}", v.type_name()),
+                )),
+            },
+            "glob" => match args.pos.as_slice() {
+                [Value::Str(pattern)]
+                    if args
+                        .named
+                        .iter()
+                        .all(|(name, _)| name == "hidden" || name == "follow") =>
+                {
+                    Ok(Some(Value::Glob(shoal_value::GlobVal {
+                        pattern: pattern.clone(),
+                        cwd: self.cwd.clone(),
+                        hidden: args
+                            .named
+                            .iter()
+                            .find(|(name, _)| name == "hidden")
+                            .is_some_and(|(_, value)| *value == Value::Bool(true)),
+                    })))
+                }
+                [v] if !matches!(v, Value::Str(_)) => Err(ErrorVal::new(
+                    "type_error",
+                    format!("glob expects str, found {}", v.type_name()),
+                )),
+                _ => Err(ErrorVal::new(
+                    "arg_error",
+                    "glob expects one pattern and optional hidden/follow arguments",
+                )),
+            },
+            "regex" => match one()? {
+                Value::Str(src) => Ok(Some(Value::Regex(Arc::new(
+                    shoal_value::RegexVal::compile(src)?,
+                )))),
+                v => Err(ErrorVal::new(
+                    "type_error",
+                    format!("regex expects str, found {}", v.type_name()),
+                )),
+            },
+            _ => Ok(None),
         }
     }
 
@@ -1649,6 +1708,24 @@ impl CallCtx for Evaluator {
 
 pub fn eval(program: &Program, cwd: impl AsRef<Path>) -> VResult<Value> {
     Evaluator::new(cwd.as_ref().to_path_buf()).eval_program(program)
+}
+
+fn parse_datetime(iso: &str) -> VResult<jiff::Zoned> {
+    if let Ok(zoned) = iso.parse::<jiff::Zoned>() {
+        return Ok(zoned);
+    }
+    if let Ok(timestamp) = iso.parse::<jiff::Timestamp>() {
+        return Ok(timestamp.to_zoned(jiff::tz::TimeZone::UTC));
+    }
+    if let Ok(date) = iso.parse::<jiff::civil::Date>() {
+        return date
+            .to_zoned(jiff::tz::TimeZone::UTC)
+            .map_err(|e| ErrorVal::new("arg_error", format!("invalid datetime: {e}")));
+    }
+    Err(ErrorVal::new(
+        "arg_error",
+        format!("invalid datetime `{iso}`"),
+    ))
 }
 
 #[cfg(test)]

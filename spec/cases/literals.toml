@@ -195,18 +195,15 @@ value = 're"\d+"'
 name = "lit-datetime-render"
 src = 't"2026-07-09T14:00Z"'
 value = "2026-07-09T14:00:00Z"
-skip = "RFC3339 rendering detail not pinned: Z vs +00:00 and whether :00 seconds are emitted"
 
 [[case]]
 name = "lit-glob-constructor-render"
 # glob renders as its pattern (CONTRACTS §3).
 src = 'glob("*.rs")'
 value = "*.rs"
-skip = "glob constructor is not implemented by the evaluator"
 
 [[case]]
 name = "lit-path-constructor-render"
 # path renders lossy, unquoted when it contains no spaces (CONTRACTS §3).
 src = 'path("a.txt")'
 value = "a.txt"
-skip = "path constructor is not implemented by the evaluator"
