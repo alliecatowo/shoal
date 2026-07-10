@@ -41,6 +41,7 @@ pub struct Render {
 #[serde(default)]
 pub struct Editor {
     pub mode: String,
+    pub bracketed_paste: bool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -113,6 +114,7 @@ impl Default for Editor {
     fn default() -> Self {
         Self {
             mode: "emacs".into(),
+            bracketed_paste: true,
         }
     }
 }
@@ -259,7 +261,7 @@ fn unknowns(v: &toml::Value, prefix: &str, out: &mut Vec<String>) {
         "prompt" => ["template"].into_iter().collect(),
         "history" => ["enabled", "max_entries", "path"].into_iter().collect(),
         "render" => ["width", "color"].into_iter().collect(),
-        "editor" => ["mode"].into_iter().collect(),
+        "editor" => ["mode", "bracketed_paste"].into_iter().collect(),
         "kernel" => ["enabled", "session"].into_iter().collect(),
         "adapters" => ["dirs"].into_iter().collect(),
         "journal" => ["enabled", "state_dir"].into_iter().collect(),

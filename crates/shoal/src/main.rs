@@ -306,6 +306,7 @@ fn repl() -> Result<i32, String> {
 
     let completions = completion_candidates(evaluator.cwd());
     let mut editor = Reedline::create()
+        .use_bracketed_paste(config.editor.bracketed_paste)
         .with_validator(Box::new(ShoalValidator))
         .with_completer(Box::new(DefaultCompleter::new_with_wordlen(
             completions.clone(),
