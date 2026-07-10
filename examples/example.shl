@@ -1,0 +1,30 @@
+#!/usr/bin/env shoal
+# example.shl — a taste of shoal. Run it with:  shoal examples/example.shl
+
+# Compose with dots, not pipes — each step knows the type it carries.
+let langs = ["rust", "go", "python", "c", "zig"]
+let longer = langs.where(.len() > 2).sort()
+echo "languages with names longer than 2 chars:"
+for name in longer {
+  echo "  - {name}"
+}
+
+# Typed units: real arithmetic, not stringly-typed mush.
+let budget = 2gb
+let used = 1.4gb
+echo "disk budget {budget}, used {used}, free {budget - used}"
+
+# Functions ARE commands — call them with flags like any program.
+fn greet(name: str, loud: bool = false) {
+  if loud { "HELLO {name.upper()}" } else { "hello {name}" }
+}
+echo (greet "shoal" --loud)
+
+# Match on shape, not string-munging.
+let n = 7
+let size = match n {
+  0        => "zero",
+  1..10    => "small",
+  _        => "big",
+}
+echo "{n} is {size}"
