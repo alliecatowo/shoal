@@ -476,6 +476,103 @@ pub fn preflight_spawn(binary: &Path, allowlist: &[String]) -> std::io::Result<S
     })
 }
 
+/// Deterministic deny-by-default Seatbelt profile. Grants must exist so
+/// canonicalization cannot silently broaden a symlinked or lexical path.
+pub fn seatbelt_profile(grants: &FsSandbox) -> Result<String, String> {
+    let mut read = canonical_grants(&grants.read)?;
+    let mut write = canonical_grants(&grants.write)?;
+    let mut delete = canonical_grants(&grants.delete)?;
+    read.sort();
+    read.dedup();
+    write.sort();
+    write.dedup();
+    delete.sort();
+    delete.dedup();
+    let mut out = String::from(
+        "(version 1)\n(deny default)\n(allow process*)\n(allow signal (target self))\n",
+    );
+    for p in read {
+        out.push_str(&format!(
+            "(allow file-read* (subpath \"{}\"))\n",
+            seatbelt_escape(&p)?
+        ));
+    }
+    for p in write {
+        out.push_str(&format!(
+            "(allow file-read* file-write* (subpath \"{}\"))\n",
+            seatbelt_escape(&p)?
+        ));
+    }
+    for p in delete {
+        out.push_str(&format!(
+            "(allow file-read-metadata file-write-unlink (subpath \"{}\"))\n",
+            seatbelt_escape(&p)?
+        ));
+    }
+    Ok(out)
+}
+fn canonical_grants(paths: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
+    paths
+        .iter()
+        .map(|p| {
+            fs::canonicalize(p)
+                .map_err(|e| format!("cannot canonicalize Seatbelt grant {}: {e}", p.display()))
+        })
+        .collect()
+}
+fn seatbelt_escape(path: &Path) -> Result<String, String> {
+    let text = path
+        .to_str()
+        .ok_or_else(|| format!("Seatbelt cannot encode non-UTF-8 path {}", path.display()))?;
+    let mut out = String::new();
+    for c in text.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            c if c.is_control() => return Err("Seatbelt grant contains a control character".into()),
+            c => out.push(c),
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(target_os = "macos")]
+pub fn apply_macos_sandbox(grants: &FsSandbox) -> Result<EnforcementStatus, String> {
+    use std::ffi::{CStr, CString, c_char};
+    let profile =
+        CString::new(seatbelt_profile(grants)?).map_err(|_| "Seatbelt profile contains NUL")?;
+    let mut error: *mut c_char = std::ptr::null_mut();
+    let result = unsafe { sandbox_init(profile.as_ptr(), 0, &mut error) };
+    if result != 0 {
+        let message = if error.is_null() {
+            "sandbox_init failed".into()
+        } else {
+            unsafe { CStr::from_ptr(error) }
+                .to_string_lossy()
+                .into_owned()
+        };
+        if !error.is_null() {
+            unsafe { sandbox_free_error(error) }
+        }
+        return Err(message);
+    }
+    Ok(EnforcementStatus{available_tier:EnforcementTier::C,active_tier:Some(EnforcementTier::C),enforced:true,detail:"Seatbelt filesystem profile active; spawn preflight is TOCTOU-prone; network enforcement unavailable".into(),landlock_abi:None,filesystem_enforced:true,spawn_exec_enforced:false,network_enforced:false})
+}
+#[cfg(target_os = "macos")]
+#[link(name = "sandbox")]
+unsafe extern "C" {
+    fn sandbox_init(
+        profile: *const std::ffi::c_char,
+        flags: u64,
+        error: *mut *mut std::ffi::c_char,
+    ) -> std::ffi::c_int;
+    fn sandbox_free_error(error: *mut std::ffi::c_char);
+}
+#[cfg(not(target_os = "macos"))]
+pub fn apply_macos_sandbox(_: &FsSandbox) -> Result<EnforcementStatus, String> {
+    Err("Seatbelt enforcement is only available on macOS".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -641,6 +738,30 @@ opaque = "ask"
             preflight_spawn(&p, std::slice::from_ref(&first.hash))
                 .unwrap()
                 .allowed
+        );
+    }
+    #[test]
+    fn seatbelt_profile_is_canonical_sorted_and_escaped() {
+        let d = tempfile::tempdir().unwrap();
+        let weird = d.path().join("quote\"and\\slash");
+        fs::create_dir(&weird).unwrap();
+        let profile = seatbelt_profile(&FsSandbox {
+            read: vec![weird.clone(), weird.clone()],
+            write: vec![],
+            delete: vec![],
+        })
+        .unwrap();
+        assert!(profile.starts_with("(version 1)\n(deny default)"));
+        assert_eq!(profile.matches("file-read* (subpath").count(), 1);
+        assert!(profile.contains("quote\\\"and\\\\slash"));
+    }
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn seatbelt_application_is_explicitly_unavailable() {
+        assert!(
+            apply_macos_sandbox(&FsSandbox::default())
+                .unwrap_err()
+                .contains("only available on macOS")
         );
     }
 }
