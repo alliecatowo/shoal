@@ -302,6 +302,11 @@ fn unresolvable_command_is_not_found() {
     assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
 }
 
+// Relies on Linux's per-argument MAX_ARG_STRLEN (128 KiB); macOS has no such
+// per-arg cap, so a 200 KiB single argument spawns fine there. The general
+// contract (spawn failure surfaces as io::Error) holds cross-platform, but is
+// only cheaply triggerable on Linux.
+#[cfg(target_os = "linux")]
 #[test]
 fn e2big_surfaces_as_io_error() {
     // A single argument beyond Linux's MAX_ARG_STRLEN (128 KiB) → E2BIG.
@@ -471,6 +476,7 @@ fn pty_not_found_still_errors_cleanly() {
     assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn pty_e2big_preserves_the_os_error() {
     let huge = "x".repeat(200_000);
