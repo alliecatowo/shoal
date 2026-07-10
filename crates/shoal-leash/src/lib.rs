@@ -321,30 +321,159 @@ pub struct EnforcementStatus {
     pub active_tier: Option<EnforcementTier>,
     pub enforced: bool,
     pub detail: String,
+    pub landlock_abi: Option<i32>,
+    pub filesystem_enforced: bool,
+    pub spawn_exec_enforced: bool,
+    pub network_enforced: bool,
 }
 
 impl EnforcementStatus {
     /// Detect the strongest plausible platform tier. Since this crate installs
     /// no backend, `enforced` remains false and `active_tier` remains `None`.
     pub fn detect() -> Self {
-        let available_tier = if cfg!(target_os = "linux") {
-            if Path::new("/sys/kernel/security/landlock").exists() {
-                EnforcementTier::A
-            } else {
-                EnforcementTier::B
+        let (available_tier, detail) = if cfg!(target_os = "linux") {
+            match landlock_abi() {
+                Some(abi) => (
+                    EnforcementTier::A,
+                    format!(
+                        "Landlock ABI {abi} available; seccomp/network enforcement unavailable"
+                    ),
+                ),
+                None => (
+                    EnforcementTier::B,
+                    "Landlock unavailable; namespace fallback not installed".into(),
+                ),
             }
         } else if cfg!(target_os = "macos") {
-            EnforcementTier::C
+            (EnforcementTier::C, "Seatbelt backend not installed".into())
         } else {
-            EnforcementTier::D
+            (EnforcementTier::D, "advisory policy only".into())
         };
         Self {
             available_tier,
             active_tier: None,
             enforced: false,
-            detail: "policy evaluation active; OS enforcement backend not installed".into(),
+            detail,
+            landlock_abi: landlock_abi(),
+            filesystem_enforced: false,
+            spawn_exec_enforced: false,
+            network_enforced: false,
         }
     }
+}
+
+/// Concrete filesystem grants for a child process. Calling [`apply_landlock`]
+/// irreversibly restricts the current thread/process and must only happen after
+/// fork in the child, immediately before exec.
+#[derive(Debug, Clone, Default)]
+pub struct FsSandbox {
+    pub read: Vec<PathBuf>,
+    pub write: Vec<PathBuf>,
+    pub delete: Vec<PathBuf>,
+}
+
+#[cfg(target_os = "linux")]
+pub fn landlock_abi() -> Option<i32> {
+    const VERSION: u32 = 1;
+    let value = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            std::ptr::null::<u8>(),
+            0usize,
+            VERSION,
+        )
+    };
+    (value > 0).then_some(value as i32)
+}
+#[cfg(not(target_os = "linux"))]
+pub fn landlock_abi() -> Option<i32> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+pub fn apply_landlock(grants: &FsSandbox) -> Result<EnforcementStatus, String> {
+    use landlock::{
+        ABI, Access, AccessFs, CompatLevel, Compatible, LandlockStatus, Ruleset, RulesetAttr,
+        RulesetCreatedAttr, RulesetStatus, path_beneath_rules,
+    };
+    let abi = ABI::V7;
+    let mut ruleset = Ruleset::default()
+        .handle_access(AccessFs::from_all(abi))
+        .map_err(|e| e.to_string())?
+        .create()
+        .map_err(|e| e.to_string())?;
+    ruleset = ruleset
+        .add_rules(path_beneath_rules(
+            grants.read.iter(),
+            AccessFs::from_read(abi),
+        ))
+        .map_err(|e| e.to_string())?;
+    ruleset = ruleset
+        .add_rules(path_beneath_rules(
+            grants.write.iter(),
+            AccessFs::from_all(abi),
+        ))
+        .map_err(|e| e.to_string())?;
+    let delete = AccessFs::RemoveDir | AccessFs::RemoveFile;
+    ruleset = ruleset
+        .add_rules(path_beneath_rules(grants.delete.iter(), delete))
+        .map_err(|e| e.to_string())?;
+    let status = ruleset
+        .set_compatibility(CompatLevel::HardRequirement)
+        .restrict_self()
+        .map_err(|e| e.to_string())?;
+    let active = matches!(status.landlock, LandlockStatus::Available { .. })
+        && matches!(status.ruleset, RulesetStatus::FullyEnforced);
+    if !active {
+        return Err(format!(
+            "Landlock restriction was not fully enforced: {status:?}"
+        ));
+    }
+    Ok(EnforcementStatus {
+        available_tier: EnforcementTier::A,
+        active_tier: Some(EnforcementTier::A),
+        enforced: true,
+        detail: format!(
+            "Landlock active ({:?}); spawn hash preflight is TOCTOU-prone; seccomp/netns unavailable",
+            status.landlock
+        ),
+        landlock_abi: landlock_abi(),
+        filesystem_enforced: true,
+        spawn_exec_enforced: false,
+        network_enforced: false,
+    })
+}
+#[cfg(not(target_os = "linux"))]
+pub fn apply_landlock(_: &FsSandbox) -> Result<EnforcementStatus, String> {
+    Err("Landlock is only available on Linux".into())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpawnPreflight {
+    pub hash: String,
+    pub allowed: bool,
+    pub assurance: &'static str,
+}
+pub fn preflight_spawn(binary: &Path, allowlist: &[String]) -> std::io::Result<SpawnPreflight> {
+    use std::io::Read;
+    let mut f = fs::File::open(binary)?;
+    let mut h = blake3::Hasher::new();
+    let mut b = [0; 65536];
+    loop {
+        let n = f.read(&mut b)?;
+        if n == 0 {
+            break;
+        }
+        h.update(&b[..n]);
+    }
+    let hash = h.finalize().to_hex().to_string();
+    let name = binary.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let allowed = allowlist.iter().any(|a| a == &hash || a == name);
+    Ok(SpawnPreflight {
+        hash,
+        allowed,
+        assurance: "content hashed before exec; TOCTOU remains until exec-time BPF-LSM pinning",
+    })
 }
 
 #[cfg(test)]
@@ -498,6 +627,20 @@ opaque = "ask"
         let s = EnforcementStatus::detect();
         assert!(!s.enforced);
         assert_eq!(s.active_tier, None);
-        assert!(s.detail.contains("not installed"));
+        assert!(s.detail.contains("unavailable"));
+    }
+    #[test]
+    fn spawn_preflight_hashes_content_and_labels_toctou() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("tool");
+        fs::write(&p, b"binary").unwrap();
+        let first = preflight_spawn(&p, &[]).unwrap();
+        assert!(!first.allowed);
+        assert!(first.assurance.contains("TOCTOU"));
+        assert!(
+            preflight_spawn(&p, std::slice::from_ref(&first.hash))
+                .unwrap()
+                .allowed
+        );
     }
 }
