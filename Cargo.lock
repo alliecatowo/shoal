@@ -1629,7 +1629,11 @@ dependencies = [
  "libc",
  "reedline",
  "serde",
+ "serde_json",
+ "shoal-adapters",
  "shoal-ast",
+ "shoal-config",
+ "shoal-doctor",
  "shoal-eval",
  "shoal-syntax",
  "shoal-value",
@@ -1655,6 +1659,28 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "shoal-auth"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "blake3",
+ "getrandom 0.3.4",
+ "serde",
+ "serde_json",
+ "subtle",
+ "tempfile",
+]
+
+[[package]]
+name = "shoal-config"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "tempfile",
+ "toml 1.1.2+spec-1.1.0",
 ]
 
 [[package]]
@@ -1708,6 +1734,7 @@ dependencies = [
  "blake3",
  "criterion",
  "rusqlite",
+ "serde",
  "serde_json",
  "tempfile",
  "zstd",
@@ -1721,6 +1748,7 @@ dependencies = [
  "ctrlc",
  "serde",
  "serde_json",
+ "shoal-auth",
  "shoal-eval",
  "shoal-exec",
  "shoal-journal",
@@ -1885,6 +1913,12 @@ dependencies = [
  "quote",
  "syn",
 ]
+
+[[package]]
+name = "subtle"
+version = "2.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "syn"

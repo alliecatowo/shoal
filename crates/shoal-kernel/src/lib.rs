@@ -1,6 +1,7 @@
 //! Long-lived Unix-socket host for the shoal evaluator (TDD §10).
 
 use serde_json::{Value as Json, json};
+use shoal_auth::TokenStore;
 use shoal_eval::Evaluator;
 use shoal_journal::{EntryRecord, Journal, JournalQuery};
 use shoal_leash::{Effect, Estimates, Plan, Policy, Reversibility, Verdict};
@@ -25,6 +26,12 @@ pub struct Kernel {
     plans: Mutex<HashMap<String, StoredPlan>>,
     tasks: Mutex<HashMap<Ref, Arc<TaskEntry>>>,
     next_task: AtomicU64,
+    auth: Option<Mutex<TokenStore>>,
+}
+#[derive(Clone)]
+struct Attachment {
+    session: Arc<Session>,
+    principal: String,
 }
 struct TaskEntry {
     task: Ref,
@@ -68,18 +75,21 @@ impl Kernel {
             plans: Mutex::new(HashMap::new()),
             tasks: Mutex::new(HashMap::new()),
             next_task: AtomicU64::new(1),
+            auth: None,
         })
     }
 
     pub fn open(state_dir: impl AsRef<Path>) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
+        let state_dir = state_dir.as_ref();
         Ok(Arc::new(Self {
             sessions: Mutex::new(HashMap::new()),
             next_client: AtomicU64::new(1),
-            journal: Mutex::new(Journal::open(state_dir.as_ref())?),
+            journal: Mutex::new(Journal::open(state_dir)?),
             policy: permissive_policy(),
             plans: Mutex::new(HashMap::new()),
             tasks: Mutex::new(HashMap::new()),
             next_task: AtomicU64::new(1),
+            auth: Some(Mutex::new(TokenStore::open(state_dir.join("tokens.json"))?)),
         }))
     }
 
@@ -87,14 +97,16 @@ impl Kernel {
         state_dir: impl AsRef<Path>,
         policy: Policy,
     ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
+        let state_dir = state_dir.as_ref();
         Ok(Arc::new(Self {
             sessions: Mutex::new(HashMap::new()),
             next_client: AtomicU64::new(1),
-            journal: Mutex::new(Journal::open(state_dir.as_ref())?),
+            journal: Mutex::new(Journal::open(state_dir)?),
             policy,
             plans: Mutex::new(HashMap::new()),
             tasks: Mutex::new(HashMap::new()),
             next_task: AtomicU64::new(1),
+            auth: Some(Mutex::new(TokenStore::open(state_dir.join("tokens.json"))?)),
         }))
     }
 
@@ -107,6 +119,7 @@ impl Kernel {
             plans: Mutex::new(HashMap::new()),
             tasks: Mutex::new(HashMap::new()),
             next_task: AtomicU64::new(1),
+            auth: None,
         })
     }
 
@@ -148,7 +161,7 @@ impl Kernel {
         let client = self.next_client.fetch_add(1, Ordering::Relaxed);
         let mut reader = BufReader::new(stream.try_clone()?);
         let mut writer = stream;
-        let mut attached: Option<Arc<Session>> = None;
+        let mut attached: Option<Attachment> = None;
         while let Some(request) = read_frame(&mut reader)? {
             let id = request.id.clone();
             let response = if request.jsonrpc != JSONRPC {
@@ -165,12 +178,31 @@ impl Kernel {
         self: &Arc<Self>,
         request: Request,
         client: u64,
-        attached: &mut Option<Arc<Session>>,
+        attached: &mut Option<Attachment>,
     ) -> Response {
         let id = request.id;
         let result: Result<Json, RpcError> = (|| match request.method.as_str() {
             "session.attach" => {
                 let params: AttachParams = decode(request.params)?;
+                let (who, token_caps, profile) = if let Some(token) = params.token {
+                    let auth = self.auth.as_ref().ok_or_else(|| RpcError {
+                        code: -32030,
+                        message: "bearer tokens unavailable in ephemeral kernel".into(),
+                        data: None,
+                    })?;
+                    let meta = auth
+                        .lock()
+                        .unwrap()
+                        .validate(&token)
+                        .ok_or_else(|| RpcError {
+                            code: -32030,
+                            message: "invalid, expired, or revoked bearer token".into(),
+                            data: None,
+                        })?;
+                    (meta.principal, meta.caps, meta.profile)
+                } else {
+                    (principal(), vec![], "local-human".into())
+                };
                 let name = params.session.unwrap_or_else(|| "default".into());
                 let session = self.session(&name).map_err(internal)?;
                 let cwd = session
@@ -180,11 +212,14 @@ impl Kernel {
                     .cwd()
                     .as_os_str()
                     .to_owned();
-                *attached = Some(session);
+                *attached = Some(Attachment {
+                    session,
+                    principal: who.clone(),
+                });
                 encode(AttachResult {
                     session: name,
-                    principal: format!("uid:{}", unsafe { libc_geteuid() }),
-                    caps: json!({"enforced":false,"tier":"D","policy_principal":principal(),"opaque":verdict_name(self.policy.evaluate_effect(&principal(), &Effect::Opaque))}),
+                    principal: who.clone(),
+                    caps: json!({"enforced":false,"tier":"D","policy_principal":who,"profile":profile,"token_caps":token_caps,"opaque":verdict_name(self.policy.evaluate_effect(&who, &Effect::Opaque))}),
                     cwd: WirePath::encode(&cwd),
                     env_hash: "local".into(),
                     ast_version: 1,
@@ -200,7 +235,9 @@ impl Kernel {
                 encode(json!({"ast_version":1,"ast":ast}))
             }
             "exec" => {
-                let session = attached.as_ref().ok_or_else(not_attached)?;
+                let attachment = attached.as_ref().ok_or_else(not_attached)?;
+                let session = &attachment.session;
+                let actor = attachment.principal.clone();
                 let params: ExecParams = decode(request.params)?;
                 if params.asynchronous {
                     let cancel = {
@@ -228,7 +265,7 @@ impl Kernel {
                         .unwrap()
                         .insert(task_ref.clone(), task.clone());
                     let kernel = self.clone();
-                    let mut task_attached = Some(session.clone());
+                    let mut task_attached = Some(attachment.clone());
                     std::thread::spawn(move || {
                         let response = kernel.dispatch(
                             Request {
@@ -277,7 +314,7 @@ impl Kernel {
                         Reversibility::Unknown,
                         Estimates::default(),
                     );
-                    let verdict = self.policy.evaluate_plan(&principal(), &plan);
+                    let verdict = self.policy.evaluate_plan(&actor, &plan);
                     let result = PlanResult {
                         plan_ref: plan.plan_ref.clone(),
                         effects: plan
@@ -294,7 +331,7 @@ impl Kernel {
                         StoredPlan {
                             src: params.src,
                             session: session.id.clone(),
-                            principal: principal(),
+                            principal: actor.clone(),
                             plan,
                             approved: verdict == Verdict::Allow,
                         },
@@ -313,7 +350,7 @@ impl Kernel {
                         Reversibility::Unknown,
                         Estimates::default(),
                     );
-                    match self.policy.evaluate_plan(&principal(), &direct_plan) {
+                    match self.policy.evaluate_plan(&actor, &direct_plan) {
                         Verdict::Deny => {
                             return Err(RpcError {
                                 code: -32010,
@@ -345,7 +382,7 @@ impl Kernel {
                     .unwrap()
                     .append(&EntryRecord {
                         session: session.id.clone(),
-                        principal: principal(),
+                        principal: actor,
                         ts_ns: now_ns(),
                         cwd: evaluator.cwd().as_os_str().as_bytes().to_vec(),
                         src: params.src.clone(),
@@ -407,7 +444,8 @@ impl Kernel {
                 })
             }
             "value.get" => {
-                let session = attached.as_ref().ok_or_else(not_attached)?;
+                let attachment = attached.as_ref().ok_or_else(not_attached)?;
+                let session = &attachment.session;
                 let params: ValueGetParams = decode(request.params)?;
                 let values = session.transcript.lock().unwrap();
                 let value = values.get(&params.r#ref).ok_or_else(|| RpcError {
@@ -427,7 +465,8 @@ impl Kernel {
                 encode(json!({"ref":params.r#ref,"value":wire}))
             }
             "task.list" => {
-                let session = attached.as_ref().ok_or_else(not_attached)?;
+                let attachment = attached.as_ref().ok_or_else(not_attached)?;
+                let session = &attachment.session;
                 let records: Vec<_> = self
                     .tasks
                     .lock()
@@ -439,7 +478,8 @@ impl Kernel {
                 encode(records)
             }
             "task.await" => {
-                let session = attached.as_ref().ok_or_else(not_attached)?;
+                let attachment = attached.as_ref().ok_or_else(not_attached)?;
+                let session = &attachment.session;
                 let p: TaskParams = decode(request.params)?;
                 let task = self.task(&p.task)?;
                 if task.session.id != session.id {
@@ -456,7 +496,8 @@ impl Kernel {
                 encode(task_record_locked(&task, &inner))
             }
             "task.cancel" => {
-                let session = attached.as_ref().ok_or_else(not_attached)?;
+                let attachment = attached.as_ref().ok_or_else(not_attached)?;
+                let session = &attachment.session;
                 let p: TaskParams = decode(request.params)?;
                 let task = self.task(&p.task)?;
                 if task.session.id != session.id {
@@ -477,7 +518,8 @@ impl Kernel {
                 encode(json!({"task":p.task,"cancel_requested":true}))
             }
             "task.suspend" => {
-                let session = attached.as_ref().ok_or_else(not_attached)?;
+                let attachment = attached.as_ref().ok_or_else(not_attached)?;
+                let session = &attachment.session;
                 let p: TaskParams = decode(request.params)?;
                 let task = self.task(&p.task)?;
                 if task.session.id != session.id {
@@ -494,7 +536,8 @@ impl Kernel {
                 })
             }
             "plan.apply" => {
-                let session = attached.as_ref().ok_or_else(not_attached)?;
+                let attachment = attached.as_ref().ok_or_else(not_attached)?;
+                let session = &attachment.session;
                 let p: PlanApplyParams = decode(request.params)?;
                 let plans = self.plans.lock().unwrap();
                 let stored = plans.get(&p.plan_ref).ok_or_else(|| RpcError {
@@ -502,7 +545,7 @@ impl Kernel {
                     message: "unknown plan_ref".into(),
                     data: None,
                 })?;
-                if stored.session != session.id || stored.principal != principal() {
+                if stored.session != session.id || stored.principal != attachment.principal {
                     return Err(RpcError {
                         code: -32010,
                         message: "plan belongs to another principal/session".into(),
@@ -510,7 +553,10 @@ impl Kernel {
                     });
                 }
                 if !stored.approved
-                    && self.policy.evaluate_plan(&principal(), &stored.plan) != Verdict::Allow
+                    && self
+                        .policy
+                        .evaluate_plan(&attachment.principal, &stored.plan)
+                        != Verdict::Allow
                 {
                     return Err(RpcError {
                         code: -32011,
@@ -1016,6 +1062,45 @@ mod tests {
         assert!(before.elapsed() < std::time::Duration::from_secs(5));
         assert_eq!(cancelled.result.unwrap()["state"], "cancelled");
         drop(second);
+        drop(reader);
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn bearer_attach_uses_token_principal_and_rejects_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tokens = TokenStore::open(dir.path().join("tokens.json")).unwrap();
+        let (secret, _) = tokens
+            .create(
+                "agent:codex".into(),
+                "readonly".into(),
+                vec!["fs.read".into()],
+                None,
+            )
+            .unwrap();
+        drop(tokens);
+        let kernel = Kernel::open(dir.path()).unwrap();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        let k = kernel.clone();
+        let thread = std::thread::spawn(move || k.handle_stream(server).unwrap());
+        let attached = call(
+            &mut client,
+            &mut reader,
+            1,
+            "session.attach",
+            json!({"token":secret,"client":{"kind":"agent","tty":false}}),
+        );
+        assert_eq!(attached.result.unwrap()["principal"], "agent:codex");
+        let denied = call(
+            &mut client,
+            &mut reader,
+            2,
+            "session.attach",
+            json!({"token":"not-a-token","client":{"kind":"agent","tty":false}}),
+        );
+        assert_eq!(denied.error.unwrap().code, -32030);
+        drop(client);
         drop(reader);
         thread.join().unwrap();
     }

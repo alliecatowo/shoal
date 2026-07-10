@@ -8,6 +8,7 @@ base64 = "0.22"
 ctrlc = "3"
 serde = "1"
 serde_json = "1"
+shoal-auth = { path = "../shoal-auth" }
 shoal-eval = { path = "../shoal-eval" }
 shoal-exec = { path = "../shoal-exec" }
 shoal-journal = { path = "../shoal-journal" }
