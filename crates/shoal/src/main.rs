@@ -5,8 +5,8 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
 use reedline::{
-    DefaultPrompt, DefaultPromptSegment, FileBackedHistory, Reedline, Signal, ValidationResult,
-    Validator,
+    DefaultCompleter, DefaultHinter, DefaultPrompt, DefaultPromptSegment, ExampleHighlighter,
+    FileBackedHistory, Reedline, Signal, ValidationResult, Validator,
 };
 use shoal_eval::Evaluator;
 use shoal_syntax::{ParseError, parse};
@@ -136,8 +136,11 @@ fn run_source(
             Ok(0)
         }
         Err(error) => {
-            eprint!("{}", format_eval_error(src, source, &error));
-            Ok(1)
+            report_eval_error(src, source, &error);
+            Ok(error
+                .status
+                .filter(|code| (1..=255).contains(code))
+                .unwrap_or(1))
         }
     }
 }
@@ -147,7 +150,15 @@ fn repl() -> Result<i32, String> {
     let mut evaluator = Evaluator::new(cwd);
     evaluator.interactive = true;
 
-    let mut editor = Reedline::create().with_validator(Box::new(ShoalValidator));
+    let completions = completion_candidates(evaluator.cwd());
+    let mut editor = Reedline::create()
+        .with_validator(Box::new(ShoalValidator))
+        .with_completer(Box::new(DefaultCompleter::new_with_wordlen(
+            completions.clone(),
+            1,
+        )))
+        .with_highlighter(Box::new(ExampleHighlighter::new(completions)))
+        .with_hinter(Box::new(DefaultHinter::default()));
     if let Some(path) = history_path() {
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
@@ -174,7 +185,7 @@ fn repl() -> Result<i32, String> {
                                 eprintln!("shoal: cannot write output: {error}");
                             }
                         }
-                        Err(error) => eprint!("{}", format_eval_error(&src, None, &error)),
+                        Err(error) => report_eval_error(&src, None, &error),
                     },
                     Err(error) => eprint!("{}", format_parse_error(&src, None, &error)),
                 }
@@ -234,7 +245,56 @@ fn short_cwd(cwd: &Path) -> String {
     } else {
         cwd.to_path_buf()
     };
-    format!("shoal {}", display.display())
+    format!("shoal {}{}", display.display(), git_suffix(cwd))
+}
+
+fn completion_candidates(cwd: &Path) -> Vec<String> {
+    let mut values: std::collections::BTreeSet<String> = [
+        "let", "var", "fn", "alias", "use", "export", "return", "break", "continue", "if", "else",
+        "match", "for", "in", "while", "try", "catch", "true", "false", "null", "cd", "pwd", "ls",
+        "echo", "run", "spawn", "parallel", "jobs", "history",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            if let Ok(entries) = fs::read_dir(dir) {
+                for entry in entries.flatten().take(4000) {
+                    if let Some(name) = entry.file_name().to_str() {
+                        values.insert(name.into());
+                    }
+                }
+            }
+        }
+    }
+    if let Ok(entries) = fs::read_dir(cwd) {
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                values.insert(if entry.path().is_dir() {
+                    format!("{name}/")
+                } else {
+                    name.into()
+                });
+            }
+        }
+    }
+    values.into_iter().collect()
+}
+
+fn git_suffix(cwd: &Path) -> String {
+    let output = std::process::Command::new("git")
+        .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output();
+    match output {
+        Ok(out) if out.status.success() => {
+            format!(" ({})", String::from_utf8_lossy(&out.stdout).trim())
+        }
+        _ => String::new(),
+    }
 }
 
 fn format_parse_error(src: &str, source: Option<&Path>, error: &ParseError) -> String {
@@ -258,6 +318,18 @@ fn format_eval_error(src: &str, source: Option<&Path>, error: &ErrorVal) -> Stri
         offset,
         error.hint.as_deref(),
     )
+}
+
+fn report_eval_error(src: &str, source: Option<&Path>, error: &ErrorVal) {
+    if let Some(stderr) = &error.stderr
+        && !stderr.is_empty()
+    {
+        eprint!("{stderr}");
+        if !stderr.ends_with('\n') {
+            eprintln!();
+        }
+    }
+    eprint!("{}", format_eval_error(src, source, error));
 }
 
 fn format_diagnostic(
@@ -411,5 +483,12 @@ mod tests {
         let rendered = format_parse_error("é x", None, &error);
         assert!(rendered.contains("<repl>:1:3: parse error: bad"));
         assert!(rendered.contains("hint: fix it"));
+    }
+
+    #[test]
+    fn completion_catalog_has_language_and_filesystem_context() {
+        let values = completion_candidates(Path::new("."));
+        assert!(values.iter().any(|v| v == "match"));
+        assert!(values.iter().any(|v| v == "shoal" || v == "cargo"));
     }
 }
