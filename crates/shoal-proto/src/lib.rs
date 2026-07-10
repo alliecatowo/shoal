@@ -212,8 +212,18 @@ pub enum WireValue {
     Cmd {
         repr: String,
     },
+    /// The elision rule (AGENT-SURFACE §3): withheld payload. Shape (type,
+    /// count, table schema, a small preview, and a human-render head) always
+    /// travels; the full value is fetchable via `value.get`/`shoal_get` on
+    /// `uri` (with an explicit `elide` budget, or a field-path/slice).
     Ref {
-        v: Ref,
+        uri: String,
+        of: String,
+        n: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cols: Option<BTreeMap<String, String>>,
+        preview: Box<WireValue>,
+        render_head: String,
     },
 }
 
@@ -287,6 +297,24 @@ pub struct ExecParams {
     pub position: String,
     #[serde(default, rename = "async")]
     pub asynchronous: bool,
+    /// Per-call elision budget (AGENT-SURFACE §3). Tightens or loosens the
+    /// kernel defaults; never loosens past the hard cap (64 KiB).
+    #[serde(default)]
+    pub elide: Option<ElideSpec>,
+}
+
+/// Per-call override of the elision thresholds (AGENT-SURFACE §3). Any field
+/// left `None` keeps the kernel default for that dimension. `max_bytes` is
+/// always clamped to the hard cap (64 KiB) — a misbehaving agent cannot ask
+/// its way out of the wall.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct ElideSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rows: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_items: Option<usize>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskParams {
@@ -337,6 +365,8 @@ pub struct ValueGetParams {
     pub r#ref: Ref,
     pub path: Option<String>,
     pub slice: Option<[usize; 2]>,
+    #[serde(default)]
+    pub elide: Option<ElideSpec>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct JournalQueryParams {

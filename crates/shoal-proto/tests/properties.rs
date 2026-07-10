@@ -86,6 +86,26 @@ fn wire_value() -> impl Strategy<Value = WireValue> {
                     n,
                 }
             }),
+            (
+                any::<String>(),
+                any::<String>(),
+                any::<usize>(),
+                proptest::option::of(prop::collection::btree_map(
+                    prop::string::string_regex("[a-z]{1,6}").unwrap(),
+                    any::<String>(),
+                    0..4,
+                )),
+                inner.clone(),
+                any::<String>(),
+            )
+                .prop_map(|(uri, of, n, cols, preview, render_head)| WireValue::Ref {
+                    uri,
+                    of,
+                    n,
+                    cols,
+                    preview: Box::new(preview),
+                    render_head,
+                }),
         ]
     })
 }

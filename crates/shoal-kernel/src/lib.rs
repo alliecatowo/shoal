@@ -440,9 +440,11 @@ impl Kernel {
                         }
                     }
                 }
+                let exec_budget = ElideBudget::from_spec(params.elide.as_ref());
+                let exec_uri = short_ref_to_uri(&value_ref, None);
                 encode(ExecResult {
                     r#ref: value_ref,
-                    value: Some(wire_value(&value)),
+                    value: Some(elide_wire_value(&value, &exec_uri, &exec_budget)),
                     render: Some(render),
                 })
             }
@@ -466,15 +468,21 @@ impl Kernel {
                     }
                     _ => value.clone(),
                 };
-                let mut wire = wire_value(&resolved);
-                if let (Some([start, end]), WireValue::List { v: items }) =
-                    (params.slice, &mut wire)
-                {
-                    *items = items
-                        .get(start.min(items.len())..end.min(items.len()))
-                        .unwrap_or(&[])
-                        .to_vec();
-                }
+                // Slicing is an explicit, targeted ask: apply it at the value
+                // level *before* the elision check, so a small slice of a
+                // huge list is never spuriously elided (and a slice that is
+                // itself still huge still is).
+                let sliced = match (params.slice, resolved) {
+                    (Some([start, end]), Value::List(items)) => {
+                        let start = start.min(items.len());
+                        let end = end.max(start).min(items.len());
+                        Value::List(items[start..end].to_vec())
+                    }
+                    (_, other) => other,
+                };
+                let budget = ElideBudget::from_spec(params.elide.as_ref());
+                let uri = short_ref_to_uri(&params.r#ref, params.path.as_deref());
+                let wire = elide_wire_value(&sliced, &uri, &budget);
                 encode(json!({"ref":params.r#ref,"value":wire}))
             }
             "task.list" => {
@@ -589,6 +597,7 @@ impl Kernel {
                             mode: "approved".into(),
                             position: "stmt".into(),
                             asynchronous: false,
+                            elide: None,
                         })
                         .unwrap(),
                     },
@@ -1082,6 +1091,186 @@ fn wire_value(value: &Value) -> WireValue {
             }
         }
         Value::Secret(s) => WireValue::Secret { name: s.name.clone() },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The elision rule (AGENT-SURFACE §3) — wire-level, automatic.
+// ---------------------------------------------------------------------------
+
+/// Kernel defaults; a caller's `elide` param may tighten or loosen these, but
+/// `max_bytes`/`max_bytes_raw` never loosen past `ELIDE_HARD_CAP`.
+const ELIDE_DEFAULT_MAX_BYTES: usize = 8 * 1024;
+const ELIDE_DEFAULT_MAX_ROWS: usize = 100;
+const ELIDE_DEFAULT_MAX_BYTES_RAW: usize = 4 * 1024;
+const ELIDE_DEFAULT_MAX_ITEMS: usize = 500;
+/// A misbehaving agent cannot flood itself: no per-call override widens the
+/// byte budget past this, regardless of what it asks for.
+const ELIDE_HARD_CAP: usize = 64 * 1024;
+/// Rows/items kept in the `preview` field and the human `render_head`.
+const ELIDE_PREVIEW_ITEMS: usize = 5;
+const ELIDE_PREVIEW_BYTES: usize = 256;
+
+#[derive(Clone, Copy)]
+struct ElideBudget {
+    max_bytes: usize,
+    max_rows: usize,
+    max_bytes_raw: usize,
+    max_items: usize,
+}
+
+impl Default for ElideBudget {
+    fn default() -> Self {
+        Self {
+            max_bytes: ELIDE_DEFAULT_MAX_BYTES,
+            max_rows: ELIDE_DEFAULT_MAX_ROWS,
+            max_bytes_raw: ELIDE_DEFAULT_MAX_BYTES_RAW,
+            max_items: ELIDE_DEFAULT_MAX_ITEMS,
+        }
+    }
+}
+
+impl ElideBudget {
+    fn from_spec(spec: Option<&ElideSpec>) -> Self {
+        let mut budget = Self::default();
+        if let Some(spec) = spec {
+            if let Some(max_bytes) = spec.max_bytes {
+                let clamped = max_bytes.min(ELIDE_HARD_CAP);
+                budget.max_bytes = clamped;
+                budget.max_bytes_raw = clamped;
+            }
+            if let Some(max_rows) = spec.max_rows {
+                budget.max_rows = max_rows;
+            }
+            if let Some(max_items) = spec.max_items {
+                budget.max_items = max_items;
+            }
+        }
+        budget
+    }
+}
+
+/// `shoal://kind/id[?path=...]` from a short ref (`kind:id`), per
+/// AGENT-SURFACE §1.
+fn short_ref_to_uri(r: &Ref, path: Option<&str>) -> String {
+    let mut uri = match r.0.split_once(':') {
+        Some((kind, rest)) => format!("shoal://{kind}/{rest}"),
+        None => format!("shoal://{}", r.0),
+    };
+    if let Some(path) = path.filter(|p| !p.is_empty()) {
+        uri.push_str("?path=");
+        uri.push_str(path);
+    }
+    uri
+}
+
+/// A small, bounded stand-in for `value` — first `ELIDE_PREVIEW_ITEMS`
+/// rows/items, or the first `ELIDE_PREVIEW_BYTES` bytes/chars — never the
+/// full payload, by construction (it never passes an unbounded child
+/// through unchanged).
+fn preview_value(value: &Value) -> Value {
+    match value {
+        Value::Table(rows) => Value::Table(rows.iter().take(ELIDE_PREVIEW_ITEMS).cloned().collect()),
+        Value::List(items) => {
+            Value::List(items.iter().take(ELIDE_PREVIEW_ITEMS).cloned().collect())
+        }
+        Value::Bytes(b) => {
+            Value::Bytes(std::sync::Arc::new(b.iter().take(ELIDE_PREVIEW_BYTES).copied().collect()))
+        }
+        Value::Str(s) => Value::Str(s.chars().take(ELIDE_PREVIEW_BYTES).collect()),
+        Value::Record(rec) => Value::Record(
+            rec.keys()
+                .take(ELIDE_PREVIEW_ITEMS)
+                .map(|k| (k.clone(), Value::Null))
+                .collect(),
+        ),
+        _ => Value::Null,
+    }
+}
+
+/// Column name -> type name, from the first row that carries each key.
+fn table_cols(rows: &[shoal_value::Record]) -> std::collections::BTreeMap<String, String> {
+    let mut cols = std::collections::BTreeMap::new();
+    for row in rows {
+        for (k, v) in row {
+            cols.entry(k.clone()).or_insert_with(|| v.type_name().to_string());
+        }
+    }
+    cols
+}
+
+/// `<uri>?path=<sub>`, chaining onto any path already present so a nested
+/// drill (e.g. a successful command's `.out`) stays reachable through
+/// `value.get`.
+fn join_path_uri(uri: &str, sub_path: &str) -> String {
+    match uri.split_once("?path=") {
+        Some((base, existing)) => format!("{base}?path={existing}.{sub_path}"),
+        None => format!("{uri}?path={sub_path}"),
+    }
+}
+
+/// The elision rule (AGENT-SURFACE §3): if `value`'s wire encoding exceeds
+/// `budget`, or it is an over-threshold table/list/bytes, emit an elided
+/// `WireValue::Ref` (shape + small preview + render head) instead of the
+/// payload. `uri` is how a caller re-fetches the full value later.
+///
+/// A successful `Outcome` whose structured `.out` is what actually carries
+/// size (table/list/bytes/big string) is unwrapped one level for the
+/// elision *decision* — mirroring `render_block`'s outcome-unification (P1c):
+/// `ls` reads as a table to the elision rule too, not as an opaque
+/// `outcome` wrapper. The outer outcome fields (`status`/`ok`/`cmd`/…)
+/// always travel; only `.out` itself is replaced with the elided form.
+fn elide_wire_value(value: &Value, uri: &str, budget: &ElideBudget) -> WireValue {
+    if let Value::Outcome(o) = value
+        && o.ok
+    {
+        let out_value = o.out_value();
+        let out_uri = join_path_uri(uri, "out");
+        return WireValue::Outcome {
+            status: o.status,
+            ok: o.ok,
+            signal: o.signal.clone(),
+            out: Box::new(elide_wire_value(&out_value, &out_uri, budget)),
+            err: String::from_utf8_lossy(&o.stderr).into_owned(),
+            dur_ns: o.dur_ns,
+            pid: o.pid,
+            cmd: o.cmd.clone(),
+        };
+    }
+    let wire = wire_value(value);
+    let encoded_len = serde_json::to_vec(&wire).map(|b| b.len()).unwrap_or(usize::MAX);
+    let too_big = encoded_len > budget.max_bytes
+        || matches!(value, Value::Table(rows) if rows.len() > budget.max_rows)
+        || matches!(value, Value::List(items) if items.len() > budget.max_items)
+        || matches!(value, Value::Bytes(b) if b.len() > budget.max_bytes_raw);
+    if !too_big {
+        return wire;
+    }
+    let n = match value {
+        Value::Table(rows) => rows.len(),
+        Value::List(items) => items.len(),
+        Value::Bytes(b) => b.len(),
+        Value::Str(s) => s.len(),
+        Value::Record(rec) => rec.len(),
+        _ => 1,
+    };
+    let cols = match value {
+        Value::Table(rows) => Some(table_cols(rows)),
+        _ => None,
+    };
+    let preview = preview_value(value);
+    let render_head = shoal_value::render::render_block(&preview, 80)
+        .lines()
+        .take(10)
+        .collect::<Vec<_>>()
+        .join("\n");
+    WireValue::Ref {
+        uri: uri.to_string(),
+        of: value.type_name().to_string(),
+        n,
+        cols,
+        preview: Box::new(wire_value(&preview)),
+        render_head,
     }
 }
 
@@ -1592,6 +1781,201 @@ mod tests {
             json!({"token":"not-a-token","client":{"kind":"agent","tty":false}}),
         );
         assert_eq!(denied.error.unwrap().code, -32030);
+        drop(client);
+        drop(reader);
+        thread.join().unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // The elision rule (AGENT-SURFACE §3).
+    // -----------------------------------------------------------------------
+
+    /// A >100-row table (real `ls` over a directory with 150 files, not a
+    /// synthetic stand-in) must come back elided: shape + schema + a 5-row
+    /// preview, never the 150-row payload. Then drill into a single row by
+    /// field-path and confirm that small result is NOT elided.
+    #[test]
+    fn big_table_exec_elides_then_drills_by_path() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..150 {
+            std::fs::write(dir.path().join(format!("f{i:04}.txt")), b"x").unwrap();
+        }
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        let kernel = Kernel::new();
+        let server_kernel = kernel.clone();
+        let thread = std::thread::spawn(move || server_kernel.handle_stream(server).unwrap());
+        call(
+            &mut client,
+            &mut reader,
+            1,
+            "session.attach",
+            json!({"client":{"kind":"agent","tty":false}}),
+        );
+        let exec = call(
+            &mut client,
+            &mut reader,
+            2,
+            "exec",
+            json!({"src": format!("ls {}", dir.path().display())}),
+        );
+        let result = exec.result.expect("ls must succeed");
+        let value_ref = result["ref"].as_str().unwrap().to_owned();
+        // `ls` is a command: its wire shape is `outcome` with a structured
+        // `.out`. Elision unwraps to `.out` for the decision (mirroring
+        // render_block's outcome-unification) — the 150-row *table* elides,
+        // the outer outcome envelope (status/ok/cmd/…) still travels.
+        let value = &result["value"];
+        assert_eq!(value["$"], "outcome");
+        let out = &value["out"];
+        assert_eq!(out["$"], "ref", "a 150-row table must elide, got {out}");
+        assert_eq!(out["of"], "table");
+        assert_eq!(out["n"], 150);
+        assert_eq!(
+            out["cols"]["name"], "path",
+            "shape (schema) travels even when the payload does not"
+        );
+        assert_eq!(out["preview"]["$"], "table");
+        assert_eq!(
+            out["preview"]["n"], 5,
+            "preview is a small head, not the full 150 rows"
+        );
+        assert!(out["render_head"].as_str().unwrap().contains("name"));
+        let wire_len = serde_json::to_string(value).unwrap().len();
+        assert!(
+            wire_len < 4 * 1024,
+            "the elided form itself must stay tiny, was {wire_len} bytes"
+        );
+
+        // Drill in: value.get with a field-path returns one small row —
+        // NOT elided, because it never hits any threshold.
+        let get = call(
+            &mut client,
+            &mut reader,
+            3,
+            "value.get",
+            json!({"ref": value_ref, "path": "out[3]"}),
+        );
+        let drilled = get.result.unwrap()["value"].clone();
+        assert_ne!(
+            drilled["$"], "ref",
+            "a single drilled row must not be elided: {drilled}"
+        );
+        assert_eq!(drilled["$"], "record");
+        assert!(drilled["v"]["name"].is_object(), "drilled row keeps its fields: {drilled}");
+
+        drop(client);
+        drop(reader);
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn small_value_is_not_elided() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        let kernel = Kernel::new();
+        let server_kernel = kernel.clone();
+        let thread = std::thread::spawn(move || server_kernel.handle_stream(server).unwrap());
+        call(
+            &mut client,
+            &mut reader,
+            1,
+            "session.attach",
+            json!({"client":{"kind":"agent","tty":false}}),
+        );
+        let exec = call(&mut client, &mut reader, 2, "exec", json!({"src":"[1,2,3]"}));
+        let value = exec.result.unwrap()["value"].clone();
+        assert_eq!(value["$"], "list", "a 3-item list is nowhere near any threshold");
+        assert_eq!(
+            value["v"],
+            json!([{"$":"int","v":1},{"$":"int","v":2},{"$":"int","v":3}])
+        );
+        drop(client);
+        drop(reader);
+        thread.join().unwrap();
+    }
+
+    /// A caller may loosen the byte budget, but never past the 64 KiB hard
+    /// cap — a misbehaving agent cannot flood its own context by asking
+    /// nicely.
+    #[test]
+    fn elision_hard_cap_cannot_be_disabled() {
+        let huge = Value::Str("x".repeat(100_000));
+        let loosened = ElideSpec {
+            max_bytes: Some(5_000_000),
+            max_rows: None,
+            max_items: None,
+        };
+        let budget = ElideBudget::from_spec(Some(&loosened));
+        assert_eq!(
+            budget.max_bytes, ELIDE_HARD_CAP,
+            "a requested budget above the hard cap must clamp down to it"
+        );
+        match elide_wire_value(&huge, "shoal://out/1", &budget) {
+            WireValue::Ref { of, n, .. } => {
+                assert_eq!(of, "str");
+                assert_eq!(n, 100_000);
+            }
+            other => panic!(
+                "a 100 KB string must still elide despite a 5 MB requested budget, got {other:?}"
+            ),
+        }
+    }
+
+    /// The flip side: loosening below the hard cap is honored, so a caller
+    /// that wants a bit more headroom than the 8 KiB default legitimately
+    /// gets it.
+    #[test]
+    fn elision_budget_can_be_loosened_up_to_the_hard_cap() {
+        let modest = Value::Str("y".repeat(20_000)); // > 8 KiB default, < 64 KiB cap
+        let loosened = ElideSpec {
+            max_bytes: Some(5_000_000),
+            max_rows: None,
+            max_items: None,
+        };
+        let budget = ElideBudget::from_spec(Some(&loosened));
+        match elide_wire_value(&modest, "shoal://out/1", &budget) {
+            WireValue::Str { .. } => {}
+            other => panic!("a 20 KiB string fits under a loosened 64 KiB cap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn value_get_elide_param_tightens_default_row_threshold() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        let kernel = Kernel::new();
+        let server_kernel = kernel.clone();
+        let thread = std::thread::spawn(move || server_kernel.handle_stream(server).unwrap());
+        call(
+            &mut client,
+            &mut reader,
+            1,
+            "session.attach",
+            json!({"client":{"kind":"agent","tty":false}}),
+        );
+        // 10 items: under every default threshold, so a plain exec would not elide.
+        let exec = call(
+            &mut client,
+            &mut reader,
+            2,
+            "exec",
+            json!({"src":"[0,1,2,3,4,5,6,7,8,9]"}),
+        );
+        assert_ne!(exec.result.as_ref().unwrap()["value"]["$"], "ref");
+        let value_ref = exec.result.unwrap()["ref"].as_str().unwrap().to_owned();
+        // A caller may tighten the budget per call — max_items:5 must elide
+        // this same 10-item list on a follow-up `value.get`.
+        let get = call(
+            &mut client,
+            &mut reader,
+            3,
+            "value.get",
+            json!({"ref": value_ref, "path": null, "slice": null, "elide": {"max_items": 5}}),
+        );
+        let value = get.result.unwrap()["value"].clone();
+        assert_eq!(value["$"], "ref", "a tightened per-call budget must elide: {value}");
+        assert_eq!(value["n"], 10);
         drop(client);
         drop(reader);
         thread.join().unwrap();

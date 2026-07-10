@@ -253,3 +253,26 @@ value = "10:00"
 name = "word-bind-str-identity"
 src = "fn showstr(s: str) { s }\nshowstr hello"
 value = '"hello"'
+
+# --- numeric methods: int/float coercion at the .abs/.round/.floor/.ceil
+# call site (shoal-value/src/methods.rs numeric_unary/float_unary): int
+# receivers stay int (abs) or pass through unchanged (round/floor/ceil have
+# no effect on an already-integral value); float receivers compute and stay
+# float, rendered per CONTRACTS §3 (a whole-valued float still renders
+# without a trailing ".0"). ---
+[[case]]
+name = "coerce-abs-negative-int-stays-int"
+src = "(-5).abs()"
+value = "5"
+[[case]]
+name = "coerce-round-float-up"
+src = "(3.6).round()"
+value = "4"
+[[case]]
+name = "coerce-floor-float-down"
+src = "(3.6).floor()"
+value = "3"
+[[case]]
+name = "coerce-ceil-float-up"
+src = "(3.2).ceil()"
+value = "4"

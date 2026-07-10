@@ -109,3 +109,57 @@ value = "0"
 name = "str-compare-lexicographic"
 src = '"apple" < "banana"'
 value = "true"
+
+# --- string method hardening (CONTRACTS §3 value methods:
+# .words .chars .split .starts_with .ends_with .replace .parse_int
+# .parse_float .matches .match). Deterministic, spec-derived. ---
+
+[[case]]
+name = "str-words-splits-on-whitespace"
+src = '"the quick fox".words()'
+value = '["the", "quick", "fox"]'
+
+[[case]]
+name = "str-chars-splits-per-character"
+src = '"ab".chars()'
+value = '["a", "b"]'
+
+[[case]]
+name = "str-split-on-separator"
+src = '"a,b,c".split(",")'
+value = '["a", "b", "c"]'
+
+[[case]]
+name = "str-starts-with-true"
+src = '"hello".starts_with("he")'
+value = "true"
+
+[[case]]
+name = "str-ends-with-true"
+src = '"hello".ends_with("lo")'
+value = "true"
+
+[[case]]
+name = "str-replace-all-occurrences"
+src = '"foo bar foo".replace("foo", "baz")'
+value = '"baz bar baz"'
+
+[[case]]
+name = "str-parse-int-success"
+src = '"42".parse_int()'
+value = "42"
+
+[[case]]
+name = "str-parse-float-success"
+src = '"3.5".parse_float()'
+value = "3.5"
+
+[[case]]
+name = "str-matches-regex-all-occurrences"
+src = '"a1b22c333".matches(re"[0-9]+")'
+value = '["1", "22", "333"]'
+
+[[case]]
+name = "str-match-regex-first-occurrence"
+src = '"a1b22c333".match(re"[0-9]+")'
+value = '"1"'

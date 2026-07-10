@@ -60,6 +60,8 @@ always tagged); `{"$":"path","v":…,"raw":base64?}` (raw present iff non-UTF-8)
 
 ## 3. The elision rule (wire-level, automatic)
 
+**Status: elision: implemented.**
+
 Any value whose encoded JSON exceeds **8 KiB**, any table over **100 rows**, any bytes over
 **4 KiB**, any list over **500 items**: the wire carries an **elided form** instead:
 

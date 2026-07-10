@@ -47,3 +47,166 @@ value = "[]"
 name = "list-skip-all"
 src = "[1, 2, 3].skip(3)"
 value = "[]"
+
+# --- higher-order + record/table method hardening (CONTRACTS §3 value
+# methods list: .where .map .each .any .all .find .flat_map .sort_by .group
+# .zip .enumerate .chunks .min .max .get .keys .values .items .contains
+# .uniq .reverse .flatten). Deterministic, spec-derived expectations. ---
+
+[[case]]
+name = "list-where-filters-by-predicate"
+src = "[1, 2, 3, 4].where(x => x % 2 == 0)"
+value = "[2, 4]"
+
+[[case]]
+name = "list-each-side-effect-then-void"
+# `.each` returns null; its value is the mutation performed via the closure.
+src = "var s = 0\n[1, 2, 3].each(x => { s += x })\ns"
+value = "6"
+
+[[case]]
+name = "list-any-finds-a-match"
+src = "[1, 2, 3].any(x => x > 2)"
+value = "true"
+
+[[case]]
+name = "list-all-false-on-one-mismatch"
+src = "[1, 2, 3].all(x => x > 1)"
+value = "false"
+
+[[case]]
+name = "list-find-returns-first-match"
+src = "[1, 2, 3, 4].find(x => x > 2)"
+value = "3"
+
+[[case]]
+name = "list-find-no-match-is-null"
+src = "[1, 2].find(x => x > 10)"
+value = "null"
+
+[[case]]
+name = "list-flat-map-expands-each-result"
+src = "[1, 2].flat_map(x => [x, x * 10])"
+value = "[1, 10, 2, 20]"
+
+[[case]]
+name = "list-sort-by-key-function"
+src = '["bb", "a", "ccc"].sort_by(s => s.len())'
+value = '["a", "bb", "ccc"]'
+
+[[case]]
+name = "list-group-by-predicate-key"
+# `.group` returns records `{key, values}` in first-occurrence order of
+# each distinct key.
+src = "[1, 2, 3, 4].group(x => x % 2 == 0)"
+value = "[{key: false, values: [1, 3]}, {key: true, values: [2, 4]}]"
+
+[[case]]
+name = "list-zip-pairs-elementwise"
+src = '[1, 2].zip(["a", "b"])'
+value = '[[1, "a"], [2, "b"]]'
+
+[[case]]
+name = "list-enumerate-pairs-with-index"
+src = '["a", "b"].enumerate()'
+value = '[[0, "a"], [1, "b"]]'
+
+[[case]]
+name = "list-chunks-groups-by-size"
+src = "[1, 2, 3, 4, 5].chunks(2)"
+value = "[[1, 2], [3, 4], [5]]"
+
+[[case]]
+name = "list-min-returns-smallest"
+src = "[3, 1, 2].min()"
+value = "1"
+
+[[case]]
+name = "list-max-returns-largest"
+src = "[3, 1, 2].max()"
+value = "3"
+
+[[case]]
+name = "list-get-out-of-range-returns-default"
+src = '[1, 2, 3].get(9, "missing")'
+value = '"missing"'
+
+[[case]]
+name = "list-contains-element"
+src = "[1, 2, 3].contains(2)"
+value = "true"
+
+[[case]]
+name = "list-uniq-preserves-first-occurrence-order"
+src = "[3, 1, 3, 2, 1].uniq()"
+value = "[3, 1, 2]"
+
+[[case]]
+name = "list-reverse-order"
+src = "[1, 2, 3].reverse()"
+value = "[3, 2, 1]"
+
+[[case]]
+name = "list-flatten-one-level"
+src = "[[1], [2, 3]].flatten()"
+value = "[1, 2, 3]"
+
+[[case]]
+name = "record-get-missing-key-returns-default"
+src = '{a: 1}.get("b", 99)'
+value = "99"
+
+[[case]]
+name = "record-keys-preserve-insertion-order"
+src = "{a: 1, b: 2}.keys()"
+value = '["a", "b"]'
+
+[[case]]
+name = "record-values-preserve-insertion-order"
+src = "{a: 1, b: 2}.values()"
+value = "[1, 2]"
+
+[[case]]
+name = "record-items-key-value-pairs"
+src = "{a: 1, b: 2}.items()"
+value = '[["a", 1], ["b", 2]]'
+
+[[case]]
+name = "record-contains-key-true"
+src = '{a: 1}.contains("a")'
+value = "true"
+
+[[case]]
+name = "record-contains-key-false"
+src = '{a: 1}.contains("z")'
+value = "false"
+
+[[case]]
+name = "record-json-serializes-in-key-order"
+src = '{a: 1}.json()'
+value = '"{\"a\":1}"'
+
+# --- table method hardening. `Value::Table` has no literal constructor in
+# the language (TDD §4.1: "table is a list<record> semantically"); the `ls`
+# builtin (outcome-unified, forwarding unknown methods to its structured
+# `.out` table per shoal-value/src/methods.rs) is the deterministic way to
+# get a real table value in a conformance case: fixture files give a known
+# row count/shape, sorted by path. ---
+
+[[case]]
+name = "table-ls-len-counts-entries"
+src = "ls.len()"
+fixture = ["a.txt", "b.txt", "sub/inner.txt"]
+value = "3"
+
+[[case]]
+name = "table-ls-first-is-lexicographically-first-path"
+src = "ls.first().name"
+fixture = ["a.txt", "b.txt", "sub/inner.txt"]
+value = "a.txt"
+
+[[case]]
+name = "table-ls-where-type-then-map-names"
+src = 'ls.where(r => r.type == "file").map(r => r.name)'
+fixture = ["a.txt", "b.txt", "sub/inner.txt"]
+value = "[a.txt, b.txt]"

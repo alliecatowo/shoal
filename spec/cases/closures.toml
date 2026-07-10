@@ -1,0 +1,50 @@
+# Control-flow and closure hardening: lexical capture (TDD §4.6 "Lexical
+# scoping"), recursion, higher-order functions returning closures,
+# for/while `break`/`continue`, and nested try/catch recovery. Deterministic,
+# spec-derived expectations (render_inline form).
+
+[[case]]
+name = "closure-captures-outer-let"
+src = "let x = 10\nlet add_x = y => y + x\nadd_x(5)"
+value = "15"
+
+[[case]]
+name = "closure-mutates-captured-var-via-each"
+# The closure shares the enclosing `var`'s binding (Env is a shared cell,
+# not copied on capture), so repeated calls through `.each` accumulate.
+src = "var total = 0\nlet acc = x => { total += x }\n[1, 2, 3].each(acc)\ntotal"
+value = "6"
+
+[[case]]
+name = "recursive-fn-factorial"
+src = "fn fact(n: int) { if n <= 1 { 1 } else { n * fact(n - 1) } }\nfact(5)"
+value = "120"
+
+[[case]]
+name = "fn-returns-closure-capturing-param"
+# A `fn`'s own parameter is captured by a lambda declared (via `let`) inside
+# its body and returned; calling the returned closure later still sees `n`.
+src = "fn adder(n: int) { let f = x => x + n\nf }\nlet add10 = adder(10)\nadd10(5)"
+value = "15"
+
+[[case]]
+name = "for-loop-break-stops-early"
+src = "var s = 0\nfor i in 1..10 { if i == 5 { break }\ns += i }\ns"
+value = "10"
+
+[[case]]
+name = "for-loop-continue-skips-iteration"
+src = "var s = 0\nfor i in 1..6 { if i % 2 == 0 { continue }\ns += i }\ns"
+value = "9"
+
+[[case]]
+name = "while-loop-break-stops-early"
+src = "var i = 0\nwhile true { i += 1\nif i == 3 { break } }\ni"
+value = "3"
+
+[[case]]
+name = "nested-try-catch-inner-recovers"
+# The inner `try` catches the division error and yields 99; the outer `try`
+# then succeeds with that value, so the outer `catch` never runs.
+src = "try { try { 1 / 0 } catch { 99 } } catch { -1 }"
+value = "99"

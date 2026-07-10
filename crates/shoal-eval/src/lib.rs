@@ -1,6 +1,7 @@
 //! Tree-walk evaluator for shoal's canonical AST.
 
 mod builtins;
+mod reef;
 
 use shoal_adapters::{AdapterCatalog, AdapterClass, SubSpec};
 use shoal_ast::*;
@@ -39,6 +40,24 @@ pub struct Evaluator {
     in_fn_body: usize,
     /// Live task registry backing the `jobs` builtin (defect #14).
     jobs: Vec<shoal_value::TaskVal>,
+    /// reef (docs/REEF.md): cached scope chain, keyed on the cwd it was
+    /// discovered for. Rebuilt only when the cwd changes (cd / `with cwd:`).
+    /// `None` until the first spawn/`which`/`reef` touches it; cheap when no
+    /// manifest is in scope (a pure filesystem walk with an empty result).
+    reef_chain: Option<(PathBuf, shoal_reef::ScopeChain)>,
+    /// reef: the provider stack, built lazily on the first *constrained*
+    /// resolution — never touched on the hot path when no manifest is in scope.
+    reef_resolver: Option<Arc<shoal_reef::Resolver>>,
+    /// reef: the in-memory lock, loaded from (and persisted next to) the nearest
+    /// manifest. Empty and inert when no manifest is in scope.
+    reef_lock: shoal_reef::Lockfile,
+    /// reef: filesystem path the current lock loads from / persists to.
+    reef_lock_path: Option<PathBuf>,
+    /// reef: optional user-scope `shoal.toml` whose `[reef]` table forms the
+    /// user scope. `None` (the default) means no user scope — the zero-config,
+    /// zero-regression path. Hosts wire a real path via
+    /// [`Evaluator::set_reef_user_manifest`]; tests never point at real config.
+    reef_user_manifest: Option<PathBuf>,
 }
 
 enum Flow {
@@ -70,7 +89,30 @@ impl Evaluator {
             call_depth: 0,
             in_fn_body: 0,
             jobs: Vec::new(),
+            reef_chain: None,
+            reef_resolver: None,
+            reef_lock: shoal_reef::Lockfile::new(),
+            reef_lock_path: None,
+            reef_user_manifest: None,
         }
+    }
+
+    /// Point the user reef scope at a `shoal.toml` whose `[reef]` table becomes
+    /// the user scope (REEF §1). Additive: without it, there is no user scope,
+    /// which is the zero-regression default. Changing the cwd next re-discovers
+    /// the chain with this path folded in.
+    pub fn set_reef_user_manifest(&mut self, path: impl Into<PathBuf>) {
+        self.reef_user_manifest = Some(path.into());
+        self.reef_chain = None;
+    }
+
+    /// Inject the reef provider stack (resolver). Additive: without it the
+    /// evaluator lazily builds [`shoal_reef::Resolver::with_defaults`] on the
+    /// first constrained resolution. Hosts use this to pin providers; tests use
+    /// it to point the resolver at fixture-rooted binaries instead of the real
+    /// system.
+    pub fn set_reef_resolver(&mut self, resolver: Arc<shoal_reef::Resolver>) {
+        self.reef_resolver = Some(resolver);
     }
 
     /// Install the host's statement renderer (defect #1). Every statement-position
@@ -1086,6 +1128,20 @@ impl Evaluator {
             let vs = self.collect_cmd_values(call)?;
             return self.builtin_save(vs);
         }
+        // `which` is reef-aware (REEF §6): it renders a resolution report, not a
+        // bare path. Intercepted before the generic builtin dispatch so it can
+        // reach the scope chain; still wrapped as an outcome + redirect-capable.
+        if call.head == "which" {
+            let value = self.builtin_which(call)?;
+            let outcome = builtin_outcome("which", value);
+            return self.apply_builtin_redirects(call, outcome);
+        }
+        // `reef` builtin family (REEF §6): binding table, add, lock, fetch.
+        if call.head == "reef" {
+            let value = self.builtin_reef(call)?;
+            let outcome = builtin_outcome("reef", value);
+            return self.apply_builtin_redirects(call, outcome);
+        }
         if builtins::is_builtin(&call.head) {
             // Outcome unification (P1a): a builtin yields a `Value::Outcome`
             // exactly like an external command — its structured result becomes
@@ -1631,7 +1687,7 @@ impl Evaluator {
 
     fn run_argv(
         &mut self,
-        argv: Vec<OsString>,
+        mut argv: Vec<OsString>,
         position: Position,
         stdin: StdinSpec,
         prefixes: &[EnvPrefix],
@@ -1651,6 +1707,10 @@ impl Evaluator {
                 env.push((OsString::from(&p.name), s));
             }
         }
+        // reef spawn-time resolution (docs/REEF.md §2, §4). A pure no-op unless
+        // the head is a bare name constrained by a manifest in scope — so a
+        // repo with no `.reef.toml` spawns exactly as before.
+        self.reef_apply(&mut argv, &mut env, span)?;
         let force_tui = meta.as_ref().is_some_and(|m| m.class == AdapterClass::Tui);
         let mode = if force_tui || (self.interactive && position == Position::Statement) {
             ExecMode::PtyTee
@@ -2110,7 +2170,7 @@ impl Evaluator {
         if builtins::is_builtin(name)
             || matches!(
                 name,
-                "cd" | "pwd" | "source" | "run" | "jobs" | "interact" | "open" | "save"
+                "cd" | "pwd" | "source" | "run" | "jobs" | "interact" | "open" | "save" | "reef"
             )
         {
             return true;
@@ -2383,16 +2443,31 @@ impl Evaluator {
                 child.env.declare("args", Value::List(args), false);
                 child.eval_program(&program)
             }
-            Some("sh") => self.run_interp("sh", path, args, position),
-            Some("py") => self.run_interp("python3", path, args, position),
-            Some("js") => self.run_interp("node", path, args, position),
-            Some("rs") => self.run_rust_script(path, args, position),
-            Some(_) => {
-                let mut argv = vec![path.as_os_str().to_owned()];
-                for v in args {
-                    argv.push(self.argv_value(v)?);
+            _ => {
+                // reef runner resolution (REEF §5): when a manifest is in scope,
+                // the `[runners]` table (ext → tool, shebang fallback) picks the
+                // interpreter, whose tool the spawn then reef-resolves. Falls
+                // back to today's fixed interpreters when no manifest applies.
+                if let Some(mut argv) = self.reef_runner_argv(path) {
+                    argv.push(path.as_os_str().to_owned());
+                    for v in args {
+                        argv.push(self.argv_value(v)?);
+                    }
+                    return self.run_argv(argv, position, StdinSpec::Null, &[], Span::default(), None);
                 }
-                self.run_argv(argv, position, StdinSpec::Null, &[], Span::default(), None)
+                match ext {
+                    Some("sh") => self.run_interp("sh", path, args, position),
+                    Some("py") => self.run_interp("python3", path, args, position),
+                    Some("js") => self.run_interp("node", path, args, position),
+                    Some("rs") => self.run_rust_script(path, args, position),
+                    _ => {
+                        let mut argv = vec![path.as_os_str().to_owned()];
+                        for v in args {
+                            argv.push(self.argv_value(v)?);
+                        }
+                        self.run_argv(argv, position, StdinSpec::Null, &[], Span::default(), None)
+                    }
+                }
             }
         }
     }

@@ -2230,6 +2230,7 @@ dependencies = [
  "shoal-journal",
  "shoal-leash",
  "shoal-picker",
+ "shoal-reef",
  "shoal-secret",
  "shoal-syntax",
  "shoal-value",
