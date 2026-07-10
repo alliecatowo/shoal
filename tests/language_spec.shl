@@ -1,11 +1,11 @@
 # Shoal Language Specification Tour
 
-echo "Running Shoal Language Specification..."
+^echo "Running Shoal Language Specification..."
 
 # 1. Variables and Shadowing
 let x = 10
 let y = 20
-if x + y != 30 { echo "Math failed!"; ^exit 1 }
+if x + y != 30 { ^echo "Math failed!"; ^exit 1 }
 
 let echo = "shadowed"
 if echo != "shadowed" { ^exit 1 }
