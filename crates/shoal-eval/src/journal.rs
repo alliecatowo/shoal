@@ -593,8 +593,18 @@ mod tests {
     use shoal_journal::Journal;
 
     /// Build a journaled evaluator rooted at `cwd` with an in-memory journal.
+    ///
+    /// `cwd` is canonicalized first: `undo_entry` canonicalizes its `root`
+    /// argument before checking that a recorded undo target is contained in
+    /// it (`checked_target`), and on macOS a tempdir's path is a symlink
+    /// alias (`/var/folders/...` -> `/private/var/folders/...`). Rooting the
+    /// evaluator at the already-canonical path keeps every path it records
+    /// (via `self.cwd.join(...)`) on the same prefix `undo_entry` compares
+    /// against — mirroring the fix already applied to shoal-journal's own
+    /// `root.path().canonicalize()` tests.
     fn journaled(cwd: &Path) -> Evaluator {
-        let mut ev = Evaluator::new(cwd.to_path_buf());
+        let root = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+        let mut ev = Evaluator::new(root);
         ev.set_journal(Journal::in_memory().unwrap(), "s1", "human");
         ev
     }
