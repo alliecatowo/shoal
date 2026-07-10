@@ -196,8 +196,9 @@ on one doctrine: **an agent never parses text it didn't explicitly ask to see ra
 - The multi‑principal kernel makes **pair‑shelling** free: a human and their agents share one live
   session, signalling each other through structured channels — no sentinel files, no `tail`.
 
-A Claude Code plugin (MCP server + a gotcha‑free "language card" skill) is in the works so an agent
-can drive shoal flawlessly. See [`docs/AGENT-SURFACE.md`](docs/AGENT-SURFACE.md).
+An installable **Claude Code plugin** ([`plugin/`](plugin/)) bundles the MCP server and a
+gotcha‑free "language card" skill so an agent can drive shoal flawlessly. See
+[`docs/AGENT-SURFACE.md`](docs/AGENT-SURFACE.md).
 
 </details>
 
@@ -295,12 +296,17 @@ Adapters wrap the entire existing ecosystem into shoal's typed world — no boil
 
 - The full language: literals + typed units, strings/interpolation, the coercion matrix, control
   flow, functions‑as‑commands, lambdas + implicit `.field` forms, dot‑chain composition, `match`
-  with every pattern kind, `try`/`catch`, and the teaching diagnostics — **300+ conformance cases,
+  with every pattern kind, `try`/`catch`, and the teaching diagnostics — **330+ conformance cases,
   green on Linux and macOS.**
 - Interactive REPL: PTY passthrough, tab completion, syntax highlighting, `it`/`out[n]`, Ctrl‑C that
-  cancels the job (not the shell).
-- reef resolution (`which`‑chain, `with reef:`, lockfile), the SQLite journal + CAS, the adapter
-  catalog, the kernel JSON‑RPC + MCP facade, and OS sandbox backends.
+  cancels the job (not the shell), and the fast `shoal-prompt`.
+- **Interpreter blocks** (`python { … }.out` → structured data — heredocs, gone) and **`.feed`**
+  values‑as‑stdin (`"b\na".feed(sort)`), which compose.
+- **leash enforcement is live** — the spawn path applies Landlock (Linux) / Seatbelt (macOS) from a
+  scoped policy, with proven denial and honest tier reporting.
+- reef resolution (`which`‑chain, `with reef:`, lockfile), the SQLite journal + CAS, **23 adapters**,
+  and the **agent surface**: kernel JSON‑RPC + MCP facade with automatic elision, `resources/*`,
+  events/channels, and an installable **Claude Code plugin** in [`plugin/`](plugin/).
 
 </details>
 
@@ -309,11 +315,10 @@ Adapters wrap the entire existing ecosystem into shoal's typed world — no boil
 
 <br>
 
-- Interpreter blocks (`python { … }.out` → structured data) and `.feed` values‑as‑stdin.
-- Activating leash enforcement on the live spawn path; journal‑backed `undo out[n]`.
-- The reactive streams subsystem (`watch` / `tail` / `every` / channels + combinators).
-- Events/channels/subscriptions for full pair‑shelling; the Claude Code plugin.
-- A broader adapter pack and the remaining structured builtins.
+- Journal‑backed `undo` and the `journal`/`history` view over the eval path (landing).
+- The reactive streams subsystem (`watch` / `tail` / `every` + combinators) and the in‑language
+  `channel()` binding on top of the kernel's event bus.
+- The remaining structured builtins and data namespaces (`math` / `json.parse` / codecs / `http`).
 
 Honest gaps are tracked in the code and design docs — nothing here is vaporware‑by‑omission.
 
