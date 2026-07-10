@@ -230,7 +230,7 @@ fn color_for_value(v: &Value) -> &'static str {
         Value::Int(_) | Value::Float(_) | Value::Size(_) | Value::Duration(_) | Value::DateTime(_) | Value::Time(_) => "\x1b[36m",
         Value::Bool(_) | Value::Null => "\x1b[96m",
         Value::Str(_) => "\x1b[32m",
-        Value::Path(p) => if p.is_dir() { "\x1b[34;1m" } else { "\x1b[39m" },
+        Value::Path(_) => "\x1b[36m",
         Value::Glob(_) | Value::Regex(_) => "\x1b[95m",
         Value::Error(_) => "\x1b[31m",
         _ => "",
@@ -280,11 +280,13 @@ fn render_table(rows: &[Record], max_width: usize) -> String {
         .enumerate()
         .map(|(i, c)| pad_to(&truncate_display(c, widths[i]), widths[i]))
         .collect();
+    out.push_str("\x1b[1m");
     out.push_str(&header.join("  "));
-    out.push('\n');
+    out.push_str("\x1b[0m\n");
     let rule_width = widths.iter().sum::<usize>() + widths.len().saturating_sub(1) * 2;
+    out.push_str("\x1b[2m");
     out.push_str(&"─".repeat(rule_width.min(max_width)));
-    out.push('\n');
+    out.push_str("\x1b[0m\n");
     for line in &cells {
         let row: Vec<String> = line
             .iter()
@@ -329,7 +331,11 @@ pub fn render_block(v: &Value, width: usize) -> String {
             let keyw = r.keys().map(|k| k.width()).max().unwrap_or(0);
             let lines: Vec<String> = r
                 .iter()
-                .map(|(k, v)| format!("{}  {}", pad_to(k, keyw), render_cell(v)))
+                .map(|(k, v)| {
+                    let color = color_for_value(v);
+                    let val_str = render_cell(v);
+                    format!("\x1b[34;1m{}\x1b[0m  {}{}\x1b[0m", pad_to(k, keyw), color, val_str)
+                })
                 .collect();
             lines.join("\n")
         }
@@ -337,16 +343,22 @@ pub fn render_block(v: &Value, width: usize) -> String {
             let text = String::from_utf8_lossy(&o.stdout);
             let text = text.strip_suffix('\n').unwrap_or(&text);
             if text.is_empty() {
-                render_inline(v)
+                if o.ok {
+                    "\x1b[32m[✅ success]\x1b[0m".to_string()
+                } else {
+                    format!("\x1b[31;1m[❌ status {}]\x1b[0m", o.status.unwrap_or(-1))
+                }
             } else {
-                text.to_string()
+                let bar = if o.ok { "\x1b[32m│\x1b[0m" } else { "\x1b[31;1m│\x1b[0m" };
+                let lines: Vec<String> = text.lines().map(|l| format!("{} {}", bar, l)).collect();
+                lines.join("\n")
             }
         }
         Value::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
         Value::Error(e) => {
-            let mut s = format!("error({}): {}", e.code, e.msg);
+            let mut s = format!("\x1b[31;1merror({}):\x1b[0m \x1b[1m{}\x1b[0m", e.code, e.msg);
             if let Some(h) = &e.hint {
-                s.push_str(&format!("\n  hint: {h}"));
+                s.push_str(&format!("\n  \x1b[33;1mhint:\x1b[0m \x1b[33m{h}\x1b[0m"));
             }
             s
         }

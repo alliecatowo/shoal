@@ -31,13 +31,14 @@ enum Action {
 }
 
 fn main() {
-    let code = match real_main(std::env::args_os().skip(1).collect()) {
-        Ok(code) => code,
-        Err(message) => {
-            eprintln!("shoal: {message}");
-            2
-        }
-    };
+    if let Err(error) = run() {
+        eprintln!("\x1b[31;1merror:\x1b[0m {error}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), String> {
+    let code = real_main(std::env::args_os().skip(1).collect())?;
     std::process::exit(code);
 }
 
@@ -283,7 +284,7 @@ fn repl() -> Result<i32, String> {
     let cwd = std::env::current_dir().map_err(|e| format!("cannot determine cwd: {e}"))?;
     let loaded = shoal_config::load(&shoal_config::LoadOptions::discover(&cwd))?;
     for warning in &loaded.warnings {
-        eprintln!("shoal config: {warning}");
+        eprintln!("\x1b[33;1mwarning:\x1b[0m config error: {warning}");
     }
     let config = loaded.config;
     let mut evaluator = Evaluator::new(cwd);
@@ -291,7 +292,7 @@ fn repl() -> Result<i32, String> {
     for dir in &config.adapters.dirs {
         let (catalog, warnings) = shoal_adapters::AdapterCatalog::load_dir(dir);
         for warning in warnings {
-            eprintln!("shoal adapter: {warning}");
+            eprintln!("\x1b[33;1mwarning:\x1b[0m failed to load adapter: {warning}");
         }
         evaluator.set_adapters(catalog);
     }
@@ -343,7 +344,7 @@ fn repl() -> Result<i32, String> {
                     Ok(program) => match evaluator.eval_program(&program) {
                         Ok(value) => {
                             if let Err(error) = render_result(&value, true) {
-                                eprintln!("shoal: cannot write output: {error}");
+                                eprintln!("\x1b[31;1merror:\x1b[0m cannot write output: {error}");
                             }
                         }
                         Err(error) => report_eval_error(&src, None, &error),
@@ -352,8 +353,7 @@ fn repl() -> Result<i32, String> {
                 }
             }
             Ok(Signal::CtrlC) => {
-                // Reedline has already cleared the current edit buffer.
-                eprintln!("^C");
+                println!("\x1b[90m^C\x1b[0m");
             }
             Ok(Signal::CtrlD) => {
                 println!();
@@ -366,16 +366,9 @@ fn repl() -> Result<i32, String> {
 }
 
 fn render_result(value: &Value, pty_was_live: bool) -> io::Result<()> {
-    // Statement-position outcomes were already streamed byte-for-byte by the
+    // External commands executed interactively stream their output to the
     // PTY tee. Rendering them here would duplicate the command's output.
     if pty_was_live && matches!(value, Value::Outcome(_)) {
-        return Ok(());
-    }
-    if let Value::Outcome(outcome) = value {
-        io::stdout().write_all(&outcome.stdout)?;
-        io::stdout().flush()?;
-        io::stderr().write_all(&outcome.stderr)?;
-        io::stderr().flush()?;
         return Ok(());
     }
     let rendered = shoal_value::render::render_block(value, terminal_width());
@@ -406,7 +399,7 @@ fn short_cwd(cwd: &Path) -> String {
     } else {
         cwd.to_path_buf()
     };
-    format!("shoal {}{}", display.display(), git_suffix(cwd))
+    format!("\x1b[32;1mshoal\x1b[0m \x1b[36;1m{}\x1b[0m\x1b[95m{}\x1b[0m", display.display(), git_suffix(cwd))
 }
 
 fn completion_candidates(cwd: &Path) -> Vec<String> {
@@ -511,12 +504,15 @@ fn format_diagnostic(
     let name: Cow<'_, str> = source
         .map(|path| path.to_string_lossy())
         .unwrap_or(Cow::Borrowed("<repl>"));
+    let name_styled = format!("\x1b[36m{name}:{line_no}:{column}\x1b[0m");
+    let kind_styled = format!("\x1b[31;1m{kind}\x1b[0m");
+    let msg_styled = format!("\x1b[1m{message}\x1b[0m");
     let mut rendered = format!(
-        "{name}:{line_no}:{column}: {kind}: {message}\n  {line}\n  {}^\n",
+        "{name_styled}: {kind_styled}: {msg_styled}\n  {line}\n  \x1b[31;1m{}^\x1b[0m\n",
         " ".repeat(column - 1)
     );
-    if let Some(hint) = hint {
-        rendered.push_str(&format!("  hint: {hint}\n"));
+    if let Some(h) = hint {
+        rendered.push_str(&format!("  \x1b[33;1mhint:\x1b[0m \x1b[33m{h}\x1b[0m\n"));
     }
     rendered
 }

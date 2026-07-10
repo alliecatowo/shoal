@@ -164,6 +164,7 @@ impl<'s> Parser<'s> {
                 let span = expr.span();
                 return Ok(Stmt::Expr { expr, span });
             }
+
             // `NAME=value cmd` is an environment prefix, while a standalone
             // `NAME=value` remains ordinary assignment. CMD lexing can see
             // the whole prefix without compromising expression dispatch.
@@ -214,6 +215,17 @@ impl<'s> Parser<'s> {
             }
         }
         if matches!(t, Tok::Caret) {
+            let call = self.command()?;
+            let span = call.span;
+            return Ok(Stmt::Expr {
+                expr: Expr::Cmd {
+                    call: Box::new(call),
+                    span,
+                },
+                span,
+            });
+        }
+        if let (Tok::PathWord(_), _) = self.peek(Mode::Cmd)? {
             let call = self.command()?;
             let span = call.span;
             return Ok(Stmt::Expr {

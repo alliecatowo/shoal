@@ -2143,6 +2143,7 @@ version = "0.1.0"
 dependencies = [
  "crossterm",
  "libc",
+ "nu-ansi-term",
  "reedline",
  "serde",
  "serde_json",
