@@ -205,6 +205,22 @@ pub struct ExecParams {
     pub mode: String,
     #[serde(default = "stmt_position")]
     pub position: String,
+    #[serde(default, rename = "async")]
+    pub asynchronous: bool,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskParams {
+    pub task: Ref,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskRecord {
+    pub task: Ref,
+    pub session: String,
+    pub state: String,
+    pub started_ns: i64,
+    pub finished_ns: Option<i64>,
+    pub result_ref: Option<Ref>,
+    pub error: Option<RpcError>,
 }
 fn run_mode() -> String {
     "run".into()

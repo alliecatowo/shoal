@@ -14,7 +14,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub struct Kernel {
@@ -23,6 +23,23 @@ pub struct Kernel {
     journal: Mutex<Journal>,
     policy: Policy,
     plans: Mutex<HashMap<String, StoredPlan>>,
+    tasks: Mutex<HashMap<Ref, Arc<TaskEntry>>>,
+    next_task: AtomicU64,
+}
+struct TaskEntry {
+    task: Ref,
+    session: Arc<Session>,
+    started_ns: i64,
+    inner: Mutex<TaskInner>,
+    done: Condvar,
+    cancel: shoal_exec::CancelToken,
+    cancel_requested: AtomicBool,
+}
+struct TaskInner {
+    state: &'static str,
+    finished_ns: Option<i64>,
+    result_ref: Option<Ref>,
+    error: Option<RpcError>,
 }
 
 struct StoredPlan {
@@ -49,6 +66,8 @@ impl Kernel {
             journal: Mutex::new(Journal::in_memory().expect("in-memory journal")),
             policy: permissive_policy(),
             plans: Mutex::new(HashMap::new()),
+            tasks: Mutex::new(HashMap::new()),
+            next_task: AtomicU64::new(1),
         })
     }
 
@@ -59,6 +78,8 @@ impl Kernel {
             journal: Mutex::new(Journal::open(state_dir.as_ref())?),
             policy: permissive_policy(),
             plans: Mutex::new(HashMap::new()),
+            tasks: Mutex::new(HashMap::new()),
+            next_task: AtomicU64::new(1),
         }))
     }
 
@@ -72,6 +93,8 @@ impl Kernel {
             journal: Mutex::new(Journal::open(state_dir.as_ref())?),
             policy,
             plans: Mutex::new(HashMap::new()),
+            tasks: Mutex::new(HashMap::new()),
+            next_task: AtomicU64::new(1),
         }))
     }
 
@@ -82,6 +105,8 @@ impl Kernel {
             journal: Mutex::new(Journal::in_memory().expect("in-memory journal")),
             policy,
             plans: Mutex::new(HashMap::new()),
+            tasks: Mutex::new(HashMap::new()),
+            next_task: AtomicU64::new(1),
         })
     }
 
@@ -119,7 +144,7 @@ impl Kernel {
         Ok(())
     }
 
-    pub fn handle_stream(&self, stream: UnixStream) -> io::Result<()> {
+    pub fn handle_stream(self: &Arc<Self>, stream: UnixStream) -> io::Result<()> {
         let client = self.next_client.fetch_add(1, Ordering::Relaxed);
         let mut reader = BufReader::new(stream.try_clone()?);
         let mut writer = stream;
@@ -137,7 +162,7 @@ impl Kernel {
     }
 
     fn dispatch(
-        &self,
+        self: &Arc<Self>,
         request: Request,
         client: u64,
         attached: &mut Option<Arc<Session>>,
@@ -177,6 +202,70 @@ impl Kernel {
             "exec" => {
                 let session = attached.as_ref().ok_or_else(not_attached)?;
                 let params: ExecParams = decode(request.params)?;
+                if params.asynchronous {
+                    let cancel = {
+                        let mut evaluator = session.evaluator.lock().unwrap();
+                        evaluator.reset_cancel();
+                        evaluator.cancellation_token()
+                    };
+                    let task_ref = Ref::new("task", self.next_task.fetch_add(1, Ordering::Relaxed));
+                    let task = Arc::new(TaskEntry {
+                        task: task_ref.clone(),
+                        session: session.clone(),
+                        started_ns: now_ns(),
+                        inner: Mutex::new(TaskInner {
+                            state: "running",
+                            finished_ns: None,
+                            result_ref: None,
+                            error: None,
+                        }),
+                        done: Condvar::new(),
+                        cancel,
+                        cancel_requested: AtomicBool::new(false),
+                    });
+                    self.tasks
+                        .lock()
+                        .unwrap()
+                        .insert(task_ref.clone(), task.clone());
+                    let kernel = self.clone();
+                    let mut task_attached = Some(session.clone());
+                    std::thread::spawn(move || {
+                        let response = kernel.dispatch(
+                            Request {
+                                jsonrpc: JSONRPC.into(),
+                                id: Json::Null,
+                                method: "exec".into(),
+                                params: serde_json::to_value(ExecParams {
+                                    asynchronous: false,
+                                    ..params
+                                })
+                                .unwrap(),
+                            },
+                            client,
+                            &mut task_attached,
+                        );
+                        let mut inner = task.inner.lock().unwrap();
+                        inner.finished_ns = Some(now_ns());
+                        if let Some(error) = response.error {
+                            inner.state = if task.cancel_requested.load(Ordering::SeqCst) {
+                                "cancelled"
+                            } else {
+                                "failed"
+                            };
+                            inner.error = Some(error);
+                        } else {
+                            inner.state = "completed";
+                            inner.result_ref = response
+                                .result
+                                .as_ref()
+                                .and_then(|r| r.get("ref"))
+                                .and_then(Json::as_str)
+                                .map(|s| Ref(s.into()));
+                        }
+                        task.done.notify_all();
+                    });
+                    return encode(json!({"task":task_ref}));
+                }
                 if params.mode == "plan" {
                     shoal_syntax::parse(&params.src).map_err(|e| RpcError {
                         code: -32001,
@@ -337,7 +426,73 @@ impl Kernel {
                 }
                 encode(json!({"ref":params.r#ref,"value":wire}))
             }
-            "task.list" => encode(json!([])),
+            "task.list" => {
+                let session = attached.as_ref().ok_or_else(not_attached)?;
+                let records: Vec<_> = self
+                    .tasks
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .filter(|task| task.session.id == session.id)
+                    .map(task_record)
+                    .collect();
+                encode(records)
+            }
+            "task.await" => {
+                let session = attached.as_ref().ok_or_else(not_attached)?;
+                let p: TaskParams = decode(request.params)?;
+                let task = self.task(&p.task)?;
+                if task.session.id != session.id {
+                    return Err(RpcError {
+                        code: -32021,
+                        message: "unknown task ref".into(),
+                        data: None,
+                    });
+                }
+                let mut inner = task.inner.lock().unwrap();
+                while matches!(inner.state, "running" | "cancelling") {
+                    inner = task.done.wait(inner).unwrap();
+                }
+                encode(task_record_locked(&task, &inner))
+            }
+            "task.cancel" => {
+                let session = attached.as_ref().ok_or_else(not_attached)?;
+                let p: TaskParams = decode(request.params)?;
+                let task = self.task(&p.task)?;
+                if task.session.id != session.id {
+                    return Err(RpcError {
+                        code: -32021,
+                        message: "unknown task ref".into(),
+                        data: None,
+                    });
+                }
+                task.cancel_requested.store(true, Ordering::SeqCst);
+                {
+                    let mut inner = task.inner.lock().unwrap();
+                    if inner.state == "running" {
+                        inner.state = "cancelling";
+                    }
+                }
+                task.cancel.cancel();
+                encode(json!({"task":p.task,"cancel_requested":true}))
+            }
+            "task.suspend" => {
+                let session = attached.as_ref().ok_or_else(not_attached)?;
+                let p: TaskParams = decode(request.params)?;
+                let task = self.task(&p.task)?;
+                if task.session.id != session.id {
+                    return Err(RpcError {
+                        code: -32021,
+                        message: "unknown task ref".into(),
+                        data: None,
+                    });
+                }
+                Err(RpcError {
+                    code: -32020,
+                    message: "task suspension is unavailable for evaluator-owned processes".into(),
+                    data: Some(json!({"task":p.task})),
+                })
+            }
             "plan.apply" => {
                 let session = attached.as_ref().ok_or_else(not_attached)?;
                 let p: PlanApplyParams = decode(request.params)?;
@@ -374,6 +529,7 @@ impl Kernel {
                             src,
                             mode: "approved".into(),
                             position: "stmt".into(),
+                            asynchronous: false,
                         })
                         .unwrap(),
                     },
@@ -486,11 +642,41 @@ impl Kernel {
         sessions.insert(name.into(), session.clone());
         Ok(session)
     }
+    fn task(&self, task: &Ref) -> Result<Arc<TaskEntry>, RpcError> {
+        self.tasks
+            .lock()
+            .unwrap()
+            .get(task)
+            .cloned()
+            .ok_or_else(|| RpcError {
+                code: -32021,
+                message: "unknown task ref".into(),
+                data: None,
+            })
+    }
+}
+
+fn task_record(task: &Arc<TaskEntry>) -> TaskRecord {
+    let inner = task.inner.lock().unwrap();
+    task_record_locked(task, &inner)
+}
+fn task_record_locked(task: &TaskEntry, inner: &TaskInner) -> TaskRecord {
+    TaskRecord {
+        task: task.task.clone(),
+        session: task.session.id.clone(),
+        state: inner.state.into(),
+        started_ns: task.started_ns,
+        finished_ns: inner.finished_ns,
+        result_ref: inner.result_ref.clone(),
+        error: inner.error.clone(),
+    }
 }
 
 struct BoundSocket(std::path::PathBuf);
 impl Drop for BoundSocket {
-    fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 fn decode<T: serde::de::DeserializeOwned>(value: Json) -> Result<T, RpcError> {
@@ -748,5 +934,89 @@ mod tests {
             drop(reader);
             thread.join().unwrap();
         }
+    }
+
+    #[test]
+    fn async_tasks_survive_disconnect_and_cancel() {
+        let kernel = Kernel::new();
+        let (mut first, server) = UnixStream::pair().unwrap();
+        let mut first_reader = BufReader::new(first.try_clone().unwrap());
+        let k = kernel.clone();
+        let thread = std::thread::spawn(move || k.handle_stream(server).unwrap());
+        call(
+            &mut first,
+            &mut first_reader,
+            1,
+            "session.attach",
+            json!({"session":"tasks","client":{"kind":"test","tty":false}}),
+        );
+        let started = call(
+            &mut first,
+            &mut first_reader,
+            2,
+            "exec",
+            json!({"src":"sh { sleep 0.2 }","async":true}),
+        );
+        let survived: Ref =
+            serde_json::from_value(started.result.unwrap()["task"].clone()).unwrap();
+        drop(first);
+        drop(first_reader);
+        thread.join().unwrap();
+
+        let (mut second, server) = UnixStream::pair().unwrap();
+        let mut reader = BufReader::new(second.try_clone().unwrap());
+        let k = kernel.clone();
+        let thread = std::thread::spawn(move || k.handle_stream(server).unwrap());
+        call(
+            &mut second,
+            &mut reader,
+            3,
+            "session.attach",
+            json!({"session":"tasks","client":{"kind":"test","tty":false}}),
+        );
+        let awaited = call(
+            &mut second,
+            &mut reader,
+            4,
+            "task.await",
+            json!({"task":survived}),
+        );
+        let awaited_value = awaited.result.unwrap();
+        assert_eq!(awaited_value["state"], "completed", "{awaited_value}");
+        let long = call(
+            &mut second,
+            &mut reader,
+            5,
+            "exec",
+            json!({"src":"sh { sleep 30 }","async":true}),
+        );
+        let task: Ref = serde_json::from_value(long.result.unwrap()["task"].clone()).unwrap();
+        let listed = call(&mut second, &mut reader, 6, "task.list", json!({}));
+        assert!(listed.result.unwrap().as_array().unwrap().len() >= 2);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            call(
+                &mut second,
+                &mut reader,
+                7,
+                "task.cancel",
+                json!({"task":task})
+            )
+            .error
+            .is_none()
+        );
+        let before = Instant::now();
+        let cancelled = call(
+            &mut second,
+            &mut reader,
+            8,
+            "task.await",
+            json!({"task":task}),
+        );
+        assert!(before.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(cancelled.result.unwrap()["state"], "cancelled");
+        drop(second);
+        drop(reader);
+        thread.join().unwrap();
     }
 }

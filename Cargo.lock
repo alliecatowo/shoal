@@ -1658,6 +1658,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "shoal-doctor"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "shoal-adapters",
+ "shoal-journal",
+ "shoal-leash",
+ "tempfile",
+ "toml 1.1.2+spec-1.1.0",
+]
+
+[[package]]
 name = "shoal-eval"
 version = "0.1.0"
 dependencies = [
