@@ -20,7 +20,7 @@ pub use reef::{PromptReefBinding, PromptReefSnapshot};
 use shoal_adapters::{AdapterCatalog, AdapterClass, SubSpec};
 use shoal_ast::*;
 use shoal_exec::{CancelToken, ExecMode, ExecSpec, StdinSpec};
-use shoal_leash::{Effect, Estimates, Plan, Reversibility};
+use shoal_leash::{Effect, Estimates, Plan, Policy as LeashPolicy, Reversibility, SandboxPolicy};
 use shoal_value::{
     CallArgs, CallCtx, ClosureVal, Env, ErrorVal, OutcomeVal, Record, VResult, Value,
 };
@@ -90,6 +90,14 @@ pub struct Evaluator {
     /// §6), nearest-first (innermost `with reef:` block wins). Empty and inert
     /// when no `with reef:` is on the dynamic stack — zero-regression.
     reef_overrides: Vec<shoal_reef::ScopeEntry>,
+    /// Active leash policy + the principal it is evaluated for (TDD §8). `None`
+    /// (the default) means no OS sandbox is ever applied to a spawn — the exact
+    /// pre-activation behavior, so `Evaluator::new` and every existing test
+    /// keep running unconfined. When set, each external spawn resolves a
+    /// [`SandboxPolicy`] for `principal` and passes it via `ExecSpec.sandbox`;
+    /// a default-permissive policy still resolves to `None` (no wrapping), so
+    /// only a genuinely-scoped principal ever confines a child.
+    leash: Option<(LeashPolicy, String)>,
 }
 
 enum Flow {
@@ -127,7 +135,39 @@ impl Evaluator {
             reef_lock_path: None,
             reef_user_manifest: None,
             reef_overrides: Vec::new(),
+            leash: None,
         }
+    }
+
+    /// Install the active leash policy and the principal spawns are evaluated
+    /// for (TDD §8). Additive: without this call there is no policy and every
+    /// spawn runs unconfined exactly as before. A default-permissive policy
+    /// (see [`shoal_leash::Policy::permissive`]) is safe to install — it still
+    /// resolves to no OS confinement for a spawn, so normal use never
+    /// regresses; only a scoped principal actually restricts a child.
+    pub fn set_leash_policy(&mut self, policy: LeashPolicy, principal: impl Into<String>) {
+        self.leash = Some((policy, principal.into()));
+    }
+
+    /// Convenience over [`Evaluator::set_leash_policy`]: load the per-user leash
+    /// policy from `~/.config/shoal/leash.toml` (or `$XDG_CONFIG_HOME`) if it
+    /// exists, else fall back to the default-permissive policy for `principal`
+    /// (TDD §8). Hosts call this once at startup so agent principals can be
+    /// scoped from config while a human keeps an unrestricted, no-regression
+    /// session.
+    pub fn load_leash_policy(&mut self, principal: impl Into<String>) {
+        let principal = principal.into();
+        let policy = LeashPolicy::load_user_or_permissive(&principal);
+        self.set_leash_policy(policy, principal);
+    }
+
+    /// Resolve the OS [`SandboxPolicy`] for the next external spawn under the
+    /// active leash policy, or `None` when no policy is installed, the
+    /// principal is unknown, or its grants are unrestricted/unscoped. `None`
+    /// keeps `ExecSpec.sandbox` unset — the pre-activation, unconfined path.
+    pub(crate) fn resolve_sandbox(&self) -> Option<SandboxPolicy> {
+        let (policy, principal) = self.leash.as_ref()?;
+        policy.sandbox_for(principal)
     }
 
     /// Point the user reef scope at a `shoal.toml` whose `[reef]` table becomes

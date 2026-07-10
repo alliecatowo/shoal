@@ -1,0 +1,26 @@
+# `ps -e -o keyword=Header,...` is the POSIX/UNIX98 form of `ps`, supported
+# by both GNU procps (Linux) and BSD `ps` (macOS): `-e` selects every
+# process and `-o keyword[=header]` chooses exactly these columns with a
+# custom header. Using `=Header` renames each column so the printed header
+# line reads the same on both platforms without needing a GNU-only flag
+# like `--no-headers` -- BSD `ps` has no such flag, which is exactly the
+# portability trap this adapter avoids. The `cols` parser discards
+# whatever that header line actually says anyway (see the parser's own
+# doc comment) and takes column identity/order from `output.type`, so the
+# custom headers here exist purely for a human skimming raw `ps` output.
+#
+# `comm` (bare command name, no arguments) is placed last, not in its
+# conventional middle position, because a GUI process's `comm` can contain
+# spaces (e.g. macOS's "Google Chrome Helper"); the `cols` parser merges
+# any overflow whitespace-split fields into the *last* column, so only the
+# last column can safely contain embedded spaces without desyncing every
+# column after it.
+[cmd.ps]
+bin = "ps"
+class = "cli"
+ok_codes = [0]
+invoke = ["-e", "-o", "pid=PID,ppid=PPID,user=USER,pcpu=CPU,pmem=MEM,comm=COMMAND"]
+output = { parse = "cols", type = "table<{pid: int, ppid: int, user: str, cpu: float, mem: float, command: str}>" }
+# No declared fs/net effects: `ps` reads transient in-kernel process-table
+# state, not file contents or the network. (`proc.spawn` for the `ps`
+# binary itself is added automatically by the planner for every adapter.)

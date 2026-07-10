@@ -1,0 +1,33 @@
+# gh's own CLI nests two words per operation (`gh pr list`, `gh issue
+# list`, `gh run list`); shoal's adapter schema only models one level of
+# subcommand per adapter head, so each two-word gh operation is exposed
+# here under a single flattened shoal-side name (`pr_list`, `issue_list`,
+# `run_list`) whose `invoke` template supplies both real argv words. This
+# is the same trick `git.sub.log` uses to pin extra fixed argv onto its
+# `invoke` template, just pinning two words instead of flags.
+[cmd.gh]
+bin = "gh"
+class = "cli"
+ok_codes = [0]
+effects = ["net.connect(api.github.com:443)"]
+
+[cmd.gh.sub.pr_list]
+params = { state = "str?", limit = "int?", author = "str?" }
+flags = { short = { L = "limit" } }
+invoke = ["pr", "list", "--json", "number,title,state,author,url,createdAt"]
+output = { parse = "json", type = "table<{number: int, title: str, state: str, author: record, url: str, createdAt: datetime}>" }
+effects = ["net.connect(api.github.com:443)"]
+
+[cmd.gh.sub.issue_list]
+params = { state = "str?", limit = "int?", assignee = "str?" }
+flags = { short = { L = "limit" } }
+invoke = ["issue", "list", "--json", "number,title,state,author,url,createdAt"]
+output = { parse = "json", type = "table<{number: int, title: str, state: str, author: record, url: str, createdAt: datetime}>" }
+effects = ["net.connect(api.github.com:443)"]
+
+[cmd.gh.sub.run_list]
+params = { limit = "int?", workflow = "str?", branch = "str?" }
+flags = { short = { L = "limit" } }
+invoke = ["run", "list", "--json", "databaseId,name,status,conclusion,workflowName,createdAt"]
+output = { parse = "json", type = "table<{databaseId: int, name: str, status: str, conclusion: str, workflowName: str, createdAt: datetime}>" }
+effects = ["net.connect(api.github.com:443)"]

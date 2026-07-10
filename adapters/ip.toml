@@ -1,0 +1,18 @@
+# Linux (iproute2) only: macOS has no `ip` command and no direct portable
+# equivalent that emits JSON (`ifconfig`/`netstat` output is unstructured
+# free text with incompatible flags across BSD and Linux). Like
+# `systemctl`, this adapter names a specific ecosystem tool rather than a
+# POSIX-portable one, and fails loudly with "command not found" on macOS
+# rather than guessing at a lookalike that would silently misparse.
+[cmd.ip]
+bin = "ip"
+class = "cli"
+ok_codes = [0]
+
+[cmd.ip.sub.addr]
+invoke = ["-j", "addr", "show"]
+output = { parse = "json", type = "table<{ifname: str, addr_info: list<record>}>" }
+
+[cmd.ip.sub.route]
+invoke = ["-j", "route", "show"]
+output = { parse = "json", type = "table<{dst: str, dev: str, gateway: str}>" }

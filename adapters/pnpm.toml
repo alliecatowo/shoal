@@ -1,0 +1,12 @@
+[cmd.pnpm]
+bin = "pnpm"
+class = "cli"
+ok_codes = [0]
+effects = ["fs.read(cwd)", "net.connect(registry.npmjs.org:443)"]
+
+[cmd.pnpm.sub.list]
+params = { depth = "int?", filter = "str?", recursive = "bool" }
+flags = { short = { r = "recursive" } }
+invoke = ["list", "--json"]
+output = { parse = "json", type = "table<{name: str, version: str, path: path, private: bool}>" }
+effects = ["fs.read(cwd)"]

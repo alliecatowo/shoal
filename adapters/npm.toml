@@ -1,0 +1,21 @@
+[cmd.npm]
+bin = "npm"
+class = "cli"
+ok_codes = [0]
+effects = ["fs.read(cwd)", "net.connect(registry.npmjs.org:443)"]
+
+[cmd.npm.sub.ls]
+params = { all = "bool", depth = "int?", package = "str?" }
+positional = ["package"]
+invoke = ["ls", "--json"]
+output = { parse = "json", type = "record" }
+effects = ["fs.read(cwd)"]
+
+# `npm outdated` exits 1 (not 0) when it finds outdated packages -- that is
+# its normal "found results" signal, not a failure, the same class of
+# nonzero-but-ok exit code as `git diff`'s "differs" (ok_codes = [0, 1]).
+[cmd.npm.sub.outdated]
+ok_codes = [0, 1]
+invoke = ["outdated", "--json"]
+output = { parse = "json", type = "record" }
+effects = ["fs.read(cwd)", "net.connect(registry.npmjs.org:443)"]

@@ -1,0 +1,17 @@
+[cmd.terraform]
+bin = "terraform"
+class = "cli"
+ok_codes = [0]
+effects = ["fs.read(cwd)"]
+
+[cmd.terraform.sub.state_list]
+invoke = ["state", "list"]
+output = { parse = "lines", type = "list<str>" }
+effects = ["fs.read(cwd)"]
+
+[cmd.terraform.sub.show]
+params = { plan_file = "path?" }
+positional = ["plan_file"]
+invoke = ["show", "-json"]
+output = { parse = "json", type = "record" }
+effects = ["fs.read(cwd)", "fs.read($plan_file)"]

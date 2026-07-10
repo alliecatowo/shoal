@@ -5,7 +5,9 @@ use shoal_ast::{Program, Stmt};
 use shoal_auth::TokenStore;
 use shoal_eval::{Evaluator, Position};
 use shoal_journal::{EntryRecord, Journal, JournalQuery};
-use shoal_leash::{Effect, Estimates, Plan, Policy, Reversibility, Verdict};
+use shoal_leash::{
+    Effect, EnforcementStatus, EnforcementTier, Estimates, Plan, Policy, Reversibility, Verdict,
+};
 use shoal_proto::*;
 use shoal_value::Value;
 use std::collections::{HashMap, VecDeque};
@@ -379,16 +381,27 @@ impl Kernel {
                     session,
                     principal: who.clone(),
                 });
+                // TDD §8 tier honesty: report the REAL strongest OS backend
+                // available on this host (Landlock → A, Seatbelt → C, else
+                // advisory D), and whether this principal's spawns will
+                // *actually* be confined — true only when a genuine OS backend
+                // exists AND this principal's policy resolves to a real sandbox
+                // (a scoped agent), never for the default-permissive human.
+                let status = EnforcementStatus::detect();
+                let tier = tier_letter(status.available_tier);
+                let backend_present = matches!(
+                    status.available_tier,
+                    EnforcementTier::A | EnforcementTier::C
+                );
+                let caps_enforced = backend_present && self.policy.sandbox_for(&who).is_some();
                 encode(AttachResult {
                     session: name,
                     principal: who.clone(),
-                    caps: json!({"enforced":false,"tier":"D","policy_principal":who,"profile":profile,"token_caps":token_caps,"opaque":verdict_name(self.policy.evaluate_effect(&who, &Effect::Opaque))}),
+                    caps: json!({"enforced":caps_enforced,"tier":tier,"available_tier":tier,"policy_principal":who,"profile":profile,"token_caps":token_caps,"opaque":verdict_name(self.policy.evaluate_effect(&who, &Effect::Opaque))}),
                     cwd: WirePath::encode(&cwd),
                     env_hash: "local".into(),
                     ast_version: 1,
-                    // TDD §8 tier honesty: the built-in policy is tier D, so
-                    // the wall is advisory, not enforced. Say so at attach.
-                    caps_enforced: false,
+                    caps_enforced,
                     elide_defaults: elide_defaults_json(),
                     channels: STATIC_CHANNELS.iter().map(|s| s.to_string()).collect(),
                 })
@@ -594,6 +607,11 @@ impl Kernel {
                 })?;
                 let ast_json = serde_json::to_string(&ast).map_err(internal)?;
                 let mut evaluator = session.evaluator.lock().unwrap();
+                // TDD §8 leash activation: bind the session's evaluator to this
+                // principal's policy so any external spawn resolves and applies
+                // an OS sandbox for `actor`. The default-permissive policy
+                // resolves to no confinement, so the human path is unchanged.
+                evaluator.set_leash_policy(self.policy.clone(), actor.clone());
                 let run_plan = derive_plan(&mut evaluator, &ast, &ast_json);
                 if params.mode == "run" {
                     match self.policy.evaluate_plan(&actor, &run_plan) {
@@ -1247,13 +1265,19 @@ fn elapsed_ns(start: Instant) -> i64 {
     start.elapsed().as_nanos().min(i64::MAX as u128) as i64
 }
 fn permissive_policy() -> Policy {
-    let who = principal();
-    Policy::from_toml(&format!(
-        "[principal.\"{who}\"]\nopaque='allow'\nauto_apply='in-grant'\njournal_read=true\n\
-         env_read=[\"*\"]\nenv_write=[\"*\"]\nsession_write=true\ntime=true\n\n\
-         [principal.\"{who}\".fs]\nread=[\"/**\"]\nwrite=[\"/**\"]\ndelete=[\"/**\"]\n"
-    ))
-    .expect("built-in policy")
+    Policy::permissive(&principal())
+}
+
+/// The single-letter wire form of an enforcement tier (TDD §8): A (Landlock),
+/// B (namespace fallback), C (Seatbelt), D (advisory). Reported at attach so a
+/// client learns the strongest OS backend available on this host.
+fn tier_letter(tier: EnforcementTier) -> &'static str {
+    match tier {
+        EnforcementTier::A => "A",
+        EnforcementTier::B => "B",
+        EnforcementTier::C => "C",
+        EnforcementTier::D => "D",
+    }
 }
 
 /// Derive a plan's real effects (TDD §8) and give it a source-anchored
@@ -2764,6 +2788,52 @@ mod tests {
                 .iter()
                 .any(|c| c == "session.transcript")
         );
+        drop(client);
+        drop(reader);
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn attach_reports_the_honest_detected_tier() {
+        // TDD §8 tier honesty: the tier at attach is the strongest OS backend
+        // this host actually has (detected), NOT a hardcoded "D". Under the
+        // default-permissive human policy nothing is confined, so `enforced`
+        // stays false even where a backend exists.
+        let kernel = Kernel::new();
+        let (mut client, mut reader, thread) = spawn(&kernel);
+        let r = attach(&mut client, &mut reader).result.unwrap();
+        let expected = tier_letter(EnforcementStatus::detect().available_tier);
+        assert_eq!(r["caps"]["tier"], expected);
+        assert_eq!(r["caps_enforced"], false);
+        assert_eq!(r["caps"]["enforced"], false);
+        drop(client);
+        drop(reader);
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn attach_enforces_only_for_a_scoped_principal_with_a_real_backend() {
+        // A genuinely-scoped principal reports `enforced: true` — but only when
+        // a real OS backend (Landlock/Seatbelt) exists; on a host without one
+        // the answer honestly degrades to false rather than claiming a wall
+        // that isn't there.
+        let who = principal();
+        let policy = Policy::from_toml(&format!(
+            "[principal.\"{who}\"]\nopaque='allow'\nauto_apply='in-grant'\n\n\
+             [principal.\"{who}\".fs]\nread=[\"/usr/**\"]\n"
+        ))
+        .unwrap();
+        let kernel = Kernel::with_policy(policy);
+        let (mut client, mut reader, thread) = spawn(&kernel);
+        let r = attach(&mut client, &mut reader).result.unwrap();
+        let status = EnforcementStatus::detect();
+        let backend_present = matches!(
+            status.available_tier,
+            EnforcementTier::A | EnforcementTier::C
+        );
+        assert_eq!(r["caps_enforced"], backend_present);
+        assert_eq!(r["caps"]["enforced"], backend_present);
+        assert_eq!(r["caps"]["tier"], tier_letter(status.available_tier));
         drop(client);
         drop(reader);
         thread.join().unwrap();

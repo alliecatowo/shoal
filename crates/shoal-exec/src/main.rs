@@ -23,8 +23,8 @@ fn main() {
     if cmd.is_empty() {
         fail("missing command")
     }
-    if let Err(e) = shoal_leash::apply_landlock(&s) {
-        fail(&format!("Landlock enforcement failed: {e}"))
+    if let Err(e) = shoal_leash::apply_sandbox(&s) {
+        fail(&format!("sandbox enforcement failed: {e}"))
     }
     let e = std::process::Command::new(&cmd[0]).args(&cmd[1..]).exec();
     fail(&format!("exec failed: {e}"))

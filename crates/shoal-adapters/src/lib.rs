@@ -219,6 +219,7 @@ fn parse_sub(t: &toml::Table) -> Result<SubSpec, String> {
                 | "tsv"
                 | "z-records"
                 | "porcelain-v2"
+                | "cols"
                 | "lines"
                 | "kv"
                 | "none"
@@ -298,6 +299,7 @@ pub fn parse_output(strategy: &str, bytes: &[u8], type_hint: Option<&str>) -> Op
         "tsv" => parse_delimited(bytes, b'\t', type_hint),
         "z-records" => parse_z_records(bytes, type_hint),
         "porcelain-v2" => parse_porcelain_v2(bytes),
+        "cols" => parse_cols(bytes, type_hint),
         _ => None,
     }
 }
@@ -416,6 +418,55 @@ fn coerce_cell(raw: &str, ty: &str) -> Option<Value> {
         "time" => Value::Time(shoal_value::parse_time(raw)?),
         _ => Value::Str(raw.into()),
     })
+}
+
+/// Parses whitespace-column tables from tools whose header line can't be
+/// trusted to determine field count or names (e.g. `df`'s `Mounted on`
+/// header is two words over one data column, and `ps`'s `%CPU`/`%MEM`
+/// headers aren't stable identifiers across GNU/BSD `ps`). Unlike
+/// `csv`/`tsv`, which look up each column by the *header text* found in the
+/// bytes, `cols` always discards the first line as a header and takes
+/// column identity and order entirely from the `output.type` hint
+/// (positionally, like `z-records`) -- this is what lets a portable
+/// `-o keyword=CustomHeader` invoke template stay decoupled from whatever
+/// the underlying OS happens to print.
+///
+/// Each remaining line is split on runs of whitespace. A line with fewer
+/// fields than the hint degrades the whole parse to `None` (mismatch, not a
+/// lie). A line with *more* fields than the hint has its overflow merged
+/// (space-joined) into the last column, so a last column that legitimately
+/// contains embedded whitespace (a mount path with a space, a multi-word
+/// process command) survives instead of desyncing every column after it.
+fn parse_cols(bytes: &[u8], hint: Option<&str>) -> Option<Value> {
+    let fields = hint_schema(hint);
+    if fields.is_empty() {
+        return None;
+    }
+    let body = text(bytes)?;
+    let mut lines = body.lines();
+    lines.next(); // header row: discarded, never consulted for shape or names
+    let rows = lines
+        .filter(|l| !l.trim().is_empty())
+        .map(|line| {
+            let mut parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < fields.len() {
+                return None;
+            }
+            let last = if parts.len() > fields.len() {
+                parts.split_off(fields.len() - 1).join(" ")
+            } else {
+                parts.pop()?.to_owned()
+            };
+            let mut r = Record::new();
+            for (name, ty) in &fields[..fields.len() - 1] {
+                r.insert(name.clone(), coerce_cell(parts.remove(0), ty)?);
+            }
+            let (last_name, last_ty) = &fields[fields.len() - 1];
+            r.insert(last_name.clone(), coerce_cell(&last, last_ty)?);
+            Some(r)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(Value::Table(rows))
 }
 
 fn parse_z_records(bytes: &[u8], hint: Option<&str>) -> Option<Value> {
@@ -730,12 +781,57 @@ output={parse="porcelain-v2", type="table<{status: str, path: path}>"}
             "bundled adapter warnings: {warnings:#?}"
         );
         let required = [
-            "git", "cargo", "rg", "docker", "kubectl", "jq", "curl", "tar", "fd", "du",
+            "git",
+            "cargo",
+            "rg",
+            "docker",
+            "kubectl",
+            "jq",
+            "curl",
+            "tar",
+            "fd",
+            "du",
+            "ps",
+            "df",
+            "systemctl",
+            "brew",
+            "npm",
+            "pnpm",
+            "gh",
+            "go",
+            "pip",
+            "sqlite3",
+            "terraform",
+            "helm",
+            "ip",
         ];
         assert_eq!(catalog.len(), required.len());
         for name in required {
             assert!(catalog.lookup(name).is_some(), "missing adapter {name}");
         }
+        // The `cols` strategy (added for `ps`/`df`) is wired end to end
+        // through the same loader path as every other parser.
+        assert_eq!(catalog.lookup("ps").unwrap().top.parse, "cols");
+        assert_eq!(catalog.lookup("df").unwrap().top.parse, "cols");
+        // gh's two-word real subcommands are flattened into single
+        // shoal-side sub names whose `invoke` template supplies both words.
+        assert_eq!(
+            catalog.lookup("gh").unwrap().subs["pr_list"].invoke,
+            Some(vec![
+                "pr".to_string(),
+                "list".to_string(),
+                "--json".to_string(),
+                "number,title,state,author,url,createdAt".to_string()
+            ])
+        );
+        assert_eq!(
+            catalog.lookup("cargo").unwrap().subs["metadata"].invoke,
+            Some(vec![
+                "metadata".to_string(),
+                "--format-version".to_string(),
+                "1".to_string()
+            ])
+        );
         assert_eq!(
             catalog.lookup("git").unwrap().subs["diff"].ok_codes,
             Some(vec![0, 1])

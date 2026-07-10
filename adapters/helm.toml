@@ -1,0 +1,12 @@
+[cmd.helm]
+bin = "helm"
+class = "cli"
+ok_codes = [0]
+effects = ["net.connect(kubernetes-api)"]
+
+[cmd.helm.sub.list]
+params = { all_namespaces = "bool", namespace = "str?" }
+flags = { short = { A = "all_namespaces", n = "namespace" } }
+invoke = ["list", "-o", "json"]
+output = { parse = "json", type = "table<{name: str, namespace: str, revision: str, updated: str, status: str, chart: str, app_version: str}>" }
+effects = ["net.connect(kubernetes-api)"]

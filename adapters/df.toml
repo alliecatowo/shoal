@@ -1,0 +1,32 @@
+# `df -kP`: `-P` (POSIX output format) is supported by both GNU df (Linux)
+# and BSD df (macOS) and guarantees exactly one line per filesystem with no
+# wrapping onto a second line for a long device name -- the plain
+# (non-`-P`) format on Linux wraps when the filesystem name is long, which
+# would desync a column-positional parser. `-k` pins 1024-byte blocks on
+# both platforms (BSD `df`'s default block size differs from Linux's, so
+# this is the one flag that must be forwarded to keep the numbers
+# meaningful and comparable across platforms).
+#
+# The `SIZE`/`USED`/`AVAIL` columns `df -kP` prints are bare block counts
+# with no unit suffix (e.g. "61255492", not "61255492b" or "58G") --
+# `size`-typed cells require a unit suffix (see `shoal_value::parse_size`),
+# so declaring these `size` would make every real invocation degrade to
+# bytes+warning instead of a table. They are declared `int` (kilobytes)
+# instead, which the parser genuinely yields; a caller wanting bytes can
+# multiply by 1024.
+#
+# The real header line is "Filesystem 1024-blocks Used Available Capacity
+# Mounted on" -- two words ("Mounted on") over the last single data column.
+# The `cols` parser is used precisely because it never tries to derive
+# column names/count from that header text (unlike `csv`/`tsv`); it always
+# discards the header line and takes shape from `output.type`.
+[cmd.df]
+bin = "df"
+class = "cli"
+ok_codes = [0]
+invoke = ["-kP"]
+output = { parse = "cols", type = "table<{filesystem: str, size_kb: int, used_kb: int, avail_kb: int, use_pct: str, mounted: path}>" }
+# No declared fs.read($paths): with no path arguments (the common case),
+# `df` enumerates the live system-wide mount table rather than reading any
+# specific file content, so there is no path binding to point a
+# parametric `fs.read` at.

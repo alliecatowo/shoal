@@ -23,3 +23,16 @@ effects = ["fs.read(cwd)", "fs.write(cwd/target)", "proc.spawn(target-binary)"]
 params = { package = "str?", all_targets = "bool", all_features = "bool" }
 flags = { short = { p = "package" } }
 effects = ["fs.read(cwd)", "fs.write(cwd/target)"]
+
+[cmd.cargo.sub.metadata]
+params = { no_deps = "bool", all_features = "bool" }
+invoke = ["metadata", "--format-version", "1"]
+output = { parse = "json", type = "record" }
+effects = ["fs.read(cwd)", "net.connect(crates.io:443)"]
+
+# `cargo tree` is intentionally not given a `[cmd.cargo.sub.tree]` entry:
+# its default output is a human-oriented box-drawing dependency tree with
+# no stable machine-readable shape (unlike `metadata --format-version 1`),
+# so declaring an `output.type` for it would promise a parse this crate
+# cannot honestly deliver. Per TDD §6, only promise a type the parser
+# genuinely yields.

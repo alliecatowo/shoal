@@ -119,6 +119,14 @@ pub struct PrincipalPolicy {
     pub auto_apply: AutoApply,
     #[serde(default)]
     pub opaque: OpaqueMode,
+    /// TDD §8 hermetic intent: when `true`, a child spawn built from this
+    /// principal demands a hard guarantee — [`crate::SandboxPolicy::hermetic`]
+    /// is set, so the exec layer refuses to spawn rather than run with any
+    /// requested dimension unenforced. `false` (the default) is best-effort:
+    /// the strongest available backend is applied and anything unenforceable
+    /// on this host is reported truthfully instead of silently granted.
+    #[serde(default)]
+    pub hermetic: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -222,6 +230,167 @@ impl Policy {
             AutoApply::Reversible => Verdict::ApprovalRequired,
         }
     }
+
+    /// The default-permissive policy for `principal` (TDD §8): allow every
+    /// effect, filesystem read/write/delete unrestricted, so enforcement is a
+    /// genuine no-op and normal use never regresses. Human principals get this
+    /// by default; agent principals are the ones that get scoped down.
+    pub fn permissive(principal: &str) -> Policy {
+        Policy::from_toml(&format!(
+            "[principal.\"{principal}\"]\nopaque='allow'\nauto_apply='in-grant'\n\
+             journal_read=true\nenv_read=[\"*\"]\nenv_write=[\"*\"]\nsession_write=true\n\
+             time=true\n\n\
+             [principal.\"{principal}\".fs]\nread=[\"/**\"]\nwrite=[\"/**\"]\ndelete=[\"/**\"]\n"
+        ))
+        .expect("built-in permissive policy")
+    }
+
+    /// Path of the per-user leash policy (TDD §8): `$XDG_CONFIG_HOME/shoal/leash.toml`
+    /// or, absent that, `~/.config/shoal/leash.toml`. `None` when neither
+    /// `XDG_CONFIG_HOME` nor `HOME` is set (no home to anchor config to).
+    pub fn user_leash_path() -> Option<PathBuf> {
+        if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME").filter(|s| !s.is_empty()) {
+            return Some(PathBuf::from(dir).join("shoal").join("leash.toml"));
+        }
+        std::env::var_os("HOME").filter(|s| !s.is_empty()).map(|h| {
+            PathBuf::from(h)
+                .join(".config")
+                .join("shoal")
+                .join("leash.toml")
+        })
+    }
+
+    /// Load the per-user leash policy from [`Policy::user_leash_path`] if it
+    /// exists and parses, otherwise fall back to [`Policy::permissive`] for
+    /// `principal`. A missing or malformed file never bricks the shell — it
+    /// degrades to permissive so normal use keeps working (TDD §8: honesty is
+    /// surfaced at attach, not by refusing to run).
+    pub fn load_user_or_permissive(principal: &str) -> Policy {
+        match Self::user_leash_path() {
+            Some(path) if path.is_file() => {
+                Self::load(&path).unwrap_or_else(|_| Self::permissive(principal))
+            }
+            _ => Self::permissive(principal),
+        }
+    }
+
+    /// Resolve the concrete OS [`SandboxPolicy`] for `principal`'s next child
+    /// spawn, or `None` when the principal is unknown, its filesystem grants
+    /// are unrestricted, or it declares no filesystem scope at all. `None`
+    /// means "run the child without OS confinement" — the plan-layer verdict
+    /// ([`Policy::evaluate_plan`]) remains the authority in that case, and the
+    /// default-permissive policy therefore never wraps a spawn (zero
+    /// regression). See [`PrincipalPolicy::to_sandbox_policy`].
+    pub fn sandbox_for(&self, principal: &str) -> Option<SandboxPolicy> {
+        self.principal(principal)
+            .and_then(PrincipalPolicy::to_sandbox_policy)
+    }
+}
+
+impl PrincipalPolicy {
+    /// True when every filesystem dimension grants the root subtree (`/**`),
+    /// i.e. an OS sandbox built from this principal would confine nothing.
+    pub fn is_fs_unrestricted(&self) -> bool {
+        grants_include_root(&self.fs_read)
+            && grants_include_root(&self.fs_write)
+            && grants_include_root(&self.fs_delete)
+    }
+
+    /// Lower this principal's filesystem scopes into a concrete
+    /// [`SandboxPolicy`] for one child spawn, or `None` when there is nothing
+    /// to confine to.
+    ///
+    /// `None` is returned when the grants are unrestricted (root subtree — a
+    /// no-op sandbox) or when no filesystem scope resolves to an existing path
+    /// (an empty Landlock/Seatbelt ruleset would only stop the child from
+    /// loading its own binary, not usefully confine it — the plan layer, not
+    /// the OS sandbox, denies those). Otherwise each glob is reduced to its
+    /// longest concrete leading path (`/work/**` → `/work`) and non-existent
+    /// roots are dropped so the backend never fails closed on a typo'd path.
+    ///
+    /// Net policy is left [`NetPolicy::Unrestricted`] because no seccomp/netns
+    /// backend exists in this build — the plan-layer `NetConnect` verdict is
+    /// the honest gate; [`crate::EnforcementStatus::network_enforced`] already
+    /// reports `false`. `hermetic` is carried through from the principal.
+    pub fn to_sandbox_policy(&self) -> Option<SandboxPolicy> {
+        if self.is_fs_unrestricted() {
+            return None;
+        }
+        let read = grant_roots(&self.fs_read);
+        let write = grant_roots(&self.fs_write);
+        let delete = grant_roots(&self.fs_delete);
+        if read.is_empty() && write.is_empty() && delete.is_empty() {
+            return None;
+        }
+        Some(SandboxPolicy {
+            fs: FsSandbox {
+                read,
+                write,
+                delete,
+            },
+            net: NetPolicy::Unrestricted,
+            spawn_hash: None,
+            hermetic: self.hermetic,
+        })
+    }
+}
+
+fn has_glob_meta(s: &str) -> bool {
+    s.chars()
+        .any(|c| matches!(c, '*' | '?' | '[' | ']' | '{' | '}'))
+}
+
+/// The longest concrete (glob-free) leading path of a policy grant, expanding a
+/// leading `~/`. `/work/**` → `/work`; `/**` → `/`; `/etc/hosts` → `/etc/hosts`.
+/// `None` when the grant has no concrete anchor (e.g. `**/foo`).
+fn grant_root(grant: &str) -> Option<PathBuf> {
+    let expanded = if let Some(rest) = grant.strip_prefix("~/") {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default()
+            .join(rest)
+    } else {
+        PathBuf::from(grant)
+    };
+    let mut root = PathBuf::new();
+    for comp in expanded.components() {
+        match comp {
+            Component::RootDir | Component::Prefix(_) => root.push(comp.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                root.pop();
+            }
+            Component::Normal(seg) => {
+                if has_glob_meta(&seg.to_string_lossy()) {
+                    break;
+                }
+                root.push(seg);
+            }
+        }
+    }
+    (!root.as_os_str().is_empty()).then_some(root)
+}
+
+/// Does any grant in `grants` reduce to the filesystem root `/`?
+fn grants_include_root(grants: &[String]) -> bool {
+    grants
+        .iter()
+        .any(|g| grant_root(g).as_deref() == Some(Path::new("/")))
+}
+
+/// Concrete, existing subtree roots for a set of grants (sorted, de-duped).
+/// Non-existent roots are dropped: Landlock/Seatbelt open each path, so a
+/// grant for a path that is not there yet must not fail the whole spawn — it
+/// simply grants nothing, which is the fail-closed direction.
+fn grant_roots(grants: &[String]) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = grants
+        .iter()
+        .filter_map(|g| grant_root(g))
+        .filter(|p| p.exists())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 fn flatten_namespace(table: &mut toml::Table, namespace: &str, fields: &[&str]) {
@@ -602,6 +771,32 @@ pub fn apply_macos_sandbox(_: &FsSandbox) -> Result<EnforcementStatus, String> {
     Err("Seatbelt enforcement is only available on macOS".into())
 }
 
+/// Apply the strongest OS filesystem sandbox this platform has to the current
+/// process, immediately before exec in a child: Linux → [`apply_landlock`],
+/// macOS → [`apply_macos_sandbox`] (Seatbelt), otherwise an honest error.
+///
+/// This is the single per-platform entry point a spawn launcher (the
+/// `shoal-sandbox-exec` helper the exec layer wraps children through) should
+/// call, so the Seatbelt path on macOS is exercised exactly as Landlock is on
+/// Linux — macOS is first-class, not a stub. Like the backend it delegates to,
+/// this irreversibly restricts the calling thread/process and must only run in
+/// the child after fork.
+pub fn apply_sandbox(grants: &FsSandbox) -> Result<EnforcementStatus, String> {
+    #[cfg(target_os = "linux")]
+    {
+        apply_landlock(grants)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        apply_macos_sandbox(grants)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = grants;
+        Err("no OS sandbox backend for this platform".into())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -816,4 +1011,97 @@ opaque = "ask"
         assert!(!p.hermetic);
         assert!(p.fs.read.is_empty());
     }
+
+    #[test]
+    fn grant_root_reduces_globs_to_concrete_prefix() {
+        assert_eq!(grant_root("/work/**"), Some(PathBuf::from("/work")));
+        assert_eq!(grant_root("/**"), Some(PathBuf::from("/")));
+        assert_eq!(grant_root("/etc/hosts"), Some(PathBuf::from("/etc/hosts")));
+        assert_eq!(grant_root("/a/b*/c"), Some(PathBuf::from("/a")));
+        assert_eq!(grant_root("**/foo"), None);
+    }
+
+    #[test]
+    fn permissive_policy_is_fs_unrestricted_and_yields_no_sandbox() {
+        // The default-permissive policy must never wrap a spawn — that is the
+        // zero-regression guarantee. `sandbox_for` returns None so the child
+        // runs exactly as it does today.
+        let p = Policy::permissive("uid:1000");
+        assert!(p.principal("uid:1000").unwrap().is_fs_unrestricted());
+        assert!(p.sandbox_for("uid:1000").is_none());
+        // Every effect a normal command needs is allowed.
+        assert_eq!(
+            p.evaluate_effect(
+                "uid:1000",
+                &Effect::FsRead {
+                    paths: vec!["/anywhere/at/all".into()]
+                }
+            ),
+            Verdict::Allow
+        );
+    }
+
+    #[test]
+    fn scoped_policy_yields_a_sandbox_with_existing_roots_only() {
+        let d = tempfile::tempdir().unwrap();
+        let real = d.path().join("work");
+        fs::create_dir(&real).unwrap();
+        let src = format!(
+            "[principal.agent]\nhermetic=true\n\n[principal.agent.fs]\n\
+             read=[\"{}/**\", \"/does/not/exist/**\"]\nwrite=[\"{}/**\"]\n",
+            real.display(),
+            real.display()
+        );
+        let policy = Policy::from_toml(&src).unwrap();
+        let sandbox = policy.sandbox_for("agent").expect("scoped → Some sandbox");
+        // The existing root survives; the non-existent one is dropped.
+        assert_eq!(sandbox.fs.read, vec![real.clone()]);
+        assert_eq!(sandbox.fs.write, vec![real.clone()]);
+        assert!(sandbox.fs.delete.is_empty());
+        // `hermetic` is carried through from the principal.
+        assert!(sandbox.hermetic);
+        assert!(!policy.principal("agent").unwrap().is_fs_unrestricted());
+    }
+
+    #[test]
+    fn unscoped_or_unknown_principal_yields_no_sandbox() {
+        // A principal that declares no fs scope has nothing concrete to
+        // confine to (the plan layer denies its fs effects instead), and an
+        // unknown principal likewise never wraps a spawn.
+        let policy = Policy::from_toml("[principal.agent]\nopaque='deny'\n").unwrap();
+        assert!(policy.sandbox_for("agent").is_none());
+        assert!(policy.sandbox_for("nobody").is_none());
+    }
+
+    #[test]
+    fn load_user_or_permissive_reads_file_then_falls_back() {
+        let d = tempfile::tempdir().unwrap();
+        let cfg = d.path().join("shoal");
+        fs::create_dir_all(&cfg).unwrap();
+        fs::write(
+            cfg.join("leash.toml"),
+            "[principal.agent]\n\n[principal.agent.fs]\nread=[\"/srv/**\"]\n",
+        )
+        .unwrap();
+        // Point XDG_CONFIG_HOME at the fixture for the duration of this test.
+        // Serialized against other env-touching tests via a process-global lock.
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", d.path()) };
+        let loaded = Policy::load_user_or_permissive("uid:0");
+        // The file defines `agent`, not `uid:0`; the loaded policy reflects the
+        // file, so `uid:0` is unknown there (not permissive).
+        assert!(loaded.principal("agent").is_some());
+        assert!(loaded.principal("uid:0").is_none());
+        // With no config file, we get the permissive fallback for the principal.
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", d.path().join("empty")) };
+        let fallback = Policy::load_user_or_permissive("uid:0");
+        assert!(fallback.principal("uid:0").unwrap().is_fs_unrestricted());
+        match prev {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+    }
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }

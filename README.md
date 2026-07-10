@@ -21,6 +21,20 @@ protocol, so an AI agent never has to scrape a wall of bytes to know what happen
 
 ---
 
+## See it
+
+<div align="center">
+
+<img src="assets/demo.gif" alt="A real shoal terminal session: the colorized starship-style prompt, ls.where(.size &gt; 1b) rendering a typed table, a [3,1,2].sort().map(x =&gt; x * 10) dot-chain, 1.5gb + 500mb unit arithmetic, a fn defined and called like a command, and the no-pipe teaching diagnostic on ls | grep foo." width="720" />
+
+<sub>Real terminal output, captured over a PTY — nothing here is mocked up. The prompt is
+<code>$directory · $git_branch · $git_status · $reef · $character</code>; <code>!14?3</code> means
+14 unstaged files and 3 untracked.</sub>
+
+</div>
+
+---
+
 Shoal keeps ordinary terminal programs alive on a **real PTY** at the prompt — colors, progress
 bars, password prompts, and full‑screen TUIs behave exactly like they do in bash — but the moment
 a command's result participates in an expression, it becomes a **typed value** you can filter,

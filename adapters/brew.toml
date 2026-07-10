@@ -1,0 +1,20 @@
+# Homebrew runs on both macOS and Linux (Linuxbrew), so unlike
+# `systemctl`/`ip` this adapter is genuinely cross-platform as long as
+# `brew` itself is installed; no flag divergence between platforms.
+[cmd.brew]
+bin = "brew"
+class = "cli"
+ok_codes = [0]
+effects = ["net.connect(formulae.brew.sh:443)"]
+
+[cmd.brew.sub.list]
+params = { formula = "bool", cask = "bool" }
+output = { parse = "lines", type = "list<str>" }
+effects = ["fs.read(brew-cellar)"]
+
+[cmd.brew.sub.info]
+params = { name = "str?", cask = "bool" }
+positional = ["name"]
+invoke = ["info", "--json=v2"]
+output = { parse = "json", type = "record" }
+effects = ["net.connect(formulae.brew.sh:443)"]

@@ -1,0 +1,14 @@
+# Linux/systemd only: there is no macOS equivalent of systemctl or the
+# systemd unit model, so this adapter is intentionally not portable to
+# macOS -- like `docker`/`kubectl`, it names a specific ecosystem tool
+# rather than a POSIX-portable one. On a machine without systemd this
+# fails loudly with "command not found", the same honest failure mode as
+# any other missing binary; it does not silently return wrong data.
+[cmd.systemctl]
+bin = "systemctl"
+class = "cli"
+ok_codes = [0]
+params = { all = "bool", type = "str?", state = "str?" }
+flags = { short = { a = "all" } }
+invoke = ["list-units", "--output=json", "--no-pager"]
+output = { parse = "json", type = "table<{unit: str, load: str, active: str, sub: str, description: str}>" }

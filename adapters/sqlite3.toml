@@ -1,0 +1,13 @@
+# A query's result columns are inherently dynamic (whatever the SQL
+# selects), so `output.type` cannot promise a fixed field set the way
+# `table<{name: str, ...}>` does elsewhere -- it documents the shape
+# (a table whose columns vary per query) rather than a concrete schema.
+[cmd.sqlite3]
+bin = "sqlite3"
+class = "cli"
+ok_codes = [0]
+params = { database = "path", query = "str" }
+positional = ["database", "query"]
+invoke = ["-json"]
+output = { parse = "json", type = "table<dynamic per query>" }
+effects = ["fs.read($database)"]

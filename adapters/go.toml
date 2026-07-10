@@ -1,0 +1,19 @@
+# `go list -json` emits one pretty-printed JSON object per package with no
+# separator between them when given multiple targets, which matches
+# neither this crate's line-oriented `ndjson` shape (`{"A":1}\n{"B":2}\n`)
+# nor a single `json` document for anything but one package. This adapter
+# is scoped to the common single-target case (`go list -json .` / `go list
+# -json ./pkg`), which yields exactly one JSON object and parses cleanly
+# as a record; multi-package queries are out of scope rather than given a
+# parse this crate cannot make honest.
+[cmd.go]
+bin = "go"
+class = "cli"
+ok_codes = [0]
+
+[cmd.go.sub.list]
+params = { package = "str?" }
+positional = ["package"]
+invoke = ["list", "-json"]
+output = { parse = "json", type = "record" }
+effects = ["fs.read(cwd)", "net.connect(proxy.golang.org:443)"]

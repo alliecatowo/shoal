@@ -382,6 +382,12 @@ impl Evaluator {
             .map(|x| x.to_string_lossy())
             .collect::<Vec<_>>()
             .join(" ");
+        // TDD §8 leash activation: under a scoped leash policy, wrap the child
+        // in the strongest available OS backend (Landlock/Seatbelt) before
+        // exec. `resolve_sandbox` returns `None` for the default-permissive
+        // policy (and when no policy is installed), so this is a pure no-op on
+        // the normal path — the child spawns exactly as before.
+        let sandbox = self.resolve_sandbox();
         let r = shoal_exec::run(
             ExecSpec {
                 argv,
@@ -389,7 +395,7 @@ impl Evaluator {
                 env,
                 stdin,
                 mode,
-                sandbox: None,
+                sandbox,
             },
             &self.cancel,
         )

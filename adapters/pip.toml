@@ -1,0 +1,10 @@
+[cmd.pip]
+bin = "pip"
+class = "cli"
+ok_codes = [0]
+
+[cmd.pip.sub.list]
+params = { outdated = "bool", user = "bool" }
+invoke = ["list", "--format", "json"]
+output = { parse = "json", type = "table<{name: str, version: str}>" }
+effects = ["fs.read(cwd)", "net.connect(pypi.org:443)"]
