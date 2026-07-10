@@ -142,8 +142,11 @@ fn execspec_sandbox_via_spawn_capture_reports_enforcement_on_wait() {
 
 #[test]
 fn execspec_sandbox_degrades_honestly_when_no_backend_is_available() {
-    if shoal_leash::landlock_abi().is_some() {
-        eprintln!("Landlock available in this environment; degrade path not reachable, skip");
+    // The degrade path is only reachable where NO OS backend exists. macOS
+    // always has the Seatbelt backend (so a requested sandbox really confines
+    // the child), and Linux with Landlock likewise — skip in either case.
+    if shoal_leash::landlock_abi().is_some() || cfg!(target_os = "macos") {
+        eprintln!("an OS sandbox backend is available; degrade path not reachable, skip");
         return;
     }
     // No Landlock (older kernel / container that blocks the syscall): the
