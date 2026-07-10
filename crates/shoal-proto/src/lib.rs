@@ -219,10 +219,59 @@ pub struct ExecResult {
     pub render: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanApplyParams {
+    pub plan_ref: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapRequestParams {
+    pub plan_ref: Option<String>,
+    #[serde(default)]
+    pub effects: Vec<Value>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanResult {
+    pub plan_ref: String,
+    pub effects: Vec<Value>,
+    pub reversibility: String,
+    pub verdict: String,
+    pub approval_pending: bool,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValueGetParams {
     pub r#ref: Ref,
     pub path: Option<String>,
     pub slice: Option<[usize; 2]>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct JournalQueryParams {
+    pub since: Option<i64>,
+    pub principal: Option<String>,
+    pub head: Option<String>,
+    pub ok: Option<bool>,
+    #[serde(default)]
+    pub limit: usize,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JournalOutput {
+    pub kind: String,
+    pub hash: String,
+    pub len: i64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JournalEntry {
+    pub id: i64,
+    pub session: String,
+    pub principal: String,
+    pub ts: i64,
+    pub dur_ns: Option<i64>,
+    pub cwd: WirePath,
+    pub src: String,
+    pub ast: Value,
+    pub effects: Value,
+    pub status: Option<i32>,
+    pub ok: Option<bool>,
+    pub opaque: bool,
+    pub outputs: Vec<JournalOutput>,
 }
 
 #[cfg(test)]

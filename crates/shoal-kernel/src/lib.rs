@@ -2,21 +2,37 @@
 
 use serde_json::{Value as Json, json};
 use shoal_eval::Evaluator;
+use shoal_journal::{EntryRecord, Journal, JournalQuery};
+use shoal_leash::{Effect, Estimates, Plan, Policy, Reversibility, Verdict};
 use shoal_proto::*;
 use shoal_value::Value;
 use std::collections::HashMap;
 use std::io::{self, BufReader};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub struct Kernel {
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     next_client: AtomicU64,
+    journal: Mutex<Journal>,
+    policy: Policy,
+    plans: Mutex<HashMap<String, StoredPlan>>,
+}
+
+struct StoredPlan {
+    src: String,
+    session: String,
+    principal: String,
+    plan: Plan,
+    approved: bool,
 }
 
 struct Session {
+    id: String,
     evaluator: Mutex<Evaluator>,
     transcript: Mutex<HashMap<Ref, Value>>,
     client_it: Mutex<HashMap<u64, Ref>>,
@@ -28,6 +44,29 @@ impl Kernel {
         Arc::new(Self {
             sessions: Mutex::new(HashMap::new()),
             next_client: AtomicU64::new(1),
+            journal: Mutex::new(Journal::in_memory().expect("in-memory journal")),
+            policy: permissive_policy(),
+            plans: Mutex::new(HashMap::new()),
+        })
+    }
+
+    pub fn open(state_dir: impl AsRef<Path>) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
+        Ok(Arc::new(Self {
+            sessions: Mutex::new(HashMap::new()),
+            next_client: AtomicU64::new(1),
+            journal: Mutex::new(Journal::open(state_dir.as_ref())?),
+            policy: permissive_policy(),
+            plans: Mutex::new(HashMap::new()),
+        }))
+    }
+
+    pub fn with_policy(policy: Policy) -> Arc<Self> {
+        Arc::new(Self {
+            sessions: Mutex::new(HashMap::new()),
+            next_client: AtomicU64::new(1),
+            journal: Mutex::new(Journal::in_memory().expect("in-memory journal")),
+            policy,
+            plans: Mutex::new(HashMap::new()),
         })
     }
 
@@ -94,7 +133,7 @@ impl Kernel {
                 encode(AttachResult {
                     session: name,
                     principal: format!("uid:{}", unsafe { libc_geteuid() }),
-                    caps: json!({"enforced":false}),
+                    caps: json!({"enforced":false,"tier":"D","policy_principal":principal(),"opaque":verdict_name(self.policy.evaluate_effect(&principal(), &Effect::Opaque))}),
                     cwd: WirePath::encode(&cwd),
                     env_hash: "local".into(),
                     ast_version: 1,
@@ -112,12 +151,70 @@ impl Kernel {
             "exec" => {
                 let session = attached.as_ref().ok_or_else(not_attached)?;
                 let params: ExecParams = decode(request.params)?;
-                if params.mode != "run" {
+                if params.mode == "plan" {
+                    shoal_syntax::parse(&params.src).map_err(|e| RpcError {
+                        code: -32001,
+                        message: e.msg,
+                        data: Some(json!({"span":e.span,"hint":e.hint})),
+                    })?;
+                    let plan = Plan::new(
+                        vec![Effect::Opaque],
+                        Reversibility::Unknown,
+                        Estimates::default(),
+                    );
+                    let verdict = self.policy.evaluate_plan(&principal(), &plan);
+                    let result = PlanResult {
+                        plan_ref: plan.plan_ref.clone(),
+                        effects: plan
+                            .effects
+                            .iter()
+                            .map(|e| serde_json::to_value(e).unwrap())
+                            .collect(),
+                        reversibility: "unknown".into(),
+                        verdict: verdict_name(verdict).into(),
+                        approval_pending: verdict == Verdict::ApprovalRequired,
+                    };
+                    self.plans.lock().unwrap().insert(
+                        plan.plan_ref.clone(),
+                        StoredPlan {
+                            src: params.src,
+                            session: session.id.clone(),
+                            principal: principal(),
+                            plan,
+                            approved: verdict == Verdict::Allow,
+                        },
+                    );
+                    return encode(result);
+                } else if params.mode != "run" && params.mode != "approved" {
                     return Err(RpcError {
-                        code: -32003,
-                        message: "plan mode is not implemented".into(),
+                        code: -32602,
+                        message: "mode must be run or plan".into(),
                         data: None,
                     });
+                }
+                if params.mode == "run" {
+                    let direct_plan = Plan::new(
+                        vec![Effect::Opaque],
+                        Reversibility::Unknown,
+                        Estimates::default(),
+                    );
+                    match self.policy.evaluate_plan(&principal(), &direct_plan) {
+                        Verdict::Deny => {
+                            return Err(RpcError {
+                                code: -32010,
+                                message: "leash denied opaque execution".into(),
+                                data: None,
+                            });
+                        }
+                        Verdict::ApprovalRequired => {
+                            return Err(RpcError {
+                                code: -32011,
+                                message: "approval required; plan first".into(),
+                                data: None,
+                            });
+                        }
+                        Verdict::Allow => {}
+                    }
                 }
                 let ast = shoal_syntax::parse(&params.src).map_err(|e| RpcError {
                     code: -32001,
@@ -126,7 +223,28 @@ impl Kernel {
                 })?;
                 let mut evaluator = session.evaluator.lock().unwrap();
                 evaluator.interactive = false;
-                let value = evaluator.eval_program(&ast).map_err(|e| RpcError { code: -32002, message: e.msg, data: Some(json!({"code":e.code,"span":e.span,"hint":e.hint,"status":e.status,"stderr":e.stderr})) })?;
+                let started = Instant::now();
+                let entry_id = self
+                    .journal
+                    .lock()
+                    .unwrap()
+                    .append(&EntryRecord {
+                        session: session.id.clone(),
+                        principal: principal(),
+                        ts_ns: now_ns(),
+                        cwd: evaluator.cwd().as_os_str().as_bytes().to_vec(),
+                        src: params.src.clone(),
+                        ast_json: serde_json::to_string(&ast).map_err(internal)?,
+                        effects_json: "[\"opaque\"]".into(),
+                        opaque: true,
+                    })
+                    .map_err(internal)?;
+                let value = evaluator.eval_program(&ast).map_err(|e| {
+                    let journal = self.journal.lock().unwrap();
+                    let _ = journal.finish(entry_id, e.status, false, elapsed_ns(started));
+                    if let Some(stderr) = &e.stderr { let _ = journal.record_output(entry_id, "stderr", stderr.as_bytes()); }
+                    RpcError { code: -32002, message: e.msg, data: Some(json!({"code":e.code,"span":e.span,"hint":e.hint,"status":e.status,"stderr":e.stderr})) }
+                })?;
                 let value_ref = Ref::new("out", session.next_value.fetch_add(1, Ordering::Relaxed));
                 session
                     .transcript
@@ -138,10 +256,39 @@ impl Kernel {
                     .lock()
                     .unwrap()
                     .insert(client, value_ref.clone());
+                let render = shoal_value::render::render_block(&value, 80);
+                {
+                    let journal = self.journal.lock().unwrap();
+                    journal
+                        .finish(entry_id, Some(0), true, elapsed_ns(started))
+                        .map_err(internal)?;
+                    journal
+                        .record_output(
+                            entry_id,
+                            "value",
+                            &serde_json::to_vec(&wire_value(&value)).map_err(internal)?,
+                        )
+                        .map_err(internal)?;
+                    if !render.is_empty() {
+                        journal
+                            .record_output(entry_id, "render", render.as_bytes())
+                            .map_err(internal)?;
+                    }
+                    if let Value::Outcome(out) = &value {
+                        journal
+                            .record_output(entry_id, "stdout", &out.stdout)
+                            .map_err(internal)?;
+                        if !out.stderr.is_empty() {
+                            journal
+                                .record_output(entry_id, "stderr", &out.stderr)
+                                .map_err(internal)?;
+                        }
+                    }
+                }
                 encode(ExecResult {
                     r#ref: value_ref,
                     value: Some(wire_value(&value)),
-                    render: Some(shoal_value::render::render_block(&value, 80)),
+                    render: Some(render),
                 })
             }
             "value.get" => {
@@ -165,6 +312,121 @@ impl Kernel {
                 encode(json!({"ref":params.r#ref,"value":wire}))
             }
             "task.list" => encode(json!([])),
+            "plan.apply" => {
+                let session = attached.as_ref().ok_or_else(not_attached)?;
+                let p: PlanApplyParams = decode(request.params)?;
+                let plans = self.plans.lock().unwrap();
+                let stored = plans.get(&p.plan_ref).ok_or_else(|| RpcError {
+                    code: -32012,
+                    message: "unknown plan_ref".into(),
+                    data: None,
+                })?;
+                if stored.session != session.id || stored.principal != principal() {
+                    return Err(RpcError {
+                        code: -32010,
+                        message: "plan belongs to another principal/session".into(),
+                        data: None,
+                    });
+                }
+                if !stored.approved
+                    && self.policy.evaluate_plan(&principal(), &stored.plan) != Verdict::Allow
+                {
+                    return Err(RpcError {
+                        code: -32011,
+                        message: "plan approval pending".into(),
+                        data: None,
+                    });
+                }
+                let src = stored.src.clone();
+                drop(plans);
+                let response = self.dispatch(
+                    Request {
+                        jsonrpc: JSONRPC.into(),
+                        id: Json::Null,
+                        method: "exec".into(),
+                        params: serde_json::to_value(ExecParams {
+                            src,
+                            mode: "approved".into(),
+                            position: "stmt".into(),
+                        })
+                        .unwrap(),
+                    },
+                    client,
+                    attached,
+                );
+                response.result.ok_or_else(|| {
+                    response
+                        .error
+                        .unwrap_or_else(|| internal("plan apply failed"))
+                })
+            }
+            "cap.request" => {
+                let p: CapRequestParams = decode(request.params)?;
+                let Some(plan_ref) = p.plan_ref else {
+                    return Err(RpcError {
+                        code: -32602,
+                        message: "plan_ref is required".into(),
+                        data: None,
+                    });
+                };
+                let mut plans = self.plans.lock().unwrap();
+                let stored = plans.get_mut(&plan_ref).ok_or_else(|| RpcError {
+                    code: -32012,
+                    message: "unknown plan_ref".into(),
+                    data: None,
+                })?;
+                if self.policy.evaluate_plan(&stored.principal, &stored.plan) == Verdict::Deny {
+                    return Err(RpcError {
+                        code: -32010,
+                        message: "policy denies requested effects".into(),
+                        data: None,
+                    });
+                }
+                stored.approved = true;
+                encode(json!({"grant":"approved","plan_ref":plan_ref,"enforced":false}))
+            }
+            "journal.query" => {
+                let p: JournalQueryParams = decode(request.params)?;
+                let rows = self
+                    .journal
+                    .lock()
+                    .unwrap()
+                    .query(&JournalQuery {
+                        since_ts_ns: p.since,
+                        principal: p.principal,
+                        head: p.head,
+                        ok: p.ok,
+                        limit: p.limit,
+                    })
+                    .map_err(internal)?;
+                let entries: Vec<JournalEntry> = rows
+                    .into_iter()
+                    .map(|r| JournalEntry {
+                        id: r.id,
+                        session: r.session,
+                        principal: r.principal,
+                        ts: r.ts_ns,
+                        dur_ns: r.dur_ns,
+                        cwd: WirePath::encode(&std::ffi::OsString::from_vec(r.cwd)),
+                        src: r.src,
+                        ast: serde_json::from_str(&r.ast_json).unwrap_or(Json::Null),
+                        effects: serde_json::from_str(&r.effects_json).unwrap_or(Json::Null),
+                        status: r.status,
+                        ok: r.ok,
+                        opaque: r.opaque,
+                        outputs: r
+                            .outputs
+                            .into_iter()
+                            .map(|o| JournalOutput {
+                                kind: o.kind,
+                                hash: o.hash,
+                                len: o.len,
+                            })
+                            .collect(),
+                    })
+                    .collect();
+                encode(entries)
+            }
             _ => Err(RpcError {
                 code: -32601,
                 message: "method not found".into(),
@@ -189,6 +451,7 @@ impl Kernel {
         }
         let cwd = std::env::current_dir()?;
         let session = Arc::new(Session {
+            id: name.into(),
             evaluator: Mutex::new(Evaluator::new(cwd)),
             transcript: Mutex::new(HashMap::new()),
             client_it: Mutex::new(HashMap::new()),
@@ -221,6 +484,33 @@ fn not_attached() -> RpcError {
         code: -32000,
         message: "attach to a session first".into(),
         data: None,
+    }
+}
+fn principal() -> String {
+    format!("uid:{}", unsafe { libc_geteuid() })
+}
+fn now_ns() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .min(i64::MAX as u128) as i64
+}
+fn elapsed_ns(start: Instant) -> i64 {
+    start.elapsed().as_nanos().min(i64::MAX as u128) as i64
+}
+fn permissive_policy() -> Policy {
+    Policy::from_toml(&format!(
+        "[principal.\"{}\"]\nopaque='allow'\nauto_apply='in-grant'\njournal_read=true\n",
+        principal()
+    ))
+    .expect("built-in policy")
+}
+fn verdict_name(v: Verdict) -> &'static str {
+    match v {
+        Verdict::Allow => "allow",
+        Verdict::Deny => "deny",
+        Verdict::ApprovalRequired => "approval_required",
     }
 }
 unsafe fn libc_geteuid() -> u32 {
@@ -287,7 +577,8 @@ mod tests {
         let (mut client, server) = UnixStream::pair().unwrap();
         let mut reader = BufReader::new(client.try_clone().unwrap());
         let kernel = Kernel::new();
-        let thread = std::thread::spawn(move || kernel.handle_stream(server).unwrap());
+        let server_kernel = kernel.clone();
+        let thread = std::thread::spawn(move || server_kernel.handle_stream(server).unwrap());
         assert!(
             call(
                 &mut client,
@@ -319,8 +610,112 @@ mod tests {
                 .error
                 .is_none()
         );
+        let journal = call(
+            &mut client,
+            &mut reader,
+            6,
+            "journal.query",
+            json!({"limit":10}),
+        );
+        let entries = journal.result.unwrap();
+        assert_eq!(entries[0]["src"], "1 + 2");
+        assert_eq!(entries[0]["ok"], true);
+        assert!(
+            entries[0]["outputs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|o| o["kind"] == "value"
+                    && o["len"].as_i64().unwrap() > 0
+                    && o["hash"].as_str().unwrap().len() == 64)
+        );
+        let value_hash = entries[0]["outputs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["kind"] == "value")
+            .unwrap()["hash"]
+            .as_str()
+            .unwrap();
+        let blob = kernel
+            .journal
+            .lock()
+            .unwrap()
+            .read_blob(value_hash)
+            .unwrap()
+            .unwrap();
+        assert!(String::from_utf8(blob).unwrap().contains("\"v\":3"));
         drop(client);
         drop(reader);
         thread.join().unwrap();
+    }
+
+    #[test]
+    fn leash_plan_approval_and_denial_flow() {
+        for (opaque, expected, approvable) in
+            [("ask", "approval_required", true), ("deny", "deny", false)]
+        {
+            let policy = Policy::from_toml(&format!(
+                "[principal.\"{}\"]\nopaque='{opaque}'\nauto_apply='never'\n",
+                principal()
+            ))
+            .unwrap();
+            let kernel = Kernel::with_policy(policy);
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let mut reader = BufReader::new(client.try_clone().unwrap());
+            let server_kernel = kernel.clone();
+            let thread = std::thread::spawn(move || server_kernel.handle_stream(server).unwrap());
+            call(
+                &mut client,
+                &mut reader,
+                1,
+                "session.attach",
+                json!({"client":{"kind":"agent","tty":false}}),
+            );
+            let planned = call(
+                &mut client,
+                &mut reader,
+                2,
+                "exec",
+                json!({"src":"1 + 2","mode":"plan","position":"stmt"}),
+            );
+            let result = planned.result.unwrap();
+            assert_eq!(result["verdict"], expected);
+            let plan_ref = result["plan_ref"].as_str().unwrap();
+            assert!(
+                call(
+                    &mut client,
+                    &mut reader,
+                    3,
+                    "plan.apply",
+                    json!({"plan_ref":plan_ref})
+                )
+                .error
+                .is_some()
+            );
+            let grant = call(
+                &mut client,
+                &mut reader,
+                4,
+                "cap.request",
+                json!({"plan_ref":plan_ref,"effects":[]}),
+            );
+            if approvable {
+                assert!(grant.error.is_none());
+                let applied = call(
+                    &mut client,
+                    &mut reader,
+                    5,
+                    "plan.apply",
+                    json!({"plan_ref":plan_ref}),
+                );
+                assert_eq!(applied.result.unwrap()["value"]["v"], 3);
+            } else {
+                assert!(grant.error.is_some());
+            }
+            drop(client);
+            drop(reader);
+            thread.join().unwrap();
+        }
     }
 }
