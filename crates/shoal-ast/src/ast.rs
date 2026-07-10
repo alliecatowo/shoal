@@ -272,10 +272,13 @@ pub enum Expr {
         handler: Box<Expr>,
         span: Span,
     },
-    /// `with cwd: p, env: {…} { body }`
+    /// `with cwd: p, env: {…}, reef: {…} { body }`
     With {
         cwd: Option<Box<Expr>>,
         env: Option<Box<Expr>>,
+        /// `reef: {tool: constraint, …}` — dynamic reef scoping (REEF.md §6).
+        /// Additive: existing `With` nodes parse with `reef: None`.
+        reef: Option<Box<Expr>>,
         body: Block,
         span: Span,
     },

@@ -58,6 +58,10 @@ pub struct Evaluator {
     /// zero-regression path. Hosts wire a real path via
     /// [`Evaluator::set_reef_user_manifest`]; tests never point at real config.
     reef_user_manifest: Option<PathBuf>,
+    /// reef: `with reef: {tool: constraint, …} { }` override layers (REEF.md
+    /// §6), nearest-first (innermost `with reef:` block wins). Empty and inert
+    /// when no `with reef:` is on the dynamic stack — zero-regression.
+    reef_overrides: Vec<shoal_reef::ScopeEntry>,
 }
 
 enum Flow {
@@ -94,6 +98,7 @@ impl Evaluator {
             reef_lock: shoal_reef::Lockfile::new(),
             reef_lock_path: None,
             reef_user_manifest: None,
+            reef_overrides: Vec::new(),
         }
     }
 
@@ -844,9 +849,13 @@ impl Evaluator {
                 span,
                 None,
             ),
-            Expr::With { cwd, env, body, .. } => {
-                self.eval_with(cwd.as_deref(), env.as_deref(), body)
-            }
+            Expr::With {
+                cwd,
+                env,
+                reef,
+                body,
+                ..
+            } => self.eval_with(cwd.as_deref(), env.as_deref(), reef.as_deref(), body),
             Expr::Spawn { body, .. } => self.spawn_block(body.clone()),
             Expr::Match {
                 scrutinee, arms, ..
@@ -1513,11 +1522,20 @@ impl Evaluator {
                 self.plan_expr(start, functions, aliases, out, depth)?;
                 self.plan_expr(end, functions, aliases, out, depth)
             }
-            Expr::With { cwd, env, body, .. } => {
+            Expr::With {
+                cwd,
+                env,
+                reef,
+                body,
+                ..
+            } => {
                 if let Some(e) = cwd {
                     self.plan_expr(e, functions, aliases, out, depth)?
                 }
                 if let Some(e) = env {
+                    self.plan_expr(e, functions, aliases, out, depth)?
+                }
+                if let Some(e) = reef {
                     self.plan_expr(e, functions, aliases, out, depth)?
                 }
                 self.plan_block(body, functions, aliases, out, depth)
@@ -2112,6 +2130,7 @@ impl Evaluator {
         &mut self,
         cwd: Option<&Expr>,
         env_expr: Option<&Expr>,
+        reef_expr: Option<&Expr>,
         body: &Block,
     ) -> VResult<Value> {
         let old_cwd = self.cwd.clone();
@@ -2133,7 +2152,27 @@ impl Evaluator {
                 self.process_env.push((k.into(), val));
             }
         }
+        // `with reef: {tool: constraint, …} { }` — dynamic reef scoping
+        // (REEF.md §6), pushed as an override layer for the block's dynamic
+        // extent and popped on every exit path below, mirroring cwd/env.
+        let mut pushed_reef = false;
+        if let Some(e) = reef_expr {
+            let Value::Record(r) = self.eval_expr(e, Position::Value)? else {
+                self.cwd = old_cwd;
+                self.process_env = old_env;
+                return Err(ErrorVal::new("type_error", "with reef expects record"));
+            };
+            if let Err(err) = self.push_reef_override(&r) {
+                self.cwd = old_cwd;
+                self.process_env = old_env;
+                return Err(err);
+            }
+            pushed_reef = true;
+        }
         let out = self.block_value(body);
+        if pushed_reef {
+            self.pop_reef_override();
+        }
         self.cwd = old_cwd;
         self.process_env = old_env;
         out

@@ -362,6 +362,47 @@ impl<'s> Parser<'s> {
                 }
             }
 
+            // `env.NAME = v` — session environment write (TDD §4.6): the
+            // assignment lvalue additionally accepts a single-hop `Field`
+            // target rooted at `env`, checked with the same tolerant,
+            // restore-on-mismatch lookahead as the bare-identifier case below
+            // so a non-`=` `env.NAME` (a plain read) falls through unchanged
+            // to the ident-adjacency / command dispatch that follows.
+            if name == "env" {
+                let save = self.pos;
+                self.bump(Mode::Expr)?; // `env`
+                if let Ok((Tok::Dot, _)) = self.peek(Mode::Expr) {
+                    self.bump(Mode::Expr)?; // `.`
+                    if let Ok((Tok::Ident(field), field_span)) = self.peek(Mode::Expr) {
+                        self.bump(Mode::Expr)?; // NAME
+                        let next = self.peek(Mode::Expr).map(|x| x.0).unwrap_or(Tok::Eof);
+                        if matches!(
+                            next,
+                            Tok::Eq | Tok::PlusEq | Tok::MinusEq | Tok::StarEq | Tok::SlashEq
+                        ) {
+                            let target = Expr::Field {
+                                recv: Box::new(Expr::Var {
+                                    name: "env".into(),
+                                    span: s,
+                                }),
+                                name: field,
+                                optional: false,
+                                span: Span::new(s.start as usize, field_span.end as usize),
+                            };
+                            let (op, _) = self.bump(Mode::Expr)?;
+                            let value = self.expr(0)?;
+                            return Ok(Stmt::Assign {
+                                target,
+                                op: assign_op(op),
+                                value,
+                                span: Span::new(start, self.pos),
+                            });
+                        }
+                    }
+                }
+                self.pos = save;
+            }
+
             // Assignment lookahead — tolerant of CMD-only tokens after the head
             // (e.g. a lone `&`, eval-audit #7): a peek error means "not `=`".
             let save = self.pos;
@@ -1327,6 +1368,7 @@ impl<'s> Parser<'s> {
     fn with_expr(&mut self, start: usize) -> ParseResult<Expr> {
         let mut cwd = None;
         let mut env = None;
+        let mut reef = None;
         loop {
             let (name, s) = self.ident()?;
             self.expect(Mode::Expr, Tok::Colon, "`:`")?;
@@ -1334,7 +1376,8 @@ impl<'s> Parser<'s> {
             match name.as_str() {
                 "cwd" => cwd = Some(Box::new(value)),
                 "env" => env = Some(Box::new(value)),
-                _ => return Err(ParseError::new("with accepts only cwd and env", s)),
+                "reef" => reef = Some(Box::new(value)),
+                _ => return Err(ParseError::new("with accepts only cwd, env, and reef", s)),
             }
             if self.eat(Mode::Expr, &Tok::Comma)?.is_none() {
                 break;
@@ -1344,6 +1387,7 @@ impl<'s> Parser<'s> {
         Ok(Expr::With {
             cwd,
             env,
+            reef,
             body,
             span: Span::new(start, self.pos),
         })

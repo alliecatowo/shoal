@@ -80,15 +80,19 @@ error_contains = "with cwd:"
 [[case]]
 name = "reef-env-assign-inside-fn-body-is-illegal"
 # TDD §4.6: `env.NAME = v` is illegal inside `fn` bodies, same rule as `cd`.
-# `env.NAME = v` as a dotted assignment target isn't accepted by the
-# source-level parser yet (the assignment lookahead only recognizes a bare
-# identifier head, not a `Field` target) — only exercised via direct AST
-# construction in shoal-eval's own unit test today. Spec-true; skip until
-# the parser accepts a field-path assignment target.
+# The assignment lookahead now accepts a `Field` target rooted at `env`
+# (a single dotted hop), so this is source-parsed for real.
 src = "fn f() { env.FOO = \"x\" }\nf()"
 error = "custom"
 error_contains = "with env:"
-skip = "env.NAME = v as a source-parsed assignment target isn't wired into shoal-syntax's assignment lookahead yet (dotted target only reachable via direct AST construction)"
+
+[[case]]
+name = "reef-env-assign-writes-session-env-for-a-child"
+# TDD §4.6: `env.NAME = v` at session top level is a legal, journaled write
+# that a subsequently spawned child observes — the sourced counterpart of
+# defect11_env_assignment_writes_session_env's direct-AST unit test.
+src = "env.SHOAL_REEF_ENV_ASSIGN = \"via-assign\"\nsh { printf '%s' \"$SHOAL_REEF_ENV_ASSIGN\" }.out"
+value = '"via-assign"'
 
 [[case]]
 name = "reef-env-with-block-sets-var-during"
@@ -118,12 +122,34 @@ src = "reef"
 skip = "the reef binding table enumerates whatever tools the host session has actually resolved — inherently host-inventory-dependent, not a fixed corpus expectation"
 
 [[case]]
-name = "reef-with-reef-dynamic-scope-not-wired"
+name = "reef-with-reef-dynamic-scope-parses-and-evals"
 # REEF.md §6: `with reef: {node: "20"} { … }` — dynamic scoping like `with
-# cwd:`/`with env:`. `with` only carries `cwd`/`env` fields today (TDD
-# §4.6); a `reef` field isn't parsed/evaluated by `Expr::With` yet.
+# cwd:`/`with env:`. `Expr::With` now carries an additive `reef` field the
+# parser/evaluator both wire up; an empty body is a pure no-op that just
+# yields the block's (null) value.
 src = 'with reef: {node: "20"} { }'
-skip = "`with` only supports cwd/env fields today (TDD S4.6); reef dynamic scoping (REEF.md S6) isn't a recognized `with` field in shoal-eval yet"
+value = "null"
+
+[[case]]
+name = "reef-with-reef-constrains-a-spawn-inside-the-block"
+# The override layer REEF.md §6 describes is highest-priority scope: a spawn
+# head it constrains resolves through the override exactly like a real
+# manifest would. Script policy (non-interactive) treats a constrained-but-
+# unlocked tool as a hard `reef_unlocked` error (resolve.rs) rather than
+# ever falling back to an ambient-PATH lookup — deterministic proof the
+# override chain is actually consulted, not just parsed, since a bare
+# command-not-found would instead surface plain `not_found`.
+src = 'with reef: {"shoal-reef-fake-tool-9f3a": "1"} { ^shoal-reef-fake-tool-9f3a }'
+error = "reef_unlocked"
+
+[[case]]
+name = "reef-with-reef-restores-after-block"
+# TDD §4.6's restore-on-any-exit-path guarantee, extended to `with reef:`
+# (REEF.md §6): once the block exits, the override no longer constrains the
+# same head, so the same spawn now fails as an ordinary missing command
+# (`not_found`), not `reef_not_found`.
+src = "with reef: {\"shoal-reef-fake-tool-9f3a\": \"1\"} { }\n^shoal-reef-fake-tool-9f3a"
+error = "not_found"
 
 [[case]]
 name = "reef-project-scope-reef-toml-walk-not-wired"

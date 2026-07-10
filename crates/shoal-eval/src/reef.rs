@@ -11,7 +11,7 @@ use super::*;
 
 use shoal_reef::{
     Binding, LockNotice, ManifestKind, Policy, ProviderCtx, ResolutionReport, Resolver, ScopeChain,
-    ViewConfig, default_view_root, synth_path,
+    ScopeEntry, ViewConfig, default_view_root, synth_path,
 };
 
 impl Evaluator {
@@ -44,11 +44,59 @@ impl Evaluator {
         self.reef_chain = Some((self.cwd.clone(), chain));
     }
 
-    /// A clone of the current scope chain (cheap: manifests are small maps). The
-    /// clone frees `self` for the resolver/lock mutations that follow.
+    /// A clone of the current scope chain (cheap: manifests are small maps),
+    /// with any active `with reef:` override layers (REEF.md §6) prepended —
+    /// nearest-first, so the innermost `with reef:` block wins ties, then the
+    /// discovered manifest chain. The clone frees `self` for the resolver/lock
+    /// mutations that follow, and never mutates the cached `reef_chain` (so
+    /// popping an override always restores exactly the cached chain).
     fn reef_chain_snapshot(&mut self) -> ScopeChain {
         self.ensure_reef_chain();
-        self.reef_chain.as_ref().expect("just ensured").1.clone()
+        let mut chain = self.reef_chain.as_ref().expect("just ensured").1.clone();
+        if !self.reef_overrides.is_empty() {
+            let mut scopes: Vec<ScopeEntry> = self.reef_overrides.iter().rev().cloned().collect();
+            scopes.append(&mut chain.scopes);
+            chain.scopes = scopes;
+        }
+        chain
+    }
+
+    /// Push a `with reef: {tool: constraint, …}` override layer for the
+    /// dynamic extent of a block (REEF.md §6), minted from a plain record of
+    /// tool name -> version-constraint string. Highest priority: it out-ranks
+    /// every discovered manifest and every previously-pushed override while
+    /// active. Pop with [`Evaluator::pop_reef_override`] on every exit path.
+    pub(crate) fn push_reef_override(&mut self, record: &Record) -> VResult<()> {
+        let mut tools = std::collections::BTreeMap::new();
+        for (k, v) in record {
+            let Value::Str(s) = v else {
+                return Err(ErrorVal::type_error(format!(
+                    "with reef: expects {{tool: \"constraint\"}}, found {} for `{k}`",
+                    v.type_name()
+                )));
+            };
+            tools.insert(
+                k.clone(),
+                shoal_reef::ToolReq::new(shoal_reef::Constraint::parse(s)),
+            );
+        }
+        self.reef_overrides.push(ScopeEntry {
+            kind: ManifestKind::Reef,
+            source: PathBuf::from("<with reef:>"),
+            manifest: shoal_reef::ReefManifest {
+                tools,
+                runners: Default::default(),
+                hermetic: false,
+            },
+            mtime: None,
+        });
+        Ok(())
+    }
+
+    /// Pop the most recently pushed `with reef:` override layer. A no-op past
+    /// the bottom of the stack (defensive; callers always balance push/pop).
+    pub(crate) fn pop_reef_override(&mut self) {
+        self.reef_overrides.pop();
     }
 
     /// The lazily-built provider stack (REEF §3). Only ever called once a
@@ -60,9 +108,13 @@ impl Evaluator {
         self.reef_resolver.as_ref().expect("just set").clone()
     }
 
-    /// True when at least one manifest constrains something in the current
-    /// scope. The single gate that keeps the no-manifest world untouched.
+    /// True when at least one manifest — discovered or a `with reef:`
+    /// override — constrains something in the current scope. The single gate
+    /// that keeps the no-manifest world untouched.
     fn reef_manifest_in_scope(&mut self) -> bool {
+        if !self.reef_overrides.is_empty() {
+            return true;
+        }
         self.ensure_reef_chain();
         !self
             .reef_chain

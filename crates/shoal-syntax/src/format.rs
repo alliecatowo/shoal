@@ -291,11 +291,18 @@ fn expr(e: &Expr) -> String {
             binder.as_ref().map(|b| format!(" {b}")).unwrap_or_default(),
             expr(handler)
         ),
-        Expr::With { cwd, env, body, .. } => format!(
+        Expr::With {
+            cwd,
+            env,
+            reef,
+            body,
+            ..
+        } => format!(
             "with {} {}",
             [
                 cwd.as_ref().map(|x| format!("cwd: {}", expr(x))),
-                env.as_ref().map(|x| format!("env: {}", expr(x)))
+                env.as_ref().map(|x| format!("env: {}", expr(x))),
+                reef.as_ref().map(|x| format!("reef: {}", expr(x))),
             ]
             .into_iter()
             .flatten()

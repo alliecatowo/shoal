@@ -145,6 +145,16 @@ impl Kernel {
             let kernel = self.clone();
             match listener.accept() {
                 Ok((stream, _)) => {
+                    // The listener is non-blocking so the accept loop can poll
+                    // `stop`, but that non-blocking flag is inherited by the
+                    // accepted stream on some platforms (e.g. macOS) and not
+                    // others (e.g. Linux, where accepted sockets are always
+                    // blocking regardless of the listener's flag). Explicitly
+                    // force the accepted connection back into blocking mode so
+                    // per-connection reads in `handle_stream` block as intended
+                    // on every platform, instead of racing the client's next
+                    // write and getting a transient `WouldBlock` misread as EOF.
+                    stream.set_nonblocking(false)?;
                     std::thread::spawn(move || {
                         let _ = kernel.handle_stream(stream);
                     });

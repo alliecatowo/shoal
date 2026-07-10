@@ -111,6 +111,131 @@ unsafe extern "C" {
     fn kill(pid: i32, signal: i32) -> i32;
 }
 
+/// Regression test for the accepted-socket non-blocking bug: `serve_until`
+/// puts the *listener* in non-blocking mode so its accept loop can poll the
+/// shutdown flag, but on some platforms (macOS) an accepted stream inherits
+/// that non-blocking flag too (unlike Linux, where an accepted socket is
+/// always blocking regardless of the listener's mode). Without an explicit
+/// `stream.set_nonblocking(false)` on the accepted connection, a server-side
+/// read that lands before the client's *next* write arrives returns
+/// `WouldBlock`, which `handle_stream` propagates as an `Err` — silently
+/// dropping the connection instead of blocking for more data.
+///
+/// This test opens one connection and issues two *sequential* requests with
+/// a deliberate pause in between, so the daemon's second `read_frame` call
+/// genuinely has to wait on an empty socket for the client's second write.
+/// Under the old bug this reliably reproduced a dropped connection (the
+/// first response would arrive, but the second `read_line` would return
+/// `WouldBlock`/EOF before the client ever wrote its second request); with
+/// the accepted stream forced back into blocking mode, both responses must
+/// arrive correctly.
+#[test]
+fn daemon_survives_a_paused_gap_between_two_sequential_requests() {
+    let _serialize = ONLY_ONE_DAEMON_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("run/session.sock");
+    let (stderr_file, stderr_path) = daemon_stderr_file(temp.path());
+    let mut child = Command::new(env!("CARGO_BIN_EXE_shoal-kernel"))
+        .args([
+            "--socket",
+            socket.to_str().unwrap(),
+            "--state-dir",
+            temp.path().join("state").to_str().unwrap(),
+        ])
+        .stdout(Stdio::null())
+        .stderr(stderr_file)
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !socket.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        socket.exists(),
+        "daemon stderr:\n{}",
+        read_daemon_stderr(&stderr_path)
+    );
+
+    let mut stream = UnixStream::connect(&socket).unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+
+    // First request: attach. Read its response fully before moving on, so
+    // the daemon's connection thread loops back around to its next
+    // `read_frame` call — and starts blocking on an empty socket — well
+    // before this test writes anything else.
+    write_frame(
+        &mut stream,
+        &Request {
+            jsonrpc: JSONRPC.into(),
+            id: 1.into(),
+            method: "session.attach".into(),
+            params: serde_json::to_value(AttachParams {
+                session: None,
+                token: None,
+                client: ClientInfo {
+                    kind: "test".into(),
+                    tty: false,
+                },
+            })
+            .unwrap(),
+        },
+    )
+    .unwrap();
+    let attach = recv(&mut reader);
+    assert!(
+        attach.error.is_none(),
+        "attach failed: {:?}; daemon stderr:\n{}",
+        attach.error,
+        read_daemon_stderr(&stderr_path)
+    );
+
+    // Deliberate pause: give the daemon's per-connection thread ample time
+    // to have already called (and be blocked in) its next `read_frame`
+    // before the second request is written. Under the old bug, this window
+    // is exactly when a non-blocking accepted socket would return
+    // `WouldBlock` and the connection would be silently dropped.
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Second request, sent well after the pause: exercises the very read
+    // that would have raced (and lost) on a non-blocking accepted stream.
+    write_frame(
+        &mut stream,
+        &Request {
+            jsonrpc: JSONRPC.into(),
+            id: 2.into(),
+            method: "exec".into(),
+            params: serde_json::to_value(ExecParams {
+                src: "1 + 1".into(),
+                mode: "run".into(),
+                position: "stmt".into(),
+                asynchronous: false,
+                elide: None,
+            })
+            .unwrap(),
+        },
+    )
+    .unwrap();
+    let exec = recv(&mut reader);
+    assert!(
+        exec.error.is_none(),
+        "exec after paused gap failed (this is exactly the accepted-socket \
+         non-blocking regression): {:?}; daemon stderr:\n{}",
+        exec.error,
+        read_daemon_stderr(&stderr_path)
+    );
+
+    unsafe {
+        kill(child.id() as i32, 2);
+    }
+    assert!(
+        child.wait().unwrap().success(),
+        "daemon stderr:\n{}",
+        read_daemon_stderr(&stderr_path)
+    );
+}
+
 /// Read one newline-framed response, without writing anything first —
 /// pairs with batching multiple requests into a single write (see
 /// `live_kernel_elides_a_big_table_over_the_wire`).
