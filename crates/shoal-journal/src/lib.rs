@@ -1299,7 +1299,14 @@ mod tests {
     fn undo_trash_move_restores_and_is_idempotent() {
         let root = tempfile::tempdir().unwrap();
         let trash_dir = tempfile::tempdir().unwrap();
-        let original = root.path().join("gone.txt");
+        // `undo_entry` canonicalizes `root` before checking that undo targets
+        // are contained within it (see `checked_target`). On macOS the tempdir
+        // path is a symlink alias (e.g. `/var/folders/...` ->
+        // `/private/var/folders/...`), so build `original` from the
+        // canonicalized root to keep the prefix check aligned with what
+        // `undo_entry` will compare against.
+        let root_path = root.path().canonicalize().unwrap();
+        let original = root_path.join("gone.txt");
         let trash = trash_dir.path().join("gone.txt");
         fs::write(&original, b"important").unwrap();
         fs::rename(&original, &trash).unwrap();
@@ -1323,7 +1330,12 @@ mod tests {
     #[test]
     fn undo_restore_bytes_refuses_stale_content() {
         let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("config");
+        // See undo_trash_move_restores_and_is_idempotent: canonicalize so
+        // `path` shares the same prefix `undo_entry` compares against after
+        // it canonicalizes `root` internally (macOS tempdirs are symlink
+        // aliases into `/private/...`).
+        let root_path = root.path().canonicalize().unwrap();
+        let path = root_path.join("config");
         fs::write(&path, b"before").unwrap();
         let j = Journal::in_memory().unwrap();
         let id = j.append(&rec("s", "human", 1, "save config")).unwrap();
@@ -1343,7 +1355,12 @@ mod tests {
     #[test]
     fn undo_restore_bytes_uses_cas() {
         let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("config");
+        // See undo_trash_move_restores_and_is_idempotent: canonicalize so
+        // `path` shares the same prefix `undo_entry` compares against after
+        // it canonicalizes `root` internally (macOS tempdirs are symlink
+        // aliases into `/private/...`).
+        let root_path = root.path().canonicalize().unwrap();
+        let path = root_path.join("config");
         fs::write(&path, b"before").unwrap();
         let j = Journal::in_memory().unwrap();
         let id = j.append(&rec("s", "human", 1, "save config")).unwrap();
@@ -1372,9 +1389,14 @@ mod tests {
     #[test]
     fn undo_replays_moves_newest_first() {
         let root = tempfile::tempdir().unwrap();
-        let a = root.path().join("a");
-        let b = root.path().join("b");
-        let c = root.path().join("c");
+        // See undo_trash_move_restores_and_is_idempotent: canonicalize so
+        // `a`/`b`/`c` share the same prefix `undo_entry` compares against
+        // after it canonicalizes `root` internally (macOS tempdirs are
+        // symlink aliases into `/private/...`).
+        let root_path = root.path().canonicalize().unwrap();
+        let a = root_path.join("a");
+        let b = root_path.join("b");
+        let c = root_path.join("c");
         fs::write(&a, b"x").unwrap();
         fs::rename(&a, &b).unwrap();
         let fp = FileFingerprint::capture(&b).unwrap();
