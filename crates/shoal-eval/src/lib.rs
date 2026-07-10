@@ -1073,4 +1073,12 @@ mod tests {
         let value = run("let r = sh { printf hello }\nr.out").unwrap();
         assert_eq!(value, Value::Str("hello".into()));
     }
+
+    #[test]
+    fn failed_statement_preserves_process_diagnostics() {
+        let err = run("sh { printf boom >&2; exit 7 }").unwrap_err();
+        assert_eq!(err.code, "cmd_failed");
+        assert_eq!(err.status, Some(7));
+        assert_eq!(err.stderr.as_deref(), Some("boom"));
+    }
 }
