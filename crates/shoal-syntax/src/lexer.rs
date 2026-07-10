@@ -488,7 +488,7 @@ impl<'s> Lexer<'s> {
                 Err(LexError::new(
                     format!(
                         "unexpected character `{}`",
-                        &self.src[pos..].chars().next().unwrap()
+                        self.src[pos..].chars().next().unwrap()
                     ),
                     Span::new(pos, pos + 1),
                 ))
