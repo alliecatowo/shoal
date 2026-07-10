@@ -481,7 +481,11 @@ impl<'s> Lexer<'s> {
         while pos < self.bytes.len()
             && (self.at(pos).is_ascii_alphanumeric() || self.at(pos) == b'_')
         {
-            pos += 1;
+            pos += self.src[pos..]
+                .chars()
+                .next()
+                .expect("position is in bounds")
+                .len_utf8();
         }
         let text = &self.src[start..pos];
         // Tagged literals: re"…", t"…"
@@ -849,7 +853,11 @@ impl<'s> Lexer<'s> {
                         .hint("use '''…''' for multiline raw strings"),
                 );
             }
-            pos += 1;
+            pos += self.src[pos..]
+                .chars()
+                .next()
+                .expect("position is in bounds")
+                .len_utf8();
         }
         if pos >= self.bytes.len() {
             return Err(LexError::new(
@@ -1173,5 +1181,11 @@ mod tests {
             Tok::Str(s) => assert_eq!(s, "line1\n  line2"),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn unterminated_raw_unicode_never_slices_inside_codepoint() {
+        let result = Lexer::new("'𐣠").token(0, Mode::Expr);
+        assert!(matches!(result, Err(LexError { ref msg, .. }) if msg.contains("unterminated")));
     }
 }
