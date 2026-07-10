@@ -1,0 +1,25 @@
+[cmd.cargo]
+bin = "cargo"
+class = "cli"
+ok_codes = [0]
+effects = ["fs.read(cwd)"]
+
+[cmd.cargo.sub.build]
+params = { release = "bool", jobs = "int?", package = "str?", target = "str?", all_features = "bool" }
+flags = { short = { j = "jobs", p = "package" } }
+effects = ["fs.read(cwd)", "fs.write(cwd/target)", "net.connect(crates.io:443)"]
+
+[cmd.cargo.sub.test]
+params = { release = "bool", jobs = "int?", package = "str?", test = "str?", no_run = "bool" }
+flags = { short = { j = "jobs", p = "package" } }
+effects = ["fs.read(cwd)", "fs.write(cwd/target)", "proc.spawn(test-binaries)"]
+
+[cmd.cargo.sub.run]
+params = { release = "bool", package = "str?", bin = "str?", args = "list<str>" }
+flags = { short = { p = "package" } }
+effects = ["fs.read(cwd)", "fs.write(cwd/target)", "proc.spawn(target-binary)"]
+
+[cmd.cargo.sub.check]
+params = { package = "str?", all_targets = "bool", all_features = "bool" }
+flags = { short = { p = "package" } }
+effects = ["fs.read(cwd)", "fs.write(cwd/target)"]

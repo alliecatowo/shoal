@@ -1,0 +1,9 @@
+[cmd.jq]
+bin = "jq"
+class = "cli"
+ok_codes = [0]
+params = { filter = "str", files = "glob", raw_output = "bool", compact_output = "bool", slurp = "bool", null_input = "bool" }
+positional = ["filter", "files"]
+flags = { short = { r = "raw_output", c = "compact_output", s = "slurp", n = "null_input" } }
+output = { parse = "json", type = "value" }
+effects = ["fs.read($files)"]

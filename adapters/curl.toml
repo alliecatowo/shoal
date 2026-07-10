@@ -1,0 +1,8 @@
+[cmd.curl]
+bin = "curl"
+class = "cli"
+ok_codes = [0]
+params = { url = "str", request = "str?", header = "list<str>", data = "str?", output = "path?", follow = "bool", fail = "bool", silent = "bool", max_time = "duration?" }
+positional = ["url"]
+flags = { short = { X = "request", H = "header", d = "data", o = "output", L = "follow", f = "fail", s = "silent", m = "max_time" } }
+effects = ["net.connect($url)", "fs.write($output)"]

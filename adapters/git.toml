@@ -1,0 +1,55 @@
+[cmd.git]
+bin = "git"
+class = "cli"
+ok_codes = [0]
+effects = ["fs.read(cwd)"]
+
+[cmd.git.sub.status]
+params = { short = "bool", branch = "bool", untracked_files = "str?" }
+flags = { short = { s = "short", b = "branch" } }
+invoke = ["status", "--porcelain=v2"]
+output = { parse = "porcelain-v2", type = "table<{status: str, path: path, orig: path?}>" }
+effects = ["fs.read(cwd)"]
+
+[cmd.git.sub.log]
+params = { n = "int?", path = "path?", follow = "bool" }
+positional = ["path"]
+invoke = ["log", "--pretty=format:%H%x00%an%x00%aI%x00%s", "-z"]
+output = { parse = "z-records", type = "table<{hash: str, author: str, date: datetime, subject: str}>" }
+effects = ["fs.read(cwd)"]
+
+[cmd.git.sub.branch]
+params = { all = "bool", delete = "bool", force = "bool", name = "str?" }
+positional = ["name"]
+flags = { short = { a = "all", d = "delete", D = "force" } }
+output = { parse = "lines", type = "list<str>" }
+effects = ["fs.read(cwd)", "fs.write(cwd/.git)"]
+
+[cmd.git.sub.push]
+params = { remote = "str?", refspec = "str?", force = "bool", dry_run = "bool", set_upstream = "bool" }
+positional = ["remote", "refspec"]
+flags = { short = { f = "force", u = "set_upstream", n = "dry_run" } }
+effects = ["fs.read(cwd)", "net.connect($remote)"]
+
+[cmd.git.sub.pull]
+params = { remote = "str?", refspec = "str?", rebase = "bool", ff_only = "bool" }
+positional = ["remote", "refspec"]
+effects = ["fs.read(cwd)", "fs.write(cwd)", "net.connect($remote)"]
+
+[cmd.git.sub.diff]
+ok_codes = [0, 1]
+params = { staged = "bool", name_only = "bool", path = "path?" }
+positional = ["path"]
+output = { parse = "lines", type = "list<str>" }
+effects = ["fs.read(cwd)"]
+
+[cmd.git.sub.add]
+params = { paths = "glob", all = "bool", patch = "bool" }
+positional = ["paths"]
+flags = { short = { A = "all", p = "patch" } }
+effects = ["fs.read($paths)", "fs.write(cwd/.git/index)"]
+
+[cmd.git.sub.commit]
+params = { message = "str?", all = "bool", amend = "bool", no_verify = "bool" }
+flags = { short = { m = "message", a = "all" } }
+effects = ["fs.read(cwd)", "fs.write(cwd/.git)"]

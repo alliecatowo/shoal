@@ -1,0 +1,10 @@
+[cmd.rg]
+bin = "rg"
+class = "cli"
+ok_codes = [0, 1]
+params = { pattern = "str", paths = "glob", ignore_case = "bool", fixed_strings = "bool", glob = "glob?", hidden = "bool", max_count = "int?" }
+positional = ["pattern", "paths"]
+flags = { short = { i = "ignore_case", F = "fixed_strings", g = "glob", m = "max_count" } }
+invoke = ["--json"]
+output = { parse = "ndjson", type = "table<{type: str, data: record}>" }
+effects = ["fs.read($paths)"]

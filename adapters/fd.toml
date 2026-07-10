@@ -1,0 +1,9 @@
+[cmd.fd]
+bin = "fd"
+class = "cli"
+ok_codes = [0, 1]
+params = { pattern = "str?", path = "path?", hidden = "bool", no_ignore = "bool", type = "str?", extension = "str?", max_depth = "int?" }
+positional = ["pattern", "path"]
+flags = { short = { H = "hidden", I = "no_ignore", t = "type", e = "extension", d = "max_depth" } }
+output = { parse = "lines", type = "list<path>" }
+effects = ["fs.read($path)"]

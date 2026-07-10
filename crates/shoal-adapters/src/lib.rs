@@ -89,7 +89,12 @@ impl AdapterCatalog {
             for (name, raw) in cmds {
                 match parse_cmd(name, raw) {
                     Ok(cmd) => {
-                        catalog.cmds.insert(name.clone(), cmd);
+                        if catalog.cmds.insert(name.clone(), cmd).is_some() {
+                            warnings.push(format!(
+                                "{}: duplicate adapter cmd.{name}; later file wins",
+                                path.display()
+                            ));
+                        }
                     }
                     Err(e) => warnings.push(format!("{}: cmd.{name}: {e}", path.display())),
                 }
@@ -100,6 +105,13 @@ impl AdapterCatalog {
 
     pub fn lookup(&self, head: &str) -> Option<&CmdAdapter> {
         self.cmds.get(head)
+    }
+
+    pub fn len(&self) -> usize {
+        self.cmds.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.cmds.is_empty()
     }
 }
 
@@ -140,9 +152,13 @@ fn parse_sub(t: &toml::Table) -> Result<SubSpec, String> {
     };
     if let Some(params) = t.get("params").and_then(toml::Value::as_table) {
         for (name, ty) in params {
+            let ty = ty.as_str().ok_or("parameter type must be a string")?;
+            if !valid_type(ty) {
+                return Err(format!("unknown parameter type {ty:?}"));
+            }
             s.params.push(ParamSpec {
                 name: name.clone(),
-                ty: ty.as_str().ok_or("parameter type must be a string")?.into(),
+                ty: ty.into(),
             });
         }
     }
@@ -166,31 +182,68 @@ fn parse_sub(t: &toml::Table) -> Result<SubSpec, String> {
     s.invoke = strings(t.get("invoke"));
     if let Some(out) = t.get("output").and_then(toml::Value::as_table) {
         s.parse = string(out.get("parse")).unwrap_or("none").into();
+        if !matches!(
+            s.parse.as_str(),
+            "json"
+                | "ndjson"
+                | "csv"
+                | "tsv"
+                | "z-records"
+                | "porcelain-v2"
+                | "lines"
+                | "kv"
+                | "none"
+        ) {
+            return Err(format!("unknown output parser {:?}", s.parse));
+        }
         s.output_type = string(out.get("type")).map(str::to_owned);
     }
     s.effects = strings(t.get("effects")).unwrap_or_default();
     s.ok_codes = ints(t.get("ok_codes"));
+    let names = s
+        .params
+        .iter()
+        .map(|p| p.name.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    for positional in &s.positional {
+        if !names.contains(positional.as_str()) {
+            return Err(format!(
+                "positional parameter {positional:?} is not declared in params"
+            ));
+        }
+    }
+    for target in s.short_flags.values() {
+        if !names.contains(target.as_str()) {
+            return Err(format!(
+                "short flag targets undeclared parameter {target:?}"
+            ));
+        }
+    }
     Ok(s)
+}
+
+fn valid_type(ty: &str) -> bool {
+    let base = ty.strip_suffix('?').unwrap_or(ty);
+    matches!(
+        base,
+        "str" | "bool" | "int" | "float" | "path" | "glob" | "size" | "duration" | "time"
+    ) || (base.starts_with("list<") && base.ends_with('>') && valid_type(&base[5..base.len() - 1]))
 }
 
 fn string(v: Option<&toml::Value>) -> Option<&str> {
     v?.as_str()
 }
 fn strings(v: Option<&toml::Value>) -> Option<Vec<String>> {
-    Some(
-        v?.as_array()?
-            .iter()
-            .map(|x| x.as_str().map(str::to_owned))
-            .collect::<Option<_>>()?,
-    )
+    v?.as_array()?
+        .iter()
+        .map(|x| x.as_str().map(str::to_owned))
+        .collect::<Option<_>>()
 }
 fn ints(v: Option<&toml::Value>) -> Option<Vec<i32>> {
-    Some(
-        v?.as_array()?
-            .iter()
-            .map(|x| x.as_integer().and_then(|n| i32::try_from(n).ok()))
-            .collect::<Option<_>>()?,
-    )
+    v?.as_array()?
+        .iter()
+        .map(|x| x.as_integer().and_then(|n| i32::try_from(n).ok()))
+        .collect::<Option<_>>()
 }
 
 pub fn parse_output(strategy: &str, bytes: &[u8], type_hint: Option<&str>) -> Option<Value> {
@@ -481,5 +534,57 @@ output={parse="porcelain-v2", type="table<{status: str, path: path}>"}
         assert!(parse_output("json", b"no", None).is_none());
         assert!(parse_output("csv", b"a,b\n1\n", None).is_none());
         assert!(parse_output("z-records", b"a\0", None).is_none());
+    }
+
+    #[test]
+    fn bundled_adapter_pack_loads_without_warnings() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../adapters");
+        let (catalog, warnings) = AdapterCatalog::load_dir(&root);
+        assert!(
+            warnings.is_empty(),
+            "bundled adapter warnings: {warnings:#?}"
+        );
+        let required = [
+            "git", "cargo", "rg", "docker", "kubectl", "jq", "curl", "tar", "fd", "du",
+        ];
+        assert_eq!(catalog.len(), required.len());
+        for name in required {
+            assert!(catalog.lookup(name).is_some(), "missing adapter {name}");
+        }
+        assert_eq!(
+            catalog.lookup("git").unwrap().subs["diff"].ok_codes,
+            Some(vec![0, 1])
+        );
+        assert_eq!(catalog.lookup("rg").unwrap().top.parse, "ndjson");
+        assert_eq!(
+            catalog.lookup("docker").unwrap().class,
+            AdapterClass::Daemon
+        );
+    }
+
+    #[test]
+    fn invalid_schema_warns_without_poisoning_siblings() {
+        let d = tempfile::tempdir().unwrap();
+        fs::write(
+            d.path().join("pack.toml"),
+            r#"
+[cmd.good]
+params={path="path"}
+[cmd.bad_type]
+params={x="quantum"}
+[cmd.bad_parser]
+output={parse="wishful"}
+[cmd.bad_binding]
+params={x="str"}
+positional=["missing"]
+"#,
+        )
+        .unwrap();
+        let (catalog, warnings) = AdapterCatalog::load_dir(d.path());
+        assert!(catalog.lookup("good").is_some());
+        assert!(catalog.lookup("bad_type").is_none());
+        assert!(catalog.lookup("bad_parser").is_none());
+        assert!(catalog.lookup("bad_binding").is_none());
+        assert_eq!(warnings.len(), 3);
     }
 }

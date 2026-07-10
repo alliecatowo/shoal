@@ -1,0 +1,8 @@
+[cmd.tar]
+bin = "tar"
+class = "cli"
+ok_codes = [0]
+params = { file = "path", paths = "glob", create = "bool", extract = "bool", list = "bool", gzip = "bool", directory = "path?" }
+positional = ["paths"]
+flags = { short = { f = "file", c = "create", x = "extract", t = "list", z = "gzip", C = "directory" } }
+effects = ["fs.read($paths)", "fs.read($file)", "fs.write($file)", "fs.write($directory)"]

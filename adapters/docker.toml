@@ -1,0 +1,25 @@
+[cmd.docker]
+bin = "docker"
+class = "daemon"
+ok_codes = [0]
+effects = ["proc.spawn(docker)", "net.connect(docker-daemon)"]
+
+[cmd.docker.sub.ps]
+params = { all = "bool", quiet = "bool", filter = "str?" }
+flags = { short = { a = "all", q = "quiet", f = "filter" } }
+invoke = ["ps", "--format", "table {{.ID}}\t{{.Image}}\t{{.Status}}\t{{.Names}}"]
+output = { parse = "tsv", type = "table<{CONTAINER ID: str, IMAGE: str, STATUS: str, NAMES: str}>" }
+effects = ["net.connect(docker-daemon)"]
+
+[cmd.docker.sub.images]
+params = { all = "bool", quiet = "bool" }
+flags = { short = { a = "all", q = "quiet" } }
+invoke = ["images", "--format", "table {{.Repository}}\t{{.Tag}}\t{{.ID}}\t{{.Size}}"]
+output = { parse = "tsv", type = "table<{REPOSITORY: str, TAG: str, IMAGE ID: str, SIZE: str}>" }
+effects = ["net.connect(docker-daemon)"]
+
+[cmd.docker.sub.run]
+params = { image = "str", detach = "bool", interactive = "bool", tty = "bool", publish = "str?", volume = "str?" }
+positional = ["image"]
+flags = { short = { d = "detach", i = "interactive", t = "tty", p = "publish", v = "volume" } }
+effects = ["net.connect(docker-daemon)", "proc.spawn(container)", "fs.read($volume)"]

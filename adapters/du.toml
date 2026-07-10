@@ -1,0 +1,9 @@
+[cmd.du]
+bin = "du"
+class = "cli"
+ok_codes = [0]
+params = { paths = "glob", summarize = "bool", human_readable = "bool", max_depth = "int?", apparent_size = "bool" }
+positional = ["paths"]
+flags = { short = { s = "summarize", h = "human_readable", d = "max_depth" } }
+output = { parse = "tsv", type = "table<{size: size, path: path}>" }
+effects = ["fs.read($paths)"]

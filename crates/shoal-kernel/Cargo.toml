@@ -1,0 +1,13 @@
+[package]
+name = "shoal-kernel"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+base64 = "0.22"
+serde = "1"
+serde_json = "1"
+shoal-eval = { path = "../shoal-eval" }
+shoal-proto = { path = "../shoal-proto" }
+shoal-syntax = { path = "../shoal-syntax" }
+shoal-value = { path = "../shoal-value" }

@@ -1,0 +1,25 @@
+[cmd.kubectl]
+bin = "kubectl"
+class = "cli"
+ok_codes = [0]
+effects = ["net.connect(kubernetes-api)"]
+
+[cmd.kubectl.sub.get]
+params = { resource = "str", name = "str?", namespace = "str?", all_namespaces = "bool", selector = "str?" }
+positional = ["resource", "name"]
+flags = { short = { n = "namespace", A = "all_namespaces", l = "selector" } }
+invoke = ["get", "--output=json"]
+output = { parse = "json", type = "record" }
+effects = ["net.connect(kubernetes-api)"]
+
+[cmd.kubectl.sub.apply]
+params = { filename = "path", namespace = "str?", dry_run = "str?" }
+flags = { short = { f = "filename", n = "namespace" } }
+effects = ["fs.read($filename)", "net.connect(kubernetes-api)"]
+
+[cmd.kubectl.sub.logs]
+params = { pod = "str", container = "str?", follow = "bool", tail = "int?", namespace = "str?" }
+positional = ["pod"]
+flags = { short = { c = "container", f = "follow", n = "namespace" } }
+output = { parse = "lines", type = "list<str>" }
+effects = ["net.connect(kubernetes-api)"]
