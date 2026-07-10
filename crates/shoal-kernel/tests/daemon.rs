@@ -198,6 +198,29 @@ fn live_kernel_elides_a_big_table_over_the_wire() {
         );
         assert!(attach.error.is_none());
 
+        // Diagnostic: is the daemon *process* itself still alive right
+        // before we send the second request? A prior investigation found
+        // the daemon's own stderr held nothing beyond its startup "ready"
+        // line when this connection later failed with a broken pipe, which
+        // rules out a panic/logged error on the daemon side but leaves two
+        // very different possibilities open — the whole process already
+        // exited (try_wait returns Some(status)) vs. only this connection
+        // was closed while the daemon keeps running (try_wait returns
+        // None). This is printed via the test's own stdout/stderr (which
+        // the harness captures per-test), not the daemon's file, so it
+        // survives regardless of which of the two turns out to be true.
+        match child.try_wait() {
+            Ok(None) => eprintln!(
+                "[diag] daemon (pid {}) still running before exec call",
+                child.id()
+            ),
+            Ok(Some(status)) => eprintln!(
+                "[diag] daemon (pid {}) ALREADY EXITED before exec call: {status}",
+                child.id()
+            ),
+            Err(e) => eprintln!("[diag] try_wait failed: {e}"),
+        }
+
         let exec = call(
             &mut stream,
             &mut reader,
