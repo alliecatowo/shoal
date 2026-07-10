@@ -458,6 +458,11 @@ mod tests {
         };
         assert!(t.exists());
     }
+    // Linux allows arbitrary bytes in filenames; macOS (APFS/HFS+) rejects
+    // non-UTF-8 names at the syscall, so the fixture can't be created there.
+    // shoal's path handling stays bytes-backed regardless (TDD §13.1); this
+    // test just needs a filesystem that can hold the bytes.
+    #[cfg(target_os = "linux")]
     #[test]
     fn ls_preserves_non_utf8() {
         use std::os::unix::ffi::OsStringExt;
