@@ -183,7 +183,7 @@ fn macos_seatbelt_profile_chain_is_exercised_by_the_scoped_policy() {
     // relies on is reachable and deny-by-default for a scoped policy (the live
     // sandboxed spawn is validated by the mac CI job running the test above,
     // which is not Landlock-guarded on that platform).
-    let (d, allowed, _secret) = scene();
+    let (_d, allowed, _secret) = scene();
     let sandbox = scoped_policy(&allowed)
         .sandbox_for("agent")
         .expect("scoped policy yields a Seatbelt sandbox on macOS");

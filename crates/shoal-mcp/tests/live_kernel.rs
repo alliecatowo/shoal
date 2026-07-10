@@ -34,11 +34,22 @@ impl LiveKernel {
         let handle = std::thread::spawn(move || {
             kernel.serve_until(&serve_socket, serve_stop).unwrap();
         });
+        // On macOS the socket file can appear (bind) a beat before `listen()`/
+        // accept is actually ready, so a bare `exists()` wait races a connect
+        // into ECONNREFUSED (OS code 61). Probe with a real connect until the
+        // listener accepts before handing the kernel back — this closes the
+        // window for every test that connects (facade or raw stream).
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !socket.exists() && Instant::now() < deadline {
+        loop {
+            if UnixStream::connect(&socket).is_ok() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "kernel must accept on its socket"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(socket.exists(), "kernel must bind its socket");
         Self {
             socket,
             stop,
