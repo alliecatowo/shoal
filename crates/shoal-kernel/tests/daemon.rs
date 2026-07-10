@@ -2,13 +2,32 @@ use shoal_proto::{AttachParams, ClientInfo, ExecParams, JSONRPC, Request, Respon
 use std::io::{BufRead, BufReader};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+
+/// Route a spawned daemon's stderr to its own file inside its tempdir
+/// (rather than piping it and never draining it, or inheriting the test
+/// binary's stderr where two daemons running concurrently can interleave
+/// their output into a single unattributable, garbled line). Callers can
+/// read this file back to attribute a panic/error message to a specific
+/// daemon instance.
+fn daemon_stderr_file(dir: &Path) -> (std::fs::File, std::path::PathBuf) {
+    let path = dir.join("daemon-stderr.log");
+    let file = std::fs::File::create(&path).unwrap();
+    (file, path)
+}
+
+/// Read back a daemon's captured stderr for inclusion in a failure message.
+fn read_daemon_stderr(path: &Path) -> String {
+    std::fs::read_to_string(path).unwrap_or_else(|e| format!("<could not read {path:?}: {e}>"))
+}
 
 #[test]
 fn daemon_binds_secure_socket_and_attaches() {
     let temp = tempfile::tempdir().unwrap();
     let socket = temp.path().join("run/session.sock");
+    let (stderr_file, stderr_path) = daemon_stderr_file(temp.path());
     let mut child = Command::new(env!("CARGO_BIN_EXE_shoal-kernel"))
         .args([
             "--socket",
@@ -17,18 +36,18 @@ fn daemon_binds_secure_socket_and_attaches() {
             temp.path().join("state").to_str().unwrap(),
         ])
         .stdout(Stdio::null())
-        // Inherit stderr (rather than piping and never draining it) so that
-        // if the daemon panics or logs an error, the message lands directly
-        // in the CI test-step log instead of being silently discarded when
-        // the unread pipe is dropped.
-        .stderr(Stdio::inherit())
+        .stderr(stderr_file)
         .spawn()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     while !socket.exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
     }
-    assert!(socket.exists());
+    assert!(
+        socket.exists(),
+        "daemon stderr:\n{}",
+        read_daemon_stderr(&stderr_path)
+    );
     assert_eq!(
         std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777,
         0o600
@@ -60,7 +79,11 @@ fn daemon_binds_secure_socket_and_attaches() {
     unsafe {
         kill(child.id() as i32, 2);
     }
-    assert!(child.wait().unwrap().success());
+    assert!(
+        child.wait().unwrap().success(),
+        "daemon stderr:\n{}",
+        read_daemon_stderr(&stderr_path)
+    );
     assert!(!socket.exists());
 }
 unsafe extern "C" {
@@ -103,6 +126,7 @@ fn live_kernel_elides_a_big_table_over_the_wire() {
     for i in 0..150 {
         std::fs::write(bigdir.join(format!("f{i:04}.txt")), b"x").unwrap();
     }
+    let (stderr_file, stderr_path) = daemon_stderr_file(temp.path());
     let mut child = Command::new(env!("CARGO_BIN_EXE_shoal-kernel"))
         .args([
             "--socket",
@@ -111,94 +135,126 @@ fn live_kernel_elides_a_big_table_over_the_wire() {
             temp.path().join("state").to_str().unwrap(),
         ])
         .stdout(Stdio::null())
-        // Inherit stderr (rather than piping and never draining it) so that
-        // if the daemon panics or logs an error mid-test, the message lands
-        // directly in the CI test-step log instead of being silently
-        // discarded when the unread pipe is dropped.
-        .stderr(Stdio::inherit())
+        .stderr(stderr_file)
         .spawn()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     while !socket.exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
     }
-    assert!(socket.exists(), "live kernel must bind its socket");
-
-    let mut stream = UnixStream::connect(&socket).unwrap();
-    let mut reader = BufReader::new(stream.try_clone().unwrap());
-    let attach = call(
-        &mut stream,
-        &mut reader,
-        1,
-        "session.attach",
-        serde_json::to_value(AttachParams {
-            session: None,
-            token: None,
-            client: ClientInfo {
-                kind: "test".into(),
-                tty: false,
-            },
-        })
-        .unwrap(),
-    );
-    assert!(attach.error.is_none());
-
-    let exec = call(
-        &mut stream,
-        &mut reader,
-        2,
-        "exec",
-        serde_json::to_value(ExecParams {
-            src: format!("ls {}", bigdir.display()),
-            mode: "run".into(),
-            position: "stmt".into(),
-            asynchronous: false,
-            elide: None,
-        })
-        .unwrap(),
-    );
-    let result = exec.result.expect("live `ls` over 150 files must succeed");
-    let out = &result["value"]["out"];
-
-    // BEFORE (what the wire would have carried without §3): a `Table` whose
-    // `cols` map every column name to a 150-long array of tagged cells —
-    // easily tens of KB for a directory listing with name/size/modified.
-    // AFTER (what actually arrives): shape only.
-    assert_eq!(
-        out["$"], "ref",
-        "150 rows over the wire, live, must arrive elided: {out}"
-    );
-    assert_eq!(out["of"], "table");
-    assert_eq!(
-        out["n"], 150,
-        "the full count still travels even though the rows don't"
-    );
-    assert_eq!(
-        out["cols"]["name"], "path",
-        "column *schema* travels (name -> type)"
-    );
     assert!(
-        out["cols"].get("size").is_some(),
-        "every table column's type is in the shape, not just the ones previewed"
+        socket.exists(),
+        "live kernel must bind its socket; daemon stderr:\n{}",
+        read_daemon_stderr(&stderr_path)
     );
-    assert_eq!(out["preview"]["$"], "table");
-    assert_eq!(
-        out["preview"]["n"], 5,
-        "preview is capped at 5 rows, not 150"
-    );
-    let preview_names_len = out["preview"]["cols"]["name"].as_array().unwrap().len();
-    assert_eq!(preview_names_len, 5);
-    assert!(!out["render_head"].as_str().unwrap().is_empty());
 
-    let elided_bytes = serde_json::to_vec(out).unwrap().len();
-    assert!(
-        elided_bytes < 4 * 1024,
-        "the elided response itself must stay small (was {elided_bytes} bytes) — \
-         a real un-elided 150-row `ls` table would run several times that"
-    );
+    // The rest of the exchange runs inside `catch_unwind` purely so that,
+    // on any failure (e.g. the daemon's connection closing unexpectedly),
+    // we can attribute it by attaching the daemon's own captured stderr —
+    // otherwise a mid-exchange failure (a closed socket, a panic in the
+    // daemon) reports only an opaque `io::Error` / `Option::unwrap` panic
+    // in the test with no indication of what the daemon-side cause was.
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut stream = UnixStream::connect(&socket).unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let attach = call(
+            &mut stream,
+            &mut reader,
+            1,
+            "session.attach",
+            serde_json::to_value(AttachParams {
+                session: None,
+                token: None,
+                client: ClientInfo {
+                    kind: "test".into(),
+                    tty: false,
+                },
+            })
+            .unwrap(),
+        );
+        assert!(attach.error.is_none());
+
+        let exec = call(
+            &mut stream,
+            &mut reader,
+            2,
+            "exec",
+            serde_json::to_value(ExecParams {
+                src: format!("ls {}", bigdir.display()),
+                mode: "run".into(),
+                position: "stmt".into(),
+                asynchronous: false,
+                elide: None,
+            })
+            .unwrap(),
+        );
+        let result = exec.result.expect("live `ls` over 150 files must succeed");
+        let out = &result["value"]["out"];
+
+        // BEFORE (what the wire would have carried without §3): a `Table`
+        // whose `cols` map every column name to a 150-long array of tagged
+        // cells — easily tens of KB for a directory listing with
+        // name/size/modified. AFTER (what actually arrives): shape only.
+        assert_eq!(
+            out["$"], "ref",
+            "150 rows over the wire, live, must arrive elided: {out}"
+        );
+        assert_eq!(out["of"], "table");
+        assert_eq!(
+            out["n"], 150,
+            "the full count still travels even though the rows don't"
+        );
+        assert_eq!(
+            out["cols"]["name"], "path",
+            "column *schema* travels (name -> type)"
+        );
+        assert!(
+            out["cols"].get("size").is_some(),
+            "every table column's type is in the shape, not just the ones previewed"
+        );
+        assert_eq!(out["preview"]["$"], "table");
+        assert_eq!(
+            out["preview"]["n"], 5,
+            "preview is capped at 5 rows, not 150"
+        );
+        let preview_names_len = out["preview"]["cols"]["name"].as_array().unwrap().len();
+        assert_eq!(preview_names_len, 5);
+        assert!(!out["render_head"].as_str().unwrap().is_empty());
+
+        let elided_bytes = serde_json::to_vec(out).unwrap().len();
+        assert!(
+            elided_bytes < 4 * 1024,
+            "the elided response itself must stay small (was {elided_bytes} bytes) — \
+             a real un-elided 150-row `ls` table would run several times that"
+        );
+    }));
+
+    if let Err(payload) = outcome {
+        // The daemon may still be alive (e.g. the failure was a client-side
+        // assertion) or already gone (e.g. its connection closed); either
+        // way, best-effort reap it so it can't linger, then surface its
+        // stderr alongside the original panic message.
+        let _ = child.kill();
+        let _ = child.wait();
+        let msg = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_else(|| "<non-string panic payload>".into());
+        panic!(
+            "live_kernel_elides_a_big_table_over_the_wire failed: {msg}\n\
+             --- daemon stderr ({}) ---\n{}",
+            stderr_path.display(),
+            read_daemon_stderr(&stderr_path)
+        );
+    }
 
     unsafe {
         kill(child.id() as i32, 2);
     }
-    assert!(child.wait().unwrap().success());
+    assert!(
+        child.wait().unwrap().success(),
+        "daemon stderr:\n{}",
+        read_daemon_stderr(&stderr_path)
+    );
 }
