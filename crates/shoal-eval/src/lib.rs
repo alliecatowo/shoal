@@ -1,5 +1,7 @@
 //! Tree-walk evaluator for shoal's canonical AST.
 
+mod builtins;
+
 use shoal_ast::*;
 use shoal_exec::{CancelToken, ExecMode, ExecSpec, StdinSpec};
 use shoal_value::{
@@ -168,7 +170,7 @@ impl Evaluator {
                 ..
             } => {
                 let iter_value = self.eval_expr(iter, Position::Value)?;
-                let vals = self.into_values(iter_value)?;
+                let vals = self.values_from(iter_value)?;
                 let mut last = Value::Null;
                 for value in vals {
                     let old = self.env.clone();
@@ -563,24 +565,28 @@ impl Evaluator {
     }
 
     fn eval_command(&mut self, call: &CmdCall, position: Position) -> VResult<Value> {
-        if let Some(bound) = self.env.get(&call.head) {
-            if !call.forced && bound.is_callable() {
-                let mut pos = Vec::new();
-                let mut named = Vec::new();
-                for a in &call.args {
-                    match a {
-                        CmdArg::FlagLong { name, value, .. } => named.push((
-                            name.clone(),
-                            match value {
-                                Some(v) => self.cmd_arg_value(v)?,
-                                None => Value::Bool(true),
-                            },
-                        )),
-                        _ => pos.extend(self.expand_arg(a)?),
-                    }
+        if let Some(bound) = self.env.get(&call.head)
+            && !call.forced
+            && bound.is_callable()
+        {
+            let mut pos = Vec::new();
+            let mut named = Vec::new();
+            for a in &call.args {
+                match a {
+                    CmdArg::FlagLong { name, value, .. } => named.push((
+                        name.clone(),
+                        match value {
+                            Some(v) => self.cmd_arg_value(v)?,
+                            None => Value::Bool(true),
+                        },
+                    )),
+                    _ => pos.extend(self.expand_arg(a)?),
                 }
-                return self.call_value(&bound, CallArgs { pos, named });
             }
+            return self.call_value(&bound, CallArgs { pos, named });
+        }
+        if builtins::is_builtin(&call.head) {
+            return builtins::run(self, call);
         }
         if call.head == "cd" {
             let p = call
@@ -863,7 +869,7 @@ impl Evaluator {
             )),
         }
     }
-    fn into_values(&self, v: Value) -> VResult<Vec<Value>> {
+    fn values_from(&self, v: Value) -> VResult<Vec<Value>> {
         match v {
             Value::List(xs) => Ok(xs),
             Value::Table(rs) => Ok(rs.into_iter().map(Value::Record).collect()),
@@ -1080,5 +1086,22 @@ mod tests {
         assert_eq!(err.code, "cmd_failed");
         assert_eq!(err.status, Some(7));
         assert_eq!(err.stderr.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn typed_builtins_dispatch_before_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = shoal_syntax::parse("touch a\nls").unwrap();
+        let value = eval(&program, dir.path()).unwrap();
+        assert!(
+            matches!(value, Value::Table(rows) if rows.len() == 1 && rows[0]["name"] == Value::Path("a".into()))
+        );
+
+        let rm = shoal_syntax::parse("rm a").unwrap();
+        let value = eval(&rm, dir.path()).unwrap();
+        assert!(
+            matches!(value, Value::List(rows) if matches!(&rows[0], Value::Record(r) if matches!(r.get("trash"), Some(Value::Path(_)))))
+        );
+        assert!(!dir.path().join("a").exists());
     }
 }
