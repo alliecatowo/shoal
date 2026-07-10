@@ -12,7 +12,7 @@ use shoal_eval::Evaluator;
 use shoal_syntax::{ParseError, parse};
 use shoal_value::{ErrorVal, Value};
 
-const USAGE: &str = "shoal 0.1.0\n\nUsage: shoal [OPTIONS] [SCRIPT]\n\nOptions:\n  -c, --command <SOURCE>  Evaluate source and exit\n  -h, --help              Print help\n  -V, --version           Print version";
+const USAGE: &str = "shoal 0.1.0\n\nUsage: shoal [OPTIONS] [SCRIPT]\n       shoal <fmt|doctor|lsp|mcp|completions> ...\n\nOptions:\n  -c, --command <SOURCE>  Evaluate source and exit\n  -h, --help              Print help\n  -V, --version           Print version\n\nDeveloper commands:\n  fmt [--check] [FILES]   Format .shl source (stdin when no files)\n  doctor [--json]         Diagnose the installation\n  lsp                     Run the language server companion\n  mcp                     Run the MCP companion\n  completions SHELL       Print bash, zsh, or fish completions";
 
 enum Action {
     Command(String, Vec<OsString>),
@@ -21,6 +21,10 @@ enum Action {
     Interactive,
     Help,
     Version,
+    Fmt { check: bool, files: Vec<PathBuf> },
+    Doctor { json: bool },
+    Companion(&'static str),
+    Completions(String),
 }
 
 fn main() {
@@ -58,6 +62,24 @@ fn real_main(args: Vec<OsString>) -> Result<i32, String> {
             run_source(&src, Some(Path::new("<stdin>")), false, Vec::new())
         }
         Action::Interactive => repl(),
+        Action::Fmt { check, files } => fmt_command(check, files),
+        Action::Doctor { json } => {
+            let report = shoal_doctor::run(&shoal_doctor::Options::from_env());
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+                )
+            } else {
+                print!("{report}")
+            }
+            Ok(report.exit_code())
+        }
+        Action::Companion(name) => run_companion(name),
+        Action::Completions(shell) => {
+            print!("{}", completion_script(&shell)?);
+            Ok(0)
+        }
     }
 }
 
@@ -71,6 +93,42 @@ fn parse_args(args: Vec<OsString>, stdin_is_tty: bool) -> Result<Action, String>
         });
     };
     match first.to_str() {
+        Some("fmt") => {
+            let mut check = false;
+            let mut files = vec![];
+            for a in iter {
+                if a == "--check" {
+                    check = true
+                } else if a.to_str().is_some_and(|s| s.starts_with('-')) {
+                    return Err(format!("unknown fmt option `{}`", a.to_string_lossy()));
+                } else {
+                    files.push(a.into())
+                }
+            }
+            Ok(Action::Fmt { check, files })
+        }
+        Some("doctor") => {
+            let args = iter.collect::<Vec<_>>();
+            if args.iter().any(|a| a != "--json") {
+                return Err("doctor accepts only --json".into());
+            }
+            Ok(Action::Doctor {
+                json: !args.is_empty(),
+            })
+        }
+        Some("lsp") => no_trailing(iter, Action::Companion("shoal-lsp")),
+        Some("mcp") => no_trailing(iter, Action::Companion("shoal-mcp")),
+        Some("completions") => {
+            let shell = iter
+                .next()
+                .ok_or("completions requires bash, zsh, or fish")?
+                .into_string()
+                .map_err(|_| "shell name is not UTF-8")?;
+            if iter.next().is_some() {
+                return Err("unexpected completion argument".into());
+            }
+            Ok(Action::Completions(shell))
+        }
         Some("-h" | "--help") => no_trailing(iter, Action::Help),
         Some("-V" | "--version") => no_trailing(iter, Action::Version),
         Some("-c" | "--command") => {
@@ -97,6 +155,79 @@ fn no_trailing(mut iter: impl Iterator<Item = OsString>, action: Action) -> Resu
         Err("unexpected argument".into())
     } else {
         Ok(action)
+    }
+}
+
+fn fmt_command(check: bool, files: Vec<PathBuf>) -> Result<i32, String> {
+    if files.is_empty() {
+        let mut src = String::new();
+        io::stdin()
+            .read_to_string(&mut src)
+            .map_err(|e| format!("cannot read stdin: {e}"))?;
+        let ast = parse(&src).map_err(|e| format!("stdin: {e}"))?;
+        let formatted = shoal_syntax::format_program(&ast);
+        if check {
+            return Ok(i32::from(formatted != src));
+        }
+        print!("{formatted}");
+        return Ok(0);
+    }
+    let mut changed = false;
+    for path in files {
+        let src = fs::read_to_string(&path)
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        let ast = parse(&src).map_err(|e| format!("{}: {e}", path.display()))?;
+        let formatted = shoal_syntax::format_program(&ast);
+        if formatted != src {
+            changed = true;
+            if !check {
+                atomic_write(&path, formatted.as_bytes())?
+            }
+        }
+    }
+    Ok(if check && changed { 1 } else { 0 })
+}
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .ok_or_else(|| format!("invalid path {}", path.display()))?
+        .to_string_lossy();
+    let tmp = parent.join(format!(".{name}.shoal-fmt-{}", std::process::id()));
+    let result = (|| {
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result.map_err(|e: io::Error| format!("cannot write {}: {e}", path.display()))
+}
+fn run_companion(name: &str) -> Result<i32, String> {
+    let status = std::process::Command::new(name).status().map_err(|e| {
+        format!("cannot launch `{name}`: {e}; install the companion binary or add it to PATH")
+    })?;
+    Ok(status.code().unwrap_or(1))
+}
+fn completion_script(shell: &str) -> Result<&'static str, String> {
+    match shell {
+        "bash" => Ok(
+            "_shoal(){ COMPREPLY=( $(compgen -W 'fmt doctor lsp mcp completions --help --version --command' -- \"${COMP_WORDS[COMP_CWORD]}\") ); }\ncomplete -F _shoal shoal\n",
+        ),
+        "zsh" => Ok(
+            "#compdef shoal\n_arguments '1:command:(fmt doctor lsp mcp completions)' '*:file:_files'\n",
+        ),
+        "fish" => Ok(
+            "complete -c shoal -f -a 'fmt doctor lsp mcp completions'\ncomplete -c shoal -s c -l command -r\n",
+        ),
+        _ => Err(format!(
+            "unsupported shell `{shell}`; expected bash, zsh, or fish"
+        )),
     }
 }
 
@@ -147,8 +278,28 @@ fn run_source(
 
 fn repl() -> Result<i32, String> {
     let cwd = std::env::current_dir().map_err(|e| format!("cannot determine cwd: {e}"))?;
+    let loaded = shoal_config::load(&shoal_config::LoadOptions::discover(&cwd))?;
+    for warning in &loaded.warnings {
+        eprintln!("shoal config: {warning}");
+    }
+    let config = loaded.config;
     let mut evaluator = Evaluator::new(cwd);
     evaluator.interactive = true;
+    for dir in &config.adapters.dirs {
+        let (catalog, warnings) = shoal_adapters::AdapterCatalog::load_dir(dir);
+        for warning in warnings {
+            eprintln!("shoal adapter: {warning}");
+        }
+        evaluator.set_adapters(catalog);
+    }
+    for init in &config.init.files {
+        let src = fs::read_to_string(init)
+            .map_err(|e| format!("cannot read init {}: {e}", init.display()))?;
+        let program = parse(&src).map_err(|e| format!("init {}: {e}", init.display()))?;
+        evaluator
+            .eval_program(&program)
+            .map_err(|e| format!("init {}: {e}", init.display()))?;
+    }
 
     let completions = completion_candidates(evaluator.cwd());
     let mut editor = Reedline::create()
@@ -159,18 +310,24 @@ fn repl() -> Result<i32, String> {
         )))
         .with_highlighter(Box::new(ExampleHighlighter::new(completions)))
         .with_hinter(Box::new(DefaultHinter::default()));
-    if let Some(path) = history_path() {
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        if let Ok(history) = FileBackedHistory::with_file(10_000, path) {
-            editor = editor.with_history(Box::new(history));
+    if config.history.enabled {
+        if let Some(path) = config.history.path.clone().or_else(history_path) {
+            if let Some(parent) = path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            if let Ok(history) = FileBackedHistory::with_file(config.history.max_entries, path) {
+                editor = editor.with_history(Box::new(history));
+            }
         }
     }
 
     loop {
+        let prompt_text = config
+            .prompt
+            .template
+            .replace("{cwd}", &short_cwd(evaluator.cwd()));
         let prompt = DefaultPrompt::new(
-            DefaultPromptSegment::Basic(short_cwd(evaluator.cwd())),
+            DefaultPromptSegment::Basic(prompt_text),
             DefaultPromptSegment::Empty,
         );
         match editor.read_line(&prompt) {
@@ -490,5 +647,32 @@ mod tests {
         let values = completion_candidates(Path::new("."));
         assert!(values.iter().any(|v| v == "match"));
         assert!(values.iter().any(|v| v == "shoal" || v == "cargo"));
+    }
+
+    #[test]
+    fn developer_subcommands_dispatch() {
+        assert!(matches!(
+            parse_args(vec!["fmt".into(), "--check".into(), "x.shl".into()], true).unwrap(),
+            Action::Fmt { check: true, .. }
+        ));
+        assert!(matches!(
+            parse_args(vec!["doctor".into(), "--json".into()], true).unwrap(),
+            Action::Doctor { json: true }
+        ));
+        assert!(matches!(
+            parse_args(vec!["lsp".into()], true).unwrap(),
+            Action::Companion("shoal-lsp")
+        ));
+        assert!(completion_script("wat").is_err());
+    }
+
+    #[test]
+    fn fmt_check_and_atomic_write() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("x.shl");
+        fs::write(&path, "let x=1").unwrap();
+        assert_eq!(fmt_command(true, vec![path.clone()]).unwrap(), 1);
+        assert_eq!(fmt_command(false, vec![path.clone()]).unwrap(), 0);
+        assert_eq!(fmt_command(true, vec![path]).unwrap(), 0);
     }
 }

@@ -11,6 +11,10 @@ shoal-ast = { version = "0.1.0", path = "../shoal-ast" }
 shoal-eval = { version = "0.1.0", path = "../shoal-eval" }
 shoal-syntax = { version = "0.1.0", path = "../shoal-syntax" }
 shoal-value = { version = "0.1.0", path = "../shoal-value" }
+shoal-config = { path = "../shoal-config" }
+shoal-adapters = { path = "../shoal-adapters" }
+shoal-doctor = { path = "../shoal-doctor" }
+serde_json = "1"
 
 [dev-dependencies]
 serde = "1.0.228"
