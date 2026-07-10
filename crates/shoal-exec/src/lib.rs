@@ -28,6 +28,7 @@
 mod cancel;
 mod capture;
 mod pty;
+mod sandbox;
 mod status;
 mod watcher;
 mod which;
@@ -56,6 +57,12 @@ pub struct ExecSpec {
     pub stdin: StdinSpec,
     /// Capture (value position) or PTY-tee (statement position).
     pub mode: ExecMode,
+    /// Optional OS-enforcement request (TDD §8). `None` (the default) is the
+    /// existing unsandboxed behavior. When `Some`, [`run`]/[`spawn_capture`]
+    /// apply the strongest available mechanism before exec in the child and
+    /// report what actually happened via [`ExecResult::enforcement`]; see
+    /// [`shoal_leash::SandboxPolicy`].
+    pub sandbox: Option<shoal_leash::SandboxPolicy>,
 }
 
 /// What to connect to the child's stdin.
@@ -105,6 +112,11 @@ pub struct ExecResult {
     pub dur: std::time::Duration,
     /// The child's process id (also its process-group id).
     pub pid: u32,
+    /// `Some` iff `ExecSpec::sandbox` was set, reporting the OS-enforcement
+    /// tier that was **actually** applied to this child (TDD §8 tier
+    /// honesty) — never `enforced: true` unless it really was. `None` means
+    /// no sandbox was requested; it does not mean one was silently applied.
+    pub enforcement: Option<shoal_leash::EnforcementStatus>,
 }
 
 /// Run `spec` to completion, blocking the calling thread.
@@ -126,16 +138,26 @@ pub fn run(spec: ExecSpec, cancel: &CancelToken) -> io::Result<ExecResult> {
     }
 }
 
-/// Run through the child-only Landlock launcher. The parent is never
-/// restricted. A requested sandbox fails closed if Landlock is unavailable.
+/// Run through the child-only Landlock/Seatbelt launcher, always with a
+/// **hard** guarantee: the parent is never restricted, and the request
+/// fails closed (no spawn at all) if the strongest backend on this platform
+/// is unavailable, rather than ever running unconfined. Prefer
+/// `ExecSpec::sandbox` (with `hermetic: true` for the same fail-closed
+/// guarantee, or `false` to degrade honestly instead of refusing) for new
+/// callers — this function is kept for source compatibility.
 pub fn run_sandboxed(
     spec: ExecSpec,
     cancel: &CancelToken,
     sandbox: shoal_leash::FsSandbox,
     verified: Option<&shoal_leash::SpawnPreflight>,
 ) -> io::Result<ExecResult> {
+    let hard_won = verified.is_some();
     let wrapped = sandbox_spec(spec, sandbox, verified)?;
-    run(wrapped, cancel)
+    let mut result = run(wrapped, cancel)?;
+    result
+        .enforcement
+        .get_or_insert_with(|| hard_landlock_status(hard_won));
+    Ok(result)
 }
 
 /// Streaming capture variant of [`run_sandboxed`].
@@ -152,6 +174,19 @@ pub fn spawn_capture_sandboxed(
         ));
     }
     spawn_capture(sandbox_spec(spec, sandbox, verified)?, cancel)
+}
+
+fn hard_landlock_status(spawn_exec_enforced: bool) -> shoal_leash::EnforcementStatus {
+    shoal_leash::EnforcementStatus {
+        available_tier: shoal_leash::EnforcementTier::A,
+        active_tier: Some(shoal_leash::EnforcementTier::A),
+        enforced: true,
+        detail: "Landlock applied via run_sandboxed's hard-requirement helper wrapping".into(),
+        landlock_abi: shoal_leash::landlock_abi(),
+        filesystem_enforced: true,
+        spawn_exec_enforced,
+        network_enforced: false,
+    }
 }
 
 fn sandbox_spec(
@@ -175,41 +210,7 @@ fn sandbox_spec(
             ));
         }
     }
-    let helper = sandbox_helper()?;
-    let mut argv = vec![helper.into_os_string()];
-    for path in sandbox.read {
-        argv.push("--read".into());
-        argv.push(path.into_os_string())
-    }
-    for path in sandbox.write {
-        argv.push("--write".into());
-        argv.push(path.into_os_string())
-    }
-    for path in sandbox.delete {
-        argv.push("--delete".into());
-        argv.push(path.into_os_string())
-    }
-    argv.push("--".into());
-    argv.push(program.into_os_string());
-    argv.extend(spec.argv.into_iter().skip(1));
-    spec.argv = argv;
+    let helper = sandbox::sandbox_helper()?;
+    spec.argv = sandbox::wrap(helper, &sandbox, program, &spec.argv);
     Ok(spec)
-}
-
-fn sandbox_helper() -> io::Result<PathBuf> {
-    let exe = std::env::current_exe()?;
-    let name = "shoal-sandbox-exec";
-    for dir in [exe.parent(), exe.parent().and_then(|p| p.parent())]
-        .into_iter()
-        .flatten()
-    {
-        let p = dir.join(name);
-        if p.is_file() {
-            return Ok(p);
-        }
-    }
-    Err(io::Error::new(
-        io::ErrorKind::NotFound,
-        "shoal-sandbox-exec helper not installed beside executable",
-    ))
 }

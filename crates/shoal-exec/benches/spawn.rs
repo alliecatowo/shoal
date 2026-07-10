@@ -11,6 +11,7 @@ fn bench_suite(c: &mut Criterion) {
                     env: std::env::vars_os().collect(),
                     stdin: StdinSpec::Null,
                     mode: ExecMode::Capture,
+                    sandbox: None,
                 },
                 &CancelToken::new(),
             )

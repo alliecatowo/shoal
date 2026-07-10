@@ -1,5 +1,7 @@
 # The agent surface — wire contract v2
 
+**Status:** wire encoding partial.
+
 **Normative.** Companion to TDD §7; supersedes it where they conflict. Implements the doctrine
 below across `shoal-proto`, `shoal-kernel`, `shoal-mcp`.
 

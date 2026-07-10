@@ -103,12 +103,19 @@ impl Evaluator {
     }
 
     /// Route a statement value to the sink, skipping nulls and skipping
-    /// interactive external outcomes (already streamed via PtyTee, defect #1).
+    /// interactive *external* outcomes (already streamed via PtyTee, defect #1).
+    /// Builtin outcomes carry `pid == 0` and are never PtyTee-streamed, so they
+    /// must still be rendered by the sink even interactively (outcome
+    /// unification, REEF-cycle P1): only a real spawned child (`pid != 0`) was
+    /// tee'd to the terminal and should be suppressed here.
     fn sink_value(&mut self, v: &Value) {
         if *v == Value::Null {
             return;
         }
-        if self.interactive && matches!(v, Value::Outcome(_)) {
+        if self.interactive
+            && let Value::Outcome(o) = v
+            && o.pid != 0
+        {
             return;
         }
         self.emit(v);
@@ -334,7 +341,7 @@ impl Evaluator {
                     let old = self.env.clone();
                     self.env = old.child();
                     self.bind_pattern(pattern, value, false)?;
-                    let flow = self.eval_block(body);
+                    let flow = self.eval_block(body, true);
                     self.env = old;
                     match flow? {
                         Flow::Value(_) => {}
@@ -350,7 +357,7 @@ impl Evaluator {
             }
             Stmt::While { cond, body, .. } => {
                 while self.eval_expr(cond, Position::Value)?.as_condition()? {
-                    match self.eval_block(body)? {
+                    match self.eval_block(body, true)? {
                         Flow::Value(_) => {}
                         Flow::Continue => {}
                         Flow::Break => break,
@@ -385,38 +392,66 @@ impl Evaluator {
                     .as_condition()
                     .map_err(|e| e.or_span(*span))?;
                 if taken {
-                    self.eval_block(then)
+                    self.eval_block(then, false)
                 } else if let Some(e) = r#else {
                     self.eval_expr_flow(e, position)
                 } else {
                     Ok(Flow::Value(Value::Null))
                 }
             }
-            Expr::Block { block, .. } => self.eval_block(block),
+            Expr::Block { block, .. } => self.eval_block(block, false),
             _ => Ok(Flow::Value(self.eval_expr(expr, position)?)),
         }
     }
 
-    fn eval_block(&mut self, block: &Block) -> VResult<Flow> {
+    /// Evaluate a block. `sink_tail` says whether the caller will DISCARD the
+    /// block's value (loop bodies) versus CONSUME it (fn body, `if`/block used
+    /// as a value, or a top-level statement whose value `eval_program` itself
+    /// sinks). The double-echo fix (P1): the trailing bare-command statement is
+    /// the block VALUE and must NOT also be sunk here — only when the caller
+    /// discards it (`sink_tail`) does its output route to the sink; otherwise
+    /// the caller renders/sinks it exactly once. Non-final bare commands always
+    /// print (they are intermediate, discard-context regardless).
+    fn eval_block(&mut self, block: &Block, sink_tail: bool) -> VResult<Flow> {
         let old = self.env.clone();
         self.env = old.child();
         let mut last = Flow::Value(Value::Null);
-        for stmt in &block.stmts {
-            // Inside executed blocks/loop bodies only *bare command* statements
-            // route their outcome to the sink; other intermediate expression
-            // values stay silent and the trailing expr is the block value that
-            // is never sunk here (defect #1b).
+        let n = block.stmts.len();
+        for (i, stmt) in block.stmts.iter().enumerate() {
+            let is_tail = i + 1 == n;
+            // A statement is in discard context when it is not the block value,
+            // or when the caller discards the block value.
+            let discard = !is_tail || sink_tail;
             if let Stmt::Expr { expr, .. } = stmt
                 && is_command_expr(expr)
             {
-                let v = self.eval_expr(expr, Position::Statement)?;
-                self.sink_value(&v);
+                // Discard-context commands run in statement position (failures
+                // raise) and print; the value-context tail runs in value
+                // position (failures surface as an outcome) and stays silent.
+                let position = if discard {
+                    Position::Statement
+                } else {
+                    Position::Value
+                };
+                let v = self.eval_expr(expr, position)?;
+                if discard {
+                    self.sink_value(&v);
+                }
                 last = Flow::Value(v);
                 continue;
             }
             last = self.eval_stmt(stmt, false)?;
             if !matches!(last, Flow::Value(_)) {
                 break;
+            }
+            // A discarded tail whose value is not a bare command (e.g. a nested
+            // `if`/block that produced a command outcome) still routes to the
+            // sink so loop-body side effects are not swallowed.
+            if is_tail
+                && sink_tail
+                && let Flow::Value(v) = &last
+            {
+                self.sink_value(v);
             }
         }
         self.env = old;
@@ -520,35 +555,9 @@ impl Evaluator {
                 }
             }
             Expr::Binary {
-                op: BinOp::And,
-                lhs,
-                rhs,
+                op: BinOp::And | BinOp::Or,
                 ..
-            } => {
-                let l = self.eval_expr(lhs, Position::Value)?.as_condition()?;
-                if !l {
-                    Ok(Value::Bool(false))
-                } else {
-                    Ok(Value::Bool(
-                        self.eval_expr(rhs, Position::Value)?.as_condition()?,
-                    ))
-                }
-            }
-            Expr::Binary {
-                op: BinOp::Or,
-                lhs,
-                rhs,
-                ..
-            } => {
-                let l = self.eval_expr(lhs, Position::Value)?.as_condition()?;
-                if l {
-                    Ok(Value::Bool(true))
-                } else {
-                    Ok(Value::Bool(
-                        self.eval_expr(rhs, Position::Value)?.as_condition()?,
-                    ))
-                }
-            }
+            } => self.eval_chain(expr, position == Position::Statement),
             Expr::Binary {
                 op: BinOp::Coalesce,
                 lhs,
@@ -727,7 +736,7 @@ impl Evaluator {
                 env: self.env.clone(),
                 doc: None,
             }))),
-            Expr::Block { block, .. } => match self.eval_block(block)? {
+            Expr::Block { block, .. } => match self.eval_block(block, false)? {
                 Flow::Value(v) | Flow::Return(v) => Ok(v),
                 Flow::Break | Flow::Continue => {
                     Err(ErrorVal::new("custom", "loop control outside loop"))
@@ -807,11 +816,54 @@ impl Evaluator {
     }
 
     fn block_value(&mut self, b: &Block) -> VResult<Value> {
-        match self.eval_block(b)? {
+        match self.eval_block(b, false)? {
             Flow::Value(v) | Flow::Return(v) => Ok(v),
             Flow::Break | Flow::Continue => {
                 Err(ErrorVal::new("custom", "loop control outside loop"))
             }
+        }
+    }
+
+    /// Evaluate an `&&`/`||` chain (outcome unification, P1d). Per the normative
+    /// corpus (`spec/cases/outcome.toml`, TDD §1.10/§3.3/§4.5) the operators are
+    /// NOT bool-narrowing: they return the short-circuiting operand **verbatim**
+    /// (whichever side's `as_condition()` decided the result), so a chain of
+    /// outcome commands stays chainable — `(echo a && echo b).status` still
+    /// works. Operands run in *value* position so a failed command surfaces as
+    /// an outcome the chain short-circuits on rather than raising (letting
+    /// `sh{exit 1} || echo x` recover). When `emit` (statement/discard context)
+    /// every executed command operand's output is routed to the sink EXCEPT the
+    /// returned one (the caller renders that once), so `echo a && echo b` prints
+    /// both and an arbitrarily long chain prints every stage.
+    fn eval_chain(&mut self, e: &Expr, emit: bool) -> VResult<Value> {
+        let Expr::Binary {
+            op: op @ (BinOp::And | BinOp::Or),
+            lhs,
+            rhs,
+            span,
+        } = e
+        else {
+            // Leaf: an ordinary sub-expression (a command, a bool, …).
+            return self.eval_expr(e, Position::Value);
+        };
+        let l = self.eval_chain(lhs, emit)?;
+        let ok = l.as_condition().map_err(|err| err.or_span(*span))?;
+        let short = match op {
+            BinOp::And => !ok,
+            BinOp::Or => ok,
+            _ => unreachable!(),
+        };
+        if short {
+            // The short-circuiting operand decides — returned verbatim, not sunk
+            // here (the caller renders it once).
+            Ok(l)
+        } else {
+            // `l` is no longer the returned operand: print it if it was a
+            // command outcome, then the rhs decides.
+            if emit && is_command_expr(lhs) {
+                self.sink_value(&l);
+            }
+            self.eval_chain(rhs, emit)
         }
     }
 
@@ -1035,9 +1087,14 @@ impl Evaluator {
             return self.builtin_save(vs);
         }
         if builtins::is_builtin(&call.head) {
+            // Outcome unification (P1a): a builtin yields a `Value::Outcome`
+            // exactly like an external command — its structured result becomes
+            // the outcome's `.out` (`parsed`), `status = 0`/`ok = true`. A
+            // builtin error still raises as before (via `?`).
             let value = builtins::run(self, call)?;
+            let outcome = builtin_outcome(&call.head, value);
             // Redirects apply to builtin results too (defect #8).
-            return self.apply_builtin_redirects(call, value);
+            return self.apply_builtin_redirects(call, outcome);
         }
         if call.head == "cd" {
             if self.in_fn_body > 0 {
@@ -1612,6 +1669,7 @@ impl Evaluator {
                 env,
                 stdin,
                 mode,
+                sandbox: None,
             },
             &self.cancel,
         )
@@ -1765,6 +1823,13 @@ impl Evaluator {
             Value::Outcome(o) => match name {
                 "status" => Ok(o.status.map_or(Value::Null, |x| Value::Int(x as i64))),
                 "ok" => Ok(Value::Bool(o.ok)),
+                "signal" => Ok(o.signal.clone().map_or(Value::Null, Value::Str)),
+                "dur" => Ok(Value::Duration(o.dur_ns)),
+                "pid" => Ok(Value::Int(o.pid as i64)),
+                "cmd" => Ok(Value::Str(o.cmd.clone())),
+                // Raw stream bytes are always reachable, even on failure.
+                "stdout" => Ok(Value::Bytes(o.stdout.clone())),
+                "stderr" => Ok(Value::Bytes(o.stderr.clone())),
                 "out" | "err" if !o.ok => Err(ErrorVal::new(
                     "cmd_failed",
                     match (o.status, &o.signal) {
@@ -1776,11 +1841,20 @@ impl Evaluator {
                 .with_hint(String::from_utf8_lossy(&o.stderr).trim().to_string())),
                 "out" => Ok(o.out_value()),
                 "err" => Ok(Value::Bytes(o.stderr.clone())),
-                "pid" => Ok(Value::Int(o.pid as i64)),
+                // Outcome unification (P1b): an unknown field forwards to the
+                // structured `.out` — `(echo hi).out` is direct, but
+                // `(stat f).size` / `outcome.name` resolve against `.out` too.
+                // A failed outcome raises the same `cmd_failed` as `.out`.
+                _ if o.ok => self.field(o.out_value(), name),
                 _ => Err(ErrorVal::new(
-                    "field_missing",
-                    format!("unknown outcome field `{name}`"),
-                )),
+                    "cmd_failed",
+                    match (o.status, &o.signal) {
+                        (Some(code), _) => format!("`{}` exited with status {code}", o.cmd),
+                        (_, Some(signal)) => format!("`{}` died from {signal}", o.cmd),
+                        _ => format!("`{}` failed", o.cmd),
+                    },
+                )
+                .with_hint(String::from_utf8_lossy(&o.stderr).trim().to_string())),
             },
             _ => Err(ErrorVal::new(
                 "field_missing",
@@ -2370,6 +2444,27 @@ impl Evaluator {
     }
 }
 
+/// Wrap a builtin's structured result in a `Value::Outcome` (outcome
+/// unification, P1a). The structured value becomes the outcome's `parsed`
+/// (`.out`); `stdout` carries the same bytes a redirect/`echo … > file` would
+/// write, so `echo`, `ls`, `stat`, `which`, … all compose and forward like
+/// external outcomes. Builtin outcomes are marked `pid == 0` so the statement
+/// sink knows they were never PtyTee-streamed.
+fn builtin_outcome(head: &str, result: Value) -> Value {
+    let stdout = value_bytes(&result);
+    Value::Outcome(Arc::new(OutcomeVal {
+        status: Some(0),
+        signal: None,
+        ok: true,
+        stdout: Arc::new(stdout),
+        stderr: Arc::new(Vec::new()),
+        dur_ns: 0,
+        pid: 0,
+        cmd: head.to_string(),
+        parsed: Some(result),
+    }))
+}
+
 /// Render a value to bytes for a builtin redirect target (defect #8).
 fn value_bytes(v: &Value) -> Vec<u8> {
     match v {
@@ -2773,24 +2868,106 @@ mod tests {
         eval(&program, cwd)
     }
 
+    /// The structured `.out` of a captured command outcome.
+    fn out_of(v: &Value) -> Value {
+        match v {
+            Value::Outcome(o) => o.out_value(),
+            other => other.clone(),
+        }
+    }
+
     #[test]
     fn defect1_nonfinal_and_block_commands_reach_sink() {
         // Non-final top-level statement values pass through to the sink; the
-        // final value is returned.
+        // final value is returned. Every command now yields an outcome whose
+        // `.out` carries the joined echo text (outcome unification, P1a).
         let (out, captured) = run_capturing("echo hi\necho bye");
-        assert_eq!(out.unwrap(), Value::Str("bye".into()));
-        assert_eq!(captured, vec![Value::Str("hi".into())]);
+        assert_eq!(out_of(&out.unwrap()), Value::Str("bye".into()));
+        assert_eq!(captured.len(), 1);
+        assert_eq!(out_of(&captured[0]), Value::Str("hi".into()));
 
         // Every iteration of a loop body's bare command reaches the sink.
         let (_out, captured) = run_capturing("for x in [1,2,3] { echo (x) }");
+        let texts: Vec<Value> = captured.iter().map(out_of).collect();
         assert_eq!(
-            captured,
+            texts,
             vec![
                 Value::Str("1".into()),
                 Value::Str("2".into()),
                 Value::Str("3".into()),
             ]
         );
+    }
+
+    #[test]
+    fn outcome_unification_builtin_out_and_ok() {
+        // A builtin is an outcome: `.out` is its structured result, `.ok` true.
+        assert_eq!(run("(echo hi).out").unwrap(), Value::Str("hi".into()));
+        assert_eq!(run("(echo hi).ok").unwrap(), Value::Bool(true));
+        // Unknown fields forward to `.out` (stat record → `.size`).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a"), b"xyz").unwrap();
+        assert_eq!(run_in("(stat a).size", dir.path()).unwrap(), Value::Size(3));
+    }
+
+    #[test]
+    fn outcome_unification_and_or_compose_commands() {
+        // `echo a && echo b` prints BOTH (P1d): `a` via the sink, `b` returned.
+        let (out, captured) = run_capturing("echo a && echo b");
+        assert_eq!(out_of(&out.unwrap()), Value::Str("b".into()));
+        assert_eq!(captured.iter().map(out_of).collect::<Vec<_>>(), vec![Value::Str("a".into())]);
+        // A three-stage chain prints every stage.
+        let (out, captured) = run_capturing("echo a && echo b && echo c");
+        assert_eq!(out_of(&out.unwrap()), Value::Str("c".into()));
+        assert_eq!(
+            captured.iter().map(out_of).collect::<Vec<_>>(),
+            vec![Value::Str("a".into()), Value::Str("b".into())]
+        );
+        // `||` recovers from a failed command without raising.
+        let out = run("sh { exit 1 } || echo x").unwrap();
+        assert_eq!(out_of(&out), Value::Str("x".into()));
+    }
+
+    #[test]
+    fn outcome_forwards_collection_methods() {
+        // `ls` is an outcome; `.where`/`.sort`/`.first(n)`/`.map` forward to its
+        // `.out` table (outcome unification P1b + first(n) arity fix).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("big"), vec![0u8; 2048]).unwrap();
+        std::fs::write(dir.path().join("small"), b"x").unwrap();
+        let names = run_in("ls.where(.size > 1b).sort(.name).map(.name)", dir.path()).unwrap();
+        assert_eq!(names, Value::List(vec![Value::Path("big".into())]));
+        // `.first(2)` returns a LIST of two, chainable into `.map`.
+        std::fs::write(dir.path().join("mid"), vec![0u8; 4]).unwrap();
+        let first_two = run_in("ls.sort(.name).first(2).map(.name)", dir.path()).unwrap();
+        assert!(matches!(first_two, Value::List(xs) if xs.len() == 2));
+    }
+
+    #[test]
+    fn double_echo_fixed_and_bare_echo_blank_line() {
+        // A fn whose last body statement is a bare command prints ONCE: the
+        // trailing command is the block value, not also sunk (P1 dbl-echo).
+        let (out, captured) = run_capturing("fn g(){ echo hi }\ng()");
+        assert_eq!(out_of(&out.unwrap()), Value::Str("hi".into()));
+        assert!(captured.is_empty(), "trailing command must not double-print: {captured:?}");
+        // Bare `echo` emits a blank line: its outcome stdout is "\n".
+        let (_out, captured) = run_capturing("echo\n42");
+        assert_eq!(captured.len(), 1);
+        match &captured[0] {
+            Value::Outcome(o) => assert_eq!(&*o.stdout, b"\n"),
+            other => panic!("expected outcome, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn top_level_ls_renders_as_table() {
+        // An outcome with a structured `.out` renders as that structure (P1c).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("only"), b"x").unwrap();
+        let v = run_in("ls", dir.path()).unwrap();
+        let rendered = shoal_value::render::render_block(&v, 80);
+        assert!(rendered.contains("name"), "ls should render a table: {rendered:?}");
+        assert!(rendered.contains("only"), "ls table should list the file: {rendered:?}");
     }
 
     #[test]
@@ -2806,7 +2983,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a"), b"x").unwrap();
         let v = run_in("stat a", dir.path()).unwrap();
-        let Value::Record(r) = v else { panic!("stat should be a record") };
+        let Value::Record(r) = out_of(&v) else { panic!("stat should be a record") };
         assert!(
             matches!(r.get("modified"), Some(Value::DateTime(_))),
             "modified must be a DateTime, got {:?}",
@@ -2820,7 +2997,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a"), b"x").unwrap();
         let v = run_in("let r = ls\nr", dir.path()).unwrap();
-        assert!(matches!(v, Value::Table(rows) if rows.len() == 1));
+        // `ls` now yields an outcome; its `.out` is the table (P1a).
+        assert!(matches!(out_of(&v), Value::Table(rows) if rows.len() == 1));
     }
 
     #[test]
@@ -2955,9 +3133,10 @@ mod tests {
 
     #[test]
     fn defect12_builtin_word_coercion() {
-        // `sleep 0ms` binds the word to a duration; `sleep 0` to seconds.
-        assert_eq!(run("sleep 0ms").unwrap(), Value::Null);
-        assert_eq!(run("sleep 0").unwrap(), Value::Null);
+        // `sleep 0ms` binds the word to a duration; `sleep 0` to seconds. The
+        // builtin now yields an outcome whose `.out` is null (P1a).
+        assert_eq!(out_of(&run("sleep 0ms").unwrap()), Value::Null);
+        assert_eq!(out_of(&run("sleep 0").unwrap()), Value::Null);
     }
 
     #[test]
@@ -2993,7 +3172,7 @@ mod tests {
     #[test]
     fn echo_renders_non_scalar_values() {
         let v = run("let items = [1,2,3]\necho (items)").unwrap();
-        assert_eq!(v, Value::Str("[1, 2, 3]".into()));
+        assert_eq!(out_of(&v), Value::Str("[1, 2, 3]".into()));
     }
 
     #[test]
@@ -3073,13 +3252,13 @@ mod tests {
     fn typed_builtins_dispatch_before_path() {
         let dir = tempfile::tempdir().unwrap();
         let program = shoal_syntax::parse("touch a\nls").unwrap();
-        let value = eval(&program, dir.path()).unwrap();
+        let value = out_of(&eval(&program, dir.path()).unwrap());
         assert!(
             matches!(value, Value::Table(rows) if rows.len() == 1 && rows[0]["name"] == Value::Path("a".into()))
         );
 
         let rm = shoal_syntax::parse("rm a").unwrap();
-        let value = eval(&rm, dir.path()).unwrap();
+        let value = out_of(&eval(&rm, dir.path()).unwrap());
         assert!(
             matches!(value, Value::List(rows) if matches!(&rows[0], Value::Record(r) if matches!(r.get("trash"), Some(Value::Path(_)))))
         );

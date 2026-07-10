@@ -1,0 +1,100 @@
+# `match` pattern forms (TDD §3.2 grammar: `pat = literal | rangepat | "_" |
+# IDENT | type IDENT | "{" fieldpats "}" | "[" listpats "]"`). Arms are
+# separated with `;` (TERM) to keep each case a single TOML line.
+#
+# Range patterns (`0..3`, `3..=10`) are already wired end-to-end (parser +
+# `Evaluator::pattern_matches`) — those two cases are plain regression.
+# Type/record/list patterns are constructed in the AST (`shoal-ast::Pattern`)
+# and round-tripped by the formatter (`shoal-syntax::format::pat`), but
+# `match_pattern`/`pattern_matches` do not parse or bind them yet — those
+# cases are expected to fail (most as a parse error) until that lands.
+
+[[case]]
+name = "match-range-basic"
+src = 'match 5 { 0..3 => "low"; 3..=10 => "mid"; _ => "high" }'
+value = '"mid"'
+
+[[case]]
+name = "match-range-boundary-exclusive-vs-inclusive"
+# 3 is excluded from `0..3` (exclusive) and included in `3..=10` (inclusive).
+src = 'match 3 { 0..3 => "low"; 3..=10 => "mid"; _ => "high" }'
+value = '"mid"'
+
+[[case]]
+name = "match-type-int"
+src = 'match 5 { int n => "int:{n}"; _ => "other" }'
+value = '"int:5"'
+
+[[case]]
+name = "match-type-str"
+src = 'match "hi" { str s => "str:{s}"; _ => "other" }'
+value = '"str:hi"'
+
+[[case]]
+name = "match-type-bool"
+src = 'match true { bool b => "bool:{b}"; _ => "other" }'
+value = '"bool:true"'
+
+[[case]]
+name = "match-type-mismatch-falls-through"
+src = 'match "hi" { int n => "int:{n}"; str s => "str:{s}" }'
+value = '"str:hi"'
+
+[[case]]
+name = "match-record-shorthand"
+src = 'match {name: "ada", age: 30} { {name, age} => "{name} is {age}"; _ => "no match" }'
+value = '"ada is 30"'
+
+[[case]]
+name = "match-record-subpattern"
+src = 'match {point: {x: 1, y: 2}} { {point: {x, y}} => x + y; _ => 0 }'
+value = "3"
+
+[[case]]
+name = "match-record-missing-field-falls-through"
+src = 'match {name: "ada"} { {name, age} => "{name} is {age}"; _ => "no age" }'
+value = '"no age"'
+
+[[case]]
+name = "match-record-nested-list-subpattern"
+src = 'match {items: [1, 2, 3]} { {items: [a, b, c]} => a + b + c; _ => 0 }'
+value = "6"
+
+[[case]]
+name = "match-record-guard"
+src = 'match {status: 200} { {status} if status >= 200 && status < 300 => "ok"; {status} => "other:{status}" }'
+value = '"ok"'
+
+[[case]]
+name = "match-list-fixed-arity"
+src = 'match [1, 2, 3] { [a, b, c] => a + b + c; _ => 0 }'
+value = "6"
+
+[[case]]
+name = "match-list-rest-binding"
+src = 'match [1, 2, 3, 4] { [first, ...rest] => rest.len(); _ => 0 }'
+value = "3"
+
+[[case]]
+name = "match-list-arity-mismatch-falls-through"
+src = 'match [1, 2] { [a, b, c] => "three"; [a, b] => "two"; _ => "other" }'
+value = '"two"'
+
+[[case]]
+name = "match-list-empty-pattern"
+src = 'match [] { [] => "empty"; _ => "nonempty" }'
+value = '"empty"'
+
+[[case]]
+name = "match-list-empty-pattern-falls-through"
+src = 'match [1] { [] => "empty"; [a] => "one:{a}"; _ => "other" }'
+value = '"one:1"'
+
+[[case]]
+name = "match-alternation-with-guard"
+# `|` alternation of literal patterns (TDD §1.4's one asylum for `|`) plus a
+# guarded bind pattern — the alternation/guard machinery itself is already
+# wired; kept here alongside the type/record/list forms for one-stop pattern
+# coverage.
+src = 'match 7 { 1 | 2 | 3 => "small"; n if n > 5 => "big"; _ => "medium" }'
+value = '"big"'

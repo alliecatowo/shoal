@@ -1,5 +1,7 @@
 # Input, interpreters, and running things: the anti-heredoc contract
 
+**Status:** interpreter blocks + `.feed`: spec complete, implementation pending.
+
 **Normative. The corpus/frame decides disputes.** Companion to `docs/TDD.md` (esp. §1.2, §1.3,
 §1.9, §4.5, §13.13, §13.14), `docs/VISION.md` §1/§4, `docs/AGENT-SURFACE.md`, `docs/REEF.md` §5;
 supersedes them where they conflict on stdin/interpreter/run surface. Everything here is a

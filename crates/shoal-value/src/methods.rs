@@ -19,13 +19,27 @@ pub fn call_method(
 }
 
 fn dispatch(ctx: &mut dyn CallCtx, recv: Value, name: &str, args: CallArgs) -> VResult<Value> {
+    // Outcome unification (P1b): an unknown method on a command outcome forwards
+    // to its structured `.out`, so `ls.where(.size > 1b).sort(.name)` works
+    // (`ls` is an outcome; `.where`/`.sort` operate on its `.out` table). Raw
+    // stream bytes stay reachable via `.stdout`/`.stderr`.
+    if let Value::Outcome(o) = &recv {
+        match name {
+            "stdout" => return Ok(Value::Bytes(o.stdout.clone())),
+            "stderr" => return Ok(Value::Bytes(o.stderr.clone())),
+            _ => {
+                let inner = o.out_value();
+                return dispatch(ctx, inner, name, args);
+            }
+        }
+    }
     match name {
         "len" | "count" => no_args(&args).and_then(|_| len(recv)),
         "is_empty" => no_args(&args)
             .and_then(|_| len(recv))
             .map(|v| Value::Bool(v == Value::Int(0))),
-        "first" => first_last(recv, true),
-        "last" => first_last(recv, false),
+        "first" => first_last(recv, &args, true),
+        "last" => first_last(recv, &args, false),
         "collect" => collect(recv),
         "tee" => tee(recv, int_arg(&args, 0, 2)?),
         "map" => map(ctx, recv, arg(&args, 0)?),
@@ -184,13 +198,27 @@ fn len(v: Value) -> VResult<Value> {
         }
     } as i64))
 }
-fn first_last(v: Value, first: bool) -> VResult<Value> {
-    let mut x = seq(v)?;
-    if first {
-        Ok(x.into_iter().next().unwrap_or(Value::Null))
-    } else {
-        Ok(x.pop().unwrap_or(Value::Null))
+/// `.first()`/`.last()` return a single element; `.first(n)`/`.last(n)` return
+/// a LIST of the first/last `n` (P3 arity fix — `.first(2)` was wrongly
+/// yielding a single record, breaking `…​.first(2).map(.name)`).
+fn first_last(v: Value, args: &CallArgs, first: bool) -> VResult<Value> {
+    if args.pos.is_empty() && args.named.is_empty() {
+        let mut x = seq(v)?;
+        return Ok(if first {
+            x.into_iter().next().unwrap_or(Value::Null)
+        } else {
+            x.pop().unwrap_or(Value::Null)
+        });
     }
+    let n = int_arg(args, 0, 0)?;
+    let x = seq(v)?;
+    let out: Vec<Value> = if first {
+        x.into_iter().take(n).collect()
+    } else {
+        let skip = x.len().saturating_sub(n);
+        x.into_iter().skip(skip).collect()
+    };
+    Ok(Value::List(out))
 }
 fn collect(v: Value) -> VResult<Value> {
     match v {
@@ -749,6 +777,51 @@ mod tests {
             Value::List(vec![Value::Int(1), Value::Int(2)])
         );
     }
+    #[test]
+    fn first_last_arity_variants() {
+        let x = Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+        // Zero-arg forms return a single element.
+        assert_eq!(call(x.clone(), "first", vec![]).unwrap(), Value::Int(1));
+        assert_eq!(call(x.clone(), "last", vec![]).unwrap(), Value::Int(3));
+        // `.first(n)`/`.last(n)` return a LIST of n (P3 arity fix).
+        assert_eq!(
+            call(x.clone(), "first", vec![Value::Int(2)]).unwrap(),
+            Value::List(vec![Value::Int(1), Value::Int(2)])
+        );
+        assert_eq!(
+            call(x.clone(), "last", vec![Value::Int(2)]).unwrap(),
+            Value::List(vec![Value::Int(2), Value::Int(3)])
+        );
+        // Overrun clamps to the collection length (no error).
+        assert_eq!(
+            call(x, "first", vec![Value::Int(9)]).unwrap(),
+            Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)])
+        );
+    }
+
+    #[test]
+    fn outcome_methods_forward_to_out() {
+        use crate::OutcomeVal;
+        use std::sync::Arc;
+        // An outcome whose `.out` is a list forwards collection methods.
+        let outcome = Value::Outcome(Arc::new(OutcomeVal {
+            status: Some(0),
+            signal: None,
+            ok: true,
+            stdout: Arc::new(Vec::new()),
+            stderr: Arc::new(Vec::new()),
+            dur_ns: 0,
+            pid: 0,
+            cmd: "x".into(),
+            parsed: Some(Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)])),
+        }));
+        assert_eq!(call(outcome.clone(), "len", vec![]).unwrap(), Value::Int(3));
+        assert_eq!(
+            call(outcome, "first", vec![Value::Int(2)]).unwrap(),
+            Value::List(vec![Value::Int(1), Value::Int(2)])
+        );
+    }
+
     #[test]
     fn task_lifecycle_methods() {
         let t = crate::TaskVal::new("t");

@@ -911,7 +911,9 @@ fn path_field(value: &Value, name: &str) -> Result<Value, String> {
             "dur_ns" => Value::Duration(o.dur_ns),
             "pid" => Value::Int(o.pid as i64),
             "cmd" => Value::Str(o.cmd.clone()),
-            _ => return Err(format!("outcome has no field `{name}`")),
+            // Unknown field names forward to the structured `.out` value,
+            // mirroring eval's Value::Outcome field-access contract.
+            _ => return path_field(&o.out_value(), name),
         }),
         Value::Error(e) => Ok(match name {
             "code" => Value::Str(e.code.clone()),

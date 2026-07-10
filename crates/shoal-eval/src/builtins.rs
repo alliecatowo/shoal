@@ -1,11 +1,12 @@
 use super::Evaluator;
 use shoal_ast::{CmdArg, CmdCall};
+use shoal_exec::CancelToken;
 use shoal_value::{ErrorVal, Record, VResult, Value};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 static TRASH_SEQ: AtomicU64 = AtomicU64::new(1);
 const NAMES: &[&str] = &[
@@ -48,7 +49,8 @@ pub(super) fn run(ev: &mut Evaluator, call: &CmdCall) -> VResult<Value> {
             .collect::<VResult<Vec<_>>>()
             .map_err(|e| e.or_span(call.span))?;
     }
-    dispatch(&call.head, &ev.cwd, &ev.process_env, args, &flags).map_err(|e| e.or_span(call.span))
+    dispatch(&call.head, &ev.cwd, &ev.process_env, args, &flags, &ev.cancel)
+        .map_err(|e| e.or_span(call.span))
 }
 
 fn dispatch(
@@ -57,6 +59,7 @@ fn dispatch(
     penv: &[(OsString, OsString)],
     args: Vec<Value>,
     flags: &[String],
+    cancel: &CancelToken,
 ) -> VResult<Value> {
     match name {
         // echo renders every value (lists/records/tables/null included), strings
@@ -79,7 +82,7 @@ fn dispatch(
         "stat" => stat(cwd, args),
         "which" => which(penv, args),
         "env" => env(penv, args),
-        "sleep" => sleep(args),
+        "sleep" => sleep(args, cancel),
         _ => Err(ErrorVal::new(
             "not_found",
             format!("unknown builtin {name}"),
@@ -380,7 +383,7 @@ fn env(penv: &[(OsString, OsString)], args: Vec<Value>) -> VResult<Value> {
         Err(ErrorVal::arg_error("env accepts zero or one name"))
     }
 }
-fn sleep(args: Vec<Value>) -> VResult<Value> {
+fn sleep(args: Vec<Value>, cancel: &CancelToken) -> VResult<Value> {
     if args.len() != 1 {
         return Err(ErrorVal::arg_error("sleep requires one duration"));
     }
@@ -393,7 +396,20 @@ fn sleep(args: Vec<Value>) -> VResult<Value> {
             ));
         }
     };
-    std::thread::sleep(d);
+    // Poll the cancel token in small increments so Ctrl-C shortens the sleep
+    // (TDD §4.7): an un-cancellable sleep froze the foreground on interrupt.
+    let deadline = Instant::now() + d;
+    let step = Duration::from_millis(50);
+    loop {
+        if cancel.is_cancelled() {
+            break;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        std::thread::sleep((deadline - now).min(step));
+    }
     Ok(Value::Null)
 }
 
@@ -407,7 +423,7 @@ mod tests {
     fn empty_rm_is_safe() {
         let d = tempfile::tempdir().unwrap();
         assert_eq!(
-            dispatch("rm", d.path(), &pe(), vec![], &[])
+            dispatch("rm", d.path(), &pe(), vec![], &[], &CancelToken::new())
                 .unwrap_err()
                 .code,
             "no_matches"
@@ -417,8 +433,15 @@ mod tests {
     fn rm_trashes_by_default() {
         let d = tempfile::tempdir().unwrap();
         fs::write(d.path().join("x"), b"x").unwrap();
-        let Value::List(xs) =
-            dispatch("rm", d.path(), &pe(), vec![Value::Path("x".into())], &[]).unwrap()
+        let Value::List(xs) = dispatch(
+            "rm",
+            d.path(),
+            &pe(),
+            vec![Value::Path("x".into())],
+            &[],
+            &CancelToken::new(),
+        )
+        .unwrap()
         else {
             panic!()
         };
@@ -457,5 +480,22 @@ mod tests {
         )
         .unwrap();
         assert!(d.path().join("b").exists());
+    }
+    #[test]
+    fn sleep_returns_promptly_when_pre_cancelled() {
+        // A pre-cancelled token makes even a long sleep return immediately
+        // (Ctrl-C shortens `sleep`, TDD §4.7).
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        let start = Instant::now();
+        assert_eq!(
+            sleep(vec![Value::Int(30)], &cancel).unwrap(),
+            Value::Null
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "cancelled sleep should return promptly, took {:?}",
+            start.elapsed()
+        );
     }
 }

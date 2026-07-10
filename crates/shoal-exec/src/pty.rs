@@ -170,7 +170,8 @@ fn forward_stdin_and_resize(
 }
 
 /// Run `spec` on a real PTY, teeing the merged output stream.
-pub(crate) fn run_pty(spec: ExecSpec, cancel: &CancelToken) -> io::Result<ExecResult> {
+pub(crate) fn run_pty(mut spec: ExecSpec, cancel: &CancelToken) -> io::Result<ExecResult> {
+    let enforcement = crate::sandbox::apply(&mut spec)?;
     let ExecSpec {
         argv,
         cwd,
@@ -351,5 +352,6 @@ pub(crate) fn run_pty(spec: ExecSpec, cancel: &CancelToken) -> io::Result<ExecRe
         stderr: Vec::new(),
         dur: start.elapsed(),
         pid: pid as u32,
+        enforcement,
     })
 }

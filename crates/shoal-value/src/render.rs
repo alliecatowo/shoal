@@ -340,18 +340,43 @@ pub fn render_block(v: &Value, width: usize) -> String {
             lines.join("\n")
         }
         Value::Outcome(o) => {
-            let text = String::from_utf8_lossy(&o.stdout);
-            let text = text.strip_suffix('\n').unwrap_or(&text);
-            if text.is_empty() {
-                if o.ok {
-                    "\x1b[32m[✅ success]\x1b[0m".to_string()
-                } else {
-                    format!("\x1b[31;1m[❌ status {}]\x1b[0m", o.status.unwrap_or(-1))
+            // Outcome unification (P1c): a successful outcome whose `.out` is
+            // structured (table/record/list) renders AS that structure, so `ls`
+            // still shows a table at top level rather than `outcome(status:…)`.
+            // Otherwise fall back to the compact stdout-text form.
+            let structured = if o.ok {
+                match o.out_value() {
+                    v @ (Value::Table(_) | Value::Record(_) | Value::List(_)) => Some(v),
+                    _ => None,
                 }
             } else {
-                let bar = if o.ok { "\x1b[32m│\x1b[0m" } else { "\x1b[31;1m│\x1b[0m" };
-                let lines: Vec<String> = text.lines().map(|l| format!("{} {}", bar, l)).collect();
-                lines.join("\n")
+                None
+            };
+            if let Some(v) = structured {
+                render_block(&v, width)
+            } else {
+                let text = String::from_utf8_lossy(&o.stdout);
+                let text = text.strip_suffix('\n').unwrap_or(&text);
+                if text.is_empty() {
+                    if o.ok {
+                        // A builtin whose structured `.out` is a (possibly empty)
+                        // string renders as that string: bare `echo` is a blank
+                        // line, not a success marker. The marker is reserved for
+                        // genuinely output-less commands (e.g. `touch`) whose
+                        // `.out` carries no text value.
+                        if let Value::Str(s) = o.out_value() {
+                            return s;
+                        }
+                        "\x1b[32m[✅ success]\x1b[0m".to_string()
+                    } else {
+                        format!("\x1b[31;1m[❌ status {}]\x1b[0m", o.status.unwrap_or(-1))
+                    }
+                } else {
+                    let bar = if o.ok { "\x1b[32m│\x1b[0m" } else { "\x1b[31;1m│\x1b[0m" };
+                    let lines: Vec<String> =
+                        text.lines().map(|l| format!("{} {}", bar, l)).collect();
+                    lines.join("\n")
+                }
             }
         }
         Value::Bytes(b) => String::from_utf8_lossy(b).into_owned(),

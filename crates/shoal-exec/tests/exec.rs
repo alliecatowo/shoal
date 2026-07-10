@@ -45,6 +45,7 @@ fn spec(argv: &[&str], mode: ExecMode) -> ExecSpec {
         env: vec![(OsString::from("PATH"), OsString::from("/usr/bin:/bin"))],
         stdin: StdinSpec::Null,
         mode,
+        sandbox: None,
     }
 }
 
@@ -321,6 +322,7 @@ fn empty_argv_is_invalid_input() {
         env: vec![],
         stdin: StdinSpec::Null,
         mode: ExecMode::Capture,
+        sandbox: None,
     };
     let err = run(s, &CancelToken::new()).expect_err("must fail");
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);

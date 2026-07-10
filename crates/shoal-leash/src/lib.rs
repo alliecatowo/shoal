@@ -372,6 +372,35 @@ pub struct FsSandbox {
     pub delete: Vec<PathBuf>,
 }
 
+/// Coarse network policy carried by [`SandboxPolicy`]. This crate has no
+/// seccomp/netns backend, so `Deny` is never independently OS-enforced today
+/// — [`EnforcementStatus::network_enforced`] reports that honestly rather
+/// than pretending the restriction took effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NetPolicy {
+    #[default]
+    Unrestricted,
+    Deny,
+}
+
+/// A concrete, resolved enforcement request for one child spawn: filesystem
+/// scopes, a coarse network policy, an optional pinned spawn hash (TDD §8
+/// content-hash pinning), and a `hermetic` intent flag.
+///
+/// `hermetic: true` means the caller wants a hard guarantee: the consumer
+/// (`shoal-exec::run`/`spawn_capture`) must refuse to spawn rather than run
+/// with any requested dimension unenforced. `hermetic: false` (default)
+/// means best-effort: the strongest available OS mechanism is applied, and
+/// anything that cannot be enforced on this host is reported truthfully via
+/// [`EnforcementStatus`] rather than silently granted.
+#[derive(Debug, Clone, Default)]
+pub struct SandboxPolicy {
+    pub fs: FsSandbox,
+    pub net: NetPolicy,
+    pub spawn_hash: Option<String>,
+    pub hermetic: bool,
+}
+
 #[cfg(target_os = "linux")]
 pub fn landlock_abi() -> Option<i32> {
     const VERSION: u32 = 1;
@@ -763,5 +792,13 @@ opaque = "ask"
                 .unwrap_err()
                 .contains("only available on macOS")
         );
+    }
+    #[test]
+    fn sandbox_policy_defaults_are_unrestricted_and_advisory() {
+        let p = SandboxPolicy::default();
+        assert_eq!(p.net, NetPolicy::Unrestricted);
+        assert!(p.spawn_hash.is_none());
+        assert!(!p.hermetic);
+        assert!(p.fs.read.is_empty());
     }
 }

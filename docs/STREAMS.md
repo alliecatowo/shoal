@@ -1,5 +1,7 @@
 # Reactive values: sources, combinators, sinks; the honest `tail -f`
 
+**Status:** spec complete, implementation pending.
+
 **Normative. The corpus/frame decides disputes.** Companion to `docs/TDD.md` (esp. §1.9, §4.5,
 §4.7, §13.7), `docs/VISION.md` §2, `docs/AGENT-SURFACE.md` §4–7, `docs/REEF.md`; supersedes them
 where they conflict on stream semantics. Everything here is a decision; the corpus

@@ -10,13 +10,13 @@ Crate dependency DAG (acyclic, enforced):
 shoal-ast  ←  shoal-value  ←  shoal-adapters
     ↑              ↑               ↑
 shoal-syntax   shoal-eval  ← ← ← ← ┘
-                   ↑   ↖ shoal-exec, shoal-journal (leaf crates, no shoal deps)
+                   ↑   ↖ shoal-exec, shoal-journal, shoal-reef (leaf crates, no shoal deps)
                 shoal (binary: REPL/TUI, script runner)
 ```
 
 Ownership map:
 - `shoal-ast`, `shoal-value` (core types), `shoal-syntax`, `shoal-eval`, `shoal` (binary): owned by the integrator. Do not edit unless your task says so.
-- `shoal-exec`, `shoal-journal`, `shoal-adapters`, `shoal-value/src/methods.rs` + `render.rs`, `spec/cases/*.toml`: delegated modules — build to the contracts below.
+- `shoal-exec`, `shoal-journal`, `shoal-adapters`, `shoal-reef`, `shoal-value/src/methods.rs` + `render.rs`, `spec/cases/*.toml`: delegated modules — build to the contracts below.
 
 Build hygiene for parallel work: only edit files inside your assigned crate/dir; never touch the workspace `Cargo.toml`; if you must add a dependency use `cargo add -p <your-crate> <dep>`; run your tests with `CARGO_TARGET_DIR=target-<yourcrate> cargo test -p <your-crate>` to avoid lock contention.
 
@@ -163,6 +163,11 @@ Render rules (normative — the conformance corpus depends on these):
 ## 4. Error codes (pinned — corpus asserts these)
 
 `parse_error type_error arg_error undefined_var not_found cmd_failed div_zero index_range field_missing utf8_error stream_consumed no_matches custom assert_failed permission recursion_limit`
+
+Extensions from the companion design docs (each pinned there; collected here per this file's own rule that every code the corpus can assert lives in one list):
+- reef (REEF.md §7): `reef_unlocked reef_drift reef_conflict reef_not_found reef_provider`
+- IO (IO.md §5): `feed_error lang_block_unbalanced runner_not_found`
+- streams (STREAMS.md, alongside the already-pinned `stream_consumed`): `stream_unbounded`
 
 ## 5. Conformance corpus schema (`spec/cases/*.toml`)
 

@@ -1,0 +1,121 @@
+# Outcome-unification cases (TDD §4.1, §4.5; CONTRACTS §3/§4).
+#
+# TDD §4.1: `outcome: {status, ok, out, err, dur, pid, cmd}`, `.out` structurally
+# parsed lazily. TDD §1.10/§3.3: `&&`/`||` admit `bool` or a command `outcome`
+# (success = true) as operands; TDD §4.5: "outcome in &&/||/if position =
+# success-as-bool, no raise". `echo` is a builtin — under outcome-unification
+# (shoal-eval's `builtin_outcome`, "P1a") it returns an `outcome` like any
+# other command call, not a bare `str`. All forms below are error-free (echo
+# cannot fail) and their renders carry no environment-dependent bytes (no
+# pid/dur/timestamps in `outcome`'s render form, per CONTRACTS §3:
+# `outcome(status: 0, ok: true)`), so every case asserts a concrete value
+# rather than skipping.
+
+[[case]]
+name = "outcome-echo-out"
+src = "(echo hi).out"
+value = '"hi"'
+
+[[case]]
+name = "outcome-echo-ok"
+src = "(echo hi).ok"
+value = "true"
+
+[[case]]
+name = "outcome-echo-status"
+src = "(echo hi).status"
+value = "0"
+
+[[case]]
+name = "outcome-echo-render-inline"
+# A bare builtin call at value position renders as an `outcome`, per
+# CONTRACTS §3's pinned outcome render form.
+src = "echo hi"
+value = "outcome(status: 0, ok: true)"
+
+[[case]]
+name = "outcome-echo-out-multi-args"
+# echo joins its (verbatim) argument words with a single space (builtins.rs
+# `echo_display`); the outcome's `.out` recovers that same text.
+src = "(echo a b c).out"
+value = '"a b c"'
+
+[[case]]
+name = "outcome-echo-out-numeric-text"
+# A builtin's `.out` is exactly its own structured return value (`echo`
+# returns the joined-args `str` verbatim), never a re-parse of serialized
+# bytes — `builtin_outcome` stashes the builtin's `Value` straight into the
+# outcome's `parsed` slot, which short-circuits `OutcomeVal::out_value`'s
+# byte-level JSON sniff entirely. So `echo 42`'s `.out` stays the str "42",
+# not an int.
+src = "(echo 42).out"
+value = '"42"'
+
+[[case]]
+name = "outcome-echo-out-json-list"
+# Same rule as above: even `[`/`{`-shaped text is not JSON-sniffed for a
+# builtin outcome, because `.out` never touches the raw bytes — it returns
+# echo's own `Value::Str` argument unchanged. (A real subprocess's outcome,
+# with no `parsed` preset, *would* auto-upgrade `[`-shaped stdout to a
+# structured list — that path is exercised on adapter output elsewhere, not
+# here.)
+src = '''(echo '[1,2,3]').out'''
+value = '"[1,2,3]"'
+
+[[case]]
+name = "outcome-echo-out-json-record"
+src = '''(echo '{"a": 1}').out'''
+value = '"{\"a\": 1}"'
+
+# --- &&/||/if/! admit outcomes as bool-coerced operands (TDD §1.10, §3.3,
+# §4.5) but the operators themselves are NOT bool-narrowing: `&&`/`||`
+# return the short-circuiting operand **verbatim** (whichever side's
+# `as_condition()` decided the result), not a forced `Value::Bool` — so a
+# chain of outcome-returning commands stays chainable (`.status`/`.out`
+# still reachable on the result) exactly like VISION §2's "structure is
+# never re-guessed because it is never lost". This still agrees with the
+# pinned unit test `strict_conditions_and_short_circuit` (`false && missing`
+# / `true || missing` -> `Value::Bool`), because there the deciding operand
+# already *was* a bool — returning it verbatim and coercing it to bool are
+# indistinguishable when the operand is already a bool.
+
+[[case]]
+name = "outcome-and-chain-both-outcomes"
+src = "echo a && echo b"
+value = "outcome(status: 0, ok: true)"
+
+[[case]]
+name = "outcome-and-chain-three"
+src = "echo a && echo b && echo c"
+value = "outcome(status: 0, ok: true)"
+
+[[case]]
+name = "outcome-or-chain-short-circuits"
+# `echo hi` is truthy, so `||` short-circuits and returns it unchanged
+# without evaluating `echo bye` at all.
+src = "echo hi || echo bye"
+value = "outcome(status: 0, ok: true)"
+
+[[case]]
+name = "outcome-and-outcome-then-bool"
+# lhs outcome is truthy, so `&&` proceeds and returns the rhs verbatim —
+# here that's a plain `bool`.
+src = "echo hi && false"
+value = "false"
+
+[[case]]
+name = "outcome-and-bool-then-outcome"
+# lhs `bool` is truthy, so `&&` proceeds and returns the rhs verbatim —
+# here that's the `echo hi` outcome.
+src = "true && (echo hi)"
+value = "outcome(status: 0, ok: true)"
+
+[[case]]
+name = "outcome-if-position"
+src = 'if (echo hi) { "yes" } else { "no" }'
+value = '"yes"'
+
+[[case]]
+name = "outcome-not-condition"
+src = "!(echo hi)"
+value = "false"

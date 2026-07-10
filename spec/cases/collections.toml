@@ -1,0 +1,49 @@
+# List-slicing methods (CONTRACTS §1 method set: `.first .last .skip .take`).
+# `.take`/`.skip` with a count already return a list in the current
+# implementation (shoal-value/src/methods.rs `slice_count`); `.first(n)`/
+# `.last(n)` currently ignore the count argument entirely and always return
+# a single element (or `null` on empty) — these cases encode the correct,
+# count-aware behavior (a slice of up to `n` elements, capped at the
+# collection's length, no error on overrun — consistent with `.take`/.skip`'s
+# existing iterator-based semantics) and are expected to fail until that
+# lands.
+
+[[case]]
+name = "list-first-n"
+src = "[1, 2, 3].first(2)"
+value = "[1, 2]"
+
+[[case]]
+name = "list-last-n"
+src = "[1, 2, 3].last(2)"
+value = "[2, 3]"
+
+[[case]]
+name = "list-first-n-full-length"
+src = "[1, 2, 3].first(3)"
+value = "[1, 2, 3]"
+
+[[case]]
+name = "list-last-n-full-length"
+src = "[1, 2, 3].last(3)"
+value = "[1, 2, 3]"
+
+[[case]]
+name = "list-take-n"
+src = "[1, 2, 3].take(2)"
+value = "[1, 2]"
+
+[[case]]
+name = "list-skip-n"
+src = "[1, 2, 3].skip(1)"
+value = "[2, 3]"
+
+[[case]]
+name = "list-take-zero"
+src = "[1, 2, 3].take(0)"
+value = "[]"
+
+[[case]]
+name = "list-skip-all"
+src = "[1, 2, 3].skip(3)"
+value = "[]"

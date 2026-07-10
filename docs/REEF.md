@@ -1,5 +1,7 @@
 # reef — tool resolution, ripped from the root
 
+**Status:** crate built+tested, eval integration in progress.
+
 **Design contract v0.1.** Companion to `docs/TDD.md`; same rules: everything here is a decision,
 the corpus decides disputes. Crate: `shoal-reef`.
 

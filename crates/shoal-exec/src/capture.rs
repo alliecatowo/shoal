@@ -69,6 +69,9 @@ struct StreamInner {
     spawn_token: CancelToken,
     threads: Vec<JoinHandle<()>>,
     reaped: bool,
+    /// What [`crate::sandbox::apply`] actually did before this child's exec,
+    /// if `ExecSpec::sandbox` was set. Carried through to [`ExecResult`].
+    enforcement: Option<shoal_leash::EnforcementStatus>,
 }
 
 impl StreamInner {
@@ -96,6 +99,7 @@ impl StreamInner {
             stderr: Vec::new(),
             dur: self.start.elapsed(),
             pid: self.child.id(),
+            enforcement: self.enforcement.take(),
         })
     }
 }
@@ -129,13 +133,14 @@ impl Drop for StreamInner {
 ///
 /// Program resolution failures ([`io::ErrorKind::NotFound`]), stdin-file open
 /// failures, and spawn errors (including `E2BIG`) surface here.
-pub fn spawn_capture(spec: ExecSpec, cancel: &CancelToken) -> io::Result<StreamingChild> {
+pub fn spawn_capture(mut spec: ExecSpec, cancel: &CancelToken) -> io::Result<StreamingChild> {
     if spec.mode != ExecMode::Capture {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "spawn_capture requires ExecMode::Capture",
         ));
     }
+    let enforcement = crate::sandbox::apply(&mut spec)?;
     let program = resolve_program(&spec.argv, &spec.env)?;
     let mut cmd = Command::new(&program);
     cmd.args(&spec.argv[1..]);
@@ -213,6 +218,7 @@ pub fn spawn_capture(spec: ExecSpec, cancel: &CancelToken) -> io::Result<Streami
             spawn_token: cancel.clone(),
             threads,
             reaped: false,
+            enforcement,
         },
     })
 }
