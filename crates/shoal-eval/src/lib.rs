@@ -759,6 +759,44 @@ impl Evaluator {
         if call.head == "pwd" {
             return Ok(Value::Path(self.cwd.clone()));
         }
+        if call.head == "source" || call.head == "run" || call.head.ends_with(".shl") {
+            let is_source = call.head == "source";
+            let script_path = if call.head == "source" || call.head == "run" {
+                let p = call
+                    .args
+                    .first()
+                    .map(|a| self.cmd_arg_value(a))
+                    .transpose()?
+                    .ok_or_else(|| ErrorVal::new("arg_error", format!("{} expects script path", call.head)))?;
+                match p {
+                    Value::Path(p) => p,
+                    Value::Str(s) => PathBuf::from(s),
+                    _ => return Err(ErrorVal::new("arg_error", "expects path")),
+                }
+            } else {
+                PathBuf::from(&call.head)
+            };
+            
+            let path = if script_path.is_absolute() {
+                script_path
+            } else {
+                self.cwd.join(script_path)
+            };
+            let src = std::fs::read_to_string(&path)
+                .map_err(|e| ErrorVal::new("io_error", format!("cannot read script: {e}")))?;
+            let program = shoal_syntax::parse(&src)
+                .map_err(|e| ErrorVal::new("parse_error", e.to_string()))?;
+                
+            if is_source {
+                return self.eval_program(&program);
+            } else {
+                let mut child = Evaluator::new(self.cwd.clone());
+                child.env = self.env.clone();
+                child.process_env = self.process_env.clone();
+                child.adapters = self.adapters.clone();
+                return child.eval_program(&program);
+            }
+        }
         if self.adapters.lookup(&call.head).is_some() {
             return self.eval_adapter(call, position);
         }
