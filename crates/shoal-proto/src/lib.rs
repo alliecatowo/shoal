@@ -158,6 +158,11 @@ pub enum WireValue {
         dur_ns: i64,
         pid: u32,
         cmd: String,
+        /// Source span of the invocation (AGENT-SURFACE §2). `None` when the
+        /// outcome carries no source anchor (e.g. a value reconstructed from
+        /// the journal); omitted from the wire when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        span: Option<WireSpan>,
     },
     Error {
         code: String,
@@ -283,6 +288,17 @@ pub struct AttachResult {
     pub cwd: WirePath,
     pub env_hash: String,
     pub ast_version: u32,
+    /// Whether the leash actually enforces (TDD §8 tier honesty) — a client
+    /// learns at attach time if the wall is real (AGENT-SURFACE §5).
+    #[serde(default)]
+    pub caps_enforced: bool,
+    /// The kernel's default elision thresholds, so a client knows the budget
+    /// before it tightens/loosens per call.
+    #[serde(default)]
+    pub elide_defaults: Value,
+    /// Channels this session may subscribe to / read (AGENT-SURFACE §4).
+    #[serde(default)]
+    pub channels: Vec<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParseParams {
@@ -295,8 +311,13 @@ pub struct ExecParams {
     pub mode: String,
     #[serde(default = "stmt_position")]
     pub position: String,
-    #[serde(default, rename = "async")]
+    #[serde(default, rename = "async", alias = "background")]
     pub asynchronous: bool,
+    /// Wall-clock cap (AGENT-SURFACE §5): when a synchronous `run` exceeds
+    /// this, the kernel converts it to a background task and returns a task
+    /// ref instead of blocking the caller's context.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
     /// Per-call elision budget (AGENT-SURFACE §3). Tightens or loosens the
     /// kernel defaults; never loosens past the hard cap (64 KiB).
     #[serde(default)]
@@ -371,11 +392,69 @@ pub struct ValueGetParams {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct JournalQueryParams {
     pub since: Option<i64>,
+    /// Upper time bound (ns since epoch); entries with `ts > until` are
+    /// dropped. Filtered in the kernel, above the journal store.
+    pub until: Option<i64>,
     pub principal: Option<String>,
     pub head: Option<String>,
     pub ok: Option<bool>,
+    /// Keep only entries whose effect set contains every listed effect kind
+    /// (e.g. `["fs.write","opaque"]`). Kernel-side post-filter.
+    #[serde(default)]
+    pub effects: Option<Vec<String>>,
     #[serde(default)]
     pub limit: usize,
+}
+
+/// `events.read` — pull the buffered tail of a channel (AGENT-SURFACE §4).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventsReadParams {
+    pub channel: String,
+    #[serde(default)]
+    pub since: Option<u64>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// `events.publish` — publish to a `user.*` channel (AGENT-SURFACE §4,§7).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventsPublishParams {
+    pub channel: String,
+    pub payload: Value,
+}
+
+/// `events.subscribe` / `events.unsubscribe` (AGENT-SURFACE §6).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventsSubParams {
+    pub channel: String,
+    #[serde(default)]
+    pub since: Option<u64>,
+}
+
+/// One event on a channel — `seq` is monotonic per channel (AGENT-SURFACE §4).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Event {
+    pub channel: String,
+    pub seq: u64,
+    pub ts: i64,
+    pub payload: Value,
+}
+
+/// `complete {src, cursor?}` — completion candidates at a cursor byte offset.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompleteParams {
+    pub src: String,
+    #[serde(default)]
+    pub cursor: Option<usize>,
+}
+
+/// `explain {src|ast}` — derived AST + effects + reversibility without running.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExplainParams {
+    #[serde(default)]
+    pub src: Option<String>,
+    #[serde(default)]
+    pub ast: Option<Value>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JournalOutput {

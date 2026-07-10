@@ -276,3 +276,55 @@ fn unmentioned_tool_is_passthrough_even_under_script_policy() {
         "unmentioned tool must not be locked"
     );
 }
+
+#[test]
+fn prompt_reef_snapshot_empty_with_no_manifest() {
+    // No `.reef.toml`/`mise.toml`/etc anywhere above cwd ⇒ empty snapshot, no
+    // panics, no filesystem surprises (docs/AGENT-SURFACE.md §12.1).
+    let dir = tempfile::tempdir().unwrap();
+    let mut ev = Evaluator::new(dir.path().to_path_buf());
+    let snap = ev.prompt_reef_snapshot();
+    assert!(snap.active_scope.is_none());
+    assert!(snap.bindings.is_empty());
+}
+
+#[test]
+fn prompt_reef_snapshot_unlocked_then_locked() {
+    // A concrete constraint (not `*`/`latest`) forces the system provider to
+    // probe `--version`, so the locked entry carries a real version string.
+    let (dir, bindir) = project("[tools]\nfaketool = \"1.2.3\"\n", &[("faketool", "1.2.3")]);
+    let mut ev = Evaluator::new(dir.path().to_path_buf());
+    ev.interactive = true; // interactive → auto-lock on the spawn below
+    ev.set_reef_resolver(fixture_resolver(&bindir));
+
+    // Before anything has spawned: constrained (a manifest mentions it) but
+    // not yet resolved — an honest gap, not a guess.
+    let snap = ev.prompt_reef_snapshot();
+    assert_eq!(
+        snap.active_scope.as_deref(),
+        Some("reef"),
+        "the nearest scope is the native .reef.toml"
+    );
+    let before = snap
+        .bindings
+        .iter()
+        .find(|b| b.tool == "faketool")
+        .expect("faketool is constrained by the manifest");
+    assert!(before.constrained);
+    assert!(before.version.is_none(), "not resolved yet");
+    assert!(before.provider.is_none());
+    assert_eq!(before.scope.as_deref(), Some("reef"));
+
+    // Spawning it auto-locks (interactive policy); the accessor then reads
+    // that lock straight off the cache — no resolver call of its own.
+    ev.eval_program(&parse("faketool")).expect("faketool runs");
+    let snap2 = ev.prompt_reef_snapshot();
+    let after = snap2
+        .bindings
+        .iter()
+        .find(|b| b.tool == "faketool")
+        .expect("still present");
+    assert_eq!(after.version.as_deref(), Some("1.2.3"));
+    assert!(after.provider.is_some());
+    assert!(after.constrained);
+}

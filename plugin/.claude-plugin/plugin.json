@@ -1,0 +1,12 @@
+{
+  "name": "shoal",
+  "version": "0.1.0",
+  "description": "Talk to shoal — the agent-first structured shell — over its MCP facade, with a complete, gotcha-free language card so the agent never guesses at syntax or protocol.",
+  "author": {
+    "name": "shoal contributors",
+    "url": "https://github.com/alliecatowo/shoal"
+  },
+  "homepage": "https://github.com/alliecatowo/shoal",
+  "license": "MIT OR Apache-2.0",
+  "keywords": ["shoal", "shell", "mcp", "structured-shell", "agent-surface"]
+}

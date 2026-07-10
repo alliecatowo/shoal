@@ -9,14 +9,18 @@
 //! never a spawn. This retires the `git_suffix()` subprocess-per-keystroke bug
 //! the old `DefaultPrompt` path carried (design §0, §10).
 //!
-//! Two integration seams intentionally read empty in this wave because the
-//! typed evaluator accessors they need (`jobs_snapshot`, `prompt_reef_snapshot`
-//! — design §12.1) live in `shoal-eval`, a crate this change set does not own:
-//! `jobs` and `reef`/`language_*` render empty until those land. Git status
-//! *counts* are likewise left at zero (branch + in-progress state are read
-//! purely from `.git`, with no subprocess and no `gix` dependency); wiring the
-//! full `gix` status engine is design §5.4/§12.3 and is deferred with the other
-//! background-cache machinery.
+//! `jobs` and `reef`/`language_*` are populated from the evaluator's typed
+//! accessors (`Evaluator::jobs_snapshot`, `Evaluator::prompt_reef_snapshot` —
+//! design §12.1): both read only in-memory/cached state (the live task
+//! registry; the cached reef `ScopeChain` + already-loaded `Lockfile`), so
+//! folding them into [`build_context`] costs no I/O beyond what the evaluator
+//! already pays elsewhere. Git status *counts* (staged/unstaged/untracked/
+//! ahead/behind) come from exactly one `git status --porcelain=v2 --branch`
+//! subprocess per call to [`build_context`] — i.e. once per command, never
+//! per keystroke (§1); a non-git `cwd` never spawns it at all (`.git`
+//! discovery is a pure filesystem walk that bails out first). Branch name and
+//! in-progress state (`rebase`/`merge`/…) stay `gix`-free, read straight out
+//! of `.git`.
 
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
@@ -198,8 +202,8 @@ pub fn run(action: PromptAction) -> Result<i32, String> {
         eprintln!("warning: {w}");
     }
 
-    let ev = Evaluator::new(cwd.clone());
-    let live = build_context(&ev, &facts, 80);
+    let mut ev = Evaluator::new(cwd.clone());
+    let live = build_context(&mut ev, &facts, 80);
 
     match action {
         PromptAction::Print { side } => {
@@ -512,13 +516,19 @@ fn resolve_nerd_font(mode: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Build a full [`PromptContext`] from live session state. Runs once per command
-/// (never per keystroke), so its handful of `stat`s reading `.git` sit in the
-/// post-command budget (§5.3 trigger 1), not the keystroke budget (§1).
-pub fn build_context(ev: &Evaluator, facts: &StaticFacts, width: u16) -> PromptContext {
+/// (never per keystroke), so its handful of `stat`s reading `.git` (plus, when
+/// `cwd` is inside a repo, the one `git status` subprocess for status counts)
+/// sit in the post-command budget (§5.3 trigger 1), not the keystroke budget
+/// (§1). Takes `&mut Evaluator` because [`Evaluator::prompt_reef_snapshot`]
+/// may need to (re)discover the cached reef scope chain when `cwd` changed —
+/// still zero subprocess, just a cache-freshness check.
+pub fn build_context(ev: &mut Evaluator, facts: &StaticFacts, width: u16) -> PromptContext {
     let cwd = ev.cwd().to_path_buf();
     let read_only = is_read_only(&cwd);
     let last_outcome = outcome_from(&ev.it);
     let git = read_git(&cwd);
+    let jobs = jobs_snapshot_from(ev);
+    let reef = reef_bindings_from(ev);
     let (h, m, s) = local_hms();
 
     PromptContext {
@@ -532,16 +542,45 @@ pub fn build_context(ev: &Evaluator, facts: &StaticFacts, width: u16) -> PromptC
         edit_mode: EditMode::Emacs,
         multiline: false,
         last_outcome,
-        jobs: shoal_prompt::JobsSnapshot::default(),
+        jobs,
         principal: facts.principal.clone(),
         leash: facts.leash.clone(),
         session: facts.session.clone(),
         time_local: (h, m, s),
         git,
-        reef: Vec::new(),
+        reef,
         battery: None,
         custom: std::collections::BTreeMap::new(),
     }
+}
+
+/// Map the evaluator's [`shoal_eval::JobsSnapshot`] onto the prompt's own
+/// (design §12.1): same shape, different crate, so the binary is the seam
+/// that converts.
+fn jobs_snapshot_from(ev: &Evaluator) -> shoal_prompt::JobsSnapshot {
+    let s = ev.jobs_snapshot();
+    shoal_prompt::JobsSnapshot {
+        running: s.running,
+        suspended: s.suspended,
+        total: s.total,
+    }
+}
+
+/// Map the evaluator's [`shoal_eval::PromptReefSnapshot`] bindings onto
+/// [`shoal_prompt::ReefBinding`] rows (design §12.1). Zero subprocess: reads
+/// only the evaluator's cached scope chain + already-loaded lockfile.
+fn reef_bindings_from(ev: &mut Evaluator) -> Vec<shoal_prompt::ReefBinding> {
+    ev.prompt_reef_snapshot()
+        .bindings
+        .into_iter()
+        .map(|b| shoal_prompt::ReefBinding {
+            tool: b.tool,
+            version: b.version,
+            provider: b.provider,
+            scope: b.scope,
+            constrained: b.constrained,
+        })
+        .collect()
 }
 
 fn outcome_from(it: &Value) -> Option<OutcomeSnapshot> {
@@ -583,9 +622,14 @@ fn local_hms() -> (u8, u8, u8) {
 // Pure-Rust git reader — branch + in-progress state, zero subprocess (§5.4)
 // ---------------------------------------------------------------------------
 
-/// Read branch + repo state from `.git` directly — no subprocess, no git lib.
-/// Status counts are left at zero pending the `gix` status engine (design §5.4);
-/// branch and in-progress operation are accurate.
+/// Read branch + repo state from `.git` directly (no subprocess, no git lib),
+/// then fill in status counts with exactly one `git status --porcelain=v2
+/// --branch` subprocess (§5.4/§12.3) — the one deliberate exception to "no
+/// subprocess" in this reader, budgeted because [`read_git`] itself only ever
+/// runs once per command (§1), never per keystroke. A repo whose git binary
+/// can't run (missing, non-zero exit, unparseable output) still gets an
+/// accurate branch/state; only the counts are flagged `degraded` and left at
+/// zero — an honest gap, not a lie (TDD §6).
 pub fn read_git(cwd: &Path) -> Option<GitSnapshot> {
     let (repo_root, git_dir) = discover_repo(cwd)?;
     let repo_relative = cwd
@@ -595,6 +639,9 @@ pub fn read_git(cwd: &Path) -> Option<GitSnapshot> {
 
     let (branch, detached_at) = read_head(&git_dir);
     let state = read_state(&git_dir);
+    let counts = git_status_counts(cwd);
+    let degraded = counts.is_none();
+    let counts = counts.unwrap_or_default();
 
     Some(GitSnapshot {
         repo_root,
@@ -602,19 +649,99 @@ pub fn read_git(cwd: &Path) -> Option<GitSnapshot> {
         branch,
         detached_at,
         state,
-        ahead: 0,
-        behind: 0,
-        staged: 0,
-        unstaged: 0,
-        untracked: 0,
-        conflicted: 0,
+        ahead: counts.ahead,
+        behind: counts.behind,
+        staged: counts.staged,
+        unstaged: counts.unstaged,
+        untracked: counts.untracked,
+        conflicted: counts.conflicted,
+        // Not derivable from a single `git status`; a second subprocess
+        // (`git stash list`) would be needed and the budget here is one call
+        // per command. Left at zero — an honest gap (§5.4's fuller engine can
+        // add it later without breaking this contract).
         stashed: 0,
-        // Counts are not computed (no gix): render them as "unknown clean"
-        // rather than flagging perpetual staleness. `git_status` therefore
-        // renders empty until §5.4's engine lands — an honest gap, not a lie.
-        degraded: false,
+        degraded,
         age: Duration::ZERO,
     })
+}
+
+/// Status counts parsed out of `git status --porcelain=v2 --branch`.
+#[derive(Debug, Clone, Copy, Default)]
+struct GitCounts {
+    ahead: u32,
+    behind: u32,
+    staged: u32,
+    unstaged: u32,
+    untracked: u32,
+    conflicted: u32,
+}
+
+/// Run the one status subprocess this reader budgets and parse it into
+/// counts. `None` on any failure to run or a non-zero exit — callers treat
+/// that as `degraded`, never as "clean".
+fn git_status_counts(cwd: &Path) -> Option<GitCounts> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["status", "--porcelain=v2", "--branch"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(parse_porcelain_v2_counts(&output.stdout))
+}
+
+/// Parse `git status --porcelain=v2 --branch` bytes into [`GitCounts`].
+///
+/// Line shapes (git-status(1)): `# branch.ab +<ahead> -<behind>` (absent with
+/// no upstream); `1 <XY> …` ordinary changed entry; `2 <XY> …` renamed/copied
+/// entry (`X`/`Y` = index/worktree status chars, `.` means unchanged); `u …`
+/// unmerged/conflicted entry; `? <path>` untracked; `! <path>` ignored
+/// (skipped). Every count only ever needs the marker byte and, for `1`/`2`,
+/// the `XY` field — never the path — so this never needs to special-case
+/// paths containing spaces or tabs the way a path-extracting parser would
+/// (contrast `shoal-adapters`' `parse_porcelain_v2`, which does extract paths
+/// for the `git status` *adapter* and is private to that crate). An
+/// unparseable or missing `branch.ab`/count field degrades to `0`, never a
+/// guess.
+fn parse_porcelain_v2_counts(bytes: &[u8]) -> GitCounts {
+    let text = String::from_utf8_lossy(bytes);
+    let mut c = GitCounts::default();
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("# branch.ab ") {
+            for tok in rest.split_whitespace() {
+                if let Some(n) = tok.strip_prefix('+') {
+                    c.ahead = n.parse().unwrap_or(0);
+                } else if let Some(n) = tok.strip_prefix('-') {
+                    c.behind = n.parse().unwrap_or(0);
+                }
+            }
+            continue;
+        }
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        let mut fields = line.split(' ');
+        match fields.next() {
+            Some("1") | Some("2") => {
+                let Some(xy) = fields.next() else { continue };
+                let mut chars = xy.chars();
+                let x = chars.next().unwrap_or('.');
+                let y = chars.next().unwrap_or('.');
+                if x != '.' {
+                    c.staged += 1;
+                }
+                if y != '.' {
+                    c.unstaged += 1;
+                }
+            }
+            Some("u") => c.conflicted += 1,
+            Some("?") => c.untracked += 1,
+            _ => {}
+        }
+    }
+    c
 }
 
 fn discover_repo(cwd: &Path) -> Option<(PathBuf, PathBuf)> {
@@ -715,5 +842,158 @@ mod tests {
         let (root, gitdir) = discover_repo(&sub).unwrap();
         assert_eq!(root, dir.path());
         assert!(gitdir.ends_with(".git"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Git status counts (§5.4/§12.3)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn porcelain_v2_counts_every_shape() {
+        let text = "# branch.oid abc123\n\
+                     # branch.head main\n\
+                     # branch.upstream origin/main\n\
+                     # branch.ab +2 -3\n\
+                     1 M. N... 100644 100644 100644 aaaa bbbb staged.txt\n\
+                     1 .M N... 100644 100644 100644 aaaa bbbb modified.txt\n\
+                     2 R. N... 100644 100644 100644 aaaa bbbb R100 renamed.txt\toriginal.txt\n\
+                     u UU N... 100644 100644 100644 100644 aaaa bbbb cccc conflict.txt\n\
+                     ? untracked.txt\n\
+                     ! ignored.txt\n";
+        let c = parse_porcelain_v2_counts(text.as_bytes());
+        assert_eq!(c.ahead, 2);
+        assert_eq!(c.behind, 3);
+        assert_eq!(c.staged, 2, "the `1 M.` and `2 R.` entries are staged");
+        assert_eq!(c.unstaged, 1, "the `1 .M` entry is unstaged");
+        assert_eq!(c.conflicted, 1);
+        assert_eq!(c.untracked, 1);
+    }
+
+    #[test]
+    fn porcelain_v2_counts_no_upstream_leaves_ahead_behind_zero() {
+        let text = "# branch.oid abc123\n# branch.head main\n? new.txt\n";
+        let c = parse_porcelain_v2_counts(text.as_bytes());
+        assert_eq!(c.ahead, 0);
+        assert_eq!(c.behind, 0);
+        assert_eq!(c.untracked, 1);
+    }
+
+    #[test]
+    fn git_status_counts_none_outside_a_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        // `dir` is never `git init`-ed: a real "not a git repository" failure
+        // must degrade to `None`, never a fabricated all-zero "clean" answer.
+        assert!(git_status_counts(dir.path()).is_none());
+    }
+
+    #[test]
+    fn git_status_counts_from_real_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        run_git(root, &["init", "-q"]);
+        run_git(root, &["config", "user.email", "t@example.com"]);
+        run_git(root, &["config", "user.name", "Test"]);
+        std::fs::write(root.join("a.txt"), "hello\n").unwrap();
+        run_git(root, &["add", "a.txt"]);
+        std::fs::write(root.join("b.txt"), "untracked\n").unwrap();
+
+        let counts = git_status_counts(root).expect("git is available in test env");
+        assert_eq!(counts.staged, 1, "a.txt is staged (added, uncommitted)");
+        assert_eq!(counts.unstaged, 0);
+        assert_eq!(counts.untracked, 1, "b.txt is untracked");
+    }
+
+    #[test]
+    fn read_git_fills_counts_for_a_real_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        run_git(root, &["init", "-q"]);
+        run_git(root, &["config", "user.email", "t@example.com"]);
+        run_git(root, &["config", "user.name", "Test"]);
+        std::fs::write(root.join("a.txt"), "hello\n").unwrap();
+        run_git(root, &["add", "a.txt"]);
+
+        let snap = read_git(root).expect("root is a git repo");
+        assert!(!snap.degraded, "git ran successfully");
+        assert_eq!(snap.staged, 1);
+        assert_eq!(snap.unstaged, 0);
+    }
+
+    fn run_git(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .status()
+            .expect("git available in test environment");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    // -----------------------------------------------------------------------
+    // build_context integration: jobs/reef/git wiring (docs/AGENT-SURFACE.md §12.1)
+    // -----------------------------------------------------------------------
+
+    fn test_facts() -> StaticFacts {
+        StaticFacts {
+            session: SessionSnapshot {
+                user: "t".into(),
+                host: "h".into(),
+                is_ssh: false,
+                is_root: false,
+            },
+            leash: LeashSnapshot {
+                tier: LeashTier::A,
+                enforced: false,
+            },
+            home: None,
+            no_color: true,
+            nerd_font: false,
+            unicode: true,
+            principal: Principal::Human,
+        }
+    }
+
+    #[test]
+    fn build_context_populates_jobs_from_the_evaluator() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ev = shoal_eval::Evaluator::new(dir.path().to_path_buf());
+        ev.eval_program(&shoal_syntax::parse("spawn { 1 + 1 }").unwrap())
+            .unwrap();
+        let ctx = build_context(&mut ev, &test_facts(), 80);
+        assert_eq!(ctx.jobs.total, 1, "the spawned task is registered");
+    }
+
+    #[test]
+    fn build_context_populates_reef_bindings_from_the_evaluator() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".reef.toml"), "[tools]\nnode = \"18\"\n").unwrap();
+        let mut ev = shoal_eval::Evaluator::new(dir.path().to_path_buf());
+        let ctx = build_context(&mut ev, &test_facts(), 80);
+        let binding = ctx
+            .reef
+            .iter()
+            .find(|b| b.tool == "node")
+            .expect("node is constrained by .reef.toml");
+        assert!(binding.constrained);
+        assert_eq!(binding.scope.as_deref(), Some("reef"));
+        // Nothing has resolved/locked it yet — an honest gap, not a guess.
+        assert!(binding.version.is_none());
+    }
+
+    #[test]
+    fn build_context_populates_git_counts_once_per_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        run_git(root, &["init", "-q"]);
+        run_git(root, &["config", "user.email", "t@example.com"]);
+        run_git(root, &["config", "user.name", "Test"]);
+        std::fs::write(root.join("a.txt"), "hello\n").unwrap();
+        run_git(root, &["add", "a.txt"]);
+
+        let mut ev = shoal_eval::Evaluator::new(root.to_path_buf());
+        let ctx = build_context(&mut ev, &test_facts(), 80);
+        let git = ctx.git.expect("root is a git repo");
+        assert!(!git.degraded);
+        assert_eq!(git.staged, 1);
     }
 }

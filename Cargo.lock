@@ -2324,6 +2324,8 @@ name = "shoal-mcp"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+ "shoal-kernel",
+ "shoal-proto",
  "tempfile",
 ]
 

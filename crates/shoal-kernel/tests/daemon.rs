@@ -211,6 +211,7 @@ fn daemon_survives_a_paused_gap_between_two_sequential_requests() {
                 mode: "run".into(),
                 position: "stmt".into(),
                 asynchronous: false,
+                timeout_ms: None,
                 elide: None,
             })
             .unwrap(),
@@ -343,6 +344,7 @@ fn live_kernel_elides_a_big_table_over_the_wire() {
                 mode: "run".into(),
                 position: "stmt".into(),
                 asynchronous: false,
+                timeout_ms: None,
                 elide: None,
             })
             .unwrap(),

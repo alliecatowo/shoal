@@ -15,6 +15,7 @@ mod script;
 mod stmt;
 
 pub(crate) use coerce::coerce_word;
+pub use reef::{PromptReefBinding, PromptReefSnapshot};
 
 use shoal_adapters::{AdapterCatalog, AdapterClass, SubSpec};
 use shoal_ast::*;
@@ -32,6 +33,20 @@ use std::time::Duration;
 pub enum Position {
     Statement,
     Value,
+}
+
+/// A count/summary of the live task table, for the prompt's `jobs` segment
+/// (docs/AGENT-SURFACE.md §12.1). Zero I/O: reads the in-memory task registry
+/// only, never a subprocess or the filesystem.
+///
+/// `suspended` is always `0` today — the task registry has no suspended state
+/// yet (only `Running`/`Done`); the field exists so this is additive, not a
+/// breaking change, the day a suspend state lands.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JobsSnapshot {
+    pub running: usize,
+    pub suspended: usize,
+    pub total: usize,
 }
 
 /// Host renderer for statement-position outcomes (defect #1).
@@ -179,6 +194,19 @@ impl Evaluator {
             return;
         }
         self.emit(v);
+    }
+
+    /// A count/summary of the live task table for the prompt's `jobs` segment
+    /// (docs/AGENT-SURFACE.md §12.1). Cheap and I/O-free: call it once per
+    /// command when building a `PromptContext`, never per keystroke.
+    pub fn jobs_snapshot(&self) -> JobsSnapshot {
+        let total = self.jobs.len();
+        let running = self.jobs.iter().filter(|t| !t.is_done()).count();
+        JobsSnapshot {
+            running,
+            suspended: 0,
+            total,
+        }
     }
 
     /// The task table backing the `jobs` builtin (defect #14).
@@ -589,6 +617,27 @@ mod tests {
         // `jobs` returns the registry table.
         let jobs = run("spawn { 1 }\njobs").unwrap();
         assert!(matches!(jobs, Value::Table(rows) if !rows.is_empty()));
+    }
+
+    #[test]
+    fn jobs_snapshot_counts_running_and_total() {
+        let mut ev = Evaluator::new(std::env::current_dir().unwrap());
+        // Nothing spawned yet: a sane, zero-I/O empty snapshot.
+        let empty = ev.jobs_snapshot();
+        assert_eq!(empty.total, 0);
+        assert_eq!(empty.running, 0);
+        assert_eq!(empty.suspended, 0);
+
+        // Awaiting every spawned task deterministically drives them to done,
+        // so the post-await snapshot is a stable total/zero-running count.
+        let prog = shoal_syntax::parse(
+            "let a = spawn { 1 + 1 }\nlet b = spawn { 2 + 2 }\na.await()\nb.await()",
+        )
+        .unwrap();
+        ev.eval_program(&prog).unwrap();
+        let snap = ev.jobs_snapshot();
+        assert_eq!(snap.total, 2, "both spawned tasks are registered");
+        assert_eq!(snap.running, 0, "both were awaited to completion");
     }
 
     #[test]

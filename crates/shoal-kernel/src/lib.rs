@@ -8,7 +8,7 @@ use shoal_journal::{EntryRecord, Journal, JournalQuery};
 use shoal_leash::{Effect, Estimates, Plan, Policy, Reversibility, Verdict};
 use shoal_proto::*;
 use shoal_value::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufReader};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::PermissionsExt;
@@ -28,6 +28,147 @@ pub struct Kernel {
     tasks: Mutex<HashMap<Ref, Arc<TaskEntry>>>,
     next_task: AtomicU64,
     auth: Option<Mutex<TokenStore>>,
+    events: EventBus,
+}
+
+/// A per-connection socket writer shared between the request/response path and
+/// any subscription push threads. Whole frames are serialized then written
+/// under this lock so a pushed `event` notification never interleaves with a
+/// response on the same fd.
+type SharedWriter = Arc<Mutex<UnixStream>>;
+
+/// Kernel-native pub/sub (AGENT-SURFACE §4/§6). One ring buffer per channel;
+/// `seq` is monotonic per channel. Subscribers get `event` notifications
+/// pushed on their own connection.
+#[derive(Default)]
+struct EventBus {
+    channels: Mutex<HashMap<String, ChannelBuf>>,
+    subs: Mutex<Vec<Subscriber>>,
+}
+
+/// Ring-buffered event log for one channel.
+#[derive(Default)]
+struct ChannelBuf {
+    next_seq: u64,
+    ring: VecDeque<Event>,
+}
+
+struct Subscriber {
+    conn: u64,
+    channel: String,
+    writer: SharedWriter,
+}
+
+/// Ring depth per channel (AGENT-SURFACE §4 requires ≥1024).
+const EVENT_RING_CAP: usize = 1024;
+
+/// The static channels a session may always subscribe to (AGENT-SURFACE §4).
+/// `task.{id}` and `user.{name}` are dynamic and not listed here.
+const STATIC_CHANNELS: &[&str] = &[
+    "session.transcript",
+    "journal",
+    "approval",
+    "render",
+    "reef",
+];
+
+impl EventBus {
+    /// Append `payload` to `channel`'s ring and push it to every live
+    /// subscriber of that channel. Returns the assigned event.
+    fn publish(&self, channel: &str, payload: Json) -> Event {
+        let event = {
+            let mut channels = self.channels.lock().unwrap();
+            let buf = channels.entry(channel.to_string()).or_default();
+            let seq = buf.next_seq;
+            buf.next_seq += 1;
+            let event = Event {
+                channel: channel.to_string(),
+                seq,
+                ts: now_ns(),
+                payload,
+            };
+            buf.ring.push_back(event.clone());
+            while buf.ring.len() > EVENT_RING_CAP {
+                buf.ring.pop_front();
+            }
+            event
+        };
+        // Push to subscribers. A dead connection (write error) is dropped from
+        // the subscriber list — the accept loop also cleans up on disconnect.
+        let mut subs = self.subs.lock().unwrap();
+        subs.retain(|s| {
+            if s.channel != channel {
+                return true;
+            }
+            let note = json!({
+                "jsonrpc": JSONRPC,
+                "method": "event",
+                "params": &event,
+            });
+            let mut w = s.writer.lock().unwrap();
+            write_json_notification(&mut w, &note).is_ok()
+        });
+        event
+    }
+
+    /// Buffered tail of `channel` from `since` (exclusive), capped at `limit`.
+    fn read(&self, channel: &str, since: Option<u64>, limit: Option<usize>) -> Vec<Event> {
+        let channels = self.channels.lock().unwrap();
+        let Some(buf) = channels.get(channel) else {
+            return Vec::new();
+        };
+        let mut out: Vec<Event> = buf
+            .ring
+            .iter()
+            .filter(|e| since.is_none_or(|s| e.seq > s))
+            .cloned()
+            .collect();
+        if let Some(limit) = limit
+            && out.len() > limit
+        {
+            out = out.split_off(out.len() - limit);
+        }
+        out
+    }
+
+    /// Register `writer` as a subscriber to `channel`. Any already-buffered
+    /// events after `since` are pushed immediately (replay, then live).
+    fn subscribe(&self, conn: u64, channel: &str, since: Option<u64>, writer: &SharedWriter) {
+        {
+            let mut subs = self.subs.lock().unwrap();
+            if !subs.iter().any(|s| s.conn == conn && s.channel == channel) {
+                subs.push(Subscriber {
+                    conn,
+                    channel: channel.to_string(),
+                    writer: writer.clone(),
+                });
+            }
+        }
+        for event in self.read(channel, since, None) {
+            let note = json!({"jsonrpc": JSONRPC, "method": "event", "params": &event});
+            let mut w = writer.lock().unwrap();
+            let _ = write_json_notification(&mut w, &note);
+        }
+    }
+
+    fn unsubscribe(&self, conn: u64, channel: &str) {
+        self.subs
+            .lock()
+            .unwrap()
+            .retain(|s| !(s.conn == conn && s.channel == channel));
+    }
+
+    fn remove_conn(&self, conn: u64) {
+        self.subs.lock().unwrap().retain(|s| s.conn != conn);
+    }
+}
+
+fn write_json_notification(writer: &mut UnixStream, value: &Json) -> io::Result<()> {
+    let mut buf = serde_json::to_vec(value).map_err(io::Error::other)?;
+    buf.push(b'\n');
+    use std::io::Write as _;
+    writer.write_all(&buf)?;
+    writer.flush()
 }
 #[derive(Clone)]
 struct Attachment {
@@ -76,6 +217,7 @@ impl Kernel {
             plans: Mutex::new(HashMap::new()),
             tasks: Mutex::new(HashMap::new()),
             next_task: AtomicU64::new(1),
+            events: EventBus::default(),
             auth: None,
         })
     }
@@ -90,6 +232,7 @@ impl Kernel {
             plans: Mutex::new(HashMap::new()),
             tasks: Mutex::new(HashMap::new()),
             next_task: AtomicU64::new(1),
+            events: EventBus::default(),
             auth: Some(Mutex::new(TokenStore::open(state_dir.join("tokens.json"))?)),
         }))
     }
@@ -107,6 +250,7 @@ impl Kernel {
             plans: Mutex::new(HashMap::new()),
             tasks: Mutex::new(HashMap::new()),
             next_task: AtomicU64::new(1),
+            events: EventBus::default(),
             auth: Some(Mutex::new(TokenStore::open(state_dir.join("tokens.json"))?)),
         }))
     }
@@ -120,6 +264,7 @@ impl Kernel {
             plans: Mutex::new(HashMap::new()),
             tasks: Mutex::new(HashMap::new()),
             next_task: AtomicU64::new(1),
+            events: EventBus::default(),
             auth: None,
         })
     }
@@ -171,18 +316,24 @@ impl Kernel {
     pub fn handle_stream(self: &Arc<Self>, stream: UnixStream) -> io::Result<()> {
         let client = self.next_client.fetch_add(1, Ordering::Relaxed);
         let mut reader = BufReader::new(stream.try_clone()?);
-        let mut writer = stream;
+        let writer: SharedWriter = Arc::new(Mutex::new(stream));
         let mut attached: Option<Attachment> = None;
-        while let Some(request) = read_frame(&mut reader)? {
-            let id = request.id.clone();
-            let response = if request.jsonrpc != JSONRPC {
-                Response::err(id, -32600, "invalid JSON-RPC version", None)
-            } else {
-                self.dispatch(request, client, &mut attached)
-            };
-            write_frame(&mut writer, &response)?;
-        }
-        Ok(())
+        let result = (|| -> io::Result<()> {
+            while let Some(request) = read_frame(&mut reader)? {
+                let id = request.id.clone();
+                let response = if request.jsonrpc != JSONRPC {
+                    Response::err(id, -32600, "invalid JSON-RPC version", None)
+                } else {
+                    self.dispatch(request, client, &mut attached, Some(&writer))
+                };
+                write_frame(&mut *writer.lock().unwrap(), &response)?;
+            }
+            Ok(())
+        })();
+        // On disconnect, drop this connection's subscriptions so publish never
+        // writes to a dead fd.
+        self.events.remove_conn(client);
+        result
     }
 
     fn dispatch(
@@ -190,6 +341,7 @@ impl Kernel {
         request: Request,
         client: u64,
         attached: &mut Option<Attachment>,
+        conn: Option<&SharedWriter>,
     ) -> Response {
         let id = request.id;
         let result: Result<Json, RpcError> = (|| match request.method.as_str() {
@@ -234,6 +386,11 @@ impl Kernel {
                     cwd: WirePath::encode(&cwd),
                     env_hash: "local".into(),
                     ast_version: 1,
+                    // TDD §8 tier honesty: the built-in policy is tier D, so
+                    // the wall is advisory, not enforced. Say so at attach.
+                    caps_enforced: false,
+                    elide_defaults: elide_defaults_json(),
+                    channels: STATIC_CHANNELS.iter().map(|s| s.to_string()).collect(),
                 })
             }
             "parse" => {
@@ -250,7 +407,14 @@ impl Kernel {
                 let session = &attachment.session;
                 let actor = attachment.principal.clone();
                 let params: ExecParams = decode(request.params)?;
-                if params.asynchronous {
+                // AGENT-SURFACE §5: `background:true`, or a synchronous run that
+                // exceeds `timeout_ms`, becomes a task ref + events channel —
+                // never a blocked context. A bare timeout runs the work on a
+                // task and waits up to the deadline for a fast inline answer.
+                if params.asynchronous || params.timeout_ms.is_some() {
+                    let elide_spec = params.elide;
+                    let wait = params.timeout_ms.map(std::time::Duration::from_millis);
+                    let is_background = params.asynchronous;
                     let cancel = {
                         let mut evaluator = session.evaluator.lock().unwrap();
                         evaluator.reset_cancel();
@@ -275,8 +439,13 @@ impl Kernel {
                         .lock()
                         .unwrap()
                         .insert(task_ref.clone(), task.clone());
+                    let waiter = task.clone();
                     let kernel = self.clone();
                     let mut task_attached = Some(attachment.clone());
+                    let task_channel = format!("task.{}", task_ref.0);
+                    kernel
+                        .events
+                        .publish(&task_channel, json!({"$":"str","v":"started"}));
                     std::thread::spawn(move || {
                         let response = kernel.dispatch(
                             Request {
@@ -285,34 +454,97 @@ impl Kernel {
                                 method: "exec".into(),
                                 params: serde_json::to_value(ExecParams {
                                     asynchronous: false,
+                                    timeout_ms: None,
                                     ..params
                                 })
                                 .unwrap(),
                             },
                             client,
                             &mut task_attached,
+                            None,
                         );
-                        let mut inner = task.inner.lock().unwrap();
-                        inner.finished_ns = Some(now_ns());
-                        if let Some(error) = response.error {
-                            inner.state = if task.cancel_requested.load(Ordering::SeqCst) {
-                                "cancelled"
+                        let exit_payload;
+                        {
+                            let mut inner = task.inner.lock().unwrap();
+                            inner.finished_ns = Some(now_ns());
+                            if let Some(error) = response.error {
+                                inner.state = if task.cancel_requested.load(Ordering::SeqCst) {
+                                    "cancelled"
+                                } else {
+                                    "failed"
+                                };
+                                inner.error = Some(error);
                             } else {
-                                "failed"
-                            };
-                            inner.error = Some(error);
-                        } else {
-                            inner.state = "completed";
-                            inner.result_ref = response
-                                .result
-                                .as_ref()
-                                .and_then(|r| r.get("ref"))
-                                .and_then(Json::as_str)
-                                .map(|s| Ref(s.into()));
+                                inner.state = "completed";
+                                inner.result_ref = response
+                                    .result
+                                    .as_ref()
+                                    .and_then(|r| r.get("ref"))
+                                    .and_then(Json::as_str)
+                                    .map(|s| Ref(s.into()));
+                            }
+                            exit_payload = json!({
+                                "$": "record",
+                                "v": {
+                                    "state": {"$":"str","v": inner.state},
+                                    "ref": inner.result_ref.as_ref()
+                                        .map(|r| json!({"$":"str","v": r.0}))
+                                        .unwrap_or(Json::Null),
+                                }
+                            });
+                            task.done.notify_all();
                         }
-                        task.done.notify_all();
+                        kernel.events.publish(&task_channel, exit_payload);
                     });
-                    return encode(json!({"task":task_ref}));
+                    let events_channel = format!("task.{}", task_ref.0);
+                    if is_background {
+                        return encode(json!({"task":task_ref,"events":events_channel}));
+                    }
+                    // Synchronous timeout: wait up to the deadline for the task
+                    // to finish; return an inline result if it beats the clock,
+                    // otherwise hand back the still-running task ref.
+                    let deadline = wait.map(|d| Instant::now() + d);
+                    let mut inner = waiter.inner.lock().unwrap();
+                    while matches!(inner.state, "running" | "cancelling") {
+                        let Some(deadline) = deadline else { break };
+                        let now = Instant::now();
+                        if now >= deadline {
+                            break;
+                        }
+                        let (guard, timed) =
+                            waiter.done.wait_timeout(inner, deadline - now).unwrap();
+                        inner = guard;
+                        if timed.timed_out() {
+                            break;
+                        }
+                    }
+                    if matches!(inner.state, "running" | "cancelling") {
+                        drop(inner);
+                        return encode(
+                            json!({"task":task_ref,"events":events_channel,"timed_out":true}),
+                        );
+                    }
+                    let result_ref = inner.result_ref.clone();
+                    let task_error = inner.error.clone();
+                    drop(inner);
+                    if let Some(error) = task_error {
+                        return Err(error);
+                    }
+                    if let Some(result_ref) = result_ref {
+                        let values = session.transcript.lock().unwrap();
+                        if let Some(value) = values.get(&result_ref) {
+                            let budget = ElideBudget::from_spec(elide_spec.as_ref());
+                            let uri = short_ref_to_uri(&result_ref, None);
+                            let wire = elide_wire_value(value, &uri, &budget);
+                            let render = shoal_value::render::render_block(value, 80);
+                            return encode(ExecResult {
+                                r#ref: result_ref,
+                                value: Some(wire),
+                                render: Some(render),
+                            });
+                        }
+                    }
+                    return encode(json!({"task":task_ref,"events":events_channel}));
                 }
                 if params.mode == "plan" {
                     let ast = shoal_syntax::parse(&params.src).map_err(|e| RpcError {
@@ -333,7 +565,7 @@ impl Kernel {
                             .iter()
                             .map(|e| serde_json::to_value(e).unwrap())
                             .collect(),
-                        reversibility: "unknown".into(),
+                        reversibility: reversibility_from_effects(&plan.effects).into(),
                         verdict: verdict_name(verdict).into(),
                         approval_pending: verdict == Verdict::ApprovalRequired,
                     };
@@ -401,12 +633,44 @@ impl Kernel {
                         opaque,
                     })
                     .map_err(internal)?;
-                let value = eval_with_position(&mut evaluator, &ast, &params.position).map_err(|e| {
-                    let journal = self.journal.lock().unwrap();
-                    let _ = journal.finish(entry_id, e.status, false, elapsed_ns(started));
-                    if let Some(stderr) = &e.stderr { let _ = journal.record_output(entry_id, "stderr", stderr.as_bytes()); }
-                    RpcError { code: -32002, message: e.msg, data: Some(json!({"code":e.code,"span":e.span,"hint":e.hint,"status":e.status,"stderr":e.stderr})) }
-                })?;
+                let value = match eval_with_position(&mut evaluator, &ast, &params.position) {
+                    Ok(value) => value,
+                    Err(e) => {
+                        {
+                            let journal = self.journal.lock().unwrap();
+                            let _ = journal.finish(entry_id, e.status, false, elapsed_ns(started));
+                            if let Some(stderr) = &e.stderr {
+                                let _ =
+                                    journal.record_output(entry_id, "stderr", stderr.as_bytes());
+                            }
+                        }
+                        // AGENT-SURFACE §0/§5: even a raised error is
+                        // addressable — store it as an out[n] transcript value
+                        // so the agent can `shoal_get` the structured error
+                        // (code/msg/span/hint) instead of parsing message text.
+                        let value_ref =
+                            Ref::new("out", session.next_value.fetch_add(1, Ordering::Relaxed));
+                        session.transcript.lock().unwrap().insert(
+                            value_ref.clone(),
+                            Value::Error(std::sync::Arc::new(e.clone())),
+                        );
+                        session
+                            .client_it
+                            .lock()
+                            .unwrap()
+                            .insert(client, value_ref.clone());
+                        let uri = short_ref_to_uri(&value_ref, None);
+                        return Err(RpcError {
+                            code: -32002,
+                            message: e.msg,
+                            data: Some(json!({
+                                "code": e.code, "span": e.span, "hint": e.hint,
+                                "status": e.status, "stderr": e.stderr,
+                                "ref": value_ref, "uri": uri
+                            })),
+                        });
+                    }
+                };
                 let value_ref = Ref::new("out", session.next_value.fetch_add(1, Ordering::Relaxed));
                 session
                     .transcript
@@ -447,6 +711,11 @@ impl Kernel {
                         }
                     }
                 }
+                // AGENT-SURFACE §4: announce the new transcript value on the
+                // `session.transcript` channel — subscribers learn a new
+                // out[n] exists (with its shape summary) without polling.
+                self.events
+                    .publish("session.transcript", transcript_event(&value_ref, &value));
                 let exec_budget = ElideBudget::from_spec(params.elide.as_ref());
                 let exec_uri = short_ref_to_uri(&value_ref, None);
                 encode(ExecResult {
@@ -504,6 +773,21 @@ impl Kernel {
                     .map(task_record)
                     .collect();
                 encode(records)
+            }
+            "task.get" => {
+                let attachment = attached.as_ref().ok_or_else(not_attached)?;
+                let session = &attachment.session;
+                let p: TaskParams = decode(request.params)?;
+                let task = self.task(&p.task)?;
+                if task.session.id != session.id {
+                    return Err(RpcError {
+                        code: -32021,
+                        message: "unknown task ref".into(),
+                        data: None,
+                    });
+                }
+                // Non-blocking snapshot (unlike task.await): the current record.
+                encode(task_record(&task))
             }
             "task.await" => {
                 let attachment = attached.as_ref().ok_or_else(not_attached)?;
@@ -604,12 +888,14 @@ impl Kernel {
                             mode: "approved".into(),
                             position: "stmt".into(),
                             asynchronous: false,
+                            timeout_ms: None,
                             elide: None,
                         })
                         .unwrap(),
                     },
                     client,
                     attached,
+                    conn,
                 );
                 response.result.ok_or_else(|| {
                     response
@@ -639,8 +925,40 @@ impl Kernel {
                         data: None,
                     });
                 }
+                // AGENT-SURFACE §5: if the caller scoped the request to a set
+                // of effect kinds, the grant only covers those — a plan that
+                // needs an effect the caller did not name stays pending, so an
+                // approval can never silently widen past what was asked for.
+                let requested: Vec<String> = p
+                    .effects
+                    .iter()
+                    .filter_map(|e| match e {
+                        Json::String(s) => Some(s.clone()),
+                        other => other.get("kind").and_then(Json::as_str).map(String::from),
+                    })
+                    .collect();
+                if !requested.is_empty() {
+                    let requested: Vec<String> = requested.iter().map(|e| norm_effect(e)).collect();
+                    let missing: Vec<String> = stored
+                        .plan
+                        .effects
+                        .iter()
+                        .map(effect_kind)
+                        .filter(|k| !requested.contains(&norm_effect(k)))
+                        .collect();
+                    if !missing.is_empty() {
+                        return encode(json!({
+                            "grant": "approval_pending",
+                            "plan_ref": plan_ref,
+                            "why": "requested effect scope does not cover the plan",
+                            "uncovered_effects": missing,
+                        }));
+                    }
+                }
                 stored.approved = true;
-                encode(json!({"grant":"approved","plan_ref":plan_ref,"enforced":false}))
+                encode(
+                    json!({"grant":"approved","plan_ref":plan_ref,"enforced":false,"granted_effects":requested}),
+                )
             }
             "journal.query" => {
                 let p: JournalQueryParams = decode(request.params)?;
@@ -656,8 +974,28 @@ impl Kernel {
                         limit: p.limit,
                     })
                     .map_err(internal)?;
+                // The journal store filters since/principal/head/ok/limit; the
+                // wire also promises `until` (upper time bound) and `effects`
+                // (effect-kind subset) — kernel-side post-filters over the
+                // returned rows (AGENT-SURFACE §5 / TDD §7).
+                // Effect kinds are stored snake_case (`fs_delete`); agents use
+                // the dotted convention (`fs.delete`). Normalize so either
+                // form matches.
+                let want_effects: Vec<String> = p
+                    .effects
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|e| norm_effect(e))
+                    .collect();
                 let entries: Vec<JournalEntry> = rows
                     .into_iter()
+                    .filter(|r| p.until.is_none_or(|until| r.ts_ns <= until))
+                    .filter(|r| {
+                        want_effects.is_empty()
+                            || want_effects
+                                .iter()
+                                .all(|want| r.effects_json.contains(want))
+                    })
                     .map(|r| JournalEntry {
                         id: r.id,
                         session: r.session,
@@ -683,6 +1021,123 @@ impl Kernel {
                     })
                     .collect();
                 encode(entries)
+            }
+            "events.read" => {
+                attached.as_ref().ok_or_else(not_attached)?;
+                let p: EventsReadParams = decode(request.params)?;
+                let events = self.events.read(&p.channel, p.since, p.limit);
+                encode(json!({"channel": p.channel, "events": events}))
+            }
+            "events.publish" => {
+                attached.as_ref().ok_or_else(not_attached)?;
+                let p: EventsPublishParams = decode(request.params)?;
+                // AGENT-SURFACE §4: only `user.*` channels are client-writable;
+                // the kernel owns the semantic channels.
+                if !p.channel.starts_with("user.") {
+                    return Err(RpcError {
+                        code: -32602,
+                        message: "only user.* channels may be published to".into(),
+                        data: Some(json!({"channel": p.channel})),
+                    });
+                }
+                let event = self.events.publish(&p.channel, p.payload);
+                encode(json!({"channel": event.channel, "seq": event.seq, "ts": event.ts}))
+            }
+            "events.subscribe" => {
+                attached.as_ref().ok_or_else(not_attached)?;
+                let p: EventsSubParams = decode(request.params)?;
+                let Some(writer) = conn else {
+                    return Err(RpcError {
+                        code: -32603,
+                        message: "subscription requires a live connection".into(),
+                        data: None,
+                    });
+                };
+                self.events.subscribe(client, &p.channel, p.since, writer);
+                encode(json!({"channel": p.channel, "subscribed": true}))
+            }
+            "events.unsubscribe" => {
+                attached.as_ref().ok_or_else(not_attached)?;
+                let p: EventsSubParams = decode(request.params)?;
+                self.events.unsubscribe(client, &p.channel);
+                encode(json!({"channel": p.channel, "subscribed": false}))
+            }
+            "blob.get" => {
+                attached.as_ref().ok_or_else(not_attached)?;
+                let hash = request
+                    .params
+                    .get("hash")
+                    .and_then(Json::as_str)
+                    .ok_or_else(|| RpcError {
+                        code: -32602,
+                        message: "blob.get requires a hash".into(),
+                        data: None,
+                    })?
+                    .to_string();
+                let blob = self
+                    .journal
+                    .lock()
+                    .unwrap()
+                    .read_blob(&hash)
+                    .map_err(internal)?
+                    .ok_or_else(|| RpcError {
+                        code: -32004,
+                        message: "unknown value hash".into(),
+                        data: None,
+                    })?;
+                // Content-addressed value blobs are stored as their `$`-tagged
+                // JSON encoding; hand it back structurally. A non-JSON blob
+                // (stdout/stderr) comes back as tagged bytes.
+                let value = serde_json::from_slice::<Json>(&blob).unwrap_or_else(|_| {
+                    json!({
+                        "$": "bytes",
+                        "len": blob.len(),
+                        "v": base64::Engine::encode(
+                            &base64::engine::general_purpose::STANDARD, &blob),
+                    })
+                });
+                encode(json!({"hash": hash, "value": value}))
+            }
+            "complete" => {
+                let p: CompleteParams = decode(request.params)?;
+                let cursor = p.cursor.unwrap_or(p.src.len()).min(p.src.len());
+                encode(json!({"candidates": complete_at(&p.src, cursor)}))
+            }
+            "explain" => {
+                let attachment = attached.as_ref().ok_or_else(not_attached)?;
+                let session = &attachment.session;
+                let p: ExplainParams = decode(request.params)?;
+                let ast = if let Some(src) = &p.src {
+                    shoal_syntax::parse(src).map_err(|e| RpcError {
+                        code: -32001,
+                        message: e.msg,
+                        data: Some(json!({"span": e.span, "hint": e.hint})),
+                    })?
+                } else if let Some(ast_json) = p.ast {
+                    serde_json::from_value(ast_json).map_err(|e| RpcError {
+                        code: -32602,
+                        message: format!("invalid ast: {e}"),
+                        data: None,
+                    })?
+                } else {
+                    return Err(RpcError {
+                        code: -32602,
+                        message: "explain requires src or ast".into(),
+                        data: None,
+                    });
+                };
+                let ast_json = serde_json::to_string(&ast).map_err(internal)?;
+                let plan = {
+                    let mut evaluator = session.evaluator.lock().unwrap();
+                    derive_plan(&mut evaluator, &ast, &ast_json)
+                };
+                encode(json!({
+                    "ast_version": 1,
+                    "ast": ast,
+                    "effects": plan.effects,
+                    "reversibility": reversibility_from_effects(&plan.effects),
+                    "plan_ref": plan.plan_ref,
+                }))
             }
             _ => Err(RpcError {
                 code: -32601,
@@ -841,11 +1296,27 @@ fn eval_with_position(
     position: &str,
 ) -> shoal_value::VResult<Value> {
     if position == "value"
-        && let [Stmt::Expr { expr, .. }] = ast.stmts.as_slice()
+        && let Some((last, init)) = ast.stmts.split_last()
     {
-        let value = evaluator.eval_expr(expr, Position::Value)?;
-        evaluator.it = value.clone();
-        return Ok(value);
+        // Run every statement but the last with ordinary statement semantics,
+        // sharing the evaluator's env so bindings carry into the final expr.
+        if !init.is_empty() {
+            evaluator.eval_program(&Program {
+                stmts: init.to_vec(),
+            })?;
+        }
+        // TDD §4.5: the *final* expression is the value; evaluate it in value
+        // position so a failed outcome is captured (bound to `it`), not raised.
+        if let Stmt::Expr { expr, .. } = last {
+            let value = evaluator.eval_expr(expr, Position::Value)?;
+            evaluator.it = value.clone();
+            return Ok(value);
+        }
+        // A final `let`/`fn`/`for`/… has no distinct value reading; run it as
+        // a statement and return whatever it produces.
+        return evaluator.eval_program(&Program {
+            stmts: vec![last.clone()],
+        });
     }
     evaluator.eval_program(ast)
 }
@@ -855,6 +1326,124 @@ fn verdict_name(v: Verdict) -> &'static str {
         Verdict::Deny => "deny",
         Verdict::ApprovalRequired => "approval_required",
     }
+}
+
+/// Derive plan reversibility from its concrete effects (AGENT-SURFACE §5,
+/// TDD §8): irreversible for opaque work, network effects, or a delete with
+/// no journaled inverse; reversible when every effect is reversible/journaled
+/// (pure reads/writes, env, session, time). This is computed here rather than
+/// trusting the leash's coarser `Reversibility` so the wire answer is derived
+/// from the effect set the agent actually sees.
+fn reversibility_from_effects(effects: &[Effect]) -> &'static str {
+    let irreversible = effects.iter().any(|e| {
+        matches!(
+            e,
+            Effect::Opaque
+                | Effect::FsDelete { .. }
+                | Effect::NetConnect { .. }
+                | Effect::NetListen { .. }
+        )
+    });
+    if irreversible {
+        "irreversible"
+    } else {
+        "reversible"
+    }
+}
+
+/// The `kind` tag an effect serializes with (`{"kind":"fs.write",…}`), used to
+/// scope a `cap.request` grant to a set of effect kinds (AGENT-SURFACE §5).
+fn effect_kind(effect: &Effect) -> String {
+    serde_json::to_value(effect)
+        .ok()
+        .and_then(|v| v.get("kind").and_then(Json::as_str).map(String::from))
+        .unwrap_or_default()
+}
+
+/// Normalize an effect kind so the agent-facing dotted convention (`fs.delete`,
+/// per AGENT-SURFACE) matches the snake_case form the effect actually
+/// serializes to (`fs_delete`).
+fn norm_effect(kind: &str) -> String {
+    kind.replace('.', "_")
+}
+
+/// The kernel's default elision thresholds, advertised at attach so a client
+/// knows the budget before tightening/loosening per call (AGENT-SURFACE §5).
+fn elide_defaults_json() -> Json {
+    json!({
+        "max_bytes": ELIDE_DEFAULT_MAX_BYTES,
+        "max_rows": ELIDE_DEFAULT_MAX_ROWS,
+        "max_bytes_raw": ELIDE_DEFAULT_MAX_BYTES_RAW,
+        "max_items": ELIDE_DEFAULT_MAX_ITEMS,
+        "hard_cap": ELIDE_HARD_CAP,
+    })
+}
+
+/// The `session.transcript` event payload for a new `out[n]` (AGENT-SURFACE
+/// §4): `{n, ref, summary:{type, ok?, cmd?, n?}}` — shape only, never payload.
+fn transcript_event(value_ref: &Ref, value: &Value) -> Json {
+    let n: i64 = value_ref
+        .0
+        .split_once(':')
+        .and_then(|(_, id)| id.parse().ok())
+        .unwrap_or(0);
+    let mut summary = serde_json::Map::new();
+    summary.insert("type".into(), json!({"$":"str","v": value.type_name()}));
+    match value {
+        Value::Outcome(o) => {
+            summary.insert("ok".into(), json!({"$":"bool","v": o.ok}));
+            summary.insert("cmd".into(), json!({"$":"str","v": o.cmd}));
+        }
+        Value::Table(rows) => {
+            summary.insert("n".into(), json!({"$":"int","v": rows.len()}));
+        }
+        Value::List(items) => {
+            summary.insert("n".into(), json!({"$":"int","v": items.len()}));
+        }
+        _ => {}
+    }
+    json!({
+        "$": "record",
+        "v": {
+            "n": {"$":"int","v": n},
+            "ref": {"$":"str","v": value_ref.0},
+            "summary": {"$":"record","v": summary},
+        }
+    })
+}
+
+/// Completion candidates at a cursor byte offset (the kernel `complete`
+/// method). Keywords/builtins plus any `let`/`var`/`fn`/`alias` names declared
+/// before the cursor, filtered by the partial word under the cursor.
+fn complete_at(src: &str, cursor: usize) -> Vec<String> {
+    const WORDS: &[&str] = &[
+        "let", "var", "fn", "alias", "use", "export", "return", "break", "continue", "if", "else",
+        "match", "for", "in", "while", "try", "catch", "true", "false", "null", "spawn", "with",
+        "sh", "ls", "cd", "pwd", "cp", "mv", "rm", "mkdir", "cat", "echo", "run", "parallel",
+        "pick", "interact", "explain",
+    ];
+    let before = &src[..cursor];
+    // The partial identifier immediately left of the cursor.
+    let start = before
+        .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let partial = &before[start..];
+    let mut names: Vec<String> = WORDS.iter().map(|s| s.to_string()).collect();
+    // Declarations already in scope (`let x`, `fn y`, …).
+    let toks: Vec<&str> = before
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|s| !s.is_empty())
+        .collect();
+    for pair in toks.windows(2) {
+        if matches!(pair[0], "let" | "var" | "fn" | "alias") {
+            names.push(pair[1].to_string());
+        }
+    }
+    names.retain(|n| n.starts_with(partial));
+    names.sort();
+    names.dedup();
+    names
 }
 unsafe fn libc_geteuid() -> u32 {
     unsafe extern "C" {
@@ -1093,6 +1682,7 @@ fn wire_value(value: &Value) -> WireValue {
             dur_ns: o.dur_ns,
             pid: o.pid,
             cmd: o.cmd.clone(),
+            span: None,
         },
         Value::Task(t) => WireValue::Task {
             id: t.id,
@@ -1256,6 +1846,7 @@ fn elide_wire_value(value: &Value, uri: &str, budget: &ElideBudget) -> WireValue
             dur_ns: o.dur_ns,
             pid: o.pid,
             cmd: o.cmd.clone(),
+            span: None,
         };
     }
     let wire = wire_value(value);
@@ -2029,6 +2620,473 @@ mod tests {
             "a tightened per-call budget must elide: {value}"
         );
         assert_eq!(value["n"], 10);
+        drop(client);
+        drop(reader);
+        thread.join().unwrap();
+    }
+
+    /// Read one already-written frame off the socket (no request sent) — for
+    /// asserting on pushed `event` notifications interleaved with responses.
+    fn recv_line(reader: &mut BufReader<UnixStream>) -> Json {
+        let mut line = String::new();
+        std::io::BufRead::read_line(reader, &mut line).unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+
+    fn attach(client: &mut UnixStream, reader: &mut BufReader<UnixStream>) -> Response {
+        call(
+            client,
+            reader,
+            1,
+            "session.attach",
+            json!({"client":{"kind":"agent","tty":false}}),
+        )
+    }
+
+    fn spawn(
+        kernel: &Arc<Kernel>,
+    ) -> (
+        UnixStream,
+        BufReader<UnixStream>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let (client, server) = UnixStream::pair().unwrap();
+        let reader = BufReader::new(client.try_clone().unwrap());
+        let k = kernel.clone();
+        let thread = std::thread::spawn(move || k.handle_stream(server).unwrap());
+        (client, reader, thread)
+    }
+
+    // -----------------------------------------------------------------------
+    // Events — channels, cursors, push (AGENT-SURFACE §4/§6).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn events_publish_read_roundtrips_on_a_user_channel() {
+        let kernel = Kernel::new();
+        let (mut client, mut reader, thread) = spawn(&kernel);
+        attach(&mut client, &mut reader);
+        // Only user.* channels are client-writable.
+        let denied = call(
+            &mut client,
+            &mut reader,
+            2,
+            "events.publish",
+            json!({"channel":"session.transcript","payload":{"$":"int","v":1}}),
+        );
+        assert_eq!(denied.error.unwrap().code, -32602);
+        // Publish two values, then read them back with monotonic per-channel seq.
+        for (i, v) in ["go", "stop"].iter().enumerate() {
+            let published = call(
+                &mut client,
+                &mut reader,
+                3 + i as i64,
+                "events.publish",
+                json!({"channel":"user.deploy","payload":{"$":"str","v":v}}),
+            );
+            assert_eq!(published.result.unwrap()["seq"], i as i64);
+        }
+        let read = call(
+            &mut client,
+            &mut reader,
+            9,
+            "events.read",
+            json!({"channel":"user.deploy"}),
+        );
+        let events = read.result.unwrap()["events"].clone();
+        let events = events.as_array().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["payload"], json!({"$":"str","v":"go"}));
+        assert_eq!(events[1]["seq"], 1);
+        // Cursor read: since=0 returns only events after seq 0.
+        let tail = call(
+            &mut client,
+            &mut reader,
+            10,
+            "events.read",
+            json!({"channel":"user.deploy","since":0}),
+        );
+        let tail = tail.result.unwrap()["events"].clone();
+        assert_eq!(tail.as_array().unwrap().len(), 1);
+        assert_eq!(tail[0]["payload"], json!({"$":"str","v":"stop"}));
+        drop(client);
+        drop(reader);
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn subscribe_pushes_session_transcript_event_before_the_exec_response() {
+        let kernel = Kernel::new();
+        let (mut client, mut reader, thread) = spawn(&kernel);
+        attach(&mut client, &mut reader);
+        call(
+            &mut client,
+            &mut reader,
+            2,
+            "events.subscribe",
+            json!({"channel":"session.transcript"}),
+        );
+        // The pushed event is written to the socket during exec dispatch, so it
+        // arrives before the exec response frame.
+        write_frame(
+            &mut client,
+            &Request {
+                jsonrpc: JSONRPC.into(),
+                id: 3.into(),
+                method: "exec".into(),
+                params: json!({"src":"1 + 2"}),
+            },
+        )
+        .unwrap();
+        let note = recv_line(&mut reader);
+        assert_eq!(note["method"], "event", "expected a pushed event: {note}");
+        assert_eq!(note["params"]["channel"], "session.transcript");
+        assert_eq!(note["params"]["payload"]["v"]["ref"]["v"], "out:1");
+        let resp = recv_line(&mut reader);
+        assert_eq!(resp["id"], 3);
+        drop(client);
+        drop(reader);
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn attach_advertises_channels_elide_defaults_and_enforcement() {
+        let kernel = Kernel::new();
+        let (mut client, mut reader, thread) = spawn(&kernel);
+        let r = attach(&mut client, &mut reader).result.unwrap();
+        assert_eq!(r["caps_enforced"], false);
+        assert_eq!(r["elide_defaults"]["max_rows"], 100);
+        assert_eq!(r["elide_defaults"]["hard_cap"], 64 * 1024);
+        assert!(
+            r["channels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c == "session.transcript")
+        );
+        drop(client);
+        drop(reader);
+        thread.join().unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Plan reversibility (AGENT-SURFACE §5) — derived, not hardcoded.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn plan_reversibility_is_derived_from_effects() {
+        let kernel = Kernel::new();
+        let (mut client, mut reader, thread) = spawn(&kernel);
+        attach(&mut client, &mut reader);
+        let del = call(
+            &mut client,
+            &mut reader,
+            2,
+            "exec",
+            json!({"src":"rm doomed.txt","mode":"plan"}),
+        )
+        .result
+        .unwrap();
+        assert_eq!(
+            del["reversibility"], "irreversible",
+            "a delete has no journaled inverse: {del}"
+        );
+        let pure = call(
+            &mut client,
+            &mut reader,
+            3,
+            "exec",
+            json!({"src":"1 + 2","mode":"plan"}),
+        )
+        .result
+        .unwrap();
+        assert_eq!(pure["reversibility"], "reversible");
+        let opaque = call(
+            &mut client,
+            &mut reader,
+            4,
+            "exec",
+            json!({"src":"sh { echo hi }","mode":"plan"}),
+        )
+        .result
+        .unwrap();
+        assert_eq!(opaque["reversibility"], "irreversible");
+        drop(client);
+        drop(reader);
+        thread.join().unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Value-position multi-statement + error-still-yields-a-ref (§0, TDD §4.5).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn value_position_captures_final_expr_of_multi_statement_src() {
+        let kernel = Kernel::new();
+        let (mut client, mut reader, thread) = spawn(&kernel);
+        attach(&mut client, &mut reader);
+        // Two statements; the final bare command must be *captured* (ok:false),
+        // not raised — the previous single-statement-only special case raised.
+        let r = call(
+            &mut client,
+            &mut reader,
+            2,
+            "exec",
+            json!({"src":"let a = 1\nsh { exit 4 }","position":"value"}),
+        );
+        let value = r
+            .result
+            .expect("value position must not raise")
+            .get("value")
+            .cloned()
+            .unwrap();
+        assert_eq!(value["$"], "outcome");
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["status"], 4);
+        // And a binding from the first statement is visible to the last.
+        let r2 = call(
+            &mut client,
+            &mut reader,
+            3,
+            "exec",
+            json!({"src":"let x = 10\nx + 5","position":"value"}),
+        );
+        assert_eq!(r2.result.unwrap()["value"], json!({"$":"int","v":15}));
+        drop(client);
+        drop(reader);
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn raised_error_still_yields_an_inspectable_transcript_ref() {
+        let kernel = Kernel::new();
+        let (mut client, mut reader, thread) = spawn(&kernel);
+        attach(&mut client, &mut reader);
+        // A genuine raise (statement position, failed command).
+        let raised = call(
+            &mut client,
+            &mut reader,
+            2,
+            "exec",
+            json!({"src":"sh { exit 5 }","position":"stmt"}),
+        );
+        let err = raised.error.expect("must raise");
+        assert_eq!(err.code, -32002);
+        let data = err.data.unwrap();
+        let value_ref = data["ref"]
+            .as_str()
+            .expect("error carries a transcript ref");
+        // The agent can shoal_get that ref and read the structured error.
+        let got = call(
+            &mut client,
+            &mut reader,
+            3,
+            "value.get",
+            json!({"ref": value_ref}),
+        );
+        assert_eq!(got.result.unwrap()["value"]["$"], "error");
+        drop(client);
+        drop(reader);
+        thread.join().unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // cap.request effect scoping (§5), complete/explain (§5).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cap_request_scopes_the_grant_to_requested_effects() {
+        let kernel = Kernel::new();
+        let (mut client, mut reader, thread) = spawn(&kernel);
+        attach(&mut client, &mut reader);
+        let plan = call(
+            &mut client,
+            &mut reader,
+            2,
+            "exec",
+            json!({"src":"sh { echo hi }","mode":"plan"}),
+        )
+        .result
+        .unwrap();
+        let plan_ref = plan["plan_ref"].as_str().unwrap().to_owned();
+        // Scoped to fs.write only — the plan's opaque effect isn't covered, so
+        // the grant stays pending (never silently widens).
+        let scoped = call(
+            &mut client,
+            &mut reader,
+            3,
+            "cap.request",
+            json!({"plan_ref": plan_ref, "effects":["fs.write"]}),
+        )
+        .result
+        .unwrap();
+        assert_eq!(scoped["grant"], "approval_pending", "{scoped}");
+        // Scoped to the actual effect kind — now it grants.
+        let ok = call(
+            &mut client,
+            &mut reader,
+            4,
+            "cap.request",
+            json!({"plan_ref": plan_ref, "effects":["opaque"]}),
+        )
+        .result
+        .unwrap();
+        assert_eq!(ok["grant"], "approved");
+        drop(client);
+        drop(reader);
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn complete_and_explain_methods() {
+        let kernel = Kernel::new();
+        let (mut client, mut reader, thread) = spawn(&kernel);
+        attach(&mut client, &mut reader);
+        let c = call(
+            &mut client,
+            &mut reader,
+            2,
+            "complete",
+            json!({"src":"le","cursor":2}),
+        )
+        .result
+        .unwrap();
+        let candidates = c["candidates"].as_array().unwrap();
+        assert!(candidates.iter().any(|v| v == "let"));
+        assert!(
+            candidates
+                .iter()
+                .all(|v| v.as_str().unwrap().starts_with("le")),
+            "candidates must be filtered by the partial word"
+        );
+        let ex = call(
+            &mut client,
+            &mut reader,
+            3,
+            "explain",
+            json!({"src":"rm gone.txt"}),
+        )
+        .result
+        .unwrap();
+        assert_eq!(ex["reversibility"], "irreversible");
+        assert!(ex["ast"].is_object() || ex["ast"].is_array() || ex["ast"]["stmts"].is_array());
+        drop(client);
+        drop(reader);
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn journal_until_and_effects_filters() {
+        let kernel = Kernel::new();
+        let (mut client, mut reader, thread) = spawn(&kernel);
+        attach(&mut client, &mut reader);
+        call(&mut client, &mut reader, 2, "exec", json!({"src":"1 + 2"}));
+        call(
+            &mut client,
+            &mut reader,
+            3,
+            "exec",
+            json!({"src":"rm gone.txt","position":"value"}),
+        );
+        // effects filter: only entries whose effect set mentions fs.delete.
+        let deletes = call(
+            &mut client,
+            &mut reader,
+            4,
+            "journal.query",
+            json!({"effects":["fs.delete"],"limit":50}),
+        )
+        .result
+        .unwrap();
+        let deletes = deletes.as_array().unwrap();
+        assert!(!deletes.is_empty());
+        assert!(
+            deletes
+                .iter()
+                .all(|e| e["src"].as_str().unwrap().starts_with("rm")),
+            "effects filter must keep only fs.delete entries: {deletes:?}"
+        );
+        // until in the far past matches nothing.
+        let none = call(
+            &mut client,
+            &mut reader,
+            5,
+            "journal.query",
+            json!({"until": 1, "limit":50}),
+        )
+        .result
+        .unwrap();
+        assert_eq!(none.as_array().unwrap().len(), 0);
+        drop(client);
+        drop(reader);
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn background_exec_returns_task_and_events_channel() {
+        let kernel = Kernel::new();
+        let (mut client, mut reader, thread) = spawn(&kernel);
+        attach(&mut client, &mut reader);
+        let bg = call(
+            &mut client,
+            &mut reader,
+            2,
+            "exec",
+            json!({"src":"sh { sleep 0.05 }","background":true}),
+        )
+        .result
+        .unwrap();
+        assert!(
+            bg["task"].is_string(),
+            "background exec returns a task ref: {bg}"
+        );
+        assert_eq!(
+            bg["events"],
+            format!("task.{}", bg["task"].as_str().unwrap())
+        );
+        drop(client);
+        drop(reader);
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn timeout_converts_a_slow_run_to_a_task() {
+        let kernel = Kernel::new();
+        let (mut client, mut reader, thread) = spawn(&kernel);
+        attach(&mut client, &mut reader);
+        // A 30s command with a 50ms budget must come back as a task ref, never
+        // block the caller's context.
+        let r = call(
+            &mut client,
+            &mut reader,
+            2,
+            "exec",
+            json!({"src":"sh { sleep 30 }","timeout_ms":50}),
+        )
+        .result
+        .unwrap();
+        assert!(r["task"].is_string(), "a timed-out run yields a task: {r}");
+        assert_eq!(r["timed_out"], true);
+        // Cancel the still-running task so its `sleep 30` child doesn't linger
+        // holding the test's output pipe open.
+        call(
+            &mut client,
+            &mut reader,
+            10,
+            "task.cancel",
+            json!({"task": r["task"]}),
+        );
+        // A fast command under budget returns inline.
+        let fast = call(
+            &mut client,
+            &mut reader,
+            3,
+            "exec",
+            json!({"src":"1 + 2","timeout_ms":5000}),
+        )
+        .result
+        .unwrap();
+        assert_eq!(fast["value"], json!({"$":"int","v":3}));
         drop(client);
         drop(reader);
         thread.join().unwrap();

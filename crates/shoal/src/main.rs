@@ -494,7 +494,7 @@ fn repl() -> Result<i32, String> {
         // Refresh the frozen prompt snapshot once, here, between commands —
         // never inside reedline's per-keystroke render (design §0.3, §2.3).
         let width = u16::try_from(terminal_width()).unwrap_or(80);
-        let ctx = prompt::build_context(&evaluator, &static_facts, width);
+        let ctx = prompt::build_context(&mut evaluator, &static_facts, width);
         if let Ok(mut cell) = shared_ctx.write() {
             *cell = Arc::new(ctx);
         }

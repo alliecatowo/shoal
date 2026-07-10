@@ -82,6 +82,7 @@ fn wire_value() -> impl Strategy<Value = WireValue> {
                         dur_ns,
                         pid,
                         cmd,
+                        span: None,
                     }
                 }),
             prop::collection::vec(

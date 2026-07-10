@@ -17,12 +17,8 @@ fn main() {
         }
     }
     if config.socket.as_os_str().is_empty() {
-        config.socket = std::env::var_os("XDG_RUNTIME_DIR")
-            .map(|p| std::path::PathBuf::from(p).join("shoal/default.sock"))
-            .unwrap_or_else(|| {
-                eprintln!("shoal-mcp: set --socket, SHOAL_SOCKET, or XDG_RUNTIME_DIR");
-                std::process::exit(2);
-            });
+        let session = config.session.as_deref().unwrap_or("default");
+        config.socket = shoal_mcp::discover_socket(session);
     }
     if let Err(error) = shoal_mcp::run_stdio(&config) {
         eprintln!("shoal-mcp: {error}");

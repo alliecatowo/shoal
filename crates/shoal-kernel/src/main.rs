@@ -62,11 +62,22 @@ unsafe extern "C" {
 }
 
 fn runtime_socket(session: &str) -> PathBuf {
-    std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(format!("/tmp/shoal-{}", unsafe { geteuid() })))
-        .join("shoal")
-        .join(format!("{session}.sock"))
+    runtime_dir().join("shoal").join(format!("{session}.sock"))
+}
+
+/// The runtime directory for the kernel socket. `$XDG_RUNTIME_DIR` when set;
+/// otherwise `$TMPDIR/shoal-{uid}` (macOS exports `TMPDIR` but not
+/// `XDG_RUNTIME_DIR`), else the hard `/tmp/shoal-{uid}` fallback. `shoal-mcp`
+/// mirrors this exactly so socket discovery agrees on every platform.
+fn runtime_dir() -> PathBuf {
+    let uid = unsafe { geteuid() };
+    if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR").filter(|s| !s.is_empty()) {
+        return PathBuf::from(xdg);
+    }
+    if let Some(tmp) = std::env::var_os("TMPDIR").filter(|s| !s.is_empty()) {
+        return PathBuf::from(tmp).join(format!("shoal-{uid}"));
+    }
+    PathBuf::from(format!("/tmp/shoal-{uid}"))
 }
 fn state_dir() -> PathBuf {
     std::env::var_os("XDG_STATE_HOME")

@@ -1,0 +1,14 @@
+{
+  "name": "shoal-marketplace",
+  "owner": {
+    "name": "shoal contributors",
+    "url": "https://github.com/alliecatowo/shoal"
+  },
+  "plugins": [
+    {
+      "name": "shoal",
+      "source": "./plugin",
+      "description": "MCP tools + a complete language card for driving shoal, the agent-first structured shell, from Claude Code."
+    }
+  ]
+}
