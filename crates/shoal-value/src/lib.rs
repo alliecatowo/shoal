@@ -456,11 +456,16 @@ pub struct ClosureVal {
     pub doc: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SecretVal {
     pub name: String,
     /// The secret material; never rendered, never journaled.
     pub value: Arc<str>,
+}
+impl std::fmt::Debug for SecretVal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("secret").field(&self.name).finish()
+    }
 }
 
 // ---------------------------------------------------------------------------

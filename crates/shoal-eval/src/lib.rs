@@ -439,6 +439,41 @@ impl Evaluator {
                 optional,
                 ..
             } => {
+                if matches!(&**recv, Expr::Var { name, .. } if name == "secret") && name == "get" {
+                    let args = self.eval_args(args)?;
+                    let [Value::Str(secret_name)] = args.pos.as_slice() else {
+                        return Err(ErrorVal::arg_error("secret.get expects one string name"));
+                    };
+                    let home = std::env::var_os("HOME")
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| PathBuf::from("."));
+                    let dir = std::env::var_os("SHOAL_SECRET_DIR")
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| {
+                            std::env::var_os("XDG_DATA_HOME")
+                                .map(PathBuf::from)
+                                .unwrap_or_else(|| home.join(".local/share"))
+                                .join("shoal/secrets")
+                        });
+                    let store = shoal_secret::SecretStore::open(dir)
+                        .map_err(|e| ErrorVal::new("permission", e.to_string()))?;
+                    let value = store
+                        .get(secret_name)
+                        .map_err(|e| ErrorVal::new("permission", e.to_string()))?
+                        .ok_or_else(|| {
+                            ErrorVal::new("not_found", format!("secret `{secret_name}` not found"))
+                        })?;
+                    let text = String::from_utf8(value.to_vec()).map_err(|_| {
+                        ErrorVal::new(
+                            "utf8_error",
+                            "secret is not valid UTF-8 for environment injection",
+                        )
+                    })?;
+                    return Ok(Value::Secret(shoal_value::SecretVal {
+                        name: secret_name.clone(),
+                        value: Arc::from(text),
+                    }));
+                }
                 let v = self.eval_expr(recv, Position::Value)?;
                 if *optional && v == Value::Null {
                     Ok(Value::Null)
@@ -1174,7 +1209,10 @@ impl Evaluator {
         let mut env = self.process_env.clone();
         for p in prefixes {
             let v = self.cmd_arg_value(&p.value)?;
-            let s = self.argv_value(v)?;
+            let s = match v {
+                Value::Secret(secret) => OsString::from(secret.value.as_ref()),
+                other => self.argv_value(other)?,
+            };
             if let Some(pair) = env.iter_mut().find(|x| x.0 == OsString::from(&p.name)) {
                 pair.1 = s;
             } else {

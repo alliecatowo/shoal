@@ -15,6 +15,7 @@ shoal-journal = { version = "0.1.0", path = "../shoal-journal" }
 shoal-leash = { version = "0.1.0", path = "../shoal-leash" }
 shoal-syntax = { version = "0.1.0", path = "../shoal-syntax" }
 shoal-value = { version = "0.1.0", path = "../shoal-value" }
+shoal-secret = { path = "../shoal-secret" }
 
 [dev-dependencies]
 tempfile = "3.20"
