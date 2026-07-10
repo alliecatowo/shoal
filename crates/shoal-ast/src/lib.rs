@@ -1,14 +1,12 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! shoal-ast — the canonical AST for the shoal shell.
+//!
+//! This is the single syntax vocabulary shared by the parser (`shoal-syntax`),
+//! the evaluator (`shoal-eval`), the journal, and the wire protocol. Every node
+//! carries a byte-offset [`Span`] into the source it was parsed from, and the
+//! whole tree serializes to the canonical JSON encoding via serde (`kind`-tagged).
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub mod ast;
+pub mod span;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub use ast::*;
+pub use span::Span;

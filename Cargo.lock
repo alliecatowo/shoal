@@ -992,6 +992,7 @@ dependencies = [
  "blake3",
  "rusqlite",
  "serde_json",
+ "tempfile",
  "zstd",
 ]
 
