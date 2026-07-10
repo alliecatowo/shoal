@@ -2228,6 +2228,7 @@ dependencies = [
  "shoal-exec",
  "shoal-journal",
  "shoal-leash",
+ "shoal-picker",
  "shoal-secret",
  "shoal-syntax",
  "shoal-value",
@@ -2337,6 +2338,15 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "shoal-reef"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "serde",
+ "toml 1.1.2+spec-1.1.0",
 ]
 
 [[package]]
