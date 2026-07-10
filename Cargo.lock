@@ -2152,6 +2152,8 @@ dependencies = [
  "shoal-config",
  "shoal-doctor",
  "shoal-eval",
+ "shoal-leash",
+ "shoal-prompt",
  "shoal-syntax",
  "shoal-value",
  "signal-hook",
@@ -2332,6 +2334,16 @@ dependencies = [
  "crossterm",
  "shoal-value",
  "unicode-segmentation",
+]
+
+[[package]]
+name = "shoal-prompt"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "serde",
+ "shoal-value",
+ "toml 1.1.2+spec-1.1.0",
 ]
 
 [[package]]

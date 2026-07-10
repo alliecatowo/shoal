@@ -1,0 +1,85 @@
+# shoal-prompt "default" theme — the zero-config behavior (design-prompt.md §9.1).
+# Every shoal-unique or platform-specific module (username/hostname/principal/
+# leash/battery) stays invisible-until-relevant.
+theme = ""
+nerd_font = "auto"
+unicode = true
+
+[format]
+left = "$directory$git_branch$git_status$git_state$reef$character"
+right = "$cmd_duration $jobs $time"
+continuation = "... "
+transient = "$character "
+
+[transient]
+enabled = false
+
+[style]
+ok = "green bold"
+error = "red bold"
+warn = "yellow bold"
+info = "blue"
+muted = "8"
+accent = "purple"
+
+[module.directory]
+truncate_to = 3
+repo_relative = true
+style = "cyan bold"
+
+[module.git_branch]
+symbol = " "
+ascii_symbol = "git:"
+style = "purple"
+
+[module.git_status]
+style = "red"
+
+[module.git_state]
+style = "yellow bold"
+
+[module.reef]
+style = "green"
+show_when_empty = false
+
+[module.language.python]
+tool = "python"
+symbol = " "
+ascii_symbol = "py:"
+style = "yellow"
+
+[module.language.node]
+tool = "node"
+symbol = " "
+ascii_symbol = "js:"
+style = "green"
+
+[module.language.rust]
+tool = "rust"
+symbol = " "
+ascii_symbol = "rs:"
+style = "red"
+
+[module.language.go]
+tool = "go"
+symbol = " "
+ascii_symbol = "go:"
+style = "cyan"
+
+[module.character]
+success_symbol = "❯"
+error_symbol = "❯"
+success_style = "green bold"
+error_style = "red bold"
+
+[module.cmd_duration]
+min_ms = 500
+style = "yellow"
+
+[module.jobs]
+threshold = 1
+style = "blue"
+
+[module.time]
+format = "%H:%M:%S"
+style = "dim"

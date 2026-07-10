@@ -18,6 +18,8 @@ serde_json = "1"
 nu-ansi-term = "0.50.3"
 toml = "1"
 signal-hook = "0.3"
+shoal-prompt = { version = "0.1.0", path = "../shoal-prompt" }
+shoal-leash = { version = "0.1.0", path = "../shoal-leash" }
 
 [dev-dependencies]
 serde = "1.0.228"

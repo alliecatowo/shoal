@@ -1,0 +1,719 @@
+//! Binary-side prompt wiring: build a [`PromptContext`] from live session state
+//! and drive the pure `shoal-prompt` renderer as reedline's prompt.
+//!
+//! The §1 invariant (a prompt render performs zero I/O / zero subprocess spawns)
+//! is honored structurally here: [`build_context`] runs **once per command**
+//! (between keystrokes, right before the next `read_line`), freezing a snapshot
+//! into a shared cell. reedline calls the render methods on every keystroke, but
+//! those only ever read the frozen snapshot — never git, never a clock syscall,
+//! never a spawn. This retires the `git_suffix()` subprocess-per-keystroke bug
+//! the old `DefaultPrompt` path carried (design §0, §10).
+//!
+//! Two integration seams intentionally read empty in this wave because the
+//! typed evaluator accessors they need (`jobs_snapshot`, `prompt_reef_snapshot`
+//! — design §12.1) live in `shoal-eval`, a crate this change set does not own:
+//! `jobs` and `reef`/`language_*` render empty until those land. Git status
+//! *counts* are likewise left at zero (branch + in-progress state are read
+//! purely from `.git`, with no subprocess and no `gix` dependency); wiring the
+//! full `gix` status engine is design §5.4/§12.3 and is deferred with the other
+//! background-cache machinery.
+
+use std::borrow::Cow;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
+
+use reedline::{Prompt, PromptEditMode, PromptHistorySearch, PromptHistorySearchStatus};
+use shoal_eval::Evaluator;
+use shoal_prompt::{
+    EditMode, GitSnapshot, LeashSnapshot, LeashTier, OutcomeSnapshot, Principal, PromptConfig,
+    PromptContext, Renderer, RepoState, SessionSnapshot, Side,
+};
+use shoal_value::Value;
+
+/// Shared, atomically-swappable snapshot cell. The REPL loop writes a fresh
+/// `Arc<PromptContext>` once per command; reedline's per-keystroke render reads
+/// it under a short read-lock (a lock, never I/O — inside §1's budget).
+pub type SharedCtx = Arc<RwLock<Arc<PromptContext>>>;
+
+/// The reedline `Prompt` impl. Thin dispatch onto the pure renderer (§2.5).
+pub struct ShoalPrompt {
+    renderer: Arc<Renderer>,
+    ctx: SharedCtx,
+    /// When true this is the transient (post-Enter) prompt (§2.5).
+    transient: bool,
+}
+
+impl ShoalPrompt {
+    pub fn new(renderer: Arc<Renderer>, ctx: SharedCtx, transient: bool) -> Self {
+        Self {
+            renderer,
+            ctx,
+            transient,
+        }
+    }
+
+    fn snapshot(&self) -> Arc<PromptContext> {
+        self.ctx
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_else(|p| p.into_inner().clone())
+    }
+}
+
+impl Prompt for ShoalPrompt {
+    fn render_prompt_left(&self) -> Cow<'_, str> {
+        let ctx = self.snapshot();
+        let side = if self.transient {
+            Side::Transient
+        } else {
+            Side::Left
+        };
+        Cow::Owned(self.renderer.render_side(side, &ctx))
+    }
+
+    fn render_prompt_right(&self) -> Cow<'_, str> {
+        if self.transient {
+            return Cow::Borrowed("");
+        }
+        let ctx = self.snapshot();
+        Cow::Owned(self.renderer.render_side(Side::Right, &ctx))
+    }
+
+    fn render_prompt_indicator(&self, _mode: PromptEditMode) -> Cow<'_, str> {
+        // Locked decision (§2.5): shoal-prompt owns the entire visual symbol via
+        // the `$character` module inside `format.left`. Returning reedline's own
+        // indicator here too would print the chevron twice.
+        Cow::Borrowed("")
+    }
+
+    fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> {
+        let ctx = self.snapshot();
+        Cow::Owned(self.renderer.render_side(Side::Continuation, &ctx))
+    }
+
+    fn render_prompt_history_search_indicator(
+        &self,
+        history_search: PromptHistorySearch,
+    ) -> Cow<'_, str> {
+        // Out of scope (§2.5, §14): reuse reedline's own default text shape.
+        let prefix = match history_search.status {
+            PromptHistorySearchStatus::Passing => "",
+            PromptHistorySearchStatus::Failing => "failing ",
+        };
+        Cow::Owned(format!(
+            "({prefix}reverse-search: {}) ",
+            history_search.term
+        ))
+    }
+
+    fn right_prompt_on_last_line(&self) -> bool {
+        self.renderer.config().right_prompt_on_last_line
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `shoal prompt` dev/introspection surface (§8)
+// ---------------------------------------------------------------------------
+
+/// `shoal prompt <explain|bench|print>` (§8).
+#[derive(Debug, Clone)]
+pub enum PromptAction {
+    Explain { side: Side },
+    Bench { n: usize, side: Side },
+    Print { side: Side },
+}
+
+/// Parse `prompt` subcommand arguments into a [`PromptAction`].
+pub fn parse_action(mut args: impl Iterator<Item = String>) -> Result<PromptAction, String> {
+    let sub = args.next().unwrap_or_else(|| "explain".into());
+    let mut side = Side::Left;
+    let mut n = 10_000usize;
+    let mut rest = args.peekable();
+    while let Some(a) = rest.next() {
+        match a.as_str() {
+            "--side" => {
+                let v = rest.next().ok_or("--side requires a value")?;
+                side = parse_side(&v)?;
+            }
+            "--n" => {
+                let v = rest.next().ok_or("--n requires a value")?;
+                n = v.parse().map_err(|_| "--n expects a number".to_string())?;
+            }
+            other => return Err(format!("unknown prompt argument `{other}`")),
+        }
+    }
+    match sub.as_str() {
+        "explain" => Ok(PromptAction::Explain { side }),
+        "bench" => Ok(PromptAction::Bench { n, side }),
+        "print" => Ok(PromptAction::Print { side }),
+        other => Err(format!(
+            "unknown prompt subcommand `{other}`; expected explain, bench, or print"
+        )),
+    }
+}
+
+fn parse_side(s: &str) -> Result<Side, String> {
+    match s {
+        "left" => Ok(Side::Left),
+        "right" => Ok(Side::Right),
+        "continuation" => Ok(Side::Continuation),
+        "transient" => Ok(Side::Transient),
+        _ => Err(format!(
+            "unknown side `{s}`; expected left, right, continuation, or transient"
+        )),
+    }
+}
+
+fn side_format(cfg: &PromptConfig, side: Side) -> &str {
+    match side {
+        Side::Left => &cfg.format.left,
+        Side::Right => &cfg.format.right,
+        Side::Continuation => &cfg.format.continuation,
+        Side::Transient => &cfg.format.transient,
+    }
+}
+
+fn side_name(side: Side) -> &'static str {
+    match side {
+        Side::Left => "left",
+        Side::Right => "right",
+        Side::Continuation => "continuation",
+        Side::Transient => "transient",
+    }
+}
+
+/// Run a `shoal prompt` subcommand.
+pub fn run(action: PromptAction) -> Result<i32, String> {
+    let cwd = std::env::current_dir().map_err(|e| format!("cannot determine cwd: {e}"))?;
+    let no_color = std::env::var_os("NO_COLOR").is_some();
+    let (config, warnings) = load_prompt_config(&cwd);
+    for w in &warnings {
+        eprintln!("warning: {w}");
+    }
+    let facts = StaticFacts::resolve(&config, no_color);
+    let deadline_ms = config.budget.render_deadline_ms;
+    let (renderer, more_warnings) = Renderer::new(config);
+    for w in &more_warnings {
+        eprintln!("warning: {w}");
+    }
+
+    let ev = Evaluator::new(cwd.clone());
+    let live = build_context(&ev, &facts, 80);
+
+    match action {
+        PromptAction::Print { side } => {
+            print!("{}", renderer.render_side(side, &live));
+            Ok(0)
+        }
+        PromptAction::Explain { side } => {
+            let src = side_format(renderer.config(), side).to_string();
+            let tokens = shoal_prompt::parse_format(&src);
+            println!("prompt {} — {}", side_name(side), src);
+            let mut total = Duration::ZERO;
+            for tok in &tokens {
+                if let shoal_prompt::FormatToken::Placeholder(id) = tok {
+                    let start = std::time::Instant::now();
+                    let rendered = renderer.render_placeholder(id, &live);
+                    let elapsed = start.elapsed();
+                    total += elapsed;
+                    let plain = strip_ansi(&rendered);
+                    println!("  {id:<16} ‹{plain}›  {}µs", elapsed.as_micros());
+                }
+            }
+            let ok = total < Duration::from_millis(deadline_ms);
+            println!(
+                "  total: {}µs (budget: {}ms) — {}",
+                total.as_micros(),
+                deadline_ms,
+                if ok { "OK" } else { "OVER" }
+            );
+            Ok(0)
+        }
+        PromptAction::Bench { n, side } => {
+            let ctx = bench_fixture(&facts);
+            // warm up
+            for _ in 0..100 {
+                let _ = renderer.render_side(side, &ctx);
+            }
+            let mut samples: Vec<u128> = Vec::with_capacity(n);
+            for _ in 0..n {
+                let start = std::time::Instant::now();
+                let out = renderer.render_side(side, &ctx);
+                samples.push(start.elapsed().as_nanos());
+                std::hint::black_box(out);
+            }
+            samples.sort_unstable();
+            let p = |q: usize| samples[(n.saturating_sub(1) * q) / 100];
+            let p50 = p(50);
+            let p99 = p(99);
+            let max = *samples.last().unwrap_or(&0);
+            println!(
+                "prompt {} bench (n={n}): p50={:.1}µs p99={:.1}µs max={:.1}µs (budget {}ms)",
+                side_name(side),
+                p50 as f64 / 1000.0,
+                p99 as f64 / 1000.0,
+                max as f64 / 1000.0,
+                deadline_ms
+            );
+            // CI regression gate (§8): exit 1 if p99 exceeds the deadline.
+            if p99 > (deadline_ms as u128) * 1_000_000 {
+                eprintln!("error: p99 exceeded the render deadline");
+                return Ok(1);
+            }
+            Ok(0)
+        }
+    }
+}
+
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for c2 in chars.by_ref() {
+                if ('\u{40}'..='\u{7e}').contains(&c2) {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// A fixed, reproducible fixture for `shoal prompt bench` (§8) — not live state.
+fn bench_fixture(facts: &StaticFacts) -> PromptContext {
+    let mut ctx = PromptContext::empty(PathBuf::from("/home/dev/develop/shoal"));
+    ctx.home = facts.home.clone();
+    ctx.no_color = facts.no_color;
+    ctx.nerd_font = facts.nerd_font;
+    ctx.unicode = facts.unicode;
+    ctx.time_local = (14, 3, 9);
+    ctx.last_outcome = Some(OutcomeSnapshot {
+        ok: true,
+        status: Some(0),
+        signal: None,
+        dur: Duration::from_millis(1250),
+        cmd_head: "cargo".into(),
+    });
+    ctx.git = Some(GitSnapshot {
+        repo_root: PathBuf::from("/home/dev/develop/shoal"),
+        repo_relative: PathBuf::from("crates/shoal-prompt"),
+        branch: Some("main".into()),
+        detached_at: None,
+        state: RepoState::Clean,
+        ahead: 1,
+        behind: 0,
+        staged: 2,
+        unstaged: 1,
+        untracked: 3,
+        conflicted: 0,
+        stashed: 0,
+        degraded: false,
+        age: Duration::ZERO,
+    });
+    ctx
+}
+
+// ---------------------------------------------------------------------------
+// Prompt config loading (§3.1 precedence, §10 migration)
+// ---------------------------------------------------------------------------
+
+/// Load and layer the prompt config from the same discovery paths
+/// `shoal_config` uses, plus the dedicated `prompt.toml` (§3.1). Returns the
+/// finished [`PromptConfig`] and any load-time warnings (§11).
+pub fn load_prompt_config(cwd: &Path) -> (PromptConfig, Vec<String>) {
+    let mut warnings = Vec::new();
+    let mut layers: Vec<toml::Value> = Vec::new();
+
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let config_dir = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home.map(|h| h.join(".config")))
+        .map(|p| p.join("shoal"));
+
+    // system + user shoal.toml [prompt] tables
+    if let Some(v) = read_prompt_table(Path::new("/etc/shoal/shoal.toml"), &mut warnings) {
+        layers.push(v);
+    }
+    if let Some(dir) = &config_dir {
+        if let Some(v) = read_prompt_table(&dir.join("shoal.toml"), &mut warnings) {
+            layers.push(v);
+        }
+        // dedicated prompt.toml (root-level = [prompt] contents directly)
+        if let Some(v) = read_root_table(&dir.join("prompt.toml"), &mut warnings) {
+            layers.push(v);
+        }
+    }
+    // project .shoal.toml [prompt] table
+    if let Some(v) = read_prompt_table(&cwd.join(".shoal.toml"), &mut warnings) {
+        layers.push(v);
+    }
+
+    // Environment overrides (highest precedence).
+    let env: Vec<(String, String)> = std::env::vars().collect();
+    layers.push(shoal_prompt::env_overrides(&env));
+
+    let config = shoal_prompt::load(layers, &mut warnings);
+    (config, warnings)
+}
+
+/// Read a config file's `[prompt]` sub-table as a prompt-contents-shaped value,
+/// applying the §10 `template` → `format.left` migration.
+fn read_prompt_table(path: &Path, warnings: &mut Vec<String>) -> Option<toml::Value> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let value: toml::Value = match toml::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            warnings.push(format!("{}: {e}", path.display()));
+            return None;
+        }
+    };
+    let prompt = value.get("prompt")?.clone();
+    Some(migrate_template(prompt, warnings))
+}
+
+fn read_root_table(path: &Path, warnings: &mut Vec<String>) -> Option<toml::Value> {
+    let text = std::fs::read_to_string(path).ok()?;
+    match toml::from_str::<toml::Value>(&text) {
+        Ok(v) => Some(migrate_template(v, warnings)),
+        Err(e) => {
+            warnings.push(format!("{}: {e}", path.display()));
+            None
+        }
+    }
+}
+
+/// §10 migration: a `[prompt]` table with the old `template` key and no new
+/// `format` key is rewritten to `format.left`, `{cwd}` → `$directory`.
+fn migrate_template(mut prompt: toml::Value, warnings: &mut Vec<String>) -> toml::Value {
+    let Some(table) = prompt.as_table_mut() else {
+        return prompt;
+    };
+    let has_template = table.contains_key("template");
+    let has_format = table.contains_key("format");
+    if has_template && has_format {
+        warnings.push(
+            "prompt: both 'template' and 'format' set; 'format' wins, 'template' ignored".into(),
+        );
+        table.remove("template");
+    } else if has_template
+        && let Some(t) = table
+            .remove("template")
+            .and_then(|v| v.as_str().map(str::to_string))
+    {
+        let left = t.replace("{cwd}", "$directory");
+        let mut fmt = toml::map::Map::new();
+        fmt.insert("left".into(), toml::Value::String(left));
+        table.insert("format".into(), toml::Value::Table(fmt));
+        warnings.push(
+            "prompt: 'template' is deprecated; migrated to format.left — update your config to silence this warning".into(),
+        );
+    }
+    prompt
+}
+
+// ---------------------------------------------------------------------------
+// Static session facts — resolved once at startup (§4.9/§4.10/§4.11/§4.15/§4.16)
+// ---------------------------------------------------------------------------
+
+/// Facts that never change over a process lifetime: session identity, leash
+/// tier, font/color resolution. Computed once, then folded into every snapshot.
+pub struct StaticFacts {
+    pub session: SessionSnapshot,
+    pub leash: LeashSnapshot,
+    pub home: Option<PathBuf>,
+    pub no_color: bool,
+    pub nerd_font: bool,
+    pub unicode: bool,
+    pub principal: Principal,
+}
+
+impl StaticFacts {
+    pub fn resolve(config: &PromptConfig, no_color: bool) -> Self {
+        let session = resolve_session();
+        let leash = resolve_leash();
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let nerd_font = resolve_nerd_font(&config.nerd_font);
+        let unicode = config.unicode;
+        Self {
+            session,
+            leash,
+            home,
+            no_color,
+            nerd_font,
+            unicode,
+            principal: Principal::Human,
+        }
+    }
+}
+
+fn resolve_session() -> SessionSnapshot {
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_default();
+    let host = hostname();
+    let is_ssh =
+        std::env::var_os("SSH_TTY").is_some() || std::env::var_os("SSH_CONNECTION").is_some();
+    // SAFETY: getuid is always safe; it only reads the caller's real uid.
+    let is_root = unsafe { libc::getuid() } == 0;
+    SessionSnapshot {
+        user,
+        host,
+        is_ssh,
+        is_root,
+    }
+}
+
+fn hostname() -> String {
+    let mut buf = [0u8; 256];
+    // SAFETY: gethostname writes at most buf.len() bytes into our buffer.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+    if rc != 0 {
+        return std::env::var("HOSTNAME").unwrap_or_default();
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..end]).into_owned()
+}
+
+fn resolve_leash() -> LeashSnapshot {
+    let status = shoal_leash::EnforcementStatus::detect();
+    let tier = match status.available_tier {
+        shoal_leash::EnforcementTier::A => LeashTier::A,
+        shoal_leash::EnforcementTier::B => LeashTier::B,
+        shoal_leash::EnforcementTier::C => LeashTier::C,
+        shoal_leash::EnforcementTier::D => LeashTier::D,
+    };
+    LeashSnapshot {
+        tier,
+        enforced: status.enforced,
+    }
+}
+
+/// nerd-font resolution (§3.5): exactly these checks, in this order.
+fn resolve_nerd_font(mode: &str) -> bool {
+    match mode {
+        "always" => true,
+        "never" => false,
+        _ => {
+            std::env::var_os("WEZTERM_PANE").is_some()
+                || std::env::var_os("KITTY_WINDOW_ID").is_some()
+                || std::env::var_os("WT_SESSION").is_some()
+                || std::env::var("SHOAL_NERD_FONT").ok().as_deref() == Some("1")
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-command context construction (§2.3 build_context)
+// ---------------------------------------------------------------------------
+
+/// Build a full [`PromptContext`] from live session state. Runs once per command
+/// (never per keystroke), so its handful of `stat`s reading `.git` sit in the
+/// post-command budget (§5.3 trigger 1), not the keystroke budget (§1).
+pub fn build_context(ev: &Evaluator, facts: &StaticFacts, width: u16) -> PromptContext {
+    let cwd = ev.cwd().to_path_buf();
+    let read_only = is_read_only(&cwd);
+    let last_outcome = outcome_from(&ev.it);
+    let git = read_git(&cwd);
+    let (h, m, s) = local_hms();
+
+    PromptContext {
+        cwd,
+        home: facts.home.clone(),
+        read_only,
+        width,
+        no_color: facts.no_color,
+        nerd_font: facts.nerd_font,
+        unicode: facts.unicode,
+        edit_mode: EditMode::Emacs,
+        multiline: false,
+        last_outcome,
+        jobs: shoal_prompt::JobsSnapshot::default(),
+        principal: facts.principal.clone(),
+        leash: facts.leash.clone(),
+        session: facts.session.clone(),
+        time_local: (h, m, s),
+        git,
+        reef: Vec::new(),
+        battery: None,
+        custom: std::collections::BTreeMap::new(),
+    }
+}
+
+fn outcome_from(it: &Value) -> Option<OutcomeSnapshot> {
+    match it {
+        Value::Outcome(o) => Some(OutcomeSnapshot {
+            ok: o.ok,
+            status: o.status,
+            signal: o.signal.clone(),
+            dur: Duration::from_nanos(o.dur_ns.max(0) as u64),
+            cmd_head: o.cmd.split_whitespace().next().unwrap_or("").to_string(),
+        }),
+        _ => None,
+    }
+}
+
+fn is_read_only(cwd: &Path) -> bool {
+    // SAFETY: access(2) only reads permission bits for the given path.
+    let c = match std::ffi::CString::new(cwd.as_os_str().to_string_lossy().as_bytes()) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    unsafe { libc::access(c.as_ptr(), libc::W_OK) != 0 }
+}
+
+fn local_hms() -> (u8, u8, u8) {
+    // SAFETY: time()/localtime_r are the standard libc time path; localtime_r
+    // writes into a caller-owned tm and is thread-safe.
+    unsafe {
+        let t = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&t, &mut tm).is_null() {
+            return (0, 0, 0);
+        }
+        (tm.tm_hour as u8, tm.tm_min as u8, tm.tm_sec as u8)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pure-Rust git reader — branch + in-progress state, zero subprocess (§5.4)
+// ---------------------------------------------------------------------------
+
+/// Read branch + repo state from `.git` directly — no subprocess, no git lib.
+/// Status counts are left at zero pending the `gix` status engine (design §5.4);
+/// branch and in-progress operation are accurate.
+pub fn read_git(cwd: &Path) -> Option<GitSnapshot> {
+    let (repo_root, git_dir) = discover_repo(cwd)?;
+    let repo_relative = cwd
+        .strip_prefix(&repo_root)
+        .map(|p| p.to_path_buf())
+        .unwrap_or_default();
+
+    let (branch, detached_at) = read_head(&git_dir);
+    let state = read_state(&git_dir);
+
+    Some(GitSnapshot {
+        repo_root,
+        repo_relative,
+        branch,
+        detached_at,
+        state,
+        ahead: 0,
+        behind: 0,
+        staged: 0,
+        unstaged: 0,
+        untracked: 0,
+        conflicted: 0,
+        stashed: 0,
+        // Counts are not computed (no gix): render them as "unknown clean"
+        // rather than flagging perpetual staleness. `git_status` therefore
+        // renders empty until §5.4's engine lands — an honest gap, not a lie.
+        degraded: false,
+        age: Duration::ZERO,
+    })
+}
+
+fn discover_repo(cwd: &Path) -> Option<(PathBuf, PathBuf)> {
+    let mut dir = cwd;
+    loop {
+        let candidate = dir.join(".git");
+        if candidate.is_dir() {
+            return Some((dir.to_path_buf(), candidate));
+        }
+        if candidate.is_file() {
+            // Worktree: `.git` file contains `gitdir: <path>`.
+            if let Ok(content) = std::fs::read_to_string(&candidate)
+                && let Some(rest) = content.trim().strip_prefix("gitdir:")
+            {
+                let gd = PathBuf::from(rest.trim());
+                let gd = if gd.is_absolute() { gd } else { dir.join(gd) };
+                return Some((dir.to_path_buf(), gd));
+            }
+        }
+        dir = dir.parent()?;
+    }
+}
+
+fn read_head(git_dir: &Path) -> (Option<String>, Option<String>) {
+    let Ok(content) = std::fs::read_to_string(git_dir.join("HEAD")) else {
+        return (None, None);
+    };
+    let content = content.trim();
+    if let Some(rest) = content.strip_prefix("ref:") {
+        let refname = rest.trim();
+        let branch = refname
+            .rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        (branch, None)
+    } else if content.len() >= 7 && content.chars().all(|c| c.is_ascii_hexdigit()) {
+        (None, Some(content[..7].to_string()))
+    } else {
+        (None, None)
+    }
+}
+
+fn read_state(git_dir: &Path) -> RepoState {
+    let exists = |name: &str| git_dir.join(name).exists();
+    if exists("rebase-merge") || exists("rebase-apply") {
+        RepoState::Rebasing
+    } else if exists("MERGE_HEAD") {
+        RepoState::Merging
+    } else if exists("CHERRY_PICK_HEAD") {
+        RepoState::CherryPicking
+    } else if exists("REVERT_HEAD") {
+        RepoState::Reverting
+    } else if exists("BISECT_LOG") {
+        RepoState::Bisecting
+    } else {
+        RepoState::Clean
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nerd_font_modes() {
+        assert!(resolve_nerd_font("always"));
+        assert!(!resolve_nerd_font("never"));
+    }
+
+    #[test]
+    fn head_parses_branch_and_detached() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("HEAD"), "ref: refs/heads/feature/x\n").unwrap();
+        assert_eq!(read_head(dir.path()).0.as_deref(), Some("x"));
+        std::fs::write(
+            dir.path().join("HEAD"),
+            "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678\n",
+        )
+        .unwrap();
+        assert_eq!(read_head(dir.path()).1.as_deref(), Some("a1b2c3d"));
+    }
+
+    #[test]
+    fn state_detects_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(read_state(dir.path()), RepoState::Clean);
+        std::fs::write(dir.path().join("MERGE_HEAD"), "x").unwrap();
+        assert_eq!(read_state(dir.path()), RepoState::Merging);
+    }
+
+    #[test]
+    fn discover_finds_git_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        let sub = dir.path().join("a/b");
+        std::fs::create_dir_all(&sub).unwrap();
+        let (root, gitdir) = discover_repo(&sub).unwrap();
+        assert_eq!(root, dir.path());
+        assert!(gitdir.ends_with(".git"));
+    }
+}

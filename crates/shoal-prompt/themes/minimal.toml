@@ -1,0 +1,49 @@
+# shoal-prompt "minimal" theme — for users who want almost nothing
+# (design-prompt.md §9.3). Note: this is about visual noise, not a speed tier —
+# the default theme is already sub-millisecond.
+theme = ""
+nerd_font = "never"
+unicode = false
+
+[format]
+left = "$directory$git_branch$character"
+right = ""
+continuation = "> "
+transient = "$character "
+
+[transient]
+enabled = true
+
+[module.directory]
+truncate_to = 1
+repo_relative = false
+style = "none"
+
+[module.git_branch]
+ascii_symbol = "("
+style = "none"
+format = "(${branch})"
+
+[module.character]
+success_symbol = ">"
+error_symbol = ">"
+success_style = "none"
+error_style = "bold"
+
+[module.git_status]
+enabled = false
+
+[module.git_state]
+enabled = false
+
+[module.reef]
+enabled = false
+
+[module.cmd_duration]
+enabled = false
+
+[module.jobs]
+enabled = false
+
+[module.time]
+enabled = false

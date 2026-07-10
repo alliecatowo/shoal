@@ -4,15 +4,66 @@ This file pins the public APIs between crates so work can proceed in parallel.
 **Do not change a pinned signature without updating this file and every consumer.**
 Read `docs/TDD.md` first — it is the semantic contract; this file is the Rust-level contract.
 
-Crate dependency DAG (acyclic, enforced):
+Crate dependency DAG (acyclic, enforced; verified against every `crates/*/Cargo.toml`
+`shoal-*` dependency line — see reproduction command below), by tier:
 
 ```
-shoal-ast  ←  shoal-value  ←  shoal-adapters
-    ↑              ↑               ↑
-shoal-syntax   shoal-eval  ← ← ← ← ┘
-                   ↑   ↖ shoal-exec, shoal-journal, shoal-reef (leaf crates, no shoal deps)
-                shoal (binary: REPL/TUI, script runner)
+Tier 0 — leaf (no shoal-* deps):
+  shoal-ast  shoal-auth  shoal-config  shoal-journal  shoal-leash
+  shoal-proto  shoal-reef  shoal-secret  shoal-wasm
+
+Tier 1 — depend only on Tier 0:
+  shoal-value   → ast
+  shoal-syntax  → ast
+  shoal-exec    → leash    (NOT a leaf — see note below)
+  shoal-history → journal
+  shoal-lsp     → syntax
+
+Tier 2 — depend on Tier 0/1:
+  shoal-adapters → ast, value
+  shoal-picker   → value
+
+Tier 3 — the domain core:
+  shoal-eval → adapters, ast, exec, journal, leash, picker, reef, secret, syntax, value
+
+Tier 4 — composition roots (daemon + tools):
+  shoal-doctor → adapters, journal, leash
+  shoal-kernel → ast, auth, eval, exec, journal, leash, proto, syntax, value
+
+Tier 5 — entrypoints (binaries):
+  shoal        → adapters, ast, config, doctor, eval, syntax, value
+  shoal-mcp, shoal-lsp  — spawned by `shoal` as companion subprocesses (`Action::Companion`,
+                          crates/shoal/src/main.rs), NOT Cargo dependencies of `shoal`;
+                          shoal-mcp itself has zero shoal-* deps (talks to shoal-kernel's
+                          socket over the wire protocol, not via Rust linkage)
+  shoal-kernel  — the long-lived per-user daemon (TDD §10); MCP/LSP/agent/human clients
+                  attach to its socket. Independent of the `shoal` binary at the Cargo-dep
+                  level (`shoal` never depends on or spawns `shoal-kernel`) — the two are
+                  alternative hostings of the same core (TDD §1.1: "kernel-less" via `shoal
+                  script.shl` links shoal-eval in-process; kernel-hosted sessions attach over
+                  the socket instead).
 ```
+
+Notes / corrections vs the old (stale) diagram:
+- `shoal-exec` is **not** a leaf — it depends on `shoal-leash` (sandboxing hooks around spawn).
+- `shoal-eval` additionally depends on `shoal-adapters`, `shoal-leash`, `shoal-secret`,
+  `shoal-picker`, `shoal-reef` (not just `shoal-value`/`shoal-syntax`/`shoal-exec`/`shoal-journal`
+  as the old diagram implied).
+- The daemon/tooling tier (`shoal-kernel`, `shoal-mcp`, `shoal-lsp`, plus `shoal-doctor`,
+  `shoal-history`, `shoal-config`, `shoal-wasm`) previously had no place in the diagram at all.
+  `shoal-kernel` is the real composition root for the daemon-hosted surfaces (MCP/LSP/agent
+  clients all attach through it); `shoal` (binary) is the composition root for the kernel-less
+  REPL/script-runner surface. `shoal-wasm` (WASM component-plugin host) and `shoal-mcp` currently
+  have no other in-workspace crate depending on them as a library — `shoal-wasm` isn't wired into
+  `shoal-eval`'s command dispatch yet, and `shoal-mcp` is a standalone binary that speaks the wire
+  protocol to a running `shoal-kernel`, not a Rust dependency of anything.
+- No cycles exist anywhere (Cargo would reject the workspace if one did); the one
+  cross-tier-looking edge (`shoal-value` needing closure-eval from `shoal-eval`) is a proper
+  dependency *inversion*, not a back-edge: `shoal-value` defines `trait CallCtx` (§7 below) and
+  `shoal-eval` implements it, so the arrow in the DAG still points `shoal-eval → shoal-value`.
+
+Reproduce: `grep -oE '^shoal-[a-z]+' crates/*/Cargo.toml` (per crate) to re-derive this table if
+crates are added/moved; re-run whenever a crate's `Cargo.toml` `[dependencies]` changes.
 
 Ownership map:
 - `shoal-ast`, `shoal-value` (core types), `shoal-syntax`, `shoal-eval`, `shoal` (binary): owned by the integrator. Do not edit unless your task says so.

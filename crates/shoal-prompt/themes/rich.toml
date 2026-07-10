@@ -1,0 +1,98 @@
+# shoal-prompt "rich" theme — everything on, maximal information density
+# (design-prompt.md §9.2).
+theme = ""
+nerd_font = "always"
+unicode = true
+
+[format]
+left = "$principal$directory$git_branch$git_state$git_status$reef$language_python$language_node$language_rust$language_go$character"
+right = "$leash $battery $cmd_duration $jobs $time"
+continuation = "▏ "
+transient = "$directory $character "
+
+[transient]
+enabled = true
+
+[module.principal]
+enabled = true
+agent_symbol = "🤖"
+show_agent_name = true
+style = "muted"
+agent_style = "cyan bold"
+
+[module.directory]
+truncate_to = 4
+truncate_style = "middle"
+repo_relative = true
+read_only_symbol = "🔒 "
+style = "cyan bold"
+
+[module.git_branch]
+symbol = " "
+style = "bright-purple bold"
+truncate_to = 24
+
+[module.git_status]
+style = "bright-red"
+stale_symbol = " …"
+
+[module.git_state]
+style = "bright-yellow bold"
+
+[module.reef]
+show_when_empty = false
+show_ambient = true
+style = "bright-green"
+
+[module.language.python]
+tool = "python"
+when = "resolved"
+symbol = " "
+style = "bright-yellow"
+
+[module.language.node]
+tool = "node"
+when = "resolved"
+symbol = " "
+style = "bright-green"
+
+[module.language.rust]
+tool = "rust"
+when = "resolved"
+symbol = " "
+style = "bright-red"
+
+[module.language.go]
+tool = "go"
+when = "resolved"
+symbol = " "
+style = "bright-cyan"
+
+[module.character]
+success_symbol = "❯"
+error_symbol = "✗"
+vicmd_symbol = "❮"
+success_style = "green bold"
+error_style = "red bold"
+vicmd_style = "yellow bold"
+
+[module.leash]
+enabled = true
+symbol_by_tier = { A = "🔒", B = "🔓", C = "🔓", D = "⚠" }
+
+[module.battery]
+enabled = true
+low_threshold = 15
+
+[module.cmd_duration]
+min_ms = 200
+style = "bright-yellow"
+
+[module.jobs]
+threshold = 1
+symbol = "✦"
+style = "bright-blue"
+
+[module.time]
+format = "%H:%M:%S"
+style = "dim"

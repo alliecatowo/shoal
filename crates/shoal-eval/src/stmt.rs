@@ -1,0 +1,281 @@
+//! Program/statement/block control flow: the top-level statement loop, `let`/
+//! `fn`/`assign`/`for`/`while` statement forms, and block evaluation
+//! (including the sink/discard-context bookkeeping the double-echo fix needs).
+
+use super::*;
+
+impl Evaluator {
+    pub fn eval_program(&mut self, program: &Program) -> VResult<Value> {
+        let mut last = Value::Null;
+        let n = program.stmts.len();
+        for (i, stmt) in program.stmts.iter().enumerate() {
+            let is_last = i + 1 == n;
+            match self.eval_stmt(stmt, true)? {
+                Flow::Value(v) => {
+                    self.it = v.clone();
+                    if is_last {
+                        last = v;
+                    } else {
+                        // Non-final statement values pass through to the sink
+                        // (defect #1a); the final value is returned to the host.
+                        self.sink_value(&v);
+                    }
+                }
+                Flow::Return(_) => {
+                    return Err(
+                        ErrorVal::new("custom", "return outside function").with_span(stmt.span())
+                    );
+                }
+                Flow::Break | Flow::Continue => {
+                    return Err(
+                        ErrorVal::new("custom", "loop control outside loop").with_span(stmt.span())
+                    );
+                }
+            }
+        }
+        Ok(last)
+    }
+
+    pub(crate) fn eval_stmt(&mut self, stmt: &Stmt, top: bool) -> VResult<Flow> {
+        match stmt {
+            Stmt::Let {
+                pattern,
+                init,
+                mutable,
+                ..
+            } => {
+                let value = self.eval_expr(init, Position::Value)?;
+                self.bind_pattern(pattern, value, *mutable)?;
+                Ok(Flow::Value(Value::Null))
+            }
+            Stmt::Fn { decl } => {
+                let closure = Value::Closure(Arc::new(ClosureVal {
+                    name: Some(decl.name.clone()),
+                    params: decl.params.clone(),
+                    rest: decl.rest.clone(),
+                    ret: decl.ret.clone(),
+                    body: Expr::Block {
+                        block: decl.body.clone(),
+                        span: decl.body.span,
+                    },
+                    env: self.env.clone(),
+                    doc: decl.doc.clone(),
+                }));
+                self.env.declare(decl.name.clone(), closure, false);
+                Ok(Flow::Value(Value::Null))
+            }
+            Stmt::Alias { name, target, .. } => {
+                self.env
+                    .declare(name.clone(), Value::CmdRef(Arc::new(target.clone())), false);
+                Ok(Flow::Value(Value::Null))
+            }
+            Stmt::Assign {
+                target,
+                op,
+                value,
+                span,
+            } => {
+                let rhs = self.eval_expr(value, Position::Value)?;
+                // `env.NAME = v` — session environment write (defect #11, §4.6).
+                if let Expr::Field { recv, name, .. } = target
+                    && matches!(&**recv, Expr::Var { name, .. } if name == "env")
+                {
+                    if *op != AssignOp::Set {
+                        return Err(ErrorVal::new(
+                            "type_error",
+                            "compound assignment is not allowed on env.NAME",
+                        )
+                        .with_span(*span));
+                    }
+                    if self.in_fn_body > 0 {
+                        return Err(ErrorVal::new(
+                            "custom",
+                            "env writes are only allowed at session top level; use `with env:` inside a fn body",
+                        )
+                        .with_span(*span));
+                    }
+                    let val = self.argv_value(rhs.clone()).map_err(|e| e.or_span(*span))?;
+                    self.process_env
+                        .retain(|(k, _)| k != &OsString::from(name.clone()));
+                    self.process_env.push((OsString::from(name.clone()), val));
+                    return Ok(Flow::Value(rhs));
+                }
+                let Expr::Var { name, .. } = target else {
+                    return Err(ErrorVal::new(
+                        "type_error",
+                        "assignment target must be a variable in v0.1",
+                    )
+                    .with_span(*span));
+                };
+                let assigned = if *op == AssignOp::Set {
+                    rhs
+                } else {
+                    let lhs = self.env.get(name).ok_or_else(|| {
+                        ErrorVal::new("undefined_var", format!("undefined variable `{name}`"))
+                    })?;
+                    let bop = match op {
+                        AssignOp::Add => BinOp::Add,
+                        AssignOp::Sub => BinOp::Sub,
+                        AssignOp::Mul => BinOp::Mul,
+                        AssignOp::Div => BinOp::Div,
+                        AssignOp::Set => unreachable!(),
+                    };
+                    shoal_value::ops::binop(bop, &lhs, &rhs)?
+                };
+                self.env.assign(name, assigned.clone()).map_err(|e| {
+                    ErrorVal::new("type_error", format!("cannot assign `{name}`: {e:?}"))
+                })?;
+                Ok(Flow::Value(assigned))
+            }
+            Stmt::Expr { expr, .. } => {
+                let position = if top {
+                    Position::Statement
+                } else {
+                    Position::Value
+                };
+                self.eval_expr_flow(expr, position)
+            }
+            Stmt::Return { value, .. } => Ok(Flow::Return(match value {
+                Some(v) => self.eval_expr(v, Position::Value)?,
+                None => Value::Null,
+            })),
+            Stmt::Break { .. } => Ok(Flow::Break),
+            Stmt::Continue { .. } => Ok(Flow::Continue),
+            Stmt::For {
+                pattern,
+                iter,
+                body,
+                ..
+            } => {
+                let iter_value = self.eval_expr(iter, Position::Value)?;
+                let vals = self.values_from(iter_value)?;
+                for value in vals {
+                    let old = self.env.clone();
+                    self.env = old.child();
+                    self.bind_pattern(pattern, value, false)?;
+                    let flow = self.eval_block(body, true);
+                    self.env = old;
+                    match flow? {
+                        Flow::Value(_) => {}
+                        Flow::Continue => continue,
+                        Flow::Break => break,
+                        r @ Flow::Return(_) => return Ok(r),
+                    }
+                }
+                // A loop is a statement, not an expression — it yields no value
+                // (so a trailing bare command in the body is not re-rendered as
+                // the loop's result). Its work is its side effects.
+                Ok(Flow::Value(Value::Null))
+            }
+            Stmt::While { cond, body, .. } => {
+                while self.eval_expr(cond, Position::Value)?.as_condition()? {
+                    match self.eval_block(body, true)? {
+                        Flow::Value(_) => {}
+                        Flow::Continue => {}
+                        Flow::Break => break,
+                        r @ Flow::Return(_) => return Ok(r),
+                    }
+                }
+                Ok(Flow::Value(Value::Null))
+            }
+            Stmt::Use { span, .. } => Err(ErrorVal::new(
+                "custom",
+                "module loading is not implemented yet",
+            )
+            .with_span(*span)),
+        }
+    }
+
+    /// Evaluate an expression appearing in statement position while letting
+    /// `break`/`continue`/`return` inside an `if`/block body propagate to the
+    /// enclosing loop rather than being flattened into a "loop control outside
+    /// loop" error (the `while … { if … { break } }` case). Non-control-flow
+    /// expressions fall back to ordinary value evaluation.
+    pub(crate) fn eval_expr_flow(&mut self, expr: &Expr, position: Position) -> VResult<Flow> {
+        match expr {
+            Expr::If {
+                cond,
+                then,
+                r#else,
+                span,
+            } => {
+                let taken = self
+                    .eval_expr(cond, Position::Value)?
+                    .as_condition()
+                    .map_err(|e| e.or_span(*span))?;
+                if taken {
+                    self.eval_block(then, false)
+                } else if let Some(e) = r#else {
+                    self.eval_expr_flow(e, position)
+                } else {
+                    Ok(Flow::Value(Value::Null))
+                }
+            }
+            Expr::Block { block, .. } => self.eval_block(block, false),
+            _ => Ok(Flow::Value(self.eval_expr(expr, position)?)),
+        }
+    }
+
+    /// Evaluate a block. `sink_tail` says whether the caller will DISCARD the
+    /// block's value (loop bodies) versus CONSUME it (fn body, `if`/block used
+    /// as a value, or a top-level statement whose value `eval_program` itself
+    /// sinks). The double-echo fix (P1): the trailing bare-command statement is
+    /// the block VALUE and must NOT also be sunk here — only when the caller
+    /// discards it (`sink_tail`) does its output route to the sink; otherwise
+    /// the caller renders/sinks it exactly once. Non-final bare commands always
+    /// print (they are intermediate, discard-context regardless).
+    pub(crate) fn eval_block(&mut self, block: &Block, sink_tail: bool) -> VResult<Flow> {
+        let old = self.env.clone();
+        self.env = old.child();
+        let mut last = Flow::Value(Value::Null);
+        let n = block.stmts.len();
+        for (i, stmt) in block.stmts.iter().enumerate() {
+            let is_tail = i + 1 == n;
+            // A statement is in discard context when it is not the block value,
+            // or when the caller discards the block value.
+            let discard = !is_tail || sink_tail;
+            if let Stmt::Expr { expr, .. } = stmt
+                && crate::helpers::is_command_expr(expr)
+            {
+                // Discard-context commands run in statement position (failures
+                // raise) and print; the value-context tail runs in value
+                // position (failures surface as an outcome) and stays silent.
+                let position = if discard {
+                    Position::Statement
+                } else {
+                    Position::Value
+                };
+                let v = self.eval_expr(expr, position)?;
+                if discard {
+                    self.sink_value(&v);
+                }
+                last = Flow::Value(v);
+                continue;
+            }
+            last = self.eval_stmt(stmt, false)?;
+            if !matches!(last, Flow::Value(_)) {
+                break;
+            }
+            // A discarded tail whose value is not a bare command (e.g. a nested
+            // `if`/block that produced a command outcome) still routes to the
+            // sink so loop-body side effects are not swallowed.
+            if is_tail
+                && sink_tail
+                && let Flow::Value(v) = &last
+            {
+                self.sink_value(v);
+            }
+        }
+        self.env = old;
+        Ok(last)
+    }
+
+    pub(crate) fn block_value(&mut self, b: &Block) -> VResult<Value> {
+        match self.eval_block(b, false)? {
+            Flow::Value(v) | Flow::Return(v) => Ok(v),
+            Flow::Break | Flow::Continue => {
+                Err(ErrorVal::new("custom", "loop control outside loop"))
+            }
+        }
+    }
+}

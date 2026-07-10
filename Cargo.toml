@@ -20,3 +20,57 @@ shoal-exec = { path = "crates/shoal-exec" }
 shoal-journal = { path = "crates/shoal-journal" }
 shoal-adapters = { path = "crates/shoal-adapters" }
 shoal-eval = { path = "crates/shoal-eval" }
+
+# Conservative, workspace-wide lint policy (scratch/audit-quality.md §1). NOT yet wired to any
+# crate: a member only inherits this table by adding `[lints] workspace = true` to its own
+# Cargo.toml, which is a per-crate opt-in landed in a follow-up wave (see
+# [workspace.metadata.lints] below for why it isn't done here). Every lint below was verified
+# to have zero violations workspace-wide (`cargo +stable clippy --workspace --all-targets --
+# -D warnings -D <lint>...`) before being added — if a lint you'd expect here is missing, check
+# [workspace.metadata.lints] first; it's likely a documented, currently-violated candidate for
+# the next cleanup wave, not an oversight.
+[workspace.lints.rust]
+# `unsafe_code` is deliberately NOT set to "warn"/"deny": the tree has real, legitimate `unsafe`
+# today (PTY/signal/uid syscalls in shoal-exec/shoal-kernel/shoal-reef/shoal-doctor, the macOS
+# Seatbelt FFI in shoal-leash, env-var mutation in shoal/shoal-eval tests — confirmed via
+# `grep -rn 'unsafe ' crates/*/src`, ~30 sites across 8 crates). scratch/audit-quality.md's
+# "zero unsafe blocks" claim was already stale when written; denying it here would trip the
+# instant any crate opts in. Revisit per-crate once each unsafe site has a `// SAFETY:` comment.
+noop_method_call = "warn"
+
+[workspace.lints.clippy]
+# Mirrors clippy's own default groups (already active without this table) so opting a crate in
+# is a portability no-op for CI, and makes the policy explicit for local `cargo clippy` (which
+# doesn't pass CI's `-D warnings` and would otherwise silently show these as non-blocking).
+all = { level = "warn", priority = -1 }
+# Small, verified-zero-violation additions beyond the default groups:
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+mem_forget = "warn"
+
+[workspace.metadata.lints]
+status = """
+[workspace.lints] above is staged, not enforced yet. Cargo only applies a workspace lints table
+to a crate that adds `[lints] workspace = true` to its own manifest, and this task's ownership is
+scoped to the root Cargo.toml only (not member manifests) — partly to avoid racing the parallel
+work landing at the same time this table was authored (shoal-eval's lib.rs module split; a new
+shoal-prompt crate). Land the opt-in crate-by-crate in a follow-up wave, confirming
+`cargo +stable clippy -p <crate> --all-targets -- -D warnings` stays green after each addition
+(a crate's own `#![allow(...)]`, e.g. shoal-syntax/src/lib.rs, takes precedence over the inherited
+workspace level per lint, so opting in is safe even for crates with existing suppressions).
+"""
+deferred_pending_violations = """
+scratch/audit-quality.md §1 proposes `clippy::missing_errors_doc` (88 warnings today),
+`clippy::missing_panics_doc` (19), `clippy::unwrap_used`/`clippy::expect_used` (hundreds),
+`clippy::use_self` (273), and rust's `missing_debug_implementations` — all desirable but each has
+existing violations workspace-wide as of this writing, so none are enabled above (enabling any of
+them now would break the first crate that opts in). Track these for a dedicated cleanup wave
+rather than enabling-with-violations; `clippy::use_self` is reportedly ~all auto-fixable via
+`cargo clippy --fix -- -W clippy::use_self` per crate, so likely the cheapest to land first.
+Also tried and DROPPED: rust's `unused_qualifications` — verified clean on 17 of 20 crates but
+shoal-eval currently has 8 sites (helpers.rs:34, host.rs:236, stmt.rs:238) freshly introduced by
+its lib.rs module split landing concurrently with this table; re-check and re-add once that
+split settles (the fix is mechanical: `crate::helpers::foo(..)` -> `helpers::foo(..)` /
+`shoal_value::ClosureVal` -> `ClosureVal` where already imported).
+"""

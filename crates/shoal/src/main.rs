@@ -3,12 +3,12 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use reedline::{
-    ColumnarMenu, DefaultHinter, DefaultPrompt, DefaultPromptSegment, Emacs, FileBackedHistory,
-    KeyCode, KeyModifiers, MenuBuilder, Reedline, ReedlineEvent, ReedlineMenu, Signal,
-    ValidationResult, Validator, default_emacs_keybindings,
+    ColumnarMenu, DefaultHinter, Emacs, FileBackedHistory, KeyCode, KeyModifiers, MenuBuilder,
+    Reedline, ReedlineEvent, ReedlineMenu, Signal, ValidationResult, Validator,
+    default_emacs_keybindings,
 };
 use shoal_eval::Evaluator;
 use shoal_syntax::{ParseCtx, ParseError, parse, parse_with_ctx};
@@ -16,10 +16,11 @@ use shoal_value::{Env, ErrorVal, Value};
 
 mod completer;
 mod highlight;
+mod prompt;
 use completer::ShoalCompleter;
 use highlight::ShoalHighlighter;
 
-const USAGE: &str = "shoal 0.1.0\n\nUsage: shoal [OPTIONS] [SCRIPT]\n       shoal <fmt|doctor|lsp|mcp|completions> ...\n\nOptions:\n  -c, --command <SOURCE>  Evaluate source and exit\n  -h, --help              Print help\n  -V, --version           Print version\n\nDeveloper commands:\n  fmt [--check] [FILES]   Format .shl source (stdin when no files)\n  doctor [--json]         Diagnose the installation\n  lsp                     Run the language server companion\n  mcp                     Run the MCP companion\n  completions SHELL       Print bash, zsh, or fish completions";
+const USAGE: &str = "shoal 0.1.0\n\nUsage: shoal [OPTIONS] [SCRIPT]\n       shoal <fmt|doctor|lsp|mcp|completions|prompt> ...\n\nOptions:\n  -c, --command <SOURCE>  Evaluate source and exit\n  -h, --help              Print help\n  -V, --version           Print version\n\nDeveloper commands:\n  fmt [--check] [FILES]   Format .shl source (stdin when no files)\n  doctor [--json]         Diagnose the installation\n  lsp                     Run the language server companion\n  mcp                     Run the MCP companion\n  completions SHELL       Print bash, zsh, or fish completions\n  prompt explain|bench|print [--side left|right|continuation|transient] [--n N]";
 
 enum Action {
     Command(String, Vec<OsString>),
@@ -32,6 +33,7 @@ enum Action {
     Doctor { json: bool },
     Companion(&'static str),
     Completions(String),
+    Prompt(prompt::PromptAction),
 }
 
 fn main() {
@@ -141,6 +143,7 @@ fn real_main(args: Vec<OsString>) -> Result<i32, String> {
             print!("{}", completion_script(&shell)?);
             Ok(0)
         }
+        Action::Prompt(action) => prompt::run(action),
     }
 }
 
@@ -176,6 +179,10 @@ fn parse_args(args: Vec<OsString>, stdin_is_tty: bool) -> Result<Action, String>
             Ok(Action::Doctor {
                 json: !args.is_empty(),
             })
+        }
+        Some("prompt") => {
+            let args = iter.filter_map(|a| a.into_string().ok());
+            Ok(Action::Prompt(prompt::parse_action(args)?))
         }
         Some("lsp") => no_trailing(iter, Action::Companion("shoal-lsp")),
         Some("mcp") => no_trailing(iter, Action::Companion("shoal-mcp")),
@@ -416,6 +423,32 @@ fn repl() -> Result<i32, String> {
             ReedlineEvent::MenuNext,
         ]),
     );
+    // Build the shoal-prompt pipeline: load + layer the prompt config, resolve
+    // the static session facts once, and set up the shared snapshot cell that
+    // the loop refreshes per command and reedline reads per keystroke (zero
+    // I/O on the render path — the whole point, design §0/§1).
+    let (prompt_config, prompt_warnings) = prompt::load_prompt_config(&cwd);
+    for warning in &prompt_warnings {
+        eprintln!(
+            "{}",
+            maybe_strip(format!("\x1b[33;1mwarning:\x1b[0m {warning}"))
+        );
+    }
+    let static_facts = prompt::StaticFacts::resolve(&prompt_config, no_color());
+    let transient_enabled = prompt_config.transient.enabled;
+    let (renderer, renderer_warnings) = shoal_prompt::Renderer::new(prompt_config);
+    for warning in &renderer_warnings {
+        eprintln!(
+            "{}",
+            maybe_strip(format!("\x1b[33;1mwarning:\x1b[0m {warning}"))
+        );
+    }
+    let renderer = Arc::new(renderer);
+    let shared_ctx: prompt::SharedCtx = Arc::new(RwLock::new(Arc::new(
+        shoal_prompt::PromptContext::empty(cwd.clone()),
+    )));
+    let shoal_prompt = prompt::ShoalPrompt::new(renderer.clone(), shared_ctx.clone(), false);
+
     let mut editor = Reedline::create()
         .use_bracketed_paste(config.editor.bracketed_paste)
         .with_validator(Box::new(ShoalValidator))
@@ -426,6 +459,16 @@ fn repl() -> Result<i32, String> {
         .with_edit_mode(Box::new(Emacs::new(keybindings)))
         .with_highlighter(Box::new(ShoalHighlighter))
         .with_hinter(Box::new(DefaultHinter::default()));
+    if transient_enabled {
+        // Transient prompt (§2.5): a second ShoalPrompt sharing the same cache,
+        // rendering `format.transient` post-Enter. Reedline invokes it at the
+        // right moment; no custom repaint logic on our side.
+        editor = editor.with_transient_prompt(Box::new(prompt::ShoalPrompt::new(
+            renderer.clone(),
+            shared_ctx.clone(),
+            true,
+        )));
+    }
     if config.history.enabled
         && let Some(path) = config.history.path.clone().or_else(history_path)
     {
@@ -448,15 +491,14 @@ fn repl() -> Result<i32, String> {
             *token = evaluator.cancellation_token();
         }
 
-        let prompt_text = config
-            .prompt
-            .template
-            .replace("{cwd}", &short_cwd(evaluator.cwd()));
-        let prompt = DefaultPrompt::new(
-            DefaultPromptSegment::Basic(prompt_text),
-            DefaultPromptSegment::Empty,
-        );
-        match editor.read_line(&prompt) {
+        // Refresh the frozen prompt snapshot once, here, between commands —
+        // never inside reedline's per-keystroke render (design §0.3, §2.3).
+        let width = u16::try_from(terminal_width()).unwrap_or(80);
+        let ctx = prompt::build_context(&evaluator, &static_facts, width);
+        if let Ok(mut cell) = shared_ctx.write() {
+            *cell = Arc::new(ctx);
+        }
+        match editor.read_line(&shoal_prompt) {
             Ok(Signal::Success(src)) => {
                 if src.trim().is_empty() {
                     continue;
@@ -546,36 +588,6 @@ fn history_path() -> Option<PathBuf> {
         return Some(PathBuf::from(state).join("shoal/history.txt"));
     }
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state/shoal/history.txt"))
-}
-
-fn short_cwd(cwd: &Path) -> String {
-    let display = if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        cwd.strip_prefix(&home)
-            .map(|tail| PathBuf::from("~").join(tail))
-            .unwrap_or_else(|_| cwd.to_path_buf())
-    } else {
-        cwd.to_path_buf()
-    };
-    maybe_strip(format!(
-        "\x1b[32;1mshoal\x1b[0m \x1b[36;1m{}\x1b[0m\x1b[95m{}\x1b[0m",
-        display.display(),
-        git_suffix(cwd)
-    ))
-}
-
-fn git_suffix(cwd: &Path) -> String {
-    let output = std::process::Command::new("git")
-        .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
-        .current_dir(cwd)
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output();
-    match output {
-        Ok(out) if out.status.success() => {
-            format!(" ({})", String::from_utf8_lossy(&out.stdout).trim())
-        }
-        _ => String::new(),
-    }
 }
 
 fn format_parse_error(src: &str, source: Option<&Path>, error: &ParseError) -> String {

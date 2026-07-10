@@ -1,0 +1,23 @@
+# Root rustfmt configuration for the shoal workspace.
+#
+# These values match what the whole tree already conforms to today — this
+# file exists to *pin* that convention (so a future rustfmt/edition bump
+# can't silently reformat everything out from under CI), not to change
+# anything. Verified: `cargo fmt --all --check` is clean with this file in
+# place, on both the local default toolchain and `+stable` (the toolchain CI
+# runs), with zero diff produced by `cargo fmt --all`.
+edition = "2024"
+max_width = 100
+newline_style = "Unix"
+
+# NOT set (checked, do not add without re-verifying):
+# `imports_granularity` and `group_imports` would be the natural knobs to
+# codify the de-facto "one alphabetized, merged use-block per file" import
+# style already followed by convention across the tree — but both are
+# unstable rustfmt options gated to the nightly channel. On stable rustfmt
+# (confirmed via `rustup run stable rustfmt --version` -> 1.9.0-stable, the
+# same channel CI's `+stable` uses), setting either key prints
+# "unstable features are only available in nightly channel" and the key is
+# silently ignored — it would document intent without ever being enforced,
+# and risks bit-rotting into a lie. Revisit only if the project adopts a
+# nightly rustfmt step.
