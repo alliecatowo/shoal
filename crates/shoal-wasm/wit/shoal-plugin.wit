@@ -1,0 +1,18 @@
+package shoal:plugin@0.1.0;
+
+interface types {
+  record tagged-value { json: string, raw: option<list<u8>> }
+  record effect { kind: string, parameters-json: string }
+  record command { name: string, signature-json: string, effects: list<effect> }
+  record method { type-name: string, name: string, signature-json: string, effects: list<effect> }
+  record completion { value: string, description: option<string> }
+}
+
+world plugin {
+  use types.{tagged-value, command, method, completion};
+  export commands: func() -> list<command>;
+  export methods: func() -> list<method>;
+  export invoke-command: func(name: string, args: list<tagged-value>) -> result<tagged-value, string>;
+  export invoke-method: func(type-name: string, name: string, receiver: tagged-value, args: list<tagged-value>) -> result<tagged-value, string>;
+  export complete: func(context-json: string) -> list<completion>;
+}
