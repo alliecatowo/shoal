@@ -2,6 +2,7 @@
 
 mod builtins;
 
+use shoal_adapters::{AdapterCatalog, AdapterClass, SubSpec};
 use shoal_ast::*;
 use shoal_exec::{CancelToken, ExecMode, ExecSpec, StdinSpec};
 use shoal_value::{
@@ -24,6 +25,7 @@ pub struct Evaluator {
     pub interactive: bool,
     pub it: Value,
     cancel: CancelToken,
+    adapters: AdapterCatalog,
 }
 
 enum Flow {
@@ -31,6 +33,14 @@ enum Flow {
     Return(Value),
     Break,
     Continue,
+}
+
+#[derive(Clone)]
+struct ExecMeta {
+    ok_codes: Vec<i32>,
+    class: AdapterClass,
+    parse: String,
+    output_type: Option<String>,
 }
 
 impl Evaluator {
@@ -42,6 +52,7 @@ impl Evaluator {
             interactive: false,
             it: Value::Null,
             cancel: CancelToken::new(),
+            adapters: AdapterCatalog::empty(),
         }
     }
 
@@ -49,9 +60,24 @@ impl Evaluator {
         &self.cwd
     }
 
+    pub fn set_adapters(&mut self, adapters: AdapterCatalog) {
+        self.adapters = adapters;
+    }
+
+    pub fn load_bundled_adapters(&mut self) -> Vec<String> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../adapters");
+        let (catalog, warnings) = AdapterCatalog::load_dir(&root);
+        self.adapters = catalog;
+        warnings
+    }
+
     /// Cancel the currently executing foreground process tree.
     pub fn cancel_current(&self) {
         self.cancel.cancel();
+    }
+
+    pub fn cancellation_token(&self) -> CancelToken {
+        self.cancel.clone()
     }
 
     /// Install a fresh cancellation epoch before reading the next command.
@@ -478,6 +504,7 @@ impl Evaluator {
                 StdinSpec::Null,
                 &[],
                 span,
+                None,
             ),
             Expr::With { cwd, env, body, .. } => {
                 self.eval_with(cwd.as_deref(), env.as_deref(), body)
@@ -610,6 +637,9 @@ impl Evaluator {
         if call.head == "pwd" {
             return Ok(Value::Path(self.cwd.clone()));
         }
+        if self.adapters.lookup(&call.head).is_some() {
+            return self.eval_adapter(call, position);
+        }
         let mut argv = vec![OsString::from(&call.head)];
         for a in &call.args {
             for v in self.expand_arg(a)? {
@@ -622,7 +652,7 @@ impl Evaluator {
                 stdin = StdinSpec::File(self.arg_path(&r.target)?);
             }
         }
-        let value = self.run_argv(argv, position, stdin, &call.env_prefix, call.span)?;
+        let value = self.run_argv(argv, position, stdin, &call.env_prefix, call.span, None)?;
         let Value::Outcome(out) = &value else {
             return Ok(value);
         };
@@ -644,6 +674,111 @@ impl Evaluator {
         Ok(value)
     }
 
+    fn eval_adapter(&mut self, call: &CmdCall, position: Position) -> VResult<Value> {
+        let adapter = self
+            .adapters
+            .lookup(&call.head)
+            .expect("checked adapter")
+            .clone();
+        let (spec, sub, start) = match call.args.first() {
+            Some(CmdArg::Word { text, .. }) if adapter.subs.contains_key(text) => {
+                (adapter.subs[text].clone(), Some(text.clone()), 1)
+            }
+            _ => (adapter.top.clone(), None, 0),
+        };
+        let mut argv = vec![OsString::from(&adapter.bin)];
+        match (&spec.invoke, &sub) {
+            (Some(rewrite), _) => argv.extend(rewrite.iter().map(OsString::from)),
+            (None, Some(sub)) => argv.push(sub.into()),
+            (None, None) => {}
+        }
+        let mut positional = 0usize;
+        let mut i = start;
+        while i < call.args.len() {
+            match &call.args[i] {
+                CmdArg::FlagLong { name, value, .. } => {
+                    let param = spec
+                        .params
+                        .iter()
+                        .find(|p| p.name == *name)
+                        .ok_or_else(|| {
+                            ErrorVal::arg_error(format!(
+                                "{}: unknown flag --{name}; expected {}",
+                                call.head,
+                                signature(&spec)
+                            ))
+                        })?;
+                    argv.push(format!("--{}", name.replace('_', "-")).into());
+                    if let Some(value) = value {
+                        let v = self.cmd_arg_value(value)?;
+                        validate_adapter_value(&v, &param.ty)?;
+                        argv.push(self.argv_value(v)?);
+                    } else if !param.ty.trim_end_matches('?').eq("bool") {
+                        i += 1;
+                        let next = call.args.get(i).ok_or_else(|| {
+                            ErrorVal::arg_error(format!("--{name} requires a value"))
+                        })?;
+                        let v = self.cmd_arg_value(next)?;
+                        validate_adapter_value(&v, &param.ty)?;
+                        argv.push(self.argv_value(v)?);
+                    }
+                }
+                CmdArg::FlagShort { chars, .. } => {
+                    for ch in chars.chars() {
+                        if !spec.short_flags.contains_key(&ch.to_string()) {
+                            return Err(ErrorVal::arg_error(format!(
+                                "{}: unknown short flag -{ch}",
+                                call.head
+                            )));
+                        }
+                    }
+                    argv.push(format!("-{chars}").into());
+                }
+                CmdArg::DashDash { .. } => argv.push("--".into()),
+                arg => {
+                    let expected = spec
+                        .positional
+                        .get(positional)
+                        .and_then(|name| spec.params.iter().find(|p| &p.name == name));
+                    let value = self.cmd_arg_value(arg)?;
+                    if let Some(param) = expected {
+                        validate_adapter_value(&value, &param.ty)?;
+                    }
+                    // A parameter typed glob owns expansion; T0/list<path> expansion remains elsewhere.
+                    if matches!(expected.map(|p| p.ty.trim_end_matches('?')), Some("glob")) {
+                        match value {
+                            Value::Glob(g) => argv.push(g.pattern.into()),
+                            v => argv.push(self.argv_value(v)?),
+                        }
+                    } else if matches!(value, Value::Glob(_)) {
+                        for value in self.expand_arg(arg)? {
+                            argv.push(self.argv_value(value)?);
+                        }
+                    } else {
+                        argv.push(self.argv_value(value)?);
+                    }
+                    positional += 1;
+                }
+            }
+            i += 1;
+        }
+        let ok_codes = spec.ok_codes.clone().unwrap_or(adapter.ok_codes);
+        let meta = ExecMeta {
+            ok_codes,
+            class: adapter.class,
+            parse: spec.parse,
+            output_type: spec.output_type,
+        };
+        self.run_argv(
+            argv,
+            position,
+            StdinSpec::Null,
+            &call.env_prefix,
+            call.span,
+            Some(meta),
+        )
+    }
+
     fn run_argv(
         &mut self,
         argv: Vec<OsString>,
@@ -651,6 +786,7 @@ impl Evaluator {
         stdin: StdinSpec,
         prefixes: &[EnvPrefix],
         span: Span,
+        meta: Option<ExecMeta>,
     ) -> VResult<Value> {
         let mut env = self.process_env.clone();
         for p in prefixes {
@@ -662,7 +798,8 @@ impl Evaluator {
                 env.push((OsString::from(&p.name), s));
             }
         }
-        let mode = if self.interactive && position == Position::Statement {
+        let force_tui = meta.as_ref().is_some_and(|m| m.class == AdapterClass::Tui);
+        let mode = if force_tui || (self.interactive && position == Position::Statement) {
             ExecMode::PtyTee
         } else {
             ExecMode::Capture
@@ -693,7 +830,11 @@ impl Evaluator {
             )
             .with_span(span)
         })?;
-        let ok = r.status == Some(0);
+        let ok_codes = meta.as_ref().map_or(&[0][..], |m| m.ok_codes.as_slice());
+        let ok = r.status.is_some_and(|code| ok_codes.contains(&code));
+        let parsed = meta.as_ref().and_then(|m| {
+            shoal_adapters::parse_output(&m.parse, &r.stdout, m.output_type.as_deref())
+        });
         let out = Value::Outcome(Arc::new(OutcomeVal {
             status: r.status,
             signal: r.signal,
@@ -703,6 +844,7 @@ impl Evaluator {
             dur_ns: r.dur.as_nanos().min(i64::MAX as u128) as i64,
             pid: r.pid,
             cmd: display,
+            parsed,
         }));
         if !ok && position == Position::Statement {
             let Value::Outcome(failed) = &out else {
@@ -1023,6 +1165,54 @@ impl Evaluator {
     }
 }
 
+fn signature(spec: &SubSpec) -> String {
+    spec.params
+        .iter()
+        .map(|p| format!("--{} <{}>", p.name.replace('_', "-"), p.ty))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn validate_adapter_value(value: &Value, ty: &str) -> VResult<()> {
+    let ty = ty.trim_end_matches('?');
+    let valid = match ty {
+        "str" => matches!(value, Value::Str(_)),
+        "bool" => matches!(value, Value::Bool(_) | Value::Str(_)),
+        "int" => {
+            matches!(value, Value::Int(_))
+                || matches!(value, Value::Str(s) if s.parse::<i64>().is_ok())
+        }
+        "float" => {
+            matches!(value, Value::Int(_) | Value::Float(_))
+                || matches!(value, Value::Str(s) if s.parse::<f64>().is_ok())
+        }
+        "path" => matches!(value, Value::Path(_) | Value::Str(_)),
+        "glob" => matches!(value, Value::Glob(_) | Value::Str(_)),
+        "size" => {
+            matches!(value, Value::Size(_))
+                || matches!(value, Value::Str(s) if shoal_value::parse_size(s).is_some())
+        }
+        "duration" => {
+            matches!(value, Value::Duration(_))
+                || matches!(value, Value::Str(s) if shoal_value::parse_duration(s).is_some())
+        }
+        "time" => {
+            matches!(value, Value::Time(_))
+                || matches!(value, Value::Str(s) if shoal_value::parse_time(s).is_some())
+        }
+        ty if ty.starts_with("list<") => true,
+        _ => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(ErrorVal::arg_error(format!(
+            "expected {ty}, found {}",
+            value.type_name()
+        )))
+    }
+}
+
 impl CallCtx for Evaluator {
     fn call_closure(&mut self, f: &Value, args: Vec<Value>) -> VResult<Value> {
         self.call_value(
@@ -1103,5 +1293,56 @@ mod tests {
             matches!(value, Value::List(rows) if matches!(&rows[0], Value::Record(r) if matches!(r.get("trash"), Some(Value::Path(_)))))
         );
         assert!(!dir.path().join("a").exists());
+    }
+
+    fn adapter_eval(toml: &str, src: &str) -> VResult<Value> {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("fixture.toml"), toml).unwrap();
+        let (catalog, warnings) = AdapterCatalog::load_dir(dir.path());
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let mut evaluator = Evaluator::new(dir.path().into());
+        evaluator.set_adapters(catalog);
+        evaluator.eval_program(&shoal_syntax::parse(src).unwrap())
+    }
+
+    #[test]
+    fn adapters_rewrite_parse_and_honor_ok_codes() {
+        let lines = adapter_eval(
+            r#"[cmd.fixture]
+bin="/usr/bin/printf"
+invoke=["one\ntwo\n"]
+output={parse="lines",type="list<str>"}
+"#,
+            "fixture",
+        )
+        .unwrap();
+        assert!(
+            matches!(lines, Value::Outcome(o) if o.out_value() == Value::List(vec![Value::Str("one".into()), Value::Str("two".into())]))
+        );
+
+        let accepted = adapter_eval(
+            r#"[cmd.accept]
+bin="/bin/sh"
+ok_codes=[0,1]
+invoke=["-c","exit 1"]
+"#,
+            "accept",
+        )
+        .unwrap();
+        assert!(matches!(accepted, Value::Outcome(o) if o.ok && o.status == Some(1)));
+    }
+
+    #[test]
+    fn adapter_typed_flags_fail_before_spawn() {
+        let error = adapter_eval(
+            r#"[cmd.typed]
+bin="/usr/bin/printf"
+params={jobs="int"}
+"#,
+            "typed --jobs=nope",
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "arg_error");
+        assert!(error.msg.contains("expected int"));
     }
 }

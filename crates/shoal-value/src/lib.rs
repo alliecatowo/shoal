@@ -201,12 +201,16 @@ pub struct OutcomeVal {
     pub pid: u32,
     /// Display form of the invocation, for errors and rendering.
     pub cmd: String,
+    pub parsed: Option<Value>,
 }
 
 impl OutcomeVal {
     /// `outcome.out` — utf-8 text with the trailing newline trimmed; if the
     /// payload parses as JSON it becomes structured data (T1, lazy).
     pub fn out_value(&self) -> Value {
+        if let Some(value) = &self.parsed {
+            return value.clone();
+        }
         let text = String::from_utf8_lossy(&self.stdout);
         let trimmed = text.strip_suffix('\n').unwrap_or(&text);
         let first = trimmed.trim_start().chars().next();
