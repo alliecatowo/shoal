@@ -125,3 +125,91 @@ pub fn run(spec: ExecSpec, cancel: &CancelToken) -> io::Result<ExecResult> {
         ExecMode::PtyTee => pty::run_pty(spec, cancel),
     }
 }
+
+/// Run through the child-only Landlock launcher. The parent is never
+/// restricted. A requested sandbox fails closed if Landlock is unavailable.
+pub fn run_sandboxed(
+    spec: ExecSpec,
+    cancel: &CancelToken,
+    sandbox: shoal_leash::FsSandbox,
+    verified: Option<&shoal_leash::SpawnPreflight>,
+) -> io::Result<ExecResult> {
+    let wrapped = sandbox_spec(spec, sandbox, verified)?;
+    run(wrapped, cancel)
+}
+
+/// Streaming capture variant of [`run_sandboxed`].
+pub fn spawn_capture_sandboxed(
+    spec: ExecSpec,
+    cancel: &CancelToken,
+    sandbox: shoal_leash::FsSandbox,
+    verified: Option<&shoal_leash::SpawnPreflight>,
+) -> io::Result<StreamingChild> {
+    if spec.mode != ExecMode::Capture {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "spawn_capture_sandboxed requires Capture mode",
+        ));
+    }
+    spawn_capture(sandbox_spec(spec, sandbox, verified)?, cancel)
+}
+
+fn sandbox_spec(
+    mut spec: ExecSpec,
+    sandbox: shoal_leash::FsSandbox,
+    verified: Option<&shoal_leash::SpawnPreflight>,
+) -> io::Result<ExecSpec> {
+    if shoal_leash::landlock_abi().is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "hard Landlock enforcement unavailable",
+        ));
+    }
+    let program = which::resolve_program(&spec.argv, &spec.env)?;
+    if let Some(expected) = verified {
+        let actual = shoal_leash::preflight_spawn(&program, std::slice::from_ref(&expected.hash))?;
+        if !expected.allowed || actual.hash != expected.hash {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "verified spawn hash does not match resolved binary",
+            ));
+        }
+    }
+    let helper = sandbox_helper()?;
+    let mut argv = vec![helper.into_os_string()];
+    for path in sandbox.read {
+        argv.push("--read".into());
+        argv.push(path.into_os_string())
+    }
+    for path in sandbox.write {
+        argv.push("--write".into());
+        argv.push(path.into_os_string())
+    }
+    for path in sandbox.delete {
+        argv.push("--delete".into());
+        argv.push(path.into_os_string())
+    }
+    argv.push("--".into());
+    argv.push(program.into_os_string());
+    argv.extend(spec.argv.into_iter().skip(1));
+    spec.argv = argv;
+    Ok(spec)
+}
+
+fn sandbox_helper() -> io::Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    let name = "shoal-sandbox-exec";
+    for dir in [exe.parent(), exe.parent().and_then(|p| p.parent())]
+        .into_iter()
+        .flatten()
+    {
+        let p = dir.join(name);
+        if p.is_file() {
+            return Ok(p);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "shoal-sandbox-exec helper not installed beside executable",
+    ))
+}

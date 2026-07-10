@@ -7,8 +7,14 @@ edition = "2024"
 anyhow = "1"
 libc = "0.2.186"
 portable-pty = "0.9.0"
+shoal-leash = { path = "../shoal-leash" }
 [dev-dependencies]
 criterion="0.7"
+tempfile="3"
 [[bench]]
 name="spawn"
 harness=false
+
+[[bin]]
+name="shoal-sandbox-exec"
+path="src/main.rs"
