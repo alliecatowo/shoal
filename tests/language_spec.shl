@@ -1,0 +1,47 @@
+# Shoal Language Specification Tour
+
+echo "Running Shoal Language Specification..."
+
+# 1. Variables and Shadowing
+let x = 10
+let y = 20
+if x + y != 30 { echo "Math failed!"; ^exit 1 }
+
+let echo = "shadowed"
+if echo != "shadowed" { ^exit 1 }
+^echo "Shadowing works!"
+
+# 2. Types
+let i = 42
+let f = 3.14
+let s = 1.5gb
+let d = 500ms
+let b = true
+let regex = re"a(b)c"
+
+# 3. String Interpolation
+let greeting = "Hello"
+let msg = "{greeting}, world! Math: {6 * 7}"
+if msg != "Hello, world! Math: 42" { ^echo "Interpolation failed!"; ^exit 1 }
+
+# 4. Data Structures
+let my_list = [1, 2, 3]
+let my_record = { name: "shoal", cool: true }
+let my_table = [{ id: 1, val: "a" }, { id: 2, val: "b" }]
+
+# 5. Control Flow
+var total = 0
+for n in my_list { total += n }
+if total != 6 { ^echo "For loop failed!"; ^exit 1 }
+
+let result = if total == 6 { "yes" } else { "no" }
+if result != "yes" { ^echo "If expression failed!"; ^exit 1 }
+
+# 6. Functions & Closures
+fn add(a, b) { a + b }
+if add(2, 3) != 5 { ^echo "Function failed!"; ^exit 1 }
+
+let mul = (a, b) => a * b
+if mul(4, 5) != 20 { ^echo "Closure failed!"; ^exit 1 }
+
+^echo "All language specification tests passed successfully!"
