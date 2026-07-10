@@ -753,7 +753,22 @@ opaque = "ask"
         let s = EnforcementStatus::detect();
         assert!(!s.enforced);
         assert_eq!(s.active_tier, None);
-        assert!(s.detail.contains("unavailable"));
+        // `detect()`'s wording of *why* nothing is enforced is intentionally
+        // platform-specific (this crate installs no backend itself, so the
+        // message just describes what host mechanism is missing): Linux
+        // phrases it as a landlock/seccomp/network mechanism being
+        // "unavailable"; macOS phrases it as the Seatbelt backend being "not
+        // installed"; anything else falls back to "advisory". All three
+        // honestly report the same underlying fact (no OS-level enforcement
+        // is active) in the phrasing appropriate to that platform's branch
+        // in `detect()`.
+        if cfg!(target_os = "linux") {
+            assert!(s.detail.contains("unavailable"), "{}", s.detail);
+        } else if cfg!(target_os = "macos") {
+            assert!(s.detail.contains("not installed"), "{}", s.detail);
+        } else {
+            assert!(s.detail.contains("advisory"), "{}", s.detail);
+        }
     }
     #[test]
     fn spawn_preflight_hashes_content_and_labels_toctou() {
