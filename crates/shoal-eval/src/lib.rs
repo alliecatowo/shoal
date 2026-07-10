@@ -1960,7 +1960,63 @@ impl Evaluator {
                         )? == Value::Bool(true),
                 )
             }
-            _ => Ok(false),
+            // `int n` / `str s` — runtime type test, bind on success (TDD §3.2).
+            Pattern::Type { ty, name, .. } => {
+                if v.type_name() == ty.name {
+                    if let Some(n) = name {
+                        self.env.declare(n.clone(), v.clone(), false);
+                    }
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            }
+            // `{ field, field: subpat }` — open record match: scrutinee must be
+            // a record containing every named field; extra fields are ignored.
+            Pattern::Record { fields, .. } => {
+                let Value::Record(map) = v else {
+                    return Ok(false);
+                };
+                for f in fields {
+                    let Some(fv) = map.get(&f.name) else {
+                        return Ok(false);
+                    };
+                    let fv = fv.clone();
+                    match &f.pattern {
+                        Some(sub) => {
+                            if !self.pattern_matches(sub, &fv)? {
+                                return Ok(false);
+                            }
+                        }
+                        None => self.env.declare(f.name.clone(), fv, false),
+                    }
+                }
+                Ok(true)
+            }
+            // `[a, b, ...rest]` — shape match over a list.
+            Pattern::List { items, rest, .. } => {
+                let Value::List(xs) = v else {
+                    return Ok(false);
+                };
+                if rest.is_some() {
+                    if xs.len() < items.len() {
+                        return Ok(false);
+                    }
+                } else if xs.len() != items.len() {
+                    return Ok(false);
+                }
+                for (p, ev) in items.iter().zip(xs.iter()) {
+                    let ev = ev.clone();
+                    if !self.pattern_matches(p, &ev)? {
+                        return Ok(false);
+                    }
+                }
+                if let Some(r) = rest {
+                    self.env
+                        .declare(r.clone(), Value::List(xs[items.len()..].to_vec()), false);
+                }
+                Ok(true)
+            }
         }
     }
     fn eval_match(&mut self, scrutinee: &Expr, arms: &[MatchArm]) -> VResult<Value> {
@@ -3423,5 +3479,98 @@ consumed = ["short", "branch"]
         assert!(plan.effects.contains(&Effect::FsWrite {
             paths: vec![dir.path().join("new")]
         }));
+    }
+
+    // --- match: type / record / list patterns (TDD §3.2) -----------------
+
+    #[test]
+    fn match_type_pattern_binds_and_falls_through() {
+        assert_eq!(
+            run(r#"match 5 { int n => "int:{n}"; _ => "other" }"#).unwrap(),
+            Value::Str("int:5".into())
+        );
+        assert_eq!(
+            run(r#"match "hi" { str s => "str:{s}"; _ => "other" }"#).unwrap(),
+            Value::Str("str:hi".into())
+        );
+        // A type mismatch falls through to the next arm.
+        assert_eq!(
+            run(r#"match "hi" { int n => "int:{n}"; str s => "str:{s}" }"#).unwrap(),
+            Value::Str("str:hi".into())
+        );
+        // A bare type name with no binder is a plain bind (matches anything).
+        assert_eq!(run(r#"match 5 { int => 1; _ => 0 }"#).unwrap(), Value::Int(1));
+    }
+
+    #[test]
+    fn match_record_pattern_shorthand_sub_and_open() {
+        assert_eq!(
+            run(r#"match {name: "ada", age: 30} { {name, age} => "{name} is {age}"; _ => "no" }"#)
+                .unwrap(),
+            Value::Str("ada is 30".into())
+        );
+        // Nested record sub-pattern.
+        assert_eq!(
+            run("match {point: {x: 1, y: 2}} { {point: {x, y}} => x + y; _ => 0 }").unwrap(),
+            Value::Int(3)
+        );
+        // Missing field falls through (open matching only ignores *extra*).
+        assert_eq!(
+            run(r#"match {name: "ada"} { {name, age} => "has age"; _ => "no age" }"#).unwrap(),
+            Value::Str("no age".into())
+        );
+        // Record + nested list sub-pattern.
+        assert_eq!(
+            run("match {items: [1, 2, 3]} { {items: [a, b, c]} => a + b + c; _ => 0 }").unwrap(),
+            Value::Int(6)
+        );
+    }
+
+    #[test]
+    fn match_record_pattern_guard_composes() {
+        assert_eq!(
+            run(r#"match {status: 200} { {status} if status >= 200 && status < 300 => "ok"; {status} => "other:{status}" }"#)
+                .unwrap(),
+            Value::Str("ok".into())
+        );
+        assert_eq!(
+            run(r#"match {status: 404} { {status} if status >= 200 && status < 300 => "ok"; {status} => "other:{status}" }"#)
+                .unwrap(),
+            Value::Str("other:404".into())
+        );
+    }
+
+    #[test]
+    fn match_list_pattern_arity_rest_and_empty() {
+        assert_eq!(
+            run("match [1, 2, 3] { [a, b, c] => a + b + c; _ => 0 }").unwrap(),
+            Value::Int(6)
+        );
+        // `...rest` binds the tail as a list.
+        assert_eq!(
+            run("match [1, 2, 3, 4] { [first, ...rest] => rest.len(); _ => 0 }").unwrap(),
+            Value::Int(3)
+        );
+        // Fixed arity: a length mismatch falls through.
+        assert_eq!(
+            run(r#"match [1, 2] { [a, b, c] => "three"; [a, b] => "two"; _ => "other" }"#).unwrap(),
+            Value::Str("two".into())
+        );
+        assert_eq!(
+            run(r#"match [] { [] => "empty"; _ => "nonempty" }"#).unwrap(),
+            Value::Str("empty".into())
+        );
+        assert_eq!(
+            run(r#"match [1] { [] => "empty"; [a] => "one:{a}"; _ => "other" }"#).unwrap(),
+            Value::Str("one:1".into())
+        );
+    }
+
+    #[test]
+    fn match_comma_separated_arms_parse() {
+        assert_eq!(
+            run(r#"match 2 { 1 => "a", 2 => "b", _ => "c" }"#).unwrap(),
+            Value::Str("b".into())
+        );
     }
 }
