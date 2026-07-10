@@ -45,6 +45,22 @@ pub struct Journal {
     cas_root: PathBuf,
     /// Keeps the CAS temp dir alive for the lifetime of an in-memory journal.
     _cas_tempdir: Option<tempfile::TempDir>,
+    output_hard_cap: usize,
+}
+
+const DEFAULT_OUTPUT_HARD_CAP: usize = 256 * 1024 * 1024;
+const TRUNCATION_MARKER: &[u8] = b"\n[shoal: output truncated; see journal metadata]\n";
+
+#[derive(Debug, Clone, Copy)]
+pub struct JournalOptions {
+    pub output_hard_cap: usize,
+}
+impl Default for JournalOptions {
+    fn default() -> Self {
+        Self {
+            output_hard_cap: DEFAULT_OUTPUT_HARD_CAP,
+        }
+    }
 }
 
 /// A journal entry as recorded at execution start ([`Journal::append`]).
@@ -80,6 +96,34 @@ pub struct OutputRow {
     pub hash: String,
     /// Length of the uncompressed bytes.
     pub len: i64,
+    pub meta: Option<OutputMeta>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputMeta {
+    pub truncated: bool,
+    pub original_len: u64,
+    pub stored_len: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GcOptions {
+    pub ttl: Option<std::time::Duration>,
+    pub max_bytes: Option<u64>,
+    pub dry_run: bool,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GcBlob {
+    pub hash: String,
+    pub bytes: u64,
+    pub referenced: bool,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct GcReport {
+    pub candidates: Vec<GcBlob>,
+    pub deleted: Vec<GcBlob>,
+    pub reclaimed_bytes: u64,
+    pub remaining_bytes: u64,
 }
 
 /// A fully materialized journal entry as returned by [`Journal::query`].
@@ -257,12 +301,36 @@ fn hex_string(bytes: &[u8]) -> String {
     s
 }
 
+fn now_ns() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .min(i64::MAX as u128) as i64
+}
+fn hex_bytes(hex: &str) -> Result<Vec<u8>, ()> {
+    if !hex.len().is_multiple_of(2) || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(());
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).map_err(|_| ()))
+        .collect()
+}
+
 impl Journal {
     /// Open (creating if needed) the journal under `state_dir`.
     ///
     /// Creates the directory tree, `<state_dir>/journal.db` in WAL mode, and
     /// `<state_dir>/cas/`.
     pub fn open(state_dir: &Path) -> rusqlite::Result<Journal> {
+        Self::open_with_options(state_dir, JournalOptions::default())
+    }
+
+    pub fn open_with_options(
+        state_dir: &Path,
+        options: JournalOptions,
+    ) -> rusqlite::Result<Journal> {
         let cas_root = state_dir.join("cas");
         fs::create_dir_all(&cas_root).map_err(io_to_sql)?;
         let conn = Connection::open(state_dir.join("journal.db"))?;
@@ -274,12 +342,17 @@ impl Journal {
             conn,
             cas_root,
             _cas_tempdir: None,
+            output_hard_cap: options.output_hard_cap,
         })
     }
 
     /// Open a throwaway journal: in-memory SQLite database, CAS in a fresh
     /// temporary directory that lives exactly as long as the returned `Journal`.
     pub fn in_memory() -> rusqlite::Result<Journal> {
+        Self::in_memory_with_options(JournalOptions::default())
+    }
+
+    pub fn in_memory_with_options(options: JournalOptions) -> rusqlite::Result<Journal> {
         let tempdir = tempfile::tempdir().map_err(io_to_sql)?;
         let cas_root = tempdir.path().join("cas");
         fs::create_dir_all(&cas_root).map_err(io_to_sql)?;
@@ -289,6 +362,7 @@ impl Journal {
             conn,
             cas_root,
             _cas_tempdir: Some(tempdir),
+            output_hard_cap: options.output_hard_cap,
         })
     }
 
@@ -324,6 +398,12 @@ impl Journal {
              );
              CREATE TABLE IF NOT EXISTS pin(
                  hash BLOB PRIMARY KEY
+             );
+             CREATE TABLE IF NOT EXISTS blob(
+                 hash BLOB PRIMARY KEY,
+                 stored_len INTEGER NOT NULL,
+                 created_ns INTEGER NOT NULL,
+                 last_access_ns INTEGER NOT NULL
              );
              CREATE INDEX IF NOT EXISTS idx_entry_ts     ON entry(ts);
              CREATE INDEX IF NOT EXISTS idx_output_entry ON output(entry_id);
@@ -381,20 +461,47 @@ impl Journal {
     /// file. The blob is written atomically (temp file + rename) before the row
     /// insert; a crash in between leaves at worst an unreferenced blob for GC.
     pub fn record_output(&self, id: i64, kind: &str, bytes: &[u8]) -> rusqlite::Result<String> {
-        let hash = blake3::hash(bytes);
+        let (stored, meta) = if bytes.len() > self.output_hard_cap {
+            let marker_len = TRUNCATION_MARKER.len().min(self.output_hard_cap);
+            let keep = self.output_hard_cap.saturating_sub(marker_len);
+            let mut stored = bytes[..keep].to_vec();
+            stored.extend_from_slice(&TRUNCATION_MARKER[..marker_len]);
+            let meta = OutputMeta {
+                truncated: true,
+                original_len: bytes.len() as u64,
+                stored_len: stored.len() as u64,
+            };
+            (stored, Some(meta))
+        } else {
+            (bytes.to_vec(), None)
+        };
+        let hash = blake3::hash(&stored);
         let hex = hash.to_hex().to_string();
         let path = self.blob_path(&hex);
         if !path.exists() {
             let parent = path.parent().expect("blob path always has a parent");
             fs::create_dir_all(parent).map_err(io_to_sql)?;
-            let compressed = zstd::encode_all(bytes, ZSTD_LEVEL).map_err(io_to_sql)?;
+            let compressed = zstd::encode_all(stored.as_slice(), ZSTD_LEVEL).map_err(io_to_sql)?;
             let mut tmp = tempfile::NamedTempFile::new_in(parent).map_err(io_to_sql)?;
             tmp.write_all(&compressed).map_err(io_to_sql)?;
             tmp.persist(&path).map_err(|e| io_to_sql(e.error))?;
         }
+        let now = now_ns();
+        self.conn.execute("INSERT OR IGNORE INTO blob(hash,stored_len,created_ns,last_access_ns) VALUES(?1,?2,?3,?3)",params![hash.as_bytes().as_slice(),stored.len() as i64,now])?;
+        let meta_json = meta
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
         self.conn.execute(
-            "INSERT INTO output (entry_id, kind, hash, len, meta) VALUES (?1, ?2, ?3, ?4, NULL)",
-            params![id, kind, hash.as_bytes().as_slice(), bytes.len() as i64],
+            "INSERT INTO output (entry_id, kind, hash, len, meta) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                id,
+                kind,
+                hash.as_bytes().as_slice(),
+                stored.len() as i64,
+                meta_json
+            ],
         )?;
         Ok(hex)
     }
@@ -415,7 +522,107 @@ impl Journal {
             Err(e) => return Err(io_to_sql(e)),
         };
         let bytes = zstd::decode_all(compressed.as_slice()).map_err(io_to_sql)?;
+        if let Ok(raw) = hex_bytes(hash) {
+            self.conn.execute(
+                "UPDATE blob SET last_access_ns=?1 WHERE hash=?2",
+                params![now_ns(), raw],
+            )?;
+        }
         Ok(Some(bytes))
+    }
+
+    pub fn pin(&self, hash: &str) -> rusqlite::Result<bool> {
+        let raw = hex_bytes(hash)
+            .map_err(|_| rusqlite::Error::InvalidParameterName("invalid hash".into()))?;
+        Ok(self
+            .conn
+            .execute("INSERT OR IGNORE INTO pin(hash) VALUES(?1)", [raw])?
+            > 0)
+    }
+
+    pub fn unpin(&self, hash: &str) -> rusqlite::Result<bool> {
+        let raw = hex_bytes(hash)
+            .map_err(|_| rusqlite::Error::InvalidParameterName("invalid hash".into()))?;
+        Ok(self.conn.execute("DELETE FROM pin WHERE hash=?1", [raw])? > 0)
+    }
+
+    pub fn pins(&self) -> rusqlite::Result<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT hash FROM pin ORDER BY hash")?;
+        stmt.query_map([], |r| {
+            let raw: Vec<u8> = r.get(0)?;
+            Ok(hex_string(&raw))
+        })?
+        .collect()
+    }
+
+    pub fn gc(&self, options: GcOptions) -> rusqlite::Result<GcReport> {
+        let mut stmt=self.conn.prepare("SELECT b.hash,b.stored_len,b.last_access_ns,EXISTS(SELECT 1 FROM output o WHERE o.hash=b.hash),EXISTS(SELECT 1 FROM pin p WHERE p.hash=b.hash) FROM blob b ORDER BY 4 ASC,b.last_access_ns ASC")?;
+        let blobs = stmt
+            .query_map([], |r| {
+                let len: i64 = r.get(1)?;
+                Ok((
+                    r.get::<_, Vec<u8>>(0)?,
+                    len.max(0) as u64,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, bool>(3)?,
+                    r.get::<_, bool>(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let total = blobs.iter().map(|x| x.1).sum::<u64>();
+        let cutoff = options
+            .ttl
+            .map(|ttl| now_ns().saturating_sub(ttl.as_nanos().min(i64::MAX as u128) as i64));
+        let mut chosen = Vec::new();
+        let mut chosen_bytes = 0;
+        for (hash, bytes, access, referenced, pinned) in &blobs {
+            if !pinned && cutoff.is_some_and(|c| *access <= c) {
+                chosen.push((hash.clone(), *bytes, *referenced));
+                chosen_bytes += bytes;
+            }
+        }
+        if let Some(budget) = options.max_bytes {
+            for (hash, bytes, _, referenced, pinned) in &blobs {
+                if total.saturating_sub(chosen_bytes) <= budget {
+                    break;
+                }
+                if !pinned && !chosen.iter().any(|x| x.0 == *hash) {
+                    chosen.push((hash.clone(), *bytes, *referenced));
+                    chosen_bytes += bytes;
+                }
+            }
+        }
+        let candidates = chosen
+            .iter()
+            .map(|(h, b, r)| GcBlob {
+                hash: hex_string(h),
+                bytes: *b,
+                referenced: *r,
+            })
+            .collect::<Vec<_>>();
+        let mut deleted = Vec::new();
+        if !options.dry_run {
+            for blob in &candidates {
+                let path = self.blob_path(&blob.hash);
+                if path.exists() {
+                    let tomb = path.with_extension(format!("gc-{}", std::process::id()));
+                    fs::rename(&path, &tomb).map_err(io_to_sql)?;
+                    if let Err(e) = fs::remove_file(&tomb) {
+                        let _ = fs::rename(&tomb, &path);
+                        return Err(io_to_sql(e));
+                    }
+                }
+                let raw = hex_bytes(&blob.hash).expect("database hash");
+                self.conn.execute("DELETE FROM blob WHERE hash=?1", [raw])?;
+                deleted.push(blob.clone());
+            }
+        }
+        Ok(GcReport {
+            candidates,
+            reclaimed_bytes: chosen_bytes,
+            remaining_bytes: total.saturating_sub(chosen_bytes),
+            deleted,
+        })
     }
 
     /// Query entries newest-first with the filters in `q`, outputs joined in.
@@ -490,17 +697,29 @@ impl Journal {
             }
         }
 
-        let mut out_stmt = self
-            .conn
-            .prepare("SELECT kind, hash, len FROM output WHERE entry_id = ?1 ORDER BY rowid")?;
+        let mut out_stmt = self.conn.prepare(
+            "SELECT kind, hash, len, meta FROM output WHERE entry_id = ?1 ORDER BY rowid",
+        )?;
         for entry in &mut out {
             entry.outputs = out_stmt
                 .query_map([entry.id], |r| {
                     let raw: Vec<u8> = r.get(1)?;
+                    let meta_json: Option<String> = r.get(3)?;
+                    let meta = meta_json
+                        .map(|json| serde_json::from_str(&json))
+                        .transpose()
+                        .map_err(|e| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                3,
+                                rusqlite::types::Type::Text,
+                                Box::new(e),
+                            )
+                        })?;
                     Ok(OutputRow {
                         kind: r.get(0)?,
                         hash: hex_string(&raw),
                         len: r.get(2)?,
+                        meta,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1230,5 +1449,138 @@ mod tests {
             Err(UndoError::Escaped(_))
         ));
         assert_eq!(fs::read(outside.path().join("file")).unwrap(), b"after");
+    }
+
+    #[test]
+    fn pins_are_idempotent_and_exempt_from_gc() {
+        let j = Journal::in_memory().unwrap();
+        let id = j.append(&rec("s", "human", 1, "echo")).unwrap();
+        let hash = j.record_output(id, "stdout", b"pinned").unwrap();
+        assert!(j.pin(&hash).unwrap());
+        assert!(!j.pin(&hash).unwrap());
+        assert_eq!(j.pins().unwrap(), vec![hash.clone()]);
+        let report = j
+            .gc(GcOptions {
+                ttl: Some(std::time::Duration::ZERO),
+                max_bytes: Some(0),
+                dry_run: false,
+            })
+            .unwrap();
+        assert!(report.deleted.is_empty());
+        assert!(j.read_blob(&hash).unwrap().is_some());
+        assert!(j.unpin(&hash).unwrap());
+    }
+
+    #[test]
+    fn gc_prefers_orphans_then_lru_and_dry_run_preserves() {
+        let j = Journal::in_memory().unwrap();
+        let id = j.append(&rec("s", "human", 1, "outputs")).unwrap();
+        let old = j.record_output(id, "stdout", b"old").unwrap();
+        let orphan = j.record_output(id, "stdout", b"orphan").unwrap();
+        let recent = j.record_output(id, "stdout", b"recent").unwrap();
+        let orphan_raw = hex_bytes(&orphan).unwrap();
+        j.conn
+            .execute("DELETE FROM output WHERE hash=?1", [orphan_raw])
+            .unwrap();
+        j.conn
+            .execute(
+                "UPDATE blob SET last_access_ns=1 WHERE hash=?1",
+                [hex_bytes(&old).unwrap()],
+            )
+            .unwrap();
+        j.conn
+            .execute(
+                "UPDATE blob SET last_access_ns=2 WHERE hash=?1",
+                [hex_bytes(&recent).unwrap()],
+            )
+            .unwrap();
+        let dry = j
+            .gc(GcOptions {
+                ttl: None,
+                max_bytes: Some(10),
+                dry_run: true,
+            })
+            .unwrap();
+        assert_eq!(dry.candidates[0].hash, orphan);
+        assert!(dry.deleted.is_empty());
+        assert!(j.read_blob(&orphan).unwrap().is_some());
+        let done = j
+            .gc(GcOptions {
+                ttl: None,
+                max_bytes: Some(10),
+                dry_run: false,
+            })
+            .unwrap();
+        assert_eq!(done.deleted[0].hash, orphan);
+        assert!(j.read_blob(&orphan).unwrap().is_none());
+    }
+
+    #[test]
+    fn ttl_collects_referenced_blob_but_metadata_survives() {
+        let j = Journal::in_memory().unwrap();
+        let id = j.append(&rec("s", "human", 1, "echo")).unwrap();
+        let hash = j.record_output(id, "stdout", b"aged").unwrap();
+        j.conn
+            .execute("UPDATE blob SET last_access_ns=0", [])
+            .unwrap();
+        let report = j
+            .gc(GcOptions {
+                ttl: Some(std::time::Duration::from_secs(1)),
+                max_bytes: None,
+                dry_run: false,
+            })
+            .unwrap();
+        assert!(report.deleted[0].referenced);
+        assert!(j.read_blob(&hash).unwrap().is_none());
+        let rows = j.query(&JournalQuery::default()).unwrap();
+        assert_eq!(rows[0].outputs[0].hash, hash);
+    }
+
+    #[test]
+    fn output_truncation_is_explicit_in_bytes_and_metadata() {
+        let j = Journal::in_memory_with_options(JournalOptions {
+            output_hard_cap: 128,
+        })
+        .unwrap();
+        let id = j.append(&rec("s", "human", 1, "loud")).unwrap();
+        let original = vec![b'x'; 1000];
+        let hash = j.record_output(id, "stdout", &original).unwrap();
+        let stored = j.read_blob(&hash).unwrap().unwrap();
+        assert_eq!(stored.len(), 128);
+        assert!(stored.ends_with(TRUNCATION_MARKER));
+        let row = &j.query(&JournalQuery::default()).unwrap()[0].outputs[0];
+        assert_eq!(
+            row.meta,
+            Some(OutputMeta {
+                truncated: true,
+                original_len: 1000,
+                stored_len: 128
+            })
+        );
+        assert_eq!(row.len, 128);
+    }
+
+    #[test]
+    fn blob_access_refreshes_lru_timestamp() {
+        let j = Journal::in_memory().unwrap();
+        let id = j.append(&rec("s", "human", 1, "echo")).unwrap();
+        let hash = j.record_output(id, "stdout", b"hot").unwrap();
+        let raw = hex_bytes(&hash).unwrap();
+        j.conn
+            .execute(
+                "UPDATE blob SET last_access_ns=1 WHERE hash=?1",
+                [raw.clone()],
+            )
+            .unwrap();
+        assert_eq!(j.read_blob(&hash).unwrap().unwrap(), b"hot");
+        let access: i64 = j
+            .conn
+            .query_row(
+                "SELECT last_access_ns FROM blob WHERE hash=?1",
+                [raw],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(access > 1);
     }
 }
