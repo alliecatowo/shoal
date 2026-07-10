@@ -335,7 +335,7 @@ fn repl() -> Result<i32, String> {
                 if src.trim().is_empty() {
                     continue;
                 }
-                match parse(&src) {
+                match shoal_syntax::parse_with_scope(&src, evaluator.env.visible_names()) {
                     Ok(program) => match evaluator.eval_program(&program) {
                         Ok(value) => {
                             if let Err(error) = render_result(&value, true) {

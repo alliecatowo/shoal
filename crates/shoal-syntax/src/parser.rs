@@ -42,6 +42,14 @@ pub fn parse(src: &str) -> ParseResult<Program> {
     Parser::new(src).parse_program()
 }
 
+pub fn parse_with_scope(src: &str, bound: impl IntoIterator<Item = String>) -> ParseResult<Program> {
+    let mut parser = Parser::new(src);
+    for name in bound {
+        parser.bind(name);
+    }
+    parser.parse_program()
+}
+
 pub struct Parser<'s> {
     lx: Lexer<'s>,
     pos: usize,
@@ -758,7 +766,9 @@ impl<'s> Parser<'s> {
             match x {
                 Seg::Lit(text) => parts.push(StrPart::Lit { text }),
                 Seg::Expr { start, end } => {
-                    let mut e = parse(&self.lx.src[start as usize..end as usize])?;
+                    let mut parser = Parser::new(&self.lx.src[start as usize..end as usize]);
+                    parser.scopes = self.scopes.clone();
+                    let mut e = parser.parse_program()?;
                     if e.stmts.len() != 1 {
                         return Err(ParseError::new(
                             "interpolation must contain one expression",
