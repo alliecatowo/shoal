@@ -310,14 +310,14 @@ fn repl() -> Result<i32, String> {
         )))
         .with_highlighter(Box::new(ExampleHighlighter::new(completions)))
         .with_hinter(Box::new(DefaultHinter::default()));
-    if config.history.enabled {
-        if let Some(path) = config.history.path.clone().or_else(history_path) {
-            if let Some(parent) = path.parent() {
-                let _ = fs::create_dir_all(parent);
-            }
-            if let Ok(history) = FileBackedHistory::with_file(config.history.max_entries, path) {
-                editor = editor.with_history(Box::new(history));
-            }
+    if config.history.enabled
+        && let Some(path) = config.history.path.clone().or_else(history_path)
+    {
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Ok(history) = FileBackedHistory::with_file(config.history.max_entries, path) {
+            editor = editor.with_history(Box::new(history));
         }
     }
 

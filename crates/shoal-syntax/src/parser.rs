@@ -1070,8 +1070,7 @@ fn is_comparison_token(t: &Tok) -> bool {
     matches!(
         t,
         Tok::EqEq | Tok::NotEq | Tok::Lt | Tok::Le | Tok::Gt | Tok::Ge
-    )
-        || matches!(t, Tok::Ident(x) if x == "in")
+    ) || matches!(t, Tok::Ident(x) if x == "in")
 }
 
 #[cfg(test)]
