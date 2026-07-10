@@ -9,8 +9,10 @@ use shoal_value::Value;
 use std::collections::HashMap;
 use std::io::{self, BufReader};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -60,6 +62,19 @@ impl Kernel {
         }))
     }
 
+    pub fn open_with_policy(
+        state_dir: impl AsRef<Path>,
+        policy: Policy,
+    ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
+        Ok(Arc::new(Self {
+            sessions: Mutex::new(HashMap::new()),
+            next_client: AtomicU64::new(1),
+            journal: Mutex::new(Journal::open(state_dir.as_ref())?),
+            policy,
+            plans: Mutex::new(HashMap::new()),
+        }))
+    }
+
     pub fn with_policy(policy: Policy) -> Arc<Self> {
         Arc::new(Self {
             sessions: Mutex::new(HashMap::new()),
@@ -71,21 +86,32 @@ impl Kernel {
     }
 
     pub fn serve(self: Arc<Self>, path: impl AsRef<Path>) -> io::Result<()> {
+        self.serve_until(path, Arc::new(AtomicBool::new(false)))
+    }
+
+    pub fn serve_until(
+        self: Arc<Self>,
+        path: impl AsRef<Path>,
+        stop: Arc<AtomicBool>,
+    ) -> io::Result<()> {
         let path = path.as_ref();
-        if path.exists() {
-            std::fs::remove_file(path)?;
-        }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let listener = UnixListener::bind(path)?;
-        for stream in listener.incoming() {
+        let _socket_guard = BoundSocket(path.to_path_buf());
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        listener.set_nonblocking(true)?;
+        while !stop.load(Ordering::SeqCst) {
             let kernel = self.clone();
-            match stream {
-                Ok(stream) => {
+            match listener.accept() {
+                Ok((stream, _)) => {
                     std::thread::spawn(move || {
                         let _ = kernel.handle_stream(stream);
                     });
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(25))
                 }
                 Err(error) => return Err(error),
             }
@@ -460,6 +486,11 @@ impl Kernel {
         sessions.insert(name.into(), session.clone());
         Ok(session)
     }
+}
+
+struct BoundSocket(std::path::PathBuf);
+impl Drop for BoundSocket {
+    fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
 }
 
 fn decode<T: serde::de::DeserializeOwned>(value: Json) -> Result<T, RpcError> {
