@@ -17,7 +17,11 @@ fn daemon_binds_secure_socket_and_attaches() {
             temp.path().join("state").to_str().unwrap(),
         ])
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        // Inherit stderr (rather than piping and never draining it) so that
+        // if the daemon panics or logs an error, the message lands directly
+        // in the CI test-step log instead of being silently discarded when
+        // the unread pipe is dropped.
+        .stderr(Stdio::inherit())
         .spawn()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -107,7 +111,11 @@ fn live_kernel_elides_a_big_table_over_the_wire() {
             temp.path().join("state").to_str().unwrap(),
         ])
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        // Inherit stderr (rather than piping and never draining it) so that
+        // if the daemon panics or logs an error mid-test, the message lands
+        // directly in the CI test-step log instead of being silently
+        // discarded when the unread pipe is dropped.
+        .stderr(Stdio::inherit())
         .spawn()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
