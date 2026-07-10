@@ -98,12 +98,24 @@ impl Evaluator {
             let outcome = builtin_outcome("reef", value);
             return self.apply_builtin_redirects(call, outcome);
         }
+        if call.head == "undo" {
+            return self.builtin_undo(call);
+        }
+        if call.head == "journal" || call.head == "history" {
+            return self.builtin_journal_view(call);
+        }
         if builtins::is_builtin(&call.head) {
             // Outcome unification (P1a): a builtin yields a `Value::Outcome`
             // exactly like an external command — its structured result becomes
             // the outcome's `.out` (`parsed`), `status = 0`/`ok = true`. A
             // builtin error still raises as before (via `?`).
+            //
+            // TDD §9 undo: capture prior state of an overwriting cp/mv/save
+            // BEFORE the mutation, then record the typed inverse AFTER. All a
+            // no-op unless a journal is installed and a statement is executing.
+            let undo_pre = self.fs_undo_pre(&call.head, call);
             let value = builtins::run(self, call)?;
+            self.fs_undo_post(&call.head, undo_pre, &value);
             let outcome = builtin_outcome(&call.head, value);
             // Redirects apply to builtin results too (defect #8).
             return self.apply_builtin_redirects(call, outcome);
@@ -449,7 +461,17 @@ impl Evaluator {
         if builtins::is_builtin(name)
             || matches!(
                 name,
-                "cd" | "pwd" | "source" | "run" | "jobs" | "interact" | "open" | "save" | "reef"
+                "cd" | "pwd"
+                    | "source"
+                    | "run"
+                    | "jobs"
+                    | "interact"
+                    | "open"
+                    | "save"
+                    | "reef"
+                    | "undo"
+                    | "journal"
+                    | "history"
             )
         {
             return true;

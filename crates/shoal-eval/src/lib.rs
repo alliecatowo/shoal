@@ -8,6 +8,7 @@ mod command;
 mod expr;
 mod helpers;
 mod host;
+mod journal;
 mod pattern;
 mod plan;
 mod reef;
@@ -20,6 +21,7 @@ pub use reef::{PromptReefBinding, PromptReefSnapshot};
 use shoal_adapters::{AdapterCatalog, AdapterClass, SubSpec};
 use shoal_ast::*;
 use shoal_exec::{CancelToken, ExecMode, ExecSpec, StdinSpec};
+use shoal_journal::Journal;
 use shoal_leash::{Effect, Estimates, Plan, Policy as LeashPolicy, Reversibility, SandboxPolicy};
 use shoal_value::{
     CallArgs, CallCtx, ClosureVal, Env, ErrorVal, OutcomeVal, Record, VResult, Value,
@@ -90,6 +92,28 @@ pub struct Evaluator {
     /// §6), nearest-first (innermost `with reef:` block wins). Empty and inert
     /// when no `with reef:` is on the dynamic stack — zero-regression.
     reef_overrides: Vec<shoal_reef::ScopeEntry>,
+    /// Optional command journal (TDD §9). `None` (the default) means NOTHING is
+    /// journaled — the exact pre-journal behavior, so `-c`/scripts/conformance
+    /// run untouched. Only when a host installs a journal via
+    /// [`Evaluator::set_journal`] (or [`Evaluator::open_default_journal`]) does
+    /// per-top-level-statement recording, output capture, and fs undo-inverse
+    /// recording happen. Held here (not shared) because `Journal` is single-
+    /// handle / not `Sync`; spawned child evaluators never inherit it.
+    journal: Option<Journal>,
+    /// Session id recorded on each journal entry (TDD §9). Ignored when no
+    /// journal is installed.
+    session_id: String,
+    /// Acting principal recorded on each journal entry: `"human"` or
+    /// `"agent:<name>"`. Ignored when no journal is installed.
+    principal: String,
+    /// The journal entry id of the top-level statement currently executing, so
+    /// nested fs mutations (rm/cp/mv/save) can attach undo inverses to it.
+    /// `None` outside a journaled statement.
+    current_entry: Option<i64>,
+    /// Source text of the program currently being evaluated, used to slice each
+    /// top-level statement's `src` for its journal entry (TDD §9). `None` when
+    /// the host did not provide it — the entry's `src` is then left empty.
+    source: Option<String>,
     /// Active leash policy + the principal it is evaluated for (TDD §8). `None`
     /// (the default) means no OS sandbox is ever applied to a spawn — the exact
     /// pre-activation behavior, so `Evaluator::new` and every existing test
@@ -136,6 +160,11 @@ impl Evaluator {
             reef_user_manifest: None,
             reef_overrides: Vec::new(),
             leash: None,
+            journal: None,
+            session_id: "default".into(),
+            principal: "human".into(),
+            current_entry: None,
+            source: None,
         }
     }
 

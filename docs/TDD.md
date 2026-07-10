@@ -286,7 +286,7 @@ Transport: JSON-RPC 2.0 over Unix socket, newline-delimited. Auth: `SO_PEERCRED`
 
 Value encoding: JSON with `$`-tags — `{"$":"size","v":1500000}`, tables columnar, streams as ref + chunks, errors `{"$":"error","code","msg","span","stderr?","hint?"}`. Refs stable: `out:12`, `val:blake3:…`, `task:7`, `plan:8f2c`.
 
-Canonical AST node kinds: `prog let var fn param alias use call word flag lit var_ref field method index lambda list record block if match arm for while range binop unop try catch with spawn sh_raw` — versioned by `ast_version` at attach.
+Canonical AST node kinds: `prog let var fn param alias use call word flag lit var_ref field method index lambda list record block if match arm for while range binop unop try catch with spawn lang_block` — versioned by `ast_version` at attach.
 
 ---
 

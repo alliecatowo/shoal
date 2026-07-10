@@ -96,7 +96,11 @@ impl Evaluator {
         }
         let path = pos[0].clone();
         let value = pos[1].clone();
-        shoal_value::methods::call_method(
+        // TDD §9 undo: if `save` overwrites an existing file under a journal,
+        // snapshot its prior bytes first, then record a restore inverse after
+        // the write. A no-op unless a journal is installed mid-statement.
+        let undo_pre = self.save_undo_pre(&path);
+        let result = shoal_value::methods::call_method(
             self,
             value,
             "save",
@@ -105,7 +109,9 @@ impl Evaluator {
                 named: vec![],
             },
             Span::default(),
-        )
+        );
+        self.save_undo_post(undo_pre);
+        result
     }
 
     /// `parallel(...closures)` — fail-fast by default; `settle: true` collects all
