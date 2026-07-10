@@ -1,0 +1,8 @@
+[package]
+name="shoal-picker"
+version="0.1.0"
+edition="2024"
+[dependencies]
+shoal-value={path="../shoal-value"}
+crossterm="0.29"
+unicode-segmentation="1.12"
