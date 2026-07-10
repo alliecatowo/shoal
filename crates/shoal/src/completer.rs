@@ -16,7 +16,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
@@ -208,9 +208,9 @@ impl ShoalCompleter {
         if dir_part.is_empty() {
             return self.cwd();
         }
-        let expanded = if dir_part.starts_with("~/") {
+        let expanded = if let Some(tail) = dir_part.strip_prefix("~/") {
             match std::env::var_os("HOME") {
-                Some(home) => PathBuf::from(home).join(&dir_part[2..]),
+                Some(home) => PathBuf::from(home).join(tail),
                 None => PathBuf::from(dir_part),
             }
         } else {
@@ -432,6 +432,7 @@ pub fn scan_adapter_names(dirs: &[PathBuf]) -> Vec<String> {
 mod tests {
     use super::*;
     use shoal_value::Env;
+    use std::path::Path;
     use std::sync::{Arc, Mutex};
 
     fn completer_at(cwd: &Path) -> ShoalCompleter {

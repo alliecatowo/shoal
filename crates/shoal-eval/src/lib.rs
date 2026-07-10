@@ -308,14 +308,14 @@ impl Evaluator {
                 })?;
                 Ok(Flow::Value(assigned))
             }
-            Stmt::Expr { expr, .. } => Ok(Flow::Value(self.eval_expr(
-                expr,
-                if top {
+            Stmt::Expr { expr, .. } => {
+                let position = if top {
                     Position::Statement
                 } else {
                     Position::Value
-                },
-            )?)),
+                };
+                self.eval_expr_flow(expr, position)
+            }
             Stmt::Return { value, .. } => Ok(Flow::Return(match value {
                 Some(v) => self.eval_expr(v, Position::Value)?,
                 None => Value::Null,
@@ -330,7 +330,6 @@ impl Evaluator {
             } => {
                 let iter_value = self.eval_expr(iter, Position::Value)?;
                 let vals = self.values_from(iter_value)?;
-                let mut last = Value::Null;
                 for value in vals {
                     let old = self.env.clone();
                     self.env = old.child();
@@ -338,31 +337,63 @@ impl Evaluator {
                     let flow = self.eval_block(body);
                     self.env = old;
                     match flow? {
-                        Flow::Value(v) => last = v,
+                        Flow::Value(_) => {}
                         Flow::Continue => continue,
                         Flow::Break => break,
                         r @ Flow::Return(_) => return Ok(r),
                     }
                 }
-                Ok(Flow::Value(last))
+                // A loop is a statement, not an expression — it yields no value
+                // (so a trailing bare command in the body is not re-rendered as
+                // the loop's result). Its work is its side effects.
+                Ok(Flow::Value(Value::Null))
             }
             Stmt::While { cond, body, .. } => {
-                let mut last = Value::Null;
                 while self.eval_expr(cond, Position::Value)?.as_condition()? {
                     match self.eval_block(body)? {
-                        Flow::Value(v) => last = v,
+                        Flow::Value(_) => {}
                         Flow::Continue => {}
                         Flow::Break => break,
                         r @ Flow::Return(_) => return Ok(r),
                     }
                 }
-                Ok(Flow::Value(last))
+                Ok(Flow::Value(Value::Null))
             }
             Stmt::Use { span, .. } => Err(ErrorVal::new(
                 "custom",
                 "module loading is not implemented yet",
             )
             .with_span(*span)),
+        }
+    }
+
+    /// Evaluate an expression appearing in statement position while letting
+    /// `break`/`continue`/`return` inside an `if`/block body propagate to the
+    /// enclosing loop rather than being flattened into a "loop control outside
+    /// loop" error (the `while … { if … { break } }` case). Non-control-flow
+    /// expressions fall back to ordinary value evaluation.
+    fn eval_expr_flow(&mut self, expr: &Expr, position: Position) -> VResult<Flow> {
+        match expr {
+            Expr::If {
+                cond,
+                then,
+                r#else,
+                span,
+            } => {
+                let taken = self
+                    .eval_expr(cond, Position::Value)?
+                    .as_condition()
+                    .map_err(|e| e.or_span(*span))?;
+                if taken {
+                    self.eval_block(then)
+                } else if let Some(e) = r#else {
+                    self.eval_expr_flow(e, position)
+                } else {
+                    Ok(Flow::Value(Value::Null))
+                }
+            }
+            Expr::Block { block, .. } => self.eval_block(block),
+            _ => Ok(Flow::Value(self.eval_expr(expr, position)?)),
         }
     }
 
@@ -944,6 +975,13 @@ impl Evaluator {
                 self.emit(&Value::Str(help));
                 return Ok(Value::Null);
             }
+            // A parameter typed `glob` owns expansion itself (TDD §4.3): the
+            // callee receives the compiled, unexpanded pattern, so a glob-typed
+            // positional slot must skip the generic glob-expansion path below.
+            let closure_sig: Option<(&[Param], Option<&RestParam>)> = match &bound {
+                Value::Closure(c) => Some((&c.params, c.rest.as_ref())),
+                _ => None,
+            };
             let mut pos = Vec::new();
             let mut named = Vec::new();
             for a in &call.args {
@@ -955,12 +993,19 @@ impl Evaluator {
                             None => Value::Bool(true),
                         },
                     )),
+                    CmdArg::Glob { .. }
+                        if closure_sig.is_some_and(|(params, rest)| {
+                            expected_param_ty(params, rest, pos.len()) == Some("glob")
+                        }) =>
+                    {
+                        pos.push(self.cmd_arg_value(a)?);
+                    }
                     _ => pos.extend(self.expand_arg(a)?),
                 }
             }
             // Coerce CMD words to the callee's declared param types (defect #12).
             if let Value::Closure(c) = &bound {
-                coerce_call_args(&c.params, &mut pos, &mut named)?;
+                coerce_call_args(&c.params, c.rest.as_ref(), &mut pos, &mut named)?;
             }
             return self.call_value(&bound, CallArgs { pos, named });
         }
@@ -1142,11 +1187,19 @@ impl Evaluator {
                                 signature(&spec)
                             ))
                         })?;
-                    argv.push(format!("--{}", name.replace('_', "-")).into());
+                    // `consumed` flags stay recognized/validated (below) but
+                    // must never reach the child's argv — see the module-level
+                    // "consumed" rule doc in shoal-adapters.
+                    let consumed = spec.consumed.iter().any(|c| c == name);
+                    if !consumed {
+                        argv.push(format!("--{}", name.replace('_', "-")).into());
+                    }
                     if let Some(value) = value {
                         let v = self.cmd_arg_value(value)?;
                         validate_adapter_value(&v, &param.ty)?;
-                        argv.push(self.argv_value(v)?);
+                        if !consumed {
+                            argv.push(self.argv_value(v)?);
+                        }
                     } else if !param.ty.trim_end_matches('?').eq("bool") {
                         i += 1;
                         let next = call.args.get(i).ok_or_else(|| {
@@ -1154,19 +1207,29 @@ impl Evaluator {
                         })?;
                         let v = self.cmd_arg_value(next)?;
                         validate_adapter_value(&v, &param.ty)?;
-                        argv.push(self.argv_value(v)?);
+                        if !consumed {
+                            argv.push(self.argv_value(v)?);
+                        }
                     }
                 }
                 CmdArg::FlagShort { chars, .. } => {
+                    let mut kept = String::new();
                     for ch in chars.chars() {
-                        if !spec.short_flags.contains_key(&ch.to_string()) {
+                        let Some(pname) = spec.short_flags.get(&ch.to_string()) else {
                             return Err(ErrorVal::arg_error(format!(
                                 "{}: unknown short flag -{ch}",
                                 call.head
                             )));
+                        };
+                        // Same "consumed" rule as the long-flag branch above:
+                        // stays a recognized short flag, just dropped from argv.
+                        if !spec.consumed.iter().any(|c| c == pname) {
+                            kept.push(ch);
                         }
                     }
-                    argv.push(format!("-{chars}").into());
+                    if !kept.is_empty() {
+                        argv.push(format!("-{kept}").into());
+                    }
                 }
                 CmdArg::DashDash { .. } => argv.push("--".into()),
                 arg => {
@@ -1949,12 +2012,14 @@ impl Evaluator {
     }
 
     fn apply_builtin_redirects(&mut self, call: &CmdCall, value: Value) -> VResult<Value> {
+        let mut captured = false;
         for r in &call.redirects {
             match r.kind {
                 RedirectKind::Out => {
                     let p = self.arg_path(&r.target)?;
                     std::fs::write(&p, value_bytes(&value))
                         .map_err(|e| ErrorVal::new("custom", e.to_string()))?;
+                    captured = true;
                 }
                 RedirectKind::Append => {
                     use std::io::Write;
@@ -1965,11 +2030,19 @@ impl Evaluator {
                         .open(&p)
                         .and_then(|mut f| f.write_all(&value_bytes(&value)))
                         .map_err(|e| ErrorVal::new("custom", e.to_string()))?;
+                    captured = true;
                 }
                 RedirectKind::In => {}
             }
         }
-        Ok(value)
+        // `cmd > file` / `>> file` sends the output to the file — it must not
+        // also be rendered to the statement sink (defect #8). Yield Null so the
+        // redirected statement stays silent on stdout.
+        if captured {
+            Ok(Value::Null)
+        } else {
+            Ok(value)
+        }
     }
 
     /// Force a real PTY for `interact <cmd…>` (§5).
@@ -2381,19 +2454,52 @@ fn coerce_word(v: Value, ty: &str) -> VResult<Value> {
         "time" => shoal_value::parse_time(&s)
             .map(Value::Time)
             .ok_or_else(|| ErrorVal::arg_error(format!("expected time, found {s:?}"))),
+        "datetime" => parse_datetime(&s)
+            .map(|z| Value::DateTime(Box::new(z)))
+            .map_err(|_| ErrorVal::arg_error(format!("expected datetime, found {s:?}"))),
         "bool" => match s.as_str() {
             "true" => Ok(Value::Bool(true)),
             "false" => Ok(Value::Bool(false)),
             _ => Err(ErrorVal::arg_error(format!("expected bool, found {s:?}"))),
         },
         "path" => Ok(Value::Path(PathBuf::from(s))),
+        "glob" => Ok(Value::Glob(shoal_value::GlobVal {
+            pattern: s,
+            cwd: PathBuf::new(),
+            hidden: false,
+        })),
         _ => Ok(Value::Str(s)),
     }
 }
 
-/// Coerce positional + named CMD-word arguments against a function's parameters.
+/// Item type name a positional slot at `idx` coerces to: the declared param's
+/// type name, or — once `idx` runs past the fixed params — the `...rest`
+/// param's element type (unwrapping a `list<T>` annotation to `T`), so
+/// `...nums: list<int>` and `...nums: int` both accumulate as `int`.
+fn expected_param_ty<'a>(
+    params: &'a [Param],
+    rest: Option<&'a RestParam>,
+    idx: usize,
+) -> Option<&'a str> {
+    if let Some(p) = params.get(idx) {
+        return p.ty.as_ref().map(|t| t.name.as_str());
+    }
+    rest.and_then(|r| r.ty.as_ref()).map(|t| {
+        if t.name == "list" {
+            t.args.first().map(|a| a.name.as_str()).unwrap_or("str")
+        } else {
+            t.name.as_str()
+        }
+    })
+}
+
+/// Coerce positional + named CMD-word arguments against a function's parameters
+/// (TDD §4.2 site 2 / §4.4 `...rest`). Variadic tails accumulate: every
+/// positional word beyond the fixed params is coerced to the rest param's
+/// element type before `call_value_inner` collects them into a `list`.
 fn coerce_call_args(
     params: &[Param],
+    rest: Option<&RestParam>,
     pos: &mut [Value],
     named: &mut [(String, Value)],
 ) -> VResult<()> {
@@ -2407,6 +2513,13 @@ fn coerce_call_args(
             slot.1 = coerce_word(std::mem::replace(&mut slot.1, Value::Null), &ty.name)?;
         } else if let Some(slot) = pos.get_mut(i) {
             *slot = coerce_word(std::mem::replace(slot, Value::Null), &ty.name)?;
+        }
+    }
+    if rest.is_some()
+        && let Some(item_ty) = expected_param_ty(params, rest, params.len())
+    {
+        for slot in pos.iter_mut().skip(params.len()) {
+            *slot = coerce_word(std::mem::replace(slot, Value::Null), item_ty)?;
         }
     }
     Ok(())
@@ -3022,6 +3135,45 @@ params={jobs="int"}
         .unwrap_err();
         assert_eq!(error.code, "arg_error");
         assert!(error.msg.contains("expected int"));
+    }
+
+    #[test]
+    fn adapter_consumed_flag_never_reaches_argv() {
+        // Regression for the git-status porcelain corruption (shoal-adapters'
+        // `consumed` rule, defect fix): `--short`/`-s` must stay a
+        // recognized, validated flag but never be appended to argv, since
+        // git's `--porcelain=v2` parser assumes an exact byte layout and
+        // `--short` (last-wins) silently switches git to a different,
+        // incompatible output format.
+        let toml = r#"[cmd.fixture]
+bin="/bin/echo"
+
+[cmd.fixture.sub.status]
+params = { short = "bool", branch = "bool" }
+flags = { short = { s = "short", b = "branch" } }
+invoke = ["status", "--porcelain=v2"]
+consumed = ["short", "branch"]
+"#;
+
+        let long = adapter_eval(toml, "fixture status --short").unwrap();
+        let Value::Outcome(o) = long else {
+            panic!("expected outcome, got {long:?}")
+        };
+        assert_eq!(
+            String::from_utf8(o.stdout.to_vec()).unwrap().trim(),
+            "status --porcelain=v2",
+            "--short must be accepted but dropped from argv"
+        );
+
+        let short = adapter_eval(toml, "fixture status -s").unwrap();
+        let Value::Outcome(o) = short else {
+            panic!("expected outcome, got {short:?}")
+        };
+        assert_eq!(
+            String::from_utf8(o.stdout.to_vec()).unwrap().trim(),
+            "status --porcelain=v2",
+            "-s must be accepted but dropped from argv"
+        );
     }
 
     #[test]

@@ -3,8 +3,6 @@
 //! Versions are opaque-unknown (npm bin scripts have no stable `--version`
 //! contract worth probing here).
 
-use std::path::PathBuf;
-
 use super::{Candidate, Provider, ProviderCtx, is_executable};
 use crate::version::Version;
 
@@ -44,6 +42,7 @@ impl Provider for NpmLocalProvider {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
 
     fn make_bin(dir: &std::path::Path, tool: &str) -> PathBuf {
         let bindir = dir.join("node_modules/.bin");

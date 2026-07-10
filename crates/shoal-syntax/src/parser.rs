@@ -1138,10 +1138,36 @@ impl<'s> Parser<'s> {
                 span: s,
             },
             Tok::Ident(name) => Pattern::Bind { name, span: s },
-            Tok::Int(value) => Pattern::Lit {
-                expr: Box::new(Expr::Int { value, span: s }),
-                span: s,
-            },
+            // Integer literal, or the start of a range pattern `a..b` / `a..=b`
+            // (TDD §3.2 grammar: `pat = literal | rangepat | …`).
+            Tok::Int(value) => {
+                let start_expr = Expr::Int { value, span: s };
+                if matches!(self.peek(Mode::Expr)?.0, Tok::DotDot | Tok::DotDotEq) {
+                    let (dot, _) = self.bump(Mode::Expr)?;
+                    let inclusive = matches!(dot, Tok::DotDotEq);
+                    let (et, es) = self.bump(Mode::Expr)?;
+                    let end_expr = match et {
+                        Tok::Int(v) => Expr::Int { value: v, span: es },
+                        _ => {
+                            return Err(ParseError::new(
+                                "expected an integer after `..` in a range pattern",
+                                es,
+                            ))
+                        }
+                    };
+                    Pattern::Range {
+                        start: Box::new(start_expr),
+                        end: Box::new(end_expr),
+                        inclusive,
+                        span: Span::new(s.start as usize, es.end as usize),
+                    }
+                } else {
+                    Pattern::Lit {
+                        expr: Box::new(start_expr),
+                        span: s,
+                    }
+                }
+            }
             Tok::Str(value) => Pattern::Lit {
                 expr: Box::new(Expr::Str { value, span: s }),
                 span: s,

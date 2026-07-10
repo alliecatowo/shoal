@@ -36,7 +36,15 @@ fn dispatch(ctx: &mut dyn CallCtx, recv: Value, name: &str, args: CallArgs) -> V
         "find" => find(ctx, recv, arg(&args, 0)?),
         "flat_map" => flat_map(ctx, recv, arg(&args, 0)?),
         "sort_by" => sort_by(ctx, recv, arg(&args, 0)?),
-        "sort" => sort(recv),
+        // `sort(.key)` sorts by the key extractor (e.g. `ls.sort(.name)`);
+        // `sort()` with no argument sorts the elements directly.
+        "sort" => {
+            if args.pos.is_empty() {
+                sort(recv)
+            } else {
+                sort_by(ctx, recv, arg(&args, 0)?)
+            }
+        }
         "reverse" => reverse(recv),
         "uniq" => uniq(recv),
         "sum" => sum(recv),

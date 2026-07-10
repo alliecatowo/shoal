@@ -14,7 +14,12 @@ use std::cmp::Ordering;
 use std::fmt;
 
 /// A parsed version.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `PartialEq`/`Eq` are implemented explicitly (not derived) to agree with
+/// [`Ord`]: two versions are equal exactly when [`Version::cmp`] says
+/// [`Ordering::Equal`], so `Version::parse("22") == Version::parse("22.0")`
+/// (zero-padded numeric equality) even though their raw text differs.
+#[derive(Debug, Clone)]
 pub struct Version {
     /// Numeric release components (e.g. `[3, 12, 4]`). Empty when opaque/unknown.
     parts: Vec<u64>,
@@ -89,6 +94,13 @@ impl fmt::Display for Version {
         }
     }
 }
+
+impl PartialEq for Version {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+impl Eq for Version {}
 
 impl PartialOrd for Version {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {

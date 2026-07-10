@@ -1,8 +1,6 @@
 //! venv provider: a project virtualenv's `.venv/bin/<tool>` when present. Walks
 //! up from the cwd. Versions are opaque-unknown.
 
-use std::path::PathBuf;
-
 use super::{Candidate, Provider, ProviderCtx, is_executable};
 use crate::version::Version;
 

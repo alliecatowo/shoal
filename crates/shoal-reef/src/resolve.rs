@@ -107,7 +107,7 @@ impl Resolver {
         if let Some(entry) = lock.get(name)
             && self.lock_entry_valid(entry, &decision)
         {
-            return self.from_lock(name, chain, &decision, entry.clone());
+            return self.resolution_from_lock(name, chain, &decision, entry.clone());
         }
 
         // A constrained miss under script policy is a hard error.
@@ -137,10 +137,6 @@ impl Resolver {
     }
 
     // --- internals ---------------------------------------------------------
-
-    fn provider_index(&self, name: &str) -> usize {
-        self.providers.iter().position(|p| p.name() == name).unwrap_or(usize::MAX)
-    }
 
     fn effective_decision(&self, chain: &ScopeChain, name: &str) -> ReefResult<Decision> {
         let mentioning: Vec<_> = chain
@@ -213,7 +209,7 @@ impl Resolver {
         decision.constraint.satisfies(&Version::parse(&entry.version))
     }
 
-    fn from_lock(
+    fn resolution_from_lock(
         &self,
         name: &str,
         chain: &ScopeChain,
@@ -407,7 +403,6 @@ impl Resolver {
         // Unconstrained resolutions land in a provider scope not present as a
         // manifest — record it explicitly so the chain shows the winner.
         if !constrained {
-            let _ = ManifestKind::Reef; // keep import used across cfgs
             out.push(ScopeDecision::new(
                 selected_scope.to_string(),
                 PathBuf::new(),
@@ -550,6 +545,15 @@ mod tests {
             .resolve("node", &chain, &mut lock, Policy::Script, &mut |_| {})
             .unwrap_err();
         assert_eq!(err.code_str(), "reef_drift");
+        // The error names *both* the stale locked hash and the current on-disk
+        // hash, per REEF.md §2 ("a hard error naming old/new hashes").
+        let msg = err.to_string();
+        let old_hash = short(&crate::hashcache::hash_bytes(b"node-22-orig"));
+        let new_hash = short(&crate::hashcache::hash_bytes(b"node-22-TAMPERED"));
+        assert_ne!(old_hash, new_hash);
+        assert!(msg.contains(&old_hash), "message {msg:?} missing old hash {old_hash}");
+        assert!(msg.contains(&new_hash), "message {msg:?} missing new hash {new_hash}");
+        assert!(err.hint.as_deref().unwrap_or("").contains("reef lock --refresh"));
     }
 
     #[test]
@@ -592,6 +596,33 @@ mod tests {
             .resolve("node", &chain, &mut lock, Policy::Interactive, &mut |_| {})
             .unwrap_err();
         assert_eq!(err.code_str(), "reef_conflict");
+        // REEF.md §2: "the error lists both sources" — no silent first-wins.
+        let msg = err.to_string();
+        assert!(msg.contains("18"), "message should cite the 18 constraint");
+        assert!(msg.contains("22"), "message should cite the 22 constraint");
+        let hint = err.hint.clone().unwrap_or_default();
+        assert!(hint.contains(base.join(".reef.toml").to_string_lossy().as_ref()));
+        assert!(hint.contains(sub.join(".reef.toml").to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn conflicting_provider_pins_across_scopes() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path();
+        std::fs::write(base.join(".reef.toml"), "[tools]\ngo = { provider = \"mise\" }\n").unwrap();
+        let sub = base.join("proj");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join(".reef.toml"), "[tools]\ngo = { provider = \"system\" }\n").unwrap();
+        let chain = ScopeChain::discover(&sub, None);
+        let r = resolver_with(vec![("mise", vec![]), ("system", vec![])]);
+        let mut lock = Lockfile::new();
+        let err = r
+            .resolve("go", &chain, &mut lock, Policy::Interactive, &mut |_| {})
+            .unwrap_err();
+        assert_eq!(err.code_str(), "reef_conflict");
+        let msg = err.to_string();
+        assert!(msg.contains("mise"));
+        assert!(msg.contains("system"));
     }
 
     #[test]

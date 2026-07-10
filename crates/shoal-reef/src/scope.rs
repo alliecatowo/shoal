@@ -209,6 +209,47 @@ mod tests {
     }
 
     #[test]
+    fn runner_table_merges_nearest_over_defaults() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path();
+        // Farther scope overrides `py`; nearer scope overrides it again.
+        write(&base.join(".reef.toml"), "[tools]\nnode = \"22\"\n[runners]\npy = \"python2\"\n");
+        let sub = base.join("proj");
+        write(
+            &sub.join(".reef.toml"),
+            "[tools]\nnode = \"22\"\n[runners]\npy = \"python3\"\nrb = \"jruby\"\n",
+        );
+        let chain = ScopeChain::discover(&sub, None);
+        let table = chain.runner_table();
+        // Nearest (`proj`) wins over the farther override.
+        assert_eq!(table.get("py").unwrap().tool, "python3");
+        // A scope-added runner not present in the shipped defaults appears.
+        assert_eq!(table.get("rb").unwrap().tool, "jruby");
+        // Shipped defaults still present for extensions no scope touched.
+        assert_eq!(table.get("js").unwrap().tool, "node");
+    }
+
+    #[test]
+    fn hermetic_true_if_any_scope_requests_it() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path();
+        write(&base.join(".reef.toml"), "[tools]\nnode = \"22\"\n");
+        let sub = base.join("proj");
+        write(&sub.join(".reef.toml"), "[tools]\npython = \"3\"\n[options]\nhermetic = true\n");
+        let chain = ScopeChain::discover(&sub, None);
+        assert!(chain.hermetic(), "any scope requesting hermetic wins");
+    }
+
+    #[test]
+    fn hermetic_false_when_no_scope_requests_it() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path();
+        write(&base.join(".reef.toml"), "[tools]\nnode = \"22\"\n");
+        let chain = ScopeChain::discover(base, None);
+        assert!(!chain.hermetic());
+    }
+
+    #[test]
     fn chain_key_reflects_mtime_change() {
         let root = tempfile::tempdir().unwrap();
         let base = root.path();

@@ -3,16 +3,20 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use reedline::{
-    DefaultCompleter, DefaultHinter, DefaultPrompt, DefaultPromptSegment,
-    FileBackedHistory, Reedline, Signal, ValidationResult, Validator,
+    ColumnarMenu, DefaultHinter, DefaultPrompt, DefaultPromptSegment, Emacs, FileBackedHistory,
+    KeyCode, KeyModifiers, MenuBuilder, Reedline, ReedlineEvent, ReedlineMenu, Signal,
+    ValidationResult, Validator, default_emacs_keybindings,
 };
 use shoal_eval::Evaluator;
-use shoal_syntax::{ParseError, parse};
-use shoal_value::{ErrorVal, Value};
+use shoal_syntax::{ParseCtx, ParseError, parse, parse_with_ctx};
+use shoal_value::{Env, ErrorVal, Value};
 
+mod completer;
 mod highlight;
+use completer::ShoalCompleter;
 use highlight::ShoalHighlighter;
 
 const USAGE: &str = "shoal 0.1.0\n\nUsage: shoal [OPTIONS] [SCRIPT]\n       shoal <fmt|doctor|lsp|mcp|completions> ...\n\nOptions:\n  -c, --command <SOURCE>  Evaluate source and exit\n  -h, --help              Print help\n  -V, --version           Print version\n\nDeveloper commands:\n  fmt [--check] [FILES]   Format .shl source (stdin when no files)\n  doctor [--json]         Diagnose the installation\n  lsp                     Run the language server companion\n  mcp                     Run the MCP companion\n  completions SHELL       Print bash, zsh, or fish completions";
@@ -31,10 +35,60 @@ enum Action {
 }
 
 fn main() {
-    if let Err(error) = run() {
-        eprintln!("\x1b[31;1merror:\x1b[0m {error}");
-        std::process::exit(1);
+    // Run everything on a worker thread with a large stack. Deep (or runaway)
+    // user recursion walks many native eval frames per shoal-level call; the
+    // 8 MiB default would overflow and `abort()` the process well before the
+    // interpreter's own recursion guard (10k nested calls) could raise a clean
+    // `recursion_limit` error. A 1 GiB reservation is virtual (only touched
+    // pages commit) and comfortably outlasts the guard.
+    let worker = std::thread::Builder::new()
+        .name("shoal-main".into())
+        .stack_size(1 << 30)
+        .spawn(|| {
+            if let Err(error) = run() {
+                eprintln!("{}", maybe_strip(format!("\x1b[31;1merror:\x1b[0m {error}")));
+                std::process::exit(1);
+            }
+        })
+        .expect("spawn main worker thread");
+    worker.join().expect("main worker thread panicked");
+}
+
+/// NO_COLOR (https://no-color.org): disable ANSI escapes whenever the
+/// variable is present at all, regardless of its value. Checked lazily on
+/// every call rather than cached, so tests (and users) can flip it mid-process.
+fn no_color() -> bool {
+    std::env::var_os("NO_COLOR").is_some()
+}
+
+/// Strip ANSI CSI escape sequences (`ESC [ ... final-byte`), leaving plain
+/// text — used to make our own colorized output NO_COLOR-safe without
+/// duplicating every builder as a plain/colored pair.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for c2 in chars.by_ref() {
+                if ('\u{40}'..='\u{7e}').contains(&c2) {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(ch);
     }
+    out
+}
+
+/// Strip ANSI from `s` when `NO_COLOR` is set; pass it through unchanged
+/// otherwise. Used at every terminal-output boundary so colorized output
+/// built elsewhere (this crate's diagnostics/prompt, or shoal-value's
+/// renderer) still honors the user's `NO_COLOR` setting.
+fn maybe_strip(s: impl Into<String>) -> String {
+    let s = s.into();
+    if no_color() { strip_ansi(&s) } else { s }
 }
 
 fn run() -> Result<(), String> {
@@ -284,18 +338,29 @@ fn repl() -> Result<i32, String> {
     let cwd = std::env::current_dir().map_err(|e| format!("cannot determine cwd: {e}"))?;
     let loaded = shoal_config::load(&shoal_config::LoadOptions::discover(&cwd))?;
     for warning in &loaded.warnings {
-        eprintln!("\x1b[33;1mwarning:\x1b[0m config error: {warning}");
+        eprintln!("{}", maybe_strip(format!("\x1b[33;1mwarning:\x1b[0m config error: {warning}")));
     }
     let config = loaded.config;
-    let mut evaluator = Evaluator::new(cwd);
+    let mut evaluator = Evaluator::new(cwd.clone());
     evaluator.interactive = true;
+    evaluator.set_statement_sink(Box::new(|v: &Value| {
+        let _ = print_value(v);
+    }));
+
+    let mut catalogs = Vec::new();
     for dir in &config.adapters.dirs {
         let (catalog, warnings) = shoal_adapters::AdapterCatalog::load_dir(dir);
         for warning in warnings {
-            eprintln!("\x1b[33;1mwarning:\x1b[0m failed to load adapter: {warning}");
+            eprintln!(
+                "{}",
+                maybe_strip(format!("\x1b[33;1mwarning:\x1b[0m failed to load adapter: {warning}"))
+            );
         }
-        evaluator.set_adapters(catalog);
+        evaluator.set_adapters(catalog.clone());
+        catalogs.push(catalog);
     }
+    let adapter_names = completer::scan_adapter_names(&config.adapters.dirs);
+
     for init in &config.init.files {
         let src = fs::read_to_string(init)
             .map_err(|e| format!("cannot read init {}: {e}", init.display()))?;
@@ -305,14 +370,52 @@ fn repl() -> Result<i32, String> {
             .map_err(|e| format!("init {}: {e}", init.display()))?;
     }
 
-    let completions = completion_candidates(evaluator.cwd());
+    // Ctrl-C must not kill the shell (TDD §4.7): install a real SIGINT
+    // handler so the OS's default "terminate" disposition never fires while
+    // a statement is executing (reedline's own `Signal::CtrlC` only covers
+    // Ctrl-C pressed *while typing*, before Enter — the terminal is back in
+    // cooked/ISIG mode by the time `eval_program` runs). The handler just
+    // forwards to whichever `CancelToken` is currently active; `eval_program`
+    // (and the exec layer under it) observe cancellation cooperatively and
+    // unwind to an error instead of the process dying.
+    let cancel_slot = Arc::new(Mutex::new(evaluator.cancellation_token()));
+    if let Ok(mut signals) =
+        signal_hook::iterator::Signals::new([signal_hook::consts::signal::SIGINT])
+    {
+        let slot = cancel_slot.clone();
+        std::thread::spawn(move || {
+            for _ in signals.forever() {
+                if let Ok(token) = slot.lock() {
+                    token.cancel();
+                }
+            }
+        });
+    }
+
+    let cwd_cell = Arc::new(Mutex::new(evaluator.cwd().to_path_buf()));
+    let completer = ShoalCompleter::new(
+        evaluator.env.clone(),
+        cwd_cell.clone(),
+        catalogs,
+        adapter_names,
+    );
+    let mut keybindings = default_emacs_keybindings();
+    keybindings.add_binding(
+        KeyModifiers::NONE,
+        KeyCode::Tab,
+        ReedlineEvent::UntilFound(vec![
+            ReedlineEvent::Menu("completion_menu".to_string()),
+            ReedlineEvent::MenuNext,
+        ]),
+    );
     let mut editor = Reedline::create()
         .use_bracketed_paste(config.editor.bracketed_paste)
         .with_validator(Box::new(ShoalValidator))
-        .with_completer(Box::new(DefaultCompleter::new_with_wordlen(
-            completions.clone(),
-            1,
+        .with_completer(Box::new(completer))
+        .with_menu(ReedlineMenu::EngineCompleter(Box::new(
+            ColumnarMenu::default().with_name("completion_menu"),
         )))
+        .with_edit_mode(Box::new(Emacs::new(keybindings)))
         .with_highlighter(Box::new(ShoalHighlighter))
         .with_hinter(Box::new(DefaultHinter::default()));
     if config.history.enabled
@@ -327,6 +430,16 @@ fn repl() -> Result<i32, String> {
     }
 
     loop {
+        // Keep the completer's cwd view and the cancel handler's active
+        // token fresh for the statement about to run.
+        if let Ok(mut cell) = cwd_cell.lock() {
+            *cell = evaluator.cwd().to_path_buf();
+        }
+        evaluator.reset_cancel();
+        if let Ok(mut token) = cancel_slot.lock() {
+            *token = evaluator.cancellation_token();
+        }
+
         let prompt_text = config
             .prompt
             .template
@@ -340,11 +453,18 @@ fn repl() -> Result<i32, String> {
                 if src.trim().is_empty() {
                     continue;
                 }
-                match shoal_syntax::parse_with_scope(&src, evaluator.env.visible_names()) {
+                let ctx = parse_ctx_for(&evaluator.env);
+                match parse_with_ctx(&src, ctx) {
                     Ok(program) => match evaluator.eval_program(&program) {
                         Ok(value) => {
+                            evaluator.record_transcript(&value);
                             if let Err(error) = render_result(&value, true) {
-                                eprintln!("\x1b[31;1merror:\x1b[0m cannot write output: {error}");
+                                eprintln!(
+                                    "{}",
+                                    maybe_strip(format!(
+                                        "\x1b[31;1merror:\x1b[0m cannot write output: {error}"
+                                    ))
+                                );
                             }
                         }
                         Err(error) => report_eval_error(&src, None, &error),
@@ -353,7 +473,7 @@ fn repl() -> Result<i32, String> {
                 }
             }
             Ok(Signal::CtrlC) => {
-                println!("\x1b[90m^C\x1b[0m");
+                println!("{}", maybe_strip("\x1b[90m^C\x1b[0m".to_string()));
             }
             Ok(Signal::CtrlD) => {
                 println!();
@@ -365,15 +485,44 @@ fn repl() -> Result<i32, String> {
     }
 }
 
+/// Build the parser's dispatch context (WP1's `ParseCtx`) from the live
+/// session `Env`: value-bindings (`let`/`var`) dispatch EXPR (so REPL `it`/
+/// `out` — themselves plain value bindings via `record_transcript` — resolve
+/// as variables), callables (`fn`/`alias`) dispatch CMD.
+fn parse_ctx_for(env: &Env) -> ParseCtx {
+    let mut value_bound = Vec::new();
+    let mut cmd_bound = Vec::new();
+    for name in env.visible_names() {
+        match env.get(&name) {
+            Some(v) if v.is_callable() => cmd_bound.push(name),
+            Some(_) => value_bound.push(name),
+            None => {}
+        }
+    }
+    ParseCtx {
+        repl: true,
+        value_bound,
+        cmd_bound,
+    }
+}
+
 fn render_result(value: &Value, pty_was_live: bool) -> io::Result<()> {
     // External commands executed interactively stream their output to the
     // PTY tee. Rendering them here would duplicate the command's output.
     if pty_was_live && matches!(value, Value::Outcome(_)) {
         return Ok(());
     }
+    print_value(value)
+}
+
+/// Render one value the same colorized way the top-level REPL result is
+/// rendered — shared by `render_result` and the statement sink (WP2) so
+/// non-final statement values inside a multi-statement line get the same
+/// live, colorized treatment as the line's final result.
+fn print_value(value: &Value) -> io::Result<()> {
     let rendered = shoal_value::render::render_block(value, terminal_width());
     if !rendered.is_empty() {
-        println!("{rendered}");
+        println!("{}", maybe_strip(rendered));
     }
     Ok(())
 }
@@ -399,41 +548,11 @@ fn short_cwd(cwd: &Path) -> String {
     } else {
         cwd.to_path_buf()
     };
-    format!("\x1b[32;1mshoal\x1b[0m \x1b[36;1m{}\x1b[0m\x1b[95m{}\x1b[0m", display.display(), git_suffix(cwd))
-}
-
-fn completion_candidates(cwd: &Path) -> Vec<String> {
-    let mut values: std::collections::BTreeSet<String> = [
-        "let", "var", "fn", "alias", "use", "export", "return", "break", "continue", "if", "else",
-        "match", "for", "in", "while", "try", "catch", "true", "false", "null", "cd", "pwd", "ls",
-        "echo", "run", "spawn", "parallel", "jobs", "history",
-    ]
-    .into_iter()
-    .map(str::to_owned)
-    .collect();
-    if let Some(path) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path) {
-            if let Ok(entries) = fs::read_dir(dir) {
-                for entry in entries.flatten().take(4000) {
-                    if let Some(name) = entry.file_name().to_str() {
-                        values.insert(name.into());
-                    }
-                }
-            }
-        }
-    }
-    if let Ok(entries) = fs::read_dir(cwd) {
-        for entry in entries.flatten() {
-            if let Some(name) = entry.file_name().to_str() {
-                values.insert(if entry.path().is_dir() {
-                    format!("{name}/")
-                } else {
-                    name.into()
-                });
-            }
-        }
-    }
-    values.into_iter().collect()
+    maybe_strip(format!(
+        "\x1b[32;1mshoal\x1b[0m \x1b[36;1m{}\x1b[0m\x1b[95m{}\x1b[0m",
+        display.display(),
+        git_suffix(cwd)
+    ))
 }
 
 fn git_suffix(cwd: &Path) -> String {
@@ -504,17 +623,18 @@ fn format_diagnostic(
     let name: Cow<'_, str> = source
         .map(|path| path.to_string_lossy())
         .unwrap_or(Cow::Borrowed("<repl>"));
-    let name_styled = format!("\x1b[36m{name}:{line_no}:{column}\x1b[0m");
-    let kind_styled = format!("\x1b[31;1m{kind}\x1b[0m");
-    let msg_styled = format!("\x1b[1m{message}\x1b[0m");
-    let mut rendered = format!(
-        "{name_styled}: {kind_styled}: {msg_styled}\n  {line}\n  \x1b[31;1m{}^\x1b[0m\n",
-        " ".repeat(column - 1)
-    );
+    // One contiguous colored span for the whole "name:line:col: kind: message"
+    // header — no ANSI reset/switch *inside* the header text, so plain-text
+    // assertions against it (and NO_COLOR stripping) both see it intact.
+    let header = format!("{name}:{line_no}:{column}: {kind}: {message}");
+    let header_styled = format!("\x1b[1;31m{header}\x1b[0m");
+    let caret = format!("{}^", " ".repeat(column.saturating_sub(1)));
+    let caret_styled = format!("\x1b[31;1m{caret}\x1b[0m");
+    let mut rendered = format!("{header_styled}\n  {line}\n  {caret_styled}\n");
     if let Some(h) = hint {
-        rendered.push_str(&format!("  \x1b[33;1mhint:\x1b[0m \x1b[33m{h}\x1b[0m\n"));
+        rendered.push_str(&format!("  \x1b[33mhint: {h}\x1b[0m\n"));
     }
-    rendered
+    maybe_strip(rendered)
 }
 
 struct ShoalValidator;
@@ -643,10 +763,34 @@ mod tests {
     }
 
     #[test]
-    fn completion_catalog_has_language_and_filesystem_context() {
-        let values = completion_candidates(Path::new("."));
-        assert!(values.iter().any(|v| v == "match"));
-        assert!(values.iter().any(|v| v == "shoal" || v == "cargo"));
+    fn parse_ctx_splits_values_from_callables() {
+        let env = Env::root();
+        env.declare("mydata", Value::Int(3), false);
+        env.declare(
+            "deploy",
+            Value::CmdRef(Arc::new(shoal_ast::CmdCall {
+                head: "echo".into(),
+                forced: false,
+                env_prefix: Vec::new(),
+                args: Vec::new(),
+                redirects: Vec::new(),
+                background: false,
+                trailing: None,
+                span: shoal_ast::Span::new(0, 0),
+            })),
+            false,
+        );
+        let ctx = parse_ctx_for(&env);
+        assert!(ctx.repl);
+        assert!(ctx.value_bound.iter().any(|n| n == "mydata"));
+        assert!(ctx.cmd_bound.iter().any(|n| n == "deploy"));
+        assert!(!ctx.cmd_bound.iter().any(|n| n == "mydata"));
+    }
+
+    #[test]
+    fn no_color_strips_ansi_escapes_but_leaves_plain_text() {
+        let colored = "\x1b[31;1merror:\x1b[0m bad thing";
+        assert_eq!(strip_ansi(colored), "error: bad thing");
     }
 
     #[test]

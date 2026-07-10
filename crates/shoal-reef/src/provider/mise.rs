@@ -73,9 +73,7 @@ impl Provider for MiseProvider {
         ctx: &ProviderCtx,
     ) -> Option<Result<Candidate, ProviderError>> {
         // Only attempt if a `mise` binary is discoverable.
-        if which_mise().is_none() {
-            return None;
-        }
+        which_mise()?;
         let spec = match req {
             Constraint::Any | Constraint::Latest => format!("{tool}@latest"),
             other => format!("{tool}@{other}"),
