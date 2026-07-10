@@ -1021,6 +1021,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "shoal-leash"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "glob",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml 1.1.2+spec-1.1.0",
+]
+
+[[package]]
 name = "shoal-proto"
 version = "0.1.0"
 dependencies = [
