@@ -11,3 +11,8 @@ regex = "1.13.0"
 serde_json = "1.0.150"
 shoal-ast = { version = "0.1.0", path = "../shoal-ast" }
 unicode-width = "0.2.2"
+[dev-dependencies]
+criterion="0.7"
+[[bench]]
+name="table"
+harness=false

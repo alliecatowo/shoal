@@ -9,3 +9,8 @@ rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde_json = "1.0.150"
 tempfile = "3.27.0"
 zstd = "0.13.3"
+[dev-dependencies]
+criterion="0.7"
+[[bench]]
+name="journal"
+harness=false
