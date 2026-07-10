@@ -23,8 +23,29 @@ fn read_daemon_stderr(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|e| format!("<could not read {path:?}: {e}>"))
 }
 
+/// Only one live `shoal-kernel` daemon per test binary at a time.
+///
+/// Both tests below spawn a real daemon child process, talk to it over a
+/// real Unix socket, and signal it directly by PID (`kill(child.id(), ...)`)
+/// to shut it down. The default Rust test harness runs `#[test]` fns
+/// concurrently on separate threads, so with no serialization both daemons
+/// are alive at once. On macOS CI this has produced a daemon (this file's
+/// second test) exiting cleanly and silently — no panic, no logged error,
+/// just its `serve_until` accept loop ending, which only happens once the
+/// `ctrlc` handler observes a termination signal — immediately after the
+/// *other* test's own daemon lifecycle (which also sends a termination
+/// signal, to what it believes is its own child) ran concurrently. Whatever
+/// the exact OS-level mechanism, forcing the two daemons to never coexist
+/// removes any possibility of one test's signal/process handling touching
+/// the other's daemon, at negligible cost (each test finishes in well under
+/// a second).
+static ONLY_ONE_DAEMON_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn daemon_binds_secure_socket_and_attaches() {
+    let _serialize = ONLY_ONE_DAEMON_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().unwrap();
     let socket = temp.path().join("run/session.sock");
     let (stderr_file, stderr_path) = daemon_stderr_file(temp.path());
@@ -119,6 +140,9 @@ fn call(
 /// actually travels).
 #[test]
 fn live_kernel_elides_a_big_table_over_the_wire() {
+    let _serialize = ONLY_ONE_DAEMON_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().unwrap();
     let socket = temp.path().join("run/session.sock");
     let bigdir = temp.path().join("bigdir");
