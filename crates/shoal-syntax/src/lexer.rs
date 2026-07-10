@@ -545,9 +545,23 @@ impl<'s> Lexer<'s> {
 
     fn number(&self, start: usize) -> LexResult {
         let mut pos = start;
-        // Radix prefixes.
+        // Radix prefixes. A prefix only applies when a valid digit of that
+        // radix actually follows — otherwise `0b` is the size literal `0` +
+        // unit `b` (zero bytes), and `0x`/`0o` likewise fall through to the
+        // decimal/size path rather than erroring on missing digits.
+        let radix_digit_follows = |b: u8, radix: u32| -> bool {
+            (b as char).to_digit(radix).is_some()
+        };
         if self.at(pos) == b'0'
             && matches!(self.at(pos + 1), b'x' | b'X' | b'o' | b'O' | b'b' | b'B')
+            && {
+                let radix = match self.at(pos + 1) {
+                    b'x' | b'X' => 16,
+                    b'o' | b'O' => 8,
+                    _ => 2,
+                };
+                radix_digit_follows(self.at(pos + 2), radix)
+            }
         {
             let radix = match self.at(pos + 1) {
                 b'x' | b'X' => 16,
