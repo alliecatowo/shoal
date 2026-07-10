@@ -27,6 +27,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, ToSql, params};
+use serde::{Deserialize, Serialize};
 
 /// Default number of rows returned by [`Journal::query`] when
 /// [`JournalQuery::limit`] is `0`.
@@ -114,6 +115,113 @@ pub struct EntryRow {
     /// Outputs linked to this entry, in recording order.
     pub outputs: Vec<OutputRow>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileFingerprint {
+    pub size: u64,
+    pub modified_ns: Option<u64>,
+    pub hash: Option<String>,
+}
+
+impl FileFingerprint {
+    pub fn capture(path: &Path) -> io::Result<Self> {
+        let meta = fs::symlink_metadata(path)?;
+        if meta.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "refusing to fingerprint symlink",
+            ));
+        }
+        let hash = if meta.is_file() {
+            Some(blake3::hash(&fs::read(path)?).to_hex().to_string())
+        } else {
+            None
+        };
+        let modified_ns = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos().min(u64::MAX as u128) as u64);
+        Ok(Self {
+            size: meta.len(),
+            modified_ns,
+            hash,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum UndoInverse {
+    TrashMove {
+        original: PathBuf,
+        trash: PathBuf,
+        trash_fingerprint: FileFingerprint,
+    },
+    RestoreBytes {
+        path: PathBuf,
+        prior_hash: String,
+        expected_current: FileFingerprint,
+    },
+    MoveBack {
+        from: PathBuf,
+        to: PathBuf,
+        expected_from: FileFingerprint,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UndoStatus {
+    Applied,
+    AlreadyApplied,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UndoStep {
+    pub inverse: UndoInverse,
+    pub status: UndoStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UndoReport {
+    pub entry_id: i64,
+    pub steps: Vec<UndoStep>,
+}
+
+#[derive(Debug)]
+pub enum UndoError {
+    Sql(rusqlite::Error),
+    Io(io::Error),
+    Invalid(String),
+    Escaped(PathBuf),
+    Stale(PathBuf),
+}
+impl From<rusqlite::Error> for UndoError {
+    fn from(e: rusqlite::Error) -> Self {
+        Self::Sql(e)
+    }
+}
+impl From<io::Error> for UndoError {
+    fn from(e: io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+impl std::fmt::Display for UndoError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Sql(e) => write!(f, "{e}"),
+            Self::Io(e) => write!(f, "{e}"),
+            Self::Invalid(e) => write!(f, "invalid undo inverse: {e}"),
+            Self::Escaped(p) => write!(f, "undo target escapes scope: {}", p.display()),
+            Self::Stale(p) => write!(
+                f,
+                "undo target was modified since recording: {}",
+                p.display()
+            ),
+        }
+    }
+}
+impl std::error::Error for UndoError {}
 
 /// Filter set for [`Journal::query`]. `Default` matches everything with the
 /// default limit.
@@ -410,6 +518,107 @@ impl Journal {
         Ok(())
     }
 
+    pub fn record_undo_inverse(&self, id: i64, inverse: &UndoInverse) -> rusqlite::Result<()> {
+        let json = serde_json::to_string(inverse)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        self.record_undo(id, inverse_name(inverse), &json)
+    }
+
+    /// Replay typed inverses newest-first. Destinations must remain inside
+    /// `root`; stale fingerprints and symlink traversal are hard failures.
+    pub fn undo_entry(&self, id: i64, root: &Path) -> Result<UndoReport, UndoError> {
+        let root = root.canonicalize()?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT inverse FROM undo WHERE entry_id=?1 ORDER BY rowid DESC")?;
+        let encoded = stmt
+            .query_map([id], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut steps = Vec::new();
+        for json in encoded {
+            let inverse: UndoInverse =
+                serde_json::from_str(&json).map_err(|e| UndoError::Invalid(e.to_string()))?;
+            let status = self.apply_inverse(&inverse, &root)?;
+            steps.push(UndoStep { inverse, status });
+        }
+        Ok(UndoReport {
+            entry_id: id,
+            steps,
+        })
+    }
+
+    fn apply_inverse(&self, inverse: &UndoInverse, root: &Path) -> Result<UndoStatus, UndoError> {
+        match inverse {
+            UndoInverse::TrashMove {
+                original,
+                trash,
+                trash_fingerprint,
+            } => {
+                checked_target(root, original)?;
+                if !trash.exists() {
+                    return if original.exists() {
+                        Ok(UndoStatus::AlreadyApplied)
+                    } else {
+                        Err(UndoError::Stale(trash.clone()))
+                    };
+                }
+                require_fingerprint(trash, trash_fingerprint)?;
+                if original.exists() {
+                    return Err(UndoError::Stale(original.clone()));
+                }
+                ensure_no_symlink_parents(root, original)?;
+                fs::rename(trash, original)?;
+                Ok(UndoStatus::Applied)
+            }
+            UndoInverse::RestoreBytes {
+                path,
+                prior_hash,
+                expected_current,
+            } => {
+                checked_target(root, path)?;
+                let prior = self
+                    .read_blob(prior_hash)?
+                    .ok_or_else(|| UndoError::Invalid(format!("missing CAS blob {prior_hash}")))?;
+                if path.exists() {
+                    let current = FileFingerprint::capture(path)?;
+                    if current.hash.as_deref() == Some(blake3::hash(&prior).to_hex().as_str()) {
+                        return Ok(UndoStatus::AlreadyApplied);
+                    }
+                    if &current != expected_current {
+                        return Err(UndoError::Stale(path.clone()));
+                    }
+                } else {
+                    return Err(UndoError::Stale(path.clone()));
+                }
+                ensure_no_symlink_parents(root, path)?;
+                atomic_replace(path, &prior)?;
+                Ok(UndoStatus::Applied)
+            }
+            UndoInverse::MoveBack {
+                from,
+                to,
+                expected_from,
+            } => {
+                checked_target(root, from)?;
+                checked_target(root, to)?;
+                if !from.exists() {
+                    return if to.exists() {
+                        Ok(UndoStatus::AlreadyApplied)
+                    } else {
+                        Err(UndoError::Stale(from.clone()))
+                    };
+                }
+                require_fingerprint(from, expected_from)?;
+                if to.exists() {
+                    return Err(UndoError::Stale(to.clone()));
+                }
+                ensure_no_symlink_parents(root, to)?;
+                fs::rename(from, to)?;
+                Ok(UndoStatus::Applied)
+            }
+        }
+    }
+
     /// List `(op, inverse_json)` undo records for entry `id`, in recording order.
     /// (`undo out[n]` replays these newest-first — callers reverse.)
     pub fn undos_for(&self, id: i64) -> rusqlite::Result<Vec<(String, String)>> {
@@ -428,6 +637,73 @@ impl Journal {
             .join(&hex[2..4])
             .join(format!("{hex}.zst"))
     }
+}
+
+fn inverse_name(inverse: &UndoInverse) -> &'static str {
+    match inverse {
+        UndoInverse::TrashMove { .. } => "trash_move",
+        UndoInverse::RestoreBytes { .. } => "restore_bytes",
+        UndoInverse::MoveBack { .. } => "move_back",
+    }
+}
+
+fn checked_target(root: &Path, path: &Path) -> Result<(), UndoError> {
+    if !path.is_absolute() || !path.starts_with(root) {
+        return Err(UndoError::Escaped(path.to_owned()));
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::CurDir => {}
+            c => normalized.push(c.as_os_str()),
+        }
+    }
+    if !normalized.starts_with(root) {
+        return Err(UndoError::Escaped(path.to_owned()));
+    }
+    Ok(())
+}
+
+fn ensure_no_symlink_parents(root: &Path, path: &Path) -> Result<(), UndoError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| UndoError::Escaped(path.to_owned()))?;
+    let relative = parent
+        .strip_prefix(root)
+        .map_err(|_| UndoError::Escaped(path.to_owned()))?;
+    let mut current = root.to_owned();
+    for component in relative.components() {
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => return Err(UndoError::Escaped(current)),
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => fs::create_dir(&current)?,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
+fn require_fingerprint(path: &Path, expected: &FileFingerprint) -> Result<(), UndoError> {
+    if &FileFingerprint::capture(path)? == expected {
+        Ok(())
+    } else {
+        Err(UndoError::Stale(path.to_owned()))
+    }
+}
+
+fn atomic_replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    tmp.write_all(bytes)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path).map_err(|e| e.error)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -798,5 +1074,161 @@ mod tests {
         let h = j.record_output(id, "stdout", b"hi\n").unwrap();
         // The tempdir CAS must still be readable as long as the Journal lives.
         assert_eq!(j.read_blob(&h).unwrap().unwrap(), b"hi\n");
+    }
+
+    #[test]
+    fn undo_trash_move_restores_and_is_idempotent() {
+        let root = tempfile::tempdir().unwrap();
+        let trash_dir = tempfile::tempdir().unwrap();
+        let original = root.path().join("gone.txt");
+        let trash = trash_dir.path().join("gone.txt");
+        fs::write(&original, b"important").unwrap();
+        fs::rename(&original, &trash).unwrap();
+        let inverse = UndoInverse::TrashMove {
+            original: original.clone(),
+            trash: trash.clone(),
+            trash_fingerprint: FileFingerprint::capture(&trash).unwrap(),
+        };
+        let j = Journal::in_memory().unwrap();
+        let id = j.append(&rec("s", "human", 1, "rm gone.txt")).unwrap();
+        j.record_undo_inverse(id, &inverse).unwrap();
+        let report = j.undo_entry(id, root.path()).unwrap();
+        assert_eq!(report.steps[0].status, UndoStatus::Applied);
+        assert_eq!(fs::read(&original).unwrap(), b"important");
+        assert_eq!(
+            j.undo_entry(id, root.path()).unwrap().steps[0].status,
+            UndoStatus::AlreadyApplied
+        );
+    }
+
+    #[test]
+    fn undo_restore_bytes_refuses_stale_content() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config");
+        fs::write(&path, b"before").unwrap();
+        let j = Journal::in_memory().unwrap();
+        let id = j.append(&rec("s", "human", 1, "save config")).unwrap();
+        let prior = j.record_output(id, "value", b"before").unwrap();
+        fs::write(&path, b"after").unwrap();
+        let inverse = UndoInverse::RestoreBytes {
+            path: path.clone(),
+            prior_hash: prior,
+            expected_current: FileFingerprint::capture(&path).unwrap(),
+        };
+        j.record_undo_inverse(id, &inverse).unwrap();
+        fs::write(&path, b"user edit").unwrap();
+        assert!(matches!(j.undo_entry(id,root.path()),Err(UndoError::Stale(p)) if p==path));
+        assert_eq!(fs::read(&path).unwrap(), b"user edit");
+    }
+
+    #[test]
+    fn undo_restore_bytes_uses_cas() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config");
+        fs::write(&path, b"before").unwrap();
+        let j = Journal::in_memory().unwrap();
+        let id = j.append(&rec("s", "human", 1, "save config")).unwrap();
+        let prior = j.record_output(id, "value", b"before").unwrap();
+        fs::write(&path, b"after").unwrap();
+        j.record_undo_inverse(
+            id,
+            &UndoInverse::RestoreBytes {
+                path: path.clone(),
+                prior_hash: prior,
+                expected_current: FileFingerprint::capture(&path).unwrap(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            j.undo_entry(id, root.path()).unwrap().steps[0].status,
+            UndoStatus::Applied
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"before");
+        assert_eq!(
+            j.undo_entry(id, root.path()).unwrap().steps[0].status,
+            UndoStatus::AlreadyApplied
+        );
+    }
+
+    #[test]
+    fn undo_replays_moves_newest_first() {
+        let root = tempfile::tempdir().unwrap();
+        let a = root.path().join("a");
+        let b = root.path().join("b");
+        let c = root.path().join("c");
+        fs::write(&a, b"x").unwrap();
+        fs::rename(&a, &b).unwrap();
+        let fp = FileFingerprint::capture(&b).unwrap();
+        let j = Journal::in_memory().unwrap();
+        let id = j.append(&rec("s", "human", 1, "mv a b; mv b c")).unwrap();
+        j.record_undo_inverse(
+            id,
+            &UndoInverse::MoveBack {
+                from: b.clone(),
+                to: a.clone(),
+                expected_from: fp.clone(),
+            },
+        )
+        .unwrap();
+        fs::rename(&b, &c).unwrap();
+        j.record_undo_inverse(
+            id,
+            &UndoInverse::MoveBack {
+                from: c,
+                to: b,
+                expected_from: fp,
+            },
+        )
+        .unwrap();
+        let report = j.undo_entry(id, root.path()).unwrap();
+        assert_eq!(report.steps.len(), 2);
+        assert!(a.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn undo_rejects_traversal_and_symlink_parent() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let j = Journal::in_memory().unwrap();
+        let id = j.append(&rec("s", "human", 1, "undo hostile")).unwrap();
+        let escaped = root.path().join("..").join("escape");
+        j.record_undo_inverse(
+            id,
+            &UndoInverse::MoveBack {
+                from: escaped.clone(),
+                to: root.path().join("safe"),
+                expected_from: FileFingerprint {
+                    size: 0,
+                    modified_ns: None,
+                    hash: None,
+                },
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            j.undo_entry(id, root.path()),
+            Err(UndoError::Escaped(_))
+        ));
+        let id2 = j.append(&rec("s", "human", 2, "undo symlink")).unwrap();
+        symlink(outside.path(), root.path().join("link")).unwrap();
+        let target = root.path().join("link/file");
+        fs::write(outside.path().join("file"), b"after").unwrap();
+        let prior = j.record_output(id2, "value", b"before").unwrap();
+        j.record_undo_inverse(
+            id2,
+            &UndoInverse::RestoreBytes {
+                path: target.clone(),
+                prior_hash: prior,
+                expected_current: FileFingerprint::capture(&target).unwrap(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            j.undo_entry(id2, root.path()),
+            Err(UndoError::Escaped(_))
+        ));
+        assert_eq!(fs::read(outside.path().join("file")).unwrap(), b"after");
     }
 }
