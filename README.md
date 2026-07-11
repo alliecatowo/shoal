@@ -115,7 +115,7 @@ live syntax highlighting, and a fast cwd/Git/reef‑aware prompt.
 ```text
 # Compose with dots, not pipes — every step knows the type it carries
 ["ada", "grace", "linus"].where(.len() > 3).map(.upper())
-# → ["ADA", "GRACE", "LINUS"]
+# → ["GRACE", "LINUS"]   ("ada" is 3 chars, so > 3 filters it out)
 
 # Real arithmetic on typed units — not stringly-typed mush
 1.5gb + 500mb          # → 2gb
@@ -148,15 +148,15 @@ Type a bash pipe and shoal doesn't run it — it teaches you the better form:
 ```text
 > ls | grep foo
 error: shoal has no pipe operator
-  hint: data composes with `.` (try `ls.where(.name.contains("foo"))`);
+  hint: data composes with `.` (try `ls.where(.size > 1mb)`);
         raw byte plumbing is `.feed(cmd)`; verbatim POSIX lives in `sh { … }`
 ```
 
 Same for the other 1970s reflexes — each with the *why* and the correct alternative:
 
 ```text
-> echo $HOME     → "shoal variables have no sigil; environment variables are env.NAME"
-> if 1 { }       → "shoal has no truthiness — try .is_empty(), .is_some(), or != null"
+> echo $HOME     → "shoal variables have no sigil; write `name`, not `$name`; environment variables are `env.NAME`"
+> if 1 { }       → "expected bool in condition — shoal has no truthiness, try .is_empty(), .is_some(), or != null"
 ```
 
 </details>

@@ -345,6 +345,29 @@ mod tests {
     fn teaching_pipe_error() {
         let e = parse("ls | wc").unwrap_err();
         assert!(e.msg.contains("no pipe operator"));
+        // TDD §1.4: the hint names the dot-chain replacement WITH an example,
+        // plus `.feed` and `sh { }`. The `(try ...)` example was dropped once —
+        // pin it so it stays.
+        let hint = e.hint.as_deref().unwrap_or_default();
+        assert!(hint.contains("ls.where(.size > 1mb)"), "hint was {hint:?}");
+        assert!(
+            hint.contains(".feed(cmd)") && hint.contains("sh {"),
+            "hint was {hint:?}"
+        );
+    }
+    #[test]
+    fn teaching_pipe_error_in_expr_position() {
+        // Both the command-position and expression-position `|` share the hint.
+        let e = parse("(ls | wc)").unwrap_err();
+        assert!(e.msg.contains("no pipe operator"));
+        assert!(
+            e.hint
+                .as_deref()
+                .unwrap_or_default()
+                .contains("ls.where(.size > 1mb)"),
+            "hint was {:?}",
+            e.hint
+        );
     }
     #[test]
     fn records_lists_and_chain() {
