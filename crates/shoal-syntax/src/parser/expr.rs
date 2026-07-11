@@ -187,13 +187,35 @@ impl<'s> Parser<'s> {
                     let optional = matches!(self.bump(Mode::Expr)?.0, Tok::QuestionDot);
                     let (name, _) = self.ident()?;
                     if self.eat(Mode::Expr, &Tok::LParen)?.is_some() {
-                        let mut args = self.args_after_open()?;
-                        // Trailing block after a method call (§3.4 `f(a){…}`).
-                        if !self.no_trailing_block
-                            && matches!(self.peek(Mode::Expr)?.0, Tok::LBrace)
-                        {
-                            args.pos.push(self.trailing_block_lambda()?);
-                        }
+                        let args = if name == "feed" && self.at_command_head()? {
+                            // `.feed(cmd args…)`: the argument is a command with
+                            // its own arguments/flags (IO.md §1.1). Parse it in
+                            // CMD mode so `sort -r`, `jq ".a"`, etc. become an
+                            // `Expr::Cmd` the evaluator spawns with the fed bytes
+                            // on stdin — otherwise EXPR rules misparse the flag/
+                            // extra word. A value-shaped argument (the inverted
+                            // `cmd.feed(value)` form) has no command head, so
+                            // `at_command_head` is false and it falls through to
+                            // ordinary expression arguments below.
+                            let call = self.command()?;
+                            let cspan = call.span;
+                            self.expect(Mode::Expr, Tok::RParen, "`)`")?;
+                            let mut a = Args::empty();
+                            a.pos.push(Expr::Cmd {
+                                call: Box::new(call),
+                                span: cspan,
+                            });
+                            a
+                        } else {
+                            let mut a = self.args_after_open()?;
+                            // Trailing block after a method call (§3.4 `f(a){…}`).
+                            if !self.no_trailing_block
+                                && matches!(self.peek(Mode::Expr)?.0, Tok::LBrace)
+                            {
+                                a.pos.push(self.trailing_block_lambda()?);
+                            }
+                            a
+                        };
                         let span = Span::new(e.span().start as usize, self.pos);
                         e = Expr::MethodCall {
                             recv: Box::new(e),

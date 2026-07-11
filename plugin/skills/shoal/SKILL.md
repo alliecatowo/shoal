@@ -334,9 +334,9 @@ method; treat the signature as authoritative per CONTRACTS but verify empiricall
 | `cmd > file`, `cmd >> file` | `cmd > file`, `cmd >> file` (kept!) | Muscle-memory sugar, CMD-mode only, desugars to `.save(file)`/`.append(file)` on stdout bytes (TDD §1.3, §3.4). The **modern, canonical** form is calling `.save`/`.append` directly: `(cmd).save(file)`. |
 | `cmd < file` | `cmd < file` (kept) | Sole stdin sugar; desugars to `StdinSpec::File` directly (IO.md §1.1). No numeric variant, no here-string variant. |
 | `cmd <<EOF ... EOF` (heredoc) | **forbidden, permanently** — use an interpreter block | Not lexed — no `<<` token exists at all. Diagnostic: *"shoal has no heredocs — feed a string or multiline literal instead: `value.feed(cmd)`, or use an interpreter block: `python { ... }`"* (IO.md §4). **Interpreter blocks are IMPLEMENTED and this is the answer**: `python { import json; print(json.dumps(...)) }.out` runs the program and auto-parses its stdout to a structured value; `sh { ... }` (TDD §13.13) and a multiline `"""..."""` literal also work. |
-| `cmd <<< "text"` (here-string) | `"text".feed(cmd)` (works) | *"shoal has no here-strings — `"text".feed(cmd)`"* (IO.md §4). `.feed` IS implemented — `"text".feed(sort).out`. For a command that needs arguments, feed a block: `"text".feed(sh { grep foo })` or `"text".feed(jq { … })`. |
+| `cmd <<< "text"` (here-string) | `"text".feed(cmd args…)` (works) | *"shoal has no here-strings — `"text".feed(cmd)`"* (IO.md §4). `.feed` IS implemented, args and all: `"text".feed(grep "foo").out`, `"text".feed(sort -r).out`. Blocks also work: `"text".feed(sh { grep foo })` / `.feed(jq { … })`. |
 | `cmd 2>file`, `cmd 2>&1`, `cmd &>file` | **forbidden** | No fd-number tokens exist in the grammar at all. Use `.stderr` on a captured outcome: `cmd.stderr.save(file)`, or `try { cmd } catch e { e.stderr }` (IO.md §4). A live PTY run (statement position) already merges stdout/stderr by construction — this is honest PTY semantics, not a missing flag. |
-| `cmd1 \| cmd2` raw byte plumbing | `value.feed(cmd)` / `cmd.feed(value)` | The one asylum the pipe error names for genuine byte plumbing. **IMPLEMENTED** — `["b","a","c"].feed(sort).out` → sorted. For a command needing args, feed a block: `.feed(sh { sort -r })` / `.feed(jq { .a })`. The bare `.feed(cmd -flag)` spelling with args doesn't parse yet — always use the block form for a command with arguments. |
+| `cmd1 \| cmd2` raw byte plumbing | `value.feed(cmd args…)` / `cmd.feed(value)` | The one asylum the pipe error names for genuine byte plumbing. **IMPLEMENTED, including args/flags**: `["b","a","c"].feed(sort -r).out`, `data.feed(grep "foo").out`, `{a:1}.feed(jq ".a").out`. The inverted `cmd.feed(value)` form works too. Interpreter/`sh` blocks are also valid feed targets: `.feed(sh { sort -r })`, `.feed(jq { .a })`. |
 | `cmd1 && cmd2`, `cmd1 \|\| cmd2` | kept, unchanged | `&&`/`||` operate on `bool` or command **outcomes** (success = true), short-circuiting, returning the deciding operand *verbatim* — not force-cast to `bool` (**corpus** `outcome.toml:outcome-and-chain-both-outcomes`, `outcome-and-bool-then-outcome`; CMD-mode chaining needs `^` when the head is a reserved word: **corpus** `operators.toml:op-cmd-and-and-runs-both-on-success`, `^true && ^true`). |
 | `cmd &` (background) | `cmd &` (kept) | Desugars to `spawn { cmd }`, prints a task handle (TDD §1.3). `shoal_cancel` exists **(P1, §0.7)** to stop a task once you have its ref, but confirm `shoal_exec` actually exposes a `background`/`timeout_ms` param before assuming you can create one through this plugin at all (§4 rule 16). |
 | `for f in *.txt; do ...; done` | `for f in glob("*.txt") { ... }` or `glob("*.txt").each(f => ...)` | `for` binds a pattern over any iterable (EBNF `"for" pattern "in" expr block`); basic range form is **(corpus** `closures.toml:for-loop-break-stops-early`, `core.toml:for-range-sum`**)**. |
@@ -803,15 +803,14 @@ run a one-line probe rather than trusting a stale banner.
   `docs/TDD.md` §7 and `docs/AGENT-SURFACE.md` §5 both name them; the kernel's `dispatch` has no case
   for either — calling them 404s with `-32601`.
 - **~~`.feed` and interpreter blocks~~ — NOW IMPLEMENTED (this card's original banner was stale).**
-  Verified working against the current binary: `["b","a","c"].feed(sort).out` (feed a value's bytes to
-  a bare command); interpreter blocks `python { print(6*7) }.out`, `jq { .a }`, `sh { sort -r }`, and
-  feeding into them — `{a:1,b:2}.feed(jq { .a }).out` → `1`, `list.feed(sh { sort -r }).out`. An
-  interpreter block's stdout **auto-parses to a structured value** on `.out`
-  (`python { import json; print(json.dumps({"n":42})) }.out` → the record `{n: 42}`). **One remaining
-  gap**: the *bare* `.feed(cmd args)` spelling with arguments/flags doesn't parse yet — write
-  `.feed(sh { cmd args })` or `.feed(jq { … })` / `.feed(python { … })` instead (feeding to a command
-  that needs args always goes through a block form today). Heredocs stay gone; this is their
-  replacement, and it works.
+  Verified working against the current binary: `["b","a","c"].feed(sort).out`, and **commands with
+  args/flags parse bare** — `["b","a","c"].feed(sort -r).out`, `data.feed(grep "foo").out`,
+  `{a:1}.feed(jq ".a").out` (the argument parses in CMD mode when it starts with a command head; the
+  inverted `cmd.feed(value)` form still parses its arg as a value). Interpreter blocks
+  `python { print(6*7) }.out`, `jq { .a }`, `sh { sort -r }` work as feed targets too —
+  `{a:1,b:2}.feed(jq { .a }).out` → `1`. An interpreter block's stdout **auto-parses to a structured
+  value** on `.out` (`python { import json; print(json.dumps({"n":42})) }.out` → the record `{n: 42}`).
+  Heredocs stay gone; this is their replacement, and it works.
 - **Reactive streams — SUBSTANTIALLY IMPLEMENTED (card's original "pending" banner was stale).**
   Verified working: `channel(name)` with `.emit(v)`/`.events()`/`.latest()`; `every(dur)`; stream
   pipelines `every(10ms).take(3).collect()` → 3, `.map`, `.scan(init, f)`; and the `stream_unbounded`

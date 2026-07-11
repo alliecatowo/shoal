@@ -31,23 +31,35 @@ name = "iofeed2-record-feeds-as-compact-json-and-reparses"
 src = "{n: 5}.feed(cat).out"
 value = "{n: 5}"
 
-# `.feed(cmd args)` with a bare arg-bearing command doesn't parse as a command
-# (feed is bidirectional, so the arg is ambiguous value-vs-command); the error
-# points at the unambiguous block form. Feeding a bare no-arg command, or any
-# block form, works. See crates/shoal-eval/src/expr_access.rs::eval_feed.
+# `.feed(cmd args…)` parses its argument in CMD mode when it starts with a
+# command head (IO.md §1.1), so a command with flags/args works bare:
+# `.feed(sort -r)`, `.feed(jq ".a")`. A value-shaped argument (the inverted
+# `cmd.feed(value)` form) has no command head and stays an expression. Block
+# forms (`sh {…}`, `jq {…}`) also work. See
+# crates/shoal-syntax/src/parser/expr.rs (postfix `.feed` arm) and
+# crates/shoal-eval/src/expr_access.rs::eval_feed.
 
 [[case]]
-name = "feed-bare-command-no-args-works"
-src = '["b", "a", "c"].feed(sh { sort }).out.trim()'
+name = "feed-bare-command-no-args"
+src = '["b", "a", "c"].feed(sort).out.trim()'
 value = '"a\nb\nc"'
 
 [[case]]
-name = "feed-block-form-with-args-works"
+name = "feed-bare-command-with-flag"
+src = '["b", "a", "c"].feed(sort -r).out.trim()'
+value = '"c\nb\na"'
+
+[[case]]
+name = "feed-bare-command-with-quoted-arg"
+src = '"foo\nbar\nfoobar".feed(grep "foo").out.trim()'
+value = '"foo\nfoobar"'
+
+[[case]]
+name = "feed-block-form-with-args"
 src = '["b", "a", "c"].feed(sh { sort -r }).out.trim()'
 value = '"c\nb\na"'
 
 [[case]]
-name = "feed-arg-bearing-bare-command-errors-with-block-hint"
-src = '["b", "a", "c"].feed(sort - r)'
-error = "type_error"
-error_contains = "sh { cmd args }"
+name = "feed-inverted-cmd-dot-feed-value"
+src = 'sort.feed(["b", "a", "c"]).out.trim()'
+value = '"a\nb\nc"'

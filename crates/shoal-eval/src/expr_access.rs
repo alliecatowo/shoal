@@ -417,8 +417,8 @@ impl Evaluator {
                 expr_noun(other)
             ))
             .with_hint(
-                "for a command with arguments, wrap it in a block: \
-                 `.feed(sh { cmd args })` or `.feed(jq { … })` / `.feed(python { … })`",
+                "feed to a command name (with args if needed: `.feed(sort -r)`), \
+                 an `sh { … }` block, or an interpreter block (`.feed(jq { … })`)",
             )
             .with_span(span)),
         }

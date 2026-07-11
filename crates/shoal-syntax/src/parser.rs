@@ -370,6 +370,43 @@ mod tests {
         );
     }
     #[test]
+    fn feed_parses_arg_bearing_command_in_cmd_mode() {
+        // `.feed(sort -r)` — the argument is a command with a flag; it must
+        // parse as an `Expr::Cmd`, not misparse the `-r` under EXPR rules.
+        let p = parse(r#"["b","a"].feed(sort -r)"#).unwrap();
+        let Stmt::Expr {
+            expr: Expr::MethodCall { name, args, .. },
+            ..
+        } = &p.stmts[0]
+        else {
+            panic!("expected a method call, got {:?}", p.stmts[0]);
+        };
+        assert_eq!(name, "feed");
+        assert!(
+            matches!(args.pos.as_slice(), [Expr::Cmd { .. }]),
+            "feed arg should be a command node, got {:?}",
+            args.pos
+        );
+    }
+    #[test]
+    fn feed_value_argument_stays_an_expression() {
+        // The inverted `cmd.feed(value)` form: a value-shaped argument has no
+        // command head, so it stays an ordinary expression (here a list).
+        let p = parse(r#"sort.feed(["b","a"])"#).unwrap();
+        let Stmt::Expr {
+            expr: Expr::MethodCall { args, .. },
+            ..
+        } = &p.stmts[0]
+        else {
+            panic!("expected a method call, got {:?}", p.stmts[0]);
+        };
+        assert!(
+            matches!(args.pos.as_slice(), [Expr::List { .. }]),
+            "inverted feed arg should stay a list expr, got {:?}",
+            args.pos
+        );
+    }
+    #[test]
     fn records_lists_and_chain() {
         let p = parse("let xs = [{name: \"a\"}]\nxs.where(.name == \"a\")").unwrap();
         match &p.stmts[1] {
