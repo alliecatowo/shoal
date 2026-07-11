@@ -86,6 +86,37 @@ impl Evaluator {
                     format!("glob has no field `{name}`"),
                 )),
             },
+            // A path's zero-arg component/attribute accessors double as fields so
+            // the `.field` shorthand in implicit lambdas reaches them —
+            // `glob("*.rs").map(.name)`, `ls.where(.size > 1mb)`. Pure components
+            // resolve without IO; the fs-backed attributes route through the `Fs`
+            // port via `path_fs_method` (docs/CONTRACTS.md §3). Argument-taking
+            // methods (`.join`/`.abs`/`.save`) stay method-only.
+            Value::Path(p) => {
+                let component =
+                    |part: Option<&std::ffi::OsStr>| match part {
+                        Some(s) => Value::Str(s.to_string_lossy().into_owned()),
+                        None => Value::Null,
+                    };
+                match name {
+                    "name" => Ok(component(p.file_name())),
+                    "stem" => Ok(component(p.file_stem())),
+                    "ext" => Ok(component(p.extension())),
+                    "parent" => Ok(match p.parent() {
+                        Some(par) if !par.as_os_str().is_empty() => {
+                            Value::Path(par.to_path_buf())
+                        }
+                        _ => Value::Null,
+                    }),
+                    "exists" | "is_dir" | "is_file" | "size" | "modified" => {
+                        self.path_fs_method(&p, name)
+                    }
+                    _ => Err(ErrorVal::new(
+                        "field_missing",
+                        format!("path has no field `{name}`"),
+                    )),
+                }
+            }
             _ => Err(ErrorVal::new(
                 "field_missing",
                 format!("{} has no field `{name}`", v.type_name()),

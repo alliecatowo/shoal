@@ -204,8 +204,14 @@ pub(crate) fn uniq(v: Value) -> VResult<Value> {
     Ok(Value::List(out))
 }
 pub(crate) fn sum(v: Value) -> VResult<Value> {
-    let mut a = Value::Int(0);
-    for x in seq(v)? {
+    // Accumulate from the first element (not Int(0)) so a homogeneous list of a
+    // non-int numeric type sums in that type: list<size> -> size, list<duration>
+    // -> duration, list<float> -> float. An empty list is still Int(0).
+    let mut it = seq(v)?.into_iter();
+    let Some(mut a) = it.next() else {
+        return Ok(Value::Int(0));
+    };
+    for x in it {
         a = crate::ops::binop(shoal_ast::BinOp::Add, &a, &x)?;
     }
     Ok(a)

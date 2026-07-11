@@ -1,0 +1,94 @@
+# Path component/attribute accessors are reachable as FIELDS, not just methods,
+# so the `.field` shorthand inside implicit lambdas resolves them:
+# `glob("*.rs").map(.name)`, `ls.where(.size > 1mb)`. Pure components
+# (`.name`/`.stem`/`.ext`/`.parent`) resolve without IO; the fs-backed
+# attributes (`.exists`/`.is_dir`/`.is_file`/`.size`/`.modified`) route through
+# the `Fs` port. See docs/CONTRACTS.md §3 and crates/shoal-eval/src/
+# expr_access.rs::field. Companion: `.sum()` accumulates a `list<size>` by
+# folding from the first element, so sizes stay sizes (no int-vs-size mismatch).
+
+[[case]]
+name = "path-field-name"
+fixture = ["a.toml"]
+src = 'path("a.toml").name'
+value = '"a.toml"'
+
+[[case]]
+name = "path-field-stem"
+fixture = ["a.toml"]
+src = 'path("a.toml").stem'
+value = '"a"'
+
+[[case]]
+name = "path-field-ext"
+fixture = ["a.toml"]
+src = 'path("a.toml").ext'
+value = '"toml"'
+
+[[case]]
+name = "path-field-ext-absent-is-null"
+src = 'path("README").ext'
+value = "null"
+
+[[case]]
+name = "path-field-parent-nested"
+src = 'path("sub/a.toml").parent.name'
+value = '"sub"'
+
+[[case]]
+name = "path-field-parent-of-bare-name-is-null"
+src = 'path("a.toml").parent'
+value = "null"
+
+[[case]]
+name = "map-name-shorthand-over-glob"
+fixture = ["a.toml", "b.toml"]
+src = 'glob("*.toml").map(.name)'
+value = '["a.toml", "b.toml"]'
+
+[[case]]
+name = "map-stem-shorthand-over-glob"
+fixture = ["a.toml", "b.toml"]
+src = 'glob("*.toml").map(.stem)'
+value = '["a", "b"]'
+
+[[case]]
+name = "path-field-exists-true"
+fixture = ["a.toml"]
+src = 'path("a.toml").exists'
+value = "true"
+
+[[case]]
+name = "path-field-exists-false"
+src = 'path("nope.toml").exists'
+value = "false"
+
+[[case]]
+name = "path-field-is-file"
+fixture = ["a.toml"]
+src = 'path("a.toml").is_file'
+value = "true"
+
+[[case]]
+name = "path-field-is-dir"
+fixture = ["d/"]
+src = 'path("d").is_dir'
+value = "true"
+
+[[case]]
+name = "map-size-then-sum-stays-size"
+src = '''
+"hello".save("a.txt")
+"hi".save("b.txt")
+glob("*.txt").map(.size).sum()
+'''
+value = "7b"
+
+[[case]]
+name = "where-size-predicate-uses-path-field"
+src = '''
+"hello".save("a.txt")
+"".save("b.txt")
+glob("*.txt").where(.size > 0b).map(.name)
+'''
+value = '["a.txt"]'

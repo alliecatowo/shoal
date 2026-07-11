@@ -100,11 +100,17 @@ fn load_cases(dir: &Path) -> Vec<Case> {
     out
 }
 
-/// Materialize `fixture` entries (empty files; parent dirs auto-created)
-/// under `root`, per CONTRACTS §5.
+/// Materialize `fixture` entries under `root`, per CONTRACTS §5. A trailing
+/// slash (`"d/"`) makes a directory; anything else is an empty file. Parent
+/// dirs are auto-created. This mirrors the shoal-eval conformance harness so
+/// both runners interpret the same corpus identically.
 fn write_fixtures(root: &Path, fixture: &[String]) -> Result<(), String> {
     for rel in fixture {
         let p = root.join(rel);
+        if rel.ends_with('/') {
+            fs::create_dir_all(&p).map_err(|e| format!("fixture mkdir {rel:?}: {e}"))?;
+            continue;
+        }
         if let Some(parent) = p.parent() {
             fs::create_dir_all(parent).map_err(|e| format!("fixture mkdir for {rel:?}: {e}"))?;
         }
