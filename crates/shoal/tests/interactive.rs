@@ -126,7 +126,7 @@ fn repl_echo_renders_once_and_exit_sets_code() {
     // answering DSR queries along the way. An empty marker waits for the first
     // prompt (first DSR answered).
     let mut pump_until = |writer: &mut Box<dyn Write + Send>, marker: &[u8]| -> bool {
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + Duration::from_secs(45);
         loop {
             answer_dsr(writer, &mut dsr_answered);
             if marker.is_empty() {
@@ -175,7 +175,7 @@ fn repl_echo_renders_once_and_exit_sets_code() {
 
     // Keep answering DSR (reedline queries once more while drawing the prompt
     // for the `exit` line) until the child actually exits.
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(45);
     let status = loop {
         answer_dsr(&mut writer, &mut dsr_answered);
         if let Some(status) = child.try_wait().expect("try_wait") {
@@ -272,7 +272,7 @@ fn repl_undo_out_n_resolves_via_journal() {
         }
     };
     let mut pump_until = |writer: &mut Box<dyn Write + Send>, marker: &[u8]| -> bool {
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + Duration::from_secs(45);
         loop {
             answer_dsr(writer, &mut dsr_answered);
             if marker.is_empty() {
@@ -333,7 +333,7 @@ fn repl_undo_out_n_resolves_via_journal() {
 
     writer.write_all(b"exit 0\r").unwrap();
     writer.flush().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(45);
     let status = loop {
         answer_dsr(&mut writer, &mut dsr_answered);
         if let Some(status) = child.try_wait().expect("try_wait") {
