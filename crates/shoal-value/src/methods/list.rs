@@ -144,6 +144,17 @@ pub(crate) fn each(ctx: &mut dyn CallCtx, v: Value, f: &Value) -> VResult<Value>
     }
     Ok(Value::Null)
 }
+/// `.reduce(init, f)` — left fold: thread `acc` through `f(acc, x)` for each
+/// element, starting from `init`, returning the final accumulator (STREAMS.md
+/// §5 names it as the collection-only terminal op that `.scan` streams). The
+/// general escape hatch when no named aggregation (`.sum`/`.min`/…) fits.
+pub(crate) fn reduce(ctx: &mut dyn CallCtx, v: Value, init: Value, f: &Value) -> VResult<Value> {
+    let mut acc = init;
+    for x in seq(v)? {
+        acc = ctx.call_closure(f, vec![acc, x])?;
+    }
+    Ok(acc)
+}
 pub(crate) fn any_all(ctx: &mut dyn CallCtx, v: Value, f: &Value, any: bool) -> VResult<Value> {
     for x in seq(v)? {
         let b = ctx.call_closure(f, vec![x])?.as_condition()?;

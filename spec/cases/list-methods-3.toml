@@ -54,3 +54,32 @@ value = "3"
 name = "list3-get-negative-index-out-of-range-is-default"
 src = "[1, 2, 3].get(-9, 99)"
 value = "99"
+
+# `.reduce(init, f)` / `.fold` — left fold, the general aggregation escape
+# hatch (STREAMS.md §5 names it as the collection terminal op `.scan` streams).
+# See crates/shoal-value/src/methods/list.rs::reduce.
+
+[[case]]
+name = "lm3-reduce-sums-from-init"
+src = '[1, 2, 3, 4].reduce(0, (a, x) => a + x)'
+value = "10"
+
+[[case]]
+name = "lm3-fold-is-a-reduce-alias"
+src = '["a", "b", "c"].fold("", (a, x) => a + x)'
+value = '"abc"'
+
+[[case]]
+name = "lm3-reduce-empty-returns-init"
+src = '[].reduce(42, (a, x) => a + x)'
+value = "42"
+
+[[case]]
+name = "lm3-reduce-over-record-field"
+src = '[{v: 10}, {v: 20}, {v: 5}].reduce(0, (a, r) => a + r.v)'
+value = "35"
+
+[[case]]
+name = "lm3-reduce-custom-max"
+src = '[3, 7, 2, 9, 1].reduce(0, (a, x) => if x > a { x } else { a })'
+value = "9"

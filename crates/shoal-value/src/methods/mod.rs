@@ -92,6 +92,7 @@ fn dispatch(ctx: &mut dyn CallCtx, recv: Value, name: &str, args: CallArgs) -> V
         "stream" => no_args(&args).and_then(|_| list::to_stream(recv)),
         "tee" => list::tee(recv, int_arg(&args, 0, 2)?),
         "map" => list::map(ctx, recv, arg(&args, 0)?),
+        "reduce" | "fold" => list::reduce(ctx, recv, arg(&args, 0)?.clone(), arg(&args, 1)?),
         "where" | "filter" => list::filter(ctx, recv, arg(&args, 0)?),
         "each" => list::each(ctx, recv, arg(&args, 0)?),
         "any" => list::any_all(ctx, recv, arg(&args, 0)?, true),
