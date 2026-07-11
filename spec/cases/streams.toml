@@ -1,0 +1,218 @@
+# Reactive streams + in-language channels (docs/STREAMS.md, ROADMAP Wave R1).
+#
+# ONLY host-safe, deterministic cases live here: the timing sources
+# (`watch`/`tail`/`every`) and the concurrent `channel().take`/`on(...)`
+# machinery are non-deterministic and are unit-tested in `shoal-eval`
+# (`crates/shoal-eval/tests/streams.rs`) instead. Every case below uses
+# `.stream()` (a finite in-memory stream) or a fully-populated channel ring,
+# so the combinators (STREAMS §3) and sinks (§4) run to a fixed value.
+
+# --- combinators (STREAMS §3), driven by the `.collect()` sink -------------
+
+[[case]]
+name = "stream-where-map"
+src = '[1, 2, 3, 4, 5, 6].stream().where(x => x % 2 == 0).map(x => x * 10).collect()'
+value = "[20, 40, 60]"
+
+[[case]]
+name = "stream-map-only"
+src = '[1, 2, 3].stream().map(x => x + 1).collect()'
+value = "[2, 3, 4]"
+
+[[case]]
+name = "stream-scan-running-sum"
+src = '[1, 2, 3, 4].stream().scan(0, (a, x) => a + x).collect()'
+value = "[1, 3, 6, 10]"
+
+[[case]]
+name = "stream-take"
+src = '[1, 2, 3, 4, 5].stream().take(3).collect()'
+value = "[1, 2, 3]"
+
+[[case]]
+name = "stream-take-until-pred"
+src = '[1, 2, 3, 4, 5].stream().take_until(x => x == 4).collect()'
+value = "[1, 2, 3]"
+
+[[case]]
+name = "stream-window-count"
+src = '[1, 2, 3, 4].stream().window(2).collect()'
+value = "[[1, 2], [2, 3], [3, 4]]"
+
+[[case]]
+name = "stream-dedupe"
+src = '[1, 1, 2, 2, 2, 3, 1].stream().dedupe().collect()'
+value = "[1, 2, 3, 1]"
+
+[[case]]
+name = "stream-distinct"
+src = '[1, 1, 2, 2, 2, 3, 1].stream().distinct().collect()'
+value = "[1, 2, 3]"
+
+[[case]]
+name = "stream-flat-map-lists"
+src = '[1, 2, 3].stream().flat_map(x => [x, x * 10]).collect()'
+value = "[1, 10, 2, 20, 3, 30]"
+
+[[case]]
+name = "stream-flat-map-substreams"
+src = '[1, 2].stream().flat_map(x => [x].stream()).collect()'
+value = "[1, 2]"
+
+[[case]]
+name = "stream-enumerate"
+src = '["a", "b", "c"].stream().enumerate().collect()'
+value = '[[0, "a"], [1, "b"], [2, "c"]]'
+
+[[case]]
+name = "stream-buffer-identity"
+src = '[1, 2, 3].stream().buffer(2).collect()'
+value = "[1, 2, 3]"
+
+[[case]]
+name = "stream-zip"
+src = '[1, 2, 3].stream().zip([10, 20].stream()).collect()'
+value = "[[1, 10], [2, 20]]"
+
+[[case]]
+name = "stream-merge-sum"
+src = '[1, 2].stream().merge([3, 4].stream()).sum()'
+value = "10"
+
+[[case]]
+name = "stream-throttle-finite-first"
+src = '[1, 2, 3].stream().throttle(1s).collect()'
+value = "[1]"
+
+[[case]]
+name = "stream-debounce-finite-last"
+src = '[1, 2, 3].stream().debounce(1ms).collect()'
+value = "[3]"
+
+# --- sources: `.stream()` promotion ---------------------------------------
+
+[[case]]
+name = "stream-from-range"
+src = '(1..5).stream().map(x => x * x).collect()'
+value = "[1, 4, 9, 16]"
+
+[[case]]
+name = "stream-from-string-lines"
+src = '"error: a\ninfo: b\nerror: c".stream().where(l => l.starts_with("error")).collect()'
+value = '["error: a", "error: c"]'
+
+# --- collection sinks fall through on a finite stream ---------------------
+
+[[case]]
+name = "stream-sum-sink"
+src = '[1, 2, 3, 4].stream().sum()'
+value = "10"
+
+[[case]]
+name = "stream-first-sink"
+src = '[5, 6, 7].stream().first()'
+value = "5"
+
+[[case]]
+name = "stream-len-sink"
+src = '[1, 2, 3, 4, 5].stream().take(3).len()'
+value = "3"
+
+[[case]]
+name = "stream-sort-sink"
+src = '[3, 1, 2].stream().sort()'
+value = "[1, 2, 3]"
+
+# --- single-consumption + boundedness discipline (STREAMS §1, §4) ---------
+
+[[case]]
+name = "stream-single-consumption"
+src = '''
+let s = [1, 2, 3].stream()
+s.collect()
+s.collect()
+'''
+error = "stream_consumed"
+
+[[case]]
+name = "stream-collect-unbounded-errors"
+src = 'channel("x").events().collect()'
+error = "stream_unbounded"
+
+# --- in-language channels (STREAMS §2.5, §7): emit / latest / events ------
+
+[[case]]
+name = "channel-emit-latest"
+src = '''
+channel("build").emit(1)
+channel("build").emit(2)
+channel("build").latest()
+'''
+value = "2"
+
+[[case]]
+name = "channel-latest-empty-is-null"
+src = 'channel("nope").latest()'
+value = "null"
+
+[[case]]
+name = "channel-events-replay-payloads"
+src = '''
+channel("z").emit("a")
+channel("z").emit("b")
+channel("z").events().map(ev => ev.payload).take(2).collect()
+'''
+value = '["a", "b"]'
+
+[[case]]
+name = "channel-events-since-cursor"
+src = '''
+channel("c").emit(10)
+channel("c").emit(20)
+channel("c").emit(30)
+channel("c").events(since: 0).map(ev => ev.payload).take(2).collect()
+'''
+value = "[20, 30]"
+
+[[case]]
+name = "channel-event-record-shape"
+src = '''
+channel("q").emit(42)
+channel("q").events().take(1).map(ev => ev.payload).first()
+'''
+value = "42"
+
+[[case]]
+name = "channel-event-seq-monotonic"
+src = '''
+channel("s").emit("x")
+channel("s").emit("y")
+channel("s").events().take(2).map(ev => ev.seq).collect()
+'''
+value = "[0, 1]"
+
+# --- stream → channel sinks (STREAMS §4): `.each`, `.into` -----------------
+
+[[case]]
+name = "stream-each-emits"
+src = '''
+[1, 2, 3].stream().each(x => channel("acc").emit(x))
+channel("acc").latest()
+'''
+value = "3"
+
+[[case]]
+name = "stream-into-channel"
+src = '''
+[7, 8, 9].stream().into(channel("mirror"))
+channel("mirror").latest()
+'''
+value = "9"
+
+[[case]]
+name = "stream-into-then-events"
+src = '''
+[1, 2].stream().into(channel("m"))
+channel("m").events().map(ev => ev.payload).take(2).collect()
+'''
+value = "[1, 2]"

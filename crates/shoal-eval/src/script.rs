@@ -68,12 +68,14 @@ impl Evaluator {
         let cwd = self.cwd.clone();
         let penv = self.process_env.clone();
         let adapters = self.adapters.clone();
+        let bus = self.bus();
         std::thread::spawn(move || {
             let mut ev = Evaluator::new(cwd);
             ev.env = env;
             ev.process_env = penv;
             ev.adapters = adapters;
             ev.cancel = child_cancel;
+            ev.set_bus(bus);
             worker.finish(ev.block_value(&body));
         });
         self.jobs.push(task.clone());
@@ -135,6 +137,7 @@ impl Evaluator {
                 child.env = self.env.clone();
                 child.process_env = self.process_env.clone();
                 child.adapters = self.adapters.clone();
+                child.set_bus(self.bus());
                 child.env.declare("args", Value::List(args), false);
                 child.eval_program(&program)
             }

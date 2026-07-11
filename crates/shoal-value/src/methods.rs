@@ -1,7 +1,10 @@
 //! Value-method standard library. Methods are deliberately pure except the
 //! explicit filesystem sinks (`save` and `append`).
 
-use crate::{CallArgs, CallCtx, ErrorVal, Record, StreamVal, VResult, Value, value_to_json};
+use crate::{
+    CallArgs, CallCtx, ErrorVal, Record, StreamVal, VResult, Value, collect_stream, drive_stream,
+    value_to_json,
+};
 use shoal_ast::Span;
 use std::cmp::Ordering;
 use std::fs::OpenOptions;
@@ -33,6 +36,14 @@ fn dispatch(ctx: &mut dyn CallCtx, recv: Value, name: &str, args: CallArgs) -> V
             }
         }
     }
+    // Streams (docs/STREAMS.md) get their own method surface: the lazy
+    // combinators (§3) return a NEW stream without driving the source, and the
+    // sinks (§4) drive it (with `ctx` for closure stages). Anything else falls
+    // through to the collection methods by materializing a *bounded* stream to a
+    // list first (an unbounded stream errors `stream_unbounded`).
+    if let Value::Stream(s) = recv {
+        return stream_method(ctx, s, name, args);
+    }
     match name {
         // `.feed(cmd)` (IO.md §1) spawns a child, which a pure value method
         // cannot do — the evaluator intercepts `.feed` in its method-call path
@@ -50,6 +61,11 @@ fn dispatch(ctx: &mut dyn CallCtx, recv: Value, name: &str, args: CallArgs) -> V
         "first" => first_last(recv, &args, true),
         "last" => first_last(recv, &args, false),
         "collect" => collect(recv),
+        // `.stream()` promotes a finite collection (or a string's lines) into a
+        // lazy `stream<T>` so the stream combinators (STREAMS §3) can be exercised
+        // on deterministic, in-memory data — the honest finite counterpart of the
+        // live `watch`/`tail`/`every` sources.
+        "stream" => no_args(&args).and_then(|_| to_stream(recv)),
         "tee" => tee(recv, int_arg(&args, 0, 2)?),
         "map" => map(ctx, recv, arg(&args, 0)?),
         "where" | "filter" => filter(ctx, recv, arg(&args, 0)?),
@@ -146,6 +162,131 @@ fn dispatch(ctx: &mut dyn CallCtx, recv: Value, name: &str, args: CallArgs) -> V
     }
 }
 
+/// Method dispatch for `stream<T>` (STREAMS §3–§4). Lazy combinators return a
+/// fresh stream (consuming `s`, TDD §1.9); sinks drive it. `.into` / `.render` /
+/// `.feed` are handled one level up in the evaluator (they need the event bus,
+/// the statement sink, or a child process) and never reach here.
+fn stream_method(
+    ctx: &mut dyn CallCtx,
+    s: StreamVal,
+    name: &str,
+    args: CallArgs,
+) -> VResult<Value> {
+    let stream = Value::Stream;
+    match name {
+        // --- lazy combinators (return a new stream) ---
+        "map" => s.map(arg(&args, 0)?.clone()).map(stream),
+        "where" | "filter" => s.filter(arg(&args, 0)?.clone()).map(stream),
+        "scan" => s
+            .scan(arg(&args, 0)?.clone(), arg(&args, 1)?.clone())
+            .map(stream),
+        "flat_map" => s.flat_map(arg(&args, 0)?.clone()).map(stream),
+        "take" => s.take_n(int_arg(&args, 0, 0)?).map(stream),
+        "take_until" => match arg(&args, 0)? {
+            Value::Stream(o) => s.take_until_stream(o.clone()).map(stream),
+            f => s.take_until_pred(f.clone()).map(stream),
+        },
+        "dedupe" => no_args(&args).and_then(|_| s.dedupe()).map(stream),
+        "distinct" => no_args(&args).and_then(|_| s.distinct()).map(stream),
+        "debounce" => s.debounce(dur_arg(&args, 0)?).map(stream),
+        "throttle" => s.throttle(dur_arg(&args, 0)?).map(stream),
+        "window" => match arg(&args, 0)? {
+            Value::Duration(ns) if *ns >= 0 => s
+                .window_dur(std::time::Duration::from_nanos(*ns as u64))
+                .map(stream),
+            Value::Int(n) if *n > 0 => s.window_count(*n as usize).map(stream),
+            _ => Err(ErrorVal::arg_error(
+                "window expects a positive count or a duration",
+            )),
+        },
+        "buffer" => s.buffer(int_arg(&args, 0, 1)?).map(stream),
+        "enumerate" => no_args(&args).and_then(|_| s.enumerate()).map(stream),
+        "merge" => match arg(&args, 0)? {
+            Value::Stream(o) => s.merge(o.clone()).map(stream),
+            v => Err(ErrorVal::type_error(format!(
+                "merge expects a stream, found {}",
+                v.type_name()
+            ))),
+        },
+        "zip" => match arg(&args, 0)? {
+            Value::Stream(o) => s.zip(o.clone()).map(stream),
+            v => Err(ErrorVal::type_error(format!(
+                "zip expects a stream, found {}",
+                v.type_name()
+            ))),
+        },
+        // --- sinks (drive the stream) ---
+        "each" => {
+            let f = arg(&args, 0)?.clone();
+            let mut up = s.take_upstream()?;
+            drive_stream(ctx, &mut *up, |ctx, v| {
+                ctx.call_closure(&f, vec![v])?;
+                Ok(())
+            })?;
+            Ok(Value::Null)
+        }
+        "collect" => no_args(&args).and_then(|_| collect_stream(ctx, &s).map(Value::List)),
+        "save" | "append" => stream_save(ctx, s, arg(&args, 0)?),
+        // Everything else (`.sort`, `.sum`, `.uniq`, `.first`, `.len`, `.tee`, …)
+        // is a collection op: materialize the *bounded* stream, then dispatch.
+        _ => {
+            let list = Value::List(collect_stream(ctx, &s)?);
+            dispatch(ctx, list, name, args)
+        }
+    }
+}
+
+/// `.save(path)` / `.append(path)` on a stream (STREAMS §4): append each item as
+/// it arrives (live logging) rather than buffering the whole stream first.
+fn stream_save(ctx: &mut dyn CallCtx, s: StreamVal, path: &Value) -> VResult<Value> {
+    let p = match path {
+        Value::Path(p) => p.clone(),
+        Value::Str(s) => PathBuf::from(s),
+        v => {
+            return Err(ErrorVal::type_error(format!(
+                "expected path, found {}",
+                v.type_name()
+            )));
+        }
+    };
+    let p = if p.is_absolute() {
+        p
+    } else {
+        ctx.cwd().join(p)
+    };
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&p)
+        .map_err(|e| ErrorVal::new("custom", format!("{}: {e}", p.display())))?;
+    let mut up = s.take_upstream()?;
+    drive_stream(ctx, &mut *up, |_ctx, v| {
+        let mut bytes = value_line_bytes(&v)?;
+        bytes.push(b'\n');
+        file.write_all(&bytes)
+            .map_err(|e| ErrorVal::new("custom", format!("{}: {e}", p.display())))
+    })?;
+    Ok(Value::Path(p))
+}
+
+/// One stream item rendered to its on-disk line form (str/bytes verbatim, other
+/// values as JSON — matching `.save`'s serialization).
+fn value_line_bytes(v: &Value) -> VResult<Vec<u8>> {
+    Ok(match v {
+        Value::Str(s) => s.as_bytes().to_vec(),
+        Value::Bytes(b) => (**b).clone(),
+        _ => serde_json::to_vec(&value_to_json(v))
+            .map_err(|e| ErrorVal::new("custom", e.to_string()))?,
+    })
+}
+
+fn dur_arg(args: &CallArgs, n: usize) -> VResult<std::time::Duration> {
+    match args.pos.get(n) {
+        Some(Value::Duration(ns)) if *ns >= 0 => Ok(std::time::Duration::from_nanos(*ns as u64)),
+        _ => Err(ErrorVal::arg_error("expected a non-negative duration")),
+    }
+}
+
 fn arg(args: &CallArgs, n: usize) -> VResult<&Value> {
     args.pos
         .get(n)
@@ -183,7 +324,14 @@ fn seq(v: Value) -> VResult<Vec<Value>> {
         Value::List(x) => Ok(x),
         Value::Table(x) => Ok(x.into_iter().map(Value::Record).collect()),
         Value::Range(r) => Ok(r.iter().map(Value::Int).collect()),
-        Value::Stream(s) => s.take()?.collect(),
+        // Streams are intercepted at the top of `dispatch` and driven with `ctx`;
+        // a stream nested inside another collection is materialized by the
+        // stream sink path, not here — reaching this arm means a raw stream was
+        // handed to a pure, ctx-less op, which cannot drive it.
+        Value::Stream(_) => Err(ErrorVal::new(
+            "stream_consumed",
+            "a stream must be collected with `.collect()` before this operation",
+        )),
         v => Err(ErrorVal::type_error(format!(
             "expected collection, found {}",
             v.type_name()
@@ -198,7 +346,6 @@ fn len(v: Value) -> VResult<Value> {
         Value::Table(x) => x.len(),
         Value::Record(x) => x.len(),
         Value::Range(r) => r.len(),
-        Value::Stream(s) => s.take()?.collect::<VResult<Vec<_>>>()?.len(),
         v => {
             return Err(ErrorVal::type_error(format!(
                 ".len unsupported on {}",
@@ -231,7 +378,6 @@ fn first_last(v: Value, args: &CallArgs, first: bool) -> VResult<Value> {
 }
 fn collect(v: Value) -> VResult<Value> {
     match v {
-        Value::Stream(s) => Ok(Value::List(s.take()?.collect::<VResult<_>>()?)),
         Value::Range(r) => Ok(Value::List(r.iter().map(Value::Int).collect())),
         x @ Value::List(_) | x @ Value::Table(_) => Ok(x),
         v => Err(ErrorVal::type_error(format!(
@@ -240,6 +386,31 @@ fn collect(v: Value) -> VResult<Value> {
         ))),
     }
 }
+/// `.stream()` — promote a finite value into a `stream<T>`. Collections stream
+/// their elements; a string streams its lines; bytes stream their UTF-8 lines.
+fn to_stream(v: Value) -> VResult<Value> {
+    let items: Vec<Value> = match v {
+        Value::List(x) => x,
+        Value::Table(x) => x.into_iter().map(Value::Record).collect(),
+        Value::Range(r) => r.iter().map(Value::Int).collect(),
+        Value::Str(s) => s.lines().map(|l| Value::Str(l.to_string())).collect(),
+        Value::Bytes(b) => String::from_utf8_lossy(&b)
+            .lines()
+            .map(|l| Value::Str(l.to_string()))
+            .collect(),
+        v => {
+            return Err(ErrorVal::type_error(format!(
+                "cannot make a stream from {}",
+                v.type_name()
+            )));
+        }
+    };
+    Ok(Value::Stream(StreamVal::from_iter(
+        "value",
+        items.into_iter().map(Ok),
+    )))
+}
+
 fn tee(v: Value, n: usize) -> VResult<Value> {
     if n == 0 {
         return Err(ErrorVal::arg_error("tee count must be positive"));

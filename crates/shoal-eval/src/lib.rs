@@ -3,6 +3,7 @@
 mod args;
 mod builtins;
 mod call;
+mod channels;
 mod coerce;
 mod command;
 mod expr;
@@ -14,6 +15,7 @@ mod plan;
 mod reef;
 mod script;
 mod stmt;
+mod streams;
 
 pub(crate) use coerce::coerce_word;
 pub use reef::{PromptReefBinding, PromptReefSnapshot};
@@ -122,6 +124,10 @@ pub struct Evaluator {
     /// a default-permissive policy still resolves to `None` (no wrapping), so
     /// only a genuinely-scoped principal ever confines a child.
     leash: Option<(LeashPolicy, String)>,
+    /// The in-language `channel(name)` event bus (docs/STREAMS.md §2.5). Shared
+    /// (Arc) so spawned tasks / `on(...)` handlers publish and subscribe to the
+    /// same session-scoped channels — coordination is channels, never files.
+    bus: Arc<channels::EventBus>,
     /// Set by the `exit`/`quit` builtin (defect: no `exit`). `Some(code)` asks
     /// the host to stop: `eval_program` halts its statement loop, and the host
     /// (REPL loop / `-c` / script runner) ends cleanly with `code`. Kept as a
@@ -171,8 +177,21 @@ impl Evaluator {
             principal: "human".into(),
             current_entry: None,
             source: None,
+            bus: channels::EventBus::shared(),
             pending_exit: None,
         }
+    }
+
+    /// The session event bus (docs/STREAMS.md). Shared into spawned tasks so
+    /// in-language channels are visible across `spawn`/`on(...)`.
+    pub(crate) fn bus(&self) -> Arc<channels::EventBus> {
+        self.bus.clone()
+    }
+
+    /// Adopt a shared event bus (used when a child evaluator must see the parent
+    /// session's in-language channels — `spawn`, `on(...)`, script children).
+    pub(crate) fn set_bus(&mut self, bus: Arc<channels::EventBus>) {
+        self.bus = bus;
     }
 
     /// Consume any pending `exit`/`quit` request. `Some(code)` means the last

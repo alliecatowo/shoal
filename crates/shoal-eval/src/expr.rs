@@ -212,6 +212,24 @@ impl Evaluator {
                     // shoal-value → shoal-picker dependency cycle.
                     let a = self.eval_args(args)?;
                     self.pick(v, &a).map_err(|e| e.or_span(span))
+                } else if let Some(chan) = crate::channels::as_channel(&v)
+                    && matches!(name.as_str(), "emit" | "events" | "latest" | "take")
+                {
+                    // In-language `channel(name)` ops (docs/STREAMS.md §2.5, §7):
+                    // wired here (not methods.rs) because they reach the session
+                    // event bus, which shoal-value cannot see.
+                    let chan = chan.to_string();
+                    let a = self.eval_args(args)?;
+                    self.eval_channel_method(&chan, name, a)
+                        .map_err(|e| e.or_span(span))
+                } else if matches!(v, Value::Stream(_))
+                    && matches!(name.as_str(), "into" | "render")
+                {
+                    // Stream sinks that need the evaluator (the event bus for
+                    // `.into(channel)`, the statement sink for `.render()`).
+                    let a = self.eval_args(args)?;
+                    self.eval_stream_sink(v, name, a)
+                        .map_err(|e| e.or_span(span))
                 } else {
                     let args = self.eval_args(args)?;
                     shoal_value::methods::call_method(self, v, name, args, span)
@@ -222,6 +240,7 @@ impl Evaluator {
                 match name.as_str() {
                     "parallel" => return self.builtin_parallel(args),
                     "retry" => return self.builtin_retry(args),
+                    "on" => return self.builtin_on(args),
                     "run" => {
                         let mut a = self.eval_args(args)?;
                         if a.pos.is_empty() {
@@ -474,12 +493,15 @@ impl Evaluator {
             )),
         }
     }
-    pub(crate) fn values_from(&self, v: Value) -> VResult<Vec<Value>> {
+    pub(crate) fn values_from(&mut self, v: Value) -> VResult<Vec<Value>> {
         match v {
             Value::List(xs) => Ok(xs),
             Value::Table(rs) => Ok(rs.into_iter().map(Value::Record).collect()),
             Value::Range(r) => Ok(r.iter().map(Value::Int).collect()),
-            Value::Stream(s) => s.take()?.collect(),
+            // Iterating a stream in a `for` drives it to completion (STREAMS §4);
+            // an endless stream errors `stream_unbounded` — use `.each(f)` for
+            // those, or bound it with `.take`/`.take_until` first.
+            Value::Stream(s) => shoal_value::collect_stream(self, &s),
             _ => Err(ErrorVal::new("type_error", "value is not iterable")),
         }
     }

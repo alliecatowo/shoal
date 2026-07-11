@@ -144,6 +144,46 @@ impl Evaluator {
                     format!("regex expects str, found {}", v.type_name()),
                 )),
             },
+            // Stream sources + in-language channels (docs/STREAMS.md §2). All
+            // yield a lazy `stream<T>` (channels via `.events()`); `channel(name)`
+            // itself yields a handle whose `.emit/.events/.latest/.take` the
+            // evaluator intercepts.
+            "channel" => match one()? {
+                Value::Str(name) => Ok(Some(crate::channels::channel_handle(name))),
+                v => Err(ErrorVal::type_error(format!(
+                    "channel expects a str name, found {}",
+                    v.type_name()
+                ))),
+            },
+            "every" => match one()? {
+                Value::Duration(ns) if *ns >= 0 => Ok(Some(
+                    self.source_every(std::time::Duration::from_nanos(*ns as u64))?,
+                )),
+                v => Err(ErrorVal::type_error(format!(
+                    "every expects a duration, found {}",
+                    v.type_name()
+                ))),
+            },
+            "watch" => {
+                if args.pos.len() != 1 {
+                    return Err(ErrorVal::arg_error("watch expects one path or glob"));
+                }
+                let recursive = args
+                    .get_named("recursive")
+                    .map(|v| *v == Value::Bool(true))
+                    .unwrap_or(true);
+                Ok(Some(self.source_watch(&args.pos[0], recursive)?))
+            }
+            "tail" => {
+                if args.pos.len() != 1 {
+                    return Err(ErrorVal::arg_error("tail expects one file path"));
+                }
+                let from_start = args
+                    .get_named("from_start")
+                    .map(|v| *v == Value::Bool(true))
+                    .unwrap_or(false);
+                Ok(Some(self.source_tail(&args.pos[0], from_start)?))
+            }
             _ => Ok(None),
         }
     }

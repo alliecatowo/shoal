@@ -357,16 +357,92 @@ pub fn feed_bytes(v: &Value) -> Result<Vec<u8>, ErrorVal> {
     }
 }
 
-/// Single-consumption stream (TDD §1.9). Identity equality.
+/// The one substrate for time-varying data (docs/STREAMS.md). A `stream<T>` is a
+/// **lazy**, **single-consumption** (TDD §1.9), **pull-based** pipeline: a base
+/// source (`watch`/`tail`/`every`/`channel().events()`/a list) wrapped in zero or
+/// more lazy combinator stages (§3). No work happens — no closure runs, no OS
+/// resource opens — until a sink (§4) drives it. Identity equality.
+///
+/// Because closure-bearing stages (`.map`/`.where`/`.scan`/`.flat_map`) must call
+/// back into the evaluator, driving requires a [`CallCtx`]; the whole pipeline is
+/// therefore driven at the sink, which holds the ctx, rather than being a plain
+/// `Iterator`.
 #[derive(Clone)]
 pub struct StreamVal {
     pub label: String,
+    /// `false` for endless sources (`every`/`watch`/`tail`/a channel with no
+    /// `.take`/`.take_until` bound). `.collect()` on an unbounded stream errors
+    /// `stream_unbounded` (STREAMS §4) rather than looping forever.
+    bounded: bool,
     inner: Arc<Mutex<StreamState>>,
 }
 
 enum StreamState {
-    Ready(Box<dyn Iterator<Item = VResult<Value>> + Send>),
+    Ready(Box<dyn Upstream>),
     Consumed,
+}
+
+/// One pull from an upstream, honoring an optional deadline.
+pub enum Pull {
+    Item(Value),
+    /// The stream ended naturally.
+    End,
+    /// The deadline elapsed with no item (only ever produced by a live,
+    /// channel-backed source or a timing combinator; an in-memory source never
+    /// times out).
+    Timeout,
+}
+
+/// A pull-based source or combinator stage. Closure-bearing stages receive the
+/// evaluator through `ctx` at pull time.
+pub trait Upstream: Send {
+    fn pull(
+        &mut self,
+        ctx: &mut dyn CallCtx,
+        timeout: Option<std::time::Duration>,
+    ) -> VResult<Pull>;
+}
+
+/// Base source over an in-memory / lazy iterator (a list, range, `.tee` fork, or
+/// a command's already-captured lines). Never times out.
+struct IterSource(Box<dyn Iterator<Item = VResult<Value>> + Send>);
+impl Upstream for IterSource {
+    fn pull(
+        &mut self,
+        _ctx: &mut dyn CallCtx,
+        _timeout: Option<std::time::Duration>,
+    ) -> VResult<Pull> {
+        match self.0.next() {
+            Some(Ok(v)) => Ok(Pull::Item(v)),
+            Some(Err(e)) => Err(e),
+            None => Ok(Pull::End),
+        }
+    }
+}
+
+/// Base source over a live channel fed by a background producer (`every`'s timer,
+/// `watch`/`tail`'s notify thread, a `channel().events()` subscription). Supports
+/// timed reads so timing combinators (`debounce`/`throttle`) work.
+struct ChanSource(std::sync::mpsc::Receiver<VResult<Value>>);
+impl Upstream for ChanSource {
+    fn pull(
+        &mut self,
+        _ctx: &mut dyn CallCtx,
+        timeout: Option<std::time::Duration>,
+    ) -> VResult<Pull> {
+        use std::sync::mpsc::RecvTimeoutError;
+        match timeout {
+            None => match self.0.recv() {
+                Ok(r) => r.map(Pull::Item),
+                Err(_) => Ok(Pull::End),
+            },
+            Some(d) => match self.0.recv_timeout(d) {
+                Ok(r) => r.map(Pull::Item),
+                Err(RecvTimeoutError::Timeout) => Ok(Pull::Timeout),
+                Err(RecvTimeoutError::Disconnected) => Ok(Pull::End),
+            },
+        }
+    }
 }
 
 impl std::fmt::Debug for StreamVal {
@@ -376,21 +452,44 @@ impl std::fmt::Debug for StreamVal {
 }
 
 impl StreamVal {
+    /// Build a stream from an in-memory / lazy iterator (a bounded source).
     pub fn from_iter<I>(label: impl Into<String>, iter: I) -> StreamVal
     where
         I: Iterator<Item = VResult<Value>> + Send + 'static,
     {
+        StreamVal::from_source(label, true, Box::new(IterSource(Box::new(iter))))
+    }
+
+    /// Build a stream from a live channel fed by a background producer. Unbounded
+    /// by default (an endless source) — bound it with `.take`/`.take_until` before
+    /// `.collect()`.
+    pub fn from_channel(
+        label: impl Into<String>,
+        rx: std::sync::mpsc::Receiver<VResult<Value>>,
+    ) -> StreamVal {
+        StreamVal::from_source(label, false, Box::new(ChanSource(rx)))
+    }
+
+    fn from_source(label: impl Into<String>, bounded: bool, up: Box<dyn Upstream>) -> StreamVal {
         StreamVal {
             label: label.into(),
-            inner: Arc::new(Mutex::new(StreamState::Ready(Box::new(iter)))),
+            bounded,
+            inner: Arc::new(Mutex::new(StreamState::Ready(up))),
         }
     }
 
-    /// Take the underlying iterator; second call is `stream_consumed`.
-    pub fn take(&self) -> VResult<Box<dyn Iterator<Item = VResult<Value>> + Send>> {
+    /// Whether the stream has a natural end (used by `.collect()` to reject
+    /// unbounded streams instead of looping forever).
+    pub fn is_bounded(&self) -> bool {
+        self.bounded
+    }
+
+    /// Take the composed upstream, enforcing single-consumption (TDD §1.9): a
+    /// second attempt is `stream_consumed`.
+    pub fn take_upstream(&self) -> VResult<Box<dyn Upstream>> {
         let mut g = self.inner.lock().unwrap();
         match std::mem::replace(&mut *g, StreamState::Consumed) {
-            StreamState::Ready(it) => Ok(it),
+            StreamState::Ready(up) => Ok(up),
             StreamState::Consumed => {
                 Err(ErrorVal::new("stream_consumed", "stream already consumed")
                     .with_hint("collect first (`.collect()`), or `.tee(2)` to split"))
@@ -398,8 +497,600 @@ impl StreamVal {
         }
     }
 
+    /// Consume `self` (single-consumption) and return a fresh stream whose
+    /// upstream is `self`'s wrapped in a new stage. `bounded` is the new stream's
+    /// boundedness.
+    fn wrap(
+        self,
+        label: impl Into<String>,
+        bounded: bool,
+        make: impl FnOnce(Box<dyn Upstream>) -> Box<dyn Upstream>,
+    ) -> VResult<StreamVal> {
+        let up = self.take_upstream()?;
+        Ok(StreamVal::from_source(label, bounded, make(up)))
+    }
+
     pub fn same(&self, other: &StreamVal) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    // --- lazy combinators (STREAMS §3) -----------------------------------
+
+    pub fn map(self, f: Value) -> VResult<StreamVal> {
+        let b = self.bounded;
+        self.wrap("value", b, |up| Box::new(stream_ops::Map { up, f }))
+    }
+    pub fn filter(self, f: Value) -> VResult<StreamVal> {
+        let (b, l) = (self.bounded, self.label.clone());
+        self.wrap(l, b, |up| Box::new(stream_ops::Filter { up, f }))
+    }
+    pub fn scan(self, init: Value, f: Value) -> VResult<StreamVal> {
+        let b = self.bounded;
+        self.wrap("value", b, |up| {
+            Box::new(stream_ops::Scan { up, f, acc: init })
+        })
+    }
+    pub fn flat_map(self, f: Value) -> VResult<StreamVal> {
+        let b = self.bounded;
+        self.wrap("value", b, |up| {
+            Box::new(stream_ops::FlatMap {
+                up,
+                f,
+                sub: None,
+                queue: std::collections::VecDeque::new(),
+            })
+        })
+    }
+    pub fn take_n(self, n: usize) -> VResult<StreamVal> {
+        let l = self.label.clone();
+        // `.take` bounds any source — an endless stream becomes finite.
+        self.wrap(l, true, |up| {
+            Box::new(stream_ops::Take { up, remaining: n })
+        })
+    }
+    pub fn take_until_pred(self, f: Value) -> VResult<StreamVal> {
+        let (b, l) = (self.bounded, self.label.clone());
+        self.wrap(l, b, |up| {
+            Box::new(stream_ops::TakeUntilPred { up, f, done: false })
+        })
+    }
+    pub fn take_until_stream(self, other: StreamVal) -> VResult<StreamVal> {
+        let (b, l) = (self.bounded, self.label.clone());
+        let other_up = other.take_upstream()?;
+        self.wrap(l, b, |up| {
+            Box::new(stream_ops::TakeUntilStream {
+                up,
+                other: other_up,
+                done: false,
+            })
+        })
+    }
+    pub fn dedupe(self) -> VResult<StreamVal> {
+        let (b, l) = (self.bounded, self.label.clone());
+        self.wrap(l, b, |up| Box::new(stream_ops::Dedupe { up, last: None }))
+    }
+    pub fn distinct(self) -> VResult<StreamVal> {
+        let (b, l) = (self.bounded, self.label.clone());
+        self.wrap(l, b, |up| {
+            Box::new(stream_ops::Distinct {
+                up,
+                seen: Vec::new(),
+            })
+        })
+    }
+    pub fn debounce(self, dur: std::time::Duration) -> VResult<StreamVal> {
+        let (b, l) = (self.bounded, self.label.clone());
+        self.wrap(l, b, |up| {
+            Box::new(stream_ops::Debounce {
+                up,
+                dur,
+                pending: None,
+                deadline: None,
+            })
+        })
+    }
+    pub fn throttle(self, dur: std::time::Duration) -> VResult<StreamVal> {
+        let (b, l) = (self.bounded, self.label.clone());
+        self.wrap(l, b, |up| {
+            Box::new(stream_ops::Throttle {
+                up,
+                dur,
+                last: None,
+            })
+        })
+    }
+    pub fn window_count(self, n: usize) -> VResult<StreamVal> {
+        let b = self.bounded;
+        self.wrap("list", b, |up| {
+            Box::new(stream_ops::WindowCount {
+                up,
+                n,
+                buf: std::collections::VecDeque::new(),
+            })
+        })
+    }
+    pub fn window_dur(self, dur: std::time::Duration) -> VResult<StreamVal> {
+        let b = self.bounded;
+        self.wrap("list", b, |up| {
+            Box::new(stream_ops::WindowDur {
+                up,
+                dur,
+                buf: Vec::new(),
+            })
+        })
+    }
+    pub fn buffer(self, _n: usize) -> VResult<StreamVal> {
+        // Pure pacing decoupler: in a synchronous pull model it has no observable
+        // effect on the item sequence, so it is an identity stage. It exists so
+        // `.buffer(n)` type-checks and reads intentionally in a chain.
+        Ok(self)
+    }
+    pub fn enumerate(self) -> VResult<StreamVal> {
+        let b = self.bounded;
+        self.wrap("list", b, |up| Box::new(stream_ops::Enumerate { up, i: 0 }))
+    }
+    pub fn merge(self, other: StreamVal) -> VResult<StreamVal> {
+        let bounded = self.bounded && other.bounded;
+        let other_up = other.take_upstream()?;
+        self.wrap("value", bounded, |up| {
+            Box::new(stream_ops::Merge {
+                a: up,
+                b: other_up,
+                a_done: false,
+                b_done: false,
+            })
+        })
+    }
+    pub fn zip(self, other: StreamVal) -> VResult<StreamVal> {
+        // `.zip` ends when EITHER side ends, so a single bounded side bounds it.
+        let bounded = self.bounded || other.bounded;
+        let other_up = other.take_upstream()?;
+        self.wrap("list", bounded, |up| {
+            Box::new(stream_ops::Zip { a: up, b: other_up })
+        })
+    }
+}
+
+/// Drive a stream to a sink, invoking `on_item` for each produced value until the
+/// stream ends. Blocks (no timeout) — the sink is the point where a live source
+/// actually runs. Cancellation is by dropping the pipeline (which drops the base
+/// receiver, so its producer thread exits).
+pub fn drive_stream(
+    ctx: &mut dyn CallCtx,
+    up: &mut dyn Upstream,
+    mut on_item: impl FnMut(&mut dyn CallCtx, Value) -> VResult<()>,
+) -> VResult<()> {
+    loop {
+        match up.pull(ctx, None)? {
+            Pull::Item(v) => on_item(ctx, v)?,
+            Pull::End => return Ok(()),
+            // A None-timeout pull never yields Timeout, but be total anyway.
+            Pull::Timeout => continue,
+        }
+    }
+}
+
+/// Collect a bounded stream into a `Vec`. Errors `stream_unbounded` on an endless
+/// source (STREAMS §4) — the caller must `.take`/`.take_until` first.
+pub fn collect_stream(ctx: &mut dyn CallCtx, s: &StreamVal) -> VResult<Vec<Value>> {
+    if !s.bounded {
+        return Err(
+            ErrorVal::new("stream_unbounded", "this stream has no natural end")
+                .with_hint("bound it first: `.take(n)` or `.take_until(...)`, or use `.each(f)`"),
+        );
+    }
+    let mut up = s.take_upstream()?;
+    let mut out = Vec::new();
+    drive_stream(ctx, &mut *up, |_ctx, v| {
+        out.push(v);
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// The lazy combinator stages (STREAMS §3). Each wraps an inner [`Upstream`] and
+/// is itself an [`Upstream`], so a chain composes by nesting.
+mod stream_ops {
+    use super::{CallCtx, Pull, Upstream, VResult, Value};
+    use std::collections::VecDeque;
+    use std::time::{Duration, Instant};
+
+    /// A short poll interval for stages that must interleave/observe two sources
+    /// (`merge`, `take_until(stream)`) without a blocking read that could starve
+    /// the other side.
+    const POLL: Duration = Duration::from_millis(20);
+
+    pub struct Map {
+        pub up: Box<dyn Upstream>,
+        pub f: Value,
+    }
+    impl Upstream for Map {
+        fn pull(&mut self, ctx: &mut dyn CallCtx, t: Option<Duration>) -> VResult<Pull> {
+            match self.up.pull(ctx, t)? {
+                Pull::Item(v) => Ok(Pull::Item(ctx.call_closure(&self.f, vec![v])?)),
+                other => Ok(other),
+            }
+        }
+    }
+
+    pub struct Filter {
+        pub up: Box<dyn Upstream>,
+        pub f: Value,
+    }
+    impl Upstream for Filter {
+        fn pull(&mut self, ctx: &mut dyn CallCtx, t: Option<Duration>) -> VResult<Pull> {
+            loop {
+                match self.up.pull(ctx, t)? {
+                    Pull::Item(v) => {
+                        if ctx.call_closure(&self.f, vec![v.clone()])?.as_condition()? {
+                            return Ok(Pull::Item(v));
+                        }
+                    }
+                    other => return Ok(other),
+                }
+            }
+        }
+    }
+
+    pub struct Scan {
+        pub up: Box<dyn Upstream>,
+        pub f: Value,
+        pub acc: Value,
+    }
+    impl Upstream for Scan {
+        fn pull(&mut self, ctx: &mut dyn CallCtx, t: Option<Duration>) -> VResult<Pull> {
+            match self.up.pull(ctx, t)? {
+                Pull::Item(v) => {
+                    self.acc = ctx.call_closure(&self.f, vec![self.acc.clone(), v])?;
+                    Ok(Pull::Item(self.acc.clone()))
+                }
+                other => Ok(other),
+            }
+        }
+    }
+
+    pub struct FlatMap {
+        pub up: Box<dyn Upstream>,
+        pub f: Value,
+        pub sub: Option<Box<dyn Upstream>>,
+        pub queue: VecDeque<Value>,
+    }
+    impl Upstream for FlatMap {
+        fn pull(&mut self, ctx: &mut dyn CallCtx, t: Option<Duration>) -> VResult<Pull> {
+            loop {
+                if let Some(v) = self.queue.pop_front() {
+                    return Ok(Pull::Item(v));
+                }
+                if let Some(sub) = self.sub.as_mut() {
+                    match sub.pull(ctx, t)? {
+                        Pull::Item(v) => return Ok(Pull::Item(v)),
+                        Pull::End => self.sub = None,
+                        Pull::Timeout => return Ok(Pull::Timeout),
+                    }
+                    continue;
+                }
+                match self.up.pull(ctx, t)? {
+                    Pull::Item(v) => {
+                        let r = ctx.call_closure(&self.f, vec![v])?;
+                        match r {
+                            Value::Stream(s) => self.sub = Some(s.take_upstream()?),
+                            Value::List(xs) => self.queue.extend(xs),
+                            Value::Table(rows) => {
+                                self.queue.extend(rows.into_iter().map(Value::Record));
+                            }
+                            Value::Range(rg) => self.queue.extend(rg.iter().map(Value::Int)),
+                            other => {
+                                return Err(super::ErrorVal::type_error(format!(
+                                    "flat_map expects each result to be a stream or list, found {}",
+                                    other.type_name()
+                                )));
+                            }
+                        }
+                    }
+                    other => return Ok(other),
+                }
+            }
+        }
+    }
+
+    pub struct Take {
+        pub up: Box<dyn Upstream>,
+        pub remaining: usize,
+    }
+    impl Upstream for Take {
+        fn pull(&mut self, ctx: &mut dyn CallCtx, t: Option<Duration>) -> VResult<Pull> {
+            if self.remaining == 0 {
+                return Ok(Pull::End);
+            }
+            match self.up.pull(ctx, t)? {
+                Pull::Item(v) => {
+                    self.remaining -= 1;
+                    Ok(Pull::Item(v))
+                }
+                other => Ok(other),
+            }
+        }
+    }
+
+    pub struct TakeUntilPred {
+        pub up: Box<dyn Upstream>,
+        pub f: Value,
+        pub done: bool,
+    }
+    impl Upstream for TakeUntilPred {
+        fn pull(&mut self, ctx: &mut dyn CallCtx, t: Option<Duration>) -> VResult<Pull> {
+            if self.done {
+                return Ok(Pull::End);
+            }
+            match self.up.pull(ctx, t)? {
+                Pull::Item(v) => {
+                    if ctx.call_closure(&self.f, vec![v.clone()])?.as_condition()? {
+                        self.done = true;
+                        Ok(Pull::End)
+                    } else {
+                        Ok(Pull::Item(v))
+                    }
+                }
+                other => Ok(other),
+            }
+        }
+    }
+
+    pub struct TakeUntilStream {
+        pub up: Box<dyn Upstream>,
+        pub other: Box<dyn Upstream>,
+        pub done: bool,
+    }
+    impl Upstream for TakeUntilStream {
+        fn pull(&mut self, ctx: &mut dyn CallCtx, t: Option<Duration>) -> VResult<Pull> {
+            if self.done {
+                return Ok(Pull::End);
+            }
+            let deadline = t.map(|d| Instant::now() + d);
+            loop {
+                // Has the signal stream produced anything yet? Non-blocking check.
+                match self.other.pull(ctx, Some(Duration::ZERO))? {
+                    Pull::Item(_) => {
+                        self.done = true;
+                        return Ok(Pull::End);
+                    }
+                    Pull::End | Pull::Timeout => {}
+                }
+                let step = match deadline {
+                    Some(dl) => dl.saturating_duration_since(Instant::now()).min(POLL),
+                    None => POLL,
+                };
+                match self.up.pull(ctx, Some(step))? {
+                    Pull::Item(v) => return Ok(Pull::Item(v)),
+                    Pull::End => return Ok(Pull::End),
+                    Pull::Timeout => {
+                        if deadline.is_some_and(|dl| Instant::now() >= dl) {
+                            return Ok(Pull::Timeout);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub struct Dedupe {
+        pub up: Box<dyn Upstream>,
+        pub last: Option<Value>,
+    }
+    impl Upstream for Dedupe {
+        fn pull(&mut self, ctx: &mut dyn CallCtx, t: Option<Duration>) -> VResult<Pull> {
+            loop {
+                match self.up.pull(ctx, t)? {
+                    Pull::Item(v) => {
+                        if self.last.as_ref() == Some(&v) {
+                            continue;
+                        }
+                        self.last = Some(v.clone());
+                        return Ok(Pull::Item(v));
+                    }
+                    other => return Ok(other),
+                }
+            }
+        }
+    }
+
+    pub struct Distinct {
+        pub up: Box<dyn Upstream>,
+        pub seen: Vec<Value>,
+    }
+    impl Upstream for Distinct {
+        fn pull(&mut self, ctx: &mut dyn CallCtx, t: Option<Duration>) -> VResult<Pull> {
+            loop {
+                match self.up.pull(ctx, t)? {
+                    Pull::Item(v) => {
+                        if self.seen.contains(&v) {
+                            continue;
+                        }
+                        self.seen.push(v.clone());
+                        return Ok(Pull::Item(v));
+                    }
+                    other => return Ok(other),
+                }
+            }
+        }
+    }
+
+    pub struct Debounce {
+        pub up: Box<dyn Upstream>,
+        pub dur: Duration,
+        pub pending: Option<Value>,
+        pub deadline: Option<Instant>,
+    }
+    impl Upstream for Debounce {
+        fn pull(&mut self, ctx: &mut dyn CallCtx, _t: Option<Duration>) -> VResult<Pull> {
+            loop {
+                let wait = self
+                    .deadline
+                    .map(|dl| dl.saturating_duration_since(Instant::now()));
+                if let (Some(_), Some(w)) = (&self.pending, wait)
+                    && w.is_zero()
+                {
+                    self.deadline = None;
+                    return Ok(Pull::Item(self.pending.take().expect("pending")));
+                }
+                match self.up.pull(ctx, wait)? {
+                    Pull::Item(v) => {
+                        self.pending = Some(v);
+                        self.deadline = Some(Instant::now() + self.dur);
+                    }
+                    Pull::Timeout => {
+                        if let Some(v) = self.pending.take() {
+                            self.deadline = None;
+                            return Ok(Pull::Item(v));
+                        }
+                    }
+                    Pull::End => {
+                        return Ok(match self.pending.take() {
+                            Some(v) => Pull::Item(v),
+                            None => Pull::End,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    pub struct Throttle {
+        pub up: Box<dyn Upstream>,
+        pub dur: Duration,
+        pub last: Option<Instant>,
+    }
+    impl Upstream for Throttle {
+        fn pull(&mut self, ctx: &mut dyn CallCtx, t: Option<Duration>) -> VResult<Pull> {
+            loop {
+                match self.up.pull(ctx, t)? {
+                    Pull::Item(v) => {
+                        let now = Instant::now();
+                        let emit = self.last.is_none_or(|l| now.duration_since(l) >= self.dur);
+                        if emit {
+                            self.last = Some(now);
+                            return Ok(Pull::Item(v));
+                        }
+                    }
+                    other => return Ok(other),
+                }
+            }
+        }
+    }
+
+    pub struct WindowCount {
+        pub up: Box<dyn Upstream>,
+        pub n: usize,
+        pub buf: VecDeque<Value>,
+    }
+    impl Upstream for WindowCount {
+        fn pull(&mut self, ctx: &mut dyn CallCtx, t: Option<Duration>) -> VResult<Pull> {
+            loop {
+                match self.up.pull(ctx, t)? {
+                    Pull::Item(v) => {
+                        self.buf.push_back(v);
+                        while self.buf.len() > self.n {
+                            self.buf.pop_front();
+                        }
+                        if self.buf.len() == self.n {
+                            return Ok(Pull::Item(Value::List(self.buf.iter().cloned().collect())));
+                        }
+                    }
+                    other => return Ok(other),
+                }
+            }
+        }
+    }
+
+    pub struct WindowDur {
+        pub up: Box<dyn Upstream>,
+        pub dur: Duration,
+        pub buf: Vec<(Instant, Value)>,
+    }
+    impl Upstream for WindowDur {
+        fn pull(&mut self, ctx: &mut dyn CallCtx, t: Option<Duration>) -> VResult<Pull> {
+            match self.up.pull(ctx, t)? {
+                Pull::Item(v) => {
+                    let now = Instant::now();
+                    self.buf.push((now, v));
+                    let dur = self.dur;
+                    self.buf.retain(|(ts, _)| now.duration_since(*ts) <= dur);
+                    Ok(Pull::Item(Value::List(
+                        self.buf.iter().map(|(_, v)| v.clone()).collect(),
+                    )))
+                }
+                other => Ok(other),
+            }
+        }
+    }
+
+    pub struct Enumerate {
+        pub up: Box<dyn Upstream>,
+        pub i: i64,
+    }
+    impl Upstream for Enumerate {
+        fn pull(&mut self, ctx: &mut dyn CallCtx, t: Option<Duration>) -> VResult<Pull> {
+            match self.up.pull(ctx, t)? {
+                Pull::Item(v) => {
+                    let idx = self.i;
+                    self.i += 1;
+                    Ok(Pull::Item(Value::List(vec![Value::Int(idx), v])))
+                }
+                other => Ok(other),
+            }
+        }
+    }
+
+    pub struct Merge {
+        pub a: Box<dyn Upstream>,
+        pub b: Box<dyn Upstream>,
+        pub a_done: bool,
+        pub b_done: bool,
+    }
+    impl Upstream for Merge {
+        fn pull(&mut self, ctx: &mut dyn CallCtx, t: Option<Duration>) -> VResult<Pull> {
+            let deadline = t.map(|d| Instant::now() + d);
+            loop {
+                if self.a_done && self.b_done {
+                    return Ok(Pull::End);
+                }
+                if !self.a_done {
+                    match self.a.pull(ctx, Some(POLL))? {
+                        Pull::Item(v) => return Ok(Pull::Item(v)),
+                        Pull::End => self.a_done = true,
+                        Pull::Timeout => {}
+                    }
+                }
+                if !self.b_done {
+                    match self.b.pull(ctx, Some(POLL))? {
+                        Pull::Item(v) => return Ok(Pull::Item(v)),
+                        Pull::End => self.b_done = true,
+                        Pull::Timeout => {}
+                    }
+                }
+                if deadline.is_some_and(|dl| Instant::now() >= dl) {
+                    return Ok(Pull::Timeout);
+                }
+            }
+        }
+    }
+
+    pub struct Zip {
+        pub a: Box<dyn Upstream>,
+        pub b: Box<dyn Upstream>,
+    }
+    impl Upstream for Zip {
+        fn pull(&mut self, ctx: &mut dyn CallCtx, t: Option<Duration>) -> VResult<Pull> {
+            let va = match self.a.pull(ctx, t)? {
+                Pull::Item(v) => v,
+                other => return Ok(other),
+            };
+            let vb = match self.b.pull(ctx, t)? {
+                Pull::Item(v) => v,
+                other => return Ok(other),
+            };
+            Ok(Pull::Item(Value::List(vec![va, vb])))
+        }
     }
 }
 
@@ -952,8 +1643,8 @@ mod tests {
     #[test]
     fn stream_single_consumption() {
         let s = StreamVal::from_iter("int", (0..3).map(|i| Ok(Value::Int(i))));
-        assert!(s.take().is_ok());
-        let err = s.take().err().expect("second take must fail");
+        assert!(s.take_upstream().is_ok());
+        let err = s.take_upstream().err().expect("second take must fail");
         assert_eq!(err.code, "stream_consumed");
     }
 
