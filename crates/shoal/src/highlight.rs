@@ -1,8 +1,27 @@
 use nu_ansi_term::{Color, Style};
 use reedline::{Highlighter, StyledText};
 use shoal_syntax::{Lexer, Mode, Tok};
+use shoal_value::{Env, Value};
 
-pub struct ShoalHighlighter;
+/// Live syntax highlighter. Holds a shared handle to the session [`Env`]
+/// (`Env` clones are `Arc`-backed, same as the completer's) so statement
+/// dispatch is approximated with the parser's real rule: a value-bound head
+/// is a variable reference, not an unknown command to paint red.
+#[derive(Default)]
+pub struct ShoalHighlighter {
+    env: Option<Env>,
+}
+
+impl ShoalHighlighter {
+    pub fn with_env(env: Env) -> Self {
+        ShoalHighlighter { env: Some(env) }
+    }
+
+    /// The session binding for `name`, if any.
+    fn binding(&self, name: &str) -> Option<Value> {
+        self.env.as_ref().and_then(|e| e.get(name))
+    }
+}
 
 fn is_keyword(name: &str) -> bool {
     matches!(
@@ -43,6 +62,19 @@ fn is_valid_command(cmd: &str) -> bool {
         }
     }
     false
+}
+
+/// Does the raw text at `pos` begin a path literal (`./ ../ ~ ~/ /…`)? A
+/// byte-level replica of the parser's `is_path_head` (TDD §2.2): such a head
+/// dispatches CMD, so the highlighter must not lex it as EXPR punctuation.
+fn is_path_head_bytes(bytes: &[u8], pos: usize) -> bool {
+    let at = |i: usize| bytes.get(i).copied().unwrap_or(0);
+    match at(pos) {
+        b'/' => true,
+        b'~' => matches!(at(pos + 1), 0 | b'/' | b' ' | b'\t' | b'\r' | b'\n' | b';'),
+        b'.' => at(pos + 1) == b'/' || (at(pos + 1) == b'.' && at(pos + 2) == b'/'),
+        _ => false,
+    }
 }
 
 /// `NO_COLOR` (https://no-color.org): checked lazily, same convention as
@@ -86,6 +118,24 @@ impl Highlighter for ShoalHighlighter {
             }
             if pos >= line.len() {
                 break;
+            }
+
+            // A path-shaped statement head (`./x.sh`, `/bin/ls`, `~/t`, `../r`)
+            // dispatches CMD in the parser (`is_path_head`) — lex it as one
+            // CMD-mode path word instead of tearing it into EXPR punctuation.
+            if expect_cmd
+                && is_path_head_bytes(line.as_bytes(), pos)
+                && let Ok((Tok::PathWord(_), s)) = lx.token(pos, Mode::Cmd)
+            {
+                let end = (s.end as usize).max(pos + 1);
+                push(
+                    &mut styled,
+                    Style::new().fg(Color::LightBlue).underline(),
+                    &line[pos..end],
+                    plain,
+                );
+                pos = highlight_cmd_tail(&lx, line, end, &mut styled, plain);
+                continue;
             }
 
             let (tok, span) = match lx.token(pos, Mode::Expr) {
@@ -154,13 +204,27 @@ impl Highlighter for ShoalHighlighter {
                     || rest.starts_with("-=")
                     || rest.starts_with("*=")
                     || rest.starts_with("/=");
-                if !is_assign && expect_cmd {
+                // Mirror the parser's statement dispatch (TDD §3.1): a
+                // VALUE-bound head is an EXPR variable reference, and an
+                // ident immediately followed by `.ident` (no whitespace) is
+                // the invoke-then-chain refinement — both dispatch EXPR, so
+                // neither may be judged as a command head. A CALLABLE binding
+                // (session `fn`/alias) dispatches CMD and is a known-valid
+                // command even though PATH has never heard of it.
+                let bound = self.binding(name);
+                let callable = bound.as_ref().is_some_and(Value::is_callable);
+                let value_bound = bound.is_some() && !callable;
+                let chains = line[end..].starts_with('.')
+                    && line.as_bytes()[end + 1..]
+                        .first()
+                        .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_');
+                if !is_assign && expect_cmd && !value_bound && !chains {
                     let head_end = match lx.token(start, Mode::Cmd) {
                         Ok((_, cmd_span)) => (cmd_span.end as usize).max(end),
                         Err(_) => end,
                     };
                     let head_text = &line[start..head_end];
-                    let style = if is_valid_command(head_text) {
+                    let style = if callable || is_valid_command(head_text) {
                         Style::new().fg(Color::Green)
                     } else {
                         Style::new().fg(Color::Red).bold()
@@ -172,14 +236,22 @@ impl Highlighter for ShoalHighlighter {
                     // below re-derives `expect_cmd` uniformly.
                     continue;
                 }
-                // Assignment target, or a plain identifier reference in expr
-                // position (not a command head) — both read the same way.
-                push(
-                    &mut styled,
-                    Style::new().fg(Color::LightBlue),
-                    &line[start..end],
-                    plain,
-                );
+                // Invoke-then-chain head: `ls` in `ls.where(…)` still names a
+                // command — color it by resolvability, but keep EXPR token
+                // boundaries for the chain that follows.
+                let style = if expect_cmd && chains && !value_bound {
+                    if callable || is_valid_command(name) {
+                        Style::new().fg(Color::Green)
+                    } else {
+                        Style::new().fg(Color::Red).bold()
+                    }
+                } else {
+                    // Assignment target, bound-variable head, or a plain
+                    // identifier reference in expr position — all read the
+                    // same way.
+                    Style::new().fg(Color::LightBlue)
+                };
+                push(&mut styled, style, &line[start..end], plain);
                 pos = end;
                 expect_cmd = false;
                 continue;
@@ -349,7 +421,90 @@ mod tests {
 
     fn styles_for(line: &str) -> Vec<(Style, String)> {
         let _guard = ENV_GUARD.lock().unwrap();
-        ShoalHighlighter.highlight(line, line.len()).buffer
+        ShoalHighlighter::default()
+            .highlight(line, line.len())
+            .buffer
+    }
+
+    /// Highlight with a session env carrying one value binding (`someVar`)
+    /// and one callable binding (`deploy`).
+    fn styles_with_bindings(line: &str) -> Vec<(Style, String)> {
+        let _guard = ENV_GUARD.lock().unwrap();
+        let env = Env::root();
+        env.declare("someVar", Value::Int(42), false);
+        env.declare(
+            "deploy",
+            Value::CmdRef(std::sync::Arc::new(shoal_ast::CmdCall {
+                head: "deploy".into(),
+                forced: false,
+                args: vec![],
+                redirects: vec![],
+                env_prefix: vec![],
+                background: false,
+                trailing: None,
+                span: shoal_ast::Span::new(0, 0),
+            })),
+            false,
+        );
+        ShoalHighlighter::with_env(env)
+            .highlight(line, line.len())
+            .buffer
+    }
+
+    #[test]
+    fn bound_variable_at_statement_head_is_not_an_unknown_command() {
+        // Regression: `let someVar = 6 * 7` then typing `someVar` painted it
+        // red-bold (unknown command). A value-bound head dispatches EXPR — it
+        // must read as a variable reference.
+        let spans = styles_with_bindings("someVar");
+        let head = spans
+            .iter()
+            .find(|(_, s)| s == "someVar")
+            .expect("identifier span");
+        assert_eq!(
+            head.0.foreground,
+            Some(Color::LightBlue),
+            "bound variable must style as a reference, got {spans:?}"
+        );
+    }
+
+    #[test]
+    fn callable_binding_at_statement_head_is_a_valid_command() {
+        // A session `fn` is a command binding: green, never red, even though
+        // PATH has never heard of it.
+        let spans = styles_with_bindings("deploy staging");
+        let head = spans
+            .iter()
+            .find(|(_, s)| s == "deploy")
+            .expect("head span");
+        assert_eq!(head.0.foreground, Some(Color::Green), "got {spans:?}");
+    }
+
+    #[test]
+    fn unbound_head_still_flags_red() {
+        let spans = styles_with_bindings("qzxunknowncmd");
+        let head = spans
+            .iter()
+            .find(|(_, s)| s == "qzxunknowncmd")
+            .expect("head span");
+        assert_eq!(head.0.foreground, Some(Color::Red), "got {spans:?}");
+    }
+
+    #[test]
+    fn invoke_then_chain_head_keeps_expr_boundaries() {
+        // `ls.where(...)` dispatches EXPR (invoke-then-chain): the head must
+        // not be torn into one giant red CMD word `ls.where(.size`.
+        let spans = styles_for("ls.where(.size > 1mb)");
+        assert!(
+            spans.iter().any(|(_, s)| s == "ls"),
+            "head should be its own span, got {spans:?}"
+        );
+        let ls = spans.iter().find(|(_, s)| s == "ls").unwrap();
+        assert_eq!(
+            ls.0.foreground,
+            Some(Color::Green),
+            "`ls` resolves on PATH/builtins, got {spans:?}"
+        );
     }
 
     fn plain_join(spans: &[(Style, String)]) -> String {
@@ -380,11 +535,25 @@ mod tests {
     }
 
     #[test]
-    fn cmd_mode_bare_word_with_dot_is_not_member_access() {
+    fn bare_ident_dot_chain_follows_parser_dispatch() {
+        // The parser dispatches `colorcheck.sh` as EXPR (invoke-then-chain:
+        // `colorcheck().sh` — empirically `undefined_var: colorcheck`), NOT
+        // as one command word; running a script by name needs the path form
+        // `./colorcheck.sh`. The highlighter must mirror that dispatch: the
+        // head is its own span, red because nothing resolves it. (This test
+        // previously asserted the opposite — one bare-word CMD span — which
+        // contradicted the parser.)
         let spans = styles_for("colorcheck.sh");
+        let head = spans
+            .iter()
+            .find(|(_, s)| s == "colorcheck")
+            .expect("head should be its own span");
+        assert_eq!(head.0.foreground, Some(Color::Red), "got {spans:?}");
+        // The path form IS one underlined command word.
+        let spans = styles_for("./colorcheck.sh");
         assert!(
-            spans.iter().any(|(_, s)| s == "colorcheck.sh"),
-            "expected one bare-word span, got {spans:?}"
+            spans.iter().any(|(_, s)| s == "./colorcheck.sh"),
+            "path head should stay one span, got {spans:?}"
         );
     }
 
@@ -426,7 +595,9 @@ mod tests {
         // in the module that reads styled output, so no other thread can
         // observe `NO_COLOR` transiently set.
         unsafe { std::env::set_var("NO_COLOR", "1") };
-        let spans = ShoalHighlighter.highlight("let x = \"abc", 0).buffer;
+        let spans = ShoalHighlighter::default()
+            .highlight("let x = \"abc", 0)
+            .buffer;
         unsafe { std::env::remove_var("NO_COLOR") };
         assert!(spans.iter().all(|(style, _)| *style == Style::default()));
     }

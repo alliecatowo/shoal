@@ -159,7 +159,7 @@ pub(crate) fn repl() -> Result<i32, String> {
             ColumnarMenu::default().with_name("completion_menu"),
         )))
         .with_edit_mode(Box::new(Emacs::new(keybindings)))
-        .with_highlighter(Box::new(ShoalHighlighter))
+        .with_highlighter(Box::new(ShoalHighlighter::with_env(evaluator.env.clone())))
         .with_hinter(Box::new(DefaultHinter::default()));
     if transient_enabled {
         // Transient prompt (§2.5): a second ShoalPrompt sharing the same cache,
