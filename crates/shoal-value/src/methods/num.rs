@@ -35,13 +35,3 @@ pub(crate) fn round_to(v: Value, ndigits: usize, f: fn(f64) -> f64) -> VResult<V
         ))),
     }
 }
-pub(crate) fn float_unary(v: Value, f: fn(f64) -> f64) -> VResult<Value> {
-    match v {
-        Value::Float(x) => Ok(Value::Float(f(x))),
-        Value::Int(i) => Ok(Value::Int(i)),
-        v => Err(ErrorVal::type_error(format!(
-            "expected number, found {}",
-            v.type_name()
-        ))),
-    }
-}
