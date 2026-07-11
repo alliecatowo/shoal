@@ -147,9 +147,9 @@ fn dispatch(ctx: &mut dyn CallCtx, recv: Value, name: &str, args: CallArgs) -> V
         "ends_with" => strops::string_pred(recv, str_arg(&args, 0, "")?, |s, q| s.ends_with(q)),
         "contains" => list::contains(recv, arg(&args, 0)?),
         "replace" => {
-            let a = str_arg(&args, 0, "")?;
-            let b = str_arg(&args, 1, "")?;
-            strops::string_unary(recv, |s| Value::Str(s.replace(a, b)))
+            let pat = arg(&args, 0)?.clone();
+            let rep = str_arg(&args, 1, "")?;
+            strops::replace_method(recv, &pat, rep)
         }
         "matches" => strops::matches_method(recv, arg(&args, 0)?),
         "match" => strops::match_method(recv, arg(&args, 0)?),

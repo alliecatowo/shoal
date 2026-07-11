@@ -211,3 +211,33 @@ value = '""'
 name = "str2-take-skip-compose-for-substring"
 src = '"abcdefg".skip(2).take(3)'
 value = '"cde"'
+
+# `.replace` accepts a regex pattern (all matches; `$1`/`$name` expand capture
+# groups) as well as a literal str — mirroring `.matches`/`.match`. See
+# crates/shoal-value/src/methods/strops.rs::replace_method.
+
+[[case]]
+name = "str2-replace-regex-char"
+src = '"hello world".replace(re"o", "0")'
+value = '"hell0 w0rld"'
+
+[[case]]
+name = "str2-replace-regex-class-all-matches"
+src = '"foo123bar456".replace(re"[0-9]+", "#")'
+value = '"foo#bar#"'
+
+[[case]]
+name = "str2-replace-regex-capture-groups"
+src = '"2026-07-11".replace(re"(\d+)-(\d+)-(\d+)", "$3/$2/$1")'
+value = '"11/07/2026"'
+
+[[case]]
+name = "str2-replace-literal-str-not-regex"
+# A str pattern is literal: the `.` matches only a real dot, not any char.
+src = '"a.b.c".replace(".", "_")'
+value = '"a_b_c"'
+
+[[case]]
+name = "str2-replace-regex-no-match-unchanged"
+src = '"abc".replace(re"[0-9]+", "#")'
+value = '"abc"'

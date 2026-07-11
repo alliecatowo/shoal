@@ -29,6 +29,25 @@ pub(crate) fn matches_method(v: Value, q: &Value) -> VResult<Value> {
         )),
     }
 }
+/// `.replace(pat, rep)` — `pat` is a `str` (literal, all occurrences) or a
+/// `regex` (all matches; `$1`/`$name` in `rep` expand capture groups, per the
+/// `regex` crate). Mirrors the str/regex duality of `.matches`/`.match`.
+pub(crate) fn replace_method(v: Value, pat: &Value, rep: &str) -> VResult<Value> {
+    match (v, pat) {
+        (Value::Str(s), Value::Str(p)) => Ok(Value::Str(s.replace(p.as_str(), rep))),
+        (Value::Str(s), Value::Regex(r)) => {
+            Ok(Value::Str(r.re.replace_all(&s, rep).into_owned()))
+        }
+        (Value::Str(_), other) => Err(ErrorVal::type_error(format!(
+            "replace pattern must be str or regex, found {}",
+            other.type_name()
+        ))),
+        (v, _) => Err(ErrorVal::type_error(format!(
+            "replace expects a str receiver, found {}",
+            v.type_name()
+        ))),
+    }
+}
 pub(crate) fn match_method(v: Value, q: &Value) -> VResult<Value> {
     match (v, q) {
         (Value::Str(s), Value::Regex(r)) => Ok(r
