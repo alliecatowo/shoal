@@ -39,7 +39,36 @@ impl Kernel {
                 let end = end.max(start).min(items.len());
                 Value::List(items[start..end].to_vec())
             }
-            (_, other) => other,
+            // A table IS a list<record> semantically (TDD §4.1) — slicing it
+            // used to silently no-op, returning the WHOLE table as if the
+            // slice had been applied.
+            (Some([start, end]), Value::Table(rows)) => {
+                let start = start.min(rows.len());
+                let end = end.max(start).min(rows.len());
+                Value::Table(rows[start..end].to_vec())
+            }
+            // Str/Bytes slice by char/byte — the same targeted-drilldown ask.
+            (Some([start, end]), Value::Str(s)) => {
+                let chars: Vec<char> = s.chars().collect();
+                let start = start.min(chars.len());
+                let end = end.max(start).min(chars.len());
+                Value::Str(chars[start..end].iter().collect())
+            }
+            (Some([start, end]), Value::Bytes(b)) => {
+                let start = start.min(b.len());
+                let end = end.max(start).min(b.len());
+                Value::Bytes(std::sync::Arc::new(b[start..end].to_vec()))
+            }
+            // Unordered/scalar values: a slice is a caller error — say so
+            // instead of silently returning the unsliced value.
+            (Some(_), other) => {
+                return Err(RpcError {
+                    code: -32005,
+                    message: format!("cannot slice a {}", other.type_name()),
+                    data: Some(json!({"ref":params.r#ref})),
+                });
+            }
+            (None, other) => other,
         };
         let budget = ElideBudget::from_spec(params.elide.as_ref());
         let uri = short_ref_to_uri(&params.r#ref, params.path.as_deref());

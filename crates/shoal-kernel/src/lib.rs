@@ -591,6 +591,39 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(String::from_utf8(blob).unwrap().contains("\"v\":3"));
+        // Slice applies to tables (list<record> semantically) — it used to
+        // silently no-op and return the whole table — and slicing an
+        // unordered/scalar value is an explicit error, not a silent identity.
+        let texec = call(
+            &mut client,
+            &mut reader,
+            40,
+            "exec",
+            json!({"src":"csv.parse(\"n\\n1\\n2\\n3\")"}),
+        );
+        let table_ref = texec.result.unwrap()["ref"].as_str().unwrap().to_owned();
+        let sliced = call(
+            &mut client,
+            &mut reader,
+            41,
+            "value.get",
+            json!({"ref":table_ref,"slice":[1,3]}),
+        );
+        let sliced = sliced.result.unwrap()["value"].clone();
+        assert_eq!(sliced["$"], "table", "csv.parse yields a table: {sliced}");
+        assert_eq!(sliced["n"], 2, "table slice should keep rows 1..3");
+        let bad = call(
+            &mut client,
+            &mut reader,
+            42,
+            "value.get",
+            json!({"ref":value_ref,"slice":[0,1]}),
+        );
+        assert_eq!(
+            bad.error.expect("slicing an int must error").code,
+            -32005,
+            "slice on a scalar must be an explicit error"
+        );
         drop(client);
         drop(reader);
         thread.join().unwrap();
