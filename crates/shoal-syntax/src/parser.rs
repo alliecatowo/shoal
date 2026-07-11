@@ -370,6 +370,44 @@ mod tests {
         );
     }
     #[test]
+    fn teaching_pipe_error_in_infix_positions() {
+        // TDD §1.4 says ANYWHERE: the infix positions used to fall out of the
+        // operator table into the generic terminator error.
+        for src in ["1 | 2", "(1 | 2)", "let a = 1 | 2"] {
+            let e = parse(src).unwrap_err();
+            assert!(e.msg.contains("no pipe operator"), "{src}: got {:?}", e.msg);
+            assert!(e.hint.is_some(), "{src}: hint missing");
+        }
+        // …while match-arm alternation stays the one legal `|`.
+        assert!(parse("match 1 { 0 | 1 => \"bit\", _ => \"x\" }").is_ok());
+    }
+    #[test]
+    fn it_and_out_are_parse_errors_outside_repl() {
+        // TDD §13.16: bare-statement forms used to dispatch as a command named
+        // `it` and fail only at runtime. Value positions already errored.
+        for src in ["it", "out", "it + 1"] {
+            let e = parse(src).unwrap_err();
+            assert!(e.msg.contains("REPL-only"), "{src}: got {:?}", e.msg);
+        }
+        // The names are effectively reserved outside a REPL: even declaring
+        // `let it = 5` parses, but any subsequent USE still errors (the
+        // value-position check in `primary()` predates this fix and does not
+        // consult bindings — consistent with §13.16's blanket rule).
+        assert!(parse("let it = 5").is_ok());
+        assert!(
+            parse("let it = 5\nit")
+                .unwrap_err()
+                .msg
+                .contains("REPL-only")
+        );
+        // The REPL context keeps `it`/`out` legal.
+        let ctx = ParseCtx {
+            repl: true,
+            ..Default::default()
+        };
+        assert!(parse_with_ctx("it", ctx).is_ok());
+    }
+    #[test]
     fn feed_parses_arg_bearing_command_in_cmd_mode() {
         // `.feed(sort -r)` — the argument is a command with a flag; it must
         // parse as an `Expr::Cmd`, not misparse the `-r` under EXPR rules.

@@ -87,6 +87,18 @@ impl<'s> Parser<'s> {
                 };
                 continue;
             }
+            // TDD §1.4: a lone `|` ANYWHERE outside `sh { }`/match-alternation
+            // gets the curated teaching error. Command-position and
+            // leading-`|` already have it; this catches the infix positions
+            // (`1 | 2`, `let a = x | y`, `(a | b)`) that used to fall out of
+            // the operator table into a generic terminator error.
+            if matches!(t, Tok::Pipe) {
+                let (_, s) = self.peek(Mode::Expr)?;
+                return Err(ParseError::new("shoal has no pipe operator", s).hint(
+                    "data composes with `.` (try `ls.where(.size > 1mb)`); raw byte plumbing \
+                     is `.feed(cmd)`; verbatim POSIX lives in `sh { … }`",
+                ));
+            }
             let Some((bp, op)) = binop(&t) else { break };
             if bp < min {
                 break;

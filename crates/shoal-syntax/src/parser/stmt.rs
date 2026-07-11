@@ -179,6 +179,15 @@ impl<'s> Parser<'s> {
                 let span = e.span();
                 return Ok(Stmt::Expr { expr: e, span });
             }
+            // TDD §13.16: `it`/`out` outside a REPL are parse errors — value
+            // positions already raise this in `primary()`, but the bare
+            // statement forms (`it`, `it + 1`) used to dispatch as a COMMAND
+            // named `it` and only fail at runtime with `command not found`.
+            // A real command named `it`/`out` stays reachable via `^it`.
+            if !self.repl && matches!(name.as_str(), "it" | "out") {
+                return Err(ParseError::new(format!("`{name}` is REPL-only"), s)
+                    .hint("bind a variable to reuse a previous result"));
+            }
             return self.command_stmt();
         }
 

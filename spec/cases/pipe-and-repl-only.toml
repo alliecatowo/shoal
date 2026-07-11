@@ -1,0 +1,47 @@
+# TDD §1.4: a lone `|` ANYWHERE outside `sh { }` / match alternation gets the
+# curated teaching error — including the infix expression positions, which
+# used to fall out of the operator table into a generic terminator error.
+# TDD §13.16: `it`/`out` outside a REPL are PARSE errors, including the bare
+# statement forms that used to dispatch as a command named `it` and fail only
+# at runtime. See crates/shoal-syntax/src/parser/{expr.rs,stmt.rs}.
+
+[[case]]
+name = "pipe-infix-between-ints-teaches"
+src = '1 | 2'
+parse_error = true
+parse_error_contains = "no pipe operator"
+
+[[case]]
+name = "pipe-infix-in-parens-teaches"
+src = '(1 | 2)'
+parse_error = true
+parse_error_contains = "no pipe operator"
+
+[[case]]
+name = "pipe-infix-in-let-rhs-teaches"
+src = 'let a = 1 | 2'
+parse_error = true
+parse_error_contains = "no pipe operator"
+
+[[case]]
+name = "pipe-match-alternation-still-legal"
+src = 'match 1 { 0 | 1 => "bit", _ => "other" }'
+value = '"bit"'
+
+[[case]]
+name = "repl-only-it-bare-statement"
+src = 'it'
+parse_error = true
+parse_error_contains = "REPL-only"
+
+[[case]]
+name = "repl-only-out-bare-statement"
+src = 'out'
+parse_error = true
+parse_error_contains = "REPL-only"
+
+[[case]]
+name = "repl-only-it-in-arithmetic-statement"
+src = 'it + 1'
+parse_error = true
+parse_error_contains = "REPL-only"
