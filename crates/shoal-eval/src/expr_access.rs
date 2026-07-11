@@ -115,23 +115,20 @@ impl Evaluator {
             // Only the argument-taking methods (`.join`/`.abs`/`.save`/`.append`)
             // stay method-only — a bare `.field` can't carry their argument.
             Value::Path(p) => {
-                let component =
-                    |part: Option<&std::ffi::OsStr>| match part {
-                        Some(s) => Value::Str(s.to_string_lossy().into_owned()),
-                        None => Value::Null,
-                    };
+                let component = |part: Option<&std::ffi::OsStr>| match part {
+                    Some(s) => Value::Str(s.to_string_lossy().into_owned()),
+                    None => Value::Null,
+                };
                 match name {
                     "name" => Ok(component(p.file_name())),
                     "stem" => Ok(component(p.file_stem())),
                     "ext" => Ok(component(p.extension())),
                     "parent" => Ok(match p.parent() {
-                        Some(par) if !par.as_os_str().is_empty() => {
-                            Value::Path(par.to_path_buf())
-                        }
+                        Some(par) if !par.as_os_str().is_empty() => Value::Path(par.to_path_buf()),
                         _ => Value::Null,
                     }),
-                    "read" | "read_bytes" | "lines" | "exists" | "is_dir"
-                    | "is_file" | "size" | "modified" => self.path_fs_method(p, name),
+                    "read" | "read_bytes" | "lines" | "exists" | "is_dir" | "is_file" | "size"
+                    | "modified" => self.path_fs_method(p, name),
                     _ => Err(ErrorVal::new(
                         "field_missing",
                         format!("path has no field `{name}`"),
@@ -194,7 +191,8 @@ impl Evaluator {
             // Stream sinks that need the evaluator (the event bus for
             // `.into(channel)`, the statement sink for `.render()`).
             let a = self.eval_args(args)?;
-            self.eval_stream_sink(v, name, a).map_err(|e| e.or_span(span))
+            self.eval_stream_sink(v, name, a)
+                .map_err(|e| e.or_span(span))
         } else if let Value::Path(p) = &v
             && matches!(
                 name,
@@ -212,7 +210,9 @@ impl Evaluator {
             // through the evaluator's Fs port, resolving against cwd. They
             // take no arguments.
             if !args.pos.is_empty() || !args.named.is_empty() {
-                return Err(ErrorVal::arg_error(format!(".{name} takes no arguments")).or_span(span));
+                return Err(
+                    ErrorVal::arg_error(format!(".{name} takes no arguments")).or_span(span)
+                );
             }
             let p = p.clone();
             self.path_fs_method(&p, name).map_err(|e| e.or_span(span))

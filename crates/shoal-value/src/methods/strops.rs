@@ -35,9 +35,7 @@ pub(crate) fn matches_method(v: Value, q: &Value) -> VResult<Value> {
 pub(crate) fn replace_method(v: Value, pat: &Value, rep: &str) -> VResult<Value> {
     match (v, pat) {
         (Value::Str(s), Value::Str(p)) => Ok(Value::Str(s.replace(p.as_str(), rep))),
-        (Value::Str(s), Value::Regex(r)) => {
-            Ok(Value::Str(r.re.replace_all(&s, rep).into_owned()))
-        }
+        (Value::Str(s), Value::Regex(r)) => Ok(Value::Str(r.re.replace_all(&s, rep).into_owned())),
         (Value::Str(_), other) => Err(ErrorVal::type_error(format!(
             "replace pattern must be str or regex, found {}",
             other.type_name()
