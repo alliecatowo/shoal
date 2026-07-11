@@ -1,17 +1,19 @@
 # A handful of small, deterministic compositional cases not yet covered
-# elsewhere: `.str()`'s receiver-type boundary on a plain `int` (only
-# `str`/`path`/`bytes` have an arm in `strops::to_str` — CONTRACTS §3 never
-# lists `int -> str` as an implicit conversion; `str_interp`/`+` concat need
-# an explicit `.str()` cast, and this is the type-error you get for
-# forgetting one on a non-castable type), a record's `.values()` feeding
-# `.flatten()`, and a `.sort_by` result immediately `.reverse()`d (descending
-# via ascending-then-flip, distinct from list2-sort-by-descending-key's
-# negated-key approach in list-methods-2.toml).
+# elsewhere: `.str()` on a plain `int` (UPDATED: `strops::to_str` gained
+# int/float/bool arms that yield the canonical render form — the old
+# "cannot convert int to str" type_error was a field-tested paper cut, and
+# TDD §5 / CONTRACTS §3 pin `.str` in the method set without restricting
+# the receiver; datetime/list/… receivers still error, per
+# dt2-str-method-is-type-error and methc-str-on-a-mixed-list-is-a-type-error),
+# a record's `.values()` feeding `.flatten()`, and a `.sort_by` result
+# immediately `.reverse()`d (descending via ascending-then-flip, distinct
+# from list2-sort-by-descending-key's negated-key approach in
+# list-methods-2.toml).
 
 [[case]]
-name = "misc-int-str-method-is-type-error"
+name = "misc-int-str-method-renders-decimal"
 src = "(5).str()"
-error = "type_error"
+value = '"5"'
 
 [[case]]
 name = "misc-record-values-then-flatten"

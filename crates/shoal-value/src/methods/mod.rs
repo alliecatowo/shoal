@@ -16,6 +16,7 @@
 //! - [`stream`] — the `stream<T>` method surface (STREAMS §3–§4).
 //! - [`outcome`] — outcome method forwarding (P1b unification).
 //! - [`task`] — task lifecycle methods (TDD §4.7 job control).
+//! - [`suggest`] — did-you-mean hints for the unknown-method fall-through.
 
 mod list;
 mod num;
@@ -24,6 +25,7 @@ mod path;
 mod record;
 mod stream;
 mod strops;
+mod suggest;
 mod task;
 
 use super::*;
@@ -121,6 +123,9 @@ fn dispatch(ctx: &mut dyn CallCtx, recv: Value, name: &str, args: CallArgs) -> V
         "chunks" => list::chunks(recv, int_arg(&args, 0, 0)?),
         "zip" => list::zip(recv, arg(&args, 0)?.clone()),
         "group" => list::group(ctx, recv, arg(&args, 0)?),
+        // `.join()` deliberately defaults its separator to "" (plain
+        // concatenation) — unlike the required-argument predicates below, a
+        // zero-arg join has one obvious, harmless meaning.
         "join" => list::join(recv, str_arg(&args, 0, "")?),
         "lines" => strops::string_unary(recv, |s| {
             Value::List(
@@ -139,17 +144,29 @@ fn dispatch(ctx: &mut dyn CallCtx, recv: Value, name: &str, args: CallArgs) -> V
         "upper" => strops::string_unary(recv, |s| Value::Str(s.to_uppercase())),
         "lower" => strops::string_unary(recv, |s| Value::Str(s.to_lowercase())),
         "split" => {
-            let sep = str_arg(&args, 0, "")?;
+            let sep = req_str_arg(&args, 0, ".split requires a separator argument")?;
             strops::string_unary(recv, |s| {
                 Value::List(s.split(sep).map(|x| Value::Str(x.into())).collect())
             })
         }
-        "starts_with" => strops::string_pred(recv, str_arg(&args, 0, "")?, |s, q| s.starts_with(q)),
-        "ends_with" => strops::string_pred(recv, str_arg(&args, 0, "")?, |s, q| s.ends_with(q)),
+        "starts_with" => strops::string_pred(
+            recv,
+            req_str_arg(&args, 0, ".starts_with requires a prefix argument")?,
+            |s, q| s.starts_with(q),
+        ),
+        "ends_with" => strops::string_pred(
+            recv,
+            req_str_arg(&args, 0, ".ends_with requires a suffix argument")?,
+            |s, q| s.ends_with(q),
+        ),
         "contains" => list::contains(recv, arg(&args, 0)?),
         "replace" => {
             let pat = arg(&args, 0)?.clone();
-            let rep = str_arg(&args, 1, "")?;
+            let rep = req_str_arg(
+                &args,
+                1,
+                ".replace requires a replacement argument: .replace(pattern, replacement)",
+            )?;
             strops::replace_method(recv, &pat, rep)
         }
         "matches" => strops::matches_method(recv, arg(&args, 0)?),
@@ -159,7 +176,11 @@ fn dispatch(ctx: &mut dyn CallCtx, recv: Value, name: &str, args: CallArgs) -> V
         "keys" => record::record_side(recv, true),
         "values" => record::record_side(recv, false),
         "items" => record::items(recv),
-        "set" => record::set(recv, str_arg(&args, 0, "")?, arg(&args, 1)?.clone()),
+        "set" => record::set(
+            recv,
+            req_str_arg(&args, 0, ".set requires a key argument: .set(key, value)")?,
+            arg(&args, 1)?.clone(),
+        ),
         "merge" => record::merge(recv, arg(&args, 0)?.clone()),
         "get" => list::get(
             recv,
@@ -185,10 +206,7 @@ fn dispatch(ctx: &mut dyn CallCtx, recv: Value, name: &str, args: CallArgs) -> V
         "suspend" => no_args(&args).and_then(|_| task::task_suspend(recv)),
         "resume" => no_args(&args).and_then(|_| task::task_resume(recv)),
         "is_suspended" => no_args(&args).and_then(|_| task::task_is_suspended(recv)),
-        _ => Err(ErrorVal::new(
-            "field_missing",
-            format!("unknown method `.{name}` on {}", recv.type_name()),
-        )),
+        _ => Err(suggest::unknown_method(name, &recv)),
     }
 }
 
@@ -217,6 +235,23 @@ pub(crate) fn int_arg(args: &CallArgs, n: usize, default: i64) -> VResult<usize>
 pub(crate) fn str_arg<'a>(args: &'a CallArgs, n: usize, default: &'a str) -> VResult<&'a str> {
     match args.pos.get(n) {
         None => Ok(default),
+        Some(Value::Str(s)) => Ok(s),
+        Some(v) => Err(ErrorVal::type_error(format!(
+            "expected str, found {}",
+            v.type_name()
+        ))),
+    }
+}
+/// A REQUIRED `str` argument: a missing argument is an `arg_error`, never a
+/// silent `""` default (lenient defaults made `"x".starts_with()` return
+/// `true` — a predicate that lies).
+pub(crate) fn req_str_arg<'a>(
+    args: &'a CallArgs,
+    n: usize,
+    missing: &'static str,
+) -> VResult<&'a str> {
+    match args.pos.get(n) {
+        None => Err(ErrorVal::arg_error(missing)),
         Some(Value::Str(s)) => Ok(s),
         Some(v) => Err(ErrorVal::type_error(format!(
             "expected str, found {}",
@@ -483,6 +518,83 @@ mod tests {
         assert_eq!(
             call(Value::Path(PathBuf::from("/a/b")), "str", vec![]).unwrap(),
             Value::Str("/a/b".into())
+        );
+    }
+
+    #[test]
+    fn unknown_method_carries_did_you_mean_hint() {
+        let list = Value::List(vec![Value::Int(1)]);
+        let e = call(list.clone(), "length", vec![]).unwrap_err();
+        assert_eq!(e.code, "field_missing");
+        assert_eq!(e.hint.as_deref(), Some("did you mean .len()?"));
+        let e = call(list.clone(), "size", vec![]).unwrap_err();
+        assert_eq!(e.hint.as_deref(), Some("did you mean .len()?"));
+        let e = call(Value::Str("a".into()), "to_upper", vec![]).unwrap_err();
+        assert_eq!(e.hint.as_deref(), Some("did you mean .upper()?"));
+        let e = call(Value::Path(PathBuf::from("x")), "read_str", vec![]).unwrap_err();
+        assert_eq!(e.hint.as_deref(), Some("did you mean .read()?"));
+        let e = call(list.clone(), "push", vec![Value::Int(2)]).unwrap_err();
+        assert!(e.hint.unwrap().contains("immutable"));
+        let e = call(Value::Str("ab".into()), "substring", vec![Value::Int(1)]).unwrap_err();
+        assert!(e.hint.unwrap().contains(".take"));
+        // A near-typo resolves by edit distance.
+        let e = call(list, "sortt", vec![]).unwrap_err();
+        assert_eq!(e.hint.as_deref(), Some("did you mean .sort()?"));
+        // Nothing plausible → no hint, same error as before.
+        let e = call(Value::Int(1), "frobnicate", vec![]).unwrap_err();
+        assert_eq!(e.code, "field_missing");
+        assert_eq!(e.hint, None);
+    }
+
+    #[test]
+    fn scalar_str_renders_canonical_form() {
+        assert_eq!(
+            call(Value::Int(42), "str", vec![]).unwrap(),
+            Value::Str("42".into())
+        );
+        assert_eq!(
+            call(Value::Float(1.5), "str", vec![]).unwrap(),
+            Value::Str("1.5".into())
+        );
+        assert_eq!(
+            call(Value::Bool(true), "str", vec![]).unwrap(),
+            Value::Str("true".into())
+        );
+        // Unconverted types keep erroring, now with a teaching hint.
+        let e = call(Value::List(vec![]), "str", vec![]).unwrap_err();
+        assert_eq!(e.code, "type_error");
+        assert!(e.hint.unwrap().contains("interpolation"));
+    }
+
+    #[test]
+    fn required_str_args_error_when_missing() {
+        let s = || Value::Str("hello".into());
+        for (method, args) in [
+            ("starts_with", vec![]),
+            ("ends_with", vec![]),
+            ("split", vec![]),
+            ("replace", vec![Value::Str("l".into())]),
+        ] {
+            let e = call(s(), method, args).unwrap_err();
+            assert_eq!(e.code, "arg_error", "{method} must require its argument");
+        }
+        let e = call(Value::Record(Record::new()), "set", vec![]).unwrap_err();
+        assert_eq!(e.code, "arg_error");
+        assert!(e.msg.contains("key"));
+        // Explicit empty-string arguments are still legal.
+        assert_eq!(
+            call(s(), "starts_with", vec![Value::Str("".into())]).unwrap(),
+            Value::Bool(true)
+        );
+        // `.join()` keeps its deliberate "" default (concatenation).
+        assert_eq!(
+            call(
+                Value::List(vec![Value::Str("a".into()), Value::Str("b".into())]),
+                "join",
+                vec![]
+            )
+            .unwrap(),
+            Value::Str("ab".into())
         );
     }
 

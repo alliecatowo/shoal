@@ -96,9 +96,18 @@ pub(crate) fn to_str(v: Value, lossy: bool) -> VResult<Value> {
                     .map_err(|_| ErrorVal::new("utf8_error", "bytes are not valid UTF-8"))
             }
         }
-        v => Err(ErrorVal::type_error(format!(
-            "cannot convert {} to str",
-            v.type_name()
-        ))),
+        // int/float/bool → their canonical render form ("42", "1.5", "true"),
+        // exactly what `"{n}"` interpolation produces (CONTRACTS §3 render
+        // rules) — `42.str()` erroring taught nothing and helped nobody.
+        v @ (Value::Int(_) | Value::Float(_) | Value::Bool(_)) => {
+            Ok(Value::Str(crate::render::render_inline(&v)))
+        }
+        // Everything else keeps its render form reachable via interpolation;
+        // `.str()` stays a *conversion*, not a formatter (datetime/list/… are
+        // pinned as type errors by the corpus).
+        v => Err(
+            ErrorVal::type_error(format!("cannot convert {} to str", v.type_name()))
+                .with_hint("format any value with string interpolation instead: \"{x}\""),
+        ),
     }
 }

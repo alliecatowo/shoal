@@ -147,18 +147,32 @@ impl Value {
     }
 }
 
-/// Serialize a value to the bytes `.feed` writes to a command's stdin
-/// (IO.md §1.2). The mapping is exhaustive over feedable types; anything else
-/// is an error — `feed_error` (with a specialized message) for the types that
-/// are *deliberately* never feedable, plain `type_error` otherwise.
+/// Serialize a value to the bytes `.feed` writes to a command's stdin,
+/// following IO.md §1.2's feedability table exactly. Anything not in the
+/// table is an error — `feed_error` (with a specialized message) for the
+/// types that are *deliberately* never feedable, plain `type_error`
+/// otherwise.
 pub fn feed_bytes(v: &Value) -> Result<Vec<u8>, ErrorVal> {
     match v {
         // str → its UTF-8 bytes, verbatim (no trailing newline added).
         Value::Str(s) => Ok(s.clone().into_bytes()),
         // bytes → raw.
         Value::Bytes(b) => Ok(b.as_ref().clone()),
-        // path → its bytes.
-        Value::Path(p) => Ok(p.to_string_lossy().into_owned().into_bytes()),
+        // path → NOT directly feedable (IO.md §1.2): a bare path is a name,
+        // not content. Feeding the name's bytes silently did the wrong thing.
+        Value::Path(_) => Err(ErrorVal::type_error(
+            "cannot feed a path to a command's stdin — a bare path is a name, not the file's contents",
+        )
+        .with_hint("feed the contents instead: path(\"x\").read.feed(cmd)")),
+        // int/float/bool/size/duration/datetime/time → decimal text via the
+        // same rule as `render_inline` (IO.md §1.2), no trailing newline.
+        Value::Int(_)
+        | Value::Float(_)
+        | Value::Bool(_)
+        | Value::Size(_)
+        | Value::Duration(_)
+        | Value::DateTime(_)
+        | Value::Time(_) => Ok(render::render_inline(v).into_bytes()),
         // list<str> → each element joined with `\n`, plus one trailing `\n`.
         Value::List(xs) if xs.iter().all(|x| matches!(x, Value::Str(_))) => {
             let mut out = String::new();
@@ -174,6 +188,21 @@ pub fn feed_bytes(v: &Value) -> Result<Vec<u8>, ErrorVal> {
         Value::Record(_) | Value::Table(_) | Value::List(_) => {
             Ok(serde_json::to_vec(&value_to_json(v)).unwrap_or_default())
         }
+        // outcome → its structured `.out` re-encoded per the rules above when
+        // one exists, else its raw stdout bytes (IO.md §1.2:
+        // `outcome.feed(cmd)` ≡ `outcome.out.feed(cmd)` when `.out` is
+        // structured, else the stdout bytes verbatim).
+        Value::Outcome(o) => match o.out_value() {
+            Value::Str(_) => Ok(o.stdout.as_ref().clone()),
+            structured => feed_bytes(&structured),
+        },
+        // stream → §1.2 promises *incremental* feeding as items arrive, which
+        // needs evaluator/exec support (a live child stdin pipe); an honest
+        // error until that lands rather than a buffering fake.
+        Value::Stream(_) => Err(ErrorVal::type_error(
+            "feeding a stream to a command's stdin is not implemented yet",
+        )
+        .with_hint("collect a bounded stream first: stream.collect().feed(cmd)")),
         // Deliberately never feedable (IO.md §1.2 / §5) → `feed_error`.
         Value::Secret(_) => Err(ErrorVal::new(
             "feed_error",
@@ -186,7 +215,8 @@ pub fn feed_bytes(v: &Value) -> Result<Vec<u8>, ErrorVal> {
                 format!("a {} cannot be fed as stdin data", v.type_name()),
             ))
         }
-        // Anything else has no pinned serialization yet → generic type_error.
+        // Anything else (null, cmd refs) has no serialization in §1.2's table
+        // → generic type_error.
         other => Err(ErrorVal::type_error(format!(
             "cannot feed a {} to a command's stdin",
             other.type_name()
@@ -380,8 +410,75 @@ mod tests {
     }
 
     #[test]
-    fn feed_bytes_unfeedable_scalar_is_type_error() {
-        assert_eq!(feed_bytes(&Value::Int(4)).unwrap_err().code, "type_error");
+    fn feed_bytes_scalars_feed_their_render_form() {
+        // IO.md §1.2: int/float/bool/size/duration/datetime/time feed their
+        // `render_inline` text, UTF-8, no trailing newline.
+        assert_eq!(feed_bytes(&Value::Int(4)).unwrap(), b"4");
+        assert_eq!(feed_bytes(&Value::Float(1.5)).unwrap(), b"1.5");
+        assert_eq!(feed_bytes(&Value::Bool(true)).unwrap(), b"true");
+        assert_eq!(feed_bytes(&Value::Size(1_500)).unwrap(), b"1.5kb");
+        assert_eq!(
+            feed_bytes(&Value::Duration(90_000_000_000)).unwrap(),
+            b"1m30s"
+        );
+        assert_eq!(
+            feed_bytes(&Value::Time(TimeVal {
+                hour: 10,
+                min: 0,
+                sec: 0
+            }))
+            .unwrap(),
+            b"10:00"
+        );
+    }
+
+    #[test]
+    fn feed_bytes_path_is_type_error_with_read_hint() {
+        // IO.md §1.2: a bare path is a name, not content — never fed silently.
+        let e = feed_bytes(&Value::Path(PathBuf::from("/a/b"))).unwrap_err();
+        assert_eq!(e.code, "type_error");
+        assert!(e.msg.contains("a name, not"));
+        assert!(e.hint.unwrap().contains(".read"));
+    }
+
+    #[test]
+    fn feed_bytes_outcome_feeds_out_or_stdout() {
+        fn outcome(stdout: &[u8], parsed: Option<Value>) -> Value {
+            Value::Outcome(Arc::new(OutcomeVal {
+                status: Some(0),
+                signal: None,
+                ok: true,
+                stdout: Arc::new(stdout.to_vec()),
+                stderr: Arc::new(Vec::new()),
+                dur_ns: 0,
+                pid: 0,
+                cmd: "x".into(),
+                parsed,
+                streamed: false,
+            }))
+        }
+        // Structured `.out` → re-encoded JSON.
+        let mut rec = Record::new();
+        rec.insert("n".into(), Value::Int(2));
+        assert_eq!(
+            feed_bytes(&outcome(b"{\"n\": 2}\n", Some(Value::Record(rec)))).unwrap(),
+            br#"{"n":2}"#
+        );
+        // Text `.out` → the raw stdout bytes, verbatim.
+        assert_eq!(feed_bytes(&outcome(b"hi\n", None)).unwrap(), b"hi\n");
+    }
+
+    #[test]
+    fn feed_bytes_stream_is_unimplemented_type_error() {
+        let s = StreamVal::from_iter("int", (0..2).map(|i| Ok(Value::Int(i))));
+        let e = feed_bytes(&Value::Stream(s)).unwrap_err();
+        assert_eq!(e.code, "type_error");
+        assert!(e.hint.unwrap().contains("collect"));
+    }
+
+    #[test]
+    fn feed_bytes_null_is_type_error() {
+        assert_eq!(feed_bytes(&Value::Null).unwrap_err().code, "type_error");
     }
 
     #[test]

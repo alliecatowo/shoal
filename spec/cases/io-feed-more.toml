@@ -1,21 +1,23 @@
-# Further `.feed` hardening beyond io.toml's first pass: the plain
-# `type_error` path for receivers with no pinned serialization (int, bool —
-# distinct from the specialized `feed_error` reserved for the deliberately-
-# never-feedable types in io.toml's `io-feed-regex-is-feed-error`), and a
-# non-str list's fall-through to compact-JSON serialization (feed_bytes's
-# `list<str>` fast path only applies when EVERY element is already a
-# `str`; a `list<int>` falls to the generic JSON branch, and `cat`'s
-# passthrough plus `.out`'s lazy JSON-sniff round-trips it back to a list).
+# Further `.feed` hardening beyond io.toml's first pass: the scalar rows of
+# IO.md §1.2's feedability table (int/bool feed their `render_inline` text —
+# these two cases previously pinned the pre-implementation `type_error`, and
+# were UPDATED when feed_bytes gained the documented scalar serialization;
+# more scalar coverage lives in method-errors.toml), and a non-str list's
+# fall-through to compact-JSON serialization (feed_bytes's `list<str>` fast
+# path only applies when EVERY element is already a `str`; a `list<int>`
+# falls to the generic JSON branch, and `cat`'s passthrough plus `.out`'s
+# lazy JSON-sniff round-trips it back to a list).
 
 [[case]]
-name = "iofeed2-int-receiver-is-type-error"
-src = "5.feed(sort)"
-error = "type_error"
+name = "iofeed2-int-receiver-feeds-decimal-text"
+# int → decimal text via `render_inline` (IO.md §1.2), no trailing newline.
+src = "5.feed(cat).out"
+value = '"5"'
 
 [[case]]
-name = "iofeed2-bool-receiver-is-type-error"
-src = "true.feed(sort)"
-error = "type_error"
+name = "iofeed2-bool-receiver-feeds-render-form"
+src = "true.feed(cat).out"
+value = '"true"'
 
 [[case]]
 name = "iofeed2-int-list-feeds-as-compact-json-and-reparses"
