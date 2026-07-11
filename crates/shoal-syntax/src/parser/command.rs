@@ -108,7 +108,115 @@ impl<'s> Parser<'s> {
         let mut trailing = None;
         loop {
             let (t, s) = self.peek(Mode::Cmd)?;
-            match t{Tok::Newline|Tok::Semi|Tok::Eof|Tok::RBrace|Tok::RParen|Tok::AndAnd|Tok::OrOr=>break,Tok::Pipe=>return Err(ParseError::new("shoal has no pipe operator",s).hint("data composes with `.` (try `ls.where(.size > 1mb)`); raw byte plumbing is `.feed(cmd)`; verbatim POSIX lives in `sh { … }`")),Tok::Amp=>{self.bump(Mode::Cmd)?;background=true;break},Tok::LBrace=>{trailing=Some(self.block()?);break},Tok::RedirOut|Tok::RedirAppend|Tok::RedirIn=>{let kind=match self.bump(Mode::Cmd)?.0{Tok::RedirOut=>RedirectKind::Out,Tok::RedirAppend=>RedirectKind::Append,_=>RedirectKind::In};let target=self.cmd_arg()?;redirects.push(Redirect{kind,span:Span::new(s.start as usize,target.span().end as usize),target})},_=>args.push(self.cmd_arg()?)}
+            match t {
+                Tok::Newline
+                | Tok::Semi
+                | Tok::Eof
+                | Tok::RBrace
+                | Tok::RParen
+                | Tok::AndAnd
+                | Tok::OrOr => break,
+                Tok::Pipe => {
+                    return Err(ParseError::new("shoal has no pipe operator", s).hint(
+                        "data composes with `.` (try `ls.where(.size > 1mb)`); raw byte plumbing \
+                         is `.feed(cmd)`; verbatim POSIX lives in `sh { … }`",
+                    ));
+                }
+                Tok::Amp => {
+                    let (_, amp_s) = self.bump(Mode::Cmd)?;
+                    // `&>` / `&>>` — the box-era stream-merging redirect
+                    // (IO.md §4). Without this check it silently reparses as
+                    // `(cmd &) > f`, a backgrounded command compared to a
+                    // variable.
+                    if let Ok((Tok::RedirOut | Tok::RedirAppend, s2)) =
+                        self.lx.token(amp_s.end as usize, Mode::Cmd)
+                        && s2.start == amp_s.end
+                    {
+                        return Err(ParseError::new(
+                            "shoal has no stream-merging redirect",
+                            Span::new(amp_s.start as usize, s2.end as usize),
+                        )
+                        .hint(
+                            "capture is structured: `(cmd).out` / `(cmd).stderr`; a \
+                             statement-position PTY run already merges the streams",
+                        ));
+                    }
+                    background = true;
+                    break;
+                }
+                Tok::LBrace => {
+                    trailing = Some(self.block()?);
+                    break;
+                }
+                Tok::RedirIn => {
+                    // `<<` (heredoc) / `<<<` (here-string) — box-era spellings
+                    // with curated teaching errors (IO.md §4).
+                    if let Ok((Tok::RedirIn, s2)) = self.lx.token(s.end as usize, Mode::Cmd)
+                        && s2.start == s.end
+                    {
+                        let third = matches!(
+                            self.lx.token(s2.end as usize, Mode::Cmd),
+                            Ok((Tok::RedirIn, s3)) if s3.start == s2.end
+                        );
+                        return Err(if third {
+                            ParseError::new(
+                                "shoal has no here-strings",
+                                Span::new(s.start as usize, s2.end as usize + 1),
+                            )
+                            .hint("feed the value instead: `\"text\".feed(cmd)`")
+                        } else {
+                            ParseError::new(
+                                "shoal has no heredocs",
+                                Span::new(s.start as usize, s2.end as usize),
+                            )
+                            .hint(
+                                "feed a string or multiline literal instead: \
+                                 `value.feed(cmd)`, or use an interpreter block: \
+                                 `python { … }`",
+                            )
+                        });
+                    }
+                    self.bump(Mode::Cmd)?;
+                    let target = self.cmd_arg()?;
+                    redirects.push(Redirect {
+                        kind: RedirectKind::In,
+                        span: Span::new(s.start as usize, target.span().end as usize),
+                        target,
+                    });
+                }
+                Tok::RedirOut | Tok::RedirAppend => {
+                    // `2>` / `1>>` — fd-numbered redirects (IO.md §4): a bare
+                    // digit word glued to the redirect. Without this check the
+                    // digit silently passes as an ARGUMENT and the redirect
+                    // grabs stdout — the opposite of the user's intent.
+                    if let Some(CmdArg::Word { text, span }) = args.last()
+                        && !text.is_empty()
+                        && text.bytes().all(|b| b.is_ascii_digit())
+                        && span.end == s.start
+                    {
+                        return Err(ParseError::new(
+                            "shoal has no fd-numbered redirects",
+                            Span::new(span.start as usize, s.end as usize),
+                        )
+                        .hint(
+                            "stderr is structured — `(cmd).stderr`, or \
+                             `try { cmd } catch e { e.stderr }`; a statement-position \
+                             PTY run already merges the streams",
+                        ));
+                    }
+                    let kind = match self.bump(Mode::Cmd)?.0 {
+                        Tok::RedirAppend => RedirectKind::Append,
+                        _ => RedirectKind::Out,
+                    };
+                    let target = self.cmd_arg()?;
+                    redirects.push(Redirect {
+                        kind,
+                        span: Span::new(s.start as usize, target.span().end as usize),
+                        target,
+                    });
+                }
+                _ => args.push(self.cmd_arg()?),
+            }
         }
         Ok(CmdCall {
             head,
@@ -125,6 +233,13 @@ impl<'s> Parser<'s> {
         let (t, s) = self.bump(Mode::Cmd)?;
         Ok(match t {
             Tok::Word(text) => CmdArg::Word { text, span: s },
+            // `IDENT=rest` is an env-prefix only AT HEAD POSITION (TDD §2.2 —
+            // the lexer classifies by shape and "the parser decides"). As an
+            // argument it is a plain word: `echo FOO=bar`, `make CC=gcc`.
+            Tok::EnvAssign(name, rest) => CmdArg::Word {
+                text: format!("{name}={rest}"),
+                span: s,
+            },
             Tok::PathWord(text) => CmdArg::Path { text, span: s },
             Tok::GlobWord(pattern) => CmdArg::Glob { pattern, span: s },
             Tok::Str(x) => CmdArg::Str {

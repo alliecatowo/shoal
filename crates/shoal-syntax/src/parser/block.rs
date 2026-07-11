@@ -40,6 +40,11 @@ impl<'s> Parser<'s> {
             });
         }
         let save = self.pos;
+        // The first field may sit on its own line (`{\n  a: 1, b: 2 }`):
+        // probe past leading newlines — later fields were already
+        // newline-tolerant, only this probe was position-sensitive. The
+        // rewind to `save` below restores fully for the block path.
+        self.skip_newlines()?;
         if let (Tok::Ident(name) | Tok::Str(name), s) = self.bump(Mode::Expr)? {
             if self.eat(Mode::Expr, &Tok::Colon)?.is_some() {
                 let mut fields = vec![RecordField {
