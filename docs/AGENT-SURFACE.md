@@ -50,13 +50,14 @@ Field-path grammar (same as `value.get`): `.field`, `[n]`, `[a..b]` — e.g.
 `null/bool/int/float` native; `{"$":"str","v":…}` only when tagging is needed (top level values are
 always tagged); `{"$":"path","v":…,"raw":base64?}` (raw present iff non-UTF-8);
 `{"$":"size","v":bytes}`; `{"$":"duration","v":ns}`; `{"$":"datetime","v":rfc3339}`;
-`{"$":"time","v":"HH:MM:SS"}`; `{"$":"regex","v":src}`; `{"$":"glob","v":pattern}`;
+`{"$":"time","v":"HH:MM:SS"}`; `{"$":"regex","src":…}`; `{"$":"glob","pattern":…}`;
 `{"$":"range","start","end","inclusive"}`; `{"$":"list","v":[…]}`;
 `{"$":"record","v":{k:…}}`; **table columnar**: `{"$":"table","cols":{name:[…],…},"n":N}`;
 `{"$":"outcome","status","signal","ok","out":<tagged>,"err":str,"dur_ns","pid","cmd","span"}`;
-`{"$":"error","code","msg","span","hint","stderr"}`; `{"$":"task","id","done","desc"}`;
-`{"$":"stream","label","uri"}` (never inline payload); `{"$":"secret","name"}` (never material);
-`{"$":"bytes","len","v":base64?}` (v elided per §3); `{"$":"closure","repr"}`.
+`{"$":"error","code","msg","span","hint","stderr"}`; `{"$":"task","id","done"}`;
+`{"$":"stream","label"}` (never inline payload); `{"$":"secret","name"}` (never material);
+`{"$":"bytes","v":base64}` (elided per §3); `{"$":"closure","repr"}`;
+`{"$":"cmd","repr"}` (alias/partial command application).
 
 ## 3. The elision rule (wire-level, automatic)
 
@@ -86,7 +87,7 @@ push = subscription (§6). At-least-once; consumers dedup by seq.
 Channels (payloads are `$`-tagged):
 ```
 session.transcript   {n, ref, summary:{type, ok?, cmd?, n?}}      every new out[n]
-task.{id}            {state:"started"|"output"|"suspended"|"exited", chunk_ref?, exit?}
+task.{id}            "started", then terminal {state:"completed"|"failed"|"cancelled", ref?}
 journal              {entry_id, head, ok, principal}
 approval             {plan_ref, effects, principal, expires}       plan awaiting approval
 render               {ref, render}                                 UI clients
@@ -105,9 +106,10 @@ its elided form) **and** a `resource_link` to the ref — text content is a rend
 ```
 shoal_exec   {src|ast, mode:"run"|"plan", position:"stmt"|"value", background:bool,
               timeout_ms?, elide?}
-  → run:  {ref, uri, value|elided, render, ok, events:"session.transcript"}
-  → run+background or timeout hit: {task:{id,uri}, events:"task.{id}"}   (never blocks context)
-  → plan: {plan_ref, uri, effects, reversibility, verdict}
+  → run:  {ref, value|elided, render}          (no uri/ok/events fields today)
+  → run+background: {task:"task:N", events:"task.N"}       (plain strings; never blocks context)
+  → timeout hit:    {task:"task:N", events:"task.N", timed_out:true}   (command keeps running)
+  → plan: {plan_ref, effects, reversibility, verdict, approval_pending}
 shoal_apply  {plan_ref}          → as exec-run   (refs are unique per plan — collision = bug)
 shoal_get    {ref|uri, path?, slice?, format?, elide?}
 shoal_journal{since?, head?, principal?, ok?, limit?}

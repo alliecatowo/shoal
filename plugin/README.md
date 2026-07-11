@@ -74,6 +74,12 @@ shoal-kernel --socket ~/.local/state/shoal/kernel.sock &
 export SHOAL_SOCKET=~/.local/state/shoal/kernel.sock   # must be set in the shell that launches `claude`
 ```
 
+**Keep `--socket` paths short.** Unix domain socket paths are capped at roughly **108 bytes**
+(`SUN_LEN`/`sun_path`; ~104 on macOS), and the limit applies to the whole absolute path. A socket
+buried in a deep project or temp directory fails to bind/connect with an unhelpful
+`Invalid argument`-style error. Prefer short, stable locations like the examples here
+(`~/.local/state/shoal/…`, `/tmp/shoal-<uid>/…`) over anything nested inside a checkout.
+
 Claude Code's stdio MCP servers inherit the environment of the process that launched `claude` — so
 whichever shell starts your Claude Code session needs `SHOAL_SOCKET` (or `XDG_RUNTIME_DIR`) exported
 *before* `claude` starts, every time, on both macOS and Linux, **unless** the `shoal-mcp` `/tmp`

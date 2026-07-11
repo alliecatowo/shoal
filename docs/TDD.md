@@ -308,7 +308,7 @@ Canonical AST node kinds: `prog let var fn param alias use call word flag lit va
 
 ```sql
 entry(id INTEGER PK, session TEXT, principal TEXT, ts INT, dur_ns INT,
-      cwd BLOB, env_hash BLOB, ast BLOB, effects TEXT, status INT, ok BOOL, opaque BOOL)
+      cwd BLOB, env_hash BLOB, src TEXT, ast BLOB, effects TEXT, status INT, ok BOOL, opaque BOOL)
 output(entry_id INT, kind TEXT, hash BLOB, len INT, meta TEXT)
 undo(entry_id INT, op TEXT, inverse TEXT)
 pin(hash BLOB PK)

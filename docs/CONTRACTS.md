@@ -106,6 +106,9 @@ pub struct ExecSpec {
     pub env: Vec<(OsString, OsString)>,  // the COMPLETE child environment
     pub stdin: StdinSpec,
     pub mode: ExecMode,
+    pub sandbox: Option<shoal_leash::SandboxPolicy>,  // None = existing unsandboxed behavior; Some = apply the
+                                                      // strongest available OS enforcement pre-exec (TDD §8),
+                                                      // reported honestly via ExecResult::enforcement
 }
 
 pub enum StdinSpec { Null, Inherit, Bytes(Vec<u8>), File(PathBuf) }
@@ -125,6 +128,9 @@ pub struct ExecResult {
     pub stderr: Vec<u8>,         // captured bytes (PtyTee: empty)
     pub dur: std::time::Duration,
     pub pid: u32,
+    pub enforcement: Option<shoal_leash::EnforcementStatus>,  // Some iff sandbox was requested: the tier
+                                                              // ACTUALLY applied (TDD §8 tier honesty) —
+                                                              // never `enforced: true` unless it really was
 }
 
 #[derive(Clone, Default)]
@@ -153,6 +159,14 @@ pub fn spawn_capture(spec: ExecSpec, cancel: &CancelToken) -> std::io::Result<St
 
 /// PATH resolution (no shell involved, ever).
 pub fn which(name: &OsStr, path_var: Option<&OsStr>) -> Option<PathBuf>;
+
+// Source-compat wrappers around the ExecSpec::sandbox path (hard/fail-closed Landlock). Kept only
+// for compatibility — exercised by shoal-exec's own tests, no other in-tree callers; new code sets
+// ExecSpec::sandbox instead.
+pub fn run_sandboxed(spec: ExecSpec, cancel: &CancelToken, sandbox: shoal_leash::FsSandbox,
+                     verified: Option<&shoal_leash::SpawnPreflight>) -> std::io::Result<ExecResult>;
+pub fn spawn_capture_sandboxed(spec: ExecSpec, cancel: &CancelToken, sandbox: shoal_leash::FsSandbox,
+                     verified: Option<&shoal_leash::SpawnPreflight>) -> std::io::Result<StreamingChild>;
 ```
 
 Requirements: no zombies (always reaped); parent terminal state always restored (PtyTee restores cooked mode even on panic — use a drop guard); Capture-mode children get `setpgid(0,0)`; E2BIG and spawn errors surface as `io::Error`. Unit tests must cover: echo capture, exit codes, signal death (`kill -SEGV` a child), stdin Bytes, cancellation kills a sleeping child, which() resolution, PtyTee against the `script`-style check `test -t 1` (child sees a tty) — PTY tests must be skipped gracefully when the test runner itself has no tty (CI): only assert what's assertable (child sees pty, bytes teed).
@@ -177,7 +191,9 @@ pub struct EntryRecord {
     pub opaque: bool,
 }
 
-pub struct OutputRow { pub kind: String, pub hash: String, pub len: i64 }
+pub struct OutputRow { pub kind: String, pub hash: String, pub len: i64, pub meta: Option<OutputMeta> }
+pub struct OutputMeta { pub truncated: bool, pub original_len: u64, pub stored_len: u64 }
+// meta is Some iff the blob was truncated at the output hard cap before storage.
 pub struct EntryRow {
     pub id: i64, pub session: String, pub principal: String,
     pub ts_ns: i64, pub dur_ns: Option<i64>, pub cwd: Vec<u8>,
@@ -200,7 +216,7 @@ impl Journal {
     pub fn in_memory() -> rusqlite::Result<Journal>;            // CAS in a temp dir
     pub fn append(&self, e: &EntryRecord) -> rusqlite::Result<i64>;
     pub fn finish(&self, id: i64, status: Option<i32>, ok: bool, dur_ns: i64) -> rusqlite::Result<()>;
-    /// Store bytes in CAS (zstd), link to entry. kind: "stdout" | "stderr" | "value" | "render". Returns blake3 hex.
+    /// Store bytes in CAS (zstd), link to entry. kind: "stdout" | "stderr" | "value" | "render" | "undo-snapshot". Returns blake3 hex.
     pub fn record_output(&self, id: i64, kind: &str, bytes: &[u8]) -> rusqlite::Result<String>;
     pub fn read_blob(&self, hash: &str) -> rusqlite::Result<Option<Vec<u8>>>;
     pub fn query(&self, q: &JournalQuery) -> rusqlite::Result<Vec<EntryRow>>;

@@ -34,11 +34,14 @@ already structured on the wire. Reach for `structuredContent` / `value.get` / `s
 > 6. Elision on the `render`/`content[0].text` fields.
 >
 > Language-surface staleness has also been corrected: `.feed`, interpreter blocks (`python { }` /
-> `jq { }` / …), and reactive streams/channels are **implemented** (see §6). The remaining genuinely-open
-> gaps this card documents (dead `capture`/`timeout` params, unexposed `elide` budgets,
-> `shoal_journal`'s `until`/`effects` schema mismatch, the narrow `value.get` path grammar,
-> `shoal_cap_request`'s unused `effects`, `complete`/`explain` being un-dispatched, background exec via
-> MCP, and real OS-level sandbox enforcement) are still open — a one-line probe beats trusting any banner.
+> `jq { }` / …), and reactive streams/channels are **implemented** (see §6). A later sync pass closed
+> most of what this note used to list as open: `shoal_exec` now has real `background`/`timeout_ms`/
+> `elide`/`mode` params (the dead `capture`/`timeout` are gone), `shoal_get` exposes `elide`,
+> `shoal_journal`'s `until`/`ok`/`effects` filters all work, `shoal_cap_request`'s `effects`
+> genuinely scopes the grant, and `complete`/`explain` are dispatched. The remaining genuinely-open
+> gaps this card documents (the narrow `value.get` path grammar, the language-channel→kernel-bus
+> bridge, and real OS-level sandbox enforcement through this surface) are still open — a one-line
+> probe beats trusting any banner.
 
 ---
 
@@ -76,16 +79,40 @@ shoal error code (`type_error`, `div_zero`, ...) lives at `data.code` for evalua
 
 ### 0.1 `shoal_exec` — run source, get a ref + a structured value
 
-**Params** (from the tool's actual JSON Schema): `{src: string (required), position?: "stmt"|"value", capture?: object, timeout?: number}`.
-**Gap**: `capture` and `timeout` are accepted by the schema but are currently **not wired to anything**
-— the kernel's `ExecParams` has no such fields, so they are silently dropped. Do not rely on them
-(see §6's "shoal_exec's capture/timeout params" bullet). If you omit `position`, the MCP facade defaults it to `"value"` (note: this differs from the
+**Params** (from the tool's actual JSON Schema, verified in `crates/shoal-mcp/src/tools.rs`;
+`additionalProperties: false`): `{src: string (required), mode?: "run"|"plan", position?:
+"stmt"|"value", background?: bool, timeout_ms?: int (≥1), elide?: {max_bytes?, max_rows?,
+max_items?}}`. The old dead `capture`/`timeout` params are **gone** — every field above is
+forwarded to the kernel and real:
+
+- `background: true` → the call returns immediately with `{"task": "task:<n>", "events":
+  "task.<n>"}` (both plain strings); the command keeps running as a kernel task. Cancel with
+  `shoal_cancel {task}`; watch via the `task.<n>` events channel (§0.8).
+- `timeout_ms` does **not kill anything**: a synchronous run that outlives the deadline is
+  *converted* to a background task and you get back `{"task": …, "events": …, "timed_out": true}`
+  (verified in `handlers_exec.rs`) — the command is still running; treat it exactly like a
+  `background:true` result.
+- `elide` is the per-call elision budget (tighten/loosen §1's defaults; `max_bytes` clamps at the
+  64 KiB hard cap).
+- Kernel-side, the wire field for `background` is named `async` (serde alias `background` —
+  `shoal-proto`'s `ExecParams`), and the kernel's `exec` additionally accepts `plan_ref` with
+  `mode: "approved"` — that mode is **`plan.apply`'s re-entry, not a caller-assertable privilege**:
+  the kernel verifies the named plan is approved for the calling session/principal and carries the
+  same source before skipping the leash verdict, and the MCP tool neither exposes nor forwards
+  `plan_ref`, so through this surface you always go `shoal_plan` → (`shoal_cap_request`) →
+  `shoal_apply`.
+
+If you omit `position`, the MCP facade defaults it to `"value"` (note: this differs from the
 raw kernel's own default of `"stmt"` — the MCP default is the one that matters to you).
 
 **What `position` actually controls** (read this carefully — it is the single sharpest edge in this
 surface): the kernel only special-cases `position: "value"` when `src` parses to **exactly one bare
 expression statement**. In that case, a failing command's `outcome` is *captured* (returned as a
-normal value, `.ok == false`, inspectable) instead of raised as an MCP error. **Any `src` with more
+normal value, `.ok == false`, inspectable) instead of raised as an MCP error. Two refinements,
+both verified against the binary: the capture applies to **external-command failures** (a non-ok
+`outcome` — e.g. `(sh { exit 3 })` comes back with `.status == 3`, `.ok == false`); a **builtin's
+raised error** (`div_zero`, `index_range`, …) still raises even as a single bare expression
+(`[1][3]` raises `index_range`, it is not captured). **Any `src` with more
 than one statement — including a `let` followed by a command — always evaluates with raise-on-failure
 semantics regardless of what you pass for `position`.** If you need to inspect a failure inside a
 multi-statement program, wrap the risky part in `try { ... } catch e { e }` inside the source itself.
@@ -97,9 +124,10 @@ multi-statement program, wrap the risky part in `try { ... } catch e { e }` insi
   those are spec'd, not implemented).
 - `value` is the real payload, `$`-tagged, elided per the rule in §1 if large.
 - `render` is a **full, non-elided** human string — see the flagged gap in §4 rule 14. Do not trust its size.
-- **A raised error produces no `ref` at all.** There is nothing to `shoal_get` afterward for a failed
-  call — the transcript entry is never created on the error path. Plan for this (see the "how to
-  inspect a failure" rule above).
+- **A raised error now DOES mint a ref** (verified in `handlers_exec.rs`): the structured error
+  value is stored in the transcript at `out:<n>`, and the JSON-RPC error's `data.ref` / `data.uri`
+  point at it — `shoal_get {ref: data.ref}` fetches the full `{code, msg, span, hint, stderr}`
+  error value after the fact, so a failed call is no longer a dead end.
 
 Worked example (kernel test `unix_stream_session_roundtrip`, `crates/shoal-kernel/src/lib.rs`):
 
@@ -126,10 +154,10 @@ evaluated at value position → `.out` is `"hi"`; rendered bare it is `outcome(s
 
 ### 0.2 `shoal_get` — drill into a transcript value without re-executing
 
-**Params**: `{ref: string (required), path?: string, slice?: [int, int]}` (`slice` is exactly 2
-integers). **Gap**: the kernel's `value.get` also accepts an `elide` budget (`{max_bytes?, max_rows?,
-max_items?}`) — `shoal_get`'s schema does not expose it (`additionalProperties: false`), so you cannot
-tighten/loosen elision through this tool today (see §6's "Per-call elision tuning via MCP" bullet).
+**Params**: `{ref: string (required), path?: string, slice?: [int, int], elide?: {max_bytes?,
+max_rows?, max_items?}}` (`slice` is exactly 2 integers). The `elide` budget **is now exposed and
+forwarded** to the kernel's `value.get` (verified in `crates/shoal-mcp/src/tools.rs`) — tighten or
+loosen per call; `max_bytes` still clamps at the 64 KiB hard cap.
 
 **Path grammar, exactly as implemented** (`resolve_value_path` in `crates/shoal-kernel/src/lib.rs`):
 dotted field names and bracketed non-negative integer indices — `out[3]`, `rows[0].name`, `out.status`.
@@ -214,49 +242,49 @@ identical shape to `shoal_exec`'s (`{ref, value, render}`). Fails with a JSON-RP
 ### 0.5 `shoal_journal` — query what already happened
 
 **Params** (tool schema, `additionalProperties: false`): `{since?: int, until?: int, principal?:
-string, effects?: string[], head?: string, limit?: int (>=1)}`.
+string, ok?: bool, effects?: string[], head?: string, limit?: int (>=1)}`.
 
-**Gap, verified in source**: the kernel's `JournalQueryParams` only has `since, principal, head, ok,
-limit` — **`until` and `effects` are accepted by the schema and silently ignored** (they map to no
-kernel field); conversely **`ok` (bool) is a real, working filter that the tool schema does not let
-you pass at all** (blocked by `additionalProperties: false`). Only `since`, `principal`, `head`,
-`limit` reliably do something today.
+**Every filter above is now real** (verified: the schema in `crates/shoal-mcp/src/tools.rs` exposes
+all seven and forwards them verbatim; the kernel's `JournalQueryParams` has `since, until,
+principal, head, ok, effects, limit`). `until` is an upper time bound (ns since epoch, filtered
+kernel-side); `ok` filters by success; `effects` keeps only entries whose effect set contains
+**every** listed effect kind (e.g. `["fs_write"]` — a kernel-side post-filter). The old
+schema/kernel mismatch (`until`/`effects` dropped, `ok` unpassable) is fixed.
 
 **Result**: an array of journal entries: `{id, session, principal, ts, dur_ns, cwd, src, ast,
-effects, status, ok, opaque, outputs: [{kind, hash, len}]}` — one row per past `exec`. `head` filters
-by the source's first word (e.g. `head: "git"` matches every `git ...` invocation). This is how you
-answer "what actually ran" without re-executing or scraping a transcript.
+effects, status, ok, opaque, outputs: [{kind, hash, len}]}` — one row per past `exec`. Two budget
+notes: each entry carries the **full canonical AST** (`ast`), so rows are heavy — keep `limit` small
+and filter server-side rather than paging everything into context. `head` compares the **first
+whitespace-separated word of the raw `src`** against your string — it usefully selects command
+statements (`head: "git"` matches every `git ...` invocation) but nothing structural (a `let`-headed
+src has head `"let"`). This is how you answer "what actually ran" without re-executing or scraping a
+transcript.
 
 ### 0.6 `shoal_cap_request` — unstick a plan awaiting approval
 
-**Params**: `{plan_ref: string (required), effects?: array}`. **Gap**: `effects` is accepted but
-**entirely unused** by the handler — it looks up the stored plan by `plan_ref` only, re-checks policy
-isn't an outright `deny`, and if so marks the whole plan `approved: true`. There is no fine-grained
-per-effect grant today despite the parameter's name — it is all-or-nothing at the plan level.
-**Result**: `{"grant":"approved","plan_ref":"...","enforced":false}` on success (`enforced` is always
-`false` — see §6's "Real OS-level sandboxing" bullet). Use this only after a `shoal_plan`/`shoal_exec` came back
-`approval_required`/`approval_pending`; call `shoal_apply` afterward to actually run it.
+**Params**: `{plan_ref: string (required), effects?: array}`. `effects` **now genuinely scopes the
+grant** (updated — verified in `handle_cap_request`, `crates/shoal-kernel/src/handlers_task.rs`): if
+you name effect kinds (strings, or `{kind: ...}` objects), the plan is only approved when the
+request covers **every** effect the plan needs; otherwise you get back `{"grant":
+"approval_pending", "why": "requested effect scope does not cover the plan", "uncovered_effects":
+[...]}` and the plan stays pending — an approval can never silently widen past what was asked for.
+An empty/omitted `effects` approves the whole plan. **Result** on success:
+`{"grant":"approved","plan_ref":"...","enforced":false,"granted_effects":[...]}` (`enforced` is
+always `false` — see §6's "Real OS-level sandboxing" bullet). Use this only after a
+`shoal_plan`/`shoal_exec` came back `approval_required`/`approval_pending`; call `shoal_apply`
+afterward to actually run it.
 
-### 0.7 `shoal_cancel` — stop a running/background task **(P1 — new tool, verify it exists)**
+### 0.7 `shoal_cancel` — stop a running/background task
 
-At authoring time this tool **did not exist** — `crates/shoal-mcp/src/lib.rs`'s tool list had six
-entries, not seven, and the kernel's own `task.cancel` was reachable only over raw JSON-RPC, never
-through MCP. This is one of the six named P1 additions. Per `docs/AGENT-SURFACE.md` §5 the intended
-shape is:
+**Params**: `{task: string (required)}` — a task ref like `"task:7"` (verified in
+`crates/shoal-mcp/src/tools.rs`'s `tools()`; forwards to the kernel's `task.cancel`,
+`additionalProperties: false`).
 
-**Params**: `{task: string}` — a task ref/id (`"task:7"` per §1's ref grammar). **Result** (intended):
-the task record transitioning to a cancelled state, mirroring the kernel's native `task.cancel`
-result shape — **not independently confirmed against source for this card; read
-`crates/shoal-mcp/src/lib.rs`'s `tools()`/`tools_call()` to get the exact schema before relying on a
-field name.**
-
-**Before you can call this productively**, you need a `task` ref in the first place — that means
-`shoal_exec`'s `background`/async path must also be reachable through MCP (see
-`docs/AGENT-SURFACE.md` §5's `shoal_exec {... background:bool, timeout_ms?}`). **That wiring is not
-one of the six things P1 was asked to fix** — do not assume it landed just because `shoal_cancel`
-did. If `shoal_exec`'s schema still has no `background`/`timeout_ms` field, `shoal_cancel` exists but
-has nothing reachable to cancel from this plugin (a task created by some *other* client sharing the
-session is the only way one would show up). Check the schema before building a workflow around this.
+The whole background loop is now reachable through this plugin: `shoal_exec {background: true}` (or
+a `timeout_ms` conversion — §0.1) hands you `{"task": "task:<n>", "events": "task.<n>"}`; watch the
+`task.<n>` channel (§0.8) for `started` and then a terminal `completed`/`failed`/`cancelled` record
+carrying the result `ref`; `shoal_cancel {task}` requests cancellation. Note `task.suspend` is still
+unimplemented (always `-32020`, even over raw JSON-RPC).
 
 ### 0.8 MCP resources — fetching elided payloads and subscribing to live output **(P1 — verify dispatch)**
 
@@ -276,7 +304,13 @@ independently confirm:
 - `resources/subscribe {uri}` on `shoal://events/{channel}` or `shoal://task/{id}/out` starts a push
   subscription; the server sends `notifications/resources/updated` with `{uri, seq, payload}` as
   events occur (§4 of `docs/AGENT-SURFACE.md`). **Never poll a resource you could instead subscribe
-  to** — that is the entire point of this layer existing.
+  to** — that is the entire point of this layer existing. **Caveat (verified in source, known
+  gap)**: subscriptions see only events published on the **kernel's** bus (`events.publish` and the
+  kernel's own `task.{id}`/`session.transcript`/`journal`/`approval` traffic). The *language-level*
+  channel API (`channel("x").emit(v)` inside evaluated source — AGENT-SURFACE §7) runs on
+  `shoal-eval`'s own in-process bus, which is **not yet bridged to the kernel bus** — an in-language
+  `.emit()` will not reach your `resources/subscribe` on `shoal://events/user.x`. Cross-principal
+  signaling via language channels doesn't work over this surface yet; use kernel-published channels.
 - Query params on any value-bearing URI: `?path=<fieldpath>&slice={a}..{b}&format=json|render|raw`
   (`docs/AGENT-SURFACE.md` §1) — same field-path grammar caveats as §0.2 (no `[a..b]` inside `path`,
   no negative indices) apply here too, since both go through the same `resolve_value_path`.
@@ -301,7 +335,9 @@ exists to end).
 - **Commands are values too.** Running `git status` produces an `outcome` value
   (`{status, ok, out, err, dur, pid, cmd}`); an unknown field/method on an outcome forwards to
   `.out`, so `git_log.subject` reads a field of the *parsed* log row, not a string you'd need to
-  regex.
+  regex. (Qualification, verified against the binary: a few builtins return a **bare value**
+  instead of an outcome — `pwd` yields a `path` directly. And an outcome's stderr accessor is
+  **`bytes`**, not `str` — `.str()` it first.)
 - **`fn` IS a command.** `fn deploy(env: str, dry: bool = false) { ... }` is immediately callable as
   `deploy staging --dry` — no separate "make this a CLI" step.
 - **No ambient ("invisible") state.** `cwd`/`env` are explicit session state, mutated only at session
@@ -323,8 +359,8 @@ method; treat the signature as authoritative per CONTRACTS but verify empiricall
 
 | bash | shoal | why / grounding |
 |---|---|---|
-| `ls \| grep x` | `ls.where(.name.contains("x"))` | `\|` is a hard parse error with a teaching message: *"shoal has no pipe operator — data composes with `.` (try `ls.where(.size > 1mb)`)..."* (TDD §1.4; **corpus** `literals.toml:parse-pipe-teaching`, `src="ls \| wc"` → `parse_error`, message contains "no pipe operator"). The suggested replacement text is quoted verbatim from the error itself. |
-| `grep ERROR file` | `path("file").read_str().lines().where(.contains("ERROR"))` | `.lines()` **(corpus** `strings.toml:str-lines-strips-crlf`**)**; substring test via `in` is **(corpus** `operators.toml:op-in-string-substring`, `"ell" in "hello"` → `true`**)** — prefer `"ERROR" in line` over `.contains` if you want a corpus-nailed-down spelling. |
+| `ls \| grep x` | `ls.where(.name.contains("x"))` | `\|` is a hard parse error with a teaching message, **verified against the binary**: *"shoal has no pipe operator"*, hint *"data composes with `.` (try `ls.where(.size > 1mb)`); raw byte plumbing is `.feed(cmd)`; verbatim POSIX lives in `sh { … }`"* (TDD §1.4; **corpus** `literals.toml:parse-pipe-teaching`). The same curated error now fires in **infix EXPR positions** too — `1 \| 2` and `let c = a \| b` teach identically (verified), not just command-position pipes. |
+| `grep ERROR file` | `path("file").read.lines().where(.contains("ERROR"))` | `.read` reads the file as a `str` (a field-reachable path accessor, CONTRACTS §3 — there is **no `.read_str()`**; that spelling is `field_missing`, verified against the binary). `.lines()` **(corpus** `strings.toml:str-lines-strips-crlf`**)**; substring test via `in` is **(corpus** `operators.toml:op-in-string-substring`, `"ell" in "hello"` → `true`**)** — prefer `"ERROR" in line` over `.contains` if you want a corpus-nailed-down spelling. |
 | `$VAR`, `$HOME` | `env.VAR` | `$` is illegal everywhere: *"shoal variables have no sigil"* (TDD §2.1; **corpus** `core.toml:parse-dollar`, `src="$HOME"` → `parse_error`, "no sigil"). Reading: `env.NAME` or `(env NAME).out`; writing at session top level: `env.NAME = "v"` (**corpus** `reef.toml:reef-env-assign-writes-session-env-for-a-child`). |
 | `$(cmd)` command substitution | `(cmd)` | CMD grammar's `arg = ... \| "(" expr ")"` — a full EXPR embeds as one word/argument; no special substitution syntax needed. A parenthesized command used as a value: **(corpus** `outcome.toml:outcome-echo-out`, `(echo hi).out` → `"hi"`**)**. |
 | `` `cmd` `` backticks | `(cmd)` or `sh { cmd }` | Backtick is illegal, error points at `sh { }`/`re"..."`/`t"..."` (TDD §2.1; **corpus** `core.toml:parse-backtick`). |
@@ -333,12 +369,12 @@ method; treat the signature as authoritative per CONTRACTS but verify empiricall
 | `find . -name '*.rs' -size +1M` | `ls.where(.size > 1mb)` | This exact phrase is TDD §1.4's own canonical pipe-replacement example — the size unit is a first-class literal, not a flag to parse (`1mb`, **corpus** `literals.toml:lit-size-mb-frac`). |
 | `cmd > file`, `cmd >> file` | `cmd > file`, `cmd >> file` (kept!) | Muscle-memory sugar, CMD-mode only, desugars to `.save(file)`/`.append(file)` on stdout bytes (TDD §1.3, §3.4). The **modern, canonical** form is calling `.save`/`.append` directly: `(cmd).save(file)`. |
 | `cmd < file` | `cmd < file` (kept) | Sole stdin sugar; desugars to `StdinSpec::File` directly (IO.md §1.1). No numeric variant, no here-string variant. |
-| `cmd <<EOF ... EOF` (heredoc) | **forbidden, permanently** — use an interpreter block | Not lexed — no `<<` token exists at all. Diagnostic: *"shoal has no heredocs — feed a string or multiline literal instead: `value.feed(cmd)`, or use an interpreter block: `python { ... }`"* (IO.md §4). **Interpreter blocks are IMPLEMENTED and this is the answer**: `python { import json; print(json.dumps(...)) }.out` runs the program and auto-parses its stdout to a structured value; `sh { ... }` (TDD §13.13) and a multiline `"""..."""` literal also work. |
-| `cmd <<< "text"` (here-string) | `"text".feed(cmd args…)` (works) | *"shoal has no here-strings — `"text".feed(cmd)`"* (IO.md §4). `.feed` IS implemented, args and all: `"text".feed(grep "foo").out`, `"text".feed(sort -r).out`. Blocks also work: `"text".feed(sh { grep foo })` / `.feed(jq { … })`. |
-| `cmd 2>file`, `cmd 2>&1`, `cmd &>file` | **forbidden** | No fd-number tokens exist in the grammar at all. Use `.stderr` on a captured outcome: `cmd.stderr.save(file)`, or `try { cmd } catch e { e.stderr }` (IO.md §4). A live PTY run (statement position) already merges stdout/stderr by construction — this is honest PTY semantics, not a missing flag. |
+| `cmd <<EOF ... EOF` (heredoc) | **forbidden, permanently** — use an interpreter block | Curated parse error, **verified against the binary**: *"shoal has no heredocs"*, hint *"feed a string or multiline literal instead: `value.feed(cmd)`, or use an interpreter block: `python { … }`"* (IO.md §4). **Interpreter blocks are IMPLEMENTED and this is the answer**: `python { import json; print(json.dumps(...)) }.out` runs the program and auto-parses its stdout to a structured value; `sh { ... }` (TDD §13.13) and a multiline `"""..."""` literal also work. |
+| `cmd <<< "text"` (here-string) | `"text".feed(cmd args…)` (works) | Curated parse error, **verified against the binary**: *"shoal has no here-strings"*, hint *"feed the value instead: `"text".feed(cmd)`"* (IO.md §4). `.feed` IS implemented, args and all: `"text".feed(grep "foo").out`, `"text".feed(sort -r).out`. Blocks also work: `"text".feed(sh { grep foo })` / `.feed(jq { … })`. |
+| `cmd 2>file`, `cmd 2>&1`, `cmd &>file` | **forbidden** | Curated parse errors, **verified against the binary**. Glued fd forms (`2>file`, `2>&1`): *"shoal has no fd-numbered redirects"*, hint *"stderr is structured — `(cmd).stderr`, or `try { cmd } catch e { e.stderr }`; a statement-position PTY run already merges the streams"*. `&>file`: *"shoal has no stream-merging redirect"*, hint *"capture is structured: `(cmd).out` / `(cmd).stderr`; a statement-position PTY run already merges the streams"*. `.stderr` is **`bytes`** — `.str()` it before string methods. A live PTY run (statement position) already merges stdout/stderr by construction — honest PTY semantics, not a missing flag. |
 | `cmd1 \| cmd2` raw byte plumbing | `value.feed(cmd args…)` / `cmd.feed(value)` | The one asylum the pipe error names for genuine byte plumbing. **IMPLEMENTED, including args/flags**: `["b","a","c"].feed(sort -r).out`, `data.feed(grep "foo").out`, `{a:1}.feed(jq ".a").out`. The inverted `cmd.feed(value)` form works too. Interpreter/`sh` blocks are also valid feed targets: `.feed(sh { sort -r })`, `.feed(jq { .a })`. |
 | `cmd1 && cmd2`, `cmd1 \|\| cmd2` | kept, unchanged | `&&`/`||` operate on `bool` or command **outcomes** (success = true), short-circuiting, returning the deciding operand *verbatim* — not force-cast to `bool` (**corpus** `outcome.toml:outcome-and-chain-both-outcomes`, `outcome-and-bool-then-outcome`; CMD-mode chaining needs `^` when the head is a reserved word: **corpus** `operators.toml:op-cmd-and-and-runs-both-on-success`, `^true && ^true`). |
-| `cmd &` (background) | `cmd &` (kept) | Desugars to `spawn { cmd }`, prints a task handle (TDD §1.3). `shoal_cancel` exists **(P1, §0.7)** to stop a task once you have its ref, but confirm `shoal_exec` actually exposes a `background`/`timeout_ms` param before assuming you can create one through this plugin at all (§4 rule 16). |
+| `cmd &` (background) | `cmd &` (kept) | Desugars to `spawn { cmd }`, prints a task handle (TDD §1.3). Over MCP, `shoal_exec` now exposes `background`/`timeout_ms` (verified in `tools()`'s schema — §0.1), and `shoal_cancel` (§0.7) stops a task once you have its ref. |
 | `for f in *.txt; do ...; done` | `for f in glob("*.txt") { ... }` or `glob("*.txt").each(f => ...)` | `for` binds a pattern over any iterable (EBNF `"for" pattern "in" expr block`); basic range form is **(corpus** `closures.toml:for-loop-break-stops-early`, `core.toml:for-range-sum`**)**. |
 | `while [ cond ]; do ...; done` | `while cond { ... }` | Direct — **(corpus** `core.toml:while-basic`**)**. `cond` must be `bool`/outcome, never a bare list/string (no truthiness). |
 | `if [ -n "$x" ]; then ... fi` (truthiness) | `if x.is_empty() { } else { }` / `if x != null { }` | No truthiness anywhere: `if [1] { 1 }` is `type_error`, "no truthiness" (TDD §1.10; **corpus** `core.toml:no-truthiness`). `.is_empty()` **(corpus** `core.toml:method-is-empty`**)**; `.is_some()`/`!= null` are named in TDD §1.10 for nullable values (not individually corpus-exercised). |
@@ -354,15 +390,41 @@ method; treat the signature as authoritative per CONTRACTS but verify empiricall
 | `awk '{s+=$1} END{print s}'` (fold) | `.reduce(0, (acc, x) => acc + x)` (alias `.fold`) | Left fold — the general aggregation escape hatch when no named op (`.sum`/`.min`/`.max`/`.group`) fits; empty list returns the init **(corpus** `list-methods-3.toml:lm3-reduce-*`**)**. |
 | `jq '. + {c:3}'` / build an object | `{a:1}.set("c", 3)`, `r.merge(other)` | Records are immutable values: `.set(k, v)` inserts/replaces one key (keeping position), `.merge(other)` layers `other`'s keys over the receiver (right wins). No `{...spread}` grammar and `+` on records is a `type_error` — use these **(corpus** `record-table-methods-2.toml:rt2-set-*`, `rt2-merge-*`**)**. Build from pairs: `pairs.reduce({}, (acc, kv) => acc.set(kv[0], kv[1]))`. |
 | `printf '%.2f' x` (round) | `x.round(2)`, `x.floor(2)`, `x.ceil(2)` | Round a `float` to N decimals (N optional, default 0 → nearest integer); ints pass through **(corpus** `numbers-more.toml:num-round-two-decimals`**)**. |
+| `$(( x + 1 ))` / str↔int | `"42".parse_int()` (str→int); `"{n}"` (int→str) | `.parse_int`/`.parse_float` are pinned in CONTRACTS §3; int→str is plain interpolation — no cast syntax. Verified against the binary: `"42".parse_int()` → `42`; `let n = 7; "{n}"` → `"7"`. |
 | `find . -type f` | `glob("**/*")` or `ls` (non-recursive) | `ls` is a builtin returning a `table` (list<record>) **(corpus** `collections.toml:table-ls-len-counts-entries`, `table-ls-where-type-then-map-names`**)**; `**` recurses, dotfiles excluded unless the pattern starts with `.` (TDD §4.3). |
-| `xargs` | `.each(f)` | **(corpus** `collections.toml:list-each-side-effect-then-void`**)**. For "read lines from a file, run a command per line": `path("list.txt").read_str().lines().each(f => rm f)` (chains `.read_str()`→`.lines()`→`.each`, all individually corpus-grounded methods). |
+| `xargs` | `.each(f)` | **(corpus** `collections.toml:list-each-side-effect-then-void`**)**. For "read lines from a file, run a command per line": `path("list.txt").read.lines().each(f => rm f)` (chains `.read`→`.lines()`→`.each`, all individually grounded methods). |
 | `which cmd` | `which cmd` (kept, richer) | Not forensics — returns a full resolution-chain **record**, not just a path (`docs/REEF.md` §6). `.name` always echoes the query **(corpus** `reef.toml:reef-which-name-field-echoes-query`**)**; unresolved tool's `.out` is `null`, not an error **(corpus** `reef-which-unresolved-tool-out-is-null`**)**; exactly one tool name — `which "a" "b"` is `arg_error` **(corpus** `reef-which-arity-error`**)**. |
 | `cd dir` (permanent) | `cd dir` at session top level | Legal and journaled at session top level; **illegal inside a `fn` body** — error names `with cwd:` as the fix **(corpus** `reef.toml:reef-cd-inside-fn-body-is-illegal`, error `custom`, contains `"with cwd:"`**)**. |
 | `(cd dir && cmd)` (scoped cd) | `with cwd: "dir" { cmd }` | Restores cwd on **any** exit path, including an error thrown inside the block **(corpus** `reef.toml:reef-cwd-restores-after-with-block`, `reef-cwd-restores-after-error-inside-with-block`, `reef-cwd-nested-with-blocks-restore-outer`**)**. |
 | `FOO=bar cmd` (scoped env) | `FOO=bar cmd` (kept) or `with env: {FOO: "bar"} { cmd }` | Leading `IDENT=word` desugars to `with env: {NAME: "value"} { cmd }` (TDD §1.3); explicit block form restores after **(corpus** `reef.toml:reef-env-with-block-sets-var-during`, `reef-env-with-block-restores-after`**)**. |
-| `test -f file`, `[ -f file ]` | *(unconfirmed — verify `path.*` method name before relying on it)* | TDD names a `path.*` namespace of methods generally; no corpus case names a specific existence-check method in the material reviewed for this card. Do not assume a spelling; check `docs/TDD.md` §5's namespace list or ask the running kernel via `complete`/`explain` if those ever land (§6 — currently unimplemented too, so today: try it and read the error). |
+| `test -f file`, `[ -f file ]` | `path("file").exists` / `.is_file` / `.is_dir` | Zero-arg `path` accessors, field-reachable (CONTRACTS §3's path-accessor list: `.read .read_bytes .lines .exists .is_dir .is_file .size .modified`). Verified against the binary: `path("Cargo.toml").exists` → `true`. |
 | `docker-compose up` (hyphenated command) | `^docker-compose up` or `run("docker-compose", "up")` | Hyphenated identifiers don't lex in EXPR mode; a hyphenated command name needs the `^` escape hatch or the fully-dynamic `run(name, args...)` form (TDD §2.3, §3.1.4). |
 | `alias ll='ls -la'` | `alias gs = git status` | AST-level partial application — binds `gs` to a partial call node; `gs -sb` appends args to the AST, never text splicing (TDD §1.8). *Not verified against a corpus case in this pass — confirm behavior empirically.* |
+
+### Format & system namespaces
+
+Eight namespaces live as names in the root env (`crates/shoal-eval/src/namespaces.rs`): `json`,
+`yaml`, `toml`, `csv`, `math`, `os`, `http`, `config`. Every call below was **verified directly
+against the binary** unless marked otherwise.
+
+- **`json` / `yaml` / `toml` / `csv`** — each has `.parse(str)` and `.stringify(value)`:
+  `json.parse("[1,2]")` → `[1, 2]`; `json.stringify({a:1})` → `'{"a":1}'`; `yaml.parse("a: 1")` →
+  `{a: 1}`; `toml.parse(path("Cargo.toml").read)` → a record you drill with field access;
+  `csv.parse("a,b\n1,2")` → a **table** (drive it with `.where`/`.map` — indexing a table with
+  `[0]` is a `type_error`); `csv.stringify([{a:1,b:2}])` → `"a,b\n1,2\n"`. This replaces most
+  `jq`/`yq` shell-outs.
+- **`math`** — functions take/return floats: `math.sqrt(144)` → `12`, plus `cbrt sin cos tan
+  asin acos atan atan2 ln log10 log2 log exp floor ceil round trunc abs sign pow min max hypot
+  clamp`. Constants are plain field reads: `math.pi`, `math.e`, `math.tau`, `math.inf`,
+  `math.nan`, `math.sqrt2`.
+- **`os`** — nullary accessors (passing any arg is `arg_error`): `os.platform()` → `"linux"`,
+  `os.arch()` → `"x86_64"`, `os.env()` → the environment as a record (`os.env().HOME`), plus
+  `os.pid() os.hostname() os.username() os.cpus() os.uptime()`.
+- **`http`** — `http.get(url)` / `http.delete(url)` (no body) and `http.post(url, body)` /
+  `http.put(url, body)`; non-2xx statuses come back as values, not raises (*surface read from
+  source, not exercised live in this pass — it does real network IO*).
+- **`config`** — reads the project's `shoal.toml`: `config.all()` for the whole record,
+  `config.get("key")`, or plain field projection `config.<key>`.
 
 ---
 
@@ -495,7 +557,9 @@ bytes list<T> record table stream<T> error outcome task plan cmd secret`.
   `echo`) does *not* re-parse its own bytes — `.out` is the builtin's own `Value` verbatim, so
   `(echo '[1,2,3]').out` stays the **string** `"[1,2,3]"`, not a list (**corpus**
   `outcome.toml:outcome-echo-out-json-list`). Don't assume every outcome's `.out` structurally parses
-  — it depends on whether the producer was a builtin or an adapter-backed external command.
+  — it depends on whether the producer was a builtin or an adapter-backed external command. The
+  stderr accessors (`.err`/`.stderr`) are **`bytes`**, not `str` (verified: `.lines()` on one is
+  `type_error: expected str, found bytes` — call `.str()` first).
 - **`table`** is `list<record>` semantically — every table method is also a list method.
 - Equality is **structural** for data types, **identity** for `task`/`stream`; comparing streams is
   an error.
@@ -540,6 +604,14 @@ failure = `arg_error`), `bool` (flag *presence*, not a parsed word — `--b` pre
 `spec/cases/coercion.toml`'s `word-bind-*` cases. **Unknown-signature (T0) targets** — a raw external
 binary with no adapter — receive every word as `str`, verbatim, always; no coercion is attempted.
 
+**Warning — value-carrying flags on user `fn`s: prefer `--flag=value`.** Today only the glued form
+binds reliably; the separated form mis-binds (verified against the binary: with
+`fn f(name: str = "d") { name }`, `f --name=abc` → `"abc"`, but `f --name abc` → `"true"` — the
+flag binds as bare presence and the value is stranded). A fix is in flight in a parallel branch;
+until it lands, always write `--flag=value` for anything that carries a value. Relatedly, **extra
+positionals are currently tolerated silently** (`f one two three` binds `one` and drops the rest —
+verified) — that tolerance is being tightened, so don't lean on it.
+
 ### 3.7 Comparisons and logic (TDD §1.10, §3.3)
 
 `&&`/`||` admit **only** `bool` or a command **outcome** (success = true) as operands — `1 && true` is
@@ -558,7 +630,10 @@ work (`false < true` → `true`).
 - `fn add(a: int, b: int) { a + b }` then calling `add(2, 5)` (EXPR call) **or** `add 2 3` (CMD call,
   word-bound) both work identically — a `fn` genuinely *is* a command (**corpus**
   `core.toml:fn-call`, `coercion.toml:word-bind-int-positional`). Defaults: `fn inc(a: int, by: int =
-  1) { a + by }`, `inc(4)` → `5` (**corpus** `fn-default`).
+  1) { a + by }`, `inc(4)` → `5` (**corpus** `fn-default`). To **capture a CMD-form call's result in
+  a binding, parenthesize it**: `let x = (deploy staging --dry)` (verified against the binary) — the
+  unparenthesized `let x = deploy staging --dry` is a parse error (`expected newline or `;` between
+  statements`), because a `let` RHS lexes in EXPR mode where bare words don't glue into a command.
 - Lambdas: `x => expr` or `(a, b) => expr`/block. **(corpus** `core.toml:multi-lambda`,
   `lambda-call-method`**)**. Closures capture the *enclosing binding itself* (a shared cell, not a
   copy) — a `var` mutated by a closure through repeated calls accumulates across calls (**corpus**
@@ -617,7 +692,9 @@ All corpus-grounded in `spec/cases/match.toml`:
   successful `try`/expression short-circuits `catch` entirely — the RHS of `??`/`catch` on a
   non-error value is never evaluated (**corpus** `operators.toml:op-coalesce-does-not-evaluate-rhs-on-value`,
   `3 ?? (1 / 0)` → `3`, no division ever happens).
-- **Every command call yields an `outcome`.** At bare/statement rendering it shows as
+- **Every external command call yields an `outcome`** — but qualify this for builtins: some return a
+  **bare value** instead (`pwd` → a `path`, verified against the binary), so don't unconditionally
+  reach for `.ok`/`.out` on a builtin's result. At bare/statement rendering an outcome shows as
   `outcome(status: 0, ok: true)` (**corpus** `outcome.toml:outcome-echo-render-inline`); `if (echo hi)
   { "yes" } else { "no" }` reads its truthiness from `.ok` automatically (`outcome-if-position`).
 
@@ -638,7 +715,9 @@ error raised inside the block (**corpus** `reef-cwd-restores-after-with-block`,
 Each rule: what's forbidden, why, the corpus/source proof, and the correct alternative.
 
 1. **No `|` pipe operator**, ever, outside `sh { }` or a `match` alternation pattern. *Why*: pipes are
-   untyped byte hoses; shoal composes typed values instead (VISION §2). *Proof*: `spec/cases/core.toml:parse-pipe-teaching`.
+   untyped byte hoses; shoal composes typed values instead (VISION §2). *Proof*: `spec/cases/core.toml:parse-pipe-teaching`;
+   verified against the binary that infix EXPR positions (`1 | 2`, `let c = a | b`) get the same
+   curated *"shoal has no pipe operator"* teaching error, not a generic parse failure.
    *Alternative*: `.where`/`.map`/dot-chains; `sh { }` for verbatim POSIX.
 2. **No `$` sigil.** *Proof*: `core.toml:parse-dollar`, "no sigil". *Alternative*: bare identifiers;
    `env.VAR` for the environment.
@@ -657,7 +736,15 @@ Each rule: what's forbidden, why, the corpus/source proof, and the correct alter
 8. **Heredocs, here-strings, and any fd-numbered/`&>`-style redirect are permanently forbidden** — not
    runtime errors, curated *parse-time* diagnostics naming the modern replacement (IO.md §4). This is
    the same enforcement class as the pipe/`$`/backtick errors — the parser recognizes the box-era
-   *shape* specifically so it can teach, not just reject.
+   *shape* specifically so it can teach, not just reject. All four are **implemented and verified
+   against the binary**: `cat << EOF` → *"shoal has no heredocs"* (hint: *"feed a string or multiline
+   literal instead: `value.feed(cmd)`, or use an interpreter block: `python { … }`"*); `cat <<< "hi"`
+   → *"shoal has no here-strings"* (hint: *"feed the value instead: `"text".feed(cmd)`"*);
+   `cmd 2>file` / `cmd 2>&1` → *"shoal has no fd-numbered redirects"* (hint: *"stderr is structured —
+   `(cmd).stderr`, or `try { cmd } catch e { e.stderr }`; a statement-position PTY run already merges
+   the streams"*); `cmd &>file` → *"shoal has no stream-merging redirect"* (hint: *"capture is
+   structured: `(cmd).out` / `(cmd).stderr`; a statement-position PTY run already merges the
+   streams"*).
 9. **Size/duration arithmetic is asymmetric on purpose.** `size * float` is fine; `size / float` is
    `type_error`. `size ± int` (bare) is always `type_error` — both operands must be sized. Negative
    size results/multipliers are `type_error` with hint "negative"; only `size/int`, `size/size`,
@@ -667,17 +754,21 @@ Each rule: what's forbidden, why, the corpus/source proof, and the correct alter
     fix-it "collect first, or `.tee(2)`") — TDD §1.9. Streams **are implemented** (channels,
     `every(dur)`, `.map`/`.scan`/`.take`/`.collect` all work, §6) — so this rule bites now: don't read
     one twice.
-11. **`it`/`out[n]` are REPL-only.** TDD's edge-case register (§13.16) makes this a parse error outside
-    a REPL, with the fix-it "bind a variable." The kernel forces `evaluator.interactive = false` for
-    **every** MCP-driven `exec` call (verified in `crates/shoal-kernel/src/lib.rs`) — treat `it`/`out`
+11. **`it`/`out[n]` are REPL-only.** Verified against the binary: outside a REPL, `it` is the parse
+    error *"`it` is REPL-only"* and `out[3]` is *"`out` is REPL-only"*, both with the hint *"bind a
+    variable to reuse a previous result"*. The kernel forces `evaluator.interactive = false` for
+    **every** MCP-driven `exec` call (verified in `crates/shoal-kernel`) — treat `it`/`out`
     as **unavailable through this MCP surface entirely**. Always bind with `let`, or keep the
     returned `ref` and use `shoal_get`.
-12. **A raised MCP error produces no transcript ref.** There is nothing to `shoal_get` afterward — the
-    entry is only created on the success path (verified: `crates/shoal-kernel/src/lib.rs`'s `exec`
-    dispatch only calls `journal.append`/creates `value_ref` *after* `eval_with_position` returns
-    `Ok`). *Alternative*: send a **single bare expression** with `position: "value"` so a failing
-    outcome is captured instead of raised, or wrap the risky part in `try { } catch e { e }` inside
-    `src` so the caught error becomes the (successful) returned value.
+12. **A raised MCP error now DOES mint a transcript ref** (updated — verified in
+    `crates/shoal-kernel/src/handlers_exec.rs`): the structured error value is stored at `out:<n>`
+    and the `-32002` error's `data.ref`/`data.uri` point at it, so `shoal_get {ref: data.ref}`
+    fetches the full `{code, msg, span, hint, stderr}` error after the fact. Two nuances remain:
+    value-position **capture** (a normal, non-error result with `.ok == false`) applies to
+    **external-command failures** only; a **builtin's** error (`div_zero`, `index_range`, …) raises
+    even for a single bare expression — you get the `-32002` + `data.ref`, not a captured outcome.
+    `try { } catch e { e }` inside `src` still works when you want the error as the *successful*
+    return value.
 13. **`position: "value"`'s capture behavior only applies to a single bare expression statement.** Any
     `src` with more than one statement (even a `let` followed by one command) always uses
     raise-on-failure semantics, whatever `position` says (verified in `eval_with_position`,
@@ -698,15 +789,21 @@ Each rule: what's forbidden, why, the corpus/source proof, and the correct alter
     `tools/call`). If `resources/list` still 404s for you, fall back to translating the `uri`
     yourself: the part before `?path=` is the short `ref` you already have; the part after is the
     `path` argument to `shoal_get`.
-16. **Background execution and task management may now be partly reachable via `shoal_cancel` (P1,
-    §0.7)** — but confirm `shoal_exec`'s schema actually accepts a `background`/`timeout_ms` field
-    before assuming you can *create* a cancellable task from this plugin in the first place; that
-    wiring was not one of the six named P1 changes. Absent that, every `shoal_exec` call still blocks
-    until the command finishes, and `shoal_cancel` has nothing of yours to act on.
+16. **Background execution and task management are now fully reachable through MCP** (updated —
+    verified in `crates/shoal-mcp/src/tools.rs` and `crates/shoal-kernel/src/handlers_exec.rs`):
+    `shoal_exec {background: true}` returns a task ref immediately, `timeout_ms` converts an overdue
+    synchronous run into a background task (`timed_out: true` — it does **not** kill the command,
+    §0.1), and `shoal_cancel {task}` requests cancellation (§0.7). A plain `shoal_exec` without
+    either field still blocks until the command finishes.
 17. **Hyphenated command names are not EXPR identifiers.** `docker-compose` needs `^docker-compose` or
     `run("docker-compose", args...)` (TDD §2.3).
-18. **Shadowing a resolvable command with `let` is legal (linted, not fatal)** — but `^name` always
-    still reaches the real command (TDD §3.1.4, §13.15). Don't assume a shadowed name is gone.
+18. **Shadowing a resolvable command with `let` is legal (linted, not fatal)** — and `^name` bypasses
+    the shadowing (TDD §3.1.4, §13.15). But **`^` bypasses *shadowing only*; adapters still
+    intercept** — verified against the binary: `^git log --oneline -1` still fails with
+    `arg_error: git: unknown flag --oneline; expected --follow <bool>, --n <int?>, --path <path?>`,
+    exactly like the un-careted call, because the git adapter's `log` sub-spec only admits its own
+    (narrower) flag surface. To reach the **raw binary** with arbitrary flags, use
+    `run("git", "log", "--oneline", "-1")` or `sh { git log --oneline -1 }` (both verified working).
 
 ---
 
@@ -728,10 +825,10 @@ Sourced directly from `crates/shoal-kernel/src/lib.rs`'s dispatch:
 | `-32011` | **approval required** (a plan's verdict) or **approval still pending** (on `shoal_apply`) | `{effects}` | Call `shoal_cap_request {plan_ref}`, then `shoal_apply {plan_ref}`. |
 | `-32012` | unknown `plan_ref` (never created, or the kernel restarted — plans are in-memory, not journaled) | `{}` | Re-derive with `shoal_plan`. |
 | `-32020` | task suspension requested — **always** returned; not implemented | `{task}` | Don't call `task.suspend` (not reachable via MCP tools anyway). |
-| `-32021` | unknown task ref | `{}` | Possible via `shoal_cancel` **(P1, §0.7)** with a stale/wrong task ref — re-check §4 rule 16 for whether you can even create a task ref through this plugin before assuming this path is reachable. |
+| `-32021` | unknown task ref | `{}` | A stale/wrong task ref passed to `shoal_cancel` (§0.7). Task refs come from `shoal_exec {background: true}` / a `timeout_ms` conversion (§0.1). |
 | `-32030` | bearer token missing/invalid/expired, or tokens unavailable on an ephemeral (`Kernel::new()`) kernel | `{}` | Check `SHOAL_TOKEN`; ensure the kernel was started with a state dir (`shoal-kernel` without `--socket`-only ephemeral mode). |
 | `-32600` | invalid JSON-RPC request/version | — | Transport bug — should not occur through this plugin's tools. |
-| `-32601` | method not found | `{method}` | You (or a future card revision) called something the kernel doesn't dispatch — see §6's unimplemented-methods list (`complete`, `explain`, `events.*`, `task.resume`, any `resources/*`). |
+| `-32601` | method not found | `{method}` | You (or a future card revision) called something the kernel doesn't dispatch. Note `complete`/`explain` and `resources/*` **are** dispatched now (§6) — an unexpected `-32601` most likely means a stale kernel binary. |
 | `-32602` | invalid params (missing required field, wrong shape) | — | Check the tool's exact schema in §0. |
 | `-32603` | internal error | — | Not a language-level problem; report it. |
 
@@ -759,6 +856,7 @@ pins it — just verify empirically if you hit an edge).
 | `assert_failed` | (pinned; no corpus case reviewed) | — |
 | `permission` | (pinned; no corpus case reviewed) | — |
 | `recursion_limit` | recursion/loop depth exceeded (depth 10k, TDD §13.12) | restructure; loop limit is off in script mode |
+| `overflow` ✓ | numeric/quantity arithmetic overflowed its representation (pinned in CONTRACTS §4; **corpus** `numbers-more.toml`; verified against the binary: `52w * 200000000` → `overflow: duration overflow`) | keep duration/size arithmetic inside i64-ns / u64-byte bounds |
 | `reef_unlocked` ✓ | a `with reef:`-constrained tool used in a non-interactive/script context without a lock | `reef.toml:reef-with-reef-constrains-a-spawn-inside-the-block` |
 | `reef_drift` | resolved binary's hash no longer matches the lock | `reef lock --refresh` (REEF.md §2; not verified reachable in this pass) |
 | `reef_conflict` | two reef scopes constrain one tool incompatibly | (not verified reachable in this pass) |
@@ -774,11 +872,12 @@ pins it — just verify empirically if you hit an edge).
 ## 6. Implementation status — what works, what to skip
 
 Stated plainly so you never waste a turn. **This card was first written against an early build and
-over-reported "not implemented"** — `.feed`, interpreter blocks, streams/channels, and all six MCP
-`(P1)` items were verified working against the current source and are now marked done. The
-genuinely-still-missing items are: background/async exec via MCP, per-call elision tuning, `capture`/
-`timeout` on `shoal_exec`, `complete`/`explain`, and real OS-level sandbox enforcement. When in doubt,
-run a one-line probe rather than trusting a stale banner.
+over-reported "not implemented"** — `.feed`, interpreter blocks, streams/channels, all six MCP
+`(P1)` items, and the whole `shoal_exec`/`shoal_get`/`shoal_journal`/`shoal_cap_request` schema
+surface were verified working against the current source/binary and are now marked done. The
+genuinely-still-missing items are: the language-channel→kernel-bus bridge (§0.8's caveat),
+`task.suspend`, content-addressed refs, and real OS-level sandbox enforcement through this surface.
+When in doubt, run a one-line probe rather than trusting a stale banner.
 
 - **DONE — The MCP `resources/*`/events subsystem.** `crates/shoal-mcp/src/lib.rs`'s `handle()` now
   dispatches `resources/list`/`read`/`subscribe`/`unsubscribe`, and `initialize` advertises
@@ -788,20 +887,24 @@ run a one-line probe rather than trusting a stale banner.
   (§0.2, §4 rule 15) is now just a fallback. Confirmed by the live e2e test
   `crates/shoal-mcp/tests/live_kernel.rs`.
 - **DONE — `shoal_cancel`.** Present in `tools()` (seven tools now). Note `task.suspend` still errors
-  (unimplemented even over raw JSON-RPC), and creating a cancellable task still needs the
-  background-exec path below, which is *not* yet wired through MCP.
-- **Background/async execution via MCP is still presumed missing** (not one of the six named P1
-  fixes) — the kernel's `exec` supports an `async`/`background` flag that spawns a trackable task,
-  but as of authoring `shoal_exec`'s MCP schema never forwarded it. Confirm the schema directly
-  (`tools/list`'s `shoal_exec` entry) before assuming you can create a task to hand to `shoal_cancel`.
-- **Per-call elision tuning via MCP** — the kernel's `value.get`/`exec` both accept an `elide` budget;
-  neither `shoal_get` nor `shoal_exec`'s MCP schema exposes it.
-- **`shoal_exec`'s `capture`/`timeout` params** — accepted by the tool schema, forwarded to nothing.
-- **`shoal_journal`'s `until`/`effects` filters** — accepted by the tool schema, forwarded to nothing;
-  conversely its real `ok` filter isn't exposed by the schema at all.
-- **`complete` and `explain`** JSON-RPC methods (typed completions, structured explanations) —
-  `docs/TDD.md` §7 and `docs/AGENT-SURFACE.md` §5 both name them; the kernel's `dispatch` has no case
-  for either — calling them 404s with `-32601`.
+  (unimplemented even over raw JSON-RPC).
+- **DONE — background/async execution via MCP.** `shoal_exec`'s schema exposes `background` and
+  `timeout_ms` and forwards both (verified in `crates/shoal-mcp/src/tools.rs`); the kernel spawns a
+  trackable task, `timeout_ms` converts an overdue run instead of killing it (§0.1), and terminal
+  task states are `completed`/`failed`/`cancelled` on the `task.<n>` channel.
+- **DONE — per-call elision tuning via MCP.** Both `shoal_exec` and `shoal_get` expose and forward
+  the `elide` budget (`{max_bytes?, max_rows?, max_items?}`); the 64 KiB hard cap still applies. The
+  old dead `capture`/`timeout` params on `shoal_exec` are gone from the schema entirely.
+- **DONE — `shoal_journal`'s full filter set.** `since`/`until`/`principal`/`ok`/`effects`/`head`/
+  `limit` are all in the tool schema and all honored kernel-side (`JournalQueryParams`).
+- **DONE — `complete` and `explain`** JSON-RPC methods (typed completions, structured explanations)
+  are dispatched kernel-side (`dispatch.rs` → `handle_complete`/`handle_explain`). They are
+  kernel-JSON-RPC-only — no `shoal_*` MCP tool wraps them yet.
+- **Language channels do not reach the kernel event bus (known gap).** `channel("x").emit(v)` in
+  evaluated source publishes to `shoal-eval`'s in-process bus only; `resources/subscribe` on
+  `shoal://events/user.x` will never see it. Only kernel-published channels
+  (`task.{id}`, `session.transcript`, `journal`, `approval`, and `events.publish` over raw JSON-RPC)
+  are subscribable today (§0.8).
 - **~~`.feed` and interpreter blocks~~ — NOW IMPLEMENTED (this card's original banner was stale).**
   Verified working against the current binary: `["b","a","c"].feed(sort).out`, and **commands with
   args/flags parse bare** — `["b","a","c"].feed(sort -r).out`, `data.feed(grep "foo").out`,
