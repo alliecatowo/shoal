@@ -177,3 +177,37 @@ value = '"result: AB"'
 name = "str2-split-multichar-separator"
 src = '"a::b::c".split("::")'
 value = '["a", "b", "c"]'
+
+# `.take`/`.skip` slice a str by CHAR (returning a substring), so text parsing
+# reads without a `.chars()…collect()` detour: `line.take(7)` / `line.skip(8)`.
+# See crates/shoal-value/src/methods/list.rs::slice_count.
+
+[[case]]
+name = "str2-take-slices-by-char"
+src = '"XY foo/bar.rs".take(2)'
+value = '"XY"'
+
+[[case]]
+name = "str2-skip-slices-by-char"
+src = '"XY foo/bar.rs".skip(3)'
+value = '"foo/bar.rs"'
+
+[[case]]
+name = "str2-take-is-char-aware-not-byte"
+src = '"héllo".take(2)'
+value = '"hé"'
+
+[[case]]
+name = "str2-take-past-end-returns-whole"
+src = '"hi".take(99)'
+value = '"hi"'
+
+[[case]]
+name = "str2-skip-past-end-returns-empty"
+src = '"hi".skip(99)'
+value = '""'
+
+[[case]]
+name = "str2-take-skip-compose-for-substring"
+src = '"abcdefg".skip(2).take(3)'
+value = '"cde"'

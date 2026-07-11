@@ -246,6 +246,17 @@ pub(crate) fn enumerate(v: Value) -> VResult<Value> {
     ))
 }
 pub(crate) fn slice_count(v: Value, n: usize, take: bool) -> VResult<Value> {
+    // `.take`/`.skip` also slice a `str` — by char, returning a substring — so
+    // text parsing reads naturally: `line.take(7)` is the git short hash,
+    // `line.skip(8)` is the message. (List/table/range keep their semantics.)
+    if let Value::Str(s) = &v {
+        let sliced: String = if take {
+            s.chars().take(n).collect()
+        } else {
+            s.chars().skip(n).collect()
+        };
+        return Ok(Value::Str(sliced));
+    }
     let x = seq(v)?;
     Ok(Value::List(if take {
         x.into_iter().take(n).collect()
