@@ -494,3 +494,85 @@ fn syntax_gap_paren_it_out_rejected_in_scripts() {
         }
     ));
 }
+
+// ---------------------------------------------------------------- for-loop
+// iterable vs. trailing-block-lambda ambiguity (dogfooding papercut).
+//
+// `postfix()`'s `f(a){…}` trailing-block desugar (§3.4) greedily grabs a
+// `{` right after a call's `)`. When that call is the *whole* for-loop
+// iterable (`for p in glob("*.md") { … }`), the desugar swallowed the loop
+// body's own brace as a bogus thunk argument to `glob(...)`, leaving the
+// `for` with no `{` to open its body and a confusing "expected `{`" error.
+// `for_stmt` now parses the iterable via `expr_before_block`, which
+// suppresses that desugar at the iterable's top level while still allowing
+// it on any nested, delimiter-enclosed subexpression.
+
+fn for_iter(p: &Program) -> &Expr {
+    match last(p) {
+        Stmt::For { iter, .. } => iter,
+        other => panic!("expected a for-loop, got {other:?}"),
+    }
+}
+
+#[test]
+fn for_in_over_a_call_parses() {
+    let p = parse(r#"for p in glob("*.md") { n += 1 }"#).unwrap();
+    assert!(matches!(for_iter(&p), Expr::FnCall { name, .. } if name == "glob"));
+}
+
+#[test]
+fn for_in_over_a_method_chain_parses() {
+    let p = parse(r#"for p in glob("*.md").filter(x => x.ok) { n += 1 }"#).unwrap();
+    assert!(matches!(for_iter(&p), Expr::MethodCall { name, .. } if name == "filter"));
+}
+
+#[test]
+fn for_in_over_a_range_parses() {
+    let p = parse("for i in 1..10 { n += i }").unwrap();
+    assert!(matches!(for_iter(&p), Expr::Range { .. }));
+}
+
+#[test]
+fn for_in_over_a_var_parses() {
+    let p = parse("var xs = [1, 2, 3]\nfor x in xs { n += x }").unwrap();
+    assert!(matches!(for_iter(&p), Expr::Var { name, .. } if name == "xs"));
+}
+
+#[test]
+fn for_in_over_a_call_still_allows_a_parenthesised_trailing_block() {
+    // The escape hatch: a call whose OWN trailing-block-lambda is wanted as
+    // (part of) the iterable still works as long as it's not left bare at
+    // the iterable's top level — parens fully enclose the ambiguity away.
+    let p = parse("for x in (retry(3) { attempt() }) { n += 1 }").unwrap();
+    match last(&p) {
+        Stmt::For { iter, .. } => match iter {
+            Expr::FnCall { name, args, .. } => {
+                assert_eq!(name, "retry");
+                // `3` plus the desugared trailing-block thunk.
+                assert_eq!(args.pos.len(), 2);
+                assert!(matches!(args.pos[1], Expr::Lambda { .. }));
+            }
+            other => panic!("{other:?}"),
+        },
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn call_trailing_block_lambda_still_works_outside_a_for_iterable() {
+    // The suppression is scoped to the for-loop's iterable only; an
+    // ordinary statement-position call keeps taking its trailing block as
+    // the `f(a){…}` sugar (§3.4) intends.
+    let p = parse("retry(3) { attempt() }").unwrap();
+    match last(&p) {
+        Stmt::Expr {
+            expr: Expr::FnCall { name, args, .. },
+            ..
+        } => {
+            assert_eq!(name, "retry");
+            assert_eq!(args.pos.len(), 2);
+            assert!(matches!(args.pos[1], Expr::Lambda { .. }));
+        }
+        other => panic!("{other:?}"),
+    }
+}

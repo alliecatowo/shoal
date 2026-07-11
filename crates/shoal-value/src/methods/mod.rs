@@ -54,6 +54,20 @@ fn dispatch(ctx: &mut dyn CallCtx, recv: Value, name: &str, args: CallArgs) -> V
     if let Value::Stream(s) = recv {
         return stream::stream_method(ctx, s, name, args);
     }
+    // Pure (no-IO) `path` component accessors (docs/CONTRACTS.md §3). Intercepted
+    // ahead of the generic table because `.abs` on a path means "absolutize",
+    // not the numeric `.abs`. The filesystem-backed path methods (`.read`,
+    // `.lines`, `.size`, …) are handled earlier still, in the evaluator, since
+    // they need the `Fs` port.
+    if let Value::Path(p) = &recv {
+        match name {
+            "name" | "stem" | "ext" => return path::component(p, name),
+            "parent" => return no_args(&args).map(|_| path::parent(p)),
+            "join" => return path::join(p, arg(&args, 0)?),
+            "abs" => return no_args(&args).map(|_| path::abs(ctx, p)),
+            _ => {}
+        }
+    }
     match name {
         // `.feed(cmd)` (IO.md §1) spawns a child, which a pure value method
         // cannot do — the evaluator intercepts `.feed` in its method-call path
@@ -424,6 +438,48 @@ mod tests {
         assert_eq!(
             call(Value::Int(1), "suspend", vec![]).unwrap_err().code,
             "type_error"
+        );
+    }
+
+    #[test]
+    fn path_pure_component_methods() {
+        let p = || Value::Path(PathBuf::from("/a/b/file.tar.gz"));
+        assert_eq!(
+            call(p(), "name", vec![]).unwrap(),
+            Value::Str("file.tar.gz".into())
+        );
+        assert_eq!(
+            call(p(), "stem", vec![]).unwrap(),
+            Value::Str("file.tar".into())
+        );
+        assert_eq!(call(p(), "ext", vec![]).unwrap(), Value::Str("gz".into()));
+        assert_eq!(
+            call(p(), "parent", vec![]).unwrap(),
+            Value::Path(PathBuf::from("/a/b"))
+        );
+        assert_eq!(
+            call(p(), "join", vec![Value::Str("x".into())]).unwrap(),
+            Value::Path(PathBuf::from("/a/b/file.tar.gz/x"))
+        );
+        // An extensionless / rootless path yields nulls where appropriate.
+        assert_eq!(
+            call(Value::Path(PathBuf::from("README")), "ext", vec![]).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            call(Value::Path(PathBuf::from("/")), "parent", vec![]).unwrap(),
+            Value::Null
+        );
+        // `.abs()` absolutizes a relative path against the ctx cwd.
+        let cwd = std::env::temp_dir();
+        assert_eq!(
+            call(Value::Path(PathBuf::from("rel/x")), "abs", vec![]).unwrap(),
+            Value::Path(cwd.join("rel/x"))
+        );
+        // `.str()` remains the fallible converter, still reaching a path.
+        assert_eq!(
+            call(Value::Path(PathBuf::from("/a/b")), "str", vec![]).unwrap(),
+            Value::Str("/a/b".into())
         );
     }
 

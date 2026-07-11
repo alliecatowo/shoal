@@ -8,6 +8,7 @@ use shoal_eval::Evaluator;
 use shoal_syntax::{ParseError, parse};
 use shoal_value::{ErrorVal, Value};
 
+mod adapters;
 mod args;
 mod completer;
 mod highlight;
@@ -140,8 +141,22 @@ fn run_source(
         }
     };
     let cwd = std::env::current_dir().map_err(|e| format!("cannot determine cwd: {e}"))?;
+    let loaded = shoal_config::load(&shoal_config::LoadOptions::discover(&cwd))?;
+    for warning in &loaded.warnings {
+        eprintln!(
+            "{}",
+            maybe_strip(format!("\x1b[33;1mwarning:\x1b[0m config error: {warning}"))
+        );
+    }
     let mut evaluator = Evaluator::new(cwd);
     evaluator.interactive = interactive;
+    // Engage the bundled adapter pack (+ any `adapters.dirs` the config
+    // declares) on every non-interactive path too — see `adapters` module
+    // doc comment for the defect this closes (`-c`/scripts ran raw system
+    // commands instead of adapters).
+    let (_, adapter_warnings) =
+        adapters::load_adapters(&mut evaluator, &loaded.config.adapters.dirs);
+    adapters::print_warnings(&adapter_warnings);
     evaluator.env.declare(
         "args",
         Value::List(

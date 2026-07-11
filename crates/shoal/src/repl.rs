@@ -69,21 +69,14 @@ pub(crate) fn repl() -> Result<i32, String> {
     // statement that produced `out[n]` recorded.
     let mut out_entries: Vec<Option<i64>> = Vec::new();
 
-    let mut catalogs = Vec::new();
-    for dir in &config.adapters.dirs {
-        let (catalog, warnings) = shoal_adapters::AdapterCatalog::load_dir(dir);
-        for warning in warnings {
-            eprintln!(
-                "{}",
-                maybe_strip(format!(
-                    "\x1b[33;1mwarning:\x1b[0m failed to load adapter: {warning}"
-                ))
-            );
-        }
-        evaluator.set_adapters(catalog.clone());
-        catalogs.push(catalog);
-    }
-    let adapter_names = completer::scan_adapter_names(&config.adapters.dirs);
+    // Bundled pack + any `adapters.dirs` the config declares — the SAME
+    // sequence `-c`/script-file runs load (`crate::adapters`), so the REPL
+    // and every other path agree on one adapter catalog.
+    let (catalogs, adapter_warnings) =
+        crate::adapters::load_adapters(&mut evaluator, &config.adapters.dirs);
+    crate::adapters::print_warnings(&adapter_warnings);
+    let adapter_names =
+        completer::scan_adapter_names(&crate::adapters::name_scan_dirs(&config.adapters.dirs));
 
     for init in &config.init.files {
         let src = fs::read_to_string(init)

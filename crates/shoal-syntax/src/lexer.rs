@@ -739,4 +739,21 @@ mod tests {
         let result = Lexer::new("'𐣠").token(0, Mode::Expr);
         assert!(matches!(result, Err(LexError { ref msg, .. }) if msg.contains("unterminated")));
     }
+
+    /// A literal open-brace in an interpolating string starts a `{expr}`
+    /// interpolation (by design — TDD §2.1). When it can't find a matching
+    /// close (a realistic dogfooding case: JSON text with escaped `"` whose
+    /// nested-string scan runs off the end looking for the interpolation's
+    /// `}`), the error must teach the fix rather than just say "unterminated".
+    #[test]
+    fn unterminated_interpolation_hint_teaches_the_fix() {
+        let err = Lexer::new(r#""{\"key\": \"value\"}""#)
+            .token(0, Mode::Expr)
+            .unwrap_err();
+        assert!(err.msg.contains("`{expr}`"), "{err:?}");
+        let hint = err.hint.expect("should carry a hint");
+        assert!(hint.contains("raw string"), "{hint}");
+        assert!(hint.contains('\''), "{hint}");
+        assert!(hint.contains('\\'), "{hint}");
+    }
 }

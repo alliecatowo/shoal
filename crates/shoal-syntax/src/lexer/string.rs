@@ -36,7 +36,10 @@ impl<'s> Lexer<'s> {
                     let expr_start = pos + 1;
                     let expr_end = self.find_interp_end(expr_start).ok_or_else(|| {
                         LexError::new("unterminated `{expr}` in string", Span::new(pos, pos + 1))
-                            .hint("escape a literal brace as \\{")
+                            .hint(
+                                "this `{` starts an interpolation — for literal braces, use a \
+                                 raw string ('…') instead, or escape each brace as \\{ and \\}",
+                            )
                     })?;
                     if !lit.is_empty() {
                         segs.push(Seg::Lit(std::mem::take(&mut lit)));

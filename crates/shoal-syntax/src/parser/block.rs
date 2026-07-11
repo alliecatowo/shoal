@@ -227,8 +227,10 @@ impl<'s> Parser<'s> {
         self.pos = save;
         // Not a lambda: a parenthesised group. Apply the same two-mode dispatch
         // as `statement()` so `(echo hi)` runs the command (substitution, D4).
+        // The group is fully enclosed by its own `)`, so any trailing block
+        // inside it can never be confused for an enclosing construct's block.
         self.skip_newlines()?;
-        let expr = self.expr_or_command(0)?;
+        let expr = self.allow_trailing_block(|p| p.expr_or_command(0))?;
         self.skip_newlines()?;
         self.expect(Mode::Expr, Tok::RParen, "`)`")?;
         Ok(expr)

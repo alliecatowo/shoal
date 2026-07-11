@@ -9,6 +9,32 @@ impl<'s> Parser<'s> {
         let lhs = self.unary(min == 0)?;
         self.expr_tail(lhs, min)
     }
+    /// Parse a full expression that a caller will immediately follow with
+    /// its *own* mandatory `{ … }` block (a `for` loop's iterable, today —
+    /// see `Parser::no_trailing_block`). Suppresses the `f(a){…}`
+    /// trailing-block desugar at this expression's top level so that
+    /// following `{` is left for the caller's `block()`, while leaving the
+    /// desugar legal on any nested, delimiter-enclosed subexpression (call
+    /// args, `[…]`, parens).
+    pub(crate) fn expr_before_block(&mut self) -> ParseResult<Expr> {
+        let saved = std::mem::replace(&mut self.no_trailing_block, true);
+        let e = self.expr(0);
+        self.no_trailing_block = saved;
+        e
+    }
+    /// Run `f` with the `no_trailing_block` restriction lifted — for a
+    /// subexpression fully enclosed by its own matching delimiter, where a
+    /// trailing `{…}` can never be mistaken for an enclosing construct's
+    /// block because the delimiter closes first.
+    pub(crate) fn allow_trailing_block<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> ParseResult<T>,
+    ) -> ParseResult<T> {
+        let saved = std::mem::replace(&mut self.no_trailing_block, false);
+        let r = f(self);
+        self.no_trailing_block = saved;
+        r
+    }
     /// Parse a `match` guard's expression. Identical to `expr(0)` except the
     /// guard's own leading operand may never resolve as the bare
     /// `IDENT => …` one-param-lambda shorthand: a guard is `bool`-valued, so
@@ -143,7 +169,7 @@ impl<'s> Parser<'s> {
     }
     pub(crate) fn primary(&mut self, top: bool) -> ParseResult<Expr> {
         let (t, s) = self.bump(Mode::Expr)?;
-        Ok(match t{Tok::Int(value)=>Expr::Int{value,span:s},Tok::Float(value)=>Expr::Float{value,span:s},Tok::Size(bytes)=>Expr::Size{bytes,span:s},Tok::Duration(ns)=>Expr::Duration{ns,span:s},Tok::Time{hour,min,sec}=>Expr::Time{hour,min,sec,span:s},Tok::Str(value)=>Expr::Str{value,span:s},Tok::StrInterp(parts)=>self.interp(parts,s)?,Tok::Regex(src)=>Expr::Regex{src,span:s},Tok::DateTime(iso)=>Expr::DateTime{iso,span:s},Tok::Ident(x)if x=="true"||x=="false"=>Expr::Bool{value:x=="true",span:s},Tok::Ident(x)if x=="null"=>Expr::Null{span:s},Tok::Ident(x)if x=="if"=>return self.if_expr(s.start as usize),Tok::Ident(x)if x=="try"=>return self.try_expr(s.start as usize),Tok::Ident(x)if x=="match"=>return self.match_expr(s.start as usize),Tok::Ident(x)if x=="with"=>return self.with_expr(s.start as usize),Tok::Ident(x)if x=="spawn"=>{let body=self.block()?;Expr::Spawn{body,span:Span::new(s.start as usize,self.pos)}},Tok::Ident(ref x)if INTERPRETERS.contains(&x.as_str())&&self.interp_block_follows(s)=>{let tool=x.clone();if self.byte(self.pos)==b'\''{let(rt,rs)=self.bump(Mode::Expr)?;match rt{Tok::Str(src)=>Expr::LangBlock{tool,src,span:Span::new(s.start as usize,rs.end as usize)},_=>return Err(ParseError::new(format!("expected {tool} payload after `{tool}'`"),rs))}}else{let open=self.expect(Mode::Expr,Tok::LBrace,"`{` or `'''…'''`")?;let(src,end)=self.lx.raw_brace_block(open.start as usize)?;self.pos=end;Expr::LangBlock{tool,src,span:Span::new(s.start as usize,end as usize)}}},Tok::Ident(name)=>{if top&&matches!(self.peek(Mode::Expr)?.0,Tok::FatArrow){self.bump(Mode::Expr)?;let body=self.expr(0)?;let end=body.span().end;Expr::Lambda{params:vec![Param{name,ty:None,default:None,span:s}],body:Box::new(body),span:Span::new(s.start as usize,end as usize)}}else{if !self.repl&&matches!(name.as_str(),"it"|"out"){return Err(ParseError::new(format!("`{name}` is REPL-only"),s).hint("bind a variable to reuse a previous result"))}Expr::Var{name,span:s}}},Tok::LParen=>return self.paren_or_lambda(s.start as usize),Tok::LBracket=>{let mut items=vec![];self.skip_newlines()?;if self.eat(Mode::Expr,&Tok::RBracket)?.is_none(){loop{items.push(self.expr(0)?);self.skip_newlines()?;if self.eat(Mode::Expr,&Tok::Comma)?.is_none(){self.expect(Mode::Expr,Tok::RBracket,"`]`")?;break}self.skip_newlines()?;if self.eat(Mode::Expr,&Tok::RBracket)?.is_some(){break}}}Expr::List{items,span:Span::new(s.start as usize,self.pos)}},Tok::LBrace=>return self.record_or_block(s.start as usize),Tok::Pipe=>return Err(ParseError::new("shoal has no pipe operator",s).hint("data composes with `.`; raw byte plumbing is `.feed(cmd)`; verbatim POSIX lives in `sh { … }`")),_=>return Err(ParseError::new(format!("expected expression, found {t:?}"),s))})
+        Ok(match t{Tok::Int(value)=>Expr::Int{value,span:s},Tok::Float(value)=>Expr::Float{value,span:s},Tok::Size(bytes)=>Expr::Size{bytes,span:s},Tok::Duration(ns)=>Expr::Duration{ns,span:s},Tok::Time{hour,min,sec}=>Expr::Time{hour,min,sec,span:s},Tok::Str(value)=>Expr::Str{value,span:s},Tok::StrInterp(parts)=>self.interp(parts,s)?,Tok::Regex(src)=>Expr::Regex{src,span:s},Tok::DateTime(iso)=>Expr::DateTime{iso,span:s},Tok::Ident(x)if x=="true"||x=="false"=>Expr::Bool{value:x=="true",span:s},Tok::Ident(x)if x=="null"=>Expr::Null{span:s},Tok::Ident(x)if x=="if"=>return self.if_expr(s.start as usize),Tok::Ident(x)if x=="try"=>return self.try_expr(s.start as usize),Tok::Ident(x)if x=="match"=>return self.match_expr(s.start as usize),Tok::Ident(x)if x=="with"=>return self.with_expr(s.start as usize),Tok::Ident(x)if x=="spawn"=>{let body=self.block()?;Expr::Spawn{body,span:Span::new(s.start as usize,self.pos)}},Tok::Ident(ref x)if INTERPRETERS.contains(&x.as_str())&&self.interp_block_follows(s)=>{let tool=x.clone();if self.byte(self.pos)==b'\''{let(rt,rs)=self.bump(Mode::Expr)?;match rt{Tok::Str(src)=>Expr::LangBlock{tool,src,span:Span::new(s.start as usize,rs.end as usize)},_=>return Err(ParseError::new(format!("expected {tool} payload after `{tool}'`"),rs))}}else{let open=self.expect(Mode::Expr,Tok::LBrace,"`{` or `'''…'''`")?;let(src,end)=self.lx.raw_brace_block(open.start as usize)?;self.pos=end;Expr::LangBlock{tool,src,span:Span::new(s.start as usize,end as usize)}}},Tok::Ident(name)=>{if top&&matches!(self.peek(Mode::Expr)?.0,Tok::FatArrow){self.bump(Mode::Expr)?;let body=self.expr(0)?;let end=body.span().end;Expr::Lambda{params:vec![Param{name,ty:None,default:None,span:s}],body:Box::new(body),span:Span::new(s.start as usize,end as usize)}}else{if !self.repl&&matches!(name.as_str(),"it"|"out"){return Err(ParseError::new(format!("`{name}` is REPL-only"),s).hint("bind a variable to reuse a previous result"))}Expr::Var{name,span:s}}},Tok::LParen=>return self.paren_or_lambda(s.start as usize),Tok::LBracket=>{let mut items=vec![];self.skip_newlines()?;if self.eat(Mode::Expr,&Tok::RBracket)?.is_none(){loop{items.push(self.allow_trailing_block(|p|p.expr(0))?);self.skip_newlines()?;if self.eat(Mode::Expr,&Tok::Comma)?.is_none(){self.expect(Mode::Expr,Tok::RBracket,"`]`")?;break}self.skip_newlines()?;if self.eat(Mode::Expr,&Tok::RBracket)?.is_some(){break}}}Expr::List{items,span:Span::new(s.start as usize,self.pos)}},Tok::LBrace=>return self.record_or_block(s.start as usize),Tok::Pipe=>return Err(ParseError::new("shoal has no pipe operator",s).hint("data composes with `.`; raw byte plumbing is `.feed(cmd)`; verbatim POSIX lives in `sh { … }`")),_=>return Err(ParseError::new(format!("expected expression, found {t:?}"),s))})
     }
     pub(crate) fn postfix(&mut self, mut e: Expr) -> ParseResult<Expr> {
         loop {
@@ -163,7 +189,9 @@ impl<'s> Parser<'s> {
                     if self.eat(Mode::Expr, &Tok::LParen)?.is_some() {
                         let mut args = self.args_after_open()?;
                         // Trailing block after a method call (§3.4 `f(a){…}`).
-                        if matches!(self.peek(Mode::Expr)?.0, Tok::LBrace) {
+                        if !self.no_trailing_block
+                            && matches!(self.peek(Mode::Expr)?.0, Tok::LBrace)
+                        {
                             args.pos.push(self.trailing_block_lambda()?);
                         }
                         let span = Span::new(e.span().start as usize, self.pos);
@@ -174,7 +202,10 @@ impl<'s> Parser<'s> {
                             optional,
                             span,
                         }
-                    } else if !optional && matches!(self.peek(Mode::Expr)?.0, Tok::LBrace) {
+                    } else if !optional
+                        && !self.no_trailing_block
+                        && matches!(self.peek(Mode::Expr)?.0, Tok::LBrace)
+                    {
                         // `xs.each { … }` — method call with only a thunk arg.
                         let mut args = Args::empty();
                         args.pos.push(self.trailing_block_lambda()?);
@@ -198,7 +229,7 @@ impl<'s> Parser<'s> {
                 }
                 Tok::LBracket => {
                     self.bump(Mode::Expr)?;
-                    let i = self.expr(0)?;
+                    let i = self.allow_trailing_block(|p| p.expr(0))?;
                     self.expect(Mode::Expr, Tok::RBracket, "`]`")?;
                     let span = Span::new(e.span().start as usize, self.pos);
                     e = Expr::Index {
@@ -211,7 +242,7 @@ impl<'s> Parser<'s> {
                     self.bump(Mode::Expr)?;
                     let mut args = self.args_after_open()?;
                     // Trailing block after a call (§3.4 `f(a){…}`).
-                    if matches!(self.peek(Mode::Expr)?.0, Tok::LBrace) {
+                    if !self.no_trailing_block && matches!(self.peek(Mode::Expr)?.0, Tok::LBrace) {
                         args.pos.push(self.trailing_block_lambda()?);
                     }
                     let span = Span::new(e.span().start as usize, self.pos);
@@ -276,6 +307,13 @@ impl<'s> Parser<'s> {
         })
     }
     pub(crate) fn args_after_open(&mut self) -> ParseResult<Args> {
+        // A call's own argument list is fully enclosed by its `(` … `)`, so a
+        // trailing `{…}` on any argument can never be confused for an
+        // enclosing construct's mandatory block (that block only follows
+        // once this whole call — and its `)` — have already closed).
+        self.allow_trailing_block(Self::args_after_open_inner)
+    }
+    fn args_after_open_inner(&mut self) -> ParseResult<Args> {
         let mut a = Args::empty();
         self.skip_newlines()?;
         if self.eat(Mode::Expr, &Tok::RParen)?.is_some() {

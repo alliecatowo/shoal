@@ -1,0 +1,259 @@
+# ~30+ additional general method/coercion cases (TDD §4.2 coercion matrix,
+# §5 method surface; docs/CONTRACTS.md §3's `call_method` set) to round out
+# corpus coverage past 1,000 cases (TDD §12's M1 target) — filling gaps in
+# methods that existing files exercise rarely or not at all (`.filter`
+# (0 hits pre-this-file), `.count`, `.flatten`, `.flat_map`, `.zip`,
+# `.enumerate`, `.chunks`, `.sort_by`, `.group`, `.min`/`.max`, `.items`,
+# `.keys`/`.values`, arithmetic promotion across `size`/`duration`).
+
+# --- `.filter` (TDD §5: an alias of `.where`, `mod.rs`'s `"where" | "filter"`
+#     match arm — previously untested directly under its own name) ----------
+
+[[case]]
+name = "methc-filter-is-an-alias-for-where"
+src = "[1, 2, 3, 4].filter(x => x % 2 == 0)"
+value = "[2, 4]"
+
+[[case]]
+name = "methc-filter-on-empty-list"
+src = "[].filter(x => true)"
+value = "[]"
+
+# --- `.count` (alias for `.len`, not a predicate counter — bytes-value.toml
+#     already proves the bytes case; this proves list/stream agree) --------
+
+[[case]]
+name = "methc-count-is-len-not-a-predicate"
+src = "[1, 2, 3].count()"
+value = "3"
+
+[[case]]
+name = "methc-count-after-where-counts-the-filtered-set"
+src = "[1, 2, 3].where(x => x > 1).count()"
+value = "2"
+
+# --- `.flatten` (one level; every element must itself be a collection) -----
+
+[[case]]
+name = "methc-flatten-one-level-only"
+src = "[[1, 2], [3, [4, 5]]].flatten()"
+value = "[1, 2, 3, [4, 5]]"
+
+[[case]]
+name = "methc-flatten-of-empty-sublists"
+src = "[[], [1], []].flatten()"
+value = "[1]"
+
+# --- `.flat_map` -------------------------------------------------------------
+
+[[case]]
+name = "methc-flat-map-combines-map-and-flatten"
+src = "[1, 2, 3].flat_map(x => [x, x * 10])"
+value = "[1, 10, 2, 20, 3, 30]"
+
+# --- `.zip` / `.enumerate` ---------------------------------------------------
+
+[[case]]
+name = "methc-zip-pairs-elementwise"
+src = "[1, 2, 3].zip([4, 5, 6])"
+value = "[[1, 4], [2, 5], [3, 6]]"
+
+[[case]]
+name = "methc-zip-truncates-to-shorter-list"
+src = "[1, 2, 3].zip([4, 5])"
+value = "[[1, 4], [2, 5]]"
+
+[[case]]
+name = "methc-enumerate-pairs-index-and-value"
+src = "[10, 20, 30].enumerate()"
+value = "[[0, 10], [1, 20], [2, 30]]"
+
+# --- `.chunks` / `.skip` / `.take` ------------------------------------------
+
+[[case]]
+name = "methc-chunks-groups-with-a-short-final-chunk"
+src = "[1, 2, 3, 4, 5].chunks(2)"
+value = "[[1, 2], [3, 4], [5]]"
+
+[[case]]
+name = "methc-skip-then-take-composes"
+src = "[1, 2, 3, 4].skip(1).take(2)"
+value = "[2, 3]"
+
+# --- `.sort_by` / `.group` / `.min` / `.max` --------------------------------
+
+[[case]]
+name = "methc-sort-by-descending-key"
+src = "[3, 1, 2].sort_by(x => -x)"
+value = "[3, 2, 1]"
+
+[[case]]
+name = "methc-group-by-key-fn"
+src = '[{name: "a", n: 1}, {name: "b", n: 1}, {name: "c", n: 2}].group(r => r.n).len()'
+value = "2"
+
+[[case]]
+name = "methc-min-of-a-list"
+src = "[5, 3, 8, 1].min()"
+value = "1"
+
+[[case]]
+name = "methc-max-of-a-list"
+src = "[5, 3, 8, 1].max()"
+value = "8"
+
+# --- `.items` / `.keys` / `.values` (record introspection) ------------------
+
+[[case]]
+name = "methc-items-pairs-a-record-into-kv-lists"
+src = "{a: 1, b: 2}.items()"
+value = '[["a", 1], ["b", 2]]'
+
+[[case]]
+name = "methc-keys-of-a-record"
+src = "{a: 1, b: 2}.keys()"
+value = '["a", "b"]'
+
+[[case]]
+name = "methc-values-of-a-record"
+src = "{a: 1, b: 2}.values()"
+value = "[1, 2]"
+
+# --- string methods rarely hit directly -------------------------------------
+
+[[case]]
+name = "methc-chars-splits-into-single-char-strings"
+src = '"abc".chars()'
+value = '["a", "b", "c"]'
+
+[[case]]
+name = "methc-words-splits-on-runs-of-whitespace"
+src = '"one two  three".words()'
+value = '["one", "two", "three"]'
+
+[[case]]
+name = "methc-upper-then-lower-roundtrips-ascii"
+src = '"Hello".upper().lower()'
+value = '"hello"'
+
+[[case]]
+name = "methc-starts-with-and-ends-with-compose"
+src = '"Hello".starts_with("He") && "Hello".ends_with("lo")'
+value = "true"
+
+[[case]]
+name = "methc-replace-all-occurrences"
+src = '"a-b-c".replace("-", "_")'
+value = '"a_b_c"'
+
+[[case]]
+name = "methc-join-requires-str-elements"
+src = '["1", "2", "3"].join("-")'
+value = '"1-2-3"'
+
+[[case]]
+name = "methc-split-preserves-empty-fields"
+src = '"a,b,,c".split(",")'
+value = '["a", "b", "", "c"]'
+
+# --- `.is_empty` across receiver types --------------------------------------
+
+[[case]]
+name = "methc-is-empty-true-for-empty-list"
+src = "[].is_empty()"
+value = "true"
+
+[[case]]
+name = "methc-is-empty-false-for-nonempty-list"
+src = "[1].is_empty()"
+value = "false"
+
+[[case]]
+name = "methc-is-empty-true-for-empty-str"
+src = '"".is_empty()'
+value = "true"
+
+# --- `.parse_int` / `.parse_float` / `.json` --------------------------------
+
+[[case]]
+name = "methc-parse-int-then-arithmetic"
+src = '"5".parse_int() + 1'
+value = "6"
+
+[[case]]
+name = "methc-parse-float-then-arithmetic"
+src = '"3.14".parse_float() + 1'
+value = "4.140000000000001"
+
+[[case]]
+name = "methc-json-serializes-a-record"
+src = '{a: 1}.json()'
+value = '"{\"a\":1}"'
+
+# --- `.sum` ------------------------------------------------------------------
+
+[[case]]
+name = "methc-sum-of-ints"
+src = "[1, 2, 3].sum()"
+value = "6"
+
+# --- coercion matrix (TDD §4.2): arithmetic promotion -----------------------
+
+[[case]]
+name = "methc-coerce-int-float-mixed-arithmetic"
+src = "2 + 3.5"
+value = "5.5"
+
+[[case]]
+name = "methc-coerce-size-plus-size"
+src = "1kb + 500b"
+value = "1.5kb"
+
+[[case]]
+name = "methc-coerce-size-times-int"
+src = "3 * 1.5kb"
+value = "4.5kb"
+
+[[case]]
+name = "methc-coerce-size-div-int"
+src = "1mb / 2"
+value = "500kb"
+
+[[case]]
+name = "methc-coerce-size-div-size-yields-float-ratio"
+src = "1mb / 1kb"
+value = "1000"
+
+[[case]]
+name = "methc-coerce-duration-plus-duration"
+src = "2s + 500ms"
+value = "2s500ms"
+
+[[case]]
+name = "methc-coerce-int-div-int-truncates"
+src = "10 / 3"
+value = "3"
+
+[[case]]
+name = "methc-coerce-float-div-int-promotes"
+src = "10.0 / 3"
+value = "3.3333333333333335"
+
+# --- misc: nullish coalescing, range render, str() error on mixed list -----
+
+[[case]]
+name = "methc-nullish-coalesce-falls-through-on-null"
+src = "null ?? 5"
+value = "5"
+
+[[case]]
+name = "methc-inclusive-range-renders-with-eq-sign"
+src = "1..=3"
+value = "1..=3"
+
+[[case]]
+name = "methc-str-on-a-mixed-list-is-a-type-error"
+# `.str()` is a `str`/`path`/`bytes` conversion (TDD §4.1) — a `list` has no
+# lossless string form, so it is a type error rather than a silent render.
+src = '[1, "a", true, null].str()'
+error = "type_error"

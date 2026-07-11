@@ -119,6 +119,17 @@ pub struct Parser<'s> {
     cmd_scopes: Vec<HashSet<String>>,
     /// REPL context: `it`/`out` are legal and a leading `.` chains on `it`.
     repl: bool,
+    /// Suppresses the `f(a){…}` trailing-block-lambda desugar (§3.4) at the
+    /// *top level* of the expression currently being parsed. Set while
+    /// parsing an expression that is immediately followed by a mandatory
+    /// `{ … }` block belonging to an *enclosing* construct (e.g. a `for`
+    /// loop's iterable) — without it, a bare call ending the expression
+    /// (`for p in glob("*.md") { … }`) would have that `{` misparsed as its
+    /// own trailing-block argument, starving the loop body of its brace.
+    /// Cleared while parsing any subexpression fully enclosed by its own
+    /// matching delimiter (call args, `[…]`, parenthesised groups), where a
+    /// trailing block can never be confused for the outer construct's block.
+    no_trailing_block: bool,
 }
 
 impl<'s> Parser<'s> {
@@ -133,6 +144,7 @@ impl<'s> Parser<'s> {
             scopes: vec![builtins],
             cmd_scopes: vec![HashSet::new()],
             repl: false,
+            no_trailing_block: false,
         }
     }
     pub(crate) fn peek(&self, m: Mode) -> ParseResult<(Tok, Span)> {

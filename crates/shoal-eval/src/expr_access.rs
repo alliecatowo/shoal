@@ -77,6 +77,15 @@ impl Evaluator {
                     format!("duration has no field `{name}`"),
                 )),
             },
+            // A glob VALUE exposes its source `.pattern` (docs/CONTRACTS.md §3);
+            // its matches are reached with `.expand()` or any collection method.
+            Value::Glob(g) => match name {
+                "pattern" => Ok(Value::Str(g.pattern)),
+                _ => Err(ErrorVal::new(
+                    "field_missing",
+                    format!("glob has no field `{name}`"),
+                )),
+            },
             _ => Err(ErrorVal::new(
                 "field_missing",
                 format!("{} has no field `{name}`", v.type_name()),
@@ -107,11 +116,73 @@ impl Evaluator {
             )),
         }
     }
+    /// Filesystem-backed `path` methods (`.read`/`.read_bytes`/`.lines`/
+    /// `.exists`/`.is_dir`/`.is_file`/`.size`/`.modified`, docs/CONTRACTS.md §3).
+    /// These live in the evaluator rather than `shoal-value::methods` because
+    /// they perform IO — routed through the [`Fs`] port so a fake can interpose
+    /// — and resolve relative paths against the session cwd.
+    pub(crate) fn path_fs_method(&self, p: &Path, name: &str) -> VResult<Value> {
+        let abs = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            self.cwd.join(p)
+        };
+        let ioerr = |e: std::io::Error| {
+            let code = if e.kind() == std::io::ErrorKind::NotFound {
+                "not_found"
+            } else {
+                "custom"
+            };
+            ErrorVal::new(code, format!("{}: {e}", abs.display()))
+        };
+        let utf8err = || ErrorVal::new("utf8_error", format!("{}: not valid UTF-8", abs.display()));
+        match name {
+            "read" => {
+                let bytes = self.fs.read(&abs).map_err(ioerr)?;
+                String::from_utf8(bytes)
+                    .map(Value::Str)
+                    .map_err(|_| utf8err())
+            }
+            "read_bytes" => Ok(Value::Bytes(Arc::new(self.fs.read(&abs).map_err(ioerr)?))),
+            "lines" => {
+                let bytes = self.fs.read(&abs).map_err(ioerr)?;
+                let s = String::from_utf8(bytes).map_err(|_| utf8err())?;
+                Ok(Value::List(
+                    s.lines()
+                        .map(|l| Value::Str(l.trim_end_matches('\r').into()))
+                        .collect(),
+                ))
+            }
+            "exists" => Ok(Value::Bool(self.fs.metadata(&abs).is_ok())),
+            "is_dir" => Ok(Value::Bool(
+                self.fs.metadata(&abs).map(|m| m.is_dir()).unwrap_or(false),
+            )),
+            "is_file" => Ok(Value::Bool(
+                self.fs.metadata(&abs).map(|m| m.is_file()).unwrap_or(false),
+            )),
+            "size" => Ok(Value::Size(self.fs.metadata(&abs).map_err(ioerr)?.len())),
+            "modified" => {
+                let m = self.fs.metadata(&abs).map_err(ioerr)?;
+                Ok(m.modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .and_then(|d| jiff::Timestamp::from_nanosecond(d.as_nanos() as i128).ok())
+                    .map(|ts| Value::DateTime(Box::new(ts.to_zoned(jiff::tz::TimeZone::system()))))
+                    .unwrap_or(Value::Null))
+            }
+            _ => unreachable!("path_fs_method called with unexpected name `{name}`"),
+        }
+    }
+
     pub(crate) fn values_from(&mut self, v: Value) -> VResult<Vec<Value>> {
         match v {
             Value::List(xs) => Ok(xs),
             Value::Table(rs) => Ok(rs.into_iter().map(Value::Record).collect()),
             Value::Range(r) => Ok(r.iter().map(Value::Int).collect()),
+            // Iterating a glob VALUE expands its matches (TDD §4.3): `for f in
+            // glob("*.rs")` walks the sorted `list<path>`. (Passing a glob as a
+            // command argument still expands at the callee — that is unchanged.)
+            Value::Glob(g) => self.expand_glob(&g),
             // Iterating a stream in a `for` drives it to completion (STREAMS §4);
             // an endless stream errors `stream_unbounded` — use `.each(f)` for
             // those, or bound it with `.take`/`.take_until` first.

@@ -31,20 +31,7 @@ impl Evaluator {
     pub(crate) fn expand_arg(&mut self, a: &CmdArg) -> VResult<Vec<Value>> {
         let v = self.cmd_arg_value(a)?;
         if let Value::Glob(g) = v {
-            let pat = g.cwd.join(&g.pattern).to_string_lossy().into_owned();
-            // Dotfile exclusion (TDD §4.3): a plain `*.txt` skips `.hidden.txt`;
-            // dotfiles are only matched when the pattern's own last component
-            // starts with `.`, or the glob was built `hidden: true`.
-            let options = glob::MatchOptions {
-                require_literal_leading_dot: !g.hidden && !pattern_matches_dotfiles(&g.pattern),
-                ..glob::MatchOptions::default()
-            };
-            let mut paths = glob::glob_with(&pat, options)
-                .map_err(|e| ErrorVal::new("arg_error", e.to_string()))?
-                .filter_map(Result::ok)
-                .map(Value::Path)
-                .collect::<Vec<_>>();
-            paths.sort_by_key(shoal_value::render::render_inline);
+            let paths = self.expand_glob(&g)?;
             // Zero-match glob lint (defect #16, §1.5): nullglob still yields zero
             // argv, but a statement-level miss is worth a diagnostic.
             if paths.is_empty() {
@@ -54,6 +41,28 @@ impl Evaluator {
         } else {
             Ok(vec![v])
         }
+    }
+    /// Expand a glob value into its sorted `list<path>` matches against the
+    /// glob's origin cwd, honoring the dotfile-exclusion rule (TDD §4.3). This
+    /// is the shared core behind command-argument expansion, `for x in <glob>`,
+    /// and the glob-value collection methods; it emits no nullglob lint — the
+    /// command-argument path adds that itself.
+    pub(crate) fn expand_glob(&self, g: &shoal_value::GlobVal) -> VResult<Vec<Value>> {
+        let pat = g.cwd.join(&g.pattern).to_string_lossy().into_owned();
+        // Dotfile exclusion (TDD §4.3): a plain `*.txt` skips `.hidden.txt`;
+        // dotfiles are only matched when the pattern's own last component
+        // starts with `.`, or the glob was built `hidden: true`.
+        let options = glob::MatchOptions {
+            require_literal_leading_dot: !g.hidden && !pattern_matches_dotfiles(&g.pattern),
+            ..glob::MatchOptions::default()
+        };
+        let mut paths = glob::glob_with(&pat, options)
+            .map_err(|e| ErrorVal::new("arg_error", e.to_string()))?
+            .filter_map(Result::ok)
+            .map(Value::Path)
+            .collect::<Vec<_>>();
+        paths.sort_by_key(shoal_value::render::render_inline);
+        Ok(paths)
     }
     pub(crate) fn argv_value(&self, v: Value) -> VResult<OsString> {
         match v {

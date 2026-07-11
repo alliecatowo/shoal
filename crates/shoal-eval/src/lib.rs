@@ -1569,4 +1569,152 @@ consumed = ["short", "branch"]
             Value::Str("hi".into())
         );
     }
+
+    #[test]
+    fn path_filesystem_methods_read_lines_and_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("data.txt"), b"alpha\nbeta\r\ngamma\n").unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+
+        // `.read()` resolves relative to cwd and returns the whole file as str.
+        assert_eq!(
+            run_in(r#"path("data.txt").read()"#, dir.path()).unwrap(),
+            Value::Str("alpha\nbeta\r\ngamma\n".into())
+        );
+        // `.read_bytes()` yields raw bytes.
+        assert!(matches!(
+            run_in(r#"path("data.txt").read_bytes()"#, dir.path()).unwrap(),
+            Value::Bytes(b) if b.len() == 18
+        ));
+        // `.lines()` splits and strips CR, and composes with list methods.
+        assert_eq!(
+            run_in(r#"path("data.txt").lines()"#, dir.path()).unwrap(),
+            Value::List(vec![
+                Value::Str("alpha".into()),
+                Value::Str("beta".into()),
+                Value::Str("gamma".into()),
+            ])
+        );
+        assert_eq!(
+            run_in(r#"path("data.txt").lines().first(2)"#, dir.path()).unwrap(),
+            Value::List(vec![Value::Str("alpha".into()), Value::Str("beta".into())])
+        );
+        // `.exists()`/`.is_file()`/`.is_dir()`.
+        assert_eq!(
+            run_in(r#"path("data.txt").exists()"#, dir.path()).unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            run_in(r#"path("nope.txt").exists()"#, dir.path()).unwrap(),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            run_in(r#"path("data.txt").is_file()"#, dir.path()).unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            run_in(r#"path("sub").is_dir()"#, dir.path()).unwrap(),
+            Value::Bool(true)
+        );
+        // `.size()` is a size.
+        assert_eq!(
+            run_in(r#"path("data.txt").size()"#, dir.path()).unwrap(),
+            Value::Size(18)
+        );
+        // `.modified()` is a datetime.
+        assert!(matches!(
+            run_in(r#"path("data.txt").modified()"#, dir.path()).unwrap(),
+            Value::DateTime(_)
+        ));
+        // A missing file surfaces `not_found`, not a panic.
+        assert_eq!(
+            run_in(r#"path("nope.txt").read()"#, dir.path())
+                .unwrap_err()
+                .code,
+            "not_found"
+        );
+    }
+
+    #[test]
+    fn path_pure_component_methods() {
+        // Pure component accessors need no filesystem.
+        assert_eq!(
+            run(r#"path("/a/b/file.txt").name()"#).unwrap(),
+            Value::Str("file.txt".into())
+        );
+        assert_eq!(
+            run(r#"path("/a/b/file.txt").stem()"#).unwrap(),
+            Value::Str("file".into())
+        );
+        assert_eq!(
+            run(r#"path("/a/b/file.txt").ext()"#).unwrap(),
+            Value::Str("txt".into())
+        );
+        assert_eq!(
+            run(r#"path("/a/b/file.txt").parent()"#).unwrap(),
+            Value::Path("/a/b".into())
+        );
+        assert_eq!(
+            run(r#"path("/a/b").join("c")"#).unwrap(),
+            Value::Path("/a/b/c".into())
+        );
+        // `.ext()` of an extensionless name is null.
+        assert_eq!(run(r#"path("/a/README").ext()"#).unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn glob_value_behaves_as_collection() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), b"").unwrap();
+        std::fs::write(dir.path().join("b.rs"), b"").unwrap();
+        std::fs::write(dir.path().join("c.txt"), b"").unwrap();
+
+        // `.len()` expands and counts (sorted, cwd-relative).
+        assert_eq!(
+            run_in(r#"glob("*.rs").len()"#, dir.path()).unwrap(),
+            Value::Int(2)
+        );
+        // `.expand()` yields the sorted match list.
+        assert_eq!(
+            run_in(r#"glob("*.rs").expand().len()"#, dir.path()).unwrap(),
+            Value::Int(2)
+        );
+        // `.pattern` (field and method) returns the source pattern.
+        assert_eq!(
+            run_in(r#"glob("*.rs").pattern"#, dir.path()).unwrap(),
+            Value::Str("*.rs".into())
+        );
+        // `.map(...)` re-dispatches on the expanded list.
+        assert_eq!(
+            run_in(r#"glob("*.rs").map(.name())"#, dir.path()).unwrap(),
+            Value::List(vec![Value::Str("a.rs".into()), Value::Str("b.rs".into())])
+        );
+        // `for x in <glob>` iterates the expanded matches. (The glob value is
+        // parenthesized only to sidestep a parser limitation shared by every
+        // `)`-terminated call in a for-in head — the iteration itself is the
+        // glob-value path exercised here.)
+        let (_out, captured) =
+            run_capturing_in(r#"for f in (glob("*.rs")) { echo (f.name()) }"#, dir.path());
+        let texts: Vec<Value> = captured.iter().map(out_of).collect();
+        assert_eq!(
+            texts,
+            vec![Value::Str("a.rs".into()), Value::Str("b.rs".into())]
+        );
+    }
+
+    /// `run_capturing`, but in an explicit cwd (for glob/fixture tests).
+    fn run_capturing_in(src: &str, cwd: &Path) -> (VResult<Value>, Vec<Value>) {
+        use std::sync::{Arc, Mutex};
+        let program = shoal_syntax::parse(src).unwrap_or_else(|e| panic!("parse failed: {e}"));
+        let mut ev = Evaluator::new(cwd.to_path_buf());
+        let sink: Arc<Mutex<Vec<Value>>> = Arc::default();
+        let sink2 = sink.clone();
+        ev.set_statement_sink(Box::new(move |v: &Value| {
+            sink2.lock().unwrap().push(v.clone())
+        }));
+        let out = ev.eval_program(&program);
+        drop(ev);
+        let captured = Arc::try_unwrap(sink).unwrap().into_inner().unwrap();
+        (out, captured)
+    }
 }

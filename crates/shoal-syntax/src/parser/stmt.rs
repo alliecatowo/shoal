@@ -386,7 +386,10 @@ impl<'s> Parser<'s> {
             (Tok::Ident(x), _) if x == "in" => {}
             (_, s) => return Err(ParseError::new("expected `in`", s)),
         }
-        let iter = self.expr(0)?;
+        // The iterable is a full expr (TDD §3.1 `for pattern in expr block`);
+        // the `{` that follows opens the loop body, not a trailing-block arg
+        // on a bare call ending the iterable (e.g. `glob("*.md")`).
+        let iter = self.expr_before_block()?;
         self.scopes.push(HashSet::new());
         if let Pattern::Bind { name, .. } = &pattern {
             self.bind(name.clone())

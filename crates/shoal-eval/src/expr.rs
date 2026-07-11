@@ -219,6 +219,57 @@ impl Evaluator {
                     let a = self.eval_args(args)?;
                     self.eval_stream_sink(v, name, a)
                         .map_err(|e| e.or_span(span))
+                } else if let Value::Path(p) = &v
+                    && matches!(
+                        name.as_str(),
+                        "read"
+                            | "read_bytes"
+                            | "lines"
+                            | "exists"
+                            | "is_dir"
+                            | "is_file"
+                            | "size"
+                            | "modified"
+                    )
+                {
+                    // Filesystem-backed path methods (docs/CONTRACTS.md §3) route
+                    // through the evaluator's Fs port, resolving against cwd. They
+                    // take no arguments.
+                    if !args.pos.is_empty() || !args.named.is_empty() {
+                        return Err(ErrorVal::arg_error(format!(".{name} takes no arguments"))
+                            .or_span(span));
+                    }
+                    let p = p.clone();
+                    self.path_fs_method(&p, name).map_err(|e| e.or_span(span))
+                } else if let Value::Glob(g) = &v {
+                    // A glob VALUE behaves as a lazy collection of its matches
+                    // (TDD §4.3): `.pattern`/`.expand()` are glob-native; every
+                    // other method expands the glob to a sorted `list<path>` and
+                    // re-dispatches on that list, so `glob("*.rs").map(…)`,
+                    // `.len()`, `.first(3)`, etc. all work. (Passing a glob AS a
+                    // command argument still expands at the callee — unchanged.)
+                    match name.as_str() {
+                        "pattern" => {
+                            if !args.pos.is_empty() || !args.named.is_empty() {
+                                return Err(ErrorVal::arg_error(".pattern takes no arguments")
+                                    .or_span(span));
+                            }
+                            Ok(Value::Str(g.pattern.clone()))
+                        }
+                        "expand" => {
+                            if !args.pos.is_empty() || !args.named.is_empty() {
+                                return Err(
+                                    ErrorVal::arg_error(".expand takes no arguments").or_span(span)
+                                );
+                            }
+                            Ok(Value::List(self.expand_glob(g)?))
+                        }
+                        _ => {
+                            let list = Value::List(self.expand_glob(g)?);
+                            let a = self.eval_args(args)?;
+                            shoal_value::methods::call_method(self, list, name, a, span)
+                        }
+                    }
                 } else if let Value::Record(r) = &v
                     && r.get(name).is_some_and(Value::is_callable)
                 {
