@@ -34,3 +34,20 @@ name = "desugar2-alias-flags-pass-through-to-adapter-invocation"
 # `"git status"`.
 src = "alias gs = git status\n(gs --short).cmd"
 value = '"git status --short"'
+
+# The `.field`/`.method` implicit-lambda shorthand only desugars when it is the
+# WHOLE call argument (`.map(.name)`). A leading `.` anywhere else — e.g. inside
+# a record literal passed to `.map({a: .name})` — has no receiver and gets a
+# teaching parse error pointing at the explicit `x => …` form. See
+# crates/shoal-syntax/src/parser/expr.rs (primary, `Tok::Dot` arm).
+
+[[case]]
+name = "dm-leading-dot-in-record-literal-is-teaching-error"
+src = '[{a: 1}].map({x: .a})'
+parse_error = true
+parse_error_contains = "leading `.` has no receiver"
+
+[[case]]
+name = "dm-explicit-lambda-record-projection-works"
+src = '[{a: 1}, {a: 2}].map(x => {v: x.a}).map(.v)'
+value = "[1, 2]"
