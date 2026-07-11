@@ -201,13 +201,19 @@ fn repl_echo_renders_once_and_exit_sets_code() {
         "external output did not appear"
     );
 
-    writer.write_all(b"exit 5\r").unwrap();
-    writer.flush().unwrap();
-
-    // Keep answering DSR (reedline queries once more while drawing the prompt
-    // for the `exit` line) until the child actually exits.
+    // `exit 5`, re-sent periodically: a line typed between the pty child's
+    // last output and its reaping is legitimately consumed by the stdin
+    // forwarder, so a single send can be swallowed — retry until the REPL
+    // actually exits (idempotent: once reedline has the line, the process
+    // ends and later sends go nowhere).
     let deadline = Instant::now() + Duration::from_secs(45);
+    let mut last_send = Instant::now() - Duration::from_secs(1);
     let status = loop {
+        if last_send.elapsed() >= Duration::from_millis(700) {
+            let _ = writer.write_all(b"exit 5\r");
+            let _ = writer.flush();
+            last_send = Instant::now();
+        }
         answer_dsr(&mut writer, &mut dsr_answered);
         if let Some(status) = child.try_wait().expect("try_wait") {
             break status;
@@ -237,6 +243,140 @@ fn repl_echo_renders_once_and_exit_sets_code() {
         5,
         "exit 5 should set the process status; transcript:\n{text}"
     );
+}
+
+/// A statement-position PTY child must receive the user's typed bytes (TDD
+/// §1.2 "byte-identical to bash"): shoal forwards the real tty to the child's
+/// pty (raw mode + stdin pump). Regression: the evaluator passed
+/// `StdinSpec::Null` for bare commands, so interactive TUIs (vim, claude)
+/// got output-only PTYs — keystrokes never arrived and every terminal
+/// query response was echoed as `^[[…` caret junk by the cooked-mode line
+/// discipline. Here `head -c 2` must actually consume two typed bytes and
+/// let the script continue to its `:DONE` marker.
+#[test]
+fn repl_pty_child_reads_interactive_stdin() {
+    let pty = native_pty_system();
+    let pair = pty
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("open pty");
+
+    let home = tempfile::tempdir().unwrap();
+    let mut cmd = CommandBuilder::new(BIN);
+    cmd.cwd(home.path());
+    cmd.env("NO_COLOR", "1");
+    cmd.env("TERM", "xterm");
+    cmd.env("HOME", home.path());
+    cmd.env("XDG_CONFIG_HOME", home.path());
+    cmd.env("XDG_STATE_HOME", home.path());
+    cmd.env_remove("SHOAL_CONFIG");
+
+    let mut child = pair.slave.spawn_command(cmd).expect("spawn repl");
+    drop(pair.slave);
+
+    let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let reader_buf = Arc::clone(&buf);
+    let mut reader = pair.master.try_clone_reader().expect("clone reader");
+    let reader_thread = std::thread::spawn(move || {
+        let mut chunk = [0u8; 4096];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => reader_buf.lock().unwrap().extend_from_slice(&chunk[..n]),
+            }
+        }
+    });
+
+    let mut writer = pair.master.take_writer().expect("take writer");
+    let mut dsr_answered = 0usize;
+    let answer_dsr = |writer: &mut Box<dyn Write + Send>, answered: &mut usize| {
+        let seen = buf
+            .lock()
+            .unwrap()
+            .windows(4)
+            .filter(|w| *w == b"\x1b[6n")
+            .count();
+        while *answered < seen {
+            let _ = writer.write_all(b"\x1b[1;1R");
+            let _ = writer.flush();
+            *answered += 1;
+        }
+    };
+    let mut pump_until = |writer: &mut Box<dyn Write + Send>, marker: &[u8]| -> bool {
+        let deadline = Instant::now() + Duration::from_secs(45);
+        loop {
+            answer_dsr(writer, &mut dsr_answered);
+            if marker.is_empty() {
+                if dsr_answered >= 1 {
+                    return true;
+                }
+            } else if buf
+                .lock()
+                .unwrap()
+                .windows(marker.len())
+                .any(|w| w == marker)
+            {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+
+    assert!(pump_until(&mut writer, b""), "REPL never drew a prompt");
+
+    // The `""` splits keep the typed line (echoed by reedline) from matching
+    // the markers, so a hit proves the CHILD produced them. `head -c 2` blocks
+    // until two stdin bytes actually reach it through the forwarded tty.
+    writer
+        .write_all(b"/bin/sh -c 'echo REA\"\"DY; head -c 2; echo :DO\"\"NE'\r")
+        .unwrap();
+    writer.flush().unwrap();
+    assert!(
+        pump_until(&mut writer, b"READY"),
+        "pty child did not start; transcript:\n{}",
+        String::from_utf8_lossy(&buf.lock().unwrap())
+    );
+
+    // Type two bytes + Enter: the forwarder must carry them to the child's
+    // pty, whose line discipline delivers `hi\n`; `head -c 2` consumes `hi`
+    // and the script proceeds to print the :DONE marker.
+    writer.write_all(b"hi\r").unwrap();
+    writer.flush().unwrap();
+    assert!(
+        pump_until(&mut writer, b":DONE"),
+        "typed stdin never reached the pty child; transcript:\n{}",
+        String::from_utf8_lossy(&buf.lock().unwrap())
+    );
+
+    // `exit 0`, re-sent periodically: a line typed in the window between the
+    // child's last output and its reaping is legitimately consumed by the
+    // stdin forwarder (it still belongs to the child then), so a single send
+    // can be swallowed. Retrying until the REPL exits is race-free — once
+    // reedline has the line, the process ends and later sends go nowhere.
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let mut last_send = Instant::now() - Duration::from_secs(1);
+    loop {
+        if last_send.elapsed() >= Duration::from_millis(700) {
+            let _ = writer.write_all(b"exit 0\r");
+            let _ = writer.flush();
+            last_send = Instant::now();
+        }
+        answer_dsr(&mut writer, &mut dsr_answered);
+        if child.try_wait().expect("try_wait").is_some() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "REPL did not exit");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(writer);
+    let _ = reader_thread.join();
 }
 
 /// docs/ROADMAP.md R3: `undo out[n]` resolves via the host's `out[n] ->

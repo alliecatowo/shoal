@@ -461,6 +461,19 @@ impl Evaluator {
         } else {
             ExecMode::Capture
         };
+        // A PTY child owns the real terminal for its run (TDD §1.2 "byte-
+        // identical to bash"): unless a redirect (`< file`) or `.feed` already
+        // claimed stdin, forward the user's tty — shoal-exec then engages raw
+        // mode on the real terminal and pumps stdin/resizes to the child.
+        // Without this, interactive TUIs (vim, claude, htop) get output-only
+        // PTYs: the cooked-mode line discipline echoes every mouse event and
+        // terminal query response as `^[[…` caret junk and delivers keystrokes
+        // only on Enter.
+        let stdin = if mode == ExecMode::PtyTee && matches!(stdin, StdinSpec::Null) {
+            StdinSpec::Inherit
+        } else {
+            stdin
+        };
         // Only the PtyTee path streams the child's bytes to the real terminal;
         // the result renderer suppresses re-rendering exactly these (defect #1).
         let streamed = mode == ExecMode::PtyTee;
