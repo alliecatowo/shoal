@@ -382,14 +382,13 @@ pub fn render_block(v: &Value, width: usize) -> String {
                         format!("\x1b[31;1m[❌ status {}]\x1b[0m", o.status.unwrap_or(-1))
                     }
                 } else {
-                    let bar = if o.ok {
-                        "\x1b[32m│\x1b[0m"
-                    } else {
-                        "\x1b[31;1m│\x1b[0m"
-                    };
-                    let lines: Vec<String> =
-                        text.lines().map(|l| format!("{} {}", bar, l)).collect();
-                    lines.join("\n")
+                    // Command text output renders verbatim — no decoration. A
+                    // gutter bar here was a literal glyph (not an ANSI escape),
+                    // so it corrupted piped/non-interactive output and made a
+                    // bare `echo hi` print `│ hi`. Failure is surfaced by the
+                    // `cmd_failed` error path and `.ok`/`.status`, not by
+                    // recoloring captured bytes.
+                    text.to_string()
                 }
             }
         }

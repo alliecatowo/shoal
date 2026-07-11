@@ -61,6 +61,37 @@ fn dash_c_builtin_renders() {
     assert!(stdout.contains("hello"), "stdout was {stdout:?}");
 }
 
+#[test]
+fn dash_c_echo_has_no_gutter() {
+    // A bare `echo` prints its text verbatim — no `│` gutter glyph, which used
+    // to leak into piped/non-interactive output and prefix every line.
+    let (_, stdout) = run_c("echo hello world");
+    assert_eq!(stdout, "hello world\n", "stdout was {stdout:?}");
+}
+
+#[test]
+fn dash_c_intermediate_and_final_render_identically() {
+    // Regression: the final statement went through the block renderer while
+    // intermediate statements went through a dumber default, so the same
+    // command rendered two different ways depending on position. Two identical
+    // echoes must produce two identical lines.
+    let (_, stdout) = run_c("echo same\necho same");
+    assert_eq!(stdout, "same\nsame\n", "stdout was {stdout:?}");
+}
+
+#[test]
+fn dash_c_intermediate_structured_output_is_tabular() {
+    // An intermediate structured builtin (`ls`) renders as a table, not a
+    // compact inline `[{…}]` blob — the same treatment the final statement
+    // gets. Assert the shared table header appears for the non-final `ls`.
+    let (_, stdout) = run_c("ls\necho done");
+    assert!(
+        stdout.contains("name") && stdout.contains("type") && stdout.contains("size"),
+        "intermediate `ls` should render a table header; stdout was {stdout:?}"
+    );
+    assert!(stdout.trim_end().ends_with("done"), "stdout was {stdout:?}");
+}
+
 /// Drive the interactive REPL over a PTY: `echo` renders exactly once, an
 /// external command prints exactly once, and `exit <code>` sets the status.
 #[test]

@@ -150,6 +150,15 @@ fn run_source(
     }
     let mut evaluator = Evaluator::new(cwd);
     evaluator.interactive = interactive;
+    // Render every non-final statement the same way the final result is
+    // rendered (structured `.out` as a table, text verbatim), so a script's
+    // intermediate and last statements look identical. Without this the
+    // no-sink default renders intermediate outcomes as a compact inline blob
+    // while the final one gets the full block treatment. The REPL installs
+    // its own equivalent sink.
+    evaluator.set_statement_sink(Box::new(|v: &Value| {
+        let _ = repl::print_value(v);
+    }));
     // Engage the bundled adapter pack (+ any `adapters.dirs` the config
     // declares) on every non-interactive path too — see `adapters` module
     // doc comment for the defect this closes (`-c`/scripts ran raw system

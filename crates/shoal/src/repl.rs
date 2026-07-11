@@ -461,7 +461,7 @@ pub(crate) fn render_result(value: &Value, pty_was_live: bool) -> io::Result<()>
 /// rendered — shared by `render_result` and the statement sink (WP2) so
 /// non-final statement values inside a multi-statement line get the same
 /// live, colorized treatment as the line's final result.
-fn print_value(value: &Value) -> io::Result<()> {
+pub(crate) fn print_value(value: &Value) -> io::Result<()> {
     let rendered = shoal_value::render::render_block(value, terminal_width());
     if !rendered.is_empty() {
         println!("{}", maybe_strip(rendered));
