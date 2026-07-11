@@ -1094,6 +1094,32 @@ params = { follow = "bool" }
     }
 
     #[test]
+    fn single_char_adapter_param_emits_posix_single_dash() {
+        // A single-character param (git log's `n`) must reach the child as
+        // `-n`, not `--n` — the adapter used to validate `--n` and then
+        // forward it verbatim, which the real tool rejects, leaving the
+        // adapter's own advertised flag unusable. printf echoes its argv
+        // back so the emitted spelling is directly observable.
+        let toml = r#"[cmd.fixture]
+bin="/usr/bin/printf"
+invoke=["%s %s"]
+params={ n = "int?" }
+output={parse="lines",type="list<str>"}
+"#;
+        for src in ["fixture --n=2", "fixture --n 2"] {
+            let out = adapter_eval(toml, src).unwrap();
+            let Value::Outcome(o) = out else {
+                panic!("expected outcome");
+            };
+            assert_eq!(
+                o.out_value(),
+                Value::List(vec![Value::Str("-n 2".into())]),
+                "{src} argv spelling"
+            );
+        }
+    }
+
+    #[test]
     fn planning_derives_exact_builtin_paths_without_mutation() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a"), b"a").unwrap();

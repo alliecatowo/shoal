@@ -366,7 +366,17 @@ impl Evaluator {
                     // "consumed" rule doc in shoal-adapters.
                     let consumed = spec.consumed.iter().any(|c| c == name);
                     if !consumed {
-                        argv.push(format!("--{}", name.replace('_', "-")).into());
+                        // Single-character params emit the POSIX single-dash
+                        // form: git has `-n`, not `--n` — this used to
+                        // validate `--n` and forward it verbatim, which git
+                        // rejects ("ambiguous argument"), leaving the
+                        // adapter's own advertised flag unusable.
+                        let spelled = if name.chars().count() == 1 {
+                            format!("-{name}")
+                        } else {
+                            format!("--{}", name.replace('_', "-"))
+                        };
+                        argv.push(spelled.into());
                     }
                     if let Some(value) = value {
                         let v = self.cmd_arg_value(value)?;
