@@ -169,7 +169,7 @@ impl<'s> Parser<'s> {
             }
             let guard = if matches!(&self.peek(Mode::Expr)?.0, Tok::Ident(x) if x == "if") {
                 self.bump(Mode::Expr)?;
-                Some(self.expr(0)?)
+                Some(self.guard_expr()?)
             } else {
                 None
             };

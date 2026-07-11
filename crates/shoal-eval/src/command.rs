@@ -8,6 +8,24 @@ use crate::host::builtin_outcome;
 
 impl Evaluator {
     pub(crate) fn eval_command(&mut self, call: &CmdCall, position: Position) -> VResult<Value> {
+        // Trailing `&` desugars to `spawn { <call> }` (TDD §3.4): the command
+        // runs on a background task and the statement yields a `task` handle
+        // instead of running synchronously.
+        if call.background {
+            let mut inner = call.clone();
+            inner.background = false;
+            let body = Block {
+                stmts: vec![Stmt::Expr {
+                    expr: Expr::Cmd {
+                        call: Box::new(inner),
+                        span: call.span,
+                    },
+                    span: call.span,
+                }],
+                span: call.span,
+            };
+            return self.spawn_block(body);
+        }
         // Session callables (fns/aliases) resolve as commands even when `^`-forced
         // (defect #3): `^` bypasses only non-callable let/var shadows.
         if let Some(bound) = self.env.get(&call.head)
@@ -49,6 +67,30 @@ impl Evaluator {
                         }) =>
                     {
                         pos.push(self.cmd_arg_value(a)?);
+                    }
+                    // A non-variadic `list<T>` param receives an entire word/glob
+                    // expansion as one list (TDD §4.3): `showpaths *.txt` binds
+                    // every sorted match to `paths: list<path>`, not just the
+                    // first. Element type coercion (`path`/`str`/…) applies per
+                    // item; `coerce_call_args` leaves the assembled list intact.
+                    CmdArg::Glob { .. } | CmdArg::Word { .. } | CmdArg::Path { .. }
+                        if closure_sig
+                            .and_then(|(params, _)| params.get(pos.len()))
+                            .and_then(|p| p.ty.as_ref())
+                            .is_some_and(|t| t.name == "list") =>
+                    {
+                        let elem = closure_sig
+                            .and_then(|(params, _)| params.get(pos.len()))
+                            .and_then(|p| p.ty.as_ref())
+                            .and_then(|t| t.args.first())
+                            .map(|t| t.name.clone())
+                            .unwrap_or_else(|| "str".into());
+                        let items = self
+                            .expand_arg(a)?
+                            .into_iter()
+                            .map(|v| crate::coerce::coerce_word(v, &elem))
+                            .collect::<VResult<Vec<_>>>()?;
+                        pos.push(Value::List(items));
                     }
                     _ => pos.extend(self.expand_arg(a)?),
                 }
@@ -97,6 +139,16 @@ impl Evaluator {
         }
         if call.head == "interact" {
             return self.builtin_interact(call);
+        }
+        // `assert(cond, msg?)` (CONTRACTS §4) — also reachable as a command head.
+        if call.head == "assert" {
+            let pos = self.collect_cmd_values(call)?;
+            return self
+                .builtin_assert(&CallArgs {
+                    pos,
+                    named: Vec::new(),
+                })
+                .map_err(|e| e.or_span(call.span));
         }
         if call.head == "open" {
             let vs = self.collect_cmd_values(call)?;
@@ -496,6 +548,7 @@ impl Evaluator {
                     | "run"
                     | "jobs"
                     | "interact"
+                    | "assert"
                     | "open"
                     | "save"
                     | "reef"

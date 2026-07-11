@@ -45,6 +45,38 @@ impl Evaluator {
                 )
                 .with_hint(String::from_utf8_lossy(&o.stderr).trim().to_string())),
             },
+            // Calendar-component fields on a datetime (backs `now.year`, the
+            // TDD §2.1 relative-anchor probe, and tagged-literal access).
+            Value::DateTime(z) => match name {
+                "year" => Ok(Value::Int(z.year() as i64)),
+                "month" => Ok(Value::Int(z.month() as i64)),
+                "day" => Ok(Value::Int(z.day() as i64)),
+                "hour" => Ok(Value::Int(z.hour() as i64)),
+                "minute" => Ok(Value::Int(z.minute() as i64)),
+                "second" => Ok(Value::Int(z.second() as i64)),
+                _ => Err(ErrorVal::new(
+                    "field_missing",
+                    format!("datetime has no field `{name}`"),
+                )),
+            },
+            // Duration relative-anchor composition (TDD §2.1): `30d.ago` /
+            // `1h.from_now` resolve against the live wall clock into a datetime.
+            Value::Duration(ns) => match name {
+                "ago" | "from_now" => {
+                    let base = crate::helpers::now_zoned(self.clock.as_ref());
+                    let signed = if name == "ago" { -ns } else { ns };
+                    let span = jiff::SignedDuration::from_nanos(signed);
+                    base.checked_add(span)
+                        .map(|z| Value::DateTime(Box::new(z)))
+                        .map_err(|e| {
+                            ErrorVal::new("overflow", format!("datetime out of range: {e}"))
+                        })
+                }
+                _ => Err(ErrorVal::new(
+                    "field_missing",
+                    format!("duration has no field `{name}`"),
+                )),
+            },
             _ => Err(ErrorVal::new(
                 "field_missing",
                 format!("{} has no field `{name}`", v.type_name()),

@@ -1,0 +1,58 @@
+# Further curated teaching diagnostics beyond teaching-diagnostics.toml:
+# lexer-level "unexpected `]`"/"unexpected character" fallbacks (a bare `]`
+# at a fresh CMD-mode token position, a non-ASCII identifier-shaped
+# character, a stray `~`/`@`), the `$`-sigil diagnostic specifically from
+# CMD-mode word scanning (core.toml's `parse-dollar` only exercises the
+# EXPR-mode branch, via a statement-initial `$HOME`), and a mid-word
+# backtick (core.toml's `parse-backtick` only exercises the
+# statement-initial, mode-independent branch via `` `pwd` ``). Every needle
+# is chosen to appear in the diagnostic's own `msg` (this file's sibling's
+# harness-parity note applies here too).
+
+[[case]]
+name = "teach2-unexpected-close-bracket-at-fresh-token-position"
+# A `]` at a spot where the CMD-mode lexer expects a fresh token (after a
+# resolved command word, not mid-word) is its own diagnostic, distinct from
+# the mid-word empty-word fallback.
+src = "echo ]"
+parse_error = true
+parse_error_contains = "unexpected `]`"
+
+[[case]]
+name = "teach2-at-symbol-is-unexpected-character"
+src = "@"
+parse_error = true
+parse_error_contains = "unexpected character"
+
+[[case]]
+name = "teach2-non-ascii-identifier-start-is-unexpected-character"
+# Identifiers are ASCII-only per TDD §2.3; a bare non-ASCII letter can never
+# start one.
+src = "π"
+parse_error = true
+parse_error_contains = "unexpected character"
+
+[[case]]
+name = "teach2-tilde-is-unexpected-character-in-expr-mode"
+src = "1 ~ 2"
+parse_error = true
+parse_error_contains = "unexpected character"
+
+[[case]]
+name = "teach2-dollar-sigil-inside-a-cmd-mode-word"
+# Distinct code path from core.toml's `parse-dollar` (a statement-initial
+# `$HOME`, dispatched via the EXPR-mode `expr_token` branch): here `$`
+# appears mid-argument in an already-CMD-mode command line, hitting
+# `cmd_word`'s own sigil check instead.
+src = "echo $HOME"
+parse_error = true
+parse_error_contains = "no sigil"
+
+[[case]]
+name = "teach2-mid-word-backtick-inside-a-cmd-argument"
+# Distinct from core.toml's `parse-backtick` (a statement-initial `` `pwd` ``,
+# caught by `token()`'s mode-independent leading check): here the backtick
+# appears mid-word, inside `cmd_word`'s own scan loop.
+src = "echo a`b"
+parse_error = true
+parse_error_contains = "backtick is not shoal syntax"

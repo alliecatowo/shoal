@@ -151,7 +151,7 @@ impl<'s> Parser<'s> {
                 next,
                 Tok::Eq | Tok::PlusEq | Tok::MinusEq | Tok::StarEq | Tok::SlashEq
             ) {
-                let target = self.primary()?;
+                let target = self.primary(true)?;
                 let (op, _) = self.bump(Mode::Expr)?;
                 let value = self.expr(0)?;
                 return Ok(Stmt::Assign {

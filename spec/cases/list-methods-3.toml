@@ -1,0 +1,56 @@
+# Further list-method hardening beyond collections.toml/list-methods-2.toml:
+# empty-input edge cases for the higher-order/pairing combinators
+# (`.group`/`.zip`/`.enumerate` on `[]`), an exact (no-remainder) `.chunks`
+# division, `.flatten` tolerating an empty nested list alongside a
+# non-empty one, `.uniq` on `str` elements (list-methods-2.toml only
+# exercised int/empty), `range.contains` on a non-member, and `.get`'s
+# negative-index semantics (methods/list.rs::get treats a negative int key
+# exactly like list negative-indexing, wrapping from the end — a genuinely
+# distinct rule from its record+str-key sibling, and not yet asserted
+# anywhere: collections.toml's `list-get-out-of-range-returns-default` only
+# covers a positive out-of-range key).
+
+[[case]]
+name = "list3-group-empty-list-is-empty"
+src = "[].group(x => x)"
+value = "[]"
+
+[[case]]
+name = "list3-zip-both-empty"
+src = "[].zip([])"
+value = "[]"
+
+[[case]]
+name = "list3-chunks-exact-division-no-remainder"
+src = "[1, 2, 3, 4].chunks(2)"
+value = "[[1, 2], [3, 4]]"
+
+[[case]]
+name = "list3-flatten-with-an-empty-nested-list"
+src = "[[1], []].flatten()"
+value = "[1]"
+
+[[case]]
+name = "list3-enumerate-empty-list-is-empty"
+src = "[].enumerate()"
+value = "[]"
+
+[[case]]
+name = "list3-range-contains-a-non-member"
+src = "(1..5).contains(10)"
+value = "false"
+
+[[case]]
+name = "list3-uniq-on-strings"
+src = '["b", "a", "b"].uniq()'
+value = '["b", "a"]'
+
+[[case]]
+name = "list3-get-negative-index-in-range-found"
+src = "[1, 2, 3].get(-1, 99)"
+value = "3"
+
+[[case]]
+name = "list3-get-negative-index-out-of-range-is-default"
+src = "[1, 2, 3].get(-9, 99)"
+value = "99"

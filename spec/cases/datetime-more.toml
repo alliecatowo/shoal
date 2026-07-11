@@ -54,14 +54,3 @@ value = "true"
 name = "dt2-time-literal-ordering"
 src = "10:00 < 10:01"
 value = "true"
-
-[[case]]
-name = "dt2-relative-anchors-not-implemented"
-# TDD §2.1: "Relative anchors are functions: `now`, `today`; durations
-# compose via `.ago` / `.from_now`." None of the four exist in shoal-eval:
-# `now`/`today` resolve as ordinary undefined identifiers (`undefined_var`/
-# `not_found` depending on parse shape), and `duration.ago`/`.from_now` are
-# plain `field_missing` — ordinary, non-datetime-aware field lookups.
-src = "now.year"
-error = "undefined_var"
-skip = "TDD §2.1's now/today relative-anchor functions and .ago/.from_now duration composition have no implementation in shoal-eval yet — now resolves as a plain undefined variable instead of a live-clock function"

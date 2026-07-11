@@ -52,18 +52,16 @@ sh -c 'printf hi' > out.txt
 value = '"hi"'
 
 [[case]]
-name = "desugar-spawn-ampersand-not-yet-wired"
+name = "desugar-spawn-ampersand-yields-an-awaitable-task"
 # `cmd … &` -> `spawn { call(…) }` (TDD §3.4): the parser sets
-# `CmdCall.background = true` (proven by shoal-syntax's own
-# `command_shape` unit test) and the formatter round-trips it
-# (`format.rs` emits the trailing `&`), but no evaluator call-site reads
-# `call.background` (`grep -rn '\.background' crates/shoal-eval/src` finds
-# nothing outside `background: false` in synthetic call construction) — so
-# today `cmd &` just runs synchronously, identically to `cmd` without the
-# `&`, instead of yielding a `task`. This is a real spec/impl gap, not a
-# corpus authoring choice.
-src = "(echo hi &).is_done()"
-skip = "`&` background desugar is unimplemented in shoal-eval: CmdCall.background is parsed/formatted but no eval call-site reads it (cmd & runs synchronously, does not yield a task) — TDD §3.4 row not yet honored"
+# `CmdCall.background = true` and `command.rs::eval_command` reads it,
+# re-wrapping the call in a `spawn { }` block so the statement yields a
+# `task` handle instead of running synchronously. Awaiting that task blocks
+# to completion and surfaces the command's outcome — `.await.out` here is
+# deterministic (a bare, timing-independent value), unlike `.is_done()`
+# immediately after spawn.
+src = "(echo hi &).await().out"
+value = '"hi"'
 
 [[case]]
 name = "desugar-alias-bare-invoke"

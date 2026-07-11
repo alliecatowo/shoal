@@ -32,7 +32,14 @@ impl Evaluator {
         let v = self.cmd_arg_value(a)?;
         if let Value::Glob(g) = v {
             let pat = g.cwd.join(&g.pattern).to_string_lossy().into_owned();
-            let mut paths = glob::glob(&pat)
+            // Dotfile exclusion (TDD §4.3): a plain `*.txt` skips `.hidden.txt`;
+            // dotfiles are only matched when the pattern's own last component
+            // starts with `.`, or the glob was built `hidden: true`.
+            let options = glob::MatchOptions {
+                require_literal_leading_dot: !g.hidden && !pattern_matches_dotfiles(&g.pattern),
+                ..glob::MatchOptions::default()
+            };
+            let mut paths = glob::glob_with(&pat, options)
                 .map_err(|e| ErrorVal::new("arg_error", e.to_string()))?
                 .filter_map(Result::ok)
                 .map(Value::Path)
@@ -101,4 +108,14 @@ impl Evaluator {
             }
         })
     }
+}
+
+/// Whether a glob pattern intends to match dotfiles: true when its final path
+/// component begins with a literal `.` (TDD §4.3 "unless pattern starts with
+/// `.`"). `**/.env` → true, `*.txt` / `**/*.txt` → false.
+fn pattern_matches_dotfiles(pattern: &str) -> bool {
+    pattern
+        .rsplit(['/', '\\'])
+        .next()
+        .is_some_and(|last| last.starts_with('.'))
 }

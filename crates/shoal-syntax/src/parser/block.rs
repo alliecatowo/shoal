@@ -203,6 +203,27 @@ impl<'s> Parser<'s> {
                 span: Span::new(start, end as usize),
             });
         }
+        // Not a lambda. A single bare identifier with no type annotation
+        // (`(it)`, `(out)`, `(x)`, …) parsed as a would-be one-param list
+        // above, so it never reaches `primary()`'s `Tok::Ident` arm — which
+        // is where the `it`/`out` REPL-only check lives — on the fallback
+        // reparse below (`expr_or_command` dispatches an unbound bare name
+        // as a COMMAND, not through `primary()`). Apply that same check here
+        // so `(it)`/`(out)` error in script mode exactly as `it`/`out` do
+        // everywhere else a bare reference to them is reachable as a value
+        // (TDD §13.16).
+        if plausible
+            && params.len() == 1
+            && params[0].ty.is_none()
+            && !self.repl
+            && matches!(params[0].name.as_str(), "it" | "out")
+        {
+            let name = &params[0].name;
+            return Err(
+                ParseError::new(format!("`{name}` is REPL-only"), params[0].span)
+                    .hint("bind a variable to reuse a previous result"),
+            );
+        }
         self.pos = save;
         // Not a lambda: a parenthesised group. Apply the same two-mode dispatch
         // as `statement()` so `(echo hi)` runs the command (substitution, D4).

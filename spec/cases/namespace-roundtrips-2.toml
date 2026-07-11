@@ -1,0 +1,51 @@
+# Further namespace round-trip hardening beyond namespaces.toml/namespaces-
+# more.toml: yaml round-tripping a LIST of records (not just a flat record),
+# toml's `[[array-of-tables]]` syntax, deeply nested list-of-lists JSON,
+# cross-namespace conversion (parse in one data language, re-serialize in
+# another), a toml round-trip through a nested record, csv's "everything
+# stays a string" promise on a numeric-looking field, and two more exact
+# `math` identities (log2/log10 of a power of their own base).
+
+[[case]]
+name = "ns3-yaml-roundtrip-list-of-records"
+src = 'yaml.parse(yaml.stringify([{a: 1}, {a: 2}]))'
+value = "[{a: 1}, {a: 2}]"
+
+[[case]]
+name = "ns3-toml-parse-array-of-tables"
+src = 'toml.parse("[[items]]\nname = \"x\"\n[[items]]\nname = \"y\"").items'
+value = '[{name: "x"}, {name: "y"}]'
+
+[[case]]
+name = "ns3-json-parse-nested-list-of-lists"
+src = 'json.parse("[[1,2],[3,4]]")'
+value = "[[1, 2], [3, 4]]"
+
+[[case]]
+name = "ns3-yaml-then-json-cross-conversion"
+# Parse in one data language, re-serialize in another — the shoal `Value`
+# in between is the only shared representation.
+src = 'json.stringify(yaml.parse("a: 1\nb: 2"))'
+value = '"{\"a\":1,\"b\":2}"'
+
+[[case]]
+name = "ns3-csv-numeric-field-stays-str"
+# csv has no type inference — every field is a `str`, even one that looks
+# like a bare integer.
+src = 'csv.parse("n\n5").first().n'
+value = '"5"'
+
+[[case]]
+name = "ns3-toml-roundtrip-nested-record"
+src = "toml.parse(toml.stringify({a: {b: 1}})).a.b"
+value = "1"
+
+[[case]]
+name = "ns3-math-log2-of-a-power-of-two"
+src = "math.log2(8)"
+value = "3"
+
+[[case]]
+name = "ns3-math-log10-of-a-power-of-ten"
+src = "math.log10(100)"
+value = "2"

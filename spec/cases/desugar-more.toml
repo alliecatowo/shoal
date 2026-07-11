@@ -34,18 +34,3 @@ name = "desugar2-alias-flags-pass-through-to-adapter-invocation"
 # `"git status"`.
 src = "alias gs = git status\n(gs --short).cmd"
 value = '"git status --short"'
-skip = "TDD §1.8 'later args append' does not hold for a flag appended to an aliased adapter call after definition: (git status --short).cmd correctly shows the flag, but alias gs = git status; (gs --short).cmd drops it, rendering plain \"git status\" — real gap in shoal-eval's alias-argv-append path, not a corpus authoring choice"
-
-[[case]]
-name = "desugar2-list-path-glob-param-binds-only-first-match-not-a-list"
-# TDD §4.3 promises a `list<path>`-typed callee param receives ALL glob
-# matches; the current word-binding coercion (`args.rs`) instead treats a
-# non-variadic `list<path>`/`list<str>` parameter exactly like a bare
-# `path`/`str` one and binds only the glob's first (sorted) match, silently
-# dropping the rest — a real, distinct-from-variadic gap (word-bind-list-
-# int-variadic-accumulates in coercion.toml covers the `...rest: list<int>`
-# form, which DOES work correctly; this is the non-variadic sibling).
-fixture = ["a.txt", "b.txt"]
-src = "fn showpaths(paths: list<path>) { paths.len() }\nshowpaths *.txt"
-error = "type_error"
-skip = "TDD §4.3: a non-variadic list<path>/list<str> parameter should receive every glob match as a list; the current word-binding coercion instead binds only the first match as a bare path/str (dropping the rest), so .len() on it raises 'unsupported on path' instead of returning the match count — real gap in shoal-eval's args.rs, not a corpus authoring choice"

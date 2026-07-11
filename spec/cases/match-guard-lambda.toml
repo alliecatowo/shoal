@@ -1,0 +1,40 @@
+# The match-guard/lambda-shorthand parser conflict (match-more.toml's
+# `match2-guard-comparing-two-bound-names-is-a-known-parser-gap` documents
+# it via `skip`, minimally reproduced there as `match 5 { n if flag => 1; _
+# => 0 }`): whenever a guard expression's rightmost operand is a bare
+# identifier immediately followed by `=>`, `primary()`'s IDENT-then-
+# FatArrow lambda shorthand greedily consumes that `=>`, so the match arm's
+# own arrow search then fails. These cases are exactly that shape (a guard
+# ending in a bare bound name, not a literal/call/index), asserting the
+# CORRECT parse once the conflict is resolved.
+
+[[case]]
+name = "guardlambda-two-bound-names-simple-comparison"
+src = 'match [3, 1] { [a, b] if a > b => "desc"; _ => "asc" }'
+value = '"desc"'
+
+[[case]]
+name = "guardlambda-minimal-repro-from-match-more-toml"
+# The exact minimal reproduction cited in match-more.toml's skip reason.
+src = "let flag = true\nmatch 5 { n if flag => 1; _ => 0 }"
+value = "1"
+
+[[case]]
+name = "guardlambda-comparison-against-a-bound-threshold"
+src = "let threshold = 3\nmatch 5 { n if n > threshold => \"big\"; _ => \"small\" }"
+value = '"big"'
+
+[[case]]
+name = "guardlambda-record-guard-comparing-two-fields"
+src = 'match {a: 5, b: 2} { {a, b} if a > b => "gt"; _ => "le" }'
+value = '"gt"'
+
+[[case]]
+name = "guardlambda-equality-of-two-bound-names"
+src = 'match [2, 2] { [a, b] if a == b => "eq"; _ => "neq" }'
+value = '"eq"'
+
+[[case]]
+name = "guardlambda-two-bound-names-falls-through-when-equal"
+src = 'match [4, 4] { [a, b] if a > b => "desc"; _ => "not-desc" }'
+value = '"not-desc"'

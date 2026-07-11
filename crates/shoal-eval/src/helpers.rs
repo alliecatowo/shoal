@@ -70,6 +70,23 @@ pub(crate) fn default_render(v: &Value) {
     }
 }
 
+/// Live wall-clock datetime in the system time zone, sourced from the
+/// evaluator's [`Clock`] port (so tests can pin it). Backs the `now` relative
+/// anchor and duration `.ago`/`.from_now` composition (TDD §2.1).
+pub(crate) fn now_zoned(clock: &dyn shoal_value::Clock) -> jiff::Zoned {
+    let ns = clock.now_ns();
+    jiff::Timestamp::from_nanosecond(ns as i128)
+        .map(|ts| ts.to_zoned(jiff::tz::TimeZone::system()))
+        .unwrap_or_else(|_| jiff::Zoned::now())
+}
+
+/// Today at midnight in the system time zone (the `today` relative anchor,
+/// TDD §2.1). Falls back to the raw `now` instant if start-of-day overflows.
+pub(crate) fn today_zoned(clock: &dyn shoal_value::Clock) -> jiff::Zoned {
+    let z = now_zoned(clock);
+    z.start_of_day().unwrap_or(z)
+}
+
 pub(crate) fn parse_datetime(iso: &str) -> VResult<jiff::Zoned> {
     if let Ok(zoned) = iso.parse::<jiff::Zoned>() {
         return Ok(zoned);

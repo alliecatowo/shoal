@@ -1,0 +1,69 @@
+# Datetime/time value-method hardening beyond datetime-more.toml's
+# arithmetic/comparison/render pass: `.uniq`/`in`-membership (which use
+# plain `==`, not the list-receiver `cmp` helper below), `.json`'s exact
+# serialized form, and cross-offset instant equality. Also covers sort/min/max
+# over the full comparable-type set: `<`/`>` directly compare
+# `datetime`/`time`/`size`/`duration`/`bool` fine (ops.rs::compare, proven
+# throughout datetime-more.toml/size-duration-more.toml/operators.toml), and
+# `.sort()`/`.min()`/`.max()` now delegate to that SAME comparator
+# (shoal-value's `methods/list.rs::cmp` forwards to `ops::compare`), so
+# ordering a list of any of those types matches how the operators compare
+# them. Every passing value cross-checked against the real evaluator via the
+# conformance harness.
+
+[[case]]
+name = "dt3-uniq-preserves-first-occurrence-order"
+src = 't"2026-07-09T14:00Z" == t"2026-07-09T14:00Z"'
+value = "true"
+
+[[case]]
+name = "dt3-uniq-dedupes-equal-instants"
+src = '[t"2026-07-09T14:00Z", t"2026-07-09T14:00Z", t"2026-01-01T00:00Z"].uniq()'
+value = "[2026-07-09T14:00:00Z, 2026-01-01T00:00:00Z]"
+
+[[case]]
+name = "dt3-in-list-membership"
+src = 't"2026-07-09T14:00Z" in [t"2026-01-01T00:00Z", t"2026-07-09T14:00Z"]'
+value = "true"
+
+[[case]]
+name = "dt3-not-in-list-when-absent"
+src = 't"2026-03-03T00:00Z" in [t"2026-01-01T00:00Z", t"2026-07-09T14:00Z"]'
+value = "false"
+
+[[case]]
+name = "dt3-different-explicit-offsets-same-instant-are-equal"
+# An explicit `+01:00` offset and `Z` (UTC) describing the same instant
+# (14:00+01:00 == 13:00Z) compare equal — equality is instant-based, not
+# offset-text-based.
+src = 't"2026-07-09T14:00+01:00" == t"2026-07-09T13:00Z"'
+value = "true"
+
+[[case]]
+name = "dt3-json-serializes-full-zoned-form"
+# `Value::DateTime`'s `.json()` (shoal-value/src/json.rs) serializes
+# `jiff::Zoned`'s own `Display`, which includes the resolved offset AND an
+# IANA zone annotation for an explicit `Z` input — not a bare `Z`-suffixed
+# ISO-8601 string.
+src = 't"2026-07-09T14:00Z".json()'
+value = '"\"2026-07-09T14:00:00+00:00[UTC]\""'
+
+[[case]]
+name = "dt3-sort-list-of-datetimes"
+# See this file's header: `.sort()` on a collection of `datetime` values
+# orders them via the same comparator as a bare `<`/`>` (datetime-more.toml's
+# `dt2-comparison-later-is-greater`).
+src = '[t"2026-07-09T14:00Z", t"2026-01-01T00:00Z"].sort()'
+value = "[2026-01-01T00:00:00Z, 2026-07-09T14:00:00Z]"
+
+[[case]]
+name = "dt3-min-of-durations"
+# The same comparator path drives `.min()`/`.max()` for a non-datetime
+# type (`duration`).
+src = "[3s, 1s, 2s].min()"
+value = "1s"
+
+[[case]]
+name = "dt3-sort-list-of-bools"
+src = "[true, false].sort()"
+value = "[false, true]"

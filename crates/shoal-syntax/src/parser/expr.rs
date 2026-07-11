@@ -6,8 +6,21 @@ use super::*;
 
 impl<'s> Parser<'s> {
     pub(crate) fn expr(&mut self, min: u8) -> ParseResult<Expr> {
-        let lhs = self.unary()?;
+        let lhs = self.unary(min == 0)?;
         self.expr_tail(lhs, min)
+    }
+    /// Parse a `match` guard's expression. Identical to `expr(0)` except the
+    /// guard's own leading operand may never resolve as the bare
+    /// `IDENT => …` one-param-lambda shorthand: a guard is `bool`-valued, so
+    /// a lambda literal is never a legitimate whole guard, and a trailing
+    /// bare identifier immediately before the arm's `=>` is always that
+    /// identifier as an ordinary operand, never a fresh lambda param — see
+    /// match-more.toml's guard-lambda gap. (A nested call argument inside
+    /// the guard, e.g. `xs.any(n => n > 3)`, starts its own fresh `expr(0)`
+    /// and is unaffected.)
+    pub(crate) fn guard_expr(&mut self) -> ParseResult<Expr> {
+        let lhs = self.unary(false)?;
+        self.expr_tail(lhs, 0)
     }
     pub(crate) fn expr_tail(&mut self, mut lhs: Expr, min: u8) -> ParseResult<Expr> {
         loop {
@@ -101,11 +114,19 @@ impl<'s> Parser<'s> {
         }
         Ok(lhs)
     }
-    pub(crate) fn unary(&mut self) -> ParseResult<Expr> {
+    /// `top` is true only when this call sits at the very start of a fresh
+    /// `expr(0)` (an argument, a statement, a guard, …) rather than as the
+    /// right-hand operand of a binary operator. It gates `primary()`'s bare
+    /// `IDENT => …` one-param-lambda shorthand: that shorthand may only
+    /// consume the identifier it just parsed *and* the arrow that follows,
+    /// so firing it mid-binop-chain (e.g. a `match` guard's `a > b => …`,
+    /// where `b` is the operator's rhs, not a fresh expression) would
+    /// swallow a `=>` that belongs to an enclosing construct instead.
+    pub(crate) fn unary(&mut self, top: bool) -> ParseResult<Expr> {
         let (t, s) = self.peek(Mode::Expr)?;
         if matches!(t, Tok::Bang | Tok::Minus) {
             self.bump(Mode::Expr)?;
-            let e = self.unary()?;
+            let e = self.unary(top)?;
             let end = e.span().end;
             return Ok(Expr::Unary {
                 op: if matches!(t, Tok::Bang) {
@@ -117,12 +138,12 @@ impl<'s> Parser<'s> {
                 span: Span::new(s.start as usize, end as usize),
             });
         }
-        let p = self.primary()?;
+        let p = self.primary(top)?;
         self.postfix(p)
     }
-    pub(crate) fn primary(&mut self) -> ParseResult<Expr> {
+    pub(crate) fn primary(&mut self, top: bool) -> ParseResult<Expr> {
         let (t, s) = self.bump(Mode::Expr)?;
-        Ok(match t{Tok::Int(value)=>Expr::Int{value,span:s},Tok::Float(value)=>Expr::Float{value,span:s},Tok::Size(bytes)=>Expr::Size{bytes,span:s},Tok::Duration(ns)=>Expr::Duration{ns,span:s},Tok::Time{hour,min,sec}=>Expr::Time{hour,min,sec,span:s},Tok::Str(value)=>Expr::Str{value,span:s},Tok::StrInterp(parts)=>self.interp(parts,s)?,Tok::Regex(src)=>Expr::Regex{src,span:s},Tok::DateTime(iso)=>Expr::DateTime{iso,span:s},Tok::Ident(x)if x=="true"||x=="false"=>Expr::Bool{value:x=="true",span:s},Tok::Ident(x)if x=="null"=>Expr::Null{span:s},Tok::Ident(x)if x=="if"=>return self.if_expr(s.start as usize),Tok::Ident(x)if x=="try"=>return self.try_expr(s.start as usize),Tok::Ident(x)if x=="match"=>return self.match_expr(s.start as usize),Tok::Ident(x)if x=="with"=>return self.with_expr(s.start as usize),Tok::Ident(x)if x=="spawn"=>{let body=self.block()?;Expr::Spawn{body,span:Span::new(s.start as usize,self.pos)}},Tok::Ident(ref x)if INTERPRETERS.contains(&x.as_str())&&self.interp_block_follows(s)=>{let tool=x.clone();if self.byte(self.pos)==b'\''{let(rt,rs)=self.bump(Mode::Expr)?;match rt{Tok::Str(src)=>Expr::LangBlock{tool,src,span:Span::new(s.start as usize,rs.end as usize)},_=>return Err(ParseError::new(format!("expected {tool} payload after `{tool}'`"),rs))}}else{let open=self.expect(Mode::Expr,Tok::LBrace,"`{` or `'''…'''`")?;let(src,end)=self.lx.raw_brace_block(open.start as usize)?;self.pos=end;Expr::LangBlock{tool,src,span:Span::new(s.start as usize,end as usize)}}},Tok::Ident(name)=>{if matches!(self.peek(Mode::Expr)?.0,Tok::FatArrow){self.bump(Mode::Expr)?;let body=self.expr(0)?;let end=body.span().end;Expr::Lambda{params:vec![Param{name,ty:None,default:None,span:s}],body:Box::new(body),span:Span::new(s.start as usize,end as usize)}}else{if !self.repl&&matches!(name.as_str(),"it"|"out"){return Err(ParseError::new(format!("`{name}` is REPL-only"),s).hint("bind a variable to reuse a previous result"))}Expr::Var{name,span:s}}},Tok::LParen=>return self.paren_or_lambda(s.start as usize),Tok::LBracket=>{let mut items=vec![];self.skip_newlines()?;if self.eat(Mode::Expr,&Tok::RBracket)?.is_none(){loop{items.push(self.expr(0)?);self.skip_newlines()?;if self.eat(Mode::Expr,&Tok::Comma)?.is_none(){self.expect(Mode::Expr,Tok::RBracket,"`]`")?;break}self.skip_newlines()?;if self.eat(Mode::Expr,&Tok::RBracket)?.is_some(){break}}}Expr::List{items,span:Span::new(s.start as usize,self.pos)}},Tok::LBrace=>return self.record_or_block(s.start as usize),Tok::Pipe=>return Err(ParseError::new("shoal has no pipe operator",s).hint("data composes with `.`; raw byte plumbing is `.feed(cmd)`; verbatim POSIX lives in `sh { … }`")),_=>return Err(ParseError::new(format!("expected expression, found {t:?}"),s))})
+        Ok(match t{Tok::Int(value)=>Expr::Int{value,span:s},Tok::Float(value)=>Expr::Float{value,span:s},Tok::Size(bytes)=>Expr::Size{bytes,span:s},Tok::Duration(ns)=>Expr::Duration{ns,span:s},Tok::Time{hour,min,sec}=>Expr::Time{hour,min,sec,span:s},Tok::Str(value)=>Expr::Str{value,span:s},Tok::StrInterp(parts)=>self.interp(parts,s)?,Tok::Regex(src)=>Expr::Regex{src,span:s},Tok::DateTime(iso)=>Expr::DateTime{iso,span:s},Tok::Ident(x)if x=="true"||x=="false"=>Expr::Bool{value:x=="true",span:s},Tok::Ident(x)if x=="null"=>Expr::Null{span:s},Tok::Ident(x)if x=="if"=>return self.if_expr(s.start as usize),Tok::Ident(x)if x=="try"=>return self.try_expr(s.start as usize),Tok::Ident(x)if x=="match"=>return self.match_expr(s.start as usize),Tok::Ident(x)if x=="with"=>return self.with_expr(s.start as usize),Tok::Ident(x)if x=="spawn"=>{let body=self.block()?;Expr::Spawn{body,span:Span::new(s.start as usize,self.pos)}},Tok::Ident(ref x)if INTERPRETERS.contains(&x.as_str())&&self.interp_block_follows(s)=>{let tool=x.clone();if self.byte(self.pos)==b'\''{let(rt,rs)=self.bump(Mode::Expr)?;match rt{Tok::Str(src)=>Expr::LangBlock{tool,src,span:Span::new(s.start as usize,rs.end as usize)},_=>return Err(ParseError::new(format!("expected {tool} payload after `{tool}'`"),rs))}}else{let open=self.expect(Mode::Expr,Tok::LBrace,"`{` or `'''…'''`")?;let(src,end)=self.lx.raw_brace_block(open.start as usize)?;self.pos=end;Expr::LangBlock{tool,src,span:Span::new(s.start as usize,end as usize)}}},Tok::Ident(name)=>{if top&&matches!(self.peek(Mode::Expr)?.0,Tok::FatArrow){self.bump(Mode::Expr)?;let body=self.expr(0)?;let end=body.span().end;Expr::Lambda{params:vec![Param{name,ty:None,default:None,span:s}],body:Box::new(body),span:Span::new(s.start as usize,end as usize)}}else{if !self.repl&&matches!(name.as_str(),"it"|"out"){return Err(ParseError::new(format!("`{name}` is REPL-only"),s).hint("bind a variable to reuse a previous result"))}Expr::Var{name,span:s}}},Tok::LParen=>return self.paren_or_lambda(s.start as usize),Tok::LBracket=>{let mut items=vec![];self.skip_newlines()?;if self.eat(Mode::Expr,&Tok::RBracket)?.is_none(){loop{items.push(self.expr(0)?);self.skip_newlines()?;if self.eat(Mode::Expr,&Tok::Comma)?.is_none(){self.expect(Mode::Expr,Tok::RBracket,"`]`")?;break}self.skip_newlines()?;if self.eat(Mode::Expr,&Tok::RBracket)?.is_some(){break}}}Expr::List{items,span:Span::new(s.start as usize,self.pos)}},Tok::LBrace=>return self.record_or_block(s.start as usize),Tok::Pipe=>return Err(ParseError::new("shoal has no pipe operator",s).hint("data composes with `.`; raw byte plumbing is `.feed(cmd)`; verbatim POSIX lives in `sh { … }`")),_=>return Err(ParseError::new(format!("expected expression, found {t:?}"),s))})
     }
     pub(crate) fn postfix(&mut self, mut e: Expr) -> ParseResult<Expr> {
         loop {
@@ -196,11 +217,45 @@ impl<'s> Parser<'s> {
                     let span = Span::new(e.span().start as usize, self.pos);
                     match e {
                         Expr::Var { name, .. } => e = Expr::FnCall { name, args, span },
-                        _ => {
-                            return Err(ParseError::new(
-                                "only a named function can be called directly",
-                                span,
-                            ));
+                        callee => {
+                            // Direct call of a non-`Var` primary (TDD §3.2's
+                            // `postfix = primary { … | call [trailing] }`
+                            // grammar makes `lambda` an ordinary `primary`
+                            // with no carve-out against an immediate `call`
+                            // postfix — `(x => x + 1)(5)` must parse). `FnCall`
+                            // only carries a bare name, so desugar to the
+                            // name-first-then-call form that already works:
+                            // `{ let __iife = <callee>; __iife(args) }`. Each
+                            // occurrence gets its own block scope, so nested
+                            // or sibling IIFEs never collide on the name.
+                            let callee_span = callee.span();
+                            let name: String = "__iife".into();
+                            let let_stmt = Stmt::Let {
+                                pattern: Pattern::Bind {
+                                    name: name.clone(),
+                                    span: callee_span,
+                                },
+                                ty: None,
+                                init: callee,
+                                mutable: false,
+                                exported: false,
+                                span: callee_span,
+                            };
+                            let call_expr = Expr::FnCall { name, args, span };
+                            let block_span = Span::new(callee_span.start as usize, self.pos);
+                            e = Expr::Block {
+                                block: Block {
+                                    stmts: vec![
+                                        let_stmt,
+                                        Stmt::Expr {
+                                            expr: call_expr,
+                                            span,
+                                        },
+                                    ],
+                                    span: block_span,
+                                },
+                                span: block_span,
+                            };
                         }
                     }
                 }

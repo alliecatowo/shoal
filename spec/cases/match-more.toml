@@ -26,7 +26,6 @@ name = "match2-guard-comparing-two-bound-names-is-a-known-parser-gap"
 # identifier immediately before `=>`) gets swallowed as a lambda arrow.
 src = 'match [1, 2] { [a, b] if a > b => "desc"; _ => "not-desc" }'
 value = '"not-desc"'
-skip = "known shoal-syntax gap: a guard whose final operand is a bare identifier immediately followed by `=>` gets mis-parsed as a one-param lambda (primary()'s IDENT-then-FatArrow shorthand), swallowing the match arm's own `=>` and producing 'expected `=>`' — reproducible minimally as `match 5 { n if flag => 1; _ => 0 }`"
 
 [[case]]
 name = "match2-guard-two-names-worked-around-with-arithmetic"

@@ -80,6 +80,21 @@ impl Evaluator {
                 for v in args.pos {
                     call.args.push(self.value_cmd_arg(v, call.span)?);
                 }
+                // Later flags append to the aliased call's argv too (TDD §1.8):
+                // `alias gs = git status; gs --short` must carry `--short`
+                // through, not drop it. A bare presence flag (`--short`) arrives
+                // as `Bool(true)`; a valued flag (`--n=5`) carries its value.
+                for (name, v) in args.named {
+                    let value = match v {
+                        Value::Bool(true) => None,
+                        other => Some(Box::new(self.value_cmd_arg(other, call.span)?)),
+                    };
+                    call.args.push(CmdArg::FlagLong {
+                        name,
+                        value,
+                        span: call.span,
+                    });
+                }
                 self.eval_command(&call, Position::Value)
             }
             _ => Err(ErrorVal::new(
@@ -87,6 +102,37 @@ impl Evaluator {
                 format!("{} is not callable", f.type_name()),
             )),
         }
+    }
+
+    /// `assert(cond: bool, msg: str?)` (CONTRACTS §4): raise `assert_failed`
+    /// with `msg` (or a default) when `cond` is false, else `null`.
+    pub(crate) fn builtin_assert(&self, args: &CallArgs) -> VResult<Value> {
+        if !args.named.is_empty() {
+            return Err(ErrorVal::arg_error("assert takes no named arguments"));
+        }
+        let cond = args
+            .pos
+            .first()
+            .ok_or_else(|| ErrorVal::arg_error("assert expects a condition"))?;
+        if args.pos.len() > 2 {
+            return Err(ErrorVal::arg_error(
+                "assert expects at most a condition and a message",
+            ));
+        }
+        if cond.as_condition()? {
+            return Ok(Value::Null);
+        }
+        let msg = match args.pos.get(1) {
+            Some(Value::Str(s)) => s.clone(),
+            Some(v) => {
+                return Err(ErrorVal::type_error(format!(
+                    "assert message must be a str, found {}",
+                    v.type_name()
+                )));
+            }
+            None => "assertion failed".to_string(),
+        };
+        Err(ErrorVal::new("assert_failed", msg))
     }
 
     pub(crate) fn call_constructor(&self, name: &str, args: &CallArgs) -> VResult<Option<Value>> {

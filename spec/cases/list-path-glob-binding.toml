@@ -1,0 +1,38 @@
+# TDD §4.3's promise that a non-variadic `list<path>`/`list<str>` callee
+# param receives EVERY glob match as a list (desugar-more.toml's
+# `desugar2-list-path-glob-param-binds-only-first-match-not-a-list`
+# documents the pre-implementation gap via `skip`: the old word-binding
+# coercion bound only the glob's first sorted match as a bare scalar,
+# dropping the rest). The variadic sibling (`...rest: list<path>`,
+# coercion.toml's `word-bind-list-int-variadic-accumulates` and glob-
+# more.toml's `glob2-*`) already worked correctly before this fix; these
+# cases are the non-variadic form specifically.
+
+[[case]]
+name = "listpath-non-variadic-binds-every-match"
+fixture = ["a.txt", "b.txt"]
+src = "fn showpaths(paths: list<path>) { paths.len() }\nshowpaths *.txt"
+value = "2"
+
+[[case]]
+name = "listpath-non-variadic-preserves-sorted-order"
+fixture = ["b.txt", "a.txt"]
+# A glob-matched `list<path>` element is cwd-absolutized (like `ls`'s
+# `.path` field, per fs-builtins.toml's determinism note) — only the
+# basename suffix is safe to assert directly.
+src = "fn firstname(paths: list<path>) { paths.first().display().ends_with(\"a.txt\") }\nfirstname *.txt"
+value = "true"
+
+[[case]]
+name = "listpath-str-variant-non-variadic-also-collects-every-match"
+fixture = ["a.txt", "b.txt"]
+src = "fn shownames(names: list<str>) { names.len() }\nshownames *.txt"
+value = "2"
+
+[[case]]
+name = "listpath-single-match-is-still-a-one-element-list"
+# Even a glob with exactly ONE match must still bind a LIST of length one,
+# not fall back to the old bare-scalar behavior.
+fixture = ["only.txt"]
+src = "fn showpaths(paths: list<path>) { paths.len() }\nshowpaths *.txt"
+value = "1"

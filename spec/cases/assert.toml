@@ -1,0 +1,35 @@
+# The `assert` builtin (CONTRACTS §4 pins `assert_failed`; error-codes.toml's
+# `errcode-assert-builtin-not-implemented` documents the pre-implementation
+# gap via `skip`). A true condition is a void/side-effect-only success
+# (mirroring the corpus's other void builtins — `.each()`/`sleep()` — which
+# all yield `null`); a false condition raises `assert_failed`.
+
+[[case]]
+name = "assert-true-condition-yields-null"
+src = "assert(1 == 1)"
+value = "null"
+
+[[case]]
+name = "assert-false-condition-is-assert-failed"
+src = "assert(1 == 2)"
+error = "assert_failed"
+
+[[case]]
+name = "assert-true-literal"
+src = "assert(true)"
+value = "null"
+
+[[case]]
+name = "assert-false-literal-is-assert-failed"
+src = "assert(false)"
+error = "assert_failed"
+
+[[case]]
+name = "assert-passing-guard-lets-fn-body-continue"
+src = "fn f(n: int) { assert(n > 0)\nn * 2 }\nf(5)"
+value = "10"
+
+[[case]]
+name = "assert-failing-guard-stops-fn-body"
+src = "fn f(n: int) { assert(n > 0)\nn * 2 }\nf(-1)"
+error = "assert_failed"

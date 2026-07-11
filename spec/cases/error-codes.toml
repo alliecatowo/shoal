@@ -94,19 +94,10 @@ parse_error = true
 parse_error_contains = "unbalanced braces"
 
 [[case]]
-name = "errcode-assert-builtin-not-implemented"
-# TDD's builtin surface never actually lists a dedicated `assert`
-# construct (§5's core-verb list has no `assert`), and no eval call-site
-# raises `assert_failed` (`grep -rn assert_failed crates/` finds nothing) —
-# this is a genuine surface gap, not a corpus authoring choice.
-src = "assert(1 == 2)"
-skip = "no `assert` builtin/error path exists yet anywhere in shoal-eval — CONTRACTS §4's assert_failed code has no producer"
-
-[[case]]
-name = "errcode-runner-not-found-not-implemented"
-# IO.md §6's `run <path>` extension/shebang-fallback resolution (which would
-# raise `runner_not_found` on exhaustion) isn't wired into shoal-eval's `run`
-# builtin yet — an unresolvable path today surfaces a plain filesystem
-# `not_found` from the underlying spawn attempt instead.
+name = "errcode-runner-not-found"
+# IO.md §6's `run <path>` extension/shebang-fallback resolution raises
+# `runner_not_found` once every candidate runner is exhausted — an
+# unresolvable script path (unknown extension, no shebang) surfaces this
+# code rather than a bare filesystem `not_found` from the spawn attempt.
 src = 'run("./definitely-not-a-real-script-xyz.zzz")'
-skip = "IO.md §6's extension/shebang runner-resolution fallback (which raises runner_not_found on exhaustion) isn't implemented in shoal-eval's `run` builtin yet — an unresolvable path surfaces a plain spawn-level not_found instead"
+error = "runner_not_found"

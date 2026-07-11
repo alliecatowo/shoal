@@ -26,6 +26,16 @@ impl<'s> Parser<'s> {
                     false
                 } else if self.adjacent_postfix_after_ident(s)? {
                     false
+                } else if matches!(
+                    self.lx.token(s.end as usize, Mode::Expr),
+                    Ok((Tok::FatArrow, _))
+                ) {
+                    // `x => …` is the bare single-param lambda shorthand
+                    // (TDD §3.2 primary alternative), never a zero-arg
+                    // command named `x` — dispatch EXPR so `(x => x + 1)`
+                    // (grouped, or immediately called) parses as a lambda
+                    // instead of `x` with argv `["=", ">", "x", "+", "1"]`.
+                    false
                 } else {
                     // value-bound → EXPR (Var); cmd-bound or unbound → command.
                     !self.bound(&name)

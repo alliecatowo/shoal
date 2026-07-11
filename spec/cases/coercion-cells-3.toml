@@ -1,0 +1,79 @@
+# Further coercion-matrix hardening beyond coercion.toml/coercion-more.toml/
+# size-duration-more.toml: unary minus on a BOUND (non-literal) duration
+# variable (distinct from the lexer-level literal-negation cases in
+# literals.toml — this exercises the runtime `UnOp::Neg` path in
+# shoal-value's `ops::unop`), unary minus's missing `size` arm, `path`
+# ordering/equality (never asserted anywhere else in the corpus), more
+# cross-type `==` cells (always a clean `false`, never an error), and the
+# `.len()` method's receiver-type boundary (only `str`/`bytes`/`list`/
+# `table`/`record`/`range` have an arm; every other type is a plain
+# `type_error`, not `field_missing`).
+
+[[case]]
+name = "coerce3-duration-negation-on-bound-variable"
+# Distinct from literals.toml's `lit-duration-negative` (`-90s`, folded at
+# the lexer): here the duration lives in a `let` binding first, so `-d`
+# exercises the runtime `ops::unop` path instead of literal folding.
+src = "let d = 5s\n-d"
+value = "-5s"
+
+[[case]]
+name = "coerce3-size-unary-minus-is-type-error"
+# `ops::unop`'s `Neg` arm has no `size` case — negating a size (bound or
+# literal) is a type error, consistent with size's general
+# "cannot go negative" rule (coerce-size-minus-size-negative-is-error et al.
+# in coercion.toml).
+src = "let sz = 5kb\n-sz"
+error = "type_error"
+
+[[case]]
+name = "coerce3-path-lexicographic-ordering"
+src = 'path("a.txt") < path("b.txt")'
+value = "true"
+
+[[case]]
+name = "coerce3-path-equality"
+src = 'path("a.txt") == path("a.txt")'
+value = "true"
+
+[[case]]
+name = "coerce3-path-inequality"
+src = 'path("a.txt") == path("b.txt")'
+value = "false"
+
+[[case]]
+name = "coerce3-int-vs-size-cross-type-equality-is-false"
+# Never promoted across kinds (unlike int/float) — `5` and `5kb` (5000
+# bytes) are never equal regardless of magnitude.
+src = "5 == 5kb"
+value = "false"
+
+[[case]]
+name = "coerce3-bool-vs-int-cross-type-equality-is-false"
+src = "true == 1"
+value = "false"
+
+[[case]]
+name = "coerce3-datetime-vs-str-cross-type-equality-is-false"
+src = 't"2026-07-09T00:00Z" == "2026-07-09"'
+value = "false"
+
+[[case]]
+name = "coerce3-len-unsupported-on-datetime"
+src = 't"2026-07-09T00:00Z".len()'
+error = "type_error"
+
+[[case]]
+name = "coerce3-len-unsupported-on-int"
+src = "5.len()"
+error = "type_error"
+
+[[case]]
+name = "coerce3-len-unsupported-on-bool"
+src = "true.len()"
+error = "type_error"
+
+[[case]]
+name = "coerce3-len-unsupported-on-duration"
+src = "5s.len()"
+error = "type_error"

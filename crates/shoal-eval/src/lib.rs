@@ -1458,4 +1458,115 @@ consumed = ["short", "branch"]
         assert!(ev.task_by_id(t.id).is_some());
         t.cancel();
     }
+
+    #[test]
+    fn now_and_today_are_live_datetime_anchors() {
+        // `now`/`today` (TDD §2.1) resolve to a datetime, not an undefined var.
+        let this_year = jiff::Zoned::now().year() as i64;
+        assert_eq!(run("now.year").unwrap(), Value::Int(this_year));
+        assert_eq!(run("today.year").unwrap(), Value::Int(this_year));
+        assert_eq!(run("now().year").unwrap(), Value::Int(this_year));
+        // `today` is midnight: hour/minute/second all zero.
+        assert_eq!(run("today.hour").unwrap(), Value::Int(0));
+        assert_eq!(run("today.minute").unwrap(), Value::Int(0));
+        // A user binding still shadows the anchor name.
+        assert_eq!(run("let now = 5\nnow").unwrap(), Value::Int(5));
+    }
+
+    #[test]
+    fn duration_ago_and_from_now_compose_to_datetime() {
+        // `.ago` is in the past, `.from_now` in the future (TDD §2.1).
+        assert!(matches!(run("1h.ago").unwrap(), Value::DateTime(_)));
+        assert!(matches!(run("30d.from_now").unwrap(), Value::DateTime(_)));
+        // from_now is strictly after ago for the same duration.
+        assert_eq!(run("1h.from_now > 1h.ago").unwrap(), Value::Bool(true));
+        // Round-trips through datetime arithmetic: now + 1h ~ 1h.from_now.
+        assert_eq!(run("1h.from_now > now").unwrap(), Value::Bool(true));
+        assert_eq!(run("1h.ago < now").unwrap(), Value::Bool(true));
+        // An unknown duration field is still a plain field_missing.
+        assert_eq!(run("1h.nope").unwrap_err().code, "field_missing");
+    }
+
+    #[test]
+    fn assert_builtin_raises_assert_failed() {
+        // False condition → assert_failed (CONTRACTS §4).
+        let e = run("assert(1 == 2)").unwrap_err();
+        assert_eq!(e.code, "assert_failed");
+        // Custom message is carried through.
+        let e = run(r#"assert(false, "boom")"#).unwrap_err();
+        assert_eq!(e.code, "assert_failed");
+        assert_eq!(e.msg, "boom");
+        // True condition → null, no raise.
+        assert_eq!(run("assert(1 == 1)").unwrap(), Value::Null);
+        // Command-head spelling works too.
+        assert_eq!(run("assert (2 > 1)").unwrap(), Value::Null);
+        // Non-bool condition is a type_error, not a silent pass.
+        assert_eq!(run("assert(3)").unwrap_err().code, "type_error");
+    }
+
+    #[test]
+    fn list_path_param_receives_all_glob_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "").unwrap();
+        // A non-variadic `list<path>` param gets every sorted match (TDD §4.3).
+        let v = run_in(
+            "fn showpaths(paths: list<path>) { paths.len() }\nshowpaths *.txt",
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(v, Value::Int(2));
+    }
+
+    #[test]
+    fn glob_excludes_dotfiles_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".hidden.txt"), "").unwrap();
+        std::fs::write(dir.path().join("a.txt"), "").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "").unwrap();
+        // Plain `*.txt` skips `.hidden.txt` (TDD §4.3): 2, not 3.
+        let v = run_in(
+            "fn f(...rest: list<path>) { rest.len() }\nf *.txt",
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(v, Value::Int(2));
+        // A dot-leading pattern opts back in.
+        let v = run_in(
+            "fn f(...rest: list<path>) { rest.len() }\nf .*.txt",
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(v, Value::Int(1));
+    }
+
+    #[test]
+    fn alias_appends_later_flags_to_adapter_call() {
+        // `alias gs = git status; (gs --short).cmd` must carry `--short`
+        // through to the resolved argv (TDD §1.8), not drop it.
+        let v = run("alias gs = git status\n(gs --short).cmd").unwrap();
+        assert_eq!(v, Value::Str("git status --short".into()));
+    }
+
+    #[test]
+    fn run_unresolvable_extension_raises_runner_not_found() {
+        // No `[runners]` entry and no shebang for `.zzz` → runner_not_found
+        // (IO.md §3.2 step 3), not a bare filesystem not_found.
+        let e = run(r#"run("./definitely-not-a-real-script-xyz.zzz")"#).unwrap_err();
+        assert_eq!(e.code, "runner_not_found");
+    }
+
+    #[test]
+    fn background_ampersand_yields_a_task() {
+        // `cmd &` desugars to `spawn { cmd }` (TDD §3.4): yields a task.
+        let v = run("let t = (echo hi &)\nt.await()\nt.is_done()").unwrap();
+        assert_eq!(v, Value::Bool(true));
+        // Value-position `&` produces a task handle directly.
+        assert!(matches!(run("(echo hi &)").unwrap(), Value::Task(_)));
+        // The awaited task's outcome is the command's stdout.
+        assert_eq!(
+            run("let t = (echo hi &)\nt.await().out").unwrap(),
+            Value::Str("hi".into())
+        );
+    }
 }

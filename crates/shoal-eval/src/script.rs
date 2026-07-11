@@ -181,15 +181,63 @@ impl Evaluator {
                     Some("js") => self.run_interp("node", path, args, position),
                     Some("rs") => self.run_rust_script(path, args, position),
                     _ => {
-                        let mut argv = vec![path.as_os_str().to_owned()];
-                        for v in args {
-                            argv.push(self.argv_value(v)?);
+                        // Extension not in any `[runners]` table and not a
+                        // builtin interpreter (IO.md §3.2 step 1 exhausted):
+                        // fall back to the file's shebang (step 2), else raise
+                        // `runner_not_found` (step 3) instead of blindly
+                        // exec'ing an unresolvable path.
+                        if let Some(mut argv) = self.shebang_argv(path) {
+                            argv.push(path.as_os_str().to_owned());
+                            for v in args {
+                                argv.push(self.argv_value(v)?);
+                            }
+                            return self.run_argv(
+                                argv,
+                                position,
+                                StdinSpec::Null,
+                                &[],
+                                Span::default(),
+                                None,
+                            );
                         }
-                        self.run_argv(argv, position, StdinSpec::Null, &[], Span::default(), None)
+                        Err(ErrorVal::new(
+                            "runner_not_found",
+                            format!("no runner for {}", path.display()),
+                        )
+                        .with_hint(
+                            "configured runners: py js ts sh shl rb lua — add one under \
+                             `[runners]` in a `.reef.toml`, or give the file a `#!` shebang"
+                                .to_string(),
+                        ))
                     }
                 }
             }
         }
+    }
+
+    /// Shebang-fallback runner resolution (IO.md §3.2 step 2): read the file's
+    /// first line; if it is `#!<interp> [args…]`, return the interpreter argv
+    /// prefix. `#!/usr/bin/env <tool>` resolves to `<tool>` (env-style). `None`
+    /// when the file is unreadable or has no shebang.
+    pub(crate) fn shebang_argv(&self, path: &Path) -> Option<Vec<OsString>> {
+        let content = self.fs.read_to_string(path).ok()?;
+        let first = content.lines().next()?;
+        let rest = first.strip_prefix("#!")?.trim();
+        let mut words = rest.split_whitespace();
+        let interp = words.next()?;
+        let mut argv: Vec<OsString> = Vec::new();
+        let base = Path::new(interp)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(interp);
+        if base == "env" {
+            // `#!/usr/bin/env python` → the real interpreter is the next word.
+            argv.push(OsString::from(words.next()?));
+        } else {
+            argv.push(OsString::from(interp));
+        }
+        argv.extend(words.map(OsString::from));
+        Some(argv)
     }
 
     pub(crate) fn run_interp(

@@ -92,7 +92,6 @@ name = "edge-bare-parenthesized-it-bypasses-repl-only-check"
 src = "(it)"
 parse_error = true
 parse_error_contains = "REPL-only"
-skip = "paren_or_lambda's single-bare-identifier special case doesn't route through primary()'s it/out REPL-only check — (it)/(out) parse successfully in script mode when they should error; TDD §13.16 not fully honored"
 
 # --- §13.6: signal death surfaces as `signal`, `status` stays null, never
 # a synthesized 128+n exit code -------------------------------------------

@@ -1,0 +1,14 @@
+# Further stream hardening beyond streams.toml/streams-more.toml:
+# `.buffer(0)` staying an identity pass-through (a zero-sized buffer still
+# forwards every element), and `.window` on an empty source producing no
+# windows at all rather than an error.
+
+[[case]]
+name = "stream3-buffer-zero-is-identity"
+src = "[1, 2].stream().buffer(0).collect()"
+value = "[1, 2]"
+
+[[case]]
+name = "stream3-window-on-empty-source-is-empty"
+src = "[].stream().window(2).collect()"
+value = "[]"

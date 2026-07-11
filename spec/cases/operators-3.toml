@@ -1,0 +1,27 @@
+# Further operator hardening beyond operators.toml/operators-more.toml:
+# safe-nav chained through a field access AND then a method call in one
+# expression (operators.toml's safe-nav cases stop at a bare field), `??`
+# feeding its result straight into a method call, `in` on an empty list
+# (structurally false, not an error), and a str ordering case pinning
+# ASCII case-sensitivity (uppercase sorts before lowercase — `"Z" < "a"` is
+# true because `Z` is 0x5A and `a` is 0x61).
+
+[[case]]
+name = "op3-safenav-chained-field-then-method-call"
+src = "let x = {name: \"ada\"}\nx?.name?.upper()"
+value = '"ADA"'
+
+[[case]]
+name = "op3-coalesce-result-feeds-a-method-call"
+src = "(null ?? null ?? 5).abs()"
+value = "5"
+
+[[case]]
+name = "op3-in-on-empty-list-is-false"
+src = '"a" in []'
+value = "false"
+
+[[case]]
+name = "op3-ascii-uppercase-sorts-before-lowercase"
+src = '"Z" < "a"'
+value = "true"

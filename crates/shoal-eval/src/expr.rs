@@ -36,6 +36,16 @@ impl Evaluator {
                 // invoking it zero-arg in value position (defect #5, §3.4).
                 if let Some(v) = self.env.get(name) {
                     Ok(v)
+                } else if name == "now" {
+                    // Relative anchor (TDD §2.1): live wall-clock datetime.
+                    Ok(Value::DateTime(Box::new(crate::helpers::now_zoned(
+                        self.clock.as_ref(),
+                    ))))
+                } else if name == "today" {
+                    // Relative anchor (TDD §2.1): today at midnight.
+                    Ok(Value::DateTime(Box::new(crate::helpers::today_zoned(
+                        self.clock.as_ref(),
+                    ))))
                 } else if self.is_command_name(name) {
                     let call = CmdCall {
                         head: name.clone(),
@@ -229,6 +239,21 @@ impl Evaluator {
                     "parallel" => return self.builtin_parallel(args),
                     "retry" => return self.builtin_retry(args),
                     "on" => return self.builtin_on(args),
+                    // Relative anchors as functions (TDD §2.1): `now()`/`today()`.
+                    "now" if args.pos.is_empty() && args.named.is_empty() => {
+                        return Ok(Value::DateTime(Box::new(crate::helpers::now_zoned(
+                            self.clock.as_ref(),
+                        ))));
+                    }
+                    "today" if args.pos.is_empty() && args.named.is_empty() => {
+                        return Ok(Value::DateTime(Box::new(crate::helpers::today_zoned(
+                            self.clock.as_ref(),
+                        ))));
+                    }
+                    "assert" => {
+                        let a = self.eval_args(args)?;
+                        return self.builtin_assert(&a).map_err(|e| e.or_span(span));
+                    }
                     "run" => {
                         let mut a = self.eval_args(args)?;
                         if a.pos.is_empty() {

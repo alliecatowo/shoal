@@ -1,0 +1,69 @@
+# TDD §2.1's relative-anchor surface: `now`/`today` as live-clock functions,
+# and duration `.ago`/`.from_now` composition (datetime-more.toml's
+# `dt2-relative-anchors-not-implemented` documents the pre-implementation
+# gap via `skip`; this file exercises the feature itself once it lands).
+# Host-safety discipline: every assertion is a RELATION anchored to a fixed
+# past instant (`t"2020-01-01T00:00Z"`) or to another `now`/`today` call
+# within the same run, never an exact clock value — every one holds for as
+# long as this repository exists, on any host, in any timezone (`now`/
+# `today` are instant-based; `t"…Z"` is an explicit UTC anchor). `now`/
+# `today` are bound to a `let` first (not used as the bare, statement-
+# initial token) so the statement parses in EXPR mode — a bare leading
+# `now`/`today` dispatches as a COMMAND per TDD §3.1.3's identifier rule,
+# which is a real but orthogonal parsing detail (see edges.toml's analogous
+# `it`/`out` notes), not the relative-anchor feature under test here.
+
+[[case]]
+name = "reldt-now-is-after-a-fixed-past-datetime"
+src = "let n = now\nn > t\"2020-01-01T00:00Z\""
+value = "true"
+
+[[case]]
+name = "reldt-today-is-not-before-a-fixed-past-date"
+src = "let d = today\nd >= t\"2020-01-01\""
+value = "true"
+
+[[case]]
+name = "reldt-today-called-twice-is-equal"
+# `today` truncates to midnight of the current date; two calls within the
+# same (sub-millisecond) evaluation never cross a day boundary.
+src = "let a = today\nlet b = today\na == b"
+value = "true"
+
+[[case]]
+name = "reldt-now-is-at-or-after-today"
+src = "let n = now\nlet d = today\nn >= d"
+value = "true"
+
+[[case]]
+name = "reldt-hour-ago-is-before-now"
+src = "let n = now\n1h.ago < n"
+value = "true"
+
+[[case]]
+name = "reldt-hour-from-now-is-after-now"
+src = "let n = now\n1h.from_now > n"
+value = "true"
+
+[[case]]
+name = "reldt-ago-and-from-now-are-symmetric-around-now"
+src = "1h.ago < 1h.from_now"
+value = "true"
+
+[[case]]
+name = "reldt-day-ago-is-before-today"
+src = "let d = today\n1d.ago < d"
+value = "true"
+
+[[case]]
+name = "reldt-week-from-now-is-after-now"
+src = "let n = now\n1w.from_now > n"
+value = "true"
+
+[[case]]
+name = "reldt-now-has-no-str-conversion"
+# `now` resolves to a genuine `datetime` value, which inherits datetime's
+# existing `.str()` gap (datetime-more.toml's `dt2-str-method-is-type-error`)
+# — proves `now` is the real value type, not some other representation.
+src = "let n = now\nn.str()"
+error = "type_error"

@@ -58,18 +58,3 @@ let h = compose(x => x + 1, x => x * 2)
 h(5)
 '''
 value = "11"
-
-[[case]]
-name = "closure2-immediately-invoked-lambda-literal-is-a-parse-error"
-# TDD §3.2's grammar (`postfix = primary { … | call [trailing] }`, with
-# `lambda` as one of `primary`'s alternatives) implies `(x => x + 1)(5)`
-# should parse as a lambda-primary immediately followed by a `call`
-# postfix — but the parser explicitly rejects calling a parenthesized
-# lambda literal directly ("only a named function can be called
-# directly"). Binding the same lambda to a name first and calling THAT
-# works fine (see closure2-function-composition above), so this is
-# specifically the direct-literal-call spelling that's restricted.
-src = "(x => x + 1)(5)"
-value = "6"
-parse_error = true
-skip = "shoal-syntax rejects calling a parenthesized lambda literal directly ('only a named function can be called directly'), even though TDD §3.2's postfix grammar (primary { ... | call [trailing] }, with lambda as a primary alternative) doesn't carve out an exception for it — binding the lambda to a name first and calling that works fine, so this is a real, narrow parser restriction rather than a corpus authoring choice"

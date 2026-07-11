@@ -1,0 +1,98 @@
+# Further record/table method hardening beyond collections.toml/record-
+# table-more.toml: `table`-receiver forms of the higher-order/slicing
+# methods not yet exercised on a real `ls`-sourced table (`.enumerate`,
+# `.group`, `.chunks`, `.sort_by`, `.zip`, `.any`, `.all`, `.find` — all
+# already proven on plain `list` receivers elsewhere, but `Value::Table`
+# takes a distinct path through `seq()`), and the collection-methods'
+# `record`-receiver boundary: a bare `record` is never itself an iterable
+# `seq()` source (only its `.keys()`/`.values()`/`.items()` sidecar lists
+# are) — `.first`/`.sum`/`.map`/`.where` on a raw record are plain type
+# errors, not `field_missing`. Same determinism discipline as fs-builtins*
+# .toml: only `.name`/`.type`/`.len()` are asserted, never a cwd-absolutized
+# path field.
+
+[[case]]
+name = "rt3-table-enumerate-then-map-names"
+fixture = ["a.txt", "b.txt"]
+src = 'ls.enumerate().map(p => p[1].name)'
+value = "[a.txt, b.txt]"
+
+[[case]]
+name = "rt3-table-group-by-type-count"
+fixture = ["a.txt", "b.txt"]
+src = 'ls.group(r => r.type).len()'
+value = "1"
+
+[[case]]
+name = "rt3-table-chunks-of-one-count"
+fixture = ["a.txt", "b.txt"]
+src = "ls.chunks(1).len()"
+value = "2"
+
+[[case]]
+name = "rt3-table-sort-by-name-then-first"
+fixture = ["b.txt", "a.txt"]
+src = "ls.sort_by(r => r.name).first().name"
+value = "a.txt"
+
+[[case]]
+name = "rt3-table-zip-with-plain-list"
+fixture = ["a.txt", "b.txt"]
+src = 'ls.map(r => r.name).zip([1, 2])'
+value = "[[a.txt, 1], [b.txt, 2]]"
+
+[[case]]
+name = "rt3-table-any-true"
+fixture = ["a.txt"]
+src = 'ls.any(r => r.type == "file")'
+value = "true"
+
+[[case]]
+name = "rt3-table-all-true"
+fixture = ["a.txt"]
+src = 'ls.all(r => r.type == "file")'
+value = "true"
+
+[[case]]
+name = "rt3-table-find-by-name"
+fixture = ["a.txt", "b.txt"]
+src = 'ls.find(r => r.name == "b.txt").name'
+value = "b.txt"
+
+[[case]]
+name = "rt3-record-first-is-type-error"
+# A bare record is not `seq()`-iterable (unlike its own `.keys()`/`.values()`
+# lists) — `.first()` (and every other list-shaped method) errors, it does
+# not treat the record as a single-element or field-keyed collection.
+src = "{a: 1}.first()"
+error = "type_error"
+
+[[case]]
+name = "rt3-record-sum-is-type-error"
+src = "{a: 1}.sum()"
+error = "type_error"
+
+[[case]]
+name = "rt3-record-map-is-type-error"
+src = "{a: 1}.map(x => x)"
+error = "type_error"
+
+[[case]]
+name = "rt3-record-where-is-type-error"
+src = "{a: 1}.where(x => true)"
+error = "type_error"
+
+[[case]]
+name = "rt3-record-values-then-sum"
+src = "{a: 1, b: 2, c: 3}.values().sum()"
+value = "6"
+
+[[case]]
+name = "rt3-record-keys-then-join"
+src = '{a: 1, b: 2}.keys().join(",")'
+value = '"a,b"'
+
+[[case]]
+name = "rt3-nested-record-in-list-get-with-default"
+src = "[{a: 1}].get(5, {a: 0}).a"
+value = "0"

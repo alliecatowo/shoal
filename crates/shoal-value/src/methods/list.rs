@@ -25,26 +25,13 @@ pub(crate) fn seq(v: Value) -> VResult<Vec<Value>> {
     }
 }
 
+/// Ordering used by `.sort()`/`.min()`/`.max()`. Delegates to the same
+/// total-order comparator as the `<`/`>`/`<=`/`>=` operators
+/// ([`crate::ops::compare`]) so every directly-comparable value type
+/// (int/float/str/path/size/duration/datetime/time/bool) sorts consistently
+/// with how it compares — no narrower, separately-maintained arm set.
 pub(crate) fn cmp(a: &Value, b: &Value) -> VResult<Ordering> {
-    match (a, b) {
-        (Value::Int(a), Value::Int(b)) => Ok(a.cmp(b)),
-        (Value::Float(a), Value::Float(b)) => a
-            .partial_cmp(b)
-            .ok_or_else(|| ErrorVal::type_error("NaN is not orderable")),
-        (Value::Int(a), Value::Float(b)) => (*a as f64)
-            .partial_cmp(b)
-            .ok_or_else(|| ErrorVal::type_error("NaN is not orderable")),
-        (Value::Float(a), Value::Int(b)) => a
-            .partial_cmp(&(*b as f64))
-            .ok_or_else(|| ErrorVal::type_error("NaN is not orderable")),
-        (Value::Str(a), Value::Str(b)) => Ok(a.cmp(b)),
-        (Value::Path(a), Value::Path(b)) => Ok(a.cmp(b)),
-        _ => Err(ErrorVal::type_error(format!(
-            "cannot compare {} and {}",
-            a.type_name(),
-            b.type_name()
-        ))),
-    }
+    crate::ops::compare(a, b)
 }
 
 pub(crate) fn len(v: Value) -> VResult<Value> {

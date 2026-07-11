@@ -378,3 +378,119 @@ fn repl_leading_dot_chains_on_it() {
     // In script context a leading `.` is not an `it` chain.
     assert!(parse(".first()").is_err());
 }
+
+// ---------------------------------------------------------------- syntax-gaps:
+// IIFE call restriction, match-guard-lambda mis-parse, `(it)`/`(out)` REPL bypass.
+// (spec/cases/closures-more.toml, match-more.toml, edges.toml)
+
+/// TDD §3.2's `postfix = primary { … | call [trailing] }` grammar makes
+/// `lambda` an ordinary `primary` with no carve-out against an immediate
+/// `call` postfix — a parenthesized lambda literal must be directly
+/// callable, not just callable once bound to a name.
+#[test]
+fn syntax_gap_iife_direct_call_of_lambda_literal() {
+    let p = parse("(x => x + 1)(5)").unwrap();
+    match last(&p) {
+        Stmt::Expr {
+            expr: Expr::Block { block, .. },
+            ..
+        } => {
+            assert_eq!(block.stmts.len(), 2);
+            assert!(matches!(
+                block.stmts[0],
+                Stmt::Let {
+                    init: Expr::Lambda { .. },
+                    ..
+                }
+            ));
+            match &block.stmts[1] {
+                Stmt::Expr {
+                    expr: Expr::FnCall { args, .. },
+                    ..
+                } => assert!(matches!(args.pos[0], Expr::Int { value: 5, .. })),
+                other => panic!("{other:?}"),
+            }
+        }
+        other => panic!("{other:?}"),
+    }
+    // A named-function call still works exactly as before (no regression).
+    assert!(matches!(
+        last(&parse("let h = x => x + 1\nh(5)").unwrap()),
+        Stmt::Expr {
+            expr: Expr::FnCall { .. },
+            ..
+        }
+    ));
+    // Calling a fn-literal thunk directly also goes through the same path.
+    assert!(parse("(() => 1)()").is_ok());
+}
+
+/// `primary()`'s bare `IDENT => …` one-param-lambda shorthand must only
+/// fire at the head of a fresh expression, never as the rhs of a binary
+/// operator — otherwise a guard's trailing bound name swallows the match
+/// arm's own `=>` (reproduced minimally below).
+#[test]
+fn syntax_gap_match_guard_trailing_bound_name_does_not_swallow_arrow() {
+    let p = parse("match 5 { n if flag => 1; _ => 0 }").unwrap();
+    match last(&p) {
+        Stmt::Expr {
+            expr: Expr::Match { arms, .. },
+            ..
+        } => {
+            assert_eq!(arms.len(), 2);
+            assert!(matches!(arms[0].guard, Some(Expr::Var { .. })));
+        }
+        other => panic!("{other:?}"),
+    }
+    let p = parse(r#"match [1, 2] { [a, b] if a > b => "desc"; _ => "not-desc" }"#).unwrap();
+    match last(&p) {
+        Stmt::Expr {
+            expr: Expr::Match { arms, .. },
+            ..
+        } => assert!(matches!(
+            arms[0].guard,
+            Some(Expr::Binary { op: BinOp::Gt, .. })
+        )),
+        other => panic!("{other:?}"),
+    }
+    // A call-argument lambda shorthand elsewhere in the guard is unaffected
+    // (its own fresh `expr(0)`, not the guard's own leading operand).
+    assert!(parse("match [1, 2, 3] { xs if xs.any(n => n > 2) => 1; _ => 0 }").is_ok());
+}
+
+/// `paren_or_lambda`'s single-bare-identifier tentative-lambda-params path
+/// must fall back to the same `it`/`out` REPL-only check `primary()` uses,
+/// not to unconditional command dispatch (which would treat `it`/`out` as
+/// ordinary — if REPL-context-less — command names).
+#[test]
+fn syntax_gap_paren_it_out_rejected_in_scripts() {
+    assert!(parse("(it)").is_err());
+    assert!(parse("(out)").is_err());
+    assert!(
+        parse_with_ctx(
+            "(it)",
+            ParseCtx {
+                repl: true,
+                ..vb(&[])
+            }
+        )
+        .is_ok()
+    );
+    // An ordinary single-bare-identifier group is unaffected: an unbound
+    // name still dispatches as a command substitution (D4), and a bound
+    // one still resolves to the value.
+    assert!(matches!(
+        last(&parse("(echo)").unwrap()),
+        Stmt::Expr {
+            expr: Expr::Cmd { .. },
+            ..
+        }
+    ));
+    assert!(matches!(
+        last(&parse("let ls = 5\n(ls)").unwrap()),
+        Stmt::Expr {
+            expr: Expr::Var { .. },
+            ..
+        }
+    ));
+}

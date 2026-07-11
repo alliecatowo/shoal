@@ -36,4 +36,3 @@ fn f(...rest: list<path>) { rest.len() }
 f *.txt
 '''
 value = "2"
-skip = "TDD §4.3's dotfile-exclusion rule ('dotfiles excluded unless pattern starts with .') is not honored by the current glob expansion — a plain *.txt pattern currently includes .hidden.txt in its match set (3 matches) instead of skipping it (2), real gap not a corpus authoring choice"

@@ -1,0 +1,39 @@
+# Immediately-invoked lambda literals (closures-more.toml's
+# `closure2-immediately-invoked-lambda-literal-is-a-parse-error` documents
+# the pre-fix restriction via `skip`: shoal-syntax rejected calling a
+# parenthesized lambda literal directly, even though binding the same
+# lambda to a name first and calling THAT already worked fine —
+# closures-more.toml's `closure2-function-composition`). These cases assert
+# the CORRECT value for several IIFE shapes once the direct-call
+# restriction is lifted.
+
+[[case]]
+name = "iife-two-param-sum"
+src = "((a, b) => a + b)(2, 3)"
+value = "5"
+
+[[case]]
+name = "iife-zero-param"
+src = "(() => 42)()"
+value = "42"
+
+[[case]]
+name = "iife-result-chained-with-a-method-call"
+src = "((x) => [x, x * 2])(3).sum()"
+value = "9"
+
+[[case]]
+name = "iife-embedded-in-a-larger-arithmetic-expression"
+src = "1 + (x => x * 2)(3)"
+value = "7"
+
+[[case]]
+name = "iife-nested-double-call"
+# An IIFE whose own body is itself another IIFE.
+src = "((x) => (y => x + y)(3))(4)"
+value = "7"
+
+[[case]]
+name = "iife-block-body"
+src = "(() => { let x = 5\nx * 2 })()"
+value = "10"
