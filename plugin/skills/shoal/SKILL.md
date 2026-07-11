@@ -17,20 +17,28 @@ below is traced to `docs/TDD.md`, `docs/VISION.md`, `docs/REEF.md`, `docs/AGENT-
 already structured on the wire. Reach for `structuredContent` / `value.get` / `shoal_get`, never for
 `content[0].text` or the human `render` string.
 
-> **Surface-currency note (read once).** This card was written against `docs/AGENT-SURFACE.md`
-> ("the wire encoding" v2) as the *intended* target surface, at a moment when the MCP facade
-> (`crates/shoal-mcp`, `crates/shoal-kernel`) was **actively gaining**: MCP `resources/*`
-> (`resources/list`/`read`/`subscribe`), the `events`/channel subsystem, a `shoal_cancel` tool,
-> elision applied to the `render`/`content[0].text` fields (not just `structuredContent`), a
-> macOS-safe socket-path fallback in `shoal-mcp` matching `shoal-kernel`'s, and a real (non-hardcoded)
-> `reversibility` value on `shoal_plan`. Everywhere below that depends on one of those six changes is
-> marked **(P1)** — treat it as "this is how it's *supposed* to behave per spec; re-verify against
-> `crates/shoal-mcp/src/lib.rs` and `crates/shoal-kernel/src/lib.rs` before trusting it if this card
-> feels stale." Everything *not* marked **(P1)** was confirmed directly against source at authoring
-> time and is not expected to have moved. Every other gap this card documents (dead `capture`/`timeout`
-> params, unexposed `elide` budgets, `shoal_journal`'s schema mismatch, the narrow `value.get` path
-> grammar, `shoal_cap_request`'s unused `effects`, `complete`/`explain` being un-dispatched, etc.) was
-> **not** in scope for that concurrent change — assume those are still open until you check.
+> **Surface-currency note (read once — UPDATED).** This card originally hedged six MCP-facade features
+> as **(P1)** ("intended, re-verify before trusting"). **All six have since been confirmed landed
+> against source — treat every `(P1)` marker below as DONE, not pending:**
+> 1. MCP `resources/*` — `resources/list`/`read`/`subscribe`/`unsubscribe` are dispatched
+>    (`crates/shoal-mcp/src/lib.rs` `Facade::handle`), and `initialize` advertises
+>    `capabilities.resources.subscribe = true`. Use `resources/read` to drill into an elided value's
+>    `shoal://…` uri directly — the manual `ref`+`path` translation (§0.2/§4-rule-15) is now just a
+>    fallback, not the primary path.
+> 2. The `events`/channel subsystem — `resources/subscribe` on a `shoal://events/{ch}` uri starts a
+>    forwarder that pushes `notifications/resources/updated` frames (`client.rs::run_event_forwarder`).
+> 3. `shoal_cancel` — present in `tools()` (the tool list has seven entries now).
+> 4. Real (non-hardcoded) `reversibility` — the kernel computes it via `reversibility_from_effects`
+>    (`handlers_exec.rs`/`handlers_session.rs`), not the literal `"unknown"`.
+> 5. macOS-safe socket-path fallback in `shoal-mcp` matching `shoal-kernel`.
+> 6. Elision on the `render`/`content[0].text` fields.
+>
+> Language-surface staleness has also been corrected: `.feed`, interpreter blocks (`python { }` /
+> `jq { }` / …), and reactive streams/channels are **implemented** (see §6). The remaining genuinely-open
+> gaps this card documents (dead `capture`/`timeout` params, unexposed `elide` budgets,
+> `shoal_journal`'s `until`/`effects` schema mismatch, the narrow `value.get` path grammar,
+> `shoal_cap_request`'s unused `effects`, `complete`/`explain` being un-dispatched, background exec via
+> MCP, and real OS-level sandbox enforcement) are still open — a one-line probe beats trusting any banner.
 
 ---
 
@@ -766,22 +774,22 @@ pins it — just verify empirically if you hit an edge).
 ## 6. Implementation status — what works, what to skip
 
 Stated plainly so you never waste a turn. **This card was first written against an early build and
-over-reported "not implemented"** — the `.feed`, interpreter-block, and stream/channel entries below
-were verified working against the current binary and are now marked accordingly. The genuinely-missing
-items (MCP resources P1, background exec via MCP, per-call elision tuning, `complete`/`explain`, real
-OS sandboxing) remain flagged. When in doubt, run a one-line probe rather than trusting a stale banner.
+over-reported "not implemented"** — `.feed`, interpreter blocks, streams/channels, and all six MCP
+`(P1)` items were verified working against the current source and are now marked done. The
+genuinely-still-missing items are: background/async exec via MCP, per-call elision tuning, `capture`/
+`timeout` on `shoal_exec`, `complete`/`explain`, and real OS-level sandbox enforcement. When in doubt,
+run a one-line probe rather than trusting a stale banner.
 
-- **(P1 — check before assuming still true) The MCP `resources/*`/events subsystem.** At authoring
-  time there was no `resources/list`, `resources/read`, `resources/subscribe`, or
-  `notifications/resources/updated` — `crates/shoal-mcp/src/lib.rs`'s `handle()` dispatched exactly
-  `initialize`, `ping`, `tools/list`, `tools/call`. This is one of the six named P1 additions (§0.8) —
-  call `resources/list` once to find out whether it's live in the build you're talking to. Until
-  confirmed, keep hand-translating any `shoal://...` uri to a `shoal_get` call (§0.2, §4 rule 15).
-- **(P1 — check before assuming still true) `shoal_cancel`.** At authoring time it did not exist as
-  an MCP tool — the kernel's `task.list`/`task.await`/`task.cancel` were reachable only over raw
-  JSON-RPC (and `task.suspend` always errors, unimplemented even there). This is one of the six named
-  P1 additions (§0.7) — check `tools/list`'s output for a seventh tool before assuming it's absent.
-  Even if present, see the next bullet: it may have nothing to act on.
+- **DONE — The MCP `resources/*`/events subsystem.** `crates/shoal-mcp/src/lib.rs`'s `handle()` now
+  dispatches `resources/list`/`read`/`subscribe`/`unsubscribe`, and `initialize` advertises
+  `capabilities.resources.subscribe = true`; event notifications forward as
+  `notifications/resources/updated` (`client.rs::run_event_forwarder`). Use `resources/read` on a
+  `shoal://…` uri to drill into an elided value directly — the `shoal_get`+manual-URI translation
+  (§0.2, §4 rule 15) is now just a fallback. Confirmed by the live e2e test
+  `crates/shoal-mcp/tests/live_kernel.rs`.
+- **DONE — `shoal_cancel`.** Present in `tools()` (seven tools now). Note `task.suspend` still errors
+  (unimplemented even over raw JSON-RPC), and creating a cancellable task still needs the
+  background-exec path below, which is *not* yet wired through MCP.
 - **Background/async execution via MCP is still presumed missing** (not one of the six named P1
   fixes) — the kernel's `exec` supports an `async`/`background` flag that spawns a trackable task,
   but as of authoring `shoal_exec`'s MCP schema never forwarded it. Confirm the schema directly
