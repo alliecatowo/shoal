@@ -416,6 +416,10 @@ impl Evaluator {
                 ".feed's argument must be a command, not {}",
                 expr_noun(other)
             ))
+            .with_hint(
+                "for a command with arguments, wrap it in a block: \
+                 `.feed(sh { cmd args })` or `.feed(jq { … })` / `.feed(python { … })`",
+            )
             .with_span(span)),
         }
     }

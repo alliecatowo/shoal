@@ -30,3 +30,24 @@ value = "[1, 2, 3]"
 name = "iofeed2-record-feeds-as-compact-json-and-reparses"
 src = "{n: 5}.feed(cat).out"
 value = "{n: 5}"
+
+# `.feed(cmd args)` with a bare arg-bearing command doesn't parse as a command
+# (feed is bidirectional, so the arg is ambiguous value-vs-command); the error
+# points at the unambiguous block form. Feeding a bare no-arg command, or any
+# block form, works. See crates/shoal-eval/src/expr_access.rs::eval_feed.
+
+[[case]]
+name = "feed-bare-command-no-args-works"
+src = '["b", "a", "c"].feed(sh { sort }).out.trim()'
+value = '"a\nb\nc"'
+
+[[case]]
+name = "feed-block-form-with-args-works"
+src = '["b", "a", "c"].feed(sh { sort -r }).out.trim()'
+value = '"c\nb\na"'
+
+[[case]]
+name = "feed-arg-bearing-bare-command-errors-with-block-hint"
+src = '["b", "a", "c"].feed(sort - r)'
+error = "type_error"
+error_contains = "sh { cmd args }"
