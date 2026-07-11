@@ -1,0 +1,55 @@
+# Stream method-surface hardening beyond streams.toml/streams-more.toml/
+# streams-3.toml: `.save`/`.append` (STREAMS §4's own per-item live-logging
+# sink, distinct from the collection-method `.save`/`.append` on a plain
+# `str`/`bytes` value) and the "everything else materializes then
+# dispatches" fallthrough path (`methods/stream.rs`'s own comment: "`.sort`,
+# `.sum`, `.uniq`, `.first`, `.len`, `.tee`, …") exercised on methods not yet
+# proven through a stream receiver anywhere else (`.chunks`/`.group`/`.uniq`/
+# `.join`/`.reverse`).
+
+[[case]]
+name = "streamsink-save-writes-one-line-per-item"
+src = '''
+[1, 2, 3].stream().save("out.txt")
+(cat out.txt).out.str()
+'''
+value = '"1\n2\n3\n"'
+
+[[case]]
+name = "streamsink-append-accumulates-across-two-streams"
+src = '''
+["a"].stream().save("out.txt")
+["b"].stream().append("out.txt")
+(cat out.txt).out.str()
+'''
+value = '"a\nb\n"'
+
+[[case]]
+name = "streamsink-fallthrough-chunks"
+src = "[1, 2, 3, 4].stream().chunks(2)"
+value = "[[1, 2], [3, 4]]"
+
+[[case]]
+name = "streamsink-fallthrough-group"
+src = "[1, 1, 2].stream().group(x => x)"
+value = "[{key: 1, values: [1, 1]}, {key: 2, values: [2]}]"
+
+[[case]]
+name = "streamsink-fallthrough-uniq-preserves-first-occurrence"
+src = "[3, 1, 3, 2].stream().uniq()"
+value = "[3, 1, 2]"
+
+[[case]]
+name = "streamsink-fallthrough-join"
+src = '["a", "b"].stream().join(",")'
+value = '"a,b"'
+
+[[case]]
+name = "streamsink-fallthrough-reverse"
+src = "[1, 2, 3].stream().reverse()"
+value = "[3, 2, 1]"
+
+[[case]]
+name = "streamsink-fallthrough-min-max"
+src = "[3, 1, 2].stream().min()"
+value = "1"

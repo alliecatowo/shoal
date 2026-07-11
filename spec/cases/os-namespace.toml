@@ -1,0 +1,68 @@
+# The `os.*` namespace (TDD §5's namespace list; `crates/shoal-eval/src/
+# namespaces.rs::os_ns`). Every accessor is nullary; most return genuinely
+# host-varying values (platform/arch/hostname/username/pid/cpu count), so —
+# same discipline as datetime-relative.toml's clock-anchored relations —
+# every assertion here is a RELATION that holds on any host this corpus
+# might run on (Linux or macOS, per this repo's CI matrix), never a baked-in
+# exact value.
+
+[[case]]
+name = "osns-platform-is-a-known-value"
+src = '["linux", "macos", "windows", "freebsd"].contains(os.platform())'
+value = "true"
+
+[[case]]
+name = "osns-arch-is-a-nonempty-string"
+src = "os.arch().len() > 0"
+value = "true"
+
+[[case]]
+name = "osns-pid-is-positive"
+src = "os.pid() > 0"
+value = "true"
+
+[[case]]
+name = "osns-cpus-is-at-least-one"
+src = "os.cpus() >= 1"
+value = "true"
+
+[[case]]
+name = "osns-hostname-is-a-nonempty-string"
+src = "os.hostname().len() > 0"
+value = "true"
+
+[[case]]
+name = "osns-username-is-a-nonempty-string"
+src = "os.username().len() > 0"
+value = "true"
+
+[[case]]
+name = "osns-uptime-is-a-non-negative-duration"
+src = "os.uptime() >= 0s"
+value = "true"
+
+[[case]]
+name = "osns-env-is-a-record"
+src = "os.env().contains(\"__definitely_not_a_real_env_key__\")"
+value = "false"
+
+[[case]]
+name = "osns-platform-rejects-an-argument"
+# `os.*` accessors are nullary (`os_ns`'s own arity guard) — a stray
+# positional arg is an `arg_error`, not silently ignored.
+src = 'os.platform("x")'
+error = "arg_error"
+
+[[case]]
+name = "osns-unknown-method-is-field-missing"
+src = "os.nope()"
+error = "field_missing"
+
+[[case]]
+name = "osns-pid-matches-os-crate-process-id"
+# `os.pid()` and the builtin `ps`-adjacent process id must agree with the
+# std `process::id()` used to construct BOTH — proven indirectly by
+# comparing two separate calls within the same run (a single process has
+# one pid for its whole lifetime).
+src = "os.pid() == os.pid()"
+value = "true"

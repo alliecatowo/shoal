@@ -1,0 +1,120 @@
+# Type-pattern (`type IDENT`) coverage beyond match.toml/match-more.toml's
+# int/str/bool/float/null pass: the rest of `is_type_name`'s recognized set
+# (`crates/shoal-syntax/src/parser/pattern.rs`) — `path`/`size`/`duration`/
+# `datetime`/`time`/`list`/`record`/`table`/`range`/`bytes`/`glob`/`regex` —
+# proving `pattern_matches`'s `Pattern::Type` arm (a plain
+# `v.type_name() == ty.name` runtime check) dispatches correctly for every
+# one, plus the mismatch direction (a value of some OTHER type never matches).
+#
+# Parser-gap note (found while authoring this file, same family as match-
+# more.toml's documented guard/lambda conflict): `match EXPR { … }` where
+# `EXPR`'s own postfix chain (a call OR a bare field access) sits directly
+# against the `{` hits the trailing-block-sugar grammar (`postfix = primary {
+# "." IDENT [call] [trailing] | … }`, TDD §3.4's `f(a) { … }` row) — the
+# parser attaches the match's own `{ }` to the scrutinee as a trailing-block
+# argument instead of treating it as the match body, so both `match
+# path("a.txt") { path p => … }` and `match x.out { table t => … }` are
+# parse errors ("expected `{`"/similar). Every scrutinee below whose postfix
+# chain would otherwise sit flush against the match body's `{` is therefore
+# either bound to a `let` first, or wrapped in an extra `( … )` — sidestepping
+# the ambiguity entirely (never a workaround for the pattern semantics under
+# test, which only start once the match itself parses).
+
+[[case]]
+name = "matchtype2-path-matches-and-binds"
+src = '''
+let x = path("a.txt")
+match x { path p => "path:{p}"; _ => "other" }
+'''
+value = '"path:a.txt"'
+
+[[case]]
+name = "matchtype2-path-mismatch-falls-through"
+src = 'match 5 { path p => "path"; _ => "notpath" }'
+value = '"notpath"'
+
+[[case]]
+name = "matchtype2-size-matches-and-binds"
+src = 'match 5kb { size s => "size:{s}"; _ => "other" }'
+value = '"size:5kb"'
+
+[[case]]
+name = "matchtype2-size-mismatch-falls-through"
+src = 'match 5 { size s => "size"; _ => "notsize" }'
+value = '"notsize"'
+
+[[case]]
+name = "matchtype2-duration-matches-and-binds"
+src = 'match 5s { duration d => "dur:{d}"; _ => "other" }'
+value = '"dur:5s"'
+
+[[case]]
+name = "matchtype2-datetime-matches-and-binds"
+src = 'match t"2026-07-09T00:00Z" { datetime d => "dt:{d}"; _ => "other" }'
+value = '"dt:2026-07-09T00:00:00Z"'
+
+[[case]]
+name = "matchtype2-time-matches-and-binds"
+src = "match 10:30am { time t => \"time:{t}\"; _ => \"other\" }"
+value = '"time:10:30"'
+
+[[case]]
+name = "matchtype2-list-matches-and-binds"
+src = "match [1, 2] { list l => \"list:{l}\"; _ => \"other\" }"
+value = '"list:[1, 2]"'
+
+[[case]]
+name = "matchtype2-list-mismatch-falls-through-on-record"
+src = "match {a: 1} { list l => \"list\"; _ => \"notlist\" }"
+value = '"notlist"'
+
+[[case]]
+name = "matchtype2-record-matches-and-binds"
+src = "match {a: 1} { record r => \"rec:{r}\"; _ => \"other\" }"
+value = '"rec:{a: 1}"'
+
+[[case]]
+name = "matchtype2-range-matches-and-binds"
+src = "match (1..3) { range r => \"range:{r}\"; _ => \"other\" }"
+value = '"range:1..3"'
+
+[[case]]
+name = "matchtype2-bytes-matches-and-binds"
+src = '''
+let b = sh { printf hi }.stdout
+match b { bytes x => "bytes:{x.len()}"; _ => "other" }
+'''
+value = '"bytes:2"'
+
+[[case]]
+name = "matchtype2-glob-matches-and-binds"
+src = '''
+let g = glob("*.txt")
+match g { glob x => "glob:{x}"; _ => "other" }
+'''
+value = '"glob:*.txt"'
+
+[[case]]
+name = "matchtype2-regex-matches-and-binds"
+src = '''
+let r = re"[0-9]+"
+match r { regex x => "matched"; _ => "other" }
+'''
+value = '"matched"'
+
+[[case]]
+name = "matchtype2-table-matches-a-real-ls-table"
+fixture = ["a.txt"]
+src = '''
+let x = ls
+match (x.out) { table t => t.len(); _ => -1 }
+'''
+value = "1"
+
+[[case]]
+name = "matchtype2-first-matching-arm-wins-over-later-type-arm"
+# Both `int`/`float` type patterns admit a scrutinee of exactly one of
+# them; arms are tried top-to-bottom, so listing `float` first for an `int`
+# scrutinee simply never fires (the FIRST admitting arm always wins).
+src = 'match 5 { float f => "float"; int n => "int:{n}"; _ => "other" }'
+value = '"int:5"'

@@ -1,0 +1,42 @@
+# A handful of small, deterministic compositional cases not yet covered
+# elsewhere: `.str()`'s receiver-type boundary on a plain `int` (only
+# `str`/`path`/`bytes` have an arm in `strops::to_str` — CONTRACTS §3 never
+# lists `int -> str` as an implicit conversion; `str_interp`/`+` concat need
+# an explicit `.str()` cast, and this is the type-error you get for
+# forgetting one on a non-castable type), a record's `.values()` feeding
+# `.flatten()`, and a `.sort_by` result immediately `.reverse()`d (descending
+# via ascending-then-flip, distinct from list2-sort-by-descending-key's
+# negated-key approach in list-methods-2.toml).
+
+[[case]]
+name = "misc-int-str-method-is-type-error"
+src = "(5).str()"
+error = "type_error"
+
+[[case]]
+name = "misc-record-values-then-flatten"
+src = "{a: [1, 2], b: [3, 4]}.values().flatten()"
+value = "[1, 2, 3, 4]"
+
+[[case]]
+name = "misc-sort-by-then-reverse-is-descending"
+src = '["bb", "a", "ccc"].sort_by(s => s.len()).reverse()'
+value = '["ccc", "bb", "a"]'
+
+[[case]]
+name = "misc-split-map-upper-join-pipeline"
+src = '''
+let s = "hello world"
+s.split(" ").map(w => w.upper()).join("-")
+'''
+value = '"HELLO-WORLD"'
+
+[[case]]
+name = "misc-string-concatenation-chain"
+src = '"a" + "b" + "c"'
+value = '"abc"'
+
+[[case]]
+name = "misc-nested-map-where-sum-pipeline"
+src = "[1, 2, 3].map(x => x * x).where(x => x > 3).sum()"
+value = "13"

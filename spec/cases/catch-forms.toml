@@ -1,0 +1,66 @@
+# `catch` hardening beyond operators.toml's first pass (which covers the
+# bound-name postfix form on a `div_zero`, its no-error passthrough, and the
+# `try`/`catch` block form's error-binding + no-error-yields-block-value
+# cases): recovering from error CODES other than `div_zero` (`index_range`,
+# `field_missing`, an outcome's `cmd_failed`, `assert_failed`), the
+# unbound-block `try { } catch { }` form when an error DOES occur (its
+# sibling case only exercises the no-error path), and a recovered value
+# feeding straight into further arithmetic/method calls in the same
+# expression.
+#
+# Parser-gap note (found while authoring this file): `catch`'s optional
+# `[IDENT]` binder is genuinely ambiguous with a bare `true`/`false` HANDLER
+# expression, because `true`/`false` lex as plain `Ident` tokens (match-
+# pattern.rs's own literal-arm comment: "`Tok::Ident(x) if x == \"true\" ||
+# x == \"false\"`") — `catch true` parses `true` as the bound error name,
+# then expects a handler expression and hits EOF/newline instead. Every
+# handler below is therefore a non-bool literal, a string, a list, or a
+# method-chain result — never a bare `true`/`false`.
+
+[[case]]
+name = "catchforms-recovers-index-range-error"
+src = 'try { [1][5] } catch e { "idx" }'
+value = '"idx"'
+
+[[case]]
+name = "catchforms-recovers-field-missing-error"
+src = '''
+let x = try { {a: 1}.b } catch { -1 }
+x
+'''
+value = "-1"
+
+[[case]]
+name = "catchforms-recovers-outcome-cmd-failed"
+src = '''
+let r = (sh -c "exit 3")
+(r.out) catch "recovered-outcome"
+'''
+value = '"recovered-outcome"'
+
+[[case]]
+name = "catchforms-recovers-assert-failed"
+src = "assert(false) catch 5"
+value = "5"
+
+[[case]]
+name = "catchforms-recovered-value-feeds-arithmetic"
+src = "1 + ((1 / 0) catch 5)"
+value = "6"
+
+[[case]]
+name = "catchforms-recovered-value-feeds-a-method-chain"
+src = "((1 / 0) catch [1, 2, 3]).len()"
+value = "3"
+
+[[case]]
+name = "catchforms-unbound-try-catch-block-recovers-div-zero"
+src = 'try { 1 / 0 } catch { "recovered" }'
+value = '"recovered"'
+
+[[case]]
+name = "catchforms-passthrough-unaffected-by-handler-type"
+# No error occurs, so the handler (a different type from the body's result)
+# is never evaluated or type-checked against it.
+src = '(5).abs() catch [1, 2, 3]'
+value = "5"

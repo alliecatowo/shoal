@@ -1,0 +1,82 @@
+# The typed-error boundaries of the shared list/record method surface not
+# yet exercised anywhere else: `int_arg`'s non-negative guard (shared by
+# `.take`/`.skip`/`.chunks`/`.tee`), `.get`'s exact receiver+key type
+# contract (only `record+str` or `list+int` are admitted — `table`/`list+str`
+# /`record+int` all fall through to the same message), `.zip`/`.join`'s
+# element-type checks, `.sort`'s cross-type comparison failure, `.contains`'s
+# key-type checks on `str`/`record` receivers, and `.min`/`.max` on an empty
+# collection (null, not an error).
+
+[[case]]
+name = "lrerr-take-negative-is-type-error"
+src = "[1, 2, 3].take(-1)"
+error = "type_error"
+
+[[case]]
+name = "lrerr-skip-negative-is-type-error"
+src = "[1, 2, 3].skip(-1)"
+error = "type_error"
+
+[[case]]
+name = "lrerr-chunks-negative-is-type-error"
+src = "[1, 2, 3].chunks(-1)"
+error = "type_error"
+
+[[case]]
+name = "lrerr-tee-negative-is-type-error"
+src = "[1, 2, 3].tee(-1)"
+error = "type_error"
+
+[[case]]
+name = "lrerr-get-list-with-str-key-is-type-error"
+src = '[1, 2].get("a", 0)'
+error = "type_error"
+
+[[case]]
+name = "lrerr-get-record-with-int-key-is-type-error"
+src = "{a: 1}.get(0, 9)"
+error = "type_error"
+
+[[case]]
+name = "lrerr-get-table-is-type-error"
+# `.get` admits exactly `record+str` or `list+int` — a `table` receiver
+# (`ls`'s structured output) has no arm of its own, unlike the seq()-backed
+# methods that treat a table as a list-of-records.
+fixture = ["a.txt"]
+src = 'ls.get(0, 9)'
+error = "type_error"
+
+[[case]]
+name = "lrerr-zip-non-collection-argument-is-type-error"
+src = "[1, 2].zip(5)"
+error = "type_error"
+
+[[case]]
+name = "lrerr-join-non-str-element-is-type-error"
+src = "[1, 2].join(\",\")"
+error = "type_error"
+
+[[case]]
+name = "lrerr-sort-cross-type-elements-is-type-error"
+src = '[1, "a"].sort()'
+error = "type_error"
+
+[[case]]
+name = "lrerr-string-contains-non-str-needle-is-type-error"
+src = '"abc".contains(1)'
+error = "type_error"
+
+[[case]]
+name = "lrerr-record-contains-non-str-key-is-type-error"
+src = "{a: 1}.contains(1)"
+error = "type_error"
+
+[[case]]
+name = "lrerr-min-on-empty-list-is-null"
+src = "let x = [].min()\nx == null"
+value = "true"
+
+[[case]]
+name = "lrerr-max-on-empty-list-is-null"
+src = "let x = [].max()\nx == null"
+value = "true"

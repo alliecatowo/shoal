@@ -1,0 +1,46 @@
+# Further size/duration render hardening beyond size-duration-more.toml:
+# CONTRACTS §3's "largest decimal unit with integer part >= 1" rule at the
+# `tb` ceiling, the compound duration render's multi-part form spanning
+# `w`/`d` and `d`/`h`/`m`/`s` simultaneously, the exact-boundary rollover
+# from `999b` to `1kb`, and the render-vs-value distinction for a size that
+# rolls all the way up from a sub-second-duration-shaped addition.
+
+[[case]]
+name = "sizedur2-tb-render-from-a-bytes-literal"
+src = "1099511627776b"
+value = "1.1tb"
+
+[[case]]
+name = "sizedur2-compound-render-weeks-and-days"
+src = "1w + 2d"
+value = "1w2d"
+
+[[case]]
+name = "sizedur2-compound-render-days-hours-minutes-seconds"
+src = "2d + 3h + 4m + 5s"
+value = "2d3h4m5s"
+
+[[case]]
+name = "sizedur2-gb-render-from-mb-literal"
+src = "1500mb"
+value = "1.5gb"
+
+[[case]]
+name = "sizedur2-seconds-rollover-to-hours-and-days"
+src = "90000s"
+value = "1d1h"
+
+[[case]]
+name = "sizedur2-byte-boundary-rolls-over-to-kb"
+src = "1000b"
+value = "1kb"
+
+[[case]]
+name = "sizedur2-byte-boundary-just-under-stays-bytes"
+src = "999b"
+value = "999b"
+
+[[case]]
+name = "sizedur2-duration-addition-chain-renders-compound"
+src = "(1h + 30m) + 30m"
+value = "2h"

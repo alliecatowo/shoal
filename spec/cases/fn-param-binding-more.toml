@@ -1,0 +1,47 @@
+# Further `fn` parameter-binding hardening beyond coercion.toml's word-bind-*
+# pass and desugar.toml's flag-binding rows: a default value (`param = expr`,
+# TDD §3.2's `param` grammar row) actually taking effect when the argument
+# is omitted, a positional argument overriding that same default, a NAMED
+# argument overriding a default while a sibling default stays in effect, a
+# `list<str>` variadic tail (desugar.toml/coercion.toml only exercise
+# `list<int>`), and named-before-positional binding order (a named arg fills
+# its slot first; a later bare positional fills the next still-unbound
+# parameter in declaration order, not literal source order).
+
+[[case]]
+name = "fnbind-default-value-used-when-omitted"
+src = "fn f(x: int = 7) { x }\nf()"
+value = "7"
+
+[[case]]
+name = "fnbind-default-value-overridden-by-positional"
+src = "fn f(x: int = 7) { x }\nf 3"
+value = "3"
+
+[[case]]
+name = "fnbind-named-arg-overrides-one-default-sibling-default-stays"
+src = "fn f(x: int = 7, y: int = 1) { x + y }\nf(y: 2)"
+value = "9"
+
+[[case]]
+name = "fnbind-positional-overrides-default-sibling-default-stays"
+src = "fn f(a: int, b: int = 100) { a + b }\nf(5)"
+value = "105"
+
+[[case]]
+name = "fnbind-variadic-list-str-accumulates-count"
+src = "fn f(...xs: list<str>) { xs.len() }\nf a b c"
+value = "3"
+
+[[case]]
+name = "fnbind-variadic-list-str-preserves-order"
+src = "fn f(...xs: list<str>) { xs }\nf a b c"
+value = '["a", "b", "c"]'
+
+[[case]]
+name = "fnbind-named-before-positional-binding-order"
+# `b` is bound by name first; the remaining bare positional `2` fills the
+# next still-unbound parameter in DECLARATION order (`a`), not literal
+# left-to-right source order.
+src = "fn f(a: int, b: int) { a + b }\nf(b: 1, 2)"
+value = "3"

@@ -1,0 +1,147 @@
+# The `bytes` value type (TDD §4.1's type list; produced by an outcome's raw
+# `.stdout`/`.stderr` fields — CONTRACTS §3 doesn't special-case it, so a
+# `sh { }` block's stdout, read via `.stdout` rather than the lazily-parsed
+# `.out`, is the deterministic, host-safe way to get a real `Value::Bytes` in
+# a conformance case). Exercises the receiver-type boundary across the
+# shared method surface (`.len`/`.str`/`.display`/`.json`/`.save`/`.stream`/
+# `.is_empty`), structural equality, and the methods that do NOT admit a
+# `bytes` receiver (`.first`/`.contains`/`.reverse`/`.upper` — none of
+# `seq()`'s or `string_unary`'s match arms include `Value::Bytes`).
+
+[[case]]
+name = "bytes-len-counts-raw-bytes"
+src = '''
+let b = sh { printf hi }.stdout
+b.len()
+'''
+value = "2"
+
+[[case]]
+name = "bytes-count-is-an-alias-for-len"
+src = '''
+let b = sh { printf hi }.stdout
+b.count()
+'''
+value = "2"
+
+[[case]]
+name = "bytes-is-empty-true-on-empty-stdout"
+src = '''
+let b = sh { }.stdout
+b.is_empty()
+'''
+value = "true"
+
+[[case]]
+name = "bytes-is-empty-false-on-nonempty-stdout"
+src = '''
+let b = sh { printf hi }.stdout
+b.is_empty()
+'''
+value = "false"
+
+[[case]]
+name = "bytes-str-decodes-valid-utf8"
+src = '''
+let b = sh { printf hi }.stdout
+b.str()
+'''
+value = '"hi"'
+
+[[case]]
+name = "bytes-str-on-invalid-utf8-is-utf8-error"
+# A lone 0xFF byte (octal \377) is never a valid UTF-8 lead byte on its own.
+src = '''
+let b = sh { printf '\377' }.stdout
+b.str()
+'''
+error = "utf8_error"
+
+[[case]]
+name = "bytes-display-is-lossy-on-invalid-utf8"
+# `.display()` never errors — invalid sequences become the replacement char.
+src = '''
+let b = sh { printf '\377' }.stdout
+b.display()
+'''
+value = '"�"'
+
+[[case]]
+name = "bytes-structural-equality-same-content"
+src = '''
+let a = sh { printf hi }.stdout
+let b = sh { printf hi }.stdout
+a == b
+'''
+value = "true"
+
+[[case]]
+name = "bytes-structural-equality-different-content"
+src = '''
+let a = sh { printf hi }.stdout
+let b = sh { printf bye }.stdout
+a == b
+'''
+value = "false"
+
+[[case]]
+name = "bytes-first-is-type-error"
+# `Value::Bytes` has no arm in `methods/list.rs::seq` — it is never itself a
+# collection to slice, unlike `str`/`list`/`table`/`range`.
+src = '''
+let b = sh { printf hi }.stdout
+b.first()
+'''
+error = "type_error"
+
+[[case]]
+name = "bytes-contains-is-type-error"
+src = '''
+let b = sh { printf hi }.stdout
+b.contains("h")
+'''
+error = "type_error"
+
+[[case]]
+name = "bytes-reverse-is-type-error"
+# `.reverse()`'s only non-`seq` special case is `str`; bytes falls through to
+# `seq()`, which has no `Bytes` arm.
+src = '''
+let b = sh { printf hi }.stdout
+b.reverse()
+'''
+error = "type_error"
+
+[[case]]
+name = "bytes-upper-is-type-error"
+# `string_unary` (backing `.upper`/`.lower`/`.trim`) only admits `Value::Str`.
+src = '''
+let b = sh { printf hi }.stdout
+b.upper()
+'''
+error = "type_error"
+
+[[case]]
+name = "bytes-save-writes-raw-bytes-to-a-file"
+src = '''
+let b = sh { printf hi }.stdout
+b.save("out.txt")
+(cat out.txt).out.str()
+'''
+value = '"hi"'
+
+[[case]]
+name = "bytes-stream-splits-into-lines"
+src = '''
+let b = sh { printf "a\nb" }.stdout
+b.stream().collect()
+'''
+value = '["a", "b"]'
+
+[[case]]
+name = "bytes-json-serializes-as-a-lossy-json-string"
+src = '''
+let b = sh { printf hi }.stdout
+b.json()
+'''
+value = '"\"hi\""'

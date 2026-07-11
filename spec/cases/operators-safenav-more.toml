@@ -1,0 +1,34 @@
+# Further `?.` (safe-navigation) hardening beyond operators.toml/
+# operators-3.toml's field-chain pass: `?.` short-circuiting a METHOD CALL's
+# arguments entirely (never evaluated, mirroring `??`'s own "does not
+# evaluate rhs" case for `op-coalesce-does-not-evaluate-rhs-on-value`) when
+# the receiver is `null`, and a non-null receiver's safe-nav method call
+# chaining into a further plain (non-safe) method call.
+
+[[case]]
+name = "safenav2-method-call-args-never-evaluated-when-null"
+# `1 / 0` inside the argument list would raise `div_zero` if evaluated; `?.`
+# short-circuits before the call (and its arguments) are ever reached.
+src = '''
+let x = null
+let y = x?.foo(1 / 0)
+y == null
+'''
+value = "true"
+
+[[case]]
+name = "safenav2-nonnull-method-call-chains-into-plain-method"
+src = '''
+let x = {a: 5}
+x?.a?.abs()
+'''
+value = "5"
+
+[[case]]
+name = "safenav2-null-result-falls-through-coalesce"
+# `?.` on a `null` receiver yields `null`, which `??` then substitutes for.
+src = '''
+let x = null
+x?.a ?? 99
+'''
+value = "99"

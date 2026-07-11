@@ -1,0 +1,77 @@
+# Calendar-component field access on `datetime` (`crates/shoal-eval/src/
+# expr_access.rs::field`'s `Value::DateTime` arm: `.year`/`.month`/`.day`/
+# `.hour`/`.minute`/`.second`) and the `duration` relative-anchor fields
+# (`.ago`/`.from_now`, backing the TDD §2.1 relative-anchor sugar) — neither
+# is exercised anywhere else in the corpus (datetime-relative.toml only
+# calls `.ago`/`.from_now` on a literal duration in a relation-based
+# assertion, never checking the field-access boundary itself), plus the
+# `field_missing` edges for both types (an unknown field on either).
+
+[[case]]
+name = "dtfield-year"
+src = 't"2026-07-09T14:30:45Z".year'
+value = "2026"
+
+[[case]]
+name = "dtfield-month"
+src = 't"2026-07-09T14:30:45Z".month'
+value = "7"
+
+[[case]]
+name = "dtfield-day"
+src = 't"2026-07-09T14:30:45Z".day'
+value = "9"
+
+[[case]]
+name = "dtfield-hour"
+src = 't"2026-07-09T14:30:45Z".hour'
+value = "14"
+
+[[case]]
+name = "dtfield-minute"
+src = 't"2026-07-09T14:30:45Z".minute'
+value = "30"
+
+[[case]]
+name = "dtfield-second"
+src = 't"2026-07-09T14:30:45Z".second'
+value = "45"
+
+[[case]]
+name = "dtfield-midnight-hour-minute-second-are-zero"
+src = 't"2026-01-01T00:00:00Z".hour + t"2026-01-01T00:00:00Z".minute + t"2026-01-01T00:00:00Z".second'
+value = "0"
+
+[[case]]
+name = "dtfield-unknown-field-is-field-missing"
+src = 't"2026-07-09T00:00Z".nope'
+error = "field_missing"
+
+[[case]]
+name = "dtfield-sum-of-components-via-field-chain"
+src = '''
+let d = t"2026-07-09T14:30:45Z"
+d.year + d.month + d.day
+'''
+value = "2042"
+
+[[case]]
+name = "durfield-unknown-field-is-field-missing"
+src = "5s.nope"
+error = "field_missing"
+
+[[case]]
+name = "durfield-ago-on-bound-variable-is-before-now"
+src = '''
+let d = 3s
+d.ago < now
+'''
+value = "true"
+
+[[case]]
+name = "durfield-from-now-on-bound-variable-is-after-now"
+src = '''
+let d = 3s
+d.from_now > now
+'''
+value = "true"

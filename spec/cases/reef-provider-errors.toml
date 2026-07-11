@@ -1,0 +1,45 @@
+# `reef_provider` (CONTRACTS §4's pinned reef code family; reef.toml's own
+# header notes most of REEF.md's real-provider surface is host-dependent and
+# `skip`s it) — but `reef add <tool>@<version>`'s manifest-mutation path
+# (`crates/shoal-eval/src/reef_builtins.rs::reef_add`) hits `reef_provider`
+# on two purely textual, deterministic, host-safe conditions: a malformed
+# TOML manifest already on disk, and a manifest whose `[tools]` key exists
+# but isn't itself a table. Neither depends on any real tool inventory.
+
+[[case]]
+name = "reefprovider-add-with-malformed-existing-manifest"
+src = '''
+"not valid toml [[[".save(".reef.toml")
+reef add sometool@1.0
+'''
+error = "reef_provider"
+error_contains = "parsing manifest"
+
+[[case]]
+name = "reefprovider-add-with-non-table-tools-key"
+src = '''
+"tools = 5".save(".reef.toml")
+reef add sometool@1.0
+'''
+error = "reef_provider"
+error_contains = "not a table"
+
+[[case]]
+name = "reefprovider-add-requires-a-tool-at-version-spec"
+src = "reef add"
+error = "arg_error"
+
+[[case]]
+name = "reefprovider-add-rejects-a-spec-with-no-at-sign"
+src = "reef add sometoolnoversion"
+error = "arg_error"
+
+[[case]]
+name = "reefprovider-add-rejects-an-empty-version-after-at"
+src = "reef add sometool@"
+error = "arg_error"
+
+[[case]]
+name = "reefprovider-add-rejects-an-empty-tool-name-before-at"
+src = "reef add @1.0"
+error = "arg_error"
