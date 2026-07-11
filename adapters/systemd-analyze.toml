@@ -1,0 +1,21 @@
+# Linux/systemd only: like `systemctl`, there is no macOS equivalent of
+# systemd's boot-time accounting, so this adapter is intentionally not
+# portable and fails loudly with "command not found" on a machine without
+# systemd, the same honest failure mode as any other missing binary.
+[cmd.systemd-analyze]
+bin = "systemd-analyze"
+class = "cli"
+ok_codes = [0]
+
+# `blame` prints one "<time> <unit>" line per unit, sorted slowest-first,
+# with **no header row at all** — unlike `ps`/`df`, so the `cols` strategy
+# (which unconditionally discards a first line as header) would silently
+# eat the slowest real entry. `lines` is used instead: raw text, one entry
+# per line, not further destructured. `time` prints in a terse mixed form
+# (`1.234s`, `891ms`, `2min 3.456s`) that isn't uniformly one
+# `shoal_value::parse_duration`-recognized token, which is the other
+# reason a structured `{time, unit}` split isn't attempted here — this is
+# what the tool genuinely, uniformly yields.
+[cmd.systemd-analyze.sub.blame]
+invoke = ["blame"]
+output = { parse = "lines", type = "list<str>" }

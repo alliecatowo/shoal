@@ -870,6 +870,33 @@ impl Kernel {
                     data: Some(json!({"task":p.task})),
                 })
             }
+            // docs/ROADMAP.md R3: added alongside the pre-existing
+            // `task.suspend` above, honest in the same way — a kernel task is
+            // a Rust thread recursively calling back into `dispatch`, not a
+            // single tracked child process/group, so there is nothing here to
+            // send `SIGCONT` to yet. Real suspend/resume for a task's spawned
+            // children lands with the eval sibling's task-lifecycle methods
+            // (`.suspend()`/`.resume()`, R3); once a task's process handle is
+            // reachable from here, this stub becomes the real thing without
+            // changing the wire shape.
+            "task.resume" => {
+                let attachment = attached.as_ref().ok_or_else(not_attached)?;
+                let session = &attachment.session;
+                let p: TaskParams = decode(request.params)?;
+                let task = self.task(&p.task)?;
+                if task.session.id != session.id {
+                    return Err(RpcError {
+                        code: -32021,
+                        message: "unknown task ref".into(),
+                        data: None,
+                    });
+                }
+                Err(RpcError {
+                    code: -32020,
+                    message: "task resume is unavailable for evaluator-owned processes".into(),
+                    data: Some(json!({"task":p.task})),
+                })
+            }
             "plan.apply" => {
                 let attachment = attached.as_ref().ok_or_else(not_attached)?;
                 let session = &attachment.session;
@@ -3118,6 +3145,80 @@ mod tests {
         assert_eq!(
             bg["events"],
             format!("task.{}", bg["task"].as_str().unwrap())
+        );
+        drop(client);
+        drop(reader);
+        thread.join().unwrap();
+    }
+
+    /// docs/ROADMAP.md R3: `task.resume` exists alongside `task.suspend`,
+    /// wired the same honest way — never a silent no-op, always a clear
+    /// error until a task's process handle is actually reachable here.
+    #[test]
+    fn task_resume_wire_method_is_honest_and_symmetric_with_suspend() {
+        let kernel = Kernel::new();
+        let (mut client, mut reader, thread) = spawn(&kernel);
+        attach(&mut client, &mut reader);
+        let bg = call(
+            &mut client,
+            &mut reader,
+            2,
+            "exec",
+            json!({"src":"sh { sleep 0.05 }","background":true}),
+        )
+        .result
+        .unwrap();
+        let task = bg["task"].clone();
+
+        let resume = call(
+            &mut client,
+            &mut reader,
+            3,
+            "task.resume",
+            json!({"task": task}),
+        );
+        let error = resume.error.expect("task.resume is not yet implemented");
+        assert_eq!(error.code, -32020);
+        assert!(
+            error.message.contains("resume"),
+            "message: {}",
+            error.message
+        );
+
+        // Same shape as `task.suspend` for the same task.
+        let suspend = call(
+            &mut client,
+            &mut reader,
+            4,
+            "task.suspend",
+            json!({"task": task}),
+        );
+        assert_eq!(suspend.error.unwrap().code, -32020);
+
+        // An unknown task ref is rejected before the honest-stub error, for
+        // both methods.
+        let unknown = json!({"task": "task:999999"});
+        assert_eq!(
+            call(&mut client, &mut reader, 5, "task.resume", unknown.clone())
+                .error
+                .unwrap()
+                .code,
+            -32021
+        );
+        assert_eq!(
+            call(&mut client, &mut reader, 6, "task.suspend", unknown)
+                .error
+                .unwrap()
+                .code,
+            -32021
+        );
+
+        call(
+            &mut client,
+            &mut reader,
+            7,
+            "task.cancel",
+            json!({"task": task}),
         );
         drop(client);
         drop(reader);

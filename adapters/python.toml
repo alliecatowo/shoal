@@ -1,0 +1,18 @@
+# Interpreter-class adapter (IO.md §2.2): `python { BODY }` resolves the
+# head `python` through this adapter and, because `class = "interpreter"`,
+# lexes the trailing `{ }` as a raw payload (`Expr::LangBlock`) instead of a
+# trailing thunk. Evaluation hands the payload to `python3 -c BODY`
+# (`invoke = ["-c"]`, `invoke_payload` defaults to `"arg"` per IO.md §2.6
+# step 3) — effectively `python3 -c "$(cat <<'EOF' ... EOF)"` with none of
+# the quoting.
+#
+# The binary is pinned to `python3`, not the bare `python`: on stock macOS
+# and many Linux distributions `python` is either absent or still Python 2,
+# while `python3` is the one name POSIX/PEP 394 guarantee resolves to a
+# Python-3 interpreter on every platform shoal targets.
+[cmd.python]
+bin = "python3"
+class = "interpreter"
+invoke = ["-c"]
+ok_codes = [0]
+effects = ["fs.read(cwd)"]

@@ -1,0 +1,26 @@
+# Jujutsu (jj) — cross-platform (Rust binary, ships for Linux/macOS/
+# Windows). Structured (JSON/NUL-delimited) template output is a newer,
+# still-evolving part of jj's CLI surface across versions, so rather than
+# pin a custom `-T` template whose exact field names/stability can't be
+# verified here, these subs stick to jj's own stable, well-known built-in
+# behaviors and keep the output as raw text lines (`list<str>`, not
+# further destructured) — honest per TDD §6 rather than a fabricated
+# schema riding on an unverified template.
+[cmd.jj]
+bin = "jj"
+class = "cli"
+ok_codes = [0]
+effects = ["fs.read(cwd)"]
+
+[cmd.jj.sub.status]
+invoke = ["status", "--no-pager", "--color=never"]
+output = { parse = "lines", type = "list<str>" }
+effects = ["fs.read(cwd)"]
+
+[cmd.jj.sub.log]
+params = { limit = "int?", revisions = "str?" }
+positional = ["revisions"]
+flags = { short = { n = "limit", r = "revisions" } }
+invoke = ["log", "--no-graph", "--no-pager", "--color=never", "-T", "builtin_log_oneline"]
+output = { parse = "lines", type = "list<str>" }
+effects = ["fs.read(cwd)"]

@@ -119,7 +119,25 @@ impl Evaluator {
                 self.plan_expr(recv, functions, aliases, out, depth)?;
                 self.plan_expr(index, functions, aliases, out, depth)
             }
-            Expr::MethodCall { recv, args, .. } => {
+            Expr::MethodCall {
+                recv, name, args, ..
+            } => {
+                // `http.get/post/put/delete(url, …)` declares a `net.connect`
+                // effect for leash + plan (ROADMAP R2). The host is parsed from a
+                // literal URL argument; a non-literal URL declares an
+                // unknown-host connect (`*`).
+                if let Expr::Var { name: ns, .. } = &**recv
+                    && ns == "http"
+                    && matches!(name.as_str(), "get" | "post" | "put" | "delete")
+                {
+                    let (host, port) = args
+                        .pos
+                        .first()
+                        .and_then(url_literal)
+                        .map(|u| url_host_port(&u))
+                        .unwrap_or_else(|| ("*".into(), 443));
+                    push_effect(out, Effect::NetConnect { host, port });
+                }
                 self.plan_expr(recv, functions, aliases, out, depth)?;
                 for e in &args.pos {
                     self.plan_expr(e, functions, aliases, out, depth)?;
@@ -261,7 +279,7 @@ impl Evaluator {
             "which" => vec![Effect::EnvRead {
                 names: vec!["PATH".into()],
             }],
-            "ls" | "cat" | "stat" => vec![Effect::FsRead {
+            "ls" | "cat" | "stat" | "head" => vec![Effect::FsRead {
                 paths: if ps.is_empty() {
                     vec![self.cwd.clone()]
                 } else {
@@ -269,6 +287,9 @@ impl Evaluator {
                 },
             }],
             "mkdir" | "touch" => vec![Effect::FsWrite { paths: ps }],
+            "ln" => vec![Effect::FsWrite {
+                paths: ps.into_iter().skip(1).collect(),
+            }],
             "cp" => {
                 if ps.len() < 2 {
                     return Err(ErrorVal::arg_error("cp requires source and destination"));
@@ -432,5 +453,189 @@ fn parse_declared_effect(
 pub(crate) fn push_effect(out: &mut Vec<Effect>, effect: Effect) {
     if !out.contains(&effect) {
         out.push(effect)
+    }
+}
+
+/// The literal string value of an expression, if it is a plain string literal
+/// (for extracting a `net.connect` host from `http.get("https://…")`).
+fn url_literal(e: &Expr) -> Option<String> {
+    match e {
+        Expr::Str { value, .. } => Some(value.clone()),
+        _ => None,
+    }
+}
+
+/// Parse `host` and `port` from a URL for a `net.connect` effect. Defaults to the
+/// scheme port (443 for https, 80 otherwise) when the URL has no explicit port.
+fn url_host_port(url: &str) -> (String, u16) {
+    let default_port = if url.starts_with("https") { 443 } else { 80 };
+    let after_scheme = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
+    // Strip any userinfo (`user:pass@host`).
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    match host_port.rsplit_once(':') {
+        Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty() => {
+            (h.to_string(), p.parse().unwrap_or(default_port))
+        }
+        _ => (host_port.to_string(), default_port),
+    }
+}
+
+impl Evaluator {
+    /// `plan { … }` / `plan <cmd …>` (ROADMAP R3): derive and render the effect
+    /// plan without spawning or mutating. The derived program is stashed so a
+    /// later `apply <ref>` can run it; the returned record carries its `id`.
+    pub(crate) fn builtin_plan(&mut self, call: &CmdCall) -> VResult<Value> {
+        let program = self.plan_target_program(call)?;
+        let plan = self.plan_program(&program)?;
+        self.plans.push(program);
+        let id = self.plans.len() as i64;
+        Ok(plan_record(&plan, Some(id)))
+    }
+
+    /// `apply <ref>` (ROADMAP R3): run a previously-derived `plan { … }`. The ref
+    /// is the record `plan` returned (its `id` field) or a bare plan id int.
+    pub(crate) fn builtin_apply(&mut self, call: &CmdCall) -> VResult<Value> {
+        let vs = self.collect_cmd_values(call)?;
+        let id = match vs.first() {
+            Some(Value::Int(n)) => *n,
+            // A bare `apply 3` word arrives as a str; accept a numeric one.
+            Some(Value::Str(s)) if s.parse::<i64>().is_ok() => s.parse().unwrap(),
+            Some(Value::Record(r)) => match r.get("id") {
+                Some(Value::Int(n)) => *n,
+                _ => {
+                    return Err(ErrorVal::arg_error(
+                        "apply expects a plan reference (a `plan { … }` result or its id)",
+                    ));
+                }
+            },
+            _ => {
+                return Err(ErrorVal::arg_error(
+                    "apply expects a plan reference: `apply <plan>`",
+                ));
+            }
+        };
+        let idx = usize::try_from(id - 1)
+            .ok()
+            .filter(|i| *i < self.plans.len())
+            .ok_or_else(|| ErrorVal::new("not_found", format!("no plan #{id} to apply")))?;
+        let program = self.plans[idx].clone();
+        self.eval_program(&program)
+    }
+
+    /// `explain(src)` (ROADMAP R2/R3): parse a source string and render what it
+    /// would do — its effect plan — without running it.
+    pub(crate) fn builtin_explain(&mut self, call: &CmdCall) -> VResult<Value> {
+        let vs = self.collect_cmd_values(call)?;
+        let src = match vs.first() {
+            Some(Value::Str(s)) => s.clone(),
+            Some(Value::Path(p)) => p.to_string_lossy().into_owned(),
+            _ => return Err(ErrorVal::arg_error("explain expects a source string")),
+        };
+        let program =
+            shoal_syntax::parse(&src).map_err(|e| ErrorVal::new("parse_error", e.to_string()))?;
+        let plan = self.plan_program(&program)?;
+        let mut r = match plan_record(&plan, None) {
+            Value::Record(r) => r,
+            _ => Record::new(),
+        };
+        r.insert("source".into(), Value::Str(src));
+        Ok(Value::Record(r))
+    }
+
+    /// The program a `plan`/`apply` verb targets: a trailing `{ … }` block, or a
+    /// bare `plan rm x` command reconstructed from the remaining words.
+    fn plan_target_program(&self, call: &CmdCall) -> VResult<Program> {
+        if let Some(block) = &call.trailing {
+            return Ok(Program {
+                stmts: block.stmts.clone(),
+            });
+        }
+        let mut args = call.args.iter();
+        let head = args.next().and_then(cmd_arg_word).ok_or_else(|| {
+            ErrorVal::arg_error("plan expects a block `plan { … }` or a command `plan <cmd> …`")
+        })?;
+        let inner = CmdCall {
+            head,
+            forced: false,
+            args: args.cloned().collect(),
+            redirects: vec![],
+            env_prefix: vec![],
+            background: false,
+            trailing: None,
+            span: call.span,
+        };
+        Ok(Program {
+            stmts: vec![Stmt::Expr {
+                expr: Expr::Cmd {
+                    call: Box::new(inner),
+                    span: call.span,
+                },
+                span: call.span,
+            }],
+        })
+    }
+}
+
+/// The literal word text of a command argument (for `plan <cmd> …` head/args).
+fn cmd_arg_word(arg: &CmdArg) -> Option<String> {
+    match arg {
+        CmdArg::Word { text, .. } | CmdArg::Path { text, .. } => Some(text.clone()),
+        _ => None,
+    }
+}
+
+/// Render a derived [`Plan`] as a shoal record: `{id?, effects: [str], reversible,
+/// spawns}`. Human-readable and machine-usable (the `id` feeds `apply`).
+fn plan_record(plan: &Plan, id: Option<i64>) -> Value {
+    let effects: Vec<Value> = plan
+        .effects
+        .iter()
+        .map(|e| Value::Str(effect_str(e)))
+        .collect();
+    let spawns = plan
+        .effects
+        .iter()
+        .any(|e| matches!(e, Effect::ProcSpawn { .. } | Effect::Opaque));
+    let mut r = Record::new();
+    if let Some(id) = id {
+        r.insert("id".into(), Value::Int(id));
+    }
+    r.insert("effects".into(), Value::List(effects));
+    r.insert(
+        "reversible".into(),
+        Value::Bool(matches!(plan.reversibility, Reversibility::Reversible)),
+    );
+    r.insert("spawns".into(), Value::Bool(spawns));
+    Value::Record(r)
+}
+
+fn join_paths(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// A one-line human description of a single effect, for `plan`/`explain` output.
+fn effect_str(e: &Effect) -> String {
+    match e {
+        Effect::FsRead { paths } => format!("read {}", join_paths(paths)),
+        Effect::FsWrite { paths } => format!("write {}", join_paths(paths)),
+        Effect::FsDelete { paths } => format!("delete {}", join_paths(paths)),
+        Effect::ProcSpawn { argv0, .. } => format!("spawn {argv0}"),
+        Effect::NetConnect { host, port } => format!("connect {host}:{port}"),
+        Effect::NetListen { port } => format!("listen {port}"),
+        Effect::EnvRead { names } => format!("env-read {}", names.join(", ")),
+        Effect::EnvWrite { names } => format!("env-write {}", names.join(", ")),
+        Effect::SecretUse { names } => format!("secret-use {}", names.join(", ")),
+        Effect::SessionWrite => "session-write".to_string(),
+        Effect::JournalRead => "journal-read".to_string(),
+        Effect::Time => "read-clock".to_string(),
+        Effect::Opaque => "opaque (effects unknown)".to_string(),
     }
 }

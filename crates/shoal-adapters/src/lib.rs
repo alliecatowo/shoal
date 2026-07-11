@@ -35,6 +35,29 @@ pub enum AdapterClass {
     Cli,
     Tui,
     Daemon,
+    /// IO.md §2.2: a head with this class, immediately followed by `{` (or
+    /// the triple-raw `'''` form) at command-head position, lexes a raw
+    /// balanced-brace/triple-quoted block into `Expr::LangBlock` instead of
+    /// a trailing thunk — the adapter-declarative generalization of what
+    /// TDD §13.13 hardcoded for `sh { }` alone. `class = "interpreter"`
+    /// implies `block = "raw"` by default (no separate field needed for
+    /// the only shape v1 has). This is purely a declaration the parser/eval
+    /// consult by name; it does not change how `SubSpec`/`ParamSpec`
+    /// argv-binding works for any *non*-block invocation of the same tool.
+    Interpreter,
+}
+
+/// IO.md §2.6 step 3: how an interpreter-class raw block's source text
+/// reaches the child process. `Arg` (the default) appends it as a single
+/// argv word after `top.invoke`'s flag template (e.g. `python3 -c BODY`,
+/// where `invoke = ["-c"]`); `Stdin` pipes it to the child's stdin instead.
+/// Declaring this on a non-`interpreter`-class adapter is a schema error
+/// (the field is meaningless there) and is rejected at load time, not
+/// silently ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvokePayload {
+    Arg,
+    Stdin,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +87,9 @@ pub struct CmdAdapter {
     pub bin: String,
     pub class: AdapterClass,
     pub ok_codes: Vec<i32>,
+    /// Only meaningful when `class == AdapterClass::Interpreter`; see
+    /// `InvokePayload`. Defaults to `Arg` for every other class.
+    pub invoke_payload: InvokePayload,
     pub top: SubSpec,
     pub subs: HashMap<String, SubSpec>,
 }
@@ -150,7 +176,19 @@ fn parse_cmd(name: &str, raw: &toml::Value) -> Result<CmdAdapter, String> {
         "cli" => AdapterClass::Cli,
         "tui" => AdapterClass::Tui,
         "daemon" => AdapterClass::Daemon,
+        "interpreter" => AdapterClass::Interpreter,
         x => return Err(format!("unknown class {x:?}")),
+    };
+    let invoke_payload_raw = string(t.get("invoke_payload"));
+    if invoke_payload_raw.is_some() && class != AdapterClass::Interpreter {
+        return Err(
+            "invoke_payload may only be declared on a class = \"interpreter\" adapter".into(),
+        );
+    }
+    let invoke_payload = match invoke_payload_raw.unwrap_or("arg") {
+        "arg" => InvokePayload::Arg,
+        "stdin" => InvokePayload::Stdin,
+        x => return Err(format!("unknown invoke_payload {x:?}")),
     };
     let ok_codes = ints(t.get("ok_codes")).unwrap_or_else(|| vec![0]);
     let top = parse_sub(t)?;
@@ -168,6 +206,7 @@ fn parse_cmd(name: &str, raw: &toml::Value) -> Result<CmdAdapter, String> {
         bin,
         class,
         ok_codes,
+        invoke_payload,
         top,
         subs,
     })
@@ -804,11 +843,56 @@ output={parse="porcelain-v2", type="table<{status: str, path: path}>"}
             "terraform",
             "helm",
             "ip",
+            "python",
+            "node",
+            "ruby",
+            "deno",
+            "bash",
+            "ss",
+            "systemd-analyze",
+            "jj",
+            "rustup",
+            "bun",
+            "aws",
+            "gcloud",
         ];
         assert_eq!(catalog.len(), required.len());
         for name in required {
             assert!(catalog.lookup(name).is_some(), "missing adapter {name}");
         }
+        // IO.md §2.2: the interpreter-class set the shipped pack declares,
+        // wired end to end through the same loader path as every other
+        // class value.
+        for interp in ["python", "node", "ruby", "deno", "jq", "bash"] {
+            assert_eq!(
+                catalog.lookup(interp).unwrap().class,
+                AdapterClass::Interpreter,
+                "{interp} should be class = \"interpreter\""
+            );
+            // No adapter declares invoke_payload explicitly yet, so every
+            // interpreter-class adapter falls back to the documented
+            // default.
+            assert_eq!(
+                catalog.lookup(interp).unwrap().invoke_payload,
+                InvokePayload::Arg
+            );
+        }
+        // python/node/ruby/deno/bash each declare the flag template that
+        // precedes their raw block's payload argv word (IO.md §2.6 step 3);
+        // jq takes its filter as a bare positional, so it declares none.
+        assert_eq!(
+            catalog.lookup("python").unwrap().top.invoke,
+            Some(vec!["-c".to_string()])
+        );
+        assert_eq!(
+            catalog.lookup("node").unwrap().top.invoke,
+            Some(vec!["-e".to_string()])
+        );
+        assert_eq!(
+            catalog.lookup("deno").unwrap().top.invoke,
+            Some(vec!["eval".to_string()])
+        );
+        assert_eq!(catalog.lookup("jq").unwrap().top.invoke, None);
         // The `cols` strategy (added for `ps`/`df`) is wired end to end
         // through the same loader path as every other parser.
         assert_eq!(catalog.lookup("ps").unwrap().top.parse, "cols");
@@ -911,5 +995,90 @@ consumed=["missing"]
         assert!(catalog.lookup("bad_consumed").is_none());
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("consumed"), "{warnings:?}");
+    }
+
+    // IO.md §2.2/§2.6: `class = "interpreter"` is a schema value alongside
+    // cli|tui|daemon, and `invoke_payload` is only meaningful there.
+    #[test]
+    fn interpreter_class_loads_and_defaults_invoke_payload_to_arg() {
+        let d = tempfile::tempdir().unwrap();
+        fs::write(
+            d.path().join("pack.toml"),
+            r#"
+[cmd.py]
+bin="python3"
+class="interpreter"
+invoke=["-c"]
+"#,
+        )
+        .unwrap();
+        let (catalog, warnings) = AdapterCatalog::load_dir(d.path());
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let py = catalog.lookup("py").unwrap();
+        assert_eq!(py.class, AdapterClass::Interpreter);
+        assert_eq!(py.invoke_payload, InvokePayload::Arg);
+        assert_eq!(py.top.invoke, Some(vec!["-c".to_string()]));
+    }
+
+    #[test]
+    fn interpreter_class_accepts_explicit_stdin_payload_mode() {
+        let d = tempfile::tempdir().unwrap();
+        fs::write(
+            d.path().join("pack.toml"),
+            r#"
+[cmd.example]
+bin="example"
+class="interpreter"
+invoke_payload="stdin"
+"#,
+        )
+        .unwrap();
+        let (catalog, warnings) = AdapterCatalog::load_dir(d.path());
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(
+            catalog.lookup("example").unwrap().invoke_payload,
+            InvokePayload::Stdin
+        );
+    }
+
+    #[test]
+    fn invoke_payload_on_non_interpreter_class_warns_without_poisoning_siblings() {
+        let d = tempfile::tempdir().unwrap();
+        fs::write(
+            d.path().join("pack.toml"),
+            r#"
+[cmd.good]
+params={path="path"}
+[cmd.bad_class]
+class="cli"
+invoke_payload="stdin"
+"#,
+        )
+        .unwrap();
+        let (catalog, warnings) = AdapterCatalog::load_dir(d.path());
+        assert!(catalog.lookup("good").is_some());
+        assert!(catalog.lookup("bad_class").is_none());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("invoke_payload"), "{warnings:?}");
+    }
+
+    #[test]
+    fn unknown_invoke_payload_value_warns_without_poisoning_siblings() {
+        let d = tempfile::tempdir().unwrap();
+        fs::write(
+            d.path().join("pack.toml"),
+            r#"
+[cmd.good]
+params={path="path"}
+[cmd.bad_payload]
+class="interpreter"
+invoke_payload="socket"
+"#,
+        )
+        .unwrap();
+        let (catalog, warnings) = AdapterCatalog::load_dir(d.path());
+        assert!(catalog.lookup("good").is_some());
+        assert!(catalog.lookup("bad_payload").is_none());
+        assert_eq!(warnings.len(), 1);
     }
 }

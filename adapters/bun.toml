@@ -1,0 +1,19 @@
+# bun — cross-platform (Linux/macOS/Windows) JS runtime + package manager.
+# `pm ls` prints a package tree as indented text (box-drawing characters,
+# no `--json` mode), so — like `jj`'s log — it's kept as raw `lines`
+# rather than a fabricated structured schema.
+[cmd.bun]
+bin = "bun"
+class = "cli"
+ok_codes = [0]
+effects = ["fs.read(cwd)"]
+
+[cmd.bun.sub.pm_ls]
+invoke = ["pm", "ls"]
+output = { parse = "lines", type = "list<str>" }
+effects = ["fs.read(cwd)"]
+
+[cmd.bun.sub.install]
+params = { frozen_lockfile = "bool" }
+invoke = ["install"]
+effects = ["fs.read(cwd)", "fs.write(cwd/node_modules)", "net.connect(registry)"]

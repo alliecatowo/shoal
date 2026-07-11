@@ -207,3 +207,161 @@ fn repl_echo_renders_once_and_exit_sets_code() {
         "exit 5 should set the process status; transcript:\n{text}"
     );
 }
+
+/// docs/ROADMAP.md R3: `undo out[n]` resolves via the host's `out[n] ->
+/// journal entry id` map. Drives the real REPL over a PTY: `rm victim`
+/// journals a reversible trash-move as `out[3]` (after three prior
+/// statements fill `out[0..2]`), then `undo out[3]` must restore the file —
+/// proving the rewrite from `out[N]` to a real entry id actually reached the
+/// eval's `undo <id>` path (a bare, un-rewritten `out[3]` value is not a
+/// valid undo target and would raise instead).
+#[test]
+fn repl_undo_out_n_resolves_via_journal() {
+    let pty = native_pty_system();
+    let pair = pty
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("open pty");
+
+    let home = tempfile::tempdir().unwrap();
+    let victim = home.path().join("victim");
+    std::fs::write(&victim, b"payload").unwrap();
+
+    let mut cmd = CommandBuilder::new(BIN);
+    cmd.cwd(home.path());
+    cmd.env("NO_COLOR", "1");
+    cmd.env("TERM", "xterm");
+    cmd.env("HOME", home.path());
+    cmd.env("XDG_CONFIG_HOME", home.path());
+    cmd.env("XDG_STATE_HOME", home.path());
+    cmd.env_remove("SHOAL_CONFIG");
+
+    let mut child = pair.slave.spawn_command(cmd).expect("spawn repl");
+    drop(pair.slave);
+
+    let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let reader_buf = Arc::clone(&buf);
+    let mut reader = pair.master.try_clone_reader().expect("clone reader");
+    let reader_thread = std::thread::spawn(move || {
+        let mut chunk = [0u8; 4096];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => reader_buf.lock().unwrap().extend_from_slice(&chunk[..n]),
+            }
+        }
+    });
+
+    let mut writer = pair.master.take_writer().expect("take writer");
+    let mut dsr_answered = 0usize;
+    let answer_dsr = |writer: &mut Box<dyn Write + Send>, answered: &mut usize| {
+        let seen = buf
+            .lock()
+            .unwrap()
+            .windows(4)
+            .filter(|w| *w == b"\x1b[6n")
+            .count();
+        while *answered < seen {
+            let _ = writer.write_all(b"\x1b[1;1R");
+            let _ = writer.flush();
+            *answered += 1;
+        }
+    };
+    let mut pump_until = |writer: &mut Box<dyn Write + Send>, marker: &[u8]| -> bool {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            answer_dsr(writer, &mut dsr_answered);
+            if marker.is_empty() {
+                if dsr_answered >= 1 {
+                    return true;
+                }
+            } else if buf
+                .lock()
+                .unwrap()
+                .windows(marker.len())
+                .any(|w| w == marker)
+            {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+
+    assert!(pump_until(&mut writer, b""), "REPL never drew a prompt");
+
+    // Three statements to fill out[0..2], each awaited via a distinct marker
+    // before moving on (the REPL processes one line at a time).
+    for marker in ["811001", "811002", "811003"] {
+        writer
+            .write_all(format!("echo {marker}\r").as_bytes())
+            .unwrap();
+        writer.flush().unwrap();
+        assert!(
+            pump_until(&mut writer, marker.as_bytes()),
+            "dummy echo {marker} did not render"
+        );
+    }
+
+    // `rm victim` becomes out[3]; wait for it via a trailing sentinel rather
+    // than rm's own (empty) output.
+    writer.write_all(b"rm victim\r").unwrap();
+    writer.flush().unwrap();
+    writer.write_all(b"echo 811004\r").unwrap();
+    writer.flush().unwrap();
+    assert!(
+        pump_until(&mut writer, b"811004"),
+        "rm victim did not complete"
+    );
+    assert!(!victim.exists(), "rm should have trashed the file");
+
+    // The fix under test: `out[3]` resolves to `rm`'s journal entry id.
+    writer.write_all(b"undo out[3]\r").unwrap();
+    writer.flush().unwrap();
+    writer.write_all(b"echo 811005\r").unwrap();
+    writer.flush().unwrap();
+    assert!(
+        pump_until(&mut writer, b"811005"),
+        "undo out[3] did not complete"
+    );
+
+    writer.write_all(b"exit 0\r").unwrap();
+    writer.flush().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let status = loop {
+        answer_dsr(&mut writer, &mut dsr_answered);
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "REPL did not exit after `exit 0`"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    drop(writer);
+    let _ = reader_thread.join();
+
+    let text = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+    assert_eq!(status.exit_code(), 0, "transcript:\n{text}");
+    assert!(
+        victim.exists(),
+        "undo out[3] should have restored the file; transcript:\n{text}"
+    );
+    assert_eq!(
+        std::fs::read(&victim).unwrap(),
+        b"payload",
+        "restored file should have its original bytes; transcript:\n{text}"
+    );
+    assert!(
+        !text.contains("undo target must be a journal entry id"),
+        "out[3] should have been rewritten to a real entry id, not fallen through \
+         to the unresolved-value error; transcript:\n{text}"
+    );
+}

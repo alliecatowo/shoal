@@ -151,10 +151,13 @@ fn dispatch(ctx: &mut dyn CallCtx, recv: Value, name: &str, args: CallArgs) -> V
         "ceil" => float_unary(recv, f64::ceil),
         "save" => save(ctx, recv, arg(&args, 0)?, false),
         "append" => save(ctx, recv, arg(&args, 0)?, true),
-        // Task lifecycle methods (defect #14).
+        // Task lifecycle methods (defect #14, TDD §4.7 job control).
         "await" | "wait" => no_args(&args).and_then(|_| task_await(recv)),
         "cancel" => no_args(&args).and_then(|_| task_cancel(recv)),
         "is_done" => no_args(&args).and_then(|_| task_is_done(recv)),
+        "suspend" => no_args(&args).and_then(|_| task_suspend(recv)),
+        "resume" => no_args(&args).and_then(|_| task_resume(recv)),
+        "is_suspended" => no_args(&args).and_then(|_| task_is_suspended(recv)),
         _ => Err(ErrorVal::new(
             "field_missing",
             format!("unknown method `.{name}` on {}", recv.type_name()),
@@ -807,6 +810,39 @@ fn task_is_done(recv: Value) -> VResult<Value> {
         ))),
     }
 }
+fn task_suspend(recv: Value) -> VResult<Value> {
+    match recv {
+        Value::Task(t) => {
+            t.suspend();
+            Ok(Value::Task(t))
+        }
+        v => Err(ErrorVal::type_error(format!(
+            ".suspend expects a task, found {}",
+            v.type_name()
+        ))),
+    }
+}
+fn task_resume(recv: Value) -> VResult<Value> {
+    match recv {
+        Value::Task(t) => {
+            t.resume();
+            Ok(Value::Task(t))
+        }
+        v => Err(ErrorVal::type_error(format!(
+            ".resume expects a task, found {}",
+            v.type_name()
+        ))),
+    }
+}
+fn task_is_suspended(recv: Value) -> VResult<Value> {
+    match recv {
+        Value::Task(t) => Ok(Value::Bool(t.is_suspended())),
+        v => Err(ErrorVal::type_error(format!(
+            ".is_suspended expects a task, found {}",
+            v.type_name()
+        ))),
+    }
+}
 fn save(ctx: &mut dyn CallCtx, v: Value, path: &Value, append: bool) -> VResult<Value> {
     let p = match path {
         Value::Path(p) => p.clone(),
@@ -1023,6 +1059,40 @@ mod tests {
         // Wrong receiver type is a type error.
         assert_eq!(
             call(Value::Int(1), "await", vec![]).unwrap_err().code,
+            "type_error"
+        );
+    }
+
+    #[test]
+    fn task_suspend_resume_methods() {
+        let t = crate::TaskVal::new("t");
+        assert_eq!(
+            call(Value::Task(t.clone()), "is_suspended", vec![]).unwrap(),
+            Value::Bool(false)
+        );
+        // `.suspend()` returns the task (chainable) and flips the flag.
+        assert!(matches!(
+            call(Value::Task(t.clone()), "suspend", vec![]).unwrap(),
+            Value::Task(_)
+        ));
+        assert!(t.is_suspended());
+        assert_eq!(
+            call(Value::Task(t.clone()), "is_suspended", vec![]).unwrap(),
+            Value::Bool(true)
+        );
+        call(Value::Task(t.clone()), "resume", vec![]).unwrap();
+        assert!(!t.is_suspended());
+        // Suspend/resume hooks fire.
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let f = flag.clone();
+        t.on_suspend(Box::new(move || {
+            f.store(true, std::sync::atomic::Ordering::SeqCst)
+        }));
+        t.suspend();
+        assert!(flag.load(std::sync::atomic::Ordering::SeqCst));
+        // Wrong receiver type is a type error.
+        assert_eq!(
+            call(Value::Int(1), "suspend", vec![]).unwrap_err().code,
             "type_error"
         );
     }

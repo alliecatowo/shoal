@@ -189,11 +189,10 @@ impl Evaluator {
                 }
                 Ok(Flow::Value(Value::Null))
             }
-            Stmt::Use { span, .. } => Err(ErrorVal::new(
-                "custom",
-                "module loading is not implemented yet",
-            )
-            .with_span(*span)),
+            Stmt::Use { path, span } => {
+                self.eval_use(path, *span)?;
+                Ok(Flow::Value(Value::Null))
+            }
         }
     }
 

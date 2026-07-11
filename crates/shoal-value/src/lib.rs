@@ -1113,6 +1113,14 @@ pub struct TaskShared {
     cancel_requested: AtomicBool,
     /// Hooks run on cancel (e.g. cancel exec tokens of children).
     on_cancel: Mutex<Vec<Box<dyn Fn() + Send>>>,
+    /// Suspend state (TDD §4.7 job control): `task.suspend()` SIGTSTPs the task's
+    /// process group, `task.resume()` SIGCONTs it. The actual OS signal is sent
+    /// by hooks a spawner/host registers (`on_suspend`/`on_resume`), so this
+    /// mechanism is signalling-backend-agnostic (a thread-only task simply has no
+    /// hooks). `suspended` tracks the flag for `jobs`/prompt accounting.
+    suspended: AtomicBool,
+    on_suspend: Mutex<Vec<Box<dyn Fn() + Send>>>,
+    on_resume: Mutex<Vec<Box<dyn Fn() + Send>>>,
 }
 
 impl std::fmt::Debug for TaskShared {
@@ -1136,6 +1144,9 @@ impl TaskVal {
                 cond: Condvar::new(),
                 cancel_requested: AtomicBool::new(false),
                 on_cancel: Mutex::new(Vec::new()),
+                suspended: AtomicBool::new(false),
+                on_suspend: Mutex::new(Vec::new()),
+                on_resume: Mutex::new(Vec::new()),
             }),
         }
     }
@@ -1177,6 +1188,45 @@ impl TaskVal {
         } else {
             self.shared.on_cancel.lock().unwrap().push(hook);
         }
+    }
+
+    /// Request the task suspend (TDD §4.7): mark it suspended and run every
+    /// registered suspend hook (which is where a spawner/host sends `SIGTSTP` to
+    /// the task's process group). Idempotent — suspending an already-suspended
+    /// task re-runs the hooks, which is harmless (`SIGTSTP` to a stopped group is
+    /// a no-op).
+    pub fn suspend(&self) {
+        self.shared.suspended.store(true, Ordering::SeqCst);
+        for hook in self.shared.on_suspend.lock().unwrap().iter() {
+            hook();
+        }
+    }
+
+    /// Request the task resume (TDD §4.7): clear the suspended flag and run every
+    /// registered resume hook (`SIGCONT` to the process group). Idempotent.
+    pub fn resume(&self) {
+        self.shared.suspended.store(false, Ordering::SeqCst);
+        for hook in self.shared.on_resume.lock().unwrap().iter() {
+            hook();
+        }
+    }
+
+    pub fn is_suspended(&self) -> bool {
+        self.shared.suspended.load(Ordering::SeqCst)
+    }
+
+    /// Register a hook run when the task is suspended (e.g. `SIGTSTP` the child
+    /// process group). If the task is already suspended, the hook fires now.
+    pub fn on_suspend(&self, hook: Box<dyn Fn() + Send>) {
+        if self.is_suspended() {
+            hook();
+        }
+        self.shared.on_suspend.lock().unwrap().push(hook);
+    }
+
+    /// Register a hook run when the task is resumed (`SIGCONT`).
+    pub fn on_resume(&self, hook: Box<dyn Fn() + Send>) {
+        self.shared.on_resume.lock().unwrap().push(hook);
     }
 
     pub fn same(&self, other: &TaskVal) -> bool {

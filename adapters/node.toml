@@ -1,0 +1,11 @@
+# Interpreter-class adapter (IO.md §2.2): `node { BODY }` hands the raw
+# block to `node -e BODY`. `-e`/`--eval` is portable across every platform
+# Node ships on (Linux/macOS/Windows), so no divergence note is needed —
+# unlike `python`'s `python`-vs-`python3` naming trap, `node` itself is the
+# one stable binary name.
+[cmd.node]
+bin = "node"
+class = "interpreter"
+invoke = ["-e"]
+ok_codes = [0]
+effects = ["fs.read(cwd)"]

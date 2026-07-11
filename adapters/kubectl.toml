@@ -23,3 +23,19 @@ positional = ["pod"]
 flags = { short = { c = "container", f = "follow", n = "namespace" } }
 output = { parse = "lines", type = "list<str>" }
 effects = ["net.connect(kubernetes-api)"]
+
+[cmd.kubectl.sub.delete]
+params = { resource = "str", name = "str?", namespace = "str?", all = "bool" }
+positional = ["resource", "name"]
+flags = { short = { n = "namespace", A = "all" } }
+effects = ["net.connect(kubernetes-api)"]
+
+# `current-context` is a flattened two-word subcommand (same pattern as
+# `gh`'s `pr_list`) and always prints exactly one line: the active
+# context's name. Unlike every other sub here, this reads the local
+# kubeconfig only — it never talks to the API server, so it declares no
+# `net.connect` effect.
+[cmd.kubectl.sub.config_current_context]
+invoke = ["config", "current-context"]
+output = { parse = "lines", type = "list<str>" }
+effects = ["fs.read(~/.kube/config)"]

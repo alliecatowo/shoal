@@ -20,6 +20,9 @@ shoal-picker = { version = "0.1.0", path = "../shoal-picker" }
 shoal-reef = { version = "0.1.0", path = "../shoal-reef" }
 toml = "0.9"
 notify = "8.2.0"
+ureq = "3.3.0"
+serde_norway = "0.9.42"
+csv = "1.4.0"
 
 [dev-dependencies]
 tempfile = "3.20"

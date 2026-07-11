@@ -1,0 +1,12 @@
+# Interpreter-class adapter (IO.md §2.2): `deno { BODY }` hands the raw
+# block to `deno eval BODY`. Unlike python/node/ruby, Deno has no top-level
+# `-c`/`-e` flag — inline evaluation is the `eval` *subcommand* — so the
+# "flag template" this adapter declares (`invoke`) is a bare word, not a
+# dash-flag; `invoke` is just an argv-template list either way, and the
+# eval side appends the payload after it the same way regardless of shape.
+[cmd.deno]
+bin = "deno"
+class = "interpreter"
+invoke = ["eval"]
+ok_codes = [0]
+effects = ["fs.read(cwd)"]

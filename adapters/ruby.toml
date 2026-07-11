@@ -1,0 +1,9 @@
+# Interpreter-class adapter (IO.md §2.2): `ruby { BODY }` hands the raw
+# block to `ruby -e BODY`, same mechanism as `python`/`node`, portable
+# across platforms since `-e` is a stable MRI flag everywhere Ruby ships.
+[cmd.ruby]
+bin = "ruby"
+class = "interpreter"
+invoke = ["-e"]
+ok_codes = [0]
+effects = ["fs.read(cwd)"]

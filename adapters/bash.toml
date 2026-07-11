@@ -1,0 +1,13 @@
+# Interpreter-class adapter (IO.md §2.2): `bash { BODY }` hands the raw
+# block to `bash -c BODY` — the same mechanism `sh { }` uses (TDD §13.13),
+# now declared as data instead of a hardcoded parser keyword. `sh` and
+# `bash` are deliberately separate adapters (not aliases of one another):
+# `sh` resolves to the system's POSIX shell (often `dash` on Linux, a much
+# stricter/faster non-Bash shell), while `bash` pins Bash-specific syntax
+# (arrays, `[[ ]]`, etc.) explicitly. Both accept their payload via `-c`.
+[cmd.bash]
+bin = "bash"
+class = "interpreter"
+invoke = ["-c"]
+ok_codes = [0]
+effects = ["fs.read(cwd)"]

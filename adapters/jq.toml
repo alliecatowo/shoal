@@ -1,6 +1,15 @@
+# `class = "interpreter"` (IO.md §2.2) additionally opts `jq { FILTER }` into
+# raw-block lexing, so `blob.feed(jq { .items[] | select(.active) })` works
+# (IO.md §2.7): the block's raw text becomes jq's filter argument, exactly
+# where `filter` already binds below for the ordinary `jq(filter: ...)`
+# call shape — the block form and the named-argument form are two syntaxes
+# for the same one positional argument, not two different adapters. No
+# `invoke`/`invoke_payload` override is needed: jq takes its filter as a
+# bare positional (no `-c`-equivalent flag), which is exactly the
+# `invoke_payload = "arg"` default with an empty flag template.
 [cmd.jq]
 bin = "jq"
-class = "cli"
+class = "interpreter"
 ok_codes = [0]
 params = { filter = "str", files = "glob", raw_output = "bool", compact_output = "bool", slurp = "bool", null_input = "bool" }
 positional = ["filter", "files"]

@@ -147,11 +147,20 @@ impl Evaluator {
                 optional,
                 ..
             } => {
-                let v = self.eval_expr(recv, Position::Value)?;
-                if *optional && v == Value::Null {
-                    Ok(Value::Null)
+                // Namespace constant access (`math.pi`, `config.<key>`): a
+                // namespace name that isn't shadowed by a binding (ROADMAP R2).
+                if let Expr::Var { name: ns, .. } = &**recv
+                    && self.env.get(ns).is_none()
+                    && crate::namespaces::is_namespace(ns)
+                {
+                    crate::namespaces::field(self, ns, name)
                 } else {
-                    self.field(v, name)
+                    let v = self.eval_expr(recv, Position::Value)?;
+                    if *optional && v == Value::Null {
+                        Ok(Value::Null)
+                    } else {
+                        self.field(v, name)
+                    }
                 }
             }
             Expr::Index { recv, index, .. } => {
@@ -204,6 +213,18 @@ impl Evaluator {
                         value: Arc::from(text),
                     }));
                 }
+                // Namespace function call (`json.parse(s)`, `http.get(url)`,
+                // `os.platform()`, `math.sqrt(2)`): a namespace name not shadowed
+                // by a binding (ROADMAP R2). Handled here (not methods.rs) because
+                // several members reach the evaluator (session env, network, cwd).
+                if let Expr::Var { name: ns, .. } = &**recv
+                    && self.env.get(ns).is_none()
+                    && crate::namespaces::is_namespace(ns)
+                {
+                    let a = self.eval_args(args)?;
+                    return crate::namespaces::call_method(self, ns, name, a)
+                        .map_err(|e| e.or_span(span));
+                }
                 let v = self.eval_expr(recv, Position::Value)?;
                 if *optional && v == Value::Null {
                     Ok(Value::Null)
@@ -230,6 +251,15 @@ impl Evaluator {
                     let a = self.eval_args(args)?;
                     self.eval_stream_sink(v, name, a)
                         .map_err(|e| e.or_span(span))
+                } else if let Value::Record(r) = &v
+                    && r.get(name).is_some_and(Value::is_callable)
+                {
+                    // A callable record field is invoked as a method — this is how
+                    // a module fn runs as `deploy.build(...)` (ROADMAP R3 modules)
+                    // and how any record-of-closures dispatches.
+                    let f = r.get(name).cloned().expect("callable field present");
+                    let a = self.eval_args(args)?;
+                    self.call_value(&f, a).map_err(|e| e.or_span(span))
                 } else {
                     let args = self.eval_args(args)?;
                     shoal_value::methods::call_method(self, v, name, args, span)

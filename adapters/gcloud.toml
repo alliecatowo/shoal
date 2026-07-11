@@ -1,0 +1,18 @@
+# Google Cloud CLI — cross-platform (Linux/macOS/Windows). Every subcommand
+# supports `--format=json` uniformly, pinned explicitly rather than relying
+# on the user's local `gcloud config` default format.
+[cmd.gcloud]
+bin = "gcloud"
+class = "cli"
+ok_codes = [0]
+effects = ["net.connect(gcloud)"]
+
+[cmd.gcloud.sub.projects_list]
+invoke = ["projects", "list", "--format=json"]
+output = { parse = "json", type = "table<{projectId: str, name: str, projectNumber: str}>" }
+effects = ["net.connect(gcloud)"]
+
+[cmd.gcloud.sub.config_list]
+invoke = ["config", "list", "--format=json"]
+output = { parse = "json", type = "record" }
+effects = ["net.connect(gcloud)"]

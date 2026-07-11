@@ -1,0 +1,25 @@
+# AWS CLI v2 — cross-platform (Linux/macOS/Windows). Most subcommands
+# support a uniform `--output json`, pinned explicitly here (never left at
+# whatever the user's `~/.aws/config` default is) so the shape is stable
+# regardless of local config. `s3 ls`/`s3 cp` etc. are the exception —
+# those are high-level S3 helper commands that always print plain text
+# regardless of `--output`, so `s3_ls` is declared as raw `lines`, honestly
+# reflecting what the tool actually emits rather than assuming JSON works
+# everywhere in this CLI.
+[cmd.aws]
+bin = "aws"
+class = "cli"
+ok_codes = [0]
+effects = ["net.connect(aws)"]
+
+[cmd.aws.sub.sts_get_caller_identity]
+invoke = ["sts", "get-caller-identity", "--output", "json"]
+output = { parse = "json", type = "record" }
+effects = ["net.connect(aws)"]
+
+[cmd.aws.sub.s3_ls]
+params = { path = "str?" }
+positional = ["path"]
+invoke = ["s3", "ls"]
+output = { parse = "lines", type = "list<str>" }
+effects = ["net.connect(aws)"]

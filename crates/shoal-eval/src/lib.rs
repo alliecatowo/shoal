@@ -10,6 +10,8 @@ mod expr;
 mod helpers;
 mod host;
 mod journal;
+mod modules;
+mod namespaces;
 mod pattern;
 mod plan;
 mod reef;
@@ -134,6 +136,15 @@ pub struct Evaluator {
     /// value the host acts on — eval NEVER calls `std::process::exit`, which
     /// would break the kernel/embedded host.
     pending_exit: Option<i32>,
+    /// Module cache (ROADMAP R3): a module (keyed by canonical path) evaluates
+    /// once per session; its exports record is memoized here. Empty until the
+    /// first `use`.
+    modules: std::collections::HashMap<PathBuf, Value>,
+    /// The stack of modules currently being loaded, for circular-`use` detection.
+    module_stack: Vec<PathBuf>,
+    /// Derived-but-unspawned plans from the `plan { … }` REPL verb (ROADMAP R3),
+    /// indexed by id (`1`-based). `apply <ref>` looks a plan up here and runs it.
+    plans: Vec<Program>,
 }
 
 enum Flow {
@@ -179,6 +190,9 @@ impl Evaluator {
             source: None,
             bus: channels::EventBus::shared(),
             pending_exit: None,
+            modules: std::collections::HashMap::new(),
+            module_stack: Vec::new(),
+            plans: Vec::new(),
         }
     }
 
@@ -303,10 +317,19 @@ impl Evaluator {
     /// command when building a `PromptContext`, never per keystroke.
     pub fn jobs_snapshot(&self) -> JobsSnapshot {
         let total = self.jobs.len();
-        let running = self.jobs.iter().filter(|t| !t.is_done()).count();
+        let running = self
+            .jobs
+            .iter()
+            .filter(|t| !t.is_done() && !t.is_suspended())
+            .count();
+        let suspended = self
+            .jobs
+            .iter()
+            .filter(|t| !t.is_done() && t.is_suspended())
+            .count();
         JobsSnapshot {
             running,
-            suspended: 0,
+            suspended,
             total,
         }
     }
@@ -321,10 +344,44 @@ impl Evaluator {
                 r.insert("id".into(), Value::Int(t.id as i64));
                 r.insert("desc".into(), Value::Str(t.shared.desc.clone()));
                 r.insert("done".into(), Value::Bool(t.is_done()));
+                r.insert("suspended".into(), Value::Bool(t.is_suspended()));
                 r
             })
             .collect();
         Value::Table(rows)
+    }
+
+    /// Suspend a background task by id (TDD §4.7 job control, ROADMAP R3). The
+    /// kernel-callable path behind the wire `task.suspend` method and the REPL
+    /// `fg`/job-control flow: it flips the task's suspended state and runs its
+    /// suspend hooks (`SIGTSTP` to the task's process group, when a spawner has
+    /// registered one). Returns `false` if no task has that id.
+    pub fn suspend_task(&self, id: u64) -> bool {
+        match self.jobs.iter().find(|t| t.id == id) {
+            Some(t) => {
+                t.suspend();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Resume a suspended task by id (`SIGCONT`). Counterpart to
+    /// [`Evaluator::suspend_task`]. Returns `false` if no task has that id.
+    pub fn resume_task(&self, id: u64) -> bool {
+        match self.jobs.iter().find(|t| t.id == id) {
+            Some(t) => {
+                t.resume();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Look up a live task by id (for the REPL `fg <task>` path, which re-fronts a
+    /// background task and must first resolve it from the job table).
+    pub fn task_by_id(&self, id: u64) -> Option<shoal_value::TaskVal> {
+        self.jobs.iter().find(|t| t.id == id).cloned()
     }
 
     pub fn cwd(&self) -> &Path {
@@ -1099,5 +1156,235 @@ consumed = ["short", "branch"]
             run(r#"match 2 { 1 => "a", 2 => "b", _ => "c" }"#).unwrap(),
             Value::Str("b".into())
         );
+    }
+
+    // --- R2: data namespaces --------------------------------------------------
+
+    #[test]
+    fn json_namespace_roundtrips() {
+        assert_eq!(run(r#"json.parse('{"a":1}').a"#).unwrap(), Value::Int(1));
+        assert_eq!(
+            run("json.stringify([1, 2, 3])").unwrap(),
+            Value::Str("[1,2,3]".into())
+        );
+        // A bound name shadows the namespace.
+        assert_eq!(run("let json = 7\njson").unwrap(), Value::Int(7));
+        // Invalid JSON is an arg_error.
+        assert_eq!(
+            run(r#"json.parse('{not json}')"#).unwrap_err().code,
+            "arg_error"
+        );
+    }
+
+    #[test]
+    fn yaml_and_toml_and_csv_namespaces() {
+        // yaml round-trips a scalar map.
+        assert_eq!(run("yaml.parse('a: 1').a").unwrap(), Value::Int(1));
+        // toml parses a key.
+        assert_eq!(run("toml.parse('a = 1').a").unwrap(), Value::Int(1));
+        // csv parses a header row into a table of records.
+        let v = run(r#"csv.parse("name,age\nada,30")"#).unwrap();
+        let Value::Table(rows) = v else {
+            panic!("csv.parse should be a table, got {v:?}")
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["name"], Value::Str("ada".into()));
+        assert_eq!(rows[0]["age"], Value::Str("30".into()));
+    }
+
+    #[test]
+    fn math_namespace_constants_and_fns() {
+        assert_eq!(run("math.sqrt(4)").unwrap(), Value::Float(2.0));
+        let Value::Float(pi) = run("math.pi").unwrap() else {
+            panic!("math.pi should be a float")
+        };
+        assert!((pi - std::f64::consts::PI).abs() < 1e-12);
+        assert_eq!(run("math.max(3, 7)").unwrap(), Value::Float(7.0));
+        assert_eq!(run("math.clamp(9, 0, 5)").unwrap(), Value::Float(5.0));
+        // clamp with lo > hi is an arg_error.
+        assert_eq!(run("math.clamp(1, 5, 0)").unwrap_err().code, "arg_error");
+    }
+
+    #[test]
+    fn os_namespace_reports_platform() {
+        assert_eq!(
+            run("os.platform()").unwrap(),
+            Value::Str(std::env::consts::OS.into())
+        );
+        assert_eq!(
+            run("os.arch()").unwrap(),
+            Value::Str(std::env::consts::ARCH.into())
+        );
+        assert_eq!(
+            run("os.pid()").unwrap(),
+            Value::Int(std::process::id() as i64)
+        );
+        assert!(matches!(run("os.cpus()").unwrap(), Value::Int(n) if n >= 1));
+        assert!(matches!(run("os.env()").unwrap(), Value::Record(_)));
+    }
+
+    #[test]
+    #[ignore = "requires network access; gated out of CI"]
+    fn http_get_is_typed() {
+        let v = run(r#"http.get("https://example.com")"#).unwrap();
+        let Value::Record(r) = v else { panic!() };
+        assert!(matches!(r.get("status"), Some(Value::Int(_))));
+        assert!(matches!(r.get("ok"), Some(Value::Bool(_))));
+        assert!(matches!(r.get("body"), Some(Value::Str(_))));
+    }
+
+    // --- R2: structured builtins head / ln ------------------------------------
+
+    #[test]
+    fn head_returns_first_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f"), b"a\nb\nc\nd\n").unwrap();
+        assert_eq!(
+            out_of(&run_in("head f 2", dir.path()).unwrap()),
+            Value::List(vec![Value::Str("a".into()), Value::Str("b".into())])
+        );
+        // Default n = 10 returns all four.
+        assert!(
+            matches!(out_of(&run_in("head f", dir.path()).unwrap()), Value::List(xs) if xs.len() == 4)
+        );
+    }
+
+    #[test]
+    fn ln_creates_symlink_and_hardlink() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("orig"), b"data").unwrap();
+        run_in("ln --symbolic orig slink", dir.path()).unwrap();
+        assert!(
+            dir.path()
+                .join("slink")
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        run_in("ln orig hard", dir.path()).unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("hard")).unwrap(),
+            b"data".to_vec()
+        );
+    }
+
+    // --- R3: modules ----------------------------------------------------------
+
+    #[test]
+    fn use_binds_module_exports_and_runs_fns() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("greet.shl"),
+            "export fn hello(who: str) { \"hi {who}\" }\nexport let version = 3\nfn private() { 1 }",
+        )
+        .unwrap();
+        // A module fn runs as a namespaced command.
+        assert_eq!(
+            run_in("use ./greet\ngreet.hello(\"ada\")", dir.path()).unwrap(),
+            Value::Str("hi ada".into())
+        );
+        // A value export is a field.
+        assert_eq!(
+            run_in("use ./greet\ngreet.version", dir.path()).unwrap(),
+            Value::Int(3)
+        );
+        // A non-exported decl is not visible.
+        assert_eq!(
+            run_in("use ./greet\ngreet.private", dir.path())
+                .unwrap_err()
+                .code,
+            "field_missing"
+        );
+    }
+
+    #[test]
+    fn circular_use_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.shl"), "use ./b\nexport let x = 1").unwrap();
+        std::fs::write(dir.path().join("b.shl"), "use ./a\nexport let y = 2").unwrap();
+        let err = run_in("use ./a", dir.path()).unwrap_err();
+        assert_eq!(err.code, "custom");
+        assert!(err.msg.contains("circular"), "{}", err.msg);
+    }
+
+    #[test]
+    fn missing_module_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            run_in("use ./nope", dir.path()).unwrap_err().code,
+            "not_found"
+        );
+    }
+
+    // --- R3: plan / apply / explain -------------------------------------------
+
+    #[test]
+    fn plan_renders_effects_without_running() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("x"), b"x").unwrap();
+        let v = run_in("plan { rm x }", dir.path()).unwrap();
+        let Value::Record(r) = &v else {
+            panic!("plan should be a record, got {v:?}")
+        };
+        // The file is untouched — plan spawns/mutates nothing.
+        assert!(dir.path().join("x").exists());
+        let Some(Value::List(effects)) = r.get("effects") else {
+            panic!("plan record needs effects")
+        };
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Value::Str(s) if s.starts_with("delete"))),
+            "{effects:?}"
+        );
+        assert!(matches!(r.get("id"), Some(Value::Int(_))));
+    }
+
+    #[test]
+    fn apply_runs_a_derived_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("x"), b"x").unwrap();
+        // `plan { … }` derives (id 1) without mutating; `apply 1` runs it.
+        let out = run_in("plan { rm x }\napply 1", dir.path()).unwrap();
+        // Now the rm actually ran.
+        assert!(!dir.path().join("x").exists());
+        assert!(matches!(out_of(&out), Value::List(_)));
+    }
+
+    #[test]
+    fn explain_reports_effects_of_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let v = run_in(r#"explain("rm x")"#, dir.path()).unwrap();
+        let Value::Record(r) = v else { panic!() };
+        assert_eq!(r.get("source"), Some(&Value::Str("rm x".into())));
+        assert!(matches!(r.get("effects"), Some(Value::List(_))));
+    }
+
+    // --- R3: task suspend / resume --------------------------------------------
+
+    #[test]
+    fn task_suspend_resume_methods_and_entrypoints() {
+        // Value-method surface: `.suspend()`/`.resume()`/`.is_suspended()`.
+        let v = run("let t = spawn { sleep 0ms\n1 }\nt.suspend()\nt.is_suspended()").unwrap();
+        assert_eq!(v, Value::Bool(true));
+        let v = run("let t = spawn { sleep 0ms\n1 }\nt.suspend()\nt.resume()\nt.is_suspended()")
+            .unwrap();
+        assert_eq!(v, Value::Bool(false));
+
+        // Kernel-callable entry points + jobs snapshot accounting.
+        let mut ev = Evaluator::new(std::env::current_dir().unwrap());
+        let prog = shoal_syntax::parse("spawn { sleep 5s }").unwrap();
+        let task = ev.eval_program(&prog).unwrap();
+        let Value::Task(t) = task else { panic!() };
+        assert!(ev.suspend_task(t.id));
+        assert!(t.is_suspended());
+        assert_eq!(ev.jobs_snapshot().suspended, 1);
+        assert!(ev.resume_task(t.id));
+        assert!(!t.is_suspended());
+        assert!(!ev.suspend_task(999_999));
+        // fg lookup resolves a live task.
+        assert!(ev.task_by_id(t.id).is_some());
+        t.cancel();
     }
 }

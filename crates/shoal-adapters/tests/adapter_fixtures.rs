@@ -466,3 +466,195 @@ fn ip_route_json_parses_route_table() {
     assert_eq!(rows[0]["gateway"], Value::Str("192.168.1.1".into()));
     assert_eq!(parse(spec, b"not json"), None);
 }
+
+// ----------------------------------------------------------------- ss ----
+
+#[test]
+fn ss_cols_parses_realistic_socket_table_and_degrades_on_short_rows() {
+    let c = catalog();
+    let spec = top(&c, "ss");
+    assert_eq!(spec.parse, "cols");
+
+    let good = b"Netid  State      Recv-Q Send-Q  Local Address:Port    Peer Address:Port\n\
+                 tcp    LISTEN     0      128     0.0.0.0:22            0.0.0.0:*\n\
+                 udp    UNCONN     0      0       127.0.0.1:323         0.0.0.0:*\n";
+    let v = parse(spec, good).expect("realistic ss -tuln output must parse");
+    let Value::Table(rows) = v else {
+        panic!("expected table")
+    };
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["netid"], Value::Str("tcp".into()));
+    assert_eq!(rows[0]["local"], Value::Str("0.0.0.0:22".into()));
+    assert_eq!(rows[0]["recv_q"], Value::Int(0));
+    assert_eq!(rows[1]["peer"], Value::Str("0.0.0.0:*".into()));
+
+    // A row missing its Peer Address:Port column must degrade the whole
+    // parse, not silently misalign the remaining columns.
+    let truncated = b"Netid  State      Recv-Q Send-Q  Local Address:Port    Peer Address:Port\n\
+                       tcp    LISTEN     0      128     0.0.0.0:22\n";
+    assert_eq!(parse(spec, truncated), None);
+}
+
+// ------------------------------------------------------ systemd-analyze ----
+
+#[test]
+fn systemd_analyze_blame_lines_parses_raw_entries() {
+    let c = catalog();
+    let spec = sub(&c, "systemd-analyze", "blame");
+    assert_eq!(spec.parse, "lines");
+
+    let good: &[u8] =
+        b"          1.234s NetworkManager.service\n           891ms systemd-udevd.service\n";
+    assert_eq!(
+        parse(spec, good),
+        Some(Value::List(vec![
+            Value::Str("          1.234s NetworkManager.service".into()),
+            Value::Str("           891ms systemd-udevd.service".into()),
+        ]))
+    );
+}
+
+// ----------------------------------------------------------------- jj ----
+
+#[test]
+fn jj_status_and_log_lines_parse_raw_text() {
+    let c = catalog();
+    let status = sub(&c, "jj", "status");
+    assert_eq!(status.parse, "lines");
+    let good = b"Working copy changes:\nM src/lib.rs\nWorking copy : abc123 (no description set)\n";
+    let Value::List(lines) = parse(status, good).unwrap() else {
+        panic!("expected list")
+    };
+    assert_eq!(lines.len(), 3);
+
+    let log = sub(&c, "jj", "log");
+    assert_eq!(
+        log.invoke,
+        Some(vec![
+            "log".to_string(),
+            "--no-graph".to_string(),
+            "--no-pager".to_string(),
+            "--color=never".to_string(),
+            "-T".to_string(),
+            "builtin_log_oneline".to_string(),
+        ])
+    );
+}
+
+// ------------------------------------------------------------ rustup ----
+
+#[test]
+fn rustup_toolchain_and_target_list_parse_lines() {
+    let c = catalog();
+    let toolchains = sub(&c, "rustup", "toolchain_list");
+    assert_eq!(
+        parse(
+            toolchains,
+            b"stable-x86_64-unknown-linux-gnu (default)\nnightly-x86_64-unknown-linux-gnu\n"
+        ),
+        Some(Value::List(vec![
+            Value::Str("stable-x86_64-unknown-linux-gnu (default)".into()),
+            Value::Str("nightly-x86_64-unknown-linux-gnu".into()),
+        ]))
+    );
+    let targets = sub(&c, "rustup", "target_list");
+    assert_eq!(
+        parse(targets, b"wasm32-unknown-unknown (installed)\n"),
+        Some(Value::List(vec![Value::Str(
+            "wasm32-unknown-unknown (installed)".into()
+        )]))
+    );
+}
+
+// --------------------------------------------------------------- bun ----
+
+#[test]
+fn bun_pm_ls_lines_parses_tree_text_and_degrades_on_invalid_utf8() {
+    let c = catalog();
+    let spec = sub(&c, "bun", "pm_ls");
+    assert_eq!(spec.parse, "lines");
+
+    let good = b"myapp@1.0.0 /repo\n\xE2\x94\x9C\xE2\x94\x80\xE2\x94\x80 lodash@4.17.21\n";
+    let Value::List(lines) = parse(spec, good).unwrap() else {
+        panic!("expected list")
+    };
+    assert_eq!(lines[0], Value::Str("myapp@1.0.0 /repo".into()));
+
+    // Invalid UTF-8 bytes are not valid text at all -- degrade, not lie.
+    assert_eq!(parse(spec, b"myapp\xff\xfe"), None);
+}
+
+// --------------------------------------------------------------- aws ----
+
+#[test]
+fn aws_sts_get_caller_identity_json_parses_record() {
+    let c = catalog();
+    let spec = sub(&c, "aws", "sts_get_caller_identity");
+    assert_eq!(spec.parse, "json");
+
+    let good = br#"{"UserId":"AIDAEXAMPLE","Account":"123456789012","Arn":"arn:aws:iam::123456789012:user/allie"}"#;
+    let Value::Record(r) = parse(spec, good).expect("realistic sts get-caller-identity must parse")
+    else {
+        panic!("expected record")
+    };
+    assert_eq!(r["Account"], Value::Str("123456789012".into()));
+
+    assert_eq!(parse(spec, b"{\"UserId\": "), None);
+}
+
+#[test]
+fn aws_s3_ls_lines_parses_bucket_listing() {
+    let c = catalog();
+    let spec = sub(&c, "aws", "s3_ls");
+    assert_eq!(spec.parse, "lines");
+    let good = b"2026-01-01 00:00:00        123 report.csv\n";
+    assert_eq!(
+        parse(spec, good),
+        Some(Value::List(vec![Value::Str(
+            "2026-01-01 00:00:00        123 report.csv".into()
+        )]))
+    );
+}
+
+// ------------------------------------------------------------ gcloud ----
+
+#[test]
+fn gcloud_projects_list_json_parses_table() {
+    let c = catalog();
+    let spec = sub(&c, "gcloud", "projects_list");
+    assert_eq!(spec.parse, "json");
+
+    let good = br#"[{"projectId":"my-proj","name":"My Project","projectNumber":"123456789"}]"#;
+    let Value::Table(rows) =
+        parse(spec, good).expect("realistic projects list --format=json must parse")
+    else {
+        panic!("expected table")
+    };
+    assert_eq!(rows[0]["projectId"], Value::Str("my-proj".into()));
+
+    assert_eq!(parse(spec, b"[{\"projectId\": "), None);
+}
+
+#[test]
+fn gcloud_config_list_json_parses_record() {
+    let c = catalog();
+    let spec = sub(&c, "gcloud", "config_list");
+    let good = br#"{"core":{"project":"my-proj"}}"#;
+    let Value::Record(r) = parse(spec, good).unwrap() else {
+        panic!("expected record")
+    };
+    assert!(matches!(r["core"], Value::Record(_)));
+}
+
+// ----------------------------------------------------------- kubectl ----
+
+#[test]
+fn kubectl_config_current_context_lines_parses_single_line() {
+    let c = catalog();
+    let spec = sub(&c, "kubectl", "config_current_context");
+    assert_eq!(spec.parse, "lines");
+    assert_eq!(
+        parse(spec, b"my-cluster-context\n"),
+        Some(Value::List(vec![Value::Str("my-cluster-context".into())]))
+    );
+}

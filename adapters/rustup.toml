@@ -1,0 +1,17 @@
+# rustup — cross-platform (Linux/macOS/Windows) Rust toolchain manager.
+# `toolchain list`/`target list` are flattened two-word subcommands (same
+# pattern as `gh`'s `pr_list`/`run_list`): the shoal-side sub name joins
+# the real argv words with `_`, and `invoke` supplies both words.
+[cmd.rustup]
+bin = "rustup"
+class = "cli"
+ok_codes = [0]
+
+[cmd.rustup.sub.toolchain_list]
+invoke = ["toolchain", "list"]
+output = { parse = "lines", type = "list<str>" }
+
+[cmd.rustup.sub.target_list]
+params = { installed = "bool" }
+invoke = ["target", "list"]
+output = { parse = "lines", type = "list<str>" }

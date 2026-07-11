@@ -11,6 +11,7 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 static TRASH_SEQ: AtomicU64 = AtomicU64::new(1);
 const NAMES: &[&str] = &[
     "echo", "ls", "cat", "mkdir", "touch", "cp", "mv", "rm", "stat", "which", "env", "sleep",
+    "head", "ln",
 ];
 pub(super) fn is_builtin(name: &str) -> bool {
     NAMES.contains(&name)
@@ -87,6 +88,8 @@ fn dispatch(
             has(flags, &["r", "R", "recursive"]),
         ),
         "stat" => stat(cwd, args),
+        "head" => head(cwd, args),
+        "ln" => ln(cwd, args, has(flags, &["s", "symbolic"])),
         "which" => which(penv, args),
         "env" => env(penv, args),
         "sleep" => sleep(args, cancel),
@@ -356,6 +359,69 @@ fn stat(cwd: &Path, args: Vec<Value>) -> VResult<Value> {
     } else {
         Ok(Value::Table(rows))
     }
+}
+/// `head(file, n: int = 10) -> list<str>` (TDD §5): the first `n` lines of a
+/// text file, structured. UTF-8 is read lossily so a stray non-UTF-8 byte never
+/// aborts the read.
+fn head(cwd: &Path, args: Vec<Value>) -> VResult<Value> {
+    if args.is_empty() {
+        return Err(ErrorVal::arg_error("head requires a file path"));
+    }
+    let n = match args.get(1) {
+        None => 10usize,
+        Some(Value::Int(i)) if *i >= 0 => *i as usize,
+        Some(Value::Str(s)) => s.parse::<usize>().map_err(|_| {
+            ErrorVal::arg_error(format!("head: expected a line count, found {s:?}"))
+        })?,
+        Some(v) => {
+            return Err(ErrorVal::type_error(format!(
+                "head: expected an int line count, found {}",
+                v.type_name()
+            )));
+        }
+    };
+    let p = path(cwd, args[0].clone())?;
+    let bytes = fs::read(&p).map_err(|e| ioerr("read", &p, e))?;
+    let text = String::from_utf8_lossy(&bytes);
+    let lines = text
+        .lines()
+        .take(n)
+        .map(|l| Value::Str(l.to_string()))
+        .collect();
+    Ok(Value::List(lines))
+}
+
+/// `ln(target, link, symbolic: bool = false)` (TDD §5): create a hard link (or a
+/// symlink with `--symbolic`/`-s`). Returns a record describing the link created.
+fn ln(cwd: &Path, args: Vec<Value>, symbolic: bool) -> VResult<Value> {
+    if args.len() != 2 {
+        return Err(ErrorVal::arg_error("ln requires a target and a link name"));
+    }
+    let link = path(cwd, args[1].clone())?;
+    let mut r = Record::new();
+    if symbolic {
+        // Preserve the target verbatim so a relative symlink points where the
+        // user meant (relative to the link's directory), not to the cwd.
+        let target = match &args[0] {
+            Value::Path(p) => p.clone(),
+            Value::Str(s) => PathBuf::from(s),
+            v => {
+                return Err(ErrorVal::type_error(format!(
+                    "ln: expected a path target, found {}",
+                    v.type_name()
+                )));
+            }
+        };
+        std::os::unix::fs::symlink(&target, &link).map_err(|e| ioerr("symlink", &link, e))?;
+        r.insert("target".into(), Value::Path(target));
+    } else {
+        let target = path(cwd, args[0].clone())?;
+        fs::hard_link(&target, &link).map_err(|e| ioerr("link", &link, e))?;
+        r.insert("target".into(), Value::Path(target));
+    }
+    r.insert("link".into(), Value::Path(link));
+    r.insert("symbolic".into(), Value::Bool(symbolic));
+    Ok(Value::Record(r))
 }
 fn which(penv: &[(OsString, OsString)], args: Vec<Value>) -> VResult<Value> {
     if args.len() != 1 {

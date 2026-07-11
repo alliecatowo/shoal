@@ -1,0 +1,20 @@
+# Linux (iproute2) only: macOS has no `ss` at all (BSD's own `netstat`
+# covers similar ground but with an incompatible flag set and free-text
+# output). Like `ip`/`systemctl`, this adapter names a specific ecosystem
+# tool rather than a POSIX-portable one, and fails loudly with "command not
+# found" on macOS instead of guessing at a lookalike that would misparse.
+#
+# `-tuln`: TCP+UDP sockets, listening only, numeric (no DNS/service-name
+# lookups, which would otherwise make column widths and content vary by
+# network/`/etc/services` and could stall on a slow resolver). Every data
+# row is then exactly 6 whitespace-separated fields with no embedded
+# spaces in any of them, so `cols` (which takes column identity/order from
+# `output.type` and ignores the header text) parses it cleanly without
+# needing `ss`'s JSON output (`-J`), which is only available on newer
+# iproute2 and would make this adapter silently version-gated.
+[cmd.ss]
+bin = "ss"
+class = "cli"
+ok_codes = [0]
+invoke = ["-tuln"]
+output = { parse = "cols", type = "table<{netid: str, state: str, recv_q: int, send_q: int, local: str, peer: str}>" }

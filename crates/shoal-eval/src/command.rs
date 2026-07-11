@@ -82,6 +82,19 @@ impl Evaluator {
             self.pending_exit = Some(code);
             return Ok(Value::Null);
         }
+        // plan/apply/explain REPL verbs (ROADMAP R3). `plan { … }` renders the
+        // effect plan without spawning; `apply <ref>` runs a derived plan;
+        // `explain(src)` renders what a source string would do. Intercepted before
+        // builtin/adapter/external dispatch so `plan`/`apply`/`explain` are verbs.
+        if call.head == "plan" {
+            return self.builtin_plan(call);
+        }
+        if call.head == "apply" {
+            return self.builtin_apply(call);
+        }
+        if call.head == "explain" {
+            return self.builtin_explain(call);
+        }
         if call.head == "interact" {
             return self.builtin_interact(call);
         }
@@ -487,6 +500,9 @@ impl Evaluator {
                     | "undo"
                     | "journal"
                     | "history"
+                    | "plan"
+                    | "apply"
+                    | "explain"
             )
         {
             return true;

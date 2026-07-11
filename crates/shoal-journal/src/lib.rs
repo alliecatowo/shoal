@@ -746,7 +746,7 @@ impl Journal {
     /// Replay typed inverses newest-first. Destinations must remain inside
     /// `root`; stale fingerprints and symlink traversal are hard failures.
     pub fn undo_entry(&self, id: i64, root: &Path) -> Result<UndoReport, UndoError> {
-        let root = root.canonicalize()?;
+        let root = resolve_leading_symlink_prefix(root)?;
         let mut stmt = self
             .conn
             .prepare("SELECT inverse FROM undo WHERE entry_id=?1 ORDER BY rowid DESC")?;
@@ -867,7 +867,7 @@ fn inverse_name(inverse: &UndoInverse) -> &'static str {
 }
 
 fn checked_target(root: &Path, path: &Path) -> Result<(), UndoError> {
-    if !path.is_absolute() || !path.starts_with(root) {
+    if !path.is_absolute() {
         return Err(UndoError::Escaped(path.to_owned()));
     }
     let mut normalized = PathBuf::new();
@@ -880,9 +880,7 @@ fn checked_target(root: &Path, path: &Path) -> Result<(), UndoError> {
             c => normalized.push(c.as_os_str()),
         }
     }
-    if !normalized.starts_with(root) {
-        return Err(UndoError::Escaped(path.to_owned()));
-    }
+    strip_root(root, &normalized)?;
     Ok(())
 }
 
@@ -890,9 +888,7 @@ fn ensure_no_symlink_parents(root: &Path, path: &Path) -> Result<(), UndoError> 
     let parent = path
         .parent()
         .ok_or_else(|| UndoError::Escaped(path.to_owned()))?;
-    let relative = parent
-        .strip_prefix(root)
-        .map_err(|_| UndoError::Escaped(path.to_owned()))?;
+    let relative = strip_root(root, parent)?;
     let mut current = root.to_owned();
     for component in relative.components() {
         current.push(component);
@@ -904,6 +900,64 @@ fn ensure_no_symlink_parents(root: &Path, path: &Path) -> Result<(), UndoError> 
         }
     }
     Ok(())
+}
+
+/// `path`'s components below `root`.
+///
+/// Tries a plain [`Path::strip_prefix`] first. If that fails, `root` and
+/// `path` may disagree only because one of them still carries a raw
+/// OS-level symlink alias in its leading prefix (e.g. macOS's `/tmp` ->
+/// `/private/tmp`) that the other has already had resolved — see
+/// [`resolve_leading_symlink_prefix`] and the callers in this module that
+/// canonicalize `root` up front. Re-resolve `path`'s own leading prefix the
+/// same (deliberately partial) way and retry once. This never touches
+/// anything past that leading run, so an intra-scope symlink swap — the
+/// TOCTOU case this whole scope check exists for — still can't slip through
+/// either operand.
+fn strip_root(root: &Path, path: &Path) -> Result<PathBuf, UndoError> {
+    if let Ok(rel) = path.strip_prefix(root) {
+        return Ok(rel.to_owned());
+    }
+    let realigned = resolve_leading_symlink_prefix(path)?;
+    realigned
+        .strip_prefix(root)
+        .map(PathBuf::from)
+        .map_err(|_| UndoError::Escaped(path.to_owned()))
+}
+
+/// Resolve only the *leading* run of symlink components in `path` (e.g.
+/// macOS's `/tmp` -> `/private/tmp`, `/var` -> `/private/var`), stopping at
+/// the first component that is not itself a symlink (or doesn't exist).
+///
+/// This is deliberately short of a full `canonicalize`: resolving the whole
+/// path would also silently follow a symlink planted *inside* the tracked
+/// scope, which is exactly the TOCTOU swap `ensure_no_symlink_parents`
+/// exists to catch. Restricting resolution to the unbroken run of symlinks
+/// right at the front only ever reaches genuine OS-level directory aliases
+/// (real filesystem hierarchies put those first, before any directory a
+/// user or a session could have created) and leaves everything below —
+/// scope and its descendants — exactly as given.
+fn resolve_leading_symlink_prefix(path: &Path) -> io::Result<PathBuf> {
+    let mut resolved = PathBuf::new();
+    let mut components = path.components();
+    for component in components.by_ref() {
+        let is_anchor = matches!(
+            component,
+            std::path::Component::RootDir | std::path::Component::Prefix(_)
+        );
+        resolved.push(component);
+        if is_anchor {
+            continue;
+        }
+        match fs::symlink_metadata(&resolved) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                resolved = resolved.canonicalize()?;
+            }
+            _ => break,
+        }
+    }
+    resolved.extend(components);
+    Ok(resolved)
 }
 
 fn require_fingerprint(path: &Path, expected: &FileFingerprint) -> Result<(), UndoError> {
@@ -1299,12 +1353,13 @@ mod tests {
     fn undo_trash_move_restores_and_is_idempotent() {
         let root = tempfile::tempdir().unwrap();
         let trash_dir = tempfile::tempdir().unwrap();
-        // `undo_entry` canonicalizes `root` before checking that undo targets
-        // are contained within it (see `checked_target`). On macOS the tempdir
-        // path is a symlink alias (e.g. `/var/folders/...` ->
+        // `undo_entry` resolves `root`'s leading symlink prefix before
+        // checking that undo targets are contained within it (see
+        // `checked_target`, `resolve_leading_symlink_prefix`). On macOS the
+        // tempdir path is a symlink alias (e.g. `/var/folders/...` ->
         // `/private/var/folders/...`), so build `original` from the
-        // canonicalized root to keep the prefix check aligned with what
-        // `undo_entry` will compare against.
+        // canonicalized root here to mirror how a production `self.cwd`
+        // (sourced from `getcwd`) would already be alias-free.
         let root_path = root.path().canonicalize().unwrap();
         let original = root_path.join("gone.txt");
         let trash = trash_dir.path().join("gone.txt");
@@ -1332,8 +1387,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         // See undo_trash_move_restores_and_is_idempotent: canonicalize so
         // `path` shares the same prefix `undo_entry` compares against after
-        // it canonicalizes `root` internally (macOS tempdirs are symlink
-        // aliases into `/private/...`).
+        // it resolves `root`'s leading symlink alias internally (macOS
+        // tempdirs are symlink aliases into `/private/...`).
         let root_path = root.path().canonicalize().unwrap();
         let path = root_path.join("config");
         fs::write(&path, b"before").unwrap();
@@ -1357,8 +1412,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         // See undo_trash_move_restores_and_is_idempotent: canonicalize so
         // `path` shares the same prefix `undo_entry` compares against after
-        // it canonicalizes `root` internally (macOS tempdirs are symlink
-        // aliases into `/private/...`).
+        // it resolves `root`'s leading symlink alias internally (macOS
+        // tempdirs are symlink aliases into `/private/...`).
         let root_path = root.path().canonicalize().unwrap();
         let path = root_path.join("config");
         fs::write(&path, b"before").unwrap();
@@ -1391,8 +1446,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         // See undo_trash_move_restores_and_is_idempotent: canonicalize so
         // `a`/`b`/`c` share the same prefix `undo_entry` compares against
-        // after it canonicalizes `root` internally (macOS tempdirs are
-        // symlink aliases into `/private/...`).
+        // after it resolves `root`'s leading symlink alias internally
+        // (macOS tempdirs are symlink aliases into `/private/...`).
         let root_path = root.path().canonicalize().unwrap();
         let a = root_path.join("a");
         let b = root_path.join("b");
@@ -1468,6 +1523,90 @@ mod tests {
         .unwrap();
         assert!(matches!(
             j.undo_entry(id2, root.path()),
+            Err(UndoError::Escaped(_))
+        ));
+        assert_eq!(fs::read(outside.path().join("file")).unwrap(), b"after");
+    }
+
+    #[test]
+    fn undo_restores_scoped_target_when_root_is_passed_as_a_raw_symlink_alias() {
+        // Regression test for the R5 carryover: `undo` must not refuse a
+        // legitimate target just because the caller's `root` argument still
+        // carries a raw OS-level symlink alias in its leading prefix (e.g.
+        // macOS's `/tmp` -> `/private/tmp`, `/var` -> `/private/var`) while
+        // the recorded target was built from the already-resolved form (as
+        // `std::env::current_dir()`/`getcwd` would give). `undo_entry` must
+        // resolve *that* leading prefix on `root` -- see
+        // `resolve_leading_symlink_prefix` -- without requiring the caller
+        // to pre-canonicalize. On Linux (no leading alias on a plain
+        // tempdir) this is a harmless no-op, so the same test is valid on
+        // both platforms.
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        fs::create_dir(root_path.join("nested")).unwrap();
+        let path = root_path.join("nested").join("config");
+        fs::write(&path, b"before").unwrap();
+        let j = Journal::in_memory().unwrap();
+        let id = j.append(&rec("s", "human", 1, "save config")).unwrap();
+        let prior = j.record_output(id, "value", b"before").unwrap();
+        fs::write(&path, b"after").unwrap();
+        j.record_undo_inverse(
+            id,
+            &UndoInverse::RestoreBytes {
+                path: path.clone(),
+                prior_hash: prior,
+                expected_current: FileFingerprint::capture(&path).unwrap(),
+            },
+        )
+        .unwrap();
+        // Pass the *raw*, un-pre-canonicalized tempdir path -- the form a
+        // caller gets from a `TempDir`/session config without going through
+        // `getcwd`, and exactly the form that used to make `checked_target`
+        // (wrongly) refuse the target as escaped once `undo_entry` switched
+        // from a no-op to a blanket `root.canonicalize()`.
+        let report = j.undo_entry(id, root.path()).unwrap();
+        assert_eq!(report.steps[0].status, UndoStatus::Applied);
+        assert_eq!(fs::read(&path).unwrap(), b"before");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn undo_still_refuses_intra_scope_symlink_when_root_alias_is_resolved() {
+        // The leading-prefix fix must not weaken `ensure_no_symlink_parents`:
+        // resolving a raw OS-level alias in `root` (see
+        // `resolve_leading_symlink_prefix`) must never bleed into resolving
+        // a symlink planted *inside* the tracked scope -- that's the TOCTOU
+        // swap this check exists to catch, and it must still be refused
+        // even when `root` itself needed the leading-alias treatment to
+        // line up with the (already-resolved) recorded target.
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        symlink(outside.path(), root_path.join("link")).unwrap();
+        let target = root_path.join("link/file");
+        fs::write(outside.path().join("file"), b"after").unwrap();
+        let j = Journal::in_memory().unwrap();
+        let id = j
+            .append(&rec("s", "human", 1, "undo through symlink"))
+            .unwrap();
+        let prior = j.record_output(id, "value", b"before").unwrap();
+        j.record_undo_inverse(
+            id,
+            &UndoInverse::RestoreBytes {
+                path: target.clone(),
+                prior_hash: prior,
+                expected_current: FileFingerprint::capture(&target).unwrap(),
+            },
+        )
+        .unwrap();
+        // `root.path()` is the raw, un-canonicalized tempdir path -- the
+        // same leading-alias resolution as the test above is in play --
+        // while `target` was built from the canonical form and reaches
+        // through an intra-scope symlink planted after the entry was
+        // recorded.
+        assert!(matches!(
+            j.undo_entry(id, root.path()),
             Err(UndoError::Escaped(_))
         ));
         assert_eq!(fs::read(outside.path().join("file")).unwrap(), b"after");
