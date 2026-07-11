@@ -96,3 +96,42 @@ value = '"a,b"'
 name = "rt3-nested-record-in-list-get-with-default"
 src = "[{a: 1}].get(5, {a: 0}).a"
 value = "0"
+
+# `.set(key, value)` / `.merge(other)` — immutable functional update on records
+# (the write half of the `.keys`/`.values`/`.get`/`.items` read surface). Both
+# return a new record; the receiver is untouched. See
+# crates/shoal-value/src/methods/record.rs.
+
+[[case]]
+name = "rt2-set-adds-a-key"
+src = '{a: 1, b: 2}.set("c", 3).c'
+value = "3"
+
+[[case]]
+name = "rt2-set-replaces-in-place"
+src = '{a: 1, b: 2}.set("a", 99)'
+value = "{a: 99, b: 2}"
+
+[[case]]
+name = "rt2-set-is-immutable"
+src = '''
+let r = {a: 1}
+r.set("b", 2)
+r
+'''
+value = "{a: 1}"
+
+[[case]]
+name = "rt2-merge-right-wins-and-appends"
+src = '{a: 1, b: 2}.merge({b: 20, c: 30})'
+value = "{a: 1, b: 20, c: 30}"
+
+[[case]]
+name = "rt2-merge-non-record-is-type-error"
+src = '{a: 1}.merge(5)'
+error = "type_error"
+
+[[case]]
+name = "rt2-reduce-set-builds-record-from-pairs"
+src = '[["a", 1], ["b", 2]].reduce({}, (acc, kv) => acc.set(kv[0], kv[1]))'
+value = "{a: 1, b: 2}"

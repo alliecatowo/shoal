@@ -159,6 +159,8 @@ fn dispatch(ctx: &mut dyn CallCtx, recv: Value, name: &str, args: CallArgs) -> V
         "keys" => record::record_side(recv, true),
         "values" => record::record_side(recv, false),
         "items" => record::items(recv),
+        "set" => record::set(recv, str_arg(&args, 0, "")?, arg(&args, 1)?.clone()),
+        "merge" => record::merge(recv, arg(&args, 0)?.clone()),
         "get" => list::get(
             recv,
             arg(&args, 0)?,
