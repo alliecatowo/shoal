@@ -1,0 +1,112 @@
+# Coverage sweep of docs/CONTRACTS.md §4's pinned error-code list, focused
+# on codes not yet asserted by any other corpus file: `cmd_failed`,
+# `utf8_error`, `recursion_limit`, `reef_not_found`, and the
+# `lang_block_unbalanced` PARSE diagnostic (its brace-scanner trigger lives
+# in the lexer, so the harness observes it as a `parse_error`, not an eval
+# `error` code — CONTRACTS §5's schema has no `code` field for parse
+# failures). Two genuinely unimplemented codes (`assert_failed`: no `assert`
+# builtin exists yet; `runner_not_found`: `run <path>` resolution falls back
+# to a plain `not_found`, not the extension/shebang-lookup diagnostic
+# IO.md §6 describes) are `skip`ped with a reason rather than asserted.
+
+[[case]]
+name = "errcode-cmd-failed-on-out-field-access"
+# `.out`/`.err` on a non-ok outcome raise `cmd_failed` (TDD §4.1); the raw
+# `.status`/`.stdout`/`.stderr` fields stay reachable regardless (see
+# edges.toml's signal-death cases for that side).
+src = '''
+let r = (sh -c "exit 7")
+r.out
+'''
+error = "cmd_failed"
+
+[[case]]
+name = "errcode-cmd-failed-on-err-field-access"
+src = '''
+let r = (sh -c "exit 7")
+r.err
+'''
+error = "cmd_failed"
+
+[[case]]
+name = "errcode-cmd-failed-message-names-the-exit-status"
+src = '''
+let r = (sh -c "exit 7")
+r.out
+'''
+error = "cmd_failed"
+error_contains = "exited with status 7"
+
+[[case]]
+name = "errcode-cmd-failed-status-field-still-readable"
+# The raw `.status` field never raises, even on a failed outcome — only the
+# structured `.out`/`.err` accessors do.
+src = '''
+let r = (sh -c "exit 7")
+r.status
+'''
+value = "7"
+
+[[case]]
+name = "errcode-utf8-error-on-invalid-bytes"
+# `.stdout` is the raw, unparsed byte field (never lossily decoded, unlike
+# `.out`'s lazy JSON/lossy-text sniff); `.str()` on non-UTF-8 bytes is a
+# strict decode that raises `utf8_error`. Octal `\377` in `printf` is the
+# single byte 0xFF, invalid as a UTF-8 lead byte on its own.
+src = '''sh { printf '\377' }.stdout.str()'''
+error = "utf8_error"
+
+[[case]]
+name = "errcode-recursion-limit-on-unbounded-native-recursion"
+# The interpreter's own call-stack guard (TDD §4.5-adjacent implementation
+# detail, `call_value`'s `call_depth` counter) caps nested calls at 10000,
+# independent of any language-level tail-call optimization. shoal-eval's own
+# `defect9_recursion_guard_returns_error` unit test proves the guard fires
+# correctly, but only by spawning a dedicated 2GiB-stack thread first — the
+# tree-walk interpreter's real per-call native stack usage overflows this
+# harness's default test-thread stack well before the 10000-call counter
+# guard trips (observed: SIGABRT stack-overflow, aborting the whole
+# conformance binary, not a clean case failure) — so this is asserted at the
+# unit-test layer, never safely reachable from this corpus.
+src = '''
+fn f(n: int) { f(n + 1) }
+f(0)
+'''
+error = "recursion_limit"
+skip = "10000 nested tree-walk calls overflows this harness's default test-thread native stack before the call_depth counter guard trips (SIGABRT, not a clean failure) — shoal-eval's defect9_recursion_guard_returns_error unit test covers this correctly on a dedicated 2GiB-stack thread instead"
+
+[[case]]
+name = "errcode-reef-not-found-lock-with-no-manifest"
+# `reef lock --refresh` with no `.reef.toml` anywhere in scope (the harness's
+# fresh temp cwd, with no fixture manifest) raises `reef_not_found` directly,
+# distinct from reef.toml's per-tool `reef_unlocked`/`not_found` cases.
+src = "reef lock --refresh"
+error = "reef_not_found"
+
+[[case]]
+name = "errcode-lang-block-unbalanced-braces-is-a-parse-error"
+# IO.md §5: brace-scanning `sh { … }` that reaches EOF with an unterminated
+# `{` is `lang_block_unbalanced` — surfaced as a PARSE-time diagnostic (the
+# lexer's `raw_brace_block` scanner), so the harness checks it via
+# `parse_error`/`parse_error_contains`, not an eval `error` code.
+src = "sh { echo hi"
+parse_error = true
+parse_error_contains = "unbalanced braces"
+
+[[case]]
+name = "errcode-assert-builtin-not-implemented"
+# TDD's builtin surface never actually lists a dedicated `assert`
+# construct (§5's core-verb list has no `assert`), and no eval call-site
+# raises `assert_failed` (`grep -rn assert_failed crates/` finds nothing) —
+# this is a genuine surface gap, not a corpus authoring choice.
+src = "assert(1 == 2)"
+skip = "no `assert` builtin/error path exists yet anywhere in shoal-eval — CONTRACTS §4's assert_failed code has no producer"
+
+[[case]]
+name = "errcode-runner-not-found-not-implemented"
+# IO.md §6's `run <path>` extension/shebang-fallback resolution (which would
+# raise `runner_not_found` on exhaustion) isn't wired into shoal-eval's `run`
+# builtin yet — an unresolvable path today surfaces a plain filesystem
+# `not_found` from the underlying spawn attempt instead.
+src = 'run("./definitely-not-a-real-script-xyz.zzz")'
+skip = "IO.md §6's extension/shebang runner-resolution fallback (which raises runner_not_found on exhaustion) isn't implemented in shoal-eval's `run` builtin yet — an unresolvable path surfaces a plain spawn-level not_found instead"

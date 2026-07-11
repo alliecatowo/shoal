@@ -1,0 +1,75 @@
+# Further closure/higher-order hardening beyond closures.toml: per-call
+# lambda-parameter capture (a `.map` producing one thunk per element
+# captures that iteration's OWN value, never the final one — there's no
+# shared-loop-variable aliasing bug here since each call gets a fresh
+# parameter binding), a stateful counter closure over a `var`, function
+# composition, and a real parser gap found while probing immediately-
+# invoked lambda literals.
+
+[[case]]
+name = "closure2-per-element-thunks-capture-their-own-value"
+# Each `x => (() => x)` call gets a FRESH `x` binding (the outer lambda's
+# own parameter scope, not a shared loop variable), so the returned thunks
+# recover 1, 2, 3 respectively — never all converging on the last value.
+src = '''
+let fs = [1, 2, 3].map(x => (() => x))
+fs.map(f => f())
+'''
+value = "[1, 2, 3]"
+
+[[case]]
+name = "closure2-stateful-counter-increments-across-calls"
+src = '''
+fn make_counter() {
+  var n = 0
+  () => { n += 1
+n }
+}
+let c = make_counter()
+c()
+c()
+c()
+'''
+value = "3"
+
+[[case]]
+name = "closure2-two-counters-are-independent"
+# Each call to `make_counter()` allocates its own fresh `n` binding —
+# separate closures never share state.
+src = '''
+fn make_counter() {
+  var n = 0
+  () => { n += 1
+n }
+}
+let c1 = make_counter()
+let c2 = make_counter()
+c1()
+c1()
+c2()
+'''
+value = "1"
+
+[[case]]
+name = "closure2-function-composition"
+src = '''
+let compose = (f, g) => x => f(g(x))
+let h = compose(x => x + 1, x => x * 2)
+h(5)
+'''
+value = "11"
+
+[[case]]
+name = "closure2-immediately-invoked-lambda-literal-is-a-parse-error"
+# TDD §3.2's grammar (`postfix = primary { … | call [trailing] }`, with
+# `lambda` as one of `primary`'s alternatives) implies `(x => x + 1)(5)`
+# should parse as a lambda-primary immediately followed by a `call`
+# postfix — but the parser explicitly rejects calling a parenthesized
+# lambda literal directly ("only a named function can be called
+# directly"). Binding the same lambda to a name first and calling THAT
+# works fine (see closure2-function-composition above), so this is
+# specifically the direct-literal-call spelling that's restricted.
+src = "(x => x + 1)(5)"
+value = "6"
+parse_error = true
+skip = "shoal-syntax rejects calling a parenthesized lambda literal directly ('only a named function can be called directly'), even though TDD §3.2's postfix grammar (primary { ... | call [trailing] }, with lambda as a primary alternative) doesn't carve out an exception for it — binding the lambda to a name first and calling that works fine, so this is a real, narrow parser restriction rather than a corpus authoring choice"

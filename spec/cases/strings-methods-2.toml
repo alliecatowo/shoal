@@ -1,0 +1,179 @@
+# Additional string-method hardening beyond strings.toml's first pass:
+# unicode char-counting (.len()/.chars() count Unicode scalar values, not
+# bytes), .words()/.split() edge cases (empty runs, no separator found),
+# .contains() cross-type (never a type error, per methods.rs::contains
+# dispatching structurally), .matches()/.match() empty-result shapes,
+# comparisons, and a few more render-stable method chains. Every value here
+# was cross-checked against the real evaluator via the conformance harness.
+
+[[case]]
+name = "str2-len-counts-unicode-scalars-not-bytes"
+# "café" is 4 Unicode scalar values but 5 UTF-8 bytes (é is 2 bytes).
+src = '"café".len()'
+value = "4"
+
+[[case]]
+name = "str2-chars-on-empty-string-is-empty-list"
+src = '"".chars()'
+value = "[]"
+
+[[case]]
+name = "str2-words-collapses-runs-of-whitespace"
+src = '"a b  c".words()'
+value = '["a", "b", "c"]'
+
+[[case]]
+name = "str2-words-on-empty-string-is-empty-list"
+src = '"".words()'
+value = "[]"
+
+[[case]]
+name = "str2-split-empty-run-between-separators"
+src = '"a,,b".split(",")'
+value = '["a", "", "b"]'
+
+[[case]]
+name = "str2-split-no-separator-found-is-single-element"
+src = '"abc".split(",")'
+value = '["abc"]'
+
+[[case]]
+name = "str2-contains-substring-false"
+src = '"abc".contains("z")'
+value = "false"
+
+[[case]]
+name = "str2-contains-substring-true"
+src = '"abcdef".contains("cd")'
+value = "true"
+
+[[case]]
+name = "str2-contains-empty-needle-is-true"
+src = '"abc".contains("")'
+value = "true"
+
+[[case]]
+name = "str2-matches-regex-no-match-is-empty-list"
+src = '"hello".matches(re"[0-9]+")'
+value = "[]"
+
+[[case]]
+name = "str2-match-regex-no-match-is-null"
+src = '"hello".match(re"z")'
+value = "null"
+
+[[case]]
+name = "str2-lower-mixed-case"
+src = '"AbC".lower()'
+value = '"abc"'
+
+[[case]]
+name = "str2-upper-already-upper-is-identity"
+src = '"SHOAL".upper()'
+value = '"SHOAL"'
+
+[[case]]
+name = "str2-cmp-le-equal-strings"
+src = '"a" <= "a"'
+value = "true"
+
+[[case]]
+name = "str2-cmp-ge-strings"
+src = '"b" >= "a"'
+value = "true"
+
+[[case]]
+name = "str2-empty-is-empty-true"
+src = '"".is_empty()'
+value = "true"
+
+[[case]]
+name = "str2-nonempty-is-empty-false"
+src = '"x".is_empty()'
+value = "false"
+
+[[case]]
+name = "str2-trim-only-whitespace-is-empty"
+src = '"   ".trim()'
+value = '""'
+
+[[case]]
+name = "str2-starts-with-empty-prefix-is-true"
+src = '"abc".starts_with("")'
+value = "true"
+
+[[case]]
+name = "str2-ends-with-full-string-is-true"
+src = '"abc".ends_with("abc")'
+value = "true"
+
+[[case]]
+name = "str2-replace-no-match-is-unchanged"
+src = '"abc".replace("z", "q")'
+value = '"abc"'
+
+[[case]]
+name = "str2-replace-empty-target-string-behavior"
+# Replacing empty text in an empty string is a well-defined identity case.
+src = '"".replace("x", "y")'
+value = '""'
+
+[[case]]
+name = "str2-parse-int-failure-is-arg-error"
+src = '"notanumber".parse_int()'
+error = "arg_error"
+
+[[case]]
+name = "str2-parse-float-failure-is-arg-error"
+src = '"notafloat".parse_float()'
+error = "arg_error"
+
+[[case]]
+name = "str2-parse-int-of-float-text-is-arg-error"
+src = '"3.5".parse_int()'
+error = "arg_error"
+
+[[case]]
+name = "str2-chained-upper-then-lower-is-identity"
+src = '"MiXeD".upper().lower()'
+value = '"mixed"'
+
+[[case]]
+name = "str2-lines-single-line-no-terminator"
+src = '"onlyline".lines()'
+value = '["onlyline"]'
+
+[[case]]
+name = "str2-lines-empty-string-is-empty-list"
+src = '"".lines()'
+value = "[]"
+
+[[case]]
+name = "str2-lines-trailing-newline-no-extra-blank"
+src = '"a\nb\n".lines()'
+value = '["a", "b"]'
+
+[[case]]
+name = "str2-join-list-of-str-with-comma"
+src = '["a", "b", "c"].join(",")'
+value = '"a,b,c"'
+
+[[case]]
+name = "str2-join-empty-list-is-empty-string"
+src = '[].join(",")'
+value = '""'
+
+[[case]]
+name = "str2-join-single-element-no-separator-inserted"
+src = '["only"].join(",")'
+value = '"only"'
+
+[[case]]
+name = "str2-str-interp-with-method-chain-in-hole"
+src = '"result: {"  ab  ".trim().upper()}"'
+value = '"result: AB"'
+
+[[case]]
+name = "str2-split-multichar-separator"
+src = '"a::b::c".split("::")'
+value = '["a", "b", "c"]'

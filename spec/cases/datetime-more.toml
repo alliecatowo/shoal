@@ -1,0 +1,67 @@
+# Further datetime/time hardening beyond coercion.toml's Add/Sub matrix and
+# literals.toml's render forms: comparisons, date-only vs full-timestamp
+# tagged-literal equality, year-boundary rollover, and a genuine surface gap
+# (TDD §2.1's relative anchors `now`/`today`/`.ago`/`.from_now` have no
+# producer in shoal-eval yet). Every asserted value cross-checked against
+# the real evaluator via the conformance harness.
+
+[[case]]
+name = "dt2-subtraction-gives-day-duration"
+src = 't"2026-07-09T14:00Z" - t"2026-07-08T14:00Z"'
+value = "1d"
+
+[[case]]
+name = "dt2-add-24h-rolls-to-next-day"
+src = 't"2026-07-09T00:00Z" + 24h'
+value = "2026-07-10T00:00:00Z"
+
+[[case]]
+name = "dt2-add-duration-rolls-over-year-boundary"
+src = 't"2026-12-31T23:00Z" + 2h'
+value = "2027-01-01T01:00:00Z"
+
+[[case]]
+name = "dt2-comparison-later-is-greater"
+src = 't"2026-07-09T14:00Z" > t"2026-07-08T14:00Z"'
+value = "true"
+
+[[case]]
+name = "dt2-date-only-tagged-literal-equals-midnight-timestamp"
+# `t"2026-07-09"` (date-only tagged form, TDD §2.1) parses to midnight UTC —
+# structurally equal to the explicit full-timestamp spelling.
+src = 't"2026-07-09" == t"2026-07-09T00:00Z"'
+value = "true"
+
+[[case]]
+name = "dt2-subtraction-across-month-boundary"
+src = 't"2026-03-01T00:00Z" - t"2026-02-01T00:00Z"'
+value = "4w"
+
+[[case]]
+name = "dt2-str-method-is-type-error"
+# `.str()`'s conversion table (methods.rs `to_str`) only covers `str`/
+# `path`/`bytes` receivers; `datetime` has no entry, so it's a plain
+# `type_error`, not a silent no-op.
+src = 't"2026-07-09T14:00Z".str()'
+error = "type_error"
+
+[[case]]
+name = "dt2-time-literal-equality"
+src = "10:00am == 10:00am"
+value = "true"
+
+[[case]]
+name = "dt2-time-literal-ordering"
+src = "10:00 < 10:01"
+value = "true"
+
+[[case]]
+name = "dt2-relative-anchors-not-implemented"
+# TDD §2.1: "Relative anchors are functions: `now`, `today`; durations
+# compose via `.ago` / `.from_now`." None of the four exist in shoal-eval:
+# `now`/`today` resolve as ordinary undefined identifiers (`undefined_var`/
+# `not_found` depending on parse shape), and `duration.ago`/`.from_now` are
+# plain `field_missing` — ordinary, non-datetime-aware field lookups.
+src = "now.year"
+error = "undefined_var"
+skip = "TDD §2.1's now/today relative-anchor functions and .ago/.from_now duration composition have no implementation in shoal-eval yet — now resolves as a plain undefined variable instead of a live-clock function"

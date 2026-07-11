@@ -1,0 +1,170 @@
+# Further list/record method hardening beyond collections.toml: structural
+# equality for list/record, `.sort_by` with a descending key, `.zip` on
+# uneven-length inputs (stops at the shorter, per `zip`'s pairwise
+# construction), `.chunks`/`.take`/`.skip` boundary counts, `.flatten`
+# requiring uniform nested collections, and cross-type `.contains`.
+# Every value cross-checked against the real evaluator via the conformance
+# harness.
+
+[[case]]
+name = "list2-structural-equality-true"
+src = "[1, 2] == [1, 2]"
+value = "true"
+
+[[case]]
+name = "list2-structural-equality-false-different-order"
+src = "[1, 2] == [2, 1]"
+value = "false"
+
+[[case]]
+name = "list2-record-structural-equality-true"
+src = "{a: 1} == {a: 1}"
+value = "true"
+
+[[case]]
+name = "list2-record-structural-equality-key-order-independent"
+# Structural equality for records compares content, not insertion order.
+src = "{a: 1, b: 2} == {b: 2, a: 1}"
+value = "true"
+
+[[case]]
+name = "list2-sort-by-descending-key"
+src = "[3, 1, 2].sort_by(x => -x)"
+value = "[3, 2, 1]"
+
+[[case]]
+name = "list2-zip-stops-at-shorter-input"
+src = "[1, 2, 3].zip([10, 20])"
+value = "[[1, 10], [2, 20]]"
+
+[[case]]
+name = "list2-chunks-of-one-is-singleton-groups"
+src = "[1, 2, 3].chunks(1)"
+value = "[[1], [2], [3]]"
+
+[[case]]
+name = "list2-chunks-zero-size-is-arg-error"
+src = "[1, 2, 3].chunks(0)"
+error = "arg_error"
+
+[[case]]
+name = "list2-take-more-than-length-caps-at-length"
+src = "[1, 2].take(10)"
+value = "[1, 2]"
+
+[[case]]
+name = "list2-skip-more-than-length-is-empty"
+src = "[1, 2].skip(10)"
+value = "[]"
+
+[[case]]
+name = "list2-record-contains-checks-keys-not-values"
+src = '{a: 1}.contains("b")'
+value = "false"
+
+[[case]]
+name = "list2-uniq-on-empty-is-empty"
+src = "[].uniq()"
+value = "[]"
+
+[[case]]
+name = "list2-flatten-requires-uniform-collections"
+# `.flatten()` needs every top-level element to itself be a collection; a
+# bare scalar sibling is a type error, not silently passed through.
+src = "[1, [2, 3]].flatten()"
+error = "type_error"
+
+[[case]]
+name = "list2-flatten-only-removes-one-level"
+src = "[[1, [2]], [3]].flatten()"
+value = "[1, [2], 3]"
+
+[[case]]
+name = "list2-sort-numeric-ascending"
+src = "[3, 1, 2].sort()"
+value = "[1, 2, 3]"
+
+[[case]]
+name = "list2-sort-strings-lexicographic"
+src = '["b", "a"].sort()'
+value = '["a", "b"]'
+
+[[case]]
+name = "list2-where-no-matches-is-empty-list"
+src = "[1, 2, 3].where(x => x > 10)"
+value = "[]"
+
+[[case]]
+name = "list2-reverse-twice-is-identity"
+src = "[1, 2].reverse().reverse()"
+value = "[1, 2]"
+
+[[case]]
+name = "list2-enumerate-then-map-sums-index-and-value"
+src = "[1, 2, 3].enumerate().map(p => p[0] + p[1])"
+value = "[1, 3, 5]"
+
+[[case]]
+name = "list2-null-equals-null"
+src = "null == null"
+value = "true"
+
+[[case]]
+name = "list2-null-not-equal-to-zero"
+src = "null == 0"
+value = "false"
+
+[[case]]
+name = "list2-min-on-single-element"
+src = "[7].min()"
+value = "7"
+
+[[case]]
+name = "list2-max-on-single-element"
+src = "[7].max()"
+value = "7"
+
+[[case]]
+name = "list2-sum-of-floats"
+src = "[1.5, 2.5].sum()"
+value = "4"
+
+[[case]]
+name = "list2-sum-empty-list-is-zero"
+src = "[].sum()"
+value = "0"
+
+[[case]]
+name = "list2-any-on-empty-is-false"
+src = "[].any(x => true)"
+value = "false"
+
+[[case]]
+name = "list2-all-on-empty-is-true"
+src = "[].all(x => false)"
+value = "true"
+
+[[case]]
+name = "list2-index-negative-two"
+src = "[10, 20, 30][-2]"
+value = "20"
+
+[[case]]
+name = "list2-nested-list-index-chain"
+src = "[[1, 2], [3, 4]][1][0]"
+value = "3"
+
+[[case]]
+name = "list2-list-plus-empty-list-is-unchanged"
+src = "[1, 2] + []"
+value = "[1, 2]"
+
+[[case]]
+name = "list2-map-preserves-length"
+src = "[1, 2, 3].map(x => x).len()"
+value = "3"
+
+[[case]]
+name = "list2-group-by-identity-key-order"
+src = "[2, 1, 2, 3].group(x => x)"
+value = "[{key: 2, values: [2, 2]}, {key: 1, values: [1]}, {key: 3, values: [3]}]"

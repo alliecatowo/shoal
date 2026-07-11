@@ -1,0 +1,49 @@
+# Further core-evaluator hardening beyond core.toml: the remaining compound-
+# assignment operators (`core.toml` only exercised `+=`; here `-=`/`*=`/`/=`
+# plus string `+=`), large underscore-grouped hex/binary literals, and list
+# indexing by a `range` value being a type error (lists have no `[a..b]`
+# slice syntax — `.take`/`.skip`/`.chunks` are the sanctioned slicing
+# tools).
+
+[[case]]
+name = "core2-compound-minus-assign"
+src = "var x = 10\nx -= 3\nx"
+value = "7"
+
+[[case]]
+name = "core2-compound-times-assign"
+src = "var x = 10\nx *= 2\nx"
+value = "20"
+
+[[case]]
+name = "core2-compound-div-assign"
+src = "var x = 10\nx /= 2\nx"
+value = "5"
+
+[[case]]
+name = "core2-compound-plus-assign-string"
+src = "var s = \"a\"\ns += \"b\"\ns"
+value = '"ab"'
+
+[[case]]
+name = "core2-hex-literal-large-with-underscores"
+src = "0xFF_FF_FF"
+value = "16777215"
+
+[[case]]
+name = "core2-binary-literal-with-underscore"
+src = "0b1111_0000"
+value = "240"
+
+[[case]]
+name = "core2-empty-string-equality"
+src = '"" == ""'
+value = "true"
+
+[[case]]
+name = "core2-list-index-by-range-is-type-error"
+# Lists support integer indexing (incl. negative, per collections.toml's
+# implicit coverage) but not `[a..b]` range-slice syntax — `.take`/`.skip`/
+# `.chunks` are the sanctioned slicing tools instead.
+src = "[1, 2, 3][0..2]"
+error = "type_error"

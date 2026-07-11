@@ -1,0 +1,28 @@
+# Further outcome-unification hardening beyond outcome.toml's first pass:
+# `.pid` for a BUILTIN outcome (no real subprocess spawns, so it's a fixed
+# `0`, not a real OS pid — distinct from an external-command outcome),
+# `.dur` staying a non-negative duration, `retry`'s success-on-first-try
+# passthrough, and the empty `jobs` table when nothing is backgrounded.
+
+[[case]]
+name = "outcome2-builtin-pid-is-zero-not-a-real-pid"
+# `echo` never spawns a subprocess (outcome-unification wraps its own
+# in-process `Value` return); its outcome's `.pid` is the fixed sentinel
+# `0`, never a real OS process id.
+src = "(echo a).pid"
+value = "0"
+
+[[case]]
+name = "outcome2-dur-is-non-negative"
+src = "(echo hi).dur >= 0s"
+value = "true"
+
+[[case]]
+name = "outcome2-retry-returns-immediately-on-first-success"
+src = "retry(2) { 5 }"
+value = "5"
+
+[[case]]
+name = "outcome2-jobs-empty-when-nothing-backgrounded"
+src = "jobs.len()"
+value = "0"

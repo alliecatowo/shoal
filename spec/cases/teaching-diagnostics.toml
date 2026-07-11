@@ -1,0 +1,86 @@
+# Curated teaching diagnostics (TDD §2.1's "illegal everywhere" list plus a
+# few parser-specific ones) not yet covered by core.toml's pipe/dollar/
+# backtick/comparison-chain quartet: bad string escapes, unterminated
+# interpolation, `&` used as a bitwise-looking operator (command syntax
+# only, `&&` for logical and), and a leading `|` at the start of a match
+# arm.
+#
+# IMPORTANT harness-parity note (found while authoring this file): the two
+# conformance runners disagree on what `parse_error_contains` is checked
+# against. `crates/shoal/tests/conformance.rs` matches the needle against
+# `e.msg` OR `e.hint`; `crates/shoal-eval/tests/conformance.rs` matches only
+# against `err.to_string()` — and `ParseError`'s `Display` impl
+# (`shoal-syntax/src/parser.rs`) writes `self.msg` alone, never the hint. So
+# a `parse_error_contains` needle that only appears in a diagnostic's HINT
+# (not its top-level message) passes the `shoal` crate's harness but fails
+# shoal-eval's. Every needle below is therefore chosen to appear in the
+# diagnostic's own `msg`, not only its `hint` — hint text is called out in
+# comments for context, never asserted directly via `parse_error_contains`.
+
+[[case]]
+name = "teach-unknown-string-escape"
+# hint (msg-external, not asserted per this file's header note): "escapes:
+# \n \t \r \0 \\ \" \{ \} \u{…}".
+src = '"bad \q escape"'
+parse_error = true
+parse_error_contains = "unknown escape"
+
+[[case]]
+name = "teach-unterminated-interpolation-hole"
+# hint (not asserted): "escape a literal brace as \{".
+src = '"a{b"'
+parse_error = true
+parse_error_contains = "unterminated"
+
+[[case]]
+name = "teach-bitwise-and-is-not-an-operator"
+# A lone `&` between two expressions isn't logical-and (that's `&&`) or any
+# other operator — it's reserved for command backgrounding syntax only.
+# hint (not asserted): "backgrounding with & is command syntax; logical and
+# is &&".
+src = "true & false"
+parse_error = true
+parse_error_contains = "not an operator"
+
+[[case]]
+name = "teach-leading-pipe-in-match-arm"
+# `|` is only legal BETWEEN alternated patterns (TDD §1.4's one asylum for
+# `|`); a leading one before the first pattern is a dedicated diagnostic,
+# not a generic "expected pattern" error. hint (not asserted): "alternation
+# is `a | b => …`; drop the leading `|`".
+src = 'match 5 { | 1 => "a"; _ => "b" }'
+parse_error = true
+parse_error_contains = "unexpected `|` at the start of a match arm"
+
+[[case]]
+name = "teach-bracket-cannot-start-a-command-argument"
+# A bare `[` starting a CMD-mode word (with no matching `]` closing the
+# same whitespace-delimited run, so it's not a glob character class) is
+# illegal. hint (not asserted): "quote it, or pass a list with (expr);
+# mid-word [ranges] in globs are fine".
+src = "zzznotarealcommand [a, b]"
+parse_error = true
+parse_error_contains = "cannot start a command argument"
+
+[[case]]
+name = "teach-raw-string-real-newline-is-unterminated"
+# A literal (real byte, not `\n` text) newline inside a non-triple `'…'`
+# raw string is illegal — multiline needs the triple-raw form. hint (not
+# asserted): "use '''…''' for multiline raw strings".
+src = '''
+'line1
+line2'
+'''
+parse_error = true
+parse_error_contains = "unterminated string (newline)"
+
+[[case]]
+name = "teach-interpolating-string-real-newline-is-unterminated"
+# Same rule for the interpolating `"…"` form. hint (not asserted): "use
+# \"\"\"…\"\"\" for multiline strings".
+src = '''
+"line1
+line2"
+'''
+parse_error = true
+parse_error_contains = "unterminated string (newline)"

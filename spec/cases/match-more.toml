@@ -1,0 +1,107 @@
+# Further `match` pattern/guard hardening beyond match.toml: guards
+# combining multiple bound names, nested record+list subpatterns, type
+# patterns beyond int/str/bool, and a real parser gap found while probing
+# guard shapes (documented via `skip`, not worked around).
+#
+# --- a genuine parser gap, found while authoring this file --------------
+#
+# `primary()`'s bare-`IDENT`-then-`FatArrow` lambda shorthand (and
+# `paren_or_lambda`'s `(IDENT) => …` zero/one-param sibling) fire
+# regardless of parse context: whenever the LAST token position of a guard
+# expression is a bare identifier (or a parenthesized bare identifier)
+# immediately followed by `=>`, the parser greedily consumes that `=>` as
+# a lambda arrow instead of leaving it for the match arm — so the arm's own
+# `=>` search then fails with "expected `=>`". `if flag => …`, `if n > n =>
+# …`, `if 1 < n => …`, and `if n > (c) => …` all hit this (the operand
+# ending the guard is a bare/parenthesized identifier); `if n > 1 => …`,
+# `if a - b > 0 => …`, and `if xs.contains(n) => …` do NOT (the guard's
+# final leaf is a literal, or a real call/index whose closing `)`/`]`
+# belongs to a call/index production, not `paren_or_lambda`). Every guard
+# case below is deliberately phrased to end its rightmost operand in a
+# literal/call/index for exactly this reason.
+
+[[case]]
+name = "match2-guard-comparing-two-bound-names-is-a-known-parser-gap"
+# See this file's header: `if a > b => …` mis-parses because `b` (a bare
+# identifier immediately before `=>`) gets swallowed as a lambda arrow.
+src = 'match [1, 2] { [a, b] if a > b => "desc"; _ => "not-desc" }'
+value = '"not-desc"'
+skip = "known shoal-syntax gap: a guard whose final operand is a bare identifier immediately followed by `=>` gets mis-parsed as a one-param lambda (primary()'s IDENT-then-FatArrow shorthand), swallowing the match arm's own `=>` and producing 'expected `=>`' — reproducible minimally as `match 5 { n if flag => 1; _ => 0 }`"
+
+[[case]]
+name = "match2-guard-two-names-worked-around-with-arithmetic"
+# The same comparison, rephrased so the guard's rightmost leaf is a literal
+# (`0`), sidesteps the gap above entirely and is the correct, spec-derived
+# result: [2, 1] is descending.
+src = 'match [2, 1] { [a, b] if a - b > 0 => "desc"; _ => "not-desc" }'
+value = '"desc"'
+
+[[case]]
+name = "match2-guard-ending-in-method-call-is-unaffected"
+# A guard ending in a real call's closing `)` (not a bare/parenthesized
+# identifier) never hits the gap — `call = "(" [args] ")"` is a different
+# production from `paren_or_lambda`.
+src = 'match [1, 2, 3] { xs if xs.contains(2) => "found"; _ => "missing" }'
+value = '"found"'
+
+[[case]]
+name = "match2-guard-ending-in-index-is-unaffected"
+src = 'match [5, 9] { xs if xs[1] > xs[0] => "growing"; _ => "not-growing" }'
+value = '"growing"'
+
+[[case]]
+name = "match2-nested-record-then-list-subpattern"
+src = 'match {tags: ["a", "b"]} { {tags: [first, ...rest]} => first; _ => "none" }'
+value = '"a"'
+
+[[case]]
+name = "match2-list-of-records-fixed-arity"
+src = 'match [{n: 1}, {n: 2}] { [{n: a}, {n: b}] => a + b; _ => 0 }'
+value = "3"
+
+[[case]]
+name = "match2-type-pattern-float"
+src = 'match 3.5 { float f => f * 2; _ => 0 }'
+value = "7"
+
+[[case]]
+name = "match2-type-pattern-null"
+src = 'match null { null => "isnull"; _ => "notnull" }'
+value = '"isnull"'
+
+[[case]]
+name = "match2-bool-literal-arms-both-covered"
+src = "match true { true => 1; false => 0 }"
+value = "1"
+
+[[case]]
+name = "match2-list-rest-at-head-is-a-parse-error"
+# TDD's list-pattern grammar only admits `...IDENT` as a trailing rest
+# (`listpats`); a rest marker in a leading position is rejected.
+src = "match [1, 2, 3] { [...init, last] => last; _ => 0 }"
+parse_error = true
+
+[[case]]
+name = "match2-record-guard-with-two-comparisons-anded"
+src = 'match {status: 404} { {status} if status >= 200 && status < 300 => "ok"; {status} if status >= 400 => "err"; _ => "other" }'
+value = '"err"'
+
+[[case]]
+name = "match2-empty-list-pattern-does-not-match-rest-pattern"
+src = "match [] { [a, ...rest] => \"has\"; [] => \"empty\" }"
+value = '"empty"'
+
+[[case]]
+name = "match2-single-element-rest-binds-empty-tail"
+src = "match [1] { [a, ...rest] => rest; _ => [-1] }"
+value = "[]"
+
+[[case]]
+name = "match2-alternation-of-three-int-literals"
+src = 'match 2 { 1 | 2 | 3 => "low"; _ => "high"}'
+value = '"low"'
+
+[[case]]
+name = "match2-record-field-missing-falls-through-to-wildcard"
+src = 'match {a: 1} { {a, b} => "has-both"; _ => "missing-b" }'
+value = '"missing-b"'

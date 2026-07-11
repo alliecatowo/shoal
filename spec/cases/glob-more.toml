@@ -1,0 +1,39 @@
+# Glob hardening beyond edges.toml's empty-glob case: basic non-dotfile
+# matching (counted via a `...rest: list<path>` variadic sink, since that's
+# the one word-binding shape that correctly accumulates every match — see
+# desugar-more.toml's documented gap for the non-variadic `list<path>`
+# sibling), `**` recursion into subdirectories, and a real spec/impl gap
+# found while probing TDD §4.3's dotfile-exclusion promise.
+
+[[case]]
+name = "glob2-star-matches-multiple-non-dotfiles"
+fixture = ["a.txt", "b.txt", "c.log"]
+src = '''
+fn f(...rest: list<path>) { rest.len() }
+f *.txt
+'''
+value = "2"
+
+[[case]]
+name = "glob2-double-star-recurses-into-subdirs"
+fixture = ["a.txt", "sub/b.txt"]
+src = '''
+fn f(...rest: list<path>) { rest.len() }
+f **/*.txt
+'''
+value = "2"
+
+[[case]]
+name = "glob2-dotfiles-excluded-by-default-not-honored"
+# TDD §4.3: "dotfiles excluded unless pattern starts with `.`" — a plain
+# `*.txt` should skip `.hidden.txt`. The current glob expansion does not
+# apply this filter at all: `.hidden.txt` is included in the match set
+# right alongside the non-dotfiles, so the variadic sink sees 3 matches
+# instead of the spec-correct 2.
+fixture = [".hidden.txt", "a.txt", "b.txt"]
+src = '''
+fn f(...rest: list<path>) { rest.len() }
+f *.txt
+'''
+value = "2"
+skip = "TDD §4.3's dotfile-exclusion rule ('dotfiles excluded unless pattern starts with .') is not honored by the current glob expansion — a plain *.txt pattern currently includes .hidden.txt in its match set (3 matches) instead of skipping it (2), real gap not a corpus authoring choice"

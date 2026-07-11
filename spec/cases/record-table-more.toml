@@ -1,0 +1,73 @@
+# Further record/table hardening beyond collections.toml: `.len()`/
+# `.is_empty()` on records (key count, not a list-only notion), empty-record
+# `.keys()`, bracket-indexing a record by a string key (an alternative to
+# `.field` access), deep nested field chains, and record+record being a
+# type error (no implicit merge operator — `TDD` never lists one).
+
+[[case]]
+name = "rt2-record-len-counts-keys"
+src = "{a: 1, b: 2}.len()"
+value = "2"
+
+[[case]]
+name = "rt2-empty-record-len-is-zero"
+src = "{}.len()"
+value = "0"
+
+[[case]]
+name = "rt2-empty-record-is-empty-true"
+src = "{}.is_empty()"
+value = "true"
+
+[[case]]
+name = "rt2-empty-record-keys-is-empty-list"
+src = "{}.keys()"
+value = "[]"
+
+[[case]]
+name = "rt2-record-get-with-default-present-key"
+src = '{a: 1, b: 2}.get("a", 0)'
+value = "1"
+
+[[case]]
+name = "rt2-record-bracket-index-by-string-key"
+src = '{a: 1}["a"]'
+value = "1"
+
+[[case]]
+name = "rt2-deep-nested-field-chain"
+src = "{a: {b: {c: 1}}}.a.b.c"
+value = "1"
+
+[[case]]
+name = "rt2-record-plus-record-is-type-error"
+# There is no implicit record-merge operator (TDD never lists `+` as
+# record-admitting in the coercion matrix) — `+` on two records is a plain
+# type error.
+src = "{a: 1} + {b: 2}"
+error = "type_error"
+
+[[case]]
+name = "rt2-list-of-records-map-field-then-sum"
+src = "[{a: 1}, {a: 2}].map(r => r.a).sum()"
+value = "3"
+
+[[case]]
+name = "rt2-items-first-pair-is-key-then-value"
+src = '{a: 1}.items().first()'
+value = '["a", 1]'
+
+[[case]]
+name = "rt2-record-with-list-value-field-access"
+src = "{tags: [1, 2, 3]}.tags.len()"
+value = "3"
+
+[[case]]
+name = "rt2-nested-record-equality-structural"
+src = "{a: {b: 1}} == {a: {b: 1}}"
+value = "true"
+
+[[case]]
+name = "rt2-nested-record-equality-false-on-inner-mismatch"
+src = "{a: {b: 1}} == {a: {b: 2}}"
+value = "false"

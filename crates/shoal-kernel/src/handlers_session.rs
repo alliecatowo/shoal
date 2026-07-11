@@ -1,74 +1,11 @@
-//! `dispatch` handlers for session lifecycle + read-only introspection:
-//! `session.attach`, `parse`, `complete`, `explain`, `blob.get`. Split out of
+//! `dispatch` handlers for read-only introspection: `parse`, `complete`,
+//! `explain`, `blob.get`. `session.attach` itself lives in `session.rs`
+//! alongside the `Session`/`Attachment` state it populates. Split out of
 //! `lib.rs`'s dispatch match (docs/ROADMAP.md wave R4): pure mechanical move,
 //! zero wire/behavior change.
 use super::*;
 
 impl Kernel {
-    pub(crate) fn handle_session_attach(
-        self: &Arc<Self>,
-        params: Json,
-        attached: &mut Option<Attachment>,
-    ) -> Result<Json, RpcError> {
-        let params: AttachParams = decode(params)?;
-        let (who, token_caps, profile) = if let Some(token) = params.token {
-            let auth = self.auth.as_ref().ok_or_else(|| RpcError {
-                code: -32030,
-                message: "bearer tokens unavailable in ephemeral kernel".into(),
-                data: None,
-            })?;
-            let meta = auth
-                .lock()
-                .unwrap()
-                .validate(&token)
-                .ok_or_else(|| RpcError {
-                    code: -32030,
-                    message: "invalid, expired, or revoked bearer token".into(),
-                    data: None,
-                })?;
-            (meta.principal, meta.caps, meta.profile)
-        } else {
-            (principal(), vec![], "local-human".into())
-        };
-        let name = params.session.unwrap_or_else(|| "default".into());
-        let session = self.session(&name).map_err(internal)?;
-        let cwd = session
-            .evaluator
-            .lock()
-            .unwrap()
-            .cwd()
-            .as_os_str()
-            .to_owned();
-        *attached = Some(Attachment {
-            session,
-            principal: who.clone(),
-        });
-        // TDD §8 tier honesty: report the REAL strongest OS backend
-        // available on this host (Landlock → A, Seatbelt → C, else
-        // advisory D), and whether this principal's spawns will
-        // *actually* be confined — true only when a genuine OS backend
-        // exists AND this principal's policy resolves to a real sandbox
-        // (a scoped agent), never for the default-permissive human.
-        let status = EnforcementStatus::detect();
-        let tier = tier_letter(status.available_tier);
-        let backend_present = matches!(
-            status.available_tier,
-            EnforcementTier::A | EnforcementTier::C
-        );
-        let caps_enforced = backend_present && self.policy.sandbox_for(&who).is_some();
-        encode(AttachResult {
-            session: name,
-            principal: who.clone(),
-            caps: json!({"enforced":caps_enforced,"tier":tier,"available_tier":tier,"policy_principal":who,"profile":profile,"token_caps":token_caps,"opaque":verdict_name(self.policy.evaluate_effect(&who, &Effect::Opaque))}),
-            cwd: WirePath::encode(&cwd),
-            env_hash: "local".into(),
-            ast_version: AST_VERSION,
-            caps_enforced,
-            elide_defaults: elide_defaults_json(),
-            channels: STATIC_CHANNELS.iter().map(|s| s.to_string()).collect(),
-        })
-    }
-
     pub(crate) fn handle_parse(self: &Arc<Self>, params: Json) -> Result<Json, RpcError> {
         let params: ParseParams = decode(params)?;
         let ast = shoal_syntax::parse(&params.src).map_err(|e| RpcError {

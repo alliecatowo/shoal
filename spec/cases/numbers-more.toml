@@ -1,0 +1,86 @@
+# Further int/float edge cases beyond numbers.toml's overflow/div/rem pass:
+# i64::MIN boundary literals and arithmetic, round-half-away-from-zero for
+# BOTH sign floors near a `.5` boundary, floor/ceil sign behavior, and
+# int<->float cross-type equality (arithmetic promotion makes `5 == 5.0`
+# true, per TDD §4.2 site 1). Every value cross-checked against the real
+# evaluator via the conformance harness.
+
+[[case]]
+name = "num2-int-min-literal-out-of-range-is-parse-error"
+# The bare digit run `9223372036854775808` overflows i64::MAX as a positive
+# token BEFORE unary minus applies, so even i64::MIN's own literal spelling
+# is a parse-time error, not an eval-time `overflow`.
+src = "-9223372036854775808"
+parse_error = true
+
+[[case]]
+name = "num2-int-min-reachable-via-subtraction"
+# i64::MIN is reachable via arithmetic that never spells its literal digits
+# directly: MAX's negation minus one more.
+src = "-9223372036854775807 - 1"
+value = "-9223372036854775808"
+
+[[case]]
+name = "num2-int-min-minus-one-more-overflows"
+src = "(-9223372036854775807 - 1) - 1"
+error = "overflow"
+
+[[case]]
+name = "num2-float-round-half-away-from-zero-positive"
+src = "(2.5).round()"
+value = "3"
+
+[[case]]
+name = "num2-float-round-half-away-from-zero-negative"
+src = "(-2.5).round()"
+value = "-3"
+
+[[case]]
+name = "num2-float-floor-negative-rounds-down"
+src = "(-3.5).floor()"
+value = "-4"
+
+[[case]]
+name = "num2-float-ceil-negative-rounds-up"
+src = "(-3.5).ceil()"
+value = "-3"
+
+[[case]]
+name = "num2-float-round-negative-half"
+src = "(-3.5).round()"
+value = "-4"
+
+[[case]]
+name = "num2-int-equals-float-via-promotion"
+src = "5 == 5.0"
+value = "true"
+
+[[case]]
+name = "num2-float-equals-int-via-promotion"
+src = "5.0 == 5"
+value = "true"
+
+[[case]]
+name = "num2-int-div-negative-dividend-positive-divisor"
+src = "-5 / 2"
+value = "-2"
+
+[[case]]
+name = "num2-int-div-positive-dividend-negative-divisor"
+src = "5 / -2"
+value = "-2"
+
+[[case]]
+name = "num2-int-div-both-negative"
+src = "-5 / -2"
+value = "2"
+
+[[case]]
+name = "num2-int-rem-both-negative"
+src = "-5 % -2"
+value = "-1"
+
+[[case]]
+name = "num2-int-rem-by-zero-is-div-zero"
+src = "5 % 0"
+error = "div_zero"

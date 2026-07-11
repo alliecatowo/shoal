@@ -1,0 +1,85 @@
+# size/duration coercion cells not yet in coercion.toml: same-unit Add (only
+# Sub was covered there), zero identities, cross-unit equality/ordering
+# (decimal kb = 1000 bytes, never 1024), and the numeric-only-methods
+# boundary (`.abs()` doesn't apply to size/duration receivers — TDD §4.1's
+# arithmetic promotion site is distinct from the numeric-unary method site).
+# Every value cross-checked against the real evaluator via the conformance
+# harness.
+
+[[case]]
+name = "sizedur-size-plus-size-same-unit"
+src = "1kb + 1kb"
+value = "2kb"
+
+[[case]]
+name = "sizedur-size-plus-size-rolls-over-to-next-unit"
+src = "500b + 500b"
+value = "1kb"
+
+[[case]]
+name = "sizedur-duration-plus-duration-same-unit"
+src = "1h + 1h"
+value = "2h"
+
+[[case]]
+name = "sizedur-duration-plus-duration-rolls-over"
+src = "30m + 30m"
+value = "1h"
+
+[[case]]
+name = "sizedur-duration-minus-duration-cross-unit"
+src = "1d - 12h"
+value = "12h"
+
+[[case]]
+name = "sizedur-duration-plus-zero-is-identity"
+src = "0s + 5s"
+value = "5s"
+
+[[case]]
+name = "sizedur-duration-minus-self-is-zero"
+src = "5s - 5s"
+value = "0s"
+
+[[case]]
+name = "sizedur-duration-equals-across-units"
+src = "5s == 5000ms"
+value = "true"
+
+[[case]]
+name = "sizedur-size-decimal-kb-is-not-1024-bytes"
+# Decimal `kb` = 1000 bytes; the binary family (`kib`) is the 1024 one, so a
+# decimal/byte-count equality at the 1024 boundary is false.
+src = "1kb == 1024b"
+value = "false"
+
+[[case]]
+name = "sizedur-duration-lt-cross-unit"
+src = "5s < 10s"
+value = "true"
+
+[[case]]
+name = "sizedur-size-abs-is-type-error"
+# `.abs()` is numeric-only (int/float); size has no receiver arm.
+src = "5kb.abs()"
+error = "type_error"
+
+[[case]]
+name = "sizedur-duration-abs-is-type-error"
+src = "(0s).abs()"
+error = "type_error"
+
+[[case]]
+name = "sizedur-duration-negative-literal-render"
+src = "-5s"
+value = "-5s"
+
+[[case]]
+name = "sizedur-size-times-zero-is-zero-bytes"
+src = "1kb * 0"
+value = "0b"
+
+[[case]]
+name = "sizedur-zero-size-div-int"
+src = "0kb / 5"
+value = "0b"

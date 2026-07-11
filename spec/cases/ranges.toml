@@ -1,0 +1,91 @@
+# Range value hardening: exclusive/inclusive length, empty/reversed ranges
+# (never an error — just zero iterations, matching TDD's general "no
+# surprises" numeric philosophy), `.contains`/`in`, iteration over a range
+# via `.map`/`.sum`/`for`, and the int-only bound restriction (float bounds
+# are a type error — ranges are a discrete-step construct). Every value
+# cross-checked against the real evaluator via the conformance harness.
+
+[[case]]
+name = "range-exclusive-len"
+src = "(1..5).len()"
+value = "4"
+
+[[case]]
+name = "range-inclusive-len"
+src = "(1..=5).len()"
+value = "5"
+
+[[case]]
+name = "range-reversed-is-empty-not-an-error"
+# A range whose end is before its start is simply empty — reversed bounds
+# never raise.
+src = "(5..1).len()"
+value = "0"
+
+[[case]]
+name = "range-self-equal-bounds-exclusive-is-empty"
+src = "(1..1).len()"
+value = "0"
+
+[[case]]
+name = "range-contains-a-member"
+src = "(1..10).contains(5)"
+value = "true"
+
+[[case]]
+name = "range-in-operator-excludes-inclusive-self-bound"
+# `3 in 3..3` — an empty (self-bound exclusive) range contains nothing.
+src = "3 in 3..3"
+value = "false"
+
+[[case]]
+name = "range-negative-to-positive-len"
+src = "(-3..3).len()"
+value = "6"
+
+[[case]]
+name = "range-map-doubles-each"
+src = "(1..5).map(x => x * 2)"
+value = "[2, 4, 6, 8]"
+
+[[case]]
+name = "range-for-loop-over-reversed-never-executes"
+src = '''
+var s = 0
+for i in 5..1 { s += 1 }
+s
+'''
+value = "0"
+
+[[case]]
+name = "range-sum-exclusive"
+src = "(1..5).sum()"
+value = "10"
+
+[[case]]
+name = "range-sum-inclusive"
+src = "(1..=5).sum()"
+value = "15"
+
+[[case]]
+name = "range-float-bound-is-type-error"
+# Ranges are a discrete-step construct restricted to `int` bounds (TDD §4.1
+# lists `int`, not `float`, among range-admitting types) — a float bound is
+# a type error, not silent truncation.
+src = "1..5.5"
+error = "type_error"
+
+[[case]]
+name = "range-both-float-bounds-is-type-error"
+src = "1.5..5.5"
+error = "type_error"
+
+[[case]]
+name = "range-render-exclusive"
+src = "2..7"
+value = "2..7"
+
+[[case]]
+name = "range-render-inclusive"
+src = "2..=7"
+value = "2..=7"

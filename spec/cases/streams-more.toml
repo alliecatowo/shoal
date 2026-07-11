@@ -1,0 +1,39 @@
+# Further stream hardening beyond streams.toml: `.skip` as a combinator
+# (not just a collection-sink slice), and the generic higher-order sinks
+# (`.count`/`.any`/`.all`/`.find`) forwarding through a stream exactly like
+# they do for a plain list, plus an empty source collecting cleanly.
+
+[[case]]
+name = "stream2-skip-combinator"
+src = '[1, 2, 3, 4].stream().skip(2).collect()'
+value = "[3, 4]"
+
+[[case]]
+name = "stream2-count-sink"
+src = '[1, 2].stream().count()'
+value = "2"
+
+[[case]]
+name = "stream2-empty-source-collects-to-empty-list"
+src = '[].stream().collect()'
+value = "[]"
+
+[[case]]
+name = "stream2-where-no-matches-collects-empty"
+src = '[1, 2, 3].stream().where(x => x > 10).collect()'
+value = "[]"
+
+[[case]]
+name = "stream2-any-sink"
+src = '[1, 2, 3].stream().any(x => x > 2)'
+value = "true"
+
+[[case]]
+name = "stream2-all-sink"
+src = '[1, 2, 3].stream().all(x => x > 0)'
+value = "true"
+
+[[case]]
+name = "stream2-find-sink"
+src = '[1, 2, 3].stream().find(x => x == 2)'
+value = "2"

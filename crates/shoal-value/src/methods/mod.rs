@@ -1,0 +1,454 @@
+//! Value-method standard library. Methods are deliberately pure except the
+//! explicit filesystem sinks (`save` and `append`).
+//!
+//! # Module layout
+//!
+//! This file holds `call_method`'s dispatch table (grouped by receiver type)
+//! plus the small argument-decoding helpers every arm shares. The actual
+//! method bodies live one per receiver-type module:
+//!
+//! - [`list`] — collection ops shared by `list`/`table`/`range` (via `seq`),
+//!   plus a couple of receiver-polymorphic ones (`.contains`, `.get`).
+//! - [`strops`] — string ops.
+//! - [`record`] — record-only ops (`.keys`/`.values`/`.items`).
+//! - [`path`] — `.save`/`.append`.
+//! - [`num`] — numeric unary ops.
+//! - [`stream`] — the `stream<T>` method surface (STREAMS §3–§4).
+//! - [`outcome`] — outcome method forwarding (P1b unification).
+//! - [`task`] — task lifecycle methods (TDD §4.7 job control).
+
+mod list;
+mod num;
+mod outcome;
+mod path;
+mod record;
+mod stream;
+mod strops;
+mod task;
+
+use super::*;
+
+pub fn call_method(
+    ctx: &mut dyn CallCtx,
+    recv: Value,
+    name: &str,
+    args: CallArgs,
+    span: Span,
+) -> VResult<Value> {
+    dispatch(ctx, recv, name, args).map_err(|e| e.or_span(span))
+}
+
+fn dispatch(ctx: &mut dyn CallCtx, recv: Value, name: &str, args: CallArgs) -> VResult<Value> {
+    // Outcome unification (P1b): an unknown method on a command outcome forwards
+    // to its structured `.out`, so `ls.where(.size > 1b).sort(.name)` works
+    // (`ls` is an outcome; `.where`/`.sort` operate on its `.out` table). Raw
+    // stream bytes stay reachable via `.stdout`/`.stderr`.
+    if let Value::Outcome(o) = &recv {
+        return outcome::forward(ctx, o, name, args);
+    }
+    // Streams (docs/STREAMS.md) get their own method surface: the lazy
+    // combinators (§3) return a NEW stream without driving the source, and the
+    // sinks (§4) drive it (with `ctx` for closure stages). Anything else falls
+    // through to the collection methods by materializing a *bounded* stream to a
+    // list first (an unbounded stream errors `stream_unbounded`).
+    if let Value::Stream(s) = recv {
+        return stream::stream_method(ctx, s, name, args);
+    }
+    match name {
+        // `.feed(cmd)` (IO.md §1) spawns a child, which a pure value method
+        // cannot do — the evaluator intercepts `.feed` in its method-call path
+        // (shoal-eval `expr.rs::eval_feed`) before `call_method` is ever
+        // reached, building an `ExecSpec` with the value's `feed_bytes` as
+        // stdin. Reaching here means `.feed` was called through a path that
+        // bypassed that bridge; surface a clear error rather than "no method".
+        "feed" => Err(ErrorVal::type_error(
+            ".feed must be evaluated by the interpreter, not as a pure value method",
+        )),
+        "len" | "count" => no_args(&args).and_then(|_| list::len(recv)),
+        "is_empty" => no_args(&args)
+            .and_then(|_| list::len(recv))
+            .map(|v| Value::Bool(v == Value::Int(0))),
+        "first" => list::first_last(recv, &args, true),
+        "last" => list::first_last(recv, &args, false),
+        "collect" => list::collect(recv),
+        // `.stream()` promotes a finite collection (or a string's lines) into a
+        // lazy `stream<T>` so the stream combinators (STREAMS §3) can be exercised
+        // on deterministic, in-memory data — the honest finite counterpart of the
+        // live `watch`/`tail`/`every` sources.
+        "stream" => no_args(&args).and_then(|_| list::to_stream(recv)),
+        "tee" => list::tee(recv, int_arg(&args, 0, 2)?),
+        "map" => list::map(ctx, recv, arg(&args, 0)?),
+        "where" | "filter" => list::filter(ctx, recv, arg(&args, 0)?),
+        "each" => list::each(ctx, recv, arg(&args, 0)?),
+        "any" => list::any_all(ctx, recv, arg(&args, 0)?, true),
+        "all" => list::any_all(ctx, recv, arg(&args, 0)?, false),
+        "find" => list::find(ctx, recv, arg(&args, 0)?),
+        "flat_map" => list::flat_map(ctx, recv, arg(&args, 0)?),
+        "sort_by" => list::sort_by(ctx, recv, arg(&args, 0)?),
+        // `sort(.key)` sorts by the key extractor (e.g. `ls.sort(.name)`);
+        // `sort()` with no argument sorts the elements directly.
+        "sort" => {
+            if args.pos.is_empty() {
+                list::sort(recv)
+            } else {
+                list::sort_by(ctx, recv, arg(&args, 0)?)
+            }
+        }
+        "reverse" => list::reverse(recv),
+        "uniq" => list::uniq(recv),
+        "sum" => list::sum(recv),
+        "min" => list::minmax(recv, false),
+        "max" => list::minmax(recv, true),
+        "flatten" => list::flatten(recv),
+        "enumerate" => list::enumerate(recv),
+        "skip" => list::slice_count(recv, int_arg(&args, 0, 0)?, false),
+        "take" => list::slice_count(recv, int_arg(&args, 0, 0)?, true),
+        "chunks" => list::chunks(recv, int_arg(&args, 0, 0)?),
+        "zip" => list::zip(recv, arg(&args, 0)?.clone()),
+        "group" => list::group(ctx, recv, arg(&args, 0)?),
+        "join" => list::join(recv, str_arg(&args, 0, "")?),
+        "lines" => strops::string_unary(recv, |s| {
+            Value::List(
+                s.lines()
+                    .map(|x| Value::Str(x.trim_end_matches('\r').into()))
+                    .collect(),
+            )
+        }),
+        "words" => strops::string_unary(recv, |s| {
+            Value::List(s.split_whitespace().map(|x| Value::Str(x.into())).collect())
+        }),
+        "chars" => strops::string_unary(recv, |s| {
+            Value::List(s.chars().map(|x| Value::Str(x.to_string())).collect())
+        }),
+        "trim" => strops::string_unary(recv, |s| Value::Str(s.trim().into())),
+        "upper" => strops::string_unary(recv, |s| Value::Str(s.to_uppercase())),
+        "lower" => strops::string_unary(recv, |s| Value::Str(s.to_lowercase())),
+        "split" => {
+            let sep = str_arg(&args, 0, "")?;
+            strops::string_unary(recv, |s| {
+                Value::List(s.split(sep).map(|x| Value::Str(x.into())).collect())
+            })
+        }
+        "starts_with" => strops::string_pred(recv, str_arg(&args, 0, "")?, |s, q| s.starts_with(q)),
+        "ends_with" => strops::string_pred(recv, str_arg(&args, 0, "")?, |s, q| s.ends_with(q)),
+        "contains" => list::contains(recv, arg(&args, 0)?),
+        "replace" => {
+            let a = str_arg(&args, 0, "")?;
+            let b = str_arg(&args, 1, "")?;
+            strops::string_unary(recv, |s| Value::Str(s.replace(a, b)))
+        }
+        "matches" => strops::matches_method(recv, arg(&args, 0)?),
+        "match" => strops::match_method(recv, arg(&args, 0)?),
+        "parse_int" => strops::string_parse(recv, "int"),
+        "parse_float" => strops::string_parse(recv, "float"),
+        "keys" => record::record_side(recv, true),
+        "values" => record::record_side(recv, false),
+        "items" => record::items(recv),
+        "get" => list::get(
+            recv,
+            arg(&args, 0)?,
+            args.pos.get(1).cloned().unwrap_or(Value::Null),
+        ),
+        "str" => strops::to_str(recv, false),
+        "display" => strops::to_str(recv, true),
+        "json" => Ok(Value::Str(
+            serde_json::to_string(&value_to_json(&recv))
+                .map_err(|e| ErrorVal::new("custom", e.to_string()))?,
+        )),
+        "abs" => num::numeric_unary(recv, f64::abs, i64::checked_abs),
+        "round" => num::float_unary(recv, f64::round),
+        "floor" => num::float_unary(recv, f64::floor),
+        "ceil" => num::float_unary(recv, f64::ceil),
+        "save" => path::save(ctx, recv, arg(&args, 0)?, false),
+        "append" => path::save(ctx, recv, arg(&args, 0)?, true),
+        // Task lifecycle methods (defect #14, TDD §4.7 job control).
+        "await" | "wait" => no_args(&args).and_then(|_| task::task_await(recv)),
+        "cancel" => no_args(&args).and_then(|_| task::task_cancel(recv)),
+        "is_done" => no_args(&args).and_then(|_| task::task_is_done(recv)),
+        "suspend" => no_args(&args).and_then(|_| task::task_suspend(recv)),
+        "resume" => no_args(&args).and_then(|_| task::task_resume(recv)),
+        "is_suspended" => no_args(&args).and_then(|_| task::task_is_suspended(recv)),
+        _ => Err(ErrorVal::new(
+            "field_missing",
+            format!("unknown method `.{name}` on {}", recv.type_name()),
+        )),
+    }
+}
+
+pub(crate) fn arg(args: &CallArgs, n: usize) -> VResult<&Value> {
+    args.pos
+        .get(n)
+        .ok_or_else(|| ErrorVal::arg_error(format!("missing argument {}", n + 1)))
+}
+pub(crate) fn no_args(args: &CallArgs) -> VResult<()> {
+    if args.pos.is_empty() && args.named.is_empty() {
+        Ok(())
+    } else {
+        Err(ErrorVal::arg_error("method takes no arguments"))
+    }
+}
+pub(crate) fn int_arg(args: &CallArgs, n: usize, default: i64) -> VResult<usize> {
+    match args.pos.get(n) {
+        None => Ok(default.max(0) as usize),
+        Some(Value::Int(i)) if *i >= 0 => Ok(*i as usize),
+        Some(v) => Err(ErrorVal::type_error(format!(
+            "expected non-negative int, found {}",
+            v.type_name()
+        ))),
+    }
+}
+pub(crate) fn str_arg<'a>(args: &'a CallArgs, n: usize, default: &'a str) -> VResult<&'a str> {
+    match args.pos.get(n) {
+        None => Ok(default),
+        Some(Value::Str(s)) => Ok(s),
+        Some(v) => Err(ErrorVal::type_error(format!(
+            "expected str, found {}",
+            v.type_name()
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{RegexVal, StreamVal};
+    struct C {
+        cwd: PathBuf,
+    }
+    impl CallCtx for C {
+        fn call_closure(&mut self, f: &Value, args: Vec<Value>) -> VResult<Value> {
+            match f {
+                Value::Str(s) if s == "double" => match args[0] {
+                    Value::Int(i) => Ok(Value::Int(i * 2)),
+                    _ => unreachable!(),
+                },
+                Value::Str(s) if s == "even" => match args[0] {
+                    Value::Int(i) => Ok(Value::Bool(i % 2 == 0)),
+                    _ => unreachable!(),
+                },
+                _ => Err(ErrorVal::new("custom", "bad test callback")),
+            }
+        }
+        fn cwd(&self) -> PathBuf {
+            self.cwd.clone()
+        }
+    }
+    fn c() -> C {
+        C {
+            cwd: std::env::temp_dir(),
+        }
+    }
+    fn a(xs: Vec<Value>) -> CallArgs {
+        CallArgs {
+            pos: xs,
+            named: vec![],
+        }
+    }
+    fn call(v: Value, n: &str, args: Vec<Value>) -> VResult<Value> {
+        call_method(&mut c(), v, n, a(args), Span::default())
+    }
+    #[test]
+    fn collection_basics() {
+        let x = Value::List(vec![Value::Int(3), Value::Int(1), Value::Int(3)]);
+        assert_eq!(
+            call(x.clone(), "sort", vec![]).unwrap(),
+            Value::List(vec![Value::Int(1), Value::Int(3), Value::Int(3)])
+        );
+        assert_eq!(
+            call(x, "uniq", vec![]).unwrap(),
+            Value::List(vec![Value::Int(3), Value::Int(1)])
+        );
+    }
+    #[test]
+    fn higher_order() {
+        let x = Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+        assert_eq!(
+            call(x.clone(), "map", vec![Value::Str("double".into())]).unwrap(),
+            Value::List(vec![Value::Int(2), Value::Int(4), Value::Int(6)])
+        );
+        assert_eq!(
+            call(x, "where", vec![Value::Str("even".into())]).unwrap(),
+            Value::List(vec![Value::Int(2)])
+        );
+    }
+    #[test]
+    fn stream_consumption_and_tee() {
+        let s = StreamVal::from_iter("int", (0..3).map(|i| Ok(Value::Int(i))));
+        let clone = s.clone();
+        assert!(
+            matches!(call(Value::Stream(s),"collect",vec![]).unwrap(),Value::List(x) if x.len()==3)
+        );
+        assert_eq!(
+            call(Value::Stream(clone), "collect", vec![])
+                .unwrap_err()
+                .code,
+            "stream_consumed"
+        );
+        let t = StreamVal::from_iter("int", (0..2).map(|i| Ok(Value::Int(i))));
+        assert!(
+            matches!(call(Value::Stream(t),"tee",vec![Value::Int(2)]).unwrap(),Value::List(x) if x.len()==2)
+        );
+    }
+    #[test]
+    fn strings_regex_records() {
+        assert_eq!(
+            call(Value::Str(" a b ".into()), "trim", vec![]).unwrap(),
+            Value::Str("a b".into())
+        );
+        let re = Value::Regex(std::sync::Arc::new(RegexVal::compile("[0-9]+").unwrap()));
+        assert_eq!(
+            call(Value::Str("a12b3".into()), "matches", vec![re]).unwrap(),
+            Value::List(vec![Value::Str("12".into()), Value::Str("3".into())])
+        );
+        let mut r = Record::new();
+        r.insert("a".into(), Value::Int(1));
+        assert_eq!(
+            call(Value::Record(r), "get", vec![Value::Str("a".into())]).unwrap(),
+            Value::Int(1)
+        );
+    }
+    #[test]
+    fn chunks_flatten_sum() {
+        let x = Value::List((1..=5).map(Value::Int).collect());
+        assert!(
+            matches!(call(x.clone(),"chunks",vec![Value::Int(2)]).unwrap(),Value::List(v) if v.len()==3)
+        );
+        assert_eq!(call(x, "sum", vec![]).unwrap(), Value::Int(15));
+        let nested = Value::List(vec![
+            Value::List(vec![Value::Int(1)]),
+            Value::List(vec![Value::Int(2)]),
+        ]);
+        assert_eq!(
+            call(nested, "flatten", vec![]).unwrap(),
+            Value::List(vec![Value::Int(1), Value::Int(2)])
+        );
+    }
+    #[test]
+    fn first_last_arity_variants() {
+        let x = Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+        // Zero-arg forms return a single element.
+        assert_eq!(call(x.clone(), "first", vec![]).unwrap(), Value::Int(1));
+        assert_eq!(call(x.clone(), "last", vec![]).unwrap(), Value::Int(3));
+        // `.first(n)`/`.last(n)` return a LIST of n (P3 arity fix).
+        assert_eq!(
+            call(x.clone(), "first", vec![Value::Int(2)]).unwrap(),
+            Value::List(vec![Value::Int(1), Value::Int(2)])
+        );
+        assert_eq!(
+            call(x.clone(), "last", vec![Value::Int(2)]).unwrap(),
+            Value::List(vec![Value::Int(2), Value::Int(3)])
+        );
+        // Overrun clamps to the collection length (no error).
+        assert_eq!(
+            call(x, "first", vec![Value::Int(9)]).unwrap(),
+            Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)])
+        );
+    }
+
+    #[test]
+    fn outcome_methods_forward_to_out() {
+        use crate::OutcomeVal;
+        use std::sync::Arc;
+        // An outcome whose `.out` is a list forwards collection methods.
+        let outcome = Value::Outcome(Arc::new(OutcomeVal {
+            status: Some(0),
+            signal: None,
+            ok: true,
+            stdout: Arc::new(Vec::new()),
+            stderr: Arc::new(Vec::new()),
+            dur_ns: 0,
+            pid: 0,
+            cmd: "x".into(),
+            parsed: Some(Value::List(vec![
+                Value::Int(1),
+                Value::Int(2),
+                Value::Int(3),
+            ])),
+            streamed: false,
+        }));
+        assert_eq!(call(outcome.clone(), "len", vec![]).unwrap(), Value::Int(3));
+        assert_eq!(
+            call(outcome, "first", vec![Value::Int(2)]).unwrap(),
+            Value::List(vec![Value::Int(1), Value::Int(2)])
+        );
+    }
+
+    #[test]
+    fn task_lifecycle_methods() {
+        let t = crate::TaskVal::new("t");
+        t.finish(Ok(Value::Int(42)));
+        assert_eq!(
+            call(Value::Task(t.clone()), "is_done", vec![]).unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            call(Value::Task(t.clone()), "await", vec![]).unwrap(),
+            Value::Int(42)
+        );
+        assert_eq!(call(Value::Task(t), "cancel", vec![]).unwrap(), Value::Null);
+        // Wrong receiver type is a type error.
+        assert_eq!(
+            call(Value::Int(1), "await", vec![]).unwrap_err().code,
+            "type_error"
+        );
+    }
+
+    #[test]
+    fn task_suspend_resume_methods() {
+        let t = crate::TaskVal::new("t");
+        assert_eq!(
+            call(Value::Task(t.clone()), "is_suspended", vec![]).unwrap(),
+            Value::Bool(false)
+        );
+        // `.suspend()` returns the task (chainable) and flips the flag.
+        assert!(matches!(
+            call(Value::Task(t.clone()), "suspend", vec![]).unwrap(),
+            Value::Task(_)
+        ));
+        assert!(t.is_suspended());
+        assert_eq!(
+            call(Value::Task(t.clone()), "is_suspended", vec![]).unwrap(),
+            Value::Bool(true)
+        );
+        call(Value::Task(t.clone()), "resume", vec![]).unwrap();
+        assert!(!t.is_suspended());
+        // Suspend/resume hooks fire.
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let f = flag.clone();
+        t.on_suspend(Box::new(move || {
+            f.store(true, std::sync::atomic::Ordering::SeqCst)
+        }));
+        t.suspend();
+        assert!(flag.load(std::sync::atomic::Ordering::SeqCst));
+        // Wrong receiver type is a type error.
+        assert_eq!(
+            call(Value::Int(1), "suspend", vec![]).unwrap_err().code,
+            "type_error"
+        );
+    }
+
+    #[test]
+    fn save_and_append() {
+        let d = std::env::temp_dir().join(format!("shoal-methods-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let mut ctx = C { cwd: d.clone() };
+        call_method(
+            &mut ctx,
+            Value::Str("a".into()),
+            "save",
+            a(vec![Value::Str("x".into())]),
+            Span::default(),
+        )
+        .unwrap();
+        call_method(
+            &mut ctx,
+            Value::Str("b".into()),
+            "append",
+            a(vec![Value::Str("x".into())]),
+            Span::default(),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(d.join("x")).unwrap(), "ab");
+        std::fs::remove_dir_all(d).unwrap();
+    }
+}

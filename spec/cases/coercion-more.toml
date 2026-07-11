@@ -1,0 +1,36 @@
+# Further word-binding coercion hardening beyond coercion.toml's site-2 pass:
+# parse-failure arg_error messages for int/size, a default parameter used
+# alongside an explicit positional, and `...rest: list<str>` variadic
+# accumulation with three words (coercion.toml's own variadic case only
+# used `list<int>`).
+
+[[case]]
+name = "coerce2-int-word-bind-failure-names-the-bad-word"
+src = "fn f(a: int) { a }\nf abc"
+error = "arg_error"
+error_contains = "abc"
+
+[[case]]
+name = "coerce2-size-word-bind-failure-is-arg-error"
+src = "fn showsize(s: size) { s }\nshowsize notasize"
+error = "arg_error"
+
+[[case]]
+name = "coerce2-explicit-positional-with-trailing-default"
+src = "fn f(x: int, y: int = 10) { x + y }\nf 5"
+value = "15"
+
+[[case]]
+name = "coerce2-explicit-positional-overrides-default"
+src = "fn f(x: int, y: int = 10) { x + y }\nf 5 2"
+value = "7"
+
+[[case]]
+name = "coerce2-variadic-str-list-accumulates-three-words"
+src = "fn f(...rest: list<str>) { rest }\nf a b c"
+value = '["a", "b", "c"]'
+
+[[case]]
+name = "coerce2-variadic-str-list-empty-when-no-extra-words"
+src = "fn f(...rest: list<str>) { rest.len() }\nf"
+value = "0"

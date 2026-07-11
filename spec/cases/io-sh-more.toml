@@ -1,0 +1,29 @@
+# Further `sh { … }` interpreter-block hardening beyond io.toml's first
+# pass: `.status` on a non-zero-but-not-signalled exit, `.err` capturing
+# stderr independent of `.out`, a multi-statement block's stdout staying a
+# single (embedded-newline) `str` — not auto-split into a list, since
+# `.out`'s lazy parse only special-cases JSON-shaped leading bytes — and
+# real POSIX shell arithmetic running end to end.
+
+[[case]]
+name = "iosh2-status-reflects-explicit-exit-code"
+src = "(sh { exit 3 }).status"
+value = "3"
+
+[[case]]
+name = "iosh2-stderr-captured-independent-of-stdout"
+src = "(sh { echo err 1>&2 }).err.str()"
+value = '"err\n"'
+
+[[case]]
+name = "iosh2-multi-statement-block-stdout-stays-one-string"
+# Two `echo`s inside one block join into a single stdout stream; `.out`'s
+# lazy sniff only upgrades JSON-`[`/`{`-shaped text, so plain lines stay one
+# `str` with an embedded newline, not a list.
+src = "sh { echo a; echo b }.out"
+value = '"a\nb"'
+
+[[case]]
+name = "iosh2-real-shell-arithmetic"
+src = '''sh { printf '%s' "$((2+2))" }.out'''
+value = '"4"'

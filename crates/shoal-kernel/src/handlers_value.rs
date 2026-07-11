@@ -1,6 +1,6 @@
-//! `dispatch` handlers for value/journal/event queries: `value.get`,
-//! `journal.query`, `events.read`, `events.publish`, `events.subscribe`,
-//! `events.unsubscribe`. Split out of `lib.rs`'s dispatch match
+//! `dispatch` handlers for value/journal queries: `value.get`,
+//! `journal.query`. The `events.*` handlers live in `eventbus.rs` alongside
+//! the `EventBus` they operate on. Split out of `lib.rs`'s dispatch match
 //! (docs/ROADMAP.md wave R4): pure mechanical move, zero wire/behavior change.
 use super::*;
 
@@ -108,68 +108,5 @@ impl Kernel {
             })
             .collect();
         encode(entries)
-    }
-
-    pub(crate) fn handle_events_read(
-        self: &Arc<Self>,
-        params: Json,
-        attached: &mut Option<Attachment>,
-    ) -> Result<Json, RpcError> {
-        attached.as_ref().ok_or_else(not_attached)?;
-        let p: EventsReadParams = decode(params)?;
-        let events = self.events.read(&p.channel, p.since, p.limit);
-        encode(json!({"channel": p.channel, "events": events}))
-    }
-
-    pub(crate) fn handle_events_publish(
-        self: &Arc<Self>,
-        params: Json,
-        attached: &mut Option<Attachment>,
-    ) -> Result<Json, RpcError> {
-        attached.as_ref().ok_or_else(not_attached)?;
-        let p: EventsPublishParams = decode(params)?;
-        // AGENT-SURFACE §4: only `user.*` channels are client-writable;
-        // the kernel owns the semantic channels.
-        if !p.channel.starts_with("user.") {
-            return Err(RpcError {
-                code: -32602,
-                message: "only user.* channels may be published to".into(),
-                data: Some(json!({"channel": p.channel})),
-            });
-        }
-        let event = self.events.publish(&p.channel, p.payload);
-        encode(json!({"channel": event.channel, "seq": event.seq, "ts": event.ts}))
-    }
-
-    pub(crate) fn handle_events_subscribe(
-        self: &Arc<Self>,
-        params: Json,
-        client: u64,
-        attached: &mut Option<Attachment>,
-        conn: Option<&SharedWriter>,
-    ) -> Result<Json, RpcError> {
-        attached.as_ref().ok_or_else(not_attached)?;
-        let p: EventsSubParams = decode(params)?;
-        let Some(writer) = conn else {
-            return Err(RpcError {
-                code: -32603,
-                message: "subscription requires a live connection".into(),
-                data: None,
-            });
-        };
-        self.events.subscribe(client, &p.channel, p.since, writer);
-        encode(json!({"channel": p.channel, "subscribed": true}))
-    }
-
-    pub(crate) fn handle_events_unsubscribe(
-        self: &Arc<Self>,
-        params: Json,
-        client: u64,
-        attached: &mut Option<Attachment>,
-    ) -> Result<Json, RpcError> {
-        attached.as_ref().ok_or_else(not_attached)?;
-        let p: EventsSubParams = decode(params)?;
-        self.events.unsubscribe(client, &p.channel);
-        encode(json!({"channel": p.channel, "subscribed": false}))
     }
 }

@@ -1,0 +1,32 @@
+# Further `.feed` hardening beyond io.toml's first pass: the plain
+# `type_error` path for receivers with no pinned serialization (int, bool —
+# distinct from the specialized `feed_error` reserved for the deliberately-
+# never-feedable types in io.toml's `io-feed-regex-is-feed-error`), and a
+# non-str list's fall-through to compact-JSON serialization (feed_bytes's
+# `list<str>` fast path only applies when EVERY element is already a
+# `str`; a `list<int>` falls to the generic JSON branch, and `cat`'s
+# passthrough plus `.out`'s lazy JSON-sniff round-trips it back to a list).
+
+[[case]]
+name = "iofeed2-int-receiver-is-type-error"
+src = "5.feed(sort)"
+error = "type_error"
+
+[[case]]
+name = "iofeed2-bool-receiver-is-type-error"
+src = "true.feed(sort)"
+error = "type_error"
+
+[[case]]
+name = "iofeed2-int-list-feeds-as-compact-json-and-reparses"
+# `[1, 2, 3]` isn't a `list<str>`, so `feed_bytes` falls to the generic
+# JSON branch, serializing it as the single line `[1,2,3]`; `cat` echoes
+# that byte-for-byte, and `.out`'s lazy JSON sniff (leading `[`) parses it
+# straight back into the same list.
+src = "[1, 2, 3].feed(cat).out"
+value = "[1, 2, 3]"
+
+[[case]]
+name = "iofeed2-record-feeds-as-compact-json-and-reparses"
+src = "{n: 5}.feed(cat).out"
+value = "{n: 5}"

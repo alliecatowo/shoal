@@ -1,0 +1,56 @@
+# Further filesystem-builtin hardening beyond fs-builtins.toml: failure
+# modes not yet covered (mkdir onto an existing directory, rm/cp/head on a
+# missing path) and `mv` overwriting an existing destination (content wins,
+# not an error — TDD names no distinct "overwrite protection" builtin).
+# Same determinism discipline as fs-builtins.toml: only `.name`/`.type`
+# (never the cwd-absolutized `path`/`target` fields) are asserted directly.
+
+[[case]]
+name = "fsb2-mkdir-onto-existing-directory-is-custom-error"
+src = '''
+mkdir d
+mkdir d
+'''
+error = "custom"
+
+[[case]]
+name = "fsb2-rm-missing-path-is-custom-error"
+src = "rm nope.txt"
+error = "custom"
+
+[[case]]
+name = "fsb2-cp-missing-source-is-custom-error"
+src = "cp nope.txt dest.txt"
+error = "custom"
+
+[[case]]
+name = "fsb2-head-missing-path-is-custom-error"
+src = "head nope.txt"
+error = "custom"
+
+[[case]]
+name = "fsb2-mv-overwrites-existing-destination-content"
+src = '''
+"x".save("a.txt")
+"y".save("b.txt")
+mv a.txt b.txt
+(cat b.txt).out.str()
+'''
+value = '"x"'
+
+[[case]]
+name = "fsb2-mv-onto-itself-is-a-no-op"
+src = '''
+touch a.txt
+mv a.txt a.txt
+(stat a.txt).out.name
+'''
+value = "a.txt"
+
+[[case]]
+name = "fsb2-ls-where-name-then-type"
+src = '''
+touch a.txt
+ls.where(r => r.name == "a.txt").first().type
+'''
+value = '"file"'

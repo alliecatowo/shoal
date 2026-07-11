@@ -1,12 +1,16 @@
 //! Long-lived Unix-socket host for the shoal evaluator (TDD §10).
 
 mod dispatch;
+mod eventbus;
 mod handlers_exec;
 mod handlers_session;
 mod handlers_task;
 mod handlers_value;
+mod session;
 mod wire;
 
+use eventbus::*;
+use session::*;
 use wire::*;
 
 use serde_json::{Value as Json, json};
@@ -42,155 +46,11 @@ pub struct Kernel {
     events: EventBus,
 }
 
-/// A per-connection socket writer shared between the request/response path and
-/// any subscription push threads. Whole frames are serialized then written
-/// under this lock so a pushed `event` notification never interleaves with a
-/// response on the same fd.
-type SharedWriter = Arc<Mutex<UnixStream>>;
-
-/// Kernel-native pub/sub (AGENT-SURFACE §4/§6). One ring buffer per channel;
-/// `seq` is monotonic per channel. Subscribers get `event` notifications
-/// pushed on their own connection.
-#[derive(Default)]
-struct EventBus {
-    channels: Mutex<HashMap<String, ChannelBuf>>,
-    subs: Mutex<Vec<Subscriber>>,
-}
-
-/// Ring-buffered event log for one channel.
-#[derive(Default)]
-struct ChannelBuf {
-    next_seq: u64,
-    ring: VecDeque<Event>,
-}
-
-struct Subscriber {
-    conn: u64,
-    channel: String,
-    writer: SharedWriter,
-}
-
 /// Wire version of the AST node-kind vocabulary (TDD §7, IO.md §2.5). Bumped
 /// from 1 to 2 when `sh_raw` was retired in favor of the general
 /// `lang_block` node — a breaking rename to the AST-kind enum.
 const AST_VERSION: u32 = 2;
 
-/// Ring depth per channel (AGENT-SURFACE §4 requires ≥1024).
-const EVENT_RING_CAP: usize = 1024;
-
-/// The static channels a session may always subscribe to (AGENT-SURFACE §4).
-/// `task.{id}` and `user.{name}` are dynamic and not listed here.
-const STATIC_CHANNELS: &[&str] = &[
-    "session.transcript",
-    "journal",
-    "approval",
-    "render",
-    "reef",
-];
-
-impl EventBus {
-    /// Append `payload` to `channel`'s ring and push it to every live
-    /// subscriber of that channel. Returns the assigned event.
-    fn publish(&self, channel: &str, payload: Json) -> Event {
-        let event = {
-            let mut channels = self.channels.lock().unwrap();
-            let buf = channels.entry(channel.to_string()).or_default();
-            let seq = buf.next_seq;
-            buf.next_seq += 1;
-            let event = Event {
-                channel: channel.to_string(),
-                seq,
-                ts: now_ns(),
-                payload,
-            };
-            buf.ring.push_back(event.clone());
-            while buf.ring.len() > EVENT_RING_CAP {
-                buf.ring.pop_front();
-            }
-            event
-        };
-        // Push to subscribers. A dead connection (write error) is dropped from
-        // the subscriber list — the accept loop also cleans up on disconnect.
-        let mut subs = self.subs.lock().unwrap();
-        subs.retain(|s| {
-            if s.channel != channel {
-                return true;
-            }
-            let note = json!({
-                "jsonrpc": JSONRPC,
-                "method": "event",
-                "params": &event,
-            });
-            let mut w = s.writer.lock().unwrap();
-            write_json_notification(&mut w, &note).is_ok()
-        });
-        event
-    }
-
-    /// Buffered tail of `channel` from `since` (exclusive), capped at `limit`.
-    fn read(&self, channel: &str, since: Option<u64>, limit: Option<usize>) -> Vec<Event> {
-        let channels = self.channels.lock().unwrap();
-        let Some(buf) = channels.get(channel) else {
-            return Vec::new();
-        };
-        let mut out: Vec<Event> = buf
-            .ring
-            .iter()
-            .filter(|e| since.is_none_or(|s| e.seq > s))
-            .cloned()
-            .collect();
-        if let Some(limit) = limit
-            && out.len() > limit
-        {
-            out = out.split_off(out.len() - limit);
-        }
-        out
-    }
-
-    /// Register `writer` as a subscriber to `channel`. Any already-buffered
-    /// events after `since` are pushed immediately (replay, then live).
-    fn subscribe(&self, conn: u64, channel: &str, since: Option<u64>, writer: &SharedWriter) {
-        {
-            let mut subs = self.subs.lock().unwrap();
-            if !subs.iter().any(|s| s.conn == conn && s.channel == channel) {
-                subs.push(Subscriber {
-                    conn,
-                    channel: channel.to_string(),
-                    writer: writer.clone(),
-                });
-            }
-        }
-        for event in self.read(channel, since, None) {
-            let note = json!({"jsonrpc": JSONRPC, "method": "event", "params": &event});
-            let mut w = writer.lock().unwrap();
-            let _ = write_json_notification(&mut w, &note);
-        }
-    }
-
-    fn unsubscribe(&self, conn: u64, channel: &str) {
-        self.subs
-            .lock()
-            .unwrap()
-            .retain(|s| !(s.conn == conn && s.channel == channel));
-    }
-
-    fn remove_conn(&self, conn: u64) {
-        self.subs.lock().unwrap().retain(|s| s.conn != conn);
-    }
-}
-
-fn write_json_notification(writer: &mut UnixStream, value: &Json) -> io::Result<()> {
-    let mut buf = serde_json::to_vec(value).map_err(io::Error::other)?;
-    buf.push(b'\n');
-    use std::io::Write as _;
-    writer.write_all(&buf)?;
-    writer.flush()
-}
-#[derive(Clone)]
-struct Attachment {
-    session: Arc<Session>,
-    principal: String,
-}
 struct TaskEntry {
     task: Ref,
     session: Arc<Session>,
@@ -213,14 +73,6 @@ struct StoredPlan {
     principal: String,
     plan: Plan,
     approved: bool,
-}
-
-struct Session {
-    id: String,
-    evaluator: Mutex<Evaluator>,
-    transcript: Mutex<HashMap<Ref, Value>>,
-    client_it: Mutex<HashMap<u64, Ref>>,
-    next_value: AtomicU64,
 }
 
 impl Kernel {
@@ -352,22 +204,6 @@ impl Kernel {
         result
     }
 
-    fn session(&self, name: &str) -> io::Result<Arc<Session>> {
-        let mut sessions = self.sessions.lock().unwrap();
-        if let Some(session) = sessions.get(name) {
-            return Ok(session.clone());
-        }
-        let cwd = std::env::current_dir()?;
-        let session = Arc::new(Session {
-            id: name.into(),
-            evaluator: Mutex::new(Evaluator::new(cwd)),
-            transcript: Mutex::new(HashMap::new()),
-            client_it: Mutex::new(HashMap::new()),
-            next_value: AtomicU64::new(1),
-        });
-        sessions.insert(name.into(), session.clone());
-        Ok(session)
-    }
     fn task(&self, task: &Ref) -> Result<Arc<TaskEntry>, RpcError> {
         self.tasks
             .lock()

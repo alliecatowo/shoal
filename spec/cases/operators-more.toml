@@ -1,0 +1,65 @@
+# Further operator hardening beyond operators.toml: unary-minus type
+# restrictions, cross-type `==` (always a clean `false`, never an error —
+# equality is total), list ordering comparison (no `<`/`>` for `list`, only
+# `==`/`!=`), `??`'s null-only trigger (a falsy-but-non-null `bool` passes
+# straight through, unlike languages with truthiness-based coalesce), and
+# `in`'s element-membership semantics (a list is never "in" itself as a
+# whole, only as one of its own elements would be).
+
+[[case]]
+name = "op2-unary-minus-on-bool-is-type-error"
+src = "-true"
+error = "type_error"
+
+[[case]]
+name = "op2-unary-minus-on-str-is-type-error"
+src = '-"a"'
+error = "type_error"
+
+[[case]]
+name = "op2-cross-type-equality-list-vs-str-is-false"
+src = '[1, 2] == "ab"'
+value = "false"
+
+[[case]]
+name = "op2-cross-type-equality-int-vs-str-is-false"
+src = '1 == "1"'
+value = "false"
+
+[[case]]
+name = "op2-list-ordering-comparison-is-type-error"
+# Lists support structural `==`/`!=` but not `<`/`>` — there is no total
+# order defined over arbitrary lists.
+src = "[1] < [2]"
+error = "type_error"
+
+[[case]]
+name = "op2-coalesce-only-triggers-on-null-not-falsy-bool"
+# `??` checks specifically for `null`, not general falsiness (TDD §1.10: no
+# truthiness anywhere in the language) — a `false` lhs passes through
+# unchanged.
+src = "false ?? true"
+value = "false"
+
+[[case]]
+name = "op2-coalesce-null-lhs-falls-through-to-rhs-bool"
+src = "null ?? false"
+value = "false"
+
+[[case]]
+name = "op2-in-membership-true"
+src = "5 in [1, 2, 3, 4, 5]"
+value = "true"
+
+[[case]]
+name = "op2-in-str-membership-true"
+src = '"x" in ["x", "y"]'
+value = "true"
+
+[[case]]
+name = "op2-in-whole-list-is-not-a-member-of-itself"
+# `in` checks ELEMENT membership; a whole list is not automatically
+# considered a member of an identical list unless that list itself contains
+# a nested copy.
+src = "[1, 2, 3] in [1, 2, 3]"
+value = "false"

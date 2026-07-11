@@ -1,0 +1,121 @@
+# Further namespace hardening beyond namespaces.toml's first pass: more
+# `math` functions (cbrt, two-arg log, pow with a non-trivial exponent,
+# signum's `+0.0 -> 1.0` IEEE quirk), json/yaml/toml/csv round-trips with
+# nested/quoted structures, and `.first()` as the correct way to pull one
+# row out of a `csv.parse` table (plain `[0]` indexing is a list-only
+# operation, not defined on `table`). Every value cross-checked against the
+# real evaluator via the conformance harness.
+
+[[case]]
+name = "ns2-math-cbrt-perfect-cube"
+src = "math.cbrt(27)"
+value = "3"
+
+[[case]]
+name = "ns2-math-log-base-two-explicit"
+src = "math.log(8, 2)"
+value = "3"
+
+[[case]]
+name = "ns2-math-pow-two-to-ten"
+src = "math.pow(2, 10)"
+value = "1024"
+
+[[case]]
+name = "ns2-math-min-both-negative"
+src = "math.min(-3, -7)"
+value = "-7"
+
+[[case]]
+name = "ns2-math-max-both-negative"
+src = "math.max(-3, -7)"
+value = "-3"
+
+[[case]]
+name = "ns2-math-sign-of-positive-zero-is-one"
+# Rust's `f64::signum` (the `math.sign` implementation) returns `1.0` for
+# `+0.0`, not `0.0` — an IEEE-754 quirk worth pinning explicitly.
+src = "math.sign(0)"
+value = "1"
+
+[[case]]
+name = "ns2-math-atan2-quarter-turn"
+src = "math.atan2(1, 0)"
+value = "1.5707963267948966"
+
+[[case]]
+name = "ns2-math-hypot-of-zeros"
+src = "math.hypot(0, 0)"
+value = "0"
+
+[[case]]
+name = "ns2-math-clamp-value-equals-both-bounds"
+src = "math.clamp(5, 5, 5)"
+value = "5"
+
+[[case]]
+name = "ns2-json-parse-null-literal"
+src = 'json.parse("null")'
+value = "null"
+
+[[case]]
+name = "ns2-json-stringify-null"
+src = "json.stringify(null)"
+value = '"null"'
+
+[[case]]
+name = "ns2-json-stringify-mixed-type-list"
+src = 'json.stringify([1, "a", true, null])'
+value = '"[1,\"a\",true,null]"'
+
+[[case]]
+name = "ns2-json-parse-then-sum"
+src = 'json.parse("[1, 2, 3]").sum()'
+value = "6"
+
+[[case]]
+name = "ns2-yaml-parse-null-value"
+src = 'yaml.parse("a: null").a'
+value = "null"
+
+[[case]]
+name = "ns2-yaml-parse-bool-value"
+src = 'yaml.parse("a: true").a'
+value = "true"
+
+[[case]]
+name = "ns2-yaml-stringify-list-is-block-sequence"
+src = 'yaml.stringify([1, 2, 3]).contains("- 1")'
+value = "true"
+
+[[case]]
+name = "ns2-toml-parse-array-value"
+src = 'toml.parse("a = [1, 2, 3]").a'
+value = "[1, 2, 3]"
+
+[[case]]
+name = "ns2-toml-stringify-record-with-nested-list"
+src = 'toml.stringify({a: [1, 2], b: "x"}).contains("a = [1, 2]")'
+value = "true"
+
+[[case]]
+name = "ns2-csv-parse-quoted-field-with-embedded-comma"
+src = 'csv.parse("a,b\n\"x,y\",2").first().a'
+value = '"x,y"'
+
+[[case]]
+name = "ns2-csv-parse-row-count-with-quoted-field"
+src = 'csv.parse("a,b\n\"x,y\",2").len()'
+value = "1"
+
+[[case]]
+name = "ns2-csv-table-index-by-int-is-type-error"
+# `table` isn't a `list`-indexable receiver; `.first()`/`.where()`/etc are
+# the sanctioned ways to pull rows out.
+src = 'csv.parse("a,b\n1,2")[0]'
+error = "type_error"
+
+[[case]]
+name = "ns2-json-stringify-pretty-nested-list-indented"
+src = 'json.stringify({a: [1, 2]}, pretty: true).contains("    1")'
+value = "true"

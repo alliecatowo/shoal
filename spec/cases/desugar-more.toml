@@ -1,0 +1,51 @@
+# Further §3.4 desugaring-table rows not yet covered by desugar.toml: the
+# `< file` stdin redirect (only `>`/`>>` were exercised there), negative
+# numeric flag values, and a real spec/impl gap found while probing TDD
+# §4.3's `list<path>` callee-side glob expansion promise.
+
+[[case]]
+name = "desugar2-stdin-redirect-feeds-file-to-external"
+# `cmd < f` -> stdin-from-file capture (TDD §3.4); `sh -c 'sort'` reads its
+# stdin and sorts the three lines from the redirected file.
+fixture = ["in.txt"]
+src = '''
+"b\na\nc".save("in.txt")
+(sh -c 'sort' < in.txt).out
+'''
+value = '"a\nb\nc"'
+
+[[case]]
+name = "desugar2-negative-number-flag-value"
+# `--n=-5` -> `named(n: w"-5")` coerced to `int` at call-bind (TDD §3.4 +
+# §4.4); the leading `-` is part of the flag's VALUE text, not a second
+# flag.
+src = "fn f(n: int = 0) { n }\nf --n=-5"
+value = "-5"
+
+[[case]]
+name = "desugar2-alias-flags-pass-through-to-adapter-invocation"
+# TDD §1.8: "later args append" to the aliased call's argv — but for a
+# FLAG appended after the fact (as opposed to baked into the alias
+# definition itself, which does work: see desugar.toml's
+# `desugar-alias-appends-later-args` for the positional-arg case), the
+# adapter-resolved `.cmd` field silently drops it: a direct
+# `(git status --short).cmd` correctly renders `"git status --short"`, but
+# going through `alias gs = git status; gs --short` renders only
+# `"git status"`.
+src = "alias gs = git status\n(gs --short).cmd"
+value = '"git status --short"'
+skip = "TDD §1.8 'later args append' does not hold for a flag appended to an aliased adapter call after definition: (git status --short).cmd correctly shows the flag, but alias gs = git status; (gs --short).cmd drops it, rendering plain \"git status\" — real gap in shoal-eval's alias-argv-append path, not a corpus authoring choice"
+
+[[case]]
+name = "desugar2-list-path-glob-param-binds-only-first-match-not-a-list"
+# TDD §4.3 promises a `list<path>`-typed callee param receives ALL glob
+# matches; the current word-binding coercion (`args.rs`) instead treats a
+# non-variadic `list<path>`/`list<str>` parameter exactly like a bare
+# `path`/`str` one and binds only the glob's first (sorted) match, silently
+# dropping the rest — a real, distinct-from-variadic gap (word-bind-list-
+# int-variadic-accumulates in coercion.toml covers the `...rest: list<int>`
+# form, which DOES work correctly; this is the non-variadic sibling).
+fixture = ["a.txt", "b.txt"]
+src = "fn showpaths(paths: list<path>) { paths.len() }\nshowpaths *.txt"
+error = "type_error"
+skip = "TDD §4.3: a non-variadic list<path>/list<str> parameter should receive every glob match as a list; the current word-binding coercion instead binds only the first match as a bare path/str (dropping the rest), so .len() on it raises 'unsupported on path' instead of returning the match count — real gap in shoal-eval's args.rs, not a corpus authoring choice"

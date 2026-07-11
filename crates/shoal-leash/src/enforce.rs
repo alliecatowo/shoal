@@ -1,0 +1,270 @@
+//! OS-level enforcement: platform tier detection, the concrete
+//! [`SandboxPolicy`] carried into a child spawn, and the per-platform
+//! backends (Landlock on Linux, Seatbelt on macOS) that apply it.
+
+#[cfg(target_os = "macos")]
+use crate::seatbelt::seatbelt_profile;
+use serde::Serialize;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum EnforcementTier {
+    A,
+    B,
+    C,
+    D,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EnforcementStatus {
+    pub available_tier: EnforcementTier,
+    pub active_tier: Option<EnforcementTier>,
+    pub enforced: bool,
+    pub detail: String,
+    pub landlock_abi: Option<i32>,
+    pub filesystem_enforced: bool,
+    pub spawn_exec_enforced: bool,
+    pub network_enforced: bool,
+}
+
+impl EnforcementStatus {
+    /// Detect the strongest plausible platform tier. Since this crate installs
+    /// no backend, `enforced` remains false and `active_tier` remains `None`.
+    pub fn detect() -> Self {
+        let (available_tier, detail) = if cfg!(target_os = "linux") {
+            match landlock_abi() {
+                Some(abi) => (
+                    EnforcementTier::A,
+                    format!(
+                        "Landlock ABI {abi} available; seccomp/network enforcement unavailable"
+                    ),
+                ),
+                None => (
+                    EnforcementTier::B,
+                    "Landlock unavailable; namespace fallback not installed".into(),
+                ),
+            }
+        } else if cfg!(target_os = "macos") {
+            (EnforcementTier::C, "Seatbelt backend not installed".into())
+        } else {
+            (EnforcementTier::D, "advisory policy only".into())
+        };
+        Self {
+            available_tier,
+            active_tier: None,
+            enforced: false,
+            detail,
+            landlock_abi: landlock_abi(),
+            filesystem_enforced: false,
+            spawn_exec_enforced: false,
+            network_enforced: false,
+        }
+    }
+}
+
+/// Concrete filesystem grants for a child process. Calling [`apply_landlock`]
+/// irreversibly restricts the current thread/process and must only happen after
+/// fork in the child, immediately before exec.
+#[derive(Debug, Clone, Default)]
+pub struct FsSandbox {
+    pub read: Vec<PathBuf>,
+    pub write: Vec<PathBuf>,
+    pub delete: Vec<PathBuf>,
+}
+
+/// Coarse network policy carried by [`SandboxPolicy`]. This crate has no
+/// seccomp/netns backend, so `Deny` is never independently OS-enforced today
+/// — [`EnforcementStatus::network_enforced`] reports that honestly rather
+/// than pretending the restriction took effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NetPolicy {
+    #[default]
+    Unrestricted,
+    Deny,
+}
+
+/// A concrete, resolved enforcement request for one child spawn: filesystem
+/// scopes, a coarse network policy, an optional pinned spawn hash (TDD §8
+/// content-hash pinning), and a `hermetic` intent flag.
+///
+/// `hermetic: true` means the caller wants a hard guarantee: the consumer
+/// (`shoal-exec::run`/`spawn_capture`) must refuse to spawn rather than run
+/// with any requested dimension unenforced. `hermetic: false` (default)
+/// means best-effort: the strongest available OS mechanism is applied, and
+/// anything that cannot be enforced on this host is reported truthfully via
+/// [`EnforcementStatus`] rather than silently granted.
+#[derive(Debug, Clone, Default)]
+pub struct SandboxPolicy {
+    pub fs: FsSandbox,
+    pub net: NetPolicy,
+    pub spawn_hash: Option<String>,
+    pub hermetic: bool,
+}
+
+#[cfg(target_os = "linux")]
+pub fn landlock_abi() -> Option<i32> {
+    const VERSION: u32 = 1;
+    let value = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            std::ptr::null::<u8>(),
+            0usize,
+            VERSION,
+        )
+    };
+    (value > 0).then_some(value as i32)
+}
+#[cfg(not(target_os = "linux"))]
+pub fn landlock_abi() -> Option<i32> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+pub fn apply_landlock(grants: &FsSandbox) -> Result<EnforcementStatus, String> {
+    use landlock::{
+        ABI, Access, AccessFs, CompatLevel, Compatible, LandlockStatus, Ruleset, RulesetAttr,
+        RulesetCreatedAttr, RulesetStatus, path_beneath_rules,
+    };
+    let abi = ABI::V7;
+    let mut ruleset = Ruleset::default()
+        .handle_access(AccessFs::from_all(abi))
+        .map_err(|e| e.to_string())?
+        .create()
+        .map_err(|e| e.to_string())?;
+    ruleset = ruleset
+        .add_rules(path_beneath_rules(
+            grants.read.iter(),
+            AccessFs::from_read(abi),
+        ))
+        .map_err(|e| e.to_string())?;
+    ruleset = ruleset
+        .add_rules(path_beneath_rules(
+            grants.write.iter(),
+            AccessFs::from_all(abi),
+        ))
+        .map_err(|e| e.to_string())?;
+    let delete = AccessFs::RemoveDir | AccessFs::RemoveFile;
+    ruleset = ruleset
+        .add_rules(path_beneath_rules(grants.delete.iter(), delete))
+        .map_err(|e| e.to_string())?;
+    let status = ruleset
+        .set_compatibility(CompatLevel::HardRequirement)
+        .restrict_self()
+        .map_err(|e| e.to_string())?;
+    let active = matches!(status.landlock, LandlockStatus::Available { .. })
+        && matches!(status.ruleset, RulesetStatus::FullyEnforced);
+    if !active {
+        return Err(format!(
+            "Landlock restriction was not fully enforced: {status:?}"
+        ));
+    }
+    Ok(EnforcementStatus {
+        available_tier: EnforcementTier::A,
+        active_tier: Some(EnforcementTier::A),
+        enforced: true,
+        detail: format!(
+            "Landlock active ({:?}); spawn hash preflight is TOCTOU-prone; seccomp/netns unavailable",
+            status.landlock
+        ),
+        landlock_abi: landlock_abi(),
+        filesystem_enforced: true,
+        spawn_exec_enforced: false,
+        network_enforced: false,
+    })
+}
+#[cfg(not(target_os = "linux"))]
+pub fn apply_landlock(_: &FsSandbox) -> Result<EnforcementStatus, String> {
+    Err("Landlock is only available on Linux".into())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpawnPreflight {
+    pub hash: String,
+    pub allowed: bool,
+    pub assurance: &'static str,
+}
+pub fn preflight_spawn(binary: &Path, allowlist: &[String]) -> std::io::Result<SpawnPreflight> {
+    use std::io::Read;
+    let mut f = fs::File::open(binary)?;
+    let mut h = blake3::Hasher::new();
+    let mut b = [0; 65536];
+    loop {
+        let n = f.read(&mut b)?;
+        if n == 0 {
+            break;
+        }
+        h.update(&b[..n]);
+    }
+    let hash = h.finalize().to_hex().to_string();
+    let name = binary.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let allowed = allowlist.iter().any(|a| a == &hash || a == name);
+    Ok(SpawnPreflight {
+        hash,
+        allowed,
+        assurance: "content hashed before exec; TOCTOU remains until exec-time BPF-LSM pinning",
+    })
+}
+
+#[cfg(target_os = "macos")]
+pub fn apply_macos_sandbox(grants: &FsSandbox) -> Result<EnforcementStatus, String> {
+    use std::ffi::{CStr, CString, c_char};
+    let profile =
+        CString::new(seatbelt_profile(grants)?).map_err(|_| "Seatbelt profile contains NUL")?;
+    let mut error: *mut c_char = std::ptr::null_mut();
+    let result = unsafe { sandbox_init(profile.as_ptr(), 0, &mut error) };
+    if result != 0 {
+        let message = if error.is_null() {
+            "sandbox_init failed".into()
+        } else {
+            unsafe { CStr::from_ptr(error) }
+                .to_string_lossy()
+                .into_owned()
+        };
+        if !error.is_null() {
+            unsafe { sandbox_free_error(error) }
+        }
+        return Err(message);
+    }
+    Ok(EnforcementStatus{available_tier:EnforcementTier::C,active_tier:Some(EnforcementTier::C),enforced:true,detail:"Seatbelt filesystem profile active; spawn preflight is TOCTOU-prone; network enforcement unavailable".into(),landlock_abi:None,filesystem_enforced:true,spawn_exec_enforced:false,network_enforced:false})
+}
+#[cfg(target_os = "macos")]
+#[link(name = "sandbox")]
+unsafe extern "C" {
+    fn sandbox_init(
+        profile: *const std::ffi::c_char,
+        flags: u64,
+        error: *mut *mut std::ffi::c_char,
+    ) -> std::ffi::c_int;
+    fn sandbox_free_error(error: *mut std::ffi::c_char);
+}
+#[cfg(not(target_os = "macos"))]
+pub fn apply_macos_sandbox(_: &FsSandbox) -> Result<EnforcementStatus, String> {
+    Err("Seatbelt enforcement is only available on macOS".into())
+}
+
+/// Apply the strongest OS filesystem sandbox this platform has to the current
+/// process, immediately before exec in a child: Linux → [`apply_landlock`],
+/// macOS → [`apply_macos_sandbox`] (Seatbelt), otherwise an honest error.
+///
+/// This is the single per-platform entry point a spawn launcher (the
+/// `shoal-sandbox-exec` helper the exec layer wraps children through) should
+/// call, so the Seatbelt path on macOS is exercised exactly as Landlock is on
+/// Linux — macOS is first-class, not a stub. Like the backend it delegates to,
+/// this irreversibly restricts the calling thread/process and must only run in
+/// the child after fork.
+pub fn apply_sandbox(grants: &FsSandbox) -> Result<EnforcementStatus, String> {
+    #[cfg(target_os = "linux")]
+    {
+        apply_landlock(grants)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        apply_macos_sandbox(grants)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = grants;
+        Err("no OS sandbox backend for this platform".into())
+    }
+}
