@@ -2144,6 +2144,7 @@ dependencies = [
  "crossterm",
  "libc",
  "nu-ansi-term",
+ "portable-pty",
  "reedline",
  "serde",
  "serde_json",

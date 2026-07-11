@@ -202,6 +202,12 @@ pub struct OutcomeVal {
     /// Display form of the invocation, for errors and rendering.
     pub cmd: String,
     pub parsed: Option<Value>,
+    /// True only when the child's bytes actually reached the real terminal via
+    /// the `ExecMode::PtyTee` passthrough path (defect #1). The interactive
+    /// result renderer suppresses re-rendering exactly these outcomes to avoid
+    /// double-printing; captured externals and builtins (which stream nothing)
+    /// leave this `false` so their `.out` still renders.
+    pub streamed: bool,
 }
 
 impl OutcomeVal {

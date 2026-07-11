@@ -38,6 +38,11 @@ impl Evaluator {
                     );
                 }
             }
+            // `exit`/`quit` halts the remaining statements immediately; the host
+            // reads `take_exit` and ends with the code (defect: no exit).
+            if self.pending_exit.is_some() {
+                break;
+            }
         }
         Ok(last)
     }

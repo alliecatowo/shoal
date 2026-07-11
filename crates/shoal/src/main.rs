@@ -331,6 +331,11 @@ fn run_source(
     }
     match evaluator.eval_program(&program) {
         Ok(value) => {
+            // `exit`/`quit` in a script or `-c` exits the process with its code
+            // and suppresses rendering of the (null) trailing value.
+            if let Some(code) = evaluator.take_exit() {
+                return Ok(code);
+            }
             render_result(&value, false).map_err(|e| format!("cannot write output: {e}"))?;
             Ok(0)
         }
@@ -516,6 +521,11 @@ fn repl() -> Result<i32, String> {
                                     ))
                                 );
                             }
+                            // `exit`/`quit` ends the REPL cleanly with its code,
+                            // mirroring the Ctrl-D path (defect: no exit).
+                            if let Some(code) = evaluator.take_exit() {
+                                return Ok(code);
+                            }
                         }
                         Err(error) => report_eval_error(&src, None, &error),
                     },
@@ -557,9 +567,15 @@ fn parse_ctx_for(env: &Env) -> ParseCtx {
 }
 
 fn render_result(value: &Value, pty_was_live: bool) -> io::Result<()> {
-    // External commands executed interactively stream their output to the
-    // PTY tee. Rendering them here would duplicate the command's output.
-    if pty_was_live && matches!(value, Value::Outcome(_)) {
+    // Skip re-rendering only outcomes whose bytes ACTUALLY reached the real
+    // terminal via the PtyTee passthrough (`streamed`). Rendering those again
+    // would duplicate the command's output. Builtins (echo/ls/…) and captured
+    // outcomes stream nothing, so they carry `streamed == false` and must still
+    // render their `.out` here (defect #1).
+    if pty_was_live
+        && let Value::Outcome(o) = value
+        && o.streamed
+    {
         return Ok(());
     }
     print_value(value)

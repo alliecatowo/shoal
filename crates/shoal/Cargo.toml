@@ -22,6 +22,7 @@ shoal-prompt = { version = "0.1.0", path = "../shoal-prompt" }
 shoal-leash = { version = "0.1.0", path = "../shoal-leash" }
 
 [dev-dependencies]
+portable-pty = "0.9.0"
 serde = "1.0.228"
 tempfile = "3.27.0"
 toml = "1.1.2"

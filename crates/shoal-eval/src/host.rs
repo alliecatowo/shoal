@@ -212,8 +212,9 @@ impl Evaluator {
 /// unification, P1a). The structured value becomes the outcome's `parsed`
 /// (`.out`); `stdout` carries the same bytes a redirect/`echo … > file` would
 /// write, so `echo`, `ls`, `stat`, `which`, … all compose and forward like
-/// external outcomes. Builtin outcomes are marked `pid == 0` so the statement
-/// sink knows they were never PtyTee-streamed.
+/// external outcomes. Builtin outcomes are marked `pid == 0` and `streamed ==
+/// false` (they never reach a PTY) so the statement sink and result renderer
+/// still render their `.out` (defect #1).
 pub(crate) fn builtin_outcome(head: &str, result: Value) -> Value {
     let stdout = value_bytes(&result);
     Value::Outcome(Arc::new(OutcomeVal {
@@ -226,6 +227,7 @@ pub(crate) fn builtin_outcome(head: &str, result: Value) -> Value {
         pid: 0,
         cmd: head.to_string(),
         parsed: Some(result),
+        streamed: false,
     }))
 }
 

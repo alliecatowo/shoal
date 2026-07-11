@@ -73,6 +73,15 @@ impl Evaluator {
         if call.head == "jobs" {
             return Ok(self.jobs_table());
         }
+        // `exit [code: int = 0]` / `quit`: request the host to stop. We record
+        // the code and let `eval_program` halt its statement loop; the host
+        // (REPL / -c / script) honors it via `take_exit`. NEVER process::exit
+        // here — that would kill the kernel/embedded host (defect: no exit).
+        if call.head == "exit" || call.head == "quit" {
+            let code = self.exit_code_arg(call)?;
+            self.pending_exit = Some(code);
+            return Ok(Value::Null);
+        }
         if call.head == "interact" {
             return self.builtin_interact(call);
         }
@@ -389,6 +398,9 @@ impl Evaluator {
         } else {
             ExecMode::Capture
         };
+        // Only the PtyTee path streams the child's bytes to the real terminal;
+        // the result renderer suppresses re-rendering exactly these (defect #1).
+        let streamed = mode == ExecMode::PtyTee;
         let display = argv
             .iter()
             .map(|x| x.to_string_lossy())
@@ -437,6 +449,7 @@ impl Evaluator {
             pid: r.pid,
             cmd: display,
             parsed,
+            streamed,
         }));
         if !ok && position == Position::Statement {
             let Value::Outcome(failed) = &out else {
@@ -462,6 +475,8 @@ impl Evaluator {
             || matches!(
                 name,
                 "cd" | "pwd"
+                    | "exit"
+                    | "quit"
                     | "source"
                     | "run"
                     | "jobs"
@@ -488,6 +503,27 @@ impl Evaluator {
             .find(|(k, _)| k == "PATH")
             .map(|(_, v)| v.as_os_str());
         shoal_exec::which(OsStr::new(name), path).is_some()
+    }
+
+    /// Resolve the optional `exit`/`quit` status argument to an `i32`
+    /// (default `0`). Accepts a bare integer word (`exit 3`) or an int-valued
+    /// expression; anything non-integer is an `arg_error`.
+    fn exit_code_arg(&mut self, call: &CmdCall) -> VResult<i32> {
+        let vs = self.collect_cmd_values(call)?;
+        let Some(first) = vs.into_iter().next() else {
+            return Ok(0);
+        };
+        let code = match crate::coerce::coerce_word(first, "int")? {
+            Value::Int(n) => n,
+            other => {
+                return Err(ErrorVal::arg_error(format!(
+                    "exit expects an int status, found {}",
+                    other.type_name()
+                ))
+                .with_span(call.span));
+            }
+        };
+        Ok(code.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32)
     }
 
     /// Collect a command's positional (non-flag) argument values.

@@ -122,6 +122,12 @@ pub struct Evaluator {
     /// a default-permissive policy still resolves to `None` (no wrapping), so
     /// only a genuinely-scoped principal ever confines a child.
     leash: Option<(LeashPolicy, String)>,
+    /// Set by the `exit`/`quit` builtin (defect: no `exit`). `Some(code)` asks
+    /// the host to stop: `eval_program` halts its statement loop, and the host
+    /// (REPL loop / `-c` / script runner) ends cleanly with `code`. Kept as a
+    /// value the host acts on — eval NEVER calls `std::process::exit`, which
+    /// would break the kernel/embedded host.
+    pending_exit: Option<i32>,
 }
 
 enum Flow {
@@ -165,7 +171,16 @@ impl Evaluator {
             principal: "human".into(),
             current_entry: None,
             source: None,
+            pending_exit: None,
         }
+    }
+
+    /// Consume any pending `exit`/`quit` request. `Some(code)` means the last
+    /// evaluated program asked the host to exit with `code`; the host (REPL
+    /// loop, `-c`, script runner) should stop and surface that code. Clears the
+    /// flag so a subsequent REPL line starts fresh.
+    pub fn take_exit(&mut self) -> Option<i32> {
+        self.pending_exit.take()
     }
 
     /// Install the active leash policy and the principal spawns are evaluated
@@ -247,18 +262,17 @@ impl Evaluator {
     }
 
     /// Route a statement value to the sink, skipping nulls and skipping
-    /// interactive *external* outcomes (already streamed via PtyTee, defect #1).
-    /// Builtin outcomes carry `pid == 0` and are never PtyTee-streamed, so they
-    /// must still be rendered by the sink even interactively (outcome
-    /// unification, REEF-cycle P1): only a real spawned child (`pid != 0`) was
+    /// outcomes whose bytes already reached the real terminal via PtyTee
+    /// (defect #1). Builtin outcomes and captured externals carry `streamed ==
+    /// false` — they stream nothing — so they must still be rendered by the
+    /// sink (outcome unification, REEF-cycle P1); only a PtyTee'd child was
     /// tee'd to the terminal and should be suppressed here.
     pub(crate) fn sink_value(&mut self, v: &Value) {
         if *v == Value::Null {
             return;
         }
-        if self.interactive
-            && let Value::Outcome(o) = v
-            && o.pid != 0
+        if let Value::Outcome(o) = v
+            && o.streamed
         {
             return;
         }
