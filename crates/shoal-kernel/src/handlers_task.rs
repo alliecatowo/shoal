@@ -196,6 +196,7 @@ impl Kernel {
                     asynchronous: false,
                     timeout_ms: None,
                     elide: None,
+                    plan_ref: Some(p.plan_ref.clone()),
                 })
                 .unwrap(),
             },

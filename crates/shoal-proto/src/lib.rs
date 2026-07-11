@@ -322,6 +322,13 @@ pub struct ExecParams {
     /// kernel defaults; never loosens past the hard cap (64 KiB).
     #[serde(default)]
     pub elide: Option<ElideSpec>,
+    /// Required with `mode: "approved"`: the stored plan this execution was
+    /// approved under. `"approved"` is `plan.apply`'s re-entry, not a
+    /// caller-assertable privilege — the kernel verifies the named plan is
+    /// approved for the calling session/principal and carries the same
+    /// source before skipping the leash verdict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_ref: Option<String>,
 }
 
 /// Per-call override of the elision thresholds (AGENT-SURFACE §3). Any field

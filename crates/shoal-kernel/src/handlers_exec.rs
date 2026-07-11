@@ -185,7 +185,31 @@ impl Kernel {
                 },
             );
             return encode(result);
-        } else if params.mode != "run" && params.mode != "approved" {
+        } else if params.mode == "approved" {
+            // "approved" is `plan.apply`'s re-entry, NOT a caller-assertable
+            // privilege: without this check any attached principal could send
+            // `{"mode":"approved"}` and skip the leash verdict entirely. It
+            // must name a stored plan that is approved for THIS
+            // session/principal and carries the SAME source.
+            let verified = params.plan_ref.as_ref().is_some_and(|r| {
+                self.plans.lock().unwrap().get(r).is_some_and(|sp| {
+                    sp.session == session.id
+                        && sp.principal == actor
+                        && sp.src == params.src
+                        && (sp.approved
+                            || self.policy.evaluate_plan(&actor, &sp.plan) == Verdict::Allow)
+                })
+            });
+            if !verified {
+                return Err(RpcError {
+                    code: -32010,
+                    message: "mode \"approved\" requires an approved plan_ref for this \
+                              session/principal (use plan → cap.request → plan.apply)"
+                        .into(),
+                    data: None,
+                });
+            }
+        } else if params.mode != "run" {
             return Err(RpcError {
                 code: -32602,
                 message: "mode must be run or plan".into(),

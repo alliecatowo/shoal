@@ -668,6 +668,112 @@ mod tests {
         }
     }
 
+    /// Regression: `mode:"approved"` used to skip the leash verdict for ANY
+    /// caller — the magic string alone bypassed policy. It is `plan.apply`'s
+    /// re-entry and must name a stored plan that is approved for this
+    /// session/principal with the same source; anything else is rejected
+    /// even though a plain `run` of the same source would only be
+    /// approval_required.
+    #[test]
+    fn approved_mode_is_not_a_caller_assertable_bypass() {
+        let policy = Policy::from_toml(&format!(
+            "[principal.\"{}\"]\nopaque='ask'\nauto_apply='never'\n",
+            principal()
+        ))
+        .unwrap();
+        let kernel = Kernel::with_policy(policy);
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        let server_kernel = kernel.clone();
+        let thread = std::thread::spawn(move || server_kernel.handle_stream(server).unwrap());
+        call(
+            &mut client,
+            &mut reader,
+            1,
+            "session.attach",
+            json!({"client":{"kind":"agent","tty":false}}),
+        );
+        // Baseline: the policy gates a plain run of this source.
+        let run = call(
+            &mut client,
+            &mut reader,
+            2,
+            "exec",
+            json!({"src":"sh { echo hi }","mode":"run","position":"stmt"}),
+        );
+        assert_eq!(run.error.expect("run must be gated").code, -32011);
+        // The bypass: bare `mode:"approved"` (no plan_ref) must be rejected…
+        let bare = call(
+            &mut client,
+            &mut reader,
+            3,
+            "exec",
+            json!({"src":"sh { echo hi }","mode":"approved","position":"stmt"}),
+        );
+        assert_eq!(bare.error.expect("bare approved must fail").code, -32010);
+        // …as must a plan_ref that was never approved…
+        let planned = call(
+            &mut client,
+            &mut reader,
+            4,
+            "exec",
+            json!({"src":"sh { echo hi }","mode":"plan","position":"stmt"}),
+        );
+        let plan_ref = planned.result.unwrap()["plan_ref"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let unapproved = call(
+            &mut client,
+            &mut reader,
+            5,
+            "exec",
+            json!({"src":"sh { echo hi }","mode":"approved","position":"stmt","plan_ref":plan_ref}),
+        );
+        assert_eq!(
+            unapproved
+                .error
+                .expect("unapproved plan_ref must fail")
+                .code,
+            -32010
+        );
+        // …and an approved plan_ref may not smuggle DIFFERENT source.
+        call(
+            &mut client,
+            &mut reader,
+            6,
+            "cap.request",
+            json!({"plan_ref":plan_ref,"effects":[]}),
+        );
+        let smuggled = call(
+            &mut client,
+            &mut reader,
+            7,
+            "exec",
+            json!({"src":"sh { rm -rf / }","mode":"approved","position":"stmt","plan_ref":plan_ref}),
+        );
+        assert_eq!(
+            smuggled.error.expect("source smuggling must fail").code,
+            -32010
+        );
+        // The sanctioned path still works: same source, approved plan.
+        let sanctioned = call(
+            &mut client,
+            &mut reader,
+            8,
+            "exec",
+            json!({"src":"sh { echo hi }","mode":"approved","position":"stmt","plan_ref":plan_ref}),
+        );
+        assert!(
+            sanctioned.error.is_none(),
+            "sanctioned approved exec failed: {:?}",
+            sanctioned.error
+        );
+        drop(client);
+        drop(reader);
+        thread.join().unwrap();
+    }
+
     /// Regression for the plan_ref collision (Plan identity used to hash only
     /// effects/reversibility/estimates, so any two opaque `sh { }` plans
     /// collided and `apply` silently ran whichever plan was last inserted).
