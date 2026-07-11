@@ -1,0 +1,55 @@
+# The `.field` accessor falls back to a zero-arg METHOD of the same name when
+# no such field exists, so the bare-`.field` sugar (used heavily by implicit
+# `.map(.x)`/`.where(.x)` lambdas) reaches methods too — `["a"].map(.upper)`,
+# `[1,2,3].sum`, `{a:1}.json`. A present field always WINS over a same-named
+# method (user data ahead of the stdlib), and when neither exists the error
+# still names the missing field. See crates/shoal-eval/src/expr_access.rs
+# (`field_or_method`) and docs/CONTRACTS.md §3.
+
+[[case]]
+name = "map-upper-shorthand"
+src = '["a", "b", "c"].map(.upper)'
+value = '["A", "B", "C"]'
+
+[[case]]
+name = "map-len-shorthand"
+src = '["aa", "b", "ccc"].map(.len)'
+value = "[2, 1, 3]"
+
+[[case]]
+name = "sum-as-field"
+src = '[1, 2, 3].sum'
+value = "6"
+
+[[case]]
+name = "str-upper-no-parens"
+src = '"hi".upper'
+value = '"HI"'
+
+[[case]]
+name = "record-method-json-no-parens"
+src = '{a: 1, b: 2}.json'
+value = '"{\"a\":1,\"b\":2}"'
+
+[[case]]
+name = "field-wins-over-method"
+# `keys` is both a record method and, here, a user field — the field wins.
+src = '{keys: "mydata"}.keys'
+value = '"mydata"'
+
+[[case]]
+name = "map-reverse-shorthand-on-strings"
+src = '["ab", "cd"].map(.reverse)'
+value = '["ba", "dc"]'
+
+[[case]]
+name = "missing-field-and-method-names-the-field"
+src = '{a: 1}.nope'
+error = "field_missing"
+error_contains = "nope"
+
+[[case]]
+name = "where-predicate-uses-method-fallback"
+# `.is_empty` is a method; the `.where(.is_empty)` shorthand reaches it.
+src = '[[], [1], [], [2, 3]].where(.is_empty).len()'
+value = "2"

@@ -4,10 +4,16 @@
 use super::*;
 
 impl Evaluator {
-    pub(crate) fn field(&self, v: Value, name: &str) -> VResult<Value> {
+    /// Resolve `v.name` as a *field* — the direct, no-fallback accessor set.
+    /// Callers that want the `.field` sugar to also reach zero-arg methods (so
+    /// `.map(.upper)` / `path.read` work) go through `field_or_method`, which
+    /// falls back to method dispatch on `field_missing`. Borrows `v` so that
+    /// fallback can still own it.
+    pub(crate) fn field(&self, v: &Value, name: &str) -> VResult<Value> {
         match v {
-            Value::Record(mut r) => r
-                .shift_remove(name)
+            Value::Record(r) => r
+                .get(name)
+                .cloned()
                 .ok_or_else(|| ErrorVal::new("field_missing", format!("missing field `{name}`"))),
             Value::Outcome(o) => match name {
                 "status" => Ok(o.status.map_or(Value::Null, |x| Value::Int(x as i64))),
@@ -34,7 +40,7 @@ impl Evaluator {
                 // structured `.out` — `(echo hi).out` is direct, but
                 // `(stat f).size` / `outcome.name` resolve against `.out` too.
                 // A failed outcome raises the same `cmd_failed` as `.out`.
-                _ if o.ok => self.field(o.out_value(), name),
+                _ if o.ok => self.field(&o.out_value(), name),
                 _ => Err(ErrorVal::new(
                     "cmd_failed",
                     match (o.status, &o.signal) {
@@ -64,7 +70,7 @@ impl Evaluator {
             Value::Duration(ns) => match name {
                 "ago" | "from_now" => {
                     let base = crate::helpers::now_zoned(self.clock.as_ref());
-                    let signed = if name == "ago" { -ns } else { ns };
+                    let signed = if name == "ago" { -*ns } else { *ns };
                     let span = jiff::SignedDuration::from_nanos(signed);
                     base.checked_add(span)
                         .map(|z| Value::DateTime(Box::new(z)))
@@ -80,18 +86,19 @@ impl Evaluator {
             // A glob VALUE exposes its source `.pattern` (docs/CONTRACTS.md §3);
             // its matches are reached with `.expand()` or any collection method.
             Value::Glob(g) => match name {
-                "pattern" => Ok(Value::Str(g.pattern)),
+                "pattern" => Ok(Value::Str(g.pattern.clone())),
                 _ => Err(ErrorVal::new(
                     "field_missing",
                     format!("glob has no field `{name}`"),
                 )),
             },
-            // A path's zero-arg component/attribute accessors double as fields so
-            // the `.field` shorthand in implicit lambdas reaches them —
-            // `glob("*.rs").map(.name)`, `ls.where(.size > 1mb)`. Pure components
-            // resolve without IO; the fs-backed attributes route through the `Fs`
-            // port via `path_fs_method` (docs/CONTRACTS.md §3). Argument-taking
-            // methods (`.join`/`.abs`/`.save`) stay method-only.
+            // A path's zero-arg accessors double as fields so the `.field`
+            // shorthand in implicit lambdas reaches them — `glob("*.rs").map(.name)`,
+            // `ls.where(.size > 1mb)`, `glob("*.toml").map(.read.parse_toml())`.
+            // Pure components resolve without IO; the fs-backed accessors route
+            // through the `Fs` port via `path_fs_method` (docs/CONTRACTS.md §3).
+            // Only the argument-taking methods (`.join`/`.abs`/`.save`/`.append`)
+            // stay method-only — a bare `.field` can't carry their argument.
             Value::Path(p) => {
                 let component =
                     |part: Option<&std::ffi::OsStr>| match part {
@@ -108,9 +115,8 @@ impl Evaluator {
                         }
                         _ => Value::Null,
                     }),
-                    "exists" | "is_dir" | "is_file" | "size" | "modified" => {
-                        self.path_fs_method(&p, name)
-                    }
+                    "read" | "read_bytes" | "lines" | "exists" | "is_dir"
+                    | "is_file" | "size" | "modified" => self.path_fs_method(p, name),
                     _ => Err(ErrorVal::new(
                         "field_missing",
                         format!("path has no field `{name}`"),
@@ -123,6 +129,121 @@ impl Evaluator {
             )),
         }
     }
+    /// `v.name` with the `.field`→zero-arg-method fallback: try field access
+    /// first; on `field_missing`, dispatch `name` as a zero-arg method so the
+    /// bare-`.field` sugar reaches methods too — `names.map(.upper)`,
+    /// `path.read`, `{a:1}.json`. A present field always wins over a
+    /// same-named method (user data ahead of the stdlib), and the original
+    /// `field_missing` is preferred when the method is also absent so the
+    /// error still names the field, not the method.
+    pub(crate) fn field_or_method(&mut self, v: Value, name: &str, span: Span) -> VResult<Value> {
+        match self.field(&v, name) {
+            Err(e) if e.code == "field_missing" => {
+                match self.dispatch_method(v, name, &Args::empty(), span) {
+                    Err(me) if me.code == "field_missing" => Err(e),
+                    other => other,
+                }
+            }
+            other => other,
+        }
+    }
+
+    /// Dispatch a method call `v.name(args)` across the full method surface:
+    /// the evaluator-hosted specials (`.pick`, channel ops, stream sinks, the
+    /// filesystem-backed path methods, glob-as-collection, and callable record
+    /// fields) and, failing those, the pure `shoal_value::methods` stdlib.
+    /// Shared by `Expr::MethodCall` and the `.field` fallback above.
+    pub(crate) fn dispatch_method(
+        &mut self,
+        v: Value,
+        name: &str,
+        args: &Args,
+        span: Span,
+    ) -> VResult<Value> {
+        if name == "pick" {
+            // Wired to shoal-picker here (not methods.rs) to avoid a
+            // shoal-value → shoal-picker dependency cycle.
+            let a = self.eval_args(args)?;
+            self.pick(v, &a).map_err(|e| e.or_span(span))
+        } else if let Some(chan) = crate::channels::as_channel(&v)
+            && matches!(name, "emit" | "events" | "latest" | "take")
+        {
+            // In-language `channel(name)` ops (docs/STREAMS.md §2.5, §7): wired
+            // here (not methods.rs) because they reach the session event bus,
+            // which shoal-value cannot see.
+            let chan = chan.to_string();
+            let a = self.eval_args(args)?;
+            self.eval_channel_method(&chan, name, a)
+                .map_err(|e| e.or_span(span))
+        } else if matches!(v, Value::Stream(_)) && matches!(name, "into" | "render") {
+            // Stream sinks that need the evaluator (the event bus for
+            // `.into(channel)`, the statement sink for `.render()`).
+            let a = self.eval_args(args)?;
+            self.eval_stream_sink(v, name, a).map_err(|e| e.or_span(span))
+        } else if let Value::Path(p) = &v
+            && matches!(
+                name,
+                "read"
+                    | "read_bytes"
+                    | "lines"
+                    | "exists"
+                    | "is_dir"
+                    | "is_file"
+                    | "size"
+                    | "modified"
+            )
+        {
+            // Filesystem-backed path methods (docs/CONTRACTS.md §3) route
+            // through the evaluator's Fs port, resolving against cwd. They
+            // take no arguments.
+            if !args.pos.is_empty() || !args.named.is_empty() {
+                return Err(ErrorVal::arg_error(format!(".{name} takes no arguments")).or_span(span));
+            }
+            let p = p.clone();
+            self.path_fs_method(&p, name).map_err(|e| e.or_span(span))
+        } else if let Value::Glob(g) = &v {
+            // A glob VALUE behaves as a lazy collection of its matches
+            // (TDD §4.3): `.pattern`/`.expand()` are glob-native; every other
+            // method expands the glob to a sorted `list<path>` and re-dispatches
+            // on that list, so `glob("*.rs").map(…)`, `.len()`, `.first(3)`, etc.
+            // all work. (Passing a glob AS a command argument still expands at
+            // the callee — unchanged.)
+            match name {
+                "pattern" => {
+                    if !args.pos.is_empty() || !args.named.is_empty() {
+                        return Err(
+                            ErrorVal::arg_error(".pattern takes no arguments").or_span(span)
+                        );
+                    }
+                    Ok(Value::Str(g.pattern.clone()))
+                }
+                "expand" => {
+                    if !args.pos.is_empty() || !args.named.is_empty() {
+                        return Err(ErrorVal::arg_error(".expand takes no arguments").or_span(span));
+                    }
+                    Ok(Value::List(self.expand_glob(g)?))
+                }
+                _ => {
+                    let list = Value::List(self.expand_glob(g)?);
+                    let a = self.eval_args(args)?;
+                    shoal_value::methods::call_method(self, list, name, a, span)
+                }
+            }
+        } else if let Value::Record(r) = &v
+            && r.get(name).is_some_and(Value::is_callable)
+        {
+            // A callable record field is invoked as a method — this is how a
+            // module fn runs as `deploy.build(...)` (ROADMAP R3 modules) and how
+            // any record-of-closures dispatches.
+            let f = r.get(name).cloned().expect("callable field present");
+            let a = self.eval_args(args)?;
+            self.call_value(&f, a).map_err(|e| e.or_span(span))
+        } else {
+            let a = self.eval_args(args)?;
+            shoal_value::methods::call_method(self, v, name, a, span)
+        }
+    }
+
     pub(crate) fn index(&self, v: Value, idx: Value) -> VResult<Value> {
         match (v, idx) {
             (Value::List(xs), Value::Int(i)) => {

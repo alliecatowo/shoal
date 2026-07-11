@@ -135,7 +135,7 @@ impl Evaluator {
                     if *optional && v == Value::Null {
                         Ok(Value::Null)
                     } else {
-                        self.field(v, name)
+                        self.field_or_method(v, name, span)
                     }
                 }
             }
@@ -196,92 +196,8 @@ impl Evaluator {
                 let v = self.eval_expr(recv, Position::Value)?;
                 if *optional && v == Value::Null {
                     Ok(Value::Null)
-                } else if name == "pick" {
-                    // Wired to shoal-picker here (not methods.rs) to avoid a
-                    // shoal-value → shoal-picker dependency cycle.
-                    let a = self.eval_args(args)?;
-                    self.pick(v, &a).map_err(|e| e.or_span(span))
-                } else if let Some(chan) = crate::channels::as_channel(&v)
-                    && matches!(name.as_str(), "emit" | "events" | "latest" | "take")
-                {
-                    // In-language `channel(name)` ops (docs/STREAMS.md §2.5, §7):
-                    // wired here (not methods.rs) because they reach the session
-                    // event bus, which shoal-value cannot see.
-                    let chan = chan.to_string();
-                    let a = self.eval_args(args)?;
-                    self.eval_channel_method(&chan, name, a)
-                        .map_err(|e| e.or_span(span))
-                } else if matches!(v, Value::Stream(_))
-                    && matches!(name.as_str(), "into" | "render")
-                {
-                    // Stream sinks that need the evaluator (the event bus for
-                    // `.into(channel)`, the statement sink for `.render()`).
-                    let a = self.eval_args(args)?;
-                    self.eval_stream_sink(v, name, a)
-                        .map_err(|e| e.or_span(span))
-                } else if let Value::Path(p) = &v
-                    && matches!(
-                        name.as_str(),
-                        "read"
-                            | "read_bytes"
-                            | "lines"
-                            | "exists"
-                            | "is_dir"
-                            | "is_file"
-                            | "size"
-                            | "modified"
-                    )
-                {
-                    // Filesystem-backed path methods (docs/CONTRACTS.md §3) route
-                    // through the evaluator's Fs port, resolving against cwd. They
-                    // take no arguments.
-                    if !args.pos.is_empty() || !args.named.is_empty() {
-                        return Err(ErrorVal::arg_error(format!(".{name} takes no arguments"))
-                            .or_span(span));
-                    }
-                    let p = p.clone();
-                    self.path_fs_method(&p, name).map_err(|e| e.or_span(span))
-                } else if let Value::Glob(g) = &v {
-                    // A glob VALUE behaves as a lazy collection of its matches
-                    // (TDD §4.3): `.pattern`/`.expand()` are glob-native; every
-                    // other method expands the glob to a sorted `list<path>` and
-                    // re-dispatches on that list, so `glob("*.rs").map(…)`,
-                    // `.len()`, `.first(3)`, etc. all work. (Passing a glob AS a
-                    // command argument still expands at the callee — unchanged.)
-                    match name.as_str() {
-                        "pattern" => {
-                            if !args.pos.is_empty() || !args.named.is_empty() {
-                                return Err(ErrorVal::arg_error(".pattern takes no arguments")
-                                    .or_span(span));
-                            }
-                            Ok(Value::Str(g.pattern.clone()))
-                        }
-                        "expand" => {
-                            if !args.pos.is_empty() || !args.named.is_empty() {
-                                return Err(
-                                    ErrorVal::arg_error(".expand takes no arguments").or_span(span)
-                                );
-                            }
-                            Ok(Value::List(self.expand_glob(g)?))
-                        }
-                        _ => {
-                            let list = Value::List(self.expand_glob(g)?);
-                            let a = self.eval_args(args)?;
-                            shoal_value::methods::call_method(self, list, name, a, span)
-                        }
-                    }
-                } else if let Value::Record(r) = &v
-                    && r.get(name).is_some_and(Value::is_callable)
-                {
-                    // A callable record field is invoked as a method — this is how
-                    // a module fn runs as `deploy.build(...)` (ROADMAP R3 modules)
-                    // and how any record-of-closures dispatches.
-                    let f = r.get(name).cloned().expect("callable field present");
-                    let a = self.eval_args(args)?;
-                    self.call_value(&f, a).map_err(|e| e.or_span(span))
                 } else {
-                    let args = self.eval_args(args)?;
-                    shoal_value::methods::call_method(self, v, name, args, span)
+                    self.dispatch_method(v, name, args, span)
                 }
             }
             Expr::FnCall { name, args, .. } => {
