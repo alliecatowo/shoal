@@ -30,6 +30,40 @@ Not yet built — the subject of this roadmap.
 
 ---
 
+## Wave R0 — Interactive ergonomics (do FIRST · eval+bin · S)
+
+Two dealbreakers in the interactive REPL, both with a locked root cause. Fix before anything else.
+
+**Bug 1 — statement-position builtins don't print.** `echo hello` / `ls` at the prompt render
+nothing until you pull `.out`. Root cause: `crates/shoal/src/main.rs:511` calls
+`render_result(&value, true)` unconditionally, and `render_result` (`main.rs:562`) skips rendering
+*any* `Value::Outcome` when `pty_was_live` — on the assumption the PTY already streamed it. True for
+**external** commands in statement position (real PTY passthrough — output is already on screen),
+**false for builtins** (echo/ls/cat/etc.) and any Capture-mode outcome, which stream nothing and so
+render nothing.
+**Locked fix.** An outcome must know whether its bytes actually went to the terminal. Add
+`OutcomeVal.streamed: bool` (default `false`; set `true` *only* in the `ExecMode::PtyTee` spawn path
+in `shoal-eval`, where bytes hit the real tty). Change `render_result` to skip re-rendering only
+when `matches!(value, Value::Outcome(o)) && o.streamed`. Then builtins and captured outcomes render
+their `.out`/stdout as they should; PtyTee externals still don't double-print. (Note: `render_block`'s
+Outcome arm already returns the `.out` string correctly — the value never reached it.) Add a REPL
+test (drive a PTY: `echo hello` prints `hello` immediately) and confirm an external like
+`ls --color=auto` still shows once, not twice.
+
+**Bug 2 — no `exit`.** Only Ctrl-D quits. Add an `exit [code: int = 0]` builtin (alias `quit`):
+in the REPL it ends the loop cleanly (mirror the Ctrl-D path); in a script / `-c` it exits the
+process with `code`. Register `exit`/`quit` as command heads. Cleanest wiring: the builtin returns a
+distinct `Flow::Exit(code)` (or sets an evaluator exit flag) that `eval_program`/the REPL loop
+detects and honors — do not `std::process::exit` from inside eval (breaks the kernel/embedded host);
+surface it as a value the host acts on.
+
+**Ownership.** P1 (Opus): `crates/shoal-eval` (the `streamed` flag on the PtyTee path, `exit`
+builtin/Flow) + `crates/shoal-value` (`OutcomeVal.streamed` field) + `crates/shoal/src/main.rs`
+(render_result condition, honor exit). Verify: the two PTY repros above + zero regression (336/0/6).
+This is small and unblocks the daily-driver feel — ship it first.
+
+---
+
 ## Wave R1 — Reactive streams + in-language `channel()`  [eval-heavy · L/XL]
 
 **Goal.** Make STREAMS.md real: time-varying data as first-class streams composed with the same
@@ -37,14 +71,24 @@ dot-chain combinators as collections. The honest replacement for `tail -f | grep
 coordination. Contract: `docs/STREAMS.md` (read it — it's the normative spec).
 
 **Locked decisions.**
+- **Everything time-varying is a channel.** This is the unification (per Allie): there is ONE
+  substrate — event-streams — and sources differ only in *who populates them*. `channel(name)` is
+  **user-populated** (`.emit`); `watch`/`tail`/`every`/process-stdout/journal are **system-populated**
+  channels the kernel feeds from OS file events, timers, pipes. All are consumed by the *same* stream
+  combinators. `tail`/`watch` are therefore ergonomic *constructors for system channels*, not
+  file-polling hacks — the anti-pattern being killed is **coordination by watching files**
+  (lockfiles, sentinels, `tail`-a-file-to-know-another-process-finished): that is *always* a channel,
+  never a file. Following a genuinely external log you don't control is the legitimate residue, and
+  it rides the same substrate (event-driven via `notify`, not polling).
 - `Value::Stream` already exists as a single-consumption pull iterator (TDD §1.9). Extend it, do not
-  replace it. Sources produce a `stream<T>`; combinators are lazy adapters over the iterator;
-  single-consumption is enforced by `StreamVal::take` (already present).
-- **Sources** (new builtins/fns): `watch(path | glob)` → `stream<{path, kind}>` via the `notify`
-  crate (inotify/kqueue — cross-platform, mac first-class); `tail(file, from_start: bool=false)` →
-  `stream<str>` (follows like `tail -f`); `every(duration)` → `stream<datetime>` timer ticks;
-  `channel(name).events()` → `stream<event>`; a command's streaming stdout in value position (the
-  `spawn_capture` path already streams — wrap it as a `stream<str>` of lines).
+  replace it. A stream is a consumer of a channel (system- or user-populated); combinators are lazy
+  adapters over the iterator; single-consumption is enforced by `StreamVal::take` (already present).
+- **Sources** (all yield a `stream<T>` over a channel): `watch(path | glob)` → `stream<{path, kind}>`
+  via the `notify` crate (inotify/kqueue — cross-platform, mac first-class); `tail(file,
+  from_start: bool=false)` → `stream<str>` (follows external log appends, event-driven); `every(dur)`
+  → `stream<datetime>` timer ticks; `channel(name).events()` → `stream<event>`; a command's streaming
+  stdout in value position (the `spawn_capture` path already streams — wrap it as `stream<str>` of
+  lines). Prefer `channel()` for any coordination; reserve `watch`/`tail` for external files.
 - **Combinators** (methods on `stream`, all lazy + bounded-memory unless noted): `.where .map
   .scan(init, f) .window(n | duration) .debounce(dur) .throttle(dur) .dedupe .distinct .merge(other)
   .zip(other) .take(n) .take_until(pred | stream) .buffer(n) .flat_map`. `.window`/`.buffer` are the
