@@ -9,7 +9,7 @@ shoal is a **typed value graph over one session kernel**, not a text-stream rout
 bytes between processes and re-parse them; you get back **structured values** with **stable refs**,
 and you drill into them by field path. This card is exhaustive and precise on purpose: every claim
 below is traced to `docs/TDD.md`, `docs/VISION.md`, `docs/REEF.md`, `docs/AGENT-SURFACE.md`,
-`docs/IO.md`, `docs/STREAMS.md`, `docs/CONTRACTS.md`, the 328-case conformance corpus at
+`docs/IO.md`, `docs/STREAMS.md`, `docs/CONTRACTS.md`, the 1100+-case conformance corpus at
 `spec/cases/*.toml`, or a direct read of `crates/shoal-mcp`, `crates/shoal-proto`,
 `crates/shoal-kernel`. Anything not yet implemented is called out explicitly — do not attempt it.
 
@@ -336,11 +336,16 @@ method; treat the signature as authoritative per CONTRACTS but verify empiricall
 | `if [ -n "$x" ]; then ... fi` (truthiness) | `if x.is_empty() { } else { }` / `if x != null { }` | No truthiness anywhere: `if [1] { 1 }` is `type_error`, "no truthiness" (TDD §1.10; **corpus** `core.toml:no-truthiness`). `.is_empty()` **(corpus** `core.toml:method-is-empty`**)**; `.is_some()`/`!= null` are named in TDD §1.10 for nullable values (not individually corpus-exercised). |
 | `grep`/regex extraction | `.matches(re"...")`, `.match(re"...")` | **(corpus** `strings.toml:str-matches-regex-all-occurrences`, `str-match-regex-first-occurrence`**)** — a `regex` is a tagged literal, `re"[0-9]+"`, compiled once. |
 | `awk '{print $1}'` (field split) | `.words()[0]` (whitespace) or `.split(",")[i]` (delimiter) | `.words()` splits on whitespace **(corpus** `strings.toml:str-words-splits-on-whitespace`**)**; `.split(sep)` on an explicit delimiter **(corpus** `strings.toml:str-split-on-separator`**)**. |
-| `sed 's/foo/bar/g'` | `.replace("foo", "bar")` | Replaces **all** occurrences **(corpus** `strings.toml:str-replace-all-occurrences`**)** — there is no first-occurrence-only variant named in the corpus; slice/index manually if you need that. |
+| `sed 's/foo/bar/g'` | `.replace("foo", "bar")` or `.replace(re"f.o", "bar")` | Replaces **all** occurrences **(corpus** `strings.toml:str-replace-all-occurrences`**)**; the pattern may be a literal `str` OR a `regex` (`$1`/`$name` in the replacement expand capture groups) **(corpus** `strings-methods-2.toml:str2-replace-regex-*`**)**. No first-occurrence-only variant; slice/index manually for that. |
+| `sed -E 's/(a)(b)/\2\1/'` (regex capture) | `.replace(re"(a)(b)", "$2$1")` | Capture-group refs use `$1`/`$name`, per the `regex` crate **(corpus** `str2-replace-regex-capture-groups`**)**. |
+| `${str:0:7}` (substring) | `str.take(7)`, `str.skip(3)`, `str.skip(2).take(3)` | `.take`/`.skip` slice a `str` **by char** into a substring (not just collections), so fixed-width fields read cleanly — `line.take(7)` is a git short hash **(corpus** `strings-methods-2.toml:str2-take-slices-by-char`, `str2-take-skip-compose-for-substring`**)**. |
 | `cut -d, -f1` | `row.split(",")[0]` or `table.map(r => r.split(",")[0])` | Same `.split` grounding as above. |
 | `sort` | `.sort()` (plain) / `.sort_by(f)` (key function) | `.sort_by` is **(corpus** `collections.toml:list-sort-by-key-function`, sorts by `.len()`**)**; plain `.sort()` is pinned in CONTRACTS §3 but not individually corpus-exercised. |
 | `uniq` | `.uniq()` | Preserves **first-occurrence order**, not a sorted dedup **(corpus** `collections.toml:list-uniq-preserves-first-occurrence-order`, `[3,1,3,2,1].uniq()` → `[3, 1, 2]`**)**. |
 | `wc -l`, `wc -c` | `.lines().len()`, `.len()` | **(corpus** `core.toml:method-len`, `strings.toml:str-len-counts-chars`**)**. |
+| `awk '{s+=$1} END{print s}'` (fold) | `.reduce(0, (acc, x) => acc + x)` (alias `.fold`) | Left fold — the general aggregation escape hatch when no named op (`.sum`/`.min`/`.max`/`.group`) fits; empty list returns the init **(corpus** `list-methods-3.toml:lm3-reduce-*`**)**. |
+| `jq '. + {c:3}'` / build an object | `{a:1}.set("c", 3)`, `r.merge(other)` | Records are immutable values: `.set(k, v)` inserts/replaces one key (keeping position), `.merge(other)` layers `other`'s keys over the receiver (right wins). No `{...spread}` grammar and `+` on records is a `type_error` — use these **(corpus** `record-table-methods-2.toml:rt2-set-*`, `rt2-merge-*`**)**. Build from pairs: `pairs.reduce({}, (acc, kv) => acc.set(kv[0], kv[1]))`. |
+| `printf '%.2f' x` (round) | `x.round(2)`, `x.floor(2)`, `x.ceil(2)` | Round a `float` to N decimals (N optional, default 0 → nearest integer); ints pass through **(corpus** `numbers-more.toml:num-round-two-decimals`**)**. |
 | `find . -type f` | `glob("**/*")` or `ls` (non-recursive) | `ls` is a builtin returning a `table` (list<record>) **(corpus** `collections.toml:table-ls-len-counts-entries`, `table-ls-where-type-then-map-names`**)**; `**` recurses, dotfiles excluded unless the pattern starts with `.` (TDD §4.3). |
 | `xargs` | `.each(f)` | **(corpus** `collections.toml:list-each-side-effect-then-void`**)**. For "read lines from a file, run a command per line": `path("list.txt").read_str().lines().each(f => rm f)` (chains `.read_str()`→`.lines()`→`.each`, all individually corpus-grounded methods). |
 | `which cmd` | `which cmd` (kept, richer) | Not forensics — returns a full resolution-chain **record**, not just a path (`docs/REEF.md` §6). `.name` always echoes the query **(corpus** `reef.toml:reef-which-name-field-echoes-query`**)**; unresolved tool's `.out` is `null`, not an error **(corpus** `reef-which-unresolved-tool-out-is-null`**)**; exactly one tool name — `which "a" "b"` is `arg_error` **(corpus** `reef-which-arity-error`**)**. |
@@ -554,7 +559,11 @@ work (`false < true` → `true`).
   desugars to `x => x.field <op> e`, and `.method(args)` desugars to `x => x.method(args)`. This is
   exactly what makes `ls.where(.size > 1mb)` (TDD §1.4's own canonical example) and
   `ls.where(.name.contains("x"))` read the way they do — no explicit lambda parameter needed for the
-  common case.
+  common case. A **bare `.field`** with no op/args also works and reaches a zero-arg **method** of
+  that name when there's no such field: `["a","b"].map(.upper)`, `paths.map(.name)`,
+  `[[],[1]].where(.is_empty)` (**corpus** `field-method-fallback.toml`). A real field always wins over
+  a same-named method (user data first). This is why `path` accessors (`.name .stem .ext .parent
+  .read .size .exists …`) read as fields inside a `.map(...)`.
 - Recursion works normally: `fn fact(n: int) { if n <= 1 { 1 } else { n * fact(n - 1) } }` (**corpus**
   `closures.toml:recursive-fn-factorial`); a `fn`'s own parameter can be captured by a lambda defined
   inside it and returned (**corpus** `fn-returns-closure-capturing-param`).
@@ -589,7 +598,12 @@ All corpus-grounded in `spec/cases/match.toml`:
   likewise (`while-loop-break-stops-early`).
 - `try { } catch [pat] { }` — binds the caught `error` value if a pattern name is given; the render
   form is `error(<code>: <msg>)` (**corpus** `operators.toml:op-try-catch-binds-error-value`, `1/0`
-  caught → `error(div_zero: division by zero)`). **Postfix `catch`** is the same thing as sugar:
+  caught → `error(div_zero: division by zero)`). **The bound error is introspectable** — it exposes
+  `.code .msg .hint .stderr .status` as fields, so a handler branches on the failure:
+  `catch err { if err.code == "not_found" { ... } else { ... } }` (**corpus**
+  `catch-forms.toml:catch-error-branch-on-code`). Absent optionals read as `null`. The binding syntax
+  is `catch IDENT block` (or `catch IDENT expr`), **not** `catch IDENT => ...` (that `=>` is lambda
+  syntax and is a parse error here). **Postfix `catch`** is the same thing as sugar:
   `expr catch handler` — `(1/0) catch e { "caught" }` and the bare-value form `1/0 catch "fallback"`
   both work (**corpus** `core.toml:catch-unbound-fallback`, `operators.toml:op-catch-bound-name`). A
   successful `try`/expression short-circuits `catch` entirely — the RHS of `??`/`catch` on a
