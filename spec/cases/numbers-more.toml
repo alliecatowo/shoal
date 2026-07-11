@@ -84,3 +84,38 @@ value = "-1"
 name = "num2-int-rem-by-zero-is-div-zero"
 src = "5 % 0"
 error = "div_zero"
+
+# `.round(n)`/`.floor(n)`/`.ceil(n)` round to `n` decimal places — the argument
+# used to be silently ignored (always integer-rounded). No arg / `n = 0` still
+# means nearest integer. Ints pass through at any precision.
+# See crates/shoal-value/src/methods/num.rs::round_to.
+
+[[case]]
+name = "num-round-two-decimals"
+src = '(3.14159).round(2)'
+value = "3.14"
+
+[[case]]
+name = "num-round-three-decimals"
+src = '(22.0 / 7.0).round(3)'
+value = "3.143"
+
+[[case]]
+name = "num-round-zero-precision-is-integer"
+src = '(3.7).round(0)'
+value = "4"
+
+[[case]]
+name = "num-floor-two-decimals"
+src = '(3.14159).floor(2)'
+value = "3.14"
+
+[[case]]
+name = "num-ceil-two-decimals"
+src = '(3.14159).ceil(2)'
+value = "3.15"
+
+[[case]]
+name = "num-round-int-unchanged-at-precision"
+src = '(42).round(3)'
+value = "42"

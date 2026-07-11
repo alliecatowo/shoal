@@ -171,9 +171,9 @@ fn dispatch(ctx: &mut dyn CallCtx, recv: Value, name: &str, args: CallArgs) -> V
                 .map_err(|e| ErrorVal::new("custom", e.to_string()))?,
         )),
         "abs" => num::numeric_unary(recv, f64::abs, i64::checked_abs),
-        "round" => num::float_unary(recv, f64::round),
-        "floor" => num::float_unary(recv, f64::floor),
-        "ceil" => num::float_unary(recv, f64::ceil),
+        "round" => num::round_to(recv, int_arg(&args, 0, 0)?, f64::round),
+        "floor" => num::round_to(recv, int_arg(&args, 0, 0)?, f64::floor),
+        "ceil" => num::round_to(recv, int_arg(&args, 0, 0)?, f64::ceil),
         "save" => path::save(ctx, recv, arg(&args, 0)?, false),
         "append" => path::save(ctx, recv, arg(&args, 0)?, true),
         // Task lifecycle methods (defect #14, TDD §4.7 job control).
