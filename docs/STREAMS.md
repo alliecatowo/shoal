@@ -1,6 +1,10 @@
 # Reactive values: sources, combinators, sinks; the honest `tail -f`
 
-**Status:** spec complete, implementation pending.
+**Status:** substantially implemented. Working: `channel(name)` with `.emit`/`.events()`/`.latest()`;
+`every(dur)`; stream pipelines (`.map`, `.scan(init, f)`, `.take(n)`, `.collect()`); the
+`stream_unbounded` guard on collecting an unbounded stream; `watch(...)`/`tail(...)`. Verify a
+specific combinator (`.debounce`/`.throttle`/`.window`/`.merge`/`.buffer`/`.dedupe`/`.distinct`) or
+sink (`.into(channel)`, `on channel(...) { }`) against source before relying on it.
 
 **Normative. The corpus/frame decides disputes.** Companion to `docs/TDD.md` (esp. §1.9, §4.5,
 §4.7, §13.7), `docs/VISION.md` §2, `docs/AGENT-SURFACE.md` §4–7, `docs/REEF.md`; supersedes them

@@ -1,6 +1,10 @@
 # Input, interpreters, and running things: the anti-heredoc contract
 
-**Status:** interpreter blocks + `.feed`: spec complete, implementation pending.
+**Status:** interpreter blocks + `.feed`: **implemented**. Working: `value.feed(bareCmd)`; interpreter
+blocks `python { … }` / `jq { … }` / `sh { … }` / `node { … }` etc. with `.out` auto-parsing the
+block's stdout to a structured value; and feeding into a block (`value.feed(sh { cmd args })`,
+`value.feed(jq { … })`). Remaining gap: the bare `.feed(cmd args)` spelling with arguments/flags does
+not parse yet — feed a `sh { … }` or interpreter block instead when the command needs arguments.
 
 **Normative. The corpus/frame decides disputes.** Companion to `docs/TDD.md` (esp. §1.2, §1.3,
 §1.9, §4.5, §13.13, §13.14), `docs/VISION.md` §1/§4, `docs/AGENT-SURFACE.md`, `docs/REEF.md` §5;

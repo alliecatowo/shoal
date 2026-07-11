@@ -325,10 +325,10 @@ method; treat the signature as authoritative per CONTRACTS but verify empiricall
 | `find . -name '*.rs' -size +1M` | `ls.where(.size > 1mb)` | This exact phrase is TDD §1.4's own canonical pipe-replacement example — the size unit is a first-class literal, not a flag to parse (`1mb`, **corpus** `literals.toml:lit-size-mb-frac`). |
 | `cmd > file`, `cmd >> file` | `cmd > file`, `cmd >> file` (kept!) | Muscle-memory sugar, CMD-mode only, desugars to `.save(file)`/`.append(file)` on stdout bytes (TDD §1.3, §3.4). The **modern, canonical** form is calling `.save`/`.append` directly: `(cmd).save(file)`. |
 | `cmd < file` | `cmd < file` (kept) | Sole stdin sugar; desugars to `StdinSpec::File` directly (IO.md §1.1). No numeric variant, no here-string variant. |
-| `cmd <<EOF ... EOF` (heredoc) | **forbidden, permanently** | Not lexed — no `<<` token exists at all. Diagnostic: *"shoal has no heredocs — feed a string or multiline literal instead: `value.feed(cmd)`, or use an interpreter block: `python { ... }`"* (IO.md §4). **`.feed` and non-`sh` interpreter blocks are spec'd, not yet implemented** — see §6. Today's only working replacement is a `sh { ... }` raw block (real; TDD §13.13) or a plain multiline string literal (`"""..."""`) as an argument. |
-| `cmd <<< "text"` (here-string) | **forbidden** | *"shoal has no here-strings — `"text".feed(cmd)`"* (IO.md §4). Same caveat: `.feed` is not yet implemented. |
+| `cmd <<EOF ... EOF` (heredoc) | **forbidden, permanently** — use an interpreter block | Not lexed — no `<<` token exists at all. Diagnostic: *"shoal has no heredocs — feed a string or multiline literal instead: `value.feed(cmd)`, or use an interpreter block: `python { ... }`"* (IO.md §4). **Interpreter blocks are IMPLEMENTED and this is the answer**: `python { import json; print(json.dumps(...)) }.out` runs the program and auto-parses its stdout to a structured value; `sh { ... }` (TDD §13.13) and a multiline `"""..."""` literal also work. |
+| `cmd <<< "text"` (here-string) | `"text".feed(cmd)` (works) | *"shoal has no here-strings — `"text".feed(cmd)`"* (IO.md §4). `.feed` IS implemented — `"text".feed(sort).out`. For a command that needs arguments, feed a block: `"text".feed(sh { grep foo })` or `"text".feed(jq { … })`. |
 | `cmd 2>file`, `cmd 2>&1`, `cmd &>file` | **forbidden** | No fd-number tokens exist in the grammar at all. Use `.stderr` on a captured outcome: `cmd.stderr.save(file)`, or `try { cmd } catch e { e.stderr }` (IO.md §4). A live PTY run (statement position) already merges stdout/stderr by construction — this is honest PTY semantics, not a missing flag. |
-| `cmd1 \| cmd2` raw byte plumbing | `value.feed(cmd)` / `cmd.feed(value)` | The one asylum the pipe error names for genuine byte plumbing. **Spec'd, not yet implemented** (IO.md status banner) — do not rely on `.feed` today. |
+| `cmd1 \| cmd2` raw byte plumbing | `value.feed(cmd)` / `cmd.feed(value)` | The one asylum the pipe error names for genuine byte plumbing. **IMPLEMENTED** — `["b","a","c"].feed(sort).out` → sorted. For a command needing args, feed a block: `.feed(sh { sort -r })` / `.feed(jq { .a })`. The bare `.feed(cmd -flag)` spelling with args doesn't parse yet — always use the block form for a command with arguments. |
 | `cmd1 && cmd2`, `cmd1 \|\| cmd2` | kept, unchanged | `&&`/`||` operate on `bool` or command **outcomes** (success = true), short-circuiting, returning the deciding operand *verbatim* — not force-cast to `bool` (**corpus** `outcome.toml:outcome-and-chain-both-outcomes`, `outcome-and-bool-then-outcome`; CMD-mode chaining needs `^` when the head is a reserved word: **corpus** `operators.toml:op-cmd-and-and-runs-both-on-success`, `^true && ^true`). |
 | `cmd &` (background) | `cmd &` (kept) | Desugars to `spawn { cmd }`, prints a task handle (TDD §1.3). `shoal_cancel` exists **(P1, §0.7)** to stop a task once you have its ref, but confirm `shoal_exec` actually exposes a `background`/`timeout_ms` param before assuming you can create one through this plugin at all (§4 rule 16). |
 | `for f in *.txt; do ...; done` | `for f in glob("*.txt") { ... }` or `glob("*.txt").each(f => ...)` | `for` binds a pattern over any iterable (EBNF `"for" pattern "in" expr block`); basic range form is **(corpus** `closures.toml:for-loop-break-stops-early`, `core.toml:for-range-sum`**)**. |
@@ -656,8 +656,9 @@ Each rule: what's forbidden, why, the corpus/source proof, and the correct alter
    `duration/duration`, `duration/int` reach `div_zero` on an actual zero divisor. *Proof*: the full
    `coercion.toml` block cited in §3.6 above. Don't guess at this matrix — re-check the table.
 10. **Streams are single-consumption.** A second consumption is a runtime error (`stream_consumed`,
-    fix-it "collect first, or `.tee(2)`") — TDD §1.9. (Streams themselves are not yet implemented,
-    §6 — but the *rule* applies immediately once they land; don't assume you can read one twice.)
+    fix-it "collect first, or `.tee(2)`") — TDD §1.9. Streams **are implemented** (channels,
+    `every(dur)`, `.map`/`.scan`/`.take`/`.collect` all work, §6) — so this rule bites now: don't read
+    one twice.
 11. **`it`/`out[n]` are REPL-only.** TDD's edge-case register (§13.16) makes this a parse error outside
     a REPL, with the fix-it "bind a variable." The kernel forces `evaluator.interactive = false` for
     **every** MCP-driven `exec` call (verified in `crates/shoal-kernel/src/lib.rs`) — treat `it`/`out`
@@ -744,7 +745,7 @@ pins it — just verify empirically if you hit an edge).
 | `index_range` ✓ | list/table index out of bounds | `literals.toml:list-index-range`, `[1][3]` |
 | `field_missing` ✓ | record has no such field | `core.toml:record-missing` |
 | `utf8_error` | `path.str()` on non-UTF-8 bytes | use `.display()` (lossy) instead |
-| `stream_consumed` | a stream was driven to a sink twice | `.tee(n)` before the first consumption (streams not yet implemented, §6) |
+| `stream_consumed` | a stream was driven to a sink twice | `.tee(n)` before the first consumption (streams **are** implemented — this fires for real) |
 | `no_matches` | (pinned; no corpus case reviewed) | — |
 | `custom` ✓ | a named, ad-hoc error with a specific message (e.g. the `cd`-in-`fn`/`env`-in-`fn` fix-its) | `reef.toml:reef-cd-inside-fn-body-is-illegal` |
 | `assert_failed` | (pinned; no corpus case reviewed) | — |
@@ -755,17 +756,20 @@ pins it — just verify empirically if you hit an edge).
 | `reef_conflict` | two reef scopes constrain one tool incompatibly | (not verified reachable in this pass) |
 | `reef_not_found` | a reef-constrained tool has no resolvable candidate | (not verified reachable in this pass) |
 | `reef_provider` | a reef provider itself failed | (not verified reachable in this pass) |
-| `feed_error` | **`.feed` is not implemented** (§6) — would fire on feeding a never-feedable type (`secret`/`task`/`closure`/`error`/`glob`/`regex`) once it lands | n/a today |
-| `lang_block_unbalanced` | **not implemented** (§6) — unterminated brace in a non-`sh` interpreter block | n/a today |
-| `runner_not_found` | **not implemented** (§6) — `run <path>` exhausted extension/shebang resolution | n/a today |
-| `stream_unbounded` | **not implemented** (§6) — `.collect()` on a stream with no natural end | n/a today |
+| `feed_error` | `.feed` **is implemented**; fires on feeding a never-feedable type (`secret`/`task`/`closure`/`error`/`glob`/`regex`) | feed a serializable value (str/bytes/list/record/table) instead |
+| `lang_block_unbalanced` | interpreter blocks **are implemented**; an unterminated brace in a `python { … }`/`jq { … }`/etc. block | balance the braces in the block payload |
+| `runner_not_found` | reef `run <path>` extension/shebang resolution (reef integration still partial — verify against source) | n/a for most flows |
+| `stream_unbounded` | **implemented and correct** — you `.collect()`d a stream with no natural end | bound it first with `.take(n)`/`.take_until(…)`, or use `.each(f)` |
 
 ---
 
-## 6. What's not yet implemented — do not attempt
+## 6. Implementation status — what works, what to skip
 
-Stated plainly so you never waste a turn on it. Each item names the doc whose own status banner says
-so, or the source fact that proves it.
+Stated plainly so you never waste a turn. **This card was first written against an early build and
+over-reported "not implemented"** — the `.feed`, interpreter-block, and stream/channel entries below
+were verified working against the current binary and are now marked accordingly. The genuinely-missing
+items (MCP resources P1, background exec via MCP, per-call elision tuning, `complete`/`explain`, real
+OS sandboxing) remain flagged. When in doubt, run a one-line probe rather than trusting a stale banner.
 
 - **(P1 — check before assuming still true) The MCP `resources/*`/events subsystem.** At authoring
   time there was no `resources/list`, `resources/read`, `resources/subscribe`, or
@@ -790,15 +794,23 @@ so, or the source fact that proves it.
 - **`complete` and `explain`** JSON-RPC methods (typed completions, structured explanations) —
   `docs/TDD.md` §7 and `docs/AGENT-SURFACE.md` §5 both name them; the kernel's `dispatch` has no case
   for either — calling them 404s with `-32601`.
-- **`.feed` and interpreter-block generalization** (`python { }`, `node { }`, `jq { }`, `ruby { }`,
-  `invoke_payload`, triple-raw `tool ''' ... '''` for non-`sh` tools). `docs/IO.md`'s status banner:
-  *"interpreter blocks + `.feed`: spec complete, implementation pending."* The one thing that **does**
-  work today is the pre-existing `sh { ... }` raw block (TDD §13.13) — corpus-confirmed via
-  `reef.toml`'s `sh { printf ... }` cases.
-- **All reactive streams**: `watch(...)`, `tail(...)`, `every(...)`, `channel(name)`/`.emit`/`.events()`/`on
-  channel(...) { }`, and every combinator (`.debounce .throttle .window .merge .zip .buffer .scan
-  .dedupe .distinct`) and stream-specific sink (`.into(channel)`). `docs/STREAMS.md`'s status banner:
-  *"spec complete, implementation pending."*
+- **~~`.feed` and interpreter blocks~~ — NOW IMPLEMENTED (this card's original banner was stale).**
+  Verified working against the current binary: `["b","a","c"].feed(sort).out` (feed a value's bytes to
+  a bare command); interpreter blocks `python { print(6*7) }.out`, `jq { .a }`, `sh { sort -r }`, and
+  feeding into them — `{a:1,b:2}.feed(jq { .a }).out` → `1`, `list.feed(sh { sort -r }).out`. An
+  interpreter block's stdout **auto-parses to a structured value** on `.out`
+  (`python { import json; print(json.dumps({"n":42})) }.out` → the record `{n: 42}`). **One remaining
+  gap**: the *bare* `.feed(cmd args)` spelling with arguments/flags doesn't parse yet — write
+  `.feed(sh { cmd args })` or `.feed(jq { … })` / `.feed(python { … })` instead (feeding to a command
+  that needs args always goes through a block form today). Heredocs stay gone; this is their
+  replacement, and it works.
+- **Reactive streams — SUBSTANTIALLY IMPLEMENTED (card's original "pending" banner was stale).**
+  Verified working: `channel(name)` with `.emit(v)`/`.events()`/`.latest()`; `every(dur)`; stream
+  pipelines `every(10ms).take(3).collect()` → 3, `.map`, `.scan(init, f)`; and the `stream_unbounded`
+  guard fires correctly when you `.collect()` an unbounded stream (bound it with `.take(n)` first).
+  `watch(...)`/`tail(...)` exist. Before relying on a *specific* combinator (`.debounce .throttle
+  .window .merge .buffer .dedupe .distinct`) or sink (`.into(channel)`, `on channel(...) { }`), test it
+  once — coverage is broad but this card no longer claims to enumerate exactly which are live.
 - **Most of reef's real surface**: `.reef.toml` project-scope walking, `[runners]`-based `run
   <path>`/bare-path resolution, `reef add/lock/fetch/doctor`, drift detection. `docs/REEF.md`'s status
   banner: *"crate built+tested; eval integration landing this wave."* What **does** work today,
