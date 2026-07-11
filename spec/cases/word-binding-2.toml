@@ -1,0 +1,201 @@
+# CMD-mode word binding hardening, round 2 (TDD §4.4 / §4.2 site 2):
+# `--flag value` consuming the next word for a non-bool-typed parameter
+# (exactly like `--flag=value`), strict arity — excess positionals without a
+# `...rest` and unknown named arguments are arg_errors, never silent drops —
+# a `duration`-typed param binding a bare integer word AS a duration
+# (seconds), `list<T>` params coercing per element on the EXPR-call path
+# too, and `.shl` scripts running in a FRESH lexical scope (IO.md §3.2
+# step 4) so their bindings never leak into the parent session.
+# Companion suites: coercion.toml word-bind-*, fn-param-binding-more.toml.
+# (`^head` adapter bypass is unit-tested in shoal-eval — the corpus
+# evaluator carries no adapters.)
+
+# --- `--flag value` binds the next word to a non-bool param (TDD §4.4) ---
+
+[[case]]
+name = "wb2-flag-next-word-binds-value"
+# `--times 2` must bind `2` to the int param exactly like `--times=2`, not
+# bind flag-presence `true` and reroute `2` as a stray positional.
+src = '''
+fn f(a: str, times: int = 1) { [a, "{times}"] }
+(f ada --times 2)
+'''
+value = '["ada", "2"]'
+
+[[case]]
+name = "wb2-flag-eq-value-still-binds"
+src = '''
+fn f(a: str, times: int = 1) { [a, "{times}"] }
+(f ada --times=2)
+'''
+value = '["ada", "2"]'
+
+[[case]]
+name = "wb2-flag-value-statement-position"
+src = '''
+fn f(a: str, times: int = 1) { "{a}:{times}" }
+f ada --times 2
+'''
+value = '"ada:2"'
+
+[[case]]
+name = "wb2-flag-at-end-without-value-is-arg-error"
+src = '''
+fn f(a: str, times: int = 1) { a }
+(f ada --times)
+'''
+error = "arg_error"
+error_contains = "--times requires a value"
+
+[[case]]
+name = "wb2-bool-flag-keeps-presence-semantics"
+# A bool-typed flag must NOT consume the following word.
+src = '''
+fn f(a: str, force: bool = false) { [a, force] }
+(f x --force)
+'''
+value = '["x", true]'
+
+# --- strict arity: no silent drops (TDD §4.4) ---
+
+[[case]]
+name = "wb2-excess-positionals-are-arg-error"
+src = '''
+fn f(x: int) { x }
+f(1, 2, 3)
+'''
+error = "arg_error"
+error_contains = "expected 1 argument, got 3"
+
+[[case]]
+name = "wb2-excess-positional-words-are-arg-error"
+src = '''
+fn f(x: int) { x }
+f 1 2
+'''
+error = "arg_error"
+error_contains = "expected 1 argument, got 2"
+
+[[case]]
+name = "wb2-unknown-named-arg-is-arg-error"
+src = '''
+fn f(x: int) { x }
+f(1, bogus: 99)
+'''
+error = "arg_error"
+error_contains = "unknown argument `bogus`"
+
+[[case]]
+name = "wb2-rest-param-still-absorbs-excess"
+# `...rest` legitimately absorbs the tail — no arity error.
+src = '''
+fn f(x: int, ...rest: list<int>) { rest.len() }
+f 1 2 3
+'''
+value = "2"
+
+# --- bare-int word binds a duration param AS a duration (TDD §4.2 site 2) ---
+
+[[case]]
+name = "wb2-duration-bare-int-word-binds-seconds"
+# `f 5` must give the callee a duration (5s), not a stray int that then
+# trips duration arithmetic.
+src = '''
+fn f(d: duration) { d + 1s }
+f 5
+'''
+value = "6s"
+
+[[case]]
+name = "wb2-duration-bare-int-word-renders-as-duration"
+src = '''
+fn f(d: duration) { d }
+f 90
+'''
+value = "1m30s"
+
+# --- list<T> params coerce per element on the EXPR path too ---
+
+[[case]]
+name = "wb2-list-int-expr-call-coerces-elements"
+src = '''
+fn f(xs: list<int>) { xs[0] + 1 }
+f(["2", "3"])
+'''
+value = "3"
+
+[[case]]
+name = "wb2-list-int-cmd-paren-expr-coerces-elements"
+src = '''
+fn f(xs: list<int>) { xs[0] + 1 }
+f (["2", "3"])
+'''
+value = "3"
+
+[[case]]
+name = "wb2-list-int-native-elements-pass-through"
+src = '''
+fn f(xs: list<int>) { xs[0] + 1 }
+f([2, 3])
+'''
+value = "3"
+
+[[case]]
+name = "wb2-list-elem-parse-failure-is-arg-error"
+src = '''
+fn f(xs: list<int>) { xs[0] }
+f(["nope"])
+'''
+error = "arg_error"
+error_contains = "expected int"
+
+# --- .shl scripts get a fresh lexical scope (IO.md §3.2 step 4) ---
+
+[[case]]
+name = "wb2-shl-script-lets-do-not-leak-into-parent"
+src = '''
+echo "let zzz = 42" > leak.shl
+run leak.shl
+zzz
+'''
+error = "not_found"
+
+[[case]]
+name = "wb2-shl-head-lets-do-not-leak-into-parent"
+# The bare `./x.shl` head form shares the same child-evaluator path.
+src = '''
+echo "let zzz = 42" > head.shl
+./head.shl
+zzz
+'''
+error = "not_found"
+
+[[case]]
+name = "wb2-shl-script-cannot-read-parent-lets"
+# Fresh scope cuts both ways: the child is a separate program and does not
+# see the caller's bindings either.
+src = '''
+let zzz = 7
+echo "zzz" > peek.shl
+run peek.shl
+'''
+error = "not_found"
+
+[[case]]
+name = "wb2-shl-script-args-bound-in-child"
+src = '''
+echo "args.len()" > s.shl
+run s.shl a b
+'''
+value = "2"
+
+[[case]]
+name = "wb2-source-still-shares-session-scope"
+# Contrast: `source` evaluates IN the current session, so its `let`s land
+# in the caller's scope by design.
+src = '''
+echo "let zzz = 42" > lib.shl
+source lib.shl
+zzz
+'''
+value = "42"

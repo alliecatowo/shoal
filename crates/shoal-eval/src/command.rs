@@ -51,15 +51,36 @@ impl Evaluator {
             };
             let mut pos = Vec::new();
             let mut named = Vec::new();
-            for a in &call.args {
+            let mut i = 0;
+            while i < call.args.len() {
+                let a = &call.args[i];
                 match a {
-                    CmdArg::FlagLong { name, value, .. } => named.push((
-                        name.clone(),
-                        match value {
+                    CmdArg::FlagLong { name, value, .. } => {
+                        let v = match value {
                             Some(v) => self.cmd_arg_value(v)?,
+                            // `--name v` ≡ `--name=v` when `name` is a declared
+                            // non-bool parameter (TDD §4.4): the flag consumes
+                            // the next word as its value instead of binding
+                            // presence and rerouting the word as a positional.
+                            // Bool-typed (and untyped/unknown) names keep
+                            // presence semantics.
+                            None if closure_sig.is_some_and(|(params, _)| {
+                                params.iter().any(|p| {
+                                    p.name == *name
+                                        && p.ty.as_ref().is_some_and(|t| t.name != "bool")
+                                })
+                            }) =>
+                            {
+                                i += 1;
+                                let next = call.args.get(i).ok_or_else(|| {
+                                    ErrorVal::arg_error(format!("--{name} requires a value"))
+                                })?;
+                                self.cmd_arg_value(next)?
+                            }
                             None => Value::Bool(true),
-                        },
-                    )),
+                        };
+                        named.push((name.clone(), v));
+                    }
                     CmdArg::Glob { .. }
                         if closure_sig.is_some_and(|(params, rest)| {
                             crate::coerce::expected_param_ty(params, rest, pos.len())
@@ -94,6 +115,7 @@ impl Evaluator {
                     }
                     _ => pos.extend(self.expand_arg(a)?),
                 }
+                i += 1;
             }
             // Coerce CMD words to the callee's declared param types (defect #12).
             if let Value::Closure(c) = &bound {
@@ -256,25 +278,24 @@ impl Evaluator {
             } else {
                 self.cwd.join(script_path)
             };
-            let src = self
-                .fs
-                .read_to_string(&path)
-                .map_err(|e| ErrorVal::new("io_error", format!("cannot read script: {e}")))?;
-            let program = shoal_syntax::parse(&src)
-                .map_err(|e| ErrorVal::new("parse_error", e.to_string()))?;
-
             if is_source {
+                let src = self
+                    .fs
+                    .read_to_string(&path)
+                    .map_err(|e| ErrorVal::new("io_error", format!("cannot read script: {e}")))?;
+                let program = shoal_syntax::parse(&src)
+                    .map_err(|e| ErrorVal::new("parse_error", e.to_string()))?;
                 return self.eval_program(&program);
-            } else {
-                let mut child = Evaluator::new(self.cwd.clone());
-                child.env = self.env.clone();
-                child.process_env = self.process_env.clone();
-                child.adapters = self.adapters.clone();
-                child.inherit_ports(self);
-                return child.eval_program(&program);
             }
+            // A `.shl` head runs as a separate program in a child evaluator
+            // with a fresh lexical scope (IO.md §3.2 step 4) — share the
+            // `run x.shl` path so bindings cannot leak into this session.
+            let args = self.collect_cmd_values(call)?;
+            return self.run_script_file(&path, Some("shl"), args, position);
         }
-        if self.adapters.lookup(&call.head).is_some() {
+        // `^name` bypasses adapters too (language card): the forced head must
+        // reach the real command, not the adapter's flag/signature gate.
+        if !call.forced && self.adapters.lookup(&call.head).is_some() {
             return self.eval_adapter(call, position);
         }
         let mut argv = vec![OsString::from(&call.head)];

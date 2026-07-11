@@ -878,16 +878,24 @@ mod tests {
 
     #[test]
     fn record_transcript_binds_it_and_out() {
+        // `it`/`out` are REPL-only at parse time, so this transcript test
+        // parses in REPL context.
+        let repl = |src: &str| {
+            shoal_syntax::parse_with_ctx(
+                src,
+                shoal_syntax::ParseCtx {
+                    repl: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        };
         let mut ev = Evaluator::new(std::env::current_dir().unwrap());
         ev.record_transcript(&Value::Int(7));
         ev.record_transcript(&Value::Str("hi".into()));
-        let it = ev
-            .eval_program(&shoal_syntax::parse("it").unwrap())
-            .unwrap();
+        let it = ev.eval_program(&repl("it")).unwrap();
         assert_eq!(it, Value::Str("hi".into()));
-        let out = ev
-            .eval_program(&shoal_syntax::parse("out").unwrap())
-            .unwrap();
+        let out = ev.eval_program(&repl("out")).unwrap();
         assert_eq!(
             out,
             Value::List(vec![Value::Int(7), Value::Str("hi".into())])
@@ -1061,6 +1069,28 @@ consumed = ["short", "branch"]
             "status --porcelain=v2",
             "-s must be accepted but dropped from argv"
         );
+    }
+
+    #[test]
+    fn forced_head_bypasses_adapter() {
+        // `^name` reaches the real command (language card): a forced head
+        // must skip the adapter's flag/signature gate entirely. The corpus
+        // runner carries no adapters, so this lives here.
+        let toml = r#"[cmd.zzzfixture]
+bin="zzzfixture-no-such-binary"
+
+[cmd.zzzfixture.sub.log]
+params = { follow = "bool" }
+"#;
+        // Unforced: the adapter gate rejects the unknown flag before spawn.
+        let err = adapter_eval(toml, "zzzfixture log --oneline").unwrap_err();
+        assert_eq!(err.code, "arg_error");
+        assert!(err.msg.contains("unknown flag --oneline"));
+        // Forced: dispatch bypasses the adapter and reaches PATH resolution
+        // (`not_found` here — the bin doesn't exist — proving the adapter's
+        // arg_error gate never ran).
+        let err = adapter_eval(toml, "^zzzfixture log --oneline").unwrap_err();
+        assert_eq!(err.code, "not_found");
     }
 
     #[test]

@@ -147,13 +147,19 @@ impl Evaluator {
                     .map_err(|e| ErrorVal::new("io_error", format!("cannot read script: {e}")))?;
                 let program = shoal_syntax::parse(&src)
                     .map_err(|e| ErrorVal::new("parse_error", e.to_string()))?;
+                // A `.shl` script is a separate program (IO.md §3.2 step 4):
+                // the child keeps `Evaluator::new`'s FRESH root scope. Aliasing
+                // the caller's env (`Env::clone` shares the same Arc'd scope)
+                // leaked every script `let` back into the parent session.
                 let mut child = Evaluator::new(self.cwd.clone());
-                child.env = self.env.clone();
                 child.process_env = self.process_env.clone();
                 child.adapters = self.adapters.clone();
                 child.inherit_ports(self);
                 child.set_bus(self.bus());
                 child.env.declare("args", Value::List(args), false);
+                child
+                    .env
+                    .declare("script", Value::Path(path.to_path_buf()), false);
                 child.eval_program(&program)
             }
             _ => {

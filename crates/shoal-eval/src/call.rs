@@ -39,6 +39,32 @@ impl Evaluator {
     pub(crate) fn call_value_inner(&mut self, f: &Value, args: CallArgs) -> VResult<Value> {
         match f {
             Value::Closure(c) => {
+                // Strict binding (TDD §4.4: "arity/type errors carry the exact
+                // source span"): excess positionals only flow into a declared
+                // `...rest`; without one they are an arg_error, as is any
+                // named argument that names no parameter. Silently dropping
+                // either mis-binds without a diagnostic.
+                if c.rest.is_none() && args.pos.len() > c.params.len() {
+                    return Err(ErrorVal::new(
+                        "arg_error",
+                        format!(
+                            "expected {} argument{}, got {}",
+                            c.params.len(),
+                            if c.params.len() == 1 { "" } else { "s" },
+                            args.pos.len()
+                        ),
+                    ));
+                }
+                if let Some((name, _)) = args
+                    .named
+                    .iter()
+                    .find(|(n, _)| !c.params.iter().any(|p| &p.name == n))
+                {
+                    return Err(ErrorVal::new(
+                        "arg_error",
+                        format!("unknown argument `{name}`"),
+                    ));
+                }
                 let old = self.env.clone();
                 self.env = c.env.child();
                 for (i, p) in c.params.iter().enumerate() {
@@ -57,6 +83,16 @@ impl Evaluator {
                                 "arg_error",
                                 format!("missing argument `{}`", p.name),
                             ));
+                        }
+                    };
+                    // A `list<T>` annotation coerces per element (TDD §4.2
+                    // site 2) on the EXPR path too; CMD calls arrive with
+                    // word lists pre-coerced, so this is idempotent there.
+                    let val = match crate::coerce::coerce_list_param(val, p.ty.as_ref()) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            self.env = old;
+                            return Err(e);
                         }
                     };
                     self.env.declare(p.name.clone(), val, false);
