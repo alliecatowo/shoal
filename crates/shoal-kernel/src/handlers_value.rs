@@ -70,10 +70,49 @@ impl Kernel {
             }
             (None, other) => other,
         };
-        let budget = ElideBudget::from_spec(params.elide.as_ref());
-        let uri = short_ref_to_uri(&params.r#ref, params.path.as_deref());
-        let wire = elide_wire_value(&sliced, &uri, &budget);
-        encode(json!({"ref":params.r#ref,"value":wire}))
+        // `format` (AGENT-SURFACE §1): "json" (default) → $-tagged wire value;
+        // "render" → the human render string; "raw" → str verbatim / bytes
+        // base64 (anything else has no raw byte form — say so).
+        match params.format.as_deref() {
+            None | Some("json") => {
+                let budget = ElideBudget::from_spec(params.elide.as_ref());
+                let uri = short_ref_to_uri(&params.r#ref, params.path.as_deref());
+                let wire = elide_wire_value(&sliced, &uri, &budget);
+                encode(json!({"ref":params.r#ref,"value":wire}))
+            }
+            Some("render") => {
+                let render = shoal_value::render::render_block(&sliced, 80);
+                encode(json!({"ref":params.r#ref,"render":render}))
+            }
+            Some("raw") => {
+                let raw = match &sliced {
+                    Value::Str(s) => json!({"ref":params.r#ref,"raw":s}),
+                    Value::Bytes(b) => json!({
+                        "ref": params.r#ref,
+                        "raw_base64": base64::Engine::encode(
+                            &base64::engine::general_purpose::STANDARD,
+                            &***b,
+                        ),
+                    }),
+                    other => {
+                        return Err(RpcError {
+                            code: -32005,
+                            message: format!(
+                                "format \"raw\" applies to str/bytes, not {}",
+                                other.type_name()
+                            ),
+                            data: None,
+                        });
+                    }
+                };
+                encode(raw)
+            }
+            Some(other) => Err(RpcError {
+                code: -32602,
+                message: format!("format must be json, render, or raw (got {other:?})"),
+                data: None,
+            }),
+        }
     }
 
     pub(crate) fn handle_journal_query(self: &Arc<Self>, params: Json) -> Result<Json, RpcError> {

@@ -395,6 +395,11 @@ pub struct ValueGetParams {
     pub slice: Option<[usize; 2]>,
     #[serde(default)]
     pub elide: Option<ElideSpec>,
+    /// Response shape (AGENT-SURFACE §1): `"json"` (default) returns the
+    /// `$`-tagged wire value; `"render"` returns the human render string;
+    /// `"raw"` returns a str verbatim / bytes base64 (other types error).
+    #[serde(default)]
+    pub format: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct JournalQueryParams {

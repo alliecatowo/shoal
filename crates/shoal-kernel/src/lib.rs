@@ -624,6 +624,39 @@ mod tests {
             -32005,
             "slice on a scalar must be an explicit error"
         );
+        // `[a..b]` path ranges (AGENT-SURFACE §1) — used to be "bad index".
+        let ranged = call(
+            &mut client,
+            &mut reader,
+            43,
+            "value.get",
+            json!({"ref":table_ref,"path":"rows[0..2]"}),
+        );
+        let ranged = ranged.result.unwrap()["value"].clone();
+        assert_eq!(ranged["$"], "list", "rows[0..2]: {ranged}");
+        assert_eq!(ranged["v"].as_array().unwrap().len(), 2);
+        // `format=render` returns the human string; `format=raw` on a non-str
+        // value is an explicit error.
+        let rendered = call(
+            &mut client,
+            &mut reader,
+            44,
+            "value.get",
+            json!({"ref":table_ref,"format":"render"}),
+        );
+        let rendered = rendered.result.unwrap();
+        assert!(
+            rendered["render"].as_str().unwrap().contains('1'),
+            "render output: {rendered}"
+        );
+        let raw_bad = call(
+            &mut client,
+            &mut reader,
+            45,
+            "value.get",
+            json!({"ref":value_ref,"format":"raw"}),
+        );
+        assert_eq!(raw_bad.error.expect("raw on int must error").code, -32005);
         drop(client);
         drop(reader);
         thread.join().unwrap();

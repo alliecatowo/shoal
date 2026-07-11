@@ -3,14 +3,16 @@
 //! scratch/audit-arch.md W1.3): pure mechanical move, zero behavior change.
 use super::*;
 
-/// `value.get`'s `path` grammar (TDD §7): dot fields and `[n]` indexes,
-/// e.g. `rows[3].name`, `out.lines[0]`. Structural fields on non-`Record`
-/// values (outcome/error/range/task/table) are synthesized so an agent can
-/// walk into them the same way it would a plain record.
+/// `value.get`'s `path` grammar (TDD §7, AGENT-SURFACE §1): dot fields,
+/// `[n]` indexes, and `[a..b]` half-open ranges — e.g. `rows[3].name`,
+/// `out.lines[0]`, `rows[0..5]`. Structural fields on non-`Record` values
+/// (outcome/error/range/task/table) are synthesized so an agent can walk
+/// into them the same way it would a plain record.
 #[derive(Debug, Clone)]
 enum PathSeg {
     Field(String),
     Index(usize),
+    Range(usize, usize),
 }
 
 fn parse_value_path(path: &str) -> Result<Vec<PathSeg>, String> {
@@ -30,10 +32,22 @@ fn parse_value_path(path: &str) -> Result<Vec<PathSeg>, String> {
                     .map(|p| p + i + 1)
                     .ok_or_else(|| format!("unterminated `[` in path `{path}`"))?;
                 let digits = &path[i + 1..close];
-                let idx = digits
-                    .parse::<usize>()
-                    .map_err(|_| format!("bad index `{digits}` in path `{path}`"))?;
-                segs.push(PathSeg::Index(idx));
+                // `[a..b]` half-open range (AGENT-SURFACE §1) — this used to
+                // be rejected as a "bad index" despite the doc promising it.
+                if let Some((a, b)) = digits.split_once("..") {
+                    let a = a
+                        .parse::<usize>()
+                        .map_err(|_| format!("bad range start `{a}` in path `{path}`"))?;
+                    let b = b
+                        .parse::<usize>()
+                        .map_err(|_| format!("bad range end `{b}` in path `{path}`"))?;
+                    segs.push(PathSeg::Range(a, b));
+                } else {
+                    let idx = digits
+                        .parse::<usize>()
+                        .map_err(|_| format!("bad index `{digits}` in path `{path}`"))?;
+                    segs.push(PathSeg::Index(idx));
+                }
                 i = close + 1;
                 continue;
             }
@@ -133,12 +147,31 @@ fn path_index(value: &Value, idx: usize) -> Result<Value, String> {
     }
 }
 
+/// `[a..b]` — half-open, saturating at the collection's length (the same
+/// clamp `value.get`'s top-level `slice` parameter uses).
+fn path_range(value: &Value, a: usize, b: usize) -> Result<Value, String> {
+    match value {
+        Value::List(items) => {
+            let start = a.min(items.len());
+            let end = b.max(start).min(items.len());
+            Ok(Value::List(items[start..end].to_vec()))
+        }
+        Value::Table(rows) => {
+            let start = a.min(rows.len());
+            let end = b.max(start).min(rows.len());
+            Ok(Value::Table(rows[start..end].to_vec()))
+        }
+        other => Err(format!("cannot range-slice {}", other.type_name())),
+    }
+}
+
 pub(crate) fn resolve_value_path(value: &Value, path: &str) -> Result<Value, String> {
     let mut current = value.clone();
     for seg in parse_value_path(path)? {
         current = match seg {
             PathSeg::Field(name) => path_field(&current, &name)?,
             PathSeg::Index(idx) => path_index(&current, idx)?,
+            PathSeg::Range(a, b) => path_range(&current, a, b)?,
         };
     }
     Ok(current)

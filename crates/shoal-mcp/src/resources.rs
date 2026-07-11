@@ -68,6 +68,22 @@ impl Facade {
             Err(BridgeError::Kernel(e)) => return Err(format!("kernel error: {e}")),
             Err(e) => return Err(e.to_string()),
         };
+        // `format=render`/`format=raw` responses carry a plain string — serve
+        // it as text/plain instead of JSON-encoding a JSON-encoded string.
+        if let Some(text) = value
+            .get("render")
+            .or_else(|| value.get("raw"))
+            .and_then(Value::as_str)
+        {
+            return Ok(json!({
+                "contents": [{
+                    "uri": uri,
+                    "mimeType": "text/plain",
+                    "text": bound_text(text, None),
+                }],
+                "structuredContent": value,
+            }));
+        }
         // A value URI returns `{ref,value}`; unwrap to the value itself for the
         // resource contents. Non-value roots (journal/jobs/events) return their
         // structured payload verbatim.
@@ -178,6 +194,7 @@ impl ParsedUri {
                         "path": self.query.get("path"),
                         "slice": slice,
                         "elide": self.query.get("elide").and_then(|s| serde_json::from_str::<Value>(s).ok()),
+                        "format": self.query.get("format"),
                     }),
                 ))
             }
