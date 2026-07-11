@@ -51,6 +51,21 @@ impl Evaluator {
                 )
                 .with_hint(String::from_utf8_lossy(&o.stderr).trim().to_string())),
             },
+            // A caught `error` value (bound by `catch err { … }`) exposes its
+            // parts so a handler can branch on them —
+            // `catch err { if err.code == "not_found" { … } }`. Mirrors the
+            // `ErrorVal` fields; absent optionals read as `null`.
+            Value::Error(e) => match name {
+                "code" => Ok(Value::Str(e.code.clone())),
+                "msg" => Ok(Value::Str(e.msg.clone())),
+                "hint" => Ok(e.hint.clone().map_or(Value::Null, Value::Str)),
+                "stderr" => Ok(e.stderr.clone().map_or(Value::Null, Value::Str)),
+                "status" => Ok(e.status.map_or(Value::Null, |s| Value::Int(s as i64))),
+                _ => Err(ErrorVal::new(
+                    "field_missing",
+                    format!("error has no field `{name}`"),
+                )),
+            },
             // Calendar-component fields on a datetime (backs `now.year`, the
             // TDD §2.1 relative-anchor probe, and tagged-literal access).
             Value::DateTime(z) => match name {

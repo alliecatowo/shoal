@@ -64,3 +64,32 @@ name = "catchforms-passthrough-unaffected-by-handler-type"
 # is never evaluated or type-checked against it.
 src = '(5).abs() catch [1, 2, 3]'
 value = "5"
+
+# A caught `error` value exposes its parts as fields (`.code .msg .hint
+# .stderr .status`) so a handler can branch on them — the point of the
+# error-binding form. See crates/shoal-eval/src/expr_access.rs `field` /
+# the `Value::Error` arm.
+
+[[case]]
+name = "catch-error-code-field"
+src = '(1 / 0) catch err { err.code }'
+value = '"div_zero"'
+
+[[case]]
+name = "catch-error-branch-on-code"
+src = '''
+path("nope.txt").read catch err {
+  if err.code == "not_found" { "missing" } else { "other" }
+}
+'''
+value = '"missing"'
+
+[[case]]
+name = "catch-error-msg-is-a-string"
+src = '(1 / 0) catch err { err.msg.len() > 0 }'
+value = "true"
+
+[[case]]
+name = "catch-error-absent-optional-is-null"
+src = '(1 / 0) catch err { err.status }'
+value = "null"
