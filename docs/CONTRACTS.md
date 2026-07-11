@@ -10,7 +10,7 @@ Crate dependency DAG (acyclic, enforced; verified against every `crates/*/Cargo.
 ```
 Tier 0 — leaf (no shoal-* deps):
   shoal-ast  shoal-auth  shoal-config  shoal-journal  shoal-leash
-  shoal-proto  shoal-reef  shoal-secret  shoal-wasm
+  shoal-proto  shoal-reef  shoal-secret  shoal-wasm  shoal-prompt
 
 Tier 1 — depend only on Tier 0:
   shoal-value   → ast
@@ -31,11 +31,13 @@ Tier 4 — composition roots (daemon + tools):
   shoal-kernel → ast, auth, eval, exec, journal, leash, proto, syntax, value
 
 Tier 5 — entrypoints (binaries):
-  shoal        → adapters, ast, config, doctor, eval, syntax, value
+  shoal        → adapters, ast, config, doctor, eval, prompt, syntax, value
   shoal-mcp, shoal-lsp  — spawned by `shoal` as companion subprocesses (`Action::Companion`,
                           crates/shoal/src/main.rs), NOT Cargo dependencies of `shoal`;
-                          shoal-mcp itself has zero shoal-* deps (talks to shoal-kernel's
-                          socket over the wire protocol, not via Rust linkage)
+                          shoal-mcp itself has zero shoal-* deps in `[dependencies]` (talks to
+                          shoal-kernel's socket over the wire protocol, not via Rust linkage —
+                          shoal-kernel/shoal-proto appear only as `[dev-dependencies]`, for its
+                          own integration tests)
   shoal-kernel  — the long-lived per-user daemon (TDD §10); MCP/LSP/agent/human clients
                   attach to its socket. Independent of the `shoal` binary at the Cargo-dep
                   level (`shoal` never depends on or spawns `shoal-kernel`) — the two are
@@ -43,6 +45,22 @@ Tier 5 — entrypoints (binaries):
                   script.shl` links shoal-eval in-process; kernel-hosted sessions attach over
                   the socket instead).
 ```
+
+`shoal-prompt` (TDD-adjacent `design-prompt.md` §2.1) is a **pure** leaf: it renders a shoal
+prompt string from a structured `PromptContext` snapshot with no IO and, deliberately, zero
+`shoal-*` deps in `[dependencies]` (only `serde` + `toml`) — `shoal-value` appears strictly as a
+`[dev-dependencies]` entry for a render-parity tripwire test and never ships in the compiled
+graph. `shoal` (the binary) is the only in-tree consumer today and is responsible for gathering
+the live context (cwd, git status, reef state, etc.) and feeding it in; `shoal-prompt` itself
+never reaches out to git/fs/reef.
+
+`shoal-eval`'s internals are split across many files under `crates/shoal-eval/src/` (one
+`impl Evaluator { .. }` block per file, following the `reef.rs` precedent) rather than one
+monolithic `lib.rs` — current modules: `args, builtins, call, channels, coerce, command, expr,
+helpers, host, journal, modules, namespaces, pattern, plan, reef, script, stmt, streams`. This is
+purely an internal-organization detail (no public-API surface beyond what's pinned in this file)
+and is expected to keep growing/reshuffling as eval-heavy waves land; the DAG tiers above are
+unaffected since none of these are separate crates.
 
 Notes / corrections vs the old (stale) diagram:
 - `shoal-exec` is **not** a leaf — it depends on `shoal-leash` (sandboxing hooks around spawn).

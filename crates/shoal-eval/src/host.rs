@@ -15,18 +15,15 @@ impl Evaluator {
             match r.kind {
                 RedirectKind::Out => {
                     let p = self.arg_path(&r.target)?;
-                    std::fs::write(&p, value_bytes(&value))
+                    self.fs
+                        .write(&p, &value_bytes(&value))
                         .map_err(|e| ErrorVal::new("custom", e.to_string()))?;
                     captured = true;
                 }
                 RedirectKind::Append => {
-                    use std::io::Write;
                     let p = self.arg_path(&r.target)?;
-                    std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(&p)
-                        .and_then(|mut f| f.write_all(&value_bytes(&value)))
+                    self.fs
+                        .append(&p, &value_bytes(&value))
                         .map_err(|e| ErrorVal::new("custom", e.to_string()))?;
                     captured = true;
                 }
@@ -79,13 +76,9 @@ impl Evaluator {
             }
         };
         let p = if p.is_absolute() { p } else { self.cwd.join(p) };
-        std::process::Command::new("xdg-open")
-            .arg(&p)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .map_err(|e| ErrorVal::new("custom", format!("open: {e}")))?;
+        self.opener
+            .open(&p)
+            .map_err(|e| ErrorVal::new("custom", e))?;
         Ok(Value::Null)
     }
 
@@ -130,11 +123,24 @@ impl Evaluator {
             let cwd = self.cwd.clone();
             let penv = self.process_env.clone();
             let adapters = self.adapters.clone();
+            // Share the host's effect ports (docs/ROADMAP.md R4) so a `parallel`
+            // child spawned under a fake/custom adapter sees it too. Cheap `Arc`
+            // clones; identical to the old behavior under the `Std*` defaults.
+            let fs = self.fs.clone();
+            let exec = self.exec.clone();
+            let clock = self.clock.clone();
+            let opener = self.opener.clone();
+            let secrets = self.secrets.clone();
             handles.push(std::thread::spawn(move || {
                 let mut ev = Evaluator::new(cwd);
                 ev.env = env;
                 ev.process_env = penv;
                 ev.adapters = adapters;
+                ev.fs = fs;
+                ev.exec = exec;
+                ev.clock = clock;
+                ev.opener = opener;
+                ev.secrets = secrets;
                 ev.call_value(&f, CallArgs::default())
             }));
         }

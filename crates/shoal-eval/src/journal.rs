@@ -37,14 +37,6 @@ pub(crate) enum FsUndoPre {
     Moved { src: PathBuf, dest: PathBuf },
 }
 
-fn now_ns() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
-        .min(i64::MAX as u128) as i64
-}
-
 fn elapsed_ns(start: Instant) -> i64 {
     start.elapsed().as_nanos().min(i64::MAX as u128) as i64
 }
@@ -114,7 +106,7 @@ impl Evaluator {
         let record = EntryRecord {
             session: self.session_id.clone(),
             principal: self.principal.clone(),
-            ts_ns: now_ns(),
+            ts_ns: self.clock.now_ns(),
             cwd: self.cwd.as_os_str().as_bytes().to_vec(),
             src,
             ast_json,
@@ -340,7 +332,7 @@ impl Evaluator {
     /// blake3 hash to key an undo restore on. The output row keeps the blob
     /// referenced (safe from GC).
     fn snapshot_prior(&self, entry: i64, path: &Path) -> Option<String> {
-        let bytes = std::fs::read(path).ok()?;
+        let bytes = self.fs.read(path).ok()?;
         self.journal
             .as_ref()?
             .record_output(entry, "undo-snapshot", &bytes)

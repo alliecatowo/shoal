@@ -1,9 +1,8 @@
 use super::Evaluator;
 use shoal_ast::{CmdArg, CmdCall};
 use shoal_exec::CancelToken;
-use shoal_value::{ErrorVal, Record, VResult, Value};
+use shoal_value::{ErrorVal, Fs, Record, VResult, Value};
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -50,8 +49,10 @@ pub(super) fn run(ev: &mut Evaluator, call: &CmdCall) -> VResult<Value> {
             .collect::<VResult<Vec<_>>>()
             .map_err(|e| e.or_span(call.span))?;
     }
+    let fs = ev.fs.clone();
     dispatch(
         &call.head,
+        fs.as_ref(),
         &ev.cwd,
         &ev.process_env,
         args,
@@ -63,6 +64,7 @@ pub(super) fn run(ev: &mut Evaluator, call: &CmdCall) -> VResult<Value> {
 
 fn dispatch(
     name: &str,
+    fs: &dyn Fs,
     cwd: &Path,
     penv: &[(OsString, OsString)],
     args: Vec<Value>,
@@ -75,21 +77,22 @@ fn dispatch(
         "echo" => Ok(Value::Str(
             args.iter().map(echo_display).collect::<Vec<_>>().join(" "),
         )),
-        "ls" => ls(cwd, args, has(flags, &["a", "all"])),
-        "cat" => cat(cwd, args),
-        "mkdir" => mkdir(cwd, args, has(flags, &["p", "parents"])),
-        "touch" => touch(cwd, args),
-        "cp" => copy_move(cwd, args, has(flags, &["r", "R", "recursive"]), false),
-        "mv" => copy_move(cwd, args, true, true),
+        "ls" => ls(fs, cwd, args, has(flags, &["a", "all"])),
+        "cat" => cat(fs, cwd, args),
+        "mkdir" => mkdir(fs, cwd, args, has(flags, &["p", "parents"])),
+        "touch" => touch(fs, cwd, args),
+        "cp" => copy_move(fs, cwd, args, has(flags, &["r", "R", "recursive"]), false),
+        "mv" => copy_move(fs, cwd, args, true, true),
         "rm" => rm(
+            fs,
             cwd,
             args,
             has(flags, &["permanent"]),
             has(flags, &["r", "R", "recursive"]),
         ),
-        "stat" => stat(cwd, args),
-        "head" => head(cwd, args),
-        "ln" => ln(cwd, args, has(flags, &["s", "symbolic"])),
+        "stat" => stat(fs, cwd, args),
+        "head" => head(fs, cwd, args),
+        "ln" => ln(fs, cwd, args, has(flags, &["s", "symbolic"])),
         "which" => which(penv, args),
         "env" => env(penv, args),
         "sleep" => sleep(args, cancel),
@@ -146,8 +149,8 @@ fn ioerr(op: &str, p: &Path, e: std::io::Error) -> ErrorVal {
     ErrorVal::new("custom", format!("{op} {}: {e}", p.display()))
 }
 
-fn metadata_record(p: PathBuf) -> VResult<Record> {
-    let m = fs::symlink_metadata(&p).map_err(|e| ioerr("stat", &p, e))?;
+fn metadata_record(fs: &dyn Fs, p: PathBuf) -> VResult<Record> {
+    let m = fs.symlink_metadata(&p).map_err(|e| ioerr("stat", &p, e))?;
     let mut r = Record::new();
     r.insert("path".into(), Value::Path(p.clone()));
     r.insert(
@@ -184,7 +187,7 @@ fn metadata_record(p: PathBuf) -> VResult<Record> {
     Ok(r)
 }
 
-fn ls(cwd: &Path, args: Vec<Value>, all: bool) -> VResult<Value> {
+fn ls(fs: &dyn Fs, cwd: &Path, args: Vec<Value>, all: bool) -> VResult<Value> {
     let roots = if args.is_empty() {
         vec![cwd.to_owned()]
     } else {
@@ -193,15 +196,18 @@ fn ls(cwd: &Path, args: Vec<Value>, all: bool) -> VResult<Value> {
     let mut rows = Vec::new();
     for root in roots {
         if root.is_dir() {
-            for entry in fs::read_dir(&root).map_err(|e| ioerr("list", &root, e))? {
-                let entry = entry.map_err(|e| ioerr("list", &root, e))?;
-                if !all && entry.file_name().as_encoded_bytes().starts_with(b".") {
+            for entry in fs.read_dir(&root).map_err(|e| ioerr("list", &root, e))? {
+                if !all
+                    && entry
+                        .file_name()
+                        .is_some_and(|n| n.as_encoded_bytes().starts_with(b"."))
+                {
                     continue;
                 }
-                rows.push(metadata_record(entry.path())?);
+                rows.push(metadata_record(fs, entry)?);
             }
         } else {
-            rows.push(metadata_record(root)?);
+            rows.push(metadata_record(fs, root)?);
         }
     }
     rows.sort_by(|a, b| match (a.get("path"), b.get("path")) {
@@ -211,47 +217,49 @@ fn ls(cwd: &Path, args: Vec<Value>, all: bool) -> VResult<Value> {
     Ok(Value::Table(rows))
 }
 
-fn cat(cwd: &Path, args: Vec<Value>) -> VResult<Value> {
+fn cat(fs: &dyn Fs, cwd: &Path, args: Vec<Value>) -> VResult<Value> {
     if args.is_empty() {
         return Err(ErrorVal::arg_error("cat requires at least one path"));
     }
     let mut out = Vec::new();
     for p in paths(cwd, args)? {
-        out.extend(fs::read(&p).map_err(|e| ioerr("read", &p, e))?);
+        out.extend(fs.read(&p).map_err(|e| ioerr("read", &p, e))?);
     }
     Ok(Value::Bytes(std::sync::Arc::new(out)))
 }
-fn mkdir(cwd: &Path, args: Vec<Value>, parents: bool) -> VResult<Value> {
+fn mkdir(fs: &dyn Fs, cwd: &Path, args: Vec<Value>, parents: bool) -> VResult<Value> {
     if args.is_empty() {
         return Err(ErrorVal::arg_error("mkdir requires at least one path"));
     }
     let ps = paths(cwd, args)?;
     for p in &ps {
         if parents {
-            fs::create_dir_all(p)
+            fs.create_dir_all(p)
         } else {
-            fs::create_dir(p)
+            fs.create_dir(p)
         }
         .map_err(|e| ioerr("mkdir", p, e))?;
     }
     Ok(Value::List(ps.into_iter().map(Value::Path).collect()))
 }
-fn touch(cwd: &Path, args: Vec<Value>) -> VResult<Value> {
+fn touch(fs: &dyn Fs, cwd: &Path, args: Vec<Value>) -> VResult<Value> {
     if args.is_empty() {
         return Err(ErrorVal::arg_error("touch requires at least one path"));
     }
     let ps = paths(cwd, args)?;
     for p in &ps {
-        OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(p)
-            .map_err(|e| ioerr("touch", p, e))?;
+        fs.touch(p).map_err(|e| ioerr("touch", p, e))?;
     }
     Ok(Value::List(ps.into_iter().map(Value::Path).collect()))
 }
 
-fn copy_move(cwd: &Path, args: Vec<Value>, recursive: bool, moving: bool) -> VResult<Value> {
+fn copy_move(
+    fs: &dyn Fs,
+    cwd: &Path,
+    args: Vec<Value>,
+    recursive: bool,
+    moving: bool,
+) -> VResult<Value> {
     if args.len() < 2 {
         return Err(ErrorVal::arg_error(if moving {
             "mv requires source and destination"
@@ -277,32 +285,44 @@ fn copy_move(cwd: &Path, args: Vec<Value>, recursive: bool, moving: bool) -> VRe
             dest.clone()
         };
         if moving {
-            fs::rename(&src, &target).map_err(|e| ioerr("move", &src, e))?;
+            fs.rename(&src, &target)
+                .map_err(|e| ioerr("move", &src, e))?;
         } else {
-            copy_path(&src, &target, recursive)?;
+            copy_path(fs, &src, &target, recursive)?;
         }
         out.push(Value::Path(target));
     }
     Ok(Value::List(out))
 }
-fn copy_path(src: &Path, dst: &Path, recursive: bool) -> VResult<()> {
-    let m = fs::symlink_metadata(src).map_err(|e| ioerr("copy", src, e))?;
+fn copy_path(fs: &dyn Fs, src: &Path, dst: &Path, recursive: bool) -> VResult<()> {
+    let m = fs
+        .symlink_metadata(src)
+        .map_err(|e| ioerr("copy", src, e))?;
     if m.is_dir() {
         if !recursive {
             return Err(ErrorVal::arg_error("cp: directory requires --recursive"));
         }
-        fs::create_dir_all(dst).map_err(|e| ioerr("copy", dst, e))?;
-        for e in fs::read_dir(src).map_err(|e| ioerr("copy", src, e))? {
-            let e = e.map_err(|e| ioerr("copy", src, e))?;
-            copy_path(&e.path(), &dst.join(e.file_name()), true)?
+        fs.create_dir_all(dst).map_err(|e| ioerr("copy", dst, e))?;
+        for e in fs.read_dir(src).map_err(|e| ioerr("copy", src, e))? {
+            let name = e
+                .file_name()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(&e));
+            copy_path(fs, &e, &dst.join(name), true)?
         }
     } else {
-        fs::copy(src, dst).map_err(|e| ioerr("copy", src, e))?;
+        fs.copy(src, dst).map_err(|e| ioerr("copy", src, e))?;
     }
     Ok(())
 }
 
-fn rm(cwd: &Path, args: Vec<Value>, permanent: bool, recursive: bool) -> VResult<Value> {
+fn rm(
+    fs: &dyn Fs,
+    cwd: &Path,
+    args: Vec<Value>,
+    permanent: bool,
+    recursive: bool,
+) -> VResult<Value> {
     if args.is_empty() {
         return Err(ErrorVal::new(
             "no_matches",
@@ -314,19 +334,22 @@ fn rm(cwd: &Path, args: Vec<Value>, permanent: bool, recursive: bool) -> VResult
         .join("shoal-trash")
         .join(std::process::id().to_string());
     if !permanent {
-        fs::create_dir_all(&trash).map_err(|e| ioerr("trash", &trash, e))?;
+        fs.create_dir_all(&trash)
+            .map_err(|e| ioerr("trash", &trash, e))?;
     }
     let mut out = Vec::new();
     for p in ps {
-        let meta = fs::symlink_metadata(&p).map_err(|e| ioerr("remove", &p, e))?;
+        let meta = fs
+            .symlink_metadata(&p)
+            .map_err(|e| ioerr("remove", &p, e))?;
         if permanent {
             if meta.is_dir() {
                 if !recursive {
                     return Err(ErrorVal::arg_error("rm: directory requires --recursive"));
                 }
-                fs::remove_dir_all(&p)
+                fs.remove_dir_all(&p)
             } else {
-                fs::remove_file(&p)
+                fs.remove_file(&p)
             }
             .map_err(|e| ioerr("remove", &p, e))?;
             out.push(Value::Path(p));
@@ -337,7 +360,7 @@ fn rm(cwd: &Path, args: Vec<Value>, permanent: bool, recursive: bool) -> VResult
                 .unwrap_or_else(|| OsStr::new("item"))
                 .to_string_lossy();
             let target = trash.join(format!("{seq}-{name}"));
-            fs::rename(&p, &target).map_err(|e| ioerr("trash", &p, e))?;
+            fs.rename(&p, &target).map_err(|e| ioerr("trash", &p, e))?;
             let mut r = Record::new();
             r.insert("path".into(), Value::Path(p));
             r.insert("trash".into(), Value::Path(target));
@@ -346,13 +369,13 @@ fn rm(cwd: &Path, args: Vec<Value>, permanent: bool, recursive: bool) -> VResult
     }
     Ok(Value::List(out))
 }
-fn stat(cwd: &Path, args: Vec<Value>) -> VResult<Value> {
+fn stat(fs: &dyn Fs, cwd: &Path, args: Vec<Value>) -> VResult<Value> {
     if args.is_empty() {
         return Err(ErrorVal::arg_error("stat requires at least one path"));
     }
     let rows = paths(cwd, args)?
         .into_iter()
-        .map(metadata_record)
+        .map(|p| metadata_record(fs, p))
         .collect::<VResult<Vec<_>>>()?;
     if rows.len() == 1 {
         Ok(Value::Record(rows.into_iter().next().expect("one row")))
@@ -363,7 +386,7 @@ fn stat(cwd: &Path, args: Vec<Value>) -> VResult<Value> {
 /// `head(file, n: int = 10) -> list<str>` (TDD §5): the first `n` lines of a
 /// text file, structured. UTF-8 is read lossily so a stray non-UTF-8 byte never
 /// aborts the read.
-fn head(cwd: &Path, args: Vec<Value>) -> VResult<Value> {
+fn head(fs: &dyn Fs, cwd: &Path, args: Vec<Value>) -> VResult<Value> {
     if args.is_empty() {
         return Err(ErrorVal::arg_error("head requires a file path"));
     }
@@ -381,7 +404,7 @@ fn head(cwd: &Path, args: Vec<Value>) -> VResult<Value> {
         }
     };
     let p = path(cwd, args[0].clone())?;
-    let bytes = fs::read(&p).map_err(|e| ioerr("read", &p, e))?;
+    let bytes = fs.read(&p).map_err(|e| ioerr("read", &p, e))?;
     let text = String::from_utf8_lossy(&bytes);
     let lines = text
         .lines()
@@ -393,7 +416,7 @@ fn head(cwd: &Path, args: Vec<Value>) -> VResult<Value> {
 
 /// `ln(target, link, symbolic: bool = false)` (TDD §5): create a hard link (or a
 /// symlink with `--symbolic`/`-s`). Returns a record describing the link created.
-fn ln(cwd: &Path, args: Vec<Value>, symbolic: bool) -> VResult<Value> {
+fn ln(fs: &dyn Fs, cwd: &Path, args: Vec<Value>, symbolic: bool) -> VResult<Value> {
     if args.len() != 2 {
         return Err(ErrorVal::arg_error("ln requires a target and a link name"));
     }
@@ -412,11 +435,13 @@ fn ln(cwd: &Path, args: Vec<Value>, symbolic: bool) -> VResult<Value> {
                 )));
             }
         };
-        std::os::unix::fs::symlink(&target, &link).map_err(|e| ioerr("symlink", &link, e))?;
+        fs.symlink(&target, &link)
+            .map_err(|e| ioerr("symlink", &link, e))?;
         r.insert("target".into(), Value::Path(target));
     } else {
         let target = path(cwd, args[0].clone())?;
-        fs::hard_link(&target, &link).map_err(|e| ioerr("link", &link, e))?;
+        fs.hard_link(&target, &link)
+            .map_err(|e| ioerr("link", &link, e))?;
         r.insert("target".into(), Value::Path(target));
     }
     r.insert("link".into(), Value::Path(link));
@@ -489,6 +514,7 @@ fn sleep(args: Vec<Value>, cancel: &CancelToken) -> VResult<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shoal_value::StdFs;
     fn pe() -> Vec<(OsString, OsString)> {
         std::env::vars_os().collect()
     }
@@ -496,18 +522,27 @@ mod tests {
     fn empty_rm_is_safe() {
         let d = tempfile::tempdir().unwrap();
         assert_eq!(
-            dispatch("rm", d.path(), &pe(), vec![], &[], &CancelToken::new())
-                .unwrap_err()
-                .code,
+            dispatch(
+                "rm",
+                &StdFs,
+                d.path(),
+                &pe(),
+                vec![],
+                &[],
+                &CancelToken::new()
+            )
+            .unwrap_err()
+            .code,
             "no_matches"
         );
     }
     #[test]
     fn rm_trashes_by_default() {
         let d = tempfile::tempdir().unwrap();
-        fs::write(d.path().join("x"), b"x").unwrap();
+        std::fs::write(d.path().join("x"), b"x").unwrap();
         let Value::List(xs) = dispatch(
             "rm",
+            &StdFs,
             d.path(),
             &pe(),
             vec![Value::Path("x".into())],
@@ -534,8 +569,8 @@ mod tests {
         use std::os::unix::ffi::OsStringExt;
         let d = tempfile::tempdir().unwrap();
         let name = OsString::from_vec(vec![b'f', 0xff]);
-        fs::write(d.path().join(&name), b"abc").unwrap();
-        let Value::Table(rows) = ls(d.path(), vec![], false).unwrap() else {
+        std::fs::write(d.path().join(&name), b"abc").unwrap();
+        let Value::Table(rows) = ls(&StdFs, d.path(), vec![], false).unwrap() else {
             panic!()
         };
         assert!(matches!(&rows[0]["name"],Value::Path(p)if p.as_os_str()==name));
@@ -544,12 +579,13 @@ mod tests {
     #[test]
     fn typed_fs_roundtrip() {
         let d = tempfile::tempdir().unwrap();
-        touch(d.path(), vec![Value::Path("a".into())]).unwrap();
-        fs::write(d.path().join("a"), b"hello").unwrap();
+        touch(&StdFs, d.path(), vec![Value::Path("a".into())]).unwrap();
+        std::fs::write(d.path().join("a"), b"hello").unwrap();
         assert!(
-            matches!(cat(d.path(),vec![Value::Path("a".into())]).unwrap(),Value::Bytes(b)if &*b==b"hello")
+            matches!(cat(&StdFs, d.path(),vec![Value::Path("a".into())]).unwrap(),Value::Bytes(b)if &*b==b"hello")
         );
         copy_move(
+            &StdFs,
             d.path(),
             vec![Value::Path("a".into()), Value::Path("b".into())],
             false,

@@ -1,0 +1,316 @@
+# Structured filesystem builtins (TDD §5 core verbs: `cp mv rm mkdir touch ln
+# cat stat head which env sleep`; `ls`/`echo` get their own focused coverage
+# elsewhere — collections.toml's `table-ls-*` cases and outcome.toml's
+# `outcome-echo-*` cases already cover them). `crates/shoal-eval/src/
+# builtins.rs` is the authoritative reference.
+#
+# Determinism note: `metadata_record`'s `path`/(hardlink `ln`'s) `target`/
+# `link` fields are the CWD-ABSOLUTIZED path (via `builtins.rs::path()`), so
+# rendering them directly would bake the per-run temp-dir prefix into the
+# expectation. Every case below only inspects `.name` (bare filename),
+# `.type`, `.size`, `.symbolic` (booleans/strings, cwd-independent) or proves
+# an effect indirectly (a later `stat`/`cat` on a path THIS case chose, never
+# rendering the builtin's own absolutized path fields).
+#
+# Multi-statement `src` values use a real (not escaped) newline between
+# statements — TOML triple-single-quoted literal strings, exactly like
+# streams.toml's `channel-emit-latest` — since a bare `\n` between top-level
+# statements must be an actual newline BYTE (the statement terminator), not
+# the two-character escape text (which only means something inside a shoal
+# *string literal*).
+
+# --- touch / mkdir ----------------------------------------------------------
+
+[[case]]
+name = "fsb-touch-creates-empty-file"
+src = '''
+touch f.txt
+(stat f.txt).out.size
+'''
+value = "0b"
+
+[[case]]
+name = "fsb-touch-requires-an-arg"
+src = "touch"
+error = "arg_error"
+
+[[case]]
+name = "fsb-mkdir-creates-a-directory"
+src = '''
+mkdir d
+(stat d).out.type
+'''
+value = '"dir"'
+
+[[case]]
+name = "fsb-mkdir-without-parents-on-missing-parent-is-custom-error"
+src = "mkdir a/b"
+error = "custom"
+
+[[case]]
+name = "fsb-mkdir-parents-flag-creates-nested-dirs"
+src = '''
+mkdir --parents a/b/c
+(stat a/b/c).out.type
+'''
+value = '"dir"'
+
+[[case]]
+name = "fsb-mkdir-requires-an-arg"
+src = "mkdir"
+error = "arg_error"
+
+# --- cat / save round trip ---------------------------------------------------
+
+[[case]]
+name = "fsb-cat-reads-back-saved-content"
+src = '''
+"hello".save("f.txt")
+(cat f.txt).out.str()
+'''
+value = '"hello"'
+
+[[case]]
+name = "fsb-cat-concatenates-multiple-files"
+src = '''
+"a".save("x.txt")
+"b".save("y.txt")
+(cat x.txt y.txt).out.str()
+'''
+value = '"ab"'
+
+[[case]]
+name = "fsb-cat-missing-file-is-custom-error"
+src = "cat nope.txt"
+error = "custom"
+
+[[case]]
+name = "fsb-cat-requires-an-arg"
+src = "cat"
+error = "arg_error"
+
+# --- cp / mv -----------------------------------------------------------------
+
+[[case]]
+name = "fsb-cp-copies-file-content"
+src = '''
+"hi".save("a.txt")
+cp a.txt b.txt
+(cat b.txt).out.str()
+'''
+value = '"hi"'
+
+[[case]]
+name = "fsb-cp-source-survives-copy"
+src = '''
+"hi".save("a.txt")
+cp a.txt b.txt
+(cat a.txt).out.str()
+'''
+value = '"hi"'
+
+[[case]]
+name = "fsb-cp-directory-without-recursive-is-arg-error"
+fixture = ["srcdir/f.txt"]
+src = "cp srcdir destdir"
+error = "arg_error"
+
+[[case]]
+name = "fsb-cp-recursive-copies-directory-contents"
+fixture = ["srcdir/f.txt"]
+src = '''
+cp --recursive srcdir destdir
+(stat destdir/f.txt).out.type
+'''
+value = '"file"'
+
+[[case]]
+name = "fsb-cp-requires-source-and-dest"
+src = "cp a.txt"
+error = "arg_error"
+
+[[case]]
+name = "fsb-mv-content-persists-at-new-path"
+src = '''
+"x".save("a.txt")
+mv a.txt b.txt
+(cat b.txt).out.str()
+'''
+value = '"x"'
+
+[[case]]
+name = "fsb-mv-source-no-longer-exists"
+src = '''
+"x".save("a.txt")
+mv a.txt b.txt
+stat a.txt
+'''
+error = "custom"
+
+# --- rm (trash-by-default, --permanent) --------------------------------------
+
+[[case]]
+name = "fsb-rm-removes-the-file"
+src = '''
+"x".save("x.txt")
+rm x.txt
+stat x.txt
+'''
+error = "custom"
+
+[[case]]
+name = "fsb-rm-empty-args-is-no-matches"
+src = "rm"
+error = "no_matches"
+
+[[case]]
+name = "fsb-rm-default-yields-one-record-per-path"
+src = '''
+"x".save("x.txt")
+(rm x.txt).out.len()
+'''
+value = "1"
+
+[[case]]
+name = "fsb-rm-default-record-has-path-and-trash-keys"
+src = '''
+"x".save("x.txt")
+let r = (rm x.txt).out.first()
+r.contains("path") && r.contains("trash")
+'''
+value = "true"
+
+[[case]]
+name = "fsb-rm-permanent-removes-for-real"
+src = '''
+"x".save("x.txt")
+rm --permanent x.txt
+stat x.txt
+'''
+error = "custom"
+
+[[case]]
+name = "fsb-rm-permanent-yields-bare-path-list"
+src = '''
+"x".save("x.txt")
+(rm --permanent x.txt).out.len()
+'''
+value = "1"
+
+# --- stat ---------------------------------------------------------------
+
+[[case]]
+name = "fsb-stat-single-path-is-a-record"
+src = '''
+touch f.txt
+(stat f.txt).out.name
+'''
+value = "f.txt"
+
+[[case]]
+name = "fsb-stat-multiple-paths-is-a-table"
+src = '''
+touch a.txt b.txt
+(stat a.txt b.txt).out.len()
+'''
+value = "2"
+
+[[case]]
+name = "fsb-stat-missing-file-is-custom-error"
+src = "stat nope.txt"
+error = "custom"
+
+[[case]]
+name = "fsb-stat-requires-an-arg"
+src = "stat"
+error = "arg_error"
+
+# --- head ------------------------------------------------------------------
+
+[[case]]
+name = "fsb-head-default-ten-lines"
+src = '''
+"a\nb".save("few.txt")
+(head few.txt).out
+'''
+value = '["a", "b"]'
+
+[[case]]
+name = "fsb-head-explicit-line-count"
+src = '''
+"l1\nl2\nl3\nl4".save("multi.txt")
+(head multi.txt 2).out
+'''
+value = '["l1", "l2"]'
+
+[[case]]
+name = "fsb-head-requires-a-path"
+src = "head"
+error = "arg_error"
+
+# --- ln (hardlink + --symbolic) ----------------------------------------------
+
+[[case]]
+name = "fsb-ln-hardlink-shares-content"
+src = '''
+"hi".save("t.txt")
+ln t.txt link.txt
+(cat link.txt).out.str()
+'''
+value = '"hi"'
+
+[[case]]
+name = "fsb-ln-symbolic-shares-content"
+src = '''
+"hi".save("t2.txt")
+ln --symbolic t2.txt slink.txt
+(cat slink.txt).out.str()
+'''
+value = '"hi"'
+
+[[case]]
+name = "fsb-ln-symbolic-flag-sets-symbolic-field"
+src = '''
+"hi".save("t3.txt")
+(ln --symbolic t3.txt slink3.txt).out.symbolic
+'''
+value = "true"
+
+[[case]]
+name = "fsb-ln-default-is-not-symbolic"
+src = '''
+"hi".save("t4.txt")
+(ln t4.txt link4.txt).out.symbolic
+'''
+value = "false"
+
+[[case]]
+name = "fsb-ln-requires-target-and-link"
+src = "ln t.txt"
+error = "arg_error"
+
+# --- env / sleep (reef.toml covers `which`'s record shape) ------------------
+
+[[case]]
+name = "fsb-env-two-args-is-arg-error"
+src = 'env "a" "b"'
+error = "arg_error"
+
+[[case]]
+name = "fsb-sleep-zero-returns-null"
+# `sleep` is a builtin, so its bare-statement result is outcome-wrapped
+# (`builtin_outcome`, TDD §4.1 unification) — `.out` recovers the raw `null`.
+src = "(sleep 0).out"
+value = "null"
+
+# --- echo renders any value, not just strings (TDD §5) --------------------
+
+[[case]]
+name = "fsb-echo-renders-a-parenthesized-list"
+src = "(echo ([1, 2])).out"
+value = '"[1, 2]"'
+
+[[case]]
+name = "fsb-echo-renders-a-parenthesized-record"
+src = "(echo ({a: 1})).out"
+value = '"{a: 1}"'

@@ -69,6 +69,13 @@ impl Evaluator {
         let penv = self.process_env.clone();
         let adapters = self.adapters.clone();
         let bus = self.bus();
+        // Share the host's effect ports (docs/ROADMAP.md R4) with the spawned
+        // task; `Arc` clones, identical under the `Std*` defaults.
+        let fs = self.fs.clone();
+        let exec = self.exec.clone();
+        let clock = self.clock.clone();
+        let opener = self.opener.clone();
+        let secrets = self.secrets.clone();
         std::thread::spawn(move || {
             let mut ev = Evaluator::new(cwd);
             ev.env = env;
@@ -76,6 +83,11 @@ impl Evaluator {
             ev.adapters = adapters;
             ev.cancel = child_cancel;
             ev.set_bus(bus);
+            ev.fs = fs;
+            ev.exec = exec;
+            ev.clock = clock;
+            ev.opener = opener;
+            ev.secrets = secrets;
             worker.finish(ev.block_value(&body));
         });
         self.jobs.push(task.clone());
@@ -129,7 +141,9 @@ impl Evaluator {
     ) -> VResult<Value> {
         match ext {
             Some("shl") | None => {
-                let src = std::fs::read_to_string(path)
+                let src = self
+                    .fs
+                    .read_to_string(path)
                     .map_err(|e| ErrorVal::new("io_error", format!("cannot read script: {e}")))?;
                 let program = shoal_syntax::parse(&src)
                     .map_err(|e| ErrorVal::new("parse_error", e.to_string()))?;
@@ -137,6 +151,7 @@ impl Evaluator {
                 child.env = self.env.clone();
                 child.process_env = self.process_env.clone();
                 child.adapters = self.adapters.clone();
+                child.inherit_ports(self);
                 child.set_bus(self.bus());
                 child.env.declare("args", Value::List(args), false);
                 child.eval_program(&program)

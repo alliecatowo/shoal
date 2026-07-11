@@ -48,6 +48,14 @@ dbg_macro = "warn"
 todo = "warn"
 unimplemented = "warn"
 mem_forget = "warn"
+# R4 lint-tightening pass (scratch/audit-arch.md §4 "Wave 3"): each below was checked
+# individually — `cargo +stable clippy --workspace --all-targets --locked -- -D warnings -W
+# <lint>` on top of everything above — and produced zero additional warnings workspace-wide at
+# the time it was added. They sit outside clippy::all's default groups but are cheap and
+# low-false-positive.
+cloned_instead_of_copied = "warn"
+inefficient_to_string = "warn"
+explicit_iter_loop = "warn"
 
 [workspace.metadata.lints]
 status = """
@@ -73,4 +81,15 @@ shoal-eval currently has 8 sites (helpers.rs:34, host.rs:236, stmt.rs:238) fresh
 its lib.rs module split landing concurrently with this table; re-check and re-add once that
 split settles (the fix is mechanical: `crate::helpers::foo(..)` -> `helpers::foo(..)` /
 `shoal_value::ClosureVal` -> `ClosureVal` where already imported).
+
+R4 lint-tightening pass (re-checked, still not enabled — live violation counts as of this
+writing): `clippy::use_self` (91), rust's `missing_debug_implementations` (4),
+`clippy::unused_qualifications` (4, same shoal-eval sites above — recheck once the R4 eval/
+parser/kernel file splits land, since module boundaries moving is exactly what shifts these),
+`clippy::redundant_clone` (3), `clippy::needless_pass_by_value` (4), `clippy::manual_let_else`
+(3), `clippy::single_match_else` (3), `clippy::map_unwrap_or` (8), `clippy::implicit_clone` (3).
+All cheap-looking but each has live sites; land in the same follow-up cleanup wave as the set
+above rather than one at a time here. Promoted this round (zero violations, see
+`[workspace.lints.clippy]`): `clippy::cloned_instead_of_copied`, `clippy::inefficient_to_string`,
+`clippy::explicit_iter_loop`.
 """

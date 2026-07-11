@@ -228,6 +228,33 @@ Each must keep the conformance corpus green after every split. Verify (Opus).
 `std::fs`/`std::process` calls (all via ports); one builtin registry; conformance unchanged;
 lints tightened and green.
 
+**Progress (P3 slice — lint tightening + DAG, this pass).**
+- [x] `docs/CONTRACTS.md` DAG refreshed: added `shoal-prompt` (pure leaf, zero `shoal-*` in
+  `[dependencies]`) to Tier 0 and to `shoal`'s Tier 5 dep list; clarified `shoal-mcp`'s
+  `shoal-kernel`/`shoal-proto` edges are `[dev-dependencies]` only; documented `shoal-eval`'s
+  current internal module split (`args, builtins, call, channels, coerce, command, expr,
+  helpers, host, journal, modules, namespaces, pattern, plan, reef, script, stmt, streams`) —
+  `shoal-reef` was already correctly placed (Tier 0 leaf) in the prior revision.
+  Reproduced the DAG from `Cargo.toml` `[dependencies]` sections (not full-file grep, which
+  double-counts `[dev-dependencies]`) to confirm no other edges were stale.
+- [x] `[workspace.lints.clippy]` tightened: added `cloned_instead_of_copied`,
+  `inefficient_to_string`, `explicit_iter_loop` (each individually verified zero-violation
+  workspace-wide via `cargo +stable clippy --workspace --all-targets --locked -- -D warnings -W
+  <lint>` before being added, then the full table re-verified together). Root `Cargo.toml`'s
+  `[workspace.metadata.lints]` still documents the larger deferred set (`use_self` 91
+  violations, `unused_qualifications` 4, rust's `missing_debug_implementations` 4,
+  `redundant_clone` 3, `needless_pass_by_value` 4, `manual_let_else` 3, `single_match_else` 3,
+  `map_unwrap_or` 8, `implicit_clone` 3, plus the pre-existing `missing_errors_doc`/
+  `missing_panics_doc`/`unwrap_used`/`expect_used` set) — none enabled, all have live
+  violations today.
+- [ ] Ports (`Fs`/`Exec`/`Clock`/`SecretPort`/`Opener`), the eval/parser/kernel/journal file
+  splits, and the builtin `REGISTRY`/`resolve.rs` unification are **P1/P2's slice, landing
+  concurrently in this same wave** — not verified or ticked here; confirm their state at the
+  wave's integration/verify step rather than trusting this line, since observed mid-wave the
+  workspace build was intermittently red from their in-flight edits (e.g. `shoal-eval`'s port
+  wiring, `shoal-syntax`'s lexer/parser module split) and stabilized to green again by the time
+  of this note.
+
 ---
 
 ## Wave R5 — Corpus growth + docs/wiki refresh + polish  [non-eval · M]

@@ -326,6 +326,13 @@ impl Evaluator {
         let penv = self.process_env.clone();
         let adapters = self.adapters.clone();
         let bus = self.bus();
+        // Share the host's effect ports (docs/ROADMAP.md R4) with the handler
+        // task; `Arc` clones, identical under the `Std*` defaults.
+        let fs = self.fs.clone();
+        let exec = self.exec.clone();
+        let clock = self.clock.clone();
+        let opener = self.opener.clone();
+        let secrets = self.secrets.clone();
         std::thread::spawn(move || {
             let mut ev = Evaluator::new(cwd);
             ev.env = env;
@@ -333,6 +340,11 @@ impl Evaluator {
             ev.adapters = adapters;
             ev.cancel = child_cancel;
             ev.set_bus(bus);
+            ev.fs = fs;
+            ev.exec = exec;
+            ev.clock = clock;
+            ev.opener = opener;
+            ev.secrets = secrets;
             let stream = StreamVal::from_channel("event", rx);
             let result = match stream.take_upstream() {
                 Ok(mut up) => shoal_value::drive_stream(&mut ev, &mut *up, |ctx, event| {

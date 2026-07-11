@@ -14,6 +14,7 @@ mod modules;
 mod namespaces;
 mod pattern;
 mod plan;
+mod ports;
 mod reef;
 mod script;
 mod stmt;
@@ -22,13 +23,15 @@ mod streams;
 pub(crate) use coerce::coerce_word;
 pub use reef::{PromptReefBinding, PromptReefSnapshot};
 
+use ports::{Exec, StdExec, StdSecret};
 use shoal_adapters::{AdapterCatalog, AdapterClass, SubSpec};
 use shoal_ast::*;
 use shoal_exec::{CancelToken, ExecMode, ExecSpec, StdinSpec};
 use shoal_journal::Journal;
 use shoal_leash::{Effect, Estimates, Plan, Policy as LeashPolicy, Reversibility, SandboxPolicy};
 use shoal_value::{
-    CallArgs, CallCtx, ClosureVal, Env, ErrorVal, OutcomeVal, Record, VResult, Value,
+    CallArgs, CallCtx, Clock, ClosureVal, Env, ErrorVal, Fs, Opener, OutcomeVal, Record,
+    SecretPort, StdClock, StdFs, StdOpener, VResult, Value,
 };
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -145,6 +148,19 @@ pub struct Evaluator {
     /// Derived-but-unspawned plans from the `plan { … }` REPL verb (ROADMAP R3),
     /// indexed by id (`1`-based). `apply <ref>` looks a plan up here and runs it.
     plans: Vec<Program>,
+    /// Hexagonal effect ports (docs/ROADMAP.md R4). Every direct filesystem,
+    /// spawn, clock, opener, and secret call the domain core makes routes
+    /// through one of these instead of `std::*`. The defaults are the `Std*`
+    /// adapters, which perform the identical inline calls — so a plain
+    /// `Evaluator::new` is byte-identical to the pre-ports behavior. Held as
+    /// `Arc<dyn Port>` so child evaluators (`parallel`, `source`, `spawn`)
+    /// share them cheaply and a test can interpose a fake. See
+    /// [`Evaluator::set_fs`] and friends.
+    fs: Arc<dyn Fs>,
+    exec: Arc<dyn Exec>,
+    clock: Arc<dyn Clock>,
+    opener: Arc<dyn Opener>,
+    secrets: Arc<dyn SecretPort>,
 }
 
 enum Flow {
@@ -193,7 +209,56 @@ impl Evaluator {
             modules: std::collections::HashMap::new(),
             module_stack: Vec::new(),
             plans: Vec::new(),
+            fs: Arc::new(StdFs),
+            exec: Arc::new(StdExec),
+            clock: Arc::new(StdClock),
+            opener: Arc::new(StdOpener),
+            secrets: Arc::new(StdSecret),
         }
+    }
+
+    /// Install a custom [`Fs`] adapter (docs/ROADMAP.md R4). Additive: the
+    /// default is [`StdFs`], which performs the exact `std::fs` calls the
+    /// evaluator made inline, so this only changes behavior for a host/test
+    /// that deliberately interposes a fake. Child evaluators spawned after this
+    /// call inherit the adapter.
+    pub fn set_fs(&mut self, fs: Arc<dyn Fs>) {
+        self.fs = fs;
+    }
+
+    /// Install a custom [`Exec`] adapter (spawn seam). Default: [`StdExec`].
+    pub fn set_exec(&mut self, exec: Arc<dyn Exec>) {
+        self.exec = exec;
+    }
+
+    /// Install a custom [`Clock`] (for deterministic journal timestamps under
+    /// test). Default: [`StdClock`].
+    pub fn set_clock(&mut self, clock: Arc<dyn Clock>) {
+        self.clock = clock;
+    }
+
+    /// Install a custom [`Opener`] (the `open <path>` effect). Default:
+    /// [`StdOpener`].
+    pub fn set_opener(&mut self, opener: Arc<dyn Opener>) {
+        self.opener = opener;
+    }
+
+    /// Install a custom [`SecretPort`] (secret-store reads). Default:
+    /// [`StdSecret`].
+    pub fn set_secrets(&mut self, secrets: Arc<dyn SecretPort>) {
+        self.secrets = secrets;
+    }
+
+    /// Copy the effect ports from `parent` into a freshly-created child
+    /// evaluator so `parallel`/`source`/`spawn` see the same adapters the host
+    /// installed. Cheap `Arc` clones; a no-op semantically when both hold the
+    /// `Std*` defaults.
+    pub(crate) fn inherit_ports(&mut self, parent: &Evaluator) {
+        self.fs = parent.fs.clone();
+        self.exec = parent.exec.clone();
+        self.clock = parent.clock.clone();
+        self.opener = parent.opener.clone();
+        self.secrets = parent.secrets.clone();
     }
 
     /// The session event bus (docs/STREAMS.md). Shared into spawned tasks so

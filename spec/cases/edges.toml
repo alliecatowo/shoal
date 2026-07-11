@@ -1,0 +1,122 @@
+# TDD §13's normative edge-case register — the deterministic, host-safe
+# subset not already covered by strings.toml (§13.10 CRLF), io.toml (§13.13
+# `sh {}` brace balance), coercion.toml (§4.3 glob binding), outcome.toml
+# (§13.6's `ok`/`.out` shape). Each case cites its §13 item.
+
+# --- §13.2: filenames with a leading `-` are values, not flags -------------
+
+[[case]]
+name = "edge-leading-dash-filename-preserved-as-data"
+# A literal filename starting with `-` must survive as ordinary path DATA
+# once inside a structured `table` row — it is never re-interpreted as a
+# flag downstream (D2: "values, not text").
+fixture = ["-rf"]
+src = 'ls.where(r => r.name == "-rf").len()'
+value = "1"
+
+# --- §13.3: bare `-` is a literal word, never swallowed as a flag ---------
+
+[[case]]
+name = "edge-bare-dash-is-a-literal-word-not-a-flag"
+# `-` alone has no chars after it, so the lexer's `"-" SHORTS` flag
+# production (which needs >=1 char) cannot match — it lexes as a plain WORD.
+# `cat -` therefore attempts to open a file literally named `-` (which this
+# fixture-less temp cwd doesn't have) rather than erroring over a malformed
+# flag.
+src = "cat -"
+error = "custom"
+
+# --- §13.4: an empty glob match yields zero argv entries, not an error ---
+
+[[case]]
+name = "edge-empty-glob-contributes-zero-argv-entries"
+# TDD §4.3 / §13.4: "zero matches yields zero argv entries plus the
+# statement lint" — `args.rs::expand_arg` returns an empty `Vec` for a
+# glob with no filesystem matches (this harness can't observe the stderr
+# lint, only the argv-count effect), so the surrounding words are unaffected
+# and `echo` sees exactly two arguments, not three with an empty middle one.
+src = "(echo before *.nonexistent-ext-zzz after).out"
+value = '"before after"'
+
+# --- §13.9: command-not-found ------------------------------------------
+
+[[case]]
+name = "edge-command-not-found"
+src = "zzzznotarealcommandxyz123"
+error = "not_found"
+
+# --- §13.15: shadowing a command is legal; `^name` always escapes it -----
+
+[[case]]
+name = "edge-shadowed-command-name-resolves-to-the-value"
+src = "let ls = 5\nls"
+value = "5"
+
+[[case]]
+name = "edge-caret-forces-command-despite-shadow"
+fixture = ["a.txt"]
+src = "let ls = 5\n(^ls).out.len()"
+value = "1"
+
+# --- §13.16: `it`/`out` are REPL-only; a script never sees them ----------
+
+[[case]]
+name = "edge-it-in-script-is-a-parse-error"
+# A BARE leading `it` dispatches as a COMMAND statement (rule 3.1.3 — it's
+# unbound, so it resolves through fn/alias/adapter/PATH, not through the
+# EXPR-mode `primary()` parser that carries the REPL-only check), so it
+# would just be a plain (eval-time) `not_found`. `it.foo` triggers the
+# refinement in rule 3.1.3 ("identifier immediately followed by `.`... ->
+# EXPR statement"), routing `it` through `primary()` for real, where the
+# check lives. (A bare parenthesized `(it)` does NOT hit this check —
+# `paren_or_lambda`'s single-bare-ident special case bypasses it; that gap
+# is real but out of scope for spec/cases to fix.)
+src = "it.foo"
+parse_error = true
+parse_error_contains = "REPL-only"
+
+[[case]]
+name = "edge-out-in-script-is-a-parse-error"
+src = "out.foo"
+parse_error = true
+parse_error_contains = "REPL-only"
+
+[[case]]
+name = "edge-bare-parenthesized-it-bypasses-repl-only-check"
+# A genuine gap found while authoring the two cases above: `primary()`'s
+# `Tok::Ident` arm carries the `it`/`out` REPL-only check (confirmed by
+# `it.foo`/`out.foo`/`1 + it` all correctly erroring), but `(it)` alone does
+# NOT error — `paren_or_lambda`'s handling of a single bare identifier
+# inside parens is a separate code path that never reaches that check, so
+# `it`/`out` slip through as ordinary (if REPL-context-less) `Var` refs.
+src = "(it)"
+parse_error = true
+parse_error_contains = "REPL-only"
+skip = "paren_or_lambda's single-bare-identifier special case doesn't route through primary()'s it/out REPL-only check — (it)/(out) parse successfully in script mode when they should error; TDD §13.16 not fully honored"
+
+# --- §13.6: signal death surfaces as `signal`, `status` stays null, never
+# a synthesized 128+n exit code -------------------------------------------
+
+[[case]]
+name = "edge-signal-death-reports-signal-name"
+src = '''
+let r = (sh -c 'kill -SEGV $$')
+r.signal
+'''
+value = '"SIGSEGV"'
+
+[[case]]
+name = "edge-signal-death-status-is-null-not-128-plus-n"
+src = '''
+let r = (sh -c 'kill -SEGV $$')
+r.status
+'''
+value = "null"
+
+[[case]]
+name = "edge-signal-death-ok-is-false"
+src = '''
+let r = (sh -c 'kill -SEGV $$')
+r.ok
+'''
+value = "false"

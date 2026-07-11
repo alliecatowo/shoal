@@ -7,7 +7,10 @@
 
 pub mod methods;
 pub mod ops;
+pub mod ports;
 pub mod render;
+
+pub use ports::{Clock, Fs, Opener, SecretPort, StdClock, StdFs, StdOpener};
 
 use indexmap::IndexMap;
 use shoal_ast as ast;

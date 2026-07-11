@@ -1,0 +1,69 @@
+# Integer overflow/div/rem sign semantics and float special values —
+# `crates/shoal-value/src/ops.rs` (`int_op`/`float_op`) is the authoritative
+# reference; its own `matrix` unit test already pins `7 / 2 == 3` and
+# `1 / 0` -> `div_zero`, so this file adds the not-yet-covered corners:
+# overflow's distinct `overflow` code, truncation direction + rem sign for
+# negative operands, and float division by zero (NOT an error — floats
+# divide to `inf`/`-inf`/`nan`, only int/size/duration check for a zero
+# divisor).
+
+[[case]]
+name = "num-int-add-overflow"
+src = "9223372036854775807 + 1"
+error = "overflow"
+
+[[case]]
+name = "num-int-mul-overflow"
+src = "9223372036854775807 * 2"
+error = "overflow"
+
+[[case]]
+name = "num-int-div-truncates-toward-zero-positive"
+src = "7 / 2"
+value = "3"
+
+[[case]]
+name = "num-int-div-truncates-toward-zero-negative"
+# -7 / 2 == -3.5; truncation toward zero (not floor) gives -3, not -4.
+src = "-7 / 2"
+value = "-3"
+
+[[case]]
+name = "num-int-rem-sign-follows-dividend-negative"
+src = "-7 % 3"
+value = "-1"
+
+[[case]]
+name = "num-int-rem-sign-follows-dividend-positive-divisor-negative"
+src = "7 % -3"
+value = "1"
+
+[[case]]
+name = "num-float-div-by-zero-is-positive-infinity"
+# Only int/size/duration division checks for a zero divisor and raises
+# `div_zero`; float division is plain IEEE-754 arithmetic (`ops.rs::float_op`
+# has no zero check at all), so this is a value, not an error.
+src = "1.0 / 0.0"
+value = "inf"
+
+[[case]]
+name = "num-float-div-by-zero-is-negative-infinity"
+src = "-1.0 / 0.0"
+value = "-inf"
+
+[[case]]
+name = "num-float-zero-div-zero-is-nan"
+src = "0.0 / 0.0"
+value = "nan"
+
+[[case]]
+name = "num-nan-is-not-equal-to-itself"
+src = "let n = 0.0 / 0.0\nn == n"
+value = "false"
+
+[[case]]
+name = "num-nan-comparison-is-type-error"
+# `partial_cmp` returns `None` for NaN, which `ops::compare` turns into a
+# type error rather than silently picking an ordering.
+src = "let n = 0.0 / 0.0\nn < 1.0"
+error = "type_error"

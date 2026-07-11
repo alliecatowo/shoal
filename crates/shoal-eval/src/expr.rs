@@ -183,26 +183,18 @@ impl Evaluator {
                     let [Value::Str(secret_name)] = args.pos.as_slice() else {
                         return Err(ErrorVal::arg_error("secret.get expects one string name"));
                     };
-                    let home = std::env::var_os("HOME")
-                        .map(PathBuf::from)
-                        .unwrap_or_else(|| PathBuf::from("."));
-                    let dir = std::env::var_os("SHOAL_SECRET_DIR")
-                        .map(PathBuf::from)
-                        .unwrap_or_else(|| {
-                            std::env::var_os("XDG_DATA_HOME")
-                                .map(PathBuf::from)
-                                .unwrap_or_else(|| home.join(".local/share"))
-                                .join("shoal/secrets")
-                        });
-                    let store = shoal_secret::SecretStore::open(dir)
-                        .map_err(|e| ErrorVal::new("permission", e.to_string()))?;
-                    let value = store
+                    // Secret reads route through the SecretPort (docs/ROADMAP.md
+                    // R4). The default `StdSecret` resolves the same
+                    // `SHOAL_SECRET_DIR`/`XDG_DATA_HOME`/`HOME` directory and
+                    // opens the same `shoal_secret::SecretStore` as before.
+                    let value = self
+                        .secrets
                         .get(secret_name)
-                        .map_err(|e| ErrorVal::new("permission", e.to_string()))?
+                        .map_err(|e| ErrorVal::new("permission", e))?
                         .ok_or_else(|| {
                             ErrorVal::new("not_found", format!("secret `{secret_name}` not found"))
                         })?;
-                    let text = String::from_utf8(value.to_vec()).map_err(|_| {
+                    let text = String::from_utf8(value).map_err(|_| {
                         ErrorVal::new(
                             "utf8_error",
                             "secret is not valid UTF-8 for environment injection",

@@ -1,0 +1,151 @@
+# The §3.4 desugaring table, one case per row not already exercised by an
+# existing corpus file (operators.toml already covers `.field <op> e`'s
+# sibling rows `??`/`?.`/`catch`; match.toml covers pattern desugaring).
+# `crates/shoal-syntax/src/parser.rs`'s `command_shape` unit test is the
+# parse-level proof these forms parse into the right AST; the cases below
+# additionally prove the EVALUATOR honors them end to end.
+
+[[case]]
+name = "desugar-env-prefix-scopes-a-single-spawn"
+# `NAME=v cmd` -> `with(env: {NAME: v}) { call(...) }` — scoped to exactly
+# this one spawn (TDD §3.4), not a session-wide env write. `sh -c` (not the
+# `sh { }` LangBlock form, which is a different grammar branch) is a plain
+# external command here, so this exercises `call.env_prefix` threading into
+# a real spawn (`command.rs::run_argv`), not just the parser shape.
+src = '''
+let r = (FOO=hello sh -c 'printf %s $FOO')
+r.out
+'''
+value = '"hello"'
+
+[[case]]
+name = "desugar-redirect-out-truncates-builtin-output"
+# `cmd > f` -> `.save(f)` on stdout (TDD §3.4); a builtin's outcome bytes go
+# through `host::value_bytes`, which appends exactly one trailing newline to
+# a bare (already-newline-less) `str` result.
+src = '''
+echo hi > out.txt
+(cat out.txt).out.str()
+'''
+value = '"hi\n"'
+
+[[case]]
+name = "desugar-redirect-append-accumulates"
+src = '''
+echo a > out.txt
+echo b >> out.txt
+(cat out.txt).out.str()
+'''
+value = '"a\nb\n"'
+
+[[case]]
+name = "desugar-redirect-out-is-byte-exact-for-externals"
+# The EXTERNAL-command redirect path (`command.rs::eval_command`'s
+# `RedirectKind::Out => fs.write(&target, &out.stdout)`) writes the child's
+# raw stdout bytes verbatim — no auto-appended newline the way the builtin
+# path's `value_bytes` adds one for a bare `str`. `printf hi` emits no
+# trailing newline at all, so the file is exactly two bytes.
+src = '''
+sh -c 'printf hi' > out.txt
+(cat out.txt).out.str()
+'''
+value = '"hi"'
+
+[[case]]
+name = "desugar-spawn-ampersand-not-yet-wired"
+# `cmd … &` -> `spawn { call(…) }` (TDD §3.4): the parser sets
+# `CmdCall.background = true` (proven by shoal-syntax's own
+# `command_shape` unit test) and the formatter round-trips it
+# (`format.rs` emits the trailing `&`), but no evaluator call-site reads
+# `call.background` (`grep -rn '\.background' crates/shoal-eval/src` finds
+# nothing outside `background: false` in synthetic call construction) — so
+# today `cmd &` just runs synchronously, identically to `cmd` without the
+# `&`, instead of yielding a `task`. This is a real spec/impl gap, not a
+# corpus authoring choice.
+src = "(echo hi &).is_done()"
+skip = "`&` background desugar is unimplemented in shoal-eval: CmdCall.background is parsed/formatted but no eval call-site reads it (cmd & runs synchronously, does not yield a task) — TDD §3.4 row not yet honored"
+
+[[case]]
+name = "desugar-alias-bare-invoke"
+# `alias gs = git status` binds `gs` -> a partial call node (TDD §1.8); the
+# PARSER itself tracks alias names in a separate `cmd_scopes` table (distinct
+# from `let`/`var`'s `scopes`) so a later bare reference still dispatches CMD
+# (not EXPR-var) within the same program — `crates/shoal-syntax/src/parser/
+# stmt.rs`'s alias-statement parse calls `bind_cmd` immediately.
+src = '''
+alias greet = echo hey
+(greet).out
+'''
+value = '"hey"'
+
+[[case]]
+name = "desugar-alias-appends-later-args"
+# "later args append" (TDD §3.4): calling the alias with extra positional
+# args appends them to the aliased call's argv.
+src = '''
+alias greet = echo hey
+(greet there).out
+'''
+value = '"hey there"'
+
+[[case]]
+name = "desugar-flag-long-equals-form-binds-named"
+# `--jobs=4` -> `named(jobs: w"4")` coerced through the callee's declared
+# param type (TDD §3.4 + §4.4).
+src = "fn build(jobs: int = 1) { jobs }\nbuild --jobs=4"
+value = "4"
+
+[[case]]
+name = "desugar-flag-short-explodes-per-char"
+# `-r` (a `SHORTS` short-flag run) explodes to its constituent chars
+# (`args.rs`/`builtins.rs`: `FlagShort{chars}` -> one flag-name per char);
+# combined with the long `--permanent` flag on `rm`, this recursively and
+# permanently removes a directory in one call.
+fixture = ["srcdir/f.txt"]
+src = '''
+rm --permanent -r srcdir
+stat srcdir
+'''
+error = "custom"
+
+[[case]]
+name = "desugar-implicit-arg-field-with-op"
+# `.field <op> e` (arg position) -> `x => x.field <op> e` (TDD §3.4).
+src = '[{a: 1}, {a: 2}, {a: 3}].where(.a > 1)'
+value = "[{a: 2}, {a: 3}]"
+
+[[case]]
+name = "desugar-implicit-arg-method-call"
+# `.method(args)` (arg position) -> `x => x.method(args)` (TDD §3.4). Kept
+# free of a trailing operator (unlike the `.field <op> e` row above) since
+# only the plain form is in the table — combining sugar with an operator on
+# a method-call result isn't a documented row.
+src = '["ab", "abc", "a"].map(.len())'
+value = "[2, 3, 1]"
+
+[[case]]
+name = "desugar-trailing-block-sugar-on-a-builtin-call"
+# `f(a) { … }` -> `f(a, () => { … })` (TDD §3.4). `retry(n, thunk)` takes its
+# thunk positionally, so `retry(3) { … }` must desugar to exactly that —
+# proven end to end by retrying a deliberately-failing body until the third
+# attempt, which succeeds.
+src = '''
+var attempts = 0
+retry(3) {
+  attempts += 1
+  if attempts < 3 { 1 / 0 } else { 99 }
+}
+'''
+value = "99"
+
+[[case]]
+name = "desugar-leading-dot-continuation"
+# "leading-`.` line -> continuation of previous expression's postfix chain"
+# (TDD §3.4): a newline before a `.`-continuation is NOT a statement
+# terminator.
+src = '''
+[1, 2, 3]
+  .map(x => x * 2)
+  .sum()
+'''
+value = "12"

@@ -1,0 +1,406 @@
+# Data & system namespaces (TDD §5 "Namespaces", ROADMAP Wave R2 mini-spec):
+# json/yaml/toml/csv/math as first-class values in the root env, intercepted
+# by shoal-eval's `namespaces.rs` before ordinary var/field/method dispatch.
+# Deterministic-only: `http`/`os` need the network or the host's real
+# inventory and are exercised in shoal-eval's own unit tests, not here.
+#
+# Float assertions below are restricted to identities IEEE-754/libm guarantee
+# exact (sqrt of a perfect square, `pow(x, 0)`, `ln(1)`, trig at 0, etc.) so
+# this file never depends on a transcendental function's last-bit rounding.
+
+# --- json ---------------------------------------------------------------
+
+[[case]]
+name = "ns-json-parse-object-field"
+src = '''json.parse('{"a": 1}').a'''
+value = "1"
+
+[[case]]
+name = "ns-json-parse-array"
+src = 'json.parse("[1, 2, 3]")'
+value = "[1, 2, 3]"
+
+[[case]]
+name = "ns-json-parse-nested-object"
+src = '''json.parse('{"a": {"b": 2}}').a.b'''
+value = "2"
+
+[[case]]
+name = "ns-json-parse-string-scalar"
+src = '''json.parse('"hi"')'''
+value = '"hi"'
+
+[[case]]
+name = "ns-json-parse-bool-and-null"
+src = 'json.parse("[true, false, null]")'
+value = "[true, false, null]"
+
+[[case]]
+name = "ns-json-parse-float"
+src = 'json.parse("3.5")'
+value = "3.5"
+
+[[case]]
+name = "ns-json-parse-invalid-is-arg-error"
+# A raw (single-quoted) shoal string, not a double-quoted one: `{`/`}` inside
+# a `"…"` string would start interpolation and this text has no matching
+# hole, so a raw string is the correct way to smuggle brace-shaped garbage
+# straight into `json.parse` as a runtime (not parse-time) failure.
+src = '''json.parse('{not valid')'''
+error = "arg_error"
+
+[[case]]
+name = "ns-json-parse-missing-arg-is-arg-error"
+src = "json.parse()"
+error = "arg_error"
+
+[[case]]
+name = "ns-json-parse-non-str-arg-is-arg-error"
+src = "json.parse(5)"
+error = "arg_error"
+
+[[case]]
+name = "ns-json-stringify-record-compact"
+src = "json.stringify({a: 1})"
+value = '"{\"a\":1}"'
+
+[[case]]
+name = "ns-json-stringify-list"
+src = "json.stringify([1, 2])"
+value = '"[1,2]"'
+
+[[case]]
+name = "ns-json-stringify-pretty-has-newlines"
+src = "json.stringify({a: 1}, pretty: true).contains(\"\\n\")"
+value = "true"
+
+[[case]]
+name = "ns-json-stringify-non-pretty-has-no-newlines"
+src = "json.stringify({a: 1}).contains(\"\\n\")"
+value = "false"
+
+[[case]]
+name = "ns-json-roundtrip-record-and-list"
+src = "json.parse(json.stringify({a: 1, b: [1, 2]}))"
+value = "{a: 1, b: [1, 2]}"
+
+[[case]]
+name = "ns-json-stringify-missing-arg-is-arg-error"
+src = "json.stringify()"
+error = "arg_error"
+
+# --- yaml -----------------------------------------------------------------
+
+[[case]]
+name = "ns-yaml-parse-mapping-field"
+src = 'yaml.parse("a: 1\nb: 2").a'
+value = "1"
+
+[[case]]
+name = "ns-yaml-parse-sequence"
+src = 'yaml.parse("- 1\n- 2\n- 3")'
+value = "[1, 2, 3]"
+
+[[case]]
+name = "ns-yaml-parse-nested-mapping"
+src = 'yaml.parse("a:\n  b: 2").a.b'
+value = "2"
+
+[[case]]
+name = "ns-yaml-parse-invalid-is-arg-error"
+src = 'yaml.parse("a: [1, 2")'
+error = "arg_error"
+
+[[case]]
+name = "ns-yaml-stringify-contains-key-value"
+src = 'yaml.stringify({a: 1}).contains("a: 1")'
+value = "true"
+
+[[case]]
+name = "ns-yaml-roundtrip"
+src = "yaml.parse(yaml.stringify({a: 1, b: 2})).b"
+value = "2"
+
+[[case]]
+name = "ns-yaml-parse-missing-arg-is-arg-error"
+src = "yaml.parse()"
+error = "arg_error"
+
+# --- toml -------------------------------------------------------------------
+
+[[case]]
+name = "ns-toml-parse-simple-key"
+src = 'toml.parse("a = 1").a'
+value = "1"
+
+[[case]]
+name = "ns-toml-parse-table"
+src = 'toml.parse("[a]\nb = 1").a.b'
+value = "1"
+
+[[case]]
+name = "ns-toml-parse-string-value"
+src = '''toml.parse('name = "shoal"').name'''
+value = '"shoal"'
+
+[[case]]
+name = "ns-toml-parse-invalid-is-arg-error"
+src = 'toml.parse("not = = valid")'
+error = "arg_error"
+
+[[case]]
+name = "ns-toml-stringify-contains-key-value"
+src = 'toml.stringify({a: 1}).contains("a = 1")'
+value = "true"
+
+[[case]]
+name = "ns-toml-roundtrip"
+src = "toml.parse(toml.stringify({a: 1, b: \"x\"})).b"
+value = '"x"'
+
+[[case]]
+name = "ns-toml-stringify-non-table-top-level-is-arg-error"
+# TDD/ROADMAP R2: toml needs a record/table at the top level; a bare list has
+# no key to hang off of.
+src = "toml.stringify([1, 2])"
+error = "arg_error"
+
+[[case]]
+name = "ns-toml-parse-missing-arg-is-arg-error"
+src = "toml.parse()"
+error = "arg_error"
+
+# --- csv ----------------------------------------------------------------
+
+[[case]]
+name = "ns-csv-parse-simple-table"
+src = 'csv.parse("a,b\n1,2\n3,4")'
+value = '[{a: "1", b: "2"}, {a: "3", b: "4"}]'
+
+[[case]]
+name = "ns-csv-parse-header-only-is-empty-table"
+src = 'csv.parse("a,b")'
+value = "[]"
+
+[[case]]
+name = "ns-csv-parse-single-column"
+src = 'csv.parse("name\nada\ngrace").len()'
+value = "2"
+
+[[case]]
+name = "ns-csv-parse-invalid-is-arg-error"
+# A row with fewer fields than the header, under strict flexible=false
+# (the default `ReaderBuilder`), is a parse error.
+src = 'csv.parse("a,b\n1")'
+error = "arg_error"
+
+[[case]]
+name = "ns-csv-roundtrip-record-list"
+src = 'csv.parse(csv.stringify([{a: "1", b: "2"}]))'
+value = '[{a: "1", b: "2"}]'
+
+[[case]]
+name = "ns-csv-stringify-of-table-value"
+src = 'csv.parse(csv.stringify(csv.parse("a,b\n1,2")))'
+value = '[{a: "1", b: "2"}]'
+
+[[case]]
+name = "ns-csv-stringify-non-table-is-type-error"
+src = "csv.stringify(5)"
+error = "type_error"
+
+[[case]]
+name = "ns-csv-parse-missing-arg-is-arg-error"
+src = "csv.parse()"
+error = "arg_error"
+
+# --- math: constants ---------------------------------------------------
+
+[[case]]
+name = "ns-math-pi"
+src = "math.pi"
+value = "3.141592653589793"
+
+[[case]]
+name = "ns-math-e"
+src = "math.e"
+value = "2.718281828459045"
+
+[[case]]
+name = "ns-math-tau"
+src = "math.tau"
+value = "6.283185307179586"
+
+[[case]]
+name = "ns-math-sqrt2"
+src = "math.sqrt2"
+value = "1.4142135623730951"
+
+[[case]]
+name = "ns-math-inf"
+src = "math.inf"
+value = "inf"
+
+[[case]]
+name = "ns-math-nan"
+src = "math.nan"
+value = "nan"
+
+[[case]]
+name = "ns-math-unknown-const-is-field-missing"
+src = "math.bogus"
+error = "field_missing"
+
+[[case]]
+name = "ns-math-const-called-as-fn-is-field-missing"
+# `math.pi(...)` is a call on a constant name — `call_method` doesn't know
+# constants, so it falls through to the "unknown method" branch.
+src = "math.pi()"
+error = "field_missing"
+
+# --- math: functions, restricted to IEEE/libm-exact identities ------------
+
+[[case]]
+name = "ns-math-sqrt-perfect-square"
+src = "math.sqrt(16)"
+value = "4"
+
+[[case]]
+name = "ns-math-abs-negative"
+src = "math.abs(-5)"
+value = "5"
+
+[[case]]
+name = "ns-math-floor"
+src = "math.floor(3.7)"
+value = "3"
+
+[[case]]
+name = "ns-math-ceil"
+src = "math.ceil(3.2)"
+value = "4"
+
+[[case]]
+name = "ns-math-round-half-away-from-zero"
+src = "math.round(3.5)"
+value = "4"
+
+[[case]]
+name = "ns-math-trunc-negative"
+src = "math.trunc(-3.9)"
+value = "-3"
+
+[[case]]
+name = "ns-math-min"
+src = "math.min(3, 7)"
+value = "3"
+
+[[case]]
+name = "ns-math-max"
+src = "math.max(3, 7)"
+value = "7"
+
+[[case]]
+name = "ns-math-clamp-above-hi"
+src = "math.clamp(15, 0, 10)"
+value = "10"
+
+[[case]]
+name = "ns-math-clamp-below-lo"
+src = "math.clamp(-5, 0, 10)"
+value = "0"
+
+[[case]]
+name = "ns-math-clamp-within-range"
+src = "math.clamp(5, 0, 10)"
+value = "5"
+
+[[case]]
+name = "ns-math-clamp-lo-gt-hi-is-arg-error"
+src = "math.clamp(5, 10, 0)"
+error = "arg_error"
+
+[[case]]
+name = "ns-math-hypot-3-4-5-triangle"
+src = "math.hypot(3, 4)"
+value = "5"
+
+[[case]]
+name = "ns-math-pow-anything-to-zero"
+src = "math.pow(5, 0)"
+value = "1"
+
+[[case]]
+name = "ns-math-pow-one-to-anything"
+src = "math.pow(1, 999)"
+value = "1"
+
+[[case]]
+name = "ns-math-ln-of-one"
+src = "math.ln(1)"
+value = "0"
+
+[[case]]
+name = "ns-math-log10-of-one"
+src = "math.log10(1)"
+value = "0"
+
+[[case]]
+name = "ns-math-log2-of-one"
+src = "math.log2(1)"
+value = "0"
+
+[[case]]
+name = "ns-math-exp-of-zero"
+src = "math.exp(0)"
+value = "1"
+
+[[case]]
+name = "ns-math-sin-of-zero"
+src = "math.sin(0)"
+value = "0"
+
+[[case]]
+name = "ns-math-cos-of-zero"
+src = "math.cos(0)"
+value = "1"
+
+[[case]]
+name = "ns-math-tan-of-zero"
+src = "math.tan(0)"
+value = "0"
+
+[[case]]
+name = "ns-math-asin-of-zero"
+src = "math.asin(0)"
+value = "0"
+
+[[case]]
+name = "ns-math-acos-of-one"
+src = "math.acos(1)"
+value = "0"
+
+[[case]]
+name = "ns-math-atan-of-zero"
+src = "math.atan(0)"
+value = "0"
+
+[[case]]
+name = "ns-math-atan2-of-zero-one"
+src = "math.atan2(0, 1)"
+value = "0"
+
+[[case]]
+name = "ns-math-sign-negative"
+src = "math.sign(-5)"
+value = "-1"
+
+[[case]]
+name = "ns-math-sign-positive"
+src = "math.sign(5)"
+value = "1"
+
+[[case]]
+name = "ns-math-unknown-method-is-field-missing"
+src = "math.frobnicate(1)"
+error = "field_missing"

@@ -204,7 +204,9 @@ impl Evaluator {
             } else {
                 self.cwd.join(script_path)
             };
-            let src = std::fs::read_to_string(&path)
+            let src = self
+                .fs
+                .read_to_string(&path)
                 .map_err(|e| ErrorVal::new("io_error", format!("cannot read script: {e}")))?;
             let program = shoal_syntax::parse(&src)
                 .map_err(|e| ErrorVal::new("parse_error", e.to_string()))?;
@@ -216,6 +218,7 @@ impl Evaluator {
                 child.env = self.env.clone();
                 child.process_env = self.process_env.clone();
                 child.adapters = self.adapters.clone();
+                child.inherit_ports(self);
                 return child.eval_program(&program);
             }
         }
@@ -238,17 +241,12 @@ impl Evaluator {
         let Value::Outcome(out) = &value else {
             return Ok(value);
         };
+        let fs = self.fs.clone();
         for r in &call.redirects {
+            let target = self.arg_path(&r.target)?;
             match r.kind {
-                RedirectKind::Out => std::fs::write(self.arg_path(&r.target)?, &*out.stdout),
-                RedirectKind::Append => {
-                    use std::io::Write;
-                    std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(self.arg_path(&r.target)?)
-                        .and_then(|mut f| f.write_all(&out.stdout))
-                }
+                RedirectKind::Out => fs.write(&target, &out.stdout),
+                RedirectKind::Append => fs.append(&target, &out.stdout),
                 RedirectKind::In => Ok(()),
             }
             .map_err(|e| ErrorVal::new("custom", e.to_string()))?;
@@ -425,28 +423,32 @@ impl Evaluator {
         // policy (and when no policy is installed), so this is a pure no-op on
         // the normal path — the child spawns exactly as before.
         let sandbox = self.resolve_sandbox();
-        let r = shoal_exec::run(
-            ExecSpec {
-                argv,
-                cwd: self.cwd.clone(),
-                env,
-                stdin,
-                mode,
-                sandbox,
-            },
-            &self.cancel,
-        )
-        .map_err(|e| {
-            ErrorVal::new(
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    "not_found"
-                } else {
-                    "custom"
+        // Spawn through the Exec port (docs/ROADMAP.md R4). The default
+        // `StdExec` is `shoal_exec::run` verbatim, so this is byte-identical.
+        let exec = self.exec.clone();
+        let r = exec
+            .run(
+                ExecSpec {
+                    argv,
+                    cwd: self.cwd.clone(),
+                    env,
+                    stdin,
+                    mode,
+                    sandbox,
                 },
-                e.to_string(),
+                &self.cancel,
             )
-            .with_span(span)
-        })?;
+            .map_err(|e| {
+                ErrorVal::new(
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        "not_found"
+                    } else {
+                        "custom"
+                    },
+                    e.to_string(),
+                )
+                .with_span(span)
+            })?;
         let ok_codes = meta.as_ref().map_or(&[0][..], |m| m.ok_codes.as_slice());
         let ok = r.status.is_some_and(|code| ok_codes.contains(&code));
         let parsed = meta.as_ref().and_then(|m| {
