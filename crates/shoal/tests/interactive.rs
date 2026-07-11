@@ -484,7 +484,7 @@ fn repl_undo_out_n_resolves_via_journal() {
     // than rm's own (empty) output.
     writer.write_all(b"rm victim\r").unwrap();
     writer.flush().unwrap();
-    writer.write_all(b"echo 8110\"\"04\r").unwrap();
+    writer.write_all(b"echo (811000+4)\r").unwrap();
     writer.flush().unwrap();
     assert!(
         pump_until(&mut writer, b"811004"),
@@ -495,7 +495,7 @@ fn repl_undo_out_n_resolves_via_journal() {
     // The fix under test: `out[3]` resolves to `rm`'s journal entry id.
     writer.write_all(b"undo out[3]\r").unwrap();
     writer.flush().unwrap();
-    writer.write_all(b"echo 8110\"\"05\r").unwrap();
+    writer.write_all(b"echo (811000+5)\r").unwrap();
     writer.flush().unwrap();
     assert!(
         pump_until(&mut writer, b"811005"),
