@@ -10,7 +10,7 @@ pub(crate) fn numeric_unary(
     match v {
         Value::Int(i) => fi(i)
             .map(Value::Int)
-            .ok_or_else(|| ErrorVal::new("custom", "integer overflow")),
+            .ok_or_else(|| ErrorVal::new("overflow", "integer overflow")),
         Value::Float(f) => Ok(Value::Float(ff(f))),
         v => Err(ErrorVal::type_error(format!(
             "expected number, found {}",

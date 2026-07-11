@@ -161,9 +161,18 @@ pub fn binop(op: BinOp, lhs: &Value, rhs: &Value) -> VResult<Value> {
         (Float(a), Size(b)) if op == Mul => Ok(Size((a * *b as f64).round() as u64)),
 
         // --- duration ---
+        // Checked like int/size: unchecked `+`/`*` here PANICKED the whole
+        // process (a kernel-hosted eval takes down the daemon) on e.g.
+        // `4000000000w + 4000000000w`.
         (Duration(a), Duration(b)) => match op {
-            Add => Ok(Duration(a + b)),
-            Sub => Ok(Duration(a - b)),
+            Add => a
+                .checked_add(*b)
+                .map(Duration)
+                .ok_or_else(|| ErrorVal::new("overflow", "duration overflow")),
+            Sub => a
+                .checked_sub(*b)
+                .map(Duration)
+                .ok_or_else(|| ErrorVal::new("overflow", "duration overflow")),
             Div => {
                 if *b == 0 {
                     Err(ErrorVal::new("div_zero", "division by zero"))
@@ -174,7 +183,10 @@ pub fn binop(op: BinOp, lhs: &Value, rhs: &Value) -> VResult<Value> {
             _ => Err(type_err(opname, lhs, rhs)),
         },
         (Duration(a), Int(b)) => match op {
-            Mul => Ok(Duration(a * b)),
+            Mul => a
+                .checked_mul(*b)
+                .map(Duration)
+                .ok_or_else(|| ErrorVal::new("overflow", "duration overflow")),
             Div => {
                 if *b == 0 {
                     Err(ErrorVal::new("div_zero", "division by zero"))
@@ -184,7 +196,10 @@ pub fn binop(op: BinOp, lhs: &Value, rhs: &Value) -> VResult<Value> {
             }
             _ => Err(type_err(opname, lhs, rhs)),
         },
-        (Int(a), Duration(b)) if op == Mul => Ok(Duration(a * b)),
+        (Int(a), Duration(b)) if op == Mul => a
+            .checked_mul(*b)
+            .map(Duration)
+            .ok_or_else(|| ErrorVal::new("overflow", "duration overflow")),
         (Duration(a), Float(b)) if op == Mul => Ok(Duration((*a as f64 * b).round() as i64)),
         (Float(a), Duration(b)) if op == Mul => Ok(Duration((a * *b as f64).round() as i64)),
 
@@ -207,8 +222,12 @@ pub fn binop(op: BinOp, lhs: &Value, rhs: &Value) -> VResult<Value> {
                 .map_err(|e| ErrorVal::new("overflow", format!("datetime out of range: {e}")))
         }
         (DateTime(a), DateTime(b)) if op == Sub => {
+            // The i128 ns difference can exceed i64 (~±292 years); a raw
+            // `as i64` cast wrapped silently.
             let d = a.timestamp().as_nanosecond() - b.timestamp().as_nanosecond();
-            Ok(Duration(d as i64))
+            i64::try_from(d)
+                .map(Duration)
+                .map_err(|_| ErrorVal::new("overflow", "duration overflow"))
         }
 
         _ => Err(type_err(opname, lhs, rhs)),

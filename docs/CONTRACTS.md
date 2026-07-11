@@ -235,7 +235,7 @@ Render rules (normative — the conformance corpus depends on these):
 
 ## 4. Error codes (pinned — corpus asserts these)
 
-`parse_error type_error arg_error undefined_var not_found cmd_failed div_zero index_range field_missing utf8_error stream_consumed no_matches custom assert_failed permission recursion_limit`
+`parse_error type_error arg_error undefined_var not_found cmd_failed div_zero index_range field_missing utf8_error stream_consumed no_matches custom assert_failed permission recursion_limit overflow`
 
 Extensions from the companion design docs (each pinned there; collected here per this file's own rule that every code the corpus can assert lives in one list):
 - reef (REEF.md §7): `reef_unlocked reef_drift reef_conflict reef_not_found reef_provider`
