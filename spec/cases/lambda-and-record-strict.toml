@@ -1,0 +1,159 @@
+# Two correctness fixes from a cold-agent field test, pinned here.
+#
+# BUG 1 — arrow-lambda parameters are bound in the two-scope statement
+# dispatcher. A lambda BLOCK body is parsed statement-by-statement (TDD §3.1.3:
+# a bound name at statement head → EXPR; an unbound name → COMMAND). The parser
+# now seeds an arrow-lambda's params into its value-binding scope for the body
+# parse, exactly as `fn` bodies do — so a statement whose head is the lambda's
+# own param followed by an operator (`acc + y`, `x + 1`, `total + x`) dispatches
+# as an EXPR, not misread as a command named `acc`. See
+# crates/shoal-syntax/src/parser/{block.rs (paren_or_lambda), expr.rs (primary
+# single-ident lambda)}.
+#
+# BUG 2 — `.field` access on a RECORD is STRICT. The bare-`.field`→zero-arg-
+# method fallback (which lets `.map(.upper)` / `[1,2,3].sum` reach methods) is
+# NOT applied when the receiver is a record: a record owns its field namespace,
+# so a `.name` that misses a field raises `field_missing` rather than silently
+# invoking a same-named builtin (`{key:…, values:…}.items` used to return the
+# generic record `.items()` — a silent-wrong answer). Call a record method
+# explicitly with parens. See crates/shoal-eval/src/expr_access.rs
+# (`field_or_method`) and field-method-fallback.toml.
+
+# --- BUG 1: arrow-lambda params bound in block bodies -----------------------
+
+[[case]]
+name = "lambda-block-param-then-operator"
+# The report's minimal repro: a two-param arrow lambda whose block body's
+# statement head is a param (`acc`) followed by an operator.
+src = '''
+let g = (acc, x) => { let y = x*2; acc + y }
+g(1, 2)
+'''
+value = "5"
+
+[[case]]
+name = "lambda-block-reduce-shorthand"
+# The same shape driven through `.reduce`: 0 + 1*10 + 2*10 + 3*10 = 60.
+src = '[1, 2, 3].reduce(0, (acc, x) => { let d = x*10; acc + d })'
+value = "60"
+
+[[case]]
+name = "lambda-block-param-only-statement"
+# A block body that is just the param-headed expression: 10 + 20 = 30.
+src = '[10, 20].reduce(0, (acc, x) => { acc + x })'
+value = "30"
+
+[[case]]
+name = "lambda-single-ident-block-body"
+# The one-param `x => { … }` form (parsed via primary(), not paren_or_lambda)
+# must bind its param too: 3 + 3*2 = 9.
+src = '''
+let h = x => { let y = x*2; x + y }
+h(3)
+'''
+value = "9"
+
+[[case]]
+name = "lambda-block-param-shadows-command-name"
+# `ls` is a real command head, but here it is a lambda param — bound in the
+# value scope, so `ls + n` dispatches as EXPR (subtraction/addition on the
+# param), never as a command. 10 + (1+1) = 12.
+src = '''
+let g = (x, ls) => { let n = x + 1; ls + n }
+g(1, 10)
+'''
+value = "12"
+
+[[case]]
+name = "lambda-block-sees-outer-binding"
+# The pushed param scope must not hide enclosing bindings: `base` (an outer
+# `let`) is still visible inside the lambda body. 100 + (4+1) = 105.
+src = '''
+let base = 100
+let f = (x) => { let y = x + 1; base + y }
+f(4)
+'''
+value = "105"
+
+[[case]]
+name = "lambda-block-param-bare-if"
+# A param used as the head of a control-flow expression inside the block.
+src = '''
+let m = (a) => if a > 0 { a } else { 0 }
+m(7)
+'''
+value = "7"
+
+[[case]]
+name = "lambda-single-expr-still-works"
+# Regression guard: the single-expression arrow forms are unchanged.
+src = '''
+let f = (a, b) => a + b
+f(2, 3)
+'''
+value = "5"
+
+[[case]]
+name = "lambda-single-ident-expr-still-works"
+src = '''
+let k = x => x + 1
+k(5)
+'''
+value = "6"
+
+# --- BUG 2: record field access is STRICT (no method fallback) --------------
+
+[[case]]
+name = "record-strict-method-name-not-field-raises"
+# A method name that is NOT a field of the record raises `field_missing`,
+# rather than silently invoking the builtin `.items()` method.
+src = '{a: 1}.items'
+error = "field_missing"
+error_contains = "items"
+
+[[case]]
+name = "record-strict-collision-raises"
+# The exact field-test regression: `.items` on a record whose real fields are
+# `key`/`values` must NOT return `[["key","a"],["values",[1,2,3]]]`.
+src = '{key: "a", values: [1, 2, 3]}.items'
+error = "field_missing"
+error_contains = "items"
+
+[[case]]
+name = "record-strict-json-no-parens-raises"
+# `{…}.json` (no parens) is now `field_missing`; the with-parens form lives in
+# field-method-fallback.toml (`record-method-json-with-parens`).
+src = '{a: 1, b: 2}.json'
+error = "field_missing"
+error_contains = "json"
+
+[[case]]
+name = "record-strict-field-still-works"
+# A real field is unaffected — bare `.field` on a record still returns it.
+src = '{a: 1}.a'
+value = "1"
+
+[[case]]
+name = "record-strict-field-wins-over-method"
+# When the name IS a field, the field wins even though `values` is also a
+# builtin record method.
+src = '{values: 42}.values'
+value = "42"
+
+[[case]]
+name = "record-strict-method-with-parens-works"
+# The escape hatch: call the record method explicitly with parens.
+src = '{a: 1, b: 2}.items()'
+value = '[["a", 1], ["b", 2]]'
+
+[[case]]
+name = "record-strict-nonrecord-str-fallback-kept"
+# The fallback is KEPT for non-record receivers — a bare `.upper` on a string
+# still reaches the method (this is what powers `.map(.upper)`).
+src = '"hi".upper'
+value = '"HI"'
+
+[[case]]
+name = "record-strict-nonrecord-list-fallback-kept"
+src = '[1, 2, 3].sum'
+value = "6"

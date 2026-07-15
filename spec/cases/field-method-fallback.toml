@@ -1,10 +1,16 @@
 # The `.field` accessor falls back to a zero-arg METHOD of the same name when
 # no such field exists, so the bare-`.field` sugar (used heavily by implicit
 # `.map(.x)`/`.where(.x)` lambdas) reaches methods too — `["a"].map(.upper)`,
-# `[1,2,3].sum`, `{a:1}.json`. A present field always WINS over a same-named
-# method (user data ahead of the stdlib), and when neither exists the error
-# still names the missing field. See crates/shoal-eval/src/expr_access.rs
-# (`field_or_method`) and docs/CONTRACTS.md §3.
+# `[1,2,3].sum`. A present field always WINS over a same-named method (user
+# data ahead of the stdlib), and when neither exists the error still names the
+# missing field. See crates/shoal-eval/src/expr_access.rs (`field_or_method`)
+# and docs/CONTRACTS.md §3.
+#
+# IMPORTANT — the fallback is deliberately NOT extended to RECORD receivers:
+# a record's field namespace is user-controlled, so a bare `.name` that misses
+# a field raises `field_missing` (strict) rather than silently invoking a
+# same-named builtin method. That strictness is pinned in
+# lambda-and-record-strict.toml; here `record.method()` uses explicit parens.
 
 [[case]]
 name = "map-upper-shorthand"
@@ -27,13 +33,18 @@ src = '"hi".upper'
 value = '"HI"'
 
 [[case]]
-name = "record-method-json-no-parens"
-src = '{a: 1, b: 2}.json'
+name = "record-method-json-with-parens"
+# On a RECORD the bare-`.field` fallback is intentionally OFF (records own
+# their field namespace), so a builtin record method is called with parens.
+# `{a: 1, b: 2}.json` (no parens) instead raises `field_missing` — pinned in
+# lambda-and-record-strict.toml.
+src = '{a: 1, b: 2}.json()'
 value = '"{\"a\":1,\"b\":2}"'
 
 [[case]]
 name = "field-wins-over-method"
 # `keys` is both a record method and, here, a user field — the field wins.
+# (Bare `.keys` resolves because `keys` IS a field, not via method fallback.)
 src = '{keys: "mydata"}.keys'
 value = '"mydata"'
 

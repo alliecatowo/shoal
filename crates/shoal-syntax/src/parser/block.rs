@@ -192,6 +192,16 @@ impl<'s> Parser<'s> {
             }
         }
         if plausible && self.eat(Mode::Expr, &Tok::FatArrow)?.is_some() {
+            // Register the lambda's params into the parser's value-binding
+            // scope for the duration of the body parse — exactly as `fn` bodies
+            // do (see `fn_stmt` in stmt.rs). Without this, a block-body
+            // statement whose head is a param followed by an operator
+            // (`acc + y`) misdispatches as a COMMAND named `acc` instead of an
+            // EXPR (TDD §3.1.3), because statement dispatch keys off the
+            // bound-variable scope. Harmless for expr bodies, where params
+            // already parse as `Var` in expression position.
+            self.scopes
+                .push(params.iter().map(|p| p.name.clone()).collect());
             let body = if matches!(self.peek(Mode::Expr)?.0, Tok::LBrace) {
                 let block = self.block()?;
                 Expr::Block {
@@ -201,6 +211,7 @@ impl<'s> Parser<'s> {
             } else {
                 self.expr(0)?
             };
+            self.scopes.pop();
             let end = body.span().end;
             return Ok(Expr::Lambda {
                 params,
