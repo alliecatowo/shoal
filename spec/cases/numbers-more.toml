@@ -120,6 +120,27 @@ name = "num-round-int-unchanged-at-precision"
 src = '(42).round(3)'
 value = "42"
 
+# A large precision `n` used to make `10^n` (or `x * 10^n`) overflow f64 to
+# ±inf, silently turning a finite input into `nan`/`inf`. Rounding a finite
+# float to more decimal places than it can represent is the IDENTITY, so the
+# value must come back unchanged and finite.
+# See crates/shoal-value/src/methods/num.rs::round_to (FIX 4).
+
+[[case]]
+name = "num-round-huge-precision-is-identity"
+src = '(1.23456).round(400)'
+value = "1.23456"
+
+[[case]]
+name = "num-floor-huge-precision-is-identity"
+src = '(1.5).floor(400)'
+value = "1.5"
+
+[[case]]
+name = "num-ceil-huge-precision-is-identity"
+src = '(123.456).ceil(999)'
+value = "123.456"
+
 # Duration arithmetic is CHECKED like int/size: unchecked ops used to PANIC
 # the whole process (fatal in a kernel-hosted eval) instead of raising
 # `overflow`. See crates/shoal-value/src/ops.rs.
@@ -149,3 +170,63 @@ name = "num-abs-int-min-overflow-code"
 # `.abs()` on i64::MIN raises the pinned `overflow` code (was `custom`).
 src = '(-9223372036854775807 - 1).abs()'
 error = "overflow"
+
+# `size * float` / `duration * float` are CHECKED like their `* int` siblings.
+# The float->int `as` cast SATURATES (NaN/negative->0, overflow->MAX), so these
+# used to silently return garbage (`9000000000000000000b * 100.0` yielded
+# `18446744.07tb`; `1000b * -1.0` yielded `0b`) instead of erroring the way the
+# integer arms do. See crates/shoal-value/src/ops.rs (FIX 1).
+
+[[case]]
+name = "num-size-mul-float-overflow-raises"
+src = '9000000000000000000b * 100.0'
+error = "overflow"
+error_contains = "size overflow"
+
+[[case]]
+name = "num-float-mul-size-overflow-raises"
+src = '100.0 * 9000000000000000000b'
+error = "overflow"
+error_contains = "size overflow"
+
+[[case]]
+name = "num-size-mul-negative-float-cannot-go-negative"
+src = '1000b * -1.0'
+error = "type_error"
+error_contains = "negative"
+
+[[case]]
+name = "num-negative-float-mul-size-cannot-go-negative"
+src = '-1.0 * 1000b'
+error = "type_error"
+error_contains = "negative"
+
+[[case]]
+name = "num-duration-mul-float-overflow-raises"
+src = '5000000000w * 1000.0'
+error = "overflow"
+error_contains = "duration overflow"
+
+[[case]]
+name = "num-float-mul-duration-overflow-raises"
+src = '1000.0 * 5000000000w'
+error = "overflow"
+error_contains = "duration overflow"
+
+# A negative duration is legal, so `duration * negative float` is NOT an error
+# (unlike size): it just yields a negative duration, matching `* negative int`.
+[[case]]
+name = "num-duration-mul-negative-float-is-negative-duration"
+src = '5s * -1.0'
+value = "-5s"
+
+# Well-formed `size * float` / `duration * float` still work (rounding cast).
+[[case]]
+name = "num-size-mul-float-in-range-ok"
+src = '2kb * 1.5'
+value = "3kb"
+
+[[case]]
+name = "num-duration-mul-float-in-range-ok"
+src = '30s * 1.5'
+value = "45s"

@@ -184,6 +184,13 @@ pub(crate) fn sort_by(ctx: &mut dyn CallCtx, v: Value, f: &Value) -> VResult<Val
     for x in seq(v)? {
         keyed.push((ctx.call_closure(f, vec![x.clone()])?, x));
     }
+    // Pre-validate the keys and PROPAGATE the comparison error, exactly like
+    // `sort()` below (and unlike a bare `unwrap_or(Equal)`, which silently
+    // mis-orders heterogeneous/null/NaN keys). `[{k:1},{k:"a"},{k:2}].sort(.k)`
+    // must error consistently with `[1,"a",2].sort()`.
+    for pair in keyed.windows(2) {
+        cmp(&pair[0].0, &pair[1].0)?;
+    }
     keyed.sort_by(|a, b| cmp(&a.0, &b.0).unwrap_or(Ordering::Equal));
     Ok(Value::List(keyed.into_iter().map(|x| x.1).collect()))
 }
