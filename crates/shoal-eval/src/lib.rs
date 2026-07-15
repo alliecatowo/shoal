@@ -1191,6 +1191,147 @@ output={parse="lines",type="list<str>"}
         assert!(!marker.exists());
     }
 
+    // ---- TDD §8 binary-content-hash spawn pinning ------------------------
+
+    /// `hash_resolved_bin` must produce reef/leash's exact blake3-hex so a pin
+    /// an author copies from `reef`/`which` output compares equal to what the
+    /// spawn gate computes. Cross-check against all three producers.
+    #[test]
+    fn hash_resolved_bin_matches_reef_and_leash_encoding() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("toolbin");
+        std::fs::write(&bin, b"#!/bin/sh\necho hi\n").unwrap();
+        let ev = Evaluator::new(dir.path().into());
+        let got = ev
+            .hash_resolved_bin(OsStr::new(bin.as_os_str()))
+            .expect("absolute path is hashable");
+        assert!(!got.is_empty());
+        // Same as hashing the bytes directly (reef's `hash_bytes`)…
+        assert_eq!(
+            got,
+            shoal_reef::hashcache::hash_bytes(b"#!/bin/sh\necho hi\n")
+        );
+        // …and as reef's file-hash cache…
+        assert_eq!(
+            got,
+            shoal_reef::hashcache::HashCache::new()
+                .hash_file(&bin)
+                .unwrap()
+        );
+        // …and as leash's own preflight hasher (the exec-time verifier).
+        assert_eq!(got, shoal_leash::preflight_spawn(&bin, &[]).unwrap().hash);
+    }
+
+    /// The security-critical gate, exercised directly (a full external spawn is
+    /// awkward in-harness): no policy and no-`proc_spawn` policy both allow every
+    /// spawn (the no-regression guarantee); a pinned allowlist admits only the
+    /// matching binary and denies an unlisted one.
+    #[test]
+    fn spawn_gate_no_regression_then_enforces_when_pinned() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("toolbin");
+        std::fs::write(&bin, b"real binary bytes").unwrap();
+        let bin_os = OsStr::new(bin.as_os_str());
+        let hash = shoal_reef::hashcache::hash_bytes(b"real binary bytes");
+
+        // 1. No leash policy installed at all ⇒ allow (today's behavior).
+        let ev = Evaluator::new(dir.path().into());
+        assert!(ev.spawn_gate(bin_os, None, Span::default()).is_ok());
+
+        // 2. Permissive policy (no `proc_spawn` grants) ⇒ allow. This is the
+        //    default a human principal gets; a regression here would break the
+        //    shell for everyone.
+        let mut ev = Evaluator::new(dir.path().into());
+        ev.set_leash_policy(LeashPolicy::permissive("human"), "human");
+        assert!(ev.spawn_gate(bin_os, None, Span::default()).is_ok());
+
+        // 3. Scoped fs policy but still no `proc_spawn` grants ⇒ allow.
+        let mut ev = Evaluator::new(dir.path().into());
+        ev.set_leash_policy(
+            LeashPolicy::from_toml(
+                "[principal.agent]\n\n[principal.agent.fs]\nread=[\"/work/**\"]\n",
+            )
+            .unwrap(),
+            "agent",
+        );
+        assert!(ev.spawn_gate(bin_os, None, Span::default()).is_ok());
+
+        // 4. Pinned to this binary's exact hash ⇒ allow it (hashed here, since
+        //    reef didn't resolve it — reef_hash is None).
+        let mut ev = Evaluator::new(dir.path().into());
+        ev.set_leash_policy(
+            LeashPolicy::from_toml(&format!("[principal.agent]\nproc_spawn = [\"{hash}\"]\n"))
+                .unwrap(),
+            "agent",
+        );
+        assert!(ev.spawn_gate(bin_os, None, Span::default()).is_ok());
+
+        // 5. Pinned to a DIFFERENT hash (and the name is not listed) ⇒ deny.
+        let mut ev = Evaluator::new(dir.path().into());
+        ev.set_leash_policy(
+            LeashPolicy::from_toml(&format!(
+                "[principal.agent]\nproc_spawn = [\"{}\"]\n",
+                "00".repeat(32)
+            ))
+            .unwrap(),
+            "agent",
+        );
+        let err = ev
+            .spawn_gate(bin_os, None, Span::default())
+            .expect_err("unlisted binary must be denied under an active pin");
+        assert_eq!(err.code, "spawn_denied");
+
+        // 6. Reusing reef's already-computed hash takes the same allow path
+        //    without touching the file (pass a bogus path but the real hash).
+        let mut ev = Evaluator::new(dir.path().into());
+        ev.set_leash_policy(
+            LeashPolicy::from_toml(&format!("[principal.agent]\nproc_spawn = [\"{hash}\"]\n"))
+                .unwrap(),
+            "agent",
+        );
+        assert!(
+            ev.spawn_gate(
+                OsStr::new("/nonexistent/tool"),
+                Some(&hash),
+                Span::default()
+            )
+            .is_ok()
+        );
+    }
+
+    /// `plan_derive` now emits a real, non-empty `bin_hash` for an adapter whose
+    /// bin resolves to a real file — the content hash a `proc_spawn` pin checks.
+    #[test]
+    fn planning_emits_real_bin_hash_for_resolved_adapter() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("toolbin");
+        let body = b"fixture tool bytes for planning";
+        std::fs::write(&bin, body).unwrap();
+        // An adapter whose `bin` is the absolute fixture path (host-independent).
+        std::fs::write(
+            dir.path().join("mytool.toml"),
+            format!("[cmd.mytool]\nbin=\"{}\"\n", bin.display()),
+        )
+        .unwrap();
+        let (catalog, warnings) = AdapterCatalog::load_dir(dir.path());
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let mut evaluator = Evaluator::new(dir.path().into());
+        evaluator.set_adapters(catalog);
+        let plan = evaluator
+            .plan_program(&shoal_syntax::parse("mytool").unwrap())
+            .unwrap();
+        let spawn = plan
+            .effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::ProcSpawn { bin_hash, .. } => Some(bin_hash.clone()),
+                _ => None,
+            })
+            .expect("adapter spawn effect present");
+        assert!(!spawn.is_empty(), "bin_hash must no longer be empty");
+        assert_eq!(spawn, shoal_reef::hashcache::hash_bytes(body));
+    }
+
     #[test]
     fn planning_unions_conditional_and_static_function_effects() {
         let dir = tempfile::tempdir().unwrap();

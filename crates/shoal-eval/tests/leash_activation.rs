@@ -175,6 +175,104 @@ fn scoped_policy_blocks_a_denied_sibling_through_the_eval_spawn_path() {
     }
 }
 
+// ---- TDD §8 binary-content-hash spawn pinning (end-to-end) --------------
+//
+// These travel the SAME `eval_program` → `run_argv` → `spawn_gate` path as a
+// real command, and — unlike the OS-sandbox assertions above — the pin is
+// checked *in-process before exec*, so they need neither Landlock nor the
+// sandbox helper and run identically on every platform.
+
+/// A principal whose `proc_spawn` allowlist contains only `entry` (a hash or a
+/// name), with `opaque='allow'` so nothing else gets in the way.
+fn spawn_pinned_policy(entry: &str) -> Policy {
+    Policy::from_toml(&format!(
+        "[principal.agent]\nopaque='allow'\nproc_spawn = [\"{entry}\"]\n"
+    ))
+    .expect("spawn-pinned policy parses")
+}
+
+#[test]
+fn proc_spawn_pin_blocks_an_unlisted_binary_before_exec() {
+    // cat is neither named nor hashed in the allowlist ⇒ the spawn gate denies
+    // it before the child is ever launched. This is the core enforcement the
+    // audit found missing: a policy author's `proc_spawn` list now bites.
+    let (d, _allowed, secret) = scene();
+    let mut ev = Evaluator::new(d.path().to_path_buf());
+    ev.set_leash_policy(
+        spawn_pinned_policy("some-other-tool-that-is-not-cat"),
+        "agent",
+    );
+    let src = cat_src(&secret.join("hidden.txt"));
+    let err = ev
+        .eval_program(&parse(&src))
+        .expect_err("an unlisted binary must be denied by the spawn pin");
+    assert_eq!(err.code, "spawn_denied", "unexpected error: {err:?}");
+    // The denial names the offending head so the author can see what to allow.
+    assert!(
+        err.msg.contains("proc_spawn"),
+        "denial should mention the allowlist, got {:?}",
+        err.msg
+    );
+}
+
+#[test]
+fn proc_spawn_pin_admits_a_listed_binary_by_name() {
+    // Granting the bare name `cat` lets the absolute-path spawn through: the
+    // gate matches argv0's file_name against the allowlist.
+    let (d, allowed, _secret) = scene();
+    let mut ev = Evaluator::new(d.path().to_path_buf());
+    ev.set_leash_policy(spawn_pinned_policy("cat"), "agent");
+    let out = ev
+        .eval_program(&parse(&cat_src(&allowed.join("ok.txt"))))
+        .expect("a name-listed binary runs");
+    let Value::Outcome(o) = out else {
+        panic!("expected outcome");
+    };
+    assert!(o.ok && String::from_utf8_lossy(&o.stdout).contains("OKDATA"));
+}
+
+#[test]
+fn proc_spawn_pin_admits_a_listed_binary_by_content_hash() {
+    // Granting cat's exact blake3 content hash (and NOT its name) still admits
+    // it — proving real content-hash matching, not just name matching. The hash
+    // is produced by leash's own preflight hasher, the same encoding the gate
+    // and reef use, so what an author copies from tooling compares equal.
+    let (d, allowed, _secret) = scene();
+    let cat = external_cat();
+    let hash = shoal_leash::preflight_spawn(&cat, &[]).unwrap().hash;
+    let mut ev = Evaluator::new(d.path().to_path_buf());
+    ev.set_leash_policy(spawn_pinned_policy(&hash), "agent");
+    let out = ev
+        .eval_program(&parse(&cat_src(&allowed.join("ok.txt"))))
+        .expect("a hash-listed binary runs");
+    let Value::Outcome(o) = out else {
+        panic!("expected outcome");
+    };
+    assert!(o.ok && String::from_utf8_lossy(&o.stdout).contains("OKDATA"));
+}
+
+#[test]
+fn a_policy_without_proc_spawn_grants_never_blocks_a_spawn() {
+    // The no-regression contract at the spawn boundary: a principal that is
+    // scoped on the filesystem but declares NO `proc_spawn` grants must still
+    // be able to run any command (an empty allowlist means "unrestricted
+    // spawns", NOT "deny all"). Reads the granted file to keep any OS sandbox
+    // that may also be active happy.
+    let (d, allowed, _secret) = scene();
+    let mut ev = Evaluator::new(d.path().to_path_buf());
+    ev.set_leash_policy(scoped_policy(&allowed), "agent"); // fs-scoped, no proc_spawn
+    if shoal_leash::landlock_abi().is_some() {
+        ensure_sandbox_helper();
+    }
+    let out = ev
+        .eval_program(&parse(&cat_src(&allowed.join("ok.txt"))))
+        .expect("no proc_spawn grants ⇒ the spawn is allowed");
+    let Value::Outcome(o) = out else {
+        panic!("expected outcome");
+    };
+    assert!(o.ok, "spawn must not be blocked when no proc_spawn is set");
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn macos_seatbelt_profile_chain_is_exercised_by_the_scoped_policy() {

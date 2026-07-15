@@ -484,8 +484,10 @@ impl Evaluator {
         }
         // reef spawn-time resolution (docs/REEF.md §2, §4). A pure no-op unless
         // the head is a bare name constrained by a manifest in scope — so a
-        // repo with no `.reef.toml` spawns exactly as before.
-        self.reef_apply(&mut argv, &mut env, span)?;
+        // repo with no `.reef.toml` spawns exactly as before. When reef resolves
+        // the head it hands back the binary's content hash so the leash spawn
+        // gate below can reuse it rather than re-hashing the same file.
+        let reef_hash = self.reef_apply(&mut argv, &mut env, span)?;
         let force_tui = meta.as_ref().is_some_and(|m| m.class == AdapterClass::Tui);
         let mode = if force_tui || (self.interactive && position == Position::Statement) {
             ExecMode::PtyTee
@@ -519,6 +521,14 @@ impl Evaluator {
         // policy (and when no policy is installed), so this is a pure no-op on
         // the normal path — the child spawns exactly as before.
         let sandbox = self.resolve_sandbox();
+        // TDD §8 spawn-hash pinning: consult the leash effect evaluator with
+        // this spawn's *resolved* binary (post-reef `argv[0]`) before exec. A
+        // pure no-op unless the active principal pins `proc_spawn` — see
+        // `spawn_gate`, which guards against a default-deny regression by only
+        // hashing/evaluating when a non-empty allowlist is actually configured.
+        if let Some(argv0) = argv.first() {
+            self.spawn_gate(argv0, reef_hash.as_deref(), span)?;
+        }
         // Spawn through the Exec port (docs/ROADMAP.md R4). The default
         // `StdExec` is `shoal_exec::run` verbatim, so this is byte-identical.
         let exec = self.exec.clone();
@@ -577,6 +587,80 @@ impl Evaluator {
         } else {
             Ok(out)
         }
+    }
+
+    /// The leash spawn gate (TDD §8 content-hash pinning). Consulted from
+    /// `run_argv` for every external spawn, just before exec. Returns `Ok(())`
+    /// — allow — in every case EXCEPT when the active principal pins process
+    /// spawns (a non-empty `proc_spawn` allowlist) AND the resolved binary
+    /// matches none of those pins by content hash or name.
+    ///
+    /// Zero-regression guarantee: when no leash policy is installed, or the
+    /// principal declares no `proc_spawn` grants, this returns immediately —
+    /// the binary is never hashed and the spawn proceeds exactly as it does
+    /// today. It deliberately gates on [`shoal_leash::Policy::spawn_pinning_active`]
+    /// rather than calling `evaluate_effect` unconditionally, because an empty
+    /// allowlist evaluates a `ProcSpawn` as `Deny` — consulting the evaluator
+    /// without that guard would default-deny ordinary commands.
+    ///
+    /// `reef_hash` is the content hash reef already computed for a resolved
+    /// binary (reused verbatim); when `None`, and only when pinning is active,
+    /// the resolved binary's own bytes are hashed here.
+    pub(crate) fn spawn_gate(
+        &self,
+        argv0: &OsStr,
+        reef_hash: Option<&str>,
+        span: Span,
+    ) -> VResult<()> {
+        let Some((policy, principal)) = self.leash.as_ref() else {
+            return Ok(());
+        };
+        // Empty/absent `proc_spawn` grants ⇒ allow, exactly as before pinning
+        // existed. This guard is load-bearing: without it, `evaluate_effect`
+        // below would deny every spawn under an otherwise-unrestricted policy.
+        if !policy.spawn_pinning_active(principal) {
+            return Ok(());
+        }
+        // Reuse reef's hash when it resolved `argv[0]`; otherwise hash the
+        // resolved binary's bytes (same blake3-hex as reef and
+        // `shoal_leash::preflight_spawn`). An unlocatable/unreadable binary
+        // yields an empty hash, falling back to name-only matching — still
+        // enforced, never silently allowed.
+        let bin_hash = match reef_hash {
+            Some(h) => h.to_string(),
+            None => self.hash_resolved_bin(argv0).unwrap_or_default(),
+        };
+        let effect = Effect::ProcSpawn {
+            bin_hash,
+            argv0: argv0.to_string_lossy().into_owned(),
+        };
+        match policy.evaluate_effect(principal, &effect) {
+            shoal_leash::Verdict::Allow => Ok(()),
+            _ => Err(ErrorVal::new(
+                "spawn_denied",
+                format!(
+                    "leash: spawn of `{}` denied — its content hash/name is not in principal `{principal}`'s proc_spawn allowlist",
+                    argv0.to_string_lossy()
+                ),
+            )
+            .with_span(span)),
+        }
+    }
+
+    /// Content-hash the binary `argv0` resolves to — an absolute path as-is, or
+    /// a bare name via the ambient `$PATH` (`which`) — returning reef/leash's
+    /// blake3-hex so a pin copied from `reef`/`which` output compares equal.
+    /// `None` when the binary can't be located or read. Reads through the `Fs`
+    /// port so it stays testable without touching a real binary.
+    pub(crate) fn hash_resolved_bin(&self, argv0: &OsStr) -> Option<String> {
+        let candidate = Path::new(argv0);
+        let resolved = if candidate.is_absolute() {
+            candidate.to_path_buf()
+        } else {
+            self.ambient_which(&argv0.to_string_lossy())?
+        };
+        let bytes = self.fs.read(&resolved).ok()?;
+        Some(shoal_reef::hashcache::hash_bytes(&bytes))
     }
 
     /// True when `name` resolves as a command (builtin, special head, adapter,

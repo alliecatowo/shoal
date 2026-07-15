@@ -159,30 +159,38 @@ impl Evaluator {
     /// `env` is the child environment being assembled; only its `PATH` entry is
     /// ever touched, and only for a constrained spawn. The session env is never
     /// mutated.
+    ///
+    /// Returns the resolved binary's blake3 content hash (`Some`) when reef
+    /// actually resolved the head, so the leash spawn gate (TDD §8 content-hash
+    /// pinning) can reuse it verbatim instead of re-hashing the same file;
+    /// `None` on every no-op path (no manifest, explicit path, unconstrained
+    /// head). The hash is reef's own `Resolution::hash`, identical blake3-hex to
+    /// `shoal_leash::preflight_spawn`, so a pin an author copies from `reef`
+    /// output compares equal either way.
     pub(crate) fn reef_apply(
         &mut self,
         argv: &mut [OsString],
         env: &mut Vec<(OsString, OsString)>,
         span: Span,
-    ) -> VResult<()> {
+    ) -> VResult<Option<String>> {
         // Fast bail: no manifest in scope ⇒ never touch the resolver.
         if !self.reef_manifest_in_scope() {
-            return Ok(());
+            return Ok(None);
         }
         let Some(head) = argv.first() else {
-            return Ok(());
+            return Ok(None);
         };
         // An explicit path bypasses name resolution (session fn/alias → adapter
         // bin pin → reef → …; a `/`-bearing argv[0] is already a bound binary).
         let name = head.to_string_lossy().into_owned();
         if name.contains('/') {
-            return Ok(());
+            return Ok(None);
         }
         let chain = self.reef_chain_snapshot();
         if chain.nearest_for(&name).is_none() {
             // Manifest in scope, but it does not mention this tool ⇒ exactly
             // today's behavior: ambient PATH, PATH/which resolution, untouched.
-            return Ok(());
+            return Ok(None);
         }
 
         let policy = if self.interactive {
@@ -224,7 +232,7 @@ impl Evaluator {
             Some(pair) => pair.1 = path_var,
             None => env.push((OsString::from("PATH"), path_var)),
         }
-        Ok(())
+        Ok(Some(resolution.hash))
     }
 
     /// Build (or reuse) a content-addressed view dir binding every locked tool,
