@@ -127,6 +127,26 @@ fn real_main(args: Vec<OsString>) -> Result<i32, String> {
     }
 }
 
+/// The user-scope reef manifest path (docs/REEF.md §1: `[reef]` in
+/// `shoal.toml` is the user scope): `$XDG_CONFIG_HOME/shoal/shoal.toml`,
+/// falling back to `~/.config/shoal/shoal.toml` when unset. Mirrors
+/// `shoal_config::LoadOptions::discover`'s own user-layer resolution and
+/// `shoal_leash::Policy::user_leash_path`'s identical pattern for
+/// `leash.toml`, so all three agree on one user config root. A missing file
+/// is fine: `Evaluator::set_reef_user_manifest` tolerates an absent path (no
+/// user scope, zero regression) exactly like the config/leash loaders do.
+fn reef_user_manifest_path() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME").filter(|s| !s.is_empty()) {
+        return Some(PathBuf::from(dir).join("shoal").join("shoal.toml"));
+    }
+    std::env::var_os("HOME").filter(|s| !s.is_empty()).map(|h| {
+        PathBuf::from(h)
+            .join(".config")
+            .join("shoal")
+            .join("shoal.toml")
+    })
+}
+
 fn run_source(
     src: &str,
     source: Option<&Path>,
@@ -150,6 +170,15 @@ fn run_source(
     }
     let mut evaluator = Evaluator::new(cwd);
     evaluator.interactive = interactive;
+    // Wire the user reef scope (docs/REEF.md §1) so `~/.config/shoal/
+    // shoal.toml`'s `[reef]` table actually engages — without this call the
+    // documented user scope never exists in the real binary, no matter what
+    // the user writes there (`Evaluator::set_reef_user_manifest` has no other
+    // caller). Additive: an absent/empty file is exactly today's no-user-
+    // scope behavior.
+    if let Some(path) = reef_user_manifest_path() {
+        evaluator.set_reef_user_manifest(path);
+    }
     // Render every non-final statement the same way the final result is
     // rendered (structured `.out` as a table, text verbatim), so a script's
     // intermediate and last statements look identical. Without this the
@@ -287,5 +316,42 @@ mod tests {
     fn no_color_strips_ansi_escapes_but_leaves_plain_text() {
         let colored = "\x1b[31;1merror:\x1b[0m bad thing";
         assert_eq!(strip_ansi(colored), "error: bad thing");
+    }
+
+    /// Fix 1: the user reef manifest path mirrors `shoal_config`'s own user
+    /// layer (`$XDG_CONFIG_HOME/shoal/shoal.toml`, falling back to
+    /// `~/.config/shoal/shoal.toml`) — the exact path
+    /// `Evaluator::set_reef_user_manifest` needs so the documented user
+    /// `[reef]` scope actually engages. Serialized on a lock (rather than
+    /// relying on test-harness single-threading) since it mutates process
+    /// env vars that other tests in this binary could read concurrently.
+    #[test]
+    fn reef_user_manifest_path_prefers_xdg_then_home() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        let prev_home = std::env::var_os("HOME");
+
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", "/xdg-cfg") };
+        assert_eq!(
+            reef_user_manifest_path(),
+            Some(PathBuf::from("/xdg-cfg/shoal/shoal.toml"))
+        );
+
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+        unsafe { std::env::set_var("HOME", "/home/shoaluser") };
+        assert_eq!(
+            reef_user_manifest_path(),
+            Some(PathBuf::from("/home/shoaluser/.config/shoal/shoal.toml"))
+        );
+
+        match prev_xdg {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+        match prev_home {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
     }
 }

@@ -133,6 +133,21 @@ impl Evaluator {
         }
     }
 
+    /// Look up `name` on the ambient `$PATH`, bypassing reef entirely — the
+    /// same raw lookup `which`'s NotFound fallback already performs. Shared by
+    /// the not-found "shadowed by ambient PATH" did-you-mean (below) and
+    /// `reef doctor`'s shadowed-ambient check (`reef_builtins.rs`, REEF.md §6's
+    /// third bullet): both need the same "does a name answer to something
+    /// outside reef's view" fact.
+    pub(crate) fn ambient_which(&self, name: &str) -> Option<PathBuf> {
+        let path_env = self
+            .process_env
+            .iter()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| v.as_os_str());
+        shoal_exec::which(OsStr::new(name), path_env)
+    }
+
     // --- spawn-time resolution (REEF §2, §4) -------------------------------
 
     /// The reef spawn hook, called from `run_argv` just before spawning. When
@@ -183,7 +198,15 @@ impl Evaluator {
         });
         let resolution = match outcome {
             Ok(r) => r,
-            Err(e) => return Err(reef_error_to_val(e, &name, &chain).with_span(span)),
+            Err(e) => {
+                // REEF.md §6's second did-you-mean bullet: a constrained,
+                // not-found tool might still answer to a DIFFERENT binary via
+                // plain ambient PATH — surface that so the miss doesn't read
+                // as "nothing anywhere has this" when ambient actually does,
+                // just shadowed by the project's reef scope.
+                let ambient = self.ambient_which(&name);
+                return Err(reef_error_to_val(e, &name, &chain, ambient.as_deref()).with_span(span));
+            }
         };
 
         argv[0] = resolution.path.clone().into_os_string();
@@ -267,18 +290,32 @@ impl Evaluator {
 
 /// Convert a [`shoal_reef::ReefError`] into an `ErrorVal`, preserving the stable
 /// code and hint. Enriches `reef_not_found` on a constrained tool with the
-/// did-you-mean phrasing from REEF §6.
-fn reef_error_to_val(e: shoal_reef::ReefError, name: &str, chain: &ScopeChain) -> ErrorVal {
+/// did-you-mean phrasing from REEF §6: "constrained but not installed", plus
+/// (when `ambient` names a real ambient-PATH hit for the same name) "found in
+/// ambient PATH but shadowed by project reef" — REEF §6's second bullet.
+fn reef_error_to_val(
+    e: shoal_reef::ReefError,
+    name: &str,
+    chain: &ScopeChain,
+    ambient: Option<&Path>,
+) -> ErrorVal {
     use shoal_reef::ReefCode;
     let (code, msg) = if e.code == ReefCode::NotFound {
         let constraint = chain
             .nearest_for(name)
             .map(|s| s.manifest.tools[name].constraint.to_string());
         match constraint {
-            Some(c) => (
-                e.code_str(),
-                format!("`{name}` is constrained ({c}) but not installed — reef fetch {name}"),
-            ),
+            Some(c) => {
+                let mut m =
+                    format!("`{name}` is constrained ({c}) but not installed — reef fetch {name}");
+                if let Some(p) = ambient {
+                    m.push_str(&format!(
+                        " (found in ambient PATH at {} but shadowed by project reef)",
+                        p.display()
+                    ));
+                }
+                (e.code_str(), m)
+            }
             None => (e.code_str(), e.msg.clone()),
         }
     } else {
@@ -289,4 +326,79 @@ fn reef_error_to_val(e: shoal_reef::ReefError, name: &str, chain: &ScopeChain) -
         out = out.with_hint(h);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shoal_reef::Resolver;
+    use shoal_reef::provider::SystemProvider;
+
+    /// A resolver whose only provider is a system provider rooted at a
+    /// nonexistent dir with NO ambient dirs — it can never find a candidate
+    /// for anything, no matter what the real `$PATH` holds. Mirrors
+    /// `crates/shoal-eval/tests/reef_integration.rs`'s own `fixture_resolver`
+    /// pattern, just deliberately empty instead of pointed at a fixture bin.
+    fn empty_fixture_resolver() -> Arc<Resolver> {
+        Arc::new(Resolver::new(vec![Box::new(SystemProvider::new(
+            vec![PathBuf::from("/nonexistent-shoal-reef-fixture-root-9f3a")],
+            vec![],
+        ))]))
+    }
+
+    /// Fix 5 (REEF.md §6's second did-you-mean bullet): a constrained tool
+    /// the fixture resolver can't find, but that a REAL ambient binary
+    /// answers to (here, `sh` — guaranteed present on any POSIX host, the
+    /// same assumption `crates/shoal-eval/tests/reef_integration.rs` and much
+    /// of this corpus already make), must name the shadowing in the spawn's
+    /// `reef_not_found` error — not just "not installed".
+    #[test]
+    fn spawn_not_found_names_ambient_shadow_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".reef.toml"), "[tools]\nsh = \"*\"\n").unwrap();
+        let mut ev = Evaluator::new(dir.path().to_path_buf());
+        ev.interactive = true; // reach resolve_fresh, not reef_unlocked
+        ev.set_reef_resolver(empty_fixture_resolver());
+
+        let err = ev
+            .eval_program(&shoal_syntax::parse("^sh").unwrap())
+            .expect_err("the empty fixture resolver offers no `sh` candidate");
+        assert_eq!(err.code, "reef_not_found");
+        assert!(
+            err.msg.contains("found in ambient PATH at"),
+            "expected the ambient-shadow hint, got {:?}",
+            err.msg
+        );
+        assert!(
+            err.msg.contains("shadowed by project reef"),
+            "expected the shadowed-by-reef phrasing, got {:?}",
+            err.msg
+        );
+    }
+
+    /// The hint must NOT appear when nothing — neither reef nor ambient PATH
+    /// — actually has the tool: a genuinely absent tool stays exactly
+    /// "constrained but not installed", no false-positive shadowing claim.
+    #[test]
+    fn spawn_not_found_omits_ambient_hint_when_truly_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".reef.toml"),
+            "[tools]\nghosttool-shoal-corpus-9f3a = \"*\"\n",
+        )
+        .unwrap();
+        let mut ev = Evaluator::new(dir.path().to_path_buf());
+        ev.interactive = true;
+        ev.set_reef_resolver(empty_fixture_resolver());
+
+        let err = ev
+            .eval_program(&shoal_syntax::parse("^ghosttool-shoal-corpus-9f3a").unwrap())
+            .expect_err("nothing anywhere provides this tool");
+        assert_eq!(err.code, "reef_not_found");
+        assert!(
+            !err.msg.contains("shadowed by project reef"),
+            "no real ambient hit exists; the hint must not fire, got {:?}",
+            err.msg
+        );
+    }
 }

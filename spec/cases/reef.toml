@@ -1,17 +1,28 @@
 # reef-adjacent conformance: docs/REEF.md's design contract touches `which`,
-# `env`, `cwd` — machinery shoal-eval already owns. Most of REEF.md's actual
-# surface (real resolved paths/hashes/providers, `.reef.toml` project-scope
-# walks, `reef`/`reef lock`/`reef doctor`) is host- and install-state-
-# dependent and/or not wired into shoal-eval yet (docs/REEF.md status:
-# "crate built+tested; eval integration landing this wave") — those are
-# `skip`ped below with a reason instead of asserted, per spec/README's rule
-# against environment-dependent expectations.
+# `reef`/`reef doctor`, `env`, `cwd` — machinery shoal-eval now owns end to
+# end. Most of REEF.md's surface is exercisable for real, host-independently,
+# by having each case write its OWN `.reef.toml`/`reef.lock` fixtures on the
+# fly (via `save(...)`) rather than depending on any real tool's install
+# state — the only real external dependency any case here takes is `sh`
+# (guaranteed present on any POSIX host, the same assumption `sh { … }`
+# blocks elsewhere in this corpus already make). What's left `skip`ped below
+# is genuinely host-inventory-dependent (a real `node`/mise install, an
+# actual system binary's on-disk hash) and would not be a fixed, reproducible
+# expectation across CI hosts, per spec/README's rule against
+# environment-dependent expectations.
 #
 # What IS deterministic and headless, and what the reef wave must not
 # regress, is asserted for real:
 #   - `which`'s arity contract and its *structural* record shape (REEF.md
 #     §6) for fields that don't depend on host tool inventory (`.name` only
-#     echoes the query — never the resolved path/hash/provider).
+#     echoes the query — never the resolved path/hash/provider), PLUS its
+#     `unresolved: <code>` surfacing of a real conflict/drift instead of a
+#     silently-swallowed ambient-PATH guess.
+#   - `reef` (the binding table) and `reef doctor` (drift/orphan/shadowed-
+#     ambient) against a manifest/lock the case writes itself.
+#   - project-scope `.reef.toml` walk-up from a subdirectory.
+#   - `run`'s bare-filename runner dispatch honoring the full runner table,
+#     not a separately hand-maintained extension list.
 #   - `cwd`/`env` purity: REEF.md §1 leans on "`cd` re-scopes the next
 #     resolution; nothing else changes" and TDD §4.6's restore-on-any-exit-
 #     path guarantee for `with cwd:`/`with env:` — reef's project-scope walk
@@ -41,6 +52,113 @@ name = "reef-which-arity-error"
 # form) regardless of which provider ends up answering it.
 src = 'which "a" "b"'
 error = "arg_error"
+
+[[case]]
+name = "reef-which-surfaces-conflict-not-ambient-fallback"
+# The audit's single most user-misleading finding: `which` used to swallow
+# EVERY resolver error and silently fall back to a bare ambient-PATH guess,
+# so a hard `reef_conflict` (two scopes constraining one tool incompatibly,
+# REEF.md §2) rendered exactly like an ordinary unconstrained lookup. Two
+# `.reef.toml` scopes conflicting is a pure manifest-chain decision — no
+# real tool install needed, so this is fully host-independent.
+src = '''
+save(".reef.toml", "[tools]\nfaketool = \"18\"\n")
+save("sub/.reef.toml", "[tools]\nfaketool = \"22\"\n")
+cd sub
+(which "faketool").scope
+'''
+fixture = ["sub/.keep"]
+value = '"unresolved: reef_conflict"'
+
+[[case]]
+name = "reef-which-surfaces-drift-not-ambient-fallback"
+# Same fix, a different resolver error: a valid-but-drifted lock entry
+# (hand-written, pointing at a fixture file whose bytes don't match the
+# recorded hash) short-circuits `resolve()` before any provider is ever
+# consulted, so this needs no real tool either.
+src = '''
+let root = pwd
+save(".reef.toml", "[tools]\nfaketool = \"*\"\n")
+save("fakebin", "original-bytes")
+save("reef.lock", "[tool.faketool]\nname = \"faketool\"\nversion = \"1.0.0\"\nprovider = \"mise\"\npath = \"{root}/fakebin\"\nblake3 = \"deadbeef\"\nresolved_at = \"2026-01-01T00:00:00Z\"\n")
+(which "faketool").scope
+'''
+value = '"unresolved: reef_drift"'
+
+[[case]]
+name = "reef-binding-table-lists-a-self-constrained-tool"
+# REEF.md §6: bare `reef` -> the binding table for every constrained tool.
+# Each conformance case gets its own fresh tempdir + Evaluator, so nothing
+# here is "whatever the host session happened to resolve" (the stale
+# reasoning this case used to carry, back when it was skipped) —
+# constraining `sh` makes the binding table fully self-contained.
+src = '''
+save(".reef.toml", "[tools]\nsh = \"*\"\n")
+(reef).first().scope
+'''
+value = '"reef"'
+
+[[case]]
+name = "reef-doctor-detects-drift-against-a-hand-written-lock"
+# REEF.md §2/§6: a lock entry's blake3 must match the on-disk binary; a
+# mismatch is drift, and `reef doctor` surfaces it per-tool. The lock entry
+# here is hand-written by the case itself (not a real system binary's lock),
+# so this is fully host-independent — the drift comes from a deliberately
+# wrong recorded hash against a fixture file this case also writes, not from
+# any real tool's install state.
+src = '''
+let root = pwd
+save(".reef.toml", "[tools]\nfaketool = \"*\"\n")
+save("fakebin", "some-content")
+save("reef.lock", "[tool.faketool]\nname = \"faketool\"\nversion = \"1.0.0\"\nprovider = \"mise\"\npath = \"{root}/fakebin\"\nblake3 = \"deadbeef\"\nresolved_at = \"2026-01-01T00:00:00Z\"\n")
+(reef doctor).first().status
+'''
+value = '"drift"'
+
+[[case]]
+name = "reef-doctor-detects-orphan-lock"
+# REEF.md §6: `reef doctor` flags orphan locks — a `reef.lock` entry no
+# manifest in scope mentions anymore (e.g. removed from `.reef.toml` after
+# being locked). Hand-written manifest/lock, so this needs no real tool
+# inventory.
+src = '''
+save(".reef.toml", "[tools]\nsh = \"*\"\n")
+save("reef.lock", "[tool.ghosttool]\nname = \"ghosttool\"\nversion = \"1.0.0\"\nprovider = \"mise\"\npath = \"/nonexistent/ghosttool\"\nblake3 = \"deadbeef\"\nresolved_at = \"2026-01-01T00:00:00Z\"\n")
+(reef doctor).where(.check == "orphan").first().name
+'''
+value = '"ghosttool"'
+
+[[case]]
+name = "reef-doctor-detects-shadowed-ambient"
+# REEF.md §6's third bullet: a constrained, locked name that ALSO resolves,
+# to a DIFFERENT binary, via plain ambient PATH. `sh` is locked to a fixture
+# file here; the REAL ambient `sh` (guaranteed present, same assumption the
+# rest of this corpus already makes) is a different path, so it's flagged
+# as shadowed.
+src = '''
+let root = pwd
+save(".reef.toml", "[tools]\nsh = \"*\"\n")
+save("fake-sh", "not a real shell")
+save("reef.lock", "[tool.sh]\nname = \"sh\"\nversion = \"1.0.0\"\nprovider = \"mise\"\npath = \"{root}/fake-sh\"\nblake3 = \"deadbeef\"\nresolved_at = \"2026-01-01T00:00:00Z\"\n")
+(reef doctor).where(.check == "shadowed_ambient").first().name
+'''
+value = '"sh"'
+
+[[case]]
+name = "reef-run-bare-filename-honors-full-runner-table"
+# script.rs's `run_poly` scripty gate used to hardcode `{shl,sh,py,js,rs}` —
+# a bare `run x.rb` (no `./`) misrouted to command-not-found even though
+# `RunnerTable::defaults()` has known this extension all along, and
+# `run ./x.rb` (a path literal) resolved the SAME file correctly. Remapping
+# `rb` to `sh` in this fixture's own manifest keeps the assertion
+# host-independent (no real ruby install needed) — the point is proving the
+# bare name reached the runner machinery, not that ruby is present.
+src = '''
+save(".reef.toml", "[tools]\nplaceholder = \"*\"\n\n[runners]\nrb = \"sh\"\n")
+save("x.rb", "echo bare-rb-ran")
+run("x.rb").out
+'''
+value = '"bare-rb-ran"'
 
 [[case]]
 name = "reef-cwd-restores-after-with-block"
@@ -110,16 +228,12 @@ value = "true"
 name = "reef-which-full-chain-is-host-dependent"
 # REEF.md §6's full record (`scope`, `version`, `path`, `hash`, `provider`,
 # `chain`) reflects a real host's tool inventory (mise installs, system
-# PATH, etc.) — not reproducible across CI hosts.
+# PATH, etc.) — not reproducible across CI hosts. (Unlike the
+# conflict/drift `which` cases above, which construct their own resolver
+# error out of hand-written fixtures, `node` here is a real, arbitrary
+# language runtime whose presence/version this corpus cannot control.)
 src = 'which "node"'
 skip = "which's resolved path/hash8/provider/chain for a real tool depend on the host's tool inventory (mise installs, system PATH) — not reproducible across CI hosts"
-
-[[case]]
-name = "reef-binding-table-is-host-dependent"
-# REEF.md §6: bare `reef` -> the current binding table (name, constraint,
-# version, hash8, provider, scope) for every tool the session has resolved.
-src = "reef"
-skip = "the reef binding table enumerates whatever tools the host session has actually resolved — inherently host-inventory-dependent, not a fixed corpus expectation"
 
 [[case]]
 name = "reef-with-reef-dynamic-scope-parses-and-evals"
@@ -152,20 +266,16 @@ src = "with reef: {\"shoal-reef-fake-tool-9f3a\": \"1\"} { }\n^shoal-reef-fake-t
 error = "not_found"
 
 [[case]]
-name = "reef-project-scope-reef-toml-walk-not-wired"
+name = "reef-project-scope-reef-toml-walk-up-is-wired"
 # REEF.md §1: nearest `.reef.toml` walking up from cwd, a pure function of
-# (cwd, manifest files) with no activation/hooks/env mutation. Exercising
-# this for real needs actual provider binaries and a real manifest walk
-# outcome on-disk, which shoal-eval doesn't perform yet (reef crate is
-# built+tested per docs/REEF.md's status banner; eval integration is
-# landing this wave, not necessarily finished by the time this corpus runs).
-src = 'cd sub\nwhich "rg"'
-skip = "nearest-.reef.toml project-scope resolution needs a real provider inventory and manifest walk; not wired into shoal-eval's which/resolution path as a corpus-checkable behavior yet"
-
-[[case]]
-name = "reef-lock-drift-detection-is-host-dependent"
-# REEF.md §2: `reef.lock` records a blake3 of the resolved binary; a
-# mismatch against the lock at spawn is `reef_drift`. Detecting drift for
-# real requires a real on-disk binary whose hash varies by host/install.
-src = "reef lock --refresh"
-skip = "blake3 drift detection against a real on-disk binary is host- and install-state-dependent (REEF.md S2); not a fixed, reproducible corpus expectation"
+# (cwd, manifest files) with no activation/hooks/env mutation. `sh`
+# constrained at the root is discovered from a subdirectory — proof the
+# walk-up itself (not just same-directory discovery) is wired, without
+# depending on any tool inventory beyond `sh`.
+src = '''
+save(".reef.toml", "[tools]\nsh = \"*\"\n")
+cd sub
+(which "sh").scope
+'''
+fixture = ["sub/.keep"]
+value = '"reef"'

@@ -120,7 +120,20 @@ impl Evaluator {
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
-        let scripty = matches!(ext.as_deref(), Some("shl" | "sh" | "py" | "js" | "rs"));
+        // A bare filename (no path separator) is still scripty when its
+        // extension is one the runner machinery actually knows (IO.md §3.1's
+        // "plain filename in cwd" ergonomics case) — sourced from the SAME
+        // `RunnerTable` `run_script_file`/reef itself consult (shipped
+        // defaults `py js ts sh shl rb lua`, plus any in-scope manifest's
+        // `[runners]` overlay), never a separately hand-maintained list that
+        // can drift from runner.rs again (REEF.md §5). `rs` is special-cased:
+        // it intentionally has no default runner-table entry (compile-vs-
+        // script ambiguity, REEF.md §5) but IS handled by `run_script_file`'s
+        // own rustc/rust-script fallback, so it stays scripty for symmetry
+        // with the `./x.rs` path form.
+        let scripty = ext.as_deref().is_some_and(|e| {
+            e == "rs" || self.reef_chain_snapshot().runner_table().get(e).is_some()
+        });
         if is_path || (scripty && resolved.exists()) {
             return self.run_script_file(&resolved, ext.as_deref(), args, position);
         }
@@ -312,5 +325,54 @@ impl Evaluator {
             argv.push(self.argv_value(v)?);
         }
         self.run_argv(argv, position, StdinSpec::Null, &[], Span::default(), None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Fix 3: `run_poly`'s scripty gate used to hardcode `{shl,sh,py,js,rs}`,
+    /// so a BARE filename (no `./`) with any other shipped-default extension
+    /// (`ts`/`rb`/`lua`) misrouted to a literal-command-name lookup instead of
+    /// the runner machinery — even though `RunnerTable::defaults()` has known
+    /// this extension all along. Remapping `rb` to `sh` in this fixture's own
+    /// manifest keeps the assertion host-independent (no real ruby install
+    /// needed): the point is proving the bare name reached the runner
+    /// dispatch at all, not that any particular interpreter is present.
+    #[test]
+    fn bare_filename_scripty_gate_honors_full_runner_table() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".reef.toml"),
+            "[tools]\nplaceholder = \"*\"\n\n[runners]\nrb = \"sh\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("x.rb"), b"echo bare-rb-ran\n").unwrap();
+
+        let mut ev = Evaluator::new(dir.path().to_path_buf());
+        let out = ev
+            .eval_program(&shoal_syntax::parse(r#"run("x.rb").out"#).unwrap())
+            .expect("bare `x.rb` should route through the runner table, not command lookup");
+        assert_eq!(out, Value::Str("bare-rb-ran".into()));
+    }
+
+    /// Before the fix, the SAME bare filename with no manifest in scope (so
+    /// `chain.runner_table()` is unreachable and only the `"rs"` special-case
+    /// applies) must still resolve — a regression guard for the refactor,
+    /// not new behavior. `rustc` is guaranteed present (this test binary was
+    /// built with it), so a trivial program actually compiles and runs.
+    #[test]
+    fn rs_stays_scripty_as_a_bare_filename_with_no_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("x.rs"), b"fn main() {}\n").unwrap();
+        let mut ev = Evaluator::new(dir.path().to_path_buf());
+        let out = ev
+            .eval_program(&shoal_syntax::parse(r#"run("x.rs")"#).unwrap())
+            .expect("bare `x.rs` should compile and run via rustc, not misroute to command lookup");
+        let Value::Outcome(o) = out else {
+            panic!("expected an outcome, got {out:?}")
+        };
+        assert!(o.ok, "the compiled no-op binary should exit 0");
     }
 }
