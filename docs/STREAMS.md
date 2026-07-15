@@ -1,10 +1,19 @@
 # Reactive values: sources, combinators, sinks; the honest `tail -f`
 
-**Status:** substantially implemented. Working: `channel(name)` with `.emit`/`.events()`/`.latest()`;
-`every(dur)`; stream pipelines (`.map`, `.scan(init, f)`, `.take(n)`, `.collect()`); the
-`stream_unbounded` guard on collecting an unbounded stream; `watch(...)`/`tail(...)`. Verify a
-specific combinator (`.debounce`/`.throttle`/`.window`/`.merge`/`.buffer`/`.dedupe`/`.distinct`) or
-sink (`.into(channel)`, `on channel(...) { }`) against source before relying on it.
+**Status:** implemented, including the hardening pass this spec's backpressure language demands.
+Working: `channel(name)` with `.emit`/`.events()`/`.latest()`/`.take()`; `watch`/`tail`/`every`;
+stream pipelines (`.where`, `.map`, `.scan(init, f)`, `.window`, `.debounce`, `.throttle`,
+`.dedupe`/`.distinct`, `.merge`, `.zip`, `.take`/`.take_until`, `.buffer`, `.flat_map`); the
+`stream_unbounded` guard on collecting an unbounded stream; `.tee(n)` forking a **live** stream with
+bounded per-fork queues (not just a static-collection tee); `.tap`/`.also` (run a side effect,
+return the receiver unchanged). Every live source (`every`/`watch`/`tail`) uses bounded channels
+with coalesced-summary overflow — not unbounded buffering — matching §1/§2's backpressure
+requirement exactly, not just approximately. The in-language `channel()` substrate is also bridged
+to the kernel's wire `EventBus` (`user.*`-scoped both directions) — see `docs/AGENT-SURFACE.md` §7
+and `docs/ROADMAP.md` — so a language-level emit and a wire `events.publish` are genuinely the same
+substrate, not two systems that happen to agree. Verify any specific combinator/sink against source
+before relying on it in a security- or correctness-sensitive path; this status line describes
+what's shipped, not a guarantee against a narrow regression.
 
 **Normative. The corpus/frame decides disputes.** Companion to `docs/TDD.md` (esp. §1.9, §4.5,
 §4.7, §13.7), `docs/VISION.md` §2, `docs/AGENT-SURFACE.md` §4–7, `docs/REEF.md`; supersedes them

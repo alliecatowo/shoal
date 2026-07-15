@@ -42,9 +42,9 @@ sort, and reshape without ever parsing text. It is a shell built for the age whe
 several agents share one session.
 
 > **Status:** early and honest. The language, REPL, command runner, reef resolver, journal/CAS,
-> adapter catalog, capability engine, and kernel/MCP protocol are real and tested
-> (300+ conformance cases, green on Linux **and** macOS). It is not ready to be your login shell
-> yet — but it already *feels* like the thing. See [Status & roadmap](#status--roadmap).
+> adapter catalog, capability engine, reactive streams/channels, and kernel/MCP protocol are real
+> and tested (1,200+ conformance cases, green on Linux **and** macOS). It is not ready to be your
+> login shell yet — but it already *feels* like the thing. See [Status & roadmap](#status--roadmap).
 
 <details open>
 <summary><b>Why another shell?</b></summary>
@@ -216,8 +216,10 @@ global state. shoal deletes the fossil.
 - **Names resolve through scopes, not directories**: session fns → project `.reef.toml` → user →
   system → ambient (demoted to a labeled last resort). No hooks, no activation, no env mutation;
   `cd` just re‑scopes.
-- A **blake3 lockfile** chains resolution into the sandbox: name → version → content hash → grant.
-  Binary changed since you locked it? Hard error, both hashes named.
+- A **blake3 lockfile** records every resolved tool's content hash and re-checks it at every spawn:
+  binary changed since you locked it? Hard error, both hashes named (`reef_drift`). The full
+  name → version → hash → **leash grant** chain from the original design is not fully wired yet —
+  see [`docs/REEF.md`](docs/REEF.md) §2 for the precise, honest state of that gap.
 - **`which node`** returns the full resolution chain *as a value*. "Which node built this artifact
   three weeks ago" is a journal query.
 - mise is *interop, not a dependency* — a provider that reads its install tree directly, no shims.
@@ -234,11 +236,12 @@ See [`docs/REEF.md`](docs/REEF.md).
 <br>
 
 leash answers *may this run*; reef answers *what does this name denote*. Enforcement is evaluated on
-the **semantic call** (binary content hash, typed args, declared effects) and enforced by the
-strongest available OS mechanism — **Landlock + seccomp on Linux**, **Seatbelt on macOS** (real
-`sandbox_init`, not a stub) — with **honest tier reporting**: shoal never claims "enforced" when it
-isn't. `plan → inspect effects → apply`, journaled inverses, and content‑hash spawn pinning.
-See [`docs/TDD.md`](docs/TDD.md) §8.
+the **semantic call** (typed args, declared effects) and enforced by the strongest available OS
+mechanism — **Landlock + seccomp on Linux**, **Seatbelt on macOS** (real `sandbox_init`, not a
+stub) — with **honest tier reporting**: shoal never claims "enforced" when it isn't. `plan → inspect
+effects → apply` and journaled inverses are real today. Binary-content-hash spawn pinning (policy
+naming a reef-locked hash and leash enforcing against it) is designed but **not yet wired** — see
+[`docs/REEF.md`](docs/REEF.md) §2 for the exact gap. See [`docs/TDD.md`](docs/TDD.md) §8.
 
 </details>
 
@@ -296,29 +299,43 @@ Adapters wrap the entire existing ecosystem into shoal's typed world — no boil
 
 - The full language: literals + typed units, strings/interpolation, the coercion matrix, control
   flow, functions‑as‑commands, lambdas + implicit `.field` forms, dot‑chain composition, `match`
-  with every pattern kind, `try`/`catch`, and the teaching diagnostics — **330+ conformance cases,
-  green on Linux and macOS.**
+  with every pattern kind, `try`/`catch`, and the teaching diagnostics — **1,200+ conformance
+  cases, green on Linux and macOS.**
 - Interactive REPL: PTY passthrough, tab completion, syntax highlighting, `it`/`out[n]`, Ctrl‑C that
   cancels the job (not the shell), and the fast `shoal-prompt`.
 - **Interpreter blocks** (`python { … }.out` → structured data — heredocs, gone) and **`.feed`**
   values‑as‑stdin (`"b\na".feed(sort)`), which compose.
+- **Reactive streams and in‑language channels** — `watch`/`tail`/`every`/`channel()` composed with
+  the same `.where`/`.map`/`.debounce`/`.take` vocabulary as any collection, bounded backpressure
+  throughout, and a `channel()` that round‑trips onto the kernel's wire event bus so a human's
+  session and its agents can signal each other structurally.
+- Data namespaces and the remaining builtins: `json`/`yaml`/`toml`/`csv`, `math`, `http`, `os`,
+  `config`; modules (`use ./lib/x`); `plan { … }` / `undo out[n]`.
 - **leash enforcement is live** — the spawn path applies Landlock (Linux) / Seatbelt (macOS) from a
   scoped policy, with proven denial and honest tier reporting.
-- reef resolution (`which`‑chain, `with reef:`, lockfile), the SQLite journal + CAS, **23 adapters**,
-  and the **agent surface**: kernel JSON‑RPC + MCP facade with automatic elision, `resources/*`,
-  events/channels, and an installable **Claude Code plugin** in [`plugin/`](plugin/).
+- reef resolution (`which`‑chain, `with reef:`, lockfile, live project‑scope `.reef.toml` walking),
+  the SQLite journal + CAS, **35 adapters**, and the **agent surface**: kernel JSON‑RPC + MCP
+  facade with automatic elision, `resources/*`, events/channels, and an installable **Claude Code
+  plugin** in [`plugin/`](plugin/).
 
 </details>
 
 <details>
-<summary><b>In active construction</b></summary>
+<summary><b>In active construction / honestly still open</b></summary>
 
 <br>
 
-- Journal‑backed `undo` and the `journal`/`history` view over the eval path (landing).
-- The reactive streams subsystem (`watch` / `tail` / `every` + combinators) and the in‑language
-  `channel()` binding on top of the kernel's event bus.
-- The remaining structured builtins and data namespaces (`math` / `json.parse` / codecs / `http`).
+- Binary‑content‑hash **spawn pinning** — the reef lock records and re‑checks a tool's blake3 hash,
+  but leash's policy‑time `proc_spawn` effect does not yet consult it (the hash is always empty on
+  the real spawn path today). See [`docs/REEF.md`](docs/REEF.md) §2 for the exact, corrected state.
+- The bare‑path "just type the filename" runner ergonomics (`./script.py`) work for `.shl`; other
+  extensions currently need the explicit `run script.py` spelling.
+- A builtin‑registry/command‑resolution unification (collapsing three hardcoded sources of builtin
+  identity into one), `jump`/`j` frecency `cd`, an `Outcome`'s wire `span` (always `None` today),
+  and `shoal_cap_request`'s grant response always reporting `enforced: false` regardless of the real
+  backend — see [`docs/ROADMAP.md`](docs/ROADMAP.md)'s open‑items list for the complete, current
+  punch list.
+- Config hardening (`shoal-config`) and Windows support are in flight / deferred, respectively.
 
 Honest gaps are tracked in the code and design docs — nothing here is vaporware‑by‑omission.
 
@@ -329,19 +346,23 @@ Honest gaps are tracked in the code and design docs — nothing here is vaporwar
 ## Building & testing
 
 ```sh
-cargo test --workspace --all-targets            # unit + integration + the conformance corpus
-cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
+cargo +stable clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked                              # unit + integration + the conformance corpus
 ```
 
-The normative language corpus lives in [`spec/cases`](spec/cases) — it *is* the spec; a wrong case
-is a bug in the case. CI runs the whole matrix on Linux and macOS on every push.
+The normative language corpus lives in [`spec/cases`](spec/cases) (1,218 cases across 74 files as of
+this writing) — it *is* the spec; a wrong case is a bug in the case. Isolate just the corpus with
+`cargo test -p shoal --test conformance --locked -- --nocapture`. CI runs the full matrix (build,
+test, conformance, `fmt`, `clippy`, release build) on Linux **and** macOS on every push — see
+[`CLAUDE.md`](CLAUDE.md) for the exact pre-commit gate this project holds itself to.
 
 <details>
 <summary><b>Design docs & further reading</b></summary>
 
 <br>
 
+- [`CLAUDE.md`](CLAUDE.md) — the operating manual for anyone (human or agent) working on shoal itself
 - [`docs/VISION.md`](docs/VISION.md) — the north‑star frame (the typed value graph; one kernel, three surfaces)
 - [`docs/TDD.md`](docs/TDD.md) — the language & semantics contract
 - [`docs/REEF.md`](docs/REEF.md) — tool resolution
@@ -349,6 +370,7 @@ is a bug in the case. CI runs the whole matrix on Linux and macOS on every push.
 - [`docs/STREAMS.md`](docs/STREAMS.md) — the reactive model
 - [`docs/AGENT-SURFACE.md`](docs/AGENT-SURFACE.md) — the agent wire contract
 - [`docs/CONTRACTS.md`](docs/CONTRACTS.md) — inter‑crate APIs & error codes
+- [`docs/ROADMAP.md`](docs/ROADMAP.md) — what's shipped, what's genuinely still open, and why
 - The [**project wiki**](https://github.com/alliecatowo/shoal/wiki) — narrative guides to the language, reef, agent surface, and security
 
 </details>

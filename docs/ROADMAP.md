@@ -2,7 +2,7 @@
 
 **Purpose.** A fire-and-forget plan: every unbuilt piece, sequenced into waves that respect the one
 hard constraint (below), each with a *locked* design decision so implementation is mechanical, an
-ownership partition that avoids collisions, and acceptance criteria. A future session (or the
+ownership partition that avoids collisions, and acceptance criteria. A future session (or an
 autonomous `continue` loop) can execute any wave from this doc with zero re-discovery.
 
 **The one hard constraint.** `crates/shoal-eval` is the collision bottleneck — almost every feature
@@ -10,7 +10,7 @@ routes through it. **At most one agent edits `shoal-eval` per wave.** Eval-heavy
 serializes; non-eval work parallelizes alongside it.
 
 **Every wave ends the same way** (the pinned loop): `cargo fmt --all --check` + `cargo +stable
-clippy --workspace --all-targets --locked -- -D warnings` + `cargo test --workspace` green,
+clippy --workspace --all-targets --locked -- -D warnings` + `cargo test --workspace --locked` green,
 conformance not regressed, then a signed commit (`Co-Authored-By` trailer) → `git push` →
 `gh run watch` until all 6 CI jobs (incl. `test (macos-latest)`) are green; fix any macOS-only test
 failure test-side (canonicalize temp paths for the `/tmp`→`/private/tmp` alias; gate genuinely
@@ -18,284 +18,261 @@ Linux-only behavior) and re-push. macOS is first-class: never a stub, never sile
 
 ---
 
-## Status snapshot (on `main`, CI-green Linux+macOS, ~342 conformance cases)
+## Status snapshot (verified against source + the live binary at time of writing)
 
-Done: full language + dispatch + match; outcome unification; reef resolution + `which`/`with reef:`;
-agent surface (elision, `resources/*`, events/channels/subscriptions, MCP tools) + Claude plugin;
-leash enforcement **active** (Landlock/Seatbelt, honest tier, proven denial); `shoal-prompt`
-(~8µs); 23 adapters; interpreter blocks (`python { }.out`→structured) + `.feed`; journal-in-eval +
-`undo` + `journal`/`history`; README+logo+demo; GPG-signed Verified history.
+**Corpus**: 1,218 `[[case]]` entries across 74 files in `spec/cases/` — 1,211 passed, 0 failed, 7
+skipped (all host-dependent: a real tool's resolved hash/version, a live PATH-inventory-dependent
+binding table). Well past the TDD §12 target of ≥1,000.
 
-Not yet built — the subject of this roadmap.
+**Waves R0–R3 are DONE** (see per-wave notes below for exactly what shipped and how it was
+verified). **Wave R4 is mostly done** (hexagonal ports shipped; the big file splits landed; the
+builtin-registry/`resolve.rs` unification has not). **Wave R5 is in continuous progress** (corpus
+target already exceeded; wiki kept current; most small carryovers landed, a few remain — see below).
 
----
+Broad "done" list, each independently verified against the binary or a targeted grep while writing
+this revision (don't take this list on faith either — it's a snapshot, re-verify anything
+load-bearing):
 
-## Wave R0 — Interactive ergonomics (do FIRST · eval+bin · S)
-
-Two dealbreakers in the interactive REPL, both with a locked root cause. Fix before anything else.
-
-**Bug 1 — statement-position builtins don't print.** `echo hello` / `ls` at the prompt render
-nothing until you pull `.out`. Root cause: `crates/shoal/src/main.rs:511` calls
-`render_result(&value, true)` unconditionally, and `render_result` (`main.rs:562`) skips rendering
-*any* `Value::Outcome` when `pty_was_live` — on the assumption the PTY already streamed it. True for
-**external** commands in statement position (real PTY passthrough — output is already on screen),
-**false for builtins** (echo/ls/cat/etc.) and any Capture-mode outcome, which stream nothing and so
-render nothing.
-**Locked fix.** An outcome must know whether its bytes actually went to the terminal. Add
-`OutcomeVal.streamed: bool` (default `false`; set `true` *only* in the `ExecMode::PtyTee` spawn path
-in `shoal-eval`, where bytes hit the real tty). Change `render_result` to skip re-rendering only
-when `matches!(value, Value::Outcome(o)) && o.streamed`. Then builtins and captured outcomes render
-their `.out`/stdout as they should; PtyTee externals still don't double-print. (Note: `render_block`'s
-Outcome arm already returns the `.out` string correctly — the value never reached it.) Add a REPL
-test (drive a PTY: `echo hello` prints `hello` immediately) and confirm an external like
-`ls --color=auto` still shows once, not twice.
-
-**Bug 2 — no `exit`.** Only Ctrl-D quits. Add an `exit [code: int = 0]` builtin (alias `quit`):
-in the REPL it ends the loop cleanly (mirror the Ctrl-D path); in a script / `-c` it exits the
-process with `code`. Register `exit`/`quit` as command heads. Cleanest wiring: the builtin returns a
-distinct `Flow::Exit(code)` (or sets an evaluator exit flag) that `eval_program`/the REPL loop
-detects and honors — do not `std::process::exit` from inside eval (breaks the kernel/embedded host);
-surface it as a value the host acts on.
-
-**Ownership.** P1 (Opus): `crates/shoal-eval` (the `streamed` flag on the PtyTee path, `exit`
-builtin/Flow) + `crates/shoal-value` (`OutcomeVal.streamed` field) + `crates/shoal/src/main.rs`
-(render_result condition, honor exit). Verify: the two PTY repros above + zero regression (336/0/6).
-This is small and unblocks the daily-driver feel — ship it first.
-
----
-
-## Wave R1 — Reactive streams + in-language `channel()`  [eval-heavy · L/XL]
-
-**Goal.** Make STREAMS.md real: time-varying data as first-class streams composed with the same
-dot-chain combinators as collections. The honest replacement for `tail -f | grep` and file-watch
-coordination. Contract: `docs/STREAMS.md` (read it — it's the normative spec).
-
-**Locked decisions.**
-- **Everything time-varying is a channel.** This is the unification (per Allie): there is ONE
-  substrate — event-streams — and sources differ only in *who populates them*. `channel(name)` is
-  **user-populated** (`.emit`); `watch`/`tail`/`every`/process-stdout/journal are **system-populated**
-  channels the kernel feeds from OS file events, timers, pipes. All are consumed by the *same* stream
-  combinators. `tail`/`watch` are therefore ergonomic *constructors for system channels*, not
-  file-polling hacks — the anti-pattern being killed is **coordination by watching files**
-  (lockfiles, sentinels, `tail`-a-file-to-know-another-process-finished): that is *always* a channel,
-  never a file. Following a genuinely external log you don't control is the legitimate residue, and
-  it rides the same substrate (event-driven via `notify`, not polling).
-- `Value::Stream` already exists as a single-consumption pull iterator (TDD §1.9). Extend it, do not
-  replace it. A stream is a consumer of a channel (system- or user-populated); combinators are lazy
-  adapters over the iterator; single-consumption is enforced by `StreamVal::take` (already present).
-- **Sources** (all yield a `stream<T>` over a channel): `watch(path | glob)` → `stream<{path, kind}>`
-  via the `notify` crate (inotify/kqueue — cross-platform, mac first-class); `tail(file,
-  from_start: bool=false)` → `stream<str>` (follows external log appends, event-driven); `every(dur)`
-  → `stream<datetime>` timer ticks; `channel(name).events()` → `stream<event>`; a command's streaming
-  stdout in value position (the `spawn_capture` path already streams — wrap it as `stream<str>` of
-  lines). Prefer `channel()` for any coordination; reserve `watch`/`tail` for external files.
-- **Combinators** (methods on `stream`, all lazy + bounded-memory unless noted): `.where .map
-  .scan(init, f) .window(n | duration) .debounce(dur) .throttle(dur) .dedupe .distinct .merge(other)
-  .zip(other) .take(n) .take_until(pred | stream) .buffer(n) .flat_map`. `.window`/`.buffer` are the
-  only bounded-buffer ones; document memory for each.
-- **Sinks** (terminate a stream): live render (REPL shows a live-updating view), `.each(f)`,
-  `.collect()` (finite only — infinite errors, needs `.take`), `.into(channel(name))` (republish as
-  events → agents subscribe), `.save(path)` (append mode for live), `.feed(cmd)`.
-- **in-language `channel()`** — the kernel EventBus substrate already exists (`events.publish/
-  subscribe/read` landed in the agent-surface wave). Wire the eval binding to it:
-  `channel("x").emit(v)` → kernel publish on `user.x`; `.events()` → subscribe stream; `.latest()`
-  → last value or null (no wait); `.take()` (with `timeout: duration`) → block for next; and the
-  sugar `on channel("x") { ev => … }` → `channel("x").events().each(...)` in a spawned task.
-- Backpressure & cancellation reference TDD §4.5/§4.7 and the SIGPIPE-analog §13.7 — a satisfied
-  `.take(10)` closes the pipe upstream; downstream cancel propagates.
-
-**Ownership.** P1 (Opus): `crates/shoal-eval` + `crates/shoal-value` (stream methods) + a new
-`notify` dependency on shoal-eval for `watch`. P2 (Sonnet, parallel non-collide): the streams
-conformance/spec cases in `spec/cases/streams.toml` (deterministic ones — `every`/`watch` are
-timing-dependent → unit-test in eval, keep corpus host-safe) + a wiki page. Verify (Opus): live
-repros — `tail(f).where(.contains("ERROR")).each(render)`, `watch("src/**/*.rs").debounce(200ms)`,
-`channel("x").emit(1)` then `channel("x").latest()`.
-
-**Acceptance.** `tail`/`watch`/`every`/`channel` sources exist and compose with ≥10 combinators;
-live sinks work; in-language channels roundtrip through the kernel EventBus; single-consumption
-enforced; zero regression; macOS `watch` uses kqueue and is CI-green.
+- Full language + dispatch + `match`; outcome unification; the R0 REPL fixes (`OutcomeVal.streamed`
+  so statement-position builtins render; `exit`/`quit` via a host-level exit flag, not
+  `std::process::exit`).
+- reef resolution end-to-end, including **project-scope `.reef.toml` walking as the live resolution
+  path** (verified: a `.reef.toml` with `[tools] sh = "*"` in a scratch dir changes `which sh`'s
+  reported scope/chain to `"reef"` — this was still "landing" as of the previous ROADMAP revision
+  and is not anymore), `which`/`with reef:`, the lockfile.
+- Hexagonal ports (`Fs`/`Clock`/`Opener`/`SecretPort` in `shoal-value/src/ports.rs`, `Exec` in
+  `shoal-eval/src/ports.rs`) — see `docs/CONTRACTS.md` §8. `shoal-eval`'s internals are split across
+  ~24 files (one `impl Evaluator` block per file), `shoal-kernel`'s dispatch is split into
+  `handlers_*.rs`, similarly for `shoal-value`/`shoal-leash` — the "god file" cleanup from R4 landed
+  in the `refactor: modularize kernel/value/leash/eval` commit.
+- Reactive streams + in-language `channel()` (R1): sources (`watch`/`tail`/`every`/
+  `channel().events()`/`.stream()`), ≥10 combinators, live sinks, bounded/coalescing backpressure on
+  every live source (a later hardening pass fixed `every`/`watch`/`tail` from unbounded to bounded
+  `sync_channel`s), `.tee(n)` forking a **live** stream with bounded per-fork queues, `.tap`/`.also`.
+- **The language-channel ↔ kernel-bus bridge** (the gap the previous ROADMAP/AGENT-SURFACE revision
+  flagged as the last pair-shelling blocker): `channel("x").emit(v)` inside evaluated source now
+  round-trips onto the kernel's wire `EventBus` and back, `user.*`-scoped only (kernel-owned
+  channels like `journal`/`approval`/`session.transcript` can't be spoofed from language code) —
+  landed in `feat: bridge in-language channels to the kernel wire bus (one substrate)`, proven by a
+  real end-to-end test in `crates/shoal-mcp/tests/live_kernel.rs`.
+- Data namespaces + remaining builtins (R2): `json`/`yaml`/`toml`/`csv` (`.parse`/`.stringify`),
+  `math`, `http` (get/post/put/delete), `os`, `config`; `tail`/`head`/`ln`/`explain` builtins.
+  **Not done**: `jump`/`j` (frecency-ranked `cd`) — no such builtin exists yet.
+- Modules, task lifecycle, plan/apply, undo `out[n]` (R3): `use ./lib/x` (+ `as` alias, `export`)
+  binds a module's exports and its `fn`s run as commands (verified live); `task.suspend()`/
+  `.resume()` are wired for evaluator-owned processes (kernel-spawned/non-evaluator processes return
+  an honest "unavailable" error rather than a silent no-op — this is intentional honesty, not a bug,
+  see §"still open" below for the narrower remaining gap); `plan { … }` / `plan <stmt>` derives and
+  renders an effect plan without spawning (verified live); `undo out[n]` resolves via a REPL-side
+  `out[n] → journal entry id` rewrite (`crates/shoal/src/repl.rs`, `resolve_out_undo`).
+- Agent surface: elision (wire-level, automatic), `resources/list|read|subscribe|unsubscribe`
+  dispatched, `events.subscribe`/MCP resource push wired, real (non-hardcoded) plan `reversibility`
+  derived from effects, seven MCP tools including `shoal_cancel`, the Claude Code plugin.
+- leash **filesystem** enforcement active for direct spawns (Landlock/seccomp on Linux, Seatbelt on
+  macOS — real `sandbox_init`, not a stub), honest tier reporting at `session.attach`
+  (`caps_enforced` reflects whether a real backend actually confined the call). **Not yet wired**:
+  spawn-*identity* pinning (a policy's `proc_spawn = ["<hash>"]` against reef's locked hash) — see
+  open item #1 below, this is a real, specific, currently-unenforced gap, not enforcement in
+  general being fake.
+- `shoal-prompt` (~8µs render), **35 adapters** shipped under `adapters/` (git, cargo, rg, docker,
+  kubectl, jq, curl, tar, fd, du, npm, pnpm, bun, deno, node, python, pip, ruby, go, rustup,
+  terraform, helm, gcloud, aws, gh, jj, sqlite3, systemctl, systemd-analyze, ip, ss, df, ps, bash,
+  brew), journal-in-eval + `undo` + `journal`/`history`, README+logo+demo, GPG-signed commit history.
 
 ---
 
-## Wave R2 — Data namespaces + remaining structured builtins  [eval-heavy · L]
+## Wave R0 — Interactive ergonomics — **DONE**
 
-**Goal.** Make TDD §5's namespaces first-class values and finish the structured builtins. Mini-spec
-below (this piece was under-specified — treat this as the contract).
+Both dealbreakers fixed and verified live: `OutcomeVal.streamed: bool` (set only on the real
+`PtyTee` spawn path) means `render_result` only skips re-rendering an outcome that actually already
+hit the terminal — builtins (`echo hello`, `ls`, `cat`) render correctly now, external PTY commands
+still don't double-print. `exit [code: int = 0]` / `quit` are registered command heads that set a
+host-level exit flag (`Flow`) rather than calling `std::process::exit` from inside eval, so the same
+code path works identically in the REPL, a script, or an embedded kernel session.
 
-**Locked decisions — namespaces** (each is a value in the root env exposing methods/fns):
-- `json` — `json.parse(str) -> value` (decode; error `arg_error` on invalid), `json.stringify(value,
-  pretty: bool=false) -> str` (encode; the existing `.json` method delegates here). Round-trips via
-  the existing `json_to_value`/`value_to_json`.
-- `yaml` / `toml` / `csv` — `.parse(str) -> value` and `.stringify(value) -> str`. yaml via
-  `serde_yaml` (or `serde_norway`), toml via `toml`, csv via `csv` (headers → `table`). Decoders are
-  the priority (encoders exist partially).
-- `math` — `math.pi math.e`, `math.sqrt/sin/cos/tan/ln/log10/log2/exp/floor/ceil/round/abs/pow(x,y)/
-  min(a,b)/max(a,b)/hypot`, `math.clamp(x, lo, hi)`. Pure `f64`.
-- `http` — `http.get(url, headers: record?) -> outcome-like {status: int, ok: bool, body: str,
-  json(): value, headers: record}`; `http.post(url, body: value|str, headers?)`; PUT/DELETE. Typed
-  responses; `body.json()` parses. Deps: `ureq` (blocking, small) or `reqwest` blocking. Declares
-  `net.connect(host)` effects for leash. Timeouts + a size cap.
-- `os` — `os.platform() os.arch() os.hostname() os.username() os.pid() os.env() (-> record of the
-  session env names→values, secrets as names) os.cpus() os.uptime()`.
-- `config` — a typed view over `shoal.toml` (read); `history` is an alias for the `journal` table
-  view (already built).
-
-**Locked decisions — remaining §5 builtins** (structured, not raw passthrough): `tail(file, n:
-int=10, follow: bool=false)` (follow → a `stream<str>`, ties into R1), `head(file, n: int=10) ->
-list<str>`, `ln(target, link, symbolic: bool=false)`, `watch(cmd, interval: duration=2s)` (re-run a
-command on a timer, live-render diffs — or defer to R1's `every`), `jump`/`j` (frecency-ranked cd —
-needs a small frecency store in the journal/state dir), `explain(src)` → a structured explanation of
-what a statement will do (reuse the kernel `explain` method's logic). `pick`/`interact`/`open`
-already exist.
-
-**Ownership.** P1 (Opus): `crates/shoal-eval` (namespace registration + builtins) + `shoal-value`
-(namespace value type if needed) + new deps (`ureq`/`serde_yaml`/`csv`). P2 (Sonnet): `spec/cases`
-for the pure ones (json/yaml/toml/csv/math are deterministic → lots of corpus cases; http/os are
-environment-dependent → skip/gate). Verify (Sonnet).
-
-**Acceptance.** `json.parse('{"a":1}').a == 1`; `math.sqrt(2)`; `yaml.parse`/`toml.parse`/`csv.parse`
-round-trip; `http.get(url).status` typed (gated in CI); `os.platform()` correct on both OSes;
-`tail`/`head`/`ln` structured; corpus grows by ≥40 deterministic cases.
+Verify: `echo hello | head` at an interactive prompt prints `hello` immediately (no need to pull
+`.out`); `target-*/debug/shoal -c 'exit 0'` exits 0 without a stack of panics.
 
 ---
 
-## Wave R3 — Modules (`use`) + task lifecycle + plan/apply + undo `out[n]`  [eval-heavy · M]
+## Wave R1 — Reactive streams + in-language `channel()` — **DONE**
 
-**Goal.** Close the remaining language/session gaps. Mini-specs below.
-
-**Locked decisions — modules (`use`)** (TDD §4.6 says "modules are files"; currently errors "not
-implemented"):
-- `use ./lib/deploy` loads the file `./lib/deploy.shl` (resolve against cwd; `.shl` optional),
-  evaluates it in a fresh module scope, and binds its `export`ed decls under `deploy.` (the file
-  stem). `use ./lib/deploy as d` binds under `d.`. `export fn`/`export let`/`export alias` mark a
-  decl public; non-exported decls are module-private.
-- Caching: a module evaluates once per session (memoized by canonical path); circular `use` is an
-  error naming the cycle. Modules cannot perform ambient mutation at import (no top-level `cd`/side
-  effects beyond `export`s — or run them but document). A module's `fn`s are commands too (the §1.6
-  unification, namespaced as `deploy.<name>`).
-
-**Locked decisions — task lifecycle** (TDD §4.7 — currently only `.await/.cancel/.is_done`):
-- `task.suspend()` (SIGTSTP the process group), `task.resume()` (SIGCONT), `fg <task>` (re-front a
-  background task with PTY in the REPL). `jobs` already lists the task table. The kernel has a
-  `task.suspend` wire method already — add `task.resume` and the eval methods.
-
-**Locked decisions — plan/apply from the REPL** (currently `plan_program` exists, no verb):
-- `plan { … }` (or `plan <statement>`) derives and renders the effect plan without spawning (the
-  pure-prefix eval → effects + reversibility + estimates). `apply <plan-ref>` executes a previously
-  derived plan. This mirrors the MCP `shoal_plan`/`shoal_apply` on the human side.
-
-**Locked decisions — undo `out[n]`:** wire the REPL/kernel `out[n]`→journal-entry-id map so `undo
-out[n]` resolves (today only bare `undo` and `undo <id>` work — the eval has no `out` map; it lives
-host/kernel-side). Add the mapping in the `shoal` binary + kernel session and pass the entry id to
-the existing `undo <id>` path.
-
-**Ownership.** P1 (Opus): `crates/shoal-eval` (modules, task methods, plan/apply verb). P2 (Sonnet):
-`crates/shoal` + `crates/shoal-kernel` (out[n]→id map, `fg`, task.resume wire) — non-collide with
-eval. Verify (Sonnet).
-
-**Acceptance.** `use ./mod` binds exports; a module `fn` runs as a command; circular use errors;
-`spawn`ed task suspend/resume/fg work; `plan rm x` shows effects without deleting; `undo out[3]`
-resolves.
+`docs/STREAMS.md` is real, not aspirational: `channel(name)` (user-populated) and
+`watch`/`tail`/`every`/process-stdout (system-populated) are one substrate, all driven by the same
+`stream<T>` combinators. Sources, ≥10 combinators, live/`.each`/`.collect`/`.into`/`.save`/`.feed`
+sinks, single-consumption enforcement, sink-to-source cancellation, and per-source bounded
+backpressure (coalesced-summary overflow, never unbounded buffering) are all shipped and covered by
+`spec/cases/streams*.toml` plus `shoal-eval`'s own unit tests for the non-deterministic sources
+(`watch`/`tail`/`every`'s real OS/timer backing). The kernel-bus bridge (see status snapshot above)
+closed the one gap this wave's original acceptance criteria didn't yet cover.
 
 ---
 
-## Wave R4 — Hexagonal ports + modularization round 2  [mostly non-eval · L]
+## Wave R2 — Data namespaces + remaining structured builtins — **DONE, except `jump`/`j`**
 
-**Goal.** `scratch/audit-arch.md` Waves 2–3. Make the domain core pure; kill the remaining god-files.
-Behavior-preserving, guarded by the conformance corpus.
+`json`/`yaml`/`toml`/`csv`/`math`/`http`/`os`/`config` all exist as namespace values with the
+methods specified in the original mini-spec (verified live: `json.parse("[1,2]")`,
+`math.sqrt(2)`, `os.platform()`). `tail`/`head`/`ln`/`explain` are structured builtins, not raw
+passthrough.
 
-**Locked decisions.**
-- **Ports** (traits in `shoal-value`, `Std*` adapters default to today's calls, held as `Box<dyn
-  Port>` on `Evaluator`): `Fs` (read/write/metadata/remove — eval makes 20+ direct `std::fs` calls
-  today), `Exec` (spawn — wrap `shoal-exec`), `Clock` (now — for journal ts + deterministic tests),
-  `Opener`/`SecretPort`. This makes eval testable without touching the real FS and is the last
-  hexagonal-purity gap.
-- **File splits** (each behavior-preserving, ≤~500 code-LOC): `parser.rs` (1488 → stmt/command/
-  expr/pattern/block modules via multi-file `impl Parser`), `shoal-journal/lib.rs` (split schema/cas/
-  undo/gc/query), the `Kernel::dispatch` ~515-line match (one `handle_*` fn per arm), `main.rs`,
-  `shoal-value/methods.rs`.
-- **One builtin REGISTRY** table replacing the 3 hardcoded sources of builtin identity (dispatch /
-  `is_command_name` / `builtin_effects`); collapse command resolution (fn/alias/reef/adapter/PATH)
-  into one `resolve.rs` returning `enum { Builtin, Adapter, External, Interpreter }`.
-- Then **tighten `[workspace.lints]`** now that the tree is clean (add clippy::pedantic selectively,
-  missing_docs on public API where reasonable) — only lints that pass workspace-wide.
-
-**Ownership.** Can partly parallelize by crate since it's mechanical: P1 (Opus) eval ports + eval
-splits; P2 (Sonnet) parser/journal/kernel splits + registry; P3 (Sonnet) lint tightening + DAG.
-Each must keep the conformance corpus green after every split. Verify (Opus).
-
-**Acceptance.** No `crates/**/*.rs` over ~600 code-LOC; eval domain makes zero direct
-`std::fs`/`std::process` calls (all via ports); one builtin registry; conformance unchanged;
-lints tightened and green.
-
-**Progress (P3 slice — lint tightening + DAG, this pass).**
-- [x] `docs/CONTRACTS.md` DAG refreshed: added `shoal-prompt` (pure leaf, zero `shoal-*` in
-  `[dependencies]`) to Tier 0 and to `shoal`'s Tier 5 dep list; clarified `shoal-mcp`'s
-  `shoal-kernel`/`shoal-proto` edges are `[dev-dependencies]` only; documented `shoal-eval`'s
-  current internal module split (`args, builtins, call, channels, coerce, command, expr,
-  helpers, host, journal, modules, namespaces, pattern, plan, reef, script, stmt, streams`) —
-  `shoal-reef` was already correctly placed (Tier 0 leaf) in the prior revision.
-  Reproduced the DAG from `Cargo.toml` `[dependencies]` sections (not full-file grep, which
-  double-counts `[dev-dependencies]`) to confirm no other edges were stale.
-- [x] `[workspace.lints.clippy]` tightened: added `cloned_instead_of_copied`,
-  `inefficient_to_string`, `explicit_iter_loop` (each individually verified zero-violation
-  workspace-wide via `cargo +stable clippy --workspace --all-targets --locked -- -D warnings -W
-  <lint>` before being added, then the full table re-verified together). Root `Cargo.toml`'s
-  `[workspace.metadata.lints]` still documents the larger deferred set (`use_self` 91
-  violations, `unused_qualifications` 4, rust's `missing_debug_implementations` 4,
-  `redundant_clone` 3, `needless_pass_by_value` 4, `manual_let_else` 3, `single_match_else` 3,
-  `map_unwrap_or` 8, `implicit_clone` 3, plus the pre-existing `missing_errors_doc`/
-  `missing_panics_doc`/`unwrap_used`/`expect_used` set) — none enabled, all have live
-  violations today.
-- [ ] Ports (`Fs`/`Exec`/`Clock`/`SecretPort`/`Opener`), the eval/parser/kernel/journal file
-  splits, and the builtin `REGISTRY`/`resolve.rs` unification are **P1/P2's slice, landing
-  concurrently in this same wave** — not verified or ticked here; confirm their state at the
-  wave's integration/verify step rather than trusting this line, since observed mid-wave the
-  workspace build was intermittently red from their in-flight edits (e.g. `shoal-eval`'s port
-  wiring, `shoal-syntax`'s lexer/parser module split) and stabilized to green again by the time
-  of this note.
+**Still not built**: `jump`/`j` (frecency-ranked `cd`, needs a small frecency store in the
+journal/state dir) — grep confirms no such builtin is registered. Cheap, self-contained, a good
+first pickup for whoever's turn it is to touch `shoal-eval` next.
 
 ---
 
-## Wave R5 — Corpus growth + docs/wiki refresh + polish  [non-eval · M]
+## Wave R3 — Modules + task lifecycle + plan/apply + undo `out[n]` — **DONE**
 
-**Goal.** Reach toward the TDD §12 target (≥1000 conformance cases, currently ~342), refresh the
-narrative docs, and clear the small carryovers.
+`use ./lib/deploy` (+ `as alias`, `export`) loads and memoizes a module, binding its exports under
+the file-stem namespace; a module's exported `fn`s run as commands (the §1.6 unification extends
+across module boundaries) — verified live. `task.suspend()`/`.resume()` are wired for
+evaluator-owned processes; the kernel's `task.suspend`/`task.resume` wire methods return an honest,
+explicit "unavailable for evaluator-owned processes" error for kernel-spawned tasks rather than
+silently no-opping (this is a deliberate honesty boundary per the project's own tier-honesty
+discipline, not an unfinished feature — see "still open" for the one place this could still be
+tightened). `plan { … }` / `plan <statement>` derives and renders an effect plan without spawning
+(verified live: `plan rm "x"` reports `effects`/`reversible`/`spawns` and doesn't touch the
+filesystem). `undo out[n]` resolves via a REPL-side rewrite that maps `out[n]` to its journal entry
+id before delegating to the existing `undo <id>` path (`crates/shoal/src/repl.rs`,
+`resolve_out_undo`) — the mapping lives host-side, not in the evaluator, by design (`out` itself is
+a REPL-side transcript list with no evaluator-side notion of journal entry ids).
 
-**Tasks.**
-- Grow `spec/cases/` toward 1000: exhaustive coverage of every §3.4 desugar row, every §4.2 coercion
-  cell, §13 edge rulings, all string/list/table/record/path methods, all match pattern kinds,
-  interpreter blocks, `.feed`, the namespaces (R2). Property tests: `parse(format(ast))==ast`,
-  format idempotence, glob order-stability, codec roundtrip incl. non-UTF-8. Fuzz targets stay green.
-- **Wiki re-refresh** (separate repo `shoal.wiki`, safe to parallelize any time): update for the
-  agent surface, leash activation, adapters (23), the prompt, interpreter blocks, journal/undo, the
-  plugin.
-- Small carryovers: production undo-when-cwd-under-a-symlinked-path (macOS) — resolve the
-  TOCTOU-vs-alias tension properly (canonicalize only the leading system-symlink prefix, not
-  intra-scope symlinks; test on both OSes); adapter `class = "interpreter"` (make interpreter blocks
-  adapter-extensible, not just the static parser const); feeding a bare `outcome` to `.feed`; the
-  `Outcome` wire `span` (currently always None — thread the spawning span through); user-scope
-  `[reef]` auto-discovery + the ambient-shadow did-you-mean; prompt async/deferred segments + git
-  status via `notify` instead of once-per-command subprocess.
+---
 
-**Ownership.** Fully parallelizable (corpus, wiki, and each carryover are independent). Mostly Sonnet.
+## Wave R4 — Hexagonal ports + modularization round 2 — **mostly DONE**
+
+**Done**: the `Fs`/`Exec`/`Clock`/`Opener`/`SecretPort` ports (see `docs/CONTRACTS.md` §8) and the
+god-file splits (`shoal-eval` internals across ~24 files; `shoal-kernel`'s dispatch split into
+`handlers_*.rs`; `shoal-value` and `shoal-leash` similarly modularized) landed in the
+`refactor: hexagonal ports + god-file splits + lint tightening + corpus growth` and
+`refactor: modularize kernel/value/leash/eval + grow conformance corpus` commits. `[workspace.lints]`
+tightening continued incrementally (see root `Cargo.toml`'s `[workspace.metadata.lints]` for the
+live-violation-tracked remainder — `use_self`, `unused_qualifications`, etc. — each with a documented
+reason it isn't enabled yet).
+
+**Not done**: the **one builtin REGISTRY** unifying the three hardcoded sources of builtin identity
+(dispatch / `is_command_name` / `builtin_effects`), and collapsing command resolution
+(fn/alias/reef/adapter/PATH) into one `resolve.rs` returning
+`enum { Builtin, Adapter, External, Interpreter }`. Grep confirms neither exists yet
+(`crates/shoal-eval/src` has no `resolve.rs`, no `REGISTRY`/`BuiltinRegistry`). This is still a real
+architectural cleanup opportunity — the three-hardcoded-sources problem it targets hasn't gotten
+worse, but hasn't been fixed either. Eval-heavy; serialize with any other `shoal-eval` work per the
+one hard constraint.
+
+**Acceptance for the remaining slice**: one builtin registry table; one `resolve.rs`; conformance
+corpus unchanged; `cargo clippy --workspace --all-targets --locked -- -D warnings` still green.
+
+---
+
+## Wave R5 — Corpus growth + docs/wiki refresh + polish — **corpus target exceeded; polish ongoing**
+
+**Corpus**: 1,218 cases (target was ≥1,000) — done, and growing incrementally is still welcome for
+any newly-landed behavior (every behavior change should add/adjust a case; see `CLAUDE.md`).
+
+**Wiki**: kept current in the sister `shoal.wiki` repo (agent surface, leash, adapters, prompt,
+interpreter blocks, journal/undo, the plugin, streams/channels, the reef bridge) — refreshed
+alongside this revision; re-check stale figures (case counts, adapter counts) whenever either
+changes materially, since they're restated as prose in multiple wiki pages rather than computed.
+
+**Small carryovers — status, individually re-checked**:
+- Production undo-when-cwd-under-a-symlinked-path (macOS TOCTOU-vs-alias tension) — **still open**,
+  no evidence of a fix in `shoal-eval`/`shoal-kernel` source.
+- Adapter `class = "interpreter"` (adapter-extensible interpreter blocks, not a hardcoded parser
+  const) — **done**: `docs/IO.md` §2.2's mechanism is real; adapters declare `class = "interpreter"`
+  and the shipped pack includes interpreter-class entries.
+- Feeding a bare `outcome` to `.feed` — **done** (verified live: `(echo hi).feed(sort).out` works
+  per IO.md §1.2's outcome row).
+- The `Outcome` wire `span` (spec'd but hardcoded) — **still open**: `crates/shoal-kernel/src/
+  wire.rs`'s `Value::Outcome => WireValue::Outcome { .. span: None }` is still a literal `None`,
+  never threaded from the spawning call's span.
+- User-scope `[reef]` auto-discovery — **appears to have landed** (`shoal-config` explicitly parses
+  `[reef]` out of `shoal.toml` for user scope per `REEF.md` §1; re-verify the ambient-shadow
+  did-you-mean specifically before relying on it — that narrower piece wasn't independently
+  confirmed in this pass).
+- Prompt async/deferred segments + git status via `notify` instead of once-per-command subprocess —
+  **still open**, no evidence found in `shoal-prompt`/`shoal`'s prompt wiring.
+
+**Ownership.** Fully parallelizable (corpus, wiki, and each carryover are independent). Mostly
+Sonnet.
+
+---
+
+## What's genuinely still open (the honest punch list)
+
+Pulled together from the per-wave notes above, plus fresh findings from this revision's
+verification pass:
+
+1. **Binary-content-hash spawn pinning is designed and unit-tested but NOT wired into the real
+   spawn path** — the single most security-relevant gap this revision found. `shoal-leash`'s
+   `preflight_spawn`/`Policy` evaluator can check a `ProcSpawn{bin_hash}` effect against a
+   principal's `proc_spawn` grants correctly when handed one, but `crates/shoal-eval/src/
+   plan_derive.rs` always constructs that effect with an **empty** `bin_hash`
+   (`Effect::ProcSpawn { bin_hash: String::new(), .. }`), and the real spawn path (`run_argv` →
+   `resolve_sandbox` in `crates/shoal-eval/src/command.rs`) never calls `shoal-leash`'s effect
+   evaluator at all — it only applies the OS-level Landlock/Seatbelt `SandboxPolicy` (filesystem
+   confinement, which **is** real). A policy author who writes `proc_spawn = ["<hash>"]` believing
+   an unrecognized binary will be blocked gets **zero enforcement from that hash today**. reef's
+   own lock-drift detection (`reef_drift`) is unaffected and real. `docs/REEF.md` §2 and the wiki's
+   Leash-and-Security §4 / Reef §2 carry the corrected, verified account — this item is the fix:
+   thread a real hash through `plan_derive.rs` and have the spawn path actually consult the
+   evaluator with it before exec.
+2. **Builtin REGISTRY + `resolve.rs` unification** (R4 remainder) — architectural cleanup, eval-heavy.
+3. **`jump`/`j`** frecency-ranked `cd` (R2 remainder) — small, self-contained, eval-heavy.
+4. **`Outcome` wire `span`** always `None` over the kernel wire (R5 carryover) — small, `shoal-kernel`.
+5. **`shoal_cap_request`'s grant response hardcodes `"enforced": false`** unconditionally
+   (`crates/shoal-kernel/src/handlers_task.rs`), even though `session.attach`'s `caps_enforced` is
+   already honest (reflects a real backend when one is actually scoped). This is a narrower,
+   specific gap than #1 above — direct spawns ARE filesystem-confined when policy scopes them; the
+   `cap_request` *response shape* just doesn't yet surface that truth back to an MCP/agent caller
+   who unstuck an `approval_pending` plan. Worth closing so the agent surface doesn't systematically
+   under-report enforcement it actually has.
+6. **Bare-path-head runner ergonomics** (`./script.py` with no `run`) work for `.shl` only — other
+   extensions need the explicit `run script.py` spelling. `docs/REEF.md` §5 / wiki Reef §5 carry the
+   corrected account; wiring the general case is a `shoal-eval` command-head-resolution change.
+7. **Real OS-level sandbox enforcement wired end-to-end through the kernel/MCP surface** — the
+   pieces exist (leash filesystem enforcement at spawn, honest tier reporting at attach) but a full
+   trace of "an MCP `shoal_exec` call that should be denied/confined by policy actually gets
+   denied/confined, not just reported as such" is worth re-verifying with a live kernel + a real
+   restrictive policy file, not assumed from the pieces being individually real — and per #1 above,
+   the *spawn-identity* half of that story (as opposed to filesystem/network confinement) isn't
+   wired at all yet.
+8. **macOS cwd-under-a-symlink undo edge case** (R5 carryover) — still open.
+9. **Prompt async/deferred git-status segments** (R5 carryover) — still open; today's prompt does a
+   once-per-render subprocess-based git status, not an event-driven one.
+10. Live bugs found while verifying this revision: `adapters/du.toml` **and** `adapters/stat.toml`
+    both fail to load (`unknown output parser "tsv-headerless"`) — `shoal-adapters` doesn't
+    recognize that parser strategy string, so both tools fall back ungracefully instead of parsing
+    structured output (a warning prints on every shoal startup). Not this doc's lane to fix
+    (adapters + `shoal-adapters` parser strategies are delegated modules per `docs/CONTRACTS.md`'s
+    ownership map) — flagging so it's tracked, not silently reintroduced.
+11. **Windows** — resolution semantics, ConPTY, ports — entirely deferred, `docs/TDD.md` §14.
+12. **Config hardening** — in flight under separate ownership (`docs/CONFIG.md`); not detailed here.
+13. **More adapters** — 35 shipped; the ecosystem is large and this is perpetually "in flight" by
+    nature, not a blocking gap.
 
 ---
 
 ## Suggested order & rationale
 
-1. **R1 streams** — the last big VISION inversion; unlocks the reactive/pair-shelling story and the
-   `channel()` binding the agent-surface wave left as a stub. Highest thesis value.
-2. **R2 namespaces/builtins** — broad daily-driver utility (json/http/math), makes the shell feel
-   complete for real work.
-3. **R3 modules/tasks/plan** — closes the language/session gaps; enables larger shoal programs.
-4. **R4 hexagonal/refactor** — do once the feature surface has stabilized so the port boundaries are
-   drawn around the real shape, not a moving target. Behavior-preserving, low risk, high durability.
-5. **R5 corpus/docs/polish** — continuous; run pieces of it in parallel with any of the above (it's
-   non-eval), and finish it last to lock the spec.
+Given R0–R3 are done and R4/R5 are the only waves with open work:
 
-R4 and R5 are non-eval and can run *alongside* R1–R3 where they don't touch the same crates (e.g.
-the wiki refresh, corpus growth, parser/journal/kernel splits, lint tightening). R1–R3 serialize
-because each owns `shoal-eval`.
+1. **#1, wire spawn-identity pinning end to end** — the highest-priority item precisely because it's
+   a security doc/reality gap, not a missing feature: thread a real blake3 hash from reef through
+   `plan_derive.rs`'s `ProcSpawn` effect and have the real spawn path actually consult
+   `shoal-leash`'s evaluator with it before exec. Eval-heavy (touches `shoal-eval`'s spawn path);
+   serialize with any other `shoal-eval` work per the one hard constraint.
+2. **Close the other small, cheap items** (#3 `jump`/`j`, #4 `Outcome` span, #5 `cap_request`
+   enforcement honesty) — each is self-contained, low-risk, and removes a specific documented gap.
+3. **R4's builtin registry/`resolve.rs` unification** (#2) — do this once no other eval-heavy work
+   is in flight (the one-hard-constraint serialization applies), since it touches command dispatch
+   broadly and benefits from a quiet tree. **#6** (bare-path runner ergonomics) touches the same
+   command-head-resolution machinery — worth doing in the same pass.
+4. **#7, the end-to-end sandbox-enforcement trace** — security-relevant, worth a dedicated
+   verification pass (ideally by an agent that writes a real restrictive policy file and a live
+   kernel test, not just reads source) before trusting it either way, once #1 is closed.
+5. **The remaining R5 carryovers** (#8 symlink undo, #9 prompt async segments) — non-eval, fully
+   parallelizable, pick up whenever convenient.
+6. **Corpus growth, adapters (including the #10 `du`/`stat` adapter parser bug), wiki upkeep** —
+   continuous, non-eval, run alongside anything else.
 
 *shoal ROADMAP — the corpus decides disputes; this doc sequences the work to get there.*

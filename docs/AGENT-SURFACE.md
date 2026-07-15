@@ -1,6 +1,15 @@
 # The agent surface — wire contract v2
 
-**Status:** wire encoding partial.
+**Status:** implemented and live-verified end-to-end (`crates/shoal-mcp/tests/live_kernel.rs` spins
+up a real `shoal-kernel` on a real socket and drives it through both the MCP facade and raw
+JSON-RPC). `$`-tagged value encoding, the elision rule (§3), MCP `resources/list|read|subscribe|
+unsubscribe`, `events.subscribe`/push notifications, all seven MCP tools (`shoal_exec shoal_plan
+shoal_apply shoal_get shoal_journal shoal_cancel shoal_cap_request`), and the in-language
+`channel()` ↔ kernel-wire-bus bridge (§7) are all real, not spec'd-but-pending. Two narrower gaps
+remain, tracked in `docs/ROADMAP.md`'s open-items list: an `Outcome`'s wire `span` field is always
+`None` (never threaded from the spawning call), and `shoal_cap_request`'s grant response hardcodes
+`"enforced": false` regardless of whether the approved plan is actually confined by a real OS
+backend (contrast `session.attach`'s `caps_enforced`, which is already honest).
 
 **Normative.** Companion to TDD §7; supersedes it where they conflict. Implements the doctrine
 below across `shoal-proto`, `shoal-kernel`, `shoal-mcp`.

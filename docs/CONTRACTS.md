@@ -326,4 +326,53 @@ pub trait CallCtx {
 pub type VResult<T> = Result<T, ErrorVal>;
 ```
 
+## 8. Hexagonal ports (pinned; ROADMAP R4 — done)
+
+The evaluator's domain logic depends on trait objects for every OS-facing effect family, not on
+`std::fs`/`std::process`/`std::time` directly — this is what makes `shoal-eval` unit-testable
+without touching a real filesystem/process/clock. Four traits live in `shoal-value/src/ports.rs`
+(kept there so they're reachable from a leaf crate); `Exec` lives in `shoal-eval/src/ports.rs`
+instead because its signature is stated in terms of `shoal-exec` types and `shoal-value` must stay
+a leaf. Every trait has a `Std*` default adapter that performs the *exact* call the evaluator made
+inline before the ports existed — installing the default is behavior-identical to the pre-ports
+code, so this refactor was purely structural.
+
+```rust
+// shoal-value/src/ports.rs
+pub trait Fs: Send + Sync {
+    fn read(&self, path: &Path) -> io::Result<Vec<u8>>;
+    fn read_to_string(&self, path: &Path) -> io::Result<String>;
+    fn write(&self, path: &Path, data: &[u8]) -> io::Result<()>;
+    fn append(&self, path: &Path, data: &[u8]) -> io::Result<()>;
+    fn touch(&self, path: &Path) -> io::Result<()>;
+    fn metadata(&self, path: &Path) -> io::Result<fs::Metadata>;
+    fn symlink_metadata(&self, path: &Path) -> io::Result<fs::Metadata>;
+    fn read_dir(&self, path: &Path) -> io::Result<Vec<PathBuf>>;
+    fn create_dir(&self, path: &Path) -> io::Result<()>;
+    fn create_dir_all(&self, path: &Path) -> io::Result<()>;
+    fn remove_file(&self, path: &Path) -> io::Result<()>;
+    fn remove_dir_all(&self, path: &Path) -> io::Result<()>;
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
+    fn copy(&self, from: &Path, to: &Path) -> io::Result<u64>;
+    fn hard_link(&self, src: &Path, dst: &Path) -> io::Result<()>;
+    fn symlink(&self, target: &Path, link: &Path) -> io::Result<()>;
+}
+pub trait Clock: Send + Sync { fn now_ns(&self) -> i64; }     // journal timestamps, deterministic under test
+pub trait Opener: Send + Sync { fn open(&self, path: &Path) -> Result<(), String>; }  // the `open` builtin
+pub trait SecretPort: Send + Sync {
+    fn get(&self, name: &str) -> Result<Option<Vec<u8>>, String>;   // backs `secret.get(name)`
+}
+
+// shoal-eval/src/ports.rs — needs shoal-exec types, so it can't live in shoal-value
+pub trait Exec: Send + Sync {
+    fn run(&self, spec: shoal_exec::ExecSpec, cancel: &shoal_exec::CancelToken)
+        -> std::io::Result<shoal_exec::ExecResult>;
+}
+```
+
+`Evaluator` holds each as a `Box<dyn Port>`; tests swap a fake to interpose on reads/writes/spawns/
+time without touching the real OS. Do not reintroduce a direct `std::fs`/`std::process`/
+`SystemTime::now()` call in `shoal-eval`'s domain logic — route it through the matching port, adding
+a method to the trait (plus the `Std*` default) if the one you need doesn't exist yet.
+
 `methods.rs` must be pure over these (no direct process spawning; `.save`/`.append` do fs IO relative to `ctx.cwd()`).

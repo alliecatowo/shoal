@@ -1,6 +1,12 @@
 # reef — tool resolution, ripped from the root
 
-**Status:** crate built+tested; eval integration landing this wave.
+**Status:** implemented and wired as the live resolution path. `which`, `with reef:`, the lockfile,
+and — the piece the previous revision of this line called still-landing — **project-scope
+`.reef.toml` walking** are all real: a `.reef.toml` declaring `[tools] sh = "*"` in a scratch
+directory changes `which sh`'s reported scope to `"reef"` and its resolution `chain` to name that
+manifest file, verified directly against the binary. The conformance corpus (`spec/cases/reef.toml`)
+still `skip`s the genuinely host-inventory-dependent cases (a real tool's resolved hash/version, the
+live binding table) — those are testing-determinism gaps, not functionality gaps.
 
 **Design contract v0.1.** Companion to `docs/TDD.md`; same rules: everything here is a decision,
 the corpus decides disputes. Crate: `shoal-reef`.
@@ -21,9 +27,11 @@ the first name-match wins. Its consequences are the daily misery of the terminal
 - Any writable dir on PATH is an injection vector.
 
 A shell that already owns spawn (no `execvp`, no PATH search — shoal's exec resolves explicitly),
-already records a journal, and already pins binaries by content hash (leash) can delete the
-fossil instead of shimming it. **Resolution becomes a pure, declarative, journaled function; the
-PATH becomes an *output* synthesized for legacy children, never an input the shell lives in.**
+already records a journal, and already records a content hash for every resolved binary (this
+document, §2) can delete the fossil instead of shimming it. **Resolution becomes a pure,
+declarative, journaled function; the PATH becomes an *output* synthesized for legacy children,
+never an input the shell lives in.** (Whether leash's *policy* actually consults that hash before a
+spawn is a separate, narrower question — answered honestly, not assumed, in §2.)
 
 reef is that resolver. The shoal swims; the reef is the stable structure it lives over.
 
@@ -77,8 +85,21 @@ absolute path, **blake3 of the binary**, resolved-at timestamp.
   don't get to guess. (Same interactive/script split the TDD already uses for `it` and watchdogs.)
 - At spawn, the on-disk binary is re-hashed (cached by dev/inode/mtime): a mismatch against the
   lock is `reef_drift` — a hard error naming old/new hashes, with `reef lock --refresh` as the
-  fix-it. This is supply-chain teeth: leash's `proc.spawn{bin_hash}` pins against the *lock*, so
-  policy and resolution verify the same chain: **name → version → hash → grant**.
+  fix-it. This re-hash-and-compare is real and enforced today.
+- **Not yet true, corrected from a previous revision of this line**: this section used to claim
+  "leash's `proc.spawn{bin_hash}` pins against the lock, so policy and resolution verify the same
+  chain." Verified against source, that chain is **not** wired: `Effect::ProcSpawn`'s `bin_hash`
+  field is only ever constructed as an empty string (`crates/shoal-eval/src/plan_derive.rs`,
+  hardcoded `String::new()`), and the real spawn path (`run_argv` → `resolve_sandbox` in
+  `crates/shoal-eval/src/command.rs`) only resolves an OS-level Landlock/Seatbelt `SandboxPolicy` —
+  it never calls `shoal-leash`'s `evaluate_effect`/`evaluate_plan` and never receives reef's
+  computed hash. **A leash policy author writing `proc_spawn = ["<hash>"]` believing it pins against
+  reef's blake3 lock gets zero enforcement from that hash today.** The *lock's* own drift detection
+  (bullet above) is real and independent of this; it's specifically the **policy-time** name →
+  version → hash → grant chain from the original design intent that is unbuilt. Treat "leash pins
+  spawns against reef's locked hash" as a `docs/ROADMAP.md` item, not a shipped guarantee, until
+  `plan_derive.rs` actually threads a real hash through and the spawn path actually consults leash's
+  evaluator with it.
 - Version conflicts (two scopes constraining one tool incompatibly) are values: the error lists
   both sources. No silent first-wins.
 
@@ -115,12 +136,24 @@ leash tier-A can force `hermetic` per grant.
 
 "How do I run `./script.py`" is the same question as "what does `node` denote" — resolution keyed
 on content-type instead of name. So it lives here, **not in the language core**: the `[runners]`
-table maps extension (falling back to shebang sniff) → tool + argv template. `./x.py args` at a
-command head, and `run ./x.py args`, both resolve the runner, resolve its tool through reef, and
-spawn — journaled like any spawn. `run <name> args…` with a non-path stays the TDD §3.1.4 dynamic
-command form. Defaults ship for `py js ts sh shl rb lua`; `rs` intentionally has **no default**
-(compile-vs-script ambiguity) — configuring one is one TOML line. The language core knows only
-"resolve this invocable"; delete `shoal-reef` and the language still parses.
+table maps extension (falling back to shebang sniff) → tool + argv template. The explicit spelling,
+`run ./x.py args` / `run x.py args`, resolves the runner, resolves its tool through reef, and spawns
+— journaled like any spawn; verified directly against the binary. `run <name> args…` with a non-path
+stays the TDD §3.1.4 dynamic command form. Defaults ship for `py js ts sh shl rb lua`; `rs`
+intentionally has **no default** (compile-vs-script ambiguity) — configuring one is one TOML line.
+
+**Not yet wired**: the bare-path-head ergonomics case (`./script.py args` with no leading `run`,
+IO.md §3.1's "just typing the filename" case) for **non-`.shl` extensions**. Verified against the
+binary: `run script.py` prints the script's output correctly, but a bare `./script.py` at command
+head position currently attempts to exec the file directly (and fails with a permission error if
+it isn't itself marked executable) rather than routing through `[runners]` resolution — only `.shl`
+bare-path heads work today (they route through the `"self"` child-evaluator path, which predates and
+is separate from the general runner table). If you're describing or relying on "just type the
+filename" ergonomics for a `.py`/`.js`/`.rb`/etc. script, use the explicit `run` spelling until this
+gap closes; don't assume bare-path dispatch generalizes past `.shl` yet.
+
+The language core knows only "resolve this invocable"; delete `shoal-reef` and the language still
+parses.
 
 ## 6. Surface
 
