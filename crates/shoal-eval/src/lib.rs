@@ -26,6 +26,7 @@ mod script;
 mod stmt;
 mod streams;
 
+pub use channels::{EventBus, EventForwarder};
 pub(crate) use coerce::coerce_word;
 pub use reef::{PromptReefBinding, PromptReefSnapshot};
 
@@ -277,6 +278,22 @@ impl Evaluator {
     /// session's in-language channels — `spawn`, `on(...)`, script children).
     pub(crate) fn set_bus(&mut self, bus: Arc<channels::EventBus>) {
         self.bus = bus;
+    }
+
+    /// Install the hook that mirrors in-language `channel(x).emit(...)` onto a
+    /// hosting kernel's wire bus (AGENT-SURFACE §4's one-substrate promise).
+    /// Only `user.*` channels cross — the same client-writable rule as the
+    /// wire's `events.publish`. Standalone hosts never call this.
+    pub fn set_event_forwarder(&mut self, f: EventForwarder) {
+        self.bus.set_forwarder(f);
+    }
+
+    /// A shareable handle to this session's in-language event bus, for hosts
+    /// that must publish into it WITHOUT taking the evaluator lock (a wire
+    /// `events.publish` must not stall behind a long-running exec). Inject via
+    /// [`EventBus::inject`], which never re-forwards back out.
+    pub fn event_bus(&self) -> Arc<EventBus> {
+        self.bus.clone()
     }
 
     /// Consume any pending `exit`/`quit` request. `Some(code)` means the last

@@ -12,6 +12,10 @@ pub(crate) struct Attachment {
 pub(crate) struct Session {
     pub(crate) id: String,
     pub(crate) evaluator: Mutex<Evaluator>,
+    /// The evaluator's in-language event bus, cached so wire publishes can
+    /// inject into it without taking the evaluator lock (a long-running exec
+    /// must not stall `events.publish`).
+    pub(crate) lang_bus: Arc<shoal_eval::EventBus>,
     pub(crate) transcript: Mutex<HashMap<Ref, Value>>,
     pub(crate) client_it: Mutex<HashMap<u64, Ref>>,
     pub(crate) next_value: AtomicU64,
@@ -24,9 +28,23 @@ impl Kernel {
             return Ok(session.clone());
         }
         let cwd = std::env::current_dir()?;
+        let mut evaluator = Evaluator::new(cwd);
+        // Bridge in-language channels onto the kernel wire bus (AGENT-SURFACE
+        // §4's "one substrate"): `channel("user.x").emit(v)` in evaluated
+        // source reaches `events.subscribe`/`resources/subscribe` clients.
+        // The evaluator forwards only `user.*` (its own guard), so language
+        // code cannot spoof kernel-owned semantic channels.
+        let wire_bus = self.events.clone();
+        evaluator.set_event_forwarder(Box::new(move |channel, payload| {
+            let json = serde_json::to_value(crate::wire::wire_value(payload))
+                .unwrap_or(serde_json::Value::Null);
+            wire_bus.publish(channel, json);
+        }));
+        let lang_bus = evaluator.event_bus();
         let session = Arc::new(Session {
             id: name.into(),
-            evaluator: Mutex::new(Evaluator::new(cwd)),
+            evaluator: Mutex::new(evaluator),
+            lang_bus,
             transcript: Mutex::new(HashMap::new()),
             client_it: Mutex::new(HashMap::new()),
             next_value: AtomicU64::new(1),

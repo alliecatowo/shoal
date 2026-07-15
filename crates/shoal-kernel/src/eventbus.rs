@@ -161,7 +161,7 @@ impl Kernel {
         params: Json,
         attached: &mut Option<Attachment>,
     ) -> Result<Json, RpcError> {
-        attached.as_ref().ok_or_else(not_attached)?;
+        let attachment = attached.as_ref().ok_or_else(not_attached)?;
         let p: EventsPublishParams = decode(params)?;
         // AGENT-SURFACE §4: only `user.*` channels are client-writable;
         // the kernel owns the semantic channels.
@@ -172,7 +172,14 @@ impl Kernel {
                 data: Some(json!({"channel": p.channel})),
             });
         }
-        let event = self.events.publish(&p.channel, p.payload);
+        let event = self.events.publish(&p.channel, p.payload.clone());
+        // One substrate, reverse direction: a wire publish is also visible to
+        // the session's in-language channels (`channel("user.x").latest()` /
+        // `.events()`), via `inject` — which never re-forwards, so the event
+        // cannot echo back onto the wire bus. Uses the cached bus handle, NOT
+        // the evaluator lock — a long-running exec must not stall publishes.
+        let payload = shoal_value::json_to_value(&p.payload);
+        attachment.session.lang_bus.inject(&p.channel, payload);
         encode(json!({"channel": event.channel, "seq": event.seq, "ts": event.ts}))
     }
 

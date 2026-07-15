@@ -276,3 +276,102 @@ fn raw_events_publish_read_roundtrip_on_user_channel() {
     );
     assert!(denied.error.is_some());
 }
+
+/// The channel↔wire bridge (AGENT-SURFACE §4 "one substrate"): an in-language
+/// `channel("user.x").emit(...)` must reach wire subscribers/readers, and a
+/// wire `events.publish` must be visible to in-language `latest()` — the two
+/// event worlds used to be fully disjoint (the field test's last blocker).
+#[test]
+fn language_channel_emit_bridges_to_wire_bus_and_back() {
+    let live = LiveKernel::start();
+    // Connection 1: requests/responses only (no subscription, so no pushed
+    // notification can ever interleave with a response frame here).
+    let mut stream = UnixStream::connect(&live.socket).unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    raw_call(
+        &mut stream,
+        &mut reader,
+        1,
+        "session.attach",
+        json!({"client":{"kind":"test","tty":false}}),
+    );
+    // Connection 2: a dedicated subscriber that only ever receives pushes.
+    let mut sub_stream = UnixStream::connect(&live.socket).unwrap();
+    let mut sub_reader = BufReader::new(sub_stream.try_clone().unwrap());
+    raw_call(
+        &mut sub_stream,
+        &mut sub_reader,
+        1,
+        "session.attach",
+        json!({"client":{"kind":"test","tty":false}}),
+    );
+    let sub = raw_call(
+        &mut sub_stream,
+        &mut sub_reader,
+        2,
+        "events.subscribe",
+        json!({"channel":"user.bridge"}),
+    );
+    assert!(sub.error.is_none());
+
+    // language → wire: an evaluated emit lands on the kernel bus…
+    let exec = raw_call(
+        &mut stream,
+        &mut reader,
+        2,
+        "exec",
+        json!({"src":"channel(\"user.bridge\").emit(\"lang-ping\")","position":"stmt"}),
+    );
+    assert!(exec.error.is_none(), "emit exec failed: {:?}", exec.error);
+    let read = raw_call(
+        &mut stream,
+        &mut reader,
+        3,
+        "events.read",
+        json!({"channel":"user.bridge"}),
+    );
+    let events = read.result.unwrap()["events"].clone();
+    let events = events.as_array().unwrap().clone();
+    assert_eq!(events.len(), 1, "language emit must reach the wire bus");
+    assert_eq!(events[0]["payload"], json!({"$":"str","v":"lang-ping"}));
+
+    // …and is PUSHED to the live subscriber as an `event` notification.
+    let frame = read_frame_raw(&mut sub_reader);
+    assert_eq!(frame["method"], "event", "expected a push, got {frame}");
+    assert_eq!(frame["params"]["channel"], "user.bridge");
+    assert_eq!(
+        frame["params"]["payload"],
+        json!({"$":"str","v":"lang-ping"})
+    );
+
+    // wire → language: a wire publish is visible to in-language `latest()`.
+    let published = raw_call(
+        &mut stream,
+        &mut reader,
+        4,
+        "events.publish",
+        json!({"channel":"user.bridge","payload":"wire-pong"}),
+    );
+    assert!(published.error.is_none());
+    let latest = raw_call(
+        &mut stream,
+        &mut reader,
+        5,
+        "exec",
+        json!({"src":"channel(\"user.bridge\").latest()","position":"value"}),
+    );
+    let value = latest.result.unwrap()["value"].clone();
+    assert_eq!(
+        value,
+        json!({"$":"str","v":"wire-pong"}),
+        "wire publish must be visible to language latest()"
+    );
+}
+
+/// Reads one raw frame (response OR notification) as loose JSON.
+fn read_frame_raw(reader: &mut BufReader<UnixStream>) -> Value {
+    use std::io::BufRead;
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    serde_json::from_str(&line).unwrap()
+}

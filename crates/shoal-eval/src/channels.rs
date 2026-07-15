@@ -64,10 +64,17 @@ struct ChannelState {
     subs: Vec<Sender<VResult<Value>>>,
 }
 
+/// A host-installed hook mirroring in-language emits onto an external bus
+/// (the kernel `EventBus`, so wire subscribers see them — AGENT-SURFACE §4's
+/// "one substrate" promise).
+pub type EventForwarder = Box<dyn Fn(&str, &Value) + Send + Sync>;
+
 /// Session-scoped, in-process event bus backing in-language channels.
 #[derive(Default)]
 pub struct EventBus {
     channels: Mutex<HashMap<String, ChannelState>>,
+    /// Mirrors `user.*` emits to a hosting kernel's wire bus (see [`Self::emit`]).
+    forwarder: Mutex<Option<EventForwarder>>,
 }
 
 impl EventBus {
@@ -75,10 +82,37 @@ impl EventBus {
         Arc::new(EventBus::default())
     }
 
+    /// Install the external forwarder (kernel hosting only; the standalone
+    /// REPL/script binary never sets one and behaves exactly as before).
+    pub fn set_forwarder(&self, f: EventForwarder) {
+        *self.forwarder.lock().unwrap() = Some(f);
+    }
+
     /// Publish `payload` on `name`; returns the assigned monotonic `seq`. Every
     /// live subscriber receives the event record; dead subscribers (their stream
-    /// dropped) are pruned.
+    /// dropped) are pruned. `user.*` events are additionally mirrored to the
+    /// host's external bus when a forwarder is installed — the SAME
+    /// client-writable rule the wire's `events.publish` enforces, so language
+    /// code can never spoof a kernel-owned semantic channel
+    /// (`journal`/`approval`/`session.transcript`/…) to wire subscribers.
     pub fn emit(&self, name: &str, payload: Value) -> u64 {
+        let seq = self.publish_local(name, &payload);
+        if name.starts_with("user.")
+            && let Some(f) = self.forwarder.lock().unwrap().as_ref()
+        {
+            f(name, &payload);
+        }
+        seq
+    }
+
+    /// Publish an event that ORIGINATED on the external bus (the reverse
+    /// direction of [`Self::emit`]'s mirror): ring + local subscribers only,
+    /// never the forwarder — that would echo the event straight back out.
+    pub fn inject(&self, name: &str, payload: Value) -> u64 {
+        self.publish_local(name, &payload)
+    }
+
+    fn publish_local(&self, name: &str, payload: &Value) -> u64 {
         let mut map = self.channels.lock().unwrap();
         let st = map.entry(name.to_string()).or_default();
         let seq = st.next_seq;
@@ -92,7 +126,7 @@ impl EventBus {
         while st.ring.len() > RING_CAP {
             st.ring.pop_front();
         }
-        let event = event_record(name, seq, ts_ns, &payload);
+        let event = event_record(name, seq, ts_ns, payload);
         st.subs.retain(|tx| tx.send(Ok(event.clone())).is_ok());
         seq
     }

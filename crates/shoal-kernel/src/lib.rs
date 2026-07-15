@@ -43,7 +43,7 @@ pub struct Kernel {
     tasks: Mutex<HashMap<Ref, Arc<TaskEntry>>>,
     next_task: AtomicU64,
     auth: Option<Mutex<TokenStore>>,
-    events: EventBus,
+    events: Arc<EventBus>,
 }
 
 /// Wire version of the AST node-kind vocabulary (TDD §7, IO.md §2.5). Bumped
@@ -85,7 +85,7 @@ impl Kernel {
             plans: Mutex::new(HashMap::new()),
             tasks: Mutex::new(HashMap::new()),
             next_task: AtomicU64::new(1),
-            events: EventBus::default(),
+            events: Arc::new(EventBus::default()),
             auth: None,
         })
     }
@@ -100,7 +100,7 @@ impl Kernel {
             plans: Mutex::new(HashMap::new()),
             tasks: Mutex::new(HashMap::new()),
             next_task: AtomicU64::new(1),
-            events: EventBus::default(),
+            events: Arc::new(EventBus::default()),
             auth: Some(Mutex::new(TokenStore::open(state_dir.join("tokens.json"))?)),
         }))
     }
@@ -118,7 +118,7 @@ impl Kernel {
             plans: Mutex::new(HashMap::new()),
             tasks: Mutex::new(HashMap::new()),
             next_task: AtomicU64::new(1),
-            events: EventBus::default(),
+            events: Arc::new(EventBus::default()),
             auth: Some(Mutex::new(TokenStore::open(state_dir.join("tokens.json"))?)),
         }))
     }
@@ -132,7 +132,7 @@ impl Kernel {
             plans: Mutex::new(HashMap::new()),
             tasks: Mutex::new(HashMap::new()),
             next_task: AtomicU64::new(1),
-            events: EventBus::default(),
+            events: Arc::new(EventBus::default()),
             auth: None,
         })
     }
