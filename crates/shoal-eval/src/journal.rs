@@ -43,7 +43,9 @@ fn elapsed_ns(start: Instant) -> i64 {
 
 /// The default per-user state dir the journal lives in, mirroring the kernel's
 /// `state_dir()` exactly so the REPL and kernel agree on one journal on disk.
-fn default_state_dir() -> PathBuf {
+/// Also the home of the `j`/`jump` frecency store (`frecency.rs`), so both
+/// per-user stores live side by side.
+pub(crate) fn default_state_dir() -> PathBuf {
     std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))

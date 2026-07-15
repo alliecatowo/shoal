@@ -39,6 +39,10 @@ impl Kernel {
         }
         let cwd = std::env::current_dir()?;
         let mut evaluator = Evaluator::new(cwd);
+        // Long-lived agent/interactive sessions build up `j`/`jump` directory
+        // history against the shared per-user store, same as the REPL (frecency
+        // recording is best-effort and never fails a cd).
+        evaluator.open_default_jump_history();
         // Bridge in-language channels onto the kernel wire bus (AGENT-SURFACE
         // §4's "one substrate"): `channel("user.x").emit(v)` in evaluated
         // source reaches `events.subscribe`/`resources/subscribe` clients.
