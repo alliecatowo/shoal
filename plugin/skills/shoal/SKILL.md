@@ -38,22 +38,33 @@ already structured on the wire. Reach for `structuredContent` / `value.get` / `s
 > most of what this note used to list as open: `shoal_exec` now has real `background`/`timeout_ms`/
 > `elide`/`mode` params (the dead `capture`/`timeout` are gone), `shoal_get` exposes `elide`,
 > `shoal_journal`'s `until`/`ok`/`effects` filters all work, `shoal_cap_request`'s `effects`
-> genuinely scopes the grant, and `complete`/`explain` are dispatched. The remaining genuinely-open
-> gaps this card documents (the narrow `value.get` path grammar, the language-channel→kernel-bus
-> bridge, and real OS-level sandbox enforcement through this surface) are still open — a one-line
-> probe beats trusting any banner.
+> genuinely scopes the grant, and `complete`/`explain` are dispatched.
+>
+> **A further batch just landed (verified against current source/binary), closing gaps this card
+> previously called out as open:** the **language-channel→kernel-bus bridge now works, both
+> directions, `user.*`-scoped** (`channel("user.x").emit(v)` in evaluated source reaches a
+> `resources/subscribe`/`events.subscribe` client, and a wire `events.publish` is mirrored back into
+> the session's in-language `channel("user.x")` — §0.8, §6); **`position: "value"`'s capture-vs-raise
+> now governs the *final* statement of a multi-statement `src`, not only a single bare expression**
+> (§0.1, §4 rule 13); the default, trash-based `rm` is now correctly classified **`reversible`**, not
+> `irreversible` (§0.3); **`structuredContent.render`/`content[0].text` are now both size-capped at
+> 64 KiB** with a truncation marker, closing the old unbounded-render gap (§0.1, §4 rule 14); and a
+> cancelled background task now reports terminal state `"cancelled"` (a failed one `"failed"`), not
+> always `"completed"` (§0.7). The remaining genuinely-open gaps this card documents (the narrow
+> `value.get` path grammar and real OS-level sandbox enforcement through this surface) are still
+> open — a one-line probe beats trusting any banner.
 
 ---
 
 ## 0. How you talk to shoal
 
-You do not have a bash tool here. You have **seven** MCP tools — six implemented at authoring time in
-`crates/shoal-mcp/src/lib.rs` plus `shoal_cancel` **(P1)** — all forwarding to a running `shoal-kernel`
-process over a newline-delimited JSON-RPC 2.0 Unix-socket connection (`docs/TDD.md` §7,
-`docs/AGENT-SURFACE.md` §5). Alongside the tools, `docs/AGENT-SURFACE.md` §6/§8 specs a full MCP
-**resources** layer (`resources/list`/`read`/`subscribe`, push notifications) — this is the intended
-way to fetch elided payloads and subscribe to live output **(P1** — see §0.8 below for how to use it
-and how to fall back if it isn't dispatched yet in the build you're talking to**)**.
+You do not have a bash tool here. You have **seven** MCP tools, all implemented in
+`crates/shoal-mcp/src/lib.rs` (including `shoal_cancel`, DONE — no longer P1), forwarding to a
+running `shoal-kernel` process over a newline-delimited JSON-RPC 2.0 Unix-socket connection
+(`docs/TDD.md` §7, `docs/AGENT-SURFACE.md` §5). Alongside the tools, `docs/AGENT-SURFACE.md` §6/§8
+specs a full MCP **resources** layer (`resources/list`/`read`/`subscribe`, push notifications) — this
+is now the confirmed-dispatched way to fetch elided payloads and subscribe to live output (DONE — see
+§0.8 below for how to use it).
 **A `shoal-kernel` must already be running and reachable** (see the plugin `README.md` — this is a
 separate prerequisite from the plugin itself; if a tool call fails with a connection error, that is
 the first thing to check, not a language bug).
@@ -66,10 +77,16 @@ Every tool result comes back as an MCP `tools/call` result shaped:
  "isError": false}
 ```
 
-**Always read `structuredContent`. Never read `content[0].text` as your source of truth** — it is a
-byte-identical pretty-printed dump of the same JSON for surfaces that only render text, and it is
-**not elided/size-bounded** (see §4 rule 14). Reading it is exactly the "wall of bytes" anti-pattern
-this whole system exists to end.
+**Always read `structuredContent.value`, not `render` or `content[0].text`, for data.** `content[0].text`
+is a pretty-printed dump of the result for surfaces that only render text; it and the nested `render`
+field are now both **size-capped at 64 KiB** with a `…(N more lines, fetch via <uri>)` truncation
+marker (see §4 rule 14 — this used to be a real unbounded-wall-of-bytes gap, now closed both at the
+MCP boundary and at the kernel wire layer). That cap fixes the context-explosion risk, but `render`/
+`text` are still **ANSI-laden** human strings (color codes survive even on this headless MCP surface —
+verified in `crates/shoal-kernel/src/wire.rs`'s `bound_render`, which exists specifically because a
+render can carry "a huge outcome's ANSI-laden stdout") and are not reliably field-addressable. Reach
+for `structuredContent.value`/`shoal_get` for anything you intend to parse or branch on; treat
+`render`/`text` as a human-only preview, size-bounded or not.
 
 On success, `structuredContent` is the tool's own result object. On failure (`isError: true`),
 `structuredContent` is the raw JSON-RPC error object: `{"code": <int>, "message": <string>, "data": {...}}`.
@@ -123,7 +140,8 @@ multi-statement program, wrap the risky part in `try { ... } catch e { e }` insi
   is no other ref form produced today (see §6's "Content-addressed val:blake3:... refs" bullet —
   those are spec'd, not implemented).
 - `value` is the real payload, `$`-tagged, elided per the rule in §1 if large.
-- `render` is a **full, non-elided** human string — see the flagged gap in §4 rule 14. Do not trust its size.
+- `render` is a human string, **now size-capped at 64 KiB** (truncation marker on overflow — §4 rule
+  14, DONE) but still ANSI-laden and not field-addressable. Read `value`, not `render`, for data.
 - **A raised error now DOES mint a ref** (verified in `handlers_exec.rs`): the structured error
   value is stored in the transcript at `out:<n>`, and the JSON-RPC error's `data.ref` / `data.uri`
   point at it — `shoal_get {ref: data.ref}` fetches the full `{code, msg, span, hint, stderr}`
@@ -189,10 +207,11 @@ Worked example — drilling into an elided `ls` result (kernel test
 {"ref":"out:2","value":{"$":"record","v":{"name":{"$":"path","v":"f0003.txt"},"...":"..."}}}
 ```
 
-Note the elided `out` field's embedded `uri` is `shoal://out/2?path=out`. **(P1)** this may now be
-directly fetchable via `resources/read` (§0.8) — try that first and fall back to the manual
-translation below only if it 404s: the part before `?path=` gives you the short ref (`out:2`), the
-part after `?path=` gives you the `path` argument to pass to `shoal_get` instead.
+Note the elided `out` field's embedded `uri` is `shoal://out/2?path=out`. This is **directly
+fetchable via `resources/read`** (§0.8, DONE) — prefer that over the manual translation below, which
+remains only as a fallback for the rare URI that still 404s: the part before `?path=` gives you the
+short ref (`out:2`), the part after `?path=` gives you the `path` argument to pass to `shoal_get`
+instead.
 
 ### 0.3 `shoal_plan` — derive effects without spawning anything
 
@@ -200,14 +219,20 @@ part after `?path=` gives you the `path` argument to pass to `shoal_get` instead
 cannot change those. **Result** (`PlanResult`): `{"plan_ref": "plan:<16 hex chars>", "effects": [...],
 "reversibility": <see below>, "verdict": "allow"|"deny"|"approval_required", "approval_pending": bool}`.
 
-**(P1) `reversibility` fix, intended-not-independently-verified.** At authoring time, `reversibility`
-was **hard-coded to the string `"unknown"`** in the kernel dispatch regardless of what
-`shoal-leash`'s `Plan` actually computed. This is one of the six named P1 fixes — the intended
-post-fix value is `shoal-leash`'s real computed reversibility signal (its own type; check
-`shoal-leash`'s `Plan.reversibility` for the concrete variant names, since this card does not have
-them confirmed). **Before trusting a specific reversibility string in your reasoning, read
-`crates/shoal-kernel/src/lib.rs`'s plan dispatch once to confirm it no longer returns the literal
-`"unknown"`.** If it still does, treat it exactly as before: not a real signal.
+**`reversibility` is now a real, computed signal (DONE — verified directly in source).** The kernel's
+`reversibility_from_effects` (`crates/shoal-kernel/src/lib.rs`) derives it from the plan's own
+concrete effects rather than trusting `shoal-leash`'s coarser signal or returning the old hard-coded
+`"unknown"`: `"irreversible"` if any effect is `opaque` (T0/`sh{}` — unresolvable, so assume the
+worst), `net_connect`, or `net_listen`; `"reversible"` otherwise. **`fs_delete` (from `rm`/`mv`) is
+now correctly classified `"reversible"`, not `"irreversible"`** — shoal's default `rm` moves files
+into a journaled trash and `mv`'s source-clearing step is journaled too, so `shoal_apply`'s effects
+fully recover through the journal's undo inverses (`UndoInverse::TrashMove`/`MoveBack`/
+`RestoreBytes`); a plain `sh { rm -rf ... }` is structurally `opaque` instead (never `fs_delete`) and
+stays `"irreversible"`, correctly, since that path has no trash/undo record at all. **Known caveat**:
+`fs_delete` carries no field distinguishing shoal's trash-backed `rm` from a hypothetical
+`rm --permanent` (genuinely irreversible) — the effect type doesn't carry that distinction across the
+crate boundary yet, so don't read `"reversible"` as an ironclad guarantee for every conceivable delete
+path, only the default one.
 
 Effects are `$`-free plain JSON, tagged by a `"kind"` field (from `shoal-leash`'s `Effect` enum,
 `#[serde(tag="kind", rename_all="snake_case")]`): `fs_read{paths}`, `fs_write{paths}`,
@@ -219,7 +244,7 @@ Effects are `$`-free plain JSON, tagged by a `"kind"` field (from `shoal-leash`'
 ```json
 // {"name":"shoal_plan","arguments":{"src":"git push origin main"}}
 {"plan_ref":"plan:8f2c...","verdict":"allow","approval_pending":false,
- "reversibility":"unknown",   // (P1) may now be a real computed value — see note above, verify
+ "reversibility":"irreversible",   // net_connect present → irreversible (see note above)
  "effects":[{"kind":"fs_read","paths":["/abs/cwd"]},
             {"kind":"net_connect","host":"origin","port":443},
             {"kind":"proc_spawn","bin_hash":"...","argv0":"git"}]}
@@ -286,42 +311,46 @@ a `timeout_ms` conversion — §0.1) hands you `{"task": "task:<n>", "events": "
 carrying the result `ref`; `shoal_cancel {task}` requests cancellation. Note `task.suspend` is still
 unimplemented (always `-32020`, even over raw JSON-RPC).
 
-### 0.8 MCP resources — fetching elided payloads and subscribing to live output **(P1 — verify dispatch)**
+### 0.8 MCP resources — fetching elided payloads and subscribing to live output **(DONE — confirmed dispatched)**
 
-At authoring time, `Facade::handle()` dispatched exactly `initialize`, `ping`, `tools/list`,
-`tools/call` — no `resources/*` method existed, so every elided value's embedded `shoal://...` uri was
-a dead end you had to hand-translate (§4 rule 15 explains the manual fallback; keep reading that rule
-even if resources now work, since it's your escape hatch if a particular URI still 404s).
-`docs/AGENT-SURFACE.md` §1/§6/§8 spec the intended behavior, which this card assumes but does not
-independently confirm:
+`Facade::handle()` (`crates/shoal-mcp/src/lib.rs`) now dispatches `resources/list`, `resources/read`,
+`resources/subscribe`, and `resources/unsubscribe`, and `initialize` advertises
+`capabilities.resources.subscribe = true` — confirmed against source and by the live e2e test
+`crates/shoal-mcp/tests/live_kernel.rs`. Every elided value's embedded `shoal://...` uri is a live
+fetch target, not a dead end. §4 rule 15 keeps the manual `shoal_get`+URI-translation fallback
+documented anyway — it still works and is your escape hatch if a *particular* URI 404s.
 
-- `resources/list` enumerates stable roots (`shoal://jobs`, `shoal://journal`, `shoal://session/...`)
-  plus per-session dynamic entries (open tasks, recent `out:n`).
+- **`resources/list` enumerates the stable roots — `shoal://journal`, `shoal://jobs`,
+  `shoal://session/cwd` — plus per-session open tasks (`crates/shoal-mcp/src/resources.rs`'s
+  `resources_list`).** It does **not** enumerate recent `out:n` transcript values — those are only
+  fetchable by URI if you already have one (from an `ExecResult`'s elided `Ref` or a prior call),
+  never discoverable by listing. Don't expect to browse your way to an arbitrary past `out:n`.
 - `resources/read {uri}` on a value URI (e.g. `shoal://out/12?path=.rows[3].name`) returns
   `structuredContent` — the `$`-tagged (or further-elided) value at that path/slice, **without**
-  re-executing anything. This is the *intended* primary way to drill into an elided `Ref` — prefer it
-  over the §0.2/§4-rule-15 manual `ref`+`path` translation once you've confirmed it's live.
+  re-executing anything. This is the primary way to drill into an elided `Ref` — prefer it over the
+  §0.2/§4-rule-15 manual `ref`+`path` translation.
 - `resources/subscribe {uri}` on `shoal://events/{channel}` or `shoal://task/{id}/out` starts a push
   subscription; the server sends `notifications/resources/updated` with `{uri, seq, payload}` as
   events occur (§4 of `docs/AGENT-SURFACE.md`). **Never poll a resource you could instead subscribe
-  to** — that is the entire point of this layer existing. **Caveat (verified in source, known
-  gap)**: subscriptions see only events published on the **kernel's** bus (`events.publish` and the
-  kernel's own `task.{id}`/`session.transcript`/`journal`/`approval` traffic). The *language-level*
-  channel API (`channel("x").emit(v)` inside evaluated source — AGENT-SURFACE §7) runs on
-  `shoal-eval`'s own in-process bus, which is **not yet bridged to the kernel bus** — an in-language
-  `.emit()` will not reach your `resources/subscribe` on `shoal://events/user.x`. Cross-principal
-  signaling via language channels doesn't work over this surface yet; use kernel-published channels.
+  to** — that is the entire point of this layer existing.
+- **The language-channel→kernel-bus bridge now works, both directions, `user.*`-scoped (fixed —
+  this card previously and wrongly called this a gap).** Verified live: an in-language
+  `channel("user.x").emit(v)` (evaluated inside `src`) is forwarded to the kernel's wire bus and
+  **does** reach a `resources/subscribe` on `shoal://events/user.x` (`crates/shoal-kernel/src/
+  session.rs`'s `set_event_forwarder`); the reverse direction also works — a wire `events.publish`
+  on `user.x` is mirrored back into that session's in-language `channel("user.x")`
+  (`crates/shoal-kernel/src/eventbus.rs`'s `handle_events_publish` → `lang_bus.inject`). Only `user.*`
+  channels cross in either direction — kernel-owned semantic channels (`task.*`, `session.transcript`,
+  `journal`, `approval`) stay kernel-only and are not writable from language code. Cross-principal
+  signaling via `user.*` channels is a real, working substrate now, not a gap to route around.
 - Query params on any value-bearing URI: `?path=<fieldpath>&slice={a}..{b}&format=json|render|raw`
   (`docs/AGENT-SURFACE.md` §1) — same field-path grammar caveats as §0.2 (no `[a..b]` inside `path`,
   no negative indices) apply here too, since both go through the same `resolve_value_path`.
 
-**How to tell, in one call, whether this landed**: call `resources/list`. A `-32601 method not found`
-means it has not (fall back to §0.2's `shoal_get` + manual URI translation, §4 rule 15); any other
-response means it has, and resources are your preferred path for drilling into elided values and for
-subscribing to `task.{id}`/`session.transcript`/`journal` channels instead of re-calling
-`shoal_journal`/`shoal_get` in a loop (polling a tool result is always wrong here regardless of which
-layer is live — `docs/AGENT-SURFACE.md` §6 names polling explicitly as the anti-pattern this system
-exists to end).
+Resources are your preferred path for drilling into elided values and for subscribing to
+`task.{id}`/`session.transcript`/`journal`/`user.*` channels instead of re-calling
+`shoal_journal`/`shoal_get` in a loop — polling a tool result is always wrong here
+(`docs/AGENT-SURFACE.md` §6 names polling explicitly as the anti-pattern this system exists to end).
 
 ---
 
@@ -388,6 +417,7 @@ method; treat the signature as authoritative per CONTRACTS but verify empiricall
 | `uniq` | `.uniq()` | Preserves **first-occurrence order**, not a sorted dedup **(corpus** `collections.toml:list-uniq-preserves-first-occurrence-order`, `[3,1,3,2,1].uniq()` → `[3, 1, 2]`**)**. |
 | `wc -l`, `wc -c` | `.lines().len()`, `.len()` | **(corpus** `core.toml:method-len`, `strings.toml:str-len-counts-chars`**)**. |
 | `awk '{s+=$1} END{print s}'` (fold) | `.reduce(0, (acc, x) => acc + x)` (alias `.fold`) | Left fold — the general aggregation escape hatch when no named op (`.sum`/`.min`/`.max`/`.group`) fits; empty list returns the init **(corpus** `list-methods-3.toml:lm3-reduce-*`**)**. |
+| `awk '{a[$1]++} END{for (k in a) print k, a[k]}'` (group-by) | `.group(keyfn)` | Returns a **table whose rows are shaped `{key, values}`** — **not** `{items}`/`{rows}`/`{group}`. Verified against the binary: `[1,2,3,4].group(x => x % 2)` renders a two-row table with columns `key`/`values` (`{key: 1, values: [1, 3]}`, `{key: 0, values: [2, 4]}`); `g.map(.key)` → `[1, 0]`, `g.map(.values)` → `[[1, 3], [2, 4]]`. Guessing `.items`/`.rows` on a row (or the table) is a **silent-looking but loud** `field_missing` — don't guess the field name, it's `key`/`values`. |
 | `jq '. + {c:3}'` / build an object | `{a:1}.set("c", 3)`, `r.merge(other)` | Records are immutable values: `.set(k, v)` inserts/replaces one key (keeping position), `.merge(other)` layers `other`'s keys over the receiver (right wins). No `{...spread}` grammar and `+` on records is a `type_error` — use these **(corpus** `record-table-methods-2.toml:rt2-set-*`, `rt2-merge-*`**)**. Build from pairs: `pairs.reduce({}, (acc, kv) => acc.set(kv[0], kv[1]))`. |
 | `printf '%.2f' x` (round) | `x.round(2)`, `x.floor(2)`, `x.ceil(2)` | Round a `float` to N decimals (N optional, default 0 → nearest integer); ints pass through **(corpus** `numbers-more.toml:num-round-two-decimals`**)**. |
 | `$(( x + 1 ))` / str↔int | `"42".parse_int()` (str→int); `"{n}"` (int→str) | `.parse_int`/`.parse_float` are pinned in CONTRACTS §3; int→str is plain interpolation — no cast syntax. Verified against the binary: `"42".parse_int()` → `42`; `let n = 7; "{n}"` → `"7"`. |
@@ -643,10 +673,19 @@ work (`false < true` → `true`).
   exactly what makes `ls.where(.size > 1mb)` (TDD §1.4's own canonical example) and
   `ls.where(.name.contains("x"))` read the way they do — no explicit lambda parameter needed for the
   common case. A **bare `.field`** with no op/args also works and reaches a zero-arg **method** of
-  that name when there's no such field: `["a","b"].map(.upper)`, `paths.map(.name)`,
-  `[[],[1]].where(.is_empty)` (**corpus** `field-method-fallback.toml`). A real field always wins over
-  a same-named method (user data first). This is why `path` accessors (`.name .stem .ext .parent
-  .read .size .exists …`) read as fields inside a `.map(...)`.
+  that name when there's no such field — **but only on non-record receivers**: `str`/`path`/`int`/
+  `list` all still fall back this way (`["a","b"].map(.upper)`, `paths.map(.name)`,
+  `[1,2,3].sum`, `[[],[1]].where(.is_empty)` — **corpus** `field-method-fallback.toml`). A real field
+  always wins over a same-named method (user data first). This is why `path` accessors (`.name .stem
+  .ext .parent .read .size .exists …`) read as fields inside a `.map(...)`.
+  **`record` is strict (a fix just landed) — no fallback at all.** `.field`/bare-`.method` access on a
+  `record` that isn't one of its actual fields now raises `field_missing` loudly instead of silently
+  invoking a same-named method: `{a:1}.items`, `{a:1}.json`, `{a:1}.set` are all `field_missing:
+  missing field ...` (verified against the binary), even though `.items()`/`.set(k, v)` exist as real
+  record methods — call them **with parens** to reach the method (`{a:1}.set("c", 3)` works;
+  `{a:1}.set` does not). This also applies inside `.map(...)` over a list of records —
+  `[{a:1}].map(.items)` raises the same `field_missing`, not a silent method call. Don't guess a
+  result's field name against a record and expect the old fallback to save you; it won't.
 - Recursion works normally: `fn fact(n: int) { if n <= 1 { 1 } else { n * fact(n - 1) } }` (**corpus**
   `closures.toml:recursive-fn-factorial`); a `fn`'s own parameter can be captured by a lambda defined
   inside it and returned (**corpus** `fn-returns-closure-capturing-param`).
@@ -754,12 +793,18 @@ Each rule: what's forbidden, why, the corpus/source proof, and the correct alter
     fix-it "collect first, or `.tee(2)`") — TDD §1.9. Streams **are implemented** (channels,
     `every(dur)`, `.map`/`.scan`/`.take`/`.collect` all work, §6) — so this rule bites now: don't read
     one twice.
-11. **`it`/`out[n]` are REPL-only.** Verified against the binary: outside a REPL, `it` is the parse
-    error *"`it` is REPL-only"* and `out[3]` is *"`out` is REPL-only"*, both with the hint *"bind a
-    variable to reuse a previous result"*. The kernel forces `evaluator.interactive = false` for
-    **every** MCP-driven `exec` call (verified in `crates/shoal-kernel`) — treat `it`/`out`
-    as **unavailable through this MCP surface entirely**. Always bind with `let`, or keep the
-    returned `ref` and use `shoal_get`.
+11. **`it`/`out[n]` are reserved outside a REPL — everywhere, not just over MCP.** This is a
+    *parser*-level restriction, not an MCP-specific one — verified directly against the plain CLI
+    binary, no kernel/MCP involved: `shoal -c 'out'` and `shoal -c 'it'` are each the parse error
+    *"`it`/`out` is REPL-only"*, hint *"bind a variable to reuse a previous result"*; the identical
+    error fires from a `.shl` script file and from an MCP `shoal_exec` call alike. One nuance:
+    `let out = 1` *alone* still parses (the bare word `out` is a legal binding name) — it's any
+    subsequent bare-`out`/`it` **read** that errors, e.g. `shoal -c $'let out = 1\nout'` fails on the
+    second line with the same *"`out` is REPL-only"*. Over MCP specifically, the kernel additionally
+    forces `evaluator.interactive = false` for every exec (`crates/shoal-kernel`), but that's belt
+    and suspenders — the parse error alone already makes `it`/`out` unavailable in any non-REPL
+    context. Always bind with a different name via `let`, or keep the returned `ref` and use
+    `shoal_get`.
 12. **A raised MCP error now DOES mint a transcript ref** (updated — verified in
     `crates/shoal-kernel/src/handlers_exec.rs`): the structured error value is stored at `out:<n>`
     and the `-32002` error's `data.ref`/`data.uri` point at it, so `shoal_get {ref: data.ref}`
@@ -769,26 +814,38 @@ Each rule: what's forbidden, why, the corpus/source proof, and the correct alter
     even for a single bare expression — you get the `-32002` + `data.ref`, not a captured outcome.
     `try { } catch e { e }` inside `src` still works when you want the error as the *successful*
     return value.
-13. **`position: "value"`'s capture behavior only applies to a single bare expression statement.** Any
-    `src` with more than one statement (even a `let` followed by one command) always uses
-    raise-on-failure semantics, whatever `position` says (verified in `eval_with_position`,
-    `crates/shoal-kernel/src/lib.rs`). Keep single risky commands as standalone `shoal_exec` calls, or
-    wrap multi-statement risk in `try/catch` inside the source.
-14. **(P1 — was true at authoring, being fixed) The `render` field and the tool result's
-    `content[0].text` were NOT elided or size-bounded** — only `structuredContent.value` (and its
-    nested `Ref` elision) was. *Prior proof*: `crates/shoal-kernel/src/lib.rs`'s `exec` dispatch
-    computed `render` from the *full* un-elided value before any budget check ran;
-    `crates/shoal-mcp/src/lib.rs`'s `tool_result` pretty-printed the *entire* result (including that
-    unbounded `render`) into `content[0].text`. This is one of the six named P1 fixes — **verify it
-    against current source before assuming it's safe**; until you've confirmed the fix, keep treating
-    both fields as unbounded and always read `structuredContent.value`/`.ref`, drilling in with
-    `shoal_get`/resources rather than trusting `render`'s size.
-15. **An elided value's embedded `uri` (`shoal://...`) may now be independently fetchable via
-    `resources/read` (P1, §0.8)** — at authoring time no MCP `resources/*` method was implemented at
-    all (`crates/shoal-mcp/src/lib.rs`'s `handle` dispatched only `initialize`, `ping`, `tools/list`,
-    `tools/call`). If `resources/list` still 404s for you, fall back to translating the `uri`
-    yourself: the part before `?path=` is the short `ref` you already have; the part after is the
-    `path` argument to `shoal_get`.
+13. **`position: "value"`'s capture behavior applies to the *final* statement of `src`, however many
+    statements precede it — a multi-statement program does NOT force raise-on-failure across the
+    board (correcting this card's earlier, wrong claim).** `eval_with_position`
+    (`crates/shoal-kernel/src/lib.rs`) runs every statement *except the last* with ordinary
+    statement (raise-on-failure) semantics — so an earlier statement's failure always raises,
+    regardless of `position` — but then evaluates the trailing statement in true value position
+    **if and only if it's a bare expression**, exactly like the single-statement case: a failing
+    external command there is captured (`.ok == false`), not raised. Verified directly in source
+    and matching the example in `docs/AGENT-SURFACE.md`: `{src: "let x=1\nsh{exit 3}", position:
+    "value"}` comes back **captured** (`isError: false`, a normal outcome value with `.ok == false`),
+    not as an MCP error — the preceding `let` doesn't change that. Only a **builtin's** raised error
+    (`div_zero`, `index_range`, …) stays position-invariant (rule 12) — that one always raises even
+    as the trailing statement. If a command *before* the last statement might fail and you want to
+    inspect that failure without raising, wrap it in `try { ... } catch e { ... }` inside `src`.
+14. **DONE — `render` and the tool result's `content[0].text` are now both size-capped at 64 KiB**
+    (this used to be a real gap; the old unbounded behavior is what this rule described before the
+    fix). Two independent caps, verified directly in source: kernel-side, `bound_render`
+    (`crates/shoal-kernel/src/wire.rs`) bounds any `ExecResult`/`value.get` `render` string to
+    `ELIDE_HARD_CAP` (64 KiB) before it ever reaches the wire, so `structuredContent.render` is
+    capped too, not just `content[0].text`; MCP-side, `bound_text`/`RESULT_TEXT_HARD_CAP`
+    (`crates/shoal-mcp/src/tools.rs`) independently bounds `content[0].text` the same way. Both keep
+    a head of whole lines and append a `…(N more lines, fetch via <uri>)` marker — a huge render (the
+    comment in `wire.rs` names its own motivating case: "a huge outcome's ANSI-laden stdout") can no
+    longer bypass the wall the structured `value` already respects. This closes the "wall of bytes"
+    risk, but `render`/`text` remain ANSI-laden and non-structured — keep reading
+    `structuredContent.value`/`shoal_get` for anything you need to parse or branch on.
+15. **An elided value's embedded `uri` (`shoal://...`) is independently fetchable via
+    `resources/read` (DONE, §0.8)** — `resources/*` is confirmed dispatched
+    (`crates/shoal-mcp/src/lib.rs`'s `handle` now handles `resources/list`/`read`/`subscribe`/
+    `unsubscribe`), so this is the preferred path, not a maybe. If a *particular* URI still 404s,
+    fall back to translating it yourself: the part before `?path=` is the short `ref` you already
+    have; the part after is the `path` argument to `shoal_get`.
 16. **Background execution and task management are now fully reachable through MCP** (updated —
     verified in `crates/shoal-mcp/src/tools.rs` and `crates/shoal-kernel/src/handlers_exec.rs`):
     `shoal_exec {background: true}` returns a task ref immediately, `timeout_ms` converts an overdue
@@ -804,6 +861,33 @@ Each rule: what's forbidden, why, the corpus/source proof, and the correct alter
     exactly like the un-careted call, because the git adapter's `log` sub-spec only admits its own
     (narrower) flag surface. To reach the **raw binary** with arbitrary flags, use
     `run("git", "log", "--oneline", "-1")` or `sh { git log --oneline -1 }` (both verified working).
+19. **`glob("...")` constructs a glob *pattern value*, not an expanded list — indexing it directly is
+    a `type_error`.** `glob("*.rs")[0]` → `type_error: cannot index glob with int` (verified against
+    the binary; `crates/shoal-eval/src/expr_access.rs`'s `index` has no `glob` arm, so it falls
+    through to the generic `cannot index X with Y`). **Expansion happens at the command *callee*,
+    never at construction** (TDD §4.3, §2's glob rows) — this is the load-bearing fact, not a
+    throwaway one: pass the pattern to a command and let it expand there, either bare in CMD
+    position (`ls *.rs`) or as a parenthesized value (`ls (glob("*.rs"))`) — both verified working.
+    If you genuinely need the expanded list as a value with no command involved, `.expand()` on the
+    glob does it eagerly (verified against the binary: `glob("Cargo.toml").expand()[0]` → the
+    resolved path) — but handing the pattern to a callee is still the idiomatic path.
+20. **An outcome's field/method fallback to `.out` (§3.5) does not extend to the index operator, and
+    a `table` is never int-indexable at all.** `(ls)[0]` is `type_error: cannot index outcome with
+    int` even though `.where`/`.map`/etc. on that same outcome forward fine to `.out`; `(ls).out[0]`
+    (a `table`) is *also* `type_error: cannot index table with int` (both verified against the
+    binary — `expr_access.rs`'s `index` only has arms for `list`, `str`, and `record`-by-string-key;
+    everything else, including `outcome`/`table`/`glob`, falls to the generic error above).
+    *Alternative*: index a genuine `list` (a non-table `.out`) directly; reach a specific row of a
+    `table` with `.where(...)`, `.map(...)`, or `.first()` — never `[]`.
+21. **A search-tool call with zero matches raises `cmd_failed`, not an empty result — a common
+    bash-native surprise.** `sh { grep pattern file }` / `sh { rg pattern file }` on a clean miss
+    exits `1` (grep/ripgrep's own convention for "no matches"), and the shoal adapter default is
+    `ok_codes = {0}`, so the miss surfaces as `cmd_failed: ... exited with status 1` (verified
+    against the binary) rather than a quiet empty result. *Alternative*: wrap in
+    `try { ... } catch e { ... }` if "no matches" is an expected, non-exceptional outcome for your
+    use case, or check the specific tool's own exit-code convention (some tools reserve other codes
+    for "no results" vs. a genuine error) before assuming a non-zero status always means something
+    broke.
 
 ---
 
@@ -873,9 +957,9 @@ pins it — just verify empirically if you hit an edge).
 
 Stated plainly so you never waste a turn. **This card was first written against an early build and
 over-reported "not implemented"** — `.feed`, interpreter blocks, streams/channels, all six MCP
-`(P1)` items, and the whole `shoal_exec`/`shoal_get`/`shoal_journal`/`shoal_cap_request` schema
-surface were verified working against the current source/binary and are now marked done. The
-genuinely-still-missing items are: the language-channel→kernel-bus bridge (§0.8's caveat),
+`(P1)` items, the language-channel→kernel-bus bridge, and the whole
+`shoal_exec`/`shoal_get`/`shoal_journal`/`shoal_cap_request` schema surface were verified working
+against the current source/binary and are now marked done. The genuinely-still-missing items are:
 `task.suspend`, content-addressed refs, and real OS-level sandbox enforcement through this surface.
 When in doubt, run a one-line probe rather than trusting a stale banner.
 
@@ -900,11 +984,15 @@ When in doubt, run a one-line probe rather than trusting a stale banner.
 - **DONE — `complete` and `explain`** JSON-RPC methods (typed completions, structured explanations)
   are dispatched kernel-side (`dispatch.rs` → `handle_complete`/`handle_explain`). They are
   kernel-JSON-RPC-only — no `shoal_*` MCP tool wraps them yet.
-- **Language channels do not reach the kernel event bus (known gap).** `channel("x").emit(v)` in
-  evaluated source publishes to `shoal-eval`'s in-process bus only; `resources/subscribe` on
-  `shoal://events/user.x` will never see it. Only kernel-published channels
-  (`task.{id}`, `session.transcript`, `journal`, `approval`, and `events.publish` over raw JSON-RPC)
-  are subscribable today (§0.8).
+- **DONE — the language-channel→kernel-bus bridge (this card previously and wrongly called this a
+  gap).** `channel("user.x").emit(v)` in evaluated source **does** reach a `resources/subscribe`/
+  `events.subscribe` client on `shoal://events/user.x` — verified live, not just read from source:
+  `crates/shoal-kernel/src/session.rs`'s `set_event_forwarder` mirrors in-language `user.*` emits
+  onto the kernel's wire bus. The reverse direction works too: a wire `events.publish` on `user.x` is
+  mirrored back into that session's in-language `channel("user.x")`
+  (`crates/shoal-kernel/src/eventbus.rs`'s `handle_events_publish`). Only `user.*` channels cross,
+  either direction — kernel-owned channels (`task.{id}`, `session.transcript`, `journal`, `approval`)
+  stay kernel-only, exactly as `docs/AGENT-SURFACE.md` §4 specs (see §0.8).
 - **~~`.feed` and interpreter blocks~~ — NOW IMPLEMENTED (this card's original banner was stale).**
   Verified working against the current binary: `["b","a","c"].feed(sort).out`, and **commands with
   args/flags parse bare** — `["b","a","c"].feed(sort -r).out`, `data.feed(grep "foo").out`,

@@ -60,13 +60,12 @@ set, or falls back to `/tmp/shoal-<uid>/shoal/default.sock` if it isn't.
 
 ### macOS socket path
 
-`XDG_RUNTIME_DIR` is a Linux/systemd convention — **it is typically not set on macOS**. A companion
-change to `shoal-mcp` is landing a matching `/tmp/shoal-<uid>/shoal/<session>.sock` fallback (mirroring
-`shoal-kernel`'s own default) so the two binaries' socket resolution can't drift apart even when
-`XDG_RUNTIME_DIR` is unset. **Verify this landed** (`shoal-mcp --help` or a quick read of its socket
-resolution in `crates/shoal-mcp`) before relying on it — if it hasn't yet, `shoal-mcp` only checks
-`--socket`, `SHOAL_SOCKET`, and `XDG_RUNTIME_DIR`, in that order, and exits with an error if none
-resolve. The robust, works-either-way fix is to pin an explicit socket path on both ends:
+`XDG_RUNTIME_DIR` is a Linux/systemd convention — **it is typically not set on macOS**. `shoal-mcp`
+now matches `shoal-kernel`'s own fallback exactly: `$XDG_RUNTIME_DIR/shoal/<session>.sock` when
+`XDG_RUNTIME_DIR` is set, else `$TMPDIR/shoal-<uid>/shoal/<session>.sock` (macOS exports `TMPDIR`),
+else `/tmp/shoal-<uid>/shoal/<session>.sock`. So the two binaries' socket resolution can no longer
+drift apart, on either OS. The robust, explicit-everywhere alternative is still to pin a socket path
+on both ends yourself:
 
 ```sh
 mkdir -p ~/.local/state/shoal
@@ -74,18 +73,27 @@ shoal-kernel --socket ~/.local/state/shoal/kernel.sock &
 export SHOAL_SOCKET=~/.local/state/shoal/kernel.sock   # must be set in the shell that launches `claude`
 ```
 
-**Keep `--socket` paths short.** Unix domain socket paths are capped at roughly **108 bytes**
+**Put `--socket` inside a directory you own.** The kernel secures a socket's parent directory
+(`chmod 0700`) when it created that directory or already owns it, but it will not — and cannot
+safely — touch permissions on a pre-existing directory owned by someone else (e.g. a bare shared
+`/tmp`, as in `--socket /tmp/x.sock`). Point `--socket` at a path under a directory only you control
+— `$XDG_RUNTIME_DIR/shoal/…`, `~/.local/state/shoal/…`, or `/tmp/shoal-<uid>/…` — and the kernel
+creates and locks it down for you. Get this wrong and the kernel now gives a descriptive error
+naming exactly this fix (`cannot secure socket dir …; use a socket path inside a directory you own,
+e.g. $XDG_RUNTIME_DIR/shoal/... or /tmp/shoal-<uid>/...`) rather than a confusing bind failure.
+
+**Keep `--socket` paths short, too.** Unix domain socket paths are capped at roughly **108 bytes**
 (`SUN_LEN`/`sun_path`; ~104 on macOS), and the limit applies to the whole absolute path. A socket
 buried in a deep project or temp directory fails to bind/connect with an unhelpful
-`Invalid argument`-style error. Prefer short, stable locations like the examples here
+`Invalid argument`-style error. Prefer short, stable, self-owned locations like the examples here
 (`~/.local/state/shoal/…`, `/tmp/shoal-<uid>/…`) over anything nested inside a checkout.
 
 Claude Code's stdio MCP servers inherit the environment of the process that launched `claude` — so
 whichever shell starts your Claude Code session needs `SHOAL_SOCKET` (or `XDG_RUNTIME_DIR`) exported
-*before* `claude` starts, every time, on both macOS and Linux, **unless** the `shoal-mcp` `/tmp`
-fallback above has landed and you're fine relying on it. Once a socket resolves consistently on both
-ends, behavior is identical on macOS and Linux — these are plain Rust binaries with no OS-specific
-code path in this plugin's usage.
+*before* `claude` starts, every time, on both macOS and Linux, unless you're fine relying on the
+`/tmp`/`TMPDIR` fallback above. Once a socket resolves consistently on both ends, behavior is
+identical on macOS and Linux — these are plain Rust binaries with no OS-specific code path in this
+plugin's usage.
 
 ## Install
 
