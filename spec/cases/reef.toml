@@ -196,6 +196,23 @@ error = "custom"
 error_contains = "with cwd:"
 
 [[case]]
+name = "jump-inside-fn-body-is-illegal"
+# `j`/`jump` is a session-cwd mutation, exactly like `cd`, so it is illegal
+# inside a `fn` body for the same reason (the fix-it names `with cwd:`). This
+# guard fires before any frecency-store I/O, so the case is host-independent.
+src = "fn f() { jump \"x\" }\nf()"
+error = "custom"
+error_contains = "with cwd:"
+
+[[case]]
+name = "jump-takes-at-most-one-query"
+# `j`/`jump` accepts an optional single query. A second argument is an
+# arg_error, caught before the store is ever consulted (host-independent).
+src = "jump \"a\" \"b\""
+error = "arg_error"
+error_contains = "at most one query"
+
+[[case]]
 name = "reef-env-assign-inside-fn-body-is-illegal"
 # TDD §4.6: `env.NAME = v` is illegal inside `fn` bodies, same rule as `cd`.
 # The assignment lookahead now accepts a `Field` target rooted at `env`

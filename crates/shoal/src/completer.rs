@@ -27,12 +27,12 @@ use shoal_syntax::{Lexer, Mode, Tok};
 use shoal_value::{Env, Value};
 
 /// Command names shoal-eval special-cases or implements directly
-/// (`crates/shoal-eval/src/builtins.rs::NAMES` plus the `cd`/`pwd`/`run`/
-/// `source` heads special-cased in `eval_command`). Kept in sync by hand:
+/// (`crates/shoal-eval/src/builtins.rs::NAMES` plus the `cd`/`pwd`/`j`/`jump`/
+/// `run`/`source` heads special-cased in `eval_command`). Kept in sync by hand:
 /// shoal-eval doesn't expose this list publicly (see api_changes).
 const SHOAL_BUILTINS: &[&str] = &[
     "echo", "ls", "cat", "mkdir", "touch", "cp", "mv", "rm", "stat", "which", "env", "sleep", "cd",
-    "pwd", "run", "source",
+    "pwd", "j", "jump", "run", "source",
 ];
 
 /// Cursor context, resolved from the raw buffer text alone (no full parse —

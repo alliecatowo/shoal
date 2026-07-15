@@ -48,7 +48,8 @@ fn is_keyword(name: &str) -> bool {
 
 fn is_valid_command(cmd: &str) -> bool {
     let builtins = [
-        "cd", "pwd", "ls", "echo", "run", "spawn", "parallel", "jobs", "history", "clear", "exit",
+        "cd", "pwd", "j", "jump", "ls", "echo", "run", "spawn", "parallel", "jobs", "history",
+        "clear", "exit",
     ];
     if builtins.contains(&cmd) {
         return true;

@@ -232,7 +232,9 @@ impl Evaluator {
         if let Some(body) = functions.get(&call.head) {
             return self.plan_block(body, functions, aliases, out, depth + 1);
         }
-        if builtins::is_builtin(&call.head) || matches!(call.head.as_str(), "cd" | "pwd") {
+        if builtins::is_builtin(&call.head)
+            || matches!(call.head.as_str(), "cd" | "pwd" | "j" | "jump")
+        {
             for effect in self.builtin_effects(call)? {
                 push_effect(out, effect);
             }

@@ -9,6 +9,7 @@ mod command;
 mod expr;
 mod expr_access;
 mod expr_binop;
+mod frecency;
 mod helpers;
 mod host;
 mod journal;
@@ -155,6 +156,13 @@ pub struct Evaluator {
     /// Derived-but-unspawned plans from the `plan { … }` REPL verb (ROADMAP R3),
     /// indexed by id (`1`-based). `apply <ref>` looks a plan up here and runs it.
     plans: Vec<Program>,
+    /// Persistent directory-frecency store for `j`/`jump` (`frecency.rs`).
+    /// `None` (the `Evaluator::new` default, so `-c`/scripts/conformance never
+    /// write) disables recording; a `j` query then still reads the shared
+    /// per-user store. `Some(path)` (set by an interactive host via
+    /// [`Evaluator::open_default_jump_history`], or a test via
+    /// [`Evaluator::set_jump_store`]) makes every `cd` bump that file.
+    jump_store: Option<PathBuf>,
     /// Hexagonal effect ports (docs/ROADMAP.md R4). Every direct filesystem,
     /// spawn, clock, opener, and secret call the domain core makes routes
     /// through one of these instead of `std::*`. The defaults are the `Std*`
@@ -216,6 +224,7 @@ impl Evaluator {
             modules: std::collections::HashMap::new(),
             module_stack: Vec::new(),
             plans: Vec::new(),
+            jump_store: None,
             fs: Arc::new(StdFs),
             exec: Arc::new(StdExec),
             clock: Arc::new(StdClock),

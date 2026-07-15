@@ -240,7 +240,17 @@ impl Evaluator {
             self.cwd = if p.is_absolute() { p } else { self.cwd.join(p) }
                 .canonicalize()
                 .map_err(|e| ErrorVal::new("arg_error", e.to_string()))?;
+            // Record the destination into the `j`/`jump` frecency store so every
+            // cd feeds directory history (best-effort; never fails the cd).
+            let cwd = self.cwd.clone();
+            self.record_cd(&cwd);
             return Ok(Value::Path(self.cwd.clone()));
+        }
+        // `j`/`jump`: frecency-ranked directory jump (frecency.rs). A session-
+        // cwd mutation like `cd`, so it is intercepted here rather than in the
+        // pure `builtins::run` dispatch (which cannot change the cwd).
+        if call.head == "j" || call.head == "jump" {
+            return self.eval_jump(call);
         }
         if call.head == "pwd" {
             return Ok(Value::Path(self.cwd.clone()));
@@ -670,6 +680,8 @@ impl Evaluator {
             || matches!(
                 name,
                 "cd" | "pwd"
+                    | "j"
+                    | "jump"
                     | "exit"
                     | "quit"
                     | "source"
