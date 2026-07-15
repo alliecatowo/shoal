@@ -50,6 +50,45 @@ fn float_op(op: BinOp, a: f64, b: f64) -> Value {
     })
 }
 
+/// `size * float` (either operand order). The float→int `as` cast SATURATES
+/// (NaN/negative→0, overflow→u64::MAX), which silently produced garbage sizes
+/// where the integer arms (`checked_mul` + `< 0` guard) correctly error. Range-
+/// check the rounded product before casting and mirror the integer arms' exact
+/// error codes/messages: a negative product is `type_error: size cannot go
+/// negative`; a non-finite or out-of-u64-range product is `overflow: size
+/// overflow`.
+fn size_mul_float(a: u64, b: f64) -> VResult<Value> {
+    let product = (a as f64) * b;
+    let rounded = product.round();
+    if rounded.is_nan() {
+        return Err(ErrorVal::new("overflow", "size overflow"));
+    }
+    if rounded < 0.0 {
+        return Err(ErrorVal::type_error("size cannot go negative"));
+    }
+    // `u64::MAX as f64` rounds up to 2^64; reject `>=` so the subsequent cast
+    // can never saturate (every value strictly below 2^64 casts exactly).
+    if rounded >= u64::MAX as f64 {
+        return Err(ErrorVal::new("overflow", "size overflow"));
+    }
+    Ok(Value::Size(rounded as u64))
+}
+
+/// `duration * float` (either operand order). Same saturating-cast hazard as
+/// [`size_mul_float`], but durations are signed and negatives are legal, so
+/// both over- and under-flow map to `overflow: duration overflow` — exactly
+/// what the integer `Duration * int` arm's `checked_mul` produces.
+fn duration_mul_float(a: i64, b: f64) -> VResult<Value> {
+    let product = (a as f64) * b;
+    let rounded = product.round();
+    // `i64::MAX as f64` rounds up to 2^63 and `i64::MIN as f64` is exactly
+    // -2^63; reject `>= 2^63` and `< -2^63` so the cast can never saturate.
+    if rounded.is_nan() || rounded >= i64::MAX as f64 || rounded < i64::MIN as f64 {
+        return Err(ErrorVal::new("overflow", "duration overflow"));
+    }
+    Ok(Value::Duration(rounded as i64))
+}
+
 /// Apply an arithmetic/comparison/`in` operator. `&&`/`||`/`??` short-circuit
 /// in the evaluator and never reach here.
 pub fn binop(op: BinOp, lhs: &Value, rhs: &Value) -> VResult<Value> {
@@ -157,8 +196,8 @@ pub fn binop(op: BinOp, lhs: &Value, rhs: &Value) -> VResult<Value> {
                     .ok_or_else(|| ErrorVal::new("overflow", "size overflow"))
             }
         }
-        (Size(a), Float(b)) if op == Mul => Ok(Size((*a as f64 * b).round() as u64)),
-        (Float(a), Size(b)) if op == Mul => Ok(Size((a * *b as f64).round() as u64)),
+        (Size(a), Float(b)) if op == Mul => size_mul_float(*a, *b),
+        (Float(a), Size(b)) if op == Mul => size_mul_float(*b, *a),
 
         // --- duration ---
         // Checked like int/size: unchecked `+`/`*` here PANICKED the whole
@@ -200,8 +239,8 @@ pub fn binop(op: BinOp, lhs: &Value, rhs: &Value) -> VResult<Value> {
             .checked_mul(*b)
             .map(Duration)
             .ok_or_else(|| ErrorVal::new("overflow", "duration overflow")),
-        (Duration(a), Float(b)) if op == Mul => Ok(Duration((*a as f64 * b).round() as i64)),
-        (Float(a), Duration(b)) if op == Mul => Ok(Duration((a * *b as f64).round() as i64)),
+        (Duration(a), Float(b)) if op == Mul => duration_mul_float(*a, *b),
+        (Float(a), Duration(b)) if op == Mul => duration_mul_float(*b, *a),
 
         // --- datetime ---
         (DateTime(z), Duration(ns)) => {
@@ -353,6 +392,70 @@ mod tests {
             )
             .unwrap(),
             Value::Duration(60_000_000_000)
+        );
+    }
+
+    #[test]
+    fn size_duration_times_float_is_checked() {
+        // In-range products still round-cast fine.
+        assert_eq!(
+            binop(Mul, &Value::Size(2000), &Value::Float(1.5)).unwrap(),
+            Value::Size(3000)
+        );
+        assert_eq!(
+            binop(Mul, &Value::Float(1.5), &Value::Size(2000)).unwrap(),
+            Value::Size(3000)
+        );
+        // Overflow past u64 -> `overflow: size overflow`, both operand orders.
+        let e = binop(
+            Mul,
+            &Value::Size(9_000_000_000_000_000_000),
+            &Value::Float(100.0),
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "overflow");
+        assert!(e.msg.contains("size overflow"), "{}", e.msg);
+        assert_eq!(
+            binop(
+                Mul,
+                &Value::Float(100.0),
+                &Value::Size(9_000_000_000_000_000_000)
+            )
+            .unwrap_err()
+            .code,
+            "overflow"
+        );
+        // Negative product -> `type_error: size cannot go negative`.
+        let e = binop(Mul, &Value::Size(1000), &Value::Float(-1.0)).unwrap_err();
+        assert_eq!(e.code, "type_error");
+        assert!(e.msg.contains("negative"), "{}", e.msg);
+        // NaN / infinite products are rejected as overflow, never cast to 0.
+        assert_eq!(
+            binop(Mul, &Value::Size(1000), &Value::Float(f64::NAN))
+                .unwrap_err()
+                .code,
+            "overflow"
+        );
+        assert_eq!(
+            binop(Mul, &Value::Size(1000), &Value::Float(f64::INFINITY))
+                .unwrap_err()
+                .code,
+            "overflow"
+        );
+        // Durations are signed: a negative product is legal, not an error.
+        assert_eq!(
+            binop(Mul, &Value::Duration(5_000_000_000), &Value::Float(-1.0)).unwrap(),
+            Value::Duration(-5_000_000_000)
+        );
+        // Duration overflow past i64 -> `overflow: duration overflow`.
+        let e = binop(Mul, &Value::Duration(i64::MAX), &Value::Float(1000.0)).unwrap_err();
+        assert_eq!(e.code, "overflow");
+        assert!(e.msg.contains("duration overflow"), "{}", e.msg);
+        assert_eq!(
+            binop(Mul, &Value::Float(1000.0), &Value::Duration(i64::MIN))
+                .unwrap_err()
+                .code,
+            "overflow"
         );
     }
 

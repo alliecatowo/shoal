@@ -32,6 +32,29 @@ name = "list2-sort-by-descending-key"
 src = "[3, 1, 2].sort_by(x => -x)"
 value = "[3, 2, 1]"
 
+# `.sort_by`/`.sort(.key)` must PROPAGATE the key-comparison error like `.sort()`
+# does — not silently mis-order incomparable keys as `Equal`. All three of the
+# forms below error consistently with `[1, "a", 2].sort()`.
+# See crates/shoal-value/src/methods/list.rs::sort_by (FIX 2).
+
+[[case]]
+name = "list2-sort-by-incomparable-keys-errors"
+src = '[{k: 1}, {k: "a"}, {k: 2}].sort_by(r => r.k)'
+error = "type_error"
+error_contains = "cannot compare"
+
+[[case]]
+name = "list2-sort-key-incomparable-keys-errors"
+src = '[{k: 1}, {k: "a"}, {k: 2}].sort(.k)'
+error = "type_error"
+error_contains = "cannot compare"
+
+[[case]]
+name = "list2-sort-elements-incomparable-errors"
+src = '[1, "a", 2].sort()'
+error = "type_error"
+error_contains = "cannot compare"
+
 [[case]]
 name = "list2-zip-stops-at-shorter-input"
 src = "[1, 2, 3].zip([10, 20])"

@@ -564,12 +564,25 @@ fn parse_z_records(bytes: &[u8], hint: Option<&str>) -> Option<Value> {
         return Some(Value::Table(Vec::new()));
     }
     let mut cells = bytes.split(|b| *b == 0).collect::<Vec<_>>();
-    // A well-formed NUL-terminated stream ends with a separator, which
-    // splits into one trailing empty cell. Tolerate any number of stray
-    // trailing separators (and thus trailing empty cells) rather than
-    // only ever popping exactly one -- an extra trailing separator should
-    // not make otherwise well-formed records degrade to unparsed bytes.
-    while cells.last().is_some_and(|x| x.is_empty()) {
+    // A stream of nothing but NUL bytes carries no field data at all: an empty
+    // table, not a row of empty fields.
+    if cells.iter().all(|x| x.is_empty()) {
+        return Some(Value::Table(Vec::new()));
+    }
+    // A well-formed NUL-*terminated* stream of N complete records splits into
+    // exactly ONE trailing empty cell (the final record terminator), giving
+    // `N * fields + 1` cells. Pop only that single terminator -- and only when
+    // it is genuinely a stray terminator (`len % fields == 1`), NEVER a
+    // legitimately-empty FINAL field. The old loop popped *every* trailing
+    // empty, so a real `git log ... -z` whose most-recent commit has an empty
+    // subject (`...\0author\0date\0<empty subject>\0`) lost its trailing empty
+    // field, breaking `len % fields` and degrading the whole table to raw
+    // bytes. Popping exactly one keeps that `subject: ""` field intact. (A
+    // stream with more than one stray trailing separator is genuinely
+    // malformed and degrades to bytes below, per TDD §6 "mismatch degrades to
+    // bytes rather than lying" -- it can't be told apart from an empty final
+    // field without lying about one of the two.)
+    if cells.len() % fields.len() == 1 && cells.last().is_some_and(|x| x.is_empty()) {
         cells.pop();
     }
     if cells.is_empty() {
@@ -1032,20 +1045,63 @@ output={parse="porcelain-v2", type="table<{status: str, path: path}>"}
     }
 
     #[test]
-    fn z_records_tolerates_trailing_separators() {
+    fn z_records_single_terminator_and_noise() {
         let h = "table<{hash: str, author: str, path: path}>";
-        // A single trailing NUL (the normal `-z`-terminated shape).
+        // A single trailing NUL (the normal `-z`-terminated shape): `N*fields+1`
+        // cells, one trailing terminator empty -> pop exactly one -> N rows.
         let single = parse_output("z-records", b"abc\0Allie\0a.rs\0", Some(h)).unwrap();
         assert!(matches!(&single, Value::Table(t) if t.len() == 1));
-        // A stray extra trailing NUL must not make an otherwise well-formed
-        // stream degrade to unparsed bytes.
-        let double = parse_output("z-records", b"abc\0Allie\0a.rs\0\0", Some(h)).unwrap();
-        assert!(matches!(&double, Value::Table(t) if t.len() == 1));
-        // Pure separator noise with no records at all is an empty table.
+        // Pure separator noise with no field data at all is an empty table.
         assert_eq!(
             parse_output("z-records", b"\0\0", Some(h)),
             Some(Value::Table(vec![]))
         );
+        // Regression for FIX 3: a genuinely-empty FINAL field must survive.
+        // `abc\0Allie\0\0` (path is empty) + `-z` terminator `\0` splits to
+        // [abc, Allie, "", ""] = 4 cells, `4 % 3 == 1`; popping the single
+        // terminator keeps the empty `path` field instead of over-trimming it
+        // and degrading the whole table to bytes.
+        let empty_last =
+            parse_output("z-records", b"abc\0Allie\0\0", Some(h)).expect("empty last field parses");
+        match &empty_last {
+            Value::Table(t) => {
+                assert_eq!(t.len(), 1);
+                assert_eq!(t[0]["path"], Value::Path("".into()));
+            }
+            other => panic!("expected a 1-row table, got {other:?}"),
+        }
+        // A stream carrying MORE than the single record terminator (a genuine
+        // stray extra NUL) is malformed and now degrades to bytes rather than
+        // being silently absorbed -- the deliberate FIX 3 trade: absorbing
+        // arbitrary trailing NULs is indistinguishable from an empty final
+        // field, and preserving the field wins (TDD §6).
+        assert!(parse_output("z-records", b"abc\0Allie\0a.rs\0\0", Some(h)).is_none());
+    }
+
+    #[test]
+    fn z_records_git_log_empty_subject_stays_a_table() {
+        // The real trigger: `adapters/git.toml`'s `git log ... -z` emits 4
+        // fields (`%H\0%an\0%aI\0%s`) per commit. A repo whose most-recent
+        // commit has an EMPTY subject produces a trailing empty `subject` cell
+        // immediately before the `-z` record terminator. The old loop popped
+        // both, corrupting `len % fields` and degrading the log to raw bytes;
+        // FIX 3 pops only the single terminator so `subject: ""` survives.
+        let h = "table<{hash: str, author: str, date: datetime, subject: str}>";
+        // Two commits: the second (most-recent-first from git) has an empty
+        // subject. Bytes: rec1 fields + \0, rec2 fields (empty subject) + \0.
+        // `\x00` (not `\0`) before the year digits so the NUL doesn't read as
+        // an octal escape.
+        let bytes =
+            b"h2\0Bob\x002024-01-02T00:00:00Z\0\0h1\0Alice\x002024-01-01T00:00:00Z\0first commit\0";
+        let v = parse_output("z-records", bytes, Some(h)).expect("git-log z-records parses");
+        match &v {
+            Value::Table(t) => {
+                assert_eq!(t.len(), 2, "both commits present");
+                assert_eq!(t[0]["subject"], Value::Str("".into()));
+                assert_eq!(t[1]["subject"], Value::Str("first commit".into()));
+            }
+            other => panic!("expected a 2-row table, got {other:?}"),
+        }
     }
 
     #[test]
