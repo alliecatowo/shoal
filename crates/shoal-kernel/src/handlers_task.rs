@@ -264,8 +264,15 @@ impl Kernel {
             }
         }
         stored.approved = true;
+        // Same honest enforcement truth `session.attach`'s `caps_enforced`
+        // reports (docs/ROADMAP.md open-item #5) — not a hardcoded `false`.
+        // An agent that just unstuck an `approval_pending` plan via
+        // `cap.request` must learn whether the OS is actually going to
+        // confine what it is about to run, the same way it would have
+        // learned at attach time.
+        let enforced = self.caps_enforced_for(&stored.principal);
         encode(
-            json!({"grant":"approved","plan_ref":plan_ref,"enforced":false,"granted_effects":requested}),
+            json!({"grant":"approved","plan_ref":plan_ref,"enforced":enforced,"granted_effects":requested}),
         )
     }
 }

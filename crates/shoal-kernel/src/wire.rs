@@ -177,6 +177,34 @@ pub(crate) fn resolve_value_path(value: &Value, path: &str) -> Result<Value, Str
     Ok(current)
 }
 
+/// `Outcome`'s wire `span` (AGENT-SURFACE §2: "source span of the
+/// invocation"), honestly reported.
+///
+/// **Always `None` today** — and that is not this function discarding a
+/// value it has in hand. `OutcomeVal` (`crates/shoal-value/src/outcome.rs`)
+/// carries no `span` field at all, so there is nothing here to forward. The
+/// span genuinely exists in scope at the moment an outcome is *constructed*
+/// — `crates/shoal-eval/src/command.rs`'s spawn path already has a `span`
+/// local at that point (it stamps the *error* path's `ErrorVal` with
+/// `.with_span(span)` a few lines above where the success-path `OutcomeVal`
+/// is built) — but it is dropped before reaching `OutcomeVal`, because
+/// `OutcomeVal` has no field to hold it.
+///
+/// Populating this honestly (rather than fabricating a plausible-looking
+/// span) needs an eval-side plumb, out of `shoal-kernel`'s lane:
+/// 1. add `pub span: Option<Span>` to `OutcomeVal` (`shoal-value`, a Tier 1
+///    crate `shoal-kernel` does not own);
+/// 2. thread the invocation's span into every `OutcomeVal { .. }`
+///    constructor (`shoal-eval/src/command.rs`'s spawn path and
+///    `shoal-eval/src/host.rs`'s `builtin_outcome`).
+///
+/// Once that lands, this becomes `o.span.map(|s| WireSpan{start:s.start,
+/// end:s.end})` and both call sites below stop being honest-null and start
+/// reporting the real thing.
+fn outcome_span(_o: &shoal_value::OutcomeVal) -> Option<WireSpan> {
+    None
+}
+
 pub(crate) fn wire_value(value: &Value) -> WireValue {
     match value {
         Value::Null => WireValue::Null,
@@ -266,7 +294,7 @@ pub(crate) fn wire_value(value: &Value) -> WireValue {
             dur_ns: o.dur_ns,
             pid: o.pid,
             cmd: o.cmd.clone(),
-            span: None,
+            span: outcome_span(o),
         },
         Value::Task(t) => WireValue::Task {
             id: t.id,
@@ -430,7 +458,7 @@ pub(crate) fn elide_wire_value(value: &Value, uri: &str, budget: &ElideBudget) -
             dur_ns: o.dur_ns,
             pid: o.pid,
             cmd: o.cmd.clone(),
-            span: None,
+            span: outcome_span(o),
         };
     }
     let wire = wire_value(value);
@@ -472,6 +500,26 @@ pub(crate) fn elide_wire_value(value: &Value, uri: &str, budget: &ElideBudget) -
     }
 }
 
+/// Strip ANSI escape sequences (SGR color codes and other CSI-final-byte
+/// sequences — cursor movement, etc.) from `s`.
+///
+/// `shoal_value::render::render_block`/`render_inline` unconditionally emit
+/// ANSI (`color_for_value` et al. in `shoal-value/src/render.rs`) — fine for
+/// `shoal`'s own interactive REPL, which reads a real terminal and wants the
+/// color, but agent-hostile noise on the kernel/MCP wire: `session.attach`
+/// forces every kernel exec headless (`evaluator.interactive = false`,
+/// `handlers_exec.rs`) and a cold-agent field test found the escape bytes
+/// still landing verbatim in `structuredContent.render` and `content[].text`
+/// — an agent has no terminal to interpret them, so they read as junk
+/// characters. Delegates to the `vte`-based `strip-ansi-escapes` crate
+/// (already resolved in the workspace's dependency graph via `reedline`,
+/// `shoal`'s REPL line-editor) rather than a hand-rolled regex, so this
+/// correctly handles the full ECMA-48 CSI grammar (`ESC '[' params
+/// intermediates final`), not just the `ESC [ ... m` SGR subset.
+pub(crate) fn strip_ansi(s: &str) -> String {
+    strip_ansi_escapes::strip_str(s)
+}
+
 /// Bound a human render string to `ELIDE_HARD_CAP`, the same hard cap
 /// `shoal-mcp`'s `content[0].text` is bounded to (AGENT-SURFACE §3). Without
 /// this, `ExecResult.render`/`value.get`'s `format=render` response can carry
@@ -481,11 +529,18 @@ pub(crate) fn elide_wire_value(value: &Value, uri: &str, budget: &ElideBudget) -
 /// at the wire boundary (here) rather than only at the MCP facade so every
 /// kernel client, not just `shoal-mcp`, gets the same honest bound.
 ///
+/// `strip` is `true` on the headless/MCP path (the attaching client did not
+/// declare itself a real tty — `Attachment::tty`) and `false` for a genuine
+/// interactive kernel-hosted client; stripping happens *before* bounding so
+/// the byte budget is spent on content, not escape codes a client can't use
+/// anyway.
+///
 /// Keeps a head of whole lines under the budget and appends a
 /// `…(N more lines, fetch via <uri>)` marker — mirroring `shoal-mcp::tools::
 /// bound_text`'s truncation shape so an agent sees the same "how do I get
 /// the rest" hint everywhere a render is bounded.
-pub(crate) fn bound_render(render: String, uri: &str) -> String {
+pub(crate) fn bound_render(render: String, uri: &str, strip: bool) -> String {
+    let render = if strip { strip_ansi(&render) } else { render };
     if render.len() <= ELIDE_HARD_CAP {
         return render;
     }
