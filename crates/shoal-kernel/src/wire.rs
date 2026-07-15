@@ -471,3 +471,40 @@ pub(crate) fn elide_wire_value(value: &Value, uri: &str, budget: &ElideBudget) -
         render_head,
     }
 }
+
+/// Bound a human render string to `ELIDE_HARD_CAP`, the same hard cap
+/// `shoal-mcp`'s `content[0].text` is bounded to (AGENT-SURFACE §3). Without
+/// this, `ExecResult.render`/`value.get`'s `format=render` response can carry
+/// an arbitrarily large render string (e.g. a huge outcome's ANSI-laden
+/// stdout) right next to a properly-elided structured `value` — the render
+/// field bypassing the wall the structured value already respects. Applied
+/// at the wire boundary (here) rather than only at the MCP facade so every
+/// kernel client, not just `shoal-mcp`, gets the same honest bound.
+///
+/// Keeps a head of whole lines under the budget and appends a
+/// `…(N more lines, fetch via <uri>)` marker — mirroring `shoal-mcp::tools::
+/// bound_text`'s truncation shape so an agent sees the same "how do I get
+/// the rest" hint everywhere a render is bounded.
+pub(crate) fn bound_render(render: String, uri: &str) -> String {
+    if render.len() <= ELIDE_HARD_CAP {
+        return render;
+    }
+    let budget = ELIDE_HARD_CAP.saturating_sub(96);
+    let total_lines = render.lines().count();
+    let mut head = String::new();
+    let mut kept = 0usize;
+    for line in render.lines() {
+        if head.len() + line.len() + 1 > budget {
+            break;
+        }
+        head.push_str(line);
+        head.push('\n');
+        kept += 1;
+    }
+    // Degenerate case: a single line longer than the whole budget.
+    if head.is_empty() {
+        head = render.chars().take(budget).collect();
+    }
+    let remaining = total_lines.saturating_sub(kept);
+    format!("{head}…({remaining} more lines, fetch via {uri})")
+}

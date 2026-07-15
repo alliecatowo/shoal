@@ -37,8 +37,7 @@ fn prepare_socket(path: &Path) -> io::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "socket needs parent"))?;
-    fs::create_dir_all(parent)?;
-    fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+    secure_socket_dir(parent)?;
     if path.exists() {
         if UnixStream::connect(path).is_ok() {
             return Err(io::Error::new(
@@ -57,6 +56,43 @@ fn prepare_socket(path: &Path) -> io::Result<()> {
     }
     Ok(())
 }
+
+/// Make sure the socket's parent directory exists and, when the kernel owns
+/// it, isn't group/world-accessible. The kernel only *tightens* permissions
+/// on a directory it actually has the right to change: one it just created,
+/// or one it already owns. A pre-existing directory owned by someone else
+/// (e.g. a shared `/tmp` when the socket path is `--socket /tmp/x.sock`) is
+/// left untouched — `chmod`ing a shared root-owned directory either fails
+/// `EPERM` as a non-root caller, or, run as root, would strip access from
+/// every other user of that directory. Either way it is never something the
+/// kernel should attempt. The real security boundary is the socket *file*
+/// itself, created `0600` at bind time (see `Kernel::serve_until`) — this is
+/// defense in depth, applied only where the kernel actually has standing to
+/// apply it.
+fn secure_socket_dir(parent: &Path) -> io::Result<()> {
+    let describe = |err: io::Error| {
+        io::Error::new(
+            err.kind(),
+            format!(
+                "cannot secure socket dir {}: {err}; use a socket path inside a directory you \
+                 own, e.g. $XDG_RUNTIME_DIR/shoal/... or /tmp/shoal-<uid>/...",
+                parent.display()
+            ),
+        )
+    };
+    let pre_existing = parent.exists();
+    fs::create_dir_all(parent).map_err(describe)?;
+    let owned_by_us = fs::metadata(parent)
+        .map(|m| m.uid() == unsafe { geteuid() })
+        .unwrap_or(false);
+    if pre_existing && !owned_by_us {
+        // Not ours to chmod: skip. The socket file created inside it is
+        // still 0600, which is the boundary that actually matters.
+        return Ok(());
+    }
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).map_err(describe)
+}
+
 unsafe extern "C" {
     fn geteuid() -> u32;
 }
@@ -113,5 +149,88 @@ impl Args {
             }
         }
         Ok(a)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn we_are_root() -> bool {
+        unsafe { geteuid() == 0 }
+    }
+
+    /// The bug: `--socket /tmp/x.sock` puts the socket's parent at `/tmp` —
+    /// a pre-existing, root-owned, shared directory. The old
+    /// `prepare_socket` unconditionally `chmod`ed the parent to `0700`,
+    /// which a non-root caller cannot do to a directory it doesn't own —
+    /// surfaced verbatim as "Operation not permitted (os error 1)" with no
+    /// diagnostic. `prepare_socket` must now boot cleanly: it owns (and
+    /// therefore secures) only directories it creates or already owns, and
+    /// leaves a shared parent alone — the socket file itself (0600 at bind
+    /// time) is the real boundary.
+    #[test]
+    fn prepare_socket_survives_a_shared_not_owned_parent_dir() {
+        if we_are_root() {
+            eprintln!(
+                "skipping: running as root, cannot exercise a parent dir this caller doesn't own"
+            );
+            return;
+        }
+        let sock =
+            std::env::temp_dir().join(format!("shoal-kbug-test-{}.sock", std::process::id()));
+        let _ = fs::remove_file(&sock);
+        let result = prepare_socket(&sock);
+        assert!(
+            result.is_ok(),
+            "socket bring-up must not fail on a shared, not-owned-by-us parent: {result:?}"
+        );
+        let _ = fs::remove_file(&sock);
+    }
+
+    /// A directory the kernel *does* own, but genuinely cannot secure (no
+    /// write permission on its own parent so `create_dir_all` fails), must
+    /// fail with a message that NAMES the cause and tells the caller how to
+    /// route around it — never a bare, unexplained OS errno.
+    #[test]
+    fn secure_socket_dir_wraps_a_real_failure_descriptively() {
+        if we_are_root() {
+            eprintln!("skipping: root bypasses the permission check this test relies on");
+            return;
+        }
+        let base = tempfile::tempdir().unwrap();
+        let readonly = base.path().join("ro");
+        fs::create_dir(&readonly).unwrap();
+        fs::set_permissions(&readonly, fs::Permissions::from_mode(0o500)).unwrap();
+        let child = readonly.join("shoal-sock-dir");
+
+        let err = secure_socket_dir(&child).expect_err("a read-only parent cannot be secured");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cannot secure socket dir"),
+            "error must name the cause: {msg}"
+        );
+        assert!(
+            msg.contains("use a socket path inside a directory you own"),
+            "error must hint at a fix: {msg}"
+        );
+
+        // Restore write access so the tempdir's own Drop cleanup can remove it.
+        fs::set_permissions(&readonly, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    /// The happy path is unchanged: a fresh parent the kernel creates itself
+    /// is still locked down to `0700`.
+    #[test]
+    fn prepare_socket_still_secures_a_freshly_created_parent() {
+        let base = tempfile::tempdir().unwrap();
+        let sock = base.path().join("run").join("kernel.sock");
+        prepare_socket(&sock).unwrap();
+        let parent_mode = fs::metadata(sock.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(parent_mode, 0o700, "a kernel-created parent must be 0700");
     }
 }

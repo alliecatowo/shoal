@@ -82,7 +82,11 @@ impl Kernel {
             }
             Some("render") => {
                 let render = shoal_value::render::render_block(&sliced, 80);
-                encode(json!({"ref":params.r#ref,"render":render}))
+                // Same hard cap as MCP's content[0].text (AGENT-SURFACE §3):
+                // `format=render` must not be a way to bypass the elision
+                // wall by asking for the human render instead of the value.
+                let uri = short_ref_to_uri(&params.r#ref, params.path.as_deref());
+                encode(json!({"ref":params.r#ref,"render":bound_render(render, &uri)}))
             }
             Some("raw") => {
                 let raw = match &sliced {

@@ -367,19 +367,45 @@ fn verdict_name(v: Verdict) -> &'static str {
 }
 
 /// Derive plan reversibility from its concrete effects (AGENT-SURFACE §5,
-/// TDD §8): irreversible for opaque work, network effects, or a delete with
-/// no journaled inverse; reversible when every effect is reversible/journaled
-/// (pure reads/writes, env, session, time). This is computed here rather than
-/// trusting the leash's coarser `Reversibility` so the wire answer is derived
-/// from the effect set the agent actually sees.
+/// TDD §8): irreversible for opaque work or network effects; reversible when
+/// every effect is reversible/journaled (pure reads/writes, env, session,
+/// time — AND filesystem deletes, see below). This is computed here rather
+/// than trusting the leash's coarser `Reversibility` so the wire answer is
+/// derived from the effect set the agent actually sees.
+///
+/// **`Effect::FsDelete` and the trash-vs-opaque distinction (bug fix,
+/// judgment call documented here per the fix's instructions):** the only two
+/// builtins that ever emit `FsDelete` are `rm` and `mv` (`shoal-eval`'s
+/// `plan_effects.rs`); `sh{}`/any external command emits `Effect::Opaque`
+/// instead and NEVER `FsDelete` — the two are structurally disjoint by
+/// construction of the planner, so an `FsDelete` effect can never actually
+/// originate from an opaque `sh { rm -rf }` (that stays caught by the
+/// `Opaque` arm below, unconditionally). Given that, `FsDelete` is treated
+/// as reversible: shoal's default `rm` moves files into a journaled trash
+/// (`apply` fully recovers them; see `shoal-eval`'s `fs_undo_post`/
+/// `record_trash_inverses` and `shoal-journal`'s `UndoInverse::TrashMove`),
+/// and `mv`'s source-clearing "delete" is likewise undoable
+/// (`UndoInverse::MoveBack`/`RestoreBytes`).
+///
+/// KNOWN LIMITATION: `Effect::FsDelete{paths}` carries no field
+/// distinguishing that default trash-based `rm` from `rm --permanent`
+/// (genuinely irreversible, no trash, no undo record) — `shoal-eval`'s
+/// `builtin_effects()` discards CLI flags before deriving the effect, and
+/// `Effect` (defined in `shoal-leash`, outside this crate) has no
+/// `trashed`/`permanent` field to carry that distinction across the
+/// boundary. A precise answer would need either a new field on `Effect`
+/// itself, or the kernel inspecting raw AST flags at plan time — both bigger
+/// changes than a effects-only reclassification. Between "call the common,
+/// default, undoable `rm`/`mv` reversible" (which is what a cold agent
+/// actually hit and correctly flagged as misleading) and "call the rare,
+/// explicitly-opted-into `--permanent` case reversible too" (optimistic but
+/// never claims an *opaque/external* delete is safe), this picks the former
+/// as the least-misleading default given the information available here.
 fn reversibility_from_effects(effects: &[Effect]) -> &'static str {
     let irreversible = effects.iter().any(|e| {
         matches!(
             e,
-            Effect::Opaque
-                | Effect::FsDelete { .. }
-                | Effect::NetConnect { .. }
-                | Effect::NetListen { .. }
+            Effect::Opaque | Effect::NetConnect { .. } | Effect::NetListen { .. }
         )
     });
     if irreversible {
@@ -1598,6 +1624,10 @@ mod tests {
         let kernel = Kernel::new();
         let (mut client, mut reader, thread) = spawn(&kernel);
         attach(&mut client, &mut reader);
+        // shoal's `rm` is trash-based (journaled, `apply` fully recovers it)
+        // — NOT an opaque, unrecoverable delete, so a plan for it must not
+        // be flatly reported "irreversible" (bug: a cold agent driving the
+        // MCP surface found this misleading).
         let del = call(
             &mut client,
             &mut reader,
@@ -1608,8 +1638,8 @@ mod tests {
         .result
         .unwrap();
         assert_eq!(
-            del["reversibility"], "irreversible",
-            "a delete has no journaled inverse: {del}"
+            del["reversibility"], "reversible",
+            "shoal's rm trashes (journaled undo) rather than deleting outright: {del}"
         );
         let pure = call(
             &mut client,
@@ -1621,6 +1651,11 @@ mod tests {
         .result
         .unwrap();
         assert_eq!(pure["reversibility"], "reversible");
+        // An opaque external command is a DIFFERENT effect (`Effect::Opaque`,
+        // never `Effect::FsDelete`) and must stay irreversible even when its
+        // source text also happens to say "rm -rf" — the kernel cannot see
+        // inside a `sh{}` block's effects at all, so it can never mistake
+        // this for shoal's own trash-based delete.
         let opaque = call(
             &mut client,
             &mut reader,
@@ -1631,6 +1666,31 @@ mod tests {
         .result
         .unwrap();
         assert_eq!(opaque["reversibility"], "irreversible");
+        let opaque_rm = call(
+            &mut client,
+            &mut reader,
+            5,
+            "exec",
+            json!({"src":"sh { rm -rf doomed.txt }","mode":"plan"}),
+        )
+        .result
+        .unwrap();
+        assert_eq!(
+            opaque_rm["reversibility"], "irreversible",
+            "an opaque external rm -rf must never be reported reversible: {opaque_rm}"
+        );
+        // `mv`'s source-clearing "delete" is also journaled/undoable
+        // (MoveBack/RestoreBytes), so it gets the same treatment as `rm`.
+        let moved = call(
+            &mut client,
+            &mut reader,
+            6,
+            "exec",
+            json!({"src":"mv a.txt b.txt","mode":"plan"}),
+        )
+        .result
+        .unwrap();
+        assert_eq!(moved["reversibility"], "reversible", "{moved}");
         drop(client);
         drop(reader);
         thread.join().unwrap();
@@ -1788,7 +1848,10 @@ mod tests {
         )
         .result
         .unwrap();
-        assert_eq!(ex["reversibility"], "irreversible");
+        // shoal's `rm` trashes rather than deleting outright (see
+        // `plan_reversibility_is_derived_from_effects`), so `explain` must
+        // agree with `shoal_plan`'s answer here.
+        assert_eq!(ex["reversibility"], "reversible");
         assert!(ex["ast"].is_object() || ex["ast"].is_array() || ex["ast"]["stmts"].is_array());
         drop(client);
         drop(reader);
@@ -1860,10 +1923,14 @@ mod tests {
             bg["task"].is_string(),
             "background exec returns a task ref: {bg}"
         );
-        assert_eq!(
-            bg["events"],
-            format!("task.{}", bg["task"].as_str().unwrap())
-        );
+        // AGENT-SURFACE §4: the events channel is `task.{bare id}` (e.g.
+        // `task.7`), NOT `task.{full ref}` — the task ref itself is already
+        // `task:7`, so naively prefixing it with `task.` doubles up into
+        // `task.task:7`, which no `events.read`/`resources/subscribe` caller
+        // can ever match against the real `task.{id}` channel.
+        let task_ref = bg["task"].as_str().unwrap();
+        let bare_id = task_ref.strip_prefix("task:").unwrap();
+        assert_eq!(bg["events"], format!("task.{bare_id}"));
         drop(client);
         drop(reader);
         thread.join().unwrap();

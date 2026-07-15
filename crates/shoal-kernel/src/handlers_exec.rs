@@ -28,7 +28,14 @@ impl Kernel {
                 evaluator.reset_cancel();
                 evaluator.cancellation_token()
             };
-            let task_ref = Ref::new("task", self.next_task.fetch_add(1, Ordering::Relaxed));
+            // AGENT-SURFACE §4/§5: the events channel is `task.{bare id}`
+            // (e.g. `task.7`), NOT `task.{full ref}` (`task.task:7`) — keep
+            // the bare numeric id around so the channel name is built from
+            // it directly instead of re-deriving it from `task_ref.0` (which
+            // is already the `task:N`-prefixed ref string and would double
+            // the prefix).
+            let task_id = self.next_task.fetch_add(1, Ordering::Relaxed);
+            let task_ref = Ref::new("task", task_id);
             let task = Arc::new(TaskEntry {
                 task: task_ref.clone(),
                 session: session.clone(),
@@ -50,7 +57,7 @@ impl Kernel {
             let waiter = task.clone();
             let kernel = self.clone();
             let mut task_attached = Some(attachment.clone());
-            let task_channel = format!("task.{}", task_ref.0);
+            let task_channel = format!("task.{task_id}");
             kernel
                 .events
                 .publish(&task_channel, json!({"$":"str","v":"started"}));
@@ -83,13 +90,41 @@ impl Kernel {
                         };
                         inner.error = Some(error);
                     } else {
-                        inner.state = "completed";
                         inner.result_ref = response
                             .result
                             .as_ref()
                             .and_then(|r| r.get("ref"))
                             .and_then(Json::as_str)
                             .map(|s| Ref(s.into()));
+                        // The eval position most callers use for a
+                        // background/timed run (`position:"value"`, the MCP
+                        // facade's default) captures a failing or
+                        // signal-killed outcome as a normal RETURNED value
+                        // instead of raising it as an RpcError (§4.5: "a
+                        // failed outcome is captured, not raised") — so
+                        // `response.error` alone cannot tell a naturally
+                        // completed task from one that was killed via
+                        // `shoal_cancel`. Inspect the actual outcome the
+                        // task produced: a signal-killed outcome while
+                        // cancellation was requested is `cancelled`; any
+                        // other non-ok outcome is `failed`; only a truly
+                        // successful result is `completed`.
+                        let outcome = inner
+                            .result_ref
+                            .as_ref()
+                            .and_then(|r| task.session.transcript.lock().unwrap().get(r).cloned());
+                        inner.state = match &outcome {
+                            Some(Value::Outcome(o)) if !o.ok => {
+                                if task.cancel_requested.load(Ordering::SeqCst)
+                                    && o.signal.is_some()
+                                {
+                                    "cancelled"
+                                } else {
+                                    "failed"
+                                }
+                            }
+                            _ => "completed",
+                        };
                     }
                     exit_payload = json!({
                         "$": "record",
@@ -104,7 +139,7 @@ impl Kernel {
                 }
                 kernel.events.publish(&task_channel, exit_payload);
             });
-            let events_channel = format!("task.{}", task_ref.0);
+            let events_channel = format!("task.{task_id}");
             if is_background {
                 return encode(json!({"task":task_ref,"events":events_channel}));
             }
@@ -145,7 +180,7 @@ impl Kernel {
                     return encode(ExecResult {
                         r#ref: result_ref,
                         value: Some(wire),
-                        render: Some(render),
+                        render: Some(bound_render(render, &uri)),
                     });
                 }
             }
@@ -350,10 +385,15 @@ impl Kernel {
             .publish("session.transcript", transcript_event(&value_ref, &value));
         let exec_budget = ElideBudget::from_spec(params.elide.as_ref());
         let exec_uri = short_ref_to_uri(&value_ref, None);
+        // The journal keeps the full render above (record_output); the wire
+        // response bounds it to the same hard cap as MCP's content[0].text
+        // (AGENT-SURFACE §3) — a huge render must never bypass the wall the
+        // structured value already respects.
+        let bounded_render = bound_render(render, &exec_uri);
         encode(ExecResult {
             r#ref: value_ref,
             value: Some(elide_wire_value(&value, &exec_uri, &exec_budget)),
-            render: Some(render),
+            render: Some(bounded_render),
         })
     }
 }

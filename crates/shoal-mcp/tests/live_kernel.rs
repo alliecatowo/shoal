@@ -140,6 +140,19 @@ fn mcp_exec_elides_render_and_text_then_resource_read_drills_in() {
         "a truncated render must tell the agent how to fetch the rest"
     );
 
+    // §3 bug fix: `structuredContent.render` (the exec result's own render
+    // field, distinct from the `content[0].text` derived from it) must be
+    // bounded by the SAME hard cap — a 252 KiB ANSI-laden render sitting
+    // right next to a properly-elided `value` is exactly the elision bypass
+    // this closes.
+    let structured_render = result["structuredContent"]["render"].as_str().unwrap();
+    assert!(
+        structured_render.len() <= 64 * 1024,
+        "structuredContent.render must be capped too, was {} bytes",
+        structured_render.len()
+    );
+    assert!(structured_render.contains("more lines, fetch via"));
+
     // A resource_link points at the value's ref for zero-token drill-in.
     let link = content
         .iter()
@@ -192,6 +205,121 @@ fn mcp_small_value_inline_and_state_resources() {
     let journal = read_resource(&mut facade, "shoal://journal");
     let entries = journal["structuredContent"].as_array().unwrap();
     assert!(entries.iter().any(|e| e["src"] == "1 + 2"));
+}
+
+/// AGENT-SURFACE §4/§5: `shoal_exec {background:true}` must return an events
+/// channel of the form `task.{bare id}` (e.g. `task.7`) — NOT
+/// `task.{full ref}` (`task.task:7`), which no `events.read`/
+/// `resources/subscribe` caller could ever match against the real channel a
+/// task's lifecycle events are actually published on.
+#[test]
+fn mcp_background_exec_events_channel_is_bare_task_id() {
+    let live = LiveKernel::start();
+    let mut facade = Facade::connect(&live.config()).unwrap();
+
+    let bg = call_tool(
+        &mut facade,
+        "shoal_exec",
+        json!({"src":"sh { sleep 0.05 }","background":true}),
+    );
+    let structured = &bg["structuredContent"];
+    let task_ref = structured["task"]
+        .as_str()
+        .expect("background exec returns a task ref")
+        .to_string();
+    let bare_id = task_ref.strip_prefix("task:").expect("task ref is task:N");
+    assert_eq!(
+        structured["events"],
+        format!("task.{bare_id}"),
+        "events channel must be task.{{bare id}}, not double-prefixed: {structured}"
+    );
+}
+
+/// AGENT-SURFACE §4: a task killed via `shoal_cancel` must read back
+/// `state:"cancelled"` in `shoal://jobs` — not `"completed"`. The MCP
+/// facade's default `position:"value"` captures a signal-killed outcome
+/// (`ok:false, signal:"SIGINT"`) as a normal returned value instead of
+/// raising it as an RPC error, so the terminal state must be derived from
+/// the outcome itself, not just from whether the eval call raised.
+#[test]
+fn mcp_cancelled_task_reads_back_cancelled_not_completed() {
+    let live = LiveKernel::start();
+    let mut facade = Facade::connect(&live.config()).unwrap();
+
+    let bg = call_tool(
+        &mut facade,
+        "shoal_exec",
+        json!({"src":"sh { sleep 5 }","background":true}),
+    );
+    let task_ref = bg["structuredContent"]["task"]
+        .as_str()
+        .expect("background exec returns a task ref")
+        .to_string();
+
+    let cancel = call_tool(&mut facade, "shoal_cancel", json!({"task": task_ref}));
+    assert_ne!(
+        cancel["isError"], true,
+        "cancel request must succeed: {cancel}"
+    );
+
+    // Cancellation kills the child asynchronously (SIGINT, then escalating)
+    // — poll `shoal://jobs` until the task leaves its transient state
+    // instead of assuming the very next read has already settled.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut last_state = String::new();
+    loop {
+        let jobs = read_resource(&mut facade, "shoal://jobs");
+        let tasks = jobs["structuredContent"].as_array().unwrap().clone();
+        if let Some(task) = tasks.iter().find(|t| t["task"] == json!(task_ref)) {
+            last_state = task["state"].as_str().unwrap_or_default().to_string();
+            if last_state != "running" && last_state != "cancelling" {
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "task never reached a terminal state, last seen {last_state:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        last_state, "cancelled",
+        "a shoal_cancel'd task must read back cancelled, not completed/failed"
+    );
+}
+
+/// AGENT-SURFACE §5/TDD §8: shoal's `rm` trashes (journaled, undo-recoverable
+/// via `apply`) rather than deleting outright, so `shoal_plan` must not
+/// flatly call it "irreversible" — but an opaque external `sh { rm -rf }`
+/// (a structurally different effect, `Effect::Opaque`, never
+/// `Effect::FsDelete`) must never be reported reversible just because its
+/// source text also says "rm -rf".
+#[test]
+fn mcp_shoal_plan_distinguishes_trash_rm_from_opaque_rm() {
+    let live = LiveKernel::start();
+    let mut facade = Facade::connect(&live.config()).unwrap();
+    let doomed = live._dir.path().join("doomed.txt");
+    std::fs::write(&doomed, b"x").unwrap();
+
+    let plan = call_tool(
+        &mut facade,
+        "shoal_plan",
+        json!({"src": format!("rm {}", doomed.display())}),
+    );
+    assert_eq!(
+        plan["structuredContent"]["reversibility"], "reversible",
+        "shoal's rm trashes (journaled undo); a plan for it must not read irreversible: {plan}"
+    );
+
+    let opaque_plan = call_tool(
+        &mut facade,
+        "shoal_plan",
+        json!({"src": format!("sh {{ rm -rf {} }}", doomed.display())}),
+    );
+    assert_eq!(
+        opaque_plan["structuredContent"]["reversibility"], "irreversible",
+        "an opaque external rm -rf must never be reported reversible: {opaque_plan}"
+    );
 }
 
 // ---------------------------------------------------------------------------
