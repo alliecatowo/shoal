@@ -1,11 +1,41 @@
+//! shoal's layered configuration: `shoal.toml`/`​.shoal.toml` discovery,
+//! merging, validation, and the typed [`Config`] model consumers read.
+//!
+//! Full reference: `docs/CONFIG.md`. Short version:
+//!
+//! - **Layering** (lowest → highest precedence): system (`/etc/shoal/shoal.toml`)
+//!   → user (`$XDG_CONFIG_HOME/shoal/shoal.toml`, falling back to
+//!   `~/.config/shoal/shoal.toml`) → project (nearest `.shoal.toml` walking up
+//!   from the cwd) → environment overrides (`NO_COLOR`, `SHOAL_*`). Each layer
+//!   deep-merges over the previous one key-by-key — an unset key falls
+//!   through to the layer below, it is never "the whole table replaces the
+//!   whole table". See [`LoadOptions::discover`] and [`load`].
+//! - **Validation** (docs/CONFIG.md §4): an unknown key is a warning (never a
+//!   silently dropped value) naming the exact dotted path plus a
+//!   did-you-mean suggestion when one is close; a type mismatch is a hard
+//!   [`ConfigError`] naming the key path and the expected type; malformed
+//!   TOML is a hard [`ConfigError`] — nothing in this crate panics on
+//!   attacker- or typo-controlled input.
+//! - **Coverage**: every key in [`Config`] has a documented, sane default —
+//!   an absent `shoal.toml` anywhere on the layer chain is a fully usable
+//!   configuration.
+
+mod error;
+mod load;
+mod schema;
+
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::BTreeSet,
-    ffi::OsString,
-    fs,
-    path::{Path, PathBuf},
-};
-#[derive(Debug, Clone, Serialize, Deserialize)]
+
+pub use error::ConfigError;
+pub use load::{LoadOptions, Loaded, find_project_config, load};
+
+/// The full, typed shoal configuration — the merged result of every layer.
+/// Every field has a default, so `Config::default()` is itself a valid,
+/// complete configuration (docs/CONFIG.md documents each one).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub version: u32,
@@ -18,58 +48,153 @@ pub struct Config {
     pub journal: Journal,
     pub leash: Leash,
     pub init: Init,
+    pub completion: Completion,
+    pub reef: Reef,
+    /// `name -> expansion`. AST-level partial application (TDD §1.8) — a
+    /// config-declared `gs = "git status"` is equivalent to the session
+    /// statement `alias gs = git status` run at startup, just persisted.
+    pub aliases: BTreeMap<String, String>,
+    /// `NAME -> value`, set in the session environment at startup (like a
+    /// declarative `.profile`).
+    pub env: BTreeMap<String, String>,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+
+/// Legacy/simple prompt config. `shoal-prompt` (the crate that actually
+/// renders prompts) loads its own richer `[prompt]` schema (`format.left`,
+/// `format.right`, `transient`, …) directly from the same files; this
+/// `template` field is what that loader falls back to migrating from an
+/// old-style config (design-prompt.md §10) and is kept here mainly so
+/// `[prompt]` round-trips through this crate without tripping the
+/// unknown-key scanner. New code should prefer `shoal-prompt`'s schema.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Prompt {
     pub template: String,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct History {
     pub enabled: bool,
+    /// Maximum number of entries kept in the history file.
     pub max_entries: usize,
+    /// History file path; `None` = the host's platform default (typically
+    /// `$XDG_STATE_HOME/shoal/history` or similar — the host, not this
+    /// crate, resolves the fallback).
     pub path: Option<PathBuf>,
+    /// Skip appending an entry that's identical to the immediately
+    /// preceding one (classic `HISTCONTROL=ignoredups`).
+    pub dedup: bool,
+    /// Glob-ish prefixes/patterns; a command line matching any entry here is
+    /// never recorded to history (`HISTIGNORE`-equivalent). Matching
+    /// semantics are the host's (this crate only carries the patterns).
+    pub ignore: Vec<String>,
+    /// Classic `HISTCONTROL=ignorespace`: a line typed with a **leading
+    /// space** is never recorded.
+    pub ignore_space: bool,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Render {
     pub width: Option<usize>,
     pub color: bool,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Editor {
     pub mode: String,
     pub bracketed_paste: bool,
+    /// `chord -> action`, e.g. `"ctrl-r" = "history_search_backward"`. Empty
+    /// = the host's built-in bindings for `mode` are used unmodified.
+    pub keybindings: BTreeMap<String, String>,
+    /// How long (milliseconds) the line editor waits after a prefix key
+    /// (e.g. `Esc`, or `jk` in vi insert mode) before deciding no chord is
+    /// coming and treating it as a standalone keystroke.
+    pub key_timeout_ms: u64,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Kernel {
     pub enabled: bool,
     pub session: String,
 }
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Adapters {
+    /// Extra adapter directories scanned in addition to the bundled pack, in
+    /// order (later entries can shadow earlier ones for the same command
+    /// name).
     pub dirs: Vec<PathBuf>,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Journal {
     pub enabled: bool,
+    /// `None` = the host's platform default state directory.
     pub state_dir: Option<PathBuf>,
 }
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Leash {
+    /// Path to the leash policy file (REEF.md/CONTRACTS.md leash tier).
+    /// `None` = no policy loaded (unsandboxed).
     pub policy: Option<PathBuf>,
 }
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Init {
+    /// Script files run, in order, at the start of every interactive
+    /// session (a config-driven `.shoalrc`-equivalent).
     pub files: Vec<PathBuf>,
 }
+
+/// Tab-completion behavior.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Completion {
+    /// Allow non-contiguous/typo-tolerant matches, not just prefix matches.
+    pub fuzzy: bool,
+    pub case_insensitive: bool,
+    /// Cap on how many candidates are computed/shown per completion; keeps a
+    /// huge `PATH`/directory from making a keystroke feel laggy.
+    pub max_results: usize,
+    /// Show the interactive selection menu at all (vs. cycle-only).
+    pub menu: bool,
+}
+
+/// User-scope reef bindings (REEF.md §1: `[reef]` in `shoal.toml` is the
+/// *user* scope; project scope is the nearest `.reef.toml`). `shoal-reef`
+/// re-parses `[reef]` directly out of the raw `shoal.toml` text with its own
+/// richer manifest schema (constraints, providers, runner argv templates) —
+/// the fields here are deliberately loose (`toml::Value` per entry) so this
+/// crate only needs to agree with `shoal-reef` on "this is a table", not on
+/// the full tool/runner grammar, which is `shoal-reef`'s to evolve.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct Reef {
+    /// `tool name -> constraint` — a bare version string (`"22"`, `"*"`) or a
+    /// table (`{ version = "1.4", provider = "mise" }`).
+    pub tools: BTreeMap<String, toml::Value>,
+    /// `extension -> invocation` — a bare tool name (`"python"`) or a table
+    /// (`{ tool = "deno", args = ["run"] }`).
+    pub runners: BTreeMap<String, toml::Value>,
+    pub options: ReefOptions,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ReefOptions {
+    /// Child PATH is synthesized-only (no ambient system tail) when true.
+    pub hermetic: bool,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -83,9 +208,14 @@ impl Default for Config {
             journal: Journal::default(),
             leash: Leash::default(),
             init: Init::default(),
+            completion: Completion::default(),
+            reef: Reef::default(),
+            aliases: BTreeMap::new(),
+            env: BTreeMap::new(),
         }
     }
 }
+
 impl Default for Prompt {
     fn default() -> Self {
         Self {
@@ -93,15 +223,20 @@ impl Default for Prompt {
         }
     }
 }
+
 impl Default for History {
     fn default() -> Self {
         Self {
             enabled: true,
             max_entries: 10_000,
             path: None,
+            dedup: true,
+            ignore: Vec::new(),
+            ignore_space: true,
         }
     }
 }
+
 impl Default for Render {
     fn default() -> Self {
         Self {
@@ -110,14 +245,18 @@ impl Default for Render {
         }
     }
 }
+
 impl Default for Editor {
     fn default() -> Self {
         Self {
             mode: "emacs".into(),
             bracketed_paste: true,
+            keybindings: BTreeMap::new(),
+            key_timeout_ms: 25,
         }
     }
 }
+
 impl Default for Kernel {
     fn default() -> Self {
         Self {
@@ -126,6 +265,7 @@ impl Default for Kernel {
         }
     }
 }
+
 impl Default for Journal {
     fn default() -> Self {
         Self {
@@ -134,195 +274,37 @@ impl Default for Journal {
         }
     }
 }
-#[derive(Debug)]
-pub struct Loaded {
-    pub config: Config,
-    pub warnings: Vec<String>,
-    pub sources: Vec<PathBuf>,
-}
-#[derive(Debug)]
-pub struct LoadOptions {
-    pub system: Option<PathBuf>,
-    pub user: Option<PathBuf>,
-    pub project: Option<PathBuf>,
-    pub env: Vec<(OsString, OsString)>,
-}
-impl LoadOptions {
-    pub fn discover(cwd: &Path) -> Self {
-        let home = std::env::var_os("HOME").map(PathBuf::from);
-        let user = std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|| home.map(|h| h.join(".config")))
-            .map(|p| p.join("shoal/shoal.toml"));
+
+impl Default for Completion {
+    fn default() -> Self {
         Self {
-            system: Some("/etc/shoal/shoal.toml".into()),
-            user,
-            project: Some(cwd.join(".shoal.toml")),
-            env: std::env::vars_os().collect(),
+            fuzzy: true,
+            case_insensitive: true,
+            max_results: 100,
+            menu: true,
         }
     }
 }
-pub fn load(o: &LoadOptions) -> Result<Loaded, String> {
-    let mut merged = toml::Value::try_from(Config::default()).map_err(|e| e.to_string())?;
-    let mut warnings = vec![];
-    let mut sources = vec![];
-    for path in [&o.system, &o.user, &o.project].into_iter().flatten() {
-        match fs::read_to_string(path) {
-            Ok(s) => {
-                let value: toml::Value =
-                    toml::from_str(&s).map_err(|e| format!("{}: {e}", path.display()))?;
-                unknowns(&value, "", &mut warnings);
-                merge(&mut merged, value);
-                sources.push(path.clone())
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(format!("{}: {e}", path.display())),
-        }
-    }
-    apply_env(&mut merged, &o.env)?;
-    let config: Config = merged
-        .try_into()
-        .map_err(|e| format!("invalid configuration: {e}"))?;
-    validate(&config)?;
-    Ok(Loaded {
-        config,
-        warnings,
-        sources,
-    })
-}
-fn merge(dst: &mut toml::Value, src: toml::Value) {
-    match (dst, src) {
-        (toml::Value::Table(d), toml::Value::Table(s)) => {
-            for (k, v) in s {
-                if let Some(old) = d.get_mut(&k) {
-                    merge(old, v)
-                } else {
-                    d.insert(k, v);
-                }
-            }
-        }
-        (d, s) => *d = s,
-    }
-}
-fn apply_env(v: &mut toml::Value, env: &[(OsString, OsString)]) -> Result<(), String> {
-    for (k, val) in env {
-        let Some(k) = k.to_str() else { continue };
-        let Some(val) = val.to_str() else {
-            return Err(format!("{k} is not UTF-8"));
-        };
-        let path = match k {
-            "SHOAL_PROMPT" => Some(["prompt", "template"]),
-            "SHOAL_HISTORY" => Some(["history", "enabled"]),
-            "SHOAL_KERNEL" => Some(["kernel", "enabled"]),
-            _ => None,
-        };
-        if let Some([a, b]) = path {
-            let table = v
-                .as_table_mut()
-                .unwrap()
-                .get_mut(a)
-                .unwrap()
-                .as_table_mut()
-                .unwrap();
-            table.insert(
-                b.into(),
-                if b == "enabled" {
-                    toml::Value::Boolean(
-                        val.parse().map_err(|_| format!("{k} expects true/false"))?,
-                    )
-                } else {
-                    toml::Value::String(val.into())
-                },
-            );
-        }
-    }
-    Ok(())
-}
-fn validate(c: &Config) -> Result<(), String> {
-    if c.version != 1 {
-        return Err(format!("unsupported config version {}", c.version));
-    }
-    if c.history.max_entries == 0 {
-        return Err("history.max_entries must be positive".into());
-    }
-    if !matches!(c.editor.mode.as_str(), "emacs" | "vi") {
-        return Err("editor.mode must be emacs or vi".into());
-    }
-    Ok(())
-}
-fn unknowns(v: &toml::Value, prefix: &str, out: &mut Vec<String>) {
-    let allowed: BTreeSet<&str> = match prefix {
-        "" => [
-            "version", "prompt", "history", "render", "editor", "kernel", "adapters", "journal",
-            "leash", "init",
-        ]
-        .into_iter()
-        .collect(),
-        "prompt" => ["template"].into_iter().collect(),
-        "history" => ["enabled", "max_entries", "path"].into_iter().collect(),
-        "render" => ["width", "color"].into_iter().collect(),
-        "editor" => ["mode", "bracketed_paste"].into_iter().collect(),
-        "kernel" => ["enabled", "session"].into_iter().collect(),
-        "adapters" => ["dirs"].into_iter().collect(),
-        "journal" => ["enabled", "state_dir"].into_iter().collect(),
-        "leash" => ["policy"].into_iter().collect(),
-        "init" => ["files"].into_iter().collect(),
-        _ => BTreeSet::new(),
-    };
-    if let Some(t) = v.as_table() {
-        for (k, x) in t {
-            if !allowed.contains(k.as_str()) {
-                out.push(format!(
-                    "unknown config key {}{}",
-                    if prefix.is_empty() { "" } else { prefix },
-                    if prefix.is_empty() {
-                        k.clone()
-                    } else {
-                        format!(".{k}")
-                    }
-                ))
-            } else if x.is_table() {
-                unknowns(x, k, out)
-            }
-        }
-    }
-}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
-    fn precedence_and_warning() {
-        let t = tempfile::tempdir().unwrap();
-        let s = t.path().join("s");
-        let u = t.path().join("u");
-        let p = t.path().join("p");
-        fs::write(&s, "[prompt]\ntemplate='system'").unwrap();
-        fs::write(&u, "[prompt]\ntemplate='user'").unwrap();
-        fs::write(&p, "[prompt]\ntemplate='project'\nwat=1").unwrap();
-        let l = load(&LoadOptions {
-            system: Some(s),
-            user: Some(u),
-            project: Some(p),
-            env: vec![("SHOAL_PROMPT".into(), "env".into())],
-        })
-        .unwrap();
-        assert_eq!(l.config.prompt.template, "env");
-        assert_eq!(l.warnings.len(), 1)
+    fn default_config_round_trips_through_toml() {
+        let text = toml::to_string(&Config::default()).unwrap();
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back, Config::default());
     }
+
     #[test]
-    fn invalid_version() {
-        let t = tempfile::tempdir().unwrap();
-        let p = t.path().join("c");
-        fs::write(&p, "version=9").unwrap();
+    fn default_config_passes_its_own_schema_check() {
+        let value = toml::Value::try_from(Config::default()).unwrap();
+        let mut warnings = Vec::new();
+        schema::check(&value, schema::ROOT, "", &mut warnings).unwrap();
         assert!(
-            load(&LoadOptions {
-                system: None,
-                user: Some(p),
-                project: None,
-                env: vec![]
-            })
-            .unwrap_err()
-            .contains("unsupported")
-        )
+            warnings.is_empty(),
+            "Config::default() must not trip its own unknown-key scanner: {warnings:?}"
+        );
     }
 }
