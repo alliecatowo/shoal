@@ -203,10 +203,10 @@ value = "3"
 name = "table-ls-first-is-lexicographically-first-path"
 src = "ls.first().name"
 fixture = ["a.txt", "b.txt", "sub/inner.txt"]
-value = "a.txt"
+value = '"a.txt"'
 
 [[case]]
 name = "table-ls-where-type-then-map-names"
 src = 'ls.where(r => r.type == "file").map(r => r.name)'
 fixture = ["a.txt", "b.txt", "sub/inner.txt"]
-value = "[a.txt, b.txt]"
+value = '["a.txt", "b.txt"]'

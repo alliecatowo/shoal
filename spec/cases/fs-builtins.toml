@@ -205,7 +205,7 @@ src = '''
 touch f.txt
 (stat f.txt).out.name
 '''
-value = "f.txt"
+value = '"f.txt"'
 
 [[case]]
 name = "fsb-stat-multiple-paths-is-a-table"

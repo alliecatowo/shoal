@@ -42,3 +42,33 @@ value = '"abc"'
 name = "misc-nested-map-where-sum-pipeline"
 src = "[1, 2, 3].map(x => x * x).where(x => x > 3).sum()"
 value = "13"
+
+# `.tap(f)` / `.also(f)` — the shoal answer to bash `tee`: run f for its side
+# effect, return the receiver UNCHANGED so a dot-chain keeps flowing (there is
+# no pipe to split, and a value is already both shown and reusable). See
+# crates/shoal-value/src/methods/mod.rs dispatch.
+
+[[case]]
+name = "misc-tap-returns-receiver-unchanged"
+src = '[1, 2, 3].tap(x => x.len()).map(y => y * 10)'
+value = "[10, 20, 30]"
+
+[[case]]
+name = "misc-tap-runs-the-side-effect"
+src = '''
+"payload".tap(s => s.save("tapped.txt"))
+path("tapped.txt").read
+'''
+value = '"payload"'
+
+[[case]]
+name = "misc-also-is-an-alias-for-tap"
+src = '{a: 5}.also(r => r.a).a'
+value = "5"
+
+[[case]]
+name = "misc-tap-on-outcome-taps-the-outcome-not-out"
+# `.tap` sees the full outcome (`.ok`), then passes the outcome through so
+# `.out` still resolves.
+src = '(echo hi).tap(o => o.ok).out'
+value = '"hi"'

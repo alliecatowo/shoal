@@ -153,11 +153,18 @@ fn metadata_record(fs: &dyn Fs, p: PathBuf) -> VResult<Record> {
     let m = fs.symlink_metadata(&p).map_err(|e| ioerr("stat", &p, e))?;
     let mut r = Record::new();
     r.insert("path".into(), Value::Path(p.clone()));
+    // `name` is the basename as a STRING — a filename you can `.upper()`,
+    // `.split(".")`, interpolate, or `+`-concat. The full `path` field stays a
+    // `path`. (Was a `Value::Path`, which made every string op on a row's name
+    // — `.map(.name.upper())`, `"pre" + row.name` — a type_error.)
     r.insert(
         "name".into(),
-        Value::Path(PathBuf::from(
-            p.file_name().unwrap_or_else(|| p.as_os_str()),
-        )),
+        Value::Str(
+            p.file_name()
+                .unwrap_or_else(|| p.as_os_str())
+                .to_string_lossy()
+                .into_owned(),
+        ),
     );
     r.insert(
         "type".into(),
@@ -573,7 +580,13 @@ mod tests {
         let Value::Table(rows) = ls(&StdFs, d.path(), vec![], false).unwrap() else {
             panic!()
         };
-        assert!(matches!(&rows[0]["name"],Value::Path(p)if p.as_os_str()==name));
+        // `name` is now a lossy STRING (the exact bytes stay on `path`); a
+        // non-UTF-8 byte becomes the replacement char.
+        assert_eq!(
+            rows[0]["name"],
+            Value::Str(name.to_string_lossy().into_owned())
+        );
+        assert!(matches!(&rows[0]["path"], Value::Path(p) if p.file_name() == Some(&name)));
         assert_eq!(rows[0]["size"], Value::Size(3));
     }
     #[test]

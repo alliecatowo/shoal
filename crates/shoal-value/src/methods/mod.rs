@@ -41,6 +41,17 @@ pub fn call_method(
 }
 
 fn dispatch(ctx: &mut dyn CallCtx, recv: Value, name: &str, args: CallArgs) -> VResult<Value> {
+    // `.tap(f)` / `.also(f)` — shoal's answer to bash `tee`: run `f(recv)` for
+    // its side effect (save it, log it, inspect it) and return `recv`
+    // UNCHANGED so the dot-chain keeps flowing. `cmd | tee file | next`
+    // becomes `cmd.tap(o => o.stdout.save(file)).<next>`. Intercepted before
+    // the outcome/stream forwarding so it taps the ACTUAL receiver (e.g. a
+    // command's full outcome, not its `.out`). `f`'s own result is discarded.
+    if matches!(name, "tap" | "also") {
+        let f = arg(&args, 0)?;
+        ctx.call_closure(f, vec![recv.clone()])?;
+        return Ok(recv);
+    }
     // Outcome unification (P1b): an unknown method on a command outcome forwards
     // to its structured `.out`, so `ls.where(.size > 1b).sort(.name)` works
     // (`ls` is an outcome; `.where`/`.sort` operate on its `.out` table). Raw

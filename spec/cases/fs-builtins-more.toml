@@ -45,7 +45,7 @@ touch a.txt
 mv a.txt a.txt
 (stat a.txt).out.name
 '''
-value = "a.txt"
+value = '"a.txt"'
 
 [[case]]
 name = "fsb2-ls-where-name-then-type"

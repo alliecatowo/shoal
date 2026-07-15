@@ -16,6 +16,7 @@
 //! [`ops`], split out for size.
 
 mod ops;
+mod tee;
 
 use super::*;
 
@@ -297,6 +298,31 @@ impl StreamVal {
             Box::new(ops::Zip { a: up, b: other_up })
         })
     }
+
+    /// `.tee(n)` — fork into `n` independently-drivable streams sharing this
+    /// stream's upstream (STREAMS §1: "each replaying every item to its own
+    /// sink"). Under the sync-pull model, whichever fork pulls next drives the
+    /// shared source and the item is replayed into every sibling fork's
+    /// BOUNDED queue ([`tee::TEE_QUEUE_CAP`]); a fork that falls further
+    /// behind than the cap gets overflowed items coalesced into a
+    /// `{dropped: n}` marker element (§6.1) instead of unbounded buffering.
+    /// Forks inherit this stream's boundedness — a fork of an endless source
+    /// is still endless (`.collect()` on it stays `stream_unbounded`).
+    ///
+    /// Bounded streams don't use this path: `methods/stream.rs` materializes
+    /// them once and replays the full list per fork, preserving exact
+    /// whole-stream replay with no cap.
+    pub fn tee(self, n: usize) -> VResult<Vec<StreamVal>> {
+        if n == 0 {
+            return Err(ErrorVal::arg_error("tee count must be positive"));
+        }
+        let (label, bounded) = (self.label.clone(), self.bounded);
+        let up = self.take_upstream()?;
+        Ok(tee::fork(up, n)
+            .into_iter()
+            .map(|h| StreamVal::from_source(label.clone(), bounded, Box::new(h)))
+            .collect())
+    }
 }
 
 /// Drive a stream to a sink, invoking `on_item` for each produced value until the
@@ -334,4 +360,89 @@ pub fn collect_stream(ctx: &mut dyn CallCtx, s: &StreamVal) -> VResult<Vec<Value
         Ok(())
     })?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct C;
+    impl CallCtx for C {
+        fn call_closure(&mut self, _f: &Value, _args: Vec<Value>) -> VResult<Value> {
+            Err(ErrorVal::new("custom", "no closures in these tests"))
+        }
+        fn cwd(&self) -> PathBuf {
+            std::env::temp_dir()
+        }
+    }
+
+    /// An endless-MARKED in-memory source: exercises the live-fork tee path
+    /// (bounded queues + drop/coalesce) deterministically, with no timers.
+    fn endless_marked(n: i64) -> StreamVal {
+        StreamVal::from_source(
+            "int",
+            false,
+            Box::new(IterSource(Box::new((0..n).map(|i| Ok(Value::Int(i)))))),
+        )
+    }
+
+    fn drain(s: &StreamVal) -> Vec<Value> {
+        let mut up = s.take_upstream().unwrap();
+        let mut out = Vec::new();
+        drive_stream(&mut C, &mut *up, |_c, v| {
+            out.push(v);
+            Ok(())
+        })
+        .unwrap();
+        out
+    }
+
+    #[test]
+    fn tee_live_forks_replay_within_the_bound() {
+        let forks = endless_marked(3).tee(2).unwrap();
+        assert_eq!(forks.len(), 2);
+        assert!(
+            !forks[0].is_bounded(),
+            "a fork of an endless stream is endless"
+        );
+        let a = drain(&forks[0]);
+        let b = drain(&forks[1]);
+        assert_eq!(a, vec![Value::Int(0), Value::Int(1), Value::Int(2)]);
+        assert_eq!(b, a, "the second fork replays every item from its queue");
+    }
+
+    #[test]
+    fn tee_live_fork_overflow_coalesces_to_dropped_marker() {
+        // Fork 0 drains the whole 200-item source before fork 1 pulls once:
+        // fork 1's bounded queue keeps the first TEE_QUEUE_CAP items; the
+        // overflowed remainder is dropped and surfaced as one `{dropped: n}`
+        // marker element — bounded memory with an honest signal (STREAMS §6.1).
+        let forks = endless_marked(200).tee(2).unwrap();
+        let a = drain(&forks[0]);
+        assert_eq!(a.len(), 200, "the pulling fork sees every item");
+        let b = drain(&forks[1]);
+        assert_eq!(b.len(), tee::TEE_QUEUE_CAP + 1);
+        for (i, v) in b[..tee::TEE_QUEUE_CAP].iter().enumerate() {
+            assert_eq!(v, &Value::Int(i as i64));
+        }
+        match &b[tee::TEE_QUEUE_CAP] {
+            Value::Record(r) => assert_eq!(
+                r.get("dropped"),
+                Some(&Value::Int((200 - tee::TEE_QUEUE_CAP) as i64))
+            ),
+            other => panic!("expected a {{dropped: n}} marker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tee_zero_is_an_error_and_consumed_stream_cannot_fork() {
+        assert_eq!(
+            endless_marked(1).tee(0).unwrap_err().code,
+            "arg_error",
+            "tee(0) is rejected"
+        );
+        let s = endless_marked(1);
+        drain(&s);
+        assert_eq!(s.tee(2).unwrap_err().code, "stream_consumed");
+    }
 }

@@ -397,7 +397,7 @@ fn live_kernel_elides_a_big_table_over_the_wire() {
             "the full count still travels even though the rows don't"
         );
         assert_eq!(
-            out["cols"]["name"], "path",
+            out["cols"]["name"], "str",
             "column *schema* travels (name -> type)"
         );
         assert!(

@@ -68,7 +68,23 @@ pub(crate) fn stream_method(
         }
         "collect" => no_args(&args).and_then(|_| collect_stream(ctx, &s).map(Value::List)),
         "save" | "append" => stream_save(ctx, s, arg(&args, 0)?),
-        // Everything else (`.sort`, `.sum`, `.uniq`, `.first`, `.len`, `.tee`, …)
+        // `.tee(n)` (STREAMS §1): fork into n independently-drivable streams.
+        // A bounded stream materializes once and each fork replays the full
+        // list (exact whole-stream replay, the pre-existing behavior); a
+        // live/endless stream — where materializing would be
+        // `stream_unbounded` — forks lazily over the shared source with
+        // bounded per-fork queues (`stream/tee.rs`).
+        "tee" => {
+            let n = int_arg(&args, 0, 2)?;
+            if s.is_bounded() {
+                super::list::tee(Value::List(collect_stream(ctx, &s)?), n)
+            } else {
+                Ok(Value::List(
+                    s.tee(n)?.into_iter().map(Value::Stream).collect(),
+                ))
+            }
+        }
+        // Everything else (`.sort`, `.sum`, `.uniq`, `.first`, `.len`, …)
         // is a collection op: materialize the *bounded* stream, then dispatch.
         _ => {
             let list = Value::List(collect_stream(ctx, &s)?);

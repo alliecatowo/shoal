@@ -1,0 +1,43 @@
+# `.tee(n)` forks a stream (STREAMS §1). A BOUNDED stream (`.stream()`)
+# materializes once and each fork replays the exact whole stream; a LIVE
+# stream forks lazily over the shared source with bounded per-fork queues, so
+# `.tee` on a live source no longer errors `stream_unbounded` (the fix-it that
+# `stream_consumed` recommends is now functional). Backpressure/coalesce drop
+# behavior is timing-dependent, covered by unit tests in
+# crates/shoal-value/src/stream/tee.rs and crates/shoal-eval/src/streams.rs.
+
+[[case]]
+name = "tee-bounded-both-forks-replay-whole-stream"
+src = '''
+let t = [1, 2, 3].stream().tee(2)
+[t[0].collect(), t[1].collect()]
+'''
+value = "[[1, 2, 3], [1, 2, 3]]"
+
+[[case]]
+name = "tee-bounded-default-count-is-two"
+src = '[10, 20].stream().tee().len()'
+value = "2"
+
+[[case]]
+name = "tee-count-three-yields-three-forks"
+src = '["a"].stream().tee(3).map(s => s.collect())'
+value = '[["a"], ["a"], ["a"]]'
+
+[[case]]
+name = "tee-zero-is-arg-error"
+src = '[1].stream().tee(0)'
+error = "arg_error"
+
+[[case]]
+name = "tee-live-source-does-not-raise-stream-unbounded"
+src = 'every(1ms).tee(2)[0].take(2).collect().len()'
+value = "2"
+
+[[case]]
+name = "tee-live-both-forks-drive-independently"
+src = '''
+let t = every(1ms).tee(2)
+[t[0].take(2).collect().len(), t[1].take(2).collect().len()]
+'''
+value = "[2, 2]"

@@ -15,7 +15,7 @@
 name = "rt3-table-enumerate-then-map-names"
 fixture = ["a.txt", "b.txt"]
 src = 'ls.enumerate().map(p => p[1].name)'
-value = "[a.txt, b.txt]"
+value = '["a.txt", "b.txt"]'
 
 [[case]]
 name = "rt3-table-group-by-type-count"
@@ -33,13 +33,13 @@ value = "2"
 name = "rt3-table-sort-by-name-then-first"
 fixture = ["b.txt", "a.txt"]
 src = "ls.sort_by(r => r.name).first().name"
-value = "a.txt"
+value = '"a.txt"'
 
 [[case]]
 name = "rt3-table-zip-with-plain-list"
 fixture = ["a.txt", "b.txt"]
 src = 'ls.map(r => r.name).zip([1, 2])'
-value = "[[a.txt, 1], [b.txt, 2]]"
+value = '[["a.txt", 1], ["b.txt", 2]]'
 
 [[case]]
 name = "rt3-table-any-true"
@@ -57,7 +57,7 @@ value = "true"
 name = "rt3-table-find-by-name"
 fixture = ["a.txt", "b.txt"]
 src = 'ls.find(r => r.name == "b.txt").name'
-value = "b.txt"
+value = '"b.txt"'
 
 [[case]]
 name = "rt3-record-first-is-type-error"

@@ -1235,7 +1235,7 @@ mod tests {
         assert_eq!(out["of"], "table");
         assert_eq!(out["n"], 150);
         assert_eq!(
-            out["cols"]["name"], "path",
+            out["cols"]["name"], "str",
             "shape (schema) travels even when the payload does not"
         );
         assert_eq!(out["preview"]["$"], "table");
