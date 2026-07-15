@@ -264,13 +264,26 @@ fn a_policy_without_proc_spawn_grants_never_blocks_a_spawn() {
     if shoal_leash::landlock_abi().is_some() {
         ensure_sandbox_helper();
     }
-    let out = ev
-        .eval_program(&parse(&cat_src(&allowed.join("ok.txt"))))
-        .expect("no proc_spawn grants ⇒ the spawn is allowed");
-    let Value::Outcome(o) = out else {
-        panic!("expected outcome");
-    };
-    assert!(o.ok, "spawn must not be blocked when no proc_spawn is set");
+    // The contract under test is that an empty `proc_spawn` allowlist does NOT
+    // gate-deny the spawn (empty ⇒ unrestricted spawns, not deny-all) — an
+    // in-process check made before exec, so it is platform-independent. Whether
+    // the child then runs to completion is a SEPARATE layer: on macOS the scoped
+    // fs-Seatbelt can abort `cat` before it reads (its dyld shared cache lives
+    // under `/System/**`, outside `scoped_policy`'s granted globs), surfacing as
+    // `cmd_failed`, not `spawn_denied`. So assert on the gate's decision — a run
+    // is fine (Linux, where Landlock grants the system dirs cat needs) and an
+    // OS-sandbox-induced failure is tolerated, but a `spawn_denied` from the gate
+    // is exactly the regression this guards against.
+    match ev.eval_program(&parse(&cat_src(&allowed.join("ok.txt")))) {
+        Ok(Value::Outcome(o)) => {
+            assert!(o.ok, "spawn must not be blocked when no proc_spawn is set");
+        }
+        Ok(other) => panic!("expected an outcome, got {other:?}"),
+        Err(e) => assert_ne!(
+            e.code, "spawn_denied",
+            "empty proc_spawn must never gate-deny a spawn; got {e:?}"
+        ),
+    }
 }
 
 #[cfg(target_os = "macos")]
