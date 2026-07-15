@@ -1,0 +1,202 @@
+# Behavioral coverage for the daily-driver adapter-pack expansion, using
+# ONLY binaries guaranteed present on both Linux and macOS CI runners: git
+# (this very repo requires it to be checked out), and the POSIX-standard
+# `printf`/`sort`/`grep`. Deliberately NEVER jq/docker/kubectl/etc. here —
+# those aren't installed on every CI runner and would fail this corpus.
+#
+# Note on scope: `Evaluator::new` (this harness's own construction, see
+# `crates/shoal-eval/tests/conformance.rs` and `crates/shoal/tests/
+# conformance.rs`) starts with an EMPTY `AdapterCatalog` — neither
+# conformance runner calls `load_bundled_adapters`/`set_adapters` — so every
+# case below dispatches through the generic external-command path
+# (`command.rs::eval_command`'s tail), not through `adapters/git.toml`'s
+# declarative `[cmd.git.sub.*]` entries. That TOML-driven dispatch (argv
+# construction from `params`/`positional`/`flags`/`invoke`/`consumed`, and
+# the `parse`/`output.type` structured-output contract) is covered instead
+# by `crates/shoal-adapters`'s own unit tests (`src/lib.rs`'s
+# `bundled_adapter_pack_loads_without_warnings` plus `tests/
+# adapter_fixtures.rs`), which feed canned realistic bytes through the
+# exact parser each adapter declares — no real binary required there
+# either. This file's job is different and complementary: prove that
+# shoal's OWN command/outcome/pipe semantics behave correctly when the
+# tools being run are the real, guaranteed-safe ones a daily driver reaches
+# for constantly. Every expected value below was verified against the real
+# binaries before being written here (branch name pinned via `-b main` so
+# `git`'s own `init.defaultBranch` host default can never make a case
+# flaky; commit identity is configured inline so no ambient `~/.gitconfig`
+# is required).
+
+# --- git: init / status --porcelain (real porcelain v1, not this crate's
+#     adapter-side porcelain-v2 parser -- see the file header) -------------
+
+[[case]]
+name = "adapterspack-git-init-exit-status-zero"
+src = "(git init).status"
+value = "0"
+
+[[case]]
+name = "adapterspack-git-status-porcelain-empty-on-fresh-repo"
+src = '''
+git init -q -b main
+(git status --porcelain).out
+'''
+value = '""'
+
+[[case]]
+name = "adapterspack-git-status-porcelain-shows-untracked-file"
+fixture = ["scratch.txt"]
+src = '''
+git init -q -b main
+(git status --porcelain).out
+'''
+value = '"?? scratch.txt"'
+
+[[case]]
+name = "adapterspack-git-add-stages-file-as-porcelain-added"
+fixture = ["scratch.txt"]
+src = '''
+git init -q -b main
+git add scratch.txt
+(git status --porcelain).out
+'''
+value = '"A  scratch.txt"'
+
+[[case]]
+name = "adapterspack-git-commit-then-status-is-clean"
+fixture = ["scratch.txt"]
+src = '''
+git init -q -b main
+git config "user.email" "test@example.com"
+git config "user.name" "Test"
+git add scratch.txt
+git commit -q -m "initial"
+(git status --porcelain).out
+'''
+value = '""'
+
+[[case]]
+name = "adapterspack-git-status-porcelain-multiple-untracked-files-sorted"
+fixture = ["b.txt", "a.txt"]
+src = '''
+git init -q -b main
+(git status --porcelain).out
+'''
+value = '"?? a.txt\n?? b.txt"'
+
+[[case]]
+name = "adapterspack-git-status-porcelain-piped-through-sort-stays-stable"
+# Composes two of this file's guaranteed-safe tools: git's already-sorted
+# porcelain output survives an idempotent re-sort unchanged.
+fixture = ["b.txt", "a.txt"]
+src = '''
+git init -q -b main
+(git status --porcelain).out.feed(sort).out
+'''
+value = '"?? a.txt\n?? b.txt"'
+
+# --- git: remote (local-config-only, no network) -------------------------
+
+[[case]]
+name = "adapterspack-git-remote-bare-lists-name-only"
+src = '''
+git init -q -b main
+git remote add origin https://example.com/repo.git
+(git remote).out
+'''
+value = '"origin"'
+
+[[case]]
+name = "adapterspack-git-remote-verbose-shows-fetch-and-push-urls"
+src = '''
+git init -q -b main
+git remote add origin https://example.com/repo.git
+(git remote -v).out
+'''
+value = '"origin\thttps://example.com/repo.git (fetch)\norigin\thttps://example.com/repo.git (push)"'
+
+# --- git: stash ------------------------------------------------------------
+
+[[case]]
+name = "adapterspack-git-stash-push-cleans-worktree"
+fixture = ["f.txt"]
+src = '''
+git init -q -b main
+git config "user.email" "test@example.com"
+git config "user.name" "Test"
+git add f.txt
+git commit -q -m "first"
+echo change >> f.txt
+git stash push -m "wip" -q
+(git status --porcelain).out
+'''
+value = '""'
+
+[[case]]
+name = "adapterspack-git-stash-list-shows-pushed-entry"
+fixture = ["f.txt"]
+src = '''
+git init -q -b main
+git config "user.email" "test@example.com"
+git config "user.name" "Test"
+git add f.txt
+git commit -q -m "first"
+echo change >> f.txt
+git stash push -m "wip" -q
+(git stash list).out
+'''
+value = '"stash@{0}: On main: wip"'
+
+[[case]]
+name = "adapterspack-git-stash-pop-restores-worktree-change"
+fixture = ["f.txt"]
+src = '''
+git init -q -b main
+git config "user.email" "test@example.com"
+git config "user.name" "Test"
+git add f.txt
+git commit -q -m "first"
+echo change >> f.txt
+git stash push -m "wip" -q
+git stash pop -q
+(git status --porcelain).out
+'''
+value = '" M f.txt"'
+
+# --- printf (POSIX) ---------------------------------------------------------
+
+[[case]]
+name = "adapterspack-printf-zero-padded-width"
+src = '(printf "%05d" "42").out'
+value = '"00042"'
+
+[[case]]
+name = "adapterspack-printf-multiple-positional-args"
+src = '(printf "%s-%s" "a" "b").out'
+value = '"a-b"'
+
+# --- grep (POSIX) ------------------------------------------------------------
+
+[[case]]
+name = "adapterspack-grep-count-flag-counts-matching-lines"
+src = '"foo\nbar\nfoobar\nbaz".feed(grep -c "foo").out'
+value = '"2"'
+
+[[case]]
+name = "adapterspack-grep-no-match-status-is-one"
+src = '"foo\nbar".feed(grep "xyz").status'
+value = "1"
+
+[[case]]
+name = "adapterspack-grep-no-match-out-raises-cmd-failed"
+# `.out` on a non-ok outcome raises `cmd_failed` (TDD §4.1); grep's own
+# "no match" signal (exit 1) is not a crash, just a non-ok outcome -- the
+# raw `.status` field (asserted above) stays readable regardless.
+src = '"foo\nbar".feed(grep "xyz").out'
+error = "cmd_failed"
+
+# --- sort (POSIX) ------------------------------------------------------------
+
+[[case]]
+name = "adapterspack-sort-unique-flag-dedupes"
+src = '["b", "a", "b", "c", "a"].feed(sort -u).out'
+value = '"a\nb\nc"'

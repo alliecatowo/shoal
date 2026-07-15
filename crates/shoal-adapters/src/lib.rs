@@ -259,6 +259,7 @@ fn parse_sub(t: &toml::Table) -> Result<SubSpec, String> {
                 | "z-records"
                 | "porcelain-v2"
                 | "cols"
+                | "tsv-headerless"
                 | "lines"
                 | "kv"
                 | "none"
@@ -339,6 +340,7 @@ pub fn parse_output(strategy: &str, bytes: &[u8], type_hint: Option<&str>) -> Op
         "z-records" => parse_z_records(bytes, type_hint),
         "porcelain-v2" => parse_porcelain_v2(bytes),
         "cols" => parse_cols(bytes, type_hint),
+        "tsv-headerless" => parse_tsv_headerless(bytes, type_hint),
         _ => None,
     }
 }
@@ -502,6 +504,49 @@ fn parse_cols(bytes: &[u8], hint: Option<&str>) -> Option<Value> {
             }
             let (last_name, last_ty) = &fields[fields.len() - 1];
             r.insert(last_name.clone(), coerce_cell(&last, last_ty)?);
+            Some(r)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(Value::Table(rows))
+}
+
+/// Parses tab-column data from tools whose output has **no header line at
+/// all** -- unlike `cols` (which always discards a first line as a header)
+/// and unlike `tsv`/`csv` (which read column names from a header line
+/// found in the bytes themselves). `du -h`'s `<size>\t<path>` per line is
+/// exactly this shape: every line is data, with no header row to discard or
+/// to read names from. This is the genuine bug this parser exists to fix
+/// (Real bug #2): `adapters/du.toml` used to declare `parse = "tsv"`,
+/// which treats the very FIRST real `du` line as a header — silently
+/// swallowing it as fake column names (e.g. an actual size like `"4.0K"`
+/// and an actual path becoming the promised `size`/`path` keys' stand-ins)
+/// instead of a genuine `{size, path}` row, and losing that row from the
+/// table entirely. Column identity/order instead comes entirely from the
+/// `output.type` hint (positionally, like `z-records`/`cols`), and the
+/// delimiter is a literal tab -- not a whitespace run like `cols` uses --
+/// so a last-field value containing ordinary spaces (a path with a space in
+/// it) survives without needing `cols`'s overflow-merge trick. A line that
+/// doesn't split into exactly the hint's field count degrades the whole
+/// parse to `None` (mismatch, not a lie), same as `csv`/`tsv`'s exact
+/// column-count check.
+fn parse_tsv_headerless(bytes: &[u8], hint: Option<&str>) -> Option<Value> {
+    let fields = hint_schema(hint);
+    if fields.is_empty() {
+        return None;
+    }
+    let body = text(bytes)?;
+    let rows = body
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|line| {
+            let parts: Vec<&str> = line.split('\t').collect();
+            if parts.len() != fields.len() {
+                return None;
+            }
+            let mut r = Record::new();
+            for ((name, ty), raw) in fields.iter().zip(&parts) {
+                r.insert(name.clone(), coerce_cell(raw, ty)?);
+            }
             Some(r)
         })
         .collect::<Option<Vec<_>>>()?;
@@ -713,6 +758,83 @@ output={parse="porcelain-v2", type="table<{status: str, path: path}>"}
         assert!(parse_output("z-records", b"a\0", None).is_none());
     }
 
+    // Regression for Real bug #2: `adapters/du.toml` used to declare
+    // `parse = "tsv"` for `du -k`-shaped output, but real `du` prints NO
+    // header line at all -- every line is a genuine `<size_kb>\t<path>`
+    // data row. `tsv`'s "first row is the header" rule silently swallowed
+    // the very first real row as fake column names (keyed by whatever that
+    // row's literal text happened to be, not by the promised
+    // `size_kb`/`path` hint names) and, for a single-directory invocation
+    // (exactly one output line), degraded a real one-row result to a
+    // phantom EMPTY table. `tsv-headerless` fixes this: every line is data,
+    // and column identity/order come from the hint alone. (Bare block
+    // counts, not `size`-typed: `du -k`'s numbers carry no unit suffix, the
+    // same reason `df.toml`'s `size_kb`/`used_kb`/`avail_kb` are `int`, not
+    // `size` -- `du -h`'s human-readable suffixes like `"310G"`/`"60K"`
+    // aren't accepted by `shoal_value::parse_size` either, which only
+    // recognizes `b`/`kb`/`mb`/.../`kib`/... suffixes, not bare
+    // single-letter ones, so `du.toml` pins `-k` and consumes
+    // `human_readable` — see that file.)
+    #[test]
+    fn tsv_headerless_parses_du_shaped_output_with_no_header_row() {
+        let h = "table<{size_kb: int, path: path}>";
+        // Single-directory `du -k .` output: exactly one line, no header.
+        // The old `tsv` strategy would have swallowed this as a "header"
+        // and returned an empty table.
+        let single = parse_output("tsv-headerless", b"335328176\t.\n", Some(h)).unwrap();
+        assert_eq!(
+            single,
+            Value::Table(vec![{
+                let mut r = Record::new();
+                r.insert("size_kb".into(), Value::Int(335328176));
+                r.insert("path".into(), Value::Path(".".into()));
+                r
+            }])
+        );
+
+        // Multi-line `du -k` output: every line (including the first) must
+        // survive as a real row, not get eaten as a header.
+        let multi = parse_output(
+            "tsv-headerless",
+            b"44\tcrates/shoal-adapters/src\n24\tcrates/shoal-adapters/tests\n",
+            Some(h),
+        )
+        .unwrap();
+        let Value::Table(rows) = multi else {
+            panic!("expected table")
+        };
+        assert_eq!(rows.len(), 2, "no row should be swallowed as a header");
+        assert_eq!(rows[0]["size_kb"], Value::Int(44));
+        assert_eq!(
+            rows[1]["path"],
+            Value::Path("crates/shoal-adapters/tests".into())
+        );
+    }
+
+    #[test]
+    fn tsv_headerless_preserves_embedded_spaces_via_explicit_tab_delimiter() {
+        // Unlike `cols` (which splits on whitespace RUNS and must merge
+        // overflow into the last column to survive embedded spaces),
+        // `tsv-headerless` splits on a literal tab, so a path containing
+        // ordinary spaces survives with no special-casing at all.
+        let h = "table<{size_kb: int, path: path}>";
+        let v = parse_output("tsv-headerless", b"512\tMy Documents\n", Some(h)).unwrap();
+        let Value::Table(rows) = v else {
+            panic!("expected table")
+        };
+        assert_eq!(rows[0]["path"], Value::Path("My Documents".into()));
+    }
+
+    #[test]
+    fn tsv_headerless_degrades_on_column_count_mismatch() {
+        let h = "table<{size_kb: int, path: path}>";
+        // Three tab-separated fields where the hint promises exactly two.
+        assert_eq!(
+            parse_output("tsv-headerless", b"4\textra\tfile.txt\n", Some(h)),
+            None
+        );
+    }
+
     // Regression for Real bug #1: `git status --porcelain=v2 --short` used
     // to have its `?`/`!` lines parsed as if they were still porcelain v2,
     // baking a leading space into `path` (short format has a second marker
@@ -855,6 +977,13 @@ output={parse="porcelain-v2", type="table<{status: str, path: path}>"}
             "bun",
             "aws",
             "gcloud",
+            "yq",
+            "stat",
+            "zip",
+            "unzip",
+            "yarn",
+            "uv",
+            "podman",
         ];
         assert_eq!(catalog.len(), required.len());
         for name in required {
@@ -863,7 +992,7 @@ output={parse="porcelain-v2", type="table<{status: str, path: path}>"}
         // IO.md §2.2: the interpreter-class set the shipped pack declares,
         // wired end to end through the same loader path as every other
         // class value.
-        for interp in ["python", "node", "ruby", "deno", "jq", "bash"] {
+        for interp in ["python", "node", "ruby", "deno", "jq", "bash", "yq"] {
             assert_eq!(
                 catalog.lookup(interp).unwrap().class,
                 AdapterClass::Interpreter,
@@ -893,10 +1022,26 @@ output={parse="porcelain-v2", type="table<{status: str, path: path}>"}
             Some(vec!["eval".to_string()])
         );
         assert_eq!(catalog.lookup("jq").unwrap().top.invoke, None);
+        // `yq` (mikefarah, YAML-native jq-alike) pins `-o=json` since its
+        // default output is YAML, unlike jq's already-JSON default.
+        assert_eq!(
+            catalog.lookup("yq").unwrap().top.invoke,
+            Some(vec!["-o=json".to_string()])
+        );
         // The `cols` strategy (added for `ps`/`df`) is wired end to end
         // through the same loader path as every other parser.
         assert_eq!(catalog.lookup("ps").unwrap().top.parse, "cols");
         assert_eq!(catalog.lookup("df").unwrap().top.parse, "cols");
+        // The `tsv-headerless` strategy (added for `du`/`stat`, Real bug #2)
+        // is wired end to end through the same loader path as every other
+        // parser, and `du`'s `human_readable` flag is consumed to protect
+        // the pinned `-k` numeric format (see `du.toml`).
+        assert_eq!(catalog.lookup("du").unwrap().top.parse, "tsv-headerless");
+        assert_eq!(catalog.lookup("stat").unwrap().top.parse, "tsv-headerless");
+        assert_eq!(
+            catalog.lookup("du").unwrap().top.consumed,
+            vec!["human_readable".to_string()]
+        );
         // gh's two-word real subcommands are flattened into single
         // shoal-side sub names whose `invoke` template supplies both words.
         assert_eq!(
@@ -948,6 +1093,37 @@ output={parse="porcelain-v2", type="table<{status: str, path: path}>"}
                 .is_empty()
         );
         assert!(catalog.lookup("rg").unwrap().top.consumed.is_empty());
+        // git's flattened `stash_list`/`stash_push`/`stash_pop` subs (no
+        // single real verb, same trick as `gh`'s `pr_list`/`run_list`).
+        let git = catalog.lookup("git").unwrap();
+        assert_eq!(
+            git.subs["stash_list"].invoke,
+            Some(vec!["stash".to_string(), "list".to_string()])
+        );
+        assert_eq!(
+            git.subs["stash_push"].invoke,
+            Some(vec!["stash".to_string(), "push".to_string()])
+        );
+        assert_eq!(
+            git.subs["stash_pop"].invoke,
+            Some(vec!["stash".to_string(), "pop".to_string()])
+        );
+        assert!(git.subs.contains_key("show"));
+        assert!(git.subs.contains_key("remote"));
+        // podman's own formatter recognizes bare `--format json` directly
+        // (no `docker.toml`-style go-template/tsv workaround needed).
+        assert_eq!(
+            catalog.lookup("podman").unwrap().subs["ps"].invoke,
+            Some(vec![
+                "ps".to_string(),
+                "--format".to_string(),
+                "json".to_string()
+            ])
+        );
+        assert_eq!(
+            catalog.lookup("podman").unwrap().subs["ps"].consumed,
+            vec!["quiet".to_string()]
+        );
     }
 
     #[test]

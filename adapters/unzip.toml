@@ -1,0 +1,30 @@
+# Info-ZIP `unzip` — ships by default on macOS; commonly installed on
+# Linux. Extraction is unzip's *default* action (no subcommand verb at all:
+# `unzip archive.zip -d dir`), so it is modeled at the top level, not as a
+# `.sub.extract` — a `[cmd.unzip.sub.X]` entry with no `invoke` override
+# would push its own shoal-side name onto argv as a literal word (the same
+# trick `git.sub.branch`/`cargo.sub.build` rely on, where the sub name IS
+# the tool's real verb), which unzip has no such verb for.
+#
+# `list` uses `-Z1` (zipinfo "short" format, invoked via unzip's own
+# built-in zipinfo mode) to print exactly one archive member path per line
+# with **no header at all** — unlike `unzip -l`'s human table, which has a
+# header row, a dashed separator row, AND a trailing totals row, none of
+# which any parser here models cleanly (`cols` always discards exactly one
+# header line; this table has three non-data lines). `lines` is the
+# honestly-achievable shape.
+[cmd.unzip]
+bin = "unzip"
+class = "cli"
+ok_codes = [0]
+params = { archive = "path", directory = "path?", overwrite = "bool" }
+positional = ["archive"]
+flags = { short = { d = "directory", o = "overwrite" } }
+effects = ["fs.read($archive)", "fs.write($directory)"]
+
+[cmd.unzip.sub.list]
+params = { archive = "path" }
+positional = ["archive"]
+invoke = ["-Z1"]
+output = { parse = "lines", type = "list<path>" }
+effects = ["fs.read($archive)"]

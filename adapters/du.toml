@@ -1,9 +1,33 @@
+# `du -k` prints exactly `<kilobytes>\t<path>` per line with **no header row
+# at all** -- unlike `docker ps --format "table ..."` (which genuinely has
+# one), so this uses `tsv-headerless` (column identity/order from the
+# `output.type` hint, every line is data), not `tsv` (which reads column
+# names from an assumed header line and would silently swallow the very
+# first real row as fake header text -- see shoal-adapters' "Real bug #2"
+# regression test).
+#
+# `-k` is pinned via `invoke` (not left to whatever block-size the user's
+# environment/POSIXLY_CORRECT defaults to) for the same portability reason
+# `df.toml` pins `-kP`: both GNU and BSD `du` support it, and the resulting
+# numbers are bare kilobyte counts with no unit suffix -- so, like
+# `df.toml`'s `size_kb`/`used_kb`/`avail_kb`, this column is declared `int`,
+# not `size` (`shoal_value::parse_size` requires a `b`/`kb`/`mb`/.../`kib`
+# suffix; `du -h`'s human-readable single-letter suffixes like `"310G"`
+# aren't one, and `-k`'s plain digits aren't one either). `human_readable`
+# stays a declared, recognized flag (so `-h` is still valid to type) but is
+# `consumed`: forwarding it alongside the pinned `-k` would let `-h`
+# silently win the same "last format flag wins" trap `git status
+# --porcelain=v2 --short` and `docker ps --format ... --quiet` already
+# guard against, switching real output to non-numeric human-readable text
+# that this table's `int` column can never parse.
 [cmd.du]
 bin = "du"
 class = "cli"
 ok_codes = [0]
 params = { paths = "glob", summarize = "bool", human_readable = "bool", max_depth = "int?", apparent_size = "bool" }
 positional = ["paths"]
+invoke = ["-k"]
 flags = { short = { s = "summarize", h = "human_readable", d = "max_depth" } }
-output = { parse = "tsv", type = "table<{size: size, path: path}>" }
+consumed = ["human_readable"]
+output = { parse = "tsv-headerless", type = "table<{size_kb: int, path: path}>" }
 effects = ["fs.read($paths)"]

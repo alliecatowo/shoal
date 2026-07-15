@@ -1,0 +1,25 @@
+# Yarn Classic (v1) — cross-platform (Linux/macOS/Windows) JS package
+# manager. Its global `--json` flag wraps a command's own output in a
+# single envelope object, shaped `{"type": "...", "data": {...}}` — a
+# `record`, not a bare array of packages the way `pnpm list --json`/`npm ls
+# --json` are (see `pnpm.toml`/`npm.toml`), so these are typed `record`
+# (matching what the tool genuinely emits), not `table<...>`.
+[cmd.yarn]
+bin = "yarn"
+class = "cli"
+ok_codes = [0]
+effects = ["fs.read(cwd)", "net.connect(registry.yarnpkg.com:443)"]
+
+[cmd.yarn.sub.list]
+params = { depth = "int?", pattern = "str?" }
+invoke = ["list", "--json"]
+output = { parse = "json", type = "record" }
+effects = ["fs.read(cwd)"]
+
+# `yarn outdated` exits 1 (not 0) when it finds outdated packages — the
+# same class of nonzero-but-ok exit code as `npm outdated`/`git diff`.
+[cmd.yarn.sub.outdated]
+ok_codes = [0, 1]
+invoke = ["outdated", "--json"]
+output = { parse = "json", type = "record" }
+effects = ["fs.read(cwd)", "net.connect(registry.yarnpkg.com:443)"]

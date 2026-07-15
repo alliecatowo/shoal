@@ -658,3 +658,231 @@ fn kubectl_config_current_context_lines_parses_single_line() {
         Some(Value::List(vec![Value::Str("my-cluster-context".into())]))
     );
 }
+
+// ----------------------------------------------------------------- git ----
+
+#[test]
+fn git_show_and_remote_and_stash_subs_declare_the_expected_shape() {
+    let c = catalog();
+    // `show` has no clean structured shape (default output is prose +
+    // patch), so it's kept as honest raw `lines`, like `diff`.
+    let show = sub(&c, "git", "show");
+    assert_eq!(show.parse, "lines");
+    // `remote` reads local config only -- no `net.connect` effect, unlike
+    // `push`/`pull`.
+    let remote = sub(&c, "git", "remote");
+    assert_eq!(remote.parse, "lines");
+    assert!(!remote.effects.iter().any(|e| e.starts_with("net.connect")));
+    // `stash_list`/`stash_push`/`stash_pop` are flattened two-word
+    // subcommands (same trick as `gh`'s `pr_list`/`run_list`).
+    let stash_list = sub(&c, "git", "stash_list");
+    assert_eq!(
+        stash_list.invoke,
+        Some(vec!["stash".to_string(), "list".to_string()])
+    );
+    assert_eq!(stash_list.parse, "lines");
+    let stash_push = sub(&c, "git", "stash_push");
+    assert_eq!(
+        stash_push.invoke,
+        Some(vec!["stash".to_string(), "push".to_string()])
+    );
+    let stash_pop = sub(&c, "git", "stash_pop");
+    assert_eq!(
+        stash_pop.invoke,
+        Some(vec!["stash".to_string(), "pop".to_string()])
+    );
+}
+
+#[test]
+fn git_show_and_remote_and_stash_list_parse_realistic_line_output() {
+    let c = catalog();
+    let show = sub(&c, "git", "show");
+    let bytes = b"commit abc123\nAuthor: Allie <allie@example.com>\n\n    fix bug\n";
+    assert_eq!(
+        parse(show, bytes),
+        Some(Value::List(vec![
+            Value::Str("commit abc123".into()),
+            Value::Str("Author: Allie <allie@example.com>".into()),
+            Value::Str("".into()),
+            Value::Str("    fix bug".into()),
+        ]))
+    );
+
+    let remote = sub(&c, "git", "remote");
+    let verbose = b"origin\thttps://example.com/repo.git (fetch)\norigin\thttps://example.com/repo.git (push)\n";
+    let Value::List(lines) = parse(remote, verbose).unwrap() else {
+        panic!("expected list")
+    };
+    assert_eq!(lines.len(), 2);
+    assert_eq!(
+        lines[0],
+        Value::Str("origin\thttps://example.com/repo.git (fetch)".into())
+    );
+
+    let stash_list = sub(&c, "git", "stash_list");
+    assert_eq!(
+        parse(stash_list, b"stash@{0}: On main: wip\n"),
+        Some(Value::List(vec![Value::Str(
+            "stash@{0}: On main: wip".into()
+        )]))
+    );
+}
+
+// ------------------------------------------------------------------ yq ----
+
+#[test]
+fn yq_interpreter_class_pins_json_output_flag() {
+    let c = catalog();
+    let yq = c.lookup("yq").unwrap();
+    assert_eq!(yq.class, shoal_adapters::AdapterClass::Interpreter);
+    assert_eq!(yq.top.invoke, Some(vec!["-o=json".to_string()]));
+    assert_eq!(yq.top.parse, "json");
+}
+
+#[test]
+fn yq_json_output_parses_and_degrades_on_bad_json() {
+    let c = catalog();
+    let spec = top(&c, "yq");
+    let good = br#"{"name":"myapp","version":1}"#;
+    let Value::Record(r) = parse(spec, good).expect("realistic yq -o=json output must parse")
+    else {
+        panic!("expected record")
+    };
+    assert_eq!(r["name"], Value::Str("myapp".into()));
+    assert_eq!(parse(spec, b"{\"name\": "), None);
+}
+
+// ---------------------------------------------------------------- stat ----
+
+#[test]
+fn stat_tsv_headerless_parses_realistic_output_and_degrades_on_mismatch() {
+    let c = catalog();
+    let spec = top(&c, "stat");
+    assert_eq!(spec.parse, "tsv-headerless");
+    assert_eq!(
+        spec.invoke,
+        Some(vec!["--format=%s\t%Y\t%F\t%n".to_string()])
+    );
+
+    let good = b"3\t1720555200\tregular file\t/tmp/a.txt\n4096\t1720555300\tdirectory\t/tmp/sub\n";
+    let v = parse(spec, good).expect("realistic stat --format output must parse");
+    let Value::Table(rows) = v else {
+        panic!("expected table")
+    };
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["size_bytes"], Value::Int(3));
+    assert_eq!(rows[0]["kind"], Value::Str("regular file".into()));
+    assert_eq!(rows[0]["name"], Value::Path("/tmp/a.txt".into()));
+    assert_eq!(rows[1]["kind"], Value::Str("directory".into()));
+
+    // A row with a missing field (three tab-separated fields, not four)
+    // must degrade the whole parse, not silently misalign columns.
+    let truncated = b"3\t1720555200\tregular file\n";
+    assert_eq!(parse(spec, truncated), None);
+}
+
+// --------------------------------------------------------------- unzip ----
+
+#[test]
+fn unzip_list_lines_parses_zipinfo_short_format() {
+    let c = catalog();
+    let spec = sub(&c, "unzip", "list");
+    assert_eq!(spec.parse, "lines");
+    assert_eq!(spec.invoke, Some(vec!["-Z1".to_string()]));
+
+    let good = b"a.txt\nsub/b.txt\n";
+    assert_eq!(
+        parse(spec, good),
+        Some(Value::List(vec![
+            Value::Str("a.txt".into()),
+            Value::Str("sub/b.txt".into()),
+        ]))
+    );
+}
+
+// ---------------------------------------------------------------- yarn ----
+
+#[test]
+fn yarn_list_json_parses_envelope_record() {
+    let c = catalog();
+    let spec = sub(&c, "yarn", "list");
+    assert_eq!(spec.parse, "json");
+    assert_eq!(
+        spec.invoke,
+        Some(vec!["list".to_string(), "--json".to_string()])
+    );
+
+    let good = br#"{"type":"tree","data":{"type":"list","trees":[{"name":"lodash@4.17.21","children":[],"hint":null,"color":null,"depth":0}]}}"#;
+    let Value::Record(r) = parse(spec, good).expect("realistic yarn list --json must parse") else {
+        panic!("expected record")
+    };
+    assert_eq!(r["type"], Value::Str("tree".into()));
+    assert!(matches!(r["data"], Value::Record(_)));
+
+    assert_eq!(parse(spec, b"{\"type\": "), None);
+}
+
+#[test]
+fn yarn_outdated_json_allows_ok_code_one() {
+    let c = catalog();
+    let spec = sub(&c, "yarn", "outdated");
+    assert_eq!(spec.ok_codes, Some(vec![0, 1]));
+    let good = br#"{"type":"table","data":{"head":["Package","Current","Wanted","Latest"],"body":[["lodash","4.17.20","4.17.21","4.17.21"]]}}"#;
+    let Value::Record(r) = parse(spec, good).unwrap() else {
+        panic!("expected record")
+    };
+    assert!(matches!(r["data"], Value::Record(_)));
+}
+
+// ------------------------------------------------------------------ uv ----
+
+#[test]
+fn uv_pip_list_json_parses_table_of_packages() {
+    let c = catalog();
+    let spec = sub(&c, "uv", "pip_list");
+    assert_eq!(spec.parse, "json");
+    assert_eq!(
+        spec.invoke,
+        Some(vec![
+            "pip".to_string(),
+            "list".to_string(),
+            "--format".to_string(),
+            "json".to_string()
+        ])
+    );
+
+    let good = br#"[{"name":"requests","version":"2.31.0"}]"#;
+    let Value::Table(rows) =
+        parse(spec, good).expect("realistic uv pip list --format json must parse")
+    else {
+        panic!("expected table")
+    };
+    assert_eq!(rows[0]["name"], Value::Str("requests".into()));
+    assert_eq!(parse(spec, b"[{\"name\": "), None);
+}
+
+// -------------------------------------------------------------- podman ----
+
+#[test]
+fn podman_ps_and_images_json_parse_realistic_rows() {
+    let c = catalog();
+    let ps = sub(&c, "podman", "ps");
+    assert_eq!(ps.parse, "json");
+    assert_eq!(ps.consumed, vec!["quiet".to_string()]);
+    let good_ps = br#"[{"Id":"abc123","Image":"alpine","Names":["quirky_box"],"State":"running"}]"#;
+    let Value::Table(rows) =
+        parse(ps, good_ps).expect("realistic podman ps --format json must parse")
+    else {
+        panic!("expected table")
+    };
+    assert_eq!(rows[0]["Image"], Value::Str("alpine".into()));
+    assert!(matches!(rows[0]["Names"], Value::List(_)));
+    assert_eq!(parse(ps, b"[{\"Id\": "), None);
+
+    let images = sub(&c, "podman", "images");
+    let good_images = br#"[{"Id":"def456","Repository":"alpine","Tag":"latest","Size":7800000}]"#;
+    let Value::Table(rows) = parse(images, good_images).unwrap() else {
+        panic!("expected table")
+    };
+    assert_eq!(rows[0]["Tag"], Value::Str("latest".into()));
+}

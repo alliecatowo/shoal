@@ -1,0 +1,24 @@
+# `class = "interpreter"` (IO.md §2.2) opts `yq { FILTER }` into raw-block
+# lexing, exactly like `jq.toml` — the block's raw text becomes yq's filter
+# argument, the same one positional argument `filter` already binds below
+# for the ordinary `yq(filter: ...)` call shape.
+#
+# This targets mikefarah's Go `yq` (the widely-packaged `yq` on Linux/macOS
+# today), not the older Python `yq` (a thin jq wrapper) or `jq`+`yaml2json`
+# pipelines — those have different flag surfaces entirely. Unlike `jq`,
+# whose default output already IS JSON, plain `yq` defaults to YAML output
+# even when reading JSON input, so `-o=json` is pinned via `invoke` to force
+# the one shape this crate's `json` parser can honestly read; nothing here
+# exposes an `output_format` param that could override it back to YAML (the
+# same reasoning `docker.toml`/`git.toml` document for their `consumed`
+# fields — simplest to just never offer the footgun rather than declare and
+# consume it).
+[cmd.yq]
+bin = "yq"
+class = "interpreter"
+ok_codes = [0]
+params = { filter = "str", files = "glob" }
+positional = ["filter", "files"]
+invoke = ["-o=json"]
+output = { parse = "json", type = "value" }
+effects = ["fs.read($files)"]

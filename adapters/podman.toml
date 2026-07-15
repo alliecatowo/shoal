@@ -1,0 +1,34 @@
+# Podman is largely docker-CLI-compatible, but unlike `docker` (whose
+# `--format` only understands Go templates, forcing `docker.toml`'s
+# `table {{...}}`-plus-`tsv` workaround), podman's own formatter recognizes
+# the bare keyword `json` and emits a genuine JSON array directly — so these
+# subs use plain `--format json` instead of that workaround.
+#
+# Unlike `docker` (which always talks to a persistent daemon socket),
+# podman's default (rootless, daemonless) mode forks containers directly —
+# there is no daemon socket to name a `net.connect` effect for, so this
+# adapter declares none, honestly reflecting the difference from
+# `docker.toml`'s `class = "daemon"` / `net.connect(docker-daemon)` pair.
+[cmd.podman]
+bin = "podman"
+class = "cli"
+ok_codes = [0]
+effects = ["proc.spawn(podman)"]
+
+[cmd.podman.sub.ps]
+params = { all = "bool", quiet = "bool", filter = "str?" }
+flags = { short = { a = "all", q = "quiet", f = "filter" } }
+invoke = ["ps", "--format", "json"]
+# Same "consumed" rationale as `docker.sub.ps`: `--quiet`/`-q` requests an
+# alternate (IDs-only) output shape that would compete with the pinned
+# `--format json`, and the JSON array already contains the ID field.
+consumed = ["quiet"]
+output = { parse = "json", type = "table<{Id: str, Image: str, Names: list<str>, State: str}>" }
+effects = []
+
+[cmd.podman.sub.images]
+params = { all = "bool" }
+flags = { short = { a = "all" } }
+invoke = ["images", "--format", "json"]
+output = { parse = "json", type = "table<{Id: str, Repository: str, Tag: str, Size: int}>" }
+effects = []

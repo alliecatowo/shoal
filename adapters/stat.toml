@@ -1,0 +1,32 @@
+# GNU coreutils `stat` only (Linux): BSD/macOS `stat` uses a completely
+# different flag syntax (`-f format` with different directives, e.g. `%z`/
+# `%m`/`%N` instead of GNU's `%s`/`%Y`/`%n`) with no shared subset — unlike
+# `ps`/`df`, which share one POSIX-ish flag surface across GNU and BSD, so
+# this names a specific implementation rather than a portable one, like
+# `systemctl`/`ip`/`ss`, and fails loudly with "command not found" (or
+# wrong-flags) on macOS instead of guessing at a lookalike that would
+# misparse.
+#
+# `--format` is pinned to a fixed, tab-separated field list (`%s` size in
+# bytes, `%Y` mtime as Unix epoch seconds, `%F` a freeform file-type
+# description, `%n` filename) with **no header line at all** — like `du`,
+# so this uses the `tsv-headerless` strategy (column identity/order from the
+# `output.type` hint; every line is data). GNU `stat --format` (unlike
+# `--printf`) always appends a trailing newline per file automatically, so
+# multiple positional paths yield one line each. Because the delimiter here
+# is an explicit literal tab (not a whitespace run), `%F`'s multi-word
+# values ("regular file", "symbolic link") can't desync later columns the
+# way `cols`'s whitespace-run splitting would need `ps`/`df`'s "last column
+# only" trick to survive.
+#
+# `size_bytes` (not `size`-typed): `%s` is a bare byte count with no unit
+# suffix, the same reason `df.toml`'s `size_kb` is `int`, not `size`.
+[cmd.stat]
+bin = "stat"
+class = "cli"
+ok_codes = [0]
+params = { paths = "glob" }
+positional = ["paths"]
+invoke = ["--format=%s\t%Y\t%F\t%n"]
+output = { parse = "tsv-headerless", type = "table<{size_bytes: int, mtime: int, kind: str, name: path}>" }
+effects = ["fs.read($paths)"]

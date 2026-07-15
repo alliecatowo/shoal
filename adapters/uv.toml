@@ -1,0 +1,15 @@
+# uv (Astral) — cross-platform (Linux/macOS/Windows) Python package/project
+# manager. `uv pip` deliberately mirrors pip's own CLI surface, and `uv pip
+# list --format json` yields the identical `[{"name": ..., "version": ...}]`
+# shape `pip list --format json` does (see `pip.toml`) — same parse/type.
+[cmd.uv]
+bin = "uv"
+class = "cli"
+ok_codes = [0]
+effects = ["fs.read(cwd)", "net.connect(pypi.org:443)"]
+
+[cmd.uv.sub.pip_list]
+params = { outdated = "bool" }
+invoke = ["pip", "list", "--format", "json"]
+output = { parse = "json", type = "table<{name: str, version: str}>" }
+effects = ["fs.read(cwd)"]

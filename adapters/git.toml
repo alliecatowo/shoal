@@ -20,11 +20,59 @@ output = { parse = "porcelain-v2", type = "table<{status: str, path: path, orig:
 effects = ["fs.read(cwd)"]
 
 [cmd.git.sub.log]
-params = { n = "int?", path = "path?", follow = "bool" }
+# `author`/`since`/`until`/`grep` are pure commit FILTERS (git-log(1)): they
+# narrow which commits are emitted but never touch the pinned
+# `--pretty=format:...`/`-z` output shape the `z-records` parser depends on,
+# unlike `short`/`branch` on `status` above -- so, unlike those, none of
+# these need `consumed`.
+params = { n = "int?", path = "path?", follow = "bool", author = "str?", since = "str?", until = "str?", grep = "str?" }
 positional = ["path"]
 invoke = ["log", "--pretty=format:%H%x00%an%x00%aI%x00%s", "-z"]
 output = { parse = "z-records", type = "table<{hash: str, author: str, date: datetime, subject: str}>" }
 effects = ["fs.read(cwd)"]
+
+# `git show` has no clean machine-readable output mode for a commit (its
+# default is a human-oriented patch: commit header prose followed by a
+# unified diff) -- unlike `log`, there is no stable per-field delimiter to
+# pin via `--pretty`/`-z` without losing the diff body itself, so, like
+# `diff` below, this is kept as raw `lines`, honest per TDD §6 rather than a
+# fabricated structured schema.
+[cmd.git.sub.show]
+params = { ref = "str?", name_only = "bool", stat = "bool" }
+positional = ["ref"]
+output = { parse = "lines", type = "list<str>" }
+effects = ["fs.read(cwd)"]
+
+# `git remote`/`git remote -v` read local config only (`.git/config`) -- no
+# network call happens until an explicit `fetch`/`push`/`update`, so unlike
+# `push`/`pull` below this declares no `net.connect` effect. `verbose`
+# changes each line's own content (bare name vs. `name<TAB>url (type)`) but
+# never the LINE-ORIENTED shape itself, so `lines` parses either form
+# equally honestly -- no `consumed` needed, unlike `status`'s
+# `short`/`branch` (which would corrupt a *record-shaped* parser instead).
+[cmd.git.sub.remote]
+params = { verbose = "bool" }
+flags = { short = { v = "verbose" } }
+output = { parse = "lines", type = "list<str>" }
+effects = ["fs.read(cwd)"]
+
+# `git stash` has no single verb: `list`/`push`/`pop` are flattened
+# shoal-side subs (same trick as `gh`'s `pr_list`/`run_list`), each pinning
+# its own real two-word argv via `invoke`.
+[cmd.git.sub.stash_list]
+invoke = ["stash", "list"]
+output = { parse = "lines", type = "list<str>" }
+effects = ["fs.read(cwd)"]
+
+[cmd.git.sub.stash_push]
+params = { message = "str?", include_untracked = "bool" }
+flags = { short = { m = "message", u = "include_untracked" } }
+invoke = ["stash", "push"]
+effects = ["fs.read(cwd)", "fs.write(cwd/.git)"]
+
+[cmd.git.sub.stash_pop]
+invoke = ["stash", "pop"]
+effects = ["fs.read(cwd)", "fs.write(cwd)", "fs.write(cwd/.git)"]
 
 [cmd.git.sub.branch]
 params = { all = "bool", delete = "bool", force = "bool", name = "str?" }

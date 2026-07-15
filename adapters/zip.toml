@@ -1,0 +1,16 @@
+# Info-ZIP `zip` — ships by default on macOS; commonly installed on Linux.
+# No machine-readable output mode for archive creation (there is no
+# `--json`/structured listing while writing), so — like `tar` — this
+# declares only the create action with no `output` block: fs effects only,
+# honestly reflecting what the tool prints (a free-text per-entry
+# add/deflate log, not a shape this crate would promise a parse for).
+# Listing an existing archive's structured contents is `unzip`'s job (see
+# `unzip.toml`'s `list` sub), not this adapter's.
+[cmd.zip]
+bin = "zip"
+class = "cli"
+ok_codes = [0]
+params = { archive = "path", paths = "glob", recurse = "bool", quiet = "bool" }
+positional = ["archive", "paths"]
+flags = { short = { r = "recurse", q = "quiet" } }
+effects = ["fs.read($paths)", "fs.write($archive)"]
