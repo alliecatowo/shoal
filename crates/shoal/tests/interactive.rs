@@ -536,3 +536,128 @@ fn repl_undo_out_n_resolves_via_journal() {
          to the unresolved-value error; transcript:\n{text}"
     );
 }
+
+/// docs/CONFIG.md §1/§6, docs/REEF.md §1: `[reef]` in `shoal.toml` is reef's
+/// *user* scope, wired in `run_source` via
+/// `evaluator.set_reef_user_manifest(reef_user_manifest_path())` — but the
+/// REPL builds its own separate `Evaluator` and was missing that exact call
+/// (flagged by a parallel lane), so the documented user reef scope never
+/// engaged in the interactive shell even though it worked for `-c`/scripts.
+/// Proof: declare a tool in the user config's `[reef.tools]` with no project
+/// `.reef.toml` anywhere in scope, drive the real REPL over a PTY, and assert
+/// bare `reef` (which lists every tool a manifest *currently in scope*
+/// constrains, docs REEF.md/`reef_binding_table`) surfaces it — only possible
+/// if the user manifest actually loaded.
+#[test]
+fn repl_reef_user_scope_from_config_engages() {
+    let pty = native_pty_system();
+    let pair = pty
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("open pty");
+
+    let home = tempfile::tempdir().unwrap();
+    let config_dir = home.path().join(".config").join("shoal");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("shoal.toml"),
+        "version = 1\n[reef.tools]\nshoalcfgwiretool = \"*\"\n",
+    )
+    .unwrap();
+
+    let mut cmd = CommandBuilder::new(BIN);
+    cmd.cwd(home.path());
+    cmd.env("NO_COLOR", "1");
+    cmd.env("TERM", "xterm");
+    cmd.env("HOME", home.path());
+    cmd.env("XDG_CONFIG_HOME", home.path().join(".config"));
+    cmd.env("XDG_STATE_HOME", home.path());
+    cmd.env_remove("SHOAL_CONFIG");
+
+    let mut child = pair.slave.spawn_command(cmd).expect("spawn repl");
+    drop(pair.slave);
+
+    let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let reader_buf = Arc::clone(&buf);
+    let mut reader = pair.master.try_clone_reader().expect("clone reader");
+    let reader_thread = std::thread::spawn(move || {
+        let mut chunk = [0u8; 4096];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => reader_buf.lock().unwrap().extend_from_slice(&chunk[..n]),
+            }
+        }
+    });
+
+    let mut writer = pair.master.take_writer().expect("take writer");
+    let mut dsr_answered = 0usize;
+    let answer_dsr = |writer: &mut Box<dyn Write + Send>, answered: &mut usize| {
+        let seen = buf
+            .lock()
+            .unwrap()
+            .windows(4)
+            .filter(|w| *w == b"\x1b[6n")
+            .count();
+        while *answered < seen {
+            let _ = writer.write_all(b"\x1b[1;1R");
+            let _ = writer.flush();
+            *answered += 1;
+        }
+    };
+    let mut pump_until = |writer: &mut Box<dyn Write + Send>, marker: &[u8]| -> bool {
+        let deadline = Instant::now() + Duration::from_secs(45);
+        loop {
+            answer_dsr(writer, &mut dsr_answered);
+            if marker.is_empty() {
+                if dsr_answered >= 1 {
+                    return true;
+                }
+            } else if buf
+                .lock()
+                .unwrap()
+                .windows(marker.len())
+                .any(|w| w == marker)
+            {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+
+    assert!(pump_until(&mut writer, b""), "REPL never drew a prompt");
+
+    writer.write_all(b"reef\r").unwrap();
+    writer.flush().unwrap();
+    assert!(
+        pump_until(&mut writer, b"shoalcfgwiretool"),
+        "bare `reef` should list the user-config-declared tool, proving the \
+         user `[reef]` scope engaged in the REPL; transcript:\n{}",
+        String::from_utf8_lossy(&buf.lock().unwrap())
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let mut last_send = Instant::now() - Duration::from_secs(1);
+    loop {
+        if last_send.elapsed() >= Duration::from_millis(700) {
+            let _ = writer.write_all(b"exit 0\r");
+            let _ = writer.flush();
+            last_send = Instant::now();
+        }
+        answer_dsr(&mut writer, &mut dsr_answered);
+        if child.try_wait().expect("try_wait").is_some() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "REPL did not exit");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(writer);
+    let _ = reader_thread.join();
+}

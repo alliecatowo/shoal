@@ -9,9 +9,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
 use reedline::{
-    ColumnarMenu, DefaultHinter, Emacs, FileBackedHistory, KeyCode, KeyModifiers, MenuBuilder,
-    Reedline, ReedlineEvent, ReedlineMenu, Signal, ValidationResult, Validator,
-    default_emacs_keybindings,
+    ColumnarMenu, DefaultHinter, EditMode, Emacs, FileBackedHistory, History, HistoryItem,
+    HistoryItemId, HistorySessionId, KeyCode, KeyModifiers, MenuBuilder, Reedline, ReedlineEvent,
+    ReedlineMenu, SearchDirection, SearchQuery, Signal, ValidationResult, Validator, Vi,
+    default_emacs_keybindings, default_vi_insert_keybindings, default_vi_normal_keybindings,
 };
 use shoal_ast::{CmdArg, Expr, Program, Stmt, UnOp};
 use shoal_eval::Evaluator;
@@ -27,6 +28,10 @@ use crate::{format_parse_error, maybe_strip, no_color, report_eval_error};
 pub(crate) fn repl() -> Result<i32, String> {
     let cwd = std::env::current_dir().map_err(|e| format!("cannot determine cwd: {e}"))?;
     let loaded = shoal_config::load(&shoal_config::LoadOptions::discover(&cwd))?;
+    // Before anything else prints: feed `render.color` into `no_color()` so
+    // even these very warnings honor a `render.color = false` in `shoal.toml`
+    // (docs/CONFIG.md §5/§6), the same way `NO_COLOR` already does.
+    crate::apply_render_color_config(loaded.config.render.color);
     for warning in &loaded.warnings {
         eprintln!(
             "{}",
@@ -36,6 +41,18 @@ pub(crate) fn repl() -> Result<i32, String> {
     let config = loaded.config;
     let mut evaluator = Evaluator::new(cwd.clone());
     evaluator.interactive = true;
+    // Wire the user reef scope (docs/REEF.md §1) exactly like `run_source`
+    // does (crate::reef_user_manifest_path). The REPL builds its own
+    // `Evaluator` and was missing this call entirely — without it,
+    // `~/.config/shoal/shoal.toml`'s `[reef]` table engaged for `-c`/scripts
+    // but never for the interactive shell. Additive: an absent/empty file is
+    // exactly today's no-user-scope behavior.
+    if let Some(path) = crate::reef_user_manifest_path() {
+        evaluator.set_reef_user_manifest(path);
+    }
+    // `[aliases]`/`[env]` (docs/CONFIG.md §5): same seeding `run_source` does,
+    // before any init file or typed input runs.
+    crate::seed_config_bindings(&mut evaluator, &config);
     evaluator.set_statement_sink(Box::new(|v: &Value| {
         let _ = print_value(v);
     }));
@@ -115,16 +132,24 @@ pub(crate) fn repl() -> Result<i32, String> {
         cwd_cell.clone(),
         catalogs,
         adapter_names,
+    )
+    .configure(
+        config.completion.fuzzy,
+        config.completion.case_insensitive,
+        config.completion.max_results,
     );
-    let mut keybindings = default_emacs_keybindings();
-    keybindings.add_binding(
-        KeyModifiers::NONE,
-        KeyCode::Tab,
-        ReedlineEvent::UntilFound(vec![
-            ReedlineEvent::Menu("completion_menu".to_string()),
-            ReedlineEvent::MenuNext,
-        ]),
-    );
+    // `editor.keybindings` (docs/CONFIG.md §5): parse `chord -> action`
+    // strings into real reedline bindings, warning (never failing) on
+    // anything unrecognized.
+    let (custom_bindings, keybinding_warnings) =
+        crate::keybindings::parse_bindings(&config.editor.keybindings);
+    for warning in &keybinding_warnings {
+        eprintln!(
+            "{}",
+            maybe_strip(format!("\x1b[33;1mwarning:\x1b[0m {warning}"))
+        );
+    }
+    let edit_mode = build_edit_mode(&config, &custom_bindings);
     // Build the shoal-prompt pipeline: load + layer the prompt config, resolve
     // the static session facts once, and set up the shared snapshot cell that
     // the loop refreshes per command and reedline reads per keystroke (zero
@@ -158,9 +183,29 @@ pub(crate) fn repl() -> Result<i32, String> {
         .with_menu(ReedlineMenu::EngineCompleter(Box::new(
             ColumnarMenu::default().with_name("completion_menu"),
         )))
-        .with_edit_mode(Box::new(Emacs::new(keybindings)))
+        // `completion.menu` (docs/CONFIG.md §5): `false` asks for cycle-only
+        // completion rather than the interactive popup. reedline has no
+        // separate non-menu completion path (the `Completer` trait is only
+        // ever driven through the `ReedlineMenu` system), but it exposes
+        // exactly this pair of knobs for the "no popup, just complete"
+        // experience: a unique match is inserted immediately
+        // (`quick_completions`) and multiple matches complete their shared
+        // prefix in place rather than opening the dropdown
+        // (`partial_completions`) — the popup still appears only when
+        // several candidates share no common prefix, since at that point
+        // there is nothing else reedline can do with them.
+        .with_quick_completions(!config.completion.menu)
+        .with_partial_completions(!config.completion.menu)
+        .with_edit_mode(edit_mode)
         .with_highlighter(Box::new(ShoalHighlighter::with_env(evaluator.env.clone())))
-        .with_hinter(Box::new(DefaultHinter::default()));
+        .with_hinter(Box::new(DefaultHinter::default()))
+        // `history.ignore_space` (docs/CONFIG.md §5, classic
+        // `HISTCONTROL=ignorespace`): reedline has this exact knob built in.
+        .with_history_exclusion_prefix(if config.history.ignore_space {
+            Some(" ".to_string())
+        } else {
+            None
+        });
     if transient_enabled {
         // Transient prompt (§2.5): a second ShoalPrompt sharing the same cache,
         // rendering `format.transient` post-Enter. Reedline invokes it at the
@@ -178,6 +223,15 @@ pub(crate) fn repl() -> Result<i32, String> {
             let _ = fs::create_dir_all(parent);
         }
         if let Ok(history) = FileBackedHistory::with_file(config.history.max_entries, path) {
+            // `history.dedup`/`history.ignore` (docs/CONFIG.md §5):
+            // `FileBackedHistory` has no built-in filtering, so wrap it in a
+            // thin `History` adapter that applies both before ever calling
+            // through to `save`.
+            let history = FilteredHistory::new(
+                Box::new(history),
+                config.history.dedup,
+                config.history.ignore.clone(),
+            );
             editor = editor.with_history(Box::new(history));
         }
     }
@@ -255,6 +309,151 @@ pub(crate) fn repl() -> Result<i32, String> {
             Err(error) => return Err(format!("line editor failed: {error}")),
         }
     }
+}
+
+/// Build the reedline edit mode for `config.editor.mode` (docs/CONFIG.md
+/// §5): `"emacs"` or `"vi"` — shoal-config's semantic validation already
+/// rejects anything else (§4), but this defensively falls back to emacs for
+/// any other value rather than panicking, since a `Config` can also be built
+/// directly (tests, an embedder) bypassing that validation. Tab always
+/// drives the completion menu regardless of mode. `[editor.keybindings]`
+/// custom chords (§5) are layered on top of whichever mode's own default
+/// table(s) are in play — both the insert and normal tables in vi mode,
+/// since the config schema draws no per-mode distinction.
+fn build_edit_mode(
+    config: &shoal_config::Config,
+    custom: &[crate::keybindings::ParsedBinding],
+) -> Box<dyn EditMode> {
+    let tab_event = ReedlineEvent::UntilFound(vec![
+        ReedlineEvent::Menu("completion_menu".to_string()),
+        ReedlineEvent::MenuNext,
+    ]);
+    if config.editor.mode == "vi" {
+        let mut insert = default_vi_insert_keybindings();
+        let mut normal = default_vi_normal_keybindings();
+        insert.add_binding(KeyModifiers::NONE, KeyCode::Tab, tab_event);
+        for b in custom {
+            insert.add_binding(b.modifiers, b.code, b.event.clone());
+            normal.add_binding(b.modifiers, b.code, b.event.clone());
+        }
+        Box::new(Vi::new(insert, normal))
+    } else {
+        let mut kb = default_emacs_keybindings();
+        kb.add_binding(KeyModifiers::NONE, KeyCode::Tab, tab_event);
+        for b in custom {
+            kb.add_binding(b.modifiers, b.code, b.event.clone());
+        }
+        Box::new(Emacs::new(kb))
+    }
+}
+
+/// `history.dedup`/`history.ignore` (docs/CONFIG.md §5): a `History` adapter
+/// that wraps a real backend (here, `FileBackedHistory`) and filters what
+/// actually reaches `save` — neither knob has any built-in support in
+/// reedline's history backends. Every other `History` method delegates
+/// straight through; only `save` has filtering logic.
+struct FilteredHistory {
+    inner: Box<dyn History>,
+    dedup: bool,
+    ignore: Vec<String>,
+    last_recorded: Option<String>,
+}
+
+impl FilteredHistory {
+    fn new(inner: Box<dyn History>, dedup: bool, ignore: Vec<String>) -> Self {
+        // Seed from the most recent entry already on disk (if any), so
+        // `dedup` also catches "identical to the last line of the *previous*
+        // session" on a fresh process start, not just within this session.
+        let last_recorded = inner
+            .search(SearchQuery::everything(SearchDirection::Backward, None))
+            .ok()
+            .and_then(|rows| rows.into_iter().next())
+            .map(|item| item.command_line);
+        Self {
+            inner,
+            dedup,
+            ignore,
+            last_recorded,
+        }
+    }
+
+    fn should_skip(&self, line: &str) -> bool {
+        if self.dedup && self.last_recorded.as_deref() == Some(line) {
+            return true;
+        }
+        self.ignore.iter().any(|pattern| glob_match(pattern, line))
+    }
+}
+
+impl History for FilteredHistory {
+    fn save(&mut self, h: HistoryItem) -> reedline::Result<HistoryItem> {
+        if self.should_skip(&h.command_line) {
+            // Pretend it was handled without actually persisting a
+            // duplicate/ignored entry — the caller (`Reedline::submit_buffer`)
+            // just records whatever id comes back for its own bookkeeping.
+            return Ok(h);
+        }
+        self.last_recorded = Some(h.command_line.clone());
+        self.inner.save(h)
+    }
+    fn load(&self, id: HistoryItemId) -> reedline::Result<HistoryItem> {
+        self.inner.load(id)
+    }
+    fn count(&self, query: SearchQuery) -> reedline::Result<i64> {
+        self.inner.count(query)
+    }
+    fn search(&self, query: SearchQuery) -> reedline::Result<Vec<HistoryItem>> {
+        self.inner.search(query)
+    }
+    fn update(
+        &mut self,
+        id: HistoryItemId,
+        updater: &dyn Fn(HistoryItem) -> HistoryItem,
+    ) -> reedline::Result<()> {
+        self.inner.update(id, updater)
+    }
+    fn clear(&mut self) -> reedline::Result<()> {
+        self.inner.clear()
+    }
+    fn delete(&mut self, h: HistoryItemId) -> reedline::Result<()> {
+        self.inner.delete(h)
+    }
+    fn sync(&mut self) -> io::Result<()> {
+        self.inner.sync()
+    }
+    fn session(&self) -> Option<HistorySessionId> {
+        self.inner.session()
+    }
+}
+
+/// Minimal shell-glob matcher for `history.ignore` patterns (docs/CONFIG.md
+/// §5's `HISTIGNORE`-equivalent): `*` matches any run of characters
+/// (including none), `?` matches exactly one; every other character matches
+/// itself literally. `shoal-config` only carries the raw pattern strings
+/// (its own doc comment: "matching semantics are the host's") — this is this
+/// host's choice, deliberately the simplest thing that reads like a shell
+/// pattern rather than a full regex engine.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let pat: Vec<char> = pattern.chars().collect();
+    let txt: Vec<char> = text.chars().collect();
+    // Classic DP: `dp[i][j]` = pattern[..i] matches text[..j].
+    let mut dp = vec![vec![false; txt.len() + 1]; pat.len() + 1];
+    dp[0][0] = true;
+    for i in 1..=pat.len() {
+        if pat[i - 1] == '*' {
+            dp[i][0] = dp[i - 1][0];
+        }
+    }
+    for i in 1..=pat.len() {
+        for j in 1..=txt.len() {
+            dp[i][j] = match pat[i - 1] {
+                '*' => dp[i - 1][j] || dp[i][j - 1],
+                '?' => dp[i - 1][j - 1],
+                c => dp[i - 1][j - 1] && c == txt[j - 1],
+            };
+        }
+    }
+    dp[pat.len()][txt.len()]
 }
 
 /// Principal/session recorded on the REPL's own journal entries (TDD §9). A
@@ -604,5 +803,144 @@ mod tests {
         assert!(ctx.value_bound.iter().any(|n| n == "mydata"));
         assert!(ctx.cmd_bound.iter().any(|n| n == "deploy"));
         assert!(!ctx.cmd_bound.iter().any(|n| n == "mydata"));
+    }
+
+    #[test]
+    fn glob_match_supports_star_and_question_wildcards() {
+        assert!(glob_match("ls*", "ls -la"));
+        assert!(glob_match(
+            "* --password=*",
+            "curl --password=secret --url=x"
+        ));
+        assert!(glob_match("g?t status", "git status"));
+        assert!(!glob_match("g?t status", "goat status"));
+        assert!(glob_match("*", ""));
+        assert!(glob_match("exact", "exact"));
+        assert!(!glob_match("exact", "exactly"));
+    }
+
+    /// `history.dedup` (docs/CONFIG.md §5): a line identical to the
+    /// immediately preceding one is skipped; a different line, or the same
+    /// line after a different one in between, is recorded.
+    #[test]
+    fn filtered_history_dedup_skips_only_immediate_repeats() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = FileBackedHistory::with_file(100, dir.path().join("hist")).unwrap();
+        let mut history = FilteredHistory::new(Box::new(inner), true, Vec::new());
+        history.save(HistoryItem::from_command_line("ls")).unwrap();
+        history.save(HistoryItem::from_command_line("ls")).unwrap();
+        history.save(HistoryItem::from_command_line("pwd")).unwrap();
+        history.save(HistoryItem::from_command_line("ls")).unwrap();
+        let all = history
+            .search(SearchQuery::everything(SearchDirection::Forward, None))
+            .unwrap();
+        let lines: Vec<&str> = all.iter().map(|i| i.command_line.as_str()).collect();
+        assert_eq!(
+            lines,
+            vec!["ls", "pwd", "ls"],
+            "the immediate repeat must be dropped, but a later repeat after a \
+             different line must not be"
+        );
+    }
+
+    /// `history.ignore` (docs/CONFIG.md §5, `HISTIGNORE`-equivalent): a line
+    /// matching any pattern is never recorded.
+    #[test]
+    fn filtered_history_ignore_patterns_are_never_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = FileBackedHistory::with_file(100, dir.path().join("hist")).unwrap();
+        let mut history = FilteredHistory::new(
+            Box::new(inner),
+            false,
+            vec!["ls*".to_string(), "secret *".to_string()],
+        );
+        history
+            .save(HistoryItem::from_command_line("ls -la"))
+            .unwrap();
+        history
+            .save(HistoryItem::from_command_line("secret reveal"))
+            .unwrap();
+        history
+            .save(HistoryItem::from_command_line("echo kept"))
+            .unwrap();
+        let all = history
+            .search(SearchQuery::everything(SearchDirection::Forward, None))
+            .unwrap();
+        assert_eq!(all.len(), 1, "only the non-matching line should persist");
+        assert_eq!(all[0].command_line, "echo kept");
+    }
+
+    #[test]
+    fn filtered_history_dedup_seeds_from_the_last_persisted_entry() {
+        // A fresh `FilteredHistory` built over a backend that already has
+        // entries (a new process attaching to an existing history file) must
+        // still dedup against the *last* one, not just entries recorded in
+        // this in-memory instance's own lifetime.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hist");
+        {
+            let mut inner = FileBackedHistory::with_file(100, path.clone()).unwrap();
+            inner.save(HistoryItem::from_command_line("ls")).unwrap();
+            inner.sync().unwrap();
+        }
+        let inner = FileBackedHistory::with_file(100, path).unwrap();
+        let mut history = FilteredHistory::new(Box::new(inner), true, Vec::new());
+        history.save(HistoryItem::from_command_line("ls")).unwrap();
+        let all = history
+            .search(SearchQuery::everything(SearchDirection::Forward, None))
+            .unwrap();
+        assert_eq!(
+            all.len(),
+            1,
+            "the repeat of the last-persisted line must be deduped"
+        );
+    }
+
+    /// `editor.mode` (docs/CONFIG.md §5): `"vi"` selects reedline's `Vi` edit
+    /// mode, anything else (including the default `"emacs"`) selects `Emacs`.
+    #[test]
+    fn build_edit_mode_selects_vi_or_emacs_from_config() {
+        let mut config = shoal_config::Config::default();
+        config.editor.mode = "vi".to_string();
+        let vi_mode = build_edit_mode(&config, &[]);
+        assert!(matches!(
+            vi_mode.edit_mode(),
+            reedline::PromptEditMode::Vi(_)
+        ));
+
+        config.editor.mode = "emacs".to_string();
+        let emacs_mode = build_edit_mode(&config, &[]);
+        assert_eq!(emacs_mode.edit_mode(), reedline::PromptEditMode::Emacs);
+    }
+
+    /// `editor.keybindings` (docs/CONFIG.md §5): a custom chord actually
+    /// fires its configured action through the real `EditMode::parse_event`
+    /// path, in both emacs and vi-insert mode.
+    #[test]
+    fn build_edit_mode_applies_custom_bindings() {
+        use crossterm::event::{Event, KeyEvent};
+
+        let custom = vec![crate::keybindings::ParsedBinding {
+            modifiers: KeyModifiers::CONTROL,
+            code: KeyCode::Char('g'),
+            event: ReedlineEvent::ClearScreen,
+        }];
+        let raw_event = || -> reedline::ReedlineRawEvent {
+            Event::Key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL))
+                .try_into()
+                .unwrap()
+        };
+
+        let config = shoal_config::Config::default();
+        let mut emacs_mode = build_edit_mode(&config, &custom);
+        assert_eq!(
+            emacs_mode.parse_event(raw_event()),
+            ReedlineEvent::ClearScreen
+        );
+
+        let mut vi_config = shoal_config::Config::default();
+        vi_config.editor.mode = "vi".to_string();
+        let mut vi_mode = build_edit_mode(&vi_config, &custom);
+        assert_eq!(vi_mode.parse_event(raw_event()), ReedlineEvent::ClearScreen);
     }
 }

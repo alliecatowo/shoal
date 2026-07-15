@@ -316,18 +316,58 @@ friends). As of this wave, the `shoal` binary's REPL/script-runner path reads:
 - `init.files` — run at interactive-session start.
 - `editor.bracketed_paste` — passed to the line editor.
 - `history.enabled`, `history.path`, `history.max_entries` — history file wiring.
+- `aliases` — each entry is declared in the evaluator at startup (both the REPL and
+  `-c`/scripts), equivalent to typing `alias name = command` as the first thing in the session.
+- `env` — each entry is set in the session environment at startup (both the REPL and
+  `-c`/scripts), equivalent to typing `env.NAME = "value"` first. A name that isn't
+  identifier-shaped (config validation only requires non-empty/no-whitespace, not
+  identifier-shaped) can't be expressed this way and is reported as a startup warning instead of
+  silently dropped.
+- `editor.mode` — selects reedline's `Emacs` or `Vi` edit mode in the REPL.
+- `editor.keybindings` — parsed into real reedline `(chord, action)` bindings, layered on top of
+  the selected mode's defaults (both the insert and normal tables in `vi` mode). Only a curated
+  subset of actions has a plain-string form (history search/navigation, screen clearing, the
+  completion menu, a handful of unparameterized edit commands like `backspace`/`undo`); reedline's
+  many `select`/`MotionTarget`-parameterized edit commands (selection-extending motions, etc.)
+  have no string form and aren't representable here. An unrecognized chord or action is a startup
+  warning, never a hard failure.
+- `render.color` — feeds the same suppress-ANSI decision `NO_COLOR` already drove (`no_color()`
+  now checks both), so `render.color = false` in `shoal.toml` suppresses color with no env var
+  needed. (`shoal_config::load` already folds `NO_COLOR`/`SHOAL_RENDER_COLOR` into this field's
+  final value per §3, so the two checks agree by construction.)
+- `history.dedup` — a line identical to the immediately preceding one (including the last line of
+  a *previous* session, read back from the history file) is not recorded. `history.ignore` — a
+  line matching any pattern is never recorded; patterns are simple shell-style globs (`*`/`?`)
+  matched against the whole line, this host's own choice since `shoal-config` only carries the
+  raw strings. Neither has any built-in reedline support, so both are implemented via a thin
+  `History`-trait wrapper around the file-backed history.
+- `history.ignore_space` — a line typed with a leading space is never recorded, via reedline's
+  own built-in `with_history_exclusion_prefix`.
+- `completion.fuzzy`, `completion.case_insensitive`, `completion.max_results` — threaded into
+  `ShoalCompleter`'s own matching/ranking (non-contiguous subsequence matching when `fuzzy`,
+  case-folded comparison when `case_insensitive`, a hard cap on the candidate list).
+- `completion.menu` — reedline has no separate non-menu completion path (the `Completer` trait is
+  only ever driven through its `ReedlineMenu` system), so `false` is approximated with reedline's
+  own `quick_completions`/`partial_completions` knobs: a unique match is inserted immediately, and
+  multiple matches complete their shared prefix in place; the popup still appears when several
+  candidates share no common prefix at all, since at that point there is nothing else reedline can
+  do with them.
+- `[reef]` (user scope) — the REPL now wires `Evaluator::set_reef_user_manifest` identically to
+  `-c`/scripts (a parallel lane had flagged the REPL was building its own `Evaluator` and skipping
+  this call entirely, so the documented user reef scope silently never engaged in the interactive
+  shell).
 
 Schema-complete, validated, and documented, but **not yet read by any in-tree consumer** as of
 this wave (ready for a consumer to wire up — see the integrator note below):
-`editor.mode`, `editor.keybindings`, `editor.key_timeout_ms`, `history.dedup`, `history.ignore`,
-`history.ignore_space`, `render.width`, `render.color` (the `shoal` binary currently checks
-`NO_COLOR` directly rather than through `Config`), `kernel.*`, `journal.state_dir` (the binary
-resolves its own state directory independently of this field today), `leash.policy`,
-`completion.*`, `aliases`, `env`, `reef.*` (`shoal-reef` re-parses `[reef]` independently, per §5).
+`editor.key_timeout_ms` (reedline 0.49 exposes no key-sequence timeout knob at all — there is
+nothing in its public API to wire this into today), `render.width`, `kernel.*`, `journal.state_dir`
+(the binary resolves its own state directory independently of this field today), `leash.policy`,
+`reef.tools`/`reef.runners`/`reef.options` beyond user-scope engagement (`shoal-reef` re-parses
+`[reef]` independently, per §5, for the actual constraint/provider grammar).
 
 Nothing here is a defect in `shoal-config` — the schema, defaults, validation, and layering are
 all real and tested regardless of whether a given field already drives behavior; it's the
-inventory an integrator wiring up aliases/completion/keybindings/reef would work from.
+inventory an integrator wiring up completion/keybindings/reef would work from.
 
 ## 7. Rust API
 

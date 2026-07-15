@@ -59,7 +59,22 @@ pub struct ShoalCompleter {
     adapters: Vec<AdapterCatalog>,
     adapter_names: Vec<String>,
     path_cache: HashMap<PathBuf, (Option<SystemTime>, Vec<String>)>,
+    /// `completion.fuzzy` (docs/CONFIG.md §5): allow typo-tolerant,
+    /// non-contiguous matches instead of requiring a strict prefix.
+    fuzzy: bool,
+    /// `completion.case_insensitive`.
+    case_insensitive: bool,
+    /// `completion.max_results`: cap on candidates returned per completion.
+    max_results: usize,
 }
+
+/// `shoal_config::Completion`'s own defaults (fuzzy/case-insensitive on, 100
+/// results) — used so a `ShoalCompleter::new` call that never reaches
+/// `configure` (every existing call site, including every test in this
+/// module) keeps behaving exactly as it did before config was wired in.
+const DEFAULT_FUZZY: bool = true;
+const DEFAULT_CASE_INSENSITIVE: bool = true;
+const DEFAULT_MAX_RESULTS: usize = 100;
 
 impl ShoalCompleter {
     pub fn new(
@@ -74,7 +89,20 @@ impl ShoalCompleter {
             adapters,
             adapter_names,
             path_cache: HashMap::new(),
+            fuzzy: DEFAULT_FUZZY,
+            case_insensitive: DEFAULT_CASE_INSENSITIVE,
+            max_results: DEFAULT_MAX_RESULTS,
         }
+    }
+
+    /// Apply `[completion]` config (docs/CONFIG.md §5). Builder-style so
+    /// existing `ShoalCompleter::new(...)` call sites are unaffected when a
+    /// caller (a test, an embedder) doesn't need config-driven behavior.
+    pub fn configure(mut self, fuzzy: bool, case_insensitive: bool, max_results: usize) -> Self {
+        self.fuzzy = fuzzy;
+        self.case_insensitive = case_insensitive;
+        self.max_results = max_results.max(1);
+        self
     }
 
     fn cwd(&self) -> PathBuf {
@@ -120,6 +148,30 @@ impl ShoalCompleter {
         self.adapters.iter().find_map(|c| c.lookup(head))
     }
 
+    /// Match `name` against `prefix` per `[completion]` config
+    /// (docs/CONFIG.md §5): case-(in)sensitively per `case_insensitive`, and
+    /// via a non-contiguous subsequence test — a strict superset of prefix
+    /// matching, so it's exactly "typo-tolerant / non-contiguous matches,
+    /// not just prefix" — rather than a strict prefix when `fuzzy` is set.
+    fn candidate_matches(&self, name: &str, prefix: &str) -> bool {
+        if prefix.is_empty() {
+            return true;
+        }
+        if self.case_insensitive {
+            let name = name.to_lowercase();
+            let prefix = prefix.to_lowercase();
+            if self.fuzzy {
+                subsequence_match(&name, &prefix)
+            } else {
+                name.starts_with(&prefix)
+            }
+        } else if self.fuzzy {
+            subsequence_match(name, prefix)
+        } else {
+            name.starts_with(prefix)
+        }
+    }
+
     fn head_candidates(&mut self, prefix: &str) -> Vec<String> {
         let mut names: BTreeSet<String> = BTreeSet::new();
         names.extend(RESERVED.iter().map(|s| s.to_string()));
@@ -131,14 +183,14 @@ impl ShoalCompleter {
         }
         names.extend(self.adapter_names.iter().cloned());
         names.extend(self.path_names());
-        names.retain(|n| n.starts_with(prefix));
+        names.retain(|n| self.candidate_matches(n, prefix));
         names.into_iter().collect()
     }
 
     fn expr_candidates(&self, prefix: &str) -> Vec<String> {
         let mut names: BTreeSet<String> = self.env.visible_names().into_iter().collect();
         names.extend(RESERVED.iter().map(|s| s.to_string()));
-        names.retain(|n| n.starts_with(prefix));
+        names.retain(|n| self.candidate_matches(n, prefix));
         names.into_iter().collect()
     }
 
@@ -169,7 +221,7 @@ impl ShoalCompleter {
                 names.insert(format!("--{}", p.name));
             }
         }
-        names.retain(|n| n.starts_with(prefix));
+        names.retain(|n| self.candidate_matches(n, prefix));
         names.into_iter().collect()
     }
 
@@ -191,7 +243,7 @@ impl ShoalCompleter {
             if !show_hidden && name.starts_with('.') {
                 continue;
             }
-            if !name.starts_with(&file_prefix) {
+            if !self.candidate_matches(&name, &file_prefix) {
                 continue;
             }
             let is_dir = entry.path().is_dir();
@@ -226,25 +278,45 @@ impl ShoalCompleter {
 
 impl Completer for ShoalCompleter {
     fn complete(&mut self, line: &str, pos: usize) -> Vec<Suggestion> {
+        let max_results = self.max_results;
         match classify(&self.env, line, pos) {
-            Ctx::Head { start, word } => finish(self.head_candidates(&word), start, pos),
+            Ctx::Head { start, word } => {
+                finish(self.head_candidates(&word), start, pos, max_results)
+            }
             Ctx::Arg { start, word, head } => {
                 let names = if word.starts_with('-') {
                     self.flag_candidates(&head, &word)
                 } else {
                     self.fs_candidates(&word)
                 };
-                finish(names, start, pos)
+                finish(names, start, pos, max_results)
             }
-            Ctx::Expr { start, word } => finish(self.expr_candidates(&word), start, pos),
+            Ctx::Expr { start, word } => {
+                finish(self.expr_candidates(&word), start, pos, max_results)
+            }
             Ctx::None => Vec::new(),
         }
     }
 }
 
-fn finish(mut names: Vec<String>, start: usize, pos: usize) -> Vec<Suggestion> {
+/// Does every character of `needle` appear in `haystack`, in order, not
+/// necessarily contiguously? Any prefix match is also a subsequence match
+/// (each needle character is trivially found at the next haystack
+/// position), so using this predicate when `completion.fuzzy` is set is a
+/// strict superset of prefix matching — it never *rejects* what plain prefix
+/// matching would accept, only adds typo-tolerant/non-contiguous matches on
+/// top.
+fn subsequence_match(haystack: &str, needle: &str) -> bool {
+    let mut chars = haystack.chars();
+    needle.chars().all(|nc| chars.any(|hc| hc == nc))
+}
+
+/// Sort, dedup, cap to `completion.max_results` (docs/CONFIG.md §5), and
+/// convert to reedline `Suggestion`s.
+fn finish(mut names: Vec<String>, start: usize, pos: usize, max_results: usize) -> Vec<Suggestion> {
     names.sort();
     names.dedup();
+    names.truncate(max_results);
     names
         .into_iter()
         .map(|value| {
@@ -704,5 +776,101 @@ flags  = { short = { s = "short" } }
         assert!(flags.iter().any(|f| f == "--short"));
         let short = c.flag_candidates("git", "-");
         assert!(short.iter().any(|f| f == "-s"));
+    }
+
+    #[test]
+    fn subsequence_match_is_a_superset_of_prefix_matching() {
+        assert!(subsequence_match("shoal-eval", "sho"), "a real prefix");
+        assert!(
+            subsequence_match("shoal-eval", "sev"),
+            "non-contiguous typo-tolerant match"
+        );
+        assert!(!subsequence_match("shoal-eval", "zzz"));
+        assert!(
+            subsequence_match("anything", ""),
+            "empty needle always matches"
+        );
+    }
+
+    /// `completion.fuzzy = false` (docs/CONFIG.md §5): only strict prefix
+    /// matches, no non-contiguous "typo-tolerant" candidates.
+    #[test]
+    fn fuzzy_false_restricts_to_strict_prefix_matches() {
+        let fuzzy_env = Env::root();
+        fuzzy_env.declare("myservice", Value::Int(1), false);
+        let fuzzy = ShoalCompleter::new(
+            fuzzy_env,
+            Arc::new(Mutex::new(PathBuf::from("."))),
+            Vec::new(),
+            Vec::new(),
+        )
+        .configure(true, true, 100);
+        // Fuzzy (default): a non-contiguous subsequence still matches.
+        assert!(
+            fuzzy
+                .expr_candidates("mysvc")
+                .iter()
+                .any(|n| n == "myservice")
+        );
+
+        let strict_env = Env::root();
+        strict_env.declare("myservice", Value::Int(1), false);
+        let strict = ShoalCompleter::new(
+            strict_env,
+            Arc::new(Mutex::new(PathBuf::from("."))),
+            Vec::new(),
+            Vec::new(),
+        )
+        .configure(false, true, 100);
+        assert!(
+            !strict
+                .expr_candidates("mysvc")
+                .iter()
+                .any(|n| n == "myservice"),
+            "fuzzy=false must reject a non-prefix subsequence match"
+        );
+        assert!(
+            strict
+                .expr_candidates("myser")
+                .iter()
+                .any(|n| n == "myservice")
+        );
+    }
+
+    /// `completion.case_insensitive = false`: an exact-case mismatch must not
+    /// match.
+    #[test]
+    fn case_insensitive_false_requires_exact_case() {
+        let env = Env::root();
+        env.declare("MyThing", Value::Int(1), false);
+        let c = ShoalCompleter::new(
+            env,
+            Arc::new(Mutex::new(PathBuf::from("."))),
+            Vec::new(),
+            Vec::new(),
+        )
+        .configure(false, false, 100);
+        assert!(!c.expr_candidates("mything").iter().any(|n| n == "MyThing"));
+        assert!(c.expr_candidates("MyTh").iter().any(|n| n == "MyThing"));
+    }
+
+    /// `completion.max_results` caps the candidate list (docs/CONFIG.md §5).
+    #[test]
+    fn max_results_caps_the_candidate_list() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..10 {
+            fs::write(dir.path().join(format!("file{i}.txt")), b"").unwrap();
+        }
+        let c = ShoalCompleter::new(
+            Env::root(),
+            Arc::new(Mutex::new(dir.path().to_path_buf())),
+            Vec::new(),
+            Vec::new(),
+        )
+        .configure(true, true, 3);
+        let names = c.fs_candidates("");
+        assert_eq!(names.len(), 10, "fs_candidates itself is uncapped");
+        let suggestions = finish(names, 0, 0, 3);
+        assert_eq!(suggestions.len(), 3, "finish() truncates to max_results");
     }
 }
