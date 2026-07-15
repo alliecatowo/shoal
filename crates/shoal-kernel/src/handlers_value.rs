@@ -86,7 +86,10 @@ impl Kernel {
                 // `format=render` must not be a way to bypass the elision
                 // wall by asking for the human render instead of the value.
                 let uri = short_ref_to_uri(&params.r#ref, params.path.as_deref());
-                encode(json!({"ref":params.r#ref,"render":bound_render(render, &uri)}))
+                encode(json!({
+                    "ref": params.r#ref,
+                    "render": bound_render(render, &uri, !attachment.tty),
+                }))
             }
             Some("raw") => {
                 let raw = match &sliced {

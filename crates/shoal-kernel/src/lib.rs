@@ -216,6 +216,24 @@ impl Kernel {
                 data: None,
             })
     }
+
+    /// The real enforcement truth for `principal` (TDD §8 tier honesty):
+    /// `true` only when a genuine OS backend (Landlock/Seatbelt) exists on
+    /// this host *and* the policy actually resolves a real sandbox for this
+    /// principal — never for the default-permissive human. Single source of
+    /// truth shared by `session.attach`'s `caps_enforced` and
+    /// `cap.request`'s grant response (docs/ROADMAP.md open-item #5): an
+    /// agent that unstuck an `approval_pending` plan via `cap.request` must
+    /// get the SAME honest answer `attach` already gives, not a hardcoded
+    /// `false` that systematically under-reports enforcement it actually has.
+    pub(crate) fn caps_enforced_for(&self, principal: &str) -> bool {
+        let status = EnforcementStatus::detect();
+        let backend_present = matches!(
+            status.available_tier,
+            EnforcementTier::A | EnforcementTier::C
+        );
+        backend_present && self.policy.sandbox_for(principal).is_some()
+    }
 }
 
 fn task_record(task: &Arc<TaskEntry>) -> TaskRecord {
@@ -2048,6 +2066,278 @@ mod tests {
         .result
         .unwrap();
         assert_eq!(fast["value"], json!({"$":"int","v":3}));
+        drop(client);
+        drop(reader);
+        thread.join().unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Three agent-wire honesty fixes: outcome span (ROADMAP #4), cap.request
+    // enforced (ROADMAP #5), ANSI stripped from render on the headless/MCP
+    // path (cold-agent field test finding).
+    // -----------------------------------------------------------------------
+
+    fn bare_outcome(ok: bool, stdout: &[u8]) -> Value {
+        Value::Outcome(Arc::new(shoal_value::OutcomeVal {
+            status: Some(if ok { 0 } else { 1 }),
+            signal: None,
+            ok,
+            stdout: Arc::new(stdout.to_vec()),
+            stderr: Arc::new(Vec::new()),
+            dur_ns: 1_000,
+            pid: 42,
+            cmd: "echo hi".into(),
+            parsed: None,
+            streamed: false,
+        }))
+    }
+
+    /// Fix 1 (ROADMAP #4): `OutcomeVal` (`shoal-value/src/outcome.rs`) has no
+    /// `span` field yet, so `wire_value` cannot forward one — see
+    /// `wire::outcome_span`'s doc comment for exactly why and what an
+    /// eval-side plumb would need to add. The wire's honest behavior is to
+    /// OMIT the field entirely (`skip_serializing_if`), never to fabricate a
+    /// plausible-looking span. This test pins that contract so a future
+    /// eval-side plumb is a deliberate, visible change here, not a silent
+    /// flip in either direction.
+    #[test]
+    fn outcome_span_is_honestly_omitted_pending_an_eval_side_plumb() {
+        let wire = wire_value(&bare_outcome(true, b"hi\n"));
+        let json = serde_json::to_value(&wire).unwrap();
+        assert!(
+            json.get("span").is_none(),
+            "span must be honestly omitted (nothing to source it from), not null-but-present: {json}"
+        );
+    }
+
+    /// Same honest-omission contract holds through the elision path (the
+    /// outer `Outcome` wrapper survives elision of a big `.out` unchanged).
+    #[test]
+    fn outcome_span_is_honestly_omitted_through_elision_too() {
+        let budget = ElideBudget::default();
+        let wire = elide_wire_value(&bare_outcome(true, b"hi\n"), "shoal://out/1", &budget);
+        let json = serde_json::to_value(&wire).unwrap();
+        assert!(json.get("span").is_none(), "{json}");
+    }
+
+    /// Fix 2 (ROADMAP #5): `cap.request`'s grant response must report the
+    /// SAME enforcement truth `session.attach`'s `caps_enforced` already
+    /// does for this principal — never a hardcoded `false`. Mirrors
+    /// `attach_enforces_only_for_a_scoped_principal_with_a_real_backend`'s
+    /// scoped-principal setup so both endpoints are asked about the same
+    /// principal and must agree.
+    #[test]
+    fn cap_request_reports_the_same_enforcement_truth_attach_does() {
+        let who = principal();
+        let policy = Policy::from_toml(&format!(
+            "[principal.\"{who}\"]\nopaque='allow'\nauto_apply='in-grant'\n\n\
+             [principal.\"{who}\".fs]\nread=[\"/usr/**\"]\n"
+        ))
+        .unwrap();
+        let kernel = Kernel::with_policy(policy);
+        let (mut client, mut reader, thread) = spawn(&kernel);
+        let attach_result = attach(&mut client, &mut reader).result.unwrap();
+        let status = EnforcementStatus::detect();
+        let backend_present = matches!(
+            status.available_tier,
+            EnforcementTier::A | EnforcementTier::C
+        );
+        assert_eq!(attach_result["caps_enforced"], backend_present);
+        let planned = call(
+            &mut client,
+            &mut reader,
+            2,
+            "exec",
+            json!({"src":"sh { echo hi }","mode":"plan"}),
+        )
+        .result
+        .unwrap();
+        let plan_ref = planned["plan_ref"].as_str().unwrap().to_owned();
+        let grant = call(
+            &mut client,
+            &mut reader,
+            3,
+            "cap.request",
+            json!({"plan_ref": plan_ref, "effects": []}),
+        )
+        .result
+        .unwrap();
+        assert_eq!(grant["grant"], "approved", "{grant}");
+        assert_eq!(
+            grant["enforced"], backend_present,
+            "cap.request must report the SAME enforcement truth attach did: {grant}"
+        );
+        drop(client);
+        drop(reader);
+        thread.join().unwrap();
+    }
+
+    /// Baseline: the default-permissive human principal gets `enforced:false`
+    /// from BOTH endpoints — a mismatch in this direction would be just as
+    /// dishonest as under-reporting a real backend.
+    #[test]
+    fn cap_request_reports_false_for_the_default_permissive_principal() {
+        let kernel = Kernel::new();
+        let (mut client, mut reader, thread) = spawn(&kernel);
+        let attach_result = attach(&mut client, &mut reader).result.unwrap();
+        assert_eq!(attach_result["caps_enforced"], false);
+        let planned = call(
+            &mut client,
+            &mut reader,
+            2,
+            "exec",
+            json!({"src":"sh { echo hi }","mode":"plan"}),
+        )
+        .result
+        .unwrap();
+        let plan_ref = planned["plan_ref"].as_str().unwrap().to_owned();
+        let grant = call(
+            &mut client,
+            &mut reader,
+            3,
+            "cap.request",
+            json!({"plan_ref": plan_ref, "effects": []}),
+        )
+        .result
+        .unwrap();
+        assert_eq!(grant["grant"], "approved", "{grant}");
+        assert_eq!(grant["enforced"], false, "{grant}");
+        drop(client);
+        drop(reader);
+        thread.join().unwrap();
+    }
+
+    // -- Fix 3: ANSI stripped from render on the headless/MCP wire ---------
+
+    #[test]
+    fn strip_ansi_removes_sgr_color_codes() {
+        assert_eq!(strip_ansi("\x1b[32mhi\x1b[0m"), "hi");
+    }
+
+    #[test]
+    fn strip_ansi_removes_non_sgr_csi_sequences_too() {
+        // Cursor-movement/erase CSI (final bytes `H`/`K`), not just SGR
+        // color (`m`) — the stripper covers the general CSI grammar.
+        assert_eq!(strip_ansi("\x1b[2K\x1b[1;1Hhello"), "hello");
+    }
+
+    #[test]
+    fn strip_ansi_is_a_no_op_on_plain_text() {
+        assert_eq!(
+            strip_ansi("plain text, no escapes here"),
+            "plain text, no escapes here"
+        );
+    }
+
+    /// Fix 3: on the headless/MCP path (the attaching client did not declare
+    /// a real tty — what `shoal-mcp` and every shipped client attach with
+    /// today), the kernel strips ANSI from the human-facing `render` string
+    /// before it reaches the wire; a genuine interactive (`tty:true`) client
+    /// keeps the color. The structured `value` field is untouched either
+    /// way (not asserted on here — it never carried render-layer ANSI to
+    /// begin with).
+    #[test]
+    fn headless_client_gets_ansi_stripped_render_but_a_tty_client_keeps_color() {
+        // Sanity first: render_block genuinely emits ANSI for a table (the
+        // bold header / dim separator are unconditional, regardless of cell
+        // content) — otherwise this test would vacuously pass no matter
+        // what the fix does.
+        let mut row = shoal_value::Record::new();
+        row.insert("n".to_string(), Value::Int(1));
+        let raw = shoal_value::render::render_block(&Value::Table(vec![row]), 80);
+        assert!(
+            raw.contains('\u{1b}'),
+            "sanity: render_block must emit ANSI for a table: {raw:?}"
+        );
+
+        // Headless (tty:false): the kernel strips it.
+        let kernel = Kernel::new();
+        let (mut client, mut reader, thread) = spawn(&kernel);
+        attach(&mut client, &mut reader);
+        let exec = call(
+            &mut client,
+            &mut reader,
+            2,
+            "exec",
+            json!({"src":"csv.parse(\"n\\n1\\n2\\n3\")"}),
+        )
+        .result
+        .unwrap();
+        let render = exec["render"].as_str().unwrap();
+        assert!(
+            !render.contains('\u{1b}'),
+            "headless render must be ANSI-free: {render:?}"
+        );
+        assert!(
+            render.contains('1'),
+            "content must still be present: {render:?}"
+        );
+        drop(client);
+        drop(reader);
+        thread.join().unwrap();
+
+        // A genuine interactive client (tty:true) keeps its color — the fix
+        // must not blanket-strip regardless of what the client declared.
+        let kernel2 = Kernel::new();
+        let (mut client2, mut reader2, thread2) = spawn(&kernel2);
+        call(
+            &mut client2,
+            &mut reader2,
+            1,
+            "session.attach",
+            json!({"client":{"kind":"human","tty":true}}),
+        );
+        let exec2 = call(
+            &mut client2,
+            &mut reader2,
+            2,
+            "exec",
+            json!({"src":"csv.parse(\"n\\n1\\n2\\n3\")"}),
+        )
+        .result
+        .unwrap();
+        let render2 = exec2["render"].as_str().unwrap();
+        assert!(
+            render2.contains('\u{1b}'),
+            "a real tty client must keep its color: {render2:?}"
+        );
+        drop(client2);
+        drop(reader2);
+        thread2.join().unwrap();
+    }
+
+    /// The same headless stripping applies to `value.get`'s `format=render`
+    /// path (`handlers_value.rs`), not just `exec`'s inline render.
+    #[test]
+    fn headless_value_get_format_render_is_also_ansi_stripped() {
+        let kernel = Kernel::new();
+        let (mut client, mut reader, thread) = spawn(&kernel);
+        attach(&mut client, &mut reader);
+        let exec = call(
+            &mut client,
+            &mut reader,
+            2,
+            "exec",
+            json!({"src":"csv.parse(\"n\\n1\\n2\\n3\")"}),
+        )
+        .result
+        .unwrap();
+        let value_ref = exec["ref"].as_str().unwrap().to_owned();
+        let rendered = call(
+            &mut client,
+            &mut reader,
+            3,
+            "value.get",
+            json!({"ref": value_ref, "format": "render"}),
+        )
+        .result
+        .unwrap();
+        let render = rendered["render"].as_str().unwrap();
+        assert!(
+            !render.contains('\u{1b}'),
+            "headless format=render must be ANSI-free: {render:?}"
+        );
+        assert!(render.contains('1'), "content preserved: {render:?}");
         drop(client);
         drop(reader);
         thread.join().unwrap();

@@ -7,6 +7,16 @@ use super::*;
 pub(crate) struct Attachment {
     pub(crate) session: Arc<Session>,
     pub(crate) principal: String,
+    /// Whether the attaching client declared itself a real interactive
+    /// terminal (`session.attach`'s `client.tty`). Every client this
+    /// codebase actually ships today (`shoal-mcp`, the test harness) attaches
+    /// with `tty:false` — `shoal` (the REPL binary) never goes through the
+    /// kernel at all (CLAUDE.md: "shoal never depends on or spawns
+    /// shoal-kernel"), so this is currently always `false` in practice. It
+    /// exists so kernel-side rendering can tell a genuine future interactive
+    /// kernel-hosted client (colors wanted) apart from a headless/MCP one
+    /// (colors are agent-hostile noise) — see `bound_render`'s `strip` param.
+    pub(crate) tty: bool,
 }
 
 pub(crate) struct Session {
@@ -59,6 +69,7 @@ impl Kernel {
         attached: &mut Option<Attachment>,
     ) -> Result<Json, RpcError> {
         let params: AttachParams = decode(params)?;
+        let tty = params.client.tty;
         let (who, token_caps, profile) = if let Some(token) = params.token {
             let auth = self.auth.as_ref().ok_or_else(|| RpcError {
                 code: -32030,
@@ -90,6 +101,7 @@ impl Kernel {
         *attached = Some(Attachment {
             session,
             principal: who.clone(),
+            tty,
         });
         // TDD §8 tier honesty: report the REAL strongest OS backend
         // available on this host (Landlock → A, Seatbelt → C, else
@@ -99,11 +111,7 @@ impl Kernel {
         // (a scoped agent), never for the default-permissive human.
         let status = EnforcementStatus::detect();
         let tier = tier_letter(status.available_tier);
-        let backend_present = matches!(
-            status.available_tier,
-            EnforcementTier::A | EnforcementTier::C
-        );
-        let caps_enforced = backend_present && self.policy.sandbox_for(&who).is_some();
+        let caps_enforced = self.caps_enforced_for(&who);
         encode(AttachResult {
             session: name,
             principal: who.clone(),

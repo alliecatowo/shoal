@@ -180,7 +180,7 @@ impl Kernel {
                     return encode(ExecResult {
                         r#ref: result_ref,
                         value: Some(wire),
-                        render: Some(bound_render(render, &uri)),
+                        render: Some(bound_render(render, &uri, !attachment.tty)),
                     });
                 }
             }
@@ -389,7 +389,7 @@ impl Kernel {
         // response bounds it to the same hard cap as MCP's content[0].text
         // (AGENT-SURFACE §3) — a huge render must never bypass the wall the
         // structured value already respects.
-        let bounded_render = bound_render(render, &exec_uri);
+        let bounded_render = bound_render(render, &exec_uri, !attachment.tty);
         encode(ExecResult {
             r#ref: value_ref,
             value: Some(elide_wire_value(&value, &exec_uri, &exec_budget)),
