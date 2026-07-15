@@ -150,7 +150,20 @@ impl Evaluator {
     /// error still names the field, not the method.
     pub(crate) fn field_or_method(&mut self, v: Value, name: &str, span: Span) -> VResult<Value> {
         match self.field(&v, name) {
-            Err(e) if e.code == "field_missing" => {
+            // A Record's field namespace is user-controlled, so field access on
+            // a record is STRICT: a `.name` that misses a field raises the loud
+            // `field_missing` and must NOT silently fall through to a same-named
+            // builtin method. Otherwise any record whose intended field collides
+            // with a method (`items`/`keys`/`values`/`json`/`len`/…) — e.g.
+            // `{key: "a", values: [1,2,3]}.items` — would return the generic
+            // record method's result, shadowing real data with stdlib behaviour
+            // (a silent-wrong answer). Call a record method explicitly with
+            // parens (`record.items()`), which routes through normal method
+            // dispatch. Non-record receivers (str/path/int/list/glob/…) have no
+            // user-controlled field names to shadow, so they KEEP the fallback —
+            // that is what makes `.map(.upper)` (str→method), `.map(.name)`
+            // (path accessor), and `[1,2,3].sum` (list→method) resolve.
+            Err(e) if e.code == "field_missing" && !matches!(v, Value::Record(_)) => {
                 match self.dispatch_method(v, name, &Args::empty(), span) {
                     Err(me) if me.code == "field_missing" => Err(e),
                     other => other,
