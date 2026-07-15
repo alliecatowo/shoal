@@ -62,7 +62,7 @@ impl Evaluator {
                 ]
             }
             "rm" => vec![Effect::FsDelete { paths: ps }],
-            "cd" => vec![Effect::SessionWrite],
+            "cd" | "j" | "jump" => vec![Effect::SessionWrite],
             _ => vec![],
         };
         Ok(e)

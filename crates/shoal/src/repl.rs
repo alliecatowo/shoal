@@ -66,6 +66,11 @@ pub(crate) fn repl() -> Result<i32, String> {
     // R3): the evaluator's own journal handle is private, and `out` itself is
     // just a plain REPL-side list of past values with no tie to entry ids.
     let state_dir = shoal_state_dir();
+    // Enable `j`/`jump` directory-frecency recording against a store colocated
+    // with the journal (`<state_dir>/jump.frecency`). Every interactive `cd`
+    // now bumps directory history; best-effort, so a store write failure never
+    // breaks navigation. Kept off for `-c`/scripts (they use `Evaluator::new`).
+    evaluator.set_jump_store(state_dir.join("jump.frecency"));
     let journal_reader = match (Journal::open(&state_dir), Journal::open(&state_dir)) {
         (Ok(write_handle), Ok(read_handle)) => {
             evaluator.set_journal(write_handle, REPL_SESSION, REPL_PRINCIPAL);
