@@ -609,6 +609,15 @@ fn parse_z_records(bytes: &[u8], hint: Option<&str>) -> Option<Value> {
 /// degrade the same way, since this adapter does not model their shape and
 /// silently dropping them would misrepresent the status as complete. Per
 /// TDD §6: "mismatch degrades to bytes + warning rather than lying."
+///
+/// Beyond the raw `status` field (porcelain's two-character `XY` code for
+/// `1`/`2` rows, or the bare `?`/`!` marker), every row also gets a semantic
+/// `state: str` so `(git status).where(.state == "modified")` reads
+/// naturally instead of requiring callers to know porcelain's XY alphabet
+/// (see `xy_state` for the `1`/`2` mapping). `?`/`!` rows get the fixed
+/// `"untracked"`/`"ignored"` state directly, since they have no `XY` pair to
+/// derive from. `status` itself is unchanged/untouched by this — existing
+/// consumers of the raw code keep working exactly as before.
 fn parse_porcelain_v2(bytes: &[u8]) -> Option<Value> {
     let mut rows = Vec::new();
     for line in text(bytes)?.lines() {
@@ -627,7 +636,13 @@ fn parse_porcelain_v2(bytes: &[u8]) -> Option<Value> {
                 if raw.get(1) != Some(&b' ') || line.len() < 3 {
                     return None;
                 }
+                let state = if raw[0] == b'?' {
+                    "untracked"
+                } else {
+                    "ignored"
+                };
                 r.insert("status".into(), Value::Str(line[..1].into()));
+                r.insert("state".into(), Value::Str(state.into()));
                 r.insert("path".into(), Value::Path(line[2..].into()));
             }
             b'1' => {
@@ -636,6 +651,7 @@ fn parse_porcelain_v2(bytes: &[u8]) -> Option<Value> {
                     return None;
                 }
                 r.insert("status".into(), Value::Str(parts[1].into()));
+                r.insert("state".into(), Value::Str(xy_state(parts[1]).into()));
                 r.insert("path".into(), Value::Path(parts[8].into()));
             }
             b'2' => {
@@ -644,6 +660,7 @@ fn parse_porcelain_v2(bytes: &[u8]) -> Option<Value> {
                     return None;
                 }
                 r.insert("status".into(), Value::Str(parts[1].into()));
+                r.insert("state".into(), Value::Str(xy_state(parts[1]).into()));
                 let (path, orig) = match parts[9].split_once('\t') {
                     Some((p, o)) => (p, Some(o)),
                     None => (parts[9], None),
@@ -658,6 +675,39 @@ fn parse_porcelain_v2(bytes: &[u8]) -> Option<Value> {
         rows.push(r);
     }
     Some(Value::Table(rows))
+}
+
+/// Maps a porcelain-v2 `XY` code's two characters (`X` = staged/index state,
+/// `Y` = worktree state; see git-status(1)) to a single semantic state word.
+///
+/// Rule: the worktree half (`Y`, second char) wins if it is anything other
+/// than unmodified (`.`); otherwise the staged half (`X`, first char) is
+/// used. Concretely this means a file changed in the worktree — whether or
+/// not it's *also* staged (`.M` or `MM`) — reads as `"modified"`, while a
+/// file that is staged-only with no further worktree change (`A.`) reads as
+/// `"added"`, not `"unmodified"`. Each letter maps to a word: `M` ->
+/// `"modified"`, `A` -> `"added"`, `D` -> `"deleted"`, `R` -> `"renamed"`,
+/// `C` -> `"copied"`, `T` -> `"typechange"`, `U` -> `"unmerged"`. A missing
+/// or unrecognized char (including `.`/`.`, i.e. truly no change) falls back
+/// to `"unmodified"`; real git never emits a no-op `..` row, so this
+/// fallback is a defensive default rather than an expected case.
+fn xy_state(xy: &str) -> &'static str {
+    fn word(c: char) -> &'static str {
+        match c {
+            'M' => "modified",
+            'A' => "added",
+            'D' => "deleted",
+            'R' => "renamed",
+            'C' => "copied",
+            'T' => "typechange",
+            'U' => "unmerged",
+            _ => "unmodified",
+        }
+    }
+    let mut chars = xy.chars();
+    let x = chars.next().unwrap_or('.');
+    let y = chars.next().unwrap_or('.');
+    if y != '.' { word(y) } else { word(x) }
 }
 
 fn rows_or_list(vals: Vec<Value>) -> Option<Value> {
@@ -905,6 +955,71 @@ output={parse="porcelain-v2", type="table<{status: str, path: path}>"}
         assert_eq!(rows[0]["status"], Value::Str("R100".into()));
         assert_eq!(rows[0]["path"], Value::Path("new_name.rs".into()));
         assert_eq!(rows[0]["orig"], Value::Path("old_name.rs".into()));
+    }
+
+    // The whole point of the `state` field: `(git status).where(.status ==
+    // "modified")` can never match anything because `status` is always the
+    // raw two-char `XY` porcelain code (`.M`, `M.`, `MM`, ...), never an
+    // English word -- a footgun for a shell whose pitch is "filter
+    // structured output like data." `state` is the derived semantic word
+    // that makes `.where(.state == "modified")` actually work, without
+    // disturbing `status` (asserted alongside `state` on every row here so
+    // a regression to either field is caught).
+    #[test]
+    fn porcelain_v2_derives_semantic_state_field() {
+        let bytes = b"1 .M N... 100644 100644 100644 aaaa1111 bbbb2222 mod_worktree.rs\n\
+1 M. N... 100644 100644 100644 aaaa1111 bbbb2222 mod_staged.rs\n\
+1 A. N... 100644 100644 100644 aaaa1111 bbbb2222 added_staged.rs\n\
+1 MM N... 100644 100644 100644 aaaa1111 bbbb2222 mod_both.rs\n\
+2 R. N... 100644 100644 100644 aaaa1111 bbbb2222 R100 new_name.rs\told_name.rs\n\
+? untracked_file.txt\n\
+! ignored_file.log\n";
+        let v = parse_output("porcelain-v2", bytes, None).unwrap();
+        let Value::Table(rows) = v else {
+            panic!("expected table")
+        };
+        assert_eq!(rows.len(), 7);
+
+        // `.M`: unmodified in the index, modified in the worktree -- Y
+        // wins, and Y='M' -> "modified". This is the exact case the task
+        // description calls out: a worktree-modified file must read as
+        // "modified", not something derived from the (unchanged) index half.
+        assert_eq!(rows[0]["status"], Value::Str(".M".into()));
+        assert_eq!(rows[0]["state"], Value::Str("modified".into()));
+
+        // `M.`: modified in the index, unmodified in the worktree -- Y is
+        // '.' (no worktree change to prefer), so falls back to X='M' ->
+        // "modified".
+        assert_eq!(rows[1]["status"], Value::Str("M.".into()));
+        assert_eq!(rows[1]["state"], Value::Str("modified".into()));
+
+        // `A.`: staged-new (added to the index) with no further worktree
+        // change -- Y='.' falls back to X='A' -> "added", per the task's
+        // required outcome for a purely staged-new file.
+        assert_eq!(rows[2]["status"], Value::Str("A.".into()));
+        assert_eq!(rows[2]["state"], Value::Str("added".into()));
+
+        // `MM`: modified in both the index and the worktree -- Y='M' wins
+        // (same result as `.M`, since worktree state takes priority
+        // regardless of what's also staged).
+        assert_eq!(rows[3]["status"], Value::Str("MM".into()));
+        assert_eq!(rows[3]["state"], Value::Str("modified".into()));
+
+        // `2 R.`: a rename entry with an unmodified worktree since the
+        // rename -- Y='.' falls back to X='R' -> "renamed"; `orig` still
+        // carries the pre-rename path exactly as before.
+        assert_eq!(rows[4]["status"], Value::Str("R.".into()));
+        assert_eq!(rows[4]["state"], Value::Str("renamed".into()));
+        assert_eq!(rows[4]["path"], Value::Path("new_name.rs".into()));
+        assert_eq!(rows[4]["orig"], Value::Path("old_name.rs".into()));
+
+        // `?`: untracked has no `XY` pair at all -- fixed "untracked" state.
+        assert_eq!(rows[5]["status"], Value::Str("?".into()));
+        assert_eq!(rows[5]["state"], Value::Str("untracked".into()));
+
+        // `!`: ignored, likewise fixed -- "ignored".
+        assert_eq!(rows[6]["status"], Value::Str("!".into()));
+        assert_eq!(rows[6]["state"], Value::Str("ignored".into()));
     }
 
     #[test]

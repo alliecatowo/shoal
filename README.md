@@ -128,7 +128,7 @@ fn deploy(env: str, dry: bool = false) {
 deploy staging --dry   # → "would deploy to staging"
 
 # Structured output from real tools, via adapters — filter it like data
-(git status).where(.status.contains("M")).map(.path)
+(git status).where(.state == "modified").map(.path)
 
 # Pattern-match on shape, not string-munging
 match request {

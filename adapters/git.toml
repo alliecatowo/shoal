@@ -16,7 +16,14 @@ invoke = ["status", "--porcelain=v2"]
 # "consumed" rule). The porcelain-v2 table already carries everything
 # `--short`/`--branch` would otherwise reveal.
 consumed = ["short", "branch"]
-output = { parse = "porcelain-v2", type = "table<{status: str, path: path, orig: path?}>" }
+# `status` stays the raw porcelain `XY` code (or bare `?`/`!` marker) for
+# power users/existing consumers; `state` is a derived semantic word --
+# worktree half wins if changed, else staged half, mapped M/A/D/R/C/T/U ->
+# modified/added/deleted/renamed/copied/typechange/unmerged, with
+# `?`->untracked and `!`->ignored -- so `.where(.state == "modified")` reads
+# naturally without callers needing to know porcelain's XY alphabet. See
+# `xy_state` in `crates/shoal-adapters/src/lib.rs` for the exact mapping.
+output = { parse = "porcelain-v2", type = "table<{status: str, state: str, path: path, orig: path?}>" }
 effects = ["fs.read(cwd)"]
 
 [cmd.git.sub.log]
