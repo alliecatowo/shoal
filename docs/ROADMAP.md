@@ -202,20 +202,25 @@ Sonnet.
 Pulled together from the per-wave notes above, plus fresh findings from this revision's
 verification pass:
 
-1. **Binary-content-hash spawn pinning is designed and unit-tested but NOT wired into the real
-   spawn path** — the single most security-relevant gap this revision found. `shoal-leash`'s
-   `preflight_spawn`/`Policy` evaluator can check a `ProcSpawn{bin_hash}` effect against a
-   principal's `proc_spawn` grants correctly when handed one, but `crates/shoal-eval/src/
-   plan_derive.rs` always constructs that effect with an **empty** `bin_hash`
-   (`Effect::ProcSpawn { bin_hash: String::new(), .. }`), and the real spawn path (`run_argv` →
-   `resolve_sandbox` in `crates/shoal-eval/src/command.rs`) never calls `shoal-leash`'s effect
-   evaluator at all — it only applies the OS-level Landlock/Seatbelt `SandboxPolicy` (filesystem
-   confinement, which **is** real). A policy author who writes `proc_spawn = ["<hash>"]` believing
-   an unrecognized binary will be blocked gets **zero enforcement from that hash today**. reef's
-   own lock-drift detection (`reef_drift`) is unaffected and real. `docs/REEF.md` §2 and the wiki's
-   Leash-and-Security §4 / Reef §2 carry the corrected, verified account — this item is the fix:
-   thread a real hash through `plan_derive.rs` and have the spawn path actually consult the
-   evaluator with it before exec.
+1. **Binary-content-hash spawn pinning — WIRED (was the single most security-relevant gap).**
+   `shoal-eval`'s spawn path now consults `shoal-leash`'s effect evaluator before exec. In
+   `crates/shoal-eval/src/command.rs`, `run_argv` calls a new `spawn_gate` for every external
+   spawn: when the active principal declares a non-empty `proc_spawn` allowlist
+   (`Policy::spawn_pinning_active`), the resolved binary's blake3 content hash is checked against it
+   via `Policy::evaluate_effect(ProcSpawn{bin_hash, argv0})`; a miss returns a `spawn_denied` error
+   *before* the child is launched. The hash is reef's own `Resolution::hash` when reef resolved the
+   head (reused verbatim — same blake3-hex `reef_apply` now returns), else it is computed from the
+   resolved binary's bytes via `shoal_reef::hashcache::hash_bytes`, so a pin an author copies from
+   `reef`/`which` output compares equal either way. `plan_derive.rs` likewise now emits a real
+   `bin_hash` instead of `String::new()`. **No default-deny regression:** the gate is a strict
+   no-op unless `proc_spawn` is non-empty — an empty/absent allowlist means "unrestricted spawns",
+   guarded explicitly by `spawn_pinning_active` (an empty allowlist would otherwise evaluate every
+   `ProcSpawn` as `Deny`) and pinned by unit + end-to-end tests
+   (`crates/shoal-eval/tests/leash_activation.rs`, `crates/shoal-leash/src/lib.rs`). Residual
+   caveat: the hash is a pre-exec preflight, so a TOCTOU window remains between check and exec until
+   an exec-time BPF-LSM/`spawn_hash` pin lands — the same caveat `preflight_spawn` already
+   documents; the OS `SandboxPolicy.spawn_hash` pin (exec-layer `verify_pin`) remains available for
+   the fs-scoped path.
 2. **Builtin REGISTRY + `resolve.rs` unification** (R4 remainder) — architectural cleanup, eval-heavy.
 3. **`jump`/`j`** frecency-ranked `cd` (R2 remainder) — small, self-contained, eval-heavy.
 4. **`Outcome` wire `span`** always `None` over the kernel wire (R5 carryover) — small, `shoal-kernel`.

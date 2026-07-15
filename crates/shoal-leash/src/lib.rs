@@ -116,6 +116,71 @@ opaque = "ask"
         }
     }
     #[test]
+    fn spawn_pinning_active_only_when_proc_spawn_is_set() {
+        // The load-bearing no-regression guard: a principal is "pinning" iff it
+        // declares a non-empty `proc_spawn` allowlist. The default-permissive
+        // policy sets none, so it never pins — ordinary spawns stay allowed.
+        let p = policy();
+        assert!(p.spawn_pinning_active("agent")); // has proc_spawn = ["cargo", "deadbeef"]
+        assert!(!p.spawn_pinning_active("missing")); // unknown principal
+        let permissive = Policy::permissive("uid:1000");
+        assert!(!permissive.spawn_pinning_active("uid:1000"));
+        let no_spawn = Policy::from_toml("[principal.agent]\nopaque='allow'\n").unwrap();
+        assert!(!no_spawn.spawn_pinning_active("agent"));
+    }
+
+    #[test]
+    fn proc_spawn_allowlist_admits_matching_hash_and_denies_others() {
+        // A principal that pins a concrete content hash allows exactly that hash
+        // (regardless of the argv0 name) and denies an unlisted one. This is the
+        // enforcement the spawn gate relies on once pinning is active.
+        let p =
+            Policy::from_toml("[principal.agent]\nproc_spawn = [\"aa11bb22ccddeeff\"]\n").unwrap();
+        assert!(p.spawn_pinning_active("agent"));
+        assert_eq!(
+            p.evaluate_effect(
+                "agent",
+                &Effect::ProcSpawn {
+                    bin_hash: "aa11bb22ccddeeff".into(),
+                    argv0: "/opt/vendor/tool".into(), // name is unlisted; hash carries it
+                }
+            ),
+            Verdict::Allow
+        );
+        assert_eq!(
+            p.evaluate_effect(
+                "agent",
+                &Effect::ProcSpawn {
+                    bin_hash: "0000000000000000".into(), // a different binary's hash
+                    argv0: "/usr/bin/tool".into(),
+                }
+            ),
+            Verdict::Deny
+        );
+    }
+
+    #[test]
+    fn empty_proc_spawn_would_default_deny_hence_the_guard() {
+        // Documents *why* `spawn_pinning_active` exists: with an empty allowlist
+        // `evaluate_effect` denies every spawn (nothing matches). Callers must
+        // gate on `spawn_pinning_active` and skip the evaluator entirely, or an
+        // otherwise-unrestricted principal would be unable to run any command.
+        let p = Policy::from_toml("[principal.agent]\nopaque='allow'\n").unwrap();
+        assert!(!p.spawn_pinning_active("agent"));
+        assert_eq!(
+            p.evaluate_effect(
+                "agent",
+                &Effect::ProcSpawn {
+                    bin_hash: "anyhash".into(),
+                    argv0: "/bin/ls".into(),
+                }
+            ),
+            Verdict::Deny,
+            "an empty allowlist denies — which is exactly why the gate must skip it"
+        );
+    }
+
+    #[test]
     fn opaque_and_unknown_principal() {
         let p = policy();
         assert_eq!(

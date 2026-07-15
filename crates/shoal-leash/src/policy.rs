@@ -117,6 +117,23 @@ impl Policy {
         self.principals.get(name)
     }
 
+    /// Whether `principal` pins process spawns — i.e. declares a non-empty
+    /// `proc_spawn` allowlist. This is the explicit guard for TDD §8's
+    /// "empty grants ⇒ allow" contract at the *spawn* boundary.
+    ///
+    /// When this returns `false` (an unknown principal, or one with no
+    /// `proc_spawn` grants) a caller MUST treat every spawn as allowed and MUST
+    /// NOT route it through [`Policy::evaluate_effect`]: with an empty allowlist
+    /// `evaluate_effect` evaluates any [`Effect::ProcSpawn`] as [`Verdict::Deny`]
+    /// (nothing matches), so consulting the evaluator with no `proc_spawn`
+    /// grants set would default-deny ordinary commands. The spawn path therefore
+    /// gates on this predicate first and only hashes/evaluates a binary once a
+    /// principal has actually opted into spawn pinning.
+    pub fn spawn_pinning_active(&self, principal: &str) -> bool {
+        self.principal(principal)
+            .is_some_and(|p| !p.proc_spawn.is_empty())
+    }
+
     pub fn evaluate_effect(&self, principal: &str, effect: &Effect) -> Verdict {
         let Some(p) = self.principal(principal) else {
             return Verdict::Deny;

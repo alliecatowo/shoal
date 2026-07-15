@@ -251,10 +251,18 @@ impl Evaluator {
                     push_effect(out, effect);
                 }
             }
+            // Derive a real binary-content hash for the plan (TDD §8): resolve
+            // the adapter's bin and hash it, matching reef/leash's blake3-hex so
+            // the hash a plan renders is the one a `proc_spawn` pin would check.
+            // Falls back to an empty hash when the tool isn't installed/locatable
+            // (name-only matching, as before) — planning never spawns or mutates.
+            let bin_hash = self
+                .hash_resolved_bin(OsStr::new(&adapter.bin))
+                .unwrap_or_default();
             push_effect(
                 out,
                 Effect::ProcSpawn {
-                    bin_hash: String::new(),
+                    bin_hash,
                     argv0: adapter.bin,
                 },
             );
