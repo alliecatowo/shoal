@@ -103,6 +103,10 @@ impl StreamInner {
             stdout_spill: None,
             dur: self.start.elapsed(),
             pid: self.child.id(),
+            #[allow(clippy::cast_sign_loss)] // pgids are positive
+            pgid: self.pgid as u32,
+            // Capture mode has no controlling tty and thus no stop concept.
+            stopped: false,
             enforcement: self.enforcement.take(),
         })
     }

@@ -138,6 +138,15 @@ pub(crate) fn repl() -> Result<i32, String> {
             }
         });
     }
+    // Job control (TDD §4.7): an interactive shell must ignore SIGTSTP/SIGTTOU/
+    // SIGTTIN so a stray Ctrl-Z or a terminal-handoff operation never suspends
+    // the shell itself — the classic bug this replaces. Gated on a real tty (the
+    // same check the interactive path already relies on) so a piped/`-c` run is
+    // untouched. Uses no-op *handlers*, so spawned children reset to SIG_DFL on
+    // exec and can still be stopped on their own pty (see shoal-exec).
+    if io::stdin().is_terminal() {
+        shoal_eval::install_shell_job_control_signals();
+    }
 
     let cwd_cell = Arc::new(Mutex::new(evaluator.cwd().to_path_buf()));
     let completer = ShoalCompleter::new(
@@ -272,6 +281,23 @@ pub(crate) fn repl() -> Result<i32, String> {
                 if src.trim().is_empty() {
                     continue;
                 }
+                // Job control (TDD §4.7): `fg`/`bg` with a numeric job id (or a
+                // bare `fg`/`bg` targeting the most-recent stopped job) resume a
+                // Ctrl-Z'd foreground external command. Handled here, before
+                // parse/eval, because it manipulates the live parked PTY + the
+                // real terminal directly — not something the evaluator models.
+                // A `fg <name>` (identifier) is NOT matched here and still flows
+                // through `rewrite_fg` to resume a background `spawn` task.
+                if let Some(jc) = parse_job_control(&src) {
+                    // Fresh cancel epoch so Ctrl-C during a foreground resume is
+                    // observed by that job's watcher.
+                    evaluator.reset_cancel();
+                    if let Ok(mut token) = cancel_slot.lock() {
+                        *token = evaluator.cancellation_token();
+                    }
+                    handle_job_control(&mut evaluator, jc);
+                    continue;
+                }
                 // `fg <task>` (docs/ROADMAP.md R3): host-level sugar, resolved
                 // as plain source text before parsing since the evaluator has
                 // no `fg` builtin of its own — see `rewrite_fg`.
@@ -317,9 +343,19 @@ pub(crate) fn repl() -> Result<i32, String> {
                                         ))
                                     );
                                 }
+                                // Job control (TDD §4.7): if a foreground
+                                // external command was Ctrl-Z'd during this
+                                // statement, it is now a stopped job — announce
+                                // it (bash's "[n]+ Stopped …") and return to the
+                                // prompt. The outcome itself rendered nothing
+                                // (its bytes already streamed to the terminal).
+                                if let Some((id, desc)) = evaluator.take_pending_stop() {
+                                    print_stopped_notice(id, &desc);
+                                }
                                 // `exit`/`quit` ends the REPL cleanly with its code,
                                 // mirroring the Ctrl-D path (defect: no exit).
                                 if let Some(code) = evaluator.take_exit() {
+                                    shoal_eval::shutdown_stopped_jobs();
                                     return Ok(code);
                                 }
                             }
@@ -334,6 +370,8 @@ pub(crate) fn repl() -> Result<i32, String> {
             }
             Ok(Signal::CtrlD) => {
                 println!();
+                // Reap any Ctrl-Z'd jobs so no stopped child is orphaned.
+                shoal_eval::shutdown_stopped_jobs();
                 return Ok(0);
             }
             Ok(_) => {}
@@ -649,6 +687,125 @@ fn rewrite_fg(src: &str) -> Option<String> {
         return None;
     }
     Some(format!("{name}.resume()\n{name}.await()"))
+}
+
+/// Which job-control verb was typed and its optional numeric target.
+enum JobKind {
+    Fg,
+    Bg,
+}
+
+struct JobControl {
+    kind: JobKind,
+    /// Explicit job id from the `jobs` table; `None` means "the current job"
+    /// (the most-recently stopped one), matching the shell convention.
+    id: Option<u64>,
+}
+
+impl JobKind {
+    fn name(&self) -> &'static str {
+        match self {
+            JobKind::Fg => "fg",
+            JobKind::Bg => "bg",
+        }
+    }
+}
+
+/// Recognize `fg`/`bg` job-control lines (TDD §4.7): bare `fg`/`bg`, or with a
+/// numeric job id (optionally a bash-style `%N`). Deliberately does NOT match
+/// `fg <name>` (an identifier — that resumes a `spawn` task via [`rewrite_fg`]),
+/// nor unrelated commands like `fgrep`/`fg=1`; those return `None` and flow
+/// through the normal parse/eval path.
+fn parse_job_control(src: &str) -> Option<JobControl> {
+    let trimmed = src.trim();
+    let (kind, rest) = match trimmed.strip_prefix("fg") {
+        Some(r) => (JobKind::Fg, r),
+        None => (JobKind::Bg, trimmed.strip_prefix("bg")?),
+    };
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return Some(JobControl { kind, id: None });
+    }
+    // A single bare positive integer (optionally `%N`); anything else is not a
+    // job-control line (e.g. `fg mytask`, `fgrep pattern`, `bg-tool`).
+    let digits = rest.strip_prefix('%').unwrap_or(rest);
+    let id: u64 = digits.parse().ok()?;
+    Some(JobControl { kind, id: Some(id) })
+}
+
+/// The `[n]+ Stopped …` prompt notice for a Ctrl-Z'd foreground command.
+fn print_stopped_notice(id: u64, desc: &str) {
+    println!(
+        "{}",
+        maybe_strip(format!("\x1b[90m[{id}]+  Stopped\x1b[0m  {desc}"))
+    );
+}
+
+/// Resume a stopped foreground external command (TDD §4.7). `fg` hands it the
+/// terminal, SIGCONTs, and waits (WUNTRACED) for it to finish or stop again;
+/// `bg` SIGCONTs it and lets it run detached. Job resources live in shoal-exec's
+/// parked-job registry (the live PTY, keyed by pid) and in the evaluator's job
+/// table (the listing + kernel suspend/resume) — this bridges the two by id.
+fn handle_job_control(evaluator: &mut shoal_eval::Evaluator, jc: JobControl) {
+    let warn = |msg: &str| {
+        eprintln!(
+            "{}",
+            maybe_strip(format!("\x1b[33;1m{}:\x1b[0m {msg}", jc.kind.name()))
+        );
+    };
+    let Some(id) = jc.id.or_else(|| evaluator.last_stopped_external()) else {
+        warn("no current job");
+        return;
+    };
+    let Some(pid) = evaluator.external_job_pid(id) else {
+        warn(&format!("no such stopped job [{id}]"));
+        return;
+    };
+    let Some(job) = shoal_eval::take_stopped_job(pid) else {
+        // The eval-side record outlived its parked PTY (already resumed/reaped);
+        // retire it so it stops showing up.
+        warn(&format!("job [{id}] is no longer available"));
+        evaluator.finish_external_job(id);
+        return;
+    };
+
+    match jc.kind {
+        JobKind::Fg => {
+            // Echo the command being re-fronted (bash does), mark it running,
+            // then hand over the terminal and wait.
+            println!("{}", maybe_strip(job.command().to_string()));
+            evaluator.mark_external_resumed(id);
+            let cancel = evaluator.cancellation_token();
+            match job.resume_foreground(&cancel) {
+                Ok(res) if res.stopped => {
+                    // Ctrl-Z'd again: back to a stopped job at the prompt.
+                    evaluator.mark_external_stopped(id);
+                    if let Some((sid, desc)) = evaluator.take_pending_stop() {
+                        print_stopped_notice(sid, &desc);
+                    }
+                }
+                Ok(_) => {
+                    evaluator.finish_external_job(id);
+                }
+                Err(error) => {
+                    eprintln!("{}", maybe_strip(format!("\x1b[31;1mfg:\x1b[0m {error}")));
+                    evaluator.finish_external_job(id);
+                }
+            }
+        }
+        JobKind::Bg => {
+            evaluator.mark_external_resumed(id);
+            println!(
+                "{}",
+                maybe_strip(format!("\x1b[90m[{id}]+ {} &\x1b[0m", job.command()))
+            );
+            // SIGCONT + detach: output keeps flowing to the terminal, stdin is
+            // not forwarded. A backgrounded external's later completion is not
+            // reflected back into the jobs table (documented limitation) — it
+            // reads as running until the session ends or it is `fg`'d again.
+            job.resume_background();
+        }
+    }
 }
 
 /// Build the parser's dispatch context (WP1's `ParseCtx`) from the live
@@ -970,6 +1127,27 @@ mod tests {
         assert!(!input_is_incomplete("echo \"{\""));
         assert!(!input_is_incomplete("# {\n1"));
         assert!(!input_is_incomplete("[1, 2]"));
+    }
+
+    /// Job-control line recognition (TDD §4.7): bare `fg`/`bg` and `%N`/`N`
+    /// forms are job control; an identifier arg, a longer command sharing the
+    /// prefix, or an assignment must fall through untouched.
+    #[test]
+    fn parse_job_control_matches_only_fg_bg_verbs() {
+        let fg = |s: &str| parse_job_control(s).map(|jc| (matches!(jc.kind, JobKind::Fg), jc.id));
+        assert_eq!(fg("fg"), Some((true, None)));
+        assert_eq!(fg("  fg  "), Some((true, None)));
+        assert_eq!(fg("fg 2"), Some((true, Some(2))));
+        assert_eq!(fg("fg %3"), Some((true, Some(3))));
+        assert_eq!(fg("bg"), Some((false, None)));
+        assert_eq!(fg("bg 5"), Some((false, Some(5))));
+        // Not job control: an identifier arg (that is `rewrite_fg`'s domain),
+        // a command that merely starts with the letters, or an assignment.
+        assert!(parse_job_control("fg mytask").is_none());
+        assert!(parse_job_control("fgrep pattern").is_none());
+        assert!(parse_job_control("bgtool").is_none());
+        assert!(parse_job_control("fg=1").is_none());
+        assert!(parse_job_control("echo hi").is_none());
     }
 
     #[test]

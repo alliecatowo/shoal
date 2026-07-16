@@ -122,6 +122,24 @@ impl TaskVal {
         self.shared.suspended.load(Ordering::SeqCst)
     }
 
+    /// Mark the task suspended WITHOUT running the suspend hooks. Used when the
+    /// OS already stopped the underlying process — a foreground external command
+    /// SIGTSTP'd by Ctrl-Z (TDD §4.7 job control): the stop physically happened,
+    /// so firing the `on_suspend` hooks (which re-send `SIGTSTP`) would be
+    /// redundant. `jobs`/prompt accounting then reflects the stop. Contrast with
+    /// [`TaskVal::suspend`], which is the request-a-suspend path that DOES signal.
+    pub fn mark_suspended(&self) {
+        self.shared.suspended.store(true, Ordering::SeqCst);
+    }
+
+    /// Clear the suspended flag WITHOUT running the resume hooks — for a caller
+    /// that performs the `SIGCONT` + terminal handoff itself (the REPL `fg`/`bg`
+    /// job-control path drives the terminal re-attach directly rather than via a
+    /// generic hook). Counterpart to [`TaskVal::mark_suspended`].
+    pub fn mark_resumed(&self) {
+        self.shared.suspended.store(false, Ordering::SeqCst);
+    }
+
     /// Register a hook run when the task is suspended (e.g. `SIGTSTP` the child
     /// process group). If the task is already suspended, the hook fires now.
     pub fn on_suspend(&self, hook: Box<dyn Fn() + Send>) {
