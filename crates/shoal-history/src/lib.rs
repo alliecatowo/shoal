@@ -179,6 +179,7 @@ mod tests {
     fn truncation_surfaces_in_json() {
         let j = Journal::in_memory_with_options(JournalOptions {
             output_hard_cap: 64,
+            ..Default::default()
         })
         .unwrap();
         let id = j.append(&rec("loud", "[]")).unwrap();
