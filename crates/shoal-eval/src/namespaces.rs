@@ -526,8 +526,10 @@ fn config_record(ev: &Evaluator) -> VResult<Value> {
     let mut dir: Option<PathBuf> = Some(ev.cwd().to_path_buf());
     while let Some(d) = dir {
         let candidate = d.join("shoal.toml");
-        if candidate.is_file() {
-            let text = std::fs::read_to_string(&candidate)
+        if ev.fs.is_file(&candidate) {
+            let text = ev
+                .fs
+                .read_to_string(&candidate)
                 .map_err(|e| ErrorVal::new("io_error", format!("config: {e}")))?;
             let j: serde_json::Value = toml::from_str(&text)
                 .map_err(|e| ErrorVal::arg_error(format!("config: shoal.toml: {e}")))?;

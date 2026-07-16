@@ -211,7 +211,7 @@ impl Evaluator {
                 .map(|s| s.source.clone())
                 .unwrap_or_else(|| self.cwd.join(".reef.toml"))
         };
-        let mut doc = match std::fs::read_to_string(&manifest_path) {
+        let mut doc = match self.fs.read_to_string(&manifest_path) {
             Ok(text) => text
                 .parse::<toml::Table>()
                 .map_err(|e| ErrorVal::new("reef_provider", format!("parsing manifest: {e}")))?,
@@ -227,7 +227,8 @@ impl Evaluator {
             ));
         };
         tools.insert(tool.clone(), toml::Value::String(ver.clone()));
-        std::fs::write(&manifest_path, doc.to_string())
+        self.fs
+            .write(&manifest_path, doc.to_string().as_bytes())
             .map_err(|e| ErrorVal::new("reef_provider", format!("writing manifest: {e}")))?;
 
         // Re-discover so the fresh constraint is in scope, then lock it.
