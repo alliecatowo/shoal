@@ -97,6 +97,7 @@ impl StreamInner {
             signal,
             stdout: Vec::new(),
             stderr: Vec::new(),
+            truncated: false,
             dur: self.start.elapsed(),
             pid: self.child.id(),
             enforcement: self.enforcement.take(),
@@ -225,21 +226,105 @@ pub fn spawn_capture(mut spec: ExecSpec, cancel: &CancelToken) -> io::Result<Str
 
 /// Blocking capture run: drains stdout and stderr on two threads (so a child
 /// filling both pipes can never deadlock), waits, and returns the collected
-/// bytes.
+/// bytes. Each stream is bounded to [`crate::capture_hard_cap`] bytes in memory
+/// (TDD §317) so an unbounded producer (`yes`, `cat /dev/zero`) cannot OOM the
+/// shell; overflow is discarded and [`ExecResult::truncated`] is set.
 pub(crate) fn run_capture(spec: ExecSpec, cancel: &CancelToken) -> io::Result<ExecResult> {
+    let cap = crate::capture_hard_cap();
     let mut child = spawn_capture(spec, cancel)?;
     let out = mem::replace(&mut child.stdout, Box::new(io::empty()));
     let err = mem::replace(&mut child.stderr, Box::new(io::empty()));
-    let t_out = thread::spawn(move || drain(out));
-    let t_err = thread::spawn(move || drain(err));
+    let t_out = thread::spawn(move || drain_capped(out, cap));
+    let t_err = thread::spawn(move || drain_capped(err, cap));
     let mut res = child.wait(cancel)?;
-    res.stdout = t_out.join().unwrap_or_default();
-    res.stderr = t_err.join().unwrap_or_default();
+    let (stdout, out_trunc) = t_out.join().unwrap_or_default();
+    let (stderr, err_trunc) = t_err.join().unwrap_or_default();
+    res.stdout = stdout;
+    res.stderr = stderr;
+    res.truncated = out_trunc || err_trunc;
     Ok(res)
 }
 
-fn drain(mut r: Box<dyn Read + Send>) -> Vec<u8> {
+/// Read `r` to EOF, buffering at most `cap` bytes. Reading continues past the
+/// cap (draining and discarding the overflow) so the child never blocks on a
+/// full pipe; the returned flag is `true` when any byte was dropped.
+fn drain_capped(mut r: Box<dyn Read + Send>, cap: usize) -> (Vec<u8>, bool) {
     let mut buf = Vec::new();
-    let _ = r.read_to_end(&mut buf);
-    buf
+    let mut chunk = [0u8; 65536];
+    let mut truncated = false;
+    loop {
+        match r.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                if buf.len() < cap {
+                    let take = (cap - buf.len()).min(n);
+                    buf.extend_from_slice(&chunk[..take]);
+                    if take < n {
+                        truncated = true;
+                    }
+                } else {
+                    truncated = true;
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    (buf, truncated)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// FIX 4: a bounded producer emitting more than `cap` bytes fills the buffer
+    /// to exactly the cap and reports truncation — the buffer never grows past
+    /// the bound, so an unbounded child can't OOM the shell.
+    #[test]
+    fn drain_capped_stops_at_cap_and_flags_truncation() {
+        let cap = 4096;
+        let producer = vec![b'x'; cap + 5000];
+        let r: Box<dyn Read + Send> = Box::new(io::Cursor::new(producer));
+        let (buf, truncated) = drain_capped(r, cap);
+        assert_eq!(buf.len(), cap, "buffer must stop growing at the cap");
+        assert!(buf.iter().all(|&b| b == b'x'));
+        assert!(truncated, "dropping overflow must set the truncated flag");
+    }
+
+    /// Output at or under the cap is captured whole with no truncation flag.
+    #[test]
+    fn drain_capped_keeps_output_within_cap() {
+        let cap = 4096;
+        let producer = vec![b'y'; 1000];
+        let r: Box<dyn Read + Send> = Box::new(io::Cursor::new(producer));
+        let (buf, truncated) = drain_capped(r, cap);
+        assert_eq!(buf.len(), 1000);
+        assert!(!truncated);
+    }
+
+    /// Exactly-cap-sized output is not falsely flagged as truncated.
+    #[test]
+    fn drain_capped_exact_cap_is_not_truncated() {
+        let cap = 4096;
+        let r: Box<dyn Read + Send> = Box::new(io::Cursor::new(vec![b'z'; cap]));
+        let (buf, truncated) = drain_capped(r, cap);
+        assert_eq!(buf.len(), cap);
+        assert!(!truncated, "an exact fit is complete, not truncated");
+    }
+
+    /// The configurable cap resolves (default or override) to a positive bound.
+    #[test]
+    fn capture_hard_cap_is_positive_and_overridable() {
+        assert!(crate::capture_hard_cap() > 0);
+        crate::set_capture_hard_cap(1234);
+        assert_eq!(crate::capture_hard_cap(), 1234);
+        crate::set_capture_hard_cap(0);
+        assert_eq!(
+            crate::capture_hard_cap(),
+            1,
+            "zero is clamped to a positive cap"
+        );
+        // Restore the resolved default so other tests in this binary are unaffected.
+        crate::set_capture_hard_cap(crate::DEFAULT_CAPTURE_HARD_CAP);
+    }
 }

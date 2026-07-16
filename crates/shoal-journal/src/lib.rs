@@ -85,6 +85,11 @@ impl Journal {
         // `PRAGMA journal_mode=WAL` returns a result row; consume it.
         conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // Wait (rather than immediately fail with SQLITE_BUSY) for a competing
+        // writer's lock: the journal is shared across processes and every
+        // journaling call site swallows errors, so a busy failure here silently
+        // drops the entry and its undo inverse. See `JournalOptions::busy_timeout`.
+        conn.busy_timeout(options.busy_timeout)?;
         Self::init_schema(&conn)?;
         Ok(Journal {
             conn,
@@ -105,6 +110,7 @@ impl Journal {
         let cas_root = tempdir.path().join("cas");
         fs::create_dir_all(&cas_root).map_err(io_to_sql)?;
         let conn = Connection::open_in_memory()?;
+        conn.busy_timeout(options.busy_timeout)?;
         Self::init_schema(&conn)?;
         Ok(Journal {
             conn,
