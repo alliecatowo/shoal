@@ -103,6 +103,8 @@ e.g. `max_entries`, so an automatic split would be ambiguous).
 | `SHOAL_HISTORY_DEDUP` | `history.dedup` | bool |
 | `SHOAL_RENDER_COLOR` | `render.color` | bool |
 | `SHOAL_RENDER_WIDTH` | `render.width` | non-negative int |
+| `SHOAL_RENDER_PAGING` | `render.paging` | string (`never`\|`auto`) |
+| `SHOAL_RENDER_PAGER` | `render.pager` | string |
 | `SHOAL_EDITOR_MODE` | `editor.mode` | string (`emacs`\|`vi`) |
 | `SHOAL_EDITOR_BRACKETED_PASTE` | `editor.bracketed_paste` | bool |
 | `SHOAL_KERNEL_ENABLED` (alias: `SHOAL_KERNEL`) | `kernel.enabled` | bool |
@@ -166,6 +168,7 @@ invalid table header
 | `version` must be `1` | `version: unsupported config version <n> (expected 1)` |
 | `history.max_entries` must be `> 0` | `history.max_entries: must be greater than 0` |
 | `editor.mode` must be `emacs` or `vi` | `editor.mode: must be \`emacs\` or \`vi\`` |
+| `render.paging` must be `never` or `auto` | `render.paging: must be \`never\` or \`auto\`` |
 | `completion.max_results` must be `> 0` | `completion.max_results: must be greater than 0` |
 | an `aliases` name must be non-empty, no whitespace | `aliases: alias name \`g s\` must not contain whitespace` |
 | an `env` name must be non-empty | `env: environment variable name must not be empty` |
@@ -218,6 +221,8 @@ scanner, and is what `shoal-prompt`'s loader migrates from when it sees an old-s
 |---|---|---|---|
 | `render.width` | integer, optional | unset → detect terminal width | force a render width |
 | `render.color` | bool | `true` | ANSI color on rendered output; forced off by `NO_COLOR` (§3) regardless of this value |
+| `render.paging` | string | `"never"` | `"never"` or `"auto"` — opt-in gate for the interactive REPL's pager integration (see §6); `"never"` is byte-for-byte identical to shoal before this knob existed |
+| `render.pager` | string, optional | unset → `$PAGER`, else `less -R` | explicit pager command, e.g. `"less -R"` or `"bat --paging=always"` |
 
 ### `[editor]`
 
@@ -353,6 +358,19 @@ friends). As of this wave, the `shoal` binary's REPL/script-runner path reads:
   `-c`/scripts (a parallel lane had flagged the REPL was building its own `Evaluator` and skipping
   this call entirely, so the documented user reef scope silently never engaged in the interactive
   shell).
+- `render.paging`/`render.pager` — resolved once per REPL session into a `PagerContext`
+  (`crates/shoal/src/repl.rs`) and consulted only at the *final* per-line result render
+  (`render_result_paged`): when `render.paging = "auto"`, stdout is a real TTY, and the rendered
+  output would not fit on one screen (terminal height from the same `crossterm::terminal::size()`
+  call the renderer already uses for width detection, with wrapped-line accounting so a long
+  unwrapped string still triggers paging), the output is piped through the resolved pager (`render.pager`,
+  else `$PAGER`, else the built-in `less -R`) instead of printed directly. Any pager failure
+  (missing binary, spawn error) falls back to a plain print — output is never lost. Scoped away
+  from `-c`/scripts (`main::run_source` only ever calls the plain `render_result`, which has no
+  pager awareness) and from mid-statement values inside a multi-statement REPL line (the
+  `statement_sink` always calls `print_value` directly). Default `"never"` means this is
+  byte-for-byte inert until a user opts in; flipping the default to `"auto"` is a one-line change
+  in `Render::default()` (`crates/shoal-config/src/lib.rs`).
 
 Schema-complete, validated, and documented, but **not yet read by any in-tree consumer** as of
 this wave (ready for a consumer to wire up — see the integrator note below):
