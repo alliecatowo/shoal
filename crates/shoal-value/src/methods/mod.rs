@@ -28,7 +28,7 @@ mod strops;
 mod suggest;
 mod task;
 
-pub use suggest::{method_names, methods_for};
+pub use suggest::{levenshtein, method_names, methods_for};
 
 use super::*;
 

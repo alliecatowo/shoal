@@ -293,8 +293,10 @@ fn hint(name: &str, type_name: &str) -> Option<String> {
 }
 
 /// Classic two-row Levenshtein edit distance (method names are short ASCII;
-/// no dependency warranted).
-fn levenshtein(a: &str, b: &str) -> usize {
+/// no dependency warranted). Exposed via `methods` so the evaluator's command
+/// did-you-mean (TDD §13.9) reuses the very same metric the method did-you-mean
+/// uses here, rather than duplicating it.
+pub fn levenshtein(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
     if a.is_empty() {

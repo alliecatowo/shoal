@@ -668,6 +668,9 @@ impl Evaluator {
         if let Some(argv0) = argv.first() {
             self.spawn_gate(argv0, reef_hash.as_deref(), span)?;
         }
+        // Capture the head before `argv` moves into the spawn spec, so a
+        // `not_found` failure below can offer a command did-you-mean (TDD §13.9).
+        let failed_head = argv.first().map(|s| s.to_string_lossy().into_owned());
         // TDD §317 disk-spill: for value-position captures only (never PTY,
         // whose output already reached the terminal), and only when a journal
         // is installed to adopt the overflow into its CAS. `None` otherwise
@@ -698,15 +701,25 @@ impl Evaluator {
                 &self.cancel,
             )
             .map_err(|e| {
-                ErrorVal::new(
-                    if e.kind() == std::io::ErrorKind::NotFound {
-                        "not_found"
-                    } else {
-                        "custom"
-                    },
+                let is_not_found = e.kind() == std::io::ErrorKind::NotFound;
+                let err = ErrorVal::new(
+                    if is_not_found { "not_found" } else { "custom" },
                     e.to_string(),
                 )
-                .with_span(span)
+                .with_span(span);
+                // TDD §13.9: when the head simply isn't a resolvable command,
+                // point at the closest known one (builtins ∪ adapter heads ∪
+                // in-scope callable bindings) — mirrors the method did-you-mean.
+                // The primary `not_found`/"command not found" code+message is
+                // unchanged; we only ADD a hint when a near-miss exists.
+                match failed_head
+                    .as_deref()
+                    .filter(|_| is_not_found)
+                    .and_then(|h| self.command_suggestion(h))
+                {
+                    Some(hint) => err.with_hint(hint),
+                    None => err,
+                }
             })?;
         // Job control (TDD §4.7): a foreground PtyTee child that was *stopped*
         // (Ctrl-Z → SIGTSTP) rather than finishing. Register it as a suspended
@@ -977,6 +990,54 @@ impl Evaluator {
         shoal_exec::which(OsStr::new(name), path).is_some()
     }
 
+    /// Command did-you-mean (TDD §13.9): when a command head fails to resolve,
+    /// find the closest *known* command name so the `not_found` error can carry
+    /// a `did you mean 'X'?` hint — the command-head analogue of the method
+    /// did-you-mean (`shoal_value::methods::suggest`).
+    ///
+    /// The candidate vocabulary is deliberately host-INDEPENDENT so the hint is
+    /// deterministic and testable: the canonical builtin registry
+    /// (`shoal_syntax::commands::builtin_names`), the adapter command heads the
+    /// evaluator holds, and the in-scope callable session bindings (fn/alias
+    /// names). We do NOT scan `$PATH` — that would be noisy and non-reproducible.
+    ///
+    /// Threshold mirrors the method hint: names of ≥ 5 chars tolerate an edit
+    /// distance of 2, shorter names only 1 (at distance 2 a 4-char typo matches
+    /// half the table), and the match must be strictly closer than the typo's
+    /// own length so a short head can't match unrelated noise.
+    fn command_suggestion(&self, head: &str) -> Option<String> {
+        // A reef-rewritten `argv[0]` can be an absolute path, but the user typed
+        // a bare name — compare against the final path component.
+        let head = head
+            .rsplit(['/', std::path::MAIN_SEPARATOR])
+            .next()
+            .unwrap_or(head);
+        let len = head.chars().count();
+        if len == 0 {
+            return None;
+        }
+        let max_d = if len >= 5 { 2 } else { 1 };
+        // Union the deterministic candidate sources, then sort+dedup so ties
+        // break identically every run (the first minimum wins in `min_by_key`).
+        let mut candidates: Vec<String> = builtins::builtin_names()
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        candidates.extend(self.adapters.names().map(str::to_owned));
+        for name in self.env.visible_names() {
+            if self.env.get(&name).is_some_and(|v| v.is_callable()) {
+                candidates.push(name);
+            }
+        }
+        candidates.sort_unstable();
+        candidates.dedup();
+        let (dist, best) = candidates
+            .iter()
+            .map(|c| (shoal_value::methods::levenshtein(head, c), c))
+            .min_by_key(|(d, _)| *d)?;
+        (dist <= max_d && dist < len).then(|| format!("did you mean '{best}'?"))
+    }
+
     /// Resolve the optional `exit`/`quit` status argument to an `i32`
     /// (default `0`). Accepts a bare integer word (`exit 3`) or an int-valued
     /// expression; anything non-integer is an `arg_error`.
@@ -1034,5 +1095,114 @@ impl CasBytesLoader {
 impl shoal_value::BytesLoad for CasBytesLoader {
     fn load(&self) -> std::io::Result<Vec<u8>> {
         self.cas.read(&self.hash)
+    }
+}
+
+#[cfg(test)]
+mod command_did_you_mean_tests {
+    //! TDD §13.9 command did-you-mean. The conformance corpus
+    //! (`spec/cases/edges.toml`) proves the hint reaches the wire for builtin +
+    //! session-binding sources; these unit tests pin what the corpus harness
+    //! cannot — the adapter candidate source (the corpus evaluator loads none),
+    //! the edit-distance threshold, and the precise ABSENCE of a hint for a
+    //! too-far head.
+    use super::*;
+
+    // `command_suggestion` reads only the candidate vocabulary (builtins,
+    // adapters, env) — never the filesystem — so the cwd need not exist.
+    fn ev() -> Evaluator {
+        Evaluator::new(std::env::temp_dir())
+    }
+
+    #[test]
+    fn builtin_typos_suggest_the_canonical_head() {
+        let ev = ev();
+        for (typo, want) in [
+            ("journl", "journal"),
+            ("puhd", "pushd"),
+            ("wich", "which"),
+            ("slee", "sleep"),
+            ("popdd", "popd"),
+            ("historyy", "history"),
+        ] {
+            assert_eq!(
+                ev.command_suggestion(typo).as_deref(),
+                Some(format!("did you mean '{want}'?").as_str()),
+                "`{typo}` should suggest `{want}`"
+            );
+        }
+    }
+
+    #[test]
+    fn a_head_too_far_from_anything_known_gets_no_hint() {
+        let ev = ev();
+        // `xyzzy` (5 chars, so distance 2 is tolerated) is still nowhere near
+        // any builtin; a wildly-unlike head likewise stays hint-free.
+        assert_eq!(ev.command_suggestion("xyzzy"), None);
+        assert_eq!(ev.command_suggestion("zzzznotarealcommandxyz123"), None);
+        // Empty head (a reef basename edge) never suggests.
+        assert_eq!(ev.command_suggestion(""), None);
+    }
+
+    #[test]
+    fn short_heads_only_tolerate_distance_one() {
+        let ev = ev();
+        // A 2-char head at distance 2 from every 2-char builtin (`ls`/`cp`/…)
+        // must NOT match — at distance 2 a short name matches half the table.
+        assert_eq!(ev.command_suggestion("qz"), None);
+        // …but a genuine distance-1 short typo does resolve.
+        assert_eq!(
+            ev.command_suggestion("lst").as_deref(),
+            Some("did you mean 'ls'?")
+        );
+    }
+
+    #[test]
+    fn adapter_command_heads_join_the_candidate_set() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("pack.toml"),
+            "[cmd.docker]\nbin = \"docker\"\n[cmd.kubectl]\nbin = \"kubectl\"\n",
+        )
+        .unwrap();
+        let (catalog, warnings) = shoal_adapters::AdapterCatalog::load_dir(dir.path());
+        assert!(warnings.is_empty(), "adapter fixture should parse cleanly");
+        let mut ev = Evaluator::new(dir.path().to_path_buf());
+        ev.set_adapters(catalog);
+        // `dcoker` is a transposition of `docker` (distance 2, len ≥ 5).
+        assert_eq!(
+            ev.command_suggestion("dcoker").as_deref(),
+            Some("did you mean 'docker'?")
+        );
+        assert_eq!(
+            ev.command_suggestion("kubctl").as_deref(),
+            Some("did you mean 'kubectl'?")
+        );
+    }
+
+    #[test]
+    fn in_scope_callable_bindings_join_the_candidate_set() {
+        let mut ev = ev();
+        let program = shoal_syntax::parse("fn deploy() { 42 }").unwrap();
+        ev.eval_program(&program).unwrap();
+        assert_eq!(
+            ev.command_suggestion("deployy").as_deref(),
+            Some("did you mean 'deploy'?")
+        );
+        // A plain (non-callable) `let` binding is NOT a command candidate.
+        let program = shoal_syntax::parse("let treasure = 1").unwrap();
+        ev.eval_program(&program).unwrap();
+        assert_eq!(ev.command_suggestion("treasuer"), None);
+    }
+
+    #[test]
+    fn a_reef_rewritten_absolute_argv0_matches_on_its_basename() {
+        let ev = ev();
+        // `argv[0]` can be an absolute path post-reef; the user typed a bare
+        // name, so we compare against the final component.
+        assert_eq!(
+            ev.command_suggestion("/usr/bin/journl").as_deref(),
+            Some("did you mean 'journal'?")
+        );
     }
 }
