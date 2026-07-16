@@ -25,7 +25,7 @@ use shoal_adapters::{AdapterCatalog, CmdAdapter};
 use shoal_syntax::commands::builtin_names;
 use shoal_syntax::lexer::RESERVED;
 use shoal_syntax::{Lexer, Mode, Tok};
-use shoal_value::{Env, Value, method_names};
+use shoal_value::{Env, Value, method_names, methods_for};
 
 /// Cursor context, resolved from the raw buffer text alone (no full parse —
 /// see `classify`).
@@ -43,7 +43,15 @@ enum Ctx {
     Expr { start: usize, word: String },
     /// Completing a method/field name immediately after a `.` (`recv.<word>`)
     /// in EXPR position — offer the value-method vocabulary, not variables.
-    Method { start: usize, word: String },
+    /// `recv` is the inferred receiver type name (a `Value::type_name` string
+    /// understood by `shoal_value::methods_for`) when we could pin it down from
+    /// the token(s) before the `.`, else `None` — meaning "offer the full method
+    /// union" (see [`infer_receiver_type`]).
+    Method {
+        start: usize,
+        word: String,
+        recv: Option<String>,
+    },
     /// Nothing sensible to complete (e.g. cursor inside a literal).
     None,
 }
@@ -189,14 +197,18 @@ impl ShoalCompleter {
         names.into_iter().collect()
     }
 
-    /// Method/field candidates for a `.`-position word (`recv.<prefix>`): the
-    /// flat value-method vocabulary from shoal-value (`method_names`), filtered
-    /// per `[completion]` config. Receiver-type-aware filtering is deliberately
-    /// out of scope — a value's dynamic type isn't known from buffer text alone
-    /// — so every method name is a candidate, which is still a strict
-    /// improvement over offering variable names in method position.
-    fn method_candidates(&self, prefix: &str) -> Vec<String> {
-        method_names()
+    /// Method/field candidates for a `.`-position word (`recv.<prefix>`),
+    /// filtered per `[completion]` config. When the receiver's type was inferred
+    /// (`recv` is `Some`) we offer only that type's methods
+    /// (`shoal_value::methods_for`) — so `[1,2,3].` proposes `where`/`map`/`sum`
+    /// and not `upper`/`split`. When it wasn't (a chained/computed/unknown
+    /// receiver), we fall back to the flat union across every type
+    /// (`method_names`), which is exactly the old, type-agnostic behavior — never
+    /// fewer or wrong candidates than before.
+    fn method_candidates(&self, prefix: &str, recv: Option<&str>) -> Vec<String> {
+        let per_type = recv.and_then(methods_for);
+        let names: &[&str] = per_type.as_deref().unwrap_or_else(|| method_names());
+        names
             .iter()
             .filter(|n| self.candidate_matches(n, prefix))
             .map(|s| s.to_string())
@@ -303,9 +315,12 @@ impl Completer for ShoalCompleter {
             Ctx::Expr { start, word } => {
                 finish(self.expr_candidates(&word), start, pos, max_results)
             }
-            Ctx::Method { start, word } => {
-                finish(self.method_candidates(&word), start, pos, max_results)
-            }
+            Ctx::Method { start, word, recv } => finish(
+                self.method_candidates(&word, recv.as_deref()),
+                start,
+                pos,
+                max_results,
+            ),
             Ctx::None => Vec::new(),
         }
     }
@@ -354,14 +369,156 @@ fn split_dir_prefix(word: &str) -> (String, String) {
 /// (variable/function/keyword completion) or a [`Ctx::Method`] (value-method
 /// completion) depending on whether the identifier is immediately preceded by a
 /// `.` — i.e. it's a method/field on some receiver (`recv.<word>`). A `?.`
-/// optional-chain also ends in `.`, so it's covered too.
-fn expr_or_method(line: &str, pos: usize) -> Ctx {
+/// optional-chain also ends in `.`, so it's covered too. When it's a method
+/// position we additionally try to infer the receiver's type so completion can
+/// narrow to that type's methods.
+fn expr_or_method(env: &Env, line: &str, pos: usize) -> Ctx {
     let (start, word) = trailing_ident(line, pos);
     if start > 0 && line.as_bytes()[start - 1] == b'.' {
-        Ctx::Method { start, word }
+        let recv = infer_receiver_type(env, line, start - 1);
+        Ctx::Method { start, word, recv }
     } else {
         Ctx::Expr { start, word }
     }
+}
+
+/// Infer the receiver type for a `.`-position completion from the token(s)
+/// immediately before the `.` at `dot_pos` (`line[dot_pos] == '.'`). Returns a
+/// `Value::type_name` string understood by [`methods_for`], or `None` — "fall
+/// back to the full method union" — for anything we can't pin down cleanly.
+///
+/// Handled (a strict, receiver-narrowing win over the union):
+/// - literals directly before the `.`: `"…"`/`'…'` → str, an int/float literal,
+///   a size/duration literal, `true`/`false` → bool, a `[…]` list literal, a
+///   `{…}` record literal;
+/// - a simple binding `name.` whose live `Value` in `env` gives its type.
+///
+/// Everything else falls back to `None` (mandatory, so this never regresses):
+/// a chained access `a.b.`, a call/group result `f(x).`/`(…).`, an indexed
+/// element `xs[0].`, a name that isn't a value binding, or a binding whose type
+/// has no dedicated method table (stream/outcome/closure/… — [`methods_for`]
+/// itself returns `None` there, and `method_candidates` then uses the union).
+fn infer_receiver_type(env: &Env, line: &str, dot_pos: usize) -> Option<String> {
+    let stmt_start = statement_start(line, dot_pos);
+    let toks = expr_tokens(line, stmt_start, dot_pos);
+    let (last_tok, _) = toks.last()?;
+    match last_tok {
+        Tok::Str(_) | Tok::StrInterp(_) => Some("str".into()),
+        Tok::Int(_) => Some("int".into()),
+        Tok::Float(_) => Some("float".into()),
+        Tok::Size(_) => Some("size".into()),
+        Tok::Duration(_) => Some("duration".into()),
+        Tok::Time { .. } => Some("time".into()),
+        Tok::DateTime(_) => Some("datetime".into()),
+        Tok::Ident(name) => {
+            match name.as_str() {
+                "true" | "false" => return Some("bool".into()),
+                // A reserved keyword (`if.`, `for.`) is never a receiver, and a
+                // value binding can never shadow one.
+                kw if RESERVED.contains(&kw) => return None,
+                _ => {}
+            }
+            // `a.b.` — the receiver of *this* `.` is the field access `a.b`,
+            // whose type we can't know from text; fall back. (The token before
+            // `b` is a `.`/`?.`.)
+            if matches!(
+                toks.iter().rev().nth(1),
+                Some((Tok::Dot | Tok::QuestionDot, _))
+            ) {
+                return None;
+            }
+            // Simple binding: infer from the live value's variant.
+            Some(env.get(name.as_str())?.type_name().to_string())
+        }
+        // A trailing `]`/`}` is a list/record *literal* only when its matching
+        // opener isn't applied to a preceding value (indexing / a call / a
+        // header block); otherwise fall back.
+        Tok::RBracket => bracket_literal_type(&toks, &Tok::LBracket, "list"),
+        Tok::RBrace => bracket_literal_type(&toks, &Tok::LBrace, "record"),
+        // Call/group result (`)`), or any other token: unknown → union.
+        _ => None,
+    }
+}
+
+/// Lex `line[stmt_start..dot_pos]` in EXPR mode into `(tok, start)` pairs
+/// (trivia dropped), so [`infer_receiver_type`] can inspect the receiver just
+/// before a `.`. Tokens that would overrun `dot_pos` are excluded (e.g. the
+/// `?.` of a `recv?.field` chain, so `recv` remains the last token).
+fn expr_tokens(line: &str, stmt_start: usize, dot_pos: usize) -> Vec<(Tok, usize)> {
+    let lx = Lexer::new(line);
+    let mut out = Vec::new();
+    let mut scan = stmt_start;
+    loop {
+        let next = lx.skip_trivia(scan);
+        if next >= dot_pos {
+            break;
+        }
+        let Ok((tok, span)) = lx.token(next, Mode::Expr) else {
+            break;
+        };
+        let (start, end) = (span.start as usize, span.end as usize);
+        if matches!(tok, Tok::Eof) || start >= dot_pos || end > dot_pos {
+            break;
+        }
+        out.push((tok, start));
+        scan = end.max(next + 1);
+    }
+    out
+}
+
+/// Classify a trailing `]`/`}` (whose matching `opener` and result `ty` are
+/// given): a fresh list/record literal, or postfix application (index/call/
+/// block) that we can't type. Returns `Some(ty)` only for the literal case.
+fn bracket_literal_type(toks: &[(Tok, usize)], opener: &Tok, ty: &str) -> Option<String> {
+    // Walk back to the matching opener by bracket depth.
+    let mut depth = 0i32;
+    let mut open_idx = None;
+    for (i, (tok, _)) in toks.iter().enumerate().rev() {
+        match tok {
+            Tok::RParen | Tok::RBracket | Tok::RBrace => depth += 1,
+            Tok::LParen | Tok::LBracket | Tok::LBrace => {
+                depth -= 1;
+                if depth == 0 {
+                    open_idx = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let open_idx = open_idx?;
+    // Unbalanced / mismatched (shouldn't happen for a closed receiver): bail.
+    if &toks[open_idx].0 != opener {
+        return None;
+    }
+    // An atom-ending token right before the opener means the brackets are
+    // postfix (`xs[0]`, `f(){…}`) rather than a literal → fall back.
+    let prev = open_idx.checked_sub(1).map(|i| &toks[i].0);
+    if prev.is_some_and(atom_ends) {
+        return None;
+    }
+    Some(ty.to_string())
+}
+
+/// Does `tok` end an atom/value expression? A `[`/`{` right after such a token
+/// is postfix (indexing/call/header block), not the opener of a fresh literal.
+fn atom_ends(tok: &Tok) -> bool {
+    matches!(
+        tok,
+        Tok::Ident(_)
+            | Tok::RParen
+            | Tok::RBracket
+            | Tok::RBrace
+            | Tok::Str(_)
+            | Tok::StrInterp(_)
+            | Tok::Int(_)
+            | Tok::Float(_)
+            | Tok::Size(_)
+            | Tok::Duration(_)
+            | Tok::Time { .. }
+            | Tok::DateTime(_)
+            | Tok::Regex(_)
+    )
 }
 
 /// Backward scan for the identifier ending exactly at `pos` — used for
@@ -477,7 +634,7 @@ fn classify(env: &Env, line: &str, pos: usize) -> Ctx {
                 ))
             );
             if is_keyword || is_bound || is_assign {
-                expr_or_method(line, pos)
+                expr_or_method(env, line, pos)
             } else {
                 match cmd_word_at(&lx, e0, pos, line) {
                     Some((start, word)) => Ctx::Arg {
@@ -493,7 +650,7 @@ fn classify(env: &Env, line: &str, pos: usize) -> Ctx {
             if pos <= e0 {
                 Ctx::None
             } else {
-                expr_or_method(line, pos)
+                expr_or_method(env, line, pos)
             }
         }
     }
@@ -615,13 +772,15 @@ mod tests {
         // A bound receiver followed by `.<word>` is method/field position, not
         // a plain expr reference — so completion offers method names.
         let env = Env::root();
-        env.declare("items", Value::Int(1), false);
+        env.declare("items", Value::List(vec![Value::Int(1)]), false);
         let ctx = classify(&env, "items.le", 8);
         assert_eq!(
             ctx,
             Ctx::Method {
                 start: 6,
-                word: "le".into()
+                word: "le".into(),
+                // `items` is a live list binding — receiver type inferred.
+                recv: Some("list".into()),
             }
         );
     }
@@ -683,11 +842,11 @@ mod tests {
 
     #[test]
     fn method_position_offers_method_names_expr_does_not() {
-        // `tbl.wh<TAB>` — a bound receiver in `.`-position — offers value
+        // `tbl.wh<TAB>` — a bound list receiver in `.`-position — offers value
         // method names (`where`); the same prefix in plain expr position
         // (`let x = wh`) offers variables/keywords, never method names.
         let env = Env::root();
-        env.declare("tbl", Value::Int(1), false);
+        env.declare("tbl", Value::List(vec![Value::Int(1)]), false);
         let mut c = ShoalCompleter::new(
             env,
             Arc::new(Mutex::new(PathBuf::from("."))),
@@ -707,6 +866,223 @@ mod tests {
             "plain expr position must NOT offer method names, got {:?}",
             expr.iter().map(|s| &s.value).collect::<Vec<_>>()
         );
+    }
+
+    // ---- receiver-type-aware method completion after `.` -------------------
+
+    fn completer_with(env: Env) -> ShoalCompleter {
+        ShoalCompleter::new(
+            env,
+            Arc::new(Mutex::new(PathBuf::from("."))),
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
+    /// Complete `line` at its end and collect the candidate strings.
+    fn cands(c: &mut ShoalCompleter, line: &str) -> Vec<String> {
+        c.complete(line, line.len())
+            .into_iter()
+            .map(|s| s.value)
+            .collect()
+    }
+
+    fn has(cs: &[String], m: &str) -> bool {
+        cs.iter().any(|c| c == m)
+    }
+
+    #[test]
+    fn method_completion_infers_literal_receiver_types() {
+        let mut c = completer_with(Env::root());
+
+        // `[…]` list literal → list methods, not str/record-only methods.
+        let list = cands(&mut c, "[1,2,3].");
+        for m in ["where", "map", "sum", "sort_by", "first"] {
+            assert!(has(&list, m), "list literal should offer `.{m}`: {list:?}");
+        }
+        for m in ["upper", "split", "keys"] {
+            assert!(
+                !has(&list, m),
+                "list literal must NOT offer `.{m}`: {list:?}"
+            );
+        }
+
+        // `"…"` string literal → str methods.
+        let s = cands(&mut c, "\"hi\".");
+        for m in ["upper", "len", "split", "trim"] {
+            assert!(has(&s, m), "str literal should offer `.{m}`: {s:?}");
+        }
+        for m in ["where", "map", "keys"] {
+            assert!(!has(&s, m), "str literal must NOT offer `.{m}`: {s:?}");
+        }
+
+        // `'…'` raw string literal → str methods too.
+        let raw = cands(&mut c, "'hi'.");
+        assert!(
+            has(&raw, "upper"),
+            "raw str literal should offer `.upper`: {raw:?}"
+        );
+        assert!(
+            !has(&raw, "where"),
+            "raw str literal must NOT offer `.where`: {raw:?}"
+        );
+
+        // Integer literal → numeric methods, not collection/str methods.
+        let int = cands(&mut c, "42.");
+        for m in ["abs", "round", "floor", "ceil"] {
+            assert!(has(&int, m), "int literal should offer `.{m}`: {int:?}");
+        }
+        for m in ["where", "upper", "keys"] {
+            assert!(!has(&int, m), "int literal must NOT offer `.{m}`: {int:?}");
+        }
+
+        // Float literal → numeric methods (and the `1.5` isn't mis-split).
+        let float = cands(&mut c, "1.5.");
+        assert!(
+            has(&float, "round"),
+            "float literal should offer `.round`: {float:?}"
+        );
+        assert!(
+            !has(&float, "where"),
+            "float literal must NOT offer `.where`: {float:?}"
+        );
+
+        // `{…}` record literal → record methods.
+        let rec = cands(&mut c, "{a:1}.");
+        for m in ["keys", "values", "items", "merge"] {
+            assert!(has(&rec, m), "record literal should offer `.{m}`: {rec:?}");
+        }
+        for m in ["upper", "map", "where"] {
+            assert!(
+                !has(&rec, m),
+                "record literal must NOT offer `.{m}`: {rec:?}"
+            );
+        }
+
+        // `true`/`false` → bool (scalar) methods: universal serializers only.
+        let b = cands(&mut c, "true.");
+        assert!(has(&b, "json"), "bool literal should offer `.json`: {b:?}");
+        for m in ["where", "upper", "abs"] {
+            assert!(!has(&b, m), "bool literal must NOT offer `.{m}`: {b:?}");
+        }
+
+        // A size/duration literal → scalar methods (no distinct set of its own).
+        let size = cands(&mut c, "1mb.");
+        assert!(
+            has(&size, "json"),
+            "size literal should offer `.json`: {size:?}"
+        );
+        assert!(
+            !has(&size, "upper"),
+            "size literal must NOT offer `.upper`: {size:?}"
+        );
+        let dur = cands(&mut c, "30s.");
+        assert!(
+            has(&dur, "save"),
+            "duration literal should offer `.save`: {dur:?}"
+        );
+        assert!(
+            !has(&dur, "where"),
+            "duration literal must NOT offer `.where`: {dur:?}"
+        );
+    }
+
+    #[test]
+    fn method_completion_universal_methods_appear_for_every_type() {
+        // `.tap`/`.also` (dispatched for every receiver) and the universal
+        // serializers survive the type narrowing.
+        let mut c = completer_with(Env::root());
+        for (line, ty) in [("[1,2,3].", "list"), ("\"x\".", "str"), ("42.", "int")] {
+            let cs = cands(&mut c, line);
+            for m in ["tap", "also", "json"] {
+                assert!(
+                    has(&cs, m),
+                    "{ty} should still offer universal `.{m}`: {cs:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn method_completion_infers_binding_receiver_type() {
+        // `xs.` where `xs` is a live list binding → list methods, not str ops.
+        let env = Env::root();
+        env.declare("xs", Value::List(vec![Value::Int(1), Value::Int(2)]), false);
+        let mut c = completer_with(env);
+        let cs = cands(&mut c, "xs.");
+        assert!(
+            has(&cs, "where"),
+            "list binding should offer `.where`: {cs:?}"
+        );
+        assert!(has(&cs, "sum"), "list binding should offer `.sum`: {cs:?}");
+        assert!(
+            !has(&cs, "upper"),
+            "list binding must NOT offer `.upper`: {cs:?}"
+        );
+
+        // A str binding narrows to str methods.
+        let env2 = Env::root();
+        env2.declare("name", Value::Str("bob".into()), false);
+        let mut c2 = completer_with(env2);
+        let cs2 = cands(&mut c2, "name.");
+        assert!(
+            has(&cs2, "upper"),
+            "str binding should offer `.upper`: {cs2:?}"
+        );
+        assert!(
+            !has(&cs2, "where"),
+            "str binding must NOT offer `.where`: {cs2:?}"
+        );
+    }
+
+    #[test]
+    fn method_completion_falls_back_to_union_for_complex_receivers() {
+        // The union offers everything, so it contains BOTH a str-only method
+        // (`upper`) and a list method (`where`) — the tell-tale of "not
+        // narrowed". Every fallback case below must keep that full vocabulary.
+        let env = Env::root();
+        env.declare("rec", Value::Record(shoal_value::Record::new()), false);
+        env.declare("xs", Value::List(vec![Value::Int(1)]), false);
+        // A command binding: a type with no dedicated method table → union.
+        env.declare(
+            "f",
+            Value::CmdRef(Arc::new(shoal_ast::CmdCall {
+                head: "echo".into(),
+                forced: false,
+                env_prefix: Vec::new(),
+                args: Vec::new(),
+                redirects: Vec::new(),
+                background: false,
+                trailing: None,
+                span: shoal_ast::Span::new(0, 0),
+            })),
+            false,
+        );
+        let mut c = completer_with(env);
+
+        let union_like = |cs: &[String], label: &str| {
+            assert!(
+                has(cs, "upper"),
+                "{label} should fall back to the union (has `upper`): {cs:?}"
+            );
+            assert!(
+                has(cs, "where"),
+                "{label} should fall back to the union (has `where`): {cs:?}"
+            );
+            assert!(
+                has(cs, "keys"),
+                "{label} should fall back to the union (has `keys`): {cs:?}"
+            );
+        };
+
+        // Chained field access `rec.a.` — receiver type of the 2nd `.` unknown.
+        union_like(&cands(&mut c, "rec.a."), "chained access");
+        // Call/group result `f(x).`.
+        union_like(&cands(&mut c, "f(x)."), "call result");
+        // Indexed element `xs[0].` — the `[…]` is postfix, not a literal.
+        union_like(&cands(&mut c, "xs[0]."), "indexed element");
+        // A binding whose type has no dedicated table (a command) → union.
+        union_like(&cands(&mut c, "f."), "table-less binding");
     }
 
     #[test]

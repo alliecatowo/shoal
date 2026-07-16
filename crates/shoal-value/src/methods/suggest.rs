@@ -169,13 +169,26 @@ static METHOD_NAMES: std::sync::LazyLock<Vec<&'static str>> = std::sync::LazyLoc
 
 /// The canonical, sorted, deduped list of value-method names (across every
 /// receiver type). Consumed by the shell's completer for `.`-position
-/// (method/field) completion; see [`METHOD_NAMES`].
+/// (method/field) completion when the receiver's type is unknown; see
+/// [`METHOD_NAMES`] and [`methods_for`].
 pub fn method_names() -> &'static [&'static str] {
     &METHOD_NAMES
 }
 
-fn known_methods(type_name: &str) -> &'static [&'static str] {
-    match type_name {
+/// The single source of truth mapping a `Value::type_name` string to the
+/// per-receiver method table `dispatch` accepts for it. Both the did-you-mean
+/// hints ([`known_methods`]) and the receiver-aware completion set
+/// ([`methods_for`]) read from *this* one match, and [`METHOD_NAMES`] is the
+/// union of the very same `*_METHODS` constants — so a new dispatch arm added to
+/// one table can't leave the others stale relative to each other.
+///
+/// `None` = the type has no dedicated per-receiver table because its method
+/// surface is dynamic or forwarded (`stream` combinators, an `outcome`
+/// forwarding to its `.out`, closures/commands/secrets/errors) — callers that
+/// want a receiver-narrowed set should fall back to the full [`method_names`]
+/// union rather than narrow to an inaccurate handful.
+fn type_table(type_name: &str) -> Option<&'static [&'static str]> {
+    Some(match type_name {
         "list" | "table" | "range" => SEQ_METHODS,
         "str" => STR_METHODS,
         "record" => RECORD_METHODS,
@@ -184,8 +197,37 @@ fn known_methods(type_name: &str) -> &'static [&'static str] {
         "task" => TASK_METHODS,
         "bytes" => BYTES_METHODS,
         "bool" | "size" | "duration" | "datetime" | "time" => SCALAR_METHODS,
-        _ => &[],
-    }
+        _ => return None,
+    })
+}
+
+fn known_methods(type_name: &str) -> &'static [&'static str] {
+    type_table(type_name).unwrap_or(&[])
+}
+
+/// The method names applicable to a receiver of `type_name` (the string
+/// [`Value::type_name`](crate::Value::type_name) returns), for receiver-aware
+/// `.`-position completion in the shell. The universal
+/// [`POLY_METHODS`] (`tap`/`also`, dispatched for every receiver) are folded in
+/// so a type-narrowed set never drops the methods that apply to *all* types.
+/// Sorted and deduped.
+///
+/// Returns `None` for a type with no dedicated per-receiver table (see
+/// [`type_table`]); the caller should offer the full [`method_names`] union in
+/// that case so it never presents *fewer* candidates than the type-agnostic
+/// path would. Because the underlying tables are the same ones [`METHOD_NAMES`]
+/// and the did-you-mean hints consume, `methods_for("list")` is always a subset
+/// of `method_names()` and can't drift from what `dispatch` actually accepts.
+pub fn methods_for(type_name: &str) -> Option<Vec<&'static str>> {
+    let base = type_table(type_name)?;
+    let mut v: Vec<&'static str> = base
+        .iter()
+        .copied()
+        .chain(POLY_METHODS.iter().copied())
+        .collect();
+    v.sort_unstable();
+    v.dedup();
+    Some(v)
 }
 
 /// The `field_missing` error for an unknown method, with a did-you-mean hint
@@ -292,6 +334,75 @@ mod tests {
         want.sort_unstable();
         want.dedup();
         assert_eq!(names, want.as_slice(), "must be sorted and deduped");
+    }
+
+    #[test]
+    fn methods_for_is_a_subset_of_the_union_and_carries_poly_methods() {
+        for ty in [
+            "list", "str", "record", "int", "float", "path", "bytes", "task", "size",
+        ] {
+            let per_type = methods_for(ty).unwrap_or_else(|| panic!("{ty} should have a table"));
+            // Every receiver-narrowed name is also in the flat union — the two
+            // are built from the same `*_METHODS` constants, so this can only
+            // hold if they haven't drifted apart.
+            for m in &per_type {
+                assert!(
+                    method_names().contains(m),
+                    "methods_for({ty}) offers `{m}` which is absent from method_names()"
+                );
+            }
+            // The universal `tap`/`also` are folded into every concrete table.
+            assert!(
+                per_type.contains(&"tap"),
+                "methods_for({ty}) must include tap"
+            );
+            assert!(
+                per_type.contains(&"also"),
+                "methods_for({ty}) must include also"
+            );
+            // Sorted + deduped.
+            let mut want = per_type.clone();
+            want.sort_unstable();
+            want.dedup();
+            assert_eq!(
+                per_type, want,
+                "methods_for({ty}) must be sorted and deduped"
+            );
+        }
+        // A type with a dynamic/forwarded surface (or a nonexistent type) has no
+        // dedicated table — callers fall back to the union.
+        assert_eq!(methods_for("stream"), None);
+        assert_eq!(methods_for("outcome"), None);
+        assert_eq!(methods_for("closure"), None);
+        assert_eq!(methods_for("bogus"), None);
+    }
+
+    #[test]
+    fn methods_for_narrows_correctly_per_receiver() {
+        // A list offers collection ops, never string-only ops.
+        let list = methods_for("list").unwrap();
+        for m in ["where", "map", "sum", "sort_by", "first"] {
+            assert!(list.contains(&m), "list should offer `{m}`");
+        }
+        for m in ["upper", "lower", "split", "keys", "values"] {
+            assert!(!list.contains(&m), "list must NOT offer `{m}`");
+        }
+        // A str offers string ops, not record/collection higher-order ops.
+        let s = methods_for("str").unwrap();
+        for m in ["upper", "len", "split", "trim", "starts_with"] {
+            assert!(s.contains(&m), "str should offer `{m}`");
+        }
+        for m in ["where", "map", "keys"] {
+            assert!(!s.contains(&m), "str must NOT offer `{m}`");
+        }
+        // A record offers record ops.
+        let r = methods_for("record").unwrap();
+        for m in ["keys", "values", "items", "merge", "get"] {
+            assert!(r.contains(&m), "record should offer `{m}`");
+        }
+        for m in ["upper", "map", "where"] {
+            assert!(!r.contains(&m), "record must NOT offer `{m}`");
+        }
     }
 
     #[test]

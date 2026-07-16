@@ -28,7 +28,7 @@ mod strops;
 mod suggest;
 mod task;
 
-pub use suggest::method_names;
+pub use suggest::{method_names, methods_for};
 
 use super::*;
 
@@ -651,6 +651,41 @@ mod tests {
         assert_eq!(call(x(), "sum", vec![]).unwrap(), Value::Int(6));
         assert_eq!(call(x(), "min", vec![]).unwrap(), Value::Int(1));
         assert_eq!(call(x(), "max", vec![]).unwrap(), Value::Int(3));
+    }
+
+    #[test]
+    fn methods_for_agrees_with_dispatch() {
+        // Every name `methods_for` advertises for a receiver type must be a name
+        // `dispatch` actually recognizes — i.e. calling it never yields the
+        // `field_missing` "unknown method" error. (It may error on missing
+        // arguments or a type mismatch; that still proves the arm exists.) This
+        // is the guard that the completion vocabulary can't drift ahead of the
+        // real method table.
+        let sample = |ty: &str| -> Value {
+            match ty {
+                "list" => Value::List(vec![Value::Int(1), Value::Int(2)]),
+                "str" => Value::Str("hi".into()),
+                "record" => {
+                    let mut r = Record::new();
+                    r.insert("a".into(), Value::Int(1));
+                    Value::Record(r)
+                }
+                "int" => Value::Int(3),
+                "float" => Value::Float(1.5),
+                "bytes" => Value::Bytes(std::sync::Arc::new(vec![1, 2, 3])),
+                _ => unreachable!(),
+            }
+        };
+        for ty in ["list", "str", "record", "int", "float", "bytes"] {
+            for m in methods_for(ty).unwrap() {
+                if let Err(e) = call(sample(ty), m, vec![]) {
+                    assert_ne!(
+                        e.code, "field_missing",
+                        "methods_for({ty}) advertises `.{m}` but dispatch rejects it as unknown"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
