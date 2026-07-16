@@ -24,6 +24,16 @@
 //! `status: None` — never the shell-style `128+n` encoding. Children are
 //! always reaped (no zombies), and spawn failures such as `E2BIG` surface as
 //! [`std::io::Error`].
+//!
+//! Job control (TDD §4.7): a PtyTee **foreground** child is waited on with
+//! `WUNTRACED`, so a Ctrl-Z (SIGTSTP delivered to the child's foreground
+//! process group by the pty line discipline) is observable as a *stop* rather
+//! than hanging the shell. On a stop, [`run`] returns an [`ExecResult`] with
+//! `stopped: true` and parks the still-live PTY (master + child) so the host
+//! can later resume it in the foreground (`fg`) or background (`bg`) via
+//! [`PtyJob`]/[`take_stopped_job`]. This is strictly additive: a child that
+//! runs to completion behaves byte-identically to before, and Capture mode has
+//! no stop concept at all.
 
 mod cancel;
 mod capture;
@@ -40,6 +50,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 pub use cancel::CancelToken;
 pub use capture::{StreamingChild, spawn_capture};
+pub use pty::{PtyJob, shutdown_stopped_jobs, take_stopped_job};
 pub use which::which;
 
 /// Default hard cap on the bytes buffered in memory when capturing a command's
@@ -247,11 +258,66 @@ pub struct ExecResult {
     pub dur: std::time::Duration,
     /// The child's process id (also its process-group id).
     pub pid: u32,
+    /// The child's process-group id. Every child is placed in its own process
+    /// group (Capture: `setpgid(0, 0)` in the child; PtyTee: the child is a
+    /// session leader via `setsid`, so its group id equals its pid). Job control
+    /// (TDD §4.7) signals the whole group via `kill(-pgid, …)`.
+    pub pgid: u32,
+    /// `true` when a PtyTee foreground child was **stopped** (SIGTSTP/SIGSTOP —
+    /// e.g. the user pressed Ctrl-Z) rather than having exited. The child is
+    /// alive and suspended, its live PTY parked for resumption (see
+    /// [`take_stopped_job`]); `status`/`signal` are both `None`. Always `false`
+    /// for Capture and for any normally-terminated child. A [`run`] caller that
+    /// never uses job control can ignore this field — it stays `false` unless a
+    /// real terminal stop occurs.
+    pub stopped: bool,
     /// `Some` iff `ExecSpec::sandbox` was set, reporting the OS-enforcement
     /// tier that was **actually** applied to this child (TDD §8 tier
     /// honesty) — never `enforced: true` unless it really was. `None` means
     /// no sandbox was requested; it does not mean one was silently applied.
     pub enforcement: Option<shoal_leash::EnforcementStatus>,
+}
+
+/// Install the interactive shell's job-control signal dispositions (TDD §4.7):
+/// a no-op **handler** (not `SIG_IGN`) for `SIGTSTP`, `SIGTTOU`, and `SIGTTIN`,
+/// so the shell itself is never suspended by a stray Ctrl-Z or by the terminal-
+/// control operations of the handoff. Crucially this uses a handler rather than
+/// `SIG_IGN` because `exec` resets *caught* signals to `SIG_DFL` in a child
+/// while `SIG_IGN` would persist across exec — so spawned children still get the
+/// default disposition, which is exactly what lets Ctrl-Z stop them on their pty.
+/// Idempotent; a host (the REPL) calls this once at startup when interactive.
+pub fn install_shell_job_control_signals() {
+    extern "C" fn noop(_sig: libc::c_int) {}
+    for sig in [libc::SIGTSTP, libc::SIGTTOU, libc::SIGTTIN] {
+        // SAFETY: installing a trivial (empty, async-signal-safe) handler with a
+        // zeroed sigaction whose mask we clear and SA_RESTART set.
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = noop as *const () as usize;
+            libc::sigemptyset(&raw mut sa.sa_mask);
+            sa.sa_flags = libc::SA_RESTART;
+            libc::sigaction(sig, &raw const sa, std::ptr::null_mut());
+        }
+    }
+}
+
+/// Send `SIGTSTP` to a whole process group (`kill(-pgid, SIGTSTP)`) — the job-
+/// control "suspend this job" primitive (TDD §4.7). Memory-safe; a `SIGTSTP` to
+/// an already-stopped group is a harmless no-op. Exposed so hosts/the evaluator
+/// can drive suspend/resume without a direct `libc` dependency.
+pub fn suspend_group(pgid: i32) {
+    // SAFETY: signalling a process group is memory-safe.
+    unsafe {
+        libc::kill(-pgid, libc::SIGTSTP);
+    }
+}
+
+/// Send `SIGCONT` to a whole process group — the "resume this job" primitive.
+pub fn continue_group(pgid: i32) {
+    // SAFETY: signalling a process group is memory-safe.
+    unsafe {
+        libc::kill(-pgid, libc::SIGCONT);
+    }
 }
 
 /// Run `spec` to completion, blocking the calling thread.

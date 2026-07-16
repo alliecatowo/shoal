@@ -407,6 +407,23 @@ fn pty_child_sees_a_tty_on_all_std_fds() {
 }
 
 #[test]
+fn pty_child_is_its_own_process_group_leader() {
+    // Job control (TDD §4.7) signals the whole group via `kill(-pgid, …)`, so
+    // the child must be in its OWN group. portable-pty's `setsid` makes it a
+    // session/group leader, so pgid == pid — both positive.
+    let res = run(sh("true", ExecMode::PtyTee), &CancelToken::new()).expect("run");
+    assert!(res.pid > 0, "child must report a pid");
+    assert_eq!(
+        res.pgid, res.pid,
+        "a PTY child is a session leader, so its process-group id is its pid"
+    );
+    assert!(
+        !res.stopped,
+        "a child that ran to completion is not stopped"
+    );
+}
+
+#[test]
 fn pty_tee_captures_output_bytes() {
     let res = run(
         sh("printf hello-from-pty", ExecMode::PtyTee),

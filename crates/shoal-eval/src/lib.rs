@@ -30,6 +30,14 @@ mod streams;
 pub use channels::{EventBus, EventForwarder};
 pub(crate) use coerce::coerce_word;
 pub use reef::{PromptReefBinding, PromptReefSnapshot};
+// Job-control surface (TDD §4.7) the interactive host (the REPL) drives. Re-
+// exported through the evaluator — which the REPL already depends on — so `fg`/
+// `bg` and the shell's signal setup need no new `shoal` -> `shoal-exec` Cargo
+// edge (the crate-map DAG in CONTRACTS.md stays as pinned; `shoal` reaches
+// exec's process-control primitives via `shoal-eval`, its existing dependency).
+pub use shoal_exec::{
+    PtyJob, install_shell_job_control_signals, shutdown_stopped_jobs, take_stopped_job,
+};
 
 use ports::{Exec, StdExec, StdSecret};
 use shoal_adapters::{AdapterCatalog, AdapterClass, SubSpec};
@@ -85,6 +93,19 @@ pub struct Evaluator {
     in_fn_body: usize,
     /// Live task registry backing the `jobs` builtin (defect #14).
     jobs: Vec<shoal_value::TaskVal>,
+    /// Map of stopped-external job id → child pid, for the REPL's `fg`/`bg`
+    /// (TDD §4.7 job control). A stopped foreground external command is recorded
+    /// twice: as a suspended `TaskVal` in `jobs` (so it lists via `jobs` and the
+    /// kernel `task.suspend`/`task.resume` wire methods drive its SIGTSTP/SIGCONT
+    /// through the task's hooks), and here so `fg`/`bg` can locate its still-live
+    /// parked PTY by pid (via [`shoal_exec::take_stopped_job`]). Empty unless an
+    /// interactive foreground command has actually been Ctrl-Z'd.
+    external_jobs: std::collections::HashMap<u64, u32>,
+    /// The most recent foreground external command that stopped this turn
+    /// (job id, display form), set by `run_argv` when the exec layer reports a
+    /// stop and drained by the REPL (`take_pending_stop`) to print the
+    /// "[id]+ Stopped …" notice and return to the prompt.
+    pending_stop: Option<(u64, String)>,
     /// reef (docs/REEF.md): cached scope chain, keyed on the cwd it was
     /// discovered for. Rebuilt only when the cwd changes (cd / `with cwd:`).
     /// `None` until the first spawn/`which`/`reef` touches it; cheap when no
@@ -218,6 +239,8 @@ impl Evaluator {
             call_depth: 0,
             in_fn_body: 0,
             jobs: Vec::new(),
+            external_jobs: std::collections::HashMap::new(),
+            pending_stop: None,
             reef_chain: None,
             reef_resolver: None,
             reef_lock: shoal_reef::Lockfile::new(),
@@ -444,17 +467,32 @@ impl Evaluator {
         }
     }
 
-    /// The task table backing the `jobs` builtin (defect #14).
+    /// The task table backing the `jobs` builtin (defect #14). Rows cover both
+    /// spawned tasks and stopped foreground external commands (TDD §4.7 job
+    /// control) — a Ctrl-Z'd external appears here as a `stopped` job alongside
+    /// any backgrounded `spawn` tasks. The `state` column collapses the
+    /// `done`/`suspended` booleans into one word (`running`/`stopped`/`done`)
+    /// for legibility; the booleans remain for programmatic filtering.
     pub(crate) fn jobs_table(&self) -> Value {
         let rows = self
             .jobs
             .iter()
             .map(|t| {
+                let done = t.is_done();
+                let suspended = t.is_suspended();
+                let state = if done {
+                    "done"
+                } else if suspended {
+                    "stopped"
+                } else {
+                    "running"
+                };
                 let mut r = Record::new();
                 r.insert("id".into(), Value::Int(t.id as i64));
                 r.insert("desc".into(), Value::Str(t.shared.desc.clone()));
-                r.insert("done".into(), Value::Bool(t.is_done()));
-                r.insert("suspended".into(), Value::Bool(t.is_suspended()));
+                r.insert("state".into(), Value::Str(state.into()));
+                r.insert("done".into(), Value::Bool(done));
+                r.insert("suspended".into(), Value::Bool(suspended));
                 r
             })
             .collect();
@@ -492,6 +530,87 @@ impl Evaluator {
     /// background task and must first resolve it from the job table).
     pub fn task_by_id(&self, id: u64) -> Option<shoal_value::TaskVal> {
         self.jobs.iter().find(|t| t.id == id).cloned()
+    }
+
+    /// Record a foreground external command that the OS just *stopped* (Ctrl-Z →
+    /// SIGTSTP, TDD §4.7). Registers a suspended [`shoal_value::TaskVal`] in the
+    /// job table so it lists via `jobs` and the kernel `task.suspend`/
+    /// `task.resume` wire methods drive its SIGTSTP/SIGCONT (through the hooks
+    /// installed here, which signal the child's process group `pgid`). The pid
+    /// is stashed so the REPL's `fg`/`bg` can find the still-live parked PTY via
+    /// [`shoal_exec::take_stopped_job`]. Returns the new job id. The stop
+    /// physically already happened, so the task is marked suspended WITHOUT
+    /// re-sending SIGTSTP (see [`shoal_value::TaskVal::mark_suspended`]).
+    pub fn register_stopped_external(&mut self, pid: u32, pgid: i32, desc: String) -> u64 {
+        let task = shoal_value::TaskVal::new(desc.clone());
+        task.on_suspend(Box::new(move || shoal_exec::suspend_group(pgid)));
+        task.on_resume(Box::new(move || shoal_exec::continue_group(pgid)));
+        task.mark_suspended();
+        let id = task.id;
+        self.jobs.push(task);
+        self.external_jobs.insert(id, pid);
+        self.pending_stop = Some((id, desc));
+        id
+    }
+
+    /// The child pid of a stopped-external job id, for the REPL `fg`/`bg` path to
+    /// locate its parked PTY. `None` if `id` is not a stopped external command.
+    pub fn external_job_pid(&self, id: u64) -> Option<u32> {
+        self.external_jobs.get(&id).copied()
+    }
+
+    /// The most recently registered external command that is currently stopped —
+    /// the "current job" a bare `fg`/`bg` (no id) targets, matching the shell
+    /// convention. `None` when no external command is stopped.
+    pub fn last_stopped_external(&self) -> Option<u64> {
+        self.jobs
+            .iter()
+            .filter(|t| t.is_suspended() && self.external_jobs.contains_key(&t.id))
+            .map(|t| t.id)
+            .max()
+    }
+
+    /// The most recently stopped foreground external command (job id, display),
+    /// consumed once by the REPL after each command to print the stop notice.
+    pub fn take_pending_stop(&mut self) -> Option<(u64, String)> {
+        self.pending_stop.take()
+    }
+
+    /// Mark a stopped-external job as running again WITHOUT signalling — the
+    /// REPL `fg`/`bg` path performs the SIGCONT + terminal handoff itself, so
+    /// this only updates the job-table state. Returns `false` for an unknown id.
+    pub fn mark_external_resumed(&self, id: u64) -> bool {
+        match self.jobs.iter().find(|t| t.id == id) {
+            Some(t) => {
+                t.mark_resumed();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Re-mark a stopped-external job as stopped (it was `fg`'d and then Ctrl-Z'd
+    /// again) and re-arm the pending-stop notice, without re-signalling.
+    pub fn mark_external_stopped(&mut self, id: u64) {
+        if let Some(t) = self.jobs.iter().find(|t| t.id == id) {
+            t.mark_suspended();
+            let desc = t.shared.desc.clone();
+            self.pending_stop = Some((id, desc));
+        }
+    }
+
+    /// Retire a stopped-external job once it has finished (its `fg`/`bg` resume
+    /// ran to completion): mark the task done so `jobs` shows it terminal, and
+    /// drop the pid mapping. Returns `false` for an unknown id.
+    pub fn finish_external_job(&mut self, id: u64) -> bool {
+        self.external_jobs.remove(&id);
+        match self.jobs.iter().find(|t| t.id == id) {
+            Some(t) => {
+                t.finish(Ok(Value::Null));
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn cwd(&self) -> &Path {
@@ -1702,6 +1821,54 @@ output={parse="lines",type="list<str>"}
         // fg lookup resolves a live task.
         assert!(ev.task_by_id(t.id).is_some());
         t.cancel();
+    }
+
+    /// A foreground external command stopped by Ctrl-Z (TDD §4.7) is recorded
+    /// as a `stopped` job that lists alongside spawned tasks, resolves to its
+    /// pid for `fg`/`bg`, and walks running↔stopped→done as the REPL drives it —
+    /// all without a real process (the state transitions never fire the SIGTSTP/
+    /// SIGCONT hooks; those are covered against the OS in shoal-exec).
+    #[test]
+    fn stopped_external_command_lists_and_transitions_in_the_jobs_table() {
+        fn job_state(ev: &Evaluator, id: u64) -> Option<String> {
+            let Value::Table(rows) = ev.jobs_table() else {
+                return None;
+            };
+            rows.iter()
+                .find(|r| matches!(r.get("id"), Some(Value::Int(n)) if *n as u64 == id))
+                .and_then(|r| match r.get("state") {
+                    Some(Value::Str(s)) => Some(s.clone()),
+                    _ => None,
+                })
+        }
+
+        let mut ev = Evaluator::new(std::env::current_dir().unwrap());
+        let id = ev.register_stopped_external(4242, 4242, "sleep 30".into());
+
+        // The pending-stop notice is queued for the REPL exactly once.
+        assert_eq!(ev.take_pending_stop(), Some((id, "sleep 30".to_string())));
+        assert_eq!(ev.take_pending_stop(), None);
+
+        // It resolves to its pid (for `fg`/`bg`) and shows as `stopped`.
+        assert_eq!(ev.external_job_pid(id), Some(4242));
+        assert_eq!(job_state(&ev, id).as_deref(), Some("stopped"));
+        assert_eq!(ev.jobs_snapshot().suspended, 1);
+
+        // Resuming (`fg`/`bg`) flips it back to running without signalling.
+        assert!(ev.mark_external_resumed(id));
+        assert_eq!(job_state(&ev, id).as_deref(), Some("running"));
+        assert_eq!(ev.jobs_snapshot().running, 1);
+
+        // A re-stop (`fg`'d then Ctrl-Z'd again) re-arms the notice + state.
+        ev.mark_external_stopped(id);
+        assert_eq!(job_state(&ev, id).as_deref(), Some("stopped"));
+        assert_eq!(ev.take_pending_stop(), Some((id, "sleep 30".to_string())));
+
+        // Finishing retires it: `done`, and no longer resolvable for `fg`/`bg`.
+        assert!(ev.finish_external_job(id));
+        assert_eq!(job_state(&ev, id).as_deref(), Some("done"));
+        assert_eq!(ev.external_job_pid(id), None);
+        assert!(!ev.mark_external_resumed(999_999), "unknown id is a no-op");
     }
 
     #[test]

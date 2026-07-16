@@ -708,6 +708,33 @@ impl Evaluator {
                 )
                 .with_span(span)
             })?;
+        // Job control (TDD §4.7): a foreground PtyTee child that was *stopped*
+        // (Ctrl-Z → SIGTSTP) rather than finishing. Register it as a suspended
+        // job (so it lists in `jobs` and the REPL `fg`/`bg` can resume its parked
+        // PTY by pid) and return a streamed outcome that renders nothing — the
+        // REPL sees the pending stop and returns to the prompt. Never raise a
+        // `cmd_failed` for a stop: the command did not fail, it is suspended.
+        if r.stopped {
+            self.register_stopped_external(r.pid, r.pgid as i32, display.clone());
+            return Ok(Value::Outcome(Arc::new(OutcomeVal {
+                status: None,
+                signal: None,
+                ok: false,
+                stdout: Arc::new(r.stdout),
+                // A stopped PtyTee job never spills to CAS (§317 spill is a
+                // Capture-mode, value-position concern).
+                stdout_ref: None,
+                stderr: Arc::new(Vec::new()),
+                dur_ns: r.dur.as_nanos().min(i64::MAX as u128) as i64,
+                pid: r.pid,
+                cmd: display,
+                parsed: None,
+                // The child's bytes already reached the real terminal via the
+                // PtyTee passthrough, so the result renderer must not reprint.
+                streamed: true,
+                span: Some(span),
+            })));
+        }
         let ok_codes = meta.as_ref().map_or(&[0][..], |m| m.ok_codes.as_slice());
         let ok = r.status.is_some_and(|code| ok_codes.contains(&code));
         let parsed = meta.as_ref().and_then(|m| {
