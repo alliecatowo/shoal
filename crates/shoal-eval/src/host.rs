@@ -15,16 +15,22 @@ impl Evaluator {
             match r.kind {
                 RedirectKind::Out => {
                     let p = self.arg_path(&r.target)?;
+                    // Undo (TDD §9): snapshot the target's prior bytes first, so
+                    // `echo x > f` is reversible exactly like `cp`/`save`.
+                    let undo_pre = self.redirect_undo_pre(&p);
                     self.fs
                         .write(&p, &value_bytes(&value))
                         .map_err(|e| ErrorVal::new("custom", e.to_string()))?;
+                    self.overwrite_undo_post(undo_pre);
                     captured = true;
                 }
                 RedirectKind::Append => {
                     let p = self.arg_path(&r.target)?;
+                    let undo_pre = self.redirect_undo_pre(&p);
                     self.fs
                         .append(&p, &value_bytes(&value))
                         .map_err(|e| ErrorVal::new("custom", e.to_string()))?;
+                    self.overwrite_undo_post(undo_pre);
                     captured = true;
                 }
                 RedirectKind::In => {}
@@ -103,7 +109,7 @@ impl Evaluator {
             },
             Span::default(),
         );
-        self.save_undo_post(undo_pre);
+        self.overwrite_undo_post(undo_pre);
         result
     }
 
