@@ -123,19 +123,22 @@ impl LanguageServer for Backend {
 
 /// Language keywords the parser special-cases beyond `shoal_syntax::lexer::
 /// RESERVED`: `with`/`spawn` (statement forms) and the `sh { }` verbatim escape
-/// hatch. Builtin *command* heads are NOT listed here — they come from
-/// shoal-eval's `builtin_names()` registry so this file can't drift from eval.
+/// hatch. Builtin *command* heads are NOT listed here — they come from the
+/// canonical [`builtin_names`](shoal_syntax::commands::builtin_names) registry so
+/// this file can't drift from the evaluator's own command-head vocabulary.
 const EXTRA_KEYWORDS: &[&str] = &["with", "spawn", "sh"];
 
 /// The static completion vocabulary: language keywords (the parser's reserved
-/// set plus [`EXTRA_KEYWORDS`]) ∪ builtin command heads (shoal-eval's canonical
-/// [`builtin_names`](shoal_eval::builtin_names) registry). Document-local
-/// declarations are layered on top per-request in `completion`.
+/// set plus [`EXTRA_KEYWORDS`]) ∪ builtin command heads (the canonical
+/// [`builtin_names`](shoal_syntax::commands::builtin_names) registry, which lives
+/// in the leaf `shoal-syntax` crate and is the same list the evaluator dispatches
+/// on). Document-local declarations are layered on top per-request in
+/// `completion`.
 fn base_vocabulary() -> impl Iterator<Item = &'static str> {
     shoal_syntax::lexer::RESERVED
         .iter()
         .chain(EXTRA_KEYWORDS)
-        .chain(shoal_eval::builtin_names())
+        .chain(shoal_syntax::commands::builtin_names())
         .copied()
 }
 fn help(w: &str) -> Option<&'static str> {
@@ -238,8 +241,9 @@ mod tests {
         for kw in ["let", "fn", "match", "with", "spawn", "sh"] {
             assert!(vocab.contains(&kw), "missing keyword `{kw}`");
         }
-        // Builtin command heads sourced from shoal-eval's registry, including
-        // ones the old hand-copied WORDS list omitted.
+        // Builtin command heads sourced from the canonical
+        // `shoal_syntax::commands` registry (the same list eval dispatches on),
+        // including ones the old hand-copied WORDS list omitted.
         for head in ["cd", "ls", "reef", "jobs", "history", "undo", "plan"] {
             assert!(vocab.contains(&head), "missing builtin `{head}`");
         }

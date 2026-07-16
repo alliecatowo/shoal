@@ -14,9 +14,11 @@ Tier 0 — leaf (no shoal-* deps):
 
 Tier 1 — depend only on Tier 0:
   shoal-value   → ast
-  shoal-syntax  → ast
+  shoal-syntax  → ast    (also owns the canonical builtin command-head registry —
+                          `shoal_syntax::commands::builtin_names()` — see note below)
   shoal-exec    → leash    (NOT a leaf — see note below)
   shoal-history → journal
+  shoal-lsp     → syntax
 
 Tier 2 — depend on Tier 0/1:
   shoal-adapters → ast, value
@@ -28,7 +30,6 @@ Tier 3 — the domain core:
 Tier 4 — composition roots (daemon + tools):
   shoal-doctor → adapters, journal, leash
   shoal-kernel → ast, auth, eval, exec, journal, leash, proto, syntax, value
-  shoal-lsp    → syntax, eval
 
 Tier 5 — entrypoints (binaries):
   shoal        → adapters, ast, config, doctor, eval, prompt, syntax, value
@@ -37,13 +38,14 @@ Tier 5 — entrypoints (binaries):
                           shoal-mcp itself has zero shoal-* deps in `[dependencies]` (talks to
                           shoal-kernel's socket over the wire protocol, not via Rust linkage —
                           shoal-kernel/shoal-proto appear only as `[dev-dependencies]`, for its
-                          own integration tests). shoal-lsp, by contrast, DOES link shoal-* crates:
-                          shoal-syntax (parse/format/diagnostics) and — as of the builtin-registry
-                          unification — shoal-eval, for its canonical `builtin_names()` command-head
-                          registry, so LSP completion shares one source of truth with the evaluator
-                          instead of a hand-copied word list. This lifts shoal-lsp from Tier 1 to
-                          Tier 4 (it now sits above shoal-eval in the DAG); it remains acyclic —
-                          shoal-eval never depends on shoal-lsp.
+                          own integration tests). shoal-lsp links only shoal-syntax (Tier 1) —
+                          parse/format/diagnostics plus the canonical `builtin_names()` command-head
+                          registry that now lives in `shoal_syntax::commands`, so LSP completion
+                          shares one source of truth with the evaluator without pulling shoal-eval
+                          into the DAG. (The registry used to live in shoal-eval, which briefly
+                          lifted shoal-lsp to Tier 4; hoisting the list into the leaf shoal-syntax
+                          crate — which every consumer already links — dropped that edge and put
+                          shoal-lsp back at Tier 1.)
   shoal-kernel  — the long-lived per-user daemon (TDD §10); MCP/LSP/agent/human clients
                   attach to its socket. Independent of the `shoal` binary at the Cargo-dep
                   level (`shoal` never depends on or spawns `shoal-kernel`) — the two are

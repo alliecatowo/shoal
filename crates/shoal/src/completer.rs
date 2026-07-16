@@ -22,7 +22,7 @@ use std::time::SystemTime;
 
 use reedline::{Completer, Span as RlSpan, Suggestion};
 use shoal_adapters::{AdapterCatalog, CmdAdapter};
-use shoal_eval::builtin_names;
+use shoal_syntax::commands::builtin_names;
 use shoal_syntax::lexer::RESERVED;
 use shoal_syntax::{Lexer, Mode, Tok};
 use shoal_value::{Env, Value, method_names};

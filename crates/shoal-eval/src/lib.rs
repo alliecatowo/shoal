@@ -27,7 +27,6 @@ mod script;
 mod stmt;
 mod streams;
 
-pub use builtins::builtin_names;
 pub use channels::{EventBus, EventForwarder};
 pub(crate) use coerce::coerce_word;
 pub use reef::{PromptReefBinding, PromptReefSnapshot};

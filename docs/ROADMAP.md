@@ -159,14 +159,17 @@ tightening continued incrementally (see root `Cargo.toml`'s `[workspace.metadata
 live-violation-tracked remainder — `use_self`, `unused_qualifications`, etc. — each with a documented
 reason it isn't enabled yet).
 
-**Done (partial): the builtin-identity half.** `crates/shoal-eval/src/builtins.rs` now holds one
-canonical registry (`NAMES` + `SPECIAL_HEADS`, exposed via `pub fn builtin_names()`) that `is_builtin`/
-`is_special_head`/`is_command_name` all derive from, instead of hand-copied lists drifting across
-dispatch sites. The completer, syntax highlighter, and `shoal-lsp` (which gained a `shoal-eval`
-dependency for this, moving it from Tier 1 to Tier 4 — see `docs/CONTRACTS.md`'s crate-dependency
-DAG) now consume that same list, so every real builtin tab-completes/highlights consistently and a
-new head can't silently skip one of the four consumers (`refactor: one canonical builtin-command
-registry + method-name completion`).
+**Done (partial): the builtin-identity half.** The leaf crate `shoal-syntax` now holds one
+canonical registry (`NAMES` + `SPECIAL_HEADS`, exposed via `shoal_syntax::commands::builtin_names()`
+plus `is_builtin`/`is_special_head`) that eval's `is_command_name`/dispatch derive from (re-exporting
+the two predicates through `builtins`), instead of hand-copied lists drifting across dispatch sites.
+The completer, syntax highlighter, and `shoal-lsp` all consume that same list, so every real builtin
+tab-completes/highlights consistently and a new head can't silently skip one of the four consumers
+(`refactor: one canonical builtin-command registry + method-name completion`). The list first landed
+in `shoal-eval`, which forced `shoal-lsp` to depend on the whole evaluator (Tier 1 → Tier 4); a
+follow-up hoisted it into `shoal-syntax` — the leaf every consumer already links — so `shoal-lsp`
+dropped its `shoal-eval` dep and returned to Tier 1 (`refactor: move builtin registry to shoal-syntax
+so shoal-lsp drops its shoal-eval dep`; see `docs/CONTRACTS.md`'s crate-dependency DAG).
 
 **Not done**: the broader command-*resolution* unification — collapsing fn/alias/reef/adapter/PATH
 lookup into one `resolve.rs` returning `enum { Builtin, Adapter, External, Interpreter }`. Grep
