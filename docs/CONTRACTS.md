@@ -228,6 +228,9 @@ pub fn spawn_capture_sandboxed(spec: ExecSpec, cancel: &CancelToken, sandbox: sh
 // and lets the owner send keystrokes + read the RENDERED screen. Same no-leak reaping discipline
 // as job control (own session/pgroup leader, reaped via waitpid, idempotent teardown). Spawn goes
 // through ExecSpec::sandbox (leash confinement) exactly like run(). cols/rows clamped to 1..=1000.
+// The kernel host wraps these into the wire surface (AGENT-SURFACE §10): pty.open/send/read/resize/
+// close, plus pty.list {} → {ptys:[{pty_id,cmd,pid,cols,rows,alive}]} (session-scoped; backs the
+// shoal://pty resource root, with shoal://pty/{id} = one session's rendered screen via pty.read).
 pub const PTY_DEFAULT_COLS: u16; pub const PTY_DEFAULT_ROWS: u16;  // 80, 24
 pub const PTY_MAX_COLS: u16;     pub const PTY_MAX_ROWS: u16;      // 1000, 1000
 
@@ -253,6 +256,10 @@ impl PtySession {
     pub fn send(&mut self, bytes: &[u8]) -> std::io::Result<()>;    // write keystrokes to the master
     pub fn resize(&mut self, cols: u16, rows: u16) -> std::io::Result<()>;
     pub fn read_screen(&mut self) -> ScreenSnapshot;               // opportunistically reaps a self-exited child
+    pub fn alive(&mut self) -> bool;                               // like read_screen's reap, but NO grid snapshot / no
+                                                                   // `changed`-hash touch — for enumerating open ptys
+                                                                   // (kernel pty.list / shoal://pty) without consuming
+                                                                   // the `changed` signal a later read_screen owes
     pub fn close(&mut self) -> (Option<i32>, Option<String>);      // terminate + reap; idempotent; Drop is a backstop
 }
 // The key-name protocol's byte encoding (terminal-domain half; the kernel decodes the JSON shape):

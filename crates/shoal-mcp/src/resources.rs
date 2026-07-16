@@ -24,6 +24,11 @@ impl Facade {
                 "reef",
                 "Session reef resolution state (active scope + tool bindings)",
             ),
+            resource_entry(
+                "shoal://pty",
+                "pty",
+                "Open interactive PTY sessions (drill in via shoal://pty/{id})",
+            ),
         ];
         // Dynamic: open/recent tasks become live resources.
         if let Ok(tasks) = self.kernel.call("task.list", json!({}))
@@ -48,6 +53,23 @@ impl Facade {
                         &uri,
                         plan_ref,
                         "A derived plan: effects, reversibility, verdict",
+                    ));
+                }
+            }
+        }
+        // Dynamic: open interactive ptys this session opened become live
+        // resources — `shoal://pty/{id}` drills into one's rendered screen,
+        // mirroring how a task/plan becomes an addressable noun.
+        if let Ok(ptys) = self.kernel.call("pty.list", json!({}))
+            && let Some(array) = ptys.get("ptys").and_then(Value::as_array)
+        {
+            for pty in array {
+                if let Some(id) = pty.get("pty_id").and_then(Value::as_str) {
+                    let uri = short_ref_to_uri(id);
+                    resources.push(resource_entry(
+                        &uri,
+                        id,
+                        "An open interactive PTY session (rendered screen)",
                     ));
                 }
             }
@@ -202,6 +224,7 @@ pub(crate) fn resource_templates() -> Value {
         {"uriTemplate":"shoal://task/{id}/out{?path,slice,format}","name":"task-output","description":"A task's captured output, drillable by field-path/slice","mimeType":"application/json"},
         {"uriTemplate":"shoal://plan/{ref}","name":"plan","description":"A derived plan: effects, reversibility, verdict","mimeType":"application/json"},
         {"uriTemplate":"shoal://session/{view}","name":"session-view","description":"A session state view: cwd | env | reef","mimeType":"application/json"},
+        {"uriTemplate":"shoal://pty/{id}","name":"pty-screen","description":"An open interactive PTY session's rendered screen (same shape as pty.read)","mimeType":"application/json"},
         {"uriTemplate":"shoal://journal{?since,until,head,principal,ok,effects,limit}","name":"journal","description":"The structured execution journal","mimeType":"application/json"},
         {"uriTemplate":"shoal://events/{channel}{?since,limit}","name":"events","description":"A cursor-read event channel","mimeType":"application/json"}
     ]})
@@ -301,6 +324,25 @@ impl ParsedUri {
                     .ok_or("shoal://task/{id} needs an id")?;
                 Ok(("task.get", json!({ "task": format!("task:{id}") })))
             }
+            "pty" => match self.segments.first() {
+                // `shoal://pty` → the session's open pty list (same data as the
+                // `pty.list` wire method / `shoal_pty_list` tool).
+                None => Ok(("pty.list", json!({}))),
+                // `shoal://pty/{id}` → that pty's rendered screen (same shape
+                // `pty.read` returns). The URI form drops the `pty:` prefix
+                // (`pty:{id}` → `shoal://pty/{id}`); the kernel keys live ptys
+                // on the full `pty:{id}` ref, so restore it. Tolerate a caller
+                // that passes the full ref back verbatim. A closed/unknown id
+                // surfaces the kernel's clean UNKNOWN_PTY not-found.
+                Some(id) => {
+                    let pty_ref = if id.starts_with("pty:") {
+                        id.clone()
+                    } else {
+                        format!("pty:{id}")
+                    };
+                    Ok(("pty.read", json!({ "pty_id": pty_ref })))
+                }
+            },
             "jobs" => Ok(("task.list", json!({}))),
             "journal" => Ok((
                 "journal.query",
@@ -406,5 +448,23 @@ mod tests {
         let (method, params) = plan.to_kernel_call().unwrap();
         assert_eq!(method, "plan.get");
         assert_eq!(params["plan_ref"], "plan:deadbeef00112233");
+
+        // `shoal://pty` enumerates; `shoal://pty/{id}` reads one rendered
+        // screen, restoring the `pty:` ref prefix the URI form drops.
+        let pty_root = ParsedUri::parse("shoal://pty").unwrap();
+        let (method, params) = pty_root.to_kernel_call().unwrap();
+        assert_eq!(method, "pty.list");
+        assert_eq!(params, json!({}));
+        let pty_one = ParsedUri::parse("shoal://pty/3").unwrap();
+        let (method, params) = pty_one.to_kernel_call().unwrap();
+        assert_eq!(method, "pty.read");
+        assert_eq!(params["pty_id"], "pty:3");
+        // A caller that passes the full ref back verbatim is tolerated.
+        let pty_full = ParsedUri::parse("shoal://pty/pty:3").unwrap();
+        let (_, params) = pty_full.to_kernel_call().unwrap();
+        assert_eq!(params["pty_id"], "pty:3");
+        // A pty URI is not subscribable (the push event is a documented
+        // follow-up, not wired here).
+        assert!(pty_one.event_channel().is_none());
     }
 }

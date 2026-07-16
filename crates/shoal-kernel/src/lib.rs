@@ -1446,6 +1446,103 @@ mod tests {
         thread.join().unwrap();
     }
 
+    /// AGENT-SURFACE §10 (`pty.list` / `shoal://pty`): open PTY sessions are
+    /// first-class and session-scoped. A pty opened by session A is enumerated
+    /// by A's `pty.list`, is invisible to a DIFFERENT session B (both the list
+    /// and a direct `pty.read` of A's ref — an opaque `UNKNOWN_PTY`), and
+    /// leaves A's list once closed. Drives a real `cat` on a PTY like the live
+    /// MCP test, over the same Unix-socket wire production uses.
+    #[test]
+    fn pty_list_is_session_scoped() {
+        let kernel = Kernel::new();
+        // Session A on connection one.
+        let (mut a, server) = UnixStream::pair().unwrap();
+        let mut a_reader = BufReader::new(a.try_clone().unwrap());
+        let ka = kernel.clone();
+        let ta = std::thread::spawn(move || ka.handle_stream(server).unwrap());
+        call(
+            &mut a,
+            &mut a_reader,
+            1,
+            "session.attach",
+            json!({"session":"A","client":{"kind":"agent","tty":false}}),
+        );
+        let opened = call(&mut a, &mut a_reader, 2, "pty.open", json!({"cmd":"cat"}));
+        let pty_id = opened.result.unwrap()["pty_id"]
+            .as_str()
+            .expect("pty.open returns a pty_id")
+            .to_owned();
+
+        // A sees exactly its one pty, with the documented shape.
+        let list_a = call(&mut a, &mut a_reader, 3, "pty.list", json!({}));
+        let ptys_a = list_a.result.unwrap()["ptys"].as_array().unwrap().clone();
+        assert_eq!(ptys_a.len(), 1, "session A sees its one pty: {ptys_a:?}");
+        assert_eq!(ptys_a[0]["pty_id"], json!(pty_id));
+        assert_eq!(ptys_a[0]["cmd"], "cat");
+        assert_eq!(ptys_a[0]["alive"], true);
+        assert!(ptys_a[0]["pid"].as_u64().unwrap() > 0);
+        assert!(ptys_a[0]["cols"].as_u64().unwrap() > 0);
+        assert!(ptys_a[0]["rows"].as_u64().unwrap() > 0);
+
+        // Session B on a second connection: a different session must NOT see
+        // A's ptys, and cannot read A's pty by ref (opaque not-found).
+        let (mut b, server) = UnixStream::pair().unwrap();
+        let mut b_reader = BufReader::new(b.try_clone().unwrap());
+        let kb = kernel.clone();
+        let tb = std::thread::spawn(move || kb.handle_stream(server).unwrap());
+        call(
+            &mut b,
+            &mut b_reader,
+            1,
+            "session.attach",
+            json!({"session":"B","client":{"kind":"agent","tty":false}}),
+        );
+        let list_b = call(&mut b, &mut b_reader, 2, "pty.list", json!({}));
+        assert!(
+            list_b.result.unwrap()["ptys"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "session B must not see session A's ptys"
+        );
+        let read_b = call(
+            &mut b,
+            &mut b_reader,
+            3,
+            "pty.read",
+            json!({"pty_id": pty_id}),
+        );
+        assert_eq!(
+            read_b.error.expect("B cannot read A's pty").code,
+            UNKNOWN_PTY,
+            "another session's pty ref is an opaque UNKNOWN_PTY"
+        );
+
+        // Closing from A drops it out of A's list.
+        call(
+            &mut a,
+            &mut a_reader,
+            4,
+            "pty.close",
+            json!({"pty_id": pty_id}),
+        );
+        let list_a2 = call(&mut a, &mut a_reader, 5, "pty.list", json!({}));
+        assert!(
+            list_a2.result.unwrap()["ptys"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "a closed pty must leave pty.list"
+        );
+
+        drop(a);
+        drop(a_reader);
+        ta.join().unwrap();
+        drop(b);
+        drop(b_reader);
+        tb.join().unwrap();
+    }
+
     // -----------------------------------------------------------------------
     // The elision rule (AGENT-SURFACE §3).
     // -----------------------------------------------------------------------
