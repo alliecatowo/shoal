@@ -38,6 +38,7 @@
 mod cancel;
 mod capture;
 mod pty;
+mod pty_session;
 mod sandbox;
 mod status;
 mod watcher;
@@ -51,7 +52,25 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 pub use cancel::CancelToken;
 pub use capture::{StreamingChild, spawn_capture};
 pub use pty::{PtyJob, shutdown_stopped_jobs, take_stopped_job};
+pub use pty_session::{
+    PTY_DEFAULT_COLS, PTY_DEFAULT_ROWS, PTY_MAX_COLS, PTY_MAX_ROWS, PtyOpenSpec, PtySession,
+    ScreenSnapshot, named_key,
+};
 pub use which::which;
+
+/// Resolve `argv[0]` (an absolute path as-is, or a bare name via the `PATH`
+/// entry of `env`) and return the blake3-hex of its on-disk bytes — the same
+/// digest `shoal_reef::hashcache::hash_bytes` / `shoal_leash::preflight_spawn`
+/// produce, so a `proc_spawn` pin an author copies from `reef`/`which` compares
+/// equal. `None` when the binary can't be located or read. Used by kernel hosts
+/// to build the [`shoal_leash::Effect::ProcSpawn`] `bin_hash` for the PTY-open
+/// spawn gate without re-implementing resolution/hashing.
+#[must_use]
+pub fn resolve_and_hash(argv: &[OsString], env: &[(OsString, OsString)]) -> Option<String> {
+    let program = which::resolve_program(argv, env).ok()?;
+    let bytes = std::fs::read(&program).ok()?;
+    Some(blake3::hash(&bytes).to_hex().to_string())
+}
 
 /// Default hard cap on the bytes buffered in memory when capturing a command's
 /// output in value position (TDD §317). Once a captured buffer reaches this

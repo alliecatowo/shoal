@@ -135,6 +135,13 @@ pub mod error_code {
     pub const TASK_CONTROL_UNAVAILABLE: i32 = -32020;
     /// The named `task` ref is unknown, or belongs to another session.
     pub const UNKNOWN_TASK: i32 = -32021;
+    /// The named `pty_id` (`pty.send`/`pty.read`/`pty.resize`/`pty.close`) is
+    /// unknown, already closed, or belongs to another session.
+    pub const UNKNOWN_PTY: i32 = -32022;
+    /// A `pty.open` could not spawn the requested program on a PTY — the
+    /// program was not resolvable, the sandbox could not be applied, or PTY/
+    /// spawn plumbing failed (the underlying `io::Error` travels in the message).
+    pub const PTY_SPAWN_FAILED: i32 = -32023;
     /// Bearer-token authentication failed on `session.attach`: either this
     /// kernel has no `TokenStore` configured at all (an ephemeral kernel),
     /// or the given token is missing/expired/revoked.
@@ -443,6 +450,46 @@ pub struct ElideSpec {
 pub struct TaskParams {
     pub task: Ref,
 }
+/// `pty.open` (AGENT-SURFACE §10): spawn an interactive program on a real PTY
+/// as a long-lived, keyed kernel session with a `vt100`-rendered screen.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PtyOpenParams {
+    pub cmd: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub cols: Option<u16>,
+    #[serde(default)]
+    pub rows: Option<u16>,
+    /// Extra environment overrides layered onto the session's environment.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+}
+
+/// `pty.read`/`pty.close` — identify a live PTY session by its `pty:{id}` ref.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PtyRefParams {
+    pub pty_id: Ref,
+}
+
+/// `pty.send` — deliver input to a PTY. `input` accepts a raw string, an
+/// object (`{"key":"Enter"}` / `{"text":"…"}` / `{"bytes":"<base64>"}`), or an
+/// array mixing those, so an agent can express "type `i`, `hello`, Escape,
+/// `:wq`, Enter" in one call (the key-name protocol; AGENT-SURFACE §10).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PtySendParams {
+    pub pty_id: Ref,
+    pub input: Value,
+}
+
+/// `pty.resize` — change a live PTY's window size (and its emulator grid).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PtyResizeParams {
+    pub pty_id: Ref,
+    pub cols: u16,
+    pub rows: u16,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskRecord {
     pub task: Ref,
@@ -628,6 +675,8 @@ mod tests {
         assert_eq!(UNKNOWN_PLAN, -32012);
         assert_eq!(TASK_CONTROL_UNAVAILABLE, -32020);
         assert_eq!(UNKNOWN_TASK, -32021);
+        assert_eq!(UNKNOWN_PTY, -32022);
+        assert_eq!(PTY_SPAWN_FAILED, -32023);
         assert_eq!(AUTH_FAILED, -32030);
     }
 }

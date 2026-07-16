@@ -736,3 +736,113 @@ fn read_frame_raw(reader: &mut BufReader<UnixStream>) -> Value {
     reader.read_line(&mut line).unwrap();
     serde_json::from_str(&line).unwrap()
 }
+
+// ---------------------------------------------------------------------------
+// AGENT-SURFACE §10: an agent drives an interactive PTY program over the wire
+// and reads back a rendered screen (never a byte wall).
+// ---------------------------------------------------------------------------
+
+/// `true` once `pid` is no longer a live process — `kill(pid, 0)` → `ESRCH`.
+/// The OS-level no-leak proof: after `pty.close` the child must be reaped.
+#[allow(clippy::cast_possible_wrap)] // pids fit in i32 in practice
+fn process_is_gone(pid: u32) -> bool {
+    let pid = pid as libc::pid_t;
+    // SAFETY: signal 0 is the POSIX existence probe; it delivers nothing.
+    unsafe {
+        libc::kill(pid, 0) == -1
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    }
+}
+
+/// The full vertical slice over a REAL kernel + socket through the MCP facade:
+/// open an interactive `cat` on a PTY, type a line + a named `Enter`, poll the
+/// RENDERED screen until the echoed text appears at a moved cursor, then close
+/// and prove the child was reaped (no leaked process). `cat` is deterministic
+/// and present on every host: the tty line discipline echoes typed characters
+/// and `cat` writes each completed line back, so the emulator's screen grid
+/// carries the text — exercising open → send(named key) → read(rendered
+/// screen) → close → reap end-to-end.
+#[test]
+fn mcp_pty_drive_cat_reads_rendered_screen_then_closes_and_reaps() {
+    let live = LiveKernel::start();
+    let mut facade = Facade::connect(&live.config()).unwrap();
+
+    // Open an interactive program on a 40x10 terminal.
+    let opened = call_tool(
+        &mut facade,
+        "shoal_pty_open",
+        json!({"cmd":"cat","cols":40,"rows":10}),
+    );
+    assert_ne!(opened["isError"], true, "pty.open must succeed: {opened}");
+    let sc = &opened["structuredContent"];
+    let pty_id = sc["pty_id"].as_str().expect("pty.open returns a pty_id");
+    assert!(pty_id.starts_with("pty:"), "pty_id shape: {pty_id}");
+    assert_eq!(sc["cols"], 40, "the requested size took: {sc}");
+    assert_eq!(sc["rows"], 10);
+    let pid = sc["pid"].as_u64().expect("pty.open returns the child pid") as u32;
+    let pty_id = pty_id.to_string();
+
+    // Type text then a NAMED Enter key — the key-name protocol, mixed in one
+    // send as an array.
+    let sent = call_tool(
+        &mut facade,
+        "shoal_pty_send",
+        json!({"pty_id": pty_id, "input": ["hello-pty", {"key":"Enter"}]}),
+    );
+    assert_ne!(sent["isError"], true, "pty.send must succeed: {sent}");
+
+    // Poll the RENDERED screen until the echoed line shows up. The screen is a
+    // bounded array of text rows — no escape bytes.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let read = loop {
+        let read = call_tool(&mut facade, "shoal_pty_read", json!({"pty_id": pty_id}));
+        assert_ne!(read["isError"], true, "pty.read must succeed: {read}");
+        let rsc = &read["structuredContent"];
+        let screen = rsc["screen"]
+            .as_array()
+            .expect("screen is an array of rows");
+        assert_eq!(screen.len(), 10, "screen has exactly `rows` rows: {rsc}");
+        if screen
+            .iter()
+            .any(|row| row.as_str().is_some_and(|r| r.contains("hello-pty")))
+        {
+            break read;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "rendered screen never showed the echoed line: {rsc}"
+        );
+        std::thread::sleep(Duration::from_millis(30));
+    };
+    let rsc = &read["structuredContent"];
+    // The cursor advanced off row 0 — the emulator tracked the newline, proving
+    // it is a real terminal emulator, not a raw byte passthrough.
+    assert!(
+        rsc["cursor"]["row"].as_u64().unwrap() >= 1,
+        "cursor should have moved down after the newline: {rsc}"
+    );
+    assert_eq!(rsc["alive"], true, "cat is still running");
+    assert_eq!(rsc["exit"], Value::Null, "an alive pty has a null exit");
+
+    // Close terminates + reaps; the child must actually be gone (no leak).
+    let closed = call_tool(&mut facade, "shoal_pty_close", json!({"pty_id": pty_id}));
+    assert_eq!(
+        closed["structuredContent"]["closed"], true,
+        "closed: {closed}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !process_is_gone(pid) {
+        assert!(
+            Instant::now() < deadline,
+            "the pty child must be reaped after pty.close — leaked pid {pid}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // A read on the now-closed pty is a clean not-found, not a hang/crash.
+    let after = call_tool(&mut facade, "shoal_pty_read", json!({"pty_id": pty_id}));
+    assert_eq!(
+        after["isError"], true,
+        "reading a closed pty is an error: {after}"
+    );
+}

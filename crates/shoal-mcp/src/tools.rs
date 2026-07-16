@@ -70,6 +70,41 @@ fn map_tool(name: &str, args: Value) -> Result<(&'static str, Value), String> {
             "cap.request",
             json!({"plan_ref":required_str(object,"plan_ref")?,"effects":object.get("effects").cloned().unwrap_or_else(||json!([]))}),
         ),
+        // Interactive-PTY surface (AGENT-SURFACE §10): drive a real TUI/REPL
+        // over the wire and read back a rendered screen.
+        "shoal_pty_open" => (
+            "pty.open",
+            json!({
+                "cmd": required_str(object,"cmd")?,
+                "args": object.get("args").cloned().unwrap_or_else(||json!([])),
+                "cols": object.get("cols"),
+                "rows": object.get("rows"),
+                "env": object.get("env").cloned().unwrap_or_else(||json!({})),
+            }),
+        ),
+        "shoal_pty_send" => (
+            "pty.send",
+            json!({
+                "pty_id": required_str(object,"pty_id")?,
+                "input": object.get("input").cloned().unwrap_or(Value::Null),
+            }),
+        ),
+        "shoal_pty_read" => (
+            "pty.read",
+            json!({"pty_id": required_str(object,"pty_id")?}),
+        ),
+        "shoal_pty_resize" => (
+            "pty.resize",
+            json!({
+                "pty_id": required_str(object,"pty_id")?,
+                "cols": object.get("cols"),
+                "rows": object.get("rows"),
+            }),
+        ),
+        "shoal_pty_close" => (
+            "pty.close",
+            json!({"pty_id": required_str(object,"pty_id")?}),
+        ),
         _ => return Err(format!("unknown tool {name:?}")),
     })
 }
@@ -193,6 +228,31 @@ pub fn tools() -> Vec<Value> {
             "Request grant/approval for a plan stuck at approval_pending; effects scope the grant",
             json!({"type":"object","properties":{"plan_ref":{"type":"string"},"effects":{"type":"array"}},"required":["plan_ref"],"additionalProperties":false}),
         ),
+        tool(
+            "shoal_pty_open",
+            "Spawn an interactive program (vim, an installer, a REPL, any TUI) on a real terminal and return a pty_id to drive it. Then use shoal_pty_send to type and shoal_pty_read to see the rendered screen. Leash-gated like any spawn.",
+            json!({"type":"object","properties":{"cmd":{"type":"string","description":"program to run, e.g. \"vim\", \"python3\", \"sh\""},"args":{"type":"array","items":{"type":"string"}},"cols":{"type":"integer","minimum":1,"maximum":1000},"rows":{"type":"integer","minimum":1,"maximum":1000},"env":{"type":"object","additionalProperties":{"type":"string"}}},"required":["cmd"],"additionalProperties":false}),
+        ),
+        tool(
+            "shoal_pty_send",
+            "Send keystrokes to a pty. `input` is a string (typed verbatim), a named key like {\"key\":\"Enter\"}/{\"key\":\"Escape\"}/{\"key\":\"Ctrl-C\"}, or an ARRAY mixing them, e.g. [\"i\",\"hello\",{\"key\":\"Escape\"},\":wq\",{\"key\":\"Enter\"}]. Named keys: Enter, Tab, Escape, Backspace, Delete, Space, Up/Down/Left/Right, Home, End, PageUp/PageDown, F1-F12, Ctrl-<letter>.",
+            json!({"type":"object","properties":{"pty_id":{"type":"string"},"input":{"description":"string | {key|text|bytes} object | array of those"}},"required":["pty_id","input"],"additionalProperties":false}),
+        ),
+        tool(
+            "shoal_pty_read",
+            "Read a pty's RENDERED screen: `screen` is an array of text rows (bounded by cols×rows), plus cursor {row,col,hidden}, a `changed` bit (did the screen change since your last read), `alive`, and `exit`. Never returns raw escape bytes.",
+            json!({"type":"object","properties":{"pty_id":{"type":"string"}},"required":["pty_id"],"additionalProperties":false}),
+        ),
+        tool(
+            "shoal_pty_resize",
+            "Resize a pty's terminal window (and its emulator grid)",
+            json!({"type":"object","properties":{"pty_id":{"type":"string"},"cols":{"type":"integer","minimum":1,"maximum":1000},"rows":{"type":"integer","minimum":1,"maximum":1000}},"required":["pty_id","cols","rows"],"additionalProperties":false}),
+        ),
+        tool(
+            "shoal_pty_close",
+            "Terminate and reap a pty session (no process is left running)",
+            json!({"type":"object","properties":{"pty_id":{"type":"string"}},"required":["pty_id"],"additionalProperties":false}),
+        ),
     ]
 }
 fn tool(name: &str, description: &str, input_schema: Value) -> Value {
@@ -211,7 +271,9 @@ mod tests {
             .collect();
         assert!(names.contains(&"shoal_cancel".to_string()));
         assert!(names.contains(&"shoal_exec".to_string()));
-        assert_eq!(tools().len(), 7);
+        assert!(names.contains(&"shoal_pty_open".to_string()));
+        assert!(names.contains(&"shoal_pty_read".to_string()));
+        assert_eq!(tools().len(), 12);
         for t in tools() {
             assert_eq!(t["inputSchema"]["type"], "object")
         }
@@ -241,6 +303,37 @@ mod tests {
                 .unwrap()
                 .0,
             "cap.request"
+        );
+        assert_eq!(
+            map_tool("shoal_pty_open", json!({"cmd":"cat"})).unwrap().0,
+            "pty.open"
+        );
+        assert_eq!(
+            map_tool("shoal_pty_send", json!({"pty_id":"pty:1","input":"x"}))
+                .unwrap()
+                .0,
+            "pty.send"
+        );
+        assert_eq!(
+            map_tool("shoal_pty_read", json!({"pty_id":"pty:1"}))
+                .unwrap()
+                .0,
+            "pty.read"
+        );
+        assert_eq!(
+            map_tool(
+                "shoal_pty_resize",
+                json!({"pty_id":"pty:1","cols":80,"rows":24})
+            )
+            .unwrap()
+            .0,
+            "pty.resize"
+        );
+        assert_eq!(
+            map_tool("shoal_pty_close", json!({"pty_id":"pty:1"}))
+                .unwrap()
+                .0,
+            "pty.close"
         );
     }
     #[test]

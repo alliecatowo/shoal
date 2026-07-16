@@ -10,6 +10,7 @@ libc = "0.2.186"
 portable-pty = "0.9.0"
 shoal-leash = { path = "../shoal-leash" }
 tempfile = "3"
+vt100 = "0.16.2"
 [dev-dependencies]
 criterion="0.7"
 tempfile="3"

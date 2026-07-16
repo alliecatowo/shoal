@@ -3,6 +3,7 @@
 mod dispatch;
 mod eventbus;
 mod handlers_exec;
+mod handlers_pty;
 mod handlers_session;
 mod handlers_task;
 mod handlers_value;
@@ -51,6 +52,12 @@ pub struct Kernel {
     plans: Mutex<HashMap<String, StoredPlan>>,
     tasks: Mutex<HashMap<Ref, Arc<TaskEntry>>>,
     next_task: AtomicU64,
+    /// Long-lived interactive PTY sessions (AGENT-SURFACE §10), keyed by their
+    /// `pty:{id}` ref like `tasks`. Each holds a live child on a real PTY plus
+    /// its `vt100` emulator; scoped to the session that opened it. Dropped (and
+    /// so terminated + reaped) on `pty.close` or when the kernel is dropped.
+    ptys: Mutex<HashMap<Ref, Arc<PtyEntry>>>,
+    next_pty: AtomicU64,
     auth: Option<Mutex<TokenStore>>,
     events: Arc<EventBus>,
 }
@@ -76,6 +83,19 @@ struct TaskInner {
     error: Option<RpcError>,
 }
 
+/// A registered interactive PTY session (AGENT-SURFACE §10). The live
+/// [`shoal_exec::PtySession`] (child + PTY master + `vt100` emulator) sits
+/// behind a `Mutex` so `pty.send`/`pty.read`/`pty.resize`/`pty.close` from
+/// different connections serialize on it. `session_id`/`principal` scope it to
+/// its opener the same way [`TaskEntry`] scopes a task.
+struct PtyEntry {
+    session_id: String,
+    #[allow(dead_code)] // recorded for parity with tasks / future auditing
+    principal: String,
+    cmd: String,
+    session: Mutex<shoal_exec::PtySession>,
+}
+
 struct StoredPlan {
     src: String,
     session: String,
@@ -95,6 +115,8 @@ impl Kernel {
             plans: Mutex::new(HashMap::new()),
             tasks: Mutex::new(HashMap::new()),
             next_task: AtomicU64::new(1),
+            ptys: Mutex::new(HashMap::new()),
+            next_pty: AtomicU64::new(1),
             events: Arc::new(EventBus::default()),
             auth: None,
         })
@@ -111,6 +133,8 @@ impl Kernel {
             plans: Mutex::new(HashMap::new()),
             tasks: Mutex::new(HashMap::new()),
             next_task: AtomicU64::new(1),
+            ptys: Mutex::new(HashMap::new()),
+            next_pty: AtomicU64::new(1),
             events: Arc::new(EventBus::default()),
             auth: Some(Mutex::new(TokenStore::open(state_dir.join("tokens.json"))?)),
         }))
@@ -130,6 +154,8 @@ impl Kernel {
             plans: Mutex::new(HashMap::new()),
             tasks: Mutex::new(HashMap::new()),
             next_task: AtomicU64::new(1),
+            ptys: Mutex::new(HashMap::new()),
+            next_pty: AtomicU64::new(1),
             events: Arc::new(EventBus::default()),
             auth: Some(Mutex::new(TokenStore::open(state_dir.join("tokens.json"))?)),
         }))
@@ -145,6 +171,8 @@ impl Kernel {
             plans: Mutex::new(HashMap::new()),
             tasks: Mutex::new(HashMap::new()),
             next_task: AtomicU64::new(1),
+            ptys: Mutex::new(HashMap::new()),
+            next_pty: AtomicU64::new(1),
             events: Arc::new(EventBus::default()),
             auth: None,
         })
@@ -230,6 +258,23 @@ impl Kernel {
             })
     }
 
+    /// Look up a live PTY session by ref, enforcing that it belongs to the
+    /// calling session (an unknown ref and another session's ref are the same
+    /// opaque not-found, mirroring `task`).
+    fn pty(&self, pty_id: &Ref, session_id: &str) -> Result<Arc<PtyEntry>, RpcError> {
+        let entry = self
+            .ptys
+            .lock()
+            .unwrap()
+            .get(pty_id)
+            .cloned()
+            .ok_or_else(unknown_pty)?;
+        if entry.session_id != session_id {
+            return Err(unknown_pty());
+        }
+        Ok(entry)
+    }
+
     /// The real enforcement truth for `principal` (TDD §8 tier honesty):
     /// `true` only when a genuine OS backend (Landlock/Seatbelt) exists on
     /// this host *and* the policy actually resolves a real sandbox for this
@@ -293,6 +338,13 @@ fn not_attached() -> RpcError {
     RpcError {
         code: NOT_ATTACHED,
         message: "attach to a session first".into(),
+        data: None,
+    }
+}
+fn unknown_pty() -> RpcError {
+    RpcError {
+        code: UNKNOWN_PTY,
+        message: "unknown or closed pty_id".into(),
         data: None,
     }
 }
