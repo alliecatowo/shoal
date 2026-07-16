@@ -1,0 +1,24 @@
+# util-linux `lscpu` (Linux only, like `lsblk`/`findmnt`): no direct macOS
+# equivalent (`sysctl -a` covers similar ground with a wholly different
+# key/value namespace and no JSON mode), so like `ip`/`systemctl` this names
+# a specific ecosystem tool rather than a POSIX-portable one.
+#
+# `-J` wraps its output as `{"lscpu": [{"field": "...", "data": "..."}, ...]}`
+# -- an unusual shape even among this crate's JSON adapters: rather than one
+# object per CPU/property with named keys (`ip -j addr show`'s
+# `{"ifname": ..., "addr_info": ...}` style), every property is a two-column
+# `{field, data}` record in a flat list. This is a `record` envelope
+# (`.lscpu` is the table), same convention as `lsblk.toml`/`findmnt.toml`,
+# but it makes `(lscpu().lscpu).where(.field == "Model name:")` (not a
+# `.model_name`-style direct field lookup) the natural way to query a
+# specific property -- an intentional consequence of `lscpu`'s own
+# field/data-pairs shape, not a shortcoming of this adapter. `field` values
+# retain their trailing colon exactly as `lscpu` prints them (e.g.
+# `"CPU(s):"`), since this adapter passes the real bytes through unaltered
+# rather than reformatting them.
+[cmd.lscpu]
+bin = "lscpu"
+class = "cli"
+ok_codes = [0]
+invoke = ["-J"]
+output = { parse = "json", type = "record" }

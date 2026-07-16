@@ -1,0 +1,23 @@
+# util-linux `findmnt` (Linux only, like `lsblk`/`ss`/`ip`): no macOS
+# equivalent with a JSON output mode. Complements `df.toml` rather than
+# duplicating it -- `df` reports per-filesystem *usage* (size/used/avail as
+# real `size_kb` `Value::Size`s, pinned via `-kP` for a stable numeric
+# shape), while `findmnt` reports the *mount table itself* (source device,
+# fstype, and the full mount option string), information `df` doesn't carry
+# at all. Pinning an explicit `-o` column list (rather than relying on
+# whatever columns a given util-linux build defaults to for `-J`) keeps this
+# adapter's shape stable the same way `df.toml`'s `-kP` and `ps.toml`'s
+# `-o keyword=Header` do.
+#
+# Real `findmnt -J` wraps the mount list in a `{"filesystems": [...]}`
+# envelope with each mount's sub-mounts nested under its own `children`
+# array (a real tree: `/dev`'s children are `/dev/pts`, `/dev/shm`, etc, not
+# a flat list) -- same `record`-not-`table` convention as `lsblk.toml`, and
+# `json_to_value` auto-normalizes each `children` array to a nested `Table`
+# with no special-casing needed here.
+[cmd.findmnt]
+bin = "findmnt"
+class = "cli"
+ok_codes = [0]
+invoke = ["-J", "-o", "TARGET,SOURCE,FSTYPE,OPTIONS"]
+output = { parse = "json", type = "record" }

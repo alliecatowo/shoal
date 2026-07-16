@@ -1,0 +1,42 @@
+# systemd/journald only (Linux): like `systemctl`/`ss`/`ip`, this names a
+# specific ecosystem tool rather than a POSIX-portable one (there is no
+# macOS journald), and fails loudly with "command not found" rather than
+# guessing at a lookalike.
+#
+# `-o json` (one JSON object per journal entry) plus `--no-pager` (journald
+# tools default to launching `less` on an interactive terminal, which would
+# hang a non-interactive adapter invocation waiting on a pager it can never
+# quit -- the same class of fix `git log`/`gh` adapters don't need since
+# neither defaults to a pager) is pinned via `invoke`. `-o json`'s output is
+# genuinely **one JSON object per line**, not one JSON array wrapping every
+# entry -- unlike `systemctl.toml`'s `list-units --output=json` (a single
+# top-level array) -- so this uses `ndjson`, not `json`.
+#
+# `n` (`-n`/`--lines`, defaults to the journal's own default of 10 if
+# unset), `unit` (`-u`, filters to one systemd unit's log lines), `since`
+# (`--since`, e.g. `"1 hour ago"`/an ISO timestamp -- journalctl has no
+# short form for this flag), `priority` (`-p`, a syslog level name or
+# number), and `reverse` (`-r`, newest-first) are the common real filters;
+# none of them touch the pinned `-o json`/`--no-pager` output-shape flags,
+# so unlike `git status`'s `short`/`branch`, nothing here needs `consumed`.
+#
+# journald's JSON export prints every field -- even ones that look numeric,
+# like `_PID`/`__REALTIME_TIMESTAMP` -- as a JSON *string*, never a bare
+# number (confirmed against real `journalctl -o json` output), so the
+# representative fields below are typed `str` throughout rather than `int`;
+# typing them `int` would be a lie the real bytes don't back up (TDD §6).
+# The `ndjson` parser (like `json`) does not consult `output.type` for
+# per-field coercion (see the module doc on `hint_schema`) -- every field
+# journald actually emits survives in the parsed record exactly as-is, not
+# just the subset named here; this hint documents the handful most useful
+# for `.where(...)` filtering; MESSAGE, PRIORITY, and SYSLOG_IDENTIFIER
+# selected as it are almost always present, while _PID and _COMM are not
+# present in kernel-sourced entries (no owning process).
+[cmd.journalctl]
+bin = "journalctl"
+class = "cli"
+ok_codes = [0]
+params = { n = "int?", unit = "str?", since = "str?", priority = "str?", reverse = "bool" }
+flags = { short = { n = "n", u = "unit", p = "priority", r = "reverse" } }
+invoke = ["-o", "json", "--no-pager"]
+output = { parse = "ndjson", type = "table<{MESSAGE: str, PRIORITY: str, SYSLOG_IDENTIFIER: str?, _PID: str?, _COMM: str?, __REALTIME_TIMESTAMP: str}>" }

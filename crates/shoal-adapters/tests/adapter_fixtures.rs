@@ -889,3 +889,275 @@ fn podman_ps_and_images_json_parse_realistic_rows() {
     };
     assert_eq!(rows[0]["Tag"], Value::Str("latest".into()));
 }
+
+// -------------------------------------------------------------- lsblk ----
+
+#[test]
+fn lsblk_json_parses_record_with_nested_children_table() {
+    let c = catalog();
+    let spec = top(&c, "lsblk");
+    assert_eq!(spec.parse, "json");
+    assert_eq!(
+        spec.invoke,
+        Some(vec![
+            "-J".to_string(),
+            "-b".to_string(),
+            "-o".to_string(),
+            "NAME,SIZE,TYPE,MOUNTPOINT,FSTYPE,RM,RO".to_string(),
+        ])
+    );
+
+    // Realistic `lsblk -J -b -o ...` output: a disk with a nested LUKS
+    // partition child, plus a swap device with no children at all.
+    let good = br#"{"blockdevices":[
+        {"name":"zram0","size":8589934592,"type":"disk","mountpoint":"[SWAP]","fstype":"swap","rm":false,"ro":false},
+        {"name":"nvme0n1","size":1000204886016,"type":"disk","mountpoint":null,"fstype":null,"rm":false,"ro":false,
+         "children":[{"name":"nvme0n1p1","size":629145600,"type":"part","mountpoint":"/boot/efi","fstype":"vfat","rm":false,"ro":false}]}
+    ]}"#;
+    let Value::Record(r) = parse(spec, good).expect("realistic lsblk -J -b output must parse")
+    else {
+        panic!("expected record")
+    };
+    let Value::Table(devices) = &r["blockdevices"] else {
+        panic!("expected blockdevices table")
+    };
+    assert_eq!(devices.len(), 2);
+    // `-b` forces SIZE to a bare byte count (a JSON number), not a
+    // human-readable string like "8G" -- the generic `json` parser doesn't
+    // consult `output.type` for coercion (see `hint_schema`'s doc), so this
+    // comes through as a plain `Value::Int`, matching every other
+    // JSON-sourced adapter here (docker/podman/ip/systemctl).
+    assert_eq!(devices[0]["size"], Value::Int(8589934592));
+    assert_eq!(devices[0]["mountpoint"], Value::Str("[SWAP]".into()));
+    // A `null` field (no mountpoint/fstype on a bare disk) survives as
+    // `Value::Null`, not a missing key or a lossy empty string.
+    assert_eq!(devices[1]["mountpoint"], Value::Null);
+    let Value::Table(children) = &devices[1]["children"] else {
+        panic!("expected nested children table")
+    };
+    assert_eq!(children[0]["name"], Value::Str("nvme0n1p1".into()));
+
+    assert_eq!(parse(spec, br#"{"blockdevices": [{"name": "#), None);
+}
+
+// ------------------------------------------------------------- findmnt ----
+
+#[test]
+fn findmnt_json_parses_record_with_nested_children_table() {
+    let c = catalog();
+    let spec = top(&c, "findmnt");
+    assert_eq!(spec.parse, "json");
+    assert_eq!(
+        spec.invoke,
+        Some(vec![
+            "-J".to_string(),
+            "-o".to_string(),
+            "TARGET,SOURCE,FSTYPE,OPTIONS".to_string(),
+        ])
+    );
+
+    let good = br#"{"filesystems":[
+        {"target":"/","source":"/dev/mapper/root","fstype":"btrfs","options":"rw,relatime",
+         "children":[{"target":"/dev","source":"devtmpfs","fstype":"devtmpfs","options":"rw,nosuid"}]}
+    ]}"#;
+    let Value::Record(r) = parse(spec, good).expect("realistic findmnt -J output must parse")
+    else {
+        panic!("expected record")
+    };
+    let Value::Table(mounts) = &r["filesystems"] else {
+        panic!("expected filesystems table")
+    };
+    assert_eq!(mounts[0]["target"], Value::Str("/".into()));
+    let Value::Table(children) = &mounts[0]["children"] else {
+        panic!("expected nested children table")
+    };
+    assert_eq!(children[0]["target"], Value::Str("/dev".into()));
+
+    assert_eq!(parse(spec, br#"{"filesystems": [{"target": "#), None);
+}
+
+// ------------------------------------------------------------ journalctl ----
+
+#[test]
+fn journalctl_ndjson_parses_one_object_per_line_and_degrades_on_bad_line() {
+    let c = catalog();
+    let spec = top(&c, "journalctl");
+    assert_eq!(spec.parse, "ndjson");
+    assert_eq!(
+        spec.invoke,
+        Some(vec![
+            "-o".to_string(),
+            "json".to_string(),
+            "--no-pager".to_string(),
+        ])
+    );
+
+    // Real `journalctl -o json` prints one JSON object per line, not a
+    // single top-level array -- every field (even numeric-looking ones like
+    // `_PID`/`__REALTIME_TIMESTAMP`) comes through as a JSON string.
+    let good = b"{\"MESSAGE\":\"session opened\",\"PRIORITY\":\"6\",\"SYSLOG_IDENTIFIER\":\"sshd\",\"_PID\":\"1234\",\"__REALTIME_TIMESTAMP\":\"1784192741450765\"}\n\
+                 {\"MESSAGE\":\"session closed\",\"PRIORITY\":\"6\",\"_COMM\":\"systemd\",\"__REALTIME_TIMESTAMP\":\"1784192741450900\"}\n";
+    let Value::Table(rows) = parse(spec, good).expect("realistic journalctl -o json must parse")
+    else {
+        panic!("expected table")
+    };
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["MESSAGE"], Value::Str("session opened".into()));
+    // Confirmed against real output: journald's JSON export never emits a
+    // bare numeric field, even for a PID or a monotonic timestamp -- typing
+    // these `int` in the adapter would be a lie the real bytes don't back.
+    assert_eq!(rows[0]["_PID"], Value::Str("1234".into()));
+
+    // A truncated/malformed line (a killed `journalctl` mid-stream) must
+    // degrade the whole parse, not silently drop just that entry.
+    assert_eq!(parse(spec, b"{\"MESSAGE\": \"session opened\"\n"), None);
+}
+
+// ------------------------------------------------------------------ who ----
+
+#[test]
+fn who_cols_parses_realistic_sessions_and_degrades_on_short_rows() {
+    let c = catalog();
+    let spec = top(&c, "who");
+    assert_eq!(spec.parse, "cols");
+    assert_eq!(spec.invoke, Some(vec!["-H".to_string()]));
+
+    // `-H` manufactures the header line real bare `who` doesn't print at
+    // all; `cols` discards it unconditionally, same as `ps`/`df`.
+    let good = b"NAME     LINE         TIME             COMMENT\n\
+                 allie    seat0        2026-07-06 10:53\n\
+                 allie    tty2         2026-07-06 10:53\n";
+    let v = parse(spec, good).expect("realistic who -H output must parse");
+    let Value::Table(rows) = v else {
+        panic!("expected table")
+    };
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["user"], Value::Str("allie".into()));
+    assert_eq!(rows[0]["line"], Value::Str("seat0".into()));
+    assert_eq!(rows[0]["date"], Value::Str("2026-07-06".into()));
+    assert_eq!(rows[0]["time"], Value::Str("10:53".into()));
+
+    // A remote/X session's optional trailing "(host)" comment is overflow
+    // beyond the 4-column hint and merges into the last column (`time`),
+    // same trick `ps.toml`'s multi-word `command` column relies on.
+    let with_comment = b"NAME     LINE         TIME             COMMENT\n\
+                          allie    pts/3        2026-07-06 11:02 (:0)\n";
+    let Value::Table(rows) = parse(spec, with_comment).unwrap() else {
+        panic!("expected table")
+    };
+    assert_eq!(rows[0]["time"], Value::Str("11:02 (:0)".into()));
+
+    // A row missing its TIME column entirely must degrade the whole parse.
+    let truncated = b"NAME     LINE         TIME             COMMENT\n\
+                       allie    seat0        2026-07-06\n";
+    assert_eq!(parse(spec, truncated), None);
+}
+
+// ------------------------------------------------------------------ env ----
+
+#[test]
+fn env_kv_parses_key_value_dump_including_embedded_equals_in_value() {
+    let c = catalog();
+    let spec = top(&c, "env");
+    assert_eq!(spec.parse, "kv");
+
+    let good = b"HOME=/home/allie\nSHELL=/usr/bin/zsh\nDEBUGINFOD_URLS=ima:enforcing https://x=y\n";
+    let Value::Record(r) = parse(spec, good).expect("realistic env dump must parse") else {
+        panic!("expected record")
+    };
+    assert_eq!(r["HOME"], Value::Str("/home/allie".into()));
+    assert_eq!(r.len(), 3);
+    // The value's own embedded `=` must not truncate it -- `kv` splits on
+    // only the *first* `=`, which is exactly right since a POSIX env var
+    // name itself can never contain `=`.
+    assert_eq!(
+        r["DEBUGINFOD_URLS"],
+        Value::Str("ima:enforcing https://x=y".into())
+    );
+}
+
+// ---------------------------------------------------------------- lscpu ----
+
+#[test]
+fn lscpu_json_parses_field_data_pairs_table() {
+    let c = catalog();
+    let spec = top(&c, "lscpu");
+    assert_eq!(spec.parse, "json");
+    assert_eq!(spec.invoke, Some(vec!["-J".to_string()]));
+
+    let good = br#"{"lscpu":[
+        {"field":"Architecture:","data":"x86_64"},
+        {"field":"CPU(s):","data":"16"},
+        {"field":"Model name:","data":"AMD Ryzen 9 6900HX with Radeon Graphics"}
+    ]}"#;
+    let Value::Record(r) = parse(spec, good).expect("realistic lscpu -J output must parse") else {
+        panic!("expected record")
+    };
+    let Value::Table(fields) = &r["lscpu"] else {
+        panic!("expected lscpu table")
+    };
+    assert_eq!(fields.len(), 3);
+    assert_eq!(fields[0]["field"], Value::Str("Architecture:".into()));
+    assert_eq!(fields[1]["data"], Value::Str("16".into()));
+
+    assert_eq!(parse(spec, br#"{"lscpu": [{"field": "#), None);
+}
+
+// -------------------------------------------------------------- vmstat ----
+
+#[test]
+fn vmstat_cols2_parses_two_line_banner_and_degrades_on_short_row() {
+    let c = catalog();
+    let spec = top(&c, "vmstat");
+    assert_eq!(spec.parse, "cols2");
+    assert_eq!(spec.invoke, Some(vec!["-S".to_string(), "k".to_string()]));
+
+    let good = b"procs -----------memory---------- ---swap-- -----io---- -system-- -------cpu-------\n\
+                  r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st gu\n\
+                  1  0 8387704 248564   544 7046504  11   28   334   529 1789    4  2  1 97  0  0  0\n";
+    let v = parse(spec, good).expect("realistic vmstat -S k output must parse");
+    let Value::Table(rows) = v else {
+        panic!("expected table")
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["r"], Value::Int(1));
+    // `swpd`/`free`/`buff`/`cache` are `size_kb`-typed: bare digit counts
+    // pinned by `-S k` to kilobytes, scaled `*1024` into a real, comparable
+    // `Value::Size` -- same as `du.toml`/`df.toml`.
+    assert_eq!(rows[0]["swpd"], Value::Size(8387704 * 1024));
+    assert_eq!(rows[0]["free"], Value::Size(248564 * 1024));
+    assert_eq!(rows[0]["gu"], Value::Int(0));
+
+    // A row with a missing trailing column (17 fields, not the full 18)
+    // must degrade the whole parse, not silently misalign the rest.
+    let truncated = b"procs -----------memory----------\n\
+                       r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st gu\n\
+                       1  0 8387704 248564   544 7046504  11   28   334   529 1789    4  2  1 97  0  0\n";
+    assert_eq!(parse(spec, truncated), None);
+}
+
+// ------------------------------------------------------------ ip link ----
+
+#[test]
+fn ip_link_json_parses_interface_table() {
+    let c = catalog();
+    let spec = sub(&c, "ip", "link");
+    assert_eq!(spec.parse, "json");
+    assert_eq!(
+        spec.invoke,
+        Some(vec![
+            "-j".to_string(),
+            "link".to_string(),
+            "show".to_string()
+        ])
+    );
+
+    let good = br#"[{"ifindex":1,"ifname":"lo","mtu":65536,"operstate":"UNKNOWN","address":"00:00:00:00:00:00"}]"#;
+    let Value::Table(rows) = parse(spec, good).expect("realistic ip -j link show must parse")
+    else {
+        panic!("expected table")
+    };
+    assert_eq!(rows[0]["ifname"], Value::Str("lo".into()));
+    assert_eq!(rows[0]["mtu"], Value::Int(65536));
+    assert_eq!(parse(spec, b"[{\"ifindex\": "), None);
+}

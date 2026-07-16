@@ -1,0 +1,35 @@
+# procps-ng `vmstat` (Linux; BSD `vmstat` prints a different, incompatible
+# column set with no shared subset worth pinning, same class of split as
+# `stat.toml`'s GNU-only `--format`). A bare, no-delay/no-count invocation
+# prints exactly one data row (live sample), stacked under a fixed **two**
+# -line banner: a category header (`"procs -----------memory----------..."`)
+# directly above the real per-column header
+# (`"r  b   swpd   free   buff  cache..."`). No flag on any common `vmstat`
+# build suppresses just the category line while keeping the column header
+# (`-y`/`--no-first` skips a *redundant data row* that only appears in
+# repeated `delay count` sampling mode -- verified against real output it
+# has no effect on a bare one-shot invocation, since there's only ever one
+# data row to begin with) -- unlike `ps`/`df`, whose single header line the
+# existing `cols` strategy already discards. This is exactly why the
+# `cols2` parser strategy exists (see its doc comment in
+# `shoal-adapters/src/lib.rs`): it discards exactly 2 leading lines instead
+# of `cols`'s hardcoded 1, then parses identically.
+#
+# `-S k` pins the memory columns' display unit to kilobytes explicitly
+# (procps-ng's own default already is k, but pinning it the same way
+# `du.toml`'s `-k`/`df.toml`'s `-kP` do keeps this adapter's numbers stable
+# even if that default ever changed upstream) -- which is what licenses
+# typing `swpd`/`free`/`buff`/`cache` as `size_kb` (bare digit counts with
+# no unit suffix, scaled `*1024` into a genuine comparable `Value::Size`,
+# same as `du`/`df`; see `parse_size_kb`). `si`/`so` (swap in/out) and
+# `bi`/`bo` (block in/out) are *rates* (per second), not point-in-time
+# sizes, so they stay plain `int` rather than being mistyped as `size_kb`.
+# `us`/`sy`/`id`/`wa`/`st`/`gu` are CPU-time percentages (0-100, ints on
+# this platform, never fractional) and `in`/`cs` are interrupts/context
+# switches per second -- all plain `int`.
+[cmd.vmstat]
+bin = "vmstat"
+class = "cli"
+ok_codes = [0]
+invoke = ["-S", "k"]
+output = { parse = "cols2", type = "table<{r: int, b: int, swpd: size_kb, free: size_kb, buff: size_kb, cache: size_kb, si: int, so: int, bi: int, bo: int, in: int, cs: int, us: int, sy: int, id: int, wa: int, st: int, gu: int}>" }

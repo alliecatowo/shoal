@@ -16,3 +16,14 @@ output = { parse = "json", type = "table<{ifname: str, addr_info: list<record>}>
 [cmd.ip.sub.route]
 invoke = ["-j", "route", "show"]
 output = { parse = "json", type = "table<{dst: str, dev: str, gateway: str}>" }
+
+# Network interfaces themselves (link layer): distinct from `addr` (which is
+# per-address, and only lists interfaces that HAVE an assigned address) and
+# `route` (routing table). A loopback-only or address-less-but-up interface
+# (a bridge, a down NIC) still shows up here. Real `ip -j link show` is a
+# top-level JSON array of per-interface objects, same uniform-array shape as
+# `addr`/`route`, so it stays a genuine `table<{...}>`, not a `record`
+# envelope.
+[cmd.ip.sub.link]
+invoke = ["-j", "link", "show"]
+output = { parse = "json", type = "table<{ifindex: int, ifname: str, mtu: int, operstate: str, address: str}>" }

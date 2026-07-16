@@ -259,6 +259,7 @@ fn parse_sub(t: &toml::Table) -> Result<SubSpec, String> {
                 | "z-records"
                 | "porcelain-v2"
                 | "cols"
+                | "cols2"
                 | "tsv-headerless"
                 | "lines"
                 | "kv"
@@ -349,6 +350,7 @@ pub fn parse_output(strategy: &str, bytes: &[u8], type_hint: Option<&str>) -> Op
         "z-records" => parse_z_records(bytes, type_hint),
         "porcelain-v2" => parse_porcelain_v2(bytes),
         "cols" => parse_cols(bytes, type_hint),
+        "cols2" => parse_cols_n(bytes, type_hint, 2),
         "tsv-headerless" => parse_tsv_headerless(bytes, type_hint),
         _ => None,
     }
@@ -513,13 +515,36 @@ fn parse_size_kb(raw: &str) -> Option<u64> {
 /// contains embedded whitespace (a mount path with a space, a multi-word
 /// process command) survives instead of desyncing every column after it.
 fn parse_cols(bytes: &[u8], hint: Option<&str>) -> Option<Value> {
+    parse_cols_n(bytes, hint, 1)
+}
+
+/// Generalization of `parse_cols` that discards a fixed number of leading
+/// preamble lines (not just the always-exactly-one header `cols` assumes)
+/// before every remaining line is treated as a data row. This exists for
+/// tools like `vmstat(8)`, whose fixed two-line banner is a *category*
+/// header ("procs -----------memory----------...") stacked directly above
+/// the real per-column header line, with no flag on any common `vmstat`
+/// build to suppress just one of the two (unlike `ps`/`df`, which have a
+/// single, cleanly-discardable header line `cols` already handles, or `w
+/// -h`, which happens to suppress its column-header line entirely and so
+/// already works with plain `cols`'s "discard exactly one line" rule since
+/// the remaining first line is the summary line `cols` treats as the
+/// discarded header). Exposed as the separate `"cols2"` parser strategy
+/// (rather than a parameterized field on `"cols"` in the TOML schema) so
+/// this stays a pure addition: every existing `cols`-strategy adapter's
+/// `SubSpec`/`parse_output` call sites are untouched, since `parse_output`'s
+/// signature (consumed by `shoal-eval`, outside this crate) does not need to
+/// grow a new parameter to carry a per-adapter skip count.
+fn parse_cols_n(bytes: &[u8], hint: Option<&str>, skip_lines: usize) -> Option<Value> {
     let fields = hint_schema(hint);
     if fields.is_empty() {
         return None;
     }
     let body = text(bytes)?;
     let mut lines = body.lines();
-    lines.next(); // header row: discarded, never consulted for shape or names
+    for _ in 0..skip_lines {
+        lines.next(); // preamble/header row: discarded, never consulted for shape or names
+    }
     let rows = lines
         .filter(|l| !l.trim().is_empty())
         .map(|line| {
@@ -848,6 +873,38 @@ output={parse="porcelain-v2", type="table<{status: str, path: path}>"}
         );
         assert!(matches!(p, Some(Value::Table(t)) if t.len()==2));
     }
+    // `cols2` (added for `vmstat(8)`, which stacks a fixed two-line banner --
+    // a category header directly above the real per-column header, with no
+    // flag to suppress just one of the two -- unlike `ps`/`df`'s single
+    // cleanly-discardable header line) discards exactly 2 leading lines
+    // before treating every remaining line as a data row, reusing the same
+    // whitespace-run splitting + last-column-overflow-merge rules as `cols`.
+    #[test]
+    fn cols2_discards_two_leading_lines_then_parses_like_cols() {
+        let h = "table<{r: int, b: int, swpd: size_kb, free: size_kb}>";
+        let good = b"procs -----------memory----------\n\
+                      r  b   swpd   free\n\
+                      2  1 8388028 310712\n";
+        let v = parse_output("cols2", good, Some(h)).expect("vmstat-shaped output must parse");
+        let Value::Table(rows) = v else {
+            panic!("expected table")
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["r"], Value::Int(2));
+        assert_eq!(rows[0]["b"], Value::Int(1));
+        assert_eq!(rows[0]["swpd"], Value::Size(8388028 * 1024));
+        assert_eq!(rows[0]["free"], Value::Size(310712 * 1024));
+
+        // A malformed data row (fewer fields than the hint, once the two
+        // leading lines are discarded) must degrade the whole parse to
+        // `None`, not silently misalign columns -- same mismatch rule as
+        // plain `cols`.
+        let malformed = b"procs -----------memory----------\n\
+                           r  b   swpd   free\n\
+                           2  1 8388028\n";
+        assert_eq!(parse_output("cols2", malformed, Some(h)), None);
+    }
+
     #[test]
     fn malformed_structured_output_degrades() {
         assert!(parse_output("json", b"no", None).is_none());
@@ -1247,6 +1304,13 @@ output={parse="porcelain-v2", type="table<{status: str, path: path}>"}
             "yarn",
             "uv",
             "podman",
+            "lsblk",
+            "findmnt",
+            "journalctl",
+            "who",
+            "env",
+            "lscpu",
+            "vmstat",
         ];
         assert_eq!(catalog.len(), required.len());
         for name in required {
@@ -1386,6 +1450,37 @@ output={parse="porcelain-v2", type="table<{status: str, path: path}>"}
         assert_eq!(
             catalog.lookup("podman").unwrap().subs["ps"].consumed,
             vec!["quiet".to_string()]
+        );
+        // `vmstat`'s two-line banner needs the `cols2` strategy (plain
+        // `cols` only ever discards one line); wired end to end through the
+        // same loader path as every other parser.
+        assert_eq!(catalog.lookup("vmstat").unwrap().top.parse, "cols2");
+        // `env`'s `KEY=VALUE` lines are the exact shape `kv` was built for.
+        assert_eq!(catalog.lookup("env").unwrap().top.parse, "kv");
+        // `who` has no header line of its own; `-H` is pinned via `invoke`
+        // so `cols`'s "discard exactly one line" assumption holds.
+        assert_eq!(catalog.lookup("who").unwrap().top.parse, "cols");
+        assert_eq!(
+            catalog.lookup("who").unwrap().top.invoke,
+            Some(vec!["-H".to_string()])
+        );
+        // `lsblk`/`findmnt`/`lscpu` are JSON-native (`-J`), same family as
+        // `ip`/`systemctl`.
+        assert_eq!(catalog.lookup("lsblk").unwrap().top.parse, "json");
+        assert_eq!(catalog.lookup("findmnt").unwrap().top.parse, "json");
+        assert_eq!(catalog.lookup("lscpu").unwrap().top.parse, "json");
+        // `journalctl -o json` is one JSON object per line, i.e. `ndjson`,
+        // not a single top-level JSON document.
+        assert_eq!(catalog.lookup("journalctl").unwrap().top.parse, "ndjson");
+        // `ip`'s pre-existing `addr`/`route` subs gain a `link` sibling
+        // (interface list), same JSON-array shape.
+        assert_eq!(
+            catalog.lookup("ip").unwrap().subs["link"].invoke,
+            Some(vec![
+                "-j".to_string(),
+                "link".to_string(),
+                "show".to_string()
+            ])
         );
     }
 

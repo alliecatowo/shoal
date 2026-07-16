@@ -1,0 +1,22 @@
+# POSIX `who` exists on both GNU/Linux and BSD/macOS, but plain `who` (no
+# flags) prints **no header line at all** -- unlike `ps`/`df`, whose header
+# line `cols` can unconditionally discard. `-H` is pinned via `invoke`
+# specifically to manufacture that discardable header line (both GNU
+# coreutils and BSD `who` support bare `-H`), the same portability trick
+# `stat.toml`'s `--format` and `ps.toml`'s `-o keyword=Header` use to force a
+# stable shape rather than relying on flag-less defaults.
+#
+# Real `-H` output's `TIME` column itself prints as two whitespace-separated
+# tokens (`"2026-07-06 10:53"`, date then time), so the hint below declares
+# them as two separate trailing columns rather than one -- `cols` has no way
+# to *merge* two adjacent tokens into a single field (only to merge
+# *overflow* tokens into the last declared column). A remote/X11 session's
+# optional trailing `(host)` comment, when present, is exactly that kind of
+# overflow and lands merged into `time` (e.g. `"10:53 (:0)"`), the same
+# trick `ps.toml`'s multi-word `comm` column relies on.
+[cmd.who]
+bin = "who"
+class = "cli"
+ok_codes = [0]
+invoke = ["-H"]
+output = { parse = "cols", type = "table<{user: str, line: str, date: str, time: str}>" }
