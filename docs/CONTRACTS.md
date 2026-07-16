@@ -109,7 +109,8 @@ Build hygiene for parallel work: only edit files inside your assigned crate/dir;
 
 ## 1. shoal-exec — public API (pinned)
 
-Blocking, thread-based. No tokio. `libc` + `portable-pty` allowed.
+Blocking, thread-based. No tokio. `libc` + `portable-pty` allowed, plus `vt100` (pure-Rust
+terminal emulator, owned by this crate alone — it backs the long-lived interactive `PtySession`).
 
 ```rust
 use std::ffi::{OsStr, OsString};
@@ -220,6 +221,46 @@ pub fn run_sandboxed(spec: ExecSpec, cancel: &CancelToken, sandbox: shoal_leash:
                      verified: Option<&shoal_leash::SpawnPreflight>) -> std::io::Result<ExecResult>;
 pub fn spawn_capture_sandboxed(spec: ExecSpec, cancel: &CancelToken, sandbox: shoal_leash::FsSandbox,
                      verified: Option<&shoal_leash::SpawnPreflight>) -> std::io::Result<StreamingChild>;
+
+// ── Long-lived, agent-driveable interactive PTY sessions (AGENT-SURFACE §10) ──────────────────
+// Unlike run(PtyTee) — one-shot, teed to the REAL terminal, blocks to completion — a PtySession
+// keeps the child + PTY master ALIVE with no real terminal, feeds output into a `vt100` emulator,
+// and lets the owner send keystrokes + read the RENDERED screen. Same no-leak reaping discipline
+// as job control (own session/pgroup leader, reaped via waitpid, idempotent teardown). Spawn goes
+// through ExecSpec::sandbox (leash confinement) exactly like run(). cols/rows clamped to 1..=1000.
+pub const PTY_DEFAULT_COLS: u16; pub const PTY_DEFAULT_ROWS: u16;  // 80, 24
+pub const PTY_MAX_COLS: u16;     pub const PTY_MAX_ROWS: u16;      // 1000, 1000
+
+pub struct PtyOpenSpec {
+    pub argv: Vec<OsString>, pub cwd: PathBuf, pub env: Vec<(OsString, OsString)>,  // TERM defaulted if absent
+    pub cols: u16, pub rows: u16,
+    pub sandbox: Option<shoal_leash::SandboxPolicy>,  // None = unconfined (permissive human), like ExecSpec
+}
+pub struct ScreenSnapshot {
+    pub cols: u16, pub rows: u16,
+    pub cursor_row: u16, pub cursor_col: u16, pub cursor_hidden: bool,
+    pub rows_text: Vec<String>,       // one plain-text row per grid line (len == rows), no escape bytes
+    pub changed: bool,                // rendered screen differs from the previous read_screen (content hash)
+    pub alive: bool,                  // child's terminal stream still open
+    pub exit_status: Option<i32>, pub exit_signal: Option<String>,  // set once exited+reaped
+    pub pid: u32,
+}
+pub struct PtySession { /* opaque */ }
+impl PtySession {
+    pub fn open(spec: PtyOpenSpec) -> std::io::Result<PtySession>;  // spawns on a fresh PTY, starts the reader
+    pub fn pid(&self) -> u32;
+    pub fn size(&self) -> (u16, u16);
+    pub fn send(&mut self, bytes: &[u8]) -> std::io::Result<()>;    // write keystrokes to the master
+    pub fn resize(&mut self, cols: u16, rows: u16) -> std::io::Result<()>;
+    pub fn read_screen(&mut self) -> ScreenSnapshot;               // opportunistically reaps a self-exited child
+    pub fn close(&mut self) -> (Option<i32>, Option<String>);      // terminate + reap; idempotent; Drop is a backstop
+}
+// The key-name protocol's byte encoding (terminal-domain half; the kernel decodes the JSON shape):
+// Enter/Tab/Escape/Backspace/Delete/Space/arrows/Home/End/Page{Up,Down}/F1-F12/Ctrl-<letter>, else None.
+pub fn named_key(name: &str) -> Option<Vec<u8>>;
+// Resolve argv[0] (abs path or via env PATH) and return its blake3-hex (== reef/leash hash), for a
+// kernel host to build the Effect::ProcSpawn bin_hash of a PTY-open spawn gate. None if unlocatable.
+pub fn resolve_and_hash(argv: &[OsString], env: &[(OsString, OsString)]) -> Option<String>;
 ```
 
 Requirements: no zombies (always reaped); parent terminal state always restored (PtyTee restores cooked mode even on panic — use a drop guard); Capture-mode children get `setpgid(0,0)`; E2BIG and spawn errors surface as `io::Error`. Unit tests must cover: echo capture, exit codes, signal death (`kill -SEGV` a child), stdin Bytes, cancellation kills a sleeping child, which() resolution, PtyTee against the `script`-style check `test -t 1` (child sees a tty) — PTY tests must be skipped gracefully when the test runner itself has no tty (CI): only assert what's assertable (child sees pty, bytes teed).

@@ -217,6 +217,11 @@ shoal_get    {ref|uri, path?, slice?, format?, elide?}
 shoal_journal{since?, head?, principal?, ok?, limit?}
 shoal_cancel {task}
 shoal_cap_request {effects:[…]}  → granted | denied{why} | approval_pending{ref}
+shoal_pty_open  {cmd, args?, cols?, rows?, env?}   → {pty_id:"pty:N", pid, cols, rows, cmd}
+shoal_pty_send  {pty_id, input}                    → {pty_id, sent}          (input: §10 key protocol)
+shoal_pty_read  {pty_id}                            → {cols, rows, cursor, screen:[rows], changed, alive, exit}
+shoal_pty_resize{pty_id, cols, rows}               → {pty_id, cols, rows}
+shoal_pty_close {pty_id}                            → {pty_id, closed:true, exit}
 ```
 
 Kernel JSON-RPC keeps the TDD §7 method set (`session.attach`, `parse`, `exec`, `plan.apply`,
@@ -348,8 +353,94 @@ shoal-kernel-specific code lives:
 | `-32012` | `UNKNOWN_PLAN` | The named `plan_ref` (`plan.get`/`plan.apply`/`cap.request`) is unknown or has expired. |
 | `-32020` | `TASK_CONTROL_UNAVAILABLE` | Task suspend/resume is unavailable: a kernel task is a Rust thread recursively re-entering `dispatch`, not a single tracked child process/group, so there is nothing to signal yet. |
 | `-32021` | `UNKNOWN_TASK` | The named `task` ref is unknown, or belongs to another session. |
+| `-32022` | `UNKNOWN_PTY` | The named `pty_id` (`pty.send`/`pty.read`/`pty.resize`/`pty.close`) is unknown, already closed, or belongs to another session. |
+| `-32023` | `PTY_SPAWN_FAILED` | A `pty.open` could not spawn the program on a PTY — unresolvable program, sandbox that could not be applied, or PTY/spawn plumbing failure (the underlying `io::Error` travels in the message). |
 | `-32030` | `AUTH_FAILED` | Bearer-token authentication failed on `session.attach`: either this kernel has no `TokenStore` configured at all (an ephemeral kernel), or the given token is missing/expired/revoked. |
 
 `crates/shoal-proto/src/lib.rs`'s `error_code_constants_match_pinned_wire_values` test pins every
 number above to its constant — a refactor-safety net so centralizing the taxonomy can never
 silently renumber a code already on the wire.
+
+## 10. Interactive PTY sessions — driving a TUI over the wire
+
+The rest of this surface is value-capture: a program runs to completion and its *output value* is
+elided into refs. That is the wrong shape for an **interactive** program — vim, an installer prompt
+that asks yes/no, a language REPL, `htop`, a curses menu — which never "completes" and whose state
+lives on a *screen* it redraws in place. An agent attached over the wire is `tty:false`; there is no
+terminal for it to see, and a raw byte dump of a curses program is an unreadable wall of escape
+sequences. So shoal gives the agent the **rendered screen** instead: it runs the program on a real
+PTY inside the kernel, feeds the child's output through a `vt100` terminal emulator, and lets the
+agent read back the emulator's `cols×rows` character grid — "an agent reads a rendered screen, never
+a byte wall." This is the interactive extension of the anti-bash-tool doctrine (§0).
+
+**Lifecycle.** A PTY session is long-lived and keyed like a task, under a `pty:{id}` ref scoped to
+the session that opened it (another session's ref is an opaque `UNKNOWN_PTY`, exactly as tasks
+scope). Open it, drive it with send/read as many times as needed, then close it — close terminates
+**and reaps** the child (no leaked process; a dropped session reaps as a backstop). The child is its
+own session/process-group leader and is reaped via the same no-leak discipline as job control.
+
+```
+pty.open   {cmd, args?, cols?, rows?, env?}   → {pty_id:"pty:N", pid, cols, rows, cmd}
+pty.send   {pty_id, input}                    → {pty_id, sent}
+pty.read   {pty_id}                            → rendered screen (below)
+pty.resize {pty_id, cols, rows}               → {pty_id, cols, rows}
+pty.close  {pty_id}                            → {pty_id, closed:true, exit}
+```
+
+Defaults are 80×24; `cols`/`rows` are clamped to `1..=1000` so a read is always ≤ `cols×rows`
+cells — the screen is bounded by construction, the way every other payload on this surface is
+bounded. The child's environment is the session's environment with the caller's `env` overrides
+layered on, plus a default `TERM` (so curses programs behave). MCP exposes each verb as a tool
+(`shoal_pty_open`/`shoal_pty_send`/`shoal_pty_read`/`shoal_pty_resize`/`shoal_pty_close`).
+
+**Leash gating.** `pty.open` is a `ProcSpawn` effect gated through the same path every spawn uses:
+the principal's `proc_spawn` allowlist is consulted (`bin_hash`/name), and a scoped principal's
+`SandboxPolicy` (Landlock/Seatbelt + spawn-hash pin) confines the child before exec. The
+default-permissive human spawns unconfined, exactly as an ordinary command does. A denied spawn is
+`LEASH_DENIED`; one needing approval is `APPROVAL_REQUIRED`.
+
+**The key-name protocol (`pty.send input`).** `input` is one of, or an array mixing, these forms so
+an agent can express a whole editing gesture in one call:
+
+- a **string** — typed verbatim as UTF-8 (`"hello"`);
+- `{"key": NAME}` — a **named key** encoded to the bytes a terminal sends: `Enter`/`Return`, `Tab`,
+  `Escape`/`Esc`, `Backspace`, `Delete`, `Space`, `Up`/`Down`/`Left`/`Right`, `Home`, `End`,
+  `PageUp`/`PageDown`, `Insert`, `F1`–`F12`, and `Ctrl-<letter>` / `C-<letter>` (plus `Ctrl-[`,
+  `Ctrl-\`, `Ctrl-]`, `Ctrl-Space`);
+- `{"text": "…"}` — an explicit literal (same as a bare string);
+- `{"bytes": "<base64>"}` — raw bytes, for anything the named set doesn't cover.
+
+So the canonical "edit a file in vim" gesture is one send:
+`["i", "hello", {"key":"Escape"}, ":wq", {"key":"Enter"}]` — insert mode, type `hello`, escape, `:wq`,
+Enter. An unknown key name is `INVALID_PARAMS` (never silently dropped).
+
+**The rendered screen (`pty.read`).** Returns the emulator's current frame:
+
+```json
+{ "pty_id":"pty:1", "cmd":"vim notes.txt",
+  "cols":80, "rows":24,
+  "cursor": {"row":3, "col":10, "hidden":false},
+  "screen": ["line 0 …", "line 1 …", …],   // exactly `rows` plain-text strings, no escape bytes
+  "changed": true,                          // did the RENDERED screen change since your last read?
+  "alive": true,                            // is the child's terminal stream still open?
+  "exit": null,                             // or {"status":0} / {"signal":"SIGKILL"} once it ends
+  "pid": 12345 }
+```
+
+`screen` is one plain-text string per grid row (trailing blanks trimmed, no newlines, no escape
+sequences) — the emulator has already resolved every cursor move, clear, and redraw. `cursor` is
+where the program's cursor sits (so an agent knows which field/menu-item is focused). `changed` is a
+content-hash comparison against the previous read: bytes that don't alter the visible grid (a
+cursor-position query reply, say) do not flip it, so an agent can cheaply tell "the screen settled"
+from "it's still redrawing." `alive`/`exit` report the child's fate; once it exits, the kernel reaps
+it opportunistically so a self-terminating program (an installer that finishes) is observed as
+`alive:false` with its exit code, without an explicit close.
+
+**Status.** `open`/`send`/`read`/`resize`/`close` are wired end-to-end (kernel `dispatch` +
+`shoal-mcp` tools), proven by `crates/shoal-mcp/tests/live_kernel.rs`
+(`mcp_pty_drive_cat_reads_rendered_screen_then_closes_and_reaps`): a real kernel over a real socket
+opens `cat`, sends text + a named `Enter`, reads the echoed line off the rendered screen at a moved
+cursor, closes, and asserts the child pid is reaped (no leak). Documented follow-ups (not yet
+wired): a **`pty.{id}.screen` push event** so a live UI/subscriber sees frames as they change rather
+than polling `pty.read`; a `pty.list` enumerator + `shoal://pty/{id}` resource root; and an
+**in-language** surface (`interact`-style handle usable from evaluated source, not just the wire).
