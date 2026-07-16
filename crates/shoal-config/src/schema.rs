@@ -64,7 +64,6 @@ pub(crate) const ROOT: Kind = Kind::Table(&[
             ("mode", Kind::Str),
             ("bracketed_paste", Kind::Bool),
             ("keybindings", Kind::StrMap),
-            ("key_timeout_ms", Kind::UInt),
         ]),
     ),
     (

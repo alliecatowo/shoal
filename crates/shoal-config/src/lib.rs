@@ -109,10 +109,6 @@ pub struct Editor {
     /// `chord -> action`, e.g. `"ctrl-r" = "history_search_backward"`. Empty
     /// = the host's built-in bindings for `mode` are used unmodified.
     pub keybindings: BTreeMap<String, String>,
-    /// How long (milliseconds) the line editor waits after a prefix key
-    /// (e.g. `Esc`, or `jk` in vi insert mode) before deciding no chord is
-    /// coming and treating it as a standalone keystroke.
-    pub key_timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -252,7 +248,6 @@ impl Default for Editor {
             mode: "emacs".into(),
             bracketed_paste: true,
             keybindings: BTreeMap::new(),
-            key_timeout_ms: 25,
         }
     }
 }

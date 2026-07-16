@@ -580,8 +580,10 @@ fn entry_row_record(e: &shoal_journal::EntryRow) -> Record {
         .unwrap_or(Value::Null);
     r.insert("ts".into(), ts);
     r.insert("principal".into(), Value::Str(e.principal.clone()));
-    let head = e.src.split_whitespace().next().unwrap_or("").to_string();
-    r.insert("src".into(), Value::Str(head));
+    // The full recorded source, not just the head word: a `src` column showing
+    // only `git` for `git push origin main` is as good as empty for a history
+    // view. `--head` filtering still matches on the head in the journal query.
+    r.insert("src".into(), Value::Str(e.src.clone()));
     r.insert("ok".into(), e.ok.map(Value::Bool).unwrap_or(Value::Null));
     r.insert(
         "status".into(),
@@ -790,9 +792,33 @@ mod tests {
         // third, newest-first).
         assert!(rows.len() >= 3, "rows: {}", rows.len());
         assert!(rows.iter().all(|r| r.get("id").is_some()));
+        // The `src` column carries the FULL statement source, not just the head
+        // word (regression: the view used to slice off everything after the
+        // first space, so a populated `src` still rendered as good as empty).
         assert!(
             rows.iter()
-                .any(|r| r.get("src") == Some(&Value::Str("echo".into())))
+                .any(|r| r.get("src") == Some(&Value::Str("echo one".into()))),
+            "src column should show the full source line: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn journal_view_src_column_shows_full_source_not_head() {
+        // Regression (BUG: empty/head-only `src` column): the `history`/
+        // `journal` view must render the ENTIRE recorded source under `src`,
+        // not just the first whitespace-delimited word. A multi-token command
+        // whose head alone is uninformative proves the full line survives.
+        let dir = tempfile::tempdir().unwrap();
+        let mut ev = journaled(dir.path());
+        run_journaled(&mut ev, "echo alpha beta gamma").unwrap();
+        let table = run_journaled(&mut ev, "journal").unwrap();
+        let Value::Table(rows) = table else {
+            panic!("journal should be a table, got {table:?}")
+        };
+        assert!(
+            rows.iter()
+                .any(|r| r.get("src") == Some(&Value::Str("echo alpha beta gamma".into()))),
+            "full source expected in the src column, got: {rows:?}"
         );
     }
 
