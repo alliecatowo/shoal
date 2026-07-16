@@ -105,7 +105,6 @@ e.g. `max_entries`, so an automatic split would be ambiguous).
 | `SHOAL_RENDER_WIDTH` | `render.width` | non-negative int |
 | `SHOAL_EDITOR_MODE` | `editor.mode` | string (`emacs`\|`vi`) |
 | `SHOAL_EDITOR_BRACKETED_PASTE` | `editor.bracketed_paste` | bool |
-| `SHOAL_EDITOR_KEY_TIMEOUT_MS` | `editor.key_timeout_ms` | non-negative int |
 | `SHOAL_KERNEL_ENABLED` (alias: `SHOAL_KERNEL`) | `kernel.enabled` | bool |
 | `SHOAL_KERNEL_SESSION` | `kernel.session` | string |
 | `SHOAL_JOURNAL_ENABLED` | `journal.enabled` | bool |
@@ -167,7 +166,6 @@ invalid table header
 | `version` must be `1` | `version: unsupported config version <n> (expected 1)` |
 | `history.max_entries` must be `> 0` | `history.max_entries: must be greater than 0` |
 | `editor.mode` must be `emacs` or `vi` | `editor.mode: must be \`emacs\` or \`vi\`` |
-| `editor.key_timeout_ms` must be `1..=60000` | `editor.key_timeout_ms: must be between 1 and 60000 (milliseconds)` |
 | `completion.max_results` must be `> 0` | `completion.max_results: must be greater than 0` |
 | an `aliases` name must be non-empty, no whitespace | `aliases: alias name \`g s\` must not contain whitespace` |
 | an `env` name must be non-empty | `env: environment variable name must not be empty` |
@@ -228,7 +226,6 @@ scanner, and is what `shoal-prompt`'s loader migrates from when it sees an old-s
 | `editor.mode` | string | `"emacs"` | `emacs` or `vi` |
 | `editor.bracketed_paste` | bool | `true` | enable terminal bracketed-paste mode |
 | `editor.keybindings` | table of strings | `{}` | `chord -> action`, e.g. `"ctrl-r" = "history_search_backward"`; empty = the host's built-in bindings for `mode` |
-| `editor.key_timeout_ms` | integer (milliseconds) | `25` | how long the line editor waits after a prefix key (`Esc`, `jk` in vi insert mode, …) before treating it as standalone |
 
 ### `[kernel]`
 
@@ -359,11 +356,18 @@ friends). As of this wave, the `shoal` binary's REPL/script-runner path reads:
 
 Schema-complete, validated, and documented, but **not yet read by any in-tree consumer** as of
 this wave (ready for a consumer to wire up — see the integrator note below):
-`editor.key_timeout_ms` (reedline 0.49 exposes no key-sequence timeout knob at all — there is
-nothing in its public API to wire this into today), `render.width`, `kernel.*`, `journal.state_dir`
+`render.width`, `kernel.*`, `journal.state_dir`
 (the binary resolves its own state directory independently of this field today), `leash.policy`,
 `reef.tools`/`reef.runners`/`reef.options` beyond user-scope engagement (`shoal-reef` re-parses
 `[reef]` independently, per §5, for the actual constraint/provider grammar).
+
+An `editor.key_timeout_ms` knob was previously defined here but has been removed: reedline (0.49,
+the line editor this shell embeds) exposes no key-sequence/chord timeout in its public API — key
+chords are disambiguated by crossterm at the terminal layer with no configurable delay, and
+`with_poll_interval` governs only idle-callback/external-event cadence, not key timing. Rather
+than keep a schema field validated but wired to nothing (a config that silently does nothing when
+set), the knob was dropped. Reintroduce it only alongside a real consumer if a future line editor
+grows such an API.
 
 Nothing here is a defect in `shoal-config` — the schema, defaults, validation, and layering are
 all real and tested regardless of whether a given field already drives behavior; it's the

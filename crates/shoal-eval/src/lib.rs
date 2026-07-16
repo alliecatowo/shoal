@@ -163,6 +163,17 @@ pub struct Evaluator {
     /// [`Evaluator::open_default_jump_history`], or a test via
     /// [`Evaluator::set_jump_store`]) makes every `cd` bump that file.
     jump_store: Option<PathBuf>,
+    /// The directory `cd -` returns to: the cwd immediately before the last
+    /// real navigation (`cd`/`pushd`/`popd`/`j`). `None` until the first cwd
+    /// change. Held as a plain field exactly like `cwd` — session-scoped
+    /// ambient state, never persisted to disk. `cd -` restores this *exact*
+    /// `PathBuf` (byte-identical to the directory left), never a re-derived one.
+    oldpwd: Option<PathBuf>,
+    /// The `pushd`/`popd` directory stack: the directories *below* the current
+    /// `cwd`, which is always the conceptual top. `dirs` renders `[cwd] ++
+    /// dir_stack` (current first, bash's left-to-right order). Session-scoped
+    /// ambient state like `cwd`; never journaled or persisted to disk.
+    dir_stack: Vec<PathBuf>,
     /// Hexagonal effect ports (docs/ROADMAP.md R4). Every direct filesystem,
     /// spawn, clock, opener, and secret call the domain core makes routes
     /// through one of these instead of `std::*`. The defaults are the `Std*`
@@ -225,6 +236,8 @@ impl Evaluator {
             module_stack: Vec::new(),
             plans: Vec::new(),
             jump_store: None,
+            oldpwd: None,
+            dir_stack: Vec::new(),
             fs: Arc::new(StdFs),
             exec: Arc::new(StdExec),
             clock: Arc::new(StdClock),

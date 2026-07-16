@@ -196,11 +196,6 @@ const ENV_OVERRIDES: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Bool,
     ),
     (
-        "SHOAL_EDITOR_KEY_TIMEOUT_MS",
-        &["editor", "key_timeout_ms"],
-        EnvKind::UInt,
-    ),
-    (
         "SHOAL_KERNEL_ENABLED",
         &["kernel", "enabled"],
         EnvKind::Bool,
@@ -339,12 +334,6 @@ fn validate(c: &Config) -> Result<(), ConfigError> {
     }
     if !matches!(c.editor.mode.as_str(), "emacs" | "vi") {
         return Err(value_err("editor.mode", "must be `emacs` or `vi`"));
-    }
-    if c.editor.key_timeout_ms == 0 || c.editor.key_timeout_ms > 60_000 {
-        return Err(value_err(
-            "editor.key_timeout_ms",
-            "must be between 1 and 60000 (milliseconds)",
-        ));
     }
     if c.completion.max_results == 0 {
         return Err(value_err(
@@ -684,7 +673,6 @@ color = true
 [editor]
 mode = "vi"
 bracketed_paste = true
-key_timeout_ms = 40
 [editor.keybindings]
 "ctrl-r" = "history_search_backward"
 
@@ -752,7 +740,6 @@ hermetic = false
         assert_eq!(c.history.ignore, vec!["ls".to_string(), "cd *".to_string()]);
         assert_eq!(c.render.width, Some(120));
         assert_eq!(c.editor.mode, "vi");
-        assert_eq!(c.editor.key_timeout_ms, 40);
         assert_eq!(
             c.editor.keybindings.get("ctrl-r").map(String::as_str),
             Some("history_search_backward")

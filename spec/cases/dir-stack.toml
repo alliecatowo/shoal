@@ -1,0 +1,102 @@
+# `cd -`, OLDPWD, and the `pushd`/`popd`/`dirs` directory stack (TDD §4.6).
+#
+# Every case runs in a fresh temp cwd. `cd -` restores the EXACT `PathBuf` left
+# (not a re-canonicalized one), so round-trips compare equal regardless of any
+# symlink aliasing on the host's temp dir — hence the path-equality assertions
+# rather than literal absolute paths (which would be host-dependent). Stack
+# depth is checked with the integer `dirs.len()`, which is fully deterministic.
+# Interactive/journal-backed behavior the corpus can't express is covered by
+# Rust tests in shoal-eval (frecency.rs).
+
+# --- cd - / OLDPWD --------------------------------------------------------
+
+[[case]]
+name = "cd-dash-round-trips-to-previous-dir"
+fixture = ["sub/"]
+src = "let start = pwd\ncd sub\ncd -\nstart == pwd"
+value = "true"
+
+[[case]]
+name = "cd-dash-twice-returns-to-second-dir"
+fixture = ["sub/"]
+# `inner` leads the comparison so it dispatches EXPR — a bare `pwd` at
+# statement start would parse as the `pwd` command taking `== inner` as args.
+src = "cd sub\nlet inner = pwd\ncd -\ncd -\ninner == pwd"
+value = "true"
+
+[[case]]
+name = "cd-dash-without-oldpwd-errors"
+src = "cd -"
+error = "custom"
+error_contains = "OLDPWD"
+
+# --- dirs -----------------------------------------------------------------
+
+[[case]]
+name = "dirs-initial-is-current-dir-only"
+src = "dirs.len()"
+value = "1"
+
+[[case]]
+name = "dirs-first-element-is-cwd"
+src = "dirs.first() == pwd"
+value = "true"
+
+# --- pushd / popd ---------------------------------------------------------
+
+[[case]]
+name = "pushd-deepens-the-stack"
+fixture = ["a/"]
+src = "pushd a\ndirs.len()"
+value = "2"
+
+[[case]]
+name = "pushd-returns-the-new-stack-as-a-list"
+fixture = ["a/"]
+src = "(pushd a).len()"
+value = "2"
+
+[[case]]
+name = "pushd-popd-round-trips-to-origin"
+fixture = ["a/"]
+src = "let start = pwd\npushd a\npopd\nstart == pwd"
+value = "true"
+
+[[case]]
+name = "pushd-twice-then-popd-leaves-depth-two"
+fixture = ["a/", "b/"]
+src = "pushd a\npushd ../b\npopd\ndirs.len()"
+value = "2"
+
+[[case]]
+name = "popd-on-empty-stack-errors"
+src = "popd"
+error = "custom"
+error_contains = "empty"
+
+[[case]]
+name = "pushd-no-arg-swaps-top-two"
+fixture = ["a/"]
+src = "let start = pwd\npushd a\npushd\nstart == pwd"
+value = "true"
+
+[[case]]
+name = "pushd-no-arg-empty-stack-errors"
+src = "pushd"
+error = "custom"
+error_contains = "swap"
+
+# --- session-scope rule (mirrors cd, TDD §4.6) ----------------------------
+
+[[case]]
+name = "pushd-inside-fn-body-is-illegal"
+fixture = ["sub/"]
+src = "fn f() { pushd \"sub\" }\nf()"
+error = "custom"
+error_contains = "top level"
+
+[[case]]
+name = "popd-inside-fn-body-is-illegal"
+src = "fn f() { popd }\nf()"
+error = "custom"
+error_contains = "top level"

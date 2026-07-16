@@ -331,9 +331,9 @@ impl Evaluator {
             )
             .with_span(call.span)
         })?;
-        self.cwd = canon;
-        let cwd = self.cwd.clone();
-        self.record_cd(&cwd);
+        // Route through `change_cwd` so a jump also updates OLDPWD (a later
+        // `cd -` returns to where the jump left from) and records frecency.
+        self.change_cwd(canon);
         Ok(Value::Path(self.cwd.clone()))
     }
 

@@ -275,6 +275,12 @@ pub(crate) fn repl() -> Result<i32, String> {
                         // `out[n]` undo target into its recorded entry id so it
                         // resolves via the existing `undo <id>` path.
                         resolve_out_undo(&mut program, &out_entries);
+                        // Hand the evaluator this line's source so each journaled
+                        // top-level statement can slice its own `src` (TDD §9);
+                        // without this the `history`/`journal` view shows an empty
+                        // `src` column for every interactive entry, since
+                        // `stmt_source` has nothing to slice from.
+                        evaluator.set_source(run_src.clone());
                         let started_ns = now_ns();
                         match evaluator.eval_program(&program) {
                             Ok(value) => {
