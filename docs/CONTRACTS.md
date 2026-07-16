@@ -396,6 +396,7 @@ impl AdapterCatalog {
     pub fn empty() -> Self;
     pub fn load_dir(dir: &std::path::Path) -> (Self, Vec<String>);  // (catalog, warnings) — never fails hard
     pub fn lookup(&self, head: &str) -> Option<&CmdAdapter>;
+    pub fn names(&self) -> impl Iterator<Item = &str>;             // registered command heads (unordered); feeds command did-you-mean
 }
 pub struct CmdAdapter {
     pub name: String, pub bin: String, pub class: AdapterClass,

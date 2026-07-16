@@ -161,6 +161,14 @@ impl AdapterCatalog {
         self.cmds.get(head)
     }
 
+    /// The command heads this catalog knows. Order is unspecified — the sole
+    /// caller (the evaluator's command did-you-mean, TDD §13.9) sorts/dedups
+    /// across candidate sources — so this is just a cheap read view over the
+    /// registered names, no allocation.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.cmds.keys().map(String::as_str)
+    }
+
     pub fn len(&self) -> usize {
         self.cmds.len()
     }

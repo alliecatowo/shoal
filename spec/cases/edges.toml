@@ -45,6 +45,56 @@ name = "edge-command-not-found"
 src = "zzzznotarealcommandxyz123"
 error = "not_found"
 
+# §13.9 command did-you-mean: an unresolvable head that is a near-miss of a
+# KNOWN command earns a `did you mean 'X'?` hint (the command-head analogue of
+# the method did-you-mean). Candidates are host-independent — the canonical
+# builtin registry, adapter heads, and in-scope callable bindings — so no $PATH
+# scan taints the suggestion. The primary `not_found` code/message is unchanged;
+# only a hint is added, and both harnesses match `error_contains` against
+# msg-OR-hint. The conformance evaluator loads no adapters, so these cases pin
+# the builtin + session-binding sources (adapter + threshold coverage lives in
+# `crates/shoal-eval/src/command.rs`'s unit tests).
+[[case]]
+name = "edge-command-not-found-hint-journal"
+src = "journl"
+error = "not_found"
+error_contains = "did you mean 'journal'?"
+
+[[case]]
+name = "edge-command-not-found-hint-pushd"
+src = "puhd"
+error = "not_found"
+error_contains = "did you mean 'pushd'?"
+
+[[case]]
+name = "edge-command-not-found-hint-which"
+src = "wich"
+error = "not_found"
+error_contains = "did you mean 'which'?"
+
+[[case]]
+name = "edge-command-not-found-hint-sleep"
+src = "slee 1ms"
+error = "not_found"
+error_contains = "did you mean 'sleep'?"
+
+# A callable session binding (fn/alias) joins the candidate set, so a typo of a
+# just-defined command resolves to it.
+[[case]]
+name = "edge-command-not-found-hint-session-binding"
+src = "fn deploy() { 42 }\ndeployy"
+error = "not_found"
+error_contains = "did you mean 'deploy'?"
+
+# A head too far from anything known stays a bare `not_found` — no bogus hint.
+# (The harness can only assert a substring is PRESENT, so absence of a hint is
+# pinned precisely by the `command_suggestion` unit tests; this case documents
+# that a wildly-unlike head still errors cleanly with the unchanged code.)
+[[case]]
+name = "edge-command-not-found-no-hint-when-far"
+src = "xyzzy"
+error = "not_found"
+
 # --- §13.15: shadowing a command is legal; `^name` always escapes it -----
 
 [[case]]
