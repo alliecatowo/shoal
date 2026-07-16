@@ -124,10 +124,20 @@ impl Kernel {
 
     pub fn open(state_dir: impl AsRef<Path>) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
         let state_dir = state_dir.as_ref();
+        let journal = Journal::open(state_dir)?;
+        let events = EventBus::default();
+        // P2 fix: reopening an EXISTING on-disk store must resume its
+        // `journal`/`session.transcript` seq state, not restart both at 0 —
+        // see `EventBus::seed_from_journal` for why (a reconnecting agent's
+        // persisted `since=N` cursor would otherwise collide with a
+        // brand-new seq the freshly-restarted kernel hands out starting
+        // from 0 again). A fresh, empty store is a no-op: both channels
+        // correctly still start at 0.
+        events.seed_from_journal(&journal);
         Ok(Arc::new(Self {
             sessions: Mutex::new(HashMap::new()),
             next_client: AtomicU64::new(1),
-            journal: Mutex::new(Journal::open(state_dir)?),
+            journal: Mutex::new(journal),
             state_dir: Some(state_dir.to_path_buf()),
             policy: permissive_policy(),
             plans: Mutex::new(HashMap::new()),
@@ -135,7 +145,7 @@ impl Kernel {
             next_task: AtomicU64::new(1),
             ptys: Mutex::new(HashMap::new()),
             next_pty: AtomicU64::new(1),
-            events: Arc::new(EventBus::default()),
+            events: Arc::new(events),
             auth: Some(Mutex::new(TokenStore::open(state_dir.join("tokens.json"))?)),
         }))
     }
@@ -145,10 +155,14 @@ impl Kernel {
         policy: Policy,
     ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
         let state_dir = state_dir.as_ref();
+        let journal = Journal::open(state_dir)?;
+        let events = EventBus::default();
+        // Same restart-seq-continuity fix as `Kernel::open` above.
+        events.seed_from_journal(&journal);
         Ok(Arc::new(Self {
             sessions: Mutex::new(HashMap::new()),
             next_client: AtomicU64::new(1),
-            journal: Mutex::new(Journal::open(state_dir)?),
+            journal: Mutex::new(journal),
             state_dir: Some(state_dir.to_path_buf()),
             policy,
             plans: Mutex::new(HashMap::new()),
@@ -156,7 +170,7 @@ impl Kernel {
             next_task: AtomicU64::new(1),
             ptys: Mutex::new(HashMap::new()),
             next_pty: AtomicU64::new(1),
-            events: Arc::new(EventBus::default()),
+            events: Arc::new(events),
             auth: Some(Mutex::new(TokenStore::open(state_dir.join("tokens.json"))?)),
         }))
     }
@@ -2314,6 +2328,193 @@ mod tests {
             assert_eq!(&ev["payload"]["v"]["ref"]["v"], want_ref);
         }
 
+        drop(client);
+        drop(reader);
+        thread.join().unwrap();
+    }
+
+    /// P2 fix (architecture audit): event-bus seq state for BOTH
+    /// journal-backed channels must survive a real kernel RESTART, not just
+    /// live within one process's lifetime. Before this fix, `Kernel::open`
+    /// always built a brand-new, unseeded `EventBus::default()` — so
+    /// reopening an EXISTING on-disk store reset both channels' `next_seq`
+    /// to 0 and their durable indexes to empty, even though the store itself
+    /// still held every entry from the prior process. A reconnecting agent's
+    /// persisted `since=N` cursor would then get an empty read, and the
+    /// freshly-restarted kernel's own next publish would collide with
+    /// whatever seq 0 meant in the PRIOR lifetime.
+    ///
+    /// Simulates a restart with two SEPARATE `Kernel::open` calls against the
+    /// same on-disk state dir, one after the other (never both alive at
+    /// once — a real process restart, not two concurrent kernels sharing a
+    /// store). The "prior lifetime" execs are 3-statement programs, exactly
+    /// like `journal_channel_replay_excludes_evaluator_per_statement_entries`,
+    /// so the on-disk store also holds the session evaluator's own
+    /// per-statement rows — proving the seeded index still reflects the
+    /// CHANNEL after a restart, not every row in the store.
+    #[test]
+    fn event_bus_seq_state_survives_a_kernel_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let pre_restart_execs = 5usize;
+
+        // "Prior lifetime": open, run a few execs, then drop the kernel
+        // entirely (closing its journal handle) before reopening.
+        {
+            let kernel = Kernel::open(dir.path()).unwrap();
+            let (mut client, mut reader, thread) = spawn(&kernel);
+            attach(&mut client, &mut reader);
+            for i in 0..pre_restart_execs {
+                let r = call(
+                    &mut client,
+                    &mut reader,
+                    100 + i as i64,
+                    "exec",
+                    json!({"src":"let a = 1\nlet b = 2\na + b"}),
+                );
+                assert!(r.error.is_none(), "prelude exec {i} failed: {:?}", r.error);
+            }
+            drop(client);
+            drop(reader);
+            thread.join().unwrap();
+        }
+
+        // Sanity: the on-disk store holds more rows than execs (the
+        // evaluator's own per-statement entries are in there too).
+        let total_rows = Journal::open(dir.path())
+            .unwrap()
+            .query(&JournalQuery {
+                limit: 1_000_000,
+                ..Default::default()
+            })
+            .unwrap()
+            .len();
+        assert!(
+            total_rows > pre_restart_execs,
+            "the on-disk store should also hold per-statement rows: {total_rows} rows for \
+             {pre_restart_execs} execs"
+        );
+
+        // "Restart": a brand-new `Kernel::open` (fresh `EventBus::default()`)
+        // against the exact same on-disk state dir.
+        let kernel2 = Kernel::open(dir.path()).unwrap();
+        let (mut client2, mut reader2, thread2) = spawn(&kernel2);
+        attach(&mut client2, &mut reader2);
+
+        // A newly published `journal` event must continue past the
+        // pre-existing (coarse) journal-channel entry count — never reset
+        // to 0 and never collide with a pre-restart seq.
+        let exec = call(
+            &mut client2,
+            &mut reader2,
+            200,
+            "exec",
+            json!({"src":"1 + 1"}),
+        );
+        assert!(
+            exec.error.is_none(),
+            "post-restart exec failed: {:?}",
+            exec.error
+        );
+
+        let read_after = call(
+            &mut client2,
+            &mut reader2,
+            201,
+            "events.read",
+            json!({"channel":"journal","since":0}),
+        );
+        let events_after = read_after.result.unwrap()["events"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let newest_seq = events_after
+            .last()
+            .expect("at least the just-published post-restart event")["seq"]
+            .as_u64()
+            .unwrap();
+        assert!(
+            newest_seq >= pre_restart_execs as u64,
+            "(a) a newly-published journal seq ({newest_seq}) must continue past the \
+             {pre_restart_execs} pre-restart journal entries, not reset to 0: {events_after:?}"
+        );
+
+        // (b) The pre-restart journal events are still replayable: reading
+        // since=0 (aged out of the brand-new, empty ring) reconstructs them
+        // from the durable journal — exactly `pre_restart_execs - 1` of them
+        // (since=0 excludes seq 0 itself), each the coarse whole-submission
+        // entry, not a per-statement phantom.
+        let pre_restart_events: Vec<&Json> = events_after
+            .iter()
+            .filter(|e| e["seq"].as_u64().unwrap() < pre_restart_execs as u64)
+            .collect();
+        assert_eq!(
+            pre_restart_events.len(),
+            pre_restart_execs - 1,
+            "replay after restart must recover exactly the pre-restart journal events, no more \
+             (per-statement rows) and no fewer: {events_after:?}"
+        );
+        for ev in &pre_restart_events {
+            assert_eq!(
+                ev["payload"]["v"]["head"]["v"], "let",
+                "a reconstructed pre-restart event must be the coarse entry, not a \
+                 per-statement row: {ev}"
+            );
+        }
+
+        // (c) Same replay-survives-restart property for `session.transcript`
+        // — every pre-restart exec here succeeded, so each has a persisted
+        // transcript row too.
+        let transcript_read = call(
+            &mut client2,
+            &mut reader2,
+            202,
+            "events.read",
+            json!({"channel":"session.transcript","since":0}),
+        );
+        let transcript_events = transcript_read.result.unwrap()["events"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let pre_restart_transcript: Vec<&Json> = transcript_events
+            .iter()
+            .filter(|e| e["seq"].as_u64().unwrap() < pre_restart_execs as u64)
+            .collect();
+        assert_eq!(
+            pre_restart_transcript.len(),
+            pre_restart_execs - 1,
+            "replay after restart must recover the pre-restart transcript events too: \
+             {transcript_events:?}"
+        );
+
+        drop(client2);
+        drop(reader2);
+        thread2.join().unwrap();
+    }
+
+    /// Companion to the restart test above: a brand-new on-disk store (the
+    /// common case — most `Kernel::open` calls are not reopening a
+    /// previously used store) must still start both journal-backed
+    /// channels' seqs at 0, exactly as before this fix.
+    #[test]
+    fn kernel_open_on_a_fresh_store_still_starts_journal_channel_seqs_at_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let kernel = Kernel::open(dir.path()).unwrap();
+        let (mut client, mut reader, thread) = spawn(&kernel);
+        attach(&mut client, &mut reader);
+        let exec = call(&mut client, &mut reader, 1, "exec", json!({"src":"1 + 1"}));
+        assert!(exec.error.is_none());
+        let read = call(
+            &mut client,
+            &mut reader,
+            2,
+            "events.read",
+            json!({"channel":"journal","since":null}),
+        );
+        let events = read.result.unwrap()["events"].as_array().unwrap().clone();
+        assert_eq!(
+            events[0]["seq"], 0,
+            "a fresh on-disk store's first journal event must still start at seq 0: {events:?}"
+        );
         drop(client);
         drop(reader);
         thread.join().unwrap();

@@ -29,7 +29,11 @@ pub(crate) struct EventBus {
     ///
     /// Written (under the `channels` lock, so it can never diverge from the
     /// seqs the ring hands out) only by `publish_journal`; read by the
-    /// kernel's `read_journal_channel` fallback.
+    /// kernel's `read_journal_channel` fallback. Also rebuilt WHOLESALE, once,
+    /// at kernel construction time by [`EventBus::seed_from_journal`] (P2:
+    /// event-bus seqs surviving a kernel restart) when reopening an existing
+    /// on-disk store — see that method for how it recovers exactly this same
+    /// membership/order from durable state alone.
     journal_index: Mutex<Vec<i64>>,
     /// The same dense-index idea as `journal_index`, for the
     /// `session.transcript` channel (the G2 follow-up this closes): indexed
@@ -41,6 +45,8 @@ pub(crate) struct EventBus {
     /// at the same call site that publishes the live event. Written only by
     /// `publish_transcript`; read by `read_transcript_channel`. `approval`/
     /// `render`/`user.*` still touch neither index — they stay ring-only.
+    /// Also rebuilt at construction time by [`EventBus::seed_from_journal`],
+    /// same as `journal_index` above.
     transcript_index: Mutex<Vec<i64>>,
 }
 
@@ -422,6 +428,101 @@ impl EventBus {
             keep
         });
     }
+
+    /// Rebuild `journal`/`session.transcript` seq state from an EXISTING
+    /// on-disk journal's rows (P2 fix, AGENT-SURFACE §4's "replayable from
+    /// ANY seq" promise): called once, by `Kernel::open`/`open_with_policy`,
+    /// BEFORE the kernel starts serving any connection — so a freshly-built
+    /// `EventBus::default()` re-mounting a store a PRIOR kernel process
+    /// already wrote to starts both channels' seq counters past whatever
+    /// that prior lifetime handed out, instead of colliding a reconnecting
+    /// agent's persisted `since=N` cursor with a brand-new seq climbing from
+    /// 0 again.
+    ///
+    /// Precisely reconstructs the SAME membership `publish_journal`/
+    /// `publish_transcript` would have built incrementally in memory during
+    /// the prior lifetime, from durable state alone — no schema change, no
+    /// touching `shoal-journal`:
+    /// - `journal`: an entry is a coarse, whole-submission entry (the kind
+    ///   `handle_exec` appends exactly once per `exec` call — the ONLY kind
+    ///   that ever fires a `journal` event) iff its `ast` column
+    ///   deserializes as a [`shoal_ast::Program`], the shape `handle_exec`
+    ///   always records there (`serde_json::to_string(&ast)` where `ast:
+    ///   Program`). A session's own evaluator instead journals one entry per
+    ///   top-level STATEMENT (`shoal-eval`'s `journal_begin_stmt`), each
+    ///   recording a bare [`shoal_ast::Stmt`] (internally tagged `kind`, no
+    ///   `stmts` field) — that shape fails to deserialize as a `Program`, so
+    ///   those rows are correctly excluded, exactly as the in-memory index
+    ///   already excluded them within one process lifetime (pinned by
+    ///   `journal_channel_replay_excludes_evaluator_per_statement_entries`).
+    /// - `session.transcript`: exactly the coarse entries (from the filter
+    ///   above) that also have a persisted `transcript_event` row —
+    ///   `Journal::transcript_events_by_entry` already silently skips any id
+    ///   without one (the error-exec path never records one), so this is
+    ///   precisely the successful-exec subset, in the same ascending order
+    ///   the live channel always assigned.
+    ///
+    /// Both indexes are seeded oldest-first (seq 0 == the earliest surviving
+    /// entry), in ascending entry-id order — the same order concurrent
+    /// `handle_exec` calls assign seqs in live, since a publish always
+    /// follows its own entry's append.
+    ///
+    /// Best-effort: a query failure (corrupt store, I/O error) leaves the
+    /// affected channel(s) seeded at zero — no worse than before this fix,
+    /// never a hard failure of kernel construction. An empty store is a
+    /// no-op: both channels correctly start at 0, same as an ephemeral
+    /// in-memory kernel.
+    pub(crate) fn seed_from_journal(&self, journal: &Journal) {
+        let Ok(mut entries) = journal.query(&JournalQuery {
+            // The whole store, oldest-to-newest once reversed below — the
+            // only way to enumerate every existing row through the existing
+            // filtered-query API (there is no dedicated count/list-ids call,
+            // and adding one is a `shoal-journal` schema/API change out of
+            // this fix's lane).
+            limit: i64::MAX as usize,
+            ..Default::default()
+        }) else {
+            return;
+        };
+        if entries.is_empty() {
+            return;
+        }
+        // `query` is newest-first (`ORDER BY id DESC`); every index here is
+        // oldest-first.
+        entries.reverse();
+        let coarse_ids: Vec<i64> = entries
+            .iter()
+            .filter(|e| serde_json::from_str::<Program>(&e.ast_json).is_ok())
+            .map(|e| e.id)
+            .collect();
+        self.seed_index(&self.journal_index, "journal", &coarse_ids);
+        if let Ok(rows) = journal.transcript_events_by_entry(&coarse_ids) {
+            let transcript_ids: Vec<i64> = rows.iter().map(|r| r.entry_id).collect();
+            self.seed_index(
+                &self.transcript_index,
+                "session.transcript",
+                &transcript_ids,
+            );
+        }
+    }
+
+    /// Shared seeding step for one durable index (see
+    /// [`EventBus::seed_from_journal`]): append `entry_ids` (already
+    /// ascending, already the exact membership for `channel`) and set that
+    /// channel's `next_seq` to match, so the first post-restart publish
+    /// continues from N rather than colliding with seq 0..N-1. Only ever
+    /// called before this bus is shared with a serving kernel, so there is
+    /// no concurrent publish to race with.
+    fn seed_index(&self, index: &Mutex<Vec<i64>>, channel: &str, entry_ids: &[i64]) {
+        if entry_ids.is_empty() {
+            return;
+        }
+        let mut idx = index.lock().unwrap();
+        idx.extend_from_slice(entry_ids);
+        let mut channels = self.channels.lock().unwrap();
+        let buf = channels.entry(channel.to_string()).or_default();
+        buf.next_seq = idx.len() as u64;
+    }
 }
 
 fn write_json_notification(writer: &mut UnixStream, value: &Json) -> io::Result<()> {
@@ -486,12 +587,20 @@ impl Kernel {
             return Ok(self.events.read("journal", since, None));
         }
         let mut out: Vec<Event> = Vec::new();
-        // Reconstruct the gap below the ring, if `since` reaches into it.
-        if let Some(oldest) = self.events.ring_oldest_seq("journal") {
-            let want = self.events.journal_index_range(since, oldest);
-            if !want.is_empty() {
-                out = self.reconstruct_journal_events(&want)?;
-            }
+        // Reconstruct the gap below the ring, if `since` reaches into it. The
+        // ring can be genuinely EMPTY here even though `published > 0`: right
+        // after a kernel restart, `EventBus::seed_from_journal` seeds the
+        // durable index from a pre-existing store but deliberately leaves the
+        // ring untouched, and nothing has been published yet in this fresh
+        // process — `ring_oldest_seq` returns `None` in exactly that case
+        // (impossible pre-seeding, since every publish always pushed into
+        // both the ring and the index together). Treat "no ring yet" as
+        // "everything published so far is aged out", not "nothing to
+        // reconstruct" — `published` itself is the right upper bound.
+        let oldest = self.events.ring_oldest_seq("journal").unwrap_or(published);
+        let want = self.events.journal_index_range(since, oldest);
+        if !want.is_empty() {
+            out = self.reconstruct_journal_events(&want)?;
         }
         // Then the ring tail (fast path, byte-for-byte as before).
         out.extend(self.events.read("journal", since, None));
@@ -575,11 +684,15 @@ impl Kernel {
             return Ok(self.events.read("session.transcript", since, None));
         }
         let mut out: Vec<Event> = Vec::new();
-        if let Some(oldest) = self.events.ring_oldest_seq("session.transcript") {
-            let want = self.events.transcript_index_range(since, oldest);
-            if !want.is_empty() {
-                out = self.reconstruct_transcript_events(&want)?;
-            }
+        // Same ring-can-be-empty-but-published>0 fallback as
+        // `read_journal_channel` above (post-restart, pre-first-publish).
+        let oldest = self
+            .events
+            .ring_oldest_seq("session.transcript")
+            .unwrap_or(published);
+        let want = self.events.transcript_index_range(since, oldest);
+        if !want.is_empty() {
+            out = self.reconstruct_transcript_events(&want)?;
         }
         out.extend(self.events.read("session.transcript", since, None));
         if let Some(limit) = limit
@@ -871,5 +984,134 @@ mod tests {
         bus.unsubscribe(1, "user.bye");
         assert_eq!(bus.subs.lock().unwrap().len(), 0);
         drop(client_end);
+    }
+
+    // -----------------------------------------------------------------------
+    // `EventBus::seed_from_journal` (P2: seqs surviving a kernel restart).
+    // -----------------------------------------------------------------------
+
+    /// Appends one "coarse" entry (`ast` = a whole [`Program`]) to `journal`,
+    /// optionally preceded by a "fine" per-statement entry (`ast` = a bare
+    /// [`Stmt`]) — mirroring exactly what a real on-disk kernel session
+    /// leaves behind: `handle_exec`'s own coarse entry plus the session
+    /// evaluator's per-statement ones, sharing the same store. Returns the
+    /// coarse entry's id. `with_transcript` mirrors a successful exec also
+    /// recording a `session.transcript` row for that same entry.
+    fn append_simulated_exec(journal: &Journal, with_fine_row: bool, with_transcript: bool) -> i64 {
+        let stmt = Stmt::Return {
+            value: None,
+            span: shoal_ast::Span::default(),
+        };
+        if with_fine_row {
+            let fine_id = journal
+                .append(&EntryRecord {
+                    session: "s".into(),
+                    principal: "human".into(),
+                    ts_ns: 0,
+                    cwd: vec![],
+                    src: "return".into(),
+                    ast_json: serde_json::to_string(&stmt).unwrap(),
+                    effects_json: "[]".into(),
+                    opaque: false,
+                })
+                .unwrap();
+            journal.finish(fine_id, Some(0), true, 0).unwrap();
+        }
+        let program = Program { stmts: vec![stmt] };
+        let coarse_id = journal
+            .append(&EntryRecord {
+                session: "s".into(),
+                principal: "human".into(),
+                ts_ns: 0,
+                cwd: vec![],
+                src: "return".into(),
+                ast_json: serde_json::to_string(&program).unwrap(),
+                effects_json: "[]".into(),
+                opaque: false,
+            })
+            .unwrap();
+        journal.finish(coarse_id, Some(0), true, 0).unwrap();
+        if with_transcript {
+            journal.record_transcript_event(coarse_id, 0, "{}").unwrap();
+        }
+        coarse_id
+    }
+
+    /// The core P2 regression: seeding from an on-disk store that already
+    /// holds prior "exec" entries must (1) recover ONLY the coarse
+    /// whole-submission entries into `journal_index` — the interleaved fine
+    /// per-statement rows a real session evaluator also writes must be
+    /// excluded, exactly as the in-memory index already excludes them within
+    /// one process lifetime — (2) recover only the subset with a persisted
+    /// transcript row into `transcript_index`, and (3) leave both channels'
+    /// `next_seq` past the seeded count, so the very next publish continues
+    /// rather than colliding with seq 0.
+    #[test]
+    fn seed_from_journal_recovers_coarse_entries_and_seq_continues() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::open(dir.path()).unwrap();
+
+        // Three simulated execs, each with an interleaved fine per-statement
+        // row; only the first two get a transcript row (the third stands in
+        // for a failed exec: journaled, but no session.transcript event).
+        let coarse_a = append_simulated_exec(&journal, true, true);
+        let coarse_b = append_simulated_exec(&journal, true, true);
+        let coarse_c = append_simulated_exec(&journal, true, false);
+
+        let bus = EventBus::default();
+        bus.seed_from_journal(&journal);
+
+        assert_eq!(
+            bus.journal_published_count(),
+            3,
+            "only the 3 coarse entries seed the journal index, not the 3 interleaved fine rows"
+        );
+        assert_eq!(
+            bus.journal_index_range(None, 3),
+            vec![(0, coarse_a), (1, coarse_b), (2, coarse_c)],
+            "seeded oldest-first, in ascending entry-id order"
+        );
+        assert_eq!(
+            bus.transcript_published_count(),
+            2,
+            "only the 2 coarse entries with a persisted transcript_event row seed the \
+             transcript index"
+        );
+        assert_eq!(
+            bus.transcript_index_range(None, 2),
+            vec![(0, coarse_a), (1, coarse_b)],
+        );
+
+        // The next publish on each channel continues from the seeded count,
+        // not 0 — no collision with a cursor a pre-restart agent might hold.
+        let journal_event = bus.publish_journal(999, json!({"probe": true}));
+        assert_eq!(
+            journal_event.seq, 3,
+            "journal seq must continue past the seeded count, not reset to 0"
+        );
+        let transcript_event = bus.publish_transcript(999, json!({"probe": true}));
+        assert_eq!(
+            transcript_event.seq, 2,
+            "transcript seq must continue past the seeded count, not reset to 0"
+        );
+    }
+
+    /// Zero-regression companion: seeding from a brand-new, empty store (the
+    /// common case — most kernel opens are not a restart of a previously
+    /// used store) must be a no-op, leaving both channels starting at seq 0
+    /// exactly as an ephemeral in-memory kernel does.
+    #[test]
+    fn seed_from_journal_is_a_no_op_on_a_fresh_empty_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::open(dir.path()).unwrap();
+        let bus = EventBus::default();
+        bus.seed_from_journal(&journal);
+        assert_eq!(bus.journal_published_count(), 0);
+        assert_eq!(bus.transcript_published_count(), 0);
+        let event = bus.publish_journal(1, json!({}));
+        assert_eq!(
+            event.seq, 0,
+            "a fresh empty store must still start seqs at 0"
+        );
     }
 }
