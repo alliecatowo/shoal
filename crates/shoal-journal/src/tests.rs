@@ -1,5 +1,6 @@
 use super::*;
 use crate::cas::TRUNCATION_MARKER;
+use crate::schema::CURRENT_SCHEMA_VERSION;
 
 fn rec(session: &str, principal: &str, ts_ns: i64, src: &str) -> EntryRecord {
     EntryRecord {
@@ -104,6 +105,94 @@ fn open_creates_tree_and_wal_mode() {
         .query_row("PRAGMA journal_mode", [], |r| r.get(0))
         .unwrap();
     assert_eq!(mode.to_lowercase(), "wal");
+}
+
+#[test]
+fn fresh_on_disk_db_is_stamped_to_current_schema_version() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let j = Journal::open(dir.path()).unwrap();
+        j.append(&rec("s", "human", 1, "echo hi")).unwrap();
+    } // drop the handle so a fresh connection reads the persisted header cleanly
+    let conn = Connection::open(dir.path().join("journal.db")).unwrap();
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, CURRENT_SCHEMA_VERSION);
+}
+
+#[test]
+fn reopening_preserves_schema_version_and_data() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let j = Journal::open(dir.path()).unwrap();
+        j.append(&rec("s", "human", 1, "echo persists")).unwrap();
+    }
+    let j = Journal::open(dir.path()).unwrap();
+    let rows = j.query(&JournalQuery::default()).unwrap();
+    assert_eq!(rows.len(), 1, "data must survive a reopen");
+    assert_eq!(rows[0].src, "echo persists");
+    let version: i64 = j
+        .conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, CURRENT_SCHEMA_VERSION);
+}
+
+#[test]
+fn a_schema_version_from_a_newer_shoal_refuses_to_open() {
+    let dir = tempfile::tempdir().unwrap();
+    // Open once (stamps CURRENT_SCHEMA_VERSION), then hand-stamp a version this build has
+    // never heard of — simulating a `journal.db` last written by a newer shoal.
+    {
+        let j = Journal::open(dir.path()).unwrap();
+        drop(j);
+        let conn = Connection::open(dir.path().join("journal.db")).unwrap();
+        conn.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION + 1)
+            .unwrap();
+    }
+    // `Journal` has no `Debug` impl, so `unwrap_err` (which needs `T: Debug` for its panic
+    // message) can't be called directly on `Result<Journal, _>`; discard the `Ok` payload first.
+    let err = Journal::open(dir.path()).map(|_| ()).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("newer") && msg.contains("schema version"),
+        "error should clearly name a too-new schema version, got: {msg}"
+    );
+}
+
+#[test]
+fn legacy_zero_version_db_is_adopted_without_losing_rows() {
+    // Simulate a "legacy" database: tables already exist (created by a real `Journal::open`,
+    // so their shape is exactly today's), but `user_version` is 0 — either because this row
+    // predates the versioning scaffold entirely, or (as done here) because we force it back to
+    // 0 by hand after the fact. Either way `migrate` must adopt it to CURRENT without touching
+    // the data.
+    let dir = tempfile::tempdir().unwrap();
+    let id;
+    {
+        let j = Journal::open(dir.path()).unwrap();
+        id = j.append(&rec("s", "human", 1, "echo legacy")).unwrap();
+    }
+    {
+        // Force the just-stamped version back to 0, as if this were pre-versioning.
+        let conn = Connection::open(dir.path().join("journal.db")).unwrap();
+        conn.pragma_update(None, "user_version", 0i64).unwrap();
+    }
+
+    let j = Journal::open(dir.path()).expect("a legacy user_version=0 db must still open");
+    let rows = j.query(&JournalQuery::default()).unwrap();
+    assert_eq!(rows.len(), 1, "the pre-existing row must survive adoption");
+    assert_eq!(rows[0].id, id);
+    assert_eq!(rows[0].src, "echo legacy");
+    let version: i64 = j
+        .conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        version, CURRENT_SCHEMA_VERSION,
+        "adoption must stamp the current version"
+    );
 }
 
 #[test]
@@ -590,6 +679,26 @@ fn in_memory_cas_lives_with_journal() {
     let h = j.record_output(id, "stdout", b"hi\n").unwrap();
     // The tempdir CAS must still be readable as long as the Journal lives.
     assert_eq!(j.read_blob(&h).unwrap().unwrap(), b"hi\n");
+}
+
+#[test]
+fn in_memory_journal_is_stamped_to_current_schema_version_and_stays_usable() {
+    // Ephemeral/in-memory journals must be no-op-safe through `migrate`: a fresh in-memory
+    // database starts at user_version 0 (same as a fresh on-disk one), so this exercises the
+    // exact same "fresh database" arm, just without any file on disk.
+    let j = Journal::in_memory().unwrap();
+    let version: i64 = j
+        .conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, CURRENT_SCHEMA_VERSION);
+
+    // And it must still be fully usable afterward.
+    let id = j.append(&rec("s", "human", 1, "echo hi")).unwrap();
+    j.finish(id, Some(0), true, 1).unwrap();
+    let rows = j.query(&JournalQuery::default()).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, id);
 }
 
 #[test]

@@ -94,7 +94,7 @@ impl Journal {
         // journaling call site swallows errors, so a busy failure here silently
         // drops the entry and its undo inverse. See `JournalOptions::busy_timeout`.
         conn.busy_timeout(options.busy_timeout)?;
-        Self::init_schema(&conn)?;
+        Self::migrate(&conn)?;
         Ok(Journal {
             conn,
             cas_root,
@@ -115,7 +115,7 @@ impl Journal {
         fs::create_dir_all(&cas_root).map_err(io_to_sql)?;
         let conn = Connection::open_in_memory()?;
         conn.busy_timeout(options.busy_timeout)?;
-        Self::init_schema(&conn)?;
+        Self::migrate(&conn)?;
         Ok(Journal {
             conn,
             cas_root,

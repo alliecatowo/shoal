@@ -271,7 +271,19 @@ SQLite (rusqlite bundled) + blake3 CAS. Schema per TDD §9 (entry/output/undo/pi
 tables; WAL mode). `transcript_event` was added additively (`CREATE TABLE IF NOT EXISTS` inside
 `init_schema`, which runs on every `open`/`open_with_options`/`in_memory` call) — a pre-existing
 `journal.db` written before this table existed opens unchanged and gains the table the next time it
-is opened; no versioned migration step exists or is needed for column/table additions in this crate.
+is opened; additive column/table changes still need no versioned migration step.
+
+Arch finding P8 (schema-version scaffold, ahead of shoal's first non-additive migration): every
+open (`open_with_options`/`in_memory_with_options`, and therefore `open`/`in_memory`) now runs
+`Journal::migrate` (`schema.rs`, crate-private — no public API change), which stamps SQLite's
+built-in `PRAGMA user_version` to a crate-private `CURRENT_SCHEMA_VERSION: i64 = 1` after
+`init_schema`. A fresh database or a legacy pre-versioning one (`user_version == 0`, tables already
+matching because every change to date has been additive) is adopted to `CURRENT_SCHEMA_VERSION`
+with zero data loss and zero DDL; a database already at `CURRENT_SCHEMA_VERSION` is left alone; one
+stamped by a *newer* shoal (`user_version > CURRENT_SCHEMA_VERSION`) makes `open`/`in_memory` return
+a clear `rusqlite::Error` instead of risking a silent misread. `1..CURRENT_SCHEMA_VERSION` is a
+documented, currently-unreachable dispatch point for the first real (non-additive) migration,
+whenever one ships — see the doc comment on `Journal::migrate` for the exact recipe.
 
 ```rust
 use std::path::Path;
