@@ -189,6 +189,8 @@ const ENV_OVERRIDES: &[(&str, &[&str], EnvKind)] = &[
     ("SHOAL_HISTORY_DEDUP", &["history", "dedup"], EnvKind::Bool),
     ("SHOAL_RENDER_COLOR", &["render", "color"], EnvKind::Bool),
     ("SHOAL_RENDER_WIDTH", &["render", "width"], EnvKind::UInt),
+    ("SHOAL_RENDER_PAGING", &["render", "paging"], EnvKind::Str),
+    ("SHOAL_RENDER_PAGER", &["render", "pager"], EnvKind::Str),
     ("SHOAL_EDITOR_MODE", &["editor", "mode"], EnvKind::Str),
     (
         "SHOAL_EDITOR_BRACKETED_PASTE",
@@ -334,6 +336,9 @@ fn validate(c: &Config) -> Result<(), ConfigError> {
     }
     if !matches!(c.editor.mode.as_str(), "emacs" | "vi") {
         return Err(value_err("editor.mode", "must be `emacs` or `vi`"));
+    }
+    if !matches!(c.render.paging.as_str(), "never" | "auto") {
+        return Err(value_err("render.paging", "must be `never` or `auto`"));
     }
     if c.completion.max_results == 0 {
         return Err(value_err(
@@ -532,6 +537,48 @@ mod tests {
         assert_eq!(l.config.kernel.session, "work");
     }
 
+    /// `render.paging` defaults to `"never"` (identical behavior to before
+    /// this knob existed — an unconfigured shoal never pages) and is
+    /// settable via either the config file or `SHOAL_RENDER_PAGING`/
+    /// `SHOAL_RENDER_PAGER`.
+    #[test]
+    fn render_paging_defaults_to_never_and_is_env_overridable() {
+        assert_eq!(Config::default().render.paging, "never");
+        assert_eq!(Config::default().render.pager, None);
+
+        let l = load(&opts(
+            None,
+            None,
+            None,
+            vec![
+                ("SHOAL_RENDER_PAGING", "auto"),
+                ("SHOAL_RENDER_PAGER", "bat --paging=always"),
+            ],
+        ))
+        .unwrap();
+        assert_eq!(l.config.render.paging, "auto");
+        assert_eq!(
+            l.config.render.pager.as_deref(),
+            Some("bat --paging=always")
+        );
+    }
+
+    #[test]
+    fn render_paging_rejects_anything_other_than_never_or_auto() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("c");
+        fs::write(&p, "[render]\npaging = \"always\"\n").unwrap();
+        let err = load(&opts(None, Some(p), None, vec![])).unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::Value {
+                source: None,
+                key: "render.paging".into(),
+                message: "must be `never` or `auto`".into(),
+            }
+        );
+    }
+
     #[test]
     fn no_color_env_forces_render_color_off_even_if_config_says_true() {
         let t = tempfile::tempdir().unwrap();
@@ -669,6 +716,8 @@ ignore_space = true
 [render]
 width = 120
 color = true
+paging = "auto"
+pager = "less -R"
 
 [editor]
 mode = "vi"
@@ -739,6 +788,8 @@ hermetic = false
         assert!(c.history.dedup);
         assert_eq!(c.history.ignore, vec!["ls".to_string(), "cd *".to_string()]);
         assert_eq!(c.render.width, Some(120));
+        assert_eq!(c.render.paging, "auto");
+        assert_eq!(c.render.pager.as_deref(), Some("less -R"));
         assert_eq!(c.editor.mode, "vi");
         assert_eq!(
             c.editor.keybindings.get("ctrl-r").map(String::as_str),

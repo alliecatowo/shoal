@@ -99,6 +99,20 @@ pub struct History {
 pub struct Render {
     pub width: Option<usize>,
     pub color: bool,
+    /// Opt-in gate for the interactive REPL's pager integration
+    /// (docs/CONFIG.md §5): `"never"` (the default — identical behavior to
+    /// before this knob existed) never pages; `"auto"` pipes the REPL's
+    /// *final* rendered result through a pager when stdout is a real TTY and
+    /// the output would not fit on one screen. Never engages for `-c`/script
+    /// runs, and never engages for mid-statement values inside a
+    /// multi-statement line — see `crates/shoal/src/repl.rs`'s
+    /// `render_result_paged`.
+    pub paging: String,
+    /// Explicit pager command, e.g. `"less -R"` or `"bat --paging=always"`.
+    /// `None` (the default) falls back to `$PAGER`, then to the built-in
+    /// `less -R` (the `-R` matters: rendered output is colorized ANSI, and
+    /// plain `less` would print raw escape codes instead of color).
+    pub pager: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -238,6 +252,8 @@ impl Default for Render {
         Self {
             width: None,
             color: true,
+            paging: "never".into(),
+            pager: None,
         }
     }
 }
