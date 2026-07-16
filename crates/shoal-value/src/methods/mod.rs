@@ -54,19 +54,27 @@ fn dispatch(ctx: &mut dyn CallCtx, recv: Value, name: &str, args: CallArgs) -> V
         ctx.call_closure(f, vec![recv.clone()])?;
         return Ok(recv);
     }
-    // Lazy CAS-backed bytes (TDD §317). The cheap, no-load answers come from the
-    // metadata; `.load`/`.bytes` materialize to a resident `bytes`; `.ref`
-    // yields the recoverable `val:blake3:…` handle; anything else materializes
-    // the full content once and re-dispatches through the normal `bytes` path,
-    // so no per-method arm has to know about CAS backing.
+    // Lazy CAS-backed bytes (TDD §317, centralized per the P6 audit). The
+    // cheap, no-load answers (`len`/`count`/`is_empty`/`ref`) are the ONE
+    // `CasBytesVal::cheap_method` chokepoint — every site that needs a
+    // metadata-only answer calls it instead of hand-rolling this match, so it
+    // can't silently drift out of sync with `json_preview`'s equivalent
+    // metadata-only answer for a NESTED occurrence (`crate::json`).
+    // `.load`/`.bytes` materialize to a resident `bytes`; anything else
+    // materializes the full content once and re-dispatches through the normal
+    // `bytes` path, so no per-method arm has to know about CAS backing. This
+    // is the one call site where a full CAS load of a bare (non-nested)
+    // CasBytes value is deliberate and expected — see `crate::json`'s doc
+    // comment on why the nested case (a CasBytes buried in a record/table
+    // field) does NOT take this path.
     if let Value::CasBytes(c) = &recv {
+        if let Some(v) = c.cheap_method(name) {
+            return Ok(v);
+        }
         match name {
-            "len" | "count" => return Ok(Value::Int(c.len as i64)),
-            "is_empty" => return Ok(Value::Bool(c.len == 0)),
             "load" | "bytes" => {
                 return c.resolve().map(|b| Value::Bytes(std::sync::Arc::new(b)));
             }
-            "ref" => return Ok(Value::Str(c.reference())),
             _ => {
                 let full = c.resolve()?;
                 return dispatch(ctx, Value::Bytes(std::sync::Arc::new(full)), name, args);
@@ -160,7 +168,11 @@ fn dispatch(ctx: &mut dyn CallCtx, recv: Value, name: &str, args: CallArgs) -> V
         "take" => list::slice_count(recv, int_arg(&args, 0, 0)?, true),
         "chunks" => list::chunks(recv, int_arg(&args, 0, 0)?),
         "zip" => list::zip(recv, arg(&args, 0)?.clone()),
-        "group" => list::group(ctx, recv, arg(&args, 0)?),
+        // `group_by` is an accepted alias for `group` (same {key, values}
+        // table), added for consistency with `sort_by` — a dogfood pass found
+        // agents reaching for `.group_by(.k)` by analogy and bouncing off
+        // `unknown method .group_by` with a `did you mean .group()?` hint.
+        "group" | "group_by" => list::group(ctx, recv, arg(&args, 0)?),
         // `.join()` deliberately defaults its separator to "" (plain
         // concatenation) — unlike the required-argument predicates below, a
         // zero-arg join has one obvious, harmless meaning.
@@ -731,5 +743,106 @@ mod tests {
         .unwrap();
         assert_eq!(std::fs::read_to_string(d.join("x")).unwrap(), "ab");
         std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn group_by_is_an_alias_for_group() {
+        let x = Value::List(vec![
+            Value::Int(1),
+            Value::Int(2),
+            Value::Int(3),
+            Value::Int(4),
+        ]);
+        let key = Value::Str("even".into());
+        assert_eq!(
+            call(x.clone(), "group_by", vec![key.clone()]).unwrap(),
+            call(x, "group", vec![key]).unwrap()
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // CasBytes chokepoint tests (P6 audit): the dispatch-level end-to-end
+    // proof that `cheap_method` and `json_preview` are actually wired in,
+    // on top of the direct unit tests in `value_types.rs`/`json.rs`.
+    // -------------------------------------------------------------------
+    mod cas_bytes_chokepoint {
+        use super::*;
+        use crate::value_types::test_support;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        fn probe() -> (Value, Arc<AtomicUsize>) {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let c = test_support::cas_bytes(b"hel", b"hello world", calls.clone());
+            (Value::CasBytes(Arc::new(c)), calls)
+        }
+
+        #[test]
+        fn cheap_methods_never_load_through_dispatch() {
+            let (v, calls) = probe();
+            assert_eq!(call(v.clone(), "len", vec![]).unwrap(), Value::Int(11));
+            assert_eq!(call(v.clone(), "count", vec![]).unwrap(), Value::Int(11));
+            assert_eq!(
+                call(v.clone(), "is_empty", vec![]).unwrap(),
+                Value::Bool(false)
+            );
+            assert_eq!(
+                call(v, "ref", vec![]).unwrap(),
+                Value::Str("val:blake3:deadbeefcafef00d".into())
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        fn load_and_bytes_materialize_exactly_once() {
+            let (v, calls) = probe();
+            assert_eq!(
+                call(v, "load", vec![]).unwrap(),
+                Value::Bytes(Arc::new(b"hello world".to_vec()))
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+
+        /// Existing behavior preserved: a bare `.json()` METHOD call on a
+        /// CasBytes value still fully materializes (unlike the nested case),
+        /// because it falls through `dispatch`'s `_ =>` arm to a resolved
+        /// `Value::Bytes` before `value_to_json` is ever consulted.
+        #[test]
+        fn bare_json_method_still_fully_materializes() {
+            let (v, calls) = probe();
+            let out = call(v, "json", vec![]).unwrap();
+            assert_eq!(out, Value::Str("\"hello world\"".into()));
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+
+        /// The actual fix, exercised through the real dispatch path a shell
+        /// user hits: `.json()` on a RECORD whose field is a spilled capture
+        /// does not load the CAS just to serialize the record.
+        #[test]
+        fn json_on_a_record_with_a_nested_cas_bytes_field_does_not_load() {
+            let (v, calls) = probe();
+            let mut r = Record::new();
+            r.insert("out".into(), v);
+            let out = call(Value::Record(r), "json", vec![]).unwrap();
+            let Value::Str(s) = out else {
+                panic!("expected str");
+            };
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            let j: serde_json::Value = serde_json::from_str(&s).unwrap();
+            assert_eq!(j["out"]["$"], "bytes_ref");
+            assert_eq!(j["out"]["len"], 11);
+        }
+
+        /// `render()` stays cheap too (unchanged — verified end to end).
+        #[test]
+        fn render_does_not_load() {
+            let (v, calls) = probe();
+            let Value::CasBytes(c) = &v else {
+                unreachable!()
+            };
+            let rendered = crate::render::render_inline(&Value::CasBytes(c.clone()));
+            assert!(rendered.contains("val:blake3:deadbeefcafef00d"));
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        }
     }
 }

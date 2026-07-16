@@ -102,6 +102,16 @@ src = "[1, 2, 3, 4].group(x => x % 2 == 0)"
 value = "[{key: false, values: [1, 3]}, {key: true, values: [2, 4]}]"
 
 [[case]]
+name = "list-group-by-is-an-alias-for-group"
+# `.group_by` is an accepted alias for `.group` (papercut fix: a dogfood pass
+# found `.group_by` failing with `unknown method` + a `did you mean .group()?`
+# hint, inconsistent with `.sort_by` existing alongside `.sort`). Same
+# {key, values} table, same behavior — verified by direct equality here rather
+# than restating the shape.
+src = "[1, 2, 3, 4].group_by(x => x % 2 == 0) == [1, 2, 3, 4].group(x => x % 2 == 0)"
+value = "true"
+
+[[case]]
 name = "list-zip-pairs-elementwise"
 src = '[1, 2].zip(["a", "b"])'
 value = '[[1, "a"], [2, "b"]]'
