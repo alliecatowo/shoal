@@ -1580,6 +1580,156 @@ mod tests {
         thread.join().unwrap();
     }
 
+    /// TDD §317 wire follow-up: `value.get` RESOLVES a CAS-backed bytes ref. A
+    /// top-level `CasBytes` (a value-position capture spilled to the CAS) elides
+    /// to a `ref` on the default `format=json` path — a huge blob never ships
+    /// whole — but an explicit `slice` or `format=raw` fetches the real content
+    /// from the CAS through the value's own loader (the same `BytesLoad`/`Cas`
+    /// seam), honoring the elision wall on what actually travels back.
+    #[test]
+    fn value_get_resolves_cas_backed_bytes_ref() {
+        struct FixedLoader(Vec<u8>);
+        impl shoal_value::BytesLoad for FixedLoader {
+            fn load(&self) -> std::io::Result<Vec<u8>> {
+                Ok(self.0.clone())
+            }
+        }
+        struct FailLoader;
+        impl shoal_value::BytesLoad for FailLoader {
+            fn load(&self) -> std::io::Result<Vec<u8>> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "blob gone",
+                ))
+            }
+        }
+        let decode = |s: &str| {
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, s).unwrap()
+        };
+
+        let kernel = Kernel::new();
+        // Pre-populate a session transcript with a CAS-backed bytes value (5000
+        // bytes — well over the raw budget, so the default fetch must elide) and
+        // a second one whose loader fails (an unresolvable ref).
+        let content: Vec<u8> = (0u32..5000).map(|i| (i % 251) as u8).collect();
+        let session = kernel.session("casb", "human").unwrap();
+        {
+            let ok = std::sync::Arc::new(shoal_value::CasBytesVal {
+                hash: "a".repeat(64),
+                len: content.len() as u64,
+                preview: std::sync::Arc::new(content[..64].to_vec()),
+                truncated: false,
+                loader: std::sync::Arc::new(FixedLoader(content.clone())),
+            });
+            let broken = std::sync::Arc::new(shoal_value::CasBytesVal {
+                hash: "b".repeat(64),
+                len: 123,
+                preview: std::sync::Arc::new(Vec::new()),
+                truncated: false,
+                loader: std::sync::Arc::new(FailLoader),
+            });
+            let mut t = session.transcript.lock().unwrap();
+            t.insert(Ref::new("out", 1u64), Value::CasBytes(ok));
+            t.insert(Ref::new("out", 2u64), Value::CasBytes(broken));
+        }
+
+        let (mut client, mut reader, thread) = spawn(&kernel);
+        call(
+            &mut client,
+            &mut reader,
+            1,
+            "session.attach",
+            json!({"session":"casb","client":{"kind":"agent","tty":false}}),
+        );
+
+        // Default json: a CAS-backed value elides to an honest ref (no content),
+        // carrying the TRUE length — a huge blob never ships whole.
+        let def = call(
+            &mut client,
+            &mut reader,
+            2,
+            "value.get",
+            json!({"ref":"out:1"}),
+        );
+        let v = def.result.unwrap()["value"].clone();
+        assert_eq!(v["$"], "ref", "a CAS-backed value elides by default: {v}");
+        assert_eq!(v["of"], "bytes");
+        assert_eq!(
+            v["n"],
+            content.len(),
+            "the elided ref carries the true length"
+        );
+
+        // A small slice RESOLVES to the exact CAS bytes, inline.
+        let sl = call(
+            &mut client,
+            &mut reader,
+            3,
+            "value.get",
+            json!({"ref":"out:1","slice":[0,10]}),
+        );
+        let v = sl.result.unwrap()["value"].clone();
+        assert_eq!(v["$"], "bytes", "a small slice resolves inline: {v}");
+        assert_eq!(decode(v["v"].as_str().unwrap()), content[0..10]);
+
+        // format=raw resolves the FULL content (base64).
+        let raw = call(
+            &mut client,
+            &mut reader,
+            4,
+            "value.get",
+            json!({"ref":"out:1","format":"raw"}),
+        );
+        assert_eq!(
+            decode(raw.result.unwrap()["raw_base64"].as_str().unwrap()),
+            content
+        );
+
+        // slice + format=raw resolves exactly the requested sub-range.
+        let rawslice = call(
+            &mut client,
+            &mut reader,
+            5,
+            "value.get",
+            json!({"ref":"out:1","slice":[5,15],"format":"raw"}),
+        );
+        assert_eq!(
+            decode(rawslice.result.unwrap()["raw_base64"].as_str().unwrap()),
+            content[5..15]
+        );
+
+        // A slice that is itself still oversized re-elides at the wall.
+        let big = call(
+            &mut client,
+            &mut reader,
+            6,
+            "value.get",
+            json!({"ref":"out:1","slice":[0,5000]}),
+        );
+        assert_eq!(
+            big.result.unwrap()["value"]["$"],
+            "ref",
+            "an oversized slice re-elides rather than shipping whole"
+        );
+
+        // An unresolvable ref (its CAS blob is gone) is a clear error, no panic.
+        let bad = call(
+            &mut client,
+            &mut reader,
+            7,
+            "value.get",
+            json!({"ref":"out:2","slice":[0,1]}),
+        );
+        assert!(
+            bad.error.is_some(),
+            "a failed CAS resolution surfaces an error, not a panic"
+        );
+
+        drop(client);
+        drop(reader);
+        thread.join().unwrap();
+    }
+
     /// Read one already-written frame off the socket (no request sent) — for
     /// asserting on pushed `event` notifications interleaved with responses.
     fn recv_line(reader: &mut BufReader<UnixStream>) -> Json {

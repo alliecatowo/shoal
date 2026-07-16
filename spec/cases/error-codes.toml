@@ -84,6 +84,26 @@ src = "reef lock --refresh"
 error = "reef_not_found"
 
 [[case]]
+name = "errcode-val-blake3-ref-without-cas-is-not-found"
+# TDD §317 in-language dispatch: a `val:blake3:<hash>` content short-ref
+# (the recoverable handle `.ref` yields) written as a value is resolved
+# against the session CAS when a method is called on it. The corpus runs
+# with NO journal/CAS installed, so a ref-shaped string there cannot resolve
+# — it raises a clear `not_found` rather than silently measuring itself as a
+# plain string (which would return the ref's ~75-character length).
+src = '"val:blake3:0000000000000000000000000000000000000000000000000000000000000000".len'
+error = "not_found"
+error_contains = "journal/CAS"
+
+[[case]]
+name = "errcode-non-ref-string-still-dispatches-string-methods"
+# The `val:blake3:` interception is scoped to that exact reserved shape: an
+# ordinary string is unaffected and keeps dispatching string methods, so
+# `.len` is the character count (5), never a content-ref resolution attempt.
+src = '"hello".len'
+value = "5"
+
+[[case]]
 name = "errcode-lang-block-unbalanced-braces-is-a-parse-error"
 # IO.md §5: brace-scanning `sh { … }` that reaches EOF with an unterminated
 # `{` is `lang_block_unbalanced` — surfaced as a PARSE-time diagnostic (the

@@ -821,6 +821,63 @@ impl Evaluator {
         }))
     }
 
+    /// Resolve a `val:blake3:<hash>` content short-ref (the recoverable form
+    /// [`shoal_value::CasBytesVal::reference`] / `.ref` yields) into a lazy
+    /// [`Value::CasBytes`] backed by this session's journal CAS, so a bare ref
+    /// *written as a value* dispatches methods and materializes exactly like the
+    /// §317 spill it came from (this is the in-language mirror of the wire
+    /// `value.get` resolution).
+    ///
+    /// Returns `None` when `s` is not a content ref at all — the caller then
+    /// dispatches the string through the ordinary string-method path unchanged.
+    /// Returns `Some(Err(..))` — a clear `not_found` — when the ref is genuine
+    /// but cannot be resolved: no journal/CAS is installed in this session, or
+    /// no blob is tracked under that hash.
+    pub(crate) fn resolve_content_ref(&self, s: &str, span: Span) -> Option<VResult<Value>> {
+        let hash = shoal_value::CasBytesVal::parse_ref(s)?;
+        Some(self.load_content_ref(hash).map_err(|e| e.with_span(span)))
+    }
+
+    /// The fallible core of [`Self::resolve_content_ref`]: builds the lazy
+    /// [`Value::CasBytes`] for `hash`. `.len` is answered from the `blob` table
+    /// metadata alone (never loading the content); a bare ref carries no resident
+    /// preview, so `render` shows the ref + true length and materialization loads
+    /// on demand through the same [`CasBytesLoader`]/[`shoal_journal::Cas`] seam a
+    /// fresh spill uses.
+    fn load_content_ref(&self, hash: &str) -> VResult<Value> {
+        let prefix = shoal_value::CasBytesVal::REF_PREFIX;
+        let Some(journal) = self.journal.as_ref() else {
+            return Err(ErrorVal::new(
+                "not_found",
+                format!(
+                    "cannot resolve content ref {prefix}{hash}: this session has no journal/CAS"
+                ),
+            ));
+        };
+        let len = journal
+            .blob_len(hash)
+            .map_err(|e| {
+                ErrorVal::new(
+                    "not_found",
+                    format!("cannot resolve content ref {prefix}{hash}: {e}"),
+                )
+            })?
+            .ok_or_else(|| {
+                ErrorVal::new(
+                    "not_found",
+                    format!("no CAS blob for content ref {prefix}{hash}"),
+                )
+            })?;
+        let loader = CasBytesLoader::new(journal.cas(), hash.to_string());
+        Ok(Value::CasBytes(Arc::new(shoal_value::CasBytesVal {
+            hash: hash.to_string(),
+            len,
+            preview: Arc::new(Vec::new()),
+            truncated: false,
+            loader: Arc::new(loader),
+        })))
+    }
+
     /// The leash spawn gate (TDD §8 content-hash pinning). Consulted from
     /// `run_argv` for every external spawn, just before exec. Returns `Ok(())`
     /// — allow — in every case EXCEPT when the active principal pins process
@@ -958,9 +1015,20 @@ impl Evaluator {
 /// Holds a DB-independent [`shoal_journal::Cas`] (just a path), so a ref-backed
 /// [`shoal_value::CasBytesVal`] stays `Send + Sync` and outlives the borrow of
 /// the evaluator that produced it.
-struct CasBytesLoader {
+///
+/// Reused verbatim by [`crate::Evaluator::resolve_content_ref`] to back a bare
+/// `val:blake3:<hash>` ref written as a value (the §317 in-language dispatch
+/// follow-up) — same CAS seam as a fresh spill, so a recovered ref materializes
+/// exactly like the capture it came from.
+pub(crate) struct CasBytesLoader {
     cas: shoal_journal::Cas,
     hash: String,
+}
+
+impl CasBytesLoader {
+    pub(crate) fn new(cas: shoal_journal::Cas, hash: String) -> Self {
+        Self { cas, hash }
+    }
 }
 
 impl shoal_value::BytesLoad for CasBytesLoader {

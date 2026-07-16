@@ -4,6 +4,18 @@
 //! (docs/ROADMAP.md wave R4): pure mechanical move, zero wire/behavior change.
 use super::*;
 
+/// Map a §317 CAS-backed bytes resolution failure — a missing or corrupt blob
+/// surfaced when `value.get` materializes an elided `CasBytes` ref under a
+/// `slice`/`format=raw` ask — to a wire error that names the ref, so an agent
+/// fetching the content gets a clear reason instead of a bare code.
+fn cas_resolve_error(r#ref: &Ref, err: shoal_value::ErrorVal) -> RpcError {
+    RpcError {
+        code: -32004,
+        message: err.msg,
+        data: Some(json!({"ref": r#ref, "code": err.code})),
+    }
+}
+
 impl Kernel {
     pub(crate) fn handle_value_get(
         self: &Arc<Self>,
@@ -59,6 +71,20 @@ impl Kernel {
                 let end = end.max(start).min(b.len());
                 Value::Bytes(std::sync::Arc::new(b[start..end].to_vec()))
             }
+            // §317: a slice of a CAS-backed bytes ref RESOLVES it. Slicing is
+            // an explicit "give me these bytes" ask, so materialize the full
+            // content from the CAS (through the value's own loader — the same
+            // `BytesLoad`/`Cas` seam the in-language path uses) and slice it.
+            // A small slice then travels inline; a slice that is itself still
+            // huge re-elides at the wall below, exactly like a plain `bytes`.
+            (Some([start, end]), Value::CasBytes(c)) => {
+                let full = c
+                    .resolve()
+                    .map_err(|e| cas_resolve_error(&params.r#ref, e))?;
+                let start = start.min(full.len());
+                let end = end.max(start).min(full.len());
+                Value::Bytes(std::sync::Arc::new(full[start..end].to_vec()))
+            }
             // Unordered/scalar values: a slice is a caller error — say so
             // instead of silently returning the unsliced value.
             (Some(_), other) => {
@@ -101,6 +127,23 @@ impl Kernel {
                             &***b,
                         ),
                     }),
+                    // §317: `format=raw` on a CAS-backed bytes ref resolves it —
+                    // materialize the full content from the CAS and hand back its
+                    // base64, exactly as for a resident `bytes`. (An unsliced
+                    // CasBytes only reaches here under `format=raw`; the default
+                    // `format=json` path still elides it to a ref, above.)
+                    Value::CasBytes(c) => {
+                        let full = c
+                            .resolve()
+                            .map_err(|e| cas_resolve_error(&params.r#ref, e))?;
+                        json!({
+                            "ref": params.r#ref,
+                            "raw_base64": base64::Engine::encode(
+                                &base64::engine::general_purpose::STANDARD,
+                                &full,
+                            ),
+                        })
+                    }
                     other => {
                         return Err(RpcError {
                             code: -32005,

@@ -159,6 +159,16 @@ Shape always travels (type, counts, schema, small preview); payload never does u
 Callers may tighten/loosen per call (`elide:{max_bytes,max_rows}` on exec/read), never disable
 above a hard cap (64 KiB) — a misbehaving agent cannot flood itself.
 
+A **CAS-backed bytes** value (a value-position capture that spilled to disk past the RAM cap, TDD
+§317) is oversized by construction: the default `format=json` fetch always elides it to a `ref`
+carrying its true length (`{"$":"ref","of":"bytes","n":…}`) — a huge blob never ships whole. To
+**resolve** the content, `value.get` (and the equivalent `shoal://…?…` resource query) honors a
+`slice={a}..{b}` or `format=raw` on that same ref: it materializes the bytes from the CAS and
+returns the requested sub-range (base64), still subject to the elision wall — a small slice travels
+inline, a slice that is itself still oversized re-elides. The same `val:blake3:<hash>` short-ref is
+resolvable in-language too: calling a method on it loads from the session CAS and dispatches on the
+resulting `bytes`.
+
 ## 4. Events — channels, cursors, push
 
 Kernel-native pub/sub over the same socket. Every event: `{channel, seq, ts, payload}` — `seq`

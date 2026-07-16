@@ -294,6 +294,10 @@ impl Journal {
     /// A cheap, cloneable, DB-independent CAS reader (just the cas_root path) — the Send+Sync handle a lazy
     /// Value::CasBytes loader holds. Shares this journal's on-disk store.
     pub fn cas(&self) -> Cas;
+    /// Stored (uncompressed) byte length of a blob from the `blob` table alone — no file open, no decode.
+    /// Ok(None) for an unknown/malformed hash. The cheap `.len` a lazy Value::CasBytes answers from when
+    /// a bare `val:blake3:<hash>` ref is resolved in-language (TDD §317), without materializing content.
+    pub fn blob_len(&self, hash: &str) -> rusqlite::Result<Option<u64>>;
     pub fn query(&self, q: &JournalQuery) -> rusqlite::Result<Vec<EntryRow>>;
     /// Targeted fetch of entries by id, in the EXACT order requested (not database order); ids not
     /// found are simply absent, never an error. The cold-replay counterpart to `query`'s filtered

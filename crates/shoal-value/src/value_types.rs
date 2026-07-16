@@ -32,6 +32,18 @@ pub struct CasBytesVal {
 }
 
 impl CasBytesVal {
+    /// The scheme prefix of a recoverable content short-ref: the wire/CAS form
+    /// `.ref` yields and the in-language dispatch path recognizes (TDD §317).
+    pub const REF_PREFIX: &'static str = "val:blake3:";
+
+    /// Parse a `val:blake3:<hash>` content short-ref, returning the bare blake3
+    /// hex on a match. `None` when `s` is not a content ref of this scheme — the
+    /// single place the ref grammar is decoded, mirroring [`Self::reference`]
+    /// (which encodes it), so the wire form and the in-language resolver agree.
+    pub fn parse_ref(s: &str) -> Option<&str> {
+        s.strip_prefix(Self::REF_PREFIX)
+    }
+
     /// Load the full content from the CAS, mapping any I/O/integrity failure to
     /// an `io_error` [`ErrorVal`].
     pub fn resolve(&self) -> VResult<Vec<u8>> {
@@ -45,7 +57,7 @@ impl CasBytesVal {
 
     /// The recoverable content ref, e.g. `val:blake3:<hash>`.
     pub fn reference(&self) -> String {
-        format!("val:blake3:{}", self.hash)
+        format!("{}{}", Self::REF_PREFIX, self.hash)
     }
 }
 
@@ -277,4 +289,29 @@ pub fn parse_time(word: &str) -> Option<TimeVal> {
         return None;
     }
     Some(TimeVal { hour, min, sec })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn content_ref_encode_decode_roundtrip() {
+        // `parse_ref` strips exactly the prefix `reference()` writes.
+        assert_eq!(CasBytesVal::REF_PREFIX, "val:blake3:");
+        assert_eq!(
+            CasBytesVal::parse_ref("val:blake3:deadbeef"),
+            Some("deadbeef")
+        );
+        assert_eq!(
+            CasBytesVal::parse_ref(&format!("{}cafef00d", CasBytesVal::REF_PREFIX)),
+            Some("cafef00d")
+        );
+        // Non-refs (a transcript short-ref, a bare algorithm tag, plain text)
+        // are left alone so ordinary strings keep dispatching string methods.
+        assert_eq!(CasBytesVal::parse_ref("out:5"), None);
+        assert_eq!(CasBytesVal::parse_ref("blake3:deadbeef"), None);
+        assert_eq!(CasBytesVal::parse_ref("val:blake2:deadbeef"), None);
+        assert_eq!(CasBytesVal::parse_ref("hello world"), None);
+    }
 }
