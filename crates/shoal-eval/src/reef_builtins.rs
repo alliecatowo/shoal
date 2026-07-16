@@ -189,8 +189,30 @@ impl Evaluator {
         Ok(Value::Table(rows))
     }
 
-    /// `reef add <tool>@<ver>`: write the nearest `.reef.toml` (creating one in
-    /// cwd if none) and lock the tool.
+    /// `reef add <tool>@<ver>`: write the target `.reef.toml` and lock the tool.
+    ///
+    /// **Target precedence — the LOCAL manifest always wins (REEF.md §1/§6).**
+    /// A `.reef.toml` sitting in `cwd` is *this* (sub)project's own manifest, so
+    /// `reef add` must edit it — and it is resolved by a direct
+    /// [`Fs::is_file`](shoal_value::ports::Fs::is_file) existence probe, NOT by
+    /// consulting the parsed scope chain:
+    ///
+    /// 1. `cwd/.reef.toml` **exists** → that is the target. If it is malformed,
+    ///    the read+parse below surfaces the LOCAL parse error and writes
+    ///    nothing — never an ancestor.
+    /// 2. otherwise → the chain's nearest native `.reef.toml` (a real ancestor
+    ///    project), so `reef add` in a bare subdir still writes the project's
+    ///    manifest one dir up ("writes nearest manifest", REEF.md §6).
+    /// 3. otherwise → create a fresh `cwd/.reef.toml`.
+    ///
+    /// The existence probe (rather than the chain) is load-bearing:
+    /// [`ScopeChain::discover`] *silently skips* a malformed `.reef.toml`, so the
+    /// chain's nearest **parsed** `Reef` scope can be an ANCESTOR's manifest even
+    /// though a broken one sits right here. Selecting the target off the chain
+    /// (the old behavior) meant a malformed local manifest under a valid ancestor
+    /// caused `reef add` to silently mutate the ANCESTOR — a nasty footgun for a
+    /// subproject nested under a project. Probing `cwd` for the file directly
+    /// keeps the local manifest authoritative whether it parses or not.
     fn reef_add(&mut self, spec: Option<&str>) -> VResult<Value> {
         let spec = spec.ok_or_else(|| ErrorVal::arg_error("reef add expects <tool>@<version>"))?;
         let (tool, ver) = match spec.split_once('@') {
@@ -201,20 +223,28 @@ impl Evaluator {
                 )));
             }
         };
-        // The nearest native manifest, or a new one in cwd.
-        let manifest_path = {
+        // Local manifest first (via the Fs port so a present-but-malformed one is
+        // still seen, unlike the chain which skips it); then the nearest ancestor
+        // Reef scope; then a fresh manifest in cwd.
+        let local = self.cwd.join(".reef.toml");
+        let manifest_path = if self.fs.is_file(&local) {
+            local
+        } else {
             let chain = self.reef_chain_snapshot();
             chain
                 .scopes
                 .iter()
                 .find(|s| s.kind == ManifestKind::Reef)
                 .map(|s| s.source.clone())
-                .unwrap_or_else(|| self.cwd.join(".reef.toml"))
+                .unwrap_or(local)
         };
         let mut doc = match self.fs.read_to_string(&manifest_path) {
-            Ok(text) => text
-                .parse::<toml::Table>()
-                .map_err(|e| ErrorVal::new("reef_provider", format!("parsing manifest: {e}")))?,
+            Ok(text) => text.parse::<toml::Table>().map_err(|e| {
+                ErrorVal::new(
+                    "reef_provider",
+                    format!("parsing manifest {}: {e}", manifest_path.display()),
+                )
+            })?,
             Err(_) => toml::Table::new(),
         };
         let tools = doc
@@ -740,5 +770,108 @@ mod tests {
             panic!("expected a table")
         };
         assert!(rows.is_empty());
+    }
+
+    /// Item 1 — the footgun scenario: a MALFORMED `cwd/.reef.toml` under a VALID
+    /// ancestor `.reef.toml`. `reef add` must surface the LOCAL parse error and
+    /// leave the ancestor's manifest byte-for-byte untouched. Before the fix,
+    /// `ScopeChain::discover` silently skipped the broken local file, so the
+    /// chain's nearest parsed `Reef` scope was the ANCESTOR and `reef add`
+    /// silently mutated it — hiding the local parse error entirely.
+    #[test]
+    fn reef_add_surfaces_local_parse_error_not_ancestor_write() {
+        let root = tempfile::tempdir().unwrap();
+        let ancestor = root.path().join(".reef.toml");
+        let ancestor_text = "[tools]\nnode = \"18\"\n";
+        std::fs::write(&ancestor, ancestor_text).unwrap();
+        let sub = root.path().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let local = sub.join(".reef.toml");
+        let local_text = "[tools\nfaketool = "; // malformed TOML
+        std::fs::write(&local, local_text).unwrap();
+
+        let mut ev = Evaluator::new(sub.clone());
+        let err = ev
+            .eval_program(&shoal_syntax::parse("reef add faketool@1").unwrap())
+            .expect_err("a malformed local manifest must surface a parse error");
+        assert_eq!(err.code, "reef_provider");
+        assert!(
+            err.msg.contains(&local.display().to_string()),
+            "the parse error must name the LOCAL manifest, got: {}",
+            err.msg
+        );
+        // The ancestor manifest is untouched — no silent write one dir up.
+        assert_eq!(std::fs::read_to_string(&ancestor).unwrap(), ancestor_text);
+        // The malformed local file is left exactly as-is (we never wrote it).
+        assert_eq!(std::fs::read_to_string(&local).unwrap(), local_text);
+    }
+
+    /// Item 1 — the ordinary local case: a VALID `cwd/.reef.toml` under a valid
+    /// ancestor. `reef add` edits the LOCAL manifest; the ancestor is untouched.
+    #[test]
+    fn reef_add_edits_local_manifest_not_ancestor() {
+        let root = tempfile::tempdir().unwrap();
+        let ancestor = root.path().join(".reef.toml");
+        let ancestor_text = "[tools]\nnode = \"18\"\n";
+        std::fs::write(&ancestor, ancestor_text).unwrap();
+        let sub = root.path().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let local = sub.join(".reef.toml");
+        std::fs::write(&local, "[tools]\nrg = \"*\"\n").unwrap();
+
+        let mut ev = Evaluator::new(sub.clone());
+        // faketool never resolves, so the lock step no-ops — but the manifest
+        // EDIT still lands (the tool constraint is written before the lock).
+        ev.eval_program(&shoal_syntax::parse("reef add faketool@1").unwrap())
+            .expect("reef add on a valid local manifest succeeds");
+
+        let written = std::fs::read_to_string(&local).unwrap();
+        let tbl: toml::Table = written.parse().unwrap();
+        assert_eq!(tbl["tools"]["faketool"].as_str(), Some("1"));
+        assert_eq!(tbl["tools"]["rg"].as_str(), Some("*"), "existing pin kept");
+        // The ancestor never sees the new pin.
+        assert_eq!(std::fs::read_to_string(&ancestor).unwrap(), ancestor_text);
+    }
+
+    /// Item 1 — no local manifest: `reef add` falls back to the chain's nearest
+    /// ancestor `.reef.toml` ("writes nearest manifest", REEF.md §6), since the
+    /// subdir has none of its own.
+    #[test]
+    fn reef_add_falls_back_to_nearest_ancestor_when_no_local() {
+        let root = tempfile::tempdir().unwrap();
+        let ancestor = root.path().join(".reef.toml");
+        std::fs::write(&ancestor, "[tools]\nnode = \"18\"\n").unwrap();
+        let sub = root.path().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let mut ev = Evaluator::new(sub.clone());
+        ev.eval_program(&shoal_syntax::parse("reef add faketool@1").unwrap())
+            .expect("reef add falls back to the ancestor manifest");
+
+        // The ancestor gained the pin; no local manifest was created.
+        let tbl: toml::Table = std::fs::read_to_string(&ancestor).unwrap().parse().unwrap();
+        assert_eq!(tbl["tools"]["faketool"].as_str(), Some("1"));
+        assert_eq!(tbl["tools"]["node"].as_str(), Some("18"));
+        assert!(
+            !sub.join(".reef.toml").exists(),
+            "no local manifest should be created when an ancestor exists"
+        );
+    }
+
+    /// Item 1 — greenfield: no manifest anywhere in the chain → create a fresh
+    /// `cwd/.reef.toml`. (Guarded against ambient ancestor pollution above the
+    /// shared tempdir, which would otherwise steal the write as a "nearest
+    /// ancestor".)
+    #[test]
+    fn reef_add_creates_local_manifest_when_none_in_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        panic_if_ancestor_reef_pollution(dir.path());
+        let mut ev = Evaluator::new(dir.path().to_path_buf());
+        ev.eval_program(&shoal_syntax::parse("reef add faketool@1").unwrap())
+            .expect("reef add creates a manifest when none exists");
+        let local = dir.path().join(".reef.toml");
+        assert!(local.exists(), "a fresh cwd/.reef.toml must be created");
+        let tbl: toml::Table = std::fs::read_to_string(&local).unwrap().parse().unwrap();
+        assert_eq!(tbl["tools"]["faketool"].as_str(), Some("1"));
     }
 }
