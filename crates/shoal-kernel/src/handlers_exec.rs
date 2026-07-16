@@ -316,6 +316,19 @@ impl Kernel {
                 opaque,
             })
             .map_err(internal)?;
+        // Hand the evaluator this call's source so each journaled top-level
+        // statement can slice its own `src` (TDD §9) — mirrors the REPL's fix
+        // at `crates/shoal/src/repl.rs` (`evaluator.set_source(run_src...)`
+        // right before `eval_program`): without this, `stmt_source` has
+        // nothing to slice from, so the evaluator's own per-statement journal
+        // entries (and the `history`/`journal` builtin backed by them) show an
+        // empty `src` column for every kernel-hosted statement. Set right
+        // before eval, on the session's evaluator, under the same lock this
+        // whole `run`/`approved` path already holds — covers both modes (the
+        // "approved" branch above falls through to this same code, and the
+        // async/timeout wrapper above re-enters `handle_exec` with the same
+        // `src` via `dispatch`, hitting this exact call again).
+        evaluator.set_source(params.src.clone());
         let value = match eval_with_position(&mut evaluator, &ast, &params.position) {
             Ok(value) => value,
             Err(e) => {
@@ -422,5 +435,79 @@ impl Kernel {
             value: Some(elide_wire_value(&value, &exec_uri, &exec_budget)),
             render: Some(bounded_render),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test for the `evaluator.set_source(...)` call added above.
+    ///
+    /// The kernel does NOT install a journal on a real session's evaluator
+    /// (it keeps its own separate exec-level journal — `Kernel::journal`,
+    /// appended to directly in `handle_exec` with `src: params.src.clone()`,
+    /// which was already correct before this fix and is untouched by it).
+    /// The evaluator's *own* per-statement journal integration
+    /// (`journal_begin_stmt`/`stmt_source` in `shoal-eval/src/journal.rs`,
+    /// which also backs the in-language `history`/`journal` builtin) only
+    /// runs when a journal is installed on the evaluator itself, and
+    /// `stmt_source` only has real text to slice once `Evaluator::set_source`
+    /// has been called. To observe whether `handle_exec` actually reaches
+    /// `set_source` on every code path, this test installs a journal
+    /// directly on the session's evaluator (something a real kernel session
+    /// never does today) purely as a probe, then drives two statements
+    /// through the real `handle_exec` entry point: a marker `let`, then
+    /// `history`. If `set_source` were never called (the pre-fix state),
+    /// `stmt_source` would slice an empty `self.source` and every stmt-level
+    /// journal entry's `src` would come back empty; with the fix, the
+    /// marker statement's entry carries its exact source text.
+    #[test]
+    fn exec_calls_set_source_so_stmt_journal_entries_carry_src() {
+        // `Kernel::new()`'s default policy (`permissive_policy`) is scoped to
+        // THIS process's actual uid principal (`principal()`) — any other
+        // principal name gets denied (`leash denied execution`), so the
+        // attachment below must use the same principal the kernel treats as
+        // permissive rather than an arbitrary test name.
+        let actor = principal();
+        let kernel = Kernel::new();
+        let session = kernel.session("set-source-probe").expect("create session");
+        {
+            let mut evaluator = session.evaluator.lock().unwrap();
+            evaluator.set_journal(
+                Journal::in_memory().expect("in-memory journal"),
+                "set-source-probe",
+                &actor,
+            );
+        }
+        let mut attached = Some(Attachment {
+            session: session.clone(),
+            principal: actor,
+            tty: false,
+        });
+
+        let marker_src = "let set_source_probe_9182 = 9182";
+        let exec = kernel
+            .handle_exec(json!({"src": marker_src}), 1, &mut attached)
+            .expect("exec of a plain let must succeed");
+        assert!(exec.get("ref").is_some(), "exec result: {exec:?}");
+
+        let hist = kernel
+            .handle_exec(json!({"src": "history"}), 2, &mut attached)
+            .expect("exec of `history` must succeed");
+        let cols = hist["value"]["cols"]["src"]
+            .as_array()
+            .unwrap_or_else(|| panic!("history's table has no src column: {hist:?}"));
+        let found = cols
+            .iter()
+            .find(|v| v["v"] == marker_src)
+            .unwrap_or_else(|| {
+                panic!("no journal entry with src={marker_src:?} found among {cols:?}")
+            });
+        assert_eq!(
+            found["v"], marker_src,
+            "stmt-level journal entry's src must equal the exact submitted source, non-empty \
+             (only true once handle_exec calls Evaluator::set_source before eval)"
+        );
     }
 }
