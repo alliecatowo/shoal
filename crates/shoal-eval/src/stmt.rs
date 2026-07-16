@@ -21,9 +21,14 @@ impl Evaluator {
                     self.it = v.clone();
                     if is_last {
                         last = v;
-                    } else {
+                    } else if self.echo_intermediate(stmt) {
                         // Non-final statement values pass through to the sink
                         // (defect #1a); the final value is returned to the host.
+                        // Under `render.echo = quiet`/`commands` (docs/CONFIG.md
+                        // §5) only bare-command intermediates echo — a pure
+                        // expression (`1+1`, `let x=…`) at intermediate position
+                        // stays silent, so a non-interactive script no longer
+                        // prints every step.
                         self.sink_value(&v);
                     }
                 }
@@ -45,6 +50,18 @@ impl Evaluator {
             }
         }
         Ok(last)
+    }
+
+    /// Whether a non-final top-level statement's value routes to the statement
+    /// sink, per the active [`EchoMode`] (`render.echo`, docs/CONFIG.md §5).
+    /// `All` (the default) echoes every intermediate — the REPL/legacy
+    /// behavior; `Quiet`/`Commands` echo only bare-command intermediates so a
+    /// script's intermediate pure expressions (`1+1`, `let x=…`) stay silent.
+    fn echo_intermediate(&self, stmt: &Stmt) -> bool {
+        match self.echo_mode {
+            EchoMode::All => true,
+            EchoMode::Quiet | EchoMode::Commands => crate::is_bare_command_stmt(stmt),
+        }
     }
 
     pub(crate) fn eval_stmt(&mut self, stmt: &Stmt, top: bool) -> VResult<Flow> {

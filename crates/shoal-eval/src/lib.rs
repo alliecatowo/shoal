@@ -46,8 +46,8 @@ use shoal_exec::{CancelToken, ExecMode, ExecSpec, StdinSpec};
 use shoal_journal::Journal;
 use shoal_leash::{Effect, Estimates, Plan, Policy as LeashPolicy, Reversibility, SandboxPolicy};
 use shoal_value::{
-    CallArgs, CallCtx, Clock, ClosureVal, Env, ErrorVal, Fs, Opener, OutcomeVal, Record,
-    SecretPort, StdClock, StdFs, StdOpener, VResult, Value,
+    CallArgs, CallCtx, Clock, ClosureVal, ConfigPort, ConfigSnapshot, Env, ErrorVal, Fs, Opener,
+    OutcomeVal, Record, SecretPort, StdClock, StdFs, StdOpener, VResult, Value,
 };
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -58,6 +58,42 @@ use std::time::Duration;
 pub enum Position {
     Statement,
     Value,
+}
+
+/// How much of a program's top-level statement values auto-render (the
+/// `render.echo` knob, docs/CONFIG.md §5). Governs only what the evaluator
+/// routes to the statement sink for *intermediate* (non-final) statements —
+/// the final statement's value is always returned to the host, which decides
+/// how to present it (see the host's `run_source` for `Commands`-mode final
+/// suppression). The default is [`EchoMode::All`], which preserves the REPL's
+/// and every existing test/`Evaluator::new` caller's echo-everything behavior;
+/// the non-interactive runner opts into `Quiet`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EchoMode {
+    /// Echo every non-null top-level statement value (the REPL default and the
+    /// legacy `-c`/script behavior). This is what `Evaluator::new` starts with,
+    /// so nothing regresses unless a host explicitly opts into another mode.
+    #[default]
+    All,
+    /// Echo only bare-command output; suppress every non-command intermediate
+    /// (`1+1`, `let x=…`). The host also suppresses a non-command *final*
+    /// expression in this mode.
+    Commands,
+    /// Echo bare-command output for intermediates but keep the final
+    /// statement's value (the non-interactive default): a multi-statement
+    /// script shows its commands' output and its last value, but not its
+    /// intermediate pure expressions.
+    Quiet,
+}
+
+/// Whether `stmt` is a bare command statement (`ls`, `git status`, `a && b`) —
+/// the shape whose output shows in `quiet`/`commands` echo modes even when it
+/// is not the final statement. A public free function (not just the crate-
+/// internal [`helpers::is_command_expr`]) so the host can apply the same
+/// command-vs-expression test to a program's *final* statement when deciding
+/// whether to render it under [`EchoMode::Commands`].
+pub fn is_bare_command_stmt(stmt: &Stmt) -> bool {
+    matches!(stmt, Stmt::Expr { expr, .. } if helpers::is_command_expr(expr))
 }
 
 /// A count/summary of the live task table, for the prompt's `jobs` segment
@@ -208,6 +244,22 @@ pub struct Evaluator {
     clock: Arc<dyn Clock>,
     opener: Arc<dyn Opener>,
     secrets: Arc<dyn SecretPort>,
+    /// Resolved configuration snapshot backing the in-language `config`
+    /// namespace (`config.get`/`config.all`). The default is an empty snapshot
+    /// (no config injected → `config.get` is `null`, never a filesystem walk);
+    /// a host injects the *same* resolved `shoal_config::Config` it applies to
+    /// itself via [`Evaluator::set_config`], so in-language config == the
+    /// host-applied config. Held as `Arc<dyn ConfigPort>` like the other ports
+    /// so child evaluators inherit it cheaply (see [`inherit_ports`]).
+    ///
+    /// [`inherit_ports`]: Evaluator::inherit_ports
+    config: Arc<dyn ConfigPort>,
+    /// How much of a script/`-c` run's top-level statement values auto-render
+    /// (the `render.echo` knob, docs/CONFIG.md §5). Default [`EchoMode::All`]
+    /// (echo everything) so `Evaluator::new`, the REPL, and every conformance
+    /// case keep their current behavior; the non-interactive host opts into
+    /// `Quiet`.
+    echo_mode: EchoMode,
 }
 
 enum Flow {
@@ -266,6 +318,8 @@ impl Evaluator {
             clock: Arc::new(StdClock),
             opener: Arc::new(StdOpener),
             secrets: Arc::new(StdSecret),
+            config: Arc::new(ConfigSnapshot::default()),
+            echo_mode: EchoMode::default(),
         }
     }
 
@@ -301,6 +355,25 @@ impl Evaluator {
         self.secrets = secrets;
     }
 
+    /// Install the resolved-config snapshot backing the in-language `config`
+    /// namespace (`config.get`/`config.all`). Additive: the default is an
+    /// empty snapshot, so an evaluator with no config injected reports `null`
+    /// for every `config.get(key)` (no filesystem walk). The host passes a
+    /// [`shoal_value::ConfigSnapshot`] built from the same `shoal_config`
+    /// it applies to itself, so in-language config == host-applied config.
+    /// Child evaluators spawned after this call inherit the snapshot.
+    pub fn set_config(&mut self, config: Arc<dyn ConfigPort>) {
+        self.config = config;
+    }
+
+    /// Select how much of a script/`-c` run's top-level statement values
+    /// auto-render (the `render.echo` knob). Default [`EchoMode::All`] echoes
+    /// every statement (the REPL/legacy behavior); the non-interactive host
+    /// sets [`EchoMode::Quiet`] so intermediate pure expressions stay silent.
+    pub fn set_echo_mode(&mut self, mode: EchoMode) {
+        self.echo_mode = mode;
+    }
+
     /// Copy the effect ports from `parent` into a freshly-created child
     /// evaluator so `parallel`/`source`/`spawn` see the same adapters the host
     /// installed. Cheap `Arc` clones; a no-op semantically when both hold the
@@ -311,6 +384,7 @@ impl Evaluator {
         self.clock = parent.clock.clone();
         self.opener = parent.opener.clone();
         self.secrets = parent.secrets.clone();
+        self.config = parent.config.clone();
     }
 
     /// The session event bus (docs/STREAMS.md). Shared into spawned tasks so
@@ -730,6 +804,87 @@ mod tests {
                 Value::Str("3".into()),
             ]
         );
+    }
+
+    /// `render.echo` (docs/CONFIG.md §5): [`EchoMode`] gates which non-final
+    /// top-level statement values route to the statement sink. `Quiet`/
+    /// `Commands` suppress intermediate pure expressions (`1+1`) but still echo
+    /// intermediate bare commands; `All` (the default) echoes every
+    /// intermediate. The final value is always returned to the host, never sunk.
+    #[test]
+    fn echo_mode_gates_intermediate_statement_rendering() {
+        use std::sync::{Arc, Mutex};
+        let run_mode = |src: &str, mode: EchoMode| -> (VResult<Value>, Vec<Value>) {
+            let program = shoal_syntax::parse(src).unwrap();
+            let mut ev = Evaluator::new(std::env::current_dir().unwrap());
+            ev.set_echo_mode(mode);
+            let sink: Arc<Mutex<Vec<Value>>> = Arc::default();
+            let sink2 = sink.clone();
+            ev.set_statement_sink(Box::new(move |v: &Value| {
+                sink2.lock().unwrap().push(v.clone())
+            }));
+            let out = ev.eval_program(&program);
+            drop(ev);
+            (out, Arc::try_unwrap(sink).unwrap().into_inner().unwrap())
+        };
+        let sunk = |captured: &[Value]| captured.iter().map(out_of).collect::<Vec<_>>();
+
+        // Quiet: the intermediate `1+1` is NOT sunk; the intermediate `echo hi`
+        // (a bare command) still is; the final `42` is returned, never sunk.
+        let (out, captured) = run_mode("1+1\necho hi\n42", EchoMode::Quiet);
+        assert_eq!(out.unwrap(), Value::Int(42));
+        assert_eq!(sunk(&captured), vec![Value::Str("hi".into())]);
+
+        // Commands: same intermediate gate as Quiet (only bare commands echo).
+        let (out, captured) = run_mode("1+1\necho hi\n42", EchoMode::Commands);
+        assert_eq!(out.unwrap(), Value::Int(42));
+        assert_eq!(sunk(&captured), vec![Value::Str("hi".into())]);
+
+        // All (the default): every intermediate is sunk — the `1+1` too.
+        let (out, captured) = run_mode("1+1\necho hi\n42", EchoMode::All);
+        assert_eq!(out.unwrap(), Value::Int(42));
+        assert_eq!(
+            sunk(&captured),
+            vec![Value::Int(2), Value::Str("hi".into())]
+        );
+    }
+
+    /// Decision 2: the in-language `config` namespace reads the host-INJECTED
+    /// snapshot (`set_config`), never a `shoal.toml` walked off the filesystem.
+    /// So an injected snapshot wins over an on-disk file, and with NO snapshot
+    /// the answer is `null` (no filesystem fallback) — the kernel-less/test
+    /// default that keeps `config.get` for an unset key behaving as before.
+    #[test]
+    fn config_namespace_reads_injected_snapshot_not_the_filesystem() {
+        let dir = tempfile::tempdir().unwrap();
+        // An on-disk shoal.toml the OLD filesystem-walking implementation would
+        // have read; it must be ignored by both paths below.
+        std::fs::write(dir.path().join("shoal.toml"), "greeting = \"from-disk\"\n").unwrap();
+
+        let get = shoal_syntax::parse("config.get(\"greeting\")").unwrap();
+
+        // Injected snapshot → `config.get` reads THAT, not the on-disk file.
+        let mut ev = Evaluator::new(dir.path().to_path_buf());
+        let mut rec = Record::new();
+        rec.insert("greeting".into(), Value::Str("from-snapshot".into()));
+        ev.set_config(Arc::new(ConfigSnapshot::new(Value::Record(rec))));
+        assert_eq!(
+            ev.eval_program(&get).unwrap(),
+            Value::Str("from-snapshot".into())
+        );
+
+        // No snapshot injected → degrades to null; does NOT fall back to the
+        // on-disk shoal.toml sitting in the cwd.
+        let mut ev2 = Evaluator::new(dir.path().to_path_buf());
+        assert_eq!(ev2.eval_program(&get).unwrap(), Value::Null);
+
+        // `config.all()` returns the whole injected snapshot record.
+        let all = shoal_syntax::parse("config.all()").unwrap();
+        let mut ev3 = Evaluator::new(dir.path().to_path_buf());
+        let mut rec = Record::new();
+        rec.insert("k".into(), Value::Int(7));
+        ev3.set_config(Arc::new(ConfigSnapshot::new(Value::Record(rec.clone()))));
+        assert_eq!(ev3.eval_program(&all).unwrap(), Value::Record(rec));
     }
 
     #[test]

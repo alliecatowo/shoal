@@ -4,7 +4,7 @@
 //! observe the fake — and the real filesystem is never touched.
 
 use shoal_eval::Evaluator;
-use shoal_value::{Fs, ReadSeek, Value};
+use shoal_value::{ConfigSnapshot, Fs, ReadSeek, Record, Value};
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -78,8 +78,8 @@ impl Fs for FakeFs {
     }
     fn is_file(&self, path: &Path) -> bool {
         // Overridden (the default routes through `metadata`, which this fake
-        // can't fabricate) so the `config` reader's existence probe is
-        // interposable in memory.
+        // can't fabricate) so any in-memory existence probe is interposable
+        // without touching the real filesystem.
         self.files.lock().unwrap().contains_key(path)
     }
     fn read_dir(&self, _path: &Path) -> io::Result<Vec<PathBuf>> {
@@ -146,23 +146,39 @@ fn redirect_append_routes_through_the_fs_port() {
     assert_eq!(written, b"a\nb\n");
 }
 
-/// The in-language `config` reader routes through the port: it finds and parses
-/// a seeded, in-memory `shoal.toml` via `Fs::is_file` + `Fs::read_to_string`,
-/// with nothing on the real disk (the cwd does not exist). This pins the fix for
-/// the `config` reader's former direct `std::fs::read_to_string` + `is_file`
-/// leak (CONTRACTS §8).
+/// The in-language `config` reader no longer routes through the `Fs` port: it
+/// reads the host-INJECTED config snapshot (`Evaluator::set_config`), so a
+/// seeded on-disk `shoal.toml` in the (fake) filesystem is IGNORED and the
+/// injected snapshot wins. This pins Decision 2 — eval must not re-parse
+/// `shoal.toml` itself, so the in-language `config` reflects the same
+/// layered/validated config `shoal-config` resolved for the host.
 #[test]
-fn config_reader_routes_through_the_fs_port() {
+fn config_reads_injected_snapshot_not_the_fs_port() {
     let cwd = Path::new("/nonexistent-shoal-ports-test");
     let fs = Arc::new(FakeFs::default());
-    fs.seed(cwd.join("shoal.toml"), b"greeting = \"hi\"\n".to_vec());
+    // A shoal.toml the OLD filesystem-walking reader would have picked up.
+    fs.seed(
+        cwd.join("shoal.toml"),
+        b"greeting = \"from-disk\"\n".to_vec(),
+    );
 
-    let out = eval_with_fs("config.all()", cwd, fs);
+    let program = shoal_syntax::parse("config.all()").expect("parse");
+    let mut ev = Evaluator::new(cwd.to_path_buf());
+    ev.set_fs(fs);
+    let mut snapshot = Record::new();
+    snapshot.insert("greeting".into(), Value::Str("from-snapshot".into()));
+    ev.set_config(Arc::new(ConfigSnapshot::new(Value::Record(snapshot))));
+
+    let out = ev.eval_program(&program).expect("eval");
     let rec = match out {
         Value::Record(r) => r,
         other => panic!("expected a record, got {}", other.type_name()),
     };
-    assert_eq!(rec.get("greeting"), Some(&Value::Str("hi".into())));
+    assert_eq!(
+        rec.get("greeting"),
+        Some(&Value::Str("from-snapshot".into())),
+        "config must read the injected snapshot, not the on-disk shoal.toml"
+    );
 }
 
 /// `cat` reads through the port: seed the fake, and `cat` returns its bytes

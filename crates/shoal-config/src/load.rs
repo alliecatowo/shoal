@@ -191,6 +191,7 @@ const ENV_OVERRIDES: &[(&str, &[&str], EnvKind)] = &[
     ("SHOAL_RENDER_WIDTH", &["render", "width"], EnvKind::UInt),
     ("SHOAL_RENDER_PAGING", &["render", "paging"], EnvKind::Str),
     ("SHOAL_RENDER_PAGER", &["render", "pager"], EnvKind::Str),
+    ("SHOAL_RENDER_ECHO", &["render", "echo"], EnvKind::Str),
     ("SHOAL_EDITOR_MODE", &["editor", "mode"], EnvKind::Str),
     (
         "SHOAL_EDITOR_BRACKETED_PASTE",
@@ -339,6 +340,14 @@ fn validate(c: &Config) -> Result<(), ConfigError> {
     }
     if !matches!(c.render.paging.as_str(), "never" | "auto") {
         return Err(value_err("render.paging", "must be `never` or `auto`"));
+    }
+    if let Some(echo) = &c.render.echo
+        && !matches!(echo.as_str(), "quiet" | "commands" | "all")
+    {
+        return Err(value_err(
+            "render.echo",
+            "must be `quiet`, `commands`, or `all`",
+        ));
     }
     if c.completion.max_results == 0 {
         return Err(value_err(
@@ -579,6 +588,51 @@ mod tests {
         );
     }
 
+    /// `render.echo` defaults to unset (`None` — each host surface picks its
+    /// own fallback: `-c`/scripts default to `quiet`, the REPL to `all`) and
+    /// is settable via either the config file or `SHOAL_RENDER_ECHO`.
+    #[test]
+    fn render_echo_defaults_to_none_and_is_env_overridable() {
+        assert_eq!(Config::default().render.echo, None);
+
+        let l = load(&opts(
+            None,
+            None,
+            None,
+            vec![("SHOAL_RENDER_ECHO", "commands")],
+        ))
+        .unwrap();
+        assert_eq!(l.config.render.echo.as_deref(), Some("commands"));
+    }
+
+    #[test]
+    fn render_echo_rejects_anything_other_than_quiet_commands_or_all() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("c");
+        fs::write(&p, "[render]\necho = \"loud\"\n").unwrap();
+        let err = load(&opts(None, Some(p), None, vec![])).unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::Value {
+                source: None,
+                key: "render.echo".into(),
+                message: "must be `quiet`, `commands`, or `all`".into(),
+            }
+        );
+    }
+
+    /// All three legal values load cleanly from the config file.
+    #[test]
+    fn render_echo_accepts_each_legal_value() {
+        for value in ["quiet", "commands", "all"] {
+            let t = tempfile::tempdir().unwrap();
+            let p = t.path().join("c");
+            fs::write(&p, format!("[render]\necho = \"{value}\"\n")).unwrap();
+            let l = load(&opts(None, Some(p), None, vec![])).unwrap();
+            assert_eq!(l.config.render.echo.as_deref(), Some(value));
+        }
+    }
+
     #[test]
     fn no_color_env_forces_render_color_off_even_if_config_says_true() {
         let t = tempfile::tempdir().unwrap();
@@ -718,6 +772,7 @@ width = 120
 color = true
 paging = "auto"
 pager = "less -R"
+echo = "quiet"
 
 [editor]
 mode = "vi"
@@ -790,6 +845,7 @@ hermetic = false
         assert_eq!(c.render.width, Some(120));
         assert_eq!(c.render.paging, "auto");
         assert_eq!(c.render.pager.as_deref(), Some("less -R"));
+        assert_eq!(c.render.echo.as_deref(), Some("quiet"));
         assert_eq!(c.editor.mode, "vi");
         assert_eq!(
             c.editor.keybindings.get("ctrl-r").map(String::as_str),

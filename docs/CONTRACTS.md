@@ -477,6 +477,11 @@ pub trait SecretPort: Send + Sync {
 pub trait BytesLoad: Send + Sync {                                  // loads a lazy Value::CasBytes (TDD §317)
     fn load(&self) -> std::io::Result<Vec<u8>>;                     // adapter over shoal_journal::Cas lives in shoal-eval
 }
+pub trait ConfigPort: Send + Sync {                                 // backs the in-language `config` namespace
+    fn snapshot(&self) -> &Value;                                   // resolved-config record; `config.get`/`config.all` read it
+}
+pub struct ConfigSnapshot { /* value: Value */ }                    // default adapter; empty record = no config injected
+impl ConfigPort for ConfigSnapshot { /* … */ }                     // host injects one built from shoal_config::load's Config
 
 // shoal-eval/src/ports.rs — needs shoal-exec types, so it can't live in shoal-value
 pub trait Exec: Send + Sync {
@@ -489,5 +494,15 @@ pub trait Exec: Send + Sync {
 time without touching the real OS. Do not reintroduce a direct `std::fs`/`std::process`/
 `SystemTime::now()` call in `shoal-eval`'s domain logic — route it through the matching port, adding
 a method to the trait (plus the `Std*` default) if the one you need doesn't exist yet.
+
+`ConfigPort` follows the same seam but for *reading* the resolved config rather than an OS effect:
+the host (`shoal` binary) builds a `ConfigSnapshot` from the SAME `shoal_config::load`'d `Config` it
+applies to itself and injects it via `Evaluator::set_config`, so the in-language `config` namespace
+(`config.get`/`config.all`) can never disagree with the host-applied config. Crucially `shoal-eval`
+must **not** depend on `shoal-config` (leaf-crate DAG) — the trait + snapshot live in `shoal-value`
+and carry a plain `Value`, and the binary does the wiring. Unlike the `Std*` adapters, the default
+(`ConfigSnapshot::default()`) is an EMPTY record, not a real-OS read: a kernel-less/`-c`/test
+evaluator with no config injected reports `null` for `config.get(key)` and `{}` for `config.all()`
+— it never falls back to walking the filesystem for a `shoal.toml`.
 
 `methods.rs` must be pure over these (no direct process spawning; `.save`/`.append` do fs IO relative to `ctx.cwd()`).

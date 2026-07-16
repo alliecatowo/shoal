@@ -61,6 +61,18 @@ pub(crate) fn repl() -> Result<i32, String> {
     // `[aliases]`/`[env]` (docs/CONFIG.md §5): same seeding `run_source` does,
     // before any init file or typed input runs.
     crate::seed_config_bindings(&mut evaluator, &config);
+    // `render.echo` (docs/CONFIG.md §5): the interactive REPL keeps `all` (echo
+    // every result) by default; an explicit `render.echo` in config still wins.
+    evaluator.set_echo_mode(crate::resolve_echo_mode(
+        config.render.echo.as_deref(),
+        shoal_eval::EchoMode::All,
+    ));
+    // Inject the resolved config so in-language `config.get`/`config.all` read
+    // the same layered/validated config the REPL itself applied (parity with
+    // `run_source`), not a raw `shoal.toml` walked off the filesystem.
+    evaluator.set_config(Arc::new(shoal_value::ConfigSnapshot::new(
+        crate::config_snapshot_value(&config),
+    )));
     evaluator.set_statement_sink(Box::new(|v: &Value| {
         let _ = print_value(v);
     }));

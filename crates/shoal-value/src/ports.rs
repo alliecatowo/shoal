@@ -12,6 +12,7 @@
 //! `SecretPort` over `shoal-secret`) keep their trait here but implement the
 //! `Std*` adapter in `shoal-eval`, so `shoal-value` stays a leaf crate.
 
+use crate::{Record, Value};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -246,4 +247,68 @@ pub trait BytesLoad: Send + Sync {
     /// Materialize the full content. Errors are I/O or integrity failures
     /// (a missing/corrupt CAS blob); the caller maps them to an `io_error`.
     fn load(&self) -> std::io::Result<Vec<u8>>;
+}
+
+// ---------------------------------------------------------------------------
+// ConfigPort — resolved-config snapshot read port
+// ---------------------------------------------------------------------------
+
+/// Read access to the resolved, host-applied configuration backing the
+/// in-language `config` namespace (`config.get(key)`, `config.all`). The
+/// evaluator holds a `dyn ConfigPort` and reads the snapshot from it instead
+/// of walking the filesystem to re-parse `shoal.toml` on its own — which would
+/// bypass the host's layering/env-override/validation (all of which live in
+/// `shoal-config`, a crate `shoal-value`/`shoal-eval` deliberately do not
+/// depend on). The host injects a [`ConfigSnapshot`] built from the *same*
+/// resolved `Config` it applies to itself, so in-language `config.get` and the
+/// host-applied config can never disagree.
+///
+/// The default adapter is the **empty** [`ConfigSnapshot`] (`Default`): a
+/// kernel-less/`-c`/test evaluator that never had a config injected reports an
+/// empty record, so `config.get(key)` degrades to `null` — never a filesystem
+/// walk. This mirrors how the other ports degrade to their inert default.
+pub trait ConfigPort: Send + Sync {
+    /// The whole resolved config as a record [`Value`] (`config.all`);
+    /// `config.get(key)` reads one top-level key out of it. An adapter with no
+    /// injected config returns an empty record.
+    fn snapshot(&self) -> &Value;
+}
+
+/// The default [`ConfigPort`] adapter: a plain resolved-config snapshot. Holds
+/// the config as a record [`Value`] (what `config.all` returns); the host
+/// builds one from `shoal_config::load`'s resolved `Config` and injects it via
+/// `Evaluator::set_config`. [`ConfigSnapshot::default`] (an empty record) is
+/// the no-config, zero-regression default the evaluator starts with.
+#[derive(Debug, Clone)]
+pub struct ConfigSnapshot {
+    value: Value,
+}
+
+impl ConfigSnapshot {
+    /// Wrap an already-resolved config record. `value` is normally a
+    /// [`Value::Record`] (the serialized `Config`); anything else makes every
+    /// `config.get(key)` resolve to `null`, exactly like an empty snapshot.
+    pub fn new(value: Value) -> Self {
+        Self { value }
+    }
+
+    /// The empty snapshot: an empty record. `config.get(key)` on it is always
+    /// `null`, and `config.all` is `{}`.
+    pub fn empty() -> Self {
+        Self {
+            value: Value::Record(Record::new()),
+        }
+    }
+}
+
+impl Default for ConfigSnapshot {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl ConfigPort for ConfigSnapshot {
+    fn snapshot(&self) -> &Value {
+        &self.value
+    }
 }
