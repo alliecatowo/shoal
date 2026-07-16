@@ -75,6 +75,29 @@ Real gaps that remain, tracked in `docs/ROADMAP.md`'s open-items list:
   `shoal_journal::Journal::entries_by_id`/`transcript_events_by_entry` — targeted, order-preserving,
   missing-ids-skipped fetches (`crates/shoal-journal/src/query.rs`/`transcript.rs`) — rather than a
   wide `query()` scan filtered in memory, so a cold replay past the ring pulls only the rows it needs.
+- **Replay cursors now survive a kernel RESTART, not just one process's lifetime** (architecture
+  audit P2): `journal_index`/`transcript_index` were in-memory only, and `EventBus::default()` was
+  built fresh on every `Kernel::open`/`open_with_policy` with no seeding from the journal — so a
+  restart reset both channels' `next_seq` to 0 and emptied both indexes, even though the on-disk
+  store itself still held every entry. A reconnecting agent's persisted `since=N` cursor got an
+  empty read, and the freshly-restarted kernel's own next publish then climbed from seq 0 again,
+  colliding with whatever seq 0 meant in the prior lifetime. Fixed by `EventBus::seed_from_journal`
+  (`crates/shoal-kernel/src/eventbus.rs`), called by `Kernel::open`/`open_with_policy` before the
+  kernel serves any connection: it rebuilds `journal_index` from every ROW whose `ast` column
+  deserializes as a whole `shoal_ast::Program` (the shape `handle_exec` always records for its own
+  coarse, whole-submission entry — the ONLY kind that ever fires a `journal` event; a session
+  evaluator's finer per-statement rows record a bare `shoal_ast::Stmt` instead, which fails that
+  deserialization and is correctly excluded, exactly as the in-memory index already excluded them
+  within one lifetime), then sets `next_seq` to the recovered count so the first post-restart publish
+  continues from N rather than colliding with seq 0..N-1. `transcript_index` is seeded the same way,
+  scoped to whichever of those same entries has a persisted `transcript_event` row (precise, no
+  broadening — the error-exec path never records one). A brand-new, empty store is a no-op: both
+  channels still correctly start at 0. `read_journal_channel`/`read_transcript_channel` also had to
+  treat a ring that is empty-but-`published>0` (true right after a restart, before this process has
+  published anything itself) as "everything is aged out", not "nothing to reconstruct" — pinned by
+  `event_bus_seq_state_survives_a_kernel_restart` (`shoal-kernel/src/lib.rs`) and
+  `seed_from_journal_recovers_coarse_entries_and_seq_continues`/
+  `seed_from_journal_is_a_no_op_on_a_fresh_empty_store` (`shoal-kernel/src/eventbus.rs`).
 - `approval`/`render` remain ring-buffered only (≥1024 events per channel), not journal-backed: a
   subscriber that falls behind by more than the ring cap loses those events for good. Both are
   transient control events with no journal representation at all and stay ring-only by design.
