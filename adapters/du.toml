@@ -9,17 +9,25 @@
 # `-k` is pinned via `invoke` (not left to whatever block-size the user's
 # environment/POSIXLY_CORRECT defaults to) for the same portability reason
 # `df.toml` pins `-kP`: both GNU and BSD `du` support it, and the resulting
-# numbers are bare kilobyte counts with no unit suffix -- so, like
-# `df.toml`'s `size_kb`/`used_kb`/`avail_kb`, this column is declared `int`,
-# not `size` (`shoal_value::parse_size` requires a `b`/`kb`/`mb`/.../`kib`
-# suffix; `du -h`'s human-readable single-letter suffixes like `"310G"`
-# aren't one, and `-k`'s plain digits aren't one either). `human_readable`
-# stays a declared, recognized flag (so `-h` is still valid to type) but is
-# `consumed`: forwarding it alongside the pinned `-k` would let `-h`
-# silently win the same "last format flag wins" trap `git status
-# --porcelain=v2 --short` and `docker ps --format ... --quiet` already
-# guard against, switching real output to non-numeric human-readable text
-# that this table's `int` column can never parse.
+# numbers are bare kilobyte counts with no unit suffix. `shoal_value::
+# parse_size` requires a `b`/`kb`/`mb`/.../`kib` suffix and `du -k`'s plain
+# digits don't carry one (nor would `du -h`'s human-readable single-letter
+# suffixes like `"310G"` -- those aren't a `parse_size`-recognized unit
+# either), so this column can't be typed plain `size` directly off the raw
+# bytes. It also must not stay a bare `int`: that would silently drop the
+# fact that the digits are kilobytes, forcing every caller to remember and
+# hand-multiply by 1024 before comparing against a real size literal like
+# `1mb`. `size_kb` is the fix -- a column type that says "these digits are
+# already known (by this adapter's own pinned `-k` flag) to be 1024-byte
+# blocks" and does that `* 1024` scaling into a genuine `Value::Size` during
+# parsing, so `(du).where(.size > 1mb)` reads and works exactly like the
+# `ls` builtin's real `size` column (see `parse_size_kb` in
+# shoal-adapters/src/lib.rs). `human_readable` stays a declared, recognized
+# flag (so `-h` is still valid to type) but is `consumed`: forwarding it
+# alongside the pinned `-k` would let `-h` silently win the same "last format
+# flag wins" trap `git status --porcelain=v2 --short` and `docker ps
+# --format ... --quiet` already guard against, switching real output to
+# non-numeric human-readable text that `size_kb` can never parse either.
 [cmd.du]
 bin = "du"
 class = "cli"
@@ -29,5 +37,5 @@ positional = ["paths"]
 invoke = ["-k"]
 flags = { short = { s = "summarize", h = "human_readable", d = "max_depth" } }
 consumed = ["human_readable"]
-output = { parse = "tsv-headerless", type = "table<{size_kb: int, path: path}>" }
+output = { parse = "tsv-headerless", type = "table<{size: size_kb, path: path}>" }
 effects = ["fs.read($paths)"]

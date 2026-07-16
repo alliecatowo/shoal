@@ -10,10 +10,16 @@
 # The `SIZE`/`USED`/`AVAIL` columns `df -kP` prints are bare block counts
 # with no unit suffix (e.g. "61255492", not "61255492b" or "58G") --
 # `size`-typed cells require a unit suffix (see `shoal_value::parse_size`),
-# so declaring these `size` would make every real invocation degrade to
-# bytes+warning instead of a table. They are declared `int` (kilobytes)
-# instead, which the parser genuinely yields; a caller wanting bytes can
-# multiply by 1024.
+# so these can't be parsed as plain `size` off the raw bytes. They also
+# shouldn't stay bare `int`: that would silently hide the fact that the
+# digits are kilobytes and push a manual `* 1024` onto every caller before a
+# comparison against a real size literal like `1gb` could even type-check.
+# `size_kb` is the column type that fixes this -- it declares "these bare
+# digits are already known (by this adapter's own pinned `-k` flag) to be
+# 1024-byte blocks" and performs that scaling into a genuine `Value::Size`
+# during parsing (see `parse_size_kb` in shoal-adapters/src/lib.rs), so
+# `(df).where(.size > 1gb)` reads and works exactly like the `ls` builtin's
+# real `size` column -- no caller-side unit bookkeeping required.
 #
 # The real header line is "Filesystem 1024-blocks Used Available Capacity
 # Mounted on" -- two words ("Mounted on") over the last single data column.
@@ -25,7 +31,7 @@ bin = "df"
 class = "cli"
 ok_codes = [0]
 invoke = ["-kP"]
-output = { parse = "cols", type = "table<{filesystem: str, size_kb: int, used_kb: int, avail_kb: int, use_pct: str, mounted: path}>" }
+output = { parse = "cols", type = "table<{filesystem: str, size: size_kb, used: size_kb, avail: size_kb, use_pct: str, mounted: path}>" }
 # No declared fs.read($paths): with no path arguments (the common case),
 # `df` enumerates the live system-wide mount table rather than reading any
 # specific file content, so there is no path binding to point a

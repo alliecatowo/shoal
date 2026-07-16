@@ -301,7 +301,16 @@ fn valid_type(ty: &str) -> bool {
     let base = ty.strip_suffix('?').unwrap_or(ty);
     matches!(
         base,
-        "str" | "bool" | "int" | "float" | "path" | "glob" | "size" | "duration" | "time"
+        "str"
+            | "bool"
+            | "int"
+            | "float"
+            | "path"
+            | "glob"
+            | "size"
+            | "size_kb"
+            | "duration"
+            | "time"
     ) || (base.starts_with("list<") && base.ends_with('>') && valid_type(&base[5..base.len() - 1]))
 }
 
@@ -455,10 +464,35 @@ fn coerce_cell(raw: &str, ty: &str) -> Option<Value> {
         "float" => Value::Float(raw.parse().ok()?),
         "bool" => Value::Bool(raw.parse().ok()?),
         "size" => Value::Size(shoal_value::parse_size(raw)?),
+        "size_kb" => Value::Size(parse_size_kb(raw)?),
         "duration" => Value::Duration(shoal_value::parse_duration(raw)?),
         "time" => Value::Time(shoal_value::parse_time(raw)?),
         _ => Value::Str(raw.into()),
     })
+}
+
+/// Parses a bare kilobyte count (no unit suffix, e.g. `du -k`/`df -kP`'s
+/// digit-only `SIZE`/`USED`/`AVAIL` columns) into byte-scaled `Value::Size`.
+///
+/// This exists because `shoal_value::parse_size` requires an alphabetic unit
+/// suffix (`b`/`kb`/`mb`/`kib`/...) and rejects a bare number outright -- but
+/// `du -k`/`df -kP` are pinned specifically because they print bare digits
+/// with NO suffix on both GNU and BSD, so `"size"` can never be used directly
+/// for these columns. `size_kb` bridges that gap: the raw cell is already
+/// known (by the adapter's own pinned `-k` invoke flag) to be counted in
+/// 1024-byte blocks, so the column type declares that unit directly and this
+/// does the fixed `* 1024` scaling in one place. Parses as `f64` (not
+/// `u64`) so a cell that happens to carry a decimal (defensive, not
+/// something real `-k` output produces) still degrades sensibly by rounding
+/// instead of hard-failing the whole row/table the way `"int"` would on the
+/// same input; a negative or non-numeric cell still degrades to `None`
+/// (mismatch, not a lie -- TDD §6), same as every other typed column here.
+fn parse_size_kb(raw: &str) -> Option<u64> {
+    let kb: f64 = raw.parse().ok()?;
+    if !kb.is_finite() || kb < 0.0 {
+        return None;
+    }
+    Some((kb * 1024.0).round() as u64)
 }
 
 /// Parses whitespace-column tables from tools whose header line can't be
@@ -823,24 +857,23 @@ output={parse="porcelain-v2", type="table<{status: str, path: path}>"}
 
     // Regression for Real bug #2: `adapters/du.toml` used to declare
     // `parse = "tsv"` for `du -k`-shaped output, but real `du` prints NO
-    // header line at all -- every line is a genuine `<size_kb>\t<path>`
-    // data row. `tsv`'s "first row is the header" rule silently swallowed
-    // the very first real row as fake column names (keyed by whatever that
-    // row's literal text happened to be, not by the promised
-    // `size_kb`/`path` hint names) and, for a single-directory invocation
-    // (exactly one output line), degraded a real one-row result to a
-    // phantom EMPTY table. `tsv-headerless` fixes this: every line is data,
-    // and column identity/order come from the hint alone. (Bare block
-    // counts, not `size`-typed: `du -k`'s numbers carry no unit suffix, the
-    // same reason `df.toml`'s `size_kb`/`used_kb`/`avail_kb` are `int`, not
-    // `size` -- `du -h`'s human-readable suffixes like `"310G"`/`"60K"`
-    // aren't accepted by `shoal_value::parse_size` either, which only
-    // recognizes `b`/`kb`/`mb`/.../`kib`/... suffixes, not bare
-    // single-letter ones, so `du.toml` pins `-k` and consumes
-    // `human_readable` — see that file.)
+    // header line at all -- every line is a genuine `<size>\t<path>` data
+    // row. `tsv`'s "first row is the header" rule silently swallowed the
+    // very first real row as fake column names (keyed by whatever that
+    // row's literal text happened to be, not by the promised `size`/`path`
+    // hint names) and, for a single-directory invocation (exactly one output
+    // line), degraded a real one-row result to a phantom EMPTY table.
+    // `tsv-headerless` fixes this: every line is data, and column
+    // identity/order come from the hint alone. (`size_kb`-typed, not bare
+    // `int`: `du -k`'s numbers carry no unit suffix, so `shoal_value::
+    // parse_size` can't parse them directly -- but the adapter itself
+    // already knows, from its own pinned `-k` invoke flag, that the bare
+    // digits are 1024-byte blocks, so `size_kb` bridges that gap by scaling
+    // `* 1024` into a real `Value::Size` instead of leaving the caller with
+    // an untyped `int` -- see `parse_size_kb` and `du.toml`.)
     #[test]
     fn tsv_headerless_parses_du_shaped_output_with_no_header_row() {
-        let h = "table<{size_kb: int, path: path}>";
+        let h = "table<{size: size_kb, path: path}>";
         // Single-directory `du -k .` output: exactly one line, no header.
         // The old `tsv` strategy would have swallowed this as a "header"
         // and returned an empty table.
@@ -849,7 +882,7 @@ output={parse="porcelain-v2", type="table<{status: str, path: path}>"}
             single,
             Value::Table(vec![{
                 let mut r = Record::new();
-                r.insert("size_kb".into(), Value::Int(335328176));
+                r.insert("size".into(), Value::Size(335328176 * 1024));
                 r.insert("path".into(), Value::Path(".".into()));
                 r
             }])
@@ -867,7 +900,7 @@ output={parse="porcelain-v2", type="table<{status: str, path: path}>"}
             panic!("expected table")
         };
         assert_eq!(rows.len(), 2, "no row should be swallowed as a header");
-        assert_eq!(rows[0]["size_kb"], Value::Int(44));
+        assert_eq!(rows[0]["size"], Value::Size(44 * 1024));
         assert_eq!(
             rows[1]["path"],
             Value::Path("crates/shoal-adapters/tests".into())
@@ -880,22 +913,81 @@ output={parse="porcelain-v2", type="table<{status: str, path: path}>"}
         // overflow into the last column to survive embedded spaces),
         // `tsv-headerless` splits on a literal tab, so a path containing
         // ordinary spaces survives with no special-casing at all.
-        let h = "table<{size_kb: int, path: path}>";
+        let h = "table<{size: size_kb, path: path}>";
         let v = parse_output("tsv-headerless", b"512\tMy Documents\n", Some(h)).unwrap();
         let Value::Table(rows) = v else {
             panic!("expected table")
         };
         assert_eq!(rows[0]["path"], Value::Path("My Documents".into()));
+        assert_eq!(rows[0]["size"], Value::Size(512 * 1024));
     }
 
     #[test]
     fn tsv_headerless_degrades_on_column_count_mismatch() {
-        let h = "table<{size_kb: int, path: path}>";
+        let h = "table<{size: size_kb, path: path}>";
         // Three tab-separated fields where the hint promises exactly two.
         assert_eq!(
             parse_output("tsv-headerless", b"4\textra\tfile.txt\n", Some(h)),
             None
         );
+    }
+
+    // `size_kb` is the whole point: a `du`/`df`-shaped column must come out
+    // as a real, comparable `Value::Size`, not a bare `int` a caller has to
+    // remember is secretly kilobytes and manually multiply. This drives the
+    // parsed cell through `shoal_value::ops::compare` the same way
+    // `(du).where(.size > 1mb)` does at the language level (TDD/CONTRACTS
+    // §"the corpus decides disputes" doesn't reach shoal-adapters directly,
+    // so this is the crate-local proof the byte scaling is right).
+    #[test]
+    fn size_kb_column_is_comparable_as_a_real_size() {
+        let h = "table<{size: size_kb, path: path}>";
+        // 500kb = 512_000b (under 1mb's 1_000_000b); 2048kb = 2_097_152b
+        // (over it) -- one row on each side of the threshold, so the filter
+        // below can't pass vacuously true or vacuously false either way.
+        let bytes = b"500\tsmall\n2048\tbig\n";
+        let v = parse_output("tsv-headerless", bytes, Some(h)).unwrap();
+        let Value::Table(rows) = v else {
+            panic!("expected table")
+        };
+        assert_eq!(rows.len(), 2);
+
+        let one_mb = Value::Size(shoal_value::parse_size("1mb").unwrap());
+        let over_1mb: Vec<_> = rows
+            .iter()
+            .filter(|r| {
+                matches!(
+                    shoal_value::ops::compare(&r["size"], &one_mb),
+                    Ok(std::cmp::Ordering::Greater)
+                )
+            })
+            .collect();
+        assert_eq!(over_1mb.len(), 1, "only the 2048kb row exceeds 1mb");
+        assert_eq!(over_1mb[0]["path"], Value::Path("big".into()));
+
+        // Both rows exceed 1kb in bytes -- sanity-check the comparison isn't
+        // vacuously true/false in both directions.
+        let one_kb = Value::Size(shoal_value::parse_size("1kb").unwrap());
+        let over_1kb: Vec<_> = rows
+            .iter()
+            .filter(|r| {
+                matches!(
+                    shoal_value::ops::compare(&r["size"], &one_kb),
+                    Ok(std::cmp::Ordering::Greater)
+                )
+            })
+            .collect();
+        assert_eq!(over_1kb.len(), 2, "both rows exceed 1kb in bytes");
+    }
+
+    #[test]
+    fn size_kb_degrades_on_non_numeric_or_negative_cells() {
+        let h = "table<{size: size_kb, path: path}>";
+        assert_eq!(
+            parse_output("tsv-headerless", b"notanumber\tfile\n", Some(h)),
+            None
+        );
+        assert_eq!(parse_output("tsv-headerless", b"-5\tfile\n", Some(h)), None);
     }
 
     // Regression for Real bug #1: `git status --porcelain=v2 --short` used
