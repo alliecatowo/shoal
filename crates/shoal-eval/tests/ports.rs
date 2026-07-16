@@ -4,7 +4,7 @@
 //! observe the fake — and the real filesystem is never touched.
 
 use shoal_eval::Evaluator;
-use shoal_value::{Fs, Value};
+use shoal_value::{Fs, ReadSeek, Value};
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -40,6 +40,12 @@ impl Fs for FakeFs {
         let bytes = self.read(path)?;
         String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
+    fn open_read(&self, path: &Path) -> io::Result<Box<dyn ReadSeek + Send>> {
+        // An in-memory, seekable reader over the fake's bytes — the `tail`
+        // source drives this exactly as it would a real `File`.
+        let bytes = self.read(path)?;
+        Ok(Box::new(io::Cursor::new(bytes)))
+    }
     fn write(&self, path: &Path, data: &[u8]) -> io::Result<()> {
         self.files
             .lock()
@@ -69,6 +75,12 @@ impl Fs for FakeFs {
     }
     fn symlink_metadata(&self, _path: &Path) -> io::Result<std::fs::Metadata> {
         unreachable!("symlink_metadata not exercised by the port-seam test")
+    }
+    fn is_file(&self, path: &Path) -> bool {
+        // Overridden (the default routes through `metadata`, which this fake
+        // can't fabricate) so the `config` reader's existence probe is
+        // interposable in memory.
+        self.files.lock().unwrap().contains_key(path)
     }
     fn read_dir(&self, _path: &Path) -> io::Result<Vec<PathBuf>> {
         unreachable!("read_dir not exercised by the port-seam test")
@@ -132,6 +144,25 @@ fn redirect_append_routes_through_the_fs_port() {
 
     let written = fs.get(&cwd.join("log")).expect("fake fs captured appends");
     assert_eq!(written, b"a\nb\n");
+}
+
+/// The in-language `config` reader routes through the port: it finds and parses
+/// a seeded, in-memory `shoal.toml` via `Fs::is_file` + `Fs::read_to_string`,
+/// with nothing on the real disk (the cwd does not exist). This pins the fix for
+/// the `config` reader's former direct `std::fs::read_to_string` + `is_file`
+/// leak (CONTRACTS §8).
+#[test]
+fn config_reader_routes_through_the_fs_port() {
+    let cwd = Path::new("/nonexistent-shoal-ports-test");
+    let fs = Arc::new(FakeFs::default());
+    fs.seed(cwd.join("shoal.toml"), b"greeting = \"hi\"\n".to_vec());
+
+    let out = eval_with_fs("config.all()", cwd, fs);
+    let rec = match out {
+        Value::Record(r) => r,
+        other => panic!("expected a record, got {}", other.type_name()),
+    };
+    assert_eq!(rec.get("greeting"), Some(&Value::Str("hi".into())));
 }
 
 /// `cat` reads through the port: seed the fake, and `cat` returns its bytes

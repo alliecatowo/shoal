@@ -80,7 +80,9 @@ impl Evaluator {
                 format!("circular `use`: {}", cycle.join(" -> ")),
             ));
         }
-        let src = std::fs::read_to_string(canon)
+        let src = self
+            .fs
+            .read_to_string(canon)
             .map_err(|e| ErrorVal::new("io_error", format!("cannot read module: {e}")))?;
         let program =
             shoal_syntax::parse(&src).map_err(|e| ErrorVal::new("parse_error", e.to_string()))?;

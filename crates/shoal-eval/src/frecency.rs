@@ -211,26 +211,28 @@ impl FrecencyStore {
         }
     }
 
-    /// Load the store from `path`. A missing or unreadable file (or invalid
-    /// UTF-8) is treated as an empty store — never an error.
-    pub(crate) fn load(path: &Path) -> Self {
-        match std::fs::read_to_string(path) {
+    /// Load the store from `path` through the [`Fs`] port. A missing or
+    /// unreadable file (or invalid UTF-8) is treated as an empty store — never
+    /// an error.
+    pub(crate) fn load(fs: &dyn Fs, path: &Path) -> Self {
+        match fs.read_to_string(path) {
             Ok(text) => Self::parse(&text),
             Err(_) => Self::default(),
         }
     }
 
-    /// Atomically persist the store to `path` (temp file + rename). Returns the
-    /// I/O result; callers on the `cd` hot path swallow it (best-effort).
-    pub(crate) fn save(&self, path: &Path) -> std::io::Result<()> {
+    /// Atomically persist the store to `path` through the [`Fs`] port (write to
+    /// a temp file, then rename). Returns the I/O result; callers on the `cd`
+    /// hot path swallow it (best-effort).
+    pub(crate) fn save(&self, fs: &dyn Fs, path: &Path) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            fs.create_dir_all(parent)?;
         }
         // Per-pid temp name so concurrent shells don't stomp each other's
         // in-progress write before the atomic rename publishes it.
         let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-        std::fs::write(&tmp, self.serialize())?;
-        std::fs::rename(&tmp, path)?;
+        fs.write(&tmp, self.serialize().as_bytes())?;
+        fs.rename(&tmp, path)?;
         Ok(())
     }
 }
@@ -285,9 +287,9 @@ impl Evaluator {
             return; // recording disabled (scripts / -c / conformance)
         };
         let now = self.clock.now_ns() / 1_000_000_000;
-        let mut store = FrecencyStore::load(&path);
+        let mut store = FrecencyStore::load(self.fs.as_ref(), &path);
         store.add(dir, now);
-        let _ = store.save(&path);
+        let _ = store.save(self.fs.as_ref(), &path);
     }
 
     /// The `j`/`jump` builtin: resolve the best matching stored directory for an
@@ -354,7 +356,7 @@ impl Evaluator {
             }
         }
         let now = self.clock.now_ns() / 1_000_000_000;
-        let store = FrecencyStore::load(&self.jump_read_path());
+        let store = FrecencyStore::load(self.fs.as_ref(), &self.jump_read_path());
         for e in store.ranked(query, now) {
             if e.path.is_dir() {
                 return Ok(e.path.clone());
@@ -485,11 +487,11 @@ notanumber\t100\t/bad/rank
         let dir = tempfile::tempdir().unwrap();
         // Missing file.
         let missing = dir.path().join("does-not-exist");
-        assert!(FrecencyStore::load(&missing).entries.is_empty());
+        assert!(FrecencyStore::load(&StdFs, &missing).entries.is_empty());
         // A file of pure garbage (no valid line) loads as empty, not an error.
         let corrupt = dir.path().join("corrupt");
         std::fs::write(&corrupt, b"\x00\x01not at all valid\xff\xfe").unwrap();
-        assert!(FrecencyStore::load(&corrupt).entries.is_empty());
+        assert!(FrecencyStore::load(&StdFs, &corrupt).entries.is_empty());
     }
 
     #[test]
@@ -499,8 +501,8 @@ notanumber\t100\t/bad/rank
         let mut store = FrecencyStore::default();
         store.add(Path::new("/x/y"), 300);
         store.add(Path::new("/x/y"), 350);
-        store.save(&path).unwrap();
-        let reloaded = FrecencyStore::load(&path);
+        store.save(&StdFs, &path).unwrap();
+        let reloaded = FrecencyStore::load(&StdFs, &path);
         assert_eq!(reloaded.entries.len(), 1);
         assert_eq!(reloaded.entries[0].path, PathBuf::from("/x/y"));
         assert_eq!(reloaded.entries[0].rank, 2.0);
@@ -555,7 +557,7 @@ notanumber\t100\t/bad/rank
         run(&mut ev, "cd ../beta/shoal-project");
 
         // Both destinations were recorded by the plain `cd`s.
-        let recorded = FrecencyStore::load(&store);
+        let recorded = FrecencyStore::load(&StdFs, &store);
         assert_eq!(
             recorded.entries.len(),
             2,
@@ -606,7 +608,7 @@ notanumber\t100\t/bad/rank
         // cd still works despite the corrupt store, and rewrites it cleanly.
         run(&mut ev, "cd dir1");
         assert_eq!(ev.cwd(), root.join("dir1").as_path());
-        let reloaded = FrecencyStore::load(&store);
+        let reloaded = FrecencyStore::load(&StdFs, &store);
         assert_eq!(reloaded.entries.len(), 1);
         assert_eq!(reloaded.entries[0].path, root.join("dir1"));
     }

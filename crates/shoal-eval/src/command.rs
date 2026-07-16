@@ -818,7 +818,7 @@ impl Evaluator {
             .ingest_spill(&spill.path, &spill.hash, spill.len, true)
             .is_err()
         {
-            let _ = std::fs::remove_file(&spill.path);
+            let _ = self.fs.remove_file(&spill.path);
             return None;
         }
         let loader = CasBytesLoader {

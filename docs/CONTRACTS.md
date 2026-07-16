@@ -448,14 +448,17 @@ code, so this refactor was purely structural.
 
 ```rust
 // shoal-value/src/ports.rs
+pub trait ReadSeek: io::Read + io::Seek {}   // blanket-impl'd for every Read+Seek; `tail`'s seekable reader
 pub trait Fs: Send + Sync {
     fn read(&self, path: &Path) -> io::Result<Vec<u8>>;
     fn read_to_string(&self, path: &Path) -> io::Result<String>;
+    fn open_read(&self, path: &Path) -> io::Result<Box<dyn ReadSeek + Send>>;  // seekable stream for `tail`
     fn write(&self, path: &Path, data: &[u8]) -> io::Result<()>;
     fn append(&self, path: &Path, data: &[u8]) -> io::Result<()>;
     fn touch(&self, path: &Path) -> io::Result<()>;
     fn metadata(&self, path: &Path) -> io::Result<fs::Metadata>;
     fn symlink_metadata(&self, path: &Path) -> io::Result<fs::Metadata>;
+    fn is_file(&self, path: &Path) -> bool;   // default: metadata().is_file(); overridable by in-memory fakes
     fn read_dir(&self, path: &Path) -> io::Result<Vec<PathBuf>>;
     fn create_dir(&self, path: &Path) -> io::Result<()>;
     fn create_dir_all(&self, path: &Path) -> io::Result<()>;

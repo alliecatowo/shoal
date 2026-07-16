@@ -20,6 +20,15 @@ use std::path::{Path, PathBuf};
 // Fs — filesystem port
 // ---------------------------------------------------------------------------
 
+/// A readable **and seekable** byte source: the return type of
+/// [`Fs::open_read`]. The `tail` stream source both seeks (to EOF, or to a
+/// saved byte offset it advances across appends) and reads whole lines as they
+/// land, so the port hands back a `Read + Seek` object rather than a bare
+/// reader. The blanket impl makes every `Read + Seek` type (a real
+/// `std::fs::File`, an in-memory `io::Cursor` in a test) a `ReadSeek` for free.
+pub trait ReadSeek: io::Read + io::Seek {}
+impl<T: io::Read + io::Seek> ReadSeek for T {}
+
 /// Filesystem effects used by the evaluator's builtins, redirects, script
 /// loading, and journal snapshots. Every method returns [`io::Result`] so the
 /// call-sites keep their existing `io::Error`-based error mapping unchanged.
@@ -33,6 +42,10 @@ pub trait Fs: Send + Sync {
     /// Read the entire contents of a file into a `String`
     /// (`std::fs::read_to_string`).
     fn read_to_string(&self, path: &Path) -> io::Result<String>;
+    /// Open a file for streaming, seekable reads (`std::fs::File::open`). Backs
+    /// the `tail` source's incremental read loop, which seeks to EOF / a saved
+    /// byte offset and then reads whole lines as they arrive.
+    fn open_read(&self, path: &Path) -> io::Result<Box<dyn ReadSeek + Send>>;
     /// Write bytes to a file, truncating it first (`std::fs::write`).
     fn write(&self, path: &Path, data: &[u8]) -> io::Result<()>;
     /// Append bytes to a file, creating it if absent (`OpenOptions` create +
@@ -45,6 +58,14 @@ pub trait Fs: Send + Sync {
     fn metadata(&self, path: &Path) -> io::Result<fs::Metadata>;
     /// Metadata without following symlinks (`std::fs::symlink_metadata`).
     fn symlink_metadata(&self, path: &Path) -> io::Result<fs::Metadata>;
+    /// Whether `path` is an existing regular file, following symlinks — the
+    /// port form of `Path::is_file`. Never errors: a missing path or an IO
+    /// failure is `false`. The default routes through [`metadata`](Fs::metadata)
+    /// so it is byte-identical to `Path::is_file` under [`StdFs`]; an in-memory
+    /// adapter overrides it to answer from its own store.
+    fn is_file(&self, path: &Path) -> bool {
+        self.metadata(path).map(|m| m.is_file()).unwrap_or(false)
+    }
     /// The (full) paths of a directory's entries (`std::fs::read_dir`, each
     /// entry's `.path()`). Order is unspecified, exactly as `read_dir` yields.
     fn read_dir(&self, path: &Path) -> io::Result<Vec<PathBuf>>;
@@ -77,6 +98,9 @@ impl Fs for StdFs {
     }
     fn read_to_string(&self, path: &Path) -> io::Result<String> {
         fs::read_to_string(path)
+    }
+    fn open_read(&self, path: &Path) -> io::Result<Box<dyn ReadSeek + Send>> {
+        Ok(Box::new(fs::File::open(path)?))
     }
     fn write(&self, path: &Path, data: &[u8]) -> io::Result<()> {
         fs::write(path, data)

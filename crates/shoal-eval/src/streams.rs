@@ -23,9 +23,10 @@
 
 use crate::Evaluator;
 use notify::{EventKind, RecursiveMode, Watcher};
-use shoal_value::{ErrorVal, Record, StreamVal, VResult, Value};
+use shoal_value::{ErrorVal, Fs, Record, StreamVal, VResult, Value};
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::{SyncSender, TrySendError, channel, sync_channel};
 use std::time::Duration;
 
@@ -165,7 +166,11 @@ impl Evaluator {
             ));
         }
         let (tx, rx) = sync_channel::<VResult<Value>>(SOURCE_BUF);
-        std::thread::spawn(move || tail_loop(&path, from_start, &tx));
+        // The tail producer reads through the `Fs` port (not `std::fs` directly)
+        // so the streaming source is interposable/fakeable like every other
+        // filesystem effect; the `Arc` clone rides into the producer thread.
+        let fs = self.fs.clone();
+        std::thread::spawn(move || tail_loop(&fs, &path, from_start, &tx));
         Ok(Value::Stream(StreamVal::from_channel("str", rx)))
     }
 
@@ -257,8 +262,8 @@ fn glob_prefix(pattern: &str) -> PathBuf {
 
 /// The tail producer: seek, then wait on `notify` for appends, reading whole
 /// lines as they land. Exits when the consumer drops `tx`.
-fn tail_loop(path: &Path, from_start: bool, tx: &SyncSender<VResult<Value>>) {
-    let mut file = match std::fs::File::open(path) {
+fn tail_loop(fs: &Arc<dyn Fs>, path: &Path, from_start: bool, tx: &SyncSender<VResult<Value>>) {
+    let mut file = match fs.open_read(path) {
         Ok(f) => f,
         Err(e) => {
             let _ = tx.send(Err(ErrorVal::new("io_error", format!("tail: {e}"))));
@@ -291,19 +296,19 @@ fn tail_loop(path: &Path, from_start: bool, tx: &SyncSender<VResult<Value>>) {
 
     // Read whatever is already available past `pos` (the from_start backlog, or
     // any bytes written between open and the first event).
-    if !read_new_lines(path, &mut pos, tx, &mut dropped) {
+    if !read_new_lines(fs, path, &mut pos, tx, &mut dropped) {
         return;
     }
     for res in raw_rx {
         match res {
             Ok(ev) if matches!(ev.kind, EventKind::Modify(_) | EventKind::Create(_)) => {
                 // Truncation/rotation: file shrank → restart from its new EOF.
-                if let Ok(meta) = std::fs::metadata(path)
+                if let Ok(meta) = fs.metadata(path)
                     && meta.len() < pos
                 {
                     pos = 0;
                 }
-                if !read_new_lines(path, &mut pos, tx, &mut dropped) {
+                if !read_new_lines(fs, path, &mut pos, tx, &mut dropped) {
                     break;
                 }
             }
@@ -325,12 +330,13 @@ fn tail_loop(path: &Path, from_start: bool, tx: &SyncSender<VResult<Value>>) {
 /// past the last full line. A trailing partial line (no `\n`) is left unread.
 /// Returns `false` if the consumer has gone (send failed) so the caller stops.
 fn read_new_lines(
+    fs: &Arc<dyn Fs>,
     path: &Path,
     pos: &mut u64,
     tx: &SyncSender<VResult<Value>>,
     dropped: &mut u64,
 ) -> bool {
-    let mut file = match std::fs::File::open(path) {
+    let mut file = match fs.open_read(path) {
         Ok(f) => f,
         Err(_) => return true,
     };
