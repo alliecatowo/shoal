@@ -234,6 +234,10 @@ pub(crate) fn builtin_outcome(head: &str, result: Value) -> Value {
         cmd: head.to_string(),
         parsed: Some(result),
         streamed: false,
+        // No invocation span in scope here: `builtin_outcome` is handed only a
+        // head string and an already-computed result value, not the call site.
+        // Honestly `None` (the wire omits it) rather than fabricating one.
+        span: None,
     }))
 }
 

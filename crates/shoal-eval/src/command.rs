@@ -695,6 +695,11 @@ impl Evaluator {
             cmd: display,
             parsed,
             streamed,
+            // Stamp the invocation's source span — the same `span` the sibling
+            // error path below hands to `ErrorVal::with_span`, so a command's
+            // success and failure carry an identical source anchor on the wire
+            // (AGENT-SURFACE §2).
+            span: Some(span),
         }));
         if !ok && position == Position::Statement {
             let Value::Outcome(failed) = &out else {
