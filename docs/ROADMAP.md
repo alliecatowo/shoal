@@ -26,7 +26,8 @@ binding table). Well past the TDD §12 target of ≥1,000.
 
 **Waves R0–R3 are DONE** (see per-wave notes below for exactly what shipped and how it was
 verified). **Wave R4 is mostly done** (hexagonal ports shipped; the big file splits landed; the
-builtin-registry/`resolve.rs` unification has not). **Wave R5 is in continuous progress** (corpus
+builtin-identity registry has landed too — see below — but the broader command-*resolution*
+unification into one `resolve.rs` has not). **Wave R5 is in continuous progress** (corpus
 target already exceeded; wiki kept current; most small carryovers landed, a few remain — see below).
 
 Broad "done" list, each independently verified against the binary or a targeted grep while writing
@@ -57,7 +58,8 @@ load-bearing):
   real end-to-end test in `crates/shoal-mcp/tests/live_kernel.rs`.
 - Data namespaces + remaining builtins (R2): `json`/`yaml`/`toml`/`csv` (`.parse`/`.stringify`),
   `math`, `http` (get/post/put/delete), `os`, `config`; `tail`/`head`/`ln`/`explain` builtins.
-  **Not done**: `jump`/`j` (frecency-ranked `cd`) — no such builtin exists yet.
+  `jump`/`j` (frecency-ranked `cd`, plus a `pushd`/`popd`/`dirs` directory stack and `cd -`/`OLDPWD`)
+  have since landed too — see the R2 wave note below.
 - Modules, task lifecycle, plan/apply, undo `out[n]` (R3): `use ./lib/x` (+ `as` alias, `export`)
   binds a module's exports and its `fn`s run as commands (verified live); `task.suspend()`/
   `.resume()` are wired for evaluator-owned processes (kernel-spawned/non-evaluator processes return
@@ -74,10 +76,14 @@ load-bearing):
   spawn-*identity* pinning (a policy's `proc_spawn = ["<hash>"]` against reef's locked hash) — see
   open item #1 below, this is a real, specific, currently-unenforced gap, not enforcement in
   general being fake.
-- `shoal-prompt` (~8µs render), **35 adapters** shipped under `adapters/` (git, cargo, rg, docker,
-  kubectl, jq, curl, tar, fd, du, npm, pnpm, bun, deno, node, python, pip, ruby, go, rustup,
-  terraform, helm, gcloud, aws, gh, jj, sqlite3, systemctl, systemd-analyze, ip, ss, df, ps, bash,
-  brew), journal-in-eval + `undo` + `journal`/`history`, README+logo+demo, GPG-signed commit history.
+- `shoal-prompt` (~8µs render), **42 adapters** shipped under `adapters/` (git, cargo, rg, docker,
+  kubectl, jq, curl, tar, fd, du, df, stat, npm, pnpm, bun, yarn, deno, node, python, pip, uv, ruby,
+  go, rustup, terraform, helm, gcloud, aws, gh, jj, sqlite3, systemctl, systemd-analyze, ip, ss, ps,
+  bash, brew, podman, unzip, zip, yq — `ls adapters/` for the current, growing list), journal-in-eval
+  + `undo` + `journal`/`history`, README+logo+demo, GPG-signed commit history. `du`/`df` now emit a
+  real, comparable `Value::Size` (a `size_kb`-typed column scaling the pinned `-k`/`-kP` block
+  counts ×1024) rather than bare kb ints, and `du.toml`/`stat.toml`'s previous `tsv-headerless`
+  parser-load failure (see the old open-items #10 below) is fixed — both load and parse cleanly now.
 
 ---
 
@@ -108,16 +114,19 @@ closed the one gap this wave's original acceptance criteria didn't yet cover.
 
 ---
 
-## Wave R2 — Data namespaces + remaining structured builtins — **DONE, except `jump`/`j`**
+## Wave R2 — Data namespaces + remaining structured builtins — **DONE**
 
 `json`/`yaml`/`toml`/`csv`/`math`/`http`/`os`/`config` all exist as namespace values with the
 methods specified in the original mini-spec (verified live: `json.parse("[1,2]")`,
 `math.sqrt(2)`, `os.platform()`). `tail`/`head`/`ln`/`explain` are structured builtins, not raw
 passthrough.
 
-**Still not built**: `jump`/`j` (frecency-ranked `cd`, needs a small frecency store in the
-journal/state dir) — grep confirms no such builtin is registered. Cheap, self-contained, a good
-first pickup for whoever's turn it is to touch `shoal-eval` next.
+**`jump`/`j` (frecency-ranked `cd`) has landed**: a small frecency store backs `jump`/`j`, verified
+live (`jump "x"` ranks and cds by recency+frequency); `feat(eval): jump/j frecency-ranked directory
+jumping`. A `pushd`/`popd`/`dirs` directory stack and `cd -`/`OLDPWD` landed alongside it in a later
+wave (`feat(shell): cd -/pushd/popd/dirs`) — all route through one `change_cwd` choke point so
+directory history keeps recording, all session-scoped and top-level-only like `cd` itself
+(**corpus** `spec/cases/dir-stack.toml`, `reef.toml:jump-inside-fn-body-is-illegal`).
 
 ---
 
@@ -150,17 +159,26 @@ tightening continued incrementally (see root `Cargo.toml`'s `[workspace.metadata
 live-violation-tracked remainder — `use_self`, `unused_qualifications`, etc. — each with a documented
 reason it isn't enabled yet).
 
-**Not done**: the **one builtin REGISTRY** unifying the three hardcoded sources of builtin identity
-(dispatch / `is_command_name` / `builtin_effects`), and collapsing command resolution
-(fn/alias/reef/adapter/PATH) into one `resolve.rs` returning
-`enum { Builtin, Adapter, External, Interpreter }`. Grep confirms neither exists yet
-(`crates/shoal-eval/src` has no `resolve.rs`, no `REGISTRY`/`BuiltinRegistry`). This is still a real
-architectural cleanup opportunity — the three-hardcoded-sources problem it targets hasn't gotten
-worse, but hasn't been fixed either. Eval-heavy; serialize with any other `shoal-eval` work per the
-one hard constraint.
+**Done (partial): the builtin-identity half.** `crates/shoal-eval/src/builtins.rs` now holds one
+canonical registry (`NAMES` + `SPECIAL_HEADS`, exposed via `pub fn builtin_names()`) that `is_builtin`/
+`is_special_head`/`is_command_name` all derive from, instead of hand-copied lists drifting across
+dispatch sites. The completer, syntax highlighter, and `shoal-lsp` (which gained a `shoal-eval`
+dependency for this, moving it from Tier 1 to Tier 4 — see `docs/CONTRACTS.md`'s crate-dependency
+DAG) now consume that same list, so every real builtin tab-completes/highlights consistently and a
+new head can't silently skip one of the four consumers (`refactor: one canonical builtin-command
+registry + method-name completion`).
 
-**Acceptance for the remaining slice**: one builtin registry table; one `resolve.rs`; conformance
-corpus unchanged; `cargo clippy --workspace --all-targets --locked -- -D warnings` still green.
+**Not done**: the broader command-*resolution* unification — collapsing fn/alias/reef/adapter/PATH
+lookup into one `resolve.rs` returning `enum { Builtin, Adapter, External, Interpreter }`. Grep
+confirms it still doesn't exist (`crates/shoal-eval/src` has no `resolve.rs`); dispatch across those
+sources is still the separate hand-written paths in `command.rs`/`call.rs`. This is a narrower
+remaining slice than the original item (the builtin-identity drift it also targeted is fixed), still
+a real cleanup opportunity, still eval-heavy — serialize with any other `shoal-eval` work per the one
+hard constraint.
+
+**Acceptance for the remaining slice**: one `resolve.rs` unifying fn/alias/reef/adapter/PATH lookup;
+conformance corpus unchanged; `cargo clippy --workspace --all-targets --locked -- -D warnings` still
+green.
 
 ---
 
@@ -221,8 +239,12 @@ verification pass:
    an exec-time BPF-LSM/`spawn_hash` pin lands — the same caveat `preflight_spawn` already
    documents; the OS `SandboxPolicy.spawn_hash` pin (exec-layer `verify_pin`) remains available for
    the fs-scoped path.
-2. **Builtin REGISTRY + `resolve.rs` unification** (R4 remainder) — architectural cleanup, eval-heavy.
-3. **`jump`/`j`** frecency-ranked `cd` (R2 remainder) — small, self-contained, eval-heavy.
+2. **Command-resolution `resolve.rs` unification — REMAINING SLICE ONLY.** The builtin-*identity*
+   half (one registry backing dispatch/completer/highlighter/LSP) shipped — see Wave R4 above. What's
+   left is collapsing fn/alias/reef/adapter/PATH lookup itself into one `resolve.rs`; architectural
+   cleanup, eval-heavy.
+3. **`jump`/`j` frecency-ranked `cd` — DONE** (R2), along with a `pushd`/`popd`/`dirs` directory stack
+   and `cd -`/`OLDPWD` that landed in the same stretch of work — see Wave R2 above.
 4. **`Outcome` wire `span`** always `None` over the kernel wire (R5 carryover) — small, `shoal-kernel`.
 5. **`shoal_cap_request`'s grant response enforcement honesty — WIRED.**
    `crates/shoal-kernel/src/handlers_task.rs`'s `handle_cap_request` calls the same
@@ -244,16 +266,16 @@ verification pass:
 8. **macOS cwd-under-a-symlink undo edge case** (R5 carryover) — still open.
 9. **Prompt async/deferred git-status segments** (R5 carryover) — still open; today's prompt does a
    once-per-render subprocess-based git status, not an event-driven one.
-10. Live bugs found while verifying this revision: `adapters/du.toml` **and** `adapters/stat.toml`
-    both fail to load (`unknown output parser "tsv-headerless"`) — `shoal-adapters` doesn't
-    recognize that parser strategy string, so both tools fall back ungracefully instead of parsing
-    structured output (a warning prints on every shoal startup). Not this doc's lane to fix
-    (adapters + `shoal-adapters` parser strategies are delegated modules per `docs/CONTRACTS.md`'s
-    ownership map) — flagging so it's tracked, not silently reintroduced.
+10. ~~`adapters/du.toml`/`adapters/stat.toml` fail to load (`unknown output parser
+    "tsv-headerless"`)~~ — **FIXED**. `shoal-adapters` now implements the `tsv-headerless` strategy
+    (`parse_tsv_headerless` in `crates/shoal-adapters/src/lib.rs`); both load and parse cleanly with
+    no startup warning (verified live: `du`/`stat` render structured tables, not a passthrough
+    fallback). `du`/`df` additionally moved off bare kb ints onto a real, comparable `Value::Size`
+    (`size_kb`-typed columns, `fix(adapters): du/df emit a real, comparable Value::Size...`).
 11. **Windows** — resolution semantics, ConPTY, ports — entirely deferred, `docs/TDD.md` §14.
 12. **Config hardening** — in flight under separate ownership (`docs/CONFIG.md`); not detailed here.
-13. **More adapters** — 35 shipped; the ecosystem is large and this is perpetually "in flight" by
-    nature, not a blocking gap.
+13. **More adapters** — 42 shipped as of this revision (`ls adapters/` for the current, growing
+    list); the ecosystem is large and this is perpetually "in flight" by nature, not a blocking gap.
 
 ---
 
@@ -266,13 +288,13 @@ Given R0–R3 are done and R4/R5 are the only waves with open work:
    `plan_derive.rs`'s `ProcSpawn` effect and have the real spawn path actually consult
    `shoal-leash`'s evaluator with it before exec. Eval-heavy (touches `shoal-eval`'s spawn path);
    serialize with any other `shoal-eval` work per the one hard constraint.
-2. **Close the other small, cheap items** (#3 `jump`/`j`, #4 `Outcome` span — #5 `cap_request`
-   enforcement honesty is already closed, see above) — each is self-contained, low-risk, and
-   removes a specific documented gap.
-3. **R4's builtin registry/`resolve.rs` unification** (#2) — do this once no other eval-heavy work
-   is in flight (the one-hard-constraint serialization applies), since it touches command dispatch
-   broadly and benefits from a quiet tree. **#6** (bare-path runner ergonomics) touches the same
-   command-head-resolution machinery — worth doing in the same pass.
+2. **Close the other small, cheap items** (#4 `Outcome` span — #3 `jump`/`j` and #5 `cap_request`
+   enforcement honesty are already closed, see above) — self-contained, low-risk, removes a specific
+   documented gap.
+3. **The remaining `resolve.rs` command-resolution slice** (#2) — do this once no other eval-heavy
+   work is in flight (the one-hard-constraint serialization applies), since it touches command
+   dispatch broadly and benefits from a quiet tree. **#6** (bare-path runner ergonomics) touches the
+   same command-head-resolution machinery — worth doing in the same pass.
 4. **#7, the end-to-end sandbox-enforcement trace** — security-relevant, worth a dedicated
    verification pass (ideally by an agent that writes a real restrictive policy file and a live
    kernel test, not just reads source) before trusting it either way, once #1 is closed.

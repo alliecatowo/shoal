@@ -231,7 +231,7 @@ Lexical scoping; modules are files (`use ./lib/deploy` binds `export`s under `de
 
 ## 5. Builtin surface (namespaces, v1)
 
-Core verbs: `ls cd pwd cp mv rm mkdir touch ln cat open save stat which env echo sleep kill ps du df tail head watch jump(j) pick interact explain run sh spawn parallel retry with sudo`. Namespaces: `str.* path.* list.* table.* stream.* math.* json/yaml/toml/csv.* http.*`, `os.*`, `journal`, `jobs`, `history`, `config`, `secret`, `re`. Value methods: `.where .sort .first .last .map .each .group .sum .len .uniq .join .lines .words .matches .replace .save .pick .tee .collect …`. Builtins obey the same signature/flag/coercion machinery as user `fn`s.
+Core verbs: `ls cd pwd pushd popd dirs cp mv rm mkdir touch ln cat open save stat which env echo sleep kill ps du df tail head watch jump(j) pick interact explain run sh spawn parallel retry with sudo`. Namespaces: `str.* path.* list.* table.* stream.* math.* json/yaml/toml/csv.* http.*`, `os.*`, `journal`, `jobs`, `history`, `config`, `secret`, `re`. Value methods: `.where .sort .first .last .map .each .group .sum .len .uniq .join .lines .words .matches .replace .save .pick .tee .collect …`. Builtins obey the same signature/flag/coercion machinery as user `fn`s.
 
 ---
 

@@ -99,8 +99,10 @@ cargo run -p shoal -- examples/example.shl
 
 Statement‑position commands run on a PTY, so `vim`, `git rebase -i`, `htop`, and a colored
 `cargo build` all behave normally. Expressions and assignments capture clean structured output
-instead. The editor has persistent history, multiline input, context‑aware tab completion,
-live syntax highlighting, and a fast cwd/Git/reef‑aware prompt.
+instead. The editor has persistent history, multiline input, context‑aware tab completion (every
+builtin and value method, one shared registry with the LSP), live syntax highlighting, a fast
+cwd/Git/reef‑aware prompt, `cd -`/`pushd`/`popd`/`dirs` for directory‑stack navigation, and an
+opt‑in pager (`render.paging = "auto"`, honors `$PAGER`) for long output.
 
 ```text
 ~/dev/shoal  main ▲  rust 1.97          # the prompt already knows — zero subprocesses
@@ -314,9 +316,16 @@ Adapters wrap the entire existing ecosystem into shoal's typed world — no boil
 - **leash enforcement is live** — the spawn path applies Landlock (Linux) / Seatbelt (macOS) from a
   scoped policy, with proven denial and honest tier reporting.
 - reef resolution (`which`‑chain, `with reef:`, lockfile, live project‑scope `.reef.toml` walking),
-  the SQLite journal + CAS, **35 adapters**, and the **agent surface**: kernel JSON‑RPC + MCP
+  the SQLite journal + CAS, **42 adapters**, and the **agent surface**: kernel JSON‑RPC + MCP
   facade with automatic elision, `resources/*`, events/channels, and an installable **Claude Code
   plugin** in [`plugin/`](plugin/).
+- `jump`/`j` frecency‑ranked `cd`, a `pushd`/`popd`/`dirs` directory stack, and `cd -` (`OLDPWD`) —
+  all session‑scoped, top‑level‑only like `cd`, and journaled the same way.
+- One canonical builtin‑command registry backing the evaluator, completer, syntax highlighter, and
+  `shoal-lsp` — every real builtin (and every value method) now tab‑completes; adding a builtin can
+  no longer silently skip completion/highlighting in just one of the four.
+- An opt‑in REPL **pager** for long output (`render.paging = "auto"`, `render.pager` or `$PAGER`) —
+  see [`docs/CONFIG.md`](docs/CONFIG.md) §6.
 
 </details>
 
@@ -330,11 +339,9 @@ Adapters wrap the entire existing ecosystem into shoal's typed world — no boil
   the real spawn path today). See [`docs/REEF.md`](docs/REEF.md) §2 for the exact, corrected state.
 - The bare‑path "just type the filename" runner ergonomics (`./script.py`) work for `.shl`; other
   extensions currently need the explicit `run script.py` spelling.
-- A builtin‑registry/command‑resolution unification (collapsing three hardcoded sources of builtin
-  identity into one), `jump`/`j` frecency `cd`, an `Outcome`'s wire `span` (always `None` today),
-  and `shoal_cap_request`'s grant response always reporting `enforced: false` regardless of the real
-  backend — see [`docs/ROADMAP.md`](docs/ROADMAP.md)'s open‑items list for the complete, current
-  punch list.
+- An `Outcome`'s wire `span` is honestly always `None` today — no eval-side plumbing carries a
+  command's source span onto its success value yet (the error path already does) — see
+  [`docs/ROADMAP.md`](docs/ROADMAP.md)'s open‑items list for the complete, current punch list.
 - Config hardening (`shoal-config`) and Windows support are in flight / deferred, respectively.
 
 Honest gaps are tracked in the code and design docs — nothing here is vaporware‑by‑omission.
