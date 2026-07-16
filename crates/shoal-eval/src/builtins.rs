@@ -4,16 +4,64 @@ use shoal_exec::CancelToken;
 use shoal_value::{ErrorVal, Fs, Record, VResult, Value};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 static TRASH_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// Structured builtins dispatched by [`run`]/[`dispatch`] below — the fs / env
+/// / sleep family that produces a typed `Value` from raw CMD words. This is the
+/// set [`is_builtin`] gates the generic `builtins::run` dispatch on; keeping it
+/// separate from [`SPECIAL_HEADS`] is load-bearing (a special head like `cd`
+/// must NOT route to `dispatch`, which only knows these fourteen).
 const NAMES: &[&str] = &[
     "echo", "ls", "cat", "mkdir", "touch", "cp", "mv", "rm", "stat", "which", "env", "sleep",
     "head", "ln",
 ];
+
+/// Command heads intercepted directly in `eval_command` (session navigation,
+/// job control, journal/undo, plan verbs, `source`/`run`) — dispatched there by
+/// name to their own methods, NOT via `dispatch`. Together with [`NAMES`] this
+/// is the complete builtin command-head vocabulary exposed by [`builtin_names`]
+/// and honored by [`Evaluator::is_command_name`](super::Evaluator). Keep this in
+/// lockstep with the `if call.head == "…"` guards in `command.rs`.
+const SPECIAL_HEADS: &[&str] = &[
+    "cd", "pushd", "popd", "dirs", "j", "jump", "pwd", "exit", "quit", "source", "run", "jobs",
+    "interact", "assert", "open", "save", "reef", "undo", "journal", "history", "plan", "apply",
+    "explain",
+];
+
+/// The one canonical builtin registry: every name that resolves as a builtin
+/// command head (structured builtins ∪ special heads), sorted and deduped. This
+/// is THE source of truth — the completer, highlighter, and LSP all consume it
+/// (via [`builtin_names`]) instead of hand-maintaining their own drifting copies.
+static BUILTIN_NAMES: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+    let mut v: Vec<&'static str> = NAMES.iter().chain(SPECIAL_HEADS).copied().collect();
+    v.sort_unstable();
+    v.dedup();
+    v
+});
+
+/// The canonical, sorted, deduped list of builtin command-head names (structured
+/// builtins ∪ the special heads intercepted in `eval_command`). Public so the
+/// shell (completion/highlighting) and the LSP derive their builtin vocabulary
+/// from eval itself rather than a stale hand-copy that silently drifts.
+pub fn builtin_names() -> &'static [&'static str] {
+    &BUILTIN_NAMES
+}
+
+/// A structured builtin (routes to `builtins::run`)? Gates the generic dispatch
+/// in `eval_command`; distinct from [`is_special_head`].
 pub(super) fn is_builtin(name: &str) -> bool {
     NAMES.contains(&name)
+}
+
+/// A command head special-cased directly in `eval_command` (not via `run`)?
+/// Consumed by [`Evaluator::is_command_name`](super::Evaluator) so its notion of
+/// "resolves as a builtin command" stays tied to the registry data above.
+pub(super) fn is_special_head(name: &str) -> bool {
+    SPECIAL_HEADS.contains(&name)
 }
 
 /// A builtin signature (defect #12): scalar param types by index, plus an
@@ -525,6 +573,41 @@ mod tests {
     fn pe() -> Vec<(OsString, OsString)> {
         std::env::vars_os().collect()
     }
+    #[test]
+    fn builtin_registry_is_complete_sorted_and_deduped() {
+        let names = builtin_names();
+        // Every builtin command head — structured ∪ special — must be present.
+        for expected in [
+            "cd", "pushd", "popd", "dirs", "history", "journal", "jobs", "exit", "quit", "plan",
+            "apply", "explain", "undo", "reef", "save", "assert", "interact", "open", "run",
+            "source", "j", "jump", "pwd", "echo", "ls", "cat", "which", "env", "head", "ln",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "registry is missing builtin `{expected}`"
+            );
+        }
+        // `clear` was a bogus entry in the highlighter's old hand-list — it is
+        // NOT a shoal builtin (only ever an external on PATH).
+        assert!(
+            !names.contains(&"clear"),
+            "`clear` is not a builtin and must not be in the registry"
+        );
+        // The public list is sorted and deduped so consumers can binary-search.
+        let mut want = names.to_vec();
+        want.sort_unstable();
+        want.dedup();
+        assert_eq!(
+            names,
+            want.as_slice(),
+            "registry must be sorted and deduped"
+        );
+        // Structured builtins and special heads are disjoint (`which` is the
+        // only name reachable both ways, and it lives in NAMES) — the union
+        // count is exactly the two lists' lengths.
+        assert_eq!(names.len(), NAMES.len() + SPECIAL_HEADS.len());
+    }
+
     #[test]
     fn empty_rm_is_safe() {
         let d = tempfile::tempdir().unwrap();

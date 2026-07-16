@@ -139,6 +139,41 @@ const BYTES_METHODS: &[&str] = &[
 /// universal serializers.
 const SCALAR_METHODS: &[&str] = &["json", "save", "append", "feed"];
 
+/// Receiver-polymorphic methods dispatched at the top of
+/// [`super::dispatch`] (before the per-type arms), so they never appear in any
+/// of the per-receiver `*_METHODS` tables above.
+const POLY_METHODS: &[&str] = &["tap", "also"];
+
+/// Every method name the dispatch table accepts, across all receiver types,
+/// sorted and deduped. Powers method/field completion after `.` in the shell
+/// (and any other surface that needs the flat method vocabulary). Built by
+/// unioning the per-receiver tables above so it can't drift from the
+/// did-you-mean hint sets — extend a `*_METHODS` list and this list grows too.
+static METHOD_NAMES: std::sync::LazyLock<Vec<&'static str>> = std::sync::LazyLock::new(|| {
+    let mut v: Vec<&'static str> = SEQ_METHODS
+        .iter()
+        .chain(STR_METHODS)
+        .chain(RECORD_METHODS)
+        .chain(NUM_METHODS)
+        .chain(PATH_METHODS)
+        .chain(TASK_METHODS)
+        .chain(BYTES_METHODS)
+        .chain(SCALAR_METHODS)
+        .chain(POLY_METHODS)
+        .copied()
+        .collect();
+    v.sort_unstable();
+    v.dedup();
+    v
+});
+
+/// The canonical, sorted, deduped list of value-method names (across every
+/// receiver type). Consumed by the shell's completer for `.`-position
+/// (method/field) completion; see [`METHOD_NAMES`].
+pub fn method_names() -> &'static [&'static str] {
+    &METHOD_NAMES
+}
+
 fn known_methods(type_name: &str) -> &'static [&'static str] {
     match type_name {
         "list" | "table" | "range" => SEQ_METHODS,
@@ -242,6 +277,22 @@ fn levenshtein(a: &str, b: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn method_names_union_is_sorted_deduped_and_covers_receivers() {
+        let names = method_names();
+        // Representative methods from each receiver family are all present.
+        for m in [
+            "where", "map", "sort", "upper", "lower", "split", "keys", "values", "abs", "round",
+            "name", "stem", "await", "cancel", "tap", "also",
+        ] {
+            assert!(names.contains(&m), "method_names() is missing `{m}`");
+        }
+        let mut want = names.to_vec();
+        want.sort_unstable();
+        want.dedup();
+        assert_eq!(names, want.as_slice(), "must be sorted and deduped");
+    }
 
     #[test]
     fn levenshtein_basics() {

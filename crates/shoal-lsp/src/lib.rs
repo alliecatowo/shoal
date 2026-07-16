@@ -84,7 +84,9 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
         let byte = position_to_byte(text, p.text_document_position.position);
-        let mut names = WORDS.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        // Completion vocabulary = language keywords ∪ builtin command heads
+        // (see `base_vocabulary`) ∪ lexical declarations seen so far.
+        let mut names: Vec<String> = base_vocabulary().map(str::to_string).collect();
         names.extend(declarations_before(&text[..byte]));
         names.sort();
         names.dedup();
@@ -119,12 +121,23 @@ impl LanguageServer for Backend {
     }
 }
 
-const WORDS: &[&str] = &[
-    "let", "var", "fn", "alias", "use", "export", "return", "break", "continue", "if", "else",
-    "match", "for", "in", "while", "try", "catch", "true", "false", "null", "spawn", "with", "sh",
-    "ls", "cd", "pwd", "cp", "mv", "rm", "mkdir", "cat", "echo", "run", "parallel", "pick",
-    "interact", "explain",
-];
+/// Language keywords the parser special-cases beyond `shoal_syntax::lexer::
+/// RESERVED`: `with`/`spawn` (statement forms) and the `sh { }` verbatim escape
+/// hatch. Builtin *command* heads are NOT listed here — they come from
+/// shoal-eval's `builtin_names()` registry so this file can't drift from eval.
+const EXTRA_KEYWORDS: &[&str] = &["with", "spawn", "sh"];
+
+/// The static completion vocabulary: language keywords (the parser's reserved
+/// set plus [`EXTRA_KEYWORDS`]) ∪ builtin command heads (shoal-eval's canonical
+/// [`builtin_names`](shoal_eval::builtin_names) registry). Document-local
+/// declarations are layered on top per-request in `completion`.
+fn base_vocabulary() -> impl Iterator<Item = &'static str> {
+    shoal_syntax::lexer::RESERVED
+        .iter()
+        .chain(EXTRA_KEYWORDS)
+        .chain(shoal_eval::builtin_names())
+        .copied()
+}
 fn help(w: &str) -> Option<&'static str> {
     Some(match w {
         "let" => "`let name = expr` creates an immutable lexical binding.",
@@ -218,6 +231,20 @@ mod tests {
         assert_eq!(position_to_byte(s, Position::new(0, 3)), 5);
         assert_eq!(byte_to_position(s, s.len()), Position::new(1, 2));
     }
+    #[test]
+    fn base_vocabulary_has_keywords_and_registry_builtins() {
+        let vocab: Vec<&str> = base_vocabulary().collect();
+        // Language keywords (RESERVED + the parser's extra statement forms).
+        for kw in ["let", "fn", "match", "with", "spawn", "sh"] {
+            assert!(vocab.contains(&kw), "missing keyword `{kw}`");
+        }
+        // Builtin command heads sourced from shoal-eval's registry, including
+        // ones the old hand-copied WORDS list omitted.
+        for head in ["cd", "ls", "reef", "jobs", "history", "undo", "plan"] {
+            assert!(vocab.contains(&head), "missing builtin `{head}`");
+        }
+    }
+
     #[test]
     fn declarations_are_lexical() {
         assert_eq!(

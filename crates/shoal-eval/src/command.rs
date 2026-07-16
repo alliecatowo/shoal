@@ -790,33 +790,11 @@ impl Evaluator {
     /// True when `name` resolves as a command (builtin, special head, adapter,
     /// or an executable on `PATH`) — drives command-in-expression (defect #5).
     pub(crate) fn is_command_name(&self, name: &str) -> bool {
-        if builtins::is_builtin(name)
-            || matches!(
-                name,
-                "cd" | "pwd"
-                    | "pushd"
-                    | "popd"
-                    | "dirs"
-                    | "j"
-                    | "jump"
-                    | "exit"
-                    | "quit"
-                    | "source"
-                    | "run"
-                    | "jobs"
-                    | "interact"
-                    | "assert"
-                    | "open"
-                    | "save"
-                    | "reef"
-                    | "undo"
-                    | "journal"
-                    | "history"
-                    | "plan"
-                    | "apply"
-                    | "explain"
-            )
-        {
+        // Builtin command heads come straight from the canonical registry
+        // (`builtins.rs`): structured builtins via `is_builtin`, the heads
+        // special-cased in `eval_command` via `is_special_head`. Deriving both
+        // sides from the same data is what keeps this in step with dispatch.
+        if builtins::is_builtin(name) || builtins::is_special_head(name) {
             return true;
         }
         if name.contains('/') || name.contains('.') {
