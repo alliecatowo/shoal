@@ -79,7 +79,12 @@ fn path_field(value: &Value, name: &str) -> Result<Value, String> {
             "ok" => Value::Bool(o.ok),
             "signal" => o.signal.clone().map(Value::Str).unwrap_or(Value::Null),
             "out" => o.out_value(),
-            "stdout" => Value::Bytes(o.stdout.clone()),
+            // §317: a value-position capture whose stdout spilled to the CAS
+            // surfaces `.stdout` as a lazy, ref-backed `bytes` (true length,
+            // on-demand load), so `value.get {path:"stdout", slice/format}` can
+            // resolve the full content — mirroring the eval-side field accessor
+            // (`expr_access.rs`). Ordinary resident output is unchanged.
+            "stdout" => o.stdout_value(),
             "stderr" => Value::Bytes(o.stderr.clone()),
             "dur_ns" => Value::Duration(o.dur_ns),
             "pid" => Value::Int(o.pid as i64),

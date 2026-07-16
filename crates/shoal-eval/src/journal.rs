@@ -1103,4 +1103,78 @@ mod tests {
             "no spill blob is pinned for a sub-cap capture"
         );
     }
+
+    /// TDD §317 in-language dispatch follow-up: a bare `val:blake3:<hash>`
+    /// content ref *written as a value* (the short-ref `.ref` yields) is
+    /// resolvable in-language — calling a method on it loads the bytes from the
+    /// session CAS and dispatches on the resulting lazy `bytes`, so a recovered
+    /// ref answers `.len`, materializes, and round-trips `.ref` exactly like the
+    /// capture it came from. An unknown hash is a clean `not_found`, and an
+    /// ordinary (non-ref) string still dispatches string methods unchanged.
+    #[test]
+    fn val_blake3_ref_string_dispatches_through_the_cas() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ev = journaled(dir.path());
+        // Seed the session CAS with a known blob directly (no spill needed):
+        // `record_output` writes the blake3-addressed blob and its `blob` row,
+        // which is exactly what a spilled capture leaves behind.
+        let content = b"hello, cas-backed world!\n".repeat(40); // 1000 bytes, valid UTF-8
+        let hash = ev
+            .journal
+            .as_ref()
+            .unwrap()
+            .record_output(1, "value", &content)
+            .unwrap();
+        let reference = format!("val:blake3:{hash}");
+
+        // `.len` answers the TRUE content length from the blob metadata — the
+        // ref string is resolved to a lazy CAS-backed `bytes`, never measured as
+        // a plain string (which would report the 75-odd characters of the ref).
+        assert_eq!(
+            run_journaled(&mut ev, &format!("\"{reference}\".len")).unwrap(),
+            Value::Int(content.len() as i64)
+        );
+        // Materialization loads the exact bytes from the CAS.
+        assert_eq!(
+            run_journaled(&mut ev, &format!("\"{reference}\".load.len")).unwrap(),
+            Value::Int(content.len() as i64)
+        );
+        assert_eq!(
+            run_journaled(
+                &mut ev,
+                &format!("\"{reference}\".str().starts_with(\"hello\")")
+            )
+            .unwrap(),
+            Value::Bool(true)
+        );
+        // `.ref` round-trips the recoverable handle unchanged.
+        assert_eq!(
+            run_journaled(&mut ev, &format!("\"{reference}\".ref")).unwrap(),
+            Value::Str(reference.clone())
+        );
+        // An unknown hash is a clean `not_found`, not a wrong string-length.
+        let unknown = format!("val:blake3:{}", "0".repeat(64));
+        let err = run_journaled(&mut ev, &format!("\"{unknown}\".len")).unwrap_err();
+        assert_eq!(err.code, "not_found", "unknown hash: {}", err.msg);
+        // A non-ref string still dispatches string methods verbatim.
+        assert_eq!(
+            run_journaled(&mut ev, "\"hello\".len").unwrap(),
+            Value::Int(5)
+        );
+    }
+
+    /// The same ref grammar is inert without a journal/CAS: a `val:blake3:`
+    /// string then errors clearly rather than silently measuring itself as a
+    /// string (the corpus / `-c` path installs no journal, so this is the
+    /// common case for a stray ref-shaped literal).
+    #[test]
+    fn val_blake3_ref_without_journal_errors_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ev = Evaluator::new(dir.path().to_path_buf());
+        let program =
+            shoal_syntax::parse(&format!("\"val:blake3:{}\".len", "a".repeat(64))).unwrap();
+        let err = ev.eval_program(&program).unwrap_err();
+        assert_eq!(err.code, "not_found");
+        assert!(err.msg.contains("journal/CAS"), "{}", err.msg);
+    }
 }

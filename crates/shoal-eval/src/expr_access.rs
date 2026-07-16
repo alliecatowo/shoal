@@ -188,6 +188,19 @@ impl Evaluator {
         args: &Args,
         span: Span,
     ) -> VResult<Value> {
+        // A bare `val:blake3:<hash>` content ref written as a value (the
+        // short-ref form `.ref` yields) is resolvable in-language (TDD §317
+        // follow-up): load its bytes from this session's journal CAS and
+        // re-dispatch on the resulting lazy `bytes`, so a recovered ref answers
+        // `.len`, materializes, etc. exactly like the capture it came from. A
+        // string that is NOT a content ref falls straight through to normal
+        // string-method dispatch; an unresolvable one (no CAS, unknown hash)
+        // surfaces a clear `not_found` rather than a wrong string-length answer.
+        if let Value::Str(s) = &v
+            && let Some(resolved) = self.resolve_content_ref(s, span)
+        {
+            return self.dispatch_method(resolved?, name, args, span);
+        }
         if name == "pick" {
             // Wired to shoal-picker here (not methods.rs) to avoid a
             // shoal-value → shoal-picker dependency cycle.

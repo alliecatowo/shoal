@@ -174,6 +174,28 @@ impl Journal {
         Ok(Some(bytes))
     }
 
+    /// The stored (uncompressed) byte length of the CAS blob addressed by
+    /// `hash`, read from the `blob` table alone — no file open, no decode. `None`
+    /// when no such blob is tracked (unknown/malformed hash). This is the cheap
+    /// metadata a lazy, ref-backed [`crate::Cas`] value answers `.len` from when
+    /// resolving a bare `val:blake3:<hash>` ref (TDD §317 in-language dispatch):
+    /// the true content length without ever materializing it.
+    pub fn blob_len(&self, hash: &str) -> rusqlite::Result<Option<u64>> {
+        let raw = match hex_bytes(hash) {
+            Ok(raw) => raw,
+            Err(()) => return Ok(None),
+        };
+        match self.conn.query_row(
+            "SELECT stored_len FROM blob WHERE hash = ?1",
+            params![raw.as_slice()],
+            |row| row.get::<_, i64>(0),
+        ) {
+            Ok(len) => Ok(Some(len as u64)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Absolute path of the CAS blob for a hex hash:
     /// `<cas>/<hex[0..2]>/<hex[2..4]>/<hex>.zst`.
     pub(crate) fn blob_path(&self, hex: &str) -> PathBuf {
