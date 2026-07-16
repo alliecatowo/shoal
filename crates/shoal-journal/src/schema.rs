@@ -6,10 +6,31 @@
 //! (set up in [`Journal::open_with_options`]) makes an entry that was
 //! appended but never finished (e.g. a crash mid-execution) durable and
 //! visible with `NULL` status on reopen.
+//!
+//! # Schema versioning (arch finding P8)
+//!
+//! Every table so far has been created with `CREATE TABLE IF NOT EXISTS`, and every change to
+//! date (e.g. adding `transcript_event`) has been additive, so no version marker was ever kept.
+//! [`Journal::migrate`] adds the scaffold a future *non-additive* change (renaming/dropping a
+//! column, restructuring a table) will need: it stamps SQLite's built-in `PRAGMA user_version` to
+//! [`CURRENT_SCHEMA_VERSION`] on every open, so an old-vs-new on-disk schema can be told apart
+//! before it's misread. See [`Journal::migrate`]'s doc comment for exactly how to add the first
+//! real migration.
+
+use std::io;
 
 use rusqlite::{Connection, params};
 
-use crate::Journal;
+use crate::{Journal, io_to_sql};
+
+/// The schema version this build of `shoal-journal` understands, stamped into
+/// `PRAGMA user_version` by [`Journal::migrate`] on every open.
+///
+/// Bump this — and extend the `match` in [`Journal::migrate`] — only when a schema change is
+/// genuinely non-additive. A purely additive change (a new `CREATE TABLE IF NOT EXISTS`, like
+/// `transcript_event` was) needs no bump: [`Journal::init_schema`] already re-runs on every open
+/// and is idempotent, so an old database just gains the new table in place.
+pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 1;
 
 /// A journal entry as recorded at execution start ([`Journal::append`]).
 ///
@@ -36,6 +57,71 @@ pub struct EntryRecord {
 }
 
 impl Journal {
+    /// Ensure `conn`'s on-disk schema exists and is stamped at [`CURRENT_SCHEMA_VERSION`].
+    ///
+    /// Called by every constructor that opens a connection (`open_with_options`,
+    /// `in_memory_with_options`) in place of a bare [`Journal::init_schema`] call. SQLite's
+    /// `PRAGMA user_version` is a 32-bit integer baked into the database file header for exactly
+    /// this purpose (default `0`, no table needed, survives across opens) — reading it tells us
+    /// which of four situations we're in:
+    ///
+    /// - **`0`, fresh database**: `init_schema` (called first, below) just created every table
+    ///   at today's shape, so there is nothing to migrate — stamp `CURRENT_SCHEMA_VERSION` and
+    ///   done.
+    /// - **`0`, legacy database**: a `journal.db` written before this scaffold existed. Its tables
+    ///   already exist and already match today's shape, because every change to date has been
+    ///   additive (`CREATE TABLE IF NOT EXISTS`, e.g. `transcript_event`) and `init_schema` just
+    ///   re-ran and is a no-op past table-creation. So this case is indistinguishable from — and
+    ///   handled identically to — the fresh-database case: stamp the version. Zero data loss,
+    ///   zero DDL, because there is genuinely nothing to change.
+    /// - **`== CURRENT_SCHEMA_VERSION`**: already up to date. Nothing to do.
+    /// - **`> CURRENT_SCHEMA_VERSION`**: this database was written by a *newer* shoal, whose
+    ///   schema shape this build doesn't understand. Refuse to open rather than risk silently
+    ///   misreading or corrupting it — the caller needs to upgrade instead.
+    ///
+    /// A fifth case, `1..CURRENT_SCHEMA_VERSION`, is where a real migration will one day live. It
+    /// is unreachable today (`CURRENT_SCHEMA_VERSION` is still `1`, so no version in that range
+    /// can exist), but is wired up and documented so the first migration doesn't have to touch
+    /// this dispatch's shape. **To add migration `N -> N+1`:**
+    ///
+    /// 1. Bump [`CURRENT_SCHEMA_VERSION`] to `N + 1`.
+    /// 2. Add a match arm below (in the `_` arm's place, or ahead of it if there are several
+    ///    versions to step through) keyed on the version, e.g. `n if n == N => { conn
+    ///    .execute_batch("ALTER TABLE ...")?; }` — one self-contained, tested transformation per
+    ///    version, not a jump straight to `CURRENT_SCHEMA_VERSION`. Prefer a `while version <
+    ///    CURRENT_SCHEMA_VERSION` loop over a `match` once there is more than one step to chain.
+    /// 3. Leave the final `PRAGMA user_version` write (below) to stamp `CURRENT_SCHEMA_VERSION`
+    ///    once every step has run — don't stamp inside the arm itself.
+    /// 4. Add a `tests.rs` case that hand-builds a version-`N` fixture database (see
+    ///    `legacy_zero_version_db_is_adopted_without_losing_rows` for the pattern of building a
+    ///    fixture by hand and asserting both the new shape AND that pre-existing rows survive).
+    pub(crate) fn migrate(conn: &Connection) -> rusqlite::Result<()> {
+        Self::init_schema(conn)?;
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        match version {
+            // Fresh database, or a legacy pre-versioning one whose tables already match (see
+            // the doc comment above) — either way there is nothing to migrate.
+            0 => {}
+            v if v == CURRENT_SCHEMA_VERSION => return Ok(()),
+            v if v > CURRENT_SCHEMA_VERSION => {
+                return Err(io_to_sql(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "journal.db schema version {v} is newer than this shoal-journal build \
+                         understands (max {CURRENT_SCHEMA_VERSION}); refusing to open — upgrade \
+                         shoal before touching this database"
+                    ),
+                )));
+            }
+            // 1..CURRENT_SCHEMA_VERSION: the future-migration dispatch point. No migration has
+            // ever shipped (CURRENT_SCHEMA_VERSION is still 1), so this arm is currently
+            // unreachable. See the doc comment above for exactly how to add one here.
+            _ => {}
+        }
+        conn.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
+        Ok(())
+    }
+
     /// Create tables and indexes (idempotent). Schema per TDD §9.
     pub(crate) fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         conn.execute_batch(
