@@ -1826,8 +1826,19 @@ output={parse="lines",type="list<str>"}
     /// A foreground external command stopped by Ctrl-Z (TDD §4.7) is recorded
     /// as a `stopped` job that lists alongside spawned tasks, resolves to its
     /// pid for `fg`/`bg`, and walks running↔stopped→done as the REPL drives it —
-    /// all without a real process (the state transitions never fire the SIGTSTP/
-    /// SIGCONT hooks; those are covered against the OS in shoal-exec).
+    /// all without a real process (this test only exercises the jobs-table
+    /// bookkeeping, never a SIGTSTP/SIGCONT hook). The underlying OS mechanics
+    /// this bookkeeping represents — `WUNTRACED`/`WIFSTOPPED` mapping to a
+    /// stopped `ExecResult`, `SIGCONT` resuming a real stopped child to
+    /// completion, the `PARKED_JOBS` registry (`take_stopped_job` exactly once,
+    /// `shutdown_stopped_jobs` draining without a leak), and the `reaped` guard
+    /// against re-signalling an already-reaped/pid-recycled job — are covered
+    /// against the OS with real child processes in
+    /// `crates/shoal-exec/src/pty.rs`'s own `#[cfg(test)] mod tests`. What
+    /// remains untested anywhere (needs a real controlling terminal, so it's a
+    /// manual-verification gap, not an automatable one) is the live end-to-end
+    /// round trip: a user's actual Ctrl-Z keystroke being turned into `SIGTSTP`
+    /// by the pty line discipline, through the REPL prompt, to `fg`/`bg`.
     #[test]
     fn stopped_external_command_lists_and_transitions_in_the_jobs_table() {
         fn job_state(ev: &Evaluator, id: u64) -> Option<String> {
