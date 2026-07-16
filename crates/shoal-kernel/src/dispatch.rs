@@ -18,6 +18,8 @@ impl Kernel {
         let params = request.params;
         let result: Result<Json, RpcError> = match request.method.as_str() {
             "session.attach" => self.handle_session_attach(params, attached),
+            "session.env" => self.handle_session_env(attached),
+            "session.reef" => self.handle_session_reef(attached),
             "parse" => self.handle_parse(params),
             "exec" => self.handle_exec(params, client, attached),
             "value.get" => self.handle_value_get(params, attached),
@@ -27,6 +29,8 @@ impl Kernel {
             "task.cancel" => self.handle_task_cancel(params, attached),
             "task.suspend" => self.handle_task_suspend(params, attached),
             "task.resume" => self.handle_task_resume(params, attached),
+            "plan.get" => self.handle_plan_get(params, attached),
+            "plan.list" => self.handle_plan_list(attached),
             "plan.apply" => self.handle_plan_apply(params, client, attached, conn),
             "cap.request" => self.handle_cap_request(params),
             "journal.query" => self.handle_journal_query(params),

@@ -14,6 +14,16 @@ impl Facade {
             resource_entry("shoal://journal", "journal", "Structured execution journal"),
             resource_entry("shoal://jobs", "jobs", "The task table"),
             resource_entry("shoal://session/cwd", "cwd", "Session working directory"),
+            resource_entry(
+                "shoal://session/env",
+                "env",
+                "Session environment (names; values only if granted)",
+            ),
+            resource_entry(
+                "shoal://session/reef",
+                "reef",
+                "Session reef resolution state (active scope + tool bindings)",
+            ),
         ];
         // Dynamic: open/recent tasks become live resources.
         if let Ok(tasks) = self.kernel.call("task.list", json!({}))
@@ -23,6 +33,22 @@ impl Facade {
                 if let Some(id) = task.get("task").and_then(Value::as_str) {
                     let uri = short_ref_to_uri(id);
                     resources.push(resource_entry(&uri, id, "Background task record"));
+                }
+            }
+        }
+        // Dynamic: open plans this session/principal derived (inspectable via
+        // `shoal://plan/{ref}`, applicable via `shoal_apply`).
+        if let Ok(plans) = self.kernel.call("plan.list", json!({}))
+            && let Some(array) = plans.as_array()
+        {
+            for plan in array {
+                if let Some(plan_ref) = plan.get("plan_ref").and_then(Value::as_str) {
+                    let uri = short_ref_to_uri(plan_ref);
+                    resources.push(resource_entry(
+                        &uri,
+                        plan_ref,
+                        "A derived plan: effects, reversibility, verdict",
+                    ));
                 }
             }
         }
@@ -40,62 +66,69 @@ impl Facade {
             .ok_or("resources/read requires uri")?
             .to_string();
         let parsed = ParsedUri::parse(&uri)?;
-        // Session state views are served from the cached attach result — no
-        // extra round-trip, and env is names-only unless granted (§1).
+        // Session state views. `cwd` is served from the cached attach result (no
+        // round-trip); `env`/`reef` read the session evaluator live via a
+        // dedicated kernel method (fresh, so in-session `cd`/env-writes/reef
+        // locks are reflected). Env is names-only unless granted (§1) — the
+        // kernel enforces that; the facade just relays.
         if parsed.root == "session" {
             let field = parsed.segments.first().map(String::as_str).unwrap_or("");
-            let contents = match field {
+            let value = match field {
                 "cwd" => self
                     .kernel
                     .attach
                     .get("cwd")
                     .cloned()
                     .unwrap_or(Value::Null),
+                "env" => self.call_kernel("session.env", json!({}))?,
+                "reef" => self.call_kernel("session.reef", json!({}))?,
                 other => return Err(format!("unsupported session view: {other}")),
             };
-            return Ok(json!({
-                "contents": [{
-                    "uri": uri,
-                    "mimeType": "application/json",
-                    "text": serde_json::to_string_pretty(&contents).unwrap_or_default(),
-                }],
-                "structuredContent": contents,
-            }));
+            return Ok(value_read_result(&uri, value));
+        }
+        // `shoal://task/{id}/out`: the task's captured output — the read side of
+        // the subscription (§6). A kernel task captures the *whole* outcome at
+        // completion (no streaming cursor infra yet), so this returns the full
+        // current output: resolve the task record's `result_ref` through
+        // `value.get` (reusing existing methods, honoring ?path/slice/format).
+        // A task with no captured value yet (still running, or failed before
+        // producing one) hands back its record so the reader sees state/error
+        // rather than a misleading empty payload.
+        if parsed.root == "task" && parsed.segments.get(1).map(String::as_str) == Some("out") {
+            let id = parsed
+                .segments
+                .first()
+                .ok_or("shoal://task/{id}/out needs an id")?;
+            let record = self.call_kernel("task.get", json!({ "task": format!("task:{id}") }))?;
+            let Some(result_ref) = record.get("result_ref").and_then(Value::as_str) else {
+                return Ok(value_read_result(&uri, record));
+            };
+            let value = self.call_kernel(
+                "value.get",
+                json!({
+                    "ref": result_ref,
+                    "path": parsed.query.get("path"),
+                    "slice": parsed.query.get("slice").and_then(|s| parse_slice(s)),
+                    "format": parsed.query.get("format"),
+                    "elide": parsed.query.get("elide").and_then(|s| serde_json::from_str::<Value>(s).ok()),
+                }),
+            )?;
+            return Ok(value_read_result(&uri, value));
         }
         let (method, kparams) = parsed.to_kernel_call()?;
-        let value = match self.kernel.call(method, kparams) {
-            Ok(v) => v,
-            Err(BridgeError::Kernel(e)) => return Err(format!("kernel error: {e}")),
-            Err(e) => return Err(e.to_string()),
-        };
-        // `format=render`/`format=raw` responses carry a plain string — serve
-        // it as text/plain instead of JSON-encoding a JSON-encoded string.
-        if let Some(text) = value
-            .get("render")
-            .or_else(|| value.get("raw"))
-            .and_then(Value::as_str)
-        {
-            return Ok(json!({
-                "contents": [{
-                    "uri": uri,
-                    "mimeType": "text/plain",
-                    "text": bound_text(text, None),
-                }],
-                "structuredContent": value,
-            }));
+        let value = self.call_kernel(method, kparams)?;
+        Ok(value_read_result(&uri, value))
+    }
+
+    /// One kernel JSON-RPC call with the resource layer's error convention: a
+    /// kernel-side `error` surfaces as `kernel error: …`, transport failures as
+    /// their own display. Shared by every `resources/read` path.
+    fn call_kernel(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        match self.kernel.call(method, params) {
+            Ok(v) => Ok(v),
+            Err(BridgeError::Kernel(e)) => Err(format!("kernel error: {e}")),
+            Err(e) => Err(e.to_string()),
         }
-        // A value URI returns `{ref,value}`; unwrap to the value itself for the
-        // resource contents. Non-value roots (journal/jobs/events) return their
-        // structured payload verbatim.
-        let contents = value.get("value").cloned().unwrap_or(value);
-        Ok(json!({
-            "contents": [{
-                "uri": uri,
-                "mimeType": "application/json",
-                "text": bound_text(&serde_json::to_string_pretty(&contents).unwrap_or_default(), None),
-            }],
-            "structuredContent": contents,
-        }))
     }
 
     /// `resources/subscribe` (AGENT-SURFACE §6): map a `shoal://events/{ch}` or
@@ -127,6 +160,38 @@ fn resource_entry(uri: &str, name: &str, description: &str) -> Value {
     json!({"uri":uri,"name":name,"description":description,"mimeType":"application/json"})
 }
 
+/// Turn a kernel value response into the MCP `resources/read` result shape.
+/// `format=render`/`format=raw` responses carry a plain string — served as
+/// `text/plain` instead of JSON-encoding a JSON-encoded string. A value URI
+/// returns `{ref,value}`; unwrap to the value itself. Non-value payloads
+/// (journal/jobs/events/session views/plans) travel verbatim as
+/// `structuredContent`.
+fn value_read_result(uri: &str, value: Value) -> Value {
+    if let Some(text) = value
+        .get("render")
+        .or_else(|| value.get("raw"))
+        .and_then(Value::as_str)
+    {
+        return json!({
+            "contents": [{
+                "uri": uri,
+                "mimeType": "text/plain",
+                "text": bound_text(text, None),
+            }],
+            "structuredContent": value,
+        });
+    }
+    let contents = value.get("value").cloned().unwrap_or(value);
+    json!({
+        "contents": [{
+            "uri": uri,
+            "mimeType": "application/json",
+            "text": bound_text(&serde_json::to_string_pretty(&contents).unwrap_or_default(), None),
+        }],
+        "structuredContent": contents,
+    })
+}
+
 /// `resources/templates/list` (AGENT-SURFACE §8): the query-parameterized
 /// forms an agent can instantiate.
 pub(crate) fn resource_templates() -> Value {
@@ -134,6 +199,9 @@ pub(crate) fn resource_templates() -> Value {
         {"uriTemplate":"shoal://out/{n}{?path,slice,format}","name":"transcript-value","description":"A transcript value, drillable by field-path/slice","mimeType":"application/json"},
         {"uriTemplate":"shoal://val/{hash}","name":"content-value","description":"An immutable content-addressed value","mimeType":"application/json"},
         {"uriTemplate":"shoal://task/{id}","name":"task","description":"A background task record","mimeType":"application/json"},
+        {"uriTemplate":"shoal://task/{id}/out{?path,slice,format}","name":"task-output","description":"A task's captured output, drillable by field-path/slice","mimeType":"application/json"},
+        {"uriTemplate":"shoal://plan/{ref}","name":"plan","description":"A derived plan: effects, reversibility, verdict","mimeType":"application/json"},
+        {"uriTemplate":"shoal://session/{view}","name":"session-view","description":"A session state view: cwd | env | reef","mimeType":"application/json"},
         {"uriTemplate":"shoal://journal{?since,until,head,principal,ok,effects,limit}","name":"journal","description":"The structured execution journal","mimeType":"application/json"},
         {"uriTemplate":"shoal://events/{channel}{?since,limit}","name":"events","description":"A cursor-read event channel","mimeType":"application/json"}
     ]})
@@ -203,7 +271,28 @@ impl ParsedUri {
                     .segments
                     .first()
                     .ok_or("shoal://val/{hash} needs a hash")?;
+                // Accept both the bare hash (`shoal://val/{hex}`) and the spec's
+                // short-ref form `val:blake3:{hex}` → `shoal://val/blake3:{hex}`
+                // (AGENT-SURFACE §1): the kernel's CAS keys on the raw hex, so
+                // strip the `blake3:` algorithm prefix before `blob.get`.
+                let hash = hash.strip_prefix("blake3:").unwrap_or(hash);
                 Ok(("blob.get", json!({ "hash": hash })))
+            }
+            "plan" => {
+                let plan_ref = self
+                    .segments
+                    .first()
+                    .ok_or("shoal://plan/{ref} needs a plan ref")?;
+                // The URI form drops the `plan:` prefix (`plan:<hex>` →
+                // `shoal://plan/<hex>`); the kernel keys stored plans on the full
+                // `plan:<hex>` ref, so restore it. Tolerate a caller that passes
+                // the full ref back verbatim.
+                let plan_ref = if plan_ref.starts_with("plan:") {
+                    plan_ref.clone()
+                } else {
+                    format!("plan:{plan_ref}")
+                };
+                Ok(("plan.get", json!({ "plan_ref": plan_ref })))
             }
             "task" => {
                 let id = self
@@ -304,5 +393,18 @@ mod tests {
         let (method, params) = val.to_kernel_call().unwrap();
         assert_eq!(method, "blob.get");
         assert_eq!(params["hash"], "abc123");
+
+        // The spec short-ref form `val:blake3:<hex>` → `shoal://val/blake3:<hex>`
+        // must strip the algorithm prefix so the CAS lookup keys on raw hex.
+        let val_prefixed = ParsedUri::parse("shoal://val/blake3:abc123").unwrap();
+        let (method, params) = val_prefixed.to_kernel_call().unwrap();
+        assert_eq!(method, "blob.get");
+        assert_eq!(params["hash"], "abc123");
+
+        // A plan URI drops the `plan:` prefix; the kernel keys on the full ref.
+        let plan = ParsedUri::parse("shoal://plan/deadbeef00112233").unwrap();
+        let (method, params) = plan.to_kernel_call().unwrap();
+        assert_eq!(method, "plan.get");
+        assert_eq!(params["plan_ref"], "plan:deadbeef00112233");
     }
 }
