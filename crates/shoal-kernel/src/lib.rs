@@ -1889,6 +1889,224 @@ mod tests {
         thread.join().unwrap();
     }
 
+    /// AGENT-SURFACE §4, the G2 follow-up this closes: `session.transcript`
+    /// is now ALSO journal-backed and replayable from ANY seq, mirroring the
+    /// `journal` channel's replay (`read_transcript_channel`/
+    /// `reconstruct_transcript_events` in `eventbus.rs`, backed by
+    /// `shoal_journal::Journal::record_transcript_event`/
+    /// `transcript_events_by_entry`). Generate more than a full ring of
+    /// transcript events (one per successful exec), read from a `since` that
+    /// has aged out of the ring, and assert every aged-out event comes back
+    /// with the correct seq and the exact persisted payload, contiguous with
+    /// whatever the ring still holds. Also pins the `limit`/beyond-newest/
+    /// within-ring cases, same as the `journal` channel's test.
+    #[test]
+    fn session_transcript_channel_replays_aged_out_events_from_the_journal() {
+        let kernel = Kernel::new();
+        let (mut client, mut reader, thread) = spawn(&kernel);
+        attach(&mut client, &mut reader);
+
+        // One `session.transcript` event per exec (every exec here succeeds);
+        // overflow the ring by a clear margin.
+        let total = EVENT_RING_CAP + 40;
+        for i in 0..total {
+            let r = call(
+                &mut client,
+                &mut reader,
+                100 + i as i64,
+                "exec",
+                json!({"src":"1 + 1"}),
+            );
+            assert!(r.error.is_none(), "exec {i} failed: {:?}", r.error);
+        }
+
+        // seq 0 has aged out of the ring. Reading since=0 must still return
+        // every event after seq 0 — the aged-out ones rebuilt from the
+        // journal's `transcript_event` table, then the ring tail —
+        // contiguous across the ring boundary.
+        let read = call(
+            &mut client,
+            &mut reader,
+            9001,
+            "events.read",
+            json!({"channel":"session.transcript","since":0}),
+        );
+        let events = read.result.unwrap()["events"].as_array().unwrap().clone();
+        assert_eq!(
+            events.len(),
+            total - 1,
+            "since=0 (exclusive) must return every transcript event after seq 0 — ring + \
+             journal fallback, not just the ring's {EVENT_RING_CAP}"
+        );
+        for (idx, ev) in events.iter().enumerate() {
+            let expected_seq = (idx + 1) as u64;
+            assert_eq!(
+                ev["seq"].as_u64().unwrap(),
+                expected_seq,
+                "seqs must be contiguous and ascending across the ring boundary: {ev}"
+            );
+            assert_eq!(ev["channel"], "session.transcript");
+            let payload = &ev["payload"]["v"];
+            // Every exec here produces exactly one out[n], so seq N's ref is
+            // out:(N+2): seq 0 is out:1 (excluded by since=0), so the first
+            // returned event (seq 1) is out:2.
+            assert_eq!(
+                payload["ref"]["v"],
+                format!("out:{}", expected_seq + 1),
+                "reconstructed ref must match the live numbering: {ev}"
+            );
+            assert_eq!(
+                payload["summary"]["v"]["type"]["v"], "int",
+                "reconstructed summary must reflect the value's real shape, not a placeholder: \
+                 {ev}"
+            );
+        }
+
+        // A `limit` still bounds the result to the newest N even when the
+        // fallback contributed older events.
+        let limited = call(
+            &mut client,
+            &mut reader,
+            9002,
+            "events.read",
+            json!({"channel":"session.transcript","since":0,"limit":5}),
+        );
+        let limited = limited.result.unwrap()["events"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(limited.len(), 5, "limit keeps the newest 5");
+        assert_eq!(limited[4]["seq"].as_u64().unwrap(), (total - 1) as u64);
+
+        // Not-found / beyond-newest: since at or past the newest seq is
+        // empty, never an error.
+        let last_seq = (total - 1) as u64;
+        let at_newest = call(
+            &mut client,
+            &mut reader,
+            9003,
+            "events.read",
+            json!({"channel":"session.transcript","since": last_seq}),
+        );
+        assert!(
+            at_newest.result.unwrap()["events"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "since == newest seq: nothing after it"
+        );
+        let beyond = call(
+            &mut client,
+            &mut reader,
+            9004,
+            "events.read",
+            json!({"channel":"session.transcript","since": last_seq + 500}),
+        );
+        assert!(
+            beyond.result.unwrap()["events"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "since beyond newest seq: empty, not an error"
+        );
+
+        // Fast path untouched: a since WITHIN the ring is served from the
+        // ring alone and returns exactly the tail after it.
+        let within = last_seq - 3;
+        let tail = call(
+            &mut client,
+            &mut reader,
+            9005,
+            "events.read",
+            json!({"channel":"session.transcript","since": within}),
+        );
+        let tail = tail.result.unwrap()["events"].as_array().unwrap().clone();
+        assert_eq!(tail.len(), 3, "since 3 below newest: exactly the last 3");
+        assert_eq!(tail[0]["seq"].as_u64().unwrap(), within + 1);
+
+        drop(client);
+        drop(reader);
+        thread.join().unwrap();
+    }
+
+    /// The `session.transcript` channel fires only on a SUCCESSFUL exec
+    /// (`handlers_exec.rs`'s error path never reaches `publish_transcript`);
+    /// a failed exec still consumes an `out[n]` slot and gets its own coarse
+    /// journal entry, but no `transcript_event` row. Journal-backed replay
+    /// must reflect exactly that — entries with no transcript row are simply
+    /// absent from the replayed channel, never phantom events — while
+    /// staying contiguous and in order for the entries that DO have one, the
+    /// same "reconstruction reflects the channel, not the whole store"
+    /// property `journal_channel_replay_excludes_evaluator_per_statement_
+    /// entries` pins for the `journal` channel.
+    #[test]
+    fn session_transcript_channel_replay_skips_entries_with_no_transcript_row() {
+        let kernel = Kernel::new();
+        let (mut client, mut reader, thread) = spawn(&kernel);
+        attach(&mut client, &mut reader);
+
+        // Overflow the ring by a clear margin even after excluding the
+        // ~third of execs that fail (and thus never fire a transcript
+        // event): every exec still consumes an out[n] slot and a journal
+        // entry, so the store ends up with MORE entries than transcript
+        // events, mirroring the journal channel's over-production hazard.
+        let total = EVENT_RING_CAP * 2;
+        let mut expected_refs = Vec::new();
+        for i in 0..total {
+            let fails = i % 3 == 0;
+            let src = if fails { "1 / 0" } else { "1 + 1" };
+            let r = call(
+                &mut client,
+                &mut reader,
+                100 + i as i64,
+                "exec",
+                json!({"src": src}),
+            );
+            let n = i + 1; // out[n] numbering: consumed by every exec, pass or fail
+            if fails {
+                assert!(r.error.is_some(), "exec {i} ({src}) should have failed");
+            } else {
+                assert!(r.error.is_none(), "exec {i} failed: {:?}", r.error);
+                expected_refs.push(format!("out:{n}"));
+            }
+        }
+        assert!(
+            expected_refs.len() > EVENT_RING_CAP,
+            "the mix must still overflow the transcript ring: {} successes",
+            expected_refs.len()
+        );
+
+        let read = call(
+            &mut client,
+            &mut reader,
+            9001,
+            "events.read",
+            json!({"channel":"session.transcript","since":0}),
+        );
+        let events = read.result.unwrap()["events"].as_array().unwrap().clone();
+        // since=0 excludes seq 0 itself (the first successful exec's own
+        // transcript event) — every OTHER successful exec's event must
+        // appear, in order, contiguous, with none for a failed exec.
+        let expected = &expected_refs[1..];
+        assert_eq!(
+            events.len(),
+            expected.len(),
+            "exactly one event per SUCCESSFUL exec after seq 0 — no phantoms for the failed ones"
+        );
+        for (idx, (ev, want_ref)) in events.iter().zip(expected.iter()).enumerate() {
+            assert_eq!(
+                ev["seq"].as_u64().unwrap(),
+                (idx + 1) as u64,
+                "contiguous seqs across the ring boundary: {ev}"
+            );
+            assert_eq!(&ev["payload"]["v"]["ref"]["v"], want_ref);
+        }
+
+        drop(client);
+        drop(reader);
+        thread.join().unwrap();
+    }
+
     #[test]
     fn subscribe_pushes_session_transcript_event_before_the_exec_response() {
         let kernel = Kernel::new();

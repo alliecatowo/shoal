@@ -75,6 +75,11 @@ impl Journal {
                  created_ns INTEGER NOT NULL,
                  last_access_ns INTEGER NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS transcript_event(
+                 entry_id INTEGER PRIMARY KEY,
+                 ts       INTEGER NOT NULL,
+                 payload  TEXT    NOT NULL
+             );
              CREATE INDEX IF NOT EXISTS idx_entry_ts     ON entry(ts);
              CREATE INDEX IF NOT EXISTS idx_output_entry ON output(entry_id);
              CREATE INDEX IF NOT EXISTS idx_undo_entry   ON undo(entry_id);",
