@@ -3,7 +3,11 @@
 use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
 use std::os::unix::fs::FileTypeExt;
+use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 mod client;
 mod resources;
@@ -75,7 +79,52 @@ impl Facade {
     }
 }
 
+/// Best-effort: make sure a kernel is listening on `config.socket`, lazily
+/// bringing up a detached `shoal-kernel` daemon if none is. This is what makes
+/// the MCP plugin zero-config — registering `shoal mcp` as an MCP server is the
+/// whole setup; the first agent connection spawns the per-user kernel if it
+/// isn't already running, instead of failing with a bare "connection refused".
+///
+/// Never fails the caller: if the kernel can't be started (binary not on
+/// `PATH`, exec trouble) the subsequent `Facade::connect` surfaces the real
+/// connection error. Opt out with `SHOAL_NO_AUTOSTART=1` when the kernel is
+/// supervised externally (a systemd user unit, a hand-started daemon).
+///
+/// The kernel's own `prepare_socket` refuses to bind a socket another kernel is
+/// already listening on, so two agents racing to autostart just leave one live
+/// daemon — we connect to whichever won.
+pub fn ensure_kernel(config: &Config) {
+    // Warm-daemon fast path: a listener is already up, nothing to do.
+    if UnixStream::connect(&config.socket).is_ok() {
+        return;
+    }
+    if std::env::var_os("SHOAL_NO_AUTOSTART").is_some_and(|v| !v.is_empty()) {
+        return;
+    }
+    let mut cmd = Command::new("shoal-kernel");
+    cmd.arg("--socket")
+        .arg(&config.socket)
+        // Detach: silence stdio and start a new process group so the daemon
+        // outlives this (per-session, per-agent) mcp process.
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0);
+    if cmd.spawn().is_err() {
+        return; // not on PATH / cannot exec — let Facade::connect surface it
+    }
+    // Poll for readiness (kernel binds its socket, then accepts). Bounded at
+    // ~5s so a genuinely broken kernel can't hang the agent forever.
+    for _ in 0..100 {
+        if UnixStream::connect(&config.socket).is_ok() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 pub fn run_stdio(config: &Config) -> Result<(), BridgeError> {
+    ensure_kernel(config);
     let mut facade = Facade::connect(config)?;
     let stdin = io::stdin();
     let mut reader = stdin.lock();
@@ -216,5 +265,24 @@ mod tests {
         assert!(!socket_exists(&p));
         let _l = UnixListener::bind(&p).unwrap();
         assert!(socket_exists(&p));
+    }
+
+    /// Warm-daemon fast path: when a kernel is already listening, `ensure_kernel`
+    /// returns at once via the connect probe — it must not spawn anything or
+    /// block. (The real spawn path needs `shoal-kernel` on `PATH`, so it's
+    /// covered by out-of-process dogfooding, not this in-process test.)
+    #[test]
+    fn ensure_kernel_is_a_noop_when_a_listener_is_up() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("kernel.sock");
+        let _listener = UnixListener::bind(&path).unwrap();
+        let c = Config {
+            socket: path,
+            session: None,
+            token: None,
+        };
+        // Returns immediately because the connect probe succeeds; a hang or a
+        // stray spawn would show up as a test timeout / leaked process.
+        ensure_kernel(&c);
     }
 }
