@@ -56,3 +56,45 @@ name = "teach2-mid-word-backtick-inside-a-cmd-argument"
 src = "echo a`b"
 parse_error = true
 parse_error_contains = "backtick is not shoal syntax"
+
+# `command().method()` chaining: a CMD-mode argument word carrying a `.`
+# (Cmd-mode word scanning never breaks on `.`, so `log.len`/`log.where`/
+# `somedir.len` all lex as ONE word) immediately glued to `(` is the
+# "chain a method straight onto a multi-word command" mistake — the parser
+# has already committed to CMD dispatch by the time it sees the glued `(`
+# (unlike a single bare command name, e.g. `ls.len()`, which dispatches EXPR
+# instead per `at_command_head`'s `adjacent_postfix_after_ident` check and
+# just works). Wrapping the command in parens is the fix: `(git log).len()`.
+# `command()`'s arg loop (`crates/shoal-syntax/src/parser/command.rs`) now
+# recognizes this exact shape — a `Tok::LParen` glued (no gap) to a
+# just-pushed dotted `CmdArg::Word` — and, only when the parenthesised
+# content then fails to parse on its own, replaces whatever generic error
+# that content produced with a hint pointing at the real fix. hint (not
+# asserted, per this file's harness-parity note): "to chain methods on a
+# command, wrap it in parentheses — (git log).len()".
+
+[[case]]
+name = "teach2-command-arg-method-chain-empty-parens"
+# The glued `(` is immediately followed by `)` — an empty parenthesised
+# group is never a valid expression on its own.
+src = "git log.len()"
+parse_error = true
+parse_error_contains = "expected expression, found RParen"
+
+[[case]]
+name = "teach2-command-arg-method-chain-empty-parens-single-word-cmd"
+# Same shape as `teach2-command-arg-method-chain-empty-parens` but on a
+# single-word command's lone argument, not a multi-word command name.
+src = "ls somedir.len()"
+parse_error = true
+parse_error_contains = "expected expression, found RParen"
+
+[[case]]
+name = "teach2-command-arg-method-chain-dot-shorthand-inside-parens"
+# The glued `(` contains a bare `.field`/`.method` shorthand as its
+# content — legal only as a WHOLE call argument (`.where(.size > 1mb)`),
+# not as a bare parenthesised subexpression, so it hits the "no receiver"
+# diagnostic instead of the empty-parens one above.
+src = 'git log.where(.author == "nobody")'
+parse_error = true
+parse_error_contains = "a leading `.` has no receiver here"

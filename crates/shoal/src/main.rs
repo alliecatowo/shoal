@@ -78,8 +78,11 @@ pub(crate) fn no_color() -> bool {
 
 /// Strip ANSI CSI escape sequences (`ESC [ ... final-byte`), leaving plain
 /// text — used to make our own colorized output NO_COLOR-safe without
-/// duplicating every builder as a plain/colored pair.
-fn strip_ansi(s: &str) -> String {
+/// duplicating every builder as a plain/colored pair. `pub(crate)` (not
+/// private) because `prompt.rs`'s `Explain` path needs the same stripping
+/// for its plain-text placeholder preview — this is the one canonical copy
+/// (was byte-identical hand-rolled duplicate before the dedup).
+pub(crate) fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(ch) = chars.next() {

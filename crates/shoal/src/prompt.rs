@@ -221,7 +221,7 @@ pub fn run(action: PromptAction) -> Result<i32, String> {
                     let rendered = renderer.render_placeholder(id, &live);
                     let elapsed = start.elapsed();
                     total += elapsed;
-                    let plain = strip_ansi(&rendered);
+                    let plain = crate::strip_ansi(&rendered);
                     println!("  {id:<16} ‹{plain}›  {}µs", elapsed.as_micros());
                 }
             }
@@ -268,24 +268,6 @@ pub fn run(action: PromptAction) -> Result<i32, String> {
             Ok(0)
         }
     }
-}
-
-fn strip_ansi(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\u{1b}' && chars.peek() == Some(&'[') {
-            chars.next();
-            for c2 in chars.by_ref() {
-                if ('\u{40}'..='\u{7e}').contains(&c2) {
-                    break;
-                }
-            }
-            continue;
-        }
-        out.push(ch);
-    }
-    out
 }
 
 /// A fixed, reproducible fixture for `shoal prompt bench` (§8) — not live state.

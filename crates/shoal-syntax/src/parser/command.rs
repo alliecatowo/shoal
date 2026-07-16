@@ -108,6 +108,20 @@ impl<'s> Parser<'s> {
         let mut trailing = None;
         loop {
             let (t, s) = self.peek(Mode::Cmd)?;
+            // `git log.len()` / `ls somedir.len()` / `git log.where(…)`: a
+            // command ARGUMENT word carrying a `.` (lexed as one Cmd-mode
+            // word — Cmd words don't break on `.`) immediately glued to `(`
+            // is almost always an attempt to chain a method onto the
+            // command's result. That grammar is ambiguous and not supported
+            // (the receiver would be the whole command, not one word) — but
+            // when the parenthesised content itself then fails to parse
+            // (empty `()`, or a bare `.field` shorthand that isn't a whole
+            // call argument), point at the actual fix: wrap the command.
+            let paren_after_dotted_arg = matches!(t, Tok::LParen)
+                && matches!(
+                    args.last(),
+                    Some(CmdArg::Word { text, span }) if span.end == s.start && text.contains('.')
+                );
             match t {
                 Tok::Newline
                 | Tok::Semi
@@ -215,7 +229,16 @@ impl<'s> Parser<'s> {
                         target,
                     });
                 }
-                _ => args.push(self.cmd_arg()?),
+                _ => match self.cmd_arg() {
+                    Ok(arg) => args.push(arg),
+                    Err(e) if paren_after_dotted_arg => {
+                        return Err(e.hint(
+                            "to chain methods on a command, wrap it in parentheses — \
+                             (git log).len()",
+                        ));
+                    }
+                    Err(e) => return Err(e),
+                },
             }
         }
         Ok(CmdCall {

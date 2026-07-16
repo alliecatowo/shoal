@@ -32,7 +32,7 @@ Tier 4 — composition roots (daemon + tools):
   shoal-kernel → ast, auth, eval, exec, journal, leash, proto, syntax, value
 
 Tier 5 — entrypoints (binaries):
-  shoal        → adapters, ast, config, doctor, eval, prompt, syntax, value
+  shoal        → adapters, ast, config, doctor, eval, journal, leash, prompt, syntax, value
   shoal-mcp, shoal-lsp  — spawned by `shoal` as companion subprocesses (`Action::Companion`,
                           crates/shoal/src/main.rs), NOT Cargo dependencies of `shoal`;
                           shoal-mcp itself has zero shoal-* deps in `[dependencies]` (talks to
@@ -87,6 +87,14 @@ Notes / corrections vs the old (stale) diagram:
   cross-tier-looking edge (`shoal-value` needing closure-eval from `shoal-eval`) is a proper
   dependency *inversion*, not a back-edge: `shoal-value` defines `trait CallCtx` (§7 below) and
   `shoal-eval` implements it, so the arrow in the DAG still points `shoal-eval → shoal-value`.
+- The `shoal` (binary) line was itself stale despite this file's own "verified against every
+  Cargo.toml" claim: `crates/shoal/Cargo.toml` `[dependencies]` also lists `shoal-journal` and
+  `shoal-leash` (both real, non-dev deps — used for `shoal doctor`'s installation diagnostics and
+  the journal-backed history/undo path in the binary), which the table omitted. Fixed; re-verified
+  every other tier's edge list against its crate's `[dependencies]` section (excluding
+  `[dev-dependencies]`, which is why `shoal-mcp → shoal-kernel, shoal-proto` and
+  `shoal-prompt → shoal-value` do NOT appear as edges above even though those names appear in
+  those crates' `Cargo.toml` files) at the same time — no other line was stale.
 
 Reproduce: `grep -oE '^shoal-[a-z]+' crates/*/Cargo.toml` (per crate) to re-derive this table if
 crates are added/moved; re-run whenever a crate's `Cargo.toml` `[dependencies]` changes.
