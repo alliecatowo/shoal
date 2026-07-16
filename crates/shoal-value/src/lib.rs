@@ -37,7 +37,10 @@ mod stream;
 mod task;
 mod value_types;
 
-pub use ports::{BytesLoad, Clock, Fs, Opener, ReadSeek, SecretPort, StdClock, StdFs, StdOpener};
+pub use ports::{
+    BytesLoad, Clock, ConfigPort, ConfigSnapshot, Fs, Opener, ReadSeek, SecretPort, StdClock,
+    StdFs, StdOpener,
+};
 
 pub use env::{AssignError, Binding, Env};
 pub use json::{json_to_value, value_to_json};

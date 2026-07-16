@@ -61,6 +61,7 @@ pub(crate) const ROOT: Kind = Kind::Table(&[
             ("color", Kind::Bool),
             ("paging", Kind::Str),
             ("pager", Kind::Str),
+            ("echo", Kind::Str),
         ]),
     ),
     (

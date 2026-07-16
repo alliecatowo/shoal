@@ -3,11 +3,12 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use shoal_eval::Evaluator;
+use shoal_eval::{EchoMode, Evaluator, is_bare_command_stmt};
 use shoal_syntax::{ParseError, parse};
-use shoal_value::{ErrorVal, Value};
+use shoal_value::{ConfigSnapshot, ErrorVal, Value};
 
 mod adapters;
 mod args;
@@ -251,6 +252,36 @@ pub(crate) fn quote_shoal_string(value: &str) -> String {
     out
 }
 
+/// Resolve the `render.echo` mode (docs/CONFIG.md §5) for a surface, falling
+/// back to `default` when the key is unset — and, defensively, when it holds an
+/// unrecognized value (config validation already rejects those, so this only
+/// matters for a `Config` built directly in a test/embedder). The
+/// non-interactive runner passes `EchoMode::Quiet`; the REPL passes
+/// `EchoMode::All`.
+pub(crate) fn resolve_echo_mode(echo: Option<&str>, default: EchoMode) -> EchoMode {
+    match echo {
+        Some("quiet") => EchoMode::Quiet,
+        Some("commands") => EchoMode::Commands,
+        Some("all") => EchoMode::All,
+        _ => default,
+    }
+}
+
+/// Build the in-language `config` snapshot (`config.get`/`config.all`,
+/// docs/CONFIG.md §6) from the host's *resolved* `shoal_config::Config` — the
+/// exact same layered/validated/env-folded config the binary applies to itself
+/// — so `config.get(...)` in a script can never disagree with the config the
+/// host used. Serializes the typed `Config` to a record `Value` via the
+/// serde_json → `json_to_value` path the `config` namespace already round-trips
+/// through; on the practically-impossible serialization failure it degrades to
+/// an empty record rather than aborting the run.
+pub(crate) fn config_snapshot_value(config: &shoal_config::Config) -> Value {
+    match serde_json::to_value(config) {
+        Ok(json) => shoal_value::json_to_value(&json),
+        Err(_) => Value::Record(shoal_value::Record::new()),
+    }
+}
+
 fn run_source(
     src: &str,
     source: Option<&Path>,
@@ -279,6 +310,19 @@ fn run_source(
     };
     let mut evaluator = Evaluator::new(cwd);
     evaluator.interactive = interactive;
+    // `render.echo` (docs/CONFIG.md §5): a non-interactive run defaults to
+    // `quiet` — only bare-command output and the FINAL statement's value show,
+    // intermediate pure expressions (`1+1`, `let x=…`) do NOT auto-print. The
+    // evaluator gates intermediate rendering; the final-value gate is below.
+    let echo_mode = resolve_echo_mode(loaded.config.render.echo.as_deref(), EchoMode::Quiet);
+    evaluator.set_echo_mode(echo_mode);
+    // Inject the resolved config so the in-language `config` namespace
+    // (`config.get`/`config.all`) reads the SAME layered/validated config the
+    // host applied — not a raw `shoal.toml` walked off the filesystem (defect:
+    // eval bypassed shoal-config entirely). See `config_snapshot_value`.
+    evaluator.set_config(Arc::new(ConfigSnapshot::new(config_snapshot_value(
+        &loaded.config,
+    ))));
     // Wire the user reef scope (docs/REEF.md §1) so `~/.config/shoal/
     // shoal.toml`'s `[reef]` table actually engages — without this call the
     // documented user scope never exists in the real binary, no matter what
@@ -329,7 +373,19 @@ fn run_source(
             if let Some(code) = evaluator.take_exit() {
                 return Ok(code);
             }
-            repl::render_result(&value, false).map_err(|e| format!("cannot write output: {e}"))?;
+            // `render.echo` final-value gate (docs/CONFIG.md §5): `quiet`/`all`
+            // always render the final statement's value; `commands` renders it
+            // only when the final statement is itself a bare command (so its
+            // output shows) and suppresses a final pure expression. The
+            // intermediate gate lives in the evaluator's statement loop.
+            let render_final = match echo_mode {
+                EchoMode::All | EchoMode::Quiet => true,
+                EchoMode::Commands => program.stmts.last().is_some_and(is_bare_command_stmt),
+            };
+            if render_final {
+                repl::render_result(&value, false)
+                    .map_err(|e| format!("cannot write output: {e}"))?;
+            }
             Ok(0)
         }
         Err(error) => {

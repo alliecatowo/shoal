@@ -8,7 +8,6 @@
 
 use crate::Evaluator;
 use shoal_value::{CallArgs, ErrorVal, Record, VResult, Value, json_to_value, value_to_json};
-use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// The namespace names intercepted before ordinary variable resolution. A name
@@ -520,29 +519,22 @@ fn os_uptime() -> Value {
 
 // --- config -------------------------------------------------------------------
 
-/// Parse the nearest `shoal.toml` (walking up from the cwd) into a record, or an
-/// empty record when none is found.
+/// The resolved configuration record backing `config.all`/`config.get`
+/// (TDD §5). Reads the host-injected config snapshot (`Evaluator::set_config`),
+/// NOT a raw `shoal.toml` walked off the filesystem: the host loads and applies
+/// its config through `shoal-config` (layering + env overrides + validation),
+/// then injects that same resolved value here, so in-language `config` can
+/// never disagree with the config the host applied to itself. With no snapshot
+/// injected (kernel-less / `-c` / test — the default [`ConfigSnapshot::empty`])
+/// this is an empty record, so `config.all` is `{}` and `config.get(key)` is
+/// `null` — the same zero-config answer as before, with no filesystem walk.
 fn config_record(ev: &Evaluator) -> VResult<Value> {
-    let mut dir: Option<PathBuf> = Some(ev.cwd().to_path_buf());
-    while let Some(d) = dir {
-        let candidate = d.join("shoal.toml");
-        if ev.fs.is_file(&candidate) {
-            let text = ev
-                .fs
-                .read_to_string(&candidate)
-                .map_err(|e| ErrorVal::new("io_error", format!("config: {e}")))?;
-            let j: serde_json::Value = toml::from_str(&text)
-                .map_err(|e| ErrorVal::arg_error(format!("config: shoal.toml: {e}")))?;
-            return Ok(json_to_value(&j));
-        }
-        dir = d.parent().map(Path::to_path_buf);
-    }
-    Ok(Value::Record(Record::new()))
+    Ok(ev.config.snapshot().clone())
 }
 
 fn config_get(ev: &Evaluator, key: &str) -> VResult<Value> {
-    match config_record(ev)? {
-        Value::Record(mut r) => Ok(r.shift_remove(key).unwrap_or(Value::Null)),
+    match ev.config.snapshot() {
+        Value::Record(r) => Ok(r.get(key).cloned().unwrap_or(Value::Null)),
         _ => Ok(Value::Null),
     }
 }

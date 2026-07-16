@@ -404,3 +404,22 @@ value = "1"
 name = "ns-math-unknown-method-is-field-missing"
 src = "math.frobnicate(1)"
 error = "field_missing"
+
+# --- config namespace (TDD §5) -------------------------------------------------
+# The `config` namespace reads a host-INJECTED resolved-config snapshot, never a
+# `shoal.toml` walked off the filesystem. A bare evaluator (this harness, and any
+# kernel-less/`-c` path before the host injects one) has an EMPTY snapshot, so
+# `config.all()` is `{}` and `config.get(key)` degrades to `null` — the
+# zero-config, no-filesystem-walk default. The real binary injects the same
+# layered/validated config it applies to itself (exercised in the `shoal` crate's
+# `config_wiring` integration test, which drives an actual `shoal.toml`).
+
+[[case]]
+name = "ns-config-all-empty-without-injection"
+src = "config.all()"
+value = "{}"
+
+[[case]]
+name = "ns-config-get-unset-key-is-null-without-injection"
+src = 'config.get("render")'
+value = "null"

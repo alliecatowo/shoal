@@ -110,3 +110,90 @@ fn render_color_false_in_config_suppresses_ansi_without_no_color_env() {
         "control run without render.color = false should still colorize; stderr was {stderr2:?}"
     );
 }
+
+/// `render.echo` (docs/CONFIG.md §5): a non-interactive `-c`/script run
+/// defaults to `quiet` — an intermediate bare command's output shows, the
+/// FINAL statement's value shows, but intermediate pure expressions do NOT
+/// auto-print. No `render.echo` key is set here, so this exercises the default.
+#[test]
+fn render_echo_quiet_is_the_default_for_scripts() {
+    let home = tempfile::tempdir().unwrap();
+    let out = run_with_config(home.path(), "version = 1\n", "echo CMDOUT\n100 + 1\n303");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("CMDOUT"),
+        "an intermediate bare command's output must still show; stdout was {stdout:?}"
+    );
+    assert!(
+        stdout.contains("303"),
+        "the final statement's value must show; stdout was {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("101"),
+        "an intermediate pure expression (100 + 1) must NOT auto-print in quiet; stdout was {stdout:?}"
+    );
+}
+
+/// `render.echo = "all"` restores the legacy echo-every-statement behavior:
+/// the intermediate `100 + 1` prints too.
+#[test]
+fn render_echo_all_restores_echo_every_statement() {
+    let home = tempfile::tempdir().unwrap();
+    let out = run_with_config(
+        home.path(),
+        "version = 1\n[render]\necho = \"all\"\n",
+        "echo CMDOUT\n100 + 1\n303",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for needle in ["CMDOUT", "101", "303"] {
+        assert!(
+            stdout.contains(needle),
+            "render.echo = all must echo every statement (missing {needle:?}); stdout was {stdout:?}"
+        );
+    }
+}
+
+/// `render.echo = "commands"`: only bare-command output shows — not even the
+/// final pure expression.
+#[test]
+fn render_echo_commands_suppresses_even_the_final_expression() {
+    let home = tempfile::tempdir().unwrap();
+    let out = run_with_config(
+        home.path(),
+        "version = 1\n[render]\necho = \"commands\"\n",
+        "echo CMDOUT\n100 + 1\n999",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("CMDOUT"),
+        "a bare command's output must show in commands mode; stdout was {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("101"),
+        "an intermediate pure expression must not print; stdout was {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("999"),
+        "commands mode must suppress even the final pure expression; stdout was {stdout:?}"
+    );
+}
+
+/// Decision 2 end-to-end: the in-language `config` namespace reflects the
+/// SAME layered/validated config the binary applied to itself (not a raw
+/// `shoal.toml` walk) — a value set in the user-layer config file is visible
+/// via `config.get(...)`/`config.all()`.
+#[test]
+fn config_namespace_reflects_the_host_applied_config() {
+    let home = tempfile::tempdir().unwrap();
+    let out = run_with_config(
+        home.path(),
+        "version = 1\n[history]\nmax_entries = 4242\n",
+        "config.all().history.max_entries",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("4242"),
+        "config.all() should expose the host-applied resolved config; stdout was {stdout:?}, stderr {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

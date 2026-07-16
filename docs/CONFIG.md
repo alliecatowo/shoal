@@ -105,6 +105,7 @@ e.g. `max_entries`, so an automatic split would be ambiguous).
 | `SHOAL_RENDER_WIDTH` | `render.width` | non-negative int |
 | `SHOAL_RENDER_PAGING` | `render.paging` | string (`never`\|`auto`) |
 | `SHOAL_RENDER_PAGER` | `render.pager` | string |
+| `SHOAL_RENDER_ECHO` | `render.echo` | string (`quiet`\|`commands`\|`all`) |
 | `SHOAL_EDITOR_MODE` | `editor.mode` | string (`emacs`\|`vi`) |
 | `SHOAL_EDITOR_BRACKETED_PASTE` | `editor.bracketed_paste` | bool |
 | `SHOAL_KERNEL_ENABLED` (alias: `SHOAL_KERNEL`) | `kernel.enabled` | bool |
@@ -169,6 +170,7 @@ invalid table header
 | `history.max_entries` must be `> 0` | `history.max_entries: must be greater than 0` |
 | `editor.mode` must be `emacs` or `vi` | `editor.mode: must be \`emacs\` or \`vi\`` |
 | `render.paging` must be `never` or `auto` | `render.paging: must be \`never\` or \`auto\`` |
+| `render.echo` must be `quiet`, `commands`, or `all` (when set) | `render.echo: must be \`quiet\`, \`commands\`, or \`all\`` |
 | `completion.max_results` must be `> 0` | `completion.max_results: must be greater than 0` |
 | an `aliases` name must be non-empty, no whitespace | `aliases: alias name \`g s\` must not contain whitespace` |
 | an `env` name must be non-empty | `env: environment variable name must not be empty` |
@@ -223,6 +225,7 @@ scanner, and is what `shoal-prompt`'s loader migrates from when it sees an old-s
 | `render.color` | bool | `true` | ANSI color on rendered output; forced off by `NO_COLOR` (§3) regardless of this value |
 | `render.paging` | string | `"never"` | `"never"` or `"auto"` — opt-in gate for the interactive REPL's pager integration (see §6); `"never"` is byte-for-byte identical to shoal before this knob existed |
 | `render.pager` | string, optional | unset → `$PAGER`, else `less -R` | explicit pager command, e.g. `"less -R"` or `"bat --paging=always"` |
+| `render.echo` | string, optional | unset → `quiet` for `-c`/scripts/stdin, `all` for the REPL | how much of a run's top-level statement values auto-render: `"quiet"` (bare-command output + the FINAL statement's value only — intermediate pure expressions like `1+1`/`let x=…` stay silent), `"commands"` (bare-command output only, not even the final expression), or `"all"` (echo every statement). Setting it explicitly applies to both surfaces |
 
 ### `[editor]`
 
@@ -371,6 +374,22 @@ friends). As of this wave, the `shoal` binary's REPL/script-runner path reads:
   `statement_sink` always calls `print_value` directly). Default `"never"` means this is
   byte-for-byte inert until a user opts in; flipping the default to `"auto"` is a one-line change
   in `Render::default()` (`crates/shoal-config/src/lib.rs`).
+
+- `render.echo` — how much of a **non-interactive** (`-c`/script/stdin) run's top-level statement
+  values auto-render, resolved once per run into the evaluator's `EchoMode`. `"quiet"` (the
+  non-interactive default when the key is unset) renders only bare-command output plus the FINAL
+  statement's value — intermediate pure expressions (`1+1`, `let x=…`) no longer auto-print, so a
+  script stops echoing every step; `"commands"` renders bare-command output only, suppressing even
+  the final expression; `"all"` echoes every statement (the legacy behavior). The evaluator gates
+  which *intermediate* statement values reach the statement sink (`crates/shoal-eval/src/stmt.rs`);
+  the host (`main::run_source`) applies the matching *final*-value gate. The interactive REPL
+  defaults to `"all"` (echo each result) when the key is unset; an explicit `render.echo` applies
+  to both surfaces.
+- the whole resolved config — injected into the evaluator as the snapshot backing the in-language
+  `config` namespace (`config.get(key)` / `config.all()`), so a script reads the SAME
+  layered/validated/env-folded config the host applied to itself rather than re-parsing `shoal.toml`
+  off the filesystem (see CONTRACTS §8's `ConfigPort`). With no host (a kernel-less embed / a bare
+  `Evaluator`) the snapshot is empty, so `config.get` degrades to `null` — no filesystem walk.
 
 Schema-complete, validated, and documented, but **not yet read by any in-tree consumer** as of
 this wave (ready for a consumer to wire up — see the integrator note below):

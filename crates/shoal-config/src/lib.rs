@@ -113,6 +113,16 @@ pub struct Render {
     /// `less -R` (the `-R` matters: rendered output is colorized ANSI, and
     /// plain `less` would print raw escape codes instead of color).
     pub pager: Option<String>,
+    /// How much of a non-interactive (`-c`/script/stdin) run's top-level
+    /// statement values auto-render (docs/CONFIG.md §5): `"quiet"` renders
+    /// only bare-command output plus the FINAL statement's value —
+    /// intermediate pure expressions like `1+1`/`let x=…` stay silent;
+    /// `"commands"` renders bare-command output only, not even the final
+    /// expression; `"all"` echoes every statement (the REPL's behavior).
+    /// `None` (the default) lets each host surface pick its own fallback: the
+    /// non-interactive runner defaults to `"quiet"`, the interactive REPL to
+    /// `"all"`. Setting it explicitly overrides both surfaces.
+    pub echo: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -254,6 +264,7 @@ impl Default for Render {
             color: true,
             paging: "never".into(),
             pager: None,
+            echo: None,
         }
     }
 }
