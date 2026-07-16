@@ -339,8 +339,8 @@ impl Kernel {
                         let _ = journal.record_output(entry_id, "stderr", stderr.as_bytes());
                     }
                 }
-                self.events.publish(
-                    "journal",
+                self.events.publish_journal(
+                    entry_id,
                     journal_event(entry_id, &params.src, false, &actor),
                 );
                 // AGENT-SURFACE §0/§5: even a raised error is
@@ -409,10 +409,8 @@ impl Kernel {
                 }
             }
         }
-        self.events.publish(
-            "journal",
-            journal_event(entry_id, &params.src, true, &actor),
-        );
+        self.events
+            .publish_journal(entry_id, journal_event(entry_id, &params.src, true, &actor));
         // AGENT-SURFACE §4: announce the new transcript value on the
         // `session.transcript` channel — subscribers learn a new
         // out[n] exists (with its shape summary) without polling.
