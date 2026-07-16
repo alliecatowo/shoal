@@ -41,6 +41,7 @@ pub use ports::{Clock, Fs, Opener, SecretPort, StdClock, StdFs, StdOpener};
 
 pub use env::{AssignError, Binding, Env};
 pub use json::{json_to_value, value_to_json};
+pub use methods::method_names;
 pub use outcome::OutcomeVal;
 pub use stream::{Pull, StreamVal, Upstream, collect_stream, drive_stream};
 pub use task::{TaskShared, TaskVal};

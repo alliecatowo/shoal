@@ -28,6 +28,8 @@ mod strops;
 mod suggest;
 mod task;
 
+pub use suggest::method_names;
+
 use super::*;
 
 pub fn call_method(

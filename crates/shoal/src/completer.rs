@@ -22,18 +22,10 @@ use std::time::SystemTime;
 
 use reedline::{Completer, Span as RlSpan, Suggestion};
 use shoal_adapters::{AdapterCatalog, CmdAdapter};
+use shoal_eval::builtin_names;
 use shoal_syntax::lexer::RESERVED;
 use shoal_syntax::{Lexer, Mode, Tok};
-use shoal_value::{Env, Value};
-
-/// Command names shoal-eval special-cases or implements directly
-/// (`crates/shoal-eval/src/builtins.rs::NAMES` plus the `cd`/`pwd`/`j`/`jump`/
-/// `run`/`source` heads special-cased in `eval_command`). Kept in sync by hand:
-/// shoal-eval doesn't expose this list publicly (see api_changes).
-const SHOAL_BUILTINS: &[&str] = &[
-    "echo", "ls", "cat", "mkdir", "touch", "cp", "mv", "rm", "stat", "which", "env", "sleep", "cd",
-    "pwd", "j", "jump", "run", "source",
-];
+use shoal_value::{Env, Value, method_names};
 
 /// Cursor context, resolved from the raw buffer text alone (no full parse —
 /// see `classify`).
@@ -49,6 +41,9 @@ enum Ctx {
     },
     /// Completing an identifier inside an EXPR-dispatched statement.
     Expr { start: usize, word: String },
+    /// Completing a method/field name immediately after a `.` (`recv.<word>`)
+    /// in EXPR position — offer the value-method vocabulary, not variables.
+    Method { start: usize, word: String },
     /// Nothing sensible to complete (e.g. cursor inside a literal).
     None,
 }
@@ -175,7 +170,7 @@ impl ShoalCompleter {
     fn head_candidates(&mut self, prefix: &str) -> Vec<String> {
         let mut names: BTreeSet<String> = BTreeSet::new();
         names.extend(RESERVED.iter().map(|s| s.to_string()));
-        names.extend(SHOAL_BUILTINS.iter().map(|s| s.to_string()));
+        names.extend(builtin_names().iter().map(|s| s.to_string()));
         for name in self.env.visible_names() {
             if self.env.get(&name).is_some_and(|v| v.is_callable()) {
                 names.insert(name);
@@ -192,6 +187,20 @@ impl ShoalCompleter {
         names.extend(RESERVED.iter().map(|s| s.to_string()));
         names.retain(|n| self.candidate_matches(n, prefix));
         names.into_iter().collect()
+    }
+
+    /// Method/field candidates for a `.`-position word (`recv.<prefix>`): the
+    /// flat value-method vocabulary from shoal-value (`method_names`), filtered
+    /// per `[completion]` config. Receiver-type-aware filtering is deliberately
+    /// out of scope — a value's dynamic type isn't known from buffer text alone
+    /// — so every method name is a candidate, which is still a strict
+    /// improvement over offering variable names in method position.
+    fn method_candidates(&self, prefix: &str) -> Vec<String> {
+        method_names()
+            .iter()
+            .filter(|n| self.candidate_matches(n, prefix))
+            .map(|s| s.to_string())
+            .collect()
     }
 
     /// `--flag`/`-x` candidates for a known command head: adapter params
@@ -294,6 +303,9 @@ impl Completer for ShoalCompleter {
             Ctx::Expr { start, word } => {
                 finish(self.expr_candidates(&word), start, pos, max_results)
             }
+            Ctx::Method { start, word } => {
+                finish(self.method_candidates(&word), start, pos, max_results)
+            }
             Ctx::None => Vec::new(),
         }
     }
@@ -335,6 +347,20 @@ fn split_dir_prefix(word: &str) -> (String, String) {
     match word.rfind('/') {
         Some(idx) => (word[..=idx].to_string(), word[idx + 1..].to_string()),
         None => (String::new(), word.to_string()),
+    }
+}
+
+/// Resolve an EXPR-position word to either a plain [`Ctx::Expr`]
+/// (variable/function/keyword completion) or a [`Ctx::Method`] (value-method
+/// completion) depending on whether the identifier is immediately preceded by a
+/// `.` — i.e. it's a method/field on some receiver (`recv.<word>`). A `?.`
+/// optional-chain also ends in `.`, so it's covered too.
+fn expr_or_method(line: &str, pos: usize) -> Ctx {
+    let (start, word) = trailing_ident(line, pos);
+    if start > 0 && line.as_bytes()[start - 1] == b'.' {
+        Ctx::Method { start, word }
+    } else {
+        Ctx::Expr { start, word }
     }
 }
 
@@ -451,8 +477,7 @@ fn classify(env: &Env, line: &str, pos: usize) -> Ctx {
                 ))
             );
             if is_keyword || is_bound || is_assign {
-                let (start, word) = trailing_ident(line, pos);
-                Ctx::Expr { start, word }
+                expr_or_method(line, pos)
             } else {
                 match cmd_word_at(&lx, e0, pos, line) {
                     Some((start, word)) => Ctx::Arg {
@@ -468,8 +493,7 @@ fn classify(env: &Env, line: &str, pos: usize) -> Ctx {
             if pos <= e0 {
                 Ctx::None
             } else {
-                let (start, word) = trailing_ident(line, pos);
-                Ctx::Expr { start, word }
+                expr_or_method(line, pos)
             }
         }
     }
@@ -587,15 +611,33 @@ mod tests {
     }
 
     #[test]
-    fn classify_bound_variable_head_is_expr() {
+    fn classify_bound_variable_dot_is_method() {
+        // A bound receiver followed by `.<word>` is method/field position, not
+        // a plain expr reference — so completion offers method names.
         let env = Env::root();
         env.declare("items", Value::Int(1), false);
         let ctx = classify(&env, "items.le", 8);
         assert_eq!(
             ctx,
-            Ctx::Expr {
+            Ctx::Method {
                 start: 6,
                 word: "le".into()
+            }
+        );
+    }
+
+    #[test]
+    fn classify_bound_variable_no_dot_is_expr() {
+        // The same bound receiver with a trailing space (no `.`) is plain expr
+        // position: variable/function/keyword completion, not method names.
+        let env = Env::root();
+        env.declare("items", Value::Int(1), false);
+        let ctx = classify(&env, "items ", 6);
+        assert_eq!(
+            ctx,
+            Ctx::Expr {
+                start: 6,
+                word: String::new()
             }
         );
     }
@@ -619,6 +661,52 @@ mod tests {
         let mut c = completer_at(Path::new("."));
         let names = c.head_candidates("ec");
         assert!(names.iter().any(|n| n == "echo"));
+    }
+
+    #[test]
+    fn head_candidates_include_full_builtin_registry() {
+        // Regression against the old hand-copied `SHOAL_BUILTINS` (18 stale
+        // entries): every real builtin command head now tab-completes because
+        // the completer consumes shoal-eval's canonical registry directly.
+        let mut c = completer_at(Path::new("."));
+        for head in [
+            "jobs", "history", "exit", "plan", "apply", "undo", "reef", "save", "assert",
+            "interact", "open", "pushd", "popd", "dirs",
+        ] {
+            let names = c.head_candidates(head);
+            assert!(
+                names.iter().any(|n| n == head),
+                "builtin `{head}` should be an offered head candidate"
+            );
+        }
+    }
+
+    #[test]
+    fn method_position_offers_method_names_expr_does_not() {
+        // `tbl.wh<TAB>` — a bound receiver in `.`-position — offers value
+        // method names (`where`); the same prefix in plain expr position
+        // (`let x = wh`) offers variables/keywords, never method names.
+        let env = Env::root();
+        env.declare("tbl", Value::Int(1), false);
+        let mut c = ShoalCompleter::new(
+            env,
+            Arc::new(Mutex::new(PathBuf::from("."))),
+            Vec::new(),
+            Vec::new(),
+        );
+        let method = c.complete("tbl.wh", 6);
+        assert!(
+            method.iter().any(|s| s.value == "where"),
+            "method position must offer `.where`, got {:?}",
+            method.iter().map(|s| &s.value).collect::<Vec<_>>()
+        );
+
+        let expr = c.complete("let x = wh", 10);
+        assert!(
+            !expr.iter().any(|s| s.value == "where"),
+            "plain expr position must NOT offer method names, got {:?}",
+            expr.iter().map(|s| &s.value).collect::<Vec<_>>()
+        );
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use nu_ansi_term::{Color, Style};
 use reedline::{Highlighter, StyledText};
+use shoal_eval::builtin_names;
 use shoal_syntax::{Lexer, Mode, Tok};
 use shoal_value::{Env, Value};
 
@@ -24,6 +25,9 @@ impl ShoalHighlighter {
 }
 
 fn is_keyword(name: &str) -> bool {
+    // Statement-leading keywords: the parser's reserved set plus `with`/`spawn`,
+    // which it special-cases identically (parser/command.rs). `true`/`false`/
+    // `null` are handled separately as literals, so they are excluded here.
     matches!(
         name,
         "let"
@@ -43,15 +47,16 @@ fn is_keyword(name: &str) -> bool {
             | "alias"
             | "use"
             | "export"
+            | "with"
+            | "spawn"
     )
 }
 
 fn is_valid_command(cmd: &str) -> bool {
-    let builtins = [
-        "cd", "pwd", "j", "jump", "ls", "echo", "run", "spawn", "parallel", "jobs", "history",
-        "clear", "exit",
-    ];
-    if builtins.contains(&cmd) {
+    // Builtin command heads come from shoal-eval's canonical registry (no more
+    // hand-maintained list drift — the old local array carried a bogus `clear`
+    // and missed most real heads). External commands still resolve via PATH.
+    if builtin_names().binary_search(&cmd).is_ok() {
         return true;
     }
     if let Some(paths) = std::env::var_os("PATH") {
@@ -479,6 +484,40 @@ mod tests {
             .find(|(_, s)| s == "deploy")
             .expect("head span");
         assert_eq!(head.0.foreground, Some(Color::Green), "got {spans:?}");
+    }
+
+    #[test]
+    fn registry_builtin_head_is_valid_without_path() {
+        // `undo`/`reef`/`dirs`/`jobs` are shoal builtins with no PATH binary —
+        // they must still highlight green, proving the highlighter reads the
+        // eval registry (which is consulted before the PATH fallback) rather
+        // than a stale local list. `clear`, conversely, is gone from the
+        // registry (it was never a real builtin).
+        for head in ["undo", "reef", "dirs", "jobs"] {
+            let spans = styles_for(head);
+            let h = spans
+                .iter()
+                .find(|(_, s)| s == head)
+                .unwrap_or_else(|| panic!("{head}: no head span in {spans:?}"));
+            assert_eq!(h.0.foreground, Some(Color::Green), "{head}: {spans:?}");
+        }
+    }
+
+    #[test]
+    fn spawn_and_with_style_as_keywords() {
+        // `spawn`/`with` are statement keywords (the parser special-cases them
+        // alongside RESERVED) — green + bold, not resolved-via-PATH command
+        // heads. Regression guard: dropping them from the highlighter's old
+        // valid-command list must not make them flag red.
+        for kw in ["spawn", "with"] {
+            let spans = styles_for(kw);
+            let s = spans
+                .iter()
+                .find(|(_, t)| t == kw)
+                .unwrap_or_else(|| panic!("{kw}: no span in {spans:?}"));
+            assert_eq!(s.0.foreground, Some(Color::Green), "{kw}: {spans:?}");
+            assert!(s.0.is_bold, "{kw} should be a bold keyword: {spans:?}");
+        }
     }
 
     #[test]
