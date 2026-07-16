@@ -169,4 +169,81 @@ impl Kernel {
             channels: STATIC_CHANNELS.iter().map(|s| s.to_string()).collect(),
         })
     }
+
+    /// `session.env` (AGENT-SURFACE §1, `shoal://session/env`): the session's
+    /// environment read from its own evaluator (the same source the in-language
+    /// `env` builtin reads, so in-session env writes are reflected), the same
+    /// way `session.attach` reads `cwd()`. Env is **NAMES-only unless granted**
+    /// — the values travel only when this principal's policy resolves `EnvRead`
+    /// to `Allow` (a default-permissive human does; a scoped agent that wasn't
+    /// granted an env read sees the names alone, never a guess). The `granted`
+    /// flag tells the reader which of the two it got.
+    pub(crate) fn handle_session_env(
+        self: &Arc<Self>,
+        attached: &mut Option<Attachment>,
+    ) -> Result<Json, RpcError> {
+        let attachment = attached.as_ref().ok_or_else(not_attached)?;
+        let session = &attachment.session;
+        let pairs: Vec<(String, String)> = {
+            let evaluator = session.evaluator.lock().unwrap();
+            evaluator
+                .env_vars()
+                .iter()
+                .filter_map(|(k, v)| Some((k.to_str()?.to_string(), v.to_str()?.to_string())))
+                .collect()
+        };
+        let mut names: Vec<String> = pairs.iter().map(|(k, _)| k.clone()).collect();
+        names.sort();
+        let granted = self.policy.evaluate_effect(
+            &attachment.principal,
+            &Effect::EnvRead {
+                names: names.clone(),
+            },
+        ) == Verdict::Allow;
+        if granted {
+            let env: serde_json::Map<String, Json> = pairs
+                .into_iter()
+                .map(|(k, v)| (k, Json::String(v)))
+                .collect();
+            encode(json!({"granted": true, "names": names, "env": env}))
+        } else {
+            encode(json!({"granted": false, "names": names}))
+        }
+    }
+
+    /// `session.reef` (AGENT-SURFACE §1, `shoal://session/reef`): the session's
+    /// reef resolution state — the active manifest scope and every constrained
+    /// tool's binding (locked version/provider, or an honest `null` gap when a
+    /// scope constrains a tool that isn't locked yet). Sourced entirely from the
+    /// evaluator's cached scope chain + loaded lock via
+    /// [`Evaluator::prompt_reef_snapshot`] — zero subprocess, zero fresh
+    /// resolution (docs/REEF.md, AGENT-SURFACE §12.1).
+    pub(crate) fn handle_session_reef(
+        self: &Arc<Self>,
+        attached: &mut Option<Attachment>,
+    ) -> Result<Json, RpcError> {
+        let attachment = attached.as_ref().ok_or_else(not_attached)?;
+        let session = &attachment.session;
+        let snapshot = {
+            let mut evaluator = session.evaluator.lock().unwrap();
+            evaluator.prompt_reef_snapshot()
+        };
+        let bindings: Vec<Json> = snapshot
+            .bindings
+            .iter()
+            .map(|b| {
+                json!({
+                    "tool": b.tool,
+                    "version": b.version,
+                    "provider": b.provider,
+                    "scope": b.scope,
+                    "constrained": b.constrained,
+                })
+            })
+            .collect();
+        encode(json!({
+            "active_scope": snapshot.active_scope,
+            "bindings": bindings,
+        }))
+    }
 }

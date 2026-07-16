@@ -81,7 +81,7 @@ Short refs (in values, journal, renders): `out:12`, `val:blake3:<hex>`, `task:7`
 shoal://out/{n}                    transcript value n (session-scoped)
 shoal://val/{blake3}               immutable content-addressed value
 shoal://task/{id}                  task record: status, desc, exit, timings
-shoal://task/{id}/out              task's live output (subscribable, cursor-read)
+shoal://task/{id}/out              task's captured output (subscribable; read = full current output)
 shoal://jobs                       the task table
 shoal://journal                    query root (template: ?since,head,principal,ok,limit)
 shoal://journal/entry/{id}         one entry: src, canonical AST, effects, outputs (hashes)
@@ -177,9 +177,11 @@ shoal_cap_request {effects:[…]}  → granted | denied{why} | approval_pending{
 Kernel JSON-RPC keeps the TDD §7 method set (`session.attach`, `parse`, `exec`, `plan.apply`,
 `value.get`, `task.*`, `journal.query`, `complete`, `explain`, `cap.request`) plus
 `events.read {channel, since, limit}` and `events.publish {channel, payload}` (user channels
-only). `session.attach` result gains `{caps_enforced: bool, ast_version, elide_defaults,
-channels: [names]}` so a client learns, at attach time, whether the wall is real (TDD §8 tier
-honesty) and what it may subscribe to.
+only), and the read-side introspection methods backing the §1 resource roots: `session.env` /
+`session.reef` (the `shoal://session/env|reef` views), `plan.get {plan_ref}` /
+`plan.list` (the `shoal://plan/{ref}` view + its enumeration). `session.attach` result gains
+`{caps_enforced: bool, ast_version, elide_defaults, channels: [names]}` so a client learns, at
+attach time, whether the wall is real (TDD §8 tier honesty) and what it may subscribe to.
 
 ## 6. Subscriptions — push, never poll
 
@@ -225,13 +227,35 @@ on channel("deploy") { ev => … }      → register a handler (desugars to .eve
 
 ## 8. MCP resource mechanics
 
-`resources/list` enumerates the stable roots (§1) plus per-session dynamic entries (open tasks,
-recent `out:n`). `resources/read` on a value URI returns `structuredContent` = the `$`-tagged (or
-elided) value; on an events URI returns the buffered tail. `resources/templates/list` advertises
-the query-parameterized forms (`shoal://journal{?since,head,limit}`,
-`shoal://out/{n}{?path,slice,format}`). Every `tools/call` result that produces a value includes a
-`resource_link` to its ref so the agent can drill in later for zero tokens — the tool result in
-context stays a one-line render + the ref, never the payload.
+`resources/list` enumerates the stable roots (§1) — `journal`, `jobs`, `session/cwd|env|reef` —
+plus per-session dynamic entries (open tasks, open plans). `resources/read` on a value URI returns
+`structuredContent` = the `$`-tagged (or elided) value; on an events URI returns the buffered tail.
+`resources/templates/list` advertises the query-parameterized forms (`shoal://journal{?since,head,
+limit}`, `shoal://out/{n}{?path,slice,format}`, `shoal://task/{id}/out{?path,slice,format}`,
+`shoal://plan/{ref}`, `shoal://session/{view}`). Every `tools/call` result that produces a value
+includes a `resource_link` to its ref so the agent can drill in later for zero tokens — the tool
+result in context stays a one-line render + the ref, never the payload.
+
+Every root in §1 is served (`crates/shoal-mcp/src/resources.rs`, pinned end-to-end by
+`crates/shoal-mcp/tests/live_kernel.rs`):
+- `shoal://task/{id}/out` — resolves the task's captured output (its result value), the **read**
+  side of the §6 subscription. A kernel task captures the *whole* outcome at completion, so a read
+  returns the full current output rather than a streaming cursor slice (a task's output is not yet
+  incrementally journaled; the `?slice`/`?path` drilldown still applies to the resolved value). A
+  task with no captured value yet (still running, or failed before producing one) reads back its
+  record so state/error is visible instead of an empty payload.
+- `shoal://session/env` — the session's environment read live from its evaluator (in-session env
+  writes reflected). **Names-only unless granted**: the values travel only when the principal's
+  policy resolves `EnvRead` to `Allow` (a default-permissive human does); a scoped agent without
+  that grant gets the names alone. The `granted` flag in the payload says which it got.
+- `shoal://session/reef` — the active manifest scope + every constrained tool's binding (locked
+  version/provider, or an honest `null` gap when a scope constrains a tool that isn't locked yet),
+  from the evaluator's cached scope chain + loaded lock (zero subprocess, zero fresh resolution).
+- `shoal://plan/{ref}` — the stored plan a prior `exec {mode:"plan"}`/`shoal_plan` derived and keyed
+  by `plan:<hex16>`: its canonical AST, effects, reversibility, and current leash verdict
+  (session/principal-scoped like `plan.apply`; an unknown/expired ref is a clear not-found).
+- `shoal://val/{blake3}` — accepts both the bare hex and the spec's `val:blake3:<hex>` short-ref
+  form (the `blake3:` prefix is stripped before the CAS lookup).
 
 **The contract, in one sentence:** the agent's context is a working set of *refs and shapes*; every
 byte of actual payload is pulled on purpose, structured, from an addressable noun — or pushed,

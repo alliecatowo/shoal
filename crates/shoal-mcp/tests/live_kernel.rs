@@ -96,6 +96,17 @@ fn read_resource(facade: &mut Facade, uri: &str) -> Value {
     response["result"].clone()
 }
 
+/// `resources/read` that is expected to fail — returns the whole response so
+/// the test can assert an `error` object (unknown plan/task refs, §1).
+fn read_resource_expecting_error(facade: &mut Facade, uri: &str) -> Value {
+    let request = json!({
+        "jsonrpc":"2.0","id":2,"method":"resources/read","params":{"uri":uri}
+    });
+    facade
+        .handle(&request)
+        .expect("resources/read has a response")
+}
+
 /// A >100-row table exec, over the real socket through the MCP facade: the
 /// structured value elides (§3), the human `text`/render is bounded and never
 /// carries the payload (§1 — the elision-bypass fix), and a `resource_link`
@@ -319,6 +330,228 @@ fn mcp_shoal_plan_distinguishes_trash_rm_from_opaque_rm() {
     assert_eq!(
         opaque_plan["structuredContent"]["reversibility"], "irreversible",
         "an opaque external rm -rf must never be reported reversible: {opaque_plan}"
+    );
+}
+
+/// AGENT-SURFACE §1 (`shoal://session/env`): the session environment view is
+/// served from the session evaluator. A default-permissive human is granted a
+/// value read (`env_read=["*"]`), so `granted:true` and the values travel
+/// alongside the names.
+#[test]
+fn mcp_session_env_resource_is_served_with_values_for_the_default_human() {
+    let live = LiveKernel::start();
+    let mut facade = Facade::connect(&live.config()).unwrap();
+
+    let env = read_resource(&mut facade, "shoal://session/env");
+    let sc = &env["structuredContent"];
+    assert_eq!(
+        sc["granted"], true,
+        "the default-permissive human is granted an env value read: {sc}"
+    );
+    let names = sc["names"].as_array().expect("env names is a list");
+    assert!(!names.is_empty(), "the session env is not empty: {sc}");
+    let values = sc["env"].as_object().expect("granted env carries values");
+    assert_eq!(
+        values.len(),
+        names.len(),
+        "every named var carries a value when granted"
+    );
+}
+
+/// AGENT-SURFACE §1 (`shoal://session/reef`): the reef resolution view is
+/// served and correctly shaped — an `active_scope` (string or honest null when
+/// no manifest is in scope) plus a `bindings` array. Host-independent: it only
+/// asserts the shape, never a particular manifest state.
+#[test]
+fn mcp_session_reef_resource_is_served_and_shaped() {
+    let live = LiveKernel::start();
+    let mut facade = Facade::connect(&live.config()).unwrap();
+
+    let reef = read_resource(&mut facade, "shoal://session/reef");
+    let sc = &reef["structuredContent"];
+    assert!(
+        sc.get("active_scope").is_some(),
+        "reef view carries an active_scope field (may be null): {sc}"
+    );
+    assert!(
+        sc["bindings"].is_array(),
+        "reef view carries a bindings array: {sc}"
+    );
+}
+
+/// AGENT-SURFACE §1 (`shoal://plan/{ref}`): a plan derived by `shoal_plan` is
+/// afterward readable as a resource by its `plan:<hex>` ref — its effects,
+/// reversibility, and verdict mirror what the `shoal_plan` call returned. An
+/// unknown/expired ref is a clear not-found error, never a silent empty plan.
+#[test]
+fn mcp_plan_resource_reads_back_a_stored_plan_and_errors_on_unknown() {
+    let live = LiveKernel::start();
+    let mut facade = Facade::connect(&live.config()).unwrap();
+    let doomed = live._dir.path().join("doomed.txt");
+    std::fs::write(&doomed, b"x").unwrap();
+
+    let plan = call_tool(
+        &mut facade,
+        "shoal_plan",
+        json!({"src": format!("rm {}", doomed.display())}),
+    );
+    let plan_ref = plan["structuredContent"]["plan_ref"]
+        .as_str()
+        .expect("shoal_plan returns a plan_ref")
+        .to_string();
+    // `plan:<hex>` short ref → `shoal://plan/<hex>` URI.
+    let bare = plan_ref
+        .strip_prefix("plan:")
+        .expect("plan ref is plan:<hex>");
+    let uri = format!("shoal://plan/{bare}");
+
+    let read = read_resource(&mut facade, &uri);
+    let sc = &read["structuredContent"];
+    assert_eq!(
+        sc["plan_ref"], plan_ref,
+        "the plan resource round-trips its own ref: {sc}"
+    );
+    assert_eq!(
+        sc["reversibility"], plan["structuredContent"]["reversibility"],
+        "the resource's reversibility mirrors the plan call's: {sc}"
+    );
+    assert!(
+        sc["effects"].is_array() && !sc["effects"].as_array().unwrap().is_empty(),
+        "the plan resource carries its concrete effects: {sc}"
+    );
+    assert!(
+        sc.get("verdict").is_some(),
+        "the plan resource has a verdict"
+    );
+    assert!(sc.get("ast").is_some(), "the plan resource carries its ast");
+
+    // An unknown plan ref is a not-found error, not an empty success.
+    let missing = read_resource_expecting_error(&mut facade, "shoal://plan/deadbeefdeadbeef");
+    assert!(
+        missing.get("error").is_some(),
+        "an unknown plan ref must error: {missing}"
+    );
+}
+
+/// AGENT-SURFACE §1/§6 (`shoal://task/{id}/out`): the read side of a task's
+/// output. A completed background task's captured output is reachable by URI —
+/// the `/out` segment resolves the task's result value (previously ignored, so
+/// the record was returned instead of the output). An unknown task errors.
+#[test]
+fn mcp_task_out_resource_reads_captured_output_and_errors_on_unknown() {
+    let live = LiveKernel::start();
+    let mut facade = Facade::connect(&live.config()).unwrap();
+
+    let bg = call_tool(
+        &mut facade,
+        "shoal_exec",
+        json!({"src":"sh { echo hello-from-task }","background":true}),
+    );
+    let task_ref = bg["structuredContent"]["task"]
+        .as_str()
+        .expect("background exec returns a task ref")
+        .to_string();
+    let bare_id = task_ref.strip_prefix("task:").expect("task ref is task:N");
+
+    // Wait for the task to finish and capture its output value.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let jobs = read_resource(&mut facade, "shoal://jobs");
+        let tasks = jobs["structuredContent"].as_array().unwrap().clone();
+        if let Some(task) = tasks.iter().find(|t| t["task"] == json!(task_ref))
+            && task["state"] != "running"
+            && task["state"] != "cancelling"
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "task never finished");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let out = read_resource(&mut facade, &format!("shoal://task/{bare_id}/out"));
+    let sc = &out["structuredContent"];
+    assert!(
+        !sc.is_null(),
+        "a completed task's /out resolves to its captured output, not null: {sc}"
+    );
+    // The captured output is the `echo` outcome; its text carries the marker.
+    assert!(
+        serde_json::to_string(sc)
+            .unwrap()
+            .contains("hello-from-task"),
+        "task /out carries the command's captured output: {sc}"
+    );
+
+    // An unknown task id is a not-found error.
+    let missing = read_resource_expecting_error(&mut facade, "shoal://task/999999/out");
+    assert!(
+        missing.get("error").is_some(),
+        "an unknown task's /out must error: {missing}"
+    );
+}
+
+/// AGENT-SURFACE §1 (`shoal://val/blake3:{hex}`): the spec's short-ref value
+/// URI form (with the `blake3:` algorithm prefix) must resolve the same CAS
+/// blob as the bare-hex form — the prefix is stripped before the lookup.
+#[test]
+fn mcp_val_resource_accepts_the_blake3_prefixed_spec_form() {
+    let live = LiveKernel::start();
+    let mut facade = Facade::connect(&live.config()).unwrap();
+
+    // Run something so the journal CAS holds at least one output blob.
+    call_tool(&mut facade, "shoal_exec", json!({"src":"1 + 2"}));
+    let journal = read_resource(&mut facade, "shoal://journal");
+    let entries = journal["structuredContent"].as_array().unwrap();
+    let hash = entries
+        .iter()
+        .flat_map(|e| e["outputs"].as_array().cloned().unwrap_or_default())
+        .find_map(|o| o["hash"].as_str().map(String::from))
+        .expect("a journal entry carries at least one content-addressed output");
+
+    let bare = read_resource(&mut facade, &format!("shoal://val/{hash}"));
+    let prefixed = read_resource(&mut facade, &format!("shoal://val/blake3:{hash}"));
+    assert_eq!(
+        bare["structuredContent"], prefixed["structuredContent"],
+        "val:blake3:<hex> resolves the same blob as the bare hex form"
+    );
+}
+
+/// AGENT-SURFACE §8: `resources/list` advertises the newly-served static roots
+/// (`session/env`, `session/reef`) and any open plan the session derived.
+#[test]
+fn mcp_resources_list_advertises_new_roots_and_open_plans() {
+    let live = LiveKernel::start();
+    let mut facade = Facade::connect(&live.config()).unwrap();
+    let doomed = live._dir.path().join("doomed.txt");
+    std::fs::write(&doomed, b"x").unwrap();
+    let plan = call_tool(
+        &mut facade,
+        "shoal_plan",
+        json!({"src": format!("rm {}", doomed.display())}),
+    );
+    let plan_ref = plan["structuredContent"]["plan_ref"].as_str().unwrap();
+    let bare = plan_ref.strip_prefix("plan:").unwrap();
+
+    let list = facade
+        .handle(&json!({"jsonrpc":"2.0","id":3,"method":"resources/list"}))
+        .unwrap();
+    let uris: Vec<String> = list["result"]["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["uri"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        uris.iter().any(|u| u == "shoal://session/env"),
+        "session/env is advertised: {uris:?}"
+    );
+    assert!(
+        uris.iter().any(|u| u == "shoal://session/reef"),
+        "session/reef is advertised: {uris:?}"
+    );
+    assert!(
+        uris.iter().any(|u| *u == format!("shoal://plan/{bare}")),
+        "the open plan is advertised: {uris:?}"
     );
 }
 

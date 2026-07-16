@@ -499,6 +499,15 @@ impl Evaluator {
         &self.cwd
     }
 
+    /// The session's process environment (name → value pairs) — the same
+    /// source the in-language `env` builtin reads and that seeds a spawned
+    /// child's environment, including any in-session env writes. A read-only
+    /// session-state accessor mirroring [`Evaluator::cwd`], used by the
+    /// kernel's `shoal://session/env` resource view (docs/AGENT-SURFACE.md §1).
+    pub fn env_vars(&self) -> &[(OsString, OsString)] {
+        &self.process_env
+    }
+
     pub fn set_adapters(&mut self, adapters: AdapterCatalog) {
         self.adapters = adapters;
     }

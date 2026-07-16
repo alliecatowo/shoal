@@ -147,6 +147,84 @@ impl Kernel {
         })
     }
 
+    /// `plan.get` (AGENT-SURFACE §1, `shoal://plan/{ref}`): the stored plan a
+    /// prior `exec {mode:"plan"}` / `shoal_plan` derived and keyed by its
+    /// `plan:<hex16>` ref — its canonical AST (re-parsed from the stored
+    /// source), concrete effects, reversibility, and the *current* leash
+    /// verdict, mirroring what `explain` returns plus the verdict fields
+    /// `exec`'s plan mode reports. Session/principal-scoped like `plan.apply`
+    /// (a plan is private to the principal that derived it), and an unknown or
+    /// expired ref is a clear not-found (`-32012`), never a silent empty plan.
+    pub(crate) fn handle_plan_get(
+        self: &Arc<Self>,
+        params: Json,
+        attached: &mut Option<Attachment>,
+    ) -> Result<Json, RpcError> {
+        let attachment = attached.as_ref().ok_or_else(not_attached)?;
+        let session = &attachment.session;
+        let p: PlanApplyParams = decode(params)?;
+        let plans = self.plans.lock().unwrap();
+        let stored = plans.get(&p.plan_ref).ok_or_else(|| RpcError {
+            code: -32012,
+            message: "unknown or expired plan_ref".into(),
+            data: Some(json!({ "plan_ref": p.plan_ref })),
+        })?;
+        if stored.session != session.id || stored.principal != attachment.principal {
+            return Err(RpcError {
+                code: -32010,
+                message: "plan belongs to another principal/session".into(),
+                data: None,
+            });
+        }
+        // Re-parse the stored source so the canonical AST travels alongside the
+        // derived effects (the plan record itself keeps only source + effects).
+        // The source parsed cleanly when the plan was stored, so this succeeds;
+        // an `ast: null` is an honest gap, never a fabricated tree.
+        let ast = shoal_syntax::parse(&stored.src).ok();
+        let verdict = self.policy.evaluate_plan(&stored.principal, &stored.plan);
+        encode(json!({
+            "ast_version": AST_VERSION,
+            "ast": ast,
+            "plan_ref": stored.plan.plan_ref,
+            "effects": stored.plan.effects,
+            "reversibility": reversibility_from_effects(&stored.plan.effects),
+            "verdict": verdict_name(verdict),
+            "approval_pending": verdict == Verdict::ApprovalRequired,
+            "approved": stored.approved,
+            "src": stored.src,
+        }))
+    }
+
+    /// `plan.list` (AGENT-SURFACE §8): the open plans this session/principal
+    /// derived and can inspect (`plan.get`) or apply (`plan.apply`) — the
+    /// enumerable backing for `shoal://plan/*` in `resources/list`. Scoped the
+    /// same way `plan.get`/`plan.apply` are: a principal only ever sees its own
+    /// plans.
+    pub(crate) fn handle_plan_list(
+        self: &Arc<Self>,
+        attached: &mut Option<Attachment>,
+    ) -> Result<Json, RpcError> {
+        let attachment = attached.as_ref().ok_or_else(not_attached)?;
+        let session = &attachment.session;
+        let plans = self.plans.lock().unwrap();
+        let records: Vec<Json> = plans
+            .values()
+            .filter(|sp| sp.session == session.id && sp.principal == attachment.principal)
+            .map(|sp| {
+                let verdict = self.policy.evaluate_plan(&sp.principal, &sp.plan);
+                json!({
+                    "plan_ref": sp.plan.plan_ref,
+                    "effects": sp.plan.effects,
+                    "reversibility": reversibility_from_effects(&sp.plan.effects),
+                    "verdict": verdict_name(verdict),
+                    "approval_pending": verdict == Verdict::ApprovalRequired,
+                    "approved": sp.approved,
+                })
+            })
+            .collect();
+        encode(records)
+    }
+
     pub(crate) fn handle_plan_apply(
         self: &Arc<Self>,
         params: Json,
