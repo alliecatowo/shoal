@@ -180,29 +180,20 @@ pub(crate) fn resolve_value_path(value: &Value, path: &str) -> Result<Value, Str
 /// `Outcome`'s wire `span` (AGENT-SURFACE §2: "source span of the
 /// invocation"), honestly reported.
 ///
-/// **Always `None` today** — and that is not this function discarding a
-/// value it has in hand. `OutcomeVal` (`crates/shoal-value/src/outcome.rs`)
-/// carries no `span` field at all, so there is nothing here to forward. The
-/// span genuinely exists in scope at the moment an outcome is *constructed*
-/// — `crates/shoal-eval/src/command.rs`'s spawn path already has a `span`
-/// local at that point (it stamps the *error* path's `ErrorVal` with
-/// `.with_span(span)` a few lines above where the success-path `OutcomeVal`
-/// is built) — but it is dropped before reaching `OutcomeVal`, because
-/// `OutcomeVal` has no field to hold it.
-///
-/// Populating this honestly (rather than fabricating a plausible-looking
-/// span) needs an eval-side plumb, out of `shoal-kernel`'s lane:
-/// 1. add `pub span: Option<Span>` to `OutcomeVal` (`shoal-value`, a Tier 1
-///    crate `shoal-kernel` does not own);
-/// 2. thread the invocation's span into every `OutcomeVal { .. }`
-///    constructor (`shoal-eval/src/command.rs`'s spawn path and
-///    `shoal-eval/src/host.rs`'s `builtin_outcome`).
-///
-/// Once that lands, this becomes `o.span.map(|s| WireSpan{start:s.start,
-/// end:s.end})` and both call sites below stop being honest-null and start
-/// reporting the real thing.
-fn outcome_span(_o: &shoal_value::OutcomeVal) -> Option<WireSpan> {
-    None
+/// `OutcomeVal` (`crates/shoal-value/src/outcome.rs`) now carries an
+/// `Option<Span>`, stamped on the command spawn path
+/// (`crates/shoal-eval/src/command.rs`) with the *same* `span` the sibling
+/// error path hands to `ErrorVal::with_span` — so a command's success and
+/// failure report an identical source anchor here. Outcomes with no
+/// invocation site in scope (builtin-wrapped results, values reconstructed
+/// from the journal) carry `None`, and the wire omits the field entirely
+/// (`skip_serializing_if`) rather than fabricating one. Mirrors exactly how
+/// `wire_value` encodes `ErrorVal`'s span a few arms below.
+fn outcome_span(o: &shoal_value::OutcomeVal) -> Option<WireSpan> {
+    o.span.map(|s| WireSpan {
+        start: s.start,
+        end: s.end,
+    })
 }
 
 pub(crate) fn wire_value(value: &Value) -> WireValue {

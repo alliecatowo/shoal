@@ -37,9 +37,11 @@ natural emit point for them exists inside `shoal-kernel` itself yet — it needs
 event-forwarder hook analogous to `session.rs`'s existing `user.*` bridge.
 
 Real gaps that remain, tracked in `docs/ROADMAP.md`'s open-items list:
-- An `Outcome`'s wire `span` field is always `None` (never threaded from the spawning call;
-  `OutcomeVal` carries no field for it yet — see `wire::outcome_span`'s doc comment for exactly
-  what an eval-side plumb would need).
+- An `Outcome`'s wire `span` field is now threaded end-to-end for command spawns: `OutcomeVal`
+  carries `Option<Span>` (`shoal-value/src/outcome.rs`), stamped on `shoal-eval`'s spawn path
+  (`command.rs`) with the same span its sibling error path uses, and forwarded by
+  `wire::outcome_span`. It is still honestly omitted (`skip_serializing_if`) for outcomes with no
+  invocation site in scope — builtin-wrapped results and values reconstructed from the journal.
 - `session.transcript`/`journal`/`approval`/`render` are ring-buffered (≥1024 events per channel)
   like every other channel, but not yet *journal-backed* for replay past that ring depth — a
   subscriber that falls behind by more than the ring cap loses those events for good; recoverable

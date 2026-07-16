@@ -430,6 +430,7 @@ mod tests {
                 Value::Int(3),
             ])),
             streamed: false,
+            span: None,
         }));
         assert_eq!(call(outcome.clone(), "len", vec![]).unwrap(), Value::Int(3));
         assert_eq!(

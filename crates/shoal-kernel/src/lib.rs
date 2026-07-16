@@ -2352,24 +2352,68 @@ mod tests {
             cmd: "echo hi".into(),
             parsed: None,
             streamed: false,
+            // Genuinely spanless — mirrors a builtin-wrapped or
+            // journal-reconstructed outcome, exercising the honest-omission arm.
+            span: None,
         }))
     }
 
-    /// Fix 1 (ROADMAP #4): `OutcomeVal` (`shoal-value/src/outcome.rs`) has no
-    /// `span` field yet, so `wire_value` cannot forward one — see
-    /// `wire::outcome_span`'s doc comment for exactly why and what an
-    /// eval-side plumb would need to add. The wire's honest behavior is to
-    /// OMIT the field entirely (`skip_serializing_if`), never to fabricate a
-    /// plausible-looking span. This test pins that contract so a future
-    /// eval-side plumb is a deliberate, visible change here, not a silent
-    /// flip in either direction.
+    /// An outcome that DOES carry a source span (as the command spawn path now
+    /// stamps): `bare_outcome` plus `OutcomeVal::with_span`.
+    fn spanned_outcome(ok: bool, stdout: &[u8], span: shoal_ast::Span) -> Value {
+        let Value::Outcome(o) = bare_outcome(ok, stdout) else {
+            unreachable!()
+        };
+        let mut inner = Arc::try_unwrap(o).unwrap();
+        inner.span = Some(span);
+        Value::Outcome(Arc::new(inner))
+    }
+
+    /// Fix 1 (ROADMAP #4): `OutcomeVal` now carries `Option<Span>`, stamped on
+    /// the command spawn path with the same span the sibling error path uses
+    /// (`shoal-eval/src/command.rs`). When a span is present it must reach the
+    /// wire under the `span` key with the same `{start,end}` shape `ErrorVal`'s
+    /// span already uses. This pins the populated direction.
     #[test]
-    fn outcome_span_is_honestly_omitted_pending_an_eval_side_plumb() {
+    fn outcome_span_reaches_the_wire_when_stamped() {
+        let wire = wire_value(&spanned_outcome(true, b"hi\n", shoal_ast::Span::new(3, 9)));
+        let json = serde_json::to_value(&wire).unwrap();
+        assert_eq!(
+            json.get("span"),
+            Some(&serde_json::json!({"start": 3, "end": 9})),
+            "a stamped span must travel on the wire: {json}"
+        );
+    }
+
+    /// The populated span survives the elision path too (the outer `Outcome`
+    /// wrapper carries its fields through even when `.out` is elided).
+    #[test]
+    fn outcome_span_reaches_the_wire_through_elision_too() {
+        let budget = ElideBudget::default();
+        let wire = elide_wire_value(
+            &spanned_outcome(true, b"hi\n", shoal_ast::Span::new(3, 9)),
+            "shoal://out/1",
+            &budget,
+        );
+        let json = serde_json::to_value(&wire).unwrap();
+        assert_eq!(
+            json.get("span"),
+            Some(&serde_json::json!({"start": 3, "end": 9})),
+            "{json}"
+        );
+    }
+
+    /// The honest-omission contract still holds when the span is *genuinely*
+    /// absent (builtin-wrapped / journal-reconstructed outcomes): the wire
+    /// OMITS the field entirely (`skip_serializing_if`), never null-but-present
+    /// and never a fabricated span.
+    #[test]
+    fn outcome_span_is_honestly_omitted_when_absent() {
         let wire = wire_value(&bare_outcome(true, b"hi\n"));
         let json = serde_json::to_value(&wire).unwrap();
         assert!(
             json.get("span").is_none(),
-            "span must be honestly omitted (nothing to source it from), not null-but-present: {json}"
+            "span must be honestly omitted when absent, not null-but-present: {json}"
         );
     }
 
@@ -2381,6 +2425,50 @@ mod tests {
         let wire = elide_wire_value(&bare_outcome(true, b"hi\n"), "shoal://out/1", &budget);
         let json = serde_json::to_value(&wire).unwrap();
         assert!(json.get("span").is_none(), "{json}");
+    }
+
+    /// End-to-end: an outcome produced by a REAL command exec through the
+    /// kernel carries a non-null `{start,end}` span on the wire — proof the
+    /// eval-side stamp (`command.rs`) reaches the wire boundary, not just a
+    /// hand-built `OutcomeVal`. `sh { echo hi }` spawns an external command, so
+    /// it flows through `run_argv`'s spawn path (which stamps the span), not
+    /// the builtin path (which leaves it `None`).
+    #[test]
+    fn real_command_exec_outcome_carries_a_span_on_the_wire() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        let kernel = Kernel::new();
+        let server_kernel = kernel.clone();
+        let thread = std::thread::spawn(move || server_kernel.handle_stream(server).unwrap());
+        call(
+            &mut client,
+            &mut reader,
+            1,
+            "session.attach",
+            json!({"client":{"kind":"agent","tty":false}}),
+        );
+        let exec = call(
+            &mut client,
+            &mut reader,
+            2,
+            "exec",
+            json!({"src":"sh { echo hi }"}),
+        );
+        let value = exec.result.unwrap()["value"].clone();
+        let span = &value["span"];
+        assert!(
+            span.is_object(),
+            "real command exec must carry a span object on the wire: {value}"
+        );
+        let start = span["start"].as_u64().expect("span.start");
+        let end = span["end"].as_u64().expect("span.end");
+        assert!(
+            end > start,
+            "span must cover the non-empty invocation source: {span}"
+        );
+        drop(client);
+        drop(reader);
+        thread.join().unwrap();
     }
 
     /// Fix 2 (ROADMAP #5): `cap.request`'s grant response must report the

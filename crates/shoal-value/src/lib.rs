@@ -456,6 +456,7 @@ mod tests {
                 cmd: "x".into(),
                 parsed,
                 streamed: false,
+                span: None,
             }))
         }
         // Structured `.out` → re-encoded JSON.
