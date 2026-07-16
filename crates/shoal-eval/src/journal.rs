@@ -295,21 +295,44 @@ impl Evaluator {
     /// `save`-specific pre-capture: snapshot the prior bytes of `path` if it is
     /// an existing file under an active journal.
     pub(crate) fn save_undo_pre(&mut self, path: &Value) -> Option<FsUndoPre> {
+        let target = self.value_to_path(path)?;
+        self.overwrite_undo_pre(&target)
+    }
+
+    /// Redirect (`>` / `>>`) pre-capture: identical to `save`'s — if the target
+    /// already exists, snapshot its prior bytes so an output redirect can be
+    /// reversed by `undo` exactly like `cp`/`save` (TDD §9). A brand-new target
+    /// records nothing: there is no create-inverse in [`UndoInverse`] yet, so a
+    /// `>`/`>>` that creates a file is left non-reversible (documented
+    /// follow-up), never faked. `>>` reuses the same overwrite inverse: undo
+    /// restores the full prior contents, which drops the appended bytes.
+    pub(crate) fn redirect_undo_pre(&mut self, target: &Path) -> Option<FsUndoPre> {
+        self.overwrite_undo_pre(target)
+    }
+
+    /// Core overwrite pre-capture shared by `save` and output redirects: under
+    /// an active journal + statement, if `target` is an existing file, snapshot
+    /// its prior bytes into the CAS and yield the restore inverse to record
+    /// after the write. `snapshot_prior` refuses (returns `None`) when the prior
+    /// bytes would exceed the CAS cap and be stored truncated, so a corrupt
+    /// partial-content inverse is never keyed.
+    fn overwrite_undo_pre(&mut self, target: &Path) -> Option<FsUndoPre> {
         let entry = self.current_entry?;
         self.journal.as_ref()?;
-        let target = self.value_to_path(path)?;
         if !target.is_file() {
             return None;
         }
-        let hash = self.snapshot_prior(entry, &target)?;
+        let hash = self.snapshot_prior(entry, target)?;
         Some(FsUndoPre::Overwrite {
-            path: target,
+            path: target.to_path_buf(),
             prior_hash: hash,
         })
     }
 
-    /// `save`-specific post-record: turn the snapshot into a restore inverse.
-    pub(crate) fn save_undo_post(&mut self, pre: Option<FsUndoPre>) {
+    /// Turn an overwrite snapshot into a `RestoreBytes` inverse after the write
+    /// has run. Shared by `save` and output-redirect (`>` / `>>`) writes.
+    /// Best-effort: a journaling failure never fails the caller's write.
+    pub(crate) fn overwrite_undo_post(&mut self, pre: Option<FsUndoPre>) {
         let (Some(entry), Some(FsUndoPre::Overwrite { path, prior_hash })) =
             (self.current_entry, pre)
         else {
@@ -759,6 +782,150 @@ mod tests {
         assert_eq!(std::fs::read(dir.path().join("dst")).unwrap(), b"newbytes");
         run_journaled(&mut ev, "undo").unwrap();
         assert_eq!(std::fs::read(dir.path().join("dst")).unwrap(), b"prior-dst");
+    }
+
+    #[test]
+    fn redirect_out_overwrite_records_restore_bytes_and_undo_restores() {
+        // `echo x > f` clobbers an existing file's contents exactly like `cp`,
+        // so it must record a `RestoreBytes` inverse and be reversible.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), b"original\n").unwrap();
+        let mut ev = journaled(dir.path());
+        run_journaled(&mut ev, "echo replaced > f.txt").unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("f.txt")).unwrap(),
+            b"replaced\n"
+        );
+        let rows = ev
+            .journal
+            .as_ref()
+            .unwrap()
+            .query(&JournalQuery::default())
+            .unwrap();
+        let undos = ev.journal.as_ref().unwrap().undos_for(rows[0].id).unwrap();
+        assert_eq!(undos[0].0, "restore_bytes");
+        run_journaled(&mut ev, "undo").unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("f.txt")).unwrap(),
+            b"original\n"
+        );
+    }
+
+    #[test]
+    fn redirect_append_records_restore_bytes_and_undo_restores_prior() {
+        // `>>` grows the file; undo restores the full prior contents (dropping
+        // the appended bytes) via the same overwrite `RestoreBytes` inverse.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("log.txt"), b"first\n").unwrap();
+        let mut ev = journaled(dir.path());
+        run_journaled(&mut ev, "echo second >> log.txt").unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("log.txt")).unwrap(),
+            b"first\nsecond\n"
+        );
+        let rows = ev
+            .journal
+            .as_ref()
+            .unwrap()
+            .query(&JournalQuery::default())
+            .unwrap();
+        let undos = ev.journal.as_ref().unwrap().undos_for(rows[0].id).unwrap();
+        assert_eq!(undos[0].0, "restore_bytes");
+        run_journaled(&mut ev, "undo").unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("log.txt")).unwrap(),
+            b"first\n"
+        );
+    }
+
+    #[test]
+    fn external_redirect_overwrite_records_restore_bytes_and_undo_restores() {
+        // The external-command redirect site (`command.rs`) must wrap its write
+        // too: `some-cmd > f` / `sh -c '…' > f` is reversible like a builtin's.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), b"original").unwrap();
+        let mut ev = journaled(dir.path());
+        run_journaled(&mut ev, "sh -c 'printf replaced' > f.txt").unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("f.txt")).unwrap(),
+            b"replaced"
+        );
+        let rows = ev
+            .journal
+            .as_ref()
+            .unwrap()
+            .query(&JournalQuery::default())
+            .unwrap();
+        let undos = ev.journal.as_ref().unwrap().undos_for(rows[0].id).unwrap();
+        assert_eq!(undos[0].0, "restore_bytes");
+        run_journaled(&mut ev, "undo").unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("f.txt")).unwrap(),
+            b"original"
+        );
+    }
+
+    #[test]
+    fn redirect_to_new_file_records_no_inverse() {
+        // A redirect that CREATES a new file has no reversible inverse yet:
+        // `UndoInverse` carries no create/delete variant, so create-new is left
+        // non-reversible (documented follow-up) rather than faked.
+        let dir = tempfile::tempdir().unwrap();
+        let mut ev = journaled(dir.path());
+        run_journaled(&mut ev, "echo fresh > new.txt").unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("new.txt")).unwrap(),
+            b"fresh\n"
+        );
+        let rows = ev
+            .journal
+            .as_ref()
+            .unwrap()
+            .query(&JournalQuery::default())
+            .unwrap();
+        let undos = ev.journal.as_ref().unwrap().undos_for(rows[0].id).unwrap();
+        assert!(
+            undos.is_empty(),
+            "create-new redirect must not fake an inverse; got {undos:?}"
+        );
+        let err = run_journaled(&mut ev, "undo").unwrap_err();
+        assert!(err.msg.contains("nothing to undo"), "{}", err.msg);
+    }
+
+    #[test]
+    fn redirect_overwrite_larger_than_cap_records_no_reversible_inverse() {
+        // The truncation guard applies to redirects too: prior contents that
+        // exceed the CAS cap would snapshot truncated, so `snapshot_prior`
+        // refuses and no replayable `RestoreBytes` is keyed — undo can never
+        // overwrite the file with corrupt partial bytes.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| dir.path().to_path_buf());
+        std::fs::write(root.join("f.txt"), vec![b'a'; 500]).unwrap();
+        let mut ev = Evaluator::new(root.clone());
+        ev.set_journal(
+            Journal::in_memory_with_options(JournalOptions {
+                output_hard_cap: 128,
+                ..Default::default()
+            })
+            .unwrap(),
+            "s1",
+            "human",
+        );
+        run_journaled(&mut ev, "echo small > f.txt").unwrap();
+        let rows = ev
+            .journal
+            .as_ref()
+            .unwrap()
+            .query(&JournalQuery::default())
+            .unwrap();
+        let undos = ev.journal.as_ref().unwrap().undos_for(rows[0].id).unwrap();
+        assert!(
+            undos.is_empty(),
+            "a truncated prior snapshot must not key a replayable inverse; got {undos:?}"
+        );
     }
 
     #[test]

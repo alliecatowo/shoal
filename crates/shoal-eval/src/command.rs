@@ -313,11 +313,24 @@ impl Evaluator {
         for r in &call.redirects {
             let target = self.arg_path(&r.target)?;
             match r.kind {
-                RedirectKind::Out => fs.write(&target, &out.stdout),
-                RedirectKind::Append => fs.append(&target, &out.stdout),
-                RedirectKind::In => Ok(()),
+                // Undo (TDD §9): an external command's `> file` / `>> file`
+                // clobbers the target's contents just like `cp` — snapshot the
+                // prior bytes first, record the restore inverse after, so
+                // `some-cmd > f` and `sh { … } > f` are reversible too.
+                RedirectKind::Out => {
+                    let undo_pre = self.redirect_undo_pre(&target);
+                    fs.write(&target, &out.stdout)
+                        .map_err(|e| ErrorVal::new("custom", e.to_string()))?;
+                    self.overwrite_undo_post(undo_pre);
+                }
+                RedirectKind::Append => {
+                    let undo_pre = self.redirect_undo_pre(&target);
+                    fs.append(&target, &out.stdout)
+                        .map_err(|e| ErrorVal::new("custom", e.to_string()))?;
+                    self.overwrite_undo_post(undo_pre);
+                }
+                RedirectKind::In => {}
             }
-            .map_err(|e| ErrorVal::new("custom", e.to_string()))?;
         }
         Ok(value)
     }
