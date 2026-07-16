@@ -5,6 +5,7 @@ use std::fs;
 use std::io;
 use std::io::Write as _;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
@@ -15,16 +16,28 @@ use crate::{Journal, hex_bytes, io_to_sql, now_ns};
 const ZSTD_LEVEL: i32 = 3;
 
 const DEFAULT_OUTPUT_HARD_CAP: usize = 256 * 1024 * 1024;
+/// Default SQLite `busy_timeout`: how long a writer blocks waiting for a
+/// competing writer's lock before giving up with `SQLITE_BUSY`. The journal is
+/// shared across processes (REPL + kernel + shoal-history all open the same
+/// state dir), and the journaling call sites deliberately swallow errors, so a
+/// zero timeout — rusqlite's default — silently drops a concurrent write *and*
+/// its undo inverse. Five seconds comfortably covers a single-statement WAL
+/// commit under contention.
+const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const TRUNCATION_MARKER: &[u8] = b"\n[shoal: output truncated; see journal metadata]\n";
 
 #[derive(Debug, Clone, Copy)]
 pub struct JournalOptions {
     pub output_hard_cap: usize,
+    /// How long a write blocks on a busy database before failing (see
+    /// [`DEFAULT_BUSY_TIMEOUT`]). Applied on every connection at open time.
+    pub busy_timeout: Duration,
 }
 impl Default for JournalOptions {
     fn default() -> Self {
         Self {
             output_hard_cap: DEFAULT_OUTPUT_HARD_CAP,
+            busy_timeout: DEFAULT_BUSY_TIMEOUT,
         }
     }
 }
@@ -57,6 +70,23 @@ impl Journal {
     /// file. The blob is written atomically (temp file + rename) before the row
     /// insert; a crash in between leaves at worst an unreferenced blob for GC.
     pub fn record_output(&self, id: i64, kind: &str, bytes: &[u8]) -> rusqlite::Result<String> {
+        self.record_output_meta(id, kind, bytes).map(|(hex, _)| hex)
+    }
+
+    /// Like [`Journal::record_output`], but also returns the [`OutputMeta`]
+    /// describing the stored blob when it was **truncated** to fit
+    /// `output_hard_cap` (`None` when the bytes were stored whole).
+    ///
+    /// Callers that must not silently persist a truncated blob — undo snapshots
+    /// above all, where the returned hash keys a replayable `RestoreBytes`
+    /// inverse — use this to detect truncation and refuse rather than record a
+    /// restore that would overwrite the user's file with partial+marker bytes.
+    pub fn record_output_meta(
+        &self,
+        id: i64,
+        kind: &str,
+        bytes: &[u8],
+    ) -> rusqlite::Result<(String, Option<OutputMeta>)> {
         let (stored, meta) = if bytes.len() > self.output_hard_cap {
             let marker_len = TRUNCATION_MARKER.len().min(self.output_hard_cap);
             let keep = self.output_hard_cap.saturating_sub(marker_len);
@@ -99,13 +129,19 @@ impl Journal {
                 meta_json
             ],
         )?;
-        Ok(hex)
+        Ok((hex, meta))
     }
 
     /// Fetch and decompress a CAS blob by its blake3 hex hash.
     ///
     /// Returns `Ok(None)` when the blob does not exist (including malformed hash
     /// strings, which cannot name a blob).
+    ///
+    /// The store is content-addressed, so the decompressed bytes are re-hashed
+    /// and checked against the requested key before being returned. A mismatch
+    /// (on-disk corruption / bit-rot / a swapped blob) is an integrity error
+    /// rather than wrong bytes — this defends `undo` (`RestoreBytes`) and
+    /// `blob.get` from ever acting on tampered content.
     pub fn read_blob(&self, hash: &str) -> rusqlite::Result<Option<Vec<u8>>> {
         // A hash that is not plain hex (or is too short to shard) cannot address
         // a blob; this also guards against path traversal.
@@ -118,6 +154,17 @@ impl Journal {
             Err(e) => return Err(io_to_sql(e)),
         };
         let bytes = zstd::decode_all(compressed.as_slice()).map_err(io_to_sql)?;
+        // Integrity: content-addressed bytes MUST re-hash to their key.
+        if !blake3::hash(&bytes)
+            .to_hex()
+            .as_str()
+            .eq_ignore_ascii_case(hash)
+        {
+            return Err(io_to_sql(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("CAS blob {hash} failed integrity check: content hash mismatch"),
+            )));
+        }
         if let Ok(raw) = hex_bytes(hash) {
             self.conn.execute(
                 "UPDATE blob SET last_access_ns=?1 WHERE hash=?2",

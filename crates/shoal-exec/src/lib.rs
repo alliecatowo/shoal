@@ -36,10 +36,49 @@ mod which;
 use std::ffi::OsString;
 use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub use cancel::CancelToken;
 pub use capture::{StreamingChild, spawn_capture};
 pub use which::which;
+
+/// Default hard cap on the bytes buffered in memory when capturing a command's
+/// output in value position (TDD §317). Once a captured buffer reaches this
+/// size it stops growing and [`ExecResult::truncated`] is set. 64 MiB is high
+/// enough that ordinary command output is never affected, yet low enough that
+/// `let x = (yes)` / `let x = (cat /dev/zero)` cannot OOM the shell.
+///
+/// The full §317 promise (spill to CAS past this cap and expose the overflow as
+/// a ref) is a documented follow-up; this is the safe minimum: bound the RAM.
+pub const DEFAULT_CAPTURE_HARD_CAP: usize = 64 * 1024 * 1024;
+
+/// `0` sentinel = not yet resolved; the first [`capture_hard_cap`] call seeds it
+/// from the `SHOAL_CAPTURE_CAP_BYTES` env var (a positive integer) or the
+/// default, so the cap is configurable without an API/ABI change to `ExecSpec`.
+static CAPTURE_HARD_CAP: AtomicUsize = AtomicUsize::new(0);
+
+/// The active in-memory capture hard cap in bytes (see
+/// [`DEFAULT_CAPTURE_HARD_CAP`]). Resolved once from `SHOAL_CAPTURE_CAP_BYTES`
+/// or the default, unless overridden by [`set_capture_hard_cap`].
+pub fn capture_hard_cap() -> usize {
+    let cached = CAPTURE_HARD_CAP.load(Ordering::Relaxed);
+    if cached != 0 {
+        return cached;
+    }
+    let resolved = std::env::var("SHOAL_CAPTURE_CAP_BYTES")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_CAPTURE_HARD_CAP);
+    CAPTURE_HARD_CAP.store(resolved, Ordering::Relaxed);
+    resolved
+}
+
+/// Override the in-memory capture hard cap (bytes). For hosts wiring config and
+/// for tests; `0` is clamped to `1` so the cap is always positive.
+pub fn set_capture_hard_cap(bytes: usize) {
+    CAPTURE_HARD_CAP.store(bytes.max(1), Ordering::Relaxed);
+}
 
 /// A fully-resolved request to execute one external process.
 #[derive(Debug, Clone)]
@@ -108,6 +147,12 @@ pub struct ExecResult {
     pub stdout: Vec<u8>,
     /// Captured bytes (PtyTee: empty — stderr is merged into the pty stream).
     pub stderr: Vec<u8>,
+    /// `true` when captured output hit the in-memory hard cap
+    /// ([`capture_hard_cap`]) and was truncated: the buffered `stdout`/`stderr`
+    /// (or the PtyTee `stdout`) is a prefix of what the child actually produced.
+    /// The child still ran to completion and, for PtyTee, the real terminal saw
+    /// the full stream — only the returned buffer is bounded.
+    pub truncated: bool,
     /// Wall-clock time from spawn to reap.
     pub dur: std::time::Duration,
     /// The child's process id (also its process-group id).

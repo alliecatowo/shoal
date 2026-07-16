@@ -333,12 +333,24 @@ impl Evaluator {
     /// Read a file's current bytes and store them in the CAS, returning the
     /// blake3 hash to key an undo restore on. The output row keeps the blob
     /// referenced (safe from GC).
+    ///
+    /// Returns `None` when the snapshot could not be recorded *faithfully*: a
+    /// file larger than the journal's `output_hard_cap` would be stored
+    /// truncated (partial bytes + a truncation marker), and keying a replayable
+    /// `RestoreBytes` inverse on that hash would make `undo` silently overwrite
+    /// the user's file with corrupt, partial content. Refusing the snapshot
+    /// leaves the op non-reversible — the correct, honest failure.
     fn snapshot_prior(&self, entry: i64, path: &Path) -> Option<String> {
         let bytes = self.fs.read(path).ok()?;
-        self.journal
+        let (hash, meta) = self
+            .journal
             .as_ref()?
-            .record_output(entry, "undo-snapshot", &bytes)
-            .ok()
+            .record_output_meta(entry, "undo-snapshot", &bytes)
+            .ok()?;
+        if meta.is_some_and(|m| m.truncated) {
+            return None;
+        }
+        Some(hash)
     }
 
     /// Resolve a command's non-flag args to absolute paths, but only when every
@@ -584,7 +596,7 @@ fn entry_row_record(e: &shoal_journal::EntryRow) -> Record {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shoal_journal::Journal;
+    use shoal_journal::{Journal, JournalOptions};
 
     /// Build a journaled evaluator rooted at `cwd` with an in-memory journal.
     ///
@@ -682,6 +694,57 @@ mod tests {
             std::fs::read(dir.path().join("f.txt")).unwrap(),
             b"original"
         );
+    }
+
+    /// FIX 2: when the prior contents exceed the journal's `output_hard_cap`,
+    /// the undo snapshot would be stored truncated (partial bytes + marker).
+    /// `snapshot_prior` must refuse to record a replayable `RestoreBytes`
+    /// inverse in that case, so `undo` can never restore corrupt partial content
+    /// over the user's file. The op is simply left non-reversible.
+    #[test]
+    fn overwrite_larger_than_cap_records_no_reversible_inverse() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| dir.path().to_path_buf());
+        // Prior contents (500 bytes) exceed the 128-byte cap → snapshot truncates.
+        std::fs::write(root.join("f.txt"), vec![b'a'; 500]).unwrap();
+        let mut ev = Evaluator::new(root.clone());
+        ev.set_journal(
+            Journal::in_memory_with_options(JournalOptions {
+                output_hard_cap: 128,
+                ..Default::default()
+            })
+            .unwrap(),
+            "s1",
+            "human",
+        );
+
+        run_journaled(&mut ev, r#"save("f.txt", "small-replacement")"#).unwrap();
+        assert_eq!(
+            std::fs::read(root.join("f.txt")).unwrap(),
+            b"small-replacement"
+        );
+
+        // No restore_bytes inverse was recorded for the truncated snapshot.
+        let rows = ev
+            .journal
+            .as_ref()
+            .unwrap()
+            .query(&JournalQuery::default())
+            .unwrap();
+        let undos = ev.journal.as_ref().unwrap().undos_for(rows[0].id).unwrap();
+        assert!(
+            undos.is_empty(),
+            "a truncated snapshot must not key a replayable inverse; got {undos:?}"
+        );
+
+        // And `undo` therefore has nothing to restore — it never writes the
+        // truncated+marker bytes over the file.
+        let err = run_journaled(&mut ev, "undo").unwrap_err();
+        assert_eq!(err.code, "custom", "{}", err.msg);
+        assert!(err.msg.contains("nothing to undo"), "{}", err.msg);
     }
 
     #[test]

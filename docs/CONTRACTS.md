@@ -126,12 +126,20 @@ pub struct ExecResult {
     pub signal: Option<String>,  // Some("SIGSEGV") etc. on signal death (never 128+n encoding)
     pub stdout: Vec<u8>,         // captured bytes (PtyTee: the teed merged stream)
     pub stderr: Vec<u8>,         // captured bytes (PtyTee: empty)
+    pub truncated: bool,         // captured buffer hit capture_hard_cap() and was truncated (TDD §317);
+                                 // stdout/stderr is a prefix — child still ran, PtyTee terminal saw all
     pub dur: std::time::Duration,
     pub pid: u32,
     pub enforcement: Option<shoal_leash::EnforcementStatus>,  // Some iff sandbox was requested: the tier
                                                               // ACTUALLY applied (TDD §8 tier honesty) —
                                                               // never `enforced: true` unless it really was
 }
+
+// Configurable in-memory cap on value-position capture (TDD §317). Default 64 MiB; env override
+// SHOAL_CAPTURE_CAP_BYTES; set_capture_hard_cap for hosts/tests. Bounds RAM so `let x = (yes)` can't OOM.
+pub const DEFAULT_CAPTURE_HARD_CAP: usize;
+pub fn capture_hard_cap() -> usize;
+pub fn set_capture_hard_cap(bytes: usize);
 
 #[derive(Clone, Default)]
 pub struct CancelToken(/* private */);
@@ -211,13 +219,23 @@ pub struct JournalQuery {
     pub limit: usize,              // 0 = default 100
 }
 
+// JournalOptions { output_hard_cap: usize (default 256 MiB), busy_timeout: Duration (default 5s) }.
+// busy_timeout is applied on every connection at open: the journal is shared across processes, and
+// the journaling call sites swallow errors, so a 0 timeout silently drops a concurrent write + inverse.
 impl Journal {
     pub fn open(state_dir: &Path) -> rusqlite::Result<Journal>; // creates <dir>/journal.db (WAL) + <dir>/cas/
+    pub fn open_with_options(state_dir: &Path, options: JournalOptions) -> rusqlite::Result<Journal>;
     pub fn in_memory() -> rusqlite::Result<Journal>;            // CAS in a temp dir
+    pub fn in_memory_with_options(options: JournalOptions) -> rusqlite::Result<Journal>;
     pub fn append(&self, e: &EntryRecord) -> rusqlite::Result<i64>;
     pub fn finish(&self, id: i64, status: Option<i32>, ok: bool, dur_ns: i64) -> rusqlite::Result<()>;
     /// Store bytes in CAS (zstd), link to entry. kind: "stdout" | "stderr" | "value" | "render" | "undo-snapshot". Returns blake3 hex.
     pub fn record_output(&self, id: i64, kind: &str, bytes: &[u8]) -> rusqlite::Result<String>;
+    /// As record_output, but also returns Some(OutputMeta) when the blob was truncated to output_hard_cap
+    /// (None when stored whole). Undo snapshots use this to refuse keying a replayable inverse on partial bytes.
+    pub fn record_output_meta(&self, id: i64, kind: &str, bytes: &[u8]) -> rusqlite::Result<(String, Option<OutputMeta>)>;
+    /// Content-addressed read: decompressed bytes are re-hashed against `hash`; a mismatch (corruption/bit-rot)
+    /// is an integrity Err, never wrong bytes. Ok(None) only when the blob is absent / hash is malformed.
     pub fn read_blob(&self, hash: &str) -> rusqlite::Result<Option<Vec<u8>>>;
     pub fn query(&self, q: &JournalQuery) -> rusqlite::Result<Vec<EntryRow>>;
     /// Record an undo inverse for an entry (op: "trash", "restore_bytes", ...; inverse: JSON).

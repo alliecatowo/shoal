@@ -718,6 +718,7 @@ fn ttl_collects_referenced_blob_but_metadata_survives() {
 fn output_truncation_is_explicit_in_bytes_and_metadata() {
     let j = Journal::in_memory_with_options(JournalOptions {
         output_hard_cap: 128,
+        ..Default::default()
     })
     .unwrap();
     let id = j.append(&rec("s", "human", 1, "loud")).unwrap();
@@ -760,4 +761,95 @@ fn blob_access_refreshes_lru_timestamp() {
         )
         .unwrap();
     assert!(access > 1);
+}
+
+#[test]
+fn read_blob_rejects_corrupted_content() {
+    // FIX 3: reads are integrity-verified. Store a genuine blob, then overwrite
+    // its on-disk .zst with a *valid* zstd stream of DIFFERENT bytes (a swap /
+    // bit-rot that still decompresses cleanly). read_blob must refuse it rather
+    // than hand back the wrong content to `undo`/`blob.get`.
+    let j = Journal::in_memory().unwrap();
+    let id = j.append(&rec("s", "human", 1, "echo")).unwrap();
+    let hash = j.record_output(id, "stdout", b"genuine payload").unwrap();
+    assert_eq!(j.read_blob(&hash).unwrap().unwrap(), b"genuine payload");
+
+    let forged = zstd::encode_all(&b"tampered payload"[..], 3).unwrap();
+    fs::write(j.blob_path(&hash), forged).unwrap();
+
+    let err = j.read_blob(&hash);
+    assert!(
+        err.is_err(),
+        "a content-hash mismatch must be an integrity error, got {err:?}"
+    );
+    assert!(
+        format!("{:?}", err.unwrap_err()).contains("integrity"),
+        "error should name the integrity failure"
+    );
+}
+
+#[test]
+fn busy_timeout_zero_fails_fast_on_contended_write() {
+    // FIX 3 baseline / FIX 1 rationale: with busy_timeout = 0 (rusqlite's
+    // default), a write that meets a held writer lock fails immediately with
+    // SQLITE_BUSY — which the journaling call sites swallow, silently dropping
+    // the entry. This proves the failure mode the default timeout guards.
+    let dir = tempfile::tempdir().unwrap();
+    let writer = Journal::open_with_options(
+        dir.path(),
+        JournalOptions {
+            busy_timeout: std::time::Duration::ZERO,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    // A second connection grabs the write lock and holds it for the whole test.
+    let blocker = rusqlite::Connection::open(dir.path().join("journal.db")).unwrap();
+    blocker.busy_timeout(std::time::Duration::ZERO).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+    let res = writer.append(&rec("s", "human", 1, "echo dropped"));
+    assert!(
+        res.is_err(),
+        "a zero busy_timeout must fail fast against a held write lock"
+    );
+    blocker.execute_batch("ROLLBACK").unwrap();
+}
+
+#[test]
+fn busy_timeout_lets_a_blocked_writer_wait_instead_of_dropping() {
+    // FIX 1: a non-zero busy_timeout makes a contended writer WAIT for the lock
+    // rather than drop its entry. A held lock is released after a short delay;
+    // the write must then land (with timeout = 0 it would have errored, per the
+    // test above).
+    let dir = tempfile::tempdir().unwrap();
+    let writer = Journal::open_with_options(
+        dir.path(),
+        JournalOptions {
+            busy_timeout: std::time::Duration::from_secs(10),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let blocker = rusqlite::Connection::open(dir.path().join("journal.db")).unwrap();
+    blocker
+        .busy_timeout(std::time::Duration::from_secs(10))
+        .unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+    // Release the lock after a delay; the append below is already waiting on it.
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        blocker.execute_batch("COMMIT").unwrap();
+    });
+
+    let id = writer
+        .append(&rec("s", "human", 1, "echo survived"))
+        .expect("busy_timeout should let the write wait for the lock, not drop it");
+    releaser.join().unwrap();
+
+    let rows = writer.query(&JournalQuery::default()).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, id);
+    assert_eq!(rows[0].src, "echo survived");
 }

@@ -293,11 +293,17 @@ pub(crate) fn run_pty(mut spec: ExecSpec, cancel: &CancelToken) -> io::Result<Ex
     }
 
     // Output pump: master → tee buffer, plus raw passthrough to the real
-    // terminal when there is one.
+    // terminal when there is one. The tee buffer is bounded to the capture hard
+    // cap (TDD §317) so a runaway child can't OOM the shell; the real terminal
+    // still receives the full, unbounded stream — only the returned buffer is
+    // capped, and `tee_truncated` records when overflow was dropped.
+    let cap = crate::capture_hard_cap();
     let tee: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let tee_truncated = Arc::new(AtomicBool::new(false));
     let pump_done = Arc::new(AtomicBool::new(false));
     let pump = {
         let tee = Arc::clone(&tee);
+        let tee_truncated = Arc::clone(&tee_truncated);
         let pump_done = Arc::clone(&pump_done);
         let mut passthrough = if stdout_is_tty { dup_stdout() } else { None };
         thread::spawn(move || {
@@ -306,7 +312,18 @@ pub(crate) fn run_pty(mut spec: ExecSpec, cancel: &CancelToken) -> io::Result<Ex
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
-                        tee.lock().expect("tee lock").extend_from_slice(&buf[..n]);
+                        {
+                            let mut tee = tee.lock().expect("tee lock");
+                            if tee.len() < cap {
+                                let take = (cap - tee.len()).min(n);
+                                tee.extend_from_slice(&buf[..take]);
+                                if take < n {
+                                    tee_truncated.store(true, Ordering::SeqCst);
+                                }
+                            } else {
+                                tee_truncated.store(true, Ordering::SeqCst);
+                            }
+                        }
                         if let Some(out) = passthrough.as_mut() {
                             let _ = out.write_all(&buf[..n]);
                         }
@@ -343,6 +360,7 @@ pub(crate) fn run_pty(mut spec: ExecSpec, cancel: &CancelToken) -> io::Result<Ex
     let raw_status = raw_status?;
     let (status, signal) = decode_wait_status(raw_status);
     let stdout = mem::take(&mut *tee.lock().expect("tee lock"));
+    let truncated = tee_truncated.load(Ordering::SeqCst);
     drop(child); // portable-pty child handle; already reaped via waitpid
     #[allow(clippy::cast_sign_loss)] // pids are positive
     Ok(ExecResult {
@@ -350,6 +368,7 @@ pub(crate) fn run_pty(mut spec: ExecSpec, cancel: &CancelToken) -> io::Result<Ex
         signal,
         stdout,
         stderr: Vec::new(),
+        truncated,
         dur: start.elapsed(),
         pid: pid as u32,
         enforcement,
