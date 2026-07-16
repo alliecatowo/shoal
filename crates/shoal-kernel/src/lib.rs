@@ -1669,6 +1669,226 @@ mod tests {
         thread.join().unwrap();
     }
 
+    /// AGENT-SURFACE §4 / audit gap G2: the `journal` channel is journal-backed
+    /// and replayable from ANY seq, not just the last `EVENT_RING_CAP` events.
+    /// Generate more than a full ring of journal-backed events (one finished
+    /// journal entry — hence one `journal` event — per exec), then read from a
+    /// `since` that has aged out of the in-memory ring and assert every aged-out
+    /// event comes back with the correct seq, correct scoping, and contiguous
+    /// with the events the ring still holds. Also pins the not-found (since
+    /// beyond newest) case and that the in-ring fast path is untouched.
+    #[test]
+    fn journal_channel_replays_aged_out_events_from_the_journal() {
+        let kernel = Kernel::new();
+        let (mut client, mut reader, thread) = spawn(&kernel);
+        attach(&mut client, &mut reader);
+
+        // One `journal` event per exec; overflow the ring by a clear margin.
+        let total = EVENT_RING_CAP + 40;
+        for i in 0..total {
+            let r = call(
+                &mut client,
+                &mut reader,
+                100 + i as i64,
+                "exec",
+                json!({"src":"1 + 1"}),
+            );
+            assert!(r.error.is_none(), "exec {i} failed: {:?}", r.error);
+        }
+
+        // seq 0 has aged out of the ring (only the last EVENT_RING_CAP seqs are
+        // still retained). Reading since=0 must still return every event after
+        // seq 0 — the aged-out ones rebuilt from the journal, then the ring
+        // tail — contiguous across the ring boundary.
+        let read = call(
+            &mut client,
+            &mut reader,
+            9001,
+            "events.read",
+            json!({"channel":"journal","since":0}),
+        );
+        let events = read.result.unwrap()["events"].as_array().unwrap().clone();
+        assert_eq!(
+            events.len(),
+            total - 1,
+            "since=0 (exclusive) must return every journal event after seq 0 — ring + journal \
+             fallback, not just the ring's {EVENT_RING_CAP}"
+        );
+        for (idx, ev) in events.iter().enumerate() {
+            let expected_seq = (idx + 1) as u64;
+            assert_eq!(
+                ev["seq"].as_u64().unwrap(),
+                expected_seq,
+                "seqs must be contiguous and ascending across the ring boundary: {ev}"
+            );
+            assert_eq!(ev["channel"], "journal");
+            let payload = &ev["payload"]["v"];
+            assert_eq!(payload["ok"]["v"], true, "each `1 + 1` finished ok: {ev}");
+            assert_eq!(
+                payload["head"]["v"], "1",
+                "head is the leading command word of the entry: {ev}"
+            );
+            assert_eq!(
+                payload["principal"]["v"],
+                principal(),
+                "reconstructed events keep the live channel's principal scoping: {ev}"
+            );
+            // In-memory kernel: no evaluator double-journaling, so the coarse
+            // exec entry's rowid is exactly seq+1 (first append == rowid 1 ==
+            // seq 0). Pins the seq↔journal-entry correspondence.
+            assert_eq!(
+                payload["entry_id"]["v"].as_u64().unwrap(),
+                expected_seq + 1,
+                "seq↔entry_id correspondence: {ev}"
+            );
+        }
+
+        // A `limit` still bounds the result to the newest N even when the
+        // fallback contributed older events.
+        let limited = call(
+            &mut client,
+            &mut reader,
+            9002,
+            "events.read",
+            json!({"channel":"journal","since":0,"limit":5}),
+        );
+        let limited = limited.result.unwrap()["events"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(limited.len(), 5, "limit keeps the newest 5");
+        assert_eq!(limited[4]["seq"].as_u64().unwrap(), (total - 1) as u64);
+
+        // Not-found / beyond-newest: since at or past the newest seq is empty,
+        // never an error.
+        let last_seq = (total - 1) as u64;
+        let at_newest = call(
+            &mut client,
+            &mut reader,
+            9003,
+            "events.read",
+            json!({"channel":"journal","since": last_seq}),
+        );
+        assert!(
+            at_newest.result.unwrap()["events"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "since == newest seq: nothing after it"
+        );
+        let beyond = call(
+            &mut client,
+            &mut reader,
+            9004,
+            "events.read",
+            json!({"channel":"journal","since": last_seq + 500}),
+        );
+        assert!(
+            beyond.result.unwrap()["events"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "since beyond newest seq: empty, not an error"
+        );
+
+        // Fast path untouched: a since WITHIN the ring is served from the ring
+        // alone and returns exactly the tail after it.
+        let within = last_seq - 3;
+        let tail = call(
+            &mut client,
+            &mut reader,
+            9005,
+            "events.read",
+            json!({"channel":"journal","since": within}),
+        );
+        let tail = tail.result.unwrap()["events"].as_array().unwrap().clone();
+        assert_eq!(tail.len(), 3, "since 3 below newest: exactly the last 3");
+        assert_eq!(tail[0]["seq"].as_u64().unwrap(), within + 1);
+
+        drop(client);
+        drop(reader);
+        thread.join().unwrap();
+    }
+
+    /// The journal-backed replay must reflect the `journal` CHANNEL, not every
+    /// row in the journal store. In an on-disk session the session evaluator
+    /// ALSO writes its own finer per-statement entries into the same store
+    /// (`session.rs`), but only the coarse exec-level entry fires a `journal`
+    /// event. Reconstruction keys off the seq↔entry index, so those
+    /// per-statement rows are excluded — the replay has exactly one event per
+    /// exec, not one per statement, with no phantom events and no leakage.
+    #[test]
+    fn journal_channel_replay_excludes_evaluator_per_statement_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let kernel = Kernel::open(dir.path()).unwrap();
+        let (mut client, mut reader, thread) = spawn(&kernel);
+        attach(&mut client, &mut reader);
+
+        // Three top-level statements per exec: on-disk, the store gets one
+        // coarse entry + three per-statement entries per exec, but the channel
+        // fires once per exec. Overflow the ring so replay must hit the journal.
+        let execs = EVENT_RING_CAP + 5;
+        for i in 0..execs {
+            let r = call(
+                &mut client,
+                &mut reader,
+                100 + i as i64,
+                "exec",
+                json!({"src":"let a = 1\nlet b = 2\na + b"}),
+            );
+            assert!(r.error.is_none(), "exec {i} failed: {:?}", r.error);
+        }
+
+        // Sanity: the store itself holds far more rows than the channel
+        // published (the evaluator's per-statement entries), so a naive
+        // "reconstruct every journal row" would over-produce.
+        let jq = call(
+            &mut client,
+            &mut reader,
+            9000,
+            "journal.query",
+            json!({"limit": 1_000_000}),
+        );
+        let rows = jq.result.unwrap().as_array().unwrap().len();
+        assert!(
+            rows >= execs * 3,
+            "on-disk store should also hold the finer per-statement entries: {rows} rows for \
+             {execs} execs"
+        );
+
+        // Replay from seq 0 (aged out): EXACTLY one event per exec, contiguous
+        // seqs, each the coarse whole-submission entry (head "let") — no
+        // phantom per-statement events.
+        let read = call(
+            &mut client,
+            &mut reader,
+            9001,
+            "events.read",
+            json!({"channel":"journal","since":0}),
+        );
+        let events = read.result.unwrap()["events"].as_array().unwrap().clone();
+        assert_eq!(
+            events.len(),
+            execs - 1,
+            "one journal event per exec, not per statement — evaluator rows are filtered out"
+        );
+        for (idx, ev) in events.iter().enumerate() {
+            assert_eq!(
+                ev["seq"].as_u64().unwrap(),
+                (idx + 1) as u64,
+                "contiguous seqs, no per-statement phantoms: {ev}"
+            );
+            assert_eq!(
+                ev["payload"]["v"]["head"]["v"], "let",
+                "each replayed event is the coarse exec-level entry: {ev}"
+            );
+        }
+
+        drop(client);
+        drop(reader);
+        thread.join().unwrap();
+    }
+
     #[test]
     fn subscribe_pushes_session_transcript_event_before_the_exec_response() {
         let kernel = Kernel::new();

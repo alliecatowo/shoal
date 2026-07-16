@@ -18,6 +18,21 @@ pub(crate) type SharedWriter = Arc<Mutex<UnixStream>>;
 pub(crate) struct EventBus {
     channels: Mutex<HashMap<String, ChannelBuf>>,
     subs: Mutex<Vec<Subscriber>>,
+    /// The seq↔journal-entry correspondence for the `journal` channel, the one
+    /// channel whose events are backed by durable journal rows and are
+    /// therefore replayable past the in-memory ring (AGENT-SURFACE §4). Dense
+    /// `Vec` indexed by the journal channel's `seq` (0-based, contiguous),
+    /// holding the journal `entry_id` each seq was published for. This is only
+    /// the *pointer* — the event payload (`head`/`ok`/`principal`) is
+    /// reconstructed from the journal itself, not from here, so an aged-out
+    /// `journal` event costs one `i64` of memory, not a buffered event.
+    ///
+    /// Written (under the `channels` lock, so it can never diverge from the
+    /// seqs the ring hands out) only by `publish_journal`; read by the kernel's
+    /// `read_journal_channel` fallback. Other channels never touch it — they
+    /// stay ring-only (AGENT-SURFACE §4: `user.*`/`task.{id}`/`approval`/
+    /// `render`/`session.transcript` are NOT journal-backed).
+    journal_index: Mutex<Vec<i64>>,
 }
 
 /// Ring-buffered event log for one channel.
@@ -34,7 +49,7 @@ struct Subscriber {
 }
 
 /// Ring depth per channel (AGENT-SURFACE §4 requires ≥1024).
-const EVENT_RING_CAP: usize = 1024;
+pub(crate) const EVENT_RING_CAP: usize = 1024;
 
 /// Bound on a subscriber's own outgoing queue — distinct from the per-channel
 /// ring buffer above. This is the backpressure boundary AGENT-SURFACE §6
@@ -178,6 +193,22 @@ fn spawn_subscriber_writer(queue: Arc<SubQueue>, writer: SharedWriter) {
 
 impl EventBus {
     /// Append `payload` to `channel`'s ring and enqueue it for every live
+    /// subscriber (thin wrapper over [`EventBus::publish_inner`] with no
+    /// durable-id recording — the path every non-`journal` channel takes).
+    pub(crate) fn publish(&self, channel: &str, payload: Json) -> Event {
+        self.publish_inner(channel, payload, None)
+    }
+
+    /// Publish on the `journal` channel, recording the durable `entry_id` this
+    /// event corresponds to so it can be reconstructed from the journal after
+    /// it ages out of the ring (AGENT-SURFACE §4 journal-backed replay). The
+    /// only difference from `publish` is that the seq↔`entry_id` pair is
+    /// appended to `journal_index` atomically with the seq assignment.
+    pub(crate) fn publish_journal(&self, entry_id: i64, payload: Json) -> Event {
+        self.publish_inner("journal", payload, Some(entry_id))
+    }
+
+    /// Append `payload` to `channel`'s ring and enqueue it for every live
     /// subscriber of that channel. Never blocks on a subscriber's socket:
     /// `Subscriber::queue.push` (AGENT-SURFACE §6) is a bounded, in-memory
     /// operation, and the lock held here (`subs`) guards only that push, not
@@ -185,12 +216,27 @@ impl EventBus {
     /// subscription's own dedicated writer thread (`spawn_subscriber_writer`).
     /// A stalled/slow subscriber can therefore delay at most its own
     /// delivery, never another subscriber's, and never this call.
-    pub(crate) fn publish(&self, channel: &str, payload: Json) -> Event {
+    ///
+    /// `durable_id` is `Some` only for the `journal` channel: the seq↔entry
+    /// pointer is pushed onto `journal_index` inside the same `channels`-lock
+    /// critical section that assigns `seq`, so concurrent publishes can never
+    /// interleave the index out of order relative to the seqs the ring hands
+    /// out (index position == seq, always).
+    fn publish_inner(&self, channel: &str, payload: Json, durable_id: Option<i64>) -> Event {
         let event = {
             let mut channels = self.channels.lock().unwrap();
             let buf = channels.entry(channel.to_string()).or_default();
             let seq = buf.next_seq;
             buf.next_seq += 1;
+            if let Some(entry_id) = durable_id {
+                let mut index = self.journal_index.lock().unwrap();
+                debug_assert_eq!(
+                    index.len() as u64,
+                    seq,
+                    "journal_index must stay dense and aligned with journal-channel seqs"
+                );
+                index.push(entry_id);
+            }
             let event = Event {
                 channel: channel.to_string(),
                 seq,
@@ -208,6 +254,38 @@ impl EventBus {
             sub.queue.push(event.clone());
         }
         event
+    }
+
+    /// Oldest `seq` still retained in `channel`'s ring, or `None` if the
+    /// channel has never published. Used by the journal-backed read path to
+    /// find the boundary below which events have aged out of the ring.
+    pub(crate) fn ring_oldest_seq(&self, channel: &str) -> Option<u64> {
+        self.channels
+            .lock()
+            .unwrap()
+            .get(channel)
+            .and_then(|buf| buf.ring.front().map(|e| e.seq))
+    }
+
+    /// Total number of events ever published on the `journal` channel this
+    /// process (== the channel's `next_seq`). `journal_index` has exactly one
+    /// entry per published journal event, so its length is that count.
+    pub(crate) fn journal_published_count(&self) -> u64 {
+        self.journal_index.lock().unwrap().len() as u64
+    }
+
+    /// The `(seq, entry_id)` pairs for journal-channel events whose `seq` is
+    /// strictly greater than `since` and strictly less than `upto` — i.e. the
+    /// events that a caller asked for (via `since`) but that have already aged
+    /// out of the ring (below `upto`, the ring's oldest retained seq). Returned
+    /// ascending by seq. This is the seq→entry pointer set the kernel then
+    /// resolves against the journal to rebuild the actual events.
+    pub(crate) fn journal_index_range(&self, since: Option<u64>, upto: u64) -> Vec<(u64, i64)> {
+        let index = self.journal_index.lock().unwrap();
+        let start = since.map(|s| s.saturating_add(1)).unwrap_or(0);
+        (start..upto)
+            .filter_map(|seq| index.get(seq as usize).map(|&entry_id| (seq, entry_id)))
+            .collect()
     }
 
     /// Buffered tail of `channel` from `since` (exclusive), capped at `limit`.
@@ -297,8 +375,129 @@ impl Kernel {
     ) -> Result<Json, RpcError> {
         attached.as_ref().ok_or_else(not_attached)?;
         let p: EventsReadParams = decode(params)?;
-        let events = self.events.read(&p.channel, p.since, p.limit);
+        // The `journal` channel is journal-backed: a `since` older than the
+        // ring's oldest retained seq is served from the durable journal rather
+        // than lost (AGENT-SURFACE §4). Every other channel is ring-only.
+        let events = if p.channel == "journal" {
+            self.read_journal_channel(p.since, p.limit)?
+        } else {
+            self.events.read(&p.channel, p.since, p.limit)
+        };
         encode(json!({"channel": p.channel, "events": events}))
+    }
+
+    /// Read the `journal` channel with journal-backed replay (AGENT-SURFACE §4,
+    /// audit gap G2). Events still in the in-memory ring are served from it
+    /// exactly as before (the fast path is untouched); events that have aged
+    /// out of the ring — a `since` below the ring's oldest retained seq — are
+    /// reconstructed from the durable journal so an agent can replay the
+    /// channel from ANY seq, not just the last `EVENT_RING_CAP`.
+    ///
+    /// The seq↔journal correspondence: every `journal` event's `seq` was
+    /// recorded, at publish time, against the coarse exec-level journal
+    /// `entry_id` it announced (`EventBus::journal_index`). Reconstruction
+    /// resolves each aged-out seq to its `entry_id` through that index, then
+    /// rebuilds the `{entry_id, head, ok, principal}` payload from the journal
+    /// row itself — so the *pointer* lives in memory (one `i64` per event) but
+    /// the *payload* is journal-backed and durable. Using the index as the
+    /// membership set is also what keeps reconstruction faithful in on-disk
+    /// sessions, where the session evaluator ALSO writes its own finer
+    /// per-statement entries into the same store (`session.rs`): those rows
+    /// were never published on this channel, so they are excluded because their
+    /// ids are not in the index.
+    fn read_journal_channel(
+        self: &Arc<Self>,
+        since: Option<u64>,
+        limit: Option<usize>,
+    ) -> Result<Vec<Event>, RpcError> {
+        // Nothing published yet, or `since` at/after the newest seq: the ring
+        // already answers correctly (empty), and there is nothing older to
+        // reconstruct. This also covers the not-found/beyond-newest case.
+        let published = self.events.journal_published_count();
+        if published == 0 || since.is_some_and(|s| s.saturating_add(1) >= published) {
+            return Ok(self.events.read("journal", since, None));
+        }
+        let mut out: Vec<Event> = Vec::new();
+        // Reconstruct the gap below the ring, if `since` reaches into it.
+        if let Some(oldest) = self.events.ring_oldest_seq("journal") {
+            let want = self.events.journal_index_range(since, oldest);
+            if !want.is_empty() {
+                out = self.reconstruct_journal_events(&want)?;
+            }
+        }
+        // Then the ring tail (fast path, byte-for-byte as before).
+        out.extend(self.events.read("journal", since, None));
+        // Mirror `EventBus::read`'s limit semantics: keep the newest `limit`.
+        if let Some(limit) = limit
+            && out.len() > limit
+        {
+            out = out.split_off(out.len() - limit);
+        }
+        Ok(out)
+    }
+
+    /// Rebuild `journal` events for the given ascending `(seq, entry_id)`
+    /// pairs by reading their rows from the durable journal. One query pulls
+    /// the journal history; rows are indexed by id and only the requested ids
+    /// (the coarse exec-level entries this channel published) are kept — the
+    /// evaluator's per-statement rows present in on-disk stores are filtered
+    /// out because they are absent from `want`.
+    ///
+    /// This is the cold fallback path (a subscriber that fell behind by more
+    /// than `EVENT_RING_CAP`), not the hot path, so a single wide query +
+    /// in-memory filter is deliberately favored over machinery the journal
+    /// crate does not expose today (a targeted `entries_by_id` fetch would let
+    /// this pull only the needed rows — a clean follow-up once shoal-journal
+    /// grows one).
+    fn reconstruct_journal_events(
+        self: &Arc<Self>,
+        want: &[(u64, i64)],
+    ) -> Result<Vec<Event>, RpcError> {
+        let by_id: HashMap<i64, u64> = want.iter().map(|&(seq, id)| (id, seq)).collect();
+        let rows = {
+            let journal = self.journal.lock().unwrap();
+            journal
+                .query(&JournalQuery {
+                    // Fetch the whole history (SQLite `LIMIT -1`); we keep only
+                    // the ids in `want`. Journals are GC-bounded and this runs
+                    // only on the cold replay path.
+                    limit: usize::MAX,
+                    ..Default::default()
+                })
+                .map_err(internal)?
+        };
+        // seq -> event, so we can emit strictly ascending by seq afterwards.
+        let mut found: HashMap<u64, Event> = HashMap::new();
+        for row in rows {
+            let Some(&seq) = by_id.get(&row.id) else {
+                continue;
+            };
+            let ok = row.ok.unwrap_or(false);
+            found.insert(
+                seq,
+                Event {
+                    channel: "journal".to_string(),
+                    seq,
+                    // The journal records the entry's start (`ts_ns`) and, once
+                    // finished, its duration; the live event fired at finish, so
+                    // start + duration is the faithful reconstruction of that
+                    // instant (falls back to start for the degenerate no-dur
+                    // case). Consumers dedup by seq, never by ts.
+                    ts: row.ts_ns.saturating_add(row.dur_ns.unwrap_or(0)),
+                    payload: journal_event(row.id, &row.src, ok, &row.principal),
+                },
+            );
+        }
+        // Emit in ascending seq order, contiguous with the ring tail. A seq in
+        // `want` with no journal row (its entry GC'd out from under the index)
+        // is simply skipped — the gap is honest, not fabricated.
+        let mut events: Vec<Event> = Vec::with_capacity(want.len());
+        for &(seq, _) in want {
+            if let Some(event) = found.remove(&seq) {
+                events.push(event);
+            }
+        }
+        Ok(events)
     }
 
     pub(crate) fn handle_events_publish(
