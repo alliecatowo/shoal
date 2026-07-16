@@ -141,6 +141,8 @@ shoal://journal                    query root (template: ?since,head,principal,o
 shoal://journal/entry/{id}         one entry: src, canonical AST, effects, outputs (hashes)
 shoal://plan/{ref}                 a derived plan: effects, reversibility, verdict
 shoal://session/cwd|env|reef       session state views (env NAMES only unless granted)
+shoal://pty                        open interactive PTY sessions (session-scoped; == pty.list)
+shoal://pty/{id}                   one PTY session's rendered screen (== pty.read)
 shoal://events/{channel}           event channel, cursor-read (?since=seq)
 ```
 
@@ -245,6 +247,7 @@ shoal_pty_send  {pty_id, input}                    → {pty_id, sent}          (
 shoal_pty_read  {pty_id}                            → {cols, rows, cursor, screen:[rows], changed, alive, exit}
 shoal_pty_resize{pty_id, cols, rows}               → {pty_id, cols, rows}
 shoal_pty_close {pty_id}                            → {pty_id, closed:true, exit}
+shoal_pty_list  {}                                  → {ptys:[{pty_id, cmd, pid, cols, rows, alive}]}
 ```
 
 Kernel JSON-RPC keeps the TDD §7 method set (`session.attach`, `parse`, `exec`, `plan.apply`,
@@ -252,7 +255,10 @@ Kernel JSON-RPC keeps the TDD §7 method set (`session.attach`, `parse`, `exec`,
 `events.read {channel, since, limit}` and `events.publish {channel, payload}` (user channels
 only), and the read-side introspection methods backing the §1 resource roots: `session.env` /
 `session.reef` (the `shoal://session/env|reef` views), `plan.get {plan_ref}` /
-`plan.list` (the `shoal://plan/{ref}` view + its enumeration). `session.attach` result gains
+`plan.list` (the `shoal://plan/{ref}` view + its enumeration), and `pty.list {}` → `{ptys:
+[{pty_id, cmd, pid, cols, rows, alive}]}` (the `shoal://pty` view — the open interactive PTY
+sessions for the ATTACHED session only, scoped exactly like `task.list`; `shoal://pty/{id}` reads
+one session's rendered screen through `pty.read`). `session.attach` result gains
 `{caps_enforced: bool, ast_version, elide_defaults, channels: [names]}` so a client learns, at
 attach time, whether the wall is real (TDD §8 tier honesty) and what it may subscribe to.
 
@@ -305,12 +311,13 @@ on channel("deploy") { ev => … }      → register a handler (desugars to .eve
 
 ## 8. MCP resource mechanics
 
-`resources/list` enumerates the stable roots (§1) — `journal`, `jobs`, `session/cwd|env|reef` —
-plus per-session dynamic entries (open tasks, open plans). `resources/read` on a value URI returns
+`resources/list` enumerates the stable roots (§1) — `journal`, `jobs`, `session/cwd|env|reef`,
+`pty` — plus per-session dynamic entries (open tasks, open plans, open ptys — each open
+`shoal://pty/{id}` becomes a live resource). `resources/read` on a value URI returns
 `structuredContent` = the `$`-tagged (or elided) value; on an events URI returns the buffered tail.
 `resources/templates/list` advertises the query-parameterized forms (`shoal://journal{?since,head,
 limit}`, `shoal://out/{n}{?path,slice,format}`, `shoal://task/{id}/out{?path,slice,format}`,
-`shoal://plan/{ref}`, `shoal://session/{view}`). Every `tools/call` result that produces a value
+`shoal://plan/{ref}`, `shoal://session/{view}`, `shoal://pty/{id}`). Every `tools/call` result that produces a value
 includes a `resource_link` to its ref so the agent can drill in later for zero tokens — the tool
 result in context stays a one-line render + the ref, never the payload.
 
@@ -408,7 +415,15 @@ pty.send   {pty_id, input}                    → {pty_id, sent}
 pty.read   {pty_id}                            → rendered screen (below)
 pty.resize {pty_id, cols, rows}               → {pty_id, cols, rows}
 pty.close  {pty_id}                            → {pty_id, closed:true, exit}
+pty.list   {}                                  → {ptys:[{pty_id, cmd, pid, cols, rows, alive}]}
 ```
+
+`pty.list` makes open ptys **first-class** on the surface — discoverable and drill-in-able the way
+an exec'd value is — and is session-scoped exactly like the drive verbs: it returns ONLY the
+attached session's open ptys, never another session's. It backs the `shoal://pty` resource root
+(the list) and `shoal://pty/{id}` (one session's rendered screen, the same shape `pty.read`
+returns; a closed/unknown id is a clean `UNKNOWN_PTY` not-found). It is screen-free by design (a
+small enumeration, never a wall of grids) — an agent lists, then drills into one screen.
 
 Defaults are 80×24; `cols`/`rows` are clamped to `1..=1000` so a read is always ≤ `cols×rows`
 cells — the screen is bounded by construction, the way every other payload on this surface is
@@ -459,11 +474,16 @@ from "it's still redrawing." `alive`/`exit` report the child's fate; once it exi
 it opportunistically so a self-terminating program (an installer that finishes) is observed as
 `alive:false` with its exit code, without an explicit close.
 
-**Status.** `open`/`send`/`read`/`resize`/`close` are wired end-to-end (kernel `dispatch` +
-`shoal-mcp` tools), proven by `crates/shoal-mcp/tests/live_kernel.rs`
-(`mcp_pty_drive_cat_reads_rendered_screen_then_closes_and_reaps`): a real kernel over a real socket
-opens `cat`, sends text + a named `Enter`, reads the echoed line off the rendered screen at a moved
-cursor, closes, and asserts the child pid is reaped (no leak). Documented follow-ups (not yet
-wired): a **`pty.{id}.screen` push event** so a live UI/subscriber sees frames as they change rather
-than polling `pty.read`; a `pty.list` enumerator + `shoal://pty/{id}` resource root; and an
-**in-language** surface (`interact`-style handle usable from evaluated source, not just the wire).
+**Status.** `open`/`send`/`read`/`resize`/`close`/`list` are wired end-to-end (kernel `dispatch` +
+`shoal-mcp` tools + the `shoal://pty` / `shoal://pty/{id}` resource roots), proven by
+`crates/shoal-mcp/tests/live_kernel.rs`
+(`mcp_pty_drive_cat_reads_rendered_screen_then_closes_and_reaps` and
+`mcp_pty_list_and_resources_track_open_sessions`): a real kernel over a real socket opens `cat`,
+sends text + a named `Enter`, reads the echoed line off the rendered screen at a moved cursor, then
+lists the open ptys, drills into `shoal://pty/{id}`'s rendered screen, closes, and asserts both the
+child pid is reaped (no leak) and the pty leaves `pty.list` (its screen resource then a clean
+not-found). `pty.list`'s session-scoping is additionally pinned by
+`shoal-kernel`'s `pty_list_is_session_scoped` unit test. Documented follow-ups (not yet wired): a
+**`pty.{id}.screen` push event** so a live UI/subscriber sees frames as they change rather than
+polling `pty.read` (needs the `shoal-exec` reader thread to publish into the kernel `EventBus`); and
+an **in-language** surface (`interact`-style handle usable from evaluated source, not just the wire).

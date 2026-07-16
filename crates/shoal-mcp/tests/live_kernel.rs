@@ -846,3 +846,129 @@ fn mcp_pty_drive_cat_reads_rendered_screen_then_closes_and_reaps() {
         "reading a closed pty is an error: {after}"
     );
 }
+
+/// AGENT-SURFACE §10 (`pty.list` / `shoal://pty` + `shoal://pty/{id}`): open
+/// PTY sessions are first-class on the agent surface — discoverable via the
+/// `shoal_pty_list` tool and the `shoal://pty` resource, and drill-in-able via
+/// `shoal://pty/{id}` (the rendered screen), mirroring how an exec'd value
+/// becomes a `shoal://` noun. Over a REAL kernel + socket through the MCP
+/// facade: with no pty open the list is empty; open `cat`; assert `pty.list`
+/// (both the tool and the `shoal://pty` resource) shows exactly that session
+/// with the documented shape; read `shoal://pty/{id}` and assert the rendered
+/// screen shape; close it; assert it leaves `pty.list` and its screen resource
+/// then errors cleanly.
+#[test]
+fn mcp_pty_list_and_resources_track_open_sessions() {
+    let live = LiveKernel::start();
+    let mut facade = Facade::connect(&live.config()).unwrap();
+
+    // Nothing open yet: the list tool AND the shoal://pty resource are empty.
+    let empty = call_tool(&mut facade, "shoal_pty_list", json!({}));
+    assert_ne!(empty["isError"], true, "pty.list must succeed: {empty}");
+    assert!(
+        empty["structuredContent"]["ptys"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "no ptys open yet: {empty}"
+    );
+    let empty_res = read_resource(&mut facade, "shoal://pty");
+    assert!(
+        empty_res["structuredContent"]["ptys"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "shoal://pty is empty with no ptys open: {empty_res}"
+    );
+
+    // Open an interactive cat on a 40x10 terminal.
+    let opened = call_tool(
+        &mut facade,
+        "shoal_pty_open",
+        json!({"cmd":"cat","cols":40,"rows":10}),
+    );
+    assert_ne!(opened["isError"], true, "pty.open must succeed: {opened}");
+    let pty_id = opened["structuredContent"]["pty_id"]
+        .as_str()
+        .expect("pty.open returns a pty_id")
+        .to_string();
+    let bare = pty_id
+        .strip_prefix("pty:")
+        .expect("pty id is pty:N")
+        .to_string();
+
+    // shoal_pty_list shows exactly that session with the documented shape.
+    let listed = call_tool(&mut facade, "shoal_pty_list", json!({}));
+    let ptys = listed["structuredContent"]["ptys"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(ptys.len(), 1, "exactly the one open pty: {listed}");
+    let entry = &ptys[0];
+    assert_eq!(entry["pty_id"], json!(pty_id));
+    assert_eq!(entry["cmd"], "cat");
+    assert_eq!(entry["cols"], 40);
+    assert_eq!(entry["rows"], 10);
+    assert_eq!(entry["alive"], true);
+    assert!(entry["pid"].as_u64().unwrap() > 0);
+
+    // The shoal://pty resource carries the same list.
+    let res = read_resource(&mut facade, "shoal://pty");
+    let res_ptys = res["structuredContent"]["ptys"].as_array().unwrap();
+    assert_eq!(res_ptys.len(), 1, "shoal://pty mirrors pty.list: {res}");
+    assert_eq!(res_ptys[0]["pty_id"], json!(pty_id));
+
+    // resources/list advertises the shoal://pty root AND the open session entry.
+    let list = facade
+        .handle(&json!({"jsonrpc":"2.0","id":3,"method":"resources/list"}))
+        .unwrap();
+    let uris: Vec<String> = list["result"]["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["uri"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        uris.iter().any(|u| u == "shoal://pty"),
+        "shoal://pty root advertised: {uris:?}"
+    );
+    assert!(
+        uris.iter().any(|u| *u == format!("shoal://pty/{bare}")),
+        "the open pty is advertised: {uris:?}"
+    );
+
+    // shoal://pty/{id} drills into the one session's RENDERED screen — the same
+    // shape pty.read returns (bounded rows array, cursor, alive), no byte wall.
+    let screen = read_resource(&mut facade, &format!("shoal://pty/{bare}"));
+    let ssc = &screen["structuredContent"];
+    assert_eq!(ssc["pty_id"], json!(pty_id));
+    assert_eq!(ssc["cols"], 40);
+    assert_eq!(ssc["rows"], 10);
+    assert_eq!(ssc["alive"], true);
+    let rows = ssc["screen"]
+        .as_array()
+        .expect("screen is an array of rows");
+    assert_eq!(rows.len(), 10, "screen has exactly `rows` rows: {ssc}");
+    assert!(ssc["cursor"].is_object(), "screen carries a cursor: {ssc}");
+
+    // Close terminates + reaps; the pty leaves pty.list and its screen resource
+    // then errors cleanly (a closed id is an opaque not-found, never a hang).
+    let closed = call_tool(&mut facade, "shoal_pty_close", json!({"pty_id": pty_id}));
+    assert_eq!(
+        closed["structuredContent"]["closed"], true,
+        "closed: {closed}"
+    );
+    let after = call_tool(&mut facade, "shoal_pty_list", json!({}));
+    assert!(
+        after["structuredContent"]["ptys"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "a closed pty must leave pty.list: {after}"
+    );
+    let missing = read_resource_expecting_error(&mut facade, &format!("shoal://pty/{bare}"));
+    assert!(
+        missing.get("error").is_some(),
+        "reading a closed pty's screen must error: {missing}"
+    );
+}

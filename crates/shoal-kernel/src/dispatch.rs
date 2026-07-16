@@ -34,6 +34,7 @@ impl Kernel {
             "pty.read" => self.handle_pty_read(params, attached),
             "pty.resize" => self.handle_pty_resize(params, attached),
             "pty.close" => self.handle_pty_close(params, attached),
+            "pty.list" => self.handle_pty_list(attached),
             "plan.get" => self.handle_plan_get(params, attached),
             "plan.list" => self.handle_plan_list(attached),
             "plan.apply" => self.handle_plan_apply(params, client, attached, conn),

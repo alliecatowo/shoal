@@ -105,6 +105,9 @@ fn map_tool(name: &str, args: Value) -> Result<(&'static str, Value), String> {
             "pty.close",
             json!({"pty_id": required_str(object,"pty_id")?}),
         ),
+        // Enumerate this session's open ptys — the discovery verb behind the
+        // `shoal://pty` resource root.
+        "shoal_pty_list" => ("pty.list", json!({})),
         _ => return Err(format!("unknown tool {name:?}")),
     })
 }
@@ -253,6 +256,11 @@ pub fn tools() -> Vec<Value> {
             "Terminate and reap a pty session (no process is left running)",
             json!({"type":"object","properties":{"pty_id":{"type":"string"}},"required":["pty_id"],"additionalProperties":false}),
         ),
+        tool(
+            "shoal_pty_list",
+            "List the OPEN interactive pty sessions for this session: an array of {pty_id, cmd, pid, cols, rows, alive}. Use it to discover ptys you (or a prior turn) opened; then shoal_pty_read a pty_id to see its rendered screen, or read the shoal://pty resource. Only your own session's ptys are visible.",
+            json!({"type":"object","properties":{},"additionalProperties":false}),
+        ),
     ]
 }
 fn tool(name: &str, description: &str, input_schema: Value) -> Value {
@@ -273,7 +281,8 @@ mod tests {
         assert!(names.contains(&"shoal_exec".to_string()));
         assert!(names.contains(&"shoal_pty_open".to_string()));
         assert!(names.contains(&"shoal_pty_read".to_string()));
-        assert_eq!(tools().len(), 12);
+        assert!(names.contains(&"shoal_pty_list".to_string()));
+        assert_eq!(tools().len(), 13);
         for t in tools() {
             assert_eq!(t["inputSchema"]["type"], "object")
         }
@@ -335,6 +344,9 @@ mod tests {
                 .0,
             "pty.close"
         );
+        let (method, params) = map_tool("shoal_pty_list", json!({})).unwrap();
+        assert_eq!(method, "pty.list");
+        assert_eq!(params, json!({}));
     }
     #[test]
     fn cap_request_forwards_plan_ref() {

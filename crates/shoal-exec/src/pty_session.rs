@@ -335,15 +335,7 @@ impl PtySession {
     pub fn read_screen(&mut self) -> ScreenSnapshot {
         // If the reader saw EOF, the child's terminal stream ended: reap it
         // (non-blocking) so its exit is reflected and it never lingers.
-        if self.shared.child_exited.load(Ordering::SeqCst)
-            && !self.reaped
-            && let Some(raw) = reap_nohang(self.pid)
-        {
-            let (status, signal) = decode_wait_status(raw);
-            self.exit_status = status;
-            self.exit_signal = signal;
-            self.reaped = true;
-        }
+        self.reap_if_exited();
 
         let (cursor_row, cursor_col, cursor_hidden, rows_text, hash) = {
             let parser = self.shared.parser.lock().expect("parser lock");
@@ -378,6 +370,34 @@ impl PtySession {
             exit_signal: self.exit_signal.clone(),
             pid: self.pid(),
         }
+    }
+
+    /// If the reader thread saw the child's terminal stream end, reap the child
+    /// (non-blocking) so `exit_status`/`exit_signal`/`reaped` reflect its fate
+    /// and no zombie lingers. Idempotent. Shared by [`PtySession::read_screen`]
+    /// and [`PtySession::alive`].
+    fn reap_if_exited(&mut self) {
+        if self.shared.child_exited.load(Ordering::SeqCst)
+            && !self.reaped
+            && let Some(raw) = reap_nohang(self.pid)
+        {
+            let (status, signal) = decode_wait_status(raw);
+            self.exit_status = status;
+            self.exit_signal = signal;
+            self.reaped = true;
+        }
+    }
+
+    /// Whether the child is still alive, opportunistically reaping a self-exited
+    /// child first — like [`PtySession::read_screen`], but WITHOUT snapshotting
+    /// the grid or touching the `changed`-tracking hash. So enumerating open
+    /// sessions (the kernel's `pty.list` / `shoal://pty` resource) can report an
+    /// accurate `alive` flag without consuming the `changed` signal a subsequent
+    /// `read_screen` owes the caller.
+    #[must_use]
+    pub fn alive(&mut self) -> bool {
+        self.reap_if_exited();
+        !self.reaped
     }
 
     /// Terminate the child (if still running) and reap it, then tear down the

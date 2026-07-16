@@ -247,6 +247,63 @@ impl Kernel {
             "exit": exit_json(status, signal),
         }))
     }
+
+    /// `pty.list {}` → `{ptys:[{pty_id, cmd, pid, cols, rows, alive}]}`.
+    /// Enumerates the OPEN interactive PTY sessions for the ATTACHED session
+    /// ONLY — the same session-scoping `pty.send`/`read`/`resize`/`close`
+    /// enforce, so another session's ptys are invisible here exactly as
+    /// `task.list` scopes tasks. This is the read side of the `shoal://pty`
+    /// resource root: it makes open ptys first-class on the agent surface
+    /// (discoverable + drill-in-able via `shoal://pty/{id}`), mirroring how an
+    /// exec'd value becomes an addressable `shoal://` noun. Screen-free by
+    /// design (a small enumeration, never a wall of grids) — an agent drills
+    /// into one session's rendered screen with `pty.read` / `shoal://pty/{id}`.
+    pub(crate) fn handle_pty_list(
+        self: &Arc<Self>,
+        attached: &mut Option<Attachment>,
+    ) -> Result<Json, RpcError> {
+        let attachment = attached.as_ref().ok_or_else(not_attached)?;
+        let session_id = attachment.session.id.clone();
+        // Snapshot the matching entries (clone the Arcs, drop the registry lock)
+        // before touching any per-session lock, so this never holds `ptys` and a
+        // `PtyEntry::session` lock at once.
+        let mut entries: Vec<(u64, Arc<PtyEntry>)> = self
+            .ptys
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, entry)| entry.session_id == session_id)
+            .map(|(pty_ref, entry)| (pty_id_num(pty_ref), entry.clone()))
+            .collect();
+        // Stable, ascending order (open order) so the list is deterministic.
+        entries.sort_by_key(|(id, _)| *id);
+        let ptys: Vec<Json> = entries
+            .iter()
+            .map(|(id, entry)| {
+                let mut session = entry.session.lock().unwrap();
+                let (cols, rows) = session.size();
+                json!({
+                    "pty_id": Ref::new("pty", id),
+                    "cmd": entry.cmd,
+                    "pid": session.pid(),
+                    "cols": cols,
+                    "rows": rows,
+                    "alive": session.alive(),
+                })
+            })
+            .collect();
+        encode(json!({ "ptys": ptys }))
+    }
+}
+
+/// The numeric id from a `pty:{id}` ref (0 if unparseable — never happens for a
+/// ref the kernel minted, but keeps this total).
+fn pty_id_num(pty_ref: &Ref) -> u64 {
+    pty_ref
+        .0
+        .split_once(':')
+        .and_then(|(_, id)| id.parse().ok())
+        .unwrap_or(0)
 }
 
 /// Build the `exit` field: `null` while the child is alive, else `{status,
