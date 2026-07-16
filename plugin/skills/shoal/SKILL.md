@@ -426,6 +426,8 @@ method; treat the signature as authoritative per CONTRACTS but verify empiricall
 | `which cmd` | `which cmd` (kept, richer) | Not forensics — returns a full resolution-chain **record**, not just a path (`docs/REEF.md` §6). `.name` always echoes the query **(corpus** `reef.toml:reef-which-name-field-echoes-query`**)**; unresolved tool's `.out` is `null`, not an error **(corpus** `reef-which-unresolved-tool-out-is-null`**)**; exactly one tool name — `which "a" "b"` is `arg_error` **(corpus** `reef-which-arity-error`**)**. |
 | `cd dir` (permanent) | `cd dir` at session top level | Legal and journaled at session top level; **illegal inside a `fn` body** — error names `with cwd:` as the fix **(corpus** `reef.toml:reef-cd-inside-fn-body-is-illegal`, error `custom`, contains `"with cwd:"`**)**. |
 | `(cd dir && cmd)` (scoped cd) | `with cwd: "dir" { cmd }` | Restores cwd on **any** exit path, including an error thrown inside the block **(corpus** `reef.toml:reef-cwd-restores-after-with-block`, `reef-cwd-restores-after-error-inside-with-block`, `reef-cwd-nested-with-blocks-restore-outer`**)**. |
+| `cd -` (OLDPWD) | `cd -` (kept) | Round-trips to the previous cwd via a session-scoped `OLDPWD`, same top-level-only rule as `cd dir`; erroring `custom` with `"OLDPWD"` in the message if nothing has been recorded yet **(corpus** `dir-stack.toml:cd-dash-round-trips-to-previous-dir`, `cd-dash-without-oldpwd-errors`**)**. |
+| `pushd dir` / `popd` / `dirs` | same names, kept | A session-scoped directory stack: `pushd dir` cds and pushes (no-arg `pushd` swaps the top two instead), `popd` pops and cds there (`custom` error, `"empty"`, on an empty stack), `dirs` returns the stack as a `list<path>` with the **current dir first** — all top-level-only, same `fn`-body restriction as `cd` **(corpus** `dir-stack.toml:pushd-deepens-the-stack`, `pushd-popd-round-trips-to-origin`, `popd-on-empty-stack-errors`, `pushd-no-arg-swaps-top-two`, `pushd-inside-fn-body-is-illegal`**)**. |
 | `FOO=bar cmd` (scoped env) | `FOO=bar cmd` (kept) or `with env: {FOO: "bar"} { cmd }` | Leading `IDENT=word` desugars to `with env: {NAME: "value"} { cmd }` (TDD §1.3); explicit block form restores after **(corpus** `reef.toml:reef-env-with-block-sets-var-during`, `reef-env-with-block-restores-after`**)**. |
 | `test -f file`, `[ -f file ]` | `path("file").exists` / `.is_file` / `.is_dir` | Zero-arg `path` accessors, field-reachable (CONTRACTS §3's path-accessor list: `.read .read_bytes .lines .exists .is_dir .is_file .size .modified`). Verified against the binary: `path("Cargo.toml").exists` → `true`. |
 | `docker-compose up` (hyphenated command) | `^docker-compose up` or `run("docker-compose", "up")` | Hyphenated identifiers don't lex in EXPR mode; a hyphenated command name needs the `^` escape hatch or the fully-dynamic `run(name, args...)` form (TDD §2.3, §3.1.4). |
@@ -1020,7 +1022,9 @@ When in doubt, run a one-line probe rather than trusting a stale banner.
   enforcement is not wired into the code path this plugin talks to. The policy engine's *logical*
   allow/deny/approval_required decisions are real; the *sandbox* backing them is not, yet.
 - **TUI-only affordances**: statement-position PTY passthrough (color, progress bars), Ctrl-C/Ctrl-Z
-  job control, live-rendering streams at the prompt, `pick()`/`interact`. The kernel forces
+  job control, live-rendering streams at the prompt, `pick()`/`interact`, and the REPL's opt-in
+  output pager (`render.paging`, `docs/CONFIG.md` §6) — paging only ever engages on a real
+  interactive TTY, never on an MCP-dispatched exec. The kernel forces
   `evaluator.interactive = false` for every exec dispatched through this surface — MCP execution is
   **always** headless/capture-mode. Do not expect (or try to request) a colorized/interactive run.
 - **Content-addressed `val:blake3:...` refs.** The kernel only mints session-scoped `out:N` transcript

@@ -20,7 +20,13 @@
 # only" trick to survive.
 #
 # `size_bytes` (not `size`-typed): `%s` is a bare byte count with no unit
-# suffix, the same reason `df.toml`'s `size_kb` is `int`, not `size`.
+# suffix, so it can't be parsed as plain `size` either (see
+# `shoal_value::parse_size`). Unlike `du.toml`/`df.toml`'s `size`/`used`/
+# `avail` columns -- typed `size_kb`, which scales bare *kilobyte* digits
+# x1024 into a genuine `Value::Size` (see `parse_size_kb` in
+# shoal-adapters/src/lib.rs) -- there is no equivalent 1x-scale column type
+# for bare *byte* counts, so this one stays a plain `int`; a caller wanting
+# a comparable `Value::Size` has to convert it by hand for now.
 [cmd.stat]
 bin = "stat"
 class = "cli"
