@@ -444,19 +444,27 @@ mod tests {
 
     /// Regression test for the `evaluator.set_source(...)` call added above.
     ///
-    /// The kernel does NOT install a journal on a real session's evaluator
-    /// (it keeps its own separate exec-level journal — `Kernel::journal`,
-    /// appended to directly in `handle_exec` with `src: params.src.clone()`,
-    /// which was already correct before this fix and is untouched by it).
+    /// `Kernel::new()` builds an EPHEMERAL, in-memory-only kernel with no
+    /// on-disk state dir at all (`Kernel::state_dir` is `None`), so
+    /// `session()` (`crates/shoal-kernel/src/session.rs`) deliberately does
+    /// NOT install a journal on this particular session's evaluator — there
+    /// is no on-disk store to open one against. (A real on-disk kernel built
+    /// via `Kernel::open`/`open_with_policy` DOES get one automatically; see
+    /// `kernel_open_installs_a_session_journal_so_history_builtin_sees_real_data`
+    /// in `lib.rs`'s test module.) The kernel also always keeps its own
+    /// separate exec-level journal (`Kernel::journal`, appended to directly
+    /// in `handle_exec` with `src: params.src.clone()`, which was already
+    /// correct before this fix and is untouched by it).
+    ///
     /// The evaluator's *own* per-statement journal integration
     /// (`journal_begin_stmt`/`stmt_source` in `shoal-eval/src/journal.rs`,
     /// which also backs the in-language `history`/`journal` builtin) only
     /// runs when a journal is installed on the evaluator itself, and
     /// `stmt_source` only has real text to slice once `Evaluator::set_source`
     /// has been called. To observe whether `handle_exec` actually reaches
-    /// `set_source` on every code path, this test installs a journal
-    /// directly on the session's evaluator (something a real kernel session
-    /// never does today) purely as a probe, then drives two statements
+    /// `set_source` on every code path without needing a real on-disk
+    /// kernel, this test installs a journal directly on this ephemeral
+    /// session's evaluator purely as a probe, then drives two statements
     /// through the real `handle_exec` entry point: a marker `let`, then
     /// `history`. If `set_source` were never called (the pre-fix state),
     /// `stmt_source` would slice an empty `self.source` and every stmt-level
@@ -471,7 +479,9 @@ mod tests {
         // permissive rather than an arbitrary test name.
         let actor = principal();
         let kernel = Kernel::new();
-        let session = kernel.session("set-source-probe").expect("create session");
+        let session = kernel
+            .session("set-source-probe", &actor)
+            .expect("create session");
         {
             let mut evaluator = session.evaluator.lock().unwrap();
             evaluator.set_journal(

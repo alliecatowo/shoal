@@ -28,7 +28,7 @@ use std::io::{self, BufReader};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -38,6 +38,14 @@ pub struct Kernel {
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     next_client: AtomicU64,
     journal: Mutex<Journal>,
+    /// The per-user state dir this kernel's own `journal` (above) was opened
+    /// against, if any (`None` for the ephemeral in-memory kernels used by
+    /// `new`/`with_policy`, which have no on-disk store at all). Kept around
+    /// so `session()` can open a SECOND, independent `Journal` handle onto
+    /// the exact same on-disk SQLite/WAL store for each session's own
+    /// `Evaluator` (mirrors `crates/shoal/src/repl.rs`'s dual-handle
+    /// pattern) — never a divergent path from the kernel's own journal.
+    state_dir: Option<PathBuf>,
     policy: Policy,
     plans: Mutex<HashMap<String, StoredPlan>>,
     tasks: Mutex<HashMap<Ref, Arc<TaskEntry>>>,
@@ -81,6 +89,7 @@ impl Kernel {
             sessions: Mutex::new(HashMap::new()),
             next_client: AtomicU64::new(1),
             journal: Mutex::new(Journal::in_memory().expect("in-memory journal")),
+            state_dir: None,
             policy: permissive_policy(),
             plans: Mutex::new(HashMap::new()),
             tasks: Mutex::new(HashMap::new()),
@@ -96,6 +105,7 @@ impl Kernel {
             sessions: Mutex::new(HashMap::new()),
             next_client: AtomicU64::new(1),
             journal: Mutex::new(Journal::open(state_dir)?),
+            state_dir: Some(state_dir.to_path_buf()),
             policy: permissive_policy(),
             plans: Mutex::new(HashMap::new()),
             tasks: Mutex::new(HashMap::new()),
@@ -114,6 +124,7 @@ impl Kernel {
             sessions: Mutex::new(HashMap::new()),
             next_client: AtomicU64::new(1),
             journal: Mutex::new(Journal::open(state_dir)?),
+            state_dir: Some(state_dir.to_path_buf()),
             policy,
             plans: Mutex::new(HashMap::new()),
             tasks: Mutex::new(HashMap::new()),
@@ -128,6 +139,7 @@ impl Kernel {
             sessions: Mutex::new(HashMap::new()),
             next_client: AtomicU64::new(1),
             journal: Mutex::new(Journal::in_memory().expect("in-memory journal")),
+            state_dir: None,
             policy,
             plans: Mutex::new(HashMap::new()),
             tasks: Mutex::new(HashMap::new()),
@@ -1285,6 +1297,74 @@ mod tests {
             json!({"token":"not-a-token","client":{"kind":"agent","tty":false}}),
         );
         assert_eq!(denied.error.unwrap().code, -32030);
+        drop(client);
+        drop(reader);
+        thread.join().unwrap();
+    }
+
+    /// End-to-end proof that a real (on-disk) kernel session's own
+    /// `Evaluator` gets a journal installed automatically, with no test-side
+    /// probe injection (unlike `handlers_exec::tests::
+    /// exec_calls_set_source_so_stmt_journal_entries_carry_src`, which
+    /// installs a journal by hand because it drives an ephemeral
+    /// `Kernel::new()` — deliberately the ONE case that must stay journal-
+    /// less, since it has no on-disk state dir at all). `Kernel::open` gives
+    /// this kernel a real `state_dir`, so `session()` should now open a
+    /// second journal handle on it and hand it to the session's evaluator
+    /// (`crates/shoal-kernel/src/session.rs`). Attach, run a marker
+    /// statement, then run the in-language `history` builtin — all over the
+    /// same real Unix-socket wire `session.attach`/`exec` use in production —
+    /// and confirm the marker's exact source text comes back in `history`'s
+    /// `src` column. Before the fix, `session()` never called
+    /// `Evaluator::set_journal` at all, so `history` inside a kernel session
+    /// always came back empty regardless of what the kernel's own separate,
+    /// coarser exec-level journal (`self.journal`, `journal.query`) recorded.
+    #[test]
+    fn kernel_open_installs_a_session_journal_so_history_builtin_sees_real_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let kernel = Kernel::open(dir.path()).unwrap();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        let server_kernel = kernel.clone();
+        let thread = std::thread::spawn(move || server_kernel.handle_stream(server).unwrap());
+        call(
+            &mut client,
+            &mut reader,
+            1,
+            "session.attach",
+            json!({"client":{"kind":"agent","tty":false}}),
+        );
+        let marker_src = "let kernel_journal_probe_4471 = 4471";
+        let exec = call(
+            &mut client,
+            &mut reader,
+            2,
+            "exec",
+            json!({"src": marker_src}),
+        );
+        assert!(
+            exec.error.is_none(),
+            "marker exec must succeed: {:?}",
+            exec.error
+        );
+
+        let hist = call(
+            &mut client,
+            &mut reader,
+            3,
+            "exec",
+            json!({"src": "history"}),
+        );
+        let hist_result = hist.result.expect("exec of `history` must succeed");
+        let cols = hist_result["value"]["cols"]["src"]
+            .as_array()
+            .unwrap_or_else(|| panic!("history's table has no src column: {hist_result:?}"));
+        assert!(
+            cols.iter().any(|v| v["v"] == marker_src),
+            "no journal entry with src={marker_src:?} found among {cols:?} — the session \
+             evaluator has no journal installed, so the in-language `history` builtin is inert \
+             even though a real on-disk Kernel::open must install one automatically"
+        );
         drop(client);
         drop(reader);
         thread.join().unwrap();

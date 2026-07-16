@@ -32,7 +32,12 @@ pub(crate) struct Session {
 }
 
 impl Kernel {
-    pub(crate) fn session(&self, name: &str) -> io::Result<Arc<Session>> {
+    /// Get-or-create the named session. `principal` is only consulted the
+    /// FIRST time this session name is created (an already-cached session
+    /// keeps whatever `Evaluator` it was built with, journal included) — its
+    /// only caller, `handle_session_attach`, always knows `who` before
+    /// calling this.
+    pub(crate) fn session(&self, name: &str, principal: &str) -> io::Result<Arc<Session>> {
         let mut sessions = self.sessions.lock().unwrap();
         if let Some(session) = sessions.get(name) {
             return Ok(session.clone());
@@ -43,6 +48,42 @@ impl Kernel {
         // history against the shared per-user store, same as the REPL (frecency
         // recording is best-effort and never fails a cd).
         evaluator.open_default_jump_history();
+        // Install a command journal on the session's own evaluator (TDD §9),
+        // mirroring `crates/shoal/src/repl.rs`'s `set_journal` call: without
+        // this, the evaluator's per-statement journal integration
+        // (`journal_begin_stmt`/`stmt_source` in `shoal-eval/src/journal.rs`)
+        // never runs, so the in-language `history`/`journal` builtin is inert
+        // in every kernel session — even though `handle_exec` already
+        // records the same statement in the kernel's own separate,
+        // coarser exec-level journal (`self.journal` above, unaffected by
+        // this change).
+        //
+        // `Journal::open` here opens a SECOND, independent handle onto the
+        // exact same on-disk state dir `self.journal` was opened against
+        // (SQLite/WAL supports concurrent handles on one store fine) — never
+        // a divergent path: `self.state_dir` is `Some` only when this
+        // `Kernel` was itself built via `Kernel::open`/`open_with_policy`
+        // against that same dir. An ephemeral in-memory kernel
+        // (`Kernel::new`/`with_policy`, what most unit tests use) has no
+        // on-disk state dir at all, so this is skipped entirely there,
+        // exactly as before this change.
+        //
+        // Best-effort, like the REPL: a real open failure (permissions, a
+        // corrupt store, …) must never fail session creation — the session
+        // still works, just with the in-language history/journal builtin
+        // disabled, the same way an interactive REPL degrades when its own
+        // journal can't be opened.
+        if let Some(state_dir) = &self.state_dir {
+            match Journal::open(state_dir) {
+                Ok(journal) => evaluator.set_journal(journal, name, principal),
+                Err(error) => {
+                    eprintln!(
+                        "shoal-kernel: warning: journal unavailable for session {name:?} \
+                         ({error}); in-language history/journal disabled this session"
+                    );
+                }
+            }
+        }
         // Bridge in-language channels onto the kernel wire bus (AGENT-SURFACE
         // §4's "one substrate"): `channel("user.x").emit(v)` in evaluated
         // source reaches `events.subscribe`/`resources/subscribe` clients.
@@ -94,7 +135,7 @@ impl Kernel {
             (principal(), vec![], "local-human".into())
         };
         let name = params.session.unwrap_or_else(|| "default".into());
-        let session = self.session(&name).map_err(internal)?;
+        let session = self.session(&name, &who).map_err(internal)?;
         let cwd = session
             .evaluator
             .lock()
