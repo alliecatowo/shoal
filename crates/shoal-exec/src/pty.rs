@@ -728,3 +728,213 @@ pub(crate) fn run_pty(mut spec: ExecSpec, cancel: &CancelToken) -> io::Result<Ex
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ExecMode;
+    use std::ffi::OsString;
+
+    /// Serializes every test below that parks/takes/drains the process-global
+    /// `PARKED_JOBS` registry. Without this, cargo test's default thread
+    /// parallelism would let one test's `shutdown_stopped_jobs` (which drains
+    /// the WHOLE registry) reap a still-in-flight job that a different test
+    /// running concurrently just parked — a real cross-test race that lives in
+    /// the test suite's shared global, not in the production code under test.
+    static JOB_CONTROL_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// A PtyTee spec running `/bin/sh -c script`, no stdin — so `forward_tty`
+    /// is always `false` and these tests need no controlling terminal (CI/
+    /// agent sandboxes have none).
+    fn sh_spec(script: &str) -> ExecSpec {
+        ExecSpec {
+            argv: vec![
+                OsString::from("/bin/sh"),
+                OsString::from("-c"),
+                OsString::from(script),
+            ],
+            cwd: std::env::current_dir().expect("cwd"),
+            env: vec![(OsString::from("PATH"), OsString::from("/usr/bin:/bin"))],
+            stdin: StdinSpec::Null,
+            mode: ExecMode::PtyTee,
+            sandbox: None,
+            spill: None,
+        }
+    }
+
+    /// Poll `pred` until it is true or `timeout` elapses (panicking with `msg`
+    /// on timeout). Used throughout instead of a fixed sleep so these tests
+    /// bound their worst-case runtime without flaking under CI load.
+    fn wait_until(timeout: Duration, msg: &str, mut pred: impl FnMut() -> bool) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if pred() {
+                return;
+            }
+            assert!(Instant::now() < deadline, "{msg}");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// `true` once `pid` is no longer a live process at all — `kill(pid, 0)`
+    /// fails with `ESRCH`. A merely *stopped* process still passes
+    /// `kill(pid, 0)` (it's alive, just suspended), so this only goes true
+    /// once the process has actually been reaped — exactly the distinction
+    /// the no-zombie/no-orphan assertions below need.
+    #[allow(clippy::cast_possible_wrap)] // pids fit in i32 in practice
+    fn process_is_gone(pid: u32) -> bool {
+        let pid = pid as libc::pid_t;
+        // SAFETY: signal 0 is the POSIX existence probe; it delivers nothing.
+        unsafe {
+            libc::kill(pid, 0) == -1
+                && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        }
+    }
+
+    /// The core job-control contract this module implements: a child that
+    /// stops itself (`SIGSTOP`) is observed via `WUNTRACED` as a *stop*,
+    /// `run_pty` maps that to a stopped `ExecResult` rather than an exit, and
+    /// `SIGCONT` (driven here via `resume_foreground`) lets it run to
+    /// completion normally. This is the exact mechanism a real Ctrl-Z rides on
+    /// (the pty line discipline delivering `SIGTSTP` in place of our
+    /// programmatic `SIGSTOP`); the one piece this cannot exercise without a
+    /// real controlling terminal is that line-discipline translation itself —
+    /// see the module docs and the corresponding comment in shoal-eval.
+    #[test]
+    fn wifstopped_maps_to_stopped_execresult_and_sigcont_resumes_to_completion() {
+        let _serial = JOB_CONTROL_TEST_LOCK.lock().unwrap();
+        let cancel = CancelToken::new();
+        let res = run_pty(sh_spec("kill -STOP $$; echo resumed-ok"), &cancel).expect("run_pty");
+
+        assert!(
+            res.stopped,
+            "a self-SIGSTOP under WUNTRACED must report stopped, not exited"
+        );
+        assert_eq!(res.status, None, "a stopped child has no exit status yet");
+        assert_eq!(res.signal, None, "a stopped child has not died to a signal");
+        assert_eq!(res.pgid, res.pid, "a pty child is its own group leader");
+
+        let job = take_stopped_job(res.pid).expect("stopped job must be parked");
+        assert_eq!(job.pid(), res.pid);
+
+        let final_res = job
+            .resume_foreground(&CancelToken::new())
+            .expect("resume_foreground");
+        assert!(
+            !final_res.stopped,
+            "a SIGCONT'd child that then exits is not stopped"
+        );
+        assert_eq!(final_res.status, Some(0));
+        assert!(
+            final_res.stdout.windows(10).any(|w| w == b"resumed-ok"),
+            "expected the post-resume output in the tee, got {:?}",
+            String::from_utf8_lossy(&final_res.stdout)
+        );
+    }
+
+    /// `PARKED_JOBS` gives out each stopped job exactly once: a second
+    /// `take_stopped_job` for the same pid must find nothing. The job it DID
+    /// hand back, once dropped without resuming (an abandoned Ctrl-Z'd job),
+    /// must leave no zombie/orphan behind — the `Drop` -> `kill_and_reap` path.
+    #[test]
+    fn take_stopped_job_is_exactly_once_and_drop_cleans_up() {
+        let _serial = JOB_CONTROL_TEST_LOCK.lock().unwrap();
+        let cancel = CancelToken::new();
+        let res = run_pty(sh_spec("kill -STOP $$"), &cancel).expect("run_pty");
+        assert!(res.stopped);
+
+        let job = take_stopped_job(res.pid).expect("first take must find the parked job");
+        assert!(
+            take_stopped_job(res.pid).is_none(),
+            "a parked job must not be handed out twice"
+        );
+
+        drop(job); // abandoned without resuming: Drop must reap it via kill_and_reap
+        wait_until(
+            Duration::from_secs(5),
+            "an abandoned stopped job must be reaped on drop, not left as a zombie/orphan",
+            || process_is_gone(res.pid),
+        );
+    }
+
+    /// `shutdown_stopped_jobs` drains every parked job (not just one), killing
+    /// and reaping each — the host calls this on shell shutdown so a stack of
+    /// Ctrl-Z'd jobs never survives the process exiting.
+    #[test]
+    fn shutdown_stopped_jobs_drains_every_parked_job_without_a_leak() {
+        let _serial = JOB_CONTROL_TEST_LOCK.lock().unwrap();
+        let cancel = CancelToken::new();
+        let a = run_pty(sh_spec("kill -STOP $$"), &cancel).expect("run_pty a");
+        let b = run_pty(sh_spec("kill -STOP $$"), &cancel).expect("run_pty b");
+        assert!(a.stopped && b.stopped);
+
+        shutdown_stopped_jobs();
+
+        assert!(
+            take_stopped_job(a.pid).is_none(),
+            "job a must have been drained by shutdown"
+        );
+        assert!(
+            take_stopped_job(b.pid).is_none(),
+            "job b must have been drained by shutdown"
+        );
+        wait_until(
+            Duration::from_secs(5),
+            "job a must be reaped by shutdown, not left running/orphaned",
+            || process_is_gone(a.pid),
+        );
+        wait_until(
+            Duration::from_secs(5),
+            "job b must be reaped by shutdown, not left running/orphaned",
+            || process_is_gone(b.pid),
+        );
+    }
+
+    /// `kill_and_reap` is idempotent: once a job is marked `reaped`, a second
+    /// call must be a safe no-op rather than re-signalling a pid the kernel
+    /// may since have recycled for an unrelated process — the guard the
+    /// `reaped` field exists for.
+    #[test]
+    fn kill_and_reap_is_idempotent_and_guards_an_already_reaped_job() {
+        let _serial = JOB_CONTROL_TEST_LOCK.lock().unwrap();
+        let cancel = CancelToken::new();
+        let res = run_pty(sh_spec("kill -STOP $$"), &cancel).expect("run_pty");
+        let mut job = take_stopped_job(res.pid).expect("parked job");
+
+        assert!(
+            !job.reaped,
+            "a freshly parked job must not start out reaped"
+        );
+        job.kill_and_reap();
+        assert!(job.reaped, "kill_and_reap must mark the job reaped");
+        wait_until(
+            Duration::from_secs(5),
+            "kill_and_reap must actually kill and reap the child",
+            || process_is_gone(res.pid),
+        );
+
+        // Second call on an already-reaped job: must not panic/error and must
+        // remain a no-op (nothing left alive to mis-signal).
+        job.kill_and_reap();
+        assert!(job.reaped);
+    }
+
+    /// `resume_background`: `SIGCONT` lets the job finish off the calling
+    /// thread (no fg terminal reattachment), and it is still reaped with no
+    /// zombie left behind once it exits.
+    #[test]
+    fn resume_background_runs_to_completion_and_is_reaped() {
+        let _serial = JOB_CONTROL_TEST_LOCK.lock().unwrap();
+        let cancel = CancelToken::new();
+        let res = run_pty(sh_spec("kill -STOP $$"), &cancel).expect("run_pty");
+        let job = take_stopped_job(res.pid).expect("parked job");
+
+        job.resume_background();
+
+        wait_until(
+            Duration::from_secs(5),
+            "a backgrounded job must run to completion and be reaped",
+            || process_is_gone(res.pid),
+        );
+    }
+}
