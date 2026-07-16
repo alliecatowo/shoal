@@ -109,7 +109,10 @@ fn df_cols_parses_posix_output_ignoring_two_word_header() {
     };
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0]["filesystem"], Value::Str("/dev/sda1".into()));
-    assert_eq!(rows[0]["size_kb"], Value::Int(61255492));
+    // `size` is `size_kb`-typed (see adapters/df.toml): the bare `-kP`
+    // block count is scaled `* 1024` into a real, comparable `Value::Size`
+    // rather than left as an untyped `int` the caller has to hand-convert.
+    assert_eq!(rows[0]["size"], Value::Size(61255492 * 1024));
     assert_eq!(rows[0]["use_pct"], Value::Str("54%".into()));
     assert_eq!(rows[0]["mounted"], Value::Path("/".into()));
     assert_eq!(rows[1]["mounted"], Value::Path("/dev/shm".into()));
