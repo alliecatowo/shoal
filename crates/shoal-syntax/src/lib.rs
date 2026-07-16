@@ -10,6 +10,7 @@
     clippy::approx_constant
 )]
 
+pub mod commands;
 mod format;
 pub mod lexer;
 mod parser;

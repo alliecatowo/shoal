@@ -1,6 +1,6 @@
 use nu_ansi_term::{Color, Style};
 use reedline::{Highlighter, StyledText};
-use shoal_eval::builtin_names;
+use shoal_syntax::commands::builtin_names;
 use shoal_syntax::{Lexer, Mode, Tok};
 use shoal_value::{Env, Value};
 

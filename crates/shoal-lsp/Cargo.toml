@@ -7,7 +7,6 @@ edition = "2024"
 shoal-syntax = { path = "../shoal-syntax" }
 tower-lsp = "0.20"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "sync"] }
-shoal-eval = { version = "0.1.0", path = "../shoal-eval" }
 
 [[bin]]
 name = "shoal-lsp"

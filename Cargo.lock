@@ -2523,7 +2523,6 @@ dependencies = [
 name = "shoal-lsp"
 version = "0.1.0"
 dependencies = [
- "shoal-eval",
  "shoal-syntax",
  "tokio",
  "tower-lsp",

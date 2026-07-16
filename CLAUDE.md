@@ -36,9 +36,15 @@ Tier 0 — leaf (no shoal-* deps):
 
 Tier 1 — depend only on Tier 0:
   shoal-value    -> ast            (Value enum, Env, ErrorVal, ports, methods, render)
-  shoal-syntax   -> ast            (modal lexer, recursive-descent + Pratt parser)
+  shoal-syntax   -> ast            (modal lexer, recursive-descent + Pratt parser; also owns the
+                                    canonical builtin command-head registry — `shoal_syntax::
+                                    commands::builtin_names()`/`is_builtin`/`is_special_head` —
+                                    the ONE list eval dispatch, the shell's completer/highlighter,
+                                    and shoal-lsp all consume so they can't drift)
   shoal-exec     -> leash          (NOT a leaf — spawn/PTY/tee/signals + sandbox hooks)
   shoal-history  -> journal
+  shoal-lsp      -> syntax         (tower-lsp server; parse/format/diagnostics + the builtin-head
+                                    completion vocabulary, all from shoal-syntax — no eval dep)
 
 Tier 2 — depend on Tier 0/1:
   shoal-adapters -> ast, value     (declarative TOML tool schemas)
@@ -52,21 +58,14 @@ Tier 4 — composition roots:
   shoal-doctor -> adapters, journal, leash          (installation diagnostics)
   shoal-kernel -> ast, auth, eval, exec, journal, leash, proto, syntax, value
     (long-lived per-user daemon; sessions, journal, socket, EventBus)
-  shoal-lsp    -> syntax, eval
-    (tower-lsp server; parse/format/diagnostics from syntax, plus shoal-eval's canonical
-    `builtin_names()` registry so LSP completion never drifts from the evaluator's own
-    command-head list. Moved here from Tier 1 by the builtin-registry unification — still
-    acyclic, shoal-eval never depends on shoal-lsp. Candidate future refactor, not done:
-    hoist `builtin_names()`'s backing list into a leaf crate so shoal-lsp can drop the
-    shoal-eval dependency and go back to being a light Tier 1 crate.)
 
 Tier 5 — entrypoints (binaries):
   shoal      -> adapters, ast, config, doctor, eval, prompt, syntax, value   (REPL/script runner)
   shoal-mcp, shoal-lsp — spawned by `shoal` as companion subprocesses (`shoal mcp`/`shoal lsp`),
                          NOT Cargo dependencies of `shoal`. shoal-mcp has zero shoal-* deps in
                          [dependencies] and talks to a running shoal-kernel purely over the wire;
-                         shoal-lsp, unlike shoal-mcp, DOES link shoal-* crates (syntax, eval —
-                         see Tier 4 above) — it just isn't a Cargo dependency of `shoal` itself.
+                         shoal-lsp links only shoal-syntax (Tier 1 — parse/format/diagnostics plus
+                         the canonical builtin-head registry), so it never pulls in the evaluator.
   shoal-kernel — independent of `shoal` at the Cargo level; `shoal` never depends on or spawns it.
                  One engine (shoal-eval), two hostings: kernel-less (embedded, `shoal -c`/scripts)
                  or kernel-hosted (socket-attached, interactive + agent sessions).
