@@ -5,11 +5,51 @@ up a real `shoal-kernel` on a real socket and drives it through both the MCP fac
 JSON-RPC). `$`-tagged value encoding, the elision rule (§3), MCP `resources/list|read|subscribe|
 unsubscribe`, `events.subscribe`/push notifications, all seven MCP tools (`shoal_exec shoal_plan
 shoal_apply shoal_get shoal_journal shoal_cancel shoal_cap_request`), and the in-language
-`channel()` ↔ kernel-wire-bus bridge (§7) are all real, not spec'd-but-pending. Two narrower gaps
-remain, tracked in `docs/ROADMAP.md`'s open-items list: an `Outcome`'s wire `span` field is always
-`None` (never threaded from the spawning call), and `shoal_cap_request`'s grant response hardcodes
-`"enforced": false` regardless of whether the approved plan is actually confined by a real OS
-backend (contrast `session.attach`'s `caps_enforced`, which is already honest).
+`channel()` ↔ kernel-wire-bus bridge (§7) are all real, not spec'd-but-pending.
+`shoal_cap_request`'s grant response reports the SAME honest enforcement truth `session.attach`'s
+`caps_enforced` does (`Kernel::caps_enforced_for`, shared by both call sites in
+`crates/shoal-kernel/src/handlers_task.rs`/`lib.rs`) — it does **not** hardcode `"enforced": false`;
+an earlier revision of this doc said otherwise, that line was stale (pinned by
+`cap_request_reports_the_same_enforcement_truth_attach_does` and
+`cap_request_reports_false_for_the_default_permissive_principal`, `shoal-kernel/src/lib.rs`).
+
+The event bus is backpressured per §6: `crates/shoal-kernel/src/eventbus.rs` gives every
+subscription its own bounded queue and a dedicated writer thread, so `publish()` is a
+lock-and-append operation that never performs a blocking socket write itself — a slow or fully
+stalled subscriber can delay at most its own delivery, never another subscriber's, and never the
+producer. A subscriber whose queue overflows gets a coalesced `{dropped, latest_seq}` summary
+instead of unbounded buffering (pinned by `eventbus::tests::publish_does_not_block_when_a_subscriber
+_never_reads`, `a_stalled_subscriber_never_stalls_a_healthy_one`,
+`a_stalled_subscriber_gets_a_coalesced_dropped_summary`). One consequence worth knowing: because
+delivery is now off the dispatch call path, an event pushed on the SAME connection that triggered
+it is no longer guaranteed to arrive before that call's own RPC response — only that it arrives
+(at-least-once, per §4/§6).
+
+The `approval` channel (§4) is wired: `exec {mode:"plan"}` publishes on it the moment a plan lands
+at `Verdict::ApprovalRequired`, so a second principal (a human's session, a supervising agent)
+learns about a pending approval by subscribing, not by polling `journal.query` or re-deriving the
+plan (pinned by `approval_channel_fires_when_a_plan_needs_approval`). `journal` and `render` are
+now wired too — `journal` fires `{entry_id, head, ok, principal}` once per finished journal entry;
+`render` fires `{ref, render}` alongside every `session.transcript` announcement. `reef` does
+**not** emit and has been removed from `STATIC_CHANNELS` rather than left advertised-but-dead: tool
+lock/drift/fetch events originate inside `shoal-eval`'s reef resolution (a different crate), and no
+natural emit point for them exists inside `shoal-kernel` itself yet — it needs an eval-side
+event-forwarder hook analogous to `session.rs`'s existing `user.*` bridge.
+
+Real gaps that remain, tracked in `docs/ROADMAP.md`'s open-items list:
+- An `Outcome`'s wire `span` field is always `None` (never threaded from the spawning call;
+  `OutcomeVal` carries no field for it yet — see `wire::outcome_span`'s doc comment for exactly
+  what an eval-side plumb would need).
+- `session.transcript`/`journal`/`approval`/`render` are ring-buffered (≥1024 events per channel)
+  like every other channel, but not yet *journal-backed* for replay past that ring depth — a
+  subscriber that falls behind by more than the ring cap loses those events for good; recoverable
+  today only via `journal.query`'s own independent SQLite-backed history, not via
+  `events.read`/`resources/read` on the channel itself.
+- Per-client `it` (`Session::client_it`, the last transcript value a given connection saw) is
+  tracked on every `exec` but not yet exposed through any wire method — nothing reads it back
+  today.
+- `approval`'s `expires` field is honestly `{"$":"null"}` always: `StoredPlan` carries no TTL/
+  deadline field to report (same honest-omission precedent as `wire::outcome_span`).
 
 **Normative.** Companion to TDD §7; supersedes it where they conflict. Implements the doctrine
 below across `shoal-proto`, `shoal-kernel`, `shoal-mcp`.
@@ -89,20 +129,26 @@ above a hard cap (64 KiB) — a misbehaving agent cannot flood itself.
 ## 4. Events — channels, cursors, push
 
 Kernel-native pub/sub over the same socket. Every event: `{channel, seq, ts, payload}` — `seq`
-monotonic **per channel**; ring-buffered (≥1024 events; `session.transcript`/`journal` channels
-are journal-backed, replayable from any seq). Read = `shoal://events/{ch}?since={seq}`;
+monotonic **per channel**; ring-buffered (≥1024 events per channel — every channel today, including
+`session.transcript`/`journal`, uses the same in-memory ring; neither is yet *journal-backed* for
+replay past that depth, see the status section above). Read = `shoal://events/{ch}?since={seq}`;
 push = subscription (§6). At-least-once; consumers dedup by seq.
 
 Channels (payloads are `$`-tagged):
 ```
 session.transcript   {n, ref, summary:{type, ok?, cmd?, n?}}      every new out[n]
 task.{id}            "started", then terminal {state:"completed"|"failed"|"cancelled", ref?}
-journal              {entry_id, head, ok, principal}
+journal              {entry_id, head, ok, principal}               every finished journal entry
 approval             {plan_ref, effects, principal, expires}       plan awaiting approval
-render               {ref, render}                                 UI clients
-reef                 {tool, event:"locked"|"drift"|"fetched", hash}
+render               {ref, render}                                 alongside every session.transcript
 user.{name}          arbitrary $-tagged value                      in-language channel(name)
 ```
+
+`reef` (`{tool, event:"locked"|"drift"|"fetched", hash}`) is NOT in this list: it was previously
+advertised in `STATIC_CHANNELS` with nothing ever publishing to it (a dead channel a subscriber
+could wait on forever) and has been removed rather than left silently unwired — see the status
+section above for why (no natural emit point inside `shoal-kernel`; the events would need to
+originate in `shoal-eval`'s reef resolution).
 
 `user.*` channels are the cross-principal primitive: a human's session and its agents signal each
 other structurally (pair-shelling; no file-watching, no sentinel strings in ttys).
@@ -144,10 +190,17 @@ a client that missed events replays with `?since={last_seq}` (ring-buffered chan
 query (journal-backed channels). **A correct agent never calls the same read twice hoping for
 change — it subscribes.** The word "poll" appears in this system only as an anti-pattern.
 
-Backpressure: a slow subscriber's queue is bounded; on overflow the kernel drops to a **coalesced
-summary** for that subscriber (`{dropped: n, latest_seq}`) rather than unbounded buffering or
-blocking producers — the subscriber re-reads from `latest_seq`. Liveness beats completeness on a
-saturated channel; completeness is always recoverable from the journal.
+**Status: backpressure implemented** (`crates/shoal-kernel/src/eventbus.rs`: a bounded per-subscriber
+queue plus one dedicated writer thread per subscription — `publish()` only ever appends to the
+queue, never performs the socket write itself). A slow subscriber's queue is bounded; on overflow
+the kernel drops to a **coalesced summary** for that subscriber (`{dropped: n, latest_seq}`) rather
+than unbounded buffering or blocking producers — the subscriber re-reads from `latest_seq`.
+Liveness beats completeness on a saturated channel; completeness for ring-buffered channels is
+recoverable up to the ring depth (§4), and only fully recoverable from the journal for entries the
+journal itself records (i.e. `journal.query`, not yet every event channel — see the status section
+above). One corollary of moving the write off the dispatch call path: an event pushed on the same
+connection that triggered it is no longer ordered relative to that call's own RPC response, only
+guaranteed to arrive (at-least-once).
 
 ## 7. In-language channel & event API (the pair-shelling primitive)
 

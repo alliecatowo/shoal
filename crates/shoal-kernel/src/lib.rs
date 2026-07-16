@@ -494,6 +494,63 @@ fn transcript_event(value_ref: &Ref, value: &Value) -> Json {
     })
 }
 
+/// The `approval` event payload (AGENT-SURFACE §4): `{plan_ref, effects,
+/// principal, expires}`, fired once — the moment `exec {mode:"plan"}`
+/// computes `Verdict::ApprovalRequired` for a newly stored plan — so a
+/// SEPARATE subscriber (a human's session, a supervising agent) learns a
+/// plan is stuck awaiting approval by subscribing, not by polling
+/// `journal.query` or re-issuing the same plan.
+///
+/// `expires` is honestly `{"$":"null"}`: `StoredPlan` carries no TTL/deadline
+/// field today, so there is nothing to report (same honest-omission
+/// precedent as `wire::outcome_span` — report absence, never fabricate a
+/// plausible-looking deadline).
+fn approval_event(plan_ref: &str, effects: &[Json], principal: &str) -> Json {
+    json!({
+        "$": "record",
+        "v": {
+            "plan_ref": {"$":"str","v": plan_ref},
+            "effects": {"$":"list","v": effects},
+            "principal": {"$":"str","v": principal},
+            "expires": {"$":"null"},
+        }
+    })
+}
+
+/// The `journal` event payload (AGENT-SURFACE §4): `{entry_id, head, ok,
+/// principal}`, fired once per finished journal entry (mirrors
+/// `session.transcript`'s "announce right after the fact" shape — the entry
+/// already exists in the journal by the time this fires). `head` is the
+/// entry's leading command word (`shoal-journal`'s own `head`-filter
+/// semantics: `src.split_whitespace().next()`), not a hash.
+fn journal_event(entry_id: i64, src: &str, ok: bool, principal: &str) -> Json {
+    let head = src.split_whitespace().next().unwrap_or_default();
+    json!({
+        "$": "record",
+        "v": {
+            "entry_id": {"$":"int","v": entry_id},
+            "head": {"$":"str","v": head},
+            "ok": {"$":"bool","v": ok},
+            "principal": {"$":"str","v": principal},
+        }
+    })
+}
+
+/// The `render` event payload (AGENT-SURFACE §4): `{ref, render}`, for a UI
+/// client mirroring a session's output live without polling `value.get
+/// {format:"render"}`. Fired alongside `session.transcript` for every new
+/// `out[n]`, carrying the SAME bounded/ANSI-stripped render string the exec
+/// response itself returns — never a second, unbounded copy.
+fn render_event(value_ref: &Ref, render: &str) -> Json {
+    json!({
+        "$": "record",
+        "v": {
+            "ref": {"$":"str","v": value_ref.0},
+            "render": {"$":"str","v": render},
+        }
+    })
+}
+
 /// Completion candidates at a cursor byte offset (the kernel `complete`
 /// method). Keywords/builtins plus any `let`/`var`/`fn`/`alias` names declared
 /// before the cursor, filtered by the partial word under the cursor.
@@ -1544,8 +1601,6 @@ mod tests {
             "events.subscribe",
             json!({"channel":"session.transcript"}),
         );
-        // The pushed event is written to the socket during exec dispatch, so it
-        // arrives before the exec response frame.
         write_frame(
             &mut client,
             &Request {
@@ -1556,12 +1611,140 @@ mod tests {
             },
         )
         .unwrap();
-        let note = recv_line(&mut reader);
+        // Both the pushed `session.transcript` notification and the exec
+        // response land on this connection, but which arrives FIRST is no
+        // longer guaranteed (FIX 1, AGENT-SURFACE §6): the notification is
+        // now delivered by a dedicated per-subscriber writer thread, off the
+        // dispatch call path entirely, so `publish()` never blocks on a
+        // slow/stalled subscriber's socket. That decoupling is exactly what
+        // makes the ordering this test used to pin (event strictly before
+        // response, because the old code wrote the notification inline,
+        // synchronously, from within dispatch) impossible to promise anymore
+        // — read both frames and check each on its own merits, regardless of
+        // which arrives first.
+        let first = recv_line(&mut reader);
+        let second = recv_line(&mut reader);
+        let (note, resp) = if first["method"] == "event" {
+            (first, second)
+        } else {
+            (second, first)
+        };
         assert_eq!(note["method"], "event", "expected a pushed event: {note}");
         assert_eq!(note["params"]["channel"], "session.transcript");
         assert_eq!(note["params"]["payload"]["v"]["ref"]["v"], "out:1");
-        let resp = recv_line(&mut reader);
         assert_eq!(resp["id"], 3);
+        drop(client);
+        drop(reader);
+        thread.join().unwrap();
+    }
+
+    /// FIX 2 (AGENT-SURFACE §4): `approval` used to be advertised in
+    /// `STATIC_CHANNELS` with nothing ever publishing to it — a dead
+    /// channel. `exec {mode:"plan"}` now fires it the moment a plan lands at
+    /// `Verdict::ApprovalRequired`, so a SEPARATE principal (a human's
+    /// session, a supervising agent — a different connection here, on
+    /// purpose) learns about a pending approval by subscribing, never by
+    /// polling `journal.query` or re-deriving the same plan.
+    #[test]
+    fn approval_channel_fires_when_a_plan_needs_approval() {
+        let policy = Policy::from_toml(&format!(
+            "[principal.\"{}\"]\nopaque='ask'\nauto_apply='never'\n",
+            principal()
+        ))
+        .unwrap();
+        let kernel = Kernel::with_policy(policy);
+
+        // A separate observer connection, subscribed to `approval`, never
+        // itself issuing the plan below.
+        let (mut observer, mut observer_reader, observer_thread) = spawn(&kernel);
+        attach(&mut observer, &mut observer_reader);
+        call(
+            &mut observer,
+            &mut observer_reader,
+            2,
+            "events.subscribe",
+            json!({"channel":"approval"}),
+        );
+
+        // A different connection: the agent whose plan lands at
+        // approval_required.
+        let (mut agent, mut agent_reader, agent_thread) = spawn(&kernel);
+        attach(&mut agent, &mut agent_reader);
+        let planned = call(
+            &mut agent,
+            &mut agent_reader,
+            2,
+            "exec",
+            json!({"src":"sh { echo hi }","mode":"plan","position":"stmt"}),
+        )
+        .result
+        .unwrap();
+        assert_eq!(planned["verdict"], "approval_required");
+        assert_eq!(planned["approval_pending"], true);
+        let plan_ref = planned["plan_ref"].as_str().unwrap().to_owned();
+
+        // The observer receives the approval event on its own connection —
+        // it never touched this plan itself.
+        let note = recv_line(&mut observer_reader);
+        assert_eq!(note["method"], "event", "expected a pushed event: {note}");
+        assert_eq!(note["params"]["channel"], "approval");
+        let payload = &note["params"]["payload"]["v"];
+        assert_eq!(payload["plan_ref"]["v"], plan_ref);
+        assert_eq!(payload["principal"]["v"], principal());
+        assert_eq!(payload["effects"]["v"], json!([{"kind":"opaque"}]));
+        assert_eq!(
+            payload["expires"]["$"], "null",
+            "no plan-expiry mechanism exists yet — honestly null, not fabricated: {payload}"
+        );
+
+        drop(observer);
+        drop(observer_reader);
+        observer_thread.join().unwrap();
+        drop(agent);
+        drop(agent_reader);
+        agent_thread.join().unwrap();
+    }
+
+    /// A plan that is immediately `Verdict::Allow` never needed approval, so
+    /// it must NOT fire `approval` — only a plan actually stuck pending
+    /// should ever announce on this channel.
+    #[test]
+    fn approval_channel_stays_silent_for_an_immediately_allowed_plan() {
+        let kernel = Kernel::new();
+        let (mut client, mut reader, thread) = spawn(&kernel);
+        attach(&mut client, &mut reader);
+        call(
+            &mut client,
+            &mut reader,
+            2,
+            "events.subscribe",
+            json!({"channel":"approval"}),
+        );
+        // The default-permissive policy allows pure arithmetic outright.
+        let planned = call(
+            &mut client,
+            &mut reader,
+            3,
+            "exec",
+            json!({"src":"1 + 2","mode":"plan"}),
+        )
+        .result
+        .unwrap();
+        assert_eq!(planned["verdict"], "allow");
+        let read_back = call(
+            &mut client,
+            &mut reader,
+            4,
+            "events.read",
+            json!({"channel":"approval"}),
+        )
+        .result
+        .unwrap();
+        assert_eq!(
+            read_back["events"].as_array().unwrap().len(),
+            0,
+            "an allowed plan must never announce on `approval`: {read_back}"
+        );
         drop(client);
         drop(reader);
         thread.join().unwrap();

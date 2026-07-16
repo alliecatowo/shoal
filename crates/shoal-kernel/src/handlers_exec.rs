@@ -219,6 +219,17 @@ impl Kernel {
                     approved: verdict == Verdict::Allow,
                 },
             );
+            if verdict == Verdict::ApprovalRequired {
+                // AGENT-SURFACE §4: a plan stuck at `approval_pending` is
+                // exactly the moment another principal (a human's session, a
+                // supervising agent) needs to learn about it without
+                // polling — announce it on `approval` the same way a new
+                // transcript value announces on `session.transcript`.
+                self.events.publish(
+                    "approval",
+                    approval_event(&result.plan_ref, &result.effects, &actor),
+                );
+            }
             return encode(result);
         } else if params.mode == "approved" {
             // "approved" is `plan.apply`'s re-entry, NOT a caller-assertable
@@ -293,7 +304,10 @@ impl Kernel {
             .unwrap()
             .append(&EntryRecord {
                 session: session.id.clone(),
-                principal: actor,
+                // Cloned, not moved: both the error and success paths below
+                // publish a `journal` event (AGENT-SURFACE §4) carrying this
+                // same principal, well after this record is built.
+                principal: actor.clone(),
                 ts_ns: now_ns(),
                 cwd: evaluator.cwd().as_os_str().as_bytes().to_vec(),
                 src: params.src.clone(),
@@ -312,6 +326,10 @@ impl Kernel {
                         let _ = journal.record_output(entry_id, "stderr", stderr.as_bytes());
                     }
                 }
+                self.events.publish(
+                    "journal",
+                    journal_event(entry_id, &params.src, false, &actor),
+                );
                 // AGENT-SURFACE §0/§5: even a raised error is
                 // addressable — store it as an out[n] transcript value
                 // so the agent can `shoal_get` the structured error
@@ -378,6 +396,10 @@ impl Kernel {
                 }
             }
         }
+        self.events.publish(
+            "journal",
+            journal_event(entry_id, &params.src, true, &actor),
+        );
         // AGENT-SURFACE §4: announce the new transcript value on the
         // `session.transcript` channel — subscribers learn a new
         // out[n] exists (with its shape summary) without polling.
@@ -390,6 +412,11 @@ impl Kernel {
         // (AGENT-SURFACE §3) — a huge render must never bypass the wall the
         // structured value already respects.
         let bounded_render = bound_render(render, &exec_uri, !attachment.tty);
+        // AGENT-SURFACE §4: a live UI subscribing to `render` sees the same
+        // string the exec response itself carries — no separate unbounded
+        // copy, no polling `value.get {format:"render"}`.
+        self.events
+            .publish("render", render_event(&value_ref, &bounded_render));
         encode(ExecResult {
             r#ref: value_ref,
             value: Some(elide_wire_value(&value, &exec_uri, &exec_budget)),
