@@ -68,11 +68,17 @@ pub fn value_to_json(v: &Value) -> serde_json::Value {
         Value::DateTime(z) => json!(z.to_string()),
         Value::Time(t) => json!(render::render_time(t)),
         Value::Bytes(b) => json!(String::from_utf8_lossy(b)),
-        // Load the full CAS-backed content (falling back to the bounded preview
-        // if the store is unreachable) so JSON serialization is faithful.
-        Value::CasBytes(c) => json!(String::from_utf8_lossy(
-            &c.resolve().unwrap_or_else(|_| c.preview.as_ref().clone())
-        )),
+        // A CAS-backed bytes value reached here is, by construction, either a
+        // bare top-level `resolve()`-first call (`json.stringify`/
+        // `yaml.stringify`/`toml.stringify` handed the value directly) or
+        // NESTED inside a record/table/list field. Either way this is the
+        // single, deliberate, bounded answer (P6 audit, see
+        // `CasBytesVal::json_preview`'s doc comment): metadata + the resident
+        // preview, never a CAS load. A bare `.json()` METHOD call never
+        // reaches this arm at all — `methods::dispatch`'s CasBytes fallback
+        // fully materializes and converts to `Value::Bytes` first, so that
+        // call site's full-fidelity behavior is unchanged.
+        Value::CasBytes(c) => c.json_preview(),
         Value::List(xs) => serde_json::Value::Array(xs.iter().map(value_to_json).collect()),
         Value::Record(r) => serde_json::Value::Object(
             r.iter()
@@ -99,5 +105,67 @@ pub fn value_to_json(v: &Value) -> serde_json::Value {
         Value::Error(e) => json!({"code": e.code, "msg": e.msg}),
         Value::Secret(s) => json!(format!("secret({})", s.name)),
         other => json!(render::render_inline(other)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::value_types::test_support;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// The P6 audit's headline fix: a CasBytes value NESTED inside a record
+    /// (the shape a real spilled `.stdout` takes once captured into a field)
+    /// no longer silently pulls the full content through the CAS just because
+    /// the record got `value_to_json`'d — it gets the same bounded
+    /// ref+preview `json_preview` shape a top-level render would show.
+    #[test]
+    fn nested_cas_bytes_does_not_load_when_json_encoding_a_record() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = test_support::cas_bytes(b"hel", b"hello world", calls.clone());
+        let mut r = Record::new();
+        r.insert("out".into(), Value::CasBytes(Arc::new(c)));
+        r.insert("status".into(), Value::Int(0));
+
+        let j = value_to_json(&Value::Record(r));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "nested encode must not load"
+        );
+        assert_eq!(j["out"]["$"], "bytes_ref");
+        assert_eq!(j["out"]["ref"], "val:blake3:deadbeefcafef00d");
+        assert_eq!(j["out"]["len"], 11);
+        assert_eq!(j["out"]["preview"], "hel");
+        assert_eq!(j["status"], 0);
+    }
+
+    /// Same fix applies to a table row and a plain list element — any
+    /// container, not just a record field.
+    #[test]
+    fn nested_cas_bytes_does_not_load_inside_list_or_table() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = test_support::cas_bytes(b"a", b"abcdef", calls.clone());
+        let list = Value::List(vec![Value::Int(1), Value::CasBytes(Arc::new(c))]);
+        let j = value_to_json(&list);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(j[1]["$"], "bytes_ref");
+        assert_eq!(j[1]["len"], 6);
+    }
+
+    /// A bare CasBytes value handed directly to `value_to_json` (the path
+    /// `json.stringify`/`yaml.stringify`/`toml.stringify` take when called
+    /// with the value itself, as opposed to the `.json()` VALUE METHOD)
+    /// is the same bounded answer — there is exactly one `value_to_json`
+    /// behavior for this type, not a top-level/nested split.
+    #[test]
+    fn bare_value_to_json_on_cas_bytes_is_also_bounded() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = test_support::cas_bytes(b"hel", b"hello world", calls.clone());
+        let j = value_to_json(&Value::CasBytes(Arc::new(c)));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(j["$"], "bytes_ref");
+        assert_eq!(j["len"], 11);
     }
 }

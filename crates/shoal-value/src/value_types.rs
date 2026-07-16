@@ -16,6 +16,42 @@ use crate::ports::BytesLoad;
 /// that need the whole bytes materialize them through [`CasBytesVal::resolve`].
 /// A small (sub-cap) capture is a plain [`Value::Bytes`] and never becomes one
 /// of these — there is zero change to the common, fully-resident path.
+///
+/// # The P6 audit's chokepoint (docs/ROADMAP.md audit, TDD §317)
+///
+/// Before this refactor, awareness of this variant was scattered across ~6
+/// call sites, each hand-rolling its own little match on `name`/metadata. Two
+/// methods here are the centralized answer:
+///
+/// - [`cheap_method`](Self::cheap_method) — the ONE `name -> metadata-only
+///   answer` table (`len`/`count`/`is_empty`/`ref`), called from
+///   `methods::dispatch`'s CasBytes arm instead of a duplicated inline match.
+/// - [`json_preview`](Self::json_preview) — the deliberate, bounded answer for
+///   a CasBytes value found NESTED inside a larger value being JSON-encoded
+///   (a record/table field, a `.feed`'d structure, a direct
+///   `json.stringify`/`yaml.stringify`/`toml.stringify` argument). Before this
+///   change, `value_to_json` (`crate::json`) called [`resolve`](Self::resolve)
+///   unconditionally there — a value the caller never asked to see in full
+///   could silently pull up to the full spill cap (~1 GiB) into memory just
+///   because it happened to be a field of something being serialized. That
+///   was the main risk this audit flagged; `json_preview` fixes it by
+///   answering from the resident preview + metadata only, exactly like
+///   `render()` does, never touching the CAS. A bare top-level `.json()` on
+///   the bytes themselves is unaffected: `methods::dispatch`'s CasBytes
+///   fallback already fully materializes (and converts to `Value::Bytes`)
+///   *before* `value_to_json` is ever reached, so that call site keeps its
+///   existing, deliberate full-load behavior.
+///
+/// Everywhere else this type's awareness turned out to already be correct and
+/// singular, not scattered: `ops.rs`'s arithmetic/comparison/`contains` tables
+/// have no `Bytes` arm either (both hit the same generic type-error fallback,
+/// consistently); structural equality (`lib.rs`) and `render.rs` each read
+/// straight off the metadata fields with no duplicated match to centralize —
+/// their existing behavior (a spilled value comparing unequal to a
+/// byte-identical resident one; a ref-carrying render distinct from a bare
+/// `Bytes` render) is a documented wrinkle, preserved here on purpose rather
+/// than "fixed", since silently reinterpreting it would be an observable
+/// behavior change nobody asked for.
 pub struct CasBytesVal {
     /// blake3 hex of the full stored content — the recoverable `val:blake3:…`
     /// ref (AGENT-SURFACE elision doctrine, in-language).
@@ -58,6 +94,40 @@ impl CasBytesVal {
     /// The recoverable content ref, e.g. `val:blake3:<hash>`.
     pub fn reference(&self) -> String {
         format!("{}{}", Self::REF_PREFIX, self.hash)
+    }
+
+    /// The metadata-only answer for a method name, when one exists — never
+    /// loads from the CAS. The single chokepoint for the cheap-answer table
+    /// (`len`/`count`/`is_empty`/`ref`); `None` means the caller needs the
+    /// actual bytes (`methods::dispatch` then either loads explicitly for
+    /// `load`/`bytes`, or fully materializes and re-dispatches as a plain
+    /// `Value::Bytes` for anything else).
+    pub fn cheap_method(&self, name: &str) -> Option<Value> {
+        match name {
+            "len" | "count" => Some(Value::Int(self.len as i64)),
+            "is_empty" => Some(Value::Bool(self.len == 0)),
+            "ref" => Some(Value::Str(self.reference())),
+            _ => None,
+        }
+    }
+
+    /// The bounded, lazy JSON representation used when this value is
+    /// encountered NESTED inside a larger value being JSON-encoded (see the
+    /// struct doc's "P6 audit" section for why this exists and why it's safe
+    /// relative to the bare top-level `.json()` method, which fully
+    /// materializes through a different, deliberate call site). Never loads
+    /// from the CAS: just the recoverable ref, the true length, the
+    /// truncation flag, and the already-resident preview — the same
+    /// information `render()` shows, shaped as JSON instead of a display
+    /// string.
+    pub fn json_preview(&self) -> serde_json::Value {
+        serde_json::json!({
+            "$": "bytes_ref",
+            "ref": self.reference(),
+            "len": self.len,
+            "truncated": self.truncated,
+            "preview": String::from_utf8_lossy(&self.preview),
+        })
     }
 }
 
@@ -291,9 +361,51 @@ pub fn parse_time(word: &str) -> Option<TimeVal> {
     Some(TimeVal { hour, min, sec })
 }
 
+/// Test-only support for the `CasBytesVal` chokepoint tests (P6 audit),
+/// `pub(crate)` so other files' test modules (`json.rs`, `methods/mod.rs`)
+/// can build a fake spilled value without a real journal/CAS, and assert
+/// whether its loader was actually invoked.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::{Arc, BytesLoad, CasBytesVal};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A [`BytesLoad`] that counts every call and hands back fixed content —
+    /// the probe a test uses to prove a "cheap" path never loads while a
+    /// materializing one loads exactly once.
+    pub(crate) struct CountingLoader {
+        pub(crate) calls: Arc<AtomicUsize>,
+        pub(crate) data: Vec<u8>,
+    }
+
+    impl BytesLoad for CountingLoader {
+        fn load(&self) -> std::io::Result<Vec<u8>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.data.clone())
+        }
+    }
+
+    /// Build a `CasBytesVal` with `preview` resident and `full` as the
+    /// "on-disk" content, wired to a loader that increments `calls` on every
+    /// actual load.
+    pub(crate) fn cas_bytes(preview: &[u8], full: &[u8], calls: Arc<AtomicUsize>) -> CasBytesVal {
+        CasBytesVal {
+            hash: "deadbeefcafef00d".into(),
+            len: full.len() as u64,
+            preview: Arc::new(preview.to_vec()),
+            truncated: preview.len() < full.len(),
+            loader: Arc::new(CountingLoader {
+                calls,
+                data: full.to_vec(),
+            }),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn content_ref_encode_decode_roundtrip() {
@@ -313,5 +425,65 @@ mod tests {
         assert_eq!(CasBytesVal::parse_ref("blake3:deadbeef"), None);
         assert_eq!(CasBytesVal::parse_ref("val:blake2:deadbeef"), None);
         assert_eq!(CasBytesVal::parse_ref("hello world"), None);
+    }
+
+    /// `cheap_method` answers `len`/`count`/`is_empty`/`ref` from metadata
+    /// alone, never touching the loader (P6 audit chokepoint).
+    #[test]
+    fn cheap_method_never_loads() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = test_support::cas_bytes(b"hel", b"hello world", calls.clone());
+        assert_eq!(c.cheap_method("len"), Some(Value::Int(11)));
+        assert_eq!(c.cheap_method("count"), Some(Value::Int(11)));
+        assert_eq!(c.cheap_method("is_empty"), Some(Value::Bool(false)));
+        assert_eq!(
+            c.cheap_method("ref"),
+            Some(Value::Str("val:blake3:deadbeefcafef00d".into()))
+        );
+        // A name outside the cheap table defers to the caller.
+        assert_eq!(c.cheap_method("upper"), None);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "cheap_method must not load"
+        );
+    }
+
+    #[test]
+    fn empty_cas_bytes_is_empty() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = test_support::cas_bytes(b"", b"", calls.clone());
+        assert_eq!(c.cheap_method("is_empty"), Some(Value::Bool(true)));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// `json_preview` (the nested-JSON P6 fix) answers from the ref/length/
+    /// truncation/preview metadata alone — never loads.
+    #[test]
+    fn json_preview_never_loads() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = test_support::cas_bytes(b"hel", b"hello world", calls.clone());
+        let j = c.json_preview();
+        assert_eq!(j["$"], "bytes_ref");
+        assert_eq!(j["ref"], "val:blake3:deadbeefcafef00d");
+        assert_eq!(j["len"], 11);
+        assert_eq!(j["truncated"], true);
+        assert_eq!(j["preview"], "hel");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "json_preview must not load"
+        );
+    }
+
+    /// `resolve()` — the deliberate full-materialize chokepoint used by the
+    /// bare top-level `.json()`/`.load`/`.bytes`/`.feed` call sites — loads
+    /// exactly once and returns the true full content, not just the preview.
+    #[test]
+    fn resolve_loads_full_content_once() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = test_support::cas_bytes(b"hel", b"hello world", calls.clone());
+        assert_eq!(c.resolve().unwrap(), b"hello world".to_vec());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

@@ -47,6 +47,7 @@ const SEQ_METHODS: &[&str] = &[
     "chunks",
     "zip",
     "group",
+    "group_by",
     "join",
     "contains",
     "get",
