@@ -36,7 +36,7 @@ mod which;
 use std::ffi::OsString;
 use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 pub use cancel::CancelToken;
 pub use capture::{StreamingChild, spawn_capture};
@@ -44,13 +44,26 @@ pub use which::which;
 
 /// Default hard cap on the bytes buffered in memory when capturing a command's
 /// output in value position (TDD §317). Once a captured buffer reaches this
-/// size it stops growing and [`ExecResult::truncated`] is set. 64 MiB is high
-/// enough that ordinary command output is never affected, yet low enough that
-/// `let x = (yes)` / `let x = (cat /dev/zero)` cannot OOM the shell.
+/// size it stops growing in RAM. 64 MiB is high enough that ordinary command
+/// output is never affected, yet low enough that `let x = (yes)` /
+/// `let x = (cat /dev/zero)` cannot OOM the shell.
 ///
-/// The full §317 promise (spill to CAS past this cap and expose the overflow as
-/// a ref) is a documented follow-up; this is the safe minimum: bound the RAM.
+/// What happens past the cap depends on whether the spec requested a spill
+/// ([`ExecSpec::spill`]): with no spill, overflow is discarded and
+/// [`ExecResult::truncated`] is set (the RAM floor, unchanged); with a spill,
+/// the full stream is streamed to a disk file (blake3-addressed, up to
+/// [`capture_spill_cap`]) and returned as [`ExecResult::stdout_spill`] so the
+/// caller can adopt it into the CAS as a ref-backed value (TDD §317's
+/// disk-spill promise). The 64 MiB resident buffer is then the value's preview.
 pub const DEFAULT_CAPTURE_HARD_CAP: usize = 64 * 1024 * 1024;
+
+/// Default hard cap on the bytes streamed to a **disk** spill file when a
+/// capture requests one ([`ExecSpec::spill`]) and its output exceeds the RAM
+/// cap. Bounds disk the way [`DEFAULT_CAPTURE_HARD_CAP`] bounds RAM: without
+/// it, `let x = (yes)` would fill the disk instead of OOMing. 1 GiB is large
+/// enough that real captures (build logs, `cat huge.log`) spill whole; past it
+/// the spill stops and [`CaptureSpill::truncated`] is set.
+pub const DEFAULT_CAPTURE_SPILL_CAP: u64 = 1024 * 1024 * 1024;
 
 /// `0` sentinel = not yet resolved; the first [`capture_hard_cap`] call seeds it
 /// from the `SHOAL_CAPTURE_CAP_BYTES` env var (a positive integer) or the
@@ -80,6 +93,32 @@ pub fn set_capture_hard_cap(bytes: usize) {
     CAPTURE_HARD_CAP.store(bytes.max(1), Ordering::Relaxed);
 }
 
+/// `0` sentinel = not yet resolved (see [`CAPTURE_HARD_CAP`]).
+static CAPTURE_SPILL_CAP: AtomicU64 = AtomicU64::new(0);
+
+/// The active disk-spill hard cap in bytes (see [`DEFAULT_CAPTURE_SPILL_CAP`]).
+/// Resolved once from `SHOAL_CAPTURE_SPILL_CAP_BYTES` or the default, unless
+/// overridden by [`set_capture_spill_cap`].
+pub fn capture_spill_cap() -> u64 {
+    let cached = CAPTURE_SPILL_CAP.load(Ordering::Relaxed);
+    if cached != 0 {
+        return cached;
+    }
+    let resolved = std::env::var("SHOAL_CAPTURE_SPILL_CAP_BYTES")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_CAPTURE_SPILL_CAP);
+    CAPTURE_SPILL_CAP.store(resolved, Ordering::Relaxed);
+    resolved
+}
+
+/// Override the disk-spill hard cap (bytes). For hosts wiring config and for
+/// tests; `0` is clamped to `1` so the cap is always positive.
+pub fn set_capture_spill_cap(bytes: u64) {
+    CAPTURE_SPILL_CAP.store(bytes.max(1), Ordering::Relaxed);
+}
+
 /// A fully-resolved request to execute one external process.
 #[derive(Debug, Clone)]
 pub struct ExecSpec {
@@ -102,6 +141,45 @@ pub struct ExecSpec {
     /// report what actually happened via [`ExecResult::enforcement`]; see
     /// [`shoal_leash::SandboxPolicy`].
     pub sandbox: Option<shoal_leash::SandboxPolicy>,
+    /// Optional disk-spill request for value-position capture (TDD §317).
+    /// `None` (the default) preserves the pre-spill behavior *exactly*: stdout
+    /// is buffered up to [`capture_hard_cap`] and any overflow is discarded
+    /// with [`ExecResult::truncated`] set. When `Some`, a capture whose stdout
+    /// exceeds the RAM cap streams the **full** stream to a blake3-addressed
+    /// file under [`SpillConfig::dir`] (bounded by [`capture_spill_cap`]),
+    /// returned as [`ExecResult::stdout_spill`]; the resident buffer becomes a
+    /// bounded preview. Only honored in [`ExecMode::Capture`].
+    pub spill: Option<SpillConfig>,
+}
+
+/// Where and whether a value-position capture may spill oversized stdout to
+/// disk (TDD §317). The caller (which owns the content-addressed store) hands
+/// in a directory it will later adopt the spill file from; keeping the CAS
+/// itself out of `shoal-exec` preserves the crate's dependency layering.
+#[derive(Debug, Clone)]
+pub struct SpillConfig {
+    /// Directory the spill file is created in. Should be on the same
+    /// filesystem the caller ingests it into. Must already exist.
+    pub dir: PathBuf,
+}
+
+/// A value-position capture whose stdout exceeded [`capture_hard_cap`] and was
+/// streamed to disk (TDD §317). The file at [`CaptureSpill::path`] holds the
+/// captured bytes (the full stream unless [`CaptureSpill::truncated`]), and
+/// [`CaptureSpill::hash`] is their blake3, so the caller can adopt it into a
+/// content-addressed store as a ref-backed value. The caller **owns** the file:
+/// it must move it into the store or delete it.
+#[derive(Debug, Clone)]
+pub struct CaptureSpill {
+    /// Path of the on-disk spill file (caller-owned; see the type docs).
+    pub path: PathBuf,
+    /// blake3 hex of the bytes actually stored in the file.
+    pub hash: String,
+    /// Length in bytes of the stored content (== the value's true length).
+    pub len: u64,
+    /// `true` when the stream itself exceeded [`capture_spill_cap`] and the
+    /// spill was truncated to that bound (the stored bytes are a prefix).
+    pub truncated: bool,
 }
 
 /// What to connect to the child's stdin.
@@ -152,7 +230,19 @@ pub struct ExecResult {
     /// (or the PtyTee `stdout`) is a prefix of what the child actually produced.
     /// The child still ran to completion and, for PtyTee, the real terminal saw
     /// the full stream — only the returned buffer is bounded.
+    ///
+    /// When [`ExecResult::stdout_spill`] is `Some`, stdout was **not** lost to
+    /// this flag — it overflowed the RAM cap but was preserved on disk; `stdout`
+    /// here is the bounded preview. `truncated` then reflects only stderr (or a
+    /// spill that itself hit [`capture_spill_cap`], mirrored in
+    /// [`CaptureSpill::truncated`]).
     pub truncated: bool,
+    /// `Some` when this was a value-position capture ([`ExecSpec::spill`] set)
+    /// whose stdout overflowed the RAM cap and was streamed to disk (TDD §317).
+    /// The caller owns the referenced file and must adopt it into its CAS (or
+    /// delete it). `None` on every other path — no spill was requested, or
+    /// stdout fit within the RAM cap and is fully resident in `stdout`.
+    pub stdout_spill: Option<CaptureSpill>,
     /// Wall-clock time from spawn to reap.
     pub dur: std::time::Duration,
     /// The child's process id (also its process-group id).

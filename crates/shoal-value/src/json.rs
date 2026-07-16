@@ -68,6 +68,11 @@ pub fn value_to_json(v: &Value) -> serde_json::Value {
         Value::DateTime(z) => json!(z.to_string()),
         Value::Time(t) => json!(render::render_time(t)),
         Value::Bytes(b) => json!(String::from_utf8_lossy(b)),
+        // Load the full CAS-backed content (falling back to the bounded preview
+        // if the store is unreachable) so JSON serialization is faithful.
+        Value::CasBytes(c) => json!(String::from_utf8_lossy(
+            &c.resolve().unwrap_or_else(|_| c.preview.as_ref().clone())
+        )),
         Value::List(xs) => serde_json::Value::Array(xs.iter().map(value_to_json).collect()),
         Value::Record(r) => serde_json::Value::Object(
             r.iter()

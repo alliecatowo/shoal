@@ -225,6 +225,17 @@ pub(crate) fn wire_value(value: &Value) -> WireValue {
         Value::Bytes(v) => WireValue::Bytes {
             v: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &**v),
         },
+        // §317 lazy CAS-backed bytes. The raw encoder can't do I/O, so it emits
+        // the resident preview; the elision layer (`elide_wire_value`) is where
+        // a top-level CAS-backed value becomes an honest `Ref` carrying its true
+        // length. (Elision at the boundary is mandated by AGENT-SURFACE §3, so a
+        // top-level oversized capture always goes through that path.)
+        Value::CasBytes(c) => WireValue::Bytes {
+            v: base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                c.preview.as_ref(),
+            ),
+        },
         Value::List(v) => WireValue::List {
             v: v.iter().map(wire_value).collect(),
         },
@@ -390,6 +401,14 @@ fn preview_value(value: &Value) -> Value {
         Value::Bytes(b) => Value::Bytes(std::sync::Arc::new(
             b.iter().take(ELIDE_PREVIEW_BYTES).copied().collect(),
         )),
+        // §317: preview a CAS-backed value from its resident prefix (never load).
+        Value::CasBytes(c) => Value::Bytes(std::sync::Arc::new(
+            c.preview
+                .iter()
+                .take(ELIDE_PREVIEW_BYTES)
+                .copied()
+                .collect(),
+        )),
         Value::Str(s) => Value::Str(s.chars().take(ELIDE_PREVIEW_BYTES).collect()),
         Value::Record(rec) => Value::Record(
             rec.keys()
@@ -459,7 +478,10 @@ pub(crate) fn elide_wire_value(value: &Value, uri: &str, budget: &ElideBudget) -
     let too_big = encoded_len > budget.max_bytes
         || matches!(value, Value::Table(rows) if rows.len() > budget.max_rows)
         || matches!(value, Value::List(items) if items.len() > budget.max_items)
-        || matches!(value, Value::Bytes(b) if b.len() > budget.max_bytes_raw);
+        || matches!(value, Value::Bytes(b) if b.len() > budget.max_bytes_raw)
+        // A §317 CAS-backed value is oversized by construction — always elide
+        // it to an honest ref rather than shipping its preview as if complete.
+        || matches!(value, Value::CasBytes(_));
     if !too_big {
         return wire;
     }
@@ -467,6 +489,8 @@ pub(crate) fn elide_wire_value(value: &Value, uri: &str, budget: &ElideBudget) -
         Value::Table(rows) => rows.len(),
         Value::List(items) => items.len(),
         Value::Bytes(b) => b.len(),
+        // §317: the true total length (never the preview length).
+        Value::CasBytes(c) => c.len as usize,
         Value::Str(s) => s.len(),
         Value::Record(rec) => rec.len(),
         _ => 1,

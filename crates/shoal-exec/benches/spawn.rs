@@ -12,6 +12,7 @@ fn bench_suite(c: &mut Criterion) {
                     stdin: StdinSpec::Null,
                     mode: ExecMode::Capture,
                     sandbox: None,
+                    spill: None,
                 },
                 &CancelToken::new(),
             )

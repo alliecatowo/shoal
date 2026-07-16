@@ -234,6 +234,8 @@ pub(crate) fn builtin_outcome(head: &str, result: Value) -> Value {
         signal: None,
         ok: true,
         stdout: Arc::new(stdout),
+        // Builtin outcomes are always fully resident (no capture spill).
+        stdout_ref: None,
         stderr: Arc::new(Vec::new()),
         dur_ns: 0,
         pid: 0,
@@ -251,6 +253,9 @@ pub(crate) fn builtin_outcome(head: &str, result: Value) -> Value {
 pub(crate) fn value_bytes(v: &Value) -> Vec<u8> {
     match v {
         Value::Bytes(b) => (**b).clone(),
+        // §317: a CAS-backed value writes its FULL content (loaded on demand),
+        // falling back to the resident preview only if the store is unreachable.
+        Value::CasBytes(c) => c.resolve().unwrap_or_else(|_| c.preview.as_ref().clone()),
         Value::Str(s) => {
             let mut b = s.clone().into_bytes();
             if !s.ends_with('\n') {
@@ -258,7 +263,7 @@ pub(crate) fn value_bytes(v: &Value) -> Vec<u8> {
             }
             b
         }
-        Value::Outcome(o) => (*o.stdout).clone(),
+        Value::Outcome(o) => o.stdout_bytes().unwrap_or_else(|_| (*o.stdout).clone()),
         Value::Null => Vec::new(),
         other => {
             let mut b = crate::helpers::display_top(other).into_bytes();

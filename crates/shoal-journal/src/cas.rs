@@ -4,7 +4,7 @@
 use std::fs;
 use std::io;
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rusqlite::params;
@@ -181,5 +181,117 @@ impl Journal {
             .join(&hex[0..2])
             .join(&hex[2..4])
             .join(format!("{hex}.zst"))
+    }
+
+    /// A cheap, cloneable, DB-independent reader over this journal's CAS
+    /// directory. Reading a blob is pure filesystem work (open + zstd-decode +
+    /// integrity check), so the returned [`Cas`] needs no SQLite connection and
+    /// is `Send + Sync` — the shape a lazy, ref-backed value's loader needs
+    /// (TDD §317). It shares the same on-disk store, so blobs written via
+    /// [`Journal::record_output`] / [`Journal::ingest_spill`] are readable
+    /// through it.
+    pub fn cas(&self) -> Cas {
+        Cas {
+            root: self.cas_root.clone(),
+        }
+    }
+
+    /// Directory value-position captures spill oversized stdout into before it
+    /// is adopted via [`Journal::ingest_spill`] (TDD §317). Co-located with the
+    /// CAS (a sibling of `cas/` under the state dir) so it shares the store's
+    /// filesystem and lifetime (an in-memory journal's temp dir cleans it up).
+    /// Created on demand.
+    pub fn spill_dir(&self) -> io::Result<PathBuf> {
+        let dir = self
+            .cas_root
+            .parent()
+            .unwrap_or(self.cas_root.as_path())
+            .join("spill");
+        fs::create_dir_all(&dir)?;
+        Ok(dir)
+    }
+
+    /// Adopt an already-written spill file (from [`Journal::spill_dir`]) into
+    /// the CAS as a compressed, blake3-addressed blob (TDD §317). `hash` and
+    /// `len` come from [`shoal_exec::CaptureSpill`] — the blake3 and byte length
+    /// of the file's contents. The blob is written (zstd-streamed, so RAM stays
+    /// bounded) only if not already present; a `blob` row is recorded and,
+    /// when `pin` is set, the blob is pinned so GC keeps it while the
+    /// in-language ref-backed value is live. The source file is removed on
+    /// success.
+    pub fn ingest_spill(
+        &self,
+        src: &Path,
+        hash: &str,
+        len: u64,
+        pin: bool,
+    ) -> rusqlite::Result<()> {
+        let raw = hex_bytes(hash)
+            .map_err(|_| rusqlite::Error::InvalidParameterName("invalid hash".into()))?;
+        let path = self.blob_path(hash);
+        if !path.exists() {
+            let parent = path.parent().expect("blob path always has a parent");
+            fs::create_dir_all(parent).map_err(io_to_sql)?;
+            let infile = fs::File::open(src).map_err(io_to_sql)?;
+            let mut tmp = tempfile::NamedTempFile::new_in(parent).map_err(io_to_sql)?;
+            zstd::stream::copy_encode(infile, &mut tmp, ZSTD_LEVEL).map_err(io_to_sql)?;
+            tmp.flush().map_err(io_to_sql)?;
+            tmp.persist(&path).map_err(|e| io_to_sql(e.error))?;
+        }
+        let now = now_ns();
+        self.conn.execute(
+            "INSERT OR IGNORE INTO blob(hash,stored_len,created_ns,last_access_ns) VALUES(?1,?2,?3,?3)",
+            params![raw.as_slice(), len as i64, now],
+        )?;
+        if pin {
+            self.pin(hash)?;
+        }
+        // Best-effort cleanup: the blob is safely in the CAS now.
+        let _ = fs::remove_file(src);
+        Ok(())
+    }
+}
+
+/// A DB-independent handle to a CAS directory (see [`Journal::cas`]). Cloning is
+/// cheap (one `PathBuf`); reads are pure filesystem work and content-verified,
+/// so a lazy [`shoal_value`]-side value can hold one as its loader without any
+/// SQLite connection or lifetime tie to the owning [`Journal`].
+#[derive(Debug, Clone)]
+pub struct Cas {
+    root: PathBuf,
+}
+
+impl Cas {
+    fn blob_path(&self, hex: &str) -> PathBuf {
+        self.root
+            .join(&hex[0..2])
+            .join(&hex[2..4])
+            .join(format!("{hex}.zst"))
+    }
+
+    /// Read and decompress the CAS blob addressed by `hash`, verifying the
+    /// decompressed bytes re-hash to `hash` (the same integrity guard as
+    /// [`Journal::read_blob`]). A missing blob or malformed hash is a
+    /// `NotFound` error; a hash mismatch is `InvalidData`.
+    pub fn read(&self, hash: &str) -> io::Result<Vec<u8>> {
+        if hash.len() < 4 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{hash} does not address a CAS blob"),
+            ));
+        }
+        let compressed = fs::read(self.blob_path(hash))?;
+        let bytes = zstd::decode_all(compressed.as_slice())?;
+        if !blake3::hash(&bytes)
+            .to_hex()
+            .as_str()
+            .eq_ignore_ascii_case(hash)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("CAS blob {hash} failed integrity check: content hash mismatch"),
+            ));
+        }
+        Ok(bytes)
     }
 }

@@ -314,7 +314,17 @@ undo(entry_id INT, op TEXT, inverse TEXT)
 pin(hash BLOB PK)
 ```
 
-**CAS**: `cas/aa/bb/<blake3>.zst`, zstd, sharded; bounded buffer, disk spill >64 MiB, truncation markers. GC: TTL + LRU, pins exempt; entry rows outlive blobs. **Undo**: fs builtins record inverses (delete → trash-CAS move; overwrite → prior-content hash); `undo out[7]` replays inverses newest-first, refuses when stale. **Redaction by construction**: secrets journaled as names only.
+**CAS**: `cas/aa/bb/<blake3>.zst`, zstd, sharded; bounded buffer, disk spill >64 MiB, truncation markers.
+Value-position capture (`let x = (cmd)`) is OOM-safe *and* lossless: stdout is buffered to
+`capture_hard_cap()` (64 MiB) in RAM, and once it overflows the full stream spills to a
+blake3-addressed CAS blob on disk (bounded by `capture_spill_cap()`, 1 GiB). The value becomes a
+lazy, ref-backed `Value::CasBytes` — a 64 MiB resident preview + `{hash, len}` + on-demand load:
+`.len` is the true length without loading, `render` shows the preview + total size + the
+`val:blake3:<hash>` ref, and `.str()`/`.load()`/index materialize the full bytes from the CAS.
+Sub-cap captures stay fully resident `Value::Bytes` (zero change). Spill only engages when a journal
+(CAS) is installed; `-c`/scripts without one keep the bounded-RAM+`truncated` floor. (Follow-ups:
+in-language method dispatch directly on a `val:blake3:` ref, and `value.get` wire resolution of a
+CasBytes ref, are not yet wired — the value is durable and materializable in-process today.) GC: TTL + LRU, pins exempt; entry rows outlive blobs. **Undo**: fs builtins record inverses (delete → trash-CAS move; overwrite → prior-content hash); `undo out[7]` replays inverses newest-first, refuses when stale. **Redaction by construction**: secrets journaled as names only.
 
 ---
 

@@ -117,7 +117,16 @@ pub struct ExecSpec {
     pub sandbox: Option<shoal_leash::SandboxPolicy>,  // None = existing unsandboxed behavior; Some = apply the
                                                       // strongest available OS enforcement pre-exec (TDD §8),
                                                       // reported honestly via ExecResult::enforcement
+    pub spill: Option<SpillConfig>,  // None (default) = pre-spill behavior (bounded buffer, overflow dropped +
+                                     // truncated). Some = value-position capture may stream stdout past the RAM
+                                     // cap to a blake3-addressed file under SpillConfig::dir (TDD §317 disk-spill),
+                                     // returned as ExecResult::stdout_spill for the caller to adopt into its CAS.
+                                     // Honored only in ExecMode::Capture.
 }
+
+// Where a value-position capture may spill oversized stdout to disk (TDD §317). The caller owns the CAS;
+// shoal-exec stays journal-independent by writing to a caller-supplied dir it later adopts the file from.
+pub struct SpillConfig { pub dir: PathBuf }  // dir must exist; ideally the CAS's own filesystem
 
 pub enum StdinSpec { Null, Inherit, Bytes(Vec<u8>), File(PathBuf) }
 
@@ -135,7 +144,12 @@ pub struct ExecResult {
     pub stdout: Vec<u8>,         // captured bytes (PtyTee: the teed merged stream)
     pub stderr: Vec<u8>,         // captured bytes (PtyTee: empty)
     pub truncated: bool,         // captured buffer hit capture_hard_cap() and was truncated (TDD §317);
-                                 // stdout/stderr is a prefix — child still ran, PtyTee terminal saw all
+                                 // stdout/stderr is a prefix — child still ran, PtyTee terminal saw all.
+                                 // When stdout_spill is Some, stdout was NOT lost to this flag (it spilled);
+                                 // truncated then reflects only stderr (or a spill hitting capture_spill_cap()).
+    pub stdout_spill: Option<CaptureSpill>,  // Some when a spill-requesting Capture's stdout overflowed the RAM
+                                             // cap and was streamed to disk (TDD §317). stdout above is the
+                                             // bounded preview; the caller owns the file and must adopt/delete it.
     pub dur: std::time::Duration,
     pub pid: u32,
     pub enforcement: Option<shoal_leash::EnforcementStatus>,  // Some iff sandbox was requested: the tier
@@ -143,11 +157,26 @@ pub struct ExecResult {
                                                               // never `enforced: true` unless it really was
 }
 
+// A value-position capture whose stdout exceeded capture_hard_cap() and was streamed to disk (TDD §317).
+// The caller owns the file: move it into its CAS (e.g. Journal::ingest_spill) or delete it.
+pub struct CaptureSpill {
+    pub path: PathBuf,      // on-disk spill file, caller-owned
+    pub hash: String,       // blake3 hex of the stored bytes
+    pub len: u64,           // stored length == the value's true byte length
+    pub truncated: bool,    // stored bytes were themselves capped at capture_spill_cap() (a prefix)
+}
+
 // Configurable in-memory cap on value-position capture (TDD §317). Default 64 MiB; env override
 // SHOAL_CAPTURE_CAP_BYTES; set_capture_hard_cap for hosts/tests. Bounds RAM so `let x = (yes)` can't OOM.
 pub const DEFAULT_CAPTURE_HARD_CAP: usize;
 pub fn capture_hard_cap() -> usize;
 pub fn set_capture_hard_cap(bytes: usize);
+// Configurable on-disk cap on a capture's spill file (TDD §317). Default 1 GiB; env override
+// SHOAL_CAPTURE_SPILL_CAP_BYTES; set_capture_spill_cap for hosts/tests. Bounds disk so `let x = (yes)`
+// with a spill can't fill it; past this the spill stops and CaptureSpill::truncated is set.
+pub const DEFAULT_CAPTURE_SPILL_CAP: u64;
+pub fn capture_spill_cap() -> u64;
+pub fn set_capture_spill_cap(bytes: u64);
 
 #[derive(Clone, Default)]
 pub struct CancelToken(/* private */);
@@ -254,6 +283,17 @@ impl Journal {
     /// Content-addressed read: decompressed bytes are re-hashed against `hash`; a mismatch (corruption/bit-rot)
     /// is an integrity Err, never wrong bytes. Ok(None) only when the blob is absent / hash is malformed.
     pub fn read_blob(&self, hash: &str) -> rusqlite::Result<Option<Vec<u8>>>;
+    // --- TDD §317 capture disk-spill ---
+    /// Directory value-position captures spill oversized stdout into (sibling of cas/ under the state dir),
+    /// created on demand. Pass to ExecSpec::spill { dir } so the spill file shares the CAS filesystem/lifetime.
+    pub fn spill_dir(&self) -> io::Result<PathBuf>;
+    /// Adopt a written spill file (from spill_dir) into the CAS as a zstd-streamed blob addressed by `hash`
+    /// (blake3 of its `len` bytes, from CaptureSpill). Records a blob row and, when pin, pins it so GC keeps
+    /// the blob while the in-language ref-backed value is live. The source file is removed on success.
+    pub fn ingest_spill(&self, src: &Path, hash: &str, len: u64, pin: bool) -> rusqlite::Result<()>;
+    /// A cheap, cloneable, DB-independent CAS reader (just the cas_root path) — the Send+Sync handle a lazy
+    /// Value::CasBytes loader holds. Shares this journal's on-disk store.
+    pub fn cas(&self) -> Cas;
     pub fn query(&self, q: &JournalQuery) -> rusqlite::Result<Vec<EntryRow>>;
     /// Targeted fetch of entries by id, in the EXACT order requested (not database order); ids not
     /// found are simply absent, never an error. The cold-replay counterpart to `query`'s filtered
@@ -273,6 +313,16 @@ impl Journal {
 ```
 
 CAS layout: `<state_dir>/cas/<hex[0..2]>/<hex[2..4]>/<hex>.zst`. Dedup by hash. Tests: roundtrip, dedup, query filters, WAL crash-tolerance smoke (drop without finish → row visible with NULL status), `entries_by_id`/`transcript_events_by_entry` order-preserving + missing-id behavior, and an additive-migration smoke test (a hand-built pre-`transcript_event` journal.db still opens and gains the table).
+
+```rust
+/// DB-independent CAS reader (Journal::cas()): one PathBuf, Clone + Send + Sync, content-verified reads.
+pub struct Cas { /* private: cas_root */ }
+impl Cas {
+    /// Read + zstd-decode the blob for `hash`, re-hashing to verify integrity (NotFound if absent/malformed,
+    /// InvalidData on mismatch). The load path behind a lazy Value::CasBytes.
+    pub fn read(&self, hash: &str) -> io::Result<Vec<u8>>;
+}
+```
 
 ## 3. shoal-value — Value enum (pinned; core types by integrator)
 
@@ -407,6 +457,9 @@ pub trait Clock: Send + Sync { fn now_ns(&self) -> i64; }     // journal timesta
 pub trait Opener: Send + Sync { fn open(&self, path: &Path) -> Result<(), String>; }  // the `open` builtin
 pub trait SecretPort: Send + Sync {
     fn get(&self, name: &str) -> Result<Option<Vec<u8>>, String>;   // backs `secret.get(name)`
+}
+pub trait BytesLoad: Send + Sync {                                  // loads a lazy Value::CasBytes (TDD §317)
+    fn load(&self) -> std::io::Result<Vec<u8>>;                     // adapter over shoal_journal::Cas lives in shoal-eval
 }
 
 // shoal-eval/src/ports.rs — needs shoal-exec types, so it can't live in shoal-value

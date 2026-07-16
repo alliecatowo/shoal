@@ -22,8 +22,11 @@ impl Evaluator {
                 "dur" => Ok(Value::Duration(o.dur_ns)),
                 "pid" => Ok(Value::Int(o.pid as i64)),
                 "cmd" => Ok(Value::Str(o.cmd.clone())),
-                // Raw stream bytes are always reachable, even on failure.
-                "stdout" => Ok(Value::Bytes(o.stdout.clone())),
+                // Raw stream bytes are always reachable, even on failure. A
+                // §317-spilled capture surfaces here as a lazy, ref-backed
+                // `bytes` (true `.len`, on-demand load); ordinary output is the
+                // resident `bytes` exactly as before.
+                "stdout" => Ok(o.stdout_value()),
                 "stderr" => Ok(Value::Bytes(o.stderr.clone())),
                 "out" | "err" if !o.ok => Err(ErrorVal::new(
                     "cmd_failed",
