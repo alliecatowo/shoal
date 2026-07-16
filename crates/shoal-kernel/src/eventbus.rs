@@ -12,7 +12,8 @@ use super::*;
 pub(crate) type SharedWriter = Arc<Mutex<UnixStream>>;
 
 /// One ring buffer per channel; `seq` is monotonic per channel. Subscribers
-/// get `event` notifications pushed on their own connection.
+/// get `event` notifications pushed on their own connection via a bounded,
+/// per-subscriber queue (AGENT-SURFACE §6) — see `SubQueue` below for why.
 #[derive(Default)]
 pub(crate) struct EventBus {
     channels: Mutex<HashMap<String, ChannelBuf>>,
@@ -29,25 +30,161 @@ struct ChannelBuf {
 struct Subscriber {
     conn: u64,
     channel: String,
-    writer: SharedWriter,
+    queue: Arc<SubQueue>,
 }
 
 /// Ring depth per channel (AGENT-SURFACE §4 requires ≥1024).
 const EVENT_RING_CAP: usize = 1024;
 
+/// Bound on a subscriber's own outgoing queue — distinct from the per-channel
+/// ring buffer above. This is the backpressure boundary AGENT-SURFACE §6
+/// promises: `publish()` (below) only ever appends to this bounded, in-memory
+/// queue, never performs the blocking socket write itself, so a stalled
+/// subscriber can delay at most its own dedicated writer thread — never the
+/// producer, and never any other subscriber. Once a subscriber's queue holds
+/// this many not-yet-written events, further events for that subscriber are
+/// dropped and coalesced into a running `{dropped, latest_seq}` summary
+/// (`SubQueueState`) instead of buffered unboundedly.
+const SUB_QUEUE_CAP: usize = 256;
+
 /// The static channels a session may always subscribe to (AGENT-SURFACE §4).
 /// `task.{id}` and `user.{name}` are dynamic and not listed here.
-pub(crate) const STATIC_CHANNELS: &[&str] = &[
-    "session.transcript",
-    "journal",
-    "approval",
-    "render",
-    "reef",
-];
+///
+/// `reef` used to be advertised here with nothing ever publishing to it — a
+/// dead channel a client could subscribe to and wait on forever. Tool
+/// lock/drift/fetch events originate inside `shoal-eval`'s reef resolution
+/// (a different crate, outside this crate's lane), so there is no natural
+/// emit point reachable from here yet; rather than leave it advertised but
+/// silent, it has been removed until an eval-side event-forwarder hook
+/// (analogous to `session.rs`'s `user.*` bridge) makes it real. See
+/// `docs/AGENT-SURFACE.md`'s status section.
+pub(crate) const STATIC_CHANNELS: &[&str] =
+    &["session.transcript", "journal", "approval", "render"];
+
+/// A subscriber's outgoing queue (AGENT-SURFACE §6): a bounded FIFO of
+/// not-yet-written events, plus a running count of events dropped since the
+/// queue last drained past capacity. Protected by its OWN lock — never
+/// `EventBus::subs` — so `publish()` appending to one subscriber's queue
+/// never contends with, let alone blocks on, another subscriber's slow
+/// writer thread doing a blocking socket write.
+struct SubQueue {
+    channel: String,
+    state: Mutex<SubQueueState>,
+    ready: Condvar,
+}
+
+#[derive(Default)]
+struct SubQueueState {
+    events: VecDeque<Event>,
+    dropped: u64,
+    latest_dropped_seq: u64,
+    closed: bool,
+}
+
+impl SubQueue {
+    fn new(channel: String) -> Arc<Self> {
+        Arc::new(Self {
+            channel,
+            state: Mutex::new(SubQueueState::default()),
+            ready: Condvar::new(),
+        })
+    }
+
+    /// Enqueue `event` for this subscriber. Never blocks: at capacity the
+    /// event is dropped and folded into the running `{dropped, latest_seq}`
+    /// summary rather than buffered — this is the only thing `publish()`
+    /// calls per subscriber, and it is a plain in-memory push, never a
+    /// socket write, so a stalled subscriber can never stall `publish()`.
+    fn push(&self, event: Event) {
+        let mut state = self.state.lock().unwrap();
+        if state.events.len() < SUB_QUEUE_CAP {
+            state.events.push_back(event);
+        } else {
+            state.dropped += 1;
+            state.latest_dropped_seq = event.seq;
+        }
+        drop(state);
+        self.ready.notify_one();
+    }
+
+    /// Mark this queue closed (connection gone / explicitly unsubscribed) so
+    /// its writer thread stops waiting and exits instead of blocking forever.
+    fn close(&self) {
+        self.state.lock().unwrap().closed = true;
+        self.ready.notify_one();
+    }
+
+    /// Block until there is something to write: a buffered event, a pending
+    /// dropped-summary (synthesized into an `Event` here so the writer thread
+    /// has one uniform thing to serialize), or closure (`None`). A pending
+    /// summary is always delivered before any event that arrives after it —
+    /// the subscriber learns about the gap before it sees anything past it.
+    fn next(&self) -> Option<Event> {
+        let mut state = self.state.lock().unwrap();
+        loop {
+            if let Some(event) = state.events.pop_front() {
+                return Some(event);
+            }
+            if state.dropped > 0 {
+                let dropped = state.dropped;
+                let latest_seq = state.latest_dropped_seq;
+                state.dropped = 0;
+                return Some(Event {
+                    channel: self.channel.clone(),
+                    seq: latest_seq,
+                    ts: now_ns(),
+                    payload: json!({"dropped": dropped, "latest_seq": latest_seq}),
+                });
+            }
+            if state.closed {
+                return None;
+            }
+            state = self.ready.wait(state).unwrap();
+        }
+    }
+}
+
+/// One dedicated thread per subscription, draining `queue` and performing
+/// the (potentially blocking) socket write — the ONLY place that write
+/// happens. Isolating it here, off any `EventBus`-wide lock and off the
+/// `publish()` call path entirely, is what makes a slow/stalled client's
+/// blocking `write_all` a problem for this one thread alone.
+fn spawn_subscriber_writer(queue: Arc<SubQueue>, writer: SharedWriter) {
+    std::thread::spawn(move || {
+        while let Some(event) = queue.next() {
+            let note = json!({
+                "jsonrpc": JSONRPC,
+                "method": "event",
+                "params": &event,
+            });
+            let mut w = writer.lock().unwrap();
+            let ok = write_json_notification(&mut w, &note).is_ok();
+            drop(w);
+            if !ok {
+                // Dead connection: stop trying. The subscriber entry itself
+                // is pruned from `EventBus::subs` by `remove_conn` when the
+                // read side of this same connection notices the disconnect
+                // (or by an explicit `unsubscribe`) — until then, `publish()`
+                // simply keeps pushing into a queue nothing drains, which is
+                // harmless: it is bounded, so it costs at most `SUB_QUEUE_CAP`
+                // events of memory, never unbounded growth or a blocked
+                // producer.
+                queue.close();
+                return;
+            }
+        }
+    });
+}
 
 impl EventBus {
-    /// Append `payload` to `channel`'s ring and push it to every live
-    /// subscriber of that channel. Returns the assigned event.
+    /// Append `payload` to `channel`'s ring and enqueue it for every live
+    /// subscriber of that channel. Never blocks on a subscriber's socket:
+    /// `Subscriber::queue.push` (AGENT-SURFACE §6) is a bounded, in-memory
+    /// operation, and the lock held here (`subs`) guards only that push, not
+    /// any write — the actual blocking I/O happens later, on each
+    /// subscription's own dedicated writer thread (`spawn_subscriber_writer`).
+    /// A stalled/slow subscriber can therefore delay at most its own
+    /// delivery, never another subscriber's, and never this call.
     pub(crate) fn publish(&self, channel: &str, payload: Json) -> Event {
         let event = {
             let mut channels = self.channels.lock().unwrap();
@@ -66,21 +203,10 @@ impl EventBus {
             }
             event
         };
-        // Push to subscribers. A dead connection (write error) is dropped from
-        // the subscriber list — the accept loop also cleans up on disconnect.
-        let mut subs = self.subs.lock().unwrap();
-        subs.retain(|s| {
-            if s.channel != channel {
-                return true;
-            }
-            let note = json!({
-                "jsonrpc": JSONRPC,
-                "method": "event",
-                "params": &event,
-            });
-            let mut w = s.writer.lock().unwrap();
-            write_json_notification(&mut w, &note).is_ok()
-        });
+        let subs = self.subs.lock().unwrap();
+        for sub in subs.iter().filter(|s| s.channel == channel) {
+            sub.queue.push(event.clone());
+        }
         event
     }
 
@@ -104,35 +230,54 @@ impl EventBus {
         out
     }
 
-    /// Register `writer` as a subscriber to `channel`. Any already-buffered
-    /// events after `since` are pushed immediately (replay, then live).
+    /// Register `writer` as a subscriber to `channel` (idempotent per
+    /// `(conn, channel)` — re-subscribing finds the existing queue rather
+    /// than spawning a second writer thread). Any already-buffered events
+    /// after `since` are enqueued for replay through the same bounded queue
+    /// and dedicated writer thread live events use, so replay and live
+    /// delivery are never a separate, ad hoc blocking write on the calling
+    /// (dispatch) thread.
     fn subscribe(&self, conn: u64, channel: &str, since: Option<u64>, writer: &SharedWriter) {
-        {
+        let queue = {
             let mut subs = self.subs.lock().unwrap();
-            if !subs.iter().any(|s| s.conn == conn && s.channel == channel) {
+            if let Some(existing) = subs.iter().find(|s| s.conn == conn && s.channel == channel) {
+                existing.queue.clone()
+            } else {
+                let queue = SubQueue::new(channel.to_string());
                 subs.push(Subscriber {
                     conn,
                     channel: channel.to_string(),
-                    writer: writer.clone(),
+                    queue: queue.clone(),
                 });
+                spawn_subscriber_writer(queue.clone(), writer.clone());
+                queue
             }
-        }
+        };
         for event in self.read(channel, since, None) {
-            let note = json!({"jsonrpc": JSONRPC, "method": "event", "params": &event});
-            let mut w = writer.lock().unwrap();
-            let _ = write_json_notification(&mut w, &note);
+            queue.push(event);
         }
     }
 
     fn unsubscribe(&self, conn: u64, channel: &str) {
-        self.subs
-            .lock()
-            .unwrap()
-            .retain(|s| !(s.conn == conn && s.channel == channel));
+        let mut subs = self.subs.lock().unwrap();
+        subs.retain(|s| {
+            let keep = !(s.conn == conn && s.channel == channel);
+            if !keep {
+                s.queue.close();
+            }
+            keep
+        });
     }
 
     pub(crate) fn remove_conn(&self, conn: u64) {
-        self.subs.lock().unwrap().retain(|s| s.conn != conn);
+        let mut subs = self.subs.lock().unwrap();
+        subs.retain(|s| {
+            let keep = s.conn != conn;
+            if !keep {
+                s.queue.close();
+            }
+            keep
+        });
     }
 }
 
@@ -213,5 +358,185 @@ impl Kernel {
         let p: EventsSubParams = decode(params)?;
         self.events.unsubscribe(client, &p.channel);
         encode(json!({"channel": p.channel, "subscribed": false}))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// Read one already-written frame off `reader` (blocking, with a bounded
+    /// timeout so a bug that hangs the write path fails the test loudly
+    /// instead of hanging the suite). Takes a caller-owned, persistent
+    /// `BufReader` — NOT a fresh one per call — because a fresh `BufReader`
+    /// wrapping a freshly `try_clone`d fd each call discards whatever extra
+    /// bytes its one internal read happened to buffer past the first line
+    /// (several frames can arrive in a single burst from a writer thread
+    /// draining a backlog); a one-shot `BufReader` silently drops those,
+    /// which starves a later call and manifests as a spurious read timeout.
+    fn recv_line(reader: &mut io::BufReader<UnixStream>) -> Json {
+        reader
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufRead::read_line(reader, &mut line).unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+
+    /// FIX 1 regression: `publish()` must return promptly even when a
+    /// subscriber never reads its socket at all — the original bug had
+    /// `publish()` call a blocking `write_all` per subscriber while holding
+    /// `EventBus::subs`, so one inert subscriber froze every future publish
+    /// to every channel. Here nothing ever reads `client_end`; if `publish`
+    /// still blocked on the write, this loop would hang well past the
+    /// assertion's bound (or forever, since nothing will ever drain it).
+    #[test]
+    fn publish_does_not_block_when_a_subscriber_never_reads() {
+        let bus = EventBus::default();
+        let (client_end, server_end) = UnixStream::pair().unwrap();
+        let writer: SharedWriter = Arc::new(Mutex::new(server_end));
+        bus.subscribe(1, "user.stress", None, &writer);
+
+        let start = Instant::now();
+        for i in 0..500 {
+            // A few KB per event: comfortably past any default socket
+            // buffer many times over across 500 publishes, so this is a
+            // faithful stand-in for "a subscriber that never reads".
+            bus.publish("user.stress", json!({"i": i, "pad": "x".repeat(2048)}));
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "publish() blocked on an unread subscriber: {elapsed:?}"
+        );
+        drop(client_end);
+    }
+
+    /// FIX 1: a genuinely stalled subscriber (its writer thread blocked mid
+    /// write) must not stall a second, healthy subscriber on the same
+    /// channel — proving `publish()`'s per-subscriber queue push is
+    /// independent across subscribers, not just fast in isolation. The stall
+    /// is simulated deterministically (holding the stalled subscriber's own
+    /// `SharedWriter` mutex from another thread) rather than relying on OS
+    /// socket-buffer sizes, which vary by host and would make this flaky.
+    #[test]
+    fn a_stalled_subscriber_never_stalls_a_healthy_one() {
+        let bus = Arc::new(EventBus::default());
+        let (stalled_client, stalled_server) = UnixStream::pair().unwrap();
+        let stalled_writer: SharedWriter = Arc::new(Mutex::new(stalled_server));
+        let (healthy_client, healthy_server) = UnixStream::pair().unwrap();
+        let healthy_writer: SharedWriter = Arc::new(Mutex::new(healthy_server));
+
+        bus.subscribe(1, "user.race", None, &stalled_writer);
+        bus.subscribe(2, "user.race", None, &healthy_writer);
+
+        // Simulate the stalled subscriber's writer thread being stuck mid
+        // blocking-write by holding its writer's mutex from here.
+        let hold = stalled_writer.clone();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let stall_thread = std::thread::spawn(move || {
+            let _guard = hold.lock().unwrap();
+            let _ = release_rx.recv();
+        });
+        // Give the stall thread a moment to actually acquire the lock before
+        // the subscriber's own writer thread (spawned by `subscribe` above)
+        // has a chance to race for it.
+        std::thread::sleep(Duration::from_millis(50));
+
+        let start = Instant::now();
+        for i in 0..10 {
+            bus.publish("user.race", json!({"i": i}));
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "publish() blocked while one subscriber's writer was stalled: {elapsed:?}"
+        );
+
+        // The healthy subscriber must still receive events promptly, live,
+        // while the other subscriber's writer is stuck.
+        let mut healthy_reader = io::BufReader::new(healthy_client.try_clone().unwrap());
+        for expected in 0..10 {
+            let got = recv_line(&mut healthy_reader);
+            assert_eq!(got["method"], "event");
+            assert_eq!(got["params"]["payload"]["i"], expected);
+        }
+
+        release_tx.send(()).unwrap();
+        stall_thread.join().unwrap();
+        drop(stalled_client);
+        drop(healthy_client);
+    }
+
+    /// FIX 1: once a stalled subscriber's queue overflows `SUB_QUEUE_CAP`,
+    /// further events for it must coalesce into a `{dropped, latest_seq}`
+    /// summary (AGENT-SURFACE §6) rather than buffering unboundedly — and
+    /// once the stall clears, that summary (not a flood of the individually
+    /// dropped events) is what the subscriber actually receives.
+    #[test]
+    fn a_stalled_subscriber_gets_a_coalesced_dropped_summary() {
+        let bus = Arc::new(EventBus::default());
+        let (client_end, server_end) = UnixStream::pair().unwrap();
+        let writer: SharedWriter = Arc::new(Mutex::new(server_end));
+        bus.subscribe(1, "user.overflow", None, &writer);
+
+        let hold = writer.clone();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let stall_thread = std::thread::spawn(move || {
+            let _guard = hold.lock().unwrap();
+            let _ = release_rx.recv();
+        });
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Publish well past `SUB_QUEUE_CAP` while the writer is stalled —
+        // some of these must be dropped-and-coalesced, not buffered forever.
+        let total = SUB_QUEUE_CAP * 3;
+        for i in 0..total {
+            bus.publish("user.overflow", json!({"i": i}));
+        }
+
+        release_tx.send(()).unwrap();
+        stall_thread.join().unwrap();
+
+        // Drain frames until we find the coalesced summary. The first
+        // SUB_QUEUE_CAP events (whichever the queue happened to still hold)
+        // are delivered first, in order, followed by exactly one summary
+        // event for everything dropped in between.
+        let mut client_reader = io::BufReader::new(client_end);
+        let mut found_summary = None;
+        for _ in 0..(SUB_QUEUE_CAP + 5) {
+            let note = recv_line(&mut client_reader);
+            assert_eq!(note["method"], "event");
+            let payload = &note["params"]["payload"];
+            if payload.get("dropped").is_some() {
+                found_summary = Some(payload.clone());
+                break;
+            }
+        }
+        let summary = found_summary
+            .expect("expected a coalesced {dropped, latest_seq} summary after a queue overflow");
+        assert!(
+            summary["dropped"].as_u64().unwrap() > 0,
+            "summary must report a nonzero drop count: {summary}"
+        );
+        assert!(
+            summary["latest_seq"].as_u64().unwrap() < total as u64,
+            "latest_seq must be a real event seq, not the overflowed total: {summary}"
+        );
+    }
+
+    #[test]
+    fn unsubscribe_stops_the_writer_thread_instead_of_leaking_it() {
+        let bus = EventBus::default();
+        let (client_end, server_end) = UnixStream::pair().unwrap();
+        let writer: SharedWriter = Arc::new(Mutex::new(server_end));
+        bus.subscribe(1, "user.bye", None, &writer);
+        assert_eq!(bus.subs.lock().unwrap().len(), 1);
+        bus.unsubscribe(1, "user.bye");
+        assert_eq!(bus.subs.lock().unwrap().len(), 0);
+        drop(client_end);
     }
 }

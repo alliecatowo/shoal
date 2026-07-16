@@ -224,13 +224,13 @@ verification pass:
 2. **Builtin REGISTRY + `resolve.rs` unification** (R4 remainder) — architectural cleanup, eval-heavy.
 3. **`jump`/`j`** frecency-ranked `cd` (R2 remainder) — small, self-contained, eval-heavy.
 4. **`Outcome` wire `span`** always `None` over the kernel wire (R5 carryover) — small, `shoal-kernel`.
-5. **`shoal_cap_request`'s grant response hardcodes `"enforced": false`** unconditionally
-   (`crates/shoal-kernel/src/handlers_task.rs`), even though `session.attach`'s `caps_enforced` is
-   already honest (reflects a real backend when one is actually scoped). This is a narrower,
-   specific gap than #1 above — direct spawns ARE filesystem-confined when policy scopes them; the
-   `cap_request` *response shape* just doesn't yet surface that truth back to an MCP/agent caller
-   who unstuck an `approval_pending` plan. Worth closing so the agent surface doesn't systematically
-   under-report enforcement it actually has.
+5. **`shoal_cap_request`'s grant response enforcement honesty — WIRED.**
+   `crates/shoal-kernel/src/handlers_task.rs`'s `handle_cap_request` calls the same
+   `Kernel::caps_enforced_for` helper `session.attach`'s `caps_enforced` uses, so a `cap.request`
+   grant reports the SAME honest enforcement truth an agent already learned at attach time — it does
+   NOT hardcode `"enforced": false` (a previous revision of this doc said otherwise; that was
+   stale). Pinned by `cap_request_reports_the_same_enforcement_truth_attach_does` and
+   `cap_request_reports_false_for_the_default_permissive_principal` (`shoal-kernel/src/lib.rs`).
 6. **Bare-path-head runner ergonomics** (`./script.py` with no `run`) work for `.shl` only — other
    extensions need the explicit `run script.py` spelling. `docs/REEF.md` §5 / wiki Reef §5 carry the
    corrected account; wiring the general case is a `shoal-eval` command-head-resolution change.
@@ -266,8 +266,9 @@ Given R0–R3 are done and R4/R5 are the only waves with open work:
    `plan_derive.rs`'s `ProcSpawn` effect and have the real spawn path actually consult
    `shoal-leash`'s evaluator with it before exec. Eval-heavy (touches `shoal-eval`'s spawn path);
    serialize with any other `shoal-eval` work per the one hard constraint.
-2. **Close the other small, cheap items** (#3 `jump`/`j`, #4 `Outcome` span, #5 `cap_request`
-   enforcement honesty) — each is self-contained, low-risk, and removes a specific documented gap.
+2. **Close the other small, cheap items** (#3 `jump`/`j`, #4 `Outcome` span — #5 `cap_request`
+   enforcement honesty is already closed, see above) — each is self-contained, low-risk, and
+   removes a specific documented gap.
 3. **R4's builtin registry/`resolve.rs` unification** (#2) — do this once no other eval-heavy work
    is in flight (the one-hard-constraint serialization applies), since it touches command dispatch
    broadly and benefits from a quiet tree. **#6** (bare-path runner ergonomics) touches the same
