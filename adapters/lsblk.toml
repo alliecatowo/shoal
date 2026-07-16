@@ -1,0 +1,33 @@
+# util-linux `lsblk` (Linux only: no macOS equivalent -- `diskutil` covers
+# similar ground with a completely different CLI/JSON shape). Like
+# `ip`/`systemctl`/`ss`, this names a specific ecosystem tool rather than a
+# POSIX-portable one, and fails loudly with "command not found" on macOS
+# instead of guessing at a lookalike.
+#
+# `-J` (JSON) plus an explicit `-o` column list pins a stable field set that
+# doesn't drift with whatever columns a given distro's `lsblk` defaults to
+# (the default column set has changed across util-linux releases). `-b`
+# forces every `SIZE` to print as a bare byte count (a JSON number) instead
+# of `-o`'s default human-readable string (`"931.5G"`); the plain `json`
+# parser does not consult `output.type` for scalar coercion the way
+# `cols`/`tsv-headerless` do (see the module doc on `hint_schema`), so this
+# adopts the same convention as every other JSON-sourced adapter here
+# (`docker`/`podman`/`ip`/`systemctl`): a numeric field like `size` comes
+# through as a plain `Value::Int` of bytes, not a `Value::Size` -- `-b` at
+# least guarantees that int is always bytes, not a distro-dependent mix of
+# raw block counts and human-readable strings.
+#
+# Real `lsblk -J` wraps its device list in a `{"blockdevices": [...]}`
+# envelope (an object, not a top-level array), so this follows the
+# `kubectl.sub.get`/`npm.sub.ls`/`brew.sub.info` convention of a bare
+# `type = "record"` rather than a `table<{...}>` shape claim the actual
+# bytes wouldn't match. A device with child partitions/LUKS volumes nests
+# them under its own `children` array; `json_to_value` auto-normalizes any
+# uniform non-empty array of objects to a `Table`, so `children` shows up as
+# a genuine nested table with no special-casing needed here.
+[cmd.lsblk]
+bin = "lsblk"
+class = "cli"
+ok_codes = [0]
+invoke = ["-J", "-b", "-o", "NAME,SIZE,TYPE,MOUNTPOINT,FSTYPE,RM,RO"]
+output = { parse = "json", type = "record" }
