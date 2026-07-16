@@ -18,21 +18,30 @@ pub(crate) type SharedWriter = Arc<Mutex<UnixStream>>;
 pub(crate) struct EventBus {
     channels: Mutex<HashMap<String, ChannelBuf>>,
     subs: Mutex<Vec<Subscriber>>,
-    /// The seq↔journal-entry correspondence for the `journal` channel, the one
-    /// channel whose events are backed by durable journal rows and are
-    /// therefore replayable past the in-memory ring (AGENT-SURFACE §4). Dense
-    /// `Vec` indexed by the journal channel's `seq` (0-based, contiguous),
-    /// holding the journal `entry_id` each seq was published for. This is only
-    /// the *pointer* — the event payload (`head`/`ok`/`principal`) is
-    /// reconstructed from the journal itself, not from here, so an aged-out
+    /// The seq↔journal-entry correspondence for the `journal` channel, the
+    /// first channel whose events were made replayable past the in-memory
+    /// ring (AGENT-SURFACE §4, audit gap G2). Dense `Vec` indexed by the
+    /// journal channel's `seq` (0-based, contiguous), holding the journal
+    /// `entry_id` each seq was published for. This is only the *pointer* —
+    /// the event payload (`head`/`ok`/`principal`) is reconstructed from the
+    /// journal's `entry` table itself, not from here, so an aged-out
     /// `journal` event costs one `i64` of memory, not a buffered event.
     ///
     /// Written (under the `channels` lock, so it can never diverge from the
-    /// seqs the ring hands out) only by `publish_journal`; read by the kernel's
-    /// `read_journal_channel` fallback. Other channels never touch it — they
-    /// stay ring-only (AGENT-SURFACE §4: `user.*`/`task.{id}`/`approval`/
-    /// `render`/`session.transcript` are NOT journal-backed).
+    /// seqs the ring hands out) only by `publish_journal`; read by the
+    /// kernel's `read_journal_channel` fallback.
     journal_index: Mutex<Vec<i64>>,
+    /// The same dense-index idea as `journal_index`, for the
+    /// `session.transcript` channel (the G2 follow-up this closes): indexed
+    /// by that channel's own `seq`, holding the journal `entry_id` the
+    /// transcript event was published for. Unlike `journal_index`, the
+    /// payload this points at is NOT reconstructed from pre-existing journal
+    /// columns — `shoal-journal`'s `transcript_event` table (keyed by that
+    /// same `entry_id`) holds it verbatim, written by `record_transcript_event`
+    /// at the same call site that publishes the live event. Written only by
+    /// `publish_transcript`; read by `read_transcript_channel`. `approval`/
+    /// `render`/`user.*` still touch neither index — they stay ring-only.
+    transcript_index: Mutex<Vec<i64>>,
 }
 
 /// Ring-buffered event log for one channel.
@@ -191,10 +200,19 @@ fn spawn_subscriber_writer(queue: Arc<SubQueue>, writer: SharedWriter) {
     });
 }
 
+/// Which of `EventBus`'s two durable indices (if any) a `publish_inner` call
+/// should record the `entry_id` pointer into — `journal` and
+/// `session.transcript` are the only two journal-backed channels
+/// (AGENT-SURFACE §4); every other channel stays ring-only.
+enum DurableChannel {
+    Journal,
+    Transcript,
+}
+
 impl EventBus {
     /// Append `payload` to `channel`'s ring and enqueue it for every live
     /// subscriber (thin wrapper over [`EventBus::publish_inner`] with no
-    /// durable-id recording — the path every non-`journal` channel takes).
+    /// durable-id recording — the path every ring-only channel takes).
     pub(crate) fn publish(&self, channel: &str, payload: Json) -> Event {
         self.publish_inner(channel, payload, None)
     }
@@ -205,7 +223,26 @@ impl EventBus {
     /// only difference from `publish` is that the seq↔`entry_id` pair is
     /// appended to `journal_index` atomically with the seq assignment.
     pub(crate) fn publish_journal(&self, entry_id: i64, payload: Json) -> Event {
-        self.publish_inner("journal", payload, Some(entry_id))
+        self.publish_inner(
+            "journal",
+            payload,
+            Some((DurableChannel::Journal, entry_id)),
+        )
+    }
+
+    /// Publish on the `session.transcript` channel, recording the durable
+    /// `entry_id` this event corresponds to (the G2 follow-up: mirrors
+    /// `publish_journal` exactly, but for `transcript_index`). The caller
+    /// (`handlers_exec.rs`) has already durably persisted the payload itself
+    /// via `Journal::record_transcript_event` — this only records the
+    /// seq↔`entry_id` pointer, same division of labor as the `journal`
+    /// channel.
+    pub(crate) fn publish_transcript(&self, entry_id: i64, payload: Json) -> Event {
+        self.publish_inner(
+            "session.transcript",
+            payload,
+            Some((DurableChannel::Transcript, entry_id)),
+        )
     }
 
     /// Append `payload` to `channel`'s ring and enqueue it for every live
@@ -217,23 +254,33 @@ impl EventBus {
     /// A stalled/slow subscriber can therefore delay at most its own
     /// delivery, never another subscriber's, and never this call.
     ///
-    /// `durable_id` is `Some` only for the `journal` channel: the seq↔entry
-    /// pointer is pushed onto `journal_index` inside the same `channels`-lock
-    /// critical section that assigns `seq`, so concurrent publishes can never
-    /// interleave the index out of order relative to the seqs the ring hands
-    /// out (index position == seq, always).
-    fn publish_inner(&self, channel: &str, payload: Json, durable_id: Option<i64>) -> Event {
+    /// `durable` is `Some` only for the `journal`/`session.transcript`
+    /// channels: the seq↔entry pointer is pushed onto the matching index
+    /// inside the same `channels`-lock critical section that assigns `seq`,
+    /// so concurrent publishes can never interleave an index out of order
+    /// relative to the seqs the ring hands out (index position == seq,
+    /// always, per index).
+    fn publish_inner(
+        &self,
+        channel: &str,
+        payload: Json,
+        durable: Option<(DurableChannel, i64)>,
+    ) -> Event {
         let event = {
             let mut channels = self.channels.lock().unwrap();
             let buf = channels.entry(channel.to_string()).or_default();
             let seq = buf.next_seq;
             buf.next_seq += 1;
-            if let Some(entry_id) = durable_id {
-                let mut index = self.journal_index.lock().unwrap();
+            if let Some((which, entry_id)) = durable {
+                let index = match which {
+                    DurableChannel::Journal => &self.journal_index,
+                    DurableChannel::Transcript => &self.transcript_index,
+                };
+                let mut index = index.lock().unwrap();
                 debug_assert_eq!(
                     index.len() as u64,
                     seq,
-                    "journal_index must stay dense and aligned with journal-channel seqs"
+                    "a durable index must stay dense and aligned with its channel's seqs"
                 );
                 index.push(entry_id);
             }
@@ -271,7 +318,16 @@ impl EventBus {
     /// process (== the channel's `next_seq`). `journal_index` has exactly one
     /// entry per published journal event, so its length is that count.
     pub(crate) fn journal_published_count(&self) -> u64 {
-        self.journal_index.lock().unwrap().len() as u64
+        Self::index_len(&self.journal_index)
+    }
+
+    /// As [`EventBus::journal_published_count`], for `session.transcript`.
+    pub(crate) fn transcript_published_count(&self) -> u64 {
+        Self::index_len(&self.transcript_index)
+    }
+
+    fn index_len(index: &Mutex<Vec<i64>>) -> u64 {
+        index.lock().unwrap().len() as u64
     }
 
     /// The `(seq, entry_id)` pairs for journal-channel events whose `seq` is
@@ -281,7 +337,16 @@ impl EventBus {
     /// ascending by seq. This is the seq→entry pointer set the kernel then
     /// resolves against the journal to rebuild the actual events.
     pub(crate) fn journal_index_range(&self, since: Option<u64>, upto: u64) -> Vec<(u64, i64)> {
-        let index = self.journal_index.lock().unwrap();
+        Self::index_range(&self.journal_index, since, upto)
+    }
+
+    /// As [`EventBus::journal_index_range`], for `session.transcript`.
+    pub(crate) fn transcript_index_range(&self, since: Option<u64>, upto: u64) -> Vec<(u64, i64)> {
+        Self::index_range(&self.transcript_index, since, upto)
+    }
+
+    fn index_range(index: &Mutex<Vec<i64>>, since: Option<u64>, upto: u64) -> Vec<(u64, i64)> {
+        let index = index.lock().unwrap();
         let start = since.map(|s| s.saturating_add(1)).unwrap_or(0);
         (start..upto)
             .filter_map(|seq| index.get(seq as usize).map(|&entry_id| (seq, entry_id)))
@@ -375,11 +440,14 @@ impl Kernel {
     ) -> Result<Json, RpcError> {
         attached.as_ref().ok_or_else(not_attached)?;
         let p: EventsReadParams = decode(params)?;
-        // The `journal` channel is journal-backed: a `since` older than the
-        // ring's oldest retained seq is served from the durable journal rather
-        // than lost (AGENT-SURFACE §4). Every other channel is ring-only.
+        // The `journal` and `session.transcript` channels are journal-backed:
+        // a `since` older than the ring's oldest retained seq is served from
+        // the durable journal rather than lost (AGENT-SURFACE §4). Every
+        // other channel is ring-only.
         let events = if p.channel == "journal" {
             self.read_journal_channel(p.since, p.limit)?
+        } else if p.channel == "session.transcript" {
+            self.read_transcript_channel(p.since, p.limit)?
         } else {
             self.events.read(&p.channel, p.since, p.limit)
         };
@@ -437,65 +505,131 @@ impl Kernel {
     }
 
     /// Rebuild `journal` events for the given ascending `(seq, entry_id)`
-    /// pairs by reading their rows from the durable journal. One query pulls
-    /// the journal history; rows are indexed by id and only the requested ids
-    /// (the coarse exec-level entries this channel published) are kept — the
-    /// evaluator's per-statement rows present in on-disk stores are filtered
-    /// out because they are absent from `want`.
+    /// pairs via [`shoal_journal::Journal::entries_by_id`] — a targeted
+    /// fetch of exactly the rows this channel needs (the coarse exec-level
+    /// entries it published), rather than a wide `query()` scan filtered in
+    /// memory: a G2 follow-up now that `shoal-journal` exposes one. The
+    /// evaluator's finer per-statement rows present in on-disk stores are
+    /// never fetched at all, because their ids are simply absent from
+    /// `want`.
     ///
     /// This is the cold fallback path (a subscriber that fell behind by more
-    /// than `EVENT_RING_CAP`), not the hot path, so a single wide query +
-    /// in-memory filter is deliberately favored over machinery the journal
-    /// crate does not expose today (a targeted `entries_by_id` fetch would let
-    /// this pull only the needed rows — a clean follow-up once shoal-journal
-    /// grows one).
+    /// than `EVENT_RING_CAP`), not the hot path.
     fn reconstruct_journal_events(
         self: &Arc<Self>,
         want: &[(u64, i64)],
     ) -> Result<Vec<Event>, RpcError> {
-        let by_id: HashMap<i64, u64> = want.iter().map(|&(seq, id)| (id, seq)).collect();
-        let rows = {
-            let journal = self.journal.lock().unwrap();
-            journal
-                .query(&JournalQuery {
-                    // Fetch the whole history (SQLite `LIMIT -1`); we keep only
-                    // the ids in `want`. Journals are GC-bounded and this runs
-                    // only on the cold replay path.
-                    limit: usize::MAX,
-                    ..Default::default()
-                })
-                .map_err(internal)?
-        };
-        // seq -> event, so we can emit strictly ascending by seq afterwards.
-        let mut found: HashMap<u64, Event> = HashMap::new();
-        for row in rows {
-            let Some(&seq) = by_id.get(&row.id) else {
-                continue;
+        let ids: Vec<i64> = want.iter().map(|&(_, id)| id).collect();
+        let rows = self
+            .journal
+            .lock()
+            .unwrap()
+            .entries_by_id(&ids)
+            .map_err(internal)?;
+        // `entries_by_id` returns rows in the SAME relative order as `ids`
+        // (i.e. `want`'s order), with any id it couldn't find (an entry GC'd
+        // out from under the index) simply absent — so a single forward scan
+        // through `want`, skipping whichever entries a row doesn't match,
+        // zips the two back together without a HashMap membership dance.
+        let mut events = Vec::with_capacity(rows.len());
+        let mut want = want.iter();
+        for row in &rows {
+            let seq = loop {
+                let &(seq, id) = want
+                    .next()
+                    .expect("entries_by_id returned a row for an id it wasn't asked for");
+                if id == row.id {
+                    break seq;
+                }
             };
             let ok = row.ok.unwrap_or(false);
-            found.insert(
+            events.push(Event {
+                channel: "journal".to_string(),
                 seq,
-                Event {
-                    channel: "journal".to_string(),
-                    seq,
-                    // The journal records the entry's start (`ts_ns`) and, once
-                    // finished, its duration; the live event fired at finish, so
-                    // start + duration is the faithful reconstruction of that
-                    // instant (falls back to start for the degenerate no-dur
-                    // case). Consumers dedup by seq, never by ts.
-                    ts: row.ts_ns.saturating_add(row.dur_ns.unwrap_or(0)),
-                    payload: journal_event(row.id, &row.src, ok, &row.principal),
-                },
-            );
+                // The journal records the entry's start (`ts_ns`) and, once
+                // finished, its duration; the live event fired at finish, so
+                // start + duration is the faithful reconstruction of that
+                // instant (falls back to start for the degenerate no-dur
+                // case). Consumers dedup by seq, never by ts.
+                ts: row.ts_ns.saturating_add(row.dur_ns.unwrap_or(0)),
+                payload: journal_event(row.id, &row.src, ok, &row.principal),
+            });
         }
-        // Emit in ascending seq order, contiguous with the ring tail. A seq in
-        // `want` with no journal row (its entry GC'd out from under the index)
-        // is simply skipped — the gap is honest, not fabricated.
-        let mut events: Vec<Event> = Vec::with_capacity(want.len());
-        for &(seq, _) in want {
-            if let Some(event) = found.remove(&seq) {
-                events.push(event);
+        Ok(events)
+    }
+
+    /// Read the `session.transcript` channel with journal-backed replay
+    /// (AGENT-SURFACE §4, the G2 follow-up this closes). Mirrors
+    /// `read_journal_channel` exactly: the ring tail is served unchanged
+    /// (fast path untouched), and a `since` reaching below the ring's oldest
+    /// retained seq is reconstructed from the durable
+    /// `shoal_journal::TranscriptEventRow`s `handlers_exec.rs` persists
+    /// alongside every live transcript event.
+    fn read_transcript_channel(
+        self: &Arc<Self>,
+        since: Option<u64>,
+        limit: Option<usize>,
+    ) -> Result<Vec<Event>, RpcError> {
+        let published = self.events.transcript_published_count();
+        if published == 0 || since.is_some_and(|s| s.saturating_add(1) >= published) {
+            return Ok(self.events.read("session.transcript", since, None));
+        }
+        let mut out: Vec<Event> = Vec::new();
+        if let Some(oldest) = self.events.ring_oldest_seq("session.transcript") {
+            let want = self.events.transcript_index_range(since, oldest);
+            if !want.is_empty() {
+                out = self.reconstruct_transcript_events(&want)?;
             }
+        }
+        out.extend(self.events.read("session.transcript", since, None));
+        if let Some(limit) = limit
+            && out.len() > limit
+        {
+            out = out.split_off(out.len() - limit);
+        }
+        Ok(out)
+    }
+
+    /// Rebuild `session.transcript` events for the given ascending `(seq,
+    /// entry_id)` pairs via [`shoal_journal::Journal::transcript_events_by_entry`].
+    /// Unlike `reconstruct_journal_events`, the payload here is not
+    /// re-derived from other columns — it is the exact `$`-tagged JSON the
+    /// live event carried, stored verbatim by `Journal::record_transcript_event`
+    /// at the same call site that publishes it, so reconstruction only
+    /// re-wraps it into an `Event`.
+    fn reconstruct_transcript_events(
+        self: &Arc<Self>,
+        want: &[(u64, i64)],
+    ) -> Result<Vec<Event>, RpcError> {
+        let ids: Vec<i64> = want.iter().map(|&(_, id)| id).collect();
+        let rows = self
+            .journal
+            .lock()
+            .unwrap()
+            .transcript_events_by_entry(&ids)
+            .map_err(internal)?;
+        // Same order-preserving zip as `reconstruct_journal_events`: rows
+        // come back in `ids`' order (== `want`'s order), any entry with no
+        // transcript row (the exec failed, so no transcript event was ever
+        // published for it) simply absent.
+        let mut events = Vec::with_capacity(rows.len());
+        let mut want = want.iter();
+        for row in &rows {
+            let seq = loop {
+                let &(seq, id) = want.next().expect(
+                    "transcript_events_by_entry returned a row for an id it wasn't asked for",
+                );
+                if id == row.entry_id {
+                    break seq;
+                }
+            };
+            let payload: Json = serde_json::from_str(&row.payload_json).map_err(internal)?;
+            events.push(Event {
+                channel: "session.transcript".to_string(),
+                seq,
+                ts: row.ts_ns,
+                payload,
+            });
         }
         Ok(events)
     }

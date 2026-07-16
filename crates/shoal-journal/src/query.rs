@@ -1,4 +1,7 @@
-//! Filtered, newest-first entry queries with joined outputs.
+//! Filtered, newest-first entry queries with joined outputs, plus a targeted
+//! by-id fetch for callers that already know exactly which rows they want.
+
+use std::collections::HashMap;
 
 use rusqlite::ToSql;
 
@@ -131,11 +134,63 @@ impl Journal {
                 break;
             }
         }
+        self.join_outputs(&mut out)?;
+        Ok(out)
+    }
 
+    /// Fetch entries for a specific, caller-known set of ids, in the EXACT
+    /// order requested (not database order) — the cold-replay counterpart to
+    /// [`Journal::query`]'s filtered newest-first scan. A caller that already
+    /// knows precisely which rows it needs (e.g. `shoal-kernel`'s
+    /// `journal`-channel replay resolving a seq→`entry_id` index) uses this
+    /// instead of a wide query + in-memory filter, so the cold path pulls
+    /// only the needed rows. Ids not present in the store are simply absent
+    /// from the result — never an error, and never a placeholder row.
+    pub fn entries_by_id(&self, ids: &[i64]) -> rusqlite::Result<Vec<EntryRow>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = std::iter::repeat_n("?", ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT id, session, principal, ts, dur_ns, cwd, src, ast, effects, status, ok, opaque
+             FROM entry WHERE id IN ({placeholders})"
+        );
+        let params: Vec<&dyn ToSql> = ids.iter().map(|id| id as &dyn ToSql).collect();
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(params.as_slice())?;
+        let mut by_id: HashMap<i64, EntryRow> = HashMap::new();
+        while let Some(row) = rows.next()? {
+            let entry = EntryRow {
+                id: row.get(0)?,
+                session: row.get(1)?,
+                principal: row.get(2)?,
+                ts_ns: row.get(3)?,
+                dur_ns: row.get(4)?,
+                cwd: row.get(5)?,
+                src: row.get(6)?,
+                ast_json: row.get(7)?,
+                effects_json: row.get(8)?,
+                status: row.get(9)?,
+                ok: row.get(10)?,
+                opaque: row.get(11)?,
+                outputs: Vec::new(),
+            };
+            by_id.insert(entry.id, entry);
+        }
+        let mut ordered: Vec<EntryRow> = ids.iter().filter_map(|id| by_id.remove(id)).collect();
+        self.join_outputs(&mut ordered)?;
+        Ok(ordered)
+    }
+
+    /// Join each entry's `output` rows in, in recording order — the shared
+    /// tail of both [`Journal::query`] and [`Journal::entries_by_id`].
+    fn join_outputs(&self, entries: &mut [EntryRow]) -> rusqlite::Result<()> {
         let mut out_stmt = self.conn.prepare(
             "SELECT kind, hash, len, meta FROM output WHERE entry_id = ?1 ORDER BY rowid",
         )?;
-        for entry in &mut out {
+        for entry in entries {
             entry.outputs = out_stmt
                 .query_map([entry.id], |r| {
                     let raw: Vec<u8> = r.get(1)?;
@@ -159,6 +214,6 @@ impl Journal {
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
         }
-        Ok(out)
+        Ok(())
     }
 }

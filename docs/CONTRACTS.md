@@ -189,7 +189,11 @@ Requirements: no zombies (always reaped); parent terminal state always restored 
 
 ## 2. shoal-journal — public API (pinned)
 
-SQLite (rusqlite bundled) + blake3 CAS. Schema per TDD §9 (entry/output/undo/pin tables; WAL mode).
+SQLite (rusqlite bundled) + blake3 CAS. Schema per TDD §9 (entry/output/undo/pin/transcript_event
+tables; WAL mode). `transcript_event` was added additively (`CREATE TABLE IF NOT EXISTS` inside
+`init_schema`, which runs on every `open`/`open_with_options`/`in_memory` call) — a pre-existing
+`journal.db` written before this table existed opens unchanged and gains the table the next time it
+is opened; no versioned migration step exists or is needed for column/table additions in this crate.
 
 ```rust
 use std::path::Path;
@@ -227,6 +231,11 @@ pub struct JournalQuery {
     pub limit: usize,              // 0 = default 100
 }
 
+/// One durably-stored `session.transcript` channel event (AGENT-SURFACE §4),
+/// keyed by the journal `entry_id` of the exec that produced it (at most one row per entry_id;
+/// only a successful exec ever produces one).
+pub struct TranscriptEventRow { pub entry_id: i64, pub ts_ns: i64, pub payload_json: String }
+
 // JournalOptions { output_hard_cap: usize (default 256 MiB), busy_timeout: Duration (default 5s) }.
 // busy_timeout is applied on every connection at open: the journal is shared across processes, and
 // the journaling call sites swallow errors, so a 0 timeout silently drops a concurrent write + inverse.
@@ -246,13 +255,24 @@ impl Journal {
     /// is an integrity Err, never wrong bytes. Ok(None) only when the blob is absent / hash is malformed.
     pub fn read_blob(&self, hash: &str) -> rusqlite::Result<Option<Vec<u8>>>;
     pub fn query(&self, q: &JournalQuery) -> rusqlite::Result<Vec<EntryRow>>;
+    /// Targeted fetch of entries by id, in the EXACT order requested (not database order); ids not
+    /// found are simply absent, never an error. The cold-replay counterpart to `query`'s filtered
+    /// newest-first scan, for a caller (e.g. shoal-kernel's `journal`-channel replay) that already
+    /// knows precisely which rows it needs and wants to avoid a wide scan + in-memory filter.
+    pub fn entries_by_id(&self, ids: &[i64]) -> rusqlite::Result<Vec<EntryRow>>;
     /// Record an undo inverse for an entry (op: "trash", "restore_bytes", ...; inverse: JSON).
     pub fn record_undo(&self, id: i64, op: &str, inverse_json: &str) -> rusqlite::Result<()>;
     pub fn undos_for(&self, id: i64) -> rusqlite::Result<Vec<(String, String)>>;
+    /// Persist a `session.transcript` event's exact `$`-tagged payload JSON for `entry_id`
+    /// (AGENT-SURFACE §4), so `shoal-kernel` can reconstruct it after it ages out of the in-memory
+    /// ring. Called once, right when the live event is published (`handlers_exec.rs`).
+    pub fn record_transcript_event(&self, entry_id: i64, ts_ns: i64, payload_json: &str) -> rusqlite::Result<()>;
+    /// As `entries_by_id`, for `transcript_event` rows: exact requested order, missing ids absent.
+    pub fn transcript_events_by_entry(&self, entry_ids: &[i64]) -> rusqlite::Result<Vec<TranscriptEventRow>>;
 }
 ```
 
-CAS layout: `<state_dir>/cas/<hex[0..2]>/<hex[2..4]>/<hex>.zst`. Dedup by hash. Tests: roundtrip, dedup, query filters, WAL crash-tolerance smoke (drop without finish → row visible with NULL status).
+CAS layout: `<state_dir>/cas/<hex[0..2]>/<hex[2..4]>/<hex>.zst`. Dedup by hash. Tests: roundtrip, dedup, query filters, WAL crash-tolerance smoke (drop without finish → row visible with NULL status), `entries_by_id`/`transcript_events_by_entry` order-preserving + missing-id behavior, and an additive-migration smoke test (a hand-built pre-`transcript_event` journal.db still opens and gains the table).
 
 ## 3. shoal-value — Value enum (pinned; core types by integrator)
 

@@ -31,7 +31,9 @@
 //! - [`cas`] — the blake3+zstd content-addressed blob store (`record_output`/`read_blob`).
 //! - [`undo`] — typed undo inverses: recording and TOCTOU-safe replay.
 //! - [`gc`] — pins and blob garbage collection.
-//! - [`query`] — filtered, newest-first entry queries with joined outputs.
+//! - [`query`] — filtered, newest-first entry queries with joined outputs, plus the targeted
+//!   `entries_by_id` fetch.
+//! - [`transcript`] — durable `session.transcript` channel event payloads, keyed by `entry_id`.
 
 use std::fmt::Write as _;
 use std::fs;
@@ -46,12 +48,14 @@ mod query;
 mod schema;
 #[cfg(test)]
 mod tests;
+mod transcript;
 mod undo;
 
 pub use cas::{JournalOptions, OutputMeta, OutputRow};
 pub use gc::{GcBlob, GcOptions, GcReport};
 pub use query::{EntryRow, JournalQuery};
 pub use schema::EntryRecord;
+pub use transcript::TranscriptEventRow;
 pub use undo::{FileFingerprint, UndoError, UndoInverse, UndoReport, UndoStatus, UndoStep};
 
 /// Handle to a journal: a SQLite database plus an on-disk CAS directory.

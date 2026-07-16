@@ -381,6 +381,13 @@ impl Kernel {
             .unwrap()
             .insert(client, value_ref.clone());
         let render = shoal_value::render::render_block(&value, 80);
+        // Built once, up front: this SAME payload is both persisted durably
+        // (so the `session.transcript` channel can replay it after it ages
+        // out of the ring — the G2 follow-up, AGENT-SURFACE §4) and carried
+        // by the live event below. Reconstruction re-wraps the durable copy
+        // verbatim rather than re-deriving it from other journal columns.
+        let transcript_payload = transcript_event(&value_ref, &value);
+        let transcript_ts = now_ns();
         {
             let journal = self.journal.lock().unwrap();
             journal
@@ -408,14 +415,22 @@ impl Kernel {
                         .map_err(internal)?;
                 }
             }
+            journal
+                .record_transcript_event(
+                    entry_id,
+                    transcript_ts,
+                    &serde_json::to_string(&transcript_payload).map_err(internal)?,
+                )
+                .map_err(internal)?;
         }
         self.events
             .publish_journal(entry_id, journal_event(entry_id, &params.src, true, &actor));
         // AGENT-SURFACE §4: announce the new transcript value on the
         // `session.transcript` channel — subscribers learn a new
-        // out[n] exists (with its shape summary) without polling.
-        self.events
-            .publish("session.transcript", transcript_event(&value_ref, &value));
+        // out[n] exists (with its shape summary) without polling. Uses
+        // `publish_transcript` (not the plain `publish`) so the seq↔entry_id
+        // pointer needed for cold replay past the ring is recorded too.
+        self.events.publish_transcript(entry_id, transcript_payload);
         let exec_budget = ElideBudget::from_spec(params.elide.as_ref());
         let exec_uri = short_ref_to_uri(&value_ref, None);
         // The journal keeps the full render above (record_output); the wire

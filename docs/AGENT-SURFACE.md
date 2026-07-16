@@ -42,31 +42,42 @@ Real gaps that remain, tracked in `docs/ROADMAP.md`'s open-items list:
   (`command.rs`) with the same span its sibling error path uses, and forwarded by
   `wire::outcome_span`. It is still honestly omitted (`skip_serializing_if`) for outcomes with no
   invocation site in scope — builtin-wrapped results and values reconstructed from the journal.
-- The `journal` channel is now *journal-backed* and replayable from ANY seq (audit gap G2 closed):
-  an `events.read {channel:"journal", since}` (or `resources/read` on
-  `shoal://events/journal?since=`) with a `since` older than the in-memory ring's oldest retained
-  seq falls back to the SQLite journal, reconstructing the aged-out `{entry_id, head, ok, principal}`
-  events contiguous with whatever the ring still holds — no longer lost past the ring cap
-  (`crates/shoal-kernel/src/eventbus.rs`: `read_journal_channel`/`reconstruct_journal_events`,
-  pinned by `journal_channel_replays_aged_out_events_from_the_journal`). The correspondence: each
-  `journal` event's `seq` is recorded, at publish time, against the coarse exec-level journal
-  `entry_id` it announced (`EventBus::journal_index`, one `i64` per event — the *pointer* is in
-  memory, the *payload* is rebuilt from the durable journal row). Using that index as the membership
-  set is also what keeps replay faithful in an on-disk session, where the session evaluator ALSO
-  writes finer per-statement rows into the same store (`session.rs`): those rows never fired on this
-  channel, so they are excluded (pinned by
-  `journal_channel_replay_excludes_evaluator_per_statement_entries`).
-- `session.transcript`/`approval`/`render` remain ring-buffered only (≥1024 events per channel), not
-  journal-backed: a subscriber that falls behind by more than the ring cap loses those events for
-  good. For `session.transcript` the underlying `out[n]` VALUES are still recoverable via
-  `journal.query` + `value.get`, but the transcript CHANNEL is not yet replayable past the ring like
-  `journal` is — and cannot be reconstructed the same way without a schema change: the journal
-  records the exec entry (src/AST/effects/outputs) but NOT the transcript event's `{n, ref,
-  summary:{type, ok?, cmd?, n?}}` shape or its per-channel `seq`, so there is no durable row to
-  synthesize the exact event from. Making it replayable needs the journal to persist each transcript
-  event's channel seq + payload (or a stable transcript-entry id keyed to it) — left as a documented
-  follow-up rather than an approximate mapping. `approval`/`render` are transient control events with
-  no journal representation at all and stay ring-only by design.
+- The `journal` AND `session.transcript` channels are both *journal-backed* and replayable from ANY
+  seq (audit gap G2, and its `session.transcript` follow-up, both closed): an `events.read
+  {channel:"journal"|"session.transcript", since}` (or `resources/read` on
+  `shoal://events/journal?since=` / `shoal://events/session.transcript?since=`) with a `since` older
+  than the in-memory ring's oldest retained seq falls back to the durable journal, reconstructing the
+  aged-out events contiguous with whatever the ring still holds — no longer lost past the ring cap
+  (`crates/shoal-kernel/src/eventbus.rs`: `read_journal_channel`/`reconstruct_journal_events` and
+  `read_transcript_channel`/`reconstruct_transcript_events`, pinned by
+  `journal_channel_replays_aged_out_events_from_the_journal` and
+  `session_transcript_channel_replays_aged_out_events_from_the_journal`). The seq↔durable-source
+  correspondence for both channels is the same dense-index idea: each event's `seq` is recorded, at
+  publish time, against the coarse exec-level journal `entry_id` it announced (`EventBus::
+  journal_index` / `EventBus::transcript_index`, one `i64` per event — the *pointer* is in memory).
+  The two channels differ in where the *payload* comes from: `journal`'s `{entry_id, head, ok,
+  principal}` is rebuilt from pre-existing `entry` columns (nothing new to persist), while
+  `session.transcript`'s `{n, ref, summary:{type, ok?, cmd?, n?}}` has no such pre-existing home — it
+  is derived from the evaluated `Value`, which the journal never durably stored in that shape — so
+  `shoal-journal` gained a small `transcript_event(entry_id PRIMARY KEY, ts, payload)` table
+  (`crates/shoal-journal/src/transcript.rs`: `record_transcript_event`/`transcript_events_by_entry`),
+  written (additively — `CREATE TABLE IF NOT EXISTS`, so a pre-existing journal.db opens unchanged
+  and gains the table on its next open) at the exact call site in `handlers_exec.rs` that publishes
+  the live event, storing the SAME `$`-tagged JSON verbatim; reconstruction re-wraps it rather than
+  re-deriving it. Using the index as the membership set is also what keeps both channels' replay
+  faithful in an on-disk session, where the session evaluator ALSO writes finer per-statement rows
+  into the same store (`session.rs`), and where a failed exec gets a coarse `journal` entry but never
+  a `transcript_event` row (only a successful exec announces on `session.transcript`): those rows
+  never fired on the channel being replayed, so they are excluded (pinned by
+  `journal_channel_replay_excludes_evaluator_per_statement_entries` and
+  `session_transcript_channel_replay_skips_entries_with_no_transcript_row`).
+- The cold replay path for both channels resolves its seq→`entry_id` index against
+  `shoal_journal::Journal::entries_by_id`/`transcript_events_by_entry` — targeted, order-preserving,
+  missing-ids-skipped fetches (`crates/shoal-journal/src/query.rs`/`transcript.rs`) — rather than a
+  wide `query()` scan filtered in memory, so a cold replay past the ring pulls only the rows it needs.
+- `approval`/`render` remain ring-buffered only (≥1024 events per channel), not journal-backed: a
+  subscriber that falls behind by more than the ring cap loses those events for good. Both are
+  transient control events with no journal representation at all and stay ring-only by design.
 - Per-client `it` (`Session::client_it`, the last transcript value a given connection saw) is
   tracked on every `exec` but not yet exposed through any wire method — nothing reads it back
   today.
@@ -151,17 +162,18 @@ above a hard cap (64 KiB) — a misbehaving agent cannot flood itself.
 ## 4. Events — channels, cursors, push
 
 Kernel-native pub/sub over the same socket. Every event: `{channel, seq, ts, payload}` — `seq`
-monotonic **per channel**; ring-buffered (≥1024 events per channel). The `journal` channel is
-additionally *journal-backed*: an `events.read {channel:"journal", since}` with a `since` below the
-ring's oldest retained seq is reconstructed from the SQLite journal, so it replays from ANY seq —
-its `seq` corresponds to the coarse exec-level journal `entry_id` it announced (see the status
-section above). Every OTHER channel (`session.transcript`, `task.{id}`, `approval`, `render`,
-`user.*`) is ring-only: a `since` past the ring depth returns only what the ring still holds. Read =
-`shoal://events/{ch}?since={seq}`; push = subscription (§6). At-least-once; consumers dedup by seq.
+monotonic **per channel**; ring-buffered (≥1024 events per channel). The `journal` AND
+`session.transcript` channels are additionally *journal-backed*: an `events.read
+{channel:"journal"|"session.transcript", since}` with a `since` below the ring's oldest retained seq
+is reconstructed from the SQLite journal, so both replay from ANY seq — each one's `seq` corresponds
+to the coarse exec-level journal `entry_id` it announced (see the status section above). Every OTHER
+channel (`task.{id}`, `approval`, `render`, `user.*`) is ring-only: a `since` past the ring depth
+returns only what the ring still holds. Read = `shoal://events/{ch}?since={seq}`; push = subscription
+(§6). At-least-once; consumers dedup by seq.
 
 Channels (payloads are `$`-tagged):
 ```
-session.transcript   {n, ref, summary:{type, ok?, cmd?, n?}}      every new out[n]
+session.transcript   {n, ref, summary:{type, ok?, cmd?, n?}}      every successful exec's new out[n]
 task.{id}            "started", then terminal {state:"completed"|"failed"|"cancelled", ref?}
 journal              {entry_id, head, ok, principal}               every finished journal entry
 approval             {plan_ref, effects, principal, expires}       plan awaiting approval
@@ -214,11 +226,11 @@ An MCP client subscribes to a resource URI (`resources/subscribe` with a
 JSON-RPC clients use `events.subscribe {channel, since?}` → a stream of `event` notifications on
 the same socket; `events.unsubscribe {channel}`. Delivery is at-least-once with per-channel `seq`;
 a client that missed events replays with `events.read {since:last_seq}`. For ring-only channels that
-recovers events up to the ring depth; for the journal-backed `journal` channel `events.read` itself
-transparently falls back to the SQLite journal for seqs that have aged out of the ring, so it
-replays from any seq (§4, status section) — no separate `journal.query` needed. **A correct agent
-never calls the same read twice hoping for change — it subscribes.** The word "poll" appears in this
-system only as an anti-pattern.
+recovers events up to the ring depth; for the journal-backed `journal`/`session.transcript` channels
+`events.read` itself transparently falls back to the SQLite journal for seqs that have aged out of
+the ring, so both replay from any seq (§4, status section) — no separate `journal.query` needed.
+**A correct agent never calls the same read twice hoping for change — it subscribes.** The word
+"poll" appears in this system only as an anti-pattern.
 
 **Status: backpressure implemented** (`crates/shoal-kernel/src/eventbus.rs`: a bounded per-subscriber
 queue plus one dedicated writer thread per subscription — `publish()` only ever appends to the
@@ -226,9 +238,10 @@ queue, never performs the socket write itself). A slow subscriber's queue is bou
 the kernel drops to a **coalesced summary** for that subscriber (`{dropped: n, latest_seq}`) rather
 than unbounded buffering or blocking producers — the subscriber re-reads from `latest_seq`.
 Liveness beats completeness on a saturated channel; completeness for ring-only channels is
-recoverable up to the ring depth (§4), and fully recoverable past it only for the `journal` channel,
-whose `events.read` is journal-backed (other channels' full history is recoverable only via the
-journal's own independent records where they exist, e.g. `journal.query` — see the status section
+recoverable up to the ring depth (§4), and fully recoverable past it for the `journal`/
+`session.transcript` channels, whose `events.read` is journal-backed (other channels' full history
+is recoverable only via the journal's own independent records where they exist, e.g. `journal.query`
+— see the status section
 above). One corollary of moving the write off the dispatch call path: an event pushed on the same
 connection that triggered it is no longer ordered relative to that call's own RPC response, only
 guaranteed to arrive (at-least-once).
