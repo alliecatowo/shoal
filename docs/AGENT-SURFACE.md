@@ -311,3 +311,45 @@ Every root in §1 is served (`crates/shoal-mcp/src/resources.rs`, pinned end-to-
 byte of actual payload is pulled on purpose, structured, from an addressable noun — or pushed,
 structured, from a subscribed channel. There is no other way for data to reach the agent, by
 construction.
+
+## 9. Error codes — `RpcError.code` taxonomy
+
+Every `RpcError` any `shoal-kernel` dispatch handler constructs (§5's methods) carries one of the
+named codes below — `crates/shoal-proto/src/lib.rs`'s `error_code` module is the single source of
+truth; a handler builds `RpcError { code: error_code::UNKNOWN_TASK, .. }`, never a bare `-32021`
+literal. This table is the agent-facing reference for what each number means; the module's own doc
+comments are the same content, kept in sync because both are refactor artifacts of one source list
+(no separate copy to drift). This is not the `ErrorVal` string taxonomy raised inside the language
+itself (`parse_error`, `type_error`, … — CONTRACTS.md §4) — that is a distinct, unrelated code space
+carried in an error *value*, not in the RPC envelope.
+
+Two families, per JSON-RPC 2.0's own reserved ranges:
+
+| Code | Name | Meaning |
+|---|---|---|
+| `-32700` | `RPC_PARSE_ERROR` | Invalid JSON received (frame-level). Not raised by `shoal-kernel` itself — a malformed frame just ends the connection via `io::Error` before any `RpcError` exists. `shoal-mcp`'s stdio bridge raises this for its own line-framed JSON. |
+| `-32600` | `INVALID_REQUEST` | The request wasn't a valid JSON-RPC 2.0 envelope (today: wrong `jsonrpc` version string). |
+| `-32601` | `METHOD_NOT_FOUND` | The method name has no handler in `Kernel::dispatch`. |
+| `-32602` | `INVALID_PARAMS` | Params failed to decode, an enum-like field (`exec`'s `mode`, `value.get`'s `format`) held a value outside its accepted set, or a param violated a scoping rule (`events.publish` off a non-`user.*` channel). |
+| `-32603` | `INTERNAL_ERROR` | An unexpected local failure (serialization, journal I/O). **Overloaded**: also used for `events.subscribe` without a live connection to subscribe on — a caller/environment condition, not a genuine internal bug. |
+
+JSON-RPC's own "implementation-defined server error" band (`-32000..=-32099`) is where every
+shoal-kernel-specific code lives:
+
+| Code | Name | Meaning |
+|---|---|---|
+| `-32000` | `NOT_ATTACHED` | No session is attached on this connection yet. Every handler but `session.attach`, `parse`, `complete`, and `cap.request` requires one. |
+| `-32001` | `PARSE_ERROR` | The submitted shoal *source* failed to parse (`shoal_syntax::parse`). Distinct from `RPC_PARSE_ERROR`: a language-level parse error carried as a normal RPC error, not a wire-framing failure. |
+| `-32002` | `RAISED` | Evaluating the parsed source raised a shoal-language error. The raised `ErrorVal` is still addressable afterward via the `out[n]` transcript ref in the error's `data`. |
+| `-32004` | `UNKNOWN_REF` | The `ref`/`hash` named by `value.get`/`blob.get` doesn't name anything this session's transcript (or the journal/CAS) knows about, or a CAS-backed bytes ref failed to resolve its stored content. |
+| `-32005` | `BAD_PATH_OR_SLICE` | A `value.get` request's `path`, `slice`, or `format` doesn't match the shape of the value it targets (bad field path, an out-of-kind slice, or a `format` the value's type doesn't support). |
+| `-32010` | `LEASH_DENIED` | The leash policy forbids the requested operation. **Overloaded** across three related-but-distinct conditions: a plain `Verdict::Deny` on `exec {mode:"run"}`; a `plan_ref` lookup (`plan.get`/`plan.apply`) naming a plan that belongs to a different principal/session; and an `exec {mode:"approved"}` re-entry that fails to verify against a stored, approved plan for this session/principal. |
+| `-32011` | `APPROVAL_REQUIRED` | The leash policy requires explicit approval (`Verdict::ApprovalRequired`) before this plan/effect set may run — `plan` it, then `cap.request`, then re-`exec` with `mode:"approved"`. |
+| `-32012` | `UNKNOWN_PLAN` | The named `plan_ref` (`plan.get`/`plan.apply`/`cap.request`) is unknown or has expired. |
+| `-32020` | `TASK_CONTROL_UNAVAILABLE` | Task suspend/resume is unavailable: a kernel task is a Rust thread recursively re-entering `dispatch`, not a single tracked child process/group, so there is nothing to signal yet. |
+| `-32021` | `UNKNOWN_TASK` | The named `task` ref is unknown, or belongs to another session. |
+| `-32030` | `AUTH_FAILED` | Bearer-token authentication failed on `session.attach`: either this kernel has no `TokenStore` configured at all (an ephemeral kernel), or the given token is missing/expired/revoked. |
+
+`crates/shoal-proto/src/lib.rs`'s `error_code_constants_match_pinned_wire_values` test pins every
+number above to its constant — a refactor-safety net so centralizing the taxonomy can never
+silently renumber a code already on the wire.

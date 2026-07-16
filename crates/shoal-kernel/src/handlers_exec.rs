@@ -188,7 +188,7 @@ impl Kernel {
         }
         if params.mode == "plan" {
             let ast = shoal_syntax::parse(&params.src).map_err(|e| RpcError {
-                code: -32001,
+                code: PARSE_ERROR,
                 message: e.msg,
                 data: Some(json!({"span":e.span,"hint":e.hint})),
             })?;
@@ -248,7 +248,7 @@ impl Kernel {
             });
             if !verified {
                 return Err(RpcError {
-                    code: -32010,
+                    code: LEASH_DENIED,
                     message: "mode \"approved\" requires an approved plan_ref for this \
                               session/principal (use plan → cap.request → plan.apply)"
                         .into(),
@@ -257,13 +257,13 @@ impl Kernel {
             }
         } else if params.mode != "run" {
             return Err(RpcError {
-                code: -32602,
+                code: INVALID_PARAMS,
                 message: "mode must be run or plan".into(),
                 data: None,
             });
         }
         let ast = shoal_syntax::parse(&params.src).map_err(|e| RpcError {
-            code: -32001,
+            code: PARSE_ERROR,
             message: e.msg,
             data: Some(json!({"span":e.span,"hint":e.hint})),
         })?;
@@ -279,14 +279,14 @@ impl Kernel {
             match self.policy.evaluate_plan(&actor, &run_plan) {
                 Verdict::Deny => {
                     return Err(RpcError {
-                        code: -32010,
+                        code: LEASH_DENIED,
                         message: "leash denied execution".into(),
                         data: Some(json!({"effects":run_plan.effects})),
                     });
                 }
                 Verdict::ApprovalRequired => {
                     return Err(RpcError {
-                        code: -32011,
+                        code: APPROVAL_REQUIRED,
                         message: "approval required; plan first".into(),
                         data: Some(json!({"effects":run_plan.effects})),
                     });
@@ -359,7 +359,7 @@ impl Kernel {
                     .insert(client, value_ref.clone());
                 let uri = short_ref_to_uri(&value_ref, None);
                 return Err(RpcError {
-                    code: -32002,
+                    code: RAISED,
                     message: e.msg,
                     data: Some(json!({
                         "code": e.code, "span": e.span, "hint": e.hint,

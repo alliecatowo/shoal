@@ -21,6 +21,7 @@ use shoal_journal::{EntryRecord, Journal, JournalQuery};
 use shoal_leash::{
     Effect, EnforcementStatus, EnforcementTier, Estimates, Plan, Policy, Reversibility, Verdict,
 };
+use shoal_proto::error_code::*;
 use shoal_proto::*;
 use shoal_value::Value;
 use std::collections::{HashMap, VecDeque};
@@ -202,7 +203,7 @@ impl Kernel {
             while let Some(request) = read_frame(&mut reader)? {
                 let id = request.id.clone();
                 let response = if request.jsonrpc != JSONRPC {
-                    Response::err(id, -32600, "invalid JSON-RPC version", None)
+                    Response::err(id, INVALID_REQUEST, "invalid JSON-RPC version", None)
                 } else {
                     self.dispatch(request, client, &mut attached, Some(&writer))
                 };
@@ -223,7 +224,7 @@ impl Kernel {
             .get(task)
             .cloned()
             .ok_or_else(|| RpcError {
-                code: -32021,
+                code: UNKNOWN_TASK,
                 message: "unknown task ref".into(),
                 data: None,
             })
@@ -273,7 +274,7 @@ impl Drop for BoundSocket {
 
 fn decode<T: serde::de::DeserializeOwned>(value: Json) -> Result<T, RpcError> {
     serde_json::from_value(value).map_err(|e| RpcError {
-        code: -32602,
+        code: INVALID_PARAMS,
         message: e.to_string(),
         data: None,
     })
@@ -283,14 +284,14 @@ fn encode<T: serde::Serialize>(value: T) -> Result<Json, RpcError> {
 }
 fn internal(error: impl std::fmt::Display) -> RpcError {
     RpcError {
-        code: -32603,
+        code: INTERNAL_ERROR,
         message: error.to_string(),
         data: None,
     }
 }
 fn not_attached() -> RpcError {
     RpcError {
-        code: -32000,
+        code: NOT_ATTACHED,
         message: "attach to a session first".into(),
         data: None,
     }
@@ -734,7 +735,7 @@ mod tests {
         );
         assert_eq!(
             bad.error.expect("slicing an int must error").code,
-            -32005,
+            BAD_PATH_OR_SLICE,
             "slice on a scalar must be an explicit error"
         );
         // `[a..b]` path ranges (AGENT-SURFACE §1) — used to be "bad index".
@@ -769,7 +770,10 @@ mod tests {
             "value.get",
             json!({"ref":value_ref,"format":"raw"}),
         );
-        assert_eq!(raw_bad.error.expect("raw on int must error").code, -32005);
+        assert_eq!(
+            raw_bad.error.expect("raw on int must error").code,
+            BAD_PATH_OR_SLICE
+        );
         drop(client);
         drop(reader);
         thread.join().unwrap();
@@ -880,7 +884,10 @@ mod tests {
             "exec",
             json!({"src":"sh { echo hi }","mode":"run","position":"stmt"}),
         );
-        assert_eq!(run.error.expect("run must be gated").code, -32011);
+        assert_eq!(
+            run.error.expect("run must be gated").code,
+            APPROVAL_REQUIRED
+        );
         // The bypass: bare `mode:"approved"` (no plan_ref) must be rejected…
         let bare = call(
             &mut client,
@@ -889,7 +896,10 @@ mod tests {
             "exec",
             json!({"src":"sh { echo hi }","mode":"approved","position":"stmt"}),
         );
-        assert_eq!(bare.error.expect("bare approved must fail").code, -32010);
+        assert_eq!(
+            bare.error.expect("bare approved must fail").code,
+            LEASH_DENIED
+        );
         // …as must a plan_ref that was never approved…
         let planned = call(
             &mut client,
@@ -914,7 +924,7 @@ mod tests {
                 .error
                 .expect("unapproved plan_ref must fail")
                 .code,
-            -32010
+            LEASH_DENIED
         );
         // …and an approved plan_ref may not smuggle DIFFERENT source.
         call(
@@ -933,7 +943,7 @@ mod tests {
         );
         assert_eq!(
             smuggled.error.expect("source smuggling must fail").code,
-            -32010
+            LEASH_DENIED
         );
         // The sanctioned path still works: same source, approved plan.
         let sanctioned = call(
@@ -1124,7 +1134,7 @@ mod tests {
             "value.get",
             json!({"ref":value_ref,"path":"nope"}),
         );
-        assert_eq!(bad.error.unwrap().code, -32005);
+        assert_eq!(bad.error.unwrap().code, BAD_PATH_OR_SLICE);
 
         let ls_exec = call(&mut client, &mut reader, 6, "exec", json!({"src":"ls"}));
         let ls_ref = ls_exec.result.unwrap()["ref"].as_str().unwrap().to_owned();
@@ -1162,7 +1172,7 @@ mod tests {
             "exec",
             json!({"src":"sh { exit 7 }","position":"stmt"}),
         );
-        assert_eq!(stmt.error.unwrap().code, -32002);
+        assert_eq!(stmt.error.unwrap().code, RAISED);
         let value = call(
             &mut client,
             &mut reader,
@@ -1296,7 +1306,7 @@ mod tests {
             "session.attach",
             json!({"token":"not-a-token","client":{"kind":"agent","tty":false}}),
         );
-        assert_eq!(denied.error.unwrap().code, -32030);
+        assert_eq!(denied.error.unwrap().code, AUTH_FAILED);
         drop(client);
         drop(reader);
         thread.join().unwrap();
@@ -1779,7 +1789,7 @@ mod tests {
             "events.publish",
             json!({"channel":"session.transcript","payload":{"$":"int","v":1}}),
         );
-        assert_eq!(denied.error.unwrap().code, -32602);
+        assert_eq!(denied.error.unwrap().code, INVALID_PARAMS);
         // Publish two values, then read them back with monotonic per-channel seq.
         for (i, v) in ["go", "stop"].iter().enumerate() {
             let published = call(
@@ -2620,7 +2630,7 @@ mod tests {
             json!({"src":"sh { exit 5 }","position":"stmt"}),
         );
         let err = raised.error.expect("must raise");
-        assert_eq!(err.code, -32002);
+        assert_eq!(err.code, RAISED);
         let data = err.data.unwrap();
         let value_ref = data["ref"]
             .as_str()
@@ -2832,7 +2842,7 @@ mod tests {
             json!({"task": task}),
         );
         let error = resume.error.expect("task.resume is not yet implemented");
-        assert_eq!(error.code, -32020);
+        assert_eq!(error.code, TASK_CONTROL_UNAVAILABLE);
         assert!(
             error.message.contains("resume"),
             "message: {}",
@@ -2847,7 +2857,7 @@ mod tests {
             "task.suspend",
             json!({"task": task}),
         );
-        assert_eq!(suspend.error.unwrap().code, -32020);
+        assert_eq!(suspend.error.unwrap().code, TASK_CONTROL_UNAVAILABLE);
 
         // An unknown task ref is rejected before the honest-stub error, for
         // both methods.
@@ -2857,14 +2867,14 @@ mod tests {
                 .error
                 .unwrap()
                 .code,
-            -32021
+            UNKNOWN_TASK
         );
         assert_eq!(
             call(&mut client, &mut reader, 6, "task.suspend", unknown)
                 .error
                 .unwrap()
                 .code,
-            -32021
+            UNKNOWN_TASK
         );
 
         call(

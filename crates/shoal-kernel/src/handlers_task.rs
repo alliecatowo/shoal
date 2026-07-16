@@ -33,7 +33,7 @@ impl Kernel {
         let task = self.task(&p.task)?;
         if task.session.id != session.id {
             return Err(RpcError {
-                code: -32021,
+                code: UNKNOWN_TASK,
                 message: "unknown task ref".into(),
                 data: None,
             });
@@ -53,7 +53,7 @@ impl Kernel {
         let task = self.task(&p.task)?;
         if task.session.id != session.id {
             return Err(RpcError {
-                code: -32021,
+                code: UNKNOWN_TASK,
                 message: "unknown task ref".into(),
                 data: None,
             });
@@ -76,7 +76,7 @@ impl Kernel {
         let task = self.task(&p.task)?;
         if task.session.id != session.id {
             return Err(RpcError {
-                code: -32021,
+                code: UNKNOWN_TASK,
                 message: "unknown task ref".into(),
                 data: None,
             });
@@ -103,13 +103,13 @@ impl Kernel {
         let task = self.task(&p.task)?;
         if task.session.id != session.id {
             return Err(RpcError {
-                code: -32021,
+                code: UNKNOWN_TASK,
                 message: "unknown task ref".into(),
                 data: None,
             });
         }
         Err(RpcError {
-            code: -32020,
+            code: TASK_CONTROL_UNAVAILABLE,
             message: "task suspension is unavailable for evaluator-owned processes".into(),
             data: Some(json!({"task":p.task})),
         })
@@ -135,13 +135,13 @@ impl Kernel {
         let task = self.task(&p.task)?;
         if task.session.id != session.id {
             return Err(RpcError {
-                code: -32021,
+                code: UNKNOWN_TASK,
                 message: "unknown task ref".into(),
                 data: None,
             });
         }
         Err(RpcError {
-            code: -32020,
+            code: TASK_CONTROL_UNAVAILABLE,
             message: "task resume is unavailable for evaluator-owned processes".into(),
             data: Some(json!({"task":p.task})),
         })
@@ -154,7 +154,8 @@ impl Kernel {
     /// verdict, mirroring what `explain` returns plus the verdict fields
     /// `exec`'s plan mode reports. Session/principal-scoped like `plan.apply`
     /// (a plan is private to the principal that derived it), and an unknown or
-    /// expired ref is a clear not-found (`-32012`), never a silent empty plan.
+    /// expired ref is a clear not-found (`UNKNOWN_PLAN`, `-32012`), never a
+    /// silent empty plan.
     pub(crate) fn handle_plan_get(
         self: &Arc<Self>,
         params: Json,
@@ -165,13 +166,13 @@ impl Kernel {
         let p: PlanApplyParams = decode(params)?;
         let plans = self.plans.lock().unwrap();
         let stored = plans.get(&p.plan_ref).ok_or_else(|| RpcError {
-            code: -32012,
+            code: UNKNOWN_PLAN,
             message: "unknown or expired plan_ref".into(),
             data: Some(json!({ "plan_ref": p.plan_ref })),
         })?;
         if stored.session != session.id || stored.principal != attachment.principal {
             return Err(RpcError {
-                code: -32010,
+                code: LEASH_DENIED,
                 message: "plan belongs to another principal/session".into(),
                 data: None,
             });
@@ -237,13 +238,13 @@ impl Kernel {
         let p: PlanApplyParams = decode(params)?;
         let plans = self.plans.lock().unwrap();
         let stored = plans.get(&p.plan_ref).ok_or_else(|| RpcError {
-            code: -32012,
+            code: UNKNOWN_PLAN,
             message: "unknown plan_ref".into(),
             data: None,
         })?;
         if stored.session != session.id || stored.principal != attachment.principal {
             return Err(RpcError {
-                code: -32010,
+                code: LEASH_DENIED,
                 message: "plan belongs to another principal/session".into(),
                 data: None,
             });
@@ -255,7 +256,7 @@ impl Kernel {
                 != Verdict::Allow
         {
             return Err(RpcError {
-                code: -32011,
+                code: APPROVAL_REQUIRED,
                 message: "plan approval pending".into(),
                 data: None,
             });
@@ -293,20 +294,20 @@ impl Kernel {
         let p: CapRequestParams = decode(params)?;
         let Some(plan_ref) = p.plan_ref else {
             return Err(RpcError {
-                code: -32602,
+                code: INVALID_PARAMS,
                 message: "plan_ref is required".into(),
                 data: None,
             });
         };
         let mut plans = self.plans.lock().unwrap();
         let stored = plans.get_mut(&plan_ref).ok_or_else(|| RpcError {
-            code: -32012,
+            code: UNKNOWN_PLAN,
             message: "unknown plan_ref".into(),
             data: None,
         })?;
         if self.policy.evaluate_plan(&stored.principal, &stored.plan) == Verdict::Deny {
             return Err(RpcError {
-                code: -32010,
+                code: LEASH_DENIED,
                 message: "policy denies requested effects".into(),
                 data: None,
             });

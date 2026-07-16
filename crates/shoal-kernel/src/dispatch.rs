@@ -42,7 +42,7 @@ impl Kernel {
             "complete" => self.handle_complete(params),
             "explain" => self.handle_explain(params, attached),
             _ => Err(RpcError {
-                code: -32601,
+                code: METHOD_NOT_FOUND,
                 message: "method not found".into(),
                 data: None,
             }),
