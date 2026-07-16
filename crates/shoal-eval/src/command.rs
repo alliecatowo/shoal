@@ -1206,3 +1206,82 @@ mod command_did_you_mean_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod dispatch_registry_lockstep {
+    //! Audit P5: `eval_command`'s special-head dispatch is a hand-written
+    //! if-chain of head-equality guards, while the *canonical* builtin registry
+    //! (`shoal_syntax::commands`, which the completer/highlighter/LSP consume)
+    //! lives elsewhere. A comment asks to "keep this in lockstep" but nothing
+    //! enforced it: add a guard here and forget the registry, and the head
+    //! dispatches yet is invisible to completion/highlight/LSP.
+    //!
+    //! This test closes that gap by reading the guards straight out of this
+    //! file's own source (`include_str!`), so it can never drift from a
+    //! hand-maintained duplicate list — a new guard is picked up automatically.
+    use super::*;
+    use std::collections::BTreeSet;
+
+    /// Every head literal the production dispatch matches on, extracted from
+    /// this file's source. We embed the whole file and cut it at the first
+    /// `#[cfg(test)]` so ONLY production `eval_command` code is scanned — the
+    /// test modules (including this one) are excluded, which also sidesteps any
+    /// self-match on the scanner's own needle.
+    fn dispatched_heads() -> BTreeSet<String> {
+        const SRC: &str = include_str!("command.rs");
+        let production = SRC.split("#[cfg(test)]").next().unwrap();
+        let needle = "call.head == \"";
+        let mut heads = BTreeSet::new();
+        let mut rest = production;
+        while let Some(i) = rest.find(needle) {
+            rest = &rest[i + needle.len()..];
+            if let Some(end) = rest.find('"') {
+                heads.insert(rest[..end].to_string());
+                rest = &rest[end + 1..];
+            }
+        }
+        heads
+    }
+
+    /// Forward: every head the dispatch intercepts is known to the canonical
+    /// registry — structured builtin (`is_builtin`, e.g. `which`) or special
+    /// head (`is_special_head`). A guard added here without a registry entry
+    /// fails this, so it can never become invisible to completion/highlight/LSP.
+    #[test]
+    fn every_dispatch_guard_is_in_the_registry() {
+        let heads = dispatched_heads();
+        // Sanity: the scan actually found the guards (guards against a silent
+        // regex/split breakage masking real drift).
+        assert!(
+            heads.len() >= 20,
+            "scan found only {} dispatch heads — did command.rs's guard shape change? {heads:?}",
+            heads.len()
+        );
+        for head in &heads {
+            assert!(
+                builtins::is_builtin(head) || builtins::is_special_head(head),
+                "dispatch guard `call.head == \"{head}\"` in command.rs is NOT in the canonical \
+                 registry (shoal_syntax::commands) — it dispatches but is invisible to \
+                 completion/highlight/LSP. Add `{head}` to NAMES or SPECIAL_HEADS."
+            );
+        }
+    }
+
+    /// Reverse: every SPECIAL head in the registry has a real dispatch guard —
+    /// so a registry entry can't advertise a head that `eval_command` never
+    /// actually intercepts. (`is_builtin` names route through the generic
+    /// `builtins::run` path, not a per-head guard, so they're excluded here.)
+    #[test]
+    fn every_special_head_in_the_registry_is_dispatched() {
+        let heads = dispatched_heads();
+        for name in builtins::builtin_names() {
+            if builtins::is_special_head(name) {
+                assert!(
+                    heads.contains(*name),
+                    "registry special head `{name}` has no `call.head == \"{name}\"` dispatch \
+                     guard in command.rs — the registry advertises a head eval never intercepts."
+                );
+            }
+        }
+    }
+}
