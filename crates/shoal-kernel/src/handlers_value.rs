@@ -10,7 +10,7 @@ use super::*;
 /// fetching the content gets a clear reason instead of a bare code.
 fn cas_resolve_error(r#ref: &Ref, err: shoal_value::ErrorVal) -> RpcError {
     RpcError {
-        code: -32004,
+        code: UNKNOWN_REF,
         message: err.msg,
         data: Some(json!({"ref": r#ref, "code": err.code})),
     }
@@ -27,14 +27,14 @@ impl Kernel {
         let params: ValueGetParams = decode(params)?;
         let values = session.transcript.lock().unwrap();
         let value = values.get(&params.r#ref).ok_or_else(|| RpcError {
-            code: -32004,
+            code: UNKNOWN_REF,
             message: "unknown value ref".into(),
             data: None,
         })?;
         let resolved = match params.path.as_deref() {
             Some(path) if !path.is_empty() => {
                 resolve_value_path(value, path).map_err(|message| RpcError {
-                    code: -32005,
+                    code: BAD_PATH_OR_SLICE,
                     message,
                     data: Some(json!({"ref":params.r#ref,"path":path})),
                 })?
@@ -89,7 +89,7 @@ impl Kernel {
             // instead of silently returning the unsliced value.
             (Some(_), other) => {
                 return Err(RpcError {
-                    code: -32005,
+                    code: BAD_PATH_OR_SLICE,
                     message: format!("cannot slice a {}", other.type_name()),
                     data: Some(json!({"ref":params.r#ref})),
                 });
@@ -146,7 +146,7 @@ impl Kernel {
                     }
                     other => {
                         return Err(RpcError {
-                            code: -32005,
+                            code: BAD_PATH_OR_SLICE,
                             message: format!(
                                 "format \"raw\" applies to str/bytes, not {}",
                                 other.type_name()
@@ -158,7 +158,7 @@ impl Kernel {
                 encode(raw)
             }
             Some(other) => Err(RpcError {
-                code: -32602,
+                code: INVALID_PARAMS,
                 message: format!("format must be json, render, or raw (got {other:?})"),
                 data: None,
             }),

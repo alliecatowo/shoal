@@ -645,7 +645,7 @@ impl Kernel {
         // the kernel owns the semantic channels.
         if !p.channel.starts_with("user.") {
             return Err(RpcError {
-                code: -32602,
+                code: INVALID_PARAMS,
                 message: "only user.* channels may be published to".into(),
                 data: Some(json!({"channel": p.channel})),
             });
@@ -672,7 +672,7 @@ impl Kernel {
         let p: EventsSubParams = decode(params)?;
         let Some(writer) = conn else {
             return Err(RpcError {
-                code: -32603,
+                code: INTERNAL_ERROR,
                 message: "subscription requires a live connection".into(),
                 data: None,
             });

@@ -9,7 +9,7 @@ impl Kernel {
     pub(crate) fn handle_parse(self: &Arc<Self>, params: Json) -> Result<Json, RpcError> {
         let params: ParseParams = decode(params)?;
         let ast = shoal_syntax::parse(&params.src).map_err(|e| RpcError {
-            code: -32001,
+            code: PARSE_ERROR,
             message: e.msg,
             data: Some(json!({"span":e.span,"hint":e.hint})),
         })?;
@@ -32,19 +32,19 @@ impl Kernel {
         let p: ExplainParams = decode(params)?;
         let ast = if let Some(src) = &p.src {
             shoal_syntax::parse(src).map_err(|e| RpcError {
-                code: -32001,
+                code: PARSE_ERROR,
                 message: e.msg,
                 data: Some(json!({"span": e.span, "hint": e.hint})),
             })?
         } else if let Some(ast_json) = p.ast {
             serde_json::from_value(ast_json).map_err(|e| RpcError {
-                code: -32602,
+                code: INVALID_PARAMS,
                 message: format!("invalid ast: {e}"),
                 data: None,
             })?
         } else {
             return Err(RpcError {
-                code: -32602,
+                code: INVALID_PARAMS,
                 message: "explain requires src or ast".into(),
                 data: None,
             });
@@ -73,7 +73,7 @@ impl Kernel {
             .get("hash")
             .and_then(Json::as_str)
             .ok_or_else(|| RpcError {
-                code: -32602,
+                code: INVALID_PARAMS,
                 message: "blob.get requires a hash".into(),
                 data: None,
             })?
@@ -85,7 +85,7 @@ impl Kernel {
             .read_blob(&hash)
             .map_err(internal)?
             .ok_or_else(|| RpcError {
-                code: -32004,
+                code: UNKNOWN_REF,
                 message: "unknown value hash".into(),
                 data: None,
             })?;

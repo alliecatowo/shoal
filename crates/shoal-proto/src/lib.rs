@@ -46,6 +46,101 @@ pub struct RpcError {
     pub data: Option<Value>,
 }
 
+/// The complete `RpcError.code` taxonomy (TDD §7, AGENT-SURFACE.md's
+/// "error codes" table). Every `RpcError` built anywhere in `shoal-kernel`
+/// is constructed with one of these named constants rather than an inline
+/// `-32XXX` literal — this module is the single place the mapping from
+/// number to meaning lives, so it can't drift silently between call sites.
+///
+/// Two families, per JSON-RPC 2.0's own reserved ranges:
+/// - `-32700..=-32600`: the spec's own pre-defined codes (documented here for
+///   completeness; shoal-kernel itself only emits [`INVALID_REQUEST`],
+///   [`METHOD_NOT_FOUND`], [`INVALID_PARAMS`], and [`INTERNAL_ERROR`] —
+///   [`RPC_PARSE_ERROR`] is a framing-level error only the `shoal-mcp` stdio
+///   bridge raises today; a `shoal-kernel` frame that fails to parse as JSON
+///   never becomes an `RpcError` at all, it just ends the connection).
+/// - `-32000..=-32099`: JSON-RPC's "implementation-defined server error"
+///   band, which is where every shoal-kernel-specific code below lives.
+///
+/// A handful of these numbers are **overloaded** — reused across call sites
+/// whose meanings are related but not identical (most notably
+/// [`LEASH_DENIED`]). Each doc comment below says so explicitly; this is a
+/// pure refactor of pre-existing behavior, not a new design decision, so the
+/// overloads are preserved rather than split into new codes (wire codes must
+/// stay byte-identical — see the crate's `wire_codes_match_taxonomy` test).
+pub mod error_code {
+    // --- JSON-RPC 2.0 spec-reserved codes ---
+
+    /// Invalid JSON was received (frame-level parse failure). Not raised by
+    /// `shoal-kernel` (a bad frame just ends the connection via `io::Error`
+    /// before any `RpcError` exists); `shoal-mcp`'s stdio bridge uses this
+    /// code when *its* line-framed JSON fails to parse.
+    pub const RPC_PARSE_ERROR: i32 = -32700;
+    /// The request was not a valid JSON-RPC 2.0 envelope (today: the wrong
+    /// `jsonrpc` version string).
+    pub const INVALID_REQUEST: i32 = -32600;
+    /// The requested method name has no handler in `Kernel::dispatch`.
+    pub const METHOD_NOT_FOUND: i32 = -32601;
+    /// The method's params failed to decode into the expected shape, or an
+    /// enum-like field (`exec`'s `mode`, `value.get`'s `format`) held a value
+    /// outside its accepted set, or a param violated a scoping rule (e.g.
+    /// `events.publish` off a non-`user.*` channel).
+    pub const INVALID_PARAMS: i32 = -32602;
+    /// An unexpected local failure the caller couldn't have prevented
+    /// (serialization, journal I/O). Also (overloaded) used for
+    /// `events.subscribe` without a live connection to subscribe on, which is
+    /// a caller/environment condition rather than a genuine internal bug.
+    pub const INTERNAL_ERROR: i32 = -32603;
+
+    // --- shoal-kernel server-error range (-32000..=-32099) ---
+
+    /// No session is attached on this connection yet. Every handler but
+    /// `session.attach`, `parse`, `complete`, and `cap.request` requires one.
+    pub const NOT_ATTACHED: i32 = -32000;
+    /// The submitted shoal *source* failed to parse (`shoal_syntax::parse`).
+    /// Distinct from [`RPC_PARSE_ERROR`]: this is a language-level parse
+    /// error carried as a normal RPC error, not a wire-framing failure.
+    pub const PARSE_ERROR: i32 = -32001;
+    /// Evaluating the parsed source raised a shoal-language error. The
+    /// raised `ErrorVal` is still addressable afterward via the `out[n]`
+    /// transcript ref carried in the error's `data`.
+    pub const RAISED: i32 = -32002;
+    /// The `ref`/`hash` named by `value.get` or `blob.get` doesn't name
+    /// anything this session's transcript (or the journal/CAS) knows about,
+    /// or a CAS-backed bytes ref failed to resolve its stored content.
+    pub const UNKNOWN_REF: i32 = -32004;
+    /// A `value.get` request's `path`, `slice`, or `format` doesn't match
+    /// the shape of the value it targets (bad field path, an out-of-kind
+    /// slice, or a `format` the value's type doesn't support).
+    pub const BAD_PATH_OR_SLICE: i32 = -32005;
+    /// The leash policy forbids the requested operation. **Overloaded**
+    /// across three related-but-distinct conditions (see
+    /// `docs/AGENT-SURFACE.md`'s error-codes table): a plain
+    /// `Verdict::Deny` on `exec {mode:"run"}`; a `plan_ref`/task lookup
+    /// (`plan.get`/`plan.apply`) that names a plan belonging to a different
+    /// principal/session; and an `exec {mode:"approved"}` re-entry that
+    /// fails to verify against a stored, approved plan for this
+    /// session/principal.
+    pub const LEASH_DENIED: i32 = -32010;
+    /// The leash policy requires explicit approval
+    /// (`Verdict::ApprovalRequired`) before this plan/effect set may run —
+    /// `plan` it, then `cap.request`, then re-`exec` with `mode:"approved"`.
+    pub const APPROVAL_REQUIRED: i32 = -32011;
+    /// The named `plan_ref` (`plan.get`/`plan.apply`/`cap.request`) is
+    /// unknown or has expired.
+    pub const UNKNOWN_PLAN: i32 = -32012;
+    /// Task suspend/resume is unavailable: a kernel task is a Rust thread
+    /// recursively re-entering `dispatch`, not a single tracked child
+    /// process/group, so there is nothing to signal yet.
+    pub const TASK_CONTROL_UNAVAILABLE: i32 = -32020;
+    /// The named `task` ref is unknown, or belongs to another session.
+    pub const UNKNOWN_TASK: i32 = -32021;
+    /// Bearer-token authentication failed on `session.attach`: either this
+    /// kernel has no `TokenStore` configured at all (an ephemeral kernel),
+    /// or the given token is missing/expired/revoked.
+    pub const AUTH_FAILED: i32 = -32030;
+}
+
 impl Response {
     pub fn ok(id: RequestId, value: impl Serialize) -> Self {
         Self {
@@ -509,5 +604,30 @@ mod tests {
         let wire = WirePath::encode(&original);
         assert!(wire.raw.is_some());
         assert_eq!(wire.decode().unwrap(), original);
+    }
+
+    /// Locks the wire contract (refactor guard): every named `error_code`
+    /// constant must keep meaning the exact numeric code shoal-kernel's
+    /// handlers emitted before this taxonomy existed. Centralizing the
+    /// constants must never silently renumber a code on the wire.
+    #[test]
+    fn error_code_constants_match_pinned_wire_values() {
+        use error_code::*;
+        assert_eq!(RPC_PARSE_ERROR, -32700);
+        assert_eq!(INVALID_REQUEST, -32600);
+        assert_eq!(METHOD_NOT_FOUND, -32601);
+        assert_eq!(INVALID_PARAMS, -32602);
+        assert_eq!(INTERNAL_ERROR, -32603);
+        assert_eq!(NOT_ATTACHED, -32000);
+        assert_eq!(PARSE_ERROR, -32001);
+        assert_eq!(RAISED, -32002);
+        assert_eq!(UNKNOWN_REF, -32004);
+        assert_eq!(BAD_PATH_OR_SLICE, -32005);
+        assert_eq!(LEASH_DENIED, -32010);
+        assert_eq!(APPROVAL_REQUIRED, -32011);
+        assert_eq!(UNKNOWN_PLAN, -32012);
+        assert_eq!(TASK_CONTROL_UNAVAILABLE, -32020);
+        assert_eq!(UNKNOWN_TASK, -32021);
+        assert_eq!(AUTH_FAILED, -32030);
     }
 }

@@ -117,7 +117,7 @@ impl Kernel {
         let tty = params.client.tty;
         let (who, token_caps, profile) = if let Some(token) = params.token {
             let auth = self.auth.as_ref().ok_or_else(|| RpcError {
-                code: -32030,
+                code: AUTH_FAILED,
                 message: "bearer tokens unavailable in ephemeral kernel".into(),
                 data: None,
             })?;
@@ -126,7 +126,7 @@ impl Kernel {
                 .unwrap()
                 .validate(&token)
                 .ok_or_else(|| RpcError {
-                    code: -32030,
+                    code: AUTH_FAILED,
                     message: "invalid, expired, or revoked bearer token".into(),
                     data: None,
                 })?;
