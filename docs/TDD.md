@@ -231,7 +231,7 @@ Lexical scoping; modules are files (`use ./lib/deploy` binds `export`s under `de
 
 ## 5. Builtin surface (namespaces, v1)
 
-Core verbs: `ls cd pwd pushd popd dirs cp mv rm mkdir touch ln cat open save stat which env echo sleep kill ps du df tail head watch jump(j) pick interact explain run sh spawn parallel retry with sudo`. Namespaces: `str.* path.* list.* table.* stream.* math.* json/yaml/toml/csv.* http.*`, `os.*`, `journal`, `jobs`, `history`, `config`, `secret`, `re`. Value methods: `.where .sort .first .last .map .each .group .sum .len .uniq .join .lines .words .matches .replace .save .pick .tee .collect …`. Builtins obey the same signature/flag/coercion machinery as user `fn`s.
+Core verbs: `ls cd pwd pushd popd dirs cp mv rm mkdir touch ln cat open save stat which env echo sleep kill ps du df tail head watch jump(j) pick interact explain run sh spawn parallel retry with sudo`. Namespace globals — bare names in the root env, each exposing constants via field access and functions via method call: `json yaml toml csv math http os config` (e.g. `math.sqrt(x)`, `os.env()`, `json.parse(s)`, `http.get(url)`). `str`/`path`/`list`/`table`/`stream` are **not** namespace globals — those operations live as dot-methods on the values themselves (`"hi".upper()`, `p.join(x)`, `xs.sum()`), never as `str.upper(...)`/`path.join(...)`. The stateful subsystems `journal`, `jobs`, `history` are command heads (dispatched in `eval_command`), not namespaces. Value methods: `.where .sort .first .last .map .each .group .sum .len .uniq .join .lines .words .matches .replace .save .pick .tee .collect …`. Builtins obey the same signature/flag/coercion machinery as user `fn`s.
 
 ---
 

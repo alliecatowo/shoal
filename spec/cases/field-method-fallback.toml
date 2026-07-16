@@ -64,3 +64,49 @@ name = "where-predicate-uses-method-fallback"
 # `.is_empty` is a method; the `.where(.is_empty)` shorthand reaches it.
 src = '[[], [1], [], [2, 3]].where(.is_empty).len()'
 value = "2"
+
+# The zero-arg aggregates (`sum`/`min`/`max`) reject a stray argument LOUDLY.
+# A projection lambda used to be dropped silently — `[1,2,3].sum(x => x)`
+# returned `6` (right-looking, wrong reasoning) and `ls.sum(.size)` gave a
+# confusing `type_error`. The correct idiom is `.map(f).sum()`, which the error
+# names. The bare-`.field`→method fallback still passes no args, so the no-arg
+# forms below stay valid. See crates/shoal-value/src/methods/mod.rs.
+
+[[case]]
+name = "sum-rejects-projection-lambda"
+src = '[1, 2, 3].sum(x => x)'
+error = "arg_error"
+error_contains = "sum takes no arguments"
+
+[[case]]
+name = "min-rejects-projection-lambda"
+src = '[3, 1, 2].min(x => x)'
+error = "arg_error"
+error_contains = "min takes no arguments"
+
+[[case]]
+name = "max-rejects-projection-lambda"
+src = '[3, 1, 2].max(.value)'
+error = "arg_error"
+error_contains = "max takes no arguments"
+
+[[case]]
+name = "sum-parens-no-arg-still-works"
+src = '[1, 2, 3].sum()'
+value = "6"
+
+[[case]]
+name = "min-parens-no-arg-still-works"
+src = '[3, 1, 2].min()'
+value = "1"
+
+[[case]]
+name = "max-parens-no-arg-still-works"
+src = '[3, 1, 2].max()'
+value = "3"
+
+[[case]]
+name = "map-then-sum-is-the-projection-idiom"
+# The suggested replacement for `.sum(f)` — project with `.map`, then aggregate.
+src = '[{n: 1}, {n: 2}, {n: 3}].map(.n).sum()'
+value = "6"

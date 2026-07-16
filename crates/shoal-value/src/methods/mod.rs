@@ -126,9 +126,15 @@ fn dispatch(ctx: &mut dyn CallCtx, recv: Value, name: &str, args: CallArgs) -> V
         }
         "reverse" => list::reverse(recv),
         "uniq" => list::uniq(recv),
-        "sum" => list::sum(recv),
-        "min" => list::minmax(recv, false),
-        "max" => list::minmax(recv, true),
+        // The zero-arg aggregates reject stray args LOUDLY. A projection lambda
+        // (`[1,2,3].sum(x => x)`, `ls.sum(.size)`) was previously dropped
+        // silently — a right-looking call with a wrong (or, for records, a
+        // confusing `type_error`) answer. The correct idiom is `.map(f).sum()`,
+        // which the error names. The bare `.sum`/`.min`/`.max` field→method
+        // fallback passes no args, so it stays valid.
+        "sum" => agg_no_args(&args, "sum").and_then(|_| list::sum(recv)),
+        "min" => agg_no_args(&args, "min").and_then(|_| list::minmax(recv, false)),
+        "max" => agg_no_args(&args, "max").and_then(|_| list::minmax(recv, true)),
         "flatten" => list::flatten(recv),
         "enumerate" => list::enumerate(recv),
         "skip" => list::slice_count(recv, int_arg(&args, 0, 0)?, false),
@@ -233,6 +239,18 @@ pub(crate) fn no_args(args: &CallArgs) -> VResult<()> {
         Ok(())
     } else {
         Err(ErrorVal::arg_error("method takes no arguments"))
+    }
+}
+/// `no_args` for the zero-arg aggregates (`sum`/`min`/`max`), whose classic
+/// misuse is a projection lambda that a plain `arg(&args, 0)` would drop
+/// silently. Names the method and points at the `.map(f).<agg>()` idiom.
+pub(crate) fn agg_no_args(args: &CallArgs, name: &str) -> VResult<()> {
+    if args.pos.is_empty() && args.named.is_empty() {
+        Ok(())
+    } else {
+        Err(ErrorVal::arg_error(format!(
+            "{name} takes no arguments (did you mean .map(f).{name}()?)"
+        )))
     }
 }
 pub(crate) fn int_arg(args: &CallArgs, n: usize, default: i64) -> VResult<usize> {
@@ -610,6 +628,29 @@ mod tests {
             .unwrap(),
             Value::Str("ab".into())
         );
+    }
+
+    #[test]
+    fn zero_arg_aggregates_reject_stray_args() {
+        let x = || Value::List(vec![Value::Int(3), Value::Int(1), Value::Int(2)]);
+        // A stray arg (classically a projection lambda) is a loud arg_error that
+        // names the method and points at the `.map(f).<agg>()` idiom — not a
+        // silently-dropped argument.
+        for agg in ["sum", "min", "max"] {
+            let e = call(x(), agg, vec![Value::Str("f".into())]).unwrap_err();
+            assert_eq!(e.code, "arg_error", "{agg} must reject a stray arg");
+            assert!(
+                e.msg.contains(&format!("{agg} takes no arguments")),
+                "{agg} error should name the method: {}",
+                e.msg
+            );
+            assert!(e.msg.contains(".map(f)"), "{agg} error should suggest .map");
+        }
+        // The no-arg forms are unaffected (the bare `.sum` field->method
+        // fallback also lands here with empty args).
+        assert_eq!(call(x(), "sum", vec![]).unwrap(), Value::Int(6));
+        assert_eq!(call(x(), "min", vec![]).unwrap(), Value::Int(1));
+        assert_eq!(call(x(), "max", vec![]).unwrap(), Value::Int(3));
     }
 
     #[test]
