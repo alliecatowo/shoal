@@ -92,9 +92,21 @@ name = "reef-binding-table-lists-a-self-constrained-tool"
 # here is "whatever the host session happened to resolve" (the stale
 # reasoning this case used to carry, back when it was skipped) —
 # constraining `sh` makes the binding table fully self-contained.
+#
+# Filtered by name (`.where(.name == "sh").first()`) rather than a bare
+# `.first()`: `ScopeChain::discover` (REEF.md §1) walks from the fresh
+# tempdir all the way to the filesystem root collecting every
+# `.reef.toml`/`mise.toml`/`.mise.toml`/`.tool-versions` it finds along the
+# way, so on a host whose ancestor tree happens to constrain some OTHER
+# tool too (an ambient ~/mise.toml, a stray manifest left in a shared /tmp,
+# etc.), the binding table can legitimately grow extra rows that sort
+# ahead of "sh" alphabetically. Naming the row we actually asserted about
+# makes this deterministic regardless of what else is in scope, without
+# weakening what the case actually checks (that `sh`'s own row reports
+# scope "reef").
 src = '''
 save(".reef.toml", "[tools]\nsh = \"*\"\n")
-(reef).first().scope
+(reef).where(.name == "sh").first().scope
 '''
 value = '"reef"'
 

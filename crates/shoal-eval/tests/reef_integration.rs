@@ -42,6 +42,45 @@ fn parse(src: &str) -> shoal_ast::Program {
     shoal_syntax::parse(src).expect("fixture source parses")
 }
 
+/// The manifest filenames `ScopeChain::discover` (docs/REEF.md §1) looks for
+/// at every directory on its walk from `cwd` up to the filesystem root.
+const REEF_MANIFEST_NAMES: &[&str] = &[".reef.toml", "mise.toml", ".mise.toml", ".tool-versions"];
+
+/// Some tests assert the "genuinely nothing constrains anything anywhere"
+/// invariant (docs/AGENT-SURFACE.md §12.1) — but `ScopeChain::discover`
+/// walks from `dir` all the way to the real filesystem root, including the
+/// shared OS temp dir every `tempfile::tempdir()` nests under. That walk is
+/// only actually empty when no ancestor directory happens to contain a
+/// `.reef.toml`/`mise.toml`/`.mise.toml`/`.tool-versions` — true on a clean
+/// host, but not something a unit test can force from Rust alone (fully
+/// bounding the walk needs a root/boundary knob on `ScopeChain::discover`
+/// itself, a `shoal-reef` source change). Rather than let ambient
+/// contamination surface as a confusing generic `assertion failed`
+/// elsewhere in the test, fail loudly here with a precise pointer at the
+/// offending file, so it reads as "environmental contamination" (fix your
+/// host / clean the shared tempdir) rather than "reef regressed".
+fn panic_if_ancestor_reef_pollution(dir: &Path) {
+    let mut cur = Some(dir);
+    while let Some(d) = cur {
+        for name in REEF_MANIFEST_NAMES {
+            let candidate = d.join(name);
+            if candidate.exists() {
+                panic!(
+                    "ambient reef-manifest pollution detected above this test's own tempdir: \
+                     {candidate:?} exists and was NOT created by this test. \
+                     ScopeChain::discover (docs/REEF.md §1) walks from cwd to the filesystem \
+                     root, so this file makes the scope chain non-empty and breaks this test's \
+                     \"nothing constrains anything\" premise. This is environmental \
+                     contamination (e.g. a stray manifest left in a shared /tmp by an unrelated \
+                     manual `reef`/`mise` repro), not a product regression — remove the file \
+                     and re-run."
+                );
+            }
+        }
+        cur = d.parent();
+    }
+}
+
 /// Build a project dir with a `.reef.toml` and a `bin/` of fixtures.
 fn project(reef_toml: &str, fixtures: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
@@ -162,9 +201,20 @@ fn reef_builtin_lists_bindings() {
     let Some(Value::Table(rows)) = o.parsed.as_ref().cloned() else {
         panic!("reef should carry a table, got {:?}", o.parsed);
     };
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].get("name"), Some(&Value::Str("faketool".into())));
-    assert_eq!(rows[0].get("scope"), Some(&Value::Str("reef".into())));
+    // Find `faketool`'s own row rather than asserting `rows.len() == 1`:
+    // `ScopeChain::discover` (docs/REEF.md §1) walks from `dir` all the way
+    // to the filesystem root, so on a host whose ancestor tree happens to
+    // constrain some OTHER tool too (an ambient `~/mise.toml`, a stray
+    // manifest left in a shared `/tmp` by unrelated reef testing, ...) the
+    // binding table can legitimately grow extra rows. Naming the row this
+    // test actually cares about keeps the assertion deterministic without
+    // weakening what it checks: that this project's own `.reef.toml`
+    // constraint on `faketool` resolves with scope "reef".
+    let row = rows
+        .iter()
+        .find(|r| r.get("name") == Some(&Value::Str("faketool".into())))
+        .expect("faketool's own row is present");
+    assert_eq!(row.get("scope"), Some(&Value::Str("reef".into())));
 }
 
 #[test]
@@ -282,6 +332,7 @@ fn prompt_reef_snapshot_empty_with_no_manifest() {
     // No `.reef.toml`/`mise.toml`/etc anywhere above cwd ⇒ empty snapshot, no
     // panics, no filesystem surprises (docs/AGENT-SURFACE.md §12.1).
     let dir = tempfile::tempdir().unwrap();
+    panic_if_ancestor_reef_pollution(dir.path());
     let mut ev = Evaluator::new(dir.path().to_path_buf());
     let snap = ev.prompt_reef_snapshot();
     assert!(snap.active_scope.is_none());

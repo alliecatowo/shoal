@@ -686,12 +686,56 @@ mod tests {
         assert_eq!(shadowed.get("name"), Some(&Value::Str("sh".into())));
     }
 
+    /// The manifest filenames `ScopeChain::discover` (docs/REEF.md §1) looks
+    /// for at every directory on its walk from `cwd` up to the filesystem
+    /// root.
+    const REEF_MANIFEST_NAMES: &[&str] =
+        &[".reef.toml", "mise.toml", ".mise.toml", ".tool-versions"];
+
+    /// `reef_doctor_empty_scope_is_empty_table_not_error` asserts the
+    /// "genuinely nothing constrains anything anywhere" invariant — but
+    /// `ScopeChain::discover` walks from `dir` all the way to the real
+    /// filesystem root, including the shared OS temp dir every
+    /// `tempfile::tempdir()` nests under. That walk is only actually empty
+    /// when no ancestor directory happens to contain a
+    /// `.reef.toml`/`mise.toml`/`.mise.toml`/`.tool-versions` — true on a
+    /// clean host, but not something this test can force from Rust alone
+    /// (fully bounding the walk needs a root/boundary knob on
+    /// `ScopeChain::discover` itself, a `shoal-reef` source change). Rather
+    /// than let ambient contamination surface as a confusing generic
+    /// `assertion failed` a few lines down, fail loudly here with a precise
+    /// pointer at the offending file, so it reads as "environmental
+    /// contamination" (fix your host / clean the shared tempdir) rather
+    /// than "reef regressed".
+    fn panic_if_ancestor_reef_pollution(dir: &Path) {
+        let mut cur = Some(dir);
+        while let Some(d) = cur {
+            for name in REEF_MANIFEST_NAMES {
+                let candidate = d.join(name);
+                if candidate.exists() {
+                    panic!(
+                        "ambient reef-manifest pollution detected above this test's own \
+                         tempdir: {candidate:?} exists and was NOT created by this test. \
+                         ScopeChain::discover (docs/REEF.md §1) walks from cwd to the \
+                         filesystem root, so this file makes the scope chain non-empty and \
+                         breaks this test's \"nothing constrains anything\" premise. This is \
+                         environmental contamination (e.g. a stray manifest left in a shared \
+                         /tmp by an unrelated manual `reef`/`mise` repro), not a product \
+                         regression — remove the file and re-run."
+                    );
+                }
+            }
+            cur = d.parent();
+        }
+    }
+
     /// `reef doctor` with no manifest in scope is a clean, empty table — not
     /// an error (unlike `reef lock`, a health check has nothing to say about
     /// nothing).
     #[test]
     fn reef_doctor_empty_scope_is_empty_table_not_error() {
         let dir = tempfile::tempdir().unwrap();
+        panic_if_ancestor_reef_pollution(dir.path());
         let Value::Table(rows) = parsed(dir.path(), "reef doctor") else {
             panic!("expected a table")
         };
