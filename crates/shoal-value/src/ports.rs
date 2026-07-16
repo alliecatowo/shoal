@@ -202,3 +202,24 @@ pub trait SecretPort: Send + Sync {
     /// `permission` error).
     fn get(&self, name: &str) -> Result<Option<Vec<u8>>, String>;
 }
+
+// ---------------------------------------------------------------------------
+// BytesLoad — content-addressed bytes loader port (TDD §317)
+// ---------------------------------------------------------------------------
+
+/// Loads the full content behind a lazy, CAS-backed [`crate::Value::CasBytes`]
+/// (TDD §317 disk-spill). A value produced when a command's captured output
+/// overflowed the RAM cap holds one of these plus a bounded preview; methods
+/// that need the whole bytes (`.str()`, `.save`, indexing, …) call [`load`]
+/// on demand, while `.len` and `render` stay cheap and never load.
+///
+/// The trait lives here so `shoal-value` keeps no dependency on `shoal-journal`;
+/// the concrete adapter (over `shoal_journal::Cas`) lives in `shoal-eval`. It is
+/// `Send + Sync` so a ref-backed value is as freely shareable as any other.
+///
+/// [`load`]: BytesLoad::load
+pub trait BytesLoad: Send + Sync {
+    /// Materialize the full content. Errors are I/O or integrity failures
+    /// (a missing/corrupt CAS blob); the caller maps them to an `io_error`.
+    fn load(&self) -> std::io::Result<Vec<u8>>;
+}

@@ -37,7 +37,7 @@ mod stream;
 mod task;
 mod value_types;
 
-pub use ports::{Clock, Fs, Opener, SecretPort, StdClock, StdFs, StdOpener};
+pub use ports::{BytesLoad, Clock, Fs, Opener, SecretPort, StdClock, StdFs, StdOpener};
 
 pub use env::{AssignError, Binding, Env};
 pub use json::{json_to_value, value_to_json};
@@ -46,8 +46,8 @@ pub use outcome::OutcomeVal;
 pub use stream::{Pull, StreamVal, Upstream, collect_stream, drive_stream};
 pub use task::{TaskShared, TaskVal};
 pub use value_types::{
-    ClosureVal, GlobVal, RangeVal, RegexVal, SecretVal, TimeVal, parse_duration, parse_size,
-    parse_time,
+    CasBytesVal, ClosureVal, GlobVal, RangeVal, RegexVal, SecretVal, TimeVal, parse_duration,
+    parse_size, parse_time,
 };
 
 use indexmap::IndexMap;
@@ -84,6 +84,12 @@ pub enum Value {
     DateTime(Box<jiff::Zoned>),
     Time(TimeVal),
     Bytes(Arc<Vec<u8>>),
+    /// Lazy, content-addressed bytes (TDD §317): a value-position capture whose
+    /// stdout overflowed the RAM cap and spilled to the CAS. Holds a bounded
+    /// preview + `{hash, len}` and loads the full content on demand. Small
+    /// captures stay plain [`Value::Bytes`]; this variant only appears past the
+    /// cap, so the common path is untouched.
+    CasBytes(Arc<CasBytesVal>),
     List(Vec<Value>),
     Record(Record),
     /// Semantically a `list<record>`; rendered as a table.
@@ -115,6 +121,8 @@ impl Value {
             Value::DateTime(_) => "datetime",
             Value::Time(_) => "time",
             Value::Bytes(_) => "bytes",
+            // A CAS-backed value is still, semantically, bytes — just lazy.
+            Value::CasBytes(_) => "bytes",
             Value::List(_) => "list",
             Value::Record(_) => "record",
             Value::Table(_) => "table",
@@ -159,6 +167,8 @@ pub fn feed_bytes(v: &Value) -> Result<Vec<u8>, ErrorVal> {
         Value::Str(s) => Ok(s.clone().into_bytes()),
         // bytes → raw.
         Value::Bytes(b) => Ok(b.as_ref().clone()),
+        // CAS-backed bytes → load the full content from the store, then raw.
+        Value::CasBytes(c) => c.resolve(),
         // path → NOT directly feedable (IO.md §1.2): a bare path is a name,
         // not content. Feeding the name's bytes silently did the wrong thing.
         Value::Path(_) => Err(ErrorVal::type_error(
@@ -314,6 +324,11 @@ impl PartialEq for Value {
             (DateTime(a), DateTime(b)) => a.timestamp() == b.timestamp(),
             (Time(a), Time(b)) => a == b,
             (Bytes(a), Bytes(b)) => a == b,
+            // Content-addressed: identical hash (and length) ⇒ identical bytes,
+            // without loading either. A CAS-backed value and a resident one are
+            // not compared here (would need a load); materialize with `.load()`
+            // first if that comparison is wanted.
+            (CasBytes(a), CasBytes(b)) => a.hash == b.hash && a.len == b.len,
             (List(a), List(b)) => a == b,
             (Record(a), Record(b)) => a == b,
             (Table(a), Table(b)) => a == b,
@@ -450,6 +465,7 @@ mod tests {
                 signal: None,
                 ok: true,
                 stdout: Arc::new(stdout.to_vec()),
+                stdout_ref: None,
                 stderr: Arc::new(Vec::new()),
                 dur_ns: 0,
                 pid: 0,

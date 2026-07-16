@@ -46,6 +46,7 @@ fn spec(argv: &[&str], mode: ExecMode) -> ExecSpec {
         stdin: StdinSpec::Null,
         mode,
         sandbox: None,
+        spill: None,
     }
 }
 
@@ -328,6 +329,7 @@ fn empty_argv_is_invalid_input() {
         stdin: StdinSpec::Null,
         mode: ExecMode::Capture,
         sandbox: None,
+        spill: None,
     };
     let err = run(s, &CancelToken::new()).expect_err("must fail");
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);

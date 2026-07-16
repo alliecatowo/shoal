@@ -13,6 +13,7 @@ fn spec(script: &str, mode: ExecMode) -> ExecSpec {
         stdin: StdinSpec::Null,
         mode,
         sandbox: None,
+        spill: None,
     }
 }
 fn grants(path: std::path::PathBuf) -> FsSandbox {

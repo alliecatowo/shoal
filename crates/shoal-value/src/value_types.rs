@@ -4,6 +4,61 @@
 //! verbatim out of `lib.rs`.
 
 use super::*;
+use crate::ports::BytesLoad;
+
+/// A lazy, content-addressed bytes value (TDD §317 disk-spill). Produced when a
+/// value-position capture's stdout overflowed the RAM cap and was spilled to the
+/// CAS: the full bytes live on disk under [`hash`](CasBytesVal::hash), only a
+/// bounded [`preview`](CasBytesVal::preview) is resident, and the full content
+/// is loaded from the CAS on demand via [`loader`](CasBytesVal::loader).
+///
+/// `.len` and `render` answer from the metadata alone (never loading); methods
+/// that need the whole bytes materialize them through [`CasBytesVal::resolve`].
+/// A small (sub-cap) capture is a plain [`Value::Bytes`] and never becomes one
+/// of these — there is zero change to the common, fully-resident path.
+pub struct CasBytesVal {
+    /// blake3 hex of the full stored content — the recoverable `val:blake3:…`
+    /// ref (AGENT-SURFACE elision doctrine, in-language).
+    pub hash: String,
+    /// True total length of the content in bytes (what `.len` returns).
+    pub len: u64,
+    /// Bounded resident prefix, for cheap `render` previews and small ops.
+    pub preview: Arc<Vec<u8>>,
+    /// `true` when even the on-disk spill was itself capped (the stored bytes,
+    /// and thus this value, are a prefix of what the command actually produced).
+    pub truncated: bool,
+    /// Loads the full content from the CAS on demand (see [`BytesLoad`]).
+    pub loader: Arc<dyn BytesLoad>,
+}
+
+impl CasBytesVal {
+    /// Load the full content from the CAS, mapping any I/O/integrity failure to
+    /// an `io_error` [`ErrorVal`].
+    pub fn resolve(&self) -> VResult<Vec<u8>> {
+        self.loader.load().map_err(|e| {
+            ErrorVal::new(
+                "io_error",
+                format!("failed to load CAS-backed bytes {}: {e}", self.reference()),
+            )
+        })
+    }
+
+    /// The recoverable content ref, e.g. `val:blake3:<hash>`.
+    pub fn reference(&self) -> String {
+        format!("val:blake3:{}", self.hash)
+    }
+}
+
+impl std::fmt::Debug for CasBytesVal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CasBytesVal")
+            .field("hash", &self.hash)
+            .field("len", &self.len)
+            .field("preview_len", &self.preview.len())
+            .field("truncated", &self.truncated)
+            .finish()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct GlobVal {

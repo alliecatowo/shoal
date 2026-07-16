@@ -369,6 +369,10 @@ pub(crate) fn run_pty(mut spec: ExecSpec, cancel: &CancelToken) -> io::Result<Ex
         stdout,
         stderr: Vec::new(),
         truncated,
+        // PtyTee (statement position) does not spill: its output already
+        // reached the real terminal, and the tee buffer is a bounded
+        // convenience. Value-position §317 spill is a Capture-mode concern.
+        stdout_spill: None,
         dur: start.elapsed(),
         pid: pid as u32,
         enforcement,

@@ -149,6 +149,63 @@ fn cas_roundtrip_and_dedup() {
 }
 
 #[test]
+fn ingest_spill_adopts_file_and_cas_reader_roundtrips() {
+    let dir = tempfile::tempdir().unwrap();
+    let j = Journal::open(dir.path()).unwrap();
+
+    // Write a "spill file" as shoal-exec would, in the journal's spill dir.
+    let spill_dir = j.spill_dir().unwrap();
+    let payload = b"spilled capture bytes\n".repeat(4096);
+    let hash = blake3::hash(&payload).to_hex().to_string();
+    let src = spill_dir.join("capture-spill-xyz");
+    fs::write(&src, &payload).unwrap();
+
+    j.ingest_spill(&src, &hash, payload.len() as u64, true)
+        .unwrap();
+
+    // Source file consumed; blob present under its real blake3, pinned.
+    assert!(!src.exists(), "the spill source is removed after adoption");
+    let blob = dir
+        .path()
+        .join("cas")
+        .join(&hash[0..2])
+        .join(&hash[2..4])
+        .join(format!("{hash}.zst"));
+    assert!(blob.is_file(), "the adopted blob exists in the CAS");
+    assert!(
+        fs::read(&blob).unwrap().len() < payload.len(),
+        "stored compressed"
+    );
+    assert_eq!(
+        j.pins().unwrap(),
+        vec![hash.clone()],
+        "spill blob is pinned"
+    );
+
+    // The DB-independent Cas reader materializes the exact full bytes.
+    let cas = j.cas();
+    assert_eq!(cas.read(&hash).unwrap(), payload);
+    // ...as does read_blob, and its stored_len is the true (uncompressed) len.
+    assert_eq!(j.read_blob(&hash).unwrap().unwrap(), payload);
+    let rows = j.query(&JournalQuery::default()).unwrap();
+    let _ = rows; // no entry linkage for a spill blob; it lives by its pin.
+
+    // Idempotent: re-adopting identical bytes is a no-op that still succeeds.
+    let src2 = spill_dir.join("capture-spill-again");
+    fs::write(&src2, &payload).unwrap();
+    j.ingest_spill(&src2, &hash, payload.len() as u64, false)
+        .unwrap();
+    assert_eq!(count_files(&dir.path().join("cas")), 1, "dedup: one blob");
+
+    // A missing blob is a NotFound error, not wrong bytes.
+    let absent = blake3::hash(b"nope").to_hex().to_string();
+    assert_eq!(
+        cas.read(&absent).unwrap_err().kind(),
+        std::io::ErrorKind::NotFound
+    );
+}
+
+#[test]
 fn distinct_bytes_get_distinct_files() {
     let dir = tempfile::tempdir().unwrap();
     let j = Journal::open(dir.path()).unwrap();

@@ -147,6 +147,9 @@ pub fn render_inline(v: &Value) -> String {
         Value::DateTime(z) => z.timestamp().to_string(),
         Value::Time(t) => render_time(t),
         Value::Bytes(b) => format!("bytes({})", render_size(b.len() as u64)),
+        // Lazy CAS-backed bytes (TDD §317): show the true total size and the
+        // recoverable content ref, never loading the bytes.
+        Value::CasBytes(c) => format!("bytes({}) {}", render_size(c.len), c.reference()),
         Value::List(xs) => {
             let items: Vec<String> = xs.iter().map(render_inline).collect();
             format!("[{}]", items.join(", "))
@@ -393,6 +396,33 @@ pub fn render_block(v: &Value, width: usize) -> String {
             }
         }
         Value::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
+        // Lazy CAS-backed bytes (TDD §317): a bounded preview followed by a
+        // marker line carrying the true total length and the `val:blake3:…`
+        // ref (the in-language mirror of the wire elision doctrine). The full
+        // content is never loaded just to render.
+        Value::CasBytes(c) => {
+            let preview = String::from_utf8_lossy(&c.preview);
+            if (c.preview.len() as u64) >= c.len {
+                preview.into_owned()
+            } else {
+                let note = if c.truncated {
+                    format!(
+                        "\x1b[2m[shoal: showing first {} of ≥{} — {} (truncated at spill cap)]\x1b[0m",
+                        render_size(c.preview.len() as u64),
+                        render_size(c.len),
+                        c.reference()
+                    )
+                } else {
+                    format!(
+                        "\x1b[2m[shoal: showing first {} of {} — {}]\x1b[0m",
+                        render_size(c.preview.len() as u64),
+                        render_size(c.len),
+                        c.reference()
+                    )
+                };
+                format!("{preview}\n{note}")
+            }
+        }
         Value::Error(e) => {
             let mut s = format!(
                 "\x1b[31;1merror({}):\x1b[0m \x1b[1m{}\x1b[0m",

@@ -10,7 +10,17 @@ pub struct OutcomeVal {
     /// Signal name (`"SIGSEGV"`) when the child died to a signal (TDD §13.6).
     pub signal: Option<String>,
     pub ok: bool,
+    /// Captured stdout. When [`stdout_ref`](OutcomeVal::stdout_ref) is `Some`
+    /// (a value-position capture that overflowed the RAM cap and spilled to the
+    /// CAS, TDD §317), this holds only the bounded resident *preview*; the full
+    /// bytes live in the CAS behind the ref. Otherwise it is the whole stdout.
     pub stdout: Arc<Vec<u8>>,
+    /// `Some` when stdout overflowed the capture RAM cap and was spilled to the
+    /// CAS (TDD §317): a lazy, ref-backed view of the *full* stdout. `.stdout`
+    /// then surfaces this (see [`OutcomeVal::stdout_value`]) so `.len` is the
+    /// true length and materialization loads from the CAS on demand. `None` is
+    /// the ordinary fully-resident case — no behavior change.
+    pub stdout_ref: Option<Arc<CasBytesVal>>,
     pub stderr: Arc<Vec<u8>>,
     pub dur_ns: i64,
     pub pid: u32,
@@ -37,6 +47,28 @@ impl OutcomeVal {
     pub fn with_span(mut self, span: Span) -> OutcomeVal {
         self.span = Some(span);
         self
+    }
+
+    /// The `.stdout` value: a lazy [`Value::CasBytes`] when stdout spilled to
+    /// the CAS (TDD §317), else the resident [`Value::Bytes`]. Callers that
+    /// surface `.stdout` use this so the ref-backed view is what users see for
+    /// oversized captures (true `.len`, on-demand materialization), with zero
+    /// change for the ordinary resident case.
+    pub fn stdout_value(&self) -> Value {
+        match &self.stdout_ref {
+            Some(c) => Value::CasBytes(c.clone()),
+            None => Value::Bytes(self.stdout.clone()),
+        }
+    }
+
+    /// The **full** stdout bytes: loaded from the CAS when stdout spilled (TDD
+    /// §317), else the resident bytes. Data sinks (redirects, `.save`) use this
+    /// so an oversized capture is written whole, not just its preview.
+    pub fn stdout_bytes(&self) -> VResult<Vec<u8>> {
+        match &self.stdout_ref {
+            Some(c) => c.resolve(),
+            None => Ok(self.stdout.as_ref().clone()),
+        }
     }
 
     /// `outcome.out` — utf-8 text with the trailing newline trimmed; if the
@@ -67,6 +99,7 @@ mod tests {
             signal: None,
             ok: true,
             stdout: Arc::new(Vec::new()),
+            stdout_ref: None,
             stderr: Arc::new(Vec::new()),
             dur_ns: 0,
             pid: 0,

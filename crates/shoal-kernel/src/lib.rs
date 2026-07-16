@@ -2566,6 +2566,7 @@ mod tests {
             signal: None,
             ok,
             stdout: Arc::new(stdout.to_vec()),
+            stdout_ref: None,
             stderr: Arc::new(Vec::new()),
             dur_ns: 1_000,
             pid: 42,

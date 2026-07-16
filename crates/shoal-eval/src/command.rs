@@ -319,13 +319,15 @@ impl Evaluator {
                 // `some-cmd > f` and `sh { … } > f` are reversible too.
                 RedirectKind::Out => {
                     let undo_pre = self.redirect_undo_pre(&target);
-                    fs.write(&target, &out.stdout)
+                    // §317: write the FULL stdout (load from CAS when it
+                    // spilled), never just the resident preview.
+                    fs.write(&target, &out.stdout_bytes()?)
                         .map_err(|e| ErrorVal::new("custom", e.to_string()))?;
                     self.overwrite_undo_post(undo_pre);
                 }
                 RedirectKind::Append => {
                     let undo_pre = self.redirect_undo_pre(&target);
-                    fs.append(&target, &out.stdout)
+                    fs.append(&target, &out.stdout_bytes()?)
                         .map_err(|e| ErrorVal::new("custom", e.to_string()))?;
                     self.overwrite_undo_post(undo_pre);
                 }
@@ -666,10 +668,23 @@ impl Evaluator {
         if let Some(argv0) = argv.first() {
             self.spawn_gate(argv0, reef_hash.as_deref(), span)?;
         }
+        // TDD §317 disk-spill: for value-position captures only (never PTY,
+        // whose output already reached the terminal), and only when a journal
+        // is installed to adopt the overflow into its CAS. `None` otherwise
+        // preserves the exact pre-spill behavior (bounded RAM buffer, overflow
+        // dropped) — so `-c`/scripts/conformance are wholly untouched.
+        let spill = if mode == ExecMode::Capture {
+            self.journal
+                .as_ref()
+                .and_then(|j| j.spill_dir().ok())
+                .map(|dir| shoal_exec::SpillConfig { dir })
+        } else {
+            None
+        };
         // Spawn through the Exec port (docs/ROADMAP.md R4). The default
         // `StdExec` is `shoal_exec::run` verbatim, so this is byte-identical.
         let exec = self.exec.clone();
-        let r = exec
+        let mut r = exec
             .run(
                 ExecSpec {
                     argv,
@@ -678,6 +693,7 @@ impl Evaluator {
                     stdin,
                     mode,
                     sandbox,
+                    spill,
                 },
                 &self.cancel,
             )
@@ -697,11 +713,23 @@ impl Evaluator {
         let parsed = meta.as_ref().and_then(|m| {
             shoal_adapters::parse_output(&m.parse, &r.stdout, m.output_type.as_deref())
         });
+        // Take the resident stdout once (it is the bounded preview when a spill
+        // occurred, the whole thing otherwise) and share the one allocation
+        // between the outcome's `.stdout` and any §317 ref-backed view.
+        let stdout = Arc::new(std::mem::take(&mut r.stdout));
+        // TDD §317: if stdout overflowed the RAM cap and spilled to disk, adopt
+        // the spill into the CAS and back `.stdout` with a lazy ref (true
+        // length + on-demand load). `None` on every ordinary capture.
+        let stdout_ref = r
+            .stdout_spill
+            .take()
+            .and_then(|spill| self.adopt_capture_spill(&spill, stdout.clone()));
         let out = Value::Outcome(Arc::new(OutcomeVal {
             status: r.status,
             signal: r.signal,
             ok,
-            stdout: Arc::new(r.stdout),
+            stdout,
+            stdout_ref,
             stderr: Arc::new(r.stderr),
             dur_ns: r.dur.as_nanos().min(i64::MAX as u128) as i64,
             pid: r.pid,
@@ -729,6 +757,41 @@ impl Evaluator {
         } else {
             Ok(out)
         }
+    }
+
+    /// Adopt a value-position capture's disk spill (TDD §317) into the journal
+    /// CAS and hand back a lazy, ref-backed view of the full stdout. `preview`
+    /// is the bounded resident prefix (shared with the outcome's `.stdout`).
+    ///
+    /// Returns `None` — degrading to the resident preview — only if there is no
+    /// journal (so the spill can never have been produced in the first place)
+    /// or adoption fails on I/O; the orphaned spill file is cleaned up in that
+    /// case. On success the blob is durable under its real blake3 and pinned so
+    /// GC keeps it while the value is live.
+    fn adopt_capture_spill(
+        &self,
+        spill: &shoal_exec::CaptureSpill,
+        preview: Arc<Vec<u8>>,
+    ) -> Option<Arc<shoal_value::CasBytesVal>> {
+        let journal = self.journal.as_ref()?;
+        if journal
+            .ingest_spill(&spill.path, &spill.hash, spill.len, true)
+            .is_err()
+        {
+            let _ = std::fs::remove_file(&spill.path);
+            return None;
+        }
+        let loader = CasBytesLoader {
+            cas: journal.cas(),
+            hash: spill.hash.clone(),
+        };
+        Some(Arc::new(shoal_value::CasBytesVal {
+            hash: spill.hash.clone(),
+            len: spill.len,
+            preview,
+            truncated: spill.truncated,
+            loader: Arc::new(loader),
+        }))
     }
 
     /// The leash spawn gate (TDD §8 content-hash pinning). Consulted from
@@ -861,5 +924,20 @@ impl Evaluator {
             }
         }
         Ok(vs)
+    }
+}
+
+/// Loads a §317 spilled capture's full bytes from the journal CAS on demand.
+/// Holds a DB-independent [`shoal_journal::Cas`] (just a path), so a ref-backed
+/// [`shoal_value::CasBytesVal`] stays `Send + Sync` and outlives the borrow of
+/// the evaluator that produced it.
+struct CasBytesLoader {
+    cas: shoal_journal::Cas,
+    hash: String,
+}
+
+impl shoal_value::BytesLoad for CasBytesLoader {
+    fn load(&self) -> std::io::Result<Vec<u8>> {
+        self.cas.read(&self.hash)
     }
 }

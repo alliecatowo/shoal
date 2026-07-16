@@ -48,7 +48,7 @@ mod schema;
 mod tests;
 mod undo;
 
-pub use cas::{JournalOptions, OutputMeta, OutputRow};
+pub use cas::{Cas, JournalOptions, OutputMeta, OutputRow};
 pub use gc::{GcBlob, GcOptions, GcReport};
 pub use query::{EntryRow, JournalQuery};
 pub use schema::EntryRecord;

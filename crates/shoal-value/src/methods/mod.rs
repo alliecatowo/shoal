@@ -54,6 +54,25 @@ fn dispatch(ctx: &mut dyn CallCtx, recv: Value, name: &str, args: CallArgs) -> V
         ctx.call_closure(f, vec![recv.clone()])?;
         return Ok(recv);
     }
+    // Lazy CAS-backed bytes (TDD §317). The cheap, no-load answers come from the
+    // metadata; `.load`/`.bytes` materialize to a resident `bytes`; `.ref`
+    // yields the recoverable `val:blake3:…` handle; anything else materializes
+    // the full content once and re-dispatches through the normal `bytes` path,
+    // so no per-method arm has to know about CAS backing.
+    if let Value::CasBytes(c) = &recv {
+        match name {
+            "len" | "count" => return Ok(Value::Int(c.len as i64)),
+            "is_empty" => return Ok(Value::Bool(c.len == 0)),
+            "load" | "bytes" => {
+                return c.resolve().map(|b| Value::Bytes(std::sync::Arc::new(b)));
+            }
+            "ref" => return Ok(Value::Str(c.reference())),
+            _ => {
+                let full = c.resolve()?;
+                return dispatch(ctx, Value::Bytes(std::sync::Arc::new(full)), name, args);
+            }
+        }
+    }
     // Outcome unification (P1b): an unknown method on a command outcome forwards
     // to its structured `.out`, so `ls.where(.size > 1b).sort(.name)` works
     // (`ls` is an outcome; `.where`/`.sort` operate on its `.out` table). Raw
@@ -438,6 +457,7 @@ mod tests {
             signal: None,
             ok: true,
             stdout: Arc::new(Vec::new()),
+            stdout_ref: None,
             stderr: Arc::new(Vec::new()),
             dur_ns: 0,
             pid: 0,

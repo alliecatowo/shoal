@@ -1015,4 +1015,92 @@ mod tests {
         assert_eq!(err.code, "custom");
         assert!(err.msg.contains("journaled session"), "{}", err.msg);
     }
+
+    /// TDD §317 disk-spill: a value-position capture whose stdout exceeds the
+    /// RAM cap is preserved to the CAS as a ref-backed value — `.len` is the
+    /// true (full) length, the blob exists and its blake3 matches, render shows
+    /// a bounded preview + the `val:blake3:…` ref (not the whole thing), and
+    /// materialization loads the correct full bytes. Nothing is lost.
+    #[test]
+    fn value_capture_over_cap_spills_to_cas_ref_backed() {
+        let dir = tempfile::tempdir().unwrap();
+        let prev_cap = shoal_exec::capture_hard_cap();
+        shoal_exec::set_capture_hard_cap(4096);
+        let mut ev = journaled(dir.path());
+
+        // A deterministic 200_000-byte capture (200_000 NUL bytes) past the cap.
+        let v =
+            run_journaled(&mut ev, "let x = sh { head -c 200000 /dev/zero }\nx.stdout").unwrap();
+
+        // The value is ref-backed, carrying the true length + a bounded preview.
+        let Value::CasBytes(c) = &v else {
+            shoal_exec::set_capture_hard_cap(prev_cap);
+            panic!("expected a ref-backed CasBytes, got {}", v.type_name());
+        };
+        assert_eq!(c.len, 200_000, ".len is the true length, not the preview");
+        assert!(
+            c.preview.len() <= 4096,
+            "preview stays bounded by the RAM cap"
+        );
+        assert!(!c.truncated, "the full stream fit under the spill cap");
+        let hash = c.hash.clone();
+
+        // `.len` answers the TRUE length through method dispatch, without loading.
+        assert_eq!(
+            run_journaled(&mut ev, "x.stdout.len").unwrap(),
+            Value::Int(200_000)
+        );
+
+        // Render is a bounded preview + the recoverable ref — not the full 200KB.
+        let inline = shoal_value::render::render_inline(&v);
+        assert!(
+            inline.contains("val:blake3:") && inline.contains(&hash),
+            "inline render carries the ref: {inline}"
+        );
+        let block = shoal_value::render::render_block(&v, 80);
+        assert!(block.contains(&hash), "block render carries the ref");
+        assert!(
+            block.len() < 100_000,
+            "render shows a preview, not the whole content ({} bytes)",
+            block.len()
+        );
+
+        // The CAS blob exists and its blake3 matches (Cas::read re-hashes and
+        // verifies the content against `hash` before returning it).
+        let expected = vec![0u8; 200_000];
+        let cas = ev.journal.as_ref().unwrap().cas();
+        assert_eq!(
+            cas.read(&hash).unwrap(),
+            expected,
+            "the CAS blob is the full, verbatim capture"
+        );
+
+        // Materialization loads the correct full bytes from the CAS.
+        let loaded = run_journaled(&mut ev, "x.stdout.load()").unwrap();
+        assert_eq!(loaded, Value::Bytes(std::sync::Arc::new(expected)));
+
+        shoal_exec::set_capture_hard_cap(prev_cap);
+    }
+
+    /// Zero-regression: a sub-cap value-position capture stays fully resident —
+    /// a plain `bytes`, no spill, no CAS blob — exactly as before §317 spill.
+    #[test]
+    fn value_capture_under_cap_stays_resident() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ev = journaled(dir.path());
+        let v = run_journaled(&mut ev, "let y = sh { head -c 100 /dev/zero }\ny.stdout").unwrap();
+        assert!(
+            matches!(v, Value::Bytes(_)),
+            "sub-cap output is fully resident, got {}",
+            v.type_name()
+        );
+        assert_eq!(
+            run_journaled(&mut ev, "y.stdout.len").unwrap(),
+            Value::Int(100)
+        );
+        assert!(
+            ev.journal.as_ref().unwrap().pins().unwrap().is_empty(),
+            "no spill blob is pinned for a sub-cap capture"
+        );
+    }
 }
