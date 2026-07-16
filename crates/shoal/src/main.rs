@@ -48,6 +48,15 @@ fn main() {
 /// involved. `false` (color enabled) until [`apply_render_color_config`] runs.
 static CONFIG_COLOR_DISABLED: AtomicBool = AtomicBool::new(false);
 
+/// Shared test-only lock serializing EVERY test in this bin that mutates or
+/// reads process-global env (`NO_COLOR`/`XDG_CONFIG_HOME`/`HOME`). All such
+/// tests — across `main`, `highlight`, and any other module — must hold this
+/// single lock, so a setter in one module can't interleave with a
+/// save-modify-restore in another and leak env state into a later assertion
+/// (which flaked the highlighter color tests under parallel `--workspace` runs).
+#[cfg(test)]
+pub(crate) static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Feed the loaded config's color decision into `no_color()`. Call once,
 /// right after loading config, before any colorized output — both `run_source`
 /// and `repl()` do this immediately after `shoal_config::load`.
@@ -425,8 +434,7 @@ mod tests {
     /// in this binary (shared with the `reef_user_manifest_path` env test).
     #[test]
     fn config_color_disabled_suppresses_ansi_like_no_color() {
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::ENV_TEST_LOCK.lock().unwrap();
         let prev = std::env::var_os("NO_COLOR");
         unsafe { std::env::remove_var("NO_COLOR") };
 
@@ -527,8 +535,7 @@ mod tests {
     /// env vars that other tests in this binary could read concurrently.
     #[test]
     fn reef_user_manifest_path_prefers_xdg_then_home() {
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::ENV_TEST_LOCK.lock().unwrap();
         let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
         let prev_home = std::env::var_os("HOME");
 

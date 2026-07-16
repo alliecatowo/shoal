@@ -418,15 +418,13 @@ fn highlight_cmd_tail(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
-    // `NO_COLOR` is process-global state; serialize every test in this
-    // module against the one test that mutates it so cargo's parallel test
-    // threads can't observe it transiently set (or unset) mid-assertion.
-    static ENV_GUARD: Mutex<()> = Mutex::new(());
+    // `NO_COLOR`/env is process-global; every env-touching test across this
+    // bin shares `crate::ENV_TEST_LOCK` (defined in main.rs) so a setter in one
+    // module can't leak env state into another module's color assertion.
 
     fn styles_for(line: &str) -> Vec<(Style, String)> {
-        let _guard = ENV_GUARD.lock().unwrap();
+        let _guard = crate::ENV_TEST_LOCK.lock().unwrap();
         ShoalHighlighter::default()
             .highlight(line, line.len())
             .buffer
@@ -435,7 +433,7 @@ mod tests {
     /// Highlight with a session env carrying one value binding (`someVar`)
     /// and one callable binding (`deploy`).
     fn styles_with_bindings(line: &str) -> Vec<(Style, String)> {
-        let _guard = ENV_GUARD.lock().unwrap();
+        let _guard = crate::ENV_TEST_LOCK.lock().unwrap();
         let env = Env::root();
         env.declare("someVar", Value::Int(42), false);
         env.declare(
@@ -630,7 +628,7 @@ mod tests {
 
     #[test]
     fn no_color_env_forces_every_span_to_default_style() {
-        let _guard = ENV_GUARD.lock().unwrap();
+        let _guard = crate::ENV_TEST_LOCK.lock().unwrap();
         // SAFETY: `ENV_GUARD` above serializes this against every other test
         // in the module that reads styled output, so no other thread can
         // observe `NO_COLOR` transiently set.
