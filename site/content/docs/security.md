@@ -127,6 +127,13 @@ The store is written atomically through a `0600` temporary file and rename. Crea
 exclusive interprocess lock across fresh load, mutation, and replace; validation uses a shared lock
 and a fresh snapshot, so concurrent writers cannot lose updates.
 
+The whole authority snapshot is fail-closed and bounded: 4 MiB total, 4,096 records, 256-byte
+principals, 128-byte profiles, and 128 capability labels of 128 bytes each per token. Unknown JSON
+fields, duplicates, noncanonical key/ID/digest encodings, or an exceeded limit invalidate the whole
+snapshot. Shoal does not repair, truncate, or evict authority records automatically; it leaves the
+file intact for operator diagnosis. Creation rejects invalid/capacity-exceeding input before
+publishing any in-memory or on-disk change.
+
 ### Profile and `--cap` are metadata today
 
 The kernel copies token `profile` and `caps` into the `session.attach` result, but authorization does not derive grants from them. Leash evaluates the token's **principal string** against `[principal."..."]` in the policy file.
@@ -147,6 +154,10 @@ the already-authenticated token's immutable identity fields against another fres
 created token is accepted without restart; revocation or expiry invalidates an existing attachment on
 its next request. Store corruption, replacement, or I/O/lock failure also fails closed instead of
 falling back to startup authority. Reattach remains available after the kernel clears the attachment.
+
+`session.attach` bounds the caller-controlled Session name, client kind, and exact canonical
+43-byte bearer representation before authority-store work. Unknown attach/client fields are
+rejected. Authentication errors use fixed messages and never quote bearer contents.
 
 ### Store-path alignment
 

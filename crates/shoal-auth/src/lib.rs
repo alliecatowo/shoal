@@ -2,15 +2,29 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fs;
-use std::io;
-use std::io::Write;
+use std::io::{self, Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
 
+/// Hard admission limits for the authority snapshot and every identity-bearing
+/// field. Authority records are never evicted to satisfy these limits: an
+/// oversized snapshot is an integrity failure and authenticates nobody.
+pub const MAX_TOKEN_STORE_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_TOKENS: usize = 4_096;
+pub const MAX_PRINCIPAL_BYTES: usize = 256;
+pub const MAX_PROFILE_BYTES: usize = 128;
+pub const MAX_CAPABILITIES_PER_TOKEN: usize = 128;
+pub const MAX_CAPABILITY_BYTES: usize = 128;
+pub const BEARER_BYTES: usize = 32;
+pub const BEARER_ENCODED_BYTES: usize = 43;
+const TOKEN_ID_HEX_BYTES: usize = 16;
+const TOKEN_DIGEST_HEX_BYTES: usize = 64;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TokenMeta {
     pub id: String,
     pub principal: String,
@@ -21,6 +35,7 @@ pub struct TokenMeta {
     pub revoked_ns: Option<i64>,
 }
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Stored {
     version: u32,
     key: String,
@@ -32,11 +47,56 @@ impl Drop for Stored {
         self.key.zeroize();
     }
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StoredToken {
-    #[serde(flatten)]
-    meta: TokenMeta,
+    id: String,
+    principal: String,
+    profile: String,
+    caps: Vec<String>,
+    created_ns: i64,
+    expires_ns: Option<i64>,
+    revoked_ns: Option<i64>,
     digest: String,
+}
+
+impl StoredToken {
+    fn from_meta(meta: TokenMeta, digest: String) -> Self {
+        Self {
+            id: meta.id,
+            principal: meta.principal,
+            profile: meta.profile,
+            caps: meta.caps,
+            created_ns: meta.created_ns,
+            expires_ns: meta.expires_ns,
+            revoked_ns: meta.revoked_ns,
+            digest,
+        }
+    }
+
+    fn meta(&self) -> TokenMeta {
+        TokenMeta {
+            id: self.id.clone(),
+            principal: self.principal.clone(),
+            profile: self.profile.clone(),
+            caps: self.caps.clone(),
+            created_ns: self.created_ns,
+            expires_ns: self.expires_ns,
+            revoked_ns: self.revoked_ns,
+        }
+    }
+
+    fn into_meta(self) -> TokenMeta {
+        TokenMeta {
+            id: self.id,
+            principal: self.principal,
+            profile: self.profile,
+            caps: self.caps,
+            created_ns: self.created_ns,
+            expires_ns: self.expires_ns,
+            revoked_ns: self.revoked_ns,
+        }
+    }
 }
 pub struct TokenStore {
     path: PathBuf,
@@ -73,7 +133,7 @@ impl TokenStore {
                     key,
                     tokens: vec![],
                 };
-                store.persist_unlocked()?;
+                store.persist_tokens_unlocked(&store.tokens, io::ErrorKind::InvalidData)?;
                 Ok(store)
             }
         })
@@ -87,12 +147,18 @@ impl TokenStore {
         &mut self,
         principal: String,
         profile: String,
-        caps: Vec<String>,
+        mut caps: Vec<String>,
         ttl_ns: Option<i64>,
     ) -> io::Result<(String, TokenMeta)> {
+        validate_text_input("principal", &principal, MAX_PRINCIPAL_BYTES)?;
+        validate_text_input("profile", &profile, MAX_PROFILE_BYTES)?;
+        validate_capabilities_input(&mut caps)?;
         let path = self.path.clone();
         with_exclusive_lock(&path, || {
             self.reload_unlocked()?;
+            if self.tokens.len() >= MAX_TOKENS {
+                return Err(invalid_input("token store capacity reached"));
+            }
             let mut secret = Zeroizing::new([0; 32]);
             getrandom::fill(&mut *secret).map_err(|e| io::Error::other(e.to_string()))?;
             // The returned bearer is necessarily an ordinary String for API
@@ -109,11 +175,13 @@ impl TokenStore {
                 expires_ns: ttl_ns.map(|t| now.saturating_add(t)),
                 revoked_ns: None,
             };
-            self.tokens.push(StoredToken {
-                meta: meta.clone(),
-                digest: hex(&digest),
-            });
-            self.persist_unlocked()?;
+            let token = StoredToken::from_meta(meta.clone(), hex(&digest));
+            let mut candidate = self.tokens.clone();
+            candidate.push(token);
+            validate_tokens(&mut candidate)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+            self.persist_tokens_unlocked(&candidate, io::ErrorKind::InvalidInput)?;
+            self.tokens = candidate;
             Ok((bearer, meta))
         })
     }
@@ -122,6 +190,9 @@ impl TokenStore {
     /// integrity failures to callers that need to distinguish them from an
     /// invalid bearer. No cached authority is consulted on failure.
     pub fn validate_checked(&self, bearer: &str) -> io::Result<Option<TokenMeta>> {
+        if !bearer_is_canonical(bearer) {
+            return Err(invalid_input("invalid bearer encoding"));
+        }
         let (key, tokens) = with_shared_lock(&self.path, || load_unlocked(&self.path))?;
         let digest = digest_with(&key, bearer.as_bytes());
         let now = now_ns();
@@ -132,8 +203,8 @@ impl TokenStore {
                 // snapshot, so conversion cannot fail here.
                 unhex(&t.digest).is_ok_and(|stored| bool::from(stored.as_slice().ct_eq(&digest)))
             })
-            .filter(|t| t.meta.revoked_ns.is_none() && t.meta.expires_ns.is_none_or(|e| e > now))
-            .map(|t| t.meta.clone()))
+            .filter(|t| t.revoked_ns.is_none() && t.expires_ns.is_none_or(|e| e > now))
+            .map(StoredToken::meta))
     }
 
     /// Compatibility authentication API. Storage, locking, and integrity
@@ -153,23 +224,23 @@ impl TokenStore {
         &self,
         attached: &TokenMeta,
     ) -> io::Result<Option<TokenMeta>> {
+        validate_meta_input(attached)?;
         let (_, tokens) = with_shared_lock(&self.path, || load_unlocked(&self.path))?;
         let now = now_ns();
         Ok(tokens
             .into_iter()
             .find(|token| {
-                token.meta.id == attached.id
-                    && token.meta.created_ns == attached.created_ns
-                    && token.meta.principal == attached.principal
-                    && token.meta.profile == attached.profile
-                    && token.meta.caps == attached.caps
-                    && token.meta.expires_ns == attached.expires_ns
+                token.id == attached.id
+                    && token.created_ns == attached.created_ns
+                    && token.principal == attached.principal
+                    && token.profile == attached.profile
+                    && token.caps == attached.caps
+                    && token.expires_ns == attached.expires_ns
             })
             .filter(|token| {
-                token.meta.revoked_ns.is_none()
-                    && token.meta.expires_ns.is_none_or(|expires| expires > now)
+                token.revoked_ns.is_none() && token.expires_ns.is_none_or(|expires| expires > now)
             })
-            .map(|token| token.meta))
+            .map(StoredToken::into_meta))
     }
 
     /// Fail-closed compatibility wrapper around
@@ -182,7 +253,7 @@ impl TokenStore {
     pub fn try_list(&self) -> io::Result<Vec<TokenMeta>> {
         with_shared_lock(&self.path, || {
             let (_, tokens) = load_unlocked(&self.path)?;
-            Ok(tokens.into_iter().map(|t| t.meta).collect())
+            Ok(tokens.into_iter().map(StoredToken::into_meta).collect())
         })
     }
 
@@ -194,14 +265,19 @@ impl TokenStore {
     }
 
     pub fn revoke(&mut self, id: &str) -> io::Result<bool> {
+        if !is_canonical_hex(id, TOKEN_ID_HEX_BYTES) {
+            return Err(invalid_input("invalid token id encoding"));
+        }
         let path = self.path.clone();
         with_exclusive_lock(&path, || {
             self.reload_unlocked()?;
-            let Some(t) = self.tokens.iter_mut().find(|t| t.meta.id == id) else {
+            let Some(index) = self.tokens.iter().position(|token| token.id == id) else {
                 return Ok(false);
             };
-            t.meta.revoked_ns = Some(now_ns());
-            self.persist_unlocked()?;
+            let mut candidate = self.tokens.clone();
+            candidate[index].revoked_ns = Some(now_ns());
+            self.persist_tokens_unlocked(&candidate, io::ErrorKind::InvalidData)?;
+            self.tokens = candidate;
             Ok(true)
         })
     }
@@ -217,79 +293,182 @@ impl TokenStore {
         digest_with(&self.key, secret)
     }
 
-    fn persist_unlocked(&self) -> io::Result<()> {
+    fn persist_tokens_unlocked(
+        &self,
+        tokens: &[StoredToken],
+        overflow_kind: io::ErrorKind,
+    ) -> io::Result<()> {
         let mut doc = Stored {
             version: 1,
             key: base64::engine::general_purpose::STANDARD.encode(*self.key),
-            tokens: self
-                .tokens
-                .iter()
-                .map(|t| StoredToken {
-                    meta: t.meta.clone(),
-                    digest: t.digest.clone(),
-                })
-                .collect(),
+            tokens: tokens.to_vec(),
         };
         let bytes = Zeroizing::new(serde_json::to_vec_pretty(&doc).map_err(io::Error::other)?);
         // Wipe the additional base64 key copy as soon as serialization is done.
         doc.key.zeroize();
+        if bytes.len() > MAX_TOKEN_STORE_BYTES {
+            return Err(io::Error::new(
+                overflow_kind,
+                "token store exceeds byte limit",
+            ));
+        }
         atomic_replace(&self.path, &bytes)
     }
 }
 
 fn load_unlocked(path: &Path) -> io::Result<(Zeroizing<[u8; 32]>, Vec<StoredToken>)> {
     secure_file(path)?;
-    let bytes = Zeroizing::new(fs::read(path)?);
-    let mut doc: Stored = serde_json::from_slice(&bytes)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let mut file = fs::File::open(path)?;
+    if file.metadata()?.len() > MAX_TOKEN_STORE_BYTES as u64 {
+        return Err(invalid_data("token store exceeds byte limit"));
+    }
+    let mut bytes = Zeroizing::new(Vec::with_capacity(8 * 1024));
+    Read::by_ref(&mut file)
+        .take(MAX_TOKEN_STORE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_TOKEN_STORE_BYTES {
+        return Err(invalid_data("token store exceeds byte limit"));
+    }
+    let mut doc: Stored =
+        serde_json::from_slice(&bytes).map_err(|_| invalid_data("invalid token store JSON"))?;
     if doc.version != 1 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "unsupported token store version",
-        ));
+        return Err(invalid_data("unsupported token store version"));
+    }
+    if doc.tokens.len() > MAX_TOKENS {
+        return Err(invalid_data("token store exceeds token limit"));
     }
     let raw = Zeroizing::new(
         base64::engine::general_purpose::STANDARD
             .decode(&doc.key)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+            .map_err(|_| invalid_data("invalid token store key encoding"))?,
     );
     let key = Zeroizing::new(
         raw.as_slice()
             .try_into()
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid token key"))?,
+            .map_err(|_| invalid_data("invalid token store key length"))?,
     );
-    let tokens = std::mem::take(&mut doc.tokens);
-    validate_tokens(&tokens)?;
+    if base64::engine::general_purpose::STANDARD.encode(*key) != doc.key {
+        return Err(invalid_data("noncanonical token store key encoding"));
+    }
+    let mut tokens = std::mem::take(&mut doc.tokens);
+    validate_tokens(&mut tokens)?;
     Ok((key, tokens))
 }
 
-fn validate_tokens(tokens: &[StoredToken]) -> io::Result<()> {
+fn validate_tokens(tokens: &mut [StoredToken]) -> io::Result<()> {
     let mut ids = BTreeSet::new();
     let mut digests = BTreeSet::new();
     for token in tokens {
-        let digest = unhex(&token.digest).map_err(|()| {
-            io::Error::new(io::ErrorKind::InvalidData, "invalid token digest encoding")
-        })?;
+        validate_stored_text("principal", &token.principal, MAX_PRINCIPAL_BYTES)?;
+        validate_stored_text("profile", &token.profile, MAX_PROFILE_BYTES)?;
+        validate_stored_capabilities(&mut token.caps)?;
+        if !is_canonical_hex(&token.id, TOKEN_ID_HEX_BYTES) {
+            return Err(invalid_data("invalid token id encoding"));
+        }
+        if !is_canonical_hex(&token.digest, TOKEN_DIGEST_HEX_BYTES) {
+            return Err(invalid_data("invalid token digest encoding"));
+        }
+        let digest =
+            unhex(&token.digest).map_err(|()| invalid_data("invalid token digest encoding"))?;
         if digest.len() != 32 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid token digest length",
-            ));
+            return Err(invalid_data("invalid token digest length"));
         }
-        if token.meta.id != hex(&digest[..8]) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "token id does not match digest",
-            ));
+        if token.id != hex(&digest[..8]) {
+            return Err(invalid_data("token id does not match digest"));
         }
-        if !ids.insert(&token.meta.id) || !digests.insert(&token.digest) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "duplicate token identity",
-            ));
+        if !ids.insert(&token.id) || !digests.insert(&token.digest) {
+            return Err(invalid_data("duplicate token identity"));
         }
     }
     Ok(())
+}
+
+/// Return whether a bearer has the exact canonical representation emitted by
+/// [`TokenStore::create`]. Callers may use this cheap check before locking or
+/// reading the authority snapshot.
+pub fn bearer_is_canonical(bearer: &str) -> bool {
+    if bearer.len() != BEARER_ENCODED_BYTES || !bearer.is_ascii() {
+        return false;
+    }
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(bearer)
+        .is_ok_and(|raw| {
+            raw.len() == BEARER_BYTES
+                && base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw) == bearer
+        })
+}
+
+fn validate_meta_input(meta: &TokenMeta) -> io::Result<()> {
+    if !is_canonical_hex(&meta.id, TOKEN_ID_HEX_BYTES) {
+        return Err(invalid_input("invalid token id encoding"));
+    }
+    validate_text_input("principal", &meta.principal, MAX_PRINCIPAL_BYTES)?;
+    validate_text_input("profile", &meta.profile, MAX_PROFILE_BYTES)?;
+    let mut caps = meta.caps.clone();
+    validate_capabilities_input(&mut caps)?;
+    if caps != meta.caps {
+        return Err(invalid_input("noncanonical token capabilities"));
+    }
+    Ok(())
+}
+
+fn validate_capabilities_input(caps: &mut [String]) -> io::Result<()> {
+    if caps.len() > MAX_CAPABILITIES_PER_TOKEN {
+        return Err(invalid_input("too many token capabilities"));
+    }
+    for cap in caps.iter() {
+        validate_text_input("capability", cap, MAX_CAPABILITY_BYTES)?;
+    }
+    caps.sort();
+    if caps.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(invalid_input("duplicate token capability"));
+    }
+    Ok(())
+}
+
+fn validate_stored_capabilities(caps: &mut [String]) -> io::Result<()> {
+    if caps.len() > MAX_CAPABILITIES_PER_TOKEN {
+        return Err(invalid_data("too many token capabilities"));
+    }
+    for cap in caps.iter() {
+        validate_stored_text("capability", cap, MAX_CAPABILITY_BYTES)?;
+    }
+    caps.sort();
+    if caps.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(invalid_data("duplicate token capability"));
+    }
+    Ok(())
+}
+
+fn validate_text_input(field: &str, value: &str, max_bytes: usize) -> io::Result<()> {
+    if value.is_empty() || value.len() > max_bytes || value.chars().any(char::is_control) {
+        return Err(invalid_input(match field {
+            "principal" => "invalid token principal",
+            "profile" => "invalid token profile",
+            _ => "invalid token capability",
+        }));
+    }
+    Ok(())
+}
+
+fn validate_stored_text(field: &str, value: &str, max_bytes: usize) -> io::Result<()> {
+    validate_text_input(field, value, max_bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
+}
+
+fn is_canonical_hex(value: &str, expected_bytes: usize) -> bool {
+    value.len() == expected_bytes
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn invalid_data(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+fn invalid_input(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 
 fn digest_with(key: &[u8; 32], secret: &[u8]) -> [u8; 32] {
@@ -397,6 +576,8 @@ fn unhex(s: &str) -> Result<Vec<u8>, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use std::io::Seek;
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
     use std::sync::Arc;
@@ -501,6 +682,195 @@ mod tests {
     }
 
     #[test]
+    fn authority_snapshot_limits_and_schema_fail_closed_without_rewriting() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("tokens.json");
+        let mut creator = TokenStore::open(&path).unwrap();
+        let (bearer, _) = creator
+            .create(
+                "agent:bounded".into(),
+                "default".into(),
+                vec!["proc.spawn".into(), "fs.read".into()],
+                None,
+            )
+            .unwrap();
+        let reader = TokenStore::open(&path).unwrap();
+        let valid = fs::read(&path).unwrap();
+
+        type Corruption = Box<dyn Fn(&mut serde_json::Value)>;
+        let corruptions: Vec<Corruption> = vec![
+            Box::new(|doc| doc["unknown"] = json!(true)),
+            Box::new(|doc| doc["tokens"][0]["unknown"] = json!({"nested": [1, 2, 3]})),
+            Box::new(|doc| {
+                doc["tokens"][0]["principal"] = json!("p".repeat(MAX_PRINCIPAL_BYTES + 1))
+            }),
+            Box::new(|doc| doc["tokens"][0]["profile"] = json!("p".repeat(MAX_PROFILE_BYTES + 1))),
+            Box::new(|doc| {
+                doc["tokens"][0]["caps"] = json!(vec!["x"; MAX_CAPABILITIES_PER_TOKEN + 1])
+            }),
+            Box::new(|doc| doc["tokens"][0]["caps"] = json!(["fs.read", "fs.read"])),
+            Box::new(|doc| {
+                let digest = doc["tokens"][0]["digest"].as_str().unwrap().to_uppercase();
+                doc["tokens"][0]["digest"] = json!(digest);
+            }),
+            Box::new(|doc| {
+                let id = doc["tokens"][0]["id"].as_str().unwrap().to_uppercase();
+                doc["tokens"][0]["id"] = json!(id);
+            }),
+        ];
+        for corrupt in corruptions {
+            let mut doc: serde_json::Value = serde_json::from_slice(&valid).unwrap();
+            corrupt(&mut doc);
+            let corrupt_bytes = serde_json::to_vec(&doc).unwrap();
+            fs::write(&path, &corrupt_bytes).unwrap();
+            for _ in 0..3 {
+                assert_eq!(
+                    reader.validate_checked(&bearer).unwrap_err().kind(),
+                    io::ErrorKind::InvalidData
+                );
+                assert!(reader.validate(&bearer).is_none());
+                assert_eq!(fs::read(&path).unwrap(), corrupt_bytes);
+            }
+        }
+
+        fs::write(&path, &valid).unwrap();
+        let mut sparse = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        sparse
+            .seek(std::io::SeekFrom::Start(MAX_TOKEN_STORE_BYTES as u64))
+            .unwrap();
+        sparse.write_all(&[0]).unwrap();
+        sparse.sync_all().unwrap();
+        let oversized_len = sparse.metadata().unwrap().len();
+        drop(sparse);
+        for _ in 0..3 {
+            assert_eq!(
+                reader.validate_checked(&bearer).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert_eq!(fs::metadata(&path).unwrap().len(), oversized_len);
+        }
+    }
+
+    #[test]
+    fn create_admission_is_canonical_bounded_and_transactional() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("tokens.json");
+        let mut store = TokenStore::open(&path).unwrap();
+        let before = fs::read(&path).unwrap();
+
+        for result in [
+            store.create("".into(), "default".into(), vec![], None),
+            store.create(
+                "p".repeat(MAX_PRINCIPAL_BYTES + 1),
+                "default".into(),
+                vec![],
+                None,
+            ),
+            store.create(
+                "agent:a".into(),
+                "p".repeat(MAX_PROFILE_BYTES + 1),
+                vec![],
+                None,
+            ),
+            store.create(
+                "agent:a".into(),
+                "default".into(),
+                vec!["fs.read".into(), "fs.read".into()],
+                None,
+            ),
+        ] {
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(fs::read(&path).unwrap(), before);
+            assert!(store.tokens.is_empty());
+        }
+
+        let (_, meta) = store
+            .create(
+                "agent:a".into(),
+                "default".into(),
+                vec!["proc.spawn".into(), "fs.read".into()],
+                None,
+            )
+            .unwrap();
+        assert_eq!(meta.caps, ["fs.read", "proc.spawn"]);
+
+        // Force atomic replacement to fail after admission. The candidate is
+        // not installed in memory and the last good authority file survives.
+        let good = fs::read(&path).unwrap();
+        fs::create_dir(tempfile_path(&path)).unwrap();
+        let count = store.tokens.len();
+        assert!(
+            store
+                .create("agent:b".into(), "default".into(), vec![], None)
+                .is_err()
+        );
+        assert_eq!(store.tokens.len(), count);
+        assert_eq!(fs::read(&path).unwrap(), good);
+    }
+
+    #[test]
+    fn absurd_bearer_is_rejected_before_authority_io() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("tokens.json");
+        let store = TokenStore::open(&path).unwrap();
+        fs::write(&path, b"malformed").unwrap();
+        for bearer in ["short".to_string(), "x".repeat(1_000_000)] {
+            assert_eq!(
+                store.validate_checked(&bearer).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+    }
+
+    #[test]
+    fn token_count_limit_rejects_whole_snapshot_and_capacity_create() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("tokens.json");
+        let mut store = TokenStore::open(&path).unwrap();
+        let (_, _) = store
+            .create("agent:seed".into(), "default".into(), vec![], None)
+            .unwrap();
+        let mut doc: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let seed = doc["tokens"][0].clone();
+        let mut tokens = Vec::with_capacity(MAX_TOKENS + 1);
+        for index in 0..MAX_TOKENS {
+            let mut token = seed.clone();
+            let mut digest = [0_u8; 32];
+            digest[..8].copy_from_slice(&(index as u64).to_be_bytes());
+            token["id"] = json!(hex(&digest[..8]));
+            token["digest"] = json!(hex(&digest));
+            token["principal"] = json!(format!("agent:{index}"));
+            tokens.push(token);
+        }
+        doc["tokens"] = json!(tokens);
+        let full = serde_json::to_vec(&doc).unwrap();
+        assert!(full.len() < MAX_TOKEN_STORE_BYTES);
+        fs::write(&path, &full).unwrap();
+        store.reload_unlocked().unwrap();
+        let before = fs::read(&path).unwrap();
+        assert_eq!(
+            store
+                .create("agent:overflow".into(), "default".into(), vec![], None)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(store.tokens.len(), MAX_TOKENS);
+
+        let mut over: serde_json::Value = serde_json::from_slice(&before).unwrap();
+        let extra = over["tokens"][0].clone();
+        over["tokens"].as_array_mut().unwrap().push(extra);
+        let over_bytes = serde_json::to_vec(&over).unwrap();
+        fs::write(&path, &over_bytes).unwrap();
+        assert_eq!(
+            store.try_list().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(fs::read(&path).unwrap(), over_bytes);
+    }
+
+    #[test]
     fn production_has_no_raw_panicking_lock_access() {
         let production = include_str!("lib.rs")
             .split("#[cfg(test)]")
@@ -601,5 +971,39 @@ mod tests {
         for i in 0..12 {
             assert!(principals.contains(&format!("agent:{i}")));
         }
+    }
+
+    #[test]
+    fn concurrent_readers_and_writer_keep_valid_snapshots_live() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("tokens.json");
+        let mut writer = TokenStore::open(&path).unwrap();
+        let (bearer, _) = writer
+            .create("agent:stable".into(), "test".into(), vec![], None)
+            .unwrap();
+        let reader = Arc::new(TokenStore::open(&path).unwrap());
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                let reader = Arc::clone(&reader);
+                let bearer = bearer.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..64 {
+                        assert_eq!(
+                            reader.validate_checked(&bearer).unwrap().unwrap().principal,
+                            "agent:stable"
+                        );
+                    }
+                })
+            })
+            .collect();
+        for index in 0..32 {
+            writer
+                .create(format!("agent:{index}"), "test".into(), vec![], None)
+                .unwrap();
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(reader.try_list().unwrap().len(), 33);
     }
 }

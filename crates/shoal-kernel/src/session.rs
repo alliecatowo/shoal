@@ -3,6 +3,73 @@
 //! `site/content/internals/change-map.md`; pure mechanical move, zero wire/behavior change.
 use super::*;
 
+pub(crate) const MAX_SESSION_NAME_BYTES: usize = 256;
+pub(crate) const MAX_CLIENT_KIND_BYTES: usize = 128;
+
+fn invalid_attach(message: &'static str) -> RpcError {
+    RpcError {
+        code: INVALID_PARAMS,
+        message: message.into(),
+        data: None,
+    }
+}
+
+fn bounded_attach_text(value: &Json, max_bytes: usize) -> bool {
+    value.as_str().is_some_and(|text| {
+        !text.is_empty() && text.len() <= max_bytes && !text.chars().any(char::is_control)
+    })
+}
+
+/// Validate the small attach schema before authentication performs hashing,
+/// locks the authority store, or retains caller-controlled identity strings.
+/// Errors are intentionally constant and never quote credential material.
+fn validate_attach_wire(params: &Json) -> Result<Option<LocalAuthMode>, RpcError> {
+    let object = params
+        .as_object()
+        .ok_or_else(|| invalid_attach("session.attach params must be an object"))?;
+    if object
+        .keys()
+        .any(|key| !matches!(key.as_str(), "session" | "token" | "local_auth" | "client"))
+    {
+        return Err(invalid_attach("unknown session.attach parameter"));
+    }
+    if let Some(session) = object.get("session")
+        && !session.is_null()
+        && !bounded_attach_text(session, MAX_SESSION_NAME_BYTES)
+    {
+        return Err(invalid_attach("invalid session name"));
+    }
+    if let Some(token) = object.get("token")
+        && !token.is_null()
+        && token.as_str().is_none()
+    {
+        return Err(invalid_attach("bearer token must be a string"));
+    }
+    let client = object
+        .get("client")
+        .and_then(Json::as_object)
+        .ok_or_else(|| invalid_attach("session.attach client must be an object"))?;
+    if client
+        .keys()
+        .any(|key| !matches!(key.as_str(), "kind" | "tty"))
+    {
+        return Err(invalid_attach("unknown session.attach client parameter"));
+    }
+    if !client
+        .get("kind")
+        .is_some_and(|kind| bounded_attach_text(kind, MAX_CLIENT_KIND_BYTES))
+        || !client.get("tty").is_some_and(Json::is_boolean)
+    {
+        return Err(invalid_attach("invalid session.attach client"));
+    }
+    match object.get("local_auth") {
+        Some(value) => serde_json::from_value::<LocalAuthMode>(value.clone())
+            .map(Some)
+            .map_err(|_| invalid_attach("invalid local authentication mode")),
+        None => Ok(None),
+    }
+}
+
 /// Principal-private identity for a named evaluator session. The wire still
 /// exposes only `name`; `principal` prevents two authenticated callers that
 /// choose the same name from sharing mutable evaluator state.
@@ -727,24 +794,22 @@ impl Kernel {
         attached: &mut Option<Attachment>,
         connection_trust: ConnectionTrust,
     ) -> Result<Json, RpcError> {
-        let local_auth = match params.get("local_auth") {
-            Some(value) => Some(
-                serde_json::from_value::<LocalAuthMode>(value.clone()).map_err(|error| {
-                    RpcError {
-                        code: INVALID_PARAMS,
-                        message: format!("invalid local_auth: {error}"),
-                        data: None,
-                    }
-                })?,
-            ),
-            None => None,
-        };
+        let local_auth = validate_attach_wire(&params)?;
         let params: AttachParams = decode(params)?;
         let tty = params.client.tty;
         if params.token.is_some() && local_auth.is_some() {
             return Err(RpcError {
                 code: INVALID_PARAMS,
                 message: "token and local_auth are mutually exclusive authentication modes".into(),
+                data: None,
+            });
+        }
+        if let Some(token) = params.token.as_deref()
+            && !shoal_auth::bearer_is_canonical(token)
+        {
+            return Err(RpcError {
+                code: AUTH_FAILED,
+                message: "invalid, expired, or revoked bearer token".into(),
                 data: None,
             });
         }

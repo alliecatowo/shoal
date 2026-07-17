@@ -104,8 +104,17 @@ bytes encoded URL-safe without padding. Token id is the first eight digest bytes
 `validate` takes a shared advisory file lock, reloads the store from disk, performs constant-time
 byte equality after decoding each stored digest, then checks revocation and strict
 `expires_ns > now`. Create and revoke take the exclusive lock, reload fresh state inside that lock,
-mutate it, and atomically replace the file. This prevents two management processes from publishing
-updates derived from stale snapshots.
+build a candidate snapshot, and atomically replace the file before publishing that candidate in
+memory. This prevents two management processes from publishing updates derived from stale snapshots
+and prevents a failed replace from creating process-local authority that disk readers cannot see.
+
+The authority document has hard admission limits: 4 MiB total, 4,096 tokens, 256-byte principals,
+128-byte profiles, and at most 128 capability labels of 128 bytes each per token. Reads stop at the
+byte boundary before JSON deserialization; unknown fields, duplicate token identities/digests,
+duplicate capability labels, noncanonical key/digest/id encodings, and any over-limit field reject
+the entire snapshot as `InvalidData`. No authority record is truncated or evicted automatically,
+and the rejected file is left intact for diagnosis. Create validates and canonicalizes its input
+before mutation, then rejects capacity or serialized-size overflow as `InvalidInput`.
 
 The kernel revalidates the attached bearer before every attached request. Create is therefore
 visible without restart; revocation, expiry, a corrupt store, or a lock/read failure invalidates a
@@ -556,9 +565,10 @@ authority of an incorrectly implemented hostcall remain outside the guest sandbo
 | requester approving its own plan | reject `LEASH_DENIED` unless self-ack explicitly enabled (HR-D3) |
 | `journal.query` `limit` omitted vs. `0` | omitted → default page; explicit `0` → zero rows; clamped to server max (HR-D5) |
 | malformed/unknown bearer | reject attach |
+| oversized/noncanonical bearer-shaped input | reject before hashing or token-store I/O; never echo the credential |
 | ephemeral kernel bearer | reject as unavailable |
 | expired or externally revoked bearer, including on an existing attachment | fresh validation rejects and clears attachment |
-| token-store lock/read/parse failure during an attached request | fail closed and clear attachment |
+| token-store lock/read/parse/integrity/limit failure during an attached request | fail closed and clear attachment; leave snapshot intact |
 | unreadable/corrupt secret envelope | error |
 | nonexistent sandbox grant roots | drop roots; possibly no OS sandbox, rely on semantic gate |
 | undeclared or policy-unauthorized WASM hostcall | reject invocation |

@@ -263,6 +263,11 @@ The bearer secret is the only stdout line. Creation metadata (`created ID (secre
 
 If PROFILE is omitted, it is `default`. `--cap` is repeatable. `--ttl` is parsed as signed seconds and converted to nanoseconds; zero or negative values create immediately expired tokens and are not useful.
 
+Creation rejects empty/control-bearing or oversized identity fields, duplicate capability labels,
+more than 128 capability labels, a full 4,096-record store, or a candidate document over 4 MiB.
+Capability labels are stored in deterministic sorted order. Rejection is transactional: the prior
+authority file remains unchanged.
+
 Important: profile/capability values are metadata reported at attachment, not grants. Leash authorization uses the principal's policy entry. See [Security and trust boundaries](@/docs/security.md#profile-and-cap-are-metadata-today).
 
 ### List

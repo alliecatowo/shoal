@@ -2056,6 +2056,77 @@ fn bearer_attach_uses_token_principal_and_rejects_invalid() {
 }
 
 #[test]
+fn attach_rejects_absurd_or_ambiguous_identity_input_without_secret_echo() {
+    let dir = tempfile::tempdir().unwrap();
+    let token_path = dir.path().join("tokens.json");
+    let mut tokens = TokenStore::open(&token_path).unwrap();
+    let (valid_bearer, _) = tokens
+        .create("agent:bounded".into(), "readonly".into(), vec![], None)
+        .unwrap();
+    drop(tokens);
+    let kernel = Kernel::open(dir.path()).unwrap();
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let mut reader = BufReader::new(client.try_clone().unwrap());
+    let worker = kernel.clone();
+    let thread = std::thread::spawn(move || worker.handle_stream(server).unwrap());
+
+    // A malformed authority snapshot proves an absurd bearer is rejected by
+    // shape before any token-store read. The response is generic and does not
+    // amplify the credential into an error.
+    let malformed = b"malformed-authority-snapshot".to_vec();
+    std::fs::write(&token_path, &malformed).unwrap();
+    let absurd = "s".repeat(1_000_000);
+    let response = call(
+        &mut client,
+        &mut reader,
+        1,
+        "session.attach",
+        json!({"token":absurd,"client":{"kind":"agent","tty":false}}),
+    );
+    let error = response.error.unwrap();
+    assert_eq!(error.code, AUTH_FAILED);
+    assert_eq!(error.message, "invalid, expired, or revoked bearer token");
+    assert!(error.message.len() < 128);
+    assert_eq!(std::fs::read(&token_path).unwrap(), malformed);
+
+    let invalid_cases = [
+        json!({"session":"s".repeat(MAX_SESSION_NAME_BYTES + 1),"client":{"kind":"agent","tty":false}}),
+        json!({"client":{"kind":"k".repeat(MAX_CLIENT_KIND_BYTES + 1),"tty":false}}),
+        json!({"local_auth":"x".repeat(1_000_000),"client":{"kind":"agent","tty":false}}),
+        json!({"unexpected":{"deep":[[[1]]]},"client":{"kind":"agent","tty":false}}),
+        json!({"client":{"kind":"agent","tty":false,"unexpected":true}}),
+    ];
+    for (offset, params) in invalid_cases.into_iter().enumerate() {
+        let response = call(
+            &mut client,
+            &mut reader,
+            2 + offset as i64,
+            "session.attach",
+            params,
+        );
+        let error = response.error.unwrap();
+        assert_eq!(error.code, INVALID_PARAMS);
+        assert!(error.message.len() < 128);
+        assert!(!error.message.contains(&"x".repeat(129)));
+    }
+
+    // A correctly shaped credential reaches the store and still fails closed
+    // on the deliberately malformed snapshot.
+    let response = call(
+        &mut client,
+        &mut reader,
+        20,
+        "session.attach",
+        json!({"token":valid_bearer,"client":{"kind":"agent","tty":false}}),
+    );
+    assert_eq!(response.error.unwrap().code, AUTH_FAILED);
+    assert_eq!(std::fs::read(&token_path).unwrap(), malformed);
+    drop(client);
+    drop(reader);
+    thread.join().unwrap();
+}
+
+#[test]
 fn durable_kernel_rejects_asserted_and_bearer_named_human_authority() {
     let dir = tempfile::tempdir().unwrap();
     let mut tokens = TokenStore::open(dir.path().join("tokens.json")).unwrap();
