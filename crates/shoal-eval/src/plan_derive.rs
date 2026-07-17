@@ -302,3 +302,87 @@ fn url_host_port(url: &str) -> (String, u16) {
         _ => (host_port.to_string(), default_port),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A7: an adapter that declares a now-recognized `proc.spawn(...)` plus an
+    /// unrecognized effect kind. The spawn must be derived (it was silently
+    /// dropped before), and the unknown kind must plan as opaque — never
+    /// silently ignored (fail-closed).
+    #[test]
+    fn adapter_effect_vocabulary_is_exhaustive_and_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("fixture.toml"),
+            r#"[cmd.deployer]
+bin="/bin/true"
+effects=["proc.spawn(container)", "net.connect(registry:443)", "quantum.entangle(qubit)"]
+"#,
+        )
+        .unwrap();
+        let (catalog, warnings) = AdapterCatalog::load_dir(dir.path());
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let mut ev = Evaluator::new(dir.path().into());
+        ev.set_adapters(catalog);
+        let effects = ev
+            .plan_program(&shoal_syntax::parse("deployer").unwrap())
+            .unwrap()
+            .effects;
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::ProcSpawn { argv0, .. } if argv0 == "container")),
+            "declared proc.spawn was not derived: {effects:?}"
+        );
+        assert!(
+            effects.iter().any(
+                |e| matches!(e, Effect::NetConnect { host, port } if host == "registry" && *port == 443)
+            ),
+            "declared net.connect was not derived: {effects:?}"
+        );
+        assert!(
+            effects.contains(&Effect::Opaque),
+            "unknown adapter effect kind was silently dropped: {effects:?}"
+        );
+    }
+
+    /// A7 (unit): every effect kind in the vocabulary parses to its concrete
+    /// effect; a bare unknown token plans as opaque, never dropped.
+    #[test]
+    fn declared_effect_covers_full_vocabulary() {
+        use crate::plan_effects::parse_declared_effect;
+        let cwd = Path::new("/tmp");
+        let b = std::collections::HashMap::new();
+        assert_eq!(
+            parse_declared_effect("net.listen(8080)", &b, cwd),
+            vec![Effect::NetListen { port: 8080 }]
+        );
+        assert_eq!(
+            parse_declared_effect("env.write(TOKEN)", &b, cwd),
+            vec![Effect::EnvWrite {
+                names: vec!["TOKEN".into()]
+            }]
+        );
+        assert_eq!(
+            parse_declared_effect("secret.use(github)", &b, cwd),
+            vec![Effect::SecretUse {
+                names: vec!["github".into()]
+            }]
+        );
+        assert_eq!(
+            parse_declared_effect("session.write", &b, cwd),
+            vec![Effect::SessionWrite]
+        );
+        assert_eq!(parse_declared_effect("time", &b, cwd), vec![Effect::Time]);
+        assert_eq!(
+            parse_declared_effect("bogus.kind(x)", &b, cwd),
+            vec![Effect::Opaque]
+        );
+        assert_eq!(
+            parse_declared_effect("bare-nonsense", &b, cwd),
+            vec![Effect::Opaque]
+        );
+    }
+}
