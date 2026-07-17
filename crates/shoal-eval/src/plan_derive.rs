@@ -376,6 +376,17 @@ impl Evaluator {
         // Effectful heads the runtime intercepts before builtin/adapter dispatch
         // (A8), mirroring `eval_command`'s special-head order.
         match call.head.as_str() {
+            "interact" => {
+                // `interact <cmd ...>` bypasses normal command dispatch and
+                // runs the first argument through `run_argv` in PTY mode. The
+                // process is the argument, not a fictitious external binary
+                // named `interact`.
+                match call.args.first().and_then(cmd_arg_str_literal) {
+                    Some(head) => self.plan_external_spawn(&head, out),
+                    None => push_effect(out, Effect::Opaque),
+                }
+                return Ok(());
+            }
             "open" => {
                 let path = call.args.first().and_then(|a| self.cmd_arg_path_literal(a));
                 self.plan_open(path, out);
@@ -411,11 +422,39 @@ impl Evaluator {
             push_effect(out, Effect::Opaque);
             return Ok(());
         }
-        if builtins::is_builtin(&call.head)
-            || matches!(call.head.as_str(), "cd" | "pwd" | "j" | "jump")
-        {
+        if builtins::is_builtin(&call.head) {
             for effect in self.builtin_effects(call)? {
                 push_effect(out, effect);
+            }
+            return Ok(());
+        }
+        // Every command head intercepted by `eval_command` must also resolve
+        // as an in-language command here. This gate deliberately consumes the
+        // canonical registry rather than maintaining a planner-only name list:
+        // `history` previously fell through as an external ProcSpawn even
+        // though runtime dispatch reads the journal, causing Leash to deny it.
+        if builtins::is_special_head(&call.head) {
+            match call.head.as_str() {
+                "cd" | "pushd" | "popd" | "j" | "jump" | "exit" | "quit" => {
+                    push_effect(out, Effect::SessionWrite);
+                }
+                "journal" | "history" => push_effect(out, Effect::JournalRead),
+                // Undo consults durable history and may restore/delete paths
+                // that cannot be identified without the selected journal row.
+                "undo" => {
+                    push_effect(out, Effect::JournalRead);
+                    push_effect(out, Effect::Opaque);
+                }
+                // `apply` executes a previously stored program; `reef` ranges
+                // from a read-only table to manifest writes/provider fetches.
+                // Without the runtime object/subcommand, both stay fail-closed.
+                "apply" | "reef" => push_effect(out, Effect::Opaque),
+                // Runtime-local reads or validation/planning operations.
+                "jobs" | "dirs" | "pwd" | "assert" | "plan" | "explain" => {}
+                // Effectful special heads are handled above. Keeping a
+                // conservative fallback means a future registry entry cannot
+                // silently become effect-free before planner semantics land.
+                _ => push_effect(out, Effect::Opaque),
             }
             return Ok(());
         }
@@ -805,6 +844,53 @@ effects=["proc.spawn(container)", "net.connect(registry:443)", "quantum.entangle
             .effects
     }
 
+    /// Planner/runtime resolution lockstep: no name in the canonical builtin
+    /// registry may fall through to the generic external-spawn branch. This is
+    /// the regression that made the in-language `history` command look like an
+    /// external binary and caused a restricted kernel session to deny it.
+    #[test]
+    fn canonical_builtins_never_fall_through_as_external_spawns() {
+        let dir = tempfile::tempdir().unwrap();
+        for &name in builtins::builtin_names() {
+            let src = match name {
+                "cp" | "mv" | "ln" => format!("{name} from to"),
+                "interact" => "interact echo".to_string(),
+                "open" => "open file".to_string(),
+                "save" => "save file value".to_string(),
+                "run" => "run echo".to_string(),
+                "source" => "source script.shl".to_string(),
+                "assert" => "assert true".to_string(),
+                "apply" => "apply 1".to_string(),
+                "explain" => "explain \"echo hi\"".to_string(),
+                _ => name.to_string(),
+            };
+            let effects = effects_at(dir.path(), &src);
+            assert!(
+                !effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::ProcSpawn { argv0, .. } if argv0 == name)),
+                "builtin `{name}` fell through as an external spawn: {effects:?}"
+            );
+        }
+
+        assert_eq!(
+            effects_at(dir.path(), "history"),
+            vec![Effect::JournalRead],
+            "history must plan the journal read performed by runtime dispatch"
+        );
+        assert_eq!(
+            effects_at(dir.path(), "journal"),
+            vec![Effect::JournalRead],
+            "journal must plan the journal read performed by runtime dispatch"
+        );
+        assert!(
+            effects_at(dir.path(), "interact echo")
+                .iter()
+                .any(|e| matches!(e, Effect::ProcSpawn { argv0, .. } if argv0 == "echo")),
+            "interact must plan its command argument as the spawned process"
+        );
+    }
+
     /// A1: `use ./mod` reads the module file and covers its body conservatively.
     #[test]
     fn use_reads_module_and_covers_body() {
@@ -1031,5 +1117,69 @@ effects=["proc.spawn(container)", "net.connect(registry:443)", "quantum.entangle
                 "pure form `{src}` derived spurious effects: {effects:?}"
             );
         }
+    }
+
+    /// HR-A11: pin every effect-planning probe that originally demonstrated a
+    /// fail-open route. These assertions check the meaningful effect and target,
+    /// not merely that the list happens to be non-empty.
+    #[test]
+    fn original_audit_probes_have_meaningful_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("module.shl"), "export let x = 1").unwrap();
+
+        let has_write = |src: &str, path: &str| {
+            effects_at(dir.path(), src).iter().any(
+                |e| matches!(e, Effect::FsWrite { paths } if paths.contains(&dir.path().join(path))),
+            )
+        };
+        let has_read = |src: &str, path: &str| {
+            effects_at(dir.path(), src).iter().any(
+                |e| matches!(e, Effect::FsRead { paths } if paths.contains(&dir.path().join(path))),
+            )
+        };
+        let spawns = |src: &str, head: &str| {
+            effects_at(dir.path(), src)
+                .iter()
+                .any(|e| matches!(e, Effect::ProcSpawn { argv0, .. } if argv0 == head))
+        };
+
+        assert!(has_write("\"x\".save(\"p\")", "p"), "method save");
+        assert!(has_write("echo hi > p", "p"), "redirect write");
+        assert!(
+            effects_at(dir.path(), "env.AUDIT_ONLY = \"y\"").contains(&Effect::EnvWrite {
+                names: vec!["AUDIT_ONLY".into()]
+            }),
+            "persistent env assignment"
+        );
+        assert!(
+            has_read("path(\"Cargo.toml\").read", "Cargo.toml"),
+            "path read"
+        );
+        let module = effects_at(dir.path(), "use ./module");
+        assert!(
+            module.iter().any(
+                |e| matches!(e, Effect::FsRead { paths } if paths.contains(&dir.path().join("module.shl")))
+            ) && module.contains(&Effect::Opaque),
+            "module read/body coverage: {module:?}"
+        );
+        assert!(has_write("spawn { \"x\".save(\"p\") }", "p"), "spawn body");
+        assert!(
+            has_write("parallel(() => \"x\".save(\"p\"))", "p"),
+            "parallel body"
+        );
+        assert!(spawns("run(\"echo\", \"hi\")", "echo"), "run builtin");
+
+        let open = effects_at(dir.path(), "open(\"Cargo.toml\")");
+        assert!(
+            open.iter().any(
+                |e| matches!(e, Effect::FsRead { paths } if paths.contains(&dir.path().join("Cargo.toml")))
+            ) && open.contains(&Effect::Opaque),
+            "open read/handler coverage: {open:?}"
+        );
+        assert!(spawns("\"x\".feed(cat)", "cat"), "feed external spawn");
+
+        // The original function-form save probe also stays pinned: the runtime
+        // signature is save(path, value), so the first argument is the target.
+        assert!(has_write("save(\"p\", \"x\")", "p"), "save builtin");
     }
 }
