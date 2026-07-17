@@ -14,12 +14,9 @@
 //! - **expr** (anywhere else — after `let x = `, inside `(...)`, a bare
 //!   expression statement): in-scope variable/function names.
 
-use std::collections::{BTreeSet, HashMap};
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
 
 use reedline::{Completer, Span as RlSpan, Suggestion};
 use shoal_adapters::{AdapterCatalog, CmdAdapter};
@@ -28,9 +25,13 @@ use shoal_syntax::lexer::RESERVED;
 use shoal_value::{Env, Value, method_names, methods_for};
 
 mod context;
+mod discovery;
 mod inference;
 
 use context::{Ctx, classify};
+#[cfg(test)]
+use discovery::{MAX_PATH_CACHE_DIRS, PATH_CACHE_REVALIDATE};
+use discovery::{PathDiscovery, adapter_names, filesystem_candidates};
 
 pub struct ShoalCompleter {
     env: Env,
@@ -38,10 +39,9 @@ pub struct ShoalCompleter {
     /// Executable search directories from the session that will execute the
     /// command. Attached REPLs cannot use the client's process PATH: the
     /// kernel session may have changed PATH independently.
-    path_dirs: Option<Arc<Mutex<Option<Vec<PathBuf>>>>>,
+    discovery: PathDiscovery,
     adapters: Vec<AdapterCatalog>,
     adapter_names: Vec<String>,
-    path_cache: HashMap<PathBuf, PathCacheEntry>,
     /// `completion.fuzzy` (site/content/internals/configuration-reference.md): allow typo-tolerant,
     /// non-contiguous matches instead of requiring a strict prefix.
     fuzzy: bool,
@@ -58,21 +58,6 @@ pub struct ShoalCompleter {
 const DEFAULT_FUZZY: bool = true;
 const DEFAULT_CASE_INSENSITIVE: bool = true;
 const DEFAULT_MAX_RESULTS: usize = 100;
-/// Directory mtimes do not change when an existing child is merely chmod'd.
-/// Periodic bounded revalidation keeps executable completion honest without
-/// rescanning every PATH directory on every keystroke.
-const PATH_CACHE_REVALIDATE: Duration = Duration::from_millis(200);
-/// A session can replace its PATH repeatedly. Directory scans are advisory,
-/// so clear-and-rebuild at this ceiling bounds retained filesystem-derived
-/// keys without changing completion results.
-const MAX_PATH_CACHE_DIRS: usize = 64;
-
-struct PathCacheEntry {
-    dir_mtime: Option<SystemTime>,
-    scanned_at: Instant,
-    names: Vec<String>,
-}
-
 impl ShoalCompleter {
     pub fn new(
         env: Env,
@@ -83,10 +68,9 @@ impl ShoalCompleter {
         Self {
             env,
             cwd,
-            path_dirs: None,
+            discovery: PathDiscovery::new(),
             adapters,
             adapter_names,
-            path_cache: HashMap::new(),
             fuzzy: DEFAULT_FUZZY,
             case_insensitive: DEFAULT_CASE_INSENSITIVE,
             max_results: DEFAULT_MAX_RESULTS,
@@ -107,7 +91,7 @@ impl ShoalCompleter {
     /// means an older remote omitted the projection, in which case retaining
     /// the process-PATH fallback preserves protocol compatibility.
     pub(crate) fn with_path_dirs(mut self, path_dirs: Arc<Mutex<Option<Vec<PathBuf>>>>) -> Self {
-        self.path_dirs = Some(path_dirs);
+        self.discovery.set_session_dirs(path_dirs);
         self
     }
 
@@ -122,69 +106,12 @@ impl ShoalCompleter {
     /// its mtime has changed since the last call (or it hasn't been seen
     /// before) — cheap enough to call on every Tab press.
     fn path_names(&mut self) -> Vec<String> {
-        let mut out = Vec::new();
-        let configured = self
-            .path_dirs
-            .as_ref()
-            .and_then(|dirs| dirs.lock().ok().and_then(|dirs| dirs.clone()));
-        let dirs = if let Some(dirs) = configured {
-            dirs
-        } else {
-            let Some(path_var) = std::env::var_os("PATH") else {
-                return out;
-            };
-            let cwd = self.cwd();
-            std::env::split_paths(&path_var)
-                .map(|dir| {
-                    if dir.is_absolute() {
-                        dir
-                    } else {
-                        cwd.join(dir)
-                    }
-                })
-                .collect()
-        };
-        for dir in dirs {
-            out.extend(self.path_dir_names(&dir));
-        }
-        out
+        let cwd = self.cwd();
+        self.discovery.path_names(&cwd)
     }
 
     fn path_dir_names(&mut self, dir: &Path) -> Vec<String> {
-        let mtime = fs::metadata(dir).and_then(|m| m.modified()).ok();
-        let stale = match self.path_cache.get(dir) {
-            Some(cached) => {
-                cached.dir_mtime != mtime || cached.scanned_at.elapsed() >= PATH_CACHE_REVALIDATE
-            }
-            None => true,
-        };
-        if stale {
-            let mut names = Vec::new();
-            if let Ok(entries) = fs::read_dir(dir) {
-                for entry in entries.flatten().take(4000) {
-                    let executable = entry.metadata().is_ok_and(|metadata| {
-                        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
-                    });
-                    if executable && let Some(name) = entry.file_name().to_str() {
-                        names.push(name.to_string());
-                    }
-                }
-            }
-            if self.path_cache.len() >= MAX_PATH_CACHE_DIRS && !self.path_cache.contains_key(dir) {
-                self.path_cache.clear();
-            }
-            self.path_cache.insert(
-                dir.to_path_buf(),
-                PathCacheEntry {
-                    dir_mtime: mtime,
-                    scanned_at: Instant::now(),
-                    names,
-                },
-            );
-        }
-        self.path_cache
-            .get(dir)
-            .map_or_else(Vec::new, |cached| cached.names.clone())
+        self.discovery.path_dir_names(dir)
     }
 
     fn adapter_lookup(&self, head: &str) -> Option<&CmdAdapter> {
@@ -319,50 +246,10 @@ impl ShoalCompleter {
     /// against the word's own directory prefix — `crates/sho` re-scans
     /// `crates/` fresh, so newly created files/directories show up.
     fn fs_candidates(&self, word: &str) -> Vec<String> {
-        let (dir_part, file_prefix) = split_dir_prefix(word);
-        let base_dir = self.resolve_dir(&dir_part);
-        let mut out = Vec::new();
-        let Ok(entries) = fs::read_dir(&base_dir) else {
-            return out;
-        };
-        let show_hidden = file_prefix.starts_with('.');
-        for entry in entries.flatten() {
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                continue;
-            };
-            if !show_hidden && name.starts_with('.') {
-                continue;
-            }
-            if !self.candidate_matches(&name, &file_prefix) {
-                continue;
-            }
-            let is_dir = entry.path().is_dir();
-            let mut value = format!("{dir_part}{name}");
-            if is_dir {
-                value.push('/');
-            }
-            out.push(value);
-        }
-        out
-    }
-
-    fn resolve_dir(&self, dir_part: &str) -> PathBuf {
-        if dir_part.is_empty() {
-            return self.cwd();
-        }
-        let expanded = if let Some(tail) = dir_part.strip_prefix("~/") {
-            match std::env::var_os("HOME") {
-                Some(home) => PathBuf::from(home).join(tail),
-                None => PathBuf::from(dir_part),
-            }
-        } else {
-            PathBuf::from(dir_part)
-        };
-        if expanded.is_absolute() {
-            expanded
-        } else {
-            self.cwd().join(expanded)
-        }
+        let cwd = self.cwd();
+        filesystem_candidates(&cwd, word, |name, prefix| {
+            self.candidate_matches(name, prefix)
+        })
     }
 }
 
@@ -427,48 +314,23 @@ fn finish(mut names: Vec<String>, start: usize, pos: usize, max_results: usize) 
         .collect()
 }
 
-fn split_dir_prefix(word: &str) -> (String, String) {
-    match word.rfind('/') {
-        Some(idx) => (word[..=idx].to_string(), word[idx + 1..].to_string()),
-        None => (String::new(), word.to_string()),
-    }
-}
-
 /// Scan adapter config directories for `[cmd.<name>]` table keys — just the
 /// name enumeration `AdapterCatalog` doesn't expose publicly (see
 /// api_changes); flag/subcommand data still goes through the real
 /// `AdapterCatalog::load_dir` + `lookup`.
 pub fn scan_adapter_names(dirs: &[PathBuf]) -> Vec<String> {
-    let mut names: BTreeSet<String> = BTreeSet::new();
-    for dir in dirs {
-        let Ok(entries) = fs::read_dir(dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().is_none_or(|e| e != "toml") {
-                continue;
-            }
-            let Ok(src) = fs::read_to_string(&path) else {
-                continue;
-            };
-            let Ok(doc) = src.parse::<toml::Value>() else {
-                continue;
-            };
-            if let Some(cmds) = doc.get("cmd").and_then(toml::Value::as_table) {
-                names.extend(cmds.keys().cloned());
-            }
-        }
-    }
-    names.into_iter().collect()
+    adapter_names(dirs)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use shoal_value::Env;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     fn completer_at(cwd: &Path) -> ShoalCompleter {
         ShoalCompleter::new(
@@ -1010,7 +872,7 @@ mod tests {
         for index in 0..MAX_PATH_CACHE_DIRS {
             completer.path_dir_names(&root.path().join(format!("missing-{index}")));
         }
-        assert_eq!(completer.path_cache.len(), MAX_PATH_CACHE_DIRS);
+        assert_eq!(completer.discovery.cache_len(), MAX_PATH_CACHE_DIRS);
 
         let current = root.path().join("current");
         fs::create_dir(&current).unwrap();
@@ -1024,8 +886,8 @@ mod tests {
             completer.path_dir_names(&current),
             vec!["bounded-tool".to_string()]
         );
-        assert_eq!(completer.path_cache.len(), 1);
-        assert!(completer.path_cache.contains_key(&current));
+        assert_eq!(completer.discovery.cache_len(), 1);
+        assert!(completer.discovery.cache_contains(&current));
     }
 
     #[test]
