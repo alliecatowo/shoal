@@ -160,6 +160,11 @@ mod tests {
         )
     }
 
+    fn declare(env: &Env, name: impl Into<String>, value: Value, mutable: bool) {
+        env.declare(name, value, mutable)
+            .expect("completion test binding stays within the environment quota");
+    }
+
     #[test]
     fn classify_empty_line_is_head() {
         let env = Env::root();
@@ -231,7 +236,7 @@ mod tests {
         // A bound receiver followed by `.<word>` is method/field position, not
         // a plain expr reference — so completion offers method names.
         let env = Env::root();
-        env.declare("items", Value::List(vec![Value::Int(1)]), false);
+        declare(&env, "items", Value::List(vec![Value::Int(1)]), false);
         let ctx = classify(&env, "items.le", 8);
         assert_eq!(
             ctx,
@@ -249,7 +254,7 @@ mod tests {
         // The same bound receiver with a trailing space (no `.`) is plain expr
         // position: variable/function/keyword completion, not method names.
         let env = Env::root();
-        env.declare("items", Value::Int(1), false);
+        declare(&env, "items", Value::Int(1), false);
         let ctx = classify(&env, "items ", 6);
         assert_eq!(
             ctx,
@@ -305,7 +310,7 @@ mod tests {
         // method names (`where`); the same prefix in plain expr position
         // (`let x = wh`) offers variables/keywords, never method names.
         let env = Env::root();
-        env.declare("tbl", Value::List(vec![Value::Int(1)]), false);
+        declare(&env, "tbl", Value::List(vec![Value::Int(1)]), false);
         let mut c = ShoalCompleter::new(
             env,
             Arc::new(Mutex::new(PathBuf::from("."))),
@@ -466,7 +471,12 @@ mod tests {
     fn method_completion_infers_binding_receiver_type() {
         // `xs.` where `xs` is a live list binding → list methods, not str ops.
         let env = Env::root();
-        env.declare("xs", Value::List(vec![Value::Int(1), Value::Int(2)]), false);
+        declare(
+            &env,
+            "xs",
+            Value::List(vec![Value::Int(1), Value::Int(2)]),
+            false,
+        );
         let mut c = completer_with(env);
         let cs = cands(&mut c, "xs.");
         assert!(
@@ -481,7 +491,7 @@ mod tests {
 
         // A str binding narrows to str methods.
         let env2 = Env::root();
-        env2.declare("name", Value::Str("bob".into()), false);
+        declare(&env2, "name", Value::Str("bob".into()), false);
         let mut c2 = completer_with(env2);
         let cs2 = cands(&mut c2, "name.");
         assert!(
@@ -500,10 +510,16 @@ mod tests {
         // (`upper`) and a list method (`where`) — the tell-tale of "not
         // narrowed". Every fallback case below must keep that full vocabulary.
         let env = Env::root();
-        env.declare("rec", Value::Record(shoal_value::Record::new()), false);
-        env.declare("xs", Value::List(vec![Value::Int(1)]), false);
+        declare(
+            &env,
+            "rec",
+            Value::Record(shoal_value::Record::new()),
+            false,
+        );
+        declare(&env, "xs", Value::List(vec![Value::Int(1)]), false);
         // A command binding: a type with no dedicated method table → union.
-        env.declare(
+        declare(
+            &env,
             "f",
             Value::CmdRef(Arc::new(shoal_ast::CmdCall {
                 head: "echo".into(),
@@ -547,8 +563,9 @@ mod tests {
     #[test]
     fn head_candidates_include_callable_session_names_but_not_plain_vars() {
         let env = Env::root();
-        env.declare("mydata", Value::Int(3), false);
-        env.declare(
+        declare(&env, "mydata", Value::Int(3), false);
+        declare(
+            &env,
             "deploy",
             Value::CmdRef(Arc::new(shoal_ast::CmdCall {
                 head: "echo".into(),
@@ -576,7 +593,7 @@ mod tests {
     #[test]
     fn expr_candidates_include_in_scope_variables() {
         let env = Env::root();
-        env.declare("myvar", Value::Int(1), false);
+        declare(&env, "myvar", Value::Int(1), false);
         let c = completer_at(Path::new("."));
         // Use the completer's own env for this assertion instead.
         let names_env = env.visible_names();
@@ -806,7 +823,7 @@ params = { adapter_only = "bool" }
     #[test]
     fn fuzzy_false_restricts_to_strict_prefix_matches() {
         let fuzzy_env = Env::root();
-        fuzzy_env.declare("myservice", Value::Int(1), false);
+        declare(&fuzzy_env, "myservice", Value::Int(1), false);
         let fuzzy = ShoalCompleter::new(
             fuzzy_env,
             Arc::new(Mutex::new(PathBuf::from("."))),
@@ -823,7 +840,7 @@ params = { adapter_only = "bool" }
         );
 
         let strict_env = Env::root();
-        strict_env.declare("myservice", Value::Int(1), false);
+        declare(&strict_env, "myservice", Value::Int(1), false);
         let strict = ShoalCompleter::new(
             strict_env,
             Arc::new(Mutex::new(PathBuf::from("."))),
@@ -851,7 +868,7 @@ params = { adapter_only = "bool" }
     #[test]
     fn case_insensitive_false_requires_exact_case() {
         let env = Env::root();
-        env.declare("MyThing", Value::Int(1), false);
+        declare(&env, "MyThing", Value::Int(1), false);
         let c = ShoalCompleter::new(
             env,
             Arc::new(Mutex::new(PathBuf::from("."))),
