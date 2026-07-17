@@ -197,10 +197,9 @@ opaque = "ask"
             "the kernel plan gate must not contradict the concrete spawn gate"
         );
 
-        let pinned = Policy::from_toml(
-            "[principal.agent]\nproc_spawn=['cargo']\nauto_apply='in-grant'\n",
-        )
-        .unwrap();
+        let pinned =
+            Policy::from_toml("[principal.agent]\nproc_spawn=['cargo']\nauto_apply='in-grant'\n")
+                .unwrap();
         assert_eq!(pinned.evaluate_plan("agent", &spawn), Verdict::Deny);
     }
 

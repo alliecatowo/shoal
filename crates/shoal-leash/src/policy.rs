@@ -180,9 +180,7 @@ impl Policy {
             // already follows this contract; plan evaluation must apply the
             // same semantics or a kernel rejects an ordinary command before
             // execution reaches that gate.
-            if matches!(effect, Effect::ProcSpawn { .. })
-                && !self.spawn_pinning_active(principal)
-            {
+            if matches!(effect, Effect::ProcSpawn { .. }) && !self.spawn_pinning_active(principal) {
                 continue;
             }
             match self.evaluate_effect(principal, effect) {
