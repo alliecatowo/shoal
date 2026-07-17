@@ -81,20 +81,20 @@ struct RawModeGuard {
 }
 
 impl RawModeGuard {
-    /// Put `fd` into raw mode; `None` if it is not a tty or termios fails.
-    fn new(fd: RawFd) -> Option<Self> {
+    /// Put an already-validated terminal `fd` into raw mode.
+    fn new(fd: RawFd) -> io::Result<Self> {
         // SAFETY: termios syscalls on a caller-owned fd with valid pointers.
         unsafe {
             let mut term = mem::zeroed::<libc::termios>();
             if libc::tcgetattr(fd, &raw mut term) != 0 {
-                return None;
+                return Err(io::Error::last_os_error());
             }
             let orig = term;
             libc::cfmakeraw(&raw mut term);
             if libc::tcsetattr(fd, libc::TCSANOW, &raw const term) != 0 {
-                return None;
+                return Err(io::Error::last_os_error());
             }
-            Some(RawModeGuard { fd, orig })
+            Ok(RawModeGuard { fd, orig })
         }
     }
 }
@@ -380,7 +380,7 @@ impl PtyJob {
         // Raw mode only when actually forwarding a real terminal; restored on
         // every exit path (panics included) when the guard drops.
         let _raw = if foreground && self.forward_tty {
-            RawModeGuard::new(0)
+            Some(RawModeGuard::new(0)?)
         } else {
             None
         };
@@ -882,6 +882,15 @@ mod tests {
         assert_eq!(after.c_cflag, before.c_cflag);
         assert_eq!(after.c_lflag, before.c_lflag);
         assert_eq!(after.c_cc, before.c_cc);
+    }
+
+    #[test]
+    fn raw_mode_setup_preserves_the_os_error() {
+        let error = match RawModeGuard::new(-1) {
+            Ok(_) => panic!("invalid terminal fd must fail closed"),
+            Err(error) => error,
+        };
+        assert_eq!(error.raw_os_error(), Some(libc::EBADF));
     }
 
     /// The core job-control contract this module implements: a child that
