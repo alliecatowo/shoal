@@ -1,0 +1,21 @@
+[package]
+name = "shoal-host"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde_json = "1"
+shoal-adapters = { path = "../shoal-adapters" }
+shoal-config = { path = "../shoal-config" }
+shoal-eval = { path = "../shoal-eval" }
+shoal-leash = { path = "../shoal-leash" }
+shoal-paths = { path = "../shoal-paths" }
+shoal-syntax = { path = "../shoal-syntax" }
+shoal-value = { path = "../shoal-value" }
+
+[dev-dependencies]
+shoal-ast = { path = "../shoal-ast" }
+tempfile = "3"

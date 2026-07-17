@@ -17,7 +17,7 @@ use reedline::{
 use shoal_ast::{CmdArg, Expr, Program, Stmt, UnOp};
 use shoal_eval::Evaluator;
 use shoal_journal::{Journal, JournalQuery};
-use shoal_syntax::{ParseCtx, parse, parse_with_ctx};
+use shoal_syntax::{ParseCtx, parse_with_ctx};
 use shoal_value::{Env, Value};
 
 use crate::completer::{self, ShoalCompleter};
@@ -27,18 +27,18 @@ use crate::{format_parse_error, maybe_strip, no_color, report_eval_error};
 
 pub(crate) fn repl() -> Result<i32, String> {
     let cwd = std::env::current_dir().map_err(|e| format!("cannot determine cwd: {e}"))?;
-    let loaded = shoal_config::load(&shoal_config::LoadOptions::discover(&cwd))?;
+    let bootstrap = shoal_host::SessionBootstrap::discover(&cwd).map_err(|e| e.to_string())?;
     // Before anything else prints: feed `render.color` into `no_color()` so
     // even these very warnings honor a `render.color = false` in `shoal.toml`
     // (site/content/internals/configuration-reference.md), the same way `NO_COLOR` already does.
-    crate::apply_render_color_config(loaded.config.render.color);
-    for warning in &loaded.warnings {
+    crate::apply_render_color_config(bootstrap.config().render.color);
+    for warning in bootstrap.config_warnings() {
         eprintln!(
             "{}",
             maybe_strip(format!("\x1b[33;1mwarning:\x1b[0m config error: {warning}"))
         );
     }
-    let config = loaded.config;
+    let config = bootstrap.config().clone();
     // `render.paging`/`render.pager` (site/content/internals/configuration-reference.md): resolved once, here,
     // from the loaded config — not re-read per keystroke/render. `enabled`
     // defaults to `false` (config default `"never"`), so an unconfigured
@@ -48,31 +48,14 @@ pub(crate) fn repl() -> Result<i32, String> {
         pager: config.render.pager.clone(),
     };
     let mut evaluator = Evaluator::new(cwd.clone());
-    evaluator.set_interactive(true);
-    // Wire the user reef scope (site/content/internals/reef-resolution.md) exactly like `run_source`
-    // does (crate::reef_user_manifest_path). The REPL builds its own
-    // `Evaluator` and was missing this call entirely — without it,
-    // `~/.config/shoal/shoal.toml`'s `[reef]` table engaged for `-c`/scripts
-    // but never for the interactive shell. Additive: an absent/empty file is
-    // exactly today's no-user-scope behavior.
-    if let Some(path) = crate::reef_user_manifest_path() {
-        evaluator.set_reef_user_manifest(path);
+    let bootstrap_report =
+        bootstrap.apply(&mut evaluator, shoal_host::Surface::Interactive, "human")?;
+    for warning in &bootstrap_report.warnings {
+        eprintln!(
+            "{}",
+            maybe_strip(format!("\x1b[33;1mwarning:\x1b[0m {warning}"))
+        );
     }
-    // `[aliases]`/`[env]` (site/content/internals/configuration-reference.md): same seeding `run_source` does,
-    // before any init file or typed input runs.
-    crate::seed_config_bindings(&mut evaluator, &config);
-    // `render.echo` (site/content/internals/configuration-reference.md): the interactive REPL keeps `all` (echo
-    // every result) by default; an explicit `render.echo` in config still wins.
-    evaluator.set_echo_mode(crate::resolve_echo_mode(
-        config.render.echo.as_deref(),
-        shoal_eval::EchoMode::All,
-    ));
-    // Inject the resolved config so in-language `config.get`/`config.all` read
-    // the same layered/validated config the REPL itself applied (parity with
-    // `run_source`), not a raw `shoal.toml` walked off the filesystem.
-    evaluator.set_config(Arc::new(shoal_value::ConfigSnapshot::new(
-        crate::config_snapshot_value(&config),
-    )));
     evaluator.set_statement_sink(Box::new(|v: &Value| {
         let _ = print_value(v);
     }));
@@ -111,23 +94,9 @@ pub(crate) fn repl() -> Result<i32, String> {
     // statement that produced `out[n]` recorded.
     let mut out_entries: Vec<Option<i64>> = Vec::new();
 
-    // Bundled pack + any `adapters.dirs` the config declares — the SAME
-    // sequence `-c`/script-file runs load (`crate::adapters`), so the REPL
-    // and every other path agree on one adapter catalog.
-    let (catalogs, adapter_warnings) =
-        crate::adapters::load_adapters(&mut evaluator, &config.adapters.dirs);
-    crate::adapters::print_warnings(&adapter_warnings);
-    let adapter_names =
-        completer::scan_adapter_names(&crate::adapters::name_scan_dirs(&config.adapters.dirs));
-
-    for init in &config.init.files {
-        let src = fs::read_to_string(init)
-            .map_err(|e| format!("cannot read init {}: {e}", init.display()))?;
-        let program = parse(&src).map_err(|e| format!("init {}: {e}", init.display()))?;
-        evaluator
-            .eval_program(&program)
-            .map_err(|e| format!("init {}: {e}", init.display()))?;
-    }
+    let catalogs = bootstrap_report.adapter_catalogs;
+    let adapter_names = completer::scan_adapter_names(&bootstrap_report.adapter_dirs);
+    bootstrap.run_init(&mut evaluator)?;
 
     // Ctrl-C must not kill the shell (site/content/internals/language-conformance-contract.md): install a real SIGINT
     // handler so the OS's default "terminate" disposition never fires while

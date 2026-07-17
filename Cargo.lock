@@ -2415,6 +2415,7 @@ dependencies = [
  "shoal-config",
  "shoal-doctor",
  "shoal-eval",
+ "shoal-host",
  "shoal-journal",
  "shoal-leash",
  "shoal-mcp",
@@ -2543,6 +2544,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "shoal-host"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "shoal-adapters",
+ "shoal-ast",
+ "shoal-config",
+ "shoal-eval",
+ "shoal-leash",
+ "shoal-paths",
+ "shoal-syntax",
+ "shoal-value",
+ "tempfile",
+]
+
+[[package]]
 name = "shoal-journal"
 version = "0.1.0"
 dependencies = [
@@ -2568,6 +2585,7 @@ dependencies = [
  "shoal-auth",
  "shoal-eval",
  "shoal-exec",
+ "shoal-host",
  "shoal-journal",
  "shoal-leash",
  "shoal-paths",
@@ -2596,6 +2614,9 @@ dependencies = [
 name = "shoal-lsp"
 version = "0.1.0"
 dependencies = [
+ "shoal-ast",
+ "shoal-eval",
+ "shoal-leash",
  "shoal-syntax",
  "tokio",
  "tower-lsp",

@@ -17,6 +17,7 @@ shoal-auth = { path = "../shoal-auth" }
 shoal-eval = { path = "../shoal-eval" }
 shoal-exec = { path = "../shoal-exec" }
 shoal-journal = { path = "../shoal-journal" }
+shoal-host = { path = "../shoal-host" }
 shoal-leash = { path = "../shoal-leash" }
 shoal-paths = { path = "../shoal-paths" }
 shoal-proto = { path = "../shoal-proto" }

@@ -161,6 +161,20 @@ impl AdapterCatalog {
         self.cmds.get(head)
     }
 
+    /// Overlay another catalog onto this one. Commands from `later` replace
+    /// commands with the same name, matching config's documented directory
+    /// precedence. The returned names are the commands that were replaced.
+    pub fn overlay(&mut self, later: &Self) -> Vec<String> {
+        let mut replaced = Vec::new();
+        for (name, command) in &later.cmds {
+            if self.cmds.insert(name.clone(), command.clone()).is_some() {
+                replaced.push(name.clone());
+            }
+        }
+        replaced.sort();
+        replaced
+    }
+
     /// The command heads this catalog knows. Order is unspecified — the sole
     /// caller (the evaluator's command did-you-mean, site/content/internals/language-conformance-contract.md) sorts/dedups
     /// across candidate sources — so this is just a cheap read view over the
@@ -811,6 +825,53 @@ fn rows_or_list(vals: Vec<Value>) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overlay_replaces_duplicates_but_keeps_disjoint_commands() {
+        let mut earlier = AdapterCatalog::empty();
+        earlier.cmds.insert(
+            "same".into(),
+            CmdAdapter {
+                name: "same".into(),
+                bin: "old".into(),
+                class: AdapterClass::Cli,
+                ok_codes: vec![0],
+                invoke_payload: InvokePayload::Arg,
+                top: SubSpec::default(),
+                subs: HashMap::new(),
+            },
+        );
+        earlier.cmds.insert(
+            "kept".into(),
+            CmdAdapter {
+                name: "kept".into(),
+                bin: "kept".into(),
+                class: AdapterClass::Cli,
+                ok_codes: vec![0],
+                invoke_payload: InvokePayload::Arg,
+                top: SubSpec::default(),
+                subs: HashMap::new(),
+            },
+        );
+        let mut later = AdapterCatalog::empty();
+        later.cmds.insert(
+            "same".into(),
+            CmdAdapter {
+                name: "same".into(),
+                bin: "new".into(),
+                class: AdapterClass::Cli,
+                ok_codes: vec![0],
+                invoke_payload: InvokePayload::Arg,
+                top: SubSpec::default(),
+                subs: HashMap::new(),
+            },
+        );
+
+        assert_eq!(earlier.overlay(&later), vec!["same"]);
+        assert_eq!(earlier.lookup("same").unwrap().bin, "new");
+        assert!(earlier.lookup("kept").is_some());
+    }
+
     #[test]
     fn loads_catalog_and_survives_bad_file() {
         let d = tempfile::tempdir().unwrap();

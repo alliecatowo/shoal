@@ -76,6 +76,19 @@ fn daemon_binds_secure_socket_and_attaches() {
     let socket = temp.path().join("run/session.sock");
     let state = temp.path().join("state");
     let admin_token = create_admin_token(&state);
+    let config_root = temp.path().join("config");
+    let config_dir = config_root.join("shoal");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let init = temp.path().join("init.shoal");
+    std::fs::write(&init, "env.FROM_INIT = \"init-value\"\n").unwrap();
+    std::fs::write(
+        config_dir.join("shoal.toml"),
+        format!(
+            "[env]\nFROM_CONFIG = \"config-value\"\n[init]\nfiles = [{}]\n",
+            serde_json::to_string(init.to_str().unwrap()).unwrap()
+        ),
+    )
+    .unwrap();
     let (stderr_file, stderr_path) = daemon_stderr_file(temp.path());
     let mut child = Command::new(env!("CARGO_BIN_EXE_shoal-kernel"))
         .args([
@@ -84,6 +97,7 @@ fn daemon_binds_secure_socket_and_attaches() {
             "--state-dir",
             state.to_str().unwrap(),
         ])
+        .env("XDG_CONFIG_HOME", &config_root)
         .stdout(Stdio::null())
         .stderr(stderr_file)
         .spawn()
@@ -158,6 +172,29 @@ fn daemon_binds_secure_socket_and_attaches() {
         &Request {
             jsonrpc: JSONRPC.into(),
             id: 3.into(),
+            method: "exec".into(),
+            params: serde_json::to_value(ExecParams {
+                src: "env.FROM_CONFIG + \":\" + env.FROM_INIT".into(),
+                mode: "run".into(),
+                position: "value".into(),
+                asynchronous: false,
+                timeout_ms: None,
+                elide: None,
+                plan_ref: None,
+            })
+            .unwrap(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        recv(&mut reader).result.unwrap()["value"],
+        serde_json::json!({"$": "str", "v": "config-value:init-value"})
+    );
+    write_frame(
+        &mut stream,
+        &Request {
+            jsonrpc: JSONRPC.into(),
+            id: 4.into(),
             method: "kernel.shutdown".into(),
             params: serde_json::json!({}),
         },
