@@ -64,6 +64,7 @@ pub(crate) struct Session {
     /// mutex guard. Fail closed instead of treating `PoisonError::into_inner`
     /// as validation of evaluator state.
     quarantined: AtomicBool,
+    last_used: Mutex<Instant>,
     /// The evaluator's in-language event bus, cached so wire publishes can
     /// inject into it without taking the evaluator lock (a long-running exec
     /// must not stall `events.publish`).
@@ -73,8 +74,14 @@ pub(crate) struct Session {
 }
 
 pub(crate) const MAX_TRANSCRIPT_PER_SESSION: usize = 4096;
+pub(crate) const MAX_SESSIONS_PER_PRINCIPAL: usize = 64;
+const IDLE_SESSION_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
 impl Session {
+    pub(crate) fn touch(&self) {
+        *self.last_used.lock().unwrap() = Instant::now();
+    }
+
     pub(crate) fn quarantine(&self) {
         self.quarantined.store(true, Ordering::SeqCst);
     }
@@ -108,13 +115,56 @@ impl Session {
 
 impl Kernel {
     /// Get-or-create the principal-private named session.
-    pub(crate) fn session(&self, name: &str, principal: &str) -> io::Result<Arc<Session>> {
+    pub(crate) fn session(&self, name: &str, principal: &str) -> Result<Arc<Session>, RpcError> {
         let key = SessionKey::new(principal, name);
         let mut sessions = self.sessions.lock().unwrap();
         if let Some(session) = sessions.get(&key) {
+            session.touch();
             return Ok(session.clone());
         }
-        let cwd = std::env::current_dir()?;
+
+        // Drop expired sessions only when the registry owns the final Arc:
+        // attachments, running/retained tasks, and live PTYs all hold leases.
+        let expired = sessions
+            .iter()
+            .filter(|(_, session)| Arc::strong_count(session) == 1)
+            .filter(|(_, session)| session.last_used.lock().unwrap().elapsed() > IDLE_SESSION_TTL)
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for expired_key in expired {
+            sessions.remove(&expired_key);
+            self.events.remove_owner(&expired_key.owner());
+        }
+
+        let owned = sessions
+            .iter()
+            .filter(|(session_key, _)| session_key.principal == principal)
+            .count();
+        if owned >= MAX_SESSIONS_PER_PRINCIPAL {
+            let victim = sessions
+                .iter()
+                .filter(|(session_key, session)| {
+                    session_key.principal == principal && Arc::strong_count(session) == 1
+                })
+                .min_by_key(|(_, session)| *session.last_used.lock().unwrap())
+                .map(|(session_key, _)| session_key.clone());
+            let Some(victim) = victim else {
+                return Err(RpcError {
+                    code: QUOTA_EXCEEDED,
+                    message: format!(
+                        "principal has reached the {MAX_SESSIONS_PER_PRINCIPAL}-session limit"
+                    ),
+                    data: Some(json!({
+                        "limit": "sessions_per_principal",
+                        "max": MAX_SESSIONS_PER_PRINCIPAL,
+                    })),
+                });
+            };
+            sessions.remove(&victim);
+            self.events.remove_owner(&victim.owner());
+        }
+
+        let cwd = std::env::current_dir().map_err(internal)?;
         let mut evaluator = Evaluator::new(cwd);
         // Long-lived agent/interactive sessions build up `j`/`jump` directory
         // history against the shared per-user store, same as the REPL (frecency
@@ -174,6 +224,7 @@ impl Kernel {
             id: name.into(),
             evaluator: Mutex::new(evaluator),
             quarantined: AtomicBool::new(false),
+            last_used: Mutex::new(Instant::now()),
             lang_bus,
             transcript: Mutex::new(HashMap::new()),
             next_value: AtomicU64::new(1),
@@ -246,7 +297,7 @@ impl Kernel {
             || profile == "supervisor"
             || token_caps.iter().any(|cap| cap == "plan.approve");
         let name = params.session.unwrap_or_else(|| "default".into());
-        let session = self.session(&name, &who).map_err(internal)?;
+        let session = self.session(&name, &who)?;
         session.ensure_healthy()?;
         let cwd = session
             .evaluator

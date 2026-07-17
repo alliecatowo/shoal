@@ -26,6 +26,7 @@ impl Kernel {
                     && let Some(attachment) = attached.as_ref()
                 {
                     attachment.session.ensure_healthy()?;
+                    attachment.session.touch();
                 }
                 match method.as_str() {
                     "session.attach" => self.handle_session_attach(params, client, attached),

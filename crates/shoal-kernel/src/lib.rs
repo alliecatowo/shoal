@@ -212,6 +212,8 @@ impl Drop for TaskWorkerGuard {
 /// its opener the same way [`TaskEntry`] scopes a task.
 struct PtyEntry {
     owner: OwnerKey,
+    /// Keeps the owning session non-idle/non-evictable for the PTY lifetime.
+    _session_lease: Arc<Session>,
     cmd: String,
     session: Mutex<shoal_exec::PtySession>,
     _active_slot: QuotaPermit,
@@ -1371,6 +1373,55 @@ mod tests {
             "the limit still applies within one exact owner"
         );
         drop((alpha_slot, beta_slot));
+    }
+
+    #[test]
+    fn session_registry_evicts_idle_lru_but_never_active_leases() {
+        let kernel = Kernel::new();
+        let principal = "agent:bounded-sessions";
+        let first = kernel.session("s0", principal).unwrap();
+        let first_owner = first.key.owner();
+        drop(first);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        for i in 1..MAX_SESSIONS_PER_PRINCIPAL {
+            drop(kernel.session(&format!("s{i}"), principal).unwrap());
+        }
+        kernel
+            .events
+            .publish_journal(&first_owner, 1, json!({"stale":true}));
+        assert_eq!(kernel.events.journal_published_count(&first_owner), 1);
+
+        drop(kernel.session("new", principal).unwrap());
+        let sessions = kernel.sessions.lock().unwrap();
+        assert_eq!(
+            sessions
+                .keys()
+                .filter(|key| key.principal == principal)
+                .count(),
+            MAX_SESSIONS_PER_PRINCIPAL
+        );
+        assert!(!sessions.contains_key(&SessionKey::new(principal, "s0")));
+        drop(sessions);
+        assert_eq!(
+            kernel.events.journal_published_count(&first_owner),
+            0,
+            "eviction removes the old owner's in-memory event indexes"
+        );
+
+        let active_kernel = Kernel::new();
+        let leases = (0..MAX_SESSIONS_PER_PRINCIPAL)
+            .map(|i| {
+                active_kernel
+                    .session(&format!("active-{i}"), principal)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let error = match active_kernel.session("over-limit", principal) {
+            Ok(_) => panic!("all active session leases must prevent eviction"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, QUOTA_EXCEEDED);
+        assert_eq!(leases.len(), MAX_SESSIONS_PER_PRINCIPAL);
     }
 
     #[test]

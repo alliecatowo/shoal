@@ -133,6 +133,7 @@ impl Kernel {
             pty_ref.clone(),
             Arc::new(PtyEntry {
                 owner,
+                _session_lease: session,
                 cmd: display.clone(),
                 session: Mutex::new(pty_session),
                 _active_slot: active_slot,

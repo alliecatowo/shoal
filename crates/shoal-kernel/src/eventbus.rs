@@ -549,6 +549,26 @@ impl EventBus {
         });
     }
 
+    /// Remove every in-memory channel cursor/index/subscription for an evicted
+    /// idle owner. Durable command history remains in the journal; event cursors
+    /// intentionally restart if that owner later recreates the session.
+    pub(crate) fn remove_owner(&self, owner: &OwnerKey) {
+        self.channels
+            .lock()
+            .unwrap()
+            .retain(|(channel_owner, _), _| channel_owner != owner);
+        self.journal_index.lock().unwrap().remove(owner);
+        self.transcript_index.lock().unwrap().remove(owner);
+        let mut subs = self.subs.lock().unwrap();
+        subs.retain(|subscriber| {
+            let keep = &subscriber.owner != owner;
+            if !keep {
+                subscriber.queue.close();
+            }
+            keep
+        });
+    }
+
     #[cfg(test)]
     pub(crate) fn subscriber_count(&self) -> usize {
         self.subs.lock().unwrap().len()
