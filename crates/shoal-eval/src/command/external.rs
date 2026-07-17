@@ -8,12 +8,24 @@ enum ProcessMode {
     Redirected(Position),
 }
 
+/// Ref-backed command values must stay comfortably below the lexical
+/// environment's per-binding retained-value ceiling. The CAS owns the complete
+/// bytes; this prefix is presentation only.
+const CAPTURE_REF_PREVIEW_BYTES: usize = 1024 * 1024;
+
+fn bound_ref_backed_preview(stdout: &mut Vec<u8>, has_spill: bool) {
+    if has_spill && stdout.len() > CAPTURE_REF_PREVIEW_BYTES {
+        stdout.truncate(CAPTURE_REF_PREVIEW_BYTES);
+        stdout.shrink_to_fit();
+    }
+}
+
 fn parse_adapter_output(meta: &ExecMeta, result: &shoal_exec::ExecResult) -> Option<Value> {
     // `stdout` is only a preview after a spill and can also be a truncated
     // prefix when capture hit its resident cap. A prefix that happens to end
     // on a row boundary must never masquerade as the command's complete
     // structured result.
-    if result.truncated || result.stdout_spill.is_some() {
+    if !result.stdout_is_complete() {
         return None;
     }
     shoal_adapters::parse_output(&meta.parse, &result.stdout, meta.output_type.as_deref())
@@ -233,6 +245,11 @@ impl Evaluator {
         let parsed = meta
             .as_ref()
             .and_then(|meta| parse_adapter_output(meta, &r));
+        // A capture spill already preserves the complete stream in the CAS.
+        // Retaining the executor's much larger transient preview in every
+        // lexical binding would defeat that indirection and can exceed the
+        // environment's aggregate retained-value budget.
+        bound_ref_backed_preview(&mut r.stdout, r.stdout_spill.is_some());
         // Take the resident stdout once (it is the bounded preview when a spill
         // occurred, the whole thing otherwise) and share the one allocation
         // between the outcome's `.stdout` and any site/content/internals/language-conformance-contract.md ref-backed view.
@@ -404,13 +421,17 @@ mod adapter_output_boundary_tests {
 
         output.truncated = true;
         assert_eq!(parse_adapter_output(&meta(), &output), None);
-        output.truncated = false;
-        output.stdout_spill = Some(shoal_exec::CaptureSpill {
-            path: PathBuf::from("unused-test-spill"),
-            hash: "00".repeat(32),
-            len: output.stdout.len() as u64 + 1,
-            truncated: false,
-        });
-        assert_eq!(parse_adapter_output(&meta(), &output), None);
+    }
+
+    #[test]
+    fn ref_backed_preview_is_reduced_before_lexical_retention() {
+        let mut stdout = vec![b'x'; CAPTURE_REF_PREVIEW_BYTES * 2];
+        bound_ref_backed_preview(&mut stdout, true);
+        assert_eq!(stdout.len(), CAPTURE_REF_PREVIEW_BYTES);
+        assert_eq!(stdout.capacity(), CAPTURE_REF_PREVIEW_BYTES);
+
+        let mut resident = vec![b'x'; CAPTURE_REF_PREVIEW_BYTES + 1];
+        bound_ref_backed_preview(&mut resident, false);
+        assert_eq!(resident.len(), CAPTURE_REF_PREVIEW_BYTES + 1);
     }
 }

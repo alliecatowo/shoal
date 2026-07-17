@@ -199,22 +199,30 @@ nonzero. Exit status and fatal signal are successful execution results.
 
 ## Memory capture bound
 
-The default in-memory cap is 64 MiB per captured stream. It resolves once from positive
-`SHOAL_CAPTURE_CAP_BYTES` or the default, unless the process-level atomic override setter is called.
-Zero overrides clamp to one byte.
+The default in-memory cap is 64 MiB per captured stream, with a separate 256 MiB process-wide
+admission ceiling across active capture drains. The per-stream cap resolves once from positive
+`SHOAL_CAPTURE_CAP_BYTES`; the aggregate cap resolves from
+`SHOAL_CAPTURE_AGGREGATE_CAP_BYTES`. Both have hard maxima and their atomic override setters clamp
+zero to one byte.
 
 `drain_capped` continues reading to EOF after the buffer reaches the cap, discarding overflow and
 setting `truncated`. Continuing the drain prevents pipe backpressure from blocking the child.
 
-Stdout and stderr each have a resident buffer, so the normal maximum is approximately twice the cap
-plus overhead. PTY has one merged buffer.
+Stdout and stderr each request a resident lease before allocating. When concurrent captures exhaust
+the aggregate ceiling, a drain receives only the remaining budget (possibly zero), continues to EOF,
+and honestly reports truncation or spills stdout. Leases are returned when the drain hands its bytes
+to the result. Long-lived evaluator bindings are independently charged to the lexical environment's
+retained-value budget. PTY capture has its own merged-buffer bound.
 
 
 ## Disk-spill state machine
 
 Only stdout can spill, only in capture mode, and only when `ExecSpec.spill` supplies an existing
-directory. The default spill cap is 1 GiB, resolved from positive
-`SHOAL_CAPTURE_SPILL_CAP_BYTES` or an atomic override.
+directory. The default per-stream spill cap is 256 MiB, resolved from positive
+`SHOAL_CAPTURE_SPILL_CAP_BYTES` or an atomic override. A second 512 MiB process-wide active-spill
+ceiling (`SHOAL_CAPTURE_AGGREGATE_SPILL_CAP_BYTES`) and a 16-file admission limit prevent concurrent
+captures from multiplying the per-stream bound without limit. Hard maxima are 512 MiB per stream and
+1 GiB aggregate.
 
 ```mermaid
 stateDiagram-v2
@@ -240,9 +248,10 @@ overflow tail are written so the file begins at byte zero. BLAKE3 hashes exactly
 stored. Reads continue to EOF even after the disk cap, but extra bytes are discarded and
 `CaptureSpill.truncated` is true.
 
-The returned `CaptureSpill` contains path, hash, stored length, and its own truncation flag. Ownership
-passes to the caller, which must adopt/move it into the CAS or remove it. `shoal-exec` deliberately
-does not depend on the journal/CAS crate.
+The returned `CaptureSpill` contains path, hash, stored length, and its own truncation flag. Its clones
+share an RAII owner: the final drop removes an unadopted file and returns its file/byte reservation.
+Moving the file into the CAS makes that cleanup a harmless `NotFound`. `shoal-exec` deliberately does
+not depend on the journal/CAS crate.
 
 When a spill exists, `ExecResult.stdout` remains the bounded preview. `ExecResult.truncated` does not
 mean stdout was lost merely because it spilled; it reflects stderr loss or spill truncation as
@@ -252,8 +261,10 @@ assembled by the capture path. Consumers must inspect both result and spill meta
 
 The evaluator's command path requests a spill when a journal/CAS context is available, then adopts
 the caller-owned file. A successfully adopted large value becomes lazy `CasBytes`/an outcome stdout
-reference. Redirects and `.feed` must load full content through `stdout_bytes`, not write only the
-resident preview.
+reference. Because the CAS owns the complete bytes, the evaluator reduces the retained presentation
+preview to 1 MiB before the value enters a lexical environment; this keeps ref-backed values within
+the independent per-binding budget. Redirects and `.feed` must load full content through
+`stdout_bytes`, not write only the resident preview.
 
 Any error between process return and adoption must clean up the temporary file. Tests should cover
 successful adoption, adoption failure, no-journal behavior, disk-cap truncation, and redirects from
@@ -291,8 +302,8 @@ and the kernel executing the path; the status must not claim atomic verified exe
 | stdin file open | return I/O error before child |
 | sandbox/pin/helper failure | return before unapproved spawn, subject to nonhermetic degrade rules |
 | OS spawn including `E2BIG` | propagate `io::Error` |
-| reader thread panic | substitute empty/default drain result; child still reaped |
-| spill create/write/flush failure | drain, fall back to preview/truncation, remove invalid file where possible |
+| reader thread panic | substitute an empty truncated drain result; child still reaped |
+| spill create/write/flush failure | drain, fall back to preview/truncation, deterministically remove the invalid file |
 | caller drops streaming child | kill group and reap |
 | process exits nonzero | return `ExecResult`, not `io::Error` |
 
@@ -300,8 +311,10 @@ and the kernel executing the path; the status must not claim atomic verified exe
 
 Capture limits are process-global atomics, not fields in `ExecSpec` or evaluator/session config.
 The first environment lookup is cached. Tests and multiple kernel sessions can affect one another if
-they call setters concurrently or assume per-session limits. Moving limits into requests would make
-resource budgets composable but requires plumbing through every execution host.
+they call setters concurrently or assume per-session limits. The aggregate counters constrain active
+drains/files process-wide; returned resident buffers are instead governed by their owner's retention
+budget. Moving every limit into requests would make resource budgets composable but requires plumbing
+through every execution host.
 
 ## Change protocol
 
@@ -321,10 +334,12 @@ resource budgets composable but requires plumbing through every execution host.
 
 - Unix-specific `setpgid`, signals, permissions, and wait status are foundational; there is no
   Windows execution backend.
-- Capture caps are process-global and cached.
+- Capture caps are process-global and cached; active admission is not fair between concurrent streams.
 - Stderr never spills and can lose content above the resident cap.
-- Spill write errors are treated like reaching the storage bound rather than preserving a detailed
-  error cause for the caller.
+- Spill create/read/write/flush errors degrade to a truncated resident preview; the detailed I/O cause
+  is not carried in `ExecResult`.
+- Spill flush establishes kernel-page-cache acceptance, not power-loss durability (`fsync` is not
+  performed). The journal/CAS adoption path owns its own durability contract.
 - Sandbox pin verification has a TOCTOU gap.
 - Network policy has no enforcing backend in the current spawn wrapper.
 - Nonhermetic sandbox requests can degrade to an unconfined child, though status is honest.

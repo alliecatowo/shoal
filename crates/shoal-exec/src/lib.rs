@@ -38,6 +38,7 @@
 mod bounded;
 mod cancel;
 mod capture;
+mod capture_budget;
 mod pty;
 mod pty_session;
 mod sandbox;
@@ -55,6 +56,15 @@ use std::sync::{Arc, Mutex};
 pub use bounded::{BoundedCommandOutput, run_bounded_command};
 pub use cancel::CancelToken;
 pub use capture::{StreamingChild, spawn_capture};
+pub use capture_budget::{
+    DEFAULT_CAPTURE_AGGREGATE_MEMORY_CAP, DEFAULT_CAPTURE_AGGREGATE_SPILL_CAP,
+    MAX_ACTIVE_CAPTURE_SPILL_FILES, MAX_CAPTURE_AGGREGATE_MEMORY_CAP,
+    MAX_CAPTURE_AGGREGATE_SPILL_CAP, MAX_CAPTURE_HARD_CAP, MAX_CAPTURE_SPILL_CAP,
+    aggregate_memory_cap as capture_aggregate_memory_cap,
+    aggregate_spill_cap as capture_aggregate_spill_cap,
+    set_aggregate_memory_cap as set_capture_aggregate_memory_cap,
+    set_aggregate_spill_cap as set_capture_aggregate_spill_cap,
+};
 pub use pty::{PtyJob, shutdown_stopped_jobs, take_background_job, take_stopped_job};
 pub use pty_session::{
     PTY_DEFAULT_COLS, PTY_DEFAULT_ROWS, PTY_MAX_COLS, PTY_MAX_ROWS, PtyOpenSpec, PtySession,
@@ -107,10 +117,11 @@ pub const DEFAULT_CAPTURE_HARD_CAP: usize = 64 * 1024 * 1024;
 /// Default hard cap on the bytes streamed to a **disk** spill file when a
 /// capture requests one ([`ExecSpec::spill`]) and its output exceeds the RAM
 /// cap. Bounds disk the way [`DEFAULT_CAPTURE_HARD_CAP`] bounds RAM: without
-/// it, `let x = (yes)` would fill the disk instead of OOMing. 1 GiB is large
-/// enough that real captures (build logs, `cat huge.log`) spill whole; past it
-/// the spill stops and [`CaptureSpill::truncated`] is set.
-pub const DEFAULT_CAPTURE_SPILL_CAP: u64 = 1024 * 1024 * 1024;
+/// it, `let x = (yes)` would fill the disk instead of OOMing. 256 MiB is large
+/// enough that ordinary captures spill whole; past it the spill stops and
+/// [`CaptureSpill::truncated`] is set. A process-wide aggregate ceiling is
+/// enforced independently across concurrent files.
+pub const DEFAULT_CAPTURE_SPILL_CAP: u64 = 256 * 1024 * 1024;
 
 /// `0` sentinel = not yet resolved; the first [`capture_hard_cap`] call seeds it
 /// from the `SHOAL_CAPTURE_CAP_BYTES` env var (a positive integer) or the
@@ -129,15 +140,16 @@ pub fn capture_hard_cap() -> usize {
         .ok()
         .and_then(|s| s.trim().parse::<usize>().ok())
         .filter(|&n| n > 0)
-        .unwrap_or(DEFAULT_CAPTURE_HARD_CAP);
+        .unwrap_or(DEFAULT_CAPTURE_HARD_CAP)
+        .min(MAX_CAPTURE_HARD_CAP);
     CAPTURE_HARD_CAP.store(resolved, Ordering::Relaxed);
     resolved
 }
 
-/// Override the in-memory capture hard cap (bytes). For hosts wiring config and
-/// for tests; `0` is clamped to `1` so the cap is always positive.
+/// Override the in-memory per-stream cap. Values are clamped to the hard sane
+/// range `1..=MAX_CAPTURE_HARD_CAP`.
 pub fn set_capture_hard_cap(bytes: usize) {
-    CAPTURE_HARD_CAP.store(bytes.max(1), Ordering::Relaxed);
+    CAPTURE_HARD_CAP.store(bytes.clamp(1, MAX_CAPTURE_HARD_CAP), Ordering::Relaxed);
 }
 
 /// `0` sentinel = not yet resolved (see [`CAPTURE_HARD_CAP`]).
@@ -155,15 +167,16 @@ pub fn capture_spill_cap() -> u64 {
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|&n| n > 0)
-        .unwrap_or(DEFAULT_CAPTURE_SPILL_CAP);
+        .unwrap_or(DEFAULT_CAPTURE_SPILL_CAP)
+        .min(MAX_CAPTURE_SPILL_CAP);
     CAPTURE_SPILL_CAP.store(resolved, Ordering::Relaxed);
     resolved
 }
 
-/// Override the disk-spill hard cap (bytes). For hosts wiring config and for
-/// tests; `0` is clamped to `1` so the cap is always positive.
+/// Override the per-stream disk-spill cap. Values are clamped to the hard sane
+/// range `1..=MAX_CAPTURE_SPILL_CAP`.
 pub fn set_capture_spill_cap(bytes: u64) {
-    CAPTURE_SPILL_CAP.store(bytes.max(1), Ordering::Relaxed);
+    CAPTURE_SPILL_CAP.store(bytes.clamp(1, MAX_CAPTURE_SPILL_CAP), Ordering::Relaxed);
 }
 
 /// A fully-resolved request to execute one external process.
@@ -214,19 +227,60 @@ pub struct SpillConfig {
 /// streamed to disk (site/content/internals/language-conformance-contract.md). The file at [`CaptureSpill::path`] holds the
 /// captured bytes (the full stream unless [`CaptureSpill::truncated`]), and
 /// [`CaptureSpill::hash`] is their blake3, so the caller can adopt it into a
-/// content-addressed store as a ref-backed value. The caller **owns** the file:
-/// it must move it into the store or delete it.
+/// content-addressed store as a ref-backed value. Moving the file transfers its
+/// content; if the value is simply dropped, Shoal removes the temporary file
+/// and releases its process-wide spill reservation deterministically.
 #[derive(Debug, Clone)]
 pub struct CaptureSpill {
-    /// Path of the on-disk spill file (caller-owned; see the type docs).
+    /// Path of the on-disk spill file. The shared owner removes it on final
+    /// drop unless the caller has moved it into durable storage.
     pub path: PathBuf,
     /// blake3 hex of the bytes actually stored in the file.
     pub hash: String,
-    /// Length in bytes of the stored content (== the value's true length).
+    /// Length in bytes of the stored content (the value's true length unless
+    /// [`CaptureSpill::truncated`] is set).
     pub len: u64,
     /// `true` when the stream itself exceeded [`capture_spill_cap`] and the
     /// spill was truncated to that bound (the stored bytes are a prefix).
     pub truncated: bool,
+    _ownership: Arc<CaptureSpillOwnership>,
+}
+
+#[derive(Debug)]
+struct CaptureSpillOwnership {
+    path: PathBuf,
+    _lease: capture_budget::SpillLease,
+}
+
+impl Drop for CaptureSpillOwnership {
+    fn drop(&mut self) {
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => {}
+        }
+    }
+}
+
+impl CaptureSpill {
+    pub(crate) fn new(
+        path: PathBuf,
+        hash: String,
+        len: u64,
+        truncated: bool,
+        lease: capture_budget::SpillLease,
+    ) -> Self {
+        Self {
+            _ownership: Arc::new(CaptureSpillOwnership {
+                path: path.clone(),
+                _lease: lease,
+            }),
+            path,
+            hash,
+            len,
+            truncated,
+        }
+    }
 }
 
 /// What to connect to the child's stdin.
@@ -368,6 +422,14 @@ pub struct ExecResult {
     /// honesty) — never `enforced: true` unless it really was. `None` means
     /// no sandbox was requested; it does not mean one was silently applied.
     pub enforcement: Option<shoal_leash::EnforcementStatus>,
+}
+
+impl ExecResult {
+    /// Whether `stdout` contains the complete stream rather than a bounded
+    /// prefix. Callers must check this before interpreting it structurally.
+    pub fn stdout_is_complete(&self) -> bool {
+        !self.truncated && self.stdout_spill.is_none()
+    }
 }
 
 /// Install the interactive shell's job-control signal dispositions (site/content/internals/language-conformance-contract.md):
