@@ -129,16 +129,50 @@ impl Kernel {
 
         let pty_id = self.next_pty.fetch_add(1, Ordering::Relaxed);
         let pty_ref = Ref::new("pty", pty_id);
-        self.ptys.lock().unwrap().insert(
-            pty_ref.clone(),
-            Arc::new(PtyEntry {
-                owner,
-                _session_lease: session,
-                cmd: display.clone(),
-                session: Mutex::new(pty_session),
-                _active_slot: active_slot,
+        let entry = Arc::new(PtyEntry {
+            owner,
+            cmd: display.clone(),
+            session: Mutex::new(pty_session),
+            lifecycle: Mutex::new(PtyLifecycle {
+                session_lease: Some(session),
+                active_slot: Some(active_slot),
+                terminal_since: None,
             }),
-        );
+        });
+        self.ptys
+            .lock()
+            .unwrap()
+            .insert(pty_ref.clone(), entry.clone());
+
+        // A child may exit without another client request. A lightweight
+        // watcher releases active quota and the session lease promptly; the
+        // final rendered screen remains available in the bounded registry.
+        let weak_kernel = Arc::downgrade(self);
+        let watched_ref = pty_ref.clone();
+        let watched_owner = entry.owner.clone();
+        let watched_entry = entry.clone();
+        if let Err(error) = std::thread::Builder::new()
+            .name(format!("shoal-pty-watch-{pty_id}"))
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    let Some(kernel) = weak_kernel.upgrade() else {
+                        break;
+                    };
+                    if watched_entry.session.lock().unwrap().alive() {
+                        continue;
+                    }
+                    watched_entry.mark_terminal();
+                    kernel.reap_terminal_ptys(&watched_owner);
+                    break;
+                }
+            })
+        {
+            self.ptys.lock().unwrap().remove(&watched_ref);
+            let _ = entry.session.lock().unwrap().close();
+            entry.mark_terminal();
+            return Err(internal(error));
+        }
         encode(json!({
             "pty_id": pty_ref,
             "pid": pid,
@@ -193,6 +227,10 @@ impl Kernel {
         let p: PtyRefParams = decode(params)?;
         let entry = self.pty(&p.pty_id, &owner)?;
         let snap = entry.session.lock().unwrap().read_screen();
+        if !snap.alive {
+            entry.mark_terminal();
+            self.reap_terminal_ptys(&owner);
+        }
         encode(json!({
             "pty_id": p.pty_id,
             "cmd": entry.cmd,
@@ -233,6 +271,10 @@ impl Kernel {
                 data: None,
             })?;
         let snap = entry.session.lock().unwrap().read_screen();
+        if !snap.alive {
+            entry.mark_terminal();
+            self.reap_terminal_ptys(&owner);
+        }
         encode(json!({"pty_id": p.pty_id, "cols": snap.cols, "rows": snap.rows}))
     }
 
@@ -251,6 +293,7 @@ impl Kernel {
         let entry = self.pty(&p.pty_id, &owner)?;
         self.ptys.lock().unwrap().remove(&p.pty_id);
         let (status, signal) = entry.session.lock().unwrap().close();
+        entry.mark_terminal();
         encode(json!({
             "pty_id": p.pty_id,
             "closed": true,
@@ -292,16 +335,23 @@ impl Kernel {
             .map(|(id, entry)| {
                 let mut session = entry.session.lock().unwrap();
                 let (cols, rows) = session.size();
+                let pid = session.pid();
+                let alive = session.alive();
+                drop(session);
+                if !alive {
+                    entry.mark_terminal();
+                }
                 json!({
                     "pty_id": Ref::new("pty", id),
                     "cmd": entry.cmd,
-                    "pid": session.pid(),
+                    "pid": pid,
                     "cols": cols,
                     "rows": rows,
-                    "alive": session.alive(),
+                    "alive": alive,
                 })
             })
             .collect();
+        self.reap_terminal_ptys(&owner);
         encode(json!({ "ptys": ptys }))
     }
 }

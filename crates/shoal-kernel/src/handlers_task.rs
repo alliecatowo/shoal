@@ -11,14 +11,17 @@ impl Kernel {
     ) -> Result<Json, RpcError> {
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
         let session = &attachment.session;
-        let records: Vec<_> = self
+        let owner = session.key.owner();
+        self.reap_finished_tasks(&owner);
+        let tasks: Vec<_> = self
             .tasks
             .lock()
             .unwrap()
             .values()
-            .filter(|task| task.session.key == session.key)
-            .map(task_record)
+            .filter(|task| task.owner == owner)
+            .cloned()
             .collect();
+        let records = tasks.iter().map(task_record).collect::<Vec<_>>();
         encode(records)
     }
 
@@ -29,9 +32,10 @@ impl Kernel {
     ) -> Result<Json, RpcError> {
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
         let session = &attachment.session;
+        self.reap_finished_tasks(&session.key.owner());
         let p: TaskParams = decode(params)?;
         let task = self.task(&p.task)?;
-        if task.session.key != session.key {
+        if task.owner != session.key.owner() {
             return Err(RpcError {
                 code: UNKNOWN_TASK,
                 message: "unknown task ref".into(),
@@ -49,9 +53,10 @@ impl Kernel {
     ) -> Result<Json, RpcError> {
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
         let session = &attachment.session;
+        self.reap_finished_tasks(&session.key.owner());
         let p: TaskParams = decode(params)?;
         let task = self.task(&p.task)?;
-        if task.session.key != session.key {
+        if task.owner != session.key.owner() {
             return Err(RpcError {
                 code: UNKNOWN_TASK,
                 message: "unknown task ref".into(),
@@ -72,9 +77,10 @@ impl Kernel {
     ) -> Result<Json, RpcError> {
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
         let session = &attachment.session;
+        self.reap_finished_tasks(&session.key.owner());
         let p: TaskParams = decode(params)?;
         let task = self.task(&p.task)?;
-        if task.session.key != session.key {
+        if task.owner != session.key.owner() {
             return Err(RpcError {
                 code: UNKNOWN_TASK,
                 message: "unknown task ref".into(),
@@ -99,9 +105,10 @@ impl Kernel {
     ) -> Result<Json, RpcError> {
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
         let session = &attachment.session;
+        self.reap_finished_tasks(&session.key.owner());
         let p: TaskParams = decode(params)?;
         let task = self.task(&p.task)?;
-        if task.session.key != session.key {
+        if task.owner != session.key.owner() {
             return Err(RpcError {
                 code: UNKNOWN_TASK,
                 message: "unknown task ref".into(),
@@ -131,9 +138,10 @@ impl Kernel {
     ) -> Result<Json, RpcError> {
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
         let session = &attachment.session;
+        self.reap_finished_tasks(&session.key.owner());
         let p: TaskParams = decode(params)?;
         let task = self.task(&p.task)?;
-        if task.session.key != session.key {
+        if task.owner != session.key.owner() {
             return Err(RpcError {
                 code: UNKNOWN_TASK,
                 message: "unknown task ref".into(),

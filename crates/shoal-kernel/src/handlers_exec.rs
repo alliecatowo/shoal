@@ -42,9 +42,12 @@ impl Kernel {
             // the prefix).
             let task_id = self.next_task.fetch_add(1, Ordering::Relaxed);
             let task_ref = Ref::new("task", task_id);
+            let task_owner = session.key.owner();
             let task = Arc::new(TaskEntry {
                 task: task_ref.clone(),
-                session: session.clone(),
+                owner: task_owner.clone(),
+                session_id: session.id.clone(),
+                session_lease: Mutex::new(Some(session.clone())),
                 started_ns: now_ns(),
                 inner: Mutex::new(TaskInner {
                     state: "running",
@@ -62,6 +65,7 @@ impl Kernel {
                 .unwrap()
                 .insert(task_ref.clone(), task.clone());
             let waiter = task.clone();
+            let worker_session = session.clone();
             let kernel = self.clone();
             let mut task_attachment = attachment.clone();
             task_attachment.cancel_epoch = Some(cancel.clone());
@@ -138,7 +142,7 @@ impl Kernel {
                             // other non-ok outcome is `failed`; only a truly
                             // successful result is `completed`.
                             let outcome = inner.result_ref.as_ref().and_then(|r| {
-                                task.session.transcript.lock().unwrap().get(r).cloned()
+                                worker_session.transcript.lock().unwrap().get(r).cloned()
                             });
                             inner.state = match &outcome {
                                 Some(Value::Outcome(o)) if !o.ok => {
@@ -165,11 +169,12 @@ impl Kernel {
                         active_slot = inner.active_slot.take();
                     }
                     drop(active_slot);
+                    task.release_session_lease();
                     task.done.notify_all();
                     kernel
                         .events
-                        .publish(&task.session.key.owner(), &task_channel, exit_payload);
-                    kernel.reap_finished_tasks(&task.session.key.owner());
+                        .publish(&task.owner, &task_channel, exit_payload);
+                    kernel.reap_finished_tasks(&task.owner);
                     worker_guard.disarm();
                 });
             if let Err(error) = spawn_result {

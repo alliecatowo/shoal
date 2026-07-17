@@ -110,7 +110,12 @@ const AST_VERSION: u32 = 2;
 
 struct TaskEntry {
     task: Ref,
-    session: Arc<Session>,
+    owner: OwnerKey,
+    session_id: String,
+    /// Keeps the evaluator session live only while the worker can still use
+    /// it. Terminal task records retain immutable identity/results without
+    /// pinning an otherwise-idle session forever.
+    session_lease: Mutex<Option<Arc<Session>>>,
     started_ns: i64,
     inner: Mutex<TaskInner>,
     done: Condvar,
@@ -126,6 +131,15 @@ struct TaskInner {
 }
 
 impl TaskEntry {
+    fn release_session_lease(&self) {
+        let mut lease = match self.session_lease.lock() {
+            Ok(lease) => lease,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        lease.take();
+        self.session_lease.clear_poison();
+    }
+
     /// Restore the complete terminal-task invariant after a worker panic.
     /// Unlike evaluator state, TaskInner is a small host-owned record whose
     /// safe failure state can be reconstructed in full: terminal timestamp,
@@ -149,6 +163,7 @@ impl TaskEntry {
             active_slot
         };
         drop(active_slot);
+        self.release_session_lease();
         self.done.notify_all();
     }
 }
@@ -189,7 +204,7 @@ impl Drop for TaskWorkerGuard {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.task.fail_worker_panic();
             self.kernel.events.publish(
-                &self.task.session.key.owner(),
+                &self.task.owner,
                 &self.channel,
                 json!({
                     "$": "record",
@@ -199,8 +214,7 @@ impl Drop for TaskWorkerGuard {
                     }
                 }),
             );
-            self.kernel
-                .reap_finished_tasks(&self.task.session.key.owner());
+            self.kernel.reap_finished_tasks(&self.task.owner);
         }));
     }
 }
@@ -212,11 +226,35 @@ impl Drop for TaskWorkerGuard {
 /// its opener the same way [`TaskEntry`] scopes a task.
 struct PtyEntry {
     owner: OwnerKey,
-    /// Keeps the owning session non-idle/non-evictable for the PTY lifetime.
-    _session_lease: Arc<Session>,
     cmd: String,
     session: Mutex<shoal_exec::PtySession>,
-    _active_slot: QuotaPermit,
+    lifecycle: Mutex<PtyLifecycle>,
+}
+
+struct PtyLifecycle {
+    /// These leases exist only while the child is alive. A bounded terminal
+    /// screen record must not consume active quota or pin evaluator state.
+    session_lease: Option<Arc<Session>>,
+    active_slot: Option<QuotaPermit>,
+    terminal_since: Option<Instant>,
+}
+
+impl PtyEntry {
+    fn mark_terminal(&self) {
+        let (active_slot, session_lease) = {
+            let mut lifecycle = self.lifecycle.lock().unwrap();
+            if lifecycle.terminal_since.is_some() {
+                return;
+            }
+            lifecycle.terminal_since = Some(Instant::now());
+            (lifecycle.active_slot.take(), lifecycle.session_lease.take())
+        };
+        drop((active_slot, session_lease));
+    }
+
+    fn terminal_since(&self) -> Option<Instant> {
+        self.lifecycle.lock().unwrap().terminal_since
+    }
 }
 
 #[derive(Default)]
@@ -268,6 +306,8 @@ impl Drop for QuotaPermit {
 }
 
 const MAX_FINISHED_TASKS_PER_SESSION: usize = 512;
+const TASK_RETENTION_NS: i64 = 24 * 60 * 60 * 1_000_000_000;
+const MAX_TERMINAL_PTYS_PER_SESSION: usize = 64;
 const PLAN_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 const MAX_STORED_PLANS_PER_OWNER: usize = 256;
 const MAX_PLAN_SOURCE_BYTES_PER_OWNER: usize = 64 * 1024 * 1024;
@@ -628,30 +668,63 @@ impl Kernel {
     }
 
     fn reap_finished_tasks(&self, owner: &OwnerKey) {
-        let mut tasks = self.tasks.lock().unwrap();
-        let mut finished = tasks
+        // Registry locks never nest with per-task locks: snapshot Arc handles,
+        // inspect their independent state, then conditionally remove only the
+        // exact entries observed. This is the canonical registry -> object
+        // lock-order pattern used by the kernel's resource registries.
+        let entries = self
+            .tasks
+            .lock()
+            .unwrap()
             .iter()
-            .filter(|(_, task)| &task.session.key.owner() == owner)
+            .filter(|(_, task)| &task.owner == owner)
+            .map(|(task_ref, task)| (task_ref.clone(), task.clone()))
+            .collect::<Vec<_>>();
+        let cutoff = now_ns().saturating_sub(TASK_RETENTION_NS);
+        let mut finished = entries
+            .into_iter()
             .filter_map(|(task_ref, task)| {
-                task.inner
-                    .lock()
-                    .unwrap()
-                    .finished_ns
-                    .map(|finished_ns| (task_ref.clone(), finished_ns))
+                let finished_ns = task.inner.lock().unwrap().finished_ns;
+                finished_ns.map(|finished_ns| (task_ref, task, finished_ns))
             })
             .collect::<Vec<_>>();
-        if finished.len() <= MAX_FINISHED_TASKS_PER_SESSION {
+        finished.sort_unstable_by_key(|(_, _, finished_ns)| *finished_ns);
+        let retained = finished
+            .iter()
+            .filter(|(_, _, finished_ns)| *finished_ns >= cutoff)
+            .count();
+        let over_cap = retained.saturating_sub(MAX_FINISHED_TASKS_PER_SESSION);
+        let mut retained_removed = 0usize;
+        let remove = finished
+            .into_iter()
+            .filter(|(_, _, finished_ns)| {
+                if *finished_ns < cutoff {
+                    true
+                } else if retained_removed < over_cap {
+                    retained_removed += 1;
+                    true
+                } else {
+                    false
+                }
+            })
+            .collect::<Vec<_>>();
+        if remove.is_empty() {
             return;
         }
-        finished.sort_unstable_by_key(|(_, finished_ns)| *finished_ns);
-        let remove = finished.len() - MAX_FINISHED_TASKS_PER_SESSION;
-        for (task_ref, _) in finished.into_iter().take(remove) {
-            tasks.remove(&task_ref);
+        let mut tasks = self.tasks.lock().unwrap();
+        for (task_ref, observed, _) in remove {
+            if tasks
+                .get(&task_ref)
+                .is_some_and(|current| Arc::ptr_eq(current, &observed))
+            {
+                tasks.remove(&task_ref);
+            }
         }
     }
 
-    /// Remove self-exited PTYs before reserving capacity for another live PTY.
-    /// Snapshot first so registry and per-PTY locks are never held together.
+    /// Detect self-exited PTYs, release their active/session leases, and bound
+    /// retained final-screen records. Snapshot first so registry and per-PTY
+    /// locks are never held together.
     fn reap_terminal_ptys(&self, owner: &OwnerKey) {
         let entries = self
             .ptys
@@ -661,18 +734,25 @@ impl Kernel {
             .filter(|(_, entry)| &entry.owner == owner)
             .map(|(pty_ref, entry)| (pty_ref.clone(), entry.clone()))
             .collect::<Vec<_>>();
-        let terminal = entries
+        let mut terminal = entries
             .into_iter()
             .filter_map(|(pty_ref, entry)| {
                 let alive = entry.session.lock().unwrap().alive();
-                (!alive).then_some((pty_ref, entry))
+                if !alive {
+                    entry.mark_terminal();
+                }
+                entry
+                    .terminal_since()
+                    .map(|terminal_since| (pty_ref, entry, terminal_since))
             })
             .collect::<Vec<_>>();
-        if terminal.is_empty() {
+        if terminal.len() <= MAX_TERMINAL_PTYS_PER_SESSION {
             return;
         }
+        terminal.sort_unstable_by_key(|(_, _, terminal_since)| *terminal_since);
+        let remove = terminal.len() - MAX_TERMINAL_PTYS_PER_SESSION;
         let mut ptys = self.ptys.lock().unwrap();
-        for (pty_ref, observed) in terminal {
+        for (pty_ref, observed, _) in terminal.into_iter().take(remove) {
             if ptys
                 .get(&pty_ref)
                 .is_some_and(|current| Arc::ptr_eq(current, &observed))
@@ -775,7 +855,7 @@ fn task_record(task: &Arc<TaskEntry>) -> TaskRecord {
 fn task_record_locked(task: &TaskEntry, inner: &TaskInner) -> TaskRecord {
     TaskRecord {
         task: task.task.clone(),
-        session: task.session.id.clone(),
+        session: task.session_id.clone(),
         state: inner.state.into(),
         started_ns: task.started_ns,
         finished_ns: inner.finished_ns,
@@ -1430,11 +1510,15 @@ mod tests {
         let alpha = kernel.session("shared-tasks", "agent:alpha").unwrap();
         let beta = kernel.session("shared-tasks", "agent:beta").unwrap();
         let task_ref = Ref::new("task", 4242);
+        let alpha_owner = alpha.key.owner();
+        let alpha_session_id = alpha.id.clone();
         kernel.tasks.lock().unwrap().insert(
             task_ref.clone(),
             Arc::new(TaskEntry {
                 task: task_ref.clone(),
-                session: alpha,
+                owner: alpha_owner,
+                session_id: alpha_session_id,
+                session_lease: Mutex::new(None),
                 started_ns: now_ns(),
                 inner: Mutex::new(TaskInner {
                     state: "completed",
@@ -1510,7 +1594,9 @@ mod tests {
         let session = kernel.session("poisoned-task", &actor).unwrap();
         let task = Arc::new(TaskEntry {
             task: Ref::new("task", 999),
-            session,
+            owner: session.key.owner(),
+            session_id: session.id.clone(),
+            session_lease: Mutex::new(Some(session)),
             started_ns: now_ns(),
             inner: Mutex::new(TaskInner {
                 state: "running",
@@ -1539,6 +1625,41 @@ mod tests {
         assert!(inner.result_ref.is_none());
         assert_eq!(inner.error.as_ref().unwrap().code, INTERNAL_ERROR);
         assert!(inner.active_slot.is_none());
+        drop(inner);
+        assert!(task.session_lease.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn terminal_tasks_release_sessions_and_stale_records_are_reaped() {
+        let kernel = Kernel::new();
+        let actor = "agent:task-retention";
+        let session = kernel.session("retention", actor).unwrap();
+        let owner = session.key.owner();
+        let baseline = Arc::strong_count(&session);
+        let task_ref = Ref::new("task", 1001);
+        let task = Arc::new(TaskEntry {
+            task: task_ref.clone(),
+            owner: owner.clone(),
+            session_id: session.id.clone(),
+            session_lease: Mutex::new(Some(session.clone())),
+            started_ns: now_ns().saturating_sub(TASK_RETENTION_NS + 1),
+            inner: Mutex::new(TaskInner {
+                state: "completed",
+                finished_ns: Some(now_ns().saturating_sub(TASK_RETENTION_NS + 1)),
+                result_ref: None,
+                error: None,
+                active_slot: None,
+            }),
+            done: Condvar::new(),
+            cancel: shoal_exec::CancelToken::new(),
+            cancel_requested: AtomicBool::new(false),
+        });
+        assert_eq!(Arc::strong_count(&session), baseline + 1);
+        task.release_session_lease();
+        assert_eq!(Arc::strong_count(&session), baseline);
+        kernel.tasks.lock().unwrap().insert(task_ref.clone(), task);
+        kernel.reap_finished_tasks(&owner);
+        assert!(!kernel.tasks.lock().unwrap().contains_key(&task_ref));
     }
 
     #[test]
@@ -1666,6 +1787,49 @@ mod tests {
         drop(client);
         drop(reader);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn self_exited_pty_releases_active_and_session_leases_without_a_request() {
+        let kernel = Kernel::new();
+        kernel.configure_limits(Limits {
+            max_ptys_per_session: 1,
+            ..Limits::default()
+        });
+        let session = kernel.session("self-exited-pty", &principal()).unwrap();
+        let owner = session.key.owner();
+        let mut attached = Some(Attachment {
+            session,
+            principal: principal(),
+            can_approve: false,
+            tty: false,
+            cancel_epoch: None,
+        });
+        let opened = kernel
+            .handle_pty_open(json!({"cmd":"sh", "args":["-c", "exit 0"]}), &mut attached)
+            .unwrap();
+        let pty_ref: Ref = serde_json::from_value(opened["pty_id"].clone()).unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while kernel.pty_slots.counts.lock().unwrap().contains_key(&owner) {
+            assert!(
+                Instant::now() < deadline,
+                "PTY watcher did not release quota"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let retained = kernel.ptys.lock().unwrap().get(&pty_ref).cloned().unwrap();
+        let lifecycle = retained.lifecycle.lock().unwrap();
+        assert!(lifecycle.active_slot.is_none());
+        assert!(lifecycle.session_lease.is_none());
+        assert!(lifecycle.terminal_since.is_some());
+        drop(lifecycle);
+
+        let next = kernel
+            .handle_pty_open(json!({"cmd":"cat"}), &mut attached)
+            .expect("self-exit released capacity before another client request");
+        kernel
+            .handle_pty_close(json!({"pty_id":next["pty_id"]}), &mut attached)
+            .unwrap();
     }
 
     #[test]
