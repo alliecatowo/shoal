@@ -11,7 +11,7 @@
 //! over one substrate. The bus lives on the `Evaluator` (session-scoped) and is
 //! shared into spawned tasks so `on(...)`/`spawn` handlers see the same channels.
 
-use crate::{ChildScope, Evaluator};
+use crate::{ChildKind, Evaluator};
 use shoal_ast::Args;
 use shoal_exec::CancelToken;
 use shoal_value::{CallArgs, ErrorVal, Record, StreamVal, TaskVal, VResult, Value};
@@ -365,7 +365,7 @@ impl Evaluator {
         // sees the caller's bindings.
         let ctx = self.child_context();
         std::thread::spawn(move || {
-            let mut ev = ctx.build(ChildScope::Inherit, child_cancel);
+            let mut ev = ctx.build(ChildKind::OnHandler, child_cancel);
             let stream = StreamVal::from_channel("event", rx);
             let result = match stream.take_upstream() {
                 Ok(mut up) => shoal_value::drive_stream(&mut ev, &mut *up, |ctx, event| {

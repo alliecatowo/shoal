@@ -140,7 +140,7 @@ impl Evaluator {
             let ctx = self.child_context();
             let cancel = self.cancellation_token();
             handles.push(std::thread::spawn(move || {
-                let mut ev = ctx.build(ChildScope::Inherit, cancel);
+                let mut ev = ctx.build(ChildKind::Parallel, cancel);
                 ev.call_value(&f, CallArgs::default())
             }));
         }

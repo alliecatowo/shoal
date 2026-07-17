@@ -25,17 +25,15 @@
 
 use super::*;
 
-/// Whether a child evaluator inherits the parent's lexical environment handle
-/// or starts from a fresh session root.
+/// Every production reason a running evaluator may create a child. Naming the
+/// route here makes inheritance policy exhaustive instead of letting each call
+/// site choose individual fields or even a raw "fresh/inherit" boolean.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ChildScope {
-    /// Share the parent's [`Env`] handle: `spawn`/`parallel`/`on` bodies are
-    /// closures/blocks that must see the caller's bindings. The handle is
-    /// interior-mutable and parent-linked, so the child observes the same scope.
-    Inherit,
-    /// Start from a fresh session root (`Env::root()`): a `.shl` script is a
-    /// separate program whose `let`s must not leak back into the caller session.
-    Fresh,
+pub(crate) enum ChildKind {
+    Spawn,
+    Script,
+    Parallel,
+    OnHandler,
 }
 
 /// A snapshot of the explicitly audited inheritable session capabilities,
@@ -46,10 +44,7 @@ pub(crate) enum ChildScope {
 pub(crate) struct ChildContext {
     host: Arc<host_services::HostServices>,
     session: session_ctx::SessionCtx,
-    reef: reef_state::ReefState,
-    cwd: PathBuf,
-    env: Env,
-    process_env: Vec<(OsString, OsString)>,
+    exec: exec_state::ChildExecSeed,
 }
 
 impl Evaluator {
@@ -61,17 +56,14 @@ impl Evaluator {
         ChildContext {
             host: self.host.clone(),
             session: self.session.for_child(),
-            reef: self.reef.clone(),
-            cwd: self.cwd.clone(),
-            env: self.env.clone(),
-            process_env: self.process_env.clone(),
+            exec: self.exec.child_seed(),
         }
     }
 }
 
 impl ChildContext {
-    /// Build the child evaluator. `scope` selects lexical-environment
-    /// inheritance; `cancel` is the cancellation token the child consults —
+    /// Build the child evaluator. `kind` exhaustively selects the route and its
+    /// lexical-environment rule; `cancel` is the token the child consults —
     /// callers pass either the parent's token (`Evaluator::cancellation_token`,
     /// so parent cancellation reaches a synchronous script or a `parallel`
     /// batch) or a FRESH token wired to a spawned task's cancel hook
@@ -80,33 +72,18 @@ impl ChildContext {
     /// Every OTHER captured capability is applied here by construction: the
     /// method destructures the whole [`ChildContext`], so the compiler rejects
     /// any captured field that is not re-applied to the child.
-    pub(crate) fn build(self, scope: ChildScope, cancel: CancelToken) -> Evaluator {
+    pub(crate) fn build(self, kind: ChildKind, cancel: CancelToken) -> Evaluator {
         let ChildContext {
             host,
             session,
-            reef,
-            cwd,
-            env,
-            process_env,
+            exec,
         } = self;
 
-        let mut child = Evaluator::new(cwd);
-        child.host = host;
-        // Session identity, policy, echo mode, and the deliberate clearing of
-        // terminal/root-only handles arrive as one required typed value.
-        child.session = session;
-        child.reef = reef;
-
-        // --- Inherited by construction -------------------------------------
-        // Lexical env: closure/spawn/parallel/on bodies inherit the caller's
-        // bindings; a `.shl` script keeps `Evaluator::new`'s fresh root.
-        if let ChildScope::Inherit = scope {
-            child.env = env;
-        }
-        child.cancel = cancel;
-        child.process_env = process_env;
-        // Reef scope/resolver/lock/overrides: constrained tool resolution must
-        // resolve identically inside a child, or a pinned tool diverges.
+        let child = Evaluator {
+            host,
+            session,
+            exec: exec_state::ExecState::child(exec, kind, cancel),
+        };
 
         // --- Deliberately NOT inherited (fresh state per child) ------------
         // journal handle:  the current `Journal` is an owned, single-connection
@@ -119,14 +96,14 @@ impl ChildContext {
         // interactive:     false — a child never owns the real terminal.
         // sink:            no competing mutable renderer; a child returns its
         //                  value through its task/return channel, not a sink.
-        // it / plans / modules / jobs / dir_stack / oldpwd / current_entry /
-        // source / pending_exit / pending_stop / external_jobs / call_depth /
+        // it / plans / modules / jobs / current_entry / source / pending_exit /
+        // pending_stop / external_jobs / call_depth /
         // in_fn_body:      per-evaluator session state; a child gets its own.
+        // oldpwd / dir_stack: inherited snapshots, because they are part of the
+        //                  caller's dynamic directory context.
         // jump_store:      None — a child never writes interactive cd frecency.
-        // echo_mode:       fresh default (`All`); only `run_script_file` runs a
-        //                  full program, and it keeps the standalone-script
-        //                  echo default rather than adopting a host's Quiet mode
-        //                  (inheriting it would change script rendering).
+        // echo_mode:       inherited as part of SessionCtx; a Quiet parent
+        //                  cannot accidentally create a noisy child.
         child
     }
 }
@@ -136,6 +113,25 @@ mod tests {
     use super::*;
     use shoal_reef::provider::SystemProvider;
     use shoal_reef::{LockEntry, ManifestKind, ReefManifest, Resolver, ScopeChain, ScopeEntry};
+
+    #[test]
+    fn production_child_sites_cannot_bypass_child_context() {
+        for (name, source) in [
+            ("script", include_str!("script.rs")),
+            ("host", include_str!("host.rs")),
+            ("channels", include_str!("channels.rs")),
+        ] {
+            let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+            assert!(
+                !production.contains("Evaluator::new("),
+                "{name} contains a manual child constructor"
+            );
+            assert!(
+                production.contains("child_context()"),
+                "{name} must use the sole typed child-construction path"
+            );
+        }
+    }
 
     #[test]
     fn child_context_copies_reef_state_and_journal_attribution_explicitly() {
@@ -150,6 +146,9 @@ mod tests {
         parent.set_echo_mode(EchoMode::Quiet);
         parent.set_interactive(true);
         parent.set_statement_sink(Box::new(|_| {}));
+        parent.env.declare("parent_only", Value::Int(1), false);
+        parent.oldpwd = Some(dir.path().join("previous"));
+        parent.dir_stack.push(dir.path().join("stacked"));
         parent.reef.lock.insert(LockEntry {
             name: "fixture".into(),
             version: "1.0.0".into(),
@@ -182,7 +181,7 @@ mod tests {
 
         let child = parent
             .child_context()
-            .build(ChildScope::Fresh, CancelToken::new());
+            .build(ChildKind::Script, CancelToken::new());
 
         assert!(
             Arc::ptr_eq(&child.host, &parent.host),
@@ -197,6 +196,12 @@ mod tests {
             "a child never owns the terminal"
         );
         assert!(child.session.sink.is_none(), "a child has no host renderer");
+        assert!(
+            child.env.get("parent_only").is_none(),
+            "a fresh-scope script child gets a new lexical root"
+        );
+        assert_eq!(child.oldpwd, parent.oldpwd);
+        assert_eq!(child.dir_stack, parent.dir_stack);
         assert!(
             !child.has_journal(),
             "the outer parent statement owns journaling; nested entries are not implied"

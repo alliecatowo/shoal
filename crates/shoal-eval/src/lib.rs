@@ -33,7 +33,7 @@ mod stmt;
 mod streams;
 
 pub use channels::{EventBus, EventForwarder};
-pub(crate) use child_context::ChildScope;
+pub(crate) use child_context::ChildKind;
 pub(crate) use coerce::coerce_word;
 pub use reef::{PromptReefBinding, PromptReefSnapshot};
 // Job-control surface (site/content/internals/language-conformance-contract.md) the interactive host (the REPL) drives. Re-

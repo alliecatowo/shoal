@@ -28,6 +28,17 @@ pub struct ExecState {
     pub(crate) dir_stack: Vec<PathBuf>,
 }
 
+/// The complete mutable snapshot allowed to cross a parent→child boundary.
+/// Fresh-only fields are absent by construction.
+pub(crate) struct ChildExecSeed {
+    reef: reef_state::ReefState,
+    cwd: PathBuf,
+    env: Env,
+    process_env: Vec<(OsString, OsString)>,
+    oldpwd: Option<PathBuf>,
+    dir_stack: Vec<PathBuf>,
+}
+
 impl ExecState {
     pub(crate) fn root(cwd: PathBuf) -> Self {
         Self {
@@ -52,6 +63,38 @@ impl ExecState {
             oldpwd: None,
             dir_stack: Vec::new(),
         }
+    }
+
+    pub(crate) fn child_seed(&self) -> ChildExecSeed {
+        ChildExecSeed {
+            reef: self.reef.clone(),
+            cwd: self.cwd.clone(),
+            env: self.env.clone(),
+            process_env: self.process_env.clone(),
+            oldpwd: self.oldpwd.clone(),
+            dir_stack: self.dir_stack.clone(),
+        }
+    }
+
+    pub(crate) fn child(seed: ChildExecSeed, kind: crate::ChildKind, cancel: CancelToken) -> Self {
+        let ChildExecSeed {
+            reef,
+            cwd,
+            env,
+            process_env,
+            oldpwd,
+            dir_stack,
+        } = seed;
+        let mut child = Self::root(cwd);
+        child.reef = reef;
+        if !matches!(kind, crate::ChildKind::Script) {
+            child.env = env;
+        }
+        child.process_env = process_env;
+        child.oldpwd = oldpwd;
+        child.dir_stack = dir_stack;
+        child.cancel = cancel;
+        child
     }
 }
 

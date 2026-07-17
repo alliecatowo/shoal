@@ -72,7 +72,7 @@ impl Evaluator {
         // `spawn` body sees the caller's bindings.
         let ctx = self.child_context();
         std::thread::spawn(move || {
-            let mut ev = ctx.build(ChildScope::Inherit, child_cancel);
+            let mut ev = ctx.build(ChildKind::Spawn, child_cancel);
             worker.finish(ev.block_value(&body));
         });
         self.jobs.push(task.clone());
@@ -147,7 +147,7 @@ impl Evaluator {
                     .map_err(|e| ErrorVal::new("parse_error", e.to_string()))?;
                 // A `.shl` script is a separate program (see
                 // `site/content/internals/values-streams-execution.md`):
-                // `ChildScope::Fresh` keeps `Evaluator::new`'s FRESH root scope,
+                // `ChildKind::Script` keeps a fresh root lexical scope,
                 // so its `let`s do not leak back into the caller session
                 // (`Env::clone` would share the same Arc'd scope and leak them).
                 // Via the one child constructor (HR-B1) it still inherits the
@@ -156,7 +156,7 @@ impl Evaluator {
                 // (audit B1–B3) — plus the parent's cancellation so a host
                 // cancel interrupts the script.
                 let cancel = self.cancellation_token();
-                let mut child = self.child_context().build(ChildScope::Fresh, cancel);
+                let mut child = self.child_context().build(ChildKind::Script, cancel);
                 child.env.declare("args", Value::List(args), false);
                 child
                     .env
