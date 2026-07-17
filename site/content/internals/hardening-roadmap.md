@@ -88,9 +88,10 @@ Rules for implementers:
 - [x] **HR-B6** — Remove or privatize `inherit_ports`-style partial copying so future call sites
   cannot under-inherit. *(B1, B3)*
   <br>Accept: no public API constructs a child evaluator without the full-context constructor.
-- [ ] **HR-B7** — Tests: a restrictive leash policy observably constrains work run via `spawn`,
-  `parallel`, an `on` handler, and a `.shl` script exactly as it does foreground; reef/config/
-  journal settings propagate identically. *(B4)*
+- [x] **HR-B7** — Tests: a restrictive leash policy observably constrains work run via `spawn`,
+  `parallel`, an `on` handler, and a `.shl` script exactly as it does foreground; config
+  propagates to every route (including `spawn`, which formerly dropped the config port); and
+  parent cancellation reaches the synchronous `parallel`/`.shl` children. *(B4, B5, B6)*
 
 ### Workstream C — effects through enforceable ports
 
