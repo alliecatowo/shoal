@@ -3,7 +3,7 @@
 //! signal-handling + reedline/prompt wiring that only the interactive path
 //! needs.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, IsTerminal};
@@ -402,6 +402,16 @@ pub(crate) fn repl(standalone: bool) -> Result<i32, String> {
     }
 
     let (background_job_tx, background_job_rx) = mpsc::channel();
+    let suppressed_task_notices = Arc::new(Mutex::new(BTreeSet::new()));
+    let mut watched_tasks = BTreeSet::new();
+    watch_new_tasks(
+        &evaluator,
+        None,
+        &mut watched_tasks,
+        &suppressed_task_notices,
+        &background_job_tx,
+        &background_printer,
+    );
 
     loop {
         drain_background_job_events(&mut evaluator, &background_job_rx);
@@ -494,6 +504,12 @@ pub(crate) fn repl(standalone: bool) -> Result<i32, String> {
                 // `fg <task>` (site/content/internals/roadmap-and-priorities.md): host-level sugar, resolved
                 // as plain source text before parsing since the evaluator has
                 // no `fg` builtin of its own — see `rewrite_fg`.
+                if let Some(name) = fg_task_name(&src)
+                    && let Some(Value::Task(task)) = evaluator.env().get(name)
+                    && let Ok(mut suppressed) = suppressed_task_notices.lock()
+                {
+                    suppressed.insert(task.id);
+                }
                 let run_src = rewrite_fg(&src).unwrap_or_else(|| src.clone());
                 let ctx = parse_ctx_for(evaluator.env());
                 match parse_with_ctx(&run_src, ctx) {
@@ -509,7 +525,16 @@ pub(crate) fn repl(standalone: bool) -> Result<i32, String> {
                         // `stmt_source` has nothing to slice from.
                         evaluator.set_source(run_src.clone());
                         let started_ns = now_ns();
-                        match evaluator.eval_program(&program) {
+                        let evaluation = evaluator.eval_program(&program);
+                        watch_new_tasks(
+                            &evaluator,
+                            evaluation.as_ref().ok(),
+                            &mut watched_tasks,
+                            &suppressed_task_notices,
+                            &background_job_tx,
+                            &background_printer,
+                        );
+                        match evaluation {
                             Ok(value) => {
                                 let entry_id = journal_reader.as_ref().and_then(|journal| {
                                     latest_entry_id(journal, REPL_PRINCIPAL, started_ns)
@@ -760,7 +785,7 @@ fn out_index_literal(arg: &CmdArg) -> Option<i64> {
 /// normal parse/eval/render/journal path) does not change. Until
 /// `.resume()` exists, `fg` surfaces the eval's own "no such method" error
 /// through the ordinary error-reporting path — never a silent no-op.
-fn rewrite_fg(src: &str) -> Option<String> {
+fn fg_task_name(src: &str) -> Option<&str> {
     let trimmed = src.trim();
     let after = trimmed.strip_prefix("fg")?;
     if !after.starts_with(|c: char| c.is_ascii_whitespace()) {
@@ -778,6 +803,11 @@ fn rewrite_fg(src: &str) -> Option<String> {
     if !first_ok || !rest_ok {
         return None;
     }
+    Some(name)
+}
+
+fn rewrite_fg(src: &str) -> Option<String> {
+    let name = fg_task_name(src)?;
     Some(format!("{name}.resume()\n{name}.await()"))
 }
 
@@ -802,23 +832,32 @@ enum BackgroundJobEvent {
         command: String,
         status: Option<i32>,
         signal: Option<String>,
+        omitted_output_bytes: usize,
         notified: bool,
     },
     Stopped {
         id: u64,
         command: String,
+        omitted_output_bytes: usize,
         notified: bool,
     },
     Failed {
         id: u64,
         error: String,
+        omitted_output_bytes: usize,
+        notified: bool,
+    },
+    TaskCompleted {
+        id: u64,
+        description: String,
+        error: Option<String>,
         notified: bool,
     },
 }
 
 impl BackgroundJobEvent {
     fn notice(&self) -> String {
-        match self {
+        let base = match self {
             Self::Completed {
                 id,
                 command,
@@ -840,6 +879,37 @@ impl BackgroundJobEvent {
             Self::Failed { id, error, .. } => maybe_strip(format!(
                 "\x1b[31;1m[{id}]+ background job failed:\x1b[0m {error}"
             )),
+            Self::TaskCompleted {
+                id,
+                description,
+                error,
+                ..
+            } => match error {
+                Some(error) => maybe_strip(format!(
+                    "\x1b[31;1m[{id}]+ task failed:\x1b[0m {description}: {error}"
+                )),
+                None => maybe_strip(format!("\x1b[90m[{id}]+  Done\x1b[0m  {description}")),
+            },
+        };
+        let omitted = match self {
+            Self::Completed {
+                omitted_output_bytes,
+                ..
+            }
+            | Self::Stopped {
+                omitted_output_bytes,
+                ..
+            }
+            | Self::Failed {
+                omitted_output_bytes,
+                ..
+            } => *omitted_output_bytes,
+            Self::TaskCompleted { .. } => 0,
+        };
+        if omitted == 0 {
+            base
+        } else {
+            format!("[shoal: {omitted} bytes of background output omitted]\n{base}")
         }
     }
 
@@ -847,7 +917,8 @@ impl BackgroundJobEvent {
         match self {
             Self::Completed { notified, .. }
             | Self::Stopped { notified, .. }
-            | Self::Failed { notified, .. } => *notified,
+            | Self::Failed { notified, .. }
+            | Self::TaskCompleted { notified, .. } => *notified,
         }
     }
 
@@ -855,9 +926,89 @@ impl BackgroundJobEvent {
         match self {
             Self::Completed { notified, .. }
             | Self::Stopped { notified, .. }
-            | Self::Failed { notified, .. } => *notified = true,
+            | Self::Failed { notified, .. }
+            | Self::TaskCompleted { notified, .. } => *notified = true,
         }
     }
+}
+
+const MAX_BACKGROUND_OUTPUT_LINE: usize = 8 * 1024;
+
+struct BackgroundOutputState {
+    id: u64,
+    printer: ExternalPrinter<String>,
+    pending: Vec<u8>,
+    omitted: usize,
+}
+
+impl BackgroundOutputState {
+    fn new(id: u64, printer: ExternalPrinter<String>) -> Self {
+        Self {
+            id,
+            printer,
+            pending: Vec::new(),
+            omitted: 0,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            if byte == b'\n' {
+                self.flush_line(true);
+                continue;
+            }
+            self.pending.push(byte);
+            if self.pending.len() >= MAX_BACKGROUND_OUTPUT_LINE {
+                self.flush_line(false);
+            }
+        }
+    }
+
+    fn finish(&mut self) -> usize {
+        if !self.pending.is_empty() {
+            self.flush_line(false);
+        }
+        std::mem::take(&mut self.omitted)
+    }
+
+    fn flush_line(&mut self, had_newline: bool) {
+        let mut bytes = std::mem::take(&mut self.pending);
+        if had_newline && bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+        let safe = sanitize_background_output(&bytes);
+        let prefix = if self.omitted > 0 {
+            format!(
+                "[shoal: {} bytes of background output omitted]\n",
+                self.omitted
+            )
+        } else {
+            String::new()
+        };
+        let message = format!("{prefix}[{}] {safe}", self.id);
+        if self.printer.sender().try_send(message).is_ok() {
+            self.omitted = 0;
+        } else {
+            self.omitted = self
+                .omitted
+                .saturating_add(bytes.len() + usize::from(had_newline));
+        }
+    }
+}
+
+fn sanitize_background_output(bytes: &[u8]) -> String {
+    let mut safe = String::new();
+    for ch in String::from_utf8_lossy(bytes).chars() {
+        match ch {
+            '\t' => safe.push('\t'),
+            ch if ch.is_control() => {
+                use std::fmt::Write as _;
+                let _ = write!(safe, "\\u{{{:x}}}", ch as u32);
+            }
+            ch => safe.push(ch),
+        }
+    }
+    safe
 }
 
 /// Queue a completion notice without ever blocking a PTY reap worker. If the
@@ -866,6 +1017,60 @@ impl BackgroundJobEvent {
 fn enqueue_background_notice(printer: &ExternalPrinter<String>, event: &mut BackgroundJobEvent) {
     if printer.sender().try_send(event.notice()).is_ok() {
         event.set_notified();
+    }
+}
+
+fn watch_new_tasks(
+    evaluator: &Evaluator,
+    final_value: Option<&Value>,
+    watched: &mut BTreeSet<u64>,
+    suppressed: &Arc<Mutex<BTreeSet<u64>>>,
+    events: &Sender<BackgroundJobEvent>,
+    printer: &ExternalPrinter<String>,
+) {
+    for task in evaluator.tasks_snapshot() {
+        if !watched.insert(task.id) {
+            continue;
+        }
+        // OS PTY jobs have their own result/status reconciliation path. Mark
+        // them seen, but never create a second TaskVal completion notice.
+        if evaluator.external_job_pid(task.id).is_some() {
+            continue;
+        }
+        let returned = matches!(final_value, Some(Value::Task(value)) if value.same(&task));
+        // A task already awaited within the same submitted line is ordinary
+        // foreground work, not a background completion. A directly returned
+        // TaskVal remains notification-worthy even if it finished very fast.
+        if task.is_done() && !returned {
+            continue;
+        }
+        let events = events.clone();
+        let printer = printer.clone();
+        let suppressed = suppressed.clone();
+        std::thread::spawn(move || {
+            let result = task.wait();
+            if suppressed
+                .lock()
+                .is_ok_and(|suppressed| suppressed.contains(&task.id))
+            {
+                return;
+            }
+            let error = result.err().map(|error| {
+                if let Some(status) = error.status {
+                    format!("{}: {} (status {status})", error.code, error.msg)
+                } else {
+                    format!("{}: {}", error.code, error.msg)
+                }
+            });
+            let mut event = BackgroundJobEvent::TaskCompleted {
+                id: task.id,
+                description: task.shared.desc.clone(),
+                error,
+                notified: false,
+            };
+            enqueue_background_notice(&printer, &mut event);
+            let _ = events.send(event);
+        });
     }
 }
 
@@ -901,10 +1106,16 @@ fn drain_background_job_events(evaluator: &mut Evaluator, events: &Receiver<Back
                 id,
                 ref error,
                 notified,
+                ..
             } => {
                 evaluator.fail_external_job(id, error.clone());
                 if !notified && let Some(notice) = fallback_notice {
                     eprintln!("{notice}");
+                }
+            }
+            BackgroundJobEvent::TaskCompleted { .. } => {
+                if let Some(notice) = fallback_notice {
+                    println!("{notice}");
                 }
             }
         }
@@ -1051,29 +1262,46 @@ fn handle_job_control(
             // the prompt thread.
             let events = background_events.clone();
             let printer = background_printer.clone();
-            job.resume_background_notify(move |result| {
-                let mut event = match result {
-                    Ok(result) if result.stopped => BackgroundJobEvent::Stopped {
-                        id,
-                        command,
-                        notified: false,
-                    },
-                    Ok(result) => BackgroundJobEvent::Completed {
-                        id,
-                        command,
-                        status: result.status,
-                        signal: result.signal,
-                        notified: false,
-                    },
-                    Err(error) => BackgroundJobEvent::Failed {
-                        id,
-                        error: error.to_string(),
-                        notified: false,
-                    },
-                };
-                enqueue_background_notice(&printer, &mut event);
-                let _ = events.send(event);
-            });
+            let output_state = Arc::new(Mutex::new(BackgroundOutputState::new(
+                id,
+                background_printer.clone(),
+            )));
+            let output_sink = output_state.clone();
+            job.resume_background_notify_with_output(
+                move |bytes| {
+                    if let Ok(mut output) = output_sink.lock() {
+                        output.push(bytes);
+                    }
+                },
+                move |result| {
+                    let omitted_output_bytes =
+                        output_state.lock().map_or(0, |mut output| output.finish());
+                    let mut event = match result {
+                        Ok(result) if result.stopped => BackgroundJobEvent::Stopped {
+                            id,
+                            command,
+                            omitted_output_bytes,
+                            notified: false,
+                        },
+                        Ok(result) => BackgroundJobEvent::Completed {
+                            id,
+                            command,
+                            status: result.status,
+                            signal: result.signal,
+                            omitted_output_bytes,
+                            notified: false,
+                        },
+                        Err(error) => BackgroundJobEvent::Failed {
+                            id,
+                            error: error.to_string(),
+                            omitted_output_bytes,
+                            notified: false,
+                        },
+                    };
+                    enqueue_background_notice(&printer, &mut event);
+                    let _ = events.send(event);
+                },
+            );
         }
     }
 }
@@ -1322,6 +1550,7 @@ mod tests {
             command: "done-job".into(),
             status: Some(0),
             signal: None,
+            omitted_output_bytes: 0,
             notified: false,
         })
         .unwrap();
@@ -1336,6 +1565,7 @@ mod tests {
             command: "failed-job".into(),
             status: Some(7),
             signal: None,
+            omitted_output_bytes: 0,
             notified: false,
         })
         .unwrap();
@@ -1353,6 +1583,7 @@ mod tests {
         tx.send(BackgroundJobEvent::Stopped {
             id: stopped,
             command: "stopped-job".into(),
+            omitted_output_bytes: 0,
             notified: false,
         })
         .unwrap();
@@ -1370,6 +1601,7 @@ mod tests {
             command: "fast-job".into(),
             status: Some(0),
             signal: None,
+            omitted_output_bytes: 0,
             notified: false,
         };
         enqueue_background_notice(&printer, &mut first);
@@ -1382,10 +1614,93 @@ mod tests {
         let mut second = BackgroundJobEvent::Failed {
             id: 8,
             error: "boom".into(),
+            omitted_output_bytes: 0,
             notified: false,
         };
         enqueue_background_notice(&printer, &mut second);
         assert!(!second.notified());
+    }
+
+    #[test]
+    fn background_output_is_line_bounded_and_terminal_control_safe() {
+        let printer = ExternalPrinter::new(4);
+        let mut output = BackgroundOutputState::new(12, printer.clone());
+        output.push(b"safe\x1b[2Jtext\r\n");
+        assert_eq!(output.finish(), 0);
+        let line = printer.get_line().unwrap();
+        assert!(line.starts_with("[12] safe"));
+        assert!(line.contains("\\u{1b}[2Jtext"));
+        assert!(!line.contains('\x1b'), "raw ESC must never reach Reedline");
+        assert!(!line.contains('\r'), "CRLF is normalized by the event path");
+    }
+
+    #[test]
+    fn background_output_queue_saturation_is_counted_for_the_terminal_notice() {
+        let printer = ExternalPrinter::new(1);
+        printer.sender().try_send("occupied".into()).unwrap();
+        let mut output = BackgroundOutputState::new(13, printer);
+        output.push(b"dropped line\n");
+        assert_eq!(output.finish(), b"dropped line\n".len());
+    }
+
+    #[test]
+    fn returned_taskvals_emit_one_async_completion_notice() {
+        let mut evaluator = Evaluator::new(PathBuf::from("/"));
+        let value = evaluator
+            .eval_program(&shoal_syntax::parse("spawn { sleep 10ms\n42 }").unwrap())
+            .unwrap();
+        let Value::Task(task) = &value else {
+            panic!("spawn must return a task")
+        };
+        let (tx, rx) = mpsc::channel();
+        let printer = ExternalPrinter::new(4);
+        let mut watched = BTreeSet::new();
+        let suppressed = Arc::new(Mutex::new(BTreeSet::new()));
+        watch_new_tasks(
+            &evaluator,
+            Some(&value),
+            &mut watched,
+            &suppressed,
+            &tx,
+            &printer,
+        );
+        let event = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(
+            event,
+            BackgroundJobEvent::TaskCompleted { id, error: None, notified: true, .. }
+                if id == task.id
+        ));
+        assert!(printer.get_line().unwrap().contains("Done"));
+
+        watch_new_tasks(
+            &evaluator,
+            Some(&value),
+            &mut watched,
+            &suppressed,
+            &tx,
+            &printer,
+        );
+        assert!(rx.try_recv().is_err(), "a task is watched exactly once");
+    }
+
+    #[test]
+    fn task_awaited_in_the_submitted_line_does_not_emit_a_background_notice() {
+        let mut evaluator = Evaluator::new(PathBuf::from("/"));
+        let value = evaluator
+            .eval_program(&shoal_syntax::parse("let t = spawn { 42 }\nt.await()").unwrap())
+            .unwrap();
+        let (tx, rx) = mpsc::channel();
+        let printer = ExternalPrinter::new(4);
+        watch_new_tasks(
+            &evaluator,
+            Some(&value),
+            &mut BTreeSet::new(),
+            &Arc::new(Mutex::new(BTreeSet::new())),
+            &tx,
+            &printer,
+        );
+        assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
+        assert!(printer.get_line().is_none());
     }
 
     #[test]

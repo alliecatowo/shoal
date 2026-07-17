@@ -19,7 +19,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use reedline::{Completer, Span as RlSpan, Suggestion};
 use shoal_adapters::{AdapterCatalog, CmdAdapter};
@@ -66,7 +66,7 @@ pub struct ShoalCompleter {
     path_dirs: Option<Arc<Mutex<Option<Vec<PathBuf>>>>>,
     adapters: Vec<AdapterCatalog>,
     adapter_names: Vec<String>,
-    path_cache: HashMap<PathBuf, (Option<SystemTime>, Vec<String>)>,
+    path_cache: HashMap<PathBuf, PathCacheEntry>,
     /// `completion.fuzzy` (site/content/internals/configuration-reference.md): allow typo-tolerant,
     /// non-contiguous matches instead of requiring a strict prefix.
     fuzzy: bool,
@@ -83,6 +83,16 @@ pub struct ShoalCompleter {
 const DEFAULT_FUZZY: bool = true;
 const DEFAULT_CASE_INSENSITIVE: bool = true;
 const DEFAULT_MAX_RESULTS: usize = 100;
+/// Directory mtimes do not change when an existing child is merely chmod'd.
+/// Periodic bounded revalidation keeps executable completion honest without
+/// rescanning every PATH directory on every keystroke.
+const PATH_CACHE_REVALIDATE: Duration = Duration::from_millis(200);
+
+struct PathCacheEntry {
+    dir_mtime: Option<SystemTime>,
+    scanned_at: Instant,
+    names: Vec<String>,
+}
 
 impl ShoalCompleter {
     pub fn new(
@@ -164,7 +174,9 @@ impl ShoalCompleter {
     fn path_dir_names(&mut self, dir: &Path) -> Vec<String> {
         let mtime = fs::metadata(dir).and_then(|m| m.modified()).ok();
         let stale = match self.path_cache.get(dir) {
-            Some((cached, _)) => *cached != mtime,
+            Some(cached) => {
+                cached.dir_mtime != mtime || cached.scanned_at.elapsed() >= PATH_CACHE_REVALIDATE
+            }
             None => true,
         };
         if stale {
@@ -179,11 +191,18 @@ impl ShoalCompleter {
                     }
                 }
             }
-            self.path_cache.insert(dir.to_path_buf(), (mtime, names));
+            self.path_cache.insert(
+                dir.to_path_buf(),
+                PathCacheEntry {
+                    dir_mtime: mtime,
+                    scanned_at: Instant::now(),
+                    names,
+                },
+            );
         }
         self.path_cache
             .get(dir)
-            .map_or_else(Vec::new, |(_, names)| names.clone())
+            .map_or_else(Vec::new, |cached| cached.names.clone())
     }
 
     fn adapter_lookup(&self, head: &str) -> Option<&CmdAdapter> {
@@ -1273,6 +1292,24 @@ mod tests {
         let mut second = c.path_dir_names(dir.path());
         second.sort();
         assert_eq!(second, vec!["toolone".to_string(), "tooltwo".to_string()]);
+    }
+
+    #[test]
+    fn path_names_cache_revalidates_chmod_without_directory_mtime_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = dir.path().join("mode-tool");
+        fs::write(&tool, b"").unwrap();
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o644)).unwrap();
+        let mut c = completer_at(Path::new("."));
+        assert!(c.path_dir_names(dir.path()).is_empty());
+
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+        std::thread::sleep(PATH_CACHE_REVALIDATE + Duration::from_millis(25));
+        assert_eq!(c.path_dir_names(dir.path()), vec!["mode-tool".to_string()]);
+
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o644)).unwrap();
+        std::thread::sleep(PATH_CACHE_REVALIDATE + Duration::from_millis(25));
+        assert!(c.path_dir_names(dir.path()).is_empty());
     }
 
     #[test]

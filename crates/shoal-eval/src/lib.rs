@@ -468,6 +468,14 @@ impl Evaluator {
         self.exec.jobs.task(id)
     }
 
+    /// Clone the bounded task registry for host-side lifecycle observation.
+    /// Task state is Arc-backed, so a host can wait without borrowing or
+    /// sharing the evaluator itself; registry pruning never invalidates the
+    /// returned handles.
+    pub fn tasks_snapshot(&self) -> Vec<shoal_value::TaskVal> {
+        self.exec.jobs.with_tasks(|tasks| tasks.to_vec())
+    }
+
     /// Record a foreground external command that the OS just *stopped* (Ctrl-Z →
     /// SIGTSTP, site/content/internals/language-conformance-contract.md). Registers a suspended [`shoal_value::TaskVal`] in the
     /// job table so it lists via `jobs` and the kernel `task.suspend`/

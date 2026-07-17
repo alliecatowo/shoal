@@ -61,6 +61,18 @@ const WINSIZE_EVERY_N_POLLS: u32 = 4;
 /// EOF before abandoning it (it exits on its own once the pty closes).
 const PUMP_DRAIN_GRACE: Duration = Duration::from_millis(500);
 
+type BackgroundOutputSink = Box<dyn FnMut(&[u8]) + Send>;
+
+struct OutputPumpConfig {
+    tee: Arc<Mutex<Vec<u8>>>,
+    tee_truncated: Arc<AtomicBool>,
+    passthrough: Option<File>,
+    background_output: Option<BackgroundOutputSink>,
+    cap: usize,
+    serve_done: Arc<AtomicBool>,
+    pump_done: Arc<AtomicBool>,
+}
+
 /// Parked, still-running PTY foreground jobs that were stopped (Ctrl-Z /
 /// SIGTSTP) and can be resumed by the host via `fg`/`bg`. Process-global
 /// because job control is inherently a per-process singleton (there is one
@@ -243,15 +255,16 @@ fn forward_stdin_and_resize(mut writer: File, done: &AtomicBool) {
 /// returns; otherwise it exits at EOF (`read` -> 0 / `EIO`, the slave closing).
 /// The tee is capped to [`crate::capture_hard_cap`] so a runaway child cannot
 /// OOM the shell; the real terminal still receives the full stream.
-fn pump_output(
-    reader: File,
-    tee: Arc<Mutex<Vec<u8>>>,
-    tee_truncated: Arc<AtomicBool>,
-    mut passthrough: Option<File>,
-    cap: usize,
-    serve_done: Arc<AtomicBool>,
-    pump_done: Arc<AtomicBool>,
-) {
+fn pump_output(reader: File, config: OutputPumpConfig) {
+    let OutputPumpConfig {
+        tee,
+        tee_truncated,
+        mut passthrough,
+        mut background_output,
+        cap,
+        serve_done,
+        pump_done,
+    } = config;
     let fd = reader.as_raw_fd();
     let mut buf = [0u8; 8192];
     loop {
@@ -304,6 +317,9 @@ fn pump_output(
         }
         if let Some(out) = passthrough.as_mut() {
             let _ = out.write_all(&buf[..n]);
+        }
+        if let Some(output) = background_output.as_mut() {
+            output(&buf[..n]);
         }
     }
     pump_done.store(true, Ordering::SeqCst);
@@ -396,6 +412,7 @@ impl PtyJob {
         foreground: bool,
         resume: bool,
         background_commands: Option<&Receiver<BackgroundCommand>>,
+        background_output: Option<BackgroundOutputSink>,
     ) -> io::Result<Wait> {
         // Raw mode only when actually forwarding a real terminal; restored on
         // every exit path (panics included) when the guard drops.
@@ -437,7 +454,10 @@ impl PtyJob {
             let tee_truncated = Arc::clone(&self.tee_truncated);
             let pump_done = Arc::clone(&pump_done);
             let serve_done = Arc::clone(&serve_done);
-            let passthrough = if self.stdout_is_tty {
+            // Foreground output retains byte-for-byte terminal passthrough.
+            // A background host can instead supply a line-editor-safe sink;
+            // legacy callers without one keep the historical passthrough.
+            let passthrough = if self.stdout_is_tty && (foreground || background_output.is_none()) {
                 dup_stdout()
             } else {
                 None
@@ -446,12 +466,15 @@ impl PtyJob {
             thread::spawn(move || {
                 pump_output(
                     reader,
-                    tee,
-                    tee_truncated,
-                    passthrough,
-                    cap,
-                    serve_done,
-                    pump_done,
+                    OutputPumpConfig {
+                        tee,
+                        tee_truncated,
+                        passthrough,
+                        background_output,
+                        cap,
+                        serve_done,
+                        pump_done,
+                    },
                 );
             })
         };
@@ -590,7 +613,7 @@ impl PtyJob {
     /// # Errors
     /// Propagates a `waitpid`/pty-plumbing [`io::Error`].
     pub fn resume_foreground(mut self, cancel: &CancelToken) -> io::Result<ExecResult> {
-        match self.serve(cancel, true, true, None)? {
+        match self.serve(cancel, true, true, None, None)? {
             Wait::Exited(raw) => Ok(self.exit_result(raw)),
             Wait::Stopped => {
                 let res = self.stopped_result();
@@ -605,7 +628,7 @@ impl PtyJob {
     /// background. Unlike [`PtyJob::resume_foreground`], this does not send
     /// SIGCONT: ownership transfer did not stop the process group.
     pub fn foreground_running(mut self, cancel: &CancelToken) -> io::Result<ExecResult> {
-        match self.serve(cancel, true, false, None)? {
+        match self.serve(cancel, true, false, None, None)? {
             Wait::Exited(raw) => Ok(self.exit_result(raw)),
             Wait::Stopped => {
                 let result = self.stopped_result();
@@ -630,7 +653,25 @@ impl PtyJob {
     /// after the child has either exited, stopped again and been re-parked, or
     /// failed during PTY service. Hosts use this to reconcile their separate
     /// job table without sharing evaluator state with the worker thread.
-    pub fn resume_background_notify<F>(mut self, notify: F)
+    pub fn resume_background_notify<F>(self, notify: F)
+    where
+        F: FnOnce(io::Result<ExecResult>) + Send + 'static,
+    {
+        self.resume_background_notify_inner(None, notify);
+    }
+
+    /// Background resume whose output is delivered to a host-owned bounded
+    /// presentation path instead of being written concurrently to fd 1. The
+    /// callback runs on the PTY pump thread and must remain nonblocking.
+    pub fn resume_background_notify_with_output<F, O>(self, output: O, notify: F)
+    where
+        F: FnOnce(io::Result<ExecResult>) + Send + 'static,
+        O: FnMut(&[u8]) + Send + 'static,
+    {
+        self.resume_background_notify_inner(Some(Box::new(output)), notify);
+    }
+
+    fn resume_background_notify_inner<F>(mut self, output: Option<BackgroundOutputSink>, notify: F)
     where
         F: FnOnce(io::Result<ExecResult>) + Send + 'static,
     {
@@ -639,7 +680,7 @@ impl PtyJob {
         register_background_job(pid, commands_tx);
         thread::spawn(move || {
             let cancel = CancelToken::new();
-            match self.serve(&cancel, false, true, Some(&commands_rx)) {
+            match self.serve(&cancel, false, true, Some(&commands_rx), output) {
                 Ok(Wait::Exited(raw)) => {
                     remove_background_job(pid);
                     notify(Ok(self.exit_result(raw)));
@@ -866,7 +907,7 @@ pub(crate) fn run_pty(mut spec: ExecSpec, cancel: &CancelToken) -> io::Result<Ex
         reaped: false,
     };
 
-    match job.serve(cancel, true, false, None) {
+    match job.serve(cancel, true, false, None, None) {
         Ok(Wait::Exited(raw)) => Ok(job.exit_result(raw)),
         Ok(Wait::Stopped) => {
             let res = job.stopped_result();
@@ -1225,6 +1266,39 @@ mod tests {
             take_background_job(res.pid).unwrap().is_none(),
             "transferred job must leave the background registry"
         );
+    }
+
+    #[test]
+    fn background_output_can_be_routed_to_a_host_sink() {
+        let _serial = JOB_CONTROL_TEST_LOCK.lock().unwrap();
+        let cancel = CancelToken::new();
+        let res =
+            run_pty(sh_spec("kill -STOP $$; printf background-safe"), &cancel).expect("run_pty");
+        let job = take_stopped_job(res.pid).expect("parked job");
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let sink = output.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        job.resume_background_notify_with_output(
+            move |bytes| sink.lock().unwrap().extend_from_slice(bytes),
+            move |result| {
+                let _ = tx.send(result);
+            },
+        );
+
+        let completed = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("background completion")
+            .expect("background result");
+        assert_eq!(completed.status, Some(0));
+        assert!(
+            output
+                .lock()
+                .unwrap()
+                .windows(b"background-safe".len())
+                .any(|window| window == b"background-safe")
+        );
+        assert!(process_is_gone(res.pid));
     }
 
     #[test]
