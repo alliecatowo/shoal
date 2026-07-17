@@ -1,6 +1,7 @@
 //! Candidate discovery, filtering, flag projection, and Reedline assembly.
 
 use std::collections::BTreeSet;
+#[cfg(test)]
 use std::path::Path;
 
 use reedline::{Span as RlSpan, Suggestion};
