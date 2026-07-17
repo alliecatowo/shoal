@@ -298,14 +298,16 @@ impl Evaluator {
         if shoal_exec::which(OsStr::new("rust-script"), path_env).is_some() {
             return self.run_interp("rust-script", path, args, position);
         }
-        // Fall back to compiling with rustc into a temp binary, then exec it.
-        let bin = std::env::temp_dir().join(format!(
-            "shoal-rs-{}-{}",
-            std::process::id(),
-            path.file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("script")
-        ));
+        // Fall back to compiling with rustc into a private per-invocation
+        // directory. Keeping the TempDir guard alive through execution makes
+        // same-stem concurrent scripts collision-free and removes both the
+        // compiler output and directory on every Result exit path.
+        let (artifact, bin) = rust_script_artifact_in(&std::env::temp_dir()).map_err(|error| {
+            ErrorVal::new(
+                "runner_not_found",
+                format!("cannot create a temporary Rust-script artifact: {error}"),
+            )
+        })?;
         let compile = self.run_argv(
             vec![
                 OsString::from("rustc"),
@@ -335,13 +337,52 @@ impl Evaluator {
         for v in args {
             argv.push(self.argv_value(v)?);
         }
-        self.run_argv(argv, position, StdinSpec::Null, &[], Span::default(), None)
+        let result = self.run_argv(argv, position, StdinSpec::Null, &[], Span::default(), None);
+        drop(artifact);
+        result
     }
+}
+
+fn rust_script_artifact_in(parent: &Path) -> std::io::Result<(tempfile::TempDir, PathBuf)> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::Builder::new()
+        .prefix("shoal-rs-")
+        .tempdir_in(parent)?;
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))?;
+    let bin = dir.path().join("script");
+    Ok((dir, bin))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rust_script_artifacts_are_unique_private_and_removed_on_drop() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let parent = tempfile::tempdir().unwrap();
+        let (first, first_bin) = rust_script_artifact_in(parent.path()).unwrap();
+        let (second, second_bin) = rust_script_artifact_in(parent.path()).unwrap();
+        assert_ne!(first.path(), second.path());
+        assert_eq!(first_bin.file_name(), Some(OsStr::new("script")));
+        assert_eq!(second_bin.file_name(), Some(OsStr::new("script")));
+        assert_eq!(
+            first.path().metadata().unwrap().permissions().mode() & 0o077,
+            0
+        );
+
+        let first_path = first.path().to_path_buf();
+        let second_path = second.path().to_path_buf();
+        std::fs::write(&first_bin, b"artifact").unwrap();
+        std::fs::write(&second_bin, b"artifact").unwrap();
+        drop(first);
+        assert!(!first_path.exists());
+        assert!(second_path.exists());
+        drop(second);
+        assert!(!second_path.exists());
+    }
 
     /// Fix 3: `run_poly`'s scripty gate used to hardcode `{shl,sh,py,js,rs}`,
     /// so a BARE filename (no `./`) with any other shipped-default extension
