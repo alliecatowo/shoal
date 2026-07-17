@@ -320,24 +320,26 @@ every capability. Do not patch only one child call site.
 
 ## Filesystem-port boundary is incomplete
 
-Injected `Fs` covers many reads and mutations, but production evaluation still mixes it with direct
-host `Path`/`std::fs` observations:
+Injected `Fs` covers every language-visible **write** and many reads, but production evaluation still
+mixes it with direct host `Path` read-only *observations*. Value/stream method saves are no longer
+here — path `.save`/`.append` and stream `.save` route through `CallCtx::fs()` (HR-C1/HR-C2). What
+remains is existence/type/canonicalization probing:
 
-| Direct host-path site | Bypassed behavior |
-|---|---|
-| `builtins.rs` `Path::is_dir` | `ls` root and `cp`/`mv` destination branching |
-| `command.rs::cd_target` | directory checks/canonicalization |
-| `frecency.rs` | candidate existence/canonicalization |
-| `modules.rs` | module candidate `is_file` and canonicalization |
-| `script.rs` | script `exists` checks |
-| `streams.rs` | watch/tail existence checks and watch rooting |
-| value/stream method save | direct `OpenOptions` writes |
+| Direct host-path site | Bypassed behavior | Kind |
+|---|---|---|
+| `builtins.rs` `Path::is_dir` | `ls` root and `cp`/`mv` destination branching | read-only probe |
+| `command.rs::cd_target` | directory checks/canonicalization | read-only probe |
+| `frecency.rs` | candidate existence/canonicalization | read-only probe |
+| `modules.rs` | module candidate `is_file` and canonicalization | read-only probe |
+| `script.rs` | script `exists` checks | read-only probe |
+| `streams.rs` | watch/tail existence checks and watch rooting | read-only probe |
 
-A fake or policy-aware `Fs` therefore cannot fully interpose filesystem semantics: it may provide
-file bytes while direct host metadata says the path does not exist, or observe writes that bypass
-its enforcement entirely. Port tests prove only the covered calls. Centralizing path metadata,
-canonicalization, open/write, and watcher setup behind capabilities is prerequisite to claiming a
-hexagonal filesystem boundary.
+These are non-mutating: a fake or policy-aware `Fs` may provide file bytes while direct host metadata
+disagrees about existence, but no *write* escapes the port any longer. Port tests prove the covered
+calls; the full inventory (routed vs. exempt) lives in the HR-C3 ledger in
+[`effects-plans-security.md`](@/internals/effects-plans-security.md). Centralizing path metadata,
+canonicalization, and watcher setup behind capabilities is the remaining read-side step toward a
+fully hexagonal filesystem boundary.
 
 ## Cancellation and error spans
 

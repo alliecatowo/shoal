@@ -126,9 +126,52 @@ lands.
 
 The evaluator holds ports for filesystem, execution, clock, opener, secrets, configuration, and
 CAS-byte loading. Default ports perform real host actions; tests can inject deterministic fakes.
-This is an incomplete seam, not proof that every effect is port-routed: direct `Path::is_dir`,
-`exists`, `canonicalize`, `std::fs::OpenOptions`, and OS watcher setup remain in production paths.
-See the filesystem-boundary ledger in the evaluator-state chapter.
+This is an improving-but-incomplete seam. Every **write** effect the language exposes now crosses
+the `Fs` port (the ledger below is the proof); the residue is a set of read-only `Path::exists`,
+`is_dir`, `is_file`, and `canonicalize` *observations* and OS watcher setup that still call the
+filesystem directly. See the filesystem-boundary ledger in the evaluator-state chapter.
+
+### In-process filesystem-effect ledger (HR-C3, 2026-07-16)
+
+Inventory of every `std::fs`/`OpenOptions` use in `shoal-value` and in `shoal-eval`'s value/method
+paths. Each site is either **routed** through the `Fs` port or an **exempt** read-only observation
+with a stated reason. Kept exact; a new effectful filesystem call adds a row.
+
+**Routed write/read effects** — mediated by the `Fs` port, so a fake can observe or deny them and a
+sandbox can enforce them:
+
+| Site | Effect | Port route |
+|---|---|---|
+| `shoal-value` `methods/path.rs::save` — value `.save`/`.append`, `save(path, value)` builtin | file write / append | `CallCtx::fs().write` / `.append` (HR-C1) |
+| `shoal-value` `methods/stream.rs::stream_save` — stream `.save`/`.append` | open-once incremental append | `CallCtx::fs().open_append` (HR-C2) |
+| `shoal-value` `ports.rs::StdFs` | every `std::fs` syscall | the port adapter itself — the boundary, not a bypass |
+| `shoal-eval` `expr_access.rs::path_fs_method` — path `.read`/`.read_bytes`/`.lines`/`.exists`/`.is_dir`/`.is_file`/`.size`/`.modified` | file read / stat | `self.fs.read` / `.metadata` |
+| `shoal-eval` `command.rs` redirects `>` and `>>` | file write / append | `self.fs.write` / `.append` |
+| `shoal-eval` `builtins.rs` — `cat`/`ls`/`mkdir`/`touch`/`mv`/`cp`/`rm`/`trash`/`ln` | read / write / dir / rename / link | `self.fs.*` |
+| `shoal-eval` `frecency.rs` dir-jump store load/save | read / write / rename | `self.fs.*` |
+| `shoal-eval` `journal.rs` undo snapshot + restore | read | `self.fs.read` |
+| `shoal-eval` `reef_builtins.rs` manifest read | stat / read | `self.fs.is_file` / `.read_to_string` |
+
+**Exempt read-only observations** — non-mutating existence/type/canonicalization probes that still
+call `Path::*` directly. They neither write, delete, nor spawn, so they are not the "in-process
+write that escapes plan/approval/sandbox" the C-findings target; several already read from
+port-fetched `Metadata`. Routing them through an `Fs` stat/exists/canonicalize method is a read-side
+follow-up, not part of lane C's write-effect mandate:
+
+| Site | Call | Why exempt |
+|---|---|---|
+| `builtins.rs` `root.is_dir()` (ls), `dest.is_dir()` (cp/mv) | `Path::is_dir` | type probe guarding a *ported* `fs.read_dir`/`fs.copy`/`fs.rename` |
+| `command.rs::cd` `joined.canonicalize()` | `Path::canonicalize` | cwd resolution; `cd` is a session-state change, not an `FsWrite` |
+| `modules.rs` module resolution | `Path::is_file` / `canonicalize` | read-only discovery; the module read/exec is planned as `FsRead` (HR-A1) |
+| `script.rs` `resolved.exists()` | `Path::exists` | dispatch probe before `run_script_file` (itself a read) |
+| `streams.rs` watch/tail `root.exists()` / `path.exists()` | `Path::exists` | source-existence guard; the source read uses `self.fs.open_read` |
+| `journal.rs` undo target `is_file`/`exists`/`is_dir` | `Path::*` | read-only guards choosing the undo inverse; the mutation is ported |
+
+The `Fs` port also mediates the `CallCtx::fs()` seam value methods reach through. Its default is the
+real filesystem (`StdFs`) so a portless context is byte-identical to the pre-port `OpenOptions`
+code; a host with a sandboxed/injected `Fs` port must return it from `CallCtx::fs()` for value-method
+writes to consult that port (the evaluator's `impl CallCtx` override is the remaining eval-side wire,
+tracked with the child-context work).
 
 More seriously, fresh evaluators created by `spawn_block`, `.shl` `run_script_file`, `parallel`, and
 `on` do not inherit the parent Leash policy/principal; they also omit Reef state, and some omit

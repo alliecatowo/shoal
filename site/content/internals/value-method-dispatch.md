@@ -22,15 +22,20 @@ and its receiver modules under
 
 ## Capability boundary
 
-The value crate's `CallCtx` exposes only:
+The value crate's `CallCtx` exposes:
 
 ```text
 call_closure(function, positional_values) -> VResult<Value>
 cwd() -> PathBuf
+fs() -> &dyn Fs        // defaults to StdFs
 ```
 
-This is enough for functional collection stages and pure path absolutization. It is not enough to
-spawn a command or inspect a filesystem. Those operations remain evaluator responsibilities.
+This is enough for functional collection stages, pure path absolutization, and the explicit write
+sinks (`.save`/`.append`), which route through the `fs()` port rather than `std::fs` directly. It is
+still not enough to spawn a command or inspect arbitrary filesystem state (reads, stat, globbing);
+those operations remain evaluator responsibilities. `fs()` defaults to `StdFs` (the real
+filesystem), so a portless context is byte-identical to the pre-port behavior; an evaluator with an
+injected/sandboxed `Fs` port overrides `fs()` in its `CallCtx` impl so value writes cross that port.
 
 ```mermaid
 flowchart LR
@@ -40,8 +45,8 @@ accDescr: Shows the components and relationships described in Capability boundar
   Eval --> Feed["feed / channel / namespace / fs path methods"]
   Eval --> Core["shoal_value::methods::call_method"]
   Core --> Pure["collection / string / record / number"]
-  Core --> Ctx["CallCtx: closure calls + cwd"]
-  Core --> Effects["save / append via direct std::fs::OpenOptions"]
+  Core --> Ctx["CallCtx: closure calls + cwd + fs() port"]
+  Core --> Effects["save / append via CallCtx::fs() Fs port"]
 ```
 
 `call_method` attaches the call span with `or_span`, preserving a more precise error span produced
@@ -196,12 +201,15 @@ Filesystem-backed path methods such as read, lines, size, metadata, or existence
 the evaluator because they require the injected `Fs` port. This split is easy to miss when adding
 completion metadata: both sets are language-visible methods on `path`.
 
-The general `save` and `append` methods write a receiver to a supplied path with direct
-`std::fs::OpenOptions` calls in `methods/path.rs`; stream `.save` does likewise in
-`methods/stream.rs`. `CallCtx` is **not** a filesystem capability. Evaluator call sites can surround
-some value saves with journal undo hooks, but the actual I/O bypasses the injected `Fs` port and
-Leash/policy effect boundary. This is architectural debt: fake filesystems and policy enforcement do
-not cover every language-visible write today.
+The general `save` and `append` methods write a receiver to a supplied path through
+`CallCtx::fs().write`/`.append` in `methods/path.rs`; stream `.save`/`.append` opens once through
+`CallCtx::fs().open_append` in `methods/stream.rs` (HR-C1/HR-C2). `CallCtx::fs()` is the filesystem
+capability: it defaults to `StdFs` (byte-identical to the pre-port `OpenOptions` code) and a host
+returns its injected/sandboxed `Fs` port from the `fs()` override so a fake can observe or deny the
+write. Evaluator call sites still surround some value saves with journal undo hooks. The remaining
+eval-side wire is the evaluator's `CallCtx::fs()` override returning its own injected port; until
+that lands, value writes cross `StdFs` (the real filesystem) rather than the evaluator's sandboxed
+port — but they are already port-routed and deniable, not raw `std::fs`.
 
 ## Numeric methods
 
@@ -289,8 +297,9 @@ arguments rather than accidentally ignoring them.
 
 - Dispatch is a hand-ordered chain; moving an arm can change meaning on path, outcome, stream, or
   lazy bytes receivers.
-- `save`/`append` and stream `.save` call `std::fs::OpenOptions` directly, bypassing evaluator `Fs`
-  injection and policy ports; port unification must preserve streaming and append semantics.
+- `save`/`append` and stream `.save` route through `CallCtx::fs()` (`.write`/`.append`/
+  `.open_append`), preserving streaming and append semantics; the port default is `StdFs`, so the
+  evaluator's `CallCtx::fs()` override to return its injected/sandboxed port is the remaining wire.
 - Some method aliases expand the discoverable surface (`reduce`/`fold`, `where`/`filter`,
   `group`/`group_by`, `tap`/`also`). Registry/help must include both.
 - Unicode string length counts scalar values, not graphemes.

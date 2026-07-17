@@ -251,10 +251,11 @@ re-auditing if time budgets become strict RPC cancellation contracts.
 | `.render()` | evaluator drives and sends each item to statement sink | `null` |
 | other collection method | collect bounded stream, redispatch on list | method-dependent |
 
-Despite two names, stream `.save` and `.append` both open with create+append. They use direct
-`std::fs::OpenOptions`, bypassing the evaluator `Fs` port, policy boundary, and journal undo model.
-Strings and bytes are written verbatim per item; other values become JSON; every item gets an added
-newline.
+Despite two names, stream `.save` and `.append` both open with create+append. They open once through
+the `Fs` port (`CallCtx::fs().open_append`, HR-C2) — a fake can observe or deny the write — rather
+than `std::fs::OpenOptions` directly; the write still bypasses the journal undo model, and consults
+the evaluator's *sandboxed* port only once the evaluator overrides `CallCtx::fs()`. Strings and bytes
+are written verbatim per item; other values become JSON; every item gets an added newline.
 
 `drive_stream` blocks with no timeout until end/error. Cancellation is documented as dropping the
 pipeline/receiver, but a sink currently holding and blocking on a live receiver needs its surrounding
@@ -380,7 +381,8 @@ site.
 - Dropped/coalesced markers widen stream element shapes without a static type system expressing it.
 - Timer and timing combinators use direct system time/sleep, reducing deterministic testability.
 - Watch existence/root discovery bypasses `Fs`; tail content reads use it.
-- Stream save/append bypass `Fs`, journal, and Leash policy ports.
+- Stream save/append cross the `Fs` port (`open_append`, HR-C2) but still bypass journal undo; they
+  reach the evaluator's sandboxed port only once its `CallCtx::fs()` override lands.
 - Predicate/signal `take_until` does not mark an unbounded stream collectable.
 - No explicit `Upstream` cancellation/deadline context spans an entire sink.
 - Event rings are memory-only and sequence spaces are local to each bus side.
