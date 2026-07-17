@@ -6,11 +6,12 @@ use std::sync::{Mutex, MutexGuard};
 
 pub const ENV_BINDING_NAME_BYTES: usize = 256;
 pub const ENV_BINDING_IDENTITY_CAP: usize = 4096;
-// Large command tables are retained in the implicit `it`/`out` bindings. Keep
-// one binding comfortably above the kernel's ordinary 1 MiB output envelope;
-// the independent aggregate wall still prevents a session from retaining an
-// unbounded sequence of maximum-sized values.
-pub const ENV_BINDING_VALUE_BYTES: usize = 2 * 1024 * 1024;
+// Large command tables are retained in the implicit `it`/`out` bindings. An
+// outcome can retain both the kernel's ordinary 1 MiB captured-output envelope
+// and its parsed table, plus the value envelope, so keep one binding above that
+// doubled representation. The independent aggregate wall still prevents a
+// session from retaining an unbounded sequence of maximum-sized values.
+pub const ENV_BINDING_VALUE_BYTES: usize = 4 * 1024 * 1024;
 pub const ENV_BINDING_AGGREGATE_BYTES: usize = 16 * 1024 * 1024;
 pub const ENV_BINDING_VALUE_DEPTH: usize = 64;
 pub const ENV_BINDING_VALUE_NODES: usize = 16 * 1024;
