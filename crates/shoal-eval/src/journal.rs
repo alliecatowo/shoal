@@ -63,9 +63,9 @@ impl Evaluator {
         session: impl Into<String>,
         principal: impl Into<String>,
     ) {
-        self.journal = Some(journal);
-        self.session_id = session.into();
-        self.principal = principal.into();
+        self.session.journal = Some(journal);
+        self.session.session_id = session.into();
+        self.session.principal = principal.into();
     }
 
     /// Open (creating if needed) the default per-user state-dir journal and
@@ -89,7 +89,7 @@ impl Evaluator {
 
     /// Whether a journal is installed (for hosts/tests).
     pub fn has_journal(&self) -> bool {
-        self.journal.is_some()
+        self.session.journal.is_some()
     }
 
     // --- per-statement recording ------------------------------------------
@@ -106,8 +106,8 @@ impl Evaluator {
         let ast_json = serde_json::to_string(stmt).unwrap_or_default();
         let (effects_json, opaque) = self.stmt_effects(stmt);
         let record = EntryRecord {
-            session: self.session_id.clone(),
-            principal: self.principal.clone(),
+            session: self.session.session_id.clone(),
+            principal: self.session.principal.clone(),
             ts_ns: self.clock.now_ns(),
             cwd: self.cwd.as_os_str().as_bytes().to_vec(),
             src,
@@ -115,7 +115,7 @@ impl Evaluator {
             effects_json,
             opaque,
         };
-        let id = self.journal.as_ref()?.append(&record).ok()?;
+        let id = self.session.journal.as_ref()?.append(&record).ok()?;
         self.current_entry = Some(id);
         Some((id, Instant::now()))
     }
@@ -132,7 +132,7 @@ impl Evaluator {
             return;
         };
         self.current_entry = None;
-        let Some(journal) = self.journal.as_ref() else {
+        let Some(journal) = self.session.journal.as_ref() else {
             return;
         };
         let dur = elapsed_ns(start);
@@ -212,7 +212,7 @@ impl Evaluator {
         let Some(entry) = self.current_entry else {
             return Vec::new();
         };
-        if self.journal.is_none() || !matches!(head, "cp" | "mv") {
+        if self.session.journal.is_none() || !matches!(head, "cp" | "mv") {
             return Vec::new();
         }
         let Some(paths) = self.literal_arg_paths(call) else {
@@ -255,7 +255,7 @@ impl Evaluator {
         let Some(entry) = self.current_entry else {
             return;
         };
-        let Some(journal) = self.journal.as_ref() else {
+        let Some(journal) = self.session.journal.as_ref() else {
             return;
         };
         if head == "rm" {
@@ -318,7 +318,7 @@ impl Evaluator {
     /// partial-content inverse is never keyed.
     fn overwrite_undo_pre(&mut self, target: &Path) -> Option<FsUndoPre> {
         let entry = self.current_entry?;
-        self.journal.as_ref()?;
+        self.session.journal.as_ref()?;
         if !target.is_file() {
             return None;
         }
@@ -338,7 +338,7 @@ impl Evaluator {
         else {
             return;
         };
-        let Some(journal) = self.journal.as_ref() else {
+        let Some(journal) = self.session.journal.as_ref() else {
             return;
         };
         if let Ok(fp) = FileFingerprint::capture(&path) {
@@ -366,6 +366,7 @@ impl Evaluator {
     fn snapshot_prior(&self, entry: i64, path: &Path) -> Option<String> {
         let bytes = self.fs.read(path).ok()?;
         let (hash, meta) = self
+            .session
             .journal
             .as_ref()?
             .record_output_meta(entry, "undo-snapshot", &bytes)
@@ -418,7 +419,7 @@ impl Evaluator {
     /// the entry's typed inverses newest-first, refusing loudly if a target has
     /// changed since it was recorded.
     pub(crate) fn builtin_undo(&mut self, call: &CmdCall) -> VResult<Value> {
-        if self.journal.is_none() {
+        if self.session.journal.is_none() {
             return Err(ErrorVal::new(
                 "custom",
                 "undo requires a journaled session; none is active",
@@ -426,7 +427,7 @@ impl Evaluator {
             .with_span(call.span));
         }
         let target = self.undo_target_id(call)?;
-        let journal = self.journal.as_ref().expect("checked");
+        let journal = self.session.journal.as_ref().expect("checked");
         let entry_id = match target {
             Some(id) => id,
             None => last_reversible_entry(journal).ok_or_else(|| {
@@ -472,7 +473,7 @@ impl Evaluator {
     /// table when no journal is installed (never crashes). `--head <word>` and
     /// `--principal <who>` filter; `--limit <n>` caps the row count.
     pub(crate) fn builtin_journal_view(&mut self, call: &CmdCall) -> VResult<Value> {
-        let Some(journal) = self.journal.as_ref() else {
+        let Some(journal) = self.session.journal.as_ref() else {
             return Ok(Value::Table(Vec::new()));
         };
         let mut query = JournalQuery::default();
@@ -651,7 +652,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut ev = journaled(dir.path());
         run_journaled(&mut ev, "echo hi").unwrap();
-        let journal = ev.journal.as_ref().unwrap();
+        let journal = ev.session.journal.as_ref().unwrap();
         let rows = journal.query(&JournalQuery::default()).unwrap();
         assert_eq!(rows.len(), 1, "one entry recorded");
         let entry = &rows[0];
@@ -677,12 +678,19 @@ mod tests {
         assert!(!dir.path().join("victim").exists(), "rm trashed the file");
         // A trash inverse was recorded.
         let rows = ev
+            .session
             .journal
             .as_ref()
             .unwrap()
             .query(&JournalQuery::default())
             .unwrap();
-        let undos = ev.journal.as_ref().unwrap().undos_for(rows[0].id).unwrap();
+        let undos = ev
+            .session
+            .journal
+            .as_ref()
+            .unwrap()
+            .undos_for(rows[0].id)
+            .unwrap();
         assert_eq!(undos.len(), 1);
         assert_eq!(undos[0].0, "trash_move");
         // `undo` moves it back with its original bytes.
@@ -706,12 +714,19 @@ mod tests {
             b"replacement"
         );
         let rows = ev
+            .session
             .journal
             .as_ref()
             .unwrap()
             .query(&JournalQuery::default())
             .unwrap();
-        let undos = ev.journal.as_ref().unwrap().undos_for(rows[0].id).unwrap();
+        let undos = ev
+            .session
+            .journal
+            .as_ref()
+            .unwrap()
+            .undos_for(rows[0].id)
+            .unwrap();
         assert_eq!(undos[0].0, "restore_bytes");
         // `undo` brings back the prior contents.
         run_journaled(&mut ev, "undo").unwrap();
@@ -754,12 +769,19 @@ mod tests {
 
         // No restore_bytes inverse was recorded for the truncated snapshot.
         let rows = ev
+            .session
             .journal
             .as_ref()
             .unwrap()
             .query(&JournalQuery::default())
             .unwrap();
-        let undos = ev.journal.as_ref().unwrap().undos_for(rows[0].id).unwrap();
+        let undos = ev
+            .session
+            .journal
+            .as_ref()
+            .unwrap()
+            .undos_for(rows[0].id)
+            .unwrap();
         assert!(
             undos.is_empty(),
             "a truncated snapshot must not key a replayable inverse; got {undos:?}"
@@ -797,12 +819,19 @@ mod tests {
             b"replaced\n"
         );
         let rows = ev
+            .session
             .journal
             .as_ref()
             .unwrap()
             .query(&JournalQuery::default())
             .unwrap();
-        let undos = ev.journal.as_ref().unwrap().undos_for(rows[0].id).unwrap();
+        let undos = ev
+            .session
+            .journal
+            .as_ref()
+            .unwrap()
+            .undos_for(rows[0].id)
+            .unwrap();
         assert_eq!(undos[0].0, "restore_bytes");
         run_journaled(&mut ev, "undo").unwrap();
         assert_eq!(
@@ -824,12 +853,19 @@ mod tests {
             b"first\nsecond\n"
         );
         let rows = ev
+            .session
             .journal
             .as_ref()
             .unwrap()
             .query(&JournalQuery::default())
             .unwrap();
-        let undos = ev.journal.as_ref().unwrap().undos_for(rows[0].id).unwrap();
+        let undos = ev
+            .session
+            .journal
+            .as_ref()
+            .unwrap()
+            .undos_for(rows[0].id)
+            .unwrap();
         assert_eq!(undos[0].0, "restore_bytes");
         run_journaled(&mut ev, "undo").unwrap();
         assert_eq!(
@@ -851,12 +887,19 @@ mod tests {
             b"replaced"
         );
         let rows = ev
+            .session
             .journal
             .as_ref()
             .unwrap()
             .query(&JournalQuery::default())
             .unwrap();
-        let undos = ev.journal.as_ref().unwrap().undos_for(rows[0].id).unwrap();
+        let undos = ev
+            .session
+            .journal
+            .as_ref()
+            .unwrap()
+            .undos_for(rows[0].id)
+            .unwrap();
         assert_eq!(undos[0].0, "restore_bytes");
         run_journaled(&mut ev, "undo").unwrap();
         assert_eq!(
@@ -878,12 +921,19 @@ mod tests {
             b"fresh\n"
         );
         let rows = ev
+            .session
             .journal
             .as_ref()
             .unwrap()
             .query(&JournalQuery::default())
             .unwrap();
-        let undos = ev.journal.as_ref().unwrap().undos_for(rows[0].id).unwrap();
+        let undos = ev
+            .session
+            .journal
+            .as_ref()
+            .unwrap()
+            .undos_for(rows[0].id)
+            .unwrap();
         assert!(
             undos.is_empty(),
             "create-new redirect must not fake an inverse; got {undos:?}"
@@ -916,12 +966,19 @@ mod tests {
         );
         run_journaled(&mut ev, "echo small > f.txt").unwrap();
         let rows = ev
+            .session
             .journal
             .as_ref()
             .unwrap()
             .query(&JournalQuery::default())
             .unwrap();
-        let undos = ev.journal.as_ref().unwrap().undos_for(rows[0].id).unwrap();
+        let undos = ev
+            .session
+            .journal
+            .as_ref()
+            .unwrap()
+            .undos_for(rows[0].id)
+            .unwrap();
         assert!(
             undos.is_empty(),
             "a truncated prior snapshot must not key a replayable inverse; got {undos:?}"
@@ -1068,7 +1125,7 @@ mod tests {
         // The CAS blob exists and its blake3 matches (Cas::read re-hashes and
         // verifies the content against `hash` before returning it).
         let expected = vec![0u8; 200_000];
-        let cas = ev.journal.as_ref().unwrap().cas();
+        let cas = ev.session.journal.as_ref().unwrap().cas();
         assert_eq!(
             cas.read(&hash).unwrap(),
             expected,
@@ -1099,7 +1156,13 @@ mod tests {
             Value::Int(100)
         );
         assert!(
-            ev.journal.as_ref().unwrap().pins().unwrap().is_empty(),
+            ev.session
+                .journal
+                .as_ref()
+                .unwrap()
+                .pins()
+                .unwrap()
+                .is_empty(),
             "no spill blob is pinned for a sub-cap capture"
         );
     }
@@ -1120,6 +1183,7 @@ mod tests {
         // which is exactly what a spilled capture leaves behind.
         let content = b"hello, cas-backed world!\n".repeat(40); // 1000 bytes, valid UTF-8
         let hash = ev
+            .session
             .journal
             .as_ref()
             .unwrap()

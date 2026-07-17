@@ -629,7 +629,7 @@ impl Evaluator {
         // gate below can reuse it rather than re-hashing the same file.
         let reef_hash = self.reef_apply(&mut argv, &mut env, span)?;
         let force_tui = meta.as_ref().is_some_and(|m| m.class == AdapterClass::Tui);
-        let mode = if force_tui || (self.interactive && position == Position::Statement) {
+        let mode = if force_tui || (self.session.interactive && position == Position::Statement) {
             ExecMode::PtyTee
         } else {
             ExecMode::Capture
@@ -678,7 +678,8 @@ impl Evaluator {
         // preserves the exact pre-spill behavior (bounded RAM buffer, overflow
         // dropped) — so `-c`/scripts/conformance are wholly untouched.
         let spill = if mode == ExecMode::Capture {
-            self.journal
+            self.session
+                .journal
                 .as_ref()
                 .and_then(|j| j.spill_dir().ok())
                 .map(|dir| shoal_exec::SpillConfig { dir })
@@ -814,7 +815,7 @@ impl Evaluator {
         spill: &shoal_exec::CaptureSpill,
         preview: Arc<Vec<u8>>,
     ) -> Option<Arc<shoal_value::CasBytesVal>> {
-        let journal = self.journal.as_ref()?;
+        let journal = self.session.journal.as_ref()?;
         if journal
             .ingest_spill(&spill.path, &spill.hash, spill.len, true)
             .is_err()
@@ -860,7 +861,7 @@ impl Evaluator {
     /// fresh spill uses.
     fn load_content_ref(&self, hash: &str) -> VResult<Value> {
         let prefix = shoal_value::CasBytesVal::REF_PREFIX;
-        let Some(journal) = self.journal.as_ref() else {
+        let Some(journal) = self.session.journal.as_ref() else {
             return Err(ErrorVal::new(
                 "not_found",
                 format!(
@@ -915,7 +916,7 @@ impl Evaluator {
         reef_hash: Option<&str>,
         span: Span,
     ) -> VResult<()> {
-        let Some((policy, principal)) = self.leash.as_ref() else {
+        let Some((policy, principal)) = self.session.leash.as_ref() else {
             return Ok(());
         };
         // Empty/absent `proc_spawn` grants ⇒ allow, exactly as before pinning

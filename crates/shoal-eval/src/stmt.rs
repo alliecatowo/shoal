@@ -58,7 +58,7 @@ impl Evaluator {
     /// behavior; `Quiet`/`Commands` echo only bare-command intermediates so a
     /// script's intermediate pure expressions (`1+1`, `let x=…`) stay silent.
     fn echo_intermediate(&self, stmt: &Stmt) -> bool {
-        match self.echo_mode {
+        match self.session.echo_mode {
             EchoMode::All => true,
             EchoMode::Quiet | EchoMode::Commands => crate::is_bare_command_stmt(stmt),
         }

@@ -52,8 +52,8 @@ impl Evaluator {
         for v in vs {
             argv.push(self.argv_value(v)?);
         }
-        let saved = self.interactive;
-        self.interactive = true;
+        let saved = self.session.interactive;
+        self.session.interactive = true;
         let r = self.run_argv(
             argv,
             Position::Statement,
@@ -62,7 +62,7 @@ impl Evaluator {
             call.span,
             None,
         );
-        self.interactive = saved;
+        self.session.interactive = saved;
         r
     }
 

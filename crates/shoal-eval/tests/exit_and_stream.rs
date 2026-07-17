@@ -21,7 +21,7 @@ fn parse(src: &str) -> shoal_ast::Program {
 fn builtin_outcome_is_not_streamed() {
     let dir = tempfile::tempdir().unwrap();
     let mut ev = Evaluator::new(dir.path().to_path_buf());
-    ev.interactive = true;
+    ev.set_interactive(true);
     let out = ev.eval_program(&parse("echo hello")).expect("echo runs");
     let Value::Outcome(o) = out else {
         panic!("echo should yield an outcome, got {out:?}");
@@ -39,7 +39,7 @@ fn builtin_outcome_is_not_streamed() {
 fn captured_external_is_not_streamed() {
     let dir = tempfile::tempdir().unwrap();
     let mut ev = Evaluator::new(dir.path().to_path_buf());
-    ev.interactive = true;
+    ev.set_interactive(true);
     // Value position (bound with `let`) forces Capture mode even interactively.
     let out = ev
         .eval_program(&parse("let r = (/usr/bin/printf hi); r"))
@@ -58,7 +58,7 @@ fn captured_external_is_not_streamed() {
 fn ptytee_external_is_streamed() {
     let dir = tempfile::tempdir().unwrap();
     let mut ev = Evaluator::new(dir.path().to_path_buf());
-    ev.interactive = true;
+    ev.set_interactive(true);
     let out = ev
         .eval_program(&parse("/usr/bin/true"))
         .expect("external runs");

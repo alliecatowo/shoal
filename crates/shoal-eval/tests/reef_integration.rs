@@ -97,7 +97,7 @@ fn project(reef_toml: &str, fixtures: &[(&str, &str)]) -> (tempfile::TempDir, Pa
 fn constrained_tool_resolves_to_fixture_and_spawns() {
     let (dir, bindir) = project("[tools]\nfaketool = \"*\"\n", &[("faketool", "1.2.3")]);
     let mut ev = Evaluator::new(dir.path().to_path_buf());
-    ev.interactive = true; // interactive → auto-lock, no reef_unlocked
+    ev.set_interactive(true); // interactive → auto-lock, no reef_unlocked
     ev.set_reef_resolver(fixture_resolver(&bindir));
 
     let out = ev.eval_program(&parse("faketool")).expect("faketool runs");
@@ -122,7 +122,7 @@ fn constrained_tool_resolves_to_fixture_and_spawns() {
 fn which_shows_the_resolution_chain() {
     let (dir, bindir) = project("[tools]\nfaketool = \"*\"\n", &[("faketool", "1.2.3")]);
     let mut ev = Evaluator::new(dir.path().to_path_buf());
-    ev.interactive = true;
+    ev.set_interactive(true);
     ev.set_reef_resolver(fixture_resolver(&bindir));
 
     let out = ev
@@ -158,7 +158,7 @@ fn which_shows_the_resolution_chain() {
 fn script_mode_unlocked_constraint_errors() {
     let (dir, bindir) = project("[tools]\nfaketool = \"*\"\n", &[("faketool", "1.2.3")]);
     let mut ev = Evaluator::new(dir.path().to_path_buf());
-    ev.interactive = false; // script/CI policy → hard error on unlocked constraint
+    ev.set_interactive(false); // script/CI policy → hard error on unlocked constraint
     ev.set_reef_resolver(fixture_resolver(&bindir));
 
     let err = ev
@@ -173,7 +173,7 @@ fn constrained_but_missing_tool_reports_did_you_mean() {
     // Manifest constrains `ghosttool`, but no fixture provides it.
     let (dir, bindir) = project("[tools]\nghosttool = \"9\"\n", &[]);
     let mut ev = Evaluator::new(dir.path().to_path_buf());
-    ev.interactive = true;
+    ev.set_interactive(true);
     ev.set_reef_resolver(fixture_resolver(&bindir));
 
     let err = ev
@@ -191,7 +191,7 @@ fn constrained_but_missing_tool_reports_did_you_mean() {
 fn reef_builtin_lists_bindings() {
     let (dir, bindir) = project("[tools]\nfaketool = \"*\"\n", &[("faketool", "1.2.3")]);
     let mut ev = Evaluator::new(dir.path().to_path_buf());
-    ev.interactive = true;
+    ev.set_interactive(true);
     ev.set_reef_resolver(fixture_resolver(&bindir));
 
     let out = ev.eval_program(&parse("reef")).expect("reef runs");
@@ -225,7 +225,7 @@ fn reef_add_writes_manifest_and_locks() {
         &[("faketool", "1"), ("other", "2")],
     );
     let mut ev = Evaluator::new(dir.path().to_path_buf());
-    ev.interactive = true;
+    ev.set_interactive(true);
     ev.set_reef_resolver(fixture_resolver(&bindir));
 
     let out = ev
@@ -304,7 +304,7 @@ fn unmentioned_tool_is_passthrough_even_under_script_policy() {
     let (dir, bindir) = project("[tools]\nfaketool = \"*\"\n", &[("faketool", "1")]);
     fixture_bin(&bindir, "othertool", "9"); // present, but NOT in the manifest
     let mut ev = Evaluator::new(dir.path().to_path_buf());
-    ev.interactive = false; // script policy — a constrained miss would error
+    ev.set_interactive(false); // script policy — a constrained miss would error
     ev.set_reef_resolver(fixture_resolver(&bindir));
 
     let src = format!("PATH={} othertool", bindir.display());
@@ -345,7 +345,7 @@ fn prompt_reef_snapshot_unlocked_then_locked() {
     // probe `--version`, so the locked entry carries a real version string.
     let (dir, bindir) = project("[tools]\nfaketool = \"1.2.3\"\n", &[("faketool", "1.2.3")]);
     let mut ev = Evaluator::new(dir.path().to_path_buf());
-    ev.interactive = true; // interactive → auto-lock on the spawn below
+    ev.set_interactive(true); // interactive → auto-lock on the spawn below
     ev.set_reef_resolver(fixture_resolver(&bindir));
 
     // Before anything has spawned: constrained (a manifest mentions it) but

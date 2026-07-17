@@ -48,7 +48,7 @@ pub(crate) fn repl() -> Result<i32, String> {
         pager: config.render.pager.clone(),
     };
     let mut evaluator = Evaluator::new(cwd.clone());
-    evaluator.interactive = true;
+    evaluator.set_interactive(true);
     // Wire the user reef scope (site/content/internals/reef-resolution.md) exactly like `run_source`
     // does (crate::reef_user_manifest_path). The REPL builds its own
     // `Evaluator` and was missing this call entirely — without it,

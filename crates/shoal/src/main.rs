@@ -309,7 +309,7 @@ fn run_source(
         }
     };
     let mut evaluator = Evaluator::new(cwd);
-    evaluator.interactive = interactive;
+    evaluator.set_interactive(interactive);
     // `render.echo` (site/content/internals/configuration-reference.md): a non-interactive run defaults to
     // `quiet` — only bare-command output and the FINAL statement's value show,
     // intermediate pure expressions (`1+1`, `let x=…`) do NOT auto-print. The
