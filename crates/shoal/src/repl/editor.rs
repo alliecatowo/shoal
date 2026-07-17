@@ -1,12 +1,14 @@
 //! Reedline edit-mode, history filtering, and multiline validation policy.
 
+use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use reedline::{
-    EditMode, Emacs, History, HistoryItem, HistoryItemId, HistorySessionId, KeyCode, KeyModifiers,
-    ReedlineEvent, SearchDirection, SearchQuery, ValidationResult, Validator, Vi,
-    default_emacs_keybindings, default_vi_insert_keybindings, default_vi_normal_keybindings,
+    EditMode, Emacs, FileBackedHistory, History, HistoryItem, HistoryItemId, HistorySessionId,
+    KeyCode, KeyModifiers, ReedlineEvent, SearchDirection, SearchQuery, ValidationResult,
+    Validator, Vi, default_emacs_keybindings, default_vi_insert_keybindings,
+    default_vi_normal_keybindings,
 };
 
 pub(super) fn build_edit_mode(
@@ -162,6 +164,18 @@ pub(super) fn history_path() -> Option<PathBuf> {
             .state_dir()
             .join("history.txt"),
     )
+}
+
+pub(super) fn open_history(max_entries: usize, path: &Path) -> Result<FileBackedHistory, String> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("cannot create history directory: {error}"))?;
+    }
+    FileBackedHistory::with_file(max_entries, path.to_path_buf())
+        .map_err(|error| format!("cannot open history file: {error}"))
 }
 
 pub(super) struct ShoalValidator;

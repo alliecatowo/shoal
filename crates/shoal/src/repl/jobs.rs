@@ -10,6 +10,58 @@ use shoal_value::Value;
 
 use crate::maybe_strip;
 
+/// REPL-owned background lifecycle state. The bounded channel, watched-ID
+/// mirror, one-shot suppressions, and terminal printer advance together.
+pub(super) struct BackgroundJobs {
+    events: SyncSender<BackgroundJobEvent>,
+    receiver: Receiver<BackgroundJobEvent>,
+    watched: BTreeSet<u64>,
+    suppressed: Arc<Mutex<BTreeSet<u64>>>,
+    printer: ExternalPrinter<String>,
+}
+
+impl BackgroundJobs {
+    pub(super) fn new(evaluator: &Evaluator, printer: ExternalPrinter<String>) -> Self {
+        let (events, receiver) = std::sync::mpsc::sync_channel(MAX_PENDING_BACKGROUND_EVENTS);
+        let mut state = Self {
+            events,
+            receiver,
+            watched: BTreeSet::new(),
+            suppressed: Arc::new(Mutex::new(BTreeSet::new())),
+            printer,
+        };
+        state.watch(evaluator, None);
+        state
+    }
+
+    pub(super) fn reconcile(&self, evaluator: &mut Evaluator) {
+        drain_background_job_events(evaluator, &self.receiver);
+    }
+
+    pub(super) fn watch(&mut self, evaluator: &Evaluator, value: Option<&Value>) {
+        watch_new_tasks(
+            evaluator,
+            value,
+            &mut self.watched,
+            &self.suppressed,
+            &self.events,
+            &self.printer,
+        );
+    }
+
+    pub(super) fn suppress(&self, task: &shoal_value::TaskVal) {
+        if let Ok(mut suppressed) = self.suppressed.lock()
+            && !task.is_done()
+        {
+            suppressed.insert(task.id);
+        }
+    }
+
+    pub(super) fn handle_control(&self, evaluator: &mut Evaluator, control: JobControl) {
+        handle_job_control(evaluator, control, &self.events, &self.printer);
+    }
+}
+
 /// `fg <task>` (site/content/internals/roadmap-and-priorities.md): re-front a background task. There is no
 /// `fg` builtin in the evaluator — task lifecycle methods (`.suspend()` /
 /// `.resume()`) are implemented by `shoal-eval` (see

@@ -3,74 +3,74 @@
 //! signal-handling + reedline/prompt wiring that only the interactive path
 //! needs.
 
-use std::collections::{BTreeSet, VecDeque};
+#[cfg(test)]
+use std::collections::BTreeSet;
+use std::collections::VecDeque;
+#[cfg(test)]
 use std::fs;
 use std::io::{self, IsTerminal};
 #[cfg(test)]
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(test)]
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
+#[cfg(test)]
 use std::time::Duration;
 
-use reedline::{
-    ColumnarMenu, DefaultHinter, ExternalPrinter, FileBackedHistory, MenuBuilder, Reedline,
-    ReedlineMenu, Signal,
-};
+use reedline::Signal;
 #[cfg(test)]
 use reedline::{
-    History, HistoryItem, KeyCode, KeyModifiers, ReedlineEvent, SearchDirection, SearchQuery,
+    ExternalPrinter, FileBackedHistory, History, HistoryItem, KeyCode, KeyModifiers, ReedlineEvent,
+    SearchDirection, SearchQuery,
 };
 use shoal_eval::Evaluator;
 use shoal_journal::Journal;
 use shoal_syntax::{ParseCtx, parse_with_ctx};
 use shoal_value::{Env, Value};
 
-use crate::completer::{self, ShoalCompleter};
-use crate::highlight::ShoalHighlighter;
+use crate::completer;
 #[cfg(test)]
 use crate::kernel_repl::ProtocolOutcome;
 use crate::kernel_repl::ProtocolSession;
-use crate::prompt;
 use crate::repl_state::RemoteEnvMirror;
-use crate::{format_parse_error, maybe_strip, no_color, report_eval_error};
+use crate::{format_parse_error, maybe_strip, report_eval_error};
 
 mod editor;
 mod jobs;
 mod protocol;
 mod rendering;
 mod transcript;
+mod ui;
 
-use editor::{FilteredHistory, ShoalValidator, build_edit_mode, history_path};
+#[cfg(test)]
+use editor::{FilteredHistory, build_edit_mode, open_history};
 #[cfg(test)]
 use editor::{glob_match, input_is_incomplete};
 
 #[cfg(test)]
 use jobs::{
-    BackgroundJobEvent, BackgroundOutputState, JobKind, consume_task_suppression,
-    enqueue_background_notice, handle_task_watcher_launch, retain_current_task_ids,
+    BackgroundJobEvent, BackgroundOutputState, JobKind, MAX_PENDING_BACKGROUND_EVENTS,
+    consume_task_suppression, drain_background_job_events, enqueue_background_notice,
+    handle_task_watcher_launch, retain_current_task_ids, watch_new_tasks,
 };
-use jobs::{
-    MAX_PENDING_BACKGROUND_EVENTS, drain_background_job_events, fg_task_name, handle_job_control,
-    parse_job_control, print_stopped_notice, rewrite_fg, watch_new_tasks,
-};
+use jobs::{BackgroundJobs, fg_task_name, parse_job_control, print_stopped_notice, rewrite_fg};
 #[cfg(test)]
 use protocol::ReplProtocol;
 use protocol::{
     execute_protocol_line, protocol_requested, refresh_protocol_state, session_path_dirs,
 };
-pub(crate) use rendering::{
-    PagerContext, print_value, render_result, render_result_paged, terminal_width,
-};
 #[cfg(test)]
 use rendering::{
-    pager_command, protocol_render_text, should_page, spawn_pager, wrapped_line_count,
+    PagerContext, pager_command, protocol_render_text, should_page, spawn_pager, wrapped_line_count,
 };
+pub(crate) use rendering::{print_value, render_result, render_result_paged, terminal_width};
 use rendering::{render_protocol_outcome, report_protocol_error};
 use transcript::{
     REPL_PRINCIPAL, REPL_SESSION, effective_journal_state_dir, language_journal_requested,
     latest_entry_id, now_ns, push_out_entry, resolve_out_undo,
 };
+use ui::ReplUi;
 
 pub(crate) fn repl(standalone: bool) -> Result<i32, String> {
     let cwd = std::env::current_dir().map_err(|e| format!("cannot determine cwd: {e}"))?;
@@ -101,15 +101,6 @@ pub(crate) fn repl(standalone: bool) -> Result<i32, String> {
         Some(ProtocolSession::new(client))
     } else {
         None
-    };
-    // `render.paging`/`render.pager` (site/content/internals/configuration-reference.md): resolved once, here,
-    // from the loaded config — not re-read per keystroke/render. `enabled`
-    // defaults to `false` (config default `"never"`), so an unconfigured
-    // shoal behaves byte-for-byte like before this knob existed.
-    let pager_ctx = PagerContext {
-        enabled: config.render.paging == "auto",
-        pager: config.render.pager.clone(),
-        configured_width: config.render.width,
     };
     let mut evaluator = Evaluator::new(cwd.clone());
     let bootstrap_report =
@@ -228,145 +219,19 @@ pub(crate) fn repl(standalone: bool) -> Result<i32, String> {
         }
         None
     };
-    let completer = ShoalCompleter::new(
-        evaluator.env().clone(),
-        cwd_cell.clone(),
+    let (mut ui, background_printer) = ReplUi::build(
+        &config,
+        &cwd,
+        &evaluator,
         catalogs,
         adapter_names,
-    )
-    .with_path_dirs(completion_path_dirs.clone())
-    .configure(
-        config.completion.fuzzy,
-        config.completion.case_insensitive,
-        config.completion.max_results,
+        cwd_cell.clone(),
+        completion_path_dirs.clone(),
     );
-    // `editor.keybindings` (site/content/internals/configuration-reference.md): parse `chord -> action`
-    // strings into real reedline bindings, warning (never failing) on
-    // anything unrecognized.
-    let (custom_bindings, keybinding_warnings) =
-        crate::keybindings::parse_bindings(&config.editor.keybindings);
-    for warning in &keybinding_warnings {
-        eprintln!(
-            "{}",
-            maybe_strip(format!("\x1b[33;1mwarning:\x1b[0m {warning}"))
-        );
-    }
-    let edit_mode = build_edit_mode(&config, &custom_bindings);
-    // Build the shoal-prompt pipeline: load + layer the prompt config, resolve
-    // the static session facts once, and set up the shared snapshot cell that
-    // the loop refreshes per command and reedline reads per keystroke (zero
-    // I/O on the render path — the whole point, site/content/internals/prompt-editor-lsp.md).
-    let (prompt_config, prompt_warnings) = prompt::load_prompt_config(&cwd);
-    for warning in &prompt_warnings {
-        eprintln!(
-            "{}",
-            maybe_strip(format!("\x1b[33;1mwarning:\x1b[0m {warning}"))
-        );
-    }
-    let static_facts = prompt::StaticFacts::resolve(&prompt_config, no_color());
-    let transient_enabled = prompt_config.transient.enabled;
-    let (renderer, renderer_warnings) = shoal_prompt::Renderer::new(prompt_config);
-    for warning in &renderer_warnings {
-        eprintln!(
-            "{}",
-            maybe_strip(format!("\x1b[33;1mwarning:\x1b[0m {warning}"))
-        );
-    }
-    let renderer = Arc::new(renderer);
-    let shared_ctx: prompt::SharedCtx = Arc::new(RwLock::new(Arc::new(
-        shoal_prompt::PromptContext::empty(cwd.clone()),
-    )));
-    let shoal_prompt = prompt::ShoalPrompt::new(renderer.clone(), shared_ctx.clone(), false);
-
-    // Detached PTY workers finish on their own threads. Reedline's bounded
-    // external printer lets those completion notices interrupt an active edit
-    // safely: the current buffer is repainted below the notice instead of
-    // being overwritten by an ordinary println from another thread.
-    let background_printer = ExternalPrinter::new(64);
-    let mut editor = Reedline::create()
-        .with_external_printer(background_printer.clone())
-        .with_poll_interval(Duration::from_millis(50))
-        .use_bracketed_paste(config.editor.bracketed_paste)
-        .with_validator(Box::new(ShoalValidator))
-        .with_completer(Box::new(completer))
-        .with_menu(ReedlineMenu::EngineCompleter(Box::new(
-            ColumnarMenu::default().with_name("completion_menu"),
-        )))
-        // `completion.menu` (site/content/internals/configuration-reference.md): `false` asks for cycle-only
-        // completion rather than the interactive popup. reedline has no
-        // separate non-menu completion path (the `Completer` trait is only
-        // ever driven through the `ReedlineMenu` system), but it exposes
-        // exactly this pair of knobs for the "no popup, just complete"
-        // experience: a unique match is inserted immediately
-        // (`quick_completions`) and multiple matches complete their shared
-        // prefix in place rather than opening the dropdown
-        // (`partial_completions`) — the popup still appears only when
-        // several candidates share no common prefix, since at that point
-        // there is nothing else reedline can do with them.
-        .with_quick_completions(!config.completion.menu)
-        .with_partial_completions(!config.completion.menu)
-        .with_edit_mode(edit_mode)
-        .with_highlighter(Box::new(ShoalHighlighter::with_env(
-            evaluator.env().clone(),
-        )))
-        .with_hinter(Box::new(DefaultHinter::default()))
-        // `history.ignore_space` (site/content/internals/configuration-reference.md, classic
-        // `HISTCONTROL=ignorespace`): reedline has this exact knob built in.
-        .with_history_exclusion_prefix(if config.history.ignore_space {
-            Some(" ".to_string())
-        } else {
-            None
-        });
-    if transient_enabled {
-        // Transient prompt (site/content/internals/prompt-editor-lsp.md): a second ShoalPrompt sharing the same cache,
-        // rendering `format.transient` post-Enter. Reedline invokes it at the
-        // right moment; no custom repaint logic on our side.
-        editor = editor.with_transient_prompt(Box::new(prompt::ShoalPrompt::new(
-            renderer.clone(),
-            shared_ctx.clone(),
-            true,
-        )));
-    }
-    if config.history.enabled
-        && let Some(path) = config.history.path.clone().or_else(history_path)
-    {
-        match open_history(config.history.max_entries, &path) {
-            Ok(history) => {
-                // `history.dedup`/`history.ignore` (site/content/internals/configuration-reference.md):
-                // `FileBackedHistory` has no built-in filtering, so wrap it in a
-                // thin `History` adapter that applies both before ever calling
-                // through to `save`.
-                let history = FilteredHistory::new(
-                    Box::new(history),
-                    config.history.dedup,
-                    config.history.ignore.clone(),
-                );
-                editor = editor.with_history(Box::new(history));
-            }
-            Err(error) => eprintln!(
-                "{}",
-                maybe_strip(format!(
-                    "\x1b[33;1mwarning:\x1b[0m history unavailable ({}): {error}",
-                    path.display()
-                ))
-            ),
-        }
-    }
-
-    let (background_job_tx, background_job_rx) = mpsc::sync_channel(MAX_PENDING_BACKGROUND_EVENTS);
-    let suppressed_task_notices = Arc::new(Mutex::new(BTreeSet::new()));
-    let mut watched_tasks = BTreeSet::new();
-    watch_new_tasks(
-        &evaluator,
-        None,
-        &mut watched_tasks,
-        &suppressed_task_notices,
-        &background_job_tx,
-        &background_printer,
-    );
+    let mut background_jobs = BackgroundJobs::new(&evaluator, background_printer);
 
     loop {
-        drain_background_job_events(&mut evaluator, &background_job_rx);
+        background_jobs.reconcile(&mut evaluator);
         // Keep the completer's cwd view and the cancel handler's active
         // token fresh for the statement about to run.
         if let Some(session) = protocol.as_mut() {
@@ -397,22 +262,15 @@ pub(crate) fn repl(standalone: bool) -> Result<i32, String> {
 
         // Refresh the frozen prompt snapshot once, here, between commands —
         // never inside reedline's per-keystroke render (site/content/internals/prompt-editor-lsp.md).
-        let render_width = pager_ctx.width();
-        let width = u16::try_from(render_width).unwrap_or(u16::MAX);
-        let ctx = match &protocol_snapshot {
-            Some(snapshot) => prompt::build_context_from_protocol(snapshot, &static_facts, width),
-            None => prompt::build_context(&mut evaluator, &static_facts, width),
-        };
-        if let Ok(mut cell) = shared_ctx.write() {
-            *cell = Arc::new(ctx);
-        }
-        match editor.read_line(&shoal_prompt) {
+        ui.refresh_prompt(&mut evaluator, protocol_snapshot.as_ref());
+        let render_width = ui.pager.width();
+        match ui.editor.read_line(&ui.prompt) {
             Ok(Signal::Success(src)) => {
                 // A detached PTY may have changed state while Reedline owned
                 // the thread. Reconcile before interpreting this line so a
                 // `jobs` query cannot observe a completion that is already in
                 // the notification queue as still running.
-                drain_background_job_events(&mut evaluator, &background_job_rx);
+                background_jobs.reconcile(&mut evaluator);
                 if src.trim().is_empty() {
                     continue;
                 }
@@ -423,7 +281,7 @@ pub(crate) fn repl(standalone: bool) -> Result<i32, String> {
                             if let Some(code) = outcome.exit_code {
                                 return Ok(code);
                             }
-                            if let Err(error) = render_protocol_outcome(&outcome, &pager_ctx) {
+                            if let Err(error) = render_protocol_outcome(&outcome, &ui.pager) {
                                 eprintln!(
                                     "{}",
                                     maybe_strip(format!(
@@ -450,7 +308,7 @@ pub(crate) fn repl(standalone: bool) -> Result<i32, String> {
                     if let Ok(mut token) = cancel_slot.lock() {
                         *token = evaluator.cancellation_token();
                     }
-                    handle_job_control(&mut evaluator, jc, &background_job_tx, &background_printer);
+                    background_jobs.handle_control(&mut evaluator, jc);
                     continue;
                 }
                 // `fg <task>` (site/content/internals/roadmap-and-priorities.md): host-level sugar, resolved
@@ -458,13 +316,8 @@ pub(crate) fn repl(standalone: bool) -> Result<i32, String> {
                 // no `fg` builtin of its own — see `rewrite_fg`.
                 if let Some(name) = fg_task_name(&src)
                     && let Some(Value::Task(task)) = evaluator.env().get(name)
-                    && let Ok(mut suppressed) = suppressed_task_notices.lock()
-                    && !task.is_done()
                 {
-                    // Hold the suppression lock across the done check and
-                    // insertion. A watcher that completes concurrently then
-                    // observes and consumes this ID instead of racing past it.
-                    suppressed.insert(task.id);
+                    background_jobs.suppress(&task);
                 }
                 let run_src = rewrite_fg(&src).unwrap_or_else(|| src.clone());
                 let ctx = parse_ctx_for(evaluator.env());
@@ -482,14 +335,7 @@ pub(crate) fn repl(standalone: bool) -> Result<i32, String> {
                         evaluator.set_source(run_src.clone());
                         let started_ns = now_ns();
                         let evaluation = evaluator.eval_program(&program);
-                        watch_new_tasks(
-                            &evaluator,
-                            evaluation.as_ref().ok(),
-                            &mut watched_tasks,
-                            &suppressed_task_notices,
-                            &background_job_tx,
-                            &background_printer,
-                        );
+                        background_jobs.watch(&evaluator, evaluation.as_ref().ok());
                         match evaluation {
                             Ok(value) => {
                                 let entry_id = journal_reader.as_ref().and_then(|journal| {
@@ -509,7 +355,7 @@ pub(crate) fn repl(standalone: bool) -> Result<i32, String> {
                                 // multi-statement REPL line would otherwise
                                 // page every intermediate value too, which
                                 // reads as broken rather than helpful.
-                                if let Err(error) = render_result_paged(&value, true, &pager_ctx) {
+                                if let Err(error) = render_result_paged(&value, true, &ui.pager) {
                                     eprintln!(
                                         "{}",
                                         maybe_strip(format!(
@@ -556,17 +402,6 @@ pub(crate) fn repl(standalone: bool) -> Result<i32, String> {
     }
 }
 
-fn open_history(max_entries: usize, path: &std::path::Path) -> Result<FileBackedHistory, String> {
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("cannot create history directory: {error}"))?;
-    }
-    FileBackedHistory::with_file(max_entries, path.to_path_buf())
-        .map_err(|error| format!("cannot open history file: {error}"))
-}
 /// Build the parser's dispatch context from the live session environment.
 /// Value bindings dispatch expressions; callables dispatch commands.
 fn parse_ctx_for(env: &Env) -> ParseCtx {
