@@ -62,8 +62,9 @@ but a running kernel does not reload it; creation and revocation take effect onl
 expiry still uses current time). Token `profile` and `caps` are echoed metadata only. Authorization
 continues through the token's principal name, Leash policy, and handler ownership checks.
 
-Most stateful methods require attachment. The current `cap.request` and `journal.query` exceptions
-are unsafe and audited explicitly below; they must not be generalized as intended public methods.
+Most stateful methods require attachment. `journal.query` now requires it too (HR-D4). The remaining
+`cap.request` exception is audited explicitly below and is being closed by its approver-identity
+repair; it must not be generalized as an intended public method.
 
 ### Shared-name principal caveat
 
@@ -130,13 +131,14 @@ The router does not apply one central attachment middleware; each handler asks f
 | `session.attach` | creates/replaces the connection attachment |
 | `parse`, `complete` | intentionally context-free and public to a socket client |
 | `cap.request` | **unattached state mutation**; approves by global plan ref without caller identity |
-| `journal.query` | **unattached data read**; queries shared rows without caller scoping |
+| `journal.query` | requires attachment (HR-D4); rejects with `NOT_ATTACHED` before reading rows |
 | every other current method | handler rejects with `NOT_ATTACHED` before its main operation |
 
-This differs from the comment in `shoal-proto::error_code::NOT_ATTACHED`, which lists
-`cap.request` as exempt but omits the also-exempt `journal.query`. More importantly, the two stateful
-exemptions are authority defects, not merely documentation drift. A socket mode of `0600` protects
-against other OS users; it does not authenticate the token principal or approver role within Shoal.
+The `journal.query` gate closes the audit's unattached-read defect: a fresh socket connection that
+never attached now gets `NOT_ATTACHED` instead of stored rows. `cap.request` remains the one
+outstanding exemption (its approver-identity repair is tracked below and in the roadmap). A socket
+mode of `0600` protects against other OS users; it does not authenticate the token principal or
+approver role within Shoal.
 
 `cap.request` is especially sensitive because the stored plan map is global and plan refs are not
 unique object IDs. `Plan::new` hashes effects, reversibility, and estimates—not source, session, or

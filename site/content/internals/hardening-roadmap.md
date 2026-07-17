@@ -114,8 +114,8 @@ Rules for implementers:
 - [ ] **HR-D3** — Approver identity must differ from the requester unless policy explicitly
   permits self-acknowledgement; default policy separates them. Document the chosen model in the
   security threat model page. *(D2, D4)*
-- [ ] **HR-D4** — `journal.query` requires attachment, matching the documented rule. *(F1)*
-- [ ] **HR-D5** — `journal.query` limits are bounded: `limit: 0` returns zero rows and a
+- [x] **HR-D4** — `journal.query` requires attachment, matching the documented rule. *(F1)*
+- [x] **HR-D5** — `journal.query` limits are bounded: `limit: 0` returns zero rows and a
   server-side maximum caps page size. *(F2)*
 - [ ] **HR-D6** — Zero-config MCP attach lands on a restricted agent principal rather than
   `local-human`; permissive attach becomes explicit opt-in. Update autostart, attach handling,
