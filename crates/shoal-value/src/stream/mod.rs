@@ -177,6 +177,7 @@ impl Upstream for IterSource {
 struct ChanSource {
     rx: std::sync::mpsc::Receiver<VResult<Value>>,
     stop: Option<Arc<std::sync::atomic::AtomicBool>>,
+    on_drop: Option<Box<dyn FnOnce() + Send>>,
 }
 impl Upstream for ChanSource {
     fn pull(
@@ -204,6 +205,9 @@ impl Drop for ChanSource {
         if let Some(stop) = &self.stop {
             stop.store(true, std::sync::atomic::Ordering::SeqCst);
         }
+        if let Some(on_drop) = self.on_drop.take() {
+            on_drop();
+        }
     }
 }
 
@@ -229,7 +233,15 @@ impl StreamVal {
         label: impl Into<String>,
         rx: std::sync::mpsc::Receiver<VResult<Value>>,
     ) -> StreamVal {
-        StreamVal::from_source(label, false, Box::new(ChanSource { rx, stop: None }))
+        StreamVal::from_source(
+            label,
+            false,
+            Box::new(ChanSource {
+                rx,
+                stop: None,
+                on_drop: None,
+            }),
+        )
     }
 
     /// Build a channel-backed stream while preserving the producer's known
@@ -239,6 +251,7 @@ impl StreamVal {
         bounded: bool,
         rx: std::sync::mpsc::Receiver<VResult<Value>>,
         stop: Arc<std::sync::atomic::AtomicBool>,
+        on_drop: Box<dyn FnOnce() + Send>,
     ) -> StreamVal {
         StreamVal::from_source(
             label,
@@ -246,6 +259,7 @@ impl StreamVal {
             Box::new(ChanSource {
                 rx,
                 stop: Some(stop),
+                on_drop: Some(on_drop),
             }),
         )
     }

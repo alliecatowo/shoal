@@ -447,42 +447,51 @@ impl Evaluator {
         const STDIN_CHUNKS: usize = 16;
         const PULL_POLL: Duration = Duration::from_millis(25);
 
+        let lease = crate::streams::acquire_stream_pump()?;
         let mut upstream = stream.take_upstream()?;
         let (stdin_sink, stdin) = shoal_exec::stream_stdin(STDIN_CHUNKS);
-        let pump_cancel = CancelToken::new();
         let parent_cancel = self.cancellation_token();
+        let pump_cancel = CancelToken::linked(&parent_cancel);
         let child = self.child_context();
         let error = Arc::new(std::sync::Mutex::new(None));
         let pump_error = error.clone();
         let worker_cancel = pump_cancel.clone();
-        let worker = std::thread::spawn(move || {
-            let mut evaluator = child.build(ChildKind::StreamPump, parent_cancel.clone());
-            loop {
-                if worker_cancel.is_cancelled() || parent_cancel.is_cancelled() {
-                    break;
-                }
-                let item = match upstream.pull(&mut evaluator, Some(PULL_POLL)) {
-                    Ok(shoal_value::Pull::Item(value)) => value,
-                    Ok(shoal_value::Pull::Timeout) => continue,
-                    Ok(shoal_value::Pull::End) => break,
-                    Err(e) => {
-                        *pump_error.lock().unwrap() = Some(e);
+        let worker = std::thread::Builder::new()
+            .name("shoal-stream-feed".into())
+            .spawn(move || {
+                let _lease = lease;
+                let mut evaluator = child.build(ChildKind::StreamPump, worker_cancel.clone());
+                loop {
+                    if worker_cancel.is_cancelled() {
                         break;
                     }
-                };
-                let sent =
-                    match send_stream_item(&stdin_sink, &worker_cancel, &parent_cancel, &item) {
+                    let item = match upstream.pull(&mut evaluator, Some(PULL_POLL)) {
+                        Ok(shoal_value::Pull::Item(value)) => value,
+                        Ok(shoal_value::Pull::Timeout) => continue,
+                        Ok(shoal_value::Pull::End) => break,
+                        Err(e) => {
+                            *pump_error.lock().unwrap() = Some(e);
+                            break;
+                        }
+                    };
+                    let sent = match send_stream_item(
+                        &stdin_sink,
+                        &worker_cancel,
+                        &parent_cancel,
+                        &item,
+                    ) {
                         Ok(sent) => sent,
                         Err(e) => {
                             *pump_error.lock().unwrap() = Some(e);
                             break;
                         }
                     };
-                if !sent {
-                    break;
+                    if !sent {
+                        break;
+                    }
                 }
-            }
-        });
+            })
+            .map_err(|e| ErrorVal::new("io_error", format!("spawn stream feed: {e}")))?;
 
         let result = self.eval_feed_command(cmd_expr, position, span, stdin);
         // Wake a pump blocked on an idle live upstream or a full stdin queue

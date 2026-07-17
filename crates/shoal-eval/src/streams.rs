@@ -31,7 +31,7 @@ use shoal_value::{
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError, channel, sync_channel};
 use std::time::Duration;
 
@@ -43,6 +43,41 @@ use std::time::Duration;
 /// buffer (site/content/internals/streams-channels.md: ticks coalesce, memory O(1) always).
 const SOURCE_BUF: usize = 64;
 const PUMP_POLL: Duration = Duration::from_millis(25);
+const MAX_STREAM_PUMPS: usize = 64;
+static ACTIVE_STREAM_PUMPS: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Debug)]
+pub(crate) struct StreamPumpLease {
+    counter: &'static AtomicUsize,
+}
+
+impl Drop for StreamPumpLease {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+fn try_acquire_stream_pump(
+    counter: &'static AtomicUsize,
+    limit: usize,
+) -> VResult<StreamPumpLease> {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |active| {
+            (active < limit).then_some(active + 1)
+        })
+        .map(|_| StreamPumpLease { counter })
+        .map_err(|_| {
+            ErrorVal::new(
+                "stream_pump_limit",
+                format!("stream pump limit reached ({limit})"),
+            )
+            .with_hint("consume or drop an existing buffered/feed stream before creating another")
+        })
+}
+
+pub(crate) fn acquire_stream_pump() -> VResult<StreamPumpLease> {
+    try_acquire_stream_pump(&ACTIVE_STREAM_PUMPS, MAX_STREAM_PUMPS)
+}
 
 impl Evaluator {
     /// Move `stream` and a fully-owned child evaluator into a producer thread,
@@ -55,35 +90,48 @@ impl Evaluator {
         capacity: usize,
     ) -> VResult<StreamVal> {
         debug_assert!(capacity > 0);
+        let lease = acquire_stream_pump()?;
         let label = stream.label.clone();
         let bounded = stream.is_bounded();
         let mut upstream = stream.take_upstream()?;
         let (tx, rx) = sync_channel(capacity);
-        let cancel = self.cancellation_token();
+        let parent_cancel = self.cancellation_token();
+        let cancel = CancelToken::linked(&parent_cancel);
+        let drop_cancel = cancel.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let producer_stop = stop.clone();
         let child = self.child_context();
 
-        std::thread::spawn(move || {
-            let mut evaluator = child.build(ChildKind::StreamPump, cancel.clone());
-            loop {
-                if cancel.is_cancelled() || producer_stop.load(Ordering::SeqCst) {
-                    break;
+        std::thread::Builder::new()
+            .name("shoal-stream-buffer".into())
+            .spawn(move || {
+                let _lease = lease;
+                let mut evaluator = child.build(ChildKind::StreamPump, cancel.clone());
+                loop {
+                    if cancel.is_cancelled() || producer_stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let delivery = match upstream.pull(&mut evaluator, Some(PUMP_POLL)) {
+                        Ok(Pull::Item(value)) => Ok(value),
+                        Ok(Pull::Timeout) => continue,
+                        Ok(Pull::End) => break,
+                        Err(error) => Err(error),
+                    };
+                    let terminal = delivery.is_err();
+                    if !send_to_buffer(&tx, &cancel, &producer_stop, delivery) || terminal {
+                        break;
+                    }
                 }
-                let delivery = match upstream.pull(&mut evaluator, Some(PUMP_POLL)) {
-                    Ok(Pull::Item(value)) => Ok(value),
-                    Ok(Pull::Timeout) => continue,
-                    Ok(Pull::End) => break,
-                    Err(error) => Err(error),
-                };
-                let terminal = delivery.is_err();
-                if !send_to_buffer(&tx, &cancel, &producer_stop, delivery) || terminal {
-                    break;
-                }
-            }
-        });
+            })
+            .map_err(|e| ErrorVal::new("io_error", format!("spawn stream buffer: {e}")))?;
 
-        Ok(StreamVal::from_buffered_channel(label, bounded, rx, stop))
+        Ok(StreamVal::from_buffered_channel(
+            label,
+            bounded,
+            rx,
+            stop,
+            Box::new(move || drop_cancel.cancel()),
+        ))
     }
 
     /// `every(interval) -> stream<datetime>` (site/content/internals/streams-channels.md): one timer thread,
@@ -559,6 +607,22 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
         assert!(ready(), "background stream pump did not settle");
+    }
+
+    #[test]
+    fn pump_leases_fail_closed_at_the_limit_and_recover_on_drop() {
+        static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+
+        let first = try_acquire_stream_pump(&ACTIVE, 2).unwrap();
+        let second = try_acquire_stream_pump(&ACTIVE, 2).unwrap();
+        let err = try_acquire_stream_pump(&ACTIVE, 2).unwrap_err();
+        assert_eq!(err.code, "stream_pump_limit");
+
+        drop(first);
+        let replacement = try_acquire_stream_pump(&ACTIVE, 2).unwrap();
+        drop(second);
+        drop(replacement);
+        assert_eq!(ACTIVE.load(Ordering::Relaxed), 0);
     }
 
     #[test]
