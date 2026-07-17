@@ -14,6 +14,7 @@ use tower_lsp::{Client, LanguageServer, jsonrpc::Result, lsp_types::*};
 const MAX_OPEN_DOCUMENTS: usize = 128;
 pub(crate) const MAX_DOCUMENT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_OPEN_SOURCE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_DOCUMENT_URI_BYTES: usize = 4 * 1024;
 
 pub struct Backend {
     client: Client,
@@ -314,6 +315,12 @@ fn admit_document(
     uri: Url,
     state: DocumentState,
 ) -> std::result::Result<(), String> {
+    if uri.as_str().len() > MAX_DOCUMENT_URI_BYTES {
+        return Err(format!(
+            "document URI is {} bytes; shoal-lsp accepts at most {MAX_DOCUMENT_URI_BYTES} bytes",
+            uri.as_str().len()
+        ));
+    }
     let source_bytes = state.text.len();
     if source_bytes > MAX_DOCUMENT_BYTES {
         return Err(format!(
@@ -591,6 +598,45 @@ mod tests {
         assert!(error.contains("per open document"));
         assert_eq!(docs[&uri].text, "let safe = 1");
         assert_eq!(docs[&uri].version, 1);
+    }
+
+    #[test]
+    fn document_admission_enforces_aggregate_source_and_uri_budgets() {
+        let mut docs = HashMap::new();
+        for index in 0..(MAX_OPEN_SOURCE_BYTES / MAX_DOCUMENT_BYTES) {
+            admit_document(
+                &mut docs,
+                Url::parse(&format!("file:///tmp/full-{index}.shl")).unwrap(),
+                pending_document("x".repeat(MAX_DOCUMENT_BYTES), 1),
+            )
+            .unwrap();
+        }
+        let retained = docs.len();
+        assert!(
+            admit_document(
+                &mut docs,
+                Url::parse("file:///tmp/over-total.shl").unwrap(),
+                pending_document("x".into(), 1),
+            )
+            .unwrap_err()
+            .contains("retained-source budget")
+        );
+        assert_eq!(docs.len(), retained);
+
+        let huge_uri = Url::parse(&format!(
+            "file:///tmp/{}.shl",
+            "u".repeat(MAX_DOCUMENT_URI_BYTES)
+        ))
+        .unwrap();
+        assert!(
+            admit_document(
+                &mut HashMap::new(),
+                huge_uri,
+                pending_document("x".into(), 1)
+            )
+            .unwrap_err()
+            .contains("document URI")
+        );
     }
 
     #[test]
