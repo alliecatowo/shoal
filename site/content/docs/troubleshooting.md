@@ -487,11 +487,13 @@ Check store alignment and restart:
 printf 'CLI store=%s\n' "${SHOAL_TOKEN_STORE:-${XDG_STATE_HOME:-$HOME/.local/state}/shoal/tokens.json}"
 ```
 
-Kernel reads `<--state-dir>/tokens.json` once at startup. A token created afterward is invisible until kernel restart.
+Kernel validation reads `<--state-dir>/tokens.json` under a shared lock. A newly created token is
+visible immediately; if attach still fails, confirm the CLI and kernel use the same state path.
 
 ### Revoked token still works
 
-Same reload limitation: restart the kernel, and stop existing MCP processes carrying the bearer. Expiry is checked live, but file revocation is not reloaded.
+Revocation is checked before every attached request. The next request fails `AUTH_FAILED` and clears
+the attachment; if it does not, the CLI changed a different token-store path.
 
 ### Token lists `--cap`, but action denied
 

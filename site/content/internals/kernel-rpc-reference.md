@@ -63,25 +63,26 @@ accDescr: Shows the components and relationships described in Envelope and conne
   T->>T: close this client's kernel subscriptions
 ```
 
-`read_frame` checks a 16 MiB limit **after** `BufRead::read_line` has accumulated the line. The
-completed-frame contract exists, but memory allocation is not bounded against a peer that never sends
-a newline. The MCP stdio reader has the same shape.
+`read_frame` enforces the 16 MiB limit during the read with `Read::take(cap + 1)`; an oversized or
+unterminated peer cannot grow the line buffer beyond that bound. Public kernel connections also use a
+10-second first-byte/remainder read deadline by default. The MCP stdio reader uses the same bounded
+line shape without the socket deadline.
 
 ## Router and attachment matrix
 
 | Method | Handler module | Attached? | State class |
 |---|---|---:|---|
 | `session.attach` | `session.rs` | creates it | session/auth mutation |
-| `session.env` | `session.rs` | yes | evaluator read + policy |
+| `session.env/snapshot`, `kernel.status/shutdown` | `session.rs`/`lifecycle.rs` | yes | owner/session and process lifecycle |
 | `session.reef` | `session.rs` | yes | evaluator cache read |
 | `parse` | `handlers_session.rs` | no | pure syntax |
 | `complete` | `handlers_session.rs` | no | lexical completion |
 | `explain` | `handlers_session.rs` | yes | parser + evaluator plan derivation |
 | `exec` | `handlers_exec.rs` | yes | evaluator, journal, transcript, tasks |
-| `value.get` | `handlers_value.rs` | yes | session transcript/CAS read |
+| `value.get`, `stream.pull/close` | value/stream handlers | yes | owner transcript/CAS/live-stream read |
 | `blob.get` | `handlers_session.rs` | yes | shared CAS read |
-| `task.list/get/await/cancel/suspend/resume` | `handlers_task.rs` | yes | session-scoped task registry |
-| `pty.open/send/read/resize/close/list` | `handlers_pty.rs` | yes | session-scoped PTY registry |
+| `task.list/get/await/cancel/suspend/resume` | `handlers_task.rs` | yes | principal/session-owned task registry |
+| `pty.open/send/read/resize/close/list` | `handlers_pty.rs` | yes | principal/session-owned PTY registry |
 | `plan.get/list/apply` | `handlers_task.rs` | yes | session/principal-scoped plan registry |
 | `cap.request` | `handlers_task.rs` | yes | attached approval mutation, approver-bound |
 | `journal.query` | `handlers_value.rs` | yes | attached persistent journal read |
@@ -112,10 +113,12 @@ server-selected inherited descriptor used by the private REPL may attach as
 token. Calling attach again replaces that connection's attachment and removes subscriptions owned
 by the previous attachment.
 
-The persistent kernel loads `tokens.json` once at startup. `shoal-token` is a separate process whose
-create/revoke writes are not observed until the kernel restarts; already-loaded expirations still
-become invalid as wall time advances. The returned profile and cap strings are descriptive metadata,
-not grants. Only principal-based Leash policy and handler ownership checks authorize operations.
+Token validation takes a shared fd lock and loads the current `tokens.json`. Create/revoke take an
+exclusive fd lock, reload under that lock, and atomically replace the file, so concurrent CLIs do not
+overwrite one another. After attachment the kernel refreshes the authenticated token metadata before
+every request; revocation, expiry, replacement, corruption, or I/O failure detaches the connection
+and fails closed with `AUTH_FAILED`. Returned profile/cap strings describe machine authority. Leash
+still authorizes language effects; `supervisor`/`plan.approve` are explicit approval capabilities.
 
 The session registry is keyed by `(principal, visible Session name)`. Reconnecting as the same
 principal/name returns the same live evaluator; another principal using the same visible name gets a
@@ -237,21 +240,18 @@ does not cancel work.
 
 ### Plan mode
 
-`mode:"plan"` parses, derives effects, evaluates the actor policy, and inserts a `StoredPlan` with
-source, session, principal, plan, and an approved bit that starts true only for `Allow`. It publishes
-an `approval` event for `ApprovalRequired`. The returned `PlanResult` contains ref, effects,
-reversibility, verdict, and `approval_pending`.
-
-Current plan refs are the first 16 hex characters of blake3 over only `(effects, reversibility,
-estimates)`. They exclude source/session/principal. Insertion into the global map can overwrite an
-equal-shape plan; do not use the ref as a unique object ID or bearer capability.
+`mode:"plan"` parses, derives effects, evaluates the actor policy, and inserts a `StoredPlan` bound to
+source, canonical AST, effects/estimates, Session, principal, and a unique per-kernel object suffix.
+It publishes an `approval` event for `ApprovalRequired`. The returned `PlanResult` contains ref,
+effects, reversibility, verdict, and `approval_pending`. Identical repeated plans remain distinct and
+cannot overwrite one another; refs are still ephemeral object identifiers, not bearer capabilities.
 
 ### Run and approved modes
 
 Ordinary run derives a fresh plan and returns `LEASH_DENIED` or `APPROVAL_REQUIRED` before evaluation
-when policy says so. Approved mode verifies the currently stored ref has the same session, principal,
-and source and is approved or now policy-allowed. A caller cannot merely write `mode:"approved"` to
-skip the gate.
+when policy says so. Approved mode verifies the stored immutable binding and either atomically
+consumes its one-shot grant or observes that current policy now allows the plan. A caller cannot
+merely write `mode:"approved"` to skip the gate.
 
 The evaluator is locked for the synchronous run. The handler:
 
@@ -336,9 +336,10 @@ optional `RpcError`. State vocabulary observed in the handler is `running`, `can
 | `task.suspend` | `{task}` | validates ownership, then `TASK_CONTROL_UNAVAILABLE` |
 | `task.resume` | `{task}` | validates ownership, then `TASK_CONTROL_UNAVAILABLE` |
 
-Ownership is by `session.id`, not directly principal. That inherits the named-session cross-principal
-weakness. Tasks remain in the process-global map after completion; there is no eviction/persistence
-policy in the handler path.
+Ownership is the exact `(principal, visible session name)` owner captured by the attachment. Wrong
+owners receive the same opaque unknown-task result as nonexistent entries. Active-task permits are
+reserved before worker spawn and released at terminal state; completed records are bounded and
+reaped oldest-first.
 
 Cancellation is cooperative through the evaluator/exec cancellation token. A failed outcome returned
 in value position is inspected so the task becomes failed; a signal-killed outcome after a requested
@@ -361,10 +362,10 @@ Ordering follows `HashMap` iteration and is not a stable wire order.
 
 ### `plan.apply`
 
-Input `{plan_ref}`. It checks attached session/principal, then requires either the mutable approved bit
-or a currently `Allow` verdict. It recursively dispatches `exec` with stored source, statement
-position, `mode:"approved"`, and the same ref. The approved exec performs its own same-source/session/
-principal verification and re-derives the execution plan.
+Input `{plan_ref}`. It checks attached session/principal, then requires either the one-shot grant or a
+current `Allow` verdict. It recursively dispatches `exec` with stored source, statement position,
+`mode:"approved"`, and the same ref. The approved exec revalidates the immutable binding, re-derives
+the plan, and atomically consumes a grant so concurrent/repeated apply cannot replay it.
 
 ### `cap.request`
 
@@ -383,19 +384,20 @@ Authority model (HR-D2/HR-D3):
    `Deny`, else `LEASH_DENIED`;
 4. if a nonempty request omits a plan effect, the result stays `approval_pending` and lists the
    uncovered effects (approval never silently widens past the requested scope);
-5. otherwise the plan is approved. An **`ApprovalRecord`** is bound onto the plan — requester,
-   approver, plan ref/hash, granted scope, approval timestamp, and (once the approved plan actually
-   runs) the journal entry id of the consuming execution. The binding is mirrored into the journal as
-   an audit entry (`journal.query` sees a `# approval …` row) and surfaced on `plan.get.approval`.
+5. otherwise the exact plan transition is reserved under the registry lock. The kernel writes the
+   durable grant audit before publishing an **`ApprovalRecord`**; an audit error or unwind restores
+   the reservation and grants nothing. The record binds requester, approver, owner, plan/source
+   hashes, granted scope, approval timestamp, grant audit ID, and consuming execution ID. Apply
+   atomically consumes the grant exactly once, and the execution audit links back to the grant.
 
 Response: `{grant:"approved", plan_ref, enforced, granted_effects, requester, approver}`. `enforced`
 reports the same honest OS-enforcement truth `session.attach.caps_enforced` does for the requester.
 
 ## PTYs
 
-PTY refs are `pty:N`. Registry entries store session ID, recorded principal, display command, and a
-mutex-protected `shoal_exec::PtySession`. All methods require attachment and lookups compare session
-ID. The principal field is currently not used for access checks.
+PTY refs are `pty:N`. Registry entries store the exact principal/session owner, display command, and
+a mutex-protected `shoal_exec::PtySession`. All methods require attachment and compare the full owner.
+Admission reserves owner, principal-aggregate, and process-global permits before spawning.
 
 ### `pty.open`
 
@@ -467,10 +469,10 @@ Rows are newest-first and contain ID, session, principal, timestamp/duration, lo
 parsed AST/effects, status/ok/opaque, and output `{kind,hash,len}` entries. Output content is fetched
 separately through blob/value routes.
 
-Attachment is required for the caller-authentication side effect. A shared pair-shell session's
-journal is intentionally readable by every principal attached to that session (see
-[session identity](../kernel-protocol/#session-identity-and-the-pair-shell-model)); cross-session
-isolation is by using distinct session names. `until`/effects post-filter **after** the store limit,
+Attachment is required and the kernel forces the exact attached principal and session into the
+journal query. A caller-provided principal filter can narrow but cannot widen that owner boundary;
+another principal choosing the same visible session name sees a distinct private session and rows.
+`until`/effects post-filter **after** the store limit,
 so a request can return fewer than its limit even when older matching rows exist. Effect matching uses
 serialized JSON substring containment rather than parsed effect-kind equality, so the filter deserves
 replacement by a typed store query.
@@ -521,6 +523,7 @@ gap: the facade does not retain the dedicated connection/thread handle needed to
 | -32022 | PTY lookup | unknown/closed or wrong-session PTY |
 | -32023 | PTY open | resolution/sandbox/spawn failure |
 | -32030 | attach | token unavailable/invalid/expired/revoked |
+| -32040 | connection/session/task/PTY/subscription admission | quota exceeded |
 
 Malformed kernel JSON does not currently become a JSON-RPC error: frame decoding returns an IO error
 and closes the connection. The MCP stdio bridge does emit `-32700` for malformed client JSON.
@@ -531,7 +534,7 @@ and closes the connection. The MCP stdio bridge does emit `-32700` for malformed
 flowchart TB
 accTitle: State and lock map
 accDescr: Shows the components and relationships described in State and lock map.
-  Kernel --> Sessions["sessions Mutex<HashMap>"]
+  Kernel --> Sessions["sessions Mutex<HashMap<OwnerKey, Session>>"]
   Sessions --> Session["Session Arc"]
   Session --> Eval["evaluator Mutex"]
   Session --> Transcript["transcript Mutex<HashMap<Ref, Value>>"]

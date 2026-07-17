@@ -93,7 +93,7 @@ shoal-kernel \
 Command-line interface:
 
 ```text
-shoal-kernel [--session NAME] [--socket PATH] [--state-dir PATH] [--policy FILE]
+shoal-kernel [--session NAME] [--socket PATH] [--state-dir PATH] [--policy FILE] [LIMIT FLAGS]
 ```
 
 | Flag | Default | Meaning |
@@ -102,6 +102,10 @@ shoal-kernel [--session NAME] [--socket PATH] [--state-dir PATH] [--policy FILE]
 | `--socket PATH` | runtime-derived | Unix socket to bind. |
 | `--state-dir PATH` | XDG-derived | Journal, CAS, token store, and supporting durable state. |
 | `--policy FILE` | none | Load a Leash policy instead of the local-human permissive default. |
+
+Limit flags cover connections, retained sessions, tasks per owner, PTYs per owner/principal/kernel,
+subscriptions per owner, CAS verification starts/window, and frame-read timeout. See the kernel
+protocol page for defaults and release/eviction semantics.
 
 On startup the process prints `shoal-kernel: ready PATH` to stderr. SIGINT/SIGTERM handling asks the serve loop to stop and the bound-socket guard removes the socket on normal teardown.
 
@@ -159,16 +163,18 @@ A session owns:
 - per-client last-seen transcript bookkeeping;
 - Reef cache/lock state held by that evaluator;
 - an in-language event bus bridged to wire `user.*` channels;
-- task and PTY visibility scoped by session.
+- task and PTY visibility scoped by the exact principal/session owner.
 
-The first attachment to a session name creates it. Later attachments to the same running kernel reuse that evaluator, so state persists across MCP process reconnects:
+The first attachment to a `(principal, session name)` creates it. Later attachments by that same
+principal reuse the evaluator, so state persists across MCP process reconnects:
 
 ```text
 client A: shoal_exec "let project = 'shoal'"
 client B, same session: shoal_exec "project"
 ```
 
-Transcript references are session-scoped. `out:3` in session `work` does not authorize lookup of `out:3` in another session.
+Transcript references are owner-scoped. `out:3` for principal A in session `work` does not authorize
+principal B's same-visible-name session or another session.
 
 Kernel restart recreates evaluator sessions; live bindings, tasks, plans, PTYs, and transcript maps do not survive. The journal/CAS and token store do. The durable `journal` and `session.transcript` event channels rebuild their sequence indices from journal state so replay cursors continue across restart.
 
@@ -176,14 +182,19 @@ Kernel restart recreates evaluator sessions; live bindings, tasks, plans, PTYs, 
 
 Every kernel connection begins with `session.attach` before most other operations. The MCP facade performs this automatically.
 
-Without a token, the connection becomes the local human principal:
+Without a token, a public MCP connection becomes the restricted machine principal:
 
 ```text
-uid:<effective uid>
-profile: local-human
+agent:mcp
+profile: restricted-agent
 ```
 
-With a valid token, principal, profile, and declared token capabilities come from the token store. Invalid, expired, or revoked tokens fail with `AUTH_FAILED` (`-32030`). An ephemeral in-memory kernel has no token store and rejects bearer authentication.
+With a valid token, principal, profile, and declared token capabilities come from the token store.
+Invalid, expired, or revoked tokens fail with `AUTH_FAILED` (`-32030`). The kernel revalidates bearer
+authority from the locked store before every later request. Public clients cannot assert
+`local-human`; that trust exists only on the anonymous descriptor inherited by the private REPL.
+The MCP client verifies restricted auth mode, public connection provenance, principal-private
+session isolation, and the security epoch before exposing tools.
 
 Attachment returns:
 

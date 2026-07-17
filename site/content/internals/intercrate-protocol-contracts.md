@@ -396,10 +396,12 @@ Stable security properties:
 - plans, tasks, PTYs, events, values, and approvals are checked against session/principal rules;
 - `caps_enforced` states actual OS enforcement availability, not merely policy configuration;
 - secret material never crosses the wire through a `Secret` value;
-- per-client `it` state must remain distinct even inside a shared session.
+- per-client `it` state remains distinct inside the same principal-private session.
 
-Current risk: the first principal attached to a named session can determine session-owned evaluator
-state that later principals share. Treat cross-principal named sessions as a security review area.
+The session registry and retained refs use an exact `(principal, Session)` owner. Equal visible names
+under different principals do not share evaluator state, transcripts, journals, tasks, PTYs, or
+quota accounting; one kernel process still shares global memory and CPU and is not a hostile-tenant
+boundary.
 
 ## Compatibility review matrix
 

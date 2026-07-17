@@ -69,7 +69,10 @@ Failure:
 }
 ```
 
-The raw kernel reader does not produce a `-32700` response for malformed JSON. A bad JSON frame or a line over 16 MiB ends that connection. The MCP stdio facade, by contrast, reports malformed MCP JSON as `-32700`.
+The raw kernel reader does not produce a `-32700` response for malformed JSON. A bad JSON frame or
+a line over 16 MiB ends that connection. The limit is applied during accumulation, and public
+connections default to a 10-second first-byte/remainder deadline. The MCP stdio facade instead
+reports malformed MCP JSON as `-32700`.
 
 Use one writer lock per connection. A subscription writer in the kernel may emit a complete `event` frame while ordinary request handling is active, but the kernel serializes whole frames so bytes do not interleave.
 
@@ -110,7 +113,11 @@ Most methods require one successful attachment per connection:
 | `client.kind` | string | empty | Informational client kind. |
 | `client.tty` | boolean | `false` | Preserve terminal color in bounded renders when true. |
 
-Without a token, attachment grants the kernel process's local `uid:<euid>` principal and `local-human` profile. The kernel does not authenticate the Unix peer with `SO_PEERCRED`; ability to reach the private socket is what protects this path. With a token, the token store supplies principal, profile, declared capabilities, expiry, and revocation state.
+Without a token, public attachment grants restricted `agent:mcp`, never local-human authority.
+`local-human` is accepted only on the anonymous endpoint inherited by the private REPL; public
+clients cannot manufacture it with `client.kind`, `tty`, or a bearer profile string. With a token,
+the current locked store supplies machine principal/profile/caps and the kernel revalidates that
+immutable identity before every later request.
 
 Representative result:
 
@@ -152,7 +159,8 @@ Intended read-only pre-attachment methods are:
 - `parse`;
 - `complete`.
 
-Current routing also permits `cap.request` and `journal.query` before attachment. That behavior is a P0 defect, not a supported anonymous API. A secure client or proxy must not reproduce it as an authorization rule.
+No other current method is public. In particular, `cap.request` and `journal.query` reject an
+unattached caller before approval or storage access.
 
 ## Method index
 
@@ -374,7 +382,8 @@ Offset and length are uncompressed byte units and length is clamped to 8 KiB. Ex
 {"$":"bytes","len":1234,"v":"base64..."}
 ```
 
-The method currently reads a complete blob into the response and has no range parameter. Use content refs deliberately and account for response size.
+The complete-small-blob compatibility response is still bounded by the same page ceiling; larger
+objects require explicit continuation.
 
 ## Tasks
 
@@ -382,7 +391,7 @@ All task selectors use `{ "task": "task:7" }`.
 
 | Method | Behavior |
 | --- | --- |
-| `task.list {}` | Returns records whose session ID matches the attached session. |
+| `task.list {}` | Returns records whose exact principal/session owner matches the attachment. |
 | `task.get` | Nonblocking record snapshot. |
 | `task.await` | Blocks the connection until state is no longer `running`/`cancelling`. |
 | `task.cancel` | Sets the cancellation token and returns `{task, cancel_requested:true}`. |
@@ -403,7 +412,8 @@ Record:
 }
 ```
 
-Task access checks session name, not principal. Because multiple principals can attach to the same named session, a session is a collaboration/trust boundary rather than a principal-isolation boundary.
+Task access checks the exact `(principal, session name)` owner. Another principal using the same
+visible name has a different evaluator, task namespace, and quota account.
 
 `task.await` has no timeout param and occupies the request path until terminal state. Prefer subscriptions/polling when the client must stay responsive.
 
@@ -419,7 +429,8 @@ Returns stored source, reparsed AST, effects, reversibility, current policy verd
 
 ### `plan.list`
 
-Params `{}`. Returns summaries whose stored metadata matches attached session and principal. A colliding insertion may already have overwritten an earlier plan, so absence does not necessarily mean it was never derived.
+Params `{}`. Returns summaries whose stored owner matches the attachment. Plan refs include a full
+content digest plus a unique object suffix, so identical plans remain distinct rather than colliding.
 
 ### `plan.apply`
 
@@ -460,7 +471,9 @@ Returns entries containing ID, session, principal, nanosecond timestamp/duration
 
 `effects` uses all-of matching after normalizing dotted/snake-case names. `until` and effects are post-filters applied after the store query and its limit, so a tight limit can yield fewer results than requested even when older matching rows exist.
 
-**Current P0 disclosure defect:** this handler has no attachment check and queries the process-wide journal. An unauthenticated socket client can read source, AST, effects, principals, paths, and output hashes. Socket filesystem permissions are presently the only reliable boundary.
+Attachment is mandatory. The kernel overwrites the query's principal/session filters with the exact
+attachment owner before reading, so caller filters can narrow results but cannot cross principal or
+same-visible-name session boundaries.
 
 ## PTYs
 
@@ -631,6 +644,7 @@ RPC errors and Shoal language `error` values are separate. The former control th
 | `-32022` | unknown PTY | Missing, closed, or other-session PTY. |
 | `-32023` | PTY spawn failed | Executable/sandbox/PTY setup failure. |
 | `-32030` | auth failed | Token unavailable/invalid/expired/revoked. |
+| `-32040` | quota exceeded | A connection/session/task/PTY/subscription budget is full. |
 
 Do not branch on error message prose. Branch on numeric code, then use structured `data` when present. Preserve unknown codes for forward compatibility.
 

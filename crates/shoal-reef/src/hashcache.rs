@@ -10,6 +10,11 @@ use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
+/// Maximum filesystem identities retained by one resolver. File hashes are an
+/// advisory acceleration, so clearing the cache at the ceiling preserves
+/// resolution results while bounding churn from replaced binaries.
+const MAX_HASH_CACHE_ENTRIES: usize = 4_096;
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct IdKey {
     dev: u64,
@@ -60,7 +65,11 @@ impl HashCache {
         }
         let bytes = std::fs::read(path)?;
         let hex = blake3::hash(&bytes).to_hex().to_string();
-        self.lock_map().insert(key, hex.clone());
+        let mut map = self.lock_map();
+        if map.len() >= MAX_HASH_CACHE_ENTRIES && !map.contains_key(&key) {
+            map.clear();
+        }
+        map.insert(key, hex.clone());
         Ok(hex)
     }
 }
@@ -97,6 +106,34 @@ mod tests {
         std::fs::write(&p, b"bbbbbb").unwrap();
         let h2 = cache.hash_file(&p).unwrap();
         assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn filesystem_identity_churn_clears_the_advisory_cache_at_its_ceiling() {
+        let cache = HashCache::new();
+        let mut map = cache.lock_map();
+        for ino in 0..MAX_HASH_CACHE_ENTRIES as u64 {
+            map.insert(
+                IdKey {
+                    dev: 1,
+                    ino,
+                    mtime: 1,
+                    mtime_ns: 0,
+                    len: 1,
+                },
+                "old".into(),
+            );
+        }
+        drop(map);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("current");
+        std::fs::write(&path, b"authoritative bytes").unwrap();
+        assert_eq!(
+            cache.hash_file(&path).unwrap(),
+            hash_bytes(b"authoritative bytes")
+        );
+        assert_eq!(cache.lock_map().len(), 1);
     }
 
     #[test]

@@ -76,8 +76,8 @@ cargo run -p shoal -- -c $'let answer = 6 * 7\nanswer'
 cargo run -p shoal -- examples/example.shl
 ```
 
-The repository currently ships **49 declarative adapters** and a normative corpus of **1,310
-cases across 77 suites**. The corpus is the executable language contract.
+The repository currently ships **49 declarative adapters** and a normative corpus of **1,331
+cases across 78 suites**. The corpus is the executable language contract.
 
 ## The model
 
@@ -145,7 +145,7 @@ accessible relationship diagrams in compact pan/zoom viewers while preserving ev
 | `shoal-reef`, `shoal-adapters` | reproducible tool resolution and typed CLI schemas |
 | `shoal-journal` | SQLite journal and blake3 content-addressed storage |
 | `shoal-leash` | plans, grants, hash pins, OS enforcement |
-| `shoal-proto`, `shoal-kernel`, `shoal-mcp` | shared sessions and agent protocols |
+| `shoal-proto`, `shoal-kernel`, `shoal-mcp` | principal-private sessions and agent protocols |
 | `shoal-prompt`, `shoal-lsp`, `shoal` | prompt, editor tooling, CLI and REPL host |
 
 The [Architecture Atlas](https://alliecatowo.github.io/shoal/internals/) traces crate boundaries,

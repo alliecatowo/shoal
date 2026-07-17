@@ -256,36 +256,16 @@ configured policy cannot be read or parsed. The local REPL may offer a visible r
 through CLI and kernel startup. Attach/capability results must distinguish “policy allowed” from “OS
 dimension enforced.” No test may infer network containment when the backend is absent.
 
-### P0.5 Live token lifecycle and capability meaning
+### P0.5 Live token lifecycle — closed; capability wording remains informational
 
-**Problem.** The persistent kernel opens `tokens.json` once and keeps the resulting token vector in
-memory. The separate `shoal-token` command rewrites that file, but the kernel has no reload path. A
-new token fails until restart; an externally revoked token remains accepted until restart unless its
-already-loaded expiry passes. `PROFILE` and `--cap` values are returned in attach metadata but are not
-consumed by Leash or handler authorization.
+Token create/revoke now takes an exclusive fd lock, reloads fresh disk state inside the lock, and
+atomically replaces it. Validation takes a shared fd lock and reloads fresh state. The kernel
+revalidates every bearer-backed attachment before each request and clears it on revocation, expiry,
+corruption, or I/O/lock failure, so serving state changes without restart and fails closed.
 
-**Design.** Prefer kernel-owned create/list/revoke operations behind a local administrative authority,
-so mutation and validation share one serialized store. If file-based administration remains, add an
-interprocess lock, persisted generation, safe reload before validation or via a watcher, and a stated
-maximum revocation latency. A failed reload should fail closed for tokens changed since the last
-known-good generation without breaking already-established policy deliberately.
-
-Choose one semantic contract for profile/caps:
-
-1. make them enforced restrictions intersected with principal Leash and handler rights; or
-2. rename/version them as descriptive labels and remove capability wording from responses/CLI.
-
-They must never widen principal policy. Established connections also need a revocation decision:
-revocation may block only future attach, or it may terminate/recheck sessions; state that explicitly.
-
-**Acceptance tests.** Against a live kernel, create a token and attach without restart; revoke it and
-prove attach fails within the promised bound; exercise expiry; race two administrators without lost
-updates; corrupt/partially replace the file; and prove cap/profile strings do not grant an operation
-absent principal policy. If live connections are revoked, verify task/PTY/subscription cleanup.
-
-**Exit.** CLI output identifies serving versus disk generation, operational docs no longer require an
-unstated restart, and the status/attach schema says whether token attributes are enforced or merely
-descriptive.
+`PROFILE` and `--cap` values remain descriptive attach metadata. They never widen authority: the
+principal's Leash policy and explicit handler ownership checks decide access. Remaining work is
+naming/schema clarity if those metadata fields continue to use capability vocabulary.
 
 ## P1 — stabilize shared composition, protocol, and persistence
 
@@ -450,12 +430,12 @@ write/append, and watch. Keep pure parsing/rendering code free of host traits.
 **Exit.** A denied or fake filesystem capability observes `.save`, `.append`, watch, canonicalization,
 and all builtins. A repository lint/check prevents new ambient filesystem calls in restricted modules.
 
-### P2.6 Resolution and registry consolidation
+### P2.6 Resolution and registry consolidation — implemented core
 
-Create a typed command-resolution result for builtin, function, alias, adapter, Reef executable,
-ambient executable, and interpreter runner. Preserve current precedence through table-driven tests
-before refactoring. Keep the builtin identity registry in the leaf syntax crate; resolution itself
-belongs in evaluation and must not create a dependency cycle.
+`shoal-syntax` now owns the canonical source kinds, precedence table, and resolution function for
+builtin, function, alias, adapter, Reef/plugin, ambient executable, and interpreter paths. Evaluator
+dispatch/planning, completion, highlighting, and LSP consume the same result. Remaining product work
+is an optional user/agent-facing explanation trace; do not fork another precedence list to add it.
 
 ## P3 — complete deliberately scoped features
 

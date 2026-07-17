@@ -3,6 +3,7 @@
 //! and cached in-memory keyed by path. Enumeration never probes.
 
 use std::collections::HashMap;
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 
@@ -12,10 +13,38 @@ use crate::version::Version;
 /// Canonical system roots, always scope `system` (not `ambient`).
 pub const CANONICAL_ROOTS: &[&str] = &["/usr/bin", "/usr/local/bin", "/bin"];
 
+/// Version probes are advisory and repeatable. Bound retained executable
+/// identities so repeated PATH churn cannot grow a long-lived resolver.
+const MAX_VERSION_CACHE_ENTRIES: usize = 1_024;
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct VersionKey {
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
+    mtime: i64,
+    mtime_ns: i64,
+    len: u64,
+}
+
+impl VersionKey {
+    fn for_path(path: &std::path::Path) -> std::io::Result<Self> {
+        let meta = std::fs::metadata(path)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            dev: meta.dev(),
+            ino: meta.ino(),
+            mtime: meta.mtime(),
+            mtime_ns: meta.mtime_nsec(),
+            len: meta.len(),
+        })
+    }
+}
+
 pub struct SystemProvider {
     roots: Vec<PathBuf>,
     ambient: Vec<PathBuf>,
-    cache: Mutex<HashMap<PathBuf, Version>>,
+    cache: Mutex<HashMap<VersionKey, Version>>,
 }
 
 impl SystemProvider {
@@ -43,7 +72,7 @@ impl SystemProvider {
         SystemProvider::new(roots, ambient)
     }
 
-    fn lock_cache(&self) -> MutexGuard<'_, HashMap<PathBuf, Version>> {
+    fn lock_cache(&self) -> MutexGuard<'_, HashMap<VersionKey, Version>> {
         match self.cache.lock() {
             Ok(cache) => cache,
             Err(poisoned) => {
@@ -80,11 +109,18 @@ impl Provider for SystemProvider {
     }
 
     fn version_of(&self, cand: &Candidate) -> Version {
-        if let Some(v) = self.lock_cache().get(&cand.path) {
+        let Ok(key) = VersionKey::for_path(&cand.path) else {
+            return probe_version(&cand.path);
+        };
+        if let Some(v) = self.lock_cache().get(&key) {
             return v.clone();
         }
         let v = probe_version(&cand.path);
-        self.lock_cache().insert(cand.path.clone(), v.clone());
+        let mut cache = self.lock_cache();
+        if cache.len() >= MAX_VERSION_CACHE_ENTRIES && !cache.contains_key(&key) {
+            cache.clear();
+        }
+        cache.insert(key, v.clone());
         v
     }
 }
@@ -130,7 +166,10 @@ mod tests {
         let v = p.version_of(&cands[0]);
         assert_eq!(v.raw(), "4.5.6");
         // Cached path present.
-        assert!(p.lock_cache().contains_key(&cands[0].path));
+        assert!(
+            p.lock_cache()
+                .contains_key(&VersionKey::for_path(&cands[0].path).unwrap())
+        );
     }
 
     #[test]
@@ -156,7 +195,10 @@ mod tests {
                     .cache
                     .lock()
                     .expect("version cache starts healthy");
-                cache.insert(poisoned_path, Version::parse("99.99.99"));
+                cache.insert(
+                    VersionKey::for_path(&poisoned_path).unwrap(),
+                    Version::parse("99.99.99"),
+                );
                 panic!("inject system version cache poison");
             })
             .expect("spawn version cache poisoner");
@@ -164,6 +206,61 @@ mod tests {
 
         assert_eq!(provider.version_of(&candidate).raw(), "4.5.6");
         assert!(!provider.cache.is_poisoned());
+        assert_eq!(provider.lock_cache().len(), 1);
+    }
+
+    #[test]
+    fn executable_replacement_invalidates_the_cached_version() {
+        let root = tempfile::tempdir().unwrap();
+        let path = make_exe(
+            root.path(),
+            "changing",
+            "#!/bin/sh\necho 'changing 1.0.0'\n",
+        );
+        let provider = SystemProvider::new(vec![root.path().into()], vec![]);
+        let candidate = provider.discover("changing", &ProviderCtx::new("/"))[0].clone();
+        assert_eq!(provider.version_of(&candidate).raw(), "1.0.0");
+
+        // A different length is part of the identity even on filesystems with
+        // coarse mtimes, so an in-place replacement must be reprobed.
+        make_exe(
+            root.path(),
+            "changing",
+            "#!/bin/sh\necho 'changing 22.33.44'\n",
+        );
+        assert_eq!(provider.version_of(&candidate).raw(), "22.33.44");
+        assert_eq!(path, candidate.path);
+    }
+
+    #[test]
+    fn version_cache_churn_clears_at_its_ceiling() {
+        let provider = SystemProvider::new(Vec::new(), Vec::new());
+        let mut cache = provider.lock_cache();
+        for ino in 0..MAX_VERSION_CACHE_ENTRIES as u64 {
+            cache.insert(
+                VersionKey {
+                    path: PathBuf::from(format!("/old/{ino}")),
+                    dev: 1,
+                    ino,
+                    mtime: 1,
+                    mtime_ns: 0,
+                    len: 1,
+                },
+                Version::parse("1.0.0"),
+            );
+        }
+        drop(cache);
+
+        let root = tempfile::tempdir().unwrap();
+        make_exe(root.path(), "current", "#!/bin/sh\necho 'current 3.2.1'\n");
+        // Use the same provider so admission exercises its full cache.
+        let candidate = Candidate::new(
+            "current",
+            Version::unknown(),
+            root.path().join("current"),
+            "system",
+        );
+        assert_eq!(provider.version_of(&candidate).raw(), "3.2.1");
         assert_eq!(provider.lock_cache().len(), 1);
     }
 

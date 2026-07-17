@@ -9,6 +9,12 @@ use std::{collections::HashMap, sync::Arc};
 use tokio::sync::{Mutex, RwLock};
 use tower_lsp::{Client, LanguageServer, jsonrpc::Result, lsp_types::*};
 
+/// Retained source is identity-bearing editor state: never silently evict an
+/// open URI, because a later change could then apply to the wrong baseline.
+const MAX_OPEN_DOCUMENTS: usize = 128;
+pub(crate) const MAX_DOCUMENT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_OPEN_SOURCE_BYTES: usize = 32 * 1024 * 1024;
+
 pub struct Backend {
     client: Client,
     docs: Arc<RwLock<HashMap<Url, DocumentState>>>,
@@ -29,6 +35,16 @@ impl Backend {
             client,
             docs: Default::default(),
             updates: Default::default(),
+        }
+    }
+
+    fn resource_limit_diagnostic(message: String) -> Diagnostic {
+        Diagnostic {
+            range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+            severity: Some(DiagnosticSeverity::ERROR),
+            source: Some("shoal-lsp".into()),
+            message,
+            ..Default::default()
         }
     }
     async fn analyze_and_publish(&self, uri: Url, text: String, version: i32) {
@@ -87,12 +103,27 @@ impl LanguageServer for Backend {
         let uri = p.text_document.uri;
         let text = p.text_document.text;
         let version = p.text_document.version;
-        {
+        let admission = {
             let _update = self.updates.lock().await;
-            self.docs
-                .write()
-                .await
-                .insert(uri.clone(), pending_document(text.clone(), version));
+            let mut docs = self.docs.write().await;
+            admit_document(
+                &mut docs,
+                uri.clone(),
+                pending_document(text.clone(), version),
+            )
+        };
+        if let Err(message) = admission {
+            self.client
+                .log_message(MessageType::ERROR, message.clone())
+                .await;
+            self.client
+                .publish_diagnostics(
+                    uri,
+                    vec![Self::resource_limit_diagnostic(message)],
+                    Some(version),
+                )
+                .await;
+            return;
         }
         self.analyze_and_publish(uri, text, version).await;
     }
@@ -101,22 +132,22 @@ impl LanguageServer for Backend {
         let version = p.text_document.version;
         let staged = {
             let _update = self.updates.lock().await;
-            let docs = self.docs.read().await;
+            let mut docs = self.docs.write().await;
             let Some(current) = docs.get(&uri) else {
                 return;
             };
             if version <= current.version {
                 return;
             }
-            let next = apply_content_changes(&current.text, &p.content_changes);
-            drop(docs);
-            if let Ok(next) = &next {
-                self.docs
-                    .write()
-                    .await
-                    .insert(uri.clone(), pending_document(next.clone(), version));
+            match apply_content_changes(&current.text, &p.content_changes) {
+                Ok(next) => admit_document(
+                    &mut docs,
+                    uri.clone(),
+                    pending_document(next.clone(), version),
+                )
+                .map(|()| next),
+                Err(message) => Err(message),
             }
-            next
         };
         let next_text = match staged {
             Ok(text) => text,
@@ -274,6 +305,39 @@ impl LanguageServer for Backend {
             analysis::document_symbols(&doc.text, &doc.symbols, span_range),
         )))
     }
+}
+
+/// Admit or replace one open document without exceeding retained identity or
+/// source-byte budgets. Existing state is left untouched on rejection.
+fn admit_document(
+    docs: &mut HashMap<Url, DocumentState>,
+    uri: Url,
+    state: DocumentState,
+) -> std::result::Result<(), String> {
+    let source_bytes = state.text.len();
+    if source_bytes > MAX_DOCUMENT_BYTES {
+        return Err(format!(
+            "document is {source_bytes} bytes; shoal-lsp accepts at most {MAX_DOCUMENT_BYTES} bytes per open document"
+        ));
+    }
+    if !docs.contains_key(&uri) && docs.len() >= MAX_OPEN_DOCUMENTS {
+        return Err(format!(
+            "shoal-lsp already retains {MAX_OPEN_DOCUMENTS} open documents; close one before opening another"
+        ));
+    }
+    let retained_without_uri = docs
+        .iter()
+        .filter(|(open_uri, _)| *open_uri != &uri)
+        .fold(0usize, |total, (_, doc)| {
+            total.saturating_add(doc.text.len())
+        });
+    if retained_without_uri.saturating_add(source_bytes) > MAX_OPEN_SOURCE_BYTES {
+        return Err(format!(
+            "open source would exceed shoal-lsp's {MAX_OPEN_SOURCE_BYTES}-byte retained-source budget"
+        ));
+    }
+    docs.insert(uri, state);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -478,6 +542,58 @@ mod tests {
     }
 
     #[test]
+    fn document_admission_rejects_identity_growth_without_evicting_open_uris() {
+        let mut docs = HashMap::new();
+        for index in 0..MAX_OPEN_DOCUMENTS {
+            let uri = Url::parse(&format!("file:///tmp/open-{index}.shl")).unwrap();
+            admit_document(&mut docs, uri, pending_document("x".into(), 1)).unwrap();
+        }
+        let first = Url::parse("file:///tmp/open-0.shl").unwrap();
+        let rejected = Url::parse("file:///tmp/rejected.shl").unwrap();
+        assert!(
+            admit_document(
+                &mut docs,
+                rejected.clone(),
+                pending_document("new".into(), 1)
+            )
+            .is_err()
+        );
+        assert_eq!(docs.len(), MAX_OPEN_DOCUMENTS);
+        assert!(docs.contains_key(&first));
+        assert!(!docs.contains_key(&rejected));
+
+        // Reopening the same identity is a replacement, not count growth.
+        admit_document(
+            &mut docs,
+            first.clone(),
+            pending_document("replacement".into(), 2),
+        )
+        .unwrap();
+        assert_eq!(docs[&first].text, "replacement");
+    }
+
+    #[test]
+    fn document_admission_rejects_oversize_source_without_mutating_baseline() {
+        let uri = Url::parse("file:///tmp/bounded.shl").unwrap();
+        let mut docs = HashMap::new();
+        admit_document(
+            &mut docs,
+            uri.clone(),
+            pending_document("let safe = 1".into(), 1),
+        )
+        .unwrap();
+        let error = admit_document(
+            &mut docs,
+            uri.clone(),
+            pending_document("x".repeat(MAX_DOCUMENT_BYTES + 1), 2),
+        )
+        .unwrap_err();
+        assert!(error.contains("per open document"));
+        assert_eq!(docs[&uri].text, "let safe = 1");
+        assert_eq!(docs[&uri].version, 1);
+    }
+
+    #[test]
     fn completion_replaces_the_whole_identifier_at_cursor() {
         let text = "let deployment = dep_suffix";
         let cursor = text.find("_suffix").unwrap();
@@ -525,6 +641,20 @@ mod tests {
         .unwrap();
         assert_eq!(module.range.start, Position::new(0, 0));
 
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unopened_definition_target_reads_are_source_bounded() {
+        let dir = unique_temp_dir("bounded-definition");
+        let module_path = dir.join("huge.shl");
+        std::fs::write(&module_path, vec![b'x'; MAX_DOCUMENT_BYTES + 1]).unwrap();
+        assert!(document::read_source_bounded(&module_path).is_none());
+        std::fs::write(&module_path, "export fn bounded() {}").unwrap();
+        assert_eq!(
+            document::read_source_bounded(&module_path).as_deref(),
+            Some("export fn bounded() {}")
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

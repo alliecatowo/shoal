@@ -87,6 +87,10 @@ const DEFAULT_MAX_RESULTS: usize = 100;
 /// Periodic bounded revalidation keeps executable completion honest without
 /// rescanning every PATH directory on every keystroke.
 const PATH_CACHE_REVALIDATE: Duration = Duration::from_millis(200);
+/// A session can replace its PATH repeatedly. Directory scans are advisory,
+/// so clear-and-rebuild at this ceiling bounds retained filesystem-derived
+/// keys without changing completion results.
+const MAX_PATH_CACHE_DIRS: usize = 64;
 
 struct PathCacheEntry {
     dir_mtime: Option<SystemTime>,
@@ -190,6 +194,9 @@ impl ShoalCompleter {
                         names.push(name.to_string());
                     }
                 }
+            }
+            if self.path_cache.len() >= MAX_PATH_CACHE_DIRS && !self.path_cache.contains_key(dir) {
+                self.path_cache.clear();
             }
             self.path_cache.insert(
                 dir.to_path_buf(),
@@ -1310,6 +1317,31 @@ mod tests {
         fs::set_permissions(&tool, fs::Permissions::from_mode(0o644)).unwrap();
         std::thread::sleep(PATH_CACHE_REVALIDATE + Duration::from_millis(25));
         assert!(c.path_dir_names(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn path_cache_churn_clears_at_its_advisory_ceiling() {
+        let root = tempfile::tempdir().unwrap();
+        let mut completer = completer_at(Path::new("."));
+        for index in 0..MAX_PATH_CACHE_DIRS {
+            completer.path_dir_names(&root.path().join(format!("missing-{index}")));
+        }
+        assert_eq!(completer.path_cache.len(), MAX_PATH_CACHE_DIRS);
+
+        let current = root.path().join("current");
+        fs::create_dir(&current).unwrap();
+        fs::write(current.join("bounded-tool"), b"").unwrap();
+        fs::set_permissions(
+            current.join("bounded-tool"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        assert_eq!(
+            completer.path_dir_names(&current),
+            vec!["bounded-tool".to_string()]
+        );
+        assert_eq!(completer.path_cache.len(), 1);
+        assert!(completer.path_cache.contains_key(&current));
     }
 
     #[test]

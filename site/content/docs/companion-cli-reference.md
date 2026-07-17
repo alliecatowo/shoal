@@ -287,9 +287,11 @@ shoal-token revoke 0123456789abcdef
 
 Unknown IDs fail. Revocation writes a timestamp rather than deleting metadata.
 
-### Kernel reload warning
+### Live kernel visibility
 
-The daemon loads its token store once. Create/revoke through this CLI does not update a running kernel's in-memory copy. Restart every affected kernel after token changes. Expiry is still checked against current time on each validation.
+Create/revoke is visible to a running kernel without restart. Writers take an exclusive fd lock and
+reload before mutation; the kernel revalidates an attached bearer from a fresh shared-locked snapshot
+before every request. Revocation or expiry therefore fails the next request and clears the attachment.
 
 The kernel always uses `<--state-dir>/tokens.json`, ignoring `SHOAL_TOKEN_STORE`; align the paths.
 

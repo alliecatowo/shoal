@@ -132,55 +132,21 @@ raised while evaluating valid source; the latter means the method call itself wa
 
 ## Current architecture debt
 
-### Critical: approval mutation and journal reads bypass attachment
+### Closed hardening boundaries that must remain invariant
 
-**Evidence:** `Kernel::dispatch` routes both `cap.request` and `journal.query` without passing the
-connection's `Attachment`. `handle_cap_request` looks up the process-global plan map by ref and sets
-`stored.approved = true` after policy evaluation, but never authenticates or authorizes the caller as
-an approver. `handle_journal_query` returns the shared journal without a caller-principal filter.
-The protocol comment claiming the complete unattached-method set also omits `journal.query`, so the
-comment and router disagree.
+The former approval, journal, plan-identity, named-session, and token-snapshot defects are closed:
 
-**Compounding identity defect:** `Plan::new` derives `plan_ref` from only effects, reversibility, and
-estimates, truncated to 16 hex characters. Kernel storage is `HashMap<plan_ref, StoredPlan>`, so
-equal-effect plans from different source/session/principal records overwrite one another. Apply does
-re-check the currently stored source/session/principal and therefore rejects many confused uses, but
-the ref is not a unique owner-scoped plan identity.
+- every stateful handler uses an attachment; journal reads force the attachment's exact owner;
+- approval reserves a one-shot transition, durably audits it before publication, and binds the
+  consuming execution;
+- plan ids bind full source/AST/effects/Session/principal content plus a unique object suffix;
+- session identity is `(principal, visible Session name)`, with matching exact-owner refs and quotas;
+- token operations use shared/exclusive fd locks and fresh disk reads, while attached requests
+  revalidate live and fail closed on revocation, expiry, or store failure.
 
-**Risk:** a same-user socket client can approve a known or derived non-denied plan without an
-approver identity and inspect journal data across token principals. Equal-shape plans can invalidate
-or replace each other's stored objects.
-
-**Direction:** require attachment plus an explicit approver/journal-read capability, scope queries,
-separate unique stored-object IDs from content fingerprints, and add two-token/two-session collision
-tests. Pin the only genuinely public methods in a router test.
-
-### High: session identity is weaker than session naming
-
-**Evidence:** `Kernel::session(name, principal)` uses `principal` only when first creating a named
-session. Later principals attaching the same name receive the same evaluator and transcript. The
-evaluator journal principal remains the creator's, while coarse exec rows use each current actor.
-
-**Risk:** cross-principal state disclosure/mutation and confused provenance when a name crosses a
-trust boundary.
-
-**Direction:** key sessions by an authenticated ownership identity or enforce an explicit ACL at
-attach, then migrate journal/transcript scoping and add same-name/two-principal tests.
-
-### High: token administration is a stale startup snapshot
-
-**Evidence:** persistent kernel constructors open `TokenStore` once and retain its in-memory token
-vector. The separate `shoal-token` command opens and atomically rewrites the same file, but the kernel
-has no reload/watcher/generation check. Token `profile` and `caps` appear in attach output, while
-authorization evaluates Leash by `principal`; no handler consumes the cap strings.
-
-**Risk:** external revocation does not stop an already-known bearer until kernel restart, newly
-created tokens fail until restart, and operators/clients can mistake descriptive cap strings for
-grants. Concurrent management processes can also replace updates from a stale file snapshot.
-
-**Direction:** make the kernel own token mutation or add locked generation-aware reload with an
-explicit maximum revocation latency. Define cap/profile values as enforced policy input or rename and
-document them as labels. Test create/revoke against a live serving kernel.
+Regression work belongs in collision, concurrency, audit-failure, and live-revocation tests. Token
+`profile` and `caps` remain descriptive attach metadata: principal Leash policy and explicit handler
+checks are the authorization boundary.
 
 ### High: the local shell and kernel are divergent composition roots
 
@@ -254,8 +220,8 @@ These are four separate, explicitly unimplemented surfaces:
 | method metadata/dispatch parity | sequence metadata advertises table/range `.get` that dispatch rejects; bool omits valid `.str`/`.display` | generate receiver metadata from executable dispatch tests or pin bidirectional parity fixtures |
 | function type soundness | scalar parameter and return annotations are not consistently enforced; non-string command arguments can bypass coercion | one runtime validator shared by expression/command calls plus return checking and conformance cases |
 | kernel task suspend/resume | handlers return `TASK_CONTROL_UNAVAILABLE` | task runtime that can identify/control owned child groups, or remove verbs |
-| WASM evaluation | `shoal-wasm` has no eval/host dependency or invocation API | effect-scoped host ABI, component lifecycle, value/wire conversion, limits |
-| WASM deadline | `shoal_wasm::Limits` has fuel/memory/table/instance ceilings but no wall-clock timeout | host deadline/interruption design and tests before claiming timeout confinement |
+| WASM ABI evolution | preview ABI v1 is integrated with declared+authorized hostcalls and bounded values | keep new hostcalls effect-scoped, versioned, cancellable, and adversarially tested |
+| WASM compilation latency | invocation has fuel/epoch/cancellation/wall-time limits, but synchronous compilation is only byte-capped | cache/admission policy if compile latency becomes an operational problem |
 | Reef runner/options-only scope | scope discovery ignores manifests whose `tools` map is empty | decide whether non-tool Reef configuration constitutes a scope; add discovery tests |
 | companion state-root parity | `shoal-history` and doctor defaults use XDG data while evaluator/kernel use XDG state | one shared root resolver or mandatory explicit state-dir plumbing |
 
@@ -318,13 +284,14 @@ solve drift by introducing dependency cycles.
 ### Low but concrete maintenance debt
 
 - `shoal-history::entry` scans all journal rows instead of `entries_by_id`.
-- Fuzz targets are shallow and their CI build is allowed to fail.
-- Color/highlighter tests inherit ambient `NO_COLOR` while asserting ANSI output.
-- Workspace lints are declared but member crates do not inherit them.
+- Fuzz targets are shallow; PR compilation is blocking and scheduled runtime fuzzing is the
+  behavioral gate.
+- Color/highlighter tests isolate ambient `NO_COLOR` while asserting ANSI output.
+- Workspace lints are declared at the root and every member crate inherits them with
+  `[lints] workspace = true`.
 - A `JobsSnapshot` comment says suspended is always zero while implementation counts suspended
   tasks; code is authoritative, but misleading comments make future regressions likely.
-- Some historical root-doc counts and feature-status claims are stale relative to source and the
-  1,310-case corpus.
+- Historical root-doc counts must remain explicitly dated relative to the current 1,331-case corpus.
 
 ## Prioritization map
 

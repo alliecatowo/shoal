@@ -1,6 +1,7 @@
 //! Document snapshots, incremental edits, diagnostics, completion, and navigation helpers.
 
 use super::*;
+use std::io::Read;
 
 pub(super) fn symbol_facts(symbol: Option<&Symbol>) -> CommandFacts {
     use analysis::SymbolFlavor;
@@ -193,7 +194,7 @@ pub(super) fn definition_in_used_module(
         let (target_text, target_ast) = if let Some(target) = docs.get(&target_uri) {
             (target.text.clone(), target.ast.clone())
         } else {
-            let text = std::fs::read_to_string(&target_path).ok()?;
+            let text = read_source_bounded(&target_path)?;
             let ast = shoal_syntax::parse(&text).ok();
             (text, ast)
         };
@@ -207,6 +208,17 @@ pub(super) fn definition_in_used_module(
         return Some(Location::new(target_uri, range));
     }
     None
+}
+
+/// Read unopened navigation targets under the same per-document source cap as
+/// editor-provided text. `take` closes the metadata/read race: a file that
+/// grows after open is still sampled by at most one byte over the ceiling.
+pub(super) fn read_source_bounded(path: &std::path::Path) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = file.take(MAX_DOCUMENT_BYTES as u64 + 1);
+    let mut text = String::new();
+    reader.read_to_string(&mut text).ok()?;
+    (text.len() <= MAX_DOCUMENT_BYTES).then_some(text)
 }
 
 pub(super) fn completion_kind(label: &str) -> CompletionItemKind {

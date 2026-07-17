@@ -318,8 +318,9 @@ Rules for codes:
 
 ## Normative conformance corpus
 
-`spec/cases/*.toml` is the behavioral specification. At the 2026-07-16 audit it contains 77 suite
-files and 1,310 globally named cases. A case has this conceptual shape:
+`spec/cases/*.toml` is the behavioral specification. At the 2026-07-16 audit it contained 77 suite
+files and 1,310 globally named cases; the reconciled tree now contains 78 suites and 1,331 cases. A
+case has this conceptual shape:
 
 ```toml
 [[case]]
@@ -373,7 +374,7 @@ explicitly skipped with a reason.
 
 ### Current corpus state
 
-The live audit result was 1,306 passed, 0 failed, and 4 skipped. The skips cover a native-thread
+The current expected result is 1,327 passed, 0 failed, and 4 skipped. The skips cover a native-thread
 recursion-stack condition, a Node block, a jq feed composition, and full-chain Reef `which`. Counts
 are evidence from that run, not a permanently hardcoded health claim; release notes must run the
 corpus again.
@@ -381,7 +382,7 @@ corpus again.
 ### Exhaustive suite ledger
 
 Every suite is named below so a language area cannot disappear behind an aggregate count. Counts
-come from `[[case]]` records in the current tree and sum to 1,310. This table should eventually be
+come from `[[case]]` records in the current tree and sum to 1,331. This table should eventually be
 generated and checked in CI; until then, adding, renaming, or splitting a suite requires updating it.
 
 #### Core syntax, control flow, and diagnostics
@@ -473,6 +474,7 @@ generated and checked in CI; until then, adding, renaming, or splitting a suite 
 | `io.toml` | 14 | feed, shell blocks, runners, stdin/output boundaries |
 | `outcome-more.toml` | 4 | additional outcome fields/composition |
 | `outcome.toml` | 15 | status/signal/success/output and condition behavior |
+| `plan-effects.toml` | 16 | derived plan effects, reversibility, and estimates |
 
 #### Reef
 
@@ -489,7 +491,7 @@ generated and checked in CI; until then, adding, renaming, or splitting a suite 
 | `streams-3.toml` | 2 | third-wave stream regressions |
 | `streams-backpressure.toml` | 6 | boundedness, timeout, and pressure behavior |
 | `streams-more.toml` | 7 | additional transformations and consumption rules |
-| `streams.toml` | 33 | source/operator/sink baseline, single consumption, unbounded errors |
+| `streams.toml` | 38 | source/operator/sink baseline, fairness, single consumption, unbounded errors |
 
 ### Two-runner risk
 

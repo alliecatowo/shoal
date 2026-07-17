@@ -19,6 +19,29 @@ pub use client::{BridgeError, Config, KernelClient, LocalAuthMode, discover_sock
 pub use tools::tools;
 
 const MAX_FRAME: usize = 16 * 1024 * 1024;
+/// Each subscription owns a kernel connection and a forwarding thread. This
+/// facade-local ceiling applies before consuming either resource; the kernel's
+/// principal/session quotas remain a second, shared admission boundary.
+const MAX_FACADE_SUBSCRIPTIONS: usize = 64;
+const MAX_SUBSCRIPTION_URI_BYTES: usize = 4 * 1024;
+
+fn subscription_admission(active: usize, uri: &str, duplicate: bool) -> Result<bool, String> {
+    if uri.len() > MAX_SUBSCRIPTION_URI_BYTES {
+        return Err(format!(
+            "subscription URI is {} bytes; maximum is {MAX_SUBSCRIPTION_URI_BYTES}",
+            uri.len()
+        ));
+    }
+    if duplicate {
+        return Ok(false);
+    }
+    if active >= MAX_FACADE_SUBSCRIPTIONS {
+        return Err(format!(
+            "MCP facade subscription limit ({MAX_FACADE_SUBSCRIPTIONS}) reached; unsubscribe before adding another resource"
+        ));
+    }
+    Ok(true)
+}
 
 pub struct Facade {
     kernel: KernelClient,
@@ -451,5 +474,24 @@ mod tests {
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         assert_eq!(args, ["--max-sessions", "19"]);
+    }
+
+    #[test]
+    fn subscription_admission_is_bounded_and_duplicate_idempotent() {
+        assert!(
+            !subscription_admission(MAX_FACADE_SUBSCRIPTIONS, "shoal://events/same", true).unwrap()
+        );
+        let error = subscription_admission(MAX_FACADE_SUBSCRIPTIONS, "shoal://events/new", false)
+            .unwrap_err();
+        assert!(error.contains("unsubscribe"));
+        assert!(
+            subscription_admission(
+                0,
+                &format!("shoal://events/{}", "x".repeat(MAX_SUBSCRIPTION_URI_BYTES)),
+                false,
+            )
+            .unwrap_err()
+            .contains("subscription URI")
+        );
     }
 }

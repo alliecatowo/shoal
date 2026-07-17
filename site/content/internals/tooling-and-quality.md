@@ -78,7 +78,7 @@ core keys.
 
 ## Normative conformance corpus
 
-`spec/cases/` contains 77 TOML suite files and 1,310 `[[case]]` records. Cases declare globally named
+`spec/cases/` contains 78 TOML suite files and 1,331 `[[case]]` records. Cases declare globally named
 source, expected rendered value or stable error code, optional message substring, parse-error
 expectation, filesystem fixtures, and an explicit skip reason.
 
@@ -162,20 +162,25 @@ resolves through the live kernel. Keep the expensive layer focused but real.
 
 ## Fuzz targets
 
-The `fuzz/` workspace has three libFuzzer targets:
+The `fuzz/` workspace has seven libFuzzer targets:
 
 | Target | Current operation |
 |---|---|
-| `lexer` | walk valid UTF-8 in expression mode while spans advance |
-| `parser` | call `parse_status` on valid UTF-8 |
-| `proto_frame` | append newline and call protocol `read_frame` on arbitrary bytes |
+| `lexer` | require progress while walking valid UTF-8 in both expression and command mode |
+| `parser` | format every complete parse and require the formatted source to parse completely |
+| `proto_frame` | decode up to 64 frames, require cursor progress, and round-trip valid requests |
+| `planner` | derive a plan for every complete parse without executing it |
+| `value_wire` | normalize JSON values idempotently and round-trip valid wire values |
+| `stream` | compose bounded closure-free stream operations and pin single consumption |
+| `policy` | evaluate parsed policies against decoded plans and each effect |
 
-These are useful panic/non-progress smoke targets but shallow. The lexer target does not cross CMD
-mode or mode transitions; the parser target asserts no semantic properties; the protocol target does
-not exercise multi-frame streams, response/notification shapes, wire values, or bounded partial-line
-behavior. The `ci.yml` `fuzz-build` job only builds the targets on every push/PR and is marked
-`continue-on-error`, so fuzz health is still not a per-PR release gate — building alone cannot
-catch a crash.
+These are useful panic/non-progress and invariant smoke targets, not exhaustive semantic proof. The
+`ci.yml` `fuzz-build` job is a blocking compile check for every target on every push/PR; building
+alone still cannot catch a crash. Both fuzz workflows explicitly set `RUSTUP_TOOLCHAIN=nightly`; otherwise the root
+stable pin would override the installed nightly toolchain required by cargo-fuzz. Each workflow first
+runs locked Cargo metadata against `fuzz/Cargo.toml`: cargo-fuzz does not expose Cargo's `--locked`
+flag, so this preflight rejects dependency changes that would otherwise rewrite `fuzz/Cargo.lock`
+silently during the build/run.
 
 A separate `.github/workflows/fuzz-nightly.yml` (HR-F4) runs each target for a bounded 120-second
 libFuzzer budget (`cargo fuzz run <target> --fuzz-dir fuzz -- -max_total_time=120`) on a daily cron
@@ -243,17 +248,16 @@ AArch64 on Linux and macOS.
 
 ### Supply-chain advisories (HR-F6)
 
-~394 registry dependencies is real supply-chain surface with no advisory audit before this task
+Hundreds of registry dependencies are real supply-chain surface with no advisory audit before this task
 (deep audit H9). The `supply-chain-audit` job in `ci.yml` installs `cargo-audit` and runs bare
 `cargo audit` against `Cargo.lock` on every push/PR to `main`.
 
 The documented allowlist lives at **`.cargo/audit.toml`** — this is `cargo-audit`'s own
 auto-discovered config path (a bare root-level `audit.toml` is silently ignored by the tool; this
-was verified locally before landing the CI job). Every ignored `RUSTSEC-*` ID carries an inline
-comment with its root cause and the condition for revisiting it. As of this writing every ignored
-advisory traces to one dependency: `shoal-wasm`'s `wasmtime = "37"` pin, whose fix for each current
-advisory requires a major-version bump (to `>=42.0.2`) rather than a same-major patch — a dependency
-change intentionally left to a separate pass rather than bundled into lint/CI hygiene work. The
+was verified locally before landing the CI job). The workspace upgraded `shoal-wasm` from Wasmtime
+37 to **46.0.1**, retiring all 15 advisories that had required a major-version bump; the explicit
+allowlist is now empty. Any future ignored `RUSTSEC-*` ID must carry its root cause and revisit
+condition in that file. The
 config also sets `output.deny = ["unmaintained", "unsound", "yanked"]`, so an unmaintained/unsound
 crate or a yanked version newly appearing in `Cargo.lock` fails the gate even though none exist
 today. Re-run `cargo audit` locally (same command CI uses) after any dependency bump and prune
@@ -261,31 +265,26 @@ allowlist entries that no longer apply.
 
 ### The `shoal-wasm` compile cost decision (HR-F8)
 
-`shoal-wasm` is a workspace member with no other crate depending on it (deep audit H10): it
-validates WASM components/manifests/resource limits in isolation, but nothing wires it into
-evaluator dispatch yet (see the implementation-status page's WASM row). It pulls in `wasmtime` with
+`shoal-wasm` is now a runtime dependency of `shoal-eval`: validated component commands participate
+in canonical command resolution and execute through the preview ABI. It pulls in Wasmtime 46.0.1 with
 the `cranelift` codegen backend, which is by far the largest single dependency subtree in this
 workspace (dozens of `wasmtime-internal-*`/`cranelift-*` crates) — `cargo build --workspace
---all-targets` pays that compile/cache cost on every CI run today even though no shipped behavior
-exercises it.
+--all-targets` pays that compile/cache cost on every CI run, now for shipped evaluator behavior.
 
-Decision: **keep it in ordinary workspace CI, cost accepted, revisit when WASM dispatch actually
-lands.** Reasoning:
+Decision: **keep it in ordinary workspace CI; the runtime path is load-bearing.** Reasoning:
 
 - Feature-gating it out of the default workspace build would need `shoal-wasm`'s own
   `Cargo.toml`/`Cargo.lock` and CI matrix changes (a dependency-shape change, not a lint/doc one);
-  the crate is presently a leaf with a real, if narrow, test suite, and splitting it into a separate
-  CI job buys cache isolation at the cost of another job to maintain for a component nothing
-  depends on.
+  evaluator integration needs the same locked graph and gate as other command dispatch paths;
+  splitting it into a separate job would no longer test the real workspace composition.
 - The crate is small (single `lib.rs`, ~250 lines) and its own compile is fast; the cost is entirely
   `wasmtime`/`cranelift`'s, and `Swatinem/rust-cache` already amortizes that across CI runs on the
   same OS/lockfile, so the marginal per-PR cost after a cache hit is low.
-- Once WASM command dispatch actually lands in `shoal-eval`, `wasmtime` becomes a load-bearing
-  dependency of a crate other things already depend on regardless of `shoal-wasm`'s own CI
-  treatment, making a special-cased job moot.
+- Runtime/evaluator tests exercise validation, resource limits, deadlines, cancellation, and the
+  declared host calls; compiling only the leaf crate would miss that integration.
 
-Revisit this decision (separate job, feature flag, or drop from `--workspace` defaults) if the
-compile/cache cost becomes a measured CI bottleneck before WASM dispatch integration begins.
+Revisit this decision (feature flag or a carefully equivalent matrix) only if measured CI cost
+justifies preserving the same evaluator integration coverage another way.
 
 
 Every member crate opts in with `[lints] workspace = true` (HR-F1,

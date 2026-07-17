@@ -43,9 +43,9 @@ best-effort spawns a detached `shoal-kernel`, polls readiness for about five sec
 `SHOAL_NO_AUTOSTART` opts out for externally supervised kernels. Competing autostarts rely on the
 kernel's socket preparation to leave one winner.
 
-Both MCP stdio and kernel socket protocols use newline JSON frames with a 16 MiB completed-frame
-limit. Like the kernel reader, the MCP reader calls `read_line` before checking size, so memory is not
-strictly bounded while the line is being accumulated.
+Both MCP stdio and kernel socket protocols use newline JSON frames with a 16 MiB limit enforced
+during the read via `Read::take(cap + 1)`, so an unterminated frame cannot grow memory past the
+bound. The public kernel additionally applies its configured frame-read deadline.
 
 Stdout is locked per complete frame. This lets the request loop and subscription-forwarder threads
 write without interleaving JSON bytes.
@@ -70,7 +70,9 @@ The facade currently exposes 13 tools:
 | `shoal_pty_close` | `pty.close` | terminate and reap a PTY |
 | `shoal_pty_list` | `pty.list` | enumerate session PTYs |
 
-The facade's main `KernelClient` attaches before calling these methods, and the kernel boundary now
+The facade's main `KernelClient` attaches as restricted `agent:mcp` unless given an explicit bearer,
+then verifies the returned auth mode, public connection provenance, principal-private session
+isolation, and security epoch before calling these methods. The kernel boundary
 enforces attachment for every stateful method: `journal.query` (HR-D4) and `cap.request` (HR-D1) were
 the last exemptions and now reject an unattached direct kernel client with `NOT_ATTACHED`.
 `cap.request` additionally binds the attached principal as the **approver** and, by default, refuses a

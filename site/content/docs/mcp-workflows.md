@@ -479,7 +479,7 @@ See [Reef tool resolution](@/docs/reef.md).
 | `-32012` | Plan absent/overwritten/restart | Derive a fresh plan. |
 | `-32021` | Task absent/other session/restart | Reconcile journal/artifact; cannot restore live task. |
 | `-32022` | PTY absent/closed/other session | Do not replay keystrokes blindly; reopen after confirmation. |
-| auth failed | Token invalid/expired/revoked/not loaded | Align store, restart after token change, refresh secret. |
+| auth failed | Token invalid/expired/revoked or store unavailable | Align the state path, repair the store, or refresh the bearer. |
 | event sequence gap | Dropped/retention/restart | Pull cursor, then reconcile authoritative state. |
 
 Never retry an effectful `shoal_exec` automatically merely because the client lost its response. The command may have completed. Query the journal, transcript events, expected artifact, or an idempotency key in the target system first.
@@ -541,7 +541,7 @@ Before automating consequential work, confirm:
 
 - the socket is private and every connector process is trusted;
 - the token principal exists in explicit policy;
-- token changes were followed by kernel restart;
+- token CLI and kernel use the same state path (changes are observed live);
 - `caps_enforced` and platform dimension gaps are acceptable;
 - the plan's effects are concrete and reviewed;
 - the session is not shared with an untrusted principal;

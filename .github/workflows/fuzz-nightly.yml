@@ -1,7 +1,7 @@
 name: Scheduled fuzz
 
 # HR-F4 (site/content/internals/hardening-roadmap.md): the `fuzz-build` job in ci.yml only
-# compiles the libFuzzer targets on every push/PR (continue-on-error, no timed run) — deep audit
+# compiles the libFuzzer targets as a blocking check on every push/PR (no timed run) — deep audit
 # finding H12 is that fuzz targets exist but nothing ever actually runs them. This workflow runs
 # each target for a short, fixed budget on a nightly schedule and fails the job (no
 # continue-on-error) if libFuzzer finds a crash, timeout, or OOM, so a regression surfaces here
@@ -35,6 +35,9 @@ jobs:
   fuzz:
     name: fuzz (${{ matrix.target }})
     runs-on: ubuntu-latest
+    # Override the repository's pinned stable toolchain for cargo-fuzz.
+    env:
+      RUSTUP_TOOLCHAIN: nightly
     strategy:
       fail-fast: false
       matrix:
@@ -48,6 +51,8 @@ jobs:
           workspaces: fuzz -> target
       - run: sudo apt-get update && sudo apt-get install -y clang
       - run: cargo install cargo-fuzz --locked
+      # cargo-fuzz has no --locked option; reject fuzz/Cargo.lock drift first.
+      - run: cargo metadata --manifest-path fuzz/Cargo.toml --locked --no-deps --format-version 1 > /dev/null
       - name: Run ${{ matrix.target }} for a bounded budget
         run: |
           cargo fuzz run "${{ matrix.target }}" --fuzz-dir fuzz -- \

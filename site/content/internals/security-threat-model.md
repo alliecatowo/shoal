@@ -1,6 +1,6 @@
 +++
 title = "Authority, authentication, secrets, and sandbox threat model"
-description = "Trust boundaries from bearer attachment through Leash plans and OS confinement, secret storage/injection, WASM validation, known bypasses, and fail-open/fail-closed choices."
+description = "Trust boundaries from bearer attachment through Leash plans and OS confinement, secret storage/injection, WASM execution, known bypasses, and fail-open/fail-closed choices."
 weight = 53
 template = "docs/page.html"
 
@@ -20,7 +20,8 @@ Shoal security is a chain of distinct mechanisms, not one sandbox switch:
 4. a spawn may lower filesystem grants into an OS sandbox request;
 5. `shoal-exec` reports what the platform actually enforced;
 6. secret values use a separate encrypted local store and restricted language paths;
-7. WASM code is currently validated only and is not a runtime plugin surface.
+7. validated WASM components execute through a bounded preview ABI with declared and authorized
+   hostcalls.
 
 Each step has different coverage. Authentication does not imply authorization, a semantic policy
 does not imply OS confinement, and an `enforced` filesystem flag does not imply network isolation.
@@ -38,7 +39,7 @@ flowchart LR
 accTitle: Trust-boundary map
 accDescr: Shows the components and relationships described in Trust-boundary map.
   Client --> Transport["local kernel transport"]
-  Transport --> Auth["TokenStore::validate"]
+  Transport --> Auth["fresh locked token validation"]
   Auth --> Principal
   Principal --> Policy["Leash semantic policy"]
   Source --> Plan["derived effects + reversibility"]
@@ -50,12 +51,13 @@ accDescr: Shows the components and relationships described in Trust-boundary map
   Exec --> OS["child process"]
   SecretStore --> Secret["Secret Value"]
   Secret --> OS
-  Wasm["WASM validation registry"] -. "not wired" .-> Eval
+  Wasm["validated WASM component"] -->|"ABI v1; declared + authorized hostcalls"| Eval
 ```
 
-The local human path can attach without a token and derives a local principal. Durable token auth is
-available only when the kernel opened a state directory; an ephemeral kernel has no `TokenStore` and
-rejects bearer attachment.
+The public socket is machine-only: tokenless clients receive the restricted `agent:mcp` identity and
+client-asserted `local-human` is rejected. Human trust exists only on the server-selected anonymous
+descriptor inherited by the private REPL. Durable token auth is available only when the kernel
+opened a state directory; an ephemeral kernel has no `TokenStore` and rejects bearer attachment.
 
 ## Assets and adversaries
 
@@ -99,29 +101,21 @@ bytes encoded URL-safe without padding. Token id is the first eight digest bytes
 | `revoked_ns` | optional revocation time |
 
 
-`validate` performs constant-time byte equality after decoding each stored digest, then checks
-revocation and strict `expires_ns > now`. It returns cloned metadata, not a mutable token object.
+`validate` takes a shared advisory file lock, reloads the store from disk, performs constant-time
+byte equality after decoding each stored digest, then checks revocation and strict
+`expires_ns > now`. Create and revoke take the exclusive lock, reload fresh state inside that lock,
+mutate it, and atomically replace the file. This prevents two management processes from publishing
+updates derived from stale snapshots.
 
-The persistent kernel opens `TokenStore` once during `Kernel::open`/`open_with_policy` and retains
-that in-memory key/token vector behind a mutex. The separate `shoal-token` process opens and rewrites
-`tokens.json`, but the running kernel has no reload, file watch, generation check, or management RPC.
-Therefore:
+The kernel revalidates the attached bearer before every attached request. Create is therefore
+visible without restart; revocation, expiry, a corrupt store, or a lock/read failure invalidates a
+live attachment and fails closed. The attachment is cleared after failed revalidation, so subsequent
+stateful calls must attach again. This provides serving-state behavior without a file watcher or a
+separate token generation protocol.
 
-- a token created by `shoal-token` after kernel startup is rejected until that kernel restarts;
-- a token revoked by `shoal-token` after kernel startup remains accepted by that kernel until restart
-  (unless its already-loaded expiry passes, which `validate` checks against current time);
-- listing in the CLI describes disk state, not necessarily the serving kernel's authentication state;
-- multiple management processes can load the same snapshot and atomically replace one another's
-  updates because the store has no interprocess lock or compare-and-swap generation.
-
-This is a revocation-latency security boundary, not merely an administrative UX issue. Until live
-reload or a kernel-owned management path exists, token create/revoke instructions must explicitly
-require kernel restart and operational tooling must verify the serving generation.
-
-Persist uses create-new temporary file mode 0600, writes and `sync_all`s, then renames. Opening an
-existing store actively sets its file permissions to 0600 before reading rather than rejecting a
-looser mode. The containing directory is created but this crate does not itself set an explicit 0700
-directory mode.
+Persist uses create-new temporary file mode 0600, writes and `sync_all`s, atomically renames, and
+syncs the directory. The store directory is mode 0700 and the data and lock files are private to the
+user boundary.
 
 The keyed hash key lives in the same file as digests. That is adequate to avoid plaintext token
 persistence and make random-token offline guessing infeasible; it is not an HSM/OS-keychain
@@ -134,9 +128,10 @@ token's `principal`. The cap strings are metadata in the shown attach path, not 
 enforced intersection with Leash grants. Security review must follow principal policy, handler
 checks, and resource ownership—not assume the returned token-cap array is a capability engine.
 
-No-token attach uses the local principal and `local-human` profile. A durable kernel validates a
-provided bearer with `TokenStore::validate`; invalid, expired, or revoked tokens share an auth-failed
-response.
+No-token attach on a public socket uses restricted `agent:mcp`; public clients cannot assert
+`local-human`. Only the private REPL's inherited anonymous descriptor supplies the server-selected
+local-human identity. A durable kernel validates a provided bearer with `TokenStore::validate`;
+invalid, expired, or revoked tokens share an auth-failed response.
 
 `PROFILE` and repeated `--cap` values accepted by `shoal-token create` are not authorization rules.
 They are copied into `AttachResult.caps.profile`/`token_caps` for client metadata. No handler
@@ -144,30 +139,30 @@ intersects them with Leash, and no resource check consumes them; the token's `pr
 used to look up policy. Creating a token with `--cap fs.read` grants nothing unless that principal's
 Leash policy and handler ownership rules already allow the operation.
 
-## Named session principal hazard
+## Named session isolation
 
-Kernel sessions are cached by user-supplied session name. `Kernel::session(name, principal)` consults
-`principal` only on first creation; later attachments to the same name receive the existing
-`Arc<Session>` and its evaluator/journal wiring. The connection `Attachment` records the new
-principal, but the underlying evaluator was created under the first principal's session setup.
+The session registry is keyed by `(principal, visible Session name)`, not the user-supplied name
+alone. Equal names under different authenticated principals produce different evaluator, transcript,
+journal, plan, task, PTY, and quota ownership domains.
 
 ```mermaid
 sequenceDiagram
-accTitle: Named session principal hazard
-accDescr: Shows the components and relationships described in Named session principal hazard.
+accTitle: Principal-private named sessions
+accDescr: Two principals using the same visible session name receive separate owned sessions.
   participant A as agent:A
   participant K as Kernel sessions map
-  participant S as named Session "default"
+  participant SA as Session (agent:A, default)
+  participant SB as Session (agent:B, default)
   A->>K: attach name=default
-  K->>S: create evaluator/journal as agent:A
+  K->>SA: create principal-private evaluator/journal
   participant B as agent:B
   B->>K: attach name=default
-  K-->>B: existing Session (no principal compatibility check)
+  K->>SB: create separate principal-private evaluator/journal
 ```
 
-Handlers may still evaluate the current attachment principal for policy decisions, but mutable
-session state and evaluator-installed authority can cross identities. Session names should be scoped
-by owner or attachment should reject a principal mismatch. This is a multi-principal isolation gap.
+Exact owner keys also scope retained refs and journal access. This closes name-collision leakage; it
+does not make one process a hostile multi-tenant boundary because principals still share global
+memory, CPU, file roots, and kernel-wide quotas.
 
 ## Semantic effect algebra
 
@@ -187,11 +182,10 @@ by owner or attachment should reject a principal mismatch. This is a multi-princ
 | `Opaque` | unknown/unclassified behavior |
 
 A `Plan` combines ordered effects, reversibility (`Reversible`, `Irreversible`, or `Unknown`), and
-optional byte/item estimates. Its reference is `plan:` plus the first 16 hex characters of a BLAKE3
-hash over canonical JSON of those three inputs.
-
-The shortened plan ref is a convenient content address, not a cryptographic authorization token.
-Approval storage must scope it to source/session/principal and preserve the full plan.
+optional byte/item estimates. The Leash value's short content fingerprint covers those semantic
+fields. The kernel's externally returned plan object ref is stronger: it binds source, canonical AST,
+effects/estimates, Session, and principal with a full BLAKE3 digest plus a unique per-kernel suffix.
+It is an ephemeral owner-scoped object id, not a transferable authorization token.
 
 ## Principal policy schema
 
@@ -289,19 +283,21 @@ authorized. `cap.request` now enforces that:
 - **Auditable binding (HR-D2).** On approval the kernel writes an `ApprovalRecord` onto the plan
   binding requester, authorized approver, full plan/source hashes, session, granted scope,
   timestamp, and — once the approved plan runs — the journal entry id of the consuming execution.
-  It is surfaced on `plan.get.approval`. The journal mirror is currently best-effort; a durable
-  append failure does not roll back approval, so fail-closed audit durability remains open.
+  It is surfaced on `plan.get.approval`. Approval first reserves the transition, then writes the
+  durable audit record; an append error or unwind restores the reservation instead of publishing a
+  grant. The grant is consumed atomically by exactly one execution, whose journal id is bound back to
+  the approval record.
 
 Plan identity is a full BLAKE3 binding over source, canonical AST, effects/estimates, session, and
 requester plus a unique per-kernel object id. Identical plans stored twice remain distinct objects;
-approval and execution revalidate the immutable binding. Remaining questions are approval replay
-(whether a grant is intentionally reusable) and making the journal audit append fail closed.
+approval and execution revalidate the immutable binding. Grants are one-shot, not reusable
+authorization handles.
 
 `journal.query` had the same missing-attachment shape; **HR-D4 closed it**: the handler now rejects
 an unattached caller with `NOT_ATTACHED` before reading any row, and its `limit` is bounded (omitted →
-default page, explicit `0` → zero rows, any value clamped to a server maximum — HR-D5). Within a
-shared pair-shell session the journal is intentionally readable by every attached principal; the
-isolation boundary is the session name, not per-row principal scoping.
+default page, explicit `0` → zero rows, any value clamped to a server maximum — HR-D5). The handler
+forces the attachment's exact `(principal, Session)` owner; a caller cannot widen the query to
+another principal with filters or a colliding visible Session name.
 
 ## Policy loading defaults
 
@@ -454,6 +450,7 @@ necessary enforcement seam, not a claim that Leash presently confines in-process
 ```text
 <dir>/master.key
 <dir>/secrets.json
+<dir>/.secrets.lock
 ```
 
 On Unix, opening sets directory mode 0700; key/data files are written 0600 and reads reject files
@@ -469,6 +466,7 @@ accDescr: Shows the components and relationships described in Secret store desig
   participant Store
   participant Disk
   API->>Store: set/delete(name, bytes)
+  Store->>Disk: acquire exclusive fd lock + reload fresh state
   Store->>Disk: read key + encrypted envelope
   Store->>Store: AES-GCM decrypt/authenticate
   Store->>Store: mutate BTreeMap
@@ -477,13 +475,18 @@ accDescr: Shows the components and relationships described in Secret store desig
 ```
 
 Names must be nonempty ASCII alphanumeric, underscore, or hyphen. `get` returns `Zeroizing<Vec<u8>>`.
-Plain serialization and decrypted bytes use zeroizing wrappers in key paths, though intermediate map
-values and caller copies can still live in memory.
+Reads take a shared fd lock; mutations take an exclusive fd lock and reload inside it, preventing
+lost updates between processes. Master-key buffers, plaintext serialization/decryption buffers, and
+every secret map value are zeroized on drop. The final `Arc<str>` language value and copies made for
+environment variables, argv, or the child process cannot receive the same Rust-level guarantee and
+remain part of the process-memory threat model.
 
 AES-GCM detects envelope modification. The master key sits beside ciphertext under the same user
 permission boundary, so disk theft of both files yields decryption capability. This protects
 accidental plaintext disclosure and at-rest separation from the JSON data file; it does not protect
-against the same compromised user/process.
+against the same compromised user/process. OS keyring storage was evaluated but deferred because a
+portable rollout needs explicit migration, headless-service behavior, and recovery semantics; Unix
+directory ownership and permissions remain the documented security boundary.
 
 ## Secret language boundary
 
@@ -503,39 +506,42 @@ must remain audited for accidental plaintext copies. Redacted rendering is not m
 Secret policy has a `SecretUse` effect and per-name grants, but all host paths must actually derive
 and evaluate that effect. Port injection alone is not authorization.
 
-## WASM validation boundary
+## WASM runtime boundary
 
 `shoal-wasm` loads strict TOML manifests with name, version, component path, declared commands,
 methods, and effect strings. Relative component paths resolve beside the manifest. Registry loading
-sorts manifest paths and rejects duplicate plugin names deterministically.
+sorts manifest paths, rejects duplicate plugin names deterministically, parses effects into the
+canonical effect algebra, and retains the validated component bytes/component so invocation does not
+reread a replaced path.
 
-The host enables Wasmtime's component model and fuel consumption, then validates by:
-
-1. compiling the component (not a core module);
-2. enumerating imports and rejecting **any** import;
-3. installing store limits;
-4. setting fuel;
-5. instantiating with an empty component linker.
+`shoal-eval` includes plugin commands in canonical command resolution and invokes the retained
+component through preview ABI v1. The host exposes only declared hostcalls that the current principal
+policy authorizes. Current capability providers include bounded `now_ns` and scoped `read_file`;
+unknown or unauthorized imports fail closed.
 
 Default limits are:
 
 | Resource | Default |
 |---|---:|
 | fuel | 10,000,000 |
-| linear memory | 64 MiB |
+| memory per instance | 64 MiB |
+| memories | 1 |
 | table elements | 10,000 |
+| tables | 4 |
 | instances | 16 |
+| manifest bytes | 256 KiB |
+| component bytes | 16 MiB |
+| hostcall bytes | 4 MiB |
+| value bytes | 4 MiB |
+| metadata bytes | 1 MiB |
+| declarations | 256 |
+| arguments | 256 |
+| wall time | 2 s |
 
-There is **no wall-clock timeout** in `Limits`. A component constrained by fuel may still need an
-epoch/deadline design for host-level latency guarantees.
-
-Most importantly, validation produces/stores only a `Manifest`. There is no evaluator command or
-method invocation path, no host ABI, no value codec, no effect authorization bridge, and no plugin
-call lifecycle. It is a prepared validation registry, not a supported plugin sandbox.
-
-Declaring effect strings in the manifest does not enforce them. A future runtime must parse them into
-the canonical effect algebra, reject unknown claims, expose only capability-scoped imports, and bind
-limits/authorization to each invocation.
+Fuel, store limits, epoch deadlines, and cancellation bound guest execution. Synchronous Wasmtime
+compilation is bounded by the component-byte cap but is not itself epoch-interruptible, so admission
+size and compile cost remain relevant operational limits. Native host code, Wasmtime bugs, and the
+authority of an incorrectly implemented hostcall remain outside the guest sandbox claim.
 
 ## Fail-open/fail-closed ledger
 
@@ -551,11 +557,11 @@ limits/authorization to each invocation.
 | `journal.query` `limit` omitted vs. `0` | omitted → default page; explicit `0` → zero rows; clamped to server max (HR-D5) |
 | malformed/unknown bearer | reject attach |
 | ephemeral kernel bearer | reject as unavailable |
-| expired bearer or bearer marked revoked in the kernel's loaded snapshot | reject |
-| bearer revoked only by an external CLI after kernel startup | currently accepted until restart |
+| expired or externally revoked bearer, including on an existing attachment | fresh validation rejects and clears attachment |
+| token-store lock/read/parse failure during an attached request | fail closed and clear attachment |
 | unreadable/corrupt secret envelope | error |
 | nonexistent sandbox grant roots | drop roots; possibly no OS sandbox, rely on semantic gate |
-| WASM imports | reject component validation |
+| undeclared or policy-unauthorized WASM hostcall | reject invocation |
 | unknown WASM manifest field | reject via `deny_unknown_fields` |
 
 Security review should make every new choice explicit in this table's style. Accidental fallback is
@@ -577,25 +583,21 @@ For a new externally reachable effect:
 10. test malformed configuration, unavailable backend, symlink/`..`, binary replacement, token
     expiry/revocation, session-name collision, and child-feature bypasses;
 11. document what is advisory, semantic-only, filesystem-only, or truly OS-enforced;
-12. never describe validated-but-unwired WASM as an executable plugin system.
+12. test WASM declaration parsing, hostcall authorization, byte/fuel/time limits, cancellation, and
+    path replacement between validation and invocation.
 
 ## Priority debt
 
-1. **Finish approval durability and replay semantics.** Plan objects now have full owner-bound
-   identity and authorized approvers, but the journal audit append is best-effort and an approved
-   object may be applied repeatedly unless the intended grant scope says otherwise.
-2. **Keep child-context inheritance audited.** The direct Leash escape is closed; newly added
+1. **Keep child-context inheritance audited.** The direct Leash escape is closed; newly added
    evaluator state still needs an explicit inheritance decision and nested journal entries remain
    intentionally absent.
-3. **Scope named kernel sessions by principal.** Existing session reuse crosses first-creator state.
-4. **Make token revocation live and generation-safe.** A running kernel currently retains its startup
-   snapshot while external management rewrites disk.
-5. **Complete parent-process port/policy coverage.** Direct filesystem/network effects bypass child
+2. **Complete parent-process port/policy coverage.** Direct filesystem/network effects bypass child
    sandbox enforcement.
-6. **Unify token caps and policy semantics or clearly keep caps informational.** Parallel authority
+3. **Unify token caps and policy semantics or clearly keep caps informational.** Parallel authority
    vocabularies invite false assumptions.
-7. **Add real network enforcement or keep hermetic network requests failing.** Never report advisory
+4. **Add real network enforcement or keep hermetic network requests failing.** Never report advisory
    denial as enforced.
-8. **Design atomic executable identity if strong pinning is required.** Current hash-before-exec is
+5. **Design atomic executable identity if strong pinning is required.** Current hash-before-exec is
    TOCTOU-prone.
-9. **Define a capability ABI before WASM invocation.** Validation alone is not authority isolation.
+6. **Keep the WASM ABI narrow and versioned.** Every new hostcall needs canonical effects, scoped
+   arguments, policy authorization, bounded transfer, cancellation behavior, and adversarial tests.

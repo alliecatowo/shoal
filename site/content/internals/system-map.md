@@ -15,9 +15,10 @@ wide = true
 Shoal is not one process with one runtime path. It is a workspace of narrow libraries assembled by
 two principal hosts:
 
-- `shoal` is the human-facing, local shell. It owns Reedline, terminal state, prompt collection,
-  configuration loading, bundled adapters, init files, and a directly embedded evaluator.
-- `shoal-kernel` is a Unix-socket JSON-RPC daemon. It owns named sessions, authentication,
+- `shoal` is the human-facing local shell. It owns Reedline, terminal state, prompt collection,
+  configuration loading, bundled adapters, and init files. Its default REPL uses a listener-free
+  private kernel child over an inherited anonymous descriptor; `--standalone` embeds the evaluator.
+- `shoal-kernel` is a JSON-RPC daemon/private child. It owns principal-private named sessions, authentication,
   transcripts, plans, tasks, long-lived PTYs, event delivery, and an evaluator per session.
   `shoal-mcp` is a stdio MCP facade over that daemon.
 
@@ -35,7 +36,8 @@ accDescr: Shows the components and relationships described in System context.
   Agent["MCP client / agent"] --> MCP["shoal-mcp\nstdio facade"]
   MCP -->|"newline JSON-RPC over Unix socket"| Kernel["shoal-kernel"]
 
-  Shell --> LocalEval["embedded Evaluator"]
+  Shell -->|"default: inherited private descriptor"| Kernel
+  Shell -->|"--standalone"| LocalEval["embedded Evaluator"]
   Kernel --> Sessions["named Session objects"]
   Sessions --> KernelEval["one Evaluator per session"]
 
@@ -53,9 +55,9 @@ accDescr: Shows the components and relationships described in System context.
   KernelEval --> Syntax
 ```
 
-The CLI can also launch companion binaries (`shoal lsp`, `shoal mcp`), but this is process
-orchestration rather than library integration. In particular, the local REPL does **not** route
-normal commands through the kernel.
+The CLI can also launch companion binaries (`shoal lsp`, `shoal mcp`). The default REPL does route
+normal commands through its private kernel, but it never binds or joins the durable public socket;
+standalone mode remains a separate embedded composition root.
 
 Sources: [`shoal` main and REPL](https://github.com/alliecatowo/shoal/tree/main/crates/shoal/src),
 [`shoal-kernel`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-kernel/src), and
@@ -167,10 +169,10 @@ and isolation bugs.
 |---|---|---|---|
 | lexical environment, `cwd`, process env, `it`, functions, aliases | `Evaluator` | evaluator/session | callers of the same evaluator |
 | local line editor state and filtered history | `shoal` REPL | process / history file | local user only |
-| named session transcript and `out[n]` values | kernel `Session` | kernel process | attached clients in that session |
+| named session transcript and `out[n]` values | kernel `Session` | kernel process | clients with the exact principal+Session owner |
 | per-connection `it` reference | kernel attachment/client | connection | no other connection |
-| plans, task wrappers, open PTYs | kernel maps | kernel process | session-scoped lookup |
-| event channel rings and subscribers | kernel `EventBus` | kernel process | permitted session clients |
+| plans, task wrappers, open PTYs | kernel maps | kernel process | exact principal+Session lookup |
+| event channel rings and subscribers | kernel `EventBus` | kernel process | permitted principal+Session clients |
 | durable transcript/journal events | SQLite journal | filesystem | later kernel processes |
 | output blobs | journal CAS | filesystem until GC | any authorized ref lookup |
 | Reef lock and executable view | project/user filesystem | filesystem | processes using that scope |

@@ -129,24 +129,22 @@ accDescr: Shows the components and relationships described in Approval lifecycle
   K->>P: derive + evaluate
   K-->>C: plan_ref, effects, verdict
   C->>K: cap.request(plan_ref)
-  K->>K: mark stored plan approved
+  K->>K: reserve transition + append durable grant audit
   C->>K: exec(mode="approved", plan_ref, same src)
-  K->>K: verify session + principal + source + approval/current allow
+  K->>K: verify immutable binding + consume one-shot grant
   K->>P: re-derive and evaluate current plan
-  K-->>C: result or leash error
+  K-->>C: result/audit binding or leash error
 ```
 
-`plan.apply` and approved `exec` re-check the currently stored session, principal, source, and
-approval state. That execution-side check is real. The approval mutation itself is currently unsafe:
-`cap.request` is routed without an attachment, receives no caller principal, and marks a global
-stored plan approved by ref. A direct socket caller therefore does not prove approver authority.
+`cap.request` requires an attached authorized approver and separates requester from approver by
+default. It reserves the exact owner-bound plan transition, appends the grant audit before publishing
+authority, and restores the reservation if audit append fails or unwinds. `plan.apply` and approved
+`exec` re-check the immutable source/AST/effects/Session/principal binding, re-derive the current plan,
+and atomically consume the grant once. The consuming execution id is bound to the audit record.
 
-Plan refs are also not unique stored-object identities. `Plan::new` hashes only effects,
-reversibility, and estimates (first 16 hex characters), while the kernel map is keyed solely by that
-ref. Two plans with equal effect shape but different source/session/principal overwrite the same
-entry. Treat the current ref as a short content-shape fingerprint, not a capability or stable object
-ID, until the [P0 authority work](../roadmap-and-priorities/)
-lands.
+Kernel plan refs use the full binding digest plus a unique per-kernel object suffix, so equal-shape
+and identical repeated plans remain distinct. They are ephemeral object identifiers, never bearer
+permissions or durable ids.
 
 ## Ports
 
@@ -272,25 +270,31 @@ capability list as if it directly grants an effect.
 
 The auth store persists a keyed hash, expiry, revocation state, and the keyed-hash secret in the same
 mode-restricted store. It does not persist the original bearer token. Verification uses a
-constant-time comparison. File permissions are part of the threat model; this is local same-user
-infrastructure, not a hardware-backed identity service.
+constant-time comparison. Create/revoke take an exclusive fd lock and reload fresh state; validation
+takes a shared fd lock and reloads fresh state. The kernel revalidates each bearer-backed attachment
+before every request and fails closed on revocation, expiry, or store error. File permissions are
+part of the threat model; this is local same-user infrastructure, not a hardware-backed identity
+service.
 
 ## Secret storage
 
 `shoal-secret` stores a name/value map encrypted with AES-256-GCM. It validates restrictive directory
-and file modes and rewrites the encrypted map on mutation. The master key resides alongside the
-store under the same user-level permission boundary. This protects accidental disclosure and
-detects ciphertext tampering; it does not protect against a process already running as the same
-compromised user. Values of type `Secret` are deliberately not generally renderable/feedable.
+and file modes. Shared/exclusive fd locks serialize fresh reads and whole-map mutation. Master-key,
+plaintext buffers, and map values zeroize on drop; final language/child-process copies remain in the
+process-memory threat model. The master key resides alongside the store under the same user-level
+permission boundary. This protects accidental disclosure and detects ciphertext tampering; it does
+not protect against a process already running as the same compromised user. Values of type `Secret`
+are deliberately not generally renderable/feedable.
 
-## WASM boundary: validated, not integrated
+## WASM boundary: bounded preview runtime
 
-`shoal-wasm` validates component/manifests, rejects ambient imports, and represents fuel, memory,
-table, and instance ceilings. Its `Limits` type has **no wall-clock timeout**. It currently has no
-evaluator or command-dispatch dependency and no invocation
-API wired into normal Shoal execution. Treat it as a prepared isolation component, not a supported
-plugin runtime. Integration must start with an explicit host-capability interface and effects—not by
-calling it directly from a builtin.
+`shoal-wasm` validates components/manifests and retains the validated component rather than rereading
+the path. Plugin commands participate in canonical evaluator resolution and execute through preview
+ABI v1. Only manifest-declared hostcalls that current principal policy authorizes are linked; current
+providers include bounded time and scoped file reading. Fuel, memory/table/instance, byte/count,
+epoch deadline, cancellation, and two-second wall-time limits constrain invocation. Synchronous
+compilation is byte-capped but not epoch-interruptible. Treat every new hostcall as a new authority
+surface requiring canonical effects, scoped inputs, bounded transfer, and adversarial tests.
 
 ## Fail-open local policy is a conscious risk
 

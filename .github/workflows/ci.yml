@@ -74,11 +74,20 @@ jobs:
   fuzz-build:
     name: fuzz targets build
     runs-on: ubuntu-latest
+    # Blocking per-PR compile smoke: every declared target must keep building.
+    # The scheduled workflow below is the behavioral runtime fuzz gate.
+    # rust-toolchain.toml pins stable repo-wide; cargo-fuzz needs nightly
+    # sanitizer flags, so explicitly select the nightly installed below.
+    env:
+      RUSTUP_TOOLCHAIN: nightly
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
       - run: sudo apt-get update && sudo apt-get install -y clang
       - run: cargo install cargo-fuzz --locked
+      # cargo-fuzz has no --locked option. Reject a stale fuzz workspace
+      # lockfile before its build can resolve and rewrite dependencies.
+      - run: cargo metadata --manifest-path fuzz/Cargo.toml --locked --no-deps --format-version 1 > /dev/null
       - run: cargo fuzz build --fuzz-dir fuzz
 
   supply-chain-audit:

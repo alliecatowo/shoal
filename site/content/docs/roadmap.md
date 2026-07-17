@@ -80,7 +80,7 @@ Include malformed params tests so decoding cannot occur before the authorization
 Attachment alone is insufficient. `journal.query` must enforce `JournalRead` and define scope:
 
 - a principal's own coarse entries;
-- explicitly shared session entries;
+- the attachment's principal-private Session entries;
 - supervisor/admin cross-principal query through a distinct grant;
 - output/CAS access aligned with the same policy.
 
@@ -176,15 +176,13 @@ The matrix must run over raw kernel and MCP, on Linux and macOS where platform b
 
 ## P1 — agent protocol and lifecycle
 
-### Live token management
+### Live token management — implemented core
 
-- Add atomic token-store reload or an authenticated kernel token-admin API.
-- Make revocation terminate/disable existing token-backed connections according to policy.
-- Expose expiry/revocation in `shoal-token list` without secrets.
-- Make profile/capability semantics either enforced or rename them clearly as labels.
-- Unify `SHOAL_TOKEN_STORE` and kernel state-dir selection.
-
-Acceptance: create/revoke becomes visible without restart; revoked token cannot reconnect and, in strict mode, existing connection loses authority promptly.
+Token create/revoke and validation serialize with fd locks and fresh reads. The kernel revalidates a
+bearer before each attached request, so create is visible immediately and revocation, expiry, or a
+store failure clears the live attachment without restart. `shoal-token list` exposes metadata but not
+bearers. Profile/cap strings remain descriptive labels; principal policy is authoritative. Remaining
+cleanup is vocabulary/path configuration consistency, not serving-state correctness.
 
 ### Stable protocol/version negotiation
 
@@ -254,19 +252,21 @@ Expose structured metrics/health and reasons for quota rejection.
 
 ## P1 — execution consistency
 
-### Unify command resolution
+### Unified command resolution — implemented core
 
-Create one resolver result covering:
+One canonical resolver result now covers:
 
 ```text
 lexical function / alias / builtin / Reef tool / adapter / PATH external / interpreter runner
 ```
 
-It should record why a candidate won, its provider/path/hash/adapter/schema, and how `^`/`run` alter resolution. Use it for evaluator dispatch, `which`, completion, highlighting, planning, diagnostics, and LSP.
+Evaluator dispatch/planning, completion, highlighting, and LSP consume the same source kinds and
+precedence table. A future explanation surface may record why a candidate won and its provider/path;
+it must consume this resolver rather than introduce a second list.
 
 Acceptance:
 
-- one precedence table and trace object;
+- one precedence table (implemented) and optional trace object;
 - no separate hand-copied head lists;
 - forced-head tests at each collision pair;
 - resolution explanation exposed to users/agents.
@@ -347,7 +347,7 @@ Evaluate platform-appropriate mechanisms (Linux namespaces/seccomp/eBPF/cgroups,
 - Install all companion binaries and place sandbox helper correctly.
 - Checksums/signatures/SBOM/provenance.
 - User services for systemd/launchd with private socket/state modes.
-- Upgrade/rollback and token-store restart behavior documented/automated.
+- Upgrade/rollback and live token-store revalidation behavior documented/automated.
 
 ### Documentation automation
 
@@ -438,7 +438,7 @@ These happen alongside priority waves:
 
 ### Conformance growth
 
-The current 1,310 cases exceed the original 1,000-case target, but every bug fix/feature needs a minimal regression. Focus new cases on:
+The current 1,331 cases exceed the original 1,000-case target, but every bug fix/feature needs a minimal regression. Focus new cases on:
 
 - precedence and command-resolution collisions;
 - error spans/hints and method receiver boundaries;

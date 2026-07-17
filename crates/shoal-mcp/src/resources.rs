@@ -163,14 +163,15 @@ impl Facade {
             .and_then(Value::as_str)
             .ok_or("resources/subscribe requires uri")?
             .to_string();
+        let duplicate = self.subscriptions.contains_key(&uri);
+        if !crate::subscription_admission(self.subscriptions.len(), &uri, duplicate)? {
+            return Ok(json!({}));
+        }
         let channel = ParsedUri::parse(&uri)?
             .event_channel()
             .ok_or("only shoal://events/{ch} and shoal://task/{id}[/out] are subscribable")?;
         let config = self.config.clone();
         let forward_uri = uri.clone();
-        if self.subscriptions.contains_key(&uri) {
-            return Ok(json!({}));
-        }
         let mut client = KernelClient::connect(&config).map_err(|error| error.to_string())?;
         client
             .subscribe_events(&channel)

@@ -7,7 +7,7 @@ template = "docs/page.html"
 [extra]
 group = "Maintenance"
 eyebrow = "Execution plan"
-status = "Active — wave 1 in flight"
+status = "Reconciled — audit tasks complete through structural wave"
 audience = "Maintainers, reviewers, and implementing agents"
 wide = true
 +++
@@ -114,39 +114,41 @@ Rules for implementers:
 
 - [x] **HR-D1** — `cap.request` requires an authenticated attachment and receives the caller
   principal. *(D1)*
-- [ ] **HR-D2** — Approval records bind requester, plan hash, approver principal, scope, and the
+- [x] **HR-D2** — Approval records bind requester, plan hash, approver principal, scope, and the
   execution that consumes the approval; the binding is journal-auditable. *(D3)*
-  <br>Partial: immutable owner-bound objects and in-memory records are implemented. Journal mirroring
-  remains best-effort rather than fail-closed, and reusable-vs-single-use approval semantics need an
-  explicit decision.
+  <br>Done: approval reserves the exact owner-bound plan transition, writes the grant audit before
+  publishing the approval, and is consumed once by compare-and-set application; audit failure or
+  unwind restores the reservation without granting authority.
 - [x] **HR-D3** — Approver identity must differ from the requester unless policy explicitly
   permits self-acknowledgement; default policy separates them. Document the chosen model in the
   security threat model page. *(D2, D4)*
 - [x] **HR-D4** — `journal.query` requires attachment, matching the documented rule. *(F1)*
 - [x] **HR-D5** — `journal.query` limits are bounded: `limit: 0` returns zero rows and a
   server-side maximum caps page size. *(F2)*
-- [ ] **HR-D6** — Zero-config MCP attach lands on a restricted agent principal rather than
+- [x] **HR-D6** — Zero-config MCP attach lands on a restricted agent principal rather than
   `local-human`; permissive attach becomes explicit opt-in. Update autostart, attach handling,
   and the agent/MCP + threat-model docs together. *(E1, E2)*
-- [ ] **HR-D7** — Session identity model made explicit: statement-level journal attribution
+- [x] **HR-D7** — Session identity model made explicit: statement-level journal attribution
   follows the current actor (matching kernel exec entries), and task/PTY cross-principal access
   rules are documented and enforced — or the shared pair-shell model is documented as
   intentional with its token-isolation consequences. *(G1, G2, G3)*
-- [ ] **HR-D8** — `live_kernel` integration tests cover: unattached `journal.query` rejected;
+  <br>Done with the stronger principal-private model: the registry key is `(principal, name)` and
+  refs, evaluator state, tasks, PTYs, event replay, quotas, and journal reads use that exact owner.
+- [x] **HR-D8** — `live_kernel` integration tests cover: unattached `journal.query` rejected;
   unattached `cap.request` rejected; zero-config attach is restricted; cross-principal task/PTY
   access follows the documented rule. *(D1, E2, F1, G3)*
 
 ### Workstream E — protocol and daemon robustness
 
-- [ ] **HR-E1** — Frame length is enforced during read (bounded reader) in `shoal-proto` and
+- [x] **HR-E1** — Frame length is enforced during read (bounded reader) in `shoal-proto` and
   `shoal-mcp`; oversize input cannot allocate past the cap. *(H6)*
   <br>Accept: a test feeds an over-limit frame and observes bounded memory + a protocol error.
-- [ ] **HR-E2** — Shared daemon state stops relying on `.lock().unwrap()`: a poison-tolerant
+- [x] **HR-E2** — Shared daemon state stops relying on `.lock().unwrap()`: a poison-tolerant
   locking pattern (recover-or-shutdown helper) replaces bare unwraps so one panicking connection
   cannot cascade. *(H4)*
-- [ ] **HR-E3** — Quotas with clear errors: max concurrent connections, and per-session caps for
+- [x] **HR-E3** — Quotas with clear errors: max concurrent connections, and per-session caps for
   tasks, PTYs, and subscriptions. *(H3, H5)*
-- [ ] **HR-E4** — Session lifecycle GC: bounded transcript retention, plan expiry,
+- [x] **HR-E4** — Session lifecycle GC: bounded transcript retention, plan expiry,
   completed-task reaping; limits configurable, defaults documented. *(H5)*
 
 ### Workstream F — workspace hygiene
@@ -165,63 +167,73 @@ Rules for implementers:
   documented allowlist. *(H9)*
 - [x] **HR-F7** — Unix-only support stated explicitly in README/docs; Windows recorded as out of
   scope for now. *(H8)*
-- [x] **HR-F8** — Decide and document how CI pays (or stops paying) the wasmtime compile cost
-  for the unwired `shoal-wasm` crate: keep, feature-gate, or a separate job. *(H10)*
+- [x] **HR-F8** — Decide and document how CI pays the Wasmtime compile cost for the now-wired
+  `shoal-wasm` runtime: keep, feature-gate, or a separate job. The load-bearing evaluator path stays
+  in the ordinary workspace gate. *(H10)*
 
 ## Wave 2 — semantic truth (P2)
 
 ### Workstream G — stream and channel semantics
 
-- [ ] **HR-G1** — `StreamVal::buffer(n)` becomes a real bounded decoupling buffer, or is removed
+- [x] **HR-G1** — `StreamVal::buffer(n)` becomes a real bounded decoupling buffer, or is removed
   and its docs state the unimplemented status. *(I2)*
-- [ ] **HR-G2** — `flat_map` interleaves substreams as documented, or the docs are corrected to
+- [x] **HR-G2** — `flat_map` interleaves substreams as documented, or the docs are corrected to
   sequential semantics; a test pins whichever behavior ships. *(I3)*
-- [ ] **HR-G3** — In-language subscriber queues are bounded with a defined overflow policy that
+- [x] **HR-G3** — In-language subscriber queues are bounded with a defined overflow policy that
   matches the documented backpressure story. *(I4)*
-- [ ] **HR-G4** — Cancelling an `on(channel, handler)` task interrupts a blocking `recv`
+- [x] **HR-G4** — Cancelling an `on(channel, handler)` task interrupts a blocking `recv`
   (timeout, close, or wakeup token); no permanently stuck handler threads. *(I5)*
-- [ ] **HR-G5** — `distinct` uses hashing (amortized O(1) membership); its memory behavior on
+- [x] **HR-G5** — `distinct` uses hashing (amortized O(1) membership); its memory behavior on
   unbounded streams is documented. *(I13)*
-- [ ] **HR-G6** — `zip`/`merge` rate-skew and backpressure semantics are documented precisely
+- [x] **HR-G6** — `zip`/`merge` rate-skew and backpressure semantics are documented precisely
   with tests. *(I14)*
-- [ ] **HR-G7** — Incremental stream `.feed` is implemented, or its explicit unimplemented error
+- [x] **HR-G7** — Incremental stream `.feed` is implemented, or its explicit unimplemented error
   and docs status are kept accurate and linked from the streams page. *(I6)*
 
 ### Workstream H — truthful surface statuses
 
-- [ ] **HR-H1** — Per-feature status labels (implemented / partial / experimental / planned) for
+- [x] **HR-H1** — Per-feature status labels (implemented / partial / experimental / planned) for
   WASM dispatch, task suspend/resume, wire stream chunking, LSP scope, and network leash
   enforcement, recorded on the implementation-status page and the relevant feature pages.
   *(I7, I8, I9, I10)*
-- [ ] **HR-H2** — REPL↔kernel decision recorded as an ADR: either the REPL attaches to
+- [x] **HR-H2** — REPL↔kernel decision recorded as an ADR: either the REPL attaches to
   `shoal-kernel` (design + tracked implementation plan) or the one-kernel/three-surfaces claim
   is narrowed everywhere it appears. *(I1)*
-- [ ] **HR-H3** — Docs drift pass: counts and open items across internals pages match source at
+  <br>Done: the default interactive REPL owns a private inherited-descriptor kernel, while named
+  public kernels are durable machine surfaces; the host split is recorded in shell-host,
+  implementation-status, and the public mental model.
+- [x] **HR-H3** — Docs drift pass: counts and open items across internals pages match source at
   a stated commit. *(I11)*
+  <br>Done: live status pages were reconciled against merge checkpoint `fcb10bd`; explicitly dated
+  2026-07-16 audit/reference snapshots retain their historical counts.
 
 ### Workstream I — secrets and token store
 
-- [ ] **HR-I1** — Secret-store boundary documented honestly (key beside ciphertext ⇒ OS
+- [x] **HR-I1** — Secret-store boundary documented honestly (key beside ciphertext ⇒ OS
   permissions are the boundary), or key material moves to the OS keyring where available. *(J1)*
-- [ ] **HR-I2** — Secret material zeroized where practical; env-injection copies noted in docs.
+- [x] **HR-I2** — Secret material zeroized where practical; env-injection copies noted in docs.
   *(J2)*
-- [ ] **HR-I3** — Interprocess locking (file lock or equivalent) around secret-store and
+- [x] **HR-I3** — Interprocess locking (file lock or equivalent) around secret-store and
   token-store read-modify-write. *(J3, J4)*
 
 ### Workstream J — structural debt (promoted into this wave)
 
-- [ ] **HR-J2** — Evaluator decomposition plan: split the god-context into cohesive sub-contexts
+- [x] **HR-J2** — Evaluator decomposition plan: split the god-context into cohesive sub-contexts
   behind the HR-B1 seam; recorded as a design page with staged extraction steps. *(H1)*
   — promoted 2026-07-16; design: evaluator-decomposition page.
 
 ## Wave 3 — structural debt (sequenced after waves 1–2)
 
-- [ ] **HR-J1** — Centralized command resolution: one resolution function/table with an explicit
+- [x] **HR-J1** — Centralized command resolution: one resolution function/table with an explicit
   precedence order consumed by the evaluator, planner, completion, and LSP. *(H2; closes the
   root cause behind A9)*
-- [ ] **HR-J3** — Kernel concurrency model review: documented limits of
+  <br>Done: `CommandSource`, `COMMAND_PRECEDENCE`, and `resolve_command_source` in `shoal-syntax`
+  are consumed by evaluator dispatch/planning, completion, highlighting, and LSP.
+- [x] **HR-J3** — Kernel concurrency model review: documented limits of
   thread-per-connection + per-session mutex; bounded executor or explicit caps where needed
   beyond HR-E3. *(H3)*
+  <br>Done: kernel-protocol records the thread/lock model and the exact global, principal, and
+  owner quotas, including the retained-session cap and idle eviction policy.
 
 ## Traceability matrix
 

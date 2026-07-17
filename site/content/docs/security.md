@@ -14,7 +14,7 @@ toc = true
 
 Shoal has useful policy, identity, and sandbox machinery, but one kernel process is not a hard multi-tenant security boundary. Run it as an unprivileged local service, keep its Unix socket private, and use separate OS users/processes/state roots for mutually hostile tenants.
 
-The first deep-audit P0s are closed: journal reads and approvals require scoped attachments; approvals bind and durably audit a distinct authorized approver; plan objects use full caller/content-bound digests and non-overwriting IDs; child evaluators inherit one audited execution context; public sockets cannot assert local-human authority; visible Session names are principal-private; and raw/blob retrieval is owner-checked and byte-bounded. Remaining risk is concentrated in incomplete OS enforcement dimensions, startup-only token loading, same-process resource sharing, and native-code behavior beyond the planner's model.
+The first deep-audit P0s are closed: journal reads and approvals require scoped attachments; approvals bind and durably audit a distinct authorized approver; plan objects use full caller/content-bound digests and non-overwriting IDs; child evaluators inherit one audited execution context; public sockets cannot assert local-human authority; visible Session names are principal-private; bearer changes are revalidated live; and raw/blob retrieval is owner-checked and byte-bounded. Remaining risk is concentrated in incomplete OS enforcement dimensions, same-process resource sharing, and native-code behavior beyond the planner's model.
 
 Do not forward the raw socket casually through TCP, a web gateway, a shared container volume, an untrusted plugin, or another-user IPC bridge. Those transports change the threat model even though socket possession no longer grants local-human authority.
 
@@ -47,7 +47,7 @@ accDescr: Shows the components and relationships described in Threat-model summa
 | Linux Landlock / macOS Seatbelt | Real filesystem restriction for child spawns when a concrete sandbox is resolved. |
 | Network restrictions | Policy/advisory only; no OS network enforcement today. |
 | Spawn hash/name allowlist | Pre-exec check with a documented TOCTOU window. |
-| Named session | Collaboration namespace, not principal isolation. |
+| Named session | Principal-private identity namespace; not a hostile-tenant process boundary. |
 | MCP facade | Safer convenience surface, not an authorization proxy around a hostile kernel peer. |
 
 ## Safe deployment checklist
@@ -60,9 +60,9 @@ For the current release:
 4. Do not forward the socket over SSH/TCP or mount it into containers with untrusted workloads.
 5. Give mutually untrusted agents separate kernel **processes**, state directories, sockets, and preferably OS users—not merely separate session names.
 6. Configure an explicit Leash policy for every token principal.
-7. Do not permit a scoped/untrusted agent to use nested-evaluator features as though the parent sandbox automatically follows it; isolate the whole kernel process at the OS/service layer.
+7. Nested evaluators inherit semantic principal/policy context, but they do not create a new OS isolation boundary; isolate the whole kernel process at the OS/service layer for hostile code.
 8. Read `caps_enforced` and the detailed platform limitations; approval is not equivalent to sandboxing.
-9. Restart the kernel after creating or revoking tokens because the token store is loaded only at startup.
+9. Treat revocation as immediate: the kernel revalidates bearer authority from the locked store before every request.
 10. Keep journal/state/secret directories private and back them up as sensitive data.
 11. Avoid `format=raw` on untrusted large values without a client-side size limit.
 
@@ -123,7 +123,9 @@ The 32-byte random bearer is printed once on stdout. Only a keyed BLAKE3 digest 
 - capability-label array;
 - creation/expiry/revocation nanosecond timestamps.
 
-The store is written atomically through a `0600` temporary file and rename, and an existing store is tightened to `0600` when opened.
+The store is written atomically through a `0600` temporary file and rename. Create/revoke hold an
+exclusive interprocess lock across fresh load, mutation, and replace; validation uses a shared lock
+and a fresh snapshot, so concurrent writers cannot lose updates.
 
 ### Profile and `--cap` are metadata today
 
@@ -138,18 +140,13 @@ This means:
 
 Treat the fields as claims/labels for clients and auditing, not enforced capability objects.
 
-### Runtime reload limitation
+### Live revocation and fail-closed reload
 
-`shoal-kernel` opens `tokens.json` into memory once at startup. `shoal-token` runs in another process and rewrites the file, but the daemon has no watcher or reload method.
-
-Consequences:
-
-- a token created while the kernel is running is not accepted until restart;
-- a token revoked while the kernel is running can remain valid in that daemon until restart;
-- a token that reaches its expiry is rejected without restart because expiry is evaluated at validation time;
-- separate kernels with different restart times may temporarily disagree about the same store.
-
-After create/revoke, restart every kernel process that uses the store. If immediate revocation is required, also stop the MCP process/connection that already holds the bearer.
+Initial attach validates against a fresh shared-locked disk snapshot. Every later request refreshes
+the already-authenticated token's immutable identity fields against another fresh snapshot. A newly
+created token is accepted without restart; revocation or expiry invalidates an existing attachment on
+its next request. Store corruption, replacement, or I/O/lock failure also fails closed instead of
+falling back to startup authority. Reattach remains available after the kernel clears the attachment.
 
 ### Store-path alignment
 
@@ -421,6 +418,14 @@ Limits still matter:
 
 Prefer programs that accept secrets through protected stdin or dedicated file descriptors, avoid echoing them, and scope child filesystem/network access.
 
+The encrypted store colocates `master.key` and ciphertext, so **directory permissions are the real
+confidentiality boundary**; copying/read-access to the directory copies both. OS-keyring integration
+was evaluated but deferred to avoid platform-dependent availability and migration semantics. Store
+reads use a shared fd lock; key bootstrap and set/delete hold an exclusive lock across load/mutate/
+save. Keys, decrypted buffers, serialized plaintext, ciphertext buffers, and stored map values use
+zeroizing wrappers where practical. Final language `Arc<str>` values, environment copies, argv, and
+child-process memory cannot be forcibly zeroized by the store.
+
 The evaluator secret store resolves:
 
 ```text
@@ -435,11 +440,8 @@ The standalone `shoal-secret` CLI does **not** currently honor `SHOAL_SECRET_DIR
 
 The protocol limits an input frame to 16 MiB and normally elides values around 8 KiB with a 64 KiB encoded hard cap. These are context protections, not comprehensive service quotas.
 
-Current unbounded/high-cost surfaces include:
+Remaining high-cost surfaces include:
 
-- `value.get format=raw` returning full string/bytes/base64;
-- `blob.get` loading a full CAS blob;
-- many named sessions, tasks, plans, PTYs, and MCP subscription threads;
 - `task.await` blocking a connection indefinitely;
 - PTY child resource consumption;
 - journal/CAS disk growth until garbage collection;
@@ -451,11 +453,10 @@ Connections, retained principal Sessions, active tasks, PTYs (per Session/princi
 
 Before describing Shoal as safe for mutually untrusted agents, the remaining minimum work is:
 
-1. add deployable mandatory-token and socket peer-credential modes;
-2. reload/revoke token state live;
-3. decide and enforce explicit `JournalRead` policy beyond the implemented exact-owner scoping;
-4. add stronger network/process/CPU/memory enforcement while preserving per-dimension truth;
-5. close raw retrieval and blob-size denial-of-service gaps;
-6. extend adversarial multi-principal, fault-injection, and long-duration lifecycle testing.
+1. add optional peer-credential binding beyond the current public machine-only attach contract;
+2. decide and enforce explicit `JournalRead` policy beyond exact-owner scoping;
+3. add stronger network/process/CPU/memory enforcement while preserving per-dimension truth;
+4. add a portable OS-keyring backend only with explicit migration and unavailable-backend behavior;
+5. extend adversarial multi-principal, fault-injection, and long-duration lifecycle testing.
 
 Track implementation status in [Current status and limits](@/docs/status-limits.md) and [Roadmap](@/docs/roadmap.md).
