@@ -170,8 +170,17 @@ The `fuzz/` workspace has three libFuzzer targets:
 These are useful panic/non-progress smoke targets but shallow. The lexer target does not cross CMD
 mode or mode transitions; the parser target asserts no semantic properties; the protocol target does
 not exercise multi-frame streams, response/notification shapes, wire values, or bounded partial-line
-behavior. CI only builds fuzz targets and marks that job `continue-on-error`, so fuzz health is not a
-release gate and no timed fuzz run occurs.
+behavior. The `ci.yml` `fuzz-build` job only builds the targets on every push/PR and is marked
+`continue-on-error`, so fuzz health is still not a per-PR release gate — building alone cannot
+catch a crash.
+
+A separate `.github/workflows/fuzz-nightly.yml` (HR-F4) runs each target for a bounded 120-second
+libFuzzer budget (`cargo fuzz run <target> --fuzz-dir fuzz -- -max_total_time=120`) on a daily cron
+schedule plus manual `workflow_dispatch`, one job per target, and fails (no `continue-on-error`) on
+a crash/timeout/OOM, uploading the libFuzzer artifact for triage. 120 seconds per target is a
+deliberate smoke-not-exhaustive budget chosen to keep the schedule cheap; it will not find a deep
+bug the way a multi-hour/day corpus-accumulating campaign would, but it does mean a fast regression
+(an immediate panic/non-progress case) surfaces within a day instead of never.
 
 ## Local and CI gates
 
