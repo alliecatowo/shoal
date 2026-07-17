@@ -134,6 +134,8 @@ struct Args {
     max_connections: Option<usize>,
     max_tasks_per_session: Option<usize>,
     max_ptys_per_session: Option<usize>,
+    max_ptys_per_principal: Option<usize>,
+    max_ptys_global: Option<usize>,
     max_subscriptions_per_session: Option<usize>,
     frame_read_timeout_ms: Option<u64>,
 }
@@ -147,6 +149,8 @@ impl Args {
             max_connections: None,
             max_tasks_per_session: None,
             max_ptys_per_session: None,
+            max_ptys_per_principal: None,
+            max_ptys_global: None,
             max_subscriptions_per_session: None,
             frame_read_timeout_ms: None,
         };
@@ -176,6 +180,14 @@ impl Args {
                     a.max_ptys_per_session =
                         Some(parse_usize(&k, it.next().ok_or_else(&missing)?)?)
                 }
+                Some("--max-ptys-per-principal") => {
+                    a.max_ptys_per_principal =
+                        Some(parse_usize(&k, it.next().ok_or_else(&missing)?)?)
+                }
+                Some("--max-ptys-global") => {
+                    a.max_ptys_global =
+                        Some(parse_usize(&k, it.next().ok_or_else(&missing)?)?)
+                }
                 Some("--max-subscriptions-per-session") => {
                     a.max_subscriptions_per_session =
                         Some(parse_usize(&k, it.next().ok_or_else(&missing)?)?)
@@ -192,7 +204,7 @@ impl Args {
                             })?,
                     )
                 }
-                Some("-h" | "--help") => return Err("usage: shoal-kernel [--session NAME] [--socket PATH] [--state-dir PATH] [--policy FILE] [--max-connections N] [--max-tasks-per-session N] [--max-ptys-per-session N] [--max-subscriptions-per-session N] [--frame-read-timeout-ms N]".into()),
+                Some("-h" | "--help") => return Err("usage: shoal-kernel [--session NAME] [--socket PATH] [--state-dir PATH] [--policy FILE] [--max-connections N] [--max-tasks-per-session N] [--max-ptys-per-session N] [--max-ptys-per-principal N] [--max-ptys-global N] [--max-subscriptions-per-session N] [--frame-read-timeout-ms N]".into()),
                 _ => return Err(format!("unknown argument {}", k.to_string_lossy())),
             }
         }
@@ -209,6 +221,10 @@ impl Args {
             max_ptys_per_session: self
                 .max_ptys_per_session
                 .unwrap_or(defaults.max_ptys_per_session),
+            max_ptys_per_principal: self
+                .max_ptys_per_principal
+                .unwrap_or(defaults.max_ptys_per_principal),
+            max_ptys_global: self.max_ptys_global.unwrap_or(defaults.max_ptys_global),
             max_subscriptions_per_session: self
                 .max_subscriptions_per_session
                 .unwrap_or(defaults.max_subscriptions_per_session),
@@ -235,6 +251,10 @@ mod tests {
                 "10",
                 "--max-ptys-per-session",
                 "3",
+                "--max-ptys-per-principal",
+                "5",
+                "--max-ptys-global",
+                "20",
                 "--frame-read-timeout-ms",
                 "2500",
             ]
@@ -245,6 +265,8 @@ mod tests {
         let limits = args.resolved_limits();
         assert_eq!(limits.max_connections, 10);
         assert_eq!(limits.max_ptys_per_session, 3);
+        assert_eq!(limits.max_ptys_per_principal, 5);
+        assert_eq!(limits.max_ptys_global, 20);
         assert_eq!(limits.frame_read_timeout_ms, 2500);
         assert_eq!(
             limits.max_tasks_per_session,

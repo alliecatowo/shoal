@@ -6,7 +6,7 @@ mod tasks;
 
 pub(crate) use connections::{ConnectionPermit, ConnectionRegistry};
 pub(crate) use plans::PlanRegistry;
-pub(crate) use ptys::PtyRegistry;
+pub(crate) use ptys::{PtyPermit, PtyRegistry};
 #[cfg(test)]
 pub(crate) use sessions::MAX_SESSIONS_PER_PRINCIPAL;
 pub(crate) use sessions::SessionRegistry;

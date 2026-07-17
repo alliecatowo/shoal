@@ -122,7 +122,7 @@ impl Kernel {
         // `pty.read` still reports `changed:true`).
         let (cols, rows) = pty_session.size();
 
-        let (pty_id, pty_ref) = self.ptys.allocate();
+        let (_, pty_ref) = self.ptys.allocate();
         let entry = Arc::new(PtyEntry {
             owner,
             cmd: display.clone(),
@@ -135,31 +135,10 @@ impl Kernel {
         });
         self.ptys.insert(pty_ref.clone(), entry.clone());
 
-        // A child may exit without another client request. A lightweight
-        // watcher releases active quota and the session lease promptly; the
-        // final rendered screen remains available in the bounded registry.
-        let weak_kernel = Arc::downgrade(self);
-        let watched_ref = pty_ref.clone();
-        let watched_owner = entry.owner.clone();
-        let watched_entry = entry.clone();
-        if let Err(error) = std::thread::Builder::new()
-            .name(format!("shoal-pty-watch-{pty_id}"))
-            .spawn(move || {
-                loop {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                    let Some(kernel) = weak_kernel.upgrade() else {
-                        break;
-                    };
-                    if watched_entry.session.lock().unwrap().alive() {
-                        continue;
-                    }
-                    watched_entry.mark_terminal();
-                    kernel.reap_terminal_ptys(&watched_owner);
-                    break;
-                }
-            })
-        {
-            self.ptys.remove(&watched_ref);
+        // A single registry-wide sweeper detects self-exited children and
+        // releases their leases. Thread count stays constant as PTYs grow.
+        if let Err(error) = self.ptys.ensure_reaper() {
+            self.ptys.remove(&pty_ref);
             let _ = entry.session.lock().unwrap().close();
             entry.mark_terminal();
             return Err(internal(error));

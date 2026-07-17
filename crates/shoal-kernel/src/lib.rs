@@ -58,7 +58,7 @@ pub struct Kernel {
     /// `pty:{id}` ref like `tasks`. Each holds a live child on a real PTY plus
     /// its `vt100` emulator; scoped to the session that opened it. Dropped (and
     /// so terminated + reaped) on `pty.close` or when the kernel is dropped.
-    ptys: PtyRegistry,
+    ptys: Arc<PtyRegistry>,
     auth: Option<Mutex<TokenStore>>,
     events: Arc<EventBus>,
     /// Whether a plan's requester may acknowledge its own plan via
@@ -79,6 +79,8 @@ pub struct Limits {
     pub max_connections: usize,
     pub max_tasks_per_session: usize,
     pub max_ptys_per_session: usize,
+    pub max_ptys_per_principal: usize,
+    pub max_ptys_global: usize,
     pub max_subscriptions_per_session: usize,
     /// Deadline for an unauthenticated connection's first byte and for the
     /// remainder of any frame once its first byte arrives. Zero disables it.
@@ -91,6 +93,8 @@ impl Default for Limits {
             max_connections: 64,
             max_tasks_per_session: 128,
             max_ptys_per_session: 32,
+            max_ptys_per_principal: 64,
+            max_ptys_global: 256,
             max_subscriptions_per_session: 256,
             frame_read_timeout_ms: 10_000,
         }
@@ -229,7 +233,7 @@ struct PtyLifecycle {
     /// These leases exist only while the child is alive. A bounded terminal
     /// screen record must not consume active quota or pin evaluator state.
     session_lease: Option<Arc<Session>>,
-    active_slot: Option<QuotaPermit>,
+    active_slot: Option<PtyPermit>,
     terminal_since: Option<Instant>,
 }
 
@@ -415,7 +419,11 @@ impl Kernel {
             policy: permissive_policy(),
             plans: PlanRegistry::new(),
             tasks: TaskRegistry::new(limits.max_tasks_per_session),
-            ptys: PtyRegistry::new(limits.max_ptys_per_session),
+            ptys: Arc::new(PtyRegistry::new(
+                limits.max_ptys_per_session,
+                limits.max_ptys_per_principal,
+                limits.max_ptys_global,
+            )),
             events: Arc::new(EventBus::default()),
             auth: None,
             allow_self_ack: AtomicBool::new(self_ack_from_env()),
@@ -449,7 +457,11 @@ impl Kernel {
             policy: permissive_policy(),
             plans: PlanRegistry::new(),
             tasks: TaskRegistry::new(limits.max_tasks_per_session),
-            ptys: PtyRegistry::new(limits.max_ptys_per_session),
+            ptys: Arc::new(PtyRegistry::new(
+                limits.max_ptys_per_session,
+                limits.max_ptys_per_principal,
+                limits.max_ptys_global,
+            )),
             events: Arc::new(events),
             auth: Some(Mutex::new(TokenStore::open(state_dir.join("tokens.json"))?)),
             allow_self_ack: AtomicBool::new(self_ack_from_env()),
@@ -480,7 +492,11 @@ impl Kernel {
             policy,
             plans: PlanRegistry::new(),
             tasks: TaskRegistry::new(limits.max_tasks_per_session),
-            ptys: PtyRegistry::new(limits.max_ptys_per_session),
+            ptys: Arc::new(PtyRegistry::new(
+                limits.max_ptys_per_session,
+                limits.max_ptys_per_principal,
+                limits.max_ptys_global,
+            )),
             events: Arc::new(events),
             auth: Some(Mutex::new(TokenStore::open(state_dir.join("tokens.json"))?)),
             allow_self_ack: AtomicBool::new(self_ack_from_env()),
@@ -503,7 +519,11 @@ impl Kernel {
             policy,
             plans: PlanRegistry::new(),
             tasks: TaskRegistry::new(limits.max_tasks_per_session),
-            ptys: PtyRegistry::new(limits.max_ptys_per_session),
+            ptys: Arc::new(PtyRegistry::new(
+                limits.max_ptys_per_session,
+                limits.max_ptys_per_principal,
+                limits.max_ptys_global,
+            )),
             events: Arc::new(EventBus::default()),
             auth: None,
             allow_self_ack: AtomicBool::new(self_ack_from_env()),
@@ -516,7 +536,11 @@ impl Kernel {
         self.connections
             .configure(limits.max_connections, limits.frame_read_timeout_ms);
         self.tasks.configure(limits.max_tasks_per_session);
-        self.ptys.configure(limits.max_ptys_per_session);
+        self.ptys.configure(
+            limits.max_ptys_per_session,
+            limits.max_ptys_per_principal,
+            limits.max_ptys_global,
+        );
         self.max_subscriptions_per_session
             .store(limits.max_subscriptions_per_session, Ordering::Relaxed);
     }
