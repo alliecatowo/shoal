@@ -2,6 +2,9 @@
 
 use super::*;
 
+const GIT_STATUS_TIMEOUT: Duration = Duration::from_millis(300);
+const GIT_STATUS_OUTPUT_CAP: usize = 256 * 1024;
+
 // ---------------------------------------------------------------------------
 // Pure-Rust git reader — branch + in-progress state, zero subprocess (site/content/internals/prompt-editor-lsp.md)
 // ---------------------------------------------------------------------------
@@ -64,13 +67,19 @@ pub(super) struct GitCounts {
 /// counts. `None` on any failure to run or a non-zero exit — callers treat
 /// that as `degraded`, never as "clean".
 pub(super) fn git_status_counts(cwd: &Path) -> Option<GitCounts> {
-    let output = std::process::Command::new("git")
+    git_status_counts_with_program(cwd, std::ffi::OsStr::new("git"))
+}
+
+fn git_status_counts_with_program(cwd: &Path, program: &std::ffi::OsStr) -> Option<GitCounts> {
+    let mut command = std::process::Command::new(program);
+    command
         .arg("-C")
         .arg(cwd)
-        .args(["status", "--porcelain=v2", "--branch"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
+        .args(["status", "--porcelain=v2", "--branch"]);
+    let output =
+        shoal_exec::run_bounded_command(&mut command, GIT_STATUS_TIMEOUT, GIT_STATUS_OUTPUT_CAP)
+            .ok()?;
+    if output.timed_out || output.truncated || !output.status.success() {
         return None;
     }
     Some(parse_porcelain_v2_counts(&output.stdout))
@@ -183,5 +192,83 @@ pub(super) fn read_state(git_dir: &Path) -> RepoState {
         RepoState::Bisecting
     } else {
         RepoState::Clean
+    }
+}
+
+#[cfg(test)]
+mod bounded_probe_tests {
+    use super::*;
+    use std::fs;
+    use std::io;
+    use std::os::unix::fs::PermissionsExt;
+    use std::thread;
+    use std::time::Instant;
+
+    fn executable_script(contents: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("git");
+        fs::write(&path, format!("#!/bin/sh\n{contents}\n")).expect("write fake git");
+        let mut permissions = fs::metadata(&path)
+            .expect("fake git metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&path, permissions).expect("make fake git executable");
+        (dir, path)
+    }
+
+    #[test]
+    fn bounded_git_probe_parses_complete_output() {
+        let (_dir, git) = executable_script(
+            "printf '# branch.ab +2 -3\\n1 M. N... 100644 100644 100644 x x file\\n? new\\n'",
+        );
+        let counts = git_status_counts_with_program(Path::new("/"), git.as_os_str())
+            .expect("complete status");
+        assert_eq!(counts.ahead, 2);
+        assert_eq!(counts.behind, 3);
+        assert_eq!(counts.staged, 1);
+        assert_eq!(counts.untracked, 1);
+    }
+
+    #[test]
+    fn truncated_status_is_degraded_instead_of_parsed_as_clean() {
+        let (_dir, git) =
+            executable_script("printf '# branch.ab +0 -0\\n'; head -c 300000 /dev/zero");
+        let start = Instant::now();
+        assert!(git_status_counts_with_program(Path::new("/"), git.as_os_str()).is_none());
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn hung_status_is_degraded_and_forked_descendant_is_killed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let descendant_path = dir.path().join("descendant.pid");
+        let script = format!(
+            "printf '# branch.ab +0 -0\\n'; sleep 30 & echo $! > '{}'; wait",
+            descendant_path.display()
+        );
+        let (_git_dir, git) = executable_script(&script);
+
+        let start = Instant::now();
+        assert!(git_status_counts_with_program(Path::new("/"), git.as_os_str()).is_none());
+        assert!(start.elapsed() < Duration::from_secs(1));
+
+        let descendant: libc::pid_t = fs::read_to_string(descendant_path)
+            .expect("descendant pid")
+            .trim()
+            .parse()
+            .expect("numeric pid");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            // SAFETY: signal 0 only checks whether this recorded pid exists.
+            let result = unsafe { libc::kill(descendant, 0) };
+            if result == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "descendant {descendant} survived"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 }

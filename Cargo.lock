@@ -2509,6 +2509,7 @@ dependencies = [
  "shoal-config",
  "shoal-doctor",
  "shoal-eval",
+ "shoal-exec",
  "shoal-host",
  "shoal-journal",
  "shoal-leash",

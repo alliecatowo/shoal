@@ -12,6 +12,7 @@ libc = "0.2.186"
 reedline = { version = "0.49.0", features = ["external_printer"] }
 shoal-ast = { version = "0.1.0", path = "../shoal-ast" }
 shoal-eval = { version = "0.1.0", path = "../shoal-eval" }
+shoal-exec = { version = "0.1.0", path = "../shoal-exec" }
 shoal-syntax = { version = "0.1.0", path = "../shoal-syntax" }
 shoal-value = { version = "0.1.0", path = "../shoal-value" }
 shoal-config = { path = "../shoal-config" }
