@@ -195,12 +195,16 @@ fn check_toml_nesting(path: &Path, text: &str) -> Result<(), ConfigError> {
     let mut quote = None;
     let mut comment = false;
     let mut depth = 0usize;
+    let mut key_dots = 0usize;
+    let mut in_value = false;
     let mut index = 0usize;
     while index < bytes.len() {
         let byte = bytes[index];
         if comment {
             if byte == b'\n' {
                 comment = false;
+                key_dots = 0;
+                in_value = false;
             }
             index += 1;
             continue;
@@ -232,6 +236,20 @@ fn check_toml_nesting(path: &Path, text: &str) -> Result<(), ConfigError> {
             }
             None => match byte {
                 b'#' => comment = true,
+                b'\n' => {
+                    key_dots = 0;
+                    in_value = false;
+                }
+                b'=' => in_value = true,
+                b'.' if !in_value => {
+                    key_dots += 1;
+                    if key_dots >= CONFIG_TOML_MAX_NESTING {
+                        return Err(ConfigError::Complexity {
+                            path: path.to_path_buf(),
+                            max_nesting: CONFIG_TOML_MAX_NESTING,
+                        });
+                    }
+                }
                 b'"' => {
                     let triple = bytes.get(index..index + 3) == Some(b"\"\"\"");
                     quote = Some(Quote::Basic {
@@ -706,6 +724,29 @@ mod tests {
                 "unknown = {}0{}\n",
                 "[".repeat(CONFIG_TOML_MAX_NESTING + 1),
                 "]".repeat(CONFIG_TOML_MAX_NESTING + 1)
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            load(&opts(None, Some(p.clone()), None, vec![])).unwrap_err(),
+            ConfigError::Complexity {
+                path: p,
+                max_nesting: CONFIG_TOML_MAX_NESTING,
+            }
+        );
+    }
+
+    #[test]
+    fn deeply_dotted_toml_key_is_rejected_before_deserialization() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("deep-dotted.toml");
+        fs::write(
+            &p,
+            format!(
+                "{} = 1\n",
+                std::iter::repeat_n("segment", CONFIG_TOML_MAX_NESTING + 1)
+                    .collect::<Vec<_>>()
+                    .join(".")
             ),
         )
         .unwrap();

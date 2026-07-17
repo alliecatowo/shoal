@@ -36,6 +36,12 @@ fn read_source_utf8(path: &Path, kind: &str, reader: impl Read) -> Result<String
 
 impl Evaluator {
     pub(crate) fn read_shoal_source(&self, path: &Path, kind: &str) -> VResult<String> {
+        if !self.host.fs.is_file(path) {
+            return Err(ErrorVal::new(
+                "source_not_file",
+                format!("{kind} {} is not a regular file", path.display()),
+            ));
+        }
         let reader = self.host.fs.open_read(path).map_err(|error| {
             ErrorVal::new(
                 "io_error",
@@ -58,6 +64,9 @@ impl Evaluator {
     /// Read only a bounded script header. A non-UTF-8 body after the first
     /// newline does not invalidate an otherwise valid shebang.
     pub(crate) fn read_shebang_line(&self, path: &Path) -> Option<String> {
+        if !self.host.fs.is_file(path) {
+            return None;
+        }
         let reader = self.host.fs.open_read(path).ok()?;
         let mut bytes = Vec::with_capacity(256);
         reader
@@ -129,6 +138,15 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.code, "source_utf8");
         assert!(error.msg.contains("binary.shl"));
+    }
+
+    #[test]
+    fn directory_is_rejected_before_opening_as_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut evaluator = Evaluator::new(directory.path().to_path_buf());
+        let error = evaluator.eval_source_file(directory.path()).unwrap_err();
+        assert_eq!(error.code, "source_not_file");
+        assert!(error.msg.contains(&directory.path().display().to_string()));
     }
 
     #[test]
