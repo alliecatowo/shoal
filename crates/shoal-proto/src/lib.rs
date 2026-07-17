@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
 pub const JSONRPC: &str = "2.0";
@@ -172,13 +172,30 @@ impl Response {
     }
 }
 
+/// Newline-delimited JSON-RPC frame cap (site/content/internals/kernel-protocol.md,
+/// site/content/internals/hardening-roadmap.md HR-E1; deep-audit finding H6). Enforced DURING the
+/// read below via [`Read::take`], not only after `read_line` returns — a bare
+/// `read_line` grows its output buffer to fit whatever the peer sends before
+/// any length check ever runs, so an oversized (or simply never-terminated)
+/// frame gets fully buffered into memory first and the cap becomes decoration
+/// rather than a real resource-exhaustion defense.
+pub const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
+
 pub fn read_frame<R: BufRead>(reader: &mut R) -> io::Result<Option<Request>> {
     let mut line = String::new();
-    let n = reader.read_line(&mut line)?;
+    // `Take` bounds how many bytes `read_line`'s internal loop can ever pull
+    // out of `reader`: once the limit is exhausted, `Take::fill_buf` reports
+    // EOF regardless of how much real data remains upstream, so `line` can
+    // never grow past `MAX_FRAME_LEN + 1` bytes no matter how large — or how
+    // long-running/never-terminated — the actual input turns out to be.
+    let n = reader
+        .by_ref()
+        .take(MAX_FRAME_LEN as u64 + 1)
+        .read_line(&mut line)?;
     if n == 0 {
         return Ok(None);
     }
-    if line.len() > 16 * 1024 * 1024 {
+    if line.len() > MAX_FRAME_LEN {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "JSON-RPC frame exceeds 16 MiB",
@@ -653,6 +670,64 @@ mod tests {
         let decoded: Response = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(decoded, response);
     }
+    /// HR-E1 / deep-audit H6 regression: a reader that never terminates and
+    /// never contains a newline must not make `read_frame` allocate
+    /// unboundedly (the bug this fixes: the length check used to run only
+    /// AFTER `read_line` returned, by which point an oversized or
+    /// never-terminated line had already been fully buffered). With the
+    /// bounded `Take`-based read, this call returns promptly with the
+    /// existing protocol error instead of hanging or growing `line` forever.
+    #[test]
+    fn read_frame_rejects_unbounded_input_without_growing_past_the_cap() {
+        struct Infinite;
+        impl Read for Infinite {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                buf.fill(b'x');
+                Ok(buf.len())
+            }
+        }
+        let mut reader = io::BufReader::new(Infinite);
+        let err = read_frame(&mut reader)
+            .expect_err("an unterminated, oversized frame must error, never hang or OOM");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("16 MiB"), "{err}");
+    }
+
+    /// Companion case: a single, well-formed (newline-terminated) frame that
+    /// is simply too big must still be rejected with the same protocol
+    /// error, not silently truncated or accepted.
+    #[test]
+    fn read_frame_rejects_a_single_oversize_line() {
+        let mut body = "x".repeat(MAX_FRAME_LEN + 1024);
+        body.push('\n');
+        let mut reader = io::BufReader::new(body.as_bytes());
+        let err =
+            read_frame(&mut reader).expect_err("a >16 MiB single frame must be a protocol error");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("16 MiB"), "{err}");
+    }
+
+    /// Zero-regression companion: a normal, well-under-the-cap frame is
+    /// unaffected by the bounded reader.
+    #[test]
+    fn read_frame_still_reads_a_normal_frame() {
+        let request = Request {
+            jsonrpc: JSONRPC.into(),
+            id: Value::from(1),
+            method: "parse".into(),
+            params: serde_json::json!({"src": "1 + 1"}),
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &request).unwrap();
+        let mut reader = io::BufReader::new(bytes.as_slice());
+        let decoded = read_frame(&mut reader).unwrap().expect("one frame");
+        assert_eq!(decoded, request);
+        assert!(
+            read_frame(&mut reader).unwrap().is_none(),
+            "EOF after the one frame"
+        );
+    }
+
     #[test]
     fn non_utf8_path_roundtrips() {
         let original = OsString::from_vec(vec![b'a', 0xff, b'b']);

@@ -134,9 +134,12 @@ Rules for implementers:
 
 ### Workstream E — protocol and daemon robustness
 
-- [ ] **HR-E1** — Frame length is enforced during read (bounded reader) in `shoal-proto` and
+- [x] **HR-E1** — Frame length is enforced during read (bounded reader) in `shoal-proto` and
   `shoal-mcp`; oversize input cannot allocate past the cap. *(H6)*
   <br>Accept: a test feeds an over-limit frame and observes bounded memory + a protocol error.
+  <br>Done: `shoal_proto::read_frame` and `shoal-mcp`'s `read_json_line` both wrap the reader in
+  `Read::take(cap+1)` before `read_line`; regression tests feed both an unterminated infinite
+  stream and a single oversize line, asserting a prompt protocol error in each crate.
 - [ ] **HR-E2** — Shared daemon state stops relying on `.lock().unwrap()`: a poison-tolerant
   locking pattern (recover-or-shutdown helper) replaces bare unwraps so one panicking connection
   cannot cascade. *(H4)*

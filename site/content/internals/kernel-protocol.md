@@ -288,9 +288,11 @@ currently serializes `timestamp().to_string()`—Unix seconds as decimal text. T
 bytes and declared contract disagree; clients need a compatibility-tested correction rather than an
 assumption based on either comment alone.
 
-The JSON-RPC frame limit is 16 MiB. `read_frame` currently uses `read_line` before checking length,
-so the limit rejects oversized completed frames but does not prevent the temporary string allocation.
-A length-delimited/bounded reader would harden hostile-client behavior.
+The JSON-RPC frame limit is 16 MiB, enforced DURING the read rather than after: `read_frame`
+(`shoal-proto`) and the MCP stdio bridge's `read_json_line` both wrap the reader in [`Read::take`]
+before calling `read_line`, so an oversized or never-terminated frame can never grow the line buffer
+past `16 MiB + 1` bytes — the cap is a real resource-exhaustion defense, not a check that runs only
+after the damage (an unbounded allocation) is already done.
 
 ## Event bus
 
