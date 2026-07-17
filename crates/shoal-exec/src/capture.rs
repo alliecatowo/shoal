@@ -9,8 +9,9 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::RecvTimeoutError;
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::cancel::CancelToken;
 use crate::status::decode_wait_status;
@@ -159,6 +160,7 @@ pub fn spawn_capture(mut spec: ExecSpec, cancel: &CancelToken) -> io::Result<Str
     cmd.stderr(Stdio::piped());
 
     let mut stdin_bytes = None;
+    let mut stdin_stream = None;
     match spec.stdin {
         StdinSpec::Null => {
             cmd.stdin(Stdio::null());
@@ -172,6 +174,10 @@ pub fn spawn_capture(mut spec: ExecSpec, cancel: &CancelToken) -> io::Result<Str
         }
         StdinSpec::File(p) => {
             cmd.stdin(Stdio::from(std::fs::File::open(&p)?));
+        }
+        StdinSpec::Stream(stream) => {
+            cmd.stdin(Stdio::piped());
+            stdin_stream = Some(stream.take()?);
         }
     }
 
@@ -193,6 +199,7 @@ pub fn spawn_capture(mut spec: ExecSpec, cancel: &CancelToken) -> io::Result<Str
     let pid = child.id();
     let pgid = pid as libc::pid_t;
 
+    let done = Arc::new(AtomicBool::new(false));
     let mut threads = Vec::new();
     if let Some(bytes) = stdin_bytes {
         let mut sink = child.stdin.take().expect("stdin was configured as piped");
@@ -202,7 +209,24 @@ pub fn spawn_capture(mut spec: ExecSpec, cancel: &CancelToken) -> io::Result<Str
         }));
     }
 
-    let done = Arc::new(AtomicBool::new(false));
+    if let Some(rx) = stdin_stream {
+        let mut sink = child.stdin.take().expect("stdin was configured as piped");
+        let child_done = done.clone();
+        threads.push(thread::spawn(move || {
+            loop {
+                match rx.recv_timeout(Duration::from_millis(25)) {
+                    Ok(chunk) => {
+                        if sink.write_all(&chunk).is_err() {
+                            break;
+                        }
+                    }
+                    Err(RecvTimeoutError::Timeout) if !child_done.load(Ordering::SeqCst) => {}
+                    Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        }));
+    }
+
     let claimed = Arc::new(AtomicBool::new(false));
     threads.push(spawn_cancel_watcher(
         pgid,

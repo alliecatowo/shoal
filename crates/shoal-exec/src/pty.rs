@@ -35,6 +35,7 @@ use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -303,6 +304,7 @@ fn pump_output(
 enum Feed {
     Bytes(Vec<u8>),
     File(File),
+    Stream(Receiver<Vec<u8>>),
 }
 
 /// The result of serving (waiting on) a PTY child for one foreground/background
@@ -390,6 +392,7 @@ impl PtyJob {
         // tty forwarding re-engages on every foreground serve.
         if let Some(feed) = self.pending_feed.take() {
             let mut w = dup_master_fd(self.master.as_ref())?;
+            let feed_done = serve_done.clone();
             helpers.push(thread::spawn(move || match feed {
                 Feed::Bytes(bytes) => {
                     let _ = w.write_all(&bytes);
@@ -397,6 +400,28 @@ impl PtyJob {
                 }
                 Feed::File(mut f) => {
                     let _ = io::copy(&mut f, &mut w);
+                    let _ = w.flush();
+                }
+                Feed::Stream(rx) => {
+                    loop {
+                        match rx.recv_timeout(Duration::from_millis(25)) {
+                            Ok(chunk) => {
+                                if w.write_all(&chunk).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(RecvTimeoutError::Timeout) if !feed_done.load(Ordering::SeqCst) => {
+                            }
+                            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
+                                // A PTY has no half-close. Deliver its canonical
+                                // EOF character when the finite stream ends.
+                                if !feed_done.load(Ordering::SeqCst) {
+                                    let _ = w.write_all(&[4]);
+                                }
+                                break;
+                            }
+                        }
+                    }
                     let _ = w.flush();
                 }
             }));
@@ -695,6 +720,7 @@ pub(crate) fn run_pty(mut spec: ExecSpec, cancel: &CancelToken) -> io::Result<Ex
         StdinSpec::File(_) => Some(Feed::File(
             stdin_file.expect("opened above for StdinSpec::File"),
         )),
+        StdinSpec::Stream(stream) => Some(Feed::Stream(stream.take()?)),
         StdinSpec::Null | StdinSpec::Inherit => None,
     };
 

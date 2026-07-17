@@ -48,6 +48,8 @@ use std::ffi::OsString;
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::{Arc, Mutex};
 
 pub use cancel::CancelToken;
 pub use capture::{StreamingChild, spawn_capture};
@@ -229,6 +231,53 @@ pub enum StdinSpec {
     Bytes(Vec<u8>),
     /// Feed the contents of a file.
     File(PathBuf),
+    /// Feed bounded chunks supplied incrementally by an owning producer.
+    Stream(StdinStream),
+}
+
+/// Producer half of a bounded incremental stdin channel.
+#[derive(Debug, Clone)]
+pub struct StdinSink(SyncSender<Vec<u8>>);
+
+impl StdinSink {
+    /// Attempt to enqueue one chunk without blocking. The producer owns its
+    /// backpressure/cancellation policy and can retry a returned full chunk.
+    pub fn try_send(&self, chunk: Vec<u8>) -> Result<(), std::sync::mpsc::TrySendError<Vec<u8>>> {
+        self.0.try_send(chunk)
+    }
+}
+
+/// Single-consumer half stored inside [`StdinSpec::Stream`]. Cloning an
+/// `ExecSpec` shares the same one-shot receiver; exactly one execution may
+/// claim it.
+#[derive(Clone)]
+pub struct StdinStream(Arc<Mutex<Option<Receiver<Vec<u8>>>>>);
+
+impl std::fmt::Debug for StdinStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StdinStream(..)")
+    }
+}
+
+impl StdinStream {
+    fn take(&self) -> io::Result<Receiver<Vec<u8>>> {
+        self.0.lock().unwrap().take().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "incremental stdin stream was already consumed",
+            )
+        })
+    }
+}
+
+/// Create a bounded incremental stdin path. `capacity` is clamped to one so
+/// neither side can accidentally request an unbounded queue or rendezvous.
+pub fn stream_stdin(capacity: usize) -> (StdinSink, StdinSpec) {
+    let (tx, rx) = sync_channel(capacity.max(1));
+    (
+        StdinSink(tx),
+        StdinSpec::Stream(StdinStream(Arc::new(Mutex::new(Some(rx))))),
+    )
 }
 
 /// Execution mode — the mechanism behind the site/content/internals/language-conformance-contract.md PTY position rule.

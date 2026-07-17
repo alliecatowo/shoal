@@ -8,7 +8,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use shoal_exec::{CancelToken, ExecMode, ExecSpec, StdinSpec, run, spawn_capture, which};
+use shoal_exec::{
+    CancelToken, ExecMode, ExecSpec, StdinSpec, run, spawn_capture, stream_stdin, which,
+};
 
 /// Minimal self-cleaning temp dir (avoids a tempfile dependency).
 struct TempDir(PathBuf);
@@ -106,6 +108,32 @@ fn capture_stdin_bytes_are_fed_and_closed() {
     let res = run(s, &CancelToken::new()).expect("run");
     assert_eq!(res.status, Some(0));
     assert_eq!(res.stdout, b"hello stdin");
+}
+
+#[test]
+fn capture_stream_stdin_consumes_bounded_chunks_until_producer_close() {
+    let (sink, stdin) = stream_stdin(1);
+    let mut s = spec(&["/bin/cat"], ExecMode::Capture);
+    s.stdin = stdin;
+    let producer = std::thread::spawn(move || {
+        sink.try_send(b"first\n".to_vec()).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        sink.try_send(b"second\n".to_vec()).unwrap();
+    });
+    let res = run(s, &CancelToken::new()).expect("run");
+    producer.join().unwrap();
+    assert_eq!(res.status, Some(0));
+    assert_eq!(res.stdout, b"first\nsecond\n");
+}
+
+#[test]
+fn stream_stdin_capacity_applies_before_execution_claims_the_receiver() {
+    let (sink, _stdin) = stream_stdin(1);
+    sink.try_send(vec![1]).unwrap();
+    assert!(matches!(
+        sink.try_send(vec![2]),
+        Err(std::sync::mpsc::TrySendError::Full(_))
+    ));
 }
 
 #[test]
@@ -483,6 +511,18 @@ fn pty_stdin_bytes_drive_an_interactive_child() {
         "expected the echoed bytes in the tee, got {:?}",
         String::from_utf8_lossy(&res.stdout)
     );
+}
+
+#[test]
+fn pty_stream_stdin_delivers_eof_when_the_producer_finishes() {
+    let (sink, stdin) = stream_stdin(2);
+    sink.try_send(b"streamed\n".to_vec()).unwrap();
+    drop(sink);
+    let mut s = spec(&["/bin/cat"], ExecMode::PtyTee);
+    s.stdin = stdin;
+    let res = run(s, &CancelToken::new()).expect("run");
+    assert_eq!(res.status, Some(0));
+    assert!(res.stdout.windows(8).any(|w| w == b"streamed"));
 }
 
 #[test]
