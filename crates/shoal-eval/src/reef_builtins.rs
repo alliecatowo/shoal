@@ -718,7 +718,9 @@ mod tests {
         let mut ev = Evaluator::new(dir.path().into());
         ev.eval_program(&shoal_syntax::parse("fn deploy() { null }").unwrap())
             .unwrap();
-        ev.env_mut().declare("answer", Value::Int(42), false);
+        ev.env_mut()
+            .declare("answer", Value::Int(42), false)
+            .unwrap();
 
         for (head, expected) in [
             ("deploy", "session_callable"),

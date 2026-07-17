@@ -161,7 +161,9 @@ pub(super) fn refresh_protocol_state(
     path_dirs: &Arc<Mutex<Option<Vec<PathBuf>>>>,
 ) -> Result<ProtocolSnapshot, String> {
     let snapshot = ProtocolSnapshot::parse(session.snapshot()?)?;
-    mirror.apply(&snapshot, env, cwd, path_dirs);
+    mirror
+        .apply(&snapshot, env, cwd, path_dirs)
+        .map_err(|error| error.to_string())?;
     Ok(snapshot)
 }
 

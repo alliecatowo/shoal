@@ -665,8 +665,8 @@ fn record_transcript_binds_it_and_out() {
         .unwrap()
     };
     let mut ev = Evaluator::new(std::env::current_dir().unwrap());
-    ev.record_transcript(&Value::Int(7));
-    ev.record_transcript(&Value::Str("hi".into()));
+    ev.record_transcript(&Value::Int(7)).unwrap();
+    ev.record_transcript(&Value::Str("hi".into())).unwrap();
     let it = ev.eval_program(&repl("it")).unwrap();
     assert_eq!(it, Value::Str("hi".into()));
     let out = ev.eval_program(&repl("out")).unwrap();
@@ -680,7 +680,7 @@ fn record_transcript_binds_it_and_out() {
 fn record_transcript_bounds_it_and_out_together() {
     let mut ev = Evaluator::new(std::env::current_dir().unwrap());
     for value in 0..=MAX_REPL_TRANSCRIPT_VALUES {
-        ev.record_transcript(&Value::Int(value as i64));
+        ev.record_transcript(&Value::Int(value as i64)).unwrap();
     }
     assert_eq!(ev.it(), &Value::Int(MAX_REPL_TRANSCRIPT_VALUES as i64));
     let Some(Value::List(out)) = ev.env().get("out") else {

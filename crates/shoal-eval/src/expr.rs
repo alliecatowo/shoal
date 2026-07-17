@@ -267,11 +267,15 @@ impl Evaluator {
                 Err(e) => {
                     let old = self.exec.shell.env.clone();
                     self.exec.shell.env = old.child();
-                    if let Some(n) = binder {
-                        self.exec
-                            .shell
-                            .env
-                            .declare(n.clone(), Value::Error(Arc::new(e)), false);
+                    if let Some(n) = binder
+                        && let Err(limit) =
+                            self.exec
+                                .shell
+                                .env
+                                .declare(n.clone(), Value::Error(Arc::new(e)), false)
+                    {
+                        self.exec.shell.env = old;
+                        return Err(limit);
                     }
                     let r = self.eval_expr(handler, Position::Value);
                     self.exec.shell.env = old;

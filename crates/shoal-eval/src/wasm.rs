@@ -426,7 +426,10 @@ mod tests {
             Value::Null
         ));
 
-        evaluator.env_mut().declare("plug", Value::Int(7), false);
+        evaluator
+            .env_mut()
+            .declare("plug", Value::Int(7), false)
+            .unwrap();
         assert_eq!(
             evaluator.resolve_head("plug", false, true).source,
             shoal_syntax::commands::CommandSource::BoundValue

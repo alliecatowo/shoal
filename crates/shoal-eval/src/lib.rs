@@ -338,9 +338,9 @@ impl Evaluator {
 
     /// Bind `it` and append to the session `out` transcript list (REPL hook).
     /// `Var("it")` / `Var("out")` then resolve from the environment normally.
-    pub fn record_transcript(&mut self, v: &Value) {
+    pub fn record_transcript(&mut self, v: &Value) -> VResult<()> {
         self.set_it(v.clone());
-        self.exec.shell.env.declare("it", v.clone(), true);
+        self.exec.shell.env.declare("it", v.clone(), true)?;
         let mut out = match self.exec.shell.env.get("out") {
             Some(Value::List(xs)) => xs,
             _ => Vec::new(),
@@ -349,7 +349,8 @@ impl Evaluator {
             out.remove(0);
         }
         out.push(v.clone());
-        self.exec.shell.env.declare("out", Value::List(out), true);
+        self.exec.shell.env.declare("out", Value::List(out), true)?;
+        Ok(())
     }
 
     /// Route a value to the statement sink (or the default stdout renderer).

@@ -193,10 +193,10 @@ impl Evaluator {
                 // cancel interrupts the script.
                 let cancel = self.cancellation_token();
                 let mut child = self.child_context().build(ChildKind::Script, cancel);
-                child.env_mut().declare("args", Value::List(args), false);
+                child.env_mut().declare("args", Value::List(args), false)?;
                 child
                     .env_mut()
-                    .declare("script", Value::Path(path.to_path_buf()), false);
+                    .declare("script", Value::Path(path.to_path_buf()), false)?;
                 child.eval_program(&program)
             }
             _ => {

@@ -288,7 +288,10 @@ fn handle_submitted_line(
     background.watch(evaluator, evaluation.as_ref().ok());
     match evaluation {
         Ok(value) => {
-            transcript.record(evaluator, &value, started_ns);
+            if let Err(error) = transcript.record(evaluator, &value, started_ns) {
+                report_eval_error(&run_src, None, &error);
+                return None;
+            }
             if let Err(error) = render_result_paged(&value, true, &ui.pager) {
                 eprintln!(
                     "{}",

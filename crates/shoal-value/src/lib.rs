@@ -33,6 +33,7 @@ pub mod render;
 mod env;
 mod json;
 mod outcome;
+mod retained;
 mod stream;
 mod task;
 mod value_types;
@@ -46,6 +47,7 @@ pub use env::{AssignError, Binding, Env};
 pub use json::{json_to_value, value_to_json};
 pub use methods::{method_names, methods_for};
 pub use outcome::OutcomeVal;
+pub use retained::{OpaqueHandling, RetainedError, RetainedLimits, retained_size};
 pub use stream::{
     Pull, StreamGap, StreamGapReason, StreamVal, Upstream, collect_stream, drive_stream,
 };
@@ -532,10 +534,10 @@ mod tests {
     #[test]
     fn env_scoping() {
         let root = Env::root();
-        root.declare("x", Value::Int(1), false);
+        root.declare("x", Value::Int(1), false).unwrap();
         let child = root.child();
         assert_eq!(child.get("x"), Some(Value::Int(1)));
-        child.declare("x", Value::Int(2), true);
+        child.declare("x", Value::Int(2), true).unwrap();
         assert_eq!(child.get("x"), Some(Value::Int(2)));
         assert_eq!(root.get("x"), Some(Value::Int(1)));
         assert_eq!(root.assign("x", Value::Int(9)), Err(AssignError::Immutable));

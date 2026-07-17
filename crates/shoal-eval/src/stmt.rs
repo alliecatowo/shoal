@@ -92,7 +92,7 @@ impl Evaluator {
                 self.exec
                     .shell
                     .env
-                    .declare(decl.name.clone(), closure, false);
+                    .declare(decl.name.clone(), closure, false)?;
                 Ok(Flow::Value(Value::Null))
             }
             Stmt::Alias { name, target, .. } => {
@@ -100,7 +100,7 @@ impl Evaluator {
                     name.clone(),
                     Value::CmdRef(Arc::new(target.clone())),
                     false,
-                );
+                )?;
                 Ok(Flow::Value(Value::Null))
             }
             Stmt::Assign {
@@ -161,13 +161,15 @@ impl Evaluator {
                     };
                     shoal_value::ops::binop(bop, &lhs, &rhs)?
                 };
-                self.exec
-                    .shell
-                    .env
-                    .assign(name, assigned.clone())
-                    .map_err(|e| {
-                        ErrorVal::new("type_error", format!("cannot assign `{name}`: {e:?}"))
-                    })?;
+                self.exec.shell.env.assign(name, assigned.clone()).map_err(
+                    |error| match error {
+                        shoal_value::AssignError::Limit(error) => error.or_span(*span),
+                        other => ErrorVal::new(
+                            "type_error",
+                            format!("cannot assign `{name}`: {other:?}"),
+                        ),
+                    },
+                )?;
                 Ok(Flow::Value(assigned))
             }
             Stmt::Expr { expr, .. } => {

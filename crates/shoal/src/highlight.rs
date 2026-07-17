@@ -482,7 +482,7 @@ mod tests {
 
     fn styles_with_bindings_inner(line: &str) -> Vec<(Style, String)> {
         let env = Env::root();
-        env.declare("someVar", Value::Int(42), false);
+        env.declare("someVar", Value::Int(42), false).unwrap();
         env.declare(
             "deploy",
             Value::CmdRef(std::sync::Arc::new(shoal_ast::CmdCall {
@@ -496,7 +496,8 @@ mod tests {
                 span: shoal_ast::Span::new(0, 0),
             })),
             false,
-        );
+        )
+        .unwrap();
         ShoalHighlighter::with_env(env)
             .highlight(line, line.len())
             .buffer
@@ -523,7 +524,7 @@ mod tests {
     fn ineligible_value_shadow_falls_through_to_builtin_highlighting() {
         let spans = with_forced_color(|| {
             let env = Env::root();
-            env.declare("ls", Value::Int(42), false);
+            env.declare("ls", Value::Int(42), false).unwrap();
             ShoalHighlighter::with_env(env).highlight("ls .", 4).buffer
         });
         let head = spans

@@ -684,7 +684,16 @@ impl Kernel {
         // lockstep with the kernel's addressable Session transcript. Failed
         // evaluations intentionally do not reach this point, matching the
         // standalone REPL's successful-value-only contract.
-        evaluator.record_transcript(&value);
+        if let Err(e) = evaluator.record_transcript(&value) {
+            return Err(RpcError {
+                code: RAISED,
+                message: e.msg,
+                data: Some(json!({
+                    "code": e.code, "span": e.span, "hint": e.hint,
+                    "status": e.status, "stderr": e.stderr
+                })),
+            });
+        }
         let evaluator_entry_id = self
             .journal
             .lock()

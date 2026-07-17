@@ -17,8 +17,8 @@ mod eval;
 use shoal_ast::Args;
 use shoal_exec::CancelToken;
 use shoal_value::{
-    CallArgs, CallCtx, ErrorVal, Pull, Record, StreamGap, StreamGapReason, StreamVal, TaskVal,
-    Upstream, VResult, Value,
+    CallArgs, CallCtx, ErrorVal, OpaqueHandling, Pull, Record, RetainedError, RetainedLimits,
+    StreamGap, StreamGapReason, StreamVal, TaskVal, Upstream, VResult, Value, retained_size,
 };
 use std::collections::{HashMap, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -61,6 +61,14 @@ const SUBSCRIBER_BYTE_CAP: usize = 256 * 1024;
 const PAYLOAD_BYTE_CAP: usize = 64 * 1024;
 const PAYLOAD_DEPTH_CAP: usize = 64;
 const PAYLOAD_NODE_CAP: usize = 4096;
+
+const CHANNEL_RETAINED_LIMITS: RetainedLimits = RetainedLimits {
+    max_bytes: PAYLOAD_BYTE_CAP,
+    max_depth: PAYLOAD_DEPTH_CAP,
+    max_nodes: PAYLOAD_NODE_CAP,
+    opaque: OpaqueHandling::Reject,
+    allow_secret: false,
+};
 
 /// Conservative allowance for the `{channel, seq, ts, payload}` record around
 /// a measured payload in each subscriber queue.
@@ -737,162 +745,35 @@ fn event_retained_bytes(name: &str, payload_bytes: usize) -> usize {
         .saturating_add(EVENT_RECORD_OVERHEAD)
 }
 
-#[derive(Default)]
-struct PayloadMeasure {
-    bytes: usize,
-    nodes: usize,
-}
-
-impl PayloadMeasure {
-    fn add_bytes(&mut self, bytes: usize) -> VResult<()> {
-        self.bytes = self.bytes.checked_add(bytes).ok_or_else(|| {
-            ErrorVal::new(
-                "channel_payload_limit",
-                "channel payload retained-size accounting overflowed",
-            )
-        })?;
-        if self.bytes > PAYLOAD_BYTE_CAP {
-            return Err(ErrorVal::new(
-                "channel_payload_limit",
-                format!(
-                    "channel payload retains more than {PAYLOAD_BYTE_CAP} bytes (measured at least {})",
-                    self.bytes
-                ),
-            ));
-        }
-        Ok(())
-    }
-
-    fn enter_node(&mut self, depth: usize, resident_bytes: usize) -> VResult<()> {
-        if depth > PAYLOAD_DEPTH_CAP {
-            return Err(ErrorVal::new(
-                "channel_payload_limit",
-                format!("channel payload depth exceeds {PAYLOAD_DEPTH_CAP}"),
-            ));
-        }
-        self.nodes = self.nodes.checked_add(1).ok_or_else(|| {
-            ErrorVal::new(
-                "channel_payload_limit",
-                "channel payload node accounting overflowed",
-            )
-        })?;
-        if self.nodes > PAYLOAD_NODE_CAP {
-            return Err(ErrorVal::new(
-                "channel_payload_limit",
-                format!("channel payload has more than {PAYLOAD_NODE_CAP} nodes"),
-            ));
-        }
-        self.add_bytes(resident_bytes)
-    }
-
-    fn visit(&mut self, value: &Value, depth: usize) -> VResult<()> {
-        self.enter_node(depth, std::mem::size_of::<Value>())?;
-        match value {
-            Value::Null
-            | Value::Bool(_)
-            | Value::Int(_)
-            | Value::Float(_)
-            | Value::Size(_)
-            | Value::Duration(_)
-            | Value::Time(_)
-            | Value::Range(_) => Ok(()),
-            Value::DateTime(_) => self.add_bytes(512),
-            Value::Str(text) => self.add_bytes(text.capacity()),
-            Value::Path(path) => self.add_bytes(path.as_os_str().as_encoded_bytes().len()),
-            Value::Glob(glob) => {
-                self.add_bytes(glob.pattern.capacity())?;
-                self.add_bytes(glob.cwd.as_os_str().as_encoded_bytes().len())
-            }
-            Value::Bytes(bytes) => self.add_bytes(bytes.capacity()),
-            Value::List(values) => {
-                self.add_bytes(
-                    values
-                        .capacity()
-                        .saturating_sub(values.len())
-                        .saturating_mul(std::mem::size_of::<Value>()),
-                )?;
-                for value in values {
-                    self.visit(value, depth + 1)?;
-                }
-                Ok(())
-            }
-            Value::Record(record) => self.visit_record(record, depth),
-            Value::Table(rows) => {
-                self.add_bytes(
-                    rows.capacity()
-                        .saturating_mul(std::mem::size_of::<Record>()),
-                )?;
-                for row in rows {
-                    self.enter_node(depth + 1, std::mem::size_of::<Record>())?;
-                    self.visit_record(row, depth + 1)?;
-                }
-                Ok(())
-            }
-            Value::Error(error) => {
-                self.add_bytes(std::mem::size_of_val(error.as_ref()))?;
-                self.add_bytes(error.code.capacity())?;
-                self.add_bytes(error.msg.capacity())?;
-                if let Some(hint) = &error.hint {
-                    self.add_bytes(hint.capacity())?;
-                }
-                if let Some(stderr) = &error.stderr {
-                    self.add_bytes(stderr.capacity())?;
-                }
-                Ok(())
-            }
-            Value::Outcome(outcome) => {
-                self.add_bytes(std::mem::size_of_val(outcome.as_ref()))?;
-                self.add_bytes(outcome.stdout.capacity())?;
-                self.add_bytes(outcome.stderr.capacity())?;
-                self.add_bytes(outcome.cmd.capacity())?;
-                if let Some(signal) = &outcome.signal {
-                    self.add_bytes(signal.capacity())?;
-                }
-                if outcome.stdout_ref.is_some() {
-                    return Err(opaque_payload_error("CAS-backed outcome"));
-                }
-                if let Some(parsed) = &outcome.parsed {
-                    self.visit(parsed, depth + 1)?;
-                }
-                Ok(())
-            }
-            Value::Secret(_) => Err(opaque_payload_error("secret")),
-            Value::CasBytes(_) => Err(opaque_payload_error("CAS-backed bytes")),
-            Value::Regex(_) => Err(opaque_payload_error("compiled regex")),
-            Value::Stream(_) => Err(opaque_payload_error("stream")),
-            Value::Task(_) => Err(opaque_payload_error("task")),
-            Value::Closure(_) => Err(opaque_payload_error("closure")),
-            Value::CmdRef(_) => Err(opaque_payload_error("command reference")),
-        }
-    }
-
-    fn visit_record(&mut self, record: &Record, depth: usize) -> VResult<()> {
-        self.add_bytes(
-            record
-                .capacity()
-                .saturating_mul(std::mem::size_of::<(String, Value)>()),
-        )?;
-        for (key, value) in record {
-            self.add_bytes(key.capacity())?;
-            self.visit(value, depth + 1)?;
-        }
-        Ok(())
-    }
-}
-
 fn payload_retained_size(value: &Value) -> VResult<usize> {
-    let mut measure = PayloadMeasure::default();
-    measure.visit(value, 1)?;
-    Ok(measure.bytes)
-}
-
-fn opaque_payload_error(kind: &str) -> ErrorVal {
-    ErrorVal::new(
-        "channel_payload_type",
-        format!(
-            "a {kind} cannot be retained in a bounded channel payload; publish materialized data instead"
+    retained_size(value, CHANNEL_RETAINED_LIMITS).map_err(|error| match error {
+        RetainedError::Opaque(kind) => ErrorVal::new(
+            "channel_payload_type",
+            format!(
+                "a {kind} cannot be retained in a bounded channel payload; publish materialized data instead"
+            ),
         ),
-    )
+        RetainedError::Secret => ErrorVal::new(
+            "channel_payload_type",
+            "a secret cannot be retained in a channel payload",
+        ),
+        RetainedError::Bytes { measured, max } => ErrorVal::new(
+            "channel_payload_limit",
+            format!("channel payload retains {measured} bytes; maximum is {max}"),
+        ),
+        RetainedError::Depth { measured, max } => ErrorVal::new(
+            "channel_payload_limit",
+            format!("channel payload depth is {measured}; maximum is {max}"),
+        ),
+        RetainedError::Nodes { measured, max } => ErrorVal::new(
+            "channel_payload_limit",
+            format!("channel payload has {measured} nodes; maximum is {max}"),
+        ),
+        RetainedError::AccountingOverflow => ErrorVal::new(
+            "channel_payload_limit",
+            "channel payload retained-size accounting overflowed",
+        ),
+    })
 }
 
 fn channel_poisoned(component: &str) -> ErrorVal {

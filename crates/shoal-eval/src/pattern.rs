@@ -7,7 +7,7 @@ impl Evaluator {
         match p {
             Pattern::Wildcard { .. } => Ok(()),
             Pattern::Bind { name, .. } => {
-                self.exec.shell.env.declare(name.clone(), v, mutable);
+                self.exec.shell.env.declare(name.clone(), v, mutable)?;
                 Ok(())
             }
             Pattern::Lit { expr, .. } => {
@@ -32,7 +32,7 @@ impl Evaluator {
                         n.clone(),
                         Value::List(xs.into_iter().skip(items.len()).collect()),
                         mutable,
-                    );
+                    )?;
                 }
                 Ok(())
             }
@@ -46,7 +46,10 @@ impl Evaluator {
         match p {
             Pattern::Wildcard { .. } => Ok(true),
             Pattern::Bind { name, .. } => {
-                self.exec.shell.env.declare(name.clone(), v.clone(), false);
+                self.exec
+                    .shell
+                    .env
+                    .declare(name.clone(), v.clone(), false)?;
                 Ok(true)
             }
             Pattern::Lit { expr, .. } => Ok(self.eval_expr(expr, Position::Value)? == *v),
@@ -71,7 +74,7 @@ impl Evaluator {
             Pattern::Type { ty, name, .. } => {
                 if v.type_name() == ty.name {
                     if let Some(n) = name {
-                        self.exec.shell.env.declare(n.clone(), v.clone(), false);
+                        self.exec.shell.env.declare(n.clone(), v.clone(), false)?;
                     }
                     Ok(true)
                 } else {
@@ -95,7 +98,7 @@ impl Evaluator {
                                 return Ok(false);
                             }
                         }
-                        None => self.exec.shell.env.declare(f.name.clone(), fv, false),
+                        None => self.exec.shell.env.declare(f.name.clone(), fv, false)?,
                     }
                 }
                 Ok(true)
@@ -123,7 +126,7 @@ impl Evaluator {
                         r.clone(),
                         Value::List(xs[items.len()..].to_vec()),
                         false,
-                    );
+                    )?;
                 }
                 Ok(true)
             }

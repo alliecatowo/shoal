@@ -29,7 +29,7 @@ impl Evaluator {
                     .with_span(span)
             })?;
         let exports = self.load_module(&canon).map_err(|e| e.or_span(span))?;
-        self.exec.shell.env.declare(stem, exports, false);
+        self.exec.shell.env.declare(stem, exports, false)?;
         Ok(())
     }
 
@@ -114,7 +114,8 @@ impl Evaluator {
         // Evaluate the module in a fresh scope: a new root env (so it cannot see
         // the caller's locals) rooted at the module file's own directory (so its
         // relative `use`/paths resolve against the module, not the caller).
-        let saved_env = std::mem::replace(&mut self.exec.shell.env, Env::root());
+        let module_env = self.exec.shell.env.isolated();
+        let saved_env = std::mem::replace(&mut self.exec.shell.env, module_env);
         let module_dir = canon
             .parent()
             .map(Path::to_path_buf)

@@ -87,7 +87,10 @@ mod tests {
     #[test]
     fn bare_bound_value_does_not_fall_through_to_spawn() {
         let mut evaluator = Evaluator::new(PathBuf::from("/"));
-        evaluator.env_mut().declare("shadow", Value::Int(42), false);
+        evaluator
+            .env_mut()
+            .declare("shadow", Value::Int(42), false)
+            .unwrap();
         assert_eq!(
             evaluator.resolve_command(&call("shadow")).source,
             CommandSource::BoundValue

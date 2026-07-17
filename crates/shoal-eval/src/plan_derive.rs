@@ -1281,7 +1281,7 @@ effects=["proc.spawn(container)", "net.connect(registry:443)", "quantum.entangle
     fn planner_and_runtime_agree_on_non_callable_binding_shadow() {
         let dir = tempfile::tempdir().unwrap();
         let mut ev = Evaluator::new(dir.path().into());
-        ev.env_mut().declare("ls", Value::Int(42), false);
+        ev.env_mut().declare("ls", Value::Int(42), false).unwrap();
 
         let bare = shoal_syntax::parse("ls").unwrap();
         assert_eq!(ev.eval_program(&bare).unwrap(), Value::Int(42));

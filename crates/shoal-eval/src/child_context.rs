@@ -149,7 +149,8 @@ mod tests {
         parent.set_statement_sink(Box::new(|_| {}));
         parent
             .env_mut()
-            .declare("parent_only", Value::Int(1), false);
+            .declare("parent_only", Value::Int(1), false)
+            .unwrap();
         parent.exec.shell.oldpwd = Some(dir.path().join("previous"));
         parent.exec.shell.dir_stack.push(dir.path().join("stacked"));
         parent.exec.reef.lock.insert(LockEntry {

@@ -97,14 +97,20 @@ impl Evaluator {
                             return Err(e);
                         }
                     };
-                    self.exec.shell.env.declare(p.name.clone(), val, false);
+                    if let Err(limit) = self.exec.shell.env.declare(p.name.clone(), val, false) {
+                        self.exec.shell.env = old;
+                        return Err(limit);
+                    }
                 }
-                if let Some(rest) = &c.rest {
-                    self.exec.shell.env.declare(
+                if let Some(rest) = &c.rest
+                    && let Err(limit) = self.exec.shell.env.declare(
                         rest.name.clone(),
                         Value::List(args.pos.iter().skip(c.params.len()).cloned().collect()),
                         false,
-                    );
+                    )
+                {
+                    self.exec.shell.env = old;
+                    return Err(limit);
                 }
                 // Track fn-body nesting so `cd`/env writes can be rejected (#10).
                 self.exec.control.in_fn_body += 1;

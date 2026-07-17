@@ -187,7 +187,7 @@ impl RemoteEnvMirror {
         env: &Env,
         cwd: &Arc<Mutex<PathBuf>>,
         path_dirs: &Arc<Mutex<Option<Vec<PathBuf>>>>,
-    ) {
+    ) -> shoal_value::VResult<()> {
         let incoming = snapshot
             .bindings
             .iter()
@@ -197,7 +197,7 @@ impl RemoteEnvMirror {
             env.remove_local(stale);
         }
         for binding in &snapshot.bindings {
-            env.declare(binding.name.clone(), placeholder(binding), false);
+            env.declare(binding.name.clone(), placeholder(binding), false)?;
         }
         self.names = incoming;
         if let Ok(mut cell) = cwd.lock() {
@@ -206,6 +206,7 @@ impl RemoteEnvMirror {
         if let Ok(mut cell) = path_dirs.lock() {
             *cell = snapshot.completion_path_dirs.clone();
         }
+        Ok(())
     }
 }
 
@@ -271,18 +272,22 @@ mod tests {
         let cwd = Arc::new(Mutex::new(PathBuf::new()));
         let path_dirs = Arc::new(Mutex::new(None));
         let mut mirror = RemoteEnvMirror::default();
-        mirror.apply(
-            &snapshot(json!([
-                {"name":"deploy","callable":true,"type":"command"},
-                {"name":"count","callable":false,"type":"int"}
-            ])),
-            &env,
-            &cwd,
-            &path_dirs,
-        );
+        mirror
+            .apply(
+                &snapshot(json!([
+                    {"name":"deploy","callable":true,"type":"command"},
+                    {"name":"count","callable":false,"type":"int"}
+                ])),
+                &env,
+                &cwd,
+                &path_dirs,
+            )
+            .unwrap();
         assert!(env.get("deploy").is_some_and(|value| value.is_callable()));
         assert!(matches!(env.get("count"), Some(Value::Int(0))));
-        mirror.apply(&snapshot(json!([])), &env, &cwd, &path_dirs);
+        mirror
+            .apply(&snapshot(json!([])), &env, &cwd, &path_dirs)
+            .unwrap();
         assert!(env.get("deploy").is_none());
         assert!(env.get("count").is_none());
         assert_eq!(*cwd.lock().unwrap(), PathBuf::from("/work"));

@@ -213,7 +213,9 @@ impl ExecState {
         } = seed;
         let mut child = Self::root(cwd);
         child.reef = reef;
-        if !matches!(kind, crate::ChildKind::Script) {
+        if matches!(kind, crate::ChildKind::Script) {
+            child.shell.env = env.isolated();
+        } else {
             child.shell.env = env;
         }
         child.shell.process_env = process_env;

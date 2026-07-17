@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use shoal_ast::{CmdArg, Expr, Program, Stmt, UnOp};
 use shoal_journal::{Journal, JournalQuery};
-use shoal_value::Value;
+use shoal_value::{VResult, Value};
 
 use crate::maybe_strip;
 
@@ -58,13 +58,14 @@ impl TranscriptState {
         evaluator: &mut shoal_eval::Evaluator,
         value: &Value,
         started_ns: i64,
-    ) {
+    ) -> VResult<()> {
+        evaluator.record_transcript(value)?;
         let entry_id = self
             .reader
             .as_ref()
             .and_then(|journal| latest_entry_id(journal, REPL_PRINCIPAL, started_ns));
         push_out_entry(&mut self.entries, entry_id);
-        evaluator.record_transcript(value);
+        Ok(())
     }
 }
 

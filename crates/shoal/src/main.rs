@@ -203,19 +203,23 @@ fn run_source(
         let width = configured_width.unwrap_or_else(repl::terminal_width).max(1);
         let _ = repl::print_value(v, width);
     }));
-    evaluator.env_mut().declare(
-        "args",
-        Value::List(
-            args.into_iter()
-                .map(|arg| Value::Path(PathBuf::from(arg)))
-                .collect(),
-        ),
-        false,
-    );
+    evaluator
+        .env_mut()
+        .declare(
+            "args",
+            Value::List(
+                args.into_iter()
+                    .map(|arg| Value::Path(PathBuf::from(arg)))
+                    .collect(),
+            ),
+            false,
+        )
+        .map_err(|error| error.to_string())?;
     if let Some(source) = source {
         evaluator
             .env_mut()
-            .declare("script", Value::Path(source.to_path_buf()), false);
+            .declare("script", Value::Path(source.to_path_buf()), false)
+            .map_err(|error| error.to_string())?;
     }
     match evaluator.eval_program(&program) {
         Ok(value) => {

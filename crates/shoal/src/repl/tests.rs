@@ -513,7 +513,7 @@ fn production_repl_has_no_infallible_thread_launches() {
 #[test]
 fn parse_ctx_splits_values_from_callables() {
     let env = Env::root();
-    env.declare("mydata", Value::Int(3), false);
+    env.declare("mydata", Value::Int(3), false).unwrap();
     env.declare(
         "deploy",
         Value::CmdRef(Arc::new(shoal_ast::CmdCall {
@@ -527,7 +527,8 @@ fn parse_ctx_splits_values_from_callables() {
             span: shoal_ast::Span::new(0, 0),
         })),
         false,
-    );
+    )
+    .unwrap();
     let ctx = parse_ctx_for(&env);
     assert!(ctx.repl);
     assert!(ctx.value_bound.iter().any(|n| n == "mydata"));
