@@ -364,10 +364,12 @@ impl PtyJob {
     }
 
     /// `SIGCONT` the whole process group.
-    fn signal_cont(&self) {
+    fn signal_cont(&self) -> io::Result<()> {
         // SAFETY: signalling a process group is memory-safe.
-        unsafe {
-            libc::kill(-self.pgid, libc::SIGCONT);
+        if unsafe { libc::kill(-self.pgid, libc::SIGCONT) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
         }
     }
 
@@ -441,13 +443,14 @@ impl PtyJob {
 
         // On resume, continue the group now that output/input are re-attached
         // (spawning the pump first means no output is lost to the gap).
-        if resume {
-            self.signal_cont();
-        }
-
-        // Wait, observing stops (WUNTRACED). A stop does NOT reap the child.
-        let raw = waitpid_untraced(self.pid)?;
-        let stopped = is_stopped(raw);
+        // Preserve a resume/wait error, but do not return it before this
+        // serve's helpers have observed shutdown. An early `?` here strands
+        // the pump and cancellation watcher indefinitely.
+        let waited = if resume {
+            self.signal_cont().and_then(|()| waitpid_untraced(self.pid))
+        } else {
+            waitpid_untraced(self.pid)
+        };
 
         // Tear down this serve's helpers. Identical for stop and exit — the
         // master and child are always left intact; on a stop they are parked.
@@ -467,6 +470,11 @@ impl PtyJob {
         for h in helpers {
             let _ = h.join();
         }
+
+        // A stop does NOT reap the child; terminal statuses are decoded by the
+        // caller after every helper belonging to this serve has retired.
+        let raw = waited?;
+        let stopped = is_stopped(raw);
 
         Ok(if stopped {
             Wait::Stopped
@@ -1002,6 +1010,34 @@ mod tests {
         // remain a no-op (nothing left alive to mis-signal).
         job.kill_and_reap();
         assert!(job.reaped);
+    }
+
+    /// A resume can race with external termination (or an administrator
+    /// killing the process group). The failed SIGCONT must be returned and,
+    /// critically, every helper attached before that signal must still stop.
+    #[test]
+    fn failed_resume_signal_retires_serve_helpers_and_reaps() {
+        let _serial = JOB_CONTROL_TEST_LOCK.lock().unwrap();
+        let cancel = CancelToken::new();
+        let res = run_pty(sh_spec("kill -STOP $$"), &cancel).expect("run_pty");
+        let job = take_stopped_job(res.pid).expect("parked job");
+        let pgid = job.pgid;
+
+        // SAFETY: this is the stopped process group owned by `job`.
+        assert_eq!(unsafe { libc::kill(-pgid, libc::SIGKILL) }, 0);
+        waitpid_blocking(job.pid).expect("reap externally terminated child");
+        assert!(process_is_gone(res.pid));
+
+        let start = Instant::now();
+        let error = job
+            .resume_foreground(&cancel)
+            .expect_err("SIGCONT of a vanished group must fail");
+        assert_eq!(error.raw_os_error(), Some(libc::ESRCH));
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "failed resume must not strand helper threads"
+        );
+        assert!(process_is_gone(res.pid), "the dead child must be reaped");
     }
 
     /// `resume_background`: `SIGCONT` lets the job finish off the calling
