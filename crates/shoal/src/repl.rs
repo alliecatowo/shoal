@@ -336,20 +336,26 @@ pub(crate) fn repl(standalone: bool) -> Result<i32, String> {
     if config.history.enabled
         && let Some(path) = config.history.path.clone().or_else(history_path)
     {
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        if let Ok(history) = FileBackedHistory::with_file(config.history.max_entries, path) {
-            // `history.dedup`/`history.ignore` (site/content/internals/configuration-reference.md):
-            // `FileBackedHistory` has no built-in filtering, so wrap it in a
-            // thin `History` adapter that applies both before ever calling
-            // through to `save`.
-            let history = FilteredHistory::new(
-                Box::new(history),
-                config.history.dedup,
-                config.history.ignore.clone(),
-            );
-            editor = editor.with_history(Box::new(history));
+        match open_history(config.history.max_entries, &path) {
+            Ok(history) => {
+                // `history.dedup`/`history.ignore` (site/content/internals/configuration-reference.md):
+                // `FileBackedHistory` has no built-in filtering, so wrap it in a
+                // thin `History` adapter that applies both before ever calling
+                // through to `save`.
+                let history = FilteredHistory::new(
+                    Box::new(history),
+                    config.history.dedup,
+                    config.history.ignore.clone(),
+                );
+                editor = editor.with_history(Box::new(history));
+            }
+            Err(error) => eprintln!(
+                "{}",
+                maybe_strip(format!(
+                    "\x1b[33;1mwarning:\x1b[0m history unavailable ({}): {error}",
+                    path.display()
+                ))
+            ),
         }
     }
 
@@ -520,6 +526,18 @@ pub(crate) fn repl(standalone: bool) -> Result<i32, String> {
             Err(error) => return Err(format!("line editor failed: {error}")),
         }
     }
+}
+
+fn open_history(max_entries: usize, path: &std::path::Path) -> Result<FileBackedHistory, String> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("cannot create history directory: {error}"))?;
+    }
+    FileBackedHistory::with_file(max_entries, path.to_path_buf())
+        .map_err(|error| format!("cannot open history file: {error}"))
 }
 
 /// Principal/session recorded on the REPL's own journal entries (site/content/internals/language-conformance-contract.md). A
@@ -1199,6 +1217,16 @@ mod tests {
         assert!(glob_match("*", ""));
         assert!(glob_match("exact", "exact"));
         assert!(!glob_match("exact", "exactly"));
+    }
+
+    #[test]
+    fn open_history_reports_an_uncreatable_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocking_file = dir.path().join("not-a-directory");
+        fs::write(&blocking_file, b"x").unwrap();
+        let error = open_history(100, &blocking_file.join("history"))
+            .expect_err("a file cannot be used as a history parent directory");
+        assert!(error.contains("cannot create history directory"), "{error}");
     }
 
     /// `history.dedup` (site/content/internals/configuration-reference.md): a line identical to the
