@@ -11,6 +11,24 @@ use crate::{Journal, OutputMeta, OutputRow, hash_string, hex_bytes};
 /// [`JournalQuery::limit`] is `0`.
 const DEFAULT_QUERY_LIMIT: usize = 100;
 
+fn sql_i64_from_usize(value: usize) -> rusqlite::Result<i64> {
+    i64::try_from(value).map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+}
+
+fn sql_i64_from_u64(value: u64) -> rusqlite::Result<i64> {
+    i64::try_from(value).map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+}
+
+fn count_as_u64(value: i64) -> rusqlite::Result<u64> {
+    u64::try_from(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Integer,
+            Box::new(error),
+        )
+    })
+}
+
 /// A fully materialized journal entry as returned by [`Journal::query`].
 ///
 /// `dur_ns`, `status`, and `ok` are `None` for entries that were appended but
@@ -45,6 +63,15 @@ pub struct EntryRow {
     pub outputs: Vec<OutputRow>,
 }
 
+/// Bounded cursor state used to lazily hydrate one durable event channel.
+/// `published` is the full historical count; `tail_entry_ids` contains only
+/// the newest caller-requested pointers, in ascending sequence order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableEventSeed {
+    pub published: u64,
+    pub tail_entry_ids: Vec<i64>,
+}
+
 /// Filter set for [`Journal::query`]. `Default` matches everything with the
 /// default limit.
 #[derive(Default)]
@@ -65,6 +92,71 @@ pub struct JournalQuery {
 }
 
 impl Journal {
+    /// Count coarse exec-level journal events for one exact owner and return
+    /// only the newest `tail_limit` pointers. Whole-program entries serialize
+    /// with a top-level `stmts` array; evaluator per-statement rows do not.
+    pub fn journal_event_seed(
+        &self,
+        principal: &str,
+        session: &str,
+        tail_limit: usize,
+    ) -> rusqlite::Result<DurableEventSeed> {
+        let published: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM entry
+              WHERE principal = ?1 AND session = ?2
+                AND json_type(ast, '$.stmts') = 'array'",
+            rusqlite::params![principal, session],
+            |row| row.get(0),
+        )?;
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM entry
+              WHERE principal = ?1 AND session = ?2
+                AND json_type(ast, '$.stmts') = 'array'
+              ORDER BY id DESC LIMIT ?3",
+        )?;
+        let mut tail_entry_ids = stmt
+            .query_map(
+                rusqlite::params![principal, session, sql_i64_from_usize(tail_limit)?],
+                |row| row.get(0),
+            )?
+            .collect::<rusqlite::Result<Vec<i64>>>()?;
+        tail_entry_ids.reverse();
+        Ok(DurableEventSeed {
+            published: count_as_u64(published)?,
+            tail_entry_ids,
+        })
+    }
+
+    /// Resolve an exact half-open sequence page for one owner's durable
+    /// `journal` channel without materializing preceding history.
+    pub fn journal_event_entry_ids(
+        &self,
+        principal: &str,
+        session: &str,
+        start_seq: u64,
+        limit: usize,
+    ) -> rusqlite::Result<Vec<i64>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM entry
+              WHERE principal = ?1 AND session = ?2
+                AND json_type(ast, '$.stmts') = 'array'
+              ORDER BY id ASC LIMIT ?3 OFFSET ?4",
+        )?;
+        stmt.query_map(
+            rusqlite::params![
+                principal,
+                session,
+                sql_i64_from_usize(limit)?,
+                sql_i64_from_u64(start_seq)?
+            ],
+            |row| row.get(0),
+        )?
+        .collect()
+    }
+
     /// Whether `hash` is linked from an output row owned by the exact
     /// principal-private session. This is the authorization lookup used before
     /// serving CAS bytes over `blob.get`; it avoids materializing an owner's

@@ -25,7 +25,25 @@
 use rusqlite::{ToSql, params};
 use std::collections::HashMap;
 
-use crate::Journal;
+use crate::{DurableEventSeed, Journal};
+
+fn sql_i64_from_usize(value: usize) -> rusqlite::Result<i64> {
+    i64::try_from(value).map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+}
+
+fn sql_i64_from_u64(value: u64) -> rusqlite::Result<i64> {
+    i64::try_from(value).map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+}
+
+fn count_as_u64(value: i64) -> rusqlite::Result<u64> {
+    u64::try_from(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Integer,
+            Box::new(error),
+        )
+    })
+}
 
 /// One durably-stored `session.transcript` channel event, keyed by the
 /// journal `entry_id` of the exec that produced it.
@@ -44,6 +62,71 @@ pub struct TranscriptEventRow {
 }
 
 impl Journal {
+    /// Count and retain only the newest transcript-event pointers for one
+    /// exact owner. The join supplies principal/session isolation while the
+    /// transcript table itself is the exact channel membership set.
+    pub fn transcript_event_seed(
+        &self,
+        principal: &str,
+        session: &str,
+        tail_limit: usize,
+    ) -> rusqlite::Result<DurableEventSeed> {
+        let published: i64 = self.conn.query_row(
+            "SELECT COUNT(*)
+               FROM transcript_event t JOIN entry e ON e.id = t.entry_id
+              WHERE e.principal = ?1 AND e.session = ?2",
+            params![principal, session],
+            |row| row.get(0),
+        )?;
+        let mut stmt = self.conn.prepare(
+            "SELECT t.entry_id
+               FROM transcript_event t JOIN entry e ON e.id = t.entry_id
+              WHERE e.principal = ?1 AND e.session = ?2
+              ORDER BY t.entry_id DESC LIMIT ?3",
+        )?;
+        let mut tail_entry_ids = stmt
+            .query_map(
+                params![principal, session, sql_i64_from_usize(tail_limit)?],
+                |row| row.get(0),
+            )?
+            .collect::<rusqlite::Result<Vec<i64>>>()?;
+        tail_entry_ids.reverse();
+        Ok(DurableEventSeed {
+            published: count_as_u64(published)?,
+            tail_entry_ids,
+        })
+    }
+
+    /// Resolve an exact forward sequence page for one owner's transcript
+    /// channel. OFFSET is the channel sequence, not the journal row id.
+    pub fn transcript_event_entry_ids(
+        &self,
+        principal: &str,
+        session: &str,
+        start_seq: u64,
+        limit: usize,
+    ) -> rusqlite::Result<Vec<i64>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT t.entry_id
+               FROM transcript_event t JOIN entry e ON e.id = t.entry_id
+              WHERE e.principal = ?1 AND e.session = ?2
+              ORDER BY t.entry_id ASC LIMIT ?3 OFFSET ?4",
+        )?;
+        stmt.query_map(
+            params![
+                principal,
+                session,
+                sql_i64_from_usize(limit)?,
+                sql_i64_from_u64(start_seq)?
+            ],
+            |row| row.get(0),
+        )?
+        .collect()
+    }
+
     /// Persist a `session.transcript` event's payload for `entry_id`
     /// (site/content/internals/kernel-protocol.md). Called once, right after the corresponding
     /// `journal` event is published for the same entry — only the

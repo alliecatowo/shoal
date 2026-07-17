@@ -56,7 +56,7 @@ mod undo;
 
 pub use cas::{Cas, JournalOptions, OutputMeta, OutputRow};
 pub use gc::{GcBlob, GcOptions, GcReport};
-pub use query::{EntryRow, JournalQuery};
+pub use query::{DurableEventSeed, EntryRow, JournalQuery};
 pub use schema::EntryRecord;
 pub use transcript::TranscriptEventRow;
 pub use undo::{FileFingerprint, UndoError, UndoInverse, UndoIo, UndoReport, UndoStatus, UndoStep};

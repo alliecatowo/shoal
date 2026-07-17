@@ -301,9 +301,12 @@ coalesces dropped counts and the latest sequence so slow readers can detect gaps
 stalled client from blocking producers or other subscribers, but the one-thread-per-subscription
 model is a scaling boundary.
 
-Only `journal` and `session.transcript` have durable replay reconstruction through journal-backed
-indexes. Approval, render, task, and `user.*` channels are ring-only and lose old events/restart
-state. A cursor read from durable channels can recover events older than the 1024-event ring.
+Only `journal` and `session.transcript` have durable replay reconstruction. Their in-memory pointer
+windows are capped at 1,024 per exact owner; older bounded pages resolve from the journal. Owners are
+hydrated lazily on first use, so kernel startup never loads every historical event. `events.read`
+returns at most 256 events and 8 MiB per forward page; follow `page.next_since` while
+`page.truncated` is true. Approval, render, task, and `user.*` channels are ring-only and report
+`page.history_lost` when the requested cursor predates their retained tail.
 
 Language `channel("user.x").emit(value)` reaches the wire bus through the session forwarder. Both
 layers enforce the `user.*` namespace so language code cannot spoof kernel-owned semantic channels.

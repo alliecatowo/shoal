@@ -485,15 +485,18 @@ capacity, events coalesce into `{dropped,latest_seq}` rather than growing withou
 
 | Method | Params | Result/behavior |
 |---|---|---|
-| `events.read` | `{channel,since?,limit?}` | `{channel,events}`; `since` is exclusive |
+| `events.read` | `{channel,since?,limit?}` | `{channel,events,page}`; forward page, `since` exclusive; omitted limit 256, zero empty, maximum 256 |
 | `events.publish` | `{channel,payload}` | only `user.*`; returns channel/seq/ts and injects language bus |
 | `events.subscribe` | `{channel,since?}` | registers this connection; replays ring then pushes notifications |
 | `events.unsubscribe` | `{channel,since?}` | closes/removes this connection/channel queue; `since` ignored |
 
-`journal` and `session.transcript` have durable cold replay. The bus keeps dense seq→entry-ID indexes,
-reseeded from journal data at kernel open. A request older than the ring reconstructs those events and
-then appends the live ring tail. `approval`, `render`, task, and `user.*` channels are ring-only and
-lose history/restart sequence.
+`journal` and `session.transcript` have durable cold replay. Kernel open does no historical scan. The
+first attach/read/exec for an exact principal/session hydrates its full published count and at most the
+newest 1,024 seq→entry-ID pointers; older forward pages resolve their bounded ID range directly from
+the journal. `page.next_since` continues a truncated page, while `page.history_lost` distinguishes a
+ring-only cursor older than `oldest_available`. A page is also bounded to 8 MiB of encoded events;
+an individually oversized payload becomes an explicit `payload_truncated` marker without losing its
+sequence cursor. Approval, render, task, and `user.*` channels are ring-only and lose old history.
 
 `events.publish` rejects kernel-owned names and mirrors the JSON payload into the attached evaluator's
 language EventBus without holding the evaluator lock. Language-originated `user.*` emits take the

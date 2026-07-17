@@ -814,6 +814,7 @@ impl Kernel {
         let name = params.session.unwrap_or_else(|| "default".into());
         let session = self.session(&name, &who)?;
         session.ensure_healthy()?;
+        self.ensure_event_owner(&session.key.owner())?;
         let cwd = session.lock_evaluator()?.cwd().as_os_str().to_owned();
         // A connection may reattach to another principal-private session.
         // Subscriptions belong to the previous owner and must not silently

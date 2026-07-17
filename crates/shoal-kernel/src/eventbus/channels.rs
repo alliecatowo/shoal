@@ -51,13 +51,17 @@ impl ChannelRegistry {
             .entry((owner.clone(), channel.to_string()))
             .or_default();
         let seq = buffer.next_seq;
-        buffer.next_seq += 1;
+        let Some(next_seq) = seq.checked_add(1) else {
+            self.quarantined.store(true, Ordering::Release);
+            return quarantined_event(channel, payload);
+        };
         if let Some((which, entry_id)) = durable
             && !durable_indexes.append(which, owner, seq, entry_id)
         {
             self.quarantined.store(true, Ordering::Release);
             return quarantined_event(channel, payload);
         }
+        buffer.next_seq = next_seq;
         let event = Event {
             channel: channel.to_string(),
             seq,
@@ -109,18 +113,31 @@ impl ChannelRegistry {
         let Some(buffer) = buffers.get(&(owner.clone(), channel.to_string())) else {
             return Vec::new();
         };
-        let mut events: Vec<Event> = buffer
+        let events: Vec<Event> = buffer
             .ring
             .iter()
             .filter(|event| since.is_none_or(|seq| event.seq > seq))
+            .take(limit.unwrap_or(usize::MAX))
             .cloned()
             .collect();
-        if let Some(limit) = limit
-            && events.len() > limit
-        {
-            events = events.split_off(events.len() - limit);
-        }
         events
+    }
+
+    pub(super) fn next_seq(&self, owner: &OwnerKey, channel: &str) -> u64 {
+        if self.is_quarantined() {
+            return 0;
+        }
+        let Ok(_coordination) = self.coordination.lock() else {
+            self.quarantined.store(true, Ordering::Release);
+            return 0;
+        };
+        let Ok(buffers) = self.buffers.lock() else {
+            self.quarantined.store(true, Ordering::Release);
+            return 0;
+        };
+        buffers
+            .get(&(owner.clone(), channel.to_string()))
+            .map_or(0, |buffer| buffer.next_seq)
     }
 
     pub(super) fn remove_owner(&self, durable_indexes: &DurableIndexes, owner: &OwnerKey) {
@@ -147,30 +164,30 @@ impl ChannelRegistry {
         durable_channel: DurableChannel,
         owner: &OwnerKey,
         channel: &str,
+        published: u64,
         entry_ids: &[i64],
-    ) {
-        if entry_ids.is_empty() {
-            return;
-        }
+    ) -> bool {
         if self.is_quarantined() || durable_indexes.is_quarantined() {
-            return;
+            return false;
         }
         let Ok(_coordination) = self.coordination.lock() else {
             self.quarantined.store(true, Ordering::Release);
-            return;
+            return false;
         };
         let Ok(mut buffers) = self.buffers.lock() else {
             self.quarantined.store(true, Ordering::Release);
-            return;
+            return false;
         };
-        let Some(next_seq) = durable_indexes.seed(durable_channel, owner, entry_ids) else {
+        let Some(next_seq) = durable_indexes.seed(durable_channel, owner, published, entry_ids)
+        else {
             self.quarantined.store(true, Ordering::Release);
-            return;
+            return false;
         };
         buffers
             .entry((owner.clone(), channel.to_string()))
             .or_default()
             .next_seq = next_seq;
+        true
     }
 
     pub(super) fn durable_len(
@@ -187,6 +204,22 @@ impl ChannelRegistry {
             return 0;
         };
         durable_indexes.len(durable_channel, owner)
+    }
+
+    pub(super) fn durable_is_initialized(
+        &self,
+        durable_indexes: &DurableIndexes,
+        durable_channel: DurableChannel,
+        owner: &OwnerKey,
+    ) -> bool {
+        if self.is_quarantined() || durable_indexes.is_quarantined() {
+            return false;
+        }
+        let Ok(_coordination) = self.coordination.lock() else {
+            self.quarantined.store(true, Ordering::Release);
+            return false;
+        };
+        durable_indexes.is_initialized(durable_channel, owner)
     }
 
     pub(super) fn durable_range(

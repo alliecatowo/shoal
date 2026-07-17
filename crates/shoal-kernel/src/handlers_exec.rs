@@ -13,6 +13,7 @@ impl Kernel {
     ) -> Result<Json, RpcError> {
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
         let session = &attachment.session;
+        self.ensure_event_owner(&session.key.owner())?;
         let actor = attachment.principal.clone();
         let interactive =
             attachment.tty && attachment.connection_trust == ConnectionTrust::EmbeddedHuman;

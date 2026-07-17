@@ -1089,6 +1089,35 @@ fn call(
     std::io::BufRead::read_line(reader, &mut line).unwrap();
     serde_json::from_str(&line).unwrap()
 }
+
+fn read_all_events(
+    writer: &mut UnixStream,
+    reader: &mut BufReader<UnixStream>,
+    mut id: i64,
+    channel: &str,
+    since: Option<u64>,
+) -> Vec<Json> {
+    let mut cursor = since;
+    let mut all = Vec::new();
+    loop {
+        let response = call(
+            writer,
+            reader,
+            id,
+            "events.read",
+            json!({"channel":channel,"since":cursor,"limit":usize::MAX}),
+        );
+        id += 1;
+        let result = response.result.expect("events.read page");
+        all.extend(result["events"].as_array().unwrap().iter().cloned());
+        if !result["page"]["truncated"].as_bool().unwrap() {
+            break;
+        }
+        cursor = result["page"]["next_since"].as_u64();
+        assert!(cursor.is_some(), "a truncated non-empty page has a cursor");
+    }
+    all
+}
 #[test]
 fn unix_stream_session_roundtrip() {
     let (mut client, server) = UnixStream::pair().unwrap();
@@ -3408,14 +3437,7 @@ fn journal_channel_replays_aged_out_events_from_the_journal() {
     // still retained). Reading since=0 must still return every event after
     // seq 0 — the aged-out ones rebuilt from the journal, then the ring
     // tail — contiguous across the ring boundary.
-    let read = call(
-        &mut client,
-        &mut reader,
-        9001,
-        "events.read",
-        json!({"channel":"journal","since":0}),
-    );
-    let events = read.result.unwrap()["events"].as_array().unwrap().clone();
+    let events = read_all_events(&mut client, &mut reader, 9001, "journal", Some(0));
     assert_eq!(
         events.len(),
         total - 1,
@@ -3451,8 +3473,8 @@ fn journal_channel_replays_aged_out_events_from_the_journal() {
         );
     }
 
-    // A `limit` still bounds the result to the newest N even when the
-    // fallback contributed older events.
+    // A `limit` is a forward page from the exclusive cursor, so callers can
+    // continue without the old newest-tail behavior skipping history.
     let limited = call(
         &mut client,
         &mut reader,
@@ -3464,8 +3486,9 @@ fn journal_channel_replays_aged_out_events_from_the_journal() {
         .as_array()
         .unwrap()
         .clone();
-    assert_eq!(limited.len(), 5, "limit keeps the newest 5");
-    assert_eq!(limited[4]["seq"].as_u64().unwrap(), (total - 1) as u64);
+    assert_eq!(limited.len(), 5, "limit returns the next 5");
+    assert_eq!(limited[0]["seq"].as_u64().unwrap(), 1);
+    assert_eq!(limited[4]["seq"].as_u64().unwrap(), 5);
 
     // Not-found / beyond-newest: since at or past the newest seq is empty,
     // never an error.
@@ -3568,14 +3591,7 @@ fn journal_channel_replay_excludes_evaluator_per_statement_entries() {
     // Replay from seq 0 (aged out): EXACTLY one event per exec, contiguous
     // seqs, each the coarse whole-submission entry (head "let") — no
     // phantom per-statement events.
-    let read = call(
-        &mut client,
-        &mut reader,
-        9001,
-        "events.read",
-        json!({"channel":"journal","since":0}),
-    );
-    let events = read.result.unwrap()["events"].as_array().unwrap().clone();
+    let events = read_all_events(&mut client, &mut reader, 9001, "journal", Some(0));
     assert_eq!(
         events.len(),
         execs - 1,
@@ -3633,14 +3649,13 @@ fn session_transcript_channel_replays_aged_out_events_from_the_journal() {
     // every event after seq 0 — the aged-out ones rebuilt from the
     // journal's `transcript_event` table, then the ring tail —
     // contiguous across the ring boundary.
-    let read = call(
+    let events = read_all_events(
         &mut client,
         &mut reader,
         9001,
-        "events.read",
-        json!({"channel":"session.transcript","since":0}),
+        "session.transcript",
+        Some(0),
     );
-    let events = read.result.unwrap()["events"].as_array().unwrap().clone();
     assert_eq!(
         events.len(),
         total - 1,
@@ -3671,8 +3686,7 @@ fn session_transcript_channel_replays_aged_out_events_from_the_journal() {
         );
     }
 
-    // A `limit` still bounds the result to the newest N even when the
-    // fallback contributed older events.
+    // A `limit` is a forward page from the exclusive cursor.
     let limited = call(
         &mut client,
         &mut reader,
@@ -3684,8 +3698,9 @@ fn session_transcript_channel_replays_aged_out_events_from_the_journal() {
         .as_array()
         .unwrap()
         .clone();
-    assert_eq!(limited.len(), 5, "limit keeps the newest 5");
-    assert_eq!(limited[4]["seq"].as_u64().unwrap(), (total - 1) as u64);
+    assert_eq!(limited.len(), 5, "limit returns the next 5");
+    assert_eq!(limited[0]["seq"].as_u64().unwrap(), 1);
+    assert_eq!(limited[4]["seq"].as_u64().unwrap(), 5);
 
     // Not-found / beyond-newest: since at or past the newest seq is
     // empty, never an error.
@@ -3785,14 +3800,13 @@ fn session_transcript_channel_replay_skips_entries_with_no_transcript_row() {
         expected_refs.len()
     );
 
-    let read = call(
+    let events = read_all_events(
         &mut client,
         &mut reader,
         9001,
-        "events.read",
-        json!({"channel":"session.transcript","since":0}),
+        "session.transcript",
+        Some(0),
     );
-    let events = read.result.unwrap()["events"].as_array().unwrap().clone();
     // since=0 excludes seq 0 itself (the first successful exec's own
     // transcript event) — every OTHER successful exec's event must
     // appear, in order, contiguous, with none for a failed exec.

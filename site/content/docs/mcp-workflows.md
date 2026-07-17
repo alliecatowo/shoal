@@ -342,13 +342,15 @@ Pseudocode:
 
 ```text
 cursor = durable_load(channel)
-events = read(channel, since=cursor)
-for event in events ordered by seq:
-    if event.seq <= cursor: continue
-    if event.seq != cursor + 1: reconcile()
-    handle_idempotently(event)
-    durable_store(event.seq)
-    cursor = event.seq
+do:
+    page = read(channel, since=cursor)
+    for event in page.events ordered by seq:
+        if event.seq <= cursor: continue
+        if event.seq != cursor + 1: reconcile()
+        handle_idempotently(event)
+        durable_store(event.seq)
+        cursor = event.seq
+while page.truncated
 subscribe(channel)
 ```
 

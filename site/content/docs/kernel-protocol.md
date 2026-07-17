@@ -542,7 +542,7 @@ Then the same connection receives:
 }
 ```
 
-Replay from `since` is enqueued through the same 256-entry subscriber queue as live events. Overflow emits a synthetic `{dropped, latest_seq}` payload. `journal` and `session.transcript` support journal-backed older replay; other channels retain only 1,024 in memory.
+Replay from `since` is enqueued through the same 256-entry subscriber queue as live events. Overflow emits a synthetic `{dropped, latest_seq}` payload. Pull-based `events.read` returns forward pages of at most 256 events (and 8 MiB); continue with `page.next_since`. `journal` and `session.transcript` support journal-backed older replay with bounded in-memory pointer windows; other channels retain only 1,024 in memory.
 
 ### Unsubscribe
 

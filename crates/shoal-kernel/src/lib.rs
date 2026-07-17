@@ -184,14 +184,6 @@ impl Kernel {
         let journal = Journal::open(state_dir)?;
         let events = EventBus::default();
         let limits = Limits::default();
-        // Reopening an EXISTING on-disk store must resume its
-        // `journal`/`session.transcript` seq state, not restart both at 0 —
-        // see `EventBus::seed_from_journal` for why (a reconnecting agent's
-        // persisted `since=N` cursor would otherwise collide with a
-        // brand-new seq the freshly-restarted kernel hands out starting
-        // from 0 again). A fresh, empty store is a no-op: both channels
-        // correctly still start at 0.
-        events.seed_from_journal(&journal);
         Ok(Arc::new(Self {
             sessions: SessionRegistry::new(limits.max_sessions),
             connections: ConnectionRegistry::new(
@@ -233,8 +225,6 @@ impl Kernel {
         let journal = Journal::open(state_dir)?;
         let events = EventBus::default();
         let limits = Limits::default();
-        // Same restart-seq-continuity fix as `Kernel::open` above.
-        events.seed_from_journal(&journal);
         Ok(Arc::new(Self {
             sessions: SessionRegistry::new(limits.max_sessions),
             connections: ConnectionRegistry::new(

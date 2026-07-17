@@ -708,8 +708,13 @@ pub struct JournalQueryParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventsReadParams {
     pub channel: String,
+    /// Exclusive cursor. A bounded response reports `page.next_since` when
+    /// more events remain; pass that value back to continue forward.
     #[serde(default)]
     pub since: Option<u64>,
+    /// Requested forward-page length. Omitted uses the server default,
+    /// explicit zero returns no events, and oversized values are clamped to
+    /// the server maximum before any journal query or allocation.
     #[serde(default)]
     pub limit: Option<usize>,
 }

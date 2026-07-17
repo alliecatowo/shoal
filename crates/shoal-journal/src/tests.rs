@@ -715,6 +715,57 @@ fn entries_by_id_joins_outputs_like_query_does() {
 }
 
 #[test]
+fn durable_event_seed_and_ranges_are_owner_scoped_and_bounded() {
+    let j = Journal::in_memory().unwrap();
+    let mut coarse_ids = Vec::new();
+    for n in 0..6 {
+        let mut entry = rec("s", "human", n, "return");
+        entry.ast_json = r#"{"stmts":[]}"#.into();
+        let id = j.append(&entry).unwrap();
+        j.finish(id, Some(0), true, 1).unwrap();
+        if n % 2 == 0 {
+            j.record_transcript_event(id, n, "{}").unwrap();
+        }
+        coarse_ids.push(id);
+        // A valid evaluator-style statement row must never consume a journal
+        // channel sequence.
+        let fine = j.append(&rec("s", "human", n, "fine")).unwrap();
+        j.finish(fine, Some(0), true, 1).unwrap();
+    }
+    let mut foreign = rec("s", "agent:other", 99, "return");
+    foreign.ast_json = r#"{"stmts":[]}"#.into();
+    j.append(&foreign).unwrap();
+
+    let seed = j.journal_event_seed("human", "s", 2).unwrap();
+    assert_eq!(seed.published, 6);
+    assert_eq!(seed.tail_entry_ids, coarse_ids[4..]);
+    assert_eq!(
+        j.journal_event_entry_ids("human", "s", 1, 3).unwrap(),
+        coarse_ids[1..4]
+    );
+
+    let transcript = j.transcript_event_seed("human", "s", 2).unwrap();
+    assert_eq!(transcript.published, 3);
+    assert_eq!(
+        transcript.tail_entry_ids,
+        vec![coarse_ids[2], coarse_ids[4]]
+    );
+    assert_eq!(
+        j.transcript_event_entry_ids("human", "s", 1, 2).unwrap(),
+        vec![coarse_ids[2], coarse_ids[4]]
+    );
+    assert!(
+        j.journal_event_entry_ids("human", "s", u64::MAX, 1)
+            .is_err(),
+        "sequence offsets must never wrap through an unchecked SQL cast"
+    );
+    assert!(
+        j.journal_event_seed("human", "s", usize::MAX).is_err(),
+        "host-sized limits must be checked before binding to SQLite"
+    );
+}
+
+#[test]
 fn transcript_event_record_and_fetch_by_entry_in_order() {
     let j = Journal::in_memory().unwrap();
     let a = j.append(&rec("s", "human", 1, "let x = 1")).unwrap();

@@ -9,7 +9,7 @@ mod durable;
 mod subscriptions;
 
 use channels::ChannelRegistry;
-use durable::{DurableChannel, DurableIndexes};
+use durable::{DURABLE_POINTER_CAP, DurableChannel, DurableIndexes};
 pub(crate) use subscriptions::SharedWriter;
 use subscriptions::SubscriptionRegistry;
 #[cfg(test)]
@@ -27,6 +27,13 @@ pub(crate) struct EventBus {
 
 /// Ring depth per channel (site/content/internals/kernel-protocol.md requires ≥1024).
 pub(crate) const EVENT_RING_CAP: usize = 1024;
+
+/// Default and absolute row ceilings for one pull page. Byte bounding below
+/// is a second wall: a handful of hostile large payloads cannot evade this
+/// cap and produce an oversized JSON-RPC response.
+pub(crate) const EVENTS_DEFAULT_PAGE: usize = 256;
+pub(crate) const EVENTS_MAX_PAGE: usize = 256;
+const EVENTS_MAX_CONTENT_BYTES: usize = MAX_FRAME_LEN / 2;
 
 /// The static channels a session may always subscribe to (site/content/internals/kernel-protocol.md).
 /// `task.{id}` and `user.{name}` are dynamic and not listed here.
@@ -199,6 +206,10 @@ impl EventBus {
         self.channels.read(owner, channel, since, limit)
     }
 
+    fn published_count(&self, owner: &OwnerKey, channel: &str) -> u64 {
+        self.channels.next_seq(owner, channel)
+    }
+
     /// Register `writer` as a subscriber to `channel` (idempotent per
     /// `(conn, channel)` — re-subscribing finds the existing queue). Any
     /// already-buffered events after `since` are merged into the same bounded
@@ -252,125 +263,141 @@ impl EventBus {
         self.subscriptions.len()
     }
 
-    /// Rebuild `journal`/`session.transcript` seq state from an EXISTING
-    /// on-disk journal's rows (`site/content/internals/kernel-protocol.md` requires replay from
-    /// ANY seq" promise): called once, by `Kernel::open`/`open_with_policy`,
-    /// BEFORE the kernel starts serving any connection — so a freshly-built
-    /// `EventBus::default()` re-mounting a store a PRIOR kernel process
-    /// already wrote to starts both channels' seq counters past whatever
-    /// that prior lifetime handed out, instead of colliding a reconnecting
-    /// agent's persisted `since=N` cursor with a brand-new seq climbing from
-    /// 0 again.
-    ///
-    /// Precisely reconstructs the SAME membership `publish_journal`/
-    /// `publish_transcript` would have built incrementally in memory during
-    /// the prior lifetime, from durable state alone — no schema change, no
-    /// touching `shoal-journal`:
-    /// - `journal`: an entry is a coarse, whole-submission entry (the kind
-    ///   `handle_exec` appends exactly once per `exec` call — the ONLY kind
-    ///   that ever fires a `journal` event) iff its `ast` column
-    ///   deserializes as a [`shoal_ast::Program`], the shape `handle_exec`
-    ///   always records there (`serde_json::to_string(&ast)` where `ast:
-    ///   Program`). A session's own evaluator instead journals one entry per
-    ///   top-level STATEMENT (`shoal-eval`'s `journal_begin_stmt`), each
-    ///   recording a bare [`shoal_ast::Stmt`] (internally tagged `kind`, no
-    ///   `stmts` field) — that shape fails to deserialize as a `Program`, so
-    ///   those rows are correctly excluded, exactly as the in-memory index
-    ///   already excluded them within one process lifetime (pinned by
-    ///   `journal_channel_replay_excludes_evaluator_per_statement_entries`).
-    /// - `session.transcript`: exactly the coarse entries (from the filter
-    ///   above) that also have a persisted `transcript_event` row —
-    ///   `Journal::transcript_events_by_entry` already silently skips any id
-    ///   without one (the error-exec path never records one), so this is
-    ///   precisely the successful-exec subset, in the same ascending order
-    ///   the live channel always assigned.
-    ///
-    /// Both indexes are seeded oldest-first (seq 0 == the earliest surviving
-    /// entry), in ascending entry-id order — the same order concurrent
-    /// `handle_exec` calls assign seqs in live, since a publish always
-    /// follows its own entry's append.
-    ///
-    /// Best-effort: a query failure (corrupt store, I/O error) leaves the
-    /// affected channel(s) seeded at zero — no worse than before this fix,
-    /// never a hard failure of kernel construction. An empty store is a
-    /// no-op: both channels correctly start at 0, same as an ephemeral
-    /// in-memory kernel.
-    pub(crate) fn seed_from_journal(&self, journal: &Journal) {
-        let Ok(mut entries) = journal.query(&JournalQuery {
-            // The whole store, oldest-to-newest once reversed below — the
-            // only way to enumerate every existing row through the existing
-            // filtered-query API (there is no dedicated count/list-ids call,
-            // and adding one is a `shoal-journal` schema/API change out of
-            // this fix's lane).
-            limit: i64::MAX as usize,
-            ..Default::default()
-        }) else {
-            return;
-        };
-        if entries.is_empty() {
-            return;
+    /// Lazily hydrate one exact owner. Kernel construction remains O(1): no
+    /// historical row is loaded until that owner first attaches/reads/execs,
+    /// and even then only a count plus the newest bounded pointer window is
+    /// retained. Older seq pages are resolved directly from the journal.
+    pub(crate) fn seed_owner_from_journal(
+        &self,
+        journal: &Journal,
+        owner: &OwnerKey,
+    ) -> Result<(), String> {
+        if self
+            .channels
+            .durable_is_initialized(&self.durable, DurableChannel::Journal, owner)
+            && self.channels.durable_is_initialized(
+                &self.durable,
+                DurableChannel::Transcript,
+                owner,
+            )
+        {
+            return Ok(());
         }
-        // `query` is newest-first (`ORDER BY id DESC`); every index here is
-        // oldest-first.
-        entries.reverse();
-        let coarse: Vec<(i64, OwnerKey)> = entries
-            .iter()
-            .filter(|e| serde_json::from_str::<Program>(&e.ast_json).is_ok())
-            .map(|e| (e.id, SessionKey::new(&e.principal, &e.session).owner()))
-            .collect();
-        let mut journal_groups: HashMap<OwnerKey, Vec<i64>> = HashMap::new();
-        for (entry_id, owner) in &coarse {
-            journal_groups
-                .entry(owner.clone())
-                .or_default()
-                .push(*entry_id);
-        }
-        for (owner, entry_ids) in &journal_groups {
-            self.seed_index(DurableChannel::Journal, owner, "journal", entry_ids);
-        }
-        let coarse_ids: Vec<i64> = coarse.iter().map(|(entry_id, _)| *entry_id).collect();
-        if let Ok(rows) = journal.transcript_events_by_entry(&coarse_ids) {
-            let owners: HashMap<i64, OwnerKey> = coarse.into_iter().collect();
-            let mut transcript_groups: HashMap<OwnerKey, Vec<i64>> = HashMap::new();
-            for row in &rows {
-                if let Some(owner) = owners.get(&row.entry_id) {
-                    transcript_groups
-                        .entry(owner.clone())
-                        .or_default()
-                        .push(row.entry_id);
-                }
-            }
-            for (owner, entry_ids) in &transcript_groups {
-                self.seed_index(
-                    DurableChannel::Transcript,
-                    owner,
-                    "session.transcript",
-                    entry_ids,
-                );
-            }
-        }
+        let journal_seed = journal
+            .journal_event_seed(&owner.0.principal, &owner.0.name, DURABLE_POINTER_CAP)
+            .map_err(|error| error.to_string())?;
+        let transcript_seed = journal
+            .transcript_event_seed(&owner.0.principal, &owner.0.name, DURABLE_POINTER_CAP)
+            .map_err(|error| error.to_string())?;
+        self.seed_index(
+            DurableChannel::Journal,
+            owner,
+            "journal",
+            journal_seed.published,
+            &journal_seed.tail_entry_ids,
+        )?;
+        self.seed_index(
+            DurableChannel::Transcript,
+            owner,
+            "session.transcript",
+            transcript_seed.published,
+            &transcript_seed.tail_entry_ids,
+        )?;
+        Ok(())
     }
 
-    /// Shared seeding step for one durable index (see
-    /// [`EventBus::seed_from_journal`]): append `entry_ids` (already
-    /// ascending, already the exact membership for `channel`) and set that
-    /// channel's `next_seq` to match, so the first post-restart publish
-    /// continues from N rather than colliding with seq 0..N-1. Only ever
-    /// called before this bus is shared with a serving kernel, so there is
-    /// no concurrent publish to race with.
+    /// Shared hydration step for one durable index: install its full count
+    /// and bounded ascending tail, then set the channel's `next_seq` so the
+    /// first post-restart publish continues from N.
     fn seed_index(
         &self,
         durable_channel: DurableChannel,
         owner: &OwnerKey,
         channel: &str,
+        published: u64,
         entry_ids: &[i64],
-    ) {
+    ) -> Result<(), String> {
         self.channels
-            .seed_durable(&self.durable, durable_channel, owner, channel, entry_ids);
+            .seed_durable(
+                &self.durable,
+                durable_channel,
+                owner,
+                channel,
+                published,
+                entry_ids,
+            )
+            .then_some(())
+            .ok_or_else(|| "durable event cursor hydration was quarantined".to_string())
     }
 }
 
+/// Apply the byte wall after the row wall but before encoding the RPC result.
+/// A single oversized payload is replaced by an explicit marker that keeps
+/// its channel/seq/ts cursor advance honest; otherwise the page stops before
+/// the event that would cross the wall and `next_since` resumes from the last
+/// returned sequence.
+fn bound_event_page(events: Vec<Event>) -> Result<(Vec<Event>, usize, bool), RpcError> {
+    let mut bounded = Vec::with_capacity(events.len());
+    let mut content_bytes = 0usize;
+    let mut payloads_truncated = events.iter().any(event_has_truncated_payload);
+    for event in events {
+        let (accepted, truncated) = push_bounded_event(&mut bounded, &mut content_bytes, event)?;
+        payloads_truncated |= truncated;
+        if !accepted {
+            break;
+        }
+    }
+    Ok((bounded, content_bytes, payloads_truncated))
+}
+
+fn event_has_truncated_payload(event: &Event) -> bool {
+    event.payload["v"]["payload_truncated"]["v"] == Json::Bool(true)
+}
+
+/// Append one event without allowing the accumulated encoded events to cross
+/// the page byte wall. A single oversized event becomes a small explicit
+/// marker so its sequence remains consumable; an aggregate overflow stops
+/// before the event and lets continuation resume from the prior cursor.
+fn push_bounded_event(
+    events: &mut Vec<Event>,
+    content_bytes: &mut usize,
+    mut event: Event,
+) -> Result<(bool, bool), RpcError> {
+    let mut encoded = serde_json::to_vec(&event).map_err(internal)?;
+    let mut payload_truncated = false;
+    if encoded.len() > EVENTS_MAX_CONTENT_BYTES {
+        event.payload = json!({
+            "$": "record",
+            "v": {
+                "payload_truncated": {"$":"bool","v":true},
+                "reason": {"$":"str","v":"event payload exceeds events.read byte wall"}
+            }
+        });
+        encoded = serde_json::to_vec(&event).map_err(internal)?;
+        payload_truncated = true;
+    }
+    let Some(next_bytes) = content_bytes.checked_add(encoded.len()) else {
+        return Ok((false, payload_truncated));
+    };
+    if next_bytes > EVENTS_MAX_CONTENT_BYTES {
+        return Ok((false, payload_truncated));
+    }
+    *content_bytes = next_bytes;
+    events.push(event);
+    Ok((true, payload_truncated))
+}
+
 impl Kernel {
+    pub(crate) fn ensure_event_owner(&self, owner: &OwnerKey) -> Result<(), RpcError> {
+        let journal = self
+            .journal
+            .lock()
+            .map_err(|_| poisoned_subsystem("journal"))?;
+        self.events
+            .seed_owner_from_journal(&journal, owner)
+            .map_err(internal)
+    }
+
     pub(crate) fn handle_events_read(
         self: &Arc<Self>,
         params: Json,
@@ -379,19 +406,58 @@ impl Kernel {
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
         self.events.ensure_replay_subsystem()?;
         let owner = attachment.session.key.owner();
+        self.ensure_event_owner(&owner)?;
         let p: EventsReadParams = decode(params)?;
+        let effective_limit = p.limit.unwrap_or(EVENTS_DEFAULT_PAGE).min(EVENTS_MAX_PAGE);
         // The `journal` and `session.transcript` channels are journal-backed:
         // a `since` older than the ring's oldest retained seq is served from
         // the durable journal rather than lost (site/content/internals/kernel-protocol.md). Every
         // other channel is ring-only.
-        let events = if p.channel == "journal" {
-            self.read_journal_channel(&owner, p.since, p.limit)?
+        let durable = p.channel == "journal" || p.channel == "session.transcript";
+        let published = if p.channel == "journal" {
+            self.events.journal_published_count(&owner)
         } else if p.channel == "session.transcript" {
-            self.read_transcript_channel(&owner, p.since, p.limit)?
+            self.events.transcript_published_count(&owner)
         } else {
-            self.events.read(&owner, &p.channel, p.since, p.limit)
+            self.events.published_count(&owner, &p.channel)
         };
-        encode(json!({"channel": p.channel, "events": events}))
+        let oldest_available = if durable {
+            0
+        } else {
+            self.events
+                .ring_oldest_seq(&owner, &p.channel)
+                .unwrap_or(published)
+        };
+        let events = if p.channel == "journal" {
+            self.read_journal_channel(&owner, p.since, effective_limit)?
+        } else if p.channel == "session.transcript" {
+            self.read_transcript_channel(&owner, p.since, effective_limit)?
+        } else {
+            self.events
+                .read(&owner, &p.channel, p.since, Some(effective_limit))
+        };
+        let (events, content_bytes, payloads_truncated) = bound_event_page(events)?;
+        let returned = events.len();
+        let requested_start = p.since.map_or(0, |seq| seq.saturating_add(1));
+        let cursor = events.last().map(|event| event.seq).or(p.since);
+        let consumed = cursor.map_or(0, |seq| seq.saturating_add(1));
+        let truncated = consumed < published;
+        encode(json!({
+            "channel": p.channel,
+            "events": events,
+            "page": {
+                "returned": returned,
+                "content_bytes": content_bytes,
+                "max_events": EVENTS_MAX_PAGE,
+                "max_content_bytes": EVENTS_MAX_CONTENT_BYTES,
+                "next_since": truncated.then_some(cursor).flatten(),
+                "truncated": truncated,
+                "request_clamped": p.limit.is_some_and(|limit| limit > EVENTS_MAX_PAGE),
+                "payloads_truncated": payloads_truncated,
+                "oldest_available": oldest_available,
+                "history_lost": !durable && requested_start < oldest_available,
+            }
+        }))
     }
 
     /// Read the `journal` channel with journal-backed replay, as specified by
@@ -402,12 +468,12 @@ impl Kernel {
     /// channel from ANY seq, not just the last `EVENT_RING_CAP`.
     ///
     /// The seq↔journal correspondence: every `journal` event's `seq` was
-    /// recorded, at publish time, against the coarse exec-level journal
-    /// `entry_id` it announced (`EventBus::journal_index`). Reconstruction
-    /// resolves each aged-out seq to its `entry_id` through that index, then
+    /// recorded against the coarse exec-level journal `entry_id` it
+    /// announced. Reconstruction resolves each aged-out seq from the bounded
+    /// pointer tail or an exact owner-scoped journal page, then
     /// rebuilds the `{entry_id, head, ok, principal}` payload from the journal
-    /// row itself — so the *pointer* lives in memory (one `i64` per event) but
-    /// the *payload* is journal-backed and durable. Using the index as the
+    /// row itself. Only the newest pointer window lives in memory; payloads
+    /// and older pointer pages are journal-backed. Using this membership as the
     /// membership set is also what keeps reconstruction faithful in on-disk
     /// sessions, where the session evaluator ALSO writes its own finer
     /// per-statement entries into the same store (`session.rs`): those rows
@@ -417,20 +483,25 @@ impl Kernel {
         self: &Arc<Self>,
         owner: &OwnerKey,
         since: Option<u64>,
-        limit: Option<usize>,
+        limit: usize,
     ) -> Result<Vec<Event>, RpcError> {
         // Nothing published yet, or `since` at/after the newest seq: the ring
         // already answers correctly (empty), and there is nothing older to
         // reconstruct. This also covers the not-found/beyond-newest case.
         let published = self.events.journal_published_count(owner);
         if published == 0 || since.is_some_and(|s| s.saturating_add(1) >= published) {
-            return Ok(self.events.read(owner, "journal", since, None));
+            return Ok(self.events.read(owner, "journal", since, Some(limit)));
         }
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let start = since.map_or(0, |seq| seq.saturating_add(1));
+        let end = start.saturating_add(limit as u64).min(published);
         let mut out: Vec<Event> = Vec::new();
         // Reconstruct the gap below the ring, if `since` reaches into it. The
         // ring can be genuinely EMPTY here even though `published > 0`: right
-        // after a kernel restart, `EventBus::seed_from_journal` seeds the
-        // durable index from a pre-existing store but deliberately leaves the
+        // after a kernel restart, lazy owner hydration seeds the durable
+        // cursor from a pre-existing store but deliberately leaves the
         // ring untouched, and nothing has been published yet in this fresh
         // process — `ring_oldest_seq` returns `None` in exactly that case
         // (impossible pre-seeding, since every publish always pushed into
@@ -441,19 +512,49 @@ impl Kernel {
             .events
             .ring_oldest_seq(owner, "journal")
             .unwrap_or(published);
-        let want = self.events.journal_index_range(owner, since, oldest);
+        let cold_end = oldest.min(end);
+        let want = self.journal_pointer_page(owner, start, cold_end)?;
         if !want.is_empty() {
             out = self.reconstruct_journal_events(&want)?;
+            if out.len() < want.len() {
+                return Ok(out);
+            }
         }
-        // Then the ring tail (fast path, byte-for-byte as before).
-        out.extend(self.events.read(owner, "journal", since, None));
-        // Mirror `EventBus::read`'s limit semantics: keep the newest `limit`.
-        if let Some(limit) = limit
-            && out.len() > limit
-        {
-            out = out.split_off(out.len() - limit);
+        let ring_start = start.max(oldest);
+        if ring_start < end {
+            let ring_since = ring_start.checked_sub(1);
+            out.extend(self.events.read(
+                owner,
+                "journal",
+                ring_since,
+                Some(usize::try_from(end - ring_start).unwrap_or(EVENTS_MAX_PAGE)),
+            ));
         }
         Ok(out)
+    }
+
+    fn journal_pointer_page(
+        &self,
+        owner: &OwnerKey,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<(u64, i64)>, RpcError> {
+        if start >= end {
+            return Ok(Vec::new());
+        }
+        let since = start.checked_sub(1);
+        let cached = self.events.journal_index_range(owner, since, end);
+        let wanted = usize::try_from(end - start).map_err(internal)?;
+        if cached.len() == wanted && cached.first().is_some_and(|(seq, _)| *seq == start) {
+            return Ok(cached);
+        }
+        let ids = self
+            .journal
+            .lock()
+            .map_err(|_| poisoned_subsystem("journal"))?
+            .journal_event_entry_ids(&owner.0.principal, &owner.0.name, start, wanted)
+            .map_err(internal)?;
+        Ok((start..).zip(ids).collect())
     }
 
     /// Rebuild `journal` events for the given ascending `(seq, entry_id)`
@@ -471,31 +572,32 @@ impl Kernel {
         self: &Arc<Self>,
         want: &[(u64, i64)],
     ) -> Result<Vec<Event>, RpcError> {
-        let ids: Vec<i64> = want.iter().map(|&(_, id)| id).collect();
-        let rows = self
+        let journal = self
             .journal
             .lock()
-            .map_err(|_| poisoned_subsystem("journal"))?
-            .entries_by_id(&ids)
-            .map_err(internal)?;
-        // `entries_by_id` returns rows in the SAME relative order as `ids`
-        // (i.e. `want`'s order), with any id it couldn't find (an entry GC'd
-        // out from under the index) simply absent — so a single forward scan
-        // through `want`, skipping whichever entries a row doesn't match,
-        // zips the two back together without a HashMap membership dance.
-        let mut events = Vec::with_capacity(rows.len());
-        let mut want = want.iter();
-        for row in &rows {
-            let seq = loop {
-                let &(seq, id) = want
-                    .next()
-                    .expect("entries_by_id returned a row for an id it wasn't asked for");
-                if id == row.id {
-                    break seq;
-                }
-            };
+            .map_err(|_| poisoned_subsystem("journal"))?;
+        let mut events = Vec::with_capacity(want.len());
+        let mut content_bytes = 0usize;
+        for &(seq, id) in want {
+            // Fetch one row at a time so 256 near-frame-sized historical
+            // sources cannot be materialized before the response byte wall
+            // gets a chance to stop the page.
+            let mut rows = journal.entries_by_id(&[id]).map_err(internal)?;
+            let row = rows.pop().ok_or_else(|| RpcError {
+                code: INTERNAL_ERROR,
+                message: format!("durable journal event {id} is missing"),
+                data: Some(json!({"subsystem":"events","entry_id":id,"quarantined":true})),
+            })?;
+            serde_json::from_str::<Program>(&row.ast_json).map_err(|error| RpcError {
+                code: INTERNAL_ERROR,
+                message: format!(
+                    "durable journal event {} has invalid whole-program AST: {error}",
+                    row.id
+                ),
+                data: Some(json!({"subsystem":"events","entry_id":row.id,"quarantined":true})),
+            })?;
             let ok = row.ok.unwrap_or(false);
-            events.push(Event {
+            let event = Event {
                 channel: "journal".to_string(),
                 seq,
                 // The journal records the entry's start (`ts_ns`) and, once
@@ -505,7 +607,10 @@ impl Kernel {
                 // case). Consumers dedup by seq, never by ts.
                 ts: row.ts_ns.saturating_add(row.dur_ns.unwrap_or(0)),
                 payload: journal_event(row.id, &row.src, ok, &row.principal),
-            });
+            };
+            if !push_bounded_event(&mut events, &mut content_bytes, event)?.0 {
+                break;
+            }
         }
         Ok(events)
     }
@@ -521,12 +626,19 @@ impl Kernel {
         self: &Arc<Self>,
         owner: &OwnerKey,
         since: Option<u64>,
-        limit: Option<usize>,
+        limit: usize,
     ) -> Result<Vec<Event>, RpcError> {
         let published = self.events.transcript_published_count(owner);
         if published == 0 || since.is_some_and(|s| s.saturating_add(1) >= published) {
-            return Ok(self.events.read(owner, "session.transcript", since, None));
+            return Ok(self
+                .events
+                .read(owner, "session.transcript", since, Some(limit)));
         }
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let start = since.map_or(0, |seq| seq.saturating_add(1));
+        let end = start.saturating_add(limit as u64).min(published);
         let mut out: Vec<Event> = Vec::new();
         // Same ring-can-be-empty-but-published>0 fallback as
         // `read_journal_channel` above (post-restart, pre-first-publish).
@@ -534,17 +646,49 @@ impl Kernel {
             .events
             .ring_oldest_seq(owner, "session.transcript")
             .unwrap_or(published);
-        let want = self.events.transcript_index_range(owner, since, oldest);
+        let cold_end = oldest.min(end);
+        let want = self.transcript_pointer_page(owner, start, cold_end)?;
         if !want.is_empty() {
             out = self.reconstruct_transcript_events(&want)?;
+            if out.len() < want.len() {
+                return Ok(out);
+            }
         }
-        out.extend(self.events.read(owner, "session.transcript", since, None));
-        if let Some(limit) = limit
-            && out.len() > limit
-        {
-            out = out.split_off(out.len() - limit);
+        let ring_start = start.max(oldest);
+        if ring_start < end {
+            let ring_since = ring_start.checked_sub(1);
+            out.extend(self.events.read(
+                owner,
+                "session.transcript",
+                ring_since,
+                Some(usize::try_from(end - ring_start).unwrap_or(EVENTS_MAX_PAGE)),
+            ));
         }
         Ok(out)
+    }
+
+    fn transcript_pointer_page(
+        &self,
+        owner: &OwnerKey,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<(u64, i64)>, RpcError> {
+        if start >= end {
+            return Ok(Vec::new());
+        }
+        let since = start.checked_sub(1);
+        let cached = self.events.transcript_index_range(owner, since, end);
+        let wanted = usize::try_from(end - start).map_err(internal)?;
+        if cached.len() == wanted && cached.first().is_some_and(|(seq, _)| *seq == start) {
+            return Ok(cached);
+        }
+        let ids = self
+            .journal
+            .lock()
+            .map_err(|_| poisoned_subsystem("journal"))?
+            .transcript_event_entry_ids(&owner.0.principal, &owner.0.name, start, wanted)
+            .map_err(internal)?;
+        Ok((start..).zip(ids).collect())
     }
 
     /// Rebuild `session.transcript` events for the given ascending `(seq,
@@ -558,35 +702,34 @@ impl Kernel {
         self: &Arc<Self>,
         want: &[(u64, i64)],
     ) -> Result<Vec<Event>, RpcError> {
-        let ids: Vec<i64> = want.iter().map(|&(_, id)| id).collect();
-        let rows = self
+        let journal = self
             .journal
             .lock()
-            .map_err(|_| poisoned_subsystem("journal"))?
-            .transcript_events_by_entry(&ids)
-            .map_err(internal)?;
-        // Same order-preserving zip as `reconstruct_journal_events`: rows
-        // come back in `ids`' order (== `want`'s order), any entry with no
-        // transcript row (the exec failed, so no transcript event was ever
-        // published for it) simply absent.
-        let mut events = Vec::with_capacity(rows.len());
-        let mut want = want.iter();
-        for row in &rows {
-            let seq = loop {
-                let &(seq, id) = want.next().expect(
-                    "transcript_events_by_entry returned a row for an id it wasn't asked for",
-                );
-                if id == row.entry_id {
-                    break seq;
-                }
-            };
+            .map_err(|_| poisoned_subsystem("journal"))?;
+        let mut events = Vec::with_capacity(want.len());
+        let mut content_bytes = 0usize;
+        for &(seq, id) in want {
+            // Payloads are intentionally read incrementally: a page of many
+            // individually legal but near-frame-sized transcript rows must
+            // not allocate in proportion to the requested row limit.
+            let mut rows = journal
+                .transcript_events_by_entry(&[id])
+                .map_err(internal)?;
+            let row = rows.pop().ok_or_else(|| RpcError {
+                code: INTERNAL_ERROR,
+                message: format!("durable transcript event {id} is missing"),
+                data: Some(json!({"subsystem":"events","entry_id":id,"quarantined":true})),
+            })?;
             let payload: Json = serde_json::from_str(&row.payload_json).map_err(internal)?;
-            events.push(Event {
+            let event = Event {
                 channel: "session.transcript".to_string(),
                 seq,
                 ts: row.ts_ns,
                 payload,
-            });
+            };
+            if !push_bounded_event(&mut events, &mut content_bytes, event)?.0 {
+                break;
+            }
         }
         Ok(events)
     }
@@ -1136,7 +1279,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // `EventBus::seed_from_journal`: seqs surviving a kernel restart.
+    // Lazy exact-owner hydration: seqs surviving a kernel restart.
     // -----------------------------------------------------------------------
 
     /// Appends one "coarse" entry (`ast` = a whole [`Program`]) to `journal`,
@@ -1196,7 +1339,7 @@ mod tests {
     /// `next_seq` past the seeded count, so the very next publish continues
     /// rather than colliding with seq 0.
     #[test]
-    fn seed_from_journal_recovers_coarse_entries_and_seq_continues() {
+    fn owner_hydration_recovers_coarse_entries_and_seq_continues() {
         let dir = tempfile::tempdir().unwrap();
         let journal = Journal::open(dir.path()).unwrap();
 
@@ -1208,8 +1351,8 @@ mod tests {
         let coarse_c = append_simulated_exec(&journal, true, false);
 
         let bus = EventBus::default();
-        bus.seed_from_journal(&journal);
         let owner = SessionKey::new("human", "s").owner();
+        bus.seed_owner_from_journal(&journal, &owner).unwrap();
 
         assert_eq!(
             bus.journal_published_count(&owner),
@@ -1259,7 +1402,13 @@ mod tests {
         let seed_done = done_tx.clone();
         let seed = std::thread::spawn(move || {
             seed_barrier.wait();
-            seed_bus.seed_index(DurableChannel::Journal, &seed_owner, "journal", &[10, 11]);
+            let _ = seed_bus.seed_index(
+                DurableChannel::Journal,
+                &seed_owner,
+                "journal",
+                2,
+                &[10, 11],
+            );
             seed_done.send(()).unwrap();
         });
         let publish_bus = bus.clone();
@@ -1278,8 +1427,170 @@ mod tests {
         }
         seed.join().unwrap();
         publish.join().unwrap();
-        assert_eq!(bus.journal_published_count(&owner), 3);
-        assert_eq!(bus.publish_journal(&owner, 100, json!({})).seq, 3);
+        if bus.channels.is_quarantined() {
+            assert_eq!(
+                bus.publish_journal(&owner, 100, json!({})).seq,
+                u64::MAX,
+                "a publish that beat owner hydration makes the ambiguous cursor fail closed"
+            );
+        } else {
+            assert_eq!(bus.journal_published_count(&owner), 3);
+            assert_eq!(bus.publish_journal(&owner, 100, json!({})).seq, 3);
+        }
+    }
+
+    #[test]
+    fn durable_pointer_tail_stays_bounded_across_long_history() {
+        let bus = EventBus::default();
+        let owner = owner("bounded-tail");
+        let total = DURABLE_POINTER_CAP + 37;
+        for id in 0..total {
+            assert_eq!(
+                bus.publish_journal(&owner, id as i64, json!({})).seq,
+                id as u64
+            );
+        }
+        assert_eq!(bus.journal_published_count(&owner), total as u64);
+        assert_eq!(
+            bus.durable.retained_len(DurableChannel::Journal, &owner),
+            DURABLE_POINTER_CAP
+        );
+        let retained = bus.journal_index_range(&owner, None, total as u64);
+        assert_eq!(retained.len(), DURABLE_POINTER_CAP);
+        assert_eq!(retained[0].0, (total - DURABLE_POINTER_CAP) as u64);
+    }
+
+    #[test]
+    fn sequence_exhaustion_quarantines_instead_of_reusing_max() {
+        let bus = EventBus::default();
+        let owner = owner("seq-exhaustion");
+        bus.seed_index(DurableChannel::Journal, &owner, "journal", u64::MAX, &[])
+            .unwrap();
+        let marker = bus.publish_journal(&owner, 1, json!({}));
+        assert_eq!(marker.seq, u64::MAX);
+        assert!(bus.channels.is_quarantined());
+    }
+
+    #[test]
+    fn oversized_hydration_fails_closed_instead_of_saturating_base_seq() {
+        let bus = EventBus::default();
+        let owner = owner("invalid-hydration");
+        assert!(
+            bus.seed_index(DurableChannel::Journal, &owner, "journal", 0, &[7])
+                .is_err()
+        );
+        assert!(bus.channels.is_quarantined());
+        assert!(bus.durable.is_quarantined());
+    }
+
+    #[test]
+    fn events_read_clamps_rows_and_bytes_with_continuation_metadata() {
+        let kernel = Kernel::new();
+        let mut attached = attachment(&kernel, "bounded-read");
+        let owner = attached.as_ref().unwrap().session.key.owner();
+        for n in 0..(EVENTS_MAX_PAGE + 20) {
+            kernel.events.publish(&owner, "user.page", json!({"n":n}));
+        }
+        let page = kernel
+            .handle_events_read(
+                json!({"channel":"user.page","limit":usize::MAX}),
+                &mut attached,
+            )
+            .unwrap();
+        assert_eq!(page["events"].as_array().unwrap().len(), EVENTS_MAX_PAGE);
+        assert_eq!(page["page"]["truncated"], true);
+        assert_eq!(page["page"]["request_clamped"], true);
+        assert_eq!(page["page"]["next_since"], (EVENTS_MAX_PAGE - 1) as u64);
+
+        let omitted = kernel
+            .handle_events_read(json!({"channel":"user.page"}), &mut attached)
+            .unwrap();
+        assert_eq!(
+            omitted["events"].as_array().unwrap().len(),
+            EVENTS_DEFAULT_PAGE
+        );
+        assert_eq!(omitted["page"]["truncated"], true);
+
+        let empty = kernel
+            .handle_events_read(json!({"channel":"user.page","limit":0}), &mut attached)
+            .unwrap();
+        assert!(empty["events"].as_array().unwrap().is_empty());
+
+        kernel.events.publish(
+            &owner,
+            "user.large",
+            json!({"body":"x".repeat(EVENTS_MAX_CONTENT_BYTES + 1024)}),
+        );
+        let large = kernel
+            .handle_events_read(json!({"channel":"user.large"}), &mut attached)
+            .unwrap();
+        assert_eq!(large["page"]["payloads_truncated"], true);
+        assert!(serde_json::to_vec(&large).unwrap().len() < MAX_FRAME_LEN);
+    }
+
+    #[test]
+    fn corrupt_program_shaped_ast_is_never_replayed_as_an_event() {
+        let kernel = Kernel::new();
+        let mut attached = attachment(&kernel, "corrupt-ast");
+        let owner = attached.as_ref().unwrap().session.key.owner();
+        let id = {
+            let journal = kernel.journal.lock().unwrap();
+            let id = journal
+                .append(&EntryRecord {
+                    session: owner.0.name.clone(),
+                    principal: owner.0.principal.clone(),
+                    ts_ns: 0,
+                    cwd: vec![],
+                    src: "corrupt".into(),
+                    ast_json: r#"{"stmts":[{"bad":true}]}"#.into(),
+                    effects_json: "[]".into(),
+                    opaque: false,
+                })
+                .unwrap();
+            journal.finish(id, Some(0), true, 0).unwrap();
+            id
+        };
+        let error = kernel
+            .handle_events_read(json!({"channel":"journal"}), &mut attached)
+            .expect_err("a merely program-shaped corrupt AST must fail closed");
+        assert_eq!(error.code, INTERNAL_ERROR);
+        assert_eq!(error.data.unwrap()["entry_id"], id);
+    }
+
+    #[test]
+    fn historical_large_transcripts_stop_before_materializing_a_whole_row_page() {
+        let kernel = Kernel::new();
+        let mut attached = attachment(&kernel, "large-transcript-page");
+        let owner = attached.as_ref().unwrap().session.key.owner();
+        {
+            let journal = kernel.journal.lock().unwrap();
+            for n in 0..3 {
+                let id = journal
+                    .append(&EntryRecord {
+                        session: owner.0.name.clone(),
+                        principal: owner.0.principal.clone(),
+                        ts_ns: n,
+                        cwd: vec![],
+                        src: "return".into(),
+                        ast_json: r#"{"stmts":[]}"#.into(),
+                        effects_json: "[]".into(),
+                        opaque: false,
+                    })
+                    .unwrap();
+                journal.finish(id, Some(0), true, 0).unwrap();
+                let payload = json!({"body":"x".repeat(EVENTS_MAX_CONTENT_BYTES / 3)});
+                journal
+                    .record_transcript_event(id, n, &serde_json::to_string(&payload).unwrap())
+                    .unwrap();
+            }
+        }
+        let page = kernel
+            .handle_events_read(json!({"channel":"session.transcript"}), &mut attached)
+            .unwrap();
+        assert_eq!(page["events"].as_array().unwrap().len(), 2);
+        assert_eq!(page["page"]["truncated"], true);
+        assert_eq!(page["page"]["next_since"], 1);
+        assert!(serde_json::to_vec(&page).unwrap().len() < MAX_FRAME_LEN);
     }
 
     /// Zero-regression companion: seeding from a brand-new, empty store (the
@@ -1287,12 +1598,12 @@ mod tests {
     /// used store) must be a no-op, leaving both channels starting at seq 0
     /// exactly as an ephemeral in-memory kernel does.
     #[test]
-    fn seed_from_journal_is_a_no_op_on_a_fresh_empty_store() {
+    fn owner_hydration_is_a_no_op_on_a_fresh_empty_store() {
         let dir = tempfile::tempdir().unwrap();
         let journal = Journal::open(dir.path()).unwrap();
         let bus = EventBus::default();
-        bus.seed_from_journal(&journal);
         let owner = owner("empty");
+        bus.seed_owner_from_journal(&journal, &owner).unwrap();
         assert_eq!(bus.journal_published_count(&owner), 0);
         assert_eq!(bus.transcript_published_count(&owner), 0);
         let event = bus.publish_journal(&owner, 1, json!({}));
