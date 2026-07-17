@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use shoal_value::{Fs, StdFs};
 
 /// One locked binding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,7 +47,13 @@ impl Lockfile {
     /// Load a lockfile from disk. A missing file yields an empty lockfile;
     /// malformed TOML is an error.
     pub fn load(path: &Path) -> Result<Lockfile, LockError> {
-        let Some(text) = crate::input::read_optional(path).map_err(lock_error)? else {
+        Self::load_with(path, &StdFs)
+    }
+
+    /// Load through an explicit filesystem capability with the same bounded,
+    /// regular-file, and UTF-8 checks as [`Self::load`].
+    pub fn load_with(path: &Path, fs: &dyn Fs) -> Result<Lockfile, LockError> {
+        let Some(text) = crate::input::read_optional_with(fs, path).map_err(lock_error)? else {
             return Ok(Lockfile::new());
         };
         crate::input::validate_toml_text(&text).map_err(lock_error)?;
@@ -62,6 +69,13 @@ impl Lockfile {
 
     /// Write the lockfile to disk (creating parent dirs).
     pub fn save(&self, path: &Path) -> Result<(), LockError> {
+        self.save_with(path, &StdFs)
+    }
+
+    /// Validate and atomically replace a lockfile through an explicit
+    /// filesystem capability. Publication only follows a complete parent-fsynced
+    /// replacement under the production adapter.
+    pub fn save_with(&self, path: &Path, fs: &dyn Fs) -> Result<(), LockError> {
         self.validate()?;
         let text = self.to_toml();
         if text.len() > crate::input::REEF_MANIFEST_MAX_BYTES {
@@ -71,9 +85,10 @@ impl Lockfile {
             )));
         }
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| LockError { msg: e.to_string() })?;
+            fs.create_dir_all(parent)
+                .map_err(|e| LockError { msg: e.to_string() })?;
         }
-        std::fs::write(path, text).map_err(lock_error)
+        fs.atomic_replace(path, text.as_bytes()).map_err(lock_error)
     }
 
     pub fn get(&self, name: &str) -> Option<&LockEntry> {

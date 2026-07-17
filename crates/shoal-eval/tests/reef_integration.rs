@@ -121,11 +121,9 @@ fn constrained_tool_resolves_to_fixture_and_spawns() {
 #[test]
 fn interactive_auto_lock_refuses_to_spawn_when_persistence_fails() {
     let (dir, bindir) = project("[tools]\nfaketool = \"*\"\n", &[("faketool", "1.2.3")]);
-    let lock_path = dir.path().join("reef.lock");
-    std::fs::write(&lock_path, "").unwrap();
-    let mut permissions = std::fs::metadata(&lock_path).unwrap().permissions();
-    permissions.set_mode(0o400);
-    std::fs::set_permissions(&lock_path, permissions).unwrap();
+    let mut directory_permissions = std::fs::metadata(dir.path()).unwrap().permissions();
+    directory_permissions.set_mode(0o555);
+    std::fs::set_permissions(dir.path(), directory_permissions).unwrap();
     let mut ev = Evaluator::new(dir.path().to_path_buf());
     ev.set_interactive(true);
     ev.set_reef_resolver(fixture_resolver(&bindir));
@@ -135,9 +133,11 @@ fn interactive_auto_lock_refuses_to_spawn_when_persistence_fails() {
         .expect("an unmentioned ambient tool does not consume Reef lock state");
     assert!(matches!(passthrough, Value::Outcome(outcome) if outcome.ok));
 
-    let error = ev
-        .eval_program(&parse("faketool"))
-        .expect_err("a non-durable auto-lock must stop before process spawn");
+    let result = ev.eval_program(&parse("faketool"));
+    let mut directory_permissions = std::fs::metadata(dir.path()).unwrap().permissions();
+    directory_permissions.set_mode(0o755);
+    std::fs::set_permissions(dir.path(), directory_permissions).unwrap();
+    let error = result.expect_err("a non-durable auto-lock must stop before process spawn");
     assert_eq!(error.code, "reef_provider");
     assert!(error.msg.contains("persisting Reef lock"), "{error:?}");
     assert!(error.span.is_some());
@@ -146,18 +146,18 @@ fn interactive_auto_lock_refuses_to_spawn_when_persistence_fails() {
 #[test]
 fn explicit_lock_reports_persistence_failure_instead_of_locked_rows() {
     let (dir, bindir) = project("[tools]\nfaketool = \"*\"\n", &[("faketool", "1.2.3")]);
-    let lock_path = dir.path().join("reef.lock");
-    std::fs::write(&lock_path, "").unwrap();
-    let mut permissions = std::fs::metadata(&lock_path).unwrap().permissions();
-    permissions.set_mode(0o400);
-    std::fs::set_permissions(&lock_path, permissions).unwrap();
+    let mut directory_permissions = std::fs::metadata(dir.path()).unwrap().permissions();
+    directory_permissions.set_mode(0o555);
+    std::fs::set_permissions(dir.path(), directory_permissions).unwrap();
     let mut ev = Evaluator::new(dir.path().to_path_buf());
     ev.set_interactive(true);
     ev.set_reef_resolver(fixture_resolver(&bindir));
 
-    let error = ev
-        .eval_program(&parse("reef lock"))
-        .expect_err("reef lock must not claim success when its file was not written");
+    let result = ev.eval_program(&parse("reef lock"));
+    let mut directory_permissions = std::fs::metadata(dir.path()).unwrap().permissions();
+    directory_permissions.set_mode(0o755);
+    std::fs::set_permissions(dir.path(), directory_permissions).unwrap();
+    let error = result.expect_err("reef lock must not claim success when its file was not written");
     assert_eq!(error.code, "reef_provider");
     assert!(error.msg.contains("persisting Reef lock"), "{error:?}");
 }
@@ -335,6 +335,41 @@ fn reef_add_writes_manifest_and_locks() {
     assert!(lock.contains("other"), "lock was {lock:?}");
 }
 
+#[test]
+fn reef_add_rejects_oversized_manifest_before_rewriting_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = dir.path().join(".reef.toml");
+    let file = std::fs::File::create(&manifest).unwrap();
+    file.set_len((shoal_reef::REEF_MANIFEST_MAX_BYTES + 1) as u64)
+        .unwrap();
+    let mut ev = Evaluator::new(dir.path().to_path_buf());
+
+    let error = ev
+        .eval_program(&parse("reef add faketool@1.2.3"))
+        .expect_err("oversized manifest must fail before TOML allocation or rewrite");
+    assert_eq!(error.code, "reef_provider");
+    assert!(error.msg.contains("exceeds the"), "{error:?}");
+    assert_eq!(
+        std::fs::metadata(&manifest).unwrap().len(),
+        (shoal_reef::REEF_MANIFEST_MAX_BYTES + 1) as u64
+    );
+}
+
+#[test]
+fn evaluator_reef_storage_uses_the_injected_filesystem_forms() {
+    let source = include_str!("../src/reef_resolve.rs");
+    let production = source
+        .split("#[cfg(test)]")
+        .next()
+        .expect("production source prefix");
+    assert!(production.contains("ScopeChain::discover_with("));
+    assert!(production.contains("Lockfile::load_with("));
+    assert!(production.contains("lock.save_with("));
+    assert!(!production.contains("ScopeChain::discover("));
+    assert!(!production.contains("Lockfile::load("));
+    assert!(!production.contains("lock.save("));
+}
+
 // --- zero-regression: NO manifest behaves exactly as before ----------------
 
 #[test]
@@ -426,6 +461,41 @@ fn prompt_reef_snapshot_empty_with_no_manifest() {
     let snap = ev.prompt_reef_snapshot();
     assert!(snap.active_scope.is_none());
     assert!(snap.bindings.is_empty());
+}
+
+#[test]
+fn same_cwd_manifest_edit_invalidates_the_evaluator_scope_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = dir.path().join(".reef.toml");
+    std::fs::write(&manifest, "[tools]\nfirst = \"1\"\n").unwrap();
+    let mut ev = Evaluator::new(dir.path().to_path_buf());
+    let first = ev.prompt_reef_snapshot();
+    assert_eq!(first.bindings.len(), 1);
+    assert_eq!(first.bindings[0].tool, "first");
+
+    // Different length is part of the metadata fingerprint too, so this is
+    // deterministic even on filesystems with coarse mtime resolution.
+    std::fs::write(&manifest, "[tools]\nsecond_longer_name = \"2\"\n").unwrap();
+    let second = ev.prompt_reef_snapshot();
+    assert_eq!(second.bindings.len(), 1);
+    assert_eq!(second.bindings[0].tool, "second_longer_name");
+}
+
+#[test]
+fn same_cwd_lock_edit_invalidates_the_evaluator_lock_cache() {
+    let (dir, bindir) = project("[tools]\nfaketool = \"*\"\n", &[("faketool", "1.2.3")]);
+    let mut ev = Evaluator::new(dir.path().to_path_buf());
+    ev.set_interactive(true);
+    ev.set_reef_resolver(fixture_resolver(&bindir));
+    let initial = ev.prompt_reef_snapshot();
+    assert_eq!(initial.bindings.len(), 1);
+
+    std::fs::write(dir.path().join("reef.lock"), "not = [valid").unwrap();
+    let error = ev
+        .eval_program(&parse("faketool"))
+        .expect_err("same-cwd invalid lock replacement must be observed before spawn");
+    assert_eq!(error.code, "reef_provider");
+    assert!(error.msg.contains("malformed Reef lock"), "{error:?}");
 }
 
 #[test]

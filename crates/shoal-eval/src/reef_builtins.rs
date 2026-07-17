@@ -5,6 +5,7 @@
 //! mechanics these commands call into.
 
 use super::*;
+use std::io::Read as _;
 
 use shoal_reef::hashcache::HashCache;
 use shoal_reef::{
@@ -345,14 +346,22 @@ impl Evaluator {
                 .map(|s| s.source.clone())
                 .unwrap_or(local)
         };
-        let mut doc = match self.host.fs.read_to_string(&manifest_path) {
-            Ok(text) => text.parse::<toml::Table>().map_err(|e| {
-                ErrorVal::new(
-                    "reef_provider",
-                    format!("parsing manifest {}: {e}", manifest_path.display()),
-                )
-            })?,
-            Err(_) => toml::Table::new(),
+        let mut doc = match read_optional_reef_manifest(self.host.fs.as_ref(), &manifest_path)? {
+            Some(text) => {
+                shoal_reef::ReefManifest::parse_reef(&text).map_err(|error| {
+                    ErrorVal::new(
+                        "reef_provider",
+                        format!("parsing manifest {}: {error}", manifest_path.display()),
+                    )
+                })?;
+                text.parse::<toml::Table>().map_err(|e| {
+                    ErrorVal::new(
+                        "reef_provider",
+                        format!("parsing manifest {}: {e}", manifest_path.display()),
+                    )
+                })?
+            }
+            None => toml::Table::new(),
         };
         let tools = doc
             .entry("tools".to_string())
@@ -364,9 +373,20 @@ impl Evaluator {
             ));
         };
         tools.insert(tool.clone(), toml::Value::String(ver.clone()));
+        let manifest_text = doc.to_string();
+        if manifest_text.len() > shoal_reef::REEF_MANIFEST_MAX_BYTES {
+            return Err(ErrorVal::new(
+                "reef_provider",
+                format!(
+                    "updated manifest {} exceeds the {}-byte limit",
+                    manifest_path.display(),
+                    shoal_reef::REEF_MANIFEST_MAX_BYTES
+                ),
+            ));
+        }
         self.host
             .fs
-            .write(&manifest_path, doc.to_string().as_bytes())
+            .atomic_replace(&manifest_path, manifest_text.as_bytes())
             .map_err(|e| ErrorVal::new("reef_provider", format!("writing manifest: {e}")))?;
 
         // Re-discover so the fresh constraint is in scope, then lock it.
@@ -583,6 +603,45 @@ impl Evaluator {
 
         Ok(Value::Table(rows))
     }
+}
+
+fn read_optional_reef_manifest(fs: &dyn Fs, path: &Path) -> VResult<Option<String>> {
+    let reader = match fs.open_read(path) {
+        Ok(reader) => reader,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(ErrorVal::new(
+                "reef_provider",
+                format!("reading manifest {}: {error}", path.display()),
+            ));
+        }
+    };
+    let mut bytes = Vec::with_capacity(8 * 1024);
+    reader
+        .take((shoal_reef::REEF_MANIFEST_MAX_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            ErrorVal::new(
+                "reef_provider",
+                format!("reading manifest {}: {error}", path.display()),
+            )
+        })?;
+    if bytes.len() > shoal_reef::REEF_MANIFEST_MAX_BYTES {
+        return Err(ErrorVal::new(
+            "reef_provider",
+            format!(
+                "manifest {} exceeds the {}-byte limit",
+                path.display(),
+                shoal_reef::REEF_MANIFEST_MAX_BYTES
+            ),
+        ));
+    }
+    String::from_utf8(bytes).map(Some).map_err(|_| {
+        ErrorVal::new(
+            "reef_provider",
+            format!("manifest {} is not valid UTF-8", path.display()),
+        )
+    })
 }
 
 /// Map a resolved [`ResolutionReport`] to the record `which` renders (site/content/internals/reef-resolution.md).

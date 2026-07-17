@@ -2786,6 +2786,7 @@ dependencies = [
  "libc",
  "serde",
  "shoal-exec",
+ "shoal-value",
  "tempfile",
  "toml 1.1.3+spec-1.1.0",
 ]

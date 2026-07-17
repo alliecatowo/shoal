@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::manifest::{ManifestKind, ReefManifest};
+use shoal_value::{Fs, StdFs};
 
 /// One scope in the chain.
 #[derive(Debug, Clone)]
@@ -44,13 +45,20 @@ pub struct ScopeChain {
     pub warnings: Vec<String>,
 }
 
-/// A cache key: the set of (path, mtime) pairs that produced a chain. Two chains
-/// with equal keys are guaranteed identical, so a caller can key its own cache
-/// on this and never suffer a stale-manifest bug.
+/// A fixed-size metadata cache key. Equality permits reuse under the documented
+/// path/kind/length/mtime identity model; it is not a hostile-filesystem content
+/// proof, so parsing still validates every file after an identity change.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChainKey {
-    entries: Vec<(PathBuf, Option<SystemTime>)>,
+    digest: blake3::Hash,
 }
+
+const MANIFEST_CANDIDATES: &[(&str, ManifestKind)] = &[
+    (".reef.toml", ManifestKind::Reef),
+    ("mise.toml", ManifestKind::Mise),
+    (".mise.toml", ManifestKind::Mise),
+    (".tool-versions", ManifestKind::ToolVersions),
+];
 
 impl ScopeChain {
     /// Discover the scope chain for `cwd`.
@@ -64,15 +72,22 @@ impl ScopeChain {
     /// Unreadable or malformed manifests are skipped (best-effort discovery;
     /// use [`ReefManifest::parse_reef`] directly to surface parse errors).
     pub fn discover(cwd: &Path, user_manifest: Option<&Path>) -> ScopeChain {
+        Self::discover_with(cwd, user_manifest, &StdFs)
+    }
+
+    /// Discover through an explicit filesystem capability. Evaluator hosts use
+    /// this form so manifest probes and bounded reads cannot escape an installed
+    /// filesystem adapter; [`Self::discover`] is the ambient CLI/library adapter.
+    pub fn discover_with(cwd: &Path, user_manifest: Option<&Path>, fs: &dyn Fs) -> ScopeChain {
         let mut scopes = Vec::new();
         let mut warnings = Vec::new();
         let mut dir = Some(cwd);
         while let Some(d) = dir {
-            collect_dir(d, &mut scopes, &mut warnings);
+            collect_dir(fs, d, &mut scopes, &mut warnings);
             dir = d.parent();
         }
         if let Some(user) = user_manifest {
-            match crate::input::read_optional(user) {
+            match crate::input::read_optional_with(fs, user) {
                 Ok(Some(text)) => match ReefManifest::parse_shoal_reef(&text) {
                     Ok(manifest) if !manifest.tools.is_empty() => push_scope(
                         &mut scopes,
@@ -80,7 +95,7 @@ impl ScopeChain {
                         ScopeEntry {
                             kind: ManifestKind::ShoalUser,
                             source: user.to_path_buf(),
-                            mtime: mtime_of(user),
+                            mtime: mtime_of(fs, user),
                             manifest,
                         },
                     ),
@@ -100,12 +115,43 @@ impl ScopeChain {
 
     /// The cache key for this chain (paths + mtimes).
     pub fn key(&self) -> ChainKey {
+        let mut hasher = blake3::Hasher::new();
+        for scope in &self.scopes {
+            hash_path(&mut hasher, &scope.source);
+            hash_time(&mut hasher, scope.mtime);
+        }
         ChainKey {
-            entries: self
-                .scopes
-                .iter()
-                .map(|s| (s.source.clone(), s.mtime))
-                .collect(),
+            digest: hasher.finalize(),
+        }
+    }
+
+    /// Metadata fingerprint of every possible manifest and adjacent lock
+    /// location from `cwd` to root, including currently missing paths and the
+    /// optional user manifest. This detects newly created files as well as
+    /// changed/removed scopes and externally refreshed locks.
+    pub fn discovery_key(cwd: &Path, user_manifest: Option<&Path>) -> ChainKey {
+        Self::discovery_key_with(cwd, user_manifest, &StdFs)
+    }
+
+    /// Capability-mediated form of [`Self::discovery_key`].
+    pub fn discovery_key_with(cwd: &Path, user_manifest: Option<&Path>, fs: &dyn Fs) -> ChainKey {
+        let mut hasher = blake3::Hasher::new();
+        let mut dir = Some(cwd);
+        while let Some(current) = dir {
+            for (name, _) in MANIFEST_CANDIDATES {
+                hash_file_state(&mut hasher, fs, &current.join(name));
+            }
+            hash_file_state(&mut hasher, fs, &current.join("reef.lock"));
+            dir = current.parent();
+        }
+        if let Some(user_manifest) = user_manifest {
+            hash_file_state(&mut hasher, fs, user_manifest);
+            if let Some(parent) = user_manifest.parent() {
+                hash_file_state(&mut hasher, fs, &parent.join("reef.lock"));
+            }
+        }
+        ChainKey {
+            digest: hasher.finalize(),
         }
     }
 
@@ -134,16 +180,10 @@ impl ScopeChain {
     }
 }
 
-fn collect_dir(d: &Path, scopes: &mut Vec<ScopeEntry>, warnings: &mut Vec<String>) {
-    let candidates: &[(&str, ManifestKind)] = &[
-        (".reef.toml", ManifestKind::Reef),
-        ("mise.toml", ManifestKind::Mise),
-        (".mise.toml", ManifestKind::Mise),
-        (".tool-versions", ManifestKind::ToolVersions),
-    ];
-    for (fname, kind) in candidates {
+fn collect_dir(fs: &dyn Fs, d: &Path, scopes: &mut Vec<ScopeEntry>, warnings: &mut Vec<String>) {
+    for (fname, kind) in MANIFEST_CANDIDATES {
         let path = d.join(fname);
-        let text = match crate::input::read_optional(&path) {
+        let text = match crate::input::read_optional_with(fs, &path) {
             Ok(Some(text)) => text,
             Ok(None) => continue,
             Err(error) => {
@@ -164,7 +204,7 @@ fn collect_dir(d: &Path, scopes: &mut Vec<ScopeEntry>, warnings: &mut Vec<String
                 ScopeEntry {
                     kind: *kind,
                     source: path.clone(),
-                    mtime: mtime_of(&path),
+                    mtime: mtime_of(fs, &path),
                     manifest,
                 },
             ),
@@ -191,8 +231,46 @@ fn push_scope(scopes: &mut Vec<ScopeEntry>, warnings: &mut Vec<String>, entry: S
     scopes.push(entry);
 }
 
-fn mtime_of(p: &Path) -> Option<SystemTime> {
-    std::fs::metadata(p).ok().and_then(|m| m.modified().ok())
+fn mtime_of(fs: &dyn Fs, path: &Path) -> Option<SystemTime> {
+    fs.metadata(path).ok().and_then(|m| m.modified().ok())
+}
+
+fn hash_path(hasher: &mut blake3::Hasher, path: &Path) {
+    let bytes = path.as_os_str().as_encoded_bytes();
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+}
+
+fn hash_time(hasher: &mut blake3::Hasher, time: Option<SystemTime>) {
+    let Some(time) = time else {
+        hasher.update(&[0]);
+        return;
+    };
+    match time.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(duration) => {
+            hasher.update(&[1]);
+            hasher.update(&duration.as_nanos().to_le_bytes());
+        }
+        Err(error) => {
+            hasher.update(&[2]);
+            hasher.update(&error.duration().as_nanos().to_le_bytes());
+        }
+    }
+}
+
+fn hash_file_state(hasher: &mut blake3::Hasher, fs: &dyn Fs, path: &Path) {
+    hash_path(hasher, path);
+    match fs.metadata(path) {
+        Ok(metadata) => {
+            hasher.update(&[1, u8::from(metadata.is_file()), u8::from(metadata.is_dir())]);
+            hasher.update(&metadata.len().to_le_bytes());
+            hash_time(hasher, metadata.modified().ok());
+        }
+        Err(error) => {
+            hasher.update(&[0]);
+            hasher.update(&error.raw_os_error().unwrap_or_default().to_le_bytes());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -386,6 +464,25 @@ mod tests {
         let k1 = ScopeChain::discover(base, None).key();
         let k2 = ScopeChain::discover(base, None).key();
         assert_eq!(k1, k2);
+    }
+
+    #[test]
+    fn discovery_key_tracks_new_changed_and_removed_candidate_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path();
+        let manifest = base.join(".reef.toml");
+        let absent = ScopeChain::discovery_key(base, None);
+        write(&manifest, "[tools]\na = \"1\"\n");
+        let created = ScopeChain::discovery_key(base, None);
+        assert_ne!(absent, created);
+        write(&manifest, "[tools]\nlonger_name = \"1\"\n");
+        let changed = ScopeChain::discovery_key(base, None);
+        assert_ne!(created, changed);
+        write(&base.join("reef.lock"), "");
+        let lock_created = ScopeChain::discovery_key(base, None);
+        assert_ne!(changed, lock_created);
+        fs::remove_file(&manifest).unwrap();
+        assert_ne!(lock_created, ScopeChain::discovery_key(base, None));
     }
 
     // Minimal mtime setter using libc utimes (avoids a filetime dependency).

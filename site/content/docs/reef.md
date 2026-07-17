@@ -113,7 +113,7 @@ $XDG_CONFIG_HOME/shoal/shoal.toml
 Its `[reef]` table becomes the lowest-priority user scope.
 
 
-Discovery is best-effort. Unreadable or malformed files are silently skipped by the scope walk. Use `reef add` or validate TOML directly when diagnosing a file that seems absent; `reef add` deliberately notices a malformed local `.reef.toml` and reports `reef_provider` instead of quietly editing an ancestor.
+Discovery is best-effort. Unreadable or malformed files are skipped by the scope walk and retained as warnings. Evaluator-hosted discovery reads through the installed filesystem capability with a one MiB regular-file/UTF-8 wall. Use `reef add` or validate TOML directly when diagnosing a file that seems absent; `reef add` deliberately notices a malformed local `.reef.toml` and reports `reef_provider` instead of quietly editing an ancestor.
 
 ### An important tools-table requirement
 
@@ -133,7 +133,7 @@ This is a current implementation limitation, not a recommended schema convention
 
 ### Cache behavior
 
-The evaluator caches the discovered chain and reloads it when `cwd` changes. Editing a manifest while remaining in the same directory does not currently invalidate that evaluator cache, even though the lower-level chain type has path/mtime keys. `reef add` explicitly invalidates the cache; a manual edit may require `cd` away and back or restarting the session.
+The evaluator caches parsed scopes, but checks a fixed-size metadata fingerprint covering every candidate and adjacent `reef.lock` path from `cwd` to the root plus the user scope. Creating, editing, replacing, or removing a manifest or lock invalidates the cache without requiring `cd` or a session restart. The fingerprint includes file kind, byte length, and modification time; contents are reparsed only after that identity changes.
 
 ## Native manifest schema
 
@@ -338,7 +338,7 @@ Hashing is cached by file identity/metadata to avoid repeatedly reading unchange
 
 ### Lock persistence and portability
 
-The evaluator persists spawn-time interactive auto-locks, bare `reef` resolutions, `which TOOL`, `reef add`, and explicit `reef lock` results before publishing them as locked evaluator state. A write failure is `reef_provider`; an auto-lock failure stops before process spawn, and `reef lock` cannot return successful rows for a file it did not write.
+The evaluator persists spawn-time interactive auto-locks, bare `reef` resolutions, `which TOOL`, `reef add`, and explicit `reef lock` results before publishing them as locked evaluator state. Manifest and lock reads/writes use the evaluator's installed filesystem capability. Lockfiles and `reef add` manifest edits use atomic replacement; a write failure is `reef_provider`, an auto-lock failure stops before process spawn, and `reef lock` cannot return successful rows for a file it did not write.
 
 An invalid, oversized, non-UTF-8, or non-regular existing lock also fails closed instead of being treated as an unlocked project and overwritten. `reef doctor` reports the invalid lockfile; inspect or remove it before intentionally rebuilding it.
 
@@ -511,7 +511,7 @@ Target selection is intentionally careful:
 
 The command inserts/updates the `[tools]` string entry, invalidates scope cache, and attempts a fresh lock. Its record contains `added`, `manifest`, `locked`, and, on success, `version` and `path`. If the constraint is written but resolution fails, the edit remains and `locked` is false with a note.
 
-`reef add` rejects malformed TOML and a non-table `tools` key. It requires exactly the `name@version` shape with nonempty sides.
+`reef add` reads at most one MiB, rejects non-UTF-8, over-nested, or malformed TOML and a non-table `tools` key, and atomically replaces the updated manifest. It requires exactly the `name@version` shape with nonempty sides.
 
 ### `reef lock [--refresh]`
 

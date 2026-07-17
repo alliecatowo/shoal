@@ -57,14 +57,15 @@ Starting at `cwd` and walking to filesystem root, each directory is checked in t
 4. `.tool-versions`.
 
 The resulting chain is nearest-first. Native Reef precedes foreign formats in the same directory.
-The optional user `[reef]` scope is appended last, so project scopes win. A scope's cache identity is
-its manifest path plus modification time.
+The optional user `[reef]` scope is appended last, so project scopes win. Evaluator reuse is guarded
+by a fixed-size fingerprint of every candidate and adjacent lock path (including missing ones), file
+kind, length, and mtime, so same-cwd creation/edit/removal refreshes the chain and lock.
 
 
-`ScopeChain::discover` silently skips unreadable or malformed native/foreign manifests. Direct parse
-APIs return errors, but normal discovery can therefore hide a typo and fall through to another scope
-or ambient tool. This best-effort behavior is a usability choice and a diagnostic risk; doctor/
-explain paths should surface skipped files if discovery becomes security-sensitive.
+`ScopeChain::discover` skips unreadable or malformed native/foreign manifests but records the reasons
+in `ScopeChain::warnings`. Direct parse APIs return errors. Evaluator discovery is mediated by its
+filesystem capability and admits at most one MiB of regular UTF-8 input per file; best-effort
+fall-through remains a usability choice that callers should surface in diagnostics.
 
 Discovery also skips a manifest when its parsed `manifest.tools` map is empty. A manifest containing
 only runner declarations or Reef options therefore does **not** participate in the scope chain today;
@@ -104,8 +105,9 @@ The hash cache avoids repeated content hashing based on file identity metadata. 
 boundary: changes that preserve the cache identity could conceal drift. When strengthening it,
 measure the cost on frequently resolved commands and retain explicit invalidation tests.
 
-Locks live beside the applicable manifest. The evaluator caches scope/resolver state and invalidates
-through the chain key rather than modifying global process PATH.
+Locks live beside the applicable manifest. The evaluator caches scope/resolver state, invalidates
+through the discovery fingerprint, and uses its filesystem capability for bounded loads and atomic
+replacement rather than modifying global process PATH.
 
 ## Executable view and hermetic PATH
 

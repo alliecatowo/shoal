@@ -1,8 +1,11 @@
 //! Bounded file and structural admission for Reef manifests and lockfiles.
 
-use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+
+use shoal_value::Fs;
+#[cfg(test)]
+use shoal_value::StdFs;
 
 pub const REEF_MANIFEST_MAX_BYTES: usize = 1024 * 1024;
 pub const REEF_MANIFEST_MAX_NESTING: usize = 64;
@@ -44,8 +47,8 @@ impl std::fmt::Display for InputError {
     }
 }
 
-pub(crate) fn read_optional(path: &Path) -> Result<Option<String>, InputError> {
-    let metadata = match fs::metadata(path) {
+pub(crate) fn read_optional_with(fs: &dyn Fs, path: &Path) -> Result<Option<String>, InputError> {
+    let metadata = match fs.metadata(path) {
         Ok(metadata) => metadata,
         Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(source) => {
@@ -60,7 +63,7 @@ pub(crate) fn read_optional(path: &Path) -> Result<Option<String>, InputError> {
             path: path.to_path_buf(),
         });
     }
-    let file = fs::File::open(path).map_err(|source| InputError::Io {
+    let file = fs.open_read(path).map_err(|source| InputError::Io {
         path: path.to_path_buf(),
         source,
     })?;
@@ -141,6 +144,7 @@ pub(crate) fn validate_string(kind: &str, value: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn sparse_non_utf8_and_non_file_inputs_are_typed() {
@@ -149,13 +153,16 @@ mod tests {
         let file = fs::File::create(&path).unwrap();
         file.set_len((REEF_MANIFEST_MAX_BYTES + 1) as u64).unwrap();
         assert!(matches!(
-            read_optional(&path),
+            read_optional_with(&StdFs, &path),
             Err(InputError::TooLarge { .. })
         ));
         fs::write(&path, [0xff]).unwrap();
-        assert!(matches!(read_optional(&path), Err(InputError::Utf8 { .. })));
         assert!(matches!(
-            read_optional(directory.path()),
+            read_optional_with(&StdFs, &path),
+            Err(InputError::Utf8 { .. })
+        ));
+        assert!(matches!(
+            read_optional_with(&StdFs, directory.path()),
             Err(InputError::NotFile { .. })
         ));
     }

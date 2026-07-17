@@ -13,6 +13,7 @@ blake3 = "1.8.5"
 libc = "0.2.186"
 serde = { version = "1.0.228", features = ["derive"] }
 shoal-exec = { path = "../shoal-exec" }
+shoal-value = { path = "../shoal-value" }
 toml = "1.1.2"
 
 [dev-dependencies]

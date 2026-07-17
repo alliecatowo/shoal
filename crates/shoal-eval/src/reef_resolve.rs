@@ -17,21 +17,30 @@ use shoal_reef::{
 impl Evaluator {
     // --- chain cache -------------------------------------------------------
 
-    /// Ensure the cached scope chain matches the current cwd. Rebuilds only when
-    /// the cwd changed since the last discovery (so `cd` / `with cwd:` re-scope
-    /// the next resolution and nothing else does). Reloads the lock next to the
-    /// nearest manifest at the same time.
+    /// Ensure the cached scope chain matches the current cwd and manifest
+    /// metadata. A new, edited, removed, or replaced candidate invalidates the
+    /// cache without requiring a directory change. Reloads the adjacent lock at
+    /// the same time.
     pub(crate) fn ensure_reef_chain(&mut self) {
+        let observed_key = ScopeChain::discovery_key_with(
+            &self.exec.shell.cwd,
+            self.host.reef_user_manifest.as_deref(),
+            self.host.fs.as_ref(),
+        );
         let fresh = match &self.exec.reef.chain {
-            Some((cwd, _)) => cwd != &self.exec.shell.cwd,
+            Some((cwd, _)) => {
+                cwd != &self.exec.shell.cwd
+                    || self.exec.reef.chain_key.as_ref() != Some(&observed_key)
+            }
             None => true,
         };
         if !fresh {
             return;
         }
-        let chain = ScopeChain::discover(
+        let chain = ScopeChain::discover_with(
             &self.exec.shell.cwd,
             self.host.reef_user_manifest.as_deref(),
+            self.host.fs.as_ref(),
         );
         self.exec.reef.lock_path = chain
             .scopes
@@ -44,7 +53,7 @@ impl Evaluator {
             .reef
             .lock_path
             .as_ref()
-            .map(|path| shoal_reef::Lockfile::load(path));
+            .map(|path| shoal_reef::Lockfile::load_with(path, self.host.fs.as_ref()));
         match loaded {
             Some(Ok(lock)) => {
                 self.exec.reef.lock = lock;
@@ -60,6 +69,7 @@ impl Evaluator {
             }
         }
         self.exec.reef.chain = Some((self.exec.shell.cwd.clone(), chain));
+        self.exec.reef.chain_key = Some(observed_key);
     }
 
     /// A clone of the current scope chain (cheap: manifests are small maps),
@@ -164,12 +174,13 @@ impl Evaluator {
                 "cannot persist Reef lock: no manifest-backed lockfile target",
             )
         })?;
-        lock.save(path).map_err(|error| {
-            ErrorVal::new(
-                "reef_provider",
-                format!("persisting Reef lock {}: {error}", path.display()),
-            )
-        })
+        lock.save_with(path, self.host.fs.as_ref())
+            .map_err(|error| {
+                ErrorVal::new(
+                    "reef_provider",
+                    format!("persisting Reef lock {}: {error}", path.display()),
+                )
+            })
     }
 
     pub(crate) fn reef_lock_loaded(&self) -> VResult<()> {
