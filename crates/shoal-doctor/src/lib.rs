@@ -2,7 +2,6 @@ use serde::Serialize;
 use std::{
     fmt, fs,
     path::{Path, PathBuf},
-    process::Command,
 };
 
 #[derive(Debug, Clone)]
@@ -233,11 +232,9 @@ fn probe_adapters(o: &Options, out: &mut Vec<Check>) {
     })
 }
 fn probe_tools(out: &mut Vec<Check>) {
+    let path = std::env::var_os("PATH");
     for tool in ["sh", "git", "rg", "cargo"] {
-        let ok = Command::new("sh")
-            .args(["-c", &format!("command -v {tool}")])
-            .output()
-            .is_ok_and(|x| x.status.success());
+        let ok = tool_available_on_path(tool, path.as_deref());
         out.push(Check {
             name: format!("tool {tool}"),
             level: if ok {
@@ -254,6 +251,16 @@ fn probe_tools(out: &mut Vec<Check>) {
             },
         })
     }
+}
+
+fn tool_available_on_path(tool: &str, path: Option<&std::ffi::OsStr>) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(path) = path else { return false };
+    std::env::split_paths(path).any(|directory| {
+        fs::metadata(directory.join(tool))
+            .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+    })
 }
 fn probe_journal(o: &Options, out: &mut Vec<Check>) {
     let result = (|| {
@@ -361,6 +368,7 @@ fn probe_configs(o: &Options, out: &mut Vec<Check>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     #[test]
     fn temp_xdg_report_is_deterministic() {
         let t = tempfile::tempdir().unwrap();
@@ -422,5 +430,21 @@ mod tests {
                 .iter()
                 .any(|c| c.name == "kernel socket" && c.level == Level::Ok)
         )
+    }
+
+    #[test]
+    fn tool_probe_requires_an_executable_regular_file() {
+        let t = tempfile::tempdir().unwrap();
+        let tool = t.path().join("audit-tool");
+        fs::write(&tool, b"#!/bin/sh\n").unwrap();
+        let path = std::env::join_paths([t.path()]).unwrap();
+
+        assert!(!tool_available_on_path("audit-tool", Some(&path)));
+        let mut permissions = fs::metadata(&tool).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&tool, permissions).unwrap();
+        assert!(tool_available_on_path("audit-tool", Some(&path)));
+        assert!(!tool_available_on_path("missing", Some(&path)));
+        assert!(!tool_available_on_path("audit-tool", None));
     }
 }
