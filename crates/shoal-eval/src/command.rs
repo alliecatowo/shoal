@@ -301,7 +301,9 @@ impl Evaluator {
             return self.eval_wasm_command(call);
         }
         if resolution.source == CommandSource::Adapter {
-            return self.eval_adapter(call, position);
+            let value = self.eval_adapter(call, position)?;
+            let value = self.apply_external_redirects(call, value)?;
+            return self.enforce_command_position(value, position);
         }
         debug_assert_eq!(resolution.source, CommandSource::External);
         let mut argv = vec![OsString::from(&call.head)];
@@ -316,19 +318,42 @@ impl Evaluator {
                 stdin = StdinSpec::File(self.arg_path(&r.target)?);
             }
         }
-        let value = self.run_argv(argv, position, stdin, &call.env_prefix, call.span, None)?;
+        let output_redirected = call
+            .redirects
+            .iter()
+            .any(|redirect| matches!(redirect.kind, RedirectKind::Out | RedirectKind::Append));
+        // A redirected command must finish capture and commit its bytes before
+        // statement-position failure promotion. This matches shell ordering:
+        // `false > file` still creates/truncates `file`, then reports failure.
+        let run_position = if output_redirected {
+            Position::Value
+        } else {
+            position
+        };
+        let value = if output_redirected {
+            self.run_argv_redirected(argv, run_position, stdin, &call.env_prefix, call.span, None)?
+        } else {
+            self.run_argv(argv, run_position, stdin, &call.env_prefix, call.span, None)?
+        };
+        let value = self.apply_external_redirects(call, value)?;
+        self.enforce_command_position(value, position)
+    }
+
+    /// Commit output redirects for any process-backed command (raw external or
+    /// adapter) from the outcome's complete stdout, including lazy CAS spills.
+    fn apply_external_redirects(&mut self, call: &CmdCall, value: Value) -> VResult<Value> {
         let Value::Outcome(out) = &value else {
             return Ok(value);
         };
         let fs = self.host.fs.clone();
         for r in &call.redirects {
-            let target = self.arg_path(&r.target)?;
             match r.kind {
                 // Undo (site/content/internals/language-conformance-contract.md): an external command's `> file` / `>> file`
                 // clobbers the target's contents just like `cp` — snapshot the
                 // prior bytes first, record the restore inverse after, so
                 // `some-cmd > f` and `sh { … } > f` are reversible too.
                 RedirectKind::Out => {
+                    let target = self.arg_path(&r.target)?;
                     let undo_pre = self.redirect_undo_pre(&target);
                     // site/content/internals/language-conformance-contract.md: write the FULL stdout (load from CAS when it
                     // spilled), never just the resident preview.
@@ -337,6 +362,7 @@ impl Evaluator {
                     self.overwrite_undo_post(undo_pre);
                 }
                 RedirectKind::Append => {
+                    let target = self.arg_path(&r.target)?;
                     let undo_pre = self.redirect_undo_pre(&target);
                     fs.append(&target, &out.stdout_bytes()?)
                         .map_err(|e| ErrorVal::new("custom", e.to_string()))?;

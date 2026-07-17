@@ -127,13 +127,42 @@ impl Evaluator {
             parse: spec.parse,
             output_type: spec.output_type,
         };
-        self.run_argv(
-            argv,
-            position,
-            StdinSpec::Null,
-            &call.env_prefix,
-            call.span,
-            Some(meta),
-        )
+        let mut stdin = StdinSpec::Null;
+        for redirect in &call.redirects {
+            if redirect.kind == RedirectKind::In {
+                stdin = StdinSpec::File(self.arg_path(&redirect.target)?);
+            }
+        }
+        let output_redirected = call
+            .redirects
+            .iter()
+            .any(|redirect| matches!(redirect.kind, RedirectKind::Out | RedirectKind::Append));
+        // Preserve statement failure semantics only after redirected bytes have
+        // been committed by the dispatch layer. Running as Value here keeps a
+        // non-zero child outcome available for that write-first ordering.
+        let run_position = if output_redirected {
+            Position::Value
+        } else {
+            position
+        };
+        if output_redirected {
+            self.run_argv_redirected(
+                argv,
+                run_position,
+                stdin,
+                &call.env_prefix,
+                call.span,
+                Some(meta),
+            )
+        } else {
+            self.run_argv(
+                argv,
+                run_position,
+                stdin,
+                &call.env_prefix,
+                call.span,
+                Some(meta),
+            )
+        }
     }
 }

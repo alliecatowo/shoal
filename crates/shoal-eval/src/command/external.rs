@@ -2,16 +2,67 @@
 
 use super::*;
 
+#[derive(Clone, Copy)]
+enum ProcessMode {
+    Auto(Position),
+    Redirected(Position),
+}
+
 impl Evaluator {
     pub(crate) fn run_argv(
         &mut self,
-        mut argv: Vec<OsString>,
+        argv: Vec<OsString>,
         position: Position,
         stdin: StdinSpec,
         prefixes: &[EnvPrefix],
         span: Span,
         meta: Option<ExecMeta>,
     ) -> VResult<Value> {
+        self.run_argv_inner(
+            argv,
+            ProcessMode::Auto(position),
+            stdin,
+            prefixes,
+            span,
+            meta,
+        )
+    }
+
+    /// Run a command that has an output redirect. Redirected execution must
+    /// capture even in an interactive statement: streaming through a PTY would
+    /// both leak bytes to the terminal and retain only the bounded tee prefix.
+    pub(super) fn run_argv_redirected(
+        &mut self,
+        argv: Vec<OsString>,
+        position: Position,
+        stdin: StdinSpec,
+        prefixes: &[EnvPrefix],
+        span: Span,
+        meta: Option<ExecMeta>,
+    ) -> VResult<Value> {
+        self.run_argv_inner(
+            argv,
+            ProcessMode::Redirected(position),
+            stdin,
+            prefixes,
+            span,
+            meta,
+        )
+    }
+
+    fn run_argv_inner(
+        &mut self,
+        mut argv: Vec<OsString>,
+        process_mode: ProcessMode,
+        stdin: StdinSpec,
+        prefixes: &[EnvPrefix],
+        span: Span,
+        meta: Option<ExecMeta>,
+    ) -> VResult<Value> {
+        let (position, force_capture) = match process_mode {
+            ProcessMode::Auto(position) => (position, false),
+            ProcessMode::Redirected(position) => (position, true),
+        };
         let mut env = self.exec.shell.process_env.clone();
         for p in prefixes {
             let v = self.cmd_arg_value(&p.value)?;
@@ -42,7 +93,8 @@ impl Evaluator {
             &stdin,
             StdinSpec::Bytes(_) | StdinSpec::File(_) | StdinSpec::Stream(_)
         );
-        let mode = if !finite_stdin
+        let mode = if !force_capture
+            && !finite_stdin
             && (force_tui || (self.session.interactive && position == Position::Statement))
         {
             ExecMode::PtyTee
@@ -199,21 +251,32 @@ impl Evaluator {
             // (site/content/internals/kernel-protocol.md).
             span: Some(span),
         }));
-        if !ok && position == Position::Statement {
-            let Value::Outcome(failed) = &out else {
-                unreachable!()
-            };
+        self.enforce_command_position(out, position)
+    }
+
+    /// Promote an unsuccessful outcome to Shoal's statement-position
+    /// `cmd_failed` error while leaving value-position outcomes inspectable.
+    /// Redirect callers run in value position until bytes have been committed,
+    /// then apply the original position through this shared gate.
+    pub(super) fn enforce_command_position(
+        &self,
+        out: Value,
+        position: Position,
+    ) -> VResult<Value> {
+        if position == Position::Statement
+            && let Value::Outcome(failed) = &out
+            && !failed.ok
+        {
             let message = match (failed.status, failed.signal.as_deref()) {
                 (Some(code), _) => format!("`{}` exited with status {code}", failed.cmd),
                 (_, Some(signal)) => format!("`{}` died from {signal}", failed.cmd),
                 _ => format!("`{}` failed", failed.cmd),
             };
-            Err(ErrorVal::new("cmd_failed", message)
+            return Err(ErrorVal::new("cmd_failed", message)
                 .with_status(failed.status)
-                .with_stderr(String::from_utf8_lossy(&failed.stderr).into_owned()))
-        } else {
-            Ok(out)
+                .with_stderr(String::from_utf8_lossy(&failed.stderr).into_owned()));
         }
+        Ok(out)
     }
 
     /// The leash spawn gate (site/content/internals/language-conformance-contract.md content-hash pinning). Consulted from
