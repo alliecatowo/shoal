@@ -432,7 +432,8 @@ impl Evaluator {
             return Ok(self.dir_stack_value());
         }
         let target = self.cd_target(call)?;
-        self.dir_stack.insert(0, self.cwd.clone());
+        let cwd = self.cwd.clone();
+        self.dir_stack.insert(0, cwd);
         self.change_cwd(target);
         Ok(self.dir_stack_value())
     }

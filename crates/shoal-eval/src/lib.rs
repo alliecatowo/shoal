@@ -7,6 +7,7 @@ mod channels;
 mod child_context;
 mod coerce;
 mod command;
+mod exec_state;
 mod expr;
 mod expr_access;
 mod expr_binop;
@@ -126,92 +127,21 @@ pub struct Evaluator {
     /// Session identity, authority, and presentation policy. Kept as one typed
     /// unit so child construction cannot copy only a subset.
     session: session_ctx::SessionCtx,
-    /// Child-inherited reef overlay/cache/lock state. Grouped so no child can
-    /// inherit only part of the resolver's mutable view.
-    reef: reef_state::ReefState,
-    pub env: Env,
-    cwd: PathBuf,
-    process_env: Vec<(OsString, OsString)>,
-    pub it: Value,
-    cancel: CancelToken,
-    /// Runtime call-stack depth guard (defect #9).
-    call_depth: usize,
-    /// Nesting depth inside `fn` bodies — gates `cd`/env writes (defect #10).
-    in_fn_body: usize,
-    /// Live task registry backing the `jobs` builtin (defect #14).
-    jobs: Vec<shoal_value::TaskVal>,
-    /// Map of stopped-external job id → child pid, for the REPL's `fg`/`bg`
-    /// (site/content/internals/language-conformance-contract.md job control). A stopped foreground external command is recorded
-    /// twice: as a suspended `TaskVal` in `jobs` (so it lists via `jobs` and the
-    /// kernel `task.suspend`/`task.resume` wire methods drive its SIGTSTP/SIGCONT
-    /// through the task's hooks), and here so `fg`/`bg` can locate its still-live
-    /// parked PTY by pid (via [`shoal_exec::take_stopped_job`]). Empty unless an
-    /// interactive foreground command has actually been Ctrl-Z'd.
-    external_jobs: std::collections::HashMap<u64, u32>,
-    /// The most recent foreground external command that stopped this turn
-    /// (job id, display form), set by `run_argv` when the exec layer reports a
-    /// stop and drained by the REPL (`take_pending_stop`) to print the
-    /// "[id]+ Stopped …" notice and return to the prompt.
-    pending_stop: Option<(u64, String)>,
-    /// reef (site/content/internals/reef-resolution.md): cached scope chain, keyed on the cwd it was
-    /// discovered for. Rebuilt only when the cwd changes (cd / `with cwd:`).
-    /// `None` until the first spawn/`which`/`reef` touches it; cheap when no
-    /// manifest is in scope (a pure filesystem walk with an empty result).
-    /// reef: the provider stack, built lazily on the first *constrained*
-    /// resolution — never touched on the hot path when no manifest is in scope.
-    /// reef: the in-memory lock, loaded from (and persisted next to) the nearest
-    /// manifest. Empty and inert when no manifest is in scope.
-    /// reef: optional user-scope `shoal.toml` whose `[reef]` table forms the
-    /// user scope. `None` (the default) means no user scope — the zero-config,
-    /// zero-regression path. Hosts wire a real path via
-    /// [`Evaluator::set_reef_user_manifest`]; tests never point at real config.
-    /// reef: `with reef: {tool: constraint, …} { }` override layers (see
-    /// `site/content/internals/reef-resolution.md`), nearest-first (innermost `with reef:` block wins). Empty and inert
-    /// when no `with reef:` is on the dynamic stack — zero-regression.
-    /// The journal entry id of the top-level statement currently executing, so
-    /// nested fs mutations (rm/cp/mv/save) can attach undo inverses to it.
-    /// `None` outside a journaled statement.
-    current_entry: Option<i64>,
-    /// Source text of the program currently being evaluated, used to slice each
-    /// top-level statement's `src` for its journal entry (site/content/internals/language-conformance-contract.md). `None` when
-    /// the host did not provide it — the entry's `src` is then left empty.
-    source: Option<String>,
-    /// The in-language `channel(name)` event bus (site/content/internals/streams-channels.md). Shared
-    /// (Arc) so spawned tasks / `on(...)` handlers publish and subscribe to the
-    /// same session-scoped channels — coordination is channels, never files.
-    /// Set by the `exit`/`quit` builtin (defect: no `exit`). `Some(code)` asks
-    /// the host to stop: `eval_program` halts its statement loop, and the host
-    /// (REPL loop / `-c` / script runner) ends cleanly with `code`. Kept as a
-    /// value the host acts on — eval NEVER calls `std::process::exit`, which
-    /// would break the kernel/embedded host.
-    pending_exit: Option<i32>,
-    /// Module cache (site/content/internals/roadmap-and-priorities.md): a module (keyed by canonical path) evaluates
-    /// once per session; its exports record is memoized here. Empty until the
-    /// first `use`.
-    modules: std::collections::HashMap<PathBuf, Value>,
-    /// The stack of modules currently being loaded, for circular-`use` detection.
-    module_stack: Vec<PathBuf>,
-    /// Derived-but-unspawned plans from the `plan { … }` REPL verb (site/content/internals/roadmap-and-priorities.md),
-    /// indexed by id (`1`-based). `apply <ref>` looks a plan up here and runs it.
-    plans: Vec<Program>,
-    /// Persistent directory-frecency store for `j`/`jump` (`frecency.rs`).
-    /// `None` (the `Evaluator::new` default, so `-c`/scripts/conformance never
-    /// write) disables recording; a `j` query then still reads the shared
-    /// per-user store. `Some(path)` (set by an interactive host via
-    /// [`Evaluator::open_default_jump_history`], or a test via
-    /// [`Evaluator::set_jump_store`]) makes every `cd` bump that file.
-    jump_store: Option<PathBuf>,
-    /// The directory `cd -` returns to: the cwd immediately before the last
-    /// real navigation (`cd`/`pushd`/`popd`/`j`). `None` until the first cwd
-    /// change. Held as a plain field exactly like `cwd` — session-scoped
-    /// ambient state, never persisted to disk. `cd -` restores this *exact*
-    /// `PathBuf` (byte-identical to the directory left), never a re-derived one.
-    oldpwd: Option<PathBuf>,
-    /// The `pushd`/`popd` directory stack: the directories *below* the current
-    /// `cwd`, which is always the conceptual top. `dirs` renders `[cwd] ++
-    /// dir_stack` (current first, bash's left-to-right order). Session-scoped
-    /// ambient state like `cwd`; never journaled or persisted to disk.
-    dir_stack: Vec<PathBuf>,
+    exec: exec_state::ExecState,
+}
+
+impl std::ops::Deref for Evaluator {
+    type Target = exec_state::ExecState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.exec
+    }
+}
+
+impl std::ops::DerefMut for Evaluator {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.exec
+    }
 }
 
 enum Flow {
@@ -234,26 +164,7 @@ impl Evaluator {
         Self {
             host: Arc::new(host_services::HostServices::default()),
             session: session_ctx::SessionCtx::default(),
-            reef: reef_state::ReefState::default(),
-            env: Env::root(),
-            cwd,
-            process_env: std::env::vars_os().collect(),
-            it: Value::Null,
-            cancel: CancelToken::new(),
-            call_depth: 0,
-            in_fn_body: 0,
-            jobs: Vec::new(),
-            external_jobs: std::collections::HashMap::new(),
-            pending_stop: None,
-            current_entry: None,
-            source: None,
-            pending_exit: None,
-            modules: std::collections::HashMap::new(),
-            module_stack: Vec::new(),
-            plans: Vec::new(),
-            jump_store: None,
-            oldpwd: None,
-            dir_stack: Vec::new(),
+            exec: exec_state::ExecState::root(cwd),
         }
     }
 
