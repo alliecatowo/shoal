@@ -4,6 +4,8 @@
 //! `site/content/internals/change-map.md`; pure mechanical move, zero wire/behavior change.
 use super::*;
 
+mod plan;
+
 impl Kernel {
     pub(crate) fn handle_exec(
         self: &Arc<Self>,
@@ -283,93 +285,7 @@ impl Kernel {
             return encode(json!({"task":task_ref,"events":events_channel}));
         }
         if params.mode == "plan" {
-            let mut evaluator = session.lock_evaluator()?;
-            let mut ast = shoal_syntax::parse_with_ctx(
-                &params.src,
-                parse_ctx_for_kernel(evaluator.env(), interactive),
-            )
-            .map_err(|e| RpcError {
-                code: PARSE_ERROR,
-                message: e.msg,
-                data: Some(json!({"span":e.span,"hint":e.hint})),
-            })?;
-            session.rewrite_out_undo(&mut ast);
-            let ast_json = serde_json::to_string(&ast).map_err(internal)?;
-            let plan = derive_plan(&mut evaluator, &ast, &ast_json);
-            drop(evaluator);
-            let source_hash = source_hash(&params.src);
-            let plan_hash = bound_plan_hash(&params.src, &ast_json, &plan, &session.id, &actor);
-            let plan_ref = self.allocate_plan_ref(&plan_hash);
-            let mut plan = plan;
-            plan.plan_ref.clone_from(&plan_ref);
-            let verdict = self.policy.evaluate_plan(&actor, &plan);
-            let result = PlanResult {
-                plan_ref: plan.plan_ref.clone(),
-                effects: plan
-                    .effects
-                    .iter()
-                    .map(|e| serde_json::to_value(e).unwrap())
-                    .collect(),
-                reversibility: reversibility_from_effects(&plan.effects).into(),
-                verdict: verdict_name(verdict).into(),
-                approval_pending: verdict == Verdict::ApprovalRequired,
-            };
-            self.plans.transaction(|plans| -> Result<(), RpcError> {
-                plans.retain(|_, stored| !plan_expired(stored));
-                let owner_plans = plans
-                    .values()
-                    .filter(|stored| stored.session == session.id && stored.principal == actor)
-                    .collect::<Vec<_>>();
-                let owner_source_bytes = owner_plans
-                    .iter()
-                    .map(|stored| stored.src.len())
-                    .sum::<usize>();
-                if owner_plans.len() >= MAX_STORED_PLANS_PER_OWNER
-                    || owner_source_bytes.saturating_add(params.src.len())
-                        > MAX_PLAN_SOURCE_BYTES_PER_OWNER
-                {
-                    return Err(RpcError {
-                        code: QUOTA_EXCEEDED,
-                        message: "stored plan quota reached".into(),
-                        data: Some(json!({
-                            "limit": "stored_plans_per_owner",
-                            "max_count": MAX_STORED_PLANS_PER_OWNER,
-                            "max_source_bytes": MAX_PLAN_SOURCE_BYTES_PER_OWNER,
-                        })),
-                    });
-                }
-                plans.insert(
-                    plan.plan_ref.clone(),
-                    StoredPlan {
-                        src: params.src,
-                        session: session.id.clone(),
-                        principal: actor.clone(),
-                        plan_hash,
-                        source_hash,
-                        plan,
-                        authorization: match verdict {
-                            Verdict::Allow => PlanAuthorization::PolicyAllowed,
-                            Verdict::ApprovalRequired => PlanAuthorization::Pending,
-                            Verdict::Deny => PlanAuthorization::Denied,
-                        },
-                        created_at: Instant::now(),
-                    },
-                );
-                Ok(())
-            })??;
-            if verdict == Verdict::ApprovalRequired {
-                // site/content/internals/kernel-protocol.md: a plan stuck at `approval_pending` is
-                // exactly the moment another principal (a human's session, a
-                // supervising agent) needs to learn about it without
-                // polling — announce it on `approval` the same way a new
-                // transcript value announces on `session.transcript`.
-                self.events.publish(
-                    &session.key.owner(),
-                    "approval",
-                    approval_event(&result.plan_ref, &result.effects, &actor),
-                );
-            }
-            return encode(result);
+            return self.handle_exec_plan(params, session, &actor, interactive);
         } else if params.mode != "approved" && params.mode != "run" {
             return Err(RpcError {
                 code: INVALID_PARAMS,
