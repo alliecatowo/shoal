@@ -88,6 +88,18 @@ export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
 rehash 2>/dev/null || true
 ```
 
+For a complete repository-managed install (main shell plus every companion and
+sandbox helper), prefer:
+
+```bash
+mise run install
+# or force a clean release rebuild first:
+mise run install:clean
+```
+
+`mise run install:check` verifies that every installed executable is identical
+to its current `target/release` artifact.
+
 `rehash` is useful in zsh after a new executable appears; it is harmlessly skipped elsewhere.
 
 ### `shoal lsp` or `shoal mcp` cannot launch companion

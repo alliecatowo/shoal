@@ -1,2 +1,22 @@
 [tools]
-rust = "latest"
+rust = "1.97.0"
+actionlint = "1.7.12"
+zola = "0.22.1"
+"cargo:cargo-audit" = "0.22.2"
+"cargo:cargo-fuzz" = "0.13.2"
+
+[tasks.check]
+description = "Run the exact local CI/release gate"
+run = "./scripts/check.sh"
+
+[tasks.install]
+description = "Build and install every Shoal executable"
+run = "./scripts/install.sh"
+
+[tasks."install:clean"]
+description = "Remove release artifacts, then rebuild and install every Shoal executable"
+run = "./scripts/install.sh --clean"
+
+[tasks."install:check"]
+description = "Verify installed Shoal executables match the current release artifacts"
+run = "./scripts/install.sh --check"

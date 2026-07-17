@@ -70,6 +70,21 @@ cargo install --path crates/shoal-doctor
 cargo install --path crates/shoal-exec
 ```
 
+The repository's mise tasks build and install the complete set together, so a
+main binary cannot be updated while its required companions remain stale:
+
+```bash
+mise install
+mise run install          # incremental release build + verified install
+mise run install:clean    # clean release rebuild + verified install
+mise run install:check    # compare installed binaries with target/release
+```
+
+The destination is `${CARGO_HOME:-$HOME/.cargo}/bin`; set
+`SHOAL_INSTALL_DIR` to choose another executable directory. Installation does
+not restart an existing durable kernel because that would discard its live
+in-memory Sessions. Restart it explicitly after an upgrade when appropriate.
+
 Installing the sandbox helper beside the other executables matters when Leash resolves a concrete OS sandbox: the spawn layer searches beside the current executable, not arbitrary `PATH`, for `shoal-sandbox-exec`.
 
 Check:
