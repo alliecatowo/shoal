@@ -58,6 +58,21 @@ fn map_tool(name: &str, args: Value) -> Result<(&'static str, Value), String> {
                 "elide": object.get("elide"),
             }),
         ),
+        "shoal_stream_pull" => (
+            "stream.pull",
+            json!({
+                "cursor": object.get("cursor").cloned().ok_or("missing cursor")?,
+                "limit": object.get("limit"),
+                "wait_ms": object.get("wait_ms"),
+                "elide": object.get("elide"),
+            }),
+        ),
+        "shoal_stream_close" => (
+            "stream.close",
+            json!({
+                "cursor": object.get("cursor").cloned().ok_or("missing cursor")?,
+            }),
+        ),
         // `until`/`effects`/`ok` are honored kernel-side; forward verbatim.
         "shoal_journal" => ("journal.query", args),
         // Task cancellation (site/content/internals/kernel-protocol.md).
@@ -217,6 +232,16 @@ pub fn tools() -> Vec<Value> {
             json!({"type":"object","properties":{"ref":{"type":"string"},"path":{"type":"string"},"slice":{"type":"array","items":{"type":"integer"},"minItems":2,"maxItems":2},"elide":{"type":"object","properties":{"max_bytes":{"type":"integer"},"max_rows":{"type":"integer"},"max_items":{"type":"integer"}}}},"required":["ref"],"additionalProperties":false}),
         ),
         tool(
+            "shoal_stream_pull",
+            "Pull the next bounded batch from a stream cursor returned by shoal_exec or shoal_get. Items are individually addressable transcript values; done and timed_out are explicit.",
+            json!({"type":"object","properties":{"cursor":{"type":"object","properties":{"ref":{"type":"string"},"path":{"type":"string"}},"required":["ref"],"additionalProperties":false},"limit":{"type":"integer","minimum":1,"maximum":64},"wait_ms":{"type":"integer","minimum":0,"maximum":1000},"elide":{"type":"object","properties":{"max_bytes":{"type":"integer"},"max_rows":{"type":"integer"},"max_items":{"type":"integer"}}}},"required":["cursor"],"additionalProperties":false}),
+        ),
+        tool(
+            "shoal_stream_close",
+            "Close a stream cursor and release its source, pump, and OS resources.",
+            json!({"type":"object","properties":{"cursor":{"type":"object","properties":{"ref":{"type":"string"},"path":{"type":"string"}},"required":["ref"],"additionalProperties":false}},"required":["cursor"],"additionalProperties":false}),
+        ),
+        tool(
             "shoal_journal",
             "Query the structured execution journal",
             json!({"type":"object","properties":{"since":{"type":"integer"},"until":{"type":"integer"},"principal":{"type":"string"},"ok":{"type":"boolean"},"effects":{"type":"array","items":{"type":"string"}},"head":{"type":"string"},"limit":{"type":"integer","minimum":1}},"additionalProperties":false}),
@@ -282,7 +307,7 @@ mod tests {
         assert!(names.contains(&"shoal_pty_open".to_string()));
         assert!(names.contains(&"shoal_pty_read".to_string()));
         assert!(names.contains(&"shoal_pty_list".to_string()));
-        assert_eq!(tools().len(), 13);
+        assert_eq!(tools().len(), 15);
         for t in tools() {
             assert_eq!(t["inputSchema"]["type"], "object")
         }
@@ -302,6 +327,18 @@ mod tests {
         assert_eq!(
             map_tool("shoal_get", json!({"ref":"out:1"})).unwrap().0,
             "value.get"
+        );
+        assert_eq!(
+            map_tool("shoal_stream_pull", json!({"cursor":{"ref":"out:1"}}))
+                .unwrap()
+                .0,
+            "stream.pull"
+        );
+        assert_eq!(
+            map_tool("shoal_stream_close", json!({"cursor":{"ref":"out:1"}}))
+                .unwrap()
+                .0,
+            "stream.close"
         );
         assert_eq!(
             map_tool("shoal_journal", json!({"limit":2})).unwrap().0,

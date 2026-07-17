@@ -5,6 +5,7 @@ mod eventbus;
 mod handlers_exec;
 mod handlers_pty;
 mod handlers_session;
+mod handlers_stream;
 mod handlers_task;
 mod handlers_value;
 mod session;

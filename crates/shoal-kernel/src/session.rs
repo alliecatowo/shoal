@@ -79,9 +79,17 @@ pub(crate) struct Session {
     pub(crate) lang_bus: Arc<shoal_eval::EventBus>,
     pub(crate) transcript: Mutex<HashMap<Ref, Value>>,
     pub(crate) next_value: AtomicU64,
+    stream_cursors: Mutex<HashMap<StreamCursorRef, Arc<Mutex<WireStreamCursor>>>>,
 }
 
 pub(crate) const MAX_TRANSCRIPT_PER_SESSION: usize = 4096;
+pub(crate) const MAX_WIRE_STREAM_CURSORS: usize = 64;
+
+pub(crate) struct WireStreamCursor {
+    pub(crate) upstream: Option<Box<dyn shoal_value::Upstream>>,
+    pub(crate) next_seq: u64,
+    pub(crate) done: bool,
+}
 
 impl Session {
     pub(crate) fn touch(&self) {
@@ -120,6 +128,118 @@ impl Session {
         {
             transcript.remove(&Ref::new("out", id - MAX_TRANSCRIPT_PER_SESSION as u64));
         }
+    }
+
+    /// Get or lazily claim a transcript stream's single-consumer upstream.
+    /// Cursor creation is serialized under the registry lock, so concurrent
+    /// first pulls cannot both consume the same `StreamVal`.
+    pub(crate) fn stream_cursor(
+        &self,
+        cursor: &StreamCursorRef,
+    ) -> Result<Arc<Mutex<WireStreamCursor>>, RpcError> {
+        let mut cursors = self.stream_cursors.lock().unwrap();
+        if let Some(entry) = cursors.get(cursor) {
+            return Ok(entry.clone());
+        }
+
+        // Terminal cursors retain no upstream resources. Reap them at the
+        // admission boundary so clients do not need to close after observing
+        // `done:true` merely to make quota progress.
+        if cursors.len() >= MAX_WIRE_STREAM_CURSORS {
+            cursors.retain(|_, entry| !entry.lock().unwrap().done);
+        }
+        if cursors.len() >= MAX_WIRE_STREAM_CURSORS {
+            return Err(RpcError {
+                code: QUOTA_EXCEEDED,
+                message: "live stream cursor quota reached".into(),
+                data: Some(json!({
+                    "limit": "stream_cursors_per_session",
+                    "max": MAX_WIRE_STREAM_CURSORS,
+                })),
+            });
+        }
+
+        let stream = self.resolve_stream_value(cursor)?;
+        let upstream = stream.take_upstream().map_err(stream_error)?;
+        let entry = Arc::new(Mutex::new(WireStreamCursor {
+            upstream: Some(upstream),
+            next_seq: 0,
+            done: false,
+        }));
+        cursors.insert(cursor.clone(), entry.clone());
+        Ok(entry)
+    }
+
+    /// Explicitly release a cursor. If it has never been pulled, claim and
+    /// immediately drop its upstream so source threads/resources are closed
+    /// and later pulls correctly observe single consumption.
+    pub(crate) fn close_stream_cursor(&self, cursor: &StreamCursorRef) -> Result<bool, RpcError> {
+        if let Some(entry) = self.stream_cursors.lock().unwrap().remove(cursor) {
+            // A concurrent pull may already hold this entry after releasing
+            // the registry map. Wait for that bounded pull, then take/drop the
+            // upstream before reporting close complete.
+            let mut entry = entry.lock().unwrap();
+            entry.upstream.take();
+            entry.done = true;
+            return Ok(true);
+        }
+        let stream = self.resolve_stream_value(cursor)?;
+        match stream.take_upstream() {
+            Ok(upstream) => {
+                drop(upstream);
+                Ok(true)
+            }
+            Err(error) if error.code == "stream_consumed" => Ok(false),
+            Err(error) => Err(stream_error(error)),
+        }
+    }
+
+    fn resolve_stream_value(
+        &self,
+        cursor: &StreamCursorRef,
+    ) -> Result<shoal_value::StreamVal, RpcError> {
+        let transcript = self.transcript.lock().unwrap();
+        let root = transcript.get(&cursor.r#ref).ok_or_else(unknown_stream)?;
+        let value = match cursor.path.as_deref() {
+            Some(path) if !path.is_empty() => {
+                resolve_value_path(root, path).map_err(|message| RpcError {
+                    code: BAD_PATH_OR_SLICE,
+                    message,
+                    data: Some(json!({"ref":cursor.r#ref,"path":path})),
+                })?
+            }
+            _ => root.clone(),
+        };
+        match value {
+            Value::Stream(stream) => Ok(stream),
+            other => Err(RpcError {
+                code: BAD_PATH_OR_SLICE,
+                message: format!("stream cursor addresses a {}", other.type_name()),
+                data: Some(json!({"ref":cursor.r#ref,"path":cursor.path})),
+            }),
+        }
+    }
+}
+
+fn unknown_stream() -> RpcError {
+    RpcError {
+        code: UNKNOWN_REF,
+        message: "unknown stream cursor".into(),
+        data: None,
+    }
+}
+
+fn stream_error(error: shoal_value::ErrorVal) -> RpcError {
+    RpcError {
+        code: RAISED,
+        message: error.msg.clone(),
+        data: Some(json!({
+            "code": error.code,
+            "span": error.span,
+            "hint": error.hint,
+            "status": error.status,
+            "stderr": error.stderr,
+        })),
     }
 }
 
@@ -194,6 +314,7 @@ impl Kernel {
                     lang_bus,
                     transcript: Mutex::new(HashMap::new()),
                     next_value: AtomicU64::new(1),
+                    stream_cursors: Mutex::new(HashMap::new()),
                 }))
             },
             |owner| {

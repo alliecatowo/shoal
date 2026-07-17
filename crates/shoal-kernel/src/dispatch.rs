@@ -46,6 +46,8 @@ impl Kernel {
                     "parse" => self.handle_parse(params),
                     "exec" => self.handle_exec(params, client, attached),
                     "value.get" => self.handle_value_get(params, attached),
+                    "stream.pull" => self.handle_stream_pull(params, attached),
+                    "stream.close" => self.handle_stream_close(params, attached),
                     "task.list" => self.handle_task_list(attached),
                     "task.get" => self.handle_task_get(params, attached),
                     "task.await" => self.handle_task_await(params, attached),

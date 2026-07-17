@@ -110,7 +110,7 @@ impl Facade {
         }
         // `shoal://task/{id}/out`: the task's captured output — the read side of
         // the subscription (site/content/internals/kernel-protocol.md). A kernel task captures the *whole* outcome at
-        // completion (no streaming cursor infra yet), so this returns the full
+        // completion (tasks do not expose a live stream cursor), so this returns the full
         // current output: resolve the task record's `result_ref` through
         // `value.get` (reusing existing methods, honoring ?path/slice/format).
         // A task with no captured value yet (still running, or failed before

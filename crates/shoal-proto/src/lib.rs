@@ -220,6 +220,16 @@ impl Ref {
     }
 }
 
+/// Stable identity of a live stream pipeline retained by a kernel session.
+/// `path` addresses a stream nested under the transcript value (for example
+/// an outcome's `out`) without pretending that the stream itself is serializable.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct StreamCursorRef {
+    pub r#ref: Ref,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "$", rename_all = "snake_case")]
 pub enum WireValue {
@@ -317,11 +327,13 @@ pub enum WireValue {
         /// Display form; closures are not wire-invocable in v0.1.
         repr: String,
     },
-    /// Stream chunks are deferred (site/content/internals/language-conformance-contract.md promises "ref + chunks"); today a
-    /// stream only wires its label — pulling chunks needs a follow-up
-    /// protocol method that does not exist yet.
+    /// A live, single-consumption stream. Kernel/session projections include a
+    /// cursor that can be driven with `stream.pull` and released with
+    /// `stream.close`; context-free projections may omit it.
     Stream {
         label: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<StreamCursorRef>,
     },
     /// Redaction by construction (site/content/internals/language-conformance-contract.md): never the secret material.
     Secret {
@@ -581,6 +593,45 @@ pub struct ValueGetParams {
     /// `"raw"` returns a str verbatim / bytes base64 (other types error).
     #[serde(default)]
     pub format: Option<String>,
+}
+
+/// `stream.pull` — pull a bounded batch from a session-owned live stream.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamPullParams {
+    pub cursor: StreamCursorRef,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Total wall-clock wait for this batch. The kernel clamps this to one
+    /// second; omitted means a non-blocking poll.
+    #[serde(default)]
+    pub wait_ms: Option<u64>,
+    #[serde(default)]
+    pub elide: Option<ElideSpec>,
+}
+
+/// `stream.close` — drop the retained pipeline and release its resources.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamCloseParams {
+    pub cursor: StreamCursorRef,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamItem {
+    pub seq: u64,
+    pub r#ref: Ref,
+    pub value: WireValue,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamPullResult {
+    pub cursor: StreamCursorRef,
+    pub items: Vec<StreamItem>,
+    pub done: bool,
+    pub timed_out: bool,
+    /// A source/combinator error terminates the cursor but does not discard
+    /// earlier items already pulled into the same batch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<WireValue>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct JournalQueryParams {

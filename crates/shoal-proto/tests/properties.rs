@@ -22,7 +22,10 @@ fn leaf() -> impl Strategy<Value = WireValue> {
         any::<String>().prop_map(|pattern| WireValue::Glob { pattern }),
         any::<String>().prop_map(|src| WireValue::Regex { src }),
         any::<String>().prop_map(|repr| WireValue::Closure { repr }),
-        any::<String>().prop_map(|label| WireValue::Stream { label }),
+        any::<String>().prop_map(|label| WireValue::Stream {
+            label,
+            cursor: None
+        }),
         any::<String>().prop_map(|name| WireValue::Secret { name }),
         any::<String>().prop_map(|repr| WireValue::Cmd { repr }),
         (any::<i64>(), any::<i64>(), any::<bool>()).prop_map(|(start, end, inclusive)| {
