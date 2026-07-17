@@ -16,7 +16,8 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
-use std::path::PathBuf;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
@@ -123,28 +124,41 @@ impl ShoalCompleter {
         let Some(path_var) = std::env::var_os("PATH") else {
             return out;
         };
+        let cwd = self.cwd();
         for dir in std::env::split_paths(&path_var) {
-            let mtime = fs::metadata(&dir).and_then(|m| m.modified()).ok();
-            let stale = match self.path_cache.get(&dir) {
-                Some((cached, _)) => *cached != mtime,
-                None => true,
+            let dir = if dir.is_absolute() {
+                dir
+            } else {
+                cwd.join(dir)
             };
-            if stale {
-                let mut names = Vec::new();
-                if let Ok(entries) = fs::read_dir(&dir) {
-                    for entry in entries.flatten().take(4000) {
-                        if let Some(name) = entry.file_name().to_str() {
-                            names.push(name.to_string());
-                        }
-                    }
-                }
-                self.path_cache.insert(dir.clone(), (mtime, names));
-            }
-            if let Some((_, names)) = self.path_cache.get(&dir) {
-                out.extend(names.iter().cloned());
-            }
+            out.extend(self.path_dir_names(&dir));
         }
         out
+    }
+
+    fn path_dir_names(&mut self, dir: &Path) -> Vec<String> {
+        let mtime = fs::metadata(dir).and_then(|m| m.modified()).ok();
+        let stale = match self.path_cache.get(dir) {
+            Some((cached, _)) => *cached != mtime,
+            None => true,
+        };
+        if stale {
+            let mut names = Vec::new();
+            if let Ok(entries) = fs::read_dir(dir) {
+                for entry in entries.flatten().take(4000) {
+                    let executable = entry.metadata().is_ok_and(|metadata| {
+                        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+                    });
+                    if executable && let Some(name) = entry.file_name().to_str() {
+                        names.push(name.to_string());
+                    }
+                }
+            }
+            self.path_cache.insert(dir.to_path_buf(), (mtime, names));
+        }
+        self.path_cache
+            .get(dir)
+            .map_or_else(Vec::new, |(_, names)| names.clone())
     }
 
     fn adapter_lookup(&self, head: &str) -> Option<&CmdAdapter> {
@@ -1211,34 +1225,27 @@ mod tests {
     fn path_names_cache_invalidates_on_mtime_change() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("toolone"), b"").unwrap();
+        fs::set_permissions(
+            dir.path().join("toolone"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        fs::write(dir.path().join("not-executable"), b"").unwrap();
+        fs::create_dir(dir.path().join("directory")).unwrap();
         let mut c = completer_at(Path::new("."));
-        // Seed the cache manually against our tempdir (bypassing $PATH so
-        // the test is hermetic), then verify a second scan after a new file
-        // appears picks it up rather than returning the cached snapshot.
-        let scan = |c: &mut ShoalCompleter, dir: &Path| -> Vec<String> {
-            let mtime = fs::metadata(dir).and_then(|m| m.modified()).ok();
-            let stale = match c.path_cache.get(dir) {
-                Some((cached, _)) => *cached != mtime,
-                None => true,
-            };
-            if stale {
-                let mut names = Vec::new();
-                if let Ok(entries) = fs::read_dir(dir) {
-                    for entry in entries.flatten() {
-                        if let Some(name) = entry.file_name().to_str() {
-                            names.push(name.to_string());
-                        }
-                    }
-                }
-                c.path_cache.insert(dir.to_path_buf(), (mtime, names));
-            }
-            c.path_cache.get(dir).unwrap().1.clone()
-        };
-        let first = scan(&mut c, dir.path());
+        // Scan the cache primitive directly so the test is hermetic rather
+        // than mutating process PATH. Non-executable files and directories are
+        // never command-head candidates.
+        let first = c.path_dir_names(dir.path());
         assert_eq!(first, vec!["toolone".to_string()]);
         std::thread::sleep(std::time::Duration::from_millis(1100));
         fs::write(dir.path().join("tooltwo"), b"").unwrap();
-        let mut second = scan(&mut c, dir.path());
+        fs::set_permissions(
+            dir.path().join("tooltwo"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let mut second = c.path_dir_names(dir.path());
         second.sort();
         assert_eq!(second, vec!["toolone".to_string(), "tooltwo".to_string()]);
     }
