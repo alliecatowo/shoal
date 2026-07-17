@@ -395,15 +395,50 @@ fn defect8_redirect_applies_to_builtin() {
 
 #[test]
 fn defect9_recursion_guard_returns_error() {
-    // Run on a large stack so the depth guard fires before the native stack
-    // overflows (the real binary evaluates on a big main-thread stack).
-    let code = std::thread::Builder::new()
-        .stack_size(2 * 1024 * 1024 * 1024)
-        .spawn(|| run("fn rec(n:int){ rec(n) }\nrec(1)").unwrap_err().code)
+    let (at_limit, code, message) = std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let at_limit =
+                run("fn descend(n:int){ if n == 0 { 0 } else { descend(n - 1) } }\ndescend(127)");
+            let beyond =
+                run("fn descend(n:int){ if n == 0 { 0 } else { descend(n - 1) } }\ndescend(128)")
+                    .expect_err("the 129th nested call must hit the typed guard");
+            (at_limit, beyond.code, beyond.msg)
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    assert_eq!(at_limit.unwrap(), Value::Int(0));
+    assert_eq!(code, "recursion_limit");
+    assert_eq!(
+        message,
+        format!(
+            "maximum call depth of {} exceeded",
+            crate::call::MAX_CALL_DEPTH
+        )
+    );
+}
+
+#[test]
+fn mutual_recursion_guard_returns_error_on_eight_mib_stack() {
+    let (code, message) = std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let error = run("fn left(){ right() }\nfn right(){ left() }\nleft()")
+                .expect_err("mutual recursion must hit the typed guard");
+            (error.code, error.msg)
+        })
         .unwrap()
         .join()
         .unwrap();
     assert_eq!(code, "recursion_limit");
+    assert_eq!(
+        message,
+        format!(
+            "maximum call depth of {} exceeded",
+            crate::call::MAX_CALL_DEPTH
+        )
+    );
 }
 
 #[test]

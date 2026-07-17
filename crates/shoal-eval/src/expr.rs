@@ -11,6 +11,16 @@ use super::*;
 
 impl Evaluator {
     pub fn eval_expr(&mut self, expr: &Expr, position: Position) -> VResult<Value> {
+        if let Expr::FnCall { name, args, .. } = expr {
+            return self.eval_fn_call_expr(name, args, position, expr.span());
+        }
+        self.eval_non_fn_expr(expr, position)
+    }
+
+    /// Non-call expression dispatch is intentionally a separate native frame.
+    /// A recursive function call can therefore enter `eval_fn_call_expr`
+    /// without retaining the locals for every unrelated expression variant.
+    fn eval_non_fn_expr(&mut self, expr: &Expr, position: Position) -> VResult<Value> {
         let span = expr.span();
         let result = match expr {
             Expr::Null { .. } => Ok(Value::Null),
@@ -201,82 +211,7 @@ impl Evaluator {
                     self.dispatch_method(v, name, args, span)
                 }
             }
-            Expr::FnCall { name, args, .. } => {
-                // Structured builtins that take closures/thunks (site/content/internals/language-conformance-contract.md).
-                match name.as_str() {
-                    "parallel" => return self.builtin_parallel(args),
-                    "retry" => return self.builtin_retry(args),
-                    "on" => return self.builtin_on(args),
-                    // Relative anchors as functions (site/content/internals/language-conformance-contract.md): `now()`/`today()`.
-                    "now" if args.pos.is_empty() && args.named.is_empty() => {
-                        return Ok(Value::DateTime(Box::new(crate::helpers::now_zoned(
-                            self.host.clock.as_ref(),
-                        ))));
-                    }
-                    "today" if args.pos.is_empty() && args.named.is_empty() => {
-                        return Ok(Value::DateTime(Box::new(crate::helpers::today_zoned(
-                            self.host.clock.as_ref(),
-                        ))));
-                    }
-                    "assert" => {
-                        let a = self.eval_args(args)?;
-                        return self.builtin_assert(&a).map_err(|e| e.or_span(span));
-                    }
-                    "run" => {
-                        let mut a = self.eval_args(args)?;
-                        if a.pos.is_empty() {
-                            return Err(ErrorVal::arg_error("run expects a path or command name"));
-                        }
-                        let target = a.pos.remove(0);
-                        return self.run_poly(target, a.pos, position);
-                    }
-                    "save" => {
-                        let a = self.eval_args(args)?;
-                        return self.builtin_save(a.pos);
-                    }
-                    "open" => {
-                        let a = self.eval_args(args)?;
-                        return self.builtin_open(a.pos);
-                    }
-                    _ => {}
-                }
-                let a = self.eval_args(args)?;
-                if let Some(value) = self.call_constructor(name, &a)? {
-                    return Ok(value);
-                }
-                if let Some(f) = self.exec.shell.env.get(name) {
-                    return self.call_value(&f, a);
-                }
-                // A name that isn't a fn but *is* a command resolves by invoking
-                // it with the given args in value position (defect #5).
-                if self.is_command_name(name) {
-                    let mut call = CmdCall {
-                        head: name.clone(),
-                        forced: false,
-                        args: vec![],
-                        redirects: vec![],
-                        env_prefix: vec![],
-                        background: false,
-                        trailing: None,
-                        span,
-                    };
-                    for v in a.pos {
-                        call.args.push(self.value_cmd_arg(v, span)?);
-                    }
-                    for (n, v) in a.named {
-                        call.args.push(CmdArg::FlagLong {
-                            name: n,
-                            value: Some(Box::new(self.value_cmd_arg(v, span)?)),
-                            span,
-                        });
-                    }
-                    return self.eval_command(&call, Position::Value);
-                }
-                Err(ErrorVal::new(
-                    "undefined_var",
-                    format!("undefined function `{name}`"),
-                ))
-            }
+            Expr::FnCall { .. } => unreachable!("function calls dispatch before non-call forms"),
             Expr::Lambda { params, body, .. } => Ok(Value::Closure(Arc::new(ClosureVal {
                 name: None,
                 params: params.clone(),
@@ -360,6 +295,91 @@ impl Evaluator {
             } => self.eval_match(scrutinee, arms),
         };
         result.map_err(|e| e.or_span(span))
+    }
+
+    /// Keep function-call dispatch out of `eval_expr`'s native frame. This is
+    /// the recursive hot path, so retaining every unrelated expression-branch
+    /// local here would multiply that frame by the Shoal call depth.
+    fn eval_fn_call_expr(
+        &mut self,
+        name: &str,
+        args: &Args,
+        position: Position,
+        span: Span,
+    ) -> VResult<Value> {
+        // Structured builtins that take closures/thunks (site/content/internals/language-conformance-contract.md).
+        match name {
+            "parallel" => return self.builtin_parallel(args),
+            "retry" => return self.builtin_retry(args),
+            "on" => return self.builtin_on(args),
+            // Relative anchors as functions (site/content/internals/language-conformance-contract.md): `now()`/`today()`.
+            "now" if args.pos.is_empty() && args.named.is_empty() => {
+                return Ok(Value::DateTime(Box::new(crate::helpers::now_zoned(
+                    self.host.clock.as_ref(),
+                ))));
+            }
+            "today" if args.pos.is_empty() && args.named.is_empty() => {
+                return Ok(Value::DateTime(Box::new(crate::helpers::today_zoned(
+                    self.host.clock.as_ref(),
+                ))));
+            }
+            "assert" => {
+                let args = self.eval_args(args)?;
+                return self
+                    .builtin_assert(&args)
+                    .map_err(|error| error.or_span(span));
+            }
+            "run" => {
+                let mut args = self.eval_args(args)?;
+                if args.pos.is_empty() {
+                    return Err(ErrorVal::arg_error("run expects a path or command name"));
+                }
+                let target = args.pos.remove(0);
+                return self.run_poly(target, args.pos, position);
+            }
+            "save" => {
+                let args = self.eval_args(args)?;
+                return self.builtin_save(args.pos);
+            }
+            "open" => {
+                let args = self.eval_args(args)?;
+                return self.builtin_open(args.pos);
+            }
+            _ => {}
+        }
+        let args = self.eval_args(args)?;
+        if let Some(value) = self.call_constructor(name, &args)? {
+            return Ok(value);
+        }
+        if let Some(function) = self.exec.shell.env.get(name) {
+            return self.call_value(&function, args);
+        }
+        // A name that isn't a fn but *is* a command resolves by invoking it
+        // with the given args in value position (defect #5).
+        if self.is_command_name(name) {
+            let mut call = CmdCall {
+                head: name.to_owned(),
+                forced: false,
+                args: vec![],
+                redirects: vec![],
+                env_prefix: vec![],
+                background: false,
+                trailing: None,
+                span,
+            };
+            for value in args.pos {
+                call.args.push(self.value_cmd_arg(value, span)?);
+            }
+            for (name, value) in args.named {
+                call.args.push(CmdArg::FlagLong {
+                    name,
+                    value: Some(Box::new(self.value_cmd_arg(value, span)?)),
+                    span,
+                });
+            }
+            return self.eval_command(&call, Position::Value);
+        }
+        Err(ErrorVal::new("undefined_var", format!("undefined function `{name}`")).with_span(span))
     }
 
     /// Evaluate an interpreter block (site/content/internals/values-streams-execution.md): resolve `tool` as a command

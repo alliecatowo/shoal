@@ -22,26 +22,13 @@ mod repl_state;
 use args::Action;
 
 fn main() {
-    // Run everything on a worker thread with a large stack. Deep (or runaway)
-    // user recursion walks many native eval frames per shoal-level call; the
-    // 8 MiB default would overflow and `abort()` the process well before the
-    // interpreter's own recursion guard (10k nested calls) could raise a clean
-    // `recursion_limit` error. A 1 GiB reservation is virtual (only touched
-    // pages commit) and comfortably outlasts the guard.
-    let worker = std::thread::Builder::new()
-        .name("shoal-main".into())
-        .stack_size(1 << 30)
-        .spawn(|| {
-            if let Err(error) = run() {
-                eprintln!(
-                    "{}",
-                    maybe_strip(format!("\x1b[31;1merror:\x1b[0m {error}"))
-                );
-                std::process::exit(1);
-            }
-        })
-        .expect("spawn main worker thread");
-    worker.join().expect("main worker thread panicked");
+    if let Err(error) = run() {
+        eprintln!(
+            "{}",
+            maybe_strip(format!("\x1b[31;1merror:\x1b[0m {error}"))
+        );
+        std::process::exit(1);
+    }
 }
 
 /// Set once at startup from the loaded config's `render.color` (see

@@ -60,7 +60,7 @@ later evaluations on the same instance.
 | `cancel` | cooperative cancellation token | consulted by sleeps, streams, and execution paths |
 | `adapters` | discovered adapter catalog | installed by host; participates in command resolution |
 | `sink` | renderer callback for statement-position values | optional boxed callback; default renderer otherwise |
-| `call_depth` | recursion guard counter | incremented around every callable value, capped at 10,000 |
+| `call_depth` | recursion guard counter | incremented around every callable value; maximum depth 128 |
 | `in_fn_body` | function nesting counter | gates ambient `cd` and `env.NAME = ...` mutation |
 | `jobs` | `TaskVal` registry | session table for spawned and stopped tasks |
 | `external_jobs` | task id to stopped child PID | bridges evaluator tasks to PTY job-control storage |

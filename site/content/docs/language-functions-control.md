@@ -243,6 +243,6 @@ These are deliberately different:
 
 ## Recursion and planning
 
-Runtime function calls carry a recursion guard intended to stop after 10,000 nested calls; plan derivation uses a smaller internal guard. This is a safety ceiling, not a promise that deeply recursive code is portable: native test-thread stack limits may be reached earlier in some builds. Use iterative collection operations or loops for large traversals while the preview runtime lacks tail-call optimization.
+Runtime callable dispatch has a hard maximum depth of 128. The 129th nested call raises `recursion_limit` with `maximum call depth of 128 exceeded`; plan derivation uses a separate, smaller internal guard. The ceiling counts nested callable values, including mutual recursion, and is a safety boundary rather than a tail-recursion feature. Use iterative collection operations or loops for larger traversals while the preview runtime lacks tail-call optimization.
 
 Continue with [Outcomes and errors](@/docs/language-errors-outcomes.md) for recovery and [Reef environments](@/docs/reef.md) for runner/tool resolution.

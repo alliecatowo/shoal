@@ -4,6 +4,8 @@
 
 use super::*;
 
+pub(crate) const MAX_CALL_DEPTH: usize = 128;
+
 impl Evaluator {
     pub(crate) fn eval_args(&mut self, args: &Args) -> VResult<CallArgs> {
         Ok(CallArgs {
@@ -24,11 +26,11 @@ impl Evaluator {
         // Runtime recursion guard (defect #9): unbounded native recursion aborts
         // the process, so cap the interpreter call stack well below that.
         self.exec.control.call_depth += 1;
-        if self.exec.control.call_depth > 10_000 {
+        if self.exec.control.call_depth > MAX_CALL_DEPTH {
             self.exec.control.call_depth -= 1;
             return Err(ErrorVal::new(
                 "recursion_limit",
-                "recursion limit exceeded (10000 nested calls)",
+                format!("maximum call depth of {MAX_CALL_DEPTH} exceeded"),
             ));
         }
         let r = self.call_value_inner(f, args);
@@ -106,7 +108,7 @@ impl Evaluator {
                 }
                 // Track fn-body nesting so `cd`/env writes can be rejected (#10).
                 self.exec.control.in_fn_body += 1;
-                let out = self.eval_expr(&c.body, Position::Value);
+                let out = self.eval_closure_body(&c.body);
                 self.exec.control.in_fn_body -= 1;
                 self.exec.shell.env = old;
                 out
@@ -138,6 +140,24 @@ impl Evaluator {
                 format!("{} is not callable", f.type_name()),
             )),
         }
+    }
+
+    /// Function bodies are normally block expressions. Enter their block
+    /// evaluator directly so each Shoal call does not retain a second copy of
+    /// `eval_expr`'s large native dispatch frame for the entire nested call.
+    /// Keep the same expression-span decoration the generic path applies.
+    fn eval_closure_body(&mut self, body: &Expr) -> VResult<Value> {
+        let Expr::Block { block, .. } = body else {
+            return self.eval_expr(body, Position::Value);
+        };
+        let result = match self.eval_block(block, false) {
+            Ok(Flow::Value(value) | Flow::Return(value)) => Ok(value),
+            Ok(Flow::Break | Flow::Continue) => {
+                Err(ErrorVal::new("custom", "loop control outside loop"))
+            }
+            Err(error) => Err(error),
+        };
+        result.map_err(|error| error.or_span(body.span()))
     }
 
     /// `assert(cond: bool, msg: str?)` (site/content/internals/intercrate-protocol-contracts.md): raise `assert_failed`

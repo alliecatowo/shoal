@@ -58,11 +58,13 @@ does not yield a function; namespace functions must be called through their synt
 
 ## Recursion guard
 
-`call_value` increments `call_depth`, rejects depth above 10,000 with `recursion_limit`, calls the
-inner dispatcher, and decrements afterward. The decrement happens for success and returned
-`VResult` errors, but native stack exhaustion can still precede a friendly limit on platforms with
-small stacks. The conformance corpus skips a deep-recursion case on a native test thread for this
-reason.
+`call_value` increments `call_depth`, rejects depth above the named 128-call ceiling with
+`recursion_limit`, calls the inner dispatcher, and decrements afterward. The decrement happens for
+success and returned `VResult` errors. Function-call expressions dispatch without retaining the
+large non-call expression frame, and closure blocks enter block evaluation directly; exact-boundary
+and mutual-recursion regressions reach the typed error on an 8 MiB native thread stack. The
+conformance corpus still skips its unbounded-recursion case because its default Rust test worker has
+a smaller native stack than that explicitly tested runtime boundary.
 
 
 ## Strict closure binding

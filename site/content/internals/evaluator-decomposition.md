@@ -121,7 +121,7 @@ The genuinely mutable state that advances as a program runs. Sub-grouped by fine
 | Field | Type | Mutated by | Lifetime |
 |---|---|---|---|
 | `cancel` | `CancelToken` | lib (`reset_cancel`) | cooperative cancellation epoch |
-| `call_depth` | `usize` | call (inc/dec around every callable) | recursion guard, capped at 10,000 |
+| `call_depth` | `usize` | call (inc/dec around every callable) | recursion guard; maximum depth 128 |
 | `in_fn_body` | `usize` | call (inc/dec), modules (save/restore) | gates ambient `cd` / `env.NAME =` |
 | `pending_exit` | `Option<i32>` | command, lib (`take_exit`) | host-honored exit request |
 | `it` | `Value` | stmt | last top-level value |
