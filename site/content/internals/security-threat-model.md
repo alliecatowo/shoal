@@ -430,11 +430,12 @@ Current filesystem port coverage is incomplete on the **read** side: several
 `Path::exists/is_dir/canonicalize` observations still bypass injected `Fs`. Every language-visible
 **write** now crosses the port — value `.save`/`.append` and stream `.save` route through
 `CallCtx::fs()` (HR-C1/HR-C2), so a fake can observe or deny them (inventory in the HR-C3 ledger in
-[effects, plans, ports, and authority](@/internals/effects-plans-security.md)). A host must still
-return its injected/sandboxed `Fs` port from the evaluator's `CallCtx::fs()` override for those
-writes to hit the *sandboxed* port rather than the `StdFs` default; a child sandbox cannot protect
-the parent from its own builtin/method effects. Any claim that Leash confines all language I/O is
-too strong today.
+[effects, plans, ports, and authority](@/internals/effects-plans-security.md)), and the evaluator's
+`CallCtx::fs()` override returns its injected `Arc<dyn Fs>`, so those writes hit the session's
+actual (sandboxed) port rather than the `StdFs` default — a denying injected adapter blocks
+`"x".save(...)` end to end. A child sandbox still cannot protect the parent from its own
+builtin/method effects outside the ported routes, and read-side probes remain unported, so any
+claim that Leash confines **all** language I/O is still too strong today.
 
 ## Secret store design
 

@@ -169,14 +169,15 @@ follow-up, not part of lane C's write-effect mandate:
 
 The `Fs` port also mediates the `CallCtx::fs()` seam value methods reach through. Its default is the
 real filesystem (`StdFs`) so a portless context is byte-identical to the pre-port `OpenOptions`
-code; a host with a sandboxed/injected `Fs` port must return it from `CallCtx::fs()` for value-method
-writes to consult that port (the evaluator's `impl CallCtx` override is the remaining eval-side wire,
-tracked with the child-context work).
+code. The evaluator's `impl CallCtx` overrides `fs()` to return its injected `Arc<dyn Fs>`
+(`set_fs`), so value-method writes consult the session's actual port; a denying injected adapter
+blocks `"x".save(...)` end to end (`value_method_saves_go_through_the_injected_fs_port`).
 
-More seriously, fresh evaluators created by `spawn_block`, `.shl` `run_script_file`, `parallel`, and
-`on` do not inherit the parent Leash policy/principal; they also omit Reef state, and some omit
-`ConfigPort`. A child external spawn can therefore resolve no sandbox despite a constrained parent.
-Until one audited child-construction API closes this, Leash is not a transitive authority boundary.
+Child evaluators created by `spawn_block`, `.shl` `run_script_file`, `parallel`, and `on` inherit
+the parent's Leash policy/principal, all ports (including `ConfigPort`), Reef state, event bus, and
+cancellation through the single `ChildContext` constructor (HR-B1–B6); cross-route propagation is
+pinned by `child_context_propagation.rs`. Leash is transitive across child construction by
+compile-enforced design rather than per-site convention.
 
 ```mermaid
 flowchart LR
