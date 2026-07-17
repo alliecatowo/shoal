@@ -199,7 +199,7 @@ impl PtySession {
         };
         let enforcement = crate::sandbox::apply(&mut exec_spec)?;
         let ExecSpec { argv, env, .. } = exec_spec;
-        let program = resolve_program(&argv, &env)?;
+        let program = resolve_program(&argv, &env, &cwd)?;
 
         // Same E2BIG guard run_pty uses: portable-pty's child-side exec-error
         // report can abort past Linux's per-string limit, so reject it up front.

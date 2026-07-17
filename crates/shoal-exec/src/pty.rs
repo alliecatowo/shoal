@@ -660,7 +660,7 @@ pub(crate) fn run_pty(mut spec: ExecSpec, cancel: &CancelToken) -> io::Result<Ex
         stdin,
         ..
     } = spec;
-    let program = resolve_program(&argv, &env)?;
+    let program = resolve_program(&argv, &env, &cwd)?;
 
     // portable-pty's Unix fork helper currently aborts in the child when its
     // exec-error report itself cannot be written after E2BIG. Reject Linux's

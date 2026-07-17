@@ -414,6 +414,44 @@ fn run_resolves_argv0_via_the_spec_env_path() {
     assert_eq!(res.stdout, b"resolved-ok");
 }
 
+#[test]
+fn run_resolves_empty_path_component_against_the_child_cwd() {
+    let dir = TempDir::new("resolve-empty-path");
+    write_script(dir.path(), "cwdtool", 0o755);
+    let mut s = spec(&["cwdtool"], ExecMode::Capture);
+    s.cwd = dir.path().to_path_buf();
+    s.env = vec![(OsString::from("PATH"), OsString::from(":"))];
+
+    let res = run(s, &CancelToken::new()).expect("empty PATH entry uses child cwd");
+    assert_eq!(res.status, Some(0));
+    assert_eq!(res.stdout, b"resolved-ok");
+}
+
+#[test]
+fn run_resolves_relative_path_component_against_the_child_cwd() {
+    let dir = TempDir::new("resolve-relative-path");
+    let bin = dir.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    write_script(&bin, "reltool", 0o755);
+    let mut s = spec(&["reltool"], ExecMode::Capture);
+    s.cwd = dir.path().to_path_buf();
+    s.env = vec![(OsString::from("PATH"), OsString::from("bin"))];
+
+    let res = run(s, &CancelToken::new()).expect("relative PATH entry uses child cwd");
+    assert_eq!(res.stdout, b"resolved-ok");
+}
+
+#[test]
+fn run_resolves_relative_slash_program_against_the_child_cwd() {
+    let dir = TempDir::new("resolve-relative-slash");
+    write_script(dir.path(), "slash-tool", 0o755);
+    let mut s = spec(&["./slash-tool"], ExecMode::Capture);
+    s.cwd = dir.path().to_path_buf();
+
+    let res = run(s, &CancelToken::new()).expect("relative slash path uses child cwd");
+    assert_eq!(res.stdout, b"resolved-ok");
+}
+
 // -------------------------------------------------------------------- pty
 
 #[test]

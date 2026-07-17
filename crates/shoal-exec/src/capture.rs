@@ -150,7 +150,7 @@ pub fn spawn_capture(mut spec: ExecSpec, cancel: &CancelToken) -> io::Result<Str
         ));
     }
     let enforcement = crate::sandbox::apply(&mut spec)?;
-    let program = resolve_program(&spec.argv, &spec.env)?;
+    let program = resolve_program(&spec.argv, &spec.env, &spec.cwd)?;
     let mut cmd = Command::new(&program);
     cmd.args(&spec.argv[1..]);
     cmd.current_dir(&spec.cwd);

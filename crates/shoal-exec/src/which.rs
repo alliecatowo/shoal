@@ -59,6 +59,7 @@ fn is_executable_file(p: &Path) -> bool {
 pub(crate) fn resolve_program(
     argv: &[OsString],
     env: &[(OsString, OsString)],
+    cwd: &Path,
 ) -> io::Result<PathBuf> {
     let Some(argv0) = argv.first() else {
         return Err(io::Error::new(
@@ -73,16 +74,56 @@ pub(crate) fn resolve_program(
         ));
     }
     if argv0.as_bytes().contains(&b'/') {
-        return Ok(PathBuf::from(argv0));
+        let path = PathBuf::from(argv0);
+        return Ok(if path.is_absolute() {
+            path
+        } else {
+            absolute_cwd(cwd)?.join(path)
+        });
     }
     let spec_path = env
         .iter()
         .find(|(k, _)| k.as_os_str() == OsStr::new("PATH"))
         .map(|(_, v)| v.as_os_str());
-    which(argv0, spec_path).ok_or_else(|| {
+    which_from(argv0, spec_path, cwd)?.ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
             format!("command not found: {}", argv0.to_string_lossy()),
         )
     })
+}
+
+fn which_from(name: &OsStr, path_var: Option<&OsStr>, cwd: &Path) -> io::Result<Option<PathBuf>> {
+    let process_path: OsString;
+    let path = match path_var {
+        Some(path) => path,
+        None => {
+            let Some(path) = std::env::var_os("PATH") else {
+                return Ok(None);
+            };
+            process_path = path;
+            &process_path
+        }
+    };
+    let cwd = absolute_cwd(cwd)?;
+    for directory in std::env::split_paths(path) {
+        let directory = if directory.is_absolute() {
+            directory
+        } else {
+            cwd.join(directory)
+        };
+        let candidate = directory.join(name);
+        if is_executable_file(&candidate) {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
+}
+
+fn absolute_cwd(cwd: &Path) -> io::Result<PathBuf> {
+    if cwd.is_absolute() {
+        Ok(cwd.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(cwd))
+    }
 }

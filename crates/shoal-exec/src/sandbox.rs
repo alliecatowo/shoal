@@ -24,7 +24,7 @@ pub(crate) fn apply(spec: &mut ExecSpec) -> io::Result<Option<EnforcementStatus>
     let Some(policy) = spec.sandbox.take() else {
         return Ok(None);
     };
-    let program = resolve_program(&spec.argv, &spec.env)?;
+    let program = resolve_program(&spec.argv, &spec.env, &spec.cwd)?;
     if let Some(pin) = &policy.spawn_hash {
         verify_pin(&program, pin)?;
     }

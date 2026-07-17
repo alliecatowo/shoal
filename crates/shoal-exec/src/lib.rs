@@ -69,7 +69,20 @@ pub use which::which;
 /// spawn gate without re-implementing resolution/hashing.
 #[must_use]
 pub fn resolve_and_hash(argv: &[OsString], env: &[(OsString, OsString)]) -> Option<String> {
-    let program = which::resolve_program(argv, env).ok()?;
+    let cwd = std::env::current_dir().ok()?;
+    resolve_and_hash_in(argv, env, &cwd)
+}
+
+/// Resolve and hash `argv[0]` using `cwd` for empty/relative `PATH`
+/// components and relative slash paths. This is the spawn-equivalent variant
+/// for hosts whose session cwd differs from their daemon process cwd.
+#[must_use]
+pub fn resolve_and_hash_in(
+    argv: &[OsString],
+    env: &[(OsString, OsString)],
+    cwd: &std::path::Path,
+) -> Option<String> {
+    let program = which::resolve_program(argv, env, cwd).ok()?;
     let bytes = std::fs::read(&program).ok()?;
     Some(blake3::hash(&bytes).to_hex().to_string())
 }
@@ -471,7 +484,7 @@ fn sandbox_spec(
             "hard Landlock enforcement unavailable",
         ));
     }
-    let program = which::resolve_program(&spec.argv, &spec.env)?;
+    let program = which::resolve_program(&spec.argv, &spec.env, &spec.cwd)?;
     if let Some(expected) = verified {
         let actual = shoal_leash::preflight_spawn(&program, std::slice::from_ref(&expected.hash))?;
         if !expected.allowed || actual.hash != expected.hash {
