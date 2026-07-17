@@ -51,16 +51,11 @@ fn run(mut args: Vec<String>) -> Result<(), (i32, String)> {
             let f = parse_query(&args[1..])?;
             let rows = query(&journal, &f).map_err(op)?;
             if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(
-                        &rows
-                            .iter()
-                            .map(|r| entry_json(&journal, r))
-                            .collect::<Vec<_>>()
-                    )
-                    .unwrap()
-                )
+                let value = rows
+                    .iter()
+                    .map(|row| entry_json(&journal, row))
+                    .collect::<Vec<_>>();
+                println!("{}", serde_json::to_string_pretty(&value).map_err(op)?)
             } else {
                 print!("{}", render_human(&journal, &rows, false))
             }
@@ -73,7 +68,7 @@ fn run(mut args: Vec<String>) -> Result<(), (i32, String)> {
             if json {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&entry_json(&journal, &row)).unwrap()
+                    serde_json::to_string_pretty(&entry_json(&journal, &row)).map_err(op)?
                 )
             } else {
                 print!("{}", render_human(&journal, &[row], true))
@@ -131,10 +126,7 @@ fn run(mut args: Vec<String>) -> Result<(), (i32, String)> {
                 "pinned_logical_bytes": status.pinned_logical_bytes,
             });
             if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&value).expect("JSON value")
-                );
+                println!("{}", serde_json::to_string_pretty(&value).map_err(op)?);
             } else {
                 println!(
                     "database: {} / {} bytes (main {}, WAL {}, SHM {})\nCAS: {} / {} bytes (logical {}, physical {}, spill {}, pinned {})",
@@ -161,9 +153,22 @@ fn run(mut args: Vec<String>) -> Result<(), (i32, String)> {
                 .ok_or((2, "undo requires --root PATH".into()))?;
             let r = undo(&journal, id, &root).map_err(|e| (1, e.to_string()))?;
             if json {
+                let steps = r
+                    .steps
+                    .iter()
+                    .map(|step| {
+                        serde_json::to_value(&step.inverse).map(|inverse| {
+                            serde_json::json!({
+                                "status": format!("{:?}", step.status).to_lowercase(),
+                                "inverse": inverse,
+                            })
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(op)?;
                 println!(
                     "{}",
-                    serde_json::json!({"entry_id":r.entry_id,"steps":r.steps.iter().map(|s|serde_json::json!({"status":format!("{:?}",s.status).to_lowercase(),"inverse":serde_json::to_value(&s.inverse).expect("serializable inverse")})).collect::<Vec<_>>() })
+                    serde_json::json!({"entry_id":r.entry_id,"steps":steps})
                 );
             } else {
                 println!("undid entry {} ({} steps)", r.entry_id, r.steps.len())
@@ -229,4 +234,22 @@ fn parse_id(v: Option<&String>) -> Result<i64, (i32, String)> {
 }
 fn op(e: impl std::fmt::Display) -> (i32, String) {
     (1, e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn production_cli_has_no_json_serialization_panics() {
+        let source = include_str!("main.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        for forbidden in ["serde_json::to_string_pretty", "serde_json::to_value"] {
+            for line in production.lines().filter(|line| line.contains(forbidden)) {
+                assert!(
+                    !line.contains("unwrap") && !line.contains("expect"),
+                    "{line}"
+                );
+            }
+        }
+        assert!(!production.contains("serializable inverse"));
+    }
 }

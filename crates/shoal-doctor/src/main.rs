@@ -15,7 +15,13 @@ fn main() {
     let json = !args.is_empty();
     let report = shoal_doctor::run(&shoal_doctor::Options::from_env());
     if json {
-        println!("{}", serde_json::to_string_pretty(&report).unwrap())
+        match serde_json::to_string_pretty(&report) {
+            Ok(rendered) => println!("{rendered}"),
+            Err(error) => {
+                eprintln!("shoal-doctor: rendering JSON report: {error}");
+                std::process::exit(2);
+            }
+        }
     } else {
         print!("{report}")
     }

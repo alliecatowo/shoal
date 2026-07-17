@@ -31,13 +31,15 @@ impl Kernel {
         let mut plan = plan;
         plan.plan_ref.clone_from(&plan_ref);
         let verdict = self.policy.evaluate_plan(actor, &plan);
+        let effects = plan
+            .effects
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(internal)?;
         let result = PlanResult {
             plan_ref: plan.plan_ref.clone(),
-            effects: plan
-                .effects
-                .iter()
-                .map(|effect| serde_json::to_value(effect).unwrap())
-                .collect(),
+            effects,
             reversibility: reversibility_from_effects(&plan.effects).into(),
             verdict: verdict_name(verdict).into(),
             approval_pending: verdict == Verdict::ApprovalRequired,
