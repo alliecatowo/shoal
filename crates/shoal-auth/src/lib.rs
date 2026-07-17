@@ -1,5 +1,6 @@
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::io::Write;
@@ -117,23 +118,29 @@ impl TokenStore {
         })
     }
 
-    /// Validate against a freshly locked disk snapshot. A concurrent revoke is
-    /// therefore visible without reopening the long-lived kernel store; an I/O
-    /// or parse failure fails closed as an invalid bearer.
-    pub fn validate(&self, bearer: &str) -> Option<TokenMeta> {
-        let (key, tokens) = with_shared_lock(&self.path, || load_unlocked(&self.path)).ok()?;
+    /// Validate against a freshly locked disk snapshot and surface storage or
+    /// integrity failures to callers that need to distinguish them from an
+    /// invalid bearer. No cached authority is consulted on failure.
+    pub fn validate_checked(&self, bearer: &str) -> io::Result<Option<TokenMeta>> {
+        let (key, tokens) = with_shared_lock(&self.path, || load_unlocked(&self.path))?;
         let digest = digest_with(&key, bearer.as_bytes());
         let now = now_ns();
-        tokens
+        Ok(tokens
             .iter()
             .find(|t| {
-                let Ok(stored) = unhex(&t.digest) else {
-                    return false;
-                };
-                stored.len() == 32 && bool::from(stored.as_slice().ct_eq(&digest))
+                // `load_unlocked` validates every digest before exposing the
+                // snapshot, so conversion cannot fail here.
+                unhex(&t.digest).is_ok_and(|stored| bool::from(stored.as_slice().ct_eq(&digest)))
             })
             .filter(|t| t.meta.revoked_ns.is_none() && t.meta.expires_ns.is_none_or(|e| e > now))
-            .map(|t| t.meta.clone())
+            .map(|t| t.meta.clone()))
+    }
+
+    /// Compatibility authentication API. Storage, locking, and integrity
+    /// errors deliberately collapse to unauthenticated; they never restore a
+    /// token from the startup snapshot.
+    pub fn validate(&self, bearer: &str) -> Option<TokenMeta> {
+        self.validate_checked(bearer).ok().flatten()
     }
 
     /// Refresh the status of a token that was already authenticated with its
@@ -142,10 +149,13 @@ impl TokenStore {
     /// alternate bearer-authentication path. The disk snapshot is fresh and
     /// storage failures, revocation, expiry, or identity replacement all fail
     /// closed.
-    pub fn refresh_authenticated(&self, attached: &TokenMeta) -> Option<TokenMeta> {
-        let (_, tokens) = with_shared_lock(&self.path, || load_unlocked(&self.path)).ok()?;
+    pub fn refresh_authenticated_checked(
+        &self,
+        attached: &TokenMeta,
+    ) -> io::Result<Option<TokenMeta>> {
+        let (_, tokens) = with_shared_lock(&self.path, || load_unlocked(&self.path))?;
         let now = now_ns();
-        tokens
+        Ok(tokens
             .into_iter()
             .find(|token| {
                 token.meta.id == attached.id
@@ -159,7 +169,13 @@ impl TokenStore {
                 token.meta.revoked_ns.is_none()
                     && token.meta.expires_ns.is_none_or(|expires| expires > now)
             })
-            .map(|token| token.meta)
+            .map(|token| token.meta))
+    }
+
+    /// Fail-closed compatibility wrapper around
+    /// [`Self::refresh_authenticated_checked`].
+    pub fn refresh_authenticated(&self, attached: &TokenMeta) -> Option<TokenMeta> {
+        self.refresh_authenticated_checked(attached).ok().flatten()
     }
 
     /// Fallible, fresh list for callers that need storage errors surfaced.
@@ -170,11 +186,11 @@ impl TokenStore {
         })
     }
 
-    /// Compatibility snapshot list. New code should prefer [`Self::try_list`]
-    /// so an on-disk integrity/I/O error is not hidden.
+    /// Compatibility list. New code should prefer [`Self::try_list`] so an
+    /// on-disk integrity/I/O error is not hidden. On failure this returns an
+    /// empty list rather than stale startup state.
     pub fn list(&self) -> Vec<TokenMeta> {
-        self.try_list()
-            .unwrap_or_else(|_| self.tokens.iter().map(|t| t.meta.clone()).collect())
+        self.try_list().unwrap_or_default()
     }
 
     pub fn revoke(&mut self, id: &str) -> io::Result<bool> {
@@ -243,7 +259,37 @@ fn load_unlocked(path: &Path) -> io::Result<(Zeroizing<[u8; 32]>, Vec<StoredToke
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid token key"))?,
     );
     let tokens = std::mem::take(&mut doc.tokens);
+    validate_tokens(&tokens)?;
     Ok((key, tokens))
+}
+
+fn validate_tokens(tokens: &[StoredToken]) -> io::Result<()> {
+    let mut ids = BTreeSet::new();
+    let mut digests = BTreeSet::new();
+    for token in tokens {
+        let digest = unhex(&token.digest).map_err(|()| {
+            io::Error::new(io::ErrorKind::InvalidData, "invalid token digest encoding")
+        })?;
+        if digest.len() != 32 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid token digest length",
+            ));
+        }
+        if token.meta.id != hex(&digest[..8]) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "token id does not match digest",
+            ));
+        }
+        if !ids.insert(&token.meta.id) || !digests.insert(&token.digest) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "duplicate token identity",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn digest_with(key: &[u8; 32], secret: &[u8]) -> [u8; 32] {
@@ -292,7 +338,12 @@ fn secure_file(path: &Path) -> io::Result<()> {
 }
 
 fn atomic_replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let parent = path.parent().expect("validated by TokenStore::open");
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "token store needs a parent directory",
+        )
+    })?;
     let tmp = tempfile_path(path);
     // The exclusive store lock permits one active writer, but a crashed writer
     // can leave this process-specific file behind.
@@ -324,12 +375,22 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 fn unhex(s: &str) -> Result<Vec<u8>, ()> {
-    if !s.len().is_multiple_of(2) {
+    fn nibble(byte: u8) -> Result<u8, ()> {
+        match byte {
+            b'0'..=b'9' => Ok(byte - b'0'),
+            b'a'..=b'f' => Ok(byte - b'a' + 10),
+            b'A'..=b'F' => Ok(byte - b'A' + 10),
+            _ => Err(()),
+        }
+    }
+
+    let bytes = s.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
         return Err(());
     }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| ()))
+    bytes
+        .chunks_exact(2)
+        .map(|pair| Ok((nibble(pair[0])? << 4) | nibble(pair[1])?))
         .collect()
 }
 
@@ -338,6 +399,7 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
+    use std::sync::Arc;
 
     #[test]
     fn secrets_never_persist_and_revoke_expiry_work() {
@@ -384,6 +446,80 @@ mod tests {
         // startup snapshot.
         assert!(reader.validate(&bearer).is_none());
         assert!(reader.refresh_authenticated(&meta).is_none());
+    }
+
+    #[test]
+    fn malformed_snapshot_is_typed_and_never_reuses_cached_authority() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("tokens.json");
+        let mut creator = TokenStore::open(&path).unwrap();
+        let (bearer, meta) = creator
+            .create("agent:cached".into(), "dev".into(), vec![], None)
+            .unwrap();
+        let reader = Arc::new(TokenStore::open(&path).unwrap());
+
+        let mut stored: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        // Even byte length plus a multibyte character exercised a prior UTF-8
+        // slicing panic in the hex decoder.
+        stored["tokens"][0]["digest"] = serde_json::Value::String("aéx".into());
+        fs::write(&path, serde_json::to_vec(&stored).unwrap()).unwrap();
+
+        for _ in 0..8 {
+            assert_eq!(
+                reader.validate_checked(&bearer).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert!(reader.validate(&bearer).is_none());
+            assert_eq!(
+                reader
+                    .refresh_authenticated_checked(&meta)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert!(reader.refresh_authenticated(&meta).is_none());
+            assert!(reader.try_list().is_err());
+            assert!(reader.list().is_empty());
+        }
+
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let reader = Arc::clone(&reader);
+                let bearer = bearer.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..16 {
+                        assert!(reader.validate_checked(&bearer).is_err());
+                        assert!(reader.validate(&bearer).is_none());
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().expect("authentication worker must not panic");
+        }
+    }
+
+    #[test]
+    fn production_has_no_raw_panicking_lock_access() {
+        let production = include_str!("lib.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or_default();
+        let compact: String = production.chars().filter(|c| !c.is_whitespace()).collect();
+        for forbidden in [
+            ".lock().unwrap()",
+            ".read().unwrap()",
+            ".write().unwrap()",
+            ".lock().expect(",
+            ".read().expect(",
+            ".write().expect(",
+        ] {
+            assert!(
+                !compact.contains(forbidden),
+                "production auth synchronization must return typed errors: {forbidden}"
+            );
+        }
     }
 
     #[test]

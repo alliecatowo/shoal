@@ -127,9 +127,15 @@ impl SecretStore {
                 "unsupported secret store version",
             ));
         }
-        let nonce = base64::engine::general_purpose::STANDARD
+        let nonce_bytes = base64::engine::general_purpose::STANDARD
             .decode(e.nonce)
             .map_err(invalid)?;
+        let nonce: [u8; 12] = nonce_bytes.as_slice().try_into().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid secret store nonce length",
+            )
+        })?;
         let ct = Zeroizing::new(
             base64::engine::general_purpose::STANDARD
                 .decode(e.ciphertext)
@@ -137,16 +143,12 @@ impl SecretStore {
         );
         let key = self.key()?;
         let cipher = Aes256Gcm::new_from_slice(&key).map_err(invalid)?;
-        let plain = Zeroizing::new(
-            cipher
-                .decrypt(nonce.as_slice().into(), ct.as_ref())
-                .map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "secret store authentication failed",
-                    )
-                })?,
-        );
+        let plain = Zeroizing::new(cipher.decrypt((&nonce).into(), ct.as_ref()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "secret store authentication failed",
+            )
+        })?);
         serde_json::from_slice(&plain).map_err(invalid)
     }
     fn save_unlocked(&self, m: &PlainSecrets) -> io::Result<()> {
@@ -243,7 +245,12 @@ fn open_lock_file(path: &Path) -> io::Result<fs::File> {
 }
 
 fn atomic(path: &Path, data: &[u8]) -> io::Result<()> {
-    let parent = path.parent().unwrap();
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "secret store file needs a parent directory",
+        )
+    })?;
     let mut t = tempfile::NamedTempFile::new_in(parent)?;
     #[cfg(unix)]
     {
@@ -262,6 +269,7 @@ fn atomic(path: &Path, data: &[u8]) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::process::Command;
+    use std::sync::Arc;
 
     #[test]
     fn lifecycle_and_redaction() {
@@ -287,6 +295,72 @@ mod tests {
         b[n - 2] ^= 1;
         fs::write(p, b).unwrap();
         assert!(s.list().is_err())
+    }
+
+    #[test]
+    fn malformed_nonce_is_typed_under_repeated_concurrent_access() {
+        let t = tempfile::tempdir().unwrap();
+        let store = Arc::new(SecretStore::open(t.path()).unwrap());
+        store.set("TOKEN", b"authority").unwrap();
+        let path = t.path().join("secrets.json");
+        let mut envelope: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        envelope["nonce"] =
+            serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode([0u8; 11]));
+        fs::write(&path, serde_json::to_vec(&envelope).unwrap()).unwrap();
+
+        for _ in 0..8 {
+            assert_eq!(store.list().unwrap_err().kind(), io::ErrorKind::InvalidData);
+            assert_eq!(
+                store.get("TOKEN").unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert_eq!(
+                store.set("TOKEN", b"replacement").unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert_eq!(
+                store.delete("TOKEN").unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let store = Arc::clone(&store);
+                std::thread::spawn(move || {
+                    for _ in 0..16 {
+                        assert!(store.list().is_err());
+                        assert!(store.get("TOKEN").is_err());
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().expect("secret-store worker must not panic");
+        }
+    }
+
+    #[test]
+    fn production_has_no_raw_panicking_lock_access() {
+        let production = include_str!("lib.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or_default();
+        let compact: String = production.chars().filter(|c| !c.is_whitespace()).collect();
+        for forbidden in [
+            ".lock().unwrap()",
+            ".read().unwrap()",
+            ".write().unwrap()",
+            ".lock().expect(",
+            ".read().expect(",
+            ".write().expect(",
+        ] {
+            assert!(
+                !compact.contains(forbidden),
+                "production secret synchronization must return typed errors: {forbidden}"
+            );
+        }
     }
 
     #[cfg(unix)]
