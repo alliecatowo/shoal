@@ -102,12 +102,22 @@ Request:
 |---|---|---|
 | `session` | string or `null`; default `"default"` | named in-memory evaluator |
 | `token` | string or `null` | bearer token validated by the persistent kernel |
-| `client.kind` | string | descriptive client class |
+| `client.kind` | string | client class; `"mcp"` selects the restricted agent mapping (HR-D6) |
 | `client.tty` | bool | retain terminal color in bounded renders when true |
 
 With a token, `TokenStore::validate` supplies `principal`, token caps, and profile. Without a token,
-the caller becomes `uid:<effective-uid>` with profile `local-human`. An ephemeral kernel has no token
-store and rejects a supplied token. Calling attach again replaces that connection's attachment.
+the mapping splits on the declared client kind (HR-D6):
+
+| No-token attach | Principal | Profile |
+|---|---|---|
+| `client.kind:"mcp"` (default) | `agent:mcp` (restricted) | `agent` |
+| `client.kind:"mcp"` with `SHOAL_MCP_PERMISSIVE`/`set_mcp_permissive` | `uid:<euid>` | `local-human` |
+| any other kind | `uid:<euid>` | `local-human` |
+
+The built-in default policy defines `agent:mcp` with execution availability intact (opaque allow,
+unrestricted fs, in-grant auto-apply, session/journal/time) but no env value reads, env writes, or
+secret use. An ephemeral kernel has no token store and rejects a supplied token. Calling attach again
+replaces that connection's attachment.
 
 The persistent kernel loads `tokens.json` once at startup. `shoal-token` is a separate process whose
 create/revoke writes are not observed until the kernel restarts; already-loaded expirations still

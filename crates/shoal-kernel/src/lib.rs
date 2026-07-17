@@ -69,6 +69,14 @@ pub struct Kernel {
     /// single-operator setups that knowingly accept self-approval. See
     /// `site/content/internals/security-threat-model.md`.
     allow_self_ack: AtomicBool,
+    /// Whether a no-token `client.kind:"mcp"` attach keeps the legacy
+    /// permissive `local-human` mapping (HR-D6 explicit opt-in). Default
+    /// `false`: a zero-config MCP client lands on the restricted
+    /// [`MCP_AGENT_PRINCIPAL`]. Enabled explicitly (env `SHOAL_MCP_PERMISSIVE`,
+    /// or [`Kernel::set_mcp_permissive`]) by operators who knowingly restore
+    /// full same-UID authority to their agents. A bearer token is the
+    /// per-principal alternative.
+    permissive_mcp_attach: AtomicBool,
 }
 
 /// Wire version of the AST node-kind vocabulary (site/content/internals/language-conformance-contract.md, site/content/internals/values-streams-execution.md). Bumped
@@ -148,7 +156,7 @@ impl Kernel {
             next_client: AtomicU64::new(1),
             journal: Mutex::new(Journal::in_memory().expect("in-memory journal")),
             state_dir: None,
-            policy: permissive_policy(),
+            policy: default_policy(),
             plans: Mutex::new(HashMap::new()),
             tasks: Mutex::new(HashMap::new()),
             next_task: AtomicU64::new(1),
@@ -157,6 +165,7 @@ impl Kernel {
             events: Arc::new(EventBus::default()),
             auth: None,
             allow_self_ack: AtomicBool::new(self_ack_from_env()),
+            permissive_mcp_attach: AtomicBool::new(mcp_permissive()),
         })
     }
 
@@ -177,7 +186,7 @@ impl Kernel {
             next_client: AtomicU64::new(1),
             journal: Mutex::new(journal),
             state_dir: Some(state_dir.to_path_buf()),
-            policy: permissive_policy(),
+            policy: default_policy(),
             plans: Mutex::new(HashMap::new()),
             tasks: Mutex::new(HashMap::new()),
             next_task: AtomicU64::new(1),
@@ -186,6 +195,7 @@ impl Kernel {
             events: Arc::new(events),
             auth: Some(Mutex::new(TokenStore::open(state_dir.join("tokens.json"))?)),
             allow_self_ack: AtomicBool::new(self_ack_from_env()),
+            permissive_mcp_attach: AtomicBool::new(mcp_permissive()),
         }))
     }
 
@@ -212,6 +222,7 @@ impl Kernel {
             events: Arc::new(events),
             auth: Some(Mutex::new(TokenStore::open(state_dir.join("tokens.json"))?)),
             allow_self_ack: AtomicBool::new(self_ack_from_env()),
+            permissive_mcp_attach: AtomicBool::new(mcp_permissive()),
         }))
     }
 
@@ -230,6 +241,7 @@ impl Kernel {
             events: Arc::new(EventBus::default()),
             auth: None,
             allow_self_ack: AtomicBool::new(self_ack_from_env()),
+            permissive_mcp_attach: AtomicBool::new(mcp_permissive()),
         })
     }
 
@@ -357,6 +369,14 @@ impl Kernel {
         self.allow_self_ack.store(allow, Ordering::SeqCst);
     }
 
+    /// Permit (or forbid) the legacy permissive `local-human` mapping for
+    /// no-token MCP-kind attaches (HR-D6). Default is forbidden — a zero-config
+    /// MCP client lands on the restricted [`MCP_AGENT_PRINCIPAL`]. The kernel
+    /// binary honors `SHOAL_MCP_PERMISSIVE` for the same purpose.
+    pub fn set_mcp_permissive(&self, allow: bool) {
+        self.permissive_mcp_attach.store(allow, Ordering::SeqCst);
+    }
+
     /// Append a journal audit entry for an approval decision (HR-D2), so the
     /// requester→plan→approver→scope binding is durably queryable via
     /// `journal.query`, not just live in the plan map. Best effort: an
@@ -466,8 +486,35 @@ fn now_ns() -> i64 {
 fn elapsed_ns(start: Instant) -> i64 {
     start.elapsed().as_nanos().min(i64::MAX as u128) as i64
 }
-fn permissive_policy() -> Policy {
-    Policy::permissive(&principal())
+/// The principal a zero-config (no-token) MCP client attaches as (HR-D6): a
+/// restricted agent identity distinct from the same-UID human, so agent work is
+/// attributed separately and — combined with HR-D3's separation of duties — an
+/// MCP agent can no longer approve plans it requested itself. See
+/// `site/content/internals/security-threat-model.md` and `agent-mcp.md`.
+pub(crate) const MCP_AGENT_PRINCIPAL: &str = "agent:mcp";
+
+/// The kernel's built-in zero-config policy (HR-D6): the same-UID human
+/// principal keeps the fully permissive grants (normal interactive use never
+/// regresses), and the restricted [`MCP_AGENT_PRINCIPAL`] is defined alongside
+/// it so a zero-config MCP attach still *works* — execution availability is
+/// preserved (opaque allow, unrestricted fs, in-grant auto-apply) while the
+/// sensitive grants are dropped: no env value reads (`session.env` becomes
+/// names-only), no persistent env writes, no secret use. An explicit `--policy`
+/// file replaces this entirely — the operator's file then governs both
+/// principals (an undeclared `agent:mcp` in such a file evaluates to Deny,
+/// the standard unknown-principal rule).
+fn default_policy() -> Policy {
+    let human = principal();
+    Policy::from_toml(&format!(
+        "[principal.\"{human}\"]\nopaque='allow'\nauto_apply='in-grant'\n\
+         journal_read=true\nenv_read=[\"*\"]\nenv_write=[\"*\"]\nsession_write=true\n\
+         time=true\n\n\
+         [principal.\"{human}\".fs]\nread=[\"/**\"]\nwrite=[\"/**\"]\ndelete=[\"/**\"]\n\n\
+         [principal.\"{MCP_AGENT_PRINCIPAL}\"]\nopaque='allow'\nauto_apply='in-grant'\n\
+         journal_read=true\nsession_write=true\ntime=true\n\n\
+         [principal.\"{MCP_AGENT_PRINCIPAL}\".fs]\nread=[\"/**\"]\nwrite=[\"/**\"]\ndelete=[\"/**\"]\n"
+    ))
+    .expect("built-in default policy")
 }
 
 /// Whether self-acknowledgement (a plan's requester approving its own plan via
@@ -476,6 +523,17 @@ fn permissive_policy() -> Policy {
 /// construction; `Kernel::set_allow_self_ack` overrides it at runtime.
 fn self_ack_from_env() -> bool {
     std::env::var_os("SHOAL_ALLOW_SELF_ACK").is_some_and(|v| !v.is_empty())
+}
+
+/// Whether a no-token `client.kind:"mcp"` attach keeps the legacy permissive
+/// `local-human` mapping (HR-D6 explicit opt-in): only when the operator sets a
+/// non-empty `SHOAL_MCP_PERMISSIVE` on the kernel process. The MCP facade's
+/// autostarted kernel inherits the agent's environment, so setting the variable
+/// in the MCP server config is sufficient. The sanctioned alternative is a
+/// bearer token, which carries its own principal and authority. Read once per
+/// kernel at construction; `Kernel::set_mcp_permissive` overrides it at runtime.
+fn mcp_permissive() -> bool {
+    std::env::var_os("SHOAL_MCP_PERMISSIVE").is_some_and(|v| !v.is_empty())
 }
 
 /// The single-letter wire form of an enforcement tier (site/content/internals/language-conformance-contract.md): A (Landlock),
@@ -2897,6 +2955,54 @@ mod tests {
             0,
             "an allowed plan must never announce on `approval`: {read_back}"
         );
+        drop(client);
+        drop(reader);
+        thread.join().unwrap();
+    }
+
+    /// HR-D6: a no-token attach that declares `client.kind:"mcp"` lands on the
+    /// restricted `agent:mcp` principal with the "agent" profile by default;
+    /// with the explicit permissive opt-in (`Kernel::set_mcp_permissive`, or
+    /// `SHOAL_MCP_PERMISSIVE` on the kernel binary) the same attach keeps the
+    /// legacy `local-human` mapping. Non-MCP client kinds are unaffected either
+    /// way.
+    #[test]
+    fn zero_config_mcp_attach_is_restricted_unless_permissive_opt_in() {
+        let kernel = Kernel::new();
+        let (mut client, mut reader, thread) = spawn(&kernel);
+        let r = call(
+            &mut client,
+            &mut reader,
+            1,
+            "session.attach",
+            json!({"client":{"kind":"mcp","tty":false}}),
+        )
+        .result
+        .unwrap();
+        assert_eq!(r["principal"], "agent:mcp", "{r}");
+        assert_eq!(r["caps"]["profile"], "agent", "{r}");
+        // The restricted agent still executes: availability is preserved.
+        let exec = call(&mut client, &mut reader, 2, "exec", json!({"src":"1 + 2"}));
+        assert!(exec.error.is_none(), "agent exec must work: {exec:?}");
+        drop(client);
+        drop(reader);
+        thread.join().unwrap();
+
+        // Explicit opt-in: the same attach maps to the local human again.
+        let kernel = Kernel::new();
+        kernel.set_mcp_permissive(true);
+        let (mut client, mut reader, thread) = spawn(&kernel);
+        let r = call(
+            &mut client,
+            &mut reader,
+            1,
+            "session.attach",
+            json!({"client":{"kind":"mcp","tty":false}}),
+        )
+        .result
+        .unwrap();
+        assert_eq!(r["principal"], json!(principal()), "{r}");
+        assert_eq!(r["caps"]["profile"], "local-human", "{r}");
         drop(client);
         drop(reader);
         thread.join().unwrap();

@@ -131,6 +131,22 @@ impl Kernel {
                     data: None,
                 })?;
             (meta.principal, meta.caps, meta.profile)
+        } else if params.client.kind == "mcp" && !self.permissive_mcp_attach.load(Ordering::SeqCst)
+        {
+            // HR-D6: a zero-config (no-token) MCP client lands on the restricted
+            // agent principal, NOT the same-UID human. Execution stays available
+            // (the built-in default policy defines `agent:mcp` with opaque
+            // allow / unrestricted fs), but the agent's identity is distinct —
+            // so agent work is attributed separately and HR-D3's separation of
+            // duties actually bites on the MCP path (the agent cannot approve
+            // its own plans; the human's session or a supervisor token can).
+            // Permissive attach is an explicit opt-in: a bearer token, or a
+            // non-empty `SHOAL_MCP_PERMISSIVE` on the kernel process. The
+            // `client.kind` string is a client declaration inside the same-UID
+            // 0600-socket trust boundary — it sets the default authority of the
+            // shipped agent surface, it is not a defense against a malicious
+            // same-UID process (which already has the user's full authority).
+            (MCP_AGENT_PRINCIPAL.into(), vec![], "agent".into())
         } else {
             (principal(), vec![], "local-human".into())
         };
