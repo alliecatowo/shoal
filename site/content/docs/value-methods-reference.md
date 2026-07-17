@@ -676,7 +676,7 @@ A stream is single-consumer. Calling a lazy combinator moves its source into a n
 | `debounce` | `(duration)` | quiet-period emission |
 | `throttle` | `(duration)` | rate-limited emission |
 | `window` | `(positive_count|duration)` | list windows |
-| `buffer` | `(capacity = 1)` | identity stage today; no queue or pacing effect |
+| `buffer` | `(capacity = 1)` | decoupled stream: a producer thread runs the upstream up to `capacity` items ahead |
 | `enumerate` | `()` | `[index,item]` |
 | `merge` | `(stream)` | interleaved streams |
 | `zip` | `(stream)` | paired `[left,right]` until one ends |

@@ -161,10 +161,71 @@ fn enumerate_pairs() {
 }
 
 #[test]
-fn buffer_is_identity() {
+fn buffer_is_lossless_and_ordered() {
+    // HR-G1: `.buffer(n)` decouples through a producer thread but must never
+    // drop or reorder — the whole sequence arrives intact.
     assert_eq!(
         rendered("[1,2,3].stream().buffer(2).collect()"),
         "[1, 2, 3]"
+    );
+}
+
+#[test]
+fn buffer_producer_runs_ahead_but_only_within_its_bound() {
+    // HR-G1's two claims in one program: DECOUPLING (production happens in the
+    // background before the consumer pulls anything) and BOUNDED READAHEAD
+    // (production pauses once the queue holds n items). The map closure runs
+    // below the buffer — on the producer thread — and reports progress onto a
+    // channel. With capacity 2 the producer can complete items 1 and 2 into
+    // the queue and stalls while HOLDING item 3 (its map already ran), so
+    // progress reads exactly 3 — not 6 (unbounded run-ahead) and not 0/null
+    // (no decoupling; the old identity stage would leave it null until
+    // collect). The final collect drains everything losslessly.
+    let v = run(
+        r#"let s = [1,2,3,4,5,6].stream().map(x => { channel("prod").emit(x)
+x }).buffer(2)
+sleep 500ms
+let ahead = channel("prod").latest()
+let all = s.collect()
+[ahead, all]"#,
+    );
+    assert_eq!(
+        render_inline(&v),
+        "[3, [1, 2, 3, 4, 5, 6]]",
+        "producer ran exactly capacity+1 items ahead, then delivered all"
+    );
+}
+
+#[test]
+fn buffer_over_an_endless_source_stays_endless_and_cleans_up() {
+    // HR-G1: boundedness is preserved (an endless source through a buffer
+    // still needs `.take` before collect), and dropping the consumer after a
+    // satisfied take tears the whole pipeline down promptly — the buffer
+    // producer exits on the disconnected send, dropping the timer receiver,
+    // which stops the timer thread. A leak/hang would blow the deadline.
+    let start = Instant::now();
+    let v = run("every(5ms).buffer(4).take(2).collect().len()");
+    assert_eq!(v, Value::Int(2));
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "pipeline shut down promptly, took {:?}",
+        start.elapsed()
+    );
+    // And the boundedness bit itself:
+    assert_eq!(
+        run_err("every(5ms).buffer(4).collect()"),
+        "stream_unbounded",
+        "a buffered endless source still refuses to collect"
+    );
+}
+
+#[test]
+fn buffer_propagates_upstream_closure_errors() {
+    // An error raised by a closure below the buffer (on the producer thread)
+    // crosses the channel and surfaces to the consumer as the stream error.
+    assert_eq!(
+        run_err(r#"[1,2,3].stream().map(x => x.no_such_method()).buffer(2).collect()"#),
+        "field_missing"
     );
 }
 

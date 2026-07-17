@@ -1,10 +1,11 @@
 # Further stream hardening beyond streams.toml/streams-more.toml:
-# `.buffer(0)` staying an identity pass-through (a zero-sized buffer still
-# forwards every element), and `.window` on an empty source producing no
-# windows at all rather than an error.
+# `.buffer(0)` — a zero-capacity decoupling buffer (HR-G1) is a rendezvous
+# handoff between the producer thread and the consumer: no readahead, but
+# every element still crosses losslessly and in order — and `.window` on an
+# empty source producing no windows at all rather than an error.
 
 [[case]]
-name = "stream3-buffer-zero-is-identity"
+name = "stream3-buffer-zero-is-lossless-rendezvous"
 src = "[1, 2].stream().buffer(0).collect()"
 value = "[1, 2]"
 
