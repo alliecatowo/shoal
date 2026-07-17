@@ -95,7 +95,14 @@ pub(super) fn fork(up: Box<dyn Upstream>, n: usize) -> Vec<TeeHandle> {
 
 impl Upstream for TeeHandle {
     fn pull(&mut self, ctx: &mut dyn CallCtx, t: Option<Duration>) -> VResult<Pull> {
-        let mut g = self.shared.lock().unwrap();
+        // `up.pull` runs arbitrary evaluator/source code while this lock is
+        // held. After an unwind its cursor and side effects are unknowable, so
+        // the entire tee is quarantined rather than replaying potentially
+        // duplicated or skipped data from a poisoned guard.
+        let mut g = self
+            .shared
+            .lock()
+            .map_err(|_| super::stream_state_poisoned())?;
         // Items already replayed to this fork by a sibling's pulls come first.
         if let Some(v) = g.queues[self.idx].pop() {
             return Ok(Pull::Item(v));
@@ -121,5 +128,104 @@ impl Upstream for TeeHandle {
             }
             Pull::Timeout => Ok(Pull::Timeout),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Fs, StdFs, StreamVal};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::path::PathBuf;
+    use std::sync::mpsc;
+    use std::thread;
+
+    struct C;
+    impl CallCtx for C {
+        fn call_closure(&mut self, _f: &Value, _args: Vec<Value>) -> VResult<Value> {
+            unreachable!("poison test source never calls a closure")
+        }
+
+        fn buffer_stream(&mut self, _stream: StreamVal, _capacity: usize) -> VResult<StreamVal> {
+            unreachable!("poison test source never buffers")
+        }
+
+        fn cwd(&self) -> PathBuf {
+            std::env::temp_dir()
+        }
+
+        fn fs(&self) -> &dyn Fs {
+            static STD: StdFs = StdFs;
+            &STD
+        }
+    }
+
+    struct BlockingPanic {
+        locked: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    }
+
+    impl Upstream for BlockingPanic {
+        fn pull(&mut self, _ctx: &mut dyn CallCtx, _t: Option<Duration>) -> VResult<Pull> {
+            self.locked.send(()).expect("test coordinator remains live");
+            self.release.recv().expect("test coordinator releases pull");
+            panic!("inject panic while tee owns its shared stream state");
+        }
+    }
+
+    #[test]
+    fn upstream_panic_quarantines_tee_for_waiters_repeats_and_drop() {
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut handles = fork(
+            Box::new(BlockingPanic {
+                locked: locked_tx,
+                release: release_rx,
+            }),
+            4,
+        );
+        let mut poisoner = handles.remove(0);
+        let mut waiter = handles.remove(0);
+        let mut repeated = handles.remove(0);
+        let cancelled = handles.remove(0);
+
+        let poisoning_thread = thread::spawn(move || {
+            assert!(catch_unwind(AssertUnwindSafe(|| poisoner.pull(&mut C, None))).is_err());
+        });
+        locked_rx.recv().expect("upstream reports holding tee lock");
+
+        let (waiter_started_tx, waiter_started_rx) = mpsc::channel();
+        let waiting_thread = thread::spawn(move || {
+            waiter_started_tx
+                .send(())
+                .expect("test coordinator remains live");
+            waiter.pull(&mut C, None)
+        });
+        waiter_started_rx
+            .recv()
+            .expect("waiter starts while lock is held");
+        drop(cancelled);
+        release_tx.send(()).expect("release poison injector");
+
+        poisoning_thread
+            .join()
+            .expect("upstream panic must be contained by test");
+        let expected = super::super::stream_state_poisoned();
+        assert_eq!(
+            waiting_thread.join().expect("waiter must not panic").err(),
+            Some(expected.clone())
+        );
+        assert_eq!(repeated.pull(&mut C, None).err(), Some(expected.clone()));
+        assert_eq!(repeated.pull(&mut C, None).err(), Some(expected));
+    }
+
+    #[test]
+    fn production_tee_locking_has_no_panic_path() {
+        let production = include_str!("tee.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("test module marker remains present");
+        assert!(!production.contains(".lock().unwrap()"));
+        assert!(!production.contains(".lock().expect("));
     }
 }

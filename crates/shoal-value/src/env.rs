@@ -2,6 +2,7 @@
 
 use super::*;
 use std::collections::HashMap;
+use std::sync::MutexGuard;
 
 #[derive(Debug, Clone)]
 pub struct Env {
@@ -27,6 +28,25 @@ pub enum AssignError {
 }
 
 impl Env {
+    /// Recover a lexical scope after an unwind while preserving its bindings.
+    ///
+    /// Every mutation in this module is a single `HashMap` operation or a
+    /// `Binding` value replacement. Rust's containers remain structurally
+    /// valid if hashing, allocation, or value code unwinds, and `parent` is
+    /// never mutated after construction. The guarded graph can therefore be
+    /// reused; unlike execution state, there is no half-advanced cursor or
+    /// external side effect to quarantine.
+    fn lock_inner(&self) -> MutexGuard<'_, EnvInner> {
+        match self.inner.lock() {
+            Ok(inner) => inner,
+            Err(poisoned) => {
+                let inner = poisoned.into_inner();
+                self.inner.clear_poison();
+                inner
+            }
+        }
+    }
+
     pub fn root() -> Env {
         Env {
             inner: Arc::new(Mutex::new(EnvInner {
@@ -46,9 +66,7 @@ impl Env {
     }
 
     pub fn declare(&self, name: impl Into<String>, value: Value, mutable: bool) {
-        self.inner
-            .lock()
-            .unwrap()
+        self.lock_inner()
             .vars
             .insert(name.into(), Binding { value, mutable });
     }
@@ -57,12 +75,12 @@ impl Env {
     /// parent. Hosts use this to refresh a mirrored remote-session namespace
     /// without accidentally deleting an inherited language binding.
     pub fn remove_local(&self, name: &str) -> Option<Binding> {
-        self.inner.lock().unwrap().vars.remove(name)
+        self.lock_inner().vars.remove(name)
     }
 
     pub fn get(&self, name: &str) -> Option<Value> {
         let parent = {
-            let g = self.inner.lock().unwrap();
+            let g = self.lock_inner();
             if let Some(b) = g.vars.get(name) {
                 return Some(b.value.clone());
             }
@@ -78,7 +96,7 @@ impl Env {
     /// Assign to an existing binding, walking up the scope chain.
     pub fn assign(&self, name: &str, value: Value) -> Result<(), AssignError> {
         let parent = {
-            let mut g = self.inner.lock().unwrap();
+            let mut g = self.lock_inner();
             if let Some(b) = g.vars.get_mut(name) {
                 if !b.mutable {
                     return Err(AssignError::Immutable);
@@ -101,7 +119,7 @@ impl Env {
         let mut seen = std::collections::HashSet::new();
         let mut cur = Some(self.clone());
         while let Some(env) = cur {
-            let g = env.inner.lock().unwrap();
+            let g = env.lock_inner();
             for k in g.vars.keys() {
                 if seen.insert(k.clone()) {
                     names.push(k.clone());
@@ -116,6 +134,9 @@ impl Env {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::Barrier;
+    use std::thread;
 
     #[test]
     fn remove_local_never_deletes_an_inherited_binding() {
@@ -128,5 +149,63 @@ mod tests {
         child.declare("shared", Value::Int(2), false);
         assert!(child.remove_local("shared").is_some());
         assert!(matches!(child.get("shared"), Some(Value::Int(1))));
+    }
+
+    #[test]
+    fn poisoned_scope_is_recovered_once_for_waiters_and_future_mutations() {
+        let root = Env::root();
+        root.declare("before", Value::Int(1), true);
+        let child = root.child();
+        child.declare("local", Value::Int(2), true);
+
+        let locked = Arc::clone(&child.inner);
+        let held = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let poisoner = {
+            let held = Arc::clone(&held);
+            let release = Arc::clone(&release);
+            thread::spawn(move || {
+                let _ = catch_unwind(AssertUnwindSafe(|| {
+                    let _guard = locked.lock().expect("scope starts healthy");
+                    held.wait();
+                    release.wait();
+                    panic!("inject lexical-scope poison");
+                }));
+            })
+        };
+
+        held.wait();
+        let waiter = {
+            let child = child.clone();
+            thread::spawn(move || child.get("local"))
+        };
+        release.wait();
+        poisoner.join().expect("poison injector must be contained");
+
+        assert_eq!(
+            waiter.join().expect("waiter must recover"),
+            Some(Value::Int(2))
+        );
+        assert!(!child.inner.is_poisoned());
+        assert_eq!(child.assign("local", Value::Int(3)), Ok(()));
+        child.declare("after", Value::Int(4), false);
+        assert_eq!(child.get("local"), Some(Value::Int(3)));
+        assert_eq!(child.get("before"), Some(Value::Int(1)));
+        assert_eq!(child.get("after"), Some(Value::Int(4)));
+        assert_eq!(
+            child.remove_local("after").map(|b| b.value),
+            Some(Value::Int(4))
+        );
+        assert!(child.visible_names().contains(&"before".to_owned()));
+    }
+
+    #[test]
+    fn production_env_locking_has_no_panic_path() {
+        let production = include_str!("env.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("test module marker remains present");
+        assert!(!production.contains(".lock().unwrap()"));
+        assert!(!production.contains(".lock().expect("));
     }
 }

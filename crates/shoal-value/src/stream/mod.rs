@@ -35,6 +35,14 @@ enum StreamState {
     Consumed,
 }
 
+const STREAM_STATE_POISONED_CODE: &str = "custom";
+const STREAM_STATE_POISONED_MSG: &str =
+    "stream state is unavailable after a synchronization failure";
+
+fn stream_state_poisoned() -> ErrorVal {
+    ErrorVal::new(STREAM_STATE_POISONED_CODE, STREAM_STATE_POISONED_MSG)
+}
+
 /// One pull from an upstream, honoring an optional deadline.
 pub enum Pull {
     Item(Value),
@@ -295,7 +303,11 @@ impl StreamVal {
     /// Take the composed upstream, enforcing single-consumption (site/content/internals/language-conformance-contract.md): a
     /// second attempt is `stream_consumed`.
     pub fn take_upstream(&self) -> VResult<Box<dyn Upstream>> {
-        let mut g = self.inner.lock().unwrap();
+        // A stream mutex can be poisoned by arbitrary upstream/evaluator code.
+        // Its cursor and external effects may already have advanced, so do not
+        // reconstruct from the poisoned guard: quarantine it and return one
+        // stable language error on every attempt.
+        let mut g = self.inner.lock().map_err(|_| stream_state_poisoned())?;
         match std::mem::replace(&mut *g, StreamState::Consumed) {
             StreamState::Ready(up) => Ok(up),
             StreamState::Consumed => {
@@ -627,5 +639,36 @@ mod tests {
         assert_eq!(record.get("dropped"), Some(&Value::Int(5)));
         assert_eq!(record.get("from_seq"), Some(&Value::Int(4)));
         assert_eq!(record.get("to_seq"), Some(&Value::Int(8)));
+    }
+
+    #[test]
+    fn poisoned_stream_state_is_quarantined_with_a_repeatable_error() {
+        let stream = endless_marked(1);
+        let locked = Arc::clone(&stream.inner);
+        let poisoner = std::thread::spawn(move || {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = locked.lock().expect("stream starts healthy");
+                panic!("inject stream-state poison");
+            }));
+        });
+        poisoner.join().expect("poison injector must be contained");
+
+        let expected = stream_state_poisoned();
+        assert_eq!(stream.take_upstream().err(), Some(expected.clone()));
+        assert_eq!(stream.take_upstream().err(), Some(expected));
+        assert!(
+            stream.inner.is_poisoned(),
+            "quarantined state stays poisoned"
+        );
+    }
+
+    #[test]
+    fn production_stream_locking_has_no_panic_path() {
+        let production = include_str!("mod.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("test module marker remains present");
+        assert!(!production.contains(".lock().unwrap()"));
+        assert!(!production.contains(".lock().expect("));
     }
 }
