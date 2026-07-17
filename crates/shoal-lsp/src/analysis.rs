@@ -18,6 +18,7 @@ pub(crate) struct Symbol {
     pub detail: String,
     pub doc: Option<String>,
     pub scope: Span,
+    pub visible_from: usize,
 }
 
 impl Symbol {
@@ -55,6 +56,7 @@ fn walk_block_like(stmts: &[Stmt], text: &str, scope: Span, symbols: &mut Vec<Sy
                 pattern,
                 mutable,
                 init,
+                span,
                 ..
             } => {
                 pattern_symbols(
@@ -65,6 +67,8 @@ fn walk_block_like(stmts: &[Stmt], text: &str, scope: Span, symbols: &mut Vec<Sy
                         SymbolFlavor::Binding
                     },
                     scope,
+                    span.end as usize,
+                    text,
                     symbols,
                 );
                 walk_expr(init, text, symbols);
@@ -77,6 +81,7 @@ fn walk_block_like(stmts: &[Stmt], text: &str, scope: Span, symbols: &mut Vec<Sy
                     detail: format!("fn {}({} params)", decl.name, decl.params.len()),
                     doc: decl.doc.clone(),
                     scope,
+                    visible_from: decl.span.start as usize,
                 });
                 for param in &decl.params {
                     symbols.push(Symbol {
@@ -86,6 +91,7 @@ fn walk_block_like(stmts: &[Stmt], text: &str, scope: Span, symbols: &mut Vec<Sy
                         detail: "function parameter".into(),
                         doc: None,
                         scope: decl.body.span,
+                        visible_from: decl.body.span.start as usize,
                     });
                     if let Some(default) = &param.default {
                         walk_expr(default, text, symbols);
@@ -100,6 +106,7 @@ fn walk_block_like(stmts: &[Stmt], text: &str, scope: Span, symbols: &mut Vec<Sy
                 detail: "command alias".into(),
                 doc: None,
                 scope,
+                visible_from: span.end as usize,
             }),
             Stmt::Assign { target, value, .. } => {
                 walk_expr(target, text, symbols);
@@ -116,7 +123,14 @@ fn walk_block_like(stmts: &[Stmt], text: &str, scope: Span, symbols: &mut Vec<Sy
                 body,
                 ..
             } => {
-                pattern_symbols(pattern, SymbolFlavor::Binding, body.span, symbols);
+                pattern_symbols(
+                    pattern,
+                    SymbolFlavor::Binding,
+                    body.span,
+                    body.span.start as usize,
+                    text,
+                    symbols,
+                );
                 walk_expr(iter, text, symbols);
                 walk_block_like(&body.stmts, text, body.span, symbols);
             }
@@ -130,11 +144,18 @@ fn walk_block_like(stmts: &[Stmt], text: &str, scope: Span, symbols: &mut Vec<Sy
     }
 }
 
-fn pattern_symbols(pattern: &Pattern, flavor: SymbolFlavor, scope: Span, out: &mut Vec<Symbol>) {
+fn pattern_symbols(
+    pattern: &Pattern,
+    flavor: SymbolFlavor,
+    scope: Span,
+    visible_from: usize,
+    text: &str,
+    out: &mut Vec<Symbol>,
+) {
     match pattern {
         Pattern::Bind { name, span } => out.push(Symbol {
             name: name.clone(),
-            span: *span,
+            span: identifier_span(text, *span, name),
             flavor,
             detail: match flavor {
                 SymbolFlavor::MutableBinding => "mutable binding",
@@ -143,6 +164,7 @@ fn pattern_symbols(pattern: &Pattern, flavor: SymbolFlavor, scope: Span, out: &m
             .into(),
             doc: None,
             scope,
+            visible_from,
         }),
         Pattern::Type {
             name: Some(name),
@@ -150,22 +172,44 @@ fn pattern_symbols(pattern: &Pattern, flavor: SymbolFlavor, scope: Span, out: &m
             ..
         } => out.push(Symbol {
             name: name.clone(),
-            span: *span,
+            span: identifier_span(text, *span, name),
             flavor,
             detail: "typed binding".into(),
             doc: None,
             scope,
+            visible_from,
         }),
         Pattern::Record { fields, .. } => {
             for field in fields {
                 if let Some(pattern) = &field.pattern {
-                    pattern_symbols(pattern, flavor, scope, out);
+                    pattern_symbols(pattern, flavor, scope, visible_from, text, out);
+                } else {
+                    out.push(Symbol {
+                        name: field.name.clone(),
+                        span: identifier_span(text, pattern.span(), &field.name),
+                        flavor,
+                        detail: "record destructure binding".into(),
+                        doc: None,
+                        scope,
+                        visible_from,
+                    });
                 }
             }
         }
-        Pattern::List { items, .. } => {
+        Pattern::List { items, rest, .. } => {
             for pattern in items {
-                pattern_symbols(pattern, flavor, scope, out);
+                pattern_symbols(pattern, flavor, scope, visible_from, text, out);
+            }
+            if let Some(name) = rest {
+                out.push(Symbol {
+                    name: name.clone(),
+                    span: last_identifier_span(text, pattern.span(), name),
+                    flavor,
+                    detail: "list rest binding".into(),
+                    doc: None,
+                    scope,
+                    visible_from,
+                });
             }
         }
         _ => {}
@@ -218,6 +262,7 @@ fn walk_expr(expr: &Expr, text: &str, out: &mut Vec<Symbol>) {
                     detail: "lambda parameter".into(),
                     doc: None,
                     scope: expr.span(),
+                    visible_from: body.span().start as usize,
                 });
             }
             walk_expr(body, text, out);
@@ -248,7 +293,14 @@ fn walk_expr(expr: &Expr, text: &str, out: &mut Vec<Symbol>) {
             walk_expr(scrutinee, text, out);
             for arm in arms {
                 for pattern in &arm.patterns {
-                    pattern_symbols(pattern, SymbolFlavor::Binding, arm.span, out);
+                    pattern_symbols(
+                        pattern,
+                        SymbolFlavor::Binding,
+                        arm.span,
+                        pattern.span().end as usize,
+                        text,
+                        out,
+                    );
                 }
                 if let Some(guard) = &arm.guard {
                     walk_expr(guard, text, out);
@@ -264,7 +316,14 @@ fn walk_expr(expr: &Expr, text: &str, out: &mut Vec<Symbol>) {
         } => {
             walk_block(body, text, out);
             if let Some(pattern) = pattern {
-                pattern_symbols(pattern, SymbolFlavor::Binding, handler.span, out);
+                pattern_symbols(
+                    pattern,
+                    SymbolFlavor::Binding,
+                    handler.span,
+                    handler.span.start as usize,
+                    text,
+                    out,
+                );
             }
             walk_block(handler, text, out);
         }
@@ -283,6 +342,7 @@ fn walk_expr(expr: &Expr, text: &str, out: &mut Vec<Symbol>) {
                     detail: "error binding".into(),
                     doc: None,
                     scope: handler.span(),
+                    visible_from: handler.span().start as usize,
                 });
             }
             walk_expr(handler, text, out);
@@ -337,6 +397,14 @@ fn identifier_span(text: &str, within: Span, name: &str) -> Span {
                 (boundary(before) && boundary(after)).then_some(start + offset)
             })
         })
+        .map_or(within, |start| Span::new(start, start + name.len()))
+}
+
+fn last_identifier_span(text: &str, within: Span, name: &str) -> Span {
+    let start = within.start as usize;
+    let end = (within.end as usize).min(text.len());
+    text.get(start..end)
+        .and_then(|slice| slice.rfind(name).map(|offset| start + offset))
         .map_or(within, |start| Span::new(start, start + name.len()))
 }
 

@@ -29,23 +29,21 @@ impl Backend {
             updates: Default::default(),
         }
     }
-    async fn publish(&self, uri: Url, text: String, version: i32) {
-        let _update = self.updates.lock().await;
-        if self
-            .docs
-            .read()
-            .await
-            .get(&uri)
-            .is_some_and(|current| current.version > version)
-        {
-            return;
-        }
+    async fn analyze_and_publish(&self, uri: Url, text: String, version: i32) {
         let analyze_uri = uri.clone();
         let fallback_text = text.clone();
         let state =
             tokio::task::spawn_blocking(move || analyze_document(&analyze_uri, text, version))
                 .await
                 .unwrap_or_else(|_| analyze_document(&uri, fallback_text, version));
+        let _update = self.updates.lock().await;
+        let current = self.docs.read().await.get(&uri).cloned();
+        if !current
+            .as_ref()
+            .is_some_and(|current| analysis_is_current(current, &state))
+        {
+            return;
+        }
         let diagnostics = state.diagnostics.clone();
         self.docs.write().await.insert(uri.clone(), state);
         self.client
@@ -60,7 +58,7 @@ impl LanguageServer for Backend {
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
-                    TextDocumentSyncKind::FULL,
+                    TextDocumentSyncKind::INCREMENTAL,
                 )),
                 document_formatting_provider: Some(OneOf::Left(true)),
                 completion_provider: Some(CompletionOptions::default()),
@@ -84,18 +82,48 @@ impl LanguageServer for Backend {
         Ok(())
     }
     async fn did_open(&self, p: DidOpenTextDocumentParams) {
-        self.publish(
-            p.text_document.uri,
-            p.text_document.text,
-            p.text_document.version,
-        )
-        .await;
+        let uri = p.text_document.uri;
+        let text = p.text_document.text;
+        let version = p.text_document.version;
+        {
+            let _update = self.updates.lock().await;
+            self.docs
+                .write()
+                .await
+                .insert(uri.clone(), pending_document(text.clone(), version));
+        }
+        self.analyze_and_publish(uri, text, version).await;
     }
     async fn did_change(&self, p: DidChangeTextDocumentParams) {
-        if let Some(c) = p.content_changes.into_iter().last() {
-            self.publish(p.text_document.uri, c.text, p.text_document.version)
-                .await;
-        }
+        let uri = p.text_document.uri;
+        let version = p.text_document.version;
+        let staged = {
+            let _update = self.updates.lock().await;
+            let docs = self.docs.read().await;
+            let Some(current) = docs.get(&uri) else {
+                return;
+            };
+            if version <= current.version {
+                return;
+            }
+            let next = apply_content_changes(&current.text, &p.content_changes);
+            drop(docs);
+            if let Ok(next) = &next {
+                self.docs
+                    .write()
+                    .await
+                    .insert(uri.clone(), pending_document(next.clone(), version));
+            }
+            next
+        };
+        let next_text = match staged {
+            Ok(text) => text,
+            Err(message) => {
+                self.client.log_message(MessageType::WARNING, message).await;
+                return;
+            }
+        };
+        self.analyze_and_publish(uri, next_text, version).await;
     }
     async fn did_close(&self, p: DidCloseTextDocumentParams) {
         let _update = self.updates.lock().await;
@@ -124,6 +152,11 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
         let byte = position_to_byte(&doc.text, p.text_document_position.position);
+        let (replace_start, replace_end) = word_bounds_at(&doc.text, byte);
+        let replace_range = Range::new(
+            byte_to_position(&doc.text, replace_start),
+            byte_to_position(&doc.text, replace_end),
+        );
         // Completion vocabulary = language keywords ∪ builtin command heads
         // (see `base_vocabulary`) ∪ lexical declarations seen so far.
         let mut names: Vec<String> = base_vocabulary().map(str::to_string).collect();
@@ -158,6 +191,10 @@ impl LanguageServer for Backend {
                         }),
                         documentation: symbol
                             .and_then(|symbol| symbol.doc.clone().map(Documentation::String)),
+                        text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                            range: replace_range,
+                            new_text: label.clone(),
+                        })),
                         label,
                         ..Default::default()
                     }
@@ -212,13 +249,15 @@ impl LanguageServer for Backend {
         };
         let pos = position_to_byte(&doc.text, p.text_document_position_params.position);
         let word = word_at(&doc.text, pos);
-        let Some(symbol) = definition_symbol(&doc.symbols, word, pos) else {
-            return Ok(None);
-        };
-        Ok(Some(GotoDefinitionResponse::Scalar(Location::new(
-            p.text_document_position_params.text_document.uri,
-            span_range(&doc.text, symbol.span),
-        ))))
+        if let Some(symbol) = definition_symbol(&doc.symbols, word, pos) {
+            return Ok(Some(GotoDefinitionResponse::Scalar(Location::new(
+                p.text_document_position_params.text_document.uri,
+                span_range(&doc.text, symbol.span),
+            ))));
+        }
+        let source_uri = &p.text_document_position_params.text_document.uri;
+        Ok(definition_in_used_module(source_uri, doc, pos, word, &docs)
+            .map(GotoDefinitionResponse::Scalar))
     }
 
     async fn document_symbol(
@@ -255,9 +294,187 @@ fn definition_symbol<'a>(symbols: &'a [Symbol], word: &str, pos: usize) -> Optio
 }
 
 fn symbol_visible_at(symbol: &Symbol, pos: usize) -> bool {
-    symbol.span.start as usize <= pos
+    (symbol.visible_from <= pos
+        || (symbol.span.start as usize <= pos && pos <= symbol.span.end as usize))
         && symbol.scope.start as usize <= pos
         && pos <= symbol.scope.end as usize
+}
+
+fn analysis_is_current(current: &DocumentState, analyzed: &DocumentState) -> bool {
+    current.version == analyzed.version && current.text == analyzed.text
+}
+
+fn pending_document(text: String, version: i32) -> DocumentState {
+    DocumentState {
+        text,
+        version,
+        ast: None,
+        diagnostics: Vec::new(),
+        symbols: Vec::new(),
+    }
+}
+
+fn apply_content_changes(
+    original: &str,
+    changes: &[TextDocumentContentChangeEvent],
+) -> std::result::Result<String, String> {
+    let mut text = original.to_string();
+    for change in changes {
+        let Some(range) = change.range else {
+            text = change.text.clone();
+            continue;
+        };
+        let start = position_to_byte_strict(&text, range.start)
+            .ok_or_else(|| format!("invalid incremental edit start: {:?}", range.start))?;
+        let end = position_to_byte_strict(&text, range.end)
+            .ok_or_else(|| format!("invalid incremental edit end: {:?}", range.end))?;
+        if start > end {
+            return Err("incremental edit range is reversed".into());
+        }
+        if let Some(expected) = change.range_length {
+            let actual = text[start..end].encode_utf16().count() as u32;
+            if actual != expected {
+                return Err(format!(
+                    "incremental edit range_length mismatch: client={expected}, actual={actual}"
+                ));
+            }
+        }
+        text.replace_range(start..end, &change.text);
+    }
+    Ok(text)
+}
+
+fn position_to_byte_strict(s: &str, p: Position) -> Option<usize> {
+    let mut start = 0usize;
+    for _ in 0..p.line {
+        let offset = s[start..].find('\n')?;
+        start += offset + 1;
+    }
+    let line_end = s[start..].find('\n').map_or(s.len(), |i| start + i);
+    let line = &s[start..line_end];
+    let mut units = 0u32;
+    for (offset, ch) in line.char_indices() {
+        if units == p.character {
+            return Some(start + offset);
+        }
+        let next = units + ch.len_utf16() as u32;
+        if p.character < next {
+            return None;
+        }
+        units = next;
+    }
+    (units == p.character).then_some(line_end)
+}
+
+fn resolve_module_path(source_uri: &Url, module: &str) -> Option<std::path::PathBuf> {
+    let source = source_uri.to_file_path().ok()?;
+    let module = std::path::PathBuf::from(module);
+    let base = if module.is_absolute() {
+        module
+    } else {
+        source.parent()?.join(module)
+    };
+    let candidates = if base.extension().is_some() {
+        vec![base]
+    } else {
+        vec![base.with_extension("shl"), base]
+    };
+    candidates
+        .into_iter()
+        .find(|path| path.is_file())
+        .and_then(|path| path.canonicalize().ok())
+}
+
+fn use_path_span(text: &str, stmt_span: Span, path: &str) -> Option<Span> {
+    let start = stmt_span.start as usize;
+    let end = (stmt_span.end as usize).min(text.len());
+    text.get(start..end)?
+        .rfind(path)
+        .map(|offset| Span::new(start + offset, start + offset + path.len()))
+}
+
+fn qualified_name_at(text: &str, pos: usize) -> Option<(&str, &str)> {
+    let (member_start, member_end) = word_bounds_at(text, pos);
+    if member_start == 0 || text.as_bytes().get(member_start - 1) != Some(&b'.') {
+        return None;
+    }
+    let qualifier_end = member_start - 1;
+    let (qualifier_start, _) = word_bounds_at(text, qualifier_end);
+    let qualifier = text.get(qualifier_start..qualifier_end)?;
+    let member = text.get(member_start..member_end)?;
+    (!qualifier.is_empty() && !member.is_empty()).then_some((qualifier, member))
+}
+
+fn exported_symbol(program: &Program, text: &str, name: &str) -> Option<Span> {
+    for stmt in &program.stmts {
+        match stmt {
+            shoal_ast::Stmt::Fn { decl } if decl.exported && decl.name == name => {
+                return collect_symbols(program, text)
+                    .into_iter()
+                    .find(|symbol| symbol.name == name && symbol.span.start >= decl.span.start)
+                    .map(|symbol| symbol.span);
+            }
+            shoal_ast::Stmt::Let {
+                exported: true,
+                span,
+                ..
+            } => {
+                if let Some(symbol) = collect_symbols(program, text).into_iter().find(|symbol| {
+                    symbol.name == name
+                        && symbol.span.start >= span.start
+                        && symbol.span.end <= span.end
+                }) {
+                    return Some(symbol.span);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn definition_in_used_module(
+    source_uri: &Url,
+    source: &DocumentState,
+    pos: usize,
+    word: &str,
+    docs: &HashMap<Url, DocumentState>,
+) -> Option<Location> {
+    let program = source.ast.as_ref()?;
+    let qualified = qualified_name_at(&source.text, pos);
+    for stmt in &program.stmts {
+        let shoal_ast::Stmt::Use { path, span } = stmt else {
+            continue;
+        };
+        let path_span = use_path_span(&source.text, *span, path)?;
+        let stem = std::path::Path::new(path).file_stem()?.to_str()?;
+        let on_path = path_span.start as usize <= pos && pos <= path_span.end as usize;
+        let on_module_name = word == stem;
+        let member = qualified
+            .filter(|(qualifier, _)| *qualifier == stem)
+            .map(|(_, member)| member);
+        if !on_path && !on_module_name && member.is_none() {
+            continue;
+        }
+        let target_path = resolve_module_path(source_uri, path)?;
+        let target_uri = Url::from_file_path(&target_path).ok()?;
+        let (target_text, target_ast) = if let Some(target) = docs.get(&target_uri) {
+            (target.text.clone(), target.ast.clone())
+        } else {
+            let text = std::fs::read_to_string(&target_path).ok()?;
+            let ast = shoal_syntax::parse(&text).ok();
+            (text, ast)
+        };
+        let range = match member {
+            Some(name) => span_range(
+                &target_text,
+                exported_symbol(target_ast.as_ref()?, &target_text, name)?,
+            ),
+            None => Range::new(Position::new(0, 0), Position::new(0, 0)),
+        };
+        return Some(Location::new(target_uri, range));
+    }
+    None
 }
 
 fn completion_kind(label: &str) -> CompletionItemKind {
@@ -309,7 +526,15 @@ fn help(w: &str) -> Option<&'static str> {
     })
 }
 fn word_at(s: &str, pos: usize) -> &str {
-    let p = pos.min(s.len());
+    let (a, b) = word_bounds_at(s, pos);
+    &s[a..b]
+}
+
+fn word_bounds_at(s: &str, pos: usize) -> (usize, usize) {
+    let mut p = pos.min(s.len());
+    while !s.is_char_boundary(p) {
+        p -= 1;
+    }
     let mut a = p;
     while a > 0 && (s.as_bytes()[a - 1].is_ascii_alphanumeric() || s.as_bytes()[a - 1] == b'_') {
         a -= 1
@@ -318,7 +543,7 @@ fn word_at(s: &str, pos: usize) -> &str {
     while b < s.len() && (s.as_bytes()[b].is_ascii_alphanumeric() || s.as_bytes()[b] == b'_') {
         b += 1
     }
-    &s[a..b]
+    (a, b)
 }
 pub fn byte_to_position(s: &str, byte: usize) -> Position {
     let mut b = byte.min(s.len());
@@ -424,6 +649,31 @@ fn parse_diagnostic(text: &str, e: shoal_syntax::ParseError) -> Diagnostic {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn change(
+        range: Range,
+        range_length: Option<u32>,
+        text: &str,
+    ) -> TextDocumentContentChangeEvent {
+        TextDocumentContentChangeEvent {
+            range: Some(range),
+            range_length,
+            text: text.into(),
+        }
+    }
+
+    fn unique_temp_dir(label: &str) -> std::path::PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("shoal-lsp-{label}-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&path).unwrap();
+        path
+    }
+
     #[test]
     fn utf16_positions() {
         let s = "a🦀b\n雪x";
@@ -493,6 +743,16 @@ mod tests {
     }
 
     #[test]
+    fn binding_is_not_visible_inside_its_own_initializer() {
+        let text = "let x = x\nx";
+        let ast = shoal_syntax::parse(text).unwrap();
+        let symbols = collect_symbols(&ast, text);
+        let initializer = text.find("= x").unwrap() + 2;
+        assert!(definition_symbol(&symbols, "x", initializer).is_none());
+        assert!(definition_symbol(&symbols, "x", text.len()).is_some());
+    }
+
+    #[test]
     fn function_parameter_does_not_leak_outside_its_scope() {
         let text = "fn f(x) { x }\nx";
         let ast = shoal_syntax::parse(text).unwrap();
@@ -522,6 +782,158 @@ mod tests {
         assert_eq!(
             &text[symbol.span.start as usize..symbol.span.end as usize],
             "n"
+        );
+    }
+
+    #[test]
+    fn incremental_changes_are_sequential_and_utf16_aware() {
+        let changes = vec![
+            change(
+                Range::new(Position::new(0, 1), Position::new(0, 3)),
+                Some(2),
+                "X",
+            ),
+            change(
+                Range::new(Position::new(1, 0), Position::new(1, 6)),
+                Some(6),
+                "done",
+            ),
+        ];
+        assert_eq!(
+            apply_content_changes("a🦀b\nsecond", &changes).unwrap(),
+            "aXb\ndone"
+        );
+    }
+
+    #[test]
+    fn incremental_changes_reject_malformed_ranges_without_mutating_input() {
+        let surrogate_middle = change(
+            Range::new(Position::new(0, 2), Position::new(0, 3)),
+            None,
+            "X",
+        );
+        assert!(apply_content_changes("a🦀b", &[surrogate_middle]).is_err());
+
+        let missing_line = change(
+            Range::new(Position::new(9, 0), Position::new(9, 0)),
+            None,
+            "X",
+        );
+        assert!(apply_content_changes("one", &[missing_line]).is_err());
+
+        let reversed = change(
+            Range::new(Position::new(0, 2), Position::new(0, 1)),
+            None,
+            "X",
+        );
+        assert!(apply_content_changes("abc", &[reversed]).is_err());
+
+        let wrong_length = change(
+            Range::new(Position::new(0, 1), Position::new(0, 3)),
+            Some(1),
+            "X",
+        );
+        assert!(apply_content_changes("a🦀b", &[wrong_length]).is_err());
+    }
+
+    #[test]
+    fn stale_analysis_requires_matching_version_and_text() {
+        let current = pending_document("let current = 1".into(), 8);
+        let same = pending_document("let current = 1".into(), 8);
+        let old_version = pending_document("let current = 1".into(), 7);
+        let wrong_text = pending_document("let stale = 1".into(), 8);
+        assert!(analysis_is_current(&current, &same));
+        assert!(!analysis_is_current(&current, &old_version));
+        assert!(!analysis_is_current(&current, &wrong_text));
+    }
+
+    #[test]
+    fn completion_replaces_the_whole_identifier_at_cursor() {
+        let text = "let deployment = dep_suffix";
+        let cursor = text.find("_suffix").unwrap();
+        let (start, end) = word_bounds_at(text, cursor);
+        assert_eq!(&text[start..end], "dep_suffix");
+        assert_eq!(byte_to_position(text, start), Position::new(0, 17));
+    }
+
+    #[test]
+    fn use_definition_resolves_paths_and_exported_members() {
+        let dir = unique_temp_dir("definition");
+        let source_path = dir.join("main.shl");
+        let module_path = dir.join("tools.shl");
+        let source_text = "use ./tools\ntools.build()";
+        let module_text = "export fn build() {}\nfn private() {}";
+        std::fs::write(&source_path, source_text).unwrap();
+        std::fs::write(&module_path, module_text).unwrap();
+        let source_uri = Url::from_file_path(&source_path).unwrap();
+        let source = analyze_document(&source_uri, source_text.into(), 1);
+        let docs = HashMap::new();
+
+        let member_pos = source_text.rfind("build").unwrap() + 2;
+        let member = definition_in_used_module(
+            &source_uri,
+            &source,
+            member_pos,
+            word_at(source_text, member_pos),
+            &docs,
+        )
+        .unwrap();
+        assert_eq!(
+            member.uri.to_file_path().unwrap(),
+            module_path.canonicalize().unwrap()
+        );
+        assert_eq!(member.range.start, Position::new(0, 10));
+
+        let path_pos = source_text.find("tools").unwrap() + 2;
+        let module = definition_in_used_module(
+            &source_uri,
+            &source,
+            path_pos,
+            word_at(source_text, path_pos),
+            &docs,
+        )
+        .unwrap();
+        assert_eq!(module.range.start, Position::new(0, 0));
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn planner_analysis_has_no_filesystem_side_effects() {
+        let dir = unique_temp_dir("planner-purity");
+        let keep = dir.join("keep");
+        std::fs::write(&keep, "sentinel").unwrap();
+        let uri = Url::from_file_path(dir.join("main.shl")).unwrap();
+        let before = std::fs::read_dir(&dir).unwrap().count();
+
+        let _state = analyze_document(&uri, "rm keep\ntouch created".into(), 1);
+
+        assert_eq!(std::fs::read_to_string(&keep).unwrap(), "sentinel");
+        assert!(!dir.join("created").exists());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), before);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn destructuring_patterns_expose_each_binding() {
+        let text = "match [1, 2] { [first, ...rest] => first }\n\
+                    match {name: \"n\"} { {name} => name }";
+        let ast = shoal_syntax::parse(text).unwrap();
+        let names = collect_symbols(&ast, text)
+            .into_iter()
+            .map(|symbol| {
+                let declared =
+                    text[symbol.span.start as usize..symbol.span.end as usize].to_string();
+                (symbol.name, declared)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                ("first".into(), "first".into()),
+                ("rest".into(), "rest".into()),
+                ("name".into(), "name".into())
+            ]
         );
     }
 }
