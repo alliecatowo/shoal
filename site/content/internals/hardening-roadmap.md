@@ -157,7 +157,7 @@ Rules for implementers:
   documented allowlist. *(H9)*
 - [x] **HR-F7** — Unix-only support stated explicitly in README/docs; Windows recorded as out of
   scope for now. *(H8)*
-- [ ] **HR-F8** — Decide and document how CI pays (or stops paying) the wasmtime compile cost
+- [x] **HR-F8** — Decide and document how CI pays (or stops paying) the wasmtime compile cost
   for the unwired `shoal-wasm` crate: keep, feature-gate, or a separate job. *(H10)*
 
 ## Wave 2 — semantic truth (P2)
