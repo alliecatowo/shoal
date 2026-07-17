@@ -609,7 +609,7 @@ fn raw_events_publish_read_roundtrip_on_user_channel() {
         &mut reader,
         1,
         "session.attach",
-        json!({"client":{"kind":"test","tty":false}}),
+        json!({"local_auth":"local-human","client":{"kind":"test","tty":false}}),
     );
     let published = raw_call(
         &mut stream,
@@ -659,7 +659,7 @@ fn language_channel_emit_bridges_to_wire_bus_and_back() {
         &mut reader,
         1,
         "session.attach",
-        json!({"client":{"kind":"test","tty":false}}),
+        json!({"local_auth":"local-human","client":{"kind":"test","tty":false}}),
     );
     // Connection 2: a dedicated subscriber that only ever receives pushes.
     let mut sub_stream = UnixStream::connect(&live.socket).unwrap();
@@ -669,7 +669,7 @@ fn language_channel_emit_bridges_to_wire_bus_and_back() {
         &mut sub_reader,
         1,
         "session.attach",
-        json!({"client":{"kind":"test","tty":false}}),
+        json!({"local_auth":"local-human","client":{"kind":"test","tty":false}}),
     );
     let sub = raw_call(
         &mut sub_stream,
@@ -1015,7 +1015,7 @@ fn raw_unattached_journal_query_is_rejected_then_allowed_after_attach() {
         &mut reader,
         2,
         "session.attach",
-        json!({"client":{"kind":"test","tty":false}}),
+        json!({"local_auth":"local-human","client":{"kind":"test","tty":false}}),
     );
     assert!(attached.error.is_none(), "attach failed: {attached:?}");
     let ok = raw_call(
@@ -1046,7 +1046,7 @@ fn raw_journal_query_limit_zero_is_empty_and_omitted_is_default() {
         &mut reader,
         1,
         "session.attach",
-        json!({"client":{"kind":"test","tty":false}}),
+        json!({"local_auth":"local-human","client":{"kind":"test","tty":false}}),
     );
     // Produce a journal entry.
     let exec = raw_call(&mut stream, &mut reader, 2, "exec", json!({"src":"1 + 2"}));

@@ -28,7 +28,7 @@ impl Kernel {
                     attachment.session.ensure_healthy()?;
                 }
                 match method.as_str() {
-                    "session.attach" => self.handle_session_attach(params, attached),
+                    "session.attach" => self.handle_session_attach(params, client, attached),
                     "session.env" => self.handle_session_env(attached),
                     "session.reef" => self.handle_session_reef(attached),
                     "parse" => self.handle_parse(params),

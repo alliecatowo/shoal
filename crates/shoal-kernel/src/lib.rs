@@ -189,6 +189,7 @@ impl Drop for TaskWorkerGuard {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.task.fail_worker_panic();
             self.kernel.events.publish(
+                &self.task.session.key.owner(),
                 &self.channel,
                 json!({
                     "$": "record",
@@ -742,7 +743,11 @@ impl Kernel {
         .unwrap_or_else(|_| "[]".into());
         let record = EntryRecord {
             session: session.to_string(),
-            principal: approval.approver.clone(),
+            // The grant mutates the requester's plan and is consumed by the
+            // requester's later execution, so store it in that exact owner's
+            // journal partition. The embedded effect still names the distinct
+            // approver for attribution and separation-of-duties auditing.
+            principal: approval.requester.clone(),
             ts_ns: approval.approved_at_ns,
             cwd: Vec::new(),
             src: format!(
@@ -1298,7 +1303,7 @@ mod tests {
             &mut reader,
             5,
             "session.attach",
-            json!({"session":"after-panic","client":{"kind":"test","tty":false}}),
+            json!({"local_auth":"local-human","session":"after-panic","client":{"kind":"test","tty":false}}),
         );
         assert!(attached.error.is_none(), "reattach failed: {attached:?}");
         let exec = call(&mut client, &mut reader, 6, "exec", json!({"src":"1 + 2"}));
@@ -1710,7 +1715,7 @@ mod tests {
                 &mut reader,
                 1,
                 "session.attach",
-                json!({"client":{"kind":"test","tty":false}})
+                json!({"local_auth":"local-human","client":{"kind":"test","tty":false}})
             )
             .error
             .is_none()
@@ -1871,7 +1876,7 @@ mod tests {
                 &mut reader,
                 1,
                 "session.attach",
-                json!({"client":{"kind":"agent","tty":false}}),
+                json!({"local_auth":"local-human","client":{"kind":"agent","tty":false}}),
             );
             let planned = call(
                 &mut client,
@@ -1949,7 +1954,7 @@ mod tests {
             &mut reader,
             1,
             "session.attach",
-            json!({"client":{"kind":"agent","tty":false}}),
+            json!({"local_auth":"local-human","client":{"kind":"agent","tty":false}}),
         );
         // Baseline: the policy gates a plain run of this source.
         let run = call(
@@ -2053,7 +2058,7 @@ mod tests {
             &mut reader,
             1,
             "session.attach",
-            json!({"client":{"kind":"agent","tty":false}}),
+            json!({"local_auth":"local-human","client":{"kind":"agent","tty":false}}),
         );
         let plan_a = call(
             &mut client,
@@ -2155,7 +2160,7 @@ mod tests {
             &mut reader,
             1,
             "session.attach",
-            json!({"client":{"kind":"agent","tty":false}}),
+            json!({"local_auth":"local-human","client":{"kind":"agent","tty":false}}),
         );
         for src in ["1 + 2", "ls"] {
             let planned = call(
@@ -2207,7 +2212,7 @@ mod tests {
             &mut reader,
             1,
             "session.attach",
-            json!({"client":{"kind":"agent","tty":false}}),
+            json!({"local_auth":"local-human","client":{"kind":"agent","tty":false}}),
         );
         let exec = call(
             &mut client,
@@ -2272,7 +2277,7 @@ mod tests {
             &mut reader,
             1,
             "session.attach",
-            json!({"client":{"kind":"agent","tty":false}}),
+            json!({"local_auth":"local-human","client":{"kind":"agent","tty":false}}),
         );
         let stmt = call(
             &mut client,
@@ -2310,7 +2315,7 @@ mod tests {
             &mut first_reader,
             1,
             "session.attach",
-            json!({"session":"tasks","client":{"kind":"test","tty":false}}),
+            json!({"local_auth":"local-human","session":"tasks","client":{"kind":"test","tty":false}}),
         );
         let started = call(
             &mut first,
@@ -2334,7 +2339,7 @@ mod tests {
             &mut reader,
             3,
             "session.attach",
-            json!({"session":"tasks","client":{"kind":"test","tty":false}}),
+            json!({"local_auth":"local-human","session":"tasks","client":{"kind":"test","tty":false}}),
         );
         let awaited = call(
             &mut second,
@@ -2421,6 +2426,52 @@ mod tests {
         thread.join().unwrap();
     }
 
+    #[test]
+    fn zero_token_attach_defaults_restricted_and_reports_security_metadata() {
+        let kernel = Kernel::new();
+        let (mut client, mut reader, thread) = spawn(&kernel);
+        let attached = call(
+            &mut client,
+            &mut reader,
+            1,
+            "session.attach",
+            json!({"client":{"kind":"untrusted","tty":false}}),
+        )
+        .result
+        .unwrap();
+        assert_eq!(attached["principal"], "agent:mcp");
+        assert_eq!(attached["auth_mode"], "restricted-agent");
+        assert_eq!(attached["session_isolation"], PRINCIPAL_SESSION_ISOLATION);
+        assert_eq!(attached["security_epoch"], ATTACH_SECURITY_EPOCH);
+
+        let denied = call(&mut client, &mut reader, 2, "exec", json!({"src":"1 + 2"}));
+        assert_eq!(denied.error.unwrap().code, LEASH_DENIED);
+        drop(client);
+        drop(reader);
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn token_and_local_auth_cannot_be_combined() {
+        let kernel = Kernel::new();
+        let (mut client, mut reader, thread) = spawn(&kernel);
+        let response = call(
+            &mut client,
+            &mut reader,
+            1,
+            "session.attach",
+            json!({
+                "token":"irrelevant",
+                "local_auth":"local-human",
+                "client":{"kind":"test","tty":false}
+            }),
+        );
+        assert_eq!(response.error.unwrap().code, INVALID_PARAMS);
+        drop(client);
+        drop(reader);
+        thread.join().unwrap();
+    }
+
     /// End-to-end proof that a real (on-disk) kernel session's own
     /// `Evaluator` gets a journal installed automatically, with no test-side
     /// probe injection (unlike `handlers_exec::tests::
@@ -2451,7 +2502,7 @@ mod tests {
             &mut reader,
             1,
             "session.attach",
-            json!({"client":{"kind":"agent","tty":false}}),
+            json!({"local_auth":"local-human","client":{"kind":"agent","tty":false}}),
         );
         let marker_src = "let kernel_journal_probe_4471 = 4471";
         let exec = call(
@@ -2508,7 +2559,7 @@ mod tests {
             &mut a_reader,
             1,
             "session.attach",
-            json!({"session":"A","client":{"kind":"agent","tty":false}}),
+            json!({"local_auth":"local-human","session":"A","client":{"kind":"agent","tty":false}}),
         );
         let opened = call(&mut a, &mut a_reader, 2, "pty.open", json!({"cmd":"cat"}));
         let pty_id = opened.result.unwrap()["pty_id"]
@@ -2538,7 +2589,7 @@ mod tests {
             &mut b_reader,
             1,
             "session.attach",
-            json!({"session":"B","client":{"kind":"agent","tty":false}}),
+            json!({"local_auth":"local-human","session":"B","client":{"kind":"agent","tty":false}}),
         );
         let list_b = call(&mut b, &mut b_reader, 2, "pty.list", json!({}));
         assert!(
@@ -2610,7 +2661,7 @@ mod tests {
             &mut reader,
             1,
             "session.attach",
-            json!({"client":{"kind":"agent","tty":false}}),
+            json!({"local_auth":"local-human","client":{"kind":"agent","tty":false}}),
         );
         let exec = call(
             &mut client,
@@ -2684,7 +2735,7 @@ mod tests {
             &mut reader,
             1,
             "session.attach",
-            json!({"client":{"kind":"agent","tty":false}}),
+            json!({"local_auth":"local-human","client":{"kind":"agent","tty":false}}),
         );
         let exec = call(
             &mut client,
@@ -2764,7 +2815,7 @@ mod tests {
             &mut reader,
             1,
             "session.attach",
-            json!({"client":{"kind":"agent","tty":false}}),
+            json!({"local_auth":"local-human","client":{"kind":"agent","tty":false}}),
         );
         // 10 items: under every default threshold, so a plain exec would not elide.
         let exec = call(
@@ -2855,7 +2906,7 @@ mod tests {
             &mut reader,
             1,
             "session.attach",
-            json!({"session":"casb","client":{"kind":"agent","tty":false}}),
+            json!({"local_auth":"local-human","session":"casb","client":{"kind":"agent","tty":false}}),
         );
 
         // Default json: a CAS-backed value elides to an honest ref (no content),
@@ -2960,7 +3011,7 @@ mod tests {
             reader,
             1,
             "session.attach",
-            json!({"client":{"kind":"agent","tty":false}}),
+            json!({"local_auth":"local-human","client":{"kind":"agent","tty":false}}),
         )
     }
 
@@ -3030,6 +3081,111 @@ mod tests {
         let tail = tail.result.unwrap()["events"].clone();
         assert_eq!(tail.as_array().unwrap().len(), 1);
         assert_eq!(tail[0]["payload"], json!({"$":"str","v":"stop"}));
+        drop(client);
+        drop(reader);
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn reattach_scopes_journal_blobs_and_subscriptions_to_the_new_owner() {
+        let kernel = Kernel::new();
+        let (mut client, mut reader, thread) = spawn(&kernel);
+        call(
+            &mut client,
+            &mut reader,
+            1,
+            "session.attach",
+            json!({"local_auth":"local-human","session":"owner-a","client":{"kind":"test","tty":false}}),
+        );
+        call(&mut client, &mut reader, 2, "exec", json!({"src":"1 + 2"}));
+        let history = call(
+            &mut client,
+            &mut reader,
+            3,
+            "journal.query",
+            json!({"limit":100}),
+        )
+        .result
+        .unwrap();
+        let row = history
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["src"] == "1 + 2")
+            .expect("owner A journal row");
+        let hash = row["outputs"]
+            .as_array()
+            .unwrap()
+            .first()
+            .expect("recorded value blob")["hash"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        call(
+            &mut client,
+            &mut reader,
+            4,
+            "events.subscribe",
+            json!({"channel":"user.private"}),
+        );
+        assert_eq!(kernel.events.subscriber_count(), 1);
+
+        call(
+            &mut client,
+            &mut reader,
+            5,
+            "session.attach",
+            json!({"local_auth":"local-human","session":"owner-b","client":{"kind":"test","tty":false}}),
+        );
+        assert_eq!(
+            kernel.events.subscriber_count(),
+            0,
+            "reattach closes subscriptions owned by the old attachment"
+        );
+        let history_b = call(
+            &mut client,
+            &mut reader,
+            6,
+            "journal.query",
+            json!({"limit":100}),
+        )
+        .result
+        .unwrap();
+        assert!(
+            history_b.as_array().unwrap().is_empty(),
+            "owner B cannot read owner A's session journal"
+        );
+        let denied = call(
+            &mut client,
+            &mut reader,
+            7,
+            "blob.get",
+            json!({"hash":hash}),
+        );
+        assert_eq!(
+            denied.error.expect("foreign blob is opaque").code,
+            UNKNOWN_REF
+        );
+
+        call(
+            &mut client,
+            &mut reader,
+            8,
+            "session.attach",
+            json!({"local_auth":"local-human","session":"owner-a","client":{"kind":"test","tty":false}}),
+        );
+        let owned = call(
+            &mut client,
+            &mut reader,
+            9,
+            "blob.get",
+            json!({"hash":hash}),
+        );
+        assert!(
+            owned.error.is_none(),
+            "owner must retain blob access: {owned:?}"
+        );
+
         drop(client);
         drop(reader);
         thread.join().unwrap();
@@ -4372,7 +4528,7 @@ mod tests {
             &mut human_reader,
             1,
             "session.attach",
-            json!({"client":{"kind":"human","tty":false}}),
+            json!({"local_auth":"local-human","client":{"kind":"human","tty":false}}),
         )
         .result
         .unwrap();
@@ -4940,7 +5096,7 @@ mod tests {
             &mut reader,
             1,
             "session.attach",
-            json!({"client":{"kind":"agent","tty":false}}),
+            json!({"local_auth":"local-human","client":{"kind":"agent","tty":false}}),
         );
         let exec = call(
             &mut client,
@@ -5137,7 +5293,7 @@ mod tests {
             &mut reader2,
             1,
             "session.attach",
-            json!({"client":{"kind":"human","tty":true}}),
+            json!({"local_auth":"local-human","client":{"kind":"human","tty":true}}),
         );
         let exec2 = call(
             &mut client2,

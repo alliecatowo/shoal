@@ -162,10 +162,11 @@ impl Kernel {
         // The evaluator forwards only `user.*` (its own guard), so language
         // code cannot spoof kernel-owned semantic channels.
         let wire_bus = self.events.clone();
+        let wire_owner = key.owner();
         evaluator.set_event_forwarder(Box::new(move |channel, payload| {
             let json = serde_json::to_value(crate::wire::wire_value(payload))
                 .unwrap_or(serde_json::Value::Null);
-            wire_bus.publish(channel, json);
+            wire_bus.publish(&wire_owner, channel, json);
         }));
         let lang_bus = evaluator.event_bus();
         let session = Arc::new(Session {
@@ -184,11 +185,31 @@ impl Kernel {
     pub(crate) fn handle_session_attach(
         self: &Arc<Self>,
         params: Json,
+        client: u64,
         attached: &mut Option<Attachment>,
     ) -> Result<Json, RpcError> {
+        let local_auth = match params.get("local_auth") {
+            Some(value) => Some(
+                serde_json::from_value::<LocalAuthMode>(value.clone()).map_err(|error| {
+                    RpcError {
+                        code: INVALID_PARAMS,
+                        message: format!("invalid local_auth: {error}"),
+                        data: None,
+                    }
+                })?,
+            ),
+            None => None,
+        };
         let params: AttachParams = decode(params)?;
         let tty = params.client.tty;
-        let (who, token_caps, profile, local_human) = if let Some(token) = params.token {
+        if params.token.is_some() && local_auth.is_some() {
+            return Err(RpcError {
+                code: INVALID_PARAMS,
+                message: "token and local_auth are mutually exclusive authentication modes".into(),
+                data: None,
+            });
+        }
+        let (who, token_caps, profile, local_human, auth_mode) = if let Some(token) = params.token {
             let auth = self.auth.as_ref().ok_or_else(|| RpcError {
                 code: AUTH_FAILED,
                 message: "bearer tokens unavailable in ephemeral kernel".into(),
@@ -203,9 +224,23 @@ impl Kernel {
                     message: "invalid, expired, or revoked bearer token".into(),
                     data: None,
                 })?;
-            (meta.principal, meta.caps, meta.profile, false)
+            (meta.principal, meta.caps, meta.profile, false, "bearer")
+        } else if local_auth.unwrap_or_default() == LocalAuthMode::LocalHuman {
+            (
+                principal(),
+                vec![],
+                "local-human".into(),
+                true,
+                "local-human",
+            )
         } else {
-            (principal(), vec![], "local-human".into(), true)
+            (
+                "agent:mcp".into(),
+                vec![],
+                "restricted-agent".into(),
+                false,
+                "restricted-agent",
+            )
         };
         let can_approve = local_human
             || profile == "supervisor"
@@ -220,6 +255,12 @@ impl Kernel {
             .cwd()
             .as_os_str()
             .to_owned();
+        // A connection may reattach to another principal-private session.
+        // Subscriptions belong to the previous owner and must not silently
+        // follow the socket into the new attachment.
+        if attached.is_some() {
+            self.events.remove_conn(client);
+        }
         *attached = Some(Attachment {
             session,
             principal: who.clone(),
@@ -236,7 +277,7 @@ impl Kernel {
         let status = EnforcementStatus::detect();
         let tier = tier_letter(status.available_tier);
         let caps_enforced = self.caps_enforced_for(&who);
-        encode(AttachResult {
+        let mut result = serde_json::to_value(AttachResult {
             session: name,
             principal: who.clone(),
             caps: json!({"enforced":caps_enforced,"tier":tier,"available_tier":tier,"policy_principal":who,"profile":profile,"token_caps":token_caps,"opaque":verdict_name(self.policy.evaluate_effect(&who, &Effect::Opaque))}),
@@ -247,6 +288,17 @@ impl Kernel {
             elide_defaults: elide_defaults_json(),
             channels: STATIC_CHANNELS.iter().map(|s| s.to_string()).collect(),
         })
+        .map_err(internal)?;
+        let object = result
+            .as_object_mut()
+            .expect("AttachResult always serializes to an object");
+        object.insert("auth_mode".into(), Json::String(auth_mode.into()));
+        object.insert(
+            "session_isolation".into(),
+            Json::String(PRINCIPAL_SESSION_ISOLATION.into()),
+        );
+        object.insert("security_epoch".into(), Json::from(ATTACH_SECURITY_EPOCH));
+        Ok(result)
     }
 
     /// `session.env` (site/content/internals/kernel-protocol.md, `shoal://session/env`): the session's

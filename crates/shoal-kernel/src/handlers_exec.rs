@@ -67,9 +67,11 @@ impl Kernel {
             task_attachment.cancel_epoch = Some(cancel.clone());
             let mut task_attached = Some(task_attachment);
             let task_channel = format!("task.{task_id}");
-            kernel
-                .events
-                .publish(&task_channel, json!({"$":"str","v":"started"}));
+            kernel.events.publish(
+                &session.key.owner(),
+                &task_channel,
+                json!({"$":"str","v":"started"}),
+            );
             let spawn_result = std::thread::Builder::new()
                 .name(format!("shoal-task-{task_id}"))
                 .spawn(move || {
@@ -164,7 +166,9 @@ impl Kernel {
                     }
                     drop(active_slot);
                     task.done.notify_all();
-                    kernel.events.publish(&task_channel, exit_payload);
+                    kernel
+                        .events
+                        .publish(&task.session.key.owner(), &task_channel, exit_payload);
                     kernel.reap_finished_tasks(&task.session.key.owner());
                     worker_guard.disarm();
                 });
@@ -296,6 +300,7 @@ impl Kernel {
                 // polling — announce it on `approval` the same way a new
                 // transcript value announces on `session.transcript`.
                 self.events.publish(
+                    &session.key.owner(),
                     "approval",
                     approval_event(&result.plan_ref, &result.effects, &actor),
                 );
@@ -530,6 +535,7 @@ impl Kernel {
                     }
                 }
                 self.events.publish_journal(
+                    &session.key.owner(),
                     entry_id,
                     journal_event(entry_id, &params.src, false, &actor),
                 );
@@ -599,14 +605,18 @@ impl Kernel {
                 )
                 .map_err(internal)?;
         }
-        self.events
-            .publish_journal(entry_id, journal_event(entry_id, &params.src, true, &actor));
+        self.events.publish_journal(
+            &session.key.owner(),
+            entry_id,
+            journal_event(entry_id, &params.src, true, &actor),
+        );
         // site/content/internals/kernel-protocol.md: announce the new transcript value on the
         // `session.transcript` channel — subscribers learn a new
         // out[n] exists (with its shape summary) without polling. Uses
         // `publish_transcript` (not the plain `publish`) so the seq↔entry_id
         // pointer needed for cold replay past the ring is recorded too.
-        self.events.publish_transcript(entry_id, transcript_payload);
+        self.events
+            .publish_transcript(&session.key.owner(), entry_id, transcript_payload);
         let exec_budget = ElideBudget::from_spec(params.elide.as_ref());
         let exec_uri = short_ref_to_uri(&value_ref, None);
         // The journal keeps the full render above (record_output); the wire
@@ -617,8 +627,11 @@ impl Kernel {
         // site/content/internals/kernel-protocol.md: a live UI subscribing to `render` sees the same
         // string the exec response itself carries — no separate unbounded
         // copy, no polling `value.get {format:"render"}`.
-        self.events
-            .publish("render", render_event(&value_ref, &bounded_render));
+        self.events.publish(
+            &session.key.owner(),
+            "render",
+            render_event(&value_ref, &bounded_render),
+        );
         encode(ExecResult {
             r#ref: value_ref,
             value: Some(elide_wire_value(&value, &exec_uri, &exec_budget)),

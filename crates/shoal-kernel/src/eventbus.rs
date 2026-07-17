@@ -15,7 +15,7 @@ pub(crate) type SharedWriter = Arc<Mutex<UnixStream>>;
 /// per-subscriber queue (site/content/internals/kernel-protocol.md) — see `SubQueue` below for why.
 #[derive(Default)]
 pub(crate) struct EventBus {
-    channels: Mutex<HashMap<String, ChannelBuf>>,
+    channels: Mutex<HashMap<(OwnerKey, String), ChannelBuf>>,
     subs: Mutex<Vec<Subscriber>>,
     /// The seq↔journal-entry correspondence for the `journal` channel, the
     /// first channel whose events were made replayable past the in-memory
@@ -33,7 +33,7 @@ pub(crate) struct EventBus {
     /// event-bus seqs survive a kernel restart when reopening an existing
     /// on-disk store — see that method for how it recovers exactly this same
     /// membership/order from durable state alone.
-    journal_index: Mutex<Vec<i64>>,
+    journal_index: Mutex<HashMap<OwnerKey, Vec<i64>>>,
     /// The same dense-index idea as `journal_index`, for the
     /// `session.transcript` channel: indexed
     /// by that channel's own `seq`, holding the journal `entry_id` the
@@ -46,7 +46,7 @@ pub(crate) struct EventBus {
     /// `render`/`user.*` still touch neither index — they stay ring-only.
     /// Also rebuilt at construction time by [`EventBus::seed_from_journal`],
     /// same as `journal_index` above.
-    transcript_index: Mutex<Vec<i64>>,
+    transcript_index: Mutex<HashMap<OwnerKey, Vec<i64>>>,
 }
 
 /// Ring-buffered event log for one channel.
@@ -58,7 +58,7 @@ struct ChannelBuf {
 
 struct Subscriber {
     conn: u64,
-    session_id: String,
+    owner: OwnerKey,
     channel: String,
     queue: Arc<SubQueue>,
 }
@@ -268,8 +268,8 @@ impl EventBus {
     /// Append `payload` to `channel`'s ring and enqueue it for every live
     /// subscriber (thin wrapper over [`EventBus::publish_inner`] with no
     /// durable-id recording — the path every ring-only channel takes).
-    pub(crate) fn publish(&self, channel: &str, payload: Json) -> Event {
-        self.publish_inner(channel, payload, None)
+    pub(crate) fn publish(&self, owner: &OwnerKey, channel: &str, payload: Json) -> Event {
+        self.publish_inner(owner, channel, payload, None)
     }
 
     /// Publish on the `journal` channel, recording the durable `entry_id` this
@@ -277,8 +277,9 @@ impl EventBus {
     /// it ages out of the ring (site/content/internals/kernel-protocol.md journal-backed replay). The
     /// only difference from `publish` is that the seq↔`entry_id` pair is
     /// appended to `journal_index` atomically with the seq assignment.
-    pub(crate) fn publish_journal(&self, entry_id: i64, payload: Json) -> Event {
+    pub(crate) fn publish_journal(&self, owner: &OwnerKey, entry_id: i64, payload: Json) -> Event {
         self.publish_inner(
+            owner,
             "journal",
             payload,
             Some((DurableChannel::Journal, entry_id)),
@@ -292,8 +293,14 @@ impl EventBus {
     /// via `Journal::record_transcript_event` — this only records the
     /// seq↔`entry_id` pointer, same division of labor as the `journal`
     /// channel.
-    pub(crate) fn publish_transcript(&self, entry_id: i64, payload: Json) -> Event {
+    pub(crate) fn publish_transcript(
+        &self,
+        owner: &OwnerKey,
+        entry_id: i64,
+        payload: Json,
+    ) -> Event {
         self.publish_inner(
+            owner,
             "session.transcript",
             payload,
             Some((DurableChannel::Transcript, entry_id)),
@@ -317,13 +324,16 @@ impl EventBus {
     /// always, per index).
     fn publish_inner(
         &self,
+        owner: &OwnerKey,
         channel: &str,
         payload: Json,
         durable: Option<(DurableChannel, i64)>,
     ) -> Event {
         let event = {
             let mut channels = self.channels.lock().unwrap();
-            let buf = channels.entry(channel.to_string()).or_default();
+            let buf = channels
+                .entry((owner.clone(), channel.to_string()))
+                .or_default();
             let seq = buf.next_seq;
             buf.next_seq += 1;
             if let Some((which, entry_id)) = durable {
@@ -331,7 +341,8 @@ impl EventBus {
                     DurableChannel::Journal => &self.journal_index,
                     DurableChannel::Transcript => &self.transcript_index,
                 };
-                let mut index = index.lock().unwrap();
+                let mut indexes = index.lock().unwrap();
+                let index = indexes.entry(owner.clone()).or_default();
                 debug_assert_eq!(
                     index.len() as u64,
                     seq,
@@ -352,7 +363,10 @@ impl EventBus {
             event
         };
         let subs = self.subs.lock().unwrap();
-        for sub in subs.iter().filter(|s| s.channel == channel) {
+        for sub in subs
+            .iter()
+            .filter(|s| s.owner == *owner && s.channel == channel)
+        {
             sub.queue.push(event.clone());
         }
         event
@@ -361,28 +375,32 @@ impl EventBus {
     /// Oldest `seq` still retained in `channel`'s ring, or `None` if the
     /// channel has never published. Used by the journal-backed read path to
     /// find the boundary below which events have aged out of the ring.
-    pub(crate) fn ring_oldest_seq(&self, channel: &str) -> Option<u64> {
+    pub(crate) fn ring_oldest_seq(&self, owner: &OwnerKey, channel: &str) -> Option<u64> {
         self.channels
             .lock()
             .unwrap()
-            .get(channel)
+            .get(&(owner.clone(), channel.to_string()))
             .and_then(|buf| buf.ring.front().map(|e| e.seq))
     }
 
     /// Total number of events ever published on the `journal` channel this
     /// process (== the channel's `next_seq`). `journal_index` has exactly one
     /// entry per published journal event, so its length is that count.
-    pub(crate) fn journal_published_count(&self) -> u64 {
-        Self::index_len(&self.journal_index)
+    pub(crate) fn journal_published_count(&self, owner: &OwnerKey) -> u64 {
+        Self::index_len(&self.journal_index, owner)
     }
 
     /// As [`EventBus::journal_published_count`], for `session.transcript`.
-    pub(crate) fn transcript_published_count(&self) -> u64 {
-        Self::index_len(&self.transcript_index)
+    pub(crate) fn transcript_published_count(&self, owner: &OwnerKey) -> u64 {
+        Self::index_len(&self.transcript_index, owner)
     }
 
-    fn index_len(index: &Mutex<Vec<i64>>) -> u64 {
-        index.lock().unwrap().len() as u64
+    fn index_len(index: &Mutex<HashMap<OwnerKey, Vec<i64>>>, owner: &OwnerKey) -> u64 {
+        index
+            .lock()
+            .unwrap()
+            .get(owner)
+            .map_or(0, |entries| entries.len() as u64)
     }
 
     /// The `(seq, entry_id)` pairs for journal-channel events whose `seq` is
@@ -391,17 +409,35 @@ impl EventBus {
     /// out of the ring (below `upto`, the ring's oldest retained seq). Returned
     /// ascending by seq. This is the seq→entry pointer set the kernel then
     /// resolves against the journal to rebuild the actual events.
-    pub(crate) fn journal_index_range(&self, since: Option<u64>, upto: u64) -> Vec<(u64, i64)> {
-        Self::index_range(&self.journal_index, since, upto)
+    pub(crate) fn journal_index_range(
+        &self,
+        owner: &OwnerKey,
+        since: Option<u64>,
+        upto: u64,
+    ) -> Vec<(u64, i64)> {
+        Self::index_range(&self.journal_index, owner, since, upto)
     }
 
     /// As [`EventBus::journal_index_range`], for `session.transcript`.
-    pub(crate) fn transcript_index_range(&self, since: Option<u64>, upto: u64) -> Vec<(u64, i64)> {
-        Self::index_range(&self.transcript_index, since, upto)
+    pub(crate) fn transcript_index_range(
+        &self,
+        owner: &OwnerKey,
+        since: Option<u64>,
+        upto: u64,
+    ) -> Vec<(u64, i64)> {
+        Self::index_range(&self.transcript_index, owner, since, upto)
     }
 
-    fn index_range(index: &Mutex<Vec<i64>>, since: Option<u64>, upto: u64) -> Vec<(u64, i64)> {
-        let index = index.lock().unwrap();
+    fn index_range(
+        indexes: &Mutex<HashMap<OwnerKey, Vec<i64>>>,
+        owner: &OwnerKey,
+        since: Option<u64>,
+        upto: u64,
+    ) -> Vec<(u64, i64)> {
+        let indexes = indexes.lock().unwrap();
+        let Some(index) = indexes.get(owner) else {
+            return Vec::new();
+        };
         let start = since.map(|s| s.saturating_add(1)).unwrap_or(0);
         (start..upto)
             .filter_map(|seq| index.get(seq as usize).map(|&entry_id| (seq, entry_id)))
@@ -409,9 +445,15 @@ impl EventBus {
     }
 
     /// Buffered tail of `channel` from `since` (exclusive), capped at `limit`.
-    fn read(&self, channel: &str, since: Option<u64>, limit: Option<usize>) -> Vec<Event> {
+    fn read(
+        &self,
+        owner: &OwnerKey,
+        channel: &str,
+        since: Option<u64>,
+        limit: Option<usize>,
+    ) -> Vec<Event> {
         let channels = self.channels.lock().unwrap();
-        let Some(buf) = channels.get(channel) else {
+        let Some(buf) = channels.get(&(owner.clone(), channel.to_string())) else {
             return Vec::new();
         };
         let mut out: Vec<Event> = buf
@@ -438,7 +480,7 @@ impl EventBus {
     fn subscribe(
         &self,
         conn: u64,
-        session_id: &str,
+        owner: &OwnerKey,
         channel: &str,
         since: Option<u64>,
         writer: &SharedWriter,
@@ -446,12 +488,15 @@ impl EventBus {
     ) -> Result<(), RpcError> {
         let queue = {
             let mut subs = self.subs.lock().unwrap();
-            if let Some(existing) = subs.iter().find(|s| s.conn == conn && s.channel == channel) {
+            if let Some(existing) = subs
+                .iter()
+                .find(|s| s.conn == conn && s.owner == *owner && s.channel == channel)
+            {
                 existing.queue.clone()
             } else {
                 let current = subs
                     .iter()
-                    .filter(|subscriber| subscriber.session_id == session_id)
+                    .filter(|subscriber| subscriber.owner == *owner)
                     .count();
                 if current >= max_per_session {
                     return Err(RpcError {
@@ -468,7 +513,7 @@ impl EventBus {
                 let queue = SubQueue::new(channel.to_string());
                 subs.push(Subscriber {
                     conn,
-                    session_id: session_id.to_string(),
+                    owner: owner.clone(),
                     channel: channel.to_string(),
                     queue: queue.clone(),
                 });
@@ -476,16 +521,16 @@ impl EventBus {
                 queue
             }
         };
-        for event in self.read(channel, since, None) {
+        for event in self.read(owner, channel, since, None) {
             queue.push(event);
         }
         Ok(())
     }
 
-    fn unsubscribe(&self, conn: u64, channel: &str) {
+    fn unsubscribe(&self, conn: u64, owner: &OwnerKey, channel: &str) {
         let mut subs = self.subs.lock().unwrap();
         subs.retain(|s| {
-            let keep = !(s.conn == conn && s.channel == channel);
+            let keep = !(s.conn == conn && s.owner == *owner && s.channel == channel);
             if !keep {
                 s.queue.close();
             }
@@ -502,6 +547,11 @@ impl EventBus {
             }
             keep
         });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn subscriber_count(&self) -> usize {
+        self.subs.lock().unwrap().len()
     }
 
     /// Rebuild `journal`/`session.transcript` seq state from an EXISTING
@@ -565,19 +615,41 @@ impl EventBus {
         // `query` is newest-first (`ORDER BY id DESC`); every index here is
         // oldest-first.
         entries.reverse();
-        let coarse_ids: Vec<i64> = entries
+        let coarse: Vec<(i64, OwnerKey)> = entries
             .iter()
             .filter(|e| serde_json::from_str::<Program>(&e.ast_json).is_ok())
-            .map(|e| e.id)
+            .map(|e| (e.id, SessionKey::new(&e.principal, &e.session).owner()))
             .collect();
-        self.seed_index(&self.journal_index, "journal", &coarse_ids);
+        let mut journal_groups: HashMap<OwnerKey, Vec<i64>> = HashMap::new();
+        for (entry_id, owner) in &coarse {
+            journal_groups
+                .entry(owner.clone())
+                .or_default()
+                .push(*entry_id);
+        }
+        for (owner, entry_ids) in &journal_groups {
+            self.seed_index(&self.journal_index, owner, "journal", entry_ids);
+        }
+        let coarse_ids: Vec<i64> = coarse.iter().map(|(entry_id, _)| *entry_id).collect();
         if let Ok(rows) = journal.transcript_events_by_entry(&coarse_ids) {
-            let transcript_ids: Vec<i64> = rows.iter().map(|r| r.entry_id).collect();
-            self.seed_index(
-                &self.transcript_index,
-                "session.transcript",
-                &transcript_ids,
-            );
+            let owners: HashMap<i64, OwnerKey> = coarse.into_iter().collect();
+            let mut transcript_groups: HashMap<OwnerKey, Vec<i64>> = HashMap::new();
+            for row in &rows {
+                if let Some(owner) = owners.get(&row.entry_id) {
+                    transcript_groups
+                        .entry(owner.clone())
+                        .or_default()
+                        .push(row.entry_id);
+                }
+            }
+            for (owner, entry_ids) in &transcript_groups {
+                self.seed_index(
+                    &self.transcript_index,
+                    owner,
+                    "session.transcript",
+                    entry_ids,
+                );
+            }
         }
     }
 
@@ -588,14 +660,23 @@ impl EventBus {
     /// continues from N rather than colliding with seq 0..N-1. Only ever
     /// called before this bus is shared with a serving kernel, so there is
     /// no concurrent publish to race with.
-    fn seed_index(&self, index: &Mutex<Vec<i64>>, channel: &str, entry_ids: &[i64]) {
+    fn seed_index(
+        &self,
+        indexes: &Mutex<HashMap<OwnerKey, Vec<i64>>>,
+        owner: &OwnerKey,
+        channel: &str,
+        entry_ids: &[i64],
+    ) {
         if entry_ids.is_empty() {
             return;
         }
-        let mut idx = index.lock().unwrap();
+        let mut indexes = indexes.lock().unwrap();
+        let idx = indexes.entry(owner.clone()).or_default();
         idx.extend_from_slice(entry_ids);
         let mut channels = self.channels.lock().unwrap();
-        let buf = channels.entry(channel.to_string()).or_default();
+        let buf = channels
+            .entry((owner.clone(), channel.to_string()))
+            .or_default();
         buf.next_seq = idx.len() as u64;
     }
 }
@@ -614,18 +695,19 @@ impl Kernel {
         params: Json,
         attached: &mut Option<Attachment>,
     ) -> Result<Json, RpcError> {
-        attached.as_ref().ok_or_else(not_attached)?;
+        let attachment = attached.as_ref().ok_or_else(not_attached)?;
+        let owner = attachment.session.key.owner();
         let p: EventsReadParams = decode(params)?;
         // The `journal` and `session.transcript` channels are journal-backed:
         // a `since` older than the ring's oldest retained seq is served from
         // the durable journal rather than lost (site/content/internals/kernel-protocol.md). Every
         // other channel is ring-only.
         let events = if p.channel == "journal" {
-            self.read_journal_channel(p.since, p.limit)?
+            self.read_journal_channel(&owner, p.since, p.limit)?
         } else if p.channel == "session.transcript" {
-            self.read_transcript_channel(p.since, p.limit)?
+            self.read_transcript_channel(&owner, p.since, p.limit)?
         } else {
-            self.events.read(&p.channel, p.since, p.limit)
+            self.events.read(&owner, &p.channel, p.since, p.limit)
         };
         encode(json!({"channel": p.channel, "events": events}))
     }
@@ -651,15 +733,16 @@ impl Kernel {
     /// ids are not in the index.
     fn read_journal_channel(
         self: &Arc<Self>,
+        owner: &OwnerKey,
         since: Option<u64>,
         limit: Option<usize>,
     ) -> Result<Vec<Event>, RpcError> {
         // Nothing published yet, or `since` at/after the newest seq: the ring
         // already answers correctly (empty), and there is nothing older to
         // reconstruct. This also covers the not-found/beyond-newest case.
-        let published = self.events.journal_published_count();
+        let published = self.events.journal_published_count(owner);
         if published == 0 || since.is_some_and(|s| s.saturating_add(1) >= published) {
-            return Ok(self.events.read("journal", since, None));
+            return Ok(self.events.read(owner, "journal", since, None));
         }
         let mut out: Vec<Event> = Vec::new();
         // Reconstruct the gap below the ring, if `since` reaches into it. The
@@ -672,13 +755,16 @@ impl Kernel {
         // both the ring and the index together). Treat "no ring yet" as
         // "everything published so far is aged out", not "nothing to
         // reconstruct" — `published` itself is the right upper bound.
-        let oldest = self.events.ring_oldest_seq("journal").unwrap_or(published);
-        let want = self.events.journal_index_range(since, oldest);
+        let oldest = self
+            .events
+            .ring_oldest_seq(owner, "journal")
+            .unwrap_or(published);
+        let want = self.events.journal_index_range(owner, since, oldest);
         if !want.is_empty() {
             out = self.reconstruct_journal_events(&want)?;
         }
         // Then the ring tail (fast path, byte-for-byte as before).
-        out.extend(self.events.read("journal", since, None));
+        out.extend(self.events.read(owner, "journal", since, None));
         // Mirror `EventBus::read`'s limit semantics: keep the newest `limit`.
         if let Some(limit) = limit
             && out.len() > limit
@@ -751,25 +837,26 @@ impl Kernel {
     /// alongside every live transcript event.
     fn read_transcript_channel(
         self: &Arc<Self>,
+        owner: &OwnerKey,
         since: Option<u64>,
         limit: Option<usize>,
     ) -> Result<Vec<Event>, RpcError> {
-        let published = self.events.transcript_published_count();
+        let published = self.events.transcript_published_count(owner);
         if published == 0 || since.is_some_and(|s| s.saturating_add(1) >= published) {
-            return Ok(self.events.read("session.transcript", since, None));
+            return Ok(self.events.read(owner, "session.transcript", since, None));
         }
         let mut out: Vec<Event> = Vec::new();
         // Same ring-can-be-empty-but-published>0 fallback as
         // `read_journal_channel` above (post-restart, pre-first-publish).
         let oldest = self
             .events
-            .ring_oldest_seq("session.transcript")
+            .ring_oldest_seq(owner, "session.transcript")
             .unwrap_or(published);
-        let want = self.events.transcript_index_range(since, oldest);
+        let want = self.events.transcript_index_range(owner, since, oldest);
         if !want.is_empty() {
             out = self.reconstruct_transcript_events(&want)?;
         }
-        out.extend(self.events.read("session.transcript", since, None));
+        out.extend(self.events.read(owner, "session.transcript", since, None));
         if let Some(limit) = limit
             && out.len() > limit
         {
@@ -838,7 +925,11 @@ impl Kernel {
                 data: Some(json!({"channel": p.channel})),
             });
         }
-        let event = self.events.publish(&p.channel, p.payload.clone());
+        let event = self.events.publish(
+            &attachment.session.key.owner(),
+            &p.channel,
+            p.payload.clone(),
+        );
         // One substrate, reverse direction: a wire publish is also visible to
         // the session's in-language channels (`channel("user.x").latest()` /
         // `.events()`), via `inject` — which never re-forwards, so the event
@@ -867,7 +958,7 @@ impl Kernel {
         };
         self.events.subscribe(
             client,
-            &attachment.session.id,
+            &attachment.session.key.owner(),
             &p.channel,
             p.since,
             writer,
@@ -882,9 +973,10 @@ impl Kernel {
         client: u64,
         attached: &mut Option<Attachment>,
     ) -> Result<Json, RpcError> {
-        attached.as_ref().ok_or_else(not_attached)?;
+        let attachment = attached.as_ref().ok_or_else(not_attached)?;
         let p: EventsSubParams = decode(params)?;
-        self.events.unsubscribe(client, &p.channel);
+        self.events
+            .unsubscribe(client, &attachment.session.key.owner(), &p.channel);
         encode(json!({"channel": p.channel, "subscribed": false}))
     }
 }
@@ -894,6 +986,10 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    fn owner(name: &str) -> OwnerKey {
+        SessionKey::new("principal:test", name).owner()
+    }
 
     #[test]
     fn poisoned_subscriber_queue_is_discarded_and_closed() {
@@ -920,6 +1016,31 @@ mod tests {
             !queue.state.is_poisoned(),
             "the closed/empty invariant was explicitly restored"
         );
+    }
+
+    #[test]
+    fn rings_and_durable_indexes_are_private_to_exact_owner() {
+        let bus = EventBus::default();
+        let alpha = SessionKey::new("agent:alpha", "shared").owner();
+        let beta = SessionKey::new("agent:beta", "shared").owner();
+
+        let alpha_event = bus.publish(&alpha, "user.private", json!({"owner":"alpha"}));
+        let beta_event = bus.publish(&beta, "user.private", json!({"owner":"beta"}));
+        assert_eq!(alpha_event.seq, 0);
+        assert_eq!(beta_event.seq, 0, "each owner has an independent cursor");
+        assert_eq!(
+            bus.read(&alpha, "user.private", None, None)[0].payload["owner"],
+            "alpha"
+        );
+        assert_eq!(
+            bus.read(&beta, "user.private", None, None)[0].payload["owner"],
+            "beta"
+        );
+
+        bus.publish_journal(&alpha, 11, json!({}));
+        bus.publish_journal(&beta, 22, json!({}));
+        assert_eq!(bus.journal_index_range(&alpha, None, 1), vec![(0, 11)]);
+        assert_eq!(bus.journal_index_range(&beta, None, 1), vec![(0, 22)]);
     }
 
     /// Read one already-written frame off `reader` (blocking, with a bounded
@@ -951,9 +1072,10 @@ mod tests {
     #[test]
     fn publish_does_not_block_when_a_subscriber_never_reads() {
         let bus = EventBus::default();
+        let owner = owner("s");
         let (client_end, server_end) = UnixStream::pair().unwrap();
         let writer: SharedWriter = Arc::new(Mutex::new(server_end));
-        bus.subscribe(1, "s", "user.stress", None, &writer, usize::MAX)
+        bus.subscribe(1, &owner, "user.stress", None, &writer, usize::MAX)
             .unwrap();
 
         let start = Instant::now();
@@ -961,7 +1083,11 @@ mod tests {
             // A few KB per event: comfortably past any default socket
             // buffer many times over across 500 publishes, so this is a
             // faithful stand-in for "a subscriber that never reads".
-            bus.publish("user.stress", json!({"i": i, "pad": "x".repeat(2048)}));
+            bus.publish(
+                &owner,
+                "user.stress",
+                json!({"i": i, "pad": "x".repeat(2048)}),
+            );
         }
         let elapsed = start.elapsed();
         assert!(
@@ -981,14 +1107,15 @@ mod tests {
     #[test]
     fn a_stalled_subscriber_never_stalls_a_healthy_one() {
         let bus = Arc::new(EventBus::default());
+        let owner = owner("s");
         let (stalled_client, stalled_server) = UnixStream::pair().unwrap();
         let stalled_writer: SharedWriter = Arc::new(Mutex::new(stalled_server));
         let (healthy_client, healthy_server) = UnixStream::pair().unwrap();
         let healthy_writer: SharedWriter = Arc::new(Mutex::new(healthy_server));
 
-        bus.subscribe(1, "s1", "user.race", None, &stalled_writer, usize::MAX)
+        bus.subscribe(1, &owner, "user.race", None, &stalled_writer, usize::MAX)
             .unwrap();
-        bus.subscribe(2, "s2", "user.race", None, &healthy_writer, usize::MAX)
+        bus.subscribe(2, &owner, "user.race", None, &healthy_writer, usize::MAX)
             .unwrap();
 
         // Simulate the stalled subscriber's writer thread being stuck mid
@@ -1006,7 +1133,7 @@ mod tests {
 
         let start = Instant::now();
         for i in 0..10 {
-            bus.publish("user.race", json!({"i": i}));
+            bus.publish(&owner, "user.race", json!({"i": i}));
         }
         let elapsed = start.elapsed();
         assert!(
@@ -1037,9 +1164,10 @@ mod tests {
     #[test]
     fn a_stalled_subscriber_gets_a_coalesced_dropped_summary() {
         let bus = Arc::new(EventBus::default());
+        let owner = owner("s");
         let (client_end, server_end) = UnixStream::pair().unwrap();
         let writer: SharedWriter = Arc::new(Mutex::new(server_end));
-        bus.subscribe(1, "s", "user.overflow", None, &writer, usize::MAX)
+        bus.subscribe(1, &owner, "user.overflow", None, &writer, usize::MAX)
             .unwrap();
 
         let hold = writer.clone();
@@ -1054,7 +1182,7 @@ mod tests {
         // some of these must be dropped-and-coalesced, not buffered forever.
         let total = SUB_QUEUE_CAP * 3;
         for i in 0..total {
-            bus.publish("user.overflow", json!({"i": i}));
+            bus.publish(&owner, "user.overflow", json!({"i": i}));
         }
 
         release_tx.send(()).unwrap();
@@ -1090,12 +1218,13 @@ mod tests {
     #[test]
     fn unsubscribe_stops_the_writer_thread_instead_of_leaking_it() {
         let bus = EventBus::default();
+        let owner = owner("s");
         let (client_end, server_end) = UnixStream::pair().unwrap();
         let writer: SharedWriter = Arc::new(Mutex::new(server_end));
-        bus.subscribe(1, "s", "user.bye", None, &writer, usize::MAX)
+        bus.subscribe(1, &owner, "user.bye", None, &writer, usize::MAX)
             .unwrap();
         assert_eq!(bus.subs.lock().unwrap().len(), 1);
-        bus.unsubscribe(1, "user.bye");
+        bus.unsubscribe(1, &owner, "user.bye");
         assert_eq!(bus.subs.lock().unwrap().len(), 0);
         drop(client_end);
     }
@@ -1103,24 +1232,19 @@ mod tests {
     #[test]
     fn subscribe_reserves_the_per_session_quota_atomically() {
         let bus = Arc::new(EventBus::default());
+        let owner = owner("same-session");
         let barrier = Arc::new(std::sync::Barrier::new(3));
-        let subscribe = |conn: u64, bus: Arc<EventBus>, barrier: Arc<std::sync::Barrier>| {
-            std::thread::spawn(move || {
-                let (_client, server) = UnixStream::pair().unwrap();
-                let writer: SharedWriter = Arc::new(Mutex::new(server));
-                barrier.wait();
-                bus.subscribe(
-                    conn,
-                    "same-session",
-                    &format!("user.{conn}"),
-                    None,
-                    &writer,
-                    1,
-                )
-            })
-        };
-        let first = subscribe(1, bus.clone(), barrier.clone());
-        let second = subscribe(2, bus.clone(), barrier.clone());
+        let subscribe =
+            |conn: u64, bus: Arc<EventBus>, owner: OwnerKey, barrier: Arc<std::sync::Barrier>| {
+                std::thread::spawn(move || {
+                    let (_client, server) = UnixStream::pair().unwrap();
+                    let writer: SharedWriter = Arc::new(Mutex::new(server));
+                    barrier.wait();
+                    bus.subscribe(conn, &owner, &format!("user.{conn}"), None, &writer, 1)
+                })
+            };
+        let first = subscribe(1, bus.clone(), owner.clone(), barrier.clone());
+        let second = subscribe(2, bus.clone(), owner, barrier.clone());
         barrier.wait();
         let results = [first.join().unwrap(), second.join().unwrap()];
         assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
@@ -1211,36 +1335,37 @@ mod tests {
 
         let bus = EventBus::default();
         bus.seed_from_journal(&journal);
+        let owner = SessionKey::new("human", "s").owner();
 
         assert_eq!(
-            bus.journal_published_count(),
+            bus.journal_published_count(&owner),
             3,
             "only the 3 coarse entries seed the journal index, not the 3 interleaved fine rows"
         );
         assert_eq!(
-            bus.journal_index_range(None, 3),
+            bus.journal_index_range(&owner, None, 3),
             vec![(0, coarse_a), (1, coarse_b), (2, coarse_c)],
             "seeded oldest-first, in ascending entry-id order"
         );
         assert_eq!(
-            bus.transcript_published_count(),
+            bus.transcript_published_count(&owner),
             2,
             "only the 2 coarse entries with a persisted transcript_event row seed the \
              transcript index"
         );
         assert_eq!(
-            bus.transcript_index_range(None, 2),
+            bus.transcript_index_range(&owner, None, 2),
             vec![(0, coarse_a), (1, coarse_b)],
         );
 
         // The next publish on each channel continues from the seeded count,
         // not 0 — no collision with a cursor a pre-restart agent might hold.
-        let journal_event = bus.publish_journal(999, json!({"probe": true}));
+        let journal_event = bus.publish_journal(&owner, 999, json!({"probe": true}));
         assert_eq!(
             journal_event.seq, 3,
             "journal seq must continue past the seeded count, not reset to 0"
         );
-        let transcript_event = bus.publish_transcript(999, json!({"probe": true}));
+        let transcript_event = bus.publish_transcript(&owner, 999, json!({"probe": true}));
         assert_eq!(
             transcript_event.seq, 2,
             "transcript seq must continue past the seeded count, not reset to 0"
@@ -1257,9 +1382,10 @@ mod tests {
         let journal = Journal::open(dir.path()).unwrap();
         let bus = EventBus::default();
         bus.seed_from_journal(&journal);
-        assert_eq!(bus.journal_published_count(), 0);
-        assert_eq!(bus.transcript_published_count(), 0);
-        let event = bus.publish_journal(1, json!({}));
+        let owner = owner("empty");
+        assert_eq!(bus.journal_published_count(&owner), 0);
+        assert_eq!(bus.transcript_published_count(&owner), 0);
+        let event = bus.publish_journal(&owner, 1, json!({}));
         assert_eq!(
             event.seq, 0,
             "a fresh empty store must still start seqs at 0"

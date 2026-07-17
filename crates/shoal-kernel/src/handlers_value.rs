@@ -188,12 +188,21 @@ impl Kernel {
         // attachment like every other stateful method (the documented rule the
         // audit found this handler silently exempted — a fresh unattached
         // socket connection could read stored journal rows). The attachment is
-        // required for its side effect of authenticating the caller; the query
-        // itself is not further principal-scoped here (a shared pair-shell
-        // session's journal is intentionally visible to its attached
-        // principals — see the session-identity model in kernel-protocol.md).
-        attached.as_ref().ok_or_else(not_attached)?;
+        // Session names are principal-private. Journal rows therefore follow
+        // the exact attached owner; a caller cannot widen the query by naming
+        // another principal in the optional filter.
+        let attachment = attached.as_ref().ok_or_else(not_attached)?;
         let p: JournalQueryParams = decode(params)?;
+        if p.principal
+            .as_ref()
+            .is_some_and(|principal| principal != &attachment.principal)
+        {
+            return Err(RpcError {
+                code: INVALID_PARAMS,
+                message: "journal principal filter must match the attached principal".into(),
+                data: None,
+            });
+        }
         // site/content/internals/kernel-rpc-reference.md limit semantics: omitted → the default page
         // size; an explicit `0` → zero rows (an empty page, never "unbounded");
         // any request is clamped down to the server-side maximum so a hostile
@@ -211,7 +220,7 @@ impl Kernel {
             .unwrap()
             .query(&JournalQuery {
                 since_ts_ns: p.since,
-                principal: p.principal,
+                principal: Some(attachment.principal.clone()),
                 head: p.head,
                 ok: p.ok,
                 limit: effective_limit,
@@ -232,6 +241,7 @@ impl Kernel {
             .collect();
         let entries: Vec<JournalEntry> = rows
             .into_iter()
+            .filter(|r| r.session == attachment.session.id && r.principal == attachment.principal)
             .filter(|r| p.until.is_none_or(|until| r.ts_ns <= until))
             .filter(|r| {
                 want_effects.is_empty()

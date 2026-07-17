@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use rusqlite::ToSql;
 
-use crate::{Journal, OutputMeta, OutputRow, hex_string};
+use crate::{Journal, OutputMeta, OutputRow, hex_bytes, hex_string};
 
 /// Default number of rows returned by [`Journal::query`] when
 /// [`JournalQuery::limit`] is `0`.
@@ -63,6 +63,31 @@ pub struct JournalQuery {
 }
 
 impl Journal {
+    /// Whether `hash` is linked from an output row owned by the exact
+    /// principal-private session. This is the authorization lookup used before
+    /// serving CAS bytes over `blob.get`; it avoids materializing an owner's
+    /// entire journal merely to check one content address.
+    pub fn output_owned_by(
+        &self,
+        hash: &str,
+        session: &str,
+        principal: &str,
+    ) -> rusqlite::Result<bool> {
+        let Ok(hash) = hex_bytes(hash) else {
+            return Ok(false);
+        };
+        self.conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1
+                   FROM output o
+                   JOIN entry e ON e.id = o.entry_id
+                  WHERE o.hash = ?1 AND e.session = ?2 AND e.principal = ?3
+             )",
+            rusqlite::params![hash, session, principal],
+            |row| row.get(0),
+        )
+    }
+
     /// Query entries newest-first with the filters in `q`, outputs joined in.
     ///
     /// `limit == 0` means the default of 100. The `head` filter matches entries

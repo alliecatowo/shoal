@@ -6,6 +6,20 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+fn local_human_attach_params() -> serde_json::Value {
+    let mut params = serde_json::to_value(AttachParams {
+        session: None,
+        token: None,
+        client: ClientInfo {
+            kind: "test".into(),
+            tty: false,
+        },
+    })
+    .unwrap();
+    params["local_auth"] = serde_json::json!("local-human");
+    params
+}
+
 /// Route a spawned daemon's stderr to its own file inside its tempdir
 /// (rather than piping it and never draining it, or inheriting the test
 /// binary's stderr where two daemons running concurrently can interleave
@@ -81,15 +95,7 @@ fn daemon_binds_secure_socket_and_attaches() {
             jsonrpc: JSONRPC.into(),
             id: 1.into(),
             method: "session.attach".into(),
-            params: serde_json::to_value(AttachParams {
-                session: None,
-                token: None,
-                client: ClientInfo {
-                    kind: "test".into(),
-                    tty: false,
-                },
-            })
-            .unwrap(),
+            params: local_human_attach_params(),
         },
     )
     .unwrap();
@@ -171,15 +177,7 @@ fn daemon_survives_a_paused_gap_between_two_sequential_requests() {
             jsonrpc: JSONRPC.into(),
             id: 1.into(),
             method: "session.attach".into(),
-            params: serde_json::to_value(AttachParams {
-                session: None,
-                token: None,
-                client: ClientInfo {
-                    kind: "test".into(),
-                    tty: false,
-                },
-            })
-            .unwrap(),
+            params: local_human_attach_params(),
         },
     )
     .unwrap();
@@ -326,15 +324,7 @@ fn live_kernel_elides_a_big_table_over_the_wire() {
             jsonrpc: JSONRPC.into(),
             id: 1.into(),
             method: "session.attach".into(),
-            params: serde_json::to_value(AttachParams {
-                session: None,
-                token: None,
-                client: ClientInfo {
-                    kind: "test".into(),
-                    tty: false,
-                },
-            })
-            .unwrap(),
+            params: local_human_attach_params(),
         };
         let exec_request = Request {
             jsonrpc: JSONRPC.into(),

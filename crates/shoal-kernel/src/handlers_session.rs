@@ -68,7 +68,7 @@ impl Kernel {
         params: Json,
         attached: &mut Option<Attachment>,
     ) -> Result<Json, RpcError> {
-        attached.as_ref().ok_or_else(not_attached)?;
+        let attachment = attached.as_ref().ok_or_else(not_attached)?;
         let hash = params
             .get("hash")
             .and_then(Json::as_str)
@@ -78,10 +78,18 @@ impl Kernel {
                 data: None,
             })?
             .to_string();
-        let blob = self
-            .journal
-            .lock()
-            .unwrap()
+        let journal = self.journal.lock().unwrap();
+        let owned = journal
+            .output_owned_by(&hash, &attachment.session.id, &attachment.principal)
+            .map_err(internal)?;
+        if !owned {
+            return Err(RpcError {
+                code: UNKNOWN_REF,
+                message: "unknown value hash".into(),
+                data: None,
+            });
+        }
+        let blob = journal
             .read_blob(&hash)
             .map_err(internal)?
             .ok_or_else(|| RpcError {
