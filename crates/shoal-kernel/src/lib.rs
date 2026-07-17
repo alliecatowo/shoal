@@ -694,6 +694,20 @@ impl Kernel {
         Ok(entry)
     }
 
+    /// Atomically remove an owned PTY. A lookup followed by a separate remove
+    /// lets two concurrent closes both operate on the same child; returning
+    /// the removed Arc also ensures teardown happens after the registry guard
+    /// is gone.
+    fn take_pty(&self, pty_id: &Ref, owner: &OwnerKey) -> Result<Arc<PtyEntry>, RpcError> {
+        let mut ptys = self.ptys.lock().unwrap();
+        if !ptys.get(pty_id).is_some_and(|entry| &entry.owner == owner) {
+            return Err(unknown_pty());
+        }
+        Ok(ptys
+            .remove(pty_id)
+            .expect("owned PTY observed under the same registry lock"))
+    }
+
     fn reap_finished_tasks(&self, owner: &OwnerKey) {
         // Registry locks never nest with per-task locks: snapshot Arc handles,
         // inspect their independent state, then conditionally remove only the
@@ -738,15 +752,19 @@ impl Kernel {
         if remove.is_empty() {
             return;
         }
-        let mut tasks = self.tasks.lock().unwrap();
-        for (task_ref, observed, _) in remove {
-            if tasks
-                .get(&task_ref)
-                .is_some_and(|current| Arc::ptr_eq(current, &observed))
-            {
-                tasks.remove(&task_ref);
-            }
-        }
+        let removed = {
+            let mut tasks = self.tasks.lock().unwrap();
+            remove
+                .into_iter()
+                .filter_map(|(task_ref, observed, _)| {
+                    tasks
+                        .get(&task_ref)
+                        .is_some_and(|current| Arc::ptr_eq(current, &observed))
+                        .then(|| tasks.remove(&task_ref).expect("task was just observed"))
+                })
+                .collect::<Vec<_>>()
+        };
+        drop(removed);
     }
 
     /// Detect self-exited PTYs, release their active/session leases, and bound
@@ -778,15 +796,19 @@ impl Kernel {
         }
         terminal.sort_unstable_by_key(|(_, _, terminal_since)| *terminal_since);
         let remove = terminal.len() - MAX_TERMINAL_PTYS_PER_SESSION;
-        let mut ptys = self.ptys.lock().unwrap();
-        for (pty_ref, observed, _) in terminal.into_iter().take(remove) {
-            if ptys
-                .get(&pty_ref)
-                .is_some_and(|current| Arc::ptr_eq(current, &observed))
-            {
-                ptys.remove(&pty_ref);
-            }
-        }
+        let removed = {
+            let mut ptys = self.ptys.lock().unwrap();
+            terminal
+                .into_iter()
+                .take(remove)
+                .filter_map(|(pty_ref, observed, _)| {
+                    ptys.get(&pty_ref)
+                        .is_some_and(|current| Arc::ptr_eq(current, &observed))
+                        .then(|| ptys.remove(&pty_ref).expect("PTY was just observed"))
+                })
+                .collect::<Vec<_>>()
+        };
+        drop(removed);
     }
 
     /// The real enforcement truth for `principal` (site/content/internals/language-conformance-contract.md tier honesty):
@@ -1872,6 +1894,56 @@ mod tests {
         drop(client);
         drop(reader);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn concurrent_pty_close_has_exactly_one_teardown_owner() {
+        let kernel = Kernel::new();
+        let actor = principal();
+        let session = kernel.session("pty-close-race", &actor).unwrap();
+        let attachment = Attachment {
+            session,
+            principal: actor,
+            can_approve: true,
+            tty: false,
+            cancel_epoch: None,
+            bearer: None,
+            security_epoch: ATTACH_SECURITY_EPOCH,
+        };
+        let mut opener = Some(attachment.clone());
+        let opened = kernel
+            .handle_pty_open(json!({"cmd":"cat"}), &mut opener)
+            .unwrap();
+        let pty_id = opened["pty_id"].clone();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let close = |kernel: Arc<Kernel>,
+                     attachment: Attachment,
+                     barrier: Arc<std::sync::Barrier>,
+                     pty_id: Json| {
+            std::thread::spawn(move || {
+                let mut attached = Some(attachment);
+                barrier.wait();
+                kernel.handle_pty_close(json!({"pty_id":pty_id}), &mut attached)
+            })
+        };
+        let first = close(
+            kernel.clone(),
+            attachment.clone(),
+            barrier.clone(),
+            pty_id.clone(),
+        );
+        let second = close(kernel.clone(), attachment, barrier.clone(), pty_id);
+        barrier.wait();
+        let results = [first.join().unwrap(), second.join().unwrap()];
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter_map(|result| result.as_ref().err())
+                .filter(|error| error.code == UNKNOWN_PTY)
+                .count(),
+            1
+        );
     }
 
     #[test]

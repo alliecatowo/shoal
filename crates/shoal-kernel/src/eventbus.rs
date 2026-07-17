@@ -690,10 +690,14 @@ impl EventBus {
         if entry_ids.is_empty() {
             return;
         }
+        // Match `publish_inner`'s single global order: channels before the
+        // selected durable index. Seeding is startup-only today, but keeping
+        // the order identical prevents a latent ABBA if lifecycle work ever
+        // invokes it after the bus has been shared.
+        let mut channels = self.channels.lock().unwrap();
         let mut indexes = indexes.lock().unwrap();
         let idx = indexes.entry(owner.clone()).or_default();
         idx.extend_from_slice(entry_ids);
-        let mut channels = self.channels.lock().unwrap();
         let buf = channels
             .entry((owner.clone(), channel.to_string()))
             .or_default();
@@ -1390,6 +1394,42 @@ mod tests {
             transcript_event.seq, 2,
             "transcript seq must continue past the seeded count, not reset to 0"
         );
+    }
+
+    #[test]
+    fn durable_seed_and_publish_share_one_lock_order() {
+        let bus = Arc::new(EventBus::default());
+        let owner = owner("lock-order");
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let (done_tx, done_rx) = mpsc::channel();
+
+        let seed_bus = bus.clone();
+        let seed_owner = owner.clone();
+        let seed_barrier = barrier.clone();
+        let seed_done = done_tx.clone();
+        let seed = std::thread::spawn(move || {
+            seed_barrier.wait();
+            seed_bus.seed_index(&seed_bus.journal_index, &seed_owner, "journal", &[10, 11]);
+            seed_done.send(()).unwrap();
+        });
+        let publish_bus = bus.clone();
+        let publish_owner = owner.clone();
+        let publish_barrier = barrier.clone();
+        let publish = std::thread::spawn(move || {
+            publish_barrier.wait();
+            publish_bus.publish_journal(&publish_owner, 99, json!({}));
+            done_tx.send(()).unwrap();
+        });
+        barrier.wait();
+        for _ in 0..2 {
+            done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("seed/publish lock order must not deadlock");
+        }
+        seed.join().unwrap();
+        publish.join().unwrap();
+        assert_eq!(bus.journal_published_count(&owner), 3);
+        assert_eq!(bus.publish_journal(&owner, 100, json!({})).seq, 3);
     }
 
     /// Zero-regression companion: seeding from a brand-new, empty store (the

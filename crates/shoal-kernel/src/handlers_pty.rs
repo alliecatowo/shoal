@@ -289,9 +289,9 @@ impl Kernel {
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
         let owner = attachment.session.key.owner();
         let p: PtyRefParams = decode(params)?;
-        // Ownership check first, then remove: another session's ref stays put.
-        let entry = self.pty(&p.pty_id, &owner)?;
-        self.ptys.lock().unwrap().remove(&p.pty_id);
+        // Ownership check and removal are one registry transaction: exactly
+        // one concurrent closer owns teardown, and foreign refs stay opaque.
+        let entry = self.take_pty(&p.pty_id, &owner)?;
         let (status, signal) = entry.session.lock().unwrap().close();
         entry.mark_terminal();
         encode(json!({
