@@ -168,13 +168,18 @@ impl KernelAutostart {
         let Some(mut child) = self.child.take() else {
             return;
         };
-        if child.try_wait().ok().flatten().is_some() {
+        let leader_exited = child.try_wait().ok().flatten().is_some();
+
+        // Kill the group even after the leader was reaped: it may have left a
+        // same-group worker behind. The unreaped leader prevented pid reuse up
+        // to the immediately preceding try_wait; descendants keep the pgid
+        // allocated after that point.
+        // SAFETY: pgid came from our fresh process-group leader.
+        let group_sent = unsafe { libc::kill(-self.pgid, libc::SIGKILL) } == 0;
+        if leader_exited {
             return;
         }
 
-        // SAFETY: pgid is the positive pid of the child placed in a fresh
-        // process group by `kernel_command` / `start_kernel_command`.
-        let group_sent = unsafe { libc::kill(-self.pgid, libc::SIGKILL) } == 0;
         let leader_sent = child.kill().is_ok();
         if group_sent || leader_sent {
             let _ = child.wait();
@@ -630,6 +635,37 @@ mod tests {
         drop(facade);
         assert!(process_is_gone(pid));
         server.join().unwrap();
+    }
+
+    #[test]
+    fn exited_kernel_leader_cannot_leave_group_descendants() {
+        let dir = tempfile::tempdir().unwrap();
+        let descendant_path = dir.path().join("descendant.pid");
+        let script = format!(
+            "sleep 30 & echo $! > '{}'; exit 0",
+            descendant_path.display()
+        );
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", &script]).process_group(0);
+        let child = command.spawn().unwrap();
+        let mut guard = KernelAutostart::new(child);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while guard.child.as_mut().unwrap().try_wait().unwrap().is_none() {
+            assert!(Instant::now() < deadline, "leader did not exit");
+            thread::sleep(Duration::from_millis(5));
+        }
+        let descendant = std::fs::read_to_string(descendant_path)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        assert!(!process_is_gone(descendant));
+        drop(guard);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !process_is_gone(descendant) {
+            assert!(Instant::now() < deadline, "descendant survived guard drop");
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 
     #[test]
