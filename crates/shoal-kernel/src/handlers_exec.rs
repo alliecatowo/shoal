@@ -388,6 +388,13 @@ impl Kernel {
                                 data: Some(json!({"plan_ref": plan_ref})),
                             });
                         }
+                        PlanAuthorization::Granting { .. } => {
+                            return Err(RpcError {
+                                code: LEASH_DENIED,
+                                message: "approval grant is still being durably recorded".into(),
+                                data: Some(json!({"plan_ref": plan_ref})),
+                            });
+                        }
                         PlanAuthorization::Consumed(record) => {
                             return Err(RpcError {
                                 code: LEASH_DENIED,

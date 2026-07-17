@@ -321,7 +321,13 @@ struct StoredPlan {
 }
 
 fn plan_expired(plan: &StoredPlan) -> bool {
-    plan.created_at.elapsed() > PLAN_TTL
+    // An in-flight transition owns this plan until its durable side effect is
+    // resolved. Purging it here could leave an approval audit or execution
+    // claim with no state to commit or roll back into.
+    !matches!(
+        plan.authorization,
+        PlanAuthorization::Granting { .. } | PlanAuthorization::Claimed(_)
+    ) && plan.created_at.elapsed() > PLAN_TTL
 }
 
 /// Authorization is a one-way state machine. An explicit approval is a
@@ -332,6 +338,13 @@ enum PlanAuthorization {
     PolicyAllowed,
     Pending,
     Denied,
+    /// A validated approval whose durable grant audit is being appended
+    /// outside the plan-registry transaction. No apply or second grant may
+    /// pass this state.
+    Granting {
+        record: ApprovalRecord,
+        restore_policy_allowed: bool,
+    },
     Approved(ApprovalRecord),
     Claimed(ApprovalRecord),
     Consumed(ApprovalRecord),
@@ -352,7 +365,7 @@ impl PlanAuthorization {
     fn approval(&self) -> Option<&ApprovalRecord> {
         match self {
             Self::Approved(record) | Self::Claimed(record) | Self::Consumed(record) => Some(record),
-            Self::PolicyAllowed | Self::Pending | Self::Denied => None,
+            Self::PolicyAllowed | Self::Pending | Self::Denied | Self::Granting { .. } => None,
         }
     }
 }
