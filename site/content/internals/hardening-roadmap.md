@@ -253,6 +253,11 @@ here so they survive branch handoffs and context compaction.
 - [x] **RA-INPUT-4** — Rich prompt files, merged TOML shape, dynamic module identities, recognized
   environment values, and direct Git control reads are bounded. Advisory failures remain visible
   and degrade to valid layers/defaults. (prompt admission follow-up)
+- [x] **RA-INPUT-5** — Encrypted secret persistence has pre-decrypt file/ciphertext/plaintext walls,
+  bounded identity/name/value/aggregate admission, strict envelope and duplicate handling,
+  canonical base64, transactional capacity behavior, and zeroized partial plaintext maps. Invalid
+  confidentiality state fails closed and remains intact for diagnosis. (secret persistence
+  follow-up)
 
 Remaining honesty constraint: regular-file classification and later open are not advertised as an
 atomic race-free security boundary. OS containment and executable preflight TOCTOU remain separate

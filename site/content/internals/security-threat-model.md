@@ -462,10 +462,11 @@ necessary enforcement seam, not a claim that Leash presently confines in-process
 <dir>/.secrets.lock
 ```
 
-On Unix, opening sets directory mode 0700; key/data files are written 0600 and reads reject files
-with group/other permission bits. The key is 32 random bytes. The entire sorted map of secret names
-to byte values is JSON-serialized, encrypted with AES-256-GCM under a fresh 12-byte random nonce, and
-stored in a versioned base64 envelope.
+On Unix, opening sets directory mode 0700; key/data files are written 0600 and reads reject
+non-regular files or files with group/other permission bits. The key is 32 raw random bytes, not a
+password-derived key. The entire sorted map of secret names to byte values is JSON-serialized,
+encrypted with AES-256-GCM under a fresh 12-byte random nonce, and stored in a versioned base64
+envelope.
 
 ```mermaid
 sequenceDiagram
@@ -489,6 +490,15 @@ lost updates between processes. Master-key buffers, plaintext serialization/decr
 every secret map value are zeroized on drop. The final `Arc<str>` language value and copies made for
 environment variables, argv, or the child process cannot receive the same Rust-level guarantee and
 remain part of the process-memory threat model.
+
+Admission is fail closed and happens before expensive transformations: 16 MiB encrypted-file wall,
+10 MiB decrypted-JSON wall, 4,096 identities, 128-byte names, 256 KiB per value, and 2 MiB aggregate
+secret bytes. The loader also bounds JSON shape, requires the fixed envelope schema and canonical
+base64, rejects duplicate identities, and authenticates before plaintext parsing. AES-GCM has no
+decompression stage: decrypted length is ciphertext length minus its fixed 16-byte tag. An invalid
+snapshot is never partially accepted or rewritten; all checked operations return an error and leave
+the file available for diagnosis. Input-limit failures are `InvalidInput`, persisted-integrity
+failures are `InvalidData`, and errors contain no plaintext.
 
 AES-GCM detects envelope modification. The master key sits beside ciphertext under the same user
 permission boundary, so disk theft of both files yields decryption capability. This protects

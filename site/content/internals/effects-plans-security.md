@@ -279,12 +279,15 @@ service.
 ## Secret storage
 
 `shoal-secret` stores a name/value map encrypted with AES-256-GCM. It validates restrictive directory
-and file modes. Shared/exclusive fd locks serialize fresh reads and whole-map mutation. Master-key,
-plaintext buffers, and map values zeroize on drop; final language/child-process copies remain in the
-process-memory threat model. The master key resides alongside the store under the same user-level
-permission boundary. This protects accidental disclosure and detects ciphertext tampering; it does
-not protect against a process already running as the same compromised user. Values of type `Secret`
-are deliberately not generally renderable/feedable.
+and file modes. Bounded regular-file admission precedes JSON/base64/decryption; the fixed envelope,
+canonical encodings, decrypted map identities, values, aggregate bytes, and JSON shape are all
+checked fail closed without rewriting a bad snapshot. Shared/exclusive fd locks serialize fresh
+reads and whole-map mutation. Master-key, plaintext buffers, parse-error partial maps, and map values
+zeroize on drop; final language/child-process copies remain in the process-memory threat model. The
+master key resides alongside the store under the same user-level permission boundary. This protects
+accidental disclosure and detects ciphertext tampering; it does not protect against a process
+already running as the same compromised user. Values of type `Secret` are deliberately not
+generally renderable/feedable.
 
 ## WASM boundary: bounded preview runtime
 

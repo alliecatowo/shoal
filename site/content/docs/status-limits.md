@@ -267,7 +267,9 @@ Wire paths preserve raw Unix bytes alongside lossy display strings. Some other v
 - Undo covers only operations that recorded a typed inverse; it is not arbitrary command rollback.
 - Undo depends on surviving CAS bytes/current fingerprint and refuses stale/symlink-escaped targets.
 - A macOS/Unix leading-symlink alias is handled defensively, but filesystem races/special mounts warrant platform testing.
-- `shoal-secret` has no print/get command and uses a key stored beside ciphertext; OS permissions are the true at-rest boundary.
+- `shoal-secret` has no print/get command, bounds encrypted/decrypted store admission, and leaves
+  invalid snapshots intact; its key is still stored beside ciphertext, so OS permissions are the
+  true at-rest boundary.
 - Evaluator honors `SHOAL_SECRET_DIR`; CLI does not, so stores can diverge.
 - An authorized child can print a typed secret into captured output; redacted wire encoding cannot prevent downstream exfiltration.
 

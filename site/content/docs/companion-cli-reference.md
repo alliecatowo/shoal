@@ -333,7 +333,9 @@ Or from a protected file:
 shoal-secret set signing-key < "$HOME/.private/signing-key"
 ```
 
-Names must be nonempty ASCII letters, digits, `_`, or `-`.
+Names must be nonempty ASCII letters, digits, `_`, or `-`, with a maximum of 128 bytes. A value is
+limited to 256 KiB. The CLI applies that wall while reading stdin, before asking the store to mutate,
+so an unbounded pipe cannot become an unbounded plaintext buffer.
 
 ### List and delete
 
@@ -353,7 +355,21 @@ $XDG_DATA_HOME/shoal/secrets
 ~/.local/share/shoal/secrets
 ```
 
-The directory is set to `0700`. `master.key` is 32 random bytes and `secrets.json` is an AES-256-GCM authenticated envelope with a new 12-byte nonce for each save; both files must have no group/world bits (effectively `0600`) or open fails. Writes use a synced temporary file and atomic persist.
+The directory is set to `0700`. `master.key` is 32 raw random bytes (there is no password or KDF)
+and `secrets.json` is an AES-256-GCM authenticated envelope with a new 12-byte nonce for each save;
+both files must be regular files with no group/world bits (effectively `0600`) or open fails. Writes
+use a synced temporary file, atomic persist, and a directory sync.
+
+The encrypted file is capped at 16 MiB before JSON/base64/decryption, ciphertext and decrypted JSON
+have independent caps, and the plaintext map admits at most 4,096 identities, 256 KiB per value,
+and 2 MiB of aggregate secret bytes. JSON depth/shape, canonical base64, duplicate identities,
+unknown/duplicate envelope fields, nonce length, and authentication tag are checked. AES-GCM adds a
+fixed 16-byte tag and does not have decompression-like output amplification.
+
+Malformed, ambiguous, non-regular, or oversized snapshots fail closed for `set`, `delete`, `list`,
+and `secret.get`. Shoal never truncates or replaces such a file automatically; it remains intact for
+diagnosis and recovery. Replacing an existing identity remains allowed when the map is at its
+identity cap, provided the value and aggregate limits still hold.
 
 The key is stored beside the ciphertext. Encryption prevents accidental plaintext inspection and detects tampering; it does not protect against an attacker who can read the whole directory. Filesystem permissions and OS-user isolation remain the boundary.
 
@@ -365,7 +381,10 @@ The evaluator honors `SHOAL_SECRET_DIR` before XDG/HOME. This CLI does not. If `
 
 Until the CLI gains a directory option, align by choosing `XDG_DATA_HOME` such that its `shoal/secrets` equals the intended store, avoid the override, or populate the custom store using a trusted program built on the library.
 
-Exit codes: usage/store-open failure 2, set/list/delete operation failure 1, success 0.
+Exit codes: usage/store-open failure 2, set/list/delete operation failure 1, success 0. At the
+library boundary, caller admission failures use `InvalidInput`; malformed/ambiguous persisted state
+uses `InvalidData`; permission and ordinary I/O errors retain their native kinds. Error text never
+contains secret values.
 
 ## `shoal-history`
 
