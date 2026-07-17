@@ -56,12 +56,9 @@ pub(crate) struct ChildContext {
     secrets: Arc<dyn SecretPort>,
     config: Arc<dyn ConfigPort>,
     leash: Option<(LeashPolicy, String)>,
-    reef_chain: Option<(PathBuf, shoal_reef::ScopeChain)>,
+    reef: ReefState,
     reef_resolver: Option<Arc<shoal_reef::Resolver>>,
-    reef_lock: shoal_reef::Lockfile,
-    reef_lock_path: Option<PathBuf>,
     reef_user_manifest: Option<PathBuf>,
-    reef_overrides: Vec<shoal_reef::ScopeEntry>,
     session_id: String,
     principal: String,
 }
@@ -85,12 +82,9 @@ impl Evaluator {
             secrets: self.secrets.clone(),
             config: self.config.clone(),
             leash: self.session.leash.clone(),
-            reef_chain: self.reef_chain.clone(),
+            reef: self.reef.clone(),
             reef_resolver: self.reef_resolver.clone(),
-            reef_lock: self.reef_lock.clone(),
-            reef_lock_path: self.reef_lock_path.clone(),
             reef_user_manifest: self.reef_user_manifest.clone(),
-            reef_overrides: self.reef_overrides.clone(),
             session_id: self.session.session_id.clone(),
             principal: self.session.principal.clone(),
         }
@@ -122,12 +116,9 @@ impl ChildContext {
             secrets,
             config,
             leash,
-            reef_chain,
+            reef,
             reef_resolver,
-            reef_lock,
-            reef_lock_path,
             reef_user_manifest,
-            reef_overrides,
             session_id,
             principal,
         } = self;
@@ -156,13 +147,12 @@ impl ChildContext {
         // parent's confinement (spawn-hash gate + OS sandbox selection).
         child.session.leash = leash;
         // Reef scope/resolver/lock/overrides: constrained tool resolution must
-        // resolve identically inside a child, or a pinned tool diverges.
-        child.reef_chain = reef_chain;
+        // resolve identically inside a child, or a pinned tool diverges. The
+        // overlay + per-cwd cache travels as one [`ReefState`] unit (HR-J2);
+        // the resolver + user manifest are the separate resolution inputs.
+        child.reef = reef;
         child.reef_resolver = reef_resolver;
-        child.reef_lock = reef_lock;
-        child.reef_lock_path = reef_lock_path;
         child.reef_user_manifest = reef_user_manifest;
-        child.reef_overrides = reef_overrides;
         // Session identity: journal ATTRIBUTION (session_id/principal) is
         // inherited even though the journal handle itself is not (see below).
         child.session.session_id = session_id;
@@ -254,12 +244,12 @@ mod decomposition_characterization {
         assert_eq!(child.session.leash.as_ref().unwrap().1, "agent:tester");
         // --- Inherited: reef overlay + resolver (the step-3 bundle) ---------
         assert_eq!(
-            child.reef_overrides.len(),
+            child.reef.overrides.len(),
             1,
             "with reef: overlay inherited"
         );
         assert!(
-            child.reef_overrides[0]
+            child.reef.overrides[0]
                 .manifest
                 .tools
                 .contains_key("faketool"),

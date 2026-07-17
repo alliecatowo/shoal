@@ -7,7 +7,7 @@ template = "docs/page.html"
 [extra]
 group = "Maintenance"
 eyebrow = "Design record"
-status = "Design — staged extraction, not yet started"
+status = "Staged extraction — steps 1–3 landed; steps 4–6 pending a quiet window"
 audience = "Runtime and security contributors"
 wide = true
 +++
@@ -22,10 +22,13 @@ caused* the B-findings (children silently lose the active leash policy, reef res
 and config). Decomposing the context is what makes those losses impossible **by construction**
 rather than by discipline.
 
-This is a design record, not an implementation. It proposes the target shape and a staged
-extraction plan; no Rust changes land from this page. It **builds on the HR-B1 seam** — the
-single authoritative child-evaluator constructor introduced by workstream B — and assumes that
-seam exists as its prerequisite.
+This page proposes the target shape and a staged extraction plan. It **builds on the HR-B1
+seam** — the single authoritative child-evaluator constructor introduced by workstream B — and
+assumes that seam exists as its prerequisite. **Steps 1–3 have landed** on
+`hardening/deep-audit-2026-07` (characterization tests, then `SessionCtx`, then `ReefState`); the
+staged-plan section below records each step's status. Steps 4–6 (the broad `HostServices`/
+`ExecState` renames and the copy-site deletion) remain scheduled for a low-contention window and
+are unimplemented.
 
 The authoritative live description of today's state is
 [evaluator state and control flow](@/internals/evaluator-state.md); read its "Child evaluator
@@ -303,28 +306,46 @@ collides with so waves can be scheduled around it.
 **Step 0 (prerequisite, in flight).** HR-B1 lands the single `Evaluator::child(...)`
 constructor. Every step below routes through it. No work here — it is the seam.
 
-**Step 1 — Decomposition characterization tests (test-module only).** Before any struct moves,
-pin the target invariants: assert that a child built via each `ChildKind` (`spawn`, `parallel`,
-`on`, `.shl`) observes the parent's leash policy, reef resolution inputs, config port, and
-journal identity. Test-module-only; conflicts with nobody; turns every later step into a provable
-no-op. *Overlaps HR-B7* — coordinate so the two suites do not duplicate; this suite pins the
-decomposition's field-level invariants specifically.
+**Step 1 — Decomposition characterization tests (test-module only). ✅ Landed.** Before any struct
+moves, pin the target invariants: assert that a child built via each `ChildKind` (`spawn`,
+`parallel`, `on`, `.shl`) observes the parent's leash policy, reef resolution inputs, config port,
+and journal identity. Test-module-only; conflicts with nobody; turns every later step into a
+provable no-op. *Overlaps HR-B7* — coordinate so the two suites do not duplicate; this suite pins
+the decomposition's field-level invariants specifically.
 *Size: ~1 agent-day. Conflicts: none (test module).*
+*Landed: behavioral reef-resolution-input inheritance across all four child kinds added to
+`tests/child_context_propagation.rs`, plus a white-box `decomposition_characterization` module in
+`child_context.rs` that pins journal identity (carried) vs. handle (fresh), the `with reef:`
+overlay, leash, and the shared config + event-bus `Arc`s at the `child_context().build` seam —
+journal identity has no in-language surface, so that half is necessarily white-box.*
 
-**Step 2 — Extract `SessionCtx`.** Move `principal`, `session_id`, `leash`, `echo_mode`,
-`interactive`, `journal`, `sink` into a `SessionCtx` struct; access via `self.session.…`. Make
-the child constructor take it by value. This step alone retires the H1 → B security core: after
-it, a child cannot be built without a `SessionCtx`.
+**Step 2 — Extract `SessionCtx`. ✅ Landed.** Move `principal`, `session_id`, `leash`, `echo_mode`,
+`interactive`, `journal`, `sink` into a `SessionCtx` struct; access via `self.session.…`. This
+step alone retires the H1 → B security core: after it, a child cannot be built without a
+`SessionCtx`.
 *Size: ~1 agent-day. Conflicts: **Workstream D (HR-D1–D7)** heavily edits `journal.rs`,
 `principal`/attribution, and `command.rs` leash reads. Schedule **after** the D-wave lands or
 pair with the D agent; this is the one high-overlap step.*
+*Landed: `SessionCtx` embedded as `Evaluator.session` with a `SessionCtx::new()` whose defaults
+match the former flat-field defaults byte-for-byte; call sites rewritten mechanically to
+`self.session.…`. The child inherits identity + leash and starts presentation
+(`echo_mode`/`interactive`/`journal`/`sink`) fresh, preserving today's child behavior exactly (no
+switch to inherited `echo_mode` — that intended change stays deferred). `interactive` was the only
+`pub` field moved, so a thin forwarding `Evaluator::set_interactive` accessor was added and the
+host crates + integration tests routed through it.*
 
-**Step 3 — Group the reef overlay + cache into the child-inherited set.** Bundle
-`reef_overrides`, `reef_chain`, `reef_lock`, `reef_lock_path` into a `ReefState` sub-struct inside
-`ExecState`, and make the constructor clone it into children. Closes the reef half of finding B
-(children currently drop all four).
+**Step 3 — Group the reef overlay + cache into the child-inherited set. ✅ Landed.** Bundle
+`reef_overrides`, `reef_chain`, `reef_lock`, `reef_lock_path` into a `ReefState` sub-struct
+(embedded directly on `Evaluator` for now; it moves inside `ExecState` at step 5), and make the
+constructor clone it into children as one unit. Closes the reef half of finding B (children
+formerly dropped all four).
 *Size: ~1 agent-day. Conflicts: **HR-J1** (centralized resolution) and any reef work touching
 `reef_resolve.rs`/`reef_builtins.rs`. Coordinate with the resolution refactor.*
+*Landed: `ReefState { overrides, chain, lock, lock_path }` (`#[derive(Clone)]`) embedded as
+`Evaluator.reef`; `ChildContext` now carries the overlay as one `reef: ReefState` cloned as a
+unit. The session-long resolution *inputs* `reef_resolver` and `reef_user_manifest` deliberately
+stay separate top-level fields (they are Class-1 host services headed for `HostServices` at
+step 4), not part of the per-eval overlay/cache bundle.*
 
 **Step 4 — Extract `HostServices` behind `Arc`.** Move the ten Class-1 fields into
 `HostServices`, hold `Arc<HostServices>`, rewrite `self.fs` → `self.host.fs` (and siblings)
@@ -353,9 +374,9 @@ anyone editing those concurrency paths.*
 
 | Step | Primary files | Conflicts with | Scheduling note |
 |---|---|---|---|
-| 1 | test module | — | anytime |
-| 2 | journal.rs, command.rs, lib.rs | HR-D1–D7 | after / with the D-wave |
-| 3 | reef_resolve.rs, reef_builtins.rs, lib.rs | HR-J1, reef work | with the resolution refactor |
+| 1 ✅ | test module | — | landed |
+| 2 ✅ | journal.rs, command.rs, lib.rs | HR-D1–D7 | landed |
+| 3 ✅ | reef_resolve.rs, reef_builtins.rs, lib.rs | HR-J1, reef work | landed |
 | 4 | ~15 modules (`self.fs`→`self.host.fs`) | HR-C1–C3, HR-A9 | low-contention window, after C/A9 |
 | 5 | stmt/command/expr/call/modules | eval-heavy work | low eval-edit-pressure window |
 | 6 | script.rs, host.rs, channels.rs | concurrency-path edits | coordinate on child sites |

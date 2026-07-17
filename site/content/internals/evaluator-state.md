@@ -98,6 +98,22 @@ dynamic, session-global, host-global, inherited into children, journaled, or res
 field without an explicit rule will eventually behave differently in `spawn`, `source`, module
 loading, and kernel sessions.
 
+**Field grouping (HR-J2 decomposition, steps 2–3).** The rows above still name the individual
+state, but several fields now live in embedded sub-structs rather than flat on `Evaluator` — the
+grouping is behavior-identical, it just makes a child's inheritance rules enforceable by type (see
+[evaluator decomposition](@/internals/evaluator-decomposition.md)):
+
+- `session: SessionCtx` holds `principal`, `session_id`, `leash`, `echo_mode`, `interactive`,
+  `journal`, and `sink` (identity, authority, presentation) — accessed as `self.session.<field>`.
+  `interactive` is no longer a `pub` field; hosts call `Evaluator::set_interactive`.
+- `reef: ReefState` holds the reef overlay + per-cwd cache — `reef_overrides` → `reef.overrides`,
+  `reef_chain` → `reef.chain`, `reef_lock` → `reef.lock`, `reef_lock_path` → `reef.lock_path` — so
+  a child inherits the whole overlay as one unit. The resolution *inputs* `reef_resolver` and
+  `reef_user_manifest` stay top-level (host-installed, immutable per statement).
+
+The remaining flat fields (`env`, `cwd`, `it`, effect ports, jobs, modules, …) are unchanged
+pending the later `HostServices`/`ExecState` extraction steps.
+
 ## Construction defaults are compatibility behavior
 
 `Evaluator::new(cwd)` creates a root environment, snapshots the OS environment, starts with
