@@ -238,6 +238,24 @@ GitHub CI builds/tests on Ubuntu and macOS with locked dependencies, runs the co
 checks fmt/Clippy, and performs release builds. Release automation produces binaries for x86_64 and
 AArch64 on Linux and macOS.
 
+### Supply-chain advisories (HR-F6)
+
+~394 registry dependencies is real supply-chain surface with no advisory audit before this task
+(deep audit H9). The `supply-chain-audit` job in `ci.yml` installs `cargo-audit` and runs bare
+`cargo audit` against `Cargo.lock` on every push/PR to `main`.
+
+The documented allowlist lives at **`.cargo/audit.toml`** — this is `cargo-audit`'s own
+auto-discovered config path (a bare root-level `audit.toml` is silently ignored by the tool; this
+was verified locally before landing the CI job). Every ignored `RUSTSEC-*` ID carries an inline
+comment with its root cause and the condition for revisiting it. As of this writing every ignored
+advisory traces to one dependency: `shoal-wasm`'s `wasmtime = "37"` pin, whose fix for each current
+advisory requires a major-version bump (to `>=42.0.2`) rather than a same-major patch — a dependency
+change intentionally left to a separate pass rather than bundled into lint/CI hygiene work. The
+config also sets `output.deny = ["unmaintained", "unsound", "yanked"]`, so an unmaintained/unsound
+crate or a yanked version newly appearing in `Cargo.lock` fails the gate even though none exist
+today. Re-run `cargo audit` locally (same command CI uses) after any dependency bump and prune
+allowlist entries that no longer apply.
+
 ### The `shoal-wasm` compile cost decision (HR-F8)
 
 `shoal-wasm` is a workspace member with no other crate depending on it (deep audit H10): it
