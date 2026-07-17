@@ -205,6 +205,103 @@ fn finish_unknown_id_errors() {
 }
 
 #[test]
+fn completion_outputs_transcript_and_marker_commit_together() {
+    let j = Journal::in_memory().unwrap();
+    let id = j.append(&rec("s", "human", 1, "return 42")).unwrap();
+    let payload = r#"{"n":0,"summary":{"type":"int"}}"#;
+
+    j.complete_with_outputs(
+        id,
+        &[("value", b"42"), ("render", b"42\n")],
+        Some((2, payload)),
+        Some(0),
+        true,
+        17,
+    )
+    .unwrap();
+
+    let rows = j.entries_by_id(&[id]).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, Some(0));
+    assert_eq!(rows[0].ok, Some(true));
+    assert_eq!(rows[0].dur_ns, Some(17));
+    assert_eq!(
+        rows[0]
+            .outputs
+            .iter()
+            .map(|output| output.kind.as_str())
+            .collect::<Vec<_>>(),
+        ["value", "render"]
+    );
+    let events = j.transcript_events_by_entry(&[id]).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].ts_ns, 2);
+    assert_eq!(events[0].payload_json, payload);
+}
+
+#[test]
+fn late_completion_failure_rolls_back_outputs_and_marker() {
+    let j = Journal::in_memory().unwrap();
+    let id = j.append(&rec("s", "human", 1, "return 42")).unwrap();
+    j.record_transcript_event(id, 1, r#"{"existing":true}"#)
+        .unwrap();
+
+    let error = j
+        .complete_with_outputs(
+            id,
+            &[("value", b"must not become visible")],
+            Some((2, r#"{"duplicate":true}"#)),
+            Some(0),
+            true,
+            17,
+        )
+        .unwrap_err();
+    assert!(matches!(error, rusqlite::Error::SqliteFailure(_, _)));
+
+    let rows = j.entries_by_id(&[id]).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, None);
+    assert_eq!(rows[0].ok, None);
+    assert_eq!(rows[0].dur_ns, None);
+    assert!(rows[0].outputs.is_empty());
+    let events = j.transcript_events_by_entry(&[id]).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].ts_ns, 1);
+    assert_eq!(events[0].payload_json, r#"{"existing":true}"#);
+}
+
+#[test]
+fn aggregate_completion_preparation_is_bounded_before_writing() {
+    let j = Journal::in_memory_with_options(JournalOptions {
+        output_hard_cap: 8,
+        ..Default::default()
+    })
+    .unwrap();
+    let id = j.append(&rec("s", "human", 1, "return 42")).unwrap();
+
+    assert!(
+        j.complete_with_outputs(
+            id,
+            &[("value", b"12345"), ("render", b"67890")],
+            None,
+            Some(0),
+            true,
+            17,
+        )
+        .is_err()
+    );
+    let too_many = vec![("value", b"x".as_slice()); 17];
+    assert!(
+        j.complete_with_outputs(id, &too_many, None, Some(0), true, 17)
+            .is_err()
+    );
+
+    let rows = j.entries_by_id(&[id]).unwrap();
+    assert_eq!(rows[0].ok, None);
+    assert!(rows[0].outputs.is_empty());
+}
+
+#[test]
 fn unfinished_entry_survives_reopen_with_null_status() {
     // WAL crash-tolerance smoke: append, drop without finish, reopen.
     let dir = tempfile::tempdir().unwrap();

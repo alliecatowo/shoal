@@ -9,7 +9,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use rusqlite::params;
+use rusqlite::{Transaction, params};
 use serde::{Deserialize, Serialize};
 
 use crate::storage::DB_WRITE_RESERVE_BYTES;
@@ -26,6 +26,10 @@ const ZSTD_LEVEL: i32 = 3;
 pub const BLOB_RANGE_MAX_BYTES: usize = 64 * 1024;
 
 const DEFAULT_OUTPUT_HARD_CAP: usize = 256 * 1024 * 1024;
+/// A completion has a small, fixed output vocabulary in every current host.
+/// Keep the aggregate API bounded so a direct embedder cannot turn one commit
+/// into an unbounded preparation/allocation loop.
+const MAX_COMPLETION_OUTPUTS: usize = 16;
 /// Default SQLite `busy_timeout`: how long a writer blocks waiting for a
 /// competing writer's lock before giving up with `SQLITE_BUSY`. The journal is
 /// shared across processes (REPL + kernel + shoal-history all open the same
@@ -107,6 +111,16 @@ pub struct OutputMeta {
     pub stored_len: u64,
 }
 
+struct PreparedOutput {
+    kind: String,
+    stored: Vec<u8>,
+    hash: blake3::Hash,
+    hex: String,
+    stored_len: i64,
+    meta: Option<OutputMeta>,
+    meta_json: Option<String>,
+}
+
 impl Journal {
     /// Store `bytes` in the CAS (zstd-compressed, blake3-addressed, deduplicated)
     /// and link them to entry `id`. `kind` is `"stdout"`, `"stderr"`, `"value"`,
@@ -133,55 +147,125 @@ impl Journal {
         kind: &str,
         bytes: &[u8],
     ) -> rusqlite::Result<(String, Option<OutputMeta>)> {
-        let (stored, meta) = if bytes.len() > self.output_hard_cap {
-            let marker_len = TRUNCATION_MARKER.len().min(self.output_hard_cap);
-            let keep = self.output_hard_cap.saturating_sub(marker_len);
-            let mut stored = bytes[..keep].to_vec();
-            stored.extend_from_slice(&TRUNCATION_MARKER[..marker_len]);
-            let meta = OutputMeta {
-                truncated: true,
-                original_len: bytes.len() as u64,
-                stored_len: stored.len() as u64,
-            };
-            (stored, Some(meta))
-        } else {
-            (bytes.to_vec(), None)
-        };
-        let hash = blake3::hash(&stored);
-        let hex = hash.to_hex().to_string();
-        let meta_json = meta
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()
-            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-        let stored_len = i64::try_from(stored.len())
-            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        let prepared = prepare_output(self.output_hard_cap, kind, bytes)?;
         let requested = DB_WRITE_RESERVE_BYTES
             .saturating_add(kind.len() as u64)
-            .saturating_add(meta_json.as_ref().map_or(0, String::len) as u64);
-        let path = self.blob_path(&hex);
-        let write_result = self.with_database_admission(requested, |tx| {
-            let admitted = self.admit_cas_growth(tx, hash.as_bytes(), stored.len() as u64)?;
-            if admitted || !path.exists() {
-                let parent = path.parent().expect("blob path always has a parent");
-                fs::create_dir_all(parent).map_err(io_to_sql)?;
-                let compressed =
-                    zstd::encode_all(stored.as_slice(), ZSTD_LEVEL).map_err(io_to_sql)?;
-                let mut tmp = tempfile::NamedTempFile::new_in(parent).map_err(io_to_sql)?;
-                tmp.write_all(&compressed).map_err(io_to_sql)?;
-                tmp.flush().map_err(io_to_sql)?;
-                tmp.persist(&path).map_err(|error| io_to_sql(error.error))?;
-            }
-            let now = now_ns();
-            tx.execute("INSERT OR IGNORE INTO blob(hash,stored_len,created_ns,last_access_ns) VALUES(?1,?2,?3,?3)",params![hash.as_bytes().as_slice(),stored_len,now])?;
-            tx.execute(
-                "INSERT INTO output (entry_id, kind, hash, len, meta) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![id, kind, hash.as_bytes().as_slice(), stored_len, meta_json],
-            )?;
-            Ok(())
+            .saturating_add(prepared.meta_json.as_ref().map_or(0, String::len) as u64);
+        self.with_database_admission(requested, |tx| {
+            self.write_prepared_output(tx, id, &prepared)
+        })?;
+        Ok((prepared.hex, prepared.meta))
+    }
+
+    /// Persist all completion outputs, the optional durable transcript event,
+    /// and the final entry marker in one SQLite transaction. CAS files are
+    /// still written before their rows and can become harmless GC orphans if a
+    /// later statement rolls back; no partial database completion is visible.
+    pub fn complete_with_outputs(
+        &self,
+        id: i64,
+        outputs: &[(&str, &[u8])],
+        transcript_event: Option<(i64, &str)>,
+        status: Option<i32>,
+        ok: bool,
+        dur_ns: i64,
+    ) -> rusqlite::Result<()> {
+        if outputs.len() > MAX_COMPLETION_OUTPUTS {
+            return Err(io_to_sql(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "journal completion has {} outputs; maximum is {MAX_COMPLETION_OUTPUTS}",
+                    outputs.len()
+                ),
+            )));
+        }
+        let prepared_bytes = outputs.iter().fold(0usize, |total, (_, bytes)| {
+            total.saturating_add(bytes.len().min(self.output_hard_cap))
         });
-        write_result?;
-        Ok((hex, meta))
+        if prepared_bytes > self.output_hard_cap {
+            return Err(io_to_sql(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "journal completion would prepare {prepared_bytes} output bytes; aggregate maximum is {}",
+                    self.output_hard_cap
+                ),
+            )));
+        }
+        let prepared = outputs
+            .iter()
+            .map(|(kind, bytes)| prepare_output(self.output_hard_cap, kind, bytes))
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let requested = prepared.iter().fold(
+            DB_WRITE_RESERVE_BYTES.saturating_mul(prepared.len() as u64 + 2),
+            |total, output| {
+                total
+                    .saturating_add(output.kind.len() as u64)
+                    .saturating_add(output.meta_json.as_ref().map_or(0, String::len) as u64)
+            },
+        );
+        let requested = requested
+            .saturating_add(transcript_event.map_or(0, |(_, payload)| payload.len() as u64));
+        self.with_database_admission(requested, |tx| {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM entry WHERE id = ?1)",
+                [id],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                return Err(rusqlite::Error::StatementChangedRows(0));
+            }
+            for output in &prepared {
+                self.write_prepared_output(tx, id, output)?;
+            }
+            if let Some((ts_ns, payload_json)) = transcript_event {
+                tx.execute(
+                    "INSERT INTO transcript_event (entry_id, ts, payload) VALUES (?1, ?2, ?3)",
+                    params![id, ts_ns, payload_json],
+                )?;
+            }
+            let changed = tx.execute(
+                "UPDATE entry SET status = ?1, ok = ?2, dur_ns = ?3 WHERE id = ?4",
+                params![status, ok, dur_ns, id],
+            )?;
+            if changed == 0 {
+                return Err(rusqlite::Error::StatementChangedRows(0));
+            }
+            Ok(())
+        })
+    }
+
+    fn write_prepared_output(
+        &self,
+        tx: &Transaction<'_>,
+        id: i64,
+        output: &PreparedOutput,
+    ) -> rusqlite::Result<()> {
+        let path = self.blob_path(&output.hex);
+        let admitted =
+            self.admit_cas_growth(tx, output.hash.as_bytes(), output.stored.len() as u64)?;
+        if admitted || !path.exists() {
+            let parent = path.parent().expect("blob path always has a parent");
+            fs::create_dir_all(parent).map_err(io_to_sql)?;
+            let compressed =
+                zstd::encode_all(output.stored.as_slice(), ZSTD_LEVEL).map_err(io_to_sql)?;
+            let mut tmp = tempfile::NamedTempFile::new_in(parent).map_err(io_to_sql)?;
+            tmp.write_all(&compressed).map_err(io_to_sql)?;
+            tmp.flush().map_err(io_to_sql)?;
+            tmp.persist(&path).map_err(|error| io_to_sql(error.error))?;
+        }
+        let now = now_ns();
+        tx.execute("INSERT OR IGNORE INTO blob(hash,stored_len,created_ns,last_access_ns) VALUES(?1,?2,?3,?3)",params![output.hash.as_bytes().as_slice(),output.stored_len,now])?;
+        tx.execute(
+            "INSERT INTO output (entry_id, kind, hash, len, meta) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                id,
+                &output.kind,
+                output.hash.as_bytes().as_slice(),
+                output.stored_len,
+                output.meta_json.as_deref()
+            ],
+        )?;
+        Ok(())
     }
 
     /// Fetch and decompress a CAS blob by its blake3 hex hash.
@@ -442,6 +526,45 @@ impl Journal {
             Ok(())
         });
     }
+}
+
+fn prepare_output(
+    output_hard_cap: usize,
+    kind: &str,
+    bytes: &[u8],
+) -> rusqlite::Result<PreparedOutput> {
+    let (stored, meta) = if bytes.len() > output_hard_cap {
+        let marker_len = TRUNCATION_MARKER.len().min(output_hard_cap);
+        let keep = output_hard_cap.saturating_sub(marker_len);
+        let mut stored = bytes[..keep].to_vec();
+        stored.extend_from_slice(&TRUNCATION_MARKER[..marker_len]);
+        let meta = OutputMeta {
+            truncated: true,
+            original_len: bytes.len() as u64,
+            stored_len: stored.len() as u64,
+        };
+        (stored, Some(meta))
+    } else {
+        (bytes.to_vec(), None)
+    };
+    let hash = blake3::hash(&stored);
+    let hex = hash.to_hex().to_string();
+    let meta_json = meta
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    let stored_len = i64::try_from(stored.len())
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    Ok(PreparedOutput {
+        kind: kind.to_owned(),
+        stored,
+        hash,
+        hex,
+        stored_len,
+        meta,
+        meta_json,
+    })
 }
 
 fn verify_spill(

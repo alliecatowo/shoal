@@ -244,14 +244,20 @@ impl Journal {
         ok: bool,
         dur_ns: i64,
     ) -> rusqlite::Result<()> {
-        let changed = self.conn.execute(
-            "UPDATE entry SET status = ?1, ok = ?2, dur_ns = ?3 WHERE id = ?4",
-            params![status, ok, dur_ns, id],
-        )?;
-        if changed == 0 {
-            return Err(rusqlite::Error::StatementChangedRows(0));
-        }
-        Ok(())
+        // `with_database_admission` always retains the dedicated completion
+        // reserve. Spend that reserve here instead of charging a second generic
+        // write allowance: completion must remain possible after begin has
+        // admitted the entry near the database ceiling.
+        self.with_database_admission(0, |tx| {
+            let changed = tx.execute(
+                "UPDATE entry SET status = ?1, ok = ?2, dur_ns = ?3 WHERE id = ?4",
+                params![status, ok, dur_ns, id],
+            )?;
+            if changed == 0 {
+                return Err(rusqlite::Error::StatementChangedRows(0));
+            }
+            Ok(())
+        })
     }
 }
 

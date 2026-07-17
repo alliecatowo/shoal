@@ -344,6 +344,7 @@ impl Evaluator {
             return finish_result(result, failure);
         };
         let dur = elapsed_ns(started);
+        let mut outputs: Vec<(&'static str, Vec<u8>)> = Vec::new();
         let (status, ok) = match &result {
             Ok(flow) => {
                 let value = match flow {
@@ -358,31 +359,23 @@ impl Evaluator {
                     && *v != Value::Null
                 {
                     let render = shoal_value::render::render_block(v, 80);
-                    if !render.is_empty()
-                        && let Err(error) = journal.record_output(id, "render", render.as_bytes())
-                    {
-                        note_failure(&mut failure, "render output", error);
+                    if !render.is_empty() {
+                        outputs.push(("render", render.into_bytes()));
                     }
                     if let Value::Outcome(o) = v {
-                        if !o.stdout.is_empty()
-                            && let Err(error) = journal.record_output(id, "stdout", &o.stdout)
-                        {
-                            note_failure(&mut failure, "stdout output", error);
+                        if !o.stdout.is_empty() {
+                            outputs.push(("stdout", o.stdout.to_vec()));
                         }
-                        if !o.stderr.is_empty()
-                            && let Err(error) = journal.record_output(id, "stderr", &o.stderr)
-                        {
-                            note_failure(&mut failure, "stderr output", error);
+                        if !o.stderr.is_empty() {
+                            outputs.push(("stderr", o.stderr.to_vec()));
                         }
                     }
                 }
                 (status, ok)
             }
             Err(err) => {
-                if let Some(stderr) = &err.stderr
-                    && let Err(error) = journal.record_output(id, "stderr", stderr.as_bytes())
-                {
-                    note_failure(&mut failure, "error stderr output", error);
+                if let Some(stderr) = &err.stderr {
+                    outputs.push(("stderr", stderr.as_bytes().to_vec()));
                 }
                 (err.status, false)
             }
@@ -396,8 +389,15 @@ impl Evaluator {
         } else {
             (status, ok)
         };
-        if let Err(error) = journal.finish(id, status, ok, dur) {
-            note_failure(&mut failure, "finish", error);
+        let output_refs = outputs
+            .iter()
+            .map(|(kind, bytes)| (*kind, bytes.as_slice()))
+            .collect::<Vec<_>>();
+        if let Err(error) = journal.complete_with_outputs(id, &output_refs, None, status, ok, dur) {
+            note_failure(&mut failure, "output completion", error);
+            if let Err(error) = journal.finish(id, None, false, dur) {
+                note_failure(&mut failure, "failed completion marker", error);
+            }
         }
         finish_result(result, failure)
     }

@@ -197,14 +197,22 @@ impl Kernel {
                         .journal
                         .lock()
                         .map_err(|_| poisoned_subsystem("journal"))?;
-                    if let Some(stderr) = &e.stderr {
-                        journal
-                            .record_output(entry_id, "stderr", stderr.as_bytes())
-                            .map_err(internal)?;
+                    let outputs = e
+                        .stderr
+                        .as_ref()
+                        .map(|stderr| vec![("stderr", stderr.as_bytes())])
+                        .unwrap_or_default();
+                    if let Err(error) = journal.complete_with_outputs(
+                        entry_id,
+                        &outputs,
+                        None,
+                        e.status,
+                        false,
+                        elapsed_ns(started),
+                    ) {
+                        let _ = journal.finish(entry_id, None, false, elapsed_ns(started));
+                        return Err(internal(error));
                     }
-                    journal
-                        .finish(entry_id, e.status, false, elapsed_ns(started))
-                        .map_err(internal)?;
                 }
                 self.events.publish_journal(
                     &session.key.owner(),
@@ -345,34 +353,29 @@ impl Kernel {
                 .journal
                 .lock()
                 .map_err(|_| poisoned_subsystem("journal"))?;
-            let persisted = (|| -> Result<(), RpcError> {
-                journal
-                    .record_output(entry_id, "value", &value_output)
-                    .map_err(internal)?;
-                if !render.is_empty() {
-                    journal
-                        .record_output(entry_id, "render", render.as_bytes())
-                        .map_err(internal)?;
+            let mut outputs: Vec<(&str, &[u8])> = vec![("value", &value_output)];
+            if !render.is_empty() {
+                outputs.push(("render", render.as_bytes()));
+            }
+            if let Value::Outcome(out) = &value {
+                outputs.push(("stdout", &out.stdout));
+                if !out.stderr.is_empty() {
+                    outputs.push(("stderr", &out.stderr));
                 }
-                if let Value::Outcome(out) = &value {
-                    journal
-                        .record_output(entry_id, "stdout", &out.stdout)
-                        .map_err(internal)?;
-                    if !out.stderr.is_empty() {
-                        journal
-                            .record_output(entry_id, "stderr", &out.stderr)
-                            .map_err(internal)?;
-                    }
-                }
-                journal
-                    .record_transcript_event(entry_id, transcript_ts, &transcript_output)
-                    .map_err(internal)?;
-                // Success is the commit marker and must be written only after
-                // every output required to replay the response is durable.
-                journal
-                    .finish(entry_id, Some(0), true, elapsed_ns(started))
-                    .map_err(internal)
-            })();
+            }
+            // Outputs, durable transcript replay metadata, and the success
+            // marker become visible together. A late constraint, quota, or
+            // I/O failure cannot leave a partly replayable successful entry.
+            let persisted = journal
+                .complete_with_outputs(
+                    entry_id,
+                    &outputs,
+                    Some((transcript_ts, &transcript_output)),
+                    Some(0),
+                    true,
+                    elapsed_ns(started),
+                )
+                .map_err(internal);
             if let Err(error) = persisted {
                 let _ = journal.finish(entry_id, None, false, elapsed_ns(started));
                 return Err(error);
@@ -392,7 +395,7 @@ impl Kernel {
             .publish_transcript(&session.key.owner(), entry_id, transcript_payload);
         let exec_budget = ElideBudget::from_spec(params.elide.as_ref());
         let exec_uri = short_ref_to_uri(&value_ref, None);
-        // The journal keeps the full render above (record_output); the wire
+        // The journal keeps the full render in the atomic completion above; the wire
         // response bounds it to the same hard cap as MCP's content[0].text
         // (site/content/internals/kernel-protocol.md) — a huge render must never bypass the wall the
         // structured value already respects.

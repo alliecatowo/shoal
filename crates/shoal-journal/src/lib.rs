@@ -15,10 +15,11 @@
 //! # Concurrency
 //!
 //! A [`Journal`] is a single-handle, single-thread object (`Send` but not `Sync`,
-//! courtesy of the underlying `rusqlite::Connection`). Each write is a single
-//! SQLite statement and therefore atomic; the WAL journal makes an unfinished
-//! entry (appended but never [`Journal::finish`]ed, e.g. across a crash) durable
-//! and visible with `NULL` status on reopen.
+//! courtesy of the underlying `rusqlite::Connection`). Writes run in admitted
+//! SQLite transactions; multi-row completion commits its outputs, optional
+//! transcript event, and final marker atomically. The WAL journal makes an
+//! unfinished entry (appended but never [`Journal::finish`]ed, e.g. across a
+//! crash) durable and visible with `NULL` status on reopen.
 //!
 //! # Module layout
 //!
