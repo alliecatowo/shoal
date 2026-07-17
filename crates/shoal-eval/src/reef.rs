@@ -69,7 +69,7 @@ impl Evaluator {
     /// cwd changes and callers reload it themselves after any lock write.
     pub fn prompt_reef_snapshot(&mut self) -> PromptReefSnapshot {
         self.ensure_reef_chain();
-        let Some((_, chain)) = self.reef.chain.as_ref() else {
+        let Some((_, chain)) = self.exec.reef.chain.as_ref() else {
             return PromptReefSnapshot::default();
         };
         let active_scope = chain.scopes.first().map(|s| s.label().to_string());
@@ -88,7 +88,7 @@ impl Evaluator {
             .into_iter()
             .map(|tool| {
                 let scope = chain.nearest_for(&tool).map(|s| s.label().to_string());
-                match self.reef.lock.get(&tool) {
+                match self.exec.reef.lock.get(&tool) {
                     Some(entry) => PromptReefBinding {
                         tool,
                         version: Some(entry.version.clone()),

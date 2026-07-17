@@ -12,7 +12,7 @@ impl Evaluator {
                 arg,
                 CmdArg::FlagLong { .. } | CmdArg::FlagShort { .. } | CmdArg::DashDash { .. }
             ) {
-                ps.extend(plan_paths(arg, &self.cwd)?);
+                ps.extend(plan_paths(arg, &self.exec.cwd)?);
             }
         }
         let e = match call.head.as_str() {
@@ -25,7 +25,7 @@ impl Evaluator {
             }],
             "ls" | "cat" | "stat" | "head" => vec![Effect::FsRead {
                 paths: if ps.is_empty() {
-                    vec![self.cwd.clone()]
+                    vec![self.exec.cwd.clone()]
                 } else {
                     ps
                 },

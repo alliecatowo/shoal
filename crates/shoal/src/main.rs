@@ -352,7 +352,7 @@ fn run_source(
     let (_, adapter_warnings) =
         adapters::load_adapters(&mut evaluator, &loaded.config.adapters.dirs);
     adapters::print_warnings(&adapter_warnings);
-    evaluator.env.declare(
+    evaluator.env_mut().declare(
         "args",
         Value::List(
             args.into_iter()
@@ -363,7 +363,7 @@ fn run_source(
     );
     if let Some(source) = source {
         evaluator
-            .env
+            .env_mut()
             .declare("script", Value::Path(source.to_path_buf()), false);
     }
     match evaluator.eval_program(&program) {
@@ -582,7 +582,7 @@ mod tests {
             .insert("9bad".to_string(), "echo hi".to_string());
         seed_config_bindings(&mut evaluator, &config);
         // Must not have bound anything under that name, and must not panic.
-        assert!(!evaluator.env.is_bound("9bad"));
+        assert!(!evaluator.env().is_bound("9bad"));
     }
 
     /// Fix 1: the user reef manifest path mirrors `shoal_config`'s own user

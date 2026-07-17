@@ -65,12 +65,12 @@ impl Evaluator {
     /// may move it into a worker thread and call [`ChildContext::build`] there.
     pub(crate) fn child_context(&self) -> ChildContext {
         ChildContext {
-            cwd: self.cwd.clone(),
-            env: self.env.clone(),
-            process_env: self.process_env.clone(),
+            cwd: self.exec.cwd.clone(),
+            env: self.exec.env.clone(),
+            process_env: self.exec.process_env.clone(),
             host: self.host.clone(),
             leash: self.session.leash.clone(),
-            reef: self.reef.clone(),
+            reef: self.exec.reef.clone(),
             session_id: self.session.session_id.clone(),
             principal: self.session.principal.clone(),
         }
@@ -106,10 +106,10 @@ impl ChildContext {
         // Lexical env: closure/spawn/parallel/on bodies inherit the caller's
         // bindings; a `.shl` script keeps `Evaluator::new`'s fresh root.
         if let ChildScope::Inherit = scope {
-            child.env = env;
+            child.exec.env = env;
         }
-        child.cancel = cancel;
-        child.process_env = process_env;
+        child.exec.cancel = cancel;
+        child.exec.process_env = process_env;
         // Host services (effect ports, adapters, event bus, and the reef
         // resolution inputs) travel as one shared `Arc<HostServices>` (HR-J2
         // step 4): a child must see the same fakes/host adapters/config or
@@ -123,7 +123,7 @@ impl ChildContext {
         // resolve identically inside a child. The overlay + per-cwd cache travels
         // as one [`ReefState`] unit (HR-J2); the resolver + user manifest are the
         // separate resolution inputs, now inside the shared `host` bundle above.
-        child.reef = reef;
+        child.exec.reef = reef;
         // Session identity: journal ATTRIBUTION (session_id/principal) is
         // inherited even though the journal handle itself is not (see below).
         child.session.session_id = session_id;
@@ -215,12 +215,12 @@ mod decomposition_characterization {
         assert_eq!(child.session.leash.as_ref().unwrap().1, "agent:tester");
         // --- Inherited: reef overlay + resolver (the step-3 bundle) ---------
         assert_eq!(
-            child.reef.overrides.len(),
+            child.exec.reef.overrides.len(),
             1,
             "with reef: overlay inherited"
         );
         assert!(
-            child.reef.overrides[0]
+            child.exec.reef.overrides[0]
                 .manifest
                 .tools
                 .contains_key("faketool"),

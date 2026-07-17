@@ -259,21 +259,22 @@ impl Evaluator {
     /// once so `cd` builds up jump history; `-c`/scripts/conformance leave it
     /// off and never write.
     pub fn open_default_jump_history(&mut self) {
-        self.jump_store = Some(crate::journal::default_state_dir().join(STORE_FILE));
+        self.exec.jump_store = Some(crate::journal::default_state_dir().join(STORE_FILE));
     }
 
     /// Point the frecency store at a specific file (hosts that manage their own
     /// state dir, and hermetic tests). Enables recording, like
     /// [`Evaluator::open_default_jump_history`].
     pub fn set_jump_store(&mut self, path: PathBuf) {
-        self.jump_store = Some(path);
+        self.exec.jump_store = Some(path);
     }
 
     /// The store file to *read* for a `j` query: the installed store when
     /// recording is enabled, else the shared per-user default so a one-shot
     /// `shoal -c 'j foo'` still resolves against real history.
     fn jump_read_path(&self) -> PathBuf {
-        self.jump_store
+        self.exec
+            .jump_store
             .clone()
             .unwrap_or_else(|| crate::journal::default_state_dir().join(STORE_FILE))
     }
@@ -283,7 +284,7 @@ impl Evaluator {
     /// it can never fail the navigation that triggered it. Uses the [`Clock`]
     /// port for "now" so tests can pin recency.
     pub(crate) fn record_cd(&mut self, dir: &Path) {
-        let Some(path) = self.jump_store.clone() else {
+        let Some(path) = self.exec.jump_store.clone() else {
             return; // recording disabled (scripts / -c / conformance)
         };
         let now = self.host.clock.now_ns() / 1_000_000_000;
@@ -299,7 +300,7 @@ impl Evaluator {
     pub(crate) fn eval_jump(&mut self, call: &CmdCall) -> VResult<Value> {
         // Same session-scope rule as `cd`: mutating the session cwd inside a
         // `fn` body is illegal (use `with cwd:` for a scoped change).
-        if self.in_fn_body > 0 {
+        if self.exec.in_fn_body > 0 {
             return Err(ErrorVal::new(
                 "custom",
                 "jump is only allowed at session top level; use `with cwd:` inside a fn body",
@@ -336,7 +337,7 @@ impl Evaluator {
         // Route through `change_cwd` so a jump also updates OLDPWD (a later
         // `cd -` returns to where the jump left from) and records frecency.
         self.change_cwd(canon);
-        Ok(Value::Path(self.cwd.clone()))
+        Ok(Value::Path(self.exec.cwd.clone()))
     }
 
     /// Resolve the directory a `j <query>` should land in, without changing the
@@ -349,7 +350,7 @@ impl Evaluator {
             let direct = if Path::new(q).is_absolute() {
                 PathBuf::from(q)
             } else {
-                self.cwd.join(q)
+                self.exec.cwd.join(q)
             };
             if direct.is_dir() {
                 return Ok(direct);

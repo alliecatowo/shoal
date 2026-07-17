@@ -992,7 +992,7 @@ fn eval_with_position(
         // position so a failed outcome is captured (bound to `it`), not raised.
         if let Stmt::Expr { expr, .. } = last {
             let value = evaluator.eval_expr(expr, Position::Value)?;
-            evaluator.it = value.clone();
+            evaluator.set_it(value.clone());
             return Ok(value);
         }
         // A final `let`/`fn`/`for`/… has no distinct value reading; run it as
