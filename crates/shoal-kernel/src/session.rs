@@ -513,9 +513,10 @@ impl Kernel {
                 for warning in report.warnings {
                     eprintln!("shoal-kernel: warning: {warning}");
                 }
-                // Init files can spawn commands, so install the authenticated
-                // kernel policy before running them. Request execution sets
-                // this again at its own boundary to prevent stale identity.
+                // Request execution sets this again at its own boundary to
+                // prevent stale identity. Configured aliases/environment are
+                // already seeded by `apply`; interactive `init.files` are not
+                // run for durable agent Sessions.
                 evaluator.set_leash_policy(self.policy.clone(), key.principal.clone());
                 // Long-lived agent/interactive sessions build up `j`/`jump` directory
                 // history against the shared per-user store, same as the REPL (frecency
@@ -570,7 +571,6 @@ impl Kernel {
                     wire_bus.publish(&wire_owner, channel, json);
                 }));
                 let lang_bus = evaluator.event_bus();
-                bootstrap.run_init(&mut evaluator).map_err(internal)?;
                 Ok(Arc::new(Session {
                     key: key.clone(),
                     id: name.into(),

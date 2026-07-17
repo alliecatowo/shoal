@@ -2,8 +2,8 @@
 //!
 //! A parser/evaluator is only one layer of a working shell session. This
 //! crate applies the resolved config snapshot, aliases, environment, Reef
-//! scope, adapters, optional leash policy, and session init files in one
-//! ordered composition so the CLI, REPL, and kernel cannot silently diverge.
+//! scope, adapters, and optional leash policy in one ordered composition.
+//! Interactive init files are an explicit second phase used only by the REPL.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -43,7 +43,8 @@ pub struct SessionBootstrap {
 }
 
 /// Non-fatal composition diagnostics and adapter metadata needed by REPL
-/// completion. Fatal config/init/policy errors are returned from `apply`.
+/// completion. Fatal config/policy errors are returned from `apply`; interactive
+/// init errors are returned separately by [`SessionBootstrap::run_init`].
 #[derive(Debug, Default)]
 pub struct BootstrapReport {
     pub warnings: Vec<String>,
@@ -282,9 +283,19 @@ mod tests {
         bootstrap
             .apply(&mut kernel, Surface::Kernel, "agent:test")
             .unwrap();
-        bootstrap.run_init(&mut kernel).unwrap();
-        assert_eq!(
+        assert!(
             kernel
+                .eval_program(&parse("env.FROM_INIT").unwrap())
+                .is_err()
+        );
+
+        let mut interactive = Evaluator::new(dir.path().to_path_buf());
+        bootstrap
+            .apply(&mut interactive, Surface::Interactive, "human")
+            .unwrap();
+        bootstrap.run_init(&mut interactive).unwrap();
+        assert_eq!(
+            interactive
                 .eval_program(&parse("env.FROM_INIT").unwrap())
                 .unwrap(),
             Value::Str("yes".into())

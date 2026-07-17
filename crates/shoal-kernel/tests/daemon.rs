@@ -419,7 +419,9 @@ fn daemon_binds_secure_socket_and_attaches() {
     let config_dir = config_root.join("shoal");
     std::fs::create_dir_all(&config_dir).unwrap();
     let init = temp.path().join("init.shoal");
-    std::fs::write(&init, "env.FROM_INIT = \"init-value\"\n").unwrap();
+    // `init.files` are an interactive-shell surface. An agent Session must not
+    // evaluate even a configured, malformed init file implicitly.
+    std::fs::write(&init, "\"unterminated\n").unwrap();
     std::fs::write(
         config_dir.join("shoal.toml"),
         format!(
@@ -513,7 +515,7 @@ fn daemon_binds_secure_socket_and_attaches() {
             id: 3.into(),
             method: "exec".into(),
             params: serde_json::to_value(ExecParams {
-                src: "env.FROM_CONFIG + \":\" + env.FROM_INIT".into(),
+                src: "env.FROM_CONFIG".into(),
                 mode: "run".into(),
                 position: "value".into(),
                 asynchronous: false,
@@ -527,7 +529,7 @@ fn daemon_binds_secure_socket_and_attaches() {
     .unwrap();
     assert_eq!(
         recv(&mut reader).result.unwrap()["value"],
-        serde_json::json!({"$": "str", "v": "config-value:init-value"})
+        serde_json::json!({"$": "str", "v": "config-value"})
     );
     write_frame(
         &mut stream,
