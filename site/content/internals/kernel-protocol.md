@@ -51,8 +51,12 @@ and [`session.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-k
 
 ## Session attachment
 
-`session.attach` is the identity and feature-negotiation boundary.
-
+`session.attach` is the identity and feature-negotiation boundary. With a bearer token the token's
+principal governs. Without one, the mapping splits on the declared client kind (HR-D6): a
+`client.kind:"mcp"` attach lands on the restricted `agent:mcp` principal (profile `"agent"`); other
+kinds keep the local `uid:N` principal (profile `local-human`). Permissive MCP attach is an explicit
+opt-in (`SHOAL_MCP_PERMISSIVE` on the kernel, or `Kernel::set_mcp_permissive`). See the
+[agent/MCP page](@/internals/agent-mcp.md) and the RPC reference for the mapping table.
 
 The response reports the actual available enforcement tier and whether this principal resolves to a
 real sandbox. Token capability metadata is returned separately from the policy principal.

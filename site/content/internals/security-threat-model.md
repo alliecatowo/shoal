@@ -134,9 +134,17 @@ token's `principal`. The cap strings are metadata in the shown attach path, not 
 enforced intersection with Leash grants. Security review must follow principal policy, handler
 checks, and resource ownership—not assume the returned token-cap array is a capability engine.
 
-No-token attach uses the local principal and `local-human` profile. A durable kernel validates a
-provided bearer with `TokenStore::validate`; invalid, expired, or revoked tokens share an auth-failed
-response.
+No-token attach is split by declared client kind (HR-D6): a `client.kind:"mcp"` attach lands on the
+restricted **`agent:mcp`** principal with the `"agent"` profile; any other kind uses the local
+`uid:N` principal and `local-human` profile. The kernel's built-in default policy defines
+`agent:mcp` with execution availability intact but without env value reads, env writes, or secret
+use — so a zero-config MCP agent works, is journaled under its own identity, and (under the
+approval separation default) cannot approve its own plans. The legacy permissive mapping for
+MCP-kind clients is an explicit opt-in: a non-empty `SHOAL_MCP_PERMISSIVE` on the kernel process,
+or `Kernel::set_mcp_permissive`. A bearer token is the per-principal alternative. The kind string
+is a client declaration inside the same-UID socket boundary — a default-authority posture, not a
+defense against a malicious same-UID process. A durable kernel validates a provided bearer with
+`TokenStore::validate`; invalid, expired, or revoked tokens share an auth-failed response.
 
 `PROFILE` and repeated `--cap` values accepted by `shoal-token create` are not authorization rules.
 They are copied into `AttachResult.caps.profile`/`token_caps` for client metadata. No handler
@@ -311,8 +319,13 @@ Kernel startup with an explicit policy can use the fallible loader. Agent-facing
 silently reuse the local-human convenience loader unless fail-open authority is intentional and
 observable.
 
-The built-in permissive policy grants root read/write/delete, wildcard env, session/journal/time,
-opaque allow, and in-grant auto-apply. It does not enable spawn pinning.
+The built-in zero-config kernel policy defines two principals (HR-D6): the same-UID human keeps the
+fully permissive grants (root read/write/delete, wildcard env, session/journal/time, opaque allow,
+in-grant auto-apply), and the restricted `agent:mcp` principal keeps execution availability (opaque
+allow, unrestricted filesystem, in-grant auto-apply, session/journal/time) while dropping env value
+reads, env writes, and secret use. Neither enables spawn pinning. An explicit `--policy` file
+replaces this built-in entirely; a file that does not define `agent:mcp` leaves zero-config agents
+at the unknown-principal deny default.
 
 ## Lowering glob policy to OS roots
 
@@ -543,6 +556,7 @@ limits/authorization to each invocation.
 | nonhermetic sandbox unavailable | run with honest degraded status |
 | hermetic requested dimension unavailable | fail closed before spawn |
 | unattached `cap.request` / `journal.query` | reject with `NOT_ATTACHED` (HR-D1/D4) |
+| no-token MCP-kind attach | restricted `agent:mcp` principal; permissive is explicit opt-in (HR-D6) |
 | requester approving its own plan | reject `LEASH_DENIED` unless self-ack explicitly enabled (HR-D3) |
 | `journal.query` `limit` omitted vs. `0` | omitted → default page; explicit `0` → zero rows; clamped to server max (HR-D5) |
 | malformed/unknown bearer | reject attach |

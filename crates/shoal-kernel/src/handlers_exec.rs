@@ -498,7 +498,7 @@ mod tests {
     /// marker statement's entry carries its exact source text.
     #[test]
     fn exec_calls_set_source_so_stmt_journal_entries_carry_src() {
-        // `Kernel::new()`'s default policy (`permissive_policy`) is scoped to
+        // `Kernel::new()`'s default policy (`default_policy`) is scoped to
         // THIS process's actual uid principal (`principal()`) — any other
         // principal name gets denied (`leash denied execution`), so the
         // attachment below must use the same principal the kernel treats as

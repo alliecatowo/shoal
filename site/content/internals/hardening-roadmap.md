@@ -117,7 +117,7 @@ Rules for implementers:
 - [x] **HR-D4** — `journal.query` requires attachment, matching the documented rule. *(F1)*
 - [x] **HR-D5** — `journal.query` limits are bounded: `limit: 0` returns zero rows and a
   server-side maximum caps page size. *(F2)*
-- [ ] **HR-D6** — Zero-config MCP attach lands on a restricted agent principal rather than
+- [x] **HR-D6** — Zero-config MCP attach lands on a restricted agent principal rather than
   `local-human`; permissive attach becomes explicit opt-in. Update autostart, attach handling,
   and the agent/MCP + threat-model docs together. *(E1, E2)*
 - [ ] **HR-D7** — Session identity model made explicit: statement-level journal attribution

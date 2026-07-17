@@ -43,6 +43,31 @@ best-effort spawns a detached `shoal-kernel`, polls readiness for about five sec
 `SHOAL_NO_AUTOSTART` opts out for externally supervised kernels. Competing autostarts rely on the
 kernel's socket preparation to leave one winner.
 
+### Zero-config identity (HR-D6)
+
+The facade attaches with `client.kind:"mcp"` and, zero-config (no `SHOAL_TOKEN`), the kernel maps
+that attach to the restricted **`agent:mcp`** principal with the `"agent"` profile — not the
+same-UID `local-human`. Availability is unchanged: the kernel's built-in default policy defines
+`agent:mcp` with execution intact (opaque allow, unrestricted filesystem, in-grant auto-apply), so
+`shoal_exec` and the other twelve tools all work out of the box. What changes is default authority
+and identity:
+
+- session env becomes **names-only** (`granted:false`; no values) — the agent has no `env_read`
+  grant;
+- persistent env writes and secret use have no grants;
+- agent work is journaled under `agent:mcp`, distinct from the human's rows;
+- combined with the approval separation-of-duties default, an MCP agent cannot approve its own
+  plans — a distinct principal (the human's session, a supervisor token) must.
+
+Permissive attach is an explicit opt-in: set `SHOAL_TOKEN` (the token's principal and policy
+govern), or set a non-empty `SHOAL_MCP_PERMISSIVE` on the kernel process to restore the legacy
+`local-human` mapping for MCP-kind clients. The autostarted kernel inherits the MCP process
+environment, so either variable in the MCP server config is sufficient. An explicit `--policy` file
+replaces the built-in default policy entirely; define `[principal."agent:mcp"]` there or zero-config
+agents evaluate to deny. The `client.kind` string is a client declaration inside the same-UID
+0600-socket trust boundary — it sets the default authority of the shipped agent surface; it is not a
+defense against a malicious same-UID process.
+
 Both MCP stdio and kernel socket protocols use newline JSON frames with a 16 MiB completed-frame
 limit. Like the kernel reader, the MCP reader calls `read_line` before checking size, so memory is not
 strictly bounded while the line is being accumulated.
