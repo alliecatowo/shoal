@@ -59,35 +59,20 @@ impl Evaluator {
     pub(crate) fn spawn_block(&mut self, body: Block) -> VResult<Value> {
         let task = shoal_value::TaskVal::new("spawn block");
         // Structured cancellation: cancelling the task cancels the child's exec
-        // tokens (defect #14).
+        // tokens (defect #14) — a FRESH token wired to the task's cancel hook.
         let child_cancel = CancelToken::new();
         let hook_cancel = child_cancel.clone();
         task.on_cancel(Box::new(move || hook_cancel.cancel()));
         let worker = task.clone();
-        let env = self.env.clone();
-        let cwd = self.cwd.clone();
-        let penv = self.process_env.clone();
-        let adapters = self.adapters.clone();
-        let bus = self.bus();
-        // Share the host's effect ports (site/content/internals/roadmap-and-priorities.md) with the spawned
-        // task; `Arc` clones, identical under the `Std*` defaults.
-        let fs = self.fs.clone();
-        let exec = self.exec.clone();
-        let clock = self.clock.clone();
-        let opener = self.opener.clone();
-        let secrets = self.secrets.clone();
+        // The one authoritative child constructor (HR-B1): it inherits the full
+        // session context — leash policy/principal, reef scope/resolver/
+        // overrides, config, all effect ports, the event bus, and session
+        // identity — by construction, not the partial hand-copy the audit
+        // (B1–B4) found here dropping leash/reef/config. `Inherit` scope: a
+        // `spawn` body sees the caller's bindings.
+        let ctx = self.child_context();
         std::thread::spawn(move || {
-            let mut ev = Evaluator::new(cwd);
-            ev.env = env;
-            ev.process_env = penv;
-            ev.adapters = adapters;
-            ev.cancel = child_cancel;
-            ev.set_bus(bus);
-            ev.fs = fs;
-            ev.exec = exec;
-            ev.clock = clock;
-            ev.opener = opener;
-            ev.secrets = secrets;
+            let mut ev = ctx.build(ChildScope::Inherit, child_cancel);
             worker.finish(ev.block_value(&body));
         });
         self.jobs.push(task.clone());
@@ -162,14 +147,16 @@ impl Evaluator {
                     .map_err(|e| ErrorVal::new("parse_error", e.to_string()))?;
                 // A `.shl` script is a separate program (see
                 // `site/content/internals/values-streams-execution.md`):
-                // the child keeps `Evaluator::new`'s FRESH root scope. Aliasing
-                // the caller's env (`Env::clone` shares the same Arc'd scope)
-                // leaked every script `let` back into the parent session.
-                let mut child = Evaluator::new(self.cwd.clone());
-                child.process_env = self.process_env.clone();
-                child.adapters = self.adapters.clone();
-                child.inherit_ports(self);
-                child.set_bus(self.bus());
+                // `ChildScope::Fresh` keeps `Evaluator::new`'s FRESH root scope,
+                // so its `let`s do not leak back into the caller session
+                // (`Env::clone` would share the same Arc'd scope and leak them).
+                // Via the one child constructor (HR-B1) it still inherits the
+                // full session context — leash/reef/config/ports/bus/session
+                // identity, which the old hand-copy here dropped for leash/reef
+                // (audit B1–B3) — plus the parent's cancellation so a host
+                // cancel interrupts the script.
+                let cancel = self.cancellation_token();
+                let mut child = self.child_context().build(ChildScope::Fresh, cancel);
                 child.env.declare("args", Value::List(args), false);
                 child
                     .env

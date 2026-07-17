@@ -4,6 +4,7 @@ mod args;
 mod builtins;
 mod call;
 mod channels;
+mod child_context;
 mod coerce;
 mod command;
 mod expr;
@@ -28,6 +29,7 @@ mod stmt;
 mod streams;
 
 pub use channels::{EventBus, EventForwarder};
+pub(crate) use child_context::ChildScope;
 pub(crate) use coerce::coerce_word;
 pub use reef::{PromptReefBinding, PromptReefSnapshot};
 // Job-control surface (site/content/internals/language-conformance-contract.md) the interactive host (the REPL) drives. Re-
@@ -250,9 +252,9 @@ pub struct Evaluator {
     /// a host injects the *same* resolved `shoal_config::Config` it applies to
     /// itself via [`Evaluator::set_config`], so in-language config == the
     /// host-applied config. Held as `Arc<dyn ConfigPort>` like the other ports
-    /// so child evaluators inherit it cheaply (see [`inherit_ports`]).
+    /// so child evaluators inherit it cheaply (see [`ChildContext`]).
     ///
-    /// [`inherit_ports`]: Evaluator::inherit_ports
+    /// [`ChildContext`]: child_context::ChildContext
     config: Arc<dyn ConfigPort>,
     /// How much of a script/`-c` run's top-level statement values auto-render
     /// (the `render.echo` knob, site/content/internals/configuration-reference.md). Default [`EchoMode::All`]
@@ -372,19 +374,6 @@ impl Evaluator {
     /// sets [`EchoMode::Quiet`] so intermediate pure expressions stay silent.
     pub fn set_echo_mode(&mut self, mode: EchoMode) {
         self.echo_mode = mode;
-    }
-
-    /// Copy the effect ports from `parent` into a freshly-created child
-    /// evaluator so `parallel`/`source`/`spawn` see the same adapters the host
-    /// installed. Cheap `Arc` clones; a no-op semantically when both hold the
-    /// `Std*` defaults.
-    pub(crate) fn inherit_ports(&mut self, parent: &Evaluator) {
-        self.fs = parent.fs.clone();
-        self.exec = parent.exec.clone();
-        self.clock = parent.clock.clone();
-        self.opener = parent.opener.clone();
-        self.secrets = parent.secrets.clone();
-        self.config = parent.config.clone();
     }
 
     /// The session event bus (site/content/internals/streams-channels.md). Shared into spawned tasks so
