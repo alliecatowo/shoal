@@ -300,7 +300,7 @@ fn reef_locked_parent() -> (tempfile::TempDir, Evaluator) {
     std::fs::create_dir_all(&bindir).unwrap();
     fixture_faketool(&bindir);
     let mut ev = Evaluator::new(dir.path().to_path_buf());
-    ev.interactive = true; // interactive → auto-lock, no reef_unlocked
+    ev.set_interactive(true); // interactive → auto-lock, no reef_unlocked
     ev.set_reef_resolver(Arc::new(Resolver::new(vec![Box::new(
         SystemProvider::new(vec![bindir], vec![]),
     )])));

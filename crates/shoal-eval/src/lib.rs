@@ -115,16 +115,77 @@ pub struct JobsSnapshot {
 /// Host renderer for statement-position outcomes (defect #1).
 pub type StatementSink = Box<dyn FnMut(&Value) + Send>;
 
+/// Session identity, authority, and presentation policy — the Class-2 evaluator
+/// state grouped by HR-J2 (`site/content/internals/evaluator-decomposition.md`):
+/// *who* is acting (`principal`/`session_id`), *what they may do* (`leash`), and
+/// *how output is presented* (`echo_mode`/`interactive`/`journal`/`sink`). These
+/// change only via explicit host setup or a kernel re-attach, never per
+/// statement. A child evaluator inherits identity + authority but starts
+/// presentation fresh (see `child_context.rs`); the field grouping is otherwise
+/// behavior-identical to the pre-decomposition flat fields.
+struct SessionCtx {
+    /// Acting principal recorded on each journal entry: `"human"` or
+    /// `"agent:<name>"`. Ignored when no journal is installed.
+    principal: String,
+    /// Session id recorded on each journal entry (site/content/internals/language-conformance-contract.md). Ignored when no
+    /// journal is installed.
+    session_id: String,
+    /// Active leash policy + the principal it is evaluated for (site/content/internals/language-conformance-contract.md). `None`
+    /// (the default) means no OS sandbox is ever applied to a spawn — the exact
+    /// pre-activation behavior, so `Evaluator::new` and every existing test
+    /// keep running unconfined. When set, each external spawn resolves a
+    /// [`SandboxPolicy`] for `principal` and passes it via `ExecSpec.sandbox`;
+    /// a default-permissive policy still resolves to `None` (no wrapping), so
+    /// only a genuinely-scoped principal ever confines a child.
+    leash: Option<(LeashPolicy, String)>,
+    /// How much of a script/`-c` run's top-level statement values auto-render
+    /// (the `render.echo` knob, site/content/internals/configuration-reference.md). Default [`EchoMode::All`]
+    /// (echo everything) so `Evaluator::new`, the REPL, and every conformance
+    /// case keep their current behavior; the non-interactive host opts into
+    /// `Quiet`.
+    echo_mode: EchoMode,
+    /// Whether interactive behavior is allowed (host-selected).
+    interactive: bool,
+    /// Optional command journal (site/content/internals/language-conformance-contract.md). `None` (the default) means NOTHING is
+    /// journaled — the exact pre-journal behavior, so `-c`/scripts/conformance
+    /// run untouched. Only when a host installs a journal via
+    /// [`Evaluator::set_journal`] (or [`Evaluator::open_default_journal`]) does
+    /// per-top-level-statement recording, output capture, and fs undo-inverse
+    /// recording happen. Held here (not shared) because `Journal` is single-
+    /// handle / not `Sync`; spawned child evaluators never inherit it.
+    journal: Option<Journal>,
+    /// Host renderer for statement-position outcomes (site/content/internals/language-conformance-contract.md, defect #1).
+    sink: Option<StatementSink>,
+}
+
+impl SessionCtx {
+    /// The default session identity/presentation, matching the pre-decomposition
+    /// `Evaluator::new` field defaults exactly: no journal, no leash, no sink,
+    /// non-interactive, echo everything, `human`/`default` attribution.
+    fn new() -> Self {
+        Self {
+            principal: "human".into(),
+            session_id: "default".into(),
+            leash: None,
+            echo_mode: EchoMode::default(),
+            interactive: false,
+            journal: None,
+            sink: None,
+        }
+    }
+}
+
 pub struct Evaluator {
     pub env: Env,
     cwd: PathBuf,
     process_env: Vec<(OsString, OsString)>,
-    pub interactive: bool,
+    /// Session identity, authority, and presentation policy grouped into one
+    /// sub-context (HR-J2 [`SessionCtx`]): `principal`/`session_id`, `leash`,
+    /// `echo_mode`, `interactive`, `journal`, and `sink`.
+    session: SessionCtx,
     pub it: Value,
     cancel: CancelToken,
     adapters: AdapterCatalog,
-    /// Host renderer for statement-position outcomes (site/content/internals/language-conformance-contract.md, defect #1).
-    sink: Option<StatementSink>,
     /// Runtime call-stack depth guard (defect #9).
     call_depth: usize,
     /// Nesting depth inside `fn` bodies — gates `cd`/env writes (defect #10).
@@ -166,20 +227,6 @@ pub struct Evaluator {
     /// `site/content/internals/reef-resolution.md`), nearest-first (innermost `with reef:` block wins). Empty and inert
     /// when no `with reef:` is on the dynamic stack — zero-regression.
     reef_overrides: Vec<shoal_reef::ScopeEntry>,
-    /// Optional command journal (site/content/internals/language-conformance-contract.md). `None` (the default) means NOTHING is
-    /// journaled — the exact pre-journal behavior, so `-c`/scripts/conformance
-    /// run untouched. Only when a host installs a journal via
-    /// [`Evaluator::set_journal`] (or [`Evaluator::open_default_journal`]) does
-    /// per-top-level-statement recording, output capture, and fs undo-inverse
-    /// recording happen. Held here (not shared) because `Journal` is single-
-    /// handle / not `Sync`; spawned child evaluators never inherit it.
-    journal: Option<Journal>,
-    /// Session id recorded on each journal entry (site/content/internals/language-conformance-contract.md). Ignored when no
-    /// journal is installed.
-    session_id: String,
-    /// Acting principal recorded on each journal entry: `"human"` or
-    /// `"agent:<name>"`. Ignored when no journal is installed.
-    principal: String,
     /// The journal entry id of the top-level statement currently executing, so
     /// nested fs mutations (rm/cp/mv/save) can attach undo inverses to it.
     /// `None` outside a journaled statement.
@@ -188,14 +235,6 @@ pub struct Evaluator {
     /// top-level statement's `src` for its journal entry (site/content/internals/language-conformance-contract.md). `None` when
     /// the host did not provide it — the entry's `src` is then left empty.
     source: Option<String>,
-    /// Active leash policy + the principal it is evaluated for (site/content/internals/language-conformance-contract.md). `None`
-    /// (the default) means no OS sandbox is ever applied to a spawn — the exact
-    /// pre-activation behavior, so `Evaluator::new` and every existing test
-    /// keep running unconfined. When set, each external spawn resolves a
-    /// [`SandboxPolicy`] for `principal` and passes it via `ExecSpec.sandbox`;
-    /// a default-permissive policy still resolves to `None` (no wrapping), so
-    /// only a genuinely-scoped principal ever confines a child.
-    leash: Option<(LeashPolicy, String)>,
     /// The in-language `channel(name)` event bus (site/content/internals/streams-channels.md). Shared
     /// (Arc) so spawned tasks / `on(...)` handlers publish and subscribe to the
     /// same session-scoped channels — coordination is channels, never files.
@@ -256,12 +295,6 @@ pub struct Evaluator {
     ///
     /// [`ChildContext`]: child_context::ChildContext
     config: Arc<dyn ConfigPort>,
-    /// How much of a script/`-c` run's top-level statement values auto-render
-    /// (the `render.echo` knob, site/content/internals/configuration-reference.md). Default [`EchoMode::All`]
-    /// (echo everything) so `Evaluator::new`, the REPL, and every conformance
-    /// case keep their current behavior; the non-interactive host opts into
-    /// `Quiet`.
-    echo_mode: EchoMode,
 }
 
 enum Flow {
@@ -285,11 +318,10 @@ impl Evaluator {
             env: Env::root(),
             cwd,
             process_env: std::env::vars_os().collect(),
-            interactive: false,
+            session: SessionCtx::new(),
             it: Value::Null,
             cancel: CancelToken::new(),
             adapters: AdapterCatalog::empty(),
-            sink: None,
             call_depth: 0,
             in_fn_body: 0,
             jobs: Vec::new(),
@@ -301,10 +333,6 @@ impl Evaluator {
             reef_lock_path: None,
             reef_user_manifest: None,
             reef_overrides: Vec::new(),
-            leash: None,
-            journal: None,
-            session_id: "default".into(),
-            principal: "human".into(),
             current_entry: None,
             source: None,
             bus: channels::EventBus::shared(),
@@ -321,7 +349,6 @@ impl Evaluator {
             opener: Arc::new(StdOpener),
             secrets: Arc::new(StdSecret),
             config: Arc::new(ConfigSnapshot::default()),
-            echo_mode: EchoMode::default(),
         }
     }
 
@@ -373,7 +400,16 @@ impl Evaluator {
     /// every statement (the REPL/legacy behavior); the non-interactive host
     /// sets [`EchoMode::Quiet`] so intermediate pure expressions stay silent.
     pub fn set_echo_mode(&mut self, mode: EchoMode) {
-        self.echo_mode = mode;
+        self.session.echo_mode = mode;
+    }
+
+    /// Select whether interactive behavior is allowed (host-selected). Thin
+    /// forwarding accessor over the [`SessionCtx`] field; hosts (`shoal`'s REPL,
+    /// the non-interactive runner, the kernel) drive it once at setup. Replaces
+    /// the former `pub interactive` field the decomposition moved into
+    /// [`SessionCtx`].
+    pub fn set_interactive(&mut self, interactive: bool) {
+        self.session.interactive = interactive;
     }
 
     /// The session event bus (site/content/internals/streams-channels.md). Shared into spawned tasks so
@@ -415,7 +451,7 @@ impl Evaluator {
     /// resolves to no OS confinement for a spawn, so normal use never
     /// regresses; only a scoped principal actually restricts a child.
     pub fn set_leash_policy(&mut self, policy: LeashPolicy, principal: impl Into<String>) {
-        self.leash = Some((policy, principal.into()));
+        self.session.leash = Some((policy, principal.into()));
     }
 
     /// Convenience over [`Evaluator::set_leash_policy`]: load the per-user leash
@@ -435,7 +471,7 @@ impl Evaluator {
     /// principal is unknown, or its grants are unrestricted/unscoped. `None`
     /// keeps `ExecSpec.sandbox` unset — the pre-activation, unconfined path.
     pub(crate) fn resolve_sandbox(&self) -> Option<SandboxPolicy> {
-        let (policy, principal) = self.leash.as_ref()?;
+        let (policy, principal) = self.session.leash.as_ref()?;
         policy.sandbox_for(principal)
     }
 
@@ -462,7 +498,7 @@ impl Evaluator {
     /// When unset, a built-in default prints to real stdout so scripts behave
     /// without host wiring.
     pub fn set_statement_sink(&mut self, f: StatementSink) {
-        self.sink = Some(f);
+        self.session.sink = Some(f);
     }
 
     /// Bind `it` and append to the session `out` transcript list (REPL hook).
@@ -479,7 +515,7 @@ impl Evaluator {
 
     /// Route a value to the statement sink (or the default stdout renderer).
     pub(crate) fn emit(&mut self, v: &Value) {
-        if let Some(sink) = self.sink.as_mut() {
+        if let Some(sink) = self.session.sink.as_mut() {
             sink(v);
         } else {
             helpers::default_render(v);

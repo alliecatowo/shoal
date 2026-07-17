@@ -84,15 +84,15 @@ impl Evaluator {
             opener: self.opener.clone(),
             secrets: self.secrets.clone(),
             config: self.config.clone(),
-            leash: self.leash.clone(),
+            leash: self.session.leash.clone(),
             reef_chain: self.reef_chain.clone(),
             reef_resolver: self.reef_resolver.clone(),
             reef_lock: self.reef_lock.clone(),
             reef_lock_path: self.reef_lock_path.clone(),
             reef_user_manifest: self.reef_user_manifest.clone(),
             reef_overrides: self.reef_overrides.clone(),
-            session_id: self.session_id.clone(),
-            principal: self.principal.clone(),
+            session_id: self.session.session_id.clone(),
+            principal: self.session.principal.clone(),
         }
     }
 }
@@ -154,7 +154,7 @@ impl ChildContext {
         child.config = config;
         // Leash policy/principal: the security fix — a child must not escape the
         // parent's confinement (spawn-hash gate + OS sandbox selection).
-        child.leash = leash;
+        child.session.leash = leash;
         // Reef scope/resolver/lock/overrides: constrained tool resolution must
         // resolve identically inside a child, or a pinned tool diverges.
         child.reef_chain = reef_chain;
@@ -165,8 +165,8 @@ impl ChildContext {
         child.reef_overrides = reef_overrides;
         // Session identity: journal ATTRIBUTION (session_id/principal) is
         // inherited even though the journal handle itself is not (see below).
-        child.session_id = session_id;
-        child.principal = principal;
+        child.session.session_id = session_id;
+        child.session.principal = principal;
 
         // --- Deliberately NOT inherited (fresh state per child) ------------
         // journal handle:  `Journal` is single-handle / not `Sync`; sharing it
@@ -231,7 +231,7 @@ mod decomposition_characterization {
         );
         // Presentation state that must NOT reach a child.
         parent.set_statement_sink(Box::new(|_v: &Value| {}));
-        parent.interactive = true;
+        parent.set_interactive(true);
         // Config + reef resolution inputs + a `with reef:` overlay layer.
         let mut cfg = Record::new();
         cfg.insert("k".into(), Value::Int(7));
@@ -244,11 +244,14 @@ mod decomposition_characterization {
         let child = parent.child_context().build(scope, CancelToken::new());
 
         // --- Inherited: journal IDENTITY (session_id + principal) -----------
-        assert_eq!(child.session_id, "sess-characterize");
-        assert_eq!(child.principal, "agent:tester");
+        assert_eq!(child.session.session_id, "sess-characterize");
+        assert_eq!(child.session.principal, "agent:tester");
         // --- Inherited: authority (the security core) ----------------------
-        assert!(child.leash.is_some(), "leash policy must reach the child");
-        assert_eq!(child.leash.as_ref().unwrap().1, "agent:tester");
+        assert!(
+            child.session.leash.is_some(),
+            "leash policy must reach the child"
+        );
+        assert_eq!(child.session.leash.as_ref().unwrap().1, "agent:tester");
         // --- Inherited: reef overlay + resolver (the step-3 bundle) ---------
         assert_eq!(
             child.reef_overrides.len(),
@@ -271,9 +274,18 @@ mod decomposition_characterization {
         assert!(Arc::ptr_eq(&parent.bus, &child.bus), "event bus shared");
 
         // --- Deliberately NOT inherited (fresh per child) ------------------
-        assert!(child.journal.is_none(), "journal HANDLE stays root-only");
-        assert!(child.sink.is_none(), "no competing mutable renderer");
-        assert!(!child.interactive, "a child never owns the terminal");
+        assert!(
+            child.session.journal.is_none(),
+            "journal HANDLE stays root-only"
+        );
+        assert!(
+            child.session.sink.is_none(),
+            "no competing mutable renderer"
+        );
+        assert!(
+            !child.session.interactive,
+            "a child never owns the terminal"
+        );
     }
 
     #[test]

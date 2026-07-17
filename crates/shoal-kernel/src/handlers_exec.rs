@@ -297,7 +297,7 @@ impl Kernel {
                 Verdict::Allow => {}
             }
         }
-        evaluator.interactive = false;
+        evaluator.set_interactive(false);
         let started = Instant::now();
         let opaque = run_plan.effects.iter().any(|e| matches!(e, Effect::Opaque));
         let effects_json = serde_json::to_string(&run_plan.effects).map_err(internal)?;
