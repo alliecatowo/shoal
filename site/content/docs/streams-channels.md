@@ -148,10 +148,10 @@ For streams, both `.save(path)` and `.append(path)` currently open the file in a
 
 ## Streams cannot feed processes yet
 
-The finite-value `feed` serializer rejects streams. Incremental stream-to-child-stdin is not wired:
+The finite-value `feed` serializer rejects streams with a `type_error` ("feeding a stream to a command's stdin is not implemented yet") before any process starts. Incremental stream-to-child-stdin is not wired — the process layer has no streaming stdin mode yet:
 
 ```text
-# current workaround
+# current workaround (the error's own hint)
 let batch = source.take(100).collect()
 batch.feed(^consumer)
 ```
