@@ -4,9 +4,9 @@
 //! needs.
 
 use std::collections::{BTreeSet, VecDeque};
-use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, IsTerminal};
+#[cfg(test)]
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
@@ -21,26 +21,34 @@ use reedline::{
 use reedline::{
     History, HistoryItem, KeyCode, KeyModifiers, ReedlineEvent, SearchDirection, SearchQuery,
 };
-use shoal_ast::{CmdArg, Expr, Program, Stmt, UnOp};
 use shoal_eval::Evaluator;
-use shoal_journal::{Journal, JournalQuery};
+use shoal_journal::Journal;
 use shoal_syntax::{ParseCtx, parse_with_ctx};
 use shoal_value::{Env, Value};
 
 use crate::completer::{self, ShoalCompleter};
 use crate::highlight::ShoalHighlighter;
-use crate::kernel_repl::{KernelRpc, ProtocolOutcome, ProtocolSession};
+#[cfg(test)]
+use crate::kernel_repl::ProtocolOutcome;
+use crate::kernel_repl::ProtocolSession;
 use crate::prompt;
-use crate::repl_state::{ProtocolSnapshot, RemoteEnvMirror};
+use crate::repl_state::RemoteEnvMirror;
 use crate::{format_parse_error, maybe_strip, no_color, report_eval_error};
 
 mod editor;
+mod protocol;
 mod rendering;
+mod transcript;
 
 use editor::{FilteredHistory, ShoalValidator, build_edit_mode, history_path};
 #[cfg(test)]
 use editor::{glob_match, input_is_incomplete};
 
+#[cfg(test)]
+use protocol::ReplProtocol;
+use protocol::{
+    execute_protocol_line, protocol_requested, refresh_protocol_state, session_path_dirs,
+};
 pub(crate) use rendering::{
     PagerContext, print_value, render_result, render_result_paged, terminal_width,
 };
@@ -49,80 +57,10 @@ use rendering::{
     pager_command, protocol_render_text, should_page, spawn_pager, wrapped_line_count,
 };
 use rendering::{render_protocol_outcome, report_protocol_error};
-
-trait ReplProtocol {
-    fn execute(
-        &mut self,
-        src: &str,
-        interrupt: &AtomicBool,
-        width: usize,
-    ) -> Result<ProtocolOutcome, String>;
-    fn snapshot(&mut self) -> Result<serde_json::Value, String>;
-}
-
-impl<R: KernelRpc> ReplProtocol for ProtocolSession<R> {
-    fn execute(
-        &mut self,
-        src: &str,
-        interrupt: &AtomicBool,
-        width: usize,
-    ) -> Result<ProtocolOutcome, String> {
-        ProtocolSession::execute(self, src, interrupt, width)
-    }
-
-    fn snapshot(&mut self) -> Result<serde_json::Value, String> {
-        ProtocolSession::snapshot(self)
-    }
-}
-
-fn protocol_requested(standalone: bool, kernel_enabled: bool) -> bool {
-    !standalone && kernel_enabled
-}
-
-fn execute_protocol_line(
-    session: &mut impl ReplProtocol,
-    src: &str,
-    interrupt: &AtomicBool,
-    width: usize,
-) -> Result<ProtocolOutcome, String> {
-    if parse_job_control(src).is_some() {
-        return Err("fg/bg process-group job control is available only with --standalone".into());
-    }
-    let run_src = rewrite_fg(src).unwrap_or_else(|| src.to_string());
-    session.execute(&run_src, interrupt, width)
-}
-
-fn refresh_protocol_state(
-    session: &mut impl ReplProtocol,
-    mirror: &mut RemoteEnvMirror,
-    env: &Env,
-    cwd: &Arc<Mutex<PathBuf>>,
-    path_dirs: &Arc<Mutex<Option<Vec<PathBuf>>>>,
-) -> Result<ProtocolSnapshot, String> {
-    let snapshot = ProtocolSnapshot::parse(session.snapshot()?)?;
-    mirror.apply(&snapshot, env, cwd, path_dirs);
-    Ok(snapshot)
-}
-
-fn session_path_dirs(env_vars: &[(OsString, OsString)], cwd: &std::path::Path) -> Vec<PathBuf> {
-    let Some((_, path)) = env_vars
-        .iter()
-        .rev()
-        .find(|(name, _)| name == OsStr::new("PATH"))
-    else {
-        return Vec::new();
-    };
-    std::env::split_paths(path)
-        .map(|dir| {
-            if dir.is_absolute() {
-                dir
-            } else {
-                cwd.join(dir)
-            }
-        })
-        .take(256)
-        .collect()
-}
+use transcript::{
+    REPL_PRINCIPAL, REPL_SESSION, effective_journal_state_dir, language_journal_requested,
+    latest_entry_id, now_ns, push_out_entry, resolve_out_undo,
+};
 
 pub(crate) fn repl(standalone: bool) -> Result<i32, String> {
     let cwd = std::env::current_dir().map_err(|e| format!("cannot determine cwd: {e}"))?;
@@ -618,161 +556,6 @@ fn open_history(max_entries: usize, path: &std::path::Path) -> Result<FileBacked
     }
     FileBackedHistory::with_file(max_entries, path.to_path_buf())
         .map_err(|error| format!("cannot open history file: {error}"))
-}
-
-/// Principal/session recorded on the REPL's own journal entries (site/content/internals/language-conformance-contract.md). A
-/// fixed, stable pair — the interactive REPL is always exactly one local
-/// human session — so `latest_entry_id`'s `principal` filter is deterministic.
-const REPL_PRINCIPAL: &str = "human";
-const REPL_SESSION: &str = "default";
-
-/// The per-user state dir the journal lives in. Mirrors `shoal-eval`'s
-/// private `default_state_dir()` exactly (used internally by
-/// `Evaluator::open_default_journal`, which this REPL does not call — it
-/// needs a *second* independent handle on the store instead, see `repl`)
-/// so both handles, and the kernel's own journal, agree on one on-disk
-/// journal per user.
-fn shoal_state_dir() -> PathBuf {
-    shoal_paths::ShoalPaths::discover()
-        .state_dir()
-        .to_path_buf()
-}
-
-fn effective_journal_state_dir(configured: Option<&Path>, cwd: &Path) -> PathBuf {
-    match configured {
-        Some(path) if path.is_absolute() => path.to_path_buf(),
-        Some(path) => cwd.join(path),
-        None => shoal_state_dir(),
-    }
-}
-
-fn language_journal_requested(configured: bool, protocol_backed: bool) -> bool {
-    configured && !protocol_backed
-}
-
-fn now_ns() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
-        .min(i64::MAX as u128) as i64
-}
-
-/// The newest `principal`-recorded journal entry at or after `since_ns` — the
-/// entry the statement just evaluated created, best-effort: only a *second*
-/// writer under the same principal appending in that narrow window (a second
-/// concurrent interactive session, say) could misattribute this, which is an
-/// acceptable bound for the single-user interactive REPL.
-fn latest_entry_id(journal: &Journal, principal: &str, since_ns: i64) -> Option<i64> {
-    let rows = journal
-        .query(&JournalQuery {
-            since_ts_ns: Some(since_ns),
-            principal: Some(principal.to_string()),
-            limit: 1,
-            ..Default::default()
-        })
-        .ok()?;
-    rows.first().map(|row| row.id)
-}
-
-/// `undo out[N]` resolution (site/content/internals/roadmap-and-priorities.md). The evaluator's `undo`
-/// builtin only ever accepts a bare journal entry id (`undo 12`) — per its
-/// own doc comment, "`out[n]` addressing is a REPL/host concern (the
-/// evaluator has no out→entry map)". `out` itself is just a plain,
-/// REPL-populated list of past values (`record_transcript`) with no tie to
-/// journal entry ids; only this host knows that mapping (`out_entries`,
-/// built alongside `record_transcript` in the REPL loop). This rewrites a
-/// literal `undo out[N]` (or `undo out[-N]`) in the freshly-parsed program
-/// into `undo <entry_id>` so it resolves via the existing `undo <id>` path.
-/// Any other shape — bare `undo`, `undo 12`, a non-literal index, an index
-/// with no recorded entry — is left untouched and falls through to the
-/// eval's existing behavior/diagnostics.
-fn resolve_out_undo(program: &mut Program, out_entries: &VecDeque<Option<i64>>) {
-    for stmt in &mut program.stmts {
-        let Stmt::Expr {
-            expr: Expr::Cmd { call, .. },
-            ..
-        } = stmt
-        else {
-            continue;
-        };
-        if call.head != "undo" || call.args.len() != 1 {
-            continue;
-        }
-        let Some(n) = out_index_literal(&call.args[0]) else {
-            continue;
-        };
-        let idx = if n >= 0 {
-            let Ok(index) = usize::try_from(n) else {
-                continue;
-            };
-            index
-        } else {
-            let Some(distance) = n
-                .checked_abs()
-                .and_then(|distance| usize::try_from(distance).ok())
-            else {
-                continue;
-            };
-            let Some(idx) = out_entries.len().checked_sub(distance) else {
-                continue;
-            };
-            idx
-        };
-        let Some(Some(entry_id)) = out_entries.get(idx) else {
-            continue;
-        };
-        let span = call.args[0].span();
-        call.args[0] = CmdArg::Expr {
-            expr: Expr::Int {
-                value: *entry_id,
-                span,
-            },
-            span,
-        };
-    }
-}
-
-/// Keep the host-only journal-id mirror aligned with the evaluator's bounded
-/// `out` window. Once the oldest value is evicted, index zero must refer to the
-/// next retained value in both collections or `undo out[n]` targets the wrong
-/// journal entry.
-fn push_out_entry(out_entries: &mut VecDeque<Option<i64>>, entry_id: Option<i64>) {
-    if out_entries.len() >= shoal_eval::MAX_REPL_TRANSCRIPT_VALUES {
-        out_entries.pop_front();
-    }
-    out_entries.push_back(entry_id);
-}
-
-/// The literal integer index `N` out of a `CmdArg` shaped like `out[N]` /
-/// `out[-N]` — `None` for anything else (a non-literal index, a receiver
-/// other than the `out` variable, or a differently-shaped argument).
-fn out_index_literal(arg: &CmdArg) -> Option<i64> {
-    let CmdArg::Expr {
-        expr: Expr::Index { recv, index, .. },
-        ..
-    } = arg
-    else {
-        return None;
-    };
-    let Expr::Var { name, .. } = recv.as_ref() else {
-        return None;
-    };
-    if name != "out" {
-        return None;
-    }
-    match index.as_ref() {
-        Expr::Int { value, .. } => Some(*value),
-        Expr::Unary {
-            op: UnOp::Neg,
-            expr,
-            ..
-        } => match expr.as_ref() {
-            Expr::Int { value, .. } => value.checked_neg(),
-            _ => None,
-        },
-        _ => None,
-    }
 }
 
 /// `fg <task>` (site/content/internals/roadmap-and-priorities.md): re-front a background task. There is no
