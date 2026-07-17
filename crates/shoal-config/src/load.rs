@@ -3,9 +3,19 @@
 
 use std::ffi::OsString;
 use std::fs;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use crate::{Config, ConfigError};
+
+/// Maximum bytes retained from any one layered `shoal.toml`. Configuration is
+/// a control-plane input, not a data transport; one MiB leaves ample room for
+/// large alias/environment maps while bounding startup memory and TOML work.
+pub const CONFIG_FILE_MAX_BYTES: usize = 1024 * 1024;
+/// Maximum bracket/inline-table nesting admitted before TOML parsing.
+pub const CONFIG_TOML_MAX_NESTING: usize = 64;
+/// Maximum UTF-8 bytes copied from one recognized environment override.
+pub const CONFIG_ENV_VALUE_MAX_BYTES: usize = 64 * 1024;
 
 /// The result of a successful [`load`]: the merged, validated config, any
 /// non-fatal warnings collected along the way (unknown keys — see
@@ -93,8 +103,9 @@ pub fn load(o: &LoadOptions) -> Result<Loaded, ConfigError> {
     let mut sources = Vec::new();
 
     for path in [&o.system, &o.user, &o.project].into_iter().flatten() {
-        match fs::read_to_string(path) {
-            Ok(text) => {
+        match read_config_file(path)? {
+            Some(text) => {
+                check_toml_nesting(path, &text)?;
                 let value: toml::Value = toml::from_str(&text).map_err(|e| ConfigError::Parse {
                     path: path.clone(),
                     message: e.to_string(),
@@ -108,13 +119,7 @@ pub fn load(o: &LoadOptions) -> Result<Loaded, ConfigError> {
                 merge(&mut merged, value);
                 sources.push(path.clone());
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                return Err(ConfigError::Io {
-                    path: path.clone(),
-                    message: e.to_string(),
-                });
-            }
+            None => {}
         }
     }
 
@@ -133,6 +138,136 @@ pub fn load(o: &LoadOptions) -> Result<Loaded, ConfigError> {
         warnings,
         sources,
     })
+}
+
+fn io_error(path: &Path, error: io::Error) -> ConfigError {
+    ConfigError::Io {
+        path: path.to_path_buf(),
+        message: error.to_string(),
+    }
+}
+
+/// Read one optional layer without trusting metadata length for allocation.
+/// The preliminary metadata check rejects ordinary directories/devices/FIFOs
+/// before open and follows symlinks, preserving symlink-to-file support. The
+/// bounded reader remains authoritative if the file grows after that check.
+fn read_config_file(path: &Path) -> Result<Option<String>, ConfigError> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(io_error(path, error)),
+    };
+    if !metadata.is_file() {
+        return Err(ConfigError::Io {
+            path: path.to_path_buf(),
+            message: "configuration layer is not a regular file".into(),
+        });
+    }
+    let file = fs::File::open(path).map_err(|error| io_error(path, error))?;
+    read_config_utf8(path, file).map(Some)
+}
+
+fn read_config_utf8(path: &Path, reader: impl Read) -> Result<String, ConfigError> {
+    let mut bytes = Vec::with_capacity(8 * 1024);
+    reader
+        .take((CONFIG_FILE_MAX_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| io_error(path, error))?;
+    if bytes.len() > CONFIG_FILE_MAX_BYTES {
+        return Err(ConfigError::TooLarge {
+            path: path.to_path_buf(),
+            max_bytes: CONFIG_FILE_MAX_BYTES,
+        });
+    }
+    String::from_utf8(bytes).map_err(|_| ConfigError::Utf8 {
+        path: path.to_path_buf(),
+    })
+}
+
+/// Reject bracket-shaped TOML recursion before invoking the TOML parser. This
+/// scanner deliberately tracks quoted strings/comments so data such as
+/// `template = "[[["` does not consume the structure budget.
+fn check_toml_nesting(path: &Path, text: &str) -> Result<(), ConfigError> {
+    #[derive(Clone, Copy)]
+    enum Quote {
+        Basic { triple: bool, escaped: bool },
+        Literal { triple: bool },
+    }
+
+    let bytes = text.as_bytes();
+    let mut quote = None;
+    let mut comment = false;
+    let mut depth = 0usize;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if comment {
+            if byte == b'\n' {
+                comment = false;
+            }
+            index += 1;
+            continue;
+        }
+        match quote {
+            Some(Quote::Basic {
+                triple,
+                mut escaped,
+            }) => {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"'
+                    && (!triple || bytes.get(index..index + 3) == Some(b"\"\"\""))
+                {
+                    quote = None;
+                    index += if triple { 3 } else { 1 };
+                    continue;
+                }
+                quote = Some(Quote::Basic { triple, escaped });
+            }
+            Some(Quote::Literal { triple }) => {
+                if byte == b'\'' && (!triple || bytes.get(index..index + 3) == Some(b"'''")) {
+                    quote = None;
+                    index += if triple { 3 } else { 1 };
+                    continue;
+                }
+            }
+            None => match byte {
+                b'#' => comment = true,
+                b'"' => {
+                    let triple = bytes.get(index..index + 3) == Some(b"\"\"\"");
+                    quote = Some(Quote::Basic {
+                        triple,
+                        escaped: false,
+                    });
+                    if triple {
+                        index += 2;
+                    }
+                }
+                b'\'' => {
+                    let triple = bytes.get(index..index + 3) == Some(b"'''");
+                    quote = Some(Quote::Literal { triple });
+                    if triple {
+                        index += 2;
+                    }
+                }
+                b'[' | b'{' => {
+                    depth += 1;
+                    if depth > CONFIG_TOML_MAX_NESTING {
+                        return Err(ConfigError::Complexity {
+                            path: path.to_path_buf(),
+                            max_nesting: CONFIG_TOML_MAX_NESTING,
+                        });
+                    }
+                }
+                b']' | b'}' => depth = depth.saturating_sub(1),
+                _ => {}
+            },
+        }
+        index += 1;
+    }
+    Ok(())
 }
 
 /// Deep-merge `src` into `dst`: a table merges key-by-key (so setting one
@@ -245,6 +380,15 @@ fn apply_env(v: &mut toml::Value, env: &[(OsString, OsString)]) -> Result<(), Co
                 message: "value is not UTF-8".into(),
             });
         };
+        if val.len() > CONFIG_ENV_VALUE_MAX_BYTES {
+            return Err(ConfigError::Env {
+                var: k.to_string(),
+                message: format!(
+                    "value is {} UTF-8 bytes; maximum is {CONFIG_ENV_VALUE_MAX_BYTES}",
+                    val.len()
+                ),
+            });
+        }
         let parsed = coerce_env(k, val, *kind)?;
         set_path(v, path, parsed).map_err(|message| ConfigError::Env {
             var: k.to_string(),
@@ -397,6 +541,19 @@ fn value_err(key: &str, message: impl Into<String>) -> ConfigError {
 mod tests {
     use super::*;
 
+    struct GrowingReader {
+        remaining: usize,
+    }
+
+    impl Read for GrowingReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let count = self.remaining.min(buf.len());
+            buf[..count].fill(b'x');
+            self.remaining -= count;
+            Ok(count)
+        }
+    }
+
     fn opts(
         system: Option<PathBuf>,
         user: Option<PathBuf>,
@@ -494,6 +651,106 @@ mod tests {
             }
             other => panic!("expected Parse, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn oversized_sparse_layer_is_rejected_before_toml() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("sparse.toml");
+        let file = fs::File::create(&p).unwrap();
+        file.set_len((CONFIG_FILE_MAX_BYTES + 1) as u64).unwrap();
+        let err = load(&opts(None, Some(p.clone()), None, vec![])).unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::TooLarge {
+                path: p,
+                max_bytes: CONFIG_FILE_MAX_BYTES,
+            }
+        );
+    }
+
+    #[test]
+    fn growing_reader_stops_after_the_limit_sentinel() {
+        let p = Path::new("growing.toml");
+        let err = read_config_utf8(
+            p,
+            GrowingReader {
+                remaining: CONFIG_FILE_MAX_BYTES * 4,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::TooLarge {
+                path: p.to_path_buf(),
+                max_bytes: CONFIG_FILE_MAX_BYTES,
+            }
+        );
+    }
+
+    #[test]
+    fn non_utf8_layer_has_a_path_aware_error() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("binary.toml");
+        fs::write(&p, [b'v', 0xff]).unwrap();
+        assert_eq!(
+            load(&opts(None, Some(p.clone()), None, vec![])).unwrap_err(),
+            ConfigError::Utf8 { path: p }
+        );
+    }
+
+    #[test]
+    fn deeply_nested_toml_is_rejected_before_deserialization() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("deep.toml");
+        fs::write(
+            &p,
+            format!(
+                "unknown = {}0{}\n",
+                "[".repeat(CONFIG_TOML_MAX_NESTING + 1),
+                "]".repeat(CONFIG_TOML_MAX_NESTING + 1)
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            load(&opts(None, Some(p.clone()), None, vec![])).unwrap_err(),
+            ConfigError::Complexity {
+                path: p,
+                max_nesting: CONFIG_TOML_MAX_NESTING,
+            }
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_to_regular_layer_remains_supported() {
+        use std::os::unix::fs::symlink;
+
+        let t = tempfile::tempdir().unwrap();
+        let target = t.path().join("target.toml");
+        let link = t.path().join("link.toml");
+        fs::write(&target, "[prompt]\ntemplate = 'linked'\n").unwrap();
+        symlink(&target, &link).unwrap();
+        let loaded = load(&opts(None, Some(link.clone()), None, vec![])).unwrap();
+        assert_eq!(loaded.config.prompt.template, "linked");
+        assert_eq!(loaded.sources, vec![link]);
+    }
+
+    #[test]
+    fn recognized_env_string_cannot_amplify_config_without_bound() {
+        let huge = "x".repeat(CONFIG_ENV_VALUE_MAX_BYTES + 1);
+        let err = load(&opts(
+            None,
+            None,
+            None,
+            vec![("SHOAL_PROMPT_TEMPLATE", &huge)],
+        ))
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Env { ref var, ref message }
+                if var == "SHOAL_PROMPT_TEMPLATE" && message.contains("maximum")
+        ));
     }
 
     #[test]
