@@ -26,7 +26,7 @@ use shoal_proto::error_code::*;
 use shoal_proto::*;
 use shoal_value::Value;
 use std::collections::{HashMap, VecDeque};
-use std::io::{self, BufReader};
+use std::io::{self, BufRead, BufReader};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -44,6 +44,7 @@ pub struct Kernel {
     max_tasks_per_session: AtomicUsize,
     max_ptys_per_session: AtomicUsize,
     max_subscriptions_per_session: AtomicUsize,
+    frame_read_timeout_ms: AtomicU64,
     journal: Mutex<Journal>,
     /// The per-user state dir this kernel's own `journal` (above) was opened
     /// against, if any (`None` for the ephemeral in-memory kernels used by
@@ -90,6 +91,9 @@ pub struct Limits {
     pub max_tasks_per_session: usize,
     pub max_ptys_per_session: usize,
     pub max_subscriptions_per_session: usize,
+    /// Deadline for an unauthenticated connection's first byte and for the
+    /// remainder of any frame once its first byte arrives. Zero disables it.
+    pub frame_read_timeout_ms: u64,
 }
 
 impl Default for Limits {
@@ -99,6 +103,7 @@ impl Default for Limits {
             max_tasks_per_session: 128,
             max_ptys_per_session: 32,
             max_subscriptions_per_session: 256,
+            frame_read_timeout_ms: 10_000,
         }
     }
 }
@@ -407,6 +412,7 @@ impl Kernel {
             max_tasks_per_session: AtomicUsize::new(limits.max_tasks_per_session),
             max_ptys_per_session: AtomicUsize::new(limits.max_ptys_per_session),
             max_subscriptions_per_session: AtomicUsize::new(limits.max_subscriptions_per_session),
+            frame_read_timeout_ms: AtomicU64::new(limits.frame_read_timeout_ms),
             journal: Mutex::new(Journal::in_memory().expect("in-memory journal")),
             state_dir: None,
             policy: permissive_policy(),
@@ -447,6 +453,7 @@ impl Kernel {
             max_tasks_per_session: AtomicUsize::new(limits.max_tasks_per_session),
             max_ptys_per_session: AtomicUsize::new(limits.max_ptys_per_session),
             max_subscriptions_per_session: AtomicUsize::new(limits.max_subscriptions_per_session),
+            frame_read_timeout_ms: AtomicU64::new(limits.frame_read_timeout_ms),
             journal: Mutex::new(journal),
             state_dir: Some(state_dir.to_path_buf()),
             policy: permissive_policy(),
@@ -484,6 +491,7 @@ impl Kernel {
             max_tasks_per_session: AtomicUsize::new(limits.max_tasks_per_session),
             max_ptys_per_session: AtomicUsize::new(limits.max_ptys_per_session),
             max_subscriptions_per_session: AtomicUsize::new(limits.max_subscriptions_per_session),
+            frame_read_timeout_ms: AtomicU64::new(limits.frame_read_timeout_ms),
             journal: Mutex::new(journal),
             state_dir: Some(state_dir.to_path_buf()),
             policy,
@@ -513,6 +521,7 @@ impl Kernel {
             max_tasks_per_session: AtomicUsize::new(limits.max_tasks_per_session),
             max_ptys_per_session: AtomicUsize::new(limits.max_ptys_per_session),
             max_subscriptions_per_session: AtomicUsize::new(limits.max_subscriptions_per_session),
+            frame_read_timeout_ms: AtomicU64::new(limits.frame_read_timeout_ms),
             journal: Mutex::new(Journal::in_memory().expect("in-memory journal")),
             state_dir: None,
             policy,
@@ -541,6 +550,8 @@ impl Kernel {
             .store(limits.max_ptys_per_session, Ordering::Relaxed);
         self.max_subscriptions_per_session
             .store(limits.max_subscriptions_per_session, Ordering::Relaxed);
+        self.frame_read_timeout_ms
+            .store(limits.frame_read_timeout_ms, Ordering::Relaxed);
     }
 
     fn reserve_connection_slot(self: &Arc<Self>) -> Result<ConnectionSlot, ()> {
@@ -614,7 +625,23 @@ impl Kernel {
         let writer: SharedWriter = Arc::new(Mutex::new(stream));
         let mut attached: Option<Attachment> = None;
         let result = (|| -> io::Result<()> {
-            while let Some(request) = read_frame(&mut reader)? {
+            loop {
+                let timeout_ms = self.frame_read_timeout_ms.load(Ordering::Relaxed);
+                // Before authentication, a client must begin its first frame
+                // within the deadline. Once attached, an entirely idle client
+                // may remain subscribed indefinitely; after the first byte of
+                // any new frame, however, the same deadline bounds completion.
+                set_read_deadline(
+                    reader.get_ref(),
+                    (attached.is_none() && timeout_ms != 0).then_some(timeout_ms),
+                )?;
+                if reader.fill_buf()?.is_empty() {
+                    break;
+                }
+                set_read_deadline(reader.get_ref(), (timeout_ms != 0).then_some(timeout_ms))?;
+                let Some(request) = read_frame(&mut reader)? else {
+                    break;
+                };
                 let id = request.id.clone();
                 let response = if request.jsonrpc != JSONRPC {
                     Response::err(id, INVALID_REQUEST, "invalid JSON-RPC version", None)
@@ -846,6 +873,10 @@ impl Kernel {
             .append_completed(&record, Some(0), true, 0)
             .map_err(internal)
     }
+}
+
+fn set_read_deadline(stream: &UnixStream, timeout_ms: Option<u64>) -> io::Result<()> {
+    stream.set_read_timeout(timeout_ms.map(std::time::Duration::from_millis))
 }
 
 fn task_record(task: &Arc<TaskEntry>) -> TaskRecord {
@@ -1346,6 +1377,54 @@ mod tests {
         assert_eq!(kernel.active_connections.load(Ordering::SeqCst), 1);
         drop(reservations);
         assert_eq!(kernel.active_connections.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn read_deadline_evicts_silent_and_partial_unauthenticated_connections() {
+        use std::io::{Read, Write};
+
+        for initial in [b"".as_slice(), b"{".as_slice()] {
+            let kernel = Kernel::new();
+            kernel.configure_limits(Limits {
+                max_connections: 1,
+                frame_read_timeout_ms: 40,
+                ..Limits::default()
+            });
+            let slot = kernel.reserve_connection_slot().unwrap();
+            let (mut client, server) = UnixStream::pair().unwrap();
+            client
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            if !initial.is_empty() {
+                client.write_all(initial).unwrap();
+            }
+            let worker_kernel = kernel.clone();
+            let worker = std::thread::spawn(move || {
+                let _slot = slot;
+                worker_kernel.handle_stream(server)
+            });
+            let mut byte = [0u8; 1];
+            assert_eq!(client.read(&mut byte).unwrap(), 0, "connection was closed");
+            assert!(worker.join().unwrap().is_err(), "deadline is observable");
+            assert_eq!(kernel.active_connections.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn attached_idle_connection_is_not_subject_to_first_byte_deadline() {
+        let kernel = Kernel::new();
+        kernel.configure_limits(Limits {
+            frame_read_timeout_ms: 40,
+            ..Limits::default()
+        });
+        let (mut client, mut reader, server) = spawn(&kernel);
+        attach(&mut client, &mut reader);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let response = call(&mut client, &mut reader, 2, "parse", json!({"src":"1 + 2"}));
+        assert!(response.error.is_none(), "attached idle client stayed live");
+        drop(client);
+        drop(reader);
+        server.join().unwrap();
     }
 
     #[test]

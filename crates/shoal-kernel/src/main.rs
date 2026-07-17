@@ -135,6 +135,7 @@ struct Args {
     max_tasks_per_session: Option<usize>,
     max_ptys_per_session: Option<usize>,
     max_subscriptions_per_session: Option<usize>,
+    frame_read_timeout_ms: Option<u64>,
 }
 impl Args {
     fn parse(mut it: impl Iterator<Item = std::ffi::OsString>) -> Result<Self, String> {
@@ -147,6 +148,7 @@ impl Args {
             max_tasks_per_session: None,
             max_ptys_per_session: None,
             max_subscriptions_per_session: None,
+            frame_read_timeout_ms: None,
         };
         let parse_usize = |key: &std::ffi::OsString,
                            value: std::ffi::OsString|
@@ -178,7 +180,19 @@ impl Args {
                     a.max_subscriptions_per_session =
                         Some(parse_usize(&k, it.next().ok_or_else(&missing)?)?)
                 }
-                Some("-h" | "--help") => return Err("usage: shoal-kernel [--session NAME] [--socket PATH] [--state-dir PATH] [--policy FILE] [--max-connections N] [--max-tasks-per-session N] [--max-ptys-per-session N] [--max-subscriptions-per-session N]".into()),
+                Some("--frame-read-timeout-ms") => {
+                    a.frame_read_timeout_ms = Some(
+                        it.next()
+                            .ok_or_else(&missing)?
+                            .to_str()
+                            .and_then(|text| text.parse().ok())
+                            .ok_or_else(|| {
+                                "--frame-read-timeout-ms requires a non-negative integer"
+                                    .to_string()
+                            })?,
+                    )
+                }
+                Some("-h" | "--help") => return Err("usage: shoal-kernel [--session NAME] [--socket PATH] [--state-dir PATH] [--policy FILE] [--max-connections N] [--max-tasks-per-session N] [--max-ptys-per-session N] [--max-subscriptions-per-session N] [--frame-read-timeout-ms N]".into()),
                 _ => return Err(format!("unknown argument {}", k.to_string_lossy())),
             }
         }
@@ -198,6 +212,9 @@ impl Args {
             max_subscriptions_per_session: self
                 .max_subscriptions_per_session
                 .unwrap_or(defaults.max_subscriptions_per_session),
+            frame_read_timeout_ms: self
+                .frame_read_timeout_ms
+                .unwrap_or(defaults.frame_read_timeout_ms),
         }
     }
 }
@@ -213,14 +230,22 @@ mod tests {
     #[test]
     fn quota_flags_override_only_the_named_limits() {
         let args = Args::parse(
-            ["--max-connections", "10", "--max-ptys-per-session", "3"]
-                .into_iter()
-                .map(std::ffi::OsString::from),
+            [
+                "--max-connections",
+                "10",
+                "--max-ptys-per-session",
+                "3",
+                "--frame-read-timeout-ms",
+                "2500",
+            ]
+            .into_iter()
+            .map(std::ffi::OsString::from),
         )
         .unwrap();
         let limits = args.resolved_limits();
         assert_eq!(limits.max_connections, 10);
         assert_eq!(limits.max_ptys_per_session, 3);
+        assert_eq!(limits.frame_read_timeout_ms, 2500);
         assert_eq!(
             limits.max_tasks_per_session,
             Limits::default().max_tasks_per_session
