@@ -83,7 +83,7 @@ impl Kernel {
                     #[cfg(test)]
                     "test.panic_evaluator" => {
                         let attachment = attached.as_ref().ok_or_else(not_attached)?;
-                        let _evaluator = attachment.session.evaluator.lock().unwrap();
+                        let _evaluator = attachment.session.lock_evaluator()?;
                         panic!("injected evaluator panic")
                     }
                     _ => Err(RpcError {

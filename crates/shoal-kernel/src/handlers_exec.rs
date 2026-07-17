@@ -105,6 +105,26 @@ impl Kernel {
                             data: None,
                         }),
                     });
+                    let response_result_ref = response
+                        .result
+                        .as_ref()
+                        .and_then(|result| result.get("ref"))
+                        .and_then(Json::as_str)
+                        .map(|value| Ref(value.into()));
+                    let outcome_result = if response.error.is_none() {
+                        match response_result_ref.as_ref() {
+                            Some(result_ref) => worker_session
+                                .lock_transcript()
+                                .map(|values| values.get(result_ref).cloned()),
+                            None => Ok(None),
+                        }
+                    } else {
+                        Ok(None)
+                    };
+                    let (outcome, transcript_error) = match outcome_result {
+                        Ok(outcome) => (outcome, None),
+                        Err(error) => (None, Some(error)),
+                    };
                     let exit_payload;
                     let active_slot;
                     {
@@ -117,6 +137,9 @@ impl Kernel {
                                 "failed"
                             };
                             inner.error = Some(error);
+                        } else if let Some(error) = transcript_error {
+                            inner.state = "failed";
+                            inner.error = Some(error);
                         } else {
                             inner.exit_code = response
                                 .result
@@ -124,12 +147,7 @@ impl Kernel {
                                 .and_then(|result| result.get("exit_code"))
                                 .and_then(Json::as_i64)
                                 .and_then(|code| i32::try_from(code).ok());
-                            inner.result_ref = response
-                                .result
-                                .as_ref()
-                                .and_then(|r| r.get("ref"))
-                                .and_then(Json::as_str)
-                                .map(|s| Ref(s.into()));
+                            inner.result_ref = response_result_ref;
                             // The eval position most callers use for a
                             // background/timed run (`position:"value"`, the MCP
                             // facade's default) captures a failing or
@@ -143,9 +161,6 @@ impl Kernel {
                             // cancellation was requested is `cancelled`; any
                             // other non-ok outcome is `failed`; only a truly
                             // successful result is `completed`.
-                            let outcome = inner.result_ref.as_ref().and_then(|r| {
-                                worker_session.transcript.lock().unwrap().get(r).cloned()
-                            });
                             inner.state = match &outcome {
                                 Some(Value::Outcome(o)) if !o.ok => {
                                     if task.cancel_requested.load(Ordering::SeqCst)
@@ -216,7 +231,7 @@ impl Kernel {
                 return Err(error);
             }
             if let Some(result_ref) = result_ref {
-                let values = session.transcript.lock().unwrap();
+                let values = session.lock_transcript()?;
                 if let Some(value) = values.get(&result_ref) {
                     let budget = ElideBudget::from_spec(elide_spec.as_ref());
                     let uri = short_ref_to_uri(&result_ref, None);
@@ -233,7 +248,7 @@ impl Kernel {
             return encode(json!({"task":task_ref,"events":events_channel}));
         }
         if params.mode == "plan" {
-            let mut evaluator = session.evaluator.lock().unwrap();
+            let mut evaluator = session.lock_evaluator()?;
             let mut ast = shoal_syntax::parse_with_ctx(
                 &params.src,
                 parse_ctx_for_kernel(evaluator.env(), interactive),
@@ -331,7 +346,7 @@ impl Kernel {
         // functions, `it`, and `out` determine command-vs-expression
         // dispatch. Hold the evaluator lock from context construction through
         // evaluation so an async worker cannot parse against a stale Env.
-        let mut evaluator = session.evaluator.lock().unwrap();
+        let mut evaluator = session.lock_evaluator()?;
         let mut ast = shoal_syntax::parse_with_ctx(
             &params.src,
             parse_ctx_for_kernel(evaluator.env(), interactive),
@@ -634,7 +649,7 @@ impl Kernel {
             .and_then(|rows| rows.first().map(|row| row.id));
         session.push_out_entry(evaluator_entry_id);
         let value_ref = Ref::new("out", session.next_value.fetch_add(1, Ordering::Relaxed));
-        session.insert_transcript(value_ref.clone(), value.clone());
+        session.insert_transcript_checked(value_ref.clone(), value.clone())?;
         let render = shoal_value::render::render_block(&value, 80);
         // Built once, up front: this SAME payload is both persisted durably
         // (so the `session.transcript` channel can replay it after it ages
@@ -785,6 +800,32 @@ mod tests {
             "pre-cancelled queued task did not stop promptly: {:?}",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn async_evaluator_poison_finishes_task_as_typed_failure() {
+        let kernel = Kernel::new();
+        let (session, mut attached) = attached(&kernel, "async-session-poison");
+        let poisoner = session.clone();
+        let thread = std::thread::spawn(move || {
+            let _evaluator = poisoner.evaluator.lock().unwrap();
+            panic!("inject async evaluator poison");
+        });
+        assert!(thread.join().is_err());
+
+        // Call the handler directly so registration can occur; the worker's
+        // recursive dispatch is the boundary that must observe quarantine and
+        // turn it into a terminal Task error rather than unwind.
+        let background = kernel
+            .handle_exec(json!({"src":"1 + 1", "async":true}), 1, &mut attached)
+            .expect("poisoned session still registers a worker for this regression");
+        let task: Ref = serde_json::from_value(background["task"].clone()).unwrap();
+        let record = kernel
+            .handle_task_await(json!({"task":task}), &mut attached)
+            .expect("task reaches a terminal record");
+        assert_eq!(record["state"], "failed");
+        assert_eq!(record["error"]["code"], INTERNAL_ERROR);
+        assert_eq!(record["error"]["data"]["session_quarantined"], true);
     }
 
     #[test]
