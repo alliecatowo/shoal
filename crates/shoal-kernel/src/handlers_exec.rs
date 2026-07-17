@@ -242,7 +242,31 @@ impl Kernel {
                 verdict: verdict_name(verdict).into(),
                 approval_pending: verdict == Verdict::ApprovalRequired,
             };
-            self.plans.lock().unwrap().insert(
+            let mut plans = self.plans.lock().unwrap();
+            plans.retain(|_, stored| !plan_expired(stored));
+            let owner_plans = plans
+                .values()
+                .filter(|stored| stored.session == session.id && stored.principal == actor)
+                .collect::<Vec<_>>();
+            let owner_source_bytes = owner_plans
+                .iter()
+                .map(|stored| stored.src.len())
+                .sum::<usize>();
+            if owner_plans.len() >= MAX_STORED_PLANS_PER_OWNER
+                || owner_source_bytes.saturating_add(params.src.len())
+                    > MAX_PLAN_SOURCE_BYTES_PER_OWNER
+            {
+                return Err(RpcError {
+                    code: QUOTA_EXCEEDED,
+                    message: "stored plan quota reached".into(),
+                    data: Some(json!({
+                        "limit": "stored_plans_per_owner",
+                        "max_count": MAX_STORED_PLANS_PER_OWNER,
+                        "max_source_bytes": MAX_PLAN_SOURCE_BYTES_PER_OWNER,
+                    })),
+                });
+            }
+            plans.insert(
                 plan.plan_ref.clone(),
                 StoredPlan {
                     src: params.src,
@@ -256,8 +280,10 @@ impl Kernel {
                         Verdict::ApprovalRequired => PlanAuthorization::Pending,
                         Verdict::Deny => PlanAuthorization::Denied,
                     },
+                    created_at: Instant::now(),
                 },
             );
+            drop(plans);
             if verdict == Verdict::ApprovalRequired {
                 // site/content/internals/kernel-protocol.md: a plan stuck at `approval_pending` is
                 // exactly the moment another principal (a human's session, a
@@ -301,6 +327,14 @@ impl Kernel {
             let actual_hash =
                 bound_plan_hash(&params.src, &ast_json, &run_plan, &session.id, &actor);
             let mut plans = self.plans.lock().unwrap();
+            if plans.get(plan_ref).is_some_and(plan_expired) {
+                plans.remove(plan_ref);
+                return Err(RpcError {
+                    code: UNKNOWN_PLAN,
+                    message: "unknown or expired plan_ref".into(),
+                    data: Some(json!({"plan_ref": plan_ref})),
+                });
+            }
             let stored = plans.get_mut(plan_ref).ok_or_else(|| RpcError {
                 code: UNKNOWN_PLAN,
                 message: "unknown plan_ref".into(),
@@ -491,15 +525,10 @@ impl Kernel {
                 // so the agent can `shoal_get` the structured error
                 // (code/msg/span/hint) instead of parsing message text.
                 let value_ref = Ref::new("out", session.next_value.fetch_add(1, Ordering::Relaxed));
-                session.transcript.lock().unwrap().insert(
+                session.insert_transcript(
                     value_ref.clone(),
                     Value::Error(std::sync::Arc::new(e.clone())),
                 );
-                session
-                    .client_it
-                    .lock()
-                    .unwrap()
-                    .insert(client, value_ref.clone());
                 let uri = short_ref_to_uri(&value_ref, None);
                 return Err(RpcError {
                     code: RAISED,
@@ -513,16 +542,7 @@ impl Kernel {
             }
         };
         let value_ref = Ref::new("out", session.next_value.fetch_add(1, Ordering::Relaxed));
-        session
-            .transcript
-            .lock()
-            .unwrap()
-            .insert(value_ref.clone(), value.clone());
-        session
-            .client_it
-            .lock()
-            .unwrap()
-            .insert(client, value_ref.clone());
+        session.insert_transcript(value_ref.clone(), value.clone());
         let render = shoal_value::render::render_block(&value, 80);
         // Built once, up front: this SAME payload is both persisted durably
         // (so the `session.transcript` channel can replay it after it ages

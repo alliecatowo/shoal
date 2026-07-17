@@ -164,7 +164,10 @@ impl Kernel {
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
         let session = &attachment.session;
         let p: PlanApplyParams = decode(params)?;
-        let plans = self.plans.lock().unwrap();
+        let mut plans = self.plans.lock().unwrap();
+        if plans.get(&p.plan_ref).is_some_and(plan_expired) {
+            plans.remove(&p.plan_ref);
+        }
         let stored = plans.get(&p.plan_ref).ok_or_else(|| RpcError {
             code: UNKNOWN_PLAN,
             message: "unknown or expired plan_ref".into(),
@@ -212,7 +215,8 @@ impl Kernel {
     ) -> Result<Json, RpcError> {
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
         let session = &attachment.session;
-        let plans = self.plans.lock().unwrap();
+        let mut plans = self.plans.lock().unwrap();
+        plans.retain(|_, stored| !plan_expired(stored));
         let records: Vec<Json> = plans
             .values()
             .filter(|sp| sp.session == session.id && sp.principal == attachment.principal)
@@ -241,7 +245,10 @@ impl Kernel {
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
         let session = &attachment.session;
         let p: PlanApplyParams = decode(params)?;
-        let plans = self.plans.lock().unwrap();
+        let mut plans = self.plans.lock().unwrap();
+        if plans.get(&p.plan_ref).is_some_and(plan_expired) {
+            plans.remove(&p.plan_ref);
+        }
         let stored = plans.get(&p.plan_ref).ok_or_else(|| RpcError {
             code: UNKNOWN_PLAN,
             message: "unknown plan_ref".into(),
@@ -354,6 +361,9 @@ impl Kernel {
         // copies the immutable binding from the exact object we approved.
         let (plan_effect_kinds, requester) = {
             let mut plans = self.plans.lock().unwrap();
+            if plans.get(&plan_ref).is_some_and(plan_expired) {
+                plans.remove(&plan_ref);
+            }
             let stored = plans.get_mut(&plan_ref).ok_or_else(|| RpcError {
                 code: UNKNOWN_PLAN,
                 message: "unknown plan_ref".into(),

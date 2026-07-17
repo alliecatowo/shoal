@@ -31,8 +31,25 @@ pub(crate) struct Session {
     /// must not stall `events.publish`).
     pub(crate) lang_bus: Arc<shoal_eval::EventBus>,
     pub(crate) transcript: Mutex<HashMap<Ref, Value>>,
-    pub(crate) client_it: Mutex<HashMap<u64, Ref>>,
     pub(crate) next_value: AtomicU64,
+}
+
+pub(crate) const MAX_TRANSCRIPT_PER_SESSION: usize = 4096;
+
+impl Session {
+    pub(crate) fn insert_transcript(&self, value_ref: Ref, value: Value) {
+        let id = value_ref
+            .0
+            .split_once(':')
+            .and_then(|(_, id)| id.parse::<u64>().ok());
+        let mut transcript = self.transcript.lock().unwrap();
+        transcript.insert(value_ref, value);
+        if let Some(id) = id
+            && id > MAX_TRANSCRIPT_PER_SESSION as u64
+        {
+            transcript.remove(&Ref::new("out", id - MAX_TRANSCRIPT_PER_SESSION as u64));
+        }
+    }
 }
 
 impl Kernel {
@@ -105,7 +122,6 @@ impl Kernel {
             evaluator: Mutex::new(evaluator),
             lang_bus,
             transcript: Mutex::new(HashMap::new()),
-            client_it: Mutex::new(HashMap::new()),
             next_value: AtomicU64::new(1),
         });
         sessions.insert(name.into(), session.clone());

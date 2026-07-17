@@ -188,6 +188,9 @@ impl Drop for QuotaPermit {
 }
 
 const MAX_FINISHED_TASKS_PER_SESSION: usize = 512;
+const PLAN_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+const MAX_STORED_PLANS_PER_OWNER: usize = 256;
+const MAX_PLAN_SOURCE_BYTES_PER_OWNER: usize = 64 * 1024 * 1024;
 
 struct StoredPlan {
     src: String,
@@ -203,6 +206,11 @@ struct StoredPlan {
     source_hash: String,
     plan: Plan,
     authorization: PlanAuthorization,
+    created_at: Instant,
+}
+
+fn plan_expired(plan: &StoredPlan) -> bool {
+    plan.created_at.elapsed() > PLAN_TTL
 }
 
 /// Authorization is a one-way state machine. An explicit approval is a
@@ -1315,6 +1323,70 @@ mod tests {
             "pty.close",
             json!({"pty_id": next_id}),
         );
+        drop(client);
+        drop(reader);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn transcript_is_bounded_at_insertion_time() {
+        let kernel = Kernel::new();
+        let session = kernel.session("bounded", &principal()).unwrap();
+        for id in 1..=(MAX_TRANSCRIPT_PER_SESSION as u64 + 1) {
+            session.insert_transcript(Ref::new("out", id), Value::Int(id as i64));
+        }
+        let transcript = session.transcript.lock().unwrap();
+        assert_eq!(transcript.len(), MAX_TRANSCRIPT_PER_SESSION);
+        assert!(!transcript.contains_key(&Ref::new("out", 1)));
+        assert!(transcript.contains_key(&Ref::new("out", MAX_TRANSCRIPT_PER_SESSION as u64 + 1)));
+    }
+
+    #[test]
+    fn expired_plan_is_rejected_before_it_can_execute() {
+        let policy = Policy::from_toml(&format!(
+            "[principal.\"{}\"]\nopaque='ask'\nauto_apply='never'\n",
+            principal()
+        ))
+        .unwrap();
+        let kernel = Kernel::with_policy(policy);
+        kernel.set_allow_self_ack(true);
+        let (mut client, mut reader, server) = spawn(&kernel);
+        attach(&mut client, &mut reader);
+        let plan_ref = call(
+            &mut client,
+            &mut reader,
+            2,
+            "exec",
+            json!({"src":"sh { echo expired }","mode":"plan"}),
+        )
+        .result
+        .unwrap()["plan_ref"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        call(
+            &mut client,
+            &mut reader,
+            3,
+            "cap.request",
+            json!({"plan_ref": plan_ref}),
+        );
+        kernel
+            .plans
+            .lock()
+            .unwrap()
+            .get_mut(&plan_ref)
+            .unwrap()
+            .created_at = Instant::now() - PLAN_TTL - std::time::Duration::from_secs(1);
+        let apply = call(
+            &mut client,
+            &mut reader,
+            4,
+            "plan.apply",
+            json!({"plan_ref": plan_ref}),
+        );
+        assert_eq!(apply.error.unwrap().code, UNKNOWN_PLAN);
+        assert!(!kernel.plans.lock().unwrap().contains_key(&plan_ref));
         drop(client);
         drop(reader);
         server.join().unwrap();
