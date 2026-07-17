@@ -264,59 +264,60 @@ does share the evaluator's effect ports and most session machinery because it ru
 
 ## Child evaluator inheritance
 
-Fresh child evaluators used by concurrency/script features must be configured deliberately. The
-`inherit_ports` helper clones `Fs`, `Exec`, `Clock`, `Opener`, `SecretPort`, and `ConfigPort`. The
-language event bus is also explicitly shared where cross-task coordination is promised. The journal
-is intentionally not inherited because its handle is neither a shared transaction coordinator nor
-`Sync`.
+Fresh child evaluators used by concurrency/script features — `spawn { }` (`script.rs::spawn_block`),
+a `.shl` script (`script.rs::run_script_file`), `parallel(...)` (`host.rs::builtin_parallel`), and
+`on(channel, handler)` (`channels.rs::builtin_on`) — are built through **one authoritative
+constructor** (`child_context.rs`). `Evaluator::child_context` captures the whole inheritable session
+context in one place; `ChildContext::build(scope, cancel)` re-applies it to a fresh evaluator. This
+is the *only* supported way to derive a child from a parent: there is no partial `inherit_ports`/
+`set_bus` seam a call site can under-inherit, and because `build` destructures the captured struct,
+forgetting to re-apply a captured field is a compile error rather than a silent security regression.
 
-Before adding a child-evaluator site, audit this matrix:
+`ChildContext` propagates, by construction: the lexical env (per `ChildScope`), process env, cwd,
+adapter catalog, all effect ports (`Fs`/`Exec`/`Clock`/`Opener`/`SecretPort`/`ConfigPort`), the leash
+policy/principal, the full reef state (scope chain, resolver, lock + lock path, user manifest, and
+`with reef:` overrides), the event bus, and the journal *session identity* (`session_id`/`principal`).
+The cancellation token is passed explicitly: `spawn`/`on` wire a *fresh* token to the task's cancel
+hook (so cancelling the task cancels the child), while a synchronous `.shl` script and a `parallel`
+batch inherit the parent's token (so a host cancel reaches them).
 
-| Capability | Usually inherit? | Reason |
+Deliberately *not* inherited — a child gets fresh state, each documented inline at the `build` seam:
+
+| Capability | Inherited? | Reason |
 |---|---:|---|
-| effect ports | yes | fake/test/host behavior must remain consistent |
+| effect ports + config | yes | fake/test/host behavior must stay consistent |
+| adapter catalog | yes | otherwise command resolution diverges |
 | event bus | yes | session channels are cross-task coordination |
-| lexical env | feature-dependent | closure children need capture; standalone scripts may not |
-| process environment/cwd | usually snapshot | commands need the caller's dynamic context |
-| adapter catalog | yes when command semantics promise it | otherwise resolution diverges |
-| Reef settings | yes when invoking tools | otherwise constrained commands diverge |
-| Leash principal/policy | yes | a child must not escape confinement |
-| journal handle | no today | single-handle ownership and concurrency semantics unresolved |
-| sink | generally no/direct result channel | competing mutable renderers are unsafe |
-
-### Critical: current children do not satisfy that matrix
-
-The table above is the required security/semantic rule, not a description of current completeness.
-Four production paths construct `Evaluator::new` and manually copy only a subset:
-
-| Child path | Source | Important current omissions |
-|---|---|---|
-| `spawn { ... }` | `script.rs::spawn_block` | Leash policy/principal; Reef chain/resolver/user scope/overrides |
-| `.shl` child runner | `script.rs::run_script_file` | Leash policy/principal; Reef chain/resolver/user scope/overrides |
-| `parallel(...)` | `host.rs::builtin_parallel` | Leash; Reef state; `ConfigPort`; event bus |
-| `on(channel, handler)` | `channels.rs::builtin_on` | Leash; Reef state; `ConfigPort` |
-
-`inherit_ports` itself clones only filesystem, exec, clock, opener, secrets, and config. It cannot
-inherit Leash or Reef, and several child sites do not call it, instead manually copying an even
-smaller set. Consequently external work executed inside a child of a constrained parent can reach
-`resolve_sandbox() == None` and run without the parent's Leash policy; tool resolution can ignore the
-parent's Reef scope/resolver/overrides; config namespace reads can return the empty default.
+| leash policy/principal | yes | a child must not escape confinement |
+| reef scope/resolver/lock/overrides | yes | constrained tool resolution must not diverge |
+| journal session identity | yes | attribution matches the parent |
+| lexical env | per `ChildScope` | closure/`spawn`/`parallel`/`on` children inherit; a `.shl` script gets a fresh root so its `let`s do not leak |
+| process env / cwd | yes (snapshot) | commands need the caller's dynamic context |
+| cancellation token | explicit arg | fresh + task-wired for `spawn`/`on`; parent's for script/`parallel` |
+| journal handle | no | single-handle ownership / not `Sync` (identity is still inherited) |
+| sink / interactive / echo mode | no | a child returns a value; it never owns the terminal or a renderer |
+| per-session tables (`jobs`, `modules`, `plans`, `dir_stack`, `it`, …) | no | a child is its own session |
 
 ```mermaid
 flowchart TD
-accTitle: Critical: current children do not satisfy that matrix
-accDescr: Shows the components and relationships described in Critical: current children do not satisfy that matrix.
-  Parent["parent Evaluator\nLeash + Reef + Config"] --> ChildNew["Evaluator::new(cwd)"]
-  ChildNew --> Manual["manual field/port copies"]
-  Manual --> Missing["Leash=None\nReef defaults\npossibly empty Config"]
-  Missing --> Spawn["child external command"]
-  Spawn --> Unconfined["resolve_sandbox() → None"]
-  Spawn --> Diverged["different tool/config resolution"]
+accTitle: One authoritative child-evaluator constructor
+accDescr: Shows how every child route builds through ChildContext.
+  Parent["parent Evaluator\nLeash + Reef + Config + Bus"] --> Ctx["Evaluator::child_context()"]
+  Ctx --> Build["ChildContext::build(scope, cancel)"]
+  Build --> Child["child Evaluator\nfull context inherited"]
+  Spawn["spawn { }"] --> Ctx
+  Script[".shl run_script_file"] --> Ctx
+  Parallel["parallel(...)"] --> Ctx
+  On["on(channel, handler)"] --> Ctx
+  Child --> Confined["resolve_sandbox / spawn gate\nhonor the parent's Leash"]
 ```
 
-This is critical architecture/security debt. The repair should be one explicit child-construction
-API parameterized by lexical-environment and journaling policy, with a pinned inheritance test for
-every capability. Do not patch only one child call site.
+`crates/shoal-eval/tests/child_context_propagation.rs` pins the security-critical guarantee: a
+restrictive leash policy's `proc_spawn` spawn-hash gate denies an unlisted binary identically
+foreground and via `spawn`, `parallel`, an `on` handler, and a `.shl` script; an injected config
+snapshot is readable in every route (including `spawn`, which formerly dropped the config port); and
+parent cancellation reaches the synchronous `parallel`/`.shl` children through the inherited token.
+This closes 2026-07-16 audit finding B (HR-B1–B7).
 
 ## Filesystem-port boundary is incomplete
 
@@ -356,10 +357,10 @@ Do not erase a nested error's span merely to attach the outer expression.
 
 - `JobsSnapshot`'s source comment says suspended is always zero, but implementation now counts
   suspended tasks. The code behavior is authoritative; the comment needs correction.
-- The evaluator is a large state aggregate. Several child creation paths manually copy fields,
-  making inheritance drift a recurring risk.
-- Child inheritance drift currently drops Leash across all fresh-evaluator paths and drops Reef
-  state broadly, creating a real policy/tool-resolution escape rather than a theoretical risk.
+- The evaluator is a large state aggregate, but child creation is funneled through the single
+  `ChildContext` constructor (`child_context.rs`): adding an inheritable field is a two-site edit
+  (capture in `child_context`, re-apply in `build`), and forgetting to re-apply a captured field is
+  a compile error, not silent inheritance drift.
 - Module lexical isolation is stronger than effect isolation; a module can still perform effects.
 - Command names can be invoked by an otherwise-unbound variable expression, so adding a builtin can
   change an `undefined_var` into execution.
