@@ -28,12 +28,12 @@
 //! them.
 
 use std::fs::File;
-use std::io::{self, Write};
+use std::io;
 use std::mem;
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -42,43 +42,21 @@ use portable_pty::{Child, CommandBuilder, MasterPty, native_pty_system};
 use shoal_leash::EnforcementStatus;
 
 use crate::cancel::CancelToken;
-use crate::status::{
-    decode_wait_status, is_stopped, waitpid_blocking, waitpid_untraced, waitpid_untraced_nohang,
-};
-use crate::watcher::spawn_cancel_watcher;
+use crate::status::{decode_wait_status, waitpid_blocking};
 use crate::which::resolve_program;
 use crate::{ExecResult, ExecSpec, StdinSpec};
 
 mod registry;
+mod service;
 mod terminal;
 
-/// After the child is reaped, how long we wait for the output pump to hit
-/// EOF before abandoning it (it exits on its own once the pty closes).
-const PUMP_DRAIN_GRACE: Duration = Duration::from_millis(500);
-
-use registry::{BackgroundCommand, park_job, register_background_job, remove_background_job};
+use registry::{park_job, register_background_job, remove_background_job};
 pub use registry::{shutdown_stopped_jobs, take_background_job, take_stopped_job};
+use service::{Feed, ServeOptions, Wait, serve};
 use terminal::{
-    BackgroundOutputSink, OutputPumpConfig, RawModeGuard, dup_master_fd, dup_stdout,
-    forward_stdin_and_resize, initial_pty_size, is_tty, lock_tee, pty_err, pump_output,
+    BackgroundOutputSink, OutputPumpConfig, RawModeGuard, initial_pty_size, is_tty, lock_tee,
+    pty_err, pump_output,
 };
-
-/// Non-tty stdin to feed into the pty exactly once (the first time the job is
-/// served). `Inherit`-tty forwarding is handled separately and re-engages on
-/// every foreground serve.
-enum Feed {
-    Bytes(Vec<u8>),
-    File(File),
-}
-
-/// The result of serving (waiting on) a PTY child for one foreground/background
-/// stint: it either terminated (raw wait status) or *stopped* (suspended).
-enum Wait {
-    Exited(i32),
-    Stopped,
-    Foreground(SyncSender<PtyJob>),
-    Shutdown,
-}
 
 /// A PTY foreground command and everything needed to keep it alive across a
 /// stop and later resume it (site/content/internals/language-conformance-contract.md). Created for every PtyTee run; held by
@@ -129,156 +107,6 @@ impl PtyJob {
     #[must_use]
     pub fn command(&self) -> &str {
         &self.display
-    }
-
-    /// `SIGCONT` the whole process group.
-    fn signal_cont(&self) -> io::Result<()> {
-        // SAFETY: signalling a process group is memory-safe.
-        if unsafe { libc::kill(-self.pgid, libc::SIGCONT) } == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
-    }
-
-    /// Attach helpers (stdin forward + output pump + cancel watcher), optionally
-    /// `SIGCONT` the group (on resume), then wait — observing a stop. Keeps the
-    /// master and child alive on every path.
-    fn serve(
-        &mut self,
-        cancel: &CancelToken,
-        foreground: bool,
-        resume: bool,
-        background_commands: Option<&Receiver<BackgroundCommand>>,
-        background_output: Option<BackgroundOutputSink>,
-    ) -> io::Result<Wait> {
-        // Raw mode only when actually forwarding a real terminal; restored on
-        // every exit path (panics included) when the guard drops.
-        let _raw = if foreground && self.forward_tty {
-            Some(RawModeGuard::new(0)?)
-        } else {
-            None
-        };
-
-        let serve_done = Arc::new(AtomicBool::new(false));
-        let mut helpers: Vec<thread::JoinHandle<()>> = Vec::new();
-
-        // Stdin plumbing. One-shot Bytes/File feed happens on the first serve;
-        // tty forwarding re-engages on every foreground serve.
-        if let Some(feed) = self.pending_feed.take() {
-            let mut w = dup_master_fd(self.master.as_ref())?;
-            helpers.push(thread::spawn(move || match feed {
-                Feed::Bytes(bytes) => {
-                    let _ = w.write_all(&bytes);
-                    let _ = w.flush();
-                }
-                Feed::File(mut f) => {
-                    let _ = io::copy(&mut f, &mut w);
-                    let _ = w.flush();
-                }
-            }));
-        } else if foreground && self.forward_tty {
-            let w = dup_master_fd(self.master.as_ref())?;
-            let d = serve_done.clone();
-            helpers.push(thread::spawn(move || forward_stdin_and_resize(w, &d)));
-        }
-
-        // Output pump (poll-based, over a dup of the master fd so it can be torn
-        // down on a stop without dropping the master itself).
-        let reader = dup_master_fd(self.master.as_ref())?;
-        let pump_done = Arc::new(AtomicBool::new(false));
-        let pump = {
-            let tee = Arc::clone(&self.tee);
-            let tee_truncated = Arc::clone(&self.tee_truncated);
-            let pump_done = Arc::clone(&pump_done);
-            let serve_done = Arc::clone(&serve_done);
-            // Foreground output retains byte-for-byte terminal passthrough.
-            // A background host can instead supply a line-editor-safe sink;
-            // legacy callers without one keep the historical passthrough.
-            let passthrough = if self.stdout_is_tty && (foreground || background_output.is_none()) {
-                dup_stdout()
-            } else {
-                None
-            };
-            let cap = self.cap;
-            thread::spawn(move || {
-                pump_output(
-                    reader,
-                    OutputPumpConfig {
-                        tee,
-                        tee_truncated,
-                        passthrough,
-                        background_output,
-                        cap,
-                        serve_done,
-                        pump_done,
-                    },
-                );
-            })
-        };
-
-        // Cancellation watcher (INT → TERM → KILL against the child's group).
-        let claimed = Arc::new(AtomicBool::new(false));
-        let watcher =
-            spawn_cancel_watcher(self.pgid, vec![cancel.clone()], claimed, serve_done.clone());
-
-        // On resume, continue the group now that output/input are re-attached
-        // (spawning the pump first means no output is lost to the gap).
-        // Preserve a resume/wait error, but do not return it before this
-        // serve's helpers have observed shutdown. An early `?` here strands
-        // the pump and cancellation watcher indefinitely.
-        let waited = if resume {
-            self.signal_cont().and_then(|()| {
-                background_commands.map_or_else(
-                    || waitpid_untraced(self.pid).map(Wait::Exited),
-                    |commands| self.wait_background(commands),
-                )
-            })
-        } else if let Some(commands) = background_commands {
-            self.wait_background(commands)
-        } else {
-            waitpid_untraced(self.pid).map(Wait::Exited)
-        };
-
-        // Tear down this serve's helpers. Identical for stop and exit — the
-        // master and child are always left intact; on a stop they are parked.
-        serve_done.store(true, Ordering::SeqCst);
-        let deadline = Instant::now() + PUMP_DRAIN_GRACE;
-        while !pump_done.load(Ordering::SeqCst) && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(10));
-        }
-        if pump_done.load(Ordering::SeqCst) {
-            let _ = pump.join();
-        }
-        // If a grandchild is holding the slave open and flooding it, the pump
-        // may not have drained within the grace window; leave it (it exits on
-        // its own once serve_done is observed on the next idle poll) rather than
-        // block the prompt — the same policy the pre-job-control code used.
-        let _ = watcher.join();
-        for h in helpers {
-            let _ = h.join();
-        }
-
-        // A stop does NOT reap the child; terminal statuses are decoded by the
-        // caller after every helper belonging to this serve has retired.
-        match waited? {
-            Wait::Exited(raw) if is_stopped(raw) => Ok(Wait::Stopped),
-            transition => Ok(transition),
-        }
-    }
-
-    fn wait_background(&self, commands: &Receiver<BackgroundCommand>) -> io::Result<Wait> {
-        loop {
-            if let Some(raw) = waitpid_untraced_nohang(self.pid)? {
-                return Ok(Wait::Exited(raw));
-            }
-            match commands.try_recv() {
-                Ok(BackgroundCommand::Foreground(reply)) => return Ok(Wait::Foreground(reply)),
-                Ok(BackgroundCommand::Shutdown) => return Ok(Wait::Shutdown),
-                Err(TryRecvError::Empty | TryRecvError::Disconnected) => {}
-            }
-            thread::sleep(Duration::from_millis(25));
-        }
     }
 
     /// Build the terminal-exit result and mark the child reaped.
@@ -351,7 +179,7 @@ impl PtyJob {
     /// # Errors
     /// Propagates a `waitpid`/pty-plumbing [`io::Error`].
     pub fn resume_foreground(mut self, cancel: &CancelToken) -> io::Result<ExecResult> {
-        match self.serve(cancel, true, true, None, None)? {
+        match serve(&mut self, cancel, ServeOptions::foreground(true))? {
             Wait::Exited(raw) => Ok(self.exit_result(raw)),
             Wait::Stopped => {
                 let res = self.stopped_result();
@@ -366,7 +194,7 @@ impl PtyJob {
     /// background. Unlike [`PtyJob::resume_foreground`], this does not send
     /// SIGCONT: ownership transfer did not stop the process group.
     pub fn foreground_running(mut self, cancel: &CancelToken) -> io::Result<ExecResult> {
-        match self.serve(cancel, true, false, None, None)? {
+        match serve(&mut self, cancel, ServeOptions::foreground(false))? {
             Wait::Exited(raw) => Ok(self.exit_result(raw)),
             Wait::Stopped => {
                 let result = self.stopped_result();
@@ -418,7 +246,11 @@ impl PtyJob {
         register_background_job(pid, commands_tx);
         thread::spawn(move || {
             let cancel = CancelToken::new();
-            match self.serve(&cancel, false, true, Some(&commands_rx), output) {
+            match serve(
+                &mut self,
+                &cancel,
+                ServeOptions::background(&commands_rx, output),
+            ) {
                 Ok(Wait::Exited(raw)) => {
                     remove_background_job(pid);
                     notify(Ok(self.exit_result(raw)));
@@ -564,7 +396,7 @@ pub(crate) fn run_pty(mut spec: ExecSpec, cancel: &CancelToken) -> io::Result<Ex
         reaped: false,
     };
 
-    match job.serve(cancel, true, false, None, None) {
+    match serve(&mut job, cancel, ServeOptions::foreground(false)) {
         Ok(Wait::Exited(raw)) => Ok(job.exit_result(raw)),
         Ok(Wait::Stopped) => {
             let res = job.stopped_result();
@@ -584,7 +416,7 @@ mod tests {
     use super::*;
     use crate::ExecMode;
     use std::ffi::OsString;
-    use std::io::Read as _;
+    use std::io::{Read as _, Write as _};
     use std::os::fd::{FromRawFd as _, IntoRawFd as _};
     use std::os::unix::net::UnixStream;
 
