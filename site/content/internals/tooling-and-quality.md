@@ -238,6 +238,34 @@ GitHub CI builds/tests on Ubuntu and macOS with locked dependencies, runs the co
 checks fmt/Clippy, and performs release builds. Release automation produces binaries for x86_64 and
 AArch64 on Linux and macOS.
 
+### The `shoal-wasm` compile cost decision (HR-F8)
+
+`shoal-wasm` is a workspace member with no other crate depending on it (deep audit H10): it
+validates WASM components/manifests/resource limits in isolation, but nothing wires it into
+evaluator dispatch yet (see the implementation-status page's WASM row). It pulls in `wasmtime` with
+the `cranelift` codegen backend, which is by far the largest single dependency subtree in this
+workspace (dozens of `wasmtime-internal-*`/`cranelift-*` crates) — `cargo build --workspace
+--all-targets` pays that compile/cache cost on every CI run today even though no shipped behavior
+exercises it.
+
+Decision: **keep it in ordinary workspace CI, cost accepted, revisit when WASM dispatch actually
+lands.** Reasoning:
+
+- Feature-gating it out of the default workspace build would need `shoal-wasm`'s own
+  `Cargo.toml`/`Cargo.lock` and CI matrix changes (a dependency-shape change, not a lint/doc one);
+  the crate is presently a leaf with a real, if narrow, test suite, and splitting it into a separate
+  CI job buys cache isolation at the cost of another job to maintain for a component nothing
+  depends on.
+- The crate is small (single `lib.rs`, ~250 lines) and its own compile is fast; the cost is entirely
+  `wasmtime`/`cranelift`'s, and `Swatinem/rust-cache` already amortizes that across CI runs on the
+  same OS/lockfile, so the marginal per-PR cost after a cache hit is low.
+- Once WASM command dispatch actually lands in `shoal-eval`, `wasmtime` becomes a load-bearing
+  dependency of a crate other things already depend on regardless of `shoal-wasm`'s own CI
+  treatment, making a special-cased job moot.
+
+Revisit this decision (separate job, feature flag, or drop from `--workspace` defaults) if the
+compile/cache cost becomes a measured CI bottleneck before WASM dispatch integration begins.
+
 
 Every member crate opts in with `[lints] workspace = true` (HR-F1,
 [hardening roadmap](@/internals/hardening-roadmap.md)), so the root manifest's lint table is
