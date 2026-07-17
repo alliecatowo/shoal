@@ -70,17 +70,39 @@ Every stateful method requires attachment: `journal.query` (HR-D4) and `cap.requ
 last exemptions and now reject an unattached caller with `NOT_ATTACHED`. The only naturally public
 methods are `session.attach`, `parse`, and `complete`.
 
-### Shared-name principal caveat
+### Session identity and the pair-shell model
 
-Session creation consults the principal only the first time a name is seen. A later principal can
-attach to the same named `Session` and share its evaluator environment/transcript. The exec handler
-does install the current actor's Leash policy before each serialized evaluation, and coarse journal
-records use the current actor, but the evaluator's own journal principal was fixed when the session
-was created.
+The session identity model is explicit (HR-D7), and it is the **shared pair-shell model, by
+design**: a named session is one shared workspace that multiple principals deliberately join — the
+product's pair-shelling goal, a human and an agent (e.g. the local `uid:N` human and the restricted
+`agent:mcp`) driving one shell together.
 
-This creates an identity/provenance seam. Until sessions are keyed or access-controlled by principal,
-hosts should avoid reusing a session name across trust boundaries. Tests for isolation must use two
-principals and the same name; two different names do not exercise this risk.
+The rules:
+
+- **Objects are session-scoped, and sharing them inside a session is intentional.** Evaluator
+  environment, transcript (`out:n` refs), tasks, PTYs, and in-language channels belong to the named
+  session. Every principal attached to that session shares full visibility and control — a partner
+  can read your PTY's screen, cancel your task, close your PTY. Cross-*session* access is denied
+  (an unknown-ref not-found), and that is the isolation boundary.
+- **Authority stays per-actor.** Each `exec` installs the *current* attachment principal's Leash
+  policy before evaluation, so what a principal may do in the shared session is still its own
+  policy's decision — sharing the workspace does not share authority. Plans remain
+  requester-scoped, and approval requires a distinct approver by default (HR-D3), which the
+  pair-shell composes with naturally: the human partner approves the agent's pending plan.
+- **Attribution follows the actor at the exec boundary.** Coarse kernel journal rows, `journal`
+  events, and `approval` events carry the current attachment principal. Two principals exec'ing in
+  one shared session produce rows attributed to each actor (pinned by the live pair-session test).
+- **One documented seam: evaluator statement-level attribution.** The session evaluator's own
+  per-statement journal identity is fixed at session creation to the *first* attaching principal
+  (`Evaluator::set_journal` has no per-exec principal update). Actor attribution must therefore be
+  read from the coarse exec rows, not the finer statement rows, in a multi-principal session.
+
+The **token-isolation consequence** hosts must internalize: a bearer token scopes *authority*, not
+*object visibility within a session it joins*. Attaching a restricted principal to a trusted
+session name grants it that session's transcript, tasks, and PTYs. The isolation boundary is the
+session name — give untrusted or differently-trusted agents their own session names; never reuse
+one name across trust boundaries. Isolation tests must use two principals and the *same* name; two
+different names do not exercise this boundary.
 
 ## Session contents
 
