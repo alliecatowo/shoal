@@ -1,0 +1,113 @@
+# Plan effect derivation is exhaustive and fail-closed (HR-A11).
+#
+# Every case here pins one dynamic probe from the 2026-07-16 deep audit
+# (site/content/internals/deep-audit-2026-07-16.md, section A): each probe
+# previously returned `effects: []`, `reversible: true`, `spawns: false` from
+# the real binary. The corrected behavior is that every effectful syntax route
+# derives non-empty, correct effects — an empty effect set is only correct for
+# provably effect-free forms (site/content/internals/effects-plans-security.md).
+#
+# Planning never executes: none of these cases mutate the case's temp cwd.
+
+[[case]]
+name = "plan-save-method-derives-write"
+src = '(plan { "x".save("p") }).effects.contains("write {pwd}/p")'
+value = "true"
+
+[[case]]
+name = "plan-append-method-derives-write"
+src = '(plan { "x".append("p") }).effects.contains("write {pwd}/p")'
+value = "true"
+
+[[case]]
+name = "plan-redirect-truncate-derives-write"
+src = '(plan { echo hi > p }).effects.contains("write {pwd}/p")'
+value = "true"
+
+[[case]]
+name = "plan-redirect-append-derives-write"
+src = '(plan { echo hi >> p }).effects.contains("write {pwd}/p")'
+value = "true"
+
+[[case]]
+name = "plan-env-assign-derives-env-write"
+src = '(plan { env.AUDIT_ONLY = "y" }).effects.contains("env-write AUDIT_ONLY")'
+value = "true"
+
+[[case]]
+name = "plan-path-read-derives-read"
+src = '(plan { path("Cargo.toml").read }).effects.contains("read {pwd}/Cargo.toml")'
+value = "true"
+
+[[case]]
+name = "plan-use-derives-module-read-and-approval"
+src = '''
+let r = (plan { use ./module })
+[r.effects.join(" ").contains("module"), r.effects.join(" ").contains("opaque")]
+'''
+value = "[true, true]"
+fixture = ["module.shl"]
+
+[[case]]
+name = "plan-spawn-body-derives-write"
+src = '(plan { spawn { "x".save("p") } }).effects.contains("write {pwd}/p")'
+value = "true"
+
+[[case]]
+name = "plan-parallel-body-derives-write"
+src = '(plan { parallel(() => "x".save("p")) }).effects.contains("write {pwd}/p")'
+value = "true"
+
+[[case]]
+name = "plan-run-derives-concrete-spawn"
+src = '''
+let r = (plan { run("echo", "hi") })
+[r.spawns, r.effects.join(" ").contains("spawn echo")]
+'''
+value = "[true, true]"
+
+[[case]]
+name = "plan-open-derives-read-and-approval"
+src = '''
+let r = (plan { open("Cargo.toml") })
+[r.effects.contains("read {pwd}/Cargo.toml"), r.effects.join(" ").contains("opaque")]
+'''
+value = "[true, true]"
+
+[[case]]
+name = "plan-save-builtin-derives-write"
+src = '(plan { save("x", "p") }).effects.contains("write {pwd}/x")'
+value = "true"
+
+[[case]]
+name = "plan-feed-derives-external-spawn"
+src = '''
+let r = (plan { "x".feed(cat) })
+[r.spawns, r.effects.join(" ").contains("spawn cat")]
+'''
+value = "[true, true]"
+
+[[case]]
+name = "plan-bare-external-derives-concrete-spawn"
+src = '''
+let r = (plan { some-unknown-tool-xyz })
+[r.spawns, r.effects.join(" ").contains("spawn some-unknown-tool-xyz")]
+'''
+value = "[true, true]"
+
+# A session-stored function cannot be statically expanded by the planner (its
+# body is a closure, not part of the planned program), so the call must derive
+# a conservative approval-requiring effect — never an empty effect set (A5).
+[[case]]
+name = "plan-session-fn-call-requires-approval"
+src = '''
+fn danger() { "x".save("p") }
+let r = (plan { danger() })
+[r.effects.is_empty(), r.effects.join(" ").contains("opaque")]
+'''
+value = "[false, true]"
+
+[[case]]
+name = "plan-pure-expression-derives-no-effects"
+src = '(plan { 1 + 2 }).effects.is_empty()'
+value = "true"
