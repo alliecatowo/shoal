@@ -820,6 +820,62 @@ mod tests {
         }
     }
 
+    /// Raw-mode ownership is scoped, not process-lifetime state. In
+    /// particular an evaluator/host panic while a PTY is foreground must not
+    /// leave the user's terminal without echo or canonical input.
+    #[test]
+    fn raw_mode_guard_restores_termios_during_unwind() {
+        struct Fds(libc::c_int, libc::c_int);
+        impl Drop for Fds {
+            fn drop(&mut self) {
+                // SAFETY: both descriptors were returned by `openpty` and are
+                // closed exactly once by this owner.
+                unsafe {
+                    libc::close(self.0);
+                    libc::close(self.1);
+                }
+            }
+        }
+
+        let mut master = -1;
+        let mut slave = -1;
+        // SAFETY: valid output pointers; null optional name/termios/winsize
+        // requests the platform defaults for a fresh pseudo-terminal.
+        let opened = unsafe {
+            libc::openpty(
+                &raw mut master,
+                &raw mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(opened, 0, "openpty: {}", io::Error::last_os_error());
+        let _fds = Fds(master, slave);
+
+        // SAFETY: `slave` is the live terminal descriptor owned above.
+        let mut before = unsafe { mem::zeroed::<libc::termios>() };
+        assert_eq!(unsafe { libc::tcgetattr(slave, &raw mut before) }, 0);
+        let unwind = std::panic::catch_unwind(|| {
+            let _raw = RawModeGuard::new(slave).expect("pty slave supports raw mode");
+            // SAFETY: same live terminal descriptor.
+            let mut during = unsafe { mem::zeroed::<libc::termios>() };
+            assert_eq!(unsafe { libc::tcgetattr(slave, &raw mut during) }, 0);
+            assert_eq!(during.c_lflag & (libc::ECHO | libc::ICANON), 0);
+            panic!("exercise unwind restoration");
+        });
+        assert!(unwind.is_err());
+
+        // SAFETY: same live terminal descriptor, after the guard was dropped.
+        let mut after = unsafe { mem::zeroed::<libc::termios>() };
+        assert_eq!(unsafe { libc::tcgetattr(slave, &raw mut after) }, 0);
+        assert_eq!(after.c_iflag, before.c_iflag);
+        assert_eq!(after.c_oflag, before.c_oflag);
+        assert_eq!(after.c_cflag, before.c_cflag);
+        assert_eq!(after.c_lflag, before.c_lflag);
+        assert_eq!(after.c_cc, before.c_cc);
+    }
+
     /// The core job-control contract this module implements: a child that
     /// stops itself (`SIGSTOP`) is observed via `WUNTRACED` as a *stop*,
     /// `run_pty` maps that to a stopped `ExecResult` rather than an exit, and
