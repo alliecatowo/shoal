@@ -32,7 +32,8 @@ The MCP facade implements:
 - `resources/templates/list` for parameterized URI forms;
 - `resources/read` for current content;
 - `resources/subscribe` for event and task update notifications;
-- `resources/unsubscribe`, currently acknowledged but not connected to the background forwarder.
+- `resources/unsubscribe`, which removes the URI worker, shuts down its dedicated kernel socket,
+  and joins the background forwarder.
 
 ## Listed resources
 

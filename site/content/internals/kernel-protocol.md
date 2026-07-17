@@ -366,8 +366,9 @@ The configurable process/session ceilings use `QUOTA_EXCEEDED` with structured `
 Session admission first removes unleased sessions idle for 24 hours, then evicts the least-recently
 used unleased owner session when a principal/process ceiling is full; if every candidate is leased,
 the new attach is rejected. Existing sessions remain attachable after a ceiling is lowered.
-In-language `spawn`/`parallel`/`on` and stream pump threads are not counted by these kernel registries,
-so this is bounded agent-host state rather than a universal thread executor.
+In-language `spawn`/`parallel`/`on` and stream pump threads are not counted by these kernel
+registries, but evaluator admission separately caps native workers at 64 per session and 512 per
+process. The systems are independently bounded rather than one universal thread executor.
 
 ## Restart contract
 

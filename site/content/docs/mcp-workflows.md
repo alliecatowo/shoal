@@ -356,7 +356,9 @@ The first event in a channel is `seq=0`, so an implementation may represent “n
 
 `journal` and `session.transcript` can reconstruct surviving durable history beyond their 1,024-event ring. Task, approval, render, and user channels cannot. A `{dropped, latest_seq}` event means pull/reconcile before proceeding.
 
-MCP `resources/unsubscribe` currently acknowledges without actually stopping its dedicated kernel connection. Subscribe once per URI per MCP process, and rely on facade process termination for cleanup.
+MCP `resources/unsubscribe` removes that URI's registered worker, shuts down its dedicated kernel
+connection, and joins the forwarding thread. Facade process termination performs the same cleanup
+for subscriptions that remain active.
 
 ## Interactive PTY workflow
 

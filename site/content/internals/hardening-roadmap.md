@@ -204,8 +204,8 @@ Rules for implementers:
   implementation-status, and the public mental model.
 - [x] **HR-H3** — Docs drift pass: counts and open items across internals pages match source at
   a stated commit. *(I11)*
-  <br>Done: live status pages were reconciled against merge checkpoint `fcb10bd`; explicitly dated
-  2026-07-16 audit/reference snapshots retain their historical counts.
+  <br>Done: live status pages were reconciled against the hardened branch on 2026-07-17; explicitly
+  dated 2026-07-16 audit/reference snapshots retain their historical counts.
 
 ### Workstream I — secrets and token store
 

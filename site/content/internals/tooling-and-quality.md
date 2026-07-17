@@ -248,9 +248,9 @@ AArch64 on Linux and macOS.
 
 ### Supply-chain advisories (HR-F6)
 
-Hundreds of registry dependencies are real supply-chain surface with no advisory audit before this task
-(deep audit H9). The `supply-chain-audit` job in `ci.yml` installs `cargo-audit` and runs bare
-`cargo audit` against `Cargo.lock` on every push/PR to `main`.
+Hundreds of registry dependencies are real supply-chain surface with no advisory audit before this
+task (deep audit H9). The `supply-chain-audit` job in `ci.yml` installs `cargo-audit` and audits both
+the root `Cargo.lock` and the independently tracked `fuzz/Cargo.lock` on every push/PR to `main`.
 
 The documented allowlist lives at **`.cargo/audit.toml`** — this is `cargo-audit`'s own
 auto-discovered config path (a bare root-level `audit.toml` is silently ignored by the tool; this
@@ -259,9 +259,9 @@ was verified locally before landing the CI job). The workspace upgraded `shoal-w
 allowlist is now empty. Any future ignored `RUSTSEC-*` ID must carry its root cause and revisit
 condition in that file. The
 config also sets `output.deny = ["unmaintained", "unsound", "yanked"]`, so an unmaintained/unsound
-crate or a yanked version newly appearing in `Cargo.lock` fails the gate even though none exist
-today. Re-run `cargo audit` locally (same command CI uses) after any dependency bump and prune
-allowlist entries that no longer apply.
+crate or a yanked version newly appearing in either lockfile fails the gate even though none exist
+today. Re-run both CI audit commands after dependency bumps and prune allowlist entries that no
+longer apply.
 
 ### The `shoal-wasm` compile cost decision (HR-F8)
 
@@ -289,11 +289,11 @@ justifies preserving the same evaluator integration coverage another way.
 
 Every member crate opts in with `[lints] workspace = true` (HR-F1,
 [hardening roadmap](@/internals/hardening-roadmap.md)), so the root manifest's lint table is
-actually active per-crate, not merely staged. `rust-toolchain.toml` at the repository root pins the
-exact stable release (currently 1.97.0) that CI's `dtolnay/rust-toolchain@stable` step resolved to
-at the time it was written (HR-F2); `rustup` picks this up automatically for any local `cargo`/
-`rustc`/`clippy`/`fmt` invocation, so a future stable release cannot silently change a contributor's
-compiler out from under a pinned CI baseline without a deliberate bump to this file.
+actually active per-crate, not merely staged. `rust-toolchain.toml` at the repository root pins
+1.97.0 and every non-fuzz CI job installs that exact `dtolnay/rust-toolchain@1.97.0` toolchain
+(HR-F2). Fuzz jobs explicitly override it with nightly. `rustup` picks the root pin up automatically
+for local `cargo`/`rustc`/`clippy`/`fmt` invocations unless the environment supplies a stronger
+override, so a compiler change requires a deliberate file/workflow update.
 
 ### Ambient-environment test debt (resolved, HR-F3)
 

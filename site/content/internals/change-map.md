@@ -184,16 +184,16 @@ multi-request kernel execution.
 **Direction:** expose a read-only evaluator parse snapshot or move binding-neutral disambiguation into
 a shared post-parse dispatch, with exact host-parity cases.
 
-### Medium-high: MCP unsubscribe does not own subscription lifetime
+### Medium-high: MCP subscriptions retain a thread-per-URI cost
 
-**Evidence:** subscribe spawns a dedicated connection/thread; the facade stores no handle; MCP
-`resources/unsubscribe` immediately acknowledges without signalling that worker.
+**Evidence:** each subscribe stores a dedicated connection/thread in the facade's URI-keyed worker
+registry. `resources/unsubscribe` removes the worker, shuts down its socket, and joins the thread.
 
-**Risk:** subscriptions and threads persist until connection/process termination, violating client
-expectations and scaling poorly across repeated subscribe/unsubscribe cycles.
+**Risk:** lifecycle ownership is now correct, but many simultaneously active URIs still scale as one
+kernel connection plus one forwarding thread each.
 
-**Direction:** registry keyed by subscription URI/client request, cancellation token plus join/close,
-and an end-to-end test that publication stops after unsubscribe.
+**Direction:** retain the tested unsubscribe ownership invariant; introduce multiplexing or a bounded
+executor only if measured active-subscription scale justifies the protocol change.
 
 ### Medium-high: dual kernel journal granularity is easy to misquery
 
@@ -206,16 +206,13 @@ kinds without a schema discriminator.
 **Direction:** add an entry kind/parent-exec relation or choose one canonical lifecycle. Return IDs
 directly instead of inferring latest rows.
 
-### Medium: incomplete stream, task, PTY, and WASM paths
+### Medium: remaining stream, task, filesystem, and WASM paths
 
 These are four separate, explicitly unimplemented surfaces:
 
 | Gap | Source evidence | Architectural work required |
 |---|---|---|
 | stream → process stdin | `feed_bytes(Value::Stream)` returns a type error | bounded backpressure/cancellation-aware producer-to-child pipe |
-| wire stream chunks | `WireValue::Stream` carries a label, no pull method | cursor/ref protocol with item/error/end, budgets, ownership and cancellation |
-| language EventBus live backpressure | replay ring is capped at 1,024, but live subscribers use unbounded queues and are cloned/sent under the bus mutex | bounded subscriber queues, explicit overflow/gap markers, and shorter publish critical section |
-| child evaluator authority escape | spawn/parallel/on/.shl children omit parent Leash and broadly omit Reef; some omit ConfigPort | one capability-complete child constructor plus inheritance tests at every site |
 | incomplete filesystem port | value/stream writes now route through `Fs` (HR-C1/C2); direct path metadata/canonicalize/exists/watch *reads* still coexist with injected `Fs` | expand capability traits to the read-side probes and prohibit direct host path access in evaluator/value effect paths |
 | method metadata/dispatch parity | sequence metadata advertises table/range `.get` that dispatch rejects; bool omits valid `.str`/`.display` | generate receiver metadata from executable dispatch tests or pin bidirectional parity fixtures |
 | function type soundness | scalar parameter and return annotations are not consistently enforced; non-string command arguments can bypass coercion | one runtime validator shared by expression/command calls plus return checking and conformance cases |
@@ -235,19 +232,13 @@ lost at restart. Journal and CAS remain, but identity-bearing values cannot simp
 A recovery design should explicitly classify reconstructible summaries, immutable CAS data, and
 non-recoverable live objects rather than imply full session durability.
 
-### Medium: lock poisoning and thread-per-subscription scaling
+### Medium: thread-per-subscription scaling
 
-Long-lived kernel state uses many `Mutex::lock().unwrap()` sites. A panic while holding a shared lock
-can poison it and cascade through later requests. Every event subscription adds a blocking writer
-thread; MCP adds another forwarding connection/thread. First remove panic sources inside critical
-sections and add stress/lock-order tests; then consider a supervised task/executor model if scaling
-needs justify it.
-
-### Medium: frame caps are checked after allocation
-
-Kernel and MCP readers accumulate a full line with `read_line` before applying the 16 MiB check. A
-hostile peer can grow memory with a newline-free frame. Use a bounded `fill_buf`/`take` loop that
-drains or closes once the cap is crossed, and test partial frames plus multiple valid frames.
+Kernel subscription queues and writes are bounded, MCP unsubscribe owns and joins its worker, and
+poison-sensitive state now has explicit recovery or quarantine policy. The remaining cost is
+structural: each kernel event subscription adds a blocking writer thread and each MCP subscription
+adds another forwarding connection/thread. Consider multiplexing or a bounded executor if measured
+scale requires it; preserve slow-consumer isolation and exact lifecycle cleanup.
 
 ### Medium: spill pins lack automatic release
 
@@ -262,13 +253,14 @@ identity metadata rather than content every time. Together these favor speed/bes
 over conspicuous failure. Record discovery diagnostics and make strict script/agent mode surface
 them; harden cache identity without hashing every executable on every prompt render.
 
-### Medium-low: schema fields exist without runtime wiring
+### Medium-low: configuration discovery still has two prompt paths
 
-Core config accepts `render.width`, `kernel.*`, `journal.*`, and `leash.policy` without corresponding
-host behavior. Its typed `prompt.template` field is also not passed through, but the rich prompt
-loader independently rereads legacy `template` from system/user and cwd-local prompt files and
-migrates it to `format.left`. Preserve that compatibility while unifying discovery: core config uses
-one nearest ancestor `.shoal.toml`, whereas rich prompt currently checks only `cwd/.shoal.toml`.
+The shared host bootstrap now consumes render width/color/echo, kernel mode/session, journal
+enablement/state root, Leash policy, adapters, plugins, Reef, aliases, and environment. The remaining
+split is prompt-specific: the rich prompt loader independently rereads legacy `template` from
+system/user and cwd-local prompt files and migrates it to `format.left`. Preserve that compatibility
+while converging discovery; core config uses one nearest ancestor `.shoal.toml`, whereas rich prompt
+currently checks only `cwd/.shoal.toml`.
 
 ### Medium-low: duplicated classifications invite drift
 
@@ -289,8 +281,6 @@ solve drift by introducing dependency cycles.
 - Color/highlighter tests isolate ambient `NO_COLOR` while asserting ANSI output.
 - Workspace lints are declared at the root and every member crate inherits them with
   `[lints] workspace = true`.
-- A `JobsSnapshot` comment says suspended is always zero while implementation counts suspended
-  tasks; code is authoritative, but misleading comments make future regressions likely.
 - Historical root-doc counts must remain explicitly dated relative to the current 1,331-case corpus.
 
 ## Prioritization map

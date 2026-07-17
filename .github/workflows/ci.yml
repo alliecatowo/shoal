@@ -24,7 +24,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.os }}
@@ -40,7 +40,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.0
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
@@ -64,7 +64,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-${{ matrix.os }}
@@ -91,17 +91,18 @@ jobs:
       - run: cargo fuzz build --fuzz-dir fuzz
 
   supply-chain-audit:
-    # HR-F6 (site/content/internals/hardening-roadmap.md): RUSTSEC advisory check over
-    # Cargo.lock. The allowlist for accepted advisories lives in `.cargo/audit.toml` (cargo-audit's
-    # own auto-discovered config path) with a reason and revisit condition per entry — do not
-    # weaken this job by adding ad-hoc `--ignore` flags here instead of documenting them there.
+    # HR-F6 (site/content/internals/hardening-roadmap.md): RUSTSEC advisory checks over the root and
+    # independently locked fuzz dependency graphs. The allowlist for accepted advisories lives in
+    # `.cargo/audit.toml` (cargo-audit's own auto-discovered config path) with a reason and revisit
+    # condition per entry — do not weaken this job with ad-hoc `--ignore` flags.
     name: supply-chain audit
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
         with:
           key: supply-chain-audit
       - run: cargo install cargo-audit --locked
       - run: cargo audit
+      - run: cargo audit --file fuzz/Cargo.lock

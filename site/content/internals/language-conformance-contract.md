@@ -374,7 +374,7 @@ explicitly skipped with a reason.
 
 ### Current corpus state
 
-The current expected result is 1,327 passed, 0 failed, and 4 skipped. The skips cover a native-thread
+The 2026-07-17 observed result is 1,327 passed, 0 failed, and 4 skipped. The skips cover a native-thread
 recursion-stack condition, a Node block, a jq feed composition, and full-chain Reef `which`. Counts
 are evidence from that run, not a permanently hardcoded health claim; release notes must run the
 corpus again.
