@@ -103,7 +103,7 @@ impl<'s> Parser<'s> {
             }
         };
         let mut args = vec![];
-        let mut redirects = vec![];
+        let mut redirects: Vec<Redirect> = vec![];
         let mut background = false;
         let mut trailing = None;
         loop {
@@ -163,6 +163,18 @@ impl<'s> Parser<'s> {
                     break;
                 }
                 Tok::RedirIn => {
+                    if redirects
+                        .iter()
+                        .any(|redirect| redirect.kind == RedirectKind::In)
+                    {
+                        return Err(ParseError::new(
+                            "a command may have only one stdin redirect",
+                            s,
+                        )
+                        .hint(
+                            "choose one input source; compose typed input first and use `.feed(cmd)` when needed",
+                        ));
+                    }
                     // `<<` (heredoc) / `<<<` (here-string) — box-era spellings
                     // with curated teaching errors (site/content/internals/values-streams-execution.md).
                     if let Ok((Tok::RedirIn, s2)) = self.lx.token(s.end as usize, Mode::Cmd)
@@ -199,6 +211,17 @@ impl<'s> Parser<'s> {
                     });
                 }
                 Tok::RedirOut | Tok::RedirAppend => {
+                    if redirects.iter().any(|redirect| {
+                        matches!(redirect.kind, RedirectKind::Out | RedirectKind::Append)
+                    }) {
+                        return Err(ParseError::new(
+                            "a command may have only one stdout redirect",
+                            s,
+                        )
+                        .hint(
+                            "choose one target; for fan-out, capture `(cmd).out` and handle each write explicitly",
+                        ));
+                    }
                     // `2>` / `1>>` — fd-numbered redirects (site/content/internals/values-streams-execution.md): a bare
                     // digit word glued to the redirect. Without this check the
                     // digit silently passes as an ARGUMENT and the redirect

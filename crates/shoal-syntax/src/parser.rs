@@ -337,6 +337,31 @@ mod tests {
         }
     }
     #[test]
+    fn duplicate_redirect_channels_are_rejected_before_evaluation() {
+        let output = parse("echo hi > first >> second").unwrap_err();
+        assert!(output.msg.contains("only one stdout redirect"));
+        assert!(
+            output
+                .hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("capture `(cmd).out`"))
+        );
+
+        let input = parse("tool < first < second").unwrap_err();
+        assert!(input.msg.contains("only one stdin redirect"));
+
+        // One redirect for each channel remains a well-defined shell shape.
+        let parsed = parse("tool < input > output").unwrap();
+        let Stmt::Expr {
+            expr: Expr::Cmd { call, .. },
+            ..
+        } = &parsed.stmts[0]
+        else {
+            panic!("expected command")
+        };
+        assert_eq!(call.redirects.len(), 2);
+    }
+    #[test]
     fn declarations_and_fn() {
         let p = parse("fn add(a: int, b: int = 1) -> int { a + b }\nlet z = add(2)").unwrap();
         assert!(matches!(p.stmts[0], Stmt::Fn { .. }));

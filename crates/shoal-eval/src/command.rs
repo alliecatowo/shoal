@@ -15,6 +15,11 @@ mod resolution;
 
 impl Evaluator {
     pub(crate) fn eval_command(&mut self, call: &CmdCall, position: Position) -> VResult<Value> {
+        // Parser-authored calls already enforce this, but aliases, plugins and
+        // embedders can construct CmdCall values directly. Validate before
+        // background desugaring, argument evaluation, filesystem mutation, or
+        // process spawn so ambiguous redirects can never partially execute.
+        validate_redirect_shape(call)?;
         // Trailing `&` desugars to `spawn { <call> }` (site/content/internals/language-conformance-contract.md): the command
         // runs on a background task and the statement yields a `task` handle
         // instead of running synchronously.
@@ -375,6 +380,29 @@ impl Evaluator {
     }
 }
 
+fn validate_redirect_shape(call: &CmdCall) -> VResult<()> {
+    let mut input = false;
+    let mut output = false;
+    for redirect in &call.redirects {
+        let duplicate = match redirect.kind {
+            RedirectKind::In => std::mem::replace(&mut input, true),
+            RedirectKind::Out | RedirectKind::Append => std::mem::replace(&mut output, true),
+        };
+        if duplicate {
+            let stream = if redirect.kind == RedirectKind::In {
+                "stdin"
+            } else {
+                "stdout"
+            };
+            return Err(ErrorVal::arg_error(format!(
+                "a command may have only one {stream} redirect"
+            ))
+            .with_span(redirect.span));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod command_did_you_mean_tests {
     //! site/content/internals/language-conformance-contract.md command did-you-mean. The conformance corpus
@@ -389,6 +417,32 @@ mod command_did_you_mean_tests {
     // adapters, env) — never the filesystem — so the cwd need not exist.
     fn ev() -> Evaluator {
         Evaluator::new(std::env::temp_dir())
+    }
+
+    #[test]
+    fn programmatic_calls_reject_ambiguous_redirects_before_dispatch() {
+        let target = |name: &str, start: usize| Redirect {
+            kind: RedirectKind::Out,
+            target: CmdArg::Word {
+                text: name.into(),
+                span: Span::new(start, start + name.len()),
+            },
+            span: Span::new(start, start + name.len()),
+        };
+        let call = CmdCall {
+            head: "definitely-not-spawned".into(),
+            forced: false,
+            args: Vec::new(),
+            redirects: vec![target("first", 10), target("second", 20)],
+            env_prefix: Vec::new(),
+            background: true,
+            trailing: None,
+            span: Span::new(0, 26),
+        };
+        let error = validate_redirect_shape(&call).unwrap_err();
+        assert_eq!(error.code, "arg_error");
+        assert!(error.msg.contains("only one stdout redirect"));
+        assert_eq!(error.span, Some(Span::new(20, 26)));
     }
 
     #[test]
