@@ -53,7 +53,7 @@ use shoal_value::{
 };
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -217,7 +217,92 @@ impl ReefState {
     }
 }
 
+/// The host-installed service handles — the Class-1 evaluator state grouped by
+/// HR-J2 (`site/content/internals/evaluator-decomposition.md`): effect ports,
+/// the adapter catalog, the event bus, and the reef resolution *inputs*. Every
+/// field is set once by the host before evaluation (via the `set_*` setters /
+/// `load_bundled_adapters`) and is read-only for the rest of the session — the
+/// census shows each "mutated in `lib.rs` only", never on a statement/expression
+/// path (invariant I4). Held as a single [`Arc<HostServices>`] on the
+/// [`Evaluator`]; a child evaluator clones the `Arc` (one refcount bump) and so
+/// inherits the *whole* bundle unconditionally — closing the config-drop half of
+/// deep-audit finding B3 by construction, since a child can no longer be built
+/// without the parent's ports/adapters/resolution inputs. The grouping is
+/// otherwise behavior-identical to the pre-decomposition flat fields.
+#[derive(Clone)]
+struct HostServices {
+    /// Hexagonal effect ports (site/content/internals/roadmap-and-priorities.md). Every direct filesystem,
+    /// spawn, clock, opener, and secret call the domain core makes routes
+    /// through one of these instead of `std::*`. The defaults are the `Std*`
+    /// adapters, which perform the identical inline calls — so a plain
+    /// `Evaluator::new` is byte-identical to the pre-ports behavior. Held as
+    /// `Arc<dyn Port>` so child evaluators (`parallel`, `source`, `spawn`)
+    /// share them cheaply and a test can interpose a fake. See
+    /// [`Evaluator::set_fs`] and friends.
+    fs: Arc<dyn Fs>,
+    exec: Arc<dyn Exec>,
+    clock: Arc<dyn Clock>,
+    opener: Arc<dyn Opener>,
+    secrets: Arc<dyn SecretPort>,
+    /// Resolved configuration snapshot backing the in-language `config`
+    /// namespace (`config.get`/`config.all`). The default is an empty snapshot
+    /// (no config injected → `config.get` is `null`, never a filesystem walk);
+    /// a host injects the *same* resolved `shoal_config::Config` it applies to
+    /// itself via [`Evaluator::set_config`], so in-language config == the
+    /// host-applied config. Held as `Arc<dyn ConfigPort>` like the other ports
+    /// so child evaluators inherit it cheaply (through the shared `Arc`).
+    config: Arc<dyn ConfigPort>,
+    /// Declarative external-command schemas (site/content/internals/roadmap-and-priorities.md). Command
+    /// resolution must not diverge in a child, so the catalog travels in the
+    /// shared `Arc` rather than being deep-cloned at each child site.
+    adapters: AdapterCatalog,
+    /// The in-language `channel(name)` event bus (site/content/internals/streams-channels.md). Shared
+    /// (Arc) so spawned tasks / `on(...)` handlers publish and subscribe to the
+    /// same session-scoped channels — coordination is channels, never files.
+    bus: Arc<channels::EventBus>,
+    /// reef: the provider stack, built lazily on the first *constrained*
+    /// resolution — never touched on the hot path when no manifest is in scope.
+    /// A [`OnceLock`] so the lazy build is a one-shot memoization visible through
+    /// the shared `Arc` without a `&mut` seam (invariant I4: the bundle stays
+    /// structurally immutable after setup). A host may preinstall a resolver via
+    /// [`Evaluator::set_reef_resolver`]; tests point it at fixture binaries.
+    reef_resolver: OnceLock<Arc<shoal_reef::Resolver>>,
+    /// reef: optional user-scope `shoal.toml` whose `[reef]` table forms the
+    /// user scope. `None` (the default) means no user scope — the zero-config,
+    /// zero-regression path. Hosts wire a real path via
+    /// [`Evaluator::set_reef_user_manifest`]; tests never point at real config.
+    reef_user_manifest: Option<PathBuf>,
+}
+
+impl HostServices {
+    /// The default host services, matching the pre-decomposition `Evaluator::new`
+    /// field defaults exactly: the `Std*` ports, an empty config snapshot, an
+    /// empty adapter catalog, a fresh shared event bus, no preinstalled reef
+    /// resolver, and no user reef manifest.
+    fn new() -> Self {
+        Self {
+            fs: Arc::new(StdFs),
+            exec: Arc::new(StdExec),
+            clock: Arc::new(StdClock),
+            opener: Arc::new(StdOpener),
+            secrets: Arc::new(StdSecret),
+            config: Arc::new(ConfigSnapshot::default()),
+            adapters: AdapterCatalog::empty(),
+            bus: channels::EventBus::shared(),
+            reef_resolver: OnceLock::new(),
+            reef_user_manifest: None,
+        }
+    }
+}
+
 pub struct Evaluator {
+    /// Host-installed service handles grouped into one shared, immutable
+    /// sub-context (HR-J2 [`HostServices`]): effect ports (`fs`/`exec`/`clock`/
+    /// `opener`/`secrets`/`config`), the adapter catalog, the event bus, and the
+    /// reef resolution inputs (`reef_resolver`/`reef_user_manifest`). Held behind
+    /// an `Arc` so a child evaluator inherits the whole bundle by cloning one
+    /// refcount (invariant I1/I4).
+    host: Arc<HostServices>,
     pub env: Env,
     cwd: PathBuf,
     process_env: Vec<(OsString, OsString)>,
@@ -227,7 +312,6 @@ pub struct Evaluator {
     session: SessionCtx,
     pub it: Value,
     cancel: CancelToken,
-    adapters: AdapterCatalog,
     /// Runtime call-stack depth guard (defect #9).
     call_depth: usize,
     /// Nesting depth inside `fn` bodies — gates `cd`/env writes (defect #10).
@@ -254,14 +338,6 @@ pub struct Evaluator {
     /// overlay as a unit (closing the reef half of finding B3), not four
     /// separately-copyable fields.
     reef: ReefState,
-    /// reef: the provider stack, built lazily on the first *constrained*
-    /// resolution — never touched on the hot path when no manifest is in scope.
-    reef_resolver: Option<Arc<shoal_reef::Resolver>>,
-    /// reef: optional user-scope `shoal.toml` whose `[reef]` table forms the
-    /// user scope. `None` (the default) means no user scope — the zero-config,
-    /// zero-regression path. Hosts wire a real path via
-    /// [`Evaluator::set_reef_user_manifest`]; tests never point at real config.
-    reef_user_manifest: Option<PathBuf>,
     /// The journal entry id of the top-level statement currently executing, so
     /// nested fs mutations (rm/cp/mv/save) can attach undo inverses to it.
     /// `None` outside a journaled statement.
@@ -270,10 +346,6 @@ pub struct Evaluator {
     /// top-level statement's `src` for its journal entry (site/content/internals/language-conformance-contract.md). `None` when
     /// the host did not provide it — the entry's `src` is then left empty.
     source: Option<String>,
-    /// The in-language `channel(name)` event bus (site/content/internals/streams-channels.md). Shared
-    /// (Arc) so spawned tasks / `on(...)` handlers publish and subscribe to the
-    /// same session-scoped channels — coordination is channels, never files.
-    bus: Arc<channels::EventBus>,
     /// Set by the `exit`/`quit` builtin (defect: no `exit`). `Some(code)` asks
     /// the host to stop: `eval_program` halts its statement loop, and the host
     /// (REPL loop / `-c` / script runner) ends cleanly with `code`. Kept as a
@@ -307,29 +379,6 @@ pub struct Evaluator {
     /// dir_stack` (current first, bash's left-to-right order). Session-scoped
     /// ambient state like `cwd`; never journaled or persisted to disk.
     dir_stack: Vec<PathBuf>,
-    /// Hexagonal effect ports (site/content/internals/roadmap-and-priorities.md). Every direct filesystem,
-    /// spawn, clock, opener, and secret call the domain core makes routes
-    /// through one of these instead of `std::*`. The defaults are the `Std*`
-    /// adapters, which perform the identical inline calls — so a plain
-    /// `Evaluator::new` is byte-identical to the pre-ports behavior. Held as
-    /// `Arc<dyn Port>` so child evaluators (`parallel`, `source`, `spawn`)
-    /// share them cheaply and a test can interpose a fake. See
-    /// [`Evaluator::set_fs`] and friends.
-    fs: Arc<dyn Fs>,
-    exec: Arc<dyn Exec>,
-    clock: Arc<dyn Clock>,
-    opener: Arc<dyn Opener>,
-    secrets: Arc<dyn SecretPort>,
-    /// Resolved configuration snapshot backing the in-language `config`
-    /// namespace (`config.get`/`config.all`). The default is an empty snapshot
-    /// (no config injected → `config.get` is `null`, never a filesystem walk);
-    /// a host injects the *same* resolved `shoal_config::Config` it applies to
-    /// itself via [`Evaluator::set_config`], so in-language config == the
-    /// host-applied config. Held as `Arc<dyn ConfigPort>` like the other ports
-    /// so child evaluators inherit it cheaply (see [`ChildContext`]).
-    ///
-    /// [`ChildContext`]: child_context::ChildContext
-    config: Arc<dyn ConfigPort>,
 }
 
 enum Flow {
@@ -350,24 +399,21 @@ struct ExecMeta {
 impl Evaluator {
     pub fn new(cwd: PathBuf) -> Self {
         Self {
+            host: Arc::new(HostServices::new()),
             env: Env::root(),
             cwd,
             process_env: std::env::vars_os().collect(),
             session: SessionCtx::new(),
             it: Value::Null,
             cancel: CancelToken::new(),
-            adapters: AdapterCatalog::empty(),
             call_depth: 0,
             in_fn_body: 0,
             jobs: Vec::new(),
             external_jobs: std::collections::HashMap::new(),
             pending_stop: None,
             reef: ReefState::new(),
-            reef_resolver: None,
-            reef_user_manifest: None,
             current_entry: None,
             source: None,
-            bus: channels::EventBus::shared(),
             pending_exit: None,
             modules: std::collections::HashMap::new(),
             module_stack: Vec::new(),
@@ -375,12 +421,6 @@ impl Evaluator {
             jump_store: None,
             oldpwd: None,
             dir_stack: Vec::new(),
-            fs: Arc::new(StdFs),
-            exec: Arc::new(StdExec),
-            clock: Arc::new(StdClock),
-            opener: Arc::new(StdOpener),
-            secrets: Arc::new(StdSecret),
-            config: Arc::new(ConfigSnapshot::default()),
         }
     }
 
@@ -390,30 +430,30 @@ impl Evaluator {
     /// that deliberately interposes a fake. Child evaluators spawned after this
     /// call inherit the adapter.
     pub fn set_fs(&mut self, fs: Arc<dyn Fs>) {
-        self.fs = fs;
+        Arc::make_mut(&mut self.host).fs = fs;
     }
 
     /// Install a custom [`Exec`] adapter (spawn seam). Default: [`StdExec`].
     pub fn set_exec(&mut self, exec: Arc<dyn Exec>) {
-        self.exec = exec;
+        Arc::make_mut(&mut self.host).exec = exec;
     }
 
     /// Install a custom [`Clock`] (for deterministic journal timestamps under
     /// test). Default: [`StdClock`].
     pub fn set_clock(&mut self, clock: Arc<dyn Clock>) {
-        self.clock = clock;
+        Arc::make_mut(&mut self.host).clock = clock;
     }
 
     /// Install a custom [`Opener`] (the `open <path>` effect). Default:
     /// [`StdOpener`].
     pub fn set_opener(&mut self, opener: Arc<dyn Opener>) {
-        self.opener = opener;
+        Arc::make_mut(&mut self.host).opener = opener;
     }
 
     /// Install a custom [`SecretPort`] (secret-store reads). Default:
     /// [`StdSecret`].
     pub fn set_secrets(&mut self, secrets: Arc<dyn SecretPort>) {
-        self.secrets = secrets;
+        Arc::make_mut(&mut self.host).secrets = secrets;
     }
 
     /// Install the resolved-config snapshot backing the in-language `config`
@@ -424,7 +464,7 @@ impl Evaluator {
     /// it applies to itself, so in-language config == host-applied config.
     /// Child evaluators spawned after this call inherit the snapshot.
     pub fn set_config(&mut self, config: Arc<dyn ConfigPort>) {
-        self.config = config;
+        Arc::make_mut(&mut self.host).config = config;
     }
 
     /// Select how much of a script/`-c` run's top-level statement values
@@ -449,7 +489,7 @@ impl Evaluator {
     /// evaluators receive it through [`ChildContext`](child_context::ChildContext);
     /// there is no partial `set_bus`-style seam a child site could under-inherit.
     pub(crate) fn bus(&self) -> Arc<channels::EventBus> {
-        self.bus.clone()
+        self.host.bus.clone()
     }
 
     /// Install the hook that mirrors in-language `channel(x).emit(...)` onto a
@@ -457,7 +497,7 @@ impl Evaluator {
     /// Only `user.*` channels cross — the same client-writable rule as the
     /// wire's `events.publish`. Standalone hosts never call this.
     pub fn set_event_forwarder(&mut self, f: EventForwarder) {
-        self.bus.set_forwarder(f);
+        self.host.bus.set_forwarder(f);
     }
 
     /// A shareable handle to this session's in-language event bus, for hosts
@@ -465,7 +505,7 @@ impl Evaluator {
     /// `events.publish` must not stall behind a long-running exec). Inject via
     /// [`EventBus::inject`], which never re-forwards back out.
     pub fn event_bus(&self) -> Arc<EventBus> {
-        self.bus.clone()
+        self.host.bus.clone()
     }
 
     /// Consume any pending `exit`/`quit` request. `Some(code)` means the last
@@ -512,7 +552,7 @@ impl Evaluator {
     /// which is the zero-regression default. Changing the cwd next re-discovers
     /// the chain with this path folded in.
     pub fn set_reef_user_manifest(&mut self, path: impl Into<PathBuf>) {
-        self.reef_user_manifest = Some(path.into());
+        Arc::make_mut(&mut self.host).reef_user_manifest = Some(path.into());
         self.reef.chain = None;
     }
 
@@ -522,7 +562,14 @@ impl Evaluator {
     /// it to point the resolver at fixture-rooted binaries instead of the real
     /// system.
     pub fn set_reef_resolver(&mut self, resolver: Arc<shoal_reef::Resolver>) {
-        self.reef_resolver = Some(resolver);
+        // Replace the whole `OnceLock` so a preinstall always wins, even in the
+        // (never-hit in practice) case where a constrained resolution already
+        // memoized a default — this preserves the pre-decomposition setter's
+        // overwrite semantics exactly. Setters run at setup (refcount 1), so
+        // `make_mut` never actually clones the bundle.
+        let cell = OnceLock::new();
+        let _ = cell.set(resolver);
+        Arc::make_mut(&mut self.host).reef_resolver = cell;
     }
 
     /// Install the host's statement renderer (defect #1). Every statement-position
@@ -754,13 +801,13 @@ impl Evaluator {
     }
 
     pub fn set_adapters(&mut self, adapters: AdapterCatalog) {
-        self.adapters = adapters;
+        Arc::make_mut(&mut self.host).adapters = adapters;
     }
 
     pub fn load_bundled_adapters(&mut self) -> Vec<String> {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../adapters");
         let (catalog, warnings) = AdapterCatalog::load_dir(&root);
-        self.adapters = catalog;
+        Arc::make_mut(&mut self.host).adapters = catalog;
         warnings
     }
 
@@ -796,7 +843,7 @@ impl CallCtx for Evaluator {
     /// `StdFs` default, so `.save`/`.append` write sinks are mediated by
     /// whatever adapter `set_fs` installed (HR-C follow-through wire).
     fn fs(&self) -> &dyn Fs {
-        &*self.fs
+        &*self.host.fs
     }
 }
 

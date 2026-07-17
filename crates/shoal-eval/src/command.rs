@@ -274,10 +274,10 @@ impl Evaluator {
                 self.cwd.join(script_path)
             };
             if is_source {
-                let src = self
-                    .fs
-                    .read_to_string(&path)
-                    .map_err(|e| ErrorVal::new("io_error", format!("cannot read script: {e}")))?;
+                let src =
+                    self.host.fs.read_to_string(&path).map_err(|e| {
+                        ErrorVal::new("io_error", format!("cannot read script: {e}"))
+                    })?;
                 let program = shoal_syntax::parse(&src)
                     .map_err(|e| ErrorVal::new("parse_error", e.to_string()))?;
                 return self.eval_program(&program);
@@ -291,7 +291,7 @@ impl Evaluator {
         }
         // `^name` bypasses adapters too (language card): the forced head must
         // reach the real command, not the adapter's flag/signature gate.
-        if !call.forced && self.adapters.lookup(&call.head).is_some() {
+        if !call.forced && self.host.adapters.lookup(&call.head).is_some() {
             return self.eval_adapter(call, position);
         }
         let mut argv = vec![OsString::from(&call.head)];
@@ -310,7 +310,7 @@ impl Evaluator {
         let Value::Outcome(out) = &value else {
             return Ok(value);
         };
-        let fs = self.fs.clone();
+        let fs = self.host.fs.clone();
         for r in &call.redirects {
             let target = self.arg_path(&r.target)?;
             match r.kind {
@@ -469,6 +469,7 @@ impl Evaluator {
 
     pub(crate) fn eval_adapter(&mut self, call: &CmdCall, position: Position) -> VResult<Value> {
         let adapter = self
+            .host
             .adapters
             .lookup(&call.head)
             .expect("checked adapter")
@@ -688,7 +689,7 @@ impl Evaluator {
         };
         // Spawn through the Exec port (site/content/internals/roadmap-and-priorities.md). The default
         // `StdExec` is `shoal_exec::run` verbatim, so this is byte-identical.
-        let exec = self.exec.clone();
+        let exec = self.host.exec.clone();
         let mut r = exec
             .run(
                 ExecSpec {
@@ -820,7 +821,7 @@ impl Evaluator {
             .ingest_spill(&spill.path, &spill.hash, spill.len, true)
             .is_err()
         {
-            let _ = self.fs.remove_file(&spill.path);
+            let _ = self.host.fs.remove_file(&spill.path);
             return None;
         }
         let loader = CasBytesLoader {
@@ -963,7 +964,7 @@ impl Evaluator {
         } else {
             self.ambient_which(&argv0.to_string_lossy())?
         };
-        let bytes = self.fs.read(&resolved).ok()?;
+        let bytes = self.host.fs.read(&resolved).ok()?;
         Some(shoal_reef::hashcache::hash_bytes(&bytes))
     }
 
@@ -981,7 +982,7 @@ impl Evaluator {
         if name.contains('/') || name.contains('.') {
             return false;
         }
-        if self.adapters.lookup(name).is_some() {
+        if self.host.adapters.lookup(name).is_some() {
             return true;
         }
         let path = self
@@ -1025,7 +1026,7 @@ impl Evaluator {
             .iter()
             .map(|s| (*s).to_owned())
             .collect();
-        candidates.extend(self.adapters.names().map(str::to_owned));
+        candidates.extend(self.host.adapters.names().map(str::to_owned));
         for name in self.env.visible_names() {
             if self.env.get(&name).is_some_and(|v| v.is_callable()) {
                 candidates.push(name);

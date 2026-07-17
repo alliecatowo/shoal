@@ -51,7 +51,7 @@ pub(super) fn run(ev: &mut Evaluator, call: &CmdCall) -> VResult<Value> {
             .collect::<VResult<Vec<_>>>()
             .map_err(|e| e.or_span(call.span))?;
     }
-    let fs = ev.fs.clone();
+    let fs = ev.host.fs.clone();
     dispatch(
         &call.head,
         fs.as_ref(),

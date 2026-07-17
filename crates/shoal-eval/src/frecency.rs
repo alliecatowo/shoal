@@ -286,10 +286,10 @@ impl Evaluator {
         let Some(path) = self.jump_store.clone() else {
             return; // recording disabled (scripts / -c / conformance)
         };
-        let now = self.clock.now_ns() / 1_000_000_000;
-        let mut store = FrecencyStore::load(self.fs.as_ref(), &path);
+        let now = self.host.clock.now_ns() / 1_000_000_000;
+        let mut store = FrecencyStore::load(self.host.fs.as_ref(), &path);
         store.add(dir, now);
-        let _ = store.save(self.fs.as_ref(), &path);
+        let _ = store.save(self.host.fs.as_ref(), &path);
     }
 
     /// The `j`/`jump` builtin: resolve the best matching stored directory for an
@@ -355,8 +355,8 @@ impl Evaluator {
                 return Ok(direct);
             }
         }
-        let now = self.clock.now_ns() / 1_000_000_000;
-        let store = FrecencyStore::load(self.fs.as_ref(), &self.jump_read_path());
+        let now = self.host.clock.now_ns() / 1_000_000_000;
+        let store = FrecencyStore::load(self.host.fs.as_ref(), &self.jump_read_path());
         for e in store.ranked(query, now) {
             if e.path.is_dir() {
                 return Ok(e.path.clone());

@@ -529,11 +529,11 @@ fn os_uptime() -> Value {
 /// this is an empty record, so `config.all` is `{}` and `config.get(key)` is
 /// `null` — the same zero-config answer as before, with no filesystem walk.
 fn config_record(ev: &Evaluator) -> VResult<Value> {
-    Ok(ev.config.snapshot().clone())
+    Ok(ev.host.config.snapshot().clone())
 }
 
 fn config_get(ev: &Evaluator, key: &str) -> VResult<Value> {
-    match ev.config.snapshot() {
+    match ev.host.config.snapshot() {
         Value::Record(r) => Ok(r.get(key).cloned().unwrap_or(Value::Null)),
         _ => Ok(Value::Null),
     }

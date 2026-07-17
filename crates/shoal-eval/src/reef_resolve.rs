@@ -29,7 +29,7 @@ impl Evaluator {
         if !fresh {
             return;
         }
-        let chain = ScopeChain::discover(&self.cwd, self.reef_user_manifest.as_deref());
+        let chain = ScopeChain::discover(&self.cwd, self.host.reef_user_manifest.as_deref());
         self.reef.lock_path = chain
             .scopes
             .iter()
@@ -102,11 +102,14 @@ impl Evaluator {
 
     /// The lazily-built provider stack (site/content/internals/reef-resolution.md). Only ever called once a
     /// manifest is in scope, so the no-manifest hot path never constructs it.
+    /// The default is memoized in the shared [`HostServices`] `OnceLock`, so the
+    /// build happens at most once per session and is visible to every child that
+    /// shares the bundle (a host may preinstall one via `set_reef_resolver`).
     pub(crate) fn reef_resolver(&mut self) -> Arc<Resolver> {
-        if self.reef_resolver.is_none() {
-            self.reef_resolver = Some(Arc::new(Resolver::with_defaults()));
-        }
-        self.reef_resolver.as_ref().expect("just set").clone()
+        self.host
+            .reef_resolver
+            .get_or_init(|| Arc::new(Resolver::with_defaults()))
+            .clone()
     }
 
     /// True when at least one manifest — discovered or a `with reef:`

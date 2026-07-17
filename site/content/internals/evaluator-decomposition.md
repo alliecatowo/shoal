@@ -7,7 +7,7 @@ template = "docs/page.html"
 [extra]
 group = "Maintenance"
 eyebrow = "Design record"
-status = "Staged extraction — steps 1–3 landed; steps 4–6 pending a quiet window"
+status = "Staged extraction — steps 1–4 landed; steps 5–6 pending a quiet window"
 audience = "Runtime and security contributors"
 wide = true
 +++
@@ -24,11 +24,11 @@ rather than by discipline.
 
 This page proposes the target shape and a staged extraction plan. It **builds on the HR-B1
 seam** — the single authoritative child-evaluator constructor introduced by workstream B — and
-assumes that seam exists as its prerequisite. **Steps 1–3 have landed** on
-`hardening/deep-audit-2026-07` (characterization tests, then `SessionCtx`, then `ReefState`); the
-staged-plan section below records each step's status. Steps 4–6 (the broad `HostServices`/
-`ExecState` renames and the copy-site deletion) remain scheduled for a low-contention window and
-are unimplemented.
+assumes that seam exists as its prerequisite. **Steps 1–4 have landed** on
+`hardening/deep-audit-2026-07` (characterization tests, then `SessionCtx`, then `ReefState`, then
+`HostServices`); the staged-plan section below records each step's status. Steps 5–6 (the `ExecState`
+extraction that collapses `Evaluator` to the three-field façade and the copy-site deletion) remain
+scheduled for a low-contention window and are unimplemented.
 
 The authoritative live description of today's state is
 [evaluator state and control flow](@/internals/evaluator-state.md); read its "Child evaluator
@@ -347,13 +347,25 @@ unit. The session-long resolution *inputs* `reef_resolver` and `reef_user_manife
 stay separate top-level fields (they are Class-1 host services headed for `HostServices` at
 step 4), not part of the per-eval overlay/cache bundle.*
 
-**Step 4 — Extract `HostServices` behind `Arc`.** Move the ten Class-1 fields into
+**Step 4 — Extract `HostServices` behind `Arc`. ✅ Landed.** Move the ten Class-1 fields into
 `HostServices`, hold `Arc<HostServices>`, rewrite `self.fs` → `self.host.fs` (and siblings)
-across ~15 modules, and replace `inherit_ports` with `host: parent.host.clone()`. Mechanically
-simple (these fields are never eval-mutated) but the **broadest textual rename** in the plan.
+across ~15 modules, and replace the per-field child copy with `host: parent.host.clone()`.
+Mechanically simple (these fields are never eval-mutated) but the **broadest textual rename** in the
+plan.
 *Size: ~1 agent-day. Conflicts: **Workstream C (HR-C1–C3)** adds `self.fs` call sites;
 **HR-A9** reads `adapters`/reef inputs. Schedule in a low-contention window **after** C and A9
 settle; the rename is mergeable but noisy.*
+*Landed: `HostServices { fs, exec, clock, opener, secrets, config, adapters, bus, reef_resolver,
+reef_user_manifest }` (`#[derive(Clone)]`) held as `Evaluator.host: Arc<HostServices>`; `ChildContext`
+now carries the whole bundle as one shared `host: Arc<HostServices>` cloned by refcount, so config,
+the event bus, and both reef resolution inputs can no longer be dropped individually at a child site
+(the config-drop half of finding B3 closes by construction). The `set_*` setters rebuild through
+`Arc::make_mut` — they run at host setup while the refcount is 1, so no clone actually happens, and
+the census's "mutated in `lib.rs` only" (I4) holds. The one eval-path writer, the lazy default
+`reef_resolver` build, became a `OnceLock<Arc<Resolver>>` one-shot memoization visible through the
+shared `Arc` — behaviorally identical (the default `Resolver::with_defaults()` is deterministic and
+a host-preinstalled resolver is set before any child exists) but without a `&mut` seam on the shared
+bundle. `CallCtx::fs()` still hands value methods `&*self.host.fs`, byte-identical.*
 
 **Step 5 — Extract `ExecState` and collapse `Evaluator` to the three-field façade.** Move the
 remaining Class-3 fields into `ExecState`; `Evaluator` becomes `{ host, session, exec }`. Field
@@ -377,7 +389,7 @@ anyone editing those concurrency paths.*
 | 1 ✅ | test module | — | landed |
 | 2 ✅ | journal.rs, command.rs, lib.rs | HR-D1–D7 | landed |
 | 3 ✅ | reef_resolve.rs, reef_builtins.rs, lib.rs | HR-J1, reef work | landed |
-| 4 | ~15 modules (`self.fs`→`self.host.fs`) | HR-C1–C3, HR-A9 | low-contention window, after C/A9 |
+| 4 ✅ | ~15 modules (`self.fs`→`self.host.fs`) | HR-C1–C3, HR-A9 | landed |
 | 5 | stmt/command/expr/call/modules | eval-heavy work | low eval-edit-pressure window |
 | 6 | script.rs, host.rs, channels.rs | concurrency-path edits | coordinate on child sites |
 
