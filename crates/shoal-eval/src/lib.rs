@@ -27,6 +27,7 @@ mod reef;
 mod reef_builtins;
 mod reef_resolve;
 mod reef_state;
+mod resolution;
 mod script;
 mod session_ctx;
 mod stmt;

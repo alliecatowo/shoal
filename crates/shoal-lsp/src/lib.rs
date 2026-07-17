@@ -1,3 +1,4 @@
+use shoal_syntax::commands::{CommandFacts, CommandSource, resolve_command_source};
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
 use tower_lsp::{Client, LanguageServer, jsonrpc::Result, lsp_types::*};
@@ -94,7 +95,7 @@ impl LanguageServer for Backend {
             names
                 .into_iter()
                 .map(|label| CompletionItem {
-                    kind: Some(CompletionItemKind::KEYWORD),
+                    kind: Some(completion_kind(&label)),
                     label,
                     ..Default::default()
                 })
@@ -118,6 +119,15 @@ impl LanguageServer for Backend {
             }),
             range: None,
         }))
+    }
+}
+
+fn completion_kind(label: &str) -> CompletionItemKind {
+    match resolve_command_source(label, CommandFacts::default()) {
+        CommandSource::StructuredBuiltin | CommandSource::SpecialBuiltin => {
+            CompletionItemKind::FUNCTION
+        }
+        _ => CompletionItemKind::KEYWORD,
     }
 }
 
@@ -247,6 +257,13 @@ mod tests {
         for head in ["cd", "ls", "reef", "jobs", "history", "undo", "plan"] {
             assert!(vocab.contains(&head), "missing builtin `{head}`");
         }
+    }
+
+    #[test]
+    fn completion_kinds_use_shared_command_classification() {
+        assert_eq!(completion_kind("ls"), CompletionItemKind::FUNCTION);
+        assert_eq!(completion_kind("cd"), CompletionItemKind::FUNCTION);
+        assert_eq!(completion_kind("let"), CompletionItemKind::KEYWORD);
     }
 
     #[test]

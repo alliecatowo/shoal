@@ -5,6 +5,7 @@
 use super::*;
 
 use crate::plan_effects::{parse_declared_effect, push_effect};
+use shoal_syntax::commands::CommandSource;
 
 impl Evaluator {
     /// Derive a conservative, concrete plan without spawning or mutating.
@@ -372,23 +373,23 @@ impl Evaluator {
         if let Some(body) = functions.get(&call.head) {
             return self.plan_block(body, functions, aliases, out, depth + 1);
         }
+        let resolution = self.resolve_command(call);
         // A bound session closure/fn (not one declared in this program) shadows
         // builtin/adapter/external dispatch and cannot be statically expanded
         // (A5): require approval rather than reporting nothing.
-        if self
-            .exec
-            .shell
-            .env
-            .get(&call.head)
-            .is_some_and(|v| v.is_callable())
-        {
+        if resolution.source == CommandSource::SessionCallable {
             push_effect(out, Effect::Opaque);
+            return Ok(());
+        }
+        // A bare non-callable binding evaluates as a value at runtime. The
+        // planner must not invent an external spawn for the same command shape.
+        if resolution.source == CommandSource::BoundValue {
             return Ok(());
         }
         // Effectful heads the runtime intercepts before builtin/adapter dispatch
         // (A8), mirroring `eval_command`'s special-head order.
-        match call.head.as_str() {
-            "interact" => {
+        match (resolution.source, call.head.as_str()) {
+            (CommandSource::SpecialBuiltin, "interact") => {
                 // `interact <cmd ...>` bypasses normal command dispatch and
                 // runs the first argument through `run_argv` in PTY mode. The
                 // process is the argument, not a fictitious external binary
@@ -399,21 +400,21 @@ impl Evaluator {
                 }
                 return Ok(());
             }
-            "open" => {
+            (CommandSource::SpecialBuiltin, "open") => {
                 let path = call.args.first().and_then(|a| self.cmd_arg_path_literal(a));
                 self.plan_open(path, out);
                 return Ok(());
             }
-            "save" => {
+            (CommandSource::SpecialBuiltin, "save") => {
                 let path = call.args.first().and_then(|a| self.cmd_arg_path_literal(a));
                 self.plan_save(path, out);
                 return Ok(());
             }
-            "run" => {
+            (CommandSource::SpecialBuiltin, "run") => {
                 self.plan_run_target(call.args.first().and_then(cmd_arg_str_literal), out);
                 return Ok(());
             }
-            "source" => {
+            (CommandSource::SpecialBuiltin, "source") => {
                 // `source <path>` reads and runs a script in this session.
                 if let Some(p) = call.args.first().and_then(|a| self.cmd_arg_path_literal(a)) {
                     push_effect(out, Effect::FsRead { paths: vec![p] });
@@ -424,7 +425,7 @@ impl Evaluator {
             _ => {}
         }
         // A `.shl` head runs a script file in a child evaluator (arbitrary code).
-        if call.head.ends_with(".shl") {
+        if resolution.source == CommandSource::Script {
             push_effect(
                 out,
                 Effect::FsRead {
@@ -434,7 +435,7 @@ impl Evaluator {
             push_effect(out, Effect::Opaque);
             return Ok(());
         }
-        if builtins::is_builtin(&call.head) {
+        if resolution.source == CommandSource::StructuredBuiltin {
             for effect in self.builtin_effects(call)? {
                 push_effect(out, effect);
             }
@@ -445,7 +446,7 @@ impl Evaluator {
         // canonical registry rather than maintaining a planner-only name list:
         // `history` previously fell through as an external ProcSpawn even
         // though runtime dispatch reads the journal, causing Leash to deny it.
-        if builtins::is_special_head(&call.head) {
+        if resolution.source == CommandSource::SpecialBuiltin {
             match call.head.as_str() {
                 "cd" | "pushd" | "popd" | "j" | "jump" | "exit" | "quit" => {
                     push_effect(out, Effect::SessionWrite);
@@ -470,7 +471,13 @@ impl Evaluator {
             }
             return Ok(());
         }
-        if let Some(adapter) = self.host.adapters.lookup(&call.head).cloned() {
+        if resolution.source == CommandSource::Adapter {
+            let adapter = self
+                .host
+                .adapters
+                .lookup(&call.head)
+                .cloned()
+                .expect("adapter resolution carries a catalog entry");
             let (spec, start) = match call.args.first() {
                 Some(CmdArg::Word { text, .. }) if adapter.subs.contains_key(text) => {
                     (adapter.subs[text].clone(), 1)
@@ -499,6 +506,7 @@ impl Evaluator {
                 },
             );
         } else {
+            debug_assert_eq!(resolution.source, CommandSource::External);
             // A generic external command spawns concretely (A6): resolve and
             // hash the binary like an adapter spawn, rather than collapsing to
             // Opaque and hiding what actually runs.
@@ -1033,6 +1041,31 @@ effects=["proc.spawn(container)", "net.connect(registry:443)", "quantum.entangle
                 "session closure `{src}` was reported effect-free: {effects:?}"
             );
         }
+    }
+
+    #[test]
+    fn planner_and_runtime_agree_on_non_callable_binding_shadow() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ev = Evaluator::new(dir.path().into());
+        ev.env_mut().declare("ls", Value::Int(42), false);
+
+        let bare = shoal_syntax::parse("ls").unwrap();
+        assert_eq!(ev.eval_program(&bare).unwrap(), Value::Int(42));
+        assert!(
+            ev.plan_program(&bare).unwrap().effects.is_empty(),
+            "planning must not invent a process or filesystem effect for a bound value"
+        );
+
+        let with_arg = ev
+            .plan_program(&shoal_syntax::parse("ls .").unwrap())
+            .unwrap();
+        assert!(
+            with_arg
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::FsRead { .. })),
+            "an ineligible value shadow must fall through to the builtin"
+        );
     }
 
     /// A6: generic external commands derive a concrete ProcSpawn (like adapter

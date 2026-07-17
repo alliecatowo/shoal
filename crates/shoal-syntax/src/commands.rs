@@ -12,6 +12,73 @@
 
 use std::sync::LazyLock;
 
+/// The winning layer in command-head resolution, ordered from most local to
+/// most ambient. Consumers add their own payload (the bound value, adapter
+/// schema, executable path, or Reef report) after this common classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CommandSource {
+    SessionCallable,
+    BoundValue,
+    StructuredBuiltin,
+    SpecialBuiltin,
+    Script,
+    Adapter,
+    External,
+}
+
+/// Canonical command precedence. This is intentionally executable data rather
+/// than prose so evaluator, planner, completion, highlighting, and LSP can pin
+/// their presentation and collision tests to the same order.
+pub const COMMAND_PRECEDENCE: &[CommandSource] = &[
+    CommandSource::SessionCallable,
+    CommandSource::BoundValue,
+    CommandSource::StructuredBuiltin,
+    CommandSource::SpecialBuiltin,
+    CommandSource::Script,
+    CommandSource::Adapter,
+    CommandSource::External,
+];
+
+/// Dynamic facts needed to classify a parsed command head. The classifier is
+/// deliberately independent of evaluator/value/adapter crates so every command
+/// consumer can use it without introducing a dependency cycle.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CommandFacts {
+    pub session_callable: bool,
+    pub session_value: bool,
+    pub value_eligible: bool,
+    pub forced: bool,
+    pub adapter: bool,
+}
+
+/// Resolve one command head against the canonical precedence table.
+///
+/// `^` preserves callable and builtin dispatch, but bypasses a non-callable
+/// lexical shadow and adapters. A bound non-callable value wins only for the
+/// argument/redirect/env-prefix-free shape that runtime can evaluate as a
+/// value.
+pub fn resolve_command_source(name: &str, facts: CommandFacts) -> CommandSource {
+    if facts.session_callable {
+        return CommandSource::SessionCallable;
+    }
+    if facts.session_value && facts.value_eligible && !facts.forced {
+        return CommandSource::BoundValue;
+    }
+    if is_builtin(name) {
+        return CommandSource::StructuredBuiltin;
+    }
+    if is_special_head(name) {
+        return CommandSource::SpecialBuiltin;
+    }
+    if name.ends_with(".shl") {
+        return CommandSource::Script;
+    }
+    if facts.adapter && !facts.forced {
+        return CommandSource::Adapter;
+    }
+    CommandSource::External
+}
+
 /// Structured builtins dispatched by `shoal-eval`'s `builtins::run`/`dispatch` —
 /// the fs / env / sleep family that produces a typed `Value` from raw CMD words.
 /// This is the set [`is_builtin`] gates the generic dispatch on; keeping it
@@ -120,5 +187,119 @@ mod tests {
                 "`{name}` must be reachable through exactly one predicate"
             );
         }
+    }
+
+    #[test]
+    fn command_precedence_is_explicit_and_complete() {
+        assert_eq!(
+            COMMAND_PRECEDENCE,
+            &[
+                CommandSource::SessionCallable,
+                CommandSource::BoundValue,
+                CommandSource::StructuredBuiltin,
+                CommandSource::SpecialBuiltin,
+                CommandSource::Script,
+                CommandSource::Adapter,
+                CommandSource::External,
+            ]
+        );
+    }
+
+    #[test]
+    fn forced_heads_bypass_only_values_and_adapters() {
+        let forced = CommandFacts {
+            session_value: true,
+            value_eligible: true,
+            forced: true,
+            adapter: true,
+            ..CommandFacts::default()
+        };
+        assert_eq!(
+            resolve_command_source("tool", forced),
+            CommandSource::External
+        );
+        assert_eq!(
+            resolve_command_source("ls", forced),
+            CommandSource::StructuredBuiltin
+        );
+        assert_eq!(
+            resolve_command_source(
+                "tool",
+                CommandFacts {
+                    session_callable: true,
+                    ..forced
+                }
+            ),
+            CommandSource::SessionCallable
+        );
+    }
+
+    #[test]
+    fn every_collision_chooses_the_first_precedence_layer() {
+        let all = CommandFacts {
+            session_callable: true,
+            session_value: true,
+            value_eligible: true,
+            forced: false,
+            adapter: true,
+        };
+        assert_eq!(
+            resolve_command_source("ls", all),
+            CommandSource::SessionCallable
+        );
+        assert_eq!(
+            resolve_command_source(
+                "ls",
+                CommandFacts {
+                    session_callable: false,
+                    ..all
+                }
+            ),
+            CommandSource::BoundValue
+        );
+        assert_eq!(
+            resolve_command_source(
+                "ls",
+                CommandFacts {
+                    session_callable: false,
+                    session_value: false,
+                    ..all
+                }
+            ),
+            CommandSource::StructuredBuiltin
+        );
+        assert_eq!(
+            resolve_command_source(
+                "cd",
+                CommandFacts {
+                    session_callable: false,
+                    session_value: false,
+                    ..all
+                }
+            ),
+            CommandSource::SpecialBuiltin
+        );
+        assert_eq!(
+            resolve_command_source(
+                "build.shl",
+                CommandFacts {
+                    session_callable: false,
+                    session_value: false,
+                    ..all
+                }
+            ),
+            CommandSource::Script
+        );
+        assert_eq!(
+            resolve_command_source(
+                "tool",
+                CommandFacts {
+                    session_callable: false,
+                    session_value: false,
+                    ..all
+                }
+            ),
+            CommandSource::Adapter
+        );
     }
 }

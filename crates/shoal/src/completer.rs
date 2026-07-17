@@ -22,7 +22,7 @@ use std::time::SystemTime;
 
 use reedline::{Completer, Span as RlSpan, Suggestion};
 use shoal_adapters::{AdapterCatalog, CmdAdapter};
-use shoal_syntax::commands::builtin_names;
+use shoal_syntax::commands::{CommandFacts, CommandSource, builtin_names, resolve_command_source};
 use shoal_syntax::lexer::RESERVED;
 use shoal_syntax::{Lexer, Mode, Tok};
 use shoal_value::{Env, Value, method_names, methods_for};
@@ -151,6 +151,22 @@ impl ShoalCompleter {
         self.adapters.iter().find_map(|c| c.lookup(head))
     }
 
+    fn head_source(&self, head: &str) -> CommandSource {
+        let binding = self.env.get(head);
+        resolve_command_source(
+            head,
+            CommandFacts {
+                session_callable: binding.as_ref().is_some_and(Value::is_callable),
+                session_value: binding.as_ref().is_some_and(|value| !value.is_callable()),
+                // Flag completion means the head already has an argument, so a
+                // non-callable lexical value cannot win this command shape.
+                value_eligible: false,
+                forced: false,
+                adapter: self.adapter_lookup(head).is_some(),
+            },
+        )
+    }
+
     /// Match `name` against `prefix` per `[completion]` config
     /// (site/content/internals/configuration-reference.md): case-(in)sensitively per `case_insensitive`, and
     /// via a non-contiguous subsequence test — a strict superset of prefix
@@ -221,26 +237,34 @@ impl ShoalCompleter {
     /// the signature").
     fn flag_candidates(&self, head: &str, prefix: &str) -> Vec<String> {
         let mut names: BTreeSet<String> = BTreeSet::new();
-        if let Some(adapter) = self.adapter_lookup(head) {
-            for p in &adapter.top.params {
-                names.insert(format!("--{}", p.name));
-            }
-            for short in adapter.top.short_flags.keys() {
-                names.insert(format!("-{short}"));
-            }
-            for sub in adapter.subs.values() {
-                for p in &sub.params {
+        match self.head_source(head) {
+            CommandSource::Adapter => {
+                let adapter = self
+                    .adapter_lookup(head)
+                    .expect("adapter resolution carries its catalog entry");
+                for p in &adapter.top.params {
                     names.insert(format!("--{}", p.name));
                 }
-                for short in sub.short_flags.keys() {
+                for short in adapter.top.short_flags.keys() {
                     names.insert(format!("-{short}"));
                 }
+                for sub in adapter.subs.values() {
+                    for p in &sub.params {
+                        names.insert(format!("--{}", p.name));
+                    }
+                    for short in sub.short_flags.keys() {
+                        names.insert(format!("-{short}"));
+                    }
+                }
             }
-        }
-        if let Some(Value::Closure(c)) = self.env.get(head) {
-            for p in &c.params {
-                names.insert(format!("--{}", p.name));
+            CommandSource::SessionCallable => {
+                if let Some(Value::Closure(c)) = self.env.get(head) {
+                    for p in &c.params {
+                        names.insert(format!("--{}", p.name));
+                    }
+                }
             }
+            _ => {}
         }
         names.retain(|n| self.candidate_matches(n, prefix));
         names.into_iter().collect()
@@ -1240,6 +1264,36 @@ flags  = { short = { s = "short" } }
         assert!(flags.iter().any(|f| f == "--short"));
         let short = c.flag_candidates("git", "-");
         assert!(short.iter().any(|f| f == "-s"));
+    }
+
+    #[test]
+    fn callable_shadow_hides_adapter_flags_by_shared_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("tool.toml"),
+            r#"
+[cmd.tool]
+bin = "tool"
+params = { adapter_only = "bool" }
+"#,
+        )
+        .unwrap();
+        let (catalog, warnings) = AdapterCatalog::load_dir(dir.path());
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        let mut evaluator = shoal_eval::Evaluator::new(dir.path().into());
+        evaluator
+            .eval_program(&shoal_syntax::parse("fn tool(session_only: bool) { null }").unwrap())
+            .unwrap();
+        let completer = ShoalCompleter::new(
+            evaluator.env().clone(),
+            Arc::new(Mutex::new(PathBuf::from("."))),
+            vec![catalog],
+            vec!["tool".into()],
+        );
+        let flags = completer.flag_candidates("tool", "--");
+        assert!(flags.iter().any(|flag| flag == "--session_only"));
+        assert!(!flags.iter().any(|flag| flag == "--adapter_only"));
     }
 
     #[test]

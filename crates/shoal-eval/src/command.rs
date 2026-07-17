@@ -5,6 +5,7 @@
 use super::*;
 use crate::coerce::{coerce_call_args, signature, validate_adapter_value};
 use crate::host::builtin_outcome;
+use shoal_syntax::commands::CommandSource;
 
 impl Evaluator {
     pub(crate) fn eval_command(&mut self, call: &CmdCall, position: Position) -> VResult<Value> {
@@ -26,11 +27,14 @@ impl Evaluator {
             };
             return self.spawn_block(body);
         }
+        let resolution = self.resolve_command(call);
         // Session callables (fns/aliases) resolve as commands even when `^`-forced
         // (defect #3): `^` bypasses only non-callable let/var shadows.
-        if let Some(bound) = self.exec.shell.env.get(&call.head)
-            && bound.is_callable()
-        {
+        if resolution.source == CommandSource::SessionCallable {
+            let bound = resolution
+                .binding
+                .clone()
+                .expect("callable resolution carries its binding");
             // `deploy --help` synthesises the signature + doc (site/content/internals/language-conformance-contract.md, defect #12).
             if let Value::Closure(c) = &bound
                 && call
@@ -125,14 +129,10 @@ impl Evaluator {
         }
         // A bare word bound to a non-callable value (e.g. `it`, `out`, or any
         // `let`) resolves to that value — bound names dispatch as EXPR (site/content/internals/language-conformance-contract.md).
-        if let Some(bound) = self.exec.shell.env.get(&call.head)
-            && !call.forced
-            && !bound.is_callable()
-            && call.args.is_empty()
-            && call.redirects.is_empty()
-            && call.env_prefix.is_empty()
-        {
-            return Ok(bound);
+        if resolution.source == CommandSource::BoundValue {
+            return Ok(resolution
+                .binding
+                .expect("value resolution carries its binding"));
         }
         if call.head == "jobs" {
             return Ok(self.jobs_table());
@@ -200,7 +200,7 @@ impl Evaluator {
         if call.head == "journal" || call.head == "history" {
             return self.builtin_journal_view(call);
         }
-        if builtins::is_builtin(&call.head) {
+        if resolution.source == CommandSource::StructuredBuiltin {
             // Outcome unification (P1a): a builtin yields a `Value::Outcome`
             // exactly like an external command — its structured result becomes
             // the outcome's `.out` (`parsed`), `status = 0`/`ok = true`. A
@@ -250,7 +250,7 @@ impl Evaluator {
             let target = vs.remove(0);
             return self.run_poly(target, vs, position);
         }
-        if call.head == "source" || call.head.ends_with(".shl") {
+        if call.head == "source" || resolution.source == CommandSource::Script {
             let is_source = call.head == "source";
             let script_path = if is_source {
                 let p = call
@@ -291,9 +291,10 @@ impl Evaluator {
         }
         // `^name` bypasses adapters too (language card): the forced head must
         // reach the real command, not the adapter's flag/signature gate.
-        if !call.forced && self.host.adapters.lookup(&call.head).is_some() {
+        if resolution.source == CommandSource::Adapter {
             return self.eval_adapter(call, position);
         }
+        debug_assert_eq!(resolution.source, CommandSource::External);
         let mut argv = vec![OsString::from(&call.head)];
         for a in &call.args {
             for v in self.expand_arg(a)? {
