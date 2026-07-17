@@ -150,7 +150,7 @@ Rules for implementers:
   passes with and without `NO_COLOR=1`. *(H13)*
 - [x] **HR-F4** — A scheduled CI job runs the fuzz targets on a short nightly budget and
   surfaces failures. *(H12)*
-- [ ] **HR-F5** — Benchmark honesty: delete or implement the prompt benchmark's per-PR/p99
+- [x] **HR-F5** — Benchmark honesty: delete or implement the prompt benchmark's per-PR/p99
   claims; make `table_1m_where_sort` exercise the real evaluator/table methods or rename/remove
   it. *(I12)*
 - [ ] **HR-F6** — Supply-chain advisories checked in CI (`cargo audit` or `cargo deny`) with a
