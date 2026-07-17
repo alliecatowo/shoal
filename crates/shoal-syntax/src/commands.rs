@@ -74,6 +74,9 @@ pub struct CommandFacts {
     pub session_value: bool,
     pub value_eligible: bool,
     pub forced: bool,
+    /// `run(name, ...)` deliberately invokes an external command dynamically,
+    /// bypassing lexical, builtin, script, and adapter dispatch.
+    pub dynamic_run: bool,
     pub adapter: bool,
 }
 
@@ -84,6 +87,9 @@ pub struct CommandFacts {
 /// argument/redirect/env-prefix-free shape that runtime can evaluate as a
 /// value.
 pub fn resolve_command_source(name: &str, facts: CommandFacts) -> CommandSource {
+    if facts.dynamic_run {
+        return CommandSource::External;
+    }
     if facts.session_callable {
         return CommandSource::SessionCallable;
     }
@@ -237,6 +243,7 @@ mod tests {
             session_value: true,
             value_eligible: true,
             forced: true,
+            dynamic_run: false,
             adapter: true,
             ..CommandFacts::default()
         };
@@ -267,6 +274,7 @@ mod tests {
             session_value: true,
             value_eligible: true,
             forced: false,
+            dynamic_run: false,
             adapter: true,
         };
         assert_eq!(
@@ -327,5 +335,21 @@ mod tests {
             ),
             CommandSource::Adapter
         );
+    }
+
+    #[test]
+    fn dynamic_run_bypasses_every_named_layer() {
+        let source = resolve_command_source(
+            "ls",
+            CommandFacts {
+                session_callable: true,
+                session_value: true,
+                value_eligible: true,
+                forced: false,
+                dynamic_run: true,
+                adapter: true,
+            },
+        );
+        assert_eq!(source, CommandSource::External);
     }
 }

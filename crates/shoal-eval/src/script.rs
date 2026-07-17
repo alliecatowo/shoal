@@ -136,6 +136,10 @@ impl Evaluator {
             return self.run_script_file(&resolved, ext.as_deref(), args, position);
         }
         // Dynamic command invocation (value semantics like any command).
+        debug_assert_eq!(
+            self.resolve_dynamic_run(&name).source,
+            shoal_syntax::commands::CommandSource::External
+        );
         let mut argv = vec![OsString::from(&name)];
         for v in args {
             argv.push(self.argv_value(v)?);

@@ -634,6 +634,10 @@ impl Evaluator {
                     && !name.starts_with('~')
                     && Path::new(&name).extension().is_none() =>
             {
+                debug_assert_eq!(
+                    self.resolve_dynamic_run(&name).source,
+                    CommandSource::External
+                );
                 self.plan_external_spawn(&name, out);
             }
             Some(name) => {
@@ -1085,6 +1089,25 @@ effects=["proc.spawn(container)", "net.connect(registry:443)", "quantum.entangle
                 .any(|e| matches!(e, Effect::ProcSpawn { argv0, .. } if argv0 == "some_external_tool_xyz")),
             "bare external did not spawn: {bare:?}"
         );
+    }
+
+    #[test]
+    fn dynamic_run_bypasses_callable_and_builtin_layers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ev = Evaluator::new(dir.path().into());
+        ev.eval_program(&shoal_syntax::parse("fn ls() { null }").unwrap())
+            .unwrap();
+        let effects = ev
+            .plan_program(&shoal_syntax::parse(r#"run("ls")"#).unwrap())
+            .unwrap()
+            .effects;
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::ProcSpawn { argv0, .. } if argv0 == "ls")),
+            "run must bypass the callable and builtin layers: {effects:?}"
+        );
+        assert!(!effects.contains(&Effect::Opaque));
     }
 
     /// A8: effectful builtins and `spawn`/`parallel` bodies derive their

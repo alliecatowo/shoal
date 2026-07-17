@@ -162,6 +162,7 @@ impl ShoalCompleter {
                 // non-callable lexical value cannot win this command shape.
                 value_eligible: false,
                 forced: false,
+                dynamic_run: false,
                 adapter: self.adapter_lookup(head).is_some(),
             },
         )

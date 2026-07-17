@@ -31,6 +31,23 @@ impl Evaluator {
                 session_value: binding.as_ref().is_some_and(|value| !value.is_callable()),
                 value_eligible,
                 forced,
+                dynamic_run: false,
+                adapter: self.host.adapters.lookup(head).is_some(),
+            },
+        );
+        CommandResolution { source, binding }
+    }
+
+    pub(crate) fn resolve_dynamic_run(&self, head: &str) -> CommandResolution {
+        let binding = self.exec.shell.env.get(head);
+        let source = resolve_command_source(
+            head,
+            CommandFacts {
+                session_callable: binding.as_ref().is_some_and(Value::is_callable),
+                session_value: binding.as_ref().is_some_and(|value| !value.is_callable()),
+                value_eligible: true,
+                forced: false,
+                dynamic_run: true,
                 adapter: self.host.adapters.lookup(head).is_some(),
             },
         );

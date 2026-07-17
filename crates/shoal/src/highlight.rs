@@ -227,6 +227,7 @@ impl Highlighter for ShoalHighlighter {
                             || rest.starts_with(';')
                             || rest.starts_with('\n'),
                         forced: false,
+                        dynamic_run: false,
                         // The highlighter has no adapter catalog; known adapter
                         // names are still supplied by completion.
                         adapter: false,
