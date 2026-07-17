@@ -17,6 +17,10 @@ pub(super) enum DurableChannel {
 pub(super) struct DurableIndexes {
     journal: Mutex<HashMap<OwnerKey, Vec<i64>>>,
     transcript: Mutex<HashMap<OwnerKey, Vec<i64>>>,
+    /// Poison in either index invalidates the shared seq-to-entry invariant.
+    /// The index is journal-reconstructible at process startup, but not while
+    /// requests are live because channel cursors may already have advanced.
+    quarantined: AtomicBool,
 }
 
 impl DurableIndexes {
@@ -34,8 +38,14 @@ impl DurableIndexes {
         owner: &OwnerKey,
         seq: u64,
         entry_id: i64,
-    ) {
-        let mut indexes = self.selected(channel).lock().unwrap();
+    ) -> bool {
+        if self.is_quarantined() {
+            return false;
+        }
+        let Ok(mut indexes) = self.selected(channel).lock() else {
+            self.quarantined.store(true, Ordering::Release);
+            return false;
+        };
         let index = indexes.entry(owner.clone()).or_default();
         debug_assert_eq!(
             index.len() as u64,
@@ -43,22 +53,37 @@ impl DurableIndexes {
             "a durable index must stay dense and aligned with its channel's seqs"
         );
         index.push(entry_id);
+        true
     }
 
     /// Extend a startup index while the caller holds the channel registry lock.
-    pub(super) fn seed(&self, channel: DurableChannel, owner: &OwnerKey, entry_ids: &[i64]) -> u64 {
-        let mut indexes = self.selected(channel).lock().unwrap();
+    pub(super) fn seed(
+        &self,
+        channel: DurableChannel,
+        owner: &OwnerKey,
+        entry_ids: &[i64],
+    ) -> Option<u64> {
+        if self.is_quarantined() {
+            return None;
+        }
+        let Ok(mut indexes) = self.selected(channel).lock() else {
+            self.quarantined.store(true, Ordering::Release);
+            return None;
+        };
         let index = indexes.entry(owner.clone()).or_default();
         index.extend_from_slice(entry_ids);
-        index.len() as u64
+        Some(index.len() as u64)
     }
 
     pub(super) fn len(&self, channel: DurableChannel, owner: &OwnerKey) -> u64 {
-        self.selected(channel)
-            .lock()
-            .unwrap()
-            .get(owner)
-            .map_or(0, |entries| entries.len() as u64)
+        if self.is_quarantined() {
+            return 0;
+        }
+        let Ok(indexes) = self.selected(channel).lock() else {
+            self.quarantined.store(true, Ordering::Release);
+            return 0;
+        };
+        indexes.get(owner).map_or(0, |entries| entries.len() as u64)
     }
 
     pub(super) fn range(
@@ -68,7 +93,13 @@ impl DurableIndexes {
         since: Option<u64>,
         upto: u64,
     ) -> Vec<(u64, i64)> {
-        let indexes = self.selected(channel).lock().unwrap();
+        if self.is_quarantined() {
+            return Vec::new();
+        }
+        let Ok(indexes) = self.selected(channel).lock() else {
+            self.quarantined.store(true, Ordering::Release);
+            return Vec::new();
+        };
         let Some(index) = indexes.get(owner) else {
             return Vec::new();
         };
@@ -79,7 +110,35 @@ impl DurableIndexes {
     }
 
     pub(super) fn remove_owner(&self, owner: &OwnerKey) {
-        self.journal.lock().unwrap().remove(owner);
-        self.transcript.lock().unwrap().remove(owner);
+        if self.is_quarantined() {
+            return;
+        }
+        let Ok(mut journal) = self.journal.lock() else {
+            self.quarantined.store(true, Ordering::Release);
+            return;
+        };
+        let Ok(mut transcript) = self.transcript.lock() else {
+            self.quarantined.store(true, Ordering::Release);
+            return;
+        };
+        journal.remove(owner);
+        transcript.remove(owner);
+    }
+
+    pub(super) fn is_quarantined(&self) -> bool {
+        self.quarantined.load(Ordering::Acquire)
+            || self.journal.is_poisoned()
+            || self.transcript.is_poisoned()
+    }
+
+    #[cfg(test)]
+    pub(super) fn poison_journal_for_test(&self) {
+        std::thread::scope(|scope| {
+            let handle = scope.spawn(|| {
+                let _guard = self.journal.lock().unwrap();
+                panic!("inject durable-index poison");
+            });
+            assert!(handle.join().is_err());
+        });
     }
 }

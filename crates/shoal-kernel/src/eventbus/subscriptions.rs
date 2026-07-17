@@ -189,6 +189,7 @@ struct DispatcherCore {
     wake: Mutex<DispatcherWake>,
     ready: Condvar,
     stopped: AtomicBool,
+    connection_failed: AtomicBool,
 }
 
 impl DispatcherCore {
@@ -204,11 +205,22 @@ impl DispatcherCore {
             }),
             ready: Condvar::new(),
             stopped: AtomicBool::new(false),
+            connection_failed: AtomicBool::new(false),
         })
     }
 
     fn notify(&self) {
-        let mut wake = self.wake.lock().unwrap();
+        if self.connection_failed.load(Ordering::Acquire) {
+            return;
+        }
+        let mut wake = match self.wake.lock() {
+            Ok(wake) => wake,
+            Err(poisoned) => {
+                drop(poisoned);
+                self.fail_connection();
+                return;
+            }
+        };
         wake.epoch = wake.epoch.wrapping_add(1);
         drop(wake);
         self.ready.notify_one();
@@ -217,16 +229,37 @@ impl DispatcherCore {
     fn next_event(&self) -> Option<Event> {
         loop {
             let observed_epoch = {
-                let wake = self.wake.lock().unwrap();
+                let wake = match self.wake.lock() {
+                    Ok(wake) => wake,
+                    Err(poisoned) => {
+                        drop(poisoned);
+                        self.fail_connection();
+                        return None;
+                    }
+                };
                 if wake.closed {
                     return None;
                 }
                 wake.epoch
             };
-            let keys = self.order.lock().unwrap().clone();
+            let keys = match self.order.lock() {
+                Ok(order) => order.clone(),
+                Err(poisoned) => {
+                    drop(poisoned);
+                    self.fail_connection();
+                    return None;
+                }
+            };
             if !keys.is_empty() {
                 let start = self.cursor.fetch_add(1, Ordering::Relaxed) % keys.len();
-                let queues = self.subscriptions.lock().unwrap();
+                let queues = match self.subscriptions.lock() {
+                    Ok(queues) => queues,
+                    Err(poisoned) => {
+                        drop(poisoned);
+                        self.fail_connection();
+                        return None;
+                    }
+                };
                 for offset in 0..keys.len() {
                     let key = &keys[(start + offset) % keys.len()];
                     if let Some(event) = queues.get(key).and_then(|queue| queue.pop()) {
@@ -234,9 +267,26 @@ impl DispatcherCore {
                     }
                 }
             }
-            let mut wake = self.wake.lock().unwrap();
+            let mut wake = match self.wake.lock() {
+                Ok(wake) => wake,
+                Err(poisoned) => {
+                    drop(poisoned);
+                    self.fail_connection();
+                    return None;
+                }
+            };
             while !wake.closed && wake.epoch == observed_epoch {
-                wake = self.ready.wait(wake).unwrap();
+                wake = match self.ready.wait(wake) {
+                    Ok(wake) => wake,
+                    Err(poisoned) => {
+                        let mut wake = poisoned.into_inner();
+                        wake.closed = true;
+                        drop(wake);
+                        self.wake.clear_poison();
+                        self.fail_connection();
+                        return None;
+                    }
+                };
             }
             if wake.closed {
                 return None;
@@ -245,21 +295,63 @@ impl DispatcherCore {
     }
 
     fn close(&self) {
-        let queues = self
-            .subscriptions
-            .lock()
-            .unwrap()
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
+        self.connection_failed.store(true, Ordering::Release);
+        let queues: Vec<Arc<SubQueue>> = match self.subscriptions.lock() {
+            Ok(mut subscriptions) => subscriptions.drain().map(|(_, queue)| queue).collect(),
+            Err(poisoned) => {
+                // Connection-fatal: discard every queue associated with this
+                // writer, restore an empty map, and never reuse the core.
+                let mut subscriptions = poisoned.into_inner();
+                let queues = subscriptions.drain().map(|(_, queue)| queue).collect();
+                drop(subscriptions);
+                self.subscriptions.clear_poison();
+                queues
+            }
+        };
         for queue in queues {
             queue.close();
         }
-        let mut wake = self.wake.lock().unwrap();
-        wake.closed = true;
-        wake.epoch = wake.epoch.wrapping_add(1);
-        drop(wake);
-        self.ready.notify_one();
+        match self.order.lock() {
+            Ok(mut order) => order.clear(),
+            Err(poisoned) => {
+                let mut order = poisoned.into_inner();
+                order.clear();
+                drop(order);
+                self.order.clear_poison();
+            }
+        }
+        match self.wake.lock() {
+            Ok(mut wake) => {
+                wake.closed = true;
+                wake.epoch = wake.epoch.wrapping_add(1);
+            }
+            Err(poisoned) => {
+                let mut wake = poisoned.into_inner();
+                wake.closed = true;
+                wake.epoch = wake.epoch.wrapping_add(1);
+                drop(wake);
+                self.wake.clear_poison();
+            }
+        }
+        self.ready.notify_all();
+    }
+
+    /// Poison in dispatcher bookkeeping makes the entire socket connection
+    /// untrustworthy: stop notification delivery and close the shared writer
+    /// so request dispatch cannot continue on a half-quarantined connection.
+    fn fail_connection(&self) {
+        self.close();
+        match self.writer.lock() {
+            Ok(writer) => {
+                let _ = writer.shutdown(std::net::Shutdown::Both);
+            }
+            Err(poisoned) => {
+                let writer = poisoned.into_inner();
+                let _ = writer.shutdown(std::net::Shutdown::Both);
+                drop(writer);
+                self.writer.clear_poison();
+            }
+        }
     }
 }
 
@@ -282,14 +374,24 @@ impl ConnectionDispatcher {
                         "method": "event",
                         "params": &event,
                     });
-                    let Ok(mut writer) = core.writer.lock() else {
-                        core.close();
-                        break;
+                    let mut writer = match core.writer.lock() {
+                        Ok(writer) => writer,
+                        Err(poisoned) => {
+                            // The writer itself is connection-fatal. Close it
+                            // through the recovered guard, then stop the core;
+                            // do not attempt to re-lock the poisoned mutex.
+                            let writer = poisoned.into_inner();
+                            let _ = writer.shutdown(std::net::Shutdown::Both);
+                            drop(writer);
+                            core.writer.clear_poison();
+                            core.close();
+                            break;
+                        }
                     };
                     let ok = write_json_notification(&mut writer, &notification).is_ok();
                     drop(writer);
                     if !ok {
-                        core.close();
+                        core.fail_connection();
                         break;
                     }
                 }
@@ -303,15 +405,34 @@ impl ConnectionDispatcher {
         Ok(dispatcher)
     }
 
-    fn subscribe(&self, key: SubscriptionKey) -> (Arc<SubQueue>, bool) {
-        let mut subscriptions = self.core.subscriptions.lock().unwrap();
+    fn subscribe(&self, key: SubscriptionKey) -> Result<(Arc<SubQueue>, bool), RpcError> {
+        if self.core.connection_failed.load(Ordering::Acquire) {
+            return Err(connection_failed());
+        }
+        let mut subscriptions = match self.core.subscriptions.lock() {
+            Ok(subscriptions) => subscriptions,
+            Err(poisoned) => {
+                drop(poisoned);
+                self.core.fail_connection();
+                return Err(connection_failed());
+            }
+        };
         if let Some(existing) = subscriptions.get(&key) {
-            return (existing.clone(), false);
+            return Ok((existing.clone(), false));
         }
         let queue = SubQueue::new(key.channel.clone());
         subscriptions.insert(key.clone(), queue.clone());
-        self.core.order.lock().unwrap().push(key);
-        (queue, true)
+        let order_result = self.core.order.lock();
+        match order_result {
+            Ok(mut order) => order.push(key),
+            Err(poisoned) => {
+                drop(poisoned);
+                drop(subscriptions);
+                self.core.fail_connection();
+                return Err(connection_failed());
+            }
+        }
+        Ok((queue, true))
     }
 
     fn deliver(&self, owner: &OwnerKey, channel: &str, event: &Event) {
@@ -319,7 +440,17 @@ impl ConnectionDispatcher {
             owner: owner.clone(),
             channel: channel.to_string(),
         };
-        let queue = self.core.subscriptions.lock().unwrap().get(&key).cloned();
+        if self.core.connection_failed.load(Ordering::Acquire) {
+            return;
+        }
+        let queue = match self.core.subscriptions.lock() {
+            Ok(subscriptions) => subscriptions.get(&key).cloned(),
+            Err(poisoned) => {
+                drop(poisoned);
+                self.core.fail_connection();
+                return;
+            }
+        };
         if let Some(queue) = queue {
             queue.push_live(event.clone());
             self.core.notify();
@@ -327,29 +458,43 @@ impl ConnectionDispatcher {
     }
 
     fn unsubscribe(&self, key: &SubscriptionKey) -> bool {
-        let queue = self.core.subscriptions.lock().unwrap().remove(key);
+        let queue = match self.core.subscriptions.lock() {
+            Ok(mut subscriptions) => subscriptions.remove(key),
+            Err(poisoned) => {
+                drop(poisoned);
+                self.core.fail_connection();
+                return true;
+            }
+        };
         if let Some(queue) = queue {
             queue.close();
-            self.core
-                .order
-                .lock()
-                .unwrap()
-                .retain(|current| current != key);
+            let mut order = match self.core.order.lock() {
+                Ok(order) => order,
+                Err(poisoned) => {
+                    drop(poisoned);
+                    self.core.fail_connection();
+                    return true;
+                }
+            };
+            order.retain(|current| current != key);
             self.core.notify();
         }
         self.is_empty()
     }
 
     fn remove_owner(&self, owner: &OwnerKey) -> bool {
-        let keys = self
-            .core
-            .subscriptions
-            .lock()
-            .unwrap()
-            .keys()
-            .filter(|key| &key.owner == owner)
-            .cloned()
-            .collect::<Vec<_>>();
+        let keys = match self.core.subscriptions.lock() {
+            Ok(subscriptions) => subscriptions
+                .keys()
+                .filter(|key| &key.owner == owner)
+                .cloned()
+                .collect::<Vec<_>>(),
+            Err(poisoned) => {
+                drop(poisoned);
+                self.core.fail_connection();
+                return true;
+            }
+        };
         for key in keys {
             self.unsubscribe(&key);
         }
@@ -357,7 +502,14 @@ impl ConnectionDispatcher {
     }
 
     fn is_empty(&self) -> bool {
-        self.core.subscriptions.lock().unwrap().is_empty()
+        match self.core.subscriptions.lock() {
+            Ok(subscriptions) => subscriptions.is_empty(),
+            Err(poisoned) => {
+                drop(poisoned);
+                self.core.fail_connection();
+                true
+            }
+        }
     }
 
     fn close(&self) {
@@ -391,6 +543,7 @@ impl SubscriptionHandle {
 #[derive(Default)]
 pub(super) struct SubscriptionRegistry {
     connections: Mutex<HashMap<u64, Arc<ConnectionDispatcher>>>,
+    quarantined: AtomicBool,
 }
 
 #[cfg(test)]
@@ -412,28 +565,48 @@ impl SubscriptionRegistry {
         writer: &SharedWriter,
         max_per_session: usize,
     ) -> Result<SubscriptionHandle, RpcError> {
-        let mut connections = self.connections.lock().unwrap();
+        if self.quarantined.load(Ordering::Acquire) || self.connections.is_poisoned() {
+            self.quarantine();
+            return Err(subscription_registry_failed());
+        }
+        let mut connections = match self.connections.lock() {
+            Ok(connections) => connections,
+            Err(poisoned) => {
+                drop(poisoned);
+                self.quarantine();
+                return Err(subscription_registry_failed());
+            }
+        };
         let key = SubscriptionKey {
             owner: owner.clone(),
             channel: channel.to_string(),
         };
+        // A poisoned dispatcher is connection-fatal, not registry-fatal.
+        // Remove only those connections before calculating the owner quota.
+        let failed = connections
+            .iter()
+            .filter_map(|(&conn, dispatcher)| {
+                dispatcher.core.subscriptions.is_poisoned().then_some(conn)
+            })
+            .collect::<Vec<_>>();
+        for failed_conn in failed {
+            if let Some(dispatcher) = connections.remove(&failed_conn) {
+                dispatcher.close();
+            }
+        }
         let existing_dispatcher = connections.get(&conn).cloned();
         let exists = existing_dispatcher.as_ref().is_some_and(|dispatcher| {
             dispatcher
                 .core
                 .subscriptions
                 .lock()
-                .unwrap()
-                .contains_key(&key)
+                .is_ok_and(|subscriptions| subscriptions.contains_key(&key))
         });
         let current = connections
             .values()
-            .map(|dispatcher| {
-                dispatcher
-                    .core
-                    .subscriptions
-                    .lock()
-                    .unwrap()
+            .filter_map(|dispatcher| dispatcher.core.subscriptions.lock().ok())
+            .map(|subscriptions| {
+                subscriptions
                     .keys()
                     .filter(|key| key.owner == *owner)
                     .count()
@@ -456,7 +629,7 @@ impl SubscriptionRegistry {
             connections.insert(conn, dispatcher.clone());
             dispatcher
         };
-        let (queue, is_new) = dispatcher.subscribe(key);
+        let (queue, is_new) = dispatcher.subscribe(key)?;
         Ok(SubscriptionHandle {
             queue,
             is_new,
@@ -465,20 +638,34 @@ impl SubscriptionRegistry {
     }
 
     pub(super) fn deliver(&self, owner: &OwnerKey, channel: &str, event: &Event) {
-        let dispatchers = self
-            .connections
-            .lock()
-            .unwrap()
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
+        if self.quarantined.load(Ordering::Acquire) {
+            return;
+        }
+        let dispatchers: Vec<Arc<ConnectionDispatcher>> = match self.connections.lock() {
+            Ok(connections) => connections.values().cloned().collect::<Vec<_>>(),
+            Err(poisoned) => {
+                drop(poisoned);
+                self.quarantine();
+                return;
+            }
+        };
         for dispatcher in dispatchers {
             dispatcher.deliver(owner, channel, event);
         }
     }
 
     pub(super) fn unsubscribe(&self, conn: u64, owner: &OwnerKey, channel: &str) {
-        let mut connections = self.connections.lock().unwrap();
+        if self.quarantined.load(Ordering::Acquire) {
+            return;
+        }
+        let mut connections = match self.connections.lock() {
+            Ok(connections) => connections,
+            Err(poisoned) => {
+                drop(poisoned);
+                self.quarantine();
+                return;
+            }
+        };
         let Some(dispatcher) = connections.get(&conn).cloned() else {
             return;
         };
@@ -493,14 +680,34 @@ impl SubscriptionRegistry {
     }
 
     pub(super) fn remove_conn(&self, conn: u64) {
-        let dispatcher = self.connections.lock().unwrap().remove(&conn);
+        if self.quarantined.load(Ordering::Acquire) {
+            return;
+        }
+        let dispatcher = match self.connections.lock() {
+            Ok(mut connections) => connections.remove(&conn),
+            Err(poisoned) => {
+                drop(poisoned);
+                self.quarantine();
+                return;
+            }
+        };
         if let Some(dispatcher) = dispatcher {
             dispatcher.close();
         }
     }
 
     pub(super) fn remove_owner(&self, owner: &OwnerKey) {
-        let mut connections = self.connections.lock().unwrap();
+        if self.quarantined.load(Ordering::Acquire) {
+            return;
+        }
+        let mut connections = match self.connections.lock() {
+            Ok(connections) => connections,
+            Err(poisoned) => {
+                drop(poisoned);
+                self.quarantine();
+                return;
+            }
+        };
         let mut empty = Vec::new();
         for (&conn, dispatcher) in connections.iter() {
             if dispatcher.remove_owner(owner) {
@@ -515,26 +722,111 @@ impl SubscriptionRegistry {
 
     #[cfg(test)]
     pub(super) fn len(&self) -> usize {
-        self.connections
-            .lock()
-            .unwrap()
+        let connections = match self.connections.lock() {
+            Ok(connections) => connections,
+            Err(poisoned) => {
+                drop(poisoned);
+                self.quarantine();
+                return 0;
+            }
+        };
+        connections
             .values()
-            .map(|dispatcher| dispatcher.core.subscriptions.lock().unwrap().len())
+            .map(|dispatcher| {
+                dispatcher
+                    .core
+                    .subscriptions
+                    .lock()
+                    .map_or(0, |subscriptions| subscriptions.len())
+            })
             .sum()
     }
 
     #[cfg(test)]
     pub(super) fn dispatcher_count(&self) -> usize {
-        self.connections.lock().unwrap().len()
+        self.connections
+            .lock()
+            .map_or(0, |connections| connections.len())
     }
 
     #[cfg(test)]
     pub(super) fn dispatcher_probe(&self, conn: u64) -> Option<DispatcherProbe> {
         self.connections
             .lock()
-            .unwrap()
+            .ok()?
             .get(&conn)
             .map(|dispatcher| DispatcherProbe(dispatcher.core.clone()))
+    }
+
+    /// A poisoned top-level map cannot safely retain any dispatcher. Drain
+    /// and close every known connection, establish an empty map, then reject
+    /// future subscription work for this process lifetime.
+    fn quarantine(&self) {
+        self.quarantined.store(true, Ordering::Release);
+        let dispatchers: Vec<Arc<ConnectionDispatcher>> = match self.connections.lock() {
+            Ok(mut connections) => connections
+                .drain()
+                .map(|(_, dispatcher)| dispatcher)
+                .collect(),
+            Err(poisoned) => {
+                let mut connections = poisoned.into_inner();
+                let dispatchers = connections
+                    .drain()
+                    .map(|(_, dispatcher)| dispatcher)
+                    .collect();
+                drop(connections);
+                self.connections.clear_poison();
+                dispatchers
+            }
+        };
+        for dispatcher in dispatchers {
+            dispatcher.close();
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn poison_connections_for_test(&self) {
+        std::thread::scope(|scope| {
+            let handle = scope.spawn(|| {
+                let _guard = self.connections.lock().unwrap();
+                panic!("inject subscription-registry poison");
+            });
+            assert!(handle.join().is_err());
+        });
+    }
+
+    #[cfg(test)]
+    pub(super) fn poison_dispatcher_for_test(&self, conn: u64) {
+        let dispatcher = self
+            .connections
+            .lock()
+            .unwrap()
+            .get(&conn)
+            .expect("test dispatcher exists")
+            .clone();
+        std::thread::scope(|scope| {
+            let handle = scope.spawn(|| {
+                let _guard = dispatcher.core.subscriptions.lock().unwrap();
+                panic!("inject connection-dispatcher poison");
+            });
+            assert!(handle.join().is_err());
+        });
+    }
+}
+
+fn connection_failed() -> RpcError {
+    RpcError {
+        code: INTERNAL_ERROR,
+        message: "event dispatcher connection is closed".into(),
+        data: Some(json!({"subsystem": "event_dispatcher", "connection_closed": true})),
+    }
+}
+
+fn subscription_registry_failed() -> RpcError {
+    RpcError {
+        code: INTERNAL_ERROR,
+        message: "event subscription registry is quarantined; restart the kernel".into(),
+        data: Some(json!({"subsystem": "event_subscriptions", "quarantined": true})),
     }
 }
 

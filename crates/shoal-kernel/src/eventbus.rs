@@ -43,6 +43,20 @@ pub(crate) const STATIC_CHANNELS: &[&str] =
     &["session.transcript", "journal", "approval", "render"];
 
 impl EventBus {
+    /// Channel cursors and durable indexes form one replay invariant. Once
+    /// either component is poisoned, requests must fail closed until process
+    /// restart can rebuild both from the journal.
+    fn ensure_replay_subsystem(&self) -> Result<(), RpcError> {
+        if self.channels.is_quarantined() || self.durable.is_quarantined() {
+            return Err(RpcError {
+                code: INTERNAL_ERROR,
+                message: "event replay subsystem is quarantined; restart the kernel".into(),
+                data: Some(json!({"subsystem": "events", "quarantined": true})),
+            });
+        }
+        Ok(())
+    }
+
     /// Append `payload` to `channel`'s ring and enqueue it for every live
     /// subscriber (thin wrapper over [`EventBus::publish_inner`] with no
     /// durable-id recording — the path every ring-only channel takes).
@@ -111,6 +125,12 @@ impl EventBus {
         let event = self
             .channels
             .publish(&self.durable, owner, channel, payload, durable);
+        // A poison observed inside publish can only be discovered after the
+        // infallible internal call has begun. Never deliver its private fault
+        // marker to subscribers.
+        if self.ensure_replay_subsystem().is_err() {
+            return event;
+        }
         self.subscriptions.deliver(owner, channel, &event);
         event
     }
@@ -194,6 +214,7 @@ impl EventBus {
         writer: &SharedWriter,
         max_per_session: usize,
     ) -> Result<(), RpcError> {
+        self.ensure_replay_subsystem()?;
         let handle = self
             .subscriptions
             .subscribe(conn, owner, channel, writer, max_per_session)?;
@@ -356,6 +377,7 @@ impl Kernel {
         attached: &mut Option<Attachment>,
     ) -> Result<Json, RpcError> {
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
+        self.events.ensure_replay_subsystem()?;
         let owner = attachment.session.key.owner();
         let p: EventsReadParams = decode(params)?;
         // The `journal` and `session.transcript` channels are journal-backed:
@@ -575,6 +597,7 @@ impl Kernel {
         attached: &mut Option<Attachment>,
     ) -> Result<Json, RpcError> {
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
+        self.events.ensure_replay_subsystem()?;
         let p: EventsPublishParams = decode(params)?;
         // site/content/internals/kernel-protocol.md: only `user.*` channels are client-writable;
         // the kernel owns the semantic channels.
@@ -590,6 +613,7 @@ impl Kernel {
             &p.channel,
             p.payload.clone(),
         );
+        self.events.ensure_replay_subsystem()?;
         // One substrate, reverse direction: a wire publish is also visible to
         // the session's in-language channels (`channel("user.x").latest()` /
         // `.events()`), via `inject` — which never re-forwards, so the event
@@ -651,6 +675,19 @@ mod tests {
         SessionKey::new("principal:test", name).owner()
     }
 
+    fn attachment(kernel: &Arc<Kernel>, name: &str) -> Option<Attachment> {
+        Some(Attachment {
+            session: kernel.session(name, "principal:test").unwrap(),
+            principal: "principal:test".into(),
+            can_approve: false,
+            tty: false,
+            cancel_epoch: None,
+            bearer: None,
+            security_epoch: ATTACH_SECURITY_EPOCH,
+            connection_trust: ConnectionTrust::EmbeddedHuman,
+        })
+    }
+
     #[test]
     fn poisoned_subscriber_queue_is_discarded_and_closed() {
         let queue = SubQueue::new("user.poison".into());
@@ -677,6 +714,100 @@ mod tests {
             !queue.state.is_poisoned(),
             "the closed/empty invariant was explicitly restored"
         );
+    }
+
+    #[test]
+    fn poisoned_channel_registry_makes_repeated_requests_fail_closed() {
+        let kernel = Kernel::new();
+        let mut attached = attachment(&kernel, "poisoned-channels");
+        kernel.events.channels.poison_buffers_for_test();
+
+        for _ in 0..2 {
+            let error = kernel
+                .handle_events_read(
+                    json!({"channel": "user.poison", "since": null}),
+                    &mut attached,
+                )
+                .expect_err("a poisoned replay registry must reject requests");
+            assert_eq!(error.code, INTERNAL_ERROR);
+            assert_eq!(error.data.unwrap()["quarantined"], true);
+        }
+
+        // Internal semantic publishers are infallible by design. They must
+        // stop at the quarantine boundary rather than panic or notify.
+        let marker = kernel.events.publish(
+            &attached.as_ref().unwrap().session.key.owner(),
+            "user.poison",
+            json!({"ignored": true}),
+        );
+        assert_eq!(marker.seq, u64::MAX);
+    }
+
+    #[test]
+    fn poisoned_durable_index_makes_repeated_requests_fail_closed() {
+        let kernel = Kernel::new();
+        let mut attached = attachment(&kernel, "poisoned-durable");
+        kernel.events.durable.poison_journal_for_test();
+
+        for _ in 0..2 {
+            let error = kernel
+                .handle_events_read(json!({"channel": "journal"}), &mut attached)
+                .expect_err("a poisoned durable index must reject requests");
+            assert_eq!(error.code, INTERNAL_ERROR);
+            assert_eq!(error.data.unwrap()["subsystem"], "events");
+        }
+    }
+
+    #[test]
+    fn poisoned_subscription_registry_is_quarantined_without_request_panics() {
+        let kernel = Kernel::new();
+        let mut attached = attachment(&kernel, "poisoned-subscriptions");
+        let (_peer, server) = UnixStream::pair().unwrap();
+        let writer = Arc::new(Mutex::new(server));
+        kernel.events.subscriptions.poison_connections_for_test();
+
+        for _ in 0..2 {
+            let error = kernel
+                .handle_events_subscribe(
+                    json!({"channel": "user.poison"}),
+                    41,
+                    &mut attached,
+                    Some(&writer),
+                )
+                .expect_err("a poisoned subscription registry must reject requests");
+            assert_eq!(error.code, INTERNAL_ERROR);
+            assert_eq!(error.data.unwrap()["subsystem"], "event_subscriptions");
+        }
+    }
+
+    #[test]
+    fn poisoned_dispatcher_closes_only_its_connection() {
+        let bus = EventBus::default();
+        let owner = owner("dispatcher-isolation");
+        let (mut bad_peer, bad_server) = UnixStream::pair().unwrap();
+        let (good_peer, good_server) = UnixStream::pair().unwrap();
+        let bad_writer = Arc::new(Mutex::new(bad_server));
+        let good_writer = Arc::new(Mutex::new(good_server));
+        bus.subscribe(1, &owner, "user.isolated", None, &bad_writer, 8)
+            .unwrap();
+        bus.subscribe(2, &owner, "user.isolated", None, &good_writer, 8)
+            .unwrap();
+        bus.subscriptions.poison_dispatcher_for_test(1);
+
+        bus.publish(&owner, "user.isolated", json!({"ok": true}));
+        bad_peer
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut byte = [0_u8; 1];
+        assert_eq!(
+            std::io::Read::read(&mut bad_peer, &mut byte).unwrap(),
+            0,
+            "poisoned dispatcher closes its RPC connection"
+        );
+        let mut good_reader = io::BufReader::new(good_peer);
+        let event = recv_line(&mut good_reader);
+        assert_eq!(event["params"]["payload"]["ok"], true);
+        bus.remove_conn(2);
     }
 
     #[test]
