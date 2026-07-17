@@ -304,7 +304,9 @@ mod tests {
         let thread = thread::spawn(move || waiter.wait());
 
         poison(&task.shared.state);
-        task.shared.cond.notify_all();
+        // The first ordinary lifecycle caller repairs poison and must wake a
+        // waiter without a test-only Condvar notification.
+        task.finish(Ok(Value::Int(42)));
 
         let expected = task_state_poisoned();
         assert_eq!(
@@ -314,7 +316,6 @@ mod tests {
         assert_eq!(task.wait(), Err(expected.clone()));
         assert!(task.is_done());
 
-        task.finish(Ok(Value::Int(42)));
         task.finish(Err(ErrorVal::new("custom", "late failure")));
         assert_eq!(task.wait(), Err(expected));
         assert!(!task.shared.state.is_poisoned());
