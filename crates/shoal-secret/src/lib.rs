@@ -1,7 +1,4 @@
-use aes_gcm::{
-    Aes256Gcm, KeyInit,
-    aead::Aead,
-};
+use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
 use base64::Engine as _;
 use rand::{TryRngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
@@ -95,23 +92,22 @@ impl SecretStore {
             .decode(e.nonce)
             .map_err(invalid)?;
         let nonce: [u8; 12] = nonce.as_slice().try_into().map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "invalid secret store nonce length")
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid secret store nonce length",
+            )
         })?;
         let ct = base64::engine::general_purpose::STANDARD
             .decode(e.ciphertext)
             .map_err(invalid)?;
         let key = self.key()?;
         let cipher = Aes256Gcm::new_from_slice(&key).map_err(invalid)?;
-        let plain = Zeroizing::new(
-            cipher
-                .decrypt((&nonce).into(), ct.as_ref())
-                .map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "secret store authentication failed",
-                    )
-                })?,
-        );
+        let plain = Zeroizing::new(cipher.decrypt((&nonce).into(), ct.as_ref()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "secret store authentication failed",
+            )
+        })?);
         serde_json::from_slice(&plain).map_err(invalid)
     }
     fn save(&self, m: &BTreeMap<String, Vec<u8>>) -> io::Result<()> {
