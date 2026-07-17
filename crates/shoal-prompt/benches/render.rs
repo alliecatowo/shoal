@@ -1,7 +1,16 @@
-//! Criterion bench for the common-path render (site/content/internals/prompt-editor-lsp.md). Run in CI on every
-//! PR touching shoal-prompt; the p99 contract is < 5 ms (site/content/internals/prompt-editor-lsp.md) — on real hardware
-//! this reads low tens of µs. A regression that reintroduces a syscall on the
-//! render path would show up here before it shows up in a user's terminal.
+//! Criterion bench for the common-path render (site/content/internals/prompt-editor-lsp.md).
+//!
+//! What this measures: `Renderer::render_side`/`render` over a fixed, hand-built `PromptContext`
+//! fixture with no IO — pure formatting/lookup cost. On typical development hardware this reads
+//! low tens of microseconds.
+//!
+//! What this does NOT measure or enforce: this bench is not run in CI (see
+//! site/content/internals/tooling-and-quality.md's "Performance review gates" section for what CI
+//! actually runs) and there is no automated p99 budget gate wired to it. `cargo bench -p
+//! shoal-prompt --bench render` is a manual/local review tool for a human comparing before/after a
+//! change to the render path; treat any number here as a local data point, not a release
+//! guarantee, until a dedicated CI job with a pinned baseline exists. The pure-render regression
+//! test that IS enforced in CI lives at `crates/shoal-prompt/tests/speed.rs`.
 
 use std::hint::black_box;
 use std::path::PathBuf;
