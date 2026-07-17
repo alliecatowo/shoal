@@ -1,0 +1,8 @@
+[toolchain]
+# Pin the exact stable release CI uses (dtolnay/rust-toolchain@stable resolves to whatever is
+# current stable at CI run time; pinning here keeps local builds, clippy, and fmt deterministic
+# with what was last verified — see site/content/internals/tooling-and-quality.md, HR-F2).
+# Bump deliberately alongside a green workspace gate; do not let this silently drift ahead of CI.
+channel = "1.97.0"
+components = ["rustfmt", "clippy"]
+profile = "default"

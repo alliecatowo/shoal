@@ -425,7 +425,7 @@ impl Evaluator {
             "uptime" => Ok(os_uptime()),
             "env" => {
                 let mut r = Record::new();
-                for (k, v) in &self.process_env {
+                for (k, v) in &self.exec.process_env {
                     if let (Some(k), Some(v)) = (k.to_str(), v.to_str()) {
                         r.insert(k.to_string(), Value::Str(v.to_string()));
                     }
@@ -439,6 +439,7 @@ impl Evaluator {
     fn os_username(&self) -> String {
         for key in ["USER", "LOGNAME", "USERNAME"] {
             if let Some(v) = self
+                .exec
                 .process_env
                 .iter()
                 .find(|(k, _)| k == std::ffi::OsStr::new(key))
@@ -529,11 +530,11 @@ fn os_uptime() -> Value {
 /// this is an empty record, so `config.all` is `{}` and `config.get(key)` is
 /// `null` — the same zero-config answer as before, with no filesystem walk.
 fn config_record(ev: &Evaluator) -> VResult<Value> {
-    Ok(ev.config.snapshot().clone())
+    Ok(ev.host.config.snapshot().clone())
 }
 
 fn config_get(ev: &Evaluator, key: &str) -> VResult<Value> {
-    match ev.config.snapshot() {
+    match ev.host.config.snapshot() {
         Value::Record(r) => Ok(r.get(key).cloned().unwrap_or(Value::Null)),
         _ => Ok(Value::Null),
     }

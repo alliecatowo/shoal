@@ -103,7 +103,7 @@ Current stream-specific combinators are:
 | `map(f)` | transform each item |
 | `where(f)` / `filter(f)` | retain items whose predicate is true |
 | `scan(initial, f)` | emit running state |
-| `flat_map(f)` | emit items from each returned collection/stream shape supported by runtime |
+| `flat_map(f)` | emit items from each returned collection/substream, one source drained fully at a time (sequential, not interleaved) |
 | `take(n)` | stop after `n`; makes the stream bounded |
 | `take_until(f_or_stream)` | stop when predicate triggers or another stream produces |
 | `dedupe()` | drop adjacent duplicates |
@@ -111,10 +111,10 @@ Current stream-specific combinators are:
 | `debounce(duration)` | emit after quiet interval |
 | `throttle(duration)` | rate-limit emissions |
 | `window(count_or_duration)` | collect count/time windows |
-| `buffer(n)` | identity stage in the current synchronous pull model |
+| `buffer(n)` | decouple: a producer thread runs the upstream up to `n` items ahead |
 | `enumerate()` | pair items with sequence positions |
-| `merge(other)` | interleave two streams |
-| `zip(other)` | pair two streams |
+| `merge(other)` | combine two streams as items arrive (left-biased polling, not fair interleaving) |
+| `zip(other)` | pair items positionally at the slower side's rate; ends with the shorter side |
 
 Every combinator consumes its input stream and returns a new one. Assign the new stream, not the old handle:
 
@@ -142,16 +142,16 @@ stream.into(channel("user.events"))
 
 For streams, both `.save(path)` and `.append(path)` currently open the file in append mode and write one line per item. Strings and bytes are written as their content; other values become JSON per line. `.save` does not truncate, despite its name—this is an important preview behavior.
 
-`buffer(n)` currently type-checks and documents intent, but it does not create a queue, background producer, or pacing boundary. Shoal's stream runtime is synchronously pulled today, so the operation returns the same stream unchanged.
+`buffer(n)` is a real decoupling stage: it starts a background producer that eagerly drives everything below it — closures included — and stays at most `n` items ahead of the consumer. Items are paced, never dropped, so the sequence is exactly preserved; `buffer(0)` is a rendezvous handoff between the two threads. Construction is eager (production begins immediately, like `every`/`watch`/`tail`), stages written after the buffer stay lazy, and a bounded stream stays collectable through it. Cancelling the session or dropping the stream stops the producer promptly.
 
 `tee(n)` returns independently drivable streams. A bounded stream materializes once for exact replay. A live stream uses a queue of at most 64 pending items per fork. When a slow fork falls behind, overflowed values are dropped and later represented in order by a `{dropped: n}` marker. The marker appears as soon as that fork's queue has room, or after its buffered items drain; overflow does not raise an error and is never silent.
 
 ## Streams cannot feed processes yet
 
-The finite-value `feed` serializer rejects streams. Incremental stream-to-child-stdin is not wired:
+The finite-value `feed` serializer rejects streams with a `type_error` ("feeding a stream to a command's stdin is not implemented yet") before any process starts. Incremental stream-to-child-stdin is not wired — the process layer has no streaming stdin mode yet:
 
 ```text
-# current workaround
+# current workaround (the error's own hint)
 let batch = source.take(100).collect()
 batch.feed(^consumer)
 ```
@@ -186,6 +186,8 @@ Event records have a common shape:
 ```
 
 Sequence numbers are monotonic per channel. Each channel retains its most recent 1,024 events. `events()` replays the current ring then goes live; `events(since: n)` replays only records with `seq > n`. If a cursor is older than the ring, evicted history cannot be recovered from the channel; persist it separately.
+
+Each live subscription buffers a bounded number of undelivered events (the replay prefix plus 256). Replay is always delivered whole. If a subscriber falls further behind, newer events are dropped for that subscriber — publishers never block — and the gap is reported in order by a single marker record `{channel, seq, ts, payload: null, dropped: n}` once the queue has room again. The marker's `seq` is the newest dropped event's sequence, so `events(since: seq)` recovers whatever the ring still retains of the gap. Distinguish markers from real events by the `dropped` field.
 
 `take()` subscribes without replay, so it sees only an event published after the call. A timeout raises `timeout` rather than returning null.
 

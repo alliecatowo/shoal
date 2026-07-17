@@ -1,0 +1,26 @@
+# cargo-audit configuration (HR-F6, site/content/internals/hardening-roadmap.md).
+#
+# This is the single documented allowlist location for accepted RUSTSEC advisories. `cargo audit`
+# auto-discovers this file at `.cargo/audit.toml` relative to the invocation directory (NOT a
+# bare root-level `audit.toml`, which cargo-audit does not read); the `supply-chain-audit` CI job
+# (.github/workflows/ci.yml) runs bare `cargo audit` from the repository root with no other flags,
+# so everything it accepts or rejects is controlled by this file alone. Do NOT silence an advisory
+# by disabling or weakening that CI job instead of listing it here with a reason.
+#
+# Previously this file allowlisted 15 RUSTSEC advisories, all tracing to the same root cause:
+# `shoal-wasm` pinned `wasmtime = "37"` (crates/shoal-wasm/Cargo.toml), and every advisory
+# affecting 37.0.3 was only fixed by a major-version bump to wasmtime >=42.0.2 (two entries needed
+# >=43.0.2). That bump has landed — `shoal-wasm` now depends on wasmtime 46.0.1, the newest stable
+# release at bump time, well past every fix floor — so all 15 entries are resolved and removed.
+# `cargo audit` against the post-bump `Cargo.lock` reports zero vulnerabilities. Re-run `cargo
+# audit` after any future dependency bump and add entries here only with the same
+# trace-to-root-cause reasoning; do not add new IDs without it.
+[advisories]
+ignore = []
+
+[output]
+# Beyond known-CVE vulnerabilities (which fail regardless of this section), also fail the gate on
+# unmaintained/unsound informational advisories and yanked crate versions in Cargo.lock — none are
+# currently present, so this is forward-hardening, not a suppression.
+deny = ["unmaintained", "unsound", "yanked"]
+quiet = false

@@ -83,15 +83,14 @@ a newline. The MCP stdio reader has the same shape.
 | `task.list/get/await/cancel/suspend/resume` | `handlers_task.rs` | yes | session-scoped task registry |
 | `pty.open/send/read/resize/close/list` | `handlers_pty.rs` | yes | session-scoped PTY registry |
 | `plan.get/list/apply` | `handlers_task.rs` | yes | session/principal-scoped plan registry |
-| `cap.request` | `handlers_task.rs` | **no** | global plan approval mutation |
-| `journal.query` | `handlers_value.rs` | **no** | shared persistent journal read |
+| `cap.request` | `handlers_task.rs` | yes | attached approval mutation, approver-bound |
+| `journal.query` | `handlers_value.rs` | yes | attached persistent journal read |
 | `events.read/publish/subscribe/unsubscribe` | `eventbus.rs` | yes | global bus plus session bridge |
 
-The two bold stateful exemptions are current authority defects. The only methods that are naturally
-public are attach, context-free parse, and context-free completion. `cap.request` neither authenticates
-an approver nor checks the plan owner against a caller. `journal.query` returns shared source/AST/
-effect/output metadata without caller scoping. The socket's `0600` mode limits OS users, not Shoal
-token principals.
+Both former exemptions are closed: `journal.query` requires attachment (HR-D4), and `cap.request`
+requires attachment and binds an approver identity distinct from the requester (HR-D1/D2/D3). The only
+methods that remain naturally public are attach, context-free parse, and context-free completion. The
+socket's `0600` mode limits OS users, not Shoal token principals — the approver-identity binding does.
 
 ## `session.*`
 
@@ -103,21 +102,33 @@ Request:
 |---|---|---|
 | `session` | string or `null`; default `"default"` | named in-memory evaluator |
 | `token` | string or `null` | bearer token validated by the persistent kernel |
-| `client.kind` | string | descriptive client class |
+| `client.kind` | string | client class; `"mcp"` selects the restricted agent mapping (HR-D6) |
 | `client.tty` | bool | retain terminal color in bounded renders when true |
 
 With a token, `TokenStore::validate` supplies `principal`, token caps, and profile. Without a token,
-the caller becomes `uid:<effective-uid>` with profile `local-human`. An ephemeral kernel has no token
-store and rejects a supplied token. Calling attach again replaces that connection's attachment.
+the mapping splits on the declared client kind (HR-D6):
+
+| No-token attach | Principal | Profile |
+|---|---|---|
+| `client.kind:"mcp"` (default) | `agent:mcp` (restricted) | `agent` |
+| `client.kind:"mcp"` with `SHOAL_MCP_PERMISSIVE`/`set_mcp_permissive` | `uid:<euid>` | `local-human` |
+| any other kind | `uid:<euid>` | `local-human` |
+
+The built-in default policy defines `agent:mcp` with execution availability intact (opaque allow,
+unrestricted fs, in-grant auto-apply, session/journal/time) but no env value reads, env writes, or
+secret use. An ephemeral kernel has no token store and rejects a supplied token. Calling attach again
+replaces that connection's attachment.
 
 The persistent kernel loads `tokens.json` once at startup. `shoal-token` is a separate process whose
 create/revoke writes are not observed until the kernel restarts; already-loaded expirations still
 become invalid as wall time advances. The returned profile and cap strings are descriptive metadata,
 not grants. Only principal-based Leash policy and handler ownership checks authorize operations.
 
-The session map is currently keyed only by `session` name. `principal` is consulted when the name is
-first created; later callers receive the cached session. This is not a safe multi-principal ownership
-model.
+The session map is keyed only by `session` name; `principal` is consulted when the name is first
+created, and later callers receive the cached session. Multi-principal sharing of a named session is
+the intentional pair-shell model (HR-D7) — objects are session-scoped, authority stays per-actor,
+and the isolation boundary is the session name. See
+[session identity](../kernel-protocol/#session-identity-and-the-pair-shell-model).
 
 Result fields:
 
@@ -315,9 +326,10 @@ optional `RpcError`. State vocabulary observed in the handler is `running`, `can
 | `task.suspend` | `{task}` | validates ownership, then `TASK_CONTROL_UNAVAILABLE` |
 | `task.resume` | `{task}` | validates ownership, then `TASK_CONTROL_UNAVAILABLE` |
 
-Ownership is by `session.id`, not directly principal. That inherits the named-session cross-principal
-weakness. Tasks remain in the process-global map after completion; there is no eviction/persistence
-policy in the handler path.
+Ownership is by `session.id`, not principal — the documented pair-shell rule (HR-D7): every
+principal attached to the same named session shares task visibility and control, and cross-session
+lookups are opaque not-founds. Tasks remain in the process-global map after completion; there is no
+eviction/persistence policy in the handler path.
 
 Cancellation is cooperative through the evaluator/exec cancellation token. A failed outcome returned
 in value position is inspected so the task becomes failed; a signal-killed outcome after a requested
@@ -347,21 +359,36 @@ principal verification and re-derives the execution plan.
 
 ### `cap.request`
 
-Input `{plan_ref?, effects: [...]}`; `plan_ref` is operationally required. Effect entries can be
-strings or objects with `kind`. Dotted and snake-case spellings are normalized. If a nonempty request
-omits a plan effect, result remains `approval_pending` and lists uncovered effects. A denied plan is
-`LEASH_DENIED`; otherwise it sets `approved:true` and reports `{grant:"approved", enforced,
-granted_effects}`.
+**Requires attachment** (HR-D1). Input `{plan_ref?, effects: [...]}`; `plan_ref` is operationally
+required. The attachment principal is the **approver**. Effect entries can be strings or objects with
+`kind`; dotted and snake-case spellings are normalized.
 
-**Current critical defect:** no attachment or caller identity reaches this handler. It mutates the
-global plan named by ref after evaluating the stored owner's policy, not an approver policy. The
-method must not be treated as safe just because normal MCP connections attach first.
+Authority model (HR-D2/HR-D3):
+
+1. an unattached caller is rejected with `NOT_ATTACHED` before any approval logic;
+2. **separation of duties** — the approver must differ from the plan's requester (owner). A requester
+   approving its own plan is `LEASH_DENIED` ("self-approval is not permitted") unless
+   self-acknowledgement is explicitly enabled (`SHOAL_ALLOW_SELF_ACK`, or
+   `Kernel::set_allow_self_ack`); the default is separation;
+3. approval never overrides a hard denial: the plan owner's policy must not evaluate the plan to
+   `Deny`, else `LEASH_DENIED`;
+4. if a nonempty request omits a plan effect, the result stays `approval_pending` and lists the
+   uncovered effects (approval never silently widens past the requested scope);
+5. otherwise the plan is approved. An **`ApprovalRecord`** is bound onto the plan — requester,
+   approver, plan ref/hash, granted scope, approval timestamp, and (once the approved plan actually
+   runs) the journal entry id of the consuming execution. The binding is mirrored into the journal as
+   an audit entry (`journal.query` sees a `# approval …` row) and surfaced on `plan.get.approval`.
+
+Response: `{grant:"approved", plan_ref, enforced, granted_effects, requester, approver}`. `enforced`
+reports the same honest OS-enforcement truth `session.attach.caps_enforced` does for the requester.
 
 ## PTYs
 
 PTY refs are `pty:N`. Registry entries store session ID, recorded principal, display command, and a
 mutex-protected `shoal_exec::PtySession`. All methods require attachment and lookups compare session
-ID. The principal field is currently not used for access checks.
+ID — the documented pair-shell rule (HR-D7): PTY access is session-scoped and deliberately shared
+across the principals attached to that session, while cross-session refs are opaque not-founds. The
+recorded principal attributes the opener; it is not an access check.
 
 ### `pty.open`
 
@@ -411,20 +438,35 @@ There is no PTY-change subscription; clients poll `pty.read` and inspect `change
 
 ## Journal query
 
-`journal.query` accepts `{since,until,principal,head,ok,effects,limit}`. Timestamps are Unix epoch
-nanoseconds. Store-side filters are since/principal/head/ok/limit; `limit:0` means the journal default
-100. The kernel then post-filters `until` and requires every requested effect substring after dotted/
-snake normalization.
+`journal.query` **requires attachment** and accepts `{since,until,principal,head,ok,effects,limit}`.
+Timestamps are Unix epoch nanoseconds. Store-side filters are since/principal/head/ok/limit; the
+kernel then post-filters `until` and requires every requested effect substring after dotted/snake
+normalization.
+
+`limit` is an optional integer with three-way semantics enforced by the kernel above the store:
+
+| `limit` | Result |
+|---|---|
+| omitted / `null` | the default page size (100 rows) |
+| explicit `0` | **zero rows** — an empty page, never "unbounded" |
+| `n` | `min(n, `server maximum`)`; the ceiling is 10,000 rows |
+
+The explicit-zero case is short-circuited in the handler and never reaches the store (whose own
+`limit: 0` sentinel means "default 100"). The wire field is therefore `Option<usize>`, so an omitted
+limit is distinguishable from a caller who genuinely asked for nothing. The server-side maximum caps a
+hostile `limit: usize::MAX` so one query cannot stream the whole journal into a single frame.
 
 Rows are newest-first and contain ID, session, principal, timestamp/duration, lossless cwd, source,
 parsed AST/effects, status/ok/opaque, and output `{kind,hash,len}` entries. Output content is fetched
 separately through blob/value routes.
 
-The method currently has no attachment check. A caller can omit `principal` and receive shared rows.
-Also note that `until`/effects post-filter **after** the store limit: a request can return fewer than
-the requested limit even when older matching rows exist. Effect matching uses serialized JSON
-substring containment rather than parsed effect-kind equality, so the filter deserves replacement by
-a typed store query.
+Attachment is required for the caller-authentication side effect. A shared pair-shell session's
+journal is intentionally readable by every principal attached to that session (see
+[session identity](../kernel-protocol/#session-identity-and-the-pair-shell-model)); cross-session
+isolation is by using distinct session names. `until`/effects post-filter **after** the store limit,
+so a request can return fewer than its limit even when older matching rows exist. Effect matching uses
+serialized JSON substring containment rather than parsed effect-kind equality, so the filter deserves
+replacement by a typed store query.
 
 ## Events
 

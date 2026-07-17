@@ -69,9 +69,29 @@ jobs:
     name: fuzz targets build
     runs-on: ubuntu-latest
     continue-on-error: true
+    # rust-toolchain.toml pins stable for every other job; cargo-fuzz needs
+    # -Z sanitizer flags, so force the nightly rustup resolved above.
+    env:
+      RUSTUP_TOOLCHAIN: nightly
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
       - run: sudo apt-get update && sudo apt-get install -y clang
       - run: cargo install cargo-fuzz --locked
       - run: cargo fuzz build --fuzz-dir fuzz
+
+  supply-chain-audit:
+    # HR-F6 (site/content/internals/hardening-roadmap.md): RUSTSEC advisory check over
+    # Cargo.lock. The allowlist for accepted advisories lives in `.cargo/audit.toml` (cargo-audit's
+    # own auto-discovered config path) with a reason and revisit condition per entry — do not
+    # weaken this job by adding ad-hoc `--ignore` flags here instead of documenting them there.
+    name: supply-chain audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: supply-chain-audit
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit

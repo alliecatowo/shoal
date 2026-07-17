@@ -5,6 +5,9 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Pure domain crate that renders a shoal prompt from a structured PromptContext snapshot — no IO, no subprocesses."
 
+[lints]
+workspace = true
+
 # Dependency rule (site/content/internals/prompt-editor-lsp.md): shoal-prompt depends on NOTHING under
 # shoal-*. Its only normal dependencies are serde (config types) and toml
 # (parsing). shoal-value appears strictly as a dev-dependency for the render

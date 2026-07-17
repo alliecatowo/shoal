@@ -58,6 +58,10 @@ struct ChannelBuf {
 
 struct Subscriber {
     conn: u64,
+    /// The session this subscription's connection was attached to at
+    /// subscribe time — used only to enforce the per-session subscription
+    /// quota (site/content/internals/hardening-roadmap.md HR-E3; deep-audit H3, H5).
+    session_id: String,
     channel: String,
     queue: Arc<SubQueue>,
 }
@@ -125,7 +129,7 @@ impl SubQueue {
     /// calls per subscriber, and it is a plain in-memory push, never a
     /// socket write, so a stalled subscriber can never stall `publish()`.
     fn push(&self, event: Event) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock_recover();
         if state.events.len() < SUB_QUEUE_CAP {
             state.events.push_back(event);
         } else {
@@ -139,7 +143,7 @@ impl SubQueue {
     /// Mark this queue closed (connection gone / explicitly unsubscribed) so
     /// its writer thread stops waiting and exits instead of blocking forever.
     fn close(&self) {
-        self.state.lock().unwrap().closed = true;
+        self.state.lock_recover().closed = true;
         self.ready.notify_one();
     }
 
@@ -149,7 +153,7 @@ impl SubQueue {
     /// summary is always delivered before any event that arrives after it —
     /// the subscriber learns about the gap before it sees anything past it.
     fn next(&self) -> Option<Event> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock_recover();
         loop {
             if let Some(event) = state.events.pop_front() {
                 return Some(event);
@@ -186,7 +190,7 @@ fn spawn_subscriber_writer(queue: Arc<SubQueue>, writer: SharedWriter) {
                 "method": "event",
                 "params": &event,
             });
-            let mut w = writer.lock().unwrap();
+            let mut w = writer.lock_recover();
             let ok = write_json_notification(&mut w, &note).is_ok();
             drop(w);
             if !ok {
@@ -272,7 +276,7 @@ impl EventBus {
         durable: Option<(DurableChannel, i64)>,
     ) -> Event {
         let event = {
-            let mut channels = self.channels.lock().unwrap();
+            let mut channels = self.channels.lock_recover();
             let buf = channels.entry(channel.to_string()).or_default();
             let seq = buf.next_seq;
             buf.next_seq += 1;
@@ -281,7 +285,7 @@ impl EventBus {
                     DurableChannel::Journal => &self.journal_index,
                     DurableChannel::Transcript => &self.transcript_index,
                 };
-                let mut index = index.lock().unwrap();
+                let mut index = index.lock_recover();
                 debug_assert_eq!(
                     index.len() as u64,
                     seq,
@@ -301,7 +305,7 @@ impl EventBus {
             }
             event
         };
-        let subs = self.subs.lock().unwrap();
+        let subs = self.subs.lock_recover();
         for sub in subs.iter().filter(|s| s.channel == channel) {
             sub.queue.push(event.clone());
         }
@@ -332,7 +336,7 @@ impl EventBus {
     }
 
     fn index_len(index: &Mutex<Vec<i64>>) -> u64 {
-        index.lock().unwrap().len() as u64
+        index.lock_recover().len() as u64
     }
 
     /// The `(seq, entry_id)` pairs for journal-channel events whose `seq` is
@@ -351,7 +355,7 @@ impl EventBus {
     }
 
     fn index_range(index: &Mutex<Vec<i64>>, since: Option<u64>, upto: u64) -> Vec<(u64, i64)> {
-        let index = index.lock().unwrap();
+        let index = index.lock_recover();
         let start = since.map(|s| s.saturating_add(1)).unwrap_or(0);
         (start..upto)
             .filter_map(|seq| index.get(seq as usize).map(|&entry_id| (seq, entry_id)))
@@ -360,7 +364,7 @@ impl EventBus {
 
     /// Buffered tail of `channel` from `since` (exclusive), capped at `limit`.
     fn read(&self, channel: &str, since: Option<u64>, limit: Option<usize>) -> Vec<Event> {
-        let channels = self.channels.lock().unwrap();
+        let channels = self.channels.lock_recover();
         let Some(buf) = channels.get(channel) else {
             return Vec::new();
         };
@@ -380,20 +384,48 @@ impl EventBus {
 
     /// Register `writer` as a subscriber to `channel` (idempotent per
     /// `(conn, channel)` — re-subscribing finds the existing queue rather
-    /// than spawning a second writer thread). Any already-buffered events
-    /// after `since` are enqueued for replay through the same bounded queue
-    /// and dedicated writer thread live events use, so replay and live
-    /// delivery are never a separate, ad hoc blocking write on the calling
-    /// (dispatch) thread.
-    fn subscribe(&self, conn: u64, channel: &str, since: Option<u64>, writer: &SharedWriter) {
+    /// than spawning a second writer thread, and never counts a second time
+    /// against the quota below). Any already-buffered events after `since`
+    /// are enqueued for replay through the same bounded queue and dedicated
+    /// writer thread live events use, so replay and live delivery are never a
+    /// separate, ad hoc blocking write on the calling (dispatch) thread.
+    ///
+    /// Enforces the per-session subscription quota
+    /// (site/content/internals/hardening-roadmap.md HR-E3; deep-audit H3, H5): a genuinely NEW
+    /// subscription past `max_per_session` for `session_id` is rejected with
+    /// a clear protocol error rather than growing this session's live
+    /// subscription count unboundedly.
+    fn subscribe(
+        &self,
+        conn: u64,
+        session_id: &str,
+        channel: &str,
+        since: Option<u64>,
+        writer: &SharedWriter,
+        max_per_session: usize,
+    ) -> Result<(), RpcError> {
         let queue = {
-            let mut subs = self.subs.lock().unwrap();
+            let mut subs = self.subs.lock_recover();
             if let Some(existing) = subs.iter().find(|s| s.conn == conn && s.channel == channel) {
                 existing.queue.clone()
             } else {
+                let current = subs.iter().filter(|s| s.session_id == session_id).count();
+                if current >= max_per_session {
+                    return Err(RpcError {
+                        code: QUOTA_EXCEEDED,
+                        message: format!(
+                            "session has reached the {max_per_session}-subscription limit"
+                        ),
+                        data: Some(json!({
+                            "limit": "subscriptions_per_session",
+                            "max": max_per_session,
+                        })),
+                    });
+                }
                 let queue = SubQueue::new(channel.to_string());
                 subs.push(Subscriber {
                     conn,
+                    session_id: session_id.to_string(),
                     channel: channel.to_string(),
                     queue: queue.clone(),
                 });
@@ -404,10 +436,11 @@ impl EventBus {
         for event in self.read(channel, since, None) {
             queue.push(event);
         }
+        Ok(())
     }
 
     fn unsubscribe(&self, conn: u64, channel: &str) {
-        let mut subs = self.subs.lock().unwrap();
+        let mut subs = self.subs.lock_recover();
         subs.retain(|s| {
             let keep = !(s.conn == conn && s.channel == channel);
             if !keep {
@@ -418,7 +451,7 @@ impl EventBus {
     }
 
     pub(crate) fn remove_conn(&self, conn: u64) {
-        let mut subs = self.subs.lock().unwrap();
+        let mut subs = self.subs.lock_recover();
         subs.retain(|s| {
             let keep = s.conn != conn;
             if !keep {
@@ -516,9 +549,9 @@ impl EventBus {
         if entry_ids.is_empty() {
             return;
         }
-        let mut idx = index.lock().unwrap();
+        let mut idx = index.lock_recover();
         idx.extend_from_slice(entry_ids);
-        let mut channels = self.channels.lock().unwrap();
+        let mut channels = self.channels.lock_recover();
         let buf = channels.entry(channel.to_string()).or_default();
         buf.next_seq = idx.len() as u64;
     }
@@ -780,7 +813,7 @@ impl Kernel {
         attached: &mut Option<Attachment>,
         conn: Option<&SharedWriter>,
     ) -> Result<Json, RpcError> {
-        attached.as_ref().ok_or_else(not_attached)?;
+        let attachment = attached.as_ref().ok_or_else(not_attached)?;
         let p: EventsSubParams = decode(params)?;
         let Some(writer) = conn else {
             return Err(RpcError {
@@ -789,7 +822,15 @@ impl Kernel {
                 data: None,
             });
         };
-        self.events.subscribe(client, &p.channel, p.since, writer);
+        let max = self.max_subscriptions_per_session.load(Ordering::Relaxed);
+        self.events.subscribe(
+            client,
+            &attachment.session.id,
+            &p.channel,
+            p.since,
+            writer,
+            max,
+        )?;
         encode(json!({"channel": p.channel, "subscribed": true}))
     }
 
@@ -843,7 +884,8 @@ mod tests {
         let bus = EventBus::default();
         let (client_end, server_end) = UnixStream::pair().unwrap();
         let writer: SharedWriter = Arc::new(Mutex::new(server_end));
-        bus.subscribe(1, "user.stress", None, &writer);
+        bus.subscribe(1, "s", "user.stress", None, &writer, usize::MAX)
+            .unwrap();
 
         let start = Instant::now();
         for i in 0..500 {
@@ -875,8 +917,10 @@ mod tests {
         let (healthy_client, healthy_server) = UnixStream::pair().unwrap();
         let healthy_writer: SharedWriter = Arc::new(Mutex::new(healthy_server));
 
-        bus.subscribe(1, "user.race", None, &stalled_writer);
-        bus.subscribe(2, "user.race", None, &healthy_writer);
+        bus.subscribe(1, "s1", "user.race", None, &stalled_writer, usize::MAX)
+            .unwrap();
+        bus.subscribe(2, "s2", "user.race", None, &healthy_writer, usize::MAX)
+            .unwrap();
 
         // Simulate the stalled subscriber's writer thread being stuck mid
         // blocking-write by holding its writer's mutex from here.
@@ -926,7 +970,8 @@ mod tests {
         let bus = Arc::new(EventBus::default());
         let (client_end, server_end) = UnixStream::pair().unwrap();
         let writer: SharedWriter = Arc::new(Mutex::new(server_end));
-        bus.subscribe(1, "user.overflow", None, &writer);
+        bus.subscribe(1, "s", "user.overflow", None, &writer, usize::MAX)
+            .unwrap();
 
         let hold = writer.clone();
         let (release_tx, release_rx) = mpsc::channel::<()>();
@@ -978,11 +1023,47 @@ mod tests {
         let bus = EventBus::default();
         let (client_end, server_end) = UnixStream::pair().unwrap();
         let writer: SharedWriter = Arc::new(Mutex::new(server_end));
-        bus.subscribe(1, "user.bye", None, &writer);
+        bus.subscribe(1, "s", "user.bye", None, &writer, usize::MAX)
+            .unwrap();
         assert_eq!(bus.subs.lock().unwrap().len(), 1);
         bus.unsubscribe(1, "user.bye");
         assert_eq!(bus.subs.lock().unwrap().len(), 0);
         drop(client_end);
+    }
+
+    /// HR-E3 (deep-audit H3, H5): a session's subscriptions are capped —
+    /// a genuinely new subscription past the limit is rejected with a clear
+    /// `QUOTA_EXCEEDED` protocol error rather than growing unboundedly, but
+    /// re-subscribing to a channel the session already holds (same conn +
+    /// channel) is idempotent and never itself counts against the cap.
+    #[test]
+    fn subscribe_enforces_the_per_session_quota() {
+        let bus = EventBus::default();
+        let (_c1, s1) = UnixStream::pair().unwrap();
+        let w1: SharedWriter = Arc::new(Mutex::new(s1));
+        let (_c2, s2) = UnixStream::pair().unwrap();
+        let w2: SharedWriter = Arc::new(Mutex::new(s2));
+        let (_c3, s3) = UnixStream::pair().unwrap();
+        let w3: SharedWriter = Arc::new(Mutex::new(s3));
+
+        // Two different connections, same session, cap of 2: both fit.
+        bus.subscribe(1, "sess", "user.a", None, &w1, 2).unwrap();
+        bus.subscribe(2, "sess", "user.b", None, &w2, 2).unwrap();
+        // A third subscription for the SAME session is over the cap.
+        let err = bus
+            .subscribe(3, "sess", "user.c", None, &w3, 2)
+            .expect_err("a 3rd subscription for this session must be rejected");
+        assert_eq!(err.code, QUOTA_EXCEEDED);
+
+        // Re-subscribing an EXISTING (conn, channel) pair is idempotent —
+        // never itself rejected, even exactly at the cap.
+        assert!(bus.subscribe(1, "sess", "user.a", None, &w1, 2).is_ok());
+
+        // A DIFFERENT session is unaffected — the quota is per-session.
+        assert!(
+            bus.subscribe(4, "other-sess", "user.d", None, &w3, 2)
+                .is_ok()
+        );
     }
 
     // -----------------------------------------------------------------------

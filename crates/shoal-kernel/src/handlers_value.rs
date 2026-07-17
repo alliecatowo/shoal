@@ -4,6 +4,20 @@
 //! `site/content/internals/kernel-protocol.md`.
 use super::*;
 
+/// Default `journal.query` page size when the caller omits `limit` — matches
+/// the journal store's own historical default so an omitted limit behaves
+/// exactly as before this change (site/content/internals/kernel-rpc-reference.md).
+pub(crate) const JOURNAL_DEFAULT_PAGE: usize = 100;
+
+/// Server-side hard ceiling on a single `journal.query` page. A caller may ask
+/// for fewer, never more: an unbounded `limit` (the audit's `limit: 0` edge
+/// case, or a hostile `usize::MAX`) is clamped to this so one query cannot
+/// stream the entire journal into a single frame (site/content/internals/kernel-rpc-reference.md).
+/// Deliberately generous — well above any real agent page and above the
+/// per-statement row volume kernel replay tests pull — so it bounds abuse
+/// without truncating legitimate bulk reads.
+pub(crate) const JOURNAL_MAX_PAGE: usize = 10_000;
+
 /// Map a CAS-backed bytes resolution failure — a missing or corrupt blob
 /// surfaced when `value.get` materializes an elided `CasBytes` ref under a
 /// `slice`/`format=raw` ask — to a wire error that names the ref, so an agent
@@ -25,7 +39,7 @@ impl Kernel {
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
         let session = &attachment.session;
         let params: ValueGetParams = decode(params)?;
-        let values = session.transcript.lock().unwrap();
+        let values = session.transcript.lock_recover();
         let value = values.get(&params.r#ref).ok_or_else(|| RpcError {
             code: UNKNOWN_REF,
             message: "unknown value ref".into(),
@@ -165,18 +179,41 @@ impl Kernel {
         }
     }
 
-    pub(crate) fn handle_journal_query(self: &Arc<Self>, params: Json) -> Result<Json, RpcError> {
+    pub(crate) fn handle_journal_query(
+        self: &Arc<Self>,
+        params: Json,
+        attached: &mut Option<Attachment>,
+    ) -> Result<Json, RpcError> {
+        // site/content/internals/kernel-protocol.md: `journal.query` requires an authenticated
+        // attachment like every other stateful method (the documented rule the
+        // audit found this handler silently exempted — a fresh unattached
+        // socket connection could read stored journal rows). The attachment is
+        // required for its side effect of authenticating the caller; the query
+        // itself is not further principal-scoped here (a shared pair-shell
+        // session's journal is intentionally visible to its attached
+        // principals — see the session-identity model in kernel-protocol.md).
+        attached.as_ref().ok_or_else(not_attached)?;
         let p: JournalQueryParams = decode(params)?;
+        // site/content/internals/kernel-rpc-reference.md limit semantics: omitted → the default page
+        // size; an explicit `0` → zero rows (an empty page, never "unbounded");
+        // any request is clamped down to the server-side maximum so a hostile
+        // `limit: usize::MAX` cannot ask the store for the entire history in one
+        // frame. The store's own `limit: 0` sentinel means "default 100", so an
+        // explicit-zero ask must short-circuit here and never reach it.
+        let effective_limit = match p.limit {
+            Some(0) => return encode(Vec::<JournalEntry>::new()),
+            Some(n) => n.min(JOURNAL_MAX_PAGE),
+            None => JOURNAL_DEFAULT_PAGE,
+        };
         let rows = self
             .journal
-            .lock()
-            .unwrap()
+            .lock_recover()
             .query(&JournalQuery {
                 since_ts_ns: p.since,
                 principal: p.principal,
                 head: p.head,
                 ok: p.ok,
-                limit: p.limit,
+                limit: effective_limit,
             })
             .map_err(internal)?;
         // The journal store filters since/principal/head/ok/limit; the

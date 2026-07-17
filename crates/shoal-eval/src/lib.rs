@@ -4,6 +4,7 @@ mod args;
 mod builtins;
 mod call;
 mod channels;
+mod child_context;
 mod coerce;
 mod command;
 mod expr;
@@ -28,6 +29,7 @@ mod stmt;
 mod streams;
 
 pub use channels::{EventBus, EventForwarder};
+pub(crate) use child_context::ChildScope;
 pub(crate) use coerce::coerce_word;
 pub use reef::{PromptReefBinding, PromptReefSnapshot};
 // Job-control surface (site/content/internals/language-conformance-contract.md) the interactive host (the REPL) drives. Re-
@@ -51,7 +53,7 @@ use shoal_value::{
 };
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,79 +115,21 @@ pub struct JobsSnapshot {
 /// Host renderer for statement-position outcomes (defect #1).
 pub type StatementSink = Box<dyn FnMut(&Value) + Send>;
 
-pub struct Evaluator {
-    pub env: Env,
-    cwd: PathBuf,
-    process_env: Vec<(OsString, OsString)>,
-    pub interactive: bool,
-    pub it: Value,
-    cancel: CancelToken,
-    adapters: AdapterCatalog,
-    /// Host renderer for statement-position outcomes (site/content/internals/language-conformance-contract.md, defect #1).
-    sink: Option<StatementSink>,
-    /// Runtime call-stack depth guard (defect #9).
-    call_depth: usize,
-    /// Nesting depth inside `fn` bodies — gates `cd`/env writes (defect #10).
-    in_fn_body: usize,
-    /// Live task registry backing the `jobs` builtin (defect #14).
-    jobs: Vec<shoal_value::TaskVal>,
-    /// Map of stopped-external job id → child pid, for the REPL's `fg`/`bg`
-    /// (site/content/internals/language-conformance-contract.md job control). A stopped foreground external command is recorded
-    /// twice: as a suspended `TaskVal` in `jobs` (so it lists via `jobs` and the
-    /// kernel `task.suspend`/`task.resume` wire methods drive its SIGTSTP/SIGCONT
-    /// through the task's hooks), and here so `fg`/`bg` can locate its still-live
-    /// parked PTY by pid (via [`shoal_exec::take_stopped_job`]). Empty unless an
-    /// interactive foreground command has actually been Ctrl-Z'd.
-    external_jobs: std::collections::HashMap<u64, u32>,
-    /// The most recent foreground external command that stopped this turn
-    /// (job id, display form), set by `run_argv` when the exec layer reports a
-    /// stop and drained by the REPL (`take_pending_stop`) to print the
-    /// "[id]+ Stopped …" notice and return to the prompt.
-    pending_stop: Option<(u64, String)>,
-    /// reef (site/content/internals/reef-resolution.md): cached scope chain, keyed on the cwd it was
-    /// discovered for. Rebuilt only when the cwd changes (cd / `with cwd:`).
-    /// `None` until the first spawn/`which`/`reef` touches it; cheap when no
-    /// manifest is in scope (a pure filesystem walk with an empty result).
-    reef_chain: Option<(PathBuf, shoal_reef::ScopeChain)>,
-    /// reef: the provider stack, built lazily on the first *constrained*
-    /// resolution — never touched on the hot path when no manifest is in scope.
-    reef_resolver: Option<Arc<shoal_reef::Resolver>>,
-    /// reef: the in-memory lock, loaded from (and persisted next to) the nearest
-    /// manifest. Empty and inert when no manifest is in scope.
-    reef_lock: shoal_reef::Lockfile,
-    /// reef: filesystem path the current lock loads from / persists to.
-    reef_lock_path: Option<PathBuf>,
-    /// reef: optional user-scope `shoal.toml` whose `[reef]` table forms the
-    /// user scope. `None` (the default) means no user scope — the zero-config,
-    /// zero-regression path. Hosts wire a real path via
-    /// [`Evaluator::set_reef_user_manifest`]; tests never point at real config.
-    reef_user_manifest: Option<PathBuf>,
-    /// reef: `with reef: {tool: constraint, …} { }` override layers (see
-    /// `site/content/internals/reef-resolution.md`), nearest-first (innermost `with reef:` block wins). Empty and inert
-    /// when no `with reef:` is on the dynamic stack — zero-regression.
-    reef_overrides: Vec<shoal_reef::ScopeEntry>,
-    /// Optional command journal (site/content/internals/language-conformance-contract.md). `None` (the default) means NOTHING is
-    /// journaled — the exact pre-journal behavior, so `-c`/scripts/conformance
-    /// run untouched. Only when a host installs a journal via
-    /// [`Evaluator::set_journal`] (or [`Evaluator::open_default_journal`]) does
-    /// per-top-level-statement recording, output capture, and fs undo-inverse
-    /// recording happen. Held here (not shared) because `Journal` is single-
-    /// handle / not `Sync`; spawned child evaluators never inherit it.
-    journal: Option<Journal>,
-    /// Session id recorded on each journal entry (site/content/internals/language-conformance-contract.md). Ignored when no
-    /// journal is installed.
-    session_id: String,
+/// Session identity, authority, and presentation policy — the Class-2 evaluator
+/// state grouped by HR-J2 (`site/content/internals/evaluator-decomposition.md`):
+/// *who* is acting (`principal`/`session_id`), *what they may do* (`leash`), and
+/// *how output is presented* (`echo_mode`/`interactive`/`journal`/`sink`). These
+/// change only via explicit host setup or a kernel re-attach, never per
+/// statement. A child evaluator inherits identity + authority but starts
+/// presentation fresh (see `child_context.rs`); the field grouping is otherwise
+/// behavior-identical to the pre-decomposition flat fields.
+struct SessionCtx {
     /// Acting principal recorded on each journal entry: `"human"` or
     /// `"agent:<name>"`. Ignored when no journal is installed.
     principal: String,
-    /// The journal entry id of the top-level statement currently executing, so
-    /// nested fs mutations (rm/cp/mv/save) can attach undo inverses to it.
-    /// `None` outside a journaled statement.
-    current_entry: Option<i64>,
-    /// Source text of the program currently being evaluated, used to slice each
-    /// top-level statement's `src` for its journal entry (site/content/internals/language-conformance-contract.md). `None` when
-    /// the host did not provide it — the entry's `src` is then left empty.
-    source: Option<String>,
+    /// Session id recorded on each journal entry (site/content/internals/language-conformance-contract.md). Ignored when no
+    /// journal is installed.
+    session_id: String,
     /// Active leash policy + the principal it is evaluated for (site/content/internals/language-conformance-contract.md). `None`
     /// (the default) means no OS sandbox is ever applied to a spawn — the exact
     /// pre-activation behavior, so `Evaluator::new` and every existing test
@@ -194,43 +138,99 @@ pub struct Evaluator {
     /// a default-permissive policy still resolves to `None` (no wrapping), so
     /// only a genuinely-scoped principal ever confines a child.
     leash: Option<(LeashPolicy, String)>,
-    /// The in-language `channel(name)` event bus (site/content/internals/streams-channels.md). Shared
-    /// (Arc) so spawned tasks / `on(...)` handlers publish and subscribe to the
-    /// same session-scoped channels — coordination is channels, never files.
-    bus: Arc<channels::EventBus>,
-    /// Set by the `exit`/`quit` builtin (defect: no `exit`). `Some(code)` asks
-    /// the host to stop: `eval_program` halts its statement loop, and the host
-    /// (REPL loop / `-c` / script runner) ends cleanly with `code`. Kept as a
-    /// value the host acts on — eval NEVER calls `std::process::exit`, which
-    /// would break the kernel/embedded host.
-    pending_exit: Option<i32>,
-    /// Module cache (site/content/internals/roadmap-and-priorities.md): a module (keyed by canonical path) evaluates
-    /// once per session; its exports record is memoized here. Empty until the
-    /// first `use`.
-    modules: std::collections::HashMap<PathBuf, Value>,
-    /// The stack of modules currently being loaded, for circular-`use` detection.
-    module_stack: Vec<PathBuf>,
-    /// Derived-but-unspawned plans from the `plan { … }` REPL verb (site/content/internals/roadmap-and-priorities.md),
-    /// indexed by id (`1`-based). `apply <ref>` looks a plan up here and runs it.
-    plans: Vec<Program>,
-    /// Persistent directory-frecency store for `j`/`jump` (`frecency.rs`).
-    /// `None` (the `Evaluator::new` default, so `-c`/scripts/conformance never
-    /// write) disables recording; a `j` query then still reads the shared
-    /// per-user store. `Some(path)` (set by an interactive host via
-    /// [`Evaluator::open_default_jump_history`], or a test via
-    /// [`Evaluator::set_jump_store`]) makes every `cd` bump that file.
-    jump_store: Option<PathBuf>,
-    /// The directory `cd -` returns to: the cwd immediately before the last
-    /// real navigation (`cd`/`pushd`/`popd`/`j`). `None` until the first cwd
-    /// change. Held as a plain field exactly like `cwd` — session-scoped
-    /// ambient state, never persisted to disk. `cd -` restores this *exact*
-    /// `PathBuf` (byte-identical to the directory left), never a re-derived one.
-    oldpwd: Option<PathBuf>,
-    /// The `pushd`/`popd` directory stack: the directories *below* the current
-    /// `cwd`, which is always the conceptual top. `dirs` renders `[cwd] ++
-    /// dir_stack` (current first, bash's left-to-right order). Session-scoped
-    /// ambient state like `cwd`; never journaled or persisted to disk.
-    dir_stack: Vec<PathBuf>,
+    /// How much of a script/`-c` run's top-level statement values auto-render
+    /// (the `render.echo` knob, site/content/internals/configuration-reference.md). Default [`EchoMode::All`]
+    /// (echo everything) so `Evaluator::new`, the REPL, and every conformance
+    /// case keep their current behavior; the non-interactive host opts into
+    /// `Quiet`.
+    echo_mode: EchoMode,
+    /// Whether interactive behavior is allowed (host-selected).
+    interactive: bool,
+    /// Optional command journal (site/content/internals/language-conformance-contract.md). `None` (the default) means NOTHING is
+    /// journaled — the exact pre-journal behavior, so `-c`/scripts/conformance
+    /// run untouched. Only when a host installs a journal via
+    /// [`Evaluator::set_journal`] (or [`Evaluator::open_default_journal`]) does
+    /// per-top-level-statement recording, output capture, and fs undo-inverse
+    /// recording happen. Held here (not shared) because `Journal` is single-
+    /// handle / not `Sync`; spawned child evaluators never inherit it.
+    journal: Option<Journal>,
+    /// Host renderer for statement-position outcomes (site/content/internals/language-conformance-contract.md, defect #1).
+    sink: Option<StatementSink>,
+}
+
+impl SessionCtx {
+    /// The default session identity/presentation, matching the pre-decomposition
+    /// `Evaluator::new` field defaults exactly: no journal, no leash, no sink,
+    /// non-interactive, echo everything, `human`/`default` attribution.
+    fn new() -> Self {
+        Self {
+            principal: "human".into(),
+            session_id: "default".into(),
+            leash: None,
+            echo_mode: EchoMode::default(),
+            interactive: false,
+            journal: None,
+            sink: None,
+        }
+    }
+}
+
+/// The reef dynamic overlay and per-cwd resolution cache (site/content/internals/reef-resolution.md),
+/// grouped by HR-J2 (`site/content/internals/evaluator-decomposition.md`) so a
+/// child evaluator inherits the whole reef overlay **as a unit** — closing the
+/// reef half of deep-audit finding B3, where the four fields were dropped
+/// individually at each hand-copy child site. Cheap to clone (small maps + an
+/// `Option<PathBuf>`); the field grouping is otherwise behavior-identical to the
+/// pre-decomposition flat fields.
+///
+/// The session-long resolution *inputs* (`reef_resolver`, `reef_user_manifest`)
+/// deliberately stay separate on the [`Evaluator`]: they are host-installed and
+/// immutable per statement (Class 1), not part of this per-eval overlay/cache.
+#[derive(Clone)]
+struct ReefState {
+    /// `with reef: {tool: constraint, …} { }` override layers, nearest-first
+    /// (innermost `with reef:` block wins). Empty and inert when no `with reef:`
+    /// is on the dynamic stack — zero-regression.
+    overrides: Vec<shoal_reef::ScopeEntry>,
+    /// Cached scope chain, keyed on the cwd it was discovered for. Rebuilt only
+    /// when the cwd changes (cd / `with cwd:`). `None` until the first
+    /// spawn/`which`/`reef` touches it; cheap when no manifest is in scope (a
+    /// pure filesystem walk with an empty result).
+    chain: Option<(PathBuf, shoal_reef::ScopeChain)>,
+    /// The in-memory lock, loaded from (and persisted next to) the nearest
+    /// manifest. Empty and inert when no manifest is in scope.
+    lock: shoal_reef::Lockfile,
+    /// Filesystem path the current lock loads from / persists to.
+    lock_path: Option<PathBuf>,
+}
+
+impl ReefState {
+    /// The default (no manifest in scope) reef overlay/cache, matching the
+    /// pre-decomposition `Evaluator::new` field defaults exactly.
+    fn new() -> Self {
+        Self {
+            overrides: Vec::new(),
+            chain: None,
+            lock: shoal_reef::Lockfile::new(),
+            lock_path: None,
+        }
+    }
+}
+
+/// The host-installed service handles — the Class-1 evaluator state grouped by
+/// HR-J2 (`site/content/internals/evaluator-decomposition.md`): effect ports,
+/// the adapter catalog, the event bus, and the reef resolution *inputs*. Every
+/// field is set once by the host before evaluation (via the `set_*` setters /
+/// `load_bundled_adapters`) and is read-only for the rest of the session — the
+/// census shows each "mutated in `lib.rs` only", never on a statement/expression
+/// path (invariant I4). Held as a single [`Arc<HostServices>`] on the
+/// [`Evaluator`]; a child evaluator clones the `Arc` (one refcount bump) and so
+/// inherits the *whole* bundle unconditionally — closing the config-drop half of
+/// deep-audit finding B3 by construction, since a child can no longer be built
+/// without the parent's ports/adapters/resolution inputs. The grouping is
+/// otherwise behavior-identical to the pre-decomposition flat fields.
+#[derive(Clone)]
+struct HostServices {
     /// Hexagonal effect ports (site/content/internals/roadmap-and-priorities.md). Every direct filesystem,
     /// spawn, clock, opener, and secret call the domain core makes routes
     /// through one of these instead of `std::*`. The defaults are the `Std*`
@@ -250,16 +250,188 @@ pub struct Evaluator {
     /// a host injects the *same* resolved `shoal_config::Config` it applies to
     /// itself via [`Evaluator::set_config`], so in-language config == the
     /// host-applied config. Held as `Arc<dyn ConfigPort>` like the other ports
-    /// so child evaluators inherit it cheaply (see [`inherit_ports`]).
-    ///
-    /// [`inherit_ports`]: Evaluator::inherit_ports
+    /// so child evaluators inherit it cheaply (through the shared `Arc`).
     config: Arc<dyn ConfigPort>,
-    /// How much of a script/`-c` run's top-level statement values auto-render
-    /// (the `render.echo` knob, site/content/internals/configuration-reference.md). Default [`EchoMode::All`]
-    /// (echo everything) so `Evaluator::new`, the REPL, and every conformance
-    /// case keep their current behavior; the non-interactive host opts into
-    /// `Quiet`.
-    echo_mode: EchoMode,
+    /// Declarative external-command schemas (site/content/internals/roadmap-and-priorities.md). Command
+    /// resolution must not diverge in a child, so the catalog travels in the
+    /// shared `Arc` rather than being deep-cloned at each child site.
+    adapters: AdapterCatalog,
+    /// The in-language `channel(name)` event bus (site/content/internals/streams-channels.md). Shared
+    /// (Arc) so spawned tasks / `on(...)` handlers publish and subscribe to the
+    /// same session-scoped channels — coordination is channels, never files.
+    bus: Arc<channels::EventBus>,
+    /// reef: the provider stack, built lazily on the first *constrained*
+    /// resolution — never touched on the hot path when no manifest is in scope.
+    /// A [`OnceLock`] so the lazy build is a one-shot memoization visible through
+    /// the shared `Arc` without a `&mut` seam (invariant I4: the bundle stays
+    /// structurally immutable after setup). A host may preinstall a resolver via
+    /// [`Evaluator::set_reef_resolver`]; tests point it at fixture binaries.
+    reef_resolver: OnceLock<Arc<shoal_reef::Resolver>>,
+    /// reef: optional user-scope `shoal.toml` whose `[reef]` table forms the
+    /// user scope. `None` (the default) means no user scope — the zero-config,
+    /// zero-regression path. Hosts wire a real path via
+    /// [`Evaluator::set_reef_user_manifest`]; tests never point at real config.
+    reef_user_manifest: Option<PathBuf>,
+}
+
+impl HostServices {
+    /// The default host services, matching the pre-decomposition `Evaluator::new`
+    /// field defaults exactly: the `Std*` ports, an empty config snapshot, an
+    /// empty adapter catalog, a fresh shared event bus, no preinstalled reef
+    /// resolver, and no user reef manifest.
+    fn new() -> Self {
+        Self {
+            fs: Arc::new(StdFs),
+            exec: Arc::new(StdExec),
+            clock: Arc::new(StdClock),
+            opener: Arc::new(StdOpener),
+            secrets: Arc::new(StdSecret),
+            config: Arc::new(ConfigSnapshot::default()),
+            adapters: AdapterCatalog::empty(),
+            bus: channels::EventBus::shared(),
+            reef_resolver: OnceLock::new(),
+            reef_user_manifest: None,
+        }
+    }
+}
+
+/// The genuinely-mutable execution core — the Class-3 evaluator state grouped by
+/// HR-J2 (`site/content/internals/evaluator-decomposition.md`): the state that
+/// advances as a program runs (lexical/ambient context, control/recursion, the
+/// reef overlay, the job/task registry, module memoization, journal attribution
+/// transients, and the frecency persistence path). Embedded as one
+/// [`Evaluator`] field so the evaluator collapses to the designed three-field
+/// façade (`host` / `session` / `exec`). A child evaluator's fresh-vs-inherited
+/// rules are applied field-by-field in [`ChildContext::build`]; the grouping is
+/// otherwise behavior-identical to the pre-decomposition flat fields.
+struct ExecState {
+    /// Current lexical environment. Swapped for calls/modules; closures capture
+    /// the handle. A child inherits it for closure bodies (`spawn`/`parallel`/
+    /// `on`) and starts from a fresh root for a `.shl` script.
+    env: Env,
+    /// Logical working directory. Session-local; changed by navigation and
+    /// temporarily by `with cwd:`/modules. A child inherits a snapshot.
+    cwd: PathBuf,
+    /// Environment passed to spawned children — a snapshot of `vars_os()` at
+    /// construction plus in-session `env.NAME =`/`with env:` writes.
+    process_env: Vec<(OsString, OsString)>,
+    /// The directory `cd -` returns to: the cwd immediately before the last
+    /// real navigation (`cd`/`pushd`/`popd`/`j`). `None` until the first cwd
+    /// change. Session-scoped ambient state, never persisted to disk. `cd -`
+    /// restores this *exact* `PathBuf` (byte-identical to the directory left),
+    /// never a re-derived one.
+    oldpwd: Option<PathBuf>,
+    /// The `pushd`/`popd` directory stack: the directories *below* the current
+    /// `cwd`, which is always the conceptual top. `dirs` renders `[cwd] ++
+    /// dir_stack` (current first, bash's left-to-right order). Session-scoped
+    /// ambient state like `cwd`; never journaled or persisted to disk.
+    dir_stack: Vec<PathBuf>,
+    /// Cooperative cancellation epoch, consulted by sleeps, streams, and
+    /// execution paths. A child gets a fresh token wired to its task.
+    cancel: CancelToken,
+    /// Runtime call-stack depth guard (defect #9).
+    call_depth: usize,
+    /// Nesting depth inside `fn` bodies — gates `cd`/env writes (defect #10).
+    in_fn_body: usize,
+    /// Set by the `exit`/`quit` builtin (defect: no `exit`). `Some(code)` asks
+    /// the host to stop: `eval_program` halts its statement loop, and the host
+    /// (REPL loop / `-c` / script runner) ends cleanly with `code`. Kept as a
+    /// value the host acts on — eval NEVER calls `std::process::exit`, which
+    /// would break the kernel/embedded host.
+    pending_exit: Option<i32>,
+    /// Last top-level value (the `it` binding). Updated after each successful
+    /// top-level statement.
+    it: Value,
+    /// reef (site/content/internals/reef-resolution.md): the dynamic overlay + per-cwd resolution
+    /// cache — the `with reef:` override stack, the cwd-keyed scope chain, and
+    /// the in-memory lock + its persistence path — grouped into one
+    /// [`ReefState`] sub-struct (HR-J2) so a child inherits the whole reef
+    /// overlay as a unit (closing the reef half of finding B3), not four
+    /// separately-copyable fields.
+    reef: ReefState,
+    /// Live task registry backing the `jobs` builtin (defect #14).
+    jobs: Vec<shoal_value::TaskVal>,
+    /// Map of stopped-external job id → child pid, for the REPL's `fg`/`bg`
+    /// (site/content/internals/language-conformance-contract.md job control). A stopped foreground external command is recorded
+    /// twice: as a suspended `TaskVal` in `jobs` (so it lists via `jobs` and the
+    /// kernel `task.suspend`/`task.resume` wire methods drive its SIGTSTP/SIGCONT
+    /// through the task's hooks), and here so `fg`/`bg` can locate its still-live
+    /// parked PTY by pid (via [`shoal_exec::take_stopped_job`]). Empty unless an
+    /// interactive foreground command has actually been Ctrl-Z'd.
+    external_jobs: std::collections::HashMap<u64, u32>,
+    /// The most recent foreground external command that stopped this turn
+    /// (job id, display form), set by `run_argv` when the exec layer reports a
+    /// stop and drained by the REPL (`take_pending_stop`) to print the
+    /// "[id]+ Stopped …" notice and return to the prompt.
+    pending_stop: Option<(u64, String)>,
+    /// Module cache (site/content/internals/roadmap-and-priorities.md): a module (keyed by canonical path) evaluates
+    /// once per session; its exports record is memoized here. Empty until the
+    /// first `use`.
+    modules: std::collections::HashMap<PathBuf, Value>,
+    /// The stack of modules currently being loaded, for circular-`use` detection.
+    module_stack: Vec<PathBuf>,
+    /// Derived-but-unspawned plans from the `plan { … }` REPL verb (site/content/internals/roadmap-and-priorities.md),
+    /// indexed by id (`1`-based). `apply <ref>` looks a plan up here and runs it.
+    plans: Vec<Program>,
+    /// Source text of the program currently being evaluated, used to slice each
+    /// top-level statement's `src` for its journal entry (site/content/internals/language-conformance-contract.md). `None` when
+    /// the host did not provide it — the entry's `src` is then left empty.
+    source: Option<String>,
+    /// The journal entry id of the top-level statement currently executing, so
+    /// nested fs mutations (rm/cp/mv/save) can attach undo inverses to it.
+    /// `None` outside a journaled statement.
+    current_entry: Option<i64>,
+    /// Persistent directory-frecency store for `j`/`jump` (`frecency.rs`).
+    /// `None` (the `Evaluator::new` default, so `-c`/scripts/conformance never
+    /// write) disables recording; a `j` query then still reads the shared
+    /// per-user store. `Some(path)` (set by an interactive host via
+    /// [`Evaluator::open_default_jump_history`], or a test via
+    /// [`Evaluator::set_jump_store`]) makes every `cd` bump that file.
+    jump_store: Option<PathBuf>,
+}
+
+impl ExecState {
+    /// The default execution core, matching the pre-decomposition `Evaluator::new`
+    /// field defaults exactly: a fresh root env, the given cwd, the process env
+    /// snapshot, empty ambient/job/module state, a fresh cancel epoch, `it` null,
+    /// and a default (no-manifest) reef overlay.
+    fn new(cwd: PathBuf) -> Self {
+        Self {
+            env: Env::root(),
+            cwd,
+            process_env: std::env::vars_os().collect(),
+            oldpwd: None,
+            dir_stack: Vec::new(),
+            cancel: CancelToken::new(),
+            call_depth: 0,
+            in_fn_body: 0,
+            pending_exit: None,
+            it: Value::Null,
+            reef: ReefState::new(),
+            jobs: Vec::new(),
+            external_jobs: std::collections::HashMap::new(),
+            pending_stop: None,
+            modules: std::collections::HashMap::new(),
+            module_stack: Vec::new(),
+            plans: Vec::new(),
+            source: None,
+            current_entry: None,
+            jump_store: None,
+        }
+    }
+}
+
+/// The tree-walk evaluator, collapsed by HR-J2 to the designed three-field
+/// façade: [`HostServices`] (Class 1, shared + immutable), [`SessionCtx`]
+/// (Class 2, identity/authority/presentation), and [`ExecState`] (Class 3, the
+/// mutable per-eval core). A child evaluator inherits `host` and `session` by
+/// construction and builds a fresh-or-inherited `exec` per child kind, so a
+/// child can no longer silently under-inherit policy, config, or resolution
+/// inputs (deep-audit findings B1–B4 / H1).
+pub struct Evaluator {
+    host: Arc<HostServices>,
+    session: SessionCtx,
+    exec: ExecState,
 }
 
 enum Flow {
@@ -280,47 +452,38 @@ struct ExecMeta {
 impl Evaluator {
     pub fn new(cwd: PathBuf) -> Self {
         Self {
-            env: Env::root(),
-            cwd,
-            process_env: std::env::vars_os().collect(),
-            interactive: false,
-            it: Value::Null,
-            cancel: CancelToken::new(),
-            adapters: AdapterCatalog::empty(),
-            sink: None,
-            call_depth: 0,
-            in_fn_body: 0,
-            jobs: Vec::new(),
-            external_jobs: std::collections::HashMap::new(),
-            pending_stop: None,
-            reef_chain: None,
-            reef_resolver: None,
-            reef_lock: shoal_reef::Lockfile::new(),
-            reef_lock_path: None,
-            reef_user_manifest: None,
-            reef_overrides: Vec::new(),
-            leash: None,
-            journal: None,
-            session_id: "default".into(),
-            principal: "human".into(),
-            current_entry: None,
-            source: None,
-            bus: channels::EventBus::shared(),
-            pending_exit: None,
-            modules: std::collections::HashMap::new(),
-            module_stack: Vec::new(),
-            plans: Vec::new(),
-            jump_store: None,
-            oldpwd: None,
-            dir_stack: Vec::new(),
-            fs: Arc::new(StdFs),
-            exec: Arc::new(StdExec),
-            clock: Arc::new(StdClock),
-            opener: Arc::new(StdOpener),
-            secrets: Arc::new(StdSecret),
-            config: Arc::new(ConfigSnapshot::default()),
-            echo_mode: EchoMode::default(),
+            host: Arc::new(HostServices::new()),
+            session: SessionCtx::new(),
+            exec: ExecState::new(cwd),
         }
+    }
+
+    /// The current lexical environment. Thin forwarding accessor over the
+    /// [`ExecState`] field the decomposition moved off the flat struct; hosts
+    /// (`shoal`'s REPL/`-c`, the highlighter, the LSP parse-ctx) read the live
+    /// scope through it. Replaces the former `pub env` field.
+    pub fn env(&self) -> &Env {
+        &self.exec.env
+    }
+
+    /// Mutable access to the current lexical environment, for a host that
+    /// declares session bindings (e.g. `-c` seeding `args`). Replaces direct
+    /// `pub env` field mutation.
+    pub fn env_mut(&mut self) -> &mut Env {
+        &mut self.exec.env
+    }
+
+    /// The last top-level value (`it`). Thin forwarding accessor over the
+    /// [`ExecState`] field; the prompt reads it. Replaces the former `pub it`
+    /// field.
+    pub fn it(&self) -> &Value {
+        &self.exec.it
+    }
+
+    /// Set the last top-level value (`it`) — the kernel mirrors a re-attached
+    /// session's last value through this. Replaces direct `pub it` field writes.
+    pub fn set_it(&mut self, value: Value) {
+        self.exec.it = value;
     }
 
     /// Install a custom [`Fs`] adapter (site/content/internals/roadmap-and-priorities.md). Additive: the
@@ -329,30 +492,30 @@ impl Evaluator {
     /// that deliberately interposes a fake. Child evaluators spawned after this
     /// call inherit the adapter.
     pub fn set_fs(&mut self, fs: Arc<dyn Fs>) {
-        self.fs = fs;
+        Arc::make_mut(&mut self.host).fs = fs;
     }
 
     /// Install a custom [`Exec`] adapter (spawn seam). Default: [`StdExec`].
     pub fn set_exec(&mut self, exec: Arc<dyn Exec>) {
-        self.exec = exec;
+        Arc::make_mut(&mut self.host).exec = exec;
     }
 
     /// Install a custom [`Clock`] (for deterministic journal timestamps under
     /// test). Default: [`StdClock`].
     pub fn set_clock(&mut self, clock: Arc<dyn Clock>) {
-        self.clock = clock;
+        Arc::make_mut(&mut self.host).clock = clock;
     }
 
     /// Install a custom [`Opener`] (the `open <path>` effect). Default:
     /// [`StdOpener`].
     pub fn set_opener(&mut self, opener: Arc<dyn Opener>) {
-        self.opener = opener;
+        Arc::make_mut(&mut self.host).opener = opener;
     }
 
     /// Install a custom [`SecretPort`] (secret-store reads). Default:
     /// [`StdSecret`].
     pub fn set_secrets(&mut self, secrets: Arc<dyn SecretPort>) {
-        self.secrets = secrets;
+        Arc::make_mut(&mut self.host).secrets = secrets;
     }
 
     /// Install the resolved-config snapshot backing the in-language `config`
@@ -363,7 +526,7 @@ impl Evaluator {
     /// it applies to itself, so in-language config == host-applied config.
     /// Child evaluators spawned after this call inherit the snapshot.
     pub fn set_config(&mut self, config: Arc<dyn ConfigPort>) {
-        self.config = config;
+        Arc::make_mut(&mut self.host).config = config;
     }
 
     /// Select how much of a script/`-c` run's top-level statement values
@@ -371,32 +534,24 @@ impl Evaluator {
     /// every statement (the REPL/legacy behavior); the non-interactive host
     /// sets [`EchoMode::Quiet`] so intermediate pure expressions stay silent.
     pub fn set_echo_mode(&mut self, mode: EchoMode) {
-        self.echo_mode = mode;
+        self.session.echo_mode = mode;
     }
 
-    /// Copy the effect ports from `parent` into a freshly-created child
-    /// evaluator so `parallel`/`source`/`spawn` see the same adapters the host
-    /// installed. Cheap `Arc` clones; a no-op semantically when both hold the
-    /// `Std*` defaults.
-    pub(crate) fn inherit_ports(&mut self, parent: &Evaluator) {
-        self.fs = parent.fs.clone();
-        self.exec = parent.exec.clone();
-        self.clock = parent.clock.clone();
-        self.opener = parent.opener.clone();
-        self.secrets = parent.secrets.clone();
-        self.config = parent.config.clone();
+    /// Select whether interactive behavior is allowed (host-selected). Thin
+    /// forwarding accessor over the [`SessionCtx`] field; hosts (`shoal`'s REPL,
+    /// the non-interactive runner, the kernel) drive it once at setup. Replaces
+    /// the former `pub interactive` field the decomposition moved into
+    /// [`SessionCtx`].
+    pub fn set_interactive(&mut self, interactive: bool) {
+        self.session.interactive = interactive;
     }
 
     /// The session event bus (site/content/internals/streams-channels.md). Shared into spawned tasks so
-    /// in-language channels are visible across `spawn`/`on(...)`.
+    /// in-language channels are visible across `spawn`/`on(...)`. Child
+    /// evaluators receive it through [`ChildContext`](child_context::ChildContext);
+    /// there is no partial `set_bus`-style seam a child site could under-inherit.
     pub(crate) fn bus(&self) -> Arc<channels::EventBus> {
-        self.bus.clone()
-    }
-
-    /// Adopt a shared event bus (used when a child evaluator must see the parent
-    /// session's in-language channels — `spawn`, `on(...)`, script children).
-    pub(crate) fn set_bus(&mut self, bus: Arc<channels::EventBus>) {
-        self.bus = bus;
+        self.host.bus.clone()
     }
 
     /// Install the hook that mirrors in-language `channel(x).emit(...)` onto a
@@ -404,7 +559,7 @@ impl Evaluator {
     /// Only `user.*` channels cross — the same client-writable rule as the
     /// wire's `events.publish`. Standalone hosts never call this.
     pub fn set_event_forwarder(&mut self, f: EventForwarder) {
-        self.bus.set_forwarder(f);
+        self.host.bus.set_forwarder(f);
     }
 
     /// A shareable handle to this session's in-language event bus, for hosts
@@ -412,7 +567,7 @@ impl Evaluator {
     /// `events.publish` must not stall behind a long-running exec). Inject via
     /// [`EventBus::inject`], which never re-forwards back out.
     pub fn event_bus(&self) -> Arc<EventBus> {
-        self.bus.clone()
+        self.host.bus.clone()
     }
 
     /// Consume any pending `exit`/`quit` request. `Some(code)` means the last
@@ -420,7 +575,7 @@ impl Evaluator {
     /// loop, `-c`, script runner) should stop and surface that code. Clears the
     /// flag so a subsequent REPL line starts fresh.
     pub fn take_exit(&mut self) -> Option<i32> {
-        self.pending_exit.take()
+        self.exec.pending_exit.take()
     }
 
     /// Install the active leash policy and the principal spawns are evaluated
@@ -430,7 +585,7 @@ impl Evaluator {
     /// resolves to no OS confinement for a spawn, so normal use never
     /// regresses; only a scoped principal actually restricts a child.
     pub fn set_leash_policy(&mut self, policy: LeashPolicy, principal: impl Into<String>) {
-        self.leash = Some((policy, principal.into()));
+        self.session.leash = Some((policy, principal.into()));
     }
 
     /// Convenience over [`Evaluator::set_leash_policy`]: load the per-user leash
@@ -450,7 +605,7 @@ impl Evaluator {
     /// principal is unknown, or its grants are unrestricted/unscoped. `None`
     /// keeps `ExecSpec.sandbox` unset — the pre-activation, unconfined path.
     pub(crate) fn resolve_sandbox(&self) -> Option<SandboxPolicy> {
-        let (policy, principal) = self.leash.as_ref()?;
+        let (policy, principal) = self.session.leash.as_ref()?;
         policy.sandbox_for(principal)
     }
 
@@ -459,8 +614,8 @@ impl Evaluator {
     /// which is the zero-regression default. Changing the cwd next re-discovers
     /// the chain with this path folded in.
     pub fn set_reef_user_manifest(&mut self, path: impl Into<PathBuf>) {
-        self.reef_user_manifest = Some(path.into());
-        self.reef_chain = None;
+        Arc::make_mut(&mut self.host).reef_user_manifest = Some(path.into());
+        self.exec.reef.chain = None;
     }
 
     /// Inject the reef provider stack (resolver). Additive: without it the
@@ -469,7 +624,14 @@ impl Evaluator {
     /// it to point the resolver at fixture-rooted binaries instead of the real
     /// system.
     pub fn set_reef_resolver(&mut self, resolver: Arc<shoal_reef::Resolver>) {
-        self.reef_resolver = Some(resolver);
+        // Replace the whole `OnceLock` so a preinstall always wins, even in the
+        // (never-hit in practice) case where a constrained resolution already
+        // memoized a default — this preserves the pre-decomposition setter's
+        // overwrite semantics exactly. Setters run at setup (refcount 1), so
+        // `make_mut` never actually clones the bundle.
+        let cell = OnceLock::new();
+        let _ = cell.set(resolver);
+        Arc::make_mut(&mut self.host).reef_resolver = cell;
     }
 
     /// Install the host's statement renderer (defect #1). Every statement-position
@@ -477,24 +639,24 @@ impl Evaluator {
     /// When unset, a built-in default prints to real stdout so scripts behave
     /// without host wiring.
     pub fn set_statement_sink(&mut self, f: StatementSink) {
-        self.sink = Some(f);
+        self.session.sink = Some(f);
     }
 
     /// Bind `it` and append to the session `out` transcript list (REPL hook).
     /// `Var("it")` / `Var("out")` then resolve from the environment normally.
     pub fn record_transcript(&mut self, v: &Value) {
-        self.env.declare("it", v.clone(), true);
-        let mut out = match self.env.get("out") {
+        self.exec.env.declare("it", v.clone(), true);
+        let mut out = match self.exec.env.get("out") {
             Some(Value::List(xs)) => xs,
             _ => Vec::new(),
         };
         out.push(v.clone());
-        self.env.declare("out", Value::List(out), true);
+        self.exec.env.declare("out", Value::List(out), true);
     }
 
     /// Route a value to the statement sink (or the default stdout renderer).
     pub(crate) fn emit(&mut self, v: &Value) {
-        if let Some(sink) = self.sink.as_mut() {
+        if let Some(sink) = self.session.sink.as_mut() {
             sink(v);
         } else {
             helpers::default_render(v);
@@ -523,13 +685,15 @@ impl Evaluator {
     /// (site/content/internals/kernel-protocol.md). Cheap and I/O-free: call it once per
     /// command when building a `PromptContext`, never per keystroke.
     pub fn jobs_snapshot(&self) -> JobsSnapshot {
-        let total = self.jobs.len();
+        let total = self.exec.jobs.len();
         let running = self
+            .exec
             .jobs
             .iter()
             .filter(|t| !t.is_done() && !t.is_suspended())
             .count();
         let suspended = self
+            .exec
             .jobs
             .iter()
             .filter(|t| !t.is_done() && t.is_suspended())
@@ -549,6 +713,7 @@ impl Evaluator {
     /// for legibility; the booleans remain for programmatic filtering.
     pub(crate) fn jobs_table(&self) -> Value {
         let rows = self
+            .exec
             .jobs
             .iter()
             .map(|t| {
@@ -579,7 +744,7 @@ impl Evaluator {
     /// suspend hooks (`SIGTSTP` to the task's process group, when a spawner has
     /// registered one). Returns `false` if no task has that id.
     pub fn suspend_task(&self, id: u64) -> bool {
-        match self.jobs.iter().find(|t| t.id == id) {
+        match self.exec.jobs.iter().find(|t| t.id == id) {
             Some(t) => {
                 t.suspend();
                 true
@@ -591,7 +756,7 @@ impl Evaluator {
     /// Resume a suspended task by id (`SIGCONT`). Counterpart to
     /// [`Evaluator::suspend_task`]. Returns `false` if no task has that id.
     pub fn resume_task(&self, id: u64) -> bool {
-        match self.jobs.iter().find(|t| t.id == id) {
+        match self.exec.jobs.iter().find(|t| t.id == id) {
             Some(t) => {
                 t.resume();
                 true
@@ -603,7 +768,7 @@ impl Evaluator {
     /// Look up a live task by id (for the REPL `fg <task>` path, which re-fronts a
     /// background task and must first resolve it from the job table).
     pub fn task_by_id(&self, id: u64) -> Option<shoal_value::TaskVal> {
-        self.jobs.iter().find(|t| t.id == id).cloned()
+        self.exec.jobs.iter().find(|t| t.id == id).cloned()
     }
 
     /// Record a foreground external command that the OS just *stopped* (Ctrl-Z →
@@ -621,25 +786,26 @@ impl Evaluator {
         task.on_resume(Box::new(move || shoal_exec::continue_group(pgid)));
         task.mark_suspended();
         let id = task.id;
-        self.jobs.push(task);
-        self.external_jobs.insert(id, pid);
-        self.pending_stop = Some((id, desc));
+        self.exec.jobs.push(task);
+        self.exec.external_jobs.insert(id, pid);
+        self.exec.pending_stop = Some((id, desc));
         id
     }
 
     /// The child pid of a stopped-external job id, for the REPL `fg`/`bg` path to
     /// locate its parked PTY. `None` if `id` is not a stopped external command.
     pub fn external_job_pid(&self, id: u64) -> Option<u32> {
-        self.external_jobs.get(&id).copied()
+        self.exec.external_jobs.get(&id).copied()
     }
 
     /// The most recently registered external command that is currently stopped —
     /// the "current job" a bare `fg`/`bg` (no id) targets, matching the shell
     /// convention. `None` when no external command is stopped.
     pub fn last_stopped_external(&self) -> Option<u64> {
-        self.jobs
+        self.exec
+            .jobs
             .iter()
-            .filter(|t| t.is_suspended() && self.external_jobs.contains_key(&t.id))
+            .filter(|t| t.is_suspended() && self.exec.external_jobs.contains_key(&t.id))
             .map(|t| t.id)
             .max()
     }
@@ -647,14 +813,14 @@ impl Evaluator {
     /// The most recently stopped foreground external command (job id, display),
     /// consumed once by the REPL after each command to print the stop notice.
     pub fn take_pending_stop(&mut self) -> Option<(u64, String)> {
-        self.pending_stop.take()
+        self.exec.pending_stop.take()
     }
 
     /// Mark a stopped-external job as running again WITHOUT signalling — the
     /// REPL `fg`/`bg` path performs the SIGCONT + terminal handoff itself, so
     /// this only updates the job-table state. Returns `false` for an unknown id.
     pub fn mark_external_resumed(&self, id: u64) -> bool {
-        match self.jobs.iter().find(|t| t.id == id) {
+        match self.exec.jobs.iter().find(|t| t.id == id) {
             Some(t) => {
                 t.mark_resumed();
                 true
@@ -666,10 +832,10 @@ impl Evaluator {
     /// Re-mark a stopped-external job as stopped (it was `fg`'d and then Ctrl-Z'd
     /// again) and re-arm the pending-stop notice, without re-signalling.
     pub fn mark_external_stopped(&mut self, id: u64) {
-        if let Some(t) = self.jobs.iter().find(|t| t.id == id) {
+        if let Some(t) = self.exec.jobs.iter().find(|t| t.id == id) {
             t.mark_suspended();
             let desc = t.shared.desc.clone();
-            self.pending_stop = Some((id, desc));
+            self.exec.pending_stop = Some((id, desc));
         }
     }
 
@@ -677,8 +843,8 @@ impl Evaluator {
     /// ran to completion): mark the task done so `jobs` shows it terminal, and
     /// drop the pid mapping. Returns `false` for an unknown id.
     pub fn finish_external_job(&mut self, id: u64) -> bool {
-        self.external_jobs.remove(&id);
-        match self.jobs.iter().find(|t| t.id == id) {
+        self.exec.external_jobs.remove(&id);
+        match self.exec.jobs.iter().find(|t| t.id == id) {
             Some(t) => {
                 t.finish(Ok(Value::Null));
                 true
@@ -688,7 +854,7 @@ impl Evaluator {
     }
 
     pub fn cwd(&self) -> &Path {
-        &self.cwd
+        &self.exec.cwd
     }
 
     /// The session's process environment (name → value pairs) — the same
@@ -697,32 +863,32 @@ impl Evaluator {
     /// session-state accessor mirroring [`Evaluator::cwd`], used by the
     /// kernel's `shoal://session/env` resource view (site/content/internals/kernel-protocol.md).
     pub fn env_vars(&self) -> &[(OsString, OsString)] {
-        &self.process_env
+        &self.exec.process_env
     }
 
     pub fn set_adapters(&mut self, adapters: AdapterCatalog) {
-        self.adapters = adapters;
+        Arc::make_mut(&mut self.host).adapters = adapters;
     }
 
     pub fn load_bundled_adapters(&mut self) -> Vec<String> {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../adapters");
         let (catalog, warnings) = AdapterCatalog::load_dir(&root);
-        self.adapters = catalog;
+        Arc::make_mut(&mut self.host).adapters = catalog;
         warnings
     }
 
     /// Cancel the currently executing foreground process tree.
     pub fn cancel_current(&self) {
-        self.cancel.cancel();
+        self.exec.cancel.cancel();
     }
 
     pub fn cancellation_token(&self) -> CancelToken {
-        self.cancel.clone()
+        self.exec.cancel.clone()
     }
 
     /// Install a fresh cancellation epoch before reading the next command.
     pub fn reset_cancel(&mut self) {
-        self.cancel = CancelToken::new();
+        self.exec.cancel = CancelToken::new();
     }
 }
 
@@ -737,7 +903,13 @@ impl CallCtx for Evaluator {
         )
     }
     fn cwd(&self) -> PathBuf {
-        self.cwd.clone()
+        self.exec.cwd.clone()
+    }
+    /// Hand value methods the evaluator's *injected* Fs port, not the trait's
+    /// `StdFs` default, so `.save`/`.append` write sinks are mediated by
+    /// whatever adapter `set_fs` installed (HR-C follow-through wire).
+    fn fs(&self) -> &dyn Fs {
+        &*self.host.fs
     }
 }
 
@@ -885,6 +1057,91 @@ mod tests {
         rec.insert("k".into(), Value::Int(7));
         ev3.set_config(Arc::new(ConfigSnapshot::new(Value::Record(rec.clone()))));
         assert_eq!(ev3.eval_program(&all).unwrap(), Value::Record(rec));
+    }
+
+    /// The Fs-port boundary is enforceable *through the evaluator*: value-method
+    /// write sinks (`.save`) resolve to the evaluator's injected port, so a
+    /// denying adapter blocks the write before it reaches the disk (HR-C wire).
+    #[test]
+    fn value_method_saves_go_through_the_injected_fs_port() {
+        use shoal_value::ReadSeek;
+        use std::io;
+
+        /// Delegates reads to [`StdFs`], refuses every write-shaped call.
+        struct DenyWrites;
+        fn denied<T>() -> io::Result<T> {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "denied by test port",
+            ))
+        }
+        impl Fs for DenyWrites {
+            fn read(&self, path: &std::path::Path) -> io::Result<Vec<u8>> {
+                StdFs.read(path)
+            }
+            fn read_to_string(&self, path: &std::path::Path) -> io::Result<String> {
+                StdFs.read_to_string(path)
+            }
+            fn open_read(&self, path: &std::path::Path) -> io::Result<Box<dyn ReadSeek + Send>> {
+                StdFs.open_read(path)
+            }
+            fn write(&self, _: &std::path::Path, _: &[u8]) -> io::Result<()> {
+                denied()
+            }
+            fn append(&self, _: &std::path::Path, _: &[u8]) -> io::Result<()> {
+                denied()
+            }
+            fn touch(&self, _: &std::path::Path) -> io::Result<()> {
+                denied()
+            }
+            fn metadata(&self, path: &std::path::Path) -> io::Result<std::fs::Metadata> {
+                StdFs.metadata(path)
+            }
+            fn symlink_metadata(&self, path: &std::path::Path) -> io::Result<std::fs::Metadata> {
+                StdFs.symlink_metadata(path)
+            }
+            fn read_dir(&self, path: &std::path::Path) -> io::Result<Vec<PathBuf>> {
+                StdFs.read_dir(path)
+            }
+            fn create_dir(&self, _: &std::path::Path) -> io::Result<()> {
+                denied()
+            }
+            fn create_dir_all(&self, _: &std::path::Path) -> io::Result<()> {
+                denied()
+            }
+            fn remove_file(&self, _: &std::path::Path) -> io::Result<()> {
+                denied()
+            }
+            fn remove_dir_all(&self, _: &std::path::Path) -> io::Result<()> {
+                denied()
+            }
+            fn rename(&self, _: &std::path::Path, _: &std::path::Path) -> io::Result<()> {
+                denied()
+            }
+            fn copy(&self, _: &std::path::Path, _: &std::path::Path) -> io::Result<u64> {
+                denied()
+            }
+            fn hard_link(&self, _: &std::path::Path, _: &std::path::Path) -> io::Result<()> {
+                denied()
+            }
+            fn symlink(&self, _: &std::path::Path, _: &std::path::Path) -> io::Result<()> {
+                denied()
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut ev = Evaluator::new(dir.path().to_path_buf());
+        ev.set_fs(Arc::new(DenyWrites));
+        let program = shoal_syntax::parse(r#""x".save("p")"#).unwrap();
+        let result = ev.eval_program(&program);
+        assert!(
+            result.is_err(),
+            "a denying injected port must surface the refusal, got {result:?}"
+        );
+        assert!(
+            !dir.path().join("p").exists(),
+            "the denied write must never reach the real filesystem"
+        );
     }
 
     #[test]

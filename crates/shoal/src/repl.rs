@@ -48,7 +48,7 @@ pub(crate) fn repl() -> Result<i32, String> {
         pager: config.render.pager.clone(),
     };
     let mut evaluator = Evaluator::new(cwd.clone());
-    evaluator.interactive = true;
+    evaluator.set_interactive(true);
     // Wire the user reef scope (site/content/internals/reef-resolution.md) exactly like `run_source`
     // does (crate::reef_user_manifest_path). The REPL builds its own
     // `Evaluator` and was missing this call entirely — without it,
@@ -162,7 +162,7 @@ pub(crate) fn repl() -> Result<i32, String> {
 
     let cwd_cell = Arc::new(Mutex::new(evaluator.cwd().to_path_buf()));
     let completer = ShoalCompleter::new(
-        evaluator.env.clone(),
+        evaluator.env().clone(),
         cwd_cell.clone(),
         catalogs,
         adapter_names,
@@ -231,7 +231,9 @@ pub(crate) fn repl() -> Result<i32, String> {
         .with_quick_completions(!config.completion.menu)
         .with_partial_completions(!config.completion.menu)
         .with_edit_mode(edit_mode)
-        .with_highlighter(Box::new(ShoalHighlighter::with_env(evaluator.env.clone())))
+        .with_highlighter(Box::new(ShoalHighlighter::with_env(
+            evaluator.env().clone(),
+        )))
         .with_hinter(Box::new(DefaultHinter::default()))
         // `history.ignore_space` (site/content/internals/configuration-reference.md, classic
         // `HISTCONTROL=ignorespace`): reedline has this exact knob built in.
@@ -314,7 +316,7 @@ pub(crate) fn repl() -> Result<i32, String> {
                 // as plain source text before parsing since the evaluator has
                 // no `fg` builtin of its own — see `rewrite_fg`.
                 let run_src = rewrite_fg(&src).unwrap_or_else(|| src.clone());
-                let ctx = parse_ctx_for(&evaluator.env);
+                let ctx = parse_ctx_for(evaluator.env());
                 match parse_with_ctx(&run_src, ctx) {
                     Ok(mut program) => {
                         // `undo out[n]` (site/content/internals/roadmap-and-priorities.md): rewrite a literal

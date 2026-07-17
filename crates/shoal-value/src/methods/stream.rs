@@ -1,10 +1,10 @@
 //! Method dispatch for `stream<T>` (site/content/internals/streams-channels.md). Lazy combinators return a
 //! fresh stream (consuming `s`, site/content/internals/language-conformance-contract.md); sinks drive it. `.into` / `.render` /
-//! `.feed` are handled one level up in the evaluator (they need the event bus,
-//! the statement sink, or a child process) and never reach here.
+//! `.feed` / `.buffer` are handled one level up in the evaluator (they need the
+//! event bus, the statement sink, a child process, or a child-evaluator producer
+//! thread) and never reach here.
 
 use super::*;
-use std::fs::OpenOptions;
 use std::io::Write as _;
 
 pub(crate) fn stream_method(
@@ -40,7 +40,16 @@ pub(crate) fn stream_method(
                 "window expects a positive count or a duration",
             )),
         },
-        "buffer" => s.buffer(int_arg(&args, 0, 1)?).map(stream),
+        // `.buffer(n)` is a REAL decoupling stage (HR-G1): it spawns a producer
+        // thread that drives the upstream through a child evaluator, which only
+        // the evaluator host can build. shoal-eval intercepts it (like `.into`
+        // and `.render`) before generic dispatch ever runs; reaching this arm
+        // means the host cannot support it — an honest error, never a silent
+        // identity pass-through.
+        "buffer" => Err(ErrorVal::new(
+            "custom",
+            "stream .buffer needs the evaluator host (it spawns a background producer)",
+        )),
         "enumerate" => no_args(&args).and_then(|_| s.enumerate()).map(stream),
         "merge" => match arg(&args, 0)? {
             Value::Stream(o) => s.merge(o.clone()).map(stream),
@@ -111,10 +120,14 @@ fn stream_save(ctx: &mut dyn CallCtx, s: StreamVal, path: &Value) -> VResult<Val
     } else {
         ctx.cwd().join(p)
     };
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&p)
+    // Open once through the injected `Fs` port instead of `std::fs::OpenOptions`
+    // (HR-C2): the sink keeps its open-once / append-each-item streaming shape,
+    // but the write now crosses the same enforceable boundary as `path.read`.
+    // `ctx.fs()` borrows `ctx` only for this call and hands back an owned
+    // writer, so `drive_stream` below can still take `ctx` mutably.
+    let mut file = ctx
+        .fs()
+        .open_append(&p)
         .map_err(|e| ErrorVal::new("custom", format!("{}: {e}", p.display())))?;
     let mut up = s.take_upstream()?;
     drive_stream(ctx, &mut *up, |_ctx, v| {

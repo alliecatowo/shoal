@@ -127,15 +127,25 @@ accDescr: Shows the components and relationships described in Evaluator port con
 
 ### `Fs`
 
-The filesystem port covers whole-file read/string read, seekable read, write, append, touch,
-metadata/symlink metadata, regular-file check, directory enumeration, directory creation/removal,
-file removal, rename, copy, hardlink, and symlink. The standard adapter delegates to `std::fs`.
+The filesystem port covers whole-file read/string read, seekable read, write, append,
+**open-for-append** (`open_append`, the open-once incremental writer backing the stream sink),
+touch, metadata/symlink metadata, regular-file check, directory enumeration, directory
+creation/removal, file removal, rename, copy, hardlink, and symlink. The standard adapter delegates
+to `std::fs`. `open_append`'s trait default fails closed (`ErrorKind::Unsupported`) so an adapter
+that mediates effects must implement it rather than let a streamed append escape.
 
-It does **not** currently cover every filesystem observation needed by the evaluator. Direct calls
-remain around `Path::exists/is_dir/canonicalize`, module/frecency discovery, script paths, stream
-sources, and value/stream save paths. In particular, path `.save`/`.append` and stream `.save` use
-direct `OpenOptions` rather than `Fs`. The architectural contract is the desired single boundary;
-the current implementation is partial and must not be described as fully hexagonal.
+Every filesystem **write** the language exposes now crosses `Fs`: path/value `.save`/`.append` route
+through `CallCtx::fs().write`/`.append` and stream `.save`/`.append` through `CallCtx::fs().open_append`
+(HR-C1/HR-C2). The `Fs` port does **not** yet cover every read-only filesystem *observation*: direct
+`Path::exists/is_dir/is_file/canonicalize` calls remain around module/frecency discovery, script
+dispatch, stream sources, and cp/ls/cd guards. The in-process filesystem-effect ledger in
+[`effects-plans-security.md`](@/internals/effects-plans-security.md) inventories every site (routed
+vs. exempt). The architectural contract is the desired single boundary; the observation residue means
+it must not yet be described as fully hexagonal.
+
+`CallCtx` (the eval↔methods bridge) exposes `fs() -> &dyn Fs` so value methods reach the same port;
+its default is `StdFs`, and a host with an injected/sandboxed port must override it in its `CallCtx`
+impl for value-method writes to consult that port.
 
 Adding an effectful filesystem operation should extend `Fs` and its fakes unless there is a
 documented host-only reason. A repair needs a port-spy test proving the operation crosses the port,
@@ -334,7 +344,10 @@ Important defaults include:
 - optional timeout can convert synchronous work into a task result;
 - elision overrides are optional and hard-clamped by the kernel;
 - `mode: approved` requires a verified stored plan and is not a caller-asserted privilege;
-- journal and event limits/defaults are applied above/below storage as documented by handlers.
+- `JournalQueryParams.limit` is `Option<usize>`: omitted → default page (100), explicit `0` → zero
+  rows, any value clamped to the server maximum (10,000). The `Option` exists so the kernel can
+  distinguish "no limit given" from "give me nothing"; `journal.query` also requires attachment;
+- event limits/defaults are applied above/below storage as documented by handlers.
 
 ## Stable JSON-RPC error taxonomy
 
@@ -367,21 +380,28 @@ split only with a protocol compatibility plan and client fallbacks.
 
 ## Session and authority contract
 
-Most kernel handlers require `session.attach`. Attach establishes session, principal, capabilities,
-cwd/environment identity, AST version, enforcement honesty, elision defaults, and channel list.
+Every stateful kernel handler requires `session.attach`; only `session.attach`, `parse`, and
+`complete` are public. Attach establishes session, principal, capabilities, cwd/environment identity,
+AST version, enforcement honesty, elision defaults, and channel list.
 
 Stable security properties:
 
 - Unix socket ownership/permissions and peer UID are the first boundary;
 - agent tokens are validated through `TokenStore::validate`;
+- `cap.request` and `journal.query` require attachment (no unattached approval mutation or journal
+  read); `cap.request` binds the attached principal as the approver, distinct from the requester by
+  default (self-acknowledgement is an explicit opt-in), and writes an auditable approval record;
 - a named session does not make refs globally visible—handlers still scope every lookup;
 - plans, tasks, PTYs, events, values, and approvals are checked against session/principal rules;
 - `caps_enforced` states actual OS enforcement availability, not merely policy configuration;
 - secret material never crosses the wire through a `Secret` value;
 - per-client `it` state must remain distinct even inside a shared session.
 
-Current risk: the first principal attached to a named session can determine session-owned evaluator
-state that later principals share. Treat cross-principal named sessions as a security review area.
+Cross-principal named sessions are the intentional pair-shell model (HR-D7): objects
+(transcript/tasks/PTYs) are session-scoped and shared by every attached principal, authority stays
+per-actor, coarse journal attribution follows the current actor, and the isolation boundary is the
+session name. The one documented seam: evaluator statement-level journal rows keep the
+session-creating principal's identity.
 
 ## Compatibility review matrix
 

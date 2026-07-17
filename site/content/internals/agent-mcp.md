@@ -43,6 +43,31 @@ best-effort spawns a detached `shoal-kernel`, polls readiness for about five sec
 `SHOAL_NO_AUTOSTART` opts out for externally supervised kernels. Competing autostarts rely on the
 kernel's socket preparation to leave one winner.
 
+### Zero-config identity (HR-D6)
+
+The facade attaches with `client.kind:"mcp"` and, zero-config (no `SHOAL_TOKEN`), the kernel maps
+that attach to the restricted **`agent:mcp`** principal with the `"agent"` profile — not the
+same-UID `local-human`. Availability is unchanged: the kernel's built-in default policy defines
+`agent:mcp` with execution intact (opaque allow, unrestricted filesystem, in-grant auto-apply), so
+`shoal_exec` and the other twelve tools all work out of the box. What changes is default authority
+and identity:
+
+- session env becomes **names-only** (`granted:false`; no values) — the agent has no `env_read`
+  grant;
+- persistent env writes and secret use have no grants;
+- agent work is journaled under `agent:mcp`, distinct from the human's rows;
+- combined with the approval separation-of-duties default, an MCP agent cannot approve its own
+  plans — a distinct principal (the human's session, a supervisor token) must.
+
+Permissive attach is an explicit opt-in: set `SHOAL_TOKEN` (the token's principal and policy
+govern), or set a non-empty `SHOAL_MCP_PERMISSIVE` on the kernel process to restore the legacy
+`local-human` mapping for MCP-kind clients. The autostarted kernel inherits the MCP process
+environment, so either variable in the MCP server config is sufficient. An explicit `--policy` file
+replaces the built-in default policy entirely; define `[principal."agent:mcp"]` there or zero-config
+agents evaluate to deny. The `client.kind` string is a client declaration inside the same-UID
+0600-socket trust boundary — it sets the default authority of the shipped agent surface; it is not a
+defense against a malicious same-UID process.
+
 Both MCP stdio and kernel socket protocols use newline JSON frames with a 16 MiB completed-frame
 limit. Like the kernel reader, the MCP reader calls `read_line` before checking size, so memory is not
 strictly bounded while the line is being accumulated.
@@ -70,12 +95,12 @@ The facade currently exposes 13 tools:
 | `shoal_pty_close` | `pty.close` | terminate and reap a PTY |
 | `shoal_pty_list` | `pty.list` | enumerate session PTYs |
 
-The facade's main `KernelClient` attaches before calling these methods, but that does not make every
-kernel handler authorization-safe. In particular, `cap.request` ignores the attachment because its
-router/handler signature receives none, and `journal.query` likewise has no attachment or
-caller-principal filter. A normal MCP call happens to arrive on an attached connection; a direct
-kernel client can call the same methods unattached, and an attached MCP principal is not checked as
-the approver. This must be fixed in the kernel boundary rather than papered over in the facade.
+The facade's main `KernelClient` attaches before calling these methods, and the kernel boundary now
+enforces attachment for every stateful method: `journal.query` (HR-D4) and `cap.request` (HR-D1) were
+the last exemptions and now reject an unattached direct kernel client with `NOT_ATTACHED`.
+`cap.request` additionally binds the attached principal as the **approver** and, by default, refuses a
+requester approving its own plan (HR-D3). The facade does not reimplement any of this authority — it
+is enforced in the kernel, not papered over in the bridge.
 
 
 Kernel RPC errors become successful MCP `tools/call` envelopes with `isError: true` and structured

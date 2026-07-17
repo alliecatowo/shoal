@@ -65,9 +65,26 @@ can contribute concrete effect templates. Paths and arguments are resolved as fa
 current evaluator state allow. Dynamic calls, unknown external behavior, or constructs that cannot
 be bounded become `Opaque` and normally make reversibility unknown.
 
+Adapter effect declarations parse against the **full** effect vocabulary — `fs.read`, `fs.write`,
+`fs.delete`, `proc.spawn`, `net.connect`, `net.listen`, `env.read`, `env.write`, `secret.use`,
+`session.write`, `journal.read`, and `time` — in both parenthesized (`proc.spawn(container)`) and
+bare (`session.write`) forms. A declaration whose kind is outside the vocabulary is **never silently
+dropped**: it plans as `Opaque` so an unrecognized adapter effect forces approval rather than
+vanishing from the plan.
 
-Derivation is intentionally conservative. It is safer to require approval for an opaque program
-than to manufacture a precise-looking plan that omits a dynamic effect.
+Derivation is intentionally conservative and fail-closed. The AST walk is structurally exhaustive —
+a match over every statement and expression node with **no wildcard arm**, so a new syntax form
+cannot be added without classifying its effects. Concretely the walk covers: `use` (module `FsRead`
+plus `Opaque` for the module body), persistent `env.NAME = …` (`EnvWrite`), command redirects
+(`>`/`>>` → `FsWrite`, `< file` → `FsRead`), the method sinks `.save`/`.append` and the path reads
+`.read`/`.lines`/…, `.feed` (an **external** spawn of the fed command, matching the runtime's
+`run_argv` path rather than builtin dispatch), the effectful builtins `run`/`open`/`save` and the
+bodies of `spawn`/`parallel`/lambda arguments, and generic external commands (a concrete `ProcSpawn`
+with a resolved binary hash, consistent with adapter spawns). A call that cannot be statically
+expanded — a session-stored closure, or any unrecognized name — becomes an approval-requiring
+`Opaque` effect; an empty effect set is emitted only for forms that are provably effect-free
+(literals, pure constructors, and control-flow scaffolding). It is safer to require approval for an
+opaque program than to manufacture a precise-looking plan that omits a dynamic effect.
 
 Sources: [`plan_derive.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-eval/src/plan_derive.rs)
 and [`plan_effects.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-eval/src/plan_effects.rs).
@@ -126,14 +143,58 @@ lands.
 
 The evaluator holds ports for filesystem, execution, clock, opener, secrets, configuration, and
 CAS-byte loading. Default ports perform real host actions; tests can inject deterministic fakes.
-This is an incomplete seam, not proof that every effect is port-routed: direct `Path::is_dir`,
-`exists`, `canonicalize`, `std::fs::OpenOptions`, and OS watcher setup remain in production paths.
-See the filesystem-boundary ledger in the evaluator-state chapter.
+This is an improving-but-incomplete seam. Every **write** effect the language exposes now crosses
+the `Fs` port (the ledger below is the proof); the residue is a set of read-only `Path::exists`,
+`is_dir`, `is_file`, and `canonicalize` *observations* and OS watcher setup that still call the
+filesystem directly. See the filesystem-boundary ledger in the evaluator-state chapter.
 
-More seriously, fresh evaluators created by `spawn_block`, `.shl` `run_script_file`, `parallel`, and
-`on` do not inherit the parent Leash policy/principal; they also omit Reef state, and some omit
-`ConfigPort`. A child external spawn can therefore resolve no sandbox despite a constrained parent.
-Until one audited child-construction API closes this, Leash is not a transitive authority boundary.
+### In-process filesystem-effect ledger (HR-C3, 2026-07-16)
+
+Inventory of every `std::fs`/`OpenOptions` use in `shoal-value` and in `shoal-eval`'s value/method
+paths. Each site is either **routed** through the `Fs` port or an **exempt** read-only observation
+with a stated reason. Kept exact; a new effectful filesystem call adds a row.
+
+**Routed write/read effects** — mediated by the `Fs` port, so a fake can observe or deny them and a
+sandbox can enforce them:
+
+| Site | Effect | Port route |
+|---|---|---|
+| `shoal-value` `methods/path.rs::save` — value `.save`/`.append`, `save(path, value)` builtin | file write / append | `CallCtx::fs().write` / `.append` (HR-C1) |
+| `shoal-value` `methods/stream.rs::stream_save` — stream `.save`/`.append` | open-once incremental append | `CallCtx::fs().open_append` (HR-C2) |
+| `shoal-value` `ports.rs::StdFs` | every `std::fs` syscall | the port adapter itself — the boundary, not a bypass |
+| `shoal-eval` `expr_access.rs::path_fs_method` — path `.read`/`.read_bytes`/`.lines`/`.exists`/`.is_dir`/`.is_file`/`.size`/`.modified` | file read / stat | `self.fs.read` / `.metadata` |
+| `shoal-eval` `command.rs` redirects `>` and `>>` | file write / append | `self.fs.write` / `.append` |
+| `shoal-eval` `builtins.rs` — `cat`/`ls`/`mkdir`/`touch`/`mv`/`cp`/`rm`/`trash`/`ln` | read / write / dir / rename / link | `self.fs.*` |
+| `shoal-eval` `frecency.rs` dir-jump store load/save | read / write / rename | `self.fs.*` |
+| `shoal-eval` `journal.rs` undo snapshot + restore | read | `self.fs.read` |
+| `shoal-eval` `reef_builtins.rs` manifest read | stat / read | `self.fs.is_file` / `.read_to_string` |
+
+**Exempt read-only observations** — non-mutating existence/type/canonicalization probes that still
+call `Path::*` directly. They neither write, delete, nor spawn, so they are not the "in-process
+write that escapes plan/approval/sandbox" the C-findings target; several already read from
+port-fetched `Metadata`. Routing them through an `Fs` stat/exists/canonicalize method is a read-side
+follow-up, not part of lane C's write-effect mandate:
+
+| Site | Call | Why exempt |
+|---|---|---|
+| `builtins.rs` `root.is_dir()` (ls), `dest.is_dir()` (cp/mv) | `Path::is_dir` | type probe guarding a *ported* `fs.read_dir`/`fs.copy`/`fs.rename` |
+| `command.rs::cd` `joined.canonicalize()` | `Path::canonicalize` | cwd resolution; `cd` is a session-state change, not an `FsWrite` |
+| `modules.rs` module resolution | `Path::is_file` / `canonicalize` | read-only discovery; the module read/exec is planned as `FsRead` (HR-A1) |
+| `script.rs` `resolved.exists()` | `Path::exists` | dispatch probe before `run_script_file` (itself a read) |
+| `streams.rs` watch/tail `root.exists()` / `path.exists()` | `Path::exists` | source-existence guard; the source read uses `self.fs.open_read` |
+| `journal.rs` undo target `is_file`/`exists`/`is_dir` | `Path::*` | read-only guards choosing the undo inverse; the mutation is ported |
+
+The `Fs` port also mediates the `CallCtx::fs()` seam value methods reach through. Its default is the
+real filesystem (`StdFs`) so a portless context is byte-identical to the pre-port `OpenOptions`
+code. The evaluator's `impl CallCtx` overrides `fs()` to return its injected `Arc<dyn Fs>`
+(`set_fs`), so value-method writes consult the session's actual port; a denying injected adapter
+blocks `"x".save(...)` end to end (`value_method_saves_go_through_the_injected_fs_port`).
+
+Child evaluators created by `spawn_block`, `.shl` `run_script_file`, `parallel`, and `on` inherit
+the parent's Leash policy/principal, all ports (including `ConfigPort`), Reef state, event bus, and
+cancellation through the single `ChildContext` constructor (HR-B1–B6); cross-route propagation is
+pinned by `child_context_propagation.rs`. Leash is transitive across child construction by
+compile-enforced design rather than per-site convention.
 
 ```mermaid
 flowchart LR

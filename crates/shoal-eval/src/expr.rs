@@ -34,17 +34,17 @@ impl Evaluator {
             Expr::Var { name, span } => {
                 // A name that isn't a variable but *is* a command resolves by
                 // invoking it zero-arg in value position (defect #5, site/content/internals/language-conformance-contract.md).
-                if let Some(v) = self.env.get(name) {
+                if let Some(v) = self.exec.env.get(name) {
                     Ok(v)
                 } else if name == "now" {
                     // Relative anchor (site/content/internals/language-conformance-contract.md): live wall-clock datetime.
                     Ok(Value::DateTime(Box::new(crate::helpers::now_zoned(
-                        self.clock.as_ref(),
+                        self.host.clock.as_ref(),
                     ))))
                 } else if name == "today" {
                     // Relative anchor (site/content/internals/language-conformance-contract.md): today at midnight.
                     Ok(Value::DateTime(Box::new(crate::helpers::today_zoned(
-                        self.clock.as_ref(),
+                        self.host.clock.as_ref(),
                     ))))
                 } else if self.is_command_name(name) {
                     let call = CmdCall {
@@ -126,7 +126,7 @@ impl Evaluator {
                 // Namespace constant access (`math.pi`, `config.<key>`): a
                 // namespace name that isn't shadowed by a binding (site/content/internals/roadmap-and-priorities.md).
                 if let Expr::Var { name: ns, .. } = &**recv
-                    && self.env.get(ns).is_none()
+                    && self.exec.env.get(ns).is_none()
                     && crate::namespaces::is_namespace(ns)
                 {
                     crate::namespaces::field(self, ns, name)
@@ -164,6 +164,7 @@ impl Evaluator {
                     // `SHOAL_SECRET_DIR`/`XDG_DATA_HOME`/`HOME` directory and
                     // opens the same `shoal_secret::SecretStore` as before.
                     let value = self
+                        .host
                         .secrets
                         .get(secret_name)
                         .map_err(|e| ErrorVal::new("permission", e))?
@@ -186,7 +187,7 @@ impl Evaluator {
                 // by a binding (site/content/internals/roadmap-and-priorities.md). Handled here (not methods.rs) because
                 // several members reach the evaluator (session env, network, cwd).
                 if let Expr::Var { name: ns, .. } = &**recv
-                    && self.env.get(ns).is_none()
+                    && self.exec.env.get(ns).is_none()
                     && crate::namespaces::is_namespace(ns)
                 {
                     let a = self.eval_args(args)?;
@@ -209,12 +210,12 @@ impl Evaluator {
                     // Relative anchors as functions (site/content/internals/language-conformance-contract.md): `now()`/`today()`.
                     "now" if args.pos.is_empty() && args.named.is_empty() => {
                         return Ok(Value::DateTime(Box::new(crate::helpers::now_zoned(
-                            self.clock.as_ref(),
+                            self.host.clock.as_ref(),
                         ))));
                     }
                     "today" if args.pos.is_empty() && args.named.is_empty() => {
                         return Ok(Value::DateTime(Box::new(crate::helpers::today_zoned(
-                            self.clock.as_ref(),
+                            self.host.clock.as_ref(),
                         ))));
                     }
                     "assert" => {
@@ -243,7 +244,7 @@ impl Evaluator {
                 if let Some(value) = self.call_constructor(name, &a)? {
                     return Ok(value);
                 }
-                if let Some(f) = self.env.get(name) {
+                if let Some(f) = self.exec.env.get(name) {
                     return self.call_value(&f, a);
                 }
                 // A name that isn't a fn but *is* a command resolves by invoking
@@ -282,7 +283,7 @@ impl Evaluator {
                 rest: None,
                 ret: None,
                 body: *body.clone(),
-                env: self.env.clone(),
+                env: self.exec.env.clone(),
                 doc: None,
             }))),
             Expr::Block { block, .. } => match self.eval_block(block, false)? {
@@ -311,13 +312,13 @@ impl Evaluator {
             } => match self.block_value(body) {
                 Ok(v) => Ok(v),
                 Err(e) => {
-                    let old = self.env.clone();
-                    self.env = old.child();
+                    let old = self.exec.env.clone();
+                    self.exec.env = old.child();
                     if let Some(p) = pattern {
                         self.bind_pattern(p, Value::Error(Arc::new(e)), false)?;
                     }
                     let r = self.block_value(handler);
-                    self.env = old;
+                    self.exec.env = old;
                     r
                 }
             },
@@ -329,14 +330,15 @@ impl Evaluator {
             } => match self.eval_expr(expr, Position::Value) {
                 Ok(v) => Ok(v),
                 Err(e) => {
-                    let old = self.env.clone();
-                    self.env = old.child();
+                    let old = self.exec.env.clone();
+                    self.exec.env = old.child();
                     if let Some(n) = binder {
-                        self.env
+                        self.exec
+                            .env
                             .declare(n.clone(), Value::Error(Arc::new(e)), false);
                     }
                     let r = self.eval_expr(handler, Position::Value);
-                    self.env = old;
+                    self.exec.env = old;
                     r
                 }
             },

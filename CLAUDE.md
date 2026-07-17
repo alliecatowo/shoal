@@ -9,7 +9,7 @@ in the Zola sources; do not grow a second manual here.
 
 Read the smallest relevant set before changing behavior:
 
-1. [`spec/cases/*.toml`](spec/cases) is the executable language contract: **1,310 cases across 77
+1. [`spec/cases/*.toml`](spec/cases) is the executable language contract: **1,331 cases across 78
    suites**. If prose and a case disagree, investigate, but do not silently change a case to match a
    regression.
 2. [`site/content/internals/language-conformance-contract.md`](site/content/internals/language-conformance-contract.md)
@@ -66,6 +66,12 @@ usually proceed independently.
 
 - Add or update conformance cases for every language-visible behavior change. Case names are unique
   repository-wide; search before adding one.
+- Docs move with code: every behavior or architecture change updates the matching page under
+  [`site/content/docs/`](site/content/docs) (user-facing) or
+  [`site/content/internals/`](site/content/internals) (architecture) in the same change set. Work
+  that closes an item in
+  [`site/content/internals/hardening-roadmap.md`](site/content/internals/hardening-roadmap.md)
+  ticks that checkbox in the same commit; never tick without a gated tree.
 - Each case gets a fresh evaluator and temporary cwd. `it`/`out[n]` are REPL-only. Use `skip` only
   for genuinely host-dependent behavior, never to hide a failure.
 - Shared types and public protocols require coordinated updates: implementation, tests, the

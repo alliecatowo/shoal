@@ -9,6 +9,7 @@
 use serde_json::{Value, json};
 use shoal_kernel::Kernel;
 use shoal_mcp::{Config, Facade};
+use shoal_proto::error_code::NOT_ATTACHED;
 use shoal_proto::{JSONRPC, Request, Response, write_frame};
 use std::io::BufReader;
 use std::os::unix::net::UnixStream;
@@ -333,28 +334,31 @@ fn mcp_shoal_plan_distinguishes_trash_rm_from_opaque_rm() {
     );
 }
 
-/// site/content/internals/kernel-protocol.md (`shoal://session/env`): the session environment view is
-/// served from the session evaluator. A default-permissive human is granted a
-/// value read (`env_read=["*"]`), so `granted:true` and the values travel
-/// alongside the names.
+/// site/content/internals/kernel-protocol.md (`shoal://session/env`) + HR-D6: the session
+/// environment view is served from the session evaluator, and for the
+/// zero-config MCP attach — which now lands on the restricted `agent:mcp`
+/// principal, not the permissive human — env is **names-only**: `granted:false`
+/// and no values travel. The names themselves are still disclosed (the
+/// documented contract), so the view remains useful without leaking values.
 #[test]
-fn mcp_session_env_resource_is_served_with_values_for_the_default_human() {
+fn mcp_session_env_resource_is_names_only_for_the_zero_config_agent() {
     let live = LiveKernel::start();
     let mut facade = Facade::connect(&live.config()).unwrap();
 
     let env = read_resource(&mut facade, "shoal://session/env");
     let sc = &env["structuredContent"];
     assert_eq!(
-        sc["granted"], true,
-        "the default-permissive human is granted an env value read: {sc}"
+        sc["granted"], false,
+        "the restricted zero-config agent is NOT granted env value reads: {sc}"
     );
     let names = sc["names"].as_array().expect("env names is a list");
-    assert!(!names.is_empty(), "the session env is not empty: {sc}");
-    let values = sc["env"].as_object().expect("granted env carries values");
-    assert_eq!(
-        values.len(),
-        names.len(),
-        "every named var carries a value when granted"
+    assert!(
+        !names.is_empty(),
+        "the session env names still travel: {sc}"
+    );
+    assert!(
+        sc.get("env").is_none() || sc["env"].is_null(),
+        "no env values may travel to an ungranted agent: {sc}"
     );
 }
 
@@ -971,4 +975,363 @@ fn mcp_pty_list_and_resources_track_open_sessions() {
         missing.get("error").is_some(),
         "reading a closed pty's screen must error: {missing}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Workstream D — kernel attachment/authority contracts over the real socket.
+// site/content/internals/kernel-protocol.md / kernel-rpc-reference.md.
+// ---------------------------------------------------------------------------
+
+/// HR-D4/HR-D8: `journal.query` requires an authenticated attachment. A fresh
+/// raw socket connection that never called `session.attach` must NOT be able to
+/// read stored journal rows — the audit confirmed it previously could. It now
+/// gets `NOT_ATTACHED`; the same connection, once attached, reads the journal.
+#[test]
+fn raw_unattached_journal_query_is_rejected_then_allowed_after_attach() {
+    let live = LiveKernel::start();
+    let mut stream = UnixStream::connect(&live.socket).unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+
+    // Never attached: journal.query is refused with NOT_ATTACHED, not served.
+    let denied = raw_call(
+        &mut stream,
+        &mut reader,
+        1,
+        "journal.query",
+        json!({ "limit": 10 }),
+    );
+    let err = denied
+        .error
+        .expect("unattached journal.query must be rejected, not served");
+    assert_eq!(
+        err.code, NOT_ATTACHED,
+        "unattached journal.query must be NOT_ATTACHED: {err:?}"
+    );
+
+    // After attaching on the same connection, journal.query works.
+    let attached = raw_call(
+        &mut stream,
+        &mut reader,
+        2,
+        "session.attach",
+        json!({"client":{"kind":"test","tty":false}}),
+    );
+    assert!(attached.error.is_none(), "attach failed: {attached:?}");
+    let ok = raw_call(
+        &mut stream,
+        &mut reader,
+        3,
+        "journal.query",
+        json!({ "limit": 10 }),
+    );
+    assert!(
+        ok.error.is_none(),
+        "an attached journal.query must succeed: {ok:?}"
+    );
+    assert!(ok.result.unwrap().is_array(), "journal.query returns rows");
+}
+
+/// HR-D5/HR-D8: `journal.query` limit semantics over the real socket. An
+/// explicit `limit: 0` returns zero rows (an empty page, not the whole
+/// history); an omitted limit returns the default page (the just-run entry is
+/// visible); and an absurd limit is clamped rather than streaming everything.
+#[test]
+fn raw_journal_query_limit_zero_is_empty_and_omitted_is_default() {
+    let live = LiveKernel::start();
+    let mut stream = UnixStream::connect(&live.socket).unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    raw_call(
+        &mut stream,
+        &mut reader,
+        1,
+        "session.attach",
+        json!({"client":{"kind":"test","tty":false}}),
+    );
+    // Produce a journal entry.
+    let exec = raw_call(&mut stream, &mut reader, 2, "exec", json!({"src":"1 + 2"}));
+    assert!(exec.error.is_none(), "exec failed: {exec:?}");
+
+    // Explicit limit:0 → zero rows (the audit's surprising edge case, fixed).
+    let zero = raw_call(
+        &mut stream,
+        &mut reader,
+        3,
+        "journal.query",
+        json!({ "limit": 0 }),
+    );
+    let zero_rows = zero.result.unwrap();
+    assert_eq!(
+        zero_rows.as_array().unwrap().len(),
+        0,
+        "limit:0 must return zero rows, not the full history: {zero_rows}"
+    );
+
+    // Omitted limit → default page: the just-run entry is present.
+    let default = raw_call(&mut stream, &mut reader, 4, "journal.query", json!({}));
+    let default_rows = default.result.unwrap();
+    let rows = default_rows.as_array().unwrap();
+    assert!(
+        rows.iter().any(|e| e["src"] == "1 + 2"),
+        "an omitted limit returns the default page including the just-run entry: {default_rows}"
+    );
+
+    // An absurd limit is accepted but clamped by the server-side maximum: the
+    // query still succeeds and returns the (few) real rows, never erroring.
+    let huge = raw_call(
+        &mut stream,
+        &mut reader,
+        5,
+        "journal.query",
+        json!({ "limit": 100_000_000usize }),
+    );
+    assert!(
+        huge.error.is_none(),
+        "an oversized limit is clamped, not an error: {huge:?}"
+    );
+}
+
+/// HR-D1/HR-D8: `cap.request` requires an authenticated attachment. A fresh raw
+/// socket connection that never attached must NOT be able to flip a plan's
+/// `approved` bit — approving is a state mutation the audit found was reachable
+/// with no caller identity at all. It now gets `NOT_ATTACHED`.
+#[test]
+fn raw_unattached_cap_request_is_rejected() {
+    let live = LiveKernel::start();
+    let mut stream = UnixStream::connect(&live.socket).unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+
+    // Never attached: cap.request is refused before any approval logic runs.
+    let denied = raw_call(
+        &mut stream,
+        &mut reader,
+        1,
+        "cap.request",
+        json!({ "plan_ref": "plan:deadbeefdeadbeef", "effects": [] }),
+    );
+    let err = denied
+        .error
+        .expect("unattached cap.request must be rejected, not processed");
+    assert_eq!(
+        err.code, NOT_ATTACHED,
+        "unattached cap.request must be NOT_ATTACHED: {err:?}"
+    );
+}
+
+/// HR-D6/HR-D8: zero-config attach is restricted. A no-token `client.kind:
+/// "mcp"` attach lands on the restricted `agent:mcp` principal with the "agent"
+/// profile — NOT the same-UID `local-human` — while execution availability is
+/// preserved: plain evaluation and an external command both still run. A
+/// no-token attach from a non-MCP client kind keeps the local-human mapping
+/// (the same-UID human surface is unchanged).
+#[test]
+fn raw_zero_config_mcp_attach_is_restricted_but_exec_still_works() {
+    let live = LiveKernel::start();
+
+    // The MCP-kind client: restricted agent principal.
+    let mut agent = UnixStream::connect(&live.socket).unwrap();
+    let mut agent_reader = BufReader::new(agent.try_clone().unwrap());
+    let attached = raw_call(
+        &mut agent,
+        &mut agent_reader,
+        1,
+        "session.attach",
+        json!({"client":{"kind":"mcp","tty":false}}),
+    )
+    .result
+    .expect("zero-config mcp attach succeeds");
+    assert_eq!(
+        attached["principal"], "agent:mcp",
+        "zero-config MCP attach must land on the restricted agent principal: {attached}"
+    );
+    assert_eq!(
+        attached["caps"]["profile"], "agent",
+        "the agent profile travels in caps: {attached}"
+    );
+
+    // Availability is preserved: evaluation and an external command still run.
+    let pure = raw_call(
+        &mut agent,
+        &mut agent_reader,
+        2,
+        "exec",
+        json!({"src":"1 + 2"}),
+    );
+    assert!(pure.error.is_none(), "plain exec must work: {pure:?}");
+    assert_eq!(pure.result.unwrap()["value"]["v"], 3);
+    let external = raw_call(
+        &mut agent,
+        &mut agent_reader,
+        3,
+        "exec",
+        json!({"src":"sh { echo hi }","position":"value"}),
+    );
+    assert!(
+        external.error.is_none(),
+        "external commands must still run under the restricted agent: {external:?}"
+    );
+
+    // A non-MCP client kind keeps the local-human mapping.
+    let mut human = UnixStream::connect(&live.socket).unwrap();
+    let mut human_reader = BufReader::new(human.try_clone().unwrap());
+    let human_attached = raw_call(
+        &mut human,
+        &mut human_reader,
+        1,
+        "session.attach",
+        json!({"client":{"kind":"test","tty":false}}),
+    )
+    .result
+    .expect("human attach succeeds");
+    let human_principal = human_attached["principal"].as_str().unwrap();
+    assert!(
+        human_principal.starts_with("uid:"),
+        "a non-MCP no-token attach keeps the local principal: {human_attached}"
+    );
+    assert_ne!(
+        human_principal, "agent:mcp",
+        "human and agent principals must be distinct"
+    );
+}
+
+/// HR-D7/HR-D8: the shared pair-shell session model, pinned over the real
+/// socket. Two DIFFERENT principals (the local human and the zero-config
+/// `agent:mcp`) attach to the SAME named session:
+///
+/// 1. task/PTY access is session-scoped and intentionally shared — the agent
+///    can read and control a PTY the human opened in their shared session;
+/// 2. coarse journal attribution follows the CURRENT actor — the human's exec
+///    rows carry the human principal and the agent's carry `agent:mcp`, even
+///    inside the one shared session.
+///
+/// (Cross-SESSION isolation — another session name cannot see these objects —
+/// is pinned separately in the kernel's `pty_sessions_are_isolated` test.)
+#[test]
+fn raw_pair_session_shares_ptys_across_principals_and_attributes_actors() {
+    let live = LiveKernel::start();
+
+    // The human half of the pair shell.
+    let mut human = UnixStream::connect(&live.socket).unwrap();
+    let mut human_reader = BufReader::new(human.try_clone().unwrap());
+    let human_attached = raw_call(
+        &mut human,
+        &mut human_reader,
+        1,
+        "session.attach",
+        json!({"session":"pair","client":{"kind":"test","tty":false}}),
+    )
+    .result
+    .unwrap();
+    let human_principal = human_attached["principal"].as_str().unwrap().to_owned();
+
+    // The agent half, joining the SAME named session as a DIFFERENT principal.
+    let mut agent = UnixStream::connect(&live.socket).unwrap();
+    let mut agent_reader = BufReader::new(agent.try_clone().unwrap());
+    let agent_attached = raw_call(
+        &mut agent,
+        &mut agent_reader,
+        1,
+        "session.attach",
+        json!({"session":"pair","client":{"kind":"mcp","tty":false}}),
+    )
+    .result
+    .unwrap();
+    assert_eq!(agent_attached["principal"], "agent:mcp");
+    assert_ne!(
+        human_principal, "agent:mcp",
+        "the pair must actually be two distinct principals"
+    );
+
+    // The human opens a PTY in the shared session…
+    let opened = raw_call(
+        &mut human,
+        &mut human_reader,
+        2,
+        "pty.open",
+        json!({"cmd":"cat","cols":40,"rows":10}),
+    )
+    .result
+    .expect("human opens a pty");
+    let pty_id = opened["pty_id"].as_str().unwrap().to_owned();
+
+    // …and the agent can see and read it: session-scoped shared control is the
+    // documented pair-shell model (kernel-protocol.md, session identity).
+    let listed = raw_call(&mut agent, &mut agent_reader, 2, "pty.list", json!({}))
+        .result
+        .expect("agent lists the shared session's ptys");
+    let ptys = listed["ptys"].as_array().unwrap();
+    assert!(
+        ptys.iter().any(|p| p["pty_id"] == json!(pty_id)),
+        "the agent sees the human's pty in their shared session: {listed}"
+    );
+    let read = raw_call(
+        &mut agent,
+        &mut agent_reader,
+        3,
+        "pty.read",
+        json!({"pty_id": pty_id}),
+    );
+    assert!(
+        read.error.is_none(),
+        "the agent may read the shared session's pty: {read:?}"
+    );
+
+    // The agent closes it — shared control includes lifecycle.
+    let closed = raw_call(
+        &mut agent,
+        &mut agent_reader,
+        4,
+        "pty.close",
+        json!({"pty_id": pty_id}),
+    );
+    assert!(
+        closed.error.is_none(),
+        "the agent may close the shared session's pty: {closed:?}"
+    );
+
+    // Each principal execs once; the coarse journal rows carry the ACTOR.
+    let human_exec = raw_call(
+        &mut human,
+        &mut human_reader,
+        3,
+        "exec",
+        json!({"src":"1 + 1"}),
+    );
+    assert!(human_exec.error.is_none());
+    let agent_exec = raw_call(
+        &mut agent,
+        &mut agent_reader,
+        5,
+        "exec",
+        json!({"src":"2 + 2"}),
+    );
+    assert!(agent_exec.error.is_none());
+    let rows = raw_call(
+        &mut agent,
+        &mut agent_reader,
+        6,
+        "journal.query",
+        json!({"limit": 50}),
+    )
+    .result
+    .unwrap();
+    let rows = rows.as_array().unwrap();
+    let human_row = rows
+        .iter()
+        .find(|r| r["src"] == "1 + 1")
+        .expect("the human's exec is journaled");
+    let agent_row = rows
+        .iter()
+        .find(|r| r["src"] == "2 + 2")
+        .expect("the agent's exec is journaled");
+    assert_eq!(
+        human_row["principal"],
+        json!(human_principal),
+        "the human's row is attributed to the human actor: {human_row}"
+    );
+    assert_eq!(
+        agent_row["principal"], "agent:mcp",
+        "the agent's row is attributed to the agent actor: {agent_row}"
+    );
+    assert_eq!(human_row["session"], "pair");
+    assert_eq!(agent_row["session"], "pair");
 }

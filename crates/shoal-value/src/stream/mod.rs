@@ -123,6 +123,19 @@ impl StreamVal {
         StreamVal::from_source(label, false, Box::new(ChanSource(rx)))
     }
 
+    /// Like [`Self::from_channel`], but with an explicit boundedness bit — for
+    /// thread-backed decoupling stages (`.buffer(n)`, HR-G1) that wrap an
+    /// existing stream and must PRESERVE its boundedness: a buffered finite
+    /// stream still has a natural end (`.collect()` stays legal), while a
+    /// buffered live source stays endless.
+    pub fn from_channel_bounded(
+        label: impl Into<String>,
+        bounded: bool,
+        rx: std::sync::mpsc::Receiver<VResult<Value>>,
+    ) -> StreamVal {
+        StreamVal::from_source(label, bounded, Box::new(ChanSource(rx)))
+    }
+
     fn from_source(label: impl Into<String>, bounded: bool, up: Box<dyn Upstream>) -> StreamVal {
         StreamVal {
             label: label.into(),
@@ -223,7 +236,7 @@ impl StreamVal {
         self.wrap(l, b, |up| {
             Box::new(ops::Distinct {
                 up,
-                seen: Vec::new(),
+                seen: std::collections::HashMap::new(),
             })
         })
     }
@@ -268,12 +281,6 @@ impl StreamVal {
             })
         })
     }
-    pub fn buffer(self, _n: usize) -> VResult<StreamVal> {
-        // Pure pacing decoupler: in a synchronous pull model it has no observable
-        // effect on the item sequence, so it is an identity stage. It exists so
-        // `.buffer(n)` type-checks and reads intentionally in a chain.
-        Ok(self)
-    }
     pub fn enumerate(self) -> VResult<StreamVal> {
         let b = self.bounded;
         self.wrap("list", b, |up| Box::new(ops::Enumerate { up, i: 0 }))
@@ -295,7 +302,11 @@ impl StreamVal {
         let bounded = self.bounded || other.bounded;
         let other_up = other.take_upstream()?;
         self.wrap("list", bounded, |up| {
-            Box::new(ops::Zip { a: up, b: other_up })
+            Box::new(ops::Zip {
+                a: up,
+                b: other_up,
+                pending_a: None,
+            })
         })
     }
 
@@ -398,6 +409,74 @@ mod tests {
     }
 
     #[test]
+    fn zip_holds_the_left_item_across_a_right_timeout() {
+        // HR-G6: zip pulls LEFT then RIGHT. When the right side times out, the
+        // already-pulled left item must be HELD for the next pull — a timeout
+        // is not the end of the stream, and discarding would be silent data
+        // loss under timing combinators. The next successful pull pairs the
+        // HELD item (1), not a freshly-pulled one (2).
+        let (tx, rx) = std::sync::mpsc::channel();
+        let a = StreamVal::from_iter("int", (1..=3).map(|i| Ok(Value::Int(i))));
+        let b = StreamVal::from_channel("int", rx);
+        let z = a.zip(b).unwrap();
+        let mut up = z.take_upstream().unwrap();
+        match up
+            .pull(&mut C, Some(std::time::Duration::from_millis(30)))
+            .unwrap()
+        {
+            Pull::Timeout => {}
+            Pull::Item(v) => panic!("right side is silent; got item {v:?}"),
+            Pull::End => panic!("stream is live; got End"),
+        }
+        tx.send(Ok(Value::Int(10))).unwrap();
+        match up
+            .pull(&mut C, Some(std::time::Duration::from_secs(5)))
+            .unwrap()
+        {
+            Pull::Item(v) => assert_eq!(
+                v,
+                Value::List(vec![Value::Int(1), Value::Int(10)]),
+                "the held left item pairs first — nothing was discarded"
+            ),
+            other => panic!(
+                "expected the pair, got {:?}",
+                matches!(other, Pull::End)
+                    .then_some("End")
+                    .unwrap_or("Timeout")
+            ),
+        }
+    }
+
+    #[test]
+    fn merge_sweeps_left_first_but_never_starves_a_silent_side() {
+        // HR-G6 precision: merge is a left-biased poll sweep, not fair
+        // interleaving. (1) Two ready in-memory sources drain left side first.
+        let a = StreamVal::from_iter("int", (1..=2).map(|i| Ok(Value::Int(i))));
+        let b = StreamVal::from_iter("int", (3..=4).map(|i| Ok(Value::Int(i))));
+        assert_eq!(
+            drain(&a.merge(b).unwrap()),
+            vec![Value::Int(1), Value::Int(2), Value::Int(3), Value::Int(4)],
+            "ready sources drain left-first"
+        );
+        // (2) A silent-but-live left side only delays the right by one poll
+        // step — the sweep moves on and delivers the ready right item.
+        let (_keep_a_alive, rx_a) = std::sync::mpsc::channel();
+        let (tx_b, rx_b) = std::sync::mpsc::channel();
+        tx_b.send(Ok(Value::Int(7))).unwrap();
+        let a = StreamVal::from_channel("int", rx_a);
+        let b = StreamVal::from_channel("int", rx_b);
+        let m = a.merge(b).unwrap();
+        let mut up = m.take_upstream().unwrap();
+        match up
+            .pull(&mut C, Some(std::time::Duration::from_secs(5)))
+            .unwrap()
+        {
+            Pull::Item(v) => assert_eq!(v, Value::Int(7), "right item flows past silent left"),
+            _ => panic!("expected the right side's item"),
+        }
+    }
+
+    #[test]
     fn tee_live_forks_replay_within_the_bound() {
         let forks = endless_marked(3).tee(2).unwrap();
         assert_eq!(forks.len(), 2);
@@ -431,6 +510,49 @@ mod tests {
                 Some(&Value::Int((200 - tee::TEE_QUEUE_CAP) as i64))
             ),
             other => panic!("expected a {{dropped: n}} marker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn distinct_hash_buckets_respect_cross_type_equality() {
+        // HR-G5: `distinct` now buckets by a canonical hash. The contract is
+        // `a == b ⟹ same bucket`, so every cross-type equality `Value` defines
+        // must still dedupe: Int/Float numeric promotion, Path/Str display
+        // equality, and −0.0/+0.0. First occurrence wins, as before.
+        let src = StreamVal::from_iter(
+            "value",
+            vec![
+                Ok(Value::Int(1)),
+                Ok(Value::Float(1.0)), // == Int(1)
+                Ok(Value::Str("a".into())),
+                Ok(Value::Path(PathBuf::from("a"))), // == Str("a")
+                Ok(Value::Float(0.0)),
+                Ok(Value::Float(-0.0)), // == 0.0
+                Ok(Value::Int(2)),
+            ]
+            .into_iter(),
+        );
+        let out = drain(&src.distinct().unwrap());
+        assert_eq!(
+            out,
+            vec![
+                Value::Int(1),
+                Value::Str("a".into()),
+                Value::Float(0.0),
+                Value::Int(2)
+            ]
+        );
+    }
+
+    #[test]
+    fn distinct_emits_each_unique_value_once_at_scale() {
+        // HR-G5: 10k items over 100 distinct keys — a smoke test that the
+        // hash-bucketed set behaves exactly like the old linear scan.
+        let src = StreamVal::from_iter("int", (0..10_000).map(|i| Ok(Value::Int(i % 100))));
+        let out = drain(&src.distinct().unwrap());
+        assert_eq!(out.len(), 100);
+        for (i, v) in out.iter().enumerate() {
+            assert_eq!(v, &Value::Int(i as i64), "first-occurrence order kept");
         }
     }
 

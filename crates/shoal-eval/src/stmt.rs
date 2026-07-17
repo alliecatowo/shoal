@@ -18,7 +18,7 @@ impl Evaluator {
             self.journal_finish_stmt(journaled, &result);
             match result? {
                 Flow::Value(v) => {
-                    self.it = v.clone();
+                    self.exec.it = v.clone();
                     if is_last {
                         last = v;
                     } else if self.echo_intermediate(stmt) {
@@ -45,7 +45,7 @@ impl Evaluator {
             }
             // `exit`/`quit` halts the remaining statements immediately; the host
             // reads `take_exit` and ends with the code (defect: no exit).
-            if self.pending_exit.is_some() {
+            if self.exec.pending_exit.is_some() {
                 break;
             }
         }
@@ -58,7 +58,7 @@ impl Evaluator {
     /// behavior; `Quiet`/`Commands` echo only bare-command intermediates so a
     /// script's intermediate pure expressions (`1+1`, `let x=…`) stay silent.
     fn echo_intermediate(&self, stmt: &Stmt) -> bool {
-        match self.echo_mode {
+        match self.session.echo_mode {
             EchoMode::All => true,
             EchoMode::Quiet | EchoMode::Commands => crate::is_bare_command_stmt(stmt),
         }
@@ -86,14 +86,15 @@ impl Evaluator {
                         block: decl.body.clone(),
                         span: decl.body.span,
                     },
-                    env: self.env.clone(),
+                    env: self.exec.env.clone(),
                     doc: decl.doc.clone(),
                 }));
-                self.env.declare(decl.name.clone(), closure, false);
+                self.exec.env.declare(decl.name.clone(), closure, false);
                 Ok(Flow::Value(Value::Null))
             }
             Stmt::Alias { name, target, .. } => {
-                self.env
+                self.exec
+                    .env
                     .declare(name.clone(), Value::CmdRef(Arc::new(target.clone())), false);
                 Ok(Flow::Value(Value::Null))
             }
@@ -115,7 +116,7 @@ impl Evaluator {
                         )
                         .with_span(*span));
                     }
-                    if self.in_fn_body > 0 {
+                    if self.exec.in_fn_body > 0 {
                         return Err(ErrorVal::new(
                             "custom",
                             "env writes are only allowed at session top level; use `with env:` inside a fn body",
@@ -123,9 +124,12 @@ impl Evaluator {
                         .with_span(*span));
                     }
                     let val = self.argv_value(rhs.clone()).map_err(|e| e.or_span(*span))?;
-                    self.process_env
+                    self.exec
+                        .process_env
                         .retain(|(k, _)| k != &OsString::from(name.clone()));
-                    self.process_env.push((OsString::from(name.clone()), val));
+                    self.exec
+                        .process_env
+                        .push((OsString::from(name.clone()), val));
                     return Ok(Flow::Value(rhs));
                 }
                 let Expr::Var { name, .. } = target else {
@@ -138,7 +142,7 @@ impl Evaluator {
                 let assigned = if *op == AssignOp::Set {
                     rhs
                 } else {
-                    let lhs = self.env.get(name).ok_or_else(|| {
+                    let lhs = self.exec.env.get(name).ok_or_else(|| {
                         ErrorVal::new("undefined_var", format!("undefined variable `{name}`"))
                     })?;
                     let bop = match op {
@@ -150,7 +154,7 @@ impl Evaluator {
                     };
                     shoal_value::ops::binop(bop, &lhs, &rhs)?
                 };
-                self.env.assign(name, assigned.clone()).map_err(|e| {
+                self.exec.env.assign(name, assigned.clone()).map_err(|e| {
                     ErrorVal::new("type_error", format!("cannot assign `{name}`: {e:?}"))
                 })?;
                 Ok(Flow::Value(assigned))
@@ -178,11 +182,11 @@ impl Evaluator {
                 let iter_value = self.eval_expr(iter, Position::Value)?;
                 let vals = self.values_from(iter_value)?;
                 for value in vals {
-                    let old = self.env.clone();
-                    self.env = old.child();
+                    let old = self.exec.env.clone();
+                    self.exec.env = old.child();
                     self.bind_pattern(pattern, value, false)?;
                     let flow = self.eval_block(body, true);
-                    self.env = old;
+                    self.exec.env = old;
                     match flow? {
                         Flow::Value(_) => {}
                         Flow::Continue => continue,
@@ -252,8 +256,8 @@ impl Evaluator {
     /// the caller renders/sinks it exactly once. Non-final bare commands always
     /// print (they are intermediate, discard-context regardless).
     pub(crate) fn eval_block(&mut self, block: &Block, sink_tail: bool) -> VResult<Flow> {
-        let old = self.env.clone();
-        self.env = old.child();
+        let old = self.exec.env.clone();
+        self.exec.env = old.child();
         let mut last = Flow::Value(Value::Null);
         let n = block.stmts.len();
         for (i, stmt) in block.stmts.iter().enumerate() {
@@ -293,7 +297,7 @@ impl Evaluator {
                 self.sink_value(v);
             }
         }
-        self.env = old;
+        self.exec.env = old;
         Ok(last)
     }
 

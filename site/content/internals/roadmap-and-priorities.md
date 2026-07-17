@@ -12,6 +12,11 @@ audience = "Maintainers, reviewers, and project planners"
 wide = true
 +++
 
+Active remediation work is tracked task-by-task in the
+[hardening roadmap](@/internals/hardening-roadmap.md), which retires every finding of the
+[2026-07-16 deep audit](@/internals/deep-audit-2026-07-16.md); this page keeps the wider
+dependency-ordered picture.
+
 This roadmap starts from the [implementation status ledger](../implementation-status/), not the
 historical feature waves. Its job is to order work so that new surface area is built on explicit
 identity, authority, bounds, and lifecycle contracts. It contains no calendar promise: priorities

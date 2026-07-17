@@ -12,12 +12,18 @@ impl Evaluator {
         reef_expr: Option<&Expr>,
         body: &Block,
     ) -> VResult<Value> {
-        let old_cwd = self.cwd.clone();
-        let old_env = self.process_env.clone();
+        let old_cwd = self.exec.cwd.clone();
+        let old_env = self.exec.process_env.clone();
         if let Some(e) = cwd {
             match self.eval_expr(e, Position::Value)? {
-                Value::Path(p) => self.cwd = if p.is_absolute() { p } else { self.cwd.join(p) },
-                Value::Str(s) => self.cwd = self.cwd.join(s),
+                Value::Path(p) => {
+                    self.exec.cwd = if p.is_absolute() {
+                        p
+                    } else {
+                        self.exec.cwd.join(p)
+                    }
+                }
+                Value::Str(s) => self.exec.cwd = self.exec.cwd.join(s),
                 _ => return Err(ErrorVal::new("type_error", "with cwd expects path")),
             }
         }
@@ -27,8 +33,10 @@ impl Evaluator {
             };
             for (k, v) in r {
                 let val = self.argv_value(v)?;
-                self.process_env.retain(|(n, _)| n != &OsString::from(&k));
-                self.process_env.push((k.into(), val));
+                self.exec
+                    .process_env
+                    .retain(|(n, _)| n != &OsString::from(&k));
+                self.exec.process_env.push((k.into(), val));
             }
         }
         // `with reef: {tool: constraint, …} { }` — dynamic reef scoping
@@ -37,13 +45,13 @@ impl Evaluator {
         let mut pushed_reef = false;
         if let Some(e) = reef_expr {
             let Value::Record(r) = self.eval_expr(e, Position::Value)? else {
-                self.cwd = old_cwd;
-                self.process_env = old_env;
+                self.exec.cwd = old_cwd;
+                self.exec.process_env = old_env;
                 return Err(ErrorVal::new("type_error", "with reef expects record"));
             };
             if let Err(err) = self.push_reef_override(&r) {
-                self.cwd = old_cwd;
-                self.process_env = old_env;
+                self.exec.cwd = old_cwd;
+                self.exec.process_env = old_env;
                 return Err(err);
             }
             pushed_reef = true;
@@ -52,45 +60,30 @@ impl Evaluator {
         if pushed_reef {
             self.pop_reef_override();
         }
-        self.cwd = old_cwd;
-        self.process_env = old_env;
+        self.exec.cwd = old_cwd;
+        self.exec.process_env = old_env;
         out
     }
     pub(crate) fn spawn_block(&mut self, body: Block) -> VResult<Value> {
         let task = shoal_value::TaskVal::new("spawn block");
         // Structured cancellation: cancelling the task cancels the child's exec
-        // tokens (defect #14).
+        // tokens (defect #14) — a FRESH token wired to the task's cancel hook.
         let child_cancel = CancelToken::new();
         let hook_cancel = child_cancel.clone();
         task.on_cancel(Box::new(move || hook_cancel.cancel()));
         let worker = task.clone();
-        let env = self.env.clone();
-        let cwd = self.cwd.clone();
-        let penv = self.process_env.clone();
-        let adapters = self.adapters.clone();
-        let bus = self.bus();
-        // Share the host's effect ports (site/content/internals/roadmap-and-priorities.md) with the spawned
-        // task; `Arc` clones, identical under the `Std*` defaults.
-        let fs = self.fs.clone();
-        let exec = self.exec.clone();
-        let clock = self.clock.clone();
-        let opener = self.opener.clone();
-        let secrets = self.secrets.clone();
+        // The one authoritative child constructor (HR-B1): it inherits the full
+        // session context — leash policy/principal, reef scope/resolver/
+        // overrides, config, all effect ports, the event bus, and session
+        // identity — by construction, not the partial hand-copy the audit
+        // (B1–B4) found here dropping leash/reef/config. `Inherit` scope: a
+        // `spawn` body sees the caller's bindings.
+        let ctx = self.child_context();
         std::thread::spawn(move || {
-            let mut ev = Evaluator::new(cwd);
-            ev.env = env;
-            ev.process_env = penv;
-            ev.adapters = adapters;
-            ev.cancel = child_cancel;
-            ev.set_bus(bus);
-            ev.fs = fs;
-            ev.exec = exec;
-            ev.clock = clock;
-            ev.opener = opener;
-            ev.secrets = secrets;
+            let mut ev = ctx.build(ChildScope::Inherit, child_cancel);
             worker.finish(ev.block_value(&body));
         });
-        self.jobs.push(task.clone());
+        self.exec.jobs.push(task.clone());
         Ok(Value::Task(task))
     }
 
@@ -114,7 +107,11 @@ impl Evaluator {
         let is_path = name.contains('/') || name.starts_with('.') || name.starts_with('~');
         let resolved = {
             let p = self.resolve_path(&name);
-            if p.is_absolute() { p } else { self.cwd.join(p) }
+            if p.is_absolute() {
+                p
+            } else {
+                self.exec.cwd.join(p)
+            }
         };
         let ext = Path::new(&name)
             .extension()
@@ -154,24 +151,27 @@ impl Evaluator {
     ) -> VResult<Value> {
         match ext {
             Some("shl") | None => {
-                let src = self
-                    .fs
-                    .read_to_string(path)
-                    .map_err(|e| ErrorVal::new("io_error", format!("cannot read script: {e}")))?;
+                let src =
+                    self.host.fs.read_to_string(path).map_err(|e| {
+                        ErrorVal::new("io_error", format!("cannot read script: {e}"))
+                    })?;
                 let program = shoal_syntax::parse(&src)
                     .map_err(|e| ErrorVal::new("parse_error", e.to_string()))?;
                 // A `.shl` script is a separate program (see
                 // `site/content/internals/values-streams-execution.md`):
-                // the child keeps `Evaluator::new`'s FRESH root scope. Aliasing
-                // the caller's env (`Env::clone` shares the same Arc'd scope)
-                // leaked every script `let` back into the parent session.
-                let mut child = Evaluator::new(self.cwd.clone());
-                child.process_env = self.process_env.clone();
-                child.adapters = self.adapters.clone();
-                child.inherit_ports(self);
-                child.set_bus(self.bus());
-                child.env.declare("args", Value::List(args), false);
+                // `ChildScope::Fresh` keeps `Evaluator::new`'s FRESH root scope,
+                // so its `let`s do not leak back into the caller session
+                // (`Env::clone` would share the same Arc'd scope and leak them).
+                // Via the one child constructor (HR-B1) it still inherits the
+                // full session context — leash/reef/config/ports/bus/session
+                // identity, which the old hand-copy here dropped for leash/reef
+                // (audit B1–B3) — plus the parent's cancellation so a host
+                // cancel interrupts the script.
+                let cancel = self.cancellation_token();
+                let mut child = self.child_context().build(ChildScope::Fresh, cancel);
+                child.exec.env.declare("args", Value::List(args), false);
                 child
+                    .exec
                     .env
                     .declare("script", Value::Path(path.to_path_buf()), false);
                 child.eval_program(&program)
@@ -240,7 +240,7 @@ impl Evaluator {
     /// prefix. `#!/usr/bin/env <tool>` resolves to `<tool>` (env-style). `None`
     /// when the file is unreadable or has no shebang.
     pub(crate) fn shebang_argv(&self, path: &Path) -> Option<Vec<OsString>> {
-        let content = self.fs.read_to_string(path).ok()?;
+        let content = self.host.fs.read_to_string(path).ok()?;
         let first = content.lines().next()?;
         let rest = first.strip_prefix("#!")?.trim();
         let mut words = rest.split_whitespace();
@@ -281,6 +281,7 @@ impl Evaluator {
         position: Position,
     ) -> VResult<Value> {
         let path_env = self
+            .exec
             .process_env
             .iter()
             .find(|(k, _)| k == "PATH")

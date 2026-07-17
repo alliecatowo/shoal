@@ -87,7 +87,7 @@ impl Evaluator {
             // `1h.from_now` resolve against the live wall clock into a datetime.
             Value::Duration(ns) => match name {
                 "ago" | "from_now" => {
-                    let base = crate::helpers::now_zoned(self.clock.as_ref());
+                    let base = crate::helpers::now_zoned(self.host.clock.as_ref());
                     let signed = if name == "ago" { -*ns } else { *ns };
                     let span = jiff::SignedDuration::from_nanos(signed);
                     base.checked_add(span)
@@ -222,6 +222,24 @@ impl Evaluator {
             let a = self.eval_args(args)?;
             self.eval_stream_sink(v, name, a)
                 .map_err(|e| e.or_span(span))
+        } else if matches!(v, Value::Stream(_)) && name == "buffer" {
+            // `.buffer(n)` needs the evaluator too (HR-G1): its decoupling
+            // producer thread drives the upstream through a child evaluator
+            // built from the child-context seam — shoal-value can't build one.
+            let Value::Stream(s) = v else { unreachable!() };
+            let a = self.eval_args(args)?;
+            let n = match a.pos.first() {
+                None => 1,
+                Some(Value::Int(i)) if *i >= 0 => *i as usize,
+                Some(other) => {
+                    return Err(ErrorVal::type_error(format!(
+                        "buffer expects a non-negative int capacity, found {}",
+                        other.type_name()
+                    ))
+                    .with_span(span));
+                }
+            };
+            self.stream_buffer(s, n).map_err(|e| e.or_span(span))
         } else if let Value::Path(p) = &v
             && matches!(
                 name,
@@ -321,7 +339,7 @@ impl Evaluator {
         let abs = if p.is_absolute() {
             p.to_path_buf()
         } else {
-            self.cwd.join(p)
+            self.exec.cwd.join(p)
         };
         let ioerr = |e: std::io::Error| {
             let code = if e.kind() == std::io::ErrorKind::NotFound {
@@ -334,14 +352,16 @@ impl Evaluator {
         let utf8err = || ErrorVal::new("utf8_error", format!("{}: not valid UTF-8", abs.display()));
         match name {
             "read" => {
-                let bytes = self.fs.read(&abs).map_err(ioerr)?;
+                let bytes = self.host.fs.read(&abs).map_err(ioerr)?;
                 String::from_utf8(bytes)
                     .map(Value::Str)
                     .map_err(|_| utf8err())
             }
-            "read_bytes" => Ok(Value::Bytes(Arc::new(self.fs.read(&abs).map_err(ioerr)?))),
+            "read_bytes" => Ok(Value::Bytes(Arc::new(
+                self.host.fs.read(&abs).map_err(ioerr)?,
+            ))),
             "lines" => {
-                let bytes = self.fs.read(&abs).map_err(ioerr)?;
+                let bytes = self.host.fs.read(&abs).map_err(ioerr)?;
                 let s = String::from_utf8(bytes).map_err(|_| utf8err())?;
                 Ok(Value::List(
                     s.lines()
@@ -349,16 +369,26 @@ impl Evaluator {
                         .collect(),
                 ))
             }
-            "exists" => Ok(Value::Bool(self.fs.metadata(&abs).is_ok())),
+            "exists" => Ok(Value::Bool(self.host.fs.metadata(&abs).is_ok())),
             "is_dir" => Ok(Value::Bool(
-                self.fs.metadata(&abs).map(|m| m.is_dir()).unwrap_or(false),
+                self.host
+                    .fs
+                    .metadata(&abs)
+                    .map(|m| m.is_dir())
+                    .unwrap_or(false),
             )),
             "is_file" => Ok(Value::Bool(
-                self.fs.metadata(&abs).map(|m| m.is_file()).unwrap_or(false),
+                self.host
+                    .fs
+                    .metadata(&abs)
+                    .map(|m| m.is_file())
+                    .unwrap_or(false),
             )),
-            "size" => Ok(Value::Size(self.fs.metadata(&abs).map_err(ioerr)?.len())),
+            "size" => Ok(Value::Size(
+                self.host.fs.metadata(&abs).map_err(ioerr)?.len(),
+            )),
             "modified" => {
-                let m = self.fs.metadata(&abs).map_err(ioerr)?;
+                let m = self.host.fs.metadata(&abs).map_err(ioerr)?;
                 Ok(m.modified()
                     .ok()
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
@@ -459,7 +489,7 @@ impl Evaluator {
     fn is_command_expr(&self, e: &Expr) -> bool {
         match e {
             Expr::LangBlock { .. } | Expr::Cmd { .. } => true,
-            Expr::Var { name, .. } => self.env.get(name).is_none(),
+            Expr::Var { name, .. } => self.exec.env.get(name).is_none(),
             _ => false,
         }
     }

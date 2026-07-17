@@ -170,8 +170,17 @@ The `fuzz/` workspace has three libFuzzer targets:
 These are useful panic/non-progress smoke targets but shallow. The lexer target does not cross CMD
 mode or mode transitions; the parser target asserts no semantic properties; the protocol target does
 not exercise multi-frame streams, response/notification shapes, wire values, or bounded partial-line
-behavior. CI only builds fuzz targets and marks that job `continue-on-error`, so fuzz health is not a
-release gate and no timed fuzz run occurs.
+behavior. The `ci.yml` `fuzz-build` job only builds the targets on every push/PR and is marked
+`continue-on-error`, so fuzz health is still not a per-PR release gate — building alone cannot
+catch a crash.
+
+A separate `.github/workflows/fuzz-nightly.yml` (HR-F4) runs each target for a bounded 120-second
+libFuzzer budget (`cargo fuzz run <target> --fuzz-dir fuzz -- -max_total_time=120`) on a daily cron
+schedule plus manual `workflow_dispatch`, one job per target, and fails (no `continue-on-error`) on
+a crash/timeout/OOM, uploading the libFuzzer artifact for triage. 120 seconds per target is a
+deliberate smoke-not-exhaustive budget chosen to keep the schedule cheap; it will not find a deep
+bug the way a multi-hour/day corpus-accumulating campaign would, but it does mean a fast regression
+(an immediate panic/non-progress case) surfaces within a day instead of never.
 
 ## Local and CI gates
 
@@ -188,6 +197,15 @@ cargo bench -p shoal-exec --bench spawn
 
 The table benchmark retains one million rows and the journal benchmark seeds 100,000 entries, so
 these are review jobs rather than ordinary unit tests. The inherited performance budgets are:
+
+`table_1m_where_sort` (HR-F5, deep audit I12) now builds a real `shoal_value::Value::Table` and
+drives it through the actual `shoal_value::methods::call_method` dispatcher — the same `where`/
+`sort` entry point `shoal-eval` calls for every language-level `.where(...)`/`.sort(...)` — instead
+of hand-filtering/sorting a bare `Vec<i64>` with plain Rust code, which is what it did before and
+which measured nothing about table-method performance. Closure evaluation itself is stood in by a
+small bench-local `CallCtx` (mirroring `shoal-value`'s own unit-test harness) because interpreting a
+real AST closure needs `shoal-eval`, which sits above `shoal-value` in the dependency graph; the
+bench file's own doc comment states exactly what is and is not measured.
 
 | Workload | Review budget |
 |---|---:|
@@ -220,17 +238,79 @@ GitHub CI builds/tests on Ubuntu and macOS with locked dependencies, runs the co
 checks fmt/Clippy, and performs release builds. Release automation produces binaries for x86_64 and
 AArch64 on Linux and macOS.
 
+### Supply-chain advisories (HR-F6)
 
-The root manifest declares workspace lint settings, but member crates do not opt in with
-`[lints] workspace = true`; the effective lint gate today is the explicit Clippy CI command.
+~394 registry dependencies is real supply-chain surface with no advisory audit before this task
+(deep audit H9). The `supply-chain-audit` job in `ci.yml` installs `cargo-audit` and runs bare
+`cargo audit` against `Cargo.lock` on every push/PR to `main`.
 
-### Ambient-environment test debt
+The documented allowlist lives at **`.cargo/audit.toml`** — this is `cargo-audit`'s own
+auto-discovered config path (a bare root-level `audit.toml` is silently ignored by the tool; this
+was verified locally before landing the CI job). Any ignored `RUSTSEC-*` ID must carry an inline
+comment with its root cause and the condition for revisiting it. The allowlist previously held 15
+entries, every one tracing to `shoal-wasm`'s `wasmtime = "37"` pin, whose fix for each advisory
+required a major-version bump (to `>=42.0.2`, two entries needed `>=43.0.2`) rather than a
+same-major patch. That bump has landed — `shoal-wasm` now depends on `wasmtime = "46.0.1"` — and
+`cargo audit` against the resulting `Cargo.lock` reports zero vulnerabilities, so the allowlist is
+empty again. The config also sets `output.deny = ["unmaintained", "unsound", "yanked"]`, so an
+unmaintained/unsound crate or a yanked version newly appearing in `Cargo.lock` fails the gate even
+though none exist today. Re-run `cargo audit` locally (same command CI uses) after any dependency
+bump and prune allowlist entries that no longer apply.
 
-This audit environment exports `NO_COLOR=1`. Under that environment, `cargo test --workspace` fails
-seven color-asserting highlighter tests; all 13 highlighter tests pass when run with `NO_COLOR`
-unset. The product is right to honor `NO_COLOR`; the tests incorrectly inherit ambient policy while
-asserting colored output. Those tests should set/unset their environment explicitly or inject color
-policy so workspace results do not depend on the invoking shell.
+### The `shoal-wasm` compile cost decision (HR-F8)
+
+`shoal-wasm` is a workspace member with no other crate depending on it (deep audit H10): it
+validates WASM components/manifests/resource limits in isolation, but nothing wires it into
+evaluator dispatch yet (see the implementation-status page's WASM row). It pulls in `wasmtime` with
+the `cranelift` codegen backend, which is by far the largest single dependency subtree in this
+workspace (dozens of `wasmtime-internal-*`/`cranelift-*` crates) — `cargo build --workspace
+--all-targets` pays that compile/cache cost on every CI run today even though no shipped behavior
+exercises it.
+
+Decision: **keep it in ordinary workspace CI, cost accepted, revisit when WASM dispatch actually
+lands.** Reasoning:
+
+- Feature-gating it out of the default workspace build would need `shoal-wasm`'s own
+  `Cargo.toml`/`Cargo.lock` and CI matrix changes (a dependency-shape change, not a lint/doc one);
+  the crate is presently a leaf with a real, if narrow, test suite, and splitting it into a separate
+  CI job buys cache isolation at the cost of another job to maintain for a component nothing
+  depends on.
+- The crate is small (single `lib.rs`, ~250 lines) and its own compile is fast; the cost is entirely
+  `wasmtime`/`cranelift`'s, and `Swatinem/rust-cache` already amortizes that across CI runs on the
+  same OS/lockfile, so the marginal per-PR cost after a cache hit is low.
+- Once WASM command dispatch actually lands in `shoal-eval`, `wasmtime` becomes a load-bearing
+  dependency of a crate other things already depend on regardless of `shoal-wasm`'s own CI
+  treatment, making a special-cased job moot.
+
+Revisit this decision (separate job, feature flag, or drop from `--workspace` defaults) if the
+compile/cache cost becomes a measured CI bottleneck before WASM dispatch integration begins.
+
+`wasmtime` was bumped from `37` to `46.0.1` to clear the RUSTSEC allowlist above (Supply-chain
+advisories, HR-F6). That bump did not materially change this decision's inputs: the
+`wasmtime`/`cranelift`-family dependency subtree shrank slightly, from 37 to 34 crates (`Cargo.lock`
+dropped `wasmtime-internal-asm-macros`, `-math`, `-slab`, and `-winch`, adding only
+`wasmtime-internal-core`), and total workspace packages went from 418 to 417. `shoal-wasm`'s own
+source needed no API adaptation across the jump.
+
+
+Every member crate opts in with `[lints] workspace = true` (HR-F1,
+[hardening roadmap](@/internals/hardening-roadmap.md)), so the root manifest's lint table is
+actually active per-crate, not merely staged. `rust-toolchain.toml` at the repository root pins the
+exact stable release (currently 1.97.0) that CI's `dtolnay/rust-toolchain@stable` step resolved to
+at the time it was written (HR-F2); `rustup` picks this up automatically for any local `cargo`/
+`rustc`/`clippy`/`fmt` invocation, so a future stable release cannot silently change a contributor's
+compiler out from under a pinned CI baseline without a deliberate bump to this file.
+
+### Ambient-environment test debt (resolved, HR-F3)
+
+`crates/shoal/src/highlight.rs`'s test module previously inherited whatever `NO_COLOR` the invoking
+shell/CI exported; under an ambient `NO_COLOR=1` (as this audit environment set), seven of the
+thirteen color-asserting highlighter tests failed even though the product was correctly honoring
+`NO_COLOR` — a test-isolation defect (deep audit H13), not a product bug. `styles_for`/
+`styles_with_bindings` now route through a shared `with_forced_color` helper that unsets `NO_COLOR`
+under `crate::ENV_TEST_LOCK` for the duration of the call and restores whatever was there before.
+All 13 highlighter tests now pass identically with `NO_COLOR=1 cargo test -p shoal` and with
+`NO_COLOR` unset; verify with both invocations after touching this module.
 
 ## Choosing the right test
 

@@ -207,22 +207,162 @@ impl Upstream for Dedupe {
 
 pub struct Distinct {
     pub up: Box<dyn Upstream>,
-    pub seen: Vec<Value>,
+    /// Seen values bucketed by a canonical hash (HR-G5, site/content/internals/streams-channels.md): membership
+    /// is amortized O(1) instead of the old `Vec` linear scan (O(n²) total).
+    /// Each bucket holds the (rare) hash collisions and is confirmed with
+    /// `Value`'s real `PartialEq`, so cross-type equality (`1 == 1.0`, a
+    /// `path` == its `str`, a `table` == the equal `list<record>`) is preserved
+    /// exactly. Memory still grows with the number of DISTINCT values seen, so
+    /// `distinct` on an unbounded stream of continuously-unique items grows
+    /// without bound — bound it (`.take(n)`) or `dedupe` adjacent runs instead.
+    pub seen: std::collections::HashMap<u64, Vec<Value>>,
 }
 impl Upstream for Distinct {
     fn pull(&mut self, ctx: &mut dyn CallCtx, t: Option<Duration>) -> VResult<Pull> {
         loop {
             match self.up.pull(ctx, t)? {
                 Pull::Item(v) => {
-                    if self.seen.contains(&v) {
+                    let bucket = self.seen.entry(distinct_hash(&v)).or_default();
+                    if bucket.iter().any(|seen| seen == &v) {
                         continue;
                     }
-                    self.seen.push(v.clone());
+                    bucket.push(v.clone());
                     return Ok(Pull::Item(v));
                 }
                 other => return Ok(other),
             }
         }
+    }
+}
+
+/// A canonical `u64` hash key for `distinct`'s membership set. The correctness
+/// contract is `a == b` (`Value::PartialEq`) ⟹ `distinct_hash(a) ==
+/// distinct_hash(b)`: equal values MUST share a bucket. A hash that is *coarser*
+/// than equality only lengthens a bucket scan (buckets are re-checked with real
+/// `PartialEq`); a hash that *splits* two equal values would wrongly emit both,
+/// so every cross-type equality is canonicalized here. Pointer-identity and
+/// rare-in-`distinct` types hash by a per-type tag only (correct — equal values
+/// still collide — at the cost of a linear bucket for those element types).
+fn distinct_hash(v: &Value) -> u64 {
+    use std::hash::Hasher;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    hash_value(v, &mut h);
+    h.finish()
+}
+
+fn hash_value(v: &Value, h: &mut impl std::hash::Hasher) {
+    use std::hash::Hash;
+    match v {
+        Value::Null => 0u8.hash(h),
+        Value::Bool(b) => {
+            1u8.hash(h);
+            b.hash(h);
+        }
+        // Numeric cross-equality: `Int(n) == Float(n as f64)`, so both hash by
+        // the same normalized `f64` bits (−0.0 → 0.0; NaN → a sentinel, since
+        // NaN != NaN keeps every NaN distinct anyway).
+        Value::Int(n) => {
+            2u8.hash(h);
+            norm_f64(*n as f64).hash(h);
+        }
+        Value::Float(f) => {
+            2u8.hash(h);
+            norm_f64(*f).hash(h);
+        }
+        // path/str cross-equality by display text.
+        Value::Str(s) => {
+            3u8.hash(h);
+            s.as_bytes().hash(h);
+        }
+        Value::Path(p) => {
+            3u8.hash(h);
+            p.to_string_lossy().as_bytes().hash(h);
+        }
+        Value::Size(n) => {
+            4u8.hash(h);
+            n.hash(h);
+        }
+        Value::Duration(n) => {
+            5u8.hash(h);
+            n.hash(h);
+        }
+        // DateTime equality is instant equality (`a.timestamp() == b.timestamp()`),
+        // so hash the instant, not the zoned wall-clock rendering.
+        Value::DateTime(d) => {
+            6u8.hash(h);
+            d.timestamp().as_nanosecond().hash(h);
+        }
+        Value::Bytes(b) => {
+            8u8.hash(h);
+            b.as_slice().hash(h);
+        }
+        Value::CasBytes(c) => {
+            9u8.hash(h);
+            c.hash.as_bytes().hash(h);
+            c.len.hash(h);
+        }
+        // table ≡ list<record>: both fold the SAME per-record hash under one
+        // container tag, so an equal table and list<record> collide.
+        Value::List(xs) => {
+            10u8.hash(h);
+            for x in xs {
+                hash_value(x, h);
+            }
+        }
+        Value::Table(rows) => {
+            10u8.hash(h);
+            for r in rows {
+                hash_record(r, h);
+            }
+        }
+        Value::Record(r) => hash_record(r, h),
+        Value::Range(r) => {
+            12u8.hash(h);
+            r.start.hash(h);
+            r.end.hash(h);
+            r.inclusive.hash(h);
+        }
+        Value::Glob(g) => {
+            13u8.hash(h);
+            g.pattern.as_bytes().hash(h);
+        }
+        Value::Regex(re) => {
+            14u8.hash(h);
+            re.src.as_bytes().hash(h);
+        }
+        // Pointer-identity / rare-in-`distinct` types: a per-type tag is enough
+        // for the collide-then-verify contract (equal values still share the
+        // bucket). These element types degrade `distinct` to a linear bucket.
+        Value::Time(_) => 15u8.hash(h),
+        Value::Error(_) => 16u8.hash(h),
+        Value::Outcome(_) => 17u8.hash(h),
+        Value::Task(_) => 18u8.hash(h),
+        Value::Closure(_) => 19u8.hash(h),
+        Value::CmdRef(_) => 20u8.hash(h),
+        Value::Secret(_) => 21u8.hash(h),
+        Value::Stream(_) => 22u8.hash(h),
+    }
+}
+
+fn hash_record(r: &super::Record, h: &mut impl std::hash::Hasher) {
+    use std::hash::Hash;
+    11u8.hash(h);
+    for (k, val) in r {
+        k.as_bytes().hash(h);
+        hash_value(val, h);
+    }
+}
+
+/// Normalize an `f64` so equal numeric values hash identically: `+0.0`/`−0.0`
+/// collapse to one key, and every NaN maps to one sentinel (NaN != NaN keeps
+/// them all distinct at the `PartialEq` verify step anyway).
+fn norm_f64(x: f64) -> u64 {
+    if x == 0.0 {
+        0
+    } else if x.is_nan() {
+        u64::MAX
+    } else {
+        x.to_bits()
     }
 }
 
@@ -352,6 +492,16 @@ impl Upstream for Enumerate {
     }
 }
 
+/// Combine two streams as items become available (HR-G6,
+/// site/content/internals/streams-channels.md). NOT fair interleaving: each
+/// pull sweeps A then B with a [`POLL`]-bounded read each — a ready A item
+/// always wins the sweep, so two already-ready in-memory sources drain left
+/// side first, and a ready B item can wait up to one poll step while A is
+/// probed. Live sources approximate arrival order at [`POLL`] granularity.
+/// Neither side backpressures the other beyond that serialization; skew is
+/// absorbed by each source's own buffer/overflow contract. An outer deadline
+/// is checked after a full sweep, so a timed pull can overshoot its budget by
+/// up to ~2×[`POLL`].
 pub struct Merge {
     pub a: Box<dyn Upstream>,
     pub b: Box<dyn Upstream>,
@@ -386,20 +536,38 @@ impl Upstream for Merge {
     }
 }
 
+/// Positional pairing (HR-G6, site/content/internals/streams-channels.md). Synchronous and
+/// unbuffered beyond one held item: each pull takes LEFT then RIGHT with the
+/// caller's timeout applied to each side in turn (a timed pull can therefore
+/// spend up to 2× the budget). The pair rate is the slower side's rate — the
+/// faster side is simply not pulled again until its partner arrives, so its
+/// producer buffer absorbs skew under that source's own overflow contract.
 pub struct Zip {
     pub a: Box<dyn Upstream>,
     pub b: Box<dyn Upstream>,
+    /// A left item whose right partner timed out — HELD for the next pull
+    /// rather than silently discarded (a timeout is not the end of the
+    /// stream; dropping data on it would be invisible loss under timing
+    /// combinators). When a side instead ENDS, one dangling left item may be
+    /// consumed-and-discarded: the stream is over and the item has no partner.
+    pub pending_a: Option<Value>,
 }
 impl Upstream for Zip {
     fn pull(&mut self, ctx: &mut dyn CallCtx, t: Option<Duration>) -> VResult<Pull> {
-        let va = match self.a.pull(ctx, t)? {
-            Pull::Item(v) => v,
-            other => return Ok(other),
+        let va = match self.pending_a.take() {
+            Some(v) => v,
+            None => match self.a.pull(ctx, t)? {
+                Pull::Item(v) => v,
+                other => return Ok(other),
+            },
         };
-        let vb = match self.b.pull(ctx, t)? {
-            Pull::Item(v) => v,
-            other => return Ok(other),
-        };
-        Ok(Pull::Item(Value::List(vec![va, vb])))
+        match self.b.pull(ctx, t)? {
+            Pull::Item(vb) => Ok(Pull::Item(Value::List(vec![va, vb]))),
+            Pull::Timeout => {
+                self.pending_a = Some(va);
+                Ok(Pull::Timeout)
+            }
+            Pull::End => Ok(Pull::End),
+        }
     }
 }

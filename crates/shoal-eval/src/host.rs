@@ -18,7 +18,8 @@ impl Evaluator {
                     // Undo (site/content/internals/language-conformance-contract.md): snapshot the target's prior bytes first, so
                     // `echo x > f` is reversible exactly like `cp`/`save`.
                     let undo_pre = self.redirect_undo_pre(&p);
-                    self.fs
+                    self.host
+                        .fs
                         .write(&p, &value_bytes(&value))
                         .map_err(|e| ErrorVal::new("custom", e.to_string()))?;
                     self.overwrite_undo_post(undo_pre);
@@ -27,7 +28,8 @@ impl Evaluator {
                 RedirectKind::Append => {
                     let p = self.arg_path(&r.target)?;
                     let undo_pre = self.redirect_undo_pre(&p);
-                    self.fs
+                    self.host
+                        .fs
                         .append(&p, &value_bytes(&value))
                         .map_err(|e| ErrorVal::new("custom", e.to_string()))?;
                     self.overwrite_undo_post(undo_pre);
@@ -52,8 +54,8 @@ impl Evaluator {
         for v in vs {
             argv.push(self.argv_value(v)?);
         }
-        let saved = self.interactive;
-        self.interactive = true;
+        let saved = self.session.interactive;
+        self.session.interactive = true;
         let r = self.run_argv(
             argv,
             Position::Statement,
@@ -62,7 +64,7 @@ impl Evaluator {
             call.span,
             None,
         );
-        self.interactive = saved;
+        self.session.interactive = saved;
         r
     }
 
@@ -81,8 +83,13 @@ impl Evaluator {
                 )));
             }
         };
-        let p = if p.is_absolute() { p } else { self.cwd.join(p) };
-        self.opener
+        let p = if p.is_absolute() {
+            p
+        } else {
+            self.exec.cwd.join(p)
+        };
+        self.host
+            .opener
             .open(&p)
             .map_err(|e| ErrorVal::new("custom", e))?;
         Ok(Value::Null)
@@ -125,28 +132,19 @@ impl Evaluator {
             .unwrap_or(false);
         let mut handles = Vec::new();
         for f in a.pos {
-            let env = self.env.clone();
-            let cwd = self.cwd.clone();
-            let penv = self.process_env.clone();
-            let adapters = self.adapters.clone();
-            // Share the host's effect ports (site/content/internals/roadmap-and-priorities.md) so a `parallel`
-            // child spawned under a fake/custom adapter sees it too. Cheap `Arc`
-            // clones; identical to the old behavior under the `Std*` defaults.
-            let fs = self.fs.clone();
-            let exec = self.exec.clone();
-            let clock = self.clock.clone();
-            let opener = self.opener.clone();
-            let secrets = self.secrets.clone();
+            // The one authoritative child constructor (HR-B1): each `parallel`
+            // closure runs in a child that inherits the full session context —
+            // leash policy/principal, reef state, config, all effect ports, the
+            // event bus, and session identity. The old hand-copy here shared
+            // only ports (dropping leash, reef, config, and the bus), so a
+            // command a policy forbids foreground could run unconfined inside a
+            // `parallel` closure (audit B1–B4). `Inherit` scope: the closure
+            // sees the caller's bindings. Inheriting the parent's cancellation
+            // token makes cancelling the parent cancel the whole batch.
+            let ctx = self.child_context();
+            let cancel = self.cancellation_token();
             handles.push(std::thread::spawn(move || {
-                let mut ev = Evaluator::new(cwd);
-                ev.env = env;
-                ev.process_env = penv;
-                ev.adapters = adapters;
-                ev.fs = fs;
-                ev.exec = exec;
-                ev.clock = clock;
-                ev.opener = opener;
-                ev.secrets = secrets;
+                let mut ev = ctx.build(ChildScope::Inherit, cancel);
                 ev.call_value(&f, CallArgs::default())
             }));
         }

@@ -59,9 +59,11 @@ accDescr: Shows the components and relationships described in Core pull protocol
   Stage2-->>Sink: transformed Pull
 ```
 
-No stage runs until a sink pulls. Constructing a `watch`/`tail`/`every` source does start its producer
-thread today, but no closure stage or downstream method work runs until consumption. Dropping the
-receiver is the producer-stop mechanism for those sources.
+No stage runs until a sink pulls, with two eager exceptions: constructing a `watch`/`tail`/`every`
+source starts its producer thread, and constructing a `.buffer(n)` stage (HR-G1) starts its
+decoupling producer — which eagerly drives everything *below* it (including closure stages, run on
+that thread in a child evaluator) up to `n` items ahead. Stages above a buffer stay lazy. Dropping
+the receiver is the producer-stop mechanism for all of these.
 
 ## Stream state and identity
 
@@ -92,7 +94,7 @@ propagate or alter the bit:
 
 | Stage | Result boundedness |
 |---|---|
-| `map`, `filter`, `scan`, `flat_map`, `dedupe`, `distinct`, timing/window stages | same as input |
+| `map`, `filter`, `scan`, `flat_map`, `dedupe`, `distinct`, `buffer`, timing/window stages | same as input |
 | `take(n)` | always bounded |
 | predicate `take_until` | currently same as input, even though predicate may stop it |
 | stream `take_until` | currently same as primary input |
@@ -136,15 +138,20 @@ channel capacity upstream.
 | `every(duration)` | one sleeping thread | `sync_channel(1)` | drop tick silently | `DateTime` |
 | `watch(path/glob)` | `notify` watcher thread | `sync_channel(64)` | owe one coalesced summary | event record |
 | `tail(path)` | `notify` + `Fs` reads | `sync_channel(64)` | count and report dropped lines | string or dropped marker |
-| `channel(name).events()` | session EventBus | unbounded `mpsc::channel` per subscriber | no subscriber backpressure bound | event record |
+| `channel(name).events()` | session EventBus | `sync_channel(replayed + 256)` per subscriber | drop + owed `{dropped: n}` marker event | event record |
 | finite value `.stream()` | caller pull | no producer buffer | exact | element |
 
-The last live-channel row is a significant exception to the general “bounded buffers” aspiration:
-EventBus subscribers use unbounded standard channels. `publish_local` holds the bus mutex while it
-clones and synchronously sends every event to every subscriber. Sends do not block only because each
-subscriber queue is unbounded; a stalled language subscriber can therefore accumulate unbounded live
-events even though replay history is capped, and large payload/fan-out cloning extends the critical
-section seen by every publisher/subscriber setup call.
+Live subscriber queues are bounded (HR-G3): each subscription's `sync_channel` capacity is its
+replay prefix (always delivered whole — replay is ring-bounded at 1,024 and never dropped) plus 256
+slots of live headroom. `publish_local` holds the bus mutex while it clones and `try_send`s to every
+subscriber; it never blocks on a slow consumer. A live event that finds a subscriber's queue full is
+dropped for that subscriber and counted; the debt is flushed — as one coalesced marker record
+`{channel, seq, ts, payload: null, dropped: n}` whose `seq` is the newest dropped event's sequence —
+by the first later publish that finds room. The marker travels with a publish, so a fully-drained
+queue with no further traffic holds the marker until the next event; `seq` is a cursor the consumer
+can hand to `.events(since: seq)` to replay whatever the ring still retains of the gap. Large
+payload/fan-out cloning still extends the bus critical section seen by every publisher/subscriber
+setup call.
 
 ## Timer state machine
 
@@ -215,26 +222,68 @@ length shrinks; rename/replacement behavior beyond that depends on platform `not
 | `map(f)` | one upstream item, returns `f(item)` |
 | `where`/`filter(f)` | loops until `f(item).as_condition()` is true |
 | `scan(init,f)` | stores accumulator, emits every updated accumulator |
-| `flat_map(f)` | drains returned stream or queued list/table/range before next outer item |
+| `flat_map(f)` | sequential: drains each returned stream or queued list/table/range to its end before the next outer item; substreams are never interleaved |
 | `take(n)` | decrements remaining count and ends at zero |
 | `take_until(predicate)` | consumes triggering item and ends without emitting it |
 | `take_until(stream)` | polls signal stream and primary source in 20 ms steps |
 | `dedupe` | stores last emitted item; removes adjacent equality duplicates |
-| `distinct` | stores all seen values in a vector; removes global duplicates |
+| `distinct` | stores all seen values hash-bucketed by a canonical hash; removes global duplicates |
 | `debounce(duration)` | retains latest pending value until quiet deadline |
 | `throttle(duration)` | emits first and drops items inside interval |
 | `window(count)` | sliding deque; emits only once full, then every item |
 | `window(duration)` | stores timestamp/value pairs; emits current time window per item |
-| `buffer(n)` | identity in synchronous pull model; no queue or pacing effect |
+| `buffer(n)` | real decoupler (HR-G1): producer thread + `sync_channel(n)`; runs at most `n` ahead, paces (never drops), preserves boundedness |
 | `enumerate` | emits `[zero_based_index, value]` |
-| `merge(other)` | polls A then B in 20 ms steps until both end |
-| `zip(other)` | pulls A then B and emits `[a,b]`; ends/times out with either pull |
+| `merge(other)` | left-biased poll sweep (A then B, 20 ms steps) until both end; ready in-memory sources drain left-first |
+| `zip(other)` | pulls A then B, emits `[a,b]`; ends with either side; holds an unpaired left item across a right timeout |
 
 
-`distinct` has unbounded memory growth on an unbounded stream with continuously unique values. It
-does not use hashing, so membership is linear in the number seen. `window(duration)` is bounded only
-by event rate inside the duration. `.buffer(n)` currently communicates intent but has no operational
-backpressure effect.
+`flat_map` is pinned to sequential semantics (HR-G2, audit I3; case
+`stream-flat-map-substreams-drain-sequentially`): the current substream is drained to `End` before
+the next outer item is pulled, and substream items are never interleaved. Interleaving is not
+implementable under the synchronous pull model without a background pump per substream, and the
+sequential order is what existing corpus cases pin. Consequence: a live/endless substream blocks the
+whole `flat_map` on itself forever — bound substreams (`.take`/`.take_until`) before returning them
+from `f`.
+
+`distinct` membership is amortized O(1) (HR-G5): seen values are bucketed by a canonical hash whose
+contract is `a == b ⟹ same bucket`, and a bucket is confirmed with `Value`'s real `PartialEq`, so the
+cross-type equalities (`1 == 1.0`, `path` vs `str`, `table` vs `list<record>`) dedupe exactly as
+before. Its *memory* is still proportional to the number of distinct values seen: on an unbounded
+stream of continuously unique values the set grows without bound — bound the stream (`.take`,
+`.take_until`) or use `dedupe`/a window when long-lived cardinality is unknown. `window(duration)` is
+bounded only by event rate inside the duration.
+
+`buffer(n)` (HR-G1) is the one thread-backed combinator: the evaluator intercepts it (shoal-value
+alone cannot build it) and spawns a producer that drives the consumed upstream through a
+child-evaluator (HR-B1 seam, `Inherit` scope — same confinement as `spawn`/`parallel`/`on` bodies)
+into a `sync_channel(n)`. It is a pacing decoupler, never lossy: a full queue blocks the producer in
+a cancel-aware retry loop (10 ms poll) rather than dropping, because dropping here would silently
+lose language-visible data — unlike the lossy *source* buffers whose items are observations.
+Construction is eager (like the system sources); `n == 0` is a rendezvous handoff; upstream errors
+cross the channel and end the stream; parent cancellation or a dropped consumer stops the producer
+within one poll, dropping the wrapped upstream so shutdown cascades to nested sources.
+
+`merge`/`zip` rate-skew and backpressure, precisely (HR-G6, audit I14; pinned by
+`merge_sweeps_left_first_but_never_starves_a_silent_side`,
+`zip_holds_the_left_item_across_a_right_timeout`, and the corpus cases
+`stream-merge-ready-sources-drain-left-first` / `stream-zip-consumes-one-left-item-past-the-shorter-end`):
+
+- **`merge` is a left-biased poll sweep, not fair interleaving.** Each pull probes A with a 20 ms
+  bounded read, then B; a ready A item always wins its sweep. Two already-ready in-memory sources
+  therefore drain the left one completely first, and a ready B item can wait up to one poll step
+  behind a live-but-slow A. Live sources approximate arrival order at 20 ms granularity. Neither
+  side backpressures the other beyond that serialization — skew lands in each source's own
+  buffer under that source's overflow contract. An outer deadline is checked after a full sweep,
+  so a timed pull may overshoot its budget by up to ~40 ms.
+- **`zip` is synchronous pairing at the slower side's rate.** Each pull takes left then right,
+  applying the caller's timeout to each side in turn (a timed pull can spend up to twice the
+  budget). The faster side is simply not pulled while its partner lags, so skew accumulates in
+  that side's producer buffer under its own drop/coalesce/pacing contract — `zip` itself buffers
+  at most one item: a left item whose right partner *timed out* is held for the next pull, never
+  discarded. When a side *ends*, the stream ends; one dangling left item may have been consumed
+  in the same pull and is discarded (it has no partner). Side effects in stages below the zip
+  (e.g. an emitting `map`) do observe that consumed-then-discarded item.
 
 `debounce` ignores the caller-supplied outer timeout and uses its own pending deadline. This is worth
 re-auditing if time budgets become strict RPC cancellation contracts.
@@ -251,10 +300,11 @@ re-auditing if time budgets become strict RPC cancellation contracts.
 | `.render()` | evaluator drives and sends each item to statement sink | `null` |
 | other collection method | collect bounded stream, redispatch on list | method-dependent |
 
-Despite two names, stream `.save` and `.append` both open with create+append. They use direct
-`std::fs::OpenOptions`, bypassing the evaluator `Fs` port, policy boundary, and journal undo model.
-Strings and bytes are written verbatim per item; other values become JSON; every item gets an added
-newline.
+Despite two names, stream `.save` and `.append` both open with create+append. They open once through
+the `Fs` port (`CallCtx::fs().open_append`, HR-C2) — a fake can observe or deny the write — rather
+than `std::fs::OpenOptions` directly; the write still bypasses the journal undo model, and consults
+the evaluator's *sandboxed* port only once the evaluator overrides `CallCtx::fs()`. Strings and bytes
+are written verbatim per item; other values become JSON; every item gets an added newline.
 
 `drive_stream` blocks with no timeout until end/error. Cancellation is documented as dropping the
 pipeline/receiver, but a sink currently holding and blocking on a live receiver needs its surrounding
@@ -293,7 +343,7 @@ The evaluator owns an `Arc<EventBus>` shared into selected child tasks. Each cha
 |---|---|
 | `next_seq` | monotonically increasing per-channel sequence, beginning at zero |
 | `ring` | newest 1,024 stored events |
-| `subs` | live sender list |
+| `subs` | live subscriber list: bounded sender + per-subscriber drop debt |
 
 Stored events contain sequence, nanosecond timestamp, and cloned payload. Consumer records are:
 
@@ -310,7 +360,7 @@ accDescr: Published events receive sequence numbers, enter a bounded replay ring
   Cursor["subscribe after cursor"] --> Replay["replay retained events"]
   Ring --> Replay
   Ring --> Fanout["live fan-out"]
-  Replay --> Queue["subscriber queue: 256"]
+  Replay --> Queue["subscriber queue: replay + 256"]
   Fanout --> Queue
   Queue --> Delivery["ordered delivery"]
   Queue -->|overflow| Drop["coalesced dropped marker + latest seq"]
@@ -358,29 +408,42 @@ recovery. “At least once” behavior comes from replaying retained records, no
 protocol.
 
 A cursor older than the retained ring silently starts at the oldest still-retained record; there is
-no explicit gap marker.
+no explicit gap marker for *replay*. A **live** delivery gap (subscriber-queue overflow, HR-G3) does
+get an explicit in-order marker: `{channel, seq, ts, payload: null, dropped: n}` with `seq` naming
+the newest dropped event.
 
 ## `on(channel, handler)` tasks
 
 `on` subscribes **before** spawning its worker so emits between setup and thread start are queued.
-It creates a `TaskVal`, installs a cancellation hook, snapshots environment/cwd/process env/adapters,
-shares selected ports and the EventBus, then drives the subscription and calls the handler for every
+It creates a `TaskVal`, wires a fresh cancellation token to the task's cancel hook, builds its child
+evaluator through the authoritative child-context constructor (HR-B5 — full session context: leash,
+reef, config, all ports, bus, identity), then drives the subscription and calls the handler for every
 full event record. The task is added to evaluator jobs and finishes with `null` or the first error.
 
-The worker is an OS thread. Its cancellation token is set by `task.cancel`, but channel receive/pull
-does not poll that token; if no further event arrives, the worker can remain blocked. It also manually
-copies evaluator capabilities, so new ports/state can be omitted—configuration is one current audit
-site.
+The worker is an OS thread. It never issues an uninterruptible blocking receive (HR-G4): the drive
+loop pulls with a bounded timeout (50 ms) and consults the task's cancellation token between pulls,
+so `task.cancel()` unblocks a handler idling on a quiet channel within one poll interval; the worker
+exits, finishes the task with `null` (same as a natural channel end), and its dropped subscription is
+pruned from the bus on the next publish. Cancellation is observed between pulls/handler calls: a
+handler mid-call completes its current event first, though external work it spawned shares the
+cancelled exec token and is killed.
 
 ## Cross-layer gaps
 
-- `feed_bytes(Stream)` refuses stream-to-process stdin; incremental child-stdin pumping is absent.
+- **Stream `.feed` status (HR-G7): unimplemented, deliberately and loudly.** `feed_bytes(Stream)`
+  raises `type_error` — "feeding a stream to a command's stdin is not implemented yet" — with the
+  workaround hint (`stream.collect().feed(cmd)`), *before* any process is spawned; the corpus case
+  `feed-stream-is-unimplemented-with-collect-hint` pins both the code and the hint. The blocker is
+  the exec surface: `shoal-exec`'s `StdinSpec` is `Null | Inherit | Bytes | File` — there is no
+  incremental child-stdin pump to drive a live pipeline into. Implementing it means adding a
+  streaming stdin variant to `shoal-exec` plus a drive loop honoring cancellation and child-exit
+  backpressure; until then the error stays, never a buffering fake.
 - Kernel `WireValue::Stream` carries only a label; there is no RPC cursor/pull/chunk lifecycle.
-- EventBus live subscriber queues are unbounded even though replay rings are bounded.
 - Dropped/coalesced markers widen stream element shapes without a static type system expressing it.
 - Timer and timing combinators use direct system time/sleep, reducing deterministic testability.
 - Watch existence/root discovery bypasses `Fs`; tail content reads use it.
-- Stream save/append bypass `Fs`, journal, and Leash policy ports.
+- Stream save/append cross the `Fs` port (`open_append`, HR-C2) but still bypass journal undo; they
+  reach the evaluator's sandboxed port only once its `CallCtx::fs()` override lands.
 - Predicate/signal `take_until` does not mark an unbounded stream collectable.
 - No explicit `Upstream` cancellation/deadline context spans an entire sink.
 - Event rings are memory-only and sequence spaces are local to each bus side.

@@ -31,6 +31,45 @@ pub(crate) struct Session {
     pub(crate) next_value: AtomicU64,
 }
 
+/// Bounded transcript retention (site/content/internals/hardening-roadmap.md HR-E4; deep-audit H5):
+/// keep at most this many of a session's most-recently-created `out[n]`
+/// values addressable at once. `out` refs are assigned from a single
+/// monotonic counter (`Session::next_value`), so "most recent N" is exactly
+/// "the N highest-numbered refs" — generous enough that any realistic
+/// short-lived cross-reference (an agent immediately following up on a value
+/// it just got back) stays well inside the window, while an unbounded
+/// long-lived session's transcript no longer grows forever. Chosen
+/// conservatively per this task's own directive ("generous retention,
+/// correctness first"): every existing kernel test that creates transcript
+/// entries stays comfortably under this cap.
+pub(crate) const MAX_TRANSCRIPT_PER_SESSION: usize = 4096;
+
+impl Session {
+    /// Evict the oldest entries from this session's transcript once it grows
+    /// past [`MAX_TRANSCRIPT_PER_SESSION`], keeping the highest-numbered
+    /// (most recently created) `out[n]` refs. A no-op well under the cap —
+    /// the common case for any session that hasn't been running a very long
+    /// time. Called after every dispatched request on this session
+    /// (`Kernel::handle_stream`'s post-dispatch GC sweep), so growth is
+    /// bounded continuously rather than requiring any cooperation from the
+    /// handler that actually inserts transcript entries.
+    pub(crate) fn gc_transcript(&self) {
+        let mut transcript = self.transcript.lock_recover();
+        if transcript.len() <= MAX_TRANSCRIPT_PER_SESSION {
+            return;
+        }
+        let mut ids: Vec<u64> = transcript
+            .keys()
+            .filter_map(|r| r.0.rsplit_once(':').and_then(|(_, n)| n.parse().ok()))
+            .collect();
+        ids.sort_unstable();
+        let evict = ids.len() - MAX_TRANSCRIPT_PER_SESSION;
+        for id in &ids[..evict] {
+            transcript.remove(&Ref::new("out", *id));
+        }
+    }
+}
+
 impl Kernel {
     /// Get-or-create the named session. `principal` is only consulted the
     /// FIRST time this session name is created (an already-cached session
@@ -38,7 +77,7 @@ impl Kernel {
     /// only caller, `handle_session_attach`, always knows `who` before
     /// calling this.
     pub(crate) fn session(&self, name: &str, principal: &str) -> io::Result<Arc<Session>> {
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = self.sessions.lock_recover();
         if let Some(session) = sessions.get(name) {
             return Ok(session.clone());
         }
@@ -122,8 +161,7 @@ impl Kernel {
                 data: None,
             })?;
             let meta = auth
-                .lock()
-                .unwrap()
+                .lock_recover()
                 .validate(&token)
                 .ok_or_else(|| RpcError {
                     code: AUTH_FAILED,
@@ -131,15 +169,36 @@ impl Kernel {
                     data: None,
                 })?;
             (meta.principal, meta.caps, meta.profile)
+        } else if params.client.kind == "mcp" && !self.permissive_mcp_attach.load(Ordering::SeqCst)
+        {
+            // HR-D6: a zero-config (no-token) MCP client lands on the restricted
+            // agent principal, NOT the same-UID human. Execution stays available
+            // (the built-in default policy defines `agent:mcp` with opaque
+            // allow / unrestricted fs), but the agent's identity is distinct —
+            // so agent work is attributed separately and HR-D3's separation of
+            // duties actually bites on the MCP path (the agent cannot approve
+            // its own plans; the human's session or a supervisor token can).
+            // Permissive attach is an explicit opt-in: a bearer token, or a
+            // non-empty `SHOAL_MCP_PERMISSIVE` on the kernel process. The
+            // `client.kind` string is a client declaration inside the same-UID
+            // 0600-socket trust boundary — it sets the default authority of the
+            // shipped agent surface, it is not a defense against a malicious
+            // same-UID process (which already has the user's full authority).
+            (MCP_AGENT_PRINCIPAL.into(), vec![], "agent".into())
         } else {
             (principal(), vec![], "local-human".into())
         };
         let name = params.session.unwrap_or_else(|| "default".into());
+        // HR-J3: bound the number of DISTINCT session names the kernel will
+        // ever create, not just the connection creating them — see
+        // `check_session_quota`'s doc comment for why an unbounded session
+        // count is an unbounded thread count even with every per-session
+        // quota in place.
+        self.check_session_quota(&name)?;
         let session = self.session(&name, &who).map_err(internal)?;
         let cwd = session
             .evaluator
-            .lock()
-            .unwrap()
+            .lock_recover()
             .cwd()
             .as_os_str()
             .to_owned();
@@ -185,7 +244,7 @@ impl Kernel {
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
         let session = &attachment.session;
         let pairs: Vec<(String, String)> = {
-            let evaluator = session.evaluator.lock().unwrap();
+            let evaluator = session.evaluator.lock_recover();
             evaluator
                 .env_vars()
                 .iter()
@@ -225,7 +284,7 @@ impl Kernel {
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
         let session = &attachment.session;
         let snapshot = {
-            let mut evaluator = session.evaluator.lock().unwrap();
+            let mut evaluator = session.evaluator.lock_recover();
             evaluator.prompt_reef_snapshot()
         };
         let bindings: Vec<Json> = snapshot

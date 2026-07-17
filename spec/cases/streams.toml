@@ -51,6 +51,14 @@ src = '[1, 1, 2, 2, 2, 3, 1].stream().distinct().collect()'
 value = "[1, 2, 3]"
 
 [[case]]
+# `distinct` membership is hash-bucketed (HR-G5) but keeps `Value` equality
+# exactly: `1 == 1.0` (numeric promotion), so the float duplicate is dropped
+# and the first occurrence (the int) is what's emitted.
+name = "stream-distinct-numeric-promotion-equality"
+src = '[1, 1.0, 2, 1].stream().distinct().collect()'
+value = "[1, 2]"
+
+[[case]]
 name = "stream-flat-map-lists"
 src = '[1, 2, 3].stream().flat_map(x => [x, x * 10]).collect()'
 value = "[1, 10, 2, 20, 3, 30]"
@@ -61,14 +69,34 @@ src = '[1, 2].stream().flat_map(x => [x].stream()).collect()'
 value = "[1, 2]"
 
 [[case]]
+# `flat_map` drains each returned substream to its natural end BEFORE pulling
+# the next outer item — SEQUENTIAL semantics, never interleaved (HR-G2, audit
+# I3; site/content/internals/streams-channels.md). Multi-element substreams
+# discriminate the two orders: interleaving would give [10, 20, 11, 21].
+name = "stream-flat-map-substreams-drain-sequentially"
+src = '[1, 2].stream().flat_map(x => [x * 10, x * 10 + 1].stream()).collect()'
+value = "[10, 11, 20, 21]"
+
+[[case]]
 name = "stream-enumerate"
 src = '["a", "b", "c"].stream().enumerate().collect()'
 value = '[[0, "a"], [1, "b"], [2, "c"]]'
 
 [[case]]
-name = "stream-buffer-identity"
+# `.buffer(n)` is a real decoupling buffer (HR-G1): a producer thread runs the
+# upstream at most n items ahead. Items are paced, never dropped — the full
+# sequence arrives in order regardless of capacity.
+name = "stream-buffer-is-lossless-and-ordered"
 src = '[1, 2, 3].stream().buffer(2).collect()'
 value = "[1, 2, 3]"
+
+[[case]]
+# Closure stages BELOW a buffer run on its producer thread inside a child
+# evaluator built from the authoritative child-context seam (HR-G1/HR-B1);
+# stages above it stay on the consumer. Both compose transparently.
+name = "stream-buffer-composes-with-closure-stages"
+src = '[1, 2, 3].stream().map(x => x * 2).buffer(2).map(x => x + 1).collect()'
+value = "[3, 5, 7]"
 
 [[case]]
 name = "stream-zip"
@@ -79,6 +107,30 @@ value = "[[1, 10], [2, 20]]"
 name = "stream-merge-sum"
 src = '[1, 2].stream().merge([3, 4].stream()).sum()'
 value = "10"
+
+[[case]]
+# `merge` is a left-biased poll sweep, not fair interleaving (HR-G6): each
+# pull probes the left stream first, so two already-ready in-memory sources
+# drain the left one completely before the right. Live sources instead
+# approximate arrival order at the 20 ms poll granularity (unit-tested in
+# shoal-value; timing keeps it out of the corpus).
+name = "stream-merge-ready-sources-drain-left-first"
+src = '[1, 2].stream().merge([3, 4].stream()).collect()'
+value = "[1, 2, 3, 4]"
+
+[[case]]
+# `zip` pulls LEFT then RIGHT each pair and ends when EITHER side ends
+# (HR-G6). The end-of-right pull happens after one more left item was
+# already consumed: that dangling item (2) is discarded — it has no partner
+# and the stream is over. The emit side effect makes the consumption
+# visible: the "pulled" channel saw 2, but the result only pairs 1.
+name = "stream-zip-consumes-one-left-item-past-the-shorter-end"
+src = '''
+let pairs = [1, 2, 3].stream().map(x => { channel("pulled").emit(x)
+x }).zip([10].stream()).collect()
+[pairs, channel("pulled").latest()]
+'''
+value = "[[[1, 10]], 2]"
 
 [[case]]
 name = "stream-throttle-finite-first"

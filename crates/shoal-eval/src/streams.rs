@@ -22,9 +22,10 @@
 //! macOS — cross-platform, mac first-class), never a poll loop in language
 //! space.
 
-use crate::Evaluator;
+use crate::{ChildScope, Evaluator};
 use notify::{EventKind, RecursiveMode, Watcher};
-use shoal_value::{ErrorVal, Fs, Record, StreamVal, VResult, Value};
+use shoal_exec::CancelToken;
+use shoal_value::{ErrorVal, Fs, Pull, Record, StreamVal, VResult, Value};
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -38,6 +39,11 @@ use std::time::Duration;
 /// that documented default here for both. `every` instead uses a 1-slot
 /// buffer (site/content/internals/streams-channels.md: ticks coalesce, memory O(1) always).
 const SOURCE_BUF: usize = 64;
+
+/// How often `.buffer(n)`'s producer thread re-checks cancellation while idle
+/// (pull timeout) or paced (full queue). Bounds both cancel latency and the
+/// latency of noticing queue room after a stall.
+const BUFFER_POLL: Duration = Duration::from_millis(10);
 
 impl Evaluator {
     /// `every(interval) -> stream<datetime>` (site/content/internals/streams-channels.md): one timer thread,
@@ -171,9 +177,69 @@ impl Evaluator {
         // The tail producer reads through the `Fs` port (not `std::fs` directly)
         // so the streaming source is interposable/fakeable like every other
         // filesystem effect; the `Arc` clone rides into the producer thread.
-        let fs = self.fs.clone();
+        let fs = self.host.fs.clone();
         std::thread::spawn(move || tail_loop(&fs, &path, from_start, &tx));
         Ok(Value::Stream(StreamVal::from_channel("str", rx)))
+    }
+
+    /// `.buffer(n)` — a REAL bounded decoupling buffer (HR-G1, audit I2):
+    /// consumes the stream and spawns a producer thread that eagerly pulls the
+    /// wrapped upstream and sends into a `sync_channel(n)`; the returned stream
+    /// reads from that channel. The producer therefore runs **at most `n` items
+    /// ahead** of the consumer — bounded memory with genuine pipelining, unlike
+    /// the removed identity stage.
+    ///
+    /// Semantics and shape:
+    /// - **Eager like a source**: constructing `.buffer(n)` starts production
+    ///   immediately (exactly as constructing `every`/`watch`/`tail` starts
+    ///   their producer threads); stages *above* the buffer stay lazy.
+    /// - **Closure stages below the buffer** run on the producer thread inside
+    ///   a child evaluator built through the authoritative child-context
+    ///   constructor (HR-B1) with `Inherit` scope — same confinement and
+    ///   bindings as `spawn`/`parallel`/`on` bodies.
+    /// - **Backpressure, never loss**: a full queue paces the producer (bounded
+    ///   `try_send` retry loop); items are never dropped, unlike the lossy
+    ///   source buffers — a decoupler must preserve the exact item sequence.
+    /// - **Cancellation/cleanup**: the producer checks the parent's
+    ///   cancellation token every [`BUFFER_POLL`] while idle or paced, and
+    ///   exits when the consumer side is dropped (send disconnects), which
+    ///   drops the wrapped upstream and cascades shutdown to nested sources.
+    /// - **Boundedness is preserved** (`from_channel_bounded`): a buffered
+    ///   finite stream still collects; a buffered live source stays endless.
+    /// - Errors from the upstream/closures cross the channel as the next item
+    ///   and end the stream. `n == 0` is a rendezvous handoff (decoupled
+    ///   threads, zero readahead).
+    pub(crate) fn stream_buffer(&mut self, s: StreamVal, n: usize) -> VResult<Value> {
+        let label = s.label.clone();
+        let bounded = s.is_bounded();
+        let mut up = s.take_upstream()?;
+        let (tx, rx) = sync_channel::<VResult<Value>>(n);
+        let ctx = self.child_context();
+        let cancel = self.cancellation_token();
+        std::thread::spawn(move || {
+            let mut ev = ctx.build(ChildScope::Inherit, cancel.clone());
+            loop {
+                if cancel.is_cancelled() {
+                    return;
+                }
+                let item = match up.pull(&mut ev, Some(BUFFER_POLL)) {
+                    Ok(Pull::Item(v)) => Ok(v),
+                    Ok(Pull::Timeout) => continue,
+                    Ok(Pull::End) => return, // tx drops → consumer sees End
+                    Err(e) => {
+                        // Surface the error, then end the stream.
+                        let _ = send_pacing(&tx, Err(e), &cancel);
+                        return;
+                    }
+                };
+                if !send_pacing(&tx, item, &cancel) {
+                    return; // consumer gone or cancelled → drop upstream, exit
+                }
+            }
+        });
+        Ok(Value::Stream(StreamVal::from_channel_bounded(
+            label, bounded, rx,
+        )))
     }
 
     /// Split a `watch` target into the directory to watch and an optional glob
@@ -371,6 +437,34 @@ fn read_new_lines(
     true
 }
 
+/// `.buffer(n)`'s pacing send (HR-G1): a full queue BLOCKS the producer — in a
+/// bounded retry loop that keeps consulting the cancellation token — rather
+/// than dropping. Unlike the lossy source buffers (`every`/`watch`/`tail`), a
+/// decoupling buffer must preserve the exact item sequence; loss here would be
+/// silent reordering of language-visible data. Returns `false` when the
+/// consumer is gone or the session is cancelled (so the producer exits and
+/// drops its upstream).
+fn send_pacing(
+    tx: &SyncSender<VResult<Value>>,
+    item: VResult<Value>,
+    cancel: &CancelToken,
+) -> bool {
+    let mut pending = item;
+    loop {
+        match tx.try_send(pending) {
+            Ok(()) => return true,
+            Err(TrySendError::Full(back)) => {
+                if cancel.is_cancelled() {
+                    return false;
+                }
+                pending = back;
+                std::thread::sleep(BUFFER_POLL);
+            }
+            Err(TrySendError::Disconnected(_)) => return false,
+        }
+    }
+}
+
 /// Send one tail line into the bounded consumer buffer (site/content/internals/streams-channels.md). A line that
 /// finds the buffer full is DROPPED (not blocked-on) and counted; the debt is
 /// flushed as a single `{dropped: n}` marker element as soon as there is room.
@@ -442,4 +536,44 @@ fn coalesced_event(root: &Path) -> Value {
     r.insert("ts".into(), now_datetime());
     r.insert("coalesced".into(), Value::Bool(true));
     Value::Record(r)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Weak;
+    use std::time::Instant;
+
+    /// HR-G1 cleanup: dropping a buffered stream without ever consuming it
+    /// must make the producer thread exit (its pacing send observes the
+    /// disconnect) and drop the wrapped upstream — observed here through a
+    /// `Weak` on a sentinel owned by the source iterator. A leaked producer
+    /// would keep the sentinel alive past the deadline.
+    #[test]
+    fn buffer_producer_exits_and_drops_upstream_on_consumer_drop() {
+        let sentinel = Arc::new(());
+        let weak: Weak<()> = Arc::downgrade(&sentinel);
+        let mut ev = Evaluator::new(std::env::temp_dir());
+        let src = StreamVal::from_iter(
+            "int",
+            (0..100_000_i64).map(move |i| {
+                let _held = &sentinel; // the iterator owns the sentinel until it drops
+                Ok(Value::Int(i))
+            }),
+        );
+        let out = ev.stream_buffer(src, 2).expect("buffer builds");
+        // The producer fills its 2 slots, then stalls in the pacing loop
+        // holding item 3. Dropping the consumer stream drops the receiver;
+        // the stalled try_send turns Disconnected and the thread exits.
+        drop(out);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while weak.strong_count() > 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            weak.strong_count(),
+            0,
+            "producer thread exited and released its upstream"
+        );
+    }
 }

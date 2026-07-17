@@ -110,13 +110,20 @@ Therefore:
 - a token created by `shoal-token` after kernel startup is rejected until that kernel restarts;
 - a token revoked by `shoal-token` after kernel startup remains accepted by that kernel until restart
   (unless its already-loaded expiry passes, which `validate` checks against current time);
-- listing in the CLI describes disk state, not necessarily the serving kernel's authentication state;
-- multiple management processes can load the same snapshot and atomically replace one another's
-  updates because the store has no interprocess lock or compare-and-swap generation.
+- listing in the CLI describes disk state, not necessarily the serving kernel's authentication state.
 
 This is a revocation-latency security boundary, not merely an administrative UX issue. Until live
 reload or a kernel-owned management path exists, token create/revoke instructions must explicitly
 require kernel restart and operational tooling must verify the serving generation.
+
+`create` and `revoke` (and the one-time key bootstrap inside `open`) hold an exclusive `fd-lock` file
+lock across a reload-mutate-persist cycle: each reloads the token list actually on disk before
+applying its own change, rather than trusting a possibly-stale in-memory snapshot, then persists and
+releases the lock (HR-I3). This closes the lost-update gap above — two processes racing to
+create/revoke tokens against the same file no longer silently clobber one another's write (a
+multi-process test pins twelve concurrent `create` calls all landing). It does not close the
+revocation-latency gap: `validate`/`list` still serve whatever this instance last loaded, not a live
+view of the file.
 
 Persist uses create-new temporary file mode 0600, writes and `sync_all`s, then renames. Opening an
 existing store actively sets its file permissions to 0600 before reading rather than rejecting a
@@ -134,9 +141,17 @@ token's `principal`. The cap strings are metadata in the shown attach path, not 
 enforced intersection with Leash grants. Security review must follow principal policy, handler
 checks, and resource ownership—not assume the returned token-cap array is a capability engine.
 
-No-token attach uses the local principal and `local-human` profile. A durable kernel validates a
-provided bearer with `TokenStore::validate`; invalid, expired, or revoked tokens share an auth-failed
-response.
+No-token attach is split by declared client kind (HR-D6): a `client.kind:"mcp"` attach lands on the
+restricted **`agent:mcp`** principal with the `"agent"` profile; any other kind uses the local
+`uid:N` principal and `local-human` profile. The kernel's built-in default policy defines
+`agent:mcp` with execution availability intact but without env value reads, env writes, or secret
+use — so a zero-config MCP agent works, is journaled under its own identity, and (under the
+approval separation default) cannot approve its own plans. The legacy permissive mapping for
+MCP-kind clients is an explicit opt-in: a non-empty `SHOAL_MCP_PERMISSIVE` on the kernel process,
+or `Kernel::set_mcp_permissive`. A bearer token is the per-principal alternative. The kind string
+is a client declaration inside the same-UID socket boundary — a default-authority posture, not a
+defense against a malicious same-UID process. A durable kernel validates a provided bearer with
+`TokenStore::validate`; invalid, expired, or revoked tokens share an auth-failed response.
 
 `PROFILE` and repeated `--cap` values accepted by `shoal-token create` are not authorization rules.
 They are copied into `AttachResult.caps.profile`/`token_caps` for client metadata. No handler
@@ -144,30 +159,40 @@ intersects them with Leash, and no resource check consumes them; the token's `pr
 used to look up policy. Creating a token with `--cap fs.read` grants nothing unless that principal's
 Leash policy and handler ownership rules already allow the operation.
 
-## Named session principal hazard
+## Named sessions: the shared pair-shell model (HR-D7)
 
-Kernel sessions are cached by user-supplied session name. `Kernel::session(name, principal)` consults
-`principal` only on first creation; later attachments to the same name receive the existing
-`Arc<Session>` and its evaluator/journal wiring. The connection `Attachment` records the new
-principal, but the underlying evaluator was created under the first principal's session setup.
+Kernel sessions are cached by user-supplied session name and are **intentionally shared across
+principals** — the pair-shell model documented in
+[kernel-protocol](@/internals/kernel-protocol.md#session-identity-and-the-pair-shell-model).
+`Kernel::session(name, principal)` consults `principal` only on first creation; later attachments to
+the same name receive the existing `Arc<Session>` and full shared control of its transcript, tasks,
+and PTYs.
 
 ```mermaid
 sequenceDiagram
-accTitle: Named session principal hazard
-accDescr: Shows the components and relationships described in Named session principal hazard.
-  participant A as agent:A
+accTitle: Shared pair-shell session
+accDescr: Two principals deliberately join one named session; each exec runs under its own actor's policy, and shared objects are session-scoped.
+  participant H as uid:N (human)
   participant K as Kernel sessions map
-  participant S as named Session "default"
-  A->>K: attach name=default
-  K->>S: create evaluator/journal as agent:A
-  participant B as agent:B
-  B->>K: attach name=default
-  K-->>B: existing Session (no principal compatibility check)
+  participant S as named Session "pair"
+  H->>K: attach name=pair
+  K->>S: create evaluator/journal as uid:N
+  participant A as agent:mcp
+  A->>K: attach name=pair
+  K-->>A: existing Session (shared workspace, by design)
 ```
 
-Handlers may still evaluate the current attachment principal for policy decisions, but mutable
-session state and evaluator-installed authority can cross identities. Session names should be scoped
-by owner or attachment should reject a principal mismatch. This is a multi-principal isolation gap.
+The security consequences are explicit, not accidental:
+
+- authority stays per-actor — each exec installs the current attachment principal's Leash policy,
+  and approval requires a distinct approver by default (HR-D3);
+- attribution follows the actor on coarse journal rows and journal/approval events; the evaluator's
+  finer statement-level rows keep the session creator's identity (a documented seam — read actor
+  attribution from the coarse rows);
+- a token scopes authority, **not** object visibility inside a session it joins. The isolation
+  boundary is the session name: give untrusted or differently-trusted agents their own session
+  names, and never reuse a name across trust boundaries. Cross-session lookups remain opaque
+  not-founds.
 
 ## Semantic effect algebra
 
@@ -269,30 +294,36 @@ Policy evaluation is only as complete as plan derivation. An effect omitted or c
 narrowly cannot be recovered by the verdict engine. Opaque behavior should remain opaque rather than
 inventing a false concrete effect.
 
-### Current kernel approval-boundary defect
+### Kernel approval boundary (HR-D1/D2/D3)
 
 The verdict engine above is sound only when the actor changing approval state is authenticated and
-authorized. Today `cap.request` is dispatched without requiring `session.attach`; its handler has no
-caller identity and sets a stored plan's `approved` bit after evaluating the **plan owner's** policy.
-The Unix socket's `0600` mode restricts access to the OS user, but it does not preserve the
-token-principal boundaries the kernel otherwise exposes.
+authorized. `cap.request` now enforces that:
 
-The plan key is a second weakness: it is a 16-hex-character prefix of a hash over effects,
-reversibility, and estimates, excluding source/session/principal. Equal-shape plans replace one
-another in the global plan map. `plan.apply` and approved `exec` do verify the currently stored
-source/session/principal, which limits direct reuse, but does not make creation or approval identity
-safe.
+- **Attachment required (HR-D1).** An unattached caller is rejected with `NOT_ATTACHED` before any
+  approval logic runs; the attachment principal is the **approver**. The Unix socket's `0600` mode
+  restricts access to the OS user; the attachment gate preserves the token-principal boundary.
+- **Separation of duties (HR-D3).** The approver must differ from the plan's requester (owner). A
+  requester approving its own plan is `LEASH_DENIED` ("self-approval is not permitted") **by
+  default**. Self-acknowledgement is an explicit opt-in (`SHOAL_ALLOW_SELF_ACK`, or
+  `Kernel::set_allow_self_ack`) for single-operator deployments that knowingly accept it. This is the
+  chosen model: *default separation, opt-in self-ack.* Approval still never overrides a hard `Deny`
+  from the plan owner's policy — it only lifts an approval-*required* verdict.
+- **Auditable binding (HR-D2).** On approval the kernel writes an `ApprovalRecord` onto the plan
+  binding requester, approver, plan ref/hash, granted scope, timestamp, and — once the approved plan
+  runs — the journal entry id of the consuming execution. The record is mirrored into the journal as
+  a `# approval …` audit row (queryable via `journal.query`) and surfaced on `plan.get.approval`.
 
-Required repair:
+Residual hardening (tracked in the roadmap, not yet done): the plan key is still a 16-hex-character
+prefix of a hash over effects/reversibility/estimates, excluding source/session/principal, so
+equal-shape plans overwrite one another in the global map. `plan.apply` and approved `exec` verify the
+currently stored source/session/principal, which limits direct reuse; unique owner-bound plan object
+identity is the remaining step.
 
-1. attach and authenticate the caller;
-2. require an explicit approver capability distinct from owning a plan;
-3. bind an approval record to a unique stored object plus exact owner/session/source/effect digest;
-4. prevent equal-effect plans from overwriting one another;
-5. audit approval decisions and test two principals over real connections.
-
-`journal.query` has the same missing attachment shape and returns shared journal rows without caller
-scoping. Treat both issues as P0 authority work.
+`journal.query` had the same missing-attachment shape; **HR-D4 closed it**: the handler now rejects
+an unattached caller with `NOT_ATTACHED` before reading any row, and its `limit` is bounded (omitted →
+default page, explicit `0` → zero rows, any value clamped to a server maximum — HR-D5). Within a
+shared pair-shell session the journal is intentionally readable by every attached principal; the
+isolation boundary is the session name, not per-row principal scoping.
 
 ## Policy loading defaults
 
@@ -305,8 +336,13 @@ Kernel startup with an explicit policy can use the fallible loader. Agent-facing
 silently reuse the local-human convenience loader unless fail-open authority is intentional and
 observable.
 
-The built-in permissive policy grants root read/write/delete, wildcard env, session/journal/time,
-opaque allow, and in-grant auto-apply. It does not enable spawn pinning.
+The built-in zero-config kernel policy defines two principals (HR-D6): the same-UID human keeps the
+fully permissive grants (root read/write/delete, wildcard env, session/journal/time, opaque allow,
+in-grant auto-apply), and the restricted `agent:mcp` principal keeps execution availability (opaque
+allow, unrestricted filesystem, in-grant auto-apply, session/journal/time) while dropping env value
+reads, env writes, and secret use. Neither enables spawn pinning. An explicit `--policy` file
+replaces this built-in entirely; a file that does not define `agent:mcp` leaves zero-config agents
+at the unknown-principal deny default.
 
 ## Lowering glob policy to OS roots
 
@@ -426,9 +462,16 @@ Landlock/Seatbelt wraps external children. Builtins, value `.save`, module disco
 journal access, network namespace methods, and other evaluator work occur in the parent process.
 They must be gated by semantic policy and routed through enforceable ports.
 
-Current filesystem port coverage is incomplete: several `Path::exists/is_dir/canonicalize` calls and
-direct `OpenOptions` writes bypass injected `Fs`. A child sandbox cannot protect the parent from its
-own builtin/method effects. Any claim that Leash confines all language I/O is too strong today.
+Current filesystem port coverage is incomplete on the **read** side: several
+`Path::exists/is_dir/canonicalize` observations still bypass injected `Fs`. Every language-visible
+**write** now crosses the port — value `.save`/`.append` and stream `.save` route through
+`CallCtx::fs()` (HR-C1/HR-C2), so a fake can observe or deny them (inventory in the HR-C3 ledger in
+[effects, plans, ports, and authority](@/internals/effects-plans-security.md)), and the evaluator's
+`CallCtx::fs()` override returns its injected `Arc<dyn Fs>`, so those writes hit the session's
+actual (sandboxed) port rather than the `StdFs` default — a denying injected adapter blocks
+`"x".save(...)` end to end. A child sandbox still cannot protect the parent from its own
+builtin/method effects outside the ported routes, and read-side probes remain unported, so any
+claim that Leash confines **all** language I/O is still too strong today.
 
 ## Secret store design
 
@@ -443,6 +486,13 @@ On Unix, opening sets directory mode 0700; key/data files are written 0600 and r
 with group/other permission bits. The key is 32 random bytes. The entire sorted map of secret names
 to byte values is JSON-serialized, encrypted with AES-256-GCM under a fresh 12-byte random nonce, and
 stored in a versioned base64 envelope.
+
+Because every mutation is a whole-map load-mutate-save cycle, `set`/`delete` hold an exclusive
+`fd-lock` file lock on `<dir>/.secrets.lock` (0600) across the entire cycle, and `get`/`list` take
+the shared side, so two processes updating the store concurrently cannot lose each other's write
+(HR-I3; a multi-process test pins twelve concurrent writers all landing). The one-time master-key
+bootstrap inside `open` shares the same exclusive lock so racing first-openers cannot install
+different keys.
 
 ```mermaid
 sequenceDiagram
@@ -460,13 +510,32 @@ accDescr: Shows the components and relationships described in Secret store desig
 ```
 
 Names must be nonempty ASCII alphanumeric, underscore, or hyphen. `get` returns `Zeroizing<Vec<u8>>`.
-Plain serialization and decrypted bytes use zeroizing wrappers in key paths, though intermediate map
-values and caller copies can still live in memory.
+The decrypted plaintext map (`PlainSecrets`), the serialized-plaintext and decrypted-plaintext
+buffers, and the key bytes are all wrapped in zeroizing types and are deterministically zeroized on
+drop — including early-return error paths inside `load`/`save`, and values displaced by `set`
+overwriting an existing name or removed by `delete`. That guarantee is scoped to `shoal-secret`
+itself: the evaluator's `SecretPort` copies the bytes into a plain `Vec<u8>`, the language-level
+`Value::Secret` payload is an ordinary `Arc<str>` with no zeroize-on-drop, and injecting a secret into
+a spawned process's environment hands the OS a further copy this crate cannot reach. Those are
+documented scope, not an oversight — see "Secret language boundary" below.
 
-AES-GCM detects envelope modification. The master key sits beside ciphertext under the same user
-permission boundary, so disk theft of both files yields decryption capability. This protects
-accidental plaintext disclosure and at-rest separation from the JSON data file; it does not protect
-against the same compromised user/process.
+AES-GCM detects envelope modification. **The real confidentiality boundary is the OS directory
+permission, not the encryption**: the master key sits beside the ciphertext in the same 0700
+directory, so copying that directory — or any read access available to the same user/process —
+yields both key and ciphertext. AES-GCM buys tamper detection and separates the store from
+accidental plaintext disclosure (e.g. a stray backup of only `secrets.json`, or a non-owner reader
+blocked by mode bits); it does not protect against the same compromised user or process that already
+has directory access.
+
+We evaluated moving the key into an OS keyring (the `keyring` crate, backed by the platform Secret
+Service/Keychain/Credential Manager) and decided to **defer** it, recorded here rather than silently
+dropped: `keyring` adds a per-platform D-Bus/Core Foundation/Windows Credential Manager dependency
+and requires a running desktop session or keychain daemon that headless servers, containers, and CI
+do not reliably have, and it would protect only the 32-byte AES key — the ciphertext stays in the
+same directory, so a same-user reader with an unlocked keyring available still recovers every secret.
+The added dependency/platform surface was judged larger than the boundary it would buy over stating
+the real boundary honestly. Revisit if shoal grows a primarily-interactive desktop deployment where a
+keyring daemon is already guaranteed present.
 
 ## Secret language boundary
 
@@ -529,6 +598,10 @@ limits/authorization to each invocation.
 | no proc-spawn allowlist at spawn gate | no pinning; allow ordinary spawn path |
 | nonhermetic sandbox unavailable | run with honest degraded status |
 | hermetic requested dimension unavailable | fail closed before spawn |
+| unattached `cap.request` / `journal.query` | reject with `NOT_ATTACHED` (HR-D1/D4) |
+| no-token MCP-kind attach | restricted `agent:mcp` principal; permissive is explicit opt-in (HR-D6) |
+| requester approving its own plan | reject `LEASH_DENIED` unless self-ack explicitly enabled (HR-D3) |
+| `journal.query` `limit` omitted vs. `0` | omitted → default page; explicit `0` → zero rows; clamped to server max (HR-D5) |
 | malformed/unknown bearer | reject attach |
 | ephemeral kernel bearer | reject as unavailable |
 | expired bearer or bearer marked revoked in the kernel's loaded snapshot | reject |
@@ -561,10 +634,14 @@ For a new externally reachable effect:
 
 ## Priority debt
 
-1. **Authenticate `cap.request` and scope `journal.query`.** Current handlers mutate/read shared
-   state without attachment; replace colliding plan refs with unique owner-bound object identity.
+1. **Unique owner-bound plan identity.** `cap.request` and `journal.query` now require attachment
+   (HR-D1/D4), approval binds a distinct approver and an auditable record (HR-D2/D3), and journal
+   limits are bounded (HR-D5). The remaining step is replacing colliding 16-hex plan refs with a
+   unique owner-bound object identity so equal-shape plans cannot overwrite one another.
 2. **Close child evaluator Leash inheritance escape.** This is a direct transitive-policy failure.
-3. **Scope named kernel sessions by principal.** Existing session reuse crosses first-creator state.
+3. **Statement-level attribution in shared sessions.** The pair-shell shared-session model is now
+   documented as intentional (HR-D7); the remaining seam is that evaluator statement-level journal
+   rows keep the session creator's identity rather than the current actor's.
 4. **Make token revocation live and generation-safe.** A running kernel currently retains its startup
    snapshot while external management rewrites disk.
 5. **Complete parent-process port/policy coverage.** Direct filesystem/network effects bypass child
