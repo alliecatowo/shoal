@@ -295,27 +295,60 @@ impl HostServices {
     }
 }
 
-pub struct Evaluator {
-    /// Host-installed service handles grouped into one shared, immutable
-    /// sub-context (HR-J2 [`HostServices`]): effect ports (`fs`/`exec`/`clock`/
-    /// `opener`/`secrets`/`config`), the adapter catalog, the event bus, and the
-    /// reef resolution inputs (`reef_resolver`/`reef_user_manifest`). Held behind
-    /// an `Arc` so a child evaluator inherits the whole bundle by cloning one
-    /// refcount (invariant I1/I4).
-    host: Arc<HostServices>,
-    pub env: Env,
+/// The genuinely-mutable execution core — the Class-3 evaluator state grouped by
+/// HR-J2 (`site/content/internals/evaluator-decomposition.md`): the state that
+/// advances as a program runs (lexical/ambient context, control/recursion, the
+/// reef overlay, the job/task registry, module memoization, journal attribution
+/// transients, and the frecency persistence path). Embedded as one
+/// [`Evaluator`] field so the evaluator collapses to the designed three-field
+/// façade (`host` / `session` / `exec`). A child evaluator's fresh-vs-inherited
+/// rules are applied field-by-field in [`ChildContext::build`]; the grouping is
+/// otherwise behavior-identical to the pre-decomposition flat fields.
+struct ExecState {
+    /// Current lexical environment. Swapped for calls/modules; closures capture
+    /// the handle. A child inherits it for closure bodies (`spawn`/`parallel`/
+    /// `on`) and starts from a fresh root for a `.shl` script.
+    env: Env,
+    /// Logical working directory. Session-local; changed by navigation and
+    /// temporarily by `with cwd:`/modules. A child inherits a snapshot.
     cwd: PathBuf,
+    /// Environment passed to spawned children — a snapshot of `vars_os()` at
+    /// construction plus in-session `env.NAME =`/`with env:` writes.
     process_env: Vec<(OsString, OsString)>,
-    /// Session identity, authority, and presentation policy grouped into one
-    /// sub-context (HR-J2 [`SessionCtx`]): `principal`/`session_id`, `leash`,
-    /// `echo_mode`, `interactive`, `journal`, and `sink`.
-    session: SessionCtx,
-    pub it: Value,
+    /// The directory `cd -` returns to: the cwd immediately before the last
+    /// real navigation (`cd`/`pushd`/`popd`/`j`). `None` until the first cwd
+    /// change. Session-scoped ambient state, never persisted to disk. `cd -`
+    /// restores this *exact* `PathBuf` (byte-identical to the directory left),
+    /// never a re-derived one.
+    oldpwd: Option<PathBuf>,
+    /// The `pushd`/`popd` directory stack: the directories *below* the current
+    /// `cwd`, which is always the conceptual top. `dirs` renders `[cwd] ++
+    /// dir_stack` (current first, bash's left-to-right order). Session-scoped
+    /// ambient state like `cwd`; never journaled or persisted to disk.
+    dir_stack: Vec<PathBuf>,
+    /// Cooperative cancellation epoch, consulted by sleeps, streams, and
+    /// execution paths. A child gets a fresh token wired to its task.
     cancel: CancelToken,
     /// Runtime call-stack depth guard (defect #9).
     call_depth: usize,
     /// Nesting depth inside `fn` bodies — gates `cd`/env writes (defect #10).
     in_fn_body: usize,
+    /// Set by the `exit`/`quit` builtin (defect: no `exit`). `Some(code)` asks
+    /// the host to stop: `eval_program` halts its statement loop, and the host
+    /// (REPL loop / `-c` / script runner) ends cleanly with `code`. Kept as a
+    /// value the host acts on — eval NEVER calls `std::process::exit`, which
+    /// would break the kernel/embedded host.
+    pending_exit: Option<i32>,
+    /// Last top-level value (the `it` binding). Updated after each successful
+    /// top-level statement.
+    it: Value,
+    /// reef (site/content/internals/reef-resolution.md): the dynamic overlay + per-cwd resolution
+    /// cache — the `with reef:` override stack, the cwd-keyed scope chain, and
+    /// the in-memory lock + its persistence path — grouped into one
+    /// [`ReefState`] sub-struct (HR-J2) so a child inherits the whole reef
+    /// overlay as a unit (closing the reef half of finding B3), not four
+    /// separately-copyable fields.
+    reef: ReefState,
     /// Live task registry backing the `jobs` builtin (defect #14).
     jobs: Vec<shoal_value::TaskVal>,
     /// Map of stopped-external job id → child pid, for the REPL's `fg`/`bg`
@@ -331,27 +364,6 @@ pub struct Evaluator {
     /// stop and drained by the REPL (`take_pending_stop`) to print the
     /// "[id]+ Stopped …" notice and return to the prompt.
     pending_stop: Option<(u64, String)>,
-    /// reef (site/content/internals/reef-resolution.md): the dynamic overlay + per-cwd resolution
-    /// cache — the `with reef:` override stack, the cwd-keyed scope chain, and
-    /// the in-memory lock + its persistence path — grouped into one
-    /// [`ReefState`] sub-struct (HR-J2) so a child inherits the whole reef
-    /// overlay as a unit (closing the reef half of finding B3), not four
-    /// separately-copyable fields.
-    reef: ReefState,
-    /// The journal entry id of the top-level statement currently executing, so
-    /// nested fs mutations (rm/cp/mv/save) can attach undo inverses to it.
-    /// `None` outside a journaled statement.
-    current_entry: Option<i64>,
-    /// Source text of the program currently being evaluated, used to slice each
-    /// top-level statement's `src` for its journal entry (site/content/internals/language-conformance-contract.md). `None` when
-    /// the host did not provide it — the entry's `src` is then left empty.
-    source: Option<String>,
-    /// Set by the `exit`/`quit` builtin (defect: no `exit`). `Some(code)` asks
-    /// the host to stop: `eval_program` halts its statement loop, and the host
-    /// (REPL loop / `-c` / script runner) ends cleanly with `code`. Kept as a
-    /// value the host acts on — eval NEVER calls `std::process::exit`, which
-    /// would break the kernel/embedded host.
-    pending_exit: Option<i32>,
     /// Module cache (site/content/internals/roadmap-and-priorities.md): a module (keyed by canonical path) evaluates
     /// once per session; its exports record is memoized here. Empty until the
     /// first `use`.
@@ -361,6 +373,14 @@ pub struct Evaluator {
     /// Derived-but-unspawned plans from the `plan { … }` REPL verb (site/content/internals/roadmap-and-priorities.md),
     /// indexed by id (`1`-based). `apply <ref>` looks a plan up here and runs it.
     plans: Vec<Program>,
+    /// Source text of the program currently being evaluated, used to slice each
+    /// top-level statement's `src` for its journal entry (site/content/internals/language-conformance-contract.md). `None` when
+    /// the host did not provide it — the entry's `src` is then left empty.
+    source: Option<String>,
+    /// The journal entry id of the top-level statement currently executing, so
+    /// nested fs mutations (rm/cp/mv/save) can attach undo inverses to it.
+    /// `None` outside a journaled statement.
+    current_entry: Option<i64>,
     /// Persistent directory-frecency store for `j`/`jump` (`frecency.rs`).
     /// `None` (the `Evaluator::new` default, so `-c`/scripts/conformance never
     /// write) disables recording; a `j` query then still reads the shared
@@ -368,17 +388,50 @@ pub struct Evaluator {
     /// [`Evaluator::open_default_jump_history`], or a test via
     /// [`Evaluator::set_jump_store`]) makes every `cd` bump that file.
     jump_store: Option<PathBuf>,
-    /// The directory `cd -` returns to: the cwd immediately before the last
-    /// real navigation (`cd`/`pushd`/`popd`/`j`). `None` until the first cwd
-    /// change. Held as a plain field exactly like `cwd` — session-scoped
-    /// ambient state, never persisted to disk. `cd -` restores this *exact*
-    /// `PathBuf` (byte-identical to the directory left), never a re-derived one.
-    oldpwd: Option<PathBuf>,
-    /// The `pushd`/`popd` directory stack: the directories *below* the current
-    /// `cwd`, which is always the conceptual top. `dirs` renders `[cwd] ++
-    /// dir_stack` (current first, bash's left-to-right order). Session-scoped
-    /// ambient state like `cwd`; never journaled or persisted to disk.
-    dir_stack: Vec<PathBuf>,
+}
+
+impl ExecState {
+    /// The default execution core, matching the pre-decomposition `Evaluator::new`
+    /// field defaults exactly: a fresh root env, the given cwd, the process env
+    /// snapshot, empty ambient/job/module state, a fresh cancel epoch, `it` null,
+    /// and a default (no-manifest) reef overlay.
+    fn new(cwd: PathBuf) -> Self {
+        Self {
+            env: Env::root(),
+            cwd,
+            process_env: std::env::vars_os().collect(),
+            oldpwd: None,
+            dir_stack: Vec::new(),
+            cancel: CancelToken::new(),
+            call_depth: 0,
+            in_fn_body: 0,
+            pending_exit: None,
+            it: Value::Null,
+            reef: ReefState::new(),
+            jobs: Vec::new(),
+            external_jobs: std::collections::HashMap::new(),
+            pending_stop: None,
+            modules: std::collections::HashMap::new(),
+            module_stack: Vec::new(),
+            plans: Vec::new(),
+            source: None,
+            current_entry: None,
+            jump_store: None,
+        }
+    }
+}
+
+/// The tree-walk evaluator, collapsed by HR-J2 to the designed three-field
+/// façade: [`HostServices`] (Class 1, shared + immutable), [`SessionCtx`]
+/// (Class 2, identity/authority/presentation), and [`ExecState`] (Class 3, the
+/// mutable per-eval core). A child evaluator inherits `host` and `session` by
+/// construction and builds a fresh-or-inherited `exec` per child kind, so a
+/// child can no longer silently under-inherit policy, config, or resolution
+/// inputs (deep-audit findings B1–B4 / H1).
+pub struct Evaluator {
+    host: Arc<HostServices>,
+    session: SessionCtx,
+    exec: ExecState,
 }
 
 enum Flow {
@@ -400,28 +453,37 @@ impl Evaluator {
     pub fn new(cwd: PathBuf) -> Self {
         Self {
             host: Arc::new(HostServices::new()),
-            env: Env::root(),
-            cwd,
-            process_env: std::env::vars_os().collect(),
             session: SessionCtx::new(),
-            it: Value::Null,
-            cancel: CancelToken::new(),
-            call_depth: 0,
-            in_fn_body: 0,
-            jobs: Vec::new(),
-            external_jobs: std::collections::HashMap::new(),
-            pending_stop: None,
-            reef: ReefState::new(),
-            current_entry: None,
-            source: None,
-            pending_exit: None,
-            modules: std::collections::HashMap::new(),
-            module_stack: Vec::new(),
-            plans: Vec::new(),
-            jump_store: None,
-            oldpwd: None,
-            dir_stack: Vec::new(),
+            exec: ExecState::new(cwd),
         }
+    }
+
+    /// The current lexical environment. Thin forwarding accessor over the
+    /// [`ExecState`] field the decomposition moved off the flat struct; hosts
+    /// (`shoal`'s REPL/`-c`, the highlighter, the LSP parse-ctx) read the live
+    /// scope through it. Replaces the former `pub env` field.
+    pub fn env(&self) -> &Env {
+        &self.exec.env
+    }
+
+    /// Mutable access to the current lexical environment, for a host that
+    /// declares session bindings (e.g. `-c` seeding `args`). Replaces direct
+    /// `pub env` field mutation.
+    pub fn env_mut(&mut self) -> &mut Env {
+        &mut self.exec.env
+    }
+
+    /// The last top-level value (`it`). Thin forwarding accessor over the
+    /// [`ExecState`] field; the prompt reads it. Replaces the former `pub it`
+    /// field.
+    pub fn it(&self) -> &Value {
+        &self.exec.it
+    }
+
+    /// Set the last top-level value (`it`) — the kernel mirrors a re-attached
+    /// session's last value through this. Replaces direct `pub it` field writes.
+    pub fn set_it(&mut self, value: Value) {
+        self.exec.it = value;
     }
 
     /// Install a custom [`Fs`] adapter (site/content/internals/roadmap-and-priorities.md). Additive: the
@@ -513,7 +575,7 @@ impl Evaluator {
     /// loop, `-c`, script runner) should stop and surface that code. Clears the
     /// flag so a subsequent REPL line starts fresh.
     pub fn take_exit(&mut self) -> Option<i32> {
-        self.pending_exit.take()
+        self.exec.pending_exit.take()
     }
 
     /// Install the active leash policy and the principal spawns are evaluated
@@ -553,7 +615,7 @@ impl Evaluator {
     /// the chain with this path folded in.
     pub fn set_reef_user_manifest(&mut self, path: impl Into<PathBuf>) {
         Arc::make_mut(&mut self.host).reef_user_manifest = Some(path.into());
-        self.reef.chain = None;
+        self.exec.reef.chain = None;
     }
 
     /// Inject the reef provider stack (resolver). Additive: without it the
@@ -583,13 +645,13 @@ impl Evaluator {
     /// Bind `it` and append to the session `out` transcript list (REPL hook).
     /// `Var("it")` / `Var("out")` then resolve from the environment normally.
     pub fn record_transcript(&mut self, v: &Value) {
-        self.env.declare("it", v.clone(), true);
-        let mut out = match self.env.get("out") {
+        self.exec.env.declare("it", v.clone(), true);
+        let mut out = match self.exec.env.get("out") {
             Some(Value::List(xs)) => xs,
             _ => Vec::new(),
         };
         out.push(v.clone());
-        self.env.declare("out", Value::List(out), true);
+        self.exec.env.declare("out", Value::List(out), true);
     }
 
     /// Route a value to the statement sink (or the default stdout renderer).
@@ -623,13 +685,15 @@ impl Evaluator {
     /// (site/content/internals/kernel-protocol.md). Cheap and I/O-free: call it once per
     /// command when building a `PromptContext`, never per keystroke.
     pub fn jobs_snapshot(&self) -> JobsSnapshot {
-        let total = self.jobs.len();
+        let total = self.exec.jobs.len();
         let running = self
+            .exec
             .jobs
             .iter()
             .filter(|t| !t.is_done() && !t.is_suspended())
             .count();
         let suspended = self
+            .exec
             .jobs
             .iter()
             .filter(|t| !t.is_done() && t.is_suspended())
@@ -649,6 +713,7 @@ impl Evaluator {
     /// for legibility; the booleans remain for programmatic filtering.
     pub(crate) fn jobs_table(&self) -> Value {
         let rows = self
+            .exec
             .jobs
             .iter()
             .map(|t| {
@@ -679,7 +744,7 @@ impl Evaluator {
     /// suspend hooks (`SIGTSTP` to the task's process group, when a spawner has
     /// registered one). Returns `false` if no task has that id.
     pub fn suspend_task(&self, id: u64) -> bool {
-        match self.jobs.iter().find(|t| t.id == id) {
+        match self.exec.jobs.iter().find(|t| t.id == id) {
             Some(t) => {
                 t.suspend();
                 true
@@ -691,7 +756,7 @@ impl Evaluator {
     /// Resume a suspended task by id (`SIGCONT`). Counterpart to
     /// [`Evaluator::suspend_task`]. Returns `false` if no task has that id.
     pub fn resume_task(&self, id: u64) -> bool {
-        match self.jobs.iter().find(|t| t.id == id) {
+        match self.exec.jobs.iter().find(|t| t.id == id) {
             Some(t) => {
                 t.resume();
                 true
@@ -703,7 +768,7 @@ impl Evaluator {
     /// Look up a live task by id (for the REPL `fg <task>` path, which re-fronts a
     /// background task and must first resolve it from the job table).
     pub fn task_by_id(&self, id: u64) -> Option<shoal_value::TaskVal> {
-        self.jobs.iter().find(|t| t.id == id).cloned()
+        self.exec.jobs.iter().find(|t| t.id == id).cloned()
     }
 
     /// Record a foreground external command that the OS just *stopped* (Ctrl-Z →
@@ -721,25 +786,26 @@ impl Evaluator {
         task.on_resume(Box::new(move || shoal_exec::continue_group(pgid)));
         task.mark_suspended();
         let id = task.id;
-        self.jobs.push(task);
-        self.external_jobs.insert(id, pid);
-        self.pending_stop = Some((id, desc));
+        self.exec.jobs.push(task);
+        self.exec.external_jobs.insert(id, pid);
+        self.exec.pending_stop = Some((id, desc));
         id
     }
 
     /// The child pid of a stopped-external job id, for the REPL `fg`/`bg` path to
     /// locate its parked PTY. `None` if `id` is not a stopped external command.
     pub fn external_job_pid(&self, id: u64) -> Option<u32> {
-        self.external_jobs.get(&id).copied()
+        self.exec.external_jobs.get(&id).copied()
     }
 
     /// The most recently registered external command that is currently stopped —
     /// the "current job" a bare `fg`/`bg` (no id) targets, matching the shell
     /// convention. `None` when no external command is stopped.
     pub fn last_stopped_external(&self) -> Option<u64> {
-        self.jobs
+        self.exec
+            .jobs
             .iter()
-            .filter(|t| t.is_suspended() && self.external_jobs.contains_key(&t.id))
+            .filter(|t| t.is_suspended() && self.exec.external_jobs.contains_key(&t.id))
             .map(|t| t.id)
             .max()
     }
@@ -747,14 +813,14 @@ impl Evaluator {
     /// The most recently stopped foreground external command (job id, display),
     /// consumed once by the REPL after each command to print the stop notice.
     pub fn take_pending_stop(&mut self) -> Option<(u64, String)> {
-        self.pending_stop.take()
+        self.exec.pending_stop.take()
     }
 
     /// Mark a stopped-external job as running again WITHOUT signalling — the
     /// REPL `fg`/`bg` path performs the SIGCONT + terminal handoff itself, so
     /// this only updates the job-table state. Returns `false` for an unknown id.
     pub fn mark_external_resumed(&self, id: u64) -> bool {
-        match self.jobs.iter().find(|t| t.id == id) {
+        match self.exec.jobs.iter().find(|t| t.id == id) {
             Some(t) => {
                 t.mark_resumed();
                 true
@@ -766,10 +832,10 @@ impl Evaluator {
     /// Re-mark a stopped-external job as stopped (it was `fg`'d and then Ctrl-Z'd
     /// again) and re-arm the pending-stop notice, without re-signalling.
     pub fn mark_external_stopped(&mut self, id: u64) {
-        if let Some(t) = self.jobs.iter().find(|t| t.id == id) {
+        if let Some(t) = self.exec.jobs.iter().find(|t| t.id == id) {
             t.mark_suspended();
             let desc = t.shared.desc.clone();
-            self.pending_stop = Some((id, desc));
+            self.exec.pending_stop = Some((id, desc));
         }
     }
 
@@ -777,8 +843,8 @@ impl Evaluator {
     /// ran to completion): mark the task done so `jobs` shows it terminal, and
     /// drop the pid mapping. Returns `false` for an unknown id.
     pub fn finish_external_job(&mut self, id: u64) -> bool {
-        self.external_jobs.remove(&id);
-        match self.jobs.iter().find(|t| t.id == id) {
+        self.exec.external_jobs.remove(&id);
+        match self.exec.jobs.iter().find(|t| t.id == id) {
             Some(t) => {
                 t.finish(Ok(Value::Null));
                 true
@@ -788,7 +854,7 @@ impl Evaluator {
     }
 
     pub fn cwd(&self) -> &Path {
-        &self.cwd
+        &self.exec.cwd
     }
 
     /// The session's process environment (name → value pairs) — the same
@@ -797,7 +863,7 @@ impl Evaluator {
     /// session-state accessor mirroring [`Evaluator::cwd`], used by the
     /// kernel's `shoal://session/env` resource view (site/content/internals/kernel-protocol.md).
     pub fn env_vars(&self) -> &[(OsString, OsString)] {
-        &self.process_env
+        &self.exec.process_env
     }
 
     pub fn set_adapters(&mut self, adapters: AdapterCatalog) {
@@ -813,16 +879,16 @@ impl Evaluator {
 
     /// Cancel the currently executing foreground process tree.
     pub fn cancel_current(&self) {
-        self.cancel.cancel();
+        self.exec.cancel.cancel();
     }
 
     pub fn cancellation_token(&self) -> CancelToken {
-        self.cancel.clone()
+        self.exec.cancel.clone()
     }
 
     /// Install a fresh cancellation epoch before reading the next command.
     pub fn reset_cancel(&mut self) {
-        self.cancel = CancelToken::new();
+        self.exec.cancel = CancelToken::new();
     }
 }
 
@@ -837,7 +903,7 @@ impl CallCtx for Evaluator {
         )
     }
     fn cwd(&self) -> PathBuf {
-        self.cwd.clone()
+        self.exec.cwd.clone()
     }
     /// Hand value methods the evaluator's *injected* Fs port, not the trait's
     /// `StdFs` default, so `.save`/`.append` write sinks are mediated by

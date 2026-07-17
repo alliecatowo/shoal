@@ -7,7 +7,7 @@ template = "docs/page.html"
 [extra]
 group = "Maintenance"
 eyebrow = "Design record"
-status = "Staged extraction — steps 1–4 landed; steps 5–6 pending a quiet window"
+status = "Complete — all six steps landed; Evaluator is the three-field façade"
 audience = "Runtime and security contributors"
 wide = true
 +++
@@ -24,11 +24,12 @@ rather than by discipline.
 
 This page proposes the target shape and a staged extraction plan. It **builds on the HR-B1
 seam** — the single authoritative child-evaluator constructor introduced by workstream B — and
-assumes that seam exists as its prerequisite. **Steps 1–4 have landed** on
-`hardening/deep-audit-2026-07` (characterization tests, then `SessionCtx`, then `ReefState`, then
-`HostServices`); the staged-plan section below records each step's status. Steps 5–6 (the `ExecState`
-extraction that collapses `Evaluator` to the three-field façade and the copy-site deletion) remain
-scheduled for a low-contention window and are unimplemented.
+assumes that seam exists as its prerequisite. **All six steps have landed** on
+`hardening/deep-audit-2026-07` (characterization tests, then `SessionCtx`, `ReefState`,
+`HostServices`, and finally `ExecState`); the staged-plan section below records each step's status.
+`Evaluator` is now the designed three-field façade `{ host, session, exec }`, and the copy-site
+deletion (step 6) is fully absorbed — the single `child_context().build` seam is the only way to
+seed a child's inherited capabilities.
 
 The authoritative live description of today's state is
 [evaluator state and control flow](@/internals/evaluator-state.md); read its "Child evaluator
@@ -367,20 +368,34 @@ shared `Arc` — behaviorally identical (the default `Resolver::with_defaults()`
 a host-preinstalled resolver is set before any child exists) but without a `&mut` seam on the shared
 bundle. `CallCtx::fs()` still hands value methods `&*self.host.fs`, byte-identical.*
 
-**Step 5 — Extract `ExecState` and collapse `Evaluator` to the three-field façade.** Move the
-remaining Class-3 fields into `ExecState`; `Evaluator` becomes `{ host, session, exec }`. Field
+**Step 5 — Extract `ExecState` and collapse `Evaluator` to the three-field façade. ✅ Landed.** Move
+the remaining Class-3 fields into `ExecState`; `Evaluator` becomes `{ host, session, exec }`. Field
 moves within `stmt.rs`/`command.rs`/`expr*.rs`/`call.rs`/`modules.rs`. Broad but mechanical.
 *Size: ~1–2 agent-days. Conflicts: touches the "hot" eval-heavy modules every language change
 edits — schedule when eval edit pressure is low; individually gateable because it is a pure field
 move.*
+*Landed: `ExecState` holds the twenty Class-3 fields — `env`, `cwd`, `process_env`, `oldpwd`,
+`dir_stack`, `cancel`, `call_depth`, `in_fn_body`, `pending_exit`, `it`, the `reef: ReefState`
+overlay/cache (moved inside `ExecState` from its step-3 top-level home), `jobs`, `external_jobs`,
+`pending_stop`, `modules`, `module_stack`, `plans`, `source`, `current_entry`, `jump_store` — with
+an `ExecState::new(cwd)` whose defaults match the former flat-field defaults byte-for-byte.
+`Evaluator` is now exactly `{ host: Arc<HostServices>, session: SessionCtx, exec: ExecState }` — the
+designed façade. ~228 `self.<field>` sites became `self.exec.<field>` across ~20 impl modules;
+`ChildContext::build` applies the fresh-vs-inherited rules onto `child.exec.<field>`. The two former
+`pub` fields `env`/`it` are now private; thin forwarding accessors `Evaluator::env`/`env_mut`/`it`/
+`set_it` replace them, and the host crates (`shoal`'s REPL/`-c`/prompt, `shoal-kernel`) route
+through those.*
 
-**Step 6 — Delete `inherit_ports` and every manual child field-copy (finishes HR-B6).** With the
-three contexts in place, `Evaluator::child` is the only way to build a child. Remove
-`inherit_ports`, the hand-copies in `spawn_block`/`run_script_file`/`builtin_parallel`/
-`builtin_on`, and privatize `Evaluator::new` field access so no site can under-inherit again.
-Verify no `Evaluator::new`-plus-manual-copy survives outside the test module.
-*Size: ~1 agent-day. Conflicts: `script.rs`/`host.rs`/`channels.rs` child sites — coordinate with
-anyone editing those concurrency paths.*
+**Step 6 — Delete `inherit_ports` and every manual child field-copy (finishes HR-B6). ✅ Absorbed.**
+This step was already completed by the earlier HR-B6 work and finished off in steps 4–5: there is no
+`inherit_ports` anywhere, all five child-build sites (`spawn_block`, `run_script_file`,
+`builtin_parallel`/`host.rs`, `builtin_on`/`channels.rs`, and the stream child in `streams.rs`) route
+through the single `child_context().build` seam, and every `Evaluator` field is private with no `pub`
+capability field a site could set directly — a child's inherited capabilities can only be seeded via
+`ChildContext`. The one post-build field write that remains (`child.exec.env.declare` for a `.shl`
+script's `args`/`script` bindings) is legitimate binding setup on an already-fully-inherited child,
+not a capability copy.
+*Size: folded into steps 4–5. Conflicts: none remaining.*
 
 ### Conflict schedule at a glance
 
@@ -390,12 +405,12 @@ anyone editing those concurrency paths.*
 | 2 ✅ | journal.rs, command.rs, lib.rs | HR-D1–D7 | landed |
 | 3 ✅ | reef_resolve.rs, reef_builtins.rs, lib.rs | HR-J1, reef work | landed |
 | 4 ✅ | ~15 modules (`self.fs`→`self.host.fs`) | HR-C1–C3, HR-A9 | landed |
-| 5 | stmt/command/expr/call/modules | eval-heavy work | low eval-edit-pressure window |
-| 6 | script.rs, host.rs, channels.rs | concurrency-path edits | coordinate on child sites |
+| 5 ✅ | stmt/command/expr/call/modules | eval-heavy work | landed |
+| 6 ✅ | script.rs, host.rs, channels.rs | concurrency-path edits | absorbed into steps 4–5 |
 
-Steps 1–3 can proceed early and independently of the broad renames. Steps 4–6 are the noisy
-finish and should be serialized into a quiet window; none of them changes behavior, so they carry
-schedule risk (merge conflicts), not correctness risk.
+Steps 1–3 proceeded early and independently of the broad renames. Steps 4–6 were the noisy finish,
+serialized into a quiet window; none of them changed behavior, so they carried schedule risk (merge
+conflicts), not correctness risk. All landed on `hardening/deep-audit-2026-07`.
 
 ## Non-goals
 

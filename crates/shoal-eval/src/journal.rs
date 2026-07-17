@@ -84,7 +84,7 @@ impl Evaluator {
     /// Provide the source text of the program about to be evaluated so each
     /// top-level statement's `src` can be sliced from it for the journal.
     pub fn set_source(&mut self, src: impl Into<String>) {
-        self.source = Some(src.into());
+        self.exec.source = Some(src.into());
     }
 
     /// Whether a journal is installed (for hosts/tests).
@@ -109,14 +109,14 @@ impl Evaluator {
             session: self.session.session_id.clone(),
             principal: self.session.principal.clone(),
             ts_ns: self.host.clock.now_ns(),
-            cwd: self.cwd.as_os_str().as_bytes().to_vec(),
+            cwd: self.exec.cwd.as_os_str().as_bytes().to_vec(),
             src,
             ast_json,
             effects_json,
             opaque,
         };
         let id = self.session.journal.as_ref()?.append(&record).ok()?;
-        self.current_entry = Some(id);
+        self.exec.current_entry = Some(id);
         Some((id, Instant::now()))
     }
 
@@ -131,7 +131,7 @@ impl Evaluator {
         let Some((id, start)) = opened else {
             return;
         };
-        self.current_entry = None;
+        self.exec.current_entry = None;
         let Some(journal) = self.session.journal.as_ref() else {
             return;
         };
@@ -175,7 +175,7 @@ impl Evaluator {
 
     /// Slice the statement's source text from the program source, if provided.
     fn stmt_source(&self, stmt: &Stmt) -> String {
-        let Some(src) = &self.source else {
+        let Some(src) = &self.exec.source else {
             return String::new();
         };
         let span = stmt.span();
@@ -209,7 +209,7 @@ impl Evaluator {
     /// literal (a non-literal arg is skipped rather than re-evaluated, so a
     /// command-substituted path never runs twice).
     pub(crate) fn fs_undo_pre(&mut self, head: &str, call: &CmdCall) -> Vec<FsUndoPre> {
-        let Some(entry) = self.current_entry else {
+        let Some(entry) = self.exec.current_entry else {
             return Vec::new();
         };
         if self.session.journal.is_none() || !matches!(head, "cp" | "mv") {
@@ -252,7 +252,7 @@ impl Evaluator {
 
     /// After a `cp`/`mv`/`rm` builtin has run, record its typed undo inverses.
     pub(crate) fn fs_undo_post(&mut self, head: &str, pre: Vec<FsUndoPre>, result: &Value) {
-        let Some(entry) = self.current_entry else {
+        let Some(entry) = self.exec.current_entry else {
             return;
         };
         let Some(journal) = self.session.journal.as_ref() else {
@@ -317,7 +317,7 @@ impl Evaluator {
     /// bytes would exceed the CAS cap and be stored truncated, so a corrupt
     /// partial-content inverse is never keyed.
     fn overwrite_undo_pre(&mut self, target: &Path) -> Option<FsUndoPre> {
-        let entry = self.current_entry?;
+        let entry = self.exec.current_entry?;
         self.session.journal.as_ref()?;
         if !target.is_file() {
             return None;
@@ -334,7 +334,7 @@ impl Evaluator {
     /// Best-effort: a journaling failure never fails the caller's write.
     pub(crate) fn overwrite_undo_post(&mut self, pre: Option<FsUndoPre>) {
         let (Some(entry), Some(FsUndoPre::Overwrite { path, prior_hash })) =
-            (self.current_entry, pre)
+            (self.exec.current_entry, pre)
         else {
             return;
         };
@@ -398,7 +398,11 @@ impl Evaluator {
                 _ => return None,
             };
             let p = self.resolve_path(&text);
-            out.push(if p.is_absolute() { p } else { self.cwd.join(p) });
+            out.push(if p.is_absolute() {
+                p
+            } else {
+                self.exec.cwd.join(p)
+            });
         }
         Some(out)
     }
@@ -409,7 +413,11 @@ impl Evaluator {
             Value::Str(s) => PathBuf::from(s),
             _ => return None,
         };
-        Some(if p.is_absolute() { p } else { self.cwd.join(p) })
+        Some(if p.is_absolute() {
+            p
+        } else {
+            self.exec.cwd.join(p)
+        })
     }
 
     // --- undo / journal builtins ------------------------------------------
@@ -438,7 +446,7 @@ impl Evaluator {
                 .with_span(call.span)
             })?,
         };
-        let root = self.cwd.clone();
+        let root = self.exec.cwd.clone();
         let report = journal.undo_entry(entry_id, &root).map_err(|e| {
             let code = match e {
                 UndoError::Stale(_) => "stale_undo",
@@ -631,7 +639,7 @@ mod tests {
     /// it (`checked_target`), and on macOS a tempdir's path is a symlink
     /// alias (`/var/folders/...` -> `/private/var/folders/...`). Rooting the
     /// evaluator at the already-canonical path keeps every path it records
-    /// (via `self.cwd.join(...)`) on the same prefix `undo_entry` compares
+    /// (via `self.exec.cwd.join(...)`) on the same prefix `undo_entry` compares
     /// against — mirroring the fix already applied to shoal-journal's own
     /// `root.path().canonicalize()` tests.
     fn journaled(cwd: &Path) -> Evaluator {

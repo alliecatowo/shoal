@@ -83,7 +83,11 @@ impl Evaluator {
                 )));
             }
         };
-        let p = if p.is_absolute() { p } else { self.cwd.join(p) };
+        let p = if p.is_absolute() {
+            p
+        } else {
+            self.exec.cwd.join(p)
+        };
         self.host
             .opener
             .open(&p)

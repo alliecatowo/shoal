@@ -22,27 +22,28 @@ impl Evaluator {
     /// the next resolution and nothing else does). Reloads the lock next to the
     /// nearest manifest at the same time.
     pub(crate) fn ensure_reef_chain(&mut self) {
-        let fresh = match &self.reef.chain {
-            Some((cwd, _)) => cwd != &self.cwd,
+        let fresh = match &self.exec.reef.chain {
+            Some((cwd, _)) => cwd != &self.exec.cwd,
             None => true,
         };
         if !fresh {
             return;
         }
-        let chain = ScopeChain::discover(&self.cwd, self.host.reef_user_manifest.as_deref());
-        self.reef.lock_path = chain
+        let chain = ScopeChain::discover(&self.exec.cwd, self.host.reef_user_manifest.as_deref());
+        self.exec.reef.lock_path = chain
             .scopes
             .iter()
             .find(|s| s.kind == ManifestKind::Reef)
             .or_else(|| chain.scopes.first())
             .map(|s| shoal_reef::Lockfile::path_next_to(&s.source));
-        self.reef.lock = self
+        self.exec.reef.lock = self
+            .exec
             .reef
             .lock_path
             .as_ref()
             .and_then(|p| shoal_reef::Lockfile::load(p).ok())
             .unwrap_or_default();
-        self.reef.chain = Some((self.cwd.clone(), chain));
+        self.exec.reef.chain = Some((self.exec.cwd.clone(), chain));
     }
 
     /// A clone of the current scope chain (cheap: manifests are small maps),
@@ -53,9 +54,17 @@ impl Evaluator {
     /// popping an override always restores exactly the cached chain).
     pub(crate) fn reef_chain_snapshot(&mut self) -> ScopeChain {
         self.ensure_reef_chain();
-        let mut chain = self.reef.chain.as_ref().expect("just ensured").1.clone();
-        if !self.reef.overrides.is_empty() {
-            let mut scopes: Vec<ScopeEntry> = self.reef.overrides.iter().rev().cloned().collect();
+        let mut chain = self
+            .exec
+            .reef
+            .chain
+            .as_ref()
+            .expect("just ensured")
+            .1
+            .clone();
+        if !self.exec.reef.overrides.is_empty() {
+            let mut scopes: Vec<ScopeEntry> =
+                self.exec.reef.overrides.iter().rev().cloned().collect();
             scopes.append(&mut chain.scopes);
             chain.scopes = scopes;
         }
@@ -81,7 +90,7 @@ impl Evaluator {
                 shoal_reef::ToolReq::new(shoal_reef::Constraint::parse(s)),
             );
         }
-        self.reef.overrides.push(ScopeEntry {
+        self.exec.reef.overrides.push(ScopeEntry {
             kind: ManifestKind::Reef,
             source: PathBuf::from("<with reef:>"),
             manifest: shoal_reef::ReefManifest {
@@ -97,7 +106,7 @@ impl Evaluator {
     /// Pop the most recently pushed `with reef:` override layer. A no-op past
     /// the bottom of the stack (defensive; callers always balance push/pop).
     pub(crate) fn pop_reef_override(&mut self) {
-        self.reef.overrides.pop();
+        self.exec.reef.overrides.pop();
     }
 
     /// The lazily-built provider stack (site/content/internals/reef-resolution.md). Only ever called once a
@@ -116,11 +125,12 @@ impl Evaluator {
     /// override — constrains something in the current scope. The single gate
     /// that keeps the no-manifest world untouched.
     pub(crate) fn reef_manifest_in_scope(&mut self) -> bool {
-        if !self.reef.overrides.is_empty() {
+        if !self.exec.reef.overrides.is_empty() {
             return true;
         }
         self.ensure_reef_chain();
         !self
+            .exec
             .reef
             .chain
             .as_ref()
@@ -133,8 +143,8 @@ impl Evaluator {
     /// Persist the in-memory lock next to its manifest, best-effort. A failure
     /// to write never fails a spawn — the lock is an optimization, not a gate.
     pub(crate) fn persist_reef_lock(&self) {
-        if let Some(path) = &self.reef.lock_path {
-            let _ = self.reef.lock.save(path);
+        if let Some(path) = &self.exec.reef.lock_path {
+            let _ = self.exec.reef.lock.save(path);
         }
     }
 
@@ -146,6 +156,7 @@ impl Evaluator {
     /// outside reef's view" fact.
     pub(crate) fn ambient_which(&self, name: &str) -> Option<PathBuf> {
         let path_env = self
+            .exec
             .process_env
             .iter()
             .find(|(k, _)| k == "PATH")
@@ -204,7 +215,7 @@ impl Evaluator {
             Policy::Script
         };
         let resolver = self.reef_resolver();
-        let mut lock = self.reef.lock.clone();
+        let mut lock = self.exec.reef.lock.clone();
         let mut notice: Option<LockNotice> = None;
         let outcome = resolver.resolve(&name, &chain, &mut lock, policy, &mut |n| {
             notice = Some(n.clone());
@@ -223,7 +234,7 @@ impl Evaluator {
         };
 
         argv[0] = resolution.path.clone().into_os_string();
-        self.reef.lock = lock;
+        self.exec.reef.lock = lock;
         if let Some(n) = notice {
             self.persist_reef_lock();
             self.emit_lock_notice(&n);
@@ -254,7 +265,7 @@ impl Evaluator {
             resolution.report.name.clone(),
             resolution.path.clone(),
         )];
-        for (tool, entry) in &self.reef.lock.tools {
+        for (tool, entry) in &self.exec.reef.lock.tools {
             if tool != &resolution.report.name {
                 bindings.push(Binding::new(tool.clone(), entry.path.clone()));
             }

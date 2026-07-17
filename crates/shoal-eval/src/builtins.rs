@@ -55,11 +55,11 @@ pub(super) fn run(ev: &mut Evaluator, call: &CmdCall) -> VResult<Value> {
     dispatch(
         &call.head,
         fs.as_ref(),
-        &ev.cwd,
-        &ev.process_env,
+        &ev.exec.cwd,
+        &ev.exec.process_env,
         args,
         &flags,
-        &ev.cancel,
+        &ev.exec.cancel,
     )
     .map_err(|e| e.or_span(call.span))
 }

@@ -28,7 +28,7 @@ impl Evaluator {
         }
         // Session callables (fns/aliases) resolve as commands even when `^`-forced
         // (defect #3): `^` bypasses only non-callable let/var shadows.
-        if let Some(bound) = self.env.get(&call.head)
+        if let Some(bound) = self.exec.env.get(&call.head)
             && bound.is_callable()
         {
             // `deploy --help` synthesises the signature + doc (site/content/internals/language-conformance-contract.md, defect #12).
@@ -125,7 +125,7 @@ impl Evaluator {
         }
         // A bare word bound to a non-callable value (e.g. `it`, `out`, or any
         // `let`) resolves to that value — bound names dispatch as EXPR (site/content/internals/language-conformance-contract.md).
-        if let Some(bound) = self.env.get(&call.head)
+        if let Some(bound) = self.exec.env.get(&call.head)
             && !call.forced
             && !bound.is_callable()
             && call.args.is_empty()
@@ -143,7 +143,7 @@ impl Evaluator {
         // here — that would kill the kernel/embedded host (defect: no exit).
         if call.head == "exit" || call.head == "quit" {
             let code = self.exit_code_arg(call)?;
-            self.pending_exit = Some(code);
+            self.exec.pending_exit = Some(code);
             return Ok(Value::Null);
         }
         // plan/apply/explain REPL verbs (site/content/internals/roadmap-and-priorities.md). `plan { … }` renders the
@@ -238,7 +238,7 @@ impl Evaluator {
             return self.eval_jump(call);
         }
         if call.head == "pwd" {
-            return Ok(Value::Path(self.cwd.clone()));
+            return Ok(Value::Path(self.exec.cwd.clone()));
         }
         // `run` is the poly runner + dynamic form (site/content/internals/pty-job-control.md): dispatch by extension
         // or, for a non-path name, invoke dynamically as a command.
@@ -271,7 +271,7 @@ impl Evaluator {
             let path = if script_path.is_absolute() {
                 script_path
             } else {
-                self.cwd.join(script_path)
+                self.exec.cwd.join(script_path)
             };
             if is_source {
                 let src =
@@ -346,9 +346,9 @@ impl Evaluator {
     /// deliberately do NOT flow through here: those are scoped save/restore cwd
     /// swaps, not navigation the user asked the shell to remember.
     pub(crate) fn change_cwd(&mut self, new: PathBuf) {
-        let prev = std::mem::replace(&mut self.cwd, new);
-        self.oldpwd = Some(prev);
-        let cwd = self.cwd.clone();
+        let prev = std::mem::replace(&mut self.exec.cwd, new);
+        self.exec.oldpwd = Some(prev);
+        let cwd = self.exec.cwd.clone();
         self.record_cd(&cwd);
     }
 
@@ -356,7 +356,7 @@ impl Evaluator {
     /// (site/content/internals/language-conformance-contract.md): a fn must not move the ambient session cwd — `with cwd:` is
     /// the scoped alternative. A pure guard shared by all three verbs.
     fn ensure_cwd_mutable(&self, verb: &str, span: Span) -> VResult<()> {
-        if self.in_fn_body > 0 {
+        if self.exec.in_fn_body > 0 {
             return Err(ErrorVal::new(
                 "custom",
                 format!(
@@ -377,15 +377,15 @@ impl Evaluator {
         self.ensure_cwd_mutable("cd", call.span)?;
         // `cd -`: jump back to the previous directory (bash's `$OLDPWD`).
         if matches!(call.args.first(), Some(CmdArg::Dash { .. })) {
-            let Some(prev) = self.oldpwd.clone() else {
+            let Some(prev) = self.exec.oldpwd.clone() else {
                 return Err(ErrorVal::new("custom", "cd: OLDPWD not set").with_span(call.span));
             };
             self.change_cwd(prev);
-            return Ok(Value::Path(self.cwd.clone()));
+            return Ok(Value::Path(self.exec.cwd.clone()));
         }
         let target = self.cd_target(call)?;
         self.change_cwd(target);
-        Ok(Value::Path(self.cwd.clone()))
+        Ok(Value::Path(self.exec.cwd.clone()))
     }
 
     /// Resolve a `cd`/`pushd` path argument to an absolute, canonicalized
@@ -406,7 +406,11 @@ impl Evaluator {
             Value::Str(s) => PathBuf::from(s),
             _ => return Err(ErrorVal::new("arg_error", "cd expects path")),
         };
-        let joined = if p.is_absolute() { p } else { self.cwd.join(p) };
+        let joined = if p.is_absolute() {
+            p
+        } else {
+            self.exec.cwd.join(p)
+        };
         joined
             .canonicalize()
             .map_err(|e| ErrorVal::new("arg_error", e.to_string()))
@@ -419,7 +423,7 @@ impl Evaluator {
     fn eval_pushd(&mut self, call: &CmdCall) -> VResult<Value> {
         self.ensure_cwd_mutable("pushd", call.span)?;
         if call.args.is_empty() {
-            let Some(top) = self.dir_stack.first().cloned() else {
+            let Some(top) = self.exec.dir_stack.first().cloned() else {
                 return Err(ErrorVal::new(
                     "custom",
                     "pushd: no other directory on the stack to swap with",
@@ -427,12 +431,12 @@ impl Evaluator {
                 .with_span(call.span));
             };
             // Swap: the current cwd takes the top slot, we move to the old top.
-            self.dir_stack[0] = self.cwd.clone();
+            self.exec.dir_stack[0] = self.exec.cwd.clone();
             self.change_cwd(top);
             return Ok(self.dir_stack_value());
         }
         let target = self.cd_target(call)?;
-        self.dir_stack.insert(0, self.cwd.clone());
+        self.exec.dir_stack.insert(0, self.exec.cwd.clone());
         self.change_cwd(target);
         Ok(self.dir_stack_value())
     }
@@ -441,12 +445,12 @@ impl Evaluator {
     /// stack is an error (nothing to pop). Returns the remaining stack.
     fn eval_popd(&mut self, call: &CmdCall) -> VResult<Value> {
         self.ensure_cwd_mutable("popd", call.span)?;
-        if self.dir_stack.is_empty() {
+        if self.exec.dir_stack.is_empty() {
             return Err(
                 ErrorVal::new("custom", "popd: directory stack is empty").with_span(call.span)
             );
         }
-        let target = self.dir_stack.remove(0);
+        let target = self.exec.dir_stack.remove(0);
         self.change_cwd(target);
         Ok(self.dir_stack_value())
     }
@@ -461,9 +465,9 @@ impl Evaluator {
     /// Build the shared `dirs`/`pushd`/`popd` return value: `[cwd] ++ dir_stack`
     /// as a `list<path>`, current directory first (bash's left-to-right order).
     fn dir_stack_value(&self) -> Value {
-        let mut out = Vec::with_capacity(self.dir_stack.len() + 1);
-        out.push(Value::Path(self.cwd.clone()));
-        out.extend(self.dir_stack.iter().cloned().map(Value::Path));
+        let mut out = Vec::with_capacity(self.exec.dir_stack.len() + 1);
+        out.push(Value::Path(self.exec.cwd.clone()));
+        out.extend(self.exec.dir_stack.iter().cloned().map(Value::Path));
         Value::List(out)
     }
 
@@ -610,7 +614,7 @@ impl Evaluator {
         span: Span,
         meta: Option<ExecMeta>,
     ) -> VResult<Value> {
-        let mut env = self.process_env.clone();
+        let mut env = self.exec.process_env.clone();
         for p in prefixes {
             let v = self.cmd_arg_value(&p.value)?;
             let s = match v {
@@ -694,14 +698,14 @@ impl Evaluator {
             .run(
                 ExecSpec {
                     argv,
-                    cwd: self.cwd.clone(),
+                    cwd: self.exec.cwd.clone(),
                     env,
                     stdin,
                     mode,
                     sandbox,
                     spill,
                 },
-                &self.cancel,
+                &self.exec.cancel,
             )
             .map_err(|e| {
                 let is_not_found = e.kind() == std::io::ErrorKind::NotFound;
@@ -986,6 +990,7 @@ impl Evaluator {
             return true;
         }
         let path = self
+            .exec
             .process_env
             .iter()
             .find(|(k, _)| k == "PATH")
@@ -1027,8 +1032,8 @@ impl Evaluator {
             .map(|s| (*s).to_owned())
             .collect();
         candidates.extend(self.host.adapters.names().map(str::to_owned));
-        for name in self.env.visible_names() {
-            if self.env.get(&name).is_some_and(|v| v.is_callable()) {
+        for name in self.exec.env.visible_names() {
+            if self.exec.env.get(&name).is_some_and(|v| v.is_callable()) {
                 candidates.push(name);
             }
         }

@@ -248,7 +248,7 @@ impl Evaluator {
                         if let Some(body) = functions.get(other) {
                             // A function declared in this program: expand it.
                             self.plan_block(body, functions, aliases, out, depth + 1)?;
-                        } else if self.env.get(other).is_some_and(|v| v.is_callable()) {
+                        } else if self.exec.env.get(other).is_some_and(|v| v.is_callable()) {
                             // A session-stored closure/function that cannot be
                             // statically expanded (A5): require approval, never
                             // report nothing.
@@ -369,7 +369,12 @@ impl Evaluator {
         // A bound session closure/fn (not one declared in this program) shadows
         // builtin/adapter/external dispatch and cannot be statically expanded
         // (A5): require approval rather than reporting nothing.
-        if self.env.get(&call.head).is_some_and(|v| v.is_callable()) {
+        if self
+            .exec
+            .env
+            .get(&call.head)
+            .is_some_and(|v| v.is_callable())
+        {
             push_effect(out, Effect::Opaque);
             return Ok(());
         }
@@ -380,7 +385,7 @@ impl Evaluator {
             && call.args.is_empty()
             && call.redirects.is_empty()
             && call.env_prefix.is_empty()
-            && self.env.get(&call.head).is_some()
+            && self.exec.env.get(&call.head).is_some()
         {
             return Ok(());
         }
@@ -470,7 +475,7 @@ impl Evaluator {
             };
             let bindings = self.plan_bindings(call, &spec, start)?;
             for declared in &spec.effects {
-                for effect in parse_declared_effect(declared, &bindings, &self.cwd) {
+                for effect in parse_declared_effect(declared, &bindings, &self.exec.cwd) {
                     push_effect(out, effect);
                 }
             }
@@ -525,7 +530,11 @@ impl Evaluator {
     /// Absolutize a literal path string against the session cwd.
     fn plan_abs(&self, s: &str) -> PathBuf {
         let p = PathBuf::from(s);
-        if p.is_absolute() { p } else { self.cwd.join(p) }
+        if p.is_absolute() {
+            p
+        } else {
+            self.exec.cwd.join(p)
+        }
     }
 
     /// The literal path a command argument names, absolutized against cwd, or
@@ -550,7 +559,7 @@ impl Evaluator {
         let base = if base.is_absolute() {
             base
         } else {
-            self.cwd.join(&base)
+            self.exec.cwd.join(&base)
         };
         let candidate = if base.extension().is_some() {
             base
@@ -659,7 +668,7 @@ impl Evaluator {
     fn is_command_operand(&self, e: &Expr) -> bool {
         match e {
             Expr::LangBlock { .. } | Expr::Cmd { .. } => true,
-            Expr::Var { name, .. } => self.env.get(name).is_none(),
+            Expr::Var { name, .. } => self.exec.env.get(name).is_none(),
             _ => false,
         }
     }

@@ -507,7 +507,7 @@ fn resolve_nerd_font(mode: &str) -> bool {
 pub fn build_context(ev: &mut Evaluator, facts: &StaticFacts, width: u16) -> PromptContext {
     let cwd = ev.cwd().to_path_buf();
     let read_only = is_read_only(&cwd);
-    let last_outcome = outcome_from(&ev.it);
+    let last_outcome = outcome_from(ev.it());
     let git = read_git(&cwd);
     let jobs = jobs_snapshot_from(ev);
     let reef = reef_bindings_from(ev);

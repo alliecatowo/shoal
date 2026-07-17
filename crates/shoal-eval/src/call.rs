@@ -23,16 +23,16 @@ impl Evaluator {
     pub(crate) fn call_value(&mut self, f: &Value, args: CallArgs) -> VResult<Value> {
         // Runtime recursion guard (defect #9): unbounded native recursion aborts
         // the process, so cap the interpreter call stack well below that.
-        self.call_depth += 1;
-        if self.call_depth > 10_000 {
-            self.call_depth -= 1;
+        self.exec.call_depth += 1;
+        if self.exec.call_depth > 10_000 {
+            self.exec.call_depth -= 1;
             return Err(ErrorVal::new(
                 "recursion_limit",
                 "recursion limit exceeded (10000 nested calls)",
             ));
         }
         let r = self.call_value_inner(f, args);
-        self.call_depth -= 1;
+        self.exec.call_depth -= 1;
         r
     }
 
@@ -65,8 +65,8 @@ impl Evaluator {
                         format!("unknown argument `{name}`"),
                     ));
                 }
-                let old = self.env.clone();
-                self.env = c.env.child();
+                let old = self.exec.env.clone();
+                self.exec.env = c.env.child();
                 for (i, p) in c.params.iter().enumerate() {
                     let val = args
                         .named
@@ -78,7 +78,7 @@ impl Evaluator {
                         (Some(v), _) => v,
                         (None, Some(d)) => self.eval_expr(d, Position::Value)?,
                         _ => {
-                            self.env = old;
+                            self.exec.env = old;
                             return Err(ErrorVal::new(
                                 "arg_error",
                                 format!("missing argument `{}`", p.name),
@@ -91,24 +91,24 @@ impl Evaluator {
                     let val = match crate::coerce::coerce_list_param(val, p.ty.as_ref()) {
                         Ok(v) => v,
                         Err(e) => {
-                            self.env = old;
+                            self.exec.env = old;
                             return Err(e);
                         }
                     };
-                    self.env.declare(p.name.clone(), val, false);
+                    self.exec.env.declare(p.name.clone(), val, false);
                 }
                 if let Some(rest) = &c.rest {
-                    self.env.declare(
+                    self.exec.env.declare(
                         rest.name.clone(),
                         Value::List(args.pos.iter().skip(c.params.len()).cloned().collect()),
                         false,
                     );
                 }
                 // Track fn-body nesting so `cd`/env writes can be rejected (#10).
-                self.in_fn_body += 1;
+                self.exec.in_fn_body += 1;
                 let out = self.eval_expr(&c.body, Position::Value);
-                self.in_fn_body -= 1;
-                self.env = old;
+                self.exec.in_fn_body -= 1;
+                self.exec.env = old;
                 out
             }
             Value::CmdRef(call) => {
@@ -200,7 +200,7 @@ impl Evaluator {
                 {
                     Ok(Some(Value::Glob(shoal_value::GlobVal {
                         pattern: pattern.clone(),
-                        cwd: self.cwd.clone(),
+                        cwd: self.exec.cwd.clone(),
                         hidden: args
                             .named
                             .iter()

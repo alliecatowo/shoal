@@ -339,7 +339,7 @@ impl Evaluator {
         let abs = if p.is_absolute() {
             p.to_path_buf()
         } else {
-            self.cwd.join(p)
+            self.exec.cwd.join(p)
         };
         let ioerr = |e: std::io::Error| {
             let code = if e.kind() == std::io::ErrorKind::NotFound {
@@ -489,7 +489,7 @@ impl Evaluator {
     fn is_command_expr(&self, e: &Expr) -> bool {
         match e {
             Expr::LangBlock { .. } | Expr::Cmd { .. } => true,
-            Expr::Var { name, .. } => self.env.get(name).is_none(),
+            Expr::Var { name, .. } => self.exec.env.get(name).is_none(),
             _ => false,
         }
     }

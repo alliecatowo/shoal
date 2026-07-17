@@ -103,9 +103,9 @@ fn exit_halts_remaining_statements() {
     ev.eval_program(&parse("let a = 1; exit 4; let b = 2"))
         .unwrap();
     assert_eq!(ev.take_exit(), Some(4));
-    assert!(ev.env.get("a").is_some(), "statement before exit ran");
+    assert!(ev.env().get("a").is_some(), "statement before exit ran");
     assert!(
-        ev.env.get("b").is_none(),
+        ev.env().get("b").is_none(),
         "statement after exit must not run"
     );
 }

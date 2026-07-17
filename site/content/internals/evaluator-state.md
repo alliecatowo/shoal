@@ -98,10 +98,11 @@ dynamic, session-global, host-global, inherited into children, journaled, or res
 field without an explicit rule will eventually behave differently in `spawn`, `source`, module
 loading, and kernel sessions.
 
-**Field grouping (HR-J2 decomposition, steps 2–4).** The rows above still name the individual
-state, but several fields now live in embedded sub-structs rather than flat on `Evaluator` — the
-grouping is behavior-identical, it just makes a child's inheritance rules enforceable by type (see
-[evaluator decomposition](@/internals/evaluator-decomposition.md)):
+**Field grouping (HR-J2 decomposition — complete).** The rows above still name the individual state,
+but `Evaluator` no longer holds them flat: it is now the three-field façade
+`{ host, session, exec }`, and every row above lives inside one of those three embedded sub-structs.
+The grouping is behavior-identical; it just makes a child's inheritance rules enforceable by type
+(see [evaluator decomposition](@/internals/evaluator-decomposition.md)):
 
 - `host: Arc<HostServices>` holds the host-installed service handles — the effect ports (`fs`,
   `exec`, `clock`, `opener`, `secrets`, `config`), the adapter `catalog`, the event `bus`, and the
@@ -114,12 +115,16 @@ grouping is behavior-identical, it just makes a child's inheritance rules enforc
 - `session: SessionCtx` holds `principal`, `session_id`, `leash`, `echo_mode`, `interactive`,
   `journal`, and `sink` (identity, authority, presentation) — accessed as `self.session.<field>`.
   `interactive` is no longer a `pub` field; hosts call `Evaluator::set_interactive`.
-- `reef: ReefState` holds the reef overlay + per-cwd cache — `reef_overrides` → `reef.overrides`,
-  `reef_chain` → `reef.chain`, `reef_lock` → `reef.lock`, `reef_lock_path` → `reef.lock_path` — so
-  a child inherits the whole overlay as one unit.
+- `exec: ExecState` holds the genuinely-mutable per-eval core — `env`, `cwd`, `process_env`,
+  `oldpwd`, `dir_stack`, `cancel`, `call_depth`, `in_fn_body`, `pending_exit`, `it`, the
+  `reef: ReefState` overlay/cache (`reef_overrides` → `exec.reef.overrides`, `reef_chain` →
+  `exec.reef.chain`, `reef_lock` → `exec.reef.lock`, `reef_lock_path` → `exec.reef.lock_path`),
+  `jobs`, `external_jobs`, `pending_stop`, `modules`, `module_stack`, `plans`, `source`,
+  `current_entry`, and `jump_store` — accessed as `self.exec.<field>`. `ChildContext::build` applies
+  the fresh-vs-inherited rules onto `child.exec.<field>` field-by-field.
 
-The remaining flat fields (`env`, `cwd`, `it`, jobs, modules, …) are unchanged pending the later
-`ExecState` extraction step.
+`env` and `it` are no longer `pub` fields; the host reads/writes them through the thin forwarding
+accessors `Evaluator::env`/`env_mut`/`it`/`set_it`.
 
 ## Construction defaults are compatibility behavior
 
@@ -169,9 +174,10 @@ accDescr: Shows the components and relationships described in Program evaluation
 ```
 
 The journal finish call occurs before `result?`, so failed statements are recorded as failures.
-`it` is updated only after a successful ordinary value. The public `it` field and the transcript
-bindings maintained by `record_transcript` are related but not identical: transcript recording is
-a host hook that declares `it` and appends to `out` in the environment.
+`it` is updated only after a successful ordinary value. The `it` value (read via `Evaluator::it`,
+now backed by `exec.it`) and the transcript bindings maintained by `record_transcript` are related
+but not identical: transcript recording is a host hook that declares `it` and appends to `out` in
+the environment.
 
 ## Internal nonlocal flow
 
