@@ -15,7 +15,8 @@ use crate::{ChildKind, Evaluator};
 use shoal_ast::Args;
 use shoal_exec::CancelToken;
 use shoal_value::{
-    CallArgs, CallCtx, ErrorVal, Pull, Record, StreamVal, TaskVal, Upstream, VResult, Value,
+    CallArgs, CallCtx, ErrorVal, Pull, Record, StreamGap, StreamGapReason, StreamVal, TaskVal,
+    Upstream, VResult, Value,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
@@ -36,6 +37,7 @@ const SUBSCRIBER_CAP: usize = 256;
 const CANCEL_POLL: Duration = Duration::from_millis(25);
 
 /// Which buffered events a new subscriber replays before going live.
+#[derive(Clone, Copy)]
 enum Replay {
     /// No replay — future events only (used by `.take`).
     None,
@@ -76,7 +78,7 @@ struct ChannelState {
 
 enum Delivery {
     Event(Value),
-    Overflow(u64),
+    Gap(StreamGap),
 }
 
 #[derive(Default)]
@@ -95,6 +97,16 @@ struct SubscriberQueue {
 struct Subscriber(Arc<SubscriberQueue>);
 
 impl Subscriber {
+    fn push_gap(&self, gap: StreamGap) -> bool {
+        let mut state = self.0.state.lock().unwrap();
+        if state.closed {
+            return false;
+        }
+        state.items.push_back(Delivery::Gap(gap));
+        self.0.ready.notify_one();
+        true
+    }
+
     fn push(&self, event: Value) -> bool {
         let mut state = self.0.state.lock().unwrap();
         if state.closed {
@@ -105,15 +117,21 @@ impl Subscriber {
             // Reserve two tail slots: one exact gap marker and the newest
             // event. If an older marker is evicted, carry its count forward so
             // loss is never silently forgotten.
-            let mut dropped = 0u64;
+            let mut gap = StreamGap::new(StreamGapReason::SubscriberOverflow, 0);
             while state.items.len() > SUBSCRIBER_CAP.saturating_sub(2) {
                 match state.items.pop_front() {
-                    Some(Delivery::Event(_)) => dropped += 1,
-                    Some(Delivery::Overflow(n)) => dropped += n,
+                    Some(Delivery::Event(event)) => {
+                        let mut dropped = StreamGap::new(StreamGapReason::SubscriberOverflow, 1);
+                        if let Some(seq) = event_seq(&event) {
+                            dropped = dropped.with_seq_range(seq, seq);
+                        }
+                        gap.absorb(dropped);
+                    }
+                    Some(Delivery::Gap(dropped)) => gap.absorb(dropped),
                     None => break,
                 }
             }
-            state.items.push_back(Delivery::Overflow(dropped));
+            state.items.push_back(Delivery::Gap(gap));
         }
         state.items.push_back(Delivery::Event(event));
         self.0.ready.notify_one();
@@ -123,7 +141,7 @@ impl Subscriber {
 
 enum Received {
     Event(Value),
-    Overflow(u64),
+    Gap(StreamGap),
     Timeout,
     Closed,
     Cancelled,
@@ -150,7 +168,7 @@ impl EventReceiver {
             if let Some(item) = state.items.pop_front() {
                 return match item {
                     Delivery::Event(v) => Received::Event(v),
-                    Delivery::Overflow(n) => Received::Overflow(n),
+                    Delivery::Gap(gap) => Received::Gap(gap),
                 };
             }
             if state.closed {
@@ -204,7 +222,7 @@ impl Upstream for EventUpstream {
     ) -> VResult<Pull> {
         Ok(match self.rx.recv(timeout, None) {
             Received::Event(v) => Pull::Item(v),
-            Received::Overflow(n) => Pull::Item(overflow_record(&self.channel, n)),
+            Received::Gap(gap) => Pull::Item(overflow_record(&self.channel, gap)),
             Received::Timeout => Pull::Timeout,
             Received::Closed | Received::Cancelled => Pull::End,
         })
@@ -315,6 +333,16 @@ impl EventBus {
         let sub = Subscriber(queue.clone());
         let mut map = self.channels.lock().unwrap();
         let st = map.entry(name.to_string()).or_default();
+        if let Replay::Since(since) = replay {
+            let expected = since.saturating_add(1);
+            let first_retained = st.ring.front().map_or(st.next_seq, |event| event.seq);
+            if first_retained > expected {
+                let gap =
+                    StreamGap::new(StreamGapReason::HistoryEvicted, first_retained - expected)
+                        .with_seq_range(expected, first_retained - 1);
+                let _ = sub.push_gap(gap);
+            }
+        }
         for s in &st.ring {
             if replay.wants(s.seq) {
                 let _ = sub.push(event_record(name, s.seq, s.ts_ns, &s.payload));
@@ -346,7 +374,7 @@ impl EventBus {
                 Received::Event(event) => return Ok(payload_of(&event)),
                 // `.take` promises a payload rather than a delivery-status
                 // record. Skip the marker and return the oldest retained event.
-                Received::Overflow(_) => continue,
+                Received::Gap(_) => continue,
                 Received::Timeout => {
                     return Err(ErrorVal::new(
                         "timeout",
@@ -384,14 +412,13 @@ fn event_record(name: &str, seq: u64, ts_ns: i128, payload: &Value) -> Value {
 /// In-band indication that this subscriber fell behind. The normal event keys
 /// remain present for shape compatibility; `seq: null` means this is not a
 /// published event, while `overflow` and `dropped` describe the local gap.
-fn overflow_record(name: &str, dropped: u64) -> Value {
-    let mut r = Record::new();
+fn overflow_record(name: &str, gap: StreamGap) -> Value {
+    let mut r = gap.into_record();
     r.insert("channel".into(), Value::Str(name.to_string()));
     r.insert("seq".into(), Value::Null);
     r.insert("ts".into(), datetime_from_ns(now_ns()));
     r.insert("payload".into(), Value::Null);
     r.insert("overflow".into(), Value::Bool(true));
-    r.insert("dropped".into(), Value::Int(dropped as i64));
     Value::Record(r)
 }
 
@@ -399,6 +426,16 @@ fn payload_of(event: &Value) -> Value {
     match event {
         Value::Record(r) => r.get("payload").cloned().unwrap_or(Value::Null),
         other => other.clone(),
+    }
+}
+
+fn event_seq(event: &Value) -> Option<u64> {
+    let Value::Record(record) = event else {
+        return None;
+    };
+    match record.get("seq") {
+        Some(Value::Int(seq)) if *seq >= 0 => Some(*seq as u64),
+        _ => None,
     }
 }
 
@@ -568,7 +605,7 @@ impl Evaluator {
             let result = loop {
                 let event = match rx.recv(None, Some(&child_cancel)) {
                     Received::Event(event) => event,
-                    Received::Overflow(n) => overflow_record(&chan, n),
+                    Received::Gap(gap) => overflow_record(&chan, gap),
                     Received::Timeout => continue,
                     Received::Closed | Received::Cancelled => break Ok(Value::Null),
                 };
@@ -612,7 +649,7 @@ mod tests {
         loop {
             match rx.recv(Some(Duration::ZERO), None) {
                 Received::Event(_) => retained += 1,
-                Received::Overflow(n) => dropped += n as usize,
+                Received::Gap(gap) => dropped += gap.dropped as usize,
                 Received::Timeout => break,
                 Received::Closed | Received::Cancelled => panic!("subscription ended early"),
             }
@@ -651,5 +688,42 @@ mod tests {
         let cancel = CancelToken::new();
         cancel.cancel();
         assert!(matches!(rx.recv(None, Some(&cancel)), Received::Cancelled));
+    }
+
+    #[test]
+    fn stale_cursor_reports_exact_history_and_queue_gaps() {
+        let bus = EventBus::default();
+        let published = RING_CAP + 10;
+        for i in 0..published {
+            bus.emit("history", Value::Int(i as i64));
+        }
+        let rx = bus.events("history", Some(0));
+        let mut retained = 0usize;
+        let mut dropped = 0usize;
+        let mut typed = false;
+        loop {
+            match rx.recv(Some(Duration::ZERO), None) {
+                Received::Event(_) => retained += 1,
+                Received::Gap(gap) => {
+                    dropped += gap.dropped as usize;
+                    let marker = overflow_record("history", gap);
+                    let Value::Record(record) = marker else {
+                        unreachable!()
+                    };
+                    typed |= record.get("marker") == Some(&Value::Str("stream_gap".into()))
+                        && record.get("reason").is_some()
+                        && record.get("from_seq").is_some()
+                        && record.get("to_seq").is_some();
+                }
+                Received::Timeout => break,
+                Received::Closed | Received::Cancelled => panic!("subscription ended early"),
+            }
+        }
+        assert!(typed, "every gap uses the stable discriminated shape");
+        assert_eq!(
+            retained + dropped,
+            published - 1,
+            "every event newer than the cursor is retained or accounted for"
+        );
     }
 }

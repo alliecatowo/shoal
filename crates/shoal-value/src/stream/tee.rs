@@ -15,8 +15,7 @@
 //! materializes the stream once and gives each fork the full list (see
 //! `methods/stream.rs`), which preserves exact whole-stream replay.
 
-use super::{CallCtx, Pull, Upstream, VResult, Value};
-use crate::Record;
+use super::{CallCtx, Pull, StreamGap, StreamGapReason, Upstream, VResult, Value};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -63,9 +62,7 @@ impl ForkQueue {
 
 /// The site/content/internals/streams-channels.md overflow marker element: `{dropped: n}`.
 fn dropped_marker(n: u64) -> Value {
-    let mut r = Record::new();
-    r.insert("dropped".into(), Value::Int(n.min(i64::MAX as u64) as i64));
-    Value::Record(r)
+    StreamGap::new(StreamGapReason::TeeOverflow, n).into_value()
 }
 
 struct TeeShared {

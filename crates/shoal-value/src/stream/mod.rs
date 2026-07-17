@@ -46,6 +46,104 @@ pub enum Pull {
     Timeout,
 }
 
+/// Machine-readable reason carried by every stream loss marker. The runtime
+/// still represents markers as ordinary records at the language boundary, but
+/// producers construct them through this closed enum so spellings and fields
+/// cannot drift independently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamGapReason {
+    SubscriberOverflow,
+    HistoryEvicted,
+    MixedOverflow,
+    TeeOverflow,
+    TailOverflow,
+    WatchOverflow,
+}
+
+impl StreamGapReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SubscriberOverflow => "subscriber_overflow",
+            Self::HistoryEvicted => "history_evicted",
+            Self::MixedOverflow => "mixed_overflow",
+            Self::TeeOverflow => "tee_overflow",
+            Self::TailOverflow => "tail_overflow",
+            Self::WatchOverflow => "watch_overflow",
+        }
+    }
+}
+
+/// Typed internal representation of an in-band stream gap. `from_seq` and
+/// `to_seq` are populated for sequenced channel events and remain `null` for
+/// sources such as `tail` and `.tee` that have no public sequence space.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamGap {
+    pub reason: StreamGapReason,
+    pub dropped: u64,
+    pub from_seq: Option<u64>,
+    pub to_seq: Option<u64>,
+}
+
+impl StreamGap {
+    pub fn new(reason: StreamGapReason, dropped: u64) -> Self {
+        Self {
+            reason,
+            dropped,
+            from_seq: None,
+            to_seq: None,
+        }
+    }
+
+    pub fn with_seq_range(mut self, from_seq: u64, to_seq: u64) -> Self {
+        self.from_seq = Some(from_seq);
+        self.to_seq = Some(to_seq);
+        self
+    }
+
+    /// Merge an older gap into this one while retaining an exact loss count and
+    /// the widest known sequence range.
+    pub fn absorb(&mut self, other: StreamGap) {
+        if self.reason != other.reason {
+            self.reason = StreamGapReason::MixedOverflow;
+        }
+        self.dropped = self.dropped.saturating_add(other.dropped);
+        self.from_seq = match (self.from_seq, other.from_seq) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        self.to_seq = match (self.to_seq, other.to_seq) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+    }
+
+    /// Stable discriminated record shape exposed to Shoal code.
+    pub fn into_record(self) -> Record {
+        let mut r = Record::new();
+        r.insert("marker".into(), Value::Str("stream_gap".into()));
+        r.insert("reason".into(), Value::Str(self.reason.as_str().into()));
+        r.insert(
+            "dropped".into(),
+            Value::Int(self.dropped.min(i64::MAX as u64) as i64),
+        );
+        r.insert(
+            "from_seq".into(),
+            self.from_seq
+                .map_or(Value::Null, |n| Value::Int(n.min(i64::MAX as u64) as i64)),
+        );
+        r.insert(
+            "to_seq".into(),
+            self.to_seq
+                .map_or(Value::Null, |n| Value::Int(n.min(i64::MAX as u64) as i64)),
+        );
+        r
+    }
+
+    pub fn into_value(self) -> Value {
+        Value::Record(self.into_record())
+    }
+}
+
 /// A pull-based source or combinator stage. Closure-bearing stages receive the
 /// evaluator through `ctx` at pull time.
 pub trait Upstream: Send {
@@ -496,5 +594,24 @@ mod tests {
         let s = endless_marked(1);
         drain(&s);
         assert_eq!(s.tee(2).unwrap_err().code, "stream_consumed");
+    }
+
+    #[test]
+    fn stream_gap_has_a_stable_discriminator_and_merges_ranges() {
+        let mut gap = StreamGap::new(StreamGapReason::HistoryEvicted, 3).with_seq_range(4, 6);
+        gap.absorb(StreamGap::new(StreamGapReason::SubscriberOverflow, 2).with_seq_range(7, 8));
+        assert_eq!(gap.reason, StreamGapReason::MixedOverflow);
+        assert_eq!(gap.dropped, 5);
+        assert_eq!(gap.from_seq, Some(4));
+        assert_eq!(gap.to_seq, Some(8));
+        let record = gap.into_record();
+        assert_eq!(record.get("marker"), Some(&Value::Str("stream_gap".into())));
+        assert_eq!(
+            record.get("reason"),
+            Some(&Value::Str("mixed_overflow".into()))
+        );
+        assert_eq!(record.get("dropped"), Some(&Value::Int(5)));
+        assert_eq!(record.get("from_seq"), Some(&Value::Int(4)));
+        assert_eq!(record.get("to_seq"), Some(&Value::Int(8)));
     }
 }

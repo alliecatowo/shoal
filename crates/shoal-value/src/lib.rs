@@ -46,7 +46,9 @@ pub use env::{AssignError, Binding, Env};
 pub use json::{json_to_value, value_to_json};
 pub use methods::{method_names, methods_for};
 pub use outcome::OutcomeVal;
-pub use stream::{Pull, StreamVal, Upstream, collect_stream, drive_stream};
+pub use stream::{
+    Pull, StreamGap, StreamGapReason, StreamVal, Upstream, collect_stream, drive_stream,
+};
 pub use task::{TaskShared, TaskVal};
 pub use value_types::{
     CasBytesVal, ClosureVal, GlobVal, RangeVal, RegexVal, SecretVal, TimeVal, parse_duration,

@@ -25,7 +25,9 @@
 use crate::{ChildKind, Evaluator};
 use notify::{EventKind, RecursiveMode, Watcher};
 use shoal_exec::CancelToken;
-use shoal_value::{ErrorVal, Fs, Pull, Record, StreamVal, VResult, Value};
+use shoal_value::{
+    ErrorVal, Fs, Pull, Record, StreamGap, StreamGapReason, StreamVal, VResult, Value,
+};
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -156,7 +158,7 @@ impl Evaluator {
             }
             // Coalesce state: `true` when at least one event was dropped on a
             // full buffer and the consumer is owed the documented coalescing summary event.
-            let mut coalesce_owed = false;
+            let mut coalesce_owed = 0u64;
             for res in raw_rx {
                 let event = match res {
                     Ok(ev) => ev,
@@ -467,9 +469,7 @@ fn send_line_bounded(tx: &SyncSender<VResult<Value>>, dropped: &mut u64, line: S
 /// `.where(x => x.dropped == null)` to keep only real lines), mirroring how
 /// `watch` surfaces overflow as a `coalesced: true` event.
 fn dropped_marker(n: u64) -> Value {
-    let mut r = Record::new();
-    r.insert("dropped".into(), Value::Int(n as i64));
-    Value::Record(r)
+    StreamGap::new(StreamGapReason::TailOverflow, n).into_value()
 }
 
 /// Forward a `watch` event into the bounded consumer buffer (site/content/internals/streams-channels.md). On a full
@@ -478,21 +478,24 @@ fn dropped_marker(n: u64) -> Value {
 /// room appears. Returns `false` only when the consumer is gone.
 fn send_coalescing(
     tx: &SyncSender<VResult<Value>>,
-    owed: &mut bool,
+    owed: &mut u64,
     root: &Path,
     event: Value,
 ) -> bool {
-    if *owed {
-        match tx.try_send(Ok(coalesced_event(root))) {
-            Ok(()) => *owed = false,
-            Err(TrySendError::Full(_)) => return true, // still full — keep the debt, drop this event
+    if *owed > 0 {
+        match tx.try_send(Ok(coalesced_event(root, *owed))) {
+            Ok(()) => *owed = 0,
+            Err(TrySendError::Full(_)) => {
+                *owed = (*owed).saturating_add(1);
+                return true;
+            }
             Err(TrySendError::Disconnected(_)) => return false,
         }
     }
     match tx.try_send(Ok(event)) {
         Ok(()) => true,
         Err(TrySendError::Full(_)) => {
-            *owed = true;
+            *owed = (*owed).saturating_add(1);
             true
         }
         Err(TrySendError::Disconnected(_)) => false,
@@ -500,8 +503,8 @@ fn send_coalescing(
 }
 
 /// The `coalesced: true` summary event (site/content/internals/streams-channels.md) owed after a `watch` overflow.
-fn coalesced_event(root: &Path) -> Value {
-    let mut r = Record::new();
+fn coalesced_event(root: &Path, dropped: u64) -> Value {
+    let mut r = StreamGap::new(StreamGapReason::WatchOverflow, dropped).into_record();
     r.insert("path".into(), Value::Path(root.to_path_buf()));
     r.insert("kind".into(), Value::Str("modified".into()));
     r.insert("ts".into(), now_datetime());
