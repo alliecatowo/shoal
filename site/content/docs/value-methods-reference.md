@@ -668,7 +668,7 @@ A stream is single-consumer. Calling a lazy combinator moves its source into a n
 | `map` | `(item => value)` | transformed item |
 | `where`, `filter` | `(item => bool)` | selected original item |
 | `scan` | `(initial, (acc,item)=>acc)` | each new accumulator |
-| `flat_map` | `(item => collection|stream-compatible)` | flattened values |
+| `flat_map` | `(item => collection|stream-compatible)` | each returned shape drained sequentially |
 | `take` | `(n)` | first n, then end; makes bounded |
 | `take_until` | `(predicate|other_stream)` | until predicate/other stream |
 | `dedupe` | `()` | remove adjacent duplicates |
@@ -676,10 +676,10 @@ A stream is single-consumer. Calling a lazy combinator moves its source into a n
 | `debounce` | `(duration)` | quiet-period emission |
 | `throttle` | `(duration)` | rate-limited emission |
 | `window` | `(positive_count|duration)` | list windows |
-| `buffer` | `(capacity = 1)` | identity stage today; no queue or pacing effect |
+| `buffer` | `(capacity = 1)` | eager lossless queue; `0` is a rendezvous |
 | `enumerate` | `()` | `[index,item]` |
-| `merge` | `(stream)` | interleaved streams |
-| `zip` | `(stream)` | paired `[left,right]` until one ends |
+| `merge` | `(stream)` | fair interleave; round-robin while both are ready |
+| `zip` | `(stream)` | positional pairs, at most one pending item per side |
 
 ```shoal
 every(1s)
@@ -704,15 +704,20 @@ Durations must be non-negative. Window count must be positive. `merge`/`zip` req
 
 Stream `save` and `append` both open the file in append mode today; neither truncates. Strings/bytes become their bytes plus newline; other items become compact JSON plus newline.
 
-Like value save, stream file sinks call the platform filesystem directly rather than the evaluator `Fs`/Leash policy path. They are not a policy-safe logging primitive in the current preview.
+Like value save, stream file sinks resolve relative paths against the evaluator cwd and open once
+through the injected `Fs` port. A recording or denying adapter can therefore observe or refuse the
+write, though these sinks still bypass journal undo and the production default remains `StdFs`.
 
 For a bounded stream, unfamiliar eager methods such as `.sort()`, `.sum()`, or `.len()` first collect the entire stream and then dispatch to collection logic. For a live/unbounded stream this raises `stream_unbounded`; bound it explicitly with `.take(n)` or `.take_until(...)`.
 
-`.feed(command)` on a stream is not implemented. It returns a type error suggesting bounded collection; there is no incremental child-stdin bridge yet.
+`.feed(command)` incrementally pumps a finite or live stream into captured child stdin. Ordinary
+values are line-framed; bytes and outcome output remain raw. The bounded stdin path holds 16 chunks
+of at most 64 KiB, applies lossless backpressure, and stops on cancellation, child exit, closed
+stdin, or a serialization/upstream error. Buffer and feed pumps share a maximum of 64 active pumps.
 
 ### Live `tee`
 
-Bounded streams materialize once and create independent replay streams. A live stream uses one shared upstream with a queue capped at 64 items for each fork. If a fork is not driven and its queue fills, later values for that fork are dropped and counted. The fork subsequently receives an in-order `{dropped: n}` marker once space is available or the queue drains; overflow does not raise. All forks still obey single-consumer semantics.
+Bounded streams materialize once and create independent replay streams. A live stream uses one shared upstream with a queue capped at 64 items for each fork. If a fork is not driven and its queue fills, later values for that fork are dropped and counted. The fork subsequently receives an in-order `{marker: "stream_gap", reason: "tee_overflow", dropped: n, from_seq: null, to_seq: null}` record once space is available or the queue drains; overflow does not raise. All forks still obey single-consumer semantics.
 
 ## Channel handle methods
 
@@ -725,7 +730,10 @@ Bounded streams materialize once and create independent replay streams. A live s
 | `latest` | `()` | latest payload or null |
 | `take` | `(timeout: duration?)` | next future payload |
 
-Event stream items are `{channel, seq, ts, payload}`. `.events()` replays the ring; `.take()` subscribes only to future events. Channel specifics are in [Streams and channels](@/docs/streams-channels.md).
+Event stream items are `{channel, seq, ts, payload}`. Each subscriber holds at most 256 deliveries;
+overflow and stale cursors yield explicit `stream_gap` records with dropped counts and sequence
+ranges. `.events()` queues retained ring entries before going live; `.take()` subscribes only to
+future events. Channel specifics are in [Streams and channels](@/docs/streams-channels.md).
 
 ## Closure, command, and secret values
 
@@ -748,7 +756,7 @@ Generic `.save()`/`.json()` on a secret writes only the redacted/tagged represen
 | other `list`, `record`, `table` | compact JSON |
 | `outcome` | encoded structured `.out`; raw stdout for ordinary text |
 | `path` | rejected: name is not content |
-| `stream` | rejected: incremental feed not implemented |
+| `stream` | incrementally serialized items; ordinary values line-framed, bytes/outcomes raw |
 | `secret` | `feed_error` |
 | `task`, `closure`, `error`, `glob`, `regex` | `feed_error` |
 | `null`, `command`, other unsupported | `type_error` |
