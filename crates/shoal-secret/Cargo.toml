@@ -7,6 +7,9 @@ edition="2024"
 workspace = true
 
 [dependencies]
+# Keep the direct feature edge: it makes the AES expanded key schedule
+# zeroizable through Cargo feature unification, even though construction is
+# reached through `aes-gcm` below.
 aes = { version = "0.9", features = ["zeroize"] }
 aes-gcm = { version = "0.11", features = ["zeroize"] }
 fd-lock = "4"
