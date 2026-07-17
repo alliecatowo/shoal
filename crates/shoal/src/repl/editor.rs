@@ -65,6 +65,15 @@ impl FilteredHistory {
         }
         self.ignore.iter().any(|pattern| glob_match(pattern, line))
     }
+
+    fn refresh_last_recorded(&mut self) {
+        self.last_recorded = self
+            .inner
+            .search(SearchQuery::everything(SearchDirection::Backward, None))
+            .ok()
+            .and_then(|rows| rows.into_iter().next())
+            .map(|item| item.command_line);
+    }
 }
 
 impl History for FilteredHistory {
@@ -72,8 +81,10 @@ impl History for FilteredHistory {
         if self.should_skip(&item.command_line) {
             return Ok(item);
         }
-        self.last_recorded = Some(item.command_line.clone());
-        self.inner.save(item)
+        let command_line = item.command_line.clone();
+        let saved = self.inner.save(item)?;
+        self.last_recorded = Some(command_line);
+        Ok(saved)
     }
 
     fn load(&self, id: HistoryItemId) -> reedline::Result<HistoryItem> {
@@ -93,15 +104,21 @@ impl History for FilteredHistory {
         id: HistoryItemId,
         updater: &dyn Fn(HistoryItem) -> HistoryItem,
     ) -> reedline::Result<()> {
-        self.inner.update(id, updater)
+        self.inner.update(id, updater)?;
+        self.refresh_last_recorded();
+        Ok(())
     }
 
     fn clear(&mut self) -> reedline::Result<()> {
-        self.inner.clear()
+        self.inner.clear()?;
+        self.last_recorded = None;
+        Ok(())
     }
 
     fn delete(&mut self, id: HistoryItemId) -> reedline::Result<()> {
-        self.inner.delete(id)
+        self.inner.delete(id)?;
+        self.refresh_last_recorded();
+        Ok(())
     }
 
     fn sync(&mut self) -> io::Result<()> {

@@ -1253,6 +1253,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn filtered_history_clear_resets_dedup_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = FileBackedHistory::with_file(100, dir.path().join("hist")).unwrap();
+        let mut history = FilteredHistory::new(Box::new(inner), true, Vec::new());
+        history
+            .save(HistoryItem::from_command_line("kept-after-clear"))
+            .unwrap();
+        history.clear().unwrap();
+        history
+            .save(HistoryItem::from_command_line("kept-after-clear"))
+            .unwrap();
+
+        let all = history
+            .search(SearchQuery::everything(SearchDirection::Forward, None))
+            .unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].command_line, "kept-after-clear");
+    }
+
     /// `history.ignore` (site/content/internals/configuration-reference.md, `HISTIGNORE`-equivalent): a line
     /// matching any pattern is never recorded.
     #[test]
