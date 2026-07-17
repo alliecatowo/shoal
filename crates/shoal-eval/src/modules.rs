@@ -103,11 +103,7 @@ impl Evaluator {
             )
             .with_hint("reuse a cached module or start a new evaluator session"));
         }
-        let src = self
-            .host
-            .fs
-            .read_to_string(canon)
-            .map_err(|e| ErrorVal::new("io_error", format!("cannot read module: {e}")))?;
+        let src = self.read_shoal_source(canon, "module")?;
         let program =
             shoal_syntax::parse(&src).map_err(|e| ErrorVal::new("parse_error", e.to_string()))?;
 
@@ -269,6 +265,32 @@ export let answer = 1"#,
         assert_eq!(bound.get("answer"), Some(&Value::Int(42)));
         assert!(!dir.path().join("module-side-effect").exists());
         assert_eq!(evaluator.exec.modules.cache.len(), MAX_CACHED_MODULES);
+    }
+
+    #[test]
+    fn oversized_sparse_module_fails_before_cache_admission_and_can_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let module = dir.path().join("large.shl");
+        let file = std::fs::File::create(&module).unwrap();
+        file.set_len((shoal_syntax::MAX_SOURCE_BYTES + 1) as u64)
+            .unwrap();
+        let mut evaluator = Evaluator::new(dir.path().to_path_buf());
+
+        let error = evaluator.eval_use("./large", Span::default()).unwrap_err();
+        assert_eq!(error.code, "source_too_large");
+        assert!(error.msg.contains(&module.display().to_string()));
+        assert!(evaluator.exec.modules.cache.is_empty());
+        assert!(evaluator.exec.modules.stack.is_empty());
+
+        std::fs::write(&module, "export let answer = 42\n").unwrap();
+        evaluator
+            .eval_use("./large", Span::default())
+            .expect("a corrected module must remain loadable in the same session");
+        assert_eq!(evaluator.exec.modules.cache.len(), 1);
+        let Value::Record(exports) = evaluator.exec.shell.env.get("large").unwrap() else {
+            panic!("module binding must be a record");
+        };
+        assert_eq!(exports.get("answer"), Some(&Value::Int(42)));
     }
 
     #[test]

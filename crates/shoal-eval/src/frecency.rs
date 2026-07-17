@@ -1090,7 +1090,9 @@ notanumber\t100\t/bad/rank
         #[derive(Clone, Copy)]
         struct ExpectedLine {
             file: &'static str,
-            line: usize,
+            /// `None` intentionally keys the exception by its exact semantic
+            /// token instead of a formatting-sensitive source line.
+            line: Option<usize>,
             text: &'static str,
         }
 
@@ -1102,47 +1104,47 @@ notanumber\t100\t/bad/rank
         const MEDIATED_METADATA_CLASSIFICATION: &[ExpectedLine] = &[
             ExpectedLine {
                 file: "builtins.rs",
-                line: 179,
+                line: Some(179),
                 text: "if m.is_dir() {",
             },
             ExpectedLine {
                 file: "builtins.rs",
-                line: 183,
+                line: Some(183),
                 text: "} else if m.is_file() {",
             },
             ExpectedLine {
                 file: "builtins.rs",
-                line: 315,
+                line: Some(315),
                 text: "if m.is_dir() {",
             },
             ExpectedLine {
                 file: "builtins.rs",
-                line: 372,
+                line: Some(372),
                 text: "if meta.is_dir() {",
             },
             ExpectedLine {
                 file: "builtins.rs",
-                line: 506,
+                line: Some(506),
                 text: "if !metadata.is_dir() || metadata.uid() != effective_uid || metadata.mode() & 0o077 != 0 {",
             },
             ExpectedLine {
                 file: "builtins.rs",
-                line: 520,
+                line: Some(520),
                 text: "if fs.symlink_metadata(path)?.is_dir() {",
             },
             ExpectedLine {
                 file: "builtins.rs",
-                line: 567,
+                line: Some(567),
                 text: "if !metadata.is_dir()",
             },
             ExpectedLine {
                 file: "expr_access.rs",
-                line: 415,
+                line: Some(415),
                 text: ".map(|m| m.is_dir())",
             },
             ExpectedLine {
                 file: "expr_access.rs",
-                line: 422,
+                line: Some(422),
                 text: ".map(|m| m.is_file())",
             },
         ];
@@ -1154,22 +1156,22 @@ notanumber\t100\t/bad/rank
         const AMBIENT_ALLOWLIST: &[ExpectedLine] = &[
             ExpectedLine {
                 file: "frecency.rs",
-                line: 322,
+                line: Some(322),
                 text: "let Ok(reader) = StdFs.open_read(path) else {",
             },
             ExpectedLine {
                 file: "frecency.rs",
-                line: 349,
+                line: Some(349),
                 text: "StdFs.create_dir_all(parent)?;",
             },
             ExpectedLine {
                 file: "frecency.rs",
-                line: 353,
+                line: Some(353),
                 text: "StdFs.atomic_replace(path, output.as_bytes())",
             },
             ExpectedLine {
                 file: "script.rs",
-                line: 367,
+                line: None,
                 text: "std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))?;",
             },
         ];
@@ -1191,9 +1193,11 @@ notanumber\t100\t/bad/rank
             line: usize,
             text: &str,
         ) -> Option<usize> {
-            expected
-                .iter()
-                .position(|item| item.file == file && item.line == line && item.text == text.trim())
+            expected.iter().position(|item| {
+                item.file == file
+                    && item.line.is_none_or(|expected| expected == line)
+                    && item.text == text.trim()
+            })
         }
 
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");

@@ -30,6 +30,7 @@ mod reef_state;
 mod resolution;
 mod script;
 mod session_ctx;
+mod source;
 mod stmt;
 mod streams;
 mod wasm;

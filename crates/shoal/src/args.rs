@@ -141,10 +141,7 @@ fn no_trailing(mut iter: impl Iterator<Item = OsString>, action: Action) -> Resu
 
 pub(crate) fn fmt_command(check: bool, files: Vec<PathBuf>) -> Result<i32, String> {
     if files.is_empty() {
-        let mut src = String::new();
-        io::stdin()
-            .read_to_string(&mut src)
-            .map_err(|e| format!("cannot read stdin: {e}"))?;
+        let src = read_source_stream(io::stdin().lock(), "stdin")?;
         let ast = parse(&src).map_err(|e| format!("stdin: {e}"))?;
         let formatted = shoal_syntax::format_program(&ast);
         if check {
@@ -155,8 +152,7 @@ pub(crate) fn fmt_command(check: bool, files: Vec<PathBuf>) -> Result<i32, Strin
     }
     let mut changed = false;
     for path in files {
-        let src = fs::read_to_string(&path)
-            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        let src = read_source_path(&path)?;
         let ast = parse(&src).map_err(|e| format!("{}: {e}", path.display()))?;
         let formatted = shoal_syntax::format_program(&ast);
         if formatted != src {
@@ -168,6 +164,36 @@ pub(crate) fn fmt_command(check: bool, files: Vec<PathBuf>) -> Result<i32, Strin
     }
     Ok(if check && changed { 1 } else { 0 })
 }
+
+pub(crate) fn read_source_path(path: &Path) -> Result<String, String> {
+    let metadata =
+        fs::metadata(path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "cannot read {}: source is not a regular file",
+            path.display()
+        ));
+    }
+    let file =
+        fs::File::open(path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    read_source_stream(file, &path.display().to_string())
+}
+
+pub(crate) fn read_source_stream(reader: impl Read, label: &str) -> Result<String, String> {
+    let max_bytes = shoal_syntax::MAX_SOURCE_BYTES;
+    let mut bytes = Vec::with_capacity(8 * 1024);
+    reader
+        .take((max_bytes + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read {label}: {error}"))?;
+    if bytes.len() > max_bytes {
+        return Err(format!(
+            "{label}: source exceeds the {max_bytes}-byte limit"
+        ));
+    }
+    String::from_utf8(bytes).map_err(|_| format!("{label}: source is not valid UTF-8"))
+}
+
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let name = path
@@ -215,6 +241,17 @@ pub(crate) fn completion_script(shell: &str) -> Result<&'static str, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct GrowingReader(usize);
+
+    impl Read for GrowingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let count = self.0.min(buffer.len());
+            buffer[..count].fill(b'x');
+            self.0 -= count;
+            Ok(count)
+        }
+    }
 
     #[test]
     fn argument_modes_are_deterministic() {
@@ -267,5 +304,38 @@ mod tests {
         assert_eq!(fmt_command(true, vec![path.clone()]).unwrap(), 1);
         assert_eq!(fmt_command(false, vec![path.clone()]).unwrap(), 0);
         assert_eq!(fmt_command(true, vec![path]).unwrap(), 0);
+    }
+
+    #[test]
+    fn cli_source_read_is_bounded_utf8_and_path_aware() {
+        let error = read_source_stream(GrowingReader(shoal_syntax::MAX_SOURCE_BYTES * 4), "stdin")
+            .unwrap_err();
+        assert!(error.contains("stdin"));
+        assert!(error.contains("exceeds"));
+
+        let error = read_source_stream(io::Cursor::new(vec![0xff]), "stdin").unwrap_err();
+        assert!(error.contains("not valid UTF-8"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sparse.shl");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len((shoal_syntax::MAX_SOURCE_BYTES + 1) as u64)
+            .unwrap();
+        let error = read_source_path(&path).unwrap_err();
+        assert!(error.contains(&path.display().to_string()));
+        assert!(error.contains("exceeds"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_source_path_preserves_symlink_to_regular_file() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.shl");
+        let link = dir.path().join("link.shl");
+        fs::write(&target, "42\n").unwrap();
+        symlink(&target, &link).unwrap();
+        assert_eq!(read_source_path(&link).unwrap(), "42\n");
     }
 }

@@ -175,10 +175,7 @@ impl Evaluator {
     ) -> VResult<Value> {
         match ext {
             Some("shl") | None => {
-                let src =
-                    self.host.fs.read_to_string(path).map_err(|e| {
-                        ErrorVal::new("io_error", format!("cannot read script: {e}"))
-                    })?;
+                let src = self.read_shoal_source(path, "script")?;
                 let program = shoal_syntax::parse(&src)
                     .map_err(|e| ErrorVal::new("parse_error", e.to_string()))?;
                 // A `.shl` script is a separate program (see
@@ -263,8 +260,7 @@ impl Evaluator {
     /// prefix. `#!/usr/bin/env <tool>` resolves to `<tool>` (env-style). `None`
     /// when the file is unreadable or has no shebang.
     pub(crate) fn shebang_argv(&self, path: &Path) -> Option<Vec<OsString>> {
-        let content = self.host.fs.read_to_string(path).ok()?;
-        let first = content.lines().next()?;
+        let first = self.read_shebang_line(path)?;
         let rest = first.strip_prefix("#!")?.trim();
         let mut words = rest.split_whitespace();
         let interp = words.next()?;
@@ -372,6 +368,45 @@ fn rust_script_artifact_in(parent: &Path) -> std::io::Result<(tempfile::TempDir,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_shoal_script_is_typed_and_a_corrected_retry_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("large.shl");
+        let file = std::fs::File::create(&script).unwrap();
+        file.set_len((shoal_syntax::MAX_SOURCE_BYTES + 1) as u64)
+            .unwrap();
+        let mut evaluator = Evaluator::new(dir.path().to_path_buf());
+
+        let error = evaluator
+            .run_script_file(&script, Some("shl"), Vec::new(), Position::Value)
+            .unwrap_err();
+        assert_eq!(error.code, "source_too_large");
+        assert!(error.msg.contains(&script.display().to_string()));
+
+        std::fs::write(&script, "42\n").unwrap();
+        assert_eq!(
+            evaluator
+                .run_script_file(&script, Some("shl"), Vec::new(), Position::Value)
+                .unwrap(),
+            Value::Int(42)
+        );
+    }
+
+    #[test]
+    fn shebang_reads_only_a_bounded_utf8_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("binary-body");
+        std::fs::write(&script, b"#!/usr/bin/env python\n\xff\xfe").unwrap();
+        let evaluator = Evaluator::new(dir.path().to_path_buf());
+        assert_eq!(
+            evaluator.shebang_argv(&script),
+            Some(vec![OsString::from("python")])
+        );
+
+        std::fs::write(&script, format!("#!{}", "x".repeat(9 * 1024))).unwrap();
+        assert_eq!(evaluator.shebang_argv(&script), None);
+    }
     use crate::host_services::NativeWorkerBudget;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

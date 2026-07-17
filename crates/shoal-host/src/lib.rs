@@ -125,12 +125,8 @@ impl SessionBootstrap {
     /// surface-specific journal, output sink, and event forwarding.
     pub fn run_init(&self, evaluator: &mut Evaluator) -> Result<(), String> {
         for init in &self.loaded.config.init.files {
-            let src = std::fs::read_to_string(init)
-                .map_err(|error| format!("cannot read init {}: {error}", init.display()))?;
-            let program =
-                parse(&src).map_err(|error| format!("init {}: {error}", init.display()))?;
             evaluator
-                .eval_program(&program)
+                .eval_source_file(init)
                 .map_err(|error| format!("init {}: {error}", init.display()))?;
         }
         Ok(())
@@ -297,6 +293,40 @@ mod tests {
         assert_eq!(
             interactive
                 .eval_program(&parse("env.FROM_INIT").unwrap())
+                .unwrap(),
+            Value::Str("yes".into())
+        );
+    }
+
+    #[test]
+    fn hostile_init_is_typed_path_aware_and_does_not_break_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let init = dir.path().join("init.shl");
+        let mut config = Config::default();
+        config.init.files.push(init.clone());
+        let bootstrap = SessionBootstrap::from_loaded(Loaded {
+            config,
+            warnings: Vec::new(),
+            sources: Vec::new(),
+        });
+        let mut evaluator = Evaluator::new(dir.path().to_path_buf());
+
+        std::fs::write(&init, [0xff]).unwrap();
+        let error = bootstrap.run_init(&mut evaluator).unwrap_err();
+        assert!(error.contains("source_utf8"), "{error}");
+        assert!(error.contains(&init.display().to_string()), "{error}");
+
+        let file = std::fs::File::create(&init).unwrap();
+        file.set_len((shoal_syntax::MAX_SOURCE_BYTES + 1) as u64)
+            .unwrap();
+        let error = bootstrap.run_init(&mut evaluator).unwrap_err();
+        assert!(error.contains("source_too_large"), "{error}");
+
+        std::fs::write(&init, "env.INIT_RECOVERED = 'yes'\n").unwrap();
+        bootstrap.run_init(&mut evaluator).unwrap();
+        assert_eq!(
+            evaluator
+                .eval_program(&parse("env.INIT_RECOVERED").unwrap())
                 .unwrap(),
             Value::Str("yes".into())
         );

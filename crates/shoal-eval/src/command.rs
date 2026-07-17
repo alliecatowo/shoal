@@ -285,10 +285,7 @@ impl Evaluator {
                 self.exec.shell.cwd.join(script_path)
             };
             if is_source {
-                let src =
-                    self.host.fs.read_to_string(&path).map_err(|e| {
-                        ErrorVal::new("io_error", format!("cannot read script: {e}"))
-                    })?;
+                let src = self.read_shoal_source(&path, "script")?;
                 let program = shoal_syntax::parse(&src)
                     .map_err(|e| ErrorVal::new("parse_error", e.to_string()))?;
                 return self.eval_program(&program);

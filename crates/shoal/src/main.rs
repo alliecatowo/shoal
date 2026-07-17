@@ -1,7 +1,6 @@
 use std::borrow::Cow;
 use std::ffi::OsString;
-use std::fs;
-use std::io::{self, IsTerminal, Read};
+use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -116,15 +115,11 @@ fn real_main(args: Vec<OsString>) -> Result<i32, String> {
         }
         Action::Command(src, args) => run_source(&src, None, false, args),
         Action::Script(path, args) => {
-            let src = fs::read_to_string(&path)
-                .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+            let src = args::read_source_path(&path)?;
             run_source(&src, Some(&path), false, args)
         }
         Action::Stdin => {
-            let mut src = String::new();
-            io::stdin()
-                .read_to_string(&mut src)
-                .map_err(|e| format!("cannot read stdin: {e}"))?;
+            let src = args::read_source_stream(io::stdin().lock(), "stdin")?;
             run_source(&src, Some(Path::new("<stdin>")), false, Vec::new())
         }
         Action::Interactive { standalone } => repl::repl(standalone),
