@@ -231,6 +231,9 @@ impl<'s> Parser<'s> {
         }
     }
     pub(crate) fn ty(&mut self) -> ParseResult<Type> {
+        self.with_nesting(Self::ty_inner)
+    }
+    fn ty_inner(&mut self) -> ParseResult<Type> {
         let (name, s) = self.ident()?;
         let mut args = vec![];
         if self.eat(Mode::Expr, &Tok::Lt)?.is_some() {

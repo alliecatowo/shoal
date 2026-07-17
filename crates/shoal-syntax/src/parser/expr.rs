@@ -6,6 +6,9 @@ use super::*;
 
 impl<'s> Parser<'s> {
     pub(crate) fn expr(&mut self, min: u8) -> ParseResult<Expr> {
+        self.with_nesting(|parser| parser.expr_inner(min))
+    }
+    fn expr_inner(&mut self, min: u8) -> ParseResult<Expr> {
         let lhs = self.unary(min == 0)?;
         self.expr_tail(lhs, min)
     }
@@ -164,7 +167,7 @@ impl<'s> Parser<'s> {
         let (t, s) = self.peek(Mode::Expr)?;
         if matches!(t, Tok::Bang | Tok::Minus) {
             self.bump(Mode::Expr)?;
-            let e = self.unary(top)?;
+            let e = self.with_nesting(|parser| parser.unary(top))?;
             let end = e.span().end;
             return Ok(Expr::Unary {
                 op: if matches!(t, Tok::Bang) {

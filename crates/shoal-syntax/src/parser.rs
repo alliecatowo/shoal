@@ -68,6 +68,15 @@ impl std::fmt::Display for ParseError {
 impl std::error::Error for ParseError {}
 pub type ParseResult<T> = Result<T, ParseError>;
 
+/// Hard walls on one parse. The wire layer permits larger envelopes because an
+/// RPC carries metadata as well as source, but constructing an AST from an
+/// unbounded source/token stream would let one connection consume arbitrary
+/// memory. Nesting is bounded separately because native-stack exhaustion aborts
+/// the process rather than producing a catchable Rust panic.
+pub const MAX_SOURCE_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_PARSE_TOKENS: usize = 262_144;
+pub const MAX_PARSE_NESTING: usize = 64;
+
 /// Parse context carrying the dispatch inputs the parser cannot infer from the
 /// source alone (site/content/internals/language-conformance-contract.md): whether we are at a REPL prompt (so `it`/`out` are
 /// legal and a leading `.` chains on `it`), plus the pre-seeded value-bindings
@@ -130,6 +139,8 @@ pub struct Parser<'s> {
     /// matching delimiter (call args, `[…]`, parenthesised groups), where a
     /// trailing block can never be confused for the outer construct's block.
     no_trailing_block: bool,
+    tokens_consumed: usize,
+    nesting: usize,
 }
 
 impl<'s> Parser<'s> {
@@ -145,6 +156,8 @@ impl<'s> Parser<'s> {
             cmd_scopes: vec![HashSet::new()],
             repl: false,
             no_trailing_block: false,
+            tokens_consumed: 0,
+            nesting: 0,
         }
     }
     pub(crate) fn peek(&self, m: Mode) -> ParseResult<(Tok, Span)> {
@@ -152,17 +165,46 @@ impl<'s> Parser<'s> {
     }
     pub(crate) fn bump(&mut self, m: Mode) -> ParseResult<(Tok, Span)> {
         let x = self.peek(m)?;
+        self.charge_token(x.1)?;
         self.pos = x.1.end as usize;
         Ok(x)
     }
     pub(crate) fn eat(&mut self, m: Mode, want: &Tok) -> ParseResult<Option<Span>> {
         let (t, s) = self.peek(m)?;
         if std::mem::discriminant(&t) == std::mem::discriminant(want) {
+            self.charge_token(s)?;
             self.pos = s.end as usize;
             Ok(Some(s))
         } else {
             Ok(None)
         }
+    }
+    fn charge_token(&mut self, span: Span) -> ParseResult<()> {
+        self.tokens_consumed = self.tokens_consumed.saturating_add(1);
+        if self.tokens_consumed > MAX_PARSE_TOKENS {
+            Err(ParseError::new(
+                format!("source exceeds the {MAX_PARSE_TOKENS}-token parse limit"),
+                span,
+            ))
+        } else {
+            Ok(())
+        }
+    }
+    pub(crate) fn with_nesting<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> ParseResult<T>,
+    ) -> ParseResult<T> {
+        if self.nesting >= MAX_PARSE_NESTING {
+            return Err(ParseError::new(
+                format!("source exceeds the {MAX_PARSE_NESTING}-level nesting limit"),
+                Span::new(self.pos, self.pos),
+            ));
+        }
+        self.nesting += 1;
+        let result = f(self);
+        // Deliberately outside `?`: every typed error path restores the budget.
+        self.nesting -= 1;
+        result
     }
     pub(crate) fn expect(&mut self, m: Mode, want: Tok, text: &str) -> ParseResult<Span> {
         self.eat(m, &want)?.ok_or_else(|| {
@@ -268,6 +310,12 @@ impl<'s> Parser<'s> {
     }
 
     pub fn parse_program(mut self) -> ParseResult<Program> {
+        if self.lx.src.len() > MAX_SOURCE_BYTES {
+            return Err(ParseError::new(
+                format!("source exceeds the {MAX_SOURCE_BYTES}-byte parse limit"),
+                Span::new(0, 0),
+            ));
+        }
         let mut stmts = vec![];
         self.term()?;
         while !self.peek_is(|t| matches!(t, Tok::Eof)) {
