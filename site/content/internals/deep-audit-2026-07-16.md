@@ -81,6 +81,18 @@ omit various reef/config/journal/session settings. Sites: `script.rs` (`spawn_bl
   foreground work; a restricted command can become unrestricted when wrapped in `spawn` or
   `parallel`. Release-blocking for the agent security story.
 
+Post-freeze additions (2026-07-16, evaluator field census for the decomposition design):
+
+- **B5** — `spawn_block` also drops the injected `config` port: it hand-copies
+  fs/exec/clock/opener/secrets but not config, and only `run_script_file` (the sole
+  `inherit_ports` caller) keeps it. Injected configuration is invisible inside `spawn { … }`.
+  Refines B3.
+- **B6** — Cancellation propagation is silently inconsistent across child routes: `spawn`/`on`
+  wire a child cancel token to the task's `on_cancel` hook, but `run_script_file` gives its
+  `.shl` child a fresh unlinked token (parent cancellation is ignored) and `builtin_parallel`
+  neither links a token nor installs an `on_cancel` hook — `parallel` children are effectively
+  uncancellable. Relates to I5.
+
 ## C — In-process filesystem effects bypass ports and sandbox (P0/P1)
 
 - **C1** — `shoal-value/src/methods/path.rs::save` and stream save code use

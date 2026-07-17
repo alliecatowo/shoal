@@ -90,7 +90,8 @@ Rules for implementers:
   <br>Accept: no public API constructs a child evaluator without the full-context constructor.
 - [ ] **HR-B7** — Tests: a restrictive leash policy observably constrains work run via `spawn`,
   `parallel`, an `on` handler, and a `.shl` script exactly as it does foreground; reef/config/
-  journal settings propagate identically. *(B4)*
+  journal settings propagate identically; the config port reaches `spawn` blocks (B5); parent
+  cancellation reaches `parallel` children and `.shl` script children (B6). *(B4, B5, B6)*
 
 ### Workstream C — effects through enforceable ports
 
@@ -235,6 +236,8 @@ Every audit finding → the task(s) that retire it.
 | B2 | HR-B1 | | H13 | HR-F3 |
 | B3 | HR-B1, HR-B6 | | I1 | HR-H2 |
 | B4 | HR-B7 | | I2 | HR-G1 |
+| B5 | HR-B1, HR-B7 | | | |
+| B6 | HR-B1, HR-B7 | | | |
 | C1 | HR-C1, HR-C2 | | I3 | HR-G2 |
 | C2 | HR-C3 | | I4 | HR-G3 |
 | C3 | HR-C4 | | I5 | HR-G4 |
