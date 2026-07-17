@@ -246,6 +246,22 @@ GitHub CI builds/tests on Ubuntu and macOS with locked dependencies, runs the co
 checks fmt/Clippy, and performs release builds. Release automation produces binaries for x86_64 and
 AArch64 on Linux and macOS.
 
+### Workflow supply-chain policy
+
+Every third-party `uses:` entry is pinned to a full 40-character commit SHA. The trailing version
+comment records the reviewed upstream line without turning a moving tag into executable authority.
+Dependabot checks the `github-actions` ecosystem weekly; action updates must resolve the proposed SHA
+back to the expected upstream tag/branch and pass the same workflow review before merge. Rust jobs
+likewise pin 1.97.0 exactly; only fuzzing deliberately uses a dated immutable snapshot of nightly.
+Workflow-installed Rust tools are version-pinned as well (`cargo-fuzz` 0.13.2 and `cargo-audit`
+0.22.2): Cargo's `--locked` flag locks a selected release's dependencies but does not choose that
+release.
+
+Workflow token permissions default to read-only or empty. CI and fuzz receive only `contents: read`;
+the Pages build/deploy jobs receive Pages and OIDC rights only where used; the release job alone gets
+`contents: write` to create and upload a tag release. New jobs must declare the smallest permission
+set their API calls require instead of inheriting write authority at workflow scope.
+
 ### Supply-chain advisories (HR-F6)
 
 Hundreds of registry dependencies are real supply-chain surface with no advisory audit before this

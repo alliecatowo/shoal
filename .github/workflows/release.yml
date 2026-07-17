@@ -4,8 +4,7 @@ on:
   push:
     tags: ["v*"]
 
-permissions:
-  contents: write
+permissions: {}
 
 env:
   CARGO_TERM_COLOR: always
@@ -14,6 +13,8 @@ jobs:
   build:
     name: build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -27,11 +28,11 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: ${{ matrix.target }}
       - name: Install cross linker (aarch64 linux)
@@ -56,7 +57,7 @@ jobs:
           tar czf "$dist.tar.gz" "$dist"
           echo "ASSET=$dist.tar.gz" >> "$GITHUB_ENV"
       - name: Upload to release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: ${{ env.ASSET }}
           generate_release_notes: true

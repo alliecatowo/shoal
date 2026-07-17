@@ -23,6 +23,9 @@ on:
         default: "120"
         required: false
 
+permissions:
+  contents: read
+
 concurrency:
   group: fuzz-nightly
   cancel-in-progress: true
@@ -43,14 +46,15 @@ jobs:
       matrix:
         target: [lexer, parser, proto_frame, planner, value_wire, stream, policy]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # nightly 2026-07-17
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: fuzz-${{ matrix.target }}
           workspaces: fuzz -> target
       - run: sudo apt-get update && sudo apt-get install -y clang
-      - run: cargo install cargo-fuzz --locked
+      # Keep this synchronized with ci.yml; `--locked` does not select the tool release.
+      - run: cargo install cargo-fuzz --version 0.13.2 --locked
       # cargo-fuzz has no --locked option; reject fuzz/Cargo.lock drift first.
       - run: cargo metadata --manifest-path fuzz/Cargo.toml --locked --no-deps --format-version 1 > /dev/null
       - name: Run ${{ matrix.target }} for a bounded budget
@@ -59,7 +63,7 @@ jobs:
             -max_total_time="${{ github.event.inputs.seconds_per_target || '120' }}"
       - name: Upload crash artifacts
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: fuzz-crash-${{ matrix.target }}
           path: fuzz/artifacts/${{ matrix.target }}/
