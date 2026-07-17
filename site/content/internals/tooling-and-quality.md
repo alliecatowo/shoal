@@ -229,13 +229,16 @@ at the time it was written (HR-F2); `rustup` picks this up automatically for any
 `rustc`/`clippy`/`fmt` invocation, so a future stable release cannot silently change a contributor's
 compiler out from under a pinned CI baseline without a deliberate bump to this file.
 
-### Ambient-environment test debt
+### Ambient-environment test debt (resolved, HR-F3)
 
-This audit environment exports `NO_COLOR=1`. Under that environment, `cargo test --workspace` fails
-seven color-asserting highlighter tests; all 13 highlighter tests pass when run with `NO_COLOR`
-unset. The product is right to honor `NO_COLOR`; the tests incorrectly inherit ambient policy while
-asserting colored output. Those tests should set/unset their environment explicitly or inject color
-policy so workspace results do not depend on the invoking shell.
+`crates/shoal/src/highlight.rs`'s test module previously inherited whatever `NO_COLOR` the invoking
+shell/CI exported; under an ambient `NO_COLOR=1` (as this audit environment set), seven of the
+thirteen color-asserting highlighter tests failed even though the product was correctly honoring
+`NO_COLOR` — a test-isolation defect (deep audit H13), not a product bug. `styles_for`/
+`styles_with_bindings` now route through a shared `with_forced_color` helper that unsets `NO_COLOR`
+under `crate::ENV_TEST_LOCK` for the duration of the call and restores whatever was there before.
+All 13 highlighter tests now pass identically with `NO_COLOR=1 cargo test -p shoal` and with
+`NO_COLOR` unset; verify with both invocations after touching this module.
 
 ## Choosing the right test
 

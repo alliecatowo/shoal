@@ -422,18 +422,47 @@ mod tests {
     // `NO_COLOR`/env is process-global; every env-touching test across this
     // bin shares `crate::ENV_TEST_LOCK` (defined in main.rs) so a setter in one
     // module can't leak env state into another module's color assertion.
+    //
+    // Almost every test below asserts specific ANSI colors/styles, so the
+    // color environment must be forced on regardless of whatever ambient
+    // `NO_COLOR` the invoking shell/CI happens to export (deep audit H13):
+    // the product is right to honor `NO_COLOR`, but these tests exercise the
+    // *colored* branch of `highlight()` on purpose and must not silently
+    // degrade to asserting nothing whenever `NO_COLOR=1` is set in the test
+    // runner's environment. `with_forced_color` unsets `NO_COLOR` for the
+    // duration of the closure (still under `ENV_TEST_LOCK`) and restores
+    // whatever was there before, so this suite passes identically whether
+    // invoked as `NO_COLOR=1 cargo test` or with `NO_COLOR` unset.
+    fn with_forced_color<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = crate::ENV_TEST_LOCK.lock().unwrap();
+        let prev = std::env::var_os("NO_COLOR");
+        // SAFETY: serialized by `ENV_TEST_LOCK` against every other test in
+        // this binary that reads or writes `NO_COLOR`.
+        unsafe { std::env::remove_var("NO_COLOR") };
+        let result = f();
+        match prev {
+            // SAFETY: same lock/serialization as above.
+            Some(v) => unsafe { std::env::set_var("NO_COLOR", v) },
+            None => unsafe { std::env::remove_var("NO_COLOR") },
+        }
+        result
+    }
 
     fn styles_for(line: &str) -> Vec<(Style, String)> {
-        let _guard = crate::ENV_TEST_LOCK.lock().unwrap();
-        ShoalHighlighter::default()
-            .highlight(line, line.len())
-            .buffer
+        with_forced_color(|| {
+            ShoalHighlighter::default()
+                .highlight(line, line.len())
+                .buffer
+        })
     }
 
     /// Highlight with a session env carrying one value binding (`someVar`)
     /// and one callable binding (`deploy`).
     fn styles_with_bindings(line: &str) -> Vec<(Style, String)> {
-        let _guard = crate::ENV_TEST_LOCK.lock().unwrap();
+        with_forced_color(|| styles_with_bindings_inner(line))
+    }
+
+    fn styles_with_bindings_inner(line: &str) -> Vec<(Style, String)> {
         let env = Env::root();
         env.declare("someVar", Value::Int(42), false);
         env.declare(
