@@ -7,6 +7,9 @@ edition = "2024"
 workspace = true
 
 [dependencies]
+shoal-ast = { path = "../shoal-ast" }
+shoal-eval = { path = "../shoal-eval" }
+shoal-leash = { path = "../shoal-leash" }
 shoal-syntax = { path = "../shoal-syntax" }
 tower-lsp = "0.20"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "sync"] }
