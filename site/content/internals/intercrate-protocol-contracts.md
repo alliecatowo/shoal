@@ -397,8 +397,11 @@ Stable security properties:
 - secret material never crosses the wire through a `Secret` value;
 - per-client `it` state must remain distinct even inside a shared session.
 
-Current risk: the first principal attached to a named session can determine session-owned evaluator
-state that later principals share. Treat cross-principal named sessions as a security review area.
+Cross-principal named sessions are the intentional pair-shell model (HR-D7): objects
+(transcript/tasks/PTYs) are session-scoped and shared by every attached principal, authority stays
+per-actor, coarse journal attribution follows the current actor, and the isolation boundary is the
+session name. The one documented seam: evaluator statement-level journal rows keep the
+session-creating principal's identity.
 
 ## Compatibility review matrix
 

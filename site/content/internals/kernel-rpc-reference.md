@@ -124,9 +124,11 @@ create/revoke writes are not observed until the kernel restarts; already-loaded 
 become invalid as wall time advances. The returned profile and cap strings are descriptive metadata,
 not grants. Only principal-based Leash policy and handler ownership checks authorize operations.
 
-The session map is currently keyed only by `session` name. `principal` is consulted when the name is
-first created; later callers receive the cached session. This is not a safe multi-principal ownership
-model.
+The session map is keyed only by `session` name; `principal` is consulted when the name is first
+created, and later callers receive the cached session. Multi-principal sharing of a named session is
+the intentional pair-shell model (HR-D7) — objects are session-scoped, authority stays per-actor,
+and the isolation boundary is the session name. See
+[session identity](../kernel-protocol/#session-identity-and-the-pair-shell-model).
 
 Result fields:
 
@@ -324,9 +326,10 @@ optional `RpcError`. State vocabulary observed in the handler is `running`, `can
 | `task.suspend` | `{task}` | validates ownership, then `TASK_CONTROL_UNAVAILABLE` |
 | `task.resume` | `{task}` | validates ownership, then `TASK_CONTROL_UNAVAILABLE` |
 
-Ownership is by `session.id`, not directly principal. That inherits the named-session cross-principal
-weakness. Tasks remain in the process-global map after completion; there is no eviction/persistence
-policy in the handler path.
+Ownership is by `session.id`, not principal — the documented pair-shell rule (HR-D7): every
+principal attached to the same named session shares task visibility and control, and cross-session
+lookups are opaque not-founds. Tasks remain in the process-global map after completion; there is no
+eviction/persistence policy in the handler path.
 
 Cancellation is cooperative through the evaluator/exec cancellation token. A failed outcome returned
 in value position is inspected so the task becomes failed; a signal-killed outcome after a requested
@@ -383,7 +386,9 @@ reports the same honest OS-enforcement truth `session.attach.caps_enforced` does
 
 PTY refs are `pty:N`. Registry entries store session ID, recorded principal, display command, and a
 mutex-protected `shoal_exec::PtySession`. All methods require attachment and lookups compare session
-ID. The principal field is currently not used for access checks.
+ID — the documented pair-shell rule (HR-D7): PTY access is session-scoped and deliberately shared
+across the principals attached to that session, while cross-session refs are opaque not-founds. The
+recorded principal attributes the opener; it is not an access check.
 
 ### `pty.open`
 

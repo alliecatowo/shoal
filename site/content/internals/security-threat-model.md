@@ -152,30 +152,40 @@ intersects them with Leash, and no resource check consumes them; the token's `pr
 used to look up policy. Creating a token with `--cap fs.read` grants nothing unless that principal's
 Leash policy and handler ownership rules already allow the operation.
 
-## Named session principal hazard
+## Named sessions: the shared pair-shell model (HR-D7)
 
-Kernel sessions are cached by user-supplied session name. `Kernel::session(name, principal)` consults
-`principal` only on first creation; later attachments to the same name receive the existing
-`Arc<Session>` and its evaluator/journal wiring. The connection `Attachment` records the new
-principal, but the underlying evaluator was created under the first principal's session setup.
+Kernel sessions are cached by user-supplied session name and are **intentionally shared across
+principals** — the pair-shell model documented in
+[kernel-protocol](@/internals/kernel-protocol.md#session-identity-and-the-pair-shell-model).
+`Kernel::session(name, principal)` consults `principal` only on first creation; later attachments to
+the same name receive the existing `Arc<Session>` and full shared control of its transcript, tasks,
+and PTYs.
 
 ```mermaid
 sequenceDiagram
-accTitle: Named session principal hazard
-accDescr: Shows the components and relationships described in Named session principal hazard.
-  participant A as agent:A
+accTitle: Shared pair-shell session
+accDescr: Two principals deliberately join one named session; each exec runs under its own actor's policy, and shared objects are session-scoped.
+  participant H as uid:N (human)
   participant K as Kernel sessions map
-  participant S as named Session "default"
-  A->>K: attach name=default
-  K->>S: create evaluator/journal as agent:A
-  participant B as agent:B
-  B->>K: attach name=default
-  K-->>B: existing Session (no principal compatibility check)
+  participant S as named Session "pair"
+  H->>K: attach name=pair
+  K->>S: create evaluator/journal as uid:N
+  participant A as agent:mcp
+  A->>K: attach name=pair
+  K-->>A: existing Session (shared workspace, by design)
 ```
 
-Handlers may still evaluate the current attachment principal for policy decisions, but mutable
-session state and evaluator-installed authority can cross identities. Session names should be scoped
-by owner or attachment should reject a principal mismatch. This is a multi-principal isolation gap.
+The security consequences are explicit, not accidental:
+
+- authority stays per-actor — each exec installs the current attachment principal's Leash policy,
+  and approval requires a distinct approver by default (HR-D3);
+- attribution follows the actor on coarse journal rows and journal/approval events; the evaluator's
+  finer statement-level rows keep the session creator's identity (a documented seam — read actor
+  attribution from the coarse rows);
+- a token scopes authority, **not** object visibility inside a session it joins. The isolation
+  boundary is the session name: give untrusted or differently-trusted agents their own session
+  names, and never reuse a name across trust boundaries. Cross-session lookups remain opaque
+  not-founds.
 
 ## Semantic effect algebra
 
@@ -596,7 +606,9 @@ For a new externally reachable effect:
    limits are bounded (HR-D5). The remaining step is replacing colliding 16-hex plan refs with a
    unique owner-bound object identity so equal-shape plans cannot overwrite one another.
 2. **Close child evaluator Leash inheritance escape.** This is a direct transitive-policy failure.
-3. **Scope named kernel sessions by principal.** Existing session reuse crosses first-creator state.
+3. **Statement-level attribution in shared sessions.** The pair-shell shared-session model is now
+   documented as intentional (HR-D7); the remaining seam is that evaluator statement-level journal
+   rows keep the session creator's identity rather than the current actor's.
 4. **Make token revocation live and generation-safe.** A running kernel currently retains its startup
    snapshot while external management rewrites disk.
 5. **Complete parent-process port/policy coverage.** Direct filesystem/network effects bypass child

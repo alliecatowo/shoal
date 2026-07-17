@@ -120,11 +120,15 @@ Rules for implementers:
 - [x] **HR-D6** — Zero-config MCP attach lands on a restricted agent principal rather than
   `local-human`; permissive attach becomes explicit opt-in. Update autostart, attach handling,
   and the agent/MCP + threat-model docs together. *(E1, E2)*
-- [ ] **HR-D7** — Session identity model made explicit: statement-level journal attribution
+- [x] **HR-D7** — Session identity model made explicit: statement-level journal attribution
   follows the current actor (matching kernel exec entries), and task/PTY cross-principal access
   rules are documented and enforced — or the shared pair-shell model is documented as
   intentional with its token-isolation consequences. *(G1, G2, G3)*
-- [ ] **HR-D8** — `live_kernel` integration tests cover: unattached `journal.query` rejected;
+  <br>Shipped as the documented pair-shell model: kernel-protocol's "Session identity and the
+  pair-shell model" section is normative; coarse exec attribution follows the actor (pinned by
+  the live pair-session test); the evaluator statement-row seam is documented and tracked in the
+  threat model's priority debt.
+- [x] **HR-D8** — `live_kernel` integration tests cover: unattached `journal.query` rejected;
   unattached `cap.request` rejected; zero-config attach is restricted; cross-principal task/PTY
   access follows the documented rule. *(D1, E2, F1, G3)*
 
