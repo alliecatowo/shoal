@@ -9,7 +9,7 @@ use crate::{Config, ConfigError};
 
 /// The result of a successful [`load`]: the merged, validated config, any
 /// non-fatal warnings collected along the way (unknown keys — see
-/// docs/CONFIG.md §4), and the layer files that were actually found and
+/// `site/content/internals/configuration-reference.md`), and the layer files that were actually found and
 /// merged (in precedence order, lowest first) — handy for a `shoal doctor`
 /// style "here's what I read" report.
 #[derive(Debug)]
@@ -21,30 +21,30 @@ pub struct Loaded {
 
 /// The four layers `load` merges, in precedence order (later wins). Every
 /// field is optional — a `None`/missing file is simply skipped, never an
-/// error (docs/CONFIG.md §1).
+/// error (site/content/internals/configuration-reference.md).
 #[derive(Debug, Clone)]
 pub struct LoadOptions {
     pub system: Option<PathBuf>,
     pub user: Option<PathBuf>,
     pub project: Option<PathBuf>,
     /// The complete set of `(name, value)` pairs consulted for env overrides
-    /// (docs/CONFIG.md §3). Callers normally pass `std::env::vars_os()`
+    /// (site/content/internals/configuration-reference.md). Callers normally pass `std::env::vars_os()`
     /// verbatim; tests pass a small synthetic set.
     pub env: Vec<(OsString, OsString)>,
 }
 
 impl LoadOptions {
-    /// Discover the layered config locations for `cwd`, per docs/CONFIG.md
-    /// §1:
+    /// Discover the layered config locations for `cwd`, per
+    /// `site/content/internals/configuration-reference.md`:
     ///
     /// 1. **system** — `/etc/shoal/shoal.toml`.
     /// 2. **user** — `$XDG_CONFIG_HOME/shoal/shoal.toml`, falling back to
     ///    `~/.config/shoal/shoal.toml` when `XDG_CONFIG_HOME` is unset.
     /// 3. **project** — the nearest `.shoal.toml` walking up from `cwd` to
     ///    the filesystem root ([`find_project_config`]) — same "nearest
-    ///    wins" rule `shoal-reef` uses for `.reef.toml` (REEF.md §1).
+    ///    wins" rule `shoal-reef` uses for `.reef.toml` (site/content/internals/reef-resolution.md).
     /// 4. **env** — the live process environment, for `NO_COLOR`/`SHOAL_*`
-    ///    overrides (docs/CONFIG.md §3), highest precedence.
+    ///    overrides (site/content/internals/configuration-reference.md), highest precedence.
     pub fn discover(cwd: &Path) -> Self {
         let home = std::env::var_os("HOME").map(PathBuf::from);
         // $XDG_CONFIG_HOME is already a config root (no extra `.config`);
@@ -66,7 +66,7 @@ impl LoadOptions {
 /// the nearest `.shoal.toml`; `None` if none exists anywhere in the
 /// ancestry. Pure function of `(start, filesystem)` — no caching, no env
 /// reads. Mirrors `ScopeChain::discover`'s "nearest manifest wins" walk
-/// (REEF.md §1): no special-casing of `$HOME` or a VCS boundary, so the
+/// (site/content/internals/reef-resolution.md): no special-casing of `$HOME` or a VCS boundary, so the
 /// search is simple and total (a finite ancestor chain always terminates).
 pub fn find_project_config(start: &Path) -> Option<PathBuf> {
     let mut dir = Some(start);
@@ -162,7 +162,7 @@ enum EnvKind {
 }
 
 /// Explicit `env var name -> (dotted key path, expected kind)` table
-/// (docs/CONFIG.md §3). Deliberately a flat static list rather than a
+/// (site/content/internals/configuration-reference.md). Deliberately a flat static list rather than a
 /// derived `SHOAL_SECTION_FIELD` split — an automatic split is ambiguous the
 /// moment a field name itself contains an underscore (`max_entries`,
 /// `bracketed_paste`, …), so every override is spelled out once, here, and
@@ -745,7 +745,7 @@ mod tests {
 
     /// A "golden" full config exercising every documented key at once —
     /// round-trips through `load` unchanged and un-warned. If this test
-    /// needs an update, docs/CONFIG.md's worked example almost certainly
+    /// needs an update, site/content/internals/configuration-reference.md's worked example almost certainly
     /// needs the same update.
     #[test]
     fn golden_full_config_round_trip() {

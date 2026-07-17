@@ -1,4 +1,4 @@
-//! **reef** — tool resolution, ripped from the root PATH fossil (`docs/REEF.md`).
+//! **reef** — tool resolution, ripped from the root PATH fossil (`site/content/internals/reef-resolution.md`).
 //!
 //! A name resolves through **scopes**, not directories: project `.reef.toml`
 //! (nearest wins) → user `[reef]` scope → provider-discovered system/ambient

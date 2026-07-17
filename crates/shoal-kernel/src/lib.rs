@@ -1,4 +1,4 @@
-//! Long-lived Unix-socket host for the shoal evaluator (TDD §10).
+//! Long-lived Unix-socket host for the shoal evaluator (site/content/internals/language-conformance-contract.md).
 
 mod dispatch;
 mod eventbus;
@@ -52,7 +52,7 @@ pub struct Kernel {
     plans: Mutex<HashMap<String, StoredPlan>>,
     tasks: Mutex<HashMap<Ref, Arc<TaskEntry>>>,
     next_task: AtomicU64,
-    /// Long-lived interactive PTY sessions (AGENT-SURFACE §10), keyed by their
+    /// Long-lived interactive PTY sessions (site/content/internals/kernel-protocol.md), keyed by their
     /// `pty:{id}` ref like `tasks`. Each holds a live child on a real PTY plus
     /// its `vt100` emulator; scoped to the session that opened it. Dropped (and
     /// so terminated + reaped) on `pty.close` or when the kernel is dropped.
@@ -62,7 +62,7 @@ pub struct Kernel {
     events: Arc<EventBus>,
 }
 
-/// Wire version of the AST node-kind vocabulary (TDD §7, IO.md §2.5). Bumped
+/// Wire version of the AST node-kind vocabulary (site/content/internals/language-conformance-contract.md, site/content/internals/values-streams-execution.md). Bumped
 /// from 1 to 2 when `sh_raw` was retired in favor of the general
 /// `lang_block` node — a breaking rename to the AST-kind enum.
 const AST_VERSION: u32 = 2;
@@ -83,7 +83,7 @@ struct TaskInner {
     error: Option<RpcError>,
 }
 
-/// A registered interactive PTY session (AGENT-SURFACE §10). The live
+/// A registered interactive PTY session (site/content/internals/kernel-protocol.md). The live
 /// [`shoal_exec::PtySession`] (child + PTY master + `vt100` emulator) sits
 /// behind a `Mutex` so `pty.send`/`pty.read`/`pty.resize`/`pty.close` from
 /// different connections serialize on it. `session_id`/`principal` scope it to
@@ -126,7 +126,7 @@ impl Kernel {
         let state_dir = state_dir.as_ref();
         let journal = Journal::open(state_dir)?;
         let events = EventBus::default();
-        // P2 fix: reopening an EXISTING on-disk store must resume its
+        // Reopening an EXISTING on-disk store must resume its
         // `journal`/`session.transcript` seq state, not restart both at 0 —
         // see `EventBus::seed_from_journal` for why (a reconnecting agent's
         // persisted `since=N` cursor would otherwise collide with a
@@ -289,12 +289,12 @@ impl Kernel {
         Ok(entry)
     }
 
-    /// The real enforcement truth for `principal` (TDD §8 tier honesty):
+    /// The real enforcement truth for `principal` (site/content/internals/language-conformance-contract.md tier honesty):
     /// `true` only when a genuine OS backend (Landlock/Seatbelt) exists on
     /// this host *and* the policy actually resolves a real sandbox for this
     /// principal — never for the default-permissive human. Single source of
     /// truth shared by `session.attach`'s `caps_enforced` and
-    /// `cap.request`'s grant response (docs/ROADMAP.md open-item #5): an
+    /// `cap.request`'s grant response (see `site/content/internals/security-threat-model.md`): an
     /// agent that unstuck an `approval_pending` plan via `cap.request` must
     /// get the SAME honest answer `attach` already gives, not a hardcoded
     /// `false` that systematically under-reports enforcement it actually has.
@@ -379,7 +379,7 @@ fn permissive_policy() -> Policy {
     Policy::permissive(&principal())
 }
 
-/// The single-letter wire form of an enforcement tier (TDD §8): A (Landlock),
+/// The single-letter wire form of an enforcement tier (site/content/internals/language-conformance-contract.md): A (Landlock),
 /// B (namespace fallback), C (Seatbelt), D (advisory). Reported at attach so a
 /// client learns the strongest OS backend available on this host.
 fn tier_letter(tier: EnforcementTier) -> &'static str {
@@ -391,7 +391,7 @@ fn tier_letter(tier: EnforcementTier) -> &'static str {
     }
 }
 
-/// Derive a plan's real effects (TDD §8) and give it a source-anchored
+/// Derive a plan's real effects (site/content/internals/language-conformance-contract.md) and give it a source-anchored
 /// `plan_ref`. Two distinct programs never collide, even when both derive to
 /// the same coarse effect set (e.g. two different `sh { }` blocks, both
 /// opaque) — the ref is a blake3 hash over the AST JSON *and* the effects,
@@ -419,7 +419,7 @@ fn canonical_plan_ref(ast_json: &str, effects: &[Effect]) -> String {
     format!("plan:{}", &hasher.finalize().to_hex()[..16])
 }
 
-/// `position: "value"` (TDD §1.2/§4.5): evaluate the sole top-level command
+/// `position: "value"` (site/content/internals/language-conformance-contract.md): evaluate the sole top-level command
 /// expression without statement-position's raise-on-non-ok, binding `it` to
 /// whatever comes back (including a failed outcome). Anything shaped other
 /// than a single bare expression statement has no meaningful non-statement
@@ -440,7 +440,7 @@ fn eval_with_position(
                 stmts: init.to_vec(),
             })?;
         }
-        // TDD §4.5: the *final* expression is the value; evaluate it in value
+        // site/content/internals/language-conformance-contract.md: the *final* expression is the value; evaluate it in value
         // position so a failed outcome is captured (bound to `it`), not raised.
         if let Stmt::Expr { expr, .. } = last {
             let value = evaluator.eval_expr(expr, Position::Value)?;
@@ -463,8 +463,8 @@ fn verdict_name(v: Verdict) -> &'static str {
     }
 }
 
-/// Derive plan reversibility from its concrete effects (AGENT-SURFACE §5,
-/// TDD §8): irreversible for opaque work or network effects; reversible when
+/// Derive plan reversibility from its concrete effects (see
+/// `site/content/internals/kernel-protocol.md`): irreversible for opaque work or network effects; reversible when
 /// every effect is reversible/journaled (pure reads/writes, env, session,
 /// time — AND filesystem deletes, see below). This is computed here rather
 /// than trusting the leash's coarser `Reversibility` so the wire answer is
@@ -513,7 +513,7 @@ fn reversibility_from_effects(effects: &[Effect]) -> &'static str {
 }
 
 /// The `kind` tag an effect serializes with (`{"kind":"fs.write",…}`), used to
-/// scope a `cap.request` grant to a set of effect kinds (AGENT-SURFACE §5).
+/// scope a `cap.request` grant to a set of effect kinds (site/content/internals/kernel-protocol.md).
 fn effect_kind(effect: &Effect) -> String {
     serde_json::to_value(effect)
         .ok()
@@ -522,14 +522,14 @@ fn effect_kind(effect: &Effect) -> String {
 }
 
 /// Normalize an effect kind so the agent-facing dotted convention (`fs.delete`,
-/// per AGENT-SURFACE) matches the snake_case form the effect actually
+/// per site/content/internals/kernel-protocol.md) matches the snake_case form the effect actually
 /// serializes to (`fs_delete`).
 fn norm_effect(kind: &str) -> String {
     kind.replace('.', "_")
 }
 
 /// The kernel's default elision thresholds, advertised at attach so a client
-/// knows the budget before tightening/loosening per call (AGENT-SURFACE §5).
+/// knows the budget before tightening/loosening per call (site/content/internals/kernel-protocol.md).
 fn elide_defaults_json() -> Json {
     json!({
         "max_bytes": ELIDE_DEFAULT_MAX_BYTES,
@@ -540,8 +540,8 @@ fn elide_defaults_json() -> Json {
     })
 }
 
-/// The `session.transcript` event payload for a new `out[n]` (AGENT-SURFACE
-/// §4): `{n, ref, summary:{type, ok?, cmd?, n?}}` — shape only, never payload.
+/// The `session.transcript` event payload for a new `out[n]` (see
+/// `site/content/internals/kernel-protocol.md`): `{n, ref, summary:{type, ok?, cmd?, n?}}` — shape only, never payload.
 fn transcript_event(value_ref: &Ref, value: &Value) -> Json {
     let n: i64 = value_ref
         .0
@@ -573,7 +573,7 @@ fn transcript_event(value_ref: &Ref, value: &Value) -> Json {
     })
 }
 
-/// The `approval` event payload (AGENT-SURFACE §4): `{plan_ref, effects,
+/// The `approval` event payload (site/content/internals/kernel-protocol.md): `{plan_ref, effects,
 /// principal, expires}`, fired once — the moment `exec {mode:"plan"}`
 /// computes `Verdict::ApprovalRequired` for a newly stored plan — so a
 /// SEPARATE subscriber (a human's session, a supervising agent) learns a
@@ -596,7 +596,7 @@ fn approval_event(plan_ref: &str, effects: &[Json], principal: &str) -> Json {
     })
 }
 
-/// The `journal` event payload (AGENT-SURFACE §4): `{entry_id, head, ok,
+/// The `journal` event payload (site/content/internals/kernel-protocol.md): `{entry_id, head, ok,
 /// principal}`, fired once per finished journal entry (mirrors
 /// `session.transcript`'s "announce right after the fact" shape — the entry
 /// already exists in the journal by the time this fires). `head` is the
@@ -615,7 +615,7 @@ fn journal_event(entry_id: i64, src: &str, ok: bool, principal: &str) -> Json {
     })
 }
 
-/// The `render` event payload (AGENT-SURFACE §4): `{ref, render}`, for a UI
+/// The `render` event payload (site/content/internals/kernel-protocol.md): `{ref, render}`, for a UI
 /// client mirroring a session's output live without polling `value.get
 /// {format:"render"}`. Fired alongside `session.transcript` for every new
 /// `out[n]`, carrying the SAME bounded/ANSI-stripped render string the exec
@@ -804,7 +804,7 @@ mod tests {
             BAD_PATH_OR_SLICE,
             "slice on a scalar must be an explicit error"
         );
-        // `[a..b]` path ranges (AGENT-SURFACE §1) — used to be "bad index".
+        // `[a..b]` path ranges (site/content/internals/kernel-protocol.md) — used to be "bad index".
         let ranged = call(
             &mut client,
             &mut reader,
@@ -1446,7 +1446,7 @@ mod tests {
         thread.join().unwrap();
     }
 
-    /// AGENT-SURFACE §10 (`pty.list` / `shoal://pty`): open PTY sessions are
+    /// site/content/internals/kernel-protocol.md (`pty.list` / `shoal://pty`): open PTY sessions are
     /// first-class and session-scoped. A pty opened by session A is enumerated
     /// by A's `pty.list`, is invisible to a DIFFERENT session B (both the list
     /// and a direct `pty.read` of A's ref — an opaque `UNKNOWN_PTY`), and
@@ -1544,7 +1544,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // The elision rule (AGENT-SURFACE §3).
+    // The elision rule (site/content/internals/kernel-protocol.md).
     // -----------------------------------------------------------------------
 
     /// A >100-row table (real `ls` over a directory with 150 files, not a
@@ -1753,7 +1753,7 @@ mod tests {
         thread.join().unwrap();
     }
 
-    /// TDD §317 wire follow-up: `value.get` RESOLVES a CAS-backed bytes ref. A
+    /// site/content/internals/language-conformance-contract.md wire follow-up: `value.get` RESOLVES a CAS-backed bytes ref. A
     /// top-level `CasBytes` (a value-position capture spilled to the CAS) elides
     /// to a `ref` on the default `format=json` path — a huge blob never ships
     /// whole — but an explicit `slice` or `format=raw` fetches the real content
@@ -1936,7 +1936,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Events — channels, cursors, push (AGENT-SURFACE §4/§6).
+    // Events — channels, cursors, push (site/content/internals/kernel-protocol.md).
     // -----------------------------------------------------------------------
 
     #[test]
@@ -1992,7 +1992,8 @@ mod tests {
         thread.join().unwrap();
     }
 
-    /// AGENT-SURFACE §4 / audit gap G2: the `journal` channel is journal-backed
+    /// The `journal` channel is journal-backed, as required by
+    /// `site/content/internals/kernel-protocol.md`:
     /// and replayable from ANY seq, not just the last `EVENT_RING_CAP` events.
     /// Generate more than a full ring of journal-backed events (one finished
     /// journal entry — hence one `journal` event — per exec), then read from a
@@ -2212,7 +2213,7 @@ mod tests {
         thread.join().unwrap();
     }
 
-    /// AGENT-SURFACE §4, the G2 follow-up this closes: `session.transcript`
+    /// `site/content/internals/kernel-protocol.md` also requires `session.transcript`
     /// is now ALSO journal-backed and replayable from ANY seq, mirroring the
     /// `journal` channel's replay (`read_transcript_channel`/
     /// `reconstruct_transcript_events` in `eventbus.rs`, backed by
@@ -2430,7 +2431,7 @@ mod tests {
         thread.join().unwrap();
     }
 
-    /// P2 fix (architecture audit): event-bus seq state for BOTH
+    /// Event-bus seq state for BOTH
     /// journal-backed channels must survive a real kernel RESTART, not just
     /// live within one process's lifetime. Before this fix, `Kernel::open`
     /// always built a brand-new, unseeded `EventBus::default()` — so
@@ -2641,7 +2642,7 @@ mod tests {
         .unwrap();
         // Both the pushed `session.transcript` notification and the exec
         // response land on this connection, but which arrives FIRST is no
-        // longer guaranteed (FIX 1, AGENT-SURFACE §6): the notification is
+        // longer guaranteed (see `site/content/internals/kernel-protocol.md`): the notification is
         // now delivered by a dedicated per-subscriber writer thread, off the
         // dispatch call path entirely, so `publish()` never blocks on a
         // slow/stalled subscriber's socket. That decoupling is exactly what
@@ -2666,7 +2667,7 @@ mod tests {
         thread.join().unwrap();
     }
 
-    /// FIX 2 (AGENT-SURFACE §4): `approval` used to be advertised in
+    /// `approval` used to be advertised in
     /// `STATIC_CHANNELS` with nothing ever publishing to it — a dead
     /// channel. `exec {mode:"plan"}` now fires it the moment a plan lands at
     /// `Verdict::ApprovalRequired`, so a SEPARATE principal (a human's
@@ -2800,7 +2801,7 @@ mod tests {
 
     #[test]
     fn attach_reports_the_honest_detected_tier() {
-        // TDD §8 tier honesty: the tier at attach is the strongest OS backend
+        // site/content/internals/language-conformance-contract.md tier honesty: the tier at attach is the strongest OS backend
         // this host actually has (detected), NOT a hardcoded "D". Under the
         // default-permissive human policy nothing is confined, so `enforced`
         // stays false even where a backend exists.
@@ -2845,7 +2846,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Plan reversibility (AGENT-SURFACE §5) — derived, not hardcoded.
+    // Plan reversibility (site/content/internals/kernel-protocol.md) — derived, not hardcoded.
     // -----------------------------------------------------------------------
 
     #[test]
@@ -2926,7 +2927,8 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Value-position multi-statement + error-still-yields-a-ref (§0, TDD §4.5).
+    // Value-position multi-statement + error-still-yields-a-ref behavior; see
+    // `site/content/internals/language-conformance-contract.md`.
     // -----------------------------------------------------------------------
 
     #[test]
@@ -3000,7 +3002,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // cap.request effect scoping (§5), complete/explain (§5).
+    // cap.request effect scoping (site/content/internals/kernel-protocol.md), complete/explain (site/content/internals/kernel-protocol.md).
     // -----------------------------------------------------------------------
 
     #[test]
@@ -3152,7 +3154,7 @@ mod tests {
             bg["task"].is_string(),
             "background exec returns a task ref: {bg}"
         );
-        // AGENT-SURFACE §4: the events channel is `task.{bare id}` (e.g.
+        // site/content/internals/kernel-protocol.md: the events channel is `task.{bare id}` (e.g.
         // `task.7`), NOT `task.{full ref}` — the task ref itself is already
         // `task:7`, so naively prefixing it with `task.` doubles up into
         // `task.task:7`, which no `events.read`/`resources/subscribe` caller
@@ -3165,7 +3167,7 @@ mod tests {
         thread.join().unwrap();
     }
 
-    /// docs/ROADMAP.md R3: `task.resume` exists alongside `task.suspend`,
+    /// site/content/internals/roadmap-and-priorities.md: `task.resume` exists alongside `task.suspend`,
     /// wired the same honest way — never a silent no-op, always a clear
     /// error until a task's process handle is actually reachable here.
     #[test]
@@ -3283,8 +3285,8 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Three agent-wire honesty fixes: outcome span (ROADMAP #4), cap.request
-    // enforced (ROADMAP #5), ANSI stripped from render on the headless/MCP
+    // Three agent-wire honesty fixes: outcome span (site/content/internals/roadmap-and-priorities.md #4), cap.request
+    // enforced (site/content/internals/roadmap-and-priorities.md #5), ANSI stripped from render on the headless/MCP
     // path (cold-agent field test finding).
     // -----------------------------------------------------------------------
 
@@ -3318,7 +3320,7 @@ mod tests {
         Value::Outcome(Arc::new(inner))
     }
 
-    /// Fix 1 (ROADMAP #4): `OutcomeVal` now carries `Option<Span>`, stamped on
+    /// Fix 1 (site/content/internals/roadmap-and-priorities.md #4): `OutcomeVal` now carries `Option<Span>`, stamped on
     /// the command spawn path with the same span the sibling error path uses
     /// (`shoal-eval/src/command.rs`). When a span is present it must reach the
     /// wire under the `span` key with the same `{start,end}` shape `ErrorVal`'s
@@ -3420,7 +3422,7 @@ mod tests {
         thread.join().unwrap();
     }
 
-    /// Fix 2 (ROADMAP #5): `cap.request`'s grant response must report the
+    /// Fix 2 (site/content/internals/roadmap-and-priorities.md #5): `cap.request`'s grant response must report the
     /// SAME enforcement truth `session.attach`'s `caps_enforced` already
     /// does for this principal — never a hardcoded `false`. Mirrors
     /// `attach_enforces_only_for_a_scoped_principal_with_a_real_backend`'s

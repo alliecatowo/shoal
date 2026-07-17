@@ -1,9 +1,9 @@
-//! `value.get` path resolution and the wire encoding / elision rule
-//! (AGENT-SURFACE §3/§7). Split out of `lib.rs` (docs/ROADMAP.md wave R4,
-//! scratch/audit-arch.md W1.3): pure mechanical move, zero behavior change.
+//! `value.get` path resolution and the wire encoding / elision rule. See
+//! `site/content/internals/kernel-protocol.md` and
+//! `site/content/internals/intercrate-protocol-contracts.md`.
 use super::*;
 
-/// `value.get`'s `path` grammar (TDD §7, AGENT-SURFACE §1): dot fields,
+/// `value.get`'s `path` grammar (site/content/internals/language-conformance-contract.md, site/content/internals/kernel-protocol.md): dot fields,
 /// `[n]` indexes, and `[a..b]` half-open ranges — e.g. `rows[3].name`,
 /// `out.lines[0]`, `rows[0..5]`. Structural fields on non-`Record` values
 /// (outcome/error/range/task/table) are synthesized so an agent can walk
@@ -32,7 +32,7 @@ fn parse_value_path(path: &str) -> Result<Vec<PathSeg>, String> {
                     .map(|p| p + i + 1)
                     .ok_or_else(|| format!("unterminated `[` in path `{path}`"))?;
                 let digits = &path[i + 1..close];
-                // `[a..b]` half-open range (AGENT-SURFACE §1) — this used to
+                // `[a..b]` half-open range (site/content/internals/kernel-protocol.md) — this used to
                 // be rejected as a "bad index" despite the doc promising it.
                 if let Some((a, b)) = digits.split_once("..") {
                     let a = a
@@ -79,7 +79,7 @@ fn path_field(value: &Value, name: &str) -> Result<Value, String> {
             "ok" => Value::Bool(o.ok),
             "signal" => o.signal.clone().map(Value::Str).unwrap_or(Value::Null),
             "out" => o.out_value(),
-            // §317: a value-position capture whose stdout spilled to the CAS
+            // site/content/internals/kernel-protocol.md: a value-position capture whose stdout spilled to the CAS
             // surfaces `.stdout` as a lazy, ref-backed `bytes` (true length,
             // on-demand load), so `value.get {path:"stdout", slice/format}` can
             // resolve the full content — mirroring the eval-side field accessor
@@ -182,7 +182,7 @@ pub(crate) fn resolve_value_path(value: &Value, path: &str) -> Result<Value, Str
     Ok(current)
 }
 
-/// `Outcome`'s wire `span` (AGENT-SURFACE §2: "source span of the
+/// `Outcome`'s wire `span` (site/content/internals/kernel-protocol.md: "source span of the
 /// invocation"), honestly reported.
 ///
 /// `OutcomeVal` (`crates/shoal-value/src/outcome.rs`) now carries an
@@ -230,10 +230,10 @@ pub(crate) fn wire_value(value: &Value) -> WireValue {
         Value::Bytes(v) => WireValue::Bytes {
             v: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &**v),
         },
-        // §317 lazy CAS-backed bytes. The raw encoder can't do I/O, so it emits
+        // site/content/internals/kernel-protocol.md lazy CAS-backed bytes. The raw encoder can't do I/O, so it emits
         // the resident preview; the elision layer (`elide_wire_value`) is where
         // a top-level CAS-backed value becomes an honest `Ref` carrying its true
-        // length. (Elision at the boundary is mandated by AGENT-SURFACE §3, so a
+        // length. (Elision at the boundary is mandated by site/content/internals/kernel-protocol.md, so a
         // top-level oversized capture always goes through that path.)
         Value::CasBytes(c) => WireValue::Bytes {
             v: base64::Engine::encode(
@@ -322,7 +322,7 @@ pub(crate) fn wire_value(value: &Value) -> WireValue {
 }
 
 // ---------------------------------------------------------------------------
-// The elision rule (AGENT-SURFACE §3) — wire-level, automatic.
+// The elision rule (site/content/internals/kernel-protocol.md) — wire-level, automatic.
 // ---------------------------------------------------------------------------
 
 /// Kernel defaults; a caller's `elide` param may tighten or loosen these, but
@@ -378,7 +378,7 @@ impl ElideBudget {
 }
 
 /// `shoal://kind/id[?path=...]` from a short ref (`kind:id`), per
-/// AGENT-SURFACE §1.
+/// site/content/internals/kernel-protocol.md.
 pub(crate) fn short_ref_to_uri(r: &Ref, path: Option<&str>) -> String {
     let mut uri = match r.0.split_once(':') {
         Some((kind, rest)) => format!("shoal://{kind}/{rest}"),
@@ -406,7 +406,7 @@ fn preview_value(value: &Value) -> Value {
         Value::Bytes(b) => Value::Bytes(std::sync::Arc::new(
             b.iter().take(ELIDE_PREVIEW_BYTES).copied().collect(),
         )),
-        // §317: preview a CAS-backed value from its resident prefix (never load).
+        // site/content/internals/kernel-protocol.md: preview a CAS-backed value from its resident prefix (never load).
         Value::CasBytes(c) => Value::Bytes(std::sync::Arc::new(
             c.preview
                 .iter()
@@ -447,7 +447,7 @@ fn join_path_uri(uri: &str, sub_path: &str) -> String {
     }
 }
 
-/// The elision rule (AGENT-SURFACE §3): if `value`'s wire encoding exceeds
+/// The elision rule (site/content/internals/kernel-protocol.md): if `value`'s wire encoding exceeds
 /// `budget`, or it is an over-threshold table/list/bytes, emit an elided
 /// `WireValue::Ref` (shape + small preview + render head) instead of the
 /// payload. `uri` is how a caller re-fetches the full value later.
@@ -484,7 +484,7 @@ pub(crate) fn elide_wire_value(value: &Value, uri: &str, budget: &ElideBudget) -
         || matches!(value, Value::Table(rows) if rows.len() > budget.max_rows)
         || matches!(value, Value::List(items) if items.len() > budget.max_items)
         || matches!(value, Value::Bytes(b) if b.len() > budget.max_bytes_raw)
-        // A §317 CAS-backed value is oversized by construction — always elide
+        // A site/content/internals/kernel-protocol.md CAS-backed value is oversized by construction — always elide
         // it to an honest ref rather than shipping its preview as if complete.
         || matches!(value, Value::CasBytes(_));
     if !too_big {
@@ -494,7 +494,7 @@ pub(crate) fn elide_wire_value(value: &Value, uri: &str, budget: &ElideBudget) -
         Value::Table(rows) => rows.len(),
         Value::List(items) => items.len(),
         Value::Bytes(b) => b.len(),
-        // §317: the true total length (never the preview length).
+        // site/content/internals/kernel-protocol.md: the true total length (never the preview length).
         Value::CasBytes(c) => c.len as usize,
         Value::Str(s) => s.len(),
         Value::Record(rec) => rec.len(),
@@ -541,7 +541,7 @@ pub(crate) fn strip_ansi(s: &str) -> String {
 }
 
 /// Bound a human render string to `ELIDE_HARD_CAP`, the same hard cap
-/// `shoal-mcp`'s `content[0].text` is bounded to (AGENT-SURFACE §3). Without
+/// `shoal-mcp`'s `content[0].text` is bounded to (site/content/internals/kernel-protocol.md). Without
 /// this, `ExecResult.render`/`value.get`'s `format=render` response can carry
 /// an arbitrarily large render string (e.g. a huge outcome's ANSI-laden
 /// stdout) right next to a properly-elided structured `value` — the render

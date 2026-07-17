@@ -1,7 +1,7 @@
 //! PtyTee mode: the child runs on a real PTY as session leader; output
 //! streams raw to the real terminal and is teed into the result buffer.
 //!
-//! Job control (TDD §4.7) is layered on top of this without disturbing the
+//! Job control (site/content/internals/language-conformance-contract.md) is layered on top of this without disturbing the
 //! passthrough. Every PtyTee child is a session/process-group leader (portable-
 //! pty calls `setsid` in the child, so its process-group id equals its pid — we
 //! never `setpgid` from the parent, which would `EPERM` on a session leader).
@@ -313,7 +313,7 @@ enum Wait {
 }
 
 /// A PTY foreground command and everything needed to keep it alive across a
-/// stop and later resume it (TDD §4.7). Created for every PtyTee run; parked in
+/// stop and later resume it (site/content/internals/language-conformance-contract.md). Created for every PtyTee run; parked in
 /// [`PARKED_JOBS`] only when the child is stopped rather than finishing.
 ///
 /// The `master` is retained (never moved into a helper thread) precisely so the
@@ -490,7 +490,7 @@ impl PtyJob {
             truncated,
             // PtyTee (statement position) never spills to disk: its bytes
             // already reached the real terminal and the tee is a bounded
-            // convenience — §317 value-position spill is a Capture-mode concern.
+            // convenience — site/content/internals/process-execution.md value-position spill is a Capture-mode concern.
             stdout_spill: None,
             dur: self.start.elapsed(),
             pid: self.pid as u32,

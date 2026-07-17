@@ -1,8 +1,7 @@
-//! Kernel-native pub/sub (AGENT-SURFACE §4/§6): the per-channel ring buffer
+//! Kernel-native pub/sub (site/content/internals/kernel-protocol.md): the per-channel ring buffer
 //! plus the `events.*` dispatch handlers (`events.read`, `events.publish`,
-//! `events.subscribe`, `events.unsubscribe`). Split out of `lib.rs`
-//! (docs/ROADMAP.md wave R4): pure mechanical move, zero wire/behavior
-//! change.
+//! `events.subscribe`, `events.unsubscribe`). See
+//! `site/content/internals/kernel-protocol.md` for the wire contract.
 use super::*;
 
 /// A per-connection socket writer shared between the request/response path
@@ -13,14 +12,14 @@ pub(crate) type SharedWriter = Arc<Mutex<UnixStream>>;
 
 /// One ring buffer per channel; `seq` is monotonic per channel. Subscribers
 /// get `event` notifications pushed on their own connection via a bounded,
-/// per-subscriber queue (AGENT-SURFACE §6) — see `SubQueue` below for why.
+/// per-subscriber queue (site/content/internals/kernel-protocol.md) — see `SubQueue` below for why.
 #[derive(Default)]
 pub(crate) struct EventBus {
     channels: Mutex<HashMap<String, ChannelBuf>>,
     subs: Mutex<Vec<Subscriber>>,
     /// The seq↔journal-entry correspondence for the `journal` channel, the
     /// first channel whose events were made replayable past the in-memory
-    /// ring (AGENT-SURFACE §4, audit gap G2). Dense `Vec` indexed by the
+    /// ring (see `site/content/internals/kernel-protocol.md`). Dense `Vec` indexed by the
     /// journal channel's `seq` (0-based, contiguous), holding the journal
     /// `entry_id` each seq was published for. This is only the *pointer* —
     /// the event payload (`head`/`ok`/`principal`) is reconstructed from the
@@ -30,13 +29,13 @@ pub(crate) struct EventBus {
     /// Written (under the `channels` lock, so it can never diverge from the
     /// seqs the ring hands out) only by `publish_journal`; read by the
     /// kernel's `read_journal_channel` fallback. Also rebuilt WHOLESALE, once,
-    /// at kernel construction time by [`EventBus::seed_from_journal`] (P2:
-    /// event-bus seqs surviving a kernel restart) when reopening an existing
+    /// at kernel construction time by [`EventBus::seed_from_journal`] so
+    /// event-bus seqs survive a kernel restart when reopening an existing
     /// on-disk store — see that method for how it recovers exactly this same
     /// membership/order from durable state alone.
     journal_index: Mutex<Vec<i64>>,
     /// The same dense-index idea as `journal_index`, for the
-    /// `session.transcript` channel (the G2 follow-up this closes): indexed
+    /// `session.transcript` channel: indexed
     /// by that channel's own `seq`, holding the journal `entry_id` the
     /// transcript event was published for. Unlike `journal_index`, the
     /// payload this points at is NOT reconstructed from pre-existing journal
@@ -63,11 +62,11 @@ struct Subscriber {
     queue: Arc<SubQueue>,
 }
 
-/// Ring depth per channel (AGENT-SURFACE §4 requires ≥1024).
+/// Ring depth per channel (site/content/internals/kernel-protocol.md requires ≥1024).
 pub(crate) const EVENT_RING_CAP: usize = 1024;
 
 /// Bound on a subscriber's own outgoing queue — distinct from the per-channel
-/// ring buffer above. This is the backpressure boundary AGENT-SURFACE §6
+/// ring buffer above. This is the backpressure boundary site/content/internals/kernel-protocol.md
 /// promises: `publish()` (below) only ever appends to this bounded, in-memory
 /// queue, never performs the blocking socket write itself, so a stalled
 /// subscriber can delay at most its own dedicated writer thread — never the
@@ -77,7 +76,7 @@ pub(crate) const EVENT_RING_CAP: usize = 1024;
 /// (`SubQueueState`) instead of buffered unboundedly.
 const SUB_QUEUE_CAP: usize = 256;
 
-/// The static channels a session may always subscribe to (AGENT-SURFACE §4).
+/// The static channels a session may always subscribe to (site/content/internals/kernel-protocol.md).
 /// `task.{id}` and `user.{name}` are dynamic and not listed here.
 ///
 /// `reef` used to be advertised here with nothing ever publishing to it — a
@@ -87,11 +86,11 @@ const SUB_QUEUE_CAP: usize = 256;
 /// emit point reachable from here yet; rather than leave it advertised but
 /// silent, it has been removed until an eval-side event-forwarder hook
 /// (analogous to `session.rs`'s `user.*` bridge) makes it real. See
-/// `docs/AGENT-SURFACE.md`'s status section.
+/// `site/content/internals/kernel-protocol.md`'s status section.
 pub(crate) const STATIC_CHANNELS: &[&str] =
     &["session.transcript", "journal", "approval", "render"];
 
-/// A subscriber's outgoing queue (AGENT-SURFACE §6): a bounded FIFO of
+/// A subscriber's outgoing queue (site/content/internals/kernel-protocol.md): a bounded FIFO of
 /// not-yet-written events, plus a running count of events dropped since the
 /// queue last drained past capacity. Protected by its OWN lock — never
 /// `EventBus::subs` — so `publish()` appending to one subscriber's queue
@@ -209,7 +208,7 @@ fn spawn_subscriber_writer(queue: Arc<SubQueue>, writer: SharedWriter) {
 /// Which of `EventBus`'s two durable indices (if any) a `publish_inner` call
 /// should record the `entry_id` pointer into — `journal` and
 /// `session.transcript` are the only two journal-backed channels
-/// (AGENT-SURFACE §4); every other channel stays ring-only.
+/// (site/content/internals/kernel-protocol.md); every other channel stays ring-only.
 enum DurableChannel {
     Journal,
     Transcript,
@@ -225,7 +224,7 @@ impl EventBus {
 
     /// Publish on the `journal` channel, recording the durable `entry_id` this
     /// event corresponds to so it can be reconstructed from the journal after
-    /// it ages out of the ring (AGENT-SURFACE §4 journal-backed replay). The
+    /// it ages out of the ring (site/content/internals/kernel-protocol.md journal-backed replay). The
     /// only difference from `publish` is that the seq↔`entry_id` pair is
     /// appended to `journal_index` atomically with the seq assignment.
     pub(crate) fn publish_journal(&self, entry_id: i64, payload: Json) -> Event {
@@ -237,7 +236,7 @@ impl EventBus {
     }
 
     /// Publish on the `session.transcript` channel, recording the durable
-    /// `entry_id` this event corresponds to (the G2 follow-up: mirrors
+    /// `entry_id` this event corresponds to (mirrors
     /// `publish_journal` exactly, but for `transcript_index`). The caller
     /// (`handlers_exec.rs`) has already durably persisted the payload itself
     /// via `Journal::record_transcript_event` — this only records the
@@ -253,7 +252,7 @@ impl EventBus {
 
     /// Append `payload` to `channel`'s ring and enqueue it for every live
     /// subscriber of that channel. Never blocks on a subscriber's socket:
-    /// `Subscriber::queue.push` (AGENT-SURFACE §6) is a bounded, in-memory
+    /// `Subscriber::queue.push` (site/content/internals/kernel-protocol.md) is a bounded, in-memory
     /// operation, and the lock held here (`subs`) guards only that push, not
     /// any write — the actual blocking I/O happens later, on each
     /// subscription's own dedicated writer thread (`spawn_subscriber_writer`).
@@ -430,7 +429,7 @@ impl EventBus {
     }
 
     /// Rebuild `journal`/`session.transcript` seq state from an EXISTING
-    /// on-disk journal's rows (P2 fix, AGENT-SURFACE §4's "replayable from
+    /// on-disk journal's rows (`site/content/internals/kernel-protocol.md` requires replay from
     /// ANY seq" promise): called once, by `Kernel::open`/`open_with_policy`,
     /// BEFORE the kernel starts serving any connection — so a freshly-built
     /// `EventBus::default()` re-mounting a store a PRIOR kernel process
@@ -543,7 +542,7 @@ impl Kernel {
         let p: EventsReadParams = decode(params)?;
         // The `journal` and `session.transcript` channels are journal-backed:
         // a `since` older than the ring's oldest retained seq is served from
-        // the durable journal rather than lost (AGENT-SURFACE §4). Every
+        // the durable journal rather than lost (site/content/internals/kernel-protocol.md). Every
         // other channel is ring-only.
         let events = if p.channel == "journal" {
             self.read_journal_channel(p.since, p.limit)?
@@ -555,8 +554,8 @@ impl Kernel {
         encode(json!({"channel": p.channel, "events": events}))
     }
 
-    /// Read the `journal` channel with journal-backed replay (AGENT-SURFACE §4,
-    /// audit gap G2). Events still in the in-memory ring are served from it
+    /// Read the `journal` channel with journal-backed replay, as specified by
+    /// `site/content/internals/kernel-protocol.md`. Events still in the in-memory ring are served from it
     /// exactly as before (the fast path is untouched); events that have aged
     /// out of the ring — a `since` below the ring's oldest retained seq — are
     /// reconstructed from the durable journal so an agent can replay the
@@ -617,7 +616,7 @@ impl Kernel {
     /// pairs via [`shoal_journal::Journal::entries_by_id`] — a targeted
     /// fetch of exactly the rows this channel needs (the coarse exec-level
     /// entries it published), rather than a wide `query()` scan filtered in
-    /// memory: a G2 follow-up now that `shoal-journal` exposes one. The
+    /// memory now that `shoal-journal` exposes a targeted lookup. The
     /// evaluator's finer per-statement rows present in on-disk stores are
     /// never fetched at all, because their ids are simply absent from
     /// `want`.
@@ -668,7 +667,7 @@ impl Kernel {
     }
 
     /// Read the `session.transcript` channel with journal-backed replay
-    /// (AGENT-SURFACE §4, the G2 follow-up this closes). Mirrors
+    /// (`site/content/internals/kernel-protocol.md`). Mirrors
     /// `read_journal_channel` exactly: the ring tail is served unchanged
     /// (fast path untouched), and a `since` reaching below the ring's oldest
     /// retained seq is reconstructed from the durable
@@ -754,7 +753,7 @@ impl Kernel {
     ) -> Result<Json, RpcError> {
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
         let p: EventsPublishParams = decode(params)?;
-        // AGENT-SURFACE §4: only `user.*` channels are client-writable;
+        // site/content/internals/kernel-protocol.md: only `user.*` channels are client-writable;
         // the kernel owns the semantic channels.
         if !p.channel.starts_with("user.") {
             return Err(RpcError {
@@ -832,7 +831,7 @@ mod tests {
         serde_json::from_str(&line).unwrap()
     }
 
-    /// FIX 1 regression: `publish()` must return promptly even when a
+    /// Regression: `publish()` must return promptly even when a
     /// subscriber never reads its socket at all — the original bug had
     /// `publish()` call a blocking `write_all` per subscriber while holding
     /// `EventBus::subs`, so one inert subscriber froze every future publish
@@ -861,7 +860,7 @@ mod tests {
         drop(client_end);
     }
 
-    /// FIX 1: a genuinely stalled subscriber (its writer thread blocked mid
+    /// A genuinely stalled subscriber (its writer thread blocked mid
     /// write) must not stall a second, healthy subscriber on the same
     /// channel — proving `publish()`'s per-subscriber queue push is
     /// independent across subscribers, not just fast in isolation. The stall
@@ -917,9 +916,9 @@ mod tests {
         drop(healthy_client);
     }
 
-    /// FIX 1: once a stalled subscriber's queue overflows `SUB_QUEUE_CAP`,
+    /// Once a stalled subscriber's queue overflows `SUB_QUEUE_CAP`,
     /// further events for it must coalesce into a `{dropped, latest_seq}`
-    /// summary (AGENT-SURFACE §6) rather than buffering unboundedly — and
+    /// summary (site/content/internals/kernel-protocol.md) rather than buffering unboundedly — and
     /// once the stall clears, that summary (not a flood of the individually
     /// dropped events) is what the subscriber actually receives.
     #[test]
@@ -987,7 +986,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // `EventBus::seed_from_journal` (P2: seqs surviving a kernel restart).
+    // `EventBus::seed_from_journal`: seqs surviving a kernel restart.
     // -----------------------------------------------------------------------
 
     /// Appends one "coarse" entry (`ast` = a whole [`Program`]) to `journal`,
@@ -1037,7 +1036,7 @@ mod tests {
         coarse_id
     }
 
-    /// The core P2 regression: seeding from an on-disk store that already
+    /// Core restart regression: seeding from an on-disk store that already
     /// holds prior "exec" entries must (1) recover ONLY the coarse
     /// whole-submission entries into `journal_index` — the interleaved fine
     /// per-statement rows a real session evaluator also writes must be

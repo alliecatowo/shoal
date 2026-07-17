@@ -1,4 +1,4 @@
-# Curated teaching diagnostics (TDD §2.1's "illegal everywhere" list plus a
+# Curated teaching diagnostics (site/content/internals/language-conformance-contract.md "illegal everywhere" list plus a
 # few parser-specific ones) not yet covered by core.toml's pipe/dollar/
 # backtick/comparison-chain quartet: bad string escapes, unterminated
 # interpolation, `&` used as a bitwise-looking operator (command syntax
@@ -44,7 +44,7 @@ parse_error_contains = "not an operator"
 
 [[case]]
 name = "teach-leading-pipe-in-match-arm"
-# `|` is only legal BETWEEN alternated patterns (TDD §1.4's one asylum for
+# `|` is only legal BETWEEN alternated patterns (site/content/internals/language-conformance-contract.md one asylum for
 # `|`); a leading one before the first pattern is a dedicated diagnostic,
 # not a generic "expected pattern" error. hint (not asserted): "alternation
 # is `a | b => …`; drop the leading `|`".

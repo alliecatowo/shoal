@@ -1,5 +1,5 @@
-//! Method dispatch for `stream<T>` (STREAMS §3–§4). Lazy combinators return a
-//! fresh stream (consuming `s`, TDD §1.9); sinks drive it. `.into` / `.render` /
+//! Method dispatch for `stream<T>` (site/content/internals/streams-channels.md). Lazy combinators return a
+//! fresh stream (consuming `s`, site/content/internals/language-conformance-contract.md); sinks drive it. `.into` / `.render` /
 //! `.feed` are handled one level up in the evaluator (they need the event bus,
 //! the statement sink, or a child process) and never reach here.
 
@@ -68,7 +68,7 @@ pub(crate) fn stream_method(
         }
         "collect" => no_args(&args).and_then(|_| collect_stream(ctx, &s).map(Value::List)),
         "save" | "append" => stream_save(ctx, s, arg(&args, 0)?),
-        // `.tee(n)` (STREAMS §1): fork into n independently-drivable streams.
+        // `.tee(n)` (site/content/internals/streams-channels.md): fork into n independently-drivable streams.
         // A bounded stream materializes once and each fork replays the full
         // list (exact whole-stream replay, the pre-existing behavior); a
         // live/endless stream — where materializing would be
@@ -93,7 +93,7 @@ pub(crate) fn stream_method(
     }
 }
 
-/// `.save(path)` / `.append(path)` on a stream (STREAMS §4): append each item as
+/// `.save(path)` / `.append(path)` on a stream (site/content/internals/streams-channels.md): append each item as
 /// it arrives (live logging) rather than buffering the whole stream first.
 fn stream_save(ctx: &mut dyn CallCtx, s: StreamVal, path: &Value) -> VResult<Value> {
     let p = match path {

@@ -32,7 +32,7 @@ impl Evaluator {
         let v = self.cmd_arg_value(a)?;
         if let Value::Glob(g) = v {
             let paths = self.expand_glob(&g)?;
-            // Zero-match glob lint (defect #16, §1.5): nullglob still yields zero
+            // Zero-match glob lint (defect #16, site/content/internals/language-conformance-contract.md): nullglob still yields zero
             // argv, but a statement-level miss is worth a diagnostic.
             if paths.is_empty() {
                 eprintln!("shoal: no matches for {}", g.pattern);
@@ -43,13 +43,13 @@ impl Evaluator {
         }
     }
     /// Expand a glob value into its sorted `list<path>` matches against the
-    /// glob's origin cwd, honoring the dotfile-exclusion rule (TDD §4.3). This
+    /// glob's origin cwd, honoring the dotfile-exclusion rule (site/content/internals/language-conformance-contract.md). This
     /// is the shared core behind command-argument expansion, `for x in <glob>`,
     /// and the glob-value collection methods; it emits no nullglob lint — the
     /// command-argument path adds that itself.
     pub(crate) fn expand_glob(&self, g: &shoal_value::GlobVal) -> VResult<Vec<Value>> {
         let pat = g.cwd.join(&g.pattern).to_string_lossy().into_owned();
-        // Dotfile exclusion (TDD §4.3): a plain `*.txt` skips `.hidden.txt`;
+        // Dotfile exclusion (site/content/internals/language-conformance-contract.md): a plain `*.txt` skips `.hidden.txt`;
         // dotfiles are only matched when the pattern's own last component
         // starts with `.`, or the glob was built `hidden: true`.
         let options = glob::MatchOptions {
@@ -120,7 +120,7 @@ impl Evaluator {
 }
 
 /// Whether a glob pattern intends to match dotfiles: true when its final path
-/// component begins with a literal `.` (TDD §4.3 "unless pattern starts with
+/// component begins with a literal `.` (site/content/internals/language-conformance-contract.md "unless pattern starts with
 /// `.`"). `**/.env` → true, `*.txt` / `**/*.txt` → false.
 fn pattern_matches_dotfiles(pattern: &str) -> bool {
     pattern

@@ -8,7 +8,7 @@ use crate::host::builtin_outcome;
 
 impl Evaluator {
     pub(crate) fn eval_command(&mut self, call: &CmdCall, position: Position) -> VResult<Value> {
-        // Trailing `&` desugars to `spawn { <call> }` (TDD §3.4): the command
+        // Trailing `&` desugars to `spawn { <call> }` (site/content/internals/language-conformance-contract.md): the command
         // runs on a background task and the statement yields a `task` handle
         // instead of running synchronously.
         if call.background {
@@ -31,7 +31,7 @@ impl Evaluator {
         if let Some(bound) = self.env.get(&call.head)
             && bound.is_callable()
         {
-            // `deploy --help` synthesises the signature + doc (§4.4, defect #12).
+            // `deploy --help` synthesises the signature + doc (site/content/internals/language-conformance-contract.md, defect #12).
             if let Value::Closure(c) = &bound
                 && call
                     .args
@@ -42,7 +42,7 @@ impl Evaluator {
                 self.emit(&Value::Str(help));
                 return Ok(Value::Null);
             }
-            // A parameter typed `glob` owns expansion itself (TDD §4.3): the
+            // A parameter typed `glob` owns expansion itself (site/content/internals/language-conformance-contract.md): the
             // callee receives the compiled, unexpanded pattern, so a glob-typed
             // positional slot must skip the generic glob-expansion path below.
             let closure_sig: Option<(&[Param], Option<&RestParam>)> = match &bound {
@@ -59,7 +59,7 @@ impl Evaluator {
                         let v = match value {
                             Some(v) => self.cmd_arg_value(v)?,
                             // `--name v` ≡ `--name=v` when `name` is a declared
-                            // non-bool parameter (TDD §4.4): the flag consumes
+                            // non-bool parameter (site/content/internals/language-conformance-contract.md): the flag consumes
                             // the next word as its value instead of binding
                             // presence and rerouting the word as a positional.
                             // Bool-typed (and untyped/unknown) names keep
@@ -90,7 +90,7 @@ impl Evaluator {
                         pos.push(self.cmd_arg_value(a)?);
                     }
                     // A non-variadic `list<T>` param receives an entire word/glob
-                    // expansion as one list (TDD §4.3): `showpaths *.txt` binds
+                    // expansion as one list (site/content/internals/language-conformance-contract.md): `showpaths *.txt` binds
                     // every sorted match to `paths: list<path>`, not just the
                     // first. Element type coercion (`path`/`str`/…) applies per
                     // item; `coerce_call_args` leaves the assembled list intact.
@@ -124,7 +124,7 @@ impl Evaluator {
             return self.call_value(&bound, CallArgs { pos, named });
         }
         // A bare word bound to a non-callable value (e.g. `it`, `out`, or any
-        // `let`) resolves to that value — bound names dispatch as EXPR (§3.1.3).
+        // `let`) resolves to that value — bound names dispatch as EXPR (site/content/internals/language-conformance-contract.md).
         if let Some(bound) = self.env.get(&call.head)
             && !call.forced
             && !bound.is_callable()
@@ -146,7 +146,7 @@ impl Evaluator {
             self.pending_exit = Some(code);
             return Ok(Value::Null);
         }
-        // plan/apply/explain REPL verbs (ROADMAP R3). `plan { … }` renders the
+        // plan/apply/explain REPL verbs (site/content/internals/roadmap-and-priorities.md). `plan { … }` renders the
         // effect plan without spawning; `apply <ref>` runs a derived plan;
         // `explain(src)` renders what a source string would do. Intercepted before
         // builtin/adapter/external dispatch so `plan`/`apply`/`explain` are verbs.
@@ -162,7 +162,7 @@ impl Evaluator {
         if call.head == "interact" {
             return self.builtin_interact(call);
         }
-        // `assert(cond, msg?)` (CONTRACTS §4) — also reachable as a command head.
+        // `assert(cond, msg?)` (site/content/internals/intercrate-protocol-contracts.md) — also reachable as a command head.
         if call.head == "assert" {
             let pos = self.collect_cmd_values(call)?;
             return self
@@ -180,7 +180,7 @@ impl Evaluator {
             let vs = self.collect_cmd_values(call)?;
             return self.builtin_save(vs);
         }
-        // `which` is reef-aware (REEF §6): it renders a resolution report, not a
+        // `which` is reef-aware (site/content/internals/reef-resolution.md): it renders a resolution report, not a
         // bare path. Intercepted before the generic builtin dispatch so it can
         // reach the scope chain; still wrapped as an outcome + redirect-capable.
         if call.head == "which" {
@@ -188,7 +188,7 @@ impl Evaluator {
             let outcome = builtin_outcome("which", value);
             return self.apply_builtin_redirects(call, outcome);
         }
-        // `reef` builtin family (REEF §6): binding table, add, lock, fetch.
+        // `reef` builtin family (site/content/internals/reef-resolution.md): binding table, add, lock, fetch.
         if call.head == "reef" {
             let value = self.builtin_reef(call)?;
             let outcome = builtin_outcome("reef", value);
@@ -206,7 +206,7 @@ impl Evaluator {
             // the outcome's `.out` (`parsed`), `status = 0`/`ok = true`. A
             // builtin error still raises as before (via `?`).
             //
-            // TDD §9 undo: capture prior state of an overwriting cp/mv/save
+            // site/content/internals/language-conformance-contract.md undo: capture prior state of an overwriting cp/mv/save
             // BEFORE the mutation, then record the typed inverse AFTER. All a
             // no-op unless a journal is installed and a statement is executing.
             let undo_pre = self.fs_undo_pre(&call.head, call);
@@ -240,7 +240,7 @@ impl Evaluator {
         if call.head == "pwd" {
             return Ok(Value::Path(self.cwd.clone()));
         }
-        // `run` is the poly runner + dynamic form (pty §8): dispatch by extension
+        // `run` is the poly runner + dynamic form (site/content/internals/pty-job-control.md): dispatch by extension
         // or, for a non-path name, invoke dynamically as a command.
         if call.head == "run" {
             let mut vs = self.collect_cmd_values(call)?;
@@ -283,7 +283,8 @@ impl Evaluator {
                 return self.eval_program(&program);
             }
             // A `.shl` head runs as a separate program in a child evaluator
-            // with a fresh lexical scope (IO.md §3.2 step 4) — share the
+            // with a fresh lexical scope (see
+            // `site/content/internals/values-streams-execution.md`) — share the
             // `run x.shl` path so bindings cannot leak into this session.
             let args = self.collect_cmd_values(call)?;
             return self.run_script_file(&path, Some("shl"), args, position);
@@ -313,13 +314,13 @@ impl Evaluator {
         for r in &call.redirects {
             let target = self.arg_path(&r.target)?;
             match r.kind {
-                // Undo (TDD §9): an external command's `> file` / `>> file`
+                // Undo (site/content/internals/language-conformance-contract.md): an external command's `> file` / `>> file`
                 // clobbers the target's contents just like `cp` — snapshot the
                 // prior bytes first, record the restore inverse after, so
                 // `some-cmd > f` and `sh { … } > f` are reversible too.
                 RedirectKind::Out => {
                     let undo_pre = self.redirect_undo_pre(&target);
-                    // §317: write the FULL stdout (load from CAS when it
+                    // site/content/internals/language-conformance-contract.md: write the FULL stdout (load from CAS when it
                     // spilled), never just the resident preview.
                     fs.write(&target, &out.stdout_bytes()?)
                         .map_err(|e| ErrorVal::new("custom", e.to_string()))?;
@@ -352,7 +353,7 @@ impl Evaluator {
     }
 
     /// Reject a session-cwd mutation (`cd`/`pushd`/`popd`) inside a `fn` body
-    /// (TDD §4.6): a fn must not move the ambient session cwd — `with cwd:` is
+    /// (site/content/internals/language-conformance-contract.md): a fn must not move the ambient session cwd — `with cwd:` is
     /// the scoped alternative. A pure guard shared by all three verbs.
     fn ensure_cwd_mutable(&self, verb: &str, span: Span) -> VResult<()> {
         if self.in_fn_body > 0 {
@@ -367,7 +368,7 @@ impl Evaluator {
         Ok(())
     }
 
-    /// `cd [dir]` / `cd -` (TDD §4.6). Bare `cd` goes to `$HOME`; `cd -` returns
+    /// `cd [dir]` / `cd -` (site/content/internals/language-conformance-contract.md). Bare `cd` goes to `$HOME`; `cd -` returns
     /// to the previous directory (OLDPWD) and echoes it (bash parity, achieved
     /// by returning the `Path`, which the statement sink renders); otherwise cd
     /// to the resolved, canonicalized path. Every form records into the frecency
@@ -621,7 +622,7 @@ impl Evaluator {
                 env.push((OsString::from(&p.name), s));
             }
         }
-        // reef spawn-time resolution (docs/REEF.md §2, §4). A pure no-op unless
+        // reef spawn-time resolution (site/content/internals/reef-resolution.md). A pure no-op unless
         // the head is a bare name constrained by a manifest in scope — so a
         // repo with no `.reef.toml` spawns exactly as before. When reef resolves
         // the head it hands back the binary's content hash so the leash spawn
@@ -633,7 +634,7 @@ impl Evaluator {
         } else {
             ExecMode::Capture
         };
-        // A PTY child owns the real terminal for its run (TDD §1.2 "byte-
+        // A PTY child owns the real terminal for its run (site/content/internals/language-conformance-contract.md "byte-
         // identical to bash"): unless a redirect (`< file`) or `.feed` already
         // claimed stdin, forward the user's tty — shoal-exec then engages raw
         // mode on the real terminal and pumps stdin/resizes to the child.
@@ -654,13 +655,13 @@ impl Evaluator {
             .map(|x| x.to_string_lossy())
             .collect::<Vec<_>>()
             .join(" ");
-        // TDD §8 leash activation: under a scoped leash policy, wrap the child
+        // site/content/internals/language-conformance-contract.md leash activation: under a scoped leash policy, wrap the child
         // in the strongest available OS backend (Landlock/Seatbelt) before
         // exec. `resolve_sandbox` returns `None` for the default-permissive
         // policy (and when no policy is installed), so this is a pure no-op on
         // the normal path — the child spawns exactly as before.
         let sandbox = self.resolve_sandbox();
-        // TDD §8 spawn-hash pinning: consult the leash effect evaluator with
+        // site/content/internals/language-conformance-contract.md spawn-hash pinning: consult the leash effect evaluator with
         // this spawn's *resolved* binary (post-reef `argv[0]`) before exec. A
         // pure no-op unless the active principal pins `proc_spawn` — see
         // `spawn_gate`, which guards against a default-deny regression by only
@@ -669,9 +670,9 @@ impl Evaluator {
             self.spawn_gate(argv0, reef_hash.as_deref(), span)?;
         }
         // Capture the head before `argv` moves into the spawn spec, so a
-        // `not_found` failure below can offer a command did-you-mean (TDD §13.9).
+        // `not_found` failure below can offer a command did-you-mean (site/content/internals/language-conformance-contract.md).
         let failed_head = argv.first().map(|s| s.to_string_lossy().into_owned());
-        // TDD §317 disk-spill: for value-position captures only (never PTY,
+        // site/content/internals/language-conformance-contract.md disk-spill: for value-position captures only (never PTY,
         // whose output already reached the terminal), and only when a journal
         // is installed to adopt the overflow into its CAS. `None` otherwise
         // preserves the exact pre-spill behavior (bounded RAM buffer, overflow
@@ -684,7 +685,7 @@ impl Evaluator {
         } else {
             None
         };
-        // Spawn through the Exec port (docs/ROADMAP.md R4). The default
+        // Spawn through the Exec port (site/content/internals/roadmap-and-priorities.md). The default
         // `StdExec` is `shoal_exec::run` verbatim, so this is byte-identical.
         let exec = self.exec.clone();
         let mut r = exec
@@ -707,7 +708,7 @@ impl Evaluator {
                     e.to_string(),
                 )
                 .with_span(span);
-                // TDD §13.9: when the head simply isn't a resolvable command,
+                // site/content/internals/language-conformance-contract.md: when the head simply isn't a resolvable command,
                 // point at the closest known one (builtins ∪ adapter heads ∪
                 // in-scope callable bindings) — mirrors the method did-you-mean.
                 // The primary `not_found`/"command not found" code+message is
@@ -721,7 +722,7 @@ impl Evaluator {
                     None => err,
                 }
             })?;
-        // Job control (TDD §4.7): a foreground PtyTee child that was *stopped*
+        // Job control (site/content/internals/language-conformance-contract.md): a foreground PtyTee child that was *stopped*
         // (Ctrl-Z → SIGTSTP) rather than finishing. Register it as a suspended
         // job (so it lists in `jobs` and the REPL `fg`/`bg` can resume its parked
         // PTY by pid) and return a streamed outcome that renders nothing — the
@@ -734,7 +735,7 @@ impl Evaluator {
                 signal: None,
                 ok: false,
                 stdout: Arc::new(r.stdout),
-                // A stopped PtyTee job never spills to CAS (§317 spill is a
+                // A stopped PtyTee job never spills to CAS (capture spill is a
                 // Capture-mode, value-position concern).
                 stdout_ref: None,
                 stderr: Arc::new(Vec::new()),
@@ -755,9 +756,9 @@ impl Evaluator {
         });
         // Take the resident stdout once (it is the bounded preview when a spill
         // occurred, the whole thing otherwise) and share the one allocation
-        // between the outcome's `.stdout` and any §317 ref-backed view.
+        // between the outcome's `.stdout` and any site/content/internals/language-conformance-contract.md ref-backed view.
         let stdout = Arc::new(std::mem::take(&mut r.stdout));
-        // TDD §317: if stdout overflowed the RAM cap and spilled to disk, adopt
+        // site/content/internals/language-conformance-contract.md: if stdout overflowed the RAM cap and spilled to disk, adopt
         // the spill into the CAS and back `.stdout` with a lazy ref (true
         // length + on-demand load). `None` on every ordinary capture.
         let stdout_ref = r
@@ -779,7 +780,7 @@ impl Evaluator {
             // Stamp the invocation's source span — the same `span` the sibling
             // error path below hands to `ErrorVal::with_span`, so a command's
             // success and failure carry an identical source anchor on the wire
-            // (AGENT-SURFACE §2).
+            // (site/content/internals/kernel-protocol.md).
             span: Some(span),
         }));
         if !ok && position == Position::Statement {
@@ -799,7 +800,7 @@ impl Evaluator {
         }
     }
 
-    /// Adopt a value-position capture's disk spill (TDD §317) into the journal
+    /// Adopt a value-position capture's disk spill (site/content/internals/language-conformance-contract.md) into the journal
     /// CAS and hand back a lazy, ref-backed view of the full stdout. `preview`
     /// is the bounded resident prefix (shared with the outcome's `.stdout`).
     ///
@@ -838,7 +839,7 @@ impl Evaluator {
     /// [`shoal_value::CasBytesVal::reference`] / `.ref` yields) into a lazy
     /// [`Value::CasBytes`] backed by this session's journal CAS, so a bare ref
     /// *written as a value* dispatches methods and materializes exactly like the
-    /// §317 spill it came from (this is the in-language mirror of the wire
+    /// spill it came from (this is the in-language mirror of the wire
     /// `value.get` resolution).
     ///
     /// Returns `None` when `s` is not a content ref at all — the caller then
@@ -891,7 +892,7 @@ impl Evaluator {
         })))
     }
 
-    /// The leash spawn gate (TDD §8 content-hash pinning). Consulted from
+    /// The leash spawn gate (site/content/internals/language-conformance-contract.md content-hash pinning). Consulted from
     /// `run_argv` for every external spawn, just before exec. Returns `Ok(())`
     /// — allow — in every case EXCEPT when the active principal pins process
     /// spawns (a non-empty `proc_spawn` allowlist) AND the resolved binary
@@ -990,7 +991,7 @@ impl Evaluator {
         shoal_exec::which(OsStr::new(name), path).is_some()
     }
 
-    /// Command did-you-mean (TDD §13.9): when a command head fails to resolve,
+    /// Command did-you-mean (site/content/internals/language-conformance-contract.md): when a command head fails to resolve,
     /// find the closest *known* command name so the `not_found` error can carry
     /// a `did you mean 'X'?` hint — the command-head analogue of the method
     /// did-you-mean (`shoal_value::methods::suggest`).
@@ -1072,14 +1073,15 @@ impl Evaluator {
     }
 }
 
-/// Loads a §317 spilled capture's full bytes from the journal CAS on demand.
+/// Loads a spilled capture's full bytes from the journal CAS on demand.
 /// Holds a DB-independent [`shoal_journal::Cas`] (just a path), so a ref-backed
 /// [`shoal_value::CasBytesVal`] stays `Send + Sync` and outlives the borrow of
 /// the evaluator that produced it.
 ///
 /// Reused verbatim by [`crate::Evaluator::resolve_content_ref`] to back a bare
-/// `val:blake3:<hash>` ref written as a value (the §317 in-language dispatch
-/// follow-up) — same CAS seam as a fresh spill, so a recovered ref materializes
+/// `val:blake3:<hash>` ref written as a value (see
+/// `site/content/internals/persistence.md`) — same CAS seam as a fresh spill,
+/// so a recovered ref materializes
 /// exactly like the capture it came from.
 pub(crate) struct CasBytesLoader {
     cas: shoal_journal::Cas,
@@ -1100,7 +1102,7 @@ impl shoal_value::BytesLoad for CasBytesLoader {
 
 #[cfg(test)]
 mod command_did_you_mean_tests {
-    //! TDD §13.9 command did-you-mean. The conformance corpus
+    //! site/content/internals/language-conformance-contract.md command did-you-mean. The conformance corpus
     //! (`spec/cases/edges.toml`) proves the hint reaches the wire for builtin +
     //! session-binding sources; these unit tests pin what the corpus harness
     //! cannot — the adapter candidate source (the corpus evaluator loads none),
@@ -1209,7 +1211,7 @@ mod command_did_you_mean_tests {
 
 #[cfg(test)]
 mod dispatch_registry_lockstep {
-    //! Audit P5: `eval_command`'s special-head dispatch is a hand-written
+    //! `eval_command`'s special-head dispatch is a hand-written
     //! if-chain of head-equality guards, while the *canonical* builtin registry
     //! (`shoal_syntax::commands`, which the completer/highlighter/LSP consume)
     //! lives elsewhere. A comment asks to "keep this in lockstep" but nothing

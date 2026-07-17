@@ -1,5 +1,5 @@
 # Range value hardening: exclusive/inclusive length, empty/reversed ranges
-# (never an error — just zero iterations, matching TDD's general "no
+# (never an error — just zero iterations, matching site/content/internals/language-conformance-contract.md's general "no
 # surprises" numeric philosophy), `.contains`/`in`, iteration over a range
 # via `.map`/`.sum`/`for`, and the int-only bound restriction (float bounds
 # are a type error — ranges are a discrete-step construct). Every value
@@ -69,7 +69,7 @@ value = "15"
 
 [[case]]
 name = "range-float-bound-is-type-error"
-# Ranges are a discrete-step construct restricted to `int` bounds (TDD §4.1
+# Ranges are a discrete-step construct restricted to `int` bounds (site/content/internals/language-conformance-contract.md
 # lists `int`, not `float`, among range-admitting types) — a float bound is
 # a type error, not silent truncation.
 src = "1..5.5"

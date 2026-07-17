@@ -1,0 +1,68 @@
+{% import "macros/icons.html" as icons %}
+{% import "macros/docs.html" as docs %}
+<!doctype html>
+<html lang="{{ lang | default(value=config.default_language) }}" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <script>try{document.documentElement.dataset.theme=localStorage.getItem("shoal-theme")||"dark"}catch(e){}</script>
+
+  {% set meta_title = config.title %}
+  {% set meta_description = config.description %}
+  {% set canonical_url = config.base_url %}
+  {% if page %}
+    {% set meta_title = page.title ~ " · " ~ config.title %}
+    {% set canonical_url = page.permalink %}
+    {% if page.description %}{% set meta_description = page.description %}{% endif %}
+  {% elif section %}
+    {% if section.path != "/" %}{% set meta_title = section.title ~ " · " ~ config.title %}{% endif %}
+    {% set canonical_url = section.permalink %}
+    {% if section.description %}{% set meta_description = section.description %}{% endif %}
+  {% endif %}
+
+  <title>{% block title %}{{ meta_title }}{% endblock title %}</title>
+  <meta name="description" content="{{ meta_description }}">
+  <link rel="canonical" href="{{ canonical_url | safe }}">
+  <meta name="theme-color" content="#07111f" media="(prefers-color-scheme: dark)">
+  <meta name="theme-color" content="#f5f8fc" media="(prefers-color-scheme: light)">
+
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="Shoal">
+  <meta property="og:title" content="{{ meta_title }}">
+  <meta property="og:description" content="{{ meta_description }}">
+  <meta property="og:url" content="{{ canonical_url | safe }}">
+  <meta property="og:image" content="{{ get_url(path=config.extra.social_image) }}">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="{{ meta_title }}">
+  <meta name="twitter:description" content="{{ meta_description }}">
+  <meta name="twitter:image" content="{{ get_url(path=config.extra.social_image) }}">
+
+  <link rel="icon" href="{{ get_url(path="favicon.svg") }}" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="{{ get_url(path="img/apple-touch-icon.png") }}">
+  <link rel="stylesheet" href="{{ get_url(path="main.css", cachebust=true) }}">
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "WebSite",
+    "name": "Shoal",
+    "url": {{ config.base_url | json_encode() | safe }},
+    "description": {{ config.description | json_encode() | safe }},
+    "codeRepository": {{ config.extra.repository_url | json_encode() | safe }},
+    "programmingLanguage": "Rust"
+  }
+  </script>
+  {% block head %}{% endblock head %}
+</head>
+<body class="{% block body_class %}{% endblock body_class %}" data-search-index="{{ get_url(path="search_index.en.json") }}" data-mermaid-version="{{ config.extra.mermaid_version }}">
+  <a class="skip-link" href="#main-content">Skip to content</a>
+  {% include "partials/header.html" %}
+  {% block body %}{% endblock body %}
+  {% include "partials/footer.html" %}
+  {% include "partials/search.html" %}
+  <div class="sidebar-scrim" data-sidebar-scrim hidden></div>
+  <script src="{{ get_url(path="js/site.js", cachebust=true) }}" defer></script>
+</body>
+</html>

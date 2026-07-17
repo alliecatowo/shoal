@@ -1,6 +1,7 @@
-//! Durable storage for `session.transcript` channel events (AGENT-SURFACE
-//! §4) — the schema-change follow-up the `journal` channel's replay work
-//! (audit gap G2) deferred rather than approximated.
+//! Durable storage for `session.transcript` channel events. See
+//! `site/content/internals/kernel-protocol.md` and
+//! `site/content/internals/journal-storage-reference.md`. This is the schema
+//! follow-up required for durable transcript replay.
 //!
 //! The `journal` channel's replay (`shoal-kernel`'s `EventBus::journal_index`
 //! and `reconstruct_journal_events`) never needed a new table: its payload
@@ -44,7 +45,7 @@ pub struct TranscriptEventRow {
 
 impl Journal {
     /// Persist a `session.transcript` event's payload for `entry_id`
-    /// (AGENT-SURFACE §4). Called once, right after the corresponding
+    /// (site/content/internals/kernel-protocol.md). Called once, right after the corresponding
     /// `journal` event is published for the same entry — only the
     /// successful-exec path ever produces a transcript event, so this is
     /// never called twice for the same `entry_id`.

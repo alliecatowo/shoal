@@ -1,4 +1,4 @@
-//! Exhaustive statement-dispatch matrix for TDD §3.1 rules 1–4. Each row pins
+//! Exhaustive statement-dispatch matrix for site/content/internals/language-conformance-contract.md rules 1–4. Each row pins
 //! the classification of the final statement's shape given the pre-seeded value
 //! and command bindings.
 

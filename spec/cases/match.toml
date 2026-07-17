@@ -1,4 +1,4 @@
-# `match` pattern forms (TDD §3.2 grammar: `pat = literal | rangepat | "_" |
+# `match` pattern forms (site/content/internals/language-conformance-contract.md grammar: `pat = literal | rangepat | "_" |
 # IDENT | type IDENT | "{" fieldpats "}" | "[" listpats "]"`). Arms are
 # separated with `;` (TERM) to keep each case a single TOML line.
 #
@@ -92,7 +92,7 @@ value = '"one:1"'
 
 [[case]]
 name = "match-alternation-with-guard"
-# `|` alternation of literal patterns (TDD §1.4's one asylum for `|`) plus a
+# `|` alternation of literal patterns (site/content/internals/language-conformance-contract.md one asylum for `|`) plus a
 # guarded bind pattern — the alternation/guard machinery itself is already
 # wired; kept here alongside the type/record/list forms for one-stop pattern
 # coverage.

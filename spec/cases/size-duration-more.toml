@@ -1,7 +1,7 @@
 # size/duration coercion cells not yet in coercion.toml: same-unit Add (only
 # Sub was covered there), zero identities, cross-unit equality/ordering
 # (decimal kb = 1000 bytes, never 1024), and the numeric-only-methods
-# boundary (`.abs()` doesn't apply to size/duration receivers — TDD §4.1's
+# boundary (`.abs()` doesn't apply to size/duration receivers — site/content/internals/language-conformance-contract.md
 # arithmetic promotion site is distinct from the numeric-unary method site).
 # Every value cross-checked against the real evaluator via the conformance
 # harness.

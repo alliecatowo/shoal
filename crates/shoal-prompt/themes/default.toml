@@ -1,4 +1,4 @@
-# shoal-prompt "default" theme — the zero-config behavior (design-prompt.md §9.1).
+# shoal-prompt "default" theme — the zero-config behavior (site/content/internals/prompt-editor-lsp.md).
 # Every shoal-unique or platform-specific module (username/hostname/principal/
 # leash/battery) stays invisible-until-relevant.
 theme = ""

@@ -1,8 +1,8 @@
-# Interpreter-class adapter (IO.md §2.2): `python { BODY }` resolves the
+# Interpreter-class adapter (site/content/internals/values-streams-execution.md): `python { BODY }` resolves the
 # head `python` through this adapter and, because `class = "interpreter"`,
 # lexes the trailing `{ }` as a raw payload (`Expr::LangBlock`) instead of a
 # trailing thunk. Evaluation hands the payload to `python3 -c BODY`
-# (`invoke = ["-c"]`, `invoke_payload` defaults to `"arg"` per IO.md §2.6
+# (`invoke = ["-c"]`, `invoke_payload` defaults to `"arg"` per site/content/internals/values-streams-execution.md
 # step 3) — effectively `python3 -c "$(cat <<'EOF' ... EOF)"` with none of
 # the quoting.
 #

@@ -1,4 +1,4 @@
-//! The modal lexer (TDD §2). The parser drives the lexer between `CMD` mode
+//! The modal lexer (site/content/internals/language-conformance-contract.md). The parser drives the lexer between `CMD` mode
 //! (command word soup) and `EXPR` mode (conventional tokens); mode is a
 //! property of grammar position, never runtime state. The lexer is
 //! position-addressed: the parser may rewind to any byte offset and re-lex in
@@ -224,7 +224,7 @@ impl<'s> Lexer<'s> {
             b'}' => Ok((Tok::RBrace, Span::new(pos, pos + 1))),
             // A `[` beginning a word is a glob character class when a matching
             // `]` closes within the same whitespace-delimited run (`[abc].txt`,
-            // §2.2). A lone unclosed `[` keeps the teaching error.
+            // site/content/internals/language-conformance-contract.md). A lone unclosed `[` keeps the teaching error.
             b'[' if self.bracket_class_closes(pos) => self.cmd_word(pos),
             b'[' => Err(LexError::new(
                 "`[` cannot start a command argument",
@@ -274,7 +274,7 @@ impl<'s> Lexer<'s> {
         false
     }
 
-    /// Scan a CMD-mode word and classify it by shape (TDD §2.2).
+    /// Scan a CMD-mode word and classify it by shape (site/content/internals/language-conformance-contract.md).
     fn cmd_word(&self, start: usize) -> LexResult {
         let mut pos = start;
         let mut has_glob = false;
@@ -487,7 +487,7 @@ impl<'s> Lexer<'s> {
             b'0'..=b'9' => self.number(pos),
             c if c == b'_' || c.is_ascii_alphabetic() => self.ident_or_tagged(pos),
             _ => {
-                // Non-ASCII identifier start? Keep identifiers ASCII per TDD §2.3.
+                // Non-ASCII identifier start? Keep identifiers ASCII per site/content/internals/language-conformance-contract.md.
                 Err(LexError::new(
                     format!(
                         "unexpected character `{}`",
@@ -547,7 +547,7 @@ impl<'s> Lexer<'s> {
     }
 
     /// Scan a raw `{ … }` block (for `sh { … }`), balanced braces outside
-    /// quotes (TDD §13.13). `open` is the position of `{`. Returns (payload,
+    /// quotes (site/content/internals/language-conformance-contract.md). `open` is the position of `{`. Returns (payload,
     /// end position after `}`).
     pub fn raw_brace_block(&self, open: usize) -> Result<(String, usize), LexError> {
         let mut pos = open + 1;
@@ -582,7 +582,7 @@ impl<'s> Lexer<'s> {
             pos += 1;
         }
         Err(
-            // IO.md §5 `lang_block_unbalanced`: brace scan hit EOF with a
+            // site/content/internals/values-streams-execution.md `lang_block_unbalanced`: brace scan hit EOF with a
             // still-open `{`. Message stays tool-agnostic (the scanner is shared
             // across every interpreter block, `sh`/`python`/`jq`/…).
             LexError::new(
@@ -741,7 +741,7 @@ mod tests {
     }
 
     /// A literal open-brace in an interpolating string starts a `{expr}`
-    /// interpolation (by design — TDD §2.1). When it can't find a matching
+    /// interpolation (by design — site/content/internals/language-conformance-contract.md). When it can't find a matching
     /// close (a realistic dogfooding case: JSON text with escaped `"` whose
     /// nested-string scan runs off the end looking for the interpolation's
     /// `}`), the error must teach the fix rather than just say "unterminated".

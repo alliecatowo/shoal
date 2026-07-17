@@ -13,7 +13,7 @@ pub(crate) fn forward(
     args: CallArgs,
 ) -> VResult<Value> {
     match name {
-        // §317: a spilled capture surfaces `.stdout` as a lazy, ref-backed
+        // site/content/internals/language-conformance-contract.md: a spilled capture surfaces `.stdout` as a lazy, ref-backed
         // `bytes`; ordinary output is the resident `bytes` as before.
         "stdout" => Ok(o.stdout_value()),
         "stderr" => Ok(Value::Bytes(o.stderr.clone())),

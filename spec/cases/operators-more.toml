@@ -35,7 +35,7 @@ error = "type_error"
 
 [[case]]
 name = "op2-coalesce-only-triggers-on-null-not-falsy-bool"
-# `??` checks specifically for `null`, not general falsiness (TDD §1.10: no
+# `??` checks specifically for `null`, not general falsiness (site/content/internals/language-conformance-contract.md: no
 # truthiness anywhere in the language) — a `false` lhs passes through
 # unchanged.
 src = "false ?? true"

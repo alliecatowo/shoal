@@ -52,7 +52,7 @@ pub(crate) fn len(v: Value) -> VResult<Value> {
 }
 
 /// `.first()`/`.last()` return a single element; `.first(n)`/`.last(n)` return
-/// a LIST of the first/last `n` (P3 arity fix — `.first(2)` was wrongly
+/// a LIST of the first/last `n` (`.first(2)` once wrongly
 /// yielding a single record, breaking `…​.first(2).map(.name)`).
 pub(crate) fn first_last(v: Value, args: &CallArgs, first: bool) -> VResult<Value> {
     if args.pos.is_empty() && args.named.is_empty() {
@@ -145,8 +145,8 @@ pub(crate) fn each(ctx: &mut dyn CallCtx, v: Value, f: &Value) -> VResult<Value>
     Ok(Value::Null)
 }
 /// `.reduce(init, f)` — left fold: thread `acc` through `f(acc, x)` for each
-/// element, starting from `init`, returning the final accumulator (STREAMS.md
-/// §5 names it as the collection-only terminal op that `.scan` streams). The
+/// element, starting from `init`, returning the final accumulator. This is the
+/// collection-only terminal counterpart to stream `.scan`.
 /// general escape hatch when no named aggregation (`.sum`/`.min`/…) fits.
 pub(crate) fn reduce(ctx: &mut dyn CallCtx, v: Value, init: Value, f: &Value) -> VResult<Value> {
     let mut acc = init;

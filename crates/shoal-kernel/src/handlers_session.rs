@@ -1,8 +1,8 @@
 //! `dispatch` handlers for read-only introspection: `parse`, `complete`,
 //! `explain`, `blob.get`. `session.attach` itself lives in `session.rs`
 //! alongside the `Session`/`Attachment` state it populates. Split out of
-//! `lib.rs`'s dispatch match (docs/ROADMAP.md wave R4): pure mechanical move,
-//! zero wire/behavior change.
+//! `lib.rs`'s dispatch match. Wire behavior is documented in
+//! `site/content/internals/kernel-protocol.md`.
 use super::*;
 
 impl Kernel {

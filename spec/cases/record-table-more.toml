@@ -2,7 +2,7 @@
 # `.is_empty()` on records (key count, not a list-only notion), empty-record
 # `.keys()`, bracket-indexing a record by a string key (an alternative to
 # `.field` access), deep nested field chains, and record+record being a
-# type error (no implicit merge operator — `TDD` never lists one).
+# type error (no implicit merge operator — `site/content/internals/language-conformance-contract.md` never lists one).
 
 [[case]]
 name = "rt2-record-len-counts-keys"
@@ -41,7 +41,7 @@ value = "1"
 
 [[case]]
 name = "rt2-record-plus-record-is-type-error"
-# There is no implicit record-merge operator (TDD never lists `+` as
+# There is no implicit record-merge operator (site/content/internals/language-conformance-contract.md never lists `+` as
 # record-admitting in the coercion matrix) — `+` on two records is a plain
 # type error.
 src = "{a: 1} + {b: 2}"

@@ -1,0 +1,111 @@
+{% macro page_link(page, current_path) %}
+<a href="{{ page.permalink }}"{% if current_path == page.path %} class="is-current" aria-current="page"{% endif %}>
+  <span>{{ page.title }}</span>
+  {% if page.extra.status %}<small class="docs-nav-status" title="Status: {{ page.extra.status }}" aria-hidden="true"></small>{% endif %}
+</a>
+{% endmacro page_link %}
+
+{% macro nav_group(section, current_path, active_group, title, number) %}
+{% set_global nav_group_count = 0 %}
+{% for page in section.pages %}
+  {% set page_group = page.extra.group | default(value="Guides") %}
+  {% if page_group == title %}{% set_global nav_group_count = nav_group_count + 1 %}{% endif %}
+{% endfor %}
+{% if nav_group_count > 0 %}
+<details class="docs-nav-book"{% if active_group == title %} open{% endif %}>
+  <summary><span>{{ number }}</span>{{ title }}</summary>
+  <ul class="docs-nav-list docs-nav-depth-0">
+    {% for page in section.pages %}
+      {% set page_group = page.extra.group | default(value="Guides") %}
+      {% if page_group == title %}
+      <li>{{ self::page_link(page=page, current_path=current_path) }}</li>
+      {% endif %}
+    {% endfor %}
+  </ul>
+</details>
+{% endif %}
+{% endmacro nav_group %}
+
+{% macro grouped_tree(section, current_path, active_group, scheme) %}
+  {% if scheme == "atlas" %}
+    {{ self::nav_group(section=section, current_path=current_path, active_group=active_group, title="Orientation", number="01") }}
+    {{ self::nav_group(section=section, current_path=current_path, active_group=active_group, title="Language & runtime", number="02") }}
+    {{ self::nav_group(section=section, current_path=current_path, active_group=active_group, title="Execution & security", number="03") }}
+    {{ self::nav_group(section=section, current_path=current_path, active_group=active_group, title="Kernel & agents", number="04") }}
+    {{ self::nav_group(section=section, current_path=current_path, active_group=active_group, title="Storage & tooling", number="05") }}
+    {{ self::nav_group(section=section, current_path=current_path, active_group=active_group, title="Maintenance", number="06") }}
+  {% else %}
+    {{ self::nav_group(section=section, current_path=current_path, active_group=active_group, title="Start here", number="01") }}
+    {{ self::nav_group(section=section, current_path=current_path, active_group=active_group, title="Language", number="02") }}
+    {{ self::nav_group(section=section, current_path=current_path, active_group=active_group, title="Shell & tools", number="03") }}
+    {{ self::nav_group(section=section, current_path=current_path, active_group=active_group, title="Agents & protocol", number="04") }}
+    {{ self::nav_group(section=section, current_path=current_path, active_group=active_group, title="Project", number="05") }}
+    {{ self::nav_group(section=section, current_path=current_path, active_group=active_group, title="Reference", number="06") }}
+  {% endif %}
+  {{ self::nav_group(section=section, current_path=current_path, active_group=active_group, title="Guides", number="··") }}
+  {% for subsection_path in section.subsections %}
+    {% set subsection = get_section(path=subsection_path) %}
+    <div class="docs-nav-subsection">
+      <a class="docs-nav-section{% if current_path == subsection.path %} is-current{% endif %}" href="{{ subsection.permalink }}">{{ subsection.title }}</a>
+      {{ self::tree(section=subsection, current_path=current_path, depth=1) }}
+    </div>
+  {% endfor %}
+{% endmacro grouped_tree %}
+
+{% macro tree(section, current_path, depth=0) %}
+<ul class="docs-nav-list docs-nav-depth-{{ depth }}">
+  {% for page in section.pages %}
+  <li>{{ self::page_link(page=page, current_path=current_path) }}</li>
+  {% endfor %}
+  {% for subsection_path in section.subsections %}
+    {% set subsection = get_section(path=subsection_path) %}
+  <li class="docs-nav-group">
+    <a class="docs-nav-section{% if current_path == subsection.path %} is-current{% endif %}" href="{{ subsection.permalink }}"{% if current_path == subsection.path %} aria-current="page"{% endif %}>
+      <span>{{ subsection.title }}</span>
+    </a>
+    {{ self::tree(section=subsection, current_path=current_path, depth=depth + 1) }}
+  </li>
+  {% endfor %}
+</ul>
+{% endmacro tree %}
+
+{% macro catalog_group(section, title, description, number, group, id) %}
+  {% set_global group_count = 0 %}
+  {% for guide in section.pages %}
+    {% set guide_group = guide.extra.group | default(value="Guides") %}
+    {% if group == "*" or guide_group == group %}{% set_global group_count = group_count + 1 %}{% endif %}
+  {% endfor %}
+  {% if group_count > 0 %}
+  <section class="guide-book" aria-labelledby="{{ id }}-title">
+    <div class="guide-book-heading">
+      <span>{{ number }}</span>
+      <div><h2 id="{{ id }}-title">{{ title }}</h2><p>{{ description }}</p></div>
+      <small>{{ group_count }} chapter{% if group_count != 1 %}s{% endif %}</small>
+    </div>
+    <div class="guide-rows">
+      {% for guide in section.pages %}
+        {% set guide_group = guide.extra.group | default(value="Guides") %}
+        {% if group == "*" or guide_group == group %}
+        <a href="{{ guide.permalink }}">
+          <span class="guide-number">{% if loop.index < 10 %}0{% endif %}{{ loop.index }}</span>
+          <span class="guide-copy"><strong>{{ guide.title }}</strong>{% if guide.description %}<small>{{ guide.description }}</small>{% endif %}</span>
+          {% if guide.extra.status %}<span class="guide-status" title="{{ guide.extra.status }}">{{ guide.extra.status }}</span>{% endif %}
+          <span class="guide-arrow" aria-hidden="true">→</span>
+        </a>
+        {% endif %}
+      {% endfor %}
+    </div>
+  </section>
+  {% endif %}
+{% endmacro catalog_group %}
+
+{% macro toc(items) %}
+<ol>
+  {% for item in items %}
+  <li>
+    <a href="{{ item.permalink | safe }}">{{ item.title }}</a>
+    {% if item.children %}{{ self::toc(items=item.children) }}{% endif %}
+  </li>
+  {% endfor %}
+</ol>
+{% endmacro toc %}

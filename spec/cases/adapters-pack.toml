@@ -188,7 +188,7 @@ value = "1"
 
 [[case]]
 name = "adapterspack-grep-no-match-out-raises-cmd-failed"
-# `.out` on a non-ok outcome raises `cmd_failed` (TDD §4.1); grep's own
+# `.out` on a non-ok outcome raises `cmd_failed` (site/content/internals/language-conformance-contract.md); grep's own
 # "no match" signal (exit 1) is not a crash, just a non-ok outcome -- the
 # raw `.status` field (asserted above) stays readable regardless.
 src = '"foo\nbar".feed(grep "xyz").out'

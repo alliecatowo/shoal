@@ -85,7 +85,7 @@ pub enum NetPolicy {
 }
 
 /// A concrete, resolved enforcement request for one child spawn: filesystem
-/// scopes, a coarse network policy, an optional pinned spawn hash (TDD §8
+/// scopes, a coarse network policy, an optional pinned spawn hash (site/content/internals/language-conformance-contract.md
 /// content-hash pinning), and a `hermetic` intent flag.
 ///
 /// `hermetic: true` means the caller wants a hard guarantee: the consumer

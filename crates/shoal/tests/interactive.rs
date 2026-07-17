@@ -1,5 +1,5 @@
-//! Wave R0 end-to-end tests for the two interactive dealbreakers
-//! (docs/ROADMAP.md):
+//! End-to-end tests for core interactive behavior
+//! (site/content/internals/roadmap-and-priorities.md):
 //!   1. statement-position builtins render their output;
 //!   2. `exit`/`quit` ends the session with a code.
 //!
@@ -245,8 +245,8 @@ fn repl_echo_renders_once_and_exit_sets_code() {
     );
 }
 
-/// A statement-position PTY child must receive the user's typed bytes (TDD
-/// §1.2 "byte-identical to bash"): shoal forwards the real tty to the child's
+/// A statement-position PTY child must receive the user's typed bytes (see
+/// `site/content/internals/pty-job-control.md`): shoal forwards the real tty to the child's
 /// pty (raw mode + stdin pump). Regression: the evaluator passed
 /// `StdinSpec::Null` for bare commands, so interactive TUIs (vim, claude)
 /// got output-only PTYs — keystrokes never arrived and every terminal
@@ -379,7 +379,7 @@ fn repl_pty_child_reads_interactive_stdin() {
     let _ = reader_thread.join();
 }
 
-/// docs/ROADMAP.md R3: `undo out[n]` resolves via the host's `out[n] ->
+/// site/content/internals/roadmap-and-priorities.md: `undo out[n]` resolves via the host's `out[n] ->
 /// journal entry id` map. Drives the real REPL over a PTY: `rm victim`
 /// journals a reversible trash-move as `out[3]` (after three prior
 /// statements fill `out[0..2]`), then `undo out[3]` must restore the file —
@@ -537,7 +537,7 @@ fn repl_undo_out_n_resolves_via_journal() {
     );
 }
 
-/// docs/CONFIG.md §1/§6, docs/REEF.md §1: `[reef]` in `shoal.toml` is reef's
+/// site/content/internals/configuration-reference.md, site/content/internals/reef-resolution.md: `[reef]` in `shoal.toml` is reef's
 /// *user* scope, wired in `run_source` via
 /// `evaluator.set_reef_user_manifest(reef_user_manifest_path())` — but the
 /// REPL builds its own separate `Evaluator` and was missing that exact call
@@ -546,7 +546,7 @@ fn repl_undo_out_n_resolves_via_journal() {
 /// Proof: declare a tool in the user config's `[reef.tools]` with no project
 /// `.reef.toml` anywhere in scope, drive the real REPL over a PTY, and assert
 /// bare `reef` (which lists every tool a manifest *currently in scope*
-/// constrains, docs REEF.md/`reef_binding_table`) surfaces it — only possible
+/// constrains, docs site/content/internals/reef-resolution.md/`reef_binding_table`) surfaces it — only possible
 /// if the user manifest actually loaded.
 #[test]
 fn repl_reef_user_scope_from_config_engages() {

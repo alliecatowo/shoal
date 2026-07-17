@@ -1,4 +1,4 @@
-//! The resolver — name → version → hash → binding (REEF.md §2), with the lock,
+//! The resolver — name → version → hash → binding (site/content/internals/reef-resolution.md), with the lock,
 //! drift detection, conflict detection, and the interactive/script policy split.
 
 use std::path::PathBuf;
@@ -584,7 +584,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code_str(), "reef_drift");
         // The error names *both* the stale locked hash and the current on-disk
-        // hash, per REEF.md §2 ("a hard error naming old/new hashes").
+        // hash, per site/content/internals/reef-resolution.md ("a hard error naming old/new hashes").
         let msg = err.to_string();
         let old_hash = short(&crate::hashcache::hash_bytes(b"node-22-orig"));
         let new_hash = short(&crate::hashcache::hash_bytes(b"node-22-TAMPERED"));
@@ -654,7 +654,7 @@ mod tests {
             .resolve("node", &chain, &mut lock, Policy::Interactive, &mut |_| {})
             .unwrap_err();
         assert_eq!(err.code_str(), "reef_conflict");
-        // REEF.md §2: "the error lists both sources" — no silent first-wins.
+        // site/content/internals/reef-resolution.md: "the error lists both sources" — no silent first-wins.
         let msg = err.to_string();
         assert!(msg.contains("18"), "message should cite the 18 constraint");
         assert!(msg.contains("22"), "message should cite the 22 constraint");

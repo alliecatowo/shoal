@@ -1,4 +1,4 @@
-//! Module loading for `use ./mod` (TDD §4.6, ROADMAP R3). `use ./lib/deploy`
+//! Module loading for `use ./mod` (site/content/internals/language-conformance-contract.md, site/content/internals/roadmap-and-priorities.md). `use ./lib/deploy`
 //! reads `./lib/deploy.shl` (resolved against the cwd; the `.shl` extension is
 //! optional), evaluates it in a **fresh** scope, and binds its `export`ed decls
 //! under the file stem (`deploy.build`, `deploy.version`) as a single record

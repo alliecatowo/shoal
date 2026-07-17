@@ -1,4 +1,4 @@
-# `.tee(n)` forks a stream (STREAMS §1). A BOUNDED stream (`.stream()`)
+# `.tee(n)` forks a stream (site/content/internals/streams-channels.md). A BOUNDED stream (`.stream()`)
 # materializes once and each fork replays the exact whole stream; a LIVE
 # stream forks lazily over the shared source with bounded per-fork queues, so
 # `.tee` on a live source no longer errors `stream_unbounded` (the fix-it that

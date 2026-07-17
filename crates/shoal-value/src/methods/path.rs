@@ -1,6 +1,6 @@
 //! `.save`/`.append` — the pure-method-surface's explicit filesystem sinks —
 //! plus the pure (no-IO) `path` component accessors (`.name`/`.stem`/`.ext`/
-//! `.parent`/`.join`/`.abs`, docs/CONTRACTS.md §3). The filesystem-backed path
+//! `.parent`/`.join`/`.abs`, site/content/internals/intercrate-protocol-contracts.md). The filesystem-backed path
 //! methods (`.read`/`.lines`/`.size`/…) live in the evaluator instead, since
 //! they need the `Fs` port.
 

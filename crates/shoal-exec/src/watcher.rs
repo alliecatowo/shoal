@@ -1,5 +1,5 @@
 //! Cancellation watcher: polls tokens and escalates INT → TERM → KILL
-//! against the child's process group (TDD §4.7).
+//! against the child's process group (site/content/internals/language-conformance-contract.md).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

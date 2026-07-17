@@ -1,11 +1,11 @@
-//! `StreamVal` and the lazy stream combinators (docs/STREAMS.md), moved
+//! `StreamVal` and the lazy stream combinators (site/content/internals/streams-channels.md), moved
 //! verbatim out of `lib.rs`.
 //!
 //! The one substrate for time-varying data. A `stream<T>` is a **lazy**,
-//! **single-consumption** (TDD §1.9), **pull-based** pipeline: a base source
+//! **single-consumption** (site/content/internals/language-conformance-contract.md), **pull-based** pipeline: a base source
 //! (`watch`/`tail`/`every`/`channel().events()`/a list) wrapped in zero or more
-//! lazy combinator stages (§3). No work happens — no closure runs, no OS
-//! resource opens — until a sink (§4) drives it. Identity equality.
+//! lazy combinator stages (site/content/internals/streams-channels.md). No work happens — no closure runs, no OS
+//! resource opens — until a sink (site/content/internals/streams-channels.md) drives it. Identity equality.
 //!
 //! Because closure-bearing stages (`.map`/`.where`/`.scan`/`.flat_map`) must call
 //! back into the evaluator, driving requires a [`CallCtx`]; the whole pipeline is
@@ -25,7 +25,7 @@ pub struct StreamVal {
     pub label: String,
     /// `false` for endless sources (`every`/`watch`/`tail`/a channel with no
     /// `.take`/`.take_until` bound). `.collect()` on an unbounded stream errors
-    /// `stream_unbounded` (STREAMS §4) rather than looping forever.
+    /// `stream_unbounded` (site/content/internals/streams-channels.md) rather than looping forever.
     bounded: bool,
     inner: Arc<Mutex<StreamState>>,
 }
@@ -137,7 +137,7 @@ impl StreamVal {
         self.bounded
     }
 
-    /// Take the composed upstream, enforcing single-consumption (TDD §1.9): a
+    /// Take the composed upstream, enforcing single-consumption (site/content/internals/language-conformance-contract.md): a
     /// second attempt is `stream_consumed`.
     pub fn take_upstream(&self) -> VResult<Box<dyn Upstream>> {
         let mut g = self.inner.lock().unwrap();
@@ -167,7 +167,7 @@ impl StreamVal {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
 
-    // --- lazy combinators (STREAMS §3) -----------------------------------
+    // --- lazy combinators (site/content/internals/streams-channels.md) -----------------------------------
 
     pub fn map(self, f: Value) -> VResult<StreamVal> {
         let b = self.bounded;
@@ -300,12 +300,12 @@ impl StreamVal {
     }
 
     /// `.tee(n)` — fork into `n` independently-drivable streams sharing this
-    /// stream's upstream (STREAMS §1: "each replaying every item to its own
+    /// stream's upstream (site/content/internals/streams-channels.md: "each replaying every item to its own
     /// sink"). Under the sync-pull model, whichever fork pulls next drives the
     /// shared source and the item is replayed into every sibling fork's
     /// BOUNDED queue ([`tee::TEE_QUEUE_CAP`]); a fork that falls further
     /// behind than the cap gets overflowed items coalesced into a
-    /// `{dropped: n}` marker element (§6.1) instead of unbounded buffering.
+    /// `{dropped: n}` marker element (site/content/internals/streams-channels.md) instead of unbounded buffering.
     /// Forks inherit this stream's boundedness — a fork of an endless source
     /// is still endless (`.collect()` on it stays `stream_unbounded`).
     ///
@@ -345,7 +345,7 @@ pub fn drive_stream(
 }
 
 /// Collect a bounded stream into a `Vec`. Errors `stream_unbounded` on an endless
-/// source (STREAMS §4) — the caller must `.take`/`.take_until` first.
+/// source (site/content/internals/streams-channels.md) — the caller must `.take`/`.take_until` first.
 pub fn collect_stream(ctx: &mut dyn CallCtx, s: &StreamVal) -> VResult<Vec<Value>> {
     if !s.bounded {
         return Err(
@@ -416,7 +416,7 @@ mod tests {
         // Fork 0 drains the whole 200-item source before fork 1 pulls once:
         // fork 1's bounded queue keeps the first TEE_QUEUE_CAP items; the
         // overflowed remainder is dropped and surfaced as one `{dropped: n}`
-        // marker element — bounded memory with an honest signal (STREAMS §6.1).
+        // marker element — bounded memory with an honest signal (site/content/internals/streams-channels.md).
         let forks = endless_marked(200).tee(2).unwrap();
         let a = drain(&forks[0]);
         assert_eq!(a.len(), 200, "the pulling fork sees every item");

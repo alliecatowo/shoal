@@ -1,5 +1,5 @@
-# The `bytes` value type (TDD §4.1's type list; produced by an outcome's raw
-# `.stdout`/`.stderr` fields — CONTRACTS §3 doesn't special-case it, so a
+# The `bytes` value type (site/content/internals/language-conformance-contract.md type list; produced by an outcome's raw
+# `.stdout`/`.stderr` fields — site/content/internals/intercrate-protocol-contracts.md doesn't special-case it, so a
 # `sh { }` block's stdout, read via `.stdout` rather than the lazily-parsed
 # `.out`, is the deterministic, host-safe way to get a real `Value::Bytes` in
 # a conformance case). Exercises the receiver-type boundary across the

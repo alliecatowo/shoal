@@ -6,7 +6,7 @@
 
 use std::fmt;
 
-/// Pinned error codes (REEF.md §7, mirrored into CONTRACTS §4).
+/// Pinned error codes (site/content/internals/reef-resolution.md, mirrored into site/content/internals/intercrate-protocol-contracts.md).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReefCode {
     /// A constrained tool has no lock entry and policy forbids auto-locking.

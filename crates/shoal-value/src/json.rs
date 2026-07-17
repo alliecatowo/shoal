@@ -8,8 +8,8 @@ pub fn json_to_value(j: &serde_json::Value) -> Value {
         serde_json::Value::Null => Value::Null,
         serde_json::Value::Bool(b) => Value::Bool(*b),
         serde_json::Value::Number(n) => {
-            // KNOWN LIMITATION (design decision needed, see FIX 5): `Value::Int`
-            // is `i64` and shoal has no bignum (TDD §193). A JSON integer in
+            // KNOWN LIMITATION (a deliberate type-system decision remains): `Value::Int`
+            // is `i64` and shoal has no bignum (site/content/internals/language-conformance-contract.md). A JSON integer in
             // (i64::MAX, u64::MAX] — e.g. a 64-bit unsigned id like
             // 18446744073709551615 — does not fit i64, so it falls through to
             // `Value::Float`, which loses integer precision above 2^53. There
@@ -72,7 +72,7 @@ pub fn value_to_json(v: &Value) -> serde_json::Value {
         // bare top-level `resolve()`-first call (`json.stringify`/
         // `yaml.stringify`/`toml.stringify` handed the value directly) or
         // NESTED inside a record/table/list field. Either way this is the
-        // single, deliberate, bounded answer (P6 audit, see
+        // single, deliberate, bounded answer (see
         // `CasBytesVal::json_preview`'s doc comment): metadata + the resident
         // preview, never a CAS load. A bare `.json()` METHOD call never
         // reaches this arm at all — `methods::dispatch`'s CasBytes fallback
@@ -115,7 +115,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// The P6 audit's headline fix: a CasBytes value NESTED inside a record
+    /// A CasBytes value NESTED inside a record
     /// (the shape a real spilled `.stdout` takes once captured into a field)
     /// no longer silently pulls the full content through the CAS just because
     /// the record got `value_to_json`'d — it gets the same bounded

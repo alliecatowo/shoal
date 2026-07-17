@@ -1,4 +1,4 @@
-# Interpreter-class adapter (IO.md §2.2): `deno { BODY }` hands the raw
+# Interpreter-class adapter (site/content/internals/values-streams-execution.md): `deno { BODY }` hands the raw
 # block to `deno eval BODY`. Unlike python/node/ruby, Deno has no top-level
 # `-c`/`-e` flag — inline evaluation is the `eval` *subcommand* — so the
 # "flag template" this adapter declares (`invoke`) is a bare word, not a

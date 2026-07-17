@@ -104,7 +104,7 @@ impl<'s> Parser<'s> {
     pub(crate) fn if_expr(&mut self, start: usize) -> ParseResult<Expr> {
         let cond = self.expr(0)?;
         let then = self.block()?;
-        // `else` may appear on the next line (§2.1 continuation).
+        // `else` may appear on the next line (site/content/internals/language-conformance-contract.md continuation).
         if matches!(self.peek(Mode::Expr)?.0, Tok::Newline) {
             self.continue_if(|t| matches!(t, Tok::Ident(x) if x == "else"))?;
         }
@@ -197,7 +197,7 @@ impl<'s> Parser<'s> {
             // do (see `fn_stmt` in stmt.rs). Without this, a block-body
             // statement whose head is a param followed by an operator
             // (`acc + y`) misdispatches as a COMMAND named `acc` instead of an
-            // EXPR (TDD §3.1.3), because statement dispatch keys off the
+            // EXPR (site/content/internals/language-conformance-contract.md), because statement dispatch keys off the
             // bound-variable scope. Harmless for expr bodies, where params
             // already parse as `Var` in expression position.
             self.scopes
@@ -227,7 +227,7 @@ impl<'s> Parser<'s> {
         // as a COMMAND, not through `primary()`). Apply that same check here
         // so `(it)`/`(out)` error in script mode exactly as `it`/`out` do
         // everywhere else a bare reference to them is reachable as a value
-        // (TDD §13.16).
+        // (site/content/internals/language-conformance-contract.md).
         if plausible
             && params.len() == 1
             && params[0].ty.is_none()

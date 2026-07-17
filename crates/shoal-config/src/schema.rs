@@ -1,6 +1,6 @@
 //! The declarative shape of a `shoal.toml`: one static tree ([`ROOT`]) that
 //! both the unknown-key scanner and the type checker walk in a single pass,
-//! so the two can never disagree about what's valid. docs/CONFIG.md is the
+//! so the two can never disagree about what's valid. site/content/internals/configuration-reference.md is the
 //! human-readable rendering of this same tree — keep them in sync.
 
 use crate::error::ConfigError;
@@ -122,7 +122,7 @@ fn type_error(path: &str, expected: Kind, found: &toml::Value) -> ConfigError {
 }
 
 /// Walk `value` against `kind`, recursively, collecting an "unknown key"
-/// warning (with a did-you-mean suggestion, docs/CONFIG.md §4) for every key
+/// warning (with a did-you-mean suggestion, site/content/internals/configuration-reference.md) for every key
 /// not in the schema, and returning the *first* type mismatch as a hard
 /// error. Never panics: every TOML shape (including a scalar where a table
 /// was expected) is handled as data.

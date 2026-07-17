@@ -106,7 +106,7 @@ impl KernelClient {
 
     /// Subscribe on this (dedicated) connection and forward every pushed
     /// `event` notification to MCP stdout as `notifications/resources/updated`
-    /// (AGENT-SURFACE §6). Runs until the connection closes.
+    /// (site/content/internals/kernel-protocol.md). Runs until the connection closes.
     pub(crate) fn run_event_forwarder(mut self, channel: String, uri: String) {
         if self
             .call("events.subscribe", json!({"channel": channel}))

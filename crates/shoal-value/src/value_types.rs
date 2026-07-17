@@ -1,12 +1,13 @@
 //! Supporting scalar/handle payloads — `GlobVal`, `RegexVal`, `TimeVal`,
 //! `RangeVal`, `ClosureVal`, `SecretVal` — plus the bind-time word-parsing
-//! helpers (`parse_size`/`parse_duration`/`parse_time`, TDD §4.2 site 2), moved
+//! helpers (`parse_size`/`parse_duration`/`parse_time`; see
+//! `site/content/internals/language-conformance-contract.md`), moved
 //! verbatim out of `lib.rs`.
 
 use super::*;
 use crate::ports::BytesLoad;
 
-/// A lazy, content-addressed bytes value (TDD §317 disk-spill). Produced when a
+/// A lazy, content-addressed bytes value (site/content/internals/language-conformance-contract.md disk-spill). Produced when a
 /// value-position capture's stdout overflowed the RAM cap and was spilled to the
 /// CAS: the full bytes live on disk under [`hash`](CasBytesVal::hash), only a
 /// bounded [`preview`](CasBytesVal::preview) is resident, and the full content
@@ -17,7 +18,7 @@ use crate::ports::BytesLoad;
 /// A small (sub-cap) capture is a plain [`Value::Bytes`] and never becomes one
 /// of these — there is zero change to the common, fully-resident path.
 ///
-/// # The P6 audit's chokepoint (docs/ROADMAP.md audit, TDD §317)
+/// # Central CAS-bytes chokepoint
 ///
 /// Before this refactor, awareness of this variant was scattered across ~6
 /// call sites, each hand-rolling its own little match on `name`/metadata. Two
@@ -54,7 +55,7 @@ use crate::ports::BytesLoad;
 /// behavior change nobody asked for.
 pub struct CasBytesVal {
     /// blake3 hex of the full stored content — the recoverable `val:blake3:…`
-    /// ref (AGENT-SURFACE elision doctrine, in-language).
+    /// ref (site/content/internals/kernel-protocol.md elision doctrine, in-language).
     pub hash: String,
     /// True total length of the content in bytes (what `.len` returns).
     pub len: u64,
@@ -69,7 +70,7 @@ pub struct CasBytesVal {
 
 impl CasBytesVal {
     /// The scheme prefix of a recoverable content short-ref: the wire/CAS form
-    /// `.ref` yields and the in-language dispatch path recognizes (TDD §317).
+    /// `.ref` yields and the in-language dispatch path recognizes (site/content/internals/language-conformance-contract.md).
     pub const REF_PREFIX: &'static str = "val:blake3:";
 
     /// Parse a `val:blake3:<hash>` content short-ref, returning the bare blake3
@@ -113,7 +114,7 @@ impl CasBytesVal {
 
     /// The bounded, lazy JSON representation used when this value is
     /// encountered NESTED inside a larger value being JSON-encoded (see the
-    /// struct doc's "P6 audit" section for why this exists and why it's safe
+    /// struct doc's "Central CAS-bytes chokepoint" section for why this exists and why it's safe
     /// relative to the bare top-level `.json()` method, which fully
     /// materializes through a different, deliberate call site). Never loads
     /// from the CAS: just the recoverable ref, the true length, the
@@ -145,7 +146,7 @@ impl std::fmt::Debug for CasBytesVal {
 #[derive(Debug, Clone, PartialEq)]
 pub struct GlobVal {
     pub pattern: String,
-    /// Origin cwd — expansion always happens against this (TDD §4.3).
+    /// Origin cwd — expansion always happens against this (site/content/internals/language-conformance-contract.md).
     pub cwd: PathBuf,
     pub hidden: bool,
 }
@@ -245,11 +246,11 @@ impl std::fmt::Debug for SecretVal {
 }
 
 // ---------------------------------------------------------------------------
-// Word parsing helpers (bind-time coercion, TDD §4.2 site 2)
+// Word parsing helpers (bind-time coercion)
 // ---------------------------------------------------------------------------
 
 /// Parse a size word like `1.5gb`, `4kib`, `237b`. Decimal units and binary
-/// (`*ib`) units per TDD §2.1.
+/// (`*ib`) units per site/content/internals/language-conformance-contract.md.
 pub fn parse_size(word: &str) -> Option<u64> {
     let lower = word.to_ascii_lowercase();
     let split = lower.find(|c: char| c.is_ascii_alphabetic())?;
@@ -361,7 +362,7 @@ pub fn parse_time(word: &str) -> Option<TimeVal> {
     Some(TimeVal { hour, min, sec })
 }
 
-/// Test-only support for the `CasBytesVal` chokepoint tests (P6 audit),
+/// Test-only support for the `CasBytesVal` chokepoint tests,
 /// `pub(crate)` so other files' test modules (`json.rs`, `methods/mod.rs`)
 /// can build a fake spilled value without a real journal/CAS, and assert
 /// whether its loader was actually invoked.
@@ -428,7 +429,7 @@ mod tests {
     }
 
     /// `cheap_method` answers `len`/`count`/`is_empty`/`ref` from metadata
-    /// alone, never touching the loader (P6 audit chokepoint).
+    /// alone, never touching the loader.
     #[test]
     fn cheap_method_never_loads() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -457,7 +458,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
-    /// `json_preview` (the nested-JSON P6 fix) answers from the ref/length/
+    /// `json_preview` answers from the ref/length/
     /// truncation/preview metadata alone — never loads.
     #[test]
     fn json_preview_never_loads() {

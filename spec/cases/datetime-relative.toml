@@ -1,4 +1,4 @@
-# TDD §2.1's relative-anchor surface: `now`/`today` as live-clock functions,
+# site/content/internals/language-conformance-contract.md relative-anchor surface: `now`/`today` as live-clock functions,
 # and duration `.ago`/`.from_now` composition (datetime-more.toml's
 # `dt2-relative-anchors-not-implemented` documents the pre-implementation
 # gap via `skip`; this file exercises the feature itself once it lands).
@@ -9,7 +9,7 @@
 # `today` are instant-based; `t"…Z"` is an explicit UTC anchor). `now`/
 # `today` are bound to a `let` first (not used as the bare, statement-
 # initial token) so the statement parses in EXPR mode — a bare leading
-# `now`/`today` dispatches as a COMMAND per TDD §3.1.3's identifier rule,
+# `now`/`today` dispatches as a COMMAND per site/content/internals/language-conformance-contract.md identifier rule,
 # which is a real but orthogonal parsing detail (see edges.toml's analogous
 # `it`/`out` notes), not the relative-anchor feature under test here.
 

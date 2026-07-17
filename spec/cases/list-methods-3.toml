@@ -56,7 +56,7 @@ src = "[1, 2, 3].get(-9, 99)"
 value = "99"
 
 # `.reduce(init, f)` / `.fold` — left fold, the general aggregation escape
-# hatch (STREAMS.md §5 names it as the collection terminal op `.scan` streams).
+# hatch (site/content/internals/streams-channels.md names it as the collection terminal op `.scan` streams).
 # See crates/shoal-value/src/methods/list.rs::reduce.
 
 [[case]]

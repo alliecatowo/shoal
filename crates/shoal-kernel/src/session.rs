@@ -1,6 +1,6 @@
 //! Session state (`Session`, the attached-connection `Attachment`) plus the
-//! `session.attach` dispatch handler. Split out of `lib.rs` (docs/ROADMAP.md
-//! wave R4): pure mechanical move, zero wire/behavior change.
+//! `session.attach` dispatch handler. Split out of `lib.rs` (site/content/internals/roadmap-and-priorities.md
+//! `site/content/internals/change-map.md`; pure mechanical move, zero wire/behavior change.
 use super::*;
 
 #[derive(Clone)]
@@ -48,7 +48,7 @@ impl Kernel {
         // history against the shared per-user store, same as the REPL (frecency
         // recording is best-effort and never fails a cd).
         evaluator.open_default_jump_history();
-        // Install a command journal on the session's own evaluator (TDD §9),
+        // Install a command journal on the session's own evaluator (site/content/internals/language-conformance-contract.md),
         // mirroring `crates/shoal/src/repl.rs`'s `set_journal` call: without
         // this, the evaluator's per-statement journal integration
         // (`journal_begin_stmt`/`stmt_source` in `shoal-eval/src/journal.rs`)
@@ -84,8 +84,8 @@ impl Kernel {
                 }
             }
         }
-        // Bridge in-language channels onto the kernel wire bus (AGENT-SURFACE
-        // §4's "one substrate"): `channel("user.x").emit(v)` in evaluated
+        // Bridge in-language channels onto the kernel wire bus (see
+        // `site/content/internals/kernel-protocol.md`): `channel("user.x").emit(v)` in evaluated
         // source reaches `events.subscribe`/`resources/subscribe` clients.
         // The evaluator forwards only `user.*` (its own guard), so language
         // code cannot spoof kernel-owned semantic channels.
@@ -148,7 +148,7 @@ impl Kernel {
             principal: who.clone(),
             tty,
         });
-        // TDD §8 tier honesty: report the REAL strongest OS backend
+        // site/content/internals/language-conformance-contract.md tier honesty: report the REAL strongest OS backend
         // available on this host (Landlock → A, Seatbelt → C, else
         // advisory D), and whether this principal's spawns will
         // *actually* be confined — true only when a genuine OS backend
@@ -170,7 +170,7 @@ impl Kernel {
         })
     }
 
-    /// `session.env` (AGENT-SURFACE §1, `shoal://session/env`): the session's
+    /// `session.env` (site/content/internals/kernel-protocol.md, `shoal://session/env`): the session's
     /// environment read from its own evaluator (the same source the in-language
     /// `env` builtin reads, so in-session env writes are reflected), the same
     /// way `session.attach` reads `cwd()`. Env is **NAMES-only unless granted**
@@ -211,13 +211,13 @@ impl Kernel {
         }
     }
 
-    /// `session.reef` (AGENT-SURFACE §1, `shoal://session/reef`): the session's
+    /// `session.reef` (site/content/internals/kernel-protocol.md, `shoal://session/reef`): the session's
     /// reef resolution state — the active manifest scope and every constrained
     /// tool's binding (locked version/provider, or an honest `null` gap when a
     /// scope constrains a tool that isn't locked yet). Sourced entirely from the
     /// evaluator's cached scope chain + loaded lock via
     /// [`Evaluator::prompt_reef_snapshot`] — zero subprocess, zero fresh
-    /// resolution (docs/REEF.md, AGENT-SURFACE §12.1).
+    /// resolution (site/content/internals/reef-resolution.md, site/content/internals/kernel-protocol.md).
     pub(crate) fn handle_session_reef(
         self: &Arc<Self>,
         attached: &mut Option<Attachment>,

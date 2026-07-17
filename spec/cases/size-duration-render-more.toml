@@ -1,5 +1,5 @@
 # Further size/duration render hardening beyond size-duration-more.toml:
-# CONTRACTS §3's "largest decimal unit with integer part >= 1" rule at the
+# site/content/internals/intercrate-protocol-contracts.md "largest decimal unit with integer part >= 1" rule at the
 # `tb` ceiling, the compound duration render's multi-part form spanning
 # `w`/`d` and `d`/`h`/`m`/`s` simultaneously, the exact-boundary rollover
 # from `999b` to `1kb`, and the render-vs-value distinction for a size that

@@ -1,6 +1,6 @@
 //! shoal-journal — the persistent command journal and content-addressed output store.
 //!
-//! Implements TDD §9: every executed statement becomes an `entry` row in a SQLite
+//! Implements site/content/internals/language-conformance-contract.md: every executed statement becomes an `entry` row in a SQLite
 //! database (WAL mode), its captured outputs are stored compressed (zstd) in a
 //! blake3-keyed content-addressed store (CAS) on disk, undo inverses are recorded
 //! per entry, and pins protect blobs from garbage collection.

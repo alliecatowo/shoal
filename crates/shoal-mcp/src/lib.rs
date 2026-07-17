@@ -167,7 +167,7 @@ fn rpc_error(id: Value, code: i32, message: &str, data: Option<Value>) -> Value 
     json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message,"data":data}})
 }
 
-/// `kind:id` short ref → `shoal://kind/id` URI (AGENT-SURFACE §1).
+/// `kind:id` short ref → `shoal://kind/id` URI (site/content/internals/kernel-protocol.md).
 pub(crate) fn short_ref_to_uri(short: &str) -> String {
     match short.split_once(':') {
         Some((kind, rest)) => format!("shoal://{kind}/{rest}"),

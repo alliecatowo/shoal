@@ -8,10 +8,10 @@ mod expr;
 mod pattern;
 mod stmt;
 
-/// Interpreter-class tools (IO.md §2.2): a head in this set, immediately
+/// Interpreter-class tools (site/content/internals/values-streams-execution.md): a head in this set, immediately
 /// followed by `{` (or the triple-raw `'''`/`'` form), lexes a raw balanced-
 /// brace block and produces `Expr::LangBlock` — the parse-time trigger. A head
-/// *not* in this set keeps `{` as a trailing block/thunk (TDD §13.14). This is
+/// *not* in this set keeps `{` as a trailing block/thunk (site/content/internals/language-conformance-contract.md). This is
 /// the static parser-side gate; the eval side maps each tool to its inline-eval
 /// invocation (shoal-eval `expr.rs`).
 pub const INTERPRETERS: &[&str] = &[
@@ -69,7 +69,7 @@ impl std::error::Error for ParseError {}
 pub type ParseResult<T> = Result<T, ParseError>;
 
 /// Parse context carrying the dispatch inputs the parser cannot infer from the
-/// source alone (TDD §3.1): whether we are at a REPL prompt (so `it`/`out` are
+/// source alone (site/content/internals/language-conformance-contract.md): whether we are at a REPL prompt (so `it`/`out` are
 /// legal and a leading `.` chains on `it`), plus the pre-seeded value-bindings
 /// (`let`/`var`/params) and command-bindings (session `fn`s/aliases).
 #[derive(Debug, Clone, Default)]
@@ -94,7 +94,7 @@ pub fn parse_with_scope(
     parser.parse_program()
 }
 
-/// The full-fidelity entry point (TDD §3.1): dispatch honours the two scope
+/// The full-fidelity entry point (site/content/internals/language-conformance-contract.md): dispatch honours the two scope
 /// categories and the REPL context. `parse`/`parse_with_scope` are compat shims
 /// mapping onto this with `repl: false` and no command bindings.
 pub fn parse_with_ctx(src: &str, ctx: ParseCtx) -> ParseResult<Program> {
@@ -119,7 +119,7 @@ pub struct Parser<'s> {
     cmd_scopes: Vec<HashSet<String>>,
     /// REPL context: `it`/`out` are legal and a leading `.` chains on `it`.
     repl: bool,
-    /// Suppresses the `f(a){…}` trailing-block-lambda desugar (§3.4) at the
+    /// Suppresses the `f(a){…}` trailing-block-lambda desugar (site/content/internals/language-conformance-contract.md) at the
     /// *top level* of the expression currently being parsed. Set while
     /// parsing an expression that is immediately followed by a mandatory
     /// `{ … }` block belonging to an *enclosing* construct (e.g. a `for`
@@ -198,7 +198,7 @@ impl<'s> Parser<'s> {
         self.lx.src.as_bytes().get(i).copied().unwrap_or(0)
     }
     /// Does the raw text at `start` begin a path literal (`./ ../ ~ ~/ /…`)?
-    /// Such a head dispatches CMD (TDD §2.2 / §3.1 rule 2 is for EXPR starters,
+    /// Such a head dispatches CMD (site/content/internals/language-conformance-contract.md rule 2 is for EXPR starters,
     /// path words are command heads).
     pub(crate) fn is_path_head(&self, start: usize) -> bool {
         match self.byte(start) {
@@ -218,7 +218,7 @@ impl<'s> Parser<'s> {
     /// followed by a raw block: either an immediately-adjacent `'` (the
     /// `tool'''…'''` / `tool'…'` raw form, matching `sh`'s legacy spelling) or a
     /// `{` open brace (whitespace permitted, as `sh { … }` allows). This is the
-    /// IO.md §2.3 parse-time trigger — checked *before* the brace is consumed so
+    /// site/content/internals/values-streams-execution.md parse-time trigger — checked *before* the brace is consumed so
     /// the parser knows to switch the lexer into raw mode.
     pub(crate) fn interp_block_follows(&self, ident_span: Span) -> bool {
         let end = ident_span.end as usize;
@@ -228,7 +228,7 @@ impl<'s> Parser<'s> {
         matches!(self.lx.token(end, Mode::Expr), Ok((Tok::LBrace, _)))
     }
     /// True when the token immediately after an identifier abuts it (no
-    /// whitespace) and is a postfix opener `.`/`?.`/`(`/`[` — the §3.1
+    /// whitespace) and is a postfix opener `.`/`?.`/`(`/`[` — the site/content/internals/language-conformance-contract.md
     /// ident-adjacency refinement forcing an EXPR statement.
     pub(crate) fn adjacent_postfix_after_ident(&self, ident_span: Span) -> ParseResult<bool> {
         Ok(match self.lx.token(ident_span.end as usize, Mode::Expr) {
@@ -239,7 +239,7 @@ impl<'s> Parser<'s> {
             Err(_) => false,
         })
     }
-    /// Consume a run of `Newline` tokens (delimiter-interior continuation, §2.1).
+    /// Consume a run of `Newline` tokens (delimiter-interior continuation, site/content/internals/language-conformance-contract.md).
     pub(crate) fn skip_newlines(&mut self) -> ParseResult<()> {
         while matches!(self.peek(Mode::Expr)?.0, Tok::Newline) {
             self.bump(Mode::Expr)?;
@@ -248,7 +248,7 @@ impl<'s> Parser<'s> {
     }
     /// Look past a run of newlines; if the next significant token satisfies
     /// `pred`, advance to just before it and return true (leading-`.`/`catch`/
-    /// `else` cross-newline continuation, §2.1). Otherwise leave `pos` intact.
+    /// `else` cross-newline continuation, site/content/internals/language-conformance-contract.md). Otherwise leave `pos` intact.
     pub(crate) fn continue_if<F: Fn(&Tok) -> bool>(&mut self, pred: F) -> ParseResult<bool> {
         let mut p = self.pos;
         loop {
@@ -345,7 +345,7 @@ mod tests {
     fn teaching_pipe_error() {
         let e = parse("ls | wc").unwrap_err();
         assert!(e.msg.contains("no pipe operator"));
-        // TDD §1.4: the hint names the dot-chain replacement WITH an example,
+        // site/content/internals/language-conformance-contract.md: the hint names the dot-chain replacement WITH an example,
         // plus `.feed` and `sh { }`. The `(try ...)` example was dropped once —
         // pin it so it stays.
         let hint = e.hint.as_deref().unwrap_or_default();
@@ -371,7 +371,7 @@ mod tests {
     }
     #[test]
     fn teaching_pipe_error_in_infix_positions() {
-        // TDD §1.4 says ANYWHERE: the infix positions used to fall out of the
+        // site/content/internals/language-conformance-contract.md says ANYWHERE: the infix positions used to fall out of the
         // operator table into the generic terminator error.
         for src in ["1 | 2", "(1 | 2)", "let a = 1 | 2"] {
             let e = parse(src).unwrap_err();
@@ -383,7 +383,7 @@ mod tests {
     }
     #[test]
     fn it_and_out_are_parse_errors_outside_repl() {
-        // TDD §13.16: bare-statement forms used to dispatch as a command named
+        // site/content/internals/language-conformance-contract.md: bare-statement forms used to dispatch as a command named
         // `it` and fail only at runtime. Value positions already errored.
         for src in ["it", "out", "it + 1"] {
             let e = parse(src).unwrap_err();
@@ -392,7 +392,7 @@ mod tests {
         // The names are effectively reserved outside a REPL: even declaring
         // `let it = 5` parses, but any subsequent USE still errors (the
         // value-position check in `primary()` predates this fix and does not
-        // consult bindings — consistent with §13.16's blanket rule).
+        // consult bindings — consistent with site/content/internals/language-conformance-contract.md blanket rule).
         assert!(parse("let it = 5").is_ok());
         assert!(
             parse("let it = 5\nit")

@@ -1,7 +1,7 @@
 # Further filesystem-builtin hardening beyond fs-builtins.toml: failure
 # modes not yet covered (mkdir onto an existing directory, rm/cp/head on a
 # missing path) and `mv` overwriting an existing destination (content wins,
-# not an error — TDD names no distinct "overwrite protection" builtin).
+# not an error — site/content/internals/language-conformance-contract.md names no distinct "overwrite protection" builtin).
 # Same determinism discipline as fs-builtins.toml: only `.name`/`.type`
 # (never the cwd-absolutized `path`/`target` fields) are asserted directly.
 

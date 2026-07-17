@@ -1,4 +1,4 @@
-# `cd -`, OLDPWD, and the `pushd`/`popd`/`dirs` directory stack (TDD §4.6).
+# `cd -`, OLDPWD, and the `pushd`/`popd`/`dirs` directory stack (site/content/internals/language-conformance-contract.md).
 #
 # Every case runs in a fresh temp cwd. `cd -` restores the EXACT `PathBuf` left
 # (not a re-canonicalized one), so round-trips compare equal regardless of any
@@ -86,7 +86,7 @@ src = "pushd"
 error = "custom"
 error_contains = "swap"
 
-# --- session-scope rule (mirrors cd, TDD §4.6) ----------------------------
+# --- session-scope rule (mirrors cd, site/content/internals/language-conformance-contract.md) ----------------------------
 
 [[case]]
 name = "pushd-inside-fn-body-is-illegal"

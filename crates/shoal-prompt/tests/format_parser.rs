@@ -1,4 +1,4 @@
-//! design §13: the format parser against a fixed corpus of every construct, and
+//! site/content/internals/prompt-editor-lsp.md: the format parser against a fixed corpus of every construct, and
 //! the whitespace-collapse rule as observed through a real render.
 
 use std::path::PathBuf;

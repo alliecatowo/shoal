@@ -1,4 +1,4 @@
-# The §3.4 desugaring table, one case per row not already exercised by an
+# The site/content/internals/language-conformance-contract.md desugaring table, one case per row not already exercised by an
 # existing corpus file (operators.toml already covers `.field <op> e`'s
 # sibling rows `??`/`?.`/`catch`; match.toml covers pattern desugaring).
 # `crates/shoal-syntax/src/parser.rs`'s `command_shape` unit test is the
@@ -8,7 +8,7 @@
 [[case]]
 name = "desugar-env-prefix-scopes-a-single-spawn"
 # `NAME=v cmd` -> `with(env: {NAME: v}) { call(...) }` — scoped to exactly
-# this one spawn (TDD §3.4), not a session-wide env write. `sh -c` (not the
+# this one spawn (site/content/internals/language-conformance-contract.md), not a session-wide env write. `sh -c` (not the
 # `sh { }` LangBlock form, which is a different grammar branch) is a plain
 # external command here, so this exercises `call.env_prefix` threading into
 # a real spawn (`command.rs::run_argv`), not just the parser shape.
@@ -20,7 +20,7 @@ value = '"hello"'
 
 [[case]]
 name = "desugar-redirect-out-truncates-builtin-output"
-# `cmd > f` -> `.save(f)` on stdout (TDD §3.4); a builtin's outcome bytes go
+# `cmd > f` -> `.save(f)` on stdout (site/content/internals/language-conformance-contract.md); a builtin's outcome bytes go
 # through `host::value_bytes`, which appends exactly one trailing newline to
 # a bare (already-newline-less) `str` result.
 src = '''
@@ -53,7 +53,7 @@ value = '"hi"'
 
 [[case]]
 name = "desugar-spawn-ampersand-yields-an-awaitable-task"
-# `cmd … &` -> `spawn { call(…) }` (TDD §3.4): the parser sets
+# `cmd … &` -> `spawn { call(…) }` (site/content/internals/language-conformance-contract.md): the parser sets
 # `CmdCall.background = true` and `command.rs::eval_command` reads it,
 # re-wrapping the call in a `spawn { }` block so the statement yields a
 # `task` handle instead of running synchronously. Awaiting that task blocks
@@ -65,7 +65,7 @@ value = '"hi"'
 
 [[case]]
 name = "desugar-alias-bare-invoke"
-# `alias gs = git status` binds `gs` -> a partial call node (TDD §1.8); the
+# `alias gs = git status` binds `gs` -> a partial call node (site/content/internals/language-conformance-contract.md); the
 # PARSER itself tracks alias names in a separate `cmd_scopes` table (distinct
 # from `let`/`var`'s `scopes`) so a later bare reference still dispatches CMD
 # (not EXPR-var) within the same program — `crates/shoal-syntax/src/parser/
@@ -78,7 +78,7 @@ value = '"hey"'
 
 [[case]]
 name = "desugar-alias-appends-later-args"
-# "later args append" (TDD §3.4): calling the alias with extra positional
+# "later args append" (site/content/internals/language-conformance-contract.md): calling the alias with extra positional
 # args appends them to the aliased call's argv.
 src = '''
 alias greet = echo hey
@@ -89,7 +89,7 @@ value = '"hey there"'
 [[case]]
 name = "desugar-flag-long-equals-form-binds-named"
 # `--jobs=4` -> `named(jobs: w"4")` coerced through the callee's declared
-# param type (TDD §3.4 + §4.4).
+# param type (site/content/internals/language-conformance-contract.md).
 src = "fn build(jobs: int = 1) { jobs }\nbuild --jobs=4"
 value = "4"
 
@@ -108,13 +108,13 @@ error = "custom"
 
 [[case]]
 name = "desugar-implicit-arg-field-with-op"
-# `.field <op> e` (arg position) -> `x => x.field <op> e` (TDD §3.4).
+# `.field <op> e` (arg position) -> `x => x.field <op> e` (site/content/internals/language-conformance-contract.md).
 src = '[{a: 1}, {a: 2}, {a: 3}].where(.a > 1)'
 value = "[{a: 2}, {a: 3}]"
 
 [[case]]
 name = "desugar-implicit-arg-method-call"
-# `.method(args)` (arg position) -> `x => x.method(args)` (TDD §3.4). Kept
+# `.method(args)` (arg position) -> `x => x.method(args)` (site/content/internals/language-conformance-contract.md). Kept
 # free of a trailing operator (unlike the `.field <op> e` row above) since
 # only the plain form is in the table — combining sugar with an operator on
 # a method-call result isn't a documented row.
@@ -123,7 +123,7 @@ value = "[2, 3, 1]"
 
 [[case]]
 name = "desugar-trailing-block-sugar-on-a-builtin-call"
-# `f(a) { … }` -> `f(a, () => { … })` (TDD §3.4). `retry(n, thunk)` takes its
+# `f(a) { … }` -> `f(a, () => { … })` (site/content/internals/language-conformance-contract.md). `retry(n, thunk)` takes its
 # thunk positionally, so `retry(3) { … }` must desugar to exactly that —
 # proven end to end by retrying a deliberately-failing body until the third
 # attempt, which succeeds.
@@ -139,7 +139,7 @@ value = "99"
 [[case]]
 name = "desugar-leading-dot-continuation"
 # "leading-`.` line -> continuation of previous expression's postfix chain"
-# (TDD §3.4): a newline before a `.`-continuation is NOT a statement
+# (site/content/internals/language-conformance-contract.md): a newline before a `.`-continuation is NOT a statement
 # terminator.
 src = '''
 [1, 2, 3]

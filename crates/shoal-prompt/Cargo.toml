@@ -5,10 +5,10 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Pure domain crate that renders a shoal prompt from a structured PromptContext snapshot — no IO, no subprocesses."
 
-# Dependency rule (design-prompt.md §2.1): shoal-prompt depends on NOTHING under
+# Dependency rule (site/content/internals/prompt-editor-lsp.md): shoal-prompt depends on NOTHING under
 # shoal-*. Its only normal dependencies are serde (config types) and toml
 # (parsing). shoal-value appears strictly as a dev-dependency for the render
-# parity tripwire test (§2.1) and never ships in the compiled dependency graph.
+# parity tripwire test (site/content/internals/prompt-editor-lsp.md) and never ships in the compiled dependency graph.
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 toml = "1"

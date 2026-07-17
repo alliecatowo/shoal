@@ -1,0 +1,16 @@
+{% import "macros/icons.html" as icons %}
+<dialog class="search-dialog" data-search-dialog aria-labelledby="search-title">
+  <div class="search-panel">
+    <header>
+      {{ icons::icon(name="search") }}
+      <label class="visually-hidden" for="site-search-input" id="search-title">Search Shoal documentation</label>
+      <input id="site-search-input" data-search-input type="search" inputmode="search" autocomplete="off" spellcheck="false" placeholder="Search language, shell, architecture…" aria-autocomplete="list" aria-controls="site-search-results">
+      <button type="button" data-search-close aria-label="Close search">{{ icons::icon(name="close") }}</button>
+    </header>
+    <div class="search-hint" data-search-hint>
+      <span>Type to search every guide</span><span><kbd>↑</kbd><kbd>↓</kbd> navigate <kbd>↵</kbd> open <kbd>esc</kbd> close</span>
+    </div>
+    <div class="search-results" id="site-search-results" data-search-results role="listbox" aria-live="polite"></div>
+    <p class="search-empty" data-search-empty hidden>No matching results. Try a language feature, crate, or subsystem.</p>
+  </div>
+</dialog>

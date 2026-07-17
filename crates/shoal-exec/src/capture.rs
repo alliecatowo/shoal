@@ -234,13 +234,13 @@ pub fn spawn_capture(mut spec: ExecSpec, cancel: &CancelToken) -> io::Result<Str
 /// Blocking capture run: drains stdout and stderr on two threads (so a child
 /// filling both pipes can never deadlock), waits, and returns the collected
 /// bytes. Each stream is bounded to [`crate::capture_hard_cap`] bytes in memory
-/// (TDD §317) so an unbounded producer (`yes`, `cat /dev/zero`) cannot OOM the
+/// (site/content/internals/language-conformance-contract.md) so an unbounded producer (`yes`, `cat /dev/zero`) cannot OOM the
 /// shell.
 ///
 /// stderr overflow is discarded (with [`ExecResult::truncated`] set), as before.
 /// stdout is the value: when the spec requests a spill ([`ExecSpec::spill`]) and
 /// stdout exceeds the RAM cap, the **full** stream is streamed to a
-/// blake3-addressed disk file instead of being dropped (TDD §317's disk-spill
+/// blake3-addressed disk file instead of being dropped (site/content/internals/language-conformance-contract.md disk-spill
 /// promise) and returned as [`ExecResult::stdout_spill`]; the resident stdout is
 /// then a bounded preview. With no spill requested, stdout behaves exactly as it
 /// did before (bounded + `truncated`).
@@ -310,7 +310,7 @@ struct DrainOut {
 /// [`drain_capped`] (bounded RAM buffer, overflow dropped + flagged). With
 /// `spill`, once the stream exceeds `cap` the **full** stream is streamed to a
 /// blake3-addressed file under `spill.dir` (up to `spill_cap` bytes); the RAM
-/// buffer is kept as a bounded preview (TDD §317).
+/// buffer is kept as a bounded preview (site/content/internals/language-conformance-contract.md).
 ///
 /// Reading always continues to EOF so the child never blocks on a full pipe.
 fn drain_stdout(
@@ -501,7 +501,7 @@ impl SpillSink {
 mod tests {
     use super::*;
 
-    /// FIX 4: a bounded producer emitting more than `cap` bytes fills the buffer
+    /// A bounded producer emitting more than `cap` bytes fills the buffer
     /// to exactly the cap and reports truncation — the buffer never grows past
     /// the bound, so an unbounded child can't OOM the shell.
     #[test]
@@ -536,7 +536,7 @@ mod tests {
         assert!(!truncated, "an exact fit is complete, not truncated");
     }
 
-    /// §317 disk-spill: a stream past the RAM cap streams the FULL content to a
+    /// site/content/internals/process-execution.md disk-spill: a stream past the RAM cap streams the FULL content to a
     /// blake3-addressed file, keeps a bounded preview, and reports the true len
     /// and hash — nothing is lost (contrast `drain_capped`, which drops it).
     #[test]

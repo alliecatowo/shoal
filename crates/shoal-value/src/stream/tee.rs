@@ -1,4 +1,4 @@
-//! Lazy `.tee(n)` forks for live streams (STREAMS §1): `n` handles share one
+//! Lazy `.tee(n)` forks for live streams (site/content/internals/streams-channels.md): `n` handles share one
 //! upstream source, each with its own **bounded** queue.
 //!
 //! Under the synchronous pull model there is no background pump: whichever
@@ -6,7 +6,7 @@
 //! replays a copy into every sibling fork's queue — that is how "each
 //! replaying every item to its own sink" is realized without a thread. A fork
 //! that falls more than [`TEE_QUEUE_CAP`] items behind gets the standing
-//! coalesce/drop discipline (STREAMS §6.1): overflowed items are dropped and
+//! coalesce/drop discipline (site/content/internals/streams-channels.md): overflowed items are dropped and
 //! summarized as a single `{dropped: n}` marker element, enqueued in order as
 //! soon as its queue has room again (or yielded when the queue drains). This
 //! keeps memory bounded per fork while never losing items *silently*.
@@ -21,7 +21,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// Per-fork queue capacity. STREAMS §1/§6.1 require every buffer to be
+/// Per-fork queue capacity. site/content/internals/streams-channels.md require every buffer to be
 /// bounded but name no size for tee forks; this matches the live sources'
 /// default buffer cap (shoal-eval's `streams.rs`).
 pub(super) const TEE_QUEUE_CAP: usize = 64;
@@ -61,7 +61,7 @@ impl ForkQueue {
     }
 }
 
-/// The STREAMS §6.1 overflow marker element: `{dropped: n}`.
+/// The site/content/internals/streams-channels.md overflow marker element: `{dropped: n}`.
 fn dropped_marker(n: u64) -> Value {
     let mut r = Record::new();
     r.insert("dropped".into(), Value::Int(n.min(i64::MAX as u64) as i64));

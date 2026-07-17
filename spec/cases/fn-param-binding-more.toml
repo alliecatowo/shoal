@@ -1,6 +1,6 @@
 # Further `fn` parameter-binding hardening beyond coercion.toml's word-bind-*
 # pass and desugar.toml's flag-binding rows: a default value (`param = expr`,
-# TDD §3.2's `param` grammar row) actually taking effect when the argument
+# site/content/internals/language-conformance-contract.md `param` grammar row) actually taking effect when the argument
 # is omitted, a positional argument overriding that same default, a NAMED
 # argument overriding a default while a sibling default stays in effect, a
 # `list<str>` variadic tail (desugar.toml/coercion.toml only exercise

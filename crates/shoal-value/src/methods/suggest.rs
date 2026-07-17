@@ -99,7 +99,7 @@ const NUM_METHODS: &[&str] = &[
 
 /// Pure component accessors (this crate) + the fs-backed set the evaluator
 /// dispatches ahead of `call_method`. `feed` is deliberately absent — a bare
-/// path is a name, not content (IO.md §1.2).
+/// path is a name, not content (site/content/internals/values-streams-execution.md).
 const PATH_METHODS: &[&str] = &[
     "name",
     "stem",
@@ -295,7 +295,7 @@ fn hint(name: &str, type_name: &str) -> Option<String> {
 
 /// Classic two-row Levenshtein edit distance (method names are short ASCII;
 /// no dependency warranted). Exposed via `methods` so the evaluator's command
-/// did-you-mean (TDD §13.9) reuses the very same metric the method did-you-mean
+/// did-you-mean (site/content/internals/language-conformance-contract.md) reuses the very same metric the method did-you-mean
 /// uses here, rather than duplicating it.
 pub fn levenshtein(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();

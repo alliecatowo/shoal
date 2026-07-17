@@ -1,0 +1,72 @@
+{% extends "base.html" %}
+{% import "macros/docs.html" as docs %}
+
+{% block body_class %}docs-page section-page{% endblock body_class %}
+
+{% block body %}
+  {% if section.path is starting_with("/internals") %}
+    {% set docs_root = get_section(path="internals/_index.md") %}
+  {% else %}
+    {% set docs_root = get_section(path="docs/_index.md") %}
+  {% endif %}
+  {% set active_path = section.path %}
+  {% if docs_root.extra.nav_scheme == "atlas" %}{% set active_group = "Orientation" %}{% else %}{% set active_group = "Start here" %}{% endif %}
+  {% include "partials/docs_sidebar.html" %}
+
+  <div class="docs-main-shell no-toc">
+    <div class="mobile-docs-bar">
+      <button type="button" data-sidebar-open aria-controls="docs-sidebar" aria-expanded="false"><span aria-hidden="true">☷</span> Browse {{ docs_root.extra.eyebrow | default(value="manual") | lower }}</button>
+    </div>
+    <main class="docs-article" id="main-content">
+      {% include "partials/breadcrumbs.html" %}
+      <header class="article-header section-header">
+        {% if section.extra.eyebrow %}<p class="eyebrow">{{ section.extra.eyebrow }}</p>{% endif %}
+        <h1>{{ section.title }}</h1>
+        {% if section.description %}<p class="lede">{{ section.description }}</p>{% endif %}
+        {% if section.extra.audience %}<dl class="article-facts"><div><dt>For</dt><dd>{{ section.extra.audience }}</dd></div></dl>{% endif %}
+      </header>
+      {% if section.content %}<article class="prose section-intro">{{ section.content | safe }}</article>{% endif %}
+
+      {% if section.subsections %}
+      <section class="section-catalog" aria-labelledby="section-groups-title">
+        <div class="catalog-heading"><p class="eyebrow">Explore by system</p><h2 id="section-groups-title">{{ section.title }} map</h2></div>
+        <div class="catalog-grid">
+          {% for subsection_path in section.subsections %}
+            {% set subsection = get_section(path=subsection_path) %}
+          <a class="catalog-card" href="{{ subsection.permalink }}">
+            <span class="catalog-index">{% if loop.index < 10 %}0{% endif %}{{ loop.index }}</span>
+            <div><h3>{{ subsection.title }}</h3>{% if subsection.description %}<p>{{ subsection.description }}</p>{% endif %}<small>{{ subsection.pages | length }} guide{% if subsection.pages | length != 1 %}s{% endif %}</small></div>
+            <span class="card-arrow" aria-hidden="true">↗</span>
+          </a>
+          {% endfor %}
+        </div>
+      </section>
+      {% endif %}
+
+      {% if section.pages %}
+      <section class="guide-list" aria-labelledby="guides-title">
+        <div class="catalog-heading"><p class="eyebrow">Browse the collection</p><h2 id="guides-title">Books and chapters</h2></div>
+        {% if section.path == docs_root.path and docs_root.extra.nav_scheme == "atlas" %}
+          {{ docs::catalog_group(section=section, title="Orientation", description="Composition roots, ownership boundaries, and the fastest paths into the codebase.", number="Book 01", group="Orientation", id="orientation") }}
+          {{ docs::catalog_group(section=section, title="Language & runtime", description="Parsing, evaluation, values, streams, and the invariants that connect them.", number="Book 02", group="Language & runtime", id="language-runtime") }}
+          {{ docs::catalog_group(section=section, title="Execution & security", description="Process boundaries, host behavior, effects, policy, and best-available enforcement.", number="Book 03", group="Execution & security", id="execution-security") }}
+          {{ docs::catalog_group(section=section, title="Kernel & agents", description="Sessions, wire contracts, bounded values, tasks, events, and MCP projection.", number="Book 04", group="Kernel & agents", id="kernel-agents") }}
+          {{ docs::catalog_group(section=section, title="Storage & tooling", description="Reef, adapters, configuration, journal persistence, CAS, and durable reconstruction.", number="Book 05", group="Storage & tooling", id="storage-tooling") }}
+          {{ docs::catalog_group(section=section, title="Maintenance", description="Change boundaries, known debt, test ownership, quality gates, and release discipline.", number="Book 06", group="Maintenance", id="maintenance") }}
+          {{ docs::catalog_group(section=section, title="Guides", description="Additional maintainer material not yet assigned to a book.", number="More", group="Guides", id="guides") }}
+        {% elif section.path == docs_root.path %}
+          {{ docs::catalog_group(section=section, title="Start here", description="Build Shoal, learn its mental model, and get comfortable at the prompt.", number="Book 01", group="Start here", id="start") }}
+          {{ docs::catalog_group(section=section, title="Language", description="Syntax, values, functions, control flow, outcomes, collections, and data methods.", number="Book 02", group="Language", id="language") }}
+          {{ docs::catalog_group(section=section, title="Shell & tools", description="External programs, live data, files, jobs, configuration, prompts, and tool resolution.", number="Book 03", group="Shell & tools", id="shell-tools") }}
+          {{ docs::catalog_group(section=section, title="Agents & protocol", description="Structured sessions, the kernel contract, MCP tools and resources, agent workflows, and trust boundaries.", number="Book 04", group="Agents & protocol", id="agents-protocol") }}
+          {{ docs::catalog_group(section=section, title="Project", description="An honest implementation ledger, current limits, and the roadmap from preview to a dependable daily shell.", number="Book 05", group="Project", id="project") }}
+          {{ docs::catalog_group(section=section, title="Reference", description="Dense grammar, builtin, namespace, value-method, and companion-command references for daily use.", number="Book 06", group="Reference", id="reference") }}
+          {{ docs::catalog_group(section=section, title="Guides", description="Additional material not yet assigned to a book.", number="More", group="Guides", id="guides") }}
+        {% else %}
+          {{ docs::catalog_group(section=section, title=section.title, description=section.description, number="Chapters", group="*", id="chapters") }}
+        {% endif %}
+      </section>
+      {% endif %}
+    </main>
+  </div>
+{% endblock body %}

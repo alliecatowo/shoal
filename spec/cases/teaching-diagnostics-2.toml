@@ -26,7 +26,7 @@ parse_error_contains = "unexpected character"
 
 [[case]]
 name = "teach2-non-ascii-identifier-start-is-unexpected-character"
-# Identifiers are ASCII-only per TDD §2.3; a bare non-ASCII letter can never
+# Identifiers are ASCII-only per site/content/internals/language-conformance-contract.md; a bare non-ASCII letter can never
 # start one.
 src = "π"
 parse_error = true

@@ -1,5 +1,5 @@
 //! In-language `channel(name)` — the user-populated end of the ONE stream
-//! substrate (docs/STREAMS.md §2.5, AGENT-SURFACE §7). A process-in-session
+//! substrate (site/content/internals/streams-channels.md, site/content/internals/kernel-protocol.md). A process-in-session
 //! event bus: `channel("x").emit(v)` publishes, `.events()` subscribes as a
 //! `stream<event>`, `.latest()` reads the last payload, `.take(timeout:)` blocks
 //! for the next. Coordination is channels, never files.
@@ -20,7 +20,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// Ring depth per channel (AGENT-SURFACE §4 requires ≥1024). Older history for a
+/// Ring depth per channel (site/content/internals/kernel-protocol.md requires ≥1024). Older history for a
 /// user channel is evicted once past this — durable history is `.save(path)` or a
 /// journaled channel, never an unbounded ring.
 const RING_CAP: usize = 1024;
@@ -65,7 +65,7 @@ struct ChannelState {
 }
 
 /// A host-installed hook mirroring in-language emits onto an external bus
-/// (the kernel `EventBus`, so wire subscribers see them — AGENT-SURFACE §4's
+/// (the kernel `EventBus`, so wire subscribers see them — site/content/internals/kernel-protocol.md
 /// "one substrate" promise).
 pub type EventForwarder = Box<dyn Fn(&str, &Value) + Send + Sync>;
 
@@ -141,9 +141,9 @@ impl EventBus {
     }
 
     /// Subscribe to `name`, returning a receiver of `event` records. Replay
-    /// mirrors the kernel EventBus (AGENT-SURFACE §4): `since: None` replays the
+    /// mirrors the kernel EventBus (site/content/internals/kernel-protocol.md): `since: None` replays the
     /// whole ring then goes live; `since: Some(n)` replays only `seq > n` (the
-    /// in-language `?since=` cursor, STREAMS §7), then live.
+    /// in-language `?since=` cursor, site/content/internals/streams-channels.md), then live.
     pub fn events(&self, name: &str, since: Option<u64>) -> Receiver<VResult<Value>> {
         self.subscribe(name, Replay::from_since(since))
     }
@@ -162,7 +162,7 @@ impl EventBus {
         rx
     }
 
-    /// Block for the next payload on `name` (STREAMS §6). `timeout` bounds the
+    /// Block for the next payload on `name` (site/content/internals/streams-channels.md). `timeout` bounds the
     /// wait: `timeout`/`channel_closed` errors surface rather than blocking a host
     /// forever. Subscribes with no replay, so only events published *after* this
     /// call are seen.
@@ -183,7 +183,7 @@ impl EventBus {
     }
 }
 
-/// `{channel, seq, ts, payload}` — the wire event shape (AGENT-SURFACE §4),
+/// `{channel, seq, ts, payload}` — the wire event shape (site/content/internals/kernel-protocol.md),
 /// yielded by `channel(name).events()`.
 fn event_record(name: &str, seq: u64, ts_ns: i128, payload: &Value) -> Value {
     let mut r = Record::new();
@@ -224,7 +224,7 @@ pub(crate) fn as_channel(v: &Value) -> Option<&str> {
 }
 
 impl Evaluator {
-    /// `channel(name).emit/.events/.latest/.take` (STREAMS §2.5, §7).
+    /// `channel(name).emit/.events/.latest/.take` (site/content/internals/streams-channels.md).
     pub(crate) fn eval_channel_method(
         &mut self,
         chan: &str,
@@ -281,7 +281,7 @@ impl Evaluator {
 
     /// Stream sinks needing the evaluator: `.into(channel(name))` republishes each
     /// item as an event; `.render()` drives the stream to the statement sink as a
-    /// live view (STREAMS §4). Both drive with `self` as the `CallCtx` directly
+    /// live view (site/content/internals/streams-channels.md). Both drive with `self` as the `CallCtx` directly
     /// (a manual pull loop) so each item can also reach an evaluator-only
     /// destination between pulls.
     pub(crate) fn eval_stream_sink(
@@ -324,7 +324,7 @@ impl Evaluator {
         Ok(Value::Null)
     }
 
-    /// `on(channel(name) | name, handler)` (STREAMS §7) — spawn a background task
+    /// `on(channel(name) | name, handler)` (site/content/internals/streams-channels.md) — spawn a background task
     /// that runs `handler(event)` for every event on the channel. This is the
     /// in-language spelling of `spawn { channel(name).events().each(handler) }`
     /// (the bare `on channel(x){ev=>…}` keyword sugar needs a grammar change,
@@ -360,7 +360,7 @@ impl Evaluator {
         let penv = self.process_env.clone();
         let adapters = self.adapters.clone();
         let bus = self.bus();
-        // Share the host's effect ports (docs/ROADMAP.md R4) with the handler
+        // Share the host's effect ports (site/content/internals/roadmap-and-priorities.md) with the handler
         // task; `Arc` clones, identical under the `Std*` defaults.
         let fs = self.fs.clone();
         let exec = self.exec.clone();

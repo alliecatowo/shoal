@@ -1,98 +1,70 @@
 ---
 name: shoal
-description: Complete operating manual for driving shoal — the agent-first structured shell — over its MCP facade (shoal_exec, shoal_plan, shoal_apply, shoal_get, shoal_journal, shoal_cap_request, shoal_cancel). Load this whenever you are about to run a command in a shoal session, write `.shl` source, translate a bash idiom into shoal, or interpret a shoal MCP tool result. Covers the full language grammar, the exact wire protocol as actually implemented (not just as spec'd), every hard rule/gotcha, and what is not yet implemented.
+description: Complete operating manual for driving shoal — the agent-first structured shell — over its 13-tool MCP facade, including structured exec, plans, refs, resources, subscriptions, and interactive PTYs. Load this whenever you are about to run a command in a shoal session, write `.shl` source, translate a shell idiom into shoal, or interpret a shoal MCP result.
 ---
 
 # shoal — the language card
 
 shoal is a **typed value graph over one session kernel**, not a text-stream router. You never pipe
-bytes between processes and re-parse them; you get back **structured values** with **stable refs**,
-and you drill into them by field path. This card is exhaustive and precise on purpose: every claim
-below is traced to `docs/TDD.md`, `docs/VISION.md`, `docs/REEF.md`, `docs/AGENT-SURFACE.md`,
-`docs/IO.md`, `docs/STREAMS.md`, `docs/CONTRACTS.md`, the 1100+-case conformance corpus at
-`spec/cases/*.toml`, or a direct read of `crates/shoal-mcp`, `crates/shoal-proto`,
-`crates/shoal-kernel`. Anything not yet implemented is called out explicitly — do not attempt it.
+bytes between processes and re-parse them; you get back **structured values** with **addressable refs**,
+and you drill into them by field path. This card is derived from the stable Zola sources under
+`site/content/docs/` and `site/content/internals/`, the 1,310-case corpus across 77 suites at
+`spec/cases/*.toml`, and the current `shoal-mcp`/`shoal-proto`/`shoal-kernel` source. When prose and
+the corpus disagree, the corpus is the behavioral authority.
 
 **The one rule above all others:** never parse shoal's own rendered text. Every value you need is
 already structured on the wire. Reach for `structuredContent` / `value.get` / `shoal_get`, never for
 `content[0].text` or the human `render` string.
 
-> **Surface-currency note (read once — UPDATED).** This card originally hedged six MCP-facade features
-> as **(P1)** ("intended, re-verify before trusting"). **All six have since been confirmed landed
-> against source — treat every `(P1)` marker below as DONE, not pending:**
-> 1. MCP `resources/*` — `resources/list`/`read`/`subscribe`/`unsubscribe` are dispatched
->    (`crates/shoal-mcp/src/lib.rs` `Facade::handle`), and `initialize` advertises
->    `capabilities.resources.subscribe = true`. Use `resources/read` to drill into an elided value's
->    `shoal://…` uri directly — the manual `ref`+`path` translation (§0.2/§4-rule-15) is now just a
->    fallback, not the primary path.
-> 2. The `events`/channel subsystem — `resources/subscribe` on a `shoal://events/{ch}` uri starts a
->    forwarder that pushes `notifications/resources/updated` frames (`client.rs::run_event_forwarder`).
-> 3. `shoal_cancel` — present in `tools()` (the tool list has seven entries now).
-> 4. Real (non-hardcoded) `reversibility` — the kernel computes it via `reversibility_from_effects`
->    (`handlers_exec.rs`/`handlers_session.rs`), not the literal `"unknown"`.
-> 5. macOS-safe socket-path fallback in `shoal-mcp` matching `shoal-kernel`.
-> 6. Elision on the `render`/`content[0].text` fields.
->
-> Language-surface staleness has also been corrected: `.feed`, interpreter blocks (`python { }` /
-> `jq { }` / …), and reactive streams/channels are **implemented** (see §6). A later sync pass closed
-> most of what this note used to list as open: `shoal_exec` now has real `background`/`timeout_ms`/
-> `elide`/`mode` params (the dead `capture`/`timeout` are gone), `shoal_get` exposes `elide`,
-> `shoal_journal`'s `until`/`ok`/`effects` filters all work, `shoal_cap_request`'s `effects`
-> genuinely scopes the grant, and `complete`/`explain` are dispatched.
->
-> **A further batch just landed (verified against current source/binary), closing gaps this card
-> previously called out as open:** the **language-channel→kernel-bus bridge now works, both
-> directions, `user.*`-scoped** (`channel("user.x").emit(v)` in evaluated source reaches a
-> `resources/subscribe`/`events.subscribe` client, and a wire `events.publish` is mirrored back into
-> the session's in-language `channel("user.x")` — §0.8, §6); **`position: "value"`'s capture-vs-raise
-> now governs the *final* statement of a multi-statement `src`, not only a single bare expression**
-> (§0.1, §4 rule 13); the default, trash-based `rm` is now correctly classified **`reversible`**, not
-> `irreversible` (§0.3); **`structuredContent.render`/`content[0].text` are now both size-capped at
-> 64 KiB** with a truncation marker, closing the old unbounded-render gap (§0.1, §4 rule 14); and a
-> cancelled background task now reports terminal state `"cancelled"` (a failed one `"failed"`), not
-> always `"completed"` (§0.7). The remaining genuinely-open gaps this card documents (the narrow
-> `value.get` path grammar and real OS-level sandbox enforcement through this surface) are still
-> open — a one-line probe beats trusting any banner.
+> **Current surface snapshot.** The MCP facade ships 13 tools, including six PTY tools; resources,
+> templates, reads, and subscriptions are live. `resources/unsubscribe` is acknowledged but does
+> not stop its dedicated forwarding connection/thread; cleanup is scoped to MCP process exit.
+> `user.*` channels bridge in both directions; background cancellation and timeout-to-task
+> conversion work; and render/text
+> previews are capped at 64 KiB. Kernel autostart is on unless a non-empty
+> `SHOAL_NO_AUTOSTART` disables it. Scoped child processes use the strongest available filesystem
+> sandbox (Landlock on Linux, Seatbelt on macOS), while unsupported dimensions are reported rather
+> than implied. Spawn-hash pinning is enforced only when the principal has opted into a non-empty
+> `proc_spawn` allowlist. CAS-backed captures expose recoverable `val:blake3:…` refs.
 
 ---
 
 ## 0. How you talk to shoal
 
-You do not have a bash tool here. You have **seven** MCP tools, all implemented in
-`crates/shoal-mcp/src/lib.rs` (including `shoal_cancel`, DONE — no longer P1), forwarding to a
-running `shoal-kernel` process over a newline-delimited JSON-RPC 2.0 Unix-socket connection
-(`docs/TDD.md` §7, `docs/AGENT-SURFACE.md` §5). Alongside the tools, `docs/AGENT-SURFACE.md` §6/§8
-specs a full MCP **resources** layer (`resources/list`/`read`/`subscribe`, push notifications) — this
-is now the confirmed-dispatched way to fetch elided payloads and subscribe to live output (DONE — see
-§0.8 below for how to use it).
-**A `shoal-kernel` must already be running and reachable** (see the plugin `README.md` — this is a
-separate prerequisite from the plugin itself; if a tool call fails with a connection error, that is
-the first thing to check, not a language bug).
+You do not have a bash tool here. You have **13 MCP tools**: seven structured-execution tools and
+six interactive-PTY tools. They forward to a `shoal-kernel` over newline-delimited JSON-RPC 2.0 on
+a Unix socket. MCP resources are the read/subscribe side of the same session.
+
+The bridge probes the socket and **autostarts a detached `shoal-kernel` by default**. It reuses a
+live listener and waits up to about five seconds for a new daemon. Set any non-empty
+`SHOAL_NO_AUTOSTART` when a service manager or human owns kernel lifecycle. Autostart still requires
+`shoal-kernel` on `PATH`; a failed best-effort spawn surfaces as the real connection error.
 
 Every tool result comes back as an MCP `tools/call` result shaped:
 
 ```json
-{"content":[{"type":"text","text":"<pretty-printed JSON copy of the result>"}],
+{"content":[{"type":"text","text":"<bounded human render, or pretty JSON when no render exists>"}],
  "structuredContent": <the same JSON value, structured>,
  "isError": false}
 ```
+
+When the result is addressable, `content` also includes a `resource_link` item for its `shoal://`
+URI.
 
 **Always read `structuredContent.value`, not `render` or `content[0].text`, for data.** `content[0].text`
 is a pretty-printed dump of the result for surfaces that only render text; it and the nested `render`
 field are now both **size-capped at 64 KiB** with a `…(N more lines, fetch via <uri>)` truncation
 marker (see §4 rule 14 — this used to be a real unbounded-wall-of-bytes gap, now closed both at the
-MCP boundary and at the kernel wire layer). That cap fixes the context-explosion risk, but `render`/
-`text` are still **ANSI-laden** human strings (color codes survive even on this headless MCP surface —
-verified in `crates/shoal-kernel/src/wire.rs`'s `bound_render`, which exists specifically because a
-render can carry "a huge outcome's ANSI-laden stdout") and are not reliably field-addressable. Reach
-for `structuredContent.value`/`shoal_get` for anything you intend to parse or branch on; treat
-`render`/`text` as a human-only preview, size-bounded or not.
+MCP boundary and at the kernel wire layer). Headless/MCP renders have ANSI control sequences
+stripped before bounding; an actual TTY attachment may preserve them. Either way, `render`/`text`
+are not reliably field-addressable. Reach for `structuredContent.value`/`shoal_get` for anything
+you intend to parse or branch on; treat `render`/`text` as a human-only preview.
 
 On success, `structuredContent` is the tool's own result object. On failure (`isError: true`),
 `structuredContent` is the raw JSON-RPC error object: `{"code": <int>, "message": <string>, "data": {...}}`.
 `code` here is a **JSON-RPC transport code** (e.g. `-32002`), not a shoal language error code — the
 shoal error code (`type_error`, `div_zero`, ...) lives at `data.code` for evaluation errors, and is
-**absent** for parse errors. See §6 for the exact table; do not assume `data.code` is always present.
+**absent** for parse errors. See §5 for the exact table; do not assume `data.code` is always present.
 
 ### 0.1 `shoal_exec` — run source, get a ref + a structured value
 
@@ -122,26 +94,35 @@ forwarded to the kernel and real:
 If you omit `position`, the MCP facade defaults it to `"value"` (note: this differs from the
 raw kernel's own default of `"stmt"` — the MCP default is the one that matters to you).
 
-**What `position` actually controls** (read this carefully — it is the single sharpest edge in this
-surface): the kernel only special-cases `position: "value"` when `src` parses to **exactly one bare
-expression statement**. In that case, a failing command's `outcome` is *captured* (returned as a
-normal value, `.ok == false`, inspectable) instead of raised as an MCP error. Two refinements,
-both verified against the binary: the capture applies to **external-command failures** (a non-ok
-`outcome` — e.g. `(sh { exit 3 })` comes back with `.status == 3`, `.ok == false`); a **builtin's
-raised error** (`div_zero`, `index_range`, …) still raises even as a single bare expression
-(`[1][3]` raises `index_range`, it is not captured). **Any `src` with more
-than one statement — including a `let` followed by a command — always evaluates with raise-on-failure
-semantics regardless of what you pass for `position`.** If you need to inspect a failure inside a
-multi-statement program, wrap the risky part in `try { ... } catch e { e }` inside the source itself.
+**What `position` actually controls** (read this carefully — it is the sharpest edge in this
+surface): with `"value"`, the kernel executes every statement before the last with ordinary
+statement semantics, then evaluates a final expression in value position. A non-OK external command
+in that final expression is returned as an inspectable outcome (`.ok == false`) instead of raised.
+An earlier non-OK command still raises. A final declaration/control statement has no special value
+reading and uses normal statement evaluation. Language/builtin errors such as `div_zero` and
+`index_range` raise in either position; they are errors, not failed command outcomes. With
+`"stmt"`, every non-OK command raises `cmd_failed`.
 
-**Result** (`ExecResult`): `{"ref": "out:<n>", "value": <$-tagged wire value, elided if large>, "render": "<full human string>"}`.
+```text
+# Captured: the final expression is in value position.
+let x = 1
+sh { exit 3 }
+
+# Raised before the final expression is reached.
+sh { exit 3 }
+x + 1
+```
+
+**Result** (`ExecResult`): `{"ref": "out:<n>", "value": <$-tagged wire value, elided if large>, "render": "<bounded human string>"}`.
 
 - `ref` is a **session-scoped transcript ref** like `"out:12"` — hand this to `shoal_get` later. There
-  is no other ref form produced today (see §6's "Content-addressed val:blake3:... refs" bullet —
-  those are spec'd, not implemented).
+  is always an `out:<n>` at the top level. A large CAS-backed byte capture can additionally expose a
+  content ref such as `val:blake3:<hash>` inside the value/render; fetch that through
+  `shoal://val/blake3:<hash>` or the corresponding blob path without replaying the command.
 - `value` is the real payload, `$`-tagged, elided per the rule in §1 if large.
-- `render` is a human string, **now size-capped at 64 KiB** (truncation marker on overflow — §4 rule
-  14, DONE) but still ANSI-laden and not field-addressable. Read `value`, not `render`, for data.
+- `render` is a human string, **size-capped at 64 KiB** with a fetch hint on overflow. Headless/MCP
+  sessions have ANSI control sequences stripped before the cap is applied. It is not
+  field-addressable: read `value`, not `render`, for data.
 - **A raised error now DOES mint a ref** (verified in `handlers_exec.rs`): the structured error
   value is stored in the transcript at `out:<n>`, and the JSON-RPC error's `data.ref` / `data.uri`
   point at it — `shoal_get {ref: data.ref}` fetches the full `{code, msg, span, hint, stderr}`
@@ -156,19 +137,21 @@ Worked example (kernel test `unix_stream_session_roundtrip`, `crates/shoal-kerne
 {"ref":"out:1","value":{"$":"list","v":[{"$":"int","v":1},{"$":"int","v":2},{"$":"int","v":3}]},"render":"[1, 2, 3]"}
 ```
 
-Every nested primitive is `$`-tagged too (`{"$":"int","v":1}`) — this is the **real** wire shape, and
-it is stricter than `docs/AGENT-SURFACE.md` §2's prose, which implies `null`/`bool`/`int`/`float`
-might travel untagged when nested. They do not, in the implementation you are talking to. Expect the
-tag everywhere.
+Every nested primitive is `$`-tagged too (`{"$":"int","v":1}`); expect the tag at every depth.
 
 A command's outcome, corpus-grounded (`spec/cases/outcome.toml`, case `outcome-echo-out`, `echo hi`
 evaluated at value position → `.out` is `"hi"`; rendered bare it is `outcome(status: 0, ok: true)`):
 
 ```json
 {"ref":"out:2","value":{"$":"outcome","status":0,"ok":true,"signal":null,
-  "out":{"$":"str","v":"hi"},"err":"","dur_ns":123456,"pid":4242,"cmd":"echo hi"},
+  "out":{"$":"str","v":"hi"},"err":"","dur_ns":123456,"pid":4242,"cmd":"echo hi",
+  "span":{"start":0,"end":7}},
  "render":"outcome(status: 0, ok: true)"}
 ```
+
+Spawned command outcomes carry the invocation span. Outcomes synthesized without a source site
+(for example a journal reconstruction or some builtin wrappers) omit `span` rather than fabricating
+one.
 
 ### 0.2 `shoal_get` — drill into a transcript value without re-executing
 
@@ -177,16 +160,17 @@ max_rows?, max_items?}}` (`slice` is exactly 2 integers). The `elide` budget **i
 forwarded** to the kernel's `value.get` (verified in `crates/shoal-mcp/src/tools.rs`) — tighten or
 loosen per call; `max_bytes` still clamps at the 64 KiB hard cap.
 
-**Path grammar, exactly as implemented** (`resolve_value_path` in `crates/shoal-kernel/src/lib.rs`):
-dotted field names and bracketed non-negative integer indices — `out[3]`, `rows[0].name`, `out.status`.
+**Path grammar, exactly as implemented** (`resolve_value_path` in
+`crates/shoal-kernel/src/wire.rs`): dotted field names, bracketed non-negative integer indices, and
+half-open bracketed ranges — `out[3]`, `rows[0].name`, `out.status`, `rows[0..5]`.
 **`path` is always evaluated from the root value bound to `ref`**, never relative to whatever was
 already elided — so if `.out` inside an outcome elided, you still pass `path: "out[3]"` against the
-*original* `ref`, not some new sub-ref. There is **no `[a..b]` range syntax inside a path string**
-(despite `docs/AGENT-SURFACE.md` §1's prose implying one) and **no negative indices** (`[-1]` works at
-the *language* level — corpus case `list-index-negative` — but not inside a `value.get`/`shoal_get`
-path string, which only parses `usize`). The separate top-level `slice: [start, end]` parameter is the
-only slicing mechanism, and it only applies when the *resolved* value (after `path`) is a `list` — on
-any other type it is silently ignored, not an error.
+*original* `ref`, not some new sub-ref. Ranges are half-open and clamp to the collection length;
+they work on lists and tables. There are **no negative indices** (`[-1]` works at the *language*
+level — corpus case `list-index-negative` — but not inside a `value.get`/`shoal_get` path string,
+whose indices parse as `usize`). The separate top-level `slice: [start, end]` applies after `path`:
+it slices lists and tables by element, strings by Unicode scalar value, and bytes/CAS-backed bytes
+by byte. A slice on an unordered or scalar value is an explicit `-32005` error.
 
 **Result**: `{"ref": "<ref>", "value": <wire value, elided if large>}`. No `render` field here.
 
@@ -259,10 +243,12 @@ produces `effects: [{"kind":"opaque"}]` and the file is never created (`shoal-ev
 ### 0.4 `shoal_apply` — execute a previously derived plan
 
 **Params**: `{plan_ref: string (required)}`. Re-runs the *exact original source* that produced that
-plan, as the same principal, in the same session, bypassing the leash re-check (trusting that the
-plan was already approved — either auto-`allow`, or approved via `shoal_cap_request`). **Result**:
-identical shape to `shoal_exec`'s (`{ref, value, render}`). Fails with a JSON-RPC error if the
-`plan_ref` is unknown, belongs to a different session/principal, or is still `approval_pending`.
+plan, as the same principal, in the same session. The kernel validates the stored plan's
+session/principal/source binding and requires either its recorded approval (auto-`allow` or
+`shoal_cap_request`) or a currently `allow` policy verdict; the internal `mode: "approved"` cannot
+be asserted directly to bypass those checks. **Result**: identical shape to `shoal_exec`'s
+(`{ref, value, render}`). Fails with a JSON-RPC error if the `plan_ref` is unknown, belongs to a
+different session/principal, or is still `approval_pending`.
 
 ### 0.5 `shoal_journal` — query what already happened
 
@@ -294,8 +280,9 @@ request covers **every** effect the plan needs; otherwise you get back `{"grant"
 "approval_pending", "why": "requested effect scope does not cover the plan", "uncovered_effects":
 [...]}` and the plan stays pending — an approval can never silently widen past what was asked for.
 An empty/omitted `effects` approves the whole plan. **Result** on success:
-`{"grant":"approved","plan_ref":"...","enforced":false,"granted_effects":[...]}` (`enforced` is
-always `false` — see §6's "Real OS-level sandboxing" bullet). Use this only after a
+`{"grant":"approved","plan_ref":"...","enforced":<bool>,"granted_effects":[...]}`. `enforced`
+uses the same honest host/principal-specific truth as `session.attach`: it is true only when a real
+Landlock/Seatbelt backend exists and this principal resolves to a scoped sandbox. Use this only after a
 `shoal_plan`/`shoal_exec` came back `approval_required`/`approval_pending`; call `shoal_apply`
 afterward to actually run it.
 
@@ -311,28 +298,33 @@ a `timeout_ms` conversion — §0.1) hands you `{"task": "task:<n>", "events": "
 carrying the result `ref`; `shoal_cancel {task}` requests cancellation. Note `task.suspend` is still
 unimplemented (always `-32020`, even over raw JSON-RPC).
 
-### 0.8 MCP resources — fetching elided payloads and subscribing to live output **(DONE — confirmed dispatched)**
+### 0.8 MCP resources — fetch, browse, and subscribe
 
-`Facade::handle()` (`crates/shoal-mcp/src/lib.rs`) now dispatches `resources/list`, `resources/read`,
-`resources/subscribe`, and `resources/unsubscribe`, and `initialize` advertises
-`capabilities.resources.subscribe = true` — confirmed against source and by the live e2e test
+`Facade::handle()` (`crates/shoal-mcp/src/lib.rs`) dispatches `resources/list`, `resources/read`, and
+`resources/subscribe`, and `initialize` advertises `capabilities.resources.subscribe = true` —
+confirmed against source and by the live e2e test
 `crates/shoal-mcp/tests/live_kernel.rs`. Every elided value's embedded `shoal://...` uri is a live
 fetch target, not a dead end. §4 rule 15 keeps the manual `shoal_get`+URI-translation fallback
 documented anyway — it still works and is your escape hatch if a *particular* URI 404s.
 
-- **`resources/list` enumerates the stable roots — `shoal://journal`, `shoal://jobs`,
-  `shoal://session/cwd` — plus per-session open tasks (`crates/shoal-mcp/src/resources.rs`'s
-  `resources_list`).** It does **not** enumerate recent `out:n` transcript values — those are only
+- **`resources/list` enumerates the stable roots** `shoal://journal`, `shoal://jobs`,
+  `shoal://session/cwd`, `shoal://session/env`, `shoal://session/reef`, and `shoal://pty`, plus
+  this session's open tasks, stored plans, and open PTYs. It does **not** enumerate recent `out:n`
+  transcript values — those are only
   fetchable by URI if you already have one (from an `ExecResult`'s elided `Ref` or a prior call),
   never discoverable by listing. Don't expect to browse your way to an arbitrary past `out:n`.
 - `resources/read {uri}` on a value URI (e.g. `shoal://out/12?path=.rows[3].name`) returns
   `structuredContent` — the `$`-tagged (or further-elided) value at that path/slice, **without**
   re-executing anything. This is the primary way to drill into an elided `Ref` — prefer it over the
   §0.2/§4-rule-15 manual `ref`+`path` translation.
-- `resources/subscribe {uri}` on `shoal://events/{channel}` or `shoal://task/{id}/out` starts a push
+- `resources/templates/list` advertises parameterized transcript values, CAS values, tasks/task
+  output, plans, session views, PTY screens, journal queries, and event channels.
+- `resources/subscribe {uri}` on `shoal://events/{channel}` or `shoal://task/{id}[/out]` starts a push
   subscription; the server sends `notifications/resources/updated` with `{uri, seq, payload}` as
-  events occur (§4 of `docs/AGENT-SURFACE.md`). **Never poll a resource you could instead subscribe
-  to** — that is the entire point of this layer existing.
+  events occur. **Never poll a resource you could instead subscribe to.**
+- `resources/unsubscribe {uri}` currently returns success without stopping the dedicated kernel
+  connection or forwarding thread created by `resources/subscribe`. Subscribe once per URI in a
+  long-lived facade; cleanup occurs when the MCP process exits.
 - **The language-channel→kernel-bus bridge now works, both directions, `user.*`-scoped (fixed —
   this card previously and wrongly called this a gap).** Verified live: an in-language
   `channel("user.x").emit(v)` (evaluated inside `src`) is forwarded to the kernel's wire bus and
@@ -343,21 +335,53 @@ documented anyway — it still works and is your escape hatch if a *particular* 
   channels cross in either direction — kernel-owned semantic channels (`task.*`, `session.transcript`,
   `journal`, `approval`) stay kernel-only and are not writable from language code. Cross-principal
   signaling via `user.*` channels is a real, working substrate now, not a gap to route around.
-- Query params on any value-bearing URI: `?path=<fieldpath>&slice={a}..{b}&format=json|render|raw`
-  (`docs/AGENT-SURFACE.md` §1) — same field-path grammar caveats as §0.2 (no `[a..b]` inside `path`,
-  no negative indices) apply here too, since both go through the same `resolve_value_path`.
+- Query params on any value-bearing URI: `?path=<fieldpath>&slice=<a>..<b>&format=json|render|raw`.
+  Paths accept fields, non-negative indices, and half-open `[a..b]` ranges; the separate `slice`
+  query is also half-open. Negative indices are not accepted here because both forms ultimately use
+  unsigned bounds.
 
 Resources are your preferred path for drilling into elided values and for subscribing to
 `task.{id}`/`session.transcript`/`journal`/`user.*` channels instead of re-calling
-`shoal_journal`/`shoal_get` in a loop — polling a tool result is always wrong here
-(`docs/AGENT-SURFACE.md` §6 names polling explicitly as the anti-pattern this system exists to end).
+`shoal_journal`/`shoal_get` in a loop — polling a tool result is always wrong here.
+
+### 0.9 Interactive PTYs — real terminal programs without raw escape-byte walls
+
+`shoal_exec` is a headless structured evaluation path. Use these six tools when the program's
+terminal behavior is the task: an editor, installer, debugger, REPL, password prompt, or full-screen
+TUI.
+
+1. `shoal_pty_open {cmd, args?, cols?, rows?, env?}` starts a real PTY in the session cwd and
+   environment, layering any string-valued `env` overrides. Dimensions default to 80×24 and are
+   clamped to 1…1000. The result is `{pty_id, pid, cols, rows, cmd}`.
+2. `shoal_pty_read {pty_id}` returns `{screen, cursor, changed, alive, exit, ...}`. `screen` is an
+   array of rendered text rows bounded by the terminal grid. It never contains a raw ANSI stream.
+3. `shoal_pty_send {pty_id, input}` accepts a literal string, an object with one of `key`, `text`, or
+   base64 `bytes`, or an array mixing those forms. Named keys include Enter, Tab, Escape, Backspace,
+   Delete, arrows, Home/End, PageUp/PageDown, F1–F12, and `Ctrl-<letter>`.
+4. `shoal_pty_resize {pty_id, cols, rows}` updates the child window size and emulator grid.
+5. `shoal_pty_list {}` recovers this session's open PTYs without returning every screen. The same
+   list is readable at `shoal://pty`; `shoal://pty/{id}` reads one screen.
+6. `shoal_pty_close {pty_id}` terminates and reaps the child. Always close a PTY you no longer need.
+
+A good edit workflow is:
+
+```json
+{"name":"shoal_pty_open","arguments":{"cmd":"vim","args":["note.txt"],"cols":100,"rows":30}}
+{"name":"shoal_pty_send","arguments":{"pty_id":"pty:1","input":["i","hello",{"key":"Escape"},":wq",{"key":"Enter"}]}}
+{"name":"shoal_pty_read","arguments":{"pty_id":"pty:1"}}
+{"name":"shoal_pty_close","arguments":{"pty_id":"pty:1"}}
+```
+
+PTY IDs are session-scoped; another session sees an opaque unknown-PTY error. `pty.open` goes
+through the same conditional spawn-pin gate and Leash filesystem sandbox lowering as other external
+spawns. It is not a bypass around approval or confinement.
 
 ---
 
 ## 1. The 60-second model
 
 - **Everything is a typed value.** Numbers, strings, lists, records, tables, paths, durations,
-  sizes, outcomes, errors — every one of `docs/TDD.md` §4.1's types renders unambiguously and never
+  sizes, outcomes, errors — every type in the stable language contract renders unambiguously and never
   degrades to "just text." A `table` *is* `list<record>`, structurally.
 - **Composition is the dot-chain, not the pipe.** `ls.where(.size > 1mb).map(.name)` — no `|`
   anywhere, ever, outside `sh { }` or a `match` alternation pattern.
@@ -374,64 +398,66 @@ Resources are your preferred path for drilling into elided values and for subscr
   which always restores on exit — including through an error.
 - **No truthiness, ever.** `if`/`&&`/`||` accept only `bool` or a command `outcome` (success = true).
   Everything else in a condition position is a `type_error`.
-- **Every value you get back over MCP has a ref.** Large ones arrive elided (shape + small preview +
-  ref); you fetch more with `shoal_get`, surgically, never by re-running the command.
+- **Every exec result gets a transcript ref.** Large values arrive elided (shape + small preview +
+  fetch URI); you fetch more with `shoal_get`, surgically, never by re-running the command. Plan,
+  journal, task, and PTY control results use their own documented identities/shapes.
 
 ---
 
 ## 2. Translating from bash
 
-Every method named below is pinned in `docs/CONTRACTS.md` §3 / `docs/TDD.md` §5's builtin surface.
+Every method named below is pinned by the intercrate and language contracts plus the central method registry.
 Rows marked **(corpus)** have a direct, exact `spec/cases/*.toml` example — check the named case
 yourself if you want the ground truth. Unmarked rows use a pinned-but-not-individually-corpus-exercised
-method; treat the signature as authoritative per CONTRACTS but verify empirically if a call surprises you.
+method; treat the signature as authoritative per site/content/internals/intercrate-protocol-contracts.md but verify empirically if a call surprises you.
 
 | bash | shoal | why / grounding |
 |---|---|---|
-| `ls \| grep x` | `ls.where(.name.contains("x"))` | `\|` is a hard parse error with a teaching message, **verified against the binary**: *"shoal has no pipe operator"*, hint *"data composes with `.` (try `ls.where(.size > 1mb)`); raw byte plumbing is `.feed(cmd)`; verbatim POSIX lives in `sh { … }`"* (TDD §1.4; **corpus** `literals.toml:parse-pipe-teaching`). The same curated error now fires in **infix EXPR positions** too — `1 \| 2` and `let c = a \| b` teach identically (verified), not just command-position pipes. |
-| `grep ERROR file` | `path("file").read.lines().where(.contains("ERROR"))` | `.read` reads the file as a `str` (a field-reachable path accessor, CONTRACTS §3 — there is **no `.read_str()`**; that spelling is `field_missing`, verified against the binary). `.lines()` **(corpus** `strings.toml:str-lines-strips-crlf`**)**; substring test via `in` is **(corpus** `operators.toml:op-in-string-substring`, `"ell" in "hello"` → `true`**)** — prefer `"ERROR" in line` over `.contains` if you want a corpus-nailed-down spelling. |
-| `$VAR`, `$HOME` | `env.VAR` | `$` is illegal everywhere: *"shoal variables have no sigil"* (TDD §2.1; **corpus** `core.toml:parse-dollar`, `src="$HOME"` → `parse_error`, "no sigil"). Reading: `env.NAME` or `(env NAME).out`; writing at session top level: `env.NAME = "v"` (**corpus** `reef.toml:reef-env-assign-writes-session-env-for-a-child`). |
+| `ls \| grep x` | `ls.where(.name.contains("x"))` | `\|` is a hard parse error with a teaching message, **verified against the binary**: *"shoal has no pipe operator"*, hint *"data composes with `.` (try `ls.where(.size > 1mb)`); raw byte plumbing is `.feed(cmd)`; verbatim POSIX lives in `sh { … }`"* (site/content/internals/language-conformance-contract.md; **corpus** `literals.toml:parse-pipe-teaching`). The same curated error now fires in **infix EXPR positions** too — `1 \| 2` and `let c = a \| b` teach identically (verified), not just command-position pipes. |
+| `grep ERROR file` | `path("file").read.lines().where(.contains("ERROR"))` | `.read` reads the file as a `str` (a field-reachable path accessor, site/content/internals/intercrate-protocol-contracts.md — there is **no `.read_str()`**; that spelling is `field_missing`, verified against the binary). `.lines()` **(corpus** `strings.toml:str-lines-strips-crlf`**)**; substring test via `in` is **(corpus** `operators.toml:op-in-string-substring`, `"ell" in "hello"` → `true`**)** — prefer `"ERROR" in line` over `.contains` if you want a corpus-nailed-down spelling. |
+| `$VAR`, `$HOME` | `env.VAR` | `$` is illegal everywhere: *"shoal variables have no sigil"* (site/content/internals/language-conformance-contract.md; **corpus** `core.toml:parse-dollar`, `src="$HOME"` → `parse_error`, "no sigil"). Reading: `env.NAME` or `(env NAME).out`; writing at session top level: `env.NAME = "v"` (**corpus** `reef.toml:reef-env-assign-writes-session-env-for-a-child`). |
 | `$(cmd)` command substitution | `(cmd)` | CMD grammar's `arg = ... \| "(" expr ")"` — a full EXPR embeds as one word/argument; no special substitution syntax needed. A parenthesized command used as a value: **(corpus** `outcome.toml:outcome-echo-out`, `(echo hi).out` → `"hi"`**)**. |
-| `` `cmd` `` backticks | `(cmd)` or `sh { cmd }` | Backtick is illegal, error points at `sh { }`/`re"..."`/`t"..."` (TDD §2.1; **corpus** `core.toml:parse-backtick`). |
-| `*.txt` glob | `*.txt` (bare, CMD position) or `glob("*.txt")` | Word containing unquoted `*`/`?`/`[...]`/`**` lexes as a `glob` literal; expansion happens at the callee, never at the shell (TDD §4.3). Explicit constructor **(corpus** `literals.toml:lit-glob-constructor-render`, `glob("*.rs")` renders `*.rs`**)**; unexpanded pattern bound to a `glob`-typed param **(corpus** `coercion.toml:word-bind-glob-not-expanded`**)**. |
-| glob matches nothing | (silently an empty list) | Nullglob **by construction** — never a literal `*` string (TDD §1.5); a statement-level lint additionally flags a glob that matched nothing. |
-| `find . -name '*.rs' -size +1M` | `ls.where(.size > 1mb)` | This exact phrase is TDD §1.4's own canonical pipe-replacement example — the size unit is a first-class literal, not a flag to parse (`1mb`, **corpus** `literals.toml:lit-size-mb-frac`). |
-| `cmd > file`, `cmd >> file` | `cmd > file`, `cmd >> file` (kept!) | Muscle-memory sugar, CMD-mode only, desugars to `.save(file)`/`.append(file)` on stdout bytes (TDD §1.3, §3.4). The **modern, canonical** form is calling `.save`/`.append` directly: `(cmd).save(file)`. |
-| `cmd < file` | `cmd < file` (kept) | Sole stdin sugar; desugars to `StdinSpec::File` directly (IO.md §1.1). No numeric variant, no here-string variant. |
-| `cmd <<EOF ... EOF` (heredoc) | **forbidden, permanently** — use an interpreter block | Curated parse error, **verified against the binary**: *"shoal has no heredocs"*, hint *"feed a string or multiline literal instead: `value.feed(cmd)`, or use an interpreter block: `python { … }`"* (IO.md §4). **Interpreter blocks are IMPLEMENTED and this is the answer**: `python { import json; print(json.dumps(...)) }.out` runs the program and auto-parses its stdout to a structured value; `sh { ... }` (TDD §13.13) and a multiline `"""..."""` literal also work. |
-| `cmd <<< "text"` (here-string) | `"text".feed(cmd args…)` (works) | Curated parse error, **verified against the binary**: *"shoal has no here-strings"*, hint *"feed the value instead: `"text".feed(cmd)`"* (IO.md §4). `.feed` IS implemented, args and all: `"text".feed(grep "foo").out`, `"text".feed(sort -r).out`. Blocks also work: `"text".feed(sh { grep foo })` / `.feed(jq { … })`. |
+| `` `cmd` `` backticks | `(cmd)` or `sh { cmd }` | Backtick is illegal, error points at `sh { }`/`re"..."`/`t"..."` (site/content/internals/language-conformance-contract.md; **corpus** `core.toml:parse-backtick`). |
+| `*.txt` glob | `*.txt` (bare, CMD position) or `glob("*.txt")` | Word containing unquoted `*`/`?`/`[...]`/`**` lexes as a `glob` literal; expansion happens at the callee, never at the shell (site/content/internals/language-conformance-contract.md). Explicit constructor **(corpus** `literals.toml:lit-glob-constructor-render`, `glob("*.rs")` renders `*.rs`**)**; unexpanded pattern bound to a `glob`-typed param **(corpus** `coercion.toml:word-bind-glob-not-expanded`**)**. |
+| glob matches nothing | (silently an empty list) | Nullglob **by construction** — never a literal `*` string (site/content/internals/language-conformance-contract.md); a statement-level lint additionally flags a glob that matched nothing. |
+| `find . -name '*.rs' -size +1M` | `ls.where(.size > 1mb)` | This exact phrase is site/content/internals/language-conformance-contract.md's own canonical pipe-replacement example — the size unit is a first-class literal, not a flag to parse (`1mb`, **corpus** `literals.toml:lit-size-mb-frac`). |
+| `cmd > file`, `cmd >> file` | `cmd > file`, `cmd >> file` (kept!) | Muscle-memory sugar, CMD-mode only, desugars to `.save(file)`/`.append(file)` on stdout bytes (site/content/internals/language-conformance-contract.md). The **modern, canonical** form is calling `.save`/`.append` directly: `(cmd).save(file)`. |
+| `cmd < file` | `cmd < file` (kept) | Sole stdin sugar; desugars to `StdinSpec::File` directly (site/content/internals/values-streams-execution.md). No numeric variant, no here-string variant. |
+| `cmd <<EOF ... EOF` (heredoc) | **forbidden, permanently** — use an interpreter block | Curated parse error, **verified against the binary**: *"shoal has no heredocs"*, hint *"feed a string or multiline literal instead: `value.feed(cmd)`, or use an interpreter block: `python { … }`"* (site/content/internals/values-streams-execution.md). **Interpreter blocks are IMPLEMENTED and this is the answer**: `python { import json; print(json.dumps(...)) }.out` runs the program and auto-parses its stdout to a structured value; `sh { ... }` (site/content/internals/language-conformance-contract.md) and a multiline `"""..."""` literal also work. |
+| `cmd <<< "text"` (here-string) | `"text".feed(cmd args…)` (works) | Curated parse error, **verified against the binary**: *"shoal has no here-strings"*, hint *"feed the value instead: `"text".feed(cmd)`"* (site/content/internals/values-streams-execution.md). `.feed` IS implemented, args and all: `"text".feed(grep "foo").out`, `"text".feed(sort -r).out`. Blocks also work: `"text".feed(sh { grep foo })` / `.feed(jq { … })`. |
 | `cmd 2>file`, `cmd 2>&1`, `cmd &>file` | **forbidden** | Curated parse errors, **verified against the binary**. Glued fd forms (`2>file`, `2>&1`): *"shoal has no fd-numbered redirects"*, hint *"stderr is structured — `(cmd).stderr`, or `try { cmd } catch e { e.stderr }`; a statement-position PTY run already merges the streams"*. `&>file`: *"shoal has no stream-merging redirect"*, hint *"capture is structured: `(cmd).out` / `(cmd).stderr`; a statement-position PTY run already merges the streams"*. `.stderr` is **`bytes`** — `.str()` it before string methods. A live PTY run (statement position) already merges stdout/stderr by construction — honest PTY semantics, not a missing flag. |
 | `cmd1 \| cmd2` raw byte plumbing | `value.feed(cmd args…)` / `cmd.feed(value)` | The one asylum the pipe error names for genuine byte plumbing. **IMPLEMENTED, including args/flags**: `["b","a","c"].feed(sort -r).out`, `data.feed(grep "foo").out`, `{a:1}.feed(jq ".a").out`. The inverted `cmd.feed(value)` form works too. Interpreter/`sh` blocks are also valid feed targets: `.feed(sh { sort -r })`, `.feed(jq { .a })`. |
 | `cmd1 && cmd2`, `cmd1 \|\| cmd2` | kept, unchanged | `&&`/`||` operate on `bool` or command **outcomes** (success = true), short-circuiting, returning the deciding operand *verbatim* — not force-cast to `bool` (**corpus** `outcome.toml:outcome-and-chain-both-outcomes`, `outcome-and-bool-then-outcome`; CMD-mode chaining needs `^` when the head is a reserved word: **corpus** `operators.toml:op-cmd-and-and-runs-both-on-success`, `^true && ^true`). |
-| `cmd &` (background) | `cmd &` (kept) | Desugars to `spawn { cmd }`, prints a task handle (TDD §1.3). Over MCP, `shoal_exec` now exposes `background`/`timeout_ms` (verified in `tools()`'s schema — §0.1), and `shoal_cancel` (§0.7) stops a task once you have its ref. |
+| `cmd &` (background) | `cmd &` (kept) | Desugars to `spawn { cmd }`, prints a task handle (site/content/internals/language-conformance-contract.md). Over MCP, `shoal_exec` now exposes `background`/`timeout_ms` (verified in `tools()`'s schema — §0.1), and `shoal_cancel` (§0.7) stops a task once you have its ref. |
 | `for f in *.txt; do ...; done` | `for f in glob("*.txt") { ... }` or `glob("*.txt").each(f => ...)` | `for` binds a pattern over any iterable (EBNF `"for" pattern "in" expr block`); basic range form is **(corpus** `closures.toml:for-loop-break-stops-early`, `core.toml:for-range-sum`**)**. |
 | `while [ cond ]; do ...; done` | `while cond { ... }` | Direct — **(corpus** `core.toml:while-basic`**)**. `cond` must be `bool`/outcome, never a bare list/string (no truthiness). |
-| `if [ -n "$x" ]; then ... fi` (truthiness) | `if x.is_empty() { } else { }` / `if x != null { }` | No truthiness anywhere: `if [1] { 1 }` is `type_error`, "no truthiness" (TDD §1.10; **corpus** `core.toml:no-truthiness`). `.is_empty()` **(corpus** `core.toml:method-is-empty`**)**; `.is_some()`/`!= null` are named in TDD §1.10 for nullable values (not individually corpus-exercised). |
+| `if [ -n "$x" ]; then ... fi` (truthiness) | `if x.is_empty() { } else { }` / `if x != null { }` | No truthiness anywhere: `if [1] { 1 }` is `type_error`, "no truthiness" (site/content/internals/language-conformance-contract.md; **corpus** `core.toml:no-truthiness`). `.is_empty()` **(corpus** `core.toml:method-is-empty`**)**; `.is_some()`/`!= null` are named in site/content/internals/language-conformance-contract.md for nullable values (not individually corpus-exercised). |
 | `grep`/regex extraction | `.matches(re"...")`, `.match(re"...")` | **(corpus** `strings.toml:str-matches-regex-all-occurrences`, `str-match-regex-first-occurrence`**)** — a `regex` is a tagged literal, `re"[0-9]+"`, compiled once. |
 | `awk '{print $1}'` (field split) | `.words()[0]` (whitespace) or `.split(",")[i]` (delimiter) | `.words()` splits on whitespace **(corpus** `strings.toml:str-words-splits-on-whitespace`**)**; `.split(sep)` on an explicit delimiter **(corpus** `strings.toml:str-split-on-separator`**)**. |
 | `sed 's/foo/bar/g'` | `.replace("foo", "bar")` or `.replace(re"f.o", "bar")` | Replaces **all** occurrences **(corpus** `strings.toml:str-replace-all-occurrences`**)**; the pattern may be a literal `str` OR a `regex` (`$1`/`$name` in the replacement expand capture groups) **(corpus** `strings-methods-2.toml:str2-replace-regex-*`**)**. No first-occurrence-only variant; slice/index manually for that. |
 | `sed -E 's/(a)(b)/\2\1/'` (regex capture) | `.replace(re"(a)(b)", "$2$1")` | Capture-group refs use `$1`/`$name`, per the `regex` crate **(corpus** `str2-replace-regex-capture-groups`**)**. |
 | `${str:0:7}` (substring) | `str.take(7)`, `str.skip(3)`, `str.skip(2).take(3)` | `.take`/`.skip` slice a `str` **by char** into a substring (not just collections), so fixed-width fields read cleanly — `line.take(7)` is a git short hash **(corpus** `strings-methods-2.toml:str2-take-slices-by-char`, `str2-take-skip-compose-for-substring`**)**. |
 | `cut -d, -f1` | `row.split(",")[0]` or `table.map(r => r.split(",")[0])` | Same `.split` grounding as above. |
-| `sort` | `.sort()` (plain) / `.sort_by(f)` (key function) | `.sort_by` is **(corpus** `collections.toml:list-sort-by-key-function`, sorts by `.len()`**)**; plain `.sort()` is pinned in CONTRACTS §3 but not individually corpus-exercised. |
+| `sort` | `.sort()` (plain) / `.sort_by(f)` (key function) | `.sort_by` is **(corpus** `collections.toml:list-sort-by-key-function`, sorts by `.len()`**)**; plain `.sort()` is pinned in site/content/internals/intercrate-protocol-contracts.md but not individually corpus-exercised. |
 | `uniq` | `.uniq()` | Preserves **first-occurrence order**, not a sorted dedup **(corpus** `collections.toml:list-uniq-preserves-first-occurrence-order`, `[3,1,3,2,1].uniq()` → `[3, 1, 2]`**)**. |
 | `wc -l`, `wc -c` | `.lines().len()`, `.len()` | **(corpus** `core.toml:method-len`, `strings.toml:str-len-counts-chars`**)**. |
 | `awk '{s+=$1} END{print s}'` (fold) | `.reduce(0, (acc, x) => acc + x)` (alias `.fold`) | Left fold — the general aggregation escape hatch when no named op (`.sum`/`.min`/`.max`/`.group`) fits; empty list returns the init **(corpus** `list-methods-3.toml:lm3-reduce-*`**)**. |
 | `awk '{a[$1]++} END{for (k in a) print k, a[k]}'` (group-by) | `.group(keyfn)` | Returns a **table whose rows are shaped `{key, values}`** — **not** `{items}`/`{rows}`/`{group}`. Verified against the binary: `[1,2,3,4].group(x => x % 2)` renders a two-row table with columns `key`/`values` (`{key: 1, values: [1, 3]}`, `{key: 0, values: [2, 4]}`); `g.map(.key)` → `[1, 0]`, `g.map(.values)` → `[[1, 3], [2, 4]]`. Guessing `.items`/`.rows` on a row (or the table) is a **silent-looking but loud** `field_missing` — don't guess the field name, it's `key`/`values`. |
 | `jq '. + {c:3}'` / build an object | `{a:1}.set("c", 3)`, `r.merge(other)` | Records are immutable values: `.set(k, v)` inserts/replaces one key (keeping position), `.merge(other)` layers `other`'s keys over the receiver (right wins). No `{...spread}` grammar and `+` on records is a `type_error` — use these **(corpus** `record-table-methods-2.toml:rt2-set-*`, `rt2-merge-*`**)**. Build from pairs: `pairs.reduce({}, (acc, kv) => acc.set(kv[0], kv[1]))`. |
 | `printf '%.2f' x` (round) | `x.round(2)`, `x.floor(2)`, `x.ceil(2)` | Round a `float` to N decimals (N optional, default 0 → nearest integer); ints pass through **(corpus** `numbers-more.toml:num-round-two-decimals`**)**. |
-| `$(( x + 1 ))` / str↔int | `"42".parse_int()` (str→int); `"{n}"` (int→str) | `.parse_int`/`.parse_float` are pinned in CONTRACTS §3; int→str is plain interpolation — no cast syntax. Verified against the binary: `"42".parse_int()` → `42`; `let n = 7; "{n}"` → `"7"`. |
-| `find . -type f` | `glob("**/*")` or `ls` (non-recursive) | `ls` is a builtin returning a `table` (list<record>) **(corpus** `collections.toml:table-ls-len-counts-entries`, `table-ls-where-type-then-map-names`**)**; `**` recurses, dotfiles excluded unless the pattern starts with `.` (TDD §4.3). |
+| `$(( x + 1 ))` / str↔int | `"42".parse_int()` (str→int); `"{n}"` (int→str) | `.parse_int`/`.parse_float` are pinned in site/content/internals/intercrate-protocol-contracts.md; int→str is plain interpolation — no cast syntax. Verified against the binary: `"42".parse_int()` → `42`; `let n = 7; "{n}"` → `"7"`. |
+| `find . -type f` | `glob("**/*")` or `ls` (non-recursive) | `ls` is a builtin returning a `table` (list<record>) **(corpus** `collections.toml:table-ls-len-counts-entries`, `table-ls-where-type-then-map-names`**)**; `**` recurses, dotfiles excluded unless the pattern starts with `.` (site/content/internals/language-conformance-contract.md). |
 | `xargs` | `.each(f)` | **(corpus** `collections.toml:list-each-side-effect-then-void`**)**. For "read lines from a file, run a command per line": `path("list.txt").read.lines().each(f => rm f)` (chains `.read`→`.lines()`→`.each`, all individually grounded methods). |
-| `which cmd` | `which cmd` (kept, richer) | Not forensics — returns a full resolution-chain **record**, not just a path (`docs/REEF.md` §6). `.name` always echoes the query **(corpus** `reef.toml:reef-which-name-field-echoes-query`**)**; unresolved tool's `.out` is `null`, not an error **(corpus** `reef-which-unresolved-tool-out-is-null`**)**; exactly one tool name — `which "a" "b"` is `arg_error` **(corpus** `reef-which-arity-error`**)**. |
+| `which cmd` | `which cmd` (kept, richer) | Not forensics — returns a full resolution-chain **record**, not just a path. `.name` always echoes the query **(corpus** `reef.toml:reef-which-name-field-echoes-query`**)**; unresolved tool's `.out` is `null`, not an error **(corpus** `reef-which-unresolved-tool-out-is-null`**)**; exactly one tool name — `which "a" "b"` is `arg_error` **(corpus** `reef-which-arity-error`**)**. |
 | `cd dir` (permanent) | `cd dir` at session top level | Legal and journaled at session top level; **illegal inside a `fn` body** — error names `with cwd:` as the fix **(corpus** `reef.toml:reef-cd-inside-fn-body-is-illegal`, error `custom`, contains `"with cwd:"`**)**. |
 | `(cd dir && cmd)` (scoped cd) | `with cwd: "dir" { cmd }` | Restores cwd on **any** exit path, including an error thrown inside the block **(corpus** `reef.toml:reef-cwd-restores-after-with-block`, `reef-cwd-restores-after-error-inside-with-block`, `reef-cwd-nested-with-blocks-restore-outer`**)**. |
 | `cd -` (OLDPWD) | `cd -` (kept) | Round-trips to the previous cwd via a session-scoped `OLDPWD`, same top-level-only rule as `cd dir`; erroring `custom` with `"OLDPWD"` in the message if nothing has been recorded yet **(corpus** `dir-stack.toml:cd-dash-round-trips-to-previous-dir`, `cd-dash-without-oldpwd-errors`**)**. |
 | `pushd dir` / `popd` / `dirs` | same names, kept | A session-scoped directory stack: `pushd dir` cds and pushes (no-arg `pushd` swaps the top two instead), `popd` pops and cds there (`custom` error, `"empty"`, on an empty stack), `dirs` returns the stack as a `list<path>` with the **current dir first** — all top-level-only, same `fn`-body restriction as `cd` **(corpus** `dir-stack.toml:pushd-deepens-the-stack`, `pushd-popd-round-trips-to-origin`, `popd-on-empty-stack-errors`, `pushd-no-arg-swaps-top-two`, `pushd-inside-fn-body-is-illegal`**)**. |
-| `FOO=bar cmd` (scoped env) | `FOO=bar cmd` (kept) or `with env: {FOO: "bar"} { cmd }` | Leading `IDENT=word` desugars to `with env: {NAME: "value"} { cmd }` (TDD §1.3); explicit block form restores after **(corpus** `reef.toml:reef-env-with-block-sets-var-during`, `reef-env-with-block-restores-after`**)**. |
-| `test -f file`, `[ -f file ]` | `path("file").exists` / `.is_file` / `.is_dir` | Zero-arg `path` accessors, field-reachable (CONTRACTS §3's path-accessor list: `.read .read_bytes .lines .exists .is_dir .is_file .size .modified`). Verified against the binary: `path("Cargo.toml").exists` → `true`. |
-| `docker-compose up` (hyphenated command) | `^docker-compose up` or `run("docker-compose", "up")` | Hyphenated identifiers don't lex in EXPR mode; a hyphenated command name needs the `^` escape hatch or the fully-dynamic `run(name, args...)` form (TDD §2.3, §3.1.4). |
-| `alias ll='ls -la'` | `alias gs = git status` | AST-level partial application — binds `gs` to a partial call node; `gs -sb` appends args to the AST, never text splicing (TDD §1.8). *Not verified against a corpus case in this pass — confirm behavior empirically.* |
+| `FOO=bar cmd` (scoped env) | `FOO=bar cmd` (kept) or `with env: {FOO: "bar"} { cmd }` | Leading `IDENT=word` desugars to `with env: {NAME: "value"} { cmd }` (site/content/internals/language-conformance-contract.md); explicit block form restores after **(corpus** `reef.toml:reef-env-with-block-sets-var-during`, `reef-env-with-block-restores-after`**)**. |
+| `test -f file`, `[ -f file ]` | `path("file").exists` / `.is_file` / `.is_dir` | Zero-arg `path` accessors, field-reachable (site/content/internals/intercrate-protocol-contracts.md's path-accessor list: `.read .read_bytes .lines .exists .is_dir .is_file .size .modified`). Verified against the binary: `path("Cargo.toml").exists` → `true`. |
+| `docker-compose up` (hyphenated command) | `^docker-compose up` or `run("docker-compose", "up")` | Hyphenated identifiers don't lex in EXPR mode; `^` forces CMD parsing and bypasses non-callable shadows **and adapters**, reaching external/reef resolution. Session functions and aliases remain callable. `run` is the fully dynamic alternative. |
+| `alias ll='ls -la'` | `alias gs = git status` | AST-level partial application: `gs extra` appends arguments to the stored call node, never text-splices. Positional and flag forwarding are corpus-pinned in `desugar.toml` and `desugar-more.toml`; aliases remain callable even as `^gs`. |
+| undo the last safe mutation | `undo` / `undo 12` / REPL-only `undo out[-1]` | The evaluator replays typed journal inverses for trash-backed removal, overwrite restoration, and moves, refusing stale fingerprints. Bare `undo` selects the newest reversible entry; `undo <id>` is host-independent. Only the interactive REPL knows the `out[n]`→journal-entry map and rewrites literal `undo out[n]`. |
 
 ### Format & system namespaces
 
@@ -462,7 +488,7 @@ against the binary** unless marked otherwise.
 
 ## 3. The complete syntax
 
-### 3.1 Lexical structure (TDD §2)
+### 3.1 Lexical structure (site/content/internals/language-conformance-contract.md)
 
 Source is UTF-8. The lexer is **modal**, switching between `CMD` mode (command word soup) and `EXPR`
 mode (conventional tokens) based purely on **grammar position**, never runtime state.
@@ -498,7 +524,7 @@ mode (conventional tokens) based purely on **grammar position**, never runtime s
   (**corpus** `core.toml:parse-pipe-teaching`); `$` (**corpus** `parse-dollar`); backtick (**corpus**
   `parse-backtick`).
 
-**CMD-mode word shapes** (TDD §2.2): a *word* begins `~/`, `./`, `../`, `/` → **path** literal
+**CMD-mode word shapes** (site/content/internals/language-conformance-contract.md): a *word* begins `~/`, `./`, `../`, `/` → **path** literal
 (bytes-backed, `~` expands now); contains unquoted `* ? [...] **` → **glob** literal; matches
 `--ident(=...)?` or `-[A-Za-z0-9]+` → **flag**; is `IDENT=rest` at head position → **env-prefix**;
 otherwise → **bare word**, type `str`. `(expr)` embeds a full EXPR expression as one argument. `>`
@@ -509,7 +535,7 @@ literal-brace *argument* must be quoted).
 minus. Bare paths/globs don't lex in EXPR mode — use `path("...")`/`glob("...")` constructors or
 string coercion.
 
-### 3.2 The two-mode statement dispatch (TDD §3.1) — read this before writing any multi-line script
+### 3.2 The two-mode statement dispatch (site/content/internals/language-conformance-contract.md) — read this before writing any multi-line script
 
 For each **statement**, look at the first token:
 
@@ -522,14 +548,16 @@ For each **statement**, look at the first token:
      (`x - 1` is subtraction). A stray bare word right after a variable is a parse error hinting
      `^x` for the command reading.
    - otherwise → **COMMAND statement**; the rest of the line lexes CMD. `X` resolves: session
-     `fn`/`alias` → adapter → PATH; unresolved = command-not-found with unified did-you-mean.
+     `fn`/`alias` → builtin/adapter → reef/external executable; unresolved = command-not-found with
+     unified did-you-mean.
    - refinement: `X` immediately followed by `.` then an identifier (no whitespace) → EXPR statement,
      invoke-then-chain desugar: `ls.where(...)` ≡ `ls().where(...)`.
-4. Escape hatches: `^X ...` forces command interpretation regardless of shadowing; `run("name",
-   args...)` is the fully dynamic form. Shadowing a resolvable command with `let` is legal, linted,
-   never an error — `^ls` always still reaches the real command.
+4. Escape hatches: `^X ...` forces CMD parsing, bypasses a non-callable `let`/`var` shadow, and
+   bypasses adapter dispatch so the external/reef-resolved command receives raw argv. A session
+   function or alias named `X` remains callable even when careted. `run("name", args...)` is the
+   fully dynamic form. Shadowing a resolvable command is legal and linted, never fatal.
 
-### 3.3 Grammar reference (normative EBNF, TDD §3.2)
+### 3.3 Grammar reference (normative EBNF, site/content/internals/language-conformance-contract.md)
 
 ```ebnf
 statement   = decl | ctrl | command | expr ;
@@ -559,7 +587,7 @@ tryx        = "try" block "catch" [pat] block ;
 `1 < 2 < 3` is a parse error with a fix-it (**corpus** `core.toml:parse-comparison-chain`, `operators.toml:op-cmp-chain-le-lt-is-error`,
 message contains "do not chain").
 
-### 3.4 Desugaring table (TDD §3.4 — what you write vs. what actually runs)
+### 3.4 Desugaring table (site/content/internals/language-conformance-contract.md — what you write vs. what actually runs)
 
 | Sugar | Canonical |
 |---|---|
@@ -574,7 +602,7 @@ message contains "do not chain").
 | `e catch h` | `try { e } catch { h }` |
 | `x?.f` | `if x == null { null } else { x.f }` (**corpus** `operators.toml:op-safenav-null-short-circuits`, `op-safenav-nonnull-accesses-field`) |
 
-### 3.5 Types (TDD §4.1)
+### 3.5 Types (site/content/internals/language-conformance-contract.md)
 
 `null bool int(i64) float(f64) str path glob regex size(u64 bytes) duration(i64 ns) datetime time
 bytes list<T> record table stream<T> error outcome task plan cmd secret`.
@@ -596,7 +624,7 @@ bytes list<T> record table stream<T> error outcome task plan cmd secret`.
 - Equality is **structural** for data types, **identity** for `task`/`stream`; comparing streams is
   an error.
 
-### 3.6 Coercion — the whole matrix (TDD §4.2), corpus-verified exactly
+### 3.6 Coercion — the whole matrix (site/content/internals/language-conformance-contract.md), corpus-verified exactly
 
 There are exactly **two** coercion sites. Everything else is a `type_error`.
 
@@ -636,15 +664,11 @@ failure = `arg_error`), `bool` (flag *presence*, not a parsed word — `--b` pre
 `spec/cases/coercion.toml`'s `word-bind-*` cases. **Unknown-signature (T0) targets** — a raw external
 binary with no adapter — receive every word as `str`, verbatim, always; no coercion is attempted.
 
-**Warning — value-carrying flags on user `fn`s: prefer `--flag=value`.** Today only the glued form
-binds reliably; the separated form mis-binds (verified against the binary: with
-`fn f(name: str = "d") { name }`, `f --name=abc` → `"abc"`, but `f --name abc` → `"true"` — the
-flag binds as bare presence and the value is stranded). A fix is in flight in a parallel branch;
-until it lands, always write `--flag=value` for anything that carries a value. Relatedly, **extra
-positionals are currently tolerated silently** (`f one two three` binds `one` and drops the rest —
-verified) — that tolerance is being tightened, so don't lean on it.
+Value-carrying flags on user functions accept both `--flag=value` and `--flag value` when the
+declared parameter is non-`bool`; a `bool` flag keeps presence semantics. Excess positionals without
+a declared rest parameter and unknown named arguments raise `arg_error` instead of being dropped.
 
-### 3.7 Comparisons and logic (TDD §1.10, §3.3)
+### 3.7 Comparisons and logic (site/content/internals/language-conformance-contract.md)
 
 `&&`/`||` admit **only** `bool` or a command **outcome** (success = true) as operands — `1 && true` is
 `type_error` (**corpus** `operators.toml:op-and-int-operand-is-error`); `!5` is `type_error`
@@ -672,7 +696,7 @@ work (`false < true` → `true`).
   `closures.toml:closure-mutates-captured-var-via-each`).
 - **Implicit `.field`/`.method` lambda sugar** — in **argument position only**: `.field <op> e`
   desugars to `x => x.field <op> e`, and `.method(args)` desugars to `x => x.method(args)`. This is
-  exactly what makes `ls.where(.size > 1mb)` (TDD §1.4's own canonical example) and
+  exactly what makes `ls.where(.size > 1mb)` (site/content/internals/language-conformance-contract.md's own canonical example) and
   `ls.where(.name.contains("x"))` read the way they do — no explicit lambda parameter needed for the
   common case. A **bare `.field`** with no op/args also works and reaches a zero-arg **method** of
   that name when there's no such field — **but only on non-record receivers**: `str`/`path`/`int`/
@@ -692,7 +716,7 @@ work (`false < true` → `true`).
   `closures.toml:recursive-fn-factorial`); a `fn`'s own parameter can be captured by a lambda defined
   inside it and returned (**corpus** `fn-returns-closure-capturing-param`).
 
-### 3.9 `match` — every pattern kind (TDD §3.2 grammar)
+### 3.9 `match` — every pattern kind (site/content/internals/language-conformance-contract.md grammar)
 
 All corpus-grounded in `spec/cases/match.toml`:
 
@@ -739,7 +763,7 @@ All corpus-grounded in `spec/cases/match.toml`:
   `outcome(status: 0, ok: true)` (**corpus** `outcome.toml:outcome-echo-render-inline`); `if (echo hi)
   { "yes" } else { "no" }` reads its truthiness from `.ok` automatically (`outcome-if-position`).
 
-### 3.11 `cwd`/`env` scoping (TDD §4.6)
+### 3.11 `cwd`/`env` scoping (site/content/internals/language-conformance-contract.md)
 
 The **session** owns `cwd`/`env`. `cd`/`env.NAME = v` are legal and journaled **only at session top
 level** — both are `custom`-coded errors naming the `with cwd:`/`with env:` fix when attempted inside
@@ -756,7 +780,7 @@ error raised inside the block (**corpus** `reef-cwd-restores-after-with-block`,
 Each rule: what's forbidden, why, the corpus/source proof, and the correct alternative.
 
 1. **No `|` pipe operator**, ever, outside `sh { }` or a `match` alternation pattern. *Why*: pipes are
-   untyped byte hoses; shoal composes typed values instead (VISION §2). *Proof*: `spec/cases/core.toml:parse-pipe-teaching`;
+   untyped byte hoses; shoal composes typed values instead (site/content/internals/system-map.md). *Proof*: `spec/cases/core.toml:parse-pipe-teaching`;
    verified against the binary that infix EXPR positions (`1 | 2`, `let c = a | b`) get the same
    curated *"shoal has no pipe operator"* teaching error, not a generic parse failure.
    *Alternative*: `.where`/`.map`/dot-chains; `sh { }` for verbatim POSIX.
@@ -775,7 +799,7 @@ Each rule: what's forbidden, why, the corpus/source proof, and the correct alter
 7. **`cd`/`env.NAME=` are illegal inside `fn` bodies.** *Proof*: `reef.toml:reef-cd-inside-fn-body-is-illegal`,
    `reef-env-assign-inside-fn-body-is-illegal`. *Alternative*: `with cwd:`/`with env: { }`.
 8. **Heredocs, here-strings, and any fd-numbered/`&>`-style redirect are permanently forbidden** — not
-   runtime errors, curated *parse-time* diagnostics naming the modern replacement (IO.md §4). This is
+   runtime errors, curated *parse-time* diagnostics naming the modern replacement (site/content/internals/values-streams-execution.md). This is
    the same enforcement class as the pipe/`$`/backtick errors — the parser recognizes the box-era
    *shape* specifically so it can teach, not just reject. All four are **implemented and verified
    against the binary**: `cat << EOF` → *"shoal has no heredocs"* (hint: *"feed a string or multiline
@@ -792,7 +816,7 @@ Each rule: what's forbidden, why, the corpus/source proof, and the correct alter
    `duration/duration`, `duration/int` reach `div_zero` on an actual zero divisor. *Proof*: the full
    `coercion.toml` block cited in §3.6 above. Don't guess at this matrix — re-check the table.
 10. **Streams are single-consumption.** A second consumption is a runtime error (`stream_consumed`,
-    fix-it "collect first, or `.tee(2)`") — TDD §1.9. Streams **are implemented** (channels,
+    fix-it "collect first, or `.tee(2)`") — site/content/internals/language-conformance-contract.md. Streams **are implemented** (channels,
     `every(dur)`, `.map`/`.scan`/`.take`/`.collect` all work, §6) — so this rule bites now: don't read
     one twice.
 11. **`it`/`out[n]` are reserved outside a REPL — everywhere, not just over MCP.** This is a
@@ -823,8 +847,8 @@ Each rule: what's forbidden, why, the corpus/source proof, and the correct alter
     statement (raise-on-failure) semantics — so an earlier statement's failure always raises,
     regardless of `position` — but then evaluates the trailing statement in true value position
     **if and only if it's a bare expression**, exactly like the single-statement case: a failing
-    external command there is captured (`.ok == false`), not raised. Verified directly in source
-    and matching the example in `docs/AGENT-SURFACE.md`: `{src: "let x=1\nsh{exit 3}", position:
+    external command there is captured (`.ok == false`), not raised. For example,
+    `{src: "let x=1\nsh{exit 3}", position:
     "value"}` comes back **captured** (`isError: false`, a normal outcome value with `.ok == false`),
     not as an MCP error — the preceding `let` doesn't change that. Only a **builtin's** raised error
     (`div_zero`, `index_range`, …) stays position-invariant (rule 12) — that one always raises even
@@ -844,10 +868,11 @@ Each rule: what's forbidden, why, the corpus/source proof, and the correct alter
     `structuredContent.value`/`shoal_get` for anything you need to parse or branch on.
 15. **An elided value's embedded `uri` (`shoal://...`) is independently fetchable via
     `resources/read` (DONE, §0.8)** — `resources/*` is confirmed dispatched
-    (`crates/shoal-mcp/src/lib.rs`'s `handle` now handles `resources/list`/`read`/`subscribe`/
-    `unsubscribe`), so this is the preferred path, not a maybe. If a *particular* URI still 404s,
-    fall back to translating it yourself: the part before `?path=` is the short `ref` you already
-    have; the part after is the `path` argument to `shoal_get`.
+    (`crates/shoal-mcp/src/lib.rs`'s `handle` handles `resources/list`/`read`/`subscribe`), so this is
+    the preferred path, not a maybe. Its `resources/unsubscribe` acknowledgement does not cancel
+    the forwarding worker; that lifecycle limitation is documented in §0.8. If a *particular* URI
+    still 404s, fall back to translating it yourself: the part before `?path=` is the short `ref`
+    you already have; the part after is the `path` argument to `shoal_get`.
 16. **Background execution and task management are now fully reachable through MCP** (updated —
     verified in `crates/shoal-mcp/src/tools.rs` and `crates/shoal-kernel/src/handlers_exec.rs`):
     `shoal_exec {background: true}` returns a task ref immediately, `timeout_ms` converts an overdue
@@ -855,19 +880,17 @@ Each rule: what's forbidden, why, the corpus/source proof, and the correct alter
     §0.1), and `shoal_cancel {task}` requests cancellation (§0.7). A plain `shoal_exec` without
     either field still blocks until the command finishes.
 17. **Hyphenated command names are not EXPR identifiers.** `docker-compose` needs `^docker-compose` or
-    `run("docker-compose", args...)` (TDD §2.3).
+    `run("docker-compose", args...)` (site/content/internals/language-conformance-contract.md).
 18. **Shadowing a resolvable command with `let` is legal (linted, not fatal)** — and `^name` bypasses
-    the shadowing (TDD §3.1.4, §13.15). But **`^` bypasses *shadowing only*; adapters still
-    intercept** — verified against the binary: `^git log --oneline -1` still fails with
-    `arg_error: git: unknown flag --oneline; expected --follow <bool>, --n <int?>, --path <path?>`,
-    exactly like the un-careted call, because the git adapter's `log` sub-spec only admits its own
-    (narrower) flag surface. To reach the **raw binary** with arbitrary flags, use
-    `run("git", "log", "--oneline", "-1")` or `sh { git log --oneline -1 }` (both verified working).
+    the non-callable shadow. **`^` also bypasses adapter dispatch**, so `^git log --oneline -1`
+    reaches the raw external/reef-resolved command with its argv intact. It does not disable session
+    functions or aliases: callable bindings still resolve first. Use `run("name", args...)` when the
+    command name itself is computed rather than syntactically known.
 19. **`glob("...")` constructs a glob *pattern value*, not an expanded list — indexing it directly is
     a `type_error`.** `glob("*.rs")[0]` → `type_error: cannot index glob with int` (verified against
     the binary; `crates/shoal-eval/src/expr_access.rs`'s `index` has no `glob` arm, so it falls
     through to the generic `cannot index X with Y`). **Expansion happens at the command *callee*,
-    never at construction** (TDD §4.3, §2's glob rows) — this is the load-bearing fact, not a
+    never at construction** (site/content/internals/language-conformance-contract.md's glob rows) — this is the load-bearing fact, not a
     throwaway one: pass the pattern to a command and let it expand there, either bare in CMD
     position (`ls *.rs`) or as a parenthesized value (`ls (glob("*.rs"))`) — both verified working.
     If you genuinely need the expanded list as a value with no command involved, `.expand()` on the
@@ -890,6 +913,16 @@ Each rule: what's forbidden, why, the corpus/source proof, and the correct alter
     use case, or check the specific tool's own exit-code convention (some tools reserve other codes
     for "no results" vs. a genuine error) before assuming a non-zero status always means something
     broke.
+22. **Spawn pinning is opt-in per principal, then fail-closed.** An absent or empty `proc_spawn`
+    allowlist preserves ordinary spawning. Once a non-empty allowlist is configured, shoal resolves
+    and hashes the executable (reusing Reef's hash when available) and evaluates the exact
+    `{bin_hash, argv0}` effect before both captured and PTY spawns. A mismatch is denied; this is no
+    longer a design-only Reef/Leash handoff.
+23. **Undo targets are journal entries, not transcript values.** `undo` chooses the newest reversible
+    journal entry and `undo 12` names an entry directly. Only the interactive REPL maintains the
+    separate `out[n]`→entry map needed to rewrite literal `undo out[n]`; do not send that spelling
+    through MCP. Undo stale-checks the recorded filesystem fingerprint and raises `stale_undo`
+    instead of overwriting intervening changes.
 
 ---
 
@@ -903,25 +936,28 @@ Sourced directly from `crates/shoal-kernel/src/lib.rs`'s dispatch:
 
 | code | meaning | `data` shape | recovery |
 |---|---|---|---|
+| `-32000` | request requires a session, but this connection has not attached | — | Reconnect/reattach; the shipped MCP bridge attaches automatically. |
 | `-32001` | **parse error** — `src` doesn't parse. No `data.code` string is set here (just `span`/`hint`) — infer "parse error" from this transport code itself. | `{span, hint}` | Fix the source per `hint`; re-check §2/§4's forbidden-spelling list first. |
-| `-32002` | **evaluation error** — parsed fine, failed at runtime. `data.code` is the real shoal error code string (§5.2). | `{code, span, hint, status, stderr}` | Branch on `data.code`; see §5.2. |
+| `-32002` | **evaluation error** — parsed fine, failed at runtime. `data.code` is the real shoal error code string (§5.2). | `{code, span, hint, status, stderr, ref, uri}` | Branch on `data.code`; the error value remains fetchable through `ref`/`uri`. |
 | `-32004` | unknown value `ref` passed to `value.get`/`shoal_get` (stale, wrong session, or never existed) | `{}` | Re-`shoal_exec` to get a fresh ref; refs don't survive kernel restarts. |
-| `-32005` | bad field `path` in `value.get`/`shoal_get` (no such field/index, or path syntax error) | `{ref, path}` | Check §0.2's path grammar; no negative indices, no `[a..b]` ranges. |
+| `-32005` | bad `path` or `slice` in `value.get`/`shoal_get` (missing field/index, malformed path, or slicing an unsupported type) | `{ref, path}` for path failures; `{ref}` or no data for other failures | Check §0.2's path grammar and value type; `[a..b]` ranges are supported, negative indices are not. |
 | `-32010` | leash **denied** execution, or a `plan_ref` belongs to a different session/principal | `{effects}` | Under the default permissive policy this should not happen; if it does, the kernel was started with a stricter `--policy`. |
 | `-32011` | **approval required** (a plan's verdict) or **approval still pending** (on `shoal_apply`) | `{effects}` | Call `shoal_cap_request {plan_ref}`, then `shoal_apply {plan_ref}`. |
 | `-32012` | unknown `plan_ref` (never created, or the kernel restarted — plans are in-memory, not journaled) | `{}` | Re-derive with `shoal_plan`. |
 | `-32020` | task suspension requested — **always** returned; not implemented | `{task}` | Don't call `task.suspend` (not reachable via MCP tools anyway). |
 | `-32021` | unknown task ref | `{}` | A stale/wrong task ref passed to `shoal_cancel` (§0.7). Task refs come from `shoal_exec {background: true}` / a `timeout_ms` conversion (§0.1). |
+| `-32022` | unknown, closed, or foreign-session `pty_id` | — | Recover this session's live IDs with `shoal_pty_list`; do not reuse a closed ID. |
+| `-32023` | `shoal_pty_open` could not resolve/spawn the program or apply its sandbox | `{cmd}` | Inspect the message; verify command resolution, policy, and platform PTY support. |
 | `-32030` | bearer token missing/invalid/expired, or tokens unavailable on an ephemeral (`Kernel::new()`) kernel | `{}` | Check `SHOAL_TOKEN`; ensure the kernel was started with a state dir (`shoal-kernel` without `--socket`-only ephemeral mode). |
 | `-32600` | invalid JSON-RPC request/version | — | Transport bug — should not occur through this plugin's tools. |
 | `-32601` | method not found | `{method}` | You (or a future card revision) called something the kernel doesn't dispatch. Note `complete`/`explain` and `resources/*` **are** dispatched now (§6) — an unexpected `-32601` most likely means a stale kernel binary. |
 | `-32602` | invalid params (missing required field, wrong shape) | — | Check the tool's exact schema in §0. |
 | `-32603` | internal error | — | Not a language-level problem; report it. |
 
-### 5.2 Language-level error codes (`data.code` on a `-32002`, per `docs/CONTRACTS.md` §4)
+### 5.2 Language-level error codes (`data.code` on a `-32002`)
 
 Pinned registry. **✓** = directly exercised by a named corpus case; no mark = pinned but not
-individually corpus-exercised in the material reviewed for this card (still authoritative — CONTRACTS
+individually corpus-exercised in the material reviewed for this card (still authoritative — site/content/internals/intercrate-protocol-contracts.md
 pins it — just verify empirically if you hit an edge).
 
 | code | meaning | recovery |
@@ -941,38 +977,38 @@ pins it — just verify empirically if you hit an edge).
 | `custom` ✓ | a named, ad-hoc error with a specific message (e.g. the `cd`-in-`fn`/`env`-in-`fn` fix-its) | `reef.toml:reef-cd-inside-fn-body-is-illegal` |
 | `assert_failed` | (pinned; no corpus case reviewed) | — |
 | `permission` | (pinned; no corpus case reviewed) | — |
-| `recursion_limit` | recursion/loop depth exceeded (depth 10k, TDD §13.12) | restructure; loop limit is off in script mode |
-| `overflow` ✓ | numeric/quantity arithmetic overflowed its representation (pinned in CONTRACTS §4; **corpus** `numbers-more.toml`; verified against the binary: `52w * 200000000` → `overflow: duration overflow`) | keep duration/size arithmetic inside i64-ns / u64-byte bounds |
+| `recursion_limit` | recursion/loop depth exceeded (depth 10k, site/content/internals/language-conformance-contract.md) | restructure; loop limit is off in script mode |
+| `overflow` ✓ | numeric/quantity arithmetic overflowed its representation (pinned in site/content/internals/intercrate-protocol-contracts.md; **corpus** `numbers-more.toml`; verified against the binary: `52w * 200000000` → `overflow: duration overflow`) | keep duration/size arithmetic inside i64-ns / u64-byte bounds |
 | `reef_unlocked` ✓ | a `with reef:`-constrained tool used in a non-interactive/script context without a lock | `reef.toml:reef-with-reef-constrains-a-spawn-inside-the-block` |
-| `reef_drift` | resolved binary's hash no longer matches the lock | `reef lock --refresh` (REEF.md §2; not verified reachable in this pass) |
+| `reef_drift` | resolved binary's hash no longer matches the lock | `reef lock --refresh` (site/content/internals/reef-resolution.md; not verified reachable in this pass) |
 | `reef_conflict` | two reef scopes constrain one tool incompatibly | (not verified reachable in this pass) |
 | `reef_not_found` | a reef-constrained tool has no resolvable candidate | (not verified reachable in this pass) |
 | `reef_provider` | a reef provider itself failed | (not verified reachable in this pass) |
 | `feed_error` | `.feed` **is implemented**; fires on feeding a never-feedable type (`secret`/`task`/`closure`/`error`/`glob`/`regex`) | feed a serializable value (str/bytes/list/record/table) instead |
 | `lang_block_unbalanced` | interpreter blocks **are implemented**; an unterminated brace in a `python { … }`/`jq { … }`/etc. block | balance the braces in the block payload |
-| `runner_not_found` | reef `run <path>` extension/shebang resolution (reef integration still partial — verify against source) | n/a for most flows |
+| `runner_not_found` | reef `run <path>` could not select an extension, shebang, or configured runner | add a supported extension/shebang or configure the runner |
 | `stream_unbounded` | **implemented and correct** — you `.collect()`d a stream with no natural end | bound it first with `.take(n)`/`.take_until(…)`, or use `.each(f)` |
 
 ---
 
 ## 6. Implementation status — what works, what to skip
 
-Stated plainly so you never waste a turn. **This card was first written against an early build and
-over-reported "not implemented"** — `.feed`, interpreter blocks, streams/channels, all six MCP
-`(P1)` items, the language-channel→kernel-bus bridge, and the whole
-`shoal_exec`/`shoal_get`/`shoal_journal`/`shoal_cap_request` schema surface were verified working
-against the current source/binary and are now marked done. The genuinely-still-missing items are:
-`task.suspend`, content-addressed refs, and real OS-level sandbox enforcement through this surface.
-When in doubt, run a one-line probe rather than trusting a stale banner.
+This snapshot is grounded in current source and the 1,310-case/77-suite corpus. The structured MCP
+surface, resources, PTYs, channels, CAS-backed refs, spawn pin gate, and platform filesystem
+sandboxes are shipped. Important boundaries remain: `task.suspend` is not implemented; network
+sandboxing is not enforced; some in-process filesystem effects bypass the child-process sandbox;
+and non-hermetic policies degrade honestly when a requested OS dimension is unavailable.
 
-- **DONE — The MCP `resources/*`/events subsystem.** `crates/shoal-mcp/src/lib.rs`'s `handle()` now
-  dispatches `resources/list`/`read`/`subscribe`/`unsubscribe`, and `initialize` advertises
+- **SHIPPED, with an unsubscribe lifecycle limit — The MCP `resources/*`/events subsystem.**
+  `crates/shoal-mcp/src/lib.rs`'s `handle()` dispatches `resources/list`/`read`/`subscribe`, and
+  `initialize` advertises
   `capabilities.resources.subscribe = true`; event notifications forward as
   `notifications/resources/updated` (`client.rs::run_event_forwarder`). Use `resources/read` on a
   `shoal://…` uri to drill into an elided value directly — the `shoal_get`+manual-URI translation
   (§0.2, §4 rule 15) is now just a fallback. Confirmed by the live e2e test
-  `crates/shoal-mcp/tests/live_kernel.rs`.
-- **DONE — `shoal_cancel`.** Present in `tools()` (seven tools now). Note `task.suspend` still errors
+  `crates/shoal-mcp/tests/live_kernel.rs`. `resources/unsubscribe` returns success but does not stop
+  that dedicated connection/worker; MCP process exit remains the cleanup boundary.
+- **DONE — `shoal_cancel`.** Present in the 13-tool surface. Note `task.suspend` still errors
   (unimplemented even over raw JSON-RPC).
 - **DONE — background/async execution via MCP.** `shoal_exec`'s schema exposes `background` and
   `timeout_ms` and forwards both (verified in `crates/shoal-mcp/src/tools.rs`); the kernel spawns a
@@ -994,7 +1030,7 @@ When in doubt, run a one-line probe rather than trusting a stale banner.
   mirrored back into that session's in-language `channel("user.x")`
   (`crates/shoal-kernel/src/eventbus.rs`'s `handle_events_publish`). Only `user.*` channels cross,
   either direction — kernel-owned channels (`task.{id}`, `session.transcript`, `journal`, `approval`)
-  stay kernel-only, exactly as `docs/AGENT-SURFACE.md` §4 specs (see §0.8).
+  stay kernel-only (see §0.8).
 - **~~`.feed` and interpreter blocks~~ — NOW IMPLEMENTED (this card's original banner was stale).**
   Verified working against the current binary: `["b","a","c"].feed(sort).out`, and **commands with
   args/flags parse bare** — `["b","a","c"].feed(sort -r).out`, `data.feed(grep "foo").out`,
@@ -1004,41 +1040,34 @@ When in doubt, run a one-line probe rather than trusting a stale banner.
   `{a:1,b:2}.feed(jq { .a }).out` → `1`. An interpreter block's stdout **auto-parses to a structured
   value** on `.out` (`python { import json; print(json.dumps({"n":42})) }.out` → the record `{n: 42}`).
   Heredocs stay gone; this is their replacement, and it works.
-- **Reactive streams — SUBSTANTIALLY IMPLEMENTED (card's original "pending" banner was stale).**
-  Verified working: `channel(name)` with `.emit(v)`/`.events()`/`.latest()`; `every(dur)`; stream
-  pipelines `every(10ms).take(3).collect()` → 3, `.map`, `.scan(init, f)`; and the `stream_unbounded`
-  guard fires correctly when you `.collect()` an unbounded stream (bound it with `.take(n)` first).
-  `watch(...)`/`tail(...)` exist. Before relying on a *specific* combinator (`.debounce .throttle
-  .window .merge .buffer .dedupe .distinct`) or sink (`.into(channel)`, `on channel(...) { }`), test it
-  once — coverage is broad but this card no longer claims to enumerate exactly which are live.
-- **Most of reef's real surface**: `.reef.toml` project-scope walking, `[runners]`-based `run
-  <path>`/bare-path resolution, `reef add/lock/fetch/doctor`, drift detection. `docs/REEF.md`'s status
-  banner: *"crate built+tested; eval integration landing this wave."* What **does** work today,
-  corpus-confirmed: `which "name"` (only `.name` is host-independent — the rest of the record depends
-  on the host's tool inventory), `with reef: { } { }` override + restore, and the `reef_unlocked`
-  error path.
-- **Real OS-level sandboxing (leash tiers A/B/C).** `session.attach` always reports `{"enforced":
-  false, "tier": "D"}` in this codebase today, regardless of platform — Landlock/seccomp/Seatbelt
-  enforcement is not wired into the code path this plugin talks to. The policy engine's *logical*
-  allow/deny/approval_required decisions are real; the *sandbox* backing them is not, yet.
-- **TUI-only affordances**: statement-position PTY passthrough (color, progress bars), Ctrl-C/Ctrl-Z
-  job control, live-rendering streams at the prompt, `pick()`/`interact`, and the REPL's opt-in
-  output pager (`render.paging`, `docs/CONFIG.md` §6) — paging only ever engages on a real
-  interactive TTY, never on an MCP-dispatched exec. The kernel forces
-  `evaluator.interactive = false` for every exec dispatched through this surface — MCP execution is
-  **always** headless/capture-mode. Do not expect (or try to request) a colorized/interactive run.
-- **Content-addressed `val:blake3:...` refs.** The kernel only mints session-scoped `out:N` transcript
-  refs today.
-- **`alias`, journal `undo` replay** — not exercised in the corpus/source reviewed for this card;
-  treat as unconfirmed rather than assuming either the spec'd behavior or its absence.
+- **Reactive streams are implemented.** `channel(name)` supports `.emit(v)`/`.events()`/`.latest()`;
+  sources include `every`, `watch`, and `tail`; lazy combinators include `map`, `filter`, `scan`,
+  `take`, `take_until`, `dedupe`, `distinct`, `debounce`, `throttle`, `window`, `buffer`, and `merge`.
+  Sinks include `collect`, `count`, `first`, `last`, `reduce`, `each`, and the evaluator-hosted
+  `.into(channel)`/`on(...)` paths. The `stream_unbounded` guard rejects an unbounded `collect`;
+  bound the source first with `.take(n)` or another terminating stage.
+- **Reef's integrated surface** includes project/user/system scope discovery, `which` reports,
+  lock/fetch/doctor/add flows, provider resolution, drift checks, spawn-time hash reuse, runner
+  selection, and `with reef:` overrides. Host-dependent path/version fields naturally vary.
+- **Leash and OS enforcement are conditional, not fictional.** Policy verdicts gate execution.
+  Scoped child filesystem access lowers to Landlock on Linux or Seatbelt on macOS when useful roots
+  exist; the default-permissive policy intentionally produces no sandbox. A non-empty `proc_spawn`
+  allowlist activates executable hashing and pin evaluation for normal and PTY spawns. Network
+  enforcement remains unavailable, and status fields report that independently.
+- **Interactive boundaries:** `shoal_exec` remains headless capture mode. For an interactive program,
+  use the six `shoal_pty_*` tools in §0.9. Human-only REPL affordances such as job-control sugar,
+  prompt paging, and direct terminal passthrough do not appear on `shoal_exec`.
+- **Content-addressed refs are live for large CAS-backed byte captures.** Such values carry a
+  `val:blake3:<hash>` ref, resolve through `blob.get`/`shoal://val/{hash}`, and can be sliced or read
+  raw without resending the whole blob. Ordinary transcript values still use session-scoped
+  `out:N` refs.
+- **Aliases and undo are implemented.** Aliases are AST partial calls with later positional/flag
+  forwarding. Journal undo replays typed inverses and stale-checks fingerprints; `undo out[n]` is
+  REPL host sugar, while `undo` and `undo <journal-id>` work at evaluator level when a journal is
+  installed.
 
 ---
 
-*This card is derived entirely from `docs/TDD.md`, `docs/VISION.md`, `docs/REEF.md`,
-`docs/AGENT-SURFACE.md`, `docs/IO.md`, `docs/STREAMS.md`, `docs/CONTRACTS.md`, the 328-case corpus at
-`spec/cases/*.toml`, and a direct read of `crates/shoal-mcp/src/lib.rs`, `crates/shoal-proto/src/lib.rs`,
-`crates/shoal-kernel/src/lib.rs` at authoring time — a moment when a concurrent change was landing
-`resources/*`, events, `shoal_cancel`, render/text elision, a macOS socket fallback, and a real
-`reversibility` value (every item marked **(P1)** above). If shoal's implementation changes, re-derive
-— never patch this card from memory, and re-read the six `crates/shoal-mcp`/`crates/shoal-kernel`
-call sites named throughout §0 before trusting a **(P1)** item as landed.*
+*Canonical prose lives in `site/content/docs/` and `site/content/internals/`; executable semantics
+live in the 1,310 cases across `spec/cases/*.toml`. Re-check the current source and corpus when this
+card and a running binary disagree.*

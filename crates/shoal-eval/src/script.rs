@@ -32,7 +32,7 @@ impl Evaluator {
             }
         }
         // `with reef: {tool: constraint, …} { }` — dynamic reef scoping
-        // (REEF.md §6), pushed as an override layer for the block's dynamic
+        // (site/content/internals/reef-resolution.md), pushed as an override layer for the block's dynamic
         // extent and popped on every exit path below, mirroring cwd/env.
         let mut pushed_reef = false;
         if let Some(e) = reef_expr {
@@ -69,7 +69,7 @@ impl Evaluator {
         let penv = self.process_env.clone();
         let adapters = self.adapters.clone();
         let bus = self.bus();
-        // Share the host's effect ports (docs/ROADMAP.md R4) with the spawned
+        // Share the host's effect ports (site/content/internals/roadmap-and-priorities.md) with the spawned
         // task; `Arc` clones, identical under the `Std*` defaults.
         let fs = self.fs.clone();
         let exec = self.exec.clone();
@@ -121,14 +121,14 @@ impl Evaluator {
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
         // A bare filename (no path separator) is still scripty when its
-        // extension is one the runner machinery actually knows (IO.md §3.1's
+        // extension is one the runner machinery actually knows (site/content/internals/values-streams-execution.md
         // "plain filename in cwd" ergonomics case) — sourced from the SAME
         // `RunnerTable` `run_script_file`/reef itself consult (shipped
         // defaults `py js ts sh shl rb lua`, plus any in-scope manifest's
         // `[runners]` overlay), never a separately hand-maintained list that
-        // can drift from runner.rs again (REEF.md §5). `rs` is special-cased:
+        // can drift from runner.rs again (site/content/internals/reef-resolution.md). `rs` is special-cased:
         // it intentionally has no default runner-table entry (compile-vs-
-        // script ambiguity, REEF.md §5) but IS handled by `run_script_file`'s
+        // script ambiguity, site/content/internals/reef-resolution.md) but IS handled by `run_script_file`'s
         // own rustc/rust-script fallback, so it stays scripty for symmetry
         // with the `./x.rs` path form.
         let scripty = ext.as_deref().is_some_and(|e| {
@@ -160,7 +160,8 @@ impl Evaluator {
                     .map_err(|e| ErrorVal::new("io_error", format!("cannot read script: {e}")))?;
                 let program = shoal_syntax::parse(&src)
                     .map_err(|e| ErrorVal::new("parse_error", e.to_string()))?;
-                // A `.shl` script is a separate program (IO.md §3.2 step 4):
+                // A `.shl` script is a separate program (see
+                // `site/content/internals/values-streams-execution.md`):
                 // the child keeps `Evaluator::new`'s FRESH root scope. Aliasing
                 // the caller's env (`Env::clone` shares the same Arc'd scope)
                 // leaked every script `let` back into the parent session.
@@ -176,7 +177,7 @@ impl Evaluator {
                 child.eval_program(&program)
             }
             _ => {
-                // reef runner resolution (REEF §5): when a manifest is in scope,
+                // reef runner resolution (site/content/internals/reef-resolution.md): when a manifest is in scope,
                 // the `[runners]` table (ext → tool, shebang fallback) picks the
                 // interpreter, whose tool the spawn then reef-resolves. Falls
                 // back to today's fixed interpreters when no manifest applies.
@@ -201,7 +202,7 @@ impl Evaluator {
                     Some("rs") => self.run_rust_script(path, args, position),
                     _ => {
                         // Extension not in any `[runners]` table and not a
-                        // builtin interpreter (IO.md §3.2 step 1 exhausted):
+                        // built-in interpreter resolution exhausted:
                         // fall back to the file's shebang (step 2), else raise
                         // `runner_not_found` (step 3) instead of blindly
                         // exec'ing an unresolvable path.
@@ -234,7 +235,7 @@ impl Evaluator {
         }
     }
 
-    /// Shebang-fallback runner resolution (IO.md §3.2 step 2): read the file's
+    /// Shebang-fallback runner resolution: read the file's
     /// first line; if it is `#!<interp> [args…]`, return the interpreter argv
     /// prefix. `#!/usr/bin/env <tool>` resolves to `<tool>` (env-style). `None`
     /// when the file is unreadable or has no shebang.

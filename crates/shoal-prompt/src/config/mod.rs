@@ -1,9 +1,9 @@
-//! The `[prompt]` config schema (§3): parse, validate, defaults, theme
-//! layering, and the format-string / unknown-key warnings of §11.
+//! The `[prompt]` config schema (site/content/internals/prompt-editor-lsp.md): parse, validate, defaults, theme
+//! layering, and the format-string / unknown-key warnings of site/content/internals/prompt-editor-lsp.md.
 //!
 //! Every struct here derives `serde(default)` so a partial or absent config
 //! degrades to defaults with a warning rather than failing the shell to start
-//! (§11: a broken prompt config must never be a broken shell).
+//! (site/content/internals/prompt-editor-lsp.md: a broken prompt config must never be a broken shell).
 
 use serde::{Deserialize, Serialize};
 
@@ -149,9 +149,9 @@ impl PromptConfig {
         ids
     }
 
-    /// Parse every `format.*` string, warning (§11) about placeholders that
+    /// Parse every `format.*` string, warning (site/content/internals/prompt-editor-lsp.md) about placeholders that
     /// match no known module id. Returns the parsed token streams so the caller
-    /// can cache them for the process lifetime (§3.4).
+    /// can cache them for the process lifetime (site/content/internals/prompt-editor-lsp.md).
     pub fn parse_formats(&self, warnings: &mut Vec<String>) -> ParsedFormats {
         let known = self.known_ids();
         let parse_side = |side: &str, src: &str, warnings: &mut Vec<String>| {
@@ -174,7 +174,7 @@ impl PromptConfig {
     }
 }
 
-/// Cached, parsed `format.*` token streams (parsed once, §3.4).
+/// Cached, parsed `format.*` token streams (parsed once, site/content/internals/prompt-editor-lsp.md).
 #[derive(Debug, Clone)]
 pub struct ParsedFormats {
     pub left: Vec<FormatToken>,
@@ -224,8 +224,8 @@ pub fn merge(dst: &mut toml::Value, src: toml::Value) {
 
 /// Build the final [`PromptConfig`] from an ordered (lowest → highest
 /// precedence) list of `[prompt]`-contents-shaped TOML values. Applies the
-/// named theme preset as an extra lowest-precedence layer (§3.1 step 1) and
-/// collects unknown-key + format warnings (§11).
+/// named theme preset as an extra lowest-precedence layer and
+/// collects unknown-key + format warnings (site/content/internals/prompt-editor-lsp.md).
 pub fn load(layers: Vec<toml::Value>, warnings: &mut Vec<String>) -> PromptConfig {
     let mut merged = toml::Value::Table(toml::map::Map::new());
     for layer in &layers {
@@ -270,7 +270,7 @@ pub fn load(layers: Vec<toml::Value>, warnings: &mut Vec<String>) -> PromptConfi
 }
 
 /// Build a `[prompt]`-contents-shaped TOML value carrying the `SHOAL_PROMPT_*`
-/// environment overrides (§3.8). Returned as the highest-precedence layer.
+/// environment overrides (site/content/internals/prompt-editor-lsp.md). Returned as the highest-precedence layer.
 pub fn env_overrides(vars: &[(String, String)]) -> toml::Value {
     let mut table = toml::map::Map::new();
     let mut format = toml::map::Map::new();

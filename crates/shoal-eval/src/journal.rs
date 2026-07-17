@@ -1,4 +1,4 @@
-//! Journal integration for the tree-walk evaluator (TDD §9, docs/VISION.md).
+//! Journal integration for the tree-walk evaluator (site/content/internals/language-conformance-contract.md, site/content/internals/system-map.md).
 //!
 //! The journal is what *actually happened*: every executed top-level statement
 //! becomes an entry (src, canonical AST, derived effects, cwd, principal, ts),
@@ -55,7 +55,7 @@ pub(crate) fn default_state_dir() -> PathBuf {
 
 impl Evaluator {
     /// Install a command journal and the session/principal recorded on each
-    /// entry (TDD §9). Additive: without this call `journal` stays `None` and
+    /// entry (site/content/internals/language-conformance-contract.md). Additive: without this call `journal` stays `None` and
     /// nothing is ever recorded.
     pub fn set_journal(
         &mut self,
@@ -301,7 +301,7 @@ impl Evaluator {
 
     /// Redirect (`>` / `>>`) pre-capture: identical to `save`'s — if the target
     /// already exists, snapshot its prior bytes so an output redirect can be
-    /// reversed by `undo` exactly like `cp`/`save` (TDD §9). A brand-new target
+    /// reversed by `undo` exactly like `cp`/`save` (site/content/internals/language-conformance-contract.md). A brand-new target
     /// records nothing: there is no create-inverse in [`UndoInverse`] yet, so a
     /// `>`/`>>` that creates a file is left non-reversible (documented
     /// follow-up), never faked. `>>` reuses the same overwrite inverse: undo
@@ -413,7 +413,7 @@ impl Evaluator {
 
     // --- undo / journal builtins ------------------------------------------
 
-    /// The `undo` builtin (TDD §9, §13.16). Bare `undo` reverses the most recent
+    /// The `undo` builtin (site/content/internals/language-conformance-contract.md). Bare `undo` reverses the most recent
     /// reversible journaled entry; `undo <id>` targets a specific entry. Replays
     /// the entry's typed inverses newest-first, refusing loudly if a target has
     /// changed since it was recorded.
@@ -721,7 +721,7 @@ mod tests {
         );
     }
 
-    /// FIX 2: when the prior contents exceed the journal's `output_hard_cap`,
+    /// When prior contents exceed the journal's `output_hard_cap`,
     /// the undo snapshot would be stored truncated (partial bytes + marker).
     /// `snapshot_prior` must refuse to record a replayable `RestoreBytes`
     /// inverse in that case, so `undo` can never restore corrupt partial content
@@ -1016,7 +1016,7 @@ mod tests {
         assert!(err.msg.contains("journaled session"), "{}", err.msg);
     }
 
-    /// TDD §317 disk-spill: a value-position capture whose stdout exceeds the
+    /// site/content/internals/language-conformance-contract.md disk-spill: a value-position capture whose stdout exceeds the
     /// RAM cap is preserved to the CAS as a ref-backed value — `.len` is the
     /// true (full) length, the blob exists and its blake3 matches, render shows
     /// a bounded preview + the `val:blake3:…` ref (not the whole thing), and
@@ -1083,7 +1083,7 @@ mod tests {
     }
 
     /// Zero-regression: a sub-cap value-position capture stays fully resident —
-    /// a plain `bytes`, no spill, no CAS blob — exactly as before §317 spill.
+    /// a plain `bytes`, no spill, no CAS blob — exactly as before capture spill was added.
     #[test]
     fn value_capture_under_cap_stays_resident() {
         let dir = tempfile::tempdir().unwrap();
@@ -1104,7 +1104,7 @@ mod tests {
         );
     }
 
-    /// TDD §317 in-language dispatch follow-up: a bare `val:blake3:<hash>`
+    /// site/content/internals/language-conformance-contract.md in-language dispatch follow-up: a bare `val:blake3:<hash>`
     /// content ref *written as a value* (the short-ref `.ref` yields) is
     /// resolvable in-language — calling a method on it loads the bytes from the
     /// session CAS and dispatches on the resulting lazy `bytes`, so a recovered

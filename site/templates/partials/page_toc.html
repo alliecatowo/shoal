@@ -1,0 +1,10 @@
+{% import "macros/docs.html" as docs %}
+{% if toc %}
+<aside class="page-toc" aria-label="On this page">
+  <div class="page-toc-inner">
+    <p>On this page</p>
+    {{ docs::toc(items=toc) }}
+    <a class="toc-top" href="#main-content">Back to top <span>↑</span></a>
+  </div>
+</aside>
+{% endif %}

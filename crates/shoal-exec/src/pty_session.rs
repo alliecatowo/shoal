@@ -8,7 +8,7 @@
 //! [`vt100::Parser`], which maintains a `cols×rows` rendered screen grid; the
 //! caller (the kernel, over the wire) writes keystrokes into the master and
 //! reads back the *rendered screen* — never a wall of raw escape bytes. This
-//! is the "an agent reads a rendered screen" surface (AGENT-SURFACE §10).
+//! is the "an agent reads a rendered screen" surface (site/content/internals/kernel-protocol.md).
 //!
 //! It reuses the same no-leak reaping discipline as the job-control PtyTee
 //! path: every child is its own session/process-group leader (portable-pty
@@ -77,7 +77,7 @@ pub struct PtyOpenSpec {
     pub cols: u16,
     /// Initial terminal height in rows.
     pub rows: u16,
-    /// Optional OS-enforcement request (TDD §8), applied to the child before
+    /// Optional OS-enforcement request (site/content/internals/language-conformance-contract.md), applied to the child before
     /// exec by [`crate::sandbox::apply`] just like any other spawn. `None`
     /// (default-permissive) spawns unconfined.
     pub sandbox: Option<shoal_leash::SandboxPolicy>,
@@ -522,7 +522,7 @@ fn pty_err(e: anyhow::Error) -> io::Error {
 
 /// Encode a named key into the bytes a terminal sends for it, or `None` for an
 /// unrecognized name. This is the terminal-domain half of the `pty.send`
-/// key-name protocol (AGENT-SURFACE §10); the JSON shape of a send request is
+/// key-name protocol (site/content/internals/kernel-protocol.md); the JSON shape of a send request is
 /// decoded by the kernel, which calls this per named key.
 ///
 /// Recognized (case-insensitive for the names, exact for `Ctrl-<x>`):

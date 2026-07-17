@@ -1,18 +1,19 @@
-//! System-populated stream sources (docs/STREAMS.md §2): `watch`/`tail`/`every`.
+//! System-populated stream sources (`watch`/`tail`/`every`). See
+//! `site/content/internals/streams-channels.md`.
 //! Each returns a lazy `stream<T>` over a live, channel-backed source fed by a
 //! background producer. The producer sends into a **bounded** `sync_channel`
-//! (STREAMS §1: "bounded buffers — never unbounded") wrapped by
+//! (bounded buffers, never unbounded) wrapped by
 //! [`StreamVal::from_channel`]; when the consumer drops the stream (a satisfied
 //! `.take`, `Ctrl-C`, end of `.each`), the receiver drops, the producer's send
 //! fails, and it exits — releasing the OS resource (timer / inotify / kqueue
-//! watch). This is the sink-to-source cancellation of STREAMS §1, for free.
+//! watch). This provides sink-to-source cancellation for free.
 //!
-//! Backpressure discipline (STREAMS §6.1): a producer never blocks on a slow
+//! Backpressure discipline: a producer never blocks on a slow
 //! consumer and never buffers without bound — it `try_send`s, and on a full
 //! buffer applies each source's coalesce/drop contract: `every` drops the tick
-//! outright (§2.4 — ticks coalesce, no marker), `watch` owes a single
-//! `{coalesced: true}` summary event (§2.1), `tail` counts dropped lines and
-//! owes a `{dropped: n}` marker element (§2.2). The only blocking sends are
+//! outright (ticks coalesce, no marker), `watch` owes a single
+//! `{coalesced: true}` summary event, and `tail` counts dropped lines and
+//! owes a `{dropped: n}` marker element. The only blocking sends are
 //! for stream-level *errors*, which are rare and must not be lost.
 //!
 //! These sources are timing/IO-dependent, so they are unit-tested here and in
@@ -30,26 +31,27 @@ use std::sync::Arc;
 use std::sync::mpsc::{SyncSender, TrySendError, channel, sync_channel};
 use std::time::Duration;
 
-/// Consumer-facing buffer cap for `watch` and `tail` (STREAMS §2.1/§2.2 —
+/// Consumer-facing buffer cap for `watch` and `tail` (site/content/internals/streams-channels.md —
 /// "bounded ring buffer" / "bounded line buffer"). The spec sizes `watch`'s
 /// ring "to the kernel's underlying event-queue limit (platform-dependent)"
-/// without naming a number, and has §2.2 share the documented default; 64 is
+/// without naming a number; 64 is
 /// that documented default here for both. `every` instead uses a 1-slot
-/// buffer (§2.4: ticks coalesce, memory O(1) always).
+/// buffer (site/content/internals/streams-channels.md: ticks coalesce, memory O(1) always).
 const SOURCE_BUF: usize = 64;
 
 impl Evaluator {
-    /// `every(interval) -> stream<datetime>` (STREAMS §2.4): one timer thread,
+    /// `every(interval) -> stream<datetime>` (site/content/internals/streams-channels.md): one timer thread,
     /// ticking the wall-clock `datetime` of each firing into a **1-slot
     /// bounded buffer** (`sync_channel(1)` + `try_send`). Ticks are never
     /// queued past that slot: a tick that fires while the slot is still
-    /// occupied (a slow consumer) is dropped — coalesced away, per §2.4 — so
+    /// occupied (a slow consumer) is dropped — coalesced away — so
     /// memory is O(1) and a stalled consumer resumes with at most one buffered
-    /// tick, then live ones. Delta from §2.4's letter: the buffered tick is
+    /// tick, then live ones. One implementation detail differs from the prose
+    /// contract: the buffered tick is
     /// the *earliest* undelivered one (at most one interval stale), not "the
     /// latest missed" — a 1-slot `try_send` buffer cannot replace its
     /// occupant. Ticks are indistinguishable apart from their timestamp, so no
-    /// marker is emitted (§2.4 requires none).
+    /// marker is emitted, as required by `site/content/internals/streams-channels.md`.
     pub(crate) fn source_every(&self, interval: Duration) -> VResult<Value> {
         if interval.is_zero() {
             return Err(ErrorVal::arg_error("every expects a positive interval"));
@@ -69,13 +71,13 @@ impl Evaluator {
         Ok(Value::Stream(StreamVal::from_channel("datetime", rx)))
     }
 
-    /// `watch(target, recursive: bool = true) -> stream<event>` (STREAMS §2.1).
+    /// `watch(target, recursive: bool = true) -> stream<event>` (site/content/internals/streams-channels.md).
     /// `target` may be a path or a glob; a glob watches its directory prefix and
     /// filters events by the compiled pattern. Elements are
     /// `{path, kind: "created"|"modified"|"removed", ts}`. The consumer-facing
     /// buffer is bounded ([`SOURCE_BUF`]); a burst faster than the consumer
     /// drains coalesces to a single `{path: root, kind: "modified", ts,
-    /// coalesced: true}` summary event (§2.1) via [`send_coalescing`].
+    /// coalesced: true}` summary event (site/content/internals/streams-channels.md) via [`send_coalescing`].
     pub(crate) fn source_watch(&self, target: &Value, recursive: bool) -> VResult<Value> {
         let (root, matcher) = self.watch_root_and_matcher(target)?;
         if !root.exists() {
@@ -109,7 +111,7 @@ impl Evaluator {
                 return;
             }
             // Coalesce state: `true` when at least one event was dropped on a
-            // full buffer and the consumer is owed the §2.1 summary event.
+            // full buffer and the consumer is owed the documented coalescing summary event.
             let mut coalesce_owed = false;
             for res in raw_rx {
                 let event = match res {
@@ -150,13 +152,13 @@ impl Evaluator {
         Ok(Value::Stream(StreamVal::from_channel("event", rx)))
     }
 
-    /// `tail(file, from_start: bool = false) -> stream<str>` (STREAMS §2.2):
+    /// `tail(file, from_start: bool = false) -> stream<str>` (site/content/internals/streams-channels.md):
     /// follows appends to `file` line-by-line, event-driven via `notify`. Seeks to
     /// EOF by default (matching `tail -f`), or byte 0 with `from_start: true`.
     /// Detects truncation/rotation (size shrank → re-read from the new start).
     /// The consumer-facing line buffer is bounded ([`SOURCE_BUF`]); an unread
     /// backlog beyond the cap is dropped and coalesced to a `{dropped: n}`
-    /// line-count marker element (§2.2) via [`send_line_bounded`].
+    /// line-count marker element (site/content/internals/streams-channels.md) via [`send_line_bounded`].
     pub(crate) fn source_tail(&self, file: &Value, from_start: bool) -> VResult<Value> {
         let path = self.stream_path_arg(file)?;
         if !path.exists() {
@@ -276,7 +278,7 @@ fn tail_loop(fs: &Arc<dyn Fs>, path: &Path, from_start: bool, tx: &SyncSender<VR
         file.seek(SeekFrom::End(0)).unwrap_or(0)
     };
     // Lines dropped on a full consumer buffer, owed to the consumer as a
-    // single `{dropped: n}` marker element once room appears (§2.2).
+    // single `{dropped: n}` marker element once room appears (site/content/internals/streams-channels.md).
     let mut dropped: u64 = 0;
 
     let (raw_tx, raw_rx) = channel();
@@ -369,7 +371,7 @@ fn read_new_lines(
     true
 }
 
-/// Send one tail line into the bounded consumer buffer (§2.2). A line that
+/// Send one tail line into the bounded consumer buffer (site/content/internals/streams-channels.md). A line that
 /// finds the buffer full is DROPPED (not blocked-on) and counted; the debt is
 /// flushed as a single `{dropped: n}` marker element as soon as there is room.
 /// Returns `false` only when the consumer is gone (so the caller stops).
@@ -395,7 +397,7 @@ fn send_line_bounded(tx: &SyncSender<VResult<Value>>, dropped: &mut u64, line: S
     }
 }
 
-/// The `{dropped: n}` overflow marker element (§2.2) — a `tail` stream widens
+/// The `{dropped: n}` overflow marker element (site/content/internals/streams-channels.md) — a `tail` stream widens
 /// to carry it structurally (a consumer distinguishes it by shape, e.g.
 /// `.where(x => x.dropped == null)` to keep only real lines), mirroring how
 /// `watch` surfaces overflow as a `coalesced: true` event.
@@ -405,7 +407,7 @@ fn dropped_marker(n: u64) -> Value {
     Value::Record(r)
 }
 
-/// Forward a `watch` event into the bounded consumer buffer (§2.1). On a full
+/// Forward a `watch` event into the bounded consumer buffer (site/content/internals/streams-channels.md). On a full
 /// buffer the event is DROPPED and the consumer is owed a single
 /// `{path: root, kind: "modified", ts, coalesced: true}` summary, flushed once
 /// room appears. Returns `false` only when the consumer is gone.
@@ -432,7 +434,7 @@ fn send_coalescing(
     }
 }
 
-/// The `coalesced: true` summary event (§2.1) owed after a `watch` overflow.
+/// The `coalesced: true` summary event (site/content/internals/streams-channels.md) owed after a `watch` overflow.
 fn coalesced_event(root: &Path) -> Value {
     let mut r = Record::new();
     r.insert("path".into(), Value::Path(root.to_path_buf()));

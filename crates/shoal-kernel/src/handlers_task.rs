@@ -1,7 +1,7 @@
 //! `dispatch` handlers for task lifecycle and plan approval: `task.list`,
 //! `task.get`, `task.await`, `task.cancel`, `task.suspend`, `task.resume`,
 //! `plan.apply`, `cap.request`. Split out of `lib.rs`'s dispatch match
-//! (docs/ROADMAP.md wave R4): pure mechanical move, zero wire/behavior change.
+//! Wire behavior is documented in `site/content/internals/kernel-protocol.md`.
 use super::*;
 
 impl Kernel {
@@ -115,13 +115,13 @@ impl Kernel {
         })
     }
 
-    // docs/ROADMAP.md R3: added alongside the pre-existing
+    // site/content/internals/roadmap-and-priorities.md: added alongside the pre-existing
     // `task.suspend` above, honest in the same way — a kernel task is
     // a Rust thread recursively calling back into `dispatch`, not a
     // single tracked child process/group, so there is nothing here to
     // send `SIGCONT` to yet. Real suspend/resume for a task's spawned
     // children lands with the eval sibling's task-lifecycle methods
-    // (`.suspend()`/`.resume()`, R3); once a task's process handle is
+    // (`.suspend()`/`.resume()`); once a task's process handle is
     // reachable from here, this stub becomes the real thing without
     // changing the wire shape.
     pub(crate) fn handle_task_resume(
@@ -147,7 +147,7 @@ impl Kernel {
         })
     }
 
-    /// `plan.get` (AGENT-SURFACE §1, `shoal://plan/{ref}`): the stored plan a
+    /// `plan.get` (site/content/internals/kernel-protocol.md, `shoal://plan/{ref}`): the stored plan a
     /// prior `exec {mode:"plan"}` / `shoal_plan` derived and keyed by its
     /// `plan:<hex16>` ref — its canonical AST (re-parsed from the stored
     /// source), concrete effects, reversibility, and the *current* leash
@@ -196,7 +196,7 @@ impl Kernel {
         }))
     }
 
-    /// `plan.list` (AGENT-SURFACE §8): the open plans this session/principal
+    /// `plan.list` (site/content/internals/kernel-protocol.md): the open plans this session/principal
     /// derived and can inspect (`plan.get`) or apply (`plan.apply`) — the
     /// enumerable backing for `shoal://plan/*` in `resources/list`. Scoped the
     /// same way `plan.get`/`plan.apply` are: a principal only ever sees its own
@@ -312,7 +312,7 @@ impl Kernel {
                 data: None,
             });
         }
-        // AGENT-SURFACE §5: if the caller scoped the request to a set
+        // site/content/internals/kernel-protocol.md: if the caller scoped the request to a set
         // of effect kinds, the grant only covers those — a plan that
         // needs an effect the caller did not name stays pending, so an
         // approval can never silently widen past what was asked for.
@@ -344,7 +344,7 @@ impl Kernel {
         }
         stored.approved = true;
         // Same honest enforcement truth `session.attach`'s `caps_enforced`
-        // reports (docs/ROADMAP.md open-item #5) — not a hardcoded `false`.
+        // reports (see `site/content/internals/security-threat-model.md`) — not a hardcoded `false`.
         // An agent that just unstuck an `approval_pending` plan via
         // `cap.request` must learn whether the OS is actually going to
         // confine what it is about to run, the same way it would have

@@ -24,7 +24,7 @@
 # like `_PID`/`__REALTIME_TIMESTAMP` -- as a JSON *string*, never a bare
 # number (confirmed against real `journalctl -o json` output), so the
 # representative fields below are typed `str` throughout rather than `int`;
-# typing them `int` would be a lie the real bytes don't back up (TDD §6).
+# typing them `int` would be a lie the real bytes don't back up (site/content/internals/language-conformance-contract.md).
 # The `ndjson` parser (like `json`) does not consult `output.type` for
 # per-field coercion (see the module doc on `hint_schema`) -- every field
 # journald actually emits survives in the parsed record exactly as-is, not

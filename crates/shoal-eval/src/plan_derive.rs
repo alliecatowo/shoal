@@ -126,7 +126,7 @@ impl Evaluator {
                 recv, name, args, ..
             } => {
                 // `http.get/post/put/delete(url, …)` declares a `net.connect`
-                // effect for leash + plan (ROADMAP R2). The host is parsed from a
+                // effect for leash + plan (site/content/internals/roadmap-and-priorities.md). The host is parsed from a
                 // literal URL argument; a non-literal URL declares an
                 // unknown-host connect (`*`).
                 if let Expr::Var { name: ns, .. } = &**recv
@@ -253,7 +253,7 @@ impl Evaluator {
                     push_effect(out, effect);
                 }
             }
-            // Derive a real binary-content hash for the plan (TDD §8): resolve
+            // Derive a real binary-content hash for the plan (site/content/internals/language-conformance-contract.md): resolve
             // the adapter's bin and hash it, matching reef/leash's blake3-hex so
             // the hash a plan renders is the one a `proc_spawn` pin would check.
             // Falls back to an empty hash when the tool isn't installed/locatable

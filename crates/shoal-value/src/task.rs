@@ -1,4 +1,4 @@
-//! `TaskVal`/`TaskShared` — task handles and job control (TDD §4.7), moved
+//! `TaskVal`/`TaskShared` — task handles and job control (site/content/internals/language-conformance-contract.md), moved
 //! verbatim out of `lib.rs`.
 
 use super::*;
@@ -20,7 +20,7 @@ pub struct TaskShared {
     cancel_requested: AtomicBool,
     /// Hooks run on cancel (e.g. cancel exec tokens of children).
     on_cancel: Mutex<Vec<Box<dyn Fn() + Send>>>,
-    /// Suspend state (TDD §4.7 job control): `task.suspend()` SIGTSTPs the task's
+    /// Suspend state (site/content/internals/language-conformance-contract.md job control): `task.suspend()` SIGTSTPs the task's
     /// process group, `task.resume()` SIGCONTs it. The actual OS signal is sent
     /// by hooks a spawner/host registers (`on_suspend`/`on_resume`), so this
     /// mechanism is signalling-backend-agnostic (a thread-only task simply has no
@@ -97,7 +97,7 @@ impl TaskVal {
         }
     }
 
-    /// Request the task suspend (TDD §4.7): mark it suspended and run every
+    /// Request the task suspend (site/content/internals/language-conformance-contract.md): mark it suspended and run every
     /// registered suspend hook (which is where a spawner/host sends `SIGTSTP` to
     /// the task's process group). Idempotent — suspending an already-suspended
     /// task re-runs the hooks, which is harmless (`SIGTSTP` to a stopped group is
@@ -109,7 +109,7 @@ impl TaskVal {
         }
     }
 
-    /// Request the task resume (TDD §4.7): clear the suspended flag and run every
+    /// Request the task resume (site/content/internals/language-conformance-contract.md): clear the suspended flag and run every
     /// registered resume hook (`SIGCONT` to the process group). Idempotent.
     pub fn resume(&self) {
         self.shared.suspended.store(false, Ordering::SeqCst);
@@ -124,7 +124,7 @@ impl TaskVal {
 
     /// Mark the task suspended WITHOUT running the suspend hooks. Used when the
     /// OS already stopped the underlying process — a foreground external command
-    /// SIGTSTP'd by Ctrl-Z (TDD §4.7 job control): the stop physically happened,
+    /// SIGTSTP'd by Ctrl-Z (site/content/internals/language-conformance-contract.md job control): the stop physically happened,
     /// so firing the `on_suspend` hooks (which re-send `SIGTSTP`) would be
     /// redundant. `jobs`/prompt accounting then reflects the stop. Contrast with
     /// [`TaskVal::suspend`], which is the request-a-suspend path that DOES signal.

@@ -408,7 +408,7 @@ fn pty_child_sees_a_tty_on_all_std_fds() {
 
 #[test]
 fn pty_child_is_its_own_process_group_leader() {
-    // Job control (TDD §4.7) signals the whole group via `kill(-pgid, …)`, so
+    // Job control (site/content/internals/language-conformance-contract.md) signals the whole group via `kill(-pgid, …)`, so
     // the child must be in its OWN group. portable-pty's `setsid` makes it a
     // session/group leader, so pgid == pid — both positive.
     let res = run(sh("true", ExecMode::PtyTee), &CancelToken::new()).expect("run");

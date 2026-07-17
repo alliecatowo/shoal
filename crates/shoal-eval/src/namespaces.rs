@@ -1,4 +1,4 @@
-//! Data & system namespaces as first-class values (TDD §5, ROADMAP R2). Each
+//! Data & system namespaces as first-class values (site/content/internals/language-conformance-contract.md, site/content/internals/roadmap-and-priorities.md). Each
 //! namespace (`json`, `yaml`, `toml`, `csv`, `math`, `http`, `os`, `config`) is a
 //! name in the root env exposing constants (field access, e.g. `math.pi`) and
 //! functions (method calls, e.g. `json.parse(s)`, `http.get(url)`). The evaluator
@@ -317,10 +317,10 @@ fn unknown_method(ns: &str, method: &str) -> VResult<Value> {
 
 // --- http ---------------------------------------------------------------------
 
-/// Body read cap for `http.*` responses (ROADMAP R2 "size cap"): responses whose
+/// Body read cap for `http.*` responses (site/content/internals/roadmap-and-priorities.md "size cap"): responses whose
 /// body exceeds this are rejected rather than buffered without bound.
 const HTTP_BODY_CAP: u64 = 64 * 1024 * 1024;
-/// Global per-request timeout (ROADMAP R2 "timeout").
+/// Global per-request timeout (site/content/internals/roadmap-and-priorities.md "timeout").
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl Evaluator {
@@ -388,7 +388,7 @@ impl Evaluator {
             .read_to_string()
             .map_err(|e| ErrorVal::new("net_error", format!("http.{method} body: {e}")))?;
         // `json`: the body parsed as JSON when it is valid JSON, else null. This
-        // is the `resp.json` accessor of the typed response (ROADMAP R2).
+        // is the `resp.json` accessor of the typed response (site/content/internals/roadmap-and-priorities.md).
         let json = serde_json::from_str::<serde_json::Value>(body.trim())
             .map(|j| json_to_value(&j))
             .unwrap_or(Value::Null);
@@ -520,7 +520,7 @@ fn os_uptime() -> Value {
 // --- config -------------------------------------------------------------------
 
 /// The resolved configuration record backing `config.all`/`config.get`
-/// (TDD §5). Reads the host-injected config snapshot (`Evaluator::set_config`),
+/// (site/content/internals/language-conformance-contract.md). Reads the host-injected config snapshot (`Evaluator::set_config`),
 /// NOT a raw `shoal.toml` walked off the filesystem: the host loads and applies
 /// its config through `shoal-config` (layering + env overrides + validation),
 /// then injects that same resolved value here, so in-language `config` can

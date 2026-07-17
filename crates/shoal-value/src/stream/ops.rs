@@ -1,4 +1,4 @@
-//! The lazy stream combinator stages (STREAMS §3), split out of
+//! The lazy stream combinator stages (site/content/internals/streams-channels.md), split out of
 //! `stream/mod.rs` for size. Each wraps an inner [`Upstream`] and is
 //! itself an [`Upstream`], so a chain composes by nesting.
 

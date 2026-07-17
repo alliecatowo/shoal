@@ -2,7 +2,7 @@
 # i64::MIN boundary literals and arithmetic, round-half-away-from-zero for
 # BOTH sign floors near a `.5` boundary, floor/ceil sign behavior, and
 # int<->float cross-type equality (arithmetic promotion makes `5 == 5.0`
-# true, per TDD §4.2 site 1). Every value cross-checked against the real
+# true, per `site/content/internals/language-conformance-contract.md`). Every value cross-checked against the real
 # evaluator via the conformance harness.
 
 [[case]]
@@ -124,7 +124,7 @@ value = "42"
 # ±inf, silently turning a finite input into `nan`/`inf`. Rounding a finite
 # float to more decimal places than it can represent is the IDENTITY, so the
 # value must come back unchanged and finite.
-# See crates/shoal-value/src/methods/num.rs::round_to (FIX 4).
+# See crates/shoal-value/src/methods/num.rs::round_to.
 
 [[case]]
 name = "num-round-huge-precision-is-identity"
@@ -175,7 +175,7 @@ error = "overflow"
 # The float->int `as` cast SATURATES (NaN/negative->0, overflow->MAX), so these
 # used to silently return garbage (`9000000000000000000b * 100.0` yielded
 # `18446744.07tb`; `1000b * -1.0` yielded `0b`) instead of erroring the way the
-# integer arms do. See crates/shoal-value/src/ops.rs (FIX 1).
+# integer arms do. See crates/shoal-value/src/ops.rs.
 
 [[case]]
 name = "num-size-mul-float-overflow-raises"

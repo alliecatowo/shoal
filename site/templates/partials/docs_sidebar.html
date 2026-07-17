@@ -1,0 +1,19 @@
+{% import "macros/docs.html" as docs %}
+<aside class="docs-sidebar" id="docs-sidebar" data-docs-sidebar aria-label="Documentation navigation">
+  <div class="docs-sidebar-inner">
+    <div class="docs-sidebar-heading">
+      <a href="{{ docs_root.permalink }}">
+        <span>{{ docs_root.extra.eyebrow | default(value="Manual") }}</span>
+        <strong>{{ docs_root.title }}</strong>
+      </a>
+      <button type="button" data-sidebar-close aria-label="Close documentation navigation">×</button>
+    </div>
+    <nav aria-label="{{ docs_root.title }}">
+      {{ docs::grouped_tree(section=docs_root, current_path=active_path, active_group=active_group, scheme=docs_root.extra.nav_scheme) }}
+    </nav>
+    <div class="docs-sidebar-foot">
+      <span class="status-dot" aria-hidden="true"></span>
+      <p><strong>Living manual</strong><span>Tracks the current source tree</span></p>
+    </div>
+  </div>
+</aside>

@@ -1,0 +1,424 @@
++++
+title = "Evaluator state and control flow"
+description = "A field-by-field map of the tree-walk evaluator, statement and expression flow, scope transitions, echo semantics, and host boundaries."
+weight = 33
+template = "docs/page.html"
+
+[extra]
+group = "Language & runtime"
+eyebrow = "Runtime book"
+status = "Source-level evaluator atlas"
+audience = "Runtime, language, host, and embedding contributors"
+wide = true
++++
+
+`shoal-eval` is the semantic center of Shoal. It consumes the canonical AST, owns one session's
+mutable language state, asks effect ports to touch the outside world, and returns runtime values or
+typed errors. It is a tree-walk evaluator: there is no bytecode, VM instruction stream, optimizer,
+or separate compile phase hidden between parsing and execution.
+
+Primary sources: [`lib.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-eval/src/lib.rs),
+[`stmt.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-eval/src/stmt.rs), and
+[`expr.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-eval/src/expr.rs).
+
+## The interpreter boundary
+
+```mermaid
+flowchart LR
+  Source --> Parser["shoal-syntax::parse"]
+  Parser --> Program["shoal_ast::Program"]
+  Program --> Eval["Evaluator::eval_program"]
+  Eval --> Env["Env / Value"]
+  Eval --> Ports["Fs / Exec / Clock / Opener / Secret / Config"]
+  Eval --> Adapters
+  Eval --> Reef
+  Eval --> Leash
+  Eval --> Journal
+  Eval --> Bus["language EventBus"]
+  Eval --> Result["VResult<Value>"]
+  Result --> Host["CLI / REPL / kernel host"]
+```
+
+The evaluator does **not** own source acquisition, terminal rendering policy, process termination,
+kernel framing, or configuration discovery. A host constructs it, installs optional capabilities,
+passes a parsed program, and interprets the result plus side-channel requests such as `take_exit()`.
+
+## Complete state ledger
+
+The `Evaluator` struct is a session object, not a disposable visitor. Every field below can affect
+later evaluations on the same instance.
+
+| Field | Meaning | Lifetime and sharing rule |
+|---|---|---|
+| `env` | current lexical environment | swapped for calls/modules; closures retain captured `Env` handles |
+| `cwd` | logical working directory | session-local; changed by navigation and temporarily by `with cwd:`/modules |
+| `process_env` | environment passed to children | snapshot of `vars_os()` at construction, then session mutations |
+| `interactive` | whether interactive behavior is allowed | host-selected |
+| `it` | last top-level value | updated after each successful top-level statement |
+| `cancel` | cooperative cancellation token | consulted by sleeps, streams, and execution paths |
+| `adapters` | discovered adapter catalog | installed by host; participates in command resolution |
+| `sink` | renderer callback for statement-position values | optional boxed callback; default renderer otherwise |
+| `call_depth` | recursion guard counter | incremented around every callable value, capped at 10,000 |
+| `in_fn_body` | function nesting counter | gates ambient `cd` and `env.NAME = ...` mutation |
+| `jobs` | `TaskVal` registry | session table for spawned and stopped tasks |
+| `external_jobs` | task id to stopped child PID | bridges evaluator tasks to PTY job-control storage |
+| `pending_stop` | newest stopped foreground command | consumed by the interactive host for the stop notice |
+| `reef_chain` | cached cwd plus discovered scopes | invalidated on cwd/user-manifest change |
+| `reef_resolver` | provider stack | injected or built lazily for constrained resolution |
+| `reef_lock` | in-memory lockfile | loaded/persisted beside nearest manifest |
+| `reef_lock_path` | lock persistence target | absent outside a manifest scope |
+| `reef_user_manifest` | optional user scope | host-injected; absent by default |
+| `reef_overrides` | dynamic `with reef:` layers | innermost-first stack |
+| `journal` | optional SQLite journal handle | deliberately not shared with spawned child evaluators |
+| `session_id` | journal session label | ignored without a journal |
+| `principal` | journal actor label | `human` or an agent identity by convention |
+| `current_entry` | open top-level journal entry | allows nested effects to attach undo records |
+| `source` | current program source text | used to slice statement source for journal rows |
+| `leash` | active policy and principal | resolves per-spawn sandbox policy |
+| `bus` | in-language event bus | `Arc`; shared across spawned/session children |
+| `pending_exit` | requested exit status | evaluator stops the program; host performs termination |
+| `modules` | canonical path to export value cache | once-per-evaluator module memoization |
+| `module_stack` | modules currently loading | circular import detection and diagnostic chain |
+| `plans` | derived but unapplied programs | one-based plan references in the session |
+| `jump_store` | frecency persistence path | absent by default so noninteractive runs do not write |
+| `oldpwd` | directory left by last navigation | exact `PathBuf` used by `cd -` |
+| `dir_stack` | directories beneath current cwd | backing state for `pushd`, `popd`, and `dirs` |
+| `fs` | filesystem port | `Arc<dyn Fs>`, defaults to `StdFs` |
+| `exec` | process execution port | `Arc<dyn Exec>`, defaults to `StdExec` |
+| `clock` | wall/monotonic time port | `Arc<dyn Clock>`, defaults to `StdClock` |
+| `opener` | desktop opener port | `Arc<dyn Opener>`, defaults to `StdOpener` |
+| `secrets` | secret retrieval port | `Arc<dyn SecretPort>`, defaults to `StdSecret` |
+| `config` | resolved configuration snapshot | `Arc<dyn ConfigPort>`, empty snapshot by default |
+| `echo_mode` | intermediate-value policy | `All`, `Commands`, or `Quiet` |
+
+This breadth is why adding state casually is dangerous. Decide whether new state is lexical,
+dynamic, session-global, host-global, inherited into children, journaled, or reset for modules. A
+field without an explicit rule will eventually behave differently in `spawn`, `source`, module
+loading, and kernel sessions.
+
+## Construction defaults are compatibility behavior
+
+`Evaluator::new(cwd)` creates a root environment, snapshots the OS environment, starts with
+`interactive = false`, `it = null`, no adapters beyond an empty catalog, and no installed journal
+or Leash policy. It installs standard effect ports, creates a shared language bus, and selects
+`EchoMode::All`.
+
+```mermaid
+stateDiagram-v2
+  [*] --> New
+  New: root Env
+  New: OS env snapshot
+  New: no journal or sandbox
+  New: standard ports
+  New: EchoMode&#58;&#58;All
+  New --> Configured: host setters
+  Configured --> Evaluating: eval_program
+  Evaluating --> Configured: value or error
+  Configured --> [*]: host drops session
+```
+
+The absence of a journal or Leash policy is meaningful. It preserves the embedding and test path:
+plain evaluator construction performs no journaling setup and adds no sandbox wrapper. Host code
+must opt in explicitly.
+
+## Program evaluation transaction
+
+`eval_program` walks `Program.stmts` in order. For every top-level statement it:
+
+1. opens a journal entry when a journal is installed;
+2. calls `eval_stmt(stmt, true)`;
+3. finishes the entry with either the value or error;
+4. converts ordinary `Flow::Value` into the current `it`;
+5. emits eligible non-final values, or saves the final value for return;
+6. rejects `return`, `break`, or `continue` that escaped their legal context;
+7. stops before the next statement when `pending_exit` is set.
+
+```mermaid
+sequenceDiagram
+  participant H as Host
+  participant E as Evaluator
+  participant J as Journal
+  participant S as Statement sink
+  H->>E: eval_program(program)
+  loop each top-level statement
+    E->>J: begin(statement slice)
+    E->>E: eval_stmt(top = true)
+    E->>J: finish(value or error)
+    alt non-final and echo-eligible
+      E->>S: sink_value(value)
+    else final
+      E->>E: retain as return value
+    end
+  end
+  E-->>H: VResult<Value>
+  H->>E: take_exit()
+```
+
+The journal finish call occurs before `result?`, so failed statements are recorded as failures.
+`it` is updated only after a successful ordinary value. The public `it` field and the transcript
+bindings maintained by `record_transcript` are related but not identical: transcript recording is
+a host hook that declares `it` and appends to `out` in the environment.
+
+## Internal nonlocal flow
+
+Rust errors represent language failures. A separate private enum represents successful nonlocal
+control:
+
+```text
+Flow::Value(Value)
+Flow::Return(Value)
+Flow::Break
+Flow::Continue
+```
+
+That distinction prevents `return` and loop control from being confused with an `ErrorVal` that a
+language `try` might catch. `eval_expr_flow` exists for expressions such as blocks and conditionals
+which must preserve the flow marker when evaluated in statement context.
+
+```mermaid
+flowchart TD
+  Stmt --> EvalStmt
+  EvalStmt --> Value
+  EvalStmt --> Return
+  EvalStmt --> Break
+  EvalStmt --> Continue
+  Value --> Parent
+  Return --> FunctionBoundary
+  Break --> LoopBoundary
+  Continue --> LoopBoundary
+  FunctionBoundary --> RuntimeValue
+  LoopBoundary --> RuntimeValue2["null / next iteration"]
+  Return -. escapes .-> TopError["return outside function"]
+  Break -. escapes .-> TopError2["loop control outside loop"]
+```
+
+## Statement semantics
+
+| Statement | Main transition | Returned flow/value |
+|---|---|---|
+| `let` | evaluate initializer, bind pattern in current environment | `null` |
+| `fn` | create closure capturing the current `Env`, declare immutable name | `null` |
+| `alias` | store an immutable `CmdRef` containing the structured call | `null` |
+| `use` | resolve, evaluate, cache, and bind module exports | `null` |
+| assignment | evaluate RHS, mutate existing binding or session env | assigned value |
+| `return` | evaluate optional expression | `Flow::Return` |
+| `break` / `continue` | no value evaluation | corresponding flow marker |
+| `for` | convert iterable, bind per-iteration child scope, honor loop flow | `null` |
+| `while` | test condition per iteration in child scope | `null` |
+| expression | evaluate in statement or value position | expression value/flow |
+
+Functions capture the `Env` handle at declaration time. Since environments are interior-mutable
+parent-linked scopes, this is lexical closure capture, not a frozen copy of every visible value.
+
+### Assignment boundary
+
+Although the AST can structurally place any expression on the left side, runtime assignment in
+v0.1 accepts only a variable, plus the special `env.NAME = value` form. Field and index mutation are
+not implemented. Compound variable assignment reads the current value and delegates to
+`shoal_value::ops::binop`.
+
+`env.NAME` accepts only simple `=` and converts through the argv coercion path. It is rejected while
+`in_fn_body > 0`; functions should use a dynamic `with env:` context instead of leaking ambient
+session changes. This is a semantic restriction, not a parser restriction.
+
+## Expression dispatch order
+
+Expression evaluation is not merely a match over node shapes. Several names have ordered special
+resolution rules.
+
+For a variable:
+
+```mermaid
+flowchart TD
+  Name --> Binding{"env.get(name)?"}
+  Binding -->|yes| Bound["return bound value"]
+  Binding -->|no| Anchor{"now or today?"}
+  Anchor -->|yes| Clock["read Clock port"]
+  Anchor -->|no| Command{"known command?"}
+  Command -->|yes| Invoke["invoke zero-argument command in value position"]
+  Command -->|no| Undefined["undefined_var"]
+```
+
+For a function-call node, closure-aware builtins (`parallel`, `retry`, `on`) and evaluator builtins
+(`now`, `today`, `assert`, `run`, `save`, `open`) are intercepted before constructors, environment
+callables, and command fallback. For a method call, `.feed`, `secret.get`, unshadowed namespaces,
+and then generic value methods are checked in that order.
+
+This ordering is part of the language. Adding a new intercepted name can steal a call from a user
+binding unless the implementation applies the same shadowing rule as namespaces.
+
+## Position is semantic context
+
+`Position::Statement` and `Position::Value` tell command and binary-chain evaluation whether output
+belongs to a top-level rendering context or must remain a composable value. The AST deliberately
+does not encode this distinction.
+
+```mermaid
+flowchart LR
+  ExprStmt["Stmt::Expr"] -->|top-level| Statement
+  ExprStmt -->|inside value block| Value
+  Statement --> Commands["command may stream/emit"]
+  Value --> Capture["command outcome remains a value"]
+```
+
+Blocks add another subtlety. They evaluate in a child environment. Intermediate statements can be
+discarded or routed to the sink, while the consumed tail expression becomes the block value. Bare
+commands in discard context still execute as statement-position work; the tail must not be emitted
+and returned twice. Any edit to block evaluation should run the double-echo and command-chain tests.
+
+## Echo and rendering ownership
+
+`EchoMode` controls only intermediate top-level values:
+
+| Mode | Intermediate pure expressions | Intermediate bare commands | Final value |
+|---|---:|---:|---|
+| `All` | emit | emit | returned to host |
+| `Commands` | suppress | emit | host may suppress a non-command final value |
+| `Quiet` | suppress | emit | returned to host |
+
+`sink_value` discards `null`. It also suppresses `Outcome` values with `streamed = true`, because a
+PTY tee already wrote those bytes to the terminal. Captured externals and builtin outcomes have
+`streamed = false` and still need host rendering.
+
+The evaluator never calls `process::exit`. `exit` and `quit` set `pending_exit`; the host calls
+`take_exit` and owns process or session shutdown. Preserving that boundary is essential for the
+kernel, tests, and library embeddings.
+
+## Scope transitions
+
+```mermaid
+flowchart TD
+  Root["session root Env"] --> Block["block child Env"]
+  Root --> Closure["closure captures Env handle"]
+  Closure --> Call["captured_env.child()"]
+  Root --> Module["fresh root Env"]
+  Root --> Loop["per-iteration child Env"]
+  Root --> Dynamic["with: temporary evaluator fields"]
+  Module --> Exports["record copied into caller binding"]
+```
+
+The important asymmetry is module loading: it swaps in a fresh root, so caller locals are invisible.
+Exported closures retain the module environment after the caller environment is restored. A module
+does share the evaluator's effect ports and most session machinery because it runs on the same
+`Evaluator`; contributors should not infer isolation from the fresh lexical root.
+
+## Child evaluator inheritance
+
+Fresh child evaluators used by concurrency/script features must be configured deliberately. The
+`inherit_ports` helper clones `Fs`, `Exec`, `Clock`, `Opener`, `SecretPort`, and `ConfigPort`. The
+language event bus is also explicitly shared where cross-task coordination is promised. The journal
+is intentionally not inherited because its handle is neither a shared transaction coordinator nor
+`Sync`.
+
+Before adding a child-evaluator site, audit this matrix:
+
+| Capability | Usually inherit? | Reason |
+|---|---:|---|
+| effect ports | yes | fake/test/host behavior must remain consistent |
+| event bus | yes | session channels are cross-task coordination |
+| lexical env | feature-dependent | closure children need capture; standalone scripts may not |
+| process environment/cwd | usually snapshot | commands need the caller's dynamic context |
+| adapter catalog | yes when command semantics promise it | otherwise resolution diverges |
+| Reef settings | yes when invoking tools | otherwise constrained commands diverge |
+| Leash principal/policy | yes | a child must not escape confinement |
+| journal handle | no today | single-handle ownership and concurrency semantics unresolved |
+| sink | generally no/direct result channel | competing mutable renderers are unsafe |
+
+### Critical: current children do not satisfy that matrix
+
+The table above is the required security/semantic rule, not a description of current completeness.
+Four production paths construct `Evaluator::new` and manually copy only a subset:
+
+| Child path | Source | Important current omissions |
+|---|---|---|
+| `spawn { ... }` | `script.rs::spawn_block` | Leash policy/principal; Reef chain/resolver/user scope/overrides |
+| `.shl` child runner | `script.rs::run_script_file` | Leash policy/principal; Reef chain/resolver/user scope/overrides |
+| `parallel(...)` | `host.rs::builtin_parallel` | Leash; Reef state; `ConfigPort`; event bus |
+| `on(channel, handler)` | `channels.rs::builtin_on` | Leash; Reef state; `ConfigPort` |
+
+`inherit_ports` itself clones only filesystem, exec, clock, opener, secrets, and config. It cannot
+inherit Leash or Reef, and several child sites do not call it, instead manually copying an even
+smaller set. Consequently external work executed inside a child of a constrained parent can reach
+`resolve_sandbox() == None` and run without the parent's Leash policy; tool resolution can ignore the
+parent's Reef scope/resolver/overrides; config namespace reads can return the empty default.
+
+```mermaid
+flowchart TD
+  Parent["parent Evaluator\nLeash + Reef + Config"] --> ChildNew["Evaluator::new(cwd)"]
+  ChildNew --> Manual["manual field/port copies"]
+  Manual --> Missing["Leash=None\nReef defaults\npossibly empty Config"]
+  Missing --> Spawn["child external command"]
+  Spawn --> Unconfined["resolve_sandbox() → None"]
+  Spawn --> Diverged["different tool/config resolution"]
+```
+
+This is critical architecture/security debt. The repair should be one explicit child-construction
+API parameterized by lexical-environment and journaling policy, with a pinned inheritance test for
+every capability. Do not patch only one child call site.
+
+## Filesystem-port boundary is incomplete
+
+Injected `Fs` covers many reads and mutations, but production evaluation still mixes it with direct
+host `Path`/`std::fs` observations:
+
+| Direct host-path site | Bypassed behavior |
+|---|---|
+| `builtins.rs` `Path::is_dir` | `ls` root and `cp`/`mv` destination branching |
+| `command.rs::cd_target` | directory checks/canonicalization |
+| `frecency.rs` | candidate existence/canonicalization |
+| `modules.rs` | module candidate `is_file` and canonicalization |
+| `script.rs` | script `exists` checks |
+| `streams.rs` | watch/tail existence checks and watch rooting |
+| value/stream method save | direct `OpenOptions` writes |
+
+A fake or policy-aware `Fs` therefore cannot fully interpose filesystem semantics: it may provide
+file bytes while direct host metadata says the path does not exist, or observe writes that bypass
+its enforcement entirely. Port tests prove only the covered calls. Centralizing path metadata,
+canonicalization, open/write, and watcher setup behind capabilities is prerequisite to claiming a
+hexagonal filesystem boundary.
+
+## Cancellation and error spans
+
+The evaluator carries a `CancelToken`, but individual operations must consult or pass it. A new
+long-running loop that never polls cancellation makes host cancellation appear broken even if the
+token is correctly set. Process execution, sleep, stream sources, retries, and waits are primary
+audit sites.
+
+`eval_expr` records the node span and applies it to errors that do not already carry a more precise
+span. Call binding and coercion should preserve the argument/declaration location where possible.
+Do not erase a nested error's span merely to attach the outer expression.
+
+## Known sharp edges
+
+- `JobsSnapshot`'s source comment says suspended is always zero, but implementation now counts
+  suspended tasks. The code behavior is authoritative; the comment needs correction.
+- The evaluator is a large state aggregate. Several child creation paths manually copy fields,
+  making inheritance drift a recurring risk.
+- Child inheritance drift currently drops Leash across all fresh-evaluator paths and drops Reef
+  state broadly, creating a real policy/tool-resolution escape rather than a theoretical risk.
+- Module lexical isolation is stronger than effect isolation; a module can still perform effects.
+- Command names can be invoked by an otherwise-unbound variable expression, so adding a builtin can
+  change an `undefined_var` into execution.
+- Assignment AST generality exceeds runtime support.
+- Environment visible-name order ultimately comes from hash maps and is not a stable presentation
+  contract unless sorted by the caller.
+- `echo_mode`, expression `Position`, `Outcome.streamed`, and host rendering form one distributed
+  presentation state machine. Changing only one layer commonly creates missing or duplicated output.
+
+## Change protocol
+
+When adding evaluator state or semantics:
+
+1. identify the owning source module and all child evaluator construction sites;
+2. write down default, reset, inheritance, persistence, and concurrency behavior;
+3. decide whether the change is syntax-visible, runtime-only, or host configuration;
+4. preserve `Flow` rather than laundering control into errors or ordinary values;
+5. route external work through an existing or new port;
+6. attach the narrowest available source span;
+7. test REPL statement position and value position separately;
+8. test inside a closure, block, module, and spawned child where relevant;
+9. test both with and without journal/Leash/config host wiring;
+10. update the protocol projection if a new value can cross the kernel boundary.
+
+The safest mental model is that `Evaluator` is a small operating session. Every field participates
+in a lifecycle, and every evaluation mode is a different view onto that same lifecycle.

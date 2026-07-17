@@ -30,7 +30,7 @@ pub(crate) fn display_top(v: &Value) -> String {
     }
 }
 
-/// Synthesised `--help` text for a user fn (§4.4).
+/// Synthesised `--help` text for a user fn (site/content/internals/language-conformance-contract.md).
 pub(crate) fn closure_help(c: &shoal_value::ClosureVal) -> String {
     let name = c.name.clone().unwrap_or_else(|| "fn".into());
     let mut params: Vec<String> = c
@@ -72,7 +72,7 @@ pub(crate) fn default_render(v: &Value) {
 
 /// Live wall-clock datetime in the system time zone, sourced from the
 /// evaluator's [`Clock`] port (so tests can pin it). Backs the `now` relative
-/// anchor and duration `.ago`/`.from_now` composition (TDD §2.1).
+/// anchor and duration `.ago`/`.from_now` composition (site/content/internals/language-conformance-contract.md).
 pub(crate) fn now_zoned(clock: &dyn shoal_value::Clock) -> jiff::Zoned {
     let ns = clock.now_ns();
     jiff::Timestamp::from_nanosecond(ns as i128)
@@ -81,7 +81,7 @@ pub(crate) fn now_zoned(clock: &dyn shoal_value::Clock) -> jiff::Zoned {
 }
 
 /// Today at midnight in the system time zone (the `today` relative anchor,
-/// TDD §2.1). Falls back to the raw `now` instant if start-of-day overflows.
+/// site/content/internals/language-conformance-contract.md). Falls back to the raw `now` instant if start-of-day overflows.
 pub(crate) fn today_zoned(clock: &dyn shoal_value::Clock) -> jiff::Zoned {
     let z = now_zoned(clock);
     z.start_of_day().unwrap_or(z)

@@ -1,4 +1,4 @@
-//! reef integration tests (docs/REEF.md §1–§6).
+//! reef integration tests (site/content/internals/reef-resolution.md).
 //!
 //! Every test builds a self-contained tempdir project — a `.reef.toml` plus
 //! fixture "binaries" (shell scripts with a `--version`) — and points the reef
@@ -42,12 +42,12 @@ fn parse(src: &str) -> shoal_ast::Program {
     shoal_syntax::parse(src).expect("fixture source parses")
 }
 
-/// The manifest filenames `ScopeChain::discover` (docs/REEF.md §1) looks for
+/// The manifest filenames `ScopeChain::discover` (site/content/internals/reef-resolution.md) looks for
 /// at every directory on its walk from `cwd` up to the filesystem root.
 const REEF_MANIFEST_NAMES: &[&str] = &[".reef.toml", "mise.toml", ".mise.toml", ".tool-versions"];
 
 /// Some tests assert the "genuinely nothing constrains anything anywhere"
-/// invariant (docs/AGENT-SURFACE.md §12.1) — but `ScopeChain::discover`
+/// invariant (site/content/internals/kernel-protocol.md) — but `ScopeChain::discover`
 /// walks from `dir` all the way to the real filesystem root, including the
 /// shared OS temp dir every `tempfile::tempdir()` nests under. That walk is
 /// only actually empty when no ancestor directory happens to contain a
@@ -68,7 +68,7 @@ fn panic_if_ancestor_reef_pollution(dir: &Path) {
                 panic!(
                     "ambient reef-manifest pollution detected above this test's own tempdir: \
                      {candidate:?} exists and was NOT created by this test. \
-                     ScopeChain::discover (docs/REEF.md §1) walks from cwd to the filesystem \
+                     ScopeChain::discover (site/content/internals/reef-resolution.md) walks from cwd to the filesystem \
                      root, so this file makes the scope chain non-empty and breaks this test's \
                      \"nothing constrains anything\" premise. This is environmental \
                      contamination (e.g. a stray manifest left in a shared /tmp by an unrelated \
@@ -202,7 +202,7 @@ fn reef_builtin_lists_bindings() {
         panic!("reef should carry a table, got {:?}", o.parsed);
     };
     // Find `faketool`'s own row rather than asserting `rows.len() == 1`:
-    // `ScopeChain::discover` (docs/REEF.md §1) walks from `dir` all the way
+    // `ScopeChain::discover` (site/content/internals/reef-resolution.md) walks from `dir` all the way
     // to the filesystem root, so on a host whose ancestor tree happens to
     // constrain some OTHER tool too (an ambient `~/mise.toml`, a stray
     // manifest left in a shared `/tmp` by unrelated reef testing, ...) the
@@ -330,7 +330,7 @@ fn unmentioned_tool_is_passthrough_even_under_script_policy() {
 #[test]
 fn prompt_reef_snapshot_empty_with_no_manifest() {
     // No `.reef.toml`/`mise.toml`/etc anywhere above cwd ⇒ empty snapshot, no
-    // panics, no filesystem surprises (docs/AGENT-SURFACE.md §12.1).
+    // panics, no filesystem surprises (site/content/internals/kernel-protocol.md).
     let dir = tempfile::tempdir().unwrap();
     panic_if_ancestor_reef_pollution(dir.path());
     let mut ev = Evaluator::new(dir.path().to_path_buf());

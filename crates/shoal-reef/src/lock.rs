@@ -1,5 +1,5 @@
 //! The lock — `reef.lock`, a committed TOML file recording every resolved tool
-//! (REEF.md §2). Lives next to the project manifest, or in the user state dir
+//! (site/content/internals/reef-resolution.md). Lives next to the project manifest, or in the user state dir
 //! for the user scope.
 
 use std::collections::BTreeMap;

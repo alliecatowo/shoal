@@ -1,4 +1,4 @@
-//! Free helper functions used by module rendering (§4): path/branch
+//! Free helper functions used by module rendering (site/content/internals/prompt-editor-lsp.md): path/branch
 //! truncation, home-dir collapsing, version trimming, and the tiny
 //! strftime subset used by `$time`.
 
@@ -43,7 +43,7 @@ pub(super) fn truncate_branch(branch: &str, n: usize, symbol: &str) -> String {
     format!("{head}{symbol}")
 }
 
-/// Drop the patch component of a semver-ish version (§4.12: "no patch").
+/// Drop the patch component of a semver-ish version (site/content/internals/prompt-editor-lsp.md: "no patch").
 pub(super) fn short_version(v: &str) -> String {
     let parts: Vec<&str> = v.split('.').collect();
     if parts.len() >= 3 {
@@ -53,7 +53,7 @@ pub(super) fn short_version(v: &str) -> String {
     }
 }
 
-/// A tiny strftime subset over `(hour, min, sec)` only (§4.9 — no date in v1).
+/// A tiny strftime subset over `(hour, min, sec)` only (site/content/internals/prompt-editor-lsp.md — no date in v1).
 pub(super) fn strftime_hms(fmt: &str, h: u8, m: u8, s: u8) -> String {
     let mut out = String::with_capacity(fmt.len());
     let mut chars = fmt.chars().peekable();

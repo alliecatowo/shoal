@@ -1,5 +1,5 @@
-//! Criterion bench for the common-path render (design §13). Run in CI on every
-//! PR touching shoal-prompt; the p99 contract is < 5 ms (§1) — on real hardware
+//! Criterion bench for the common-path render (site/content/internals/prompt-editor-lsp.md). Run in CI on every
+//! PR touching shoal-prompt; the p99 contract is < 5 ms (site/content/internals/prompt-editor-lsp.md) — on real hardware
 //! this reads low tens of µs. A regression that reintroduces a syscall on the
 //! render path would show up here before it shows up in a user's terminal.
 

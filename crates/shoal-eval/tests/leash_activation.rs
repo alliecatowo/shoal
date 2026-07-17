@@ -1,4 +1,4 @@
-//! Leash activation through the evaluator spawn path (TDD §8).
+//! Leash activation through the evaluator spawn path (site/content/internals/language-conformance-contract.md).
 //!
 //! These tests prove the wiring the audit found missing: a leash policy set on
 //! the `Evaluator` (via `set_leash_policy`) is turned into a real OS sandbox
@@ -175,7 +175,7 @@ fn scoped_policy_blocks_a_denied_sibling_through_the_eval_spawn_path() {
     }
 }
 
-// ---- TDD §8 binary-content-hash spawn pinning (end-to-end) --------------
+// ---- site/content/internals/language-conformance-contract.md binary-content-hash spawn pinning (end-to-end) --------------
 //
 // These travel the SAME `eval_program` → `run_argv` → `spawn_gate` path as a
 // real command, and — unlike the OS-sandbox assertions above — the pin is

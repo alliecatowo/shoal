@@ -93,7 +93,7 @@ value='"a\\nb"'
 [[case]]
 name="string-escape"
 # One backslash-n escape in an interpolating string is a real newline char;
-# render_inline re-escapes it back to the two-character `\n` form (CONTRACTS §3).
+# render_inline re-escapes it back to the two-character `\n` form (site/content/internals/intercrate-protocol-contracts.md).
 src='"a\nb"'
 value='"a\nb"'
 [[case]]

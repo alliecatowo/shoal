@@ -23,7 +23,7 @@ impl Evaluator {
                 "pid" => Ok(Value::Int(o.pid as i64)),
                 "cmd" => Ok(Value::Str(o.cmd.clone())),
                 // Raw stream bytes are always reachable, even on failure. A
-                // §317-spilled capture surfaces here as a lazy, ref-backed
+                // spilled capture surfaces here as lazy, ref-backed
                 // `bytes` (true `.len`, on-demand load); ordinary output is the
                 // resident `bytes` exactly as before.
                 "stdout" => Ok(o.stdout_value()),
@@ -70,7 +70,7 @@ impl Evaluator {
                 )),
             },
             // Calendar-component fields on a datetime (backs `now.year`, the
-            // TDD §2.1 relative-anchor probe, and tagged-literal access).
+            // site/content/internals/language-conformance-contract.md relative-anchor probe, and tagged-literal access).
             Value::DateTime(z) => match name {
                 "year" => Ok(Value::Int(z.year() as i64)),
                 "month" => Ok(Value::Int(z.month() as i64)),
@@ -83,7 +83,7 @@ impl Evaluator {
                     format!("datetime has no field `{name}`"),
                 )),
             },
-            // Duration relative-anchor composition (TDD §2.1): `30d.ago` /
+            // Duration relative-anchor composition (site/content/internals/language-conformance-contract.md): `30d.ago` /
             // `1h.from_now` resolve against the live wall clock into a datetime.
             Value::Duration(ns) => match name {
                 "ago" | "from_now" => {
@@ -101,7 +101,7 @@ impl Evaluator {
                     format!("duration has no field `{name}`"),
                 )),
             },
-            // A glob VALUE exposes its source `.pattern` (docs/CONTRACTS.md §3);
+            // A glob VALUE exposes its source `.pattern` (site/content/internals/intercrate-protocol-contracts.md);
             // its matches are reached with `.expand()` or any collection method.
             Value::Glob(g) => match name {
                 "pattern" => Ok(Value::Str(g.pattern.clone())),
@@ -114,7 +114,7 @@ impl Evaluator {
             // shorthand in implicit lambdas reaches them — `glob("*.rs").map(.name)`,
             // `ls.where(.size > 1mb)`, `glob("*.toml").map(.read.parse_toml())`.
             // Pure components resolve without IO; the fs-backed accessors route
-            // through the `Fs` port via `path_fs_method` (docs/CONTRACTS.md §3).
+            // through the `Fs` port via `path_fs_method` (site/content/internals/intercrate-protocol-contracts.md).
             // Only the argument-taking methods (`.join`/`.abs`/`.save`/`.append`)
             // stay method-only — a bare `.field` can't carry their argument.
             Value::Path(p) => {
@@ -189,7 +189,7 @@ impl Evaluator {
         span: Span,
     ) -> VResult<Value> {
         // A bare `val:blake3:<hash>` content ref written as a value (the
-        // short-ref form `.ref` yields) is resolvable in-language (TDD §317
+        // short-ref form `.ref` yields) is resolvable in-language (site/content/internals/language-conformance-contract.md
         // follow-up): load its bytes from this session's journal CAS and
         // re-dispatch on the resulting lazy `bytes`, so a recovered ref answers
         // `.len`, materializes, etc. exactly like the capture it came from. A
@@ -209,7 +209,7 @@ impl Evaluator {
         } else if let Some(chan) = crate::channels::as_channel(&v)
             && matches!(name, "emit" | "events" | "latest" | "take")
         {
-            // In-language `channel(name)` ops (docs/STREAMS.md §2.5, §7): wired
+            // In-language `channel(name)` ops (site/content/internals/streams-channels.md): wired
             // here (not methods.rs) because they reach the session event bus,
             // which shoal-value cannot see.
             let chan = chan.to_string();
@@ -235,7 +235,7 @@ impl Evaluator {
                     | "modified"
             )
         {
-            // Filesystem-backed path methods (docs/CONTRACTS.md §3) route
+            // Filesystem-backed path methods (site/content/internals/intercrate-protocol-contracts.md) route
             // through the evaluator's Fs port, resolving against cwd. They
             // take no arguments.
             if !args.pos.is_empty() || !args.named.is_empty() {
@@ -247,7 +247,7 @@ impl Evaluator {
             self.path_fs_method(&p, name).map_err(|e| e.or_span(span))
         } else if let Value::Glob(g) = &v {
             // A glob VALUE behaves as a lazy collection of its matches
-            // (TDD §4.3): `.pattern`/`.expand()` are glob-native; every other
+            // (site/content/internals/language-conformance-contract.md): `.pattern`/`.expand()` are glob-native; every other
             // method expands the glob to a sorted `list<path>` and re-dispatches
             // on that list, so `glob("*.rs").map(…)`, `.len()`, `.first(3)`, etc.
             // all work. (Passing a glob AS a command argument still expands at
@@ -277,7 +277,7 @@ impl Evaluator {
             && r.get(name).is_some_and(Value::is_callable)
         {
             // A callable record field is invoked as a method — this is how a
-            // module fn runs as `deploy.build(...)` (ROADMAP R3 modules) and how
+            // module fn runs as `deploy.build(...)` (site/content/internals/roadmap-and-priorities.md modules) and how
             // any record-of-closures dispatches.
             let f = r.get(name).cloned().expect("callable field present");
             let a = self.eval_args(args)?;
@@ -313,7 +313,7 @@ impl Evaluator {
         }
     }
     /// Filesystem-backed `path` methods (`.read`/`.read_bytes`/`.lines`/
-    /// `.exists`/`.is_dir`/`.is_file`/`.size`/`.modified`, docs/CONTRACTS.md §3).
+    /// `.exists`/`.is_dir`/`.is_file`/`.size`/`.modified`, site/content/internals/intercrate-protocol-contracts.md).
     /// These live in the evaluator rather than `shoal-value::methods` because
     /// they perform IO — routed through the [`Fs`] port so a fake can interpose
     /// — and resolve relative paths against the session cwd.
@@ -375,11 +375,11 @@ impl Evaluator {
             Value::List(xs) => Ok(xs),
             Value::Table(rs) => Ok(rs.into_iter().map(Value::Record).collect()),
             Value::Range(r) => Ok(r.iter().map(Value::Int).collect()),
-            // Iterating a glob VALUE expands its matches (TDD §4.3): `for f in
+            // Iterating a glob VALUE expands its matches (site/content/internals/language-conformance-contract.md): `for f in
             // glob("*.rs")` walks the sorted `list<path>`. (Passing a glob as a
             // command argument still expands at the callee — that is unchanged.)
             Value::Glob(g) => self.expand_glob(&g),
-            // Iterating a stream in a `for` drives it to completion (STREAMS §4);
+            // Iterating a stream in a `for` drives it to completion (site/content/internals/streams-channels.md);
             // an endless stream errors `stream_unbounded` — use `.each(f)` for
             // those, or bound it with `.take`/`.take_until` first.
             Value::Stream(s) => shoal_value::collect_stream(self, &s),
@@ -387,7 +387,7 @@ impl Evaluator {
         }
     }
 
-    /// `.feed` (IO.md §1): pipe a value's serialized bytes into a command's
+    /// `.feed` (site/content/internals/values-streams-execution.md): pipe a value's serialized bytes into a command's
     /// stdin, returning the command's outcome. Handles both spellings —
     /// `value.feed(cmd)` (canonical) and `cmd.feed(value)` (inverted) — by
     /// classifying which operand is the command node.

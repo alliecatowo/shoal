@@ -10,7 +10,7 @@
 # more.toml's documented guard/lambda conflict): `match EXPR { … }` where
 # `EXPR`'s own postfix chain (a call OR a bare field access) sits directly
 # against the `{` hits the trailing-block-sugar grammar (`postfix = primary {
-# "." IDENT [call] [trailing] | … }`, TDD §3.4's `f(a) { … }` row) — the
+# "." IDENT [call] [trailing] | … }`, site/content/internals/language-conformance-contract.md `f(a) { … }` row) — the
 # parser attaches the match's own `{ }` to the scrutinee as a trailing-block
 # argument instead of treating it as the match body, so both `match
 # path("a.txt") { path p => … }` and `match x.out { table t => … }` are

@@ -31,7 +31,7 @@ impl<'s> Parser<'s> {
                     Ok((Tok::FatArrow, _))
                 ) {
                     // `x => …` is the bare single-param lambda shorthand
-                    // (TDD §3.2 primary alternative), never a zero-arg
+                    // (site/content/internals/language-conformance-contract.md primary alternative), never a zero-arg
                     // command named `x` — dispatch EXPR so `(x => x + 1)`
                     // (grouped, or immediately called) parses as a lambda
                     // instead of `x` with argv `["=", ">", "x", "+", "1"]`.
@@ -139,7 +139,7 @@ impl<'s> Parser<'s> {
                 Tok::Amp => {
                     let (_, amp_s) = self.bump(Mode::Cmd)?;
                     // `&>` / `&>>` — the box-era stream-merging redirect
-                    // (IO.md §4). Without this check it silently reparses as
+                    // (site/content/internals/values-streams-execution.md). Without this check it silently reparses as
                     // `(cmd &) > f`, a backgrounded command compared to a
                     // variable.
                     if let Ok((Tok::RedirOut | Tok::RedirAppend, s2)) =
@@ -164,7 +164,7 @@ impl<'s> Parser<'s> {
                 }
                 Tok::RedirIn => {
                     // `<<` (heredoc) / `<<<` (here-string) — box-era spellings
-                    // with curated teaching errors (IO.md §4).
+                    // with curated teaching errors (site/content/internals/values-streams-execution.md).
                     if let Ok((Tok::RedirIn, s2)) = self.lx.token(s.end as usize, Mode::Cmd)
                         && s2.start == s.end
                     {
@@ -199,7 +199,7 @@ impl<'s> Parser<'s> {
                     });
                 }
                 Tok::RedirOut | Tok::RedirAppend => {
-                    // `2>` / `1>>` — fd-numbered redirects (IO.md §4): a bare
+                    // `2>` / `1>>` — fd-numbered redirects (site/content/internals/values-streams-execution.md): a bare
                     // digit word glued to the redirect. Without this check the
                     // digit silently passes as an ARGUMENT and the redirect
                     // grabs stdout — the opposite of the user's intent.
@@ -256,7 +256,7 @@ impl<'s> Parser<'s> {
         let (t, s) = self.bump(Mode::Cmd)?;
         Ok(match t {
             Tok::Word(text) => CmdArg::Word { text, span: s },
-            // `IDENT=rest` is an env-prefix only AT HEAD POSITION (TDD §2.2 —
+            // `IDENT=rest` is an env-prefix only AT HEAD POSITION (site/content/internals/language-conformance-contract.md —
             // the lexer classifies by shape and "the parser decides"). As an
             // argument it is a plain word: `echo FOO=bar`, `make CC=gcc`.
             Tok::EnvAssign(name, rest) => CmdArg::Word {

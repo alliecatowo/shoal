@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
+  <defs>
+    <radialGradient id="g1" cx="0" cy="0" r="1" gradientTransform="translate(945 130) rotate(138) scale(620 520)" gradientUnits="userSpaceOnUse"><stop stop-color="#553e94" stop-opacity=".58"/><stop offset="1" stop-color="#07111f" stop-opacity="0"/></radialGradient>
+    <radialGradient id="g2" cx="0" cy="0" r="1" gradientTransform="translate(210 620) rotate(-62) scale(520 700)" gradientUnits="userSpaceOnUse"><stop stop-color="#194678" stop-opacity=".52"/><stop offset="1" stop-color="#07111f" stop-opacity="0"/></radialGradient>
+    <pattern id="grid" width="64" height="64" patternUnits="userSpaceOnUse"><path d="M64 0H0V64" fill="none" stroke="#b5cae8" stroke-opacity=".055"/></pattern>
+    <linearGradient id="word" x1="83" y1="245" x2="770" y2="446" gradientUnits="userSpaceOnUse"><stop stop-color="#f1f5ff"/><stop offset="1" stop-color="#c9d3e7"/></linearGradient>
+  </defs>
+  <rect width="1200" height="630" rx="28" fill="#07111f"/>
+  <rect width="1200" height="630" rx="28" fill="url(#g1)"/><rect width="1200" height="630" rx="28" fill="url(#g2)"/><rect width="1200" height="630" rx="28" fill="url(#grid)"/>
+  <path d="M82 89h36" stroke="#eb8bc5"/><text x="133" y="96" fill="#a8b1c6" font-family="monospace" font-size="18" letter-spacing="3">THE SHELL, PAST THE PIPE</text>
+  <text x="78" y="310" fill="url(#word)" font-family="sans-serif" font-size="116" font-weight="700" letter-spacing="-7">Structure all</text>
+  <text x="78" y="423" fill="#bd9cff" font-family="sans-serif" font-size="116" font-weight="600" font-style="italic" letter-spacing="-7">the way down.</text>
+  <text x="84" y="511" fill="#a8b1c6" font-family="sans-serif" font-size="25">A structured shell for humans and agents.</text>
+  <rect x="914" y="238" width="198" height="198" rx="46" fill="#0a1431" stroke="#8c78e6" stroke-opacity=".3"/>
+  <path fill="#c7a3ee" d="M1013 267c16 0 25 13 29 22 10-7 28-4 35 8 8 14-1 27-7 32 8 7 11 22 3 33-7 10-19 10-27 8-3 19-13 38-33 46-21-8-31-27-34-46-8 2-20 2-27-8-8-11-5-26 3-33-6-5-15-18-7-32 7-12 25-15 35-8 4-9 13-22 30-22Z"/>
+  <path fill="#775bd2" d="M972 335c13-13 26-14 37-3-13 12-26 13-37 3Zm81 19c-12 12-24 13-34 3 12-11 24-12 34-3Z"/>
+  <path d="M82 566h1036" stroke="#b5cae8" stroke-opacity=".12"/>
+  <text x="84" y="597" fill="#718099" font-family="monospace" font-size="15">shoal · typed values · reproducible tools · structured sessions</text>
+</svg>

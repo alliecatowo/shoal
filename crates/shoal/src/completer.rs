@@ -1,5 +1,5 @@
 //! `ShoalCompleter` — a real `reedline::Completer` that dispatches on cursor
-//! context using the modal lexer (TDD §3.1's statement-dispatch rule,
+//! context using the modal lexer (site/content/internals/language-conformance-contract.md statement-dispatch rule,
 //! approximated), instead of a flat startup-snapshot word list.
 //!
 //! Contexts:
@@ -62,7 +62,7 @@ pub struct ShoalCompleter {
     adapters: Vec<AdapterCatalog>,
     adapter_names: Vec<String>,
     path_cache: HashMap<PathBuf, (Option<SystemTime>, Vec<String>)>,
-    /// `completion.fuzzy` (docs/CONFIG.md §5): allow typo-tolerant,
+    /// `completion.fuzzy` (site/content/internals/configuration-reference.md): allow typo-tolerant,
     /// non-contiguous matches instead of requiring a strict prefix.
     fuzzy: bool,
     /// `completion.case_insensitive`.
@@ -98,7 +98,7 @@ impl ShoalCompleter {
         }
     }
 
-    /// Apply `[completion]` config (docs/CONFIG.md §5). Builder-style so
+    /// Apply `[completion]` config (site/content/internals/configuration-reference.md). Builder-style so
     /// existing `ShoalCompleter::new(...)` call sites are unaffected when a
     /// caller (a test, an embedder) doesn't need config-driven behavior.
     pub fn configure(mut self, fuzzy: bool, case_insensitive: bool, max_results: usize) -> Self {
@@ -152,7 +152,7 @@ impl ShoalCompleter {
     }
 
     /// Match `name` against `prefix` per `[completion]` config
-    /// (docs/CONFIG.md §5): case-(in)sensitively per `case_insensitive`, and
+    /// (site/content/internals/configuration-reference.md): case-(in)sensitively per `case_insensitive`, and
     /// via a non-contiguous subsequence test — a strict superset of prefix
     /// matching, so it's exactly "typo-tolerant / non-contiguous matches,
     /// not just prefix" — rather than a strict prefix when `fuzzy` is set.
@@ -217,7 +217,7 @@ impl ShoalCompleter {
 
     /// `--flag`/`-x` candidates for a known command head: adapter params
     /// (top-level + all subcommands) and short flags, plus a session
-    /// function's own parameter names (TDD §1.6: "flag parsing derived from
+    /// function's own parameter names (site/content/internals/language-conformance-contract.md: "flag parsing derived from
     /// the signature").
     fn flag_candidates(&self, head: &str, prefix: &str) -> Vec<String> {
         let mut names: BTreeSet<String> = BTreeSet::new();
@@ -338,7 +338,7 @@ fn subsequence_match(haystack: &str, needle: &str) -> bool {
     needle.chars().all(|nc| chars.any(|hc| hc == nc))
 }
 
-/// Sort, dedup, cap to `completion.max_results` (docs/CONFIG.md §5), and
+/// Sort, dedup, cap to `completion.max_results` (site/content/internals/configuration-reference.md), and
 /// convert to reedline `Suggestion`s.
 fn finish(mut names: Vec<String>, start: usize, pos: usize, max_results: usize) -> Vec<Suggestion> {
     names.sort();
@@ -575,7 +575,7 @@ fn statement_start(line: &str, pos: usize) -> usize {
 }
 
 /// Walk CMD-mode tokens from `scan_pos` (using the lexer's own word
-/// boundaries — TDD §2.2) to find the word containing `pos`.
+/// boundaries — site/content/internals/language-conformance-contract.md) to find the word containing `pos`.
 fn cmd_word_at(lx: &Lexer, mut scan_pos: usize, pos: usize, line: &str) -> Option<(usize, String)> {
     loop {
         let next_sig = lx.skip_trivia(scan_pos);
@@ -594,7 +594,7 @@ fn cmd_word_at(lx: &Lexer, mut scan_pos: usize, pos: usize, line: &str) -> Optio
     }
 }
 
-/// Classify the cursor position per TDD §3.1's statement-dispatch rule,
+/// Classify the cursor position per site/content/internals/language-conformance-contract.md statement-dispatch rule,
 /// approximated well enough for completion purposes: keyword / bound-variable
 /// / assignment-target first words dispatch EXPR; everything else dispatches
 /// COMMAND (CMD-mode word boundaries for the rest of the statement).
@@ -1256,7 +1256,7 @@ flags  = { short = { s = "short" } }
         );
     }
 
-    /// `completion.fuzzy = false` (docs/CONFIG.md §5): only strict prefix
+    /// `completion.fuzzy = false` (site/content/internals/configuration-reference.md): only strict prefix
     /// matches, no non-contiguous "typo-tolerant" candidates.
     #[test]
     fn fuzzy_false_restricts_to_strict_prefix_matches() {
@@ -1318,7 +1318,7 @@ flags  = { short = { s = "short" } }
         assert!(c.expr_candidates("MyTh").iter().any(|n| n == "MyThing"));
     }
 
-    /// `completion.max_results` caps the candidate list (docs/CONFIG.md §5).
+    /// `completion.max_results` caps the candidate list (site/content/internals/configuration-reference.md).
     #[test]
     fn max_results_caps_the_candidate_list() {
         let dir = tempfile::tempdir().unwrap();

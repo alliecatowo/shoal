@@ -1,4 +1,4 @@
-//! Runners (REEF.md §5): content-type resolution keyed on file extension,
+//! Runners (site/content/internals/reef-resolution.md): content-type resolution keyed on file extension,
 //! falling back to a shebang sniff. `resolve_runner` answers "how do I run
 //! `./script.py`" by mapping the extension (or `#!` line) to a tool name plus an
 //! argv template. The named tool is itself resolved through reef by the caller.

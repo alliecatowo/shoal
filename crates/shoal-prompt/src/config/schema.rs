@@ -1,8 +1,8 @@
-//! Unknown-key validation (§3.2, §11): the allow-list of keys per table
+//! Unknown-key validation (site/content/internals/prompt-editor-lsp.md): the allow-list of keys per table
 //! path, walked recursively over the merged config value before it is
 //! deserialized into [`super::PromptConfig`].
 
-/// Warn about unknown keys anywhere in the prompt table (§3.2, §11). Dynamic
+/// Warn about unknown keys anywhere in the prompt table (site/content/internals/prompt-editor-lsp.md). Dynamic
 /// `module.language.<tool>` / `module.custom.<name>` inner keys are validated
 /// against their own schema; the user-chosen table name itself is never flagged.
 pub(super) fn validate_keys(v: &toml::Value, warnings: &mut Vec<String>) {

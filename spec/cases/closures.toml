@@ -1,4 +1,4 @@
-# Control-flow and closure hardening: lexical capture (TDD §4.6 "Lexical
+# Control-flow and closure hardening: lexical capture (site/content/internals/language-conformance-contract.md "Lexical
 # scoping"), recursion, higher-order functions returning closures,
 # for/while `break`/`continue`, and nested try/catch recovery. Deterministic,
 # spec-derived expectations (render_inline form).

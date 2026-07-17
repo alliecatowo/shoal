@@ -1,16 +1,16 @@
-# CMD-mode word binding hardening, round 2 (TDD §4.4 / §4.2 site 2):
+# CMD-mode word binding hardening (`site/content/internals/language-conformance-contract.md`):
 # `--flag value` consuming the next word for a non-bool-typed parameter
 # (exactly like `--flag=value`), strict arity — excess positionals without a
 # `...rest` and unknown named arguments are arg_errors, never silent drops —
 # a `duration`-typed param binding a bare integer word AS a duration
 # (seconds), `list<T>` params coercing per element on the EXPR-call path
-# too, and `.shl` scripts running in a FRESH lexical scope (IO.md §3.2
+# too, and `.shl` scripts running in a FRESH lexical scope (site/content/internals/values-streams-execution.md
 # step 4) so their bindings never leak into the parent session.
 # Companion suites: coercion.toml word-bind-*, fn-param-binding-more.toml.
 # (`^head` adapter bypass is unit-tested in shoal-eval — the corpus
 # evaluator carries no adapters.)
 
-# --- `--flag value` binds the next word to a non-bool param (TDD §4.4) ---
+# --- `--flag value` binds the next word to a non-bool param (site/content/internals/language-conformance-contract.md) ---
 
 [[case]]
 name = "wb2-flag-next-word-binds-value"
@@ -56,7 +56,7 @@ fn f(a: str, force: bool = false) { [a, force] }
 '''
 value = '["x", true]'
 
-# --- strict arity: no silent drops (TDD §4.4) ---
+# --- strict arity: no silent drops (site/content/internals/language-conformance-contract.md) ---
 
 [[case]]
 name = "wb2-excess-positionals-are-arg-error"
@@ -94,7 +94,7 @@ f 1 2 3
 '''
 value = "2"
 
-# --- bare-int word binds a duration param AS a duration (TDD §4.2 site 2) ---
+# --- bare-int word binds a duration param AS a duration -------------------
 
 [[case]]
 name = "wb2-duration-bare-int-word-binds-seconds"
@@ -149,7 +149,7 @@ f(["nope"])
 error = "arg_error"
 error_contains = "expected int"
 
-# --- .shl scripts get a fresh lexical scope (IO.md §3.2 step 4) ---
+# --- .shl scripts get a fresh lexical scope -------------------------------
 
 [[case]]
 name = "wb2-shl-script-lets-do-not-leak-into-parent"

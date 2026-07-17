@@ -1,4 +1,4 @@
-//! Config-driven keybinding parsing (docs/CONFIG.md `[editor.keybindings]`,
+//! Config-driven keybinding parsing (site/content/internals/configuration-reference.md `[editor.keybindings]`,
 //! `chord -> action`, e.g. `"ctrl-r" = "history_search_backward"`).
 //!
 //! reedline's own keybinding tables are always typed Rust values
@@ -118,7 +118,7 @@ fn parse_chord(chord: &str) -> Option<(KeyModifiers, KeyCode)> {
 /// shell-editing actions (history search/navigation, screen clearing, the
 /// completion menu, a handful of unparameterized `EditCommand`s); reedline's
 /// many `select`/`MotionTarget`-parameterized edit commands have no plain
-/// string form and are not represented here (docs/CONFIG.md's "read-today vs
+/// string form and are not represented here (site/content/internals/configuration-reference.md's "read-today vs
 /// schema-only" note).
 fn parse_action(action: &str) -> Option<ReedlineEvent> {
     Some(match action {

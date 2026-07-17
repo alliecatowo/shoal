@@ -1,0 +1,16 @@
+{% import "macros/icons.html" as icons %}
+<footer class="site-footer">
+  <div class="footer-inner">
+    <div class="footer-mark">
+      <img src="{{ get_url(path="img/logo-96.webp") }}" width="42" height="42" alt="">
+      <p><strong>shoal</strong><span>A structured shell for humans and agents.</span></p>
+    </div>
+    <nav aria-label="Footer navigation">
+      <a href="{{ get_url(path="@/docs/_index.md") }}">Docs</a>
+      <a href="{{ get_url(path="@/internals/_index.md") }}">Internals</a>
+      <a href="{{ config.extra.repository_url }}">GitHub {{ icons::icon(name="external") }}</a>
+      <a href="{{ config.extra.issue_url }}">Report an issue {{ icons::icon(name="external") }}</a>
+    </nav>
+    <p class="footer-meta">Built with Zola. Shoal is dual-licensed under MIT or Apache-2.0.</p>
+  </div>
+</footer>

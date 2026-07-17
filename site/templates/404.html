@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+
+{% block title %}Lost at sea · Shoal{% endblock title %}
+{% block body_class %}error-page{% endblock body_class %}
+{% block head %}<meta name="robots" content="noindex">{% endblock head %}
+
+{% block body %}
+<main id="main-content" class="error-main">
+  <div class="error-current" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
+  <div class="error-code" aria-hidden="true">404</div>
+  <p class="eyebrow">No value at this path</p>
+  <h1>This current goes nowhere.</h1>
+  <p>The page may have moved while the manual was evolving. Search the docs or return to known waters.</p>
+  <div class="error-actions"><button class="button button-primary" type="button" data-search-open>Search the manual</button><a class="button button-secondary" href="{{ get_url(path="@/_index.md") }}">Back home</a></div>
+</main>
+{% endblock body %}

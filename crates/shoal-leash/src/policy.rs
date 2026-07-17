@@ -65,7 +65,7 @@ pub struct PrincipalPolicy {
     pub auto_apply: AutoApply,
     #[serde(default)]
     pub opaque: OpaqueMode,
-    /// TDD §8 hermetic intent: when `true`, a child spawn built from this
+    /// site/content/internals/language-conformance-contract.md hermetic intent: when `true`, a child spawn built from this
     /// principal demands a hard guarantee — [`crate::SandboxPolicy::hermetic`]
     /// is set, so the exec layer refuses to spawn rather than run with any
     /// requested dimension unenforced. `false` (the default) is best-effort:
@@ -118,7 +118,7 @@ impl Policy {
     }
 
     /// Whether `principal` pins process spawns — i.e. declares a non-empty
-    /// `proc_spawn` allowlist. This is the explicit guard for TDD §8's
+    /// `proc_spawn` allowlist. This is the explicit guard for site/content/internals/language-conformance-contract.md
     /// "empty grants ⇒ allow" contract at the *spawn* boundary.
     ///
     /// When this returns `false` (an unknown principal, or one with no
@@ -194,7 +194,7 @@ impl Policy {
         }
     }
 
-    /// The default-permissive policy for `principal` (TDD §8): allow every
+    /// The default-permissive policy for `principal` (site/content/internals/language-conformance-contract.md): allow every
     /// effect, filesystem read/write/delete unrestricted, so enforcement is a
     /// genuine no-op and normal use never regresses. Human principals get this
     /// by default; agent principals are the ones that get scoped down.
@@ -208,7 +208,7 @@ impl Policy {
         .expect("built-in permissive policy")
     }
 
-    /// Path of the per-user leash policy (TDD §8): `$XDG_CONFIG_HOME/shoal/leash.toml`
+    /// Path of the per-user leash policy (site/content/internals/language-conformance-contract.md): `$XDG_CONFIG_HOME/shoal/leash.toml`
     /// or, absent that, `~/.config/shoal/leash.toml`. `None` when neither
     /// `XDG_CONFIG_HOME` nor `HOME` is set (no home to anchor config to).
     pub fn user_leash_path() -> Option<PathBuf> {
@@ -226,7 +226,7 @@ impl Policy {
     /// Load the per-user leash policy from [`Policy::user_leash_path`] if it
     /// exists and parses, otherwise fall back to [`Policy::permissive`] for
     /// `principal`. A missing or malformed file never bricks the shell — it
-    /// degrades to permissive so normal use keeps working (TDD §8: honesty is
+    /// degrades to permissive so normal use keeps working (site/content/internals/language-conformance-contract.md: honesty is
     /// surfaced at attach, not by refusing to run).
     pub fn load_user_or_permissive(principal: &str) -> Policy {
         match Self::user_leash_path() {

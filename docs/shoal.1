@@ -1,41 +1,0 @@
-.TH SHOAL 1 "July 2026" "shoal 0.1.0" "User Commands"
-.SH NAME
-shoal \- structured, agent-native shell
-.SH SYNOPSIS
-.B shoal
-[IOPTIONSR] [ISCRIPTR]
-.br
-.B shoal
-fmt [--check] [IFILESR...]
-.br
-.B shoal
-doctor [--json]
-.br
-.B shoal
-lsp | mcp | completions ISHELLR
-.SH DESCRIPTION
-With no arguments on a terminal, starts the interactive shell. With a script
-or standard input, evaluates deterministically without interactive init files.
-.SH OPTIONS
-.TP
-.BR -c , " --command " ISOURCER
-Evaluate source and exit.
-.TP
-.BR -h , " --help"
-Print command help.
-.TP
-.BR -V , " --version"
-Print the version.
-.SH DEVELOPER COMMANDS
-.TP
-.B fmt
-Canonical formatting; --check exits 1 when changes are required.
-.TP
-.B doctor
-Installation and enforcement diagnostics; --json emits structured output.
-.TP
-.B lsp, mcp
-Launch the corresponding companion process from PATH.
-.TP
-.B completions
-Generate bash, zsh, or fish completion source.

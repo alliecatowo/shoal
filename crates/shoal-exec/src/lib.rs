@@ -1,7 +1,7 @@
 //! Process execution engine for the shoal shell.
 //!
 //! Blocking and thread-based (no async runtime). Two execution modes, per
-//! TDD §1.2 (the PTY position rule — this crate implements the mechanism):
+//! site/content/internals/language-conformance-contract.md (the PTY position rule — this crate implements the mechanism):
 //!
 //! - [`ExecMode::Capture`] — value position: stdout/stderr are pipes, stdin is
 //!   configured per [`StdinSpec`], the child has no controlling tty and is
@@ -15,17 +15,17 @@
 //!   process has no tty (tests, CI), the child still gets a PTY but raw mode
 //!   and stdin forwarding are skipped gracefully.
 //!
-//! Cancellation (TDD §4.7): a [`CancelToken`] is polled roughly every 50 ms;
+//! Cancellation (site/content/internals/language-conformance-contract.md): a [`CancelToken`] is polled roughly every 50 ms;
 //! once cancelled, the child's *process group* receives `SIGINT`, escalating
 //! to `SIGTERM` after 3 s and `SIGKILL` after 3 more. The run then returns
 //! normally with the fatal signal recorded by name.
 //!
-//! Signal deaths (TDD §13.6) surface as `signal: Some("SIGSEGV")` etc. with
+//! Signal deaths (site/content/internals/language-conformance-contract.md) surface as `signal: Some("SIGSEGV")` etc. with
 //! `status: None` — never the shell-style `128+n` encoding. Children are
 //! always reaped (no zombies), and spawn failures such as `E2BIG` surface as
 //! [`std::io::Error`].
 //!
-//! Job control (TDD §4.7): a PtyTee **foreground** child is waited on with
+//! Job control (site/content/internals/language-conformance-contract.md): a PtyTee **foreground** child is waited on with
 //! `WUNTRACED`, so a Ctrl-Z (SIGTSTP delivered to the child's foreground
 //! process group by the pty line discipline) is observable as a *stop* rather
 //! than hanging the shell. On a stop, [`run`] returns an [`ExecResult`] with
@@ -73,7 +73,7 @@ pub fn resolve_and_hash(argv: &[OsString], env: &[(OsString, OsString)]) -> Opti
 }
 
 /// Default hard cap on the bytes buffered in memory when capturing a command's
-/// output in value position (TDD §317). Once a captured buffer reaches this
+/// output in value position (site/content/internals/language-conformance-contract.md). Once a captured buffer reaches this
 /// size it stops growing in RAM. 64 MiB is high enough that ordinary command
 /// output is never affected, yet low enough that `let x = (yes)` /
 /// `let x = (cat /dev/zero)` cannot OOM the shell.
@@ -83,7 +83,7 @@ pub fn resolve_and_hash(argv: &[OsString], env: &[(OsString, OsString)]) -> Opti
 /// [`ExecResult::truncated`] is set (the RAM floor, unchanged); with a spill,
 /// the full stream is streamed to a disk file (blake3-addressed, up to
 /// [`capture_spill_cap`]) and returned as [`ExecResult::stdout_spill`] so the
-/// caller can adopt it into the CAS as a ref-backed value (TDD §317's
+/// caller can adopt it into the CAS as a ref-backed value (site/content/internals/language-conformance-contract.md
 /// disk-spill promise). The 64 MiB resident buffer is then the value's preview.
 pub const DEFAULT_CAPTURE_HARD_CAP: usize = 64 * 1024 * 1024;
 
@@ -165,13 +165,13 @@ pub struct ExecSpec {
     pub stdin: StdinSpec,
     /// Capture (value position) or PTY-tee (statement position).
     pub mode: ExecMode,
-    /// Optional OS-enforcement request (TDD §8). `None` (the default) is the
+    /// Optional OS-enforcement request (site/content/internals/language-conformance-contract.md). `None` (the default) is the
     /// existing unsandboxed behavior. When `Some`, [`run`]/[`spawn_capture`]
     /// apply the strongest available mechanism before exec in the child and
     /// report what actually happened via [`ExecResult::enforcement`]; see
     /// [`shoal_leash::SandboxPolicy`].
     pub sandbox: Option<shoal_leash::SandboxPolicy>,
-    /// Optional disk-spill request for value-position capture (TDD §317).
+    /// Optional disk-spill request for value-position capture (site/content/internals/language-conformance-contract.md).
     /// `None` (the default) preserves the pre-spill behavior *exactly*: stdout
     /// is buffered up to [`capture_hard_cap`] and any overflow is discarded
     /// with [`ExecResult::truncated`] set. When `Some`, a capture whose stdout
@@ -183,7 +183,7 @@ pub struct ExecSpec {
 }
 
 /// Where and whether a value-position capture may spill oversized stdout to
-/// disk (TDD §317). The caller (which owns the content-addressed store) hands
+/// disk (site/content/internals/language-conformance-contract.md). The caller (which owns the content-addressed store) hands
 /// in a directory it will later adopt the spill file from; keeping the CAS
 /// itself out of `shoal-exec` preserves the crate's dependency layering.
 #[derive(Debug, Clone)]
@@ -194,7 +194,7 @@ pub struct SpillConfig {
 }
 
 /// A value-position capture whose stdout exceeded [`capture_hard_cap`] and was
-/// streamed to disk (TDD §317). The file at [`CaptureSpill::path`] holds the
+/// streamed to disk (site/content/internals/language-conformance-contract.md). The file at [`CaptureSpill::path`] holds the
 /// captured bytes (the full stream unless [`CaptureSpill::truncated`]), and
 /// [`CaptureSpill::hash`] is their blake3, so the caller can adopt it into a
 /// content-addressed store as a ref-backed value. The caller **owns** the file:
@@ -231,7 +231,7 @@ pub enum StdinSpec {
     File(PathBuf),
 }
 
-/// Execution mode — the mechanism behind the TDD §1.2 PTY position rule.
+/// Execution mode — the mechanism behind the site/content/internals/language-conformance-contract.md PTY position rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecMode {
     /// stdout/stderr = pipes, stdin per spec, no controlling tty, child in
@@ -268,7 +268,7 @@ pub struct ExecResult {
     /// [`CaptureSpill::truncated`]).
     pub truncated: bool,
     /// `Some` when this was a value-position capture ([`ExecSpec::spill`] set)
-    /// whose stdout overflowed the RAM cap and was streamed to disk (TDD §317).
+    /// whose stdout overflowed the RAM cap and was streamed to disk (site/content/internals/language-conformance-contract.md).
     /// The caller owns the referenced file and must adopt it into its CAS (or
     /// delete it). `None` on every other path — no spill was requested, or
     /// stdout fit within the RAM cap and is fully resident in `stdout`.
@@ -280,7 +280,7 @@ pub struct ExecResult {
     /// The child's process-group id. Every child is placed in its own process
     /// group (Capture: `setpgid(0, 0)` in the child; PtyTee: the child is a
     /// session leader via `setsid`, so its group id equals its pid). Job control
-    /// (TDD §4.7) signals the whole group via `kill(-pgid, …)`.
+    /// (site/content/internals/language-conformance-contract.md) signals the whole group via `kill(-pgid, …)`.
     pub pgid: u32,
     /// `true` when a PtyTee foreground child was **stopped** (SIGTSTP/SIGSTOP —
     /// e.g. the user pressed Ctrl-Z) rather than having exited. The child is
@@ -291,13 +291,13 @@ pub struct ExecResult {
     /// real terminal stop occurs.
     pub stopped: bool,
     /// `Some` iff `ExecSpec::sandbox` was set, reporting the OS-enforcement
-    /// tier that was **actually** applied to this child (TDD §8 tier
+    /// tier that was **actually** applied to this child (site/content/internals/language-conformance-contract.md tier
     /// honesty) — never `enforced: true` unless it really was. `None` means
     /// no sandbox was requested; it does not mean one was silently applied.
     pub enforcement: Option<shoal_leash::EnforcementStatus>,
 }
 
-/// Install the interactive shell's job-control signal dispositions (TDD §4.7):
+/// Install the interactive shell's job-control signal dispositions (site/content/internals/language-conformance-contract.md):
 /// a no-op **handler** (not `SIG_IGN`) for `SIGTSTP`, `SIGTTOU`, and `SIGTTIN`,
 /// so the shell itself is never suspended by a stray Ctrl-Z or by the terminal-
 /// control operations of the handoff. Crucially this uses a handler rather than
@@ -321,7 +321,7 @@ pub fn install_shell_job_control_signals() {
 }
 
 /// Send `SIGTSTP` to a whole process group (`kill(-pgid, SIGTSTP)`) — the job-
-/// control "suspend this job" primitive (TDD §4.7). Memory-safe; a `SIGTSTP` to
+/// control "suspend this job" primitive (site/content/internals/language-conformance-contract.md). Memory-safe; a `SIGTSTP` to
 /// an already-stopped group is a harmless no-op. Exposed so hosts/the evaluator
 /// can drive suspend/resume without a direct `libc` dependency.
 pub fn suspend_group(pgid: i32) {

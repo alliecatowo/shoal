@@ -1,4 +1,4 @@
-//! Port seam proof (docs/ROADMAP.md R4): swapping a fake [`Fs`] adapter proves
+//! Port seam proof (site/content/internals/roadmap-and-priorities.md): swapping a fake [`Fs`] adapter proves
 //! the evaluator routes every filesystem effect through the port, never through
 //! `std::fs` directly. The fake keeps files in memory, so a redirect and a `cat`
 //! observe the fake — and the real filesystem is never touched.

@@ -35,7 +35,7 @@ value = "[3, 2, 1]"
 # `.sort_by`/`.sort(.key)` must PROPAGATE the key-comparison error like `.sort()`
 # does — not silently mis-order incomparable keys as `Equal`. All three of the
 # forms below error consistently with `[1, "a", 2].sort()`.
-# See crates/shoal-value/src/methods/list.rs::sort_by (FIX 2).
+# See crates/shoal-value/src/methods/list.rs::sort_by.
 
 [[case]]
 name = "list2-sort-by-incomparable-keys-errors"

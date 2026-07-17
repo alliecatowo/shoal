@@ -1,4 +1,4 @@
-# List-slicing methods (CONTRACTS §1 method set: `.first .last .skip .take`).
+# List-slicing methods (site/content/internals/intercrate-protocol-contracts.md method set: `.first .last .skip .take`).
 # `.take`/`.skip` with a count already return a list in the current
 # implementation (shoal-value/src/methods.rs `slice_count`); `.first(n)`/
 # `.last(n)` currently ignore the count argument entirely and always return
@@ -48,7 +48,7 @@ name = "list-skip-all"
 src = "[1, 2, 3].skip(3)"
 value = "[]"
 
-# --- higher-order + record/table method hardening (CONTRACTS §3 value
+# --- higher-order + record/table method hardening (site/content/internals/intercrate-protocol-contracts.md value
 # methods list: .where .map .each .any .all .find .flat_map .sort_by .group
 # .zip .enumerate .chunks .min .max .get .keys .values .items .contains
 # .uniq .reverse .flatten). Deterministic, spec-derived expectations. ---
@@ -197,7 +197,7 @@ src = '{a: 1}.json()'
 value = '"{\"a\":1}"'
 
 # --- table method hardening. `Value::Table` has no literal constructor in
-# the language (TDD §4.1: "table is a list<record> semantically"); the `ls`
+# the language (site/content/internals/language-conformance-contract.md: "table is a list<record> semantically"); the `ls`
 # builtin (outcome-unified, forwarding unknown methods to its structured
 # `.out` table per shoal-value/src/methods.rs) is the deterministic way to
 # get a real table value in a conformance case: fixture files give a known

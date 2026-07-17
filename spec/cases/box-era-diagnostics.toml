@@ -1,4 +1,4 @@
-# Curated teaching diagnostics for box-era spellings (IO.md §4): heredocs,
+# Curated teaching diagnostics for box-era spellings (site/content/internals/values-streams-execution.md): heredocs,
 # here-strings, fd-numbered redirects, and the stream-merging redirect each
 # parse-error with the *why* and the shoal replacement — they must never
 # silently reparse as something else (`cmd 2> f` used to pass `2` as an
@@ -48,7 +48,7 @@ value = '"2"'
 
 [[case]]
 name = "env-assign-shape-is-a-plain-word-argument"
-# `IDENT=rest` is an env-prefix only at head position (TDD §2.2); as an
+# `IDENT=rest` is an env-prefix only at head position (site/content/internals/language-conformance-contract.md); as an
 # argument it is a bare word: `make CC=gcc`, `echo FOO=bar`.
 src = '(echo FOO=bar).out.trim()'
 value = '"FOO=bar"'

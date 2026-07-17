@@ -1,4 +1,4 @@
-//! Scope chain discovery (REEF.md §1).
+//! Scope chain discovery (site/content/internals/reef-resolution.md).
 //!
 //! [`ScopeChain::discover`] is a **pure function of `(cwd, filesystem)`**: it
 //! walks up from a directory collecting reef manifests (native and foreign),

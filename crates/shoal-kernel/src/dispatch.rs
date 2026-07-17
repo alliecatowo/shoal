@@ -1,6 +1,6 @@
-//! `Kernel::dispatch` — the RPC method router (TDD §10, AGENT-SURFACE §5).
-//! Split out of `lib.rs` (docs/ROADMAP.md wave R4, scratch/audit-arch.md
-//! §3c/W1.3): pure mechanical move, zero wire/behavior change. Each arm's
+//! `Kernel::dispatch` — the RPC method router. See
+//! `site/content/internals/kernel-protocol.md` and
+//! `site/content/internals/intercrate-protocol-contracts.md`. Each arm's
 //! body now lives in a `handle_<method>` function (see `handlers_session.rs`,
 //! `handlers_exec.rs`, `handlers_value.rs`, `handlers_task.rs`) so this stays
 //! a thin router over the method name.

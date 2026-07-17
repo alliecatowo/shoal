@@ -39,7 +39,7 @@ impl Evaluator {
     pub(crate) fn call_value_inner(&mut self, f: &Value, args: CallArgs) -> VResult<Value> {
         match f {
             Value::Closure(c) => {
-                // Strict binding (TDD §4.4: "arity/type errors carry the exact
+                // Strict binding (site/content/internals/language-conformance-contract.md: "arity/type errors carry the exact
                 // source span"): excess positionals only flow into a declared
                 // `...rest`; without one they are an arg_error, as is any
                 // named argument that names no parameter. Silently dropping
@@ -85,7 +85,7 @@ impl Evaluator {
                             ));
                         }
                     };
-                    // A `list<T>` annotation coerces per element (TDD §4.2
+                    // A `list<T>` annotation coerces per element (site/content/internals/language-conformance-contract.md
                     // site 2) on the EXPR path too; CMD calls arrive with
                     // word lists pre-coerced, so this is idempotent there.
                     let val = match crate::coerce::coerce_list_param(val, p.ty.as_ref()) {
@@ -116,7 +116,7 @@ impl Evaluator {
                 for v in args.pos {
                     call.args.push(self.value_cmd_arg(v, call.span)?);
                 }
-                // Later flags append to the aliased call's argv too (TDD §1.8):
+                // Later flags append to the aliased call's argv too (site/content/internals/language-conformance-contract.md):
                 // `alias gs = git status; gs --short` must carry `--short`
                 // through, not drop it. A bare presence flag (`--short`) arrives
                 // as `Bool(true)`; a valued flag (`--n=5`) carries its value.
@@ -140,7 +140,7 @@ impl Evaluator {
         }
     }
 
-    /// `assert(cond: bool, msg: str?)` (CONTRACTS §4): raise `assert_failed`
+    /// `assert(cond: bool, msg: str?)` (site/content/internals/intercrate-protocol-contracts.md): raise `assert_failed`
     /// with `msg` (or a default) when `cond` is false, else `null`.
     pub(crate) fn builtin_assert(&self, args: &CallArgs) -> VResult<Value> {
         if !args.named.is_empty() {
@@ -226,7 +226,7 @@ impl Evaluator {
                     format!("regex expects str, found {}", v.type_name()),
                 )),
             },
-            // Stream sources + in-language channels (docs/STREAMS.md §2). All
+            // Stream sources + in-language channels (site/content/internals/streams-channels.md). All
             // yield a lazy `stream<T>` (channels via `.events()`); `channel(name)`
             // itself yields a handle whose `.emit/.events/.latest/.take` the
             // evaluator intercepts.

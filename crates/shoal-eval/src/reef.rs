@@ -1,4 +1,4 @@
-//! reef integration for the evaluator (docs/REEF.md §1–§6).
+//! reef integration for the evaluator (site/content/internals/reef-resolution.md).
 //!
 //! The whole path is gated so that a repo with **no** `.reef.toml` (and no user
 //! `[reef]` config) behaves EXACTLY as before: [`Evaluator::reef_apply`] fast-
@@ -17,8 +17,8 @@
 use super::*;
 
 /// One tool binding for the prompt's `reef`/`language.<tool>` segments —
-/// shaped to drop straight into `shoal_prompt::ReefBinding` (docs/AGENT-
-/// SURFACE.md §12.1). See [`Evaluator::prompt_reef_snapshot`].
+/// shaped to drop straight into `shoal_prompt::ReefBinding` (see
+/// `site/content/internals/prompt-editor-lsp.md`).
 #[derive(Debug, Clone)]
 pub struct PromptReefBinding {
     pub tool: String,
@@ -48,11 +48,11 @@ pub struct PromptReefSnapshot {
 }
 
 impl Evaluator {
-    // --- prompt integration (docs/AGENT-SURFACE.md §12.1) ------------------
+    // --- prompt integration (site/content/internals/kernel-protocol.md) ------------------
 
     /// The active reef scope + resolved tool bindings for the prompt's
     /// `reef_context`/`language.<tool>` segments. **Zero subprocess, zero
-    /// fresh resolution** — this is the whole speed thesis (design §1/§5.4):
+    /// fresh resolution** — this is the whole speed thesis (site/content/internals/prompt-editor-lsp.md):
     /// it only ever ensures the cached [`shoal_reef::ScopeChain`] (a pure
     /// filesystem walk, at most once per command, and a no-op at all when the
     /// cwd hasn't changed) and reads the already-loaded
@@ -113,7 +113,7 @@ impl Evaluator {
         }
     }
 
-    // --- runners (REEF §5) -------------------------------------------------
+    // --- runners (site/content/internals/reef-resolution.md) -------------------------------------------------
 
     /// When a manifest is in scope, resolve the runner for `path` through reef
     /// (extension → tool, shebang fallback) and return the argv template

@@ -1,0 +1,43 @@
+base_url = "https://alliecatowo.github.io/shoal"
+title = "Shoal"
+description = "A structured shell for humans and agents: typed values, dot-chain composition, reproducible tool resolution, and a first-class agent protocol."
+default_language = "en"
+compile_sass = true
+minify_html = true
+build_search_index = true
+generate_sitemap = true
+generate_robots_txt = true
+hard_link_static = false
+
+taxonomies = []
+
+[markdown]
+smart_punctuation = true
+bottom_footnotes = true
+external_links_target_blank = true
+external_links_no_follow = false
+external_links_no_referrer = true
+insert_anchor_links = "right"
+
+[markdown.highlighting]
+error_on_missing_language = true
+style = "inline"
+light_theme = "github-light"
+dark_theme = "github-dark"
+extra_grammars = ["syntaxes/shoal.tmLanguage.json", "syntaxes/shl.tmLanguage.json"]
+
+[search]
+include_title = true
+include_description = true
+include_date = false
+include_path = true
+include_content = true
+index_format = "fuse_json"
+
+[extra]
+repository_url = "https://github.com/alliecatowo/shoal"
+repository_branch = "main"
+issue_url = "https://github.com/alliecatowo/shoal/issues/new"
+social_image = "img/social-card.png"
+version_label = "early preview"
+mermaid_version = "11.16.0"

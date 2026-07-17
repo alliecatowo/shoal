@@ -1,7 +1,7 @@
 # Calendar-component field access on `datetime` (`crates/shoal-eval/src/
 # expr_access.rs::field`'s `Value::DateTime` arm: `.year`/`.month`/`.day`/
 # `.hour`/`.minute`/`.second`) and the `duration` relative-anchor fields
-# (`.ago`/`.from_now`, backing the TDD §2.1 relative-anchor sugar) — neither
+# (`.ago`/`.from_now`, backing the site/content/internals/language-conformance-contract.md relative-anchor sugar) — neither
 # is exercised anywhere else in the corpus (datetime-relative.toml only
 # calls `.ago`/`.from_now` on a literal duration in a relation-based
 # assertion, never checking the field-access boundary itself), plus the

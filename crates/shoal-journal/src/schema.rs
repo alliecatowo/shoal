@@ -7,7 +7,7 @@
 //! appended but never finished (e.g. a crash mid-execution) durable and
 //! visible with `NULL` status on reopen.
 //!
-//! # Schema versioning (arch finding P8)
+//! # Schema versioning
 //!
 //! Every table so far has been created with `CREATE TABLE IF NOT EXISTS`, and every change to
 //! date (e.g. adding `transcript_event`) has been additive, so no version marker was ever kept.
@@ -44,7 +44,7 @@ pub struct EntryRecord {
     pub principal: String,
     /// Wall-clock start timestamp, nanoseconds since the Unix epoch.
     pub ts_ns: i64,
-    /// Bytes of the working directory path (paths are bytes-backed, TDD §13.1).
+    /// Bytes of the working directory path (paths are bytes-backed, site/content/internals/language-conformance-contract.md).
     pub cwd: Vec<u8>,
     /// Source text exactly as typed.
     pub src: String,
@@ -122,7 +122,7 @@ impl Journal {
         Ok(())
     }
 
-    /// Create tables and indexes (idempotent). Schema per TDD §9.
+    /// Create tables and indexes (idempotent). Schema per site/content/internals/language-conformance-contract.md.
     pub(crate) fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS entry(
@@ -195,7 +195,7 @@ impl Journal {
 
     /// Fill in the completion columns of a previously appended entry.
     ///
-    /// `status` is `None` for signal deaths (TDD §13.6: never 128+n encoded).
+    /// `status` is `None` for signal deaths (site/content/internals/language-conformance-contract.md: never 128+n encoded).
     /// Errors with `StatementChangedRows(0)` if `id` does not exist.
     pub fn finish(
         &self,

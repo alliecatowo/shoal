@@ -1,6 +1,6 @@
 //! [`ConfigError`] — every way loading a `shoal.toml` can fail.
 //!
-//! The overriding rule (docs/CONFIG.md §4): a bad config is always a value,
+//! The overriding rule (site/content/internals/configuration-reference.md): a bad config is always a value,
 //! never a panic. Every variant here carries enough context — which file
 //! (when known), which dotted key path, what was expected vs found — to print
 //! one precise, single-line diagnostic without the caller doing any more work
@@ -14,7 +14,7 @@ use std::path::PathBuf;
 pub enum ConfigError {
     /// A config file exists but couldn't be read (permissions, a directory
     /// where a file was expected, …). Note: a *missing* file is not an
-    /// error — every layer is optional (docs/CONFIG.md §1) — this variant is
+    /// error — every layer is optional (site/content/internals/configuration-reference.md) — this variant is
     /// only for a file that exists but can't be opened/read.
     Io { path: PathBuf, message: String },
     /// Malformed TOML syntax. `message` is `toml`'s own rendered diagnostic

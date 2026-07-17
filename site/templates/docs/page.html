@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+{% import "macros/docs.html" as docs %}
+
+{% block body_class %}docs-page{% if page.extra.wide %} docs-page-wide{% endif %}{% endblock body_class %}
+
+{% block head %}
+<meta property="og:type" content="article">
+{% endblock head %}
+
+{% block body %}
+  {% if page.path is starting_with("/internals") %}
+    {% set docs_root = get_section(path="internals/_index.md") %}
+  {% else %}
+    {% set docs_root = get_section(path="docs/_index.md") %}
+  {% endif %}
+  {% set active_path = page.path %}
+  {% set active_group = page.extra.group | default(value="Guides") %}
+  {% include "partials/docs_sidebar.html" %}
+
+  <div class="docs-main-shell{% if not page.toc %} no-toc{% endif %}">
+    <div class="mobile-docs-bar">
+      <button type="button" data-sidebar-open aria-controls="docs-sidebar" aria-expanded="false">
+        <span aria-hidden="true">☷</span> Browse {{ docs_root.extra.eyebrow | default(value="manual") | lower }}
+      </button>
+      {% if page.toc %}<a href="#page-outline">On this page <span>↓</span></a>{% endif %}
+    </div>
+
+    <main class="docs-article" id="main-content">
+      {% include "partials/breadcrumbs.html" %}
+      <header class="article-header">
+        {% if page.extra.eyebrow %}<p class="eyebrow">{{ page.extra.eyebrow }}</p>{% endif %}
+        <h1>{{ page.title }}</h1>
+        {% if page.description %}<p class="lede">{{ page.description }}</p>{% endif %}
+        {% if page.extra.status or page.extra.audience %}
+        <dl class="article-facts">
+          {% if page.extra.status %}<div><dt>Status</dt><dd><span class="fact-pip"></span>{{ page.extra.status }}</dd></div>{% endif %}
+          {% if page.extra.audience %}<div><dt>For</dt><dd>{{ page.extra.audience }}</dd></div>{% endif %}
+        </dl>
+        {% endif %}
+      </header>
+
+      {% if page.toc %}
+      <details class="inline-toc" id="page-outline">
+        <summary>On this page</summary>
+        {{ docs::toc(items=page.toc) }}
+      </details>
+      {% endif %}
+
+      <article class="prose" data-page-content>
+        {{ page.content | safe }}
+      </article>
+
+      <footer class="article-footer">
+        <div class="article-contribute">
+          <p><strong>Help keep this page true.</strong><span>Found drift, a gap, or a better explanation?</span></p>
+          <a href="{{ config.extra.repository_url }}/edit/{{ config.extra.repository_branch }}/site/content/{{ page.relative_path }}">Edit this page</a>
+        </div>
+        {% if page.lower or page.higher %}
+        <nav class="page-turner" aria-label="Adjacent pages">
+          {% if page.lower %}<a class="page-prev" href="{{ page.lower.permalink }}"><span>Previous</span><strong>← {{ page.lower.title }}</strong></a>{% else %}<span></span>{% endif %}
+          {% if page.higher %}<a class="page-next" href="{{ page.higher.permalink }}"><span>Next</span><strong>{{ page.higher.title }} →</strong></a>{% endif %}
+        </nav>
+        {% endif %}
+      </footer>
+    </main>
+    {% set toc = page.toc %}
+    {% include "partials/page_toc.html" %}
+  </div>
+{% endblock body %}

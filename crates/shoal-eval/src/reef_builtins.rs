@@ -1,4 +1,4 @@
-//! `which`/`reef` builtins layered on reef resolution (docs/REEF.md §6).
+//! `which`/`reef` builtins layered on reef resolution (site/content/internals/reef-resolution.md).
 //!
 //! Split out of [`crate::reef`] (see that module's doc for the split
 //! rationale); see [`crate::reef_resolve`] for the scope-chain/resolver
@@ -12,7 +12,7 @@ use shoal_reef::{
 };
 
 impl Evaluator {
-    // --- `which` (REEF §6) -------------------------------------------------
+    // --- `which` (site/content/internals/reef-resolution.md) -------------------------------------------------
 
     /// `which <tool>` → a resolution report record; `which <tool> --all` → a
     /// table of every candidate. With no manifest in scope, `which git` still
@@ -106,7 +106,7 @@ impl Evaluator {
         Ok(Value::Table(rows))
     }
 
-    // --- `reef` builtins (REEF §6) -----------------------------------------
+    // --- `reef` builtins (site/content/internals/reef-resolution.md) -----------------------------------------
 
     /// The `reef` builtin family: bare `reef` (binding table), `reef add
     /// <tool>@<ver>`, `reef lock [--refresh]`, `reef fetch <tool>`.
@@ -191,7 +191,7 @@ impl Evaluator {
 
     /// `reef add <tool>@<ver>`: write the target `.reef.toml` and lock the tool.
     ///
-    /// **Target precedence — the LOCAL manifest always wins (REEF.md §1/§6).**
+    /// **Target precedence — the LOCAL manifest always wins (site/content/internals/reef-resolution.md).**
     /// A `.reef.toml` sitting in `cwd` is *this* (sub)project's own manifest, so
     /// `reef add` must edit it — and it is resolved by a direct
     /// [`Fs::is_file`](shoal_value::ports::Fs::is_file) existence probe, NOT by
@@ -202,7 +202,7 @@ impl Evaluator {
     ///    nothing — never an ancestor.
     /// 2. otherwise → the chain's nearest native `.reef.toml` (a real ancestor
     ///    project), so `reef add` in a bare subdir still writes the project's
-    ///    manifest one dir up ("writes nearest manifest", REEF.md §6).
+    ///    manifest one dir up ("writes nearest manifest", site/content/internals/reef-resolution.md).
     /// 3. otherwise → create a fresh `cwd/.reef.toml`.
     ///
     /// The existence probe (rather than the chain) is load-bearing:
@@ -371,7 +371,7 @@ impl Evaluator {
         Ok(Value::Record(r))
     }
 
-    /// `reef doctor` (REEF.md §6): a health report over the current reef
+    /// `reef doctor` (site/content/internals/reef-resolution.md): a health report over the current reef
     /// state — one row per finding, never an error (a health check has
     /// nothing to say about a clean or empty scope, so it returns an empty
     /// table rather than `reef lock`'s "no manifest in scope" error):
@@ -464,7 +464,7 @@ impl Evaluator {
     }
 }
 
-/// Map a resolved [`ResolutionReport`] to the record `which` renders (REEF §6).
+/// Map a resolved [`ResolutionReport`] to the record `which` renders (site/content/internals/reef-resolution.md).
 fn report_to_record(report: &ResolutionReport) -> Value {
     let mut r = Record::new();
     r.insert("name".into(), Value::Str(report.name.clone()));
@@ -579,7 +579,7 @@ mod tests {
     }
 
     /// Fix 2: two scopes constraining `faketool` incompatibly is a pure
-    /// manifest-chain decision (REEF.md §2) — no real tool install needed, so
+    /// manifest-chain decision (site/content/internals/reef-resolution.md) — no real tool install needed, so
     /// this doesn't need a fixture resolver at all. Before the fix, `which`'s
     /// `Err(_)` arm swallowed this and reported a bare ambient/null guess.
     #[test]
@@ -716,7 +716,7 @@ mod tests {
         assert_eq!(shadowed.get("name"), Some(&Value::Str("sh".into())));
     }
 
-    /// The manifest filenames `ScopeChain::discover` (docs/REEF.md §1) looks
+    /// The manifest filenames `ScopeChain::discover` (site/content/internals/reef-resolution.md) looks
     /// for at every directory on its walk from `cwd` up to the filesystem
     /// root.
     const REEF_MANIFEST_NAMES: &[&str] =
@@ -746,7 +746,7 @@ mod tests {
                     panic!(
                         "ambient reef-manifest pollution detected above this test's own \
                          tempdir: {candidate:?} exists and was NOT created by this test. \
-                         ScopeChain::discover (docs/REEF.md §1) walks from cwd to the \
+                         ScopeChain::discover (site/content/internals/reef-resolution.md) walks from cwd to the \
                          filesystem root, so this file makes the scope chain non-empty and \
                          breaks this test's \"nothing constrains anything\" premise. This is \
                          environmental contamination (e.g. a stray manifest left in a shared \
@@ -834,7 +834,7 @@ mod tests {
     }
 
     /// Item 1 — no local manifest: `reef add` falls back to the chain's nearest
-    /// ancestor `.reef.toml` ("writes nearest manifest", REEF.md §6), since the
+    /// ancestor `.reef.toml` ("writes nearest manifest", site/content/internals/reef-resolution.md), since the
     /// subdir has none of its own.
     #[test]
     fn reef_add_falls_back_to_nearest_ancestor_when_no_local() {

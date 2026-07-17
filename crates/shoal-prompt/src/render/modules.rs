@@ -1,4 +1,4 @@
-//! Per-placeholder rendering (§4): one method per `$module`, each reading
+//! Per-placeholder rendering (site/content/internals/prompt-editor-lsp.md): one method per `$module`, each reading
 //! its config table and the relevant [`PromptContext`] field(s) and
 //! returning a styled (or empty, when hidden/disabled) string.
 
@@ -22,7 +22,7 @@ impl Renderer {
         } else {
             (m.error_symbol.as_str(), m.error_style.as_str())
         };
-        // Strict-ASCII fallback (§4.1): the chevron is hardcoded, not configured.
+        // Strict-ASCII fallback (site/content/internals/prompt-editor-lsp.md): the chevron is hardcoded, not configured.
         let symbol = if ctx.unicode {
             symbol.to_string()
         } else if vicmd {

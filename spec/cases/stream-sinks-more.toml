@@ -1,5 +1,5 @@
 # Stream method-surface hardening beyond streams.toml/streams-more.toml/
-# streams-3.toml: `.save`/`.append` (STREAMS §4's own per-item live-logging
+# streams-3.toml: `.save`/`.append` (site/content/internals/streams-channels.md own per-item live-logging
 # sink, distinct from the collection-method `.save`/`.append` on a plain
 # `str`/`bytes` value) and the "everything else materializes then
 # dispatches" fallthrough path (`methods/stream.rs`'s own comment: "`.sort`,

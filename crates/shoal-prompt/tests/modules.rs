@@ -1,4 +1,5 @@
-//! design §13: one test per module (§4), each building a minimal PromptContext
+//! One test per prompt module, each building a minimal `PromptContext`. See
+//! `site/content/internals/prompt-editor-lsp.md`.
 //! fixture and asserting the exact rendered string for default config, a changed
 //! config key, and the hidden condition. Rendered with `no_color = true` so the
 //! assertions are on plain text, not SGR sequences (styling is covered in

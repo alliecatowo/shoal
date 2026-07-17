@@ -1,5 +1,5 @@
 //! Theme presets, shipped in the binary via `include_str!` — no filesystem
-//! dependency, no install step (§3.7). A theme is *not special* beyond being an
+//! dependency, no install step (site/content/internals/prompt-editor-lsp.md). A theme is *not special* beyond being an
 //! extra lowest-precedence config layer (see [`crate::config::load`]).
 
 const DEFAULT: &str = include_str!("../themes/default.toml");
@@ -9,7 +9,7 @@ const MINIMAL: &str = include_str!("../themes/minimal.toml");
 /// The shipped theme names.
 pub const NAMES: &[&str] = &["default", "rich", "minimal"];
 
-/// Fetch a shipped theme's raw TOML by name (§3.7). Returns `None` for an
+/// Fetch a shipped theme's raw TOML by name (site/content/internals/prompt-editor-lsp.md). Returns `None` for an
 /// unknown name (the caller emits a "unknown theme" warning).
 pub fn get(name: &str) -> Option<&'static str> {
     match name {
