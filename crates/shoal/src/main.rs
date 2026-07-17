@@ -200,9 +200,7 @@ fn run_source(
     // while the final one gets the full block treatment. The REPL installs
     // its own equivalent sink.
     evaluator.set_statement_sink(Box::new(move |v: &Value| {
-        let width = configured_width
-            .unwrap_or_else(repl::terminal_width)
-            .max(1);
+        let width = configured_width.unwrap_or_else(repl::terminal_width).max(1);
         let _ = repl::print_value(v, width);
     }));
     evaluator.env_mut().declare(
@@ -236,9 +234,7 @@ fn run_source(
                 EchoMode::Commands => program.stmts.last().is_some_and(is_bare_command_stmt),
             };
             if render_final {
-                let width = configured_width
-                    .unwrap_or_else(repl::terminal_width)
-                    .max(1);
+                let width = configured_width.unwrap_or_else(repl::terminal_width).max(1);
                 repl::render_result(&value, false, width)
                     .map_err(|e| format!("cannot write output: {e}"))?;
             }

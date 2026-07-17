@@ -89,10 +89,17 @@ fn render_width_from_config_bounds_block_tables() {
         "version = 1\n[render]\nwidth = 20\n",
         "[{very_long_column: \"abcdefghijklmno\", second_column: \"1234567890\"}]",
     );
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("very_lo…"), "stdout was {stdout:?}");
-    assert!(!stdout.contains("very_long_column"), "configured width was ignored: {stdout:?}");
+    assert!(
+        !stdout.contains("very_long_column"),
+        "configured width was ignored: {stdout:?}"
+    );
 }
 
 #[test]
