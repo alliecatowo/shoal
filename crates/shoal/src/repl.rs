@@ -10,9 +10,11 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 
 use reedline::{
-    ColumnarMenu, DefaultHinter, FileBackedHistory, MenuBuilder, Reedline, ReedlineMenu, Signal,
+    ColumnarMenu, DefaultHinter, ExternalPrinter, FileBackedHistory, MenuBuilder, Reedline,
+    ReedlineMenu, Signal,
 };
 #[cfg(test)]
 use reedline::{
@@ -291,7 +293,14 @@ pub(crate) fn repl(standalone: bool) -> Result<i32, String> {
     )));
     let shoal_prompt = prompt::ShoalPrompt::new(renderer.clone(), shared_ctx.clone(), false);
 
+    // Detached PTY workers finish on their own threads. Reedline's bounded
+    // external printer lets those completion notices interrupt an active edit
+    // safely: the current buffer is repainted below the notice instead of
+    // being overwritten by an ordinary println from another thread.
+    let background_printer = ExternalPrinter::new(64);
     let mut editor = Reedline::create()
+        .with_external_printer(background_printer.clone())
+        .with_poll_interval(Duration::from_millis(50))
         .use_bracketed_paste(config.editor.bracketed_paste)
         .with_validator(Box::new(ShoalValidator))
         .with_completer(Box::new(completer))
@@ -441,7 +450,7 @@ pub(crate) fn repl(standalone: bool) -> Result<i32, String> {
                     if let Ok(mut token) = cancel_slot.lock() {
                         *token = evaluator.cancellation_token();
                     }
-                    handle_job_control(&mut evaluator, jc, &background_job_tx);
+                    handle_job_control(&mut evaluator, jc, &background_job_tx, &background_printer);
                     continue;
                 }
                 // `fg <task>` (site/content/internals/roadmap-and-priorities.md): host-level sugar, resolved
@@ -743,14 +752,71 @@ enum BackgroundJobEvent {
         command: String,
         status: Option<i32>,
         signal: Option<String>,
+        notified: bool,
     },
     Stopped {
         id: u64,
+        command: String,
+        notified: bool,
     },
     Failed {
         id: u64,
         error: String,
+        notified: bool,
     },
+}
+
+impl BackgroundJobEvent {
+    fn notice(&self) -> String {
+        match self {
+            Self::Completed {
+                id,
+                command,
+                status,
+                signal,
+                ..
+            } => {
+                let terminal = match (status, signal.as_deref()) {
+                    (Some(0), _) => "Done".to_string(),
+                    (Some(code), _) => format!("Exit {code}"),
+                    (_, Some(signal)) => signal.to_string(),
+                    _ => "Failed".to_string(),
+                };
+                maybe_strip(format!("\x1b[90m[{id}]+  {terminal}\x1b[0m  {command}"))
+            }
+            Self::Stopped { id, command, .. } => {
+                maybe_strip(format!("\x1b[90m[{id}]+  Stopped\x1b[0m  {command}"))
+            }
+            Self::Failed { id, error, .. } => maybe_strip(format!(
+                "\x1b[31;1m[{id}]+ background job failed:\x1b[0m {error}"
+            )),
+        }
+    }
+
+    fn notified(&self) -> bool {
+        match self {
+            Self::Completed { notified, .. }
+            | Self::Stopped { notified, .. }
+            | Self::Failed { notified, .. } => *notified,
+        }
+    }
+
+    fn set_notified(&mut self) {
+        match self {
+            Self::Completed { notified, .. }
+            | Self::Stopped { notified, .. }
+            | Self::Failed { notified, .. } => *notified = true,
+        }
+    }
+}
+
+/// Queue a completion notice without ever blocking a PTY reap worker. If the
+/// bounded Reedline queue is full, the event remains unmarked and the REPL
+/// thread prints it when it next drains state transitions.
+fn enqueue_background_notice(printer: &ExternalPrinter<String>, event: &mut BackgroundJobEvent) {
+    if printer.sender().try_send(event.notice()).is_ok() {
+        event.set_notified();
+    }
 }
 
 /// Reconcile terminal notifications from detached PTY workers on the REPL
@@ -759,39 +825,37 @@ enum BackgroundJobEvent {
 /// as running after its completion has been observed.
 fn drain_background_job_events(evaluator: &mut Evaluator, events: &Receiver<BackgroundJobEvent>) {
     while let Ok(event) = events.try_recv() {
+        let fallback_notice = (!event.notified()).then(|| event.notice());
         match event {
             BackgroundJobEvent::Completed {
                 id,
-                command,
                 status,
                 signal,
+                notified,
+                ..
             } => {
                 evaluator.finish_external_job_result(id, status, signal.clone());
-                let terminal = match (status, signal.as_deref()) {
-                    (Some(0), _) => "Done".to_string(),
-                    (Some(code), _) => format!("Exit {code}"),
-                    (_, Some(signal)) => signal.to_string(),
-                    _ => "Failed".to_string(),
-                };
-                println!(
-                    "{}",
-                    maybe_strip(format!("\x1b[90m[{id}]+  {terminal}\x1b[0m  {command}"))
-                );
-            }
-            BackgroundJobEvent::Stopped { id } => {
-                evaluator.mark_external_stopped(id);
-                if let Some((id, desc)) = evaluator.take_pending_stop() {
-                    print_stopped_notice(id, &desc);
+                if !notified && let Some(notice) = fallback_notice {
+                    println!("{notice}");
                 }
             }
-            BackgroundJobEvent::Failed { id, error } => {
+            BackgroundJobEvent::Stopped { id, notified, .. } => {
+                evaluator.mark_external_stopped(id);
+                if let Some((id, desc)) = evaluator.take_pending_stop() {
+                    if !notified {
+                        print_stopped_notice(id, &desc);
+                    }
+                }
+            }
+            BackgroundJobEvent::Failed {
+                id,
+                ref error,
+                notified,
+            } => {
                 evaluator.fail_external_job(id, error.clone());
-                eprintln!(
-                    "{}",
-                    maybe_strip(format!(
-                        "\x1b[31;1m[{id}]+ background job failed:\x1b[0m {error}"
-                    ))
-                );
+                if !notified && let Some(notice) = fallback_notice {
+                    eprintln!("{notice}");
+                }
             }
         }
     }
@@ -845,6 +909,7 @@ fn handle_job_control(
     evaluator: &mut shoal_eval::Evaluator,
     jc: JobControl,
     background_events: &Sender<BackgroundJobEvent>,
+    background_printer: &ExternalPrinter<String>,
 ) {
     let warn = |msg: &str| {
         eprintln!(
@@ -935,20 +1000,28 @@ fn handle_job_control(
             // to this REPL through a channel; evaluator state remains owned by
             // the prompt thread.
             let events = background_events.clone();
+            let printer = background_printer.clone();
             job.resume_background_notify(move |result| {
-                let event = match result {
-                    Ok(result) if result.stopped => BackgroundJobEvent::Stopped { id },
+                let mut event = match result {
+                    Ok(result) if result.stopped => BackgroundJobEvent::Stopped {
+                        id,
+                        command,
+                        notified: false,
+                    },
                     Ok(result) => BackgroundJobEvent::Completed {
                         id,
                         command,
                         status: result.status,
                         signal: result.signal,
+                        notified: false,
                     },
                     Err(error) => BackgroundJobEvent::Failed {
                         id,
                         error: error.to_string(),
+                        notified: false,
                     },
                 };
+                enqueue_background_notice(&printer, &mut event);
                 let _ = events.send(event);
             });
         }
@@ -1169,6 +1242,7 @@ mod tests {
             command: "done-job".into(),
             status: Some(0),
             signal: None,
+            notified: false,
         })
         .unwrap();
         drain_background_job_events(&mut evaluator, &rx);
@@ -1182,6 +1256,7 @@ mod tests {
             command: "failed-job".into(),
             status: Some(7),
             signal: None,
+            notified: false,
         })
         .unwrap();
         drain_background_job_events(&mut evaluator, &rx);
@@ -1195,12 +1270,42 @@ mod tests {
 
         let stopped = evaluator.register_stopped_external(41_002, 41_002, "stopped-job".into());
         assert!(evaluator.mark_external_resumed(stopped));
-        tx.send(BackgroundJobEvent::Stopped { id: stopped })
-            .unwrap();
+        tx.send(BackgroundJobEvent::Stopped {
+            id: stopped,
+            command: "stopped-job".into(),
+            notified: false,
+        })
+        .unwrap();
         drain_background_job_events(&mut evaluator, &rx);
         assert_eq!(evaluator.external_job_pid(stopped), Some(41_002));
         assert!(evaluator.task_by_id(stopped).unwrap().is_suspended());
         assert_eq!(evaluator.last_stopped_external(), Some(stopped));
+    }
+
+    #[test]
+    fn background_notices_use_a_bounded_nonblocking_reedline_queue() {
+        let printer = ExternalPrinter::new(1);
+        let mut first = BackgroundJobEvent::Completed {
+            id: 7,
+            command: "fast-job".into(),
+            status: Some(0),
+            signal: None,
+            notified: false,
+        };
+        enqueue_background_notice(&printer, &mut first);
+        assert!(first.notified());
+        assert!(printer.get_line().unwrap().contains("[7]+  Done"));
+
+        // Fill the capacity, then prove a PTY callback falls back instead of
+        // blocking when Reedline has not consumed the earlier notice yet.
+        printer.sender().try_send("occupied".into()).unwrap();
+        let mut second = BackgroundJobEvent::Failed {
+            id: 8,
+            error: "boom".into(),
+            notified: false,
+        };
+        enqueue_background_notice(&printer, &mut second);
+        assert!(!second.notified());
     }
 
     #[test]
