@@ -175,6 +175,48 @@ impl SessionCtx {
     }
 }
 
+/// The reef dynamic overlay and per-cwd resolution cache (site/content/internals/reef-resolution.md),
+/// grouped by HR-J2 (`site/content/internals/evaluator-decomposition.md`) so a
+/// child evaluator inherits the whole reef overlay **as a unit** — closing the
+/// reef half of deep-audit finding B3, where the four fields were dropped
+/// individually at each hand-copy child site. Cheap to clone (small maps + an
+/// `Option<PathBuf>`); the field grouping is otherwise behavior-identical to the
+/// pre-decomposition flat fields.
+///
+/// The session-long resolution *inputs* (`reef_resolver`, `reef_user_manifest`)
+/// deliberately stay separate on the [`Evaluator`]: they are host-installed and
+/// immutable per statement (Class 1), not part of this per-eval overlay/cache.
+#[derive(Clone)]
+struct ReefState {
+    /// `with reef: {tool: constraint, …} { }` override layers, nearest-first
+    /// (innermost `with reef:` block wins). Empty and inert when no `with reef:`
+    /// is on the dynamic stack — zero-regression.
+    overrides: Vec<shoal_reef::ScopeEntry>,
+    /// Cached scope chain, keyed on the cwd it was discovered for. Rebuilt only
+    /// when the cwd changes (cd / `with cwd:`). `None` until the first
+    /// spawn/`which`/`reef` touches it; cheap when no manifest is in scope (a
+    /// pure filesystem walk with an empty result).
+    chain: Option<(PathBuf, shoal_reef::ScopeChain)>,
+    /// The in-memory lock, loaded from (and persisted next to) the nearest
+    /// manifest. Empty and inert when no manifest is in scope.
+    lock: shoal_reef::Lockfile,
+    /// Filesystem path the current lock loads from / persists to.
+    lock_path: Option<PathBuf>,
+}
+
+impl ReefState {
+    /// The default (no manifest in scope) reef overlay/cache, matching the
+    /// pre-decomposition `Evaluator::new` field defaults exactly.
+    fn new() -> Self {
+        Self {
+            overrides: Vec::new(),
+            chain: None,
+            lock: shoal_reef::Lockfile::new(),
+            lock_path: None,
+        }
+    }
+}
+
 pub struct Evaluator {
     pub env: Env,
     cwd: PathBuf,
@@ -205,28 +247,21 @@ pub struct Evaluator {
     /// stop and drained by the REPL (`take_pending_stop`) to print the
     /// "[id]+ Stopped …" notice and return to the prompt.
     pending_stop: Option<(u64, String)>,
-    /// reef (site/content/internals/reef-resolution.md): cached scope chain, keyed on the cwd it was
-    /// discovered for. Rebuilt only when the cwd changes (cd / `with cwd:`).
-    /// `None` until the first spawn/`which`/`reef` touches it; cheap when no
-    /// manifest is in scope (a pure filesystem walk with an empty result).
-    reef_chain: Option<(PathBuf, shoal_reef::ScopeChain)>,
+    /// reef (site/content/internals/reef-resolution.md): the dynamic overlay + per-cwd resolution
+    /// cache — the `with reef:` override stack, the cwd-keyed scope chain, and
+    /// the in-memory lock + its persistence path — grouped into one
+    /// [`ReefState`] sub-struct (HR-J2) so a child inherits the whole reef
+    /// overlay as a unit (closing the reef half of finding B3), not four
+    /// separately-copyable fields.
+    reef: ReefState,
     /// reef: the provider stack, built lazily on the first *constrained*
     /// resolution — never touched on the hot path when no manifest is in scope.
     reef_resolver: Option<Arc<shoal_reef::Resolver>>,
-    /// reef: the in-memory lock, loaded from (and persisted next to) the nearest
-    /// manifest. Empty and inert when no manifest is in scope.
-    reef_lock: shoal_reef::Lockfile,
-    /// reef: filesystem path the current lock loads from / persists to.
-    reef_lock_path: Option<PathBuf>,
     /// reef: optional user-scope `shoal.toml` whose `[reef]` table forms the
     /// user scope. `None` (the default) means no user scope — the zero-config,
     /// zero-regression path. Hosts wire a real path via
     /// [`Evaluator::set_reef_user_manifest`]; tests never point at real config.
     reef_user_manifest: Option<PathBuf>,
-    /// reef: `with reef: {tool: constraint, …} { }` override layers (see
-    /// `site/content/internals/reef-resolution.md`), nearest-first (innermost `with reef:` block wins). Empty and inert
-    /// when no `with reef:` is on the dynamic stack — zero-regression.
-    reef_overrides: Vec<shoal_reef::ScopeEntry>,
     /// The journal entry id of the top-level statement currently executing, so
     /// nested fs mutations (rm/cp/mv/save) can attach undo inverses to it.
     /// `None` outside a journaled statement.
@@ -327,12 +362,9 @@ impl Evaluator {
             jobs: Vec::new(),
             external_jobs: std::collections::HashMap::new(),
             pending_stop: None,
-            reef_chain: None,
+            reef: ReefState::new(),
             reef_resolver: None,
-            reef_lock: shoal_reef::Lockfile::new(),
-            reef_lock_path: None,
             reef_user_manifest: None,
-            reef_overrides: Vec::new(),
             current_entry: None,
             source: None,
             bus: channels::EventBus::shared(),
@@ -481,7 +513,7 @@ impl Evaluator {
     /// the chain with this path folded in.
     pub fn set_reef_user_manifest(&mut self, path: impl Into<PathBuf>) {
         self.reef_user_manifest = Some(path.into());
-        self.reef_chain = None;
+        self.reef.chain = None;
     }
 
     /// Inject the reef provider stack (resolver). Additive: without it the
