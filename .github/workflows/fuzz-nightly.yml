@@ -1,0 +1,63 @@
+name: Scheduled fuzz
+
+# HR-F4 (site/content/internals/hardening-roadmap.md): the `fuzz-build` job in ci.yml only
+# compiles the libFuzzer targets on every push/PR (continue-on-error, no timed run) — deep audit
+# finding H12 is that fuzz targets exist but nothing ever actually runs them. This workflow runs
+# each target for a short, fixed budget on a nightly schedule and fails the job (no
+# continue-on-error) if libFuzzer finds a crash, timeout, or OOM, so a regression surfaces here
+# instead of silently sitting unexercised.
+#
+# Budget choice: 120s per target (~6 minutes total for three targets) is a deliberate "smoke, not
+# exhaustive" tradeoff — see site/content/internals/tooling-and-quality.md's Fuzz targets section
+# for what each target actually covers today (shallow: no CMD-mode/mode-transition coverage for
+# the lexer, no semantic assertions for the parser, no multi-frame/value coverage for proto_frame).
+# A deeper corpus-accumulating fuzz campaign is future work; this job's job is to catch a quick
+# regression (panic/non-progress) on a cadence, not to be the sole fuzzing strategy.
+
+on:
+  schedule:
+    # 07:00 UTC daily.
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+    inputs:
+      seconds_per_target:
+        description: "libFuzzer max_total_time per target, in seconds"
+        default: "120"
+        required: false
+
+concurrency:
+  group: fuzz-nightly
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  fuzz:
+    name: fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [lexer, parser, proto_frame]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: fuzz-${{ matrix.target }}
+          workspaces: fuzz -> target
+      - run: sudo apt-get update && sudo apt-get install -y clang
+      - run: cargo install cargo-fuzz --locked
+      - name: Run ${{ matrix.target }} for a bounded budget
+        run: |
+          cargo fuzz run "${{ matrix.target }}" --fuzz-dir fuzz -- \
+            -max_total_time="${{ github.event.inputs.seconds_per_target || '120' }}"
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore
