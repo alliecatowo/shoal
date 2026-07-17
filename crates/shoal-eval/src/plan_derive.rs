@@ -44,8 +44,38 @@ impl Evaluator {
     ) -> VResult<()> {
         match stmt {
             Stmt::Expr { expr, .. } => self.plan_expr(expr, functions, aliases, out, depth),
-            Stmt::Let { init, .. } | Stmt::Assign { value: init, .. } => {
-                self.plan_expr(init, functions, aliases, out, depth)
+            Stmt::Let { init, .. } => self.plan_expr(init, functions, aliases, out, depth),
+            Stmt::Assign { target, value, .. } => {
+                self.plan_expr(value, functions, aliases, out, depth)?;
+                // Persistent `env.NAME = …` is an environment write, not only
+                // its RHS effects (A2). Any other target is traversed for
+                // nested effects (e.g. `xs[f()] = v`).
+                if let Expr::Field { recv, name, .. } = target
+                    && matches!(&**recv, Expr::Var { name: ns, .. } if ns == "env")
+                {
+                    push_effect(
+                        out,
+                        Effect::EnvWrite {
+                            names: vec![name.clone()],
+                        },
+                    );
+                    Ok(())
+                } else {
+                    self.plan_expr(target, functions, aliases, out, depth)
+                }
+            }
+            Stmt::Use { path, .. } => {
+                // `use ./mod` reads the module file and executes every top-level
+                // statement (A1). Record the read concretely; the module body is
+                // arbitrary code, so cover it conservatively with `Opaque`.
+                push_effect(
+                    out,
+                    Effect::FsRead {
+                        paths: vec![self.plan_module_path(path)],
+                    },
+                );
+                push_effect(out, Effect::Opaque);
+                Ok(())
             }
             Stmt::Return {
                 value: Some(expr), ..
@@ -226,6 +256,11 @@ impl Evaluator {
                 "planning function recursion exceeded 64",
             ));
         }
+        // Redirects are effects independent of the head (A3): `>`/`>>` write the
+        // target, `< file` reads it. Recorded first so an aliased/functioned head
+        // (whose body redirects belong to a different call) still gets this call's
+        // redirects.
+        self.plan_redirects(call, out);
         if let Some(target) = aliases.get(&call.head) {
             return self.plan_call(target, functions, aliases, out, depth + 1);
         }
@@ -272,6 +307,69 @@ impl Evaluator {
             push_effect(out, Effect::Opaque);
         }
         Ok(())
+    }
+
+    /// Command redirects are filesystem effects independent of the head (A3):
+    /// `>`/`>>` write the target path, `< file` reads it. A dynamic (non-literal)
+    /// write target cannot be bounded, so it plans as `Opaque` (approval).
+    fn plan_redirects(&self, call: &CmdCall, out: &mut Vec<Effect>) {
+        for r in &call.redirects {
+            match r.kind {
+                // Truncate (`>`) and append (`>>`) both write the target; the
+                // effect vocabulary records the write, and append vs truncate is
+                // distinguished only in that a truncate clobbers prior bytes.
+                RedirectKind::Out | RedirectKind::Append => {
+                    match self.cmd_arg_path_literal(&r.target) {
+                        Some(p) => push_effect(out, Effect::FsWrite { paths: vec![p] }),
+                        None => push_effect(out, Effect::Opaque),
+                    }
+                }
+                RedirectKind::In => {
+                    if let Some(p) = self.cmd_arg_path_literal(&r.target) {
+                        push_effect(out, Effect::FsRead { paths: vec![p] });
+                    }
+                }
+            }
+        }
+    }
+
+    /// Absolutize a literal path string against the session cwd.
+    fn plan_abs(&self, s: &str) -> PathBuf {
+        let p = PathBuf::from(s);
+        if p.is_absolute() { p } else { self.cwd.join(p) }
+    }
+
+    /// The literal path a command argument names, absolutized against cwd, or
+    /// `None` when the argument is not a static literal.
+    fn cmd_arg_path_literal(&self, arg: &CmdArg) -> Option<PathBuf> {
+        let s = match arg {
+            CmdArg::Word { text, .. } | CmdArg::Path { text, .. } => text.clone(),
+            CmdArg::Str { expr, .. } | CmdArg::Expr { expr, .. } => match expr {
+                Expr::Str { value, .. } => value.clone(),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        Some(self.plan_abs(&s))
+    }
+
+    /// Resolve a `use <path>` module string to the file the loader will read
+    /// (A1): cwd-relative, preferring a `.shl` sibling, canonicalized best-effort.
+    /// Planning never touches the file's contents.
+    fn plan_module_path(&self, path: &str) -> PathBuf {
+        let base = PathBuf::from(path);
+        let base = if base.is_absolute() {
+            base
+        } else {
+            self.cwd.join(&base)
+        };
+        let candidate = if base.extension().is_some() {
+            base
+        } else {
+            let with_shl = base.with_extension("shl");
+            if with_shl.is_file() { with_shl } else { base }
+        };
+        candidate.canonicalize().unwrap_or(candidate)
     }
 }
 
@@ -383,6 +481,72 @@ effects=["proc.spawn(container)", "net.connect(registry:443)", "quantum.entangle
         assert_eq!(
             parse_declared_effect("bare-nonsense", &b, cwd),
             vec![Effect::Opaque]
+        );
+    }
+
+    /// Derive the effect list for `src` under a fresh evaluator rooted at `cwd`.
+    fn effects_at(cwd: &Path, src: &str) -> Vec<Effect> {
+        let mut ev = Evaluator::new(cwd.to_path_buf());
+        ev.plan_program(&shoal_syntax::parse(src).unwrap())
+            .unwrap()
+            .effects
+    }
+
+    /// A1: `use ./mod` reads the module file and covers its body conservatively.
+    #[test]
+    fn use_reads_module_and_covers_body() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("mod.shl"), "export let x = 1").unwrap();
+        let effects = effects_at(dir.path(), "use ./mod");
+        assert!(
+            effects.iter().any(
+                |e| matches!(e, Effect::FsRead { paths } if paths.iter().any(|p| p.ends_with("mod.shl")))
+            ),
+            "use did not read the module: {effects:?}"
+        );
+        assert!(
+            effects.contains(&Effect::Opaque),
+            "module body not covered: {effects:?}"
+        );
+    }
+
+    /// A2: persistent `env.NAME = …` is an EnvWrite naming NAME.
+    #[test]
+    fn env_assignment_is_env_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let effects = effects_at(dir.path(), "env.AUDIT_ONLY = \"y\"");
+        assert!(
+            effects.contains(&Effect::EnvWrite {
+                names: vec!["AUDIT_ONLY".into()]
+            }),
+            "env.NAME = … did not plan an EnvWrite: {effects:?}"
+        );
+    }
+
+    /// A3: `>`/`>>` write the redirect target; `< file` reads it.
+    #[test]
+    fn redirects_derive_fs_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        let trunc = effects_at(dir.path(), "echo hi > out.txt");
+        assert!(
+            trunc.contains(&Effect::FsWrite {
+                paths: vec![dir.path().join("out.txt")]
+            }),
+            "`> out.txt` did not plan a write: {trunc:?}"
+        );
+        let append = effects_at(dir.path(), "echo hi >> out.txt");
+        assert!(
+            append.contains(&Effect::FsWrite {
+                paths: vec![dir.path().join("out.txt")]
+            }),
+            "`>> out.txt` did not plan a write: {append:?}"
+        );
+        let read = effects_at(dir.path(), "cat < in.txt");
+        assert!(
+            read.contains(&Effect::FsRead {
+                paths: vec![dir.path().join("in.txt")]
+            }),
+            "`< in.txt` did not plan a read: {read:?}"
         );
     }
 }
