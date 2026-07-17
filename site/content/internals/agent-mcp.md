@@ -70,12 +70,12 @@ The facade currently exposes 13 tools:
 | `shoal_pty_close` | `pty.close` | terminate and reap a PTY |
 | `shoal_pty_list` | `pty.list` | enumerate session PTYs |
 
-The facade's main `KernelClient` attaches before calling these methods, but that does not make every
-kernel handler authorization-safe. In particular, `cap.request` ignores the attachment because its
-router/handler signature receives none, and `journal.query` likewise has no attachment or
-caller-principal filter. A normal MCP call happens to arrive on an attached connection; a direct
-kernel client can call the same methods unattached, and an attached MCP principal is not checked as
-the approver. This must be fixed in the kernel boundary rather than papered over in the facade.
+The facade's main `KernelClient` attaches before calling these methods, and the kernel boundary now
+enforces attachment for every stateful method: `journal.query` (HR-D4) and `cap.request` (HR-D1) were
+the last exemptions and now reject an unattached direct kernel client with `NOT_ATTACHED`.
+`cap.request` additionally binds the attached principal as the **approver** and, by default, refuses a
+requester approving its own plan (HR-D3). The facade does not reimplement any of this authority — it
+is enforced in the kernel, not papered over in the bridge.
 
 
 Kernel RPC errors become successful MCP `tools/call` envelopes with `isError: true` and structured

@@ -95,7 +95,8 @@ pub mod error_code {
     // --- shoal-kernel server-error range (-32000..=-32099) ---
 
     /// No session is attached on this connection yet. Every handler but
-    /// `session.attach`, `parse`, `complete`, and `cap.request` requires one.
+    /// `session.attach`, `parse`, and `complete` requires one. (`cap.request`
+    /// and `journal.query`, once exempt, now require attachment too — HR-D1/D4.)
     pub const NOT_ATTACHED: i32 = -32000;
     /// The submitted shoal *source* failed to parse (`shoal_syntax::parse`).
     /// Distinct from [`RPC_PARSE_ERROR`]: this is a language-level parse
