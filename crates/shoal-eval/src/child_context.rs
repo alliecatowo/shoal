@@ -174,6 +174,7 @@ mod tests {
             ScopeChain {
                 cwd: dir.path().to_path_buf(),
                 scopes: vec![scope.clone()],
+                warnings: Vec::new(),
             },
         ));
         parent.exec.reef.overrides.push(scope.clone());

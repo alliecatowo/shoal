@@ -63,6 +63,7 @@
 
 pub mod error;
 pub mod hashcache;
+mod input;
 pub mod lock;
 pub mod manifest;
 pub mod provider;
@@ -75,6 +76,10 @@ pub mod version;
 pub mod view;
 
 pub use error::{ReefCode, ReefError, ReefResult};
+pub use input::{
+    REEF_MANIFEST_MAX_BYTES, REEF_MANIFEST_MAX_NESTING, REEF_MAX_RUNNERS, REEF_MAX_SCOPES,
+    REEF_MAX_STRING_BYTES, REEF_MAX_TOOLS,
+};
 pub use lock::{LockEntry, LockError, Lockfile};
 pub use manifest::{ManifestError, ManifestKind, ReefManifest, ToolReq};
 pub use provider::{Candidate, Provider, ProviderCtx, ProviderError};

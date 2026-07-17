@@ -5,7 +5,7 @@
 //! `len` and `mtime` so an in-place rewrite (same inode) still invalidates.
 
 use std::collections::HashMap;
-use std::io;
+use std::io::{self, Read};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
@@ -52,7 +52,21 @@ impl HashCache {
     /// Return the blake3 hex digest of the file at `path`, using the identity
     /// cache. Reads the file only on a cache miss.
     pub fn hash_file(&self, path: &Path) -> io::Result<String> {
-        let meta = std::fs::metadata(path)?;
+        let expected = std::fs::metadata(path)?;
+        if !expected.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "hash target is not a regular file",
+            ));
+        }
+        let mut file = std::fs::File::open(path)?;
+        let meta = file.metadata()?;
+        if !meta.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "opened hash target is not a regular file",
+            ));
+        }
         let key = IdKey {
             dev: meta.dev(),
             ino: meta.ino(),
@@ -63,8 +77,16 @@ impl HashCache {
         if let Some(h) = self.lock_map().get(&key) {
             return Ok(h.clone());
         }
-        let bytes = std::fs::read(path)?;
-        let hex = blake3::hash(&bytes).to_hex().to_string();
+        let mut hasher = blake3::Hasher::new();
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let count = file.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            hasher.update(&buffer[..count]);
+        }
+        let hex = hasher.finalize().to_hex().to_string();
         let mut map = self.lock_map();
         if map.len() >= MAX_HASH_CACHE_ENTRIES && !map.contains_key(&key) {
             map.clear();
@@ -177,5 +199,15 @@ mod tests {
                 "production hash cache synchronization contains `{forbidden}`"
             );
         }
+    }
+
+    #[test]
+    fn production_hashing_streams_instead_of_reading_whole_files() {
+        let production = include_str!("hashcache.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(!production.contains("std::fs::read("));
+        assert!(production.contains("[0u8; 64 * 1024]"));
     }
 }

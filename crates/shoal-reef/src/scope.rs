@@ -39,6 +39,9 @@ impl ScopeEntry {
 pub struct ScopeChain {
     pub cwd: PathBuf,
     pub scopes: Vec<ScopeEntry>,
+    /// Advisory discovery diagnostics. A malformed/oversized manifest is
+    /// skipped so farther scopes remain usable, but the reason is retained.
+    pub warnings: Vec<String>,
 }
 
 /// A cache key: the set of (path, mtime) pairs that produced a chain. Two chains
@@ -62,26 +65,36 @@ impl ScopeChain {
     /// use [`ReefManifest::parse_reef`] directly to surface parse errors).
     pub fn discover(cwd: &Path, user_manifest: Option<&Path>) -> ScopeChain {
         let mut scopes = Vec::new();
+        let mut warnings = Vec::new();
         let mut dir = Some(cwd);
         while let Some(d) = dir {
-            collect_dir(d, &mut scopes);
+            collect_dir(d, &mut scopes, &mut warnings);
             dir = d.parent();
         }
-        if let Some(user) = user_manifest
-            && let Ok(text) = std::fs::read_to_string(user)
-            && let Ok(manifest) = ReefManifest::parse_shoal_reef(&text)
-            && !manifest.tools.is_empty()
-        {
-            scopes.push(ScopeEntry {
-                kind: ManifestKind::ShoalUser,
-                source: user.to_path_buf(),
-                mtime: mtime_of(user),
-                manifest,
-            });
+        if let Some(user) = user_manifest {
+            match crate::input::read_optional(user) {
+                Ok(Some(text)) => match ReefManifest::parse_shoal_reef(&text) {
+                    Ok(manifest) if !manifest.tools.is_empty() => push_scope(
+                        &mut scopes,
+                        &mut warnings,
+                        ScopeEntry {
+                            kind: ManifestKind::ShoalUser,
+                            source: user.to_path_buf(),
+                            mtime: mtime_of(user),
+                            manifest,
+                        },
+                    ),
+                    Ok(_) => {}
+                    Err(error) => warnings.push(format!("{}: {error}", user.display())),
+                },
+                Ok(None) => {}
+                Err(error) => warnings.push(error.to_string()),
+            }
         }
         ScopeChain {
             cwd: cwd.to_path_buf(),
             scopes,
+            warnings,
         }
     }
 
@@ -121,7 +134,7 @@ impl ScopeChain {
     }
 }
 
-fn collect_dir(d: &Path, scopes: &mut Vec<ScopeEntry>) {
+fn collect_dir(d: &Path, scopes: &mut Vec<ScopeEntry>, warnings: &mut Vec<String>) {
     let candidates: &[(&str, ManifestKind)] = &[
         (".reef.toml", ManifestKind::Reef),
         ("mise.toml", ManifestKind::Mise),
@@ -130,8 +143,13 @@ fn collect_dir(d: &Path, scopes: &mut Vec<ScopeEntry>) {
     ];
     for (fname, kind) in candidates {
         let path = d.join(fname);
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
+        let text = match crate::input::read_optional(&path) {
+            Ok(Some(text)) => text,
+            Ok(None) => continue,
+            Err(error) => {
+                warnings.push(error.to_string());
+                continue;
+            }
         };
         let parsed = match kind {
             ManifestKind::Reef => ReefManifest::parse_reef(&text),
@@ -139,17 +157,38 @@ fn collect_dir(d: &Path, scopes: &mut Vec<ScopeEntry>) {
             ManifestKind::ToolVersions => ReefManifest::parse_tool_versions(&text),
             ManifestKind::ShoalUser => unreachable!("user scope not discovered by walk"),
         };
-        if let Ok(manifest) = parsed
-            && !manifest.tools.is_empty()
-        {
-            scopes.push(ScopeEntry {
-                kind: *kind,
-                source: path.clone(),
-                mtime: mtime_of(&path),
-                manifest,
-            });
+        match parsed {
+            Ok(manifest) if !manifest.tools.is_empty() => push_scope(
+                scopes,
+                warnings,
+                ScopeEntry {
+                    kind: *kind,
+                    source: path.clone(),
+                    mtime: mtime_of(&path),
+                    manifest,
+                },
+            ),
+            Ok(_) => {}
+            Err(error) => warnings.push(format!("{}: {error}", path.display())),
         }
     }
+}
+
+fn push_scope(scopes: &mut Vec<ScopeEntry>, warnings: &mut Vec<String>, entry: ScopeEntry) {
+    if scopes.len() >= crate::input::REEF_MAX_SCOPES {
+        if !warnings
+            .iter()
+            .any(|warning| warning.contains("scope identity limit"))
+        {
+            warnings.push(format!(
+                "{}: scope identity limit reached ({})",
+                entry.source.display(),
+                crate::input::REEF_MAX_SCOPES
+            ));
+        }
+        return;
+    }
+    scopes.push(entry);
 }
 
 fn mtime_of(p: &Path) -> Option<SystemTime> {
@@ -206,6 +245,53 @@ mod tests {
         let chain = ScopeChain::discover(base, None);
         let near = chain.nearest_for("nodejs").unwrap();
         assert_eq!(near.kind, ManifestKind::ToolVersions);
+    }
+
+    #[test]
+    fn hostile_near_manifest_warns_and_far_valid_scope_survives() {
+        let root = tempfile::tempdir().unwrap();
+        write(&root.path().join(".reef.toml"), "[tools]\nnode='20'\n");
+        let child = root.path().join("child");
+        fs::create_dir_all(&child).unwrap();
+        let hostile = child.join(".reef.toml");
+        let file = fs::File::create(&hostile).unwrap();
+        file.set_len((crate::input::REEF_MANIFEST_MAX_BYTES + 1) as u64)
+            .unwrap();
+
+        let chain = ScopeChain::discover(&child, None);
+        assert_eq!(
+            chain.nearest_for("node").unwrap().manifest.tools["node"].constraint,
+            crate::version::Constraint::parse("20")
+        );
+        assert!(chain.warnings.iter().any(|warning| {
+            warning.contains(&hostile.display().to_string()) && warning.contains("byte limit")
+        }));
+    }
+
+    #[test]
+    fn scope_identity_limit_is_explicit_and_bounded() {
+        let mut scopes = Vec::new();
+        let mut warnings = Vec::new();
+        for index in 0..=crate::input::REEF_MAX_SCOPES {
+            push_scope(
+                &mut scopes,
+                &mut warnings,
+                ScopeEntry {
+                    kind: ManifestKind::Reef,
+                    source: PathBuf::from(format!("/scope-{index}/.reef.toml")),
+                    manifest: ReefManifest::parse_reef("[tools]\nnode='1'\n").unwrap(),
+                    mtime: None,
+                },
+            );
+        }
+        assert_eq!(scopes.len(), crate::input::REEF_MAX_SCOPES);
+        assert_eq!(
+            warnings
+                .iter()
+                .filter(|warning| warning.contains("scope identity limit"))
+                .count(),
+            1
+        );
     }
 
     #[test]

@@ -314,7 +314,9 @@ impl Resolver {
                 blake3: hash.clone(),
                 resolved_at: now_rfc3339(),
             };
-            lock.insert(entry.clone());
+            lock.try_insert(entry.clone()).map_err(|error| {
+                ReefError::provider(format!("retaining lock entry for {name}: {error}"))
+            })?;
             notice(&LockNotice {
                 name: entry.name,
                 version: entry.version,

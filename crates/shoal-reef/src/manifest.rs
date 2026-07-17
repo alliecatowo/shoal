@@ -79,41 +79,66 @@ impl std::error::Error for ManifestError {}
 impl ReefManifest {
     /// Parse a native `.reef.toml`.
     pub fn parse_reef(text: &str) -> Result<ReefManifest, ManifestError> {
+        crate::input::validate_toml_text(text).map_err(manifest_error)?;
         let raw: RawReef =
             toml::from_str(text).map_err(|e| ManifestError { msg: e.to_string() })?;
-        Ok(raw.into_manifest())
+        validate_raw_reef(&raw).map_err(manifest_error)?;
+        let manifest = raw.into_manifest();
+        validate_manifest(&manifest).map_err(manifest_error)?;
+        Ok(manifest)
     }
 
     /// Parse the `[reef]` table out of a `shoal.toml` (user scope). A file with
     /// no `[reef]` table yields an empty manifest.
     pub fn parse_shoal_reef(text: &str) -> Result<ReefManifest, ManifestError> {
+        crate::input::validate_toml_text(text).map_err(manifest_error)?;
         let raw: RawShoal =
             toml::from_str(text).map_err(|e| ManifestError { msg: e.to_string() })?;
-        Ok(raw.reef.unwrap_or_default().into_manifest())
+        let raw = raw.reef.unwrap_or_default();
+        validate_raw_reef(&raw).map_err(manifest_error)?;
+        let manifest = raw.into_manifest();
+        validate_manifest(&manifest).map_err(manifest_error)?;
+        Ok(manifest)
     }
 
     /// Adapt a foreign `mise.toml` / `.mise.toml` (read-only). Reads the
     /// `[tools]` table; values may be a string, an array (first entry wins), or
     /// a table with a `version` key. Runners/hermetic are never inferred.
     pub fn parse_mise(text: &str) -> Result<ReefManifest, ManifestError> {
+        crate::input::validate_toml_text(text).map_err(manifest_error)?;
         let raw: RawMise =
             toml::from_str(text).map_err(|e| ManifestError { msg: e.to_string() })?;
+        if raw.tools.len() > crate::input::REEF_MAX_TOOLS {
+            return Err(manifest_error(format!(
+                "manifest has {} tools; maximum is {}",
+                raw.tools.len(),
+                crate::input::REEF_MAX_TOOLS
+            )));
+        }
         let mut tools = BTreeMap::new();
         for (name, val) in raw.tools {
             if let Some(constraint) = val.constraint() {
                 tools.insert(name, ToolReq::new(constraint));
             }
         }
-        Ok(ReefManifest {
+        let manifest = ReefManifest {
             tools,
             runners: RunnerTable::default(),
             hermetic: false,
-        })
+        };
+        validate_manifest(&manifest).map_err(manifest_error)?;
+        Ok(manifest)
     }
 
     /// Adapt a foreign `.tool-versions` file (read-only). Each non-comment line
     /// is `tool version [fallback…]`; the first version token is the constraint.
     pub fn parse_tool_versions(text: &str) -> Result<ReefManifest, ManifestError> {
+        if text.len() > crate::input::REEF_MANIFEST_MAX_BYTES {
+            return Err(manifest_error(format!(
+                "manifest exceeds the {}-byte limit",
+                crate::input::REEF_MANIFEST_MAX_BYTES
+            )));
+        }
         let mut tools = BTreeMap::new();
         for line in text.lines() {
             let line = line.split('#').next().unwrap_or("").trim();
@@ -124,6 +149,14 @@ impl ReefManifest {
             let (Some(name), Some(ver)) = (it.next(), it.next()) else {
                 continue;
             };
+            crate::input::validate_string("tool name", name).map_err(manifest_error)?;
+            crate::input::validate_string("tool constraint", ver).map_err(manifest_error)?;
+            if !tools.contains_key(name) && tools.len() >= crate::input::REEF_MAX_TOOLS {
+                return Err(manifest_error(format!(
+                    "manifest exceeds the {}-tool limit",
+                    crate::input::REEF_MAX_TOOLS
+                )));
+            }
             tools.insert(name.to_string(), ToolReq::new(Constraint::parse(ver)));
         }
         Ok(ReefManifest {
@@ -132,6 +165,69 @@ impl ReefManifest {
             hermetic: false,
         })
     }
+}
+
+fn manifest_error(message: impl Into<String>) -> ManifestError {
+    ManifestError {
+        msg: message.into(),
+    }
+}
+
+fn validate_manifest(manifest: &ReefManifest) -> Result<(), String> {
+    if manifest.tools.len() > crate::input::REEF_MAX_TOOLS {
+        return Err(format!(
+            "manifest has {} tools; maximum is {}",
+            manifest.tools.len(),
+            crate::input::REEF_MAX_TOOLS
+        ));
+    }
+    if manifest.runners.len() > crate::input::REEF_MAX_RUNNERS {
+        return Err(format!(
+            "manifest has {} runners; maximum is {}",
+            manifest.runners.len(),
+            crate::input::REEF_MAX_RUNNERS
+        ));
+    }
+    for (name, requirement) in &manifest.tools {
+        crate::input::validate_string("tool name", name)?;
+        crate::input::validate_string("tool constraint", &requirement.constraint.to_string())?;
+        if let Some(provider) = &requirement.provider {
+            crate::input::validate_string("provider", provider)?;
+        }
+    }
+    for (extension, invocation) in manifest.runners.iter() {
+        crate::input::validate_string("runner extension", extension)?;
+        crate::input::validate_string("runner tool", &invocation.tool)?;
+        if invocation.args_template.len() > crate::input::REEF_MAX_RUNNER_ARGS {
+            return Err(format!(
+                "runner {extension:?} has {} arguments; maximum is {}",
+                invocation.args_template.len(),
+                crate::input::REEF_MAX_RUNNER_ARGS
+            ));
+        }
+        for argument in &invocation.args_template {
+            crate::input::validate_string("runner argument", argument)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_raw_reef(raw: &RawReef) -> Result<(), String> {
+    if raw.tools.len() > crate::input::REEF_MAX_TOOLS {
+        return Err(format!(
+            "manifest has {} tools; maximum is {}",
+            raw.tools.len(),
+            crate::input::REEF_MAX_TOOLS
+        ));
+    }
+    if raw.runners.len() > crate::input::REEF_MAX_RUNNERS {
+        return Err(format!(
+            "manifest has {} runners; maximum is {}",
+            raw.runners.len(),
+            crate::input::REEF_MAX_RUNNERS
+        ));
+    }
+    Ok(())
 }
 
 // --- raw serde layer -------------------------------------------------------
@@ -338,6 +434,23 @@ go = { version = "1.21" }
         assert_eq!(m.tools["nodejs"].constraint, Constraint::parse("22.3.0"));
         assert_eq!(m.tools["python"].constraint, Constraint::parse("3.12.4"));
         assert_eq!(m.tools["ruby"].constraint, Constraint::parse("3.3"));
+    }
+
+    #[test]
+    fn manifest_width_and_strings_are_bounded_but_unknown_fields_remain_forward_compatible() {
+        let tools = (0..=crate::input::REEF_MAX_TOOLS)
+            .map(|index| format!("t{index}='1'\n"))
+            .collect::<String>();
+        assert!(ReefManifest::parse_reef(&format!("[tools]\n{tools}")).is_err());
+
+        let huge = "x".repeat(crate::input::REEF_MAX_STRING_BYTES + 1);
+        assert!(ReefManifest::parse_reef(&format!("[tools]\nnode='{huge}'\n")).is_err());
+
+        let compatible = ReefManifest::parse_reef(
+            "unknown_future_key=true\n[tools]\nnode='22'\n[options]\nfuture=false\n",
+        )
+        .unwrap();
+        assert!(compatible.tools.contains_key("node"));
     }
 
     #[test]
