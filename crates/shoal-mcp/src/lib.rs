@@ -1,7 +1,7 @@
 //! MCP stdio facade for the shoal kernel protocol.
 
 use serde_json::{Value, json};
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
@@ -175,9 +175,22 @@ pub(crate) fn short_ref_to_uri(short: &str) -> String {
     }
 }
 
+/// Bounded read (site/content/internals/hardening-roadmap.md HR-E1; deep-audit H6): `Take` caps how
+/// many bytes `read_line`'s internal loop can ever pull out of `reader` — once
+/// the limit is exhausted, `Take::fill_buf` reports EOF regardless of how
+/// much real data remains upstream, so `line` can never grow past
+/// `MAX_FRAME + 1` bytes no matter how large (or never-terminated) the actual
+/// input is. A bare `read_line` (the prior implementation) grows its output
+/// buffer to fit whatever the peer sends BEFORE the length check below ever
+/// runs, making the cap decoration rather than a real resource-exhaustion
+/// defense. Mirrors `shoal_proto::read_frame`'s fix for the same bug on the
+/// kernel side of this same wire contract.
 pub(crate) fn read_json_line<R: BufRead>(reader: &mut R) -> Result<Option<Value>, BridgeError> {
     let mut line = String::new();
-    let n = reader.read_line(&mut line)?;
+    let n = reader
+        .by_ref()
+        .take(MAX_FRAME as u64 + 1)
+        .read_line(&mut line)?;
     if n == 0 {
         return Ok(None);
     }
@@ -235,6 +248,47 @@ mod tests {
         };
         (d, c, h)
     }
+    /// HR-E1 / deep-audit H6 regression, mirroring `shoal_proto`'s equivalent
+    /// test: an unterminated, never-ending frame must not make
+    /// `read_json_line` allocate unboundedly. Before the `Take`-based fix,
+    /// the length check ran only after `read_line` returned, so this input
+    /// would have grown `line` without bound trying to find a newline that
+    /// never comes; with the fix, the call returns promptly with the
+    /// existing protocol error.
+    #[test]
+    fn read_json_line_rejects_unbounded_input_without_growing_past_the_cap() {
+        struct Infinite;
+        impl io::Read for Infinite {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                buf.fill(b'x');
+                Ok(buf.len())
+            }
+        }
+        let mut reader = io::BufReader::new(Infinite);
+        let err = read_json_line(&mut reader)
+            .expect_err("an unterminated, oversized frame must error, never hang or OOM");
+        match err {
+            BridgeError::Protocol(msg) => assert!(msg.contains("16 MiB"), "{msg}"),
+            other => panic!("expected a protocol error, got {other:?}"),
+        }
+    }
+
+    /// Companion case: a single, well-formed (newline-terminated) frame that
+    /// is simply too big must still be rejected with the same protocol
+    /// error, not silently truncated or accepted.
+    #[test]
+    fn read_json_line_rejects_a_single_oversize_line() {
+        let mut body = "x".repeat(MAX_FRAME + 1024);
+        body.push('\n');
+        let mut reader = io::BufReader::new(body.as_bytes());
+        let err = read_json_line(&mut reader)
+            .expect_err("a >16 MiB single frame must be a protocol error");
+        match err {
+            BridgeError::Protocol(msg) => assert!(msg.contains("16 MiB"), "{msg}"),
+            other => panic!("expected a protocol error, got {other:?}"),
+        }
+    }
+
     #[test]
     fn facade_attaches_and_maps_exec() {
         let (_d, c, h) = mock();
