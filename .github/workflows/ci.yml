@@ -15,6 +15,9 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Cargo-backed mise installs may both invoke rustup. Serializing avoids
+  # races over shared component download/rename paths on macOS runners.
+  MISE_JOBS: 1
   RUST_BACKTRACE: 1
 
 jobs:
@@ -87,6 +90,10 @@ jobs:
       - name: Bootstrap Shoal
         run: cargo build -p shoal --locked
       - name: Build fuzz targets through Shoal
+        env:
+          # mise-action activates the repository's stable Rust after its own
+          # install step; cargo-fuzz itself requires nightly sanitizer flags.
+          RUSTUP_TOOLCHAIN: nightly
         run: target/debug/shoal scripts/ci-fuzz-build.shl
 
   supply-chain-audit:

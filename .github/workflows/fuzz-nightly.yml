@@ -32,6 +32,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  MISE_JOBS: 1
   RUST_BACKTRACE: 1
 
 jobs:
@@ -53,6 +54,7 @@ jobs:
         run: cargo build -p shoal --locked
       - name: Run bounded campaigns through Shoal
         env:
+          RUSTUP_TOOLCHAIN: nightly
           SHOAL_FUZZ_SECONDS: ${{ github.event.inputs.seconds_per_target || '120' }}
         run: target/debug/shoal scripts/ci-fuzz-nightly.shl
       - name: Upload crash artifacts
