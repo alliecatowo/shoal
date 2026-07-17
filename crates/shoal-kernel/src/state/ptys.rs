@@ -1,13 +1,59 @@
-use super::super::{OwnerKey, PtyEntry, Ref, unknown_pty};
+use super::super::{OwnerKey, Ref, Session};
 use shoal_proto::RpcError;
 use shoal_proto::error_code::{INTERNAL_ERROR, QUOTA_EXCEEDED};
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const MAX_TERMINAL_PER_OWNER: usize = 64;
+
+/// One registered interactive PTY and the leases held only while its child is
+/// alive. The live child/emulator has its own mutex so registry operations
+/// never serialize terminal I/O for unrelated entries.
+pub(crate) struct PtyEntry {
+    pub(crate) owner: OwnerKey,
+    pub(crate) cmd: String,
+    pub(crate) session: Mutex<shoal_exec::PtySession>,
+    pub(crate) lifecycle: Mutex<PtyLifecycle>,
+}
+
+pub(crate) struct PtyLifecycle {
+    pub(crate) session_lease: Option<Arc<Session>>,
+    pub(crate) active_slot: Option<PtyPermit>,
+    pub(crate) terminal_since: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum PtyEntryInvariant {
+    Lifecycle,
+}
+
+impl PtyEntry {
+    pub(crate) fn mark_terminal(&self) -> Result<(), PtyEntryInvariant> {
+        let (active_slot, session_lease) = {
+            let mut lifecycle = self
+                .lifecycle
+                .lock()
+                .map_err(|_| PtyEntryInvariant::Lifecycle)?;
+            if lifecycle.terminal_since.is_some() {
+                return Ok(());
+            }
+            lifecycle.terminal_since = Some(Instant::now());
+            (lifecycle.active_slot.take(), lifecycle.session_lease.take())
+        };
+        drop((active_slot, session_lease));
+        Ok(())
+    }
+
+    fn terminal_since(&self) -> Result<Option<Instant>, PtyEntryInvariant> {
+        self.lifecycle
+            .lock()
+            .map(|lifecycle| lifecycle.terminal_since)
+            .map_err(|_| PtyEntryInvariant::Lifecycle)
+    }
+}
 
 /// Owns PTY identity, admission, ownership checks, and bounded terminal
 /// tombstones. The live child/emulator mutex is never acquired under the map
@@ -490,6 +536,14 @@ fn internal_pty(error: io::Error) -> RpcError {
             "component": "reaper",
             "quarantined": false,
         })),
+    }
+}
+
+fn unknown_pty() -> RpcError {
+    RpcError {
+        code: shoal_proto::error_code::UNKNOWN_PTY,
+        message: "unknown or closed pty_id".into(),
+        data: None,
     }
 }
 

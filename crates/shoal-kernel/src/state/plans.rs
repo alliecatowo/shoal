@@ -1,11 +1,118 @@
 use super::super::OwnerKey;
-use super::super::StoredPlan;
 use serde_json::json;
+use shoal_leash::Plan;
 use shoal_proto::RpcError;
 use shoal_proto::error_code::INTERNAL_ERROR;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+pub(crate) const MAX_STORED_PLANS_PER_OWNER: usize = 256;
+pub(crate) const MAX_PLAN_SOURCE_BYTES_PER_OWNER: usize = 64 * 1024 * 1024;
+pub(crate) const PLAN_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+pub(crate) const GRANT_RESERVATION_TTL: Duration = Duration::from_secs(30);
+
+pub(crate) struct StoredPlan {
+    pub(crate) src: String,
+    pub(crate) session: String,
+    /// The plan owner / requester that derived this plan.
+    pub(crate) principal: String,
+    /// Full BLAKE3 binding of source, canonical AST, plan, session, and requester.
+    pub(crate) plan_hash: String,
+    /// Full source digest retained separately for approval/audit projections.
+    pub(crate) source_hash: String,
+    pub(crate) plan: Plan,
+    pub(crate) authorization: PlanAuthorization,
+    pub(crate) created_at: Instant,
+}
+
+pub(crate) fn plan_expired(plan: &StoredPlan) -> bool {
+    // In-flight transitions own the plan until their durable side effect is
+    // resolved; purging one could orphan an approval audit or execution claim.
+    !matches!(
+        plan.authorization,
+        PlanAuthorization::Granting { .. } | PlanAuthorization::Claimed(_)
+    ) && plan.created_at.elapsed() > PLAN_TTL
+}
+
+impl StoredPlan {
+    fn recover_stale_grant(&mut self) {
+        let restore_policy_allowed = match &self.authorization {
+            PlanAuthorization::Granting {
+                restore_policy_allowed,
+                started_at,
+                lease,
+                ..
+            } if lease.upgrade().is_none() && started_at.elapsed() >= GRANT_RESERVATION_TTL => {
+                Some(*restore_policy_allowed)
+            }
+            _ => None,
+        };
+        if let Some(restore_policy_allowed) = restore_policy_allowed {
+            self.authorization = if restore_policy_allowed {
+                PlanAuthorization::PolicyAllowed
+            } else {
+                PlanAuthorization::Pending
+            };
+        }
+    }
+}
+
+/// One-way plan authorization state. Explicit approval is single-use: a
+/// claim excludes concurrent/replayed applies, and consumed grants never
+/// return to the approved state.
+#[derive(Clone)]
+pub(crate) enum PlanAuthorization {
+    PolicyAllowed,
+    Pending,
+    Denied,
+    Granting {
+        record: ApprovalRecord,
+        restore_policy_allowed: bool,
+        started_at: Instant,
+        lease: std::sync::Weak<()>,
+    },
+    Approved(ApprovalRecord),
+    Claimed(ApprovalRecord),
+    Consumed(ApprovalRecord),
+}
+
+impl PlanAuthorization {
+    pub(crate) fn is_approved(&self) -> bool {
+        matches!(
+            self,
+            Self::PolicyAllowed | Self::Approved(_) | Self::Claimed(_) | Self::Consumed(_)
+        )
+    }
+
+    pub(crate) fn is_pending(&self) -> bool {
+        matches!(self, Self::Pending)
+    }
+
+    pub(crate) fn approval(&self) -> Option<&ApprovalRecord> {
+        match self {
+            Self::Approved(record) | Self::Claimed(record) | Self::Consumed(record) => Some(record),
+            Self::PolicyAllowed | Self::Pending | Self::Denied | Self::Granting { .. } => None,
+        }
+    }
+}
+
+/// Durable approval identity binding requester, plan, approver, scope, and
+/// the execution that consumes the grant.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ApprovalRecord {
+    pub(crate) requester: String,
+    pub(crate) approver: String,
+    pub(crate) plan_ref: String,
+    pub(crate) plan_hash: String,
+    pub(crate) source_hash: String,
+    pub(crate) session: String,
+    pub(crate) scope: Vec<String>,
+    pub(crate) approved_at_ns: i64,
+    pub(crate) grant_audit_id: i64,
+    pub(crate) consumed_by: Option<i64>,
+}
 
 /// Stored plan objects and their one-way authorization transitions. Callers
 /// operate through bounded transactions; the mutex/map and its guard never

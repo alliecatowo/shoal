@@ -1,9 +1,287 @@
-use super::super::{OwnerKey, QuotaPermit, Ref, SessionQuota, TaskEntry, now_ns, task_record};
-use shoal_proto::RpcError;
+use super::super::{Kernel, OwnerKey, Session, now_ns};
+use serde_json::{Value as Json, json};
 use shoal_proto::error_code::{INTERNAL_ERROR, UNKNOWN_TASK};
+use shoal_proto::{Ref, RpcError, TaskRecord};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+
+pub(crate) struct TaskEntry {
+    pub(crate) task: Ref,
+    pub(crate) owner: OwnerKey,
+    pub(crate) session_id: String,
+    /// Held only while a worker can still use the evaluator session.
+    pub(crate) session_lease: Mutex<Option<Arc<Session>>>,
+    pub(crate) started_ns: i64,
+    pub(crate) inner: Mutex<TaskInner>,
+    pub(crate) done: Condvar,
+    pub(crate) cancel: shoal_exec::CancelToken,
+    pub(crate) cancel_requested: AtomicBool,
+}
+
+pub(crate) struct TaskInner {
+    pub(crate) state: &'static str,
+    pub(crate) finished_ns: Option<i64>,
+    pub(crate) result_ref: Option<Ref>,
+    pub(crate) exit_code: Option<i32>,
+    pub(crate) error: Option<RpcError>,
+    pub(crate) active_slot: Option<QuotaPermit>,
+}
+
+impl TaskEntry {
+    pub(crate) fn release_session_lease(&self) {
+        let mut lease = match self.session_lease.lock() {
+            Ok(lease) => lease,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        lease.take();
+        self.session_lease.clear_poison();
+    }
+
+    fn invariant_error(&self) -> RpcError {
+        RpcError {
+            code: INTERNAL_ERROR,
+            message: "task state was reconstructed after an internal failure".into(),
+            data: Some(json!({"task": self.task, "task_reconstructed": true})),
+        }
+    }
+
+    fn reconstruct_locked(
+        &self,
+        mut inner: std::sync::MutexGuard<'_, TaskInner>,
+        message: &'static str,
+    ) -> Option<QuotaPermit> {
+        inner.state = "failed";
+        inner.finished_ns = Some(now_ns());
+        inner.result_ref = None;
+        inner.exit_code = None;
+        inner.error = Some(RpcError {
+            code: INTERNAL_ERROR,
+            message: message.into(),
+            data: Some(json!({"task": self.task, "task_reconstructed": true})),
+        });
+        inner.active_slot.take()
+    }
+
+    fn finish_reconstruction(&self, active_slot: Option<QuotaPermit>) {
+        drop(active_slot);
+        self.release_session_lease();
+        self.done.notify_all();
+    }
+
+    pub(crate) fn lock_inner(&self) -> Result<std::sync::MutexGuard<'_, TaskInner>, RpcError> {
+        match self.inner.lock() {
+            Ok(inner) => Ok(inner),
+            Err(poisoned) => {
+                let inner = poisoned.into_inner();
+                let active_slot = self.reconstruct_locked(inner, "task state mutex was poisoned");
+                self.inner.clear_poison();
+                self.finish_reconstruction(active_slot);
+                Err(self.invariant_error())
+            }
+        }
+    }
+
+    pub(crate) fn repair_wait_poison(
+        &self,
+        poisoned: std::sync::PoisonError<std::sync::MutexGuard<'_, TaskInner>>,
+    ) -> RpcError {
+        let inner = poisoned.into_inner();
+        let active_slot = self.reconstruct_locked(inner, "task waiter state was poisoned");
+        self.inner.clear_poison();
+        self.finish_reconstruction(active_slot);
+        self.invariant_error()
+    }
+
+    pub(crate) fn repair_timeout_wait_poison(
+        &self,
+        poisoned: std::sync::PoisonError<(
+            std::sync::MutexGuard<'_, TaskInner>,
+            std::sync::WaitTimeoutResult,
+        )>,
+    ) -> RpcError {
+        let (inner, _) = poisoned.into_inner();
+        let active_slot = self.reconstruct_locked(inner, "task waiter state was poisoned");
+        self.inner.clear_poison();
+        self.finish_reconstruction(active_slot);
+        self.invariant_error()
+    }
+
+    /// Restore the complete terminal-task invariant after a worker panic.
+    pub(crate) fn fail_worker_panic(&self) {
+        let (active_slot, notify) = {
+            let inner = match self.inner.lock() {
+                Ok(inner) => inner,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if inner.finished_ns.is_some() {
+                let mut inner = inner;
+                let active_slot = inner.active_slot.take();
+                self.inner.clear_poison();
+                (active_slot, false)
+            } else {
+                let active_slot = self.reconstruct_locked(inner, "task worker panicked");
+                self.inner.clear_poison();
+                (active_slot, true)
+            }
+        };
+        drop(active_slot);
+        self.release_session_lease();
+        if notify {
+            self.done.notify_all();
+        }
+    }
+}
+
+/// Unwind guard that prevents worker panics from stranding task state, waiters,
+/// session leases, or active quota permits.
+pub(crate) struct TaskWorkerGuard {
+    task: Arc<TaskEntry>,
+    kernel: Arc<Kernel>,
+    channel: String,
+    armed: bool,
+}
+
+impl TaskWorkerGuard {
+    pub(crate) fn new(task: Arc<TaskEntry>, kernel: Arc<Kernel>, channel: String) -> Self {
+        Self {
+            task,
+            kernel,
+            channel,
+            armed: true,
+        }
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TaskWorkerGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.task.fail_worker_panic();
+            self.kernel.events.publish(
+                &self.task.owner,
+                &self.channel,
+                json!({
+                    "$": "record",
+                    "v": {
+                        "state": {"$":"str", "v":"failed"},
+                        "ref": Json::Null,
+                    }
+                }),
+            );
+            self.kernel.reap_finished_tasks(&self.task.owner);
+        }));
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct SessionQuota {
+    pub(crate) counts: Mutex<HashMap<OwnerKey, usize>>,
+    quarantined: AtomicBool,
+}
+
+pub(crate) struct QuotaPermit {
+    quota: Arc<SessionQuota>,
+    owner: OwnerKey,
+}
+
+impl SessionQuota {
+    pub(crate) fn reserve(
+        self: &Arc<Self>,
+        owner: &OwnerKey,
+        max: usize,
+        limit: &'static str,
+        noun: &'static str,
+    ) -> Result<QuotaPermit, RpcError> {
+        if self.quarantined.load(Ordering::Acquire) || self.counts.is_poisoned() {
+            self.quarantined.store(true, Ordering::Release);
+            return Err(task_quota_unavailable());
+        }
+        let mut counts = match self.counts.lock() {
+            Ok(counts) => counts,
+            Err(poisoned) => {
+                drop(poisoned);
+                self.quarantined.store(true, Ordering::Release);
+                return Err(task_quota_unavailable());
+            }
+        };
+        let current = counts.entry(owner.clone()).or_default();
+        if *current >= max {
+            return Err(RpcError {
+                code: shoal_proto::error_code::QUOTA_EXCEEDED,
+                message: format!("session has reached the {max}-{noun} limit"),
+                data: Some(json!({"limit": limit, "max": max})),
+            });
+        }
+        *current += 1;
+        Ok(QuotaPermit {
+            quota: self.clone(),
+            owner: owner.clone(),
+        })
+    }
+}
+
+impl Drop for QuotaPermit {
+    fn drop(&mut self) {
+        if self.quota.quarantined.load(Ordering::Acquire) {
+            return;
+        }
+        let mut counts = match self.quota.counts.lock() {
+            Ok(counts) => counts,
+            Err(poisoned) => {
+                drop(poisoned);
+                self.quota.quarantined.store(true, Ordering::Release);
+                return;
+            }
+        };
+        if let Some(current) = counts.get_mut(&self.owner) {
+            *current = current.saturating_sub(1);
+            if *current == 0 {
+                counts.remove(&self.owner);
+            }
+        }
+    }
+}
+
+fn task_quota_unavailable() -> RpcError {
+    RpcError {
+        code: INTERNAL_ERROR,
+        message: "task quota is quarantined; restart the kernel".into(),
+        data: Some(json!({
+            "subsystem": "task_quota",
+            "quarantined": true,
+            "restart_required": true,
+        })),
+    }
+}
+
+pub(crate) fn task_record(task: &Arc<TaskEntry>) -> Result<TaskRecord, RpcError> {
+    let inner = match task.lock_inner() {
+        Ok(inner) => inner,
+        // The first failure reconstructs and unpoisons the terminal record.
+        Err(_) => task.lock_inner()?,
+    };
+    Ok(task_record_locked(task, &inner))
+}
+
+pub(crate) fn task_record_locked(task: &TaskEntry, inner: &TaskInner) -> TaskRecord {
+    TaskRecord {
+        task: task.task.clone(),
+        session: task.session_id.clone(),
+        state: inner.state.into(),
+        started_ns: task.started_ns,
+        finished_ns: inner.finished_ns,
+        result_ref: inner.result_ref.clone(),
+        exit_code: inner.exit_code,
+        error: inner.error.clone(),
+    }
+}
 
 const MAX_FINISHED_PER_OWNER: usize = 512;
 pub(crate) const RETENTION_NS: i64 = 24 * 60 * 60 * 1_000_000_000;

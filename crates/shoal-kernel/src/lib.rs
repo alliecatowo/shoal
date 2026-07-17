@@ -143,446 +143,6 @@ impl Default for Limits {
 /// `lang_block` node — a breaking rename to the AST-kind enum.
 const AST_VERSION: u32 = 2;
 
-struct TaskEntry {
-    task: Ref,
-    owner: OwnerKey,
-    session_id: String,
-    /// Keeps the evaluator session live only while the worker can still use
-    /// it. Terminal task records retain immutable identity/results without
-    /// pinning an otherwise-idle session forever.
-    session_lease: Mutex<Option<Arc<Session>>>,
-    started_ns: i64,
-    inner: Mutex<TaskInner>,
-    done: Condvar,
-    cancel: shoal_exec::CancelToken,
-    cancel_requested: AtomicBool,
-}
-struct TaskInner {
-    state: &'static str,
-    finished_ns: Option<i64>,
-    result_ref: Option<Ref>,
-    exit_code: Option<i32>,
-    error: Option<RpcError>,
-    active_slot: Option<QuotaPermit>,
-}
-
-impl TaskEntry {
-    fn release_session_lease(&self) {
-        let mut lease = match self.session_lease.lock() {
-            Ok(lease) => lease,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        lease.take();
-        self.session_lease.clear_poison();
-    }
-
-    fn invariant_error(&self) -> RpcError {
-        RpcError {
-            code: INTERNAL_ERROR,
-            message: "task state was reconstructed after an internal failure".into(),
-            data: Some(json!({"task": self.task, "task_reconstructed": true})),
-        }
-    }
-
-    fn reconstruct_locked(
-        &self,
-        mut inner: std::sync::MutexGuard<'_, TaskInner>,
-        message: &'static str,
-    ) -> Option<QuotaPermit> {
-        inner.state = "failed";
-        inner.finished_ns = Some(now_ns());
-        inner.result_ref = None;
-        inner.exit_code = None;
-        inner.error = Some(RpcError {
-            code: INTERNAL_ERROR,
-            message: message.into(),
-            data: Some(json!({"task": self.task, "task_reconstructed": true})),
-        });
-        inner.active_slot.take()
-    }
-
-    fn finish_reconstruction(&self, active_slot: Option<QuotaPermit>) {
-        drop(active_slot);
-        self.release_session_lease();
-        self.done.notify_all();
-    }
-
-    fn lock_inner(&self) -> Result<std::sync::MutexGuard<'_, TaskInner>, RpcError> {
-        match self.inner.lock() {
-            Ok(inner) => Ok(inner),
-            Err(poisoned) => {
-                let inner = poisoned.into_inner();
-                let active_slot = self.reconstruct_locked(inner, "task state mutex was poisoned");
-                self.inner.clear_poison();
-                self.finish_reconstruction(active_slot);
-                Err(self.invariant_error())
-            }
-        }
-    }
-
-    fn repair_wait_poison(
-        &self,
-        poisoned: std::sync::PoisonError<std::sync::MutexGuard<'_, TaskInner>>,
-    ) -> RpcError {
-        let inner = poisoned.into_inner();
-        let active_slot = self.reconstruct_locked(inner, "task waiter state was poisoned");
-        self.inner.clear_poison();
-        self.finish_reconstruction(active_slot);
-        self.invariant_error()
-    }
-
-    fn repair_timeout_wait_poison(
-        &self,
-        poisoned: std::sync::PoisonError<(
-            std::sync::MutexGuard<'_, TaskInner>,
-            std::sync::WaitTimeoutResult,
-        )>,
-    ) -> RpcError {
-        let (inner, _) = poisoned.into_inner();
-        let active_slot = self.reconstruct_locked(inner, "task waiter state was poisoned");
-        self.inner.clear_poison();
-        self.finish_reconstruction(active_slot);
-        self.invariant_error()
-    }
-
-    /// Restore the complete terminal-task invariant after a worker panic.
-    /// Unlike evaluator state, TaskInner is a small host-owned record whose
-    /// safe failure state can be reconstructed in full: terminal timestamp,
-    /// no result, one explicit error, and no held active quota permit.
-    fn fail_worker_panic(&self) {
-        let (active_slot, notify) = {
-            let inner = match self.inner.lock() {
-                Ok(inner) => inner,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            if inner.finished_ns.is_some() {
-                let mut inner = inner;
-                let active_slot = inner.active_slot.take();
-                self.inner.clear_poison();
-                (active_slot, false)
-            } else {
-                let active_slot = self.reconstruct_locked(inner, "task worker panicked");
-                self.inner.clear_poison();
-                (active_slot, true)
-            }
-        };
-        drop(active_slot);
-        self.release_session_lease();
-        if notify {
-            self.done.notify_all();
-        }
-    }
-}
-
-/// Ensures an unwind anywhere in task dispatch/completion cannot strand a
-/// running task, its waiters, or its quota permit. Disarmed only after the
-/// ordinary terminal transition and notifications have completed.
-struct TaskWorkerGuard {
-    task: Arc<TaskEntry>,
-    kernel: Arc<Kernel>,
-    channel: String,
-    armed: bool,
-}
-
-impl TaskWorkerGuard {
-    fn new(task: Arc<TaskEntry>, kernel: Arc<Kernel>, channel: String) -> Self {
-        Self {
-            task,
-            kernel,
-            channel,
-            armed: true,
-        }
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for TaskWorkerGuard {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        // A guard destructor runs during unwinding; never allow a secondary
-        // failure in best-effort event publication/reaping to become a double
-        // panic that aborts the process.
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.task.fail_worker_panic();
-            self.kernel.events.publish(
-                &self.task.owner,
-                &self.channel,
-                json!({
-                    "$": "record",
-                    "v": {
-                        "state": {"$":"str", "v":"failed"},
-                        "ref": Json::Null,
-                    }
-                }),
-            );
-            self.kernel.reap_finished_tasks(&self.task.owner);
-        }));
-    }
-}
-
-/// A registered interactive PTY session (site/content/internals/kernel-protocol.md). The live
-/// [`shoal_exec::PtySession`] (child + PTY master + `vt100` emulator) sits
-/// behind a `Mutex` so `pty.send`/`pty.read`/`pty.resize`/`pty.close` from
-/// different connections serialize on it. `session_id`/`principal` scope it to
-/// its opener the same way [`TaskEntry`] scopes a task.
-struct PtyEntry {
-    owner: OwnerKey,
-    cmd: String,
-    session: Mutex<shoal_exec::PtySession>,
-    lifecycle: Mutex<PtyLifecycle>,
-}
-
-struct PtyLifecycle {
-    /// These leases exist only while the child is alive. A bounded terminal
-    /// screen record must not consume active quota or pin evaluator state.
-    session_lease: Option<Arc<Session>>,
-    active_slot: Option<PtyPermit>,
-    terminal_since: Option<Instant>,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum PtyEntryInvariant {
-    Lifecycle,
-}
-
-impl PtyEntry {
-    fn mark_terminal(&self) -> Result<(), PtyEntryInvariant> {
-        let (active_slot, session_lease) = {
-            let mut lifecycle = self
-                .lifecycle
-                .lock()
-                .map_err(|_| PtyEntryInvariant::Lifecycle)?;
-            if lifecycle.terminal_since.is_some() {
-                return Ok(());
-            }
-            lifecycle.terminal_since = Some(Instant::now());
-            (lifecycle.active_slot.take(), lifecycle.session_lease.take())
-        };
-        drop((active_slot, session_lease));
-        Ok(())
-    }
-
-    fn terminal_since(&self) -> Result<Option<Instant>, PtyEntryInvariant> {
-        self.lifecycle
-            .lock()
-            .map(|lifecycle| lifecycle.terminal_since)
-            .map_err(|_| PtyEntryInvariant::Lifecycle)
-    }
-}
-
-#[derive(Default)]
-struct SessionQuota {
-    counts: Mutex<HashMap<OwnerKey, usize>>,
-    quarantined: AtomicBool,
-}
-
-struct QuotaPermit {
-    quota: Arc<SessionQuota>,
-    owner: OwnerKey,
-}
-
-impl SessionQuota {
-    fn reserve(
-        self: &Arc<Self>,
-        owner: &OwnerKey,
-        max: usize,
-        limit: &'static str,
-        noun: &'static str,
-    ) -> Result<QuotaPermit, RpcError> {
-        if self.quarantined.load(Ordering::Acquire) || self.counts.is_poisoned() {
-            self.quarantined.store(true, Ordering::Release);
-            return Err(task_quota_unavailable());
-        }
-        let mut counts = match self.counts.lock() {
-            Ok(counts) => counts,
-            Err(poisoned) => {
-                drop(poisoned);
-                self.quarantined.store(true, Ordering::Release);
-                return Err(task_quota_unavailable());
-            }
-        };
-        let current = counts.entry(owner.clone()).or_default();
-        if *current >= max {
-            return Err(RpcError {
-                code: QUOTA_EXCEEDED,
-                message: format!("session has reached the {max}-{noun} limit"),
-                data: Some(json!({"limit": limit, "max": max})),
-            });
-        }
-        *current += 1;
-        Ok(QuotaPermit {
-            quota: self.clone(),
-            owner: owner.clone(),
-        })
-    }
-}
-
-impl Drop for QuotaPermit {
-    fn drop(&mut self) {
-        if self.quota.quarantined.load(Ordering::Acquire) {
-            return;
-        }
-        let mut counts = match self.quota.counts.lock() {
-            Ok(counts) => counts,
-            Err(poisoned) => {
-                drop(poisoned);
-                self.quota.quarantined.store(true, Ordering::Release);
-                return;
-            }
-        };
-        if let Some(current) = counts.get_mut(&self.owner) {
-            *current = current.saturating_sub(1);
-            if *current == 0 {
-                counts.remove(&self.owner);
-            }
-        }
-    }
-}
-
-fn task_quota_unavailable() -> RpcError {
-    RpcError {
-        code: INTERNAL_ERROR,
-        message: "task quota is quarantined; restart the kernel".into(),
-        data: Some(json!({
-            "subsystem": "task_quota",
-            "quarantined": true,
-            "restart_required": true,
-        })),
-    }
-}
-
-const PLAN_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
-const GRANT_RESERVATION_TTL: std::time::Duration = std::time::Duration::from_secs(30);
-const MAX_STORED_PLANS_PER_OWNER: usize = 256;
-const MAX_PLAN_SOURCE_BYTES_PER_OWNER: usize = 64 * 1024 * 1024;
-
-struct StoredPlan {
-    src: String,
-    session: String,
-    /// The plan owner / **requester** — the principal that derived this plan
-    /// (`exec {mode:"plan"}`). Distinct from an `ApprovalRecord::approver`.
-    principal: String,
-    /// Full (untruncated) BLAKE3 binding of source, canonical AST, derived plan,
-    /// session, and requester. Unlike `plan_ref`, this is content identity.
-    plan_hash: String,
-    /// Full source digest kept separately so approval/audit projections can
-    /// state exactly which source was authorized without copying source text.
-    source_hash: String,
-    plan: Plan,
-    authorization: PlanAuthorization,
-    created_at: Instant,
-}
-
-fn plan_expired(plan: &StoredPlan) -> bool {
-    // An in-flight transition owns this plan until its durable side effect is
-    // resolved. Purging it here could leave an approval audit or execution
-    // claim with no state to commit or roll back into.
-    !matches!(
-        plan.authorization,
-        PlanAuthorization::Granting { .. } | PlanAuthorization::Claimed(_)
-    ) && plan.created_at.elapsed() > PLAN_TTL
-}
-
-impl StoredPlan {
-    fn recover_stale_grant(&mut self) {
-        let restore_policy_allowed = match &self.authorization {
-            PlanAuthorization::Granting {
-                restore_policy_allowed,
-                started_at,
-                lease,
-                ..
-            } if lease.upgrade().is_none() && started_at.elapsed() >= GRANT_RESERVATION_TTL => {
-                Some(*restore_policy_allowed)
-            }
-            _ => None,
-        };
-        if let Some(restore_policy_allowed) = restore_policy_allowed {
-            self.authorization = if restore_policy_allowed {
-                PlanAuthorization::PolicyAllowed
-            } else {
-                PlanAuthorization::Pending
-            };
-        }
-    }
-}
-
-/// Authorization is a one-way state machine. An explicit approval is a
-/// single-use capability: claiming it excludes concurrent/replayed applies,
-/// and a completed execution can never be returned to the approved state.
-#[derive(Clone)]
-enum PlanAuthorization {
-    PolicyAllowed,
-    Pending,
-    Denied,
-    /// A validated approval whose durable grant audit is being appended
-    /// outside the plan-registry transaction. No apply or second grant may
-    /// pass this state.
-    Granting {
-        record: ApprovalRecord,
-        restore_policy_allowed: bool,
-        started_at: Instant,
-        lease: std::sync::Weak<()>,
-    },
-    Approved(ApprovalRecord),
-    Claimed(ApprovalRecord),
-    Consumed(ApprovalRecord),
-}
-
-impl PlanAuthorization {
-    fn is_approved(&self) -> bool {
-        matches!(
-            self,
-            Self::PolicyAllowed | Self::Approved(_) | Self::Claimed(_) | Self::Consumed(_)
-        )
-    }
-
-    fn is_pending(&self) -> bool {
-        matches!(self, Self::Pending)
-    }
-
-    fn approval(&self) -> Option<&ApprovalRecord> {
-        match self {
-            Self::Approved(record) | Self::Claimed(record) | Self::Consumed(record) => Some(record),
-            Self::PolicyAllowed | Self::Pending | Self::Denied | Self::Granting { .. } => None,
-        }
-    }
-}
-
-/// The auditable record binding an approval to its requester, plan, approver,
-/// scope, and consuming execution (HR-D2). Mirrored into the journal as an
-/// audit entry at approval time (`record_approval_audit`) and surfaced on
-/// `plan.get` so the whole chain is inspectable, never an unattributed bit.
-#[derive(Clone, PartialEq, Eq)]
-struct ApprovalRecord {
-    /// The plan owner whose effects were approved.
-    requester: String,
-    /// The authenticated, authorized principal that approved (the
-    /// `cap.request` caller; distinct unless self-ack was explicitly enabled).
-    approver: String,
-    /// The source-anchored plan ref/hash this approval is bound to.
-    plan_ref: String,
-    /// Immutable full plan/content digest copied from [`StoredPlan`].
-    plan_hash: String,
-    /// Immutable full source digest copied from [`StoredPlan`].
-    source_hash: String,
-    /// Session in which the requester derived the plan.
-    session: String,
-    /// The effect kinds the approval was scoped to (empty ⇒ the whole plan).
-    scope: Vec<String>,
-    /// When the approval was granted (ns since epoch).
-    approved_at_ns: i64,
-    /// Completed journal row that durably records the grant itself.
-    grant_audit_id: i64,
-    /// The journal entry id of the execution that consumed this approval, once
-    /// an approved `exec` actually ran the plan. `None` until then.
-    consumed_by: Option<i64>,
-}
-
 impl Kernel {
     pub fn new() -> Arc<Self> {
         let limits = Limits::default();
@@ -1042,29 +602,6 @@ fn is_read_timeout(error: &io::Error) -> bool {
     )
 }
 
-fn task_record(task: &Arc<TaskEntry>) -> Result<TaskRecord, RpcError> {
-    let inner = match task.lock_inner() {
-        Ok(inner) => inner,
-        // `lock_inner` fully reconstructs and unpoisons TaskInner before
-        // returning this first error. Reads retry once so callers observe the
-        // durable terminal failure record; mutation paths retain the error.
-        Err(_) => task.lock_inner()?,
-    };
-    Ok(task_record_locked(task, &inner))
-}
-fn task_record_locked(task: &TaskEntry, inner: &TaskInner) -> TaskRecord {
-    TaskRecord {
-        task: task.task.clone(),
-        session: task.session_id.clone(),
-        state: inner.state.into(),
-        started_ns: task.started_ns,
-        finished_ns: inner.finished_ns,
-        result_ref: inner.result_ref.clone(),
-        exit_code: inner.exit_code,
-        error: inner.error.clone(),
-    }
-}
-
 struct BoundSocket(std::path::PathBuf);
 impl Drop for BoundSocket {
     fn drop(&mut self) {
@@ -1106,13 +643,6 @@ fn not_attached() -> RpcError {
     RpcError {
         code: NOT_ATTACHED,
         message: "attach to a session first".into(),
-        data: None,
-    }
-}
-fn unknown_pty() -> RpcError {
-    RpcError {
-        code: UNKNOWN_PTY,
-        message: "unknown or closed pty_id".into(),
         data: None,
     }
 }
@@ -1494,6 +1024,43 @@ unsafe fn libc_geteuid() -> u32 {
         fn geteuid() -> u32;
     }
     unsafe { geteuid() }
+}
+
+#[cfg(test)]
+mod root_structure_guard {
+    /// `lib.rs` is the composition root, not the owner of subsystem records.
+    /// The threshold leaves modest wiring headroom above the post-split size;
+    /// crossing it requires another extraction instead of silent regrowth.
+    #[test]
+    fn kernel_root_stays_a_composition_root() {
+        const MAX_ROOT_LINES: usize = 1_100;
+        let root = include_str!("lib.rs");
+        let lines = root.lines().count();
+        assert!(
+            lines <= MAX_ROOT_LINES,
+            "kernel lib.rs grew to {lines} lines (limit {MAX_ROOT_LINES}); move subsystem state to its owning module"
+        );
+        for state_type in [
+            "TaskEntry",
+            "TaskInner",
+            "SessionQuota",
+            "StoredPlan",
+            "PlanAuthorization",
+            "ApprovalRecord",
+            "PtyEntry",
+            "PtyLifecycle",
+        ] {
+            let declaration = format!("struct {state_type}");
+            let enum_declaration = format!("enum {state_type}");
+            assert!(
+                !root.lines().any(|line| {
+                    let line = line.trim_start();
+                    line.starts_with(&declaration) || line.starts_with(&enum_declaration)
+                }),
+                "{state_type} belongs in crates/shoal-kernel/src/state, not lib.rs"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
