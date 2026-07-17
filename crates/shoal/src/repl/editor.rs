@@ -255,6 +255,14 @@ pub(super) fn input_is_incomplete(source: &str) -> bool {
     if quote.is_some() || !stack.is_empty() {
         return true;
     }
+
+    // A slash at the end of a command-mode path is a complete token (`ls
+    // example/`), while a slash at the end of an expression (`1 /`) asks for
+    // another operand. Let the modal parser settle valid complete programs
+    // before applying the lightweight operator continuation fallback.
+    if shoal_syntax::parse(source).is_ok() {
+        return false;
+    }
     let tail = source.trim_end();
     tail.ends_with('\\')
         || ["&&", "||", "??", "+", "-", "*", "/", "%", "=", ",", "."]

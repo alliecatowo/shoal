@@ -221,6 +221,9 @@ fn multiline_detection_ignores_balanced_delimiters_in_strings_and_comments() {
     assert!(!input_is_incomplete("echo \"{\""));
     assert!(!input_is_incomplete("# {\n1"));
     assert!(!input_is_incomplete("[1, 2]"));
+    assert!(!input_is_incomplete("ls example/"));
+    assert!(!input_is_incomplete("cat ./"));
+    assert!(input_is_incomplete("1 /"));
 }
 
 /// Job-control line recognition (site/content/internals/language-conformance-contract.md): bare `fg`/`bg` and `%N`/`N`

@@ -2,9 +2,11 @@ use crate::args::KernelAction;
 
 pub(crate) fn run(action: KernelAction) -> Result<i32, String> {
     let config = shoal_mcp::Config::from_env()?;
-    if matches!(action, KernelAction::Start { .. }) {
-        shoal_mcp::ensure_kernel(&config);
-    }
+    // Retain ownership until the newly started daemon answers a real request.
+    // On failure, dropping the guard cleans up the process group. On success,
+    // transfer it out of the short-lived CLI so the daemon stays running.
+    let autostart =
+        matches!(action, KernelAction::Start { .. }).then(|| shoal_mcp::start_kernel(&config));
     let mut client = shoal_mcp::KernelClient::connect(&config).map_err(|error| {
         format!(
             "kernel is not reachable at {}: {error}",
@@ -18,6 +20,11 @@ pub(crate) fn run(action: KernelAction) -> Result<i32, String> {
     let result = client
         .call(method, serde_json::json!({}))
         .map_err(|error| error.to_string())?;
+    if let Some(autostart) = autostart {
+        // Dropping a Child handle does not kill the process. Once this command
+        // exits the durable daemon is adopted by the user's process manager.
+        drop(autostart.into_child());
+    }
     if json_output {
         println!(
             "{}",

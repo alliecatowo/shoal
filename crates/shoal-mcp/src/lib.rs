@@ -162,6 +162,17 @@ impl KernelAutostart {
         }
     }
 
+    /// Transfer a successfully started kernel to an external supervisor.
+    ///
+    /// MCP facades deliberately retain their guard so dropping the facade
+    /// tears down the daemon it owns. The explicit `shoal kernel start`
+    /// command has the opposite lifecycle: after a successful status probe it
+    /// exits while the daemon remains alive. Returning the `Child` makes that
+    /// ownership transfer explicit and also lets tests retain/reap it.
+    pub fn into_child(mut self) -> Option<Child> {
+        self.child.take()
+    }
+
     fn terminate(&mut self) {
         let Some(mut child) = self.child.take() else {
             return;
@@ -221,6 +232,17 @@ pub fn ensure_kernel(config: &Config) -> KernelAutostart {
         return KernelAutostart::empty();
     }
     if std::env::var_os("SHOAL_NO_AUTOSTART").is_some_and(|v| !v.is_empty()) {
+        return KernelAutostart::empty();
+    }
+    start_kernel(config)
+}
+
+/// Start a kernel for an explicit supervisor command.
+///
+/// Unlike [`ensure_kernel`], this ignores `SHOAL_NO_AUTOSTART`: that variable
+/// disables implicit MCP startup, not an operator's explicit `kernel start`.
+pub fn start_kernel(config: &Config) -> KernelAutostart {
+    if UnixStream::connect(&config.socket).is_ok() {
         return KernelAutostart::empty();
     }
     if !autostart_config_admitted(config) {
@@ -665,6 +687,21 @@ mod tests {
         drop(guard);
         assert!(process_is_gone(pid));
         drop(listener);
+    }
+
+    #[test]
+    fn explicit_supervisor_can_transfer_child_without_drop_killing_it() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 30"]).process_group(0);
+        let child = command.spawn().unwrap();
+        let pid = child.id();
+        let guard = KernelAutostart::new(child);
+
+        let mut child = guard.into_child().expect("spawned child transfers");
+        assert!(!process_is_gone(pid));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(process_is_gone(pid));
     }
 
     #[test]
