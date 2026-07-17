@@ -977,7 +977,7 @@ pins it — just verify empirically if you hit an edge).
 | `custom` ✓ | a named, ad-hoc error with a specific message (e.g. the `cd`-in-`fn`/`env`-in-`fn` fix-its) | `reef.toml:reef-cd-inside-fn-body-is-illegal` |
 | `assert_failed` | (pinned; no corpus case reviewed) | — |
 | `permission` | (pinned; no corpus case reviewed) | — |
-| `recursion_limit` | recursion/loop depth exceeded (depth 10k, site/content/internals/language-conformance-contract.md) | restructure; loop limit is off in script mode |
+| `recursion_limit` | function recursion exceeded the native-stack-safe depth of 128 | restructure the recursion; loop iteration limits are a separate policy |
 | `overflow` ✓ | numeric/quantity arithmetic overflowed its representation (pinned in site/content/internals/intercrate-protocol-contracts.md; **corpus** `numbers-more.toml`; verified against the binary: `52w * 200000000` → `overflow: duration overflow`) | keep duration/size arithmetic inside i64-ns / u64-byte bounds |
 | `reef_unlocked` ✓ | a `with reef:`-constrained tool used in a non-interactive/script context without a lock | `reef.toml:reef-with-reef-constrains-a-spawn-inside-the-block` |
 | `reef_drift` | resolved binary's hash no longer matches the lock | `reef lock --refresh` (site/content/internals/reef-resolution.md; not verified reachable in this pass) |
