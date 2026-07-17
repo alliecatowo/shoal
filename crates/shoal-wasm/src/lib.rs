@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 use wasmtime::{
-    Config, Engine, Store, StoreLimits, StoreLimitsBuilder,
+    Config, Engine, Store, StoreLimits, StoreLimitsBuilder, UpdateDeadline,
     component::{Component, HasSelf, Linker},
 };
 
@@ -145,6 +145,13 @@ pub trait CapabilityProvider: Send + Sync {
     fn authorize(&self, effect: &Effect) -> Result<(), CapabilityError>;
     fn now_ns(&self) -> Result<u64, CapabilityError>;
     fn read_file(&self, path: &Path) -> Result<Vec<u8>, CapabilityError>;
+
+    /// Whether the invocation's owning session has been cancelled. The store
+    /// checks this on every epoch tick, so pure guest computation is
+    /// interruptible even when it never crosses a hostcall boundary.
+    fn cancelled(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Default)]
@@ -182,6 +189,8 @@ pub enum PluginError {
     Component { name: String, message: String },
     #[error("plugin `{0}` not found")]
     NotFound(String),
+    #[error("plugin invocation cancelled")]
+    Cancelled,
     #[error("plugin value rejected: {0}")]
     Value(String),
     #[error("plugin `{name}` returned {kind}: {message}")]
@@ -493,14 +502,13 @@ pub struct Host {
     engine: Engine,
     limits: Limits,
     #[cfg(target_has_atomic = "64")]
-    deadline_ticker: DeadlineTicker,
+    _deadline_ticker: DeadlineTicker,
 }
 
 #[cfg(target_has_atomic = "64")]
 struct DeadlineTicker {
     cancel: Option<std::sync::mpsc::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
-    tick: Duration,
 }
 
 #[cfg(target_has_atomic = "64")]
@@ -524,14 +532,7 @@ impl DeadlineTicker {
         Ok(Self {
             cancel: Some(cancel_tx),
             thread: Some(thread),
-            tick,
         })
-    }
-
-    fn ticks_for(&self, duration: Duration) -> u64 {
-        let duration_ns = duration.as_nanos();
-        let tick_ns = self.tick.as_nanos();
-        duration_ns.div_ceil(tick_ns).max(1).min(u64::MAX as u128) as u64
     }
 }
 
@@ -564,7 +565,7 @@ impl Host {
             engine,
             limits,
             #[cfg(target_has_atomic = "64")]
-            deadline_ticker,
+            _deadline_ticker: deadline_ticker,
         })
     }
 
@@ -598,12 +599,12 @@ impl Host {
         let bindings =
             self.instantiate_with_deadline(&manifest.name, &mut store, &linker, &component)?;
         #[cfg(target_has_atomic = "64")]
-        store.set_epoch_deadline(self.deadline_ticker.ticks_for(self.limits.wall_time));
+        store.set_epoch_deadline(1);
         let commands = self.with_deadline(&manifest.name, "commands metadata", || {
             bindings.call_commands(&mut store)
         })?;
         #[cfg(target_has_atomic = "64")]
-        store.set_epoch_deadline(self.deadline_ticker.ticks_for(self.limits.wall_time));
+        store.set_epoch_deadline(1);
         let methods = self.with_deadline(&manifest.name, "methods metadata", || {
             bindings.call_methods(&mut store)
         })?;
@@ -651,6 +652,7 @@ impl Host {
                 self.limits.value_bytes
             )));
         }
+        let cancellation = capabilities.clone();
         let mut store = self.new_store(
             &plugin.manifest.name,
             &plugin.manifest.effects,
@@ -662,12 +664,22 @@ impl Host {
             &mut store,
             &linker,
             &plugin.component,
-        )?;
+        );
+        let bindings = match bindings {
+            Ok(bindings) => bindings,
+            Err(_) if cancellation.cancelled() => return Err(PluginError::Cancelled),
+            Err(error) => return Err(error),
+        };
         #[cfg(target_has_atomic = "64")]
-        store.set_epoch_deadline(self.deadline_ticker.ticks_for(self.limits.wall_time));
+        store.set_epoch_deadline(1);
         let result = self.with_deadline(&plugin.manifest.name, "command invocation", || {
             bindings.call_invoke_command(&mut store, command, &args)
-        })?;
+        });
+        let result = match result {
+            Ok(result) => result,
+            Err(_) if cancellation.cancelled() => return Err(PluginError::Cancelled),
+            Err(error) => return Err(error),
+        };
         match result {
             Ok(value) => PluginValue::from_guest(value, self.limits.value_bytes),
             Err(error) => {
@@ -720,7 +732,21 @@ impl Host {
                 message: error.to_string(),
             })?;
         #[cfg(target_has_atomic = "64")]
-        store.set_epoch_deadline(self.deadline_ticker.ticks_for(self.limits.wall_time));
+        {
+            let wall_time = self.limits.wall_time;
+            let started = std::time::Instant::now();
+            let cancellation = store.data().capabilities.clone();
+            store.epoch_deadline_callback(move |_| {
+                Ok(
+                    if cancellation.cancelled() || started.elapsed() >= wall_time {
+                        UpdateDeadline::Interrupt
+                    } else {
+                        UpdateDeadline::Continue(1)
+                    },
+                )
+            });
+            store.set_epoch_deadline(1);
+        }
         Ok(store)
     }
 
@@ -866,6 +892,15 @@ pub struct Registry {
     plugins: BTreeMap<String, ValidatedPlugin>,
 }
 
+/// Immutable command-resolution data retained by a validated registry.
+#[derive(Debug, Clone, Copy)]
+pub struct CommandMetadata<'a> {
+    pub plugin: &'a str,
+    pub declaration: &'a CommandDecl,
+    pub effects: &'a [Effect],
+    pub digest: blake3::Hash,
+}
+
 impl Registry {
     pub fn new(limits: Limits) -> Result<Self, PluginError> {
         Ok(Self {
@@ -910,6 +945,22 @@ impl Registry {
         Ok(())
     }
 
+    /// Discover manifests from configured directories in caller-provided
+    /// directory order and lexical path order within each directory. Engine
+    /// construction is fatal; malformed individual manifests are accumulated
+    /// so a host can report them without discarding every valid plugin.
+    pub fn discover(
+        dirs: &[PathBuf],
+        limits: Limits,
+    ) -> Result<(Self, Vec<PluginError>), PluginError> {
+        let mut registry = Self::new(limits)?;
+        let mut errors = Vec::new();
+        for dir in dirs {
+            errors.extend(registry.load_dir(dir));
+        }
+        Ok((registry, errors))
+    }
+
     pub fn load_dir(&mut self, dir: &Path) -> Vec<PluginError> {
         let entries = match fs::read_dir(dir) {
             Ok(entries) => entries,
@@ -950,6 +1001,44 @@ impl Registry {
 
     pub fn get(&self, name: &str) -> Option<&ValidatedPlugin> {
         self.plugins.get(name)
+    }
+
+    pub fn command(&self, name: &str) -> Option<CommandMetadata<'_>> {
+        self.plugins.values().find_map(|plugin| {
+            plugin
+                .manifest
+                .commands
+                .iter()
+                .find(|command| command.name == name)
+                .map(|declaration| CommandMetadata {
+                    plugin: &plugin.manifest.name,
+                    declaration,
+                    effects: &plugin.manifest.effects,
+                    digest: plugin.digest,
+                })
+        })
+    }
+
+    pub fn command_names(&self) -> impl Iterator<Item = &str> {
+        self.plugins.values().flat_map(|plugin| {
+            plugin
+                .manifest
+                .commands
+                .iter()
+                .map(|command| command.name.as_str())
+        })
+    }
+
+    pub fn invoke_declared_command(
+        &self,
+        command: &str,
+        args: Vec<PluginValue>,
+        capabilities: Arc<dyn CapabilityProvider>,
+    ) -> Result<PluginValue, PluginError> {
+        let metadata = self
+            .command(command)
+            .ok_or_else(|| PluginError::NotFound(command.to_string()))?;
+        self.invoke_command(metadata.plugin, command, args, capabilities)
     }
 
     pub fn invoke_command(
@@ -1066,6 +1155,26 @@ mod tests {
         read_result: Vec<u8>,
     }
 
+    struct CancelledCapabilities;
+
+    impl CapabilityProvider for CancelledCapabilities {
+        fn authorize(&self, _effect: &Effect) -> Result<(), CapabilityError> {
+            Ok(())
+        }
+
+        fn now_ns(&self) -> Result<u64, CapabilityError> {
+            Ok(0)
+        }
+
+        fn read_file(&self, _path: &Path) -> Result<Vec<u8>, CapabilityError> {
+            Ok(Vec::new())
+        }
+
+        fn cancelled(&self) -> bool {
+            true
+        }
+    }
+
     impl RecordingCapabilities {
         fn new(allow: bool) -> Self {
             Self {
@@ -1177,11 +1286,56 @@ mod tests {
         .unwrap();
         let mut registry = Registry::new(Limits::default()).unwrap();
         registry.load_manifest(&path).unwrap();
+        let metadata = registry.command("test").unwrap();
+        assert_eq!(metadata.plugin, "test");
+        assert_eq!(metadata.declaration.name, "test");
+        assert_eq!(registry.command_names().collect::<Vec<_>>(), vec!["test"]);
         fs::write(temp.path().join("p.wasm"), b"replaced after validation").unwrap();
         let value = registry
-            .invoke_command("test", "test", Vec::new(), Arc::new(DenyAllCapabilities))
+            .invoke_declared_command("test", Vec::new(), Arc::new(DenyAllCapabilities))
             .unwrap();
         assert_eq!(value, PluginValue::Null);
+    }
+
+    #[cfg(target_has_atomic = "64")]
+    #[test]
+    fn session_cancellation_interrupts_compute_only_guest_code() {
+        let component = valid_component(|wat| {
+            set_func_i32_result(wat, 4, 16);
+            set_func_i32_result(wat, 6, 128);
+            let function = wat.find("(func (;6;)").unwrap();
+            let result = wat[function..].find("i32.const 128").unwrap() + function;
+            wat.insert_str(result, "(loop $forever (br $forever))\n");
+            let end = wat.rfind(')').unwrap();
+            wat.insert_str(
+                end,
+                concat!(
+                    "(data (i32.const 0) \"\\20\\00\\00\\00\\01\\00\\00\\00\")\n",
+                    "(data (i32.const 32) \"\\40\\00\\00\\00\\04\\00\\00\\00\\44\\00\\00\\00\\02\\00\\00\\00\")\n",
+                    "(data (i32.const 64) \"test{}\")\n",
+                ),
+            );
+        });
+        let (_temp, path) = fixture_bytes(&component);
+        fs::write(
+            &path,
+            "name='test'\nversion='0.1'\nabi_version=1\ncomponent='p.wasm'\neffects=[]\n\
+             [[commands]]\nname='test'\nsignature='{}'\n",
+        )
+        .unwrap();
+        let mut registry = Registry::new(Limits {
+            fuel: u64::MAX,
+            wall_time: Duration::from_secs(5),
+            ..Limits::default()
+        })
+        .unwrap();
+        registry.load_manifest(&path).unwrap();
+        let started = Instant::now();
+        let error = registry
+            .invoke_declared_command("test", Vec::new(), Arc::new(CancelledCapabilities))
+            .unwrap_err();
+        assert!(matches!(error, PluginError::Cancelled));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]
