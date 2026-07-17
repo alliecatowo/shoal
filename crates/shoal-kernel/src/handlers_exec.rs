@@ -355,7 +355,7 @@ impl Kernel {
                 Verdict::Allow => {}
             }
         }
-        evaluator.interactive = false;
+        evaluator.set_interactive(false);
         let started = Instant::now();
         let opaque = run_plan.effects.iter().any(|e| matches!(e, Effect::Opaque));
         let mut journal_effects = run_plan

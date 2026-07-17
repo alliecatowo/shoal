@@ -44,6 +44,7 @@ pub(crate) enum ChildScope {
 /// fields are cheap to clone (`Arc` handles or small owned data) and `Send`, so
 /// the context can be moved into a worker thread and built there.
 pub(crate) struct ChildContext {
+    session: session_ctx::SessionCtx,
     cwd: PathBuf,
     env: Env,
     process_env: Vec<(OsString, OsString)>,
@@ -55,15 +56,12 @@ pub(crate) struct ChildContext {
     opener: Arc<dyn Opener>,
     secrets: Arc<dyn SecretPort>,
     config: Arc<dyn ConfigPort>,
-    leash: Option<(LeashPolicy, String)>,
     reef_chain: Option<(PathBuf, shoal_reef::ScopeChain)>,
     reef_resolver: Option<Arc<shoal_reef::Resolver>>,
     reef_lock: shoal_reef::Lockfile,
     reef_lock_path: Option<PathBuf>,
     reef_user_manifest: Option<PathBuf>,
     reef_overrides: Vec<shoal_reef::ScopeEntry>,
-    session_id: String,
-    principal: String,
 }
 
 impl Evaluator {
@@ -73,6 +71,7 @@ impl Evaluator {
     /// may move it into a worker thread and call [`ChildContext::build`] there.
     pub(crate) fn child_context(&self) -> ChildContext {
         ChildContext {
+            session: self.session.for_child(),
             cwd: self.cwd.clone(),
             env: self.env.clone(),
             process_env: self.process_env.clone(),
@@ -84,15 +83,12 @@ impl Evaluator {
             opener: self.opener.clone(),
             secrets: self.secrets.clone(),
             config: self.config.clone(),
-            leash: self.leash.clone(),
             reef_chain: self.reef_chain.clone(),
             reef_resolver: self.reef_resolver.clone(),
             reef_lock: self.reef_lock.clone(),
             reef_lock_path: self.reef_lock_path.clone(),
             reef_user_manifest: self.reef_user_manifest.clone(),
             reef_overrides: self.reef_overrides.clone(),
-            session_id: self.session_id.clone(),
-            principal: self.principal.clone(),
         }
     }
 }
@@ -110,6 +106,7 @@ impl ChildContext {
     /// any captured field that is not re-applied to the child.
     pub(crate) fn build(self, scope: ChildScope, cancel: CancelToken) -> Evaluator {
         let ChildContext {
+            session,
             cwd,
             env,
             process_env,
@@ -121,18 +118,18 @@ impl ChildContext {
             opener,
             secrets,
             config,
-            leash,
             reef_chain,
             reef_resolver,
             reef_lock,
             reef_lock_path,
             reef_user_manifest,
             reef_overrides,
-            session_id,
-            principal,
         } = self;
 
         let mut child = Evaluator::new(cwd);
+        // Session identity, policy, echo mode, and the deliberate clearing of
+        // terminal/root-only handles arrive as one required typed value.
+        child.session = session;
 
         // --- Inherited by construction -------------------------------------
         // Lexical env: closure/spawn/parallel/on bodies inherit the caller's
@@ -152,9 +149,6 @@ impl ChildContext {
         child.opener = opener;
         child.secrets = secrets;
         child.config = config;
-        // Leash policy/principal: the security fix — a child must not escape the
-        // parent's confinement (spawn-hash gate + OS sandbox selection).
-        child.leash = leash;
         // Reef scope/resolver/lock/overrides: constrained tool resolution must
         // resolve identically inside a child, or a pinned tool diverges.
         child.reef_chain = reef_chain;
@@ -163,10 +157,6 @@ impl ChildContext {
         child.reef_lock_path = reef_lock_path;
         child.reef_user_manifest = reef_user_manifest;
         child.reef_overrides = reef_overrides;
-        // Session identity: journal ATTRIBUTION (session_id/principal) is
-        // inherited even though the journal handle itself is not (see below).
-        child.session_id = session_id;
-        child.principal = principal;
 
         // --- Deliberately NOT inherited (fresh state per child) ------------
         // journal handle:  the current `Journal` is an owned, single-connection
@@ -206,6 +196,10 @@ mod tests {
             "session-a",
             "agent:auditor",
         );
+        parent.set_leash_policy(LeashPolicy::permissive("agent:auditor"), "agent:auditor");
+        parent.set_echo_mode(EchoMode::Quiet);
+        parent.set_interactive(true);
+        parent.set_statement_sink(Box::new(|_| {}));
         parent.reef_lock.insert(LockEntry {
             name: "fixture".into(),
             version: "1.0.0".into(),
@@ -240,8 +234,15 @@ mod tests {
             .child_context()
             .build(ChildScope::Fresh, CancelToken::new());
 
-        assert_eq!(child.session_id, "session-a");
-        assert_eq!(child.principal, "agent:auditor");
+        assert_eq!(child.session.session_id, "session-a");
+        assert_eq!(child.session.principal, "agent:auditor");
+        assert!(child.session.leash.is_some());
+        assert_eq!(child.session.echo_mode, EchoMode::Quiet);
+        assert!(
+            !child.session.interactive,
+            "a child never owns the terminal"
+        );
+        assert!(child.session.sink.is_none(), "a child has no host renderer");
         assert!(
             !child.has_journal(),
             "the outer parent statement owns journaling; nested entries are not implied"

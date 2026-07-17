@@ -193,7 +193,7 @@ impl Evaluator {
             return Ok(None);
         }
 
-        let policy = if self.interactive {
+        let policy = if self.session.interactive {
             Policy::Interactive
         } else {
             Policy::Script
@@ -287,7 +287,7 @@ impl Evaluator {
 
     /// Route a one-line diagnostic through the sink (or stderr without one).
     fn emit_line(&mut self, msg: &str) {
-        if self.sink.is_some() {
+        if self.session.sink.is_some() {
             let v = Value::Str(msg.to_string());
             self.emit(&v);
         } else {
@@ -365,7 +365,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(".reef.toml"), "[tools]\nsh = \"*\"\n").unwrap();
         let mut ev = Evaluator::new(dir.path().to_path_buf());
-        ev.interactive = true; // reach resolve_fresh, not reef_unlocked
+        ev.set_interactive(true); // reach resolve_fresh, not reef_unlocked
         ev.set_reef_resolver(empty_fixture_resolver());
 
         let err = ev
@@ -396,7 +396,7 @@ mod tests {
         )
         .unwrap();
         let mut ev = Evaluator::new(dir.path().to_path_buf());
-        ev.interactive = true;
+        ev.set_interactive(true);
         ev.set_reef_resolver(empty_fixture_resolver());
 
         let err = ev
