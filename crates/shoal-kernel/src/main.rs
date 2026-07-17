@@ -18,9 +18,12 @@ fn main() {
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse(std::env::args_os().skip(1))?;
     let limits = args.resolved_limits();
-    let socket = args.socket.unwrap_or_else(|| runtime_socket(&args.session));
+    let paths = shoal_paths::ShoalPaths::discover();
+    let socket = args.socket.unwrap_or_else(|| paths.socket(&args.session));
     prepare_socket(&socket)?;
-    let state = args.state_dir.unwrap_or_else(state_dir);
+    let state = args
+        .state_dir
+        .unwrap_or_else(|| paths.state_dir().to_path_buf());
     let kernel = if let Some(path) = args.policy {
         Kernel::open_with_policy(&state, Policy::load(&path)?)?
     } else {
@@ -97,32 +100,6 @@ fn secure_socket_dir(parent: &Path) -> io::Result<()> {
 
 unsafe extern "C" {
     fn geteuid() -> u32;
-}
-
-fn runtime_socket(session: &str) -> PathBuf {
-    runtime_dir().join("shoal").join(format!("{session}.sock"))
-}
-
-/// The runtime directory for the kernel socket. `$XDG_RUNTIME_DIR` when set;
-/// otherwise `$TMPDIR/shoal-{uid}` (macOS exports `TMPDIR` but not
-/// `XDG_RUNTIME_DIR`), else the hard `/tmp/shoal-{uid}` fallback. `shoal-mcp`
-/// mirrors this exactly so socket discovery agrees on every platform.
-fn runtime_dir() -> PathBuf {
-    let uid = unsafe { geteuid() };
-    if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR").filter(|s| !s.is_empty()) {
-        return PathBuf::from(xdg);
-    }
-    if let Some(tmp) = std::env::var_os("TMPDIR").filter(|s| !s.is_empty()) {
-        return PathBuf::from(tmp).join(format!("shoal-{uid}"));
-    }
-    PathBuf::from(format!("/tmp/shoal-{uid}"))
-}
-fn state_dir() -> PathBuf {
-    std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("shoal")
 }
 
 #[derive(Debug)]

@@ -49,16 +49,12 @@ pub struct StdSecret;
 impl StdSecret {
     /// The secret directory, mirroring the original inline resolution order.
     fn dir() -> PathBuf {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
         std::env::var_os("SHOAL_SECRET_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| {
-                std::env::var_os("XDG_DATA_HOME")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| home.join(".local/share"))
-                    .join("shoal/secrets")
+                shoal_paths::ShoalPaths::discover()
+                    .data_dir()
+                    .join("secrets")
             })
     }
 }

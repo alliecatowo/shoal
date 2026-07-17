@@ -24,6 +24,7 @@ signal-hook = "0.3"
 shoal-prompt = { version = "0.1.0", path = "../shoal-prompt" }
 shoal-leash = { version = "0.1.0", path = "../shoal-leash" }
 shoal-journal = { version = "0.1.0", path = "../shoal-journal" }
+shoal-paths = { path = "../shoal-paths" }
 unicode-width = "0.2.2"
 
 [dev-dependencies]

@@ -1,12 +1,8 @@
 use std::io::Read;
 fn main() {
-    let home = std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| ".".into());
-    let dir = std::env::var_os("XDG_DATA_HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| home.join(".local/share"))
-        .join("shoal/secrets");
+    let dir = shoal_paths::ShoalPaths::discover()
+        .data_dir()
+        .join("secrets");
     let store = match shoal_secret::SecretStore::open(dir) {
         Ok(s) => s,
         Err(e) => {

@@ -552,11 +552,9 @@ const REPL_SESSION: &str = "default";
 /// so both handles, and the kernel's own journal, agree on one on-disk
 /// journal per user.
 fn shoal_state_dir() -> PathBuf {
-    std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("shoal")
+    shoal_paths::ShoalPaths::discover()
+        .state_dir()
+        .to_path_buf()
 }
 
 fn now_ns() -> i64 {
@@ -1038,10 +1036,11 @@ fn terminal_height() -> usize {
 }
 
 fn history_path() -> Option<PathBuf> {
-    if let Some(state) = std::env::var_os("XDG_STATE_HOME") {
-        return Some(PathBuf::from(state).join("shoal/history.txt"));
-    }
-    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state/shoal/history.txt"))
+    Some(
+        shoal_paths::ShoalPaths::discover()
+            .state_dir()
+            .join("history.txt"),
+    )
 }
 
 struct ShoalValidator;

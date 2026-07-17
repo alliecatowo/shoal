@@ -2417,6 +2417,7 @@ dependencies = [
  "shoal-eval",
  "shoal-journal",
  "shoal-leash",
+ "shoal-paths",
  "shoal-prompt",
  "shoal-syntax",
  "shoal-value",
@@ -2456,6 +2457,7 @@ dependencies = [
  "getrandom 0.4.3",
  "serde",
  "serde_json",
+ "shoal-paths",
  "subtle",
  "tempfile",
  "zeroize",
@@ -2475,11 +2477,13 @@ name = "shoal-doctor"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "portable-pty",
  "serde",
  "serde_json",
  "shoal-adapters",
  "shoal-journal",
  "shoal-leash",
+ "shoal-paths",
  "tempfile",
  "toml 1.1.2+spec-1.1.0",
 ]
@@ -2501,6 +2505,7 @@ dependencies = [
  "shoal-exec",
  "shoal-journal",
  "shoal-leash",
+ "shoal-paths",
  "shoal-picker",
  "shoal-reef",
  "shoal-secret",
@@ -2532,6 +2537,7 @@ dependencies = [
  "rusqlite",
  "serde_json",
  "shoal-journal",
+ "shoal-paths",
  "tempfile",
 ]
 
@@ -2563,6 +2569,7 @@ dependencies = [
  "shoal-exec",
  "shoal-journal",
  "shoal-leash",
+ "shoal-paths",
  "shoal-proto",
  "shoal-syntax",
  "shoal-value",
@@ -2600,8 +2607,16 @@ dependencies = [
  "libc",
  "serde_json",
  "shoal-kernel",
+ "shoal-paths",
  "shoal-proto",
  "tempfile",
+]
+
+[[package]]
+name = "shoal-paths"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -2655,6 +2670,7 @@ dependencies = [
  "rand",
  "serde",
  "serde_json",
+ "shoal-paths",
  "tempfile",
  "zeroize",
 ]

@@ -20,6 +20,7 @@ shoal-syntax = { version = "0.1.0", path = "../shoal-syntax" }
 shoal-value = { version = "0.1.0", path = "../shoal-value" }
 shoal-secret = { path = "../shoal-secret" }
 shoal-picker = { version = "0.1.0", path = "../shoal-picker" }
+shoal-paths = { path = "../shoal-paths" }
 shoal-reef = { version = "0.1.0", path = "../shoal-reef" }
 toml = "0.9"
 notify = "8.2.0"

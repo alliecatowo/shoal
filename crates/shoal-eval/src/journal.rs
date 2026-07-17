@@ -46,11 +46,9 @@ fn elapsed_ns(start: Instant) -> i64 {
 /// Also the home of the `j`/`jump` frecency store (`frecency.rs`), so both
 /// per-user stores live side by side.
 pub(crate) fn default_state_dir() -> PathBuf {
-    std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("shoal")
+    shoal_paths::ShoalPaths::discover()
+        .state_dir()
+        .to_path_buf()
 }
 
 impl Evaluator {

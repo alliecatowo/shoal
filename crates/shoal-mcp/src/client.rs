@@ -42,43 +42,7 @@ impl Config {
 /// Without this, a bare `XDG_RUNTIME_DIR`-only lookup silently failed on macOS
 /// and socket discovery never found the running kernel.
 pub fn discover_socket(session: &str) -> PathBuf {
-    if let Some(explicit) = std::env::var_os("SHOAL_SOCKET").filter(|s| !s.is_empty()) {
-        return PathBuf::from(explicit);
-    }
-    runtime_dir().join("shoal").join(format!("{session}.sock"))
-}
-
-/// The runtime directory the kernel binds its socket under. Mirrors
-/// `shoal-kernel`'s `runtime_socket`, with a `$TMPDIR` step so a macOS session
-/// that exports `TMPDIR` (but not `XDG_RUNTIME_DIR`) is honored before the
-/// hard `/tmp/shoal-{uid}` fallback.
-fn runtime_dir() -> PathBuf {
-    runtime_dir_from(
-        std::env::var_os("XDG_RUNTIME_DIR"),
-        std::env::var_os("TMPDIR"),
-        unsafe { geteuid() },
-    )
-}
-
-/// Pure socket-directory selection (kept separate so the macOS no-`XDG` case is
-/// unit-testable without mutating process env): `$XDG_RUNTIME_DIR`, else
-/// `$TMPDIR/shoal-{uid}`, else `/tmp/shoal-{uid}` — identical to shoal-kernel.
-fn runtime_dir_from(
-    xdg: Option<std::ffi::OsString>,
-    tmpdir: Option<std::ffi::OsString>,
-    uid: u32,
-) -> PathBuf {
-    if let Some(xdg) = xdg.filter(|s| !s.is_empty()) {
-        return PathBuf::from(xdg);
-    }
-    if let Some(tmp) = tmpdir.filter(|s| !s.is_empty()) {
-        return PathBuf::from(tmp).join(format!("shoal-{uid}"));
-    }
-    PathBuf::from(format!("/tmp/shoal-{uid}"))
-}
-
-unsafe extern "C" {
-    fn geteuid() -> u32;
+    shoal_paths::ShoalPaths::discover().socket(session)
 }
 
 pub struct KernelClient {
@@ -249,38 +213,6 @@ impl std::error::Error for BridgeError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// macOS-first-class socket discovery: with no `XDG_RUNTIME_DIR` (the macOS
-    /// default), the path must fall through exactly as shoal-kernel does — to
-    /// `$TMPDIR/shoal-{uid}` when `TMPDIR` is set, else `/tmp/shoal-{uid}`.
-    #[test]
-    fn socket_discovery_falls_back_without_xdg() {
-        use std::ffi::OsString;
-        // No XDG, no TMPDIR → hard /tmp fallback.
-        assert_eq!(
-            runtime_dir_from(None, None, 501),
-            PathBuf::from("/tmp/shoal-501")
-        );
-        // No XDG, TMPDIR set (the macOS shape) → $TMPDIR/shoal-{uid}.
-        assert_eq!(
-            runtime_dir_from(None, Some(OsString::from("/var/folders/xy")), 501),
-            PathBuf::from("/var/folders/xy/shoal-501")
-        );
-        // XDG present → used verbatim (Linux).
-        assert_eq!(
-            runtime_dir_from(
-                Some(OsString::from("/run/user/1000")),
-                Some(OsString::from("/tmp")),
-                1000
-            ),
-            PathBuf::from("/run/user/1000")
-        );
-        // Empty XDG is treated as unset (a common shell footgun).
-        assert_eq!(
-            runtime_dir_from(Some(OsString::new()), None, 7),
-            PathBuf::from("/tmp/shoal-7")
-        );
-    }
 
     fn config(local_auth: LocalAuthMode, token: Option<&str>) -> Config {
         Config {

@@ -10,26 +10,19 @@ pub struct Options {
     pub runtime_dir: PathBuf,
     pub state_dir: PathBuf,
     pub config_dir: PathBuf,
+    pub socket: PathBuf,
     pub session: String,
 }
 impl Options {
     pub fn from_env() -> Self {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
+        let paths = shoal_paths::ShoalPaths::discover();
+        let session = std::env::var("SHOAL_SESSION").unwrap_or_else(|_| "default".into());
         Self {
-            runtime_dir: std::env::var_os("XDG_RUNTIME_DIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(std::env::temp_dir),
-            state_dir: std::env::var_os("XDG_DATA_HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| home.join(".local/share"))
-                .join("shoal"),
-            config_dir: std::env::var_os("XDG_CONFIG_HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| home.join(".config"))
-                .join("shoal"),
-            session: std::env::var("SHOAL_SESSION").unwrap_or_else(|_| "default".into()),
+            runtime_dir: paths.runtime_dir().to_path_buf(),
+            state_dir: paths.state_dir().to_path_buf(),
+            config_dir: paths.config_dir().to_path_buf(),
+            socket: paths.socket(&session),
+            session,
         }
     }
 }
@@ -106,15 +99,7 @@ pub fn run(o: &Options) -> Report {
         },
         detail: "stdin terminal detection".into(),
     });
-    c.push(Check {
-        name: "pty".into(),
-        level: if Path::new("/dev/ptmx").exists() {
-            Level::Ok
-        } else {
-            Level::Fail
-        },
-        detail: "/dev/ptmx availability".into(),
-    });
+    probe_pty(&mut c);
     probe_dir("runtime dir", &o.runtime_dir, &mut c);
     probe_dir("state dir", &o.state_dir, &mut c);
     probe_dir("config dir", &o.config_dir, &mut c);
@@ -124,6 +109,27 @@ pub fn run(o: &Options) -> Report {
     probe_journal(o, &mut c);
     probe_configs(o, &mut c);
     Report { checks: c }
+}
+
+fn probe_pty(out: &mut Vec<Check>) {
+    use portable_pty::{PtySize, native_pty_system};
+    let result = native_pty_system().openpty(PtySize {
+        rows: 24,
+        cols: 80,
+        pixel_width: 0,
+        pixel_height: 0,
+    });
+    out.push(Check {
+        name: "pty".into(),
+        level: if result.is_ok() {
+            Level::Ok
+        } else {
+            Level::Fail
+        },
+        detail: result
+            .map(|_| "native PTY allocation succeeded".to_string())
+            .unwrap_or_else(|error| format!("native PTY allocation failed: {error}")),
+    });
 }
 fn probe_dir(name: &str, path: &Path, out: &mut Vec<Check>) {
     let result = (|| {
@@ -146,11 +152,8 @@ fn probe_dir(name: &str, path: &Path, out: &mut Vec<Check>) {
 #[cfg(unix)]
 fn probe_socket(o: &Options, out: &mut Vec<Check>) {
     use std::os::unix::net::UnixStream;
-    let p = o
-        .runtime_dir
-        .join("shoal")
-        .join(format!("{}.sock", o.session));
-    let r = UnixStream::connect(&p);
+    let p = &o.socket;
+    let r = UnixStream::connect(p);
     out.push(Check {
         name: "kernel socket".into(),
         level: if r.is_ok() { Level::Ok } else { Level::Warn },
@@ -291,6 +294,7 @@ mod tests {
             runtime_dir: t.path().join("run"),
             state_dir: t.path().join("state"),
             config_dir: t.path().join("config"),
+            socket: t.path().join("run/shoal/none.sock"),
             session: "none".into(),
         };
         for p in [&o.runtime_dir, &o.state_dir, &o.config_dir] {
@@ -321,6 +325,7 @@ mod tests {
             runtime_dir: t.path().into(),
             state_dir: t.path().join("state"),
             config_dir: t.path().join("config"),
+            socket: sock.join("s.sock"),
             session: "s".into(),
         };
         for p in [&o.state_dir, &o.config_dir] {

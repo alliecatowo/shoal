@@ -12,11 +12,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::var_os("SHOAL_TOKEN_STORE")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            std::env::var_os("XDG_STATE_HOME")
-                .map(PathBuf::from)
-                .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("shoal/tokens.json")
+            shoal_paths::ShoalPaths::discover()
+                .state_dir()
+                .join("tokens.json")
         });
     let mut s = TokenStore::open(path)?;
     match cmd.as_str() {

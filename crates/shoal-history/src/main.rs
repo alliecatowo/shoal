@@ -13,7 +13,9 @@ fn main() {
     }
 }
 fn run(mut args: Vec<String>) -> Result<(), (i32, String)> {
-    let mut state = default_state()?;
+    let mut state = shoal_paths::ShoalPaths::discover()
+        .state_dir()
+        .to_path_buf();
     let mut json = false;
     let mut i = 0;
     while i < args.len() {
@@ -161,15 +163,6 @@ fn parse_query(args: &[String]) -> Result<QueryFilter, (i32, String)> {
         }
     }
     Ok(f)
-}
-fn default_state() -> Result<PathBuf, (i32, String)> {
-    if let Some(p) = std::env::var_os("XDG_DATA_HOME") {
-        Ok(PathBuf::from(p).join("shoal"))
-    } else if let Some(h) = std::env::var_os("HOME") {
-        Ok(PathBuf::from(h).join(".local/share/shoal"))
-    } else {
-        Err((2, "set --state-dir, XDG_DATA_HOME, or HOME".into()))
-    }
 }
 fn value(v: Option<&String>, n: &str) -> Result<String, (i32, String)> {
     v.cloned().ok_or((2, format!("--{n} requires value")))
