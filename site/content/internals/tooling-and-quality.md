@@ -223,7 +223,11 @@ AArch64 on Linux and macOS.
 
 Every member crate opts in with `[lints] workspace = true` (HR-F1,
 [hardening roadmap](@/internals/hardening-roadmap.md)), so the root manifest's lint table is
-actually active per-crate, not merely staged.
+actually active per-crate, not merely staged. `rust-toolchain.toml` at the repository root pins the
+exact stable release (currently 1.97.0) that CI's `dtolnay/rust-toolchain@stable` step resolved to
+at the time it was written (HR-F2); `rustup` picks this up automatically for any local `cargo`/
+`rustc`/`clippy`/`fmt` invocation, so a future stable release cannot silently change a contributor's
+compiler out from under a pinned CI baseline without a deliberate bump to this file.
 
 ### Ambient-environment test debt
 
