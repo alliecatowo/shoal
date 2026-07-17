@@ -194,6 +194,19 @@ Shoal does not promise Bash/POSIX parsing or expansion. There is no `$var` expan
 
 Builtin identity has a canonical registry used by evaluator/completion/highlighting/LSP, but full resolution across lexical functions, aliases, Reef, adapters, PATH, and interpreter runners still spans multiple evaluator paths. Edge-case precedence/forced-head behavior needs regression tests when changed.
 
+### Lexical environments are bounded
+
+A session retains at most 4,096 live lexical names and 16 MiB of measured binding state across root,
+block, script, and module scopes. One name is at most 256 UTF-8 bytes; one materialized value is at
+most 1 MiB, depth 64, and 16,384 nodes. Replacing an existing binding is still allowed when the
+identity cap is full, and temporary scope charges are reclaimed when that scope is dropped.
+
+Limit failures are catchable language errors: `binding_name_limit`, `binding_identity_limit`,
+`binding_value_limit`, or `binding_aggregate_limit`. Runtime handles such as closures, tasks, and
+streams receive a conservative fixed charge here and remain subject to their own subsystem quotas;
+this is accounting protection, not a complete process-memory meter. Use an OS memory limit for
+mutually hostile workloads.
+
 ### Bare path runner is narrow
 
 A bare `./script.shl` path has language runner support. Other interpreter extensions generally require explicit `run path` or an interpreter block even when an adapter declares a runner.

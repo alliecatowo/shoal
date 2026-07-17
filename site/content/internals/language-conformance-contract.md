@@ -216,6 +216,11 @@ variadics, and return values.
 - Blocks and closures use lexical environments.
 - Modules load source files, evaluate them in a module environment, and expose exports through a
   module value.
+- A session admits at most 4,096 live lexical binding identities across its ordinary, child, script,
+  and module scopes. Binding names are capped at 256 UTF-8 bytes; one materialized value is capped
+  at 1 MiB, depth 64, and 16,384 structural nodes; all live scopes share a 16 MiB retained-value
+  budget. Replacing an existing name remains legal at the identity cap, and dropping a scope
+  releases its charges.
 - Session cwd and environment are evaluator state; scoped `with` behavior must restore state on all
   exits.
 - Host-injected ports, configuration, Reef, policy, event bus, and journal are not ordinary lexical
@@ -298,6 +303,7 @@ source-emitted families include:
 | syntax/evaluation | `parse_error`, `type_error`, `arg_error`, `undefined_var`, `field_missing`, `index_range` |
 | execution/filesystem | `not_found`, `cmd_failed`, `io_error`, `permission`, `utf8_error`, `no_matches`, `feed_error` |
 | numeric/control | `div_zero`, `overflow`, `recursion_limit`, `assert_failed` |
+| lexical retention | `binding_name_limit`, `binding_identity_limit`, `binding_value_limit`, `binding_aggregate_limit` |
 | streams/events | `stream_consumed`, `stream_unbounded`, `channel_closed`, `channel_poisoned`, `channel_name_limit`, `channel_registry_limit`, `channel_subscriber_limit`, `channel_payload_limit`, `channel_payload_type` |
 | network/general | `net_error`, `custom` |
 | Reef | `reef_unlocked`, `reef_drift`, `reef_conflict`, `reef_not_found`, `reef_provider` |
