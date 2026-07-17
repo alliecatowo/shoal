@@ -14,7 +14,11 @@ pub use enforce::{
     EnforcementStatus, EnforcementTier, FsSandbox, NetPolicy, SandboxPolicy, SpawnPreflight,
     apply_landlock, apply_macos_sandbox, apply_sandbox, landlock_abi, preflight_spawn,
 };
-pub use policy::{AutoApply, OpaqueMode, Policy, PolicyLoadError, PrincipalPolicy, Verdict};
+pub use policy::{
+    AutoApply, OpaqueMode, POLICY_MAX_ASSIGNMENTS, POLICY_MAX_BYTES, POLICY_MAX_GRANT_BYTES,
+    POLICY_MAX_GRANTS_PER_KIND, POLICY_MAX_NESTING, POLICY_MAX_PRINCIPALS, Policy, PolicyLoadError,
+    PolicyParseError, PrincipalPolicy, Verdict,
+};
 pub use seatbelt::seatbelt_profile;
 
 #[cfg(test)]
@@ -403,6 +407,14 @@ opaque = "ask"
         // file, so `uid:0` is unknown there (not permissive).
         assert!(loaded.principal("agent").is_some());
         assert!(loaded.principal("uid:0").is_none());
+        std::fs::write(cfg.join("leash.toml"), "[principal.agent\n").unwrap();
+        let quarantined = Policy::load_user_or_permissive("uid:0");
+        assert!(quarantined.is_fail_closed());
+        assert!(quarantined.spawn_pinning_active("uid:0"));
+        assert_eq!(
+            quarantined.evaluate_effect("uid:0", &Effect::Time),
+            Verdict::Deny
+        );
         // With no config file, we get the permissive fallback for the principal.
         unsafe { std::env::set_var("XDG_CONFIG_HOME", d.path().join("empty")) };
         let fallback = Policy::load_user_or_permissive("uid:0");
