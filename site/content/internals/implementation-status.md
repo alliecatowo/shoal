@@ -226,8 +226,8 @@ planned/denied without a claim that allowed traffic is network-confined.
 | list/table stream source | Implemented | consumer lifecycle | finite | single-consumption semantics |
 | watch/tail/every | Implemented | sink-to-source propagation | bounded/coalescing source queues | filesystem watch still touches host APIs directly |
 | language channel | Implemented | stream consumer lifecycle | replay/live model | `user.*` bridge prevents spoofing kernel channels |
-| kernel EventBus | Implemented with scale limits | unsubscribe/disconnect closes queue | 1,024 replay ring; 256-event subscriber queues with coalesced gap summaries | one dedicated writer thread per subscription |
-| language EventBus | Implemented with scale limits | stream drop closes/prunes its queue | 1,024 replay ring; 256-event subscriber queues with explicit gap records | publishing clones bounded events while holding the channel-map mutex |
+| kernel EventBus | Implemented with scale limits | unsubscribe/disconnect closes queue | 1,024-event/2 MiB replay ring; 256-event/512 KiB subscriber queues with coalesced count+byte gap summaries | one dedicated writer thread per connection; user identity/payload admission |
+| language EventBus | Implemented with scale limits | stream drop closes/prunes its queue | 1,024-event/256 KiB replay ring; 256-event/256 KiB subscriber queues with explicit gap records | 64 channel identities and 64 live subscribers per evaluator; publish fan-out still holds the channel-map mutex |
 | stream to command stdin | Implemented for capture mode | command/caller cancellation stops the pump | 16 queued chunks, each at most 64 KiB | PTY mode rejects stream stdin; no wire stream-pull protocol |
 | stream over wire | Scaffolded label | no pull cancellation | no cursor/item budget | `WireValue::Stream` is descriptive only |
 | WASM invocation | Implemented preview ABI | fuel, epoch deadline, and session cancellation | memory/table/instance/argument/value/hostcall limits | synchronous component compilation is bounded by component bytes, not a wall interrupt |
@@ -299,8 +299,8 @@ contract limitations remain:
 - outcome spans now travel when `OutcomeVal` carries one, including through elision, and are omitted
   honestly when the producer has no source anchor;
 - `task.suspend` and `task.resume` return `TASK_CONTROL_UNAVAILABLE`;
-- kernel and in-language events both use bounded 256-event subscriber queues with explicit/coalesced
-  gap summaries;
+- kernel and in-language events both use count- and byte-bounded subscriber queues with
+  explicit/coalesced gap summaries;
 - journal and transcript cursors survive restart through durable indexes, while most other state
   does not.
 

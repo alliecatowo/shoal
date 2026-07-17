@@ -13,7 +13,7 @@ use durable::{DURABLE_POINTER_CAP, DurableChannel, DurableIndexes};
 pub(crate) use subscriptions::SharedWriter;
 use subscriptions::SubscriptionRegistry;
 #[cfg(test)]
-use subscriptions::{SUB_QUEUE_CAP, SubQueue};
+use subscriptions::{SUB_QUEUE_CAP, SUB_QUEUE_MAX_BYTES, SubQueue};
 
 /// One ring buffer per channel; `seq` is monotonic per channel. Subscribers
 /// get `event` notifications pushed on their own connection via a bounded,
@@ -34,6 +34,124 @@ pub(crate) const EVENT_RING_CAP: usize = 1024;
 pub(crate) const EVENTS_DEFAULT_PAGE: usize = 256;
 pub(crate) const EVENTS_MAX_PAGE: usize = 256;
 const EVENTS_MAX_CONTENT_BYTES: usize = MAX_FRAME_LEN / 2;
+
+/// Live EventBus admission and retained-memory walls. These are deliberately
+/// below the 16 MiB frame ceiling: one accepted user event can be cloned into
+/// a ring and several subscriber queues, so frame-size admission alone is not
+/// a meaningful memory bound.
+pub(crate) const EVENT_CHANNEL_MAX_BYTES: usize = 128;
+pub(crate) const USER_CHANNELS_PER_OWNER_MAX: usize = 256;
+pub(crate) const USER_EVENT_PAYLOAD_MAX_BYTES: usize = 64 * 1024;
+pub(crate) const EVENT_PAYLOAD_MAX_DEPTH: usize = 64;
+pub(crate) const EVENT_RING_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+struct JsonSizeWriter {
+    bytes: usize,
+    max: usize,
+}
+
+impl std::io::Write for JsonSizeWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let Some(next) = self.bytes.checked_add(buf.len()) else {
+            return Err(io::Error::other("JSON size overflow"));
+        };
+        if next > self.max {
+            return Err(io::Error::other("JSON exceeds retained-size limit"));
+        }
+        self.bytes = next;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn json_depth(value: &Json, depth: usize) -> Result<(), RpcError> {
+    if depth > EVENT_PAYLOAD_MAX_DEPTH {
+        return Err(RpcError {
+            code: INVALID_PARAMS,
+            message: format!(
+                "event payload nesting exceeds the {EVENT_PAYLOAD_MAX_DEPTH}-level limit"
+            ),
+            data: Some(json!({
+                "limit":"event_payload_depth",
+                "max":EVENT_PAYLOAD_MAX_DEPTH,
+            })),
+        });
+    }
+    match value {
+        Json::Array(items) => {
+            for item in items {
+                json_depth(item, depth + 1)?;
+            }
+        }
+        Json::Object(fields) => {
+            for item in fields.values() {
+                json_depth(item, depth + 1)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn json_encoded_len(value: &Json, max: usize) -> Result<usize, RpcError> {
+    let mut writer = JsonSizeWriter { bytes: 0, max };
+    serde_json::to_writer(&mut writer, value).map_err(|_| RpcError {
+        code: INVALID_PARAMS,
+        message: format!("event payload exceeds the {max}-byte encoded limit"),
+        data: Some(json!({"limit":"event_payload_bytes","max":max})),
+    })?;
+    Ok(writer.bytes)
+}
+
+pub(super) fn event_retained_bytes(event: &Event) -> usize {
+    let mut writer = JsonSizeWriter {
+        bytes: 0,
+        max: usize::MAX,
+    };
+    if serde_json::to_writer(&mut writer, event).is_err() {
+        return usize::MAX;
+    }
+    writer.bytes
+}
+
+fn validate_channel_name(channel: &str) -> Result<(), RpcError> {
+    if channel.is_empty()
+        || channel.len() > EVENT_CHANNEL_MAX_BYTES
+        || !channel
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(RpcError {
+            code: INVALID_PARAMS,
+            message: format!(
+                "channel must be 1..={EVENT_CHANNEL_MAX_BYTES} ASCII bytes using [A-Za-z0-9._-]"
+            ),
+            data: Some(json!({
+                "limit":"event_channel_name",
+                "max_bytes":EVENT_CHANNEL_MAX_BYTES,
+                "channel":channel,
+            })),
+        });
+    }
+    Ok(())
+}
+
+fn validate_user_event(channel: &str, payload: &Json) -> Result<(), RpcError> {
+    validate_channel_name(channel)?;
+    if !channel.starts_with("user.") || channel.len() == "user.".len() {
+        return Err(RpcError {
+            code: INVALID_PARAMS,
+            message: "only non-empty user.* channels may be published to".into(),
+            data: Some(json!({"channel":channel})),
+        });
+    }
+    json_depth(payload, 0)?;
+    json_encoded_len(payload, USER_EVENT_PAYLOAD_MAX_BYTES)?;
+    Ok(())
+}
 
 /// The static channels a session may always subscribe to (site/content/internals/kernel-protocol.md).
 /// `task.{id}` and `user.{name}` are dynamic and not listed here.
@@ -69,6 +187,25 @@ impl EventBus {
     /// durable-id recording — the path every ring-only channel takes).
     pub(crate) fn publish(&self, owner: &OwnerKey, channel: &str, payload: Json) -> Event {
         self.publish_inner(owner, channel, payload, None)
+    }
+
+    /// Fallible client/language publication boundary. Validation happens
+    /// before the payload is cloned into a ring, subscriber queues, or the
+    /// reverse evaluator bridge.
+    pub(crate) fn publish_user(
+        &self,
+        owner: &OwnerKey,
+        channel: &str,
+        payload: Json,
+    ) -> Result<Event, RpcError> {
+        validate_user_event(channel, &payload)?;
+        self.ensure_replay_subsystem()?;
+        let event = self
+            .channels
+            .publish_user(&self.durable, owner, channel, payload)?;
+        self.ensure_replay_subsystem()?;
+        self.subscriptions.deliver(owner, channel, &event);
+        Ok(event)
     }
 
     /// Publish on the `journal` channel, recording the durable `entry_id` this
@@ -408,6 +545,7 @@ impl Kernel {
         let owner = attachment.session.key.owner();
         self.ensure_event_owner(&owner)?;
         let p: EventsReadParams = decode(params)?;
+        validate_channel_name(&p.channel)?;
         let effective_limit = p.limit.unwrap_or(EVENTS_DEFAULT_PAGE).min(EVENTS_MAX_PAGE);
         // The `journal` and `session.transcript` channels are journal-backed:
         // a `since` older than the ring's oldest retained seq is served from
@@ -740,23 +878,15 @@ impl Kernel {
         attached: &mut Option<Attachment>,
     ) -> Result<Json, RpcError> {
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
-        self.events.ensure_replay_subsystem()?;
         let p: EventsPublishParams = decode(params)?;
-        // site/content/internals/kernel-protocol.md: only `user.*` channels are client-writable;
-        // the kernel owns the semantic channels.
-        if !p.channel.starts_with("user.") {
-            return Err(RpcError {
-                code: INVALID_PARAMS,
-                message: "only user.* channels may be published to".into(),
-                data: Some(json!({"channel": p.channel})),
-            });
-        }
-        let event = self.events.publish(
+        // Validate the borrowed decoded value before making the first clone
+        // for ring/subscriber ownership.
+        validate_user_event(&p.channel, &p.payload)?;
+        let event = self.events.publish_user(
             &attachment.session.key.owner(),
             &p.channel,
             p.payload.clone(),
-        );
-        self.events.ensure_replay_subsystem()?;
+        )?;
         // One substrate, reverse direction: a wire publish is also visible to
         // the session's in-language channels (`channel("user.x").latest()` /
         // `.events()`), via `inject` — which never re-forwards, so the event
@@ -776,6 +906,7 @@ impl Kernel {
     ) -> Result<Json, RpcError> {
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
         let p: EventsSubParams = decode(params)?;
+        validate_channel_name(&p.channel)?;
         let Some(writer) = conn else {
             return Err(RpcError {
                 code: INTERNAL_ERROR,
@@ -802,6 +933,7 @@ impl Kernel {
     ) -> Result<Json, RpcError> {
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
         let p: EventsSubParams = decode(params)?;
+        validate_channel_name(&p.channel)?;
         self.events
             .unsubscribe(client, &attachment.session.key.owner(), &p.channel);
         encode(json!({"channel": p.channel, "subscribed": false}))
@@ -1135,8 +1267,9 @@ mod tests {
         drop(healthy_client);
     }
 
-    /// Once a stalled subscriber's queue overflows `SUB_QUEUE_CAP`,
-    /// further events for it must coalesce into a `{dropped, latest_seq}`
+    /// Once a stalled subscriber's queue exceeds either retained-state wall,
+    /// further events for it must coalesce into a
+    /// `{dropped, dropped_bytes, latest_seq}`
     /// summary (site/content/internals/kernel-protocol.md) rather than buffering unboundedly — and
     /// once the stall clears, that summary (not a flood of the individually
     /// dropped events) is what the subscriber actually receives.
@@ -1182,11 +1315,16 @@ mod tests {
                 break;
             }
         }
-        let summary = found_summary
-            .expect("expected a coalesced {dropped, latest_seq} summary after a queue overflow");
+        let summary = found_summary.expect(
+            "expected a coalesced {dropped, dropped_bytes, latest_seq} summary after overflow",
+        );
         assert!(
             summary["dropped"].as_u64().unwrap() > 0,
             "summary must report a nonzero drop count: {summary}"
+        );
+        assert!(
+            summary["dropped_bytes"].as_u64().unwrap() > 0,
+            "summary must report dropped encoded bytes: {summary}"
         );
         assert!(
             summary["latest_seq"].as_u64().unwrap() < total as u64,
@@ -1516,16 +1654,168 @@ mod tests {
             .unwrap();
         assert!(empty["events"].as_array().unwrap().is_empty());
 
-        kernel.events.publish(
-            &owner,
-            "user.large",
-            json!({"body":"x".repeat(EVENTS_MAX_CONTENT_BYTES + 1024)}),
-        );
-        let large = kernel
-            .handle_events_read(json!({"channel":"user.large"}), &mut attached)
-            .unwrap();
-        assert_eq!(large["page"]["payloads_truncated"], true);
+        let (large, _, truncated) = bound_event_page(vec![Event {
+            channel: "user.large".into(),
+            seq: 0,
+            ts: 0,
+            payload: json!({"body":"x".repeat(EVENTS_MAX_CONTENT_BYTES + 1024)}),
+        }])
+        .unwrap();
+        assert!(truncated);
         assert!(serde_json::to_vec(&large).unwrap().len() < MAX_FRAME_LEN);
+    }
+
+    #[test]
+    fn user_publish_rejects_huge_deep_and_invalid_channels_before_retention() {
+        let kernel = Kernel::new();
+        let mut attached = attachment(&kernel, "user-admission");
+        let owner = attached.as_ref().unwrap().session.key.owner();
+
+        let huge = kernel
+            .handle_events_publish(
+                json!({
+                    "channel":"user.huge",
+                    "payload":{"body":"x".repeat(USER_EVENT_PAYLOAD_MAX_BYTES + 1)},
+                }),
+                &mut attached,
+            )
+            .expect_err("oversized user payload must be rejected before cloning");
+        assert_eq!(huge.code, INVALID_PARAMS);
+        assert_eq!(huge.data.unwrap()["limit"], "event_payload_bytes");
+
+        let mut deep = Json::Null;
+        for _ in 0..=EVENT_PAYLOAD_MAX_DEPTH {
+            deep = Json::Array(vec![deep]);
+        }
+        let deep = kernel
+            .handle_events_publish(json!({"channel":"user.deep","payload":deep}), &mut attached)
+            .expect_err("deep payload must be rejected before serialization");
+        assert_eq!(deep.data.unwrap()["limit"], "event_payload_depth");
+
+        let invalid = kernel
+            .handle_events_publish(
+                json!({
+                    "channel":format!("user.{}", "x".repeat(EVENT_CHANNEL_MAX_BYTES)),
+                    "payload":null,
+                }),
+                &mut attached,
+            )
+            .expect_err("long channel identity must be rejected");
+        assert_eq!(invalid.data.unwrap()["limit"], "event_channel_name");
+        assert_eq!(kernel.events.channels.user_identity_count(&owner), 0);
+    }
+
+    #[test]
+    fn user_channel_identity_churn_is_bounded_per_exact_owner() {
+        let bus = EventBus::default();
+        let alpha = owner("channel-churn-alpha");
+        let beta = owner("channel-churn-beta");
+        for n in 0..USER_CHANNELS_PER_OWNER_MAX {
+            bus.publish_user(&alpha, &format!("user.churn-{n}"), json!({"n":n}))
+                .unwrap();
+        }
+        assert_eq!(
+            bus.channels.user_identity_count(&alpha),
+            USER_CHANNELS_PER_OWNER_MAX
+        );
+        let error = bus
+            .publish_user(&alpha, "user.one-too-many", json!(null))
+            .unwrap_err();
+        assert_eq!(error.code, QUOTA_EXCEEDED);
+        assert_eq!(
+            error.data.unwrap()["limit"],
+            "user_event_channels_per_session"
+        );
+
+        let continued = bus
+            .publish_user(&alpha, "user.churn-0", json!({"again":true}))
+            .unwrap();
+        assert_eq!(continued.seq, 1, "existing identities remain usable");
+        assert_eq!(
+            bus.publish_user(&beta, "user.independent", json!(null))
+                .unwrap()
+                .seq,
+            0,
+            "an exact neighboring owner has its own identity budget"
+        );
+    }
+
+    #[test]
+    fn channel_ring_enforces_count_and_byte_budgets() {
+        let bus = EventBus::default();
+        let owner = owner("ring-byte-budget");
+        let payload = json!({"body":"x".repeat(8 * 1024)});
+        for seq in 0..400u64 {
+            assert_eq!(
+                bus.publish_user(&owner, "user.bytes", payload.clone())
+                    .unwrap()
+                    .seq,
+                seq
+            );
+        }
+        let (retained, bytes) = bus.channels.ring_stats(&owner, "user.bytes");
+        assert!(
+            retained < EVENT_RING_CAP,
+            "byte wall, not count wall, evicts"
+        );
+        assert!(bytes <= EVENT_RING_MAX_BYTES);
+        assert_eq!(bus.published_count(&owner, "user.bytes"), 400);
+        assert!(bus.ring_oldest_seq(&owner, "user.bytes").unwrap() > 0);
+    }
+
+    #[test]
+    fn subscription_queue_byte_overflow_is_exact_and_coalesced() {
+        let queue = SubQueue::new("user.queue-bytes".into());
+        queue.finish_replay(Vec::new());
+        let mut total_bytes = 0u64;
+        let total = 80u64;
+        for seq in 0..total {
+            let event = Event {
+                channel: "user.queue-bytes".into(),
+                seq,
+                ts: 0,
+                payload: json!({"body":"x".repeat(32 * 1024)}),
+            };
+            total_bytes += u64::try_from(event_retained_bytes(&event)).unwrap();
+            queue.push_live(event);
+        }
+        assert!(queue.retained_bytes() <= SUB_QUEUE_MAX_BYTES);
+
+        let mut delivered = 0u64;
+        let mut delivered_bytes = 0u64;
+        let mut summary = None;
+        while let Some(event) = queue.pop() {
+            if event.payload.get("dropped").is_some() {
+                summary = Some(event);
+                break;
+            }
+            delivered += 1;
+            delivered_bytes += u64::try_from(event_retained_bytes(&event)).unwrap();
+        }
+        let summary = summary.expect("overflow must produce one coalesced summary");
+        assert_eq!(summary.payload["dropped"], total - delivered);
+        assert_eq!(
+            summary.payload["dropped_bytes"],
+            total_bytes - delivered_bytes
+        );
+        assert_eq!(summary.payload["latest_seq"], total - 1);
+        assert!(queue.pop().is_none());
+
+        let replay_only = SubQueue::new("user.replay-too-large".into());
+        let oversized = Event {
+            channel: "user.replay-too-large".into(),
+            seq: 7,
+            ts: 0,
+            payload: json!({"body":"x".repeat(SUB_QUEUE_MAX_BYTES + 1)}),
+        };
+        let oversized_bytes = event_retained_bytes(&oversized);
+        replay_only.finish_replay(vec![oversized]);
+        let summary = replay_only
+            .pop()
+            .expect("an all-overflow replay still emits its gap summary");
+        assert_eq!(summary.payload["dropped"], 1);
+        assert_eq!(summary.payload["dropped_bytes"], oversized_bytes);
+        assert_eq!(summary.payload["latest_seq"], 7);
     }
 
     #[test]

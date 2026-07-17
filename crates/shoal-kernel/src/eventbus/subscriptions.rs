@@ -13,10 +13,13 @@ struct SubscriptionKey {
 
 /// Bound on one channel subscription's outgoing queue.
 pub(super) const SUB_QUEUE_CAP: usize = 256;
+pub(super) const SUB_QUEUE_MAX_BYTES: usize = 512 * 1024;
+const SUBSCRIPTIONS_HARD_CAP_PER_OWNER: usize = 1024;
 
 /// A replay handshake is normally only a channel-ring copy, but remain bounded
 /// if a test hook, scheduler stall, or unusually hot publisher delays it.
 const STAGED_EVENT_CAP: usize = EVENT_RING_CAP + SUB_QUEUE_CAP;
+const STAGED_EVENT_MAX_BYTES: usize = SUB_QUEUE_MAX_BYTES;
 
 /// A bounded FIFO for one `(owner, channel)` subscription. Live publication
 /// begins as soon as the subscription is registered, but stays in `pending`
@@ -30,11 +33,17 @@ pub(super) struct SubQueue {
 
 pub(super) struct SubQueueState {
     ready: VecDeque<Event>,
+    ready_bytes: usize,
     pending: BTreeMap<u64, Event>,
+    pending_bytes: usize,
     replaying: bool,
     next_seq: Option<u64>,
+    overflow_from: Option<u64>,
     overflow_through: Option<u64>,
+    overflow_dropped: u64,
+    overflow_dropped_bytes: u64,
     dropped: u64,
+    dropped_bytes: u64,
     latest_dropped_seq: u64,
     closed: bool,
 }
@@ -45,11 +54,17 @@ impl SubQueue {
             channel,
             state: Mutex::new(SubQueueState {
                 ready: VecDeque::new(),
+                ready_bytes: 0,
                 pending: BTreeMap::new(),
+                pending_bytes: 0,
                 replaying: true,
                 next_seq: None,
+                overflow_from: None,
                 overflow_through: None,
+                overflow_dropped: 0,
+                overflow_dropped_bytes: 0,
                 dropped: 0,
+                dropped_bytes: 0,
                 latest_dropped_seq: 0,
                 closed: false,
             }),
@@ -76,7 +91,13 @@ impl SubQueue {
             Self::stage(&mut state, event);
         }
         state.replaying = false;
-        state.next_seq = state.pending.first_key_value().map(|(&seq, _)| seq);
+        state.next_seq = match (
+            state.pending.first_key_value().map(|(&seq, _)| seq),
+            state.overflow_from,
+        ) {
+            (Some(pending), Some(overflow)) => Some(pending.min(overflow)),
+            (pending, overflow) => pending.or(overflow),
+        };
         Self::drain_pending(&mut state);
     }
 
@@ -86,23 +107,45 @@ impl SubQueue {
         {
             return;
         }
-        if state.pending.len() >= STAGED_EVENT_CAP {
+        let event_bytes = event_retained_bytes(&event);
+        let pending_bytes = state.pending_bytes.checked_add(event_bytes);
+        if state.pending.len() >= STAGED_EVENT_CAP
+            || pending_bytes.is_none_or(|bytes| bytes > STAGED_EVENT_MAX_BYTES)
+        {
+            state.overflow_from = Some(
+                state
+                    .overflow_from
+                    .map_or(event.seq, |from| from.min(event.seq)),
+            );
             state.overflow_through = Some(
                 state
                     .overflow_through
                     .map_or(event.seq, |through| through.max(event.seq)),
             );
+            state.overflow_dropped = state.overflow_dropped.saturating_add(1);
+            state.overflow_dropped_bytes = state
+                .overflow_dropped_bytes
+                .saturating_add(u64::try_from(event_bytes).unwrap_or(u64::MAX));
             return;
         }
+        state.pending_bytes = pending_bytes.unwrap();
         state.pending.insert(event.seq, event);
     }
 
     fn drain_pending(state: &mut SubQueueState) {
         if state.next_seq.is_none() {
-            state.next_seq = state.pending.first_key_value().map(|(&seq, _)| seq);
+            state.next_seq = match (
+                state.pending.first_key_value().map(|(&seq, _)| seq),
+                state.overflow_from,
+            ) {
+                (Some(pending), Some(overflow)) => Some(pending.min(overflow)),
+                (pending, overflow) => pending.or(overflow),
+            };
         }
         while let Some(next) = state.next_seq {
             if let Some(event) = state.pending.remove(&next) {
+                let event_bytes = event_retained_bytes(&event);
+                state.pending_bytes = state.pending_bytes.saturating_sub(event_bytes);
                 Self::push_ready(state, event);
                 state.next_seq = Some(next.saturating_add(1));
                 continue;
@@ -112,10 +155,34 @@ impl SubQueue {
                 .is_some_and(|through| next <= through)
             {
                 let through = state.overflow_through.take().unwrap();
-                let dropped = through.saturating_sub(next).saturating_add(1);
-                state.dropped = state.dropped.saturating_add(dropped);
+                state.overflow_from = None;
+                state.dropped = state.dropped.saturating_add(state.overflow_dropped);
+                state.dropped_bytes = state
+                    .dropped_bytes
+                    .saturating_add(state.overflow_dropped_bytes);
+                state.overflow_dropped = 0;
+                state.overflow_dropped_bytes = 0;
                 state.latest_dropped_seq = through;
-                state.pending.retain(|&seq, _| seq > through);
+                let mut removed = 0u64;
+                let mut removed_bytes = 0u64;
+                state.pending.retain(|&seq, event| {
+                    if seq > through {
+                        true
+                    } else {
+                        removed = removed.saturating_add(1);
+                        removed_bytes = removed_bytes.saturating_add(
+                            u64::try_from(event_retained_bytes(event)).unwrap_or(u64::MAX),
+                        );
+                        false
+                    }
+                });
+                state.dropped = state.dropped.saturating_add(removed);
+                state.dropped_bytes = state.dropped_bytes.saturating_add(removed_bytes);
+                state.pending_bytes = state
+                    .pending
+                    .values()
+                    .map(event_retained_bytes)
+                    .sum::<usize>();
                 state.next_seq = Some(through.saturating_add(1));
                 continue;
             }
@@ -127,10 +194,19 @@ impl SubQueue {
         // Once overflow starts, keep coalescing until its summary is emitted.
         // Otherwise a newly freed slot could let a later concrete event pass
         // the summary, making the observed sequence go backwards.
-        if state.ready.len() < SUB_QUEUE_CAP && state.dropped == 0 {
+        let event_bytes = event_retained_bytes(&event);
+        let ready_bytes = state.ready_bytes.checked_add(event_bytes);
+        if state.ready.len() < SUB_QUEUE_CAP
+            && ready_bytes.is_some_and(|bytes| bytes <= SUB_QUEUE_MAX_BYTES)
+            && state.dropped == 0
+        {
+            state.ready_bytes = ready_bytes.unwrap();
             state.ready.push_back(event);
         } else {
             state.dropped = state.dropped.saturating_add(1);
+            state.dropped_bytes = state
+                .dropped_bytes
+                .saturating_add(u64::try_from(event_bytes).unwrap_or(u64::MAX));
             state.latest_dropped_seq = event.seq;
         }
     }
@@ -141,17 +217,26 @@ impl SubQueue {
             return None;
         }
         if let Some(event) = state.ready.pop_front() {
+            state.ready_bytes = state
+                .ready_bytes
+                .saturating_sub(event_retained_bytes(&event));
             return Some(event);
         }
         if state.dropped > 0 {
             let dropped = state.dropped;
             let latest_seq = state.latest_dropped_seq;
+            let dropped_bytes = state.dropped_bytes;
             state.dropped = 0;
+            state.dropped_bytes = 0;
             return Some(Event {
                 channel: self.channel.clone(),
                 seq: latest_seq,
                 ts: now_ns(),
-                payload: json!({"dropped": dropped, "latest_seq": latest_seq}),
+                payload: json!({
+                    "dropped": dropped,
+                    "dropped_bytes": dropped_bytes,
+                    "latest_seq": latest_seq,
+                }),
             });
         }
         None
@@ -167,12 +252,21 @@ impl SubQueue {
             Err(poisoned) => {
                 let mut state = poisoned.into_inner();
                 state.ready.clear();
+                state.ready_bytes = 0;
                 state.pending.clear();
+                state.pending_bytes = 0;
                 state.closed = true;
                 self.state.clear_poison();
                 state
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn retained_bytes(&self) -> usize {
+        self.state
+            .lock()
+            .map_or(0, |state| state.ready_bytes + state.pending_bytes)
     }
 }
 
@@ -612,13 +706,15 @@ impl SubscriptionRegistry {
                     .count()
             })
             .sum::<usize>();
-        if !exists && current >= max_per_session {
+        let effective_max = max_per_session.min(SUBSCRIPTIONS_HARD_CAP_PER_OWNER);
+        if !exists && current >= effective_max {
             return Err(RpcError {
                 code: QUOTA_EXCEEDED,
-                message: format!("session has reached the {max_per_session}-subscription limit"),
+                message: format!("session has reached the {effective_max}-subscription limit"),
                 data: Some(json!({
                     "limit": "subscriptions_per_session",
-                    "max": max_per_session,
+                    "max": effective_max,
+                    "configured_max": max_per_session,
                 })),
             });
         }

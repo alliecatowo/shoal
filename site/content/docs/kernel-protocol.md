@@ -542,7 +542,7 @@ Then the same connection receives:
 }
 ```
 
-Replay from `since` is enqueued through the same 256-entry subscriber queue as live events. Overflow emits a synthetic `{dropped, latest_seq}` payload. Pull-based `events.read` returns forward pages of at most 256 events (and 8 MiB); continue with `page.next_since`. `journal` and `session.transcript` support journal-backed older replay with bounded in-memory pointer windows; other channels retain only 1,024 in memory.
+Replay from `since` is enqueued through the same subscriber queue as live events, bounded at 256 entries and 512 KiB. Overflow emits `{dropped, dropped_bytes, latest_seq}`. Channel rings are bounded at 1,024 entries and 2 MiB. Pull-based `events.read` returns forward pages of at most 256 events (and 8 MiB); continue with `page.next_since`. `journal` and `session.transcript` support journal-backed older replay with bounded in-memory pointer windows; other channels lose history evicted by either ring wall. User publishes are admitted before cloning: 128-byte ASCII channel names, 64 KiB/64-level payloads, and 256 distinct user channels per exact owner.
 
 ### Unsubscribe
 

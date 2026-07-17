@@ -356,7 +356,7 @@ subscribe(channel)
 
 The first event in a channel is `seq=0`, so an implementation may represent “no cursor” separately instead of initializing to zero and skipping it.
 
-`journal` and `session.transcript` can reconstruct surviving durable history beyond their 1,024-event ring. Task, approval, render, and user channels cannot. A `{dropped, latest_seq}` event means pull/reconcile before proceeding.
+`journal` and `session.transcript` can reconstruct surviving durable history beyond their count/byte-bounded ring. Task, approval, render, and user channels cannot. A `{dropped, dropped_bytes, latest_seq}` event means pull/reconcile before proceeding.
 
 MCP `resources/unsubscribe` removes that URI's registered worker, shuts down its dedicated kernel
 connection, and joins the forwarding thread. Facade process termination performs the same cleanup

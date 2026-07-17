@@ -246,10 +246,10 @@ Streams are pull-driven values with single-consumption state. Finite and unbound
 distinguished so terminal operations can reject unsafe collection. Operators compose lazily where
 implemented; bounded channels/tee paths must express backpressure or drop behavior explicitly.
 
-Do not use the word “bounded” as a blanket claim. Some bridges use bounded synchronous channels,
-while the evaluator's in-language event bus has unbounded live subscriber channels behind a bounded
-replay ring. The separate kernel EventBus uses bounded 256-event subscriber queues and coalesced gap
-summaries; the two buses must not be described as one identical backpressure implementation.
+Do not use the word “bounded” as a blanket claim. Some bridges use bounded synchronous channels.
+The evaluator and kernel event buses now both bound replay and subscriber state by count and bytes,
+but use distinct admission limits and gap records; they must not be described as one identical
+backpressure implementation.
 The stream/channel chapter is the source-derived matrix.
 
 ## Builtin and method contract

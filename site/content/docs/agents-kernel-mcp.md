@@ -382,7 +382,7 @@ Dynamic channels are `task.N` and `user.NAME`. Reef is intentionally not adverti
 
 Native clients use `events.subscribe`; MCP clients subscribe to `shoal://events/CHANNEL` or a task resource. Each event has `{channel, seq, ts, payload}`, with sequence monotonic per channel. Delivery is at least once; consumers deduplicate by `(channel, seq)`.
 
-`journal` and `session.transcript` replay from durable journal data even after their 1024-event rings age out and across kernel restart. Other channels are ring-only. Slow subscribers have a private queue of 256 events; overflow becomes a coalesced `{dropped, latest_seq}` notification and never blocks producers or other subscribers.
+`journal` and `session.transcript` replay from durable journal data even after their count/byte-bounded rings age out and across kernel restart. Other channels are ring-only. Slow subscribers have a private queue bounded at 256 events and 512 KiB; overflow becomes a coalesced `{dropped, dropped_bytes, latest_seq}` notification and never blocks producers or other subscribers.
 
 See [Resources and events](@/docs/mcp-resources-events.md) for payloads, cursors, and subscription semantics.
 

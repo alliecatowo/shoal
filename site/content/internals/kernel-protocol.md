@@ -287,18 +287,19 @@ wired; do not document channels that never emit.
 flowchart LR
 accTitle: Event bus
 accDescr: Shows the components and relationships described in Event bus.
-  Publisher["kernel/evaluator publisher"] --> Ring["per-channel ring\n1024 events"]
-  Publisher --> QA["subscriber A queue\n256 events"]
-  Publisher --> QB["subscriber B queue\n256 events"]
-  QA --> WA["dedicated writer thread A"]
-  QB --> WB["dedicated writer thread B"]
-  Overflow["overflow"] --> Marker["coalesced dropped + latest_seq"]
+  Publisher["kernel/evaluator publisher"] --> Ring["per-channel ring\n1024 events / 2 MiB"]
+  Publisher --> QA["subscriber A queue\n256 events / 512 KiB"]
+  Publisher --> QB["subscriber B queue\n256 events / 512 KiB"]
+  QA --> Dispatcher["fair per-connection dispatcher"]
+  QB --> Dispatcher
+  Dispatcher --> Writer["shared connection writer"]
+  Overflow["overflow"] --> Marker["dropped + dropped_bytes + latest_seq"]
   Marker --> QA
 ```
 
-Publishing never performs a blocking socket write. Each subscriber queue is bounded; overflow
-coalesces dropped counts and the latest sequence so slow readers can detect gaps. This prevents one
-stalled client from blocking producers or other subscribers, but the one-thread-per-subscription
+Publishing never performs a blocking socket write. Each subscriber queue is count- and byte-bounded;
+overflow coalesces exact dropped counts/bytes and the latest sequence so slow readers detect gaps. This prevents one
+stalled client from blocking producers or other subscribers, but the one-thread-per-connection
 model is a scaling boundary.
 
 Only `journal` and `session.transcript` have durable replay reconstruction. Their in-memory pointer
@@ -310,6 +311,8 @@ returns at most 256 events and 8 MiB per forward page; follow `page.next_since` 
 
 Language `channel("user.x").emit(value)` reaches the wire bus through the session forwarder. Both
 layers enforce the `user.*` namespace so language code cannot spoof kernel-owned semantic channels.
+The kernel additionally admits at most 64 KiB/64 levels per user payload, 128 bytes per channel name,
+and 256 retained user-channel identities per exact owner before cloning into live state.
 
 ## Tasks and PTYs
 

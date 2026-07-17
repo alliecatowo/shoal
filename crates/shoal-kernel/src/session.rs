@@ -617,7 +617,7 @@ impl Kernel {
                 evaluator.set_event_forwarder(Box::new(move |channel, payload| {
                     let json = serde_json::to_value(crate::wire::wire_value(payload))
                         .unwrap_or(serde_json::Value::Null);
-                    wire_bus.publish(&wire_owner, channel, json);
+                    let _ = wire_bus.publish_user(&wire_owner, channel, json);
                 }));
                 let lang_bus = evaluator.event_bus();
                 Ok(Arc::new(Session {

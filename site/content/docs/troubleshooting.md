@@ -586,7 +586,7 @@ By design, `timeout_ms` limits synchronous waiting and returns a task if work co
 
 Cancellation is requested/cooperative; descendant cleanup is not a universal transaction. Wait for task terminal state and inspect system processes/artifacts. Do not call the same effectful operation again until reconciled.
 
-### Missing event sequence or `{dropped, latest_seq}`
+### Missing event sequence or `{dropped, dropped_bytes, latest_seq}`
 
 The per-subscriber queue overflowed or ring history aged out. Pull from the last persisted cursor:
 

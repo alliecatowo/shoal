@@ -479,9 +479,12 @@ replacement by a typed store query.
 
 ## Events
 
-An event is `{channel,seq,ts,payload}`. Sequence is monotonic per channel. Every channel has a
-1,024-event ring. Each kernel subscriber has a 256-event queue and dedicated writer thread. At
-capacity, events coalesce into `{dropped,latest_seq}` rather than growing without bound.
+An event is `{channel,seq,ts,payload}`. Sequence is monotonic per channel. Every channel ring is
+bounded by both 1,024 events and 2 MiB. Each kernel subscriber has a queue bounded by both 256 events
+and 512 KiB; each connection owns one shared dispatcher thread. At either queue wall, events coalesce into
+`{dropped,dropped_bytes,latest_seq}` rather than growing without bound.
+The configured per-session subscription quota is honored up to a hard ceiling of 1,024 identities per
+exact owner, so an accidentally permissive configuration cannot make subscription metadata unbounded.
 
 | Method | Params | Result/behavior |
 |---|---|---|
@@ -498,9 +501,12 @@ ring-only cursor older than `oldest_available`. A page is also bounded to 8 MiB 
 an individually oversized payload becomes an explicit `payload_truncated` marker without losing its
 sequence cursor. Approval, render, task, and `user.*` channels are ring-only and lose old history.
 
-`events.publish` rejects kernel-owned names and mirrors the JSON payload into the attached evaluator's
-language EventBus without holding the evaluator lock. Language-originated `user.*` emits take the
-reverse forwarder and do not echo on injection.
+`events.publish` rejects kernel-owned names and validates before the first retained clone: channel
+names are at most 128 ASCII bytes, user payloads at most 64 KiB encoded and 64 levels deep, and one
+exact owner may retain at most 256 distinct `user.*` channel identities. It then mirrors the JSON
+payload into the attached evaluator's language EventBus without holding the evaluator lock.
+Language-originated `user.*` emits pass through the same wire-bus admission and do not echo on
+injection. These limits are per exact principal/session.
 
 Kernel unsubscribe correctly closes its writer queue. MCP `resources/unsubscribe` is a separate known
 gap: the facade does not retain the dedicated connection/thread handle needed to issue this method.

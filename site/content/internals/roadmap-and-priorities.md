@@ -298,25 +298,25 @@ does not require unrelated edits to two hand-built evaluator sequences.
 
 ### P1.2 Subscription ownership and bounded EventBus delivery
 
-**Current split.** The kernel bus already has the right core backpressure shape: a 1,024-event replay
-ring, a 256-event queue per subscriber, one isolated writer thread, coalesced
-`{dropped, latest_seq}` summaries, and explicit queue closure on kernel unsubscribe/disconnect. Two
-adjacent paths still diverge:
+**Current split.** The kernel bus has a count/byte-bounded replay ring and subscriber queues, one
+isolated writer thread per connection, coalesced `{dropped, dropped_bytes, latest_seq}` summaries,
+and explicit queue closure on kernel unsubscribe/disconnect. The evaluator bus now independently
+bounds channel identities, rings, subscribers, queues, and publishable retained values. Two adjacent
+ownership/coordination gaps remain:
 
-- the evaluator's in-language EventBus uses unbounded `mpsc` subscribers and clones/sends while its
-  channel-map mutex is held;
+- evaluator publication still clones/fans out while holding its global channel-map mutex;
 - MCP `resources/subscribe` creates a dedicated connection/thread, but
   `resources/unsubscribe` has no facade-side registry or handle with which to stop it.
 
 **Design.** Reuse the kernel semantics as the cross-bus vocabulary: owner, subscription ID,
 capacity, overflow/gap marker, cancellation token, and close/join path. Give MCP a URI-keyed registry
-whose unsubscribe closes the dedicated connection and joins or supervises its worker. Give language
-channels finite per-subscriber capacity without blocking a publisher; release the global map lock
-before fan-out where practical.
+whose unsubscribe closes the dedicated connection and joins or supervises its worker. Release the
+language bus's global map lock before fan-out where practical. Keep the two bus implementations'
+different payload types and admission policies explicit.
 
-**Acceptance tests.** Preserve the existing kernel stalled-consumer, coalesced-gap, unsubscribe, and
-disconnect tests. Add equivalent language-bus pressure tests. Through real MCP stdio, prove that
-unsubscribe stops notifications and the forwarding worker, disconnect cleans all owned
+**Acceptance tests.** Preserve the kernel and language stalled-consumer, bounded-retention,
+coalesced-gap, unsubscribe, and disconnect tests. Through real MCP stdio, prove that unsubscribe
+stops notifications and the forwarding worker, disconnect cleans all owned
 subscriptions, and repeated cycles return thread/task counts to baseline. A durable-channel gap must
 remain repairable through cursor read.
 

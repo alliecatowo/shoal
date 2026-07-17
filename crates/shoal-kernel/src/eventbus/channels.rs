@@ -2,10 +2,21 @@ use super::durable::{DurableChannel, DurableIndexes};
 use super::*;
 
 /// Ring-buffered event log for one channel.
+struct RetainedEvent {
+    event: Event,
+    bytes: usize,
+}
+
+enum PublishFailure {
+    Quarantined,
+    UserIdentityLimit,
+}
+
 #[derive(Default)]
 struct ChannelBuf {
     next_seq: u64,
-    ring: VecDeque<Event>,
+    ring: VecDeque<RetainedEvent>,
+    ring_bytes: usize,
 }
 
 /// Owns all per-owner channel rings and their monotonic cursors.
@@ -36,30 +47,80 @@ impl ChannelRegistry {
         payload: Json,
         durable: Option<(DurableChannel, i64)>,
     ) -> Event {
+        self.publish_inner(durable_indexes, owner, channel, payload, durable, false)
+            .unwrap_or_else(|(_, payload)| quarantined_event(channel, payload))
+    }
+
+    pub(super) fn publish_user(
+        &self,
+        durable_indexes: &DurableIndexes,
+        owner: &OwnerKey,
+        channel: &str,
+        payload: Json,
+    ) -> Result<Event, RpcError> {
+        self.publish_inner(durable_indexes, owner, channel, payload, None, true)
+            .map_err(|(failure, _)| match failure {
+                PublishFailure::UserIdentityLimit => RpcError {
+                    code: QUOTA_EXCEEDED,
+                    message: format!(
+                        "session has reached the {USER_CHANNELS_PER_OWNER_MAX} user-channel identity limit"
+                    ),
+                    data: Some(json!({
+                        "limit":"user_event_channels_per_session",
+                        "max":USER_CHANNELS_PER_OWNER_MAX,
+                        "channel":channel,
+                    })),
+                },
+                PublishFailure::Quarantined => RpcError {
+                    code: INTERNAL_ERROR,
+                    message: "event replay subsystem is quarantined; restart the kernel".into(),
+                    data: Some(json!({"subsystem":"events","quarantined":true})),
+                },
+            })
+    }
+
+    fn publish_inner(
+        &self,
+        durable_indexes: &DurableIndexes,
+        owner: &OwnerKey,
+        channel: &str,
+        payload: Json,
+        durable: Option<(DurableChannel, i64)>,
+        enforce_user_identity_cap: bool,
+    ) -> Result<Event, (PublishFailure, Json)> {
         if self.is_quarantined() || durable_indexes.is_quarantined() {
-            return quarantined_event(channel, payload);
+            return Err((PublishFailure::Quarantined, payload));
         }
         let Ok(_coordination) = self.coordination.lock() else {
             self.quarantined.store(true, Ordering::Release);
-            return quarantined_event(channel, payload);
+            return Err((PublishFailure::Quarantined, payload));
         };
         let Ok(mut buffers) = self.buffers.lock() else {
             self.quarantined.store(true, Ordering::Release);
-            return quarantined_event(channel, payload);
+            return Err((PublishFailure::Quarantined, payload));
         };
-        let buffer = buffers
-            .entry((owner.clone(), channel.to_string()))
-            .or_default();
+        let key = (owner.clone(), channel.to_string());
+        if enforce_user_identity_cap
+            && !buffers.contains_key(&key)
+            && buffers
+                .keys()
+                .filter(|(channel_owner, name)| channel_owner == owner && name.starts_with("user."))
+                .count()
+                >= USER_CHANNELS_PER_OWNER_MAX
+        {
+            return Err((PublishFailure::UserIdentityLimit, payload));
+        }
+        let buffer = buffers.entry(key).or_default();
         let seq = buffer.next_seq;
         let Some(next_seq) = seq.checked_add(1) else {
             self.quarantined.store(true, Ordering::Release);
-            return quarantined_event(channel, payload);
+            return Err((PublishFailure::Quarantined, payload));
         };
         if let Some((which, entry_id)) = durable
             && !durable_indexes.append(which, owner, seq, entry_id)
         {
             self.quarantined.store(true, Ordering::Release);
-            return quarantined_event(channel, payload);
+            return Err((PublishFailure::Quarantined, payload));
         }
         buffer.next_seq = next_seq;
         let event = Event {
@@ -68,11 +129,32 @@ impl ChannelRegistry {
             ts: now_ns(),
             payload,
         };
-        buffer.ring.push_back(event.clone());
-        while buffer.ring.len() > EVENT_RING_CAP {
-            buffer.ring.pop_front();
+        let retained_bytes = event_retained_bytes(&event);
+        if retained_bytes <= EVENT_RING_MAX_BYTES {
+            buffer.ring.push_back(RetainedEvent {
+                event: event.clone(),
+                bytes: retained_bytes,
+            });
+            let Some(next_bytes) = buffer.ring_bytes.checked_add(retained_bytes) else {
+                self.quarantined.store(true, Ordering::Release);
+                return Ok(event);
+            };
+            buffer.ring_bytes = next_bytes;
         }
-        event
+        while buffer.ring.len() > EVENT_RING_CAP || buffer.ring_bytes > EVENT_RING_MAX_BYTES {
+            if let Some(expired) = buffer.ring.pop_front() {
+                let Some(next_bytes) = buffer.ring_bytes.checked_sub(expired.bytes) else {
+                    self.quarantined.store(true, Ordering::Release);
+                    buffer.ring_bytes = 0;
+                    break;
+                };
+                buffer.ring_bytes = next_bytes;
+            } else {
+                buffer.ring_bytes = 0;
+                break;
+            }
+        }
+        Ok(event)
     }
 
     pub(super) fn oldest_seq(&self, owner: &OwnerKey, channel: &str) -> Option<u64> {
@@ -89,7 +171,7 @@ impl ChannelRegistry {
         };
         buffers
             .get(&(owner.clone(), channel.to_string()))
-            .and_then(|buffer| buffer.ring.front().map(|event| event.seq))
+            .and_then(|buffer| buffer.ring.front().map(|retained| retained.event.seq))
     }
 
     pub(super) fn read(
@@ -116,6 +198,7 @@ impl ChannelRegistry {
         let events: Vec<Event> = buffer
             .ring
             .iter()
+            .map(|retained| &retained.event)
             .filter(|event| since.is_none_or(|seq| event.seq > seq))
             .take(limit.unwrap_or(usize::MAX))
             .cloned()
@@ -258,6 +341,31 @@ impl ChannelRegistry {
             });
             assert!(handle.join().is_err());
         });
+    }
+
+    #[cfg(test)]
+    pub(super) fn ring_stats(&self, owner: &OwnerKey, channel: &str) -> (usize, usize) {
+        self.buffers
+            .lock()
+            .ok()
+            .and_then(|buffers| {
+                buffers
+                    .get(&(owner.clone(), channel.to_string()))
+                    .map(|buffer| (buffer.ring.len(), buffer.ring_bytes))
+            })
+            .unwrap_or((0, 0))
+    }
+
+    #[cfg(test)]
+    pub(super) fn user_identity_count(&self, owner: &OwnerKey) -> usize {
+        self.buffers.lock().map_or(0, |buffers| {
+            buffers
+                .keys()
+                .filter(|(channel_owner, channel)| {
+                    channel_owner == owner && channel.starts_with("user.")
+                })
+                .count()
+        })
     }
 }
 
