@@ -35,6 +35,7 @@
 //! runs to completion behaves byte-identically to before, and Capture mode has
 //! no stop concept at all.
 
+mod bounded;
 mod cancel;
 mod capture;
 mod pty;
@@ -51,6 +52,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 
+pub use bounded::{BoundedCommandOutput, run_bounded_command};
 pub use cancel::CancelToken;
 pub use capture::{StreamingChild, spawn_capture};
 pub use pty::{PtyJob, shutdown_stopped_jobs, take_background_job, take_stopped_job};

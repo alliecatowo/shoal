@@ -123,45 +123,27 @@ pub trait Provider: Send + Sync {
 /// The `--version` probe timeout (site/content/internals/reef-resolution.md).
 pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 
+/// Version probes only need a short banner. Retaining more would let a hostile
+/// tool amplify memory use during ordinary resolution; the executor continues
+/// draining both pipes after this cap so the child cannot block on them.
+const PROBE_OUTPUT_CAP: usize = 16 * 1024;
+
 /// Run `<path> --version` with a hard timeout and parse a version leniently from
 /// its output. Returns [`Version::unknown`] on timeout, spawn failure, or when no
 /// version-shaped token is found. Never blocks longer than [`PROBE_TIMEOUT`].
 pub(crate) fn probe_version(path: &std::path::Path) -> Version {
-    use std::process::{Command, Stdio};
-
-    let mut child = match Command::new(path)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(_) => return Version::unknown(),
-    };
-
-    let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Version::unknown();
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
+    let mut command = std::process::Command::new(path);
+    command.arg("--version");
+    let output =
+        match shoal_exec::run_bounded_command(&mut command, PROBE_TIMEOUT, PROBE_OUTPUT_CAP) {
+            Ok(output) if !output.timed_out => output,
             Err(_) => return Version::unknown(),
-        }
-    }
+            Ok(_) => return Version::unknown(),
+        };
 
-    let mut out = String::new();
-    if let Ok(o) = child.wait_with_output() {
-        out.push_str(&String::from_utf8_lossy(&o.stdout));
-        out.push(' ');
-        out.push_str(&String::from_utf8_lossy(&o.stderr));
-    }
+    let mut out = String::from_utf8_lossy(&output.stdout).into_owned();
+    out.push(' ');
+    out.push_str(&String::from_utf8_lossy(&output.stderr));
     parse_version_token(&out)
 }
 
@@ -201,6 +183,21 @@ pub(crate) fn is_executable(path: &std::path::Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::io;
+    use std::os::unix::fs::PermissionsExt;
+    use std::thread;
+    use std::time::Instant;
+
+    fn executable_script(contents: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tool");
+        fs::write(&path, format!("#!/bin/sh\n{contents}\n")).expect("write tool");
+        let mut permissions = fs::metadata(&path).expect("tool metadata").permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&path, permissions).expect("make tool executable");
+        (dir, path)
+    }
 
     #[test]
     fn parse_version_token_variants() {
@@ -215,5 +212,47 @@ mod tests {
     fn probe_missing_binary_is_unknown() {
         let v = probe_version(std::path::Path::new("/nonexistent/tool/xyz"));
         assert!(v.is_unknown());
+    }
+
+    #[test]
+    fn probe_drains_flooding_output_without_defeating_deadline() {
+        let (_dir, tool) = executable_script(
+            "printf 'hostile-tool 1.2.3\\n'; i=0; while [ $i -lt 50000 ]; do printf 0123456789; i=$((i+1)); done",
+        );
+        let start = Instant::now();
+        let version = probe_version(&tool);
+        assert_eq!(version.raw(), "1.2.3");
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn probe_timeout_kills_forked_descendants() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let descendant_path = dir.path().join("descendant.pid");
+        let script = format!("sleep 30 & echo $! > '{}'; wait", descendant_path.display());
+        let (_tool_dir, tool) = executable_script(&script);
+
+        let start = Instant::now();
+        assert!(probe_version(&tool).is_unknown());
+        assert!(start.elapsed() < Duration::from_secs(1));
+
+        let descendant: libc::pid_t = fs::read_to_string(descendant_path)
+            .expect("descendant pid")
+            .trim()
+            .parse()
+            .expect("numeric pid");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            // SAFETY: signal 0 only checks whether this recorded pid exists.
+            let result = unsafe { libc::kill(descendant, 0) };
+            if result == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "descendant {descendant} survived"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 }
