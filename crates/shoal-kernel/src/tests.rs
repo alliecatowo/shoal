@@ -679,6 +679,112 @@ fn concurrent_pty_close_has_exactly_one_teardown_owner() {
 }
 
 #[test]
+fn poisoned_pty_session_quarantines_only_that_entry_and_releases_quota() {
+    let kernel = Kernel::new();
+    kernel.configure_limits(Limits {
+        max_ptys_per_session: 1,
+        ..Limits::default()
+    });
+    let actor = principal();
+    let session = kernel.session("poisoned-pty-session", &actor).unwrap();
+    let owner = session.key.owner();
+    let mut attached = Some(Attachment {
+        session,
+        principal: actor,
+        can_approve: false,
+        tty: false,
+        cancel_epoch: None,
+        bearer: None,
+        security_epoch: ATTACH_SECURITY_EPOCH,
+        connection_trust: ConnectionTrust::EmbeddedHuman,
+    });
+    let opened = kernel
+        .handle_pty_open(json!({"cmd":"cat"}), &mut attached)
+        .unwrap();
+    let pty_ref: Ref = serde_json::from_value(opened["pty_id"].clone()).unwrap();
+    let entry = kernel.ptys.get(&pty_ref).unwrap();
+    let poisoner = entry.clone();
+    assert!(
+        std::thread::spawn(move || {
+            let _session = poisoner.session.lock().unwrap();
+            panic!("inject PTY session poison");
+        })
+        .join()
+        .is_err()
+    );
+
+    let error = kernel
+        .handle_pty_read(json!({"pty_id":pty_ref}), &mut attached)
+        .err()
+        .unwrap();
+    assert_eq!(error.code, INTERNAL_ERROR);
+    assert_eq!(error.data.as_ref().unwrap()["component"], "session");
+    assert_eq!(error.data.unwrap()["scope"], "entry");
+    assert!(kernel.ptys.get(&pty_ref).is_none());
+    assert!(!kernel.ptys.active_for(&owner));
+    drop(entry);
+
+    let replacement = kernel
+        .handle_pty_open(json!({"cmd":"cat"}), &mut attached)
+        .expect("one poisoned PTY must not quarantine healthy PTY admission");
+    kernel
+        .handle_pty_close(json!({"pty_id":replacement["pty_id"]}), &mut attached)
+        .unwrap();
+}
+
+#[test]
+fn poisoned_pty_lifecycle_fails_typed_and_releases_on_entry_drop() {
+    let kernel = Kernel::new();
+    kernel.configure_limits(Limits {
+        max_ptys_per_session: 1,
+        ..Limits::default()
+    });
+    let actor = principal();
+    let session = kernel.session("poisoned-pty-lifecycle", &actor).unwrap();
+    let mut attached = Some(Attachment {
+        session,
+        principal: actor,
+        can_approve: false,
+        tty: false,
+        cancel_epoch: None,
+        bearer: None,
+        security_epoch: ATTACH_SECURITY_EPOCH,
+        connection_trust: ConnectionTrust::EmbeddedHuman,
+    });
+    let opened = kernel
+        .handle_pty_open(json!({"cmd":"cat"}), &mut attached)
+        .unwrap();
+    let pty_ref: Ref = serde_json::from_value(opened["pty_id"].clone()).unwrap();
+    let entry = kernel.ptys.get(&pty_ref).unwrap();
+    let poisoner = entry.clone();
+    assert!(
+        std::thread::spawn(move || {
+            let _lifecycle = poisoner.lifecycle.lock().unwrap();
+            panic!("inject PTY lifecycle poison");
+        })
+        .join()
+        .is_err()
+    );
+
+    let error = kernel
+        .handle_pty_close(json!({"pty_id":pty_ref}), &mut attached)
+        .err()
+        .unwrap();
+    assert_eq!(error.code, INTERNAL_ERROR);
+    assert_eq!(error.data.as_ref().unwrap()["component"], "lifecycle");
+    assert_eq!(error.data.unwrap()["scope"], "entry");
+    assert!(kernel.ptys.get(&pty_ref).is_none());
+    drop(entry);
+
+    let replacement = kernel
+        .handle_pty_open(json!({"cmd":"cat"}), &mut attached)
+        .expect("dropping a quarantined PTY must release its permit");
+    kernel
+        .handle_pty_close(json!({"pty_id":replacement["pty_id"]}), &mut attached)
+        .unwrap();
+}
+
+#[test]
 fn self_exited_pty_releases_active_and_session_leases_without_a_request() {
     let kernel = Kernel::new();
     kernel.configure_limits(Limits {

@@ -265,21 +265,33 @@ struct PtyLifecycle {
     terminal_since: Option<Instant>,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum PtyEntryInvariant {
+    Lifecycle,
+}
+
 impl PtyEntry {
-    fn mark_terminal(&self) {
+    fn mark_terminal(&self) -> Result<(), PtyEntryInvariant> {
         let (active_slot, session_lease) = {
-            let mut lifecycle = self.lifecycle.lock().unwrap();
+            let mut lifecycle = self
+                .lifecycle
+                .lock()
+                .map_err(|_| PtyEntryInvariant::Lifecycle)?;
             if lifecycle.terminal_since.is_some() {
-                return;
+                return Ok(());
             }
             lifecycle.terminal_since = Some(Instant::now());
             (lifecycle.active_slot.take(), lifecycle.session_lease.take())
         };
         drop((active_slot, session_lease));
+        Ok(())
     }
 
-    fn terminal_since(&self) -> Option<Instant> {
-        self.lifecycle.lock().unwrap().terminal_since
+    fn terminal_since(&self) -> Result<Option<Instant>, PtyEntryInvariant> {
+        self.lifecycle
+            .lock()
+            .map(|lifecycle| lifecycle.terminal_since)
+            .map_err(|_| PtyEntryInvariant::Lifecycle)
     }
 }
 
@@ -782,8 +794,8 @@ impl Kernel {
     /// Detect self-exited PTYs, release their active/session leases, and bound
     /// retained final-screen records. Snapshot first so registry and per-PTY
     /// locks are never held together.
-    fn reap_terminal_ptys(&self, owner: &OwnerKey) {
-        self.ptys.reap_terminal(owner);
+    fn reap_terminal_ptys(&self, owner: &OwnerKey) -> Result<(), RpcError> {
+        self.ptys.reap_terminal(owner)
     }
 
     /// The real enforcement truth for `principal` (site/content/internals/language-conformance-contract.md tier honesty):
