@@ -146,11 +146,16 @@ impl LanguageServer for Backend {
                         .find(|symbol| symbol.name == label && symbol_visible_at(symbol, byte));
                     let facts = symbol_facts(symbol);
                     let source = resolve_command_source(&label, facts);
+                    let keyword = is_keyword(&label) && symbol.is_none();
                     CompletionItem {
                         kind: Some(
                             symbol.map_or_else(|| completion_kind(&label), Symbol::completion_kind),
                         ),
-                        detail: Some(format!("{} — {}", source.as_str(), source.reason())),
+                        detail: Some(if keyword {
+                            "language keyword".into()
+                        } else {
+                            format!("{} — {}", source.as_str(), source.reason())
+                        }),
                         documentation: symbol
                             .and_then(|symbol| symbol.doc.clone().map(Documentation::String)),
                         label,
@@ -262,6 +267,10 @@ fn completion_kind(label: &str) -> CompletionItemKind {
         }
         _ => CompletionItemKind::KEYWORD,
     }
+}
+
+fn is_keyword(label: &str) -> bool {
+    shoal_syntax::lexer::RESERVED.contains(&label) || EXTRA_KEYWORDS.contains(&label)
 }
 
 /// Language keywords the parser special-cases beyond `shoal_syntax::lexer::
@@ -503,5 +512,16 @@ mod tests {
             diagnostic.code == Some(NumberOrString::String("opaque_effect".into()))
                 && diagnostic.source.as_deref() == Some("shoal-planner")
         }));
+    }
+
+    #[test]
+    fn declaration_span_uses_identifier_boundaries() {
+        let text = "fn n() {}";
+        let ast = shoal_syntax::parse(text).unwrap();
+        let symbol = collect_symbols(&ast, text).remove(0);
+        assert_eq!(
+            &text[symbol.span.start as usize..symbol.span.end as usize],
+            "n"
+        );
     }
 }

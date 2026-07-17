@@ -328,7 +328,15 @@ fn identifier_span(text: &str, within: Span, name: &str) -> Span {
     let start = within.start as usize;
     let end = (within.end as usize).min(text.len());
     text.get(start..end)
-        .and_then(|slice| slice.find(name).map(|offset| start + offset))
+        .and_then(|slice| {
+            slice.match_indices(name).find_map(|(offset, _)| {
+                let before = slice[..offset].chars().next_back();
+                let after = slice[offset + name.len()..].chars().next();
+                let boundary =
+                    |c: Option<char>| c.is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'));
+                (boundary(before) && boundary(after)).then_some(start + offset)
+            })
+        })
         .map_or(within, |start| Span::new(start, start + name.len()))
 }
 
