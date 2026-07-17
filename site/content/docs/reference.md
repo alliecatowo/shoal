@@ -319,7 +319,7 @@ events.subscribe events.unsubscribe
 | `out:N` | Transcript value/error | Named session, live kernel/evaluator. |
 | `task:N` | Background/timed task | Named session, live kernel. |
 | `pty:N` | Interactive PTY | Named session, live kernel. |
-| `plan:HEX` | Stored plan | Live kernel; metadata caller-scoped but current ID collision-prone. |
+| `plan:FULL_DIGEST:OBJECT_ID` | Stored plan | Live kernel; immutable caller/content-bound object, lost on restart. |
 | `val:blake3:HASH` | Content-addressed value/blob | State-store/CAS retention. |
 
 Equivalent resource URIs use `shoal://out/N`, `shoal://task/N`, etc. Never persist the first four as durable business IDs.

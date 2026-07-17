@@ -137,35 +137,20 @@ The corpus is broad executable language coverage, not a security proof. Kernel/M
 - Layered TOML configuration with validation, warnings for unknown keys, prompt/editor/history/reef settings.
 - Configurable prompt segments, colors, symbols, left/right/continuation/transient rendering.
 - Keybinding chord/action mapping.
-- LSP diagnostics, full-document formatting, keyword/builtin/local-declaration completion, and limited hover.
+- LSP diagnostics, incremental sync, whole-document formatting, scoped completion/hover, document symbols, and local/direct-module goto definition.
 
-## Critical security limitations
+## Security boundaries and closed audit findings
 
-These are release blockers for hostile or multi-tenant operation.
+The first deep-audit P0s are now closed in code and covered by adversarial tests:
 
-### P0: unauthenticated journal query
+- `journal.query` requires attachment, is principal+Session scoped, and has a hard page cap;
+- `cap.request` requires an authenticated approver, denies self-approval by default, durably audits the immutable grant binding, and grants one-shot state;
+- plan references carry a full source/AST/effects/Session/principal digest plus a unique object suffix, so same-shape or identical repeated plans cannot overwrite one another;
+- every production child evaluator is created through one audited context that propagates principal, policy, Reef, filesystem, and cancellation state;
+- public sockets reject asserted local-human authority and default tokenless clients to restricted `agent:mcp`; only the server-selected anonymous private REPL transport is a human trust root;
+- evaluator Sessions and their refs/tasks/PTYS/quotas are keyed by principal plus visible Session name.
 
-The raw kernel router calls `journal.query` without `session.attach`. A fresh socket connection can query the global journal and receive original source, AST, effects, session/principal, cwd, status/timing, and output hashes. This is a data-disclosure flaw.
-
-### P0: unauthenticated plan approval
-
-The raw kernel router calls `cap.request` without attachment or caller verification. Given a live plan reference, a socket client can approve a plan whose stored policy is not `Deny` (subject to requested-effect coverage). The MCP connection attaches first but the kernel handler still ignores that identity.
-
-### P0: nested evaluators lose policy state
-
-Child evaluators created by `spawn`, `.shl` runner execution, `parallel`, and channel handlers do not consistently inherit the parent Leash principal/policy; some also lose Reef resolver/configuration state. A top-level `caps_enforced: true` result therefore does not establish policy propagation through nested execution.
-
-### P0/P1: plan-reference collisions
-
-`plan_ref` is 16 hex characters from a hash of effects, reversibility, and estimates only. It excludes source, session, and principal and keys one process-global map. Same-shape plans can overwrite across callers. Apply rechecks stored caller/source metadata, preventing a simple alternate-source apply, but handles can be invalidated/cross-selected and the flaw composes with unauthenticated approval.
-
-### Socket possession grants local-human attachment
-
-Tokens are optional. A client that can reach the socket may omit a token and attach as `uid:<kernel euid>`; the default kernel policy is permissive for that local-human principal. There is no `SO_PEERCRED` check or mandatory-token mode. The `0600` socket/private directory is the primary boundary.
-
-### Named sessions are not principal isolation
-
-Transcript refs, evaluator bindings/cwd/env, tasks, and PTYs are scoped to session name, not principal. Any socket client can request a session name; there is no ACL. Plans normally check principal metadata, subject to collision/approval defects. The per-statement evaluator journal can retain the first session creator's attribution for later shared principals; the coarse kernel exec journal uses the real current actor.
+These changes do not make one kernel process a hard multi-tenant boundary. Same-process principals still share global resources and persisted state files, public transport has no `SO_PEERCRED` binding, tokens load at startup, and arbitrary native code is only constrained along dimensions the OS backend actually enforces. Use separate OS users/processes/state roots for mutually hostile tenants.
 
 Full impact/mitigation: [Security and trust boundaries](@/docs/security.md).
 
@@ -188,14 +173,14 @@ Full impact/mitigation: [Security and trust boundaries](@/docs/security.md).
 | PTY output | Current rendered grid, no raw ANSI or durable scrollback stream. | Use ordinary exec for audit capture. |
 | Resource/session lifetime | Plans/tasks/PTys/transcript refs disappear on kernel restart. | Reconcile journal/artifacts and recreate. |
 | Event retention | Only journal/transcript durable; other channels retain 1,024. | Detect gaps and reconcile authoritative state. |
-| No quotas | No per-principal session/task/PTY/subscription/CPU/memory quotas. | OS service limits and fully trusted clients. |
+| Partial quotas | Connections, retained Sessions, active tasks, PTYs, subscriptions, transcript/cursor retention, plans, and frame sizes are bounded; CPU, memory, and descendant process trees are not comprehensively metered. | Apply OS service/cgroup limits for hostile workloads. |
 
 ## Token and policy limitations
 
 - `shoal-token` profile and `--cap` entries are attachment metadata, not authorization grants; Leash evaluates only the principal's policy entry.
 - The daemon reads `tokens.json` at startup and does not reload it. Create/revoke requires kernel restart; expiry is checked live.
 - `SHOAL_TOKEN_STORE` affects the CLI but not the kernel, which always uses `<state-dir>/tokens.json`.
-- The default no-`--policy` kernel is permissive for local human and does not define token principals.
+- The default no-`--policy` durable kernel gives tokenless public clients the restricted `agent:mcp` identity; the private embedded-human REPL remains a distinct trusted surface.
 - Leash effect analysis describes understood behavior; arbitrary native programs can do more unless an OS boundary prevents it.
 - Filesystem sandboxing can be active on Linux Landlock/macOS Seatbelt. Network enforcement is absent; spawn hash checking has a pre-exec TOCTOU window.
 - `caps_enforced` is a useful but coarse bool: inspect individual dimensions and nested propagation.
@@ -279,8 +264,8 @@ Wire paths preserve raw Unix bytes alongside lossy display strings. Some other v
 - Unknown-key warnings protect typos but do not migrate renamed semantics automatically.
 - Keybinding action names are a fixed mapping to Reedline; unknown chords/actions warn/skip.
 - Prompt snapshots avoid arbitrary scripting in the render path; customization is structured rather than Starship/Bash-code compatible.
-- LSP is syntax/local-document oriented: no goto definition, references, rename, workspace index, semantic tokens, code actions, signature help, or incremental sync.
-- LSP declaration completion is lexical scanning, not a scope/type-aware semantic model.
+- LSP is parser/local-document oriented with true incremental sync, scope-aware local symbols, document symbols, and goto-definition for local bindings plus exported members of directly used file modules. It still has no references, rename, workspace index, semantic tokens, code actions, signature help, or project/manifest graph.
+- LSP completion and definitions use parser-derived lexical scopes, not a type-aware or workspace-indexed semantic model.
 - `shoal lsp`/`shoal mcp` search `PATH`; they do not search beside the main binary. The sandbox helper has the opposite packaging constraint (searched beside executable).
 
 ## Platform support
@@ -318,15 +303,12 @@ Practical guidance:
 
 At minimum:
 
-1. close unauthenticated journal/approval routes;
-2. propagate policy/principal/sandbox through all nested evaluators;
-3. make plan identity collision-resistant and caller-bound;
-4. introduce mandatory authentication/peer credential checks and real session membership/isolation;
-5. add live token revocation/reload;
-6. close raw/blob resource-exhaustion gaps and add quotas;
-7. provide per-dimension enforcement truth and stronger network/process controls;
-8. harden task/process-tree/PTY/subscription lifecycle;
-9. stabilize/version wire/config/journal contracts;
-10. run adversarial cross-principal and long-duration platform testing.
+1. decide whether public deployments need mandatory bearer mode and/or peer-credential binding;
+2. add live token revocation/reload;
+3. close remaining raw/blob resource-exhaustion gaps and add CPU/memory/process-tree controls;
+4. provide stronger network/process enforcement and preserve per-dimension enforcement truth;
+5. continue long-duration task/PTY/subscription/process-tree lifecycle testing;
+6. stabilize/version wire/config/journal contracts;
+7. run adversarial cross-principal and long-duration platform testing.
 
 The ordered work is in [Roadmap](@/docs/roadmap.md). For practical current deployment, use [Security](@/docs/security.md), [Agent workflows](@/docs/mcp-workflows.md), and [Troubleshooting](@/docs/troubleshooting.md).

@@ -398,7 +398,7 @@ Reef returns the resolved binary's full BLAKE3 digest to the evaluator. When the
 Two qualifications matter:
 
 - an empty or absent `proc_spawn` list means unrestricted spawning; it is not default-deny;
-- child evaluators created by `spawn`, `.shl` execution, `parallel`, and channel handlers do not currently inherit the parent policy/principal, and some do not inherit Reef resolver/configuration state. Do not treat nested evaluator execution as a complete policy-preserving boundary yet.
+- every production child evaluator (`spawn`, `.shl`, parallel, stream, and channel routes) now inherits the audited parent policy/principal and Reef resolver/configuration through one constructor. Treat a divergence as a security regression; this still does not remove the external-spawn TOCTOU window.
 
 See [Security and trust boundaries](@/docs/security.md) for the full enforcement matrix.
 
@@ -452,7 +452,7 @@ Also, typing `./script.py` directly as a command head does not currently route t
 
 ### Script isolation
 
-A `.shl` script receives a fresh language scope with `args` and `script` bindings plus copied process environment/adapters/ports/bus. It does not leak its `let` bindings into the caller. It also does not currently inherit every Reef and Leash field from the parent evaluator; see the security warning above.
+A `.shl` script receives a fresh language scope with `args` and `script` bindings plus the audited inherited process environment/adapters/ports/bus, Reef, and Leash context. It does not leak its `let` bindings into the caller. The outer statement owns journaling rather than creating implicit nested script rows.
 
 ## `which`
 
@@ -593,7 +593,7 @@ Reef is implemented and actively used for constrained external spawns, but it is
 - `reef fetch` is mise-only and does not enforce the declared provider pin.
 - General bare-path command heads do not use runners; spell `run(PATH)`.
 - Runner defaults outside the fixed fallback require an active tools-bearing scope.
-- Child evaluators do not consistently inherit Reef/Leash context.
+- Child evaluators inherit Reef/Leash context through the audited unified child constructor; future child routes must join that inventory.
 - Hermetic controls only the emitted `PATH`, not all process effects.
 - Provider inventory and `which --all` are host-dependent by design.
 

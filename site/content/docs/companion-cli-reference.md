@@ -206,13 +206,15 @@ Current server capabilities:
 
 | Capability | Behavior |
 | --- | --- |
-| Text sync | Full-document changes. |
-| Diagnostics | One syntax diagnostic for incomplete/error parse; cleared on valid document/close. |
+| Text sync | True incremental UTF-16 range edits, with full-document replacement accepted when clients send it. Malformed/stale edits are rejected without corrupting the stored document. |
+| Diagnostics | Syntax diagnostics plus side-effect-free planner analysis; cleared/refreshed for the latest document version. |
 | Formatting | Whole-document edit using the Shoal formatter, only when parse is complete. |
-| Completion | Keywords, canonical builtin command heads, and earlier lexical `let`/`var`/`fn`/`alias` declarations. |
-| Hover | Short help for `let`, `var`, `fn`, `match`, `with`, `spawn`, `sh`, and `it`. |
+| Completion | Keywords, canonical builtin heads, and parser-derived visible bindings/functions/parameters/aliases with source details/docs. |
+| Hover | Declaration details/docs for visible symbols plus language/builtin resolution help. |
+| Goto definition | Scope-aware local declarations and exported members/paths of directly used file modules. |
+| Document symbols | Parser-derived bindings, functions, parameters, aliases, and nested scopes. |
 
-Not currently advertised: goto definition, references, rename, code actions, workspace symbols, semantic tokens, signature help, incremental sync, workspace configuration, or file watching.
+Not currently advertised: references, rename, code actions, workspace symbols/index, semantic tokens, signature help, workspace configuration, project/manifest graph, or file watching.
 
 Generic editor configuration should launch one of:
 
@@ -232,7 +234,7 @@ Formatting returns no edits when the current document is incomplete or invalid. 
 
 ### Completion caveat
 
-Local declaration discovery is intentionally lexical and simple. It scans text before the cursor, not the full semantic scope graph. Expect suggestions for declarations that may be shadowed/out of scope, and no project-wide symbol index.
+Local declaration discovery walks the parsed AST and models lexical visibility/shadowing, including function parameters and nested patterns. It is not type-aware and has no project-wide symbol index. Cross-file definition is deliberately narrow: direct file `use` paths and exported members, not a general module/workspace resolver.
 
 ## `shoal-token`
 

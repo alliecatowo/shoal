@@ -320,7 +320,7 @@ Read the structured error instead of deleting the lock reflexively. A lock misma
 
 ### Nested `spawn` resolves differently
 
-Nested evaluators do not consistently inherit parent Reef/Leash context in the current preview. This is a security/reproducibility defect. Avoid scoped-agent nested execution and use OS process isolation; do not “fix” it by widening policy. See [Security](@/docs/security.md#nested-evaluator-policy-propagation-is-incomplete).
+Nested evaluators now build through one audited child context that carries Reef, Leash identity/policy, filesystem port, and cancellation behavior. If nested behavior differs, treat it as a regression: capture the exact route (`spawn`, script, parallel, stream, or channel), compare the top-level and nested denial, and do not “fix” it by widening policy. See [Security](@/docs/security.md#nested-evaluator-policy-propagation).
 
 ## Journal, history, GC, and undo
 
@@ -510,7 +510,7 @@ Inspect structured `data`, current principal/session, plan resource, and policy.
 
 ### `APPROVAL_REQUIRED` (`-32011`)
 
-Plan first, display source/effects, obtain authorized review, then apply. Current raw approval routing is not secure against an untrusted socket peer; keep the socket fully trusted.
+Plan first, display source/effects, obtain review from an authenticated distinct approver (or an explicitly enabled self-ack setup), then apply. Check the structured error for requester/approver identity and required `supervisor`/`plan.approve` authority.
 
 ### `UNKNOWN_PLAN` after planning
 
@@ -519,9 +519,9 @@ Causes:
 - kernel restart;
 - wrong kernel/socket/session;
 - reference typo;
-- same-shape plan collision overwrote the process-global map.
+- the owning principal+Session generation was evicted or replaced.
 
-Derive a fresh plan, inspect it, and apply promptly. Do not persist plan refs as durable IDs.
+Derive a fresh plan, inspect it, and apply. Plan refs are collision-resistant distinct objects but remain in-memory; do not persist them as durable IDs.
 
 ### `caps_enforced` is false
 

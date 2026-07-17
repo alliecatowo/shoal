@@ -534,30 +534,30 @@ beyond that range. There is no viewport offset, so a cursor below the first page
 
 ## LSP architecture
 
-`shoal-lsp` is a Tokio/tower-lsp stdio server. It stores complete document text in an
-`Arc<RwLock<HashMap<Url, String>>>`. The advertised capabilities are full-document sync,
-formatting, completion, and hover.
+`shoal-lsp` is a Tokio/tower-lsp stdio server. It stores versioned document text, AST,
+diagnostics, and scoped symbols. The advertised capabilities are incremental sync, formatting,
+completion, hover, goto definition, and document symbols.
 
 ```mermaid
 flowchart LR
 accTitle: LSP request and semantic-drift pipeline
 accDescr: Editor text flows through authoritative parser and formatter services, while completion and hover approximations are checked against shared language registries to expose drift.
-  Editor["editor document"] --> Docs["in-memory full text"]
-  Docs --> Parser["authoritative parse_status"]
+  Editor["incremental UTF-16 edits"] --> Docs["versioned text + AST + symbols"]
+  Docs --> Parser["authoritative parser + planner"]
   Parser --> Diagnostics["published diagnostics"]
   Docs --> Formatter["parse + canonical formatter"]
   Formatter --> Edit["whole-document TextEdit"]
-  Docs --> Assist["completion + hover"]
+  Docs --> Assist["completion + hover + definition + symbols"]
   Grammar["commands + methods + adapter registries"] --> Assist
   Parser -. "drift check" .-> Assist
 ```
 
 ### Diagnostics
 
-Complete input publishes no diagnostics. Both `Incomplete` and `Error` publish one error-severity
-diagnostic with code `parse_error`, the parser message, and its span. Treating incomplete syntax as
-an error is sensible after a document change but can be noisy during typing. There is no semantic,
-name-resolution, type, adapter, Reef, or security diagnostic.
+Parse failures publish syntax diagnostics. Successfully parsed documents also receive
+side-effect-free planner diagnostics such as opaque effects. Analysis runs on a blocking worker and
+is installed only when both version and text still match, so stale work cannot overwrite newer
+edits. There is still no type, adapter-version, Reef-project, or full name-resolution diagnostic.
 
 ### Formatting
 
@@ -572,42 +572,50 @@ The LSP vocabulary combines:
 - parser reserved words;
 - extra parser statement forms `with`, `spawn`, and `sh`;
 - the canonical syntax builtin-name registry;
-- declaration-like names found lexically before the cursor.
+- parser-derived symbols visible at the cursor.
 
-Declaration discovery splits text on non-identifier characters and records the word following
-`let`, `var`, `fn`, or `alias`. It is not scope-aware, comment/string-aware, shadow-aware, or AST
-based. Every item is labeled `KEYWORD`; there are no insertion edits, signatures, methods, fields,
-paths, adapter flags, or documentation payloads.
+Symbol discovery walks the AST for bindings (including nested patterns), functions, parameters,
+aliases, and nested scopes. Visibility and shadowing follow source order and lexical ranges.
+Completion replaces the exact identifier span and carries symbol kinds, resolution detail, and
+function docs where available. It remains type-unaware and has no methods, fields, adapter flags,
+filesystem paths, or workspace index.
 
 ### Hover
 
-Hover identifies the ASCII identifier at the UTF-16 cursor position and serves static Markdown for
-`let`, `var`, `fn`, `match`, `with`, `spawn`, `sh`, and `it`. It does not resolve user declarations,
-builtins, value methods, adapter commands, or symbols across files.
+Hover resolves visible user declarations and their docs/details first, then static language help and
+canonical command-source information. It does not infer value types/methods or perform a workspace
+symbol search.
+
+### Definition and document symbols
+
+Goto definition follows scope-aware local declarations. For a direct file `use`, it can open the
+module path and resolve an exported member; this is intentionally narrower than a project/module
+graph. Document symbols expose the same AST-derived declarations and nesting. References, rename,
+workspace symbols, and semantic tokens are not advertised.
 
 ### Position conversion
 
-LSP character positions count UTF-16 code units. `byte_to_position` and `position_to_byte` explicitly
-convert Rust UTF-8 byte offsets and clamp beyond-document/line requests. Tests include emoji and CJK
-text. Word scanning itself is ASCII alphanumeric/underscore only.
+LSP character positions count UTF-16 code units. Incremental changes validate exact line/range
+boundaries and optional `range_length`, reject positions inside surrogate pairs, and apply multiple
+changes sequentially. Internal spans remain UTF-8 bytes and are converted back to LSP positions.
 
 ### Concurrency and lifecycle
 
-Open/change writes the document and awaits diagnostic publication. Reads hold the async docs read
-lock while parsing/formatting or assembling results; this can delay a concurrent change on a large
-document. Close removes the document and clears diagnostics. Shutdown has no persistence or worker
-cleanup.
+Open/change stages a pending version, analyzes outside the document lock on a blocking worker, and
+publishes only if still current. A short update mutex serializes version installation; close removes
+the document and clears diagnostics. Shutdown has no persisted index because there is no workspace
+database.
 
 ## Shared semantic drift risks
 
-The parser, REPL validator, completion classifier, highlighter dispatcher, and LSP declaration
-scanner each answer related syntax questions at different fidelity:
+The parser, REPL validator, completion classifier, highlighter dispatcher, and LSP symbol analysis
+still answer related syntax questions at different fidelity:
 
 
-The builtin list is now shared, which is a strong anti-drift improvement. Statement dispatch,
-incompleteness, and declaration/scope logic remain duplicated. Changes to path-head rules, new
-statement forms, optional chaining, literals, or callable dispatch require a deliberate audit of all
-five consumers.
+The builtin list and LSP AST are shared sources of truth, which are strong anti-drift improvements.
+Statement dispatch, incompleteness, and some cursor classification remain separate. Changes to
+path-head rules, statement forms, optional chaining, literals, or callable dispatch still require a
+deliberate audit across consumers.
 
 ## Maturity and risk matrix
 
@@ -622,7 +630,7 @@ five consumers.
 | highlighting | broad token/dispatch tests | environment-sensitive color tests | implemented; PATH repaint cost |
 | keybindings | chord/action tests | edit-mode construction tests | implemented, mode-state prompt gap |
 | picker | pure model/scoring/Unicode tests | terminal loop has no pseudo-TTY integration | implemented with viewport issue |
-| LSP | vocabulary/position/diagnostic unit tests | no editor protocol integration suite | useful lexical baseline |
+| LSP | AST scope/definition/incremental/diagnostic unit tests | no editor protocol integration suite | useful local semantic baseline |
 
 ## Prioritized improvements
 
@@ -639,8 +647,8 @@ five consumers.
 6. **Give the picker a scrolling viewport** and add pseudo-TTY restoration/cancellation tests.
 7. **Build a syntax-service layer** for incomplete-state, cursor context, declarations, symbols, and
    docs so REPL and LSP stop hand-copying grammar decisions.
-8. **Make LSP completion typed and scoped** after symbol identity exists; add builtin/method hover
-   from executable registries rather than another static table.
+8. **Extend the scoped LSP into a workspace graph** for references/rename and add type/method hover
+   from executable registries.
 
 ## Change checklist
 

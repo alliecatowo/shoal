@@ -19,30 +19,33 @@ ports for deterministic effects, and live process/socket/PTY tests for host boun
 
 ## Editor service
 
-`shoal-lsp` is intentionally lexical and parse-based today. It keeps full document text in memory and
-advertises full-document sync, diagnostics, whole-document formatting, completion, and hover.
+`shoal-lsp` is parser- and local-document-based today. It keeps document text plus versioned AST
+analysis in memory and advertises incremental sync, diagnostics, whole-document formatting,
+completion, hover, goto definition, and document symbols.
 
 ```mermaid
 flowchart LR
 accTitle: Editor service
 accDescr: Shows the components and relationships described in Editor service.
   Editor["LSP editor"] --> Backend["shoal-lsp Backend"]
-  Backend --> Docs["URI → full text map"]
+  Backend --> Docs["URI → versioned text + AST + symbols"]
   Docs --> ParseStatus["shoal_syntax::parse_status"]
   ParseStatus --> Diagnostics["one parse diagnostic"]
   ParseStatus --> Format["canonical AST formatter"]
-  Docs --> Completion["static vocabulary + lexical declarations"]
-  Docs --> Hover["small hard-coded help map"]
+  Docs --> Completion["vocabulary + visible scoped symbols"]
+  Docs --> Hover["symbol docs + language help"]
+  Docs --> Definition["local + direct used-module definitions"]
 ```
 
-Completion combines parser-reserved words, a few additional grammar heads, the canonical builtin
-registry, and names found by token-splitting earlier `let`/`var`/`fn`/`alias` declarations. Hover only
-covers a small set of language words. UTF-8 byte offsets are converted to LSP UTF-16 positions.
+Completion and symbols walk the parsed AST, respect lexical scope/visibility and shadowing, and
+include bindings, functions, parameters, aliases, and destructuring patterns. Incremental edits are
+applied sequentially using strict UTF-16 positions and analyzed off the async request thread; stale
+analysis cannot overwrite a newer version. Definition lookup resolves local declarations and the
+exported members/paths of directly used file modules.
 
-It does not currently implement a semantic resolver, scope-aware/type-aware completion, incremental
-sync, go-to-definition, references, rename, signature help, or semantic tokens. Adding one of those
-requires a reusable semantic index; extending the token-splitting heuristic would create false
-confidence rather than a real language service.
+It does not currently implement a workspace/project index, references, rename, signature help,
+semantic tokens, code actions, file watching, or type-aware completion. Those features require a
+reusable cross-document semantic graph beyond the current direct-module lookup.
 
 Source: [`shoal-lsp/src/lib.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-lsp/src/lib.rs).
 

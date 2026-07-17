@@ -8,13 +8,13 @@ template = "docs/page.html"
 eyebrow = "Protocol reference"
 group = "Agents & protocol"
 audience = "Kernel client implementers and Shoal maintainers"
-status = "Current implementation, including known security defects"
+status = "Current implementation, including explicit security boundaries"
 toc = true
 +++
 
 `shoal-kernel` serves JSON-RPC 2.0 over a Unix-domain socket. Each request or response is one compact JSON object followed by a newline. The API is useful for native clients that need methods not exposed by MCP, but it is a lower-level and less protected boundary: clients own framing, attachment, notification demultiplexing, resource limits, and reconnect behavior.
 
-> **Security warning:** socket possession must currently be treated as full kernel trust. `cap.request` and `journal.query` are mistakenly routed without requiring `session.attach`; the latter can disclose global journal source/AST/effects/output hashes, while the former can approve a known non-denied plan without authenticating its caller. Keep the socket in a private `0700` directory with a `0600` socket, do not proxy it to untrusted peers, and read [Security and trust boundaries](@/docs/security.md).
+> **Security boundary:** every stateful method, including `journal.query` and `cap.request`, requires an attachment and enforces its owner/approver rules. Tokenless public attachment becomes restricted `agent:mcp`; a public client cannot assert local-human authority. Keep the socket in a private `0700` directory with mode `0600` anyway: same-process resource sharing, credential theft, missing peer-credential binding, and incomplete OS enforcement still make arbitrary forwarding unsafe. See [Security and trust boundaries](@/docs/security.md).
 
 ## Transport
 
@@ -322,11 +322,11 @@ If timeout-backed work finishes before the deadline, the result is returned inli
 
 ### Planning and internal approval mode
 
-`mode: "plan"` derives policy effects, stores source/session/principal metadata, and inserts the plan under `plan:<16 hex>`. It returns:
+`mode: "plan"` derives policy effects, stores immutable source/AST/Session/principal metadata, and inserts a distinct in-memory plan object. It returns a reference shaped as `plan:<64-hex digest>:<16-hex object id>`:
 
 ```json
 {
-  "plan_ref": "plan:7b2fd854cb805ba1",
+  "plan_ref": "plan:<full-digest>:0000000000000001",
   "effects": [{"kind":"fs_write","path":"./out"}],
   "reversibility": "conditional",
   "verdict": "approval_required",
@@ -334,7 +334,7 @@ If timeout-backed work finishes before the deadline, the result is returned inli
 }
 ```
 
-The reference hashes effects, reversibility, and estimates—not source, session, or principal—and is truncated to 16 hex characters. One global map uses it as the key, so same-shape plans can overwrite across callers. Stored metadata is checked during get/apply/approved execution and prevents a direct source swap, but the handle is collision-prone and ephemeral.
+The digest binds full source, canonical AST, effects, reversibility, estimates, Session, and requester. The object suffix prevents even identical repeated plans from overwriting one another. Stored metadata is rechecked during get/apply/approved execution. The handle is still ephemeral and disappears on restart.
 
 Clients should never send `mode: "approved"` directly as a privilege assertion. The handler requires a stored plan whose session, principal, exact source, and approval/allow state match. Use `plan.apply`.
 
@@ -438,9 +438,7 @@ Checks stored session/principal and approval/current allow verdict, then interna
 }
 ```
 
-Strings and object `kind` fields are normalized. When a nonempty requested set does not cover every stored plan effect kind, the result remains `approval_pending` and lists uncovered effects. If policy is `Deny`, the method returns `LEASH_DENIED`. Otherwise it sets `approved: true` and returns enforcement truth.
-
-**Current P0 defect:** the handler receives no attachment and verifies no caller principal/session. Anyone who can reach the socket and guess/learn a live plan reference can invoke it, including before `session.attach`. The MCP facade attaches its kernel connection first, but the kernel still does not use that attachment for this method. Do not expose the raw socket across a trust boundary.
+Strings and object `kind` fields are normalized. When a nonempty requested set does not cover every stored plan effect kind, the result remains `approval_pending` and lists uncovered effects. If policy is `Deny`, the method returns `LEASH_DENIED`. Otherwise the kernel reserves the transition, durably audits the immutable requester/approver/plan/source/Session/scope binding, and commits one-shot approval before returning enforcement truth. The method requires attachment. Self-approval is denied by default; a distinct approver needs embedded-human trust or an explicit `supervisor`/`plan.approve` bearer.
 
 ## Journal
 
@@ -484,7 +482,7 @@ Raw PTY params match the [MCP tool reference](@/docs/mcp-tools-reference.md#pty-
 {"pty_id":"pty:2","cols":120,"rows":40}
 ```
 
-`pty.read` returns screen rows, cursor, change/liveness/exit metadata; no raw ANSI stream is available. `pty.list {}` and all selectors are session-scoped, not principal-scoped. `pty.close` terminates and reaps rather than detaching.
+`pty.read` returns screen rows, cursor, change/liveness/exit metadata; no raw ANSI stream is available. `pty.list {}` and all selectors are scoped to the exact principal+Session owner. `pty.close` terminates and reaps rather than detaching.
 
 ## Events
 

@@ -199,14 +199,16 @@ Kernel restart currently loses named evaluator state, transcripts held as live `
 task wrappers, PTYs, and in-memory event rings. The journal, CAS, auth store, policy, Reef manifests,
 and Reef locks survive.
 
-## Two host paths, not yet full parity
+## Private-kernel default and explicit standalone path
 
-The local CLI performs host assembly that `Kernel::session` does not currently mirror:
+The interactive CLI performs presentation/bootstrap assembly around either a private kernel-backed
+protocol Session (the default) or an explicit standalone evaluator. A durable public kernel remains
+a separate process/trust domain and does not share the private REPL's live state:
 
 ```mermaid
 flowchart TD
-accTitle: Two host paths, not yet full parity
-accDescr: Shows the components and relationships described in Two host paths, not yet full parity.
+accTitle: Private-kernel default and standalone path
+accDescr: Shows the default isolated private kernel, the explicit local evaluator, and the separate durable machine kernel.
   Config["layered shoal config"] --> CLI["local shoal host"]
   Prompt["prompt config"] --> CLI
   Bundled["bundled + extra adapters"] --> CLI
@@ -218,8 +220,10 @@ accDescr: Shows the components and relationships described in Two host paths, no
   Channel["event channel forwarder"] --> Kernel
   Policy["per-principal leash policy"] --> Kernel
 
-  CLI --> EvalA["Evaluator A"]
-  Kernel --> EvalB["Evaluator B"]
+  CLI --> Private["listener-free private kernel (default)"]
+  CLI --> EvalA["local Evaluator (--standalone)"]
+  Private --> EvalP["principal-private REPL Session"]
+  Kernel --> EvalB["durable machine Session"]
 ```
 
 As implemented, a newly created kernel session installs journal/frecency support and a channel

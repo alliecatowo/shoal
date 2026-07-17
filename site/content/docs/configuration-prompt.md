@@ -178,15 +178,15 @@ The table below reflects the schema and defaults in the current code. An empty â
 | `reef.tools` | constraint table, empty | User-scope Reef constraints. |
 | `reef.runners` | runner table, empty | User-scope script runners. |
 | `reef.options.hermetic` | boolean, `false` | Removes the ambient `PATH` tail when engaged. |
-| `kernel.enabled` | boolean, `true` | Present in the schema but does not route the standalone REPL through the kernel. |
-| `kernel.session` | string, `"default"` | Present in the schema but not used to attach the standalone REPL. |
+| `kernel.enabled` | boolean, `true` | The default interactive REPL runs through an isolated private `shoal-kernel` child. Set false (or pass `--standalone`) for the local evaluator path. |
+| `kernel.session` | string, `"default"` | Names the principal-private Session inside the default REPL's private kernel. It does not attach to a durable public kernel socket. |
 | `journal.enabled` | boolean, `true` | Not currently honored by the local REPL, which opens its journal directly. |
 | `journal.state_dir` | path or absent | Not currently used by the local REPL journal path. |
-| `leash.policy` | path or absent | Schema-complete; the main shell config does not currently load this policy. |
+| `leash.policy` | path or absent | Passed to the default interactive REPL's private kernel. The explicit standalone and noninteractive local-evaluator paths do not load it here. |
 
 `history.dedup` compares with the immediately preceding entry, including the last entry read from a previous session. An environment name that is nonempty but cannot be expressed as a Shoal identifier can pass generic validation yet produce a startup warning when the host tries to apply it.
 
-The standalone REPL and the kernel are distinct hosts. Kernel process flags and token policy are documented in [Agents, kernel, and MCP](@/docs/agents-kernel-mcp.md); durable execution history is covered in [Filesystem, jobs, and history](@/docs/filesystem-jobs-history.md).
+The default interactive REPL spawns a listener-free private kernel and connects over an inherited anonymous descriptor. Each shell gets isolated live bindings, `it`/`out`, cwd, jobs, and policy state; it does not join the named-socket kernel used by MCP/agents. `shoal --standalone` and `kernel.enabled = false` select the in-process evaluator path. Kernel process flags and token policy are documented in [Agents, kernel, and MCP](@/docs/agents-kernel-mcp.md); durable execution history is covered in [Filesystem, jobs, and history](@/docs/filesystem-jobs-history.md).
 
 ### Adapter-directory caveat
 

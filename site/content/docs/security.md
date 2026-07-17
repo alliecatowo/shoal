@@ -8,21 +8,15 @@ template = "docs/page.html"
 eyebrow = "Security"
 group = "Agents & protocol"
 audience = "Operators, agent integrators, and security reviewers"
-status = "Preview; P0 limitations require a trusted local socket"
+status = "Preview; hardened local boundary with explicit remaining limits"
 toc = true
 +++
 
-Shoal has useful policy and sandbox machinery, but the current kernel is not a multi-tenant security boundary. Run it as a single-user local service, keep its Unix socket private, and treat every process that can connect to that socket as fully trusted.
+Shoal has useful policy, identity, and sandbox machinery, but one kernel process is not a hard multi-tenant security boundary. Run it as an unprivileged local service, keep its Unix socket private, and use separate OS users/processes/state roots for mutually hostile tenants.
 
-Three current P0 defects make that guidance non-negotiable:
+The first deep-audit P0s are closed: journal reads and approvals require scoped attachments; approvals bind and durably audit a distinct authorized approver; plan objects use full caller/content-bound digests and non-overwriting IDs; child evaluators inherit one audited execution context; public sockets cannot assert local-human authority; and visible Session names are principal-private. Remaining risk is concentrated in incomplete OS enforcement dimensions, startup-only token loading, unbounded raw/blob retrieval, same-process resource sharing, and native-code behavior beyond the planner's model.
 
-1. raw `journal.query` does not require attachment and can disclose the process-wide journal, including source, AST, effects, paths, principals, and output hashes;
-2. raw `cap.request` does not require attachment or check the caller against a plan, and can mark a known non-denied plan approved.
-3. nested child evaluators used by `spawn`, `.shl` runner execution, `parallel`, and channel handlers do not consistently inherit the parent Leash principal/policy; some also lose Reef configuration, so nested execution is not a policy-preserving sandbox boundary.
-
-Plan handles also collide: `plan_ref` hashes only effects/reversibility/estimates into 16 hex characters and is the key of one global map, excluding source/session/principal. Stored metadata is checked at application, so this is not a direct source-substitution primitive, but same-shape plans can overwrite/invalidate one another and the collision composes badly with unauthenticated approval.
-
-Do not expose the raw socket through TCP, a web gateway, a shared container volume, an untrusted plugin, or another-user IPC bridge until these defects are fixed.
+Do not forward the raw socket casually through TCP, a web gateway, a shared container volume, an untrusted plugin, or another-user IPC bridge. Those transports change the threat model even though socket possession no longer grants local-human authority.
 
 ## Threat-model summary
 
@@ -85,10 +79,9 @@ This protects against other Unix users when the containing filesystem and owners
 - a compromised MCP client launched under the same user;
 - filesystem backup/snapshot readers with access to the state directory.
 
-The kernel does not validate connecting peer credentials with `SO_PEERCRED`. A connection that calls `session.attach` without a token becomes the kernel process's `uid:<effective uid>` local-human principal. Therefore an untrusted process that can reach the socket can simply omit a token; token issuance does not force it into an agent policy.
+The public listener does not accept client-asserted human presence. An attachment with neither bearer nor `local_auth` becomes the restricted `agent:mcp` principal; `local_auth:"local-human"` is rejected on every public/named socket. The only local-human trust root is the server-selected inherited anonymous descriptor used by the default interactive REPL's private, listener-free child kernel. Bearer tokens select explicit machine identities; `supervisor` or `plan.approve` authority is required for cross-principal approval.
 
-
-Tokens are useful for a trusted facade choosing a scoped identity. They are not a replacement for socket isolation and are not currently a mandatory-auth mode.
+The kernel still does not validate `SO_PEERCRED`, so socket isolation remains important: a same-UID process can reach the restricted public surface and attempt any operation its effective principal/policy permits, and a stolen bearer remains a credential. Socket possession alone no longer upgrades a client to local human.
 
 ## State-directory sensitivity
 
@@ -294,68 +287,54 @@ Shoal can derive these semantic effect variants:
 
 Effects describe the planner's understanding. They are not a complete behavior proof for arbitrary native programs. An adapter can declare that `curl URL` connects to a host and writes an output path, but a compromised `curl` binary can attempt more. OS enforcement is what constrains attempted filesystem operations; unimplemented dimensions remain policy/advisory.
 
-## Plan/approval integrity limitations
+## Plan/approval integrity
 
 A plan record stores source, session, principal, effects, and approval state. `plan.get`, `plan.list`, `plan.apply`, and internal approved execution compare stored metadata against the attached caller. That is the useful part of the design.
 
-The reference generation and approval router undermine its use as a strong authority token today:
+The stored object identity and approval transition are bound together as follows:
 
 ```mermaid
 flowchart LR
-accTitle: Plan/approval integrity limitations
-accDescr: Shows the components and relationships described in Plan/approval integrity limitations.
-    A["source A / session A"] --> H["hash effects + reversibility + estimates"]
-    B["source B / session B"] --> H
-    H --> R["same plan:16hex possible"]
-    R --> M["one global HashMap entry"]
-    U["unattached socket caller"] -->|"cap.request(ref)"| M
+accTitle: Plan/approval integrity
+accDescr: Shows immutable plan identity, authenticated approval, durable audit, and one-shot consumption.
+    P["source + AST + effects + estimates"] --> H["full bound BLAKE3 digest"]
+    O["principal + Session"] --> H
+    H --> R["unique in-process object ref"]
+    A["authenticated distinct approver"] --> G["Granting reservation"]
+    R --> G
+    G --> J["durable approval audit"]
+    J --> C["Approved → Claimed → Consumed"]
 ```
 
 Exact current behavior:
 
-- source, AST, session, and principal are not hash inputs;
-- only 64 bits of the BLAKE3 hex are retained;
-- inserting the same reference overwrites the prior stored plan;
-- application verifies selected stored source/session/principal, so a caller cannot supply alternate source to that plan;
-- an overwrite can make the original caller see unknown/cross-caller denial or apply different stored metadata;
-- `cap.request` looks up only the reference, checks the stored plan's policy is not `Deny` and the optional requested effect coverage, then sets `approved`; it never receives attachment/caller identity.
+- the full source, canonical AST, effects, reversibility, estimates, Session, and requester feed a domain-separated full BLAKE3 plan hash;
+- a monotonic per-kernel suffix makes repeated storage of identical content produce distinct non-overwriting object references;
+- `cap.request` requires an authenticated attachment and binds requester, approver, plan/source hashes, Session, and exact effect scope into a durable journal audit;
+- self-approval is denied by default; cross-principal approval requires the embedded-human trust root or a `supervisor`/`plan.approve` bearer;
+- grant/apply transitions are reserved and one-shot, with rollback on audit/request failure and compare-and-set state checks;
+- plans and references remain in-memory and disappear on kernel restart, so they are not durable capabilities or secrets.
 
-Operational mitigation is limited: keep the socket trusted, plan/apply promptly, inspect the plan resource immediately before apply, and do not treat a reference as globally unique or secret. A real fix requires attachment enforcement, caller authorization, and a collision-resistant reference bound to source/session/principal or a non-overwriting scoped store.
+## Journal query boundary
 
-## Journal disclosure defect
+`journal.query` requires an attachment, caps each page server-side, treats `limit:0` as an empty page, and forces principal/Session filters to the exact attached owner. An unattached or cross-principal query is rejected. Journal rows and CAS remain sensitive persisted data, so filesystem/state-directory permissions and bearer handling still matter.
 
-`journal.query` is routed directly to a handler with no attachment parameter. It can be invoked on a fresh connection before `session.attach` and returns entries across the kernel store unless filters narrow them.
+## Named sessions are principal-private
 
-Exposed data includes:
-
-- original submitted source;
-- canonical serialized AST;
-- derived effects and opaque flag;
-- named session and principal;
-- working directory;
-- timestamps, duration, status, and success;
-- output kind, content hash, and length.
-
-The blobs themselves still require attached `blob.get`, but hashes and source are already sensitive. A proxy must not assume the kernel's method-level gate protects journal reads. Fixing this should require attachment plus an actual `JournalRead` policy check and principal/session scoping where appropriate.
-
-## Named sessions are not isolation
-
-A named session owns a shared evaluator, bindings, cwd, environment, transcript, task namespace, PTYs, Reef state, and in-language event bus. Any socket client can request any session name during attachment; there is no session ACL.
+A Session is keyed by both authenticated principal and visible name. Two principals requesting `default` receive different evaluators, bindings, cwd, environment, transcripts, tasks, PTYs, Reef state, and event ownership. References and quotas use the same exact owner key rather than the user-chosen name alone.
 
 Current access checks:
 
 | State | Scope check |
 | --- | --- |
-| Transcript `out:N` | named session only |
-| Tasks | named session only |
-| PTYs | named session only (opener principal is stored but not checked) |
-| Environment/cwd/bindings | shared evaluator |
-| Plans | stored session **and** principal, subject to collision defect |
-| Journal query | no attachment/scope today |
+| Transcript `out:N` | principal + Session |
+| Tasks | principal + Session |
+| PTYs | principal + Session |
+| Environment/cwd/bindings | principal-private evaluator |
+| Plans | principal + Session + immutable content binding |
+| Journal query | attached principal + exact Session |
 
-Two principals attached to the same session can observe or mutate one another's evaluator state and can read/control shared tasks/PTYs. Treat the session name as a collaboration room. Use a distinct kernel process/socket for hostile tenants.
-
-The evaluator's fine-grained in-language journal handle is configured with the principal that first created the session; later principals reusing that session can therefore be attributed to the first creator in those per-statement rows. The kernel's separate coarse `exec` journal records the actual attachment principal. Audit consumers should distinguish the two row shapes and avoid relying on shared sessions for principal-perfect attribution.
+This is identity isolation inside one process, not a complete hostile-tenant sandbox. Principals still share the kernel process, global resource budgets, journal/CAS files, and any process-wide failure boundary. Use separate OS users/processes/state directories for mutually hostile tenants.
 
 ## Sandbox enforcement
 
@@ -381,18 +360,9 @@ Even when `caps_enforced` is true:
 
 Never render a single “sandboxed” badge without the dimension details.
 
-### Nested evaluator policy propagation is incomplete
+### Nested evaluator policy propagation
 
-The kernel installs the attachment principal and Leash policy on the named session evaluator immediately before a top-level execution. Several language features create another evaluator internally: structured `spawn`, `.shl` runner execution, `parallel`, and channel handlers. Those child evaluators do not currently inherit policy/principal consistently, and some also omit the parent Reef resolver/configuration state.
-
-Consequences are security-relevant:
-
-- a top-level `caps_enforced: true` report does not prove every nested child process receives the same sandbox;
-- spawn content pinning and filesystem sandbox selection can be absent on a nested evaluator's external command path;
-- tool resolution can fall back differently when Reef state is lost;
-- audit attribution/behavior can diverge from the parent intent.
-
-Do not use nested evaluator execution for untrusted scoped agents until propagation is made explicit and covered by end-to-end denial/confinement tests. OS-level isolation of the entire kernel/service user is the current containment boundary. Merely deriving a plausible top-level plan is not a substitute for runtime propagation.
+Every production child-evaluator route (`spawn`, `.shl` scripts, parallel closures, stream producers, and channel handlers) builds through one audited child-context constructor. It carries principal, Leash policy, Reef resolver/configuration, echo policy, filesystem port, and cancellation semantics; targeted tests and a production-site inventory pin that boundary. The outer parent statement owns journaling, so children do not silently create nested journal entries. This closes the earlier policy-loss gap, but it does not turn planner effects into a complete proof of arbitrary native code behavior; the concrete OS sandbox remains the enforcement boundary.
 
 ### Linux Landlock
 
@@ -475,22 +445,17 @@ Current unbounded/high-cost surfaces include:
 - journal/CAS disk growth until garbage collection;
 - CPU/memory consumed by evaluated source or child processes.
 
-There is no per-principal rate limit, memory quota, CPU quota, PTY count, task count, or session count. Use OS service controls (cgroups/launchd limits/container quotas where appropriate), supervise the daemon, and keep untrusted code outside the current kernel boundary.
+Connections, retained principal Sessions, active tasks, PTYs (per Session/principal/global), subscriptions, plan/source bytes, transcripts, stream cursors, frames, and event queues have explicit bounds. There is still no general per-principal rate, memory, CPU, or descendant-process-tree meter. Use OS service controls (cgroups/launchd limits/container quotas where appropriate), supervise the daemon, and keep hostile code outside a shared kernel process.
 
 ## Security review priorities
 
-Before describing Shoal as safe for mutually untrusted agents, the minimum work is:
+Before describing Shoal as safe for mutually untrusted agents, the remaining minimum work is:
 
-1. require authenticated attachment for every stateful/sensitive method, especially `journal.query` and `cap.request`;
-2. bind approval to an authorized caller and explicit supervising principal;
-3. make plan IDs collision-resistant and include source/session/principal or use scoped non-overwriting IDs;
-4. propagate principal, policy, sandbox, cancellation, and Reef state through every child evaluator, with bypass tests;
-5. add mandatory-token/socket peer-credential modes;
-6. isolate transcripts/tasks/PTYs by principal or formalize session membership ACLs;
-7. reload/revoke token state live;
-8. enforce journal-read policy and result scoping;
-9. add network/process/resource enforcement or report each dimension in a stable capability object;
-10. close raw retrieval and blob-size denial-of-service gaps;
-11. add adversarial integration tests across multiple principals and concurrent same-shape plans.
+1. add deployable mandatory-token and socket peer-credential modes;
+2. reload/revoke token state live;
+3. decide and enforce explicit `JournalRead` policy beyond the implemented exact-owner scoping;
+4. add stronger network/process/CPU/memory enforcement while preserving per-dimension truth;
+5. close raw retrieval and blob-size denial-of-service gaps;
+6. extend adversarial multi-principal, fault-injection, and long-duration lifecycle testing.
 
 Track implementation status in [Current status and limits](@/docs/status-limits.md) and [Roadmap](@/docs/roadmap.md).

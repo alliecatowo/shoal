@@ -230,10 +230,10 @@ planned/denied without a claim that allowed traffic is network-confined.
 | stream over wire | Scaffolded label | no pull cancellation | no cursor/item budget | `WireValue::Stream` is descriptive only |
 | WASM invocation | Scaffolded | fuel only in leaf | memory/table/instance limits | no evaluator caller or wall deadline |
 
-The most severe execution-context defect is not a missing convenience feature: child evaluators
-created by `spawn`, `parallel`, `on`, and `.shl` paths do not consistently inherit the parent Leash,
-Reef state, and config capability. A restricted parent can therefore construct a less-restricted
-child. Treat this as a security correctness issue, not ordinary composition cleanup.
+The former child-context escalation defect is closed: production child evaluators for `spawn`,
+parallel, channels, scripts, and streams build through one audited constructor carrying Leash,
+principal, Reef, config/ports, and cancellation state. A source-inventory regression test prevents
+new direct child construction. Future child factories must extend that explicit boundary.
 
 ## Security and authority status
 
@@ -262,15 +262,15 @@ against current time on each validation. `profile`/`--cap` values are echoed, no
 | Layer | Status | Honest interpretation |
 |---|---|---|
 | effect derivation | Implemented for modeled operations | opaque/raw paths remain explicitly opaque |
-| plan hashing/storage | Partial | apply checks stored source/session/principal, but the ref hashes effects/reversibility/estimates only and equal-shape plans overwrite one map entry |
-| capability approval caller | Unsafe partial | `cap.request` is routed without attachment and mutates `approved` without authenticating an approver |
-| journal query caller | Unsafe partial | `journal.query` is routed without attachment and returns the shared journal without a caller-scope check |
+| plan hashing/storage | Implemented bounded object identity | full source/AST/effects/Session/principal digest plus unique object suffix; ephemeral across restart |
+| capability approval caller | Implemented one-shot boundary | attached authorized approver, default separation of duties, durable immutable grant audit |
+| journal query caller | Implemented exact-owner boundary | attachment required, principal+Session scoped, server-capped pages; richer `JournalRead` policy remains future work |
 | allow/ask/deny policy | Implemented | verdict is not itself OS containment |
 | filesystem sandbox | Implemented on supported Linux/macOS paths | enforcement tier reports actual backend result |
 | process hash gate | Implemented preflight | content is checked before exec; TOCTOU remains |
 | network sandbox | Not implemented | network grants are planning/policy only |
 | malformed local policy handling | Risky partial | convenience loader can fall back to permissive |
-| child authority inheritance | Unsafe partial | several child evaluator constructors omit parent Leash/capabilities |
+| child authority inheritance | Implemented unified constructor | production sites carry principal/policy/Reef/fs/cancellation; future sites are inventory-guarded |
 | secret rendering | Implemented | generic render is redacted; review every new serialization/stdin path |
 | cap-request honesty | Implemented | response uses the same enforcement truth as attach |
 
@@ -284,15 +284,10 @@ the effect coverage, policy verdict, backend dimensions, and unsupported dimensi
 
 The router exposes session, parse/complete, exec, value, task, PTY, plan, capability, journal, event,
 blob, and explain method families. Attachment and parameter requirements are documented in the
-[kernel protocol](../kernel-protocol/). The route is real and extensively tested, but the following
-contract defects remain:
+[kernel protocol](../kernel-protocol/). Attachment-scoped journal reads, authenticated one-shot
+approval, full non-overwriting owner/content-bound plan identities, and bounded-during-read frame
+ingestion close the original authority/allocation defects. The following contract limitations remain:
 
-- `cap.request` does not require an attachment or authenticate an approving principal before setting
-  a stored plan's `approved` bit;
-- `journal.query` does not require an attachment and does not restrict results to a caller principal;
-- a plan ref is the first 16 hex characters of a hash over effects, reversibility, and estimates—not
-  source/session/principal—so equal-shape plans overwrite one `HashMap` slot;
-- the 16 MiB frame limit is applied after `read_line` has already accumulated a newline-free frame;
 - `value.get` with `format = "raw"` can return full `raw_base64` without the ordinary 64 KiB clamp;
 - MCP does not special-case that raw payload, so the bypass crosses the facade;
 - DateTime wire values are documented as RFC3339 but produced as Unix-second decimal strings;
@@ -480,7 +475,7 @@ internal atlas; their counts and status language are not current authority.
 
 | Historical document | Durable intent | Current canonical home | Claim that needed correction |
 |---|---|---|---|
-| `docs/VISION.md` | typed values, explicit effects, shared agent/human semantics | system map, value/effect pages | one kernel/three surfaces is a direction; local REPL does not execute through kernel |
+| `docs/VISION.md` | typed values, explicit effects, shared agent/human semantics | system map, value/effect pages | the default REPL now executes through an isolated private kernel, while durable machine kernels remain a separate trust/state domain |
 | `docs/ROADMAP.md` | wave rationale and original acceptance criteria | this page and roadmap | “done” waves concealed host/security/lifecycle qualifications; counts were stale |
 | `docs/TDD.md` | grammar, semantics, errors, edge rulings | language conformance contract | old corpus count and some later feature statuses drifted |
 | `docs/STREAMS.md` | one stream model, explicit consumption/backpressure | streams and channels | stream-to-stdin and wire pulling are still absent |

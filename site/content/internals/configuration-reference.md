@@ -319,9 +319,9 @@ currently accepts and snapshots the field without applying its intended behavior
 | resolved config snapshot | active | active | exposed to language `config` methods |
 | `prompt.template` | parallel path | not applicable | rich prompt loader independently reads and migrates it |
 | `reef.*` | parallel path | parallel path | Reef reparses raw user config with its own schema |
-| `kernel.enabled`, `kernel.session` | not consumed | not consumed | **inert in local `shoal`**; local execution embeds an evaluator |
+| `kernel.enabled`, `kernel.session` | active | not consumed | default interactive execution uses an isolated private kernel; `false` selects local evaluation; session names that private principal-owned Session |
 | `journal.enabled`, `journal.state_dir` | not honored | no journal | **inert**; REPL opens default journal unconditionally |
-| `leash.policy` | not consumed | not consumed | **inert security field**; local host does not load/set policy |
+| `leash.policy` | active on default private-kernel REPL | not consumed | passed as the private kernel's policy; explicit standalone/noninteractive paths remain local |
 
 ```mermaid
 flowchart TD
@@ -332,7 +332,7 @@ accDescr: Shows the components and relationships described in Host wiring matrix
   Config --> Bindings["aliases / env / ConfigSnapshot"]
   Config --> Adapters["adapter search dirs"]
   Config --> Init["interactive init files"]
-  Config -. "not wired" .-> Kernel["resident kernel settings"]
+  Config --> Kernel["private interactive kernel settings"]
   Config -. "not wired" .-> Journal["journal gate / state dir"]
   Config -. "not wired" .-> Leash["policy load"]
   Config -. "not wired" .-> Width["render width"]
@@ -370,8 +370,9 @@ the interactive host has already opened its journal, or see a Leash path that wa
 value accurately describes the resolved schema object but not necessarily effective host behavior.
 Internal diagnostics should eventually expose both `configured` and `effective` state.
 
-Child evaluators are a second consistency problem. Several child construction paths do not inherit
-the parent's config snapshot at all; others also omit Reef, event bus, or Leash state. See
+Production child evaluators now build through one audited child context and inherit the parent's
+config port/snapshot together with Reef, event bus, filesystem, cancellation, and Leash state. The
+outer statement deliberately owns journaling rather than creating implicit nested rows. See
 [Evaluator state and host injection](@/internals/evaluator-state.md) and
 [Security and authority propagation](@/internals/security-threat-model.md).
 
@@ -454,7 +455,7 @@ the behavioral test must demonstrate the denied/redirected/disabled operation.
 | P1 | rich prompt and core config use different project discovery | prompt can visibly disagree with `config.all` | share a discovered layer set or explicitly separate files |
 | P1 | Reef user config is reparsed independently | schema and precedence drift can surprise users | share raw parsed layers or expose a structured handoff |
 | P2 | `render.width` is inert | configuration claims an output constraint that is ignored | thread an effective width through renderer entry points |
-| P2 | kernel settings are inert in local `shoal` | users cannot infer whether evaluation is local/resident | either wire a kernel-client mode or move settings to kernel client config |
+| P2 | interactive and noninteractive kernel semantics differ | users may assume `-c`/scripts join the private REPL kernel path | keep `kernel.enabled/session`, `--standalone`, and surface boundaries explicit in CLI/config docs |
 | P2 | alias/env name validation differs from source injection | accepted config can fail later | validate exact consumer grammar and environment-name rules |
 | P3 | no live reload | long sessions retain stale configuration | define transactional reload and which state may change safely |
 

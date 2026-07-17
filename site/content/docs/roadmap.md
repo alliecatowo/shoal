@@ -52,9 +52,11 @@ Every roadmap change should preserve these constraints:
 
 These block any claim of hostile/multi-tenant agent safety.
 
-### Central attachment gate
+### Consolidate the attachment gate
 
-Move authorization out of individual handlers into a router/method-policy table so a new sensitive method cannot accidentally omit `Attachment`.
+The audited stateful handlers now require attachment, including the former `journal.query` and
+`cap.request` holes. Consolidate that property into a router/method-policy table so a new sensitive
+method cannot accidentally omit `Attachment`.
 
 Required changes:
 
@@ -91,16 +93,16 @@ Acceptance:
 - durable event replay does not bypass query policy;
 - tests include same session/different principal and different session/same principal.
 
-### Bind approval authority
+### Extend the bound approval workflow
 
-Redesign `cap.request` as an authenticated supervision action:
+`cap.request` is now an authenticated, one-shot supervision action with immutable requester,
+approver, plan/source hash, Session, exact scope, timestamp, and durable journal audit. It denies
+self-approval by default and requires explicit cross-principal authority. Remaining extensions are:
 
-- require attachment;
-- define which principals/profiles can approve which target principals;
-- record approver, exact effect set, plan/source identity, timestamp, optional expiry, and reason;
-- separate “request approval” from “grant approval” if agents and humans have different roles;
-- publish an auditable approval event/journal row;
-- prevent a plan owner from self-approving unless policy explicitly allows it.
+- make approver routing policy more expressive than the current embedded-human / `supervisor` / `plan.approve` rule;
+- add optional expiry and human reason metadata;
+- separate “request approval” from “grant approval” if asynchronous agents and humans need different roles;
+- define notification/UI flows around the already durable grant row.
 
 Acceptance:
 
@@ -110,34 +112,19 @@ Acceptance:
 - concurrent replacement/collision cannot transfer approval;
 - every grant is queryable with approver identity.
 
-### Replace plan identities
+### Evolve plan identity lifecycle
 
-The current 16-hex hash excludes source/session/principal and keys a global overwriting map. Replace it with one of:
+The audit's overwriting 16-hex identity is fixed: stored plans now use a full digest over source/AST/effects/estimates/Session/principal plus a unique object suffix, bind approval to immutable content, expire in memory, and never replace identical objects. Remaining lifecycle work is to specify deletion/retention across very long-lived kernels, decide whether policy/security generations belong in invalidation, and add larger cross-principal stress/fault-injection suites.
 
-- random 128/256-bit unguessable IDs plus stored full content hash; or
-- full collision-resistant digest over protocol version, canonical AST/source, effects, estimates, session, principal, and policy generation.
+### Evolve the unified child execution context
 
-Also:
+All production child-evaluator routes now build through one explicit context carrying identity,
+policy, Reef, filesystem port, echo behavior, and cancellation, with an inventory test preventing
+direct construction. Remaining evolution should add/clarify:
 
-- make map insertion non-overwriting;
-- scope lookup keys by session/principal where appropriate;
-- bind approval to immutable plan version;
-- define expiration and deletion;
-- return a distinct collision/internal error rather than replacing state.
-
-Acceptance includes thousands of concurrent same-effect/different-source plans across principals with zero overwrites, plus a deliberately injected hash collision test at the storage abstraction.
-
-### Propagate execution context to child evaluators
-
-Every evaluator creation path must receive a single explicit context object containing:
-
-- principal and Leash policy;
-- resolved sandbox/enforcement request;
-- Reef resolver/manifests/lock policy;
-- cwd/environment/session identity;
-- journal attribution;
-- cancellation/deadline/task lineage;
-- ports and event bridge.
+- explicit deadline/task lineage across every nested worker;
+- whether nested journal rows should exist (today the outer statement owns journaling);
+- end-to-end restrictive-policy tests for every future child factory.
 
 Audit and test `spawn`, `.shl` runner execution, `parallel`, channel handlers, module/function workers, and future evaluator factories. Make construction without a context impossible or limited to tests through an explicit untrusted/default-deny constructor.
 
@@ -160,16 +147,16 @@ Add deployable modes:
 - refuse insecure socket directory ownership/modes rather than relying only on file mode;
 - rotate/revoke connection authorization intentionally.
 
-Tokenless local-human behavior can remain a convenient default for a clearly local single-user mode, but it must be impossible in hardened mode.
+Public tokenless attachment already becomes restricted `agent:mcp`, while asserted local-human auth
+is rejected. The local-human trust root is the server-selected anonymous descriptor of a private
+interactive kernel. A hardened public mode can still add mandatory bearers and peer-UID binding.
 
-### Formalize session membership
+### Extend principal-private Session membership
 
-Choose and implement one model:
-
-- private session per principal by default with explicit invitations; or
-- shared collaboration sessions with ACL/membership/capabilities.
-
-Transcript values, bindings, cwd/env, tasks, PTYs, user channels, Reef state, and journal views must all apply the same membership rule. Store principal ownership where currently only session ID is checked.
+The implemented model is private Session per principal and visible name. Transcript values,
+bindings, cwd/env, tasks, PTYs, subscriptions, quotas, Reef state, plans, and journal views use the
+same exact owner. Future work is an explicit invitation/ACL design if collaboration rooms are ever
+added; matching visible names must never imply sharing.
 
 ## P0 completion gate
 
@@ -375,10 +362,10 @@ Evaluate platform-appropriate mechanisms (Linux namespaces/seccomp/eBPF/cgroups,
 ### LSP semantic depth
 
 - Real parser/semantic scopes for completion.
-- Definitions/references/rename across modules.
+- Extend the implemented local/direct-module definition lookup into references and rename across a workspace graph.
 - Signature help and type/method receiver diagnostics.
 - Semantic tokens, document/workspace symbols, code actions.
-- Incremental sync and project/manifest awareness.
+- Add project/manifest awareness and a reusable cross-document index; incremental sync is already implemented.
 - Formatter configuration and range formatting where semantics permit.
 
 ### Interactive shell maturity

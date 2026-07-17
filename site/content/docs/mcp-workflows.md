@@ -223,7 +223,7 @@ The approving system should display the source and complete effect list, not onl
 
 If the requested list omits a required kind, Shoal keeps it pending and lists uncovered effects.
 
-Current security caveat: raw `cap.request` does not authenticate the approving caller. This workflow is valid only inside a fully trusted socket boundary. Do not present it as multi-party authorization.
+`cap.request` authenticates the approving attachment, denies requester self-approval by default, requires explicit cross-principal approval authority, and durably records the immutable grant binding. It is a one-shot approval workflow, not a durable policy edit or transferable capability.
 
 ### Step 3: re-inspect and apply promptly
 
@@ -239,7 +239,7 @@ Then:
 {"plan_ref":"plan:7b2fd854cb805ba1"}
 ```
 
-Plan references can collide because the current 16-hex fingerprint excludes source/session/principal. Inspect immediately before apply, avoid long delays/concurrent same-shape plans, and re-plan after any ambiguity or daemon restart. The application path checks stored caller/source metadata, but collision can invalidate the handle.
+Plan references bind full source/AST/effects/Session/principal identity and include a unique per-kernel object suffix, so same-shape and identical repeated plans do not overwrite one another. Still inspect before apply and re-plan after a daemon restart: the object is ephemeral and approval is one-shot.
 
 ### Step 4: verify the effect
 

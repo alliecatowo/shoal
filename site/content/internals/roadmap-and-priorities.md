@@ -112,28 +112,19 @@ Building it before those contracts would multiply later migration work.
 
 ## P0 — close authority and input-boundary defects
 
-### P0.0 Authenticate approval and journal reads; fix plan identity
+### P0.0 Authenticate approval and journal reads; fix plan identity — baseline complete
 
-**Problem.** `cap.request` is one of the router's unattached methods. Its handler receives no
-`Attachment`, looks up a global stored plan by ref, evaluates the plan under the plan owner's policy,
-and sets `stored.approved = true`. It never authenticates or authorizes the caller as an approver.
-`journal.query` is also routed without attachment and returns rows from the shared journal without
-caller scoping. The socket is Unix-user protected, but bearer-token principals within that user are
-presented as authority boundaries elsewhere.
+**Resolved baseline.** `cap.request` and `journal.query` now require attachments. Journal pages are
+hard-capped and exact-owner scoped. Approval requires a distinct authorized approver by default,
+binds requester/approver/source/plan/Session/scope into a durable audit row, and is consumed once.
+Plan refs use a full caller/content-bound digest plus a unique object suffix, so equal-effect and
+identical repeated plans cannot overwrite one another. Public tokenless clients are restricted and
+cannot assert local-human presence.
 
-Plan identity compounds the issue. `Plan::new` hashes `(effects, reversibility, estimates)` and uses
-only 16 hex characters. It excludes source, session, and principal. The kernel stores one
-`StoredPlan` per ref in a process-global `HashMap`, so two equal-effect plans overwrite each other
-even when their source or owner differs. Later apply/approved-exec checks prevent a simple source
-swap, but refs are not stable owner-scoped plan identities and an old plan can be invalidated by a
-new one.
-
-**Design.** Require an attached authenticated caller for journal reads and capability requests.
-Define an explicit approver capability/profile; ordinary plan ownership is not automatically approval
-authority. Scope journal rows by caller policy, with a separate audited grant for cross-principal
-inspection. Make stored plan IDs unique and opaque (for example a random nonce) or hash a canonical
-record that includes source/AST digest, owner/session identity, and a collision-safe full digest.
-Keep content identity separate from object identity when both are useful.
+**Remaining design.** Centralize method attachment classes so new handlers cannot regress; add
+optional peer-credential/mandatory-bearer modes and richer `JournalRead` policy. Continue to evolve
+approver routing, expiration/reason metadata, and cross-principal journal grants without weakening
+the existing exact-owner default.
 
 **Acceptance tests.** Through raw kernel connections and MCP:
 
@@ -151,15 +142,14 @@ Keep content identity separate from object identity when both are useful.
 signatures make caller context mandatory for every state read/mutation. Protocol comments and tests
 agree with the router.
 
-### P0.1 One capability-complete child evaluator constructor
+### P0.1 One capability-complete child evaluator constructor — complete
 
-**Problem.** `spawn`, `parallel`, `on`, and `.shl` execution create evaluators through separate
-paths. They do not consistently inherit Leash, Reef state, configuration, ports, cancellation, and
-session-scoped facilities. The policy omission can turn a restricted parent into an unrestricted
-child.
+**Resolved.** `spawn`, parallel, channels, `.shl`, and stream producers now capture one typed child
+context and rebuild through one exhaustive constructor. It carries explicit principal/Leash, Reef,
+ports/config, echo, and cancellation capability without sharing arbitrary mutable evaluator state.
+Production-site inventory tests reject direct `Evaluator::new` at child factories.
 
-**Design.** Introduce a typed `EvaluatorContext` or `ChildProfile` owned by `shoal-eval`. It should
-carry explicit capabilities rather than clone arbitrary mutable evaluator state.
+The implemented shape follows this design intent:
 
 ```rust
 // Shape, not a pinned API.

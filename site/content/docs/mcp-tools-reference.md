@@ -256,7 +256,7 @@ Apply a previously stored plan:
 
 `plan_ref` is the only argument. Applying does not accept replacement source, altered arguments, or an alternate effect list. The kernel checks the selected stored plan's session, principal, source, and policy state before application.
 
-The reference itself is not a complete identity: it is currently a 16-hex-character truncation of a hash over effects, reversibility, and estimates, excluding source/session/principal. A same-shape plan can overwrite another entry in the kernel's global plan map. The metadata check prevents a direct source substitution at apply time, but collisions can invalidate references or make them select another plan's metadata. Until this is fixed, derive and apply promptly, inspect the selected plan resource, and do not use `plan_ref` as an authorization token or durable unique ID.
+The reference contains a full digest over source, canonical AST, effects, reversibility, estimates, Session, and principal plus a unique per-kernel object suffix. Same-shape and identical repeated plans cannot overwrite one another, and application rechecks the stored owner/source binding. The object remains ephemeral and disappears on restart; do not use `plan_ref` as a durable ID, secret, or transferable authorization token.
 
 Plans are ephemeral kernel state. They do not survive daemon restart. An unknown or expired-in-memory reference produces `UNKNOWN_PLAN` (`-32012`). A plan that still needs approval produces `APPROVAL_REQUIRED` (`-32011`).
 

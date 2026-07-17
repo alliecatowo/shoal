@@ -34,7 +34,7 @@ accDescr: Shows the components and relationships described in Shoal architecture
     S --> L["Leash policy"]
 ```
 
-The ordinary `shoal` REPL is a separate host. It does not attach to or spawn `shoal-kernel`; a standalone REPL and a named kernel session do not share live language bindings, `it`, jobs, or current directory merely because their names look related.
+The ordinary interactive `shoal` REPL now spawns a listener-free private `shoal-kernel` child and connects over an inherited anonymous descriptor. That server-selected transport is the only local-human trust root. Each REPL remains isolated: it does not bind or attach to the durable named socket used by MCP/agents, and two REPLs do not share live bindings, `it`/`out`, jobs, or cwd merely because their Session names match. `shoal --standalone` (or `kernel.enabled = false`) selects the older in-process evaluator path.
 
 ## Components
 
@@ -43,7 +43,7 @@ The ordinary `shoal` REPL is a separate host. It does not attach to or spawn `sh
 | `shoal-kernel` | Owns named evaluator sessions, transcript refs, plans, tasks, PTYs, event channels, journal/CAS access, authentication, and policy decisions. |
 | `shoal-mcp` | Presents the kernel through MCP stdio: 13 tools, resources, templates, and subscriptions. |
 | `shoal-token` | Creates, lists, and revokes bearer tokens for agent principals. |
-| `shoal` | Interactive/local CLI; its `mcp` subcommand launches the companion `shoal-mcp` executable from `PATH`. |
+| `shoal` | Interactive CLI backed by an isolated private kernel by default; `--standalone` uses a local evaluator, and `mcp` launches the companion from `PATH`. |
 
 Detailed references:
 
@@ -274,7 +274,7 @@ The position distinction does not turn every syntactic statement into an express
 Planning parses source and derives concrete effect records without executing it:
 
 
-Plan references currently hash only the derived effects, reversibility, and estimates, truncated to 16 hex characters after `plan:`. Source, session, and principal are stored as plan metadata but are **not** inputs to that reference. Because the kernel uses one map keyed by the short reference, two same-shape plans can overwrite one another even across sessions or principals. Application rechecks the stored session, principal, and source metadata, which prevents a simple source swap, but the collision can invalidate a caller's plan and combines dangerously with the raw unauthenticated `cap.request` defect documented in [Security and trust boundaries](@/docs/security.md). A caller cannot safely treat `plan_ref` as a globally unique or cryptographic identity.
+Plan references bind the full source/AST, effects, reversibility, estimates, principal, and Session through a full BLAKE3 digest, then add a monotonic per-kernel object suffix so storing identical content twice still creates two objects. Application rechecks the stored identity and source. `cap.request` requires an attachment; by default the requester cannot approve its own plan, and a distinct approver needs the embedded-human trust root or an explicit `supervisor`/`plan.approve` bearer. Plans remain ephemeral object handles rather than durable authorization tokens.
 
 `shoal_cap_request` does not modify a policy file. It marks a stored plan approved when the policy does not deny it and the requested effect-kind scope covers every plan effect. The response reports whether OS enforcement will actually apply.
 
@@ -413,7 +413,7 @@ The raw method set is broader than MCP tools and includes parsing, completion, e
 
 ## Current boundaries
 
-- The standalone REPL does not use kernel sessions.
+- The default REPL uses its own listener-free private kernel; it does not join the durable MCP/agent kernel. Explicit `--standalone` does not use kernel sessions.
 - Kernel transport is Unix-socket/Unix-API based; Windows is not implemented.
 - Stream values carry only a label; no wire chunk-pull protocol exists.
 - Stream `.feed` is also unavailable inside the language.
