@@ -5,8 +5,6 @@
 //! they need the `Fs` port.
 
 use super::*;
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::Path;
 
 /// `.name`/`.stem`/`.ext` — a lossy `str` component of the path, or `null` when
@@ -79,15 +77,16 @@ pub(crate) fn save(ctx: &mut dyn CallCtx, v: Value, path: &Value, append: bool) 
         _ => serde_json::to_vec(&value_to_json(&v))
             .map_err(|e| ErrorVal::new("custom", e.to_string()))?,
     };
-    let mut o = OpenOptions::new();
-    o.create(true).write(true);
-    if append {
-        o.append(true)
+    // Route through the injected `Fs` port instead of `std::fs::OpenOptions`
+    // (HR-C1). `Fs::write` is `create + write + truncate` and `Fs::append` is
+    // `create + append`, so the observable bytes/append behavior and the
+    // `io::Error`-derived error value are unchanged — but the write is now
+    // observable and deniable at the same boundary as `path.read`.
+    let res = if append {
+        ctx.fs().append(&p, &bytes)
     } else {
-        o.truncate(true)
+        ctx.fs().write(&p, &bytes)
     };
-    o.open(&p)
-        .and_then(|mut f| f.write_all(&bytes))
-        .map_err(|e| ErrorVal::new("custom", format!("{}: {e}", p.display())))?;
+    res.map_err(|e| ErrorVal::new("custom", format!("{}: {e}", p.display())))?;
     Ok(v)
 }

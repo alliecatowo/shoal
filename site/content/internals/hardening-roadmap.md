@@ -95,7 +95,7 @@ Rules for implementers:
 
 ### Workstream C — effects through enforceable ports
 
-- [ ] **HR-C1** — `path.save`/`path.append` route through the Fs effect port. *(C1)*
+- [x] **HR-C1** — `path.save`/`path.append` route through the Fs effect port. *(C1)*
 - [ ] **HR-C2** — Stream `.save`/`.append` (and any spill-to-file write in value methods) route
   through the Fs effect port. *(C1)*
 - [ ] **HR-C3** — Inventory every direct `std::fs`/`OpenOptions` use in `shoal-value` and
