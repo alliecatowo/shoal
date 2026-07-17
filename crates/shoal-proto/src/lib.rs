@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
 pub const JSONRPC: &str = "2.0";
@@ -172,13 +172,22 @@ impl Response {
     }
 }
 
+/// Maximum size of one newline-delimited JSON-RPC frame.
+///
+/// The limit is applied while reading, rather than after `read_line` has
+/// already buffered an arbitrarily large or unterminated input.
+pub const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
+
 pub fn read_frame<R: BufRead>(reader: &mut R) -> io::Result<Option<Request>> {
     let mut line = String::new();
-    let n = reader.read_line(&mut line)?;
+    let n = reader
+        .by_ref()
+        .take(MAX_FRAME_LEN as u64 + 1)
+        .read_line(&mut line)?;
     if n == 0 {
         return Ok(None);
     }
-    if line.len() > 16 * 1024 * 1024 {
+    if line.len() > MAX_FRAME_LEN {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "JSON-RPC frame exceeds 16 MiB",
@@ -653,6 +662,50 @@ mod tests {
         let decoded: Response = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(decoded, response);
     }
+
+    #[test]
+    fn read_frame_rejects_unterminated_unbounded_input() {
+        struct Infinite;
+
+        impl Read for Infinite {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                buf.fill(b'x');
+                Ok(buf.len())
+            }
+        }
+
+        let mut reader = io::BufReader::new(Infinite);
+        let error = read_frame(&mut reader)
+            .expect_err("an unterminated oversized frame must fail without unbounded buffering");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("16 MiB"), "{error}");
+    }
+
+    #[test]
+    fn read_frame_rejects_a_single_oversized_line() {
+        let mut body = "x".repeat(MAX_FRAME_LEN + 1024);
+        body.push('\n');
+        let mut reader = io::BufReader::new(body.as_bytes());
+        let error = read_frame(&mut reader).expect_err("an oversized frame must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("16 MiB"), "{error}");
+    }
+
+    #[test]
+    fn read_frame_still_reads_a_normal_frame() {
+        let request = Request {
+            jsonrpc: JSONRPC.into(),
+            id: Value::from(1),
+            method: "parse".into(),
+            params: serde_json::json!({"src": "1 + 1"}),
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &request).unwrap();
+        let mut reader = io::BufReader::new(bytes.as_slice());
+        assert_eq!(read_frame(&mut reader).unwrap(), Some(request));
+        assert!(read_frame(&mut reader).unwrap().is_none());
+    }
+
     #[test]
     fn non_utf8_path_roundtrips() {
         let original = OsString::from_vec(vec![b'a', 0xff, b'b']);

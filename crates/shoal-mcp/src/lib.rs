@@ -1,7 +1,7 @@
 //! MCP stdio facade for the shoal kernel protocol.
 
 use serde_json::{Value, json};
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
@@ -177,7 +177,10 @@ pub(crate) fn short_ref_to_uri(short: &str) -> String {
 
 pub(crate) fn read_json_line<R: BufRead>(reader: &mut R) -> Result<Option<Value>, BridgeError> {
     let mut line = String::new();
-    let n = reader.read_line(&mut line)?;
+    let n = reader
+        .by_ref()
+        .take(MAX_FRAME as u64 + 1)
+        .read_line(&mut line)?;
     if n == 0 {
         return Ok(None);
     }
@@ -235,6 +238,39 @@ mod tests {
         };
         (d, c, h)
     }
+
+    #[test]
+    fn read_json_line_rejects_unterminated_unbounded_input() {
+        struct Infinite;
+
+        impl io::Read for Infinite {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                buf.fill(b'x');
+                Ok(buf.len())
+            }
+        }
+
+        let mut reader = io::BufReader::new(Infinite);
+        let error = read_json_line(&mut reader)
+            .expect_err("an unterminated oversized frame must fail without unbounded buffering");
+        match error {
+            BridgeError::Protocol(message) => assert!(message.contains("16 MiB"), "{message}"),
+            other => panic!("expected a protocol error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_json_line_rejects_a_single_oversized_line() {
+        let mut body = "x".repeat(MAX_FRAME + 1024);
+        body.push('\n');
+        let mut reader = io::BufReader::new(body.as_bytes());
+        let error = read_json_line(&mut reader).expect_err("an oversized frame must fail");
+        match error {
+            BridgeError::Protocol(message) => assert!(message.contains("16 MiB"), "{message}"),
+            other => panic!("expected a protocol error, got {other:?}"),
+        }
+    }
+
     #[test]
     fn facade_attaches_and_maps_exec() {
         let (_d, c, h) = mock();
