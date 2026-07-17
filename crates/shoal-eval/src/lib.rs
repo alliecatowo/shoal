@@ -49,7 +49,7 @@ pub use shoal_exec::{
 use ports::{Exec, StdExec, StdSecret};
 use shoal_adapters::{AdapterCatalog, AdapterClass, SubSpec};
 use shoal_ast::*;
-use shoal_exec::{CancelToken, ExecMode, ExecSpec, StdinSpec};
+use shoal_exec::{CancelToken, ExecMode, ExecSpec, StdinSink, StdinSpec};
 use shoal_journal::Journal;
 use shoal_leash::{Effect, Estimates, Plan, Policy as LeashPolicy, Reversibility, SandboxPolicy};
 use shoal_value::{

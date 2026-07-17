@@ -379,7 +379,7 @@ impl Evaluator {
         // A tool whose convention is "program on stdin" cannot also accept fed
         // bytes — the two would collide on the single stdin channel.
         let stdin = match (stdin_src, &stdin) {
-            (Some(_), StdinSpec::Bytes(_) | StdinSpec::File(_)) => {
+            (Some(_), StdinSpec::Bytes(_) | StdinSpec::File(_) | StdinSpec::Stream(_)) => {
                 return Err(ErrorVal::type_error(format!(
                     "`{tool}` takes its program on stdin, so it cannot also be fed data"
                 ))

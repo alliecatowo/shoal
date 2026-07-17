@@ -210,14 +210,14 @@ pub fn feed_bytes(v: &Value) -> Result<Vec<u8>, ErrorVal> {
             Value::Str(_) => Ok(o.stdout.as_ref().clone()),
             structured => feed_bytes(&structured),
         },
-        // stream → site/content/internals/language-conformance-contract.md promises *incremental* feeding as items arrive, which
-        // needs evaluator/exec support (a live child stdin pipe); an honest
-        // error until that lands rather than a buffering fake.
+        // A stream's evaluator-owned `.feed(command)` path pumps items
+        // incrementally. This finite serializer deliberately cannot own or
+        // drive a stream by itself.
         Value::Stream(_) => Err(ErrorVal::new(
-            "stream_feed_unsupported",
-            "stream feeding requires an incremental child-stdin pump, which this runtime does not provide",
+            "type_error",
+            "feed_bytes serializes finite values; drive a stream with stream.feed(command)",
         )
-        .with_hint("collect a bounded stream first: stream.collect().feed(cmd)")),
+        .with_hint("use the evaluator-owned `.feed(command)` stream sink")),
         // Deliberately never feedable (site/content/internals/values-streams-execution.md) → `feed_error`.
         Value::Secret(_) => Err(ErrorVal::new(
             "feed_error",
@@ -510,12 +510,12 @@ mod tests {
     }
 
     #[test]
-    fn feed_bytes_stream_is_explicitly_unsupported_and_non_consuming() {
+    fn finite_feed_serializer_redirects_streams_to_the_owned_sink_without_consuming() {
         let s = StreamVal::from_iter("int", (0..2).map(|i| Ok(Value::Int(i))));
         let e = feed_bytes(&Value::Stream(s.clone())).unwrap_err();
-        assert_eq!(e.code, "stream_feed_unsupported");
-        assert!(e.msg.contains("incremental child-stdin pump"));
-        assert!(e.hint.unwrap().contains("collect"));
+        assert_eq!(e.code, "type_error");
+        assert!(e.msg.contains("stream.feed(command)"));
+        assert!(e.hint.unwrap().contains("evaluator-owned"));
         assert!(
             s.take_upstream().is_ok(),
             "rejecting feed must not consume the stream"

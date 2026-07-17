@@ -424,10 +424,82 @@ impl Evaluator {
             (recv, arg)
         };
         let value = self.eval_expr(value_expr, Position::Value)?;
+        if let Value::Stream(stream) = value {
+            return self.eval_stream_feed(stream, cmd_expr, position, span);
+        }
         let bytes = shoal_value::feed_bytes(&value).map_err(|e| e.or_span(span))?;
+        self.eval_feed_command(cmd_expr, position, span, StdinSpec::Bytes(bytes))
+    }
+
+    fn eval_stream_feed(
+        &mut self,
+        stream: shoal_value::StreamVal,
+        cmd_expr: &Expr,
+        position: Position,
+        span: Span,
+    ) -> VResult<Value> {
+        const STDIN_CHUNKS: usize = 16;
+        const PULL_POLL: Duration = Duration::from_millis(25);
+
+        let mut upstream = stream.take_upstream()?;
+        let (stdin_sink, stdin) = shoal_exec::stream_stdin(STDIN_CHUNKS);
+        let pump_cancel = CancelToken::new();
+        let parent_cancel = self.cancellation_token();
+        let child = self.child_context();
+        let error = Arc::new(std::sync::Mutex::new(None));
+        let pump_error = error.clone();
+        let worker_cancel = pump_cancel.clone();
+        let worker = std::thread::spawn(move || {
+            let mut evaluator = child.build(ChildKind::StreamPump, parent_cancel.clone());
+            loop {
+                if worker_cancel.is_cancelled() || parent_cancel.is_cancelled() {
+                    break;
+                }
+                let item = match upstream.pull(&mut evaluator, Some(PULL_POLL)) {
+                    Ok(shoal_value::Pull::Item(value)) => value,
+                    Ok(shoal_value::Pull::Timeout) => continue,
+                    Ok(shoal_value::Pull::End) => break,
+                    Err(e) => {
+                        *pump_error.lock().unwrap() = Some(e);
+                        break;
+                    }
+                };
+                let chunk = match stream_feed_chunk(&item) {
+                    Ok(chunk) => chunk,
+                    Err(e) => {
+                        *pump_error.lock().unwrap() = Some(e);
+                        break;
+                    }
+                };
+                if !send_stdin_chunk(&stdin_sink, &worker_cancel, &parent_cancel, chunk) {
+                    break;
+                }
+            }
+        });
+
+        let result = self.eval_feed_command(cmd_expr, position, span, stdin);
+        // Wake a pump blocked on an idle live upstream or a full stdin queue
+        // once the process has exited or failed to spawn.
+        pump_cancel.cancel();
+        if worker.join().is_err() {
+            return Err(ErrorVal::new("custom", "stream stdin pump panicked").with_span(span));
+        }
+        if let Some(e) = error.lock().unwrap().take() {
+            return Err(e.or_span(span));
+        }
+        result
+    }
+
+    fn eval_feed_command(
+        &mut self,
+        cmd_expr: &Expr,
+        position: Position,
+        span: Span,
+        stdin: StdinSpec,
+    ) -> VResult<Value> {
         match cmd_expr {
             Expr::LangBlock { tool, src, span } => {
-                self.eval_lang_block(tool, src, StdinSpec::Bytes(bytes), position, *span)
+                self.eval_lang_block(tool, src, stdin, position, *span)
             }
             Expr::Cmd { call, .. } => {
                 let mut argv = vec![OsString::from(&call.head)];
@@ -436,23 +508,11 @@ impl Evaluator {
                         argv.push(self.argv_value(v)?);
                     }
                 }
-                self.run_argv(
-                    argv,
-                    position,
-                    StdinSpec::Bytes(bytes),
-                    &call.env_prefix,
-                    call.span,
-                    None,
-                )
+                self.run_argv(argv, position, stdin, &call.env_prefix, call.span, None)
             }
-            Expr::Var { name, .. } => self.run_argv(
-                vec![OsString::from(name)],
-                position,
-                StdinSpec::Bytes(bytes),
-                &[],
-                span,
-                None,
-            ),
+            Expr::Var { name, .. } => {
+                self.run_argv(vec![OsString::from(name)], position, stdin, &[], span, None)
+            }
             other => Err(ErrorVal::type_error(format!(
                 ".feed's argument must be a command, not {}",
                 expr_noun(other)
@@ -473,6 +533,42 @@ impl Evaluator {
             Expr::LangBlock { .. } | Expr::Cmd { .. } => true,
             Expr::Var { name, .. } => self.exec.shell.env.get(name).is_none(),
             _ => false,
+        }
+    }
+}
+
+fn stream_feed_chunk(value: &Value) -> VResult<Vec<u8>> {
+    let raw_chunk = matches!(
+        value,
+        Value::Bytes(_) | Value::CasBytes(_) | Value::Outcome(_)
+    );
+    let mut bytes = shoal_value::feed_bytes(value)?;
+    // Streams of values are line-framed so item boundaries survive the byte
+    // boundary (tail strings become lines; records become NDJSON). Explicit
+    // byte/outcome chunks remain raw for binary and already-framed producers.
+    if !raw_chunk && !bytes.ends_with(b"\n") {
+        bytes.push(b'\n');
+    }
+    Ok(bytes)
+}
+
+fn send_stdin_chunk(
+    sink: &StdinSink,
+    stop: &CancelToken,
+    parent_cancel: &CancelToken,
+    mut chunk: Vec<u8>,
+) -> bool {
+    loop {
+        match sink.try_send(chunk) {
+            Ok(()) => return true,
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return false,
+            Err(std::sync::mpsc::TrySendError::Full(returned)) => {
+                if stop.is_cancelled() || parent_cancel.is_cancelled() {
+                    return false;
+                }
+                chunk = returned;
+                std::thread::park_timeout(Duration::from_millis(2));
+            }
         }
     }
 }

@@ -178,6 +178,56 @@ fn buffer_decouples_through_a_bounded_owned_pump() {
 }
 
 #[test]
+fn finite_stream_feeds_command_stdin_as_line_framed_chunks() {
+    let Value::Outcome(outcome) = run(r#"["alpha", "beta"].stream().feed(cat)"#) else {
+        panic!("stream feed must return an outcome");
+    };
+    assert_eq!(outcome.stdout.as_slice(), b"alpha\nbeta\n");
+}
+
+#[test]
+fn live_stream_feeds_items_that_arrive_after_the_child_starts() {
+    let Value::Outcome(outcome) = run(
+        r#"spawn { sleep 10ms; channel("feed-live").emit("one"); sleep 10ms; channel("feed-live").emit("two") }
+channel("feed-live").events().map(ev => ev.payload).take(2).feed(cat)"#,
+    ) else {
+        panic!("stream feed must return an outcome");
+    };
+    assert_eq!(outcome.stdout.as_slice(), b"one\ntwo\n");
+}
+
+#[test]
+fn command_early_exit_disconnects_an_endless_stream_feed() {
+    let start = Instant::now();
+    let Value::Outcome(outcome) = run(r#"every(5ms).map(x => "tick").feed(head -n 2)"#) else {
+        panic!("stream feed must return an outcome");
+    };
+    assert_eq!(outcome.stdout.as_slice(), b"tick\ntick\n");
+    assert!(start.elapsed() < Duration::from_secs(5));
+}
+
+#[test]
+fn stream_feed_surfaces_item_serialization_errors() {
+    assert_eq!(
+        run_err(r#"[path("not-content")].stream().feed(cat)"#),
+        "type_error"
+    );
+}
+
+#[test]
+fn stream_feed_stops_an_idle_pump_when_command_spawn_fails() {
+    let start = Instant::now();
+    assert_eq!(
+        run_err("every(1s).feed(definitely-not-a-command-xyz)"),
+        "not_found"
+    );
+    assert!(
+        start.elapsed() < Duration::from_millis(500),
+        "spawn failure left the live stream pump blocked"
+    );
+}
+
+#[test]
 fn zip_pairs_positionally() {
     assert_eq!(
         rendered("[1,2,3].stream().zip([10,20].stream()).collect()"),
