@@ -17,6 +17,9 @@ pub(crate) const JOURNAL_DEFAULT_PAGE: usize = 100;
 /// per-statement row volume kernel replay tests pull — so it bounds abuse
 /// without truncating legitimate bulk reads.
 pub(crate) const JOURNAL_MAX_PAGE: usize = 10_000;
+const DEFAULT_RENDER_WIDTH: usize = 80;
+const MIN_RENDER_WIDTH: usize = 20;
+const MAX_RENDER_WIDTH: usize = 512;
 
 /// Map a CAS-backed bytes resolution failure — a missing or corrupt blob
 /// surfaced when `value.get` materializes an elided `CasBytes` ref under a
@@ -121,7 +124,11 @@ impl Kernel {
                 encode(json!({"ref":params.r#ref,"value":wire}))
             }
             Some("render") => {
-                let render = shoal_value::render::render_block(&sliced, 80);
+                let width = params
+                    .width
+                    .unwrap_or(DEFAULT_RENDER_WIDTH)
+                    .clamp(MIN_RENDER_WIDTH, MAX_RENDER_WIDTH);
+                let render = shoal_value::render::render_block(&sliced, width);
                 // Same hard cap as MCP's content[0].text (site/content/internals/kernel-protocol.md):
                 // `format=render` must not be a way to bypass the elision
                 // wall by asking for the human render instead of the value.

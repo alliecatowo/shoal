@@ -1,8 +1,9 @@
-use shoal_kernel::{Kernel, Limits};
+use shoal_kernel::{ConnectionTrust, Kernel, Limits};
 use shoal_leash::Policy;
 use std::fs;
 use std::io;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::io::FromRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -19,8 +20,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse(std::env::args_os().skip(1))?;
     let limits = args.resolved_limits();
     let paths = shoal_paths::ShoalPaths::discover();
-    let socket = args.socket.unwrap_or_else(|| paths.socket(&args.session));
-    prepare_socket(&socket)?;
     let state = args
         .state_dir
         .unwrap_or_else(|| paths.state_dir().to_path_buf());
@@ -30,9 +29,36 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Kernel::open(&state)?
     };
     kernel.configure_limits(limits);
+    let socket = args.socket.unwrap_or_else(|| paths.socket(&args.session));
+    prepare_socket(&socket)?;
+    if let Some(fd) = args.embedded_fd {
+        if fd < 3 {
+            return Err("--embedded-fd must name a non-stdio descriptor".into());
+        }
+        // SAFETY: the spawning parent passes ownership of this descriptor
+        // exactly once and the one-shot embedded process exits with the stream.
+        let stream = unsafe { UnixStream::from_raw_fd(fd) };
+        let embedded = kernel.clone();
+        std::thread::Builder::new()
+            .name("shoal-kernel-embedded-human".into())
+            .spawn(move || {
+                if let Err(error) =
+                    embedded.handle_stream_with_trust(stream, ConnectionTrust::EmbeddedHuman)
+                {
+                    eprintln!("shoal-kernel: embedded connection: {error}");
+                }
+            })?;
+    }
     let stop = Arc::new(AtomicBool::new(false));
-    let signal = stop.clone();
-    ctrlc::set_handler(move || signal.store(true, Ordering::SeqCst))?;
+    if args.embedded_fd.is_none() {
+        let signal = stop.clone();
+        ctrlc::set_handler(move || signal.store(true, Ordering::SeqCst))?;
+    } else {
+        // Keep the daemon alive when the terminal delivers Ctrl-C to the
+        // foreground process group. This is a caught handler (not SIG_IGN),
+        // so exec restores SIG_DFL in command children.
+        ctrlc::set_handler(|| {})?;
+    }
     eprintln!("shoal-kernel: ready {}", socket.display());
     kernel.serve_until(&socket, stop)?;
     Ok(())
@@ -108,6 +134,7 @@ struct Args {
     socket: Option<PathBuf>,
     state_dir: Option<PathBuf>,
     policy: Option<PathBuf>,
+    embedded_fd: Option<i32>,
     max_connections: Option<usize>,
     max_tasks_per_session: Option<usize>,
     max_ptys_per_session: Option<usize>,
@@ -123,6 +150,7 @@ impl Args {
             socket: None,
             state_dir: None,
             policy: None,
+            embedded_fd: None,
             max_connections: None,
             max_tasks_per_session: None,
             max_ptys_per_session: None,
@@ -146,6 +174,15 @@ impl Args {
                 Some("--socket") => a.socket = Some(it.next().ok_or_else(&missing)?.into()),
                 Some("--state-dir") => a.state_dir = Some(it.next().ok_or_else(&missing)?.into()),
                 Some("--policy") => a.policy = Some(it.next().ok_or_else(&missing)?.into()),
+                Some("--embedded-fd") => {
+                    a.embedded_fd = Some(
+                        it.next()
+                            .ok_or_else(&missing)?
+                            .to_str()
+                            .and_then(|text| text.parse().ok())
+                            .ok_or_else(|| "--embedded-fd requires an integer".to_string())?,
+                    )
+                }
                 Some("--max-connections") => {
                     a.max_connections = Some(parse_usize(&k, it.next().ok_or_else(&missing)?)?)
                 }
@@ -181,7 +218,7 @@ impl Args {
                             })?,
                     )
                 }
-                Some("-h" | "--help") => return Err("usage: shoal-kernel [--session NAME] [--socket PATH] [--state-dir PATH] [--policy FILE] [--max-connections N] [--max-tasks-per-session N] [--max-ptys-per-session N] [--max-ptys-per-principal N] [--max-ptys-global N] [--max-subscriptions-per-session N] [--frame-read-timeout-ms N]".into()),
+                Some("-h" | "--help") => return Err("usage: shoal-kernel [--session NAME] [--socket PATH | --embedded-fd FD] [--state-dir PATH] [--policy FILE] [--max-connections N] [--max-tasks-per-session N] [--max-ptys-per-session N] [--max-ptys-per-principal N] [--max-ptys-global N] [--max-subscriptions-per-session N] [--frame-read-timeout-ms N]".into()),
                 _ => return Err(format!("unknown argument {}", k.to_string_lossy())),
             }
         }

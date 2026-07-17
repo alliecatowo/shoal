@@ -552,6 +552,8 @@ pub struct TaskRecord {
     pub started_ns: i64,
     pub finished_ns: Option<i64>,
     pub result_ref: Option<Ref>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
     pub error: Option<RpcError>,
 }
 fn run_mode() -> String {
@@ -565,6 +567,8 @@ pub struct ExecResult {
     pub r#ref: Ref,
     pub value: Option<WireValue>,
     pub render: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanApplyParams {
@@ -596,6 +600,10 @@ pub struct ValueGetParams {
     /// `"raw"` returns a str verbatim / bytes base64 (other types error).
     #[serde(default)]
     pub format: Option<String>,
+    /// Preferred display width for `format:"render"`. Servers clamp this to
+    /// a defensive range; omitted requests retain the historical 80 columns.
+    #[serde(default)]
+    pub width: Option<usize>,
 }
 
 /// `stream.pull` — pull a bounded batch from a session-owned live stream.

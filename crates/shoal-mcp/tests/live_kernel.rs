@@ -8,6 +8,7 @@
 
 use serde_json::{Value, json};
 use shoal_kernel::Kernel;
+use shoal_leash::Policy;
 use shoal_mcp::{Config, Facade};
 use shoal_proto::error_code::NOT_ATTACHED;
 use shoal_proto::{JSONRPC, Request, Response, write_frame};
@@ -29,7 +30,10 @@ impl LiveKernel {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("run/kernel.sock");
         let stop = Arc::new(AtomicBool::new(false));
-        let kernel = Kernel::new();
+        // MCP reaches the public listener as a restricted agent. Give that
+        // principal a permissive test policy rather than manufacturing human
+        // presence from possession of the socket path.
+        let kernel = Kernel::with_policy(Policy::permissive("agent:mcp"));
         let serve_socket = socket.clone();
         let serve_stop = stop.clone();
         let handle = std::thread::spawn(move || {
@@ -63,10 +67,7 @@ impl LiveKernel {
             socket: self.socket.clone(),
             session: Some("default".into()),
             token: None,
-            // This suite exercises the historical permissive kernel surface.
-            // Restricted zero-token production attach is tested at the client
-            // negotiation boundary until the kernel half of HR-D6 lands.
-            local_auth: shoal_mcp::LocalAuthMode::LocalHuman,
+            local_auth: shoal_mcp::LocalAuthMode::RestrictedAgent,
         }
     }
 }
@@ -379,11 +380,11 @@ fn mcp_shoal_plan_distinguishes_trash_rm_from_opaque_rm() {
 }
 
 /// site/content/internals/kernel-protocol.md (`shoal://session/env`): the session environment view is
-/// served from the session evaluator. A default-permissive human is granted a
+/// served from the session evaluator. The explicitly permissive test agent is granted a
 /// value read (`env_read=["*"]`), so `granted:true` and the values travel
 /// alongside the names.
 #[test]
-fn mcp_session_env_resource_is_served_with_values_for_the_default_human() {
+fn mcp_session_env_resource_is_served_with_values_for_permitted_agent() {
     let live = LiveKernel::start();
     let mut facade = Facade::connect(&live.config()).unwrap();
 
@@ -391,7 +392,7 @@ fn mcp_session_env_resource_is_served_with_values_for_the_default_human() {
     let sc = &env["structuredContent"];
     assert_eq!(
         sc["granted"], true,
-        "the default-permissive human is granted an env value read: {sc}"
+        "the explicitly permitted agent is granted an env value read: {sc}"
     );
     let names = sc["names"].as_array().expect("env names is a list");
     assert!(!names.is_empty(), "the session env is not empty: {sc}");
@@ -649,7 +650,7 @@ fn raw_events_publish_read_roundtrip_on_user_channel() {
         &mut reader,
         1,
         "session.attach",
-        json!({"local_auth":"local-human","client":{"kind":"test","tty":false}}),
+        json!({"client":{"kind":"test","tty":false}}),
     );
     let published = raw_call(
         &mut stream,
@@ -699,7 +700,7 @@ fn language_channel_emit_bridges_to_wire_bus_and_back() {
         &mut reader,
         1,
         "session.attach",
-        json!({"local_auth":"local-human","client":{"kind":"test","tty":false}}),
+        json!({"client":{"kind":"test","tty":false}}),
     );
     // Connection 2: a dedicated subscriber that only ever receives pushes.
     let mut sub_stream = UnixStream::connect(&live.socket).unwrap();
@@ -709,7 +710,7 @@ fn language_channel_emit_bridges_to_wire_bus_and_back() {
         &mut sub_reader,
         1,
         "session.attach",
-        json!({"local_auth":"local-human","client":{"kind":"test","tty":false}}),
+        json!({"client":{"kind":"test","tty":false}}),
     );
     let sub = raw_call(
         &mut sub_stream,
@@ -1055,7 +1056,7 @@ fn raw_unattached_journal_query_is_rejected_then_allowed_after_attach() {
         &mut reader,
         2,
         "session.attach",
-        json!({"local_auth":"local-human","client":{"kind":"test","tty":false}}),
+        json!({"client":{"kind":"test","tty":false}}),
     );
     assert!(attached.error.is_none(), "attach failed: {attached:?}");
     let ok = raw_call(
@@ -1086,7 +1087,7 @@ fn raw_journal_query_limit_zero_is_empty_and_omitted_is_default() {
         &mut reader,
         1,
         "session.attach",
-        json!({"local_auth":"local-human","client":{"kind":"test","tty":false}}),
+        json!({"client":{"kind":"test","tty":false}}),
     );
     // Produce a journal entry.
     let exec = raw_call(&mut stream, &mut reader, 2, "exec", json!({"src":"1 + 2"}));

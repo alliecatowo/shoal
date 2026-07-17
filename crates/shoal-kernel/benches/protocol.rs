@@ -26,7 +26,11 @@ impl Connection {
     fn new() -> Self {
         let kernel = Kernel::new();
         let (client, server) = UnixStream::pair().unwrap();
-        let worker = std::thread::spawn(move || kernel.handle_stream(server).unwrap());
+        let worker = std::thread::spawn(move || {
+            kernel
+                .handle_stream_with_trust(server, shoal_kernel::ConnectionTrust::EmbeddedHuman)
+                .unwrap()
+        });
         let reader = BufReader::new(client.try_clone().unwrap());
         let mut connection = Self {
             writer: client,
@@ -38,7 +42,8 @@ impl Connection {
             "session.attach",
             json!({
                 "session": "criterion",
-                "local_auth": "local-human"
+                "local_auth": "local-human",
+                "client": {"kind":"criterion","tty":false}
             }),
         );
         assert!(attached.error.is_none());

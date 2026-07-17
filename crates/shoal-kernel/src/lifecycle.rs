@@ -20,9 +20,10 @@ impl Kernel {
             },
             "security": {
                 "epoch": ATTACH_SECURITY_EPOCH,
-                "raw_local_human": self.allow_unauthenticated_local_human,
+                "connection_trust": attachment.connection_trust.as_str(),
+                "raw_local_human": attachment.connection_trust == ConnectionTrust::EmbeddedHuman,
                 "bearer_establishes_human_presence": false,
-                "machine_admin_credential_required": !self.allow_unauthenticated_local_human,
+                "machine_admin_credential_required": attachment.connection_trust == ConnectionTrust::Public,
             },
             "shutdown_requested": self.shutdown_requested.load(Ordering::SeqCst),
         }))

@@ -394,6 +394,11 @@ impl Kernel {
                 }
                 Ok(stored.src.clone())
             })?;
+        let connection_trust = attached
+            .as_ref()
+            .map_or(ConnectionTrust::Public, |attachment| {
+                attachment.connection_trust
+            });
         let response = self.dispatch(
             Request {
                 jsonrpc: JSONRPC.into(),
@@ -413,6 +418,7 @@ impl Kernel {
             client,
             attached,
             conn,
+            connection_trust,
         );
         response.result.ok_or_else(|| {
             response

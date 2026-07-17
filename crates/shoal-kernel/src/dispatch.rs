@@ -13,6 +13,7 @@ impl Kernel {
         client: u64,
         attached: &mut Option<Attachment>,
         conn: Option<&SharedWriter>,
+        trust: ConnectionTrust,
     ) -> Response {
         let id = request.id;
         let params = request.params;
@@ -40,9 +41,10 @@ impl Kernel {
                     attachment.session.touch();
                 }
                 match method.as_str() {
-                    "session.attach" => self.handle_session_attach(params, client, attached),
+                    "session.attach" => self.handle_session_attach(params, client, attached, trust),
                     "session.env" => self.handle_session_env(attached),
                     "session.reef" => self.handle_session_reef(attached),
+                    "session.snapshot" => self.handle_session_snapshot(attached),
                     "kernel.status" => self.handle_kernel_status(attached),
                     "kernel.shutdown" => self.handle_kernel_shutdown(attached),
                     "parse" => self.handle_parse(params),

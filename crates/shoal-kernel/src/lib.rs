@@ -21,7 +21,7 @@ use wire::*;
 use serde_json::{Value as Json, json};
 use shoal_ast::{Program, Stmt};
 use shoal_auth::{TokenMeta, TokenStore};
-use shoal_eval::{Evaluator, Position};
+use shoal_eval::{EchoMode, Evaluator, Position};
 use shoal_journal::{EntryRecord, Journal, JournalQuery};
 use shoal_leash::{
     Effect, EnforcementStatus, EnforcementTier, Estimates, Plan, Policy, Reversibility, Verdict,
@@ -62,13 +62,6 @@ pub struct Kernel {
     /// so terminated + reaped) on `pty.close` or when the kernel is dropped.
     ptys: Arc<PtyRegistry>,
     auth: Option<Mutex<TokenStore>>,
-    /// In-memory embedded kernels have no token store and may deliberately use
-    /// the hosting process as their human trust root. Durable socket daemons
-    /// keep this false: neither a wire assertion nor an ordinary bearer proves
-    /// that a human is present. Bearers can grant explicit machine-admin roles
-    /// (`supervisor` / `plan.approve`), but never acquire human semantics merely
-    /// by naming their profile `local-human`.
-    allow_unauthenticated_local_human: bool,
     shutdown_requested: AtomicBool,
     started_at: Instant,
     events: Arc<EventBus>,
@@ -98,6 +91,26 @@ pub struct Limits {
     /// Deadline for an unauthenticated connection's first byte and for the
     /// remainder of any frame once its first byte arrives. Zero disables it.
     pub frame_read_timeout_ms: u64,
+}
+
+/// Server-owned trust attached to a connection before any client bytes are
+/// read. A wire request can never select or upgrade this value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionTrust {
+    /// A connection accepted from the named filesystem socket.
+    Public,
+    /// One anonymous socket endpoint inherited directly from a parent Shoal
+    /// process. Possession is established by process inheritance, not a path.
+    EmbeddedHuman,
+}
+
+impl ConnectionTrust {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::EmbeddedHuman => "embedded-human",
+        }
+    }
 }
 
 impl Default for Limits {
@@ -137,6 +150,7 @@ struct TaskInner {
     state: &'static str,
     finished_ns: Option<i64>,
     result_ref: Option<Ref>,
+    exit_code: Option<i32>,
     error: Option<RpcError>,
     active_slot: Option<QuotaPermit>,
 }
@@ -164,6 +178,7 @@ impl TaskEntry {
             inner.state = "failed";
             inner.finished_ns = Some(now_ns());
             inner.result_ref = None;
+            inner.exit_code = None;
             inner.error = Some(RpcError {
                 code: INTERNAL_ERROR,
                 message: "task worker panicked".into(),
@@ -465,7 +480,6 @@ impl Kernel {
             )),
             events: Arc::new(EventBus::default()),
             auth: None,
-            allow_unauthenticated_local_human: true,
             shutdown_requested: AtomicBool::new(false),
             started_at: Instant::now(),
             allow_self_ack: AtomicBool::new(self_ack_from_env()),
@@ -508,7 +522,6 @@ impl Kernel {
             )),
             events: Arc::new(events),
             auth: Some(Mutex::new(TokenStore::open(state_dir.join("tokens.json"))?)),
-            allow_unauthenticated_local_human: false,
             shutdown_requested: AtomicBool::new(false),
             started_at: Instant::now(),
             allow_self_ack: AtomicBool::new(self_ack_from_env()),
@@ -548,7 +561,6 @@ impl Kernel {
             )),
             events: Arc::new(events),
             auth: Some(Mutex::new(TokenStore::open(state_dir.join("tokens.json"))?)),
-            allow_unauthenticated_local_human: false,
             shutdown_requested: AtomicBool::new(false),
             started_at: Instant::now(),
             allow_self_ack: AtomicBool::new(self_ack_from_env()),
@@ -580,7 +592,6 @@ impl Kernel {
             )),
             events: Arc::new(EventBus::default()),
             auth: None,
-            allow_unauthenticated_local_human: true,
             shutdown_requested: AtomicBool::new(false),
             started_at: Instant::now(),
             allow_self_ack: AtomicBool::new(self_ack_from_env()),
@@ -651,7 +662,8 @@ impl Kernel {
                         .name("shoal-kernel-connection".into())
                         .spawn(move || {
                             let _slot = slot;
-                            let _ = kernel.handle_stream(stream);
+                            let _ =
+                                kernel.handle_stream_with_trust(stream, ConnectionTrust::Public);
                         })?;
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -664,6 +676,16 @@ impl Kernel {
     }
 
     pub fn handle_stream(self: &Arc<Self>, stream: UnixStream) -> io::Result<()> {
+        self.handle_stream_with_trust(stream, ConnectionTrust::Public)
+    }
+
+    /// Service one already-connected stream under server-selected trust.
+    /// Public listeners must always pass [`ConnectionTrust::Public`].
+    pub fn handle_stream_with_trust(
+        self: &Arc<Self>,
+        stream: UnixStream,
+        trust: ConnectionTrust,
+    ) -> io::Result<()> {
         let client = self.connections.next_client();
         let mut reader = BufReader::new(stream.try_clone()?);
         let writer: SharedWriter = Arc::new(Mutex::new(stream));
@@ -716,7 +738,7 @@ impl Kernel {
                 let response = if request.jsonrpc != JSONRPC {
                     Response::err(id, INVALID_REQUEST, "invalid JSON-RPC version", None)
                 } else {
-                    self.dispatch(request, client, &mut attached, Some(&writer))
+                    self.dispatch(request, client, &mut attached, Some(&writer), trust)
                 };
                 // A poisoned writer may contain a partially-written JSON
                 // frame. Close this connection rather than recovering the
@@ -876,6 +898,7 @@ fn task_record_locked(task: &TaskEntry, inner: &TaskInner) -> TaskRecord {
         started_ns: task.started_ns,
         finished_ns: inner.finished_ns,
         result_ref: inner.result_ref.clone(),
+        exit_code: inner.exit_code,
         error: inner.error.clone(),
     }
 }

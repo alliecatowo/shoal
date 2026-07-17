@@ -1,8 +1,10 @@
 use shoal_proto::error_code::AUTH_FAILED;
 use shoal_proto::{AttachParams, ClientInfo, ExecParams, JSONRPC, Request, Response, write_frame};
 use std::io::{BufRead, BufReader, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -66,6 +68,146 @@ fn read_daemon_stderr(path: &Path) -> String {
 /// the other's daemon, at negligible cost (each test finishes in well under
 /// a second).
 static ONLY_ONE_DAEMON_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+fn embedded_fd_is_private_trust_while_public_listener_stays_untrusted_and_live() {
+    const EMBEDDED_FD: i32 = 3;
+    const SIGINT: i32 = 2;
+    const SIGKILL: i32 = 9;
+    const F_GETFD: i32 = 1;
+    const F_SETFD: i32 = 2;
+    const FD_CLOEXEC: i32 = 1;
+
+    let _serialize = ONLY_ONE_DAEMON_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("run/embedded.sock");
+    let state = temp.path().join("state");
+    let (mut private, child_end) = UnixStream::pair().unwrap();
+    let inherited_fd = child_end.as_raw_fd();
+    let (stderr_file, stderr_path) = daemon_stderr_file(temp.path());
+    let mut command = Command::new(env!("CARGO_BIN_EXE_shoal-kernel"));
+    command
+        .args([
+            "--embedded-fd",
+            "3",
+            "--socket",
+            socket.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+        ])
+        .stdout(Stdio::null())
+        .stderr(stderr_file);
+    // SAFETY: only descriptor syscalls run between fork and exec. `dup2`
+    // clears close-on-exec unless source and destination are already equal;
+    // the explicit fcntl covers that edge case too.
+    unsafe {
+        command.pre_exec(move || {
+            if dup2(inherited_fd, EMBEDDED_FD) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let flags = fcntl(EMBEDDED_FD, F_GETFD, 0);
+            if flags == -1 || fcntl(EMBEDDED_FD, F_SETFD, flags & !FD_CLOEXEC) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().unwrap();
+    drop(child_end);
+    let mut private_reader = BufReader::new(private.try_clone().unwrap());
+    write_frame(
+        &mut private,
+        &Request {
+            jsonrpc: JSONRPC.into(),
+            id: 1.into(),
+            method: "session.attach".into(),
+            params: serde_json::json!({
+                "local_auth":"local-human",
+                "session":"embedded",
+                "client":{"kind":"shoal-repl","tty":true}
+            }),
+        },
+    )
+    .unwrap();
+    let trusted = recv(&mut private_reader).result.unwrap();
+    assert_eq!(trusted["connection_trust"], "embedded-human");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !socket.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        socket.exists(),
+        "embedded daemon did not bind public listener:\n{}",
+        read_daemon_stderr(&stderr_path)
+    );
+    let mut public = UnixStream::connect(&socket).unwrap();
+    let mut public_reader = BufReader::new(public.try_clone().unwrap());
+    write_frame(
+        &mut public,
+        &Request {
+            jsonrpc: JSONRPC.into(),
+            id: 2.into(),
+            method: "session.attach".into(),
+            params: serde_json::json!({
+                "local_auth":"local-human",
+                "client":{"kind":"same-uid-adversary","tty":true}
+            }),
+        },
+    )
+    .unwrap();
+    assert_eq!(recv(&mut public_reader).error.unwrap().code, AUTH_FAILED);
+    write_frame(
+        &mut public,
+        &Request {
+            jsonrpc: JSONRPC.into(),
+            id: 3.into(),
+            method: "session.attach".into(),
+            params: serde_json::json!({"client":{"kind":"mcp","tty":false}}),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        recv(&mut public_reader).result.unwrap()["connection_trust"],
+        "public"
+    );
+
+    assert_eq!(unsafe { kill(child.id() as i32, SIGINT) }, 0);
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "SIGINT killed embedded kernel"
+    );
+    write_frame(
+        &mut private,
+        &Request {
+            jsonrpc: JSONRPC.into(),
+            id: 4.into(),
+            method: "parse".into(),
+            params: serde_json::json!({"src":"1 + 2"}),
+        },
+    )
+    .unwrap();
+    assert!(recv(&mut private_reader).error.is_none());
+
+    drop(private);
+    drop(private_reader);
+    write_frame(
+        &mut public,
+        &Request {
+            jsonrpc: JSONRPC.into(),
+            id: 5.into(),
+            method: "kernel.status".into(),
+            params: serde_json::json!({}),
+        },
+    )
+    .unwrap();
+    assert!(recv(&mut public_reader).error.is_none());
+    assert_eq!(unsafe { kill(child.id() as i32, SIGKILL) }, 0);
+    let _ = child.wait();
+}
 
 #[test]
 fn daemon_binds_secure_socket_and_attaches() {
@@ -211,6 +353,8 @@ fn daemon_binds_secure_socket_and_attaches() {
 unsafe extern "C" {
     fn kill(pid: i32, signal: i32) -> i32;
     fn geteuid() -> u32;
+    fn dup2(oldfd: i32, newfd: i32) -> i32;
+    fn fcntl(fd: i32, command: i32, argument: i32) -> i32;
 }
 
 /// Regression test for the accepted-socket non-blocking bug: `serve_until`

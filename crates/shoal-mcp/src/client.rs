@@ -54,8 +54,19 @@ pub struct KernelClient {
 
 impl KernelClient {
     pub fn connect(config: &Config) -> Result<Self, BridgeError> {
-        let params = attach_params(config)?;
         let stream = UnixStream::connect(&config.socket)?;
+        Self::from_stream(stream, config, "mcp", false)
+    }
+
+    /// Attach over an already-connected transport. The caller, not the wire,
+    /// is responsible for establishing the stream's provenance.
+    pub fn from_stream(
+        stream: UnixStream,
+        config: &Config,
+        client_kind: &str,
+        tty: bool,
+    ) -> Result<Self, BridgeError> {
+        let params = attach_params_for(config, client_kind, tty)?;
         let mut client = Self {
             reader: BufReader::new(stream.try_clone()?),
             writer: stream,
@@ -120,7 +131,12 @@ impl KernelClient {
     }
 }
 
+#[cfg(test)]
 fn attach_params(config: &Config) -> Result<Value, BridgeError> {
+    attach_params_for(config, "mcp", false)
+}
+
+fn attach_params_for(config: &Config, client_kind: &str, tty: bool) -> Result<Value, BridgeError> {
     if config.token.is_some() && config.local_auth == LocalAuthMode::LocalHuman {
         return Err(BridgeError::Protocol(
             "--token and --local-human are mutually exclusive authentication modes".into(),
@@ -129,7 +145,7 @@ fn attach_params(config: &Config) -> Result<Value, BridgeError> {
     let mut params = json!({
         "session": config.session,
         "token": config.token,
-        "client": {"kind":"mcp", "tty":false}
+        "client": {"kind":client_kind, "tty":tty}
     });
     if config.token.is_none() {
         params["local_auth"] = serde_json::to_value(config.local_auth)?;

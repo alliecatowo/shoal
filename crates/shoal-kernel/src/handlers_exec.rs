@@ -14,6 +14,8 @@ impl Kernel {
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
         let session = &attachment.session;
         let actor = attachment.principal.clone();
+        let interactive =
+            attachment.tty && attachment.connection_trust == ConnectionTrust::EmbeddedHuman;
         let params: ExecParams = decode(params)?;
         // site/content/internals/kernel-protocol.md: `background:true`, or a synchronous run that
         // exceeds `timeout_ms`, becomes a task ref + events channel —
@@ -47,6 +49,7 @@ impl Kernel {
                     state: "running",
                     finished_ns: None,
                     result_ref: None,
+                    exit_code: None,
                     error: None,
                     active_slot: Some(active_slot),
                 }),
@@ -60,6 +63,7 @@ impl Kernel {
             let kernel = self.clone();
             let mut task_attachment = attachment.clone();
             task_attachment.cancel_epoch = Some(cancel.clone());
+            let task_trust = task_attachment.connection_trust;
             let mut task_attached = Some(task_attachment);
             let task_channel = format!("task.{task_id}");
             kernel.events.publish(
@@ -88,6 +92,7 @@ impl Kernel {
                             client,
                             &mut task_attached,
                             None,
+                            task_trust,
                         )
                     }))
                     .unwrap_or_else(|_| Response {
@@ -113,6 +118,12 @@ impl Kernel {
                             };
                             inner.error = Some(error);
                         } else {
+                            inner.exit_code = response
+                                .result
+                                .as_ref()
+                                .and_then(|result| result.get("exit_code"))
+                                .and_then(Json::as_i64)
+                                .and_then(|code| i32::try_from(code).ok());
                             inner.result_ref = response
                                 .result
                                 .as_ref()
@@ -198,6 +209,7 @@ impl Kernel {
                 return encode(json!({"task":task_ref,"events":events_channel,"timed_out":true}));
             }
             let result_ref = inner.result_ref.clone();
+            let exit_code = inner.exit_code;
             let task_error = inner.error.clone();
             drop(inner);
             if let Some(error) = task_error {
@@ -214,22 +226,26 @@ impl Kernel {
                         r#ref: result_ref,
                         value: Some(wire),
                         render: Some(bound_render(render, &uri, !attachment.tty)),
+                        exit_code,
                     });
                 }
             }
             return encode(json!({"task":task_ref,"events":events_channel}));
         }
         if params.mode == "plan" {
-            let ast = shoal_syntax::parse(&params.src).map_err(|e| RpcError {
+            let mut evaluator = session.evaluator.lock().unwrap();
+            let ast = shoal_syntax::parse_with_ctx(
+                &params.src,
+                parse_ctx_for_kernel(evaluator.env(), interactive),
+            )
+            .map_err(|e| RpcError {
                 code: PARSE_ERROR,
                 message: e.msg,
                 data: Some(json!({"span":e.span,"hint":e.hint})),
             })?;
             let ast_json = serde_json::to_string(&ast).map_err(internal)?;
-            let plan = {
-                let mut evaluator = session.evaluator.lock().unwrap();
-                derive_plan(&mut evaluator, &ast, &ast_json)
-            };
+            let plan = derive_plan(&mut evaluator, &ast, &ast_json);
+            drop(evaluator);
             let source_hash = source_hash(&params.src);
             let plan_hash = bound_plan_hash(&params.src, &ast_json, &plan, &session.id, &actor);
             let plan_ref = self.allocate_plan_ref(&plan_hash);
@@ -310,13 +326,21 @@ impl Kernel {
                 data: None,
             });
         }
-        let ast = shoal_syntax::parse(&params.src).map_err(|e| RpcError {
+        // Parsing is session-stateful in a REPL: persisted value bindings,
+        // functions, `it`, and `out` determine command-vs-expression
+        // dispatch. Hold the evaluator lock from context construction through
+        // evaluation so an async worker cannot parse against a stale Env.
+        let mut evaluator = session.evaluator.lock().unwrap();
+        let ast = shoal_syntax::parse_with_ctx(
+            &params.src,
+            parse_ctx_for_kernel(evaluator.env(), interactive),
+        )
+        .map_err(|e| RpcError {
             code: PARSE_ERROR,
             message: e.msg,
             data: Some(json!({"span":e.span,"hint":e.hint})),
         })?;
         let ast_json = serde_json::to_string(&ast).map_err(internal)?;
-        let mut evaluator = session.evaluator.lock().unwrap();
         if let Some(cancel) = attachment.cancel_epoch.clone() {
             evaluator.set_cancellation_token(cancel);
         } else {
@@ -444,7 +468,12 @@ impl Kernel {
                 Verdict::Allow => {}
             }
         }
-        evaluator.set_interactive(false);
+        evaluator.set_interactive(interactive);
+        evaluator.set_echo_mode(if interactive {
+            EchoMode::All
+        } else {
+            EchoMode::Quiet
+        });
         let started = Instant::now();
         let opaque = run_plan.effects.iter().any(|e| matches!(e, Effect::Opaque));
         let mut journal_effects = run_plan
@@ -570,6 +599,12 @@ impl Kernel {
                 });
             }
         };
+        let exit_code = evaluator.take_exit();
+        // Keep the evaluator-visible REPL transcript (`it` and `out`) in
+        // lockstep with the kernel's addressable Session transcript. Failed
+        // evaluations intentionally do not reach this point, matching the
+        // standalone REPL's successful-value-only contract.
+        evaluator.record_transcript(&value);
         let value_ref = Ref::new("out", session.next_value.fetch_add(1, Ordering::Relaxed));
         session.insert_transcript(value_ref.clone(), value.clone());
         let render = shoal_value::render::render_block(&value, 80);
@@ -646,7 +681,25 @@ impl Kernel {
             r#ref: value_ref,
             value: Some(elide_wire_value(&value, &exec_uri, &exec_budget)),
             render: Some(bounded_render),
+            exit_code,
         })
+    }
+}
+
+fn parse_ctx_for_kernel(env: &shoal_value::Env, repl: bool) -> shoal_syntax::ParseCtx {
+    let mut value_bound = Vec::new();
+    let mut cmd_bound = Vec::new();
+    for name in env.visible_names() {
+        match env.get(&name) {
+            Some(value) if value.is_callable() => cmd_bound.push(name),
+            Some(_) => value_bound.push(name),
+            None => {}
+        }
+    }
+    shoal_syntax::ParseCtx {
+        repl,
+        value_bound,
+        cmd_bound,
     }
 }
 
@@ -665,6 +718,7 @@ mod tests {
             cancel_epoch: None,
             bearer: None,
             security_epoch: ATTACH_SECURITY_EPOCH,
+            connection_trust: ConnectionTrust::EmbeddedHuman,
         };
         (session, Some(attachment))
     }
@@ -729,6 +783,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn only_embedded_tty_exec_echoes_intermediate_expressions() {
+        fn run(kernel: &Arc<Kernel>, name: &str, trust: ConnectionTrust, tty: bool) -> Vec<Value> {
+            let (session, mut attached_state) = attached(kernel, name);
+            let attachment = attached_state.as_mut().unwrap();
+            attachment.connection_trust = trust;
+            attachment.tty = tty;
+            let captured: Arc<Mutex<Vec<Value>>> = Arc::default();
+            let sink = captured.clone();
+            session
+                .evaluator
+                .lock()
+                .unwrap()
+                .set_statement_sink(Box::new(move |value| {
+                    sink.lock().unwrap().push(value.clone());
+                }));
+            kernel
+                .handle_exec(json!({"src":"1 + 1\n42"}), 1, &mut attached_state)
+                .expect("multi-statement exec");
+            captured.lock().unwrap().clone()
+        }
+
+        let kernel = Kernel::new();
+        assert_eq!(
+            run(
+                &kernel,
+                "embedded-tty-echo",
+                ConnectionTrust::EmbeddedHuman,
+                true,
+            ),
+            vec![Value::Int(2)]
+        );
+        assert!(run(&kernel, "public-tty-quiet", ConnectionTrust::Public, true,).is_empty());
+        assert!(
+            run(
+                &kernel,
+                "embedded-headless-quiet",
+                ConnectionTrust::EmbeddedHuman,
+                false,
+            )
+            .is_empty()
+        );
+    }
+
     /// Regression test for the `evaluator.set_source(...)` call added above.
     ///
     /// `Kernel::new()` builds an EPHEMERAL, in-memory-only kernel with no
@@ -785,6 +883,7 @@ mod tests {
             cancel_epoch: None,
             bearer: None,
             security_epoch: ATTACH_SECURITY_EPOCH,
+            connection_trust: ConnectionTrust::EmbeddedHuman,
         });
 
         let marker_src = "let set_source_probe_9182 = 9182";

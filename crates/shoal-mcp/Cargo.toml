@@ -15,6 +15,7 @@ shoal-proto = { path = "../shoal-proto" }
 [dev-dependencies]
 libc = "0.2.186"
 shoal-kernel = { path = "../shoal-kernel" }
+shoal-leash = { path = "../shoal-leash" }
 shoal-proto = { path = "../shoal-proto" }
 tempfile = "3.27.0"
 

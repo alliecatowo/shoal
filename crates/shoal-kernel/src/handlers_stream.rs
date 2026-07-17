@@ -249,6 +249,7 @@ mod tests {
             cancel_epoch: None,
             bearer: None,
             security_epoch: ATTACH_SECURITY_EPOCH,
+            connection_trust: ConnectionTrust::EmbeddedHuman,
         };
         (session, Some(attachment))
     }

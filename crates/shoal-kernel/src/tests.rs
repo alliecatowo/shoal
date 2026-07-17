@@ -1,5 +1,9 @@
 use super::*;
 
+fn serve_embedded_test_stream(kernel: Arc<Kernel>, stream: UnixStream) -> io::Result<()> {
+    kernel.handle_stream_with_trust(stream, ConnectionTrust::EmbeddedHuman)
+}
+
 #[test]
 fn self_ack_env_is_an_explicit_boolean() {
     use std::ffi::OsStr;
@@ -62,7 +66,7 @@ fn read_deadline_evicts_silent_and_partial_unauthenticated_connections() {
         let worker_kernel = kernel.clone();
         let worker = std::thread::spawn(move || {
             let _slot = slot;
-            worker_kernel.handle_stream(server)
+            serve_embedded_test_stream(worker_kernel, server)
         });
         let mut byte = [0u8; 1];
         assert_eq!(client.read(&mut byte).unwrap(), 0, "connection was closed");
@@ -254,6 +258,7 @@ fn session_registry_evicts_idle_lru_but_never_active_leases() {
             state: "completed",
             finished_ns: Some(now_ns()),
             result_ref: None,
+            exit_code: None,
             error: None,
             active_slot: None,
         }),
@@ -329,6 +334,7 @@ fn task_refs_are_hidden_from_another_principal_with_the_same_session_name() {
             state: "completed",
             finished_ns: Some(now_ns()),
             result_ref: None,
+            exit_code: None,
             error: None,
             active_slot: None,
         }),
@@ -344,6 +350,7 @@ fn task_refs_are_hidden_from_another_principal_with_the_same_session_name() {
         cancel_epoch: None,
         bearer: None,
         security_epoch: ATTACH_SECURITY_EPOCH,
+        connection_trust: ConnectionTrust::EmbeddedHuman,
     });
 
     let listed = kernel.handle_task_list(&mut attached).unwrap();
@@ -367,6 +374,7 @@ fn pty_refs_are_hidden_from_another_principal_with_the_same_session_name() {
         cancel_epoch: None,
         bearer: None,
         security_epoch: ATTACH_SECURITY_EPOCH,
+        connection_trust: ConnectionTrust::EmbeddedHuman,
     });
     let mut beta_attached = Some(Attachment {
         session: beta,
@@ -376,6 +384,7 @@ fn pty_refs_are_hidden_from_another_principal_with_the_same_session_name() {
         cancel_epoch: None,
         bearer: None,
         security_epoch: ATTACH_SECURITY_EPOCH,
+        connection_trust: ConnectionTrust::EmbeddedHuman,
     });
 
     let opened = kernel
@@ -412,6 +421,7 @@ fn poisoned_task_record_is_rebuilt_as_terminal_failure() {
             state: "running",
             finished_ns: None,
             result_ref: Some(Ref::new("out", 1)),
+            exit_code: None,
             error: None,
             active_slot: None,
         }),
@@ -457,6 +467,7 @@ fn terminal_tasks_release_sessions_and_stale_records_are_reaped() {
             state: "completed",
             finished_ns: Some(now_ns().saturating_sub(TASK_RETENTION_NS + 1)),
             result_ref: None,
+            exit_code: None,
             error: None,
             active_slot: None,
         }),
@@ -612,6 +623,7 @@ fn concurrent_pty_close_has_exactly_one_teardown_owner() {
         cancel_epoch: None,
         bearer: None,
         security_epoch: ATTACH_SECURITY_EPOCH,
+        connection_trust: ConnectionTrust::EmbeddedHuman,
     };
     let mut opener = Some(attachment.clone());
     let opened = kernel
@@ -666,6 +678,7 @@ fn self_exited_pty_releases_active_and_session_leases_without_a_request() {
         cancel_epoch: None,
         bearer: None,
         security_epoch: ATTACH_SECURITY_EPOCH,
+        connection_trust: ConnectionTrust::EmbeddedHuman,
     });
     let opened = kernel
         .handle_pty_open(json!({"cmd":"sh", "args":["-c", "exit 0"]}), &mut attached)
@@ -782,7 +795,8 @@ fn unix_stream_session_roundtrip() {
     let mut reader = BufReader::new(client.try_clone().unwrap());
     let kernel = Kernel::new();
     let server_kernel = kernel.clone();
-    let thread = std::thread::spawn(move || server_kernel.handle_stream(server).unwrap());
+    let thread =
+        std::thread::spawn(move || serve_embedded_test_stream(server_kernel, server).unwrap());
     assert!(
         call(
             &mut client,
@@ -928,6 +942,141 @@ fn unix_stream_session_roundtrip() {
 }
 
 #[test]
+fn connection_provenance_controls_local_human_attachment() {
+    let public_kernel = Kernel::new();
+    let (mut public_client, public_server) = UnixStream::pair().unwrap();
+    let mut public_reader = BufReader::new(public_client.try_clone().unwrap());
+    let public_worker_kernel = public_kernel.clone();
+    let public_worker =
+        std::thread::spawn(move || public_worker_kernel.handle_stream(public_server).unwrap());
+    let denied = call(
+        &mut public_client,
+        &mut public_reader,
+        1,
+        "session.attach",
+        json!({"local_auth":"local-human","client":{"kind":"raw","tty":true}}),
+    );
+    assert_eq!(denied.error.unwrap().code, AUTH_FAILED);
+    drop(public_client);
+    drop(public_reader);
+    public_worker.join().unwrap();
+
+    let embedded_kernel = Kernel::new();
+    let (mut embedded_client, embedded_server) = UnixStream::pair().unwrap();
+    let mut embedded_reader = BufReader::new(embedded_client.try_clone().unwrap());
+    let worker_kernel = embedded_kernel.clone();
+    let embedded_worker = std::thread::spawn(move || {
+        serve_embedded_test_stream(worker_kernel, embedded_server).unwrap()
+    });
+    let attached = call(
+        &mut embedded_client,
+        &mut embedded_reader,
+        1,
+        "session.attach",
+        json!({"local_auth":"local-human","client":{"kind":"shoal-repl","tty":true}}),
+    )
+    .result
+    .expect("inherited endpoint proves embedded human presence");
+    assert_eq!(attached["connection_trust"], "embedded-human");
+    drop(embedded_client);
+    drop(embedded_reader);
+    embedded_worker.join().unwrap();
+}
+
+#[test]
+fn session_snapshot_tracks_exec_state_and_exit_codes() {
+    let kernel = Kernel::new();
+    let (mut client, mut reader, worker) = spawn(&kernel);
+    let attached = call(
+        &mut client,
+        &mut reader,
+        1,
+        "session.attach",
+        json!({"local_auth":"local-human","client":{"kind":"shoal-repl","tty":true}}),
+    );
+    assert!(attached.error.is_none(), "attach failed: {attached:?}");
+    let before = call(&mut client, &mut reader, 2, "session.snapshot", json!({}))
+        .result
+        .expect("initial snapshot");
+    assert!(before["bindings"].as_array().is_some());
+    assert!(before["jobs"].is_object());
+    assert!(before["reef"]["bindings"].as_array().is_some());
+
+    let changed = call(
+        &mut client,
+        &mut reader,
+        3,
+        "exec",
+        json!({"src":"let snapshot_local = 41\ncd /"}),
+    );
+    assert!(changed.error.is_none(), "state-changing exec: {changed:?}");
+    let after = call(&mut client, &mut reader, 4, "session.snapshot", json!({}))
+        .result
+        .expect("updated snapshot");
+    assert_ne!(before["cwd"], after["cwd"]);
+    let binding = after["bindings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|binding| binding["name"] == "snapshot_local")
+        .expect("new lexical binding appears in snapshot");
+    assert_eq!(binding["callable"], false);
+    assert_eq!(binding["type"], "int");
+
+    let first_value = call(&mut client, &mut reader, 5, "exec", json!({"src":"40 + 1"}))
+        .result
+        .expect("first transcript value");
+    assert_eq!(first_value["value"]["v"], 41);
+    let it_response = call(&mut client, &mut reader, 6, "exec", json!({"src":"it + 1"}));
+    assert!(
+        it_response.error.is_none(),
+        "it exec failed: {it_response:?}"
+    );
+    let it_value = it_response.result.unwrap();
+    assert_eq!(it_value["value"]["v"], 42);
+    let out_value = call(
+        &mut client,
+        &mut reader,
+        7,
+        "exec",
+        json!({"src":"out[-1]"}),
+    )
+    .result
+    .expect("out transcript advances after successful kernel exec");
+    assert_eq!(out_value["value"]["v"], 42);
+
+    let exited = call(&mut client, &mut reader, 8, "exec", json!({"src":"exit 7"}))
+        .result
+        .expect("exit is a host signal, not process termination");
+    assert_eq!(exited["exit_code"], 7);
+
+    let started = call(
+        &mut client,
+        &mut reader,
+        9,
+        "exec",
+        json!({"src":"exit 9","async":true}),
+    )
+    .result
+    .expect("background exit task starts");
+    let task = started["task"].clone();
+    let completed = call(
+        &mut client,
+        &mut reader,
+        10,
+        "task.await",
+        json!({"task":task}),
+    )
+    .result
+    .expect("background exit task completes");
+    assert_eq!(completed["state"], "completed");
+    assert_eq!(completed["exit_code"], 9);
+    drop(client);
+    drop(reader);
+    worker.join().unwrap();
+}
+
+#[test]
 fn leash_plan_approval_and_denial_flow() {
     for (opaque, expected, approvable) in
         [("ask", "approval_required", true), ("deny", "deny", false)]
@@ -944,7 +1093,8 @@ fn leash_plan_approval_and_denial_flow() {
         let (mut client, server) = UnixStream::pair().unwrap();
         let mut reader = BufReader::new(client.try_clone().unwrap());
         let server_kernel = kernel.clone();
-        let thread = std::thread::spawn(move || server_kernel.handle_stream(server).unwrap());
+        let thread =
+            std::thread::spawn(move || serve_embedded_test_stream(server_kernel, server).unwrap());
         call(
             &mut client,
             &mut reader,
@@ -1022,7 +1172,8 @@ fn approved_mode_is_not_a_caller_assertable_bypass() {
     let (mut client, server) = UnixStream::pair().unwrap();
     let mut reader = BufReader::new(client.try_clone().unwrap());
     let server_kernel = kernel.clone();
-    let thread = std::thread::spawn(move || server_kernel.handle_stream(server).unwrap());
+    let thread =
+        std::thread::spawn(move || serve_embedded_test_stream(server_kernel, server).unwrap());
     call(
         &mut client,
         &mut reader,
@@ -1126,7 +1277,8 @@ fn plan_refs_are_unique_per_source_and_apply_targets_the_right_one() {
     let mut reader = BufReader::new(client.try_clone().unwrap());
     let kernel = Kernel::new();
     let server_kernel = kernel.clone();
-    let thread = std::thread::spawn(move || server_kernel.handle_stream(server).unwrap());
+    let thread =
+        std::thread::spawn(move || serve_embedded_test_stream(server_kernel, server).unwrap());
     call(
         &mut client,
         &mut reader,
@@ -1228,7 +1380,8 @@ fn real_effects_not_opaque_for_pure_builtins() {
     let mut reader = BufReader::new(client.try_clone().unwrap());
     let kernel = Kernel::new();
     let server_kernel = kernel.clone();
-    let thread = std::thread::spawn(move || server_kernel.handle_stream(server).unwrap());
+    let thread =
+        std::thread::spawn(move || serve_embedded_test_stream(server_kernel, server).unwrap());
     call(
         &mut client,
         &mut reader,
@@ -1280,7 +1433,8 @@ fn value_get_path_traversal() {
     let mut reader = BufReader::new(client.try_clone().unwrap());
     let kernel = Kernel::new();
     let server_kernel = kernel.clone();
-    let thread = std::thread::spawn(move || server_kernel.handle_stream(server).unwrap());
+    let thread =
+        std::thread::spawn(move || serve_embedded_test_stream(server_kernel, server).unwrap());
     call(
         &mut client,
         &mut reader,
@@ -1345,7 +1499,8 @@ fn exec_position_stmt_raises_value_does_not() {
     let mut reader = BufReader::new(client.try_clone().unwrap());
     let kernel = Kernel::new();
     let server_kernel = kernel.clone();
-    let thread = std::thread::spawn(move || server_kernel.handle_stream(server).unwrap());
+    let thread =
+        std::thread::spawn(move || serve_embedded_test_stream(server_kernel, server).unwrap());
     call(
         &mut client,
         &mut reader,
@@ -1383,7 +1538,7 @@ fn async_tasks_survive_disconnect_and_cancel() {
     let (mut first, server) = UnixStream::pair().unwrap();
     let mut first_reader = BufReader::new(first.try_clone().unwrap());
     let k = kernel.clone();
-    let thread = std::thread::spawn(move || k.handle_stream(server).unwrap());
+    let thread = std::thread::spawn(move || serve_embedded_test_stream(k, server).unwrap());
     call(
         &mut first,
         &mut first_reader,
@@ -1406,7 +1561,7 @@ fn async_tasks_survive_disconnect_and_cancel() {
     let (mut second, server) = UnixStream::pair().unwrap();
     let mut reader = BufReader::new(second.try_clone().unwrap());
     let k = kernel.clone();
-    let thread = std::thread::spawn(move || k.handle_stream(server).unwrap());
+    let thread = std::thread::spawn(move || serve_embedded_test_stream(k, server).unwrap());
     call(
         &mut second,
         &mut reader,
@@ -1530,7 +1685,10 @@ fn durable_kernel_rejects_asserted_and_bearer_named_human_authority() {
         .unwrap();
     drop(tokens);
     let kernel = Kernel::open(dir.path()).unwrap();
-    let (mut client, mut reader, thread) = spawn(&kernel);
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let mut reader = BufReader::new(client.try_clone().unwrap());
+    let public_kernel = kernel.clone();
+    let thread = std::thread::spawn(move || public_kernel.handle_stream(server).unwrap());
 
     let asserted = call(
         &mut client,
@@ -1661,6 +1819,7 @@ fn stale_attachment_security_epoch_fails_closed_and_detaches() {
         cancel_epoch: None,
         bearer: None,
         security_epoch: ATTACH_SECURITY_EPOCH.saturating_sub(1),
+        connection_trust: ConnectionTrust::EmbeddedHuman,
     });
     let response = kernel.dispatch(
         Request {
@@ -1672,6 +1831,7 @@ fn stale_attachment_security_epoch_fails_closed_and_detaches() {
         77,
         &mut attached,
         None,
+        ConnectionTrust::EmbeddedHuman,
     );
     assert_eq!(response.error.unwrap().code, AUTH_FAILED);
     assert!(attached.is_none());
@@ -1803,7 +1963,7 @@ fn pty_list_is_session_scoped() {
     let (mut a, server) = UnixStream::pair().unwrap();
     let mut a_reader = BufReader::new(a.try_clone().unwrap());
     let ka = kernel.clone();
-    let ta = std::thread::spawn(move || ka.handle_stream(server).unwrap());
+    let ta = std::thread::spawn(move || serve_embedded_test_stream(ka, server).unwrap());
     call(
         &mut a,
         &mut a_reader,
@@ -1833,7 +1993,7 @@ fn pty_list_is_session_scoped() {
     let (mut b, server) = UnixStream::pair().unwrap();
     let mut b_reader = BufReader::new(b.try_clone().unwrap());
     let kb = kernel.clone();
-    let tb = std::thread::spawn(move || kb.handle_stream(server).unwrap());
+    let tb = std::thread::spawn(move || serve_embedded_test_stream(kb, server).unwrap());
     call(
         &mut b,
         &mut b_reader,
@@ -1905,7 +2065,8 @@ fn big_table_exec_elides_then_drills_by_path() {
     let mut reader = BufReader::new(client.try_clone().unwrap());
     let kernel = Kernel::new();
     let server_kernel = kernel.clone();
-    let thread = std::thread::spawn(move || server_kernel.handle_stream(server).unwrap());
+    let thread =
+        std::thread::spawn(move || serve_embedded_test_stream(server_kernel, server).unwrap());
     call(
         &mut client,
         &mut reader,
@@ -1979,7 +2140,8 @@ fn small_value_is_not_elided() {
     let mut reader = BufReader::new(client.try_clone().unwrap());
     let kernel = Kernel::new();
     let server_kernel = kernel.clone();
-    let thread = std::thread::spawn(move || server_kernel.handle_stream(server).unwrap());
+    let thread =
+        std::thread::spawn(move || serve_embedded_test_stream(server_kernel, server).unwrap());
     call(
         &mut client,
         &mut reader,
@@ -2059,7 +2221,8 @@ fn value_get_elide_param_tightens_default_row_threshold() {
     let mut reader = BufReader::new(client.try_clone().unwrap());
     let kernel = Kernel::new();
     let server_kernel = kernel.clone();
-    let thread = std::thread::spawn(move || server_kernel.handle_stream(server).unwrap());
+    let thread =
+        std::thread::spawn(move || serve_embedded_test_stream(server_kernel, server).unwrap());
     call(
         &mut client,
         &mut reader,
@@ -2296,7 +2459,7 @@ fn spawn(
     let (client, server) = UnixStream::pair().unwrap();
     let reader = BufReader::new(client.try_clone().unwrap());
     let k = kernel.clone();
-    let thread = std::thread::spawn(move || k.handle_stream(server).unwrap());
+    let thread = std::thread::spawn(move || serve_embedded_test_stream(k, server).unwrap());
     (client, reader, thread)
 }
 
@@ -4494,7 +4657,8 @@ fn real_command_exec_outcome_carries_a_span_on_the_wire() {
     let mut reader = BufReader::new(client.try_clone().unwrap());
     let kernel = Kernel::new();
     let server_kernel = kernel.clone();
-    let thread = std::thread::spawn(move || server_kernel.handle_stream(server).unwrap());
+    let thread =
+        std::thread::spawn(move || serve_embedded_test_stream(server_kernel, server).unwrap());
     call(
         &mut client,
         &mut reader,

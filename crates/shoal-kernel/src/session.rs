@@ -63,6 +63,8 @@ pub(crate) struct Attachment {
     /// Keeping it on the live attachment makes future epoch bumps fail closed
     /// instead of silently carrying old authority forward.
     pub(crate) security_epoch: u32,
+    /// Immutable server-selected provenance for this connection.
+    pub(crate) connection_trust: ConnectionTrust,
 }
 
 pub(crate) struct Session {
@@ -388,11 +390,58 @@ impl Kernel {
         )
     }
 
+    pub(crate) fn handle_session_snapshot(
+        &self,
+        attached: &Option<Attachment>,
+    ) -> Result<Json, RpcError> {
+        let attachment = attached.as_ref().ok_or_else(not_attached)?;
+        let mut evaluator = attachment.session.evaluator.lock().unwrap();
+        let mut names = evaluator.env().visible_names();
+        names.sort();
+        let bindings = names
+            .into_iter()
+            .filter_map(|name| {
+                evaluator.env().get(&name).map(|value| {
+                    json!({
+                        "name": name,
+                        "callable": value.is_callable(),
+                        "type": value.type_name(),
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        let jobs = evaluator.jobs_snapshot();
+        let last_value = wire_value(evaluator.it());
+        let cwd = WirePath::encode(evaluator.cwd().as_os_str());
+        let reef = evaluator.prompt_reef_snapshot();
+        Ok(json!({
+            "cwd": cwd,
+            "bindings": bindings,
+            "jobs": {
+                "running": jobs.running,
+                "suspended": jobs.suspended,
+                "total": jobs.total,
+            },
+            "reef": {
+                "active_scope": reef.active_scope,
+                "bindings": reef.bindings.into_iter().map(|binding| json!({
+                    "tool": binding.tool,
+                    "version": binding.version,
+                    "provider": binding.provider,
+                    "scope": binding.scope,
+                    "constrained": binding.constrained,
+                })).collect::<Vec<_>>(),
+            },
+            "last_value": last_value,
+        }))
+    }
+
     pub(crate) fn handle_session_attach(
         self: &Arc<Self>,
         params: Json,
         client: u64,
         attached: &mut Option<Attachment>,
+        connection_trust: ConnectionTrust,
     ) -> Result<Json, RpcError> {
         let local_auth = match params.get("local_auth") {
             Some(value) => Some(
@@ -417,7 +466,7 @@ impl Kernel {
         }
         if params.token.is_none()
             && local_auth == Some(LocalAuthMode::LocalHuman)
-            && !self.allow_unauthenticated_local_human
+            && connection_trust != ConnectionTrust::EmbeddedHuman
         {
             return Err(RpcError {
                 code: AUTH_FAILED,
@@ -425,6 +474,7 @@ impl Kernel {
                 data: Some(json!({
                     "auth_mode": "local-human",
                     "human_presence_supported": false,
+                    "connection_trust": connection_trust.as_str(),
                     "machine_admin_profiles": ["supervisor", "plan.approve"],
                 })),
             });
@@ -502,6 +552,7 @@ impl Kernel {
             cancel_epoch: None,
             bearer,
             security_epoch: ATTACH_SECURITY_EPOCH,
+            connection_trust,
         });
         // site/content/internals/language-conformance-contract.md tier honesty: report the REAL strongest OS backend
         // available on this host (Landlock → A, Seatbelt → C, else
@@ -533,6 +584,10 @@ impl Kernel {
             Json::String(PRINCIPAL_SESSION_ISOLATION.into()),
         );
         object.insert("security_epoch".into(), Json::from(ATTACH_SECURITY_EPOCH));
+        object.insert(
+            "connection_trust".into(),
+            Json::String(connection_trust.as_str().into()),
+        );
         Ok(result)
     }
 
