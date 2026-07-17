@@ -213,8 +213,9 @@ pub fn feed_bytes(v: &Value) -> Result<Vec<u8>, ErrorVal> {
         // stream → site/content/internals/language-conformance-contract.md promises *incremental* feeding as items arrive, which
         // needs evaluator/exec support (a live child stdin pipe); an honest
         // error until that lands rather than a buffering fake.
-        Value::Stream(_) => Err(ErrorVal::type_error(
-            "feeding a stream to a command's stdin is not implemented yet",
+        Value::Stream(_) => Err(ErrorVal::new(
+            "stream_feed_unsupported",
+            "stream feeding requires an incremental child-stdin pump, which this runtime does not provide",
         )
         .with_hint("collect a bounded stream first: stream.collect().feed(cmd)")),
         // Deliberately never feedable (site/content/internals/values-streams-execution.md) → `feed_error`.
@@ -502,11 +503,16 @@ mod tests {
     }
 
     #[test]
-    fn feed_bytes_stream_is_unimplemented_type_error() {
+    fn feed_bytes_stream_is_explicitly_unsupported_and_non_consuming() {
         let s = StreamVal::from_iter("int", (0..2).map(|i| Ok(Value::Int(i))));
-        let e = feed_bytes(&Value::Stream(s)).unwrap_err();
-        assert_eq!(e.code, "type_error");
+        let e = feed_bytes(&Value::Stream(s.clone())).unwrap_err();
+        assert_eq!(e.code, "stream_feed_unsupported");
+        assert!(e.msg.contains("incremental child-stdin pump"));
         assert!(e.hint.unwrap().contains("collect"));
+        assert!(
+            s.take_upstream().is_ok(),
+            "rejecting feed must not consume the stream"
+        );
     }
 
     #[test]

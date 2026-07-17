@@ -219,5 +219,5 @@ name = "feed-stream-is-unimplemented-with-collect-hint"
 # site/content/internals/language-conformance-contract.md promises incremental stream feeding; that needs exec support, so the
 # honest state is an error that names the workaround.
 src = "[1, 2].stream().feed(cat)"
-error = "type_error"
+error = "stream_feed_unsupported"
 error_contains = "collect"

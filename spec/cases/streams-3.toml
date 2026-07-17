@@ -1,12 +1,12 @@
-# Further stream hardening beyond streams.toml/streams-more.toml:
-# `.buffer(0)` staying an identity pass-through (a zero-sized buffer still
-# forwards every element), and `.window` on an empty source producing no
-# windows at all rather than an error.
+# Further stream hardening beyond streams.toml/streams-more.toml: `.buffer`
+# rejects the decoupling contract the current pull runtime cannot implement,
+# and `.window` on an empty source produces no windows rather than an error.
 
 [[case]]
-name = "stream3-buffer-zero-is-identity"
+name = "stream3-buffer-zero-is-explicitly-unsupported"
 src = "[1, 2].stream().buffer(0).collect()"
-value = "[1, 2]"
+error = "stream_buffer_unsupported"
+error_contains = "cannot decouple"
 
 [[case]]
 name = "stream3-window-on-empty-source-is-empty"

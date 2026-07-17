@@ -142,10 +142,18 @@ fn dedupe_and_distinct() {
         rendered("[1,1,2,2,2,3,1].stream().distinct().collect()"),
         "[1, 2, 3]"
     );
+    assert_eq!(
+        rendered("[1,1.0,[2],[2.0]].stream().distinct().collect()"),
+        "[1, [2]]",
+        "distinct must preserve mixed numeric equality recursively"
+    );
 }
 
 #[test]
 fn flat_map_over_lists() {
+    // `flat_map` is deliberately concat-map: each expansion is exhausted
+    // before the next outer item is pulled. It does not claim concurrent
+    // interleaving of child streams.
     assert_eq!(
         rendered("[1,2,3].stream().flat_map(x => [x, x * 10]).collect()"),
         "[1, 10, 2, 20, 3, 30]"
@@ -161,10 +169,10 @@ fn enumerate_pairs() {
 }
 
 #[test]
-fn buffer_is_identity() {
+fn buffer_rejects_the_unimplemented_decoupling_contract() {
     assert_eq!(
-        rendered("[1,2,3].stream().buffer(2).collect()"),
-        "[1, 2, 3]"
+        run_err("[1,2,3].stream().buffer(2).collect()"),
+        "stream_buffer_unsupported"
     );
 }
 
@@ -178,10 +186,11 @@ fn zip_pairs_positionally() {
 
 #[test]
 fn merge_interleaves_finite_streams() {
-    // Two in-memory sources are both immediately ready; merge drains them
-    // (order documented as arrival order — for finite in-memory, pull order).
-    let v = run("[1,2].stream().merge([3,4].stream()).sum()");
-    assert_eq!(v, Value::Int(10));
+    // Both sides are immediately ready, so round-robin preference is exact.
+    assert_eq!(
+        rendered("[1,2].stream().merge([3,4].stream()).collect()"),
+        "[1, 3, 2, 4]"
+    );
 }
 
 #[test]

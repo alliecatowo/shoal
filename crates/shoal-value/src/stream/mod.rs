@@ -184,7 +184,7 @@ impl StreamVal {
     pub fn flat_map(self, f: Value) -> VResult<StreamVal> {
         let b = self.bounded;
         self.wrap("value", b, |up| {
-            Box::new(ops::FlatMap {
+            Box::new(ops::FlatMapSequential {
                 up,
                 f,
                 sub: None,
@@ -223,7 +223,7 @@ impl StreamVal {
         self.wrap(l, b, |up| {
             Box::new(ops::Distinct {
                 up,
-                seen: Vec::new(),
+                seen: std::collections::HashMap::new(),
             })
         })
     }
@@ -269,10 +269,16 @@ impl StreamVal {
         })
     }
     pub fn buffer(self, _n: usize) -> VResult<StreamVal> {
-        // Pure pacing decoupler: in a synchronous pull model it has no observable
-        // effect on the item sequence, so it is an identity stage. It exists so
-        // `.buffer(n)` type-checks and reads intentionally in a chain.
-        Ok(self)
+        // `Upstream::pull` needs the sink's borrowed evaluator context. A real
+        // decoupling buffer would have to drive that context on a producer
+        // thread, which the current ownership model deliberately cannot do.
+        // Reject the operation instead of preserving the old identity-stage
+        // lie or introducing synchronous lookahead under a concurrency name.
+        Err(ErrorVal::new(
+            "stream_buffer_unsupported",
+            "stream.buffer() cannot decouple producers in the current pull runtime",
+        )
+        .with_hint("use channel().events() for producer/consumer decoupling"))
     }
     pub fn enumerate(self) -> VResult<StreamVal> {
         let b = self.bounded;
@@ -287,6 +293,7 @@ impl StreamVal {
                 b: other_up,
                 a_done: false,
                 b_done: false,
+                prefer_a: true,
             })
         })
     }
@@ -295,7 +302,14 @@ impl StreamVal {
         let bounded = self.bounded || other.bounded;
         let other_up = other.take_upstream()?;
         self.wrap("list", bounded, |up| {
-            Box::new(ops::Zip { a: up, b: other_up })
+            Box::new(ops::Zip {
+                a: up,
+                b: other_up,
+                pending_a: None,
+                pending_b: None,
+                wait_a: true,
+                done: false,
+            })
         })
     }
 
@@ -448,5 +462,16 @@ mod tests {
         let s = endless_marked(1);
         drain(&s);
         assert_eq!(s.tee(2).unwrap_err().code, "stream_consumed");
+    }
+
+    #[test]
+    fn unsupported_buffer_does_not_consume_its_source() {
+        let s = StreamVal::from_iter("int", (0..2).map(|i| Ok(Value::Int(i))));
+        let err = s.clone().buffer(2).unwrap_err();
+        assert_eq!(err.code, "stream_buffer_unsupported");
+        assert!(
+            s.take_upstream().is_ok(),
+            "rejecting buffer must not pull or consume the source"
+        );
     }
 }
