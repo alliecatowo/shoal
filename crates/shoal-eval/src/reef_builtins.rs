@@ -227,7 +227,7 @@ impl Evaluator {
         // still seen, unlike the chain which skips it); then the nearest ancestor
         // Reef scope; then a fresh manifest in cwd.
         let local = self.cwd.join(".reef.toml");
-        let manifest_path = if self.fs.is_file(&local) {
+        let manifest_path = if self.host.fs.is_file(&local) {
             local
         } else {
             let chain = self.reef_chain_snapshot();
@@ -238,7 +238,7 @@ impl Evaluator {
                 .map(|s| s.source.clone())
                 .unwrap_or(local)
         };
-        let mut doc = match self.fs.read_to_string(&manifest_path) {
+        let mut doc = match self.host.fs.read_to_string(&manifest_path) {
             Ok(text) => text.parse::<toml::Table>().map_err(|e| {
                 ErrorVal::new(
                     "reef_provider",
@@ -257,7 +257,8 @@ impl Evaluator {
             ));
         };
         tools.insert(tool.clone(), toml::Value::String(ver.clone()));
-        self.fs
+        self.host
+            .fs
             .write(&manifest_path, doc.to_string().as_bytes())
             .map_err(|e| ErrorVal::new("reef_provider", format!("writing manifest: {e}")))?;
 

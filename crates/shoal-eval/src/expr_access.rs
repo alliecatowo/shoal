@@ -87,7 +87,7 @@ impl Evaluator {
             // `1h.from_now` resolve against the live wall clock into a datetime.
             Value::Duration(ns) => match name {
                 "ago" | "from_now" => {
-                    let base = crate::helpers::now_zoned(self.clock.as_ref());
+                    let base = crate::helpers::now_zoned(self.host.clock.as_ref());
                     let signed = if name == "ago" { -*ns } else { *ns };
                     let span = jiff::SignedDuration::from_nanos(signed);
                     base.checked_add(span)
@@ -334,14 +334,16 @@ impl Evaluator {
         let utf8err = || ErrorVal::new("utf8_error", format!("{}: not valid UTF-8", abs.display()));
         match name {
             "read" => {
-                let bytes = self.fs.read(&abs).map_err(ioerr)?;
+                let bytes = self.host.fs.read(&abs).map_err(ioerr)?;
                 String::from_utf8(bytes)
                     .map(Value::Str)
                     .map_err(|_| utf8err())
             }
-            "read_bytes" => Ok(Value::Bytes(Arc::new(self.fs.read(&abs).map_err(ioerr)?))),
+            "read_bytes" => Ok(Value::Bytes(Arc::new(
+                self.host.fs.read(&abs).map_err(ioerr)?,
+            ))),
             "lines" => {
-                let bytes = self.fs.read(&abs).map_err(ioerr)?;
+                let bytes = self.host.fs.read(&abs).map_err(ioerr)?;
                 let s = String::from_utf8(bytes).map_err(|_| utf8err())?;
                 Ok(Value::List(
                     s.lines()
@@ -349,16 +351,26 @@ impl Evaluator {
                         .collect(),
                 ))
             }
-            "exists" => Ok(Value::Bool(self.fs.metadata(&abs).is_ok())),
+            "exists" => Ok(Value::Bool(self.host.fs.metadata(&abs).is_ok())),
             "is_dir" => Ok(Value::Bool(
-                self.fs.metadata(&abs).map(|m| m.is_dir()).unwrap_or(false),
+                self.host
+                    .fs
+                    .metadata(&abs)
+                    .map(|m| m.is_dir())
+                    .unwrap_or(false),
             )),
             "is_file" => Ok(Value::Bool(
-                self.fs.metadata(&abs).map(|m| m.is_file()).unwrap_or(false),
+                self.host
+                    .fs
+                    .metadata(&abs)
+                    .map(|m| m.is_file())
+                    .unwrap_or(false),
             )),
-            "size" => Ok(Value::Size(self.fs.metadata(&abs).map_err(ioerr)?.len())),
+            "size" => Ok(Value::Size(
+                self.host.fs.metadata(&abs).map_err(ioerr)?.len(),
+            )),
             "modified" => {
-                let m = self.fs.metadata(&abs).map_err(ioerr)?;
+                let m = self.host.fs.metadata(&abs).map_err(ioerr)?;
                 Ok(m.modified()
                     .ok()
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())

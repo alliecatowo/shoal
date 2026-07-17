@@ -139,10 +139,10 @@ impl Evaluator {
     ) -> VResult<Value> {
         match ext {
             Some("shl") | None => {
-                let src = self
-                    .fs
-                    .read_to_string(path)
-                    .map_err(|e| ErrorVal::new("io_error", format!("cannot read script: {e}")))?;
+                let src =
+                    self.host.fs.read_to_string(path).map_err(|e| {
+                        ErrorVal::new("io_error", format!("cannot read script: {e}"))
+                    })?;
                 let program = shoal_syntax::parse(&src)
                     .map_err(|e| ErrorVal::new("parse_error", e.to_string()))?;
                 // A `.shl` script is a separate program (see
@@ -227,7 +227,7 @@ impl Evaluator {
     /// prefix. `#!/usr/bin/env <tool>` resolves to `<tool>` (env-style). `None`
     /// when the file is unreadable or has no shebang.
     pub(crate) fn shebang_argv(&self, path: &Path) -> Option<Vec<OsString>> {
-        let content = self.fs.read_to_string(path).ok()?;
+        let content = self.host.fs.read_to_string(path).ok()?;
         let first = content.lines().next()?;
         let rest = first.strip_prefix("#!")?.trim();
         let mut words = rest.split_whitespace();

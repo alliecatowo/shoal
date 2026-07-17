@@ -44,21 +44,12 @@ pub(crate) enum ChildScope {
 /// fields are cheap to clone (`Arc` handles or small owned data) and `Send`, so
 /// the context can be moved into a worker thread and built there.
 pub(crate) struct ChildContext {
+    host: Arc<host_services::HostServices>,
     session: session_ctx::SessionCtx,
     reef: reef_state::ReefState,
     cwd: PathBuf,
     env: Env,
     process_env: Vec<(OsString, OsString)>,
-    adapters: AdapterCatalog,
-    bus: Arc<channels::EventBus>,
-    fs: Arc<dyn Fs>,
-    exec: Arc<dyn Exec>,
-    clock: Arc<dyn Clock>,
-    opener: Arc<dyn Opener>,
-    secrets: Arc<dyn SecretPort>,
-    config: Arc<dyn ConfigPort>,
-    reef_resolver: Option<Arc<shoal_reef::Resolver>>,
-    reef_user_manifest: Option<PathBuf>,
 }
 
 impl Evaluator {
@@ -68,21 +59,12 @@ impl Evaluator {
     /// may move it into a worker thread and call [`ChildContext::build`] there.
     pub(crate) fn child_context(&self) -> ChildContext {
         ChildContext {
+            host: self.host.clone(),
             session: self.session.for_child(),
             reef: self.reef.clone(),
             cwd: self.cwd.clone(),
             env: self.env.clone(),
             process_env: self.process_env.clone(),
-            adapters: self.adapters.clone(),
-            bus: self.bus.clone(),
-            fs: self.fs.clone(),
-            exec: self.exec.clone(),
-            clock: self.clock.clone(),
-            opener: self.opener.clone(),
-            secrets: self.secrets.clone(),
-            config: self.config.clone(),
-            reef_resolver: self.reef_resolver.clone(),
-            reef_user_manifest: self.reef_user_manifest.clone(),
         }
     }
 }
@@ -100,24 +82,16 @@ impl ChildContext {
     /// any captured field that is not re-applied to the child.
     pub(crate) fn build(self, scope: ChildScope, cancel: CancelToken) -> Evaluator {
         let ChildContext {
+            host,
             session,
             reef,
             cwd,
             env,
             process_env,
-            adapters,
-            bus,
-            fs,
-            exec,
-            clock,
-            opener,
-            secrets,
-            config,
-            reef_resolver,
-            reef_user_manifest,
         } = self;
 
         let mut child = Evaluator::new(cwd);
+        child.host = host;
         // Session identity, policy, echo mode, and the deliberate clearing of
         // terminal/root-only handles arrive as one required typed value.
         child.session = session;
@@ -131,20 +105,8 @@ impl ChildContext {
         }
         child.cancel = cancel;
         child.process_env = process_env;
-        child.adapters = adapters;
-        child.bus = bus;
-        // Effect ports (Fs/Exec/Clock/Opener/Secret/Config): a child must see
-        // the same fakes/host adapters, or in-process effects diverge.
-        child.fs = fs;
-        child.exec = exec;
-        child.clock = clock;
-        child.opener = opener;
-        child.secrets = secrets;
-        child.config = config;
         // Reef scope/resolver/lock/overrides: constrained tool resolution must
         // resolve identically inside a child, or a pinned tool diverges.
-        child.reef_resolver = reef_resolver;
-        child.reef_user_manifest = reef_user_manifest;
 
         // --- Deliberately NOT inherited (fresh state per child) ------------
         // journal handle:  the current `Journal` is an owned, single-connection
@@ -197,7 +159,7 @@ mod tests {
             resolved_at: "2026-07-16T00:00:00Z".into(),
         });
         parent.reef.lock_path = Some(dir.path().join("reef.lock"));
-        parent.reef_user_manifest = Some(dir.path().join("shoal.toml"));
+        parent.set_reef_user_manifest(dir.path().join("shoal.toml"));
         let scope = ScopeEntry {
             kind: ManifestKind::Reef,
             source: dir.path().join(".reef.toml"),
@@ -216,12 +178,16 @@ mod tests {
             vec![dir.path().join("bin")],
             vec![],
         ))]));
-        parent.reef_resolver = Some(resolver.clone());
+        parent.set_reef_resolver(resolver.clone());
 
         let child = parent
             .child_context()
             .build(ChildScope::Fresh, CancelToken::new());
 
+        assert!(
+            Arc::ptr_eq(&child.host, &parent.host),
+            "a child inherits one immutable HostServices snapshot"
+        );
         assert_eq!(child.session.session_id, "session-a");
         assert_eq!(child.session.principal, "agent:auditor");
         assert!(child.session.leash.is_some());
@@ -237,14 +203,17 @@ mod tests {
         );
         assert_eq!(child.reef.lock, parent.reef.lock);
         assert_eq!(child.reef.lock_path, parent.reef.lock_path);
-        assert_eq!(child.reef_user_manifest, parent.reef_user_manifest);
+        assert_eq!(
+            child.host.reef_user_manifest,
+            parent.host.reef_user_manifest
+        );
         let (_, child_chain) = child.reef.chain.as_ref().unwrap();
         assert_eq!(child_chain.scopes.len(), 1);
         assert_eq!(child_chain.scopes[0].source, scope.source);
         assert_eq!(child.reef.overrides.len(), 1);
         assert_eq!(child.reef.overrides[0].source, scope.source);
         assert!(Arc::ptr_eq(
-            child.reef_resolver.as_ref().unwrap(),
+            child.host.reef_resolver.get().unwrap(),
             &resolver
         ));
     }

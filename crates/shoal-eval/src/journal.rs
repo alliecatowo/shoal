@@ -108,7 +108,7 @@ impl Evaluator {
         let record = EntryRecord {
             session: self.session.session_id.clone(),
             principal: self.session.principal.clone(),
-            ts_ns: self.clock.now_ns(),
+            ts_ns: self.host.clock.now_ns(),
             cwd: self.cwd.as_os_str().as_bytes().to_vec(),
             src,
             ast_json,
@@ -364,7 +364,7 @@ impl Evaluator {
     /// the user's file with corrupt, partial content. Refusing the snapshot
     /// leaves the op non-reversible — the correct, honest failure.
     fn snapshot_prior(&self, entry: i64, path: &Path) -> Option<String> {
-        let bytes = self.fs.read(path).ok()?;
+        let bytes = self.host.fs.read(path).ok()?;
         let (hash, meta) = self
             .session
             .journal
