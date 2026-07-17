@@ -11,7 +11,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 tempfile = "3.27.0"
 zstd = "0.13.3"
 [dev-dependencies]
-criterion="0.7"
+criterion="0.8"
 [[bench]]
 name="journal"
 harness=false
