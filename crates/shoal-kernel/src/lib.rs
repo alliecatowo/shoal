@@ -8,10 +8,12 @@ mod handlers_session;
 mod handlers_task;
 mod handlers_value;
 mod session;
+mod state;
 mod wire;
 
 use eventbus::*;
 use session::*;
+use state::*;
 use wire::*;
 
 use serde_json::{Value as Json, json};
@@ -38,13 +40,10 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub struct Kernel {
     sessions: Mutex<HashMap<SessionKey, Arc<Session>>>,
-    next_client: AtomicU64,
-    active_connections: AtomicUsize,
-    max_connections: AtomicUsize,
+    connections: ConnectionRegistry,
     max_tasks_per_session: AtomicUsize,
     max_ptys_per_session: AtomicUsize,
     max_subscriptions_per_session: AtomicUsize,
-    frame_read_timeout_ms: AtomicU64,
     journal: Mutex<Journal>,
     /// The per-user state dir this kernel's own `journal` (above) was opened
     /// against, if any (`None` for the ephemeral in-memory kernels used by
@@ -406,13 +405,13 @@ impl Kernel {
         let limits = Limits::default();
         Arc::new(Self {
             sessions: Mutex::new(HashMap::new()),
-            next_client: AtomicU64::new(1),
-            active_connections: AtomicUsize::new(0),
-            max_connections: AtomicUsize::new(limits.max_connections),
+            connections: ConnectionRegistry::new(
+                limits.max_connections,
+                limits.frame_read_timeout_ms,
+            ),
             max_tasks_per_session: AtomicUsize::new(limits.max_tasks_per_session),
             max_ptys_per_session: AtomicUsize::new(limits.max_ptys_per_session),
             max_subscriptions_per_session: AtomicUsize::new(limits.max_subscriptions_per_session),
-            frame_read_timeout_ms: AtomicU64::new(limits.frame_read_timeout_ms),
             journal: Mutex::new(Journal::in_memory().expect("in-memory journal")),
             state_dir: None,
             policy: permissive_policy(),
@@ -447,13 +446,13 @@ impl Kernel {
         events.seed_from_journal(&journal);
         Ok(Arc::new(Self {
             sessions: Mutex::new(HashMap::new()),
-            next_client: AtomicU64::new(1),
-            active_connections: AtomicUsize::new(0),
-            max_connections: AtomicUsize::new(limits.max_connections),
+            connections: ConnectionRegistry::new(
+                limits.max_connections,
+                limits.frame_read_timeout_ms,
+            ),
             max_tasks_per_session: AtomicUsize::new(limits.max_tasks_per_session),
             max_ptys_per_session: AtomicUsize::new(limits.max_ptys_per_session),
             max_subscriptions_per_session: AtomicUsize::new(limits.max_subscriptions_per_session),
-            frame_read_timeout_ms: AtomicU64::new(limits.frame_read_timeout_ms),
             journal: Mutex::new(journal),
             state_dir: Some(state_dir.to_path_buf()),
             policy: permissive_policy(),
@@ -485,13 +484,13 @@ impl Kernel {
         events.seed_from_journal(&journal);
         Ok(Arc::new(Self {
             sessions: Mutex::new(HashMap::new()),
-            next_client: AtomicU64::new(1),
-            active_connections: AtomicUsize::new(0),
-            max_connections: AtomicUsize::new(limits.max_connections),
+            connections: ConnectionRegistry::new(
+                limits.max_connections,
+                limits.frame_read_timeout_ms,
+            ),
             max_tasks_per_session: AtomicUsize::new(limits.max_tasks_per_session),
             max_ptys_per_session: AtomicUsize::new(limits.max_ptys_per_session),
             max_subscriptions_per_session: AtomicUsize::new(limits.max_subscriptions_per_session),
-            frame_read_timeout_ms: AtomicU64::new(limits.frame_read_timeout_ms),
             journal: Mutex::new(journal),
             state_dir: Some(state_dir.to_path_buf()),
             policy,
@@ -515,13 +514,13 @@ impl Kernel {
         let limits = Limits::default();
         Arc::new(Self {
             sessions: Mutex::new(HashMap::new()),
-            next_client: AtomicU64::new(1),
-            active_connections: AtomicUsize::new(0),
-            max_connections: AtomicUsize::new(limits.max_connections),
+            connections: ConnectionRegistry::new(
+                limits.max_connections,
+                limits.frame_read_timeout_ms,
+            ),
             max_tasks_per_session: AtomicUsize::new(limits.max_tasks_per_session),
             max_ptys_per_session: AtomicUsize::new(limits.max_ptys_per_session),
             max_subscriptions_per_session: AtomicUsize::new(limits.max_subscriptions_per_session),
-            frame_read_timeout_ms: AtomicU64::new(limits.frame_read_timeout_ms),
             journal: Mutex::new(Journal::in_memory().expect("in-memory journal")),
             state_dir: None,
             policy,
@@ -542,26 +541,18 @@ impl Kernel {
     }
 
     pub fn configure_limits(&self, limits: Limits) {
-        self.max_connections
-            .store(limits.max_connections, Ordering::Relaxed);
+        self.connections
+            .configure(limits.max_connections, limits.frame_read_timeout_ms);
         self.max_tasks_per_session
             .store(limits.max_tasks_per_session, Ordering::Relaxed);
         self.max_ptys_per_session
             .store(limits.max_ptys_per_session, Ordering::Relaxed);
         self.max_subscriptions_per_session
             .store(limits.max_subscriptions_per_session, Ordering::Relaxed);
-        self.frame_read_timeout_ms
-            .store(limits.frame_read_timeout_ms, Ordering::Relaxed);
     }
 
-    fn reserve_connection_slot(self: &Arc<Self>) -> Result<ConnectionSlot, ()> {
-        let max = self.max_connections.load(Ordering::Relaxed);
-        self.active_connections
-            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |current| {
-                (current < max).then_some(current + 1)
-            })
-            .map(|_| ConnectionSlot(self.clone()))
-            .map_err(|_| ())
+    fn reserve_connection_slot(&self) -> Result<ConnectionPermit, ()> {
+        self.connections.reserve()
     }
 
     pub fn serve(self: Arc<Self>, path: impl AsRef<Path>) -> io::Result<()> {
@@ -598,7 +589,7 @@ impl Kernel {
                     let slot = match kernel.reserve_connection_slot() {
                         Ok(slot) => slot,
                         Err(()) => {
-                            let max = kernel.max_connections.load(Ordering::Relaxed);
+                            let max = kernel.connections.max();
                             let _ = reject_connection_over_quota(stream, max);
                             continue;
                         }
@@ -620,13 +611,13 @@ impl Kernel {
     }
 
     pub fn handle_stream(self: &Arc<Self>, stream: UnixStream) -> io::Result<()> {
-        let client = self.next_client.fetch_add(1, Ordering::Relaxed);
+        let client = self.connections.next_client();
         let mut reader = BufReader::new(stream.try_clone()?);
         let writer: SharedWriter = Arc::new(Mutex::new(stream));
         let mut attached: Option<Attachment> = None;
         let result = (|| -> io::Result<()> {
             loop {
-                let timeout_ms = self.frame_read_timeout_ms.load(Ordering::Relaxed);
+                let timeout_ms = self.connections.frame_read_timeout_ms();
                 // Before authentication, a client must begin its first frame
                 // within the deadline. Once attached, an entirely idle client
                 // may remain subscribed indefinitely; after the first byte of
@@ -921,15 +912,6 @@ struct BoundSocket(std::path::PathBuf);
 impl Drop for BoundSocket {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
-    }
-}
-
-struct ConnectionSlot(Arc<Kernel>);
-
-impl Drop for ConnectionSlot {
-    fn drop(&mut self) {
-        let previous = self.0.active_connections.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(previous > 0, "connection slot underflow");
     }
 }
 
@@ -1396,9 +1378,9 @@ mod tests {
             reservations.iter().filter(|result| result.is_ok()).count(),
             1
         );
-        assert_eq!(kernel.active_connections.load(Ordering::SeqCst), 1);
+        assert_eq!(kernel.connections.active(), 1);
         drop(reservations);
-        assert_eq!(kernel.active_connections.load(Ordering::SeqCst), 0);
+        assert_eq!(kernel.connections.active(), 0);
     }
 
     #[test]
@@ -1428,7 +1410,7 @@ mod tests {
             let mut byte = [0u8; 1];
             assert_eq!(client.read(&mut byte).unwrap(), 0, "connection was closed");
             assert!(worker.join().unwrap().is_err(), "deadline is observable");
-            assert_eq!(kernel.active_connections.load(Ordering::SeqCst), 0);
+            assert_eq!(kernel.connections.active(), 0);
         }
     }
 
