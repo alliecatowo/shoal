@@ -543,12 +543,21 @@ impl Evaluator {
             })
             .map_err(|e| ErrorVal::new("io_error", format!("spawn stream feed: {e}")))?;
 
+        let _cancel_on_unwind = CancelPumpOnDrop(pump_cancel.clone());
         let result = self.eval_feed_command(cmd_expr, position, span, stdin);
         // Wake a pump blocked on an idle live upstream or a full stdin queue
         // once the process has exited or failed to spawn.
         pump_cancel.cancel();
         if worker.join().is_err() {
-            return Err(ErrorVal::new("custom", "stream stdin pump panicked").with_span(span));
+            // The sender is dropped during unwind, so a command blocked on
+            // stdin observes EOF and terminates. Commit the panic through the
+            // same first-terminal-error cell rather than bypassing it with a
+            // generic error; if the panic poisoned that cell, `record` repairs
+            // it to the canonical synchronization failure.
+            error.record(ErrorVal::new(
+                "stream_feed_sync",
+                "stream stdin pump panicked",
+            ));
         }
         if let Some(e) = error.take_terminal() {
             return Err(e.or_span(span));
@@ -600,6 +609,18 @@ impl Evaluator {
             Expr::Var { name, .. } => self.exec.shell.env.get(name).is_none(),
             _ => false,
         }
+    }
+}
+
+/// Ensures an unwind in command evaluation cannot detach a live stdin pump.
+/// The worker polls this token while pulling and while applying queue
+/// backpressure, so cancellation bounds its exit even when normal join logic
+/// is skipped by a panic boundary above us.
+struct CancelPumpOnDrop(CancelToken);
+
+impl Drop for CancelPumpOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
     }
 }
 
@@ -722,6 +743,72 @@ mod stream_pump_error_tests {
         );
         assert!(error.take_terminal().is_none());
         assert!(!error.0.is_poisoned(), "reconstructed state is healthy");
+    }
+
+    #[test]
+    fn concurrent_producers_preserve_exactly_one_first_terminal_error() {
+        let error = StreamPumpError::default();
+        let start = Arc::new(std::sync::Barrier::new(3));
+        let mut producers = Vec::new();
+        for (code, message) in [("first", "one"), ("second", "two")] {
+            let error = error.clone();
+            let start = start.clone();
+            producers.push(
+                std::thread::Builder::new()
+                    .name(format!("stream-pump-{code}"))
+                    .spawn(move || {
+                        start.wait();
+                        error.record(ErrorVal::new(code, message));
+                    })
+                    .unwrap(),
+            );
+        }
+        start.wait();
+        for producer in producers {
+            producer.join().unwrap();
+        }
+
+        let delivered = error.take_terminal().expect("one producer wins");
+        assert!(matches!(delivered.code.as_str(), "first" | "second"));
+        assert!(error.take_terminal().is_none());
+    }
+
+    #[test]
+    fn panicking_real_pump_closes_stdin_and_surfaces_typed_sync_failure() {
+        let stream = shoal_value::StreamVal::from_iter(
+            "int",
+            std::iter::from_fn(|| -> Option<VResult<Value>> {
+                panic!("inject upstream pump panic")
+            }),
+        );
+        let command = Expr::Var {
+            name: "cat".into(),
+            span: Span::default(),
+        };
+        let mut evaluator = Evaluator::new(std::env::current_dir().unwrap());
+        let error = evaluator
+            .eval_stream_feed(stream, &command, Position::Value, Span::default())
+            .unwrap_err();
+        assert_eq!(error.code, "stream_feed_sync");
+        assert_eq!(error.msg, "stream stdin pump panicked");
+    }
+
+    #[test]
+    fn real_pump_preserves_the_upstream_terminal_error() {
+        let stream = shoal_value::StreamVal::from_iter(
+            "int",
+            std::iter::once(Err(ErrorVal::new("upstream_failed", "original failure"))),
+        );
+        let command = Expr::Var {
+            name: "cat".into(),
+            span: Span::default(),
+        };
+        let mut evaluator = Evaluator::new(std::env::current_dir().unwrap());
+        let error = evaluator
+            .eval_stream_feed(stream, &command, Position::Value, Span::default())
+            .unwrap_err();
+        assert_eq!(error.code, "upstream_failed");
+        assert_eq!(error.msg, "original failure");
     }
 
     #[test]
