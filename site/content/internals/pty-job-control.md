@@ -357,6 +357,7 @@ different ownership and output contracts.
 - PTY tee only retains a bounded prefix and never spills.
 - Programmatic sessions retain no scrollback and expose no push change subscription.
 - Task and PTY registries are separate, so partial transition failures create stale rows/resources.
-- Long-lived `PtySession` close is hard-kill rather than graceful INT/TERM escalation.
+- Explicit long-lived `PtySession` close uses a bounded INT → TERM → KILL ladder; dropping an
+  abandoned handle intentionally remains an immediate hard-kill backstop.
 - Real terminal handoff is raw byte forwarding, not classic controlling-terminal process-group transfer;
   code copied from a conventional shell may be invalid in this model.

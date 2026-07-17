@@ -53,6 +53,9 @@ use crate::{ExecMode, ExecSpec, StdinSpec};
 /// idle (data reads happen immediately on `POLLIN`). Same cadence the PtyTee
 /// pump uses.
 const READ_POLL_MS: i32 = 50;
+/// Explicit close gives cooperative terminal programs a short chance to flush
+/// state at each rung. Drop remains an immediate kill backstop.
+const CLOSE_SIGNAL_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Hard bounds on the screen grid an agent may request, so a `pty.open`/
 /// `pty.resize` can never allocate an unbounded emulator or produce an
@@ -405,22 +408,50 @@ impl PtySession {
     /// was collected in `read_screen`) only stops its reader. Returns the
     /// child's `(exit_status, exit_signal)`.
     pub fn close(&mut self) -> (Option<i32>, Option<String>) {
-        self.terminate();
+        self.terminate(true);
         (self.exit_status, self.exit_signal.clone())
     }
 
-    /// Kill-and-reap the child's process group (idempotent via `reaped`), then
-    /// join the reader thread. Shared by `close` and `Drop`.
-    fn terminate(&mut self) {
+    /// Terminate and reap the child's process group (idempotent via `reaped`),
+    /// then join the reader thread. Explicit close uses a bounded cooperative
+    /// signal ladder; Drop skips grace periods so abandoned handles cannot
+    /// stall their owner.
+    fn terminate(&mut self, graceful: bool) {
         self.reader_stop.store(true, Ordering::SeqCst);
         if !self.reaped {
             // SAFETY: signalling a process group is memory-safe. SIGCONT first
-            // so a stopped child can act on the kill.
+            // so a stopped child can act on the termination signal.
             unsafe {
                 libc::kill(-self.pgid, libc::SIGCONT);
-                libc::kill(-self.pgid, libc::SIGKILL);
             }
-            if let Ok(raw) = waitpid_blocking(self.pid) {
+            let mut raw = None;
+            let ladder: &[libc::c_int] = if graceful {
+                &[libc::SIGINT, libc::SIGTERM, libc::SIGKILL]
+            } else {
+                &[libc::SIGKILL]
+            };
+            for &signal in ladder {
+                // SAFETY: `pgid` belongs to this still-unreaped child session.
+                unsafe {
+                    libc::kill(-self.pgid, signal);
+                }
+                if signal == libc::SIGKILL {
+                    break;
+                }
+                let deadline = std::time::Instant::now() + CLOSE_SIGNAL_GRACE;
+                while std::time::Instant::now() < deadline {
+                    if let Some(status) = reap_nohang(self.pid) {
+                        raw = Some(status);
+                        break;
+                    }
+                    thread::sleep(std::time::Duration::from_millis(10));
+                }
+                if raw.is_some() {
+                    break;
+                }
+            }
+            let waited = raw.map_or_else(|| waitpid_blocking(self.pid), Ok);
+            if let Ok(raw) = waited {
                 let (status, signal) = decode_wait_status(raw);
                 self.exit_status = status;
                 self.exit_signal = signal;
@@ -437,7 +468,7 @@ impl Drop for PtySession {
     fn drop(&mut self) {
         // Backstop: an abandoned session (kernel dropped it without close, or
         // process shutdown) must never leave the child running/orphaned.
-        self.terminate();
+        self.terminate(false);
     }
 }
 
@@ -662,7 +693,7 @@ mod tests {
         assert!(snap.alive, "cat is still running");
 
         let (status, signal) = session.close();
-        // We SIGKILL'd it, so it dies to a signal (no clean exit code).
+        // An uncooperative process reaches a signal rung rather than leaking.
         assert!(
             status.is_none() || signal.is_some(),
             "a killed child reports a signal death"
@@ -675,6 +706,25 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn explicit_close_allows_a_cooperative_sigint_exit() {
+        let mut session = PtySession::open(spec(
+            &[
+                "sh",
+                "-c",
+                "trap 'exit 42' INT; printf ready; while :; do sleep 1; done",
+            ],
+            80,
+            24,
+        ))
+        .expect("open cooperative shell");
+        read_until(&mut session, "ready", Duration::from_secs(5));
+
+        let (status, signal) = session.close();
+        assert_eq!(status, Some(42));
+        assert_eq!(signal, None);
     }
 
     /// A child that exits on its own is observed as not-alive and reaped by
