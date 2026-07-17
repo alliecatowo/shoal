@@ -11,6 +11,10 @@ struct ChannelBuf {
 /// Owns all per-owner channel rings and their monotonic cursors.
 #[derive(Default)]
 pub(super) struct ChannelRegistry {
+    /// Serializes multi-component publish/seed/remove operations. The buffer
+    /// mutex remains narrow; this lifecycle guard makes owner cleanup atomic
+    /// with respect to publication without ever involving subscriptions.
+    coordination: Mutex<()>,
     buffers: Mutex<HashMap<(OwnerKey, String), ChannelBuf>>,
 }
 
@@ -29,6 +33,7 @@ impl ChannelRegistry {
         payload: Json,
         durable: Option<(DurableChannel, i64)>,
     ) -> Event {
+        let _coordination = self.coordination.lock().unwrap();
         let mut buffers = self.buffers.lock().unwrap();
         let buffer = buffers
             .entry((owner.clone(), channel.to_string()))
@@ -52,6 +57,7 @@ impl ChannelRegistry {
     }
 
     pub(super) fn oldest_seq(&self, owner: &OwnerKey, channel: &str) -> Option<u64> {
+        let _coordination = self.coordination.lock().unwrap();
         self.buffers
             .lock()
             .unwrap()
@@ -66,6 +72,7 @@ impl ChannelRegistry {
         since: Option<u64>,
         limit: Option<usize>,
     ) -> Vec<Event> {
+        let _coordination = self.coordination.lock().unwrap();
         let buffers = self.buffers.lock().unwrap();
         let Some(buffer) = buffers.get(&(owner.clone(), channel.to_string())) else {
             return Vec::new();
@@ -84,11 +91,13 @@ impl ChannelRegistry {
         events
     }
 
-    pub(super) fn remove_owner(&self, owner: &OwnerKey) {
+    pub(super) fn remove_owner(&self, durable_indexes: &DurableIndexes, owner: &OwnerKey) {
+        let _coordination = self.coordination.lock().unwrap();
         self.buffers
             .lock()
             .unwrap()
             .retain(|(channel_owner, _), _| channel_owner != owner);
+        durable_indexes.remove_owner(owner);
     }
 
     /// Seed a channel cursor and its durable replay index using the same lock
@@ -104,11 +113,34 @@ impl ChannelRegistry {
         if entry_ids.is_empty() {
             return;
         }
+        let _coordination = self.coordination.lock().unwrap();
         let mut buffers = self.buffers.lock().unwrap();
         let next_seq = durable_indexes.seed(durable_channel, owner, entry_ids);
         buffers
             .entry((owner.clone(), channel.to_string()))
             .or_default()
             .next_seq = next_seq;
+    }
+
+    pub(super) fn durable_len(
+        &self,
+        durable_indexes: &DurableIndexes,
+        durable_channel: DurableChannel,
+        owner: &OwnerKey,
+    ) -> u64 {
+        let _coordination = self.coordination.lock().unwrap();
+        durable_indexes.len(durable_channel, owner)
+    }
+
+    pub(super) fn durable_range(
+        &self,
+        durable_indexes: &DurableIndexes,
+        durable_channel: DurableChannel,
+        owner: &OwnerKey,
+        since: Option<u64>,
+        upto: u64,
+    ) -> Vec<(u64, i64)> {
+        let _coordination = self.coordination.lock().unwrap();
+        durable_indexes.range(durable_channel, owner, since, upto)
     }
 }

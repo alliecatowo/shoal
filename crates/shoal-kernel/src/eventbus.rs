@@ -87,12 +87,11 @@ impl EventBus {
 
     /// Append `payload` to `channel`'s ring and enqueue it for every live
     /// subscriber of that channel. Never blocks on a subscriber's socket:
-    /// `Subscriber::queue.push` (site/content/internals/kernel-protocol.md) is a bounded, in-memory
-    /// operation, and the lock held here (`subs`) guards only that push, not
-    /// any write — the actual blocking I/O happens later, on each
-    /// subscription's own dedicated writer thread (`spawn_subscriber_writer`).
-    /// A stalled/slow subscriber can therefore delay at most its own
-    /// delivery, never another subscriber's, and never this call.
+    /// Each per-subscription queue push is a bounded, in-memory operation; no
+    /// socket write happens on this path. Blocking I/O happens later in the
+    /// owning connection's dispatcher. A stalled/slow connection can
+    /// therefore delay at most its own delivery, never another connection's,
+    /// and never this call.
     ///
     /// `durable` is `Some` only for the `journal`/`session.transcript`
     /// channels: the seq↔entry pointer is pushed onto the matching index
@@ -127,12 +126,14 @@ impl EventBus {
     /// process (== the channel's `next_seq`). `journal_index` has exactly one
     /// entry per published journal event, so its length is that count.
     pub(crate) fn journal_published_count(&self, owner: &OwnerKey) -> u64 {
-        self.durable.len(DurableChannel::Journal, owner)
+        self.channels
+            .durable_len(&self.durable, DurableChannel::Journal, owner)
     }
 
     /// As [`EventBus::journal_published_count`], for `session.transcript`.
     pub(crate) fn transcript_published_count(&self, owner: &OwnerKey) -> u64 {
-        self.durable.len(DurableChannel::Transcript, owner)
+        self.channels
+            .durable_len(&self.durable, DurableChannel::Transcript, owner)
     }
 
     /// The `(seq, entry_id)` pairs for journal-channel events whose `seq` is
@@ -147,8 +148,8 @@ impl EventBus {
         since: Option<u64>,
         upto: u64,
     ) -> Vec<(u64, i64)> {
-        self.durable
-            .range(DurableChannel::Journal, owner, since, upto)
+        self.channels
+            .durable_range(&self.durable, DurableChannel::Journal, owner, since, upto)
     }
 
     /// As [`EventBus::journal_index_range`], for `session.transcript`.
@@ -158,8 +159,13 @@ impl EventBus {
         since: Option<u64>,
         upto: u64,
     ) -> Vec<(u64, i64)> {
-        self.durable
-            .range(DurableChannel::Transcript, owner, since, upto)
+        self.channels.durable_range(
+            &self.durable,
+            DurableChannel::Transcript,
+            owner,
+            since,
+            upto,
+        )
     }
 
     /// Buffered tail of `channel` from `since` (exclusive), capped at `limit`.
@@ -174,12 +180,11 @@ impl EventBus {
     }
 
     /// Register `writer` as a subscriber to `channel` (idempotent per
-    /// `(conn, channel)` — re-subscribing finds the existing queue rather
-    /// than spawning a second writer thread). Any already-buffered events
-    /// after `since` are enqueued for replay through the same bounded queue
-    /// and dedicated writer thread live events use, so replay and live
-    /// delivery are never a separate, ad hoc blocking write on the calling
-    /// (dispatch) thread.
+    /// `(conn, channel)` — re-subscribing finds the existing queue). Any
+    /// already-buffered events after `since` are merged into the same bounded
+    /// queue that receives live events and drained by the connection's shared
+    /// dispatcher, so replay and live delivery are never a separate, ad hoc
+    /// blocking write on the calling (dispatch) thread.
     fn subscribe(
         &self,
         conn: u64,
@@ -189,13 +194,18 @@ impl EventBus {
         writer: &SharedWriter,
         max_per_session: usize,
     ) -> Result<(), RpcError> {
-        let queue = self
+        let handle = self
             .subscriptions
             .subscribe(conn, owner, channel, writer, max_per_session)?;
-        // SubscriptionRegistry has released its lock before channel replay.
-        for event in self.read(owner, channel, since, None) {
-            queue.push(event);
-        }
+        let replay = if handle.is_new() {
+            self.read(owner, channel, since, None)
+        } else {
+            Vec::new()
+        };
+        // Live delivery was registered first, but remains staged inside the
+        // per-channel queue. finish_replay merges by seq, deduplicates, and only
+        // then makes the monotonic stream visible to the connection dispatcher.
+        handle.finish_replay(replay);
         Ok(())
     }
 
@@ -211,8 +221,7 @@ impl EventBus {
     /// idle owner. Durable command history remains in the journal; event cursors
     /// intentionally restart if that owner later recreates the session.
     pub(crate) fn remove_owner(&self, owner: &OwnerKey) {
-        self.channels.remove_owner(owner);
-        self.durable.remove_owner(owner);
+        self.channels.remove_owner(&self.durable, owner);
         // Never overlap subscription state with channel or durable locks.
         self.subscriptions.remove_owner(owner);
     }
@@ -653,14 +662,15 @@ mod tests {
         assert!(thread.join().is_err());
         assert!(queue.state.is_poisoned());
 
-        queue.push(Event {
+        queue.push_live(Event {
             channel: "user.poison".into(),
             seq: 1,
             ts: now_ns(),
             payload: json!({"never":"delivered"}),
         });
+        queue.finish_replay(Vec::new());
         assert!(
-            queue.next().is_none(),
+            queue.pop().is_none(),
             "a poisoned subscriber must be dropped, not resumed"
         );
         assert!(
@@ -692,6 +702,47 @@ mod tests {
         bus.publish_journal(&beta, 22, json!({}));
         assert_eq!(bus.journal_index_range(&alpha, None, 1), vec![(0, 11)]);
         assert_eq!(bus.journal_index_range(&beta, None, 1), vec![(0, 22)]);
+    }
+
+    #[test]
+    fn subscribe_merges_a_racing_live_event_with_replay_exactly_once_in_order() {
+        let bus = EventBus::default();
+        let owner = owner("replay-race");
+        bus.publish(&owner, "user.race", json!({"i": 0}));
+        let (client, server) = UnixStream::pair().unwrap();
+        let writer: SharedWriter = Arc::new(Mutex::new(server));
+
+        // Deterministically stop at the exact former race window: registered
+        // for live delivery, but initial replay has not been read/installed.
+        let handle = bus
+            .subscriptions
+            .subscribe(1, &owner, "user.race", &writer, usize::MAX)
+            .unwrap();
+        assert!(handle.is_new());
+        bus.publish(&owner, "user.race", json!({"i": 1}));
+        let replay = bus.read(&owner, "user.race", None, None);
+        handle.finish_replay(replay);
+
+        let mut reader = io::BufReader::new(client);
+        let first = recv_line(&mut reader);
+        let second = recv_line(&mut reader);
+        assert_eq!(first["params"]["seq"], 0);
+        assert_eq!(second["params"]["seq"], 1);
+        assert_eq!(first["params"]["payload"]["i"], 0);
+        assert_eq!(second["params"]["payload"]["i"], 1);
+
+        reader
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let mut duplicate = String::new();
+        let error = std::io::BufRead::read_line(&mut reader, &mut duplicate)
+            .expect_err("the racing seq must not be replayed a second time");
+        assert!(matches!(
+            error.kind(),
+            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+        ));
+        bus.remove_conn(1);
     }
 
     /// Read one already-written frame off `reader` (blocking, with a bounded
@@ -748,8 +799,8 @@ mod tests {
         drop(client_end);
     }
 
-    /// A genuinely stalled subscriber (its writer thread blocked mid
-    /// write) must not stall a second, healthy subscriber on the same
+    /// A genuinely stalled connection (its dispatcher blocked mid-write)
+    /// must not stall a second, healthy connection on the same
     /// channel — proving `publish()`'s per-subscriber queue push is
     /// independent across subscribers, not just fast in isolation. The stall
     /// is simulated deterministically (holding the stalled subscriber's own
@@ -769,8 +820,8 @@ mod tests {
         bus.subscribe(2, &owner, "user.race", None, &healthy_writer, usize::MAX)
             .unwrap();
 
-        // Simulate the stalled subscriber's writer thread being stuck mid
-        // blocking-write by holding its writer's mutex from here.
+        // Simulate the stalled connection dispatcher being stuck mid-write by
+        // holding its writer's mutex from here.
         let hold = stalled_writer.clone();
         let (release_tx, release_rx) = mpsc::channel::<()>();
         let stall_thread = std::thread::spawn(move || {
@@ -778,8 +829,8 @@ mod tests {
             let _ = release_rx.recv();
         });
         // Give the stall thread a moment to actually acquire the lock before
-        // the subscriber's own writer thread (spawned by `subscribe` above)
-        // has a chance to race for it.
+        // the connection dispatcher (spawned by `subscribe` above) has a
+        // chance to race for it.
         std::thread::sleep(Duration::from_millis(50));
 
         let start = Instant::now();
@@ -867,7 +918,7 @@ mod tests {
     }
 
     #[test]
-    fn unsubscribe_stops_the_writer_thread_instead_of_leaking_it() {
+    fn unsubscribe_stops_the_connection_dispatcher_instead_of_leaking_it() {
         let bus = EventBus::default();
         let owner = owner("s");
         let (client_end, server_end) = UnixStream::pair().unwrap();
@@ -878,6 +929,44 @@ mod tests {
         bus.unsubscribe(1, &owner, "user.bye");
         assert_eq!(bus.subscriptions.len(), 0);
         drop(client_end);
+    }
+
+    #[test]
+    fn one_connection_uses_one_bounded_dispatcher_and_stops_with_its_last_subscription() {
+        let bus = EventBus::default();
+        let owner = owner("one-dispatcher");
+        let (client, server) = UnixStream::pair().unwrap();
+        let writer: SharedWriter = Arc::new(Mutex::new(server));
+        let channels = 128;
+        for id in 0..channels {
+            bus.subscribe(
+                77,
+                &owner,
+                &format!("user.channel-{id}"),
+                None,
+                &writer,
+                usize::MAX,
+            )
+            .unwrap();
+        }
+        assert_eq!(bus.subscriptions.len(), channels);
+        assert_eq!(bus.subscriptions.dispatcher_count(), 1);
+        let probe = bus.subscriptions.dispatcher_probe(77).unwrap();
+
+        for id in 0..channels {
+            bus.unsubscribe(77, &owner, &format!("user.channel-{id}"));
+        }
+        assert_eq!(bus.subscriptions.len(), 0);
+        assert_eq!(bus.subscriptions.dispatcher_count(), 0);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !probe.stopped() {
+            assert!(
+                Instant::now() < deadline,
+                "connection dispatcher did not stop after its last subscription"
+            );
+            std::thread::yield_now();
+        }
+        drop(client);
     }
 
     #[test]
