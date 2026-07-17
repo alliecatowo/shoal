@@ -120,7 +120,7 @@ mod tests {
         for (name, source) in [
             ("script", include_str!("script.rs")),
             ("host", include_str!("host.rs")),
-            ("channels", include_str!("channels.rs")),
+            ("channels", include_str!("channels/eval.rs")),
         ] {
             let production = source.split("#[cfg(test)]").next().unwrap_or(source);
             assert!(
