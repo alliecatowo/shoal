@@ -29,6 +29,7 @@ use shoal_value::{ErrorVal, Fs, Pull, Record, StreamVal, VResult, Value};
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError, channel, sync_channel};
 use std::time::Duration;
 
@@ -57,12 +58,14 @@ impl Evaluator {
         let mut upstream = stream.take_upstream()?;
         let (tx, rx) = sync_channel(capacity);
         let cancel = self.cancellation_token();
+        let stop = Arc::new(AtomicBool::new(false));
+        let producer_stop = stop.clone();
         let child = self.child_context();
 
         std::thread::spawn(move || {
             let mut evaluator = child.build(ChildKind::StreamPump, cancel.clone());
             loop {
-                if cancel.is_cancelled() {
+                if cancel.is_cancelled() || producer_stop.load(Ordering::SeqCst) {
                     break;
                 }
                 let delivery = match upstream.pull(&mut evaluator, Some(PUMP_POLL)) {
@@ -72,13 +75,13 @@ impl Evaluator {
                     Err(error) => Err(error),
                 };
                 let terminal = delivery.is_err();
-                if !send_to_buffer(&tx, &cancel, delivery) || terminal {
+                if !send_to_buffer(&tx, &cancel, &producer_stop, delivery) || terminal {
                     break;
                 }
             }
         });
 
-        Ok(StreamVal::from_buffered_channel(label, bounded, rx))
+        Ok(StreamVal::from_buffered_channel(label, bounded, rx, stop))
     }
 
     /// `every(interval) -> stream<datetime>` (site/content/internals/streams-channels.md): one timer thread,
@@ -265,6 +268,7 @@ impl Evaluator {
 fn send_to_buffer(
     tx: &SyncSender<VResult<Value>>,
     cancel: &CancelToken,
+    stop: &AtomicBool,
     mut delivery: VResult<Value>,
 ) -> bool {
     loop {
@@ -272,7 +276,7 @@ fn send_to_buffer(
             Ok(()) => return true,
             Err(TrySendError::Disconnected(_)) => return false,
             Err(TrySendError::Full(returned)) => {
-                if cancel.is_cancelled() {
+                if cancel.is_cancelled() || stop.load(Ordering::SeqCst) {
                     return false;
                 }
                 delivery = returned;
@@ -516,6 +520,23 @@ mod tests {
         dropped: Arc<AtomicBool>,
     }
 
+    struct IdleSource {
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Upstream for IdleSource {
+        fn pull(&mut self, _ctx: &mut dyn CallCtx, _timeout: Option<Duration>) -> VResult<Pull> {
+            std::thread::sleep(Duration::from_millis(2));
+            Ok(Pull::Timeout)
+        }
+    }
+
+    impl Drop for IdleSource {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
     impl Upstream for CountingSource {
         fn pull(&mut self, _ctx: &mut dyn CallCtx, _timeout: Option<Duration>) -> VResult<Pull> {
             let n = self.pulls.fetch_add(1, Ordering::SeqCst);
@@ -579,6 +600,23 @@ mod tests {
         wait_until(|| pulls.load(Ordering::SeqCst) >= 2);
 
         evaluator.cancel_current();
+        wait_until(|| dropped.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn dropping_idle_buffer_signals_its_owned_upstream_without_an_item() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let source = StreamVal::from_upstream(
+            "idle",
+            false,
+            Box::new(IdleSource {
+                dropped: dropped.clone(),
+            }),
+        );
+        let mut evaluator = Evaluator::new(std::env::temp_dir());
+        let buffered = evaluator.spawn_stream_buffer(source, 2).unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+        drop(buffered);
         wait_until(|| dropped.load(Ordering::SeqCst));
     }
 }

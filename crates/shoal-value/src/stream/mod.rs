@@ -76,7 +76,10 @@ impl Upstream for IterSource {
 /// Base source over a live channel fed by a background producer (`every`'s timer,
 /// `watch`/`tail`'s notify thread, a `channel().events()` subscription). Supports
 /// timed reads so timing combinators (`debounce`/`throttle`) work.
-struct ChanSource(std::sync::mpsc::Receiver<VResult<Value>>);
+struct ChanSource {
+    rx: std::sync::mpsc::Receiver<VResult<Value>>,
+    stop: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
 impl Upstream for ChanSource {
     fn pull(
         &mut self,
@@ -85,15 +88,23 @@ impl Upstream for ChanSource {
     ) -> VResult<Pull> {
         use std::sync::mpsc::RecvTimeoutError;
         match timeout {
-            None => match self.0.recv() {
+            None => match self.rx.recv() {
                 Ok(r) => r.map(Pull::Item),
                 Err(_) => Ok(Pull::End),
             },
-            Some(d) => match self.0.recv_timeout(d) {
+            Some(d) => match self.rx.recv_timeout(d) {
                 Ok(r) => r.map(Pull::Item),
                 Err(RecvTimeoutError::Timeout) => Ok(Pull::Timeout),
                 Err(RecvTimeoutError::Disconnected) => Ok(Pull::End),
             },
+        }
+    }
+}
+
+impl Drop for ChanSource {
+    fn drop(&mut self) {
+        if let Some(stop) = &self.stop {
+            stop.store(true, std::sync::atomic::Ordering::SeqCst);
         }
     }
 }
@@ -120,7 +131,7 @@ impl StreamVal {
         label: impl Into<String>,
         rx: std::sync::mpsc::Receiver<VResult<Value>>,
     ) -> StreamVal {
-        StreamVal::from_source(label, false, Box::new(ChanSource(rx)))
+        StreamVal::from_source(label, false, Box::new(ChanSource { rx, stop: None }))
     }
 
     /// Build a channel-backed stream while preserving the producer's known
@@ -129,8 +140,16 @@ impl StreamVal {
         label: impl Into<String>,
         bounded: bool,
         rx: std::sync::mpsc::Receiver<VResult<Value>>,
+        stop: Arc<std::sync::atomic::AtomicBool>,
     ) -> StreamVal {
-        StreamVal::from_source(label, bounded, Box::new(ChanSource(rx)))
+        StreamVal::from_source(
+            label,
+            bounded,
+            Box::new(ChanSource {
+                rx,
+                stop: Some(stop),
+            }),
+        )
     }
 
     /// Build a stream from an evaluator-owned source.
