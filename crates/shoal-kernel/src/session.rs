@@ -21,6 +21,10 @@ pub(crate) struct Attachment {
     /// kernel-hosted client (colors wanted) apart from a headless/MCP one
     /// (colors are agent-hostile noise) — see `bound_render`'s `strip` param.
     pub(crate) tty: bool,
+    /// Request-local cancellation epoch for a queued task. The task worker
+    /// installs it only after acquiring the session evaluator, so a later
+    /// request cannot replace its cancellation handle while it is queued.
+    pub(crate) cancel_epoch: Option<shoal_exec::CancelToken>,
 }
 
 pub(crate) struct Session {
@@ -171,6 +175,7 @@ impl Kernel {
             principal: who.clone(),
             can_approve,
             tty,
+            cancel_epoch: None,
         });
         // site/content/internals/language-conformance-contract.md tier honesty: report the REAL strongest OS backend
         // available on this host (Landlock → A, Seatbelt → C, else

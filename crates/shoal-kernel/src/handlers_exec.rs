@@ -29,11 +29,11 @@ impl Kernel {
             let elide_spec = params.elide;
             let wait = params.timeout_ms.map(std::time::Duration::from_millis);
             let is_background = params.asynchronous;
-            let cancel = {
-                let mut evaluator = session.evaluator.lock().unwrap();
-                evaluator.reset_cancel();
-                evaluator.cancellation_token()
-            };
+            // The worker may queue behind another execution on this session's
+            // evaluator. Keep its epoch request-local until the worker owns
+            // the evaluator; installing it here would let the next request
+            // clobber it before this task starts.
+            let cancel = shoal_exec::CancelToken::new();
             // site/content/internals/kernel-protocol.md: the events channel is `task.{bare id}`
             // (e.g. `task.7`), NOT `task.{full ref}` (`task.task:7`) — keep
             // the bare numeric id around so the channel name is built from
@@ -54,7 +54,7 @@ impl Kernel {
                     active_slot: Some(active_slot),
                 }),
                 done: Condvar::new(),
-                cancel,
+                cancel: cancel.clone(),
                 cancel_requested: AtomicBool::new(false),
             });
             self.tasks
@@ -63,7 +63,9 @@ impl Kernel {
                 .insert(task_ref.clone(), task.clone());
             let waiter = task.clone();
             let kernel = self.clone();
-            let mut task_attached = Some(attachment.clone());
+            let mut task_attachment = attachment.clone();
+            task_attachment.cancel_epoch = Some(cancel.clone());
+            let mut task_attached = Some(task_attachment);
             let task_channel = format!("task.{task_id}");
             kernel
                 .events
@@ -310,6 +312,14 @@ impl Kernel {
         })?;
         let ast_json = serde_json::to_string(&ast).map_err(internal)?;
         let mut evaluator = session.evaluator.lock().unwrap();
+        if let Some(cancel) = attachment.cancel_epoch.clone() {
+            evaluator.set_cancellation_token(cancel);
+        } else {
+            // Foreground requests own distinct epochs too. In particular, a
+            // cancelled background task must not leave the next foreground
+            // command pre-cancelled.
+            evaluator.reset_cancel();
+        }
         // site/content/internals/language-conformance-contract.md leash activation: bind the session's evaluator to this
         // principal's policy so any external spawn resolves and applies
         // an OS sandbox for `actor`. The default-permissive policy
@@ -618,6 +628,79 @@ impl Kernel {
 mod tests {
     use super::*;
 
+    fn attached(kernel: &Arc<Kernel>, name: &str) -> (Arc<Session>, Option<Attachment>) {
+        let actor = principal();
+        let session = kernel.session(name, &actor).expect("create session");
+        let attachment = Attachment {
+            session: session.clone(),
+            principal: actor,
+            can_approve: true,
+            tty: false,
+            cancel_epoch: None,
+        };
+        (session, Some(attachment))
+    }
+
+    #[test]
+    fn queued_task_installs_its_own_cancellation_epoch_when_it_starts() {
+        let kernel = Kernel::new();
+        let (session, mut attached) = attached(&kernel, "cancel-epoch-queue");
+
+        // Keep the worker queued after registration, then cancel it and put an
+        // unrelated epoch on the evaluator. The worker must replace that
+        // unrelated epoch with the token stored in its TaskEntry once it owns
+        // the evaluator. The old creation-time reset lost this cancellation.
+        let mut evaluator = session.evaluator.lock().unwrap();
+        let background = kernel
+            .handle_exec(
+                json!({"src":"sh { sleep 30 }", "async":true}),
+                1,
+                &mut attached,
+            )
+            .expect("register queued task");
+        let task: Ref = serde_json::from_value(background["task"].clone()).unwrap();
+        kernel
+            .handle_task_cancel(json!({"task":task}), &mut attached)
+            .expect("cancel queued task");
+        evaluator.set_cancellation_token(shoal_exec::CancelToken::new());
+        drop(evaluator);
+
+        let started = Instant::now();
+        let record = kernel
+            .handle_task_await(json!({"task":task}), &mut attached)
+            .expect("await cancelled task");
+        assert_eq!(record["state"], "cancelled", "task record: {record}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "pre-cancelled queued task did not stop promptly: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn foreground_exec_starts_a_fresh_cancellation_epoch() {
+        let kernel = Kernel::new();
+        let (session, mut attached) = attached(&kernel, "cancel-epoch-foreground");
+        {
+            let evaluator = session.evaluator.lock().unwrap();
+            evaluator.cancel_current();
+            assert!(evaluator.cancellation_token().is_cancelled());
+        }
+
+        kernel
+            .handle_exec(json!({"src":"1 + 2"}), 1, &mut attached)
+            .expect("foreground exec after a cancelled epoch");
+        assert!(
+            !session
+                .evaluator
+                .lock()
+                .unwrap()
+                .cancellation_token()
+                .is_cancelled(),
+            "foreground request inherited the previous cancelled epoch"
+        );
+    }
+
     /// Regression test for the `evaluator.set_source(...)` call added above.
     ///
     /// `Kernel::new()` builds an EPHEMERAL, in-memory-only kernel with no
@@ -671,6 +754,7 @@ mod tests {
             principal: actor,
             can_approve: true,
             tty: false,
+            cancel_epoch: None,
         });
 
         let marker_src = "let set_source_probe_9182 = 9182";

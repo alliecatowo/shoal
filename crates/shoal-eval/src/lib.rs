@@ -559,6 +559,17 @@ impl Evaluator {
         self.cancel.clone()
     }
 
+    /// Install the cancellation epoch owned by the host's current execution.
+    ///
+    /// A host that serializes several executions through one evaluator must
+    /// install the token only after it owns that evaluator. Creating a token
+    /// while an execution is still queued lets a later request replace the
+    /// evaluator's token before the queued execution starts, disconnecting
+    /// that execution from its cancellation handle.
+    pub fn set_cancellation_token(&mut self, cancel: CancelToken) {
+        self.cancel = cancel;
+    }
+
     /// Install a fresh cancellation epoch before reading the next command.
     pub fn reset_cancel(&mut self) {
         self.cancel = CancelToken::new();
