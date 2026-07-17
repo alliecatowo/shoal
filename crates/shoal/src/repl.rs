@@ -240,14 +240,17 @@ pub(crate) fn repl(standalone: bool) -> Result<i32, String> {
     {
         let slot = cancel_slot.clone();
         let interrupt = protocol_interrupt.clone();
-        std::thread::spawn(move || {
-            for _ in signals.forever() {
-                interrupt.store(true, Ordering::SeqCst);
-                if let Ok(token) = slot.lock() {
-                    token.cancel();
+        std::thread::Builder::new()
+            .name("shoal-sigint".into())
+            .spawn(move || {
+                for _ in signals.forever() {
+                    interrupt.store(true, Ordering::SeqCst);
+                    if let Ok(token) = slot.lock() {
+                        token.cancel();
+                    }
                 }
-            }
-        });
+            })
+            .map_err(|error| format!("cannot start the SIGINT watcher: {error}"))?;
     }
     // Job control (site/content/internals/language-conformance-contract.md): an interactive shell must ignore SIGTSTP/SIGTTOU/
     // SIGTTIN so a stray Ctrl-Z or a terminal-handoff operation never suspends
@@ -1055,30 +1058,50 @@ fn watch_new_tasks(
         if task.is_done() && !returned {
             continue;
         }
+        let id = task.id;
         let events = events.clone();
-        let printer = printer.clone();
+        let watcher_printer = printer.clone();
         let suppressed = suppressed.clone();
-        std::thread::spawn(move || {
-            let result = task.wait();
-            if consume_task_suppression(&suppressed, task.id) {
-                return;
-            }
-            let error = result.err().map(|error| {
-                if let Some(status) = error.status {
-                    format!("{}: {} (status {status})", error.code, error.msg)
-                } else {
-                    format!("{}: {}", error.code, error.msg)
+        let launch = std::thread::Builder::new()
+            .name(format!("shoal-task-watch-{id}"))
+            .spawn(move || {
+                let result = task.wait();
+                if consume_task_suppression(&suppressed, task.id) {
+                    return;
                 }
+                let error = result.err().map(|error| {
+                    if let Some(status) = error.status {
+                        format!("{}: {} (status {status})", error.code, error.msg)
+                    } else {
+                        format!("{}: {}", error.code, error.msg)
+                    }
+                });
+                let mut event = BackgroundJobEvent::TaskCompleted {
+                    id: task.id,
+                    description: task.shared.desc.clone(),
+                    error,
+                    notified: false,
+                };
+                enqueue_background_notice(&watcher_printer, &mut event);
+                let _ = events.send(event);
             });
-            let mut event = BackgroundJobEvent::TaskCompleted {
-                id: task.id,
-                description: task.shared.desc.clone(),
-                error,
-                notified: false,
-            };
-            enqueue_background_notice(&printer, &mut event);
-            let _ = events.send(event);
-        });
+        handle_task_watcher_launch(launch, id, watched, printer);
+    }
+}
+
+fn handle_task_watcher_launch(
+    launch: std::io::Result<std::thread::JoinHandle<()>>,
+    id: u64,
+    watched: &mut BTreeSet<u64>,
+    printer: &ExternalPrinter<String>,
+) {
+    if let Err(error) = launch {
+        // The task itself remains owned by the evaluator. Retire only the host
+        // mirror so the next prompt can retry installing its observer.
+        watched.remove(&id);
+        let _ = printer.sender().try_send(maybe_strip(format!(
+            "\x1b[33;1mwarning:\x1b[0m cannot watch task [{id}]: {error}"
+        )));
     }
 }
 
@@ -1799,6 +1822,31 @@ mod tests {
             );
         }
         assert!(suppressed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_task_watcher_launch_retires_mirror_and_warns_for_retry() {
+        let printer = ExternalPrinter::new(1);
+        let mut watched = [77].into_iter().collect();
+        handle_task_watcher_launch(
+            Err(std::io::Error::other("thread quota reached")),
+            77,
+            &mut watched,
+            &printer,
+        );
+        assert!(!watched.contains(&77));
+        let warning = printer.get_line().unwrap();
+        assert!(warning.contains("cannot watch task [77]"));
+        assert!(warning.contains("thread quota reached"));
+    }
+
+    #[test]
+    fn production_repl_has_no_infallible_thread_launches() {
+        let production = include_str!("repl.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source prefix");
+        assert!(!production.contains("std::thread::spawn("));
     }
 
     #[test]
