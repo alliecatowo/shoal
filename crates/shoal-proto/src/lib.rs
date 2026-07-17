@@ -161,11 +161,19 @@ pub mod error_code {
 
 impl Response {
     pub fn ok(id: RequestId, value: impl Serialize) -> Self {
-        Self {
-            jsonrpc: JSONRPC.into(),
-            id,
-            result: Some(serde_json::to_value(value).expect("serializable RPC result")),
-            error: None,
+        match serde_json::to_value(value) {
+            Ok(result) => Self {
+                jsonrpc: JSONRPC.into(),
+                id,
+                result: Some(result),
+                error: None,
+            },
+            Err(error) => Self::err(
+                id,
+                error_code::INTERNAL_ERROR,
+                format!("failed to serialize RPC result: {error}"),
+                None,
+            ),
         }
     }
     pub fn err(id: RequestId, code: i32, message: impl Into<String>, data: Option<Value>) -> Self {
@@ -772,6 +780,7 @@ pub struct JournalEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Serializer;
     #[test]
     fn frames_are_newline_delimited() {
         let response = Response::ok(Value::from(1), serde_json::json!({"ok":true}));
@@ -780,6 +789,25 @@ mod tests {
         assert_eq!(bytes.last(), Some(&b'\n'));
         let decoded: Response = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn response_serialization_failure_becomes_a_wire_error() {
+        struct Fails;
+        impl Serialize for Fails {
+            fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                Err(serde::ser::Error::custom("hostile serializer"))
+            }
+        }
+
+        let response = Response::ok(Value::from(7), Fails);
+        let error = response.error.expect("serialization must fail closed");
+        assert_eq!(error.code, error_code::INTERNAL_ERROR);
+        assert!(error.message.contains("hostile serializer"));
+        assert!(response.result.is_none());
     }
 
     #[test]

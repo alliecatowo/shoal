@@ -2,7 +2,7 @@
 
 use std::fs;
 
-use crate::{Journal, hex_bytes, hex_string, io_to_sql, now_ns};
+use crate::{Journal, hash_string, hex_bytes, io_to_sql, now_ns};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GcOptions {
@@ -44,7 +44,7 @@ impl Journal {
         let mut stmt = self.conn.prepare("SELECT hash FROM pin ORDER BY hash")?;
         stmt.query_map([], |r| {
             let raw: Vec<u8> = r.get(0)?;
-            Ok(hex_string(&raw))
+            hash_string(&raw, 0)
         })?
         .collect()
     }
@@ -88,12 +88,14 @@ impl Journal {
         }
         let candidates = chosen
             .iter()
-            .map(|(h, b, r)| GcBlob {
-                hash: hex_string(h),
-                bytes: *b,
-                referenced: *r,
+            .map(|(h, b, r)| {
+                Ok(GcBlob {
+                    hash: hash_string(h, 0)?,
+                    bytes: *b,
+                    referenced: *r,
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         let mut deleted = Vec::new();
         if !options.dry_run {
             for blob in &candidates {
@@ -106,7 +108,9 @@ impl Journal {
                         return Err(io_to_sql(e));
                     }
                 }
-                let raw = hex_bytes(&blob.hash).expect("database hash");
+                let raw = hex_bytes(&blob.hash).map_err(|_| {
+                    rusqlite::Error::InvalidParameterName("invalid database hash".into())
+                })?;
                 self.conn.execute("DELETE FROM blob WHERE hash=?1", [raw])?;
                 deleted.push(blob.clone());
             }

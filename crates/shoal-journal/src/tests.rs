@@ -465,6 +465,36 @@ fn read_blob_missing_returns_none() {
 }
 
 #[test]
+fn every_public_cas_entry_rejects_non_blake3_keys_without_panicking() {
+    let j = Journal::in_memory().unwrap();
+    let spill = tempfile::NamedTempFile::new().unwrap();
+    for malformed in ["", "00", "abcd", "zzzz", "../00"] {
+        assert!(j.read_blob(malformed).unwrap().is_none());
+        assert!(j.blob_len(malformed).unwrap().is_none());
+        assert!(j.pin(malformed).is_err());
+        assert!(j.unpin(malformed).is_err());
+        assert!(j.ingest_spill(spill.path(), malformed, 0, false).is_err());
+        assert_eq!(
+            j.cas().read(malformed).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+}
+
+#[test]
+fn corrupted_output_hash_is_a_typed_query_error() {
+    let j = Journal::in_memory().unwrap();
+    let id = j.append(&rec("s", "human", 1, "echo")).unwrap();
+    j.conn
+        .execute(
+            "INSERT INTO output(entry_id,kind,hash,len) VALUES(?1,'stdout',?2,0)",
+            rusqlite::params![id, vec![0u8]],
+        )
+        .unwrap();
+    assert!(j.query(&JournalQuery::default()).is_err());
+}
+
+#[test]
 fn query_head_filter() {
     let j = Journal::in_memory().unwrap();
     j.append(&rec("s", "human", 1, "git push origin main"))
@@ -1179,6 +1209,23 @@ fn gc_prefers_orphans_then_lru_and_dry_run_preserves() {
         .unwrap();
     assert_eq!(done.deleted[0].hash, orphan);
     assert!(j.read_blob(&orphan).unwrap().is_none());
+}
+
+#[test]
+fn corrupted_blob_hash_is_a_typed_gc_error() {
+    let j = Journal::in_memory().unwrap();
+    j.conn
+        .execute(
+            "INSERT INTO blob(hash,stored_len,created_ns,last_access_ns) VALUES(?1,0,0,0)",
+            [vec![0u8]],
+        )
+        .unwrap();
+    let result = j.gc(GcOptions {
+        ttl: Some(std::time::Duration::ZERO),
+        max_bytes: Some(0),
+        dry_run: false,
+    });
+    assert!(result.is_err());
 }
 
 #[test]

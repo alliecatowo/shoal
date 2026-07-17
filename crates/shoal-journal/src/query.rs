@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use rusqlite::ToSql;
 
-use crate::{Journal, OutputMeta, OutputRow, hex_bytes, hex_string};
+use crate::{Journal, OutputMeta, OutputRow, hash_string, hex_bytes};
 
 /// Default number of rows returned by [`Journal::query`] when
 /// [`JournalQuery::limit`] is `0`.
@@ -238,7 +238,7 @@ impl Journal {
                         })?;
                     Ok(OutputRow {
                         kind: r.get(0)?,
-                        hash: hex_string(&raw),
+                        hash: hash_string(&raw, 1)?,
                         len: r.get(2)?,
                         meta,
                     })

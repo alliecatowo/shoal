@@ -149,7 +149,7 @@ impl Journal {
     pub fn read_blob(&self, hash: &str) -> rusqlite::Result<Option<Vec<u8>>> {
         // A hash that is not plain hex (or is too short to shard) cannot address
         // a blob; this also guards against path traversal.
-        if hash.len() < 4 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        if hex_bytes(hash).is_err() {
             return Ok(None);
         }
         let compressed = match fs::read(self.blob_path(hash)) {
@@ -392,7 +392,7 @@ impl Cas {
     /// [`Journal::read_blob`]). A missing blob or malformed hash is a
     /// `NotFound` error; a hash mismatch is `InvalidData`.
     pub fn read(&self, hash: &str) -> io::Result<Vec<u8>> {
-        if hash.len() < 4 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        if hex_bytes(hash).is_err() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("{hash} does not address a CAS blob"),
@@ -444,7 +444,7 @@ impl Cas {
     }
 
     fn open_decoder(&self, hash: &str) -> io::Result<Box<dyn io::Read + Send>> {
-        if hash.len() < 4 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        if hex_bytes(hash).is_err() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("{hash} does not address a CAS blob"),

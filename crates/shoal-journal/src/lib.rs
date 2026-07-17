@@ -238,11 +238,32 @@ fn now_ns() -> i64 {
 }
 
 fn hex_bytes(hex: &str) -> Result<Vec<u8>, ()> {
-    if !hex.len().is_multiple_of(2) || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+    // Every CAS key in this crate is a complete BLAKE3 digest. Requiring the
+    // exact shape here keeps malformed caller input and corrupted DB values
+    // away from the sharded path helper, whose byte slicing relies on it.
+    if hex.len() != blake3::OUT_LEN * 2 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(());
     }
     (0..hex.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).map_err(|_| ()))
         .collect()
+}
+
+fn hash_string(bytes: &[u8], column: usize) -> rusqlite::Result<String> {
+    if bytes.len() != blake3::OUT_LEN {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Blob,
+            Box::new(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "journal hash has {} bytes; expected {}",
+                    bytes.len(),
+                    blake3::OUT_LEN
+                ),
+            )),
+        ));
+    }
+    Ok(hex_string(bytes))
 }
