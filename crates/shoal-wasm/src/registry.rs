@@ -15,6 +15,7 @@ use super::{
 pub struct Registry {
     host: Host,
     plugins: BTreeMap<String, ValidatedPlugin>,
+    retained_component_bytes: usize,
 }
 
 /// Immutable command-resolution data retained by a validated registry.
@@ -31,10 +32,20 @@ impl Registry {
         Ok(Self {
             host: Host::new(limits)?,
             plugins: BTreeMap::new(),
+            retained_component_bytes: 0,
         })
     }
 
     pub fn load_manifest(&mut self, path: &Path) -> Result<(), PluginError> {
+        if self.plugins.len() >= self.host.limits.plugins {
+            return Err(PluginError::Manifest {
+                path: path.into(),
+                message: format!(
+                    "plugin registry limit ({}) reached",
+                    self.host.limits.plugins
+                ),
+            });
+        }
         let manifest = Manifest::load_bounded(path, self.host.limits.manifest_bytes)?;
         if self.plugins.contains_key(&manifest.name) {
             return Err(PluginError::Duplicate(manifest.name));
@@ -66,6 +77,23 @@ impl Registry {
             }
         }
         let plugin = self.host.validate(manifest)?;
+        let retained_component_bytes = self
+            .retained_component_bytes
+            .checked_add(plugin.bytes().len())
+            .ok_or_else(|| PluginError::Manifest {
+                path: path.into(),
+                message: "plugin registry byte accounting overflowed".into(),
+            })?;
+        if retained_component_bytes > self.host.limits.registry_component_bytes {
+            return Err(PluginError::Manifest {
+                path: path.into(),
+                message: format!(
+                    "plugin registry components exceed the {}-byte retained limit",
+                    self.host.limits.registry_component_bytes
+                ),
+            });
+        }
+        self.retained_component_bytes = retained_component_bytes;
         self.plugins.insert(plugin.manifest.name.clone(), plugin);
         Ok(())
     }
@@ -96,7 +124,19 @@ impl Registry {
         };
         let mut paths = Vec::new();
         let mut errors = Vec::new();
-        for entry in entries {
+        let mut overflowed = false;
+        for (index, entry) in entries.enumerate() {
+            if index >= self.host.limits.discovery_entries {
+                errors.push(PluginError::Manifest {
+                    path: dir.into(),
+                    message: format!(
+                        "plugin discovery entry limit ({}) reached",
+                        self.host.limits.discovery_entries
+                    ),
+                });
+                overflowed = true;
+                break;
+            }
             match entry {
                 Ok(entry) => {
                     let path = entry.path();
@@ -112,6 +152,13 @@ impl Registry {
                     message: format!("cannot read directory entry: {error}"),
                 }),
             }
+        }
+        // Loading a filesystem-order-dependent prefix would violate the
+        // documented lexical ordering and could install a surprising subset
+        // of plugins. Treat an overfull directory as one failed discovery
+        // unit and retain no authority from it.
+        if overflowed {
+            return errors;
         }
         paths.sort();
         errors.extend(
@@ -185,5 +232,9 @@ impl Registry {
 
     pub fn is_empty(&self) -> bool {
         self.plugins.is_empty()
+    }
+
+    pub fn argument_limit(&self) -> usize {
+        self.host.limits.arguments
     }
 }
