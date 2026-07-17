@@ -724,6 +724,12 @@ impl CallCtx for Evaluator {
     fn cwd(&self) -> PathBuf {
         self.cwd.clone()
     }
+    /// Hand value methods the evaluator's *injected* Fs port, not the trait's
+    /// `StdFs` default, so `.save`/`.append` write sinks are mediated by
+    /// whatever adapter `set_fs` installed (HR-C follow-through wire).
+    fn fs(&self) -> &dyn Fs {
+        &*self.fs
+    }
 }
 
 pub fn eval(program: &Program, cwd: impl AsRef<Path>) -> VResult<Value> {
@@ -870,6 +876,91 @@ mod tests {
         rec.insert("k".into(), Value::Int(7));
         ev3.set_config(Arc::new(ConfigSnapshot::new(Value::Record(rec.clone()))));
         assert_eq!(ev3.eval_program(&all).unwrap(), Value::Record(rec));
+    }
+
+    /// The Fs-port boundary is enforceable *through the evaluator*: value-method
+    /// write sinks (`.save`) resolve to the evaluator's injected port, so a
+    /// denying adapter blocks the write before it reaches the disk (HR-C wire).
+    #[test]
+    fn value_method_saves_go_through_the_injected_fs_port() {
+        use shoal_value::ReadSeek;
+        use std::io;
+
+        /// Delegates reads to [`StdFs`], refuses every write-shaped call.
+        struct DenyWrites;
+        fn denied<T>() -> io::Result<T> {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "denied by test port",
+            ))
+        }
+        impl Fs for DenyWrites {
+            fn read(&self, path: &std::path::Path) -> io::Result<Vec<u8>> {
+                StdFs.read(path)
+            }
+            fn read_to_string(&self, path: &std::path::Path) -> io::Result<String> {
+                StdFs.read_to_string(path)
+            }
+            fn open_read(&self, path: &std::path::Path) -> io::Result<Box<dyn ReadSeek + Send>> {
+                StdFs.open_read(path)
+            }
+            fn write(&self, _: &std::path::Path, _: &[u8]) -> io::Result<()> {
+                denied()
+            }
+            fn append(&self, _: &std::path::Path, _: &[u8]) -> io::Result<()> {
+                denied()
+            }
+            fn touch(&self, _: &std::path::Path) -> io::Result<()> {
+                denied()
+            }
+            fn metadata(&self, path: &std::path::Path) -> io::Result<std::fs::Metadata> {
+                StdFs.metadata(path)
+            }
+            fn symlink_metadata(&self, path: &std::path::Path) -> io::Result<std::fs::Metadata> {
+                StdFs.symlink_metadata(path)
+            }
+            fn read_dir(&self, path: &std::path::Path) -> io::Result<Vec<PathBuf>> {
+                StdFs.read_dir(path)
+            }
+            fn create_dir(&self, _: &std::path::Path) -> io::Result<()> {
+                denied()
+            }
+            fn create_dir_all(&self, _: &std::path::Path) -> io::Result<()> {
+                denied()
+            }
+            fn remove_file(&self, _: &std::path::Path) -> io::Result<()> {
+                denied()
+            }
+            fn remove_dir_all(&self, _: &std::path::Path) -> io::Result<()> {
+                denied()
+            }
+            fn rename(&self, _: &std::path::Path, _: &std::path::Path) -> io::Result<()> {
+                denied()
+            }
+            fn copy(&self, _: &std::path::Path, _: &std::path::Path) -> io::Result<u64> {
+                denied()
+            }
+            fn hard_link(&self, _: &std::path::Path, _: &std::path::Path) -> io::Result<()> {
+                denied()
+            }
+            fn symlink(&self, _: &std::path::Path, _: &std::path::Path) -> io::Result<()> {
+                denied()
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut ev = Evaluator::new(dir.path().to_path_buf());
+        ev.set_fs(Arc::new(DenyWrites));
+        let program = shoal_syntax::parse(r#""x".save("p")"#).unwrap();
+        let result = ev.eval_program(&program);
+        assert!(
+            result.is_err(),
+            "a denying injected port must surface the refusal, got {result:?}"
+        );
+        assert!(
+            !dir.path().join("p").exists(),
+            "the denied write must never reach the real filesystem"
+        );
     }
 
     #[test]

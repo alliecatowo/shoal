@@ -206,10 +206,11 @@ The general `save` and `append` methods write a receiver to a supplied path thro
 `CallCtx::fs().open_append` in `methods/stream.rs` (HR-C1/HR-C2). `CallCtx::fs()` is the filesystem
 capability: it defaults to `StdFs` (byte-identical to the pre-port `OpenOptions` code) and a host
 returns its injected/sandboxed `Fs` port from the `fs()` override so a fake can observe or deny the
-write. Evaluator call sites still surround some value saves with journal undo hooks. The remaining
-eval-side wire is the evaluator's `CallCtx::fs()` override returning its own injected port; until
-that lands, value writes cross `StdFs` (the real filesystem) rather than the evaluator's sandboxed
-port — but they are already port-routed and deniable, not raw `std::fs`.
+write. Evaluator call sites still surround some value saves with journal undo hooks. The eval-side
+wire is in place: `impl CallCtx for Evaluator` overrides `fs()` to return the evaluator's injected
+`Arc<dyn Fs>` (installed via `set_fs`), so value-method writes are mediated by the session's actual
+port — a denying injected adapter blocks `"x".save(...)` end to end, pinned by
+`value_method_saves_go_through_the_injected_fs_port` in `shoal-eval`.
 
 ## Numeric methods
 
