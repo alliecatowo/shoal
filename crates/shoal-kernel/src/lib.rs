@@ -983,7 +983,7 @@ impl Kernel {
         };
         self.journal
             .lock()
-            .unwrap()
+            .map_err(|_| poisoned_subsystem("journal"))?
             .append_completed(&record, Some(0), true, 0)
             .map_err(internal)
     }

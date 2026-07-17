@@ -475,7 +475,7 @@ impl Kernel {
         let rows = self
             .journal
             .lock()
-            .unwrap()
+            .map_err(|_| poisoned_subsystem("journal"))?
             .entries_by_id(&ids)
             .map_err(internal)?;
         // `entries_by_id` returns rows in the SAME relative order as `ids`
@@ -562,7 +562,7 @@ impl Kernel {
         let rows = self
             .journal
             .lock()
-            .unwrap()
+            .map_err(|_| poisoned_subsystem("journal"))?
             .transcript_events_by_entry(&ids)
             .map_err(internal)?;
         // Same order-preserving zip as `reconstruct_journal_events`: rows

@@ -545,19 +545,27 @@ impl Kernel {
             }));
         }
         let effects_json = serde_json::to_string(&journal_effects).map_err(internal)?;
-        let append_result = self.journal.lock().unwrap().append(&EntryRecord {
-            session: session.id.clone(),
-            // Cloned, not moved: both the error and success paths below
-            // publish a `journal` event (site/content/internals/kernel-protocol.md) carrying this
-            // same principal, well after this record is built.
-            principal: actor.clone(),
-            ts_ns: now_ns(),
-            cwd: evaluator.cwd().as_os_str().as_bytes().to_vec(),
-            src: params.src.clone(),
-            ast_json: ast_json.clone(),
-            effects_json,
-            opaque,
-        });
+        let append_result = self
+            .journal
+            .lock()
+            .map_err(|_| poisoned_subsystem("journal"))
+            .and_then(|journal| {
+                journal
+                    .append(&EntryRecord {
+                        session: session.id.clone(),
+                        // Cloned, not moved: both the error and success paths below
+                        // publish a `journal` event (site/content/internals/kernel-protocol.md) carrying this
+                        // same principal, well after this record is built.
+                        principal: actor.clone(),
+                        ts_ns: now_ns(),
+                        cwd: evaluator.cwd().as_os_str().as_bytes().to_vec(),
+                        src: params.src.clone(),
+                        ast_json: ast_json.clone(),
+                        effects_json,
+                        opaque,
+                    })
+                    .map_err(internal)
+            });
         let entry_id = match append_result {
             Ok(entry_id) => entry_id,
             Err(error) => {
@@ -573,7 +581,7 @@ impl Kernel {
                         }
                     });
                 }
-                return Err(internal(error));
+                return Err(error);
             }
         };
         if let (Some(plan_ref), Some(approval)) = (&params.plan_ref, claimed_approval) {
@@ -595,19 +603,20 @@ impl Kernel {
             let consumed = match consumed {
                 Ok(consumed) => consumed,
                 Err(error) => {
-                    let _ = self
+                    let journal = self
                         .journal
                         .lock()
-                        .map(|journal| journal.finish(entry_id, None, false, 0));
+                        .map_err(|_| poisoned_subsystem("journal"))?;
+                    let _ = journal.finish(entry_id, None, false, 0);
                     return Err(error);
                 }
             };
             if let Err(message) = consumed {
-                let _ = self
+                let journal = self
                     .journal
                     .lock()
-                    .unwrap()
-                    .finish(entry_id, None, false, 0);
+                    .map_err(|_| poisoned_subsystem("journal"))?;
+                let _ = journal.finish(entry_id, None, false, 0);
                 return Err(internal(message));
             }
         }
@@ -628,18 +637,26 @@ impl Kernel {
         let value = match eval_with_position(&mut evaluator, &ast, &params.position) {
             Ok(value) => value,
             Err(e) => {
-                {
-                    let journal = self.journal.lock().unwrap();
-                    let _ = journal.finish(entry_id, e.status, false, elapsed_ns(started));
-                    if let Some(stderr) = &e.stderr {
+                let row_finished = {
+                    let journal = self
+                        .journal
+                        .lock()
+                        .map_err(|_| poisoned_subsystem("journal"))?;
+                    let finished = journal
+                        .finish(entry_id, e.status, false, elapsed_ns(started))
+                        .is_ok();
+                    if finished && let Some(stderr) = &e.stderr {
                         let _ = journal.record_output(entry_id, "stderr", stderr.as_bytes());
                     }
+                    finished
+                };
+                if row_finished {
+                    self.events.publish_journal(
+                        &session.key.owner(),
+                        entry_id,
+                        journal_event(entry_id, &params.src, false, &actor),
+                    );
                 }
-                self.events.publish_journal(
-                    &session.key.owner(),
-                    entry_id,
-                    journal_event(entry_id, &params.src, false, &actor),
-                );
                 // site/content/internals/kernel-protocol.md: even a raised error is
                 // addressable — store it as an out[n] transcript value
                 // so the agent can `shoal_get` the structured error
@@ -670,7 +687,7 @@ impl Kernel {
         let evaluator_entry_id = self
             .journal
             .lock()
-            .unwrap()
+            .map_err(|_| poisoned_subsystem("journal"))?
             .query(&JournalQuery {
                 since_ts_ns: Some(evaluator_started_ns),
                 session: Some(session.id.clone()),
@@ -683,7 +700,14 @@ impl Kernel {
             .and_then(|rows| rows.first().map(|row| row.id));
         session.push_out_entry(evaluator_entry_id);
         let value_ref = Ref::new("out", session.next_value.fetch_add(1, Ordering::Relaxed));
-        session.insert_transcript_checked(value_ref.clone(), value.clone())?;
+        if let Err(error) = session.insert_transcript_checked(value_ref.clone(), value.clone()) {
+            let journal = self
+                .journal
+                .lock()
+                .map_err(|_| poisoned_subsystem("journal"))?;
+            let _ = journal.finish(entry_id, None, false, elapsed_ns(started));
+            return Err(error);
+        }
         let render = shoal_value::render::render_block(&value, 80);
         // Built once, up front: this SAME payload is both persisted durably
         // (so the `session.transcript` channel can replay it after it ages
@@ -693,7 +717,10 @@ impl Kernel {
         let transcript_payload = transcript_event(&value_ref, &value);
         let transcript_ts = now_ns();
         {
-            let journal = self.journal.lock().unwrap();
+            let journal = self
+                .journal
+                .lock()
+                .map_err(|_| poisoned_subsystem("journal"))?;
             journal
                 .finish(entry_id, Some(0), true, elapsed_ns(started))
                 .map_err(internal)?;
@@ -798,6 +825,61 @@ mod tests {
             connection_trust: ConnectionTrust::EmbeddedHuman,
         };
         (session, Some(attachment))
+    }
+
+    #[test]
+    fn journal_poison_is_stable_global_and_restores_approval_reservation() {
+        let kernel = Kernel::new();
+        kernel.set_allow_self_ack(true);
+        let (_session, mut attached) = attached(&kernel, "journal-poison");
+        let planned = kernel
+            .handle_exec(
+                json!({"src":"sh { echo hi }","mode":"plan","position":"stmt"}),
+                1,
+                &mut attached,
+            )
+            .unwrap();
+        let plan_ref = planned["plan_ref"].as_str().unwrap().to_owned();
+
+        let poisoner = kernel.clone();
+        let thread = std::thread::spawn(move || {
+            let _journal = poisoner.journal.lock().unwrap();
+            panic!("inject kernel journal poison");
+        });
+        assert!(thread.join().is_err());
+
+        let approval_error = kernel
+            .handle_cap_request(json!({"plan_ref":plan_ref}), &mut attached)
+            .expect_err("poisoned journal must reject a durable approval");
+        assert_eq!(approval_error.code, INTERNAL_ERROR);
+        assert_eq!(approval_error.data.unwrap()["subsystem"], "journal");
+        kernel
+            .plans
+            .transaction(|plans| {
+                assert!(matches!(
+                    plans.get(&plan_ref).map(|plan| &plan.authorization),
+                    Some(PlanAuthorization::PolicyAllowed)
+                ));
+            })
+            .unwrap();
+
+        for _ in 0..2 {
+            let error = kernel
+                .handle_exec(
+                    json!({"src":"1 + 1","mode":"run","position":"value"}),
+                    1,
+                    &mut attached,
+                )
+                .expect_err("journal quarantine must remain stable");
+            assert_eq!(error.code, INTERNAL_ERROR);
+            let data = error.data.unwrap();
+            assert_eq!(data["subsystem"], "journal");
+            assert_eq!(data["quarantined"], true);
+        }
+
+        kernel
+            .handle_session_snapshot(&attached)
+            .expect("journal poison must not quarantine evaluator session state");
     }
 
     #[test]
