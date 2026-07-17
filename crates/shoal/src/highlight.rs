@@ -71,7 +71,7 @@ fn is_valid_command(cmd: &str) -> bool {
 }
 
 /// Does the raw text at `pos` begin a path literal (`./ ../ ~ ~/ /…`)? A
-/// byte-level replica of the parser's `is_path_head` (TDD §2.2): such a head
+/// byte-level replica of the parser's `is_path_head` (site/content/internals/language-conformance-contract.md): such a head
 /// dispatches CMD, so the highlighter must not lex it as EXPR punctuation.
 fn is_path_head_bytes(bytes: &[u8], pos: usize) -> bool {
     let at = |i: usize| bytes.get(i).copied().unwrap_or(0);
@@ -175,7 +175,7 @@ impl Highlighter for ShoalHighlighter {
 
             // A bare identifier that isn't a keyword/literal/assignment
             // target, sitting where a statement head is expected, is a
-            // COMMAND head (TDD §3.1's dispatch rule, approximated the same
+            // COMMAND head (site/content/internals/language-conformance-contract.md dispatch rule, approximated the same
             // way `completer::classify` does). Its *own* word boundary must
             // then come from CMD-mode lexing, not the EXPR-mode span above —
             // EXPR mode splits on `.`, so `colorcheck.sh` would otherwise be
@@ -210,7 +210,7 @@ impl Highlighter for ShoalHighlighter {
                     || rest.starts_with("-=")
                     || rest.starts_with("*=")
                     || rest.starts_with("/=");
-                // Mirror the parser's statement dispatch (TDD §3.1): a
+                // Mirror the parser's statement dispatch (site/content/internals/language-conformance-contract.md): a
                 // VALUE-bound head is an EXPR variable reference, and an
                 // ident immediately followed by `.ident` (no whitespace) is
                 // the invoke-then-chain refinement — both dispatch EXPR, so

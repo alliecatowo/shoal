@@ -1,4 +1,4 @@
-# Structured filesystem builtins (TDD §5 core verbs: `cp mv rm mkdir touch ln
+# Structured filesystem builtins (site/content/internals/language-conformance-contract.md core verbs: `cp mv rm mkdir touch ln
 # cat stat head which env sleep`; `ls`/`echo` get their own focused coverage
 # elsewhere — collections.toml's `table-ls-*` cases and outcome.toml's
 # `outcome-echo-*` cases already cover them). `crates/shoal-eval/src/
@@ -299,11 +299,11 @@ error = "arg_error"
 [[case]]
 name = "fsb-sleep-zero-returns-null"
 # `sleep` is a builtin, so its bare-statement result is outcome-wrapped
-# (`builtin_outcome`, TDD §4.1 unification) — `.out` recovers the raw `null`.
+# (`builtin_outcome`, site/content/internals/language-conformance-contract.md unification) — `.out` recovers the raw `null`.
 src = "(sleep 0).out"
 value = "null"
 
-# --- echo renders any value, not just strings (TDD §5) --------------------
+# --- echo renders any value, not just strings (site/content/internals/language-conformance-contract.md) --------------------
 
 [[case]]
 name = "fsb-echo-renders-a-parenthesized-list"

@@ -1,7 +1,7 @@
 # Two correctness fixes from a cold-agent field test, pinned here.
 #
 # BUG 1 — arrow-lambda parameters are bound in the two-scope statement
-# dispatcher. A lambda BLOCK body is parsed statement-by-statement (TDD §3.1.3:
+# dispatcher. A lambda BLOCK body is parsed statement-by-statement (site/content/internals/language-conformance-contract.md:
 # a bound name at statement head → EXPR; an unbound name → COMMAND). The parser
 # now seeds an arrow-lambda's params into its value-binding scope for the body
 # parse, exactly as `fn` bodies do — so a statement whose head is the lambda's

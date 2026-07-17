@@ -1,0 +1,39 @@
+{% import "macros/icons.html" as icons %}
+{% set nav_path = current_path | default(value="") %}
+<header class="site-header" data-site-header>
+  <div class="header-inner">
+    <a class="wordmark" href="{{ get_url(path="@/_index.md") }}" aria-label="Shoal home">
+      <img src="{{ get_url(path="img/logo-96.webp") }}" width="38" height="38" alt="">
+      <span>shoal</span>
+      <small>{{ config.extra.version_label }}</small>
+    </a>
+
+    <nav class="primary-nav" aria-label="Primary navigation">
+      <a href="{{ get_url(path="@/docs/_index.md") }}"{% if nav_path is starting_with("/docs") %} aria-current="page"{% endif %}>Docs</a>
+      <a href="{{ get_url(path="@/internals/_index.md") }}"{% if nav_path is starting_with("/internals") %} aria-current="page"{% endif %}>Internals</a>
+      <a href="{{ config.extra.repository_url }}" rel="noreferrer">Source</a>
+    </nav>
+
+    <div class="header-actions">
+      <button class="icon-button search-trigger" type="button" data-search-open aria-label="Search documentation">
+        {{ icons::icon(name="search") }}<kbd>/</kbd>
+      </button>
+      <button class="icon-button theme-toggle" type="button" data-theme-toggle aria-label="Use light theme" title="Change color theme">
+        <span class="theme-icon theme-icon-sun">{{ icons::icon(name="sun") }}</span>
+        <span class="theme-icon theme-icon-moon">{{ icons::icon(name="moon") }}</span>
+      </button>
+      <a class="icon-button github-link" href="{{ config.extra.repository_url }}" rel="noreferrer" aria-label="Shoal on GitHub">
+        {{ icons::icon(name="github") }}
+      </a>
+      <button class="icon-button mobile-menu-toggle" type="button" data-mobile-menu-toggle aria-controls="mobile-menu" aria-expanded="false" aria-label="Open navigation">
+        <span data-menu-icon>{{ icons::icon(name="menu") }}</span>
+        <span data-close-icon hidden>{{ icons::icon(name="close") }}</span>
+      </button>
+    </div>
+  </div>
+  <nav class="mobile-menu" id="mobile-menu" data-mobile-menu aria-label="Mobile navigation" hidden>
+    <a href="{{ get_url(path="@/docs/_index.md") }}">User documentation <span>Learn Shoal</span></a>
+    <a href="{{ get_url(path="@/internals/_index.md") }}">Internals <span>Explore the architecture</span></a>
+    <a href="{{ config.extra.repository_url }}">GitHub <span>Read the source</span></a>
+  </nav>
+</header>

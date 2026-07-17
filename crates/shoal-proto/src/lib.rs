@@ -1,4 +1,4 @@
-//! Shoal's newline-framed JSON-RPC 2.0 wire contract (TDD §7).
+//! Shoal's newline-framed JSON-RPC 2.0 wire contract (site/content/internals/language-conformance-contract.md).
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -46,7 +46,7 @@ pub struct RpcError {
     pub data: Option<Value>,
 }
 
-/// The complete `RpcError.code` taxonomy (TDD §7, AGENT-SURFACE.md's
+/// The complete `RpcError.code` taxonomy (site/content/internals/language-conformance-contract.md, site/content/internals/kernel-protocol.md's
 /// "error codes" table). Every `RpcError` built anywhere in `shoal-kernel`
 /// is constructed with one of these named constants rather than an inline
 /// `-32XXX` literal — this module is the single place the mapping from
@@ -115,7 +115,7 @@ pub mod error_code {
     pub const BAD_PATH_OR_SLICE: i32 = -32005;
     /// The leash policy forbids the requested operation. **Overloaded**
     /// across three related-but-distinct conditions (see
-    /// `docs/AGENT-SURFACE.md`'s error-codes table): a plain
+    /// `site/content/internals/kernel-protocol.md`'s error-codes table): a plain
     /// `Verdict::Deny` on `exec {mode:"run"}`; a `plan_ref`/task lookup
     /// (`plan.get`/`plan.apply`) that names a plan belonging to a different
     /// principal/session; and an `exec {mode:"approved"}` re-entry that
@@ -243,7 +243,7 @@ pub enum WireValue {
     Record {
         v: BTreeMap<String, WireValue>,
     },
-    /// Columnar per TDD §7: every row contributes to every column (missing
+    /// Columnar per site/content/internals/language-conformance-contract.md: every row contributes to every column (missing
     /// cells encode as `null`), so `cols[c].len() == n` for every column.
     Table {
         cols: BTreeMap<String, Vec<WireValue>>,
@@ -260,7 +260,7 @@ pub enum WireValue {
         dur_ns: i64,
         pid: u32,
         cmd: String,
-        /// Source span of the invocation (AGENT-SURFACE §2). `None` when the
+        /// Source span of the invocation (site/content/internals/kernel-protocol.md). `None` when the
         /// outcome carries no source anchor (e.g. a value reconstructed from
         /// the journal); omitted from the wire when absent.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -304,13 +304,13 @@ pub enum WireValue {
         /// Display form; closures are not wire-invocable in v0.1.
         repr: String,
     },
-    /// Stream chunks are deferred (TDD §7 promises "ref + chunks"); today a
+    /// Stream chunks are deferred (site/content/internals/language-conformance-contract.md promises "ref + chunks"); today a
     /// stream only wires its label — pulling chunks needs a follow-up
     /// protocol method that does not exist yet.
     Stream {
         label: String,
     },
-    /// Redaction by construction (TDD §9): never the secret material.
+    /// Redaction by construction (site/content/internals/language-conformance-contract.md): never the secret material.
     Secret {
         name: String,
     },
@@ -319,7 +319,7 @@ pub enum WireValue {
     Cmd {
         repr: String,
     },
-    /// The elision rule (AGENT-SURFACE §3): withheld payload. Shape (type,
+    /// The elision rule (site/content/internals/kernel-protocol.md): withheld payload. Shape (type,
     /// count, table schema, a small preview, and a human-render head) always
     /// travels; the full value is fetchable via `value.get`/`shoal_get` on
     /// `uri` (with an explicit `elide` budget, or a field-path/slice).
@@ -390,15 +390,15 @@ pub struct AttachResult {
     pub cwd: WirePath,
     pub env_hash: String,
     pub ast_version: u32,
-    /// Whether the leash actually enforces (TDD §8 tier honesty) — a client
-    /// learns at attach time if the wall is real (AGENT-SURFACE §5).
+    /// Whether the leash actually enforces (site/content/internals/language-conformance-contract.md tier honesty) — a client
+    /// learns at attach time if the wall is real (site/content/internals/kernel-protocol.md).
     #[serde(default)]
     pub caps_enforced: bool,
     /// The kernel's default elision thresholds, so a client knows the budget
     /// before it tightens/loosens per call.
     #[serde(default)]
     pub elide_defaults: Value,
-    /// Channels this session may subscribe to / read (AGENT-SURFACE §4).
+    /// Channels this session may subscribe to / read (site/content/internals/kernel-protocol.md).
     #[serde(default)]
     pub channels: Vec<String>,
 }
@@ -415,12 +415,12 @@ pub struct ExecParams {
     pub position: String,
     #[serde(default, rename = "async", alias = "background")]
     pub asynchronous: bool,
-    /// Wall-clock cap (AGENT-SURFACE §5): when a synchronous `run` exceeds
+    /// Wall-clock cap (site/content/internals/kernel-protocol.md): when a synchronous `run` exceeds
     /// this, the kernel converts it to a background task and returns a task
     /// ref instead of blocking the caller's context.
     #[serde(default)]
     pub timeout_ms: Option<u64>,
-    /// Per-call elision budget (AGENT-SURFACE §3). Tightens or loosens the
+    /// Per-call elision budget (site/content/internals/kernel-protocol.md). Tightens or loosens the
     /// kernel defaults; never loosens past the hard cap (64 KiB).
     #[serde(default)]
     pub elide: Option<ElideSpec>,
@@ -433,7 +433,7 @@ pub struct ExecParams {
     pub plan_ref: Option<String>,
 }
 
-/// Per-call override of the elision thresholds (AGENT-SURFACE §3). Any field
+/// Per-call override of the elision thresholds (site/content/internals/kernel-protocol.md). Any field
 /// left `None` keeps the kernel default for that dimension. `max_bytes` is
 /// always clamped to the hard cap (64 KiB) — a misbehaving agent cannot ask
 /// its way out of the wall.
@@ -450,7 +450,7 @@ pub struct ElideSpec {
 pub struct TaskParams {
     pub task: Ref,
 }
-/// `pty.open` (AGENT-SURFACE §10): spawn an interactive program on a real PTY
+/// `pty.open` (site/content/internals/kernel-protocol.md): spawn an interactive program on a real PTY
 /// as a long-lived, keyed kernel session with a `vt100`-rendered screen.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PtyOpenParams {
@@ -475,7 +475,7 @@ pub struct PtyRefParams {
 /// `pty.send` — deliver input to a PTY. `input` accepts a raw string, an
 /// object (`{"key":"Enter"}` / `{"text":"…"}` / `{"bytes":"<base64>"}`), or an
 /// array mixing those, so an agent can express "type `i`, `hello`, Escape,
-/// `:wq`, Enter" in one call (the key-name protocol; AGENT-SURFACE §10).
+/// `:wq`, Enter" in one call (the key-name protocol; site/content/internals/kernel-protocol.md).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PtySendParams {
     pub pty_id: Ref,
@@ -537,7 +537,7 @@ pub struct ValueGetParams {
     pub slice: Option<[usize; 2]>,
     #[serde(default)]
     pub elide: Option<ElideSpec>,
-    /// Response shape (AGENT-SURFACE §1): `"json"` (default) returns the
+    /// Response shape (site/content/internals/kernel-protocol.md): `"json"` (default) returns the
     /// `$`-tagged wire value; `"render"` returns the human render string;
     /// `"raw"` returns a str verbatim / bytes base64 (other types error).
     #[serde(default)]
@@ -560,7 +560,7 @@ pub struct JournalQueryParams {
     pub limit: usize,
 }
 
-/// `events.read` — pull the buffered tail of a channel (AGENT-SURFACE §4).
+/// `events.read` — pull the buffered tail of a channel (site/content/internals/kernel-protocol.md).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventsReadParams {
     pub channel: String,
@@ -570,14 +570,14 @@ pub struct EventsReadParams {
     pub limit: Option<usize>,
 }
 
-/// `events.publish` — publish to a `user.*` channel (AGENT-SURFACE §4,§7).
+/// `events.publish` — publish to a `user.*` channel (site/content/internals/kernel-protocol.md).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventsPublishParams {
     pub channel: String,
     pub payload: Value,
 }
 
-/// `events.subscribe` / `events.unsubscribe` (AGENT-SURFACE §6).
+/// `events.subscribe` / `events.unsubscribe` (site/content/internals/kernel-protocol.md).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventsSubParams {
     pub channel: String,
@@ -585,7 +585,7 @@ pub struct EventsSubParams {
     pub since: Option<u64>,
 }
 
-/// One event on a channel — `seq` is monotonic per channel (AGENT-SURFACE §4).
+/// One event on a channel — `seq` is monotonic per channel (site/content/internals/kernel-protocol.md).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Event {
     pub channel: String,

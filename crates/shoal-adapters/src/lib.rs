@@ -1,4 +1,4 @@
-//! Declarative command adapters and structured output parsers (TDD §6).
+//! Declarative command adapters and structured output parsers (site/content/internals/language-conformance-contract.md).
 //!
 //! ## The "consumed" rule (pinned-format subs)
 //!
@@ -35,11 +35,11 @@ pub enum AdapterClass {
     Cli,
     Tui,
     Daemon,
-    /// IO.md §2.2: a head with this class, immediately followed by `{` (or
+    /// site/content/internals/values-streams-execution.md: a head with this class, immediately followed by `{` (or
     /// the triple-raw `'''` form) at command-head position, lexes a raw
     /// balanced-brace/triple-quoted block into `Expr::LangBlock` instead of
     /// a trailing thunk — the adapter-declarative generalization of what
-    /// TDD §13.13 hardcoded for `sh { }` alone. `class = "interpreter"`
+    /// site/content/internals/language-conformance-contract.md hardcoded for `sh { }` alone. `class = "interpreter"`
     /// implies `block = "raw"` by default (no separate field needed for
     /// the only shape v1 has). This is purely a declaration the parser/eval
     /// consult by name; it does not change how `SubSpec`/`ParamSpec`
@@ -47,7 +47,7 @@ pub enum AdapterClass {
     Interpreter,
 }
 
-/// IO.md §2.6 step 3: how an interpreter-class raw block's source text
+/// How an interpreter-class raw block's source text
 /// reaches the child process. `Arg` (the default) appends it as a single
 /// argv word after `top.invoke`'s flag template (e.g. `python3 -c BODY`,
 /// where `invoke = ["-c"]`); `Stdin` pipes it to the child's stdin instead.
@@ -162,7 +162,7 @@ impl AdapterCatalog {
     }
 
     /// The command heads this catalog knows. Order is unspecified — the sole
-    /// caller (the evaluator's command did-you-mean, TDD §13.9) sorts/dedups
+    /// caller (the evaluator's command did-you-mean, site/content/internals/language-conformance-contract.md) sorts/dedups
     /// across candidate sources — so this is just a cheap read view over the
     /// registered names, no allocation.
     pub fn names(&self) -> impl Iterator<Item = &str> {
@@ -496,7 +496,7 @@ fn coerce_cell(raw: &str, ty: &str) -> Option<Value> {
 /// something real `-k` output produces) still degrades sensibly by rounding
 /// instead of hard-failing the whole row/table the way `"int"` would on the
 /// same input; a negative or non-numeric cell still degrades to `None`
-/// (mismatch, not a lie -- TDD §6), same as every other typed column here.
+/// (mismatch, not a lie -- site/content/internals/language-conformance-contract.md), same as every other typed column here.
 fn parse_size_kb(raw: &str) -> Option<u64> {
     let kb: f64 = raw.parse().ok()?;
     if !kb.is_finite() || kb < 0.0 {
@@ -646,7 +646,7 @@ fn parse_z_records(bytes: &[u8], hint: Option<&str>) -> Option<Value> {
     // field, breaking `len % fields` and degrading the whole table to raw
     // bytes. Popping exactly one keeps that `subject: ""` field intact. (A
     // stream with more than one stray trailing separator is genuinely
-    // malformed and degrades to bytes below, per TDD §6 "mismatch degrades to
+    // malformed and degrades to bytes below, per site/content/internals/language-conformance-contract.md "mismatch degrades to
     // bytes rather than lying" -- it can't be told apart from an empty final
     // field without lying about one of the two.)
     if cells.len() % fields.len() == 1 && cells.last().is_some_and(|x| x.is_empty()) {
@@ -688,7 +688,7 @@ fn parse_z_records(bytes: &[u8], hint: Option<&str>) -> Option<Value> {
 /// in. Unmerged (`u`) records and any other unrecognized non-comment line
 /// degrade the same way, since this adapter does not model their shape and
 /// silently dropping them would misrepresent the status as complete. Per
-/// TDD §6: "mismatch degrades to bytes + warning rather than lying."
+/// site/content/internals/language-conformance-contract.md: "mismatch degrades to bytes + warning rather than lying."
 ///
 /// Beyond the raw `status` field (porcelain's two-character `XY` code for
 /// `1`/`2` rows, or the bare `?`/`!` marker), every row also gets a semantic
@@ -1001,8 +1001,8 @@ output={parse="porcelain-v2", type="table<{status: str, path: path}>"}
     // as a real, comparable `Value::Size`, not a bare `int` a caller has to
     // remember is secretly kilobytes and manually multiply. This drives the
     // parsed cell through `shoal_value::ops::compare` the same way
-    // `(du).where(.size > 1mb)` does at the language level (TDD/CONTRACTS
-    // §"the corpus decides disputes" doesn't reach shoal-adapters directly,
+    // `(du).where(.size > 1mb)` does at the language level. The language
+    // contract doesn't reach shoal-adapters directly,
     // so this is the crate-local proof the byte scaling is right).
     #[test]
     fn size_kb_column_is_comparable_as_a_real_size() {
@@ -1213,7 +1213,7 @@ output={parse="porcelain-v2", type="table<{status: str, path: path}>"}
             parse_output("z-records", b"\0\0", Some(h)),
             Some(Value::Table(vec![]))
         );
-        // Regression for FIX 3: a genuinely-empty FINAL field must survive.
+        // Regression: a genuinely-empty FINAL field must survive.
         // `abc\0Allie\0\0` (path is empty) + `-z` terminator `\0` splits to
         // [abc, Allie, "", ""] = 4 cells, `4 % 3 == 1`; popping the single
         // terminator keeps the empty `path` field instead of over-trimming it
@@ -1229,9 +1229,9 @@ output={parse="porcelain-v2", type="table<{status: str, path: path}>"}
         }
         // A stream carrying MORE than the single record terminator (a genuine
         // stray extra NUL) is malformed and now degrades to bytes rather than
-        // being silently absorbed -- the deliberate FIX 3 trade: absorbing
+        // being silently absorbed -- the deliberate trade: absorbing
         // arbitrary trailing NULs is indistinguishable from an empty final
-        // field, and preserving the field wins (TDD §6).
+        // field, and preserving the field wins (site/content/internals/language-conformance-contract.md).
         assert!(parse_output("z-records", b"abc\0Allie\0a.rs\0\0", Some(h)).is_none());
     }
 
@@ -1242,7 +1242,7 @@ output={parse="porcelain-v2", type="table<{status: str, path: path}>"}
         // commit has an EMPTY subject produces a trailing empty `subject` cell
         // immediately before the `-z` record terminator. The old loop popped
         // both, corrupting `len % fields` and degrading the log to raw bytes;
-        // FIX 3 pops only the single terminator so `subject: ""` survives.
+        // The parser pops only the single terminator so `subject: ""` survives.
         let h = "table<{hash: str, author: str, date: datetime, subject: str}>";
         // Two commits: the second (most-recent-first from git) has an empty
         // subject. Bytes: rec1 fields + \0, rec2 fields (empty subject) + \0.
@@ -1324,7 +1324,7 @@ output={parse="porcelain-v2", type="table<{status: str, path: path}>"}
         for name in required {
             assert!(catalog.lookup(name).is_some(), "missing adapter {name}");
         }
-        // IO.md §2.2: the interpreter-class set the shipped pack declares,
+        // site/content/internals/values-streams-execution.md: the interpreter-class set the shipped pack declares,
         // wired end to end through the same loader path as every other
         // class value.
         for interp in ["python", "node", "ruby", "deno", "jq", "bash", "yq"] {
@@ -1342,7 +1342,8 @@ output={parse="porcelain-v2", type="table<{status: str, path: path}>"}
             );
         }
         // python/node/ruby/deno/bash each declare the flag template that
-        // precedes their raw block's payload argv word (IO.md §2.6 step 3);
+        // precedes their raw block's payload argv word (see
+        // `site/content/internals/values-streams-execution.md`);
         // jq takes its filter as a bare positional, so it declares none.
         assert_eq!(
             catalog.lookup("python").unwrap().top.invoke,
@@ -1539,7 +1540,7 @@ consumed=["missing"]
         assert!(warnings[0].contains("consumed"), "{warnings:?}");
     }
 
-    // IO.md §2.2/§2.6: `class = "interpreter"` is a schema value alongside
+    // site/content/internals/values-streams-execution.md: `class = "interpreter"` is a schema value alongside
     // cli|tui|daemon, and `invoke_payload` is only meaningful there.
     #[test]
     fn interpreter_class_loads_and_defaults_invoke_payload_to_arg() {

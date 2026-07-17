@@ -1,12 +1,12 @@
-//! Word -> declared-type coercion (TDD §4.2 site 2, defect #12): CMD words are
+//! Word -> declared-type coercion (see
+//! `site/content/internals/language-conformance-contract.md`): CMD words are
 //! plain strings until coerced against a callee's/adapter's declared param
 //! types.
 
 use super::*;
 
-/// Coerce a single CMD word value to a declared parameter type (TDD §4.2 site 2,
-/// defect #12). Non-string values pass through unchanged; unknown types keep the
-/// value verbatim (→ str).
+/// Coerce a single CMD word value to a declared parameter type. Non-string
+/// values pass through unchanged; unknown types keep the value verbatim (→ str).
 pub(crate) fn coerce_word(v: Value, ty: &str) -> VResult<Value> {
     let ty = ty.trim_end_matches('?');
     let Value::Str(s) = &v else {
@@ -28,7 +28,7 @@ pub(crate) fn coerce_word(v: Value, ty: &str) -> VResult<Value> {
             .ok_or_else(|| ErrorVal::arg_error(format!("expected size, found {s:?}"))),
         "duration" => {
             // Accept bare integers as seconds so `sleep 1` and `sleep 10ms` both
-            // work — and bind them AS a duration (TDD §4.2 site 2), not as a
+            // work — and bind them AS a duration, not as a
             // stray int the callee then trips over in duration arithmetic.
             if let Some(ns) = shoal_value::parse_duration(&s) {
                 Ok(Value::Duration(ns))
@@ -83,7 +83,8 @@ pub(crate) fn expected_param_ty<'a>(
 }
 
 /// Coerce positional + named CMD-word arguments against a function's parameters
-/// (TDD §4.2 site 2 / §4.4 `...rest`). Variadic tails accumulate: every
+/// (`site/content/internals/language-conformance-contract.md`). Variadic tails
+/// accumulate: every
 /// positional word beyond the fixed params is coerced to the rest param's
 /// element type before `call_value_inner` collects them into a `list`.
 pub(crate) fn coerce_call_args(
@@ -121,7 +122,7 @@ pub(crate) fn coerce_call_args(
     Ok(())
 }
 
-/// Coerce each element of a `list<T>`-annotated argument (TDD §4.2 site 2's
+/// Coerce each element of a `list<T>`-annotated argument (the language contract's
 /// `list<T>` row): a bound `list` value gets per-element word coercion to `T`;
 /// any other value — or a non-`list` annotation — passes through verbatim.
 pub(crate) fn coerce_list_param(v: Value, ty: Option<&Type>) -> VResult<Value> {

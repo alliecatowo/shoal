@@ -1,4 +1,4 @@
-//! PATH synthesis — PATH as an *output*, never an input (REEF.md §4).
+//! PATH synthesis — PATH as an *output*, never an input (site/content/internals/reef-resolution.md).
 //!
 //! Given a resolved binding set, build (or reuse) a content-addressed view
 //! directory of symlinks under `$XDG_RUNTIME_DIR/shoal/views/<hash>/bin`

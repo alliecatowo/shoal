@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <defs>
+    <linearGradient id="bg" x1="8" y1="4" x2="56" y2="60" gradientUnits="userSpaceOnUse"><stop stop-color="#111e50"/><stop offset="1" stop-color="#071126"/></linearGradient>
+    <linearGradient id="shell" x1="12" y1="16" x2="52" y2="54" gradientUnits="userSpaceOnUse"><stop stop-color="#f29bce"/><stop offset=".5" stop-color="#b18bed"/><stop offset="1" stop-color="#71a7f6"/></linearGradient>
+  </defs>
+  <rect x="2" y="2" width="60" height="60" rx="16" fill="url(#bg)"/>
+  <path fill="url(#shell)" d="M32 12c4.4 0 7 3.7 8.1 6 2.6-1.8 7.6-1.1 9.5 2.2 2.2 3.8-.2 7.2-1.8 8.5 2.1 1.7 3 5.8.8 8.8-2 2.8-5.2 2.8-7.4 2.3-.8 5-3.6 10.2-9.2 12.2-5.6-2-8.4-7.2-9.2-12.2-2.2.5-5.4.5-7.4-2.3-2.2-3-.3-7.1.8-8.8-1.6-1.3-4-4.7-1.8-8.5 1.9-3.3 6.9-4 9.5-2.2 1.1-2.3 3.7-6 8.1-6Z"/>
+  <path fill="#7959ce" d="M21 31c3.5-3.5 7-3.7 10.1-.8-3.5 3.4-7 3.7-10.1.8Zm22 5c-3.2 3.2-6.4 3.4-9.2.8 3.2-3.1 6.4-3.4 9.2-.8Z"/>
+</svg>

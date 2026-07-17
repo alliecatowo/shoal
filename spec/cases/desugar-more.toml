@@ -1,11 +1,11 @@
-# Further §3.4 desugaring-table rows not yet covered by desugar.toml: the
+# Further site/content/internals/language-conformance-contract.md desugaring-table rows not yet covered by desugar.toml: the
 # `< file` stdin redirect (only `>`/`>>` were exercised there), negative
-# numeric flag values, and a real spec/impl gap found while probing TDD
-# §4.3's `list<path>` callee-side glob expansion promise.
+# numeric flag values, and a real spec/impl gap found while probing the
+# `list<path>` callee-side glob-expansion promise.
 
 [[case]]
 name = "desugar2-stdin-redirect-feeds-file-to-external"
-# `cmd < f` -> stdin-from-file capture (TDD §3.4); `sh -c 'sort'` reads its
+# `cmd < f` -> stdin-from-file capture (site/content/internals/language-conformance-contract.md); `sh -c 'sort'` reads its
 # stdin and sorts the three lines from the redirected file.
 fixture = ["in.txt"]
 src = '''
@@ -16,15 +16,15 @@ value = '"a\nb\nc"'
 
 [[case]]
 name = "desugar2-negative-number-flag-value"
-# `--n=-5` -> `named(n: w"-5")` coerced to `int` at call-bind (TDD §3.4 +
-# §4.4); the leading `-` is part of the flag's VALUE text, not a second
+# `--n=-5` -> `named(n: w"-5")` coerced to `int` at call-bind; the leading `-`
+# is part of the flag's VALUE text, not a second
 # flag.
 src = "fn f(n: int = 0) { n }\nf --n=-5"
 value = "-5"
 
 [[case]]
 name = "desugar2-alias-flags-pass-through-to-adapter-invocation"
-# TDD §1.8: "later args append" to the aliased call's argv — but for a
+# site/content/internals/language-conformance-contract.md: "later args append" to the aliased call's argv — but for a
 # FLAG appended after the fact (as opposed to baked into the alias
 # definition itself, which does work: see desugar.toml's
 # `desugar-alias-appends-later-args` for the positional-arg case), the

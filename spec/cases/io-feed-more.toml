@@ -1,5 +1,5 @@
 # Further `.feed` hardening beyond io.toml's first pass: the scalar rows of
-# IO.md §1.2's feedability table (int/bool feed their `render_inline` text —
+# site/content/internals/values-streams-execution.md feedability table (int/bool feed their `render_inline` text —
 # these two cases previously pinned the pre-implementation `type_error`, and
 # were UPDATED when feed_bytes gained the documented scalar serialization;
 # more scalar coverage lives in method-errors.toml), and a non-str list's
@@ -10,7 +10,7 @@
 
 [[case]]
 name = "iofeed2-int-receiver-feeds-decimal-text"
-# int → decimal text via `render_inline` (IO.md §1.2), no trailing newline.
+# int → decimal text via `render_inline` (site/content/internals/values-streams-execution.md), no trailing newline.
 src = "5.feed(cat).out"
 value = '"5"'
 
@@ -34,7 +34,7 @@ src = "{n: 5}.feed(cat).out"
 value = "{n: 5}"
 
 # `.feed(cmd args…)` parses its argument in CMD mode when it starts with a
-# command head (IO.md §1.1), so a command with flags/args works bare:
+# command head (site/content/internals/values-streams-execution.md), so a command with flags/args works bare:
 # `.feed(sort -r)`, `.feed(jq ".a")`. A value-shaped argument (the inverted
 # `cmd.feed(value)` form) has no command head and stays an expression. Block
 # forms (`sh {…}`, `jq {…}`) also work. See

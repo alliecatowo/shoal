@@ -3,7 +3,7 @@
 # the one word-binding shape that correctly accumulates every match — see
 # desugar-more.toml's documented gap for the non-variadic `list<path>`
 # sibling), `**` recursion into subdirectories, and a real spec/impl gap
-# found while probing TDD §4.3's dotfile-exclusion promise.
+# found while probing site/content/internals/language-conformance-contract.md dotfile-exclusion promise.
 
 [[case]]
 name = "glob2-star-matches-multiple-non-dotfiles"
@@ -25,7 +25,7 @@ value = "2"
 
 [[case]]
 name = "glob2-dotfiles-excluded-by-default-not-honored"
-# TDD §4.3: "dotfiles excluded unless pattern starts with `.`" — a plain
+# site/content/internals/language-conformance-contract.md: "dotfiles excluded unless pattern starts with `.`" — a plain
 # `*.txt` should skip `.hidden.txt`. The current glob expansion does not
 # apply this filter at all: `.hidden.txt` is included in the match set
 # right alongside the non-dotfiles, so the variadic sink sees 3 matches

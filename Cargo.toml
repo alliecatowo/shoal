@@ -6,7 +6,7 @@ members = ["crates/*"]
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/allie/shoal"
+repository = "https://github.com/alliecatowo/shoal"
 
 [profile.release]
 lto = "thin"
@@ -21,7 +21,7 @@ shoal-journal = { path = "crates/shoal-journal" }
 shoal-adapters = { path = "crates/shoal-adapters" }
 shoal-eval = { path = "crates/shoal-eval" }
 
-# Conservative, workspace-wide lint policy (scratch/audit-quality.md §1). NOT yet wired to any
+# Conservative, workspace-wide lint policy (site/content/internals/tooling-and-quality.md). NOT yet wired to any
 # crate: a member only inherits this table by adding `[lints] workspace = true` to its own
 # Cargo.toml, which is a per-crate opt-in landed in a follow-up wave (see
 # [workspace.metadata.lints] below for why it isn't done here). Every lint below was verified
@@ -33,7 +33,7 @@ shoal-eval = { path = "crates/shoal-eval" }
 # `unsafe_code` is deliberately NOT set to "warn"/"deny": the tree has real, legitimate `unsafe`
 # today (PTY/signal/uid syscalls in shoal-exec/shoal-kernel/shoal-reef/shoal-doctor, the macOS
 # Seatbelt FFI in shoal-leash, env-var mutation in shoal/shoal-eval tests — confirmed via
-# `grep -rn 'unsafe ' crates/*/src`, ~30 sites across 8 crates). scratch/audit-quality.md's
+# `grep -rn 'unsafe ' crates/*/src`, ~30 sites across 8 crates). site/content/internals/tooling-and-quality.md's
 # "zero unsafe blocks" claim was already stale when written; denying it here would trip the
 # instant any crate opts in. Revisit per-crate once each unsafe site has a `// SAFETY:` comment.
 noop_method_call = "warn"
@@ -48,7 +48,7 @@ dbg_macro = "warn"
 todo = "warn"
 unimplemented = "warn"
 mem_forget = "warn"
-# R4 lint-tightening pass (scratch/audit-arch.md §4 "Wave 3"): each below was checked
+# Verified lint-tightening additions: each entry below was checked
 # individually — `cargo +stable clippy --workspace --all-targets --locked -- -D warnings -W
 # <lint>` on top of everything above — and produced zero additional warnings workspace-wide at
 # the time it was added. They sit outside clippy::all's default groups but are cheap and
@@ -63,17 +63,17 @@ status = """
 to a crate that adds `[lints] workspace = true` to its own manifest, and this task's ownership is
 scoped to the root Cargo.toml only (not member manifests) — partly to avoid racing the parallel
 work landing at the same time this table was authored (shoal-eval's lib.rs module split; a new
-shoal-prompt crate). Land the opt-in crate-by-crate in a follow-up wave, confirming
+shoal-prompt crate). Land the opt-in crate-by-crate in a follow-up pass, confirming
 `cargo +stable clippy -p <crate> --all-targets -- -D warnings` stays green after each addition
 (a crate's own `#![allow(...)]`, e.g. shoal-syntax/src/lib.rs, takes precedence over the inherited
 workspace level per lint, so opting in is safe even for crates with existing suppressions).
 """
 deferred_pending_violations = """
-scratch/audit-quality.md §1 proposes `clippy::missing_errors_doc` (88 warnings today),
+site/content/internals/tooling-and-quality.md proposes `clippy::missing_errors_doc` (88 warnings today),
 `clippy::missing_panics_doc` (19), `clippy::unwrap_used`/`clippy::expect_used` (hundreds),
 `clippy::use_self` (273), and rust's `missing_debug_implementations` — all desirable but each has
 existing violations workspace-wide as of this writing, so none are enabled above (enabling any of
-them now would break the first crate that opts in). Track these for a dedicated cleanup wave
+them now would break the first crate that opts in). Track these for a dedicated cleanup pass
 rather than enabling-with-violations; `clippy::use_self` is reportedly ~all auto-fixable via
 `cargo clippy --fix -- -W clippy::use_self` per crate, so likely the cheapest to land first.
 Also tried and DROPPED: rust's `unused_qualifications` — verified clean on 17 of 20 crates but
@@ -82,9 +82,9 @@ its lib.rs module split landing concurrently with this table; re-check and re-ad
 split settles (the fix is mechanical: `crate::helpers::foo(..)` -> `helpers::foo(..)` /
 `shoal_value::ClosureVal` -> `ClosureVal` where already imported).
 
-R4 lint-tightening pass (re-checked, still not enabled — live violation counts as of this
+Later lint-tightening pass (re-checked, still not enabled — live violation counts as of this
 writing): `clippy::use_self` (91), rust's `missing_debug_implementations` (4),
-`clippy::unused_qualifications` (4, same shoal-eval sites above — recheck once the R4 eval/
+`clippy::unused_qualifications` (4, same shoal-eval sites above — recheck once the evaluator/
 parser/kernel file splits land, since module boundaries moving is exactly what shifts these),
 `clippy::redundant_clone` (3), `clippy::needless_pass_by_value` (4), `clippy::manual_let_else`
 (3), `clippy::single_match_else` (3), `clippy::map_unwrap_or` (8), `clippy::implicit_clone` (3).

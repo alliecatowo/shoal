@@ -1,4 +1,4 @@
-//! Host builtins that reach into IO directly (§5): `interact`, `open`, `save`,
+//! Host builtins that reach into IO directly (site/content/internals/language-conformance-contract.md): `interact`, `open`, `save`,
 //! `parallel`, `retry`, plus the builtin-redirect/outcome-wrapping helpers they
 //! (and `command.rs`) share.
 
@@ -15,7 +15,7 @@ impl Evaluator {
             match r.kind {
                 RedirectKind::Out => {
                     let p = self.arg_path(&r.target)?;
-                    // Undo (TDD §9): snapshot the target's prior bytes first, so
+                    // Undo (site/content/internals/language-conformance-contract.md): snapshot the target's prior bytes first, so
                     // `echo x > f` is reversible exactly like `cp`/`save`.
                     let undo_pre = self.redirect_undo_pre(&p);
                     self.fs
@@ -42,7 +42,7 @@ impl Evaluator {
         if captured { Ok(Value::Null) } else { Ok(value) }
     }
 
-    /// Force a real PTY for `interact <cmd…>` (§5).
+    /// Force a real PTY for `interact <cmd…>` (site/content/internals/language-conformance-contract.md).
     pub(crate) fn builtin_interact(&mut self, call: &CmdCall) -> VResult<Value> {
         let vs = self.collect_cmd_values(call)?;
         if vs.is_empty() {
@@ -66,7 +66,7 @@ impl Evaluator {
         r
     }
 
-    /// `open <path>` — detached `xdg-open` (§5).
+    /// `open <path>` — detached `xdg-open` (site/content/internals/language-conformance-contract.md).
     pub(crate) fn builtin_open(&mut self, pos: Vec<Value>) -> VResult<Value> {
         if pos.len() != 1 {
             return Err(ErrorVal::arg_error("open expects exactly one path"));
@@ -88,14 +88,14 @@ impl Evaluator {
         Ok(Value::Null)
     }
 
-    /// `save(path, value)` builtin form (§5) — delegates to the value method.
+    /// `save(path, value)` builtin form (site/content/internals/language-conformance-contract.md) — delegates to the value method.
     pub(crate) fn builtin_save(&mut self, pos: Vec<Value>) -> VResult<Value> {
         if pos.len() != 2 {
             return Err(ErrorVal::arg_error("save expects (path, value)"));
         }
         let path = pos[0].clone();
         let value = pos[1].clone();
-        // TDD §9 undo: if `save` overwrites an existing file under a journal,
+        // site/content/internals/language-conformance-contract.md undo: if `save` overwrites an existing file under a journal,
         // snapshot its prior bytes first, then record a restore inverse after
         // the write. A no-op unless a journal is installed mid-statement.
         let undo_pre = self.save_undo_pre(&path);
@@ -114,7 +114,7 @@ impl Evaluator {
     }
 
     /// `parallel(...closures)` — fail-fast by default; `settle: true` collects all
-    /// outcomes (§5).
+    /// outcomes (site/content/internals/language-conformance-contract.md).
     pub(crate) fn builtin_parallel(&mut self, args: &Args) -> VResult<Value> {
         let a = self.eval_args(args)?;
         let settle = a
@@ -129,7 +129,7 @@ impl Evaluator {
             let cwd = self.cwd.clone();
             let penv = self.process_env.clone();
             let adapters = self.adapters.clone();
-            // Share the host's effect ports (docs/ROADMAP.md R4) so a `parallel`
+            // Share the host's effect ports (site/content/internals/roadmap-and-priorities.md) so a `parallel`
             // child spawned under a fake/custom adapter sees it too. Cheap `Arc`
             // clones; identical to the old behavior under the `Std*` defaults.
             let fs = self.fs.clone();
@@ -174,7 +174,7 @@ impl Evaluator {
         Ok(Value::List(results))
     }
 
-    /// `retry(n, thunk, delay: duration?)` — retry a thunk until it succeeds (§5).
+    /// `retry(n, thunk, delay: duration?)` — retry a thunk until it succeeds (site/content/internals/language-conformance-contract.md).
     pub(crate) fn builtin_retry(&mut self, args: &Args) -> VResult<Value> {
         let a = self.eval_args(args)?;
         let n = match a.pos.first() {
@@ -253,7 +253,7 @@ pub(crate) fn builtin_outcome(head: &str, result: Value) -> Value {
 pub(crate) fn value_bytes(v: &Value) -> Vec<u8> {
     match v {
         Value::Bytes(b) => (**b).clone(),
-        // §317: a CAS-backed value writes its FULL content (loaded on demand),
+        // site/content/internals/language-conformance-contract.md: a CAS-backed value writes its FULL content (loaded on demand),
         // falling back to the resident preview only if the store is unreachable.
         Value::CasBytes(c) => c.resolve().unwrap_or_else(|_| c.preview.as_ref().clone()),
         Value::Str(s) => {

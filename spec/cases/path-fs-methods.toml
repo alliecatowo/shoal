@@ -1,5 +1,6 @@
-# Dogfood papercuts (docs/TDD.md §4.3 globs, §5 builtin surface; docs/
-# CONTRACTS.md §3 path/glob method set): `path` was bytes-backed navigation
+# Dogfood papercuts (language behavior in
+# `site/content/internals/language-conformance-contract.md`; method dispatch in
+# `site/content/internals/intercrate-protocol-contracts.md`): `path` was bytes-backed navigation
 # data with almost no methods of its own — every "is this a file, how big,
 # what's its name" question forced a detour through `stat`/`cat`. This file
 # covers the two halves of the fix:
@@ -10,7 +11,7 @@
 #     relative paths against session cwd): `.read` `.lines` `.exists`
 #     `.is_dir` `.is_file` `.size` — `crates/shoal-eval/src/expr_access.rs`.
 #
-# `path("…")` (TDD §5's constructor surface) builds a `path` value directly
+# `path("…")` (site/content/internals/language-conformance-contract.md constructor surface) builds a `path` value directly
 # from a str, unjoined to cwd — the cleanest way to get a `path` value in a
 # case without going through glob expansion's cwd-absolutization (fs-
 # builtins.toml's determinism note).
@@ -64,7 +65,7 @@ value = "sub"
 [[case]]
 name = "pathm-parent-of-a-bare-name-is-null"
 # std `Path::parent` of a bare relative name is `Some("")`, not `None` — the
-# accessor collapses that empty-path case to `null` (CONTRACTS §3) so callers
+# accessor collapses that empty-path case to `null` (site/content/internals/intercrate-protocol-contracts.md) so callers
 # don't have to special-case an empty-but-not-null path.
 fixture = ["a.txt"]
 src = 'path("a.txt").parent()'
@@ -159,7 +160,7 @@ name = "pathm-exists-takes-no-arguments"
 src = 'path("a.txt").exists("x")'
 error = "arg_error"
 
-# --- .size (filesystem-backed; render rules SIZE.md via CONTRACTS §3) ------
+# --- .size (filesystem-backed; render rules SIZE.md via site/content/internals/intercrate-protocol-contracts.md) ------
 
 [[case]]
 name = "pathm-size-of-a-saved-file"
@@ -215,7 +216,7 @@ value = '["only"]'
 
 [[case]]
 name = "pathm-lines-strips-trailing-cr"
-# TDD §13.10: `.lines()` strips `\r?\n` — the filesystem-backed path variant
+# site/content/internals/language-conformance-contract.md: `.lines()` strips `\r?\n` — the filesystem-backed path variant
 # honors the same rule as the str method it mirrors.
 src = '''
 "a\r\nb".save("crlf.txt")
@@ -231,7 +232,7 @@ path("f.txt").read().trim()
 '''
 value = '"padded"'
 
-# --- glob(...) as a collection value (TDD §4.3, CONTRACTS §3) --------------
+# --- glob(...) as a collection value (site/content/internals/language-conformance-contract.md, site/content/internals/intercrate-protocol-contracts.md) --------------
 
 [[case]]
 name = "pathm-glob-value-len-counts-matches"
@@ -285,7 +286,7 @@ fixture = ["a.txt"]
 src = 'glob("*.txt").expand().len()'
 value = "1"
 
-# --- for-in over a glob value (TDD §4.3: iterating a glob expands matches) --
+# --- for-in over a glob value (site/content/internals/language-conformance-contract.md: iterating a glob expands matches) --
 
 [[case]]
 name = "pathm-for-in-glob-counts-matches"

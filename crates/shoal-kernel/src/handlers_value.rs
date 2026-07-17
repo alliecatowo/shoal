@@ -1,10 +1,10 @@
 //! `dispatch` handlers for value/journal queries: `value.get`,
 //! `journal.query`. The `events.*` handlers live in `eventbus.rs` alongside
-//! the `EventBus` they operate on. Split out of `lib.rs`'s dispatch match
-//! (docs/ROADMAP.md wave R4): pure mechanical move, zero wire/behavior change.
+//! the `EventBus` they operate on. Wire behavior is documented in
+//! `site/content/internals/kernel-protocol.md`.
 use super::*;
 
-/// Map a §317 CAS-backed bytes resolution failure — a missing or corrupt blob
+/// Map a CAS-backed bytes resolution failure — a missing or corrupt blob
 /// surfaced when `value.get` materializes an elided `CasBytes` ref under a
 /// `slice`/`format=raw` ask — to a wire error that names the ref, so an agent
 /// fetching the content gets a clear reason instead of a bare code.
@@ -51,7 +51,7 @@ impl Kernel {
                 let end = end.max(start).min(items.len());
                 Value::List(items[start..end].to_vec())
             }
-            // A table IS a list<record> semantically (TDD §4.1) — slicing it
+            // A table IS a list<record> semantically (site/content/internals/language-conformance-contract.md) — slicing it
             // used to silently no-op, returning the WHOLE table as if the
             // slice had been applied.
             (Some([start, end]), Value::Table(rows)) => {
@@ -71,7 +71,7 @@ impl Kernel {
                 let end = end.max(start).min(b.len());
                 Value::Bytes(std::sync::Arc::new(b[start..end].to_vec()))
             }
-            // §317: a slice of a CAS-backed bytes ref RESOLVES it. Slicing is
+            // site/content/internals/kernel-protocol.md: a slice of a CAS-backed bytes ref RESOLVES it. Slicing is
             // an explicit "give me these bytes" ask, so materialize the full
             // content from the CAS (through the value's own loader — the same
             // `BytesLoad`/`Cas` seam the in-language path uses) and slice it.
@@ -96,7 +96,7 @@ impl Kernel {
             }
             (None, other) => other,
         };
-        // `format` (AGENT-SURFACE §1): "json" (default) → $-tagged wire value;
+        // `format` (site/content/internals/kernel-protocol.md): "json" (default) → $-tagged wire value;
         // "render" → the human render string; "raw" → str verbatim / bytes
         // base64 (anything else has no raw byte form — say so).
         match params.format.as_deref() {
@@ -108,7 +108,7 @@ impl Kernel {
             }
             Some("render") => {
                 let render = shoal_value::render::render_block(&sliced, 80);
-                // Same hard cap as MCP's content[0].text (AGENT-SURFACE §3):
+                // Same hard cap as MCP's content[0].text (site/content/internals/kernel-protocol.md):
                 // `format=render` must not be a way to bypass the elision
                 // wall by asking for the human render instead of the value.
                 let uri = short_ref_to_uri(&params.r#ref, params.path.as_deref());
@@ -127,7 +127,7 @@ impl Kernel {
                             &***b,
                         ),
                     }),
-                    // §317: `format=raw` on a CAS-backed bytes ref resolves it —
+                    // site/content/internals/kernel-protocol.md: `format=raw` on a CAS-backed bytes ref resolves it —
                     // materialize the full content from the CAS and hand back its
                     // base64, exactly as for a resident `bytes`. (An unsliced
                     // CasBytes only reaches here under `format=raw`; the default
@@ -182,7 +182,7 @@ impl Kernel {
         // The journal store filters since/principal/head/ok/limit; the
         // wire also promises `until` (upper time bound) and `effects`
         // (effect-kind subset) — kernel-side post-filters over the
-        // returned rows (AGENT-SURFACE §5 / TDD §7).
+        // returned rows (site/content/internals/kernel-protocol.md / site/content/internals/language-conformance-contract.md).
         // Effect kinds are stored snake_case (`fs_delete`); agents use
         // the dotted convention (`fs.delete`). Normalize so either
         // form matches.

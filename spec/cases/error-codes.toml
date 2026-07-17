@@ -1,17 +1,17 @@
-# Coverage sweep of docs/CONTRACTS.md §4's pinned error-code list, focused
+# Coverage sweep of site/content/internals/intercrate-protocol-contracts.md pinned error-code list, focused
 # on codes not yet asserted by any other corpus file: `cmd_failed`,
 # `utf8_error`, `recursion_limit`, `reef_not_found`, and the
 # `lang_block_unbalanced` PARSE diagnostic (its brace-scanner trigger lives
 # in the lexer, so the harness observes it as a `parse_error`, not an eval
-# `error` code — CONTRACTS §5's schema has no `code` field for parse
+# `error` code — site/content/internals/intercrate-protocol-contracts.md schema has no `code` field for parse
 # failures). Two genuinely unimplemented codes (`assert_failed`: no `assert`
 # builtin exists yet; `runner_not_found`: `run <path>` resolution falls back
 # to a plain `not_found`, not the extension/shebang-lookup diagnostic
-# IO.md §6 describes) are `skip`ped with a reason rather than asserted.
+# site/content/internals/values-streams-execution.md describes) are `skip`ped with a reason rather than asserted.
 
 [[case]]
 name = "errcode-cmd-failed-on-out-field-access"
-# `.out`/`.err` on a non-ok outcome raise `cmd_failed` (TDD §4.1); the raw
+# `.out`/`.err` on a non-ok outcome raise `cmd_failed` (site/content/internals/language-conformance-contract.md); the raw
 # `.status`/`.stdout`/`.stderr` fields stay reachable regardless (see
 # edges.toml's signal-death cases for that side).
 src = '''
@@ -58,7 +58,7 @@ error = "utf8_error"
 
 [[case]]
 name = "errcode-recursion-limit-on-unbounded-native-recursion"
-# The interpreter's own call-stack guard (TDD §4.5-adjacent implementation
+# The interpreter's own call-stack guard (site/content/internals/language-conformance-contract.md-adjacent implementation
 # detail, `call_value`'s `call_depth` counter) caps nested calls at 10000,
 # independent of any language-level tail-call optimization. shoal-eval's own
 # `defect9_recursion_guard_returns_error` unit test proves the guard fires
@@ -85,7 +85,7 @@ error = "reef_not_found"
 
 [[case]]
 name = "errcode-val-blake3-ref-without-cas-is-not-found"
-# TDD §317 in-language dispatch: a `val:blake3:<hash>` content short-ref
+# site/content/internals/language-conformance-contract.md in-language dispatch: a `val:blake3:<hash>` content short-ref
 # (the recoverable handle `.ref` yields) written as a value is resolved
 # against the session CAS when a method is called on it. The corpus runs
 # with NO journal/CAS installed, so a ref-shaped string there cannot resolve
@@ -105,7 +105,7 @@ value = "5"
 
 [[case]]
 name = "errcode-lang-block-unbalanced-braces-is-a-parse-error"
-# IO.md §5: brace-scanning `sh { … }` that reaches EOF with an unterminated
+# site/content/internals/values-streams-execution.md: brace-scanning `sh { … }` that reaches EOF with an unterminated
 # `{` is `lang_block_unbalanced` — surfaced as a PARSE-time diagnostic (the
 # lexer's `raw_brace_block` scanner), so the harness checks it via
 # `parse_error`/`parse_error_contains`, not an eval `error` code.
@@ -115,7 +115,7 @@ parse_error_contains = "unbalanced braces"
 
 [[case]]
 name = "errcode-runner-not-found"
-# IO.md §6's `run <path>` extension/shebang-fallback resolution raises
+# site/content/internals/values-streams-execution.md `run <path>` extension/shebang-fallback resolution raises
 # `runner_not_found` once every candidate runner is exhausted — an
 # unresolvable script path (unknown extension, no shebang) surfaces this
 # code rather than a bare filesystem `not_found` from the spawn attempt.

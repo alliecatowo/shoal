@@ -1,7 +1,7 @@
 //! Regression tests for the parser/lexer audit defects D1–D13 plus the
 //! parser-side eval-audit items (#2 fn/alias two-scope, #6 `&&`/`||` command
-//! operands, #7 `cmd &` lookahead) and the REPL leading-`.` chain. Each test
-//! uses the exact repro from `scratch/explore-parser-audit.md`.
+//! operands, #7 `cmd &` lookahead) and the REPL leading-`.` chain. The stable
+//! parser/formatter design record is `site/content/internals/parser-formatter.md`.
 
 use shoal_ast::*;
 use shoal_syntax::{ParseCtx, canonical_equivalent, format_program, parse, parse_with_ctx};
@@ -383,7 +383,7 @@ fn repl_leading_dot_chains_on_it() {
 // IIFE call restriction, match-guard-lambda mis-parse, `(it)`/`(out)` REPL bypass.
 // (spec/cases/closures-more.toml, match-more.toml, edges.toml)
 
-/// TDD §3.2's `postfix = primary { … | call [trailing] }` grammar makes
+/// site/content/internals/language-conformance-contract.md `postfix = primary { … | call [trailing] }` grammar makes
 /// `lambda` an ordinary `primary` with no carve-out against an immediate
 /// `call` postfix — a parenthesized lambda literal must be directly
 /// callable, not just callable once bound to a name.
@@ -498,7 +498,7 @@ fn syntax_gap_paren_it_out_rejected_in_scripts() {
 // ---------------------------------------------------------------- for-loop
 // iterable vs. trailing-block-lambda ambiguity (dogfooding papercut).
 //
-// `postfix()`'s `f(a){…}` trailing-block desugar (§3.4) greedily grabs a
+// `postfix()`'s `f(a){…}` trailing-block desugar (site/content/internals/language-conformance-contract.md) greedily grabs a
 // `{` right after a call's `)`. When that call is the *whole* for-loop
 // iterable (`for p in glob("*.md") { … }`), the desugar swallowed the loop
 // body's own brace as a bogus thunk argument to `glob(...)`, leaving the
@@ -562,7 +562,7 @@ fn for_in_over_a_call_still_allows_a_parenthesised_trailing_block() {
 fn call_trailing_block_lambda_still_works_outside_a_for_iterable() {
     // The suppression is scoped to the for-loop's iterable only; an
     // ordinary statement-position call keeps taking its trailing block as
-    // the `f(a){…}` sugar (§3.4) intends.
+    // the `f(a){…}` sugar (site/content/internals/language-conformance-contract.md) intends.
     let p = parse("retry(3) { attempt() }").unwrap();
     match last(&p) {
         Stmt::Expr {

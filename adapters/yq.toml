@@ -1,4 +1,4 @@
-# `class = "interpreter"` (IO.md §2.2) opts `yq { FILTER }` into raw-block
+# `class = "interpreter"` (site/content/internals/values-streams-execution.md) opts `yq { FILTER }` into raw-block
 # lexing, exactly like `jq.toml` — the block's raw text becomes yq's filter
 # argument, the same one positional argument `filter` already binds below
 # for the ordinary `yq(filter: ...)` call shape.

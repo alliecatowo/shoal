@@ -1,4 +1,4 @@
-//! `PromptContext` — the one and only input to the renderer (design-prompt.md §2.2).
+//! `PromptContext` — the one and only input to the renderer (site/content/internals/prompt-editor-lsp.md).
 //!
 //! Every field is either copy-cheap or a small owned value already sized for a
 //! single repo/session. No field is a `Result` or a `Future`: by the time a
@@ -22,9 +22,9 @@ pub struct PromptContext {
     pub width: u16,
     /// `NO_COLOR` present (checked once at process start).
     pub no_color: bool,
-    /// Nerd-font glyphs available (resolved once at startup, §3.5).
+    /// Nerd-font glyphs available (resolved once at startup, site/content/internals/prompt-editor-lsp.md).
     pub nerd_font: bool,
-    /// Unicode allowed; ascii fallback when false (§3.5).
+    /// Unicode allowed; ascii fallback when false (site/content/internals/prompt-editor-lsp.md).
     pub unicode: bool,
     pub edit_mode: EditMode,
     /// Buffer currently spans more than one line.
@@ -184,7 +184,7 @@ pub struct GitSnapshot {
 
 impl GitSnapshot {
     /// A placeholder snapshot for a repo whose first recompute has not landed
-    /// yet — known root/branch, zeroed counts, flagged degraded (§2.4).
+    /// yet — known root/branch, zeroed counts, flagged degraded (site/content/internals/prompt-editor-lsp.md).
     pub fn pending(repo_root: PathBuf, repo_relative: PathBuf, branch: Option<String>) -> Self {
         Self {
             repo_root,
@@ -220,7 +220,7 @@ pub struct BatterySnapshot {
     pub charging: bool,
 }
 
-/// State of a `[prompt.module.custom.<name>]` background computation (§7.4).
+/// State of a `[prompt.module.custom.<name>]` background computation (site/content/internals/prompt-editor-lsp.md).
 #[derive(Debug, Clone)]
 pub enum CustomSegment {
     Ready(String),

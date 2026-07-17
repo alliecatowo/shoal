@@ -1,23 +1,23 @@
 //! Binary-side prompt wiring: build a [`PromptContext`] from live session state
 //! and drive the pure `shoal-prompt` renderer as reedline's prompt.
 //!
-//! The §1 invariant (a prompt render performs zero I/O / zero subprocess spawns)
+//! The site/content/internals/prompt-editor-lsp.md invariant (a prompt render performs zero I/O / zero subprocess spawns)
 //! is honored structurally here: [`build_context`] runs **once per command**
 //! (between keystrokes, right before the next `read_line`), freezing a snapshot
 //! into a shared cell. reedline calls the render methods on every keystroke, but
 //! those only ever read the frozen snapshot — never git, never a clock syscall,
 //! never a spawn. This retires the `git_suffix()` subprocess-per-keystroke bug
-//! the old `DefaultPrompt` path carried (design §0, §10).
+//! the old `DefaultPrompt` path carried (site/content/internals/prompt-editor-lsp.md).
 //!
 //! `jobs` and `reef`/`language_*` are populated from the evaluator's typed
 //! accessors (`Evaluator::jobs_snapshot`, `Evaluator::prompt_reef_snapshot` —
-//! design §12.1): both read only in-memory/cached state (the live task
+//! site/content/internals/prompt-editor-lsp.md): both read only in-memory/cached state (the live task
 //! registry; the cached reef `ScopeChain` + already-loaded `Lockfile`), so
 //! folding them into [`build_context`] costs no I/O beyond what the evaluator
 //! already pays elsewhere. Git status *counts* (staged/unstaged/untracked/
 //! ahead/behind) come from exactly one `git status --porcelain=v2 --branch`
 //! subprocess per call to [`build_context`] — i.e. once per command, never
-//! per keystroke (§1); a non-git `cwd` never spawns it at all (`.git`
+//! per keystroke (site/content/internals/prompt-editor-lsp.md); a non-git `cwd` never spawns it at all (`.git`
 //! discovery is a pure filesystem walk that bails out first). Branch name and
 //! in-progress state (`rebase`/`merge`/…) stay `gix`-free, read straight out
 //! of `.git`.
@@ -37,14 +37,14 @@ use shoal_value::Value;
 
 /// Shared, atomically-swappable snapshot cell. The REPL loop writes a fresh
 /// `Arc<PromptContext>` once per command; reedline's per-keystroke render reads
-/// it under a short read-lock (a lock, never I/O — inside §1's budget).
+/// it under a short read-lock (a lock, never I/O — inside site/content/internals/prompt-editor-lsp.md budget).
 pub type SharedCtx = Arc<RwLock<Arc<PromptContext>>>;
 
-/// The reedline `Prompt` impl. Thin dispatch onto the pure renderer (§2.5).
+/// The reedline `Prompt` impl. Thin dispatch onto the pure renderer (site/content/internals/prompt-editor-lsp.md).
 pub struct ShoalPrompt {
     renderer: Arc<Renderer>,
     ctx: SharedCtx,
-    /// When true this is the transient (post-Enter) prompt (§2.5).
+    /// When true this is the transient (post-Enter) prompt (site/content/internals/prompt-editor-lsp.md).
     transient: bool,
 }
 
@@ -85,7 +85,7 @@ impl Prompt for ShoalPrompt {
     }
 
     fn render_prompt_indicator(&self, _mode: PromptEditMode) -> Cow<'_, str> {
-        // Locked decision (§2.5): shoal-prompt owns the entire visual symbol via
+        // Locked decision (site/content/internals/prompt-editor-lsp.md): shoal-prompt owns the entire visual symbol via
         // the `$character` module inside `format.left`. Returning reedline's own
         // indicator here too would print the chevron twice.
         Cow::Borrowed("")
@@ -100,7 +100,7 @@ impl Prompt for ShoalPrompt {
         &self,
         history_search: PromptHistorySearch,
     ) -> Cow<'_, str> {
-        // Out of scope (§2.5, §14): reuse reedline's own default text shape.
+        // Out of scope (site/content/internals/prompt-editor-lsp.md): reuse reedline's own default text shape.
         let prefix = match history_search.status {
             PromptHistorySearchStatus::Passing => "",
             PromptHistorySearchStatus::Failing => "failing ",
@@ -117,10 +117,10 @@ impl Prompt for ShoalPrompt {
 }
 
 // ---------------------------------------------------------------------------
-// `shoal prompt` dev/introspection surface (§8)
+// `shoal prompt` dev/introspection surface (site/content/internals/prompt-editor-lsp.md)
 // ---------------------------------------------------------------------------
 
-/// `shoal prompt <explain|bench|print>` (§8).
+/// `shoal prompt <explain|bench|print>` (site/content/internals/prompt-editor-lsp.md).
 #[derive(Debug, Clone)]
 pub enum PromptAction {
     Explain { side: Side },
@@ -260,7 +260,7 @@ pub fn run(action: PromptAction) -> Result<i32, String> {
                 max as f64 / 1000.0,
                 deadline_ms
             );
-            // CI regression gate (§8): exit 1 if p99 exceeds the deadline.
+            // CI regression gate (site/content/internals/prompt-editor-lsp.md): exit 1 if p99 exceeds the deadline.
             if p99 > (deadline_ms as u128) * 1_000_000 {
                 eprintln!("error: p99 exceeded the render deadline");
                 return Ok(1);
@@ -270,7 +270,7 @@ pub fn run(action: PromptAction) -> Result<i32, String> {
     }
 }
 
-/// A fixed, reproducible fixture for `shoal prompt bench` (§8) — not live state.
+/// A fixed, reproducible fixture for `shoal prompt bench` (site/content/internals/prompt-editor-lsp.md) — not live state.
 fn bench_fixture(facts: &StaticFacts) -> PromptContext {
     let mut ctx = PromptContext::empty(PathBuf::from("/home/dev/develop/shoal"));
     ctx.home = facts.home.clone();
@@ -305,12 +305,12 @@ fn bench_fixture(facts: &StaticFacts) -> PromptContext {
 }
 
 // ---------------------------------------------------------------------------
-// Prompt config loading (§3.1 precedence, §10 migration)
+// Prompt config loading (site/content/internals/prompt-editor-lsp.md precedence, site/content/internals/prompt-editor-lsp.md migration)
 // ---------------------------------------------------------------------------
 
 /// Load and layer the prompt config from the same discovery paths
-/// `shoal_config` uses, plus the dedicated `prompt.toml` (§3.1). Returns the
-/// finished [`PromptConfig`] and any load-time warnings (§11).
+/// `shoal_config` uses, plus the dedicated `prompt.toml` (site/content/internals/prompt-editor-lsp.md). Returns the
+/// finished [`PromptConfig`] and any load-time warnings (site/content/internals/prompt-editor-lsp.md).
 pub fn load_prompt_config(cwd: &Path) -> (PromptConfig, Vec<String>) {
     let mut warnings = Vec::new();
     let mut layers: Vec<toml::Value> = Vec::new();
@@ -348,7 +348,7 @@ pub fn load_prompt_config(cwd: &Path) -> (PromptConfig, Vec<String>) {
 }
 
 /// Read a config file's `[prompt]` sub-table as a prompt-contents-shaped value,
-/// applying the §10 `template` → `format.left` migration.
+/// applying the site/content/internals/prompt-editor-lsp.md `template` → `format.left` migration.
 fn read_prompt_table(path: &Path, warnings: &mut Vec<String>) -> Option<toml::Value> {
     let text = std::fs::read_to_string(path).ok()?;
     let value: toml::Value = match toml::from_str(&text) {
@@ -373,7 +373,7 @@ fn read_root_table(path: &Path, warnings: &mut Vec<String>) -> Option<toml::Valu
     }
 }
 
-/// §10 migration: a `[prompt]` table with the old `template` key and no new
+/// site/content/internals/prompt-editor-lsp.md migration: a `[prompt]` table with the old `template` key and no new
 /// `format` key is rewritten to `format.left`, `{cwd}` → `$directory`.
 fn migrate_template(mut prompt: toml::Value, warnings: &mut Vec<String>) -> toml::Value {
     let Some(table) = prompt.as_table_mut() else {
@@ -403,7 +403,7 @@ fn migrate_template(mut prompt: toml::Value, warnings: &mut Vec<String>) -> toml
 }
 
 // ---------------------------------------------------------------------------
-// Static session facts — resolved once at startup (§4.9/§4.10/§4.11/§4.15/§4.16)
+// Static session facts — resolved once at startup (site/content/internals/prompt-editor-lsp.md)
 // ---------------------------------------------------------------------------
 
 /// Facts that never change over a process lifetime: session identity, leash
@@ -479,7 +479,7 @@ fn resolve_leash() -> LeashSnapshot {
     }
 }
 
-/// nerd-font resolution (§3.5): exactly these checks, in this order.
+/// nerd-font resolution (site/content/internals/prompt-editor-lsp.md): exactly these checks, in this order.
 fn resolve_nerd_font(mode: &str) -> bool {
     match mode {
         "always" => true,
@@ -494,14 +494,14 @@ fn resolve_nerd_font(mode: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Per-command context construction (§2.3 build_context)
+// Per-command context construction (site/content/internals/prompt-editor-lsp.md build_context)
 // ---------------------------------------------------------------------------
 
 /// Build a full [`PromptContext`] from live session state. Runs once per command
 /// (never per keystroke), so its handful of `stat`s reading `.git` (plus, when
 /// `cwd` is inside a repo, the one `git status` subprocess for status counts)
-/// sit in the post-command budget (§5.3 trigger 1), not the keystroke budget
-/// (§1). Takes `&mut Evaluator` because [`Evaluator::prompt_reef_snapshot`]
+/// sit in the post-command budget (site/content/internals/prompt-editor-lsp.md trigger 1), not the keystroke budget
+/// (site/content/internals/prompt-editor-lsp.md). Takes `&mut Evaluator` because [`Evaluator::prompt_reef_snapshot`]
 /// may need to (re)discover the cached reef scope chain when `cwd` changed —
 /// still zero subprocess, just a cache-freshness check.
 pub fn build_context(ev: &mut Evaluator, facts: &StaticFacts, width: u16) -> PromptContext {
@@ -537,7 +537,7 @@ pub fn build_context(ev: &mut Evaluator, facts: &StaticFacts, width: u16) -> Pro
 }
 
 /// Map the evaluator's [`shoal_eval::JobsSnapshot`] onto the prompt's own
-/// (design §12.1): same shape, different crate, so the binary is the seam
+/// (site/content/internals/prompt-editor-lsp.md): same shape, different crate, so the binary is the seam
 /// that converts.
 fn jobs_snapshot_from(ev: &Evaluator) -> shoal_prompt::JobsSnapshot {
     let s = ev.jobs_snapshot();
@@ -549,7 +549,7 @@ fn jobs_snapshot_from(ev: &Evaluator) -> shoal_prompt::JobsSnapshot {
 }
 
 /// Map the evaluator's [`shoal_eval::PromptReefSnapshot`] bindings onto
-/// [`shoal_prompt::ReefBinding`] rows (design §12.1). Zero subprocess: reads
+/// [`shoal_prompt::ReefBinding`] rows (site/content/internals/prompt-editor-lsp.md). Zero subprocess: reads
 /// only the evaluator's cached scope chain + already-loaded lockfile.
 fn reef_bindings_from(ev: &mut Evaluator) -> Vec<shoal_prompt::ReefBinding> {
     ev.prompt_reef_snapshot()
@@ -601,17 +601,17 @@ fn local_hms() -> (u8, u8, u8) {
 }
 
 // ---------------------------------------------------------------------------
-// Pure-Rust git reader — branch + in-progress state, zero subprocess (§5.4)
+// Pure-Rust git reader — branch + in-progress state, zero subprocess (site/content/internals/prompt-editor-lsp.md)
 // ---------------------------------------------------------------------------
 
 /// Read branch + repo state from `.git` directly (no subprocess, no git lib),
 /// then fill in status counts with exactly one `git status --porcelain=v2
-/// --branch` subprocess (§5.4/§12.3) — the one deliberate exception to "no
+/// --branch` subprocess (site/content/internals/prompt-editor-lsp.md) — the one deliberate exception to "no
 /// subprocess" in this reader, budgeted because [`read_git`] itself only ever
-/// runs once per command (§1), never per keystroke. A repo whose git binary
+/// runs once per command (site/content/internals/prompt-editor-lsp.md), never per keystroke. A repo whose git binary
 /// can't run (missing, non-zero exit, unparseable output) still gets an
 /// accurate branch/state; only the counts are flagged `degraded` and left at
-/// zero — an honest gap, not a lie (TDD §6).
+/// zero — an honest gap, not a lie (site/content/internals/language-conformance-contract.md).
 pub fn read_git(cwd: &Path) -> Option<GitSnapshot> {
     let (repo_root, git_dir) = discover_repo(cwd)?;
     let repo_relative = cwd
@@ -639,7 +639,7 @@ pub fn read_git(cwd: &Path) -> Option<GitSnapshot> {
         conflicted: counts.conflicted,
         // Not derivable from a single `git status`; a second subprocess
         // (`git stash list`) would be needed and the budget here is one call
-        // per command. Left at zero — an honest gap (§5.4's fuller engine can
+        // per command. Left at zero — an honest gap (site/content/internals/prompt-editor-lsp.md fuller engine can
         // add it later without breaking this contract).
         stashed: 0,
         degraded,
@@ -827,7 +827,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Git status counts (§5.4/§12.3)
+    // Git status counts (site/content/internals/prompt-editor-lsp.md)
     // -----------------------------------------------------------------------
 
     #[test]
@@ -912,7 +912,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // build_context integration: jobs/reef/git wiring (docs/AGENT-SURFACE.md §12.1)
+    // build_context integration: jobs/reef/git wiring (site/content/internals/kernel-protocol.md)
     // -----------------------------------------------------------------------
 
     fn test_facts() -> StaticFacts {

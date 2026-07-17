@@ -1,6 +1,6 @@
 //! shoal-value — the runtime value model for the shoal shell.
 //!
-//! Types per TDD §4.1. `path` is bytes-backed (`PathBuf`/`OsString`); `secret`
+//! Types per site/content/internals/language-conformance-contract.md. `path` is bytes-backed (`PathBuf`/`OsString`); `secret`
 //! is opaque; `outcome` is an external command's result; `stream` is
 //! single-consumption; equality is structural for data types and identity for
 //! `task`/`stream`.
@@ -15,9 +15,9 @@
 //! `shoal-journal`'s `cas.rs`/`gc.rs`/… use for `impl Type { .. }` splits):
 //!
 //! - [`env`] — lexical scopes (`Env`/`Binding`).
-//! - [`stream`] — `StreamVal` and the lazy combinators (docs/STREAMS.md).
-//! - [`task`] — `TaskVal`/`TaskShared` job control (TDD §4.7).
-//! - [`outcome`] — `OutcomeVal`, a command's result (TDD §4.1).
+//! - [`stream`] — `StreamVal` and the lazy combinators (site/content/internals/streams-channels.md).
+//! - [`task`] — `TaskVal`/`TaskShared` job control (site/content/internals/language-conformance-contract.md).
+//! - [`outcome`] — `OutcomeVal`, a command's result (site/content/internals/language-conformance-contract.md).
 //! - [`value_types`] — `GlobVal`/`RegexVal`/`RangeVal`/`TimeVal`/`ClosureVal`/
 //!   `SecretVal` plus the `parse_size`/`parse_duration`/`parse_time` word
 //!   helpers.
@@ -76,7 +76,7 @@ pub enum Value {
     Int(i64),
     Float(f64),
     Str(String),
-    /// Bytes-backed filesystem path (TDD §13.1).
+    /// Bytes-backed filesystem path (site/content/internals/language-conformance-contract.md).
     Path(PathBuf),
     Glob(GlobVal),
     Regex(Arc<RegexVal>),
@@ -87,7 +87,7 @@ pub enum Value {
     DateTime(Box<jiff::Zoned>),
     Time(TimeVal),
     Bytes(Arc<Vec<u8>>),
-    /// Lazy, content-addressed bytes (TDD §317): a value-position capture whose
+    /// Lazy, content-addressed bytes (site/content/internals/language-conformance-contract.md): a value-position capture whose
     /// stdout overflowed the RAM cap and spilled to the CAS. Holds a bounded
     /// preview + `{hash, len}` and loads the full content on demand. Small
     /// captures stay plain [`Value::Bytes`]; this variant only appears past the
@@ -103,7 +103,7 @@ pub enum Value {
     Outcome(Arc<OutcomeVal>),
     Task(TaskVal),
     Closure(Arc<ClosureVal>),
-    /// Alias / partial command application (TDD §1.8).
+    /// Alias / partial command application (site/content/internals/language-conformance-contract.md).
     CmdRef(Arc<ast::CmdCall>),
     Secret(SecretVal),
 }
@@ -140,7 +140,7 @@ impl Value {
         }
     }
 
-    /// Condition coercion (TDD §1.10): `bool` is itself; an `outcome`'s truth
+    /// Condition coercion (site/content/internals/language-conformance-contract.md): `bool` is itself; an `outcome`'s truth
     /// is its success. Everything else is a type error.
     pub fn as_condition(&self) -> VResult<bool> {
         match self {
@@ -160,7 +160,7 @@ impl Value {
 }
 
 /// Serialize a value to the bytes `.feed` writes to a command's stdin,
-/// following IO.md §1.2's feedability table exactly. Anything not in the
+/// following site/content/internals/values-streams-execution.md feedability table exactly. Anything not in the
 /// table is an error — `feed_error` (with a specialized message) for the
 /// types that are *deliberately* never feedable, plain `type_error`
 /// otherwise.
@@ -172,14 +172,14 @@ pub fn feed_bytes(v: &Value) -> Result<Vec<u8>, ErrorVal> {
         Value::Bytes(b) => Ok(b.as_ref().clone()),
         // CAS-backed bytes → load the full content from the store, then raw.
         Value::CasBytes(c) => c.resolve(),
-        // path → NOT directly feedable (IO.md §1.2): a bare path is a name,
+        // path → NOT directly feedable (site/content/internals/values-streams-execution.md): a bare path is a name,
         // not content. Feeding the name's bytes silently did the wrong thing.
         Value::Path(_) => Err(ErrorVal::type_error(
             "cannot feed a path to a command's stdin — a bare path is a name, not the file's contents",
         )
         .with_hint("feed the contents instead: path(\"x\").read.feed(cmd)")),
         // int/float/bool/size/duration/datetime/time → decimal text via the
-        // same rule as `render_inline` (IO.md §1.2), no trailing newline.
+        // same rule as `render_inline` (site/content/internals/values-streams-execution.md), no trailing newline.
         Value::Int(_)
         | Value::Float(_)
         | Value::Bool(_)
@@ -203,21 +203,21 @@ pub fn feed_bytes(v: &Value) -> Result<Vec<u8>, ErrorVal> {
             Ok(serde_json::to_vec(&value_to_json(v)).unwrap_or_default())
         }
         // outcome → its structured `.out` re-encoded per the rules above when
-        // one exists, else its raw stdout bytes (IO.md §1.2:
+        // one exists, else its raw stdout bytes (site/content/internals/values-streams-execution.md:
         // `outcome.feed(cmd)` ≡ `outcome.out.feed(cmd)` when `.out` is
         // structured, else the stdout bytes verbatim).
         Value::Outcome(o) => match o.out_value() {
             Value::Str(_) => Ok(o.stdout.as_ref().clone()),
             structured => feed_bytes(&structured),
         },
-        // stream → §1.2 promises *incremental* feeding as items arrive, which
+        // stream → site/content/internals/language-conformance-contract.md promises *incremental* feeding as items arrive, which
         // needs evaluator/exec support (a live child stdin pipe); an honest
         // error until that lands rather than a buffering fake.
         Value::Stream(_) => Err(ErrorVal::type_error(
             "feeding a stream to a command's stdin is not implemented yet",
         )
         .with_hint("collect a bounded stream first: stream.collect().feed(cmd)")),
-        // Deliberately never feedable (IO.md §1.2 / §5) → `feed_error`.
+        // Deliberately never feedable (site/content/internals/values-streams-execution.md) → `feed_error`.
         Value::Secret(_) => Err(ErrorVal::new(
             "feed_error",
             "a secret cannot be fed as stdin data",
@@ -229,7 +229,7 @@ pub fn feed_bytes(v: &Value) -> Result<Vec<u8>, ErrorVal> {
                 format!("a {} cannot be fed as stdin data", v.type_name()),
             ))
         }
-        // Anything else (null, cmd refs) has no serialization in §1.2's table
+        // Anything else (null, cmd refs) has no serialization in site/content/internals/language-conformance-contract.md table
         // → generic type_error.
         other => Err(ErrorVal::type_error(format!(
             "cannot feed a {} to a command's stdin",
@@ -242,7 +242,7 @@ pub fn feed_bytes(v: &Value) -> Result<Vec<u8>, ErrorVal> {
 // Errors
 // ---------------------------------------------------------------------------
 
-/// A shoal error value. Codes are pinned in docs/CONTRACTS.md §4.
+/// A shoal error value. Codes are pinned in site/content/internals/intercrate-protocol-contracts.md.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ErrorVal {
     pub code: String,
@@ -357,7 +357,7 @@ impl PartialEq for Value {
 }
 
 // ---------------------------------------------------------------------------
-// Eval ↔ methods bridge (pinned in docs/CONTRACTS.md §7)
+// Eval ↔ methods bridge (pinned in site/content/internals/intercrate-protocol-contracts.md)
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Default)]
@@ -430,7 +430,7 @@ mod tests {
 
     #[test]
     fn feed_bytes_scalars_feed_their_render_form() {
-        // IO.md §1.2: int/float/bool/size/duration/datetime/time feed their
+        // site/content/internals/values-streams-execution.md: int/float/bool/size/duration/datetime/time feed their
         // `render_inline` text, UTF-8, no trailing newline.
         assert_eq!(feed_bytes(&Value::Int(4)).unwrap(), b"4");
         assert_eq!(feed_bytes(&Value::Float(1.5)).unwrap(), b"1.5");
@@ -453,7 +453,7 @@ mod tests {
 
     #[test]
     fn feed_bytes_path_is_type_error_with_read_hint() {
-        // IO.md §1.2: a bare path is a name, not content — never fed silently.
+        // site/content/internals/values-streams-execution.md: a bare path is a name, not content — never fed silently.
         let e = feed_bytes(&Value::Path(PathBuf::from("/a/b"))).unwrap_err();
         assert_eq!(e.code, "type_error");
         assert!(e.msg.contains("a name, not"));

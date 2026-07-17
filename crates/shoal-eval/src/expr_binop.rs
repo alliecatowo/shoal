@@ -47,7 +47,7 @@ impl Evaluator {
     }
 
     /// Evaluate an `&&`/`||` chain (outcome unification, P1d). Per the normative
-    /// corpus (`spec/cases/outcome.toml`, TDD §1.10/§3.3/§4.5) the operators are
+    /// corpus (`spec/cases/outcome.toml`, site/content/internals/language-conformance-contract.md) the operators are
     /// NOT bool-narrowing: they return the short-circuiting operand **verbatim**
     /// (whichever side's `as_condition()` decided the result), so a chain of
     /// outcome commands stays chainable — `(echo a && echo b).status` still

@@ -1,5 +1,5 @@
 //! Diagnostics: the serde-serializable resolution report `which` renders
-//! (REEF.md §6) — everything needed to show the full scope chain and the winner.
+//! (site/content/internals/reef-resolution.md) — everything needed to show the full scope chain and the winner.
 
 use std::path::PathBuf;
 

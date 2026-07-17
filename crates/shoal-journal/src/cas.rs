@@ -178,7 +178,7 @@ impl Journal {
     /// `hash`, read from the `blob` table alone — no file open, no decode. `None`
     /// when no such blob is tracked (unknown/malformed hash). This is the cheap
     /// metadata a lazy, ref-backed [`crate::Cas`] value answers `.len` from when
-    /// resolving a bare `val:blake3:<hash>` ref (TDD §317 in-language dispatch):
+    /// resolving a bare `val:blake3:<hash>` ref (site/content/internals/language-conformance-contract.md in-language dispatch):
     /// the true content length without ever materializing it.
     pub fn blob_len(&self, hash: &str) -> rusqlite::Result<Option<u64>> {
         let raw = match hex_bytes(hash) {
@@ -209,7 +209,7 @@ impl Journal {
     /// directory. Reading a blob is pure filesystem work (open + zstd-decode +
     /// integrity check), so the returned [`Cas`] needs no SQLite connection and
     /// is `Send + Sync` — the shape a lazy, ref-backed value's loader needs
-    /// (TDD §317). It shares the same on-disk store, so blobs written via
+    /// (site/content/internals/language-conformance-contract.md). It shares the same on-disk store, so blobs written via
     /// [`Journal::record_output`] / [`Journal::ingest_spill`] are readable
     /// through it.
     pub fn cas(&self) -> Cas {
@@ -219,7 +219,7 @@ impl Journal {
     }
 
     /// Directory value-position captures spill oversized stdout into before it
-    /// is adopted via [`Journal::ingest_spill`] (TDD §317). Co-located with the
+    /// is adopted via [`Journal::ingest_spill`] (site/content/internals/language-conformance-contract.md). Co-located with the
     /// CAS (a sibling of `cas/` under the state dir) so it shares the store's
     /// filesystem and lifetime (an in-memory journal's temp dir cleans it up).
     /// Created on demand.
@@ -234,7 +234,7 @@ impl Journal {
     }
 
     /// Adopt an already-written spill file (from [`Journal::spill_dir`]) into
-    /// the CAS as a compressed, blake3-addressed blob (TDD §317). `hash` and
+    /// the CAS as a compressed, blake3-addressed blob (site/content/internals/language-conformance-contract.md). `hash` and
     /// `len` come from [`shoal_exec::CaptureSpill`] — the blake3 and byte length
     /// of the file's contents. The blob is written (zstd-streamed, so RAM stays
     /// bounded) only if not already present; a `blob` row is recorded and,

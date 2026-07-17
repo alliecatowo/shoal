@@ -1,4 +1,4 @@
-# Interpreter-class adapter (IO.md §2.2): `ruby { BODY }` hands the raw
+# Interpreter-class adapter (site/content/internals/values-streams-execution.md): `ruby { BODY }` hands the raw
 # block to `ruby -e BODY`, same mechanism as `python`/`node`, portable
 # across platforms since `-e` is a stable MRI flag everywhere Ruby ships.
 [cmd.ruby]

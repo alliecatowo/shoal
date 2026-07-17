@@ -1,6 +1,6 @@
 # Literal forms: ints (dec/hex/octal/binary, underscores), floats, bools, null,
 # size units (decimal + binary), duration units, time literals, regex, glob/path
-# constructors. Render expectations per CONTRACTS.md §3.
+# constructors. Render expectations per site/content/internals/intercrate-protocol-contracts.md.
 
 [[case]]
 name = "lit-int-decimal"
@@ -104,7 +104,7 @@ value = "1mb"
 
 [[case]]
 name = "lit-size-kib-binary-renders-decimal"
-# kib family renders in decimal units in v1 (CONTRACTS §3): 1024 bytes = 1.024kb -> 1.02kb.
+# kib family renders in decimal units in v1 (site/content/internals/intercrate-protocol-contracts.md): 1024 bytes = 1.024kb -> 1.02kb.
 src = "1kib"
 value = "1.02kb"
 
@@ -198,13 +198,13 @@ value = "2026-07-09T14:00:00Z"
 
 [[case]]
 name = "lit-glob-constructor-render"
-# glob renders as its pattern (CONTRACTS §3).
+# glob renders as its pattern (site/content/internals/intercrate-protocol-contracts.md).
 src = 'glob("*.rs")'
 value = "*.rs"
 
 [[case]]
 name = "lit-path-constructor-render"
-# path renders lossy, unquoted when it contains no spaces (CONTRACTS §3).
+# path renders lossy, unquoted when it contains no spaces (site/content/internals/intercrate-protocol-contracts.md).
 src = 'path("a.txt")'
 value = "a.txt"
 
@@ -215,7 +215,7 @@ value = "0"
 
 [[case]]
 name = "lit-size-zero-bytes"
-# "0b" alone collides with the 0b<binary-digits> integer prefix (§2.1); use an
+# "0b" alone collides with the 0b<binary-digits> integer prefix (site/content/internals/language-conformance-contract.md); use an
 # unambiguous zero-size literal and check the render is still the bytes unit.
 src = "0kb"
 value = "0b"
@@ -228,14 +228,14 @@ value = "-1m30s"
 
 [[case]]
 name = "lit-time-single-digit-hour"
-# \d{1,2}:\d{2} — a single leading digit is legal; render always zero-pads (CONTRACTS §3).
+# \d{1,2}:\d{2} — a single leading digit is legal; render always zero-pads (site/content/internals/intercrate-protocol-contracts.md).
 src = "0:00"
 value = "00:00"
 
 [[case]]
 name = "lit-glob-ctor-hidden-flag-still-renders-pattern"
-# TDD §4.3: glob("…", hidden: true, follow: false) is the explicit constructor;
-# render is always just the pattern regardless of hidden/follow (CONTRACTS §3).
+# site/content/internals/language-conformance-contract.md: glob("…", hidden: true, follow: false) is the explicit constructor;
+# render is always just the pattern regardless of hidden/follow (site/content/internals/intercrate-protocol-contracts.md).
 src = 'glob("*.rs", hidden: true)'
 value = "*.rs"
 

@@ -1,13 +1,14 @@
-# Reactive streams + in-language channels (docs/STREAMS.md, ROADMAP Wave R1).
+# Reactive streams + in-language channels (site/content/internals/streams-channels.md, site/content/internals/roadmap-and-priorities.md).
 #
 # ONLY host-safe, deterministic cases live here: the timing sources
 # (`watch`/`tail`/`every`) and the concurrent `channel().take`/`on(...)`
 # machinery are non-deterministic and are unit-tested in `shoal-eval`
 # (`crates/shoal-eval/tests/streams.rs`) instead. Every case below uses
 # `.stream()` (a finite in-memory stream) or a fully-populated channel ring,
-# so the combinators (STREAMS §3) and sinks (§4) run to a fixed value.
+# so the combinators and sinks documented in
+# `site/content/internals/streams-channels.md` run to a fixed value.
 
-# --- combinators (STREAMS §3), driven by the `.collect()` sink -------------
+# --- combinators (site/content/internals/streams-channels.md), driven by the `.collect()` sink -------------
 
 [[case]]
 name = "stream-where-map"
@@ -123,7 +124,7 @@ name = "stream-sort-sink"
 src = '[3, 1, 2].stream().sort()'
 value = "[1, 2, 3]"
 
-# --- single-consumption + boundedness discipline (STREAMS §1, §4) ---------
+# --- single-consumption + boundedness discipline (site/content/internals/streams-channels.md) ---------
 
 [[case]]
 name = "stream-single-consumption"
@@ -139,7 +140,7 @@ name = "stream-collect-unbounded-errors"
 src = 'channel("x").events().collect()'
 error = "stream_unbounded"
 
-# --- in-language channels (STREAMS §2.5, §7): emit / latest / events ------
+# --- in-language channels (site/content/internals/streams-channels.md): emit / latest / events ------
 
 [[case]]
 name = "channel-emit-latest"
@@ -191,7 +192,7 @@ channel("s").events().take(2).map(ev => ev.seq).collect()
 '''
 value = "[0, 1]"
 
-# --- stream → channel sinks (STREAMS §4): `.each`, `.into` -----------------
+# --- stream → channel sinks (site/content/internals/streams-channels.md): `.each`, `.into` -----------------
 
 [[case]]
 name = "stream-each-emits"

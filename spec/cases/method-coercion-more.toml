@@ -1,12 +1,12 @@
-# ~30+ additional general method/coercion cases (TDD §4.2 coercion matrix,
-# §5 method surface; docs/CONTRACTS.md §3's `call_method` set) to round out
-# corpus coverage past 1,000 cases (TDD §12's M1 target) — filling gaps in
+# ~30+ additional general method/coercion cases (site/content/internals/language-conformance-contract.md coercion matrix,
+# method surface; site/content/internals/intercrate-protocol-contracts.md `call_method` set) to round out
+# corpus coverage past 1,000 cases (site/content/internals/language-conformance-contract.md M1 target) — filling gaps in
 # methods that existing files exercise rarely or not at all (`.filter`
 # (0 hits pre-this-file), `.count`, `.flatten`, `.flat_map`, `.zip`,
 # `.enumerate`, `.chunks`, `.sort_by`, `.group`, `.min`/`.max`, `.items`,
 # `.keys`/`.values`, arithmetic promotion across `size`/`duration`).
 
-# --- `.filter` (TDD §5: an alias of `.where`, `mod.rs`'s `"where" | "filter"`
+# --- `.filter` (site/content/internals/language-conformance-contract.md: an alias of `.where`, `mod.rs`'s `"where" | "filter"`
 #     match arm — previously untested directly under its own name) ----------
 
 [[case]]
@@ -197,7 +197,7 @@ name = "methc-sum-of-ints"
 src = "[1, 2, 3].sum()"
 value = "6"
 
-# --- coercion matrix (TDD §4.2): arithmetic promotion -----------------------
+# --- coercion matrix (site/content/internals/language-conformance-contract.md): arithmetic promotion -----------------------
 
 [[case]]
 name = "methc-coerce-int-float-mixed-arithmetic"
@@ -253,7 +253,7 @@ value = "1..=3"
 
 [[case]]
 name = "methc-str-on-a-mixed-list-is-a-type-error"
-# `.str()` is a `str`/`path`/`bytes` conversion (TDD §4.1) — a `list` has no
+# `.str()` is a `str`/`path`/`bytes` conversion (site/content/internals/language-conformance-contract.md) — a `list` has no
 # lossless string form, so it is a type error rather than a silent render.
 src = '[1, "a", true, null].str()'
 error = "type_error"

@@ -16,14 +16,14 @@
 #    `.split`/`.replace`(replacement)/`.set`(key) now raise `arg_error` when
 #    the argument is missing. `.join()` keeps its deliberate "" default
 #    (plain concatenation).
-# 4. `feed_bytes` now matches IO.md §1.2's feedability table: scalars feed
+# 4. `feed_bytes` now matches site/content/internals/values-streams-execution.md feedability table: scalars feed
 #    their `render_inline` text; a bare `path` is a name, not content →
 #    `type_error` with a `.read` hint (it previously fed the path's NAME
 #    bytes, silently wrong); an outcome feeds its structured `.out`
 #    re-encoded, else its raw stdout bytes. (int/bool scalar feeding is also
 #    pinned in io-feed-more.toml, whose two `*-is-type-error` cases were
 #    updated to the documented behavior.) `stream` feeding stays an honest
-#    unimplemented `type_error` — §1.2 wants incremental feeding, which
+#    unimplemented `type_error` — site/content/internals/language-conformance-contract.md wants incremental feeding, which
 #    needs exec support.
 
 # --- did-you-mean hints ------------------------------------------------------
@@ -175,7 +175,7 @@ name = "meth-starts-with-explicit-empty-str-still-legal"
 src = '"abc".starts_with("")'
 value = "true"
 
-# --- feed_bytes vs IO.md §1.2 ------------------------------------------------
+# --- feed_bytes vs site/content/internals/values-streams-execution.md ------------------------------------------------
 
 [[case]]
 name = "feed-size-renders-humanized"
@@ -194,7 +194,7 @@ value = '"2.5"'
 
 [[case]]
 name = "feed-path-is-type-error-with-read-hint"
-# A bare path is a name, not content (IO.md §1.2) — previously fed the
+# A bare path is a name, not content (site/content/internals/values-streams-execution.md) — previously fed the
 # NAME's bytes, silently wrong.
 src = 'path("a.txt").feed(cat)'
 fixture = ["a.txt"]
@@ -210,13 +210,13 @@ value = '"a\nb"'
 [[case]]
 name = "feed-outcome-structured-out-reencodes-json"
 # outcome → `.out` parsed as a record, so feeding re-encodes the JSON:
-# `outcome.feed(cmd)` ≡ `outcome.out.feed(cmd)` (IO.md §1.2).
+# `outcome.feed(cmd)` ≡ `outcome.out.feed(cmd)` (site/content/internals/values-streams-execution.md).
 src = "{n: 5}.feed(cat).feed(cat).out.n"
 value = "5"
 
 [[case]]
 name = "feed-stream-is-unimplemented-with-collect-hint"
-# §1.2 promises incremental stream feeding; that needs exec support, so the
+# site/content/internals/language-conformance-contract.md promises incremental stream feeding; that needs exec support, so the
 # honest state is an error that names the workaround.
 src = "[1, 2].stream().feed(cat)"
 error = "type_error"

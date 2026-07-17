@@ -1,5 +1,5 @@
-//! Canonical AST node definitions. See `docs/TDD.md` §3 for the grammar and
-//! §3.4 for the desugaring rules that produce these nodes.
+//! Canonical AST node definitions. See `site/content/internals/ast-model.md`
+//! and `site/content/internals/language-conformance-contract.md`.
 
 use crate::span::Span;
 use serde::{Deserialize, Serialize};
@@ -30,7 +30,7 @@ pub enum Stmt {
     Fn {
         decl: FnDecl,
     },
-    /// `alias gs = git status` — AST-level partial application (TDD §1.8).
+    /// `alias gs = git status` — AST-level partial application (site/content/internals/language-conformance-contract.md).
     Alias {
         name: String,
         target: CmdCall,
@@ -71,7 +71,7 @@ pub enum Stmt {
     },
     /// Everything else, including command statements (root `Expr::Cmd`).
     /// Statement-position semantics (PTY passthrough, `it` binding, raise on
-    /// non-ok) key off this being a top-level statement — see TDD §1.2, §4.5.
+    /// non-ok) key off this being a top-level statement — see site/content/internals/language-conformance-contract.md.
     Expr {
         expr: Expr,
         span: Span,
@@ -221,7 +221,7 @@ pub enum Expr {
         args: Args,
         span: Span,
     },
-    /// External/builtin command call, any position (TDD §1.2 position rule
+    /// External/builtin command call, any position (the language position rule
     /// is decided by the evaluator from context, not stored here).
     Cmd {
         call: Box<CmdCall>,
@@ -276,7 +276,7 @@ pub enum Expr {
     With {
         cwd: Option<Box<Expr>>,
         env: Option<Box<Expr>>,
-        /// `reef: {tool: constraint, …}` — dynamic reef scoping (REEF.md §6).
+        /// `reef: {tool: constraint, …}` — dynamic reef scoping (site/content/internals/reef-resolution.md).
         /// Additive: existing `With` nodes parse with `reef: None`.
         reef: Option<Box<Expr>>,
         body: Block,
@@ -287,7 +287,7 @@ pub enum Expr {
         body: Block,
         span: Span,
     },
-    /// Interpreter block (IO.md §2): `tool { verbatim source }` /
+    /// Interpreter block (site/content/internals/values-streams-execution.md): `tool { verbatim source }` /
     /// `tool ''' … '''`. `sh { … }` is just `tool: "sh"`. `tool` is resolved as
     /// a command at eval time; `src` is handed to it as its program.
     LangBlock {
@@ -443,9 +443,9 @@ pub struct FieldPat {
 // Commands
 // ---------------------------------------------------------------------------
 
-/// A command call: head word + CMD-mode arguments (TDD §2.2, §3.2 `command`).
+/// A command call: head word + CMD-mode arguments (site/content/internals/language-conformance-contract.md `command`).
 /// Flags remain structured here; they are resolved against the callee's
-/// signature (fn params or adapter schema) at bind time (TDD §4.4).
+/// signature (fn params or adapter schema) at bind time (site/content/internals/language-conformance-contract.md).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CmdCall {
     pub head: String,
@@ -476,7 +476,7 @@ pub enum CmdArg {
     Word { text: String, span: Span },
     /// Path literal (`./x`, `~/x`, `/x`, `../x`) — unexpanded source text.
     Path { text: String, span: Span },
-    /// Glob literal — expansion site is the callee (TDD §4.3).
+    /// Glob literal — expansion site is the callee (site/content/internals/language-conformance-contract.md).
     Glob { pattern: String, span: Span },
     /// Quoted string argument (may interpolate): `Expr::Str` or `Expr::StrInterp`.
     Str { expr: Expr, span: Span },
@@ -493,7 +493,7 @@ pub enum CmdArg {
     FlagShort { chars: String, span: Span },
     /// `--` end-of-flags marker.
     DashDash { span: Span },
-    /// Bare `-` (stdin convention; passed through verbatim, TDD §13.3).
+    /// Bare `-` (stdin convention; passed through verbatim, site/content/internals/language-conformance-contract.md).
     Dash { span: Span },
 }
 

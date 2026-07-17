@@ -16,7 +16,7 @@ impl<'s> Parser<'s> {
                 span: s,
             },
             // Type pattern `TYPE IDENT` (`int n`, `str s`, …). Disambiguation
-            // rule (TDD §3.2 `pat = … | IDENT | type IDENT | …`): a lone
+            // rule (site/content/internals/language-conformance-contract.md `pat = … | IDENT | type IDENT | …`): a lone
             // identifier is always a bind — even when it names a type — so a
             // type pattern requires the type name to be *followed by a binder
             // identifier* (before `=>`/`|`/`if`). `int n` → Type; `int`, `n`,
@@ -106,7 +106,7 @@ impl<'s> Parser<'s> {
                 }
             }
             // Integer literal, or the start of a range pattern `a..b` / `a..=b`
-            // (TDD §3.2 grammar: `pat = literal | rangepat | …`).
+            // (site/content/internals/language-conformance-contract.md grammar: `pat = literal | rangepat | …`).
             Tok::Int(value) => {
                 let start_expr = Expr::Int { value, span: s };
                 if matches!(self.peek(Mode::Expr)?.0, Tok::DotDot | Tok::DotDotEq) {
@@ -162,7 +162,7 @@ impl<'s> Parser<'s> {
             }
             // Pattern binders are in scope for the guard and body, so an
             // in-scope name (e.g. `status` in `{status} if status >= 200 && …`)
-            // parses as a Var rather than dispatching a command (§3.1).
+            // parses as a Var rather than dispatching a command (site/content/internals/language-conformance-contract.md).
             self.scopes.push(HashSet::new());
             for p in &patterns {
                 collect_pattern_binders(p, &mut |n| self.bind(n));
@@ -190,7 +190,7 @@ impl<'s> Parser<'s> {
                 span: Span::new(arm_start, body.span().end as usize),
                 body,
             });
-            // Arms are TERM-separated (TDD §3.2), but accept a trailing `,` as
+            // Arms are TERM-separated (site/content/internals/language-conformance-contract.md), but accept a trailing `,` as
             // an alternative terminator so Rust-style comma-separated arms
             // (`match x { 1 => a, 2 => b }`) parse too — a small friendly
             // superset.
@@ -207,7 +207,7 @@ impl<'s> Parser<'s> {
 }
 
 /// Known runtime type names usable as the head of a `type IDENT` match
-/// pattern (TDD §3.2). Mirrors `shoal_value::Value::type_name`.
+/// pattern (site/content/internals/language-conformance-contract.md). Mirrors `shoal_value::Value::type_name`.
 fn is_type_name(name: &str) -> bool {
     matches!(
         name,

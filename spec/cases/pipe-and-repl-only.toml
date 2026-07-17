@@ -1,7 +1,7 @@
-# TDD §1.4: a lone `|` ANYWHERE outside `sh { }` / match alternation gets the
+# site/content/internals/language-conformance-contract.md: a lone `|` ANYWHERE outside `sh { }` / match alternation gets the
 # curated teaching error — including the infix expression positions, which
 # used to fall out of the operator table into a generic terminator error.
-# TDD §13.16: `it`/`out` outside a REPL are PARSE errors, including the bare
+# site/content/internals/language-conformance-contract.md: `it`/`out` outside a REPL are PARSE errors, including the bare
 # statement forms that used to dispatch as a command named `it` and fail only
 # at runtime. See crates/shoal-syntax/src/parser/{expr.rs,stmt.rs}.
 

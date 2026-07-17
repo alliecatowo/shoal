@@ -1,4 +1,4 @@
-//! The speed assertion (design §1, §8's bench gate expressed as a test): the
+//! The speed assertion (site/content/internals/prompt-editor-lsp.md bench gate expressed as a test): the
 //! common-path render must be sub-millisecond. We render a realistic fixture
 //! many times and assert the *median* stays comfortably inside the p99 budget.
 //! This is the tripwire that catches a future change accidentally reintroducing

@@ -42,7 +42,7 @@ effects = ["fs.read(cwd)"]
 # default is a human-oriented patch: commit header prose followed by a
 # unified diff) -- unlike `log`, there is no stable per-field delimiter to
 # pin via `--pretty`/`-z` without losing the diff body itself, so, like
-# `diff` below, this is kept as raw `lines`, honest per TDD §6 rather than a
+# `diff` below, this is kept as raw `lines`, honest per site/content/internals/language-conformance-contract.md rather than a
 # fabricated structured schema.
 [cmd.git.sub.show]
 params = { ref = "str?", name_only = "bool", stat = "bool" }

@@ -75,7 +75,7 @@ value = "1"
 
 [[case]]
 name = "match2-list-rest-at-head-is-a-parse-error"
-# TDD's list-pattern grammar only admits `...IDENT` as a trailing rest
+# The language contract only admits `...IDENT` as a trailing list rest
 # (`listpats`); a rest marker in a leading position is rejected.
 src = "match [1, 2, 3] { [...init, last] => last; _ => 0 }"
 parse_error = true

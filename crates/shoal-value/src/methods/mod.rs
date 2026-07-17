@@ -13,9 +13,9 @@
 //! - [`record`] — record-only ops (`.keys`/`.values`/`.items`).
 //! - [`path`] — `.save`/`.append`.
 //! - [`num`] — numeric unary ops.
-//! - [`stream`] — the `stream<T>` method surface (STREAMS §3–§4).
+//! - [`stream`] — the `stream<T>` method surface (site/content/internals/streams-channels.md).
 //! - [`outcome`] — outcome method forwarding (P1b unification).
-//! - [`task`] — task lifecycle methods (TDD §4.7 job control).
+//! - [`task`] — task lifecycle methods (site/content/internals/language-conformance-contract.md job control).
 //! - [`suggest`] — did-you-mean hints for the unknown-method fall-through.
 
 mod list;
@@ -54,7 +54,7 @@ fn dispatch(ctx: &mut dyn CallCtx, recv: Value, name: &str, args: CallArgs) -> V
         ctx.call_closure(f, vec![recv.clone()])?;
         return Ok(recv);
     }
-    // Lazy CAS-backed bytes (TDD §317, centralized per the P6 audit). The
+    // Lazy CAS-backed bytes (see `site/content/internals/persistence.md`). The
     // cheap, no-load answers (`len`/`count`/`is_empty`/`ref`) are the ONE
     // `CasBytesVal::cheap_method` chokepoint — every site that needs a
     // metadata-only answer calls it instead of hand-rolling this match, so it
@@ -81,22 +81,22 @@ fn dispatch(ctx: &mut dyn CallCtx, recv: Value, name: &str, args: CallArgs) -> V
             }
         }
     }
-    // Outcome unification (P1b): an unknown method on a command outcome forwards
+    // Outcome unification: an unknown method on a command outcome forwards
     // to its structured `.out`, so `ls.where(.size > 1b).sort(.name)` works
     // (`ls` is an outcome; `.where`/`.sort` operate on its `.out` table). Raw
     // stream bytes stay reachable via `.stdout`/`.stderr`.
     if let Value::Outcome(o) = &recv {
         return outcome::forward(ctx, o, name, args);
     }
-    // Streams (docs/STREAMS.md) get their own method surface: the lazy
-    // combinators (§3) return a NEW stream without driving the source, and the
-    // sinks (§4) drive it (with `ctx` for closure stages). Anything else falls
+    // Streams (site/content/internals/streams-channels.md) get their own method surface: the lazy
+    // combinators (site/content/internals/language-conformance-contract.md) return a NEW stream without driving the source, and the
+    // sinks (site/content/internals/language-conformance-contract.md) drive it (with `ctx` for closure stages). Anything else falls
     // through to the collection methods by materializing a *bounded* stream to a
     // list first (an unbounded stream errors `stream_unbounded`).
     if let Value::Stream(s) = recv {
         return stream::stream_method(ctx, s, name, args);
     }
-    // Pure (no-IO) `path` component accessors (docs/CONTRACTS.md §3). Intercepted
+    // Pure (no-IO) `path` component accessors (site/content/internals/intercrate-protocol-contracts.md). Intercepted
     // ahead of the generic table because `.abs` on a path means "absolutize",
     // not the numeric `.abs`. The filesystem-backed path methods (`.read`,
     // `.lines`, `.size`, …) are handled earlier still, in the evaluator, since
@@ -111,7 +111,7 @@ fn dispatch(ctx: &mut dyn CallCtx, recv: Value, name: &str, args: CallArgs) -> V
         }
     }
     match name {
-        // `.feed(cmd)` (IO.md §1) spawns a child, which a pure value method
+        // `.feed(cmd)` (site/content/internals/values-streams-execution.md) spawns a child, which a pure value method
         // cannot do — the evaluator intercepts `.feed` in its method-call path
         // (shoal-eval `expr.rs::eval_feed`) before `call_method` is ever
         // reached, building an `ExecSpec` with the value's `feed_bytes` as
@@ -128,7 +128,7 @@ fn dispatch(ctx: &mut dyn CallCtx, recv: Value, name: &str, args: CallArgs) -> V
         "last" => list::first_last(recv, &args, false),
         "collect" => list::collect(recv),
         // `.stream()` promotes a finite collection (or a string's lines) into a
-        // lazy `stream<T>` so the stream combinators (STREAMS §3) can be exercised
+        // lazy `stream<T>` so the stream combinators (site/content/internals/streams-channels.md) can be exercised
         // on deterministic, in-memory data — the honest finite counterpart of the
         // live `watch`/`tail`/`every` sources.
         "stream" => no_args(&args).and_then(|_| list::to_stream(recv)),
@@ -249,7 +249,7 @@ fn dispatch(ctx: &mut dyn CallCtx, recv: Value, name: &str, args: CallArgs) -> V
         "ceil" => num::round_to(recv, int_arg(&args, 0, 0)?, f64::ceil),
         "save" => path::save(ctx, recv, arg(&args, 0)?, false),
         "append" => path::save(ctx, recv, arg(&args, 0)?, true),
-        // Task lifecycle methods (defect #14, TDD §4.7 job control).
+        // Task lifecycle methods (defect #14, site/content/internals/language-conformance-contract.md job control).
         "await" | "wait" => no_args(&args).and_then(|_| task::task_await(recv)),
         "cancel" => no_args(&args).and_then(|_| task::task_cancel(recv)),
         "is_done" => no_args(&args).and_then(|_| task::task_is_done(recv)),
@@ -443,7 +443,7 @@ mod tests {
         // Zero-arg forms return a single element.
         assert_eq!(call(x.clone(), "first", vec![]).unwrap(), Value::Int(1));
         assert_eq!(call(x.clone(), "last", vec![]).unwrap(), Value::Int(3));
-        // `.first(n)`/`.last(n)` return a LIST of n (P3 arity fix).
+        // `.first(n)`/`.last(n)` return a LIST of n.
         assert_eq!(
             call(x.clone(), "first", vec![Value::Int(2)]).unwrap(),
             Value::List(vec![Value::Int(1), Value::Int(2)])
@@ -761,7 +761,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // CasBytes chokepoint tests (P6 audit): the dispatch-level end-to-end
+    // CasBytes chokepoint tests: the dispatch-level end-to-end
     // proof that `cheap_method` and `json_preview` are actually wired in,
     // on top of the direct unit tests in `value_types.rs`/`json.rs`.
     // -------------------------------------------------------------------

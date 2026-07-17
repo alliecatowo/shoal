@@ -1,4 +1,4 @@
-//! Task lifecycle methods (defect #14, TDD §4.7 job control).
+//! Task lifecycle methods (defect #14, site/content/internals/language-conformance-contract.md job control).
 
 use super::*;
 

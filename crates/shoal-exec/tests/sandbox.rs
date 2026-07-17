@@ -213,7 +213,7 @@ fn execspec_sandbox_spawn_hash_pin_matches_and_mismatches() {
     assert_eq!(r.stdout, b"ok");
     assert!(r.enforcement.unwrap().spawn_exec_enforced);
 
-    // Wrong pin: refused before spawn (proc.spawn hash pin, TDD §8).
+    // Wrong pin: refused before spawn (proc.spawn hash pin, site/content/internals/language-conformance-contract.md).
     let bad_policy = SandboxPolicy {
         fs: grants("/bin/sh".into()),
         net: NetPolicy::Unrestricted,

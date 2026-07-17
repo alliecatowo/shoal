@@ -97,7 +97,7 @@ pub(crate) fn to_str(v: Value, lossy: bool) -> VResult<Value> {
             }
         }
         // int/float/bool → their canonical render form ("42", "1.5", "true"),
-        // exactly what `"{n}"` interpolation produces (CONTRACTS §3 render
+        // exactly what `"{n}"` interpolation produces (site/content/internals/intercrate-protocol-contracts.md render
         // rules) — `42.str()` erroring taught nothing and helped nobody.
         v @ (Value::Int(_) | Value::Float(_) | Value::Bool(_)) => {
             Ok(Value::Str(crate::render::render_inline(&v)))

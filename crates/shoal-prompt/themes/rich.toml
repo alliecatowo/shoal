@@ -1,5 +1,5 @@
 # shoal-prompt "rich" theme — everything on, maximal information density
-# (design-prompt.md §9.2).
+# (site/content/internals/prompt-editor-lsp.md).
 theme = ""
 nerd_font = "always"
 unicode = true

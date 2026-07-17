@@ -30,10 +30,10 @@ mod streams;
 pub use channels::{EventBus, EventForwarder};
 pub(crate) use coerce::coerce_word;
 pub use reef::{PromptReefBinding, PromptReefSnapshot};
-// Job-control surface (TDD §4.7) the interactive host (the REPL) drives. Re-
+// Job-control surface (site/content/internals/language-conformance-contract.md) the interactive host (the REPL) drives. Re-
 // exported through the evaluator — which the REPL already depends on — so `fg`/
 // `bg` and the shell's signal setup need no new `shoal` -> `shoal-exec` Cargo
-// edge (the crate-map DAG in CONTRACTS.md stays as pinned; `shoal` reaches
+// edge (the crate-map DAG in site/content/internals/intercrate-protocol-contracts.md stays as pinned; `shoal` reaches
 // exec's process-control primitives via `shoal-eval`, its existing dependency).
 pub use shoal_exec::{
     PtyJob, install_shell_job_control_signals, shutdown_stopped_jobs, take_stopped_job,
@@ -61,7 +61,7 @@ pub enum Position {
 }
 
 /// How much of a program's top-level statement values auto-render (the
-/// `render.echo` knob, docs/CONFIG.md §5). Governs only what the evaluator
+/// `render.echo` knob, site/content/internals/configuration-reference.md). Governs only what the evaluator
 /// routes to the statement sink for *intermediate* (non-final) statements —
 /// the final statement's value is always returned to the host, which decides
 /// how to present it (see the host's `run_source` for `Commands`-mode final
@@ -97,7 +97,7 @@ pub fn is_bare_command_stmt(stmt: &Stmt) -> bool {
 }
 
 /// A count/summary of the live task table, for the prompt's `jobs` segment
-/// (docs/AGENT-SURFACE.md §12.1). Zero I/O: reads the in-memory task registry
+/// (site/content/internals/kernel-protocol.md). Zero I/O: reads the in-memory task registry
 /// only, never a subprocess or the filesystem.
 ///
 /// `suspended` is always `0` today — the task registry has no suspended state
@@ -121,7 +121,7 @@ pub struct Evaluator {
     pub it: Value,
     cancel: CancelToken,
     adapters: AdapterCatalog,
-    /// Host renderer for statement-position outcomes (TDD §4.5, defect #1).
+    /// Host renderer for statement-position outcomes (site/content/internals/language-conformance-contract.md, defect #1).
     sink: Option<StatementSink>,
     /// Runtime call-stack depth guard (defect #9).
     call_depth: usize,
@@ -130,7 +130,7 @@ pub struct Evaluator {
     /// Live task registry backing the `jobs` builtin (defect #14).
     jobs: Vec<shoal_value::TaskVal>,
     /// Map of stopped-external job id → child pid, for the REPL's `fg`/`bg`
-    /// (TDD §4.7 job control). A stopped foreground external command is recorded
+    /// (site/content/internals/language-conformance-contract.md job control). A stopped foreground external command is recorded
     /// twice: as a suspended `TaskVal` in `jobs` (so it lists via `jobs` and the
     /// kernel `task.suspend`/`task.resume` wire methods drive its SIGTSTP/SIGCONT
     /// through the task's hooks), and here so `fg`/`bg` can locate its still-live
@@ -142,7 +142,7 @@ pub struct Evaluator {
     /// stop and drained by the REPL (`take_pending_stop`) to print the
     /// "[id]+ Stopped …" notice and return to the prompt.
     pending_stop: Option<(u64, String)>,
-    /// reef (docs/REEF.md): cached scope chain, keyed on the cwd it was
+    /// reef (site/content/internals/reef-resolution.md): cached scope chain, keyed on the cwd it was
     /// discovered for. Rebuilt only when the cwd changes (cd / `with cwd:`).
     /// `None` until the first spawn/`which`/`reef` touches it; cheap when no
     /// manifest is in scope (a pure filesystem walk with an empty result).
@@ -160,11 +160,11 @@ pub struct Evaluator {
     /// zero-regression path. Hosts wire a real path via
     /// [`Evaluator::set_reef_user_manifest`]; tests never point at real config.
     reef_user_manifest: Option<PathBuf>,
-    /// reef: `with reef: {tool: constraint, …} { }` override layers (REEF.md
-    /// §6), nearest-first (innermost `with reef:` block wins). Empty and inert
+    /// reef: `with reef: {tool: constraint, …} { }` override layers (see
+    /// `site/content/internals/reef-resolution.md`), nearest-first (innermost `with reef:` block wins). Empty and inert
     /// when no `with reef:` is on the dynamic stack — zero-regression.
     reef_overrides: Vec<shoal_reef::ScopeEntry>,
-    /// Optional command journal (TDD §9). `None` (the default) means NOTHING is
+    /// Optional command journal (site/content/internals/language-conformance-contract.md). `None` (the default) means NOTHING is
     /// journaled — the exact pre-journal behavior, so `-c`/scripts/conformance
     /// run untouched. Only when a host installs a journal via
     /// [`Evaluator::set_journal`] (or [`Evaluator::open_default_journal`]) does
@@ -172,7 +172,7 @@ pub struct Evaluator {
     /// recording happen. Held here (not shared) because `Journal` is single-
     /// handle / not `Sync`; spawned child evaluators never inherit it.
     journal: Option<Journal>,
-    /// Session id recorded on each journal entry (TDD §9). Ignored when no
+    /// Session id recorded on each journal entry (site/content/internals/language-conformance-contract.md). Ignored when no
     /// journal is installed.
     session_id: String,
     /// Acting principal recorded on each journal entry: `"human"` or
@@ -183,10 +183,10 @@ pub struct Evaluator {
     /// `None` outside a journaled statement.
     current_entry: Option<i64>,
     /// Source text of the program currently being evaluated, used to slice each
-    /// top-level statement's `src` for its journal entry (TDD §9). `None` when
+    /// top-level statement's `src` for its journal entry (site/content/internals/language-conformance-contract.md). `None` when
     /// the host did not provide it — the entry's `src` is then left empty.
     source: Option<String>,
-    /// Active leash policy + the principal it is evaluated for (TDD §8). `None`
+    /// Active leash policy + the principal it is evaluated for (site/content/internals/language-conformance-contract.md). `None`
     /// (the default) means no OS sandbox is ever applied to a spawn — the exact
     /// pre-activation behavior, so `Evaluator::new` and every existing test
     /// keep running unconfined. When set, each external spawn resolves a
@@ -194,7 +194,7 @@ pub struct Evaluator {
     /// a default-permissive policy still resolves to `None` (no wrapping), so
     /// only a genuinely-scoped principal ever confines a child.
     leash: Option<(LeashPolicy, String)>,
-    /// The in-language `channel(name)` event bus (docs/STREAMS.md §2.5). Shared
+    /// The in-language `channel(name)` event bus (site/content/internals/streams-channels.md). Shared
     /// (Arc) so spawned tasks / `on(...)` handlers publish and subscribe to the
     /// same session-scoped channels — coordination is channels, never files.
     bus: Arc<channels::EventBus>,
@@ -204,13 +204,13 @@ pub struct Evaluator {
     /// value the host acts on — eval NEVER calls `std::process::exit`, which
     /// would break the kernel/embedded host.
     pending_exit: Option<i32>,
-    /// Module cache (ROADMAP R3): a module (keyed by canonical path) evaluates
+    /// Module cache (site/content/internals/roadmap-and-priorities.md): a module (keyed by canonical path) evaluates
     /// once per session; its exports record is memoized here. Empty until the
     /// first `use`.
     modules: std::collections::HashMap<PathBuf, Value>,
     /// The stack of modules currently being loaded, for circular-`use` detection.
     module_stack: Vec<PathBuf>,
-    /// Derived-but-unspawned plans from the `plan { … }` REPL verb (ROADMAP R3),
+    /// Derived-but-unspawned plans from the `plan { … }` REPL verb (site/content/internals/roadmap-and-priorities.md),
     /// indexed by id (`1`-based). `apply <ref>` looks a plan up here and runs it.
     plans: Vec<Program>,
     /// Persistent directory-frecency store for `j`/`jump` (`frecency.rs`).
@@ -231,7 +231,7 @@ pub struct Evaluator {
     /// dir_stack` (current first, bash's left-to-right order). Session-scoped
     /// ambient state like `cwd`; never journaled or persisted to disk.
     dir_stack: Vec<PathBuf>,
-    /// Hexagonal effect ports (docs/ROADMAP.md R4). Every direct filesystem,
+    /// Hexagonal effect ports (site/content/internals/roadmap-and-priorities.md). Every direct filesystem,
     /// spawn, clock, opener, and secret call the domain core makes routes
     /// through one of these instead of `std::*`. The defaults are the `Std*`
     /// adapters, which perform the identical inline calls — so a plain
@@ -255,7 +255,7 @@ pub struct Evaluator {
     /// [`inherit_ports`]: Evaluator::inherit_ports
     config: Arc<dyn ConfigPort>,
     /// How much of a script/`-c` run's top-level statement values auto-render
-    /// (the `render.echo` knob, docs/CONFIG.md §5). Default [`EchoMode::All`]
+    /// (the `render.echo` knob, site/content/internals/configuration-reference.md). Default [`EchoMode::All`]
     /// (echo everything) so `Evaluator::new`, the REPL, and every conformance
     /// case keep their current behavior; the non-interactive host opts into
     /// `Quiet`.
@@ -323,7 +323,7 @@ impl Evaluator {
         }
     }
 
-    /// Install a custom [`Fs`] adapter (docs/ROADMAP.md R4). Additive: the
+    /// Install a custom [`Fs`] adapter (site/content/internals/roadmap-and-priorities.md). Additive: the
     /// default is [`StdFs`], which performs the exact `std::fs` calls the
     /// evaluator made inline, so this only changes behavior for a host/test
     /// that deliberately interposes a fake. Child evaluators spawned after this
@@ -387,7 +387,7 @@ impl Evaluator {
         self.config = parent.config.clone();
     }
 
-    /// The session event bus (docs/STREAMS.md). Shared into spawned tasks so
+    /// The session event bus (site/content/internals/streams-channels.md). Shared into spawned tasks so
     /// in-language channels are visible across `spawn`/`on(...)`.
     pub(crate) fn bus(&self) -> Arc<channels::EventBus> {
         self.bus.clone()
@@ -400,7 +400,7 @@ impl Evaluator {
     }
 
     /// Install the hook that mirrors in-language `channel(x).emit(...)` onto a
-    /// hosting kernel's wire bus (AGENT-SURFACE §4's one-substrate promise).
+    /// hosting kernel's wire bus (site/content/internals/kernel-protocol.md one-substrate promise).
     /// Only `user.*` channels cross — the same client-writable rule as the
     /// wire's `events.publish`. Standalone hosts never call this.
     pub fn set_event_forwarder(&mut self, f: EventForwarder) {
@@ -424,7 +424,7 @@ impl Evaluator {
     }
 
     /// Install the active leash policy and the principal spawns are evaluated
-    /// for (TDD §8). Additive: without this call there is no policy and every
+    /// for (site/content/internals/language-conformance-contract.md). Additive: without this call there is no policy and every
     /// spawn runs unconfined exactly as before. A default-permissive policy
     /// (see [`shoal_leash::Policy::permissive`]) is safe to install — it still
     /// resolves to no OS confinement for a spawn, so normal use never
@@ -436,7 +436,7 @@ impl Evaluator {
     /// Convenience over [`Evaluator::set_leash_policy`]: load the per-user leash
     /// policy from `~/.config/shoal/leash.toml` (or `$XDG_CONFIG_HOME`) if it
     /// exists, else fall back to the default-permissive policy for `principal`
-    /// (TDD §8). Hosts call this once at startup so agent principals can be
+    /// (site/content/internals/language-conformance-contract.md). Hosts call this once at startup so agent principals can be
     /// scoped from config while a human keeps an unrestricted, no-regression
     /// session.
     pub fn load_leash_policy(&mut self, principal: impl Into<String>) {
@@ -455,7 +455,7 @@ impl Evaluator {
     }
 
     /// Point the user reef scope at a `shoal.toml` whose `[reef]` table becomes
-    /// the user scope (REEF §1). Additive: without it, there is no user scope,
+    /// the user scope (site/content/internals/reef-resolution.md). Additive: without it, there is no user scope,
     /// which is the zero-regression default. Changing the cwd next re-discovers
     /// the chain with this path folded in.
     pub fn set_reef_user_manifest(&mut self, path: impl Into<PathBuf>) {
@@ -505,7 +505,7 @@ impl Evaluator {
     /// outcomes whose bytes already reached the real terminal via PtyTee
     /// (defect #1). Builtin outcomes and captured externals carry `streamed ==
     /// false` — they stream nothing — so they must still be rendered by the
-    /// sink (outcome unification, REEF-cycle P1); only a PtyTee'd child was
+    /// sink (outcome unification; see `site/content/internals/process-execution.md`); only a PtyTee'd child was
     /// tee'd to the terminal and should be suppressed here.
     pub(crate) fn sink_value(&mut self, v: &Value) {
         if *v == Value::Null {
@@ -520,7 +520,7 @@ impl Evaluator {
     }
 
     /// A count/summary of the live task table for the prompt's `jobs` segment
-    /// (docs/AGENT-SURFACE.md §12.1). Cheap and I/O-free: call it once per
+    /// (site/content/internals/kernel-protocol.md). Cheap and I/O-free: call it once per
     /// command when building a `PromptContext`, never per keystroke.
     pub fn jobs_snapshot(&self) -> JobsSnapshot {
         let total = self.jobs.len();
@@ -542,7 +542,7 @@ impl Evaluator {
     }
 
     /// The task table backing the `jobs` builtin (defect #14). Rows cover both
-    /// spawned tasks and stopped foreground external commands (TDD §4.7 job
+    /// spawned tasks and stopped foreground external commands (site/content/internals/language-conformance-contract.md job
     /// control) — a Ctrl-Z'd external appears here as a `stopped` job alongside
     /// any backgrounded `spawn` tasks. The `state` column collapses the
     /// `done`/`suspended` booleans into one word (`running`/`stopped`/`done`)
@@ -573,7 +573,7 @@ impl Evaluator {
         Value::Table(rows)
     }
 
-    /// Suspend a background task by id (TDD §4.7 job control, ROADMAP R3). The
+    /// Suspend a background task by id (site/content/internals/language-conformance-contract.md job control, site/content/internals/roadmap-and-priorities.md). The
     /// kernel-callable path behind the wire `task.suspend` method and the REPL
     /// `fg`/job-control flow: it flips the task's suspended state and runs its
     /// suspend hooks (`SIGTSTP` to the task's process group, when a spawner has
@@ -607,7 +607,7 @@ impl Evaluator {
     }
 
     /// Record a foreground external command that the OS just *stopped* (Ctrl-Z →
-    /// SIGTSTP, TDD §4.7). Registers a suspended [`shoal_value::TaskVal`] in the
+    /// SIGTSTP, site/content/internals/language-conformance-contract.md). Registers a suspended [`shoal_value::TaskVal`] in the
     /// job table so it lists via `jobs` and the kernel `task.suspend`/
     /// `task.resume` wire methods drive its SIGTSTP/SIGCONT (through the hooks
     /// installed here, which signal the child's process group `pgid`). The pid
@@ -695,7 +695,7 @@ impl Evaluator {
     /// source the in-language `env` builtin reads and that seeds a spawned
     /// child's environment, including any in-session env writes. A read-only
     /// session-state accessor mirroring [`Evaluator::cwd`], used by the
-    /// kernel's `shoal://session/env` resource view (docs/AGENT-SURFACE.md §1).
+    /// kernel's `shoal://session/env` resource view (site/content/internals/kernel-protocol.md).
     pub fn env_vars(&self) -> &[(OsString, OsString)] {
         &self.process_env
     }
@@ -806,7 +806,7 @@ mod tests {
         );
     }
 
-    /// `render.echo` (docs/CONFIG.md §5): [`EchoMode`] gates which non-final
+    /// `render.echo` (site/content/internals/configuration-reference.md): [`EchoMode`] gates which non-final
     /// top-level statement values route to the statement sink. `Quiet`/
     /// `Commands` suppress intermediate pure expressions (`1+1`) but still echo
     /// intermediate bare commands; `All` (the default) echoes every
@@ -937,7 +937,7 @@ mod tests {
     #[test]
     fn double_echo_fixed_and_bare_echo_blank_line() {
         // A fn whose last body statement is a bare command prints ONCE: the
-        // trailing command is the block value, not also sunk (P1 dbl-echo).
+        // trailing command is the block value, not also sunk.
         let (out, captured) = run_capturing("fn g(){ echo hi }\ng()");
         assert_eq!(out_of(&out.unwrap()), Value::Str("hi".into()));
         assert!(
@@ -1496,7 +1496,7 @@ output={parse="lines",type="list<str>"}
         assert!(!marker.exists());
     }
 
-    // ---- TDD §8 binary-content-hash spawn pinning ------------------------
+    // ---- site/content/internals/language-conformance-contract.md binary-content-hash spawn pinning ------------------------
 
     /// `hash_resolved_bin` must produce reef/leash's exact blake3-hex so a pin
     /// an author copies from `reef`/`which` output compares equal to what the
@@ -1652,7 +1652,7 @@ output={parse="lines",type="list<str>"}
         }));
     }
 
-    // --- match: type / record / list patterns (TDD §3.2) -----------------
+    // --- match: type / record / list patterns (site/content/internals/language-conformance-contract.md) -----------------
 
     #[test]
     fn match_type_pattern_binds_and_falls_through() {
@@ -1748,7 +1748,7 @@ output={parse="lines",type="list<str>"}
         );
     }
 
-    // --- R2: data namespaces --------------------------------------------------
+    // --- data namespaces ------------------------------------------------------
 
     #[test]
     fn json_namespace_roundtrips() {
@@ -1823,7 +1823,7 @@ output={parse="lines",type="list<str>"}
         assert!(matches!(r.get("body"), Some(Value::Str(_))));
     }
 
-    // --- R2: structured builtins head / ln ------------------------------------
+    // --- structured builtins head / ln ----------------------------------------
 
     #[test]
     fn head_returns_first_lines() {
@@ -1859,7 +1859,7 @@ output={parse="lines",type="list<str>"}
         );
     }
 
-    // --- R3: modules ----------------------------------------------------------
+    // --- modules --------------------------------------------------------------
 
     #[test]
     fn use_binds_module_exports_and_runs_fns() {
@@ -1907,7 +1907,7 @@ output={parse="lines",type="list<str>"}
         );
     }
 
-    // --- R3: plan / apply / explain -------------------------------------------
+    // --- plan / apply / explain -----------------------------------------------
 
     #[test]
     fn plan_renders_effects_without_running() {
@@ -1951,7 +1951,7 @@ output={parse="lines",type="list<str>"}
         assert!(matches!(r.get("effects"), Some(Value::List(_))));
     }
 
-    // --- R3: task suspend / resume --------------------------------------------
+    // --- task suspend / resume ------------------------------------------------
 
     #[test]
     fn task_suspend_resume_methods_and_entrypoints() {
@@ -1978,7 +1978,7 @@ output={parse="lines",type="list<str>"}
         t.cancel();
     }
 
-    /// A foreground external command stopped by Ctrl-Z (TDD §4.7) is recorded
+    /// A foreground external command stopped by Ctrl-Z (site/content/internals/language-conformance-contract.md) is recorded
     /// as a `stopped` job that lists alongside spawned tasks, resolves to its
     /// pid for `fg`/`bg`, and walks running↔stopped→done as the REPL drives it —
     /// all without a real process (this test only exercises the jobs-table
@@ -2039,7 +2039,7 @@ output={parse="lines",type="list<str>"}
 
     #[test]
     fn now_and_today_are_live_datetime_anchors() {
-        // `now`/`today` (TDD §2.1) resolve to a datetime, not an undefined var.
+        // `now`/`today` (site/content/internals/language-conformance-contract.md) resolve to a datetime, not an undefined var.
         let this_year = jiff::Zoned::now().year() as i64;
         assert_eq!(run("now.year").unwrap(), Value::Int(this_year));
         assert_eq!(run("today.year").unwrap(), Value::Int(this_year));
@@ -2053,7 +2053,7 @@ output={parse="lines",type="list<str>"}
 
     #[test]
     fn duration_ago_and_from_now_compose_to_datetime() {
-        // `.ago` is in the past, `.from_now` in the future (TDD §2.1).
+        // `.ago` is in the past, `.from_now` in the future (site/content/internals/language-conformance-contract.md).
         assert!(matches!(run("1h.ago").unwrap(), Value::DateTime(_)));
         assert!(matches!(run("30d.from_now").unwrap(), Value::DateTime(_)));
         // from_now is strictly after ago for the same duration.
@@ -2067,7 +2067,7 @@ output={parse="lines",type="list<str>"}
 
     #[test]
     fn assert_builtin_raises_assert_failed() {
-        // False condition → assert_failed (CONTRACTS §4).
+        // False condition → assert_failed (site/content/internals/intercrate-protocol-contracts.md).
         let e = run("assert(1 == 2)").unwrap_err();
         assert_eq!(e.code, "assert_failed");
         // Custom message is carried through.
@@ -2087,7 +2087,7 @@ output={parse="lines",type="list<str>"}
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "").unwrap();
         std::fs::write(dir.path().join("b.txt"), "").unwrap();
-        // A non-variadic `list<path>` param gets every sorted match (TDD §4.3).
+        // A non-variadic `list<path>` param gets every sorted match (site/content/internals/language-conformance-contract.md).
         let v = run_in(
             "fn showpaths(paths: list<path>) { paths.len() }\nshowpaths *.txt",
             dir.path(),
@@ -2102,7 +2102,7 @@ output={parse="lines",type="list<str>"}
         std::fs::write(dir.path().join(".hidden.txt"), "").unwrap();
         std::fs::write(dir.path().join("a.txt"), "").unwrap();
         std::fs::write(dir.path().join("b.txt"), "").unwrap();
-        // Plain `*.txt` skips `.hidden.txt` (TDD §4.3): 2, not 3.
+        // Plain `*.txt` skips `.hidden.txt` (site/content/internals/language-conformance-contract.md): 2, not 3.
         let v = run_in(
             "fn f(...rest: list<path>) { rest.len() }\nf *.txt",
             dir.path(),
@@ -2121,7 +2121,7 @@ output={parse="lines",type="list<str>"}
     #[test]
     fn alias_appends_later_flags_to_adapter_call() {
         // `alias gs = git status; (gs --short).cmd` must carry `--short`
-        // through to the resolved argv (TDD §1.8), not drop it.
+        // through to the resolved argv (site/content/internals/language-conformance-contract.md), not drop it.
         let v = run("alias gs = git status\n(gs --short).cmd").unwrap();
         assert_eq!(v, Value::Str("git status --short".into()));
     }
@@ -2129,14 +2129,14 @@ output={parse="lines",type="list<str>"}
     #[test]
     fn run_unresolvable_extension_raises_runner_not_found() {
         // No `[runners]` entry and no shebang for `.zzz` → runner_not_found
-        // (IO.md §3.2 step 3), not a bare filesystem not_found.
+        // (site/content/internals/values-streams-execution.md step 3), not a bare filesystem not_found.
         let e = run(r#"run("./definitely-not-a-real-script-xyz.zzz")"#).unwrap_err();
         assert_eq!(e.code, "runner_not_found");
     }
 
     #[test]
     fn background_ampersand_yields_a_task() {
-        // `cmd &` desugars to `spawn { cmd }` (TDD §3.4): yields a task.
+        // `cmd &` desugars to `spawn { cmd }` (site/content/internals/language-conformance-contract.md): yields a task.
         let v = run("let t = (echo hi &)\nt.await()\nt.is_done()").unwrap();
         assert_eq!(v, Value::Bool(true));
         // Value-position `&` produces a task handle directly.

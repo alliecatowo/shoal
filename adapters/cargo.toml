@@ -34,5 +34,5 @@ effects = ["fs.read(cwd)", "net.connect(crates.io:443)"]
 # its default output is a human-oriented box-drawing dependency tree with
 # no stable machine-readable shape (unlike `metadata --format-version 1`),
 # so declaring an `output.type` for it would promise a parse this crate
-# cannot honestly deliver. Per TDD §6, only promise a type the parser
+# cannot honestly deliver. Per site/content/internals/language-conformance-contract.md, only promise a type the parser
 # genuinely yields.

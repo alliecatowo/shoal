@@ -1,7 +1,7 @@
 # Further datetime/time hardening beyond coercion.toml's Add/Sub matrix and
 # literals.toml's render forms: comparisons, date-only vs full-timestamp
 # tagged-literal equality, year-boundary rollover, and a genuine surface gap
-# (TDD §2.1's relative anchors `now`/`today`/`.ago`/`.from_now` have no
+# (site/content/internals/language-conformance-contract.md relative anchors `now`/`today`/`.ago`/`.from_now` have no
 # producer in shoal-eval yet). Every asserted value cross-checked against
 # the real evaluator via the conformance harness.
 
@@ -27,7 +27,7 @@ value = "true"
 
 [[case]]
 name = "dt2-date-only-tagged-literal-equals-midnight-timestamp"
-# `t"2026-07-09"` (date-only tagged form, TDD §2.1) parses to midnight UTC —
+# `t"2026-07-09"` (date-only tagged form, site/content/internals/language-conformance-contract.md) parses to midnight UTC —
 # structurally equal to the explicit full-timestamp spelling.
 src = 't"2026-07-09" == t"2026-07-09T00:00Z"'
 value = "true"

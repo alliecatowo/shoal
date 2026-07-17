@@ -1,4 +1,4 @@
-//! design §2.1's pinned test obligation: shoal-prompt's duration/size formatters
+//! site/content/internals/prompt-editor-lsp.md pinned test obligation: shoal-prompt's duration/size formatters
 //! must agree byte-for-byte with `shoal_value::render::render_inline` over a
 //! fixed corpus. This is the tripwire that fires if the intentional formatter
 //! duplication ever drifts — not a user "the duration looks wrong" bug.

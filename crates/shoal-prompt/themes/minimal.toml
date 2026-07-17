@@ -1,5 +1,5 @@
 # shoal-prompt "minimal" theme — for users who want almost nothing
-# (design-prompt.md §9.3). Note: this is about visual noise, not a speed tier —
+# (site/content/internals/prompt-editor-lsp.md). Note: this is about visual noise, not a speed tier —
 # the default theme is already sub-millisecond.
 theme = ""
 nerd_font = "never"

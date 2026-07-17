@@ -1,0 +1,10 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "shl",
+  "displayName": "Shoal (shl alias)",
+  "scopeName": "source.shl",
+  "fileTypes": ["shl"],
+  "patterns": [
+    { "include": "source.shoal" }
+  ]
+}

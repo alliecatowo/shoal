@@ -2,9 +2,9 @@
 //!
 //! A **pure domain crate** (no IO, no process spawning) that takes a structured
 //! [`PromptContext`] snapshot and renders a styled prompt string. It is the
-//! normative realization of `scratch/design-prompt.md` (v0.1).
+//! normative realization of `site/content/internals/prompt-editor-lsp.md` (v0.1).
 //!
-//! ## Dependency rule (design §2.1)
+//! ## Dependency rule (site/content/internals/prompt-editor-lsp.md)
 //!
 //! This crate depends on *nothing* under `shoal-*`. The hexagonal seam is made
 //! real by the type system: shoal-prompt cannot spawn a process, resolve a
@@ -12,7 +12,7 @@
 //! guaranteed I/O-free because the crate has no way to do I/O. The producing
 //! side (the `shoal` binary) resolves every uncertain value into a "known" or
 //! "known-to-be-stale/pending" field *before* building the [`PromptContext`],
-//! so [`Renderer::render`] is a pure format-string walk (§1's invariant).
+//! so [`Renderer::render`] is a pure format-string walk (site/content/internals/prompt-editor-lsp.md invariant).
 //!
 //! ## Speed
 //!

@@ -1,22 +1,22 @@
-//! `OutcomeVal` — a command's result (TDD §4.1), moved verbatim out of `lib.rs`.
+//! `OutcomeVal` — a command's result (site/content/internals/language-conformance-contract.md), moved verbatim out of `lib.rs`.
 
 use super::*;
 
-/// A command's result (TDD §4.1). `out` is parsed lazily on first structured
+/// A command's result (site/content/internals/language-conformance-contract.md). `out` is parsed lazily on first structured
 /// access; the raw bytes are always retained.
 #[derive(Debug)]
 pub struct OutcomeVal {
     pub status: Option<i32>,
-    /// Signal name (`"SIGSEGV"`) when the child died to a signal (TDD §13.6).
+    /// Signal name (`"SIGSEGV"`) when the child died to a signal (site/content/internals/language-conformance-contract.md).
     pub signal: Option<String>,
     pub ok: bool,
     /// Captured stdout. When [`stdout_ref`](OutcomeVal::stdout_ref) is `Some`
     /// (a value-position capture that overflowed the RAM cap and spilled to the
-    /// CAS, TDD §317), this holds only the bounded resident *preview*; the full
+    /// CAS, site/content/internals/language-conformance-contract.md), this holds only the bounded resident *preview*; the full
     /// bytes live in the CAS behind the ref. Otherwise it is the whole stdout.
     pub stdout: Arc<Vec<u8>>,
     /// `Some` when stdout overflowed the capture RAM cap and was spilled to the
-    /// CAS (TDD §317): a lazy, ref-backed view of the *full* stdout. `.stdout`
+    /// CAS (site/content/internals/language-conformance-contract.md): a lazy, ref-backed view of the *full* stdout. `.stdout`
     /// then surfaces this (see [`OutcomeVal::stdout_value`]) so `.len` is the
     /// true length and materialization loads from the CAS on demand. `None` is
     /// the ordinary fully-resident case — no behavior change.
@@ -33,7 +33,7 @@ pub struct OutcomeVal {
     /// double-printing; captured externals and builtins (which stream nothing)
     /// leave this `false` so their `.out` still renders.
     pub streamed: bool,
-    /// Source span of the invocation (AGENT-SURFACE §2), when one is in scope
+    /// Source span of the invocation (site/content/internals/kernel-protocol.md), when one is in scope
     /// at construction. Carries the same byte-offset anchor `ErrorVal` uses so
     /// the sibling success/error paths of a command spawn agree. `None` when no
     /// meaningful source anchor exists (builtin-wrapped outcomes, values
@@ -50,7 +50,7 @@ impl OutcomeVal {
     }
 
     /// The `.stdout` value: a lazy [`Value::CasBytes`] when stdout spilled to
-    /// the CAS (TDD §317), else the resident [`Value::Bytes`]. Callers that
+    /// the CAS (site/content/internals/language-conformance-contract.md), else the resident [`Value::Bytes`]. Callers that
     /// surface `.stdout` use this so the ref-backed view is what users see for
     /// oversized captures (true `.len`, on-demand materialization), with zero
     /// change for the ordinary resident case.
@@ -61,8 +61,8 @@ impl OutcomeVal {
         }
     }
 
-    /// The **full** stdout bytes: loaded from the CAS when stdout spilled (TDD
-    /// §317), else the resident bytes. Data sinks (redirects, `.save`) use this
+    /// The **full** stdout bytes: loaded from the CAS when stdout spilled (see
+    /// `site/content/internals/persistence.md`), else the resident bytes. Data sinks (redirects, `.save`) use this
     /// so an oversized capture is written whole, not just its preview.
     pub fn stdout_bytes(&self) -> VResult<Vec<u8>> {
         match &self.stdout_ref {

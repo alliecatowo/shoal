@@ -1,6 +1,6 @@
-//! Style-spec grammar (§3.6) and a tiny in-crate ANSI SGR styler.
+//! Style-spec grammar (site/content/internals/prompt-editor-lsp.md) and a tiny in-crate ANSI SGR styler.
 //!
-//! design-prompt.md §2.1: the style spec is ~40 lines of `match`, not worth a
+//! site/content/internals/prompt-editor-lsp.md: the style spec is ~40 lines of `match`, not worth a
 //! crate edge for a domain-pure library, so shoal-prompt emits plain ANSI SGR
 //! sequences directly rather than depending on `nu-ansi-term`.
 
@@ -141,7 +141,7 @@ const NAMED: &[&str] = &[
 
 /// Parse a space-separated style spec into a [`Style`]. Unknown tokens are
 /// ignored; `warnings` collects a note when the spec yields zero recognized
-/// tokens (a typo like `"boldd"`, §11) — never an error, matching the project's
+/// tokens (a typo like `"boldd"`, site/content/internals/prompt-editor-lsp.md) — never an error, matching the project's
 /// warn-don't-crash posture. Tokens are order-independent, last-color-wins.
 pub fn parse_style(spec: &str, warnings: &mut Vec<String>) -> Style {
     let mut style = Style::default();

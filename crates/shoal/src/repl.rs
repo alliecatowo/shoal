@@ -30,7 +30,7 @@ pub(crate) fn repl() -> Result<i32, String> {
     let loaded = shoal_config::load(&shoal_config::LoadOptions::discover(&cwd))?;
     // Before anything else prints: feed `render.color` into `no_color()` so
     // even these very warnings honor a `render.color = false` in `shoal.toml`
-    // (docs/CONFIG.md §5/§6), the same way `NO_COLOR` already does.
+    // (site/content/internals/configuration-reference.md), the same way `NO_COLOR` already does.
     crate::apply_render_color_config(loaded.config.render.color);
     for warning in &loaded.warnings {
         eprintln!(
@@ -39,7 +39,7 @@ pub(crate) fn repl() -> Result<i32, String> {
         );
     }
     let config = loaded.config;
-    // `render.paging`/`render.pager` (docs/CONFIG.md §5): resolved once, here,
+    // `render.paging`/`render.pager` (site/content/internals/configuration-reference.md): resolved once, here,
     // from the loaded config — not re-read per keystroke/render. `enabled`
     // defaults to `false` (config default `"never"`), so an unconfigured
     // shoal behaves byte-for-byte like before this knob existed.
@@ -49,7 +49,7 @@ pub(crate) fn repl() -> Result<i32, String> {
     };
     let mut evaluator = Evaluator::new(cwd.clone());
     evaluator.interactive = true;
-    // Wire the user reef scope (docs/REEF.md §1) exactly like `run_source`
+    // Wire the user reef scope (site/content/internals/reef-resolution.md) exactly like `run_source`
     // does (crate::reef_user_manifest_path). The REPL builds its own
     // `Evaluator` and was missing this call entirely — without it,
     // `~/.config/shoal/shoal.toml`'s `[reef]` table engaged for `-c`/scripts
@@ -58,10 +58,10 @@ pub(crate) fn repl() -> Result<i32, String> {
     if let Some(path) = crate::reef_user_manifest_path() {
         evaluator.set_reef_user_manifest(path);
     }
-    // `[aliases]`/`[env]` (docs/CONFIG.md §5): same seeding `run_source` does,
+    // `[aliases]`/`[env]` (site/content/internals/configuration-reference.md): same seeding `run_source` does,
     // before any init file or typed input runs.
     crate::seed_config_bindings(&mut evaluator, &config);
-    // `render.echo` (docs/CONFIG.md §5): the interactive REPL keeps `all` (echo
+    // `render.echo` (site/content/internals/configuration-reference.md): the interactive REPL keeps `all` (echo
     // every result) by default; an explicit `render.echo` in config still wins.
     evaluator.set_echo_mode(crate::resolve_echo_mode(
         config.render.echo.as_deref(),
@@ -77,13 +77,13 @@ pub(crate) fn repl() -> Result<i32, String> {
         let _ = print_value(v);
     }));
 
-    // Install the command journal (TDD §9): without one, `undo`/`journal`/
+    // Install the command journal (site/content/internals/language-conformance-contract.md): without one, `undo`/`journal`/
     // `history` are inert (no journal means nothing is ever recorded). Open a
     // SECOND, independent handle on the exact same on-disk store (SQLite/WAL
     // supports concurrent handles fine) purely to read back each statement's
     // entry id right after it runs — that is how this host builds the
-    // `out[n] -> journal entry id` map `undo out[n]` needs (docs/ROADMAP.md
-    // R3): the evaluator's own journal handle is private, and `out` itself is
+    // `out[n] -> journal entry id` map `undo out[n]` needs (site/content/internals/roadmap-and-priorities.md
+    // (site/content/internals/persistence.md): the evaluator's own journal handle is private, and `out` itself is
     // just a plain REPL-side list of past values with no tie to entry ids.
     let state_dir = shoal_state_dir();
     // Enable `j`/`jump` directory-frecency recording against a store colocated
@@ -129,7 +129,7 @@ pub(crate) fn repl() -> Result<i32, String> {
             .map_err(|e| format!("init {}: {e}", init.display()))?;
     }
 
-    // Ctrl-C must not kill the shell (TDD §4.7): install a real SIGINT
+    // Ctrl-C must not kill the shell (site/content/internals/language-conformance-contract.md): install a real SIGINT
     // handler so the OS's default "terminate" disposition never fires while
     // a statement is executing (reedline's own `Signal::CtrlC` only covers
     // Ctrl-C pressed *while typing*, before Enter — the terminal is back in
@@ -150,7 +150,7 @@ pub(crate) fn repl() -> Result<i32, String> {
             }
         });
     }
-    // Job control (TDD §4.7): an interactive shell must ignore SIGTSTP/SIGTTOU/
+    // Job control (site/content/internals/language-conformance-contract.md): an interactive shell must ignore SIGTSTP/SIGTTOU/
     // SIGTTIN so a stray Ctrl-Z or a terminal-handoff operation never suspends
     // the shell itself — the classic bug this replaces. Gated on a real tty (the
     // same check the interactive path already relies on) so a piped/`-c` run is
@@ -172,7 +172,7 @@ pub(crate) fn repl() -> Result<i32, String> {
         config.completion.case_insensitive,
         config.completion.max_results,
     );
-    // `editor.keybindings` (docs/CONFIG.md §5): parse `chord -> action`
+    // `editor.keybindings` (site/content/internals/configuration-reference.md): parse `chord -> action`
     // strings into real reedline bindings, warning (never failing) on
     // anything unrecognized.
     let (custom_bindings, keybinding_warnings) =
@@ -187,7 +187,7 @@ pub(crate) fn repl() -> Result<i32, String> {
     // Build the shoal-prompt pipeline: load + layer the prompt config, resolve
     // the static session facts once, and set up the shared snapshot cell that
     // the loop refreshes per command and reedline reads per keystroke (zero
-    // I/O on the render path — the whole point, design §0/§1).
+    // I/O on the render path — the whole point, site/content/internals/prompt-editor-lsp.md).
     let (prompt_config, prompt_warnings) = prompt::load_prompt_config(&cwd);
     for warning in &prompt_warnings {
         eprintln!(
@@ -217,7 +217,7 @@ pub(crate) fn repl() -> Result<i32, String> {
         .with_menu(ReedlineMenu::EngineCompleter(Box::new(
             ColumnarMenu::default().with_name("completion_menu"),
         )))
-        // `completion.menu` (docs/CONFIG.md §5): `false` asks for cycle-only
+        // `completion.menu` (site/content/internals/configuration-reference.md): `false` asks for cycle-only
         // completion rather than the interactive popup. reedline has no
         // separate non-menu completion path (the `Completer` trait is only
         // ever driven through the `ReedlineMenu` system), but it exposes
@@ -233,7 +233,7 @@ pub(crate) fn repl() -> Result<i32, String> {
         .with_edit_mode(edit_mode)
         .with_highlighter(Box::new(ShoalHighlighter::with_env(evaluator.env.clone())))
         .with_hinter(Box::new(DefaultHinter::default()))
-        // `history.ignore_space` (docs/CONFIG.md §5, classic
+        // `history.ignore_space` (site/content/internals/configuration-reference.md, classic
         // `HISTCONTROL=ignorespace`): reedline has this exact knob built in.
         .with_history_exclusion_prefix(if config.history.ignore_space {
             Some(" ".to_string())
@@ -241,7 +241,7 @@ pub(crate) fn repl() -> Result<i32, String> {
             None
         });
     if transient_enabled {
-        // Transient prompt (§2.5): a second ShoalPrompt sharing the same cache,
+        // Transient prompt (site/content/internals/prompt-editor-lsp.md): a second ShoalPrompt sharing the same cache,
         // rendering `format.transient` post-Enter. Reedline invokes it at the
         // right moment; no custom repaint logic on our side.
         editor = editor.with_transient_prompt(Box::new(prompt::ShoalPrompt::new(
@@ -257,7 +257,7 @@ pub(crate) fn repl() -> Result<i32, String> {
             let _ = fs::create_dir_all(parent);
         }
         if let Ok(history) = FileBackedHistory::with_file(config.history.max_entries, path) {
-            // `history.dedup`/`history.ignore` (docs/CONFIG.md §5):
+            // `history.dedup`/`history.ignore` (site/content/internals/configuration-reference.md):
             // `FileBackedHistory` has no built-in filtering, so wrap it in a
             // thin `History` adapter that applies both before ever calling
             // through to `save`.
@@ -282,7 +282,7 @@ pub(crate) fn repl() -> Result<i32, String> {
         }
 
         // Refresh the frozen prompt snapshot once, here, between commands —
-        // never inside reedline's per-keystroke render (design §0.3, §2.3).
+        // never inside reedline's per-keystroke render (site/content/internals/prompt-editor-lsp.md).
         let width = u16::try_from(terminal_width()).unwrap_or(80);
         let ctx = prompt::build_context(&mut evaluator, &static_facts, width);
         if let Ok(mut cell) = shared_ctx.write() {
@@ -293,7 +293,7 @@ pub(crate) fn repl() -> Result<i32, String> {
                 if src.trim().is_empty() {
                     continue;
                 }
-                // Job control (TDD §4.7): `fg`/`bg` with a numeric job id (or a
+                // Job control (site/content/internals/language-conformance-contract.md): `fg`/`bg` with a numeric job id (or a
                 // bare `fg`/`bg` targeting the most-recent stopped job) resume a
                 // Ctrl-Z'd foreground external command. Handled here, before
                 // parse/eval, because it manipulates the live parked PTY + the
@@ -310,19 +310,19 @@ pub(crate) fn repl() -> Result<i32, String> {
                     handle_job_control(&mut evaluator, jc);
                     continue;
                 }
-                // `fg <task>` (docs/ROADMAP.md R3): host-level sugar, resolved
+                // `fg <task>` (site/content/internals/roadmap-and-priorities.md): host-level sugar, resolved
                 // as plain source text before parsing since the evaluator has
                 // no `fg` builtin of its own — see `rewrite_fg`.
                 let run_src = rewrite_fg(&src).unwrap_or_else(|| src.clone());
                 let ctx = parse_ctx_for(&evaluator.env);
                 match parse_with_ctx(&run_src, ctx) {
                     Ok(mut program) => {
-                        // `undo out[n]` (docs/ROADMAP.md R3): rewrite a literal
+                        // `undo out[n]` (site/content/internals/roadmap-and-priorities.md): rewrite a literal
                         // `out[n]` undo target into its recorded entry id so it
                         // resolves via the existing `undo <id>` path.
                         resolve_out_undo(&mut program, &out_entries);
                         // Hand the evaluator this line's source so each journaled
-                        // top-level statement can slice its own `src` (TDD §9);
+                        // top-level statement can slice its own `src` (site/content/internals/language-conformance-contract.md);
                         // without this the `history`/`journal` view shows an empty
                         // `src` column for every interactive entry, since
                         // `stmt_source` has nothing to slice from.
@@ -335,7 +335,7 @@ pub(crate) fn repl() -> Result<i32, String> {
                                 });
                                 out_entries.push(entry_id);
                                 evaluator.record_transcript(&value);
-                                // Paging (docs/CONFIG.md `render.paging`) applies
+                                // Paging (site/content/internals/configuration-reference.md `render.paging`) applies
                                 // ONLY to this final per-line result — never to
                                 // `-c`/scripts (`main::run_source` calls the
                                 // plain `render_result` below, which has no
@@ -355,7 +355,7 @@ pub(crate) fn repl() -> Result<i32, String> {
                                         ))
                                     );
                                 }
-                                // Job control (TDD §4.7): if a foreground
+                                // Job control (site/content/internals/language-conformance-contract.md): if a foreground
                                 // external command was Ctrl-Z'd during this
                                 // statement, it is now a stopped job — announce
                                 // it (bash's "[n]+ Stopped …") and return to the
@@ -392,13 +392,13 @@ pub(crate) fn repl() -> Result<i32, String> {
     }
 }
 
-/// Build the reedline edit mode for `config.editor.mode` (docs/CONFIG.md
-/// §5): `"emacs"` or `"vi"` — shoal-config's semantic validation already
-/// rejects anything else (§4), but this defensively falls back to emacs for
+/// Build the reedline edit mode for `config.editor.mode` (see
+/// `site/content/internals/prompt-editor-lsp.md`): `"emacs"` or `"vi"` — shoal-config's semantic validation already
+/// rejects anything else (site/content/internals/prompt-editor-lsp.md), but this defensively falls back to emacs for
 /// any other value rather than panicking, since a `Config` can also be built
 /// directly (tests, an embedder) bypassing that validation. Tab always
 /// drives the completion menu regardless of mode. `[editor.keybindings]`
-/// custom chords (§5) are layered on top of whichever mode's own default
+/// custom chords (site/content/internals/prompt-editor-lsp.md) are layered on top of whichever mode's own default
 /// table(s) are in play — both the insert and normal tables in vi mode,
 /// since the config schema draws no per-mode distinction.
 fn build_edit_mode(
@@ -428,7 +428,7 @@ fn build_edit_mode(
     }
 }
 
-/// `history.dedup`/`history.ignore` (docs/CONFIG.md §5): a `History` adapter
+/// `history.dedup`/`history.ignore` (site/content/internals/configuration-reference.md): a `History` adapter
 /// that wraps a real backend (here, `FileBackedHistory`) and filters what
 /// actually reaches `save` — neither knob has any built-in support in
 /// reedline's history backends. Every other `History` method delegates
@@ -507,8 +507,8 @@ impl History for FilteredHistory {
     }
 }
 
-/// Minimal shell-glob matcher for `history.ignore` patterns (docs/CONFIG.md
-/// §5's `HISTIGNORE`-equivalent): `*` matches any run of characters
+/// Minimal shell-glob matcher for `history.ignore` patterns (the
+/// `HISTIGNORE`-equivalent in `site/content/internals/prompt-editor-lsp.md`): `*` matches any run of characters
 /// (including none), `?` matches exactly one; every other character matches
 /// itself literally. `shoal-config` only carries the raw pattern strings
 /// (its own doc comment: "matching semantics are the host's") — this is this
@@ -537,7 +537,7 @@ fn glob_match(pattern: &str, text: &str) -> bool {
     dp[pat.len()][txt.len()]
 }
 
-/// Principal/session recorded on the REPL's own journal entries (TDD §9). A
+/// Principal/session recorded on the REPL's own journal entries (site/content/internals/language-conformance-contract.md). A
 /// fixed, stable pair — the interactive REPL is always exactly one local
 /// human session — so `latest_entry_id`'s `principal` filter is deterministic.
 const REPL_PRINCIPAL: &str = "human";
@@ -582,7 +582,7 @@ fn latest_entry_id(journal: &Journal, principal: &str, since_ns: i64) -> Option<
     rows.first().map(|row| row.id)
 }
 
-/// `undo out[N]` resolution (docs/ROADMAP.md R3). The evaluator's `undo`
+/// `undo out[N]` resolution (site/content/internals/roadmap-and-priorities.md). The evaluator's `undo`
 /// builtin only ever accepts a bare journal entry id (`undo 12`) — per its
 /// own doc comment, "`out[n]` addressing is a REPL/host concern (the
 /// evaluator has no out→entry map)". `out` itself is just a plain,
@@ -662,10 +662,10 @@ fn out_index_literal(arg: &CmdArg) -> Option<i64> {
     }
 }
 
-/// `fg <task>` (docs/ROADMAP.md R3): re-front a background task. There is no
+/// `fg <task>` (site/content/internals/roadmap-and-priorities.md): re-front a background task. There is no
 /// `fg` builtin in the evaluator — task lifecycle methods (`.suspend()` /
-/// `.resume()`) are a `shoal-eval` addition this wave (per docs/ROADMAP.md
-/// R3's task-lifecycle decision); `fg` itself is host-level sugar that
+/// `.resume()`) are implemented by `shoal-eval` (see
+/// `site/content/internals/pty-job-control.md`). `fg` itself is host-level sugar that
 /// combines them. Recognized only as the exact shape `fg <name>` (a single
 /// bare identifier, presumed bound to a task value, e.g. `let t = spawn {
 /// … }&` then `fg t`) and rewritten to `<name>.resume()\n<name>.await()`
@@ -723,7 +723,7 @@ impl JobKind {
     }
 }
 
-/// Recognize `fg`/`bg` job-control lines (TDD §4.7): bare `fg`/`bg`, or with a
+/// Recognize `fg`/`bg` job-control lines (site/content/internals/language-conformance-contract.md): bare `fg`/`bg`, or with a
 /// numeric job id (optionally a bash-style `%N`). Deliberately does NOT match
 /// `fg <name>` (an identifier — that resumes a `spawn` task via [`rewrite_fg`]),
 /// nor unrelated commands like `fgrep`/`fg=1`; those return `None` and flow
@@ -753,7 +753,7 @@ fn print_stopped_notice(id: u64, desc: &str) {
     );
 }
 
-/// Resume a stopped foreground external command (TDD §4.7). `fg` hands it the
+/// Resume a stopped foreground external command (site/content/internals/language-conformance-contract.md). `fg` hands it the
 /// terminal, SIGCONTs, and waits (WUNTRACED) for it to finish or stop again;
 /// `bg` SIGCONTs it and lets it run detached. Job resources live in shoal-exec's
 /// parked-job registry (the live PTY, keyed by pid) and in the evaluator's job
@@ -876,7 +876,7 @@ pub(crate) fn print_value(value: &Value) -> io::Result<()> {
 }
 
 /// Resolved `render.paging`/`render.pager` state for one REPL session
-/// (docs/CONFIG.md §5), built once in `repl()` from the loaded config —
+/// (site/content/internals/configuration-reference.md), built once in `repl()` from the loaded config —
 /// never re-read per line. Kept as an explicit, narrow struct threaded only
 /// into `render_result_paged` (rather than a global) so it is structurally
 /// impossible for `-c`/script runs, which never construct one, to
@@ -888,7 +888,7 @@ pub(crate) struct PagerContext {
     pub(crate) pager: Option<String>,
 }
 
-/// The interactive REPL's *final* per-line result render (docs/CONFIG.md
+/// The interactive REPL's *final* per-line result render (site/content/internals/configuration-reference.md
 /// `render.paging`): identical to `render_result` (same
 /// [`already_streamed`] skip), except that when paging is enabled, stdout is
 /// a real TTY, and the rendered output would not fit on one screen, the
@@ -1141,7 +1141,7 @@ mod tests {
         assert!(!input_is_incomplete("[1, 2]"));
     }
 
-    /// Job-control line recognition (TDD §4.7): bare `fg`/`bg` and `%N`/`N`
+    /// Job-control line recognition (site/content/internals/language-conformance-contract.md): bare `fg`/`bg` and `%N`/`N`
     /// forms are job control; an identifier arg, a longer command sharing the
     /// prefix, or an assignment must fall through untouched.
     #[test]
@@ -1201,7 +1201,7 @@ mod tests {
         assert!(!glob_match("exact", "exactly"));
     }
 
-    /// `history.dedup` (docs/CONFIG.md §5): a line identical to the
+    /// `history.dedup` (site/content/internals/configuration-reference.md): a line identical to the
     /// immediately preceding one is skipped; a different line, or the same
     /// line after a different one in between, is recorded.
     #[test]
@@ -1225,7 +1225,7 @@ mod tests {
         );
     }
 
-    /// `history.ignore` (docs/CONFIG.md §5, `HISTIGNORE`-equivalent): a line
+    /// `history.ignore` (site/content/internals/configuration-reference.md, `HISTIGNORE`-equivalent): a line
     /// matching any pattern is never recorded.
     #[test]
     fn filtered_history_ignore_patterns_are_never_recorded() {
@@ -1278,7 +1278,7 @@ mod tests {
         );
     }
 
-    /// `editor.mode` (docs/CONFIG.md §5): `"vi"` selects reedline's `Vi` edit
+    /// `editor.mode` (site/content/internals/configuration-reference.md): `"vi"` selects reedline's `Vi` edit
     /// mode, anything else (including the default `"emacs"`) selects `Emacs`.
     #[test]
     fn build_edit_mode_selects_vi_or_emacs_from_config() {
@@ -1295,7 +1295,7 @@ mod tests {
         assert_eq!(emacs_mode.edit_mode(), reedline::PromptEditMode::Emacs);
     }
 
-    /// `editor.keybindings` (docs/CONFIG.md §5): a custom chord actually
+    /// `editor.keybindings` (site/content/internals/configuration-reference.md): a custom chord actually
     /// fires its configured action through the real `EditMode::parse_event`
     /// path, in both emacs and vi-insert mode.
     #[test]
@@ -1326,7 +1326,7 @@ mod tests {
         assert_eq!(vi_mode.parse_event(raw_event()), ReedlineEvent::ClearScreen);
     }
 
-    /// `should_page` (docs/CONFIG.md `render.paging`): the four inputs each
+    /// `should_page` (site/content/internals/configuration-reference.md `render.paging`): the four inputs each
     /// independently gate paging — disabled, a non-TTY stdout, and output
     /// that already fits on one screen must all suppress it regardless of
     /// the others; only the conjunction of "enabled + TTY + overflowing"
@@ -1350,7 +1350,7 @@ mod tests {
         );
     }
 
-    /// `pager_command` resolution order (docs/CONFIG.md §5): an explicit
+    /// `pager_command` resolution order (site/content/internals/configuration-reference.md): an explicit
     /// `render.pager` config command wins over `$PAGER`, which wins over the
     /// built-in `less -R` fallback; a blank/whitespace-only value at either
     /// layer is treated as unset, not as a literal empty command.
@@ -1415,7 +1415,7 @@ mod tests {
         render_result_paged(&value, false, &pager).unwrap();
     }
 
-    /// `spawn_pager` end-to-end (docs/CONFIG.md: "if you can integration-test
+    /// `spawn_pager` end-to-end (site/content/internals/configuration-reference.md: "if you can integration-test
     /// the actual pipe cheaply... do it"): spawns a real child process,
     /// writes the rendered text through its real stdin pipe, and confirms
     /// the bytes actually arrived — the same mechanics `render_result_paged`

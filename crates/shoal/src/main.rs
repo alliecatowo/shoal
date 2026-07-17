@@ -42,9 +42,9 @@ fn main() {
     worker.join().expect("main worker thread panicked");
 }
 
-/// Set once at startup from the loaded config's `render.color` (docs/CONFIG.md
-/// §5/§6) — `shoal_config::load` already folds `NO_COLOR`/`SHOAL_RENDER_COLOR`
-/// into that value (§3), so this is the one flag `no_color()` needs to also
+/// Set once at startup from the loaded config's `render.color` (see
+/// `site/content/internals/configuration-reference.md`) — `shoal_config::load` already folds `NO_COLOR`/`SHOAL_RENDER_COLOR`
+/// into that value (site/content/internals/prompt-editor-lsp.md), so this is the one flag `no_color()` needs to also
 /// honor a plain `render.color = false` in `shoal.toml` with no env var
 /// involved. `false` (color enabled) until [`apply_render_color_config`] runs.
 static CONFIG_COLOR_DISABLED: AtomicBool = AtomicBool::new(false);
@@ -161,7 +161,7 @@ fn real_main(args: Vec<OsString>) -> Result<i32, String> {
     }
 }
 
-/// The user-scope reef manifest path (docs/REEF.md §1: `[reef]` in
+/// The user-scope reef manifest path (site/content/internals/reef-resolution.md: `[reef]` in
 /// `shoal.toml` is the user scope): `$XDG_CONFIG_HOME/shoal/shoal.toml`,
 /// falling back to `~/.config/shoal/shoal.toml` when unset. Mirrors
 /// `shoal_config::LoadOptions::discover`'s own user-layer resolution and
@@ -181,14 +181,14 @@ pub(crate) fn reef_user_manifest_path() -> Option<PathBuf> {
     })
 }
 
-/// Declare each `[aliases]`/`[env]` entry (docs/CONFIG.md §5) in `evaluator`
+/// Declare each `[aliases]`/`[env]` entry (site/content/internals/configuration-reference.md) in `evaluator`
 /// exactly as if the user had typed the equivalent session statement at
 /// startup — `alias <name> = <target>` / `env.<NAME> = "<value>"`. Neither
 /// has a dedicated seeding API on `Evaluator` (`Stmt::Alias` and the
 /// `env.NAME = …` assignment form are the only paths that ever bind them —
 /// see `shoal-eval/src/stmt.rs`), so this synthesizes and evaluates one
 /// statement per entry: the simplest way to reuse the exact machinery a
-/// typed statement goes through, per docs/CONFIG.md §6's integrator note. A
+/// typed statement goes through, per site/content/internals/configuration-reference.md integrator note. A
 /// name/value that can't be expressed this way (e.g. an alias or env name
 /// that isn't a valid identifier — config validation only requires
 /// non-empty/no-whitespace, not identifier-shaped) never aborts startup: it
@@ -252,7 +252,7 @@ pub(crate) fn quote_shoal_string(value: &str) -> String {
     out
 }
 
-/// Resolve the `render.echo` mode (docs/CONFIG.md §5) for a surface, falling
+/// Resolve the `render.echo` mode (site/content/internals/configuration-reference.md) for a surface, falling
 /// back to `default` when the key is unset — and, defensively, when it holds an
 /// unrecognized value (config validation already rejects those, so this only
 /// matters for a `Config` built directly in a test/embedder). The
@@ -268,7 +268,7 @@ pub(crate) fn resolve_echo_mode(echo: Option<&str>, default: EchoMode) -> EchoMo
 }
 
 /// Build the in-language `config` snapshot (`config.get`/`config.all`,
-/// docs/CONFIG.md §6) from the host's *resolved* `shoal_config::Config` — the
+/// site/content/internals/configuration-reference.md) from the host's *resolved* `shoal_config::Config` — the
 /// exact same layered/validated/env-folded config the binary applies to itself
 /// — so `config.get(...)` in a script can never disagree with the config the
 /// host used. Serializes the typed `Config` to a record `Value` via the
@@ -310,7 +310,7 @@ fn run_source(
     };
     let mut evaluator = Evaluator::new(cwd);
     evaluator.interactive = interactive;
-    // `render.echo` (docs/CONFIG.md §5): a non-interactive run defaults to
+    // `render.echo` (site/content/internals/configuration-reference.md): a non-interactive run defaults to
     // `quiet` — only bare-command output and the FINAL statement's value show,
     // intermediate pure expressions (`1+1`, `let x=…`) do NOT auto-print. The
     // evaluator gates intermediate rendering; the final-value gate is below.
@@ -323,7 +323,7 @@ fn run_source(
     evaluator.set_config(Arc::new(ConfigSnapshot::new(config_snapshot_value(
         &loaded.config,
     ))));
-    // Wire the user reef scope (docs/REEF.md §1) so `~/.config/shoal/
+    // Wire the user reef scope (site/content/internals/reef-resolution.md) so `~/.config/shoal/
     // shoal.toml`'s `[reef]` table actually engages — without this call the
     // documented user scope never exists in the real binary, no matter what
     // the user writes there (`Evaluator::set_reef_user_manifest` has no other
@@ -332,7 +332,7 @@ fn run_source(
     if let Some(path) = reef_user_manifest_path() {
         evaluator.set_reef_user_manifest(path);
     }
-    // `[aliases]`/`[env]` (docs/CONFIG.md §5): declare each the same way a
+    // `[aliases]`/`[env]` (site/content/internals/configuration-reference.md): declare each the same way a
     // typed `alias name = cmd` / `env.NAME = "v"` statement would, before any
     // user source runs.
     seed_config_bindings(&mut evaluator, &loaded.config);
@@ -373,7 +373,7 @@ fn run_source(
             if let Some(code) = evaluator.take_exit() {
                 return Ok(code);
             }
-            // `render.echo` final-value gate (docs/CONFIG.md §5): `quiet`/`all`
+            // `render.echo` final-value gate (site/content/internals/configuration-reference.md): `quiet`/`all`
             // always render the final statement's value; `commands` renders it
             // only when the final statement is itself a bare command (so its
             // output shows) and suppresses a final pure expression. The
@@ -488,7 +488,7 @@ mod tests {
     }
 
     /// `render.color = false` from config must suppress ANSI the same way
-    /// `NO_COLOR` does (docs/CONFIG.md §6), without the env var being set.
+    /// `NO_COLOR` does (site/content/internals/configuration-reference.md), without the env var being set.
     /// Serialized against every other test that reads `no_color()`/`NO_COLOR`
     /// in this binary (shared with the `reef_user_manifest_path` env test).
     #[test]

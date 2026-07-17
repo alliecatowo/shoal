@@ -1,5 +1,5 @@
 //! reef scope-chain cache, override stack, and spawn-time resolution
-//! (docs/REEF.md §2–§4, §6).
+//! (site/content/internals/reef-resolution.md).
 //!
 //! Split out of [`crate::reef`] (see that module's doc for the split
 //! rationale): this file owns the cached [`ScopeChain`]/lock, the
@@ -45,7 +45,7 @@ impl Evaluator {
     }
 
     /// A clone of the current scope chain (cheap: manifests are small maps),
-    /// with any active `with reef:` override layers (REEF.md §6) prepended —
+    /// with any active `with reef:` override layers (site/content/internals/reef-resolution.md) prepended —
     /// nearest-first, so the innermost `with reef:` block wins ties, then the
     /// discovered manifest chain. The clone frees `self` for the resolver/lock
     /// mutations that follow, and never mutates the cached `reef_chain` (so
@@ -62,7 +62,7 @@ impl Evaluator {
     }
 
     /// Push a `with reef: {tool: constraint, …}` override layer for the
-    /// dynamic extent of a block (REEF.md §6), minted from a plain record of
+    /// dynamic extent of a block (site/content/internals/reef-resolution.md), minted from a plain record of
     /// tool name -> version-constraint string. Highest priority: it out-ranks
     /// every discovered manifest and every previously-pushed override while
     /// active. Pop with [`Evaluator::pop_reef_override`] on every exit path.
@@ -99,7 +99,7 @@ impl Evaluator {
         self.reef_overrides.pop();
     }
 
-    /// The lazily-built provider stack (REEF §3). Only ever called once a
+    /// The lazily-built provider stack (site/content/internals/reef-resolution.md). Only ever called once a
     /// manifest is in scope, so the no-manifest hot path never constructs it.
     pub(crate) fn reef_resolver(&mut self) -> Arc<Resolver> {
         if self.reef_resolver.is_none() {
@@ -136,7 +136,7 @@ impl Evaluator {
     /// Look up `name` on the ambient `$PATH`, bypassing reef entirely — the
     /// same raw lookup `which`'s NotFound fallback already performs. Shared by
     /// the not-found "shadowed by ambient PATH" did-you-mean (below) and
-    /// `reef doctor`'s shadowed-ambient check (`reef_builtins.rs`, REEF.md §6's
+    /// `reef doctor`'s shadowed-ambient check (`reef_builtins.rs`, site/content/internals/reef-resolution.md
     /// third bullet): both need the same "does a name answer to something
     /// outside reef's view" fact.
     pub(crate) fn ambient_which(&self, name: &str) -> Option<PathBuf> {
@@ -148,12 +148,12 @@ impl Evaluator {
         shoal_exec::which(OsStr::new(name), path_env)
     }
 
-    // --- spawn-time resolution (REEF §2, §4) -------------------------------
+    // --- spawn-time resolution (site/content/internals/reef-resolution.md) -------------------------------
 
     /// The reef spawn hook, called from `run_argv` just before spawning. When
     /// the head (`argv[0]`, a bare name) is constrained by a manifest in scope,
     /// rewrites `argv[0]` to the resolved absolute binary and rewrites the
-    /// child's `PATH` to a synthesized view (REEF §4). When nothing is in scope
+    /// child's `PATH` to a synthesized view (site/content/internals/reef-resolution.md). When nothing is in scope
     /// or the head is unconstrained, it is a pure no-op — today's behavior.
     ///
     /// `env` is the child environment being assembled; only its `PATH` entry is
@@ -161,7 +161,7 @@ impl Evaluator {
     /// mutated.
     ///
     /// Returns the resolved binary's blake3 content hash (`Some`) when reef
-    /// actually resolved the head, so the leash spawn gate (TDD §8 content-hash
+    /// actually resolved the head, so the leash spawn gate (site/content/internals/language-conformance-contract.md content-hash
     /// pinning) can reuse it verbatim instead of re-hashing the same file;
     /// `None` on every no-op path (no manifest, explicit path, unconstrained
     /// head). The hash is reef's own `Resolution::hash`, identical blake3-hex to
@@ -207,7 +207,7 @@ impl Evaluator {
         let resolution = match outcome {
             Ok(r) => r,
             Err(e) => {
-                // REEF.md §6's second did-you-mean bullet: a constrained,
+                // site/content/internals/reef-resolution.md second did-you-mean bullet: a constrained,
                 // not-found tool might still answer to a DIFFERENT binary via
                 // plain ambient PATH — surface that so the miss doesn't read
                 // as "nothing anywhere has this" when ambient actually does,
@@ -225,7 +225,7 @@ impl Evaluator {
         }
 
         // Synthesize the child's PATH so legacy children see a coherent world
-        // (REEF §4): the reef view dir first, then the ambient PATH tail unless
+        // (site/content/internals/reef-resolution.md): the reef view dir first, then the ambient PATH tail unless
         // a scope requested hermetic. Never mutates the session env.
         let path_var = self.reef_synth_path(&resolution, &chain, env)?;
         match env.iter_mut().find(|(k, _)| k == "PATH") {
@@ -236,7 +236,7 @@ impl Evaluator {
     }
 
     /// Build (or reuse) a content-addressed view dir binding every locked tool,
-    /// and return the synthesized `PATH` value (REEF §4). The system tail is the
+    /// and return the synthesized `PATH` value (site/content/internals/reef-resolution.md). The system tail is the
     /// child's *ambient* PATH (so non-reef tools still resolve), dropped entirely
     /// when hermetic.
     fn reef_synth_path(
@@ -273,7 +273,7 @@ impl Evaluator {
         Ok(view.path_var)
     }
 
-    /// Emit the one-line auto-lock notice to the statement sink (REEF §2).
+    /// Emit the one-line auto-lock notice to the statement sink (site/content/internals/reef-resolution.md).
     fn emit_lock_notice(&mut self, n: &LockNotice) {
         let msg = format!(
             "reef: locked {}@{} via {} ({})",
@@ -298,9 +298,9 @@ impl Evaluator {
 
 /// Convert a [`shoal_reef::ReefError`] into an `ErrorVal`, preserving the stable
 /// code and hint. Enriches `reef_not_found` on a constrained tool with the
-/// did-you-mean phrasing from REEF §6: "constrained but not installed", plus
+/// did-you-mean phrasing from site/content/internals/reef-resolution.md: "constrained but not installed", plus
 /// (when `ambient` names a real ambient-PATH hit for the same name) "found in
-/// ambient PATH but shadowed by project reef" — REEF §6's second bullet.
+/// ambient PATH but shadowed by project reef" — site/content/internals/reef-resolution.md second bullet.
 fn reef_error_to_val(
     e: shoal_reef::ReefError,
     name: &str,
@@ -354,7 +354,7 @@ mod tests {
         ))]))
     }
 
-    /// Fix 5 (REEF.md §6's second did-you-mean bullet): a constrained tool
+    /// Fix 5 (site/content/internals/reef-resolution.md second did-you-mean bullet): a constrained tool
     /// the fixture resolver can't find, but that a REAL ambient binary
     /// answers to (here, `sh` — guaranteed present on any POSIX host, the
     /// same assumption `crates/shoal-eval/tests/reef_integration.rs` and much

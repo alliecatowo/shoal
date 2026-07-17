@@ -1,13 +1,13 @@
 //! `resources/*` handlers: `resources/list`, `resources/read`,
 //! `resources/templates/list`, `resources/subscribe`, and the `shoal://` URI
-//! parser they share (AGENT-SURFACE §1/§6/§8).
+//! parser they share (site/content/internals/kernel-protocol.md).
 
 use crate::tools::bound_text;
 use crate::{BridgeError, Facade, KernelClient, short_ref_to_uri};
 use serde_json::{Value, json};
 
 impl Facade {
-    /// `resources/list` (AGENT-SURFACE §8): the stable roots plus per-session
+    /// `resources/list` (site/content/internals/kernel-protocol.md): the stable roots plus per-session
     /// dynamic entries (open tasks). Values are browsed via `resources/read`.
     pub(crate) fn resources_list(&mut self) -> Result<Value, String> {
         let mut resources = vec![
@@ -77,7 +77,7 @@ impl Facade {
         Ok(json!({ "resources": resources }))
     }
 
-    /// `resources/read` (AGENT-SURFACE §1/§8): dispatch a `shoal://` URI to the
+    /// `resources/read` (site/content/internals/kernel-protocol.md): dispatch a `shoal://` URI to the
     /// kernel and return `structuredContent` (the `$`-tagged / elided value).
     /// So an agent following an elided value's ref never hand-translates to
     /// `shoal_get`.
@@ -91,7 +91,7 @@ impl Facade {
         // Session state views. `cwd` is served from the cached attach result (no
         // round-trip); `env`/`reef` read the session evaluator live via a
         // dedicated kernel method (fresh, so in-session `cd`/env-writes/reef
-        // locks are reflected). Env is names-only unless granted (§1) — the
+        // locks are reflected). Env is names-only unless granted (site/content/internals/kernel-protocol.md) — the
         // kernel enforces that; the facade just relays.
         if parsed.root == "session" {
             let field = parsed.segments.first().map(String::as_str).unwrap_or("");
@@ -109,7 +109,7 @@ impl Facade {
             return Ok(value_read_result(&uri, value));
         }
         // `shoal://task/{id}/out`: the task's captured output — the read side of
-        // the subscription (§6). A kernel task captures the *whole* outcome at
+        // the subscription (site/content/internals/kernel-protocol.md). A kernel task captures the *whole* outcome at
         // completion (no streaming cursor infra yet), so this returns the full
         // current output: resolve the task record's `result_ref` through
         // `value.get` (reusing existing methods, honoring ?path/slice/format).
@@ -153,7 +153,7 @@ impl Facade {
         }
     }
 
-    /// `resources/subscribe` (AGENT-SURFACE §6): map a `shoal://events/{ch}` or
+    /// `resources/subscribe` (site/content/internals/kernel-protocol.md): map a `shoal://events/{ch}` or
     /// `shoal://task/{id}/out` URI to a kernel channel and forward pushes as
     /// `notifications/resources/updated`. A dedicated background connection
     /// owns the subscription so it never contends with request/response reads.
@@ -214,7 +214,7 @@ fn value_read_result(uri: &str, value: Value) -> Value {
     })
 }
 
-/// `resources/templates/list` (AGENT-SURFACE §8): the query-parameterized
+/// `resources/templates/list` (site/content/internals/kernel-protocol.md): the query-parameterized
 /// forms an agent can instantiate.
 pub(crate) fn resource_templates() -> Value {
     json!({"resourceTemplates":[
@@ -230,7 +230,7 @@ pub(crate) fn resource_templates() -> Value {
     ]})
 }
 
-/// A parsed `shoal://` resource URI (AGENT-SURFACE §1).
+/// A parsed `shoal://` resource URI (site/content/internals/kernel-protocol.md).
 struct ParsedUri {
     root: String,
     segments: Vec<String>,
@@ -296,7 +296,7 @@ impl ParsedUri {
                     .ok_or("shoal://val/{hash} needs a hash")?;
                 // Accept both the bare hash (`shoal://val/{hex}`) and the spec's
                 // short-ref form `val:blake3:{hex}` → `shoal://val/blake3:{hex}`
-                // (AGENT-SURFACE §1): the kernel's CAS keys on the raw hex, so
+                // (site/content/internals/kernel-protocol.md): the kernel's CAS keys on the raw hex, so
                 // strip the `blake3:` algorithm prefix before `blob.get`.
                 let hash = hash.strip_prefix("blake3:").unwrap_or(hash);
                 Ok(("blob.get", json!({ "hash": hash })))

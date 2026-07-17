@@ -1,5 +1,5 @@
-//! The pure renderer: format-token walk (§3.4) + per-module `match` (§4) +
-//! style application (§3.6), with the deadline degrade of §1. No I/O, no
+//! The pure renderer: format-token walk (site/content/internals/prompt-editor-lsp.md) + per-module `match` (site/content/internals/prompt-editor-lsp.md) +
+//! style application (site/content/internals/prompt-editor-lsp.md), with the deadline degrade of site/content/internals/prompt-editor-lsp.md. No I/O, no
 //! logging, no side effects — a golden/snapshot suite drives it with hand-built
 //! `PromptContext` values, no kernel required.
 
@@ -13,7 +13,7 @@ use crate::style::parse_style;
 mod helpers;
 mod modules;
 
-/// The four independent strings reedline asks for (§2.5). `indicator` is always
+/// The four independent strings reedline asks for (site/content/internals/prompt-editor-lsp.md). `indicator` is always
 /// empty: shoal-prompt owns the entire visual symbol via `$character`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RenderedPrompt {
@@ -56,7 +56,7 @@ struct Seg {
 
 impl Renderer {
     /// Build a renderer, parsing all four format strings once and collecting any
-    /// unknown-module / style warnings (§11).
+    /// unknown-module / style warnings (site/content/internals/prompt-editor-lsp.md).
     pub fn new(config: PromptConfig) -> (Self, Vec<String>) {
         let mut warnings = Vec::new();
         let formats = config.parse_formats(&mut warnings);
@@ -77,7 +77,7 @@ impl Renderer {
         }
     }
 
-    /// Render a single side, honoring the §1 deadline: once elapsed exceeds the
+    /// Render a single side, honoring the site/content/internals/prompt-editor-lsp.md deadline: once elapsed exceeds the
     /// budget, every remaining module renders its cheapest fallback (empty).
     pub fn render_side(&self, side: Side, ctx: &PromptContext) -> String {
         let tokens = match side {
@@ -180,7 +180,7 @@ impl Renderer {
         style.paint(text, ctx.no_color)
     }
 
-    /// nerd-font symbol when available (§3.5), else the ascii fallback.
+    /// nerd-font symbol when available (site/content/internals/prompt-editor-lsp.md), else the ascii fallback.
     fn use_nerd(&self, ctx: &PromptContext) -> bool {
         ctx.nerd_font && ctx.unicode
     }
@@ -194,7 +194,7 @@ impl Renderer {
     }
 }
 
-/// Join rendered segments applying the whitespace-collapse rule (§3.4): a
+/// Join rendered segments applying the whitespace-collapse rule (site/content/internals/prompt-editor-lsp.md): a
 /// whitespace-only literal immediately adjacent to a module that rendered empty
 /// is dropped along with it. Non-whitespace literals are never dropped.
 fn join_collapsing(segs: &[Seg]) -> String {

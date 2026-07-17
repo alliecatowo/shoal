@@ -1,4 +1,4 @@
-# The `os.*` namespace (TDD §5's namespace list; `crates/shoal-eval/src/
+# The `os.*` namespace (site/content/internals/language-conformance-contract.md namespace list; `crates/shoal-eval/src/
 # namespaces.rs::os_ns`). Every accessor is nullary; most return genuinely
 # host-varying values (platform/arch/hostname/username/pid/cpu count), so —
 # same discipline as datetime-relative.toml's clock-anchored relations —

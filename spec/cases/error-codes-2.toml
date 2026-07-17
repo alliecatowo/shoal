@@ -2,7 +2,7 @@
 # `str` receiver (only `list` indexing was exercised there and in core.toml
 # — `expr_access.rs::index`'s `(Str, Int)` arm has its own bounds check and
 # message), a sanity companion proving negative string indexing stays in
-# range, and a genuinely surprising (but correct, per IO.md §2's lazy
+# range, and a genuinely surprising (but correct, per site/content/internals/values-streams-execution.md lazy
 # JSON-sniff rule) `.out` upgrade: an interpreter block whose ENTIRE stdout
 # is exactly the two bytes `{}` sniffs as valid empty-object JSON and
 # upgrades to an empty `record`, not the literal string `"{}"`.
@@ -19,7 +19,7 @@ value = '"c"'
 
 [[case]]
 name = "errcode2-sh-out-json-sniff-upgrades-empty-braces-to-empty-record"
-# `.out`'s lazy sniff (IO.md §2.7) upgrades any `{`/`[`-shaped stdout to
+# `.out`'s lazy sniff (site/content/internals/values-streams-execution.md) upgrades any `{`/`[`-shaped stdout to
 # structured data; the two-byte payload `{}` is valid (empty) JSON, so it
 # becomes `Value::Record` with zero fields, not the three-character string
 # `"{}"`.

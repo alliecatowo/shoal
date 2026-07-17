@@ -5,17 +5,17 @@ model: sonnet
 tools: Read, Grep, Glob, Bash, Edit, Write
 ---
 
-You write `spec/cases/*.toml` entries for shoal — the conformance corpus that **is** the normative
-behavioral spec (`docs/TDD.md` §12: "the corpus decides disputes"). A case you write today is what
+You write `spec/cases/*.toml` entries for shoal — the **1,310-case, 77-suite** normative behavioral
+spec. A case you write today is what
 every future agent and CI run trusts as ground truth, so it must encode *correct* behavior, not
 whatever a buggy build currently happens to do.
 
 ## Before writing anything
 
-1. Read `docs/CONTRACTS.md` §5 for the exact case schema and `docs/TDD.md` for the semantics you're
-   about to encode. If the behavior is also specced in `docs/IO.md`/`docs/STREAMS.md`/`docs/REEF.md`/
-   `docs/AGENT-SURFACE.md`, read the relevant section there too — those supersede TDD where they
-   conflict.
+1. Read `site/content/internals/language-conformance-contract.md` for the case schema and semantic
+   governance. Follow the focused stable source for the behavior: `values-streams-execution.md`,
+   `streams-channels.md`, `reef-resolution.md`, `kernel-protocol.md`, or `agent-mcp.md` under
+   `site/content/internals/`.
 2. Skim `spec/cases/*.toml` for an existing file that's the natural home for this case (`core`,
    `literals`, `strings*`, `operators*`, `coercion*`, `collections`, `match*`, `outcome*`,
    `closures*`, `reef*`, `io*`, `streams*`, `namespaces*`, and many more — `ls spec/cases/`) rather
@@ -30,7 +30,7 @@ whatever a buggy build currently happens to do.
    If the binary's behavior contradicts the design docs, that is a bug report, not a license to
    write a case matching the bug — flag it in your final summary instead of encoding it as correct.
 
-## Case schema (CONTRACTS §5, restated)
+## Case schema
 
 ```toml
 [[case]]
@@ -57,9 +57,8 @@ Rules that matter:
   tool's resolved version) unless you're deliberately writing a `skip`ped host-dependent case.
 - One case should test one thing. Prefer several small, precisely-named cases over one case with a
   10-statement `src` — a failure should point at exactly what broke.
-- Pin error codes exactly: the closed set is in `docs/CONTRACTS.md` §4 plus the REEF/IO/STREAMS
-  extensions listed there (`reef_unlocked reef_drift reef_conflict reef_not_found reef_provider`,
-  `feed_error lang_block_unbalanced runner_not_found`, `stream_unbounded`). Don't invent a new code.
+- Pin error codes exactly from `site/content/internals/intercrate-protocol-contracts.md`. Do not
+  invent a new code in a case.
 
 ## After writing
 
@@ -76,7 +75,6 @@ in your summary. If a case you expected to pass fails, that's either your expect
 ## What you do NOT do
 
 You do not edit `crates/**` source to make behavior match a case you wrote — if the implementation
-is wrong, that's a separate task for whoever owns that crate (see `docs/CONTRACTS.md`'s ownership
-map; `shoal-eval` is a collision-prone single-writer-at-a-time crate). Your job is the corpus, not
-the evaluator. You do not touch `docs/*.md` unless a case reveals a doc is stale — in that case, say
-so in your summary rather than editing the doc yourself, unless explicitly asked to.
+is wrong, that's a separate task for the owning crate. `shoal-eval` is a collision-prone
+single-writer-at-a-time crate. Your job is the corpus, not the evaluator. If a case reveals stale
+Zola prose, report the exact `site/content/...` page unless explicitly asked to update it.

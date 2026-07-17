@@ -1,4 +1,4 @@
-# Interpreter-class adapter (IO.md §2.2): `node { BODY }` hands the raw
+# Interpreter-class adapter (site/content/internals/values-streams-execution.md): `node { BODY }` hands the raw
 # block to `node -e BODY`. `-e`/`--eval` is portable across every platform
 # Node ships on (Linux/macOS/Windows), so no divergence note is needed —
 # unlike `python`'s `python`-vs-`python3` naming trap, `node` itself is the

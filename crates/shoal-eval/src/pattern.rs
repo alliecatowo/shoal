@@ -67,7 +67,7 @@ impl Evaluator {
                         )? == Value::Bool(true),
                 )
             }
-            // `int n` / `str s` — runtime type test, bind on success (TDD §3.2).
+            // `int n` / `str s` — runtime type test, bind on success (site/content/internals/language-conformance-contract.md).
             Pattern::Type { ty, name, .. } => {
                 if v.type_name() == ty.name {
                     if let Some(n) = name {

@@ -1,4 +1,5 @@
-# IO.md conformance: interpreter blocks (§2) and `.feed` (§1).
+# Interpreter-block and `.feed` conformance for
+# `site/content/internals/values-streams-execution.md`.
 #
 # Host-safety: every non-skipped case uses only tools guaranteed on the CI
 # runners *and* the dev host — `sh` and `sort` (POSIX) always, plus `python3`
@@ -39,7 +40,7 @@ value = "4"
 
 [[case]]
 name = "io-python-block-structured-out"
-# The IO.md §2.7 payoff: an interpreter block that emits JSON has a structured
+# The site/content/internals/values-streams-execution.md payoff: an interpreter block that emits JSON has a structured
 # `.out`, navigable by field path — zero text-scraping. `python3` ships on the
 # GitHub ubuntu+macos runners and the dev host; the program reaches python via
 # `-c` (baked invocation map), so this is not string-smuggling at the call
@@ -99,7 +100,7 @@ value = "{n: 2}"
 
 [[case]]
 name = "io-feed-regex-is-feed-error"
-# A regex is deliberately never feedable (IO.md §1.2 / §5) → `feed_error`.
+# A regex is deliberately never feedable (site/content/internals/values-streams-execution.md) → `feed_error`.
 src = 're"x".feed(sort)'
 error = "feed_error"
 

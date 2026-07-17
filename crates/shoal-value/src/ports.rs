@@ -1,4 +1,5 @@
-//! Hexagonal ports (docs/ROADMAP.md R4, scratch/audit-arch.md §2c).
+//! Hexagonal ports. See `site/content/internals/effects-plans-security.md`
+//! and `site/content/internals/intercrate-protocol-contracts.md`.
 //!
 //! The evaluator (`shoal-eval`) is meant to be the pure domain core, but it
 //! historically reached straight into the OS with scattered `std::fs`,
@@ -229,11 +230,11 @@ pub trait SecretPort: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
-// BytesLoad — content-addressed bytes loader port (TDD §317)
+// BytesLoad — content-addressed bytes loader port (site/content/internals/language-conformance-contract.md)
 // ---------------------------------------------------------------------------
 
 /// Loads the full content behind a lazy, CAS-backed [`crate::Value::CasBytes`]
-/// (TDD §317 disk-spill). A value produced when a command's captured output
+/// (site/content/internals/language-conformance-contract.md disk-spill). A value produced when a command's captured output
 /// overflowed the RAM cap holds one of these plus a bounded preview; methods
 /// that need the whole bytes (`.str()`, `.save`, indexing, …) call [`load`]
 /// on demand, while `.len` and `render` stay cheap and never load.

@@ -10,7 +10,7 @@ impl Evaluator {
         let n = program.stmts.len();
         for (i, stmt) in program.stmts.iter().enumerate() {
             let is_last = i + 1 == n;
-            // TDD §9: when a journal is installed, each top-level statement
+            // site/content/internals/language-conformance-contract.md: when a journal is installed, each top-level statement
             // becomes an entry (append → finish). A `None` journal makes this a
             // no-op, so scripts/-c/conformance are unaffected.
             let journaled = self.journal_begin_stmt(stmt);
@@ -24,8 +24,8 @@ impl Evaluator {
                     } else if self.echo_intermediate(stmt) {
                         // Non-final statement values pass through to the sink
                         // (defect #1a); the final value is returned to the host.
-                        // Under `render.echo = quiet`/`commands` (docs/CONFIG.md
-                        // §5) only bare-command intermediates echo — a pure
+                        // Under `render.echo = quiet`/`commands` (see
+                        // `site/content/internals/configuration-reference.md`) only bare-command intermediates echo — a pure
                         // expression (`1+1`, `let x=…`) at intermediate position
                         // stays silent, so a non-interactive script no longer
                         // prints every step.
@@ -53,7 +53,7 @@ impl Evaluator {
     }
 
     /// Whether a non-final top-level statement's value routes to the statement
-    /// sink, per the active [`EchoMode`] (`render.echo`, docs/CONFIG.md §5).
+    /// sink, per the active [`EchoMode`] (`render.echo`, site/content/internals/configuration-reference.md).
     /// `All` (the default) echoes every intermediate — the REPL/legacy
     /// behavior; `Quiet`/`Commands` echo only bare-command intermediates so a
     /// script's intermediate pure expressions (`1+1`, `let x=…`) stay silent.
@@ -104,7 +104,7 @@ impl Evaluator {
                 span,
             } => {
                 let rhs = self.eval_expr(value, Position::Value)?;
-                // `env.NAME = v` — session environment write (defect #11, §4.6).
+                // `env.NAME = v` — session environment write (defect #11, site/content/internals/language-conformance-contract.md).
                 if let Expr::Field { recv, name, .. } = target
                     && matches!(&**recv, Expr::Var { name, .. } if name == "env")
                 {
@@ -246,7 +246,7 @@ impl Evaluator {
     /// Evaluate a block. `sink_tail` says whether the caller will DISCARD the
     /// block's value (loop bodies) versus CONSUME it (fn body, `if`/block used
     /// as a value, or a top-level statement whose value `eval_program` itself
-    /// sinks). The double-echo fix (P1): the trailing bare-command statement is
+    /// sinks). To prevent double echo, the trailing bare-command statement is
     /// the block VALUE and must NOT also be sunk here — only when the caller
     /// discards it (`sink_tail`) does its output route to the sink; otherwise
     /// the caller renders/sinks it exactly once. Non-final bare commands always

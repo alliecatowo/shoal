@@ -50,11 +50,12 @@ landed or under suspicion):
 ## What counts as a finding
 
 - A command that silently does the wrong thing, or the right thing with a confusing render.
-- An error message that doesn't say what's wrong or how to fix it (compare against the "curated
-  diagnostic" bar this project holds itself to — check `docs/TDD.md`/`docs/IO.md` for the tone).
+- An error message that doesn't say what's wrong or how to fix it (compare against the diagnostic
+  contract in `site/content/internals/language-conformance-contract.md` and the examples in
+  `site/content/docs/troubleshooting.md`).
   A generic "unexpected token" where a curated hint should exist is a finding.
   Also flag the reverse: a curated diagnostic firing in a case where the message is a false lead.
-- A doc (`docs/*.md`, `README.md`, the wiki, the plugin skill card) claiming something works, is
+- A canonical page under `site/content/`, `README.md`, or the plugin skill card claiming something works, is
   "not implemented," or "in progress" that the actual binary contradicts either way. Quote the exact
   command and output.
 - Rough ergonomics: too many keystrokes for a common task, an inconsistent method name, a missing

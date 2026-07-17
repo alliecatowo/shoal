@@ -1,4 +1,4 @@
-# Data & system namespaces (TDD §5 "Namespaces", ROADMAP Wave R2 mini-spec):
+# Data & system namespaces (site/content/internals/language-conformance-contract.md "Namespaces", site/content/internals/roadmap-and-priorities.md mini-spec):
 # json/yaml/toml/csv/math as first-class values in the root env, intercepted
 # by shoal-eval's `namespaces.rs` before ordinary var/field/method dispatch.
 # Deterministic-only: `http`/`os` need the network or the host's real
@@ -160,7 +160,7 @@ value = '"x"'
 
 [[case]]
 name = "ns-toml-stringify-non-table-top-level-is-arg-error"
-# TDD/ROADMAP R2: toml needs a record/table at the top level; a bare list has
+# site/content/internals/language-conformance-contract.md, site/content/internals/roadmap-and-priorities.md: toml needs a record/table at the top level; a bare list has
 # no key to hang off of.
 src = "toml.stringify([1, 2])"
 error = "arg_error"
@@ -405,7 +405,7 @@ name = "ns-math-unknown-method-is-field-missing"
 src = "math.frobnicate(1)"
 error = "field_missing"
 
-# --- config namespace (TDD §5) -------------------------------------------------
+# --- config namespace (site/content/internals/language-conformance-contract.md) -------------------------------------------------
 # The `config` namespace reads a host-INJECTED resolved-config snapshot, never a
 # `shoal.toml` walked off the filesystem. A bare evaluator (this harness, and any
 # kernel-less/`-c` path before the host injects one) has an EMPTY snapshot, so

@@ -1,7 +1,7 @@
 //! Wires shoal-leash's OS enforcement machinery into the actual spawn path
 //! via [`crate::ExecSpec::sandbox`].
 //!
-//! Strongest-available tier, honest degrade (TDD §8): when the requested
+//! Strongest-available tier, honest degrade (site/content/internals/language-conformance-contract.md): when the requested
 //! [`shoal_leash::SandboxPolicy`] cannot be fully enforced on this host, the
 //! child still runs (so a shell without Landlock doesn't just stop working)
 //! *unless* `policy.hermetic` was set, in which case we refuse to spawn
@@ -89,7 +89,7 @@ pub(crate) fn apply(spec: &mut ExecSpec) -> io::Result<Option<EnforcementStatus>
 }
 
 /// Verify the on-disk binary's content hash matches `pin` before exec
-/// (TDD §8 spawn-hash pin). TOCTOU remains between this check and exec —
+/// (site/content/internals/language-conformance-contract.md spawn-hash pin). TOCTOU remains between this check and exec —
 /// the same caveat [`shoal_leash::preflight_spawn`] documents — but a
 /// mismatch here is a certain, verifiable reason to refuse.
 fn verify_pin(program: &Path, pin: &str) -> io::Result<()> {

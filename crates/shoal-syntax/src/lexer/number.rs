@@ -86,7 +86,7 @@ impl<'s> Lexer<'s> {
         }
         let unit = &self.src[unit_start..upos];
         if !unit.is_empty() {
-            // Units are lowercase (§2.2). Reject non-canonical case rather than
+            // Units are lowercase (site/content/internals/language-conformance-contract.md). Reject non-canonical case rather than
             // silently folding `KB`→`kb` (decimal footgun) (D12).
             if unit.bytes().any(|b| b.is_ascii_uppercase()) {
                 return Err(LexError::new(

@@ -1,6 +1,6 @@
 ---
 name: crate-auditor
-description: Audits one shoal crate against its owning spec doc(s) and the pinned contract in docs/CONTRACTS.md — finds drift between what a doc claims and what the code actually does, dead/stale status lines, undocumented public API, and contract violations. Use when asked to "audit X crate," before a docs refresh, or periodically to catch spec/reality drift before it compounds. Read-only: reports findings, does not fix code or edit docs itself unless explicitly asked.
+description: Audits one shoal crate against its stable atlas pages, current public API, dependency edges, and tests. Finds status drift, undocumented API, contract violations, and quality debt. Read-only unless explicitly asked to apply fixes.
 model: sonnet
 tools: Read, Grep, Glob, Bash
 ---
@@ -10,14 +10,15 @@ edit anything unless explicitly asked to; your default output is a report.
 
 ## Setup
 
-1. Identify which crate you're auditing and find every doc that governs it:
-   - `docs/CONTRACTS.md` — the pinned Rust-level API for `shoal-exec`, `shoal-journal`,
-     `shoal-value`, `shoal-adapters`, plus the crate dependency DAG (does your crate's actual
-     `Cargo.toml` `[dependencies]` list match the tier/edges CONTRACTS.md claims?).
-   - `docs/TDD.md` — the semantic contract, if your crate implements language-visible behavior.
-   - The crate-specific companion doc if one exists: `docs/REEF.md` (`shoal-reef`), `docs/IO.md` +
-     `docs/STREAMS.md` (interpreter blocks / `.feed` / streams, mostly `shoal-eval`),
-     `docs/AGENT-SURFACE.md` (`shoal-kernel`, `shoal-mcp`, `shoal-proto`).
+1. Identify which crate you're auditing and find every stable source that governs it:
+   - `site/content/internals/crate-ledger.md` and
+     `site/content/internals/intercrate-protocol-contracts.md` for public APIs and dependency edges.
+   - `site/content/internals/language-conformance-contract.md` when the crate implements visible
+     language behavior.
+   - The focused subsystem page: `reef-resolution.md`, `values-streams-execution.md`,
+     `streams-channels.md`, `kernel-protocol.md`, `agent-mcp.md`, `process-execution.md`, or another
+     page under `site/content/internals/`.
+   - `site/content/internals/implementation-status.md` for current maturity claims.
    - Any doc-comment `//!` header in the crate's own `src/lib.rs` claiming a status.
 2. Read the crate's actual source: every `pub` item in its public API surface, its `Cargo.toml`
    (real dependency edges — reproduce the DAG check with
@@ -26,16 +27,15 @@ edit anything unless explicitly asked to; your default output is a report.
 
 ## What to check, concretely
 
-- **Status-line drift.** Design docs carry a `Status:` line near the top (e.g. "substantially
-  implemented", "crate built+tested; eval integration landing this wave"). For each claim, verify
+- **Status drift.** For each maturity claim in the implementation ledger or focused page, verify
   it against source and, where cheap, the live binary
   (`CARGO_TARGET_DIR=target-audit cargo build --bin shoal` then a targeted `-c '…'` repro). A doc
   saying "not yet implemented"/"pending"/"landing this wave" for something that's actually shipped
   is exactly as much a bug as the reverse (claiming something works that doesn't) — this repo moves
   fast enough that both directions of drift happen constantly.
-- **Contract fidelity.** For a crate with a pinned API in `docs/CONTRACTS.md` (currently
+- **Contract fidelity.** For a crate with a pinned API in the intercrate contract (including
   `shoal-exec`, `shoal-journal`, `shoal-value`, `shoal-adapters`, the eval↔methods bridge), diff the
-  pinned signatures against the real ones. A silent signature change that didn't update CONTRACTS.md
+  pinned signatures against the real ones. A silent signature change that didn't update the contract
   is a process violation even if the code itself is correct — other in-flight work may be building
   against the stale pinned signature.
 - **DAG accuracy.** Does the crate's real `[dependencies]` list match its tier and edges as
@@ -45,7 +45,7 @@ edit anything unless explicitly asked to; your default output is a report.
   lints already warn on these — `grep -rn 'todo!\|unimplemented!\|dbg!' crates/<crate>/src`), and
   anything gated by a comment implying it's temporary that's been there a long time (`git log -1
   --format=%ai -- <file>` for a rough age check).
-- **Ownership boundary respect.** Per CONTRACTS.md's ownership map, is anything in this crate that
+- **Ownership boundary respect.** Per the crate ledger and intercrate contract, is anything in this crate that
   should live elsewhere (e.g. business logic that belongs in `shoal-eval` leaking into a
   supposedly-pure leaf crate like `shoal-value`)?
 - **Test-claim honesty.** If a doc says "N cases" or "unit-tested," run the actual test suite and

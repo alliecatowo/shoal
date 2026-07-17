@@ -1,7 +1,7 @@
-//! `dispatch`'s `exec` handler (TDD §10, AGENT-SURFACE §5/§8): plan/run/
+//! `dispatch`'s `exec` handler (site/content/internals/language-conformance-contract.md, site/content/internals/kernel-protocol.md): plan/run/
 //! approved modes, background tasks, and the synchronous-timeout-becomes-a-
-//! task path. Split out of `lib.rs`'s dispatch match (docs/ROADMAP.md wave
-//! R4): pure mechanical move, zero wire/behavior change.
+//! task path. Split out of `lib.rs`'s dispatch match (site/content/internals/roadmap-and-priorities.md wave
+//! `site/content/internals/change-map.md`; pure mechanical move, zero wire/behavior change.
 use super::*;
 
 impl Kernel {
@@ -15,7 +15,7 @@ impl Kernel {
         let session = &attachment.session;
         let actor = attachment.principal.clone();
         let params: ExecParams = decode(params)?;
-        // AGENT-SURFACE §5: `background:true`, or a synchronous run that
+        // site/content/internals/kernel-protocol.md: `background:true`, or a synchronous run that
         // exceeds `timeout_ms`, becomes a task ref + events channel —
         // never a blocked context. A bare timeout runs the work on a
         // task and waits up to the deadline for a fast inline answer.
@@ -28,7 +28,7 @@ impl Kernel {
                 evaluator.reset_cancel();
                 evaluator.cancellation_token()
             };
-            // AGENT-SURFACE §4/§5: the events channel is `task.{bare id}`
+            // site/content/internals/kernel-protocol.md: the events channel is `task.{bare id}`
             // (e.g. `task.7`), NOT `task.{full ref}` (`task.task:7`) — keep
             // the bare numeric id around so the channel name is built from
             // it directly instead of re-deriving it from `task_ref.0` (which
@@ -100,7 +100,7 @@ impl Kernel {
                         // background/timed run (`position:"value"`, the MCP
                         // facade's default) captures a failing or
                         // signal-killed outcome as a normal RETURNED value
-                        // instead of raising it as an RpcError (§4.5: "a
+                        // instead of raising it as an RpcError (site/content/internals/kernel-protocol.md: "a
                         // failed outcome is captured, not raised") — so
                         // `response.error` alone cannot tell a naturally
                         // completed task from one that was killed via
@@ -220,7 +220,7 @@ impl Kernel {
                 },
             );
             if verdict == Verdict::ApprovalRequired {
-                // AGENT-SURFACE §4: a plan stuck at `approval_pending` is
+                // site/content/internals/kernel-protocol.md: a plan stuck at `approval_pending` is
                 // exactly the moment another principal (a human's session, a
                 // supervising agent) needs to learn about it without
                 // polling — announce it on `approval` the same way a new
@@ -269,7 +269,7 @@ impl Kernel {
         })?;
         let ast_json = serde_json::to_string(&ast).map_err(internal)?;
         let mut evaluator = session.evaluator.lock().unwrap();
-        // TDD §8 leash activation: bind the session's evaluator to this
+        // site/content/internals/language-conformance-contract.md leash activation: bind the session's evaluator to this
         // principal's policy so any external spawn resolves and applies
         // an OS sandbox for `actor`. The default-permissive policy
         // resolves to no confinement, so the human path is unchanged.
@@ -305,7 +305,7 @@ impl Kernel {
             .append(&EntryRecord {
                 session: session.id.clone(),
                 // Cloned, not moved: both the error and success paths below
-                // publish a `journal` event (AGENT-SURFACE §4) carrying this
+                // publish a `journal` event (site/content/internals/kernel-protocol.md) carrying this
                 // same principal, well after this record is built.
                 principal: actor.clone(),
                 ts_ns: now_ns(),
@@ -317,7 +317,7 @@ impl Kernel {
             })
             .map_err(internal)?;
         // Hand the evaluator this call's source so each journaled top-level
-        // statement can slice its own `src` (TDD §9) — mirrors the REPL's fix
+        // statement can slice its own `src` (site/content/internals/language-conformance-contract.md) — mirrors the REPL's fix
         // at `crates/shoal/src/repl.rs` (`evaluator.set_source(run_src...)`
         // right before `eval_program`): without this, `stmt_source` has
         // nothing to slice from, so the evaluator's own per-statement journal
@@ -343,7 +343,7 @@ impl Kernel {
                     entry_id,
                     journal_event(entry_id, &params.src, false, &actor),
                 );
-                // AGENT-SURFACE §0/§5: even a raised error is
+                // site/content/internals/kernel-protocol.md: even a raised error is
                 // addressable — store it as an out[n] transcript value
                 // so the agent can `shoal_get` the structured error
                 // (code/msg/span/hint) instead of parsing message text.
@@ -383,7 +383,7 @@ impl Kernel {
         let render = shoal_value::render::render_block(&value, 80);
         // Built once, up front: this SAME payload is both persisted durably
         // (so the `session.transcript` channel can replay it after it ages
-        // out of the ring — the G2 follow-up, AGENT-SURFACE §4) and carried
+        // out of the ring (see `site/content/internals/kernel-protocol.md`) and carried
         // by the live event below. Reconstruction re-wraps the durable copy
         // verbatim rather than re-deriving it from other journal columns.
         let transcript_payload = transcript_event(&value_ref, &value);
@@ -425,7 +425,7 @@ impl Kernel {
         }
         self.events
             .publish_journal(entry_id, journal_event(entry_id, &params.src, true, &actor));
-        // AGENT-SURFACE §4: announce the new transcript value on the
+        // site/content/internals/kernel-protocol.md: announce the new transcript value on the
         // `session.transcript` channel — subscribers learn a new
         // out[n] exists (with its shape summary) without polling. Uses
         // `publish_transcript` (not the plain `publish`) so the seq↔entry_id
@@ -435,10 +435,10 @@ impl Kernel {
         let exec_uri = short_ref_to_uri(&value_ref, None);
         // The journal keeps the full render above (record_output); the wire
         // response bounds it to the same hard cap as MCP's content[0].text
-        // (AGENT-SURFACE §3) — a huge render must never bypass the wall the
+        // (site/content/internals/kernel-protocol.md) — a huge render must never bypass the wall the
         // structured value already respects.
         let bounded_render = bound_render(render, &exec_uri, !attachment.tty);
-        // AGENT-SURFACE §4: a live UI subscribing to `render` sees the same
+        // site/content/internals/kernel-protocol.md: a live UI subscribing to `render` sees the same
         // string the exec response itself carries — no separate unbounded
         // copy, no polling `value.get {format:"render"}`.
         self.events

@@ -1,12 +1,12 @@
-//! Providers — acquisition as adapters (REEF.md §3).
+//! Providers — acquisition as adapters (site/content/internals/reef-resolution.md).
 //!
 //! A provider *enumerates* candidates for a tool (fast, cached, never probing at
 //! enumerate time) and optionally *fetches* (installs) one. Only `fetch` may
 //! touch the network, and only the mise provider implements it in v1.
 //!
-//! The trait deviates from REEF's sketch in one deliberate way: `discover` and
+//! The trait deviates from site/content/internals/reef-resolution.md's sketch in one deliberate way: `discover` and
 //! `fetch` take a [`ProviderCtx`] carrying the cwd, because `npm-local` and
-//! `venv` — both listed in REEF §3 — are inherently cwd-relative. Version
+//! `venv` — both listed in site/content/internals/reef-resolution.md — are inherently cwd-relative. Version
 //! probing is factored into [`Provider::version_of`] so the resolver can probe
 //! lazily, only when a constraint actually needs a concrete version.
 
@@ -120,7 +120,7 @@ pub trait Provider: Send + Sync {
     }
 }
 
-/// The `--version` probe timeout (REEF.md §3).
+/// The `--version` probe timeout (site/content/internals/reef-resolution.md).
 pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 
 /// Run `<path> --version` with a hard timeout and parse a version leniently from

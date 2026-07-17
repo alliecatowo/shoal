@@ -1,5 +1,5 @@
 //! Leash plan derivation: a conservative, concrete-effect walk over the AST
-//! that never spawns or mutates (docs/CONTRACTS.md leash integration).
+//! that never spawns or mutates (site/content/internals/intercrate-protocol-contracts.md leash integration).
 //!
 //! Split across three files (the multi-file `impl Evaluator { .. }` pattern):
 //! this file holds the user-facing `plan`/`apply`/`explain` builtins and the
@@ -10,7 +10,7 @@
 use super::*;
 
 impl Evaluator {
-    /// `plan { … }` / `plan <cmd …>` (ROADMAP R3): derive and render the effect
+    /// `plan { … }` / `plan <cmd …>` (site/content/internals/roadmap-and-priorities.md): derive and render the effect
     /// plan without spawning or mutating. The derived program is stashed so a
     /// later `apply <ref>` can run it; the returned record carries its `id`.
     pub(crate) fn builtin_plan(&mut self, call: &CmdCall) -> VResult<Value> {
@@ -21,7 +21,7 @@ impl Evaluator {
         Ok(plan_record(&plan, Some(id)))
     }
 
-    /// `apply <ref>` (ROADMAP R3): run a previously-derived `plan { … }`. The ref
+    /// `apply <ref>` (site/content/internals/roadmap-and-priorities.md): run a previously-derived `plan { … }`. The ref
     /// is the record `plan` returned (its `id` field) or a bare plan id int.
     pub(crate) fn builtin_apply(&mut self, call: &CmdCall) -> VResult<Value> {
         let vs = self.collect_cmd_values(call)?;
@@ -51,7 +51,7 @@ impl Evaluator {
         self.eval_program(&program)
     }
 
-    /// `explain(src)` (ROADMAP R2/R3): parse a source string and render what it
+    /// `explain(src)` (site/content/internals/roadmap-and-priorities.md): parse a source string and render what it
     /// would do — its effect plan — without running it.
     pub(crate) fn builtin_explain(&mut self, call: &CmdCall) -> VResult<Value> {
         let vs = self.collect_cmd_values(call)?;

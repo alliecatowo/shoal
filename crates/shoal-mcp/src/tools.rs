@@ -1,5 +1,5 @@
 //! `tools/*` handlers: the `shoal_*` tool schemas, the MCP→kernel method
-//! mapping, and the bounded `tools/call` result shape (AGENT-SURFACE §1/§3).
+//! mapping, and the bounded `tools/call` result shape (site/content/internals/kernel-protocol.md).
 
 use crate::{BridgeError, Facade, short_ref_to_uri};
 use serde_json::{Value, json};
@@ -26,7 +26,7 @@ impl Facade {
 fn map_tool(name: &str, args: Value) -> Result<(&'static str, Value), String> {
     let object = args.as_object().ok_or("tool arguments must be an object")?;
     Ok(match name {
-        // AGENT-SURFACE §5 exec signature: mode/position/background/timeout_ms/
+        // site/content/internals/kernel-protocol.md exec signature: mode/position/background/timeout_ms/
         // elide are all forwarded (no more silently-dropped params).
         "shoal_exec" => (
             "exec",
@@ -48,7 +48,7 @@ fn map_tool(name: &str, args: Value) -> Result<(&'static str, Value), String> {
             json!({"plan_ref":required_str(object,"plan_ref")?}),
         ),
         // Forward the per-call elide budget so a caller can tighten/loosen it
-        // (AGENT-SURFACE §3) — previously accepted but dropped.
+        // (site/content/internals/kernel-protocol.md) — previously accepted but dropped.
         "shoal_get" => (
             "value.get",
             json!({
@@ -60,17 +60,17 @@ fn map_tool(name: &str, args: Value) -> Result<(&'static str, Value), String> {
         ),
         // `until`/`effects`/`ok` are honored kernel-side; forward verbatim.
         "shoal_journal" => ("journal.query", args),
-        // Task cancellation (AGENT-SURFACE §5).
+        // Task cancellation (site/content/internals/kernel-protocol.md).
         "shoal_cancel" => ("task.cancel", json!({"task": required_str(object,"task")?})),
-        // Escalation path for a plan stuck at `approval_pending` (TDD §7's
+        // Escalation path for a plan stuck at `approval_pending` (site/content/internals/language-conformance-contract.md
         // `cap.request`): without this an agent that hits a stricter-than-
         // default leash policy has no MCP-reachable way to move forward.
-        // `effects` scopes the grant (AGENT-SURFACE §5).
+        // `effects` scopes the grant (site/content/internals/kernel-protocol.md).
         "shoal_cap_request" => (
             "cap.request",
             json!({"plan_ref":required_str(object,"plan_ref")?,"effects":object.get("effects").cloned().unwrap_or_else(||json!([]))}),
         ),
-        // Interactive-PTY surface (AGENT-SURFACE §10): drive a real TUI/REPL
+        // Interactive-PTY surface (site/content/internals/kernel-protocol.md): drive a real TUI/REPL
         // over the wire and read back a rendered screen.
         "shoal_pty_open" => (
             "pty.open",
@@ -116,13 +116,13 @@ fn required_str<'a>(o: &'a serde_json::Map<String, Value>, name: &str) -> Result
         .and_then(Value::as_str)
         .ok_or_else(|| format!("missing string argument {name:?}"))
 }
-/// Absolute per-result cap for text/render sent to the agent (AGENT-SURFACE
-/// §3). A misbehaving agent cannot flood its own context: no render or text
+/// Absolute per-result cap for text/render sent to the agent (see
+/// `site/content/internals/kernel-protocol.md`). A misbehaving agent cannot flood its own context: no render or text
 /// content ever exceeds this, regardless of the value's size.
 const RESULT_TEXT_HARD_CAP: usize = 64 * 1024;
 
 /// Build a `tools/call` result whose context footprint is bounded
-/// (AGENT-SURFACE §1/§3): `structuredContent` carries the kernel's already-
+/// (site/content/internals/kernel-protocol.md): `structuredContent` carries the kernel's already-
 /// elided value; the human-readable `text` content is the render **head**,
 /// truncated with a `…(N more lines, fetch via ref)` marker; and a
 /// `resource_link` points at the value's ref so the agent can drill in for
@@ -148,7 +148,7 @@ fn tool_result(value: Value, is_error: bool) -> Value {
         });
     // Prefer the kernel's human render; fall back to compact JSON. Either way
     // it is bounded — the render string is NOT trusted to be small (a 150-row
-    // table renders to many KiB), which is exactly the elision bypass §3 closes.
+    // table renders to many KiB), which is exactly the elision bypass site/content/internals/kernel-protocol.md closes.
     let text = match value.get("render").and_then(Value::as_str) {
         Some(render) => bound_text(render, uri.as_deref()),
         None => bound_text(
@@ -356,7 +356,7 @@ mod tests {
         assert_eq!(params["effects"], json!([]));
     }
 
-    /// The elision doctrine (§3) at the MCP boundary: a huge render/text is
+    /// The elision doctrine (site/content/internals/kernel-protocol.md) at the MCP boundary: a huge render/text is
     /// never emitted whole — it is truncated to a head with a fetch marker and
     /// stays under the 64 KiB hard cap, so the render string can't bypass the
     /// wall the structured value already respects.

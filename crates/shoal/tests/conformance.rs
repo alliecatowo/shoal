@@ -1,13 +1,13 @@
 //! Conformance corpus harness (WP4).
 //!
-//! Walks `spec/cases/*.toml` (schema pinned in `docs/CONTRACTS.md` §5) and,
+//! Walks `spec/cases/*.toml` (schema pinned in `site/content/internals/intercrate-protocol-contracts.md`) and,
 //! for each case, builds a fresh `shoal_eval::Evaluator` rooted at a fresh
 //! temp-dir cwd containing the case's `fixture` entries, parses `src` with
 //! the script-mode parser (`shoal_syntax::parse`), evaluates it, and renders
 //! the final value with `shoal_value::render::render_inline`.
 //!
-//! The corpus is normative (docs/TDD.md §12: "the corpus decides disputes").
-//! Cases encode the CORRECT behavior per docs/TDD.md + docs/CONTRACTS.md,
+//! The corpus is normative (site/content/internals/language-conformance-contract.md: "the corpus decides disputes").
+//! Cases encode the CORRECT behavior per site/content/internals/language-conformance-contract.md + site/content/internals/intercrate-protocol-contracts.md,
 //! not necessarily what the current implementation does — this harness is
 //! expected to have failures while shoal-syntax/shoal-eval are still being
 //! built out in parallel. See spec/README.md for the authoring guide.
@@ -100,7 +100,7 @@ fn load_cases(dir: &Path) -> Vec<Case> {
     out
 }
 
-/// Materialize `fixture` entries under `root`, per CONTRACTS §5. A trailing
+/// Materialize `fixture` entries under `root`, per site/content/internals/intercrate-protocol-contracts.md. A trailing
 /// slash (`"d/"`) makes a directory; anything else is an empty file. Parent
 /// dirs are auto-created. This mirrors the shoal-eval conformance harness so
 /// both runners interpret the same corpus identically.
@@ -192,7 +192,7 @@ fn run_case(case: &Case) -> Result<(), String> {
                 err.code, err.msg
             )),
             Some(_) => match &case.error_contains {
-                // Checked against message-or-hint: teaching diagnostics (TDD §1.4/§13)
+                // Checked against message-or-hint: teaching diagnostics (site/content/internals/language-conformance-contract.md)
                 // often carry the human-readable clarification in `hint`.
                 Some(sub)
                     if !err.msg.contains(sub.as_str())
@@ -222,7 +222,7 @@ fn conformance_corpus() {
         spec_dir.display()
     );
 
-    // Names must be globally unique across every file (CONTRACTS §5 / spec/README.md).
+    // Names must be globally unique across every file (site/content/internals/intercrate-protocol-contracts.md / spec/README.md).
     let mut seen: HashMap<String, String> = HashMap::new();
     let mut dupes = Vec::new();
     for c in &cases {

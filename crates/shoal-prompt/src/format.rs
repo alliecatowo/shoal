@@ -1,15 +1,15 @@
-//! The format-string mini-language (§3.4).
+//! The format-string mini-language (site/content/internals/prompt-editor-lsp.md).
 //!
 //! Each `format.*` string is parsed once at config-load time into a
 //! `Vec<FormatToken>` and cached for the process lifetime — reparsing on every
-//! render would itself violate the §1 budget. Syntax is deliberately
+//! render would itself violate the site/content/internals/prompt-editor-lsp.md budget. Syntax is deliberately
 //! Starship-compatible: `$module`, `[text](style)`, literal passthrough.
 
 /// One node of a parsed format string.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FormatToken {
     /// Literal text. `ws_only` marks a run that is entirely whitespace, so the
-    /// whitespace-collapse rule (§3.4) can drop it next to an empty module.
+    /// whitespace-collapse rule (site/content/internals/prompt-editor-lsp.md) can drop it next to an empty module.
     Literal { text: String, ws_only: bool },
     /// `$ident` — a module placeholder.
     Placeholder(String),
@@ -133,7 +133,7 @@ fn read_ident(chars: &[char], start: usize) -> String {
 }
 
 /// Every `$placeholder` id referenced anywhere in `tokens` (recursing into
-/// groups) — used at load time to warn about unknown module ids (§11).
+/// groups) — used at load time to warn about unknown module ids (site/content/internals/prompt-editor-lsp.md).
 pub fn referenced_ids(tokens: &[FormatToken]) -> Vec<String> {
     let mut ids = Vec::new();
     collect_ids(tokens, &mut ids);

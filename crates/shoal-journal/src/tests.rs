@@ -882,7 +882,7 @@ fn undo_rejects_traversal_and_symlink_parent() {
 
 #[test]
 fn undo_restores_scoped_target_when_root_is_passed_as_a_raw_symlink_alias() {
-    // Regression test for the R5 carryover: `undo` must not refuse a
+    // Regression test: `undo` must not refuse a
     // legitimate target just because the caller's `root` argument still
     // carries a raw OS-level symlink alias in its leading prefix (e.g.
     // macOS's `/tmp` -> `/private/tmp`, `/var` -> `/private/var`) while
@@ -1100,7 +1100,7 @@ fn blob_access_refreshes_lru_timestamp() {
 
 #[test]
 fn read_blob_rejects_corrupted_content() {
-    // FIX 3: reads are integrity-verified. Store a genuine blob, then overwrite
+    // Reads are integrity-verified. Store a genuine blob, then overwrite
     // its on-disk .zst with a *valid* zstd stream of DIFFERENT bytes (a swap /
     // bit-rot that still decompresses cleanly). read_blob must refuse it rather
     // than hand back the wrong content to `undo`/`blob.get`.
@@ -1125,7 +1125,7 @@ fn read_blob_rejects_corrupted_content() {
 
 #[test]
 fn busy_timeout_zero_fails_fast_on_contended_write() {
-    // FIX 3 baseline / FIX 1 rationale: with busy_timeout = 0 (rusqlite's
+    // Baseline: with busy_timeout = 0 (rusqlite's
     // default), a write that meets a held writer lock fails immediately with
     // SQLITE_BUSY — which the journaling call sites swallow, silently dropping
     // the entry. This proves the failure mode the default timeout guards.
@@ -1153,7 +1153,7 @@ fn busy_timeout_zero_fails_fast_on_contended_write() {
 
 #[test]
 fn busy_timeout_lets_a_blocked_writer_wait_instead_of_dropping() {
-    // FIX 1: a non-zero busy_timeout makes a contended writer WAIT for the lock
+    // A non-zero busy_timeout makes a contended writer WAIT for the lock
     // rather than drop its entry. A held lock is released after a short delay;
     // the write must then land (with timeout = 0 it would have errored, per the
     // test above).

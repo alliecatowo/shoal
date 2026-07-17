@@ -1,4 +1,4 @@
-//! Semantic effects and plans (TDD §8): the concrete, evaluatable actions a
+//! Semantic effects and plans (site/content/internals/language-conformance-contract.md): the concrete, evaluatable actions a
 //! principal's spawn can take, bundled into a [`Plan`] with a stable
 //! content-addressed reference.
 

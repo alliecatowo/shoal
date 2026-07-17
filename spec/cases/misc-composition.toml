@@ -2,7 +2,7 @@
 # elsewhere: `.str()` on a plain `int` (UPDATED: `strops::to_str` gained
 # int/float/bool arms that yield the canonical render form — the old
 # "cannot convert int to str" type_error was a field-tested paper cut, and
-# TDD §5 / CONTRACTS §3 pin `.str` in the method set without restricting
+# site/content/internals/language-conformance-contract.md / site/content/internals/intercrate-protocol-contracts.md pin `.str` in the method set without restricting
 # the receiver; datetime/list/… receivers still error, per
 # dt2-str-method-is-type-error and methc-str-on-a-mixed-list-is-a-type-error),
 # a record's `.values()` feeding `.flatten()`, and a `.sort_by` result

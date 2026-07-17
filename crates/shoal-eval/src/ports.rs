@@ -1,4 +1,5 @@
-//! Evaluator-side port adapters (docs/ROADMAP.md R4, scratch/audit-arch.md §2c).
+//! Evaluator-side port adapters. See `site/content/internals/effects-plans-security.md`
+//! and `site/content/internals/intercrate-protocol-contracts.md`.
 //!
 //! The port *traits* live in `shoal-value` so the domain core depends only on
 //! them. The two adapters here need workspace crates `shoal-value` cannot see

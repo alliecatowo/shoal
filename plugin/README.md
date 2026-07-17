@@ -1,160 +1,170 @@
 # shoal — Claude Code plugin
 
-Gives a Claude Code agent two things:
+This plugin gives Claude Code a structured way to share a live shoal session. It installs the
+`shoal` language skill and registers `shoal mcp`, which bridges MCP over stdio to a long-lived
+`shoal-kernel` session. Results stay typed, large payloads become drillable references, and live
+changes arrive through subscriptions instead of text scraping or polling.
 
-1. **The shoal MCP tools** — the surface exposed by `shoal-mcp`, which bridges MCP to a running
-   `shoal-kernel` over its JSON-RPC/Unix-socket wire protocol. At minimum: `shoal_exec`, `shoal_plan`,
-   `shoal_apply`, `shoal_get`, `shoal_journal`, `shoal_cap_request`, plus `shoal_cancel` and an MCP
-   `resources/*` layer once they land (see `skills/shoal/SKILL.md` §0 for exactly what's confirmed vs.
-   intended as of any given build — the tool count on this surface is moving).
-2. **A skill** (`skills/shoal/SKILL.md`) — a complete, corpus-grounded language card so the agent
-   never guesses at shoal's syntax, coercion rules, or MCP protocol quirks. It documents what is real
-   today, what is only *intended* pending an in-flight change to `shoal-mcp`/`shoal-kernel`, and what
-   is spec'd but not implemented at all — each called out explicitly.
+The implementation is exercised alongside shoal's 1,310-case, 77-suite conformance corpus on
+Linux and macOS. Shoal is still pre-release; read the [current status][status] before relying on it
+as a login shell.
 
-**Both macOS and Linux are first-class here.** The only asymmetry below is the `XDG_RUNTIME_DIR`
-convention, which is a Linux/systemd default that macOS doesn't share — see "macOS socket path" below
-for the current fix and its fallback.
+## What ships
 
-## Prerequisites
+The MCP server exposes 13 tools:
 
-shoal is not one binary you point at — it's (at least) three cooperating pieces, and **all of them
-must be on `PATH`** (or referenced by absolute path, see below):
+| Tool | Purpose |
+|---|---|
+| `shoal_exec` | Evaluate shoal source, synchronously or as a task. |
+| `shoal_plan` | Derive effects and reversibility without spawning. |
+| `shoal_apply` | Apply a stored, approved plan. |
+| `shoal_get` | Read a field or slice from a transcript reference. |
+| `shoal_journal` | Query structured execution history. |
+| `shoal_cancel` | Cancel a background task. |
+| `shoal_cap_request` | Request approval for a plan's effects. |
+| `shoal_pty_open` | Start an interactive program on a real PTY. |
+| `shoal_pty_send` | Send text, bytes, or named keys to a PTY. |
+| `shoal_pty_read` | Read the bounded rendered terminal screen. |
+| `shoal_pty_resize` | Resize the terminal and emulator grid. |
+| `shoal_pty_close` | Terminate and reap a PTY session. |
+| `shoal_pty_list` | List this session's open PTYs. |
 
-1. **`shoal-kernel`** — the long-lived daemon that actually holds a session, the evaluator, and the
-   journal. **Must already be running before Claude Code starts** — nothing in this plugin starts it
-   for you.
-2. **`shoal-mcp`** — the stdio↔JSON-RPC bridge that speaks MCP on one side and shoal's wire protocol
-   on the other. This is what the plugin's MCP server config actually launches.
-3. **`shoal`** — the main binary; `shoal mcp` is a thin companion-launcher that execs `shoal-mcp` on
-   your behalf (inheriting stdio, so it works as a stdio MCP transport). You can point the plugin
-   directly at `shoal-mcp` instead if you prefer to skip the indirection.
+The server implements MCP `resources/list`, `resources/templates/list`, `resources/read`, and
+`resources/subscribe`; it acknowledges `resources/unsubscribe`, but that request does not yet stop
+the dedicated forwarding connection/thread. Subscription cleanup is currently scoped to MCP
+process exit. Shipped roots include `shoal://journal`,
+`shoal://jobs`, `shoal://session/cwd`, `shoal://session/env`, `shoal://session/reef`, and
+`shoal://pty`; open tasks, plans, and PTYs are listed dynamically. Templates cover transcript and
+content-addressed values, task output, plans, session views, PTY screens, journal queries, and event
+channels. Subscriptions are supported for `shoal://events/{channel}` and
+`shoal://task/{id}[/out]`, delivered as `notifications/resources/updated`.
 
-Install from this repository (either works; pick one per binary or just build everything):
-
-```sh
-cd /path/to/shoal
-cargo install --path crates/shoal          # installs `shoal` to ~/.cargo/bin
-cargo install --path crates/shoal-kernel    # installs `shoal-kernel`
-cargo install --path crates/shoal-mcp       # installs `shoal-mcp`
-# make sure ~/.cargo/bin is on PATH (it usually already is once you have a Rust toolchain)
-```
-
-or build in place and put `target/release` on `PATH` yourself:
-
-```sh
-cd /path/to/shoal
-cargo build --release
-# binaries land in target/release/{shoal,shoal-mcp,shoal-kernel,...}
-export PATH="/path/to/shoal/target/release:$PATH"
-```
-
-### Start the kernel
-
-```sh
-shoal-kernel &                     # default session "default", default socket location
-```
-
-By default `shoal-kernel` listens on `$XDG_RUNTIME_DIR/shoal/default.sock` if `XDG_RUNTIME_DIR` is
-set, or falls back to `/tmp/shoal-<uid>/shoal/default.sock` if it isn't.
-
-### macOS socket path
-
-`XDG_RUNTIME_DIR` is a Linux/systemd convention — **it is typically not set on macOS**. `shoal-mcp`
-now matches `shoal-kernel`'s own fallback exactly: `$XDG_RUNTIME_DIR/shoal/<session>.sock` when
-`XDG_RUNTIME_DIR` is set, else `$TMPDIR/shoal-<uid>/shoal/<session>.sock` (macOS exports `TMPDIR`),
-else `/tmp/shoal-<uid>/shoal/<session>.sock`. So the two binaries' socket resolution can no longer
-drift apart, on either OS. The robust, explicit-everywhere alternative is still to pin a socket path
-on both ends yourself:
-
-```sh
-mkdir -p ~/.local/state/shoal
-shoal-kernel --socket ~/.local/state/shoal/kernel.sock &
-export SHOAL_SOCKET=~/.local/state/shoal/kernel.sock   # must be set in the shell that launches `claude`
-```
-
-**Put `--socket` inside a directory you own.** The kernel secures a socket's parent directory
-(`chmod 0700`) when it created that directory or already owns it, but it will not — and cannot
-safely — touch permissions on a pre-existing directory owned by someone else (e.g. a bare shared
-`/tmp`, as in `--socket /tmp/x.sock`). Point `--socket` at a path under a directory only you control
-— `$XDG_RUNTIME_DIR/shoal/…`, `~/.local/state/shoal/…`, or `/tmp/shoal-<uid>/…` — and the kernel
-creates and locks it down for you. Get this wrong and the kernel now gives a descriptive error
-naming exactly this fix (`cannot secure socket dir …; use a socket path inside a directory you own,
-e.g. $XDG_RUNTIME_DIR/shoal/... or /tmp/shoal-<uid>/...`) rather than a confusing bind failure.
-
-**Keep `--socket` paths short, too.** Unix domain socket paths are capped at roughly **108 bytes**
-(`SUN_LEN`/`sun_path`; ~104 on macOS), and the limit applies to the whole absolute path. A socket
-buried in a deep project or temp directory fails to bind/connect with an unhelpful
-`Invalid argument`-style error. Prefer short, stable, self-owned locations like the examples here
-(`~/.local/state/shoal/…`, `/tmp/shoal-<uid>/…`) over anything nested inside a checkout.
-
-Claude Code's stdio MCP servers inherit the environment of the process that launched `claude` — so
-whichever shell starts your Claude Code session needs `SHOAL_SOCKET` (or `XDG_RUNTIME_DIR`) exported
-*before* `claude` starts, every time, on both macOS and Linux, unless you're fine relying on the
-`/tmp`/`TMPDIR` fallback above. Once a socket resolves consistently on both ends, behavior is
-identical on macOS and Linux — these are plain Rust binaries with no OS-specific code path in this
-plugin's usage.
+The bundled [`skills/shoal/SKILL.md`](skills/shoal/SKILL.md) is the operational language card. It
+records exact syntax and wire behavior, including the two execution positions, forced commands,
+aliases, undo, elision, resources, and PTY workflows.
 
 ## Install
 
-This repository doubles as its own plugin marketplace (`.claude-plugin/marketplace.json` at the repo
-root, listing this `plugin/` directory as the one plugin it carries):
+Install the three binaries from this checkout:
 
+```sh
+cargo install --path crates/shoal
+cargo install --path crates/shoal-kernel
+cargo install --path crates/shoal-mcp
 ```
+
+`~/.cargo/bin` must be on the `PATH` inherited by Claude Code. The plugin configuration launches
+`shoal mcp`; that companion command execs `shoal-mcp`, which connects to the kernel.
+
+Add this repository as a Claude Code marketplace and install the plugin:
+
+```text
 /plugin marketplace add /path/to/shoal
 /plugin install shoal
 ```
 
-or, once this repo is pushed and you'd rather not clone it separately first:
+After the repository is published, the marketplace source can instead be
+`alliecatowo/shoal`.
 
+### Kernel startup
+
+Kernel startup is automatic by default. On the first MCP connection, `shoal-mcp` probes the target
+socket and, if nothing is listening, starts a detached `shoal-kernel --socket <path>`. Concurrent
+startup attempts are safe: the kernel refuses to replace a live listener, and each bridge connects
+to the winner.
+
+Set a non-empty `SHOAL_NO_AUTOSTART` when the kernel is supervised externally:
+
+```sh
+export SHOAL_NO_AUTOSTART=1
+shoal-kernel &
 ```
-/plugin marketplace add alliecatowo/shoal
-/plugin install shoal
+
+Autostart is best-effort. If `shoal-kernel` is missing from `PATH` or never becomes ready, the MCP
+bridge reports the underlying connection error after a bounded wait.
+
+### Socket selection
+
+Both the bridge and kernel use the same default:
+
+1. `$XDG_RUNTIME_DIR/shoal/<session>.sock` when `XDG_RUNTIME_DIR` is set;
+2. `$TMPDIR/shoal-<uid>/shoal/<session>.sock` when `TMPDIR` is set;
+3. `/tmp/shoal-<uid>/shoal/<session>.sock` otherwise.
+
+To select a socket explicitly, set `SHOAL_SOCKET` in the environment that launches Claude Code and
+start a supervised kernel at the same path:
+
+```sh
+mkdir -p ~/.local/state/shoal
+shoal-kernel --socket ~/.local/state/shoal/kernel.sock &
+export SHOAL_SOCKET="$HOME/.local/state/shoal/kernel.sock"
+export SHOAL_NO_AUTOSTART=1
 ```
 
-Either way, once enabled you should see:
+Use a short path inside a directory you own. Unix-domain socket paths have a small platform limit,
+and the kernel intentionally refuses insecure parent directories.
 
-- New tools in your tool list, named `shoal_*` (see `skills/shoal/SKILL.md` §0 for the current exact
-  set — it is expanding).
-- The `shoal` skill available, and auto-triggered when you ask the agent to do something in/with
-  shoal.
+## Verify the connection
 
-## Verifying it's wired up
-
-Ask the agent to run `shoal_exec` with `{"src": "1 + 2", "position": "value"}`. You should get back
-`{"ref": "out:1", "value": {"$":"int","v":3}, "render": "3"}`. If instead you get a connection-refused
-style error, the kernel isn't running or the socket path doesn't match — re-check the Prerequisites
-section above before assuming anything about the plugin or the language.
-
-## Where the actual language/protocol documentation lives
-
-Don't re-derive shoal's syntax or wire protocol from memory — read `skills/shoal/SKILL.md`. It is
-sourced directly from this repository's `docs/*.md` and `spec/cases/*.toml`, and from a direct read of
-`crates/shoal-mcp`, `crates/shoal-proto`, `crates/shoal-kernel` — it documents what is real, what is
-*intended* pending an in-flight MCP-surface change (marked **(P1)** throughout), what is spec'd-but-
-not-implemented at all, and every rough edge in between.
-
-## Absolute-path alternative
-
-If you don't want anything on `PATH`, edit `.mcp.json`'s `command`/`args` to an absolute path, e.g.:
+Call `shoal_exec` with:
 
 ```json
-{"mcpServers": {"shoal": {"type": "stdio", "command": "/path/to/shoal/target/release/shoal", "args": ["mcp"]}}}
+{"src":"1 + 2","position":"value"}
 ```
 
-or point directly at the bridge binary and skip the `shoal mcp` indirection entirely:
+The structured result contains an `out:<n>` reference and the tagged integer value. Treat
+`structuredContent` as data; `content[0].text` and `render` are bounded human previews.
+
+`shoal_exec` defaults to `position: "value"` at the MCP facade. In value position, all leading
+statements execute normally and a final expression is evaluated as a value, so a non-zero external
+command outcome is returned for inspection. In statement position, a non-OK command raises
+`cmd_failed`. Language errors such as `div_zero` raise in either position and still mint a
+transcript ref in the error data.
+
+## Interactive PTY workflow
+
+Use PTY tools for programs whose terminal behavior matters; `shoal_exec` is intentionally headless.
+A normal workflow is:
+
+1. `shoal_pty_open` with `cmd`, optional string `args`, terminal dimensions, and environment.
+2. `shoal_pty_read` to inspect `screen`, `cursor`, `changed`, `alive`, and `exit`.
+3. `shoal_pty_send` with literal text, a named key such as `{"key":"Enter"}`, or an array that
+   mixes both. Named keys include arrows, navigation keys, F1–F12, and `Ctrl-<letter>`.
+4. `shoal_pty_resize` when the client layout changes.
+5. `shoal_pty_close` when finished. Use `shoal_pty_list` or `shoal://pty` to recover open IDs.
+
+PTY reads return a rendered screen, never raw escape bytes. PTY spawns pass through the same leash
+and executable-pin gate as other process launches.
+
+## Absolute-path configuration
+
+If the binaries are not on `PATH`, edit `plugin/.mcp.json` to point at the built companion:
 
 ```json
-{"mcpServers": {"shoal": {"type": "stdio", "command": "/path/to/shoal/target/release/shoal-mcp", "args": []}}}
+{
+  "mcpServers": {
+    "shoal": {
+      "type": "stdio",
+      "command": "/path/to/shoal/target/release/shoal-mcp",
+      "args": []
+    }
+  }
+}
 ```
 
-Either way, `shoal-kernel` must still be started separately first.
+Autostart still needs `shoal-kernel` on `PATH`; otherwise supervise a kernel and set
+`SHOAL_NO_AUTOSTART` plus `SHOAL_SOCKET`.
 
-## A note on plugin/marketplace schema fidelity
+## Documentation
 
-`.claude-plugin/plugin.json`, `.mcp.json`, and `../.claude-plugin/marketplace.json` (repo root) were
-written to match Anthropic's documented Claude Code plugin/marketplace schema as closely as this pass
-could confirm — see the maintainer notes accompanying this plugin's introduction for the specific
-fields that are worth a final check against a live Claude Code build (in particular: whether
-`.mcp.json` at the plugin root is auto-discovered vs. needing an explicit pointer from `plugin.json`,
-and the exact optional-field set `plugin.json`/`marketplace.json` accept beyond the required core).
+- [Agent and MCP manual][agent-mcp]
+- [Kernel protocol atlas][kernel]
+- [Language manual][manual]
+- [Status and limits][status]
+- [Roadmap][roadmap]
+
+[agent-mcp]: ../site/content/internals/agent-mcp.md
+[kernel]: ../site/content/internals/kernel-protocol.md
+[manual]: https://alliecatowo.github.io/shoal/docs/
+[status]: https://alliecatowo.github.io/shoal/docs/status-limits/
+[roadmap]: https://alliecatowo.github.io/shoal/docs/roadmap/

@@ -3,7 +3,7 @@
 # `glob("*.rs").map(.name)`, `ls.where(.size > 1mb)`. Pure components
 # (`.name`/`.stem`/`.ext`/`.parent`) resolve without IO; the fs-backed
 # attributes (`.exists`/`.is_dir`/`.is_file`/`.size`/`.modified`) route through
-# the `Fs` port. See docs/CONTRACTS.md §3 and crates/shoal-eval/src/
+# the `Fs` port. See site/content/internals/intercrate-protocol-contracts.md and crates/shoal-eval/src/
 # expr_access.rs::field. Companion: `.sum()` accumulates a `list<size>` by
 # folding from the first element, so sizes stay sizes (no int-vs-size mismatch).
 

@@ -2,7 +2,7 @@
 //! socket, driven both through the `shoal-mcp` facade and via raw JSON-RPC.
 //!
 //! These prove the agent-surface doctrine holds across the whole stack
-//! (AGENT-SURFACE §0–§8): the elision rule bounds render/text at the MCP
+//! (site/content/internals/kernel-protocol.md): the elision rule bounds render/text at the MCP
 //! boundary, an elided value's ref is a live resource, and events round-trip
 //! on a user channel.
 
@@ -97,7 +97,7 @@ fn read_resource(facade: &mut Facade, uri: &str) -> Value {
 }
 
 /// `resources/read` that is expected to fail — returns the whole response so
-/// the test can assert an `error` object (unknown plan/task refs, §1).
+/// the test can assert an `error` object (unknown plan/task refs, site/content/internals/kernel-protocol.md).
 fn read_resource_expecting_error(facade: &mut Facade, uri: &str) -> Value {
     let request = json!({
         "jsonrpc":"2.0","id":2,"method":"resources/read","params":{"uri":uri}
@@ -108,8 +108,8 @@ fn read_resource_expecting_error(facade: &mut Facade, uri: &str) -> Value {
 }
 
 /// A >100-row table exec, over the real socket through the MCP facade: the
-/// structured value elides (§3), the human `text`/render is bounded and never
-/// carries the payload (§1 — the elision-bypass fix), and a `resource_link`
+/// structured value elides (site/content/internals/kernel-protocol.md), the human `text`/render is bounded and never
+/// carries the payload (site/content/internals/kernel-protocol.md — the elision-bypass fix), and a `resource_link`
 /// points at the ref. Then `resources/read` follows that ref and drills into a
 /// single row, which is NOT elided.
 #[test]
@@ -136,7 +136,7 @@ fn mcp_exec_elides_render_and_text_then_resource_read_drills_in() {
     assert_eq!(out["of"], "table");
     assert_eq!(out["n"], 2000);
 
-    // §1: the human text content is bounded (<= 64 KiB) even though the raw
+    // site/content/internals/kernel-protocol.md: the human text content is bounded (<= 64 KiB) even though the raw
     // render of 2000 rows is far larger — the render string cannot bypass the
     // wall. And it carries the fetch marker so the agent knows where to look.
     let content = result["content"].as_array().unwrap();
@@ -151,7 +151,7 @@ fn mcp_exec_elides_render_and_text_then_resource_read_drills_in() {
         "a truncated render must tell the agent how to fetch the rest"
     );
 
-    // §3 bug fix: `structuredContent.render` (the exec result's own render
+    // site/content/internals/kernel-protocol.md bug fix: `structuredContent.render` (the exec result's own render
     // field, distinct from the `content[0].text` derived from it) must be
     // bounded by the SAME hard cap — a 252 KiB ANSI-laden render sitting
     // right next to a properly-elided `value` is exactly the elision bypass
@@ -218,7 +218,7 @@ fn mcp_small_value_inline_and_state_resources() {
     assert!(entries.iter().any(|e| e["src"] == "1 + 2"));
 }
 
-/// AGENT-SURFACE §4/§5: `shoal_exec {background:true}` must return an events
+/// site/content/internals/kernel-protocol.md: `shoal_exec {background:true}` must return an events
 /// channel of the form `task.{bare id}` (e.g. `task.7`) — NOT
 /// `task.{full ref}` (`task.task:7`), which no `events.read`/
 /// `resources/subscribe` caller could ever match against the real channel a
@@ -246,7 +246,7 @@ fn mcp_background_exec_events_channel_is_bare_task_id() {
     );
 }
 
-/// AGENT-SURFACE §4: a task killed via `shoal_cancel` must read back
+/// site/content/internals/kernel-protocol.md: a task killed via `shoal_cancel` must read back
 /// `state:"cancelled"` in `shoal://jobs` — not `"completed"`. The MCP
 /// facade's default `position:"value"` captures a signal-killed outcome
 /// (`ok:false, signal:"SIGINT"`) as a normal returned value instead of
@@ -299,7 +299,7 @@ fn mcp_cancelled_task_reads_back_cancelled_not_completed() {
     );
 }
 
-/// AGENT-SURFACE §5/TDD §8: shoal's `rm` trashes (journaled, undo-recoverable
+/// site/content/internals/kernel-protocol.md, site/content/internals/language-conformance-contract.md: shoal's `rm` trashes (journaled, undo-recoverable
 /// via `apply`) rather than deleting outright, so `shoal_plan` must not
 /// flatly call it "irreversible" — but an opaque external `sh { rm -rf }`
 /// (a structurally different effect, `Effect::Opaque`, never
@@ -333,7 +333,7 @@ fn mcp_shoal_plan_distinguishes_trash_rm_from_opaque_rm() {
     );
 }
 
-/// AGENT-SURFACE §1 (`shoal://session/env`): the session environment view is
+/// site/content/internals/kernel-protocol.md (`shoal://session/env`): the session environment view is
 /// served from the session evaluator. A default-permissive human is granted a
 /// value read (`env_read=["*"]`), so `granted:true` and the values travel
 /// alongside the names.
@@ -358,7 +358,7 @@ fn mcp_session_env_resource_is_served_with_values_for_the_default_human() {
     );
 }
 
-/// AGENT-SURFACE §1 (`shoal://session/reef`): the reef resolution view is
+/// site/content/internals/kernel-protocol.md (`shoal://session/reef`): the reef resolution view is
 /// served and correctly shaped — an `active_scope` (string or honest null when
 /// no manifest is in scope) plus a `bindings` array. Host-independent: it only
 /// asserts the shape, never a particular manifest state.
@@ -379,7 +379,7 @@ fn mcp_session_reef_resource_is_served_and_shaped() {
     );
 }
 
-/// AGENT-SURFACE §1 (`shoal://plan/{ref}`): a plan derived by `shoal_plan` is
+/// site/content/internals/kernel-protocol.md (`shoal://plan/{ref}`): a plan derived by `shoal_plan` is
 /// afterward readable as a resource by its `plan:<hex>` ref — its effects,
 /// reversibility, and verdict mirror what the `shoal_plan` call returned. An
 /// unknown/expired ref is a clear not-found error, never a silent empty plan.
@@ -433,7 +433,7 @@ fn mcp_plan_resource_reads_back_a_stored_plan_and_errors_on_unknown() {
     );
 }
 
-/// AGENT-SURFACE §1/§6 (`shoal://task/{id}/out`): the read side of a task's
+/// site/content/internals/kernel-protocol.md (`shoal://task/{id}/out`): the read side of a task's
 /// output. A completed background task's captured output is reachable by URI —
 /// the `/out` segment resolves the task's result value (previously ignored, so
 /// the record was returned instead of the output). An unknown task errors.
@@ -490,7 +490,7 @@ fn mcp_task_out_resource_reads_captured_output_and_errors_on_unknown() {
     );
 }
 
-/// AGENT-SURFACE §1 (`shoal://val/blake3:{hex}`): the spec's short-ref value
+/// site/content/internals/kernel-protocol.md (`shoal://val/blake3:{hex}`): the spec's short-ref value
 /// URI form (with the `blake3:` algorithm prefix) must resolve the same CAS
 /// blob as the bare-hex form — the prefix is stripped before the lookup.
 #[test]
@@ -516,7 +516,7 @@ fn mcp_val_resource_accepts_the_blake3_prefixed_spec_form() {
     );
 }
 
-/// AGENT-SURFACE §8: `resources/list` advertises the newly-served static roots
+/// site/content/internals/kernel-protocol.md: `resources/list` advertises the newly-served static roots
 /// (`session/env`, `session/reef`) and any open plan the session derived.
 #[test]
 fn mcp_resources_list_advertises_new_roots_and_open_plans() {
@@ -592,7 +592,7 @@ fn read_frame_as_response(reader: &mut BufReader<UnixStream>) -> Response {
 }
 
 /// `events.publish` → `events.read` round-trips on a `user.*` channel over the
-/// raw wire (AGENT-SURFACE §4/§7 — the pair-shelling primitive).
+/// raw wire (site/content/internals/kernel-protocol.md — the pair-shelling primitive).
 #[test]
 fn raw_events_publish_read_roundtrip_on_user_channel() {
     let live = LiveKernel::start();
@@ -638,7 +638,7 @@ fn raw_events_publish_read_roundtrip_on_user_channel() {
     assert!(denied.error.is_some());
 }
 
-/// The channel↔wire bridge (AGENT-SURFACE §4 "one substrate"): an in-language
+/// The channel↔wire bridge (site/content/internals/kernel-protocol.md "one substrate"): an in-language
 /// `channel("user.x").emit(...)` must reach wire subscribers/readers, and a
 /// wire `events.publish` must be visible to in-language `latest()` — the two
 /// event worlds used to be fully disjoint (the field test's last blocker).
@@ -738,7 +738,7 @@ fn read_frame_raw(reader: &mut BufReader<UnixStream>) -> Value {
 }
 
 // ---------------------------------------------------------------------------
-// AGENT-SURFACE §10: an agent drives an interactive PTY program over the wire
+// site/content/internals/kernel-protocol.md: an agent drives an interactive PTY program over the wire
 // and reads back a rendered screen (never a byte wall).
 // ---------------------------------------------------------------------------
 
@@ -847,7 +847,7 @@ fn mcp_pty_drive_cat_reads_rendered_screen_then_closes_and_reaps() {
     );
 }
 
-/// AGENT-SURFACE §10 (`pty.list` / `shoal://pty` + `shoal://pty/{id}`): open
+/// site/content/internals/kernel-protocol.md (`pty.list` / `shoal://pty` + `shoal://pty/{id}`): open
 /// PTY sessions are first-class on the agent surface — discoverable via the
 /// `shoal_pty_list` tool and the `shoal://pty` resource, and drill-in-able via
 /// `shoal://pty/{id}` (the rendered screen), mirroring how an exec'd value

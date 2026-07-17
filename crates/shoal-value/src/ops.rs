@@ -1,4 +1,4 @@
-//! Binary/unary operator semantics — the complete coercion matrix of TDD §4.2.
+//! Binary/unary operator semantics — the complete coercion matrix of site/content/internals/language-conformance-contract.md.
 //!
 //! Exactly two coercion sites exist in shoal; this file is site 1 (arithmetic
 //! promotion). Everything not listed here is a type error. Two non-coercive
@@ -95,7 +95,7 @@ pub fn binop(op: BinOp, lhs: &Value, rhs: &Value) -> VResult<Value> {
     use BinOp::*;
     use Value::*;
 
-    // Comparing streams is an error (TDD §4.1).
+    // Comparing streams is an error (site/content/internals/language-conformance-contract.md).
     if matches!(op, Eq | Ne)
         && (matches!(lhs, Stream(_)) || matches!(rhs, Stream(_)))
         && !(matches!(lhs, Stream(_)) && matches!(rhs, Stream(_)))

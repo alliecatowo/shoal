@@ -1,4 +1,4 @@
-//! Frecency-ranked directory jumping (docs/ROADMAP.md #3) — the `j`/`jump`
+//! Frecency-ranked directory jumping (site/content/internals/roadmap-and-priorities.md #3) — the `j`/`jump`
 //! builtin and the persistent store every successful `cd` bumps.
 //!
 //! # Frecency formula (zoxide-compatible)

@@ -1,4 +1,4 @@
-//! Wave R0 — interactive ergonomics (docs/ROADMAP.md).
+//! Interactive ergonomics coverage. See `site/content/internals/implementation-status.md`.
 //!
 //! Two dealbreakers, both fixed at the evaluator layer:
 //!  1. statement-position builtins must render (their outcomes carry

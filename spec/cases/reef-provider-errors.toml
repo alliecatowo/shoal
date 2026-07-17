@@ -1,5 +1,5 @@
-# `reef_provider` (CONTRACTS §4's pinned reef code family; reef.toml's own
-# header notes most of REEF.md's real-provider surface is host-dependent and
+# `reef_provider` (site/content/internals/intercrate-protocol-contracts.md pinned reef code family; reef.toml's own
+# header notes most of site/content/internals/reef-resolution.md's real-provider surface is host-dependent and
 # `skip`s it) — but `reef add <tool>@<version>`'s manifest-mutation path
 # (`crates/shoal-eval/src/reef_builtins.rs::reef_add`) hits `reef_provider`
 # on two purely textual, deterministic, host-safe conditions: a malformed

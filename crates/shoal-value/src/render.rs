@@ -1,4 +1,4 @@
-//! Rendering — the normative render rules pinned in docs/CONTRACTS.md §3.
+//! Rendering — the normative render rules pinned in site/content/internals/intercrate-protocol-contracts.md.
 //! `render_inline` is what the conformance corpus asserts against;
 //! `render_block` is the REPL's pretty top-level form.
 
@@ -147,7 +147,7 @@ pub fn render_inline(v: &Value) -> String {
         Value::DateTime(z) => z.timestamp().to_string(),
         Value::Time(t) => render_time(t),
         Value::Bytes(b) => format!("bytes({})", render_size(b.len() as u64)),
-        // Lazy CAS-backed bytes (TDD §317): show the true total size and the
+        // Lazy CAS-backed bytes (site/content/internals/language-conformance-contract.md): show the true total size and the
         // recoverable content ref, never loading the bytes.
         Value::CasBytes(c) => format!("bytes({}) {}", render_size(c.len), c.reference()),
         Value::List(xs) => {
@@ -396,7 +396,7 @@ pub fn render_block(v: &Value, width: usize) -> String {
             }
         }
         Value::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
-        // Lazy CAS-backed bytes (TDD §317): a bounded preview followed by a
+        // Lazy CAS-backed bytes (site/content/internals/language-conformance-contract.md): a bounded preview followed by a
         // marker line carrying the true total length and the `val:blake3:…`
         // ref (the in-language mirror of the wire elision doctrine). The full
         // content is never loaded just to render.

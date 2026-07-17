@@ -1,7 +1,7 @@
 //! Duration/size formatting — an intentional, parity-tested duplicate of the
-//! rules pinned in CONTRACTS.md §3 (`shoal_value::render::render_inline`).
+//! rules pinned in site/content/internals/intercrate-protocol-contracts.md (`shoal_value::render::render_inline`).
 //!
-//! design-prompt.md §2.1 makes this the one deliberate seam-crossing risk and
+//! site/content/internals/prompt-editor-lsp.md makes this the one deliberate seam-crossing risk and
 //! closes it with `tests/render_parity.rs`, which asserts these functions agree
 //! with `shoal-value` byte-for-byte over a fixed corpus. If the two ever drift,
 //! that test is the tripwire — not a user bug report.

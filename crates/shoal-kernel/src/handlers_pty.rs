@@ -1,4 +1,4 @@
-//! `dispatch` handlers for the interactive-PTY surface (AGENT-SURFACE §10):
+//! `dispatch` handlers for the interactive-PTY surface (site/content/internals/kernel-protocol.md):
 //! `pty.open`, `pty.send`, `pty.read`, `pty.resize`, `pty.close`.
 //!
 //! An agent attached over the wire is `tty:false` and gets value-capture only;
@@ -65,7 +65,7 @@ impl Kernel {
             .collect::<Vec<_>>()
             .join(" ");
 
-        // Leash gate (TDD §8), mirroring the evaluator's `spawn_gate`: only
+        // Leash gate (site/content/internals/language-conformance-contract.md), mirroring the evaluator's `spawn_gate`: only
         // consult `evaluate_effect` once the principal has actually opted into
         // spawn pinning (a non-empty `proc_spawn` allowlist) — otherwise an
         // empty allowlist would default-deny every spawn. `sandbox_for` returns
@@ -316,7 +316,7 @@ fn exit_json(status: Option<i32>, signal: Option<String>) -> Json {
     }
 }
 
-/// Encode a `pty.send` `input` into terminal bytes (AGENT-SURFACE §10's
+/// Encode a `pty.send` `input` into terminal bytes (site/content/internals/kernel-protocol.md
 /// key-name protocol). Accepts:
 /// - a **string** → sent verbatim as UTF-8;
 /// - an **object** with exactly one of `key` (a named key → [`named_key`]),

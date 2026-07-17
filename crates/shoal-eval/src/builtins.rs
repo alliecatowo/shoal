@@ -75,7 +75,7 @@ fn dispatch(
 ) -> VResult<Value> {
     match name {
         // echo renders every value (lists/records/tables/null included), strings
-        // unquoted at top level (pty §8).
+        // unquoted at top level (site/content/internals/pty-job-control.md).
         "echo" => Ok(Value::Str(
             args.iter().map(echo_display).collect::<Vec<_>>().join(" "),
         )),
@@ -109,7 +109,7 @@ fn has(flags: &[String], names: &[&str]) -> bool {
     flags.iter().any(|f| names.contains(&f.as_str()))
 }
 /// Top-level display for `echo`: scalars/paths unquoted, everything else via
-/// `render_inline` (pty §8 — lists/records/tables all printable).
+/// `render_inline` (site/content/internals/pty-job-control.md — lists/records/tables all printable).
 fn echo_display(v: &Value) -> String {
     match v {
         Value::Str(s) => s.clone(),
@@ -392,7 +392,7 @@ fn stat(fs: &dyn Fs, cwd: &Path, args: Vec<Value>) -> VResult<Value> {
         Ok(Value::Table(rows))
     }
 }
-/// `head(file, n: int = 10) -> list<str>` (TDD §5): the first `n` lines of a
+/// `head(file, n: int = 10) -> list<str>` (site/content/internals/language-conformance-contract.md): the first `n` lines of a
 /// text file, structured. UTF-8 is read lossily so a stray non-UTF-8 byte never
 /// aborts the read.
 fn head(fs: &dyn Fs, cwd: &Path, args: Vec<Value>) -> VResult<Value> {
@@ -423,7 +423,7 @@ fn head(fs: &dyn Fs, cwd: &Path, args: Vec<Value>) -> VResult<Value> {
     Ok(Value::List(lines))
 }
 
-/// `ln(target, link, symbolic: bool = false)` (TDD §5): create a hard link (or a
+/// `ln(target, link, symbolic: bool = false)` (site/content/internals/language-conformance-contract.md): create a hard link (or a
 /// symlink with `--symbolic`/`-s`). Returns a record describing the link created.
 fn ln(fs: &dyn Fs, cwd: &Path, args: Vec<Value>, symbolic: bool) -> VResult<Value> {
     if args.len() != 2 {
@@ -504,7 +504,7 @@ fn sleep(args: Vec<Value>, cancel: &CancelToken) -> VResult<Value> {
         }
     };
     // Poll the cancel token in small increments so Ctrl-C shortens the sleep
-    // (TDD §4.7): an un-cancellable sleep froze the foreground on interrupt.
+    // (site/content/internals/language-conformance-contract.md): an un-cancellable sleep froze the foreground on interrupt.
     let deadline = Instant::now() + d;
     let step = Duration::from_millis(50);
     loop {
@@ -574,7 +574,7 @@ mod tests {
     }
     // Linux allows arbitrary bytes in filenames; macOS (APFS/HFS+) rejects
     // non-UTF-8 names at the syscall, so the fixture can't be created there.
-    // shoal's path handling stays bytes-backed regardless (TDD §13.1); this
+    // shoal's path handling stays bytes-backed regardless (site/content/internals/language-conformance-contract.md); this
     // test just needs a filesystem that can hold the bytes.
     #[cfg(target_os = "linux")]
     #[test]
@@ -616,7 +616,7 @@ mod tests {
     #[test]
     fn sleep_returns_promptly_when_pre_cancelled() {
         // A pre-cancelled token makes even a long sleep return immediately
-        // (Ctrl-C shortens `sleep`, TDD §4.7).
+        // (Ctrl-C shortens `sleep`, site/content/internals/language-conformance-contract.md).
         let cancel = CancelToken::new();
         cancel.cancel();
         let start = Instant::now();

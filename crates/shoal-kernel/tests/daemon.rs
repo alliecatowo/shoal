@@ -247,7 +247,7 @@ fn recv(reader: &mut BufReader<UnixStream>) -> Response {
     serde_json::from_str(&line).unwrap()
 }
 
-/// Live end-to-end check of the elision rule (AGENT-SURFACE §3): a real
+/// Live end-to-end check of the elision rule (site/content/internals/kernel-protocol.md): a real
 /// `shoal-kernel` process on a real Unix socket, a real 150-file directory,
 /// a real `ls` exec over the wire. Confirms the *before* (what an unelided
 /// 150-row table would look like) against the *after* (the elided ref that
@@ -383,7 +383,7 @@ fn live_kernel_elides_a_big_table_over_the_wire() {
         let result = exec.result.expect("live `ls` over 150 files must succeed");
         let out = &result["value"]["out"];
 
-        // BEFORE (what the wire would have carried without §3): a `Table`
+        // BEFORE (what the wire would have carried without site/content/internals/kernel-protocol.md): a `Table`
         // whose `cols` map every column name to a 150-long array of tagged
         // cells — easily tens of KB for a directory listing with
         // name/size/modified. AFTER (what actually arrives): shape only.

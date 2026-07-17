@@ -1,4 +1,4 @@
-//! Reactive streams + in-language `channel()` (docs/STREAMS.md, ROADMAP Wave R1).
+//! Reactive streams + in-language `channel()` (site/content/internals/streams-channels.md, site/content/internals/roadmap-and-priorities.md).
 //!
 //! Timing sources (`every`/`watch`/`tail`) and the concurrent channel/`on`
 //! machinery are unit-tested here rather than in the host-safe conformance
@@ -41,7 +41,7 @@ fn rendered(src: &str) -> String {
 
 #[test]
 fn channel_emit_latest_roundtrips() {
-    // The canonical STREAMS §5 replacement for a `.done` sentinel file.
+    // The stream/channel contract's replacement for a `.done` sentinel file.
     assert_eq!(
         run(r#"channel("x").emit(1); channel("x").emit(2); channel("x").latest()"#),
         Value::Int(2)
@@ -80,7 +80,7 @@ channel("c").events(since: 0).map(ev => ev.payload).take(2).collect()"#,
 #[test]
 fn channel_take_blocks_for_the_next_value() {
     // A background emitter publishes after a short delay; `.take(timeout:)` blocks
-    // for it — no file, no poll (STREAMS §5).
+    // for it — no file, no poll (site/content/internals/streams-channels.md).
     let v = run(r#"spawn { sleep 20ms; channel("k").emit(99) }
 channel("k").take(timeout: 5s)"#);
     assert_eq!(v, Value::Int(99));

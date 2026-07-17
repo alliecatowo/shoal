@@ -1,13 +1,13 @@
-# Outcome-unification cases (TDD §4.1, §4.5; CONTRACTS §3/§4).
+# Outcome-unification cases (site/content/internals/language-conformance-contract.md; site/content/internals/intercrate-protocol-contracts.md).
 #
-# TDD §4.1: `outcome: {status, ok, out, err, dur, pid, cmd}`, `.out` structurally
-# parsed lazily. TDD §1.10/§3.3: `&&`/`||` admit `bool` or a command `outcome`
-# (success = true) as operands; TDD §4.5: "outcome in &&/||/if position =
+# site/content/internals/language-conformance-contract.md: `outcome: {status, ok, out, err, dur, pid, cmd}`, `.out` structurally
+# parsed lazily. site/content/internals/language-conformance-contract.md: `&&`/`||` admit `bool` or a command `outcome`
+# (success = true) as operands; site/content/internals/language-conformance-contract.md: "outcome in &&/||/if position =
 # success-as-bool, no raise". `echo` is a builtin — under outcome-unification
 # (shoal-eval's `builtin_outcome`, "P1a") it returns an `outcome` like any
 # other command call, not a bare `str`. All forms below are error-free (echo
 # cannot fail) and their renders carry no environment-dependent bytes (no
-# pid/dur/timestamps in `outcome`'s render form, per CONTRACTS §3:
+# pid/dur/timestamps in `outcome`'s render form, per site/content/internals/intercrate-protocol-contracts.md:
 # `outcome(status: 0, ok: true)`), so every case asserts a concrete value
 # rather than skipping.
 
@@ -29,7 +29,7 @@ value = "0"
 [[case]]
 name = "outcome-echo-render-inline"
 # A bare builtin call at value position renders as an `outcome`, per
-# CONTRACTS §3's pinned outcome render form.
+# site/content/internals/intercrate-protocol-contracts.md pinned outcome render form.
 src = "echo hi"
 value = "outcome(status: 0, ok: true)"
 
@@ -67,12 +67,12 @@ name = "outcome-echo-out-json-record"
 src = '''(echo '{"a": 1}').out'''
 value = '"{\"a\": 1}"'
 
-# --- &&/||/if/! admit outcomes as bool-coerced operands (TDD §1.10, §3.3,
-# §4.5) but the operators themselves are NOT bool-narrowing: `&&`/`||`
+# --- &&/||/if/! admit outcomes as bool-coerced operands -------------------
+# The operators themselves are NOT bool-narrowing: `&&`/`||`
 # return the short-circuiting operand **verbatim** (whichever side's
 # `as_condition()` decided the result), not a forced `Value::Bool` — so a
 # chain of outcome-returning commands stays chainable (`.status`/`.out`
-# still reachable on the result) exactly like VISION §2's "structure is
+# still reachable on the result) exactly like site/content/internals/system-map.md "structure is
 # never re-guessed because it is never lost". This still agrees with the
 # pinned unit test `strict_conditions_and_short_circuit` (`false && missing`
 # / `true || missing` -> `Value::Bool`), because there the deciding operand

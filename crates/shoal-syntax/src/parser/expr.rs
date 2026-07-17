@@ -51,7 +51,7 @@ impl<'s> Parser<'s> {
     pub(crate) fn expr_tail(&mut self, mut lhs: Expr, min: u8) -> ParseResult<Expr> {
         loop {
             let (mut t, _) = self.peek(Mode::Expr)?;
-            // Cross-newline continuation (§2.1): a trailing binary operator (the
+            // Cross-newline continuation (site/content/internals/language-conformance-contract.md): a trailing binary operator (the
             // newline is already inside an open subexpression) never reaches
             // here, but a `catch` on the *next* line must still attach.
             if min == 0 && matches!(t, Tok::Newline) {
@@ -87,7 +87,7 @@ impl<'s> Parser<'s> {
                 };
                 continue;
             }
-            // TDD §1.4: a lone `|` ANYWHERE outside `sh { }`/match-alternation
+            // site/content/internals/language-conformance-contract.md: a lone `|` ANYWHERE outside `sh { }`/match-alternation
             // gets the curated teaching error. Command-position and
             // leading-`|` already have it; this catches the infix positions
             // (`1 | 2`, `let a = x | y`, `(a | b)`) that used to fall out of
@@ -126,7 +126,7 @@ impl<'s> Parser<'s> {
             }
             self.bump(Mode::Expr)?;
             // A trailing binary operator continues the statement across newlines
-            // (§2.1); `&&`/`||` operands may be commands (eval-audit #6).
+            // (site/content/internals/language-conformance-contract.md); `&&`/`||` operands may be commands (eval-audit #6).
             self.skip_newlines()?;
             let rhs = if matches!(op, Some(BinOp::And) | Some(BinOp::Or)) {
                 self.expr_or_command(bp + 1)?
@@ -183,8 +183,8 @@ impl<'s> Parser<'s> {
         let (t, s) = self.bump(Mode::Expr)?;
         Ok(match t{Tok::Int(value)=>Expr::Int{value,span:s},Tok::Float(value)=>Expr::Float{value,span:s},Tok::Size(bytes)=>Expr::Size{bytes,span:s},Tok::Duration(ns)=>Expr::Duration{ns,span:s},Tok::Time{hour,min,sec}=>Expr::Time{hour,min,sec,span:s},Tok::Str(value)=>Expr::Str{value,span:s},Tok::StrInterp(parts)=>self.interp(parts,s)?,Tok::Regex(src)=>Expr::Regex{src,span:s},Tok::DateTime(iso)=>Expr::DateTime{iso,span:s},Tok::Ident(x)if x=="true"||x=="false"=>Expr::Bool{value:x=="true",span:s},Tok::Ident(x)if x=="null"=>Expr::Null{span:s},Tok::Ident(x)if x=="if"=>return self.if_expr(s.start as usize),Tok::Ident(x)if x=="try"=>return self.try_expr(s.start as usize),Tok::Ident(x)if x=="match"=>return self.match_expr(s.start as usize),Tok::Ident(x)if x=="with"=>return self.with_expr(s.start as usize),Tok::Ident(x)if x=="spawn"=>{let body=self.block()?;Expr::Spawn{body,span:Span::new(s.start as usize,self.pos)}},Tok::Ident(ref x)if INTERPRETERS.contains(&x.as_str())&&self.interp_block_follows(s)=>{let tool=x.clone();if self.byte(self.pos)==b'\''{let(rt,rs)=self.bump(Mode::Expr)?;match rt{Tok::Str(src)=>Expr::LangBlock{tool,src,span:Span::new(s.start as usize,rs.end as usize)},_=>return Err(ParseError::new(format!("expected {tool} payload after `{tool}'`"),rs))}}else{let open=self.expect(Mode::Expr,Tok::LBrace,"`{` or `'''…'''`")?;let(src,end)=self.lx.raw_brace_block(open.start as usize)?;self.pos=end;Expr::LangBlock{tool,src,span:Span::new(s.start as usize,end as usize)}}},Tok::Ident(name)=>{if top&&matches!(self.peek(Mode::Expr)?.0,Tok::FatArrow){self.bump(Mode::Expr)?;
 // Bind the one param into the value-binding scope for the body parse, so a
-// block body's `x + 1` dispatches as EXPR, not a command named `x` (TDD
-// §3.1.3) — mirrors the parenthesised-param path in `paren_or_lambda`.
+// block body's `x + 1` dispatches as EXPR, not a command named `x` (see
+// `site/content/internals/language-conformance-contract.md`) — mirrors the parenthesised-param path in `paren_or_lambda`.
 self.scopes.push(HashSet::new());self.bind(name.clone());let body=self.expr(0)?;self.scopes.pop();let end=body.span().end;Expr::Lambda{params:vec![Param{name,ty:None,default:None,span:s}],body:Box::new(body),span:Span::new(s.start as usize,end as usize)}}else{if !self.repl&&matches!(name.as_str(),"it"|"out"){return Err(ParseError::new(format!("`{name}` is REPL-only"),s).hint("bind a variable to reuse a previous result"))}Expr::Var{name,span:s}}},Tok::LParen=>return self.paren_or_lambda(s.start as usize),Tok::LBracket=>{let mut items=vec![];self.skip_newlines()?;if self.eat(Mode::Expr,&Tok::RBracket)?.is_none(){loop{items.push(self.allow_trailing_block(|p|p.expr(0))?);self.skip_newlines()?;if self.eat(Mode::Expr,&Tok::Comma)?.is_none(){self.expect(Mode::Expr,Tok::RBracket,"`]`")?;break}self.skip_newlines()?;if self.eat(Mode::Expr,&Tok::RBracket)?.is_some(){break}}}Expr::List{items,span:Span::new(s.start as usize,self.pos)}},Tok::LBrace=>return self.record_or_block(s.start as usize),Tok::Pipe=>return Err(ParseError::new("shoal has no pipe operator",s).hint("data composes with `.` (try `ls.where(.size > 1mb)`); raw byte plumbing is `.feed(cmd)`; verbatim POSIX lives in `sh { … }`")),Tok::Dot=>return Err(ParseError::new("a leading `.` has no receiver here",s).hint("the `.field`/`.method` shorthand only works as a whole call argument (`.map(.name)`, `.where(.size > 1mb)`); elsewhere name the value: `x => x.name`")),_=>return Err(ParseError::new(format!("expected expression, found {t:?}"),s))})
     }
     pub(crate) fn postfix(&mut self, mut e: Expr) -> ParseResult<Expr> {
@@ -192,7 +192,7 @@ self.scopes.push(HashSet::new());self.bind(name.clone());let body=self.expr(0)?;
             let (t, _) = self.peek(Mode::Expr)?;
             match t {
                 // Leading-`.` on the next line continues this postfix chain
-                // (§2.1). A `[`/`(` on the next line does *not* continue.
+                // (site/content/internals/language-conformance-contract.md). A `[`/`(` on the next line does *not* continue.
                 Tok::Newline => {
                     if self.continue_if(|t| matches!(t, Tok::Dot | Tok::QuestionDot))? {
                         continue;
@@ -205,7 +205,7 @@ self.scopes.push(HashSet::new());self.bind(name.clone());let body=self.expr(0)?;
                     if self.eat(Mode::Expr, &Tok::LParen)?.is_some() {
                         let args = if name == "feed" && self.at_command_head()? {
                             // `.feed(cmd args…)`: the argument is a command with
-                            // its own arguments/flags (IO.md §1.1). Parse it in
+                            // its own arguments/flags (site/content/internals/values-streams-execution.md). Parse it in
                             // CMD mode so `sort -r`, `jq ".a"`, etc. become an
                             // `Expr::Cmd` the evaluator spawns with the fed bytes
                             // on stdin — otherwise EXPR rules misparse the flag/
@@ -224,7 +224,7 @@ self.scopes.push(HashSet::new());self.bind(name.clone());let body=self.expr(0)?;
                             a
                         } else {
                             let mut a = self.args_after_open()?;
-                            // Trailing block after a method call (§3.4 `f(a){…}`).
+                            // Trailing block after a method call (site/content/internals/language-conformance-contract.md `f(a){…}`).
                             if !self.no_trailing_block
                                 && matches!(self.peek(Mode::Expr)?.0, Tok::LBrace)
                             {
@@ -279,7 +279,7 @@ self.scopes.push(HashSet::new());self.bind(name.clone());let body=self.expr(0)?;
                 Tok::LParen => {
                     self.bump(Mode::Expr)?;
                     let mut args = self.args_after_open()?;
-                    // Trailing block after a call (§3.4 `f(a){…}`).
+                    // Trailing block after a call (site/content/internals/language-conformance-contract.md `f(a){…}`).
                     if !self.no_trailing_block && matches!(self.peek(Mode::Expr)?.0, Tok::LBrace) {
                         args.pos.push(self.trailing_block_lambda()?);
                     }
@@ -287,7 +287,7 @@ self.scopes.push(HashSet::new());self.bind(name.clone());let body=self.expr(0)?;
                     match e {
                         Expr::Var { name, .. } => e = Expr::FnCall { name, args, span },
                         callee => {
-                            // Direct call of a non-`Var` primary (TDD §3.2's
+                            // Direct call of a non-`Var` primary (site/content/internals/language-conformance-contract.md
                             // `postfix = primary { … | call [trailing] }`
                             // grammar makes `lambda` an ordinary `primary`
                             // with no carve-out against an immediate `call`
@@ -334,7 +334,7 @@ self.scopes.push(HashSet::new());self.bind(name.clone());let body=self.expr(0)?;
         Ok(e)
     }
     /// Parse a trailing `{ … }` block as a zero-argument lambda thunk
-    /// (`() => { … }`), per the §3.4 `f(a){…}` desugar.
+    /// (`() => { … }`), per the site/content/internals/language-conformance-contract.md `f(a){…}` desugar.
     pub(crate) fn trailing_block_lambda(&mut self) -> ParseResult<Expr> {
         let block = self.block()?;
         let span = block.span;

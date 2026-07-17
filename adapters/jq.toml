@@ -1,6 +1,6 @@
-# `class = "interpreter"` (IO.md §2.2) additionally opts `jq { FILTER }` into
+# `class = "interpreter"` (site/content/internals/values-streams-execution.md) additionally opts `jq { FILTER }` into
 # raw-block lexing, so `blob.feed(jq { .items[] | select(.active) })` works
-# (IO.md §2.7): the block's raw text becomes jq's filter argument, exactly
+# (site/content/internals/values-streams-execution.md): the block's raw text becomes jq's filter argument, exactly
 # where `filter` already binds below for the ordinary `jq(filter: ...)`
 # call shape — the block form and the named-argument form are two syntaxes
 # for the same one positional argument, not two different adapters. No

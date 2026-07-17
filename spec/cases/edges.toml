@@ -1,9 +1,9 @@
-# TDD §13's normative edge-case register — the deterministic, host-safe
-# subset not already covered by strings.toml (§13.10 CRLF), io.toml (§13.13
-# `sh {}` brace balance), coercion.toml (§4.3 glob binding), outcome.toml
-# (§13.6's `ok`/`.out` shape). Each case cites its §13 item.
+# site/content/internals/language-conformance-contract.md normative edge-case register — the deterministic, host-safe
+# subset not already covered by strings.toml (site/content/internals/language-conformance-contract.md CRLF), io.toml (site/content/internals/language-conformance-contract.md
+# `sh {}` brace balance), coercion.toml (site/content/internals/language-conformance-contract.md glob binding), outcome.toml
+# (site/content/internals/language-conformance-contract.md `ok`/`.out` shape). Each case cites its site/content/internals/language-conformance-contract.md item.
 
-# --- §13.2: filenames with a leading `-` are values, not flags -------------
+# --- site/content/internals/language-conformance-contract.md: filenames with a leading `-` are values, not flags -------------
 
 [[case]]
 name = "edge-leading-dash-filename-preserved-as-data"
@@ -14,7 +14,7 @@ fixture = ["-rf"]
 src = 'ls.where(r => r.name == "-rf").len()'
 value = "1"
 
-# --- §13.3: bare `-` is a literal word, never swallowed as a flag ---------
+# --- site/content/internals/language-conformance-contract.md: bare `-` is a literal word, never swallowed as a flag ---------
 
 [[case]]
 name = "edge-bare-dash-is-a-literal-word-not-a-flag"
@@ -26,11 +26,11 @@ name = "edge-bare-dash-is-a-literal-word-not-a-flag"
 src = "cat -"
 error = "custom"
 
-# --- §13.4: an empty glob match yields zero argv entries, not an error ---
+# --- site/content/internals/language-conformance-contract.md: an empty glob match yields zero argv entries, not an error ---
 
 [[case]]
 name = "edge-empty-glob-contributes-zero-argv-entries"
-# TDD §4.3 / §13.4: "zero matches yields zero argv entries plus the
+# site/content/internals/language-conformance-contract.md: "zero matches yields zero argv entries plus the
 # statement lint" — `args.rs::expand_arg` returns an empty `Vec` for a
 # glob with no filesystem matches (this harness can't observe the stderr
 # lint, only the argv-count effect), so the surrounding words are unaffected
@@ -38,14 +38,14 @@ name = "edge-empty-glob-contributes-zero-argv-entries"
 src = "(echo before *.nonexistent-ext-zzz after).out"
 value = '"before after"'
 
-# --- §13.9: command-not-found ------------------------------------------
+# --- site/content/internals/language-conformance-contract.md: command-not-found ------------------------------------------
 
 [[case]]
 name = "edge-command-not-found"
 src = "zzzznotarealcommandxyz123"
 error = "not_found"
 
-# §13.9 command did-you-mean: an unresolvable head that is a near-miss of a
+# site/content/internals/language-conformance-contract.md command did-you-mean: an unresolvable head that is a near-miss of a
 # KNOWN command earns a `did you mean 'X'?` hint (the command-head analogue of
 # the method did-you-mean). Candidates are host-independent — the canonical
 # builtin registry, adapter heads, and in-scope callable bindings — so no $PATH
@@ -95,7 +95,7 @@ name = "edge-command-not-found-no-hint-when-far"
 src = "xyzzy"
 error = "not_found"
 
-# --- §13.15: shadowing a command is legal; `^name` always escapes it -----
+# --- site/content/internals/language-conformance-contract.md: shadowing a command is legal; `^name` always escapes it -----
 
 [[case]]
 name = "edge-shadowed-command-name-resolves-to-the-value"
@@ -108,7 +108,7 @@ fixture = ["a.txt"]
 src = "let ls = 5\n(^ls).out.len()"
 value = "1"
 
-# --- §13.16: `it`/`out` are REPL-only; a script never sees them ----------
+# --- site/content/internals/language-conformance-contract.md: `it`/`out` are REPL-only; a script never sees them ----------
 
 [[case]]
 name = "edge-it-in-script-is-a-parse-error"
@@ -143,7 +143,7 @@ src = "(it)"
 parse_error = true
 parse_error_contains = "REPL-only"
 
-# --- §13.6: signal death surfaces as `signal`, `status` stays null, never
+# --- site/content/internals/language-conformance-contract.md: signal death surfaces as `signal`, `status` stays null, never
 # a synthesized 128+n exit code -------------------------------------------
 
 [[case]]

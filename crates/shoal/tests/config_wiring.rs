@@ -1,5 +1,5 @@
 //! End-to-end coverage that config keys documented as "read today"
-//! (docs/CONFIG.md §6) actually change the `shoal` binary's behavior, driven
+//! (site/content/internals/configuration-reference.md) actually change the `shoal` binary's behavior, driven
 //! through the deterministic `-c` path (no PTY needed) against a real
 //! `shoal.toml` written to a temp `XDG_CONFIG_HOME` — the same user-layer
 //! resolution `shoal_config::LoadOptions::discover` and
@@ -111,7 +111,7 @@ fn render_color_false_in_config_suppresses_ansi_without_no_color_env() {
     );
 }
 
-/// `render.echo` (docs/CONFIG.md §5): a non-interactive `-c`/script run
+/// `render.echo` (site/content/internals/configuration-reference.md): a non-interactive `-c`/script run
 /// defaults to `quiet` — an intermediate bare command's output shows, the
 /// FINAL statement's value shows, but intermediate pure expressions do NOT
 /// auto-print. No `render.echo` key is set here, so this exercises the default.

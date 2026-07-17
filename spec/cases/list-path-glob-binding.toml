@@ -1,4 +1,4 @@
-# TDD §4.3's promise that a non-variadic `list<path>`/`list<str>` callee
+# site/content/internals/language-conformance-contract.md promise that a non-variadic `list<path>`/`list<str>` callee
 # param receives EVERY glob match as a list (desugar-more.toml's
 # `desugar2-list-path-glob-param-binds-only-first-match-not-a-list`
 # documents the pre-implementation gap via `skip`: the old word-binding

@@ -1,6 +1,6 @@
 # String literal forms: interpolating "…" escapes, raw '…' (no escapes),
 # triple """…"""/'''…''' multiline dedent, interpolation nesting.
-# Render expectations per CONTRACTS.md §3 (render_inline double-quotes,
+# Render expectations per site/content/internals/intercrate-protocol-contracts.md (render_inline double-quotes,
 # escaping control chars back to their two-char form).
 
 [[case]]
@@ -91,7 +91,7 @@ value = "5"
 
 [[case]]
 name = "str-lines-strips-crlf"
-# CONTRACTS/TDD §13.10: .lines() strips \r?\n.
+# site/content/internals/intercrate-protocol-contracts.md, site/content/internals/language-conformance-contract.md: .lines() strips \r?\n.
 src = "\"a\\r\\nb\".lines()"
 value = '["a", "b"]'
 
@@ -110,7 +110,7 @@ name = "str-compare-lexicographic"
 src = '"apple" < "banana"'
 value = "true"
 
-# --- string method hardening (CONTRACTS §3 value methods:
+# --- string method hardening (site/content/internals/intercrate-protocol-contracts.md value methods:
 # .words .chars .split .starts_with .ends_with .replace .parse_int
 # .parse_float .matches .match). Deterministic, spec-derived. ---
 

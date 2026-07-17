@@ -4,7 +4,7 @@
 # `[1,2,3].sum`. A present field always WINS over a same-named method (user
 # data ahead of the stdlib), and when neither exists the error still names the
 # missing field. See crates/shoal-eval/src/expr_access.rs (`field_or_method`)
-# and docs/CONTRACTS.md §3.
+# and site/content/internals/intercrate-protocol-contracts.md.
 #
 # IMPORTANT — the fallback is deliberately NOT extended to RECORD receivers:
 # a record's field namespace is user-controlled, so a bare `.name` that misses

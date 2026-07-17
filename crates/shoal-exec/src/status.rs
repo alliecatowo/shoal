@@ -1,5 +1,5 @@
 //! Wait-status decoding: `WIFEXITED` / `WIFSIGNALED` via libc, and signal
-//! names per TDD §13.6 (never the shell-style `128+n` encoding).
+//! names per site/content/internals/language-conformance-contract.md (never the shell-style `128+n` encoding).
 
 use std::io;
 
@@ -45,7 +45,7 @@ pub(crate) fn waitpid_blocking(pid: libc::pid_t) -> io::Result<i32> {
 
 /// Blocking `waitpid` with `WUNTRACED`, so a child that *stops* (SIGTSTP /
 /// SIGSTOP — e.g. Ctrl-Z on its controlling terminal) is reported as a status
-/// change instead of blocking until the child terminates (TDD §4.7 job
+/// change instead of blocking until the child terminates (site/content/internals/language-conformance-contract.md job
 /// control). A stopped child is NOT reaped (it is still alive, suspended);
 /// callers distinguish the two via [`is_stopped`].
 pub(crate) fn waitpid_untraced(pid: libc::pid_t) -> io::Result<i32> {

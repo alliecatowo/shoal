@@ -4,7 +4,7 @@
 # pin a custom `-T` template whose exact field names/stability can't be
 # verified here, these subs stick to jj's own stable, well-known built-in
 # behaviors and keep the output as raw text lines (`list<str>`, not
-# further destructured) — honest per TDD §6 rather than a fabricated
+# further destructured) — honest per site/content/internals/language-conformance-contract.md rather than a fabricated
 # schema riding on an unverified template.
 [cmd.jj]
 bin = "jj"

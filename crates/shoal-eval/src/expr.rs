@@ -33,16 +33,16 @@ impl Evaluator {
             }
             Expr::Var { name, span } => {
                 // A name that isn't a variable but *is* a command resolves by
-                // invoking it zero-arg in value position (defect #5, §3.4).
+                // invoking it zero-arg in value position (defect #5, site/content/internals/language-conformance-contract.md).
                 if let Some(v) = self.env.get(name) {
                     Ok(v)
                 } else if name == "now" {
-                    // Relative anchor (TDD §2.1): live wall-clock datetime.
+                    // Relative anchor (site/content/internals/language-conformance-contract.md): live wall-clock datetime.
                     Ok(Value::DateTime(Box::new(crate::helpers::now_zoned(
                         self.clock.as_ref(),
                     ))))
                 } else if name == "today" {
-                    // Relative anchor (TDD §2.1): today at midnight.
+                    // Relative anchor (site/content/internals/language-conformance-contract.md): today at midnight.
                     Ok(Value::DateTime(Box::new(crate::helpers::today_zoned(
                         self.clock.as_ref(),
                     ))))
@@ -124,7 +124,7 @@ impl Evaluator {
                 ..
             } => {
                 // Namespace constant access (`math.pi`, `config.<key>`): a
-                // namespace name that isn't shadowed by a binding (ROADMAP R2).
+                // namespace name that isn't shadowed by a binding (site/content/internals/roadmap-and-priorities.md).
                 if let Expr::Var { name: ns, .. } = &**recv
                     && self.env.get(ns).is_none()
                     && crate::namespaces::is_namespace(ns)
@@ -159,8 +159,8 @@ impl Evaluator {
                     let [Value::Str(secret_name)] = args.pos.as_slice() else {
                         return Err(ErrorVal::arg_error("secret.get expects one string name"));
                     };
-                    // Secret reads route through the SecretPort (docs/ROADMAP.md
-                    // R4). The default `StdSecret` resolves the same
+                    // Secret reads route through the SecretPort (site/content/internals/roadmap-and-priorities.md
+                    // (site/content/internals/effects-plans-security.md). The default `StdSecret` resolves the same
                     // `SHOAL_SECRET_DIR`/`XDG_DATA_HOME`/`HOME` directory and
                     // opens the same `shoal_secret::SecretStore` as before.
                     let value = self
@@ -183,7 +183,7 @@ impl Evaluator {
                 }
                 // Namespace function call (`json.parse(s)`, `http.get(url)`,
                 // `os.platform()`, `math.sqrt(2)`): a namespace name not shadowed
-                // by a binding (ROADMAP R2). Handled here (not methods.rs) because
+                // by a binding (site/content/internals/roadmap-and-priorities.md). Handled here (not methods.rs) because
                 // several members reach the evaluator (session env, network, cwd).
                 if let Expr::Var { name: ns, .. } = &**recv
                     && self.env.get(ns).is_none()
@@ -201,12 +201,12 @@ impl Evaluator {
                 }
             }
             Expr::FnCall { name, args, .. } => {
-                // Structured builtins that take closures/thunks (§5).
+                // Structured builtins that take closures/thunks (site/content/internals/language-conformance-contract.md).
                 match name.as_str() {
                     "parallel" => return self.builtin_parallel(args),
                     "retry" => return self.builtin_retry(args),
                     "on" => return self.builtin_on(args),
-                    // Relative anchors as functions (TDD §2.1): `now()`/`today()`.
+                    // Relative anchors as functions (site/content/internals/language-conformance-contract.md): `now()`/`today()`.
                     "now" if args.pos.is_empty() && args.named.is_empty() => {
                         return Ok(Value::DateTime(Box::new(crate::helpers::now_zoned(
                             self.clock.as_ref(),
@@ -359,7 +359,7 @@ impl Evaluator {
         result.map_err(|e| e.or_span(span))
     }
 
-    /// Evaluate an interpreter block (IO.md §2.6): resolve `tool` as a command
+    /// Evaluate an interpreter block (site/content/internals/values-streams-execution.md): resolve `tool` as a command
     /// and hand it `src` as its program via the tool's inline-eval convention
     /// (`lang_block_invocation`). `stdin` is whatever `.feed` supplies (or
     /// `Null` for a bare block) — it stays a separate channel from the program,
@@ -391,8 +391,9 @@ impl Evaluator {
     }
 }
 
-/// Map an interpreter-class tool to how its `src` program reaches it (IO.md
-/// §2.6 step 3): the argv tail after the resolved binary, plus `Some(bytes)`
+/// Map an interpreter-class tool to how its `src` program reaches it (see
+/// `site/content/internals/values-streams-execution.md`): the argv tail after
+/// the resolved binary, plus `Some(bytes)`
 /// when the program must instead go on stdin (the default for an
 /// interpreter-classed tool with no inline-eval flag). This is the *only* place
 /// a `-c`-shaped flag is spelled, and it is data, never typed by the user.

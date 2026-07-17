@@ -1,4 +1,4 @@
-# The complete coercion matrix of TDD §4.2 / CONTRACTS §3 (shoal-value's
+# The complete coercion matrix of site/content/internals/language-conformance-contract.md / site/content/internals/intercrate-protocol-contracts.md (shoal-value's
 # ops.rs is the authoritative reference for the arithmetic-promotion site;
 # it is explicitly documented as the complete matrix and is stable/pinned,
 # unlike shoal-eval/shoal-syntax which are mid-repair in this cycle).
@@ -199,7 +199,7 @@ name = "coerce-bool-plus-bool-is-error"
 src = "true + false"
 error = "type_error"
 
-# --- site 2: word binding (CMD-mode words coerced at call-bind, TDD §4.2.2) ---
+# --- site 2: word binding (CMD-mode words coerced at call-bind, site/content/internals/language-conformance-contract.md) ---
 [[case]]
 name = "word-bind-int-positional"
 src = "fn addn(a: int, b: int) { a + b }\naddn 2 3"
@@ -226,7 +226,7 @@ src = "fn showpath(p: path) { p.display() }\nshowpath a.txt"
 value = '"a.txt"'
 [[case]]
 name = "word-bind-glob-not-expanded"
-# a `glob`-typed param receives the compiled pattern, unexpanded (TDD §4.3).
+# a `glob`-typed param receives the compiled pattern, unexpanded (site/content/internals/language-conformance-contract.md).
 src = "fn showglob(g: glob) { g }\nshowglob *.txt"
 value = "*.txt"
 [[case]]
@@ -258,7 +258,7 @@ value = '"hello"'
 # call site (shoal-value/src/methods.rs numeric_unary/float_unary): int
 # receivers stay int (abs) or pass through unchanged (round/floor/ceil have
 # no effect on an already-integral value); float receivers compute and stay
-# float, rendered per CONTRACTS §3 (a whole-valued float still renders
+# float, rendered per site/content/internals/intercrate-protocol-contracts.md (a whole-valued float still renders
 # without a trailing ".0"). ---
 [[case]]
 name = "coerce-abs-negative-int-stays-int"

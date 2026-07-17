@@ -1,4 +1,4 @@
-//! Per-adapter fixture tests for the P2 adapter-pack expansion.
+//! Per-adapter fixture tests for the expanded adapter pack.
 //!
 //! Each test feeds `parse_output` **canned, realistic bytes** shaped like
 //! the real tool's actual output (no network, no requiring the real
@@ -7,7 +7,7 @@
 //! asserts the declared parse -> type combination genuinely holds. Each
 //! test also feeds a malformed/truncated variant of the same shape and
 //! asserts the parse degrades to `None` (bytes + warning, not a lie) per
-//! TDD §6, rather than silently emitting corrupted structured data.
+//! site/content/internals/language-conformance-contract.md, rather than silently emitting corrupted structured data.
 
 use shoal_adapters::{AdapterCatalog, SubSpec, parse_output};
 use shoal_value::Value;

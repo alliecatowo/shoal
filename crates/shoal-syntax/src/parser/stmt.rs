@@ -1,5 +1,5 @@
-//! Program/statement control flow: the top-level `statement` dispatcher (TDD
-//! §3.1), the reserved-word statement forms (`let`/`export`/`fn`/`alias`/
+//! Program/statement control flow: the top-level `statement` dispatcher (see
+//! `site/content/internals/language-conformance-contract.md`), the reserved-word statement forms (`let`/`export`/`fn`/`alias`/
 //! `use`/`for`/`while`), block parsing, and the statement terminator check.
 
 use super::*;
@@ -8,7 +8,7 @@ impl<'s> Parser<'s> {
     pub(crate) fn statement(&mut self) -> ParseResult<Stmt> {
         let start = self.lx.skip_trivia(self.pos);
 
-        // REPL leading-`.` line: a postfix chain on `it` (§3.4). Excludes the
+        // REPL leading-`.` line: a postfix chain on `it` (site/content/internals/language-conformance-contract.md). Excludes the
         // `./`…`../` path forms, which are command heads.
         if self.repl && self.byte(start) == b'.' && !self.is_path_head(start) {
             let seed = Expr::Var {
@@ -29,7 +29,7 @@ impl<'s> Parser<'s> {
 
         let (t, s) = self.peek(Mode::Expr)?;
 
-        // §3.1 rule 1 — reserved-word constructs.
+        // site/content/internals/language-conformance-contract.md rule 1 — reserved-word constructs.
         if let Tok::Ident(k) = &t {
             match k.as_str() {
                 "let" | "var" => return self.let_stmt(false),
@@ -74,7 +74,7 @@ impl<'s> Parser<'s> {
                 return Ok(Stmt::Expr { expr, span });
             }
 
-            // Interpreter block (IO.md §2.3): an interpreter-class head
+            // Interpreter block (site/content/internals/values-streams-execution.md): an interpreter-class head
             // immediately followed by `{`/`'''` is a `LangBlock` expression, not
             // a command. A head in the set *without* a following block falls
             // through to normal command dispatch (`python script.py` still runs
@@ -100,7 +100,7 @@ impl<'s> Parser<'s> {
                 }
             }
 
-            // `env.NAME = v` — session environment write (TDD §4.6): the
+            // `env.NAME = v` — session environment write (site/content/internals/language-conformance-contract.md): the
             // assignment lvalue additionally accepts a single-hop `Field`
             // target rooted at `env`, checked with the same tolerant,
             // restore-on-mismatch lookahead as the bare-identifier case below
@@ -179,7 +179,7 @@ impl<'s> Parser<'s> {
                 let span = e.span();
                 return Ok(Stmt::Expr { expr: e, span });
             }
-            // TDD §13.16: `it`/`out` outside a REPL are parse errors — value
+            // site/content/internals/language-conformance-contract.md: `it`/`out` outside a REPL are parse errors — value
             // positions already raise this in `primary()`, but the bare
             // statement forms (`it`, `it + 1`) used to dispatch as a COMMAND
             // named `it` and only fail at runtime with `command not found`.
@@ -196,7 +196,7 @@ impl<'s> Parser<'s> {
             return self.command_stmt();
         }
 
-        // §3.1 rule 2 — a non-identifier head is always an EXPR statement.
+        // site/content/internals/language-conformance-contract.md rule 2 — a non-identifier head is always an EXPR statement.
         let e = self.expr(0)?;
         let sp = e.span();
         Ok(Stmt::Expr { expr: e, span: sp })
@@ -395,7 +395,7 @@ impl<'s> Parser<'s> {
             (Tok::Ident(x), _) if x == "in" => {}
             (_, s) => return Err(ParseError::new("expected `in`", s)),
         }
-        // The iterable is a full expr (TDD §3.1 `for pattern in expr block`);
+        // The iterable is a full expr (site/content/internals/language-conformance-contract.md `for pattern in expr block`);
         // the `{` that follows opens the loop body, not a trailing-block arg
         // on a bare call ending the iterable (e.g. `glob("*.md")`).
         let iter = self.expr_before_block()?;
