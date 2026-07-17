@@ -151,7 +151,7 @@ impl Evaluator {
                 // so its `let`s do not leak back into the caller session
                 // (`Env::clone` would share the same Arc'd scope and leak them).
                 // Via the one child constructor (HR-B1) it still inherits the
-                // full session context — leash/reef/config/ports/bus/session
+                // audited session context — leash/reef/config/ports/bus/session
                 // identity, which the old hand-copy here dropped for leash/reef
                 // (audit B1–B3) — plus the parent's cancellation so a host
                 // cancel interrupts the script.

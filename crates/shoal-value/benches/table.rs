@@ -26,7 +26,7 @@ use std::path::PathBuf;
 use criterion::{Criterion, criterion_group, criterion_main};
 use shoal_ast::Span;
 use shoal_value::methods::call_method;
-use shoal_value::{CallArgs, CallCtx, Record, VResult, Value};
+use shoal_value::{CallArgs, CallCtx, Fs, Record, StdFs, VResult, Value};
 
 /// Marker closures the real language would represent as `Value::Closure`; this
 /// bench-local `CallCtx` recognizes them by name and computes the Rust
@@ -56,6 +56,11 @@ impl CallCtx for BenchCallCtx {
 
     fn cwd(&self) -> PathBuf {
         PathBuf::from(".")
+    }
+
+    fn fs(&self) -> &dyn Fs {
+        static STD: StdFs = StdFs;
+        &STD
     }
 }
 

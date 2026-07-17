@@ -346,6 +346,10 @@ mod tests {
         fn cwd(&self) -> PathBuf {
             self.cwd.clone()
         }
+        fn fs(&self) -> &dyn Fs {
+            static STD: StdFs = StdFs;
+            &STD
+        }
     }
     fn c() -> C {
         C {
@@ -1044,26 +1048,28 @@ mod tests {
             std::fs::remove_dir_all(dir).unwrap();
         }
 
-        /// Pin that the default `CallCtx::fs()` is the real filesystem, so a
-        /// context that never injects a port stays byte-identical to the
-        /// pre-port `OpenOptions` behavior (the `save_and_append` test above
-        /// exercises the happy path through the default; this nails the default
-        /// specifically).
+        /// Pin the explicit ambient-authority choice: an embedding that wants
+        /// ordinary host behavior can return `StdFs`, but `CallCtx` provides no
+        /// implicit real-filesystem default.
         #[test]
-        fn default_call_ctx_fs_is_std_fs() {
-            struct Bare;
-            impl CallCtx for Bare {
+        fn call_ctx_can_explicitly_choose_std_fs() {
+            struct ExplicitStd;
+            impl CallCtx for ExplicitStd {
                 fn call_closure(&mut self, _f: &Value, _a: Vec<Value>) -> VResult<Value> {
                     unreachable!()
                 }
                 fn cwd(&self) -> PathBuf {
                     std::env::temp_dir()
                 }
+                fn fs(&self) -> &dyn Fs {
+                    static STD: StdFs = StdFs;
+                    &STD
+                }
             }
-            let dir = std::env::temp_dir().join(format!("shoal-lanec-def-{}", std::process::id()));
+            let dir = std::env::temp_dir().join(format!("shoal-lanec-std-{}", std::process::id()));
             std::fs::create_dir_all(&dir).unwrap();
             let p = dir.join("real.txt");
-            Bare.fs().write(&p, b"on disk").unwrap();
+            ExplicitStd.fs().write(&p, b"on disk").unwrap();
             assert_eq!(std::fs::read_to_string(&p).unwrap(), "on disk");
             std::fs::remove_dir_all(dir).unwrap();
         }

@@ -12,13 +12,13 @@
 //! so a command a policy forbids foreground could run unconfined inside a
 //! `spawn`/`parallel`/handler/script.
 //!
-//! [`ChildContext`] captures the *whole* inheritable session context in one
-//! place ([`Evaluator::child_context`]) and re-applies it in one place
+//! [`ChildContext`] captures the explicitly enumerated inheritable session
+//! context in one place ([`Evaluator::child_context`]) and re-applies it in one place
 //! ([`ChildContext::build`], which destructures the struct so the compiler
-//! forces every captured field to be handled). Adding a new inheritable field
-//! is therefore a two-line edit at exactly these two sites, not a hunt across
-//! four call sites — and forgetting to *re-apply* a captured field is a compile
-//! error, not a silent security regression.
+//! forces every *captured* field to be handled). Adding an `Evaluator` field
+//! still requires a deliberate inheritance audit: Rust cannot infer that the
+//! new field belongs in this separate struct. Once captured, forgetting to
+//! re-apply it is a compile error rather than silent route-by-route drift.
 //!
 //! Fields that are deliberately NOT inherited (a child gets fresh state) are
 //! documented inline in [`ChildContext::build`], each with the rule for why.
@@ -38,11 +38,11 @@ pub(crate) enum ChildScope {
     Fresh,
 }
 
-/// A snapshot of every inheritable session capability, captured from a parent
-/// [`Evaluator`] via [`Evaluator::child_context`] and consumed exactly once by
-/// [`ChildContext::build`] to construct a child. All fields are cheap to clone
-/// (`Arc` handles or small owned data) and `Send`, so the context can be moved
-/// into a worker thread and built there.
+/// A snapshot of the explicitly audited inheritable session capabilities,
+/// captured from a parent [`Evaluator`] via [`Evaluator::child_context`] and
+/// consumed exactly once by [`ChildContext::build`] to construct a child. All
+/// fields are cheap to clone (`Arc` handles or small owned data) and `Send`, so
+/// the context can be moved into a worker thread and built there.
 pub(crate) struct ChildContext {
     cwd: PathBuf,
     env: Env,
@@ -67,7 +67,7 @@ pub(crate) struct ChildContext {
 }
 
 impl Evaluator {
-    /// Capture the full inheritable session context for a child evaluator (the
+    /// Capture the audited inheritable session context for a child evaluator (the
     /// ONLY supported way to seed a child — see [`ChildContext`]). Cheap: `Arc`
     /// clones plus small owned data. The returned context is `Send`, so a route
     /// may move it into a worker thread and call [`ChildContext::build`] there.
@@ -105,7 +105,7 @@ impl ChildContext {
     /// batch) or a FRESH token wired to a spawned task's cancel hook
     /// (`spawn`/`on`, so cancelling the task cancels its child).
     ///
-    /// Every OTHER inherited capability is applied here by construction: the
+    /// Every OTHER captured capability is applied here by construction: the
     /// method destructures the whole [`ChildContext`], so the compiler rejects
     /// any captured field that is not re-applied to the child.
     pub(crate) fn build(self, scope: ChildScope, cancel: CancelToken) -> Evaluator {
@@ -169,10 +169,13 @@ impl ChildContext {
         child.principal = principal;
 
         // --- Deliberately NOT inherited (fresh state per child) ------------
-        // journal handle:  `Journal` is single-handle / not `Sync`; sharing it
-        //                  across a worker thread is unsound. A child journals
-        //                  nothing (`None`), but keeps the parent's session_id/
-        //                  principal so any attribution it does derive matches.
+        // journal handle:  the current `Journal` is an owned, single-connection
+        //                  handle and is not part of ChildContext. The parent
+        //                  journals the outer `spawn`/`parallel`/`on`/`run`
+        //                  statement; children do not create nested entries.
+        //                  session_id/principal still propagate as attribution
+        //                  context. A future nested-journal design needs an
+        //                  explicit synchronized handle/factory and lifecycle.
         // interactive:     false — a child never owns the real terminal.
         // sink:            no competing mutable renderer; a child returns its
         //                  value through its task/return channel, not a sink.
@@ -185,5 +188,75 @@ impl ChildContext {
         //                  echo default rather than adopting a host's Quiet mode
         //                  (inheriting it would change script rendering).
         child
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shoal_reef::provider::SystemProvider;
+    use shoal_reef::{LockEntry, ManifestKind, ReefManifest, Resolver, ScopeChain, ScopeEntry};
+
+    #[test]
+    fn child_context_copies_reef_state_and_journal_attribution_explicitly() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut parent = Evaluator::new(dir.path().to_path_buf());
+        parent.set_journal(
+            shoal_journal::Journal::in_memory().unwrap(),
+            "session-a",
+            "agent:auditor",
+        );
+        parent.reef_lock.insert(LockEntry {
+            name: "fixture".into(),
+            version: "1.0.0".into(),
+            provider: "system".into(),
+            path: dir.path().join("fixture"),
+            blake3: "deadbeef".into(),
+            resolved_at: "2026-07-16T00:00:00Z".into(),
+        });
+        parent.reef_lock_path = Some(dir.path().join("reef.lock"));
+        parent.reef_user_manifest = Some(dir.path().join("shoal.toml"));
+        let scope = ScopeEntry {
+            kind: ManifestKind::Reef,
+            source: dir.path().join(".reef.toml"),
+            manifest: ReefManifest::parse_reef("[tools]\nfixture = \"*\"\n").unwrap(),
+            mtime: None,
+        };
+        parent.reef_chain = Some((
+            dir.path().to_path_buf(),
+            ScopeChain {
+                cwd: dir.path().to_path_buf(),
+                scopes: vec![scope.clone()],
+            },
+        ));
+        parent.reef_overrides.push(scope.clone());
+        let resolver = Arc::new(Resolver::new(vec![Box::new(SystemProvider::new(
+            vec![dir.path().join("bin")],
+            vec![],
+        ))]));
+        parent.reef_resolver = Some(resolver.clone());
+
+        let child = parent
+            .child_context()
+            .build(ChildScope::Fresh, CancelToken::new());
+
+        assert_eq!(child.session_id, "session-a");
+        assert_eq!(child.principal, "agent:auditor");
+        assert!(
+            !child.has_journal(),
+            "the outer parent statement owns journaling; nested entries are not implied"
+        );
+        assert_eq!(child.reef_lock, parent.reef_lock);
+        assert_eq!(child.reef_lock_path, parent.reef_lock_path);
+        assert_eq!(child.reef_user_manifest, parent.reef_user_manifest);
+        let (_, child_chain) = child.reef_chain.as_ref().unwrap();
+        assert_eq!(child_chain.scopes.len(), 1);
+        assert_eq!(child_chain.scopes[0].source, scope.source);
+        assert_eq!(child.reef_overrides.len(), 1);
+        assert_eq!(child.reef_overrides[0].source, scope.source);
+        assert!(Arc::ptr_eq(
+            child.reef_resolver.as_ref().unwrap(),
+            &resolver
+        ));
     }
 }

@@ -374,6 +374,10 @@ mod tests {
         fn cwd(&self) -> PathBuf {
             std::env::temp_dir()
         }
+        fn fs(&self) -> &dyn Fs {
+            static STD: StdFs = StdFs;
+            &STD
+        }
     }
 
     /// An endless-MARKED in-memory source: exercises the live-fork tee path

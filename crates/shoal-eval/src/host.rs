@@ -126,7 +126,7 @@ impl Evaluator {
         let mut handles = Vec::new();
         for f in a.pos {
             // The one authoritative child constructor (HR-B1): each `parallel`
-            // closure runs in a child that inherits the full session context —
+            // closure runs in a child that inherits the audited session context —
             // leash policy/principal, reef state, config, all effect ports, the
             // event bus, and session identity. The old hand-copy here shared
             // only ports (dropping leash, reef, config, and the bus), so a

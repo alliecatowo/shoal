@@ -358,7 +358,7 @@ impl Evaluator {
         task.on_cancel(Box::new(move || hook_cancel.cancel()));
         let worker = task.clone();
         // The one authoritative child constructor (HR-B1): the handler task runs
-        // in a child that inherits the full session context — leash policy/
+        // in a child that inherits the audited session context — leash policy/
         // principal, reef state, config, all effect ports, the event bus, and
         // session identity. The old hand-copy shared only the ports and bus,
         // dropping leash/reef/config (audit B1–B4). `Inherit` scope: the handler
