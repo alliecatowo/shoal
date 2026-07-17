@@ -132,7 +132,7 @@ fn validate_channel_name(channel: &str) -> Result<(), RpcError> {
             data: Some(json!({
                 "limit":"event_channel_name",
                 "max_bytes":EVENT_CHANNEL_MAX_BYTES,
-                "channel":channel,
+                "actual_bytes":channel.len(),
             })),
         });
     }
@@ -1695,13 +1695,24 @@ mod tests {
         let invalid = kernel
             .handle_events_publish(
                 json!({
-                    "channel":format!("user.{}", "x".repeat(EVENT_CHANNEL_MAX_BYTES)),
+                    "channel":format!("user.{}", "x".repeat(1024 * 1024)),
                     "payload":null,
                 }),
                 &mut attached,
             )
             .expect_err("long channel identity must be rejected");
-        assert_eq!(invalid.data.unwrap()["limit"], "event_channel_name");
+        let invalid_data = invalid.data.unwrap();
+        assert_eq!(invalid_data["limit"], "event_channel_name");
+        assert_eq!(invalid_data["actual_bytes"], "user.".len() + 1024 * 1024);
+        assert_eq!(
+            invalid_data.get("channel"),
+            None,
+            "invalid names must not be cloned into error responses"
+        );
+        assert!(
+            serde_json::to_vec(&invalid_data).unwrap().len() < 1024,
+            "hostile name rejection must stay far below the frame wall"
+        );
         assert_eq!(kernel.events.channels.user_identity_count(&owner), 0);
     }
 
