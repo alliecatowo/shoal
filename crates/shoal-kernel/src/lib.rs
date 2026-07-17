@@ -41,7 +41,6 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 pub struct Kernel {
     sessions: SessionRegistry,
     connections: ConnectionRegistry,
-    max_ptys_per_session: AtomicUsize,
     max_subscriptions_per_session: AtomicUsize,
     journal: Mutex<Journal>,
     /// The per-user state dir this kernel's own `journal` (above) was opened
@@ -63,9 +62,7 @@ pub struct Kernel {
     /// `pty:{id}` ref like `tasks`. Each holds a live child on a real PTY plus
     /// its `vt100` emulator; scoped to the session that opened it. Dropped (and
     /// so terminated + reaped) on `pty.close` or when the kernel is dropped.
-    ptys: Mutex<HashMap<Ref, Arc<PtyEntry>>>,
-    pty_slots: Arc<SessionQuota>,
-    next_pty: AtomicU64,
+    ptys: PtyRegistry,
     auth: Option<Mutex<TokenStore>>,
     events: Arc<EventBus>,
     /// Whether a plan's requester may acknowledge its own plan via
@@ -306,7 +303,6 @@ impl Drop for QuotaPermit {
     }
 }
 
-const MAX_TERMINAL_PTYS_PER_SESSION: usize = 64;
 const PLAN_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 const MAX_STORED_PLANS_PER_OWNER: usize = 256;
 const MAX_PLAN_SOURCE_BYTES_PER_OWNER: usize = 64 * 1024 * 1024;
@@ -404,7 +400,6 @@ impl Kernel {
                 limits.max_connections,
                 limits.frame_read_timeout_ms,
             ),
-            max_ptys_per_session: AtomicUsize::new(limits.max_ptys_per_session),
             max_subscriptions_per_session: AtomicUsize::new(limits.max_subscriptions_per_session),
             journal: Mutex::new(Journal::in_memory().expect("in-memory journal")),
             state_dir: None,
@@ -412,9 +407,7 @@ impl Kernel {
             plans: Mutex::new(HashMap::new()),
             next_plan: AtomicU64::new(1),
             tasks: TaskRegistry::new(limits.max_tasks_per_session),
-            ptys: Mutex::new(HashMap::new()),
-            pty_slots: Arc::new(SessionQuota::default()),
-            next_pty: AtomicU64::new(1),
+            ptys: PtyRegistry::new(limits.max_ptys_per_session),
             events: Arc::new(EventBus::default()),
             auth: None,
             allow_self_ack: AtomicBool::new(self_ack_from_env()),
@@ -442,7 +435,6 @@ impl Kernel {
                 limits.max_connections,
                 limits.frame_read_timeout_ms,
             ),
-            max_ptys_per_session: AtomicUsize::new(limits.max_ptys_per_session),
             max_subscriptions_per_session: AtomicUsize::new(limits.max_subscriptions_per_session),
             journal: Mutex::new(journal),
             state_dir: Some(state_dir.to_path_buf()),
@@ -450,9 +442,7 @@ impl Kernel {
             plans: Mutex::new(HashMap::new()),
             next_plan: AtomicU64::new(1),
             tasks: TaskRegistry::new(limits.max_tasks_per_session),
-            ptys: Mutex::new(HashMap::new()),
-            pty_slots: Arc::new(SessionQuota::default()),
-            next_pty: AtomicU64::new(1),
+            ptys: PtyRegistry::new(limits.max_ptys_per_session),
             events: Arc::new(events),
             auth: Some(Mutex::new(TokenStore::open(state_dir.join("tokens.json"))?)),
             allow_self_ack: AtomicBool::new(self_ack_from_env()),
@@ -477,7 +467,6 @@ impl Kernel {
                 limits.max_connections,
                 limits.frame_read_timeout_ms,
             ),
-            max_ptys_per_session: AtomicUsize::new(limits.max_ptys_per_session),
             max_subscriptions_per_session: AtomicUsize::new(limits.max_subscriptions_per_session),
             journal: Mutex::new(journal),
             state_dir: Some(state_dir.to_path_buf()),
@@ -485,9 +474,7 @@ impl Kernel {
             plans: Mutex::new(HashMap::new()),
             next_plan: AtomicU64::new(1),
             tasks: TaskRegistry::new(limits.max_tasks_per_session),
-            ptys: Mutex::new(HashMap::new()),
-            pty_slots: Arc::new(SessionQuota::default()),
-            next_pty: AtomicU64::new(1),
+            ptys: PtyRegistry::new(limits.max_ptys_per_session),
             events: Arc::new(events),
             auth: Some(Mutex::new(TokenStore::open(state_dir.join("tokens.json"))?)),
             allow_self_ack: AtomicBool::new(self_ack_from_env()),
@@ -504,7 +491,6 @@ impl Kernel {
                 limits.max_connections,
                 limits.frame_read_timeout_ms,
             ),
-            max_ptys_per_session: AtomicUsize::new(limits.max_ptys_per_session),
             max_subscriptions_per_session: AtomicUsize::new(limits.max_subscriptions_per_session),
             journal: Mutex::new(Journal::in_memory().expect("in-memory journal")),
             state_dir: None,
@@ -512,9 +498,7 @@ impl Kernel {
             plans: Mutex::new(HashMap::new()),
             next_plan: AtomicU64::new(1),
             tasks: TaskRegistry::new(limits.max_tasks_per_session),
-            ptys: Mutex::new(HashMap::new()),
-            pty_slots: Arc::new(SessionQuota::default()),
-            next_pty: AtomicU64::new(1),
+            ptys: PtyRegistry::new(limits.max_ptys_per_session),
             events: Arc::new(EventBus::default()),
             auth: None,
             allow_self_ack: AtomicBool::new(self_ack_from_env()),
@@ -527,8 +511,7 @@ impl Kernel {
         self.connections
             .configure(limits.max_connections, limits.frame_read_timeout_ms);
         self.tasks.configure(limits.max_tasks_per_session);
-        self.max_ptys_per_session
-            .store(limits.max_ptys_per_session, Ordering::Relaxed);
+        self.ptys.configure(limits.max_ptys_per_session);
         self.max_subscriptions_per_session
             .store(limits.max_subscriptions_per_session, Ordering::Relaxed);
     }
@@ -645,17 +628,7 @@ impl Kernel {
     /// calling session (an unknown ref and another session's ref are the same
     /// opaque not-found, mirroring `task`).
     fn pty(&self, pty_id: &Ref, owner: &OwnerKey) -> Result<Arc<PtyEntry>, RpcError> {
-        let entry = self
-            .ptys
-            .lock()
-            .unwrap()
-            .get(pty_id)
-            .cloned()
-            .ok_or_else(unknown_pty)?;
-        if &entry.owner != owner {
-            return Err(unknown_pty());
-        }
-        Ok(entry)
+        self.ptys.get_owned(pty_id, owner)
     }
 
     /// Atomically remove an owned PTY. A lookup followed by a separate remove
@@ -663,13 +636,7 @@ impl Kernel {
     /// the removed Arc also ensures teardown happens after the registry guard
     /// is gone.
     fn take_pty(&self, pty_id: &Ref, owner: &OwnerKey) -> Result<Arc<PtyEntry>, RpcError> {
-        let mut ptys = self.ptys.lock().unwrap();
-        if !ptys.get(pty_id).is_some_and(|entry| &entry.owner == owner) {
-            return Err(unknown_pty());
-        }
-        Ok(ptys
-            .remove(pty_id)
-            .expect("owned PTY observed under the same registry lock"))
+        self.ptys.take_owned(pty_id, owner)
     }
 
     fn reap_finished_tasks(&self, owner: &OwnerKey) {
@@ -680,44 +647,7 @@ impl Kernel {
     /// retained final-screen records. Snapshot first so registry and per-PTY
     /// locks are never held together.
     fn reap_terminal_ptys(&self, owner: &OwnerKey) {
-        let entries = self
-            .ptys
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(_, entry)| &entry.owner == owner)
-            .map(|(pty_ref, entry)| (pty_ref.clone(), entry.clone()))
-            .collect::<Vec<_>>();
-        let mut terminal = entries
-            .into_iter()
-            .filter_map(|(pty_ref, entry)| {
-                let alive = entry.session.lock().unwrap().alive();
-                if !alive {
-                    entry.mark_terminal();
-                }
-                entry
-                    .terminal_since()
-                    .map(|terminal_since| (pty_ref, entry, terminal_since))
-            })
-            .collect::<Vec<_>>();
-        if terminal.len() <= MAX_TERMINAL_PTYS_PER_SESSION {
-            return;
-        }
-        terminal.sort_unstable_by_key(|(_, _, terminal_since)| *terminal_since);
-        let remove = terminal.len() - MAX_TERMINAL_PTYS_PER_SESSION;
-        let removed = {
-            let mut ptys = self.ptys.lock().unwrap();
-            terminal
-                .into_iter()
-                .take(remove)
-                .filter_map(|(pty_ref, observed, _)| {
-                    ptys.get(&pty_ref)
-                        .is_some_and(|current| Arc::ptr_eq(current, &observed))
-                        .then(|| ptys.remove(&pty_ref).expect("PTY was just observed"))
-                })
-                .collect::<Vec<_>>()
-        };
-        drop(removed);
+        self.ptys.reap_terminal(owner);
     }
 
     /// The real enforcement truth for `principal` (site/content/internals/language-conformance-contract.md tier honesty):
@@ -1914,14 +1844,14 @@ mod tests {
             .unwrap();
         let pty_ref: Ref = serde_json::from_value(opened["pty_id"].clone()).unwrap();
         let deadline = Instant::now() + std::time::Duration::from_secs(5);
-        while kernel.pty_slots.counts.lock().unwrap().contains_key(&owner) {
+        while kernel.ptys.active_for(&owner) {
             assert!(
                 Instant::now() < deadline,
                 "PTY watcher did not release quota"
             );
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        let retained = kernel.ptys.lock().unwrap().get(&pty_ref).cloned().unwrap();
+        let retained = kernel.ptys.get(&pty_ref).unwrap();
         let lifecycle = retained.lifecycle.lock().unwrap();
         assert!(lifecycle.active_slot.is_none());
         assert!(lifecycle.session_lease.is_none());

@@ -101,12 +101,7 @@ impl Kernel {
 
         let owner = session.key.owner();
         self.reap_terminal_ptys(&owner);
-        let active_slot = self.pty_slots.reserve(
-            &owner,
-            self.max_ptys_per_session.load(Ordering::Relaxed),
-            "ptys_per_session",
-            "PTY",
-        )?;
+        let active_slot = self.ptys.reserve(&owner)?;
 
         let pty_session = shoal_exec::PtySession::open(shoal_exec::PtyOpenSpec {
             argv,
@@ -127,8 +122,7 @@ impl Kernel {
         // `pty.read` still reports `changed:true`).
         let (cols, rows) = pty_session.size();
 
-        let pty_id = self.next_pty.fetch_add(1, Ordering::Relaxed);
-        let pty_ref = Ref::new("pty", pty_id);
+        let (pty_id, pty_ref) = self.ptys.allocate();
         let entry = Arc::new(PtyEntry {
             owner,
             cmd: display.clone(),
@@ -139,10 +133,7 @@ impl Kernel {
                 terminal_since: None,
             }),
         });
-        self.ptys
-            .lock()
-            .unwrap()
-            .insert(pty_ref.clone(), entry.clone());
+        self.ptys.insert(pty_ref.clone(), entry.clone());
 
         // A child may exit without another client request. A lightweight
         // watcher releases active quota and the session lease promptly; the
@@ -168,7 +159,7 @@ impl Kernel {
                 }
             })
         {
-            self.ptys.lock().unwrap().remove(&watched_ref);
+            self.ptys.remove(&watched_ref);
             let _ = entry.session.lock().unwrap().close();
             entry.mark_terminal();
             return Err(internal(error));
@@ -322,11 +313,9 @@ impl Kernel {
         // `PtyEntry::session` lock at once.
         let mut entries: Vec<(u64, Arc<PtyEntry>)> = self
             .ptys
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(_, entry)| entry.owner == owner)
-            .map(|(pty_ref, entry)| (pty_id_num(pty_ref), entry.clone()))
+            .snapshot_owner(&owner)
+            .into_iter()
+            .map(|(pty_ref, entry)| (pty_id_num(&pty_ref), entry))
             .collect();
         // Stable, ascending order (open order) so the list is deterministic.
         entries.sort_by_key(|(id, _)| *id);
