@@ -277,6 +277,7 @@ impl Session {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn insert_transcript(&self, value_ref: Ref, value: Value) {
         let _ = self.insert_transcript_checked(value_ref, value);
     }
