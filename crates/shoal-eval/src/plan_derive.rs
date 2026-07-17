@@ -635,12 +635,16 @@ impl Evaluator {
                     && Path::new(&name).extension().is_none() =>
             {
                 debug_assert_eq!(
-                    self.resolve_dynamic_run(&name).source,
+                    self.resolve_dynamic_run(&name, false).source,
                     CommandSource::External
                 );
                 self.plan_external_spawn(&name, out);
             }
             Some(name) => {
+                debug_assert_eq!(
+                    self.resolve_dynamic_run(&name, true).source,
+                    CommandSource::Runner
+                );
                 push_effect(
                     out,
                     Effect::FsRead {

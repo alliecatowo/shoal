@@ -163,6 +163,7 @@ impl ShoalCompleter {
                 value_eligible: false,
                 forced: false,
                 dynamic_run: false,
+                runner: false,
                 adapter: self.adapter_lookup(head).is_some(),
             },
         )

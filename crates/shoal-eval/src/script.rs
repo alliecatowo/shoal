@@ -133,11 +133,15 @@ impl Evaluator {
             e == "rs" || self.reef_chain_snapshot().runner_table().get(e).is_some()
         });
         if is_path || (scripty && resolved.exists()) {
+            debug_assert_eq!(
+                self.resolve_dynamic_run(&name, true).source,
+                shoal_syntax::commands::CommandSource::Runner
+            );
             return self.run_script_file(&resolved, ext.as_deref(), args, position);
         }
         // Dynamic command invocation (value semantics like any command).
         debug_assert_eq!(
-            self.resolve_dynamic_run(&name).source,
+            self.resolve_dynamic_run(&name, false).source,
             shoal_syntax::commands::CommandSource::External
         );
         let mut argv = vec![OsString::from(&name)];

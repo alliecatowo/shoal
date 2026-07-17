@@ -22,6 +22,7 @@ pub enum CommandSource {
     StructuredBuiltin,
     SpecialBuiltin,
     Script,
+    Runner,
     Adapter,
     External,
 }
@@ -34,6 +35,7 @@ impl CommandSource {
             Self::StructuredBuiltin => "structured_builtin",
             Self::SpecialBuiltin => "special_builtin",
             Self::Script => "script",
+            Self::Runner => "runner",
             Self::Adapter => "adapter",
             Self::External => "external",
         }
@@ -46,6 +48,7 @@ impl CommandSource {
             Self::StructuredBuiltin => "the head is a structured Shoal builtin",
             Self::SpecialBuiltin => "the head is a session or control builtin",
             Self::Script => "the head names a .shl script",
+            Self::Runner => "explicit run selected an interpreter for a script target",
             Self::Adapter => "an adapter schema claims the unforced head",
             Self::External => "no earlier layer won; resolve through Reef or PATH",
         }
@@ -61,6 +64,7 @@ pub const COMMAND_PRECEDENCE: &[CommandSource] = &[
     CommandSource::StructuredBuiltin,
     CommandSource::SpecialBuiltin,
     CommandSource::Script,
+    CommandSource::Runner,
     CommandSource::Adapter,
     CommandSource::External,
 ];
@@ -77,6 +81,8 @@ pub struct CommandFacts {
     /// `run(name, ...)` deliberately invokes an external command dynamically,
     /// bypassing lexical, builtin, script, and adapter dispatch.
     pub dynamic_run: bool,
+    /// The dynamic target is a script/path handled by runner or shebang logic.
+    pub runner: bool,
     pub adapter: bool,
 }
 
@@ -88,7 +94,11 @@ pub struct CommandFacts {
 /// value.
 pub fn resolve_command_source(name: &str, facts: CommandFacts) -> CommandSource {
     if facts.dynamic_run {
-        return CommandSource::External;
+        return if facts.runner {
+            CommandSource::Runner
+        } else {
+            CommandSource::External
+        };
     }
     if facts.session_callable {
         return CommandSource::SessionCallable;
@@ -231,6 +241,7 @@ mod tests {
                 CommandSource::StructuredBuiltin,
                 CommandSource::SpecialBuiltin,
                 CommandSource::Script,
+                CommandSource::Runner,
                 CommandSource::Adapter,
                 CommandSource::External,
             ]
@@ -244,6 +255,7 @@ mod tests {
             value_eligible: true,
             forced: true,
             dynamic_run: false,
+            runner: false,
             adapter: true,
             ..CommandFacts::default()
         };
@@ -275,6 +287,7 @@ mod tests {
             value_eligible: true,
             forced: false,
             dynamic_run: false,
+            runner: false,
             adapter: true,
         };
         assert_eq!(
@@ -347,9 +360,22 @@ mod tests {
                 value_eligible: true,
                 forced: false,
                 dynamic_run: true,
+                runner: false,
                 adapter: true,
             },
         );
         assert_eq!(source, CommandSource::External);
+
+        assert_eq!(
+            resolve_command_source(
+                "script.py",
+                CommandFacts {
+                    dynamic_run: true,
+                    runner: true,
+                    ..CommandFacts::default()
+                }
+            ),
+            CommandSource::Runner
+        );
     }
 }

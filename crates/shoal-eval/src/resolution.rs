@@ -32,13 +32,14 @@ impl Evaluator {
                 value_eligible,
                 forced,
                 dynamic_run: false,
+                runner: false,
                 adapter: self.host.adapters.lookup(head).is_some(),
             },
         );
         CommandResolution { source, binding }
     }
 
-    pub(crate) fn resolve_dynamic_run(&self, head: &str) -> CommandResolution {
+    pub(crate) fn resolve_dynamic_run(&self, head: &str, runner: bool) -> CommandResolution {
         let binding = self.exec.shell.env.get(head);
         let source = resolve_command_source(
             head,
@@ -48,6 +49,7 @@ impl Evaluator {
                 value_eligible: true,
                 forced: false,
                 dynamic_run: true,
+                runner,
                 adapter: self.host.adapters.lookup(head).is_some(),
             },
         );

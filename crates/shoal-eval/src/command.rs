@@ -982,6 +982,7 @@ impl Evaluator {
             | CommandSource::StructuredBuiltin
             | CommandSource::SpecialBuiltin
             | CommandSource::Script
+            | CommandSource::Runner
             | CommandSource::Adapter => return true,
             CommandSource::BoundValue => return false,
             CommandSource::External => {}
