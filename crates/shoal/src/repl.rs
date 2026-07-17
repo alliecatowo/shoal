@@ -11,10 +11,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use reedline::{
-    ColumnarMenu, DefaultHinter, EditMode, Emacs, FileBackedHistory, History, HistoryItem,
-    HistoryItemId, HistorySessionId, KeyCode, KeyModifiers, MenuBuilder, Reedline, ReedlineEvent,
-    ReedlineMenu, SearchDirection, SearchQuery, Signal, ValidationResult, Validator, Vi,
-    default_emacs_keybindings, default_vi_insert_keybindings, default_vi_normal_keybindings,
+    ColumnarMenu, DefaultHinter, FileBackedHistory, MenuBuilder, Reedline, ReedlineMenu, Signal,
+};
+#[cfg(test)]
+use reedline::{
+    History, HistoryItem, KeyCode, KeyModifiers, ReedlineEvent, SearchDirection, SearchQuery,
 };
 use shoal_ast::{CmdArg, Expr, Program, Stmt, UnOp};
 use shoal_eval::Evaluator;
@@ -29,7 +30,12 @@ use crate::prompt;
 use crate::repl_state::{ProtocolSnapshot, RemoteEnvMirror};
 use crate::{format_parse_error, maybe_strip, no_color, report_eval_error};
 
+mod editor;
 mod rendering;
+
+use editor::{FilteredHistory, ShoalValidator, build_edit_mode, history_path};
+#[cfg(test)]
+use editor::{glob_match, input_is_incomplete};
 
 pub(crate) use rendering::{PagerContext, print_value, render_result, render_result_paged};
 #[cfg(test)]
@@ -507,151 +513,6 @@ pub(crate) fn repl(standalone: bool) -> Result<i32, String> {
     }
 }
 
-/// Build the reedline edit mode for `config.editor.mode` (see
-/// `site/content/internals/prompt-editor-lsp.md`): `"emacs"` or `"vi"` — shoal-config's semantic validation already
-/// rejects anything else (site/content/internals/prompt-editor-lsp.md), but this defensively falls back to emacs for
-/// any other value rather than panicking, since a `Config` can also be built
-/// directly (tests, an embedder) bypassing that validation. Tab always
-/// drives the completion menu regardless of mode. `[editor.keybindings]`
-/// custom chords (site/content/internals/prompt-editor-lsp.md) are layered on top of whichever mode's own default
-/// table(s) are in play — both the insert and normal tables in vi mode,
-/// since the config schema draws no per-mode distinction.
-fn build_edit_mode(
-    config: &shoal_config::Config,
-    custom: &[crate::keybindings::ParsedBinding],
-) -> Box<dyn EditMode> {
-    let tab_event = ReedlineEvent::UntilFound(vec![
-        ReedlineEvent::Menu("completion_menu".to_string()),
-        ReedlineEvent::MenuNext,
-    ]);
-    if config.editor.mode == "vi" {
-        let mut insert = default_vi_insert_keybindings();
-        let mut normal = default_vi_normal_keybindings();
-        insert.add_binding(KeyModifiers::NONE, KeyCode::Tab, tab_event);
-        for b in custom {
-            insert.add_binding(b.modifiers, b.code, b.event.clone());
-            normal.add_binding(b.modifiers, b.code, b.event.clone());
-        }
-        Box::new(Vi::new(insert, normal))
-    } else {
-        let mut kb = default_emacs_keybindings();
-        kb.add_binding(KeyModifiers::NONE, KeyCode::Tab, tab_event);
-        for b in custom {
-            kb.add_binding(b.modifiers, b.code, b.event.clone());
-        }
-        Box::new(Emacs::new(kb))
-    }
-}
-
-/// `history.dedup`/`history.ignore` (site/content/internals/configuration-reference.md): a `History` adapter
-/// that wraps a real backend (here, `FileBackedHistory`) and filters what
-/// actually reaches `save` — neither knob has any built-in support in
-/// reedline's history backends. Every other `History` method delegates
-/// straight through; only `save` has filtering logic.
-struct FilteredHistory {
-    inner: Box<dyn History>,
-    dedup: bool,
-    ignore: Vec<String>,
-    last_recorded: Option<String>,
-}
-
-impl FilteredHistory {
-    fn new(inner: Box<dyn History>, dedup: bool, ignore: Vec<String>) -> Self {
-        // Seed from the most recent entry already on disk (if any), so
-        // `dedup` also catches "identical to the last line of the *previous*
-        // session" on a fresh process start, not just within this session.
-        let last_recorded = inner
-            .search(SearchQuery::everything(SearchDirection::Backward, None))
-            .ok()
-            .and_then(|rows| rows.into_iter().next())
-            .map(|item| item.command_line);
-        Self {
-            inner,
-            dedup,
-            ignore,
-            last_recorded,
-        }
-    }
-
-    fn should_skip(&self, line: &str) -> bool {
-        if self.dedup && self.last_recorded.as_deref() == Some(line) {
-            return true;
-        }
-        self.ignore.iter().any(|pattern| glob_match(pattern, line))
-    }
-}
-
-impl History for FilteredHistory {
-    fn save(&mut self, h: HistoryItem) -> reedline::Result<HistoryItem> {
-        if self.should_skip(&h.command_line) {
-            // Pretend it was handled without actually persisting a
-            // duplicate/ignored entry — the caller (`Reedline::submit_buffer`)
-            // just records whatever id comes back for its own bookkeeping.
-            return Ok(h);
-        }
-        self.last_recorded = Some(h.command_line.clone());
-        self.inner.save(h)
-    }
-    fn load(&self, id: HistoryItemId) -> reedline::Result<HistoryItem> {
-        self.inner.load(id)
-    }
-    fn count(&self, query: SearchQuery) -> reedline::Result<i64> {
-        self.inner.count(query)
-    }
-    fn search(&self, query: SearchQuery) -> reedline::Result<Vec<HistoryItem>> {
-        self.inner.search(query)
-    }
-    fn update(
-        &mut self,
-        id: HistoryItemId,
-        updater: &dyn Fn(HistoryItem) -> HistoryItem,
-    ) -> reedline::Result<()> {
-        self.inner.update(id, updater)
-    }
-    fn clear(&mut self) -> reedline::Result<()> {
-        self.inner.clear()
-    }
-    fn delete(&mut self, h: HistoryItemId) -> reedline::Result<()> {
-        self.inner.delete(h)
-    }
-    fn sync(&mut self) -> io::Result<()> {
-        self.inner.sync()
-    }
-    fn session(&self) -> Option<HistorySessionId> {
-        self.inner.session()
-    }
-}
-
-/// Minimal shell-glob matcher for `history.ignore` patterns (the
-/// `HISTIGNORE`-equivalent in `site/content/internals/prompt-editor-lsp.md`): `*` matches any run of characters
-/// (including none), `?` matches exactly one; every other character matches
-/// itself literally. `shoal-config` only carries the raw pattern strings
-/// (its own doc comment: "matching semantics are the host's") — this is this
-/// host's choice, deliberately the simplest thing that reads like a shell
-/// pattern rather than a full regex engine.
-fn glob_match(pattern: &str, text: &str) -> bool {
-    let pat: Vec<char> = pattern.chars().collect();
-    let txt: Vec<char> = text.chars().collect();
-    // Classic DP: `dp[i][j]` = pattern[..i] matches text[..j].
-    let mut dp = vec![vec![false; txt.len() + 1]; pat.len() + 1];
-    dp[0][0] = true;
-    for i in 1..=pat.len() {
-        if pat[i - 1] == '*' {
-            dp[i][0] = dp[i - 1][0];
-        }
-    }
-    for i in 1..=pat.len() {
-        for j in 1..=txt.len() {
-            dp[i][j] = match pat[i - 1] {
-                '*' => dp[i - 1][j] || dp[i][j - 1],
-                '?' => dp[i - 1][j - 1],
-                c => dp[i - 1][j - 1] && c == txt[j - 1],
-            };
-        }
-    }
-    dp[pat.len()][txt.len()]
-}
-
 /// Principal/session recorded on the REPL's own journal entries (site/content/internals/language-conformance-contract.md). A
 /// fixed, stable pair — the interactive REPL is always exactly one local
 /// human session — so `latest_entry_id`'s `principal` filter is deterministic.
@@ -972,97 +833,6 @@ fn parse_ctx_for(env: &Env) -> ParseCtx {
         value_bound,
         cmd_bound,
     }
-}
-
-fn history_path() -> Option<PathBuf> {
-    Some(
-        shoal_paths::ShoalPaths::discover()
-            .state_dir()
-            .join("history.txt"),
-    )
-}
-
-struct ShoalValidator;
-
-impl Validator for ShoalValidator {
-    fn validate(&self, line: &str) -> ValidationResult {
-        if input_is_incomplete(line) {
-            ValidationResult::Incomplete
-        } else {
-            ValidationResult::Complete
-        }
-    }
-}
-
-fn input_is_incomplete(src: &str) -> bool {
-    let mut stack = Vec::new();
-    let chars: Vec<char> = src.chars().collect();
-    let mut quote: Option<(char, bool)> = None;
-    let mut escaped = false;
-    let mut comment = false;
-    let mut index = 0;
-    while index < chars.len() {
-        let ch = chars[index];
-        if comment {
-            if ch == '\n' {
-                comment = false;
-            }
-            index += 1;
-            continue;
-        }
-        if let Some((q, triple)) = quote {
-            if triple
-                && ch == q
-                && chars.get(index + 1) == Some(&q)
-                && chars.get(index + 2) == Some(&q)
-            {
-                quote = None;
-                index += 3;
-                continue;
-            }
-            if !triple && q == '"' && ch == '\\' && !escaped {
-                escaped = true;
-                index += 1;
-                continue;
-            }
-            if !triple && ch == q && !escaped {
-                quote = None;
-            }
-            escaped = false;
-            index += 1;
-            continue;
-        }
-        match ch {
-            '#' => comment = true,
-            '\'' | '"' => {
-                let triple = chars.get(index + 1) == Some(&ch) && chars.get(index + 2) == Some(&ch);
-                quote = Some((ch, triple));
-                if triple {
-                    index += 2;
-                }
-            }
-            '(' | '[' | '{' => stack.push(ch),
-            ')' if stack.last() == Some(&'(') => {
-                stack.pop();
-            }
-            ']' if stack.last() == Some(&'[') => {
-                stack.pop();
-            }
-            '}' if stack.last() == Some(&'{') => {
-                stack.pop();
-            }
-            _ => {}
-        }
-        index += 1;
-    }
-    if quote.is_some() || !stack.is_empty() {
-        return true;
-    }
-    let tail = src.trim_end();
-    tail.ends_with('\\')
-        || ["&&", "||", "??", "+", "-", "*", "/", "%", "=", ",", "."]
-            .iter()
-            .any(|operator| tail.ends_with(operator))
 }
 
 #[cfg(test)]
