@@ -198,8 +198,11 @@ Rules for implementers:
   — shipped: sequential semantics (interleaving is unimplementable under the sync pull model
   without a per-substream pump, and the corpus already pins sequential order); docs state it
   explicitly and `stream-flat-map-substreams-drain-sequentially` discriminates the order.
-- [ ] **HR-G3** — In-language subscriber queues are bounded with a defined overflow policy that
+- [x] **HR-G3** — In-language subscriber queues are bounded with a defined overflow policy that
   matches the documented backpressure story. *(I4)*
+  — shipped: `sync_channel(replayed + 256)` per subscriber; replay never dropped; live overflow
+  drops-newest with a coalesced in-order `{channel, seq, ts, payload: null, dropped: n}` marker
+  (`seq` = newest dropped, a `since:` cursor); publishers never block.
 - [ ] **HR-G4** — Cancelling an `on(channel, handler)` task interrupts a blocking `recv`
   (timeout, close, or wakeup token); no permanently stuck handler threads. *(I5)*
 - [x] **HR-G5** — `distinct` uses hashing (amortized O(1) membership); its memory behavior on

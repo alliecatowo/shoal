@@ -187,6 +187,8 @@ Event records have a common shape:
 
 Sequence numbers are monotonic per channel. Each channel retains its most recent 1,024 events. `events()` replays the current ring then goes live; `events(since: n)` replays only records with `seq > n`. If a cursor is older than the ring, evicted history cannot be recovered from the channel; persist it separately.
 
+Each live subscription buffers a bounded number of undelivered events (the replay prefix plus 256). Replay is always delivered whole. If a subscriber falls further behind, newer events are dropped for that subscriber — publishers never block — and the gap is reported in order by a single marker record `{channel, seq, ts, payload: null, dropped: n}` once the queue has room again. The marker's `seq` is the newest dropped event's sequence, so `events(since: seq)` recovers whatever the ring still retains of the gap. Distinguish markers from real events by the `dropped` field.
+
 `take()` subscribes without replay, so it sees only an event published after the call. A timeout raises `timeout` rather than returning null.
 
 ## Handlers and stream-to-channel bridges
