@@ -72,10 +72,19 @@ bare (`session.write`) forms. A declaration whose kind is outside the vocabulary
 dropped**: it plans as `Opaque` so an unrecognized adapter effect forces approval rather than
 vanishing from the plan.
 
-Derivation is intentionally conservative and fail-closed: every effectful language form is
-classified, and an unrecognized or unbounded form becomes an approval-requiring effect rather than
-an empty effect set. It is safer to require approval for an opaque program than to manufacture a
-precise-looking plan that omits a dynamic effect.
+Derivation is intentionally conservative and fail-closed. The AST walk is structurally exhaustive —
+a match over every statement and expression node with **no wildcard arm**, so a new syntax form
+cannot be added without classifying its effects. Concretely the walk covers: `use` (module `FsRead`
+plus `Opaque` for the module body), persistent `env.NAME = …` (`EnvWrite`), command redirects
+(`>`/`>>` → `FsWrite`, `< file` → `FsRead`), the method sinks `.save`/`.append` and the path reads
+`.read`/`.lines`/…, `.feed` (an **external** spawn of the fed command, matching the runtime's
+`run_argv` path rather than builtin dispatch), the effectful builtins `run`/`open`/`save` and the
+bodies of `spawn`/`parallel`/lambda arguments, and generic external commands (a concrete `ProcSpawn`
+with a resolved binary hash, consistent with adapter spawns). A call that cannot be statically
+expanded — a session-stored closure, or any unrecognized name — becomes an approval-requiring
+`Opaque` effect; an empty effect set is emitted only for forms that are provably effect-free
+(literals, pure constructors, and control-flow scaffolding). It is safer to require approval for an
+opaque program than to manufacture a precise-looking plan that omits a dynamic effect.
 
 Sources: [`plan_derive.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-eval/src/plan_derive.rs)
 and [`plan_effects.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-eval/src/plan_effects.rs).
