@@ -373,8 +373,20 @@ impl Evaluator {
             push_effect(out, Effect::Opaque);
             return Ok(());
         }
-        // Effectful heads the runtime intercepts before builtin/adapter dispatch
-        // (A8), mirroring `eval_command`'s special-head order.
+        // A bare word bound to a non-callable value resolves to that value at
+        // runtime (bound names dispatch as EXPR, `eval_command`) — a pure
+        // environment read, not a spawn.
+        if !call.forced
+            && call.args.is_empty()
+            && call.redirects.is_empty()
+            && call.env_prefix.is_empty()
+            && self.env.get(&call.head).is_some()
+        {
+            return Ok(());
+        }
+        // Heads the runtime intercepts before builtin/adapter dispatch (A8),
+        // mirroring `eval_command`'s special-head order — classified here so the
+        // external-spawn fallback below never claims a spawn they don't do.
         match call.head.as_str() {
             "open" => {
                 let path = call.args.first().and_then(|a| self.cmd_arg_path_literal(a));
@@ -395,6 +407,36 @@ impl Evaluator {
                 if let Some(p) = call.args.first().and_then(|a| self.cmd_arg_path_literal(a)) {
                     push_effect(out, Effect::FsRead { paths: vec![p] });
                 }
+                push_effect(out, Effect::Opaque);
+                return Ok(());
+            }
+            // Session-local reads/control: no external effect.
+            "jobs" | "dirs" | "assert" | "exit" | "quit" | "explain" => return Ok(()),
+            // Directory-stack mutation, like `cd`.
+            "pushd" | "popd" => {
+                push_effect(out, Effect::SessionWrite);
+                return Ok(());
+            }
+            // `plan` stores the derived program for a later `apply`.
+            "plan" => {
+                push_effect(out, Effect::SessionWrite);
+                return Ok(());
+            }
+            "journal" | "history" => {
+                push_effect(out, Effect::JournalRead);
+                return Ok(());
+            }
+            // `interact <cmd…>` spawns its command on a real PTY.
+            "interact" => {
+                match call.args.first().and_then(cmd_arg_str_literal) {
+                    Some(head) => self.plan_external_spawn(&head, out),
+                    None => push_effect(out, Effect::Opaque),
+                }
+                return Ok(());
+            }
+            // Unbounded session mutations: `undo` restores prior bytes, `apply`
+            // runs a stored program, `reef` mutates manifests/locks/fetches.
+            "undo" | "apply" | "reef" => {
                 push_effect(out, Effect::Opaque);
                 return Ok(());
             }
@@ -1030,6 +1072,46 @@ effects=["proc.spawn(container)", "net.connect(registry:443)", "quantum.entangle
                 effects.is_empty(),
                 "pure form `{src}` derived spurious effects: {effects:?}"
             );
+        }
+    }
+
+    /// A bare bound (non-callable) name resolves to its value at runtime — the
+    /// planner must not claim a spawn for it. Special heads the runtime
+    /// intercepts (`jobs`, `journal`, `undo`, …) must not claim an external
+    /// spawn either; they classify as session/journal/opaque effects.
+    #[test]
+    fn bound_values_and_special_heads_do_not_claim_spawns() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ev = Evaluator::new(dir.path().into());
+        ev.eval_program(&shoal_syntax::parse("let x = 5").unwrap())
+            .unwrap();
+        let effects = ev
+            .plan_program(&shoal_syntax::parse("x").unwrap())
+            .unwrap()
+            .effects;
+        assert!(
+            effects.is_empty(),
+            "bound value read derived effects: {effects:?}"
+        );
+        for (src, want) in [
+            ("jobs", None),
+            ("pushd sub", Some(Effect::SessionWrite)),
+            ("journal", Some(Effect::JournalRead)),
+            ("undo", Some(Effect::Opaque)),
+        ] {
+            let effects = effects_at(dir.path(), src);
+            assert!(
+                !effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::ProcSpawn { .. })),
+                "special head `{src}` claimed a spawn: {effects:?}"
+            );
+            if let Some(w) = want {
+                assert!(
+                    effects.contains(&w),
+                    "special head `{src}` missing {w:?}: {effects:?}"
+                );
+            }
         }
     }
 }
