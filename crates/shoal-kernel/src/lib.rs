@@ -165,32 +165,101 @@ impl TaskEntry {
         self.session_lease.clear_poison();
     }
 
+    fn invariant_error(&self) -> RpcError {
+        RpcError {
+            code: INTERNAL_ERROR,
+            message: "task state was reconstructed after an internal failure".into(),
+            data: Some(json!({"task": self.task, "task_reconstructed": true})),
+        }
+    }
+
+    fn reconstruct_locked(
+        &self,
+        mut inner: std::sync::MutexGuard<'_, TaskInner>,
+        message: &'static str,
+    ) -> Option<QuotaPermit> {
+        inner.state = "failed";
+        inner.finished_ns = Some(now_ns());
+        inner.result_ref = None;
+        inner.exit_code = None;
+        inner.error = Some(RpcError {
+            code: INTERNAL_ERROR,
+            message: message.into(),
+            data: Some(json!({"task": self.task, "task_reconstructed": true})),
+        });
+        inner.active_slot.take()
+    }
+
+    fn finish_reconstruction(&self, active_slot: Option<QuotaPermit>) {
+        drop(active_slot);
+        self.release_session_lease();
+        self.done.notify_all();
+    }
+
+    fn lock_inner(&self) -> Result<std::sync::MutexGuard<'_, TaskInner>, RpcError> {
+        match self.inner.lock() {
+            Ok(inner) => Ok(inner),
+            Err(poisoned) => {
+                let inner = poisoned.into_inner();
+                let active_slot = self.reconstruct_locked(inner, "task state mutex was poisoned");
+                self.inner.clear_poison();
+                self.finish_reconstruction(active_slot);
+                Err(self.invariant_error())
+            }
+        }
+    }
+
+    fn repair_wait_poison(
+        &self,
+        poisoned: std::sync::PoisonError<std::sync::MutexGuard<'_, TaskInner>>,
+    ) -> RpcError {
+        let inner = poisoned.into_inner();
+        let active_slot = self.reconstruct_locked(inner, "task waiter state was poisoned");
+        self.inner.clear_poison();
+        self.finish_reconstruction(active_slot);
+        self.invariant_error()
+    }
+
+    fn repair_timeout_wait_poison(
+        &self,
+        poisoned: std::sync::PoisonError<(
+            std::sync::MutexGuard<'_, TaskInner>,
+            std::sync::WaitTimeoutResult,
+        )>,
+    ) -> RpcError {
+        let (inner, _) = poisoned.into_inner();
+        let active_slot = self.reconstruct_locked(inner, "task waiter state was poisoned");
+        self.inner.clear_poison();
+        self.finish_reconstruction(active_slot);
+        self.invariant_error()
+    }
+
     /// Restore the complete terminal-task invariant after a worker panic.
     /// Unlike evaluator state, TaskInner is a small host-owned record whose
     /// safe failure state can be reconstructed in full: terminal timestamp,
     /// no result, one explicit error, and no held active quota permit.
     fn fail_worker_panic(&self) {
-        let active_slot = {
-            let mut inner = match self.inner.lock() {
+        let (active_slot, notify) = {
+            let inner = match self.inner.lock() {
                 Ok(inner) => inner,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            inner.state = "failed";
-            inner.finished_ns = Some(now_ns());
-            inner.result_ref = None;
-            inner.exit_code = None;
-            inner.error = Some(RpcError {
-                code: INTERNAL_ERROR,
-                message: "task worker panicked".into(),
-                data: None,
-            });
-            let active_slot = inner.active_slot.take();
-            self.inner.clear_poison();
-            active_slot
+            if inner.finished_ns.is_some() {
+                let mut inner = inner;
+                let active_slot = inner.active_slot.take();
+                self.inner.clear_poison();
+                (active_slot, false)
+            } else {
+                let active_slot = self.reconstruct_locked(inner, "task worker panicked");
+                self.inner.clear_poison();
+                (active_slot, true)
+            }
         };
         drop(active_slot);
         self.release_session_lease();
-        self.done.notify_all();
+        if notify {
+            self.done.notify_all();
+        }
     }
 }
 
@@ -298,6 +367,7 @@ impl PtyEntry {
 #[derive(Default)]
 struct SessionQuota {
     counts: Mutex<HashMap<OwnerKey, usize>>,
+    quarantined: AtomicBool,
 }
 
 struct QuotaPermit {
@@ -313,7 +383,18 @@ impl SessionQuota {
         limit: &'static str,
         noun: &'static str,
     ) -> Result<QuotaPermit, RpcError> {
-        let mut counts = self.counts.lock().unwrap();
+        if self.quarantined.load(Ordering::Acquire) || self.counts.is_poisoned() {
+            self.quarantined.store(true, Ordering::Release);
+            return Err(task_quota_unavailable());
+        }
+        let mut counts = match self.counts.lock() {
+            Ok(counts) => counts,
+            Err(poisoned) => {
+                drop(poisoned);
+                self.quarantined.store(true, Ordering::Release);
+                return Err(task_quota_unavailable());
+            }
+        };
         let current = counts.entry(owner.clone()).or_default();
         if *current >= max {
             return Err(RpcError {
@@ -332,14 +413,35 @@ impl SessionQuota {
 
 impl Drop for QuotaPermit {
     fn drop(&mut self) {
-        let mut counts = self.quota.counts.lock().unwrap();
+        if self.quota.quarantined.load(Ordering::Acquire) {
+            return;
+        }
+        let mut counts = match self.quota.counts.lock() {
+            Ok(counts) => counts,
+            Err(poisoned) => {
+                drop(poisoned);
+                self.quota.quarantined.store(true, Ordering::Release);
+                return;
+            }
+        };
         if let Some(current) = counts.get_mut(&self.owner) {
-            debug_assert!(*current > 0, "session quota underflow");
             *current = current.saturating_sub(1);
             if *current == 0 {
                 counts.remove(&self.owner);
             }
         }
+    }
+}
+
+fn task_quota_unavailable() -> RpcError {
+    RpcError {
+        code: INTERNAL_ERROR,
+        message: "task quota is quarantined; restart the kernel".into(),
+        data: Some(json!({
+            "subsystem": "task_quota",
+            "quarantined": true,
+            "restart_required": true,
+        })),
     }
 }
 
@@ -898,9 +1000,15 @@ fn is_read_timeout(error: &io::Error) -> bool {
     )
 }
 
-fn task_record(task: &Arc<TaskEntry>) -> TaskRecord {
-    let inner = task.inner.lock().unwrap();
-    task_record_locked(task, &inner)
+fn task_record(task: &Arc<TaskEntry>) -> Result<TaskRecord, RpcError> {
+    let inner = match task.lock_inner() {
+        Ok(inner) => inner,
+        // `lock_inner` fully reconstructs and unpoisons TaskInner before
+        // returning this first error. Reads retry once so callers observe the
+        // durable terminal failure record; mutation paths retain the error.
+        Err(_) => task.lock_inner()?,
+    };
+    Ok(task_record_locked(task, &inner))
 }
 fn task_record_locked(task: &TaskEntry, inner: &TaskInner) -> TaskRecord {
     TaskRecord {

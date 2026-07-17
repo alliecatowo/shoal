@@ -1,8 +1,8 @@
-use super::super::{OwnerKey, QuotaPermit, Ref, SessionQuota, TaskEntry, now_ns};
+use super::super::{OwnerKey, QuotaPermit, Ref, SessionQuota, TaskEntry, now_ns, task_record};
 use shoal_proto::RpcError;
-use shoal_proto::error_code::UNKNOWN_TASK;
+use shoal_proto::error_code::{INTERNAL_ERROR, UNKNOWN_TASK};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 const MAX_FINISHED_PER_OWNER: usize = 512;
@@ -15,6 +15,7 @@ pub(crate) struct TaskRegistry {
     slots: Arc<SessionQuota>,
     max_active_per_owner: AtomicUsize,
     next_id: AtomicU64,
+    quarantined: AtomicBool,
 }
 
 impl TaskRegistry {
@@ -24,6 +25,7 @@ impl TaskRegistry {
             slots: Arc::new(SessionQuota::default()),
             max_active_per_owner: AtomicUsize::new(max_active_per_owner),
             next_id: AtomicU64::new(1),
+            quarantined: AtomicBool::new(false),
         }
     }
 
@@ -46,21 +48,51 @@ impl TaskRegistry {
         (id, Ref::new("task", id))
     }
 
+    fn unavailable(&self) -> RpcError {
+        RpcError {
+            code: INTERNAL_ERROR,
+            message: "task registry is quarantined; restart the kernel".into(),
+            data: Some(serde_json::json!({
+                "subsystem": "task_registry",
+                "quarantined": true,
+                "restart_required": true,
+            })),
+        }
+    }
+
+    fn lock_entries(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, HashMap<Ref, Arc<TaskEntry>>>, RpcError> {
+        if self.quarantined.load(Ordering::Acquire) || self.entries.is_poisoned() {
+            self.quarantined.store(true, Ordering::Release);
+            return Err(self.unavailable());
+        }
+        match self.entries.lock() {
+            Ok(entries) => Ok(entries),
+            Err(poisoned) => {
+                drop(poisoned);
+                self.quarantined.store(true, Ordering::Release);
+                Err(self.unavailable())
+            }
+        }
+    }
+
+    pub(crate) fn insert_checked(&self, entry: Arc<TaskEntry>) -> Result<(), RpcError> {
+        self.lock_entries()?.insert(entry.task.clone(), entry);
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(crate) fn insert(&self, entry: Arc<TaskEntry>) {
-        self.entries
-            .lock()
-            .unwrap()
-            .insert(entry.task.clone(), entry);
+        let _ = self.insert_checked(entry);
     }
 
     pub(crate) fn remove(&self, task_ref: &Ref) -> Option<Arc<TaskEntry>> {
-        self.entries.lock().unwrap().remove(task_ref)
+        self.lock_entries().ok()?.remove(task_ref)
     }
 
     pub(crate) fn get(&self, task_ref: &Ref) -> Result<Arc<TaskEntry>, RpcError> {
-        self.entries
-            .lock()
-            .unwrap()
+        self.lock_entries()?
             .get(task_ref)
             .cloned()
             .ok_or_else(|| RpcError {
@@ -70,30 +102,32 @@ impl TaskRegistry {
             })
     }
 
-    pub(crate) fn snapshot_owner(&self, owner: &OwnerKey) -> Vec<Arc<TaskEntry>> {
-        self.entries
-            .lock()
-            .unwrap()
+    pub(crate) fn snapshot_owner(&self, owner: &OwnerKey) -> Result<Vec<Arc<TaskEntry>>, RpcError> {
+        Ok(self
+            .lock_entries()?
             .values()
             .filter(|task| &task.owner == owner)
             .cloned()
-            .collect()
+            .collect())
     }
 
     pub(crate) fn reap_finished(&self, owner: &OwnerKey) {
-        let entries = self
-            .entries
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(_, task)| &task.owner == owner)
-            .map(|(task_ref, task)| (task_ref.clone(), task.clone()))
-            .collect::<Vec<_>>();
+        let Ok(entries) = self.lock_entries().map(|entries| {
+            entries
+                .iter()
+                .filter(|(_, task)| &task.owner == owner)
+                .map(|(task_ref, task)| (task_ref.clone(), task.clone()))
+                .collect::<Vec<_>>()
+        }) else {
+            return;
+        };
         let cutoff = now_ns().saturating_sub(RETENTION_NS);
         let mut finished = entries
             .into_iter()
             .filter_map(|(task_ref, task)| {
-                let finished_ns = task.inner.lock().unwrap().finished_ns;
+                let finished_ns = task_record(&task)
+                    .ok()
+                    .and_then(|record| record.finished_ns);
                 finished_ns.map(|finished_ns| (task_ref, task, finished_ns))
             })
             .collect::<Vec<_>>();
@@ -118,7 +152,9 @@ impl TaskRegistry {
             })
             .collect::<Vec<_>>();
         let removed = {
-            let mut entries = self.entries.lock().unwrap();
+            let Ok(mut entries) = self.lock_entries() else {
+                return;
+            };
             remove
                 .into_iter()
                 .filter_map(|(task_ref, observed, _)| {
@@ -142,11 +178,14 @@ impl TaskRegistry {
     pub(crate) fn remove_terminal_owner(&self, owner: &OwnerKey) {
         let terminal = self
             .snapshot_owner(owner)
+            .unwrap_or_default()
             .into_iter()
-            .filter(|task| task.inner.lock().unwrap().finished_ns.is_some())
+            .filter(|task| task_record(task).is_ok_and(|record| record.finished_ns.is_some()))
             .collect::<Vec<_>>();
         let removed = {
-            let mut entries = self.entries.lock().unwrap();
+            let Ok(mut entries) = self.lock_entries() else {
+                return;
+            };
             terminal
                 .into_iter()
                 .filter_map(|observed| {
@@ -163,6 +202,68 @@ impl TaskRegistry {
 
     #[cfg(test)]
     pub(crate) fn contains(&self, task_ref: &Ref) -> bool {
-        self.entries.lock().unwrap().contains_key(task_ref)
+        self.lock_entries()
+            .is_ok_and(|entries| entries.contains_key(task_ref))
+    }
+
+    #[cfg(test)]
+    fn poison_entries_for_test(&self) {
+        std::thread::scope(|scope| {
+            let handle = scope.spawn(|| {
+                let _entries = self.entries.lock().unwrap();
+                panic!("inject task registry poison");
+            });
+            assert!(handle.join().is_err());
+        });
+    }
+}
+
+#[cfg(test)]
+mod poison_tests {
+    use super::*;
+    use crate::SessionKey;
+
+    fn owner() -> OwnerKey {
+        SessionKey::new("principal:task-poison", "task-poison").owner()
+    }
+
+    #[test]
+    fn poisoned_registry_rejects_repeated_lookup_with_restart_metadata() {
+        let registry = TaskRegistry::new(1);
+        registry.poison_entries_for_test();
+        for _ in 0..2 {
+            let error = match registry.get(&Ref::new("task", 1)) {
+                Ok(_) => panic!("poisoned registry must not masquerade as unknown task"),
+                Err(error) => error,
+            };
+            assert_eq!(error.code, INTERNAL_ERROR);
+            let data = error.data.unwrap();
+            assert_eq!(data["subsystem"], "task_registry");
+            assert_eq!(data["restart_required"], true);
+        }
+    }
+
+    #[test]
+    fn poisoned_quota_rejects_admission_and_permit_drop_does_not_panic() {
+        let registry = TaskRegistry::new(2);
+        let owner = owner();
+        let permit = registry.reserve(&owner).unwrap();
+        let quota = registry.slots.clone();
+        let poisoner = quota.clone();
+        let thread = std::thread::spawn(move || {
+            let _counts = poisoner.counts.lock().unwrap();
+            panic!("inject task quota poison");
+        });
+        assert!(thread.join().is_err());
+
+        drop(permit);
+        for _ in 0..2 {
+            let error = match registry.reserve(&owner) {
+                Ok(_) => panic!("poisoned quota must reject new admission"),
+                Err(error) => error,
+            };
+            assert_eq!(error.code, INTERNAL_ERROR);
+            assert_eq!(error.data.unwrap()["subsystem"], "task_quota");
+        }
     }
 }

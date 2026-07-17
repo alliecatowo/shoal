@@ -57,7 +57,7 @@ impl Kernel {
                 cancel: cancel.clone(),
                 cancel_requested: AtomicBool::new(false),
             });
-            self.tasks.insert(task.clone());
+            self.tasks.insert_checked(task.clone())?;
             let waiter = task.clone();
             let worker_session = session.clone();
             let kernel = self.clone();
@@ -127,10 +127,35 @@ impl Kernel {
                     };
                     let exit_payload;
                     let active_slot;
+                    let notify_completion;
                     {
-                        let mut inner = task.inner.lock().unwrap();
-                        inner.finished_ns = Some(now_ns());
-                        if let Some(error) = response.error {
+                        let mut inner = match task.lock_inner() {
+                            Ok(inner) => inner,
+                            Err(_) => {
+                                kernel.events.publish(
+                                    &task.owner,
+                                    &task_channel,
+                                    json!({
+                                        "$": "record",
+                                        "v": {
+                                            "state": {"$":"str", "v":"failed"},
+                                            "ref": Json::Null,
+                                        }
+                                    }),
+                                );
+                                kernel.reap_finished_tasks(&task.owner);
+                                worker_guard.disarm();
+                                return;
+                            }
+                        };
+                        notify_completion = inner.finished_ns.is_none();
+                        if !notify_completion {
+                            // A request/waiter already reconstructed this task
+                            // as terminal after observing poison. Preserve that
+                            // failure instead of letting a late worker overwrite
+                            // it with an apparently successful result.
+                        } else if let Some(error) = response.error {
+                            inner.finished_ns = Some(now_ns());
                             inner.state = if task.cancel_requested.load(Ordering::SeqCst) {
                                 "cancelled"
                             } else {
@@ -138,9 +163,11 @@ impl Kernel {
                             };
                             inner.error = Some(error);
                         } else if let Some(error) = transcript_error {
+                            inner.finished_ns = Some(now_ns());
                             inner.state = "failed";
                             inner.error = Some(error);
                         } else {
+                            inner.finished_ns = Some(now_ns());
                             inner.exit_code = response
                                 .result
                                 .as_ref()
@@ -183,16 +210,20 @@ impl Kernel {
                                         .unwrap_or(Json::Null),
                                 }
                         });
-                        active_slot = inner.active_slot.take();
+                        active_slot = notify_completion
+                            .then(|| inner.active_slot.take())
+                            .flatten();
                     }
-                    drop(active_slot);
-                    task.release_session_lease();
-                    task.done.notify_all();
+                    if notify_completion {
+                        drop(active_slot);
+                        task.release_session_lease();
+                        task.done.notify_all();
+                    }
+                    worker_guard.disarm();
                     kernel
                         .events
                         .publish(&task.owner, &task_channel, exit_payload);
                     kernel.reap_finished_tasks(&task.owner);
-                    worker_guard.disarm();
                 });
             if let Err(error) = spawn_result {
                 self.tasks.remove(&task_ref);
@@ -206,14 +237,17 @@ impl Kernel {
             // to finish; return an inline result if it beats the clock,
             // otherwise hand back the still-running task ref.
             let deadline = wait.map(|d| Instant::now() + d);
-            let mut inner = waiter.inner.lock().unwrap();
+            let mut inner = waiter.lock_inner()?;
             while matches!(inner.state, "running" | "cancelling") {
                 let Some(deadline) = deadline else { break };
                 let now = Instant::now();
                 if now >= deadline {
                     break;
                 }
-                let (guard, timed) = waiter.done.wait_timeout(inner, deadline - now).unwrap();
+                let (guard, timed) = match waiter.done.wait_timeout(inner, deadline - now) {
+                    Ok(result) => result,
+                    Err(poisoned) => return Err(waiter.repair_timeout_wait_poison(poisoned)),
+                };
                 inner = guard;
                 if timed.timed_out() {
                     break;

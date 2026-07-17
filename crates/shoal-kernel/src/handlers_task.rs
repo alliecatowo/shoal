@@ -96,8 +96,11 @@ impl Kernel {
         let session = &attachment.session;
         let owner = session.key.owner();
         self.reap_finished_tasks(&owner);
-        let tasks = self.tasks.snapshot_owner(&owner);
-        let records = tasks.iter().map(task_record).collect::<Vec<_>>();
+        let tasks = self.tasks.snapshot_owner(&owner)?;
+        let records = tasks
+            .iter()
+            .map(task_record)
+            .collect::<Result<Vec<_>, _>>()?;
         encode(records)
     }
 
@@ -119,7 +122,7 @@ impl Kernel {
             });
         }
         // Non-blocking snapshot (unlike task.await): the current record.
-        encode(task_record(&task))
+        encode(task_record(&task)?)
     }
 
     pub(crate) fn handle_task_await(
@@ -139,9 +142,12 @@ impl Kernel {
                 data: None,
             });
         }
-        let mut inner = task.inner.lock().unwrap();
+        let mut inner = task.lock_inner()?;
         while matches!(inner.state, "running" | "cancelling") {
-            inner = task.done.wait(inner).unwrap();
+            inner = match task.done.wait(inner) {
+                Ok(inner) => inner,
+                Err(poisoned) => return Err(task.repair_wait_poison(poisoned)),
+            };
         }
         encode(task_record_locked(&task, &inner))
     }
@@ -165,7 +171,7 @@ impl Kernel {
         }
         task.cancel_requested.store(true, Ordering::SeqCst);
         {
-            let mut inner = task.inner.lock().unwrap();
+            let mut inner = task.lock_inner()?;
             if inner.state == "running" {
                 inner.state = "cancelling";
             }
@@ -635,5 +641,75 @@ impl Kernel {
             "requester": requester,
             "approver": approver,
         }))
+    }
+}
+
+#[cfg(test)]
+mod task_poison_tests {
+    use super::*;
+
+    #[test]
+    fn request_repairs_poisoned_task_and_releases_both_leases() {
+        let kernel = Kernel::new();
+        kernel.configure_limits(Limits {
+            max_tasks_per_session: 1,
+            ..Limits::default()
+        });
+        let principal = principal();
+        let session = kernel.session("task-request-poison", &principal).unwrap();
+        let owner = session.key.owner();
+        let baseline = Arc::strong_count(&session);
+        let task_ref = Ref::new("task", 9_001);
+        let permit = kernel.tasks.reserve(&owner).unwrap();
+        let task = Arc::new(TaskEntry {
+            task: task_ref.clone(),
+            owner: owner.clone(),
+            session_id: session.id.clone(),
+            session_lease: Mutex::new(Some(session.clone())),
+            started_ns: now_ns(),
+            inner: Mutex::new(TaskInner {
+                state: "running",
+                finished_ns: None,
+                result_ref: Some(Ref::new("out", 1)),
+                exit_code: None,
+                error: None,
+                active_slot: Some(permit),
+            }),
+            done: Condvar::new(),
+            cancel: shoal_exec::CancelToken::new(),
+            cancel_requested: AtomicBool::new(false),
+        });
+        kernel.tasks.insert_checked(task.clone()).unwrap();
+        assert_eq!(Arc::strong_count(&session), baseline + 1);
+        let poisoner = task.clone();
+        let thread = std::thread::spawn(move || {
+            let _inner = poisoner.inner.lock().unwrap();
+            panic!("inject request-visible task poison");
+        });
+        assert!(thread.join().is_err());
+
+        let mut attached = Some(Attachment {
+            session: session.clone(),
+            principal,
+            can_approve: false,
+            tty: false,
+            cancel_epoch: None,
+            bearer: None,
+            security_epoch: ATTACH_SECURITY_EPOCH,
+            connection_trust: ConnectionTrust::EmbeddedHuman,
+        });
+        let record = kernel
+            .handle_task_get(json!({"task":task_ref}), &mut attached)
+            .expect("request repairs reconstructible task record");
+        assert_eq!(record["state"], "failed");
+        assert_eq!(record["error"]["data"]["task_reconstructed"], true);
+        assert_eq!(Arc::strong_count(&session), baseline + 1);
+        assert!(task.session_lease.lock().unwrap().is_none());
+
+        let replacement = kernel
+            .tasks
+            .reserve(&owner)
+            .expect("reconstruction released the active quota permit");
+        drop(replacement);
     }
 }
