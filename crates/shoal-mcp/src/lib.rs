@@ -5,7 +5,7 @@ use std::io::{self, BufRead, Read, Write};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -13,7 +13,7 @@ mod client;
 mod resources;
 mod tools;
 
-pub use client::{BridgeError, Config, KernelClient, discover_socket};
+pub use client::{BridgeError, Config, KernelClient, LocalAuthMode, discover_socket};
 pub use tools::tools;
 
 const MAX_FRAME: usize = 16 * 1024 * 1024;
@@ -101,15 +101,8 @@ pub fn ensure_kernel(config: &Config) {
     if std::env::var_os("SHOAL_NO_AUTOSTART").is_some_and(|v| !v.is_empty()) {
         return;
     }
-    let mut cmd = Command::new("shoal-kernel");
-    cmd.arg("--socket")
-        .arg(&config.socket)
-        // Detach: silence stdio and start a new process group so the daemon
-        // outlives this (per-session, per-agent) mcp process.
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .process_group(0);
+    let program = kernel_program();
+    let mut cmd = kernel_command(config, &program);
     if cmd.spawn().is_err() {
         return; // not on PATH / cannot exec — let Facade::connect surface it
     }
@@ -121,6 +114,39 @@ pub fn ensure_kernel(config: &Config) {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// Prefer the kernel installed beside this MCP facade. Besides making bundled
+/// installs reliable, this avoids letting a workspace-leading `PATH` entry
+/// substitute a different binary whenever the trusted sibling is available.
+/// Development/source layouts still fall back to normal PATH discovery.
+fn kernel_program() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| sibling_kernel(&exe))
+        .unwrap_or_else(|| PathBuf::from("shoal-kernel"))
+}
+
+fn sibling_kernel(current_exe: &Path) -> Option<PathBuf> {
+    let sibling = current_exe.parent()?.join("shoal-kernel");
+    sibling.is_file().then_some(sibling)
+}
+
+fn kernel_command(config: &Config, program: &Path) -> Command {
+    let mut cmd = Command::new(program);
+    cmd.arg("--socket")
+        .arg(&config.socket)
+        // The facade already captured the bearer for its own attach request.
+        // The daemon neither needs nor should inherit that secret: a kernel
+        // evaluator and its child processes inherit the daemon environment.
+        .env_remove("SHOAL_TOKEN")
+        // Detach: silence stdio and start a new process group so the daemon
+        // outlives this (per-session, per-agent) mcp process.
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0);
+    cmd
 }
 
 pub fn run_stdio(config: &Config) -> Result<(), BridgeError> {
@@ -235,6 +261,7 @@ mod tests {
             socket: path,
             session: Some("s".into()),
             token: Some("tok".into()),
+            local_auth: LocalAuthMode::RestrictedAgent,
         };
         (d, c, h)
     }
@@ -316,9 +343,34 @@ mod tests {
             socket: path,
             session: None,
             token: None,
+            local_auth: LocalAuthMode::RestrictedAgent,
         };
         // Returns immediately because the connect probe succeeds; a hang or a
         // stray spawn would show up as a test timeout / leaked process.
         ensure_kernel(&c);
+    }
+
+    #[test]
+    fn autostart_prefers_a_sibling_kernel_and_scrubs_the_bearer() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join("shoal-mcp");
+        let sibling = dir.path().join("shoal-kernel");
+        std::fs::write(&current, b"").unwrap();
+        std::fs::write(&sibling, b"").unwrap();
+        assert_eq!(sibling_kernel(&current), Some(sibling.clone()));
+
+        let config = Config {
+            socket: dir.path().join("kernel.sock"),
+            session: None,
+            token: Some("must-not-reach-kernel".into()),
+            local_auth: LocalAuthMode::RestrictedAgent,
+        };
+        let command = kernel_command(&config, &sibling);
+        assert_eq!(command.get_program(), sibling.as_os_str());
+        assert!(
+            command.get_envs().any(|(key, value)| {
+                key == std::ffi::OsStr::new("SHOAL_TOKEN") && value.is_none()
+            })
+        );
     }
 }

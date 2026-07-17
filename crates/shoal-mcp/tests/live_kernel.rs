@@ -63,6 +63,10 @@ impl LiveKernel {
             socket: self.socket.clone(),
             session: Some("default".into()),
             token: None,
+            // This suite exercises the historical permissive kernel surface.
+            // Restricted zero-token production attach is tested at the client
+            // negotiation boundary until the kernel half of HR-D6 lands.
+            local_auth: shoal_mcp::LocalAuthMode::LocalHuman,
         }
     }
 }

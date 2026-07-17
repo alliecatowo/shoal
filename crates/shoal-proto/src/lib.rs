@@ -389,6 +389,32 @@ pub struct ClientInfo {
     pub kind: String,
     pub tty: bool,
 }
+
+/// Local authentication requested by a client that does not present a bearer
+/// token. Restricted agent is the safe default for headless bridges; local
+/// human is an explicit same-user trust-root opt-in.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum LocalAuthMode {
+    #[default]
+    RestrictedAgent,
+    LocalHuman,
+}
+
+/// Additive security-negotiation fields returned by hardened kernels from
+/// `session.attach`. They remain a standalone wire projection so older Rust
+/// callers constructing [`AttachResult`] are source-compatible while clients
+/// can fail closed when an older kernel silently ignores `local_auth`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachSecurityMetadata {
+    pub auth_mode: LocalAuthMode,
+    pub session_isolation: String,
+    pub security_epoch: u32,
+}
+
+pub const ATTACH_SECURITY_EPOCH: u32 = 1;
+pub const PRINCIPAL_SESSION_ISOLATION: &str = "principal";
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AttachParams {
     pub session: Option<String>,
@@ -664,6 +690,31 @@ mod tests {
         assert_eq!(bytes.last(), Some(&b'\n'));
         let decoded: Response = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn attach_security_metadata_has_stable_wire_spellings() {
+        assert_eq!(
+            serde_json::to_value(LocalAuthMode::RestrictedAgent).unwrap(),
+            serde_json::json!("restricted-agent")
+        );
+        assert_eq!(
+            serde_json::to_value(LocalAuthMode::LocalHuman).unwrap(),
+            serde_json::json!("local-human")
+        );
+        let metadata = AttachSecurityMetadata {
+            auth_mode: LocalAuthMode::RestrictedAgent,
+            session_isolation: PRINCIPAL_SESSION_ISOLATION.into(),
+            security_epoch: ATTACH_SECURITY_EPOCH,
+        };
+        assert_eq!(
+            serde_json::to_value(metadata).unwrap(),
+            serde_json::json!({
+                "auth_mode": "restricted-agent",
+                "session_isolation": "principal",
+                "security_epoch": 1,
+            })
+        );
     }
 
     #[test]

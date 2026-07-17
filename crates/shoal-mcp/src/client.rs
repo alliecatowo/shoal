@@ -3,6 +3,8 @@
 
 use crate::{read_json_line, write_json_line, write_stdout_frame};
 use serde_json::{Value, json};
+pub use shoal_proto::LocalAuthMode;
+use shoal_proto::{ATTACH_SECURITY_EPOCH, PRINCIPAL_SESSION_ISOLATION};
 use std::io::{self, BufReader};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -12,6 +14,7 @@ pub struct Config {
     pub socket: PathBuf,
     pub session: Option<String>,
     pub token: Option<String>,
+    pub local_auth: LocalAuthMode,
 }
 
 impl Config {
@@ -22,6 +25,7 @@ impl Config {
             socket,
             session,
             token: std::env::var("SHOAL_TOKEN").ok(),
+            local_auth: LocalAuthMode::RestrictedAgent,
         })
     }
 }
@@ -86,6 +90,7 @@ pub struct KernelClient {
 
 impl KernelClient {
     pub fn connect(config: &Config) -> Result<Self, BridgeError> {
+        let params = attach_params(config)?;
         let stream = UnixStream::connect(&config.socket)?;
         let mut client = Self {
             reader: BufReader::new(stream.try_clone()?),
@@ -93,14 +98,8 @@ impl KernelClient {
             next_id: 1,
             attach: Value::Null,
         };
-        client.attach = client.call(
-            "session.attach",
-            json!({
-                "session": config.session,
-                "token": config.token,
-                "client": {"kind":"mcp", "tty":false}
-            }),
-        )?;
+        client.attach = client.call("session.attach", params)?;
+        validate_attach_security(config, &client.attach)?;
         Ok(client)
     }
 
@@ -150,6 +149,68 @@ impl KernelClient {
             return frame.get("result").cloned().ok_or_else(|| {
                 BridgeError::Protocol("kernel response has neither result nor error".into())
             });
+        }
+    }
+}
+
+fn attach_params(config: &Config) -> Result<Value, BridgeError> {
+    if config.token.is_some() && config.local_auth == LocalAuthMode::LocalHuman {
+        return Err(BridgeError::Protocol(
+            "--token and --local-human are mutually exclusive authentication modes".into(),
+        ));
+    }
+    let mut params = json!({
+        "session": config.session,
+        "token": config.token,
+        "client": {"kind":"mcp", "tty":false}
+    });
+    if config.token.is_none() {
+        params["local_auth"] = serde_json::to_value(config.local_auth)?;
+    }
+    Ok(params)
+}
+
+/// Refuse a silent security downgrade when a zero-token MCP asks for the
+/// restricted local-agent boundary but reaches a kernel that ignores the new
+/// attach field and grants the historical unrestricted local-human identity.
+///
+/// Explicit local-human mode intentionally accepts the legacy response: the
+/// user already opted into exactly that permissive boundary. Bearer auth keeps
+/// its existing compatibility until the kernel's principal-session migration
+/// is complete; the token still selects its configured principal.
+fn validate_attach_security(config: &Config, attach: &Value) -> Result<(), BridgeError> {
+    if config.token.is_some() {
+        return Ok(());
+    }
+    match config.local_auth {
+        LocalAuthMode::LocalHuman => {
+            if let Some(mode) = attach.get("auth_mode").and_then(Value::as_str)
+                && mode != "local-human"
+            {
+                return Err(BridgeError::Protocol(format!(
+                    "kernel attached with auth_mode {mode:?}, not requested local-human"
+                )));
+            }
+            Ok(())
+        }
+        LocalAuthMode::RestrictedAgent => {
+            let mode = attach.get("auth_mode").and_then(Value::as_str);
+            let isolation = attach.get("session_isolation").and_then(Value::as_str);
+            let epoch = attach.get("security_epoch").and_then(Value::as_u64);
+            let principal = attach.get("principal").and_then(Value::as_str);
+            if mode != Some("restricted-agent")
+                || isolation != Some(PRINCIPAL_SESSION_ISOLATION)
+                || epoch.is_none_or(|v| v < u64::from(ATTACH_SECURITY_EPOCH))
+                || !principal.is_some_and(|p| p.starts_with("agent:"))
+            {
+                return Err(BridgeError::Protocol(
+                    "kernel cannot prove restricted MCP attach and principal-isolated sessions; \
+                     upgrade shoal-kernel, provide a bearer token, or explicitly opt into \
+                     --local-human"
+                        .into(),
+                ));
+            }
+            Ok(())
         }
     }
 }
@@ -219,5 +280,64 @@ mod tests {
             runtime_dir_from(Some(OsString::new()), None, 7),
             PathBuf::from("/tmp/shoal-7")
         );
+    }
+
+    fn config(local_auth: LocalAuthMode, token: Option<&str>) -> Config {
+        Config {
+            socket: PathBuf::from("/tmp/not-used.sock"),
+            session: Some("test".into()),
+            token: token.map(str::to_owned),
+            local_auth,
+        }
+    }
+
+    #[test]
+    fn restricted_attach_requires_hardened_kernel_metadata() {
+        let config = config(LocalAuthMode::RestrictedAgent, None);
+        let legacy = json!({"principal":"uid:1000"});
+        let error = validate_attach_security(&config, &legacy).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot prove restricted MCP attach")
+        );
+
+        let hardened = json!({
+            "principal":"agent:mcp",
+            "auth_mode":"restricted-agent",
+            "session_isolation":"principal",
+            "security_epoch": ATTACH_SECURITY_EPOCH,
+        });
+        validate_attach_security(&config, &hardened).unwrap();
+    }
+
+    #[test]
+    fn explicit_local_human_and_bearer_keep_deliberate_compatibility() {
+        let legacy = json!({"principal":"uid:1000"});
+        validate_attach_security(&config(LocalAuthMode::LocalHuman, None), &legacy).unwrap();
+        validate_attach_security(
+            &config(LocalAuthMode::RestrictedAgent, Some("bearer")),
+            &legacy,
+        )
+        .unwrap();
+
+        let wrong = json!({"auth_mode":"restricted-agent"});
+        assert!(
+            validate_attach_security(&config(LocalAuthMode::LocalHuman, None), &wrong).is_err()
+        );
+    }
+
+    #[test]
+    fn attach_request_is_explicitly_restricted_without_a_token() {
+        let restricted = attach_params(&config(LocalAuthMode::RestrictedAgent, None)).unwrap();
+        assert_eq!(restricted["local_auth"], json!("restricted-agent"));
+        assert!(restricted["token"].is_null());
+
+        let bearer =
+            attach_params(&config(LocalAuthMode::RestrictedAgent, Some("secret"))).unwrap();
+        assert!(bearer.get("local_auth").is_none());
+        assert_eq!(bearer["token"], json!("secret"));
+
+        assert!(attach_params(&config(LocalAuthMode::LocalHuman, Some("secret"))).is_err());
     }
 }
