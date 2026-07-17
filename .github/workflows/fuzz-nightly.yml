@@ -7,12 +7,10 @@ name: Scheduled fuzz
 # continue-on-error) if libFuzzer finds a crash, timeout, or OOM, so a regression surfaces here
 # instead of silently sitting unexercised.
 #
-# Budget choice: 120s per target (~6 minutes total for three targets) is a deliberate "smoke, not
-# exhaustive" tradeoff — see site/content/internals/tooling-and-quality.md's Fuzz targets section
-# for what each target actually covers today (shallow: no CMD-mode/mode-transition coverage for
-# the lexer, no semantic assertions for the parser, no multi-frame/value coverage for proto_frame).
-# A deeper corpus-accumulating fuzz campaign is future work; this job's job is to catch a quick
-# regression (panic/non-progress) on a cadence, not to be the sole fuzzing strategy.
+# Budget choice: 120s per target is a deliberate smoke, not exhaustive, tradeoff. Targets run as a
+# matrix so syntax, planner, value/wire, frame, stream, and policy failures are isolated and can run
+# concurrently. Checked-in seeds provide useful starting states; longer corpus-accumulating
+# campaigns remain complementary to this bounded nightly gate.
 
 on:
   schedule:
@@ -40,7 +38,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [lexer, parser, proto_frame]
+        target: [lexer, parser, proto_frame, planner, value_wire, stream, policy]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly

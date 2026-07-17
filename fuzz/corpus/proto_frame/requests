@@ -1,0 +1,2 @@
+{"jsonrpc":"2.0","id":1,"method":"parse","params":{"src":"let x = 1"}}
+{"jsonrpc":"2.0","id":"two","method":"complete","params":{}}

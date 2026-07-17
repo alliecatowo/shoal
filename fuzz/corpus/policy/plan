@@ -1,0 +1,8 @@
+[principal.agent]
+opaque = "ask"
+auto_apply = "reversible"
+fs.read = ["./workspace/**"]
+env.read = ["PATH"]
+
+---PLAN---
+{"plan_ref":"plan:seed","effects":[{"kind":"fs_read","paths":["./workspace/input"]},{"kind":"env_read","names":["PATH"]}],"reversibility":"reversible","estimates":{"bytes":1024,"items":1}}
