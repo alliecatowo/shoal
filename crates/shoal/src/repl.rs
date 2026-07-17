@@ -5,7 +5,7 @@
 
 use std::collections::VecDeque;
 use std::fs;
-use std::io::{self, IsTerminal, Write as _};
+use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -28,6 +28,15 @@ use crate::kernel_repl::{KernelRpc, ProtocolOutcome, ProtocolSession};
 use crate::prompt;
 use crate::repl_state::{ProtocolSnapshot, RemoteEnvMirror};
 use crate::{format_parse_error, maybe_strip, no_color, report_eval_error};
+
+mod rendering;
+
+pub(crate) use rendering::{PagerContext, print_value, render_result, render_result_paged};
+#[cfg(test)]
+use rendering::{
+    pager_command, protocol_render_text, should_page, spawn_pager, wrapped_line_count,
+};
+use rendering::{render_protocol_outcome, report_protocol_error, terminal_width};
 
 trait ReplProtocol {
     fn execute(
@@ -963,227 +972,6 @@ fn parse_ctx_for(env: &Env) -> ParseCtx {
         value_bound,
         cmd_bound,
     }
-}
-
-/// `true` when `value` is an `Outcome` whose bytes already reached the real
-/// terminal via the PtyTee passthrough (`streamed`) while `pty_was_live` was
-/// in effect — rendering it again here would duplicate the command's output.
-/// Builtins (echo/ls/…) and captured outcomes stream nothing, so they carry
-/// `streamed == false` and must still render their `.out` (defect #1). Shared
-/// by `render_result` and `render_result_paged` so both agree on this one
-/// skip condition.
-fn already_streamed(value: &Value, pty_was_live: bool) -> bool {
-    pty_was_live && matches!(value, Value::Outcome(o) if o.streamed)
-}
-
-pub(crate) fn render_result(value: &Value, pty_was_live: bool) -> io::Result<()> {
-    if already_streamed(value, pty_was_live) {
-        return Ok(());
-    }
-    print_value(value)
-}
-
-/// Render one value the same colorized way the top-level REPL result is
-/// rendered — shared by `render_result` and the statement sink (WP2) so
-/// non-final statement values inside a multi-statement line get the same
-/// live, colorized treatment as the line's final result. Never pages: this
-/// is the direct-print path used by `-c`/scripts (`main::run_source`) and by
-/// every mid-statement value in a multi-statement REPL line — see
-/// `render_result_paged`'s doc comment for why paging is scoped away from
-/// both of those call sites.
-pub(crate) fn print_value(value: &Value) -> io::Result<()> {
-    let rendered = shoal_value::render::render_block(value, terminal_width());
-    if !rendered.is_empty() {
-        println!("{}", maybe_strip(rendered));
-    }
-    Ok(())
-}
-
-fn report_protocol_error(error: &str) {
-    eprintln!(
-        "{}",
-        maybe_strip(format!("\x1b[31;1merror:\x1b[0m {error}"))
-    );
-}
-
-fn render_protocol_outcome(outcome: &ProtocolOutcome, pager: &PagerContext) -> io::Result<()> {
-    if outcome.state == "cancelled" {
-        println!("{}", maybe_strip("\x1b[90m^C\x1b[0m".to_string()));
-        return Ok(());
-    }
-    let Some(rendered) = protocol_render_text(outcome) else {
-        return Ok(());
-    };
-    render_text_paged(rendered, pager)
-}
-
-fn protocol_render_text(outcome: &ProtocolOutcome) -> Option<&str> {
-    (outcome.state != "cancelled" && !outcome.streamed)
-        .then_some(outcome.render.as_deref())
-        .flatten()
-        .filter(|render| !render.is_empty())
-}
-
-fn render_text_paged(rendered: &str, pager: &PagerContext) -> io::Result<()> {
-    let width = terminal_width();
-    let is_tty = io::stdout().is_terminal();
-    let line_count = wrapped_line_count(rendered, width);
-    if should_page(pager.enabled, is_tty, line_count, terminal_height()) {
-        let env_pager = std::env::var("PAGER").ok();
-        let argv = pager_command(pager.pager.as_deref(), env_pager.as_deref());
-        if spawn_pager(&argv, &maybe_strip(rendered.to_string())) {
-            return Ok(());
-        }
-    }
-    println!("{}", maybe_strip(rendered.to_string()));
-    Ok(())
-}
-
-/// Resolved `render.paging`/`render.pager` state for one REPL session
-/// (site/content/internals/configuration-reference.md), built once in `repl()` from the loaded config —
-/// never re-read per line. Kept as an explicit, narrow struct threaded only
-/// into `render_result_paged` (rather than a global) so it is structurally
-/// impossible for `-c`/script runs, which never construct one, to
-/// accidentally engage paging.
-pub(crate) struct PagerContext {
-    /// `config.render.paging == "auto"`.
-    pub(crate) enabled: bool,
-    /// `config.render.pager`, if the user set an explicit command.
-    pub(crate) pager: Option<String>,
-}
-
-/// The interactive REPL's *final* per-line result render (site/content/internals/configuration-reference.md
-/// `render.paging`): identical to `render_result` (same
-/// [`already_streamed`] skip), except that when paging is enabled, stdout is
-/// a real TTY, and the rendered output would not fit on one screen, the
-/// output is piped through the resolved pager instead of printed directly.
-/// On ANY pager failure (missing binary, spawn error) this falls back to a
-/// plain `println!` — output is never silently lost. Deliberately NOT used
-/// for `-c`/scripts (those call `render_result`, which has no pager
-/// awareness) or for the `statement_sink` (mid-statement values in a
-/// multi-statement line always call `print_value` directly) — see the call
-/// site in `repl()` for the reasoning.
-pub(crate) fn render_result_paged(
-    value: &Value,
-    pty_was_live: bool,
-    pager: &PagerContext,
-) -> io::Result<()> {
-    if already_streamed(value, pty_was_live) {
-        return Ok(());
-    }
-    let width = terminal_width();
-    let rendered = shoal_value::render::render_block(value, width);
-    if rendered.is_empty() {
-        return Ok(());
-    }
-    render_text_paged(&rendered, pager)
-}
-
-/// Pure paging gate (unit-testable without a real terminal/TTY): page only
-/// when `render.paging = "auto"` (`enabled`), stdout is a real TTY (never
-/// page into a pipe, file redirect, or CI log), and the rendered output
-/// would not fit on one screen.
-fn should_page(
-    enabled: bool,
-    is_tty: bool,
-    rendered_line_count: usize,
-    term_height: usize,
-) -> bool {
-    enabled && is_tty && term_height > 0 && rendered_line_count > term_height
-}
-
-/// Resolve the pager argv, in precedence order: an explicit `render.pager`
-/// config command, else `$PAGER`, else the built-in fallback `less -R` (the
-/// `-R` matters: shoal's rendered output is colorized ANSI, and plain `less`
-/// would print raw escape codes instead of color). The resolved command
-/// string is split on whitespace into argv — sufficient for the common
-/// `less -R` / `bat --paging=always`-style commands this targets; a pager
-/// whose path itself needs shell quoting is out of scope for this simple
-/// resolution.
-fn pager_command(config_pager: Option<&str>, env_pager: Option<&str>) -> Vec<String> {
-    let chosen = config_pager
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .or_else(|| env_pager.map(str::trim).filter(|s| !s.is_empty()))
-        .unwrap_or("less -R");
-    chosen.split_whitespace().map(str::to_string).collect()
-}
-
-/// Pipe `text` through `argv`'s stdin and wait for it to exit. Returns `true`
-/// as soon as the pager has actually been spawned — even if the user quits
-/// early (a broken pipe on `write_all`, silently discarded: quitting a pager
-/// before it finishes is ordinary, expected behavior, never a reason to
-/// re-print everything) or the pager itself exits non-zero. Returns `false`
-/// only when the pager could never be launched at all (empty argv, missing
-/// binary, a spawn error) — the one case the caller must fall back to a
-/// plain print for, since in that case no output has reached the user yet.
-fn spawn_pager(argv: &[String], text: &str) -> bool {
-    let Some((program, args)) = argv.split_first() else {
-        return false;
-    };
-    let mut child = match std::process::Command::new(program)
-        .args(args)
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(_) => return false,
-    };
-    if let Some(mut stdin) = child.stdin.take() {
-        // A broken pipe here (the user pressed `q` before the write
-        // finished) must never panic or surface as a REPL error — this is
-        // the SIGPIPE-on-write case the lane brief calls out explicitly.
-        // Rust's runtime already ignores SIGPIPE (a broken-pipe write
-        // returns a normal `Err`, it does not signal-kill the process), so
-        // discarding the `Result` here is sufficient.
-        let _ = stdin.write_all(text.as_bytes());
-        // Dropping `stdin` (end of scope) closes shoal's end of the pipe, so
-        // the pager sees EOF and can exit even if it never finished
-        // draining stdin.
-    }
-    let _ = child.wait();
-    true
-}
-
-/// Visual terminal row count for `text` when wrapped at `width` columns:
-/// ANSI CSI sequences (`ESC [ ... final-byte`, the same escapes
-/// `render_block` emits for color) contribute zero width, and each source
-/// line wraps into `ceil(display_width / width)` rows (minimum 1 — an empty
-/// line still occupies a row) — a plain `text.lines().count()` would
-/// undercount a rendered table/long string that wraps within the terminal.
-fn wrapped_line_count(text: &str, width: usize) -> usize {
-    let width = width.max(1);
-    let mut total = 0usize;
-    for line in text.split('\n') {
-        let mut cols = 0usize;
-        let mut chars = line.chars().peekable();
-        while let Some(ch) = chars.next() {
-            if ch == '\u{1b}' && chars.peek() == Some(&'[') {
-                chars.next();
-                for c2 in chars.by_ref() {
-                    if ('\u{40}'..='\u{7e}').contains(&c2) {
-                        break;
-                    }
-                }
-                continue;
-            }
-            cols += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-        }
-        total += if cols == 0 { 1 } else { cols.div_ceil(width) };
-    }
-    total.max(1)
-}
-
-fn terminal_width() -> usize {
-    crossterm::terminal::size()
-        .map(|(width, _)| usize::from(width))
-        .unwrap_or(80)
-}
-
-fn terminal_height() -> usize {
-    crossterm::terminal::size()
-        .map(|(_, height)| usize::from(height))
-        .unwrap_or(24)
 }
 
 fn history_path() -> Option<PathBuf> {
