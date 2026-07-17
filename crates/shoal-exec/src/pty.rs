@@ -36,7 +36,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use portable_pty::{Child, CommandBuilder, MasterPty, native_pty_system};
 use shoal_leash::EnforcementStatus;
@@ -53,10 +53,7 @@ mod terminal;
 use registry::{park_job, register_background_job, remove_background_job};
 pub use registry::{shutdown_stopped_jobs, take_background_job, take_stopped_job};
 use service::{Feed, ServeOptions, Wait, serve};
-use terminal::{
-    BackgroundOutputSink, OutputPumpConfig, RawModeGuard, initial_pty_size, is_tty, lock_tee,
-    pty_err, pump_output,
-};
+use terminal::{BackgroundOutputSink, initial_pty_size, is_tty, lock_tee, pty_err};
 
 /// A PTY foreground command and everything needed to keep it alive across a
 /// stop and later resume it (site/content/internals/language-conformance-contract.md). Created for every PtyTee run; held by
@@ -419,6 +416,9 @@ mod tests {
     use std::io::{Read as _, Write as _};
     use std::os::fd::{FromRawFd as _, IntoRawFd as _};
     use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+
+    use super::terminal::{OutputPumpConfig, RawModeGuard, pump_output};
 
     fn stream_file(stream: UnixStream) -> File {
         // SAFETY: `into_raw_fd` transfers ownership and `File` takes it over.
@@ -863,6 +863,59 @@ mod tests {
             Duration::from_secs(5),
             "shell shutdown must reap running background PTYs",
             || process_is_gone(res.pid),
+        );
+    }
+
+    #[test]
+    fn production_pty_ownership_stays_decomposed() {
+        let root = include_str!("pty.rs");
+        let production_root = root
+            .split_once("#[cfg(test)]")
+            .map_or(root, |(production, _)| production);
+        let registry = include_str!("pty/registry.rs");
+        let service = include_str!("pty/service.rs");
+        let terminal = include_str!("pty/terminal.rs");
+
+        assert!(
+            production_root.lines().count() <= 430,
+            "PTY production root grew past its orchestration boundary"
+        );
+        assert!(
+            registry.lines().count() <= 120,
+            "PTY registry grew too broad"
+        );
+        assert!(service.lines().count() <= 250, "PTY service grew too broad");
+        assert!(
+            terminal.lines().count() <= 300,
+            "PTY terminal I/O grew too broad"
+        );
+
+        assert!(
+            !production_root.contains("libc::poll")
+                && !production_root.contains("libc::tcgetattr")
+                && !production_root.contains("static PARKED_JOBS")
+                && !production_root.contains("static BACKGROUND_JOBS"),
+            "OS pumps and process-global registries belong in owned submodules"
+        );
+
+        let run_pty = production_root
+            .split_once("pub(crate) fn run_pty")
+            .expect("run_pty remains in the orchestration root")
+            .1;
+        assert!(
+            run_pty.lines().count() <= 125,
+            "run_pty should remain spawn-and-dispatch orchestration"
+        );
+        let serve_span = service
+            .split_once("pub(super) fn serve")
+            .expect("service entrypoint")
+            .1
+            .split_once("\nfn attach_input")
+            .expect("input helper boundary")
+            .0;
+        assert!(
+            serve_span.lines().count() <= 65,
+            "one service stint should delegate helper ownership"
         );
     }
 }
