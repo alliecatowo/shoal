@@ -537,7 +537,10 @@ Replay from `since` is enqueued through the same 256-entry subscriber queue as l
 {"channel":"task.7"}
 ```
 
-Removes that channel subscription for the current connection and stops its kernel writer queue. It cannot unsubscribe a separate connection. This raw method works; the MCP facade's `resources/unsubscribe` currently does not forward it.
+Removes that channel subscription for the current connection and stops its kernel writer queue. It
+cannot unsubscribe a separate connection. The MCP facade uses a separate connection per resource
+subscription; its `resources/unsubscribe` closes and joins that URI's owned worker instead of trying
+to issue this method on the request connection.
 
 ## Wire values
 
@@ -575,15 +578,16 @@ Tables are columnar. Every column array has exactly `n` entries, and a missing f
 
 Paths preserve non-UTF-8 Unix bytes by including lossy `v`/`display` plus optional base64 `raw`. When `raw` exists, it is authoritative for round-trip filesystem operations.
 
-### Current DateTime mismatch
+### DateTime encoding
 
-The protocol type comment promises RFC 3339, but the encoder currently emits Unix epoch seconds as a decimal string:
+DateTime values use the protocol type's RFC 3339 string form. The encoder formats the underlying
+`jiff::Timestamp`, including fractional seconds when present:
 
 ```json
-{"$":"datetime","v":"1750000123"}
+{"$":"datetime","v":"2026-07-17T08:42:48.127638635Z"}
 ```
 
-Clients should accept this exact current behavior and avoid presenting it as RFC 3339 without conversion. This mismatch is tracked as a protocol defect and may be corrected in a future incompatible/negotiated revision.
+Clients should parse `v` as RFC 3339 rather than assuming a fixed fractional-second precision.
 
 ### Elided references
 

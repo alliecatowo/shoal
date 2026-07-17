@@ -64,21 +64,21 @@ kernel version, every third-party adapter executable, or performance targets on 
 | builtins and namespaces | Implemented | canonical builtin identity registry and corpus | broader command resolution remains distributed |
 | process capture | Implemented | real process-group and dual-pipe tests | hash preflight has an exec-time TOCTOU window |
 | interactive PTY execution | Implemented, host-limited | Unix PTY integration and REPL tests | Windows/ConPTY is deferred; kernel PTYs are poll-based |
-| streams and channels | Implemented, host-limited | evaluator stream tests and live kernel bridge | stream-to-stdin and wire item pulling are absent |
-| effects and plans | Partial authority | static derivation, policy tests, plan/apply handlers | `cap.request` is unattached; plan refs collide for equal effect shapes |
+| streams and channels | Implemented, host-limited | evaluator stream tests and live kernel bridge | incremental stream-to-stdin is bounded; wire item pulling is absent |
+| effects and plans | Implemented with enforcement limits | static derivation, policy tests, plan/apply handlers | planning cannot describe every native-program effect; network enforcement is absent |
 | Leash filesystem sandbox | Implemented, host-limited | Linux/macOS backend tests and enforcement reporting | network enforcement is unavailable; local malformed-policy mode is permissive |
 | task lifecycle | Partial | evaluator jobs and kernel async task tests | kernel suspend/resume returns `TASK_CONTROL_UNAVAILABLE` |
 | modules and script runners | Implemented, host-limited | module/corpus tests and `.shl` execution | non-`.shl` bare path heads require explicit `run` |
 | Reef environments | Implemented | resolver/provider/lock/view tests and evaluator integration | discovery/cache/persistence fail-soft edges remain |
 | adapters | Implemented | schema fixtures, bundled catalog, evaluator bindings | external tools and output dialects remain inherently environment-dependent |
-| configuration | Implemented, host-limited | typed loader tests and CLI wiring integration | accepted `kernel`, `journal`, `render.width`, and `leash.policy` fields are inert |
+| configuration | Implemented, host-limited | typed loader tests and shared host-bootstrap integration | `journal.enabled`, `journal.state_dir`, and `render.width` remain inert |
 | prompt | Implemented, host-limited | pure renderer snapshots and CLI producer | several context fields are hardcoded or never produced |
 | journal and CAS | Implemented | SQLite/CAS/undo/GC tests | dual row granularity and permanent spill pins complicate lifecycle |
-| kernel JSON-RPC | Implemented with authority defects | router/handler tests and daemon tests | unattached approval/journal calls, named-session ownership, frame allocation |
-| MCP facade | Implemented | live-kernel integration | unsubscribe does not terminate the subscription worker |
+| kernel JSON-RPC | Implemented with boundedness limits | router/handler tests and daemon tests | raw/blob retrieval is unbounded; most live objects are restart-ephemeral |
+| MCP facade | Implemented | live-kernel integration | each active resource subscription still costs one connection and thread |
 | LSP | Partial | protocol tests and shared builtin names | declarations/completion remain mostly lexical, not evaluator-semantic |
 | secrets | Implemented, host-limited | secret value redaction and port tests | storage backend and host coverage are narrow by design |
-| WASM | Scaffolded | isolated Wasmtime limit tests | no evaluator invocation path or wall-clock deadline |
+| WASM | Implemented, preview ABI | evaluator invocation and Wasmtime limit/deadline tests | synchronous component compilation is byte-bounded rather than interruptible; ABI surface is intentionally narrow |
 | Windows | Aspirational | explicit deferred branches | Unix sockets, job control, PTY, sandbox, and path rules need a separate port |
 
 ## Host-surface parity
@@ -93,11 +93,11 @@ interactive `shoal` REPL or `shoal -c`; “kernel” means direct newline-delimi
 | binding-aware statement-head parse | yes | evaluator-dependent | no | inherits kernel | no |
 | evaluate structured values | yes | yes | yes | `shoal_exec` | no |
 | persistent evaluator variables | REPL lifetime | process lifetime | named-session lifetime | named-session lifetime | no |
-| layered core config | yes | yes | no | no | no |
-| init scripts | yes | yes | no | no | no |
+| layered core config | yes | yes | yes | inherits kernel | no |
+| init scripts | yes | yes | yes | inherits kernel | no |
 | rich prompt | yes | n/a | no | no | no |
-| bundled adapters | yes | yes | not assembled by session builder | inherits kernel | names only |
-| user/project Reef | yes | yes | incomplete host assembly | inherits kernel | no |
+| bundled/configured adapters | yes | yes | yes | inherits kernel | names only |
+| user/project Reef | yes | yes | yes | inherits kernel | no |
 | journal per statement | yes | yes | yes | inherits kernel | no |
 | coarse exec journal row | no | no | yes | inherits kernel | no |
 | effect planning | yes | yes | yes | tool/resource | no |
@@ -107,22 +107,24 @@ interactive `shoal` REPL or `shoal -c`; “kernel” means direct newline-delimi
 | completion | Reedline | n/a | context-free endpoint | tool route | protocol completion |
 | diagnostics with spans | terminal | terminal | structured RPC | structured tool error | diagnostics |
 
-The most important parity gap is composition, not parsing: the CLI installs config, aliases,
-environment, init scripts, adapters, prompt state, journal/frecency, and Reef scopes independently;
-the kernel session constructor installs a smaller subset. A shared evaluator builder is therefore a
-prerequisite for claiming one language environment across human and agent surfaces.
+The former composition gap is now narrowed by `shoal-host::SessionBootstrap`: local and kernel
+evaluators share config snapshots, aliases/environment, adapters, plugins, Reef inputs, and init
+files. Surface-owned behavior remains deliberately different: only the interactive CLI owns the
+prompt/editor/history UI, while the durable kernel owns authenticated attachments, refs, PTYs, and
+its coarse execution journal.
 
 ```mermaid
 flowchart TB
 accTitle: Host-surface parity
 accDescr: Shows the components and relationships described in Host-surface parity.
-  Core["AST + syntax + evaluator"] --> Local["local host builder"]
-  Core --> Kernel["kernel Session::new"]
-  Local --> LC["config + init + adapters + Reef + prompt + journal"]
-  Kernel --> KC["journal + event forwarding + session state"]
+  Core["AST + syntax + evaluator"] --> Shared["SessionBootstrap"]
+  Shared --> Local["local evaluator"]
+  Shared --> Kernel["principal-private kernel Session"]
+  Local --> LC["prompt + editor + line history"]
+  Kernel --> KC["attachments + refs + PTYs + wire events"]
   MCP["MCP"] --> Kernel
-  Gap["parity gap"] -.-> LC
-  Gap -.-> KC
+  Local --> Common["config + init + adapters + plugins + Reef"]
+  Kernel --> Common
 ```
 
 ## Crate-by-crate maturity ledger
@@ -134,8 +136,8 @@ Test counts should be generated by CI rather than copied into prose.
 |---|---|---|---|---|
 | `shoal-ast` | source spans and syntax-independent AST | Implemented | syntax and formatter tests consume it | serialized AST changes require wire version review |
 | `shoal-syntax` | lexing, two-mode parsing, formatting, builtin identity | Implemented | unit/integration tests and corpus parsing | `ParseCtx` availability differs by host |
-| `shoal-value` | values, rendering, methods, streams, capability ports | Implemented | method/value/stream tests and corpus | direct host filesystem calls remain beside `Fs` |
-| `shoal-eval` | scopes, calls, commands, builtins, effects, modules, Reef | Implemented | largest corpus and integration surface | child creation and command resolution are duplicated |
+| `shoal-value` | values, rendering, methods, streams, capability ports | Implemented | method/value/stream tests and corpus | shared task/stream/env mutexes still use ordinary poison-unwrapping semantics |
+| `shoal-eval` | scopes, calls, commands, builtins, effects, modules, Reef | Implemented | largest corpus and integration surface | child creation is unified; broader command resolution remains distributed |
 | `shoal-exec` | capture, process groups, cancellation, PTY, sandbox launch | Implemented on Unix | real subprocess and PTY tests | ConPTY/Windows absent; pin check remains pre-exec |
 | `shoal-leash` | effects, plans, policy, enforcement reporting/backends | Implemented, platform-limited | policy unit tests and backend integration | no network containment backend |
 | `shoal-journal` | entry lifecycle, CAS, undo, pins, GC, transcript payloads | Implemented | schema, CAS, undo, GC tests | schema v1 has no row-kind/parent relation |
@@ -145,15 +147,15 @@ Test counts should be generated by CI rather than copied into prose.
 | `shoal-prompt` | pure prompt model, style, module rendering | Implemented | snapshots and renderer benchmark | CLI producer omits or hardcodes model fields |
 | `shoal-secret` | redacted secret value and storage abstraction | Implemented, narrow | focused value/store tests | not every execution path is capability-injected |
 | `shoal-picker` | structured interactive selection | Implemented locally | evaluator/terminal tests | terminal-only and not an agent protocol |
-| `shoal-proto` | JSON-RPC shapes, refs, wire values, numeric errors | Implemented with drift | serialization tests | DateTime producer violates its RFC3339 comment |
+| `shoal-proto` | JSON-RPC shapes, refs, wire values, numeric errors | Implemented | serialization tests | compatibility is preview-only and unversioned beyond AST/security fields |
 | `shoal-auth` | token persistence and validation | Partial lifecycle | token tests and kernel attach path | kernel snapshots store at startup; create/revoke require restart; profile/caps are metadata only |
-| `shoal-kernel` | sessions, RPC, refs, plans, tasks, PTYs, events | Implemented with hardening debt | unit, daemon, restart, and live MCP tests | memory-only live state, coarse/fine rows, pre-cap frame allocation |
-| `shoal-mcp` | MCP tools/resources over kernel socket | Implemented | unit and live-kernel tests | subscription cancellation ownership is missing |
+| `shoal-kernel` | sessions, RPC, refs, plans, tasks, PTYs, events | Implemented with hardening debt | unit, daemon, restart, and live MCP tests | memory-only live state, coarse/fine rows, unbounded raw/blob responses |
+| `shoal-mcp` | MCP tools/resources over kernel socket | Implemented | unit and live-kernel tests | each active resource subscription costs one socket and thread |
 | `shoal-lsp` | editor diagnostics, completion, symbols | Partial | protocol/unit tests | lexical index cannot model evaluator/module scope fully |
 | `shoal-history` | journal inspection CLI | Implemented | CLI behavior through journal API | by-ID lookup scans a broad query; state root differs |
 | `shoal-doctor` | installation and environment diagnostics | Implemented, platform-limited | focused checks | Unix socket check is explicitly unsupported elsewhere |
-| `shoal` | local CLI, REPL, prompt producer, composition root | Implemented | CLI/config/interactive tests | composition duplicates kernel setup |
-| `shoal-wasm` | isolated Wasmtime runtime limits | Scaffolded | leaf tests | no evaluator, value, effect, or host ABI integration |
+| `shoal` | local CLI, REPL, prompt producer, composition root | Implemented | CLI/config/interactive tests | interactive UI remains host-owned; default REPL uses a private kernel |
+| `shoal-wasm` | Wasmtime component runtime and ABI v1 | Implemented, narrow | runtime/evaluator integration and adversarial limit tests | host ABI exposes only declared time/read capabilities and command invocation |
 
 ## Language implementation matrix
 
@@ -167,7 +169,7 @@ Test counts should be generated by CI rather than copied into prose.
 | pipelines and redirection | Implemented | AST/evaluator/corpus | values stay structured only on Shoal-aware edges |
 | match and patterns | Implemented | evaluator/corpus | pattern expansion belongs to eval, not parser |
 | functions and closures | Partial | call/corpus tests | scalar annotations and return annotations are not uniformly enforced |
-| modules and exports | Implemented | module integration tests | module cache and child context need coordinated invalidation/inheritance |
+| modules and exports | Implemented | module integration tests | module cache is evaluator-local and has no hot invalidation |
 | interpreter blocks | Implemented | parser and adapter fixtures | parser names and adapter `class` are two authorities |
 | formatter round trip | Implemented | syntax tests | semantic comments/trivia behavior remains part of the contract |
 
@@ -185,7 +187,7 @@ the older 1,218/74 figure from the retired roadmap back into current docs.
 | string/bytes | yes | yes | bounded/elided | text and bytes must not be conflated at OS boundaries |
 | path | yes | yes | lossless path form | non-UTF-8 preservation must survive every new conversion |
 | list/record/table/range | yes | yes | recursive with budget | sequence metadata advertises `.get` for receivers dispatch rejects |
-| duration/datetime/size | yes | yes | typed variants | kernel DateTime currently emits Unix seconds as a string |
+| duration/datetime/size | yes | yes | typed variants | DateTime wire strings are RFC 3339 via `jiff::Timestamp` display |
 | outcome/error | yes | yes | refs/elision | optional outcome spans are preserved; reconstructed/builtin values can have no anchor |
 | stream/channel | yes | yes | label/ref only | no wire pull protocol for stream items |
 | task/plan/secret | yes | yes | scoped refs/redaction | restart cannot reconstruct live identity-bearing values |
@@ -225,10 +227,10 @@ planned/denied without a claim that allowed traffic is network-confined.
 | watch/tail/every | Implemented | sink-to-source propagation | bounded/coalescing source queues | filesystem watch still touches host APIs directly |
 | language channel | Implemented | stream consumer lifecycle | replay/live model | `user.*` bridge prevents spoofing kernel channels |
 | kernel EventBus | Implemented with scale limits | unsubscribe/disconnect closes queue | 1,024 replay ring; 256-event subscriber queues with coalesced gap summaries | one dedicated writer thread per subscription |
-| language EventBus | Partial | stream drop prunes sender | 1,024 replay ring; live `mpsc` subscriber queues are unbounded | clones/sends while holding the channel-map mutex |
-| stream to command stdin | Aspirational | — | — | returns `type_error`: not implemented |
+| language EventBus | Implemented with scale limits | stream drop closes/prunes its queue | 1,024 replay ring; 256-event subscriber queues with explicit gap records | publishing clones bounded events while holding the channel-map mutex |
+| stream to command stdin | Implemented for capture mode | command/caller cancellation stops the pump | 16 queued chunks, each at most 64 KiB | PTY mode rejects stream stdin; no wire stream-pull protocol |
 | stream over wire | Scaffolded label | no pull cancellation | no cursor/item budget | `WireValue::Stream` is descriptive only |
-| WASM invocation | Scaffolded | fuel only in leaf | memory/table/instance limits | no evaluator caller or wall deadline |
+| WASM invocation | Implemented preview ABI | fuel, epoch deadline, and session cancellation | memory/table/instance/argument/value/hostcall limits | synchronous component compilation is bounded by component bytes, not a wall interrupt |
 
 The former child-context escalation defect is closed: production child evaluators for `spawn`,
 parallel, channels, scripts, and streams build through one audited constructor carrying Leash,
@@ -244,13 +246,14 @@ new direct child construction. Future child factories must extend that explicit 
 | kernel socket permissions | Implemented | bound socket is set to mode `0600` on Unix |
 | persisted bearer tokens | Partial lifecycle | `TokenStore::validate` gates attach, but the kernel never reloads external create/revoke writes |
 | token profile/cap strings | Informational | returned in attach metadata; no Leash/handler authorization consumes them |
-| named-session ownership | Unsafe partial | the principal is used when a session name is first created; later principals can receive the same session |
-| task/PTY ref scoping | Implemented within session model | handlers compare session identity; inherited session ownership weakness still matters |
+| named-session ownership | Implemented principal-private identity | registry keys are `(principal, visible Session name)`; equal visible names do not share evaluators or quotas |
+| task/PTY ref scoping | Implemented exact-owner model | handlers and registries use the same principal+Session owner key |
 | live state after restart | intentionally absent | sessions, plans, approvals, tasks, PTYs, refs, and subscriptions are memory-only |
 
-Session identity must be fixed before treating names as tenant boundaries. Either key sessions by
-authenticated owner plus name or persist an explicit ACL and reject unauthorized attach. A journal
-principal column does not repair access control after a shared evaluator has already been returned.
+Principal-private keys close the former cross-principal aliasing defect, but they do not turn one
+process into a hard hostile-tenant boundary. Principals still share process memory budgets, global
+kernel resources, and persisted state roots; mutually hostile tenants need separate OS users,
+processes, and state directories.
 
 Token administration also needs an honest serving-state contract. `shoal-token` atomically rewrites
 disk state, while the kernel retains the `TokenStore` it opened at startup. A newly created token is
@@ -290,12 +293,11 @@ ingestion close the original authority/allocation defects. The following contrac
 
 - `value.get` with `format = "raw"` can return full `raw_base64` without the ordinary 64 KiB clamp;
 - MCP does not special-case that raw payload, so the bypass crosses the facade;
-- DateTime wire values are documented as RFC3339 but produced as Unix-second decimal strings;
 - outcome spans now travel when `OutcomeVal` carries one, including through elision, and are omitted
   honestly when the producer has no source anchor;
 - `task.suspend` and `task.resume` return `TASK_CONTROL_UNAVAILABLE`;
-- kernel live events use bounded 256-event subscriber queues and coalesced gap summaries, but the
-  separate in-language EventBus still uses unbounded subscriber channels;
+- kernel and in-language events both use bounded 256-event subscriber queues with explicit/coalesced
+  gap summaries;
 - journal and transcript cursors survive restart through durable indexes, while most other state
   does not.
 
@@ -305,10 +307,9 @@ explicit offset/length budget or blob/ref resource contract. “Raw” must not 
 ### MCP facade
 
 Tools and resources map to real kernel methods and have live-kernel integration coverage. MCP does
-not embed the evaluator, which keeps one source of runtime truth. However, resource unsubscribe
-currently acknowledges without owning and terminating the dedicated subscription connection/thread.
-Repeated subscribe/unsubscribe therefore has a lifecycle leak until the facade stores cancellation
-handles.
+not embed the evaluator, which keeps one source of runtime truth. The facade owns each resource
+subscription worker: `resources/unsubscribe` removes it, shuts down its dedicated socket, and joins
+the forwarding thread. The remaining scale cost is one connection and OS thread per active URI.
 
 ### Refs and elision
 
@@ -458,15 +459,16 @@ results from desired ceilings.
 
 ### Known quality gaps
 
-- workspace lint tables exist, but member manifests do not inherit them;
-- stronger lint candidates have live violations and must not be enabled as decorative policy;
+- every workspace member inherits the workspace lint table; stronger deferred lints still have live
+  violations and are tracked rather than enabled decoratively;
 - two corpus harnesses duplicate fixture/schema behavior;
 - `NO_COLOR=1` in the ambient environment makes ANSI-expecting highlighter tests fail; the same 13
   tests pass when that variable is unset;
 - test presence is uneven across crates, with significant inline unit coverage that directory counts
   do not reveal;
-- protocol bounds, slow-consumer behavior, principal isolation, and child-capability inheritance need
-  dedicated adversarial tests.
+- protocol framing, slow-consumer gap accounting, principal isolation, child-capability inheritance,
+  poison quarantine, and plugin deadlines have dedicated adversarial tests; unbounded raw/blob reads
+  and broader OS/platform matrices remain coverage and design gaps.
 
 ## Historical-document reconciliation
 
@@ -478,11 +480,11 @@ internal atlas; their counts and status language are not current authority.
 | `docs/VISION.md` | typed values, explicit effects, shared agent/human semantics | system map, value/effect pages | the default REPL now executes through an isolated private kernel, while durable machine kernels remain a separate trust/state domain |
 | `docs/ROADMAP.md` | wave rationale and original acceptance criteria | this page and roadmap | “done” waves concealed host/security/lifecycle qualifications; counts were stale |
 | `docs/TDD.md` | grammar, semantics, errors, edge rulings | language conformance contract | old corpus count and some later feature statuses drifted |
-| `docs/STREAMS.md` | one stream model, explicit consumption/backpressure | streams and channels | stream-to-stdin and wire pulling are still absent |
+| `docs/STREAMS.md` | one stream model, explicit consumption/backpressure | streams and channels | bounded stream-to-stdin is implemented; wire pulling remains absent |
 | `docs/IO.md` | typed stdin, interpreter blocks, runner UX | process execution, calls/modules, Reef | bare path auto-run remains `.shl`-only |
 | `docs/REEF.md` | reproducible scope/lock/provider/view model | Reef resolution | fail-soft discovery/cache/probe details need stronger caveats |
 | `docs/CONFIG.md` | typed layered configuration | configuration reference | several documented keys parse but do nothing |
-| `docs/AGENT-SURFACE.md` | refs, elision, events, tools, PTYs | kernel protocol and agent/MCP | raw fetch bypass, unsubscribe lifetime, and restart limits needed correction |
+| `docs/AGENT-SURFACE.md` | refs, elision, events, tools, PTYs | kernel protocol and agent/MCP | raw fetch bounds, subscription cost, and restart limits needed qualification |
 | `docs/CONTRACTS.md` | public APIs and dependency direction | intercrate protocol contracts | some pinned prose lagged current types and wire behavior |
 | `docs/BENCHMARKS.md` | performance budgets and commands | tooling and quality | targets were not continuously measured assertions |
 
@@ -491,9 +493,9 @@ internal atlas; their counts and status language are not current authority.
 | Old wave | Honest current disposition |
 |---|---|
 | R0 interactive ergonomics | Implemented on the local shell; host-specific exit/render behavior remains deliberately owned there. |
-| R1 streams/channels | Core language path implemented; stream stdin, wire pulling, and some live backpressure remain open. |
+| R1 streams/channels | Core language path and bounded stream stdin are implemented; wire pulling and cross-surface scaling remain open. |
 | R2 namespaces/builtins | Implemented; security meaning of network effects remains policy-only. |
-| R3 modules/tasks/plan/undo | Mostly implemented; kernel task control and cross-child authority inheritance are incomplete. |
+| R3 modules/tasks/plan/undo | Mostly implemented; unified child authority inheritance is complete, while kernel task suspend/resume remains unavailable. |
 | R4 ports/modularization | Structural split and several ports implemented; direct host calls and resolution duplication remain. |
 | R5 corpus/docs/polish | Corpus target exceeded; this Zola atlas replaces duplicated wiki/root status prose; polish is continuous. |
 
@@ -516,22 +518,20 @@ Before calling a subsystem “done,” answer all of these with links to executa
 
 This is a status list, not the work order; ordering and exit criteria live in the roadmap.
 
-1. `cap.request` can approve a stored plan without an authenticated attachment, and
-   `journal.query` exposes shared journal rows without caller scoping;
+1. raw value/blob retrieval can materialize an entire owner-scoped payload without a server-side
+   range or response cap;
 2. token create/revoke changes are invisible to a running kernel and token cap/profile fields are
    descriptive rather than enforced;
-3. child evaluators can lose the parent’s Leash and related capabilities;
-4. named kernel sessions are not durably owned by the authenticated principal;
-5. local and kernel evaluator composition roots diverge materially;
-6. raw value fetch and newline-free frame accumulation bypass intended wire bounds;
-7. MCP does not own facade-side subscription lifetimes, and the separate language EventBus remains
-   unbounded even though the kernel EventBus is bounded;
-8. plan refs collide across equal effect shapes and journal coarse/fine rows lack an explicit
-   relationship;
-9. accepted configuration fields overstate host behavior;
-10. Reef discovery, caching, probe authority, and lock persistence favor silent continuation;
-11. stream stdin/wire transport and kernel task control are incomplete;
-12. WASM remains a leaf scaffold, and Windows remains a separate architecture project.
+3. accepted journal/render configuration fields overstate host behavior;
+4. journal coarse/fine rows lack an explicit relationship;
+5. Reef discovery, caching, probe authority, and lock persistence favor silent continuation;
+6. wire stream pulling and kernel task control are incomplete;
+7. MCP subscriptions remain one connection/thread per active URI;
+8. command resolution and method metadata still have duplicated truth sources;
+9. filesystem/network sandbox coverage is platform- and effect-limited;
+10. plugin ABI v1 is deliberately narrow and synchronous component compilation is only byte-bounded;
+11. default temporary trash has no retention/prune lifecycle and does not free disk immediately;
+12. Windows remains a separate architecture project.
 
 ## Audit maintenance protocol
 

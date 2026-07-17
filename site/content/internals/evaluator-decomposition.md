@@ -1,40 +1,40 @@
 +++
 title = "Evaluator decomposition (HR-J2)"
-description = "Design record for splitting the Evaluator god-context into three cohesive sub-contexts behind the HR-B1 child constructor: a full field census, the target ownership shape, the invariants the split must enforce, and a staged, individually-gateable extraction plan."
+description = "Implementation record for splitting the Evaluator god-context into three cohesive sub-contexts behind the audited child constructor, preserving the pre-change field census and invariants."
 weight = 125
 template = "docs/page.html"
 
 [extra]
 group = "Maintenance"
-eyebrow = "Design record"
-status = "Design — staged extraction, not yet started"
+eyebrow = "Implementation record"
+status = "Implemented — three-context evaluator and unified child construction"
 audience = "Runtime and security contributors"
 wide = true
 +++
 
-This page is the design deliverable for hardening task **HR-J2** on the
+This page began as the design deliverable for hardening task **HR-J2** on the
 [hardening roadmap](@/internals/hardening-roadmap.md), promoted from wave 3 to wave 2 on
 2026-07-16 because it is the structural root cause behind the audit's worst findings. The
 [2026-07-16 deep audit](@/internals/deep-audit-2026-07-16.md) records it as **H1**: `Evaluator`
-is a large mutable god-context (environment, cwd, adapters, jobs, reef, journal, security,
-modules, event bus, ports, config, …), and manual child setup across that context *directly
-caused* the B-findings (children silently lose the active leash policy, reef resolution inputs,
-and config). Decomposing the context is what makes those losses impossible **by construction**
-rather than by discipline.
+recorded a large mutable god-context (environment, cwd, adapters, jobs, reef, journal, security,
+modules, event bus, ports, config, …), where manual child setup *directly caused* the B-findings.
+That pre-change diagnosis is preserved below; the decomposition and unified child constructor are
+now implemented.
 
-This is a design record, not an implementation. It proposes the target shape and a staged
-extraction plan; no Rust changes land from this page. It **builds on the HR-B1 seam** — the
-single authoritative child-evaluator constructor introduced by workstream B — and assumes that
-seam exists as its prerequisite.
+`Evaluator` now contains exactly `Arc<HostServices>`, `SessionCtx`, and `ExecState`.
+`Evaluator::child_context()` captures those three ownership domains and
+`ChildContext::build(ChildKind, CancelToken)` is the only production child construction path for
+spawn, scripts, parallel calls, channel handlers, and stream pumps. The constructor destructures the
+captured context so omitting an already-captured capability is a compile error; a source-inventory
+test rejects new manual `Evaluator::new` child sites.
 
-The authoritative live description of today's state is
-[evaluator state and control flow](@/internals/evaluator-state.md); read its "Child evaluator
-inheritance" and "Critical: current children do not satisfy that matrix" sections first. This
-page does not restate that prose — it turns it into a field-level ownership plan.
+The authoritative live description is [evaluator state and control flow](@/internals/evaluator-state.md).
+The field census and schedule below are retained as implementation rationale, not as claims that
+the old flat layout or authority escape still exists.
 
 ## Why decompose
 
-The `Evaluator` struct holds **40 fields** on one flat object. Four production paths build a
+Before HR-J2, `Evaluator` held **40 fields** on one flat object. Four production paths built a
 child evaluator by hand — `script.rs::spawn_block`, `script.rs::run_script_file`,
 `host.rs::builtin_parallel`, `channels.rs::builtin_on` — and each manually copies a *different
 subset* of those 40 fields. Every field a site forgets is a capability a child silently loses.
@@ -46,7 +46,7 @@ four sites. The fix is structural: group the 40 fields into a small number of co
 sub-contexts whose ownership and child-inheritance rules are encoded in *types*, so the compiler —
 not a reviewer — enforces that a child inherits its parent's authority and resolution inputs.
 
-## Field census
+## Pre-implementation field census
 
 Every `Evaluator` field, grouped by lifetime and annotated with the modules that mutate and
 consume it. Evidence is module names (stable) rather than line numbers (which rot). "Mutated by"
@@ -164,10 +164,10 @@ The genuinely mutable state that advances as a program runs. Sub-grouped by fine
 |---|---|---|---|
 | `jump_store` | `Option<PathBuf>` | frecency | frecency persistence target; `None` disables writes |
 
-### What the four child sites copy today
+### What the four child sites copied before HR-J2
 
-The census makes the drift concrete. Confirmed by reading `spawn_block`, `run_script_file`,
-`builtin_parallel`, and `builtin_on`:
+The census made the drift concrete in the pre-change `spawn_block`, `run_script_file`,
+`builtin_parallel`, and `builtin_on` implementations:
 
 | Capability | `spawn` | `.shl` script | `parallel` | `on` handler |
 |---|:--:|:--:|:--:|:--:|
@@ -182,18 +182,19 @@ The census makes the drift concrete. Confirmed by reading `spawn_block`, `run_sc
 | `cancel` wiring | fresh, linked to task | **fresh, unlinked** | **fresh, unwired** | fresh, linked to task |
 | journal handle | not inherited (rule) | not inherited (rule) | not inherited (rule) | not inherited (rule) |
 
-Two omissions are worth flagging beyond the audit's B-table (which lists spawn's losses as only
+Two omissions were worth flagging beyond the audit's B-table (which listed spawn's losses as only
 leash + reef): **`spawn_block` also drops the `config` port** (it copies the five other ports by
 hand but not `config`; only `run_script_file` keeps config, because only it calls
 `inherit_ports`), and **cancellation propagation is silently inconsistent** — `run_script_file`
 gives its child a fresh `CancelToken` that is never linked to the parent, and `builtin_parallel`
 neither links a token nor installs an `on_cancel` hook, so **parallel children are effectively
 uncancellable**. These belong on the audit page as refinements of B3 and as a cancellation-scope
-finding.
+finding. They motivated the typed child seed and cancellation rules now in `child_context.rs` and
+`exec_state.rs`.
 
-## Target shape
+## Implemented shape
 
-Collapse the 40 flat fields into a three-field façade:
+The implementation collapses the 40 flat fields into a three-field façade:
 
 ```rust
 pub struct Evaluator {
@@ -203,16 +204,16 @@ pub struct Evaluator {
 }
 ```
 
-The `Evaluator::child(...)` constructor from HR-B1 takes `Arc<HostServices>` and a `SessionCtx`
-as **non-optional** parameters and constructs a fresh-or-inherited `ExecState` according to a
-`ChildKind` enum (`Spawn`, `Script`, `Parallel`, `OnHandler`). Because the first two parameters
-are required and typed, a child that omits the parent's authority or resolution inputs **does not
-compile**.
+`Evaluator::child_context()` captures `Arc<HostServices>`, `SessionCtx`, and an explicit
+`ChildExecSeed`; `ChildContext::build` consumes them and constructs a fresh/inherited `ExecState`
+according to `ChildKind` (`Spawn`, `Script`, `Parallel`, `OnHandler`, or `StreamPump`). Because the
+captured fields are required and destructured, a child that omits the parent's captured authority or
+resolution inputs **does not compile**.
 
 ### `HostServices` — `Arc`, shared, unconditionally inherited
 
 Holds Class 1. Wrapped in a single `Arc<HostServices>`; a child clones the `Arc` (one refcount
-bump), never the contents. `adapters` moves behind the `Arc` too (today it is deep-cloned at each
+bump), never the contents. `adapters` moved behind the `Arc` too (it was deep-cloned at each
 child site — the `Arc` makes that free). Setters (`set_fs`, `set_adapters`,
 `set_reef_resolver`, …) run only during host setup, before any child exists; at runtime
 `HostServices` is read-only.
@@ -251,7 +252,7 @@ a `.shl` script child takes a **fresh root `env`** (intended isolation) but stil
 |---|---|---|
 | env | inherit for closure children; fresh root for scripts | closures need capture; scripts must not leak `let`s back to the parent |
 | cwd, process_env, oldpwd, dir_stack | inherit (snapshot) | commands need the caller's dynamic context |
-| reef_overrides, reef_chain, reef_lock, reef_lock_path | **inherit** | a `spawn` inside `with reef:` must honor the override and the locked versions; today all four are dropped |
+| reef_overrides, reef_chain, reef_lock, reef_lock_path | **inherit** | a `spawn` inside `with reef:` must honor the override and the locked versions; the pre-change children dropped all four |
 | cancel | fresh, **linked to the child's task** | fixes the unwired-cancel gap in script/parallel |
 | call_depth, in_fn_body | fresh (0) | recursion / `fn`-body nesting is per-eval |
 | it, pending_exit, pending_stop | fresh | top-level result and exit/stop notices are per-run and host-consumed |
@@ -293,18 +294,16 @@ The decomposition is only worth doing if it makes these true **by construction**
   unchanged; the census is the proof that no field is added, dropped, or re-typed in a
   behavior-visible way.
 
-## Staged extraction plan
+## Historical staged extraction plan
 
-Ordered, individually gateable steps. Each step **compiles and passes the full gate**
-(`fmt` + `clippy -D warnings` + workspace tests + conformance) on its own, so any step can land
-as a standalone PR and the sequence can pause between steps. Six agents are concurrently editing
-`shoal-eval`; the ordering keeps the broad-rename steps *last* and names the workstream each step
-collides with so waves can be scheduled around it.
+The following is the individually gateable sequence used to land the implementation. It is retained
+to explain why the broad field moves followed the security seam and characterization tests; the
+steps are complete, and the old conflict notes are historical.
 
-**Step 0 (prerequisite, in flight).** HR-B1 lands the single `Evaluator::child(...)`
-constructor. Every step below routes through it. No work here — it is the seam.
+**Step 0 (completed prerequisite).** HR-B1 landed the single child-context constructor. Every
+production child route now uses that seam.
 
-**Step 1 — Decomposition characterization tests (test-module only).** Before any struct moves,
+**Step 1 — Decomposition characterization tests (completed).** Before any struct moves,
 pin the target invariants: assert that a child built via each `ChildKind` (`spawn`, `parallel`,
 `on`, `.shl`) observes the parent's leash policy, reef resolution inputs, config port, and
 journal identity. Test-module-only; conflicts with nobody; turns every later step into a provable
@@ -312,7 +311,7 @@ no-op. *Overlaps HR-B7* — coordinate so the two suites do not duplicate; this 
 decomposition's field-level invariants specifically.
 *Size: ~1 agent-day. Conflicts: none (test module).*
 
-**Step 2 — Extract `SessionCtx`.** Move `principal`, `session_id`, `leash`, `echo_mode`,
+**Step 2 — Extract `SessionCtx` (completed).** Move `principal`, `session_id`, `leash`, `echo_mode`,
 `interactive`, `journal`, `sink` into a `SessionCtx` struct; access via `self.session.…`. Make
 the child constructor take it by value. This step alone retires the H1 → B security core: after
 it, a child cannot be built without a `SessionCtx`.
@@ -320,14 +319,14 @@ it, a child cannot be built without a `SessionCtx`.
 `principal`/attribution, and `command.rs` leash reads. Schedule **after** the D-wave lands or
 pair with the D agent; this is the one high-overlap step.*
 
-**Step 3 — Group the reef overlay + cache into the child-inherited set.** Bundle
+**Step 3 — Group the reef overlay + cache into the child-inherited set (completed).** Bundle
 `reef_overrides`, `reef_chain`, `reef_lock`, `reef_lock_path` into a `ReefState` sub-struct inside
 `ExecState`, and make the constructor clone it into children. Closes the reef half of finding B
-(children currently drop all four).
+(the pre-change children dropped all four).
 *Size: ~1 agent-day. Conflicts: **HR-J1** (centralized resolution) and any reef work touching
 `reef_resolve.rs`/`reef_builtins.rs`. Coordinate with the resolution refactor.*
 
-**Step 4 — Extract `HostServices` behind `Arc`.** Move the ten Class-1 fields into
+**Step 4 — Extract `HostServices` behind `Arc` (completed).** Move the ten Class-1 fields into
 `HostServices`, hold `Arc<HostServices>`, rewrite `self.fs` → `self.host.fs` (and siblings)
 across ~15 modules, and replace `inherit_ports` with `host: parent.host.clone()`. Mechanically
 simple (these fields are never eval-mutated) but the **broadest textual rename** in the plan.
@@ -335,14 +334,14 @@ simple (these fields are never eval-mutated) but the **broadest textual rename**
 **HR-A9** reads `adapters`/reef inputs. Schedule in a low-contention window **after** C and A9
 settle; the rename is mergeable but noisy.*
 
-**Step 5 — Extract `ExecState` and collapse `Evaluator` to the three-field façade.** Move the
+**Step 5 — Extract `ExecState` and collapse `Evaluator` to the three-field façade (completed).** Move the
 remaining Class-3 fields into `ExecState`; `Evaluator` becomes `{ host, session, exec }`. Field
 moves within `stmt.rs`/`command.rs`/`expr*.rs`/`call.rs`/`modules.rs`. Broad but mechanical.
 *Size: ~1–2 agent-days. Conflicts: touches the "hot" eval-heavy modules every language change
 edits — schedule when eval edit pressure is low; individually gateable because it is a pure field
 move.*
 
-**Step 6 — Delete `inherit_ports` and every manual child field-copy (finishes HR-B6).** With the
+**Step 6 — Delete `inherit_ports` and every manual child field-copy (completed HR-B6).** With the
 three contexts in place, `Evaluator::child` is the only way to build a child. Remove
 `inherit_ports`, the hand-copies in `spawn_block`/`run_script_file`/`builtin_parallel`/
 `builtin_on`, and privatize `Evaluator::new` field access so no site can under-inherit again.
@@ -350,7 +349,7 @@ Verify no `Evaluator::new`-plus-manual-copy survives outside the test module.
 *Size: ~1 agent-day. Conflicts: `script.rs`/`host.rs`/`channels.rs` child sites — coordinate with
 anyone editing those concurrency paths.*
 
-### Conflict schedule at a glance
+### Historical conflict schedule at a glance
 
 | Step | Primary files | Conflicts with | Scheduling note |
 |---|---|---|---|
@@ -361,9 +360,9 @@ anyone editing those concurrency paths.*
 | 5 | stmt/command/expr/call/modules | eval-heavy work | low eval-edit-pressure window |
 | 6 | script.rs, host.rs, channels.rs | concurrency-path edits | coordinate on child sites |
 
-Steps 1–3 can proceed early and independently of the broad renames. Steps 4–6 are the noisy
-finish and should be serialized into a quiet window; none of them changes behavior, so they carry
-schedule risk (merge conflicts), not correctness risk.
+Steps 1–3 proceeded ahead of the broad renames; steps 4–6 completed the three-context façade and
+removed manual child copies. Future fields must still be classified deliberately as shared,
+inherited/root-only, or fresh execution state and covered by child-inheritance tests.
 
 ## Non-goals
 

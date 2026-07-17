@@ -105,18 +105,23 @@ Request:
 | `client.kind` | string | descriptive client class |
 | `client.tty` | bool | retain terminal color in bounded renders when true |
 
-With a token, `TokenStore::validate` supplies `principal`, token caps, and profile. Without a token,
-the caller becomes `uid:<effective-uid>` with profile `local-human`. An ephemeral kernel has no token
-store and rejects a supplied token. Calling attach again replaces that connection's attachment.
+With a token, `TokenStore::validate` supplies `principal`, token caps, and profile. A tokenless public
+socket caller becomes restricted `agent:mcp`; it cannot assert local-human authority. Only the
+server-selected inherited descriptor used by the private REPL may attach as
+`uid:<effective-uid>`/`local-human`. An ephemeral kernel has no token store and rejects a supplied
+token. Calling attach again replaces that connection's attachment and removes subscriptions owned
+by the previous attachment.
 
 The persistent kernel loads `tokens.json` once at startup. `shoal-token` is a separate process whose
 create/revoke writes are not observed until the kernel restarts; already-loaded expirations still
 become invalid as wall time advances. The returned profile and cap strings are descriptive metadata,
 not grants. Only principal-based Leash policy and handler ownership checks authorize operations.
 
-The session map is currently keyed only by `session` name. `principal` is consulted when the name is
-first created; later callers receive the cached session. This is not a safe multi-principal ownership
-model.
+The session registry is keyed by `(principal, visible Session name)`. Reconnecting as the same
+principal/name returns the same live evaluator; another principal using the same visible name gets a
+different evaluator, refs, tasks, PTYs, event rings, and quota accounting. This is strong in-process
+ownership isolation, not a hard hostile-tenant boundary: principals still share the kernel process,
+global resource budgets, and configured state root.
 
 Result fields:
 
@@ -130,10 +135,14 @@ Result fields:
 | `caps_enforced` | whether a real backend and non-permissive policy combine to enforce |
 | `elide_defaults` | default value budgets |
 | `channels` | static kernel channels: transcript, journal, approval, render |
+| `auth_mode`, `connection_trust` | bearer/restricted/private-human attachment provenance |
+| `session_isolation` | current principal-private Session isolation contract |
+| `security_epoch` | attachment security contract revision |
 
-Creation installs a fresh evaluator at the kernel process cwd, default jump history, an optional
-second journal handle onto the same state directory, and the `user.*` language-to-wire event bridge.
-It does not assemble the local CLI's layered config/init/adapters/Reef environment.
+Creation applies the shared host bootstrap at the kernel process cwd: config snapshot,
+aliases/environment, adapters, WebAssembly plugins, Reef inputs, and init files. It then installs the
+authenticated kernel policy, default jump history, an optional second journal handle onto the same
+state directory, and the `user.*` language-to-wire event bridge.
 
 ### `session.env`
 

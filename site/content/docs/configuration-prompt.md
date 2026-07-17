@@ -182,15 +182,18 @@ The table below reflects the schema and defaults in the current code. An empty â
 | `kernel.session` | string, `"default"` | Names the principal-private Session inside the default REPL's private kernel. It does not attach to a durable public kernel socket. |
 | `journal.enabled` | boolean, `true` | Not currently honored by the local REPL, which opens its journal directly. |
 | `journal.state_dir` | path or absent | Not currently used by the local REPL journal path. |
-| `leash.policy` | path or absent | Passed to the default interactive REPL's private kernel. The explicit standalone and noninteractive local-evaluator paths do not load it here. |
+| `leash.policy` | path or absent | Loaded fail-closed by the shared host bootstrap for local/kernel evaluators and passed to the default private REPL kernel. |
 
 `history.dedup` compares with the immediately preceding entry, including the last entry read from a previous session. An environment name that is nonempty but cannot be expressed as a Shoal identifier can pass generic validation yet produce a startup warning when the host tries to apply it.
 
 The default interactive REPL spawns a listener-free private kernel and connects over an inherited anonymous descriptor. Each shell gets isolated live bindings, `it`/`out`, cwd, jobs, and policy state; it does not join the named-socket kernel used by MCP/agents. `shoal --standalone` and `kernel.enabled = false` select the in-process evaluator path. Kernel process flags and token policy are documented in [Agents, kernel, and MCP](@/docs/agents-kernel-mcp.md); durable execution history is covered in [Filesystem, jobs, and history](@/docs/filesystem-jobs-history.md).
 
-### Adapter-directory caveat
+### Adapter-directory precedence
 
-`adapters.dirs` is intended as an ordered extension path, and later entries can shadow earlier definitions. In the current implementation, loading a configured directory replaces the evaluator's active adapter catalog at each step. Consequently, the last successfully loaded custom directory can become the active catalog rather than merely augmenting the bundled one. Completion may still show names from all discovered catalogs. Treat a custom directory as a complete catalog until this is corrected, and use `^command` when you deliberately want to bypass adapters.
+`adapters.dirs` is an ordered extension path. The bundled catalog loads first; each configured
+directory overlays it, and a later definition replaces only a matching command head. Shoal warns
+when an overlay shadows an earlier head. Completion and dispatch are assembled from the same ordered
+catalog set. Use `^command` when you deliberately want to bypass the resulting adapter.
 
 ## Environment overrides
 

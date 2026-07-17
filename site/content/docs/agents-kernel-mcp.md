@@ -416,16 +416,19 @@ The raw method set is broader than MCP tools and includes parsing, completion, e
 - The default REPL uses its own listener-free private kernel; it does not join the durable MCP/agent kernel. Explicit `--standalone` does not use kernel sessions.
 - Kernel transport is Unix-socket/Unix-API based; Windows is not implemented.
 - Stream values carry only a label; no wire chunk-pull protocol exists.
-- Stream `.feed` is also unavailable inside the language.
+- Language streams can feed captured commands through a bounded incremental stdin queue; streams
+  still have no item-pull representation on the kernel wire.
 - Task output is captured as one value on completion, not incrementally cursor-readable.
 - Task suspend/resume is unavailable on the kernel wire.
 - `format=raw` bytes can currently place full base64 in `structuredContent`, bypassing the nominal 64 KiB wall.
-- Datetime wire values currently contain a decimal Unix-seconds string despite the protocol type comment promising RFC3339.
 - Session `cwd` in MCP resources is cached from attach rather than refreshed from the kernel, while env/Reef views are live.
-- `resources/unsubscribe` returns success but does not currently stop the background subscription connection created by `resources/subscribe`; ending the MCP process/connection does.
+- Each active MCP resource subscription owns one dedicated kernel connection and OS thread;
+  `resources/unsubscribe` shuts down and joins that worker.
 - Plans, tasks, PTYs, transcript maps, and evaluator bindings are in-memory.
 - Per-client last `it` is tracked internally but has no read method.
-- The WebAssembly host crate is not wired into kernel execution.
+- Configured WebAssembly component plugins load through the shared host bootstrap and are callable in
+  kernel sessions. ABI v1 is narrow; fuel, epoch wall deadline, memory/table/instance, value, and
+  hostcall limits apply.
 
 These are captured in [Current status and compatibility](@/docs/status-limits.md#kernel-and-agents), not hidden behind aspirational language.
 

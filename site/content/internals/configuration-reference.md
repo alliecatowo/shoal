@@ -321,7 +321,7 @@ currently accepts and snapshots the field without applying its intended behavior
 | `reef.*` | parallel path | parallel path | Reef reparses raw user config with its own schema |
 | `kernel.enabled`, `kernel.session` | active | not consumed | default interactive execution uses an isolated private kernel; `false` selects local evaluation; session names that private principal-owned Session |
 | `journal.enabled`, `journal.state_dir` | not honored | no journal | **inert**; REPL opens default journal unconditionally |
-| `leash.policy` | active on default private-kernel REPL | not consumed | passed as the private kernel's policy; explicit standalone/noninteractive paths remain local |
+| `leash.policy` | active | active | shared bootstrap loads configured policy before evaluation; malformed configured policy fails startup rather than degrading permissively |
 
 ```mermaid
 flowchart TD
@@ -334,7 +334,7 @@ accDescr: Shows the components and relationships described in Host wiring matrix
   Config --> Init["interactive init files"]
   Config --> Kernel["private interactive kernel settings"]
   Config -. "not wired" .-> Journal["journal gate / state dir"]
-  Config -. "not wired" .-> Leash["policy load"]
+  Config --> Leash["fail-closed policy load"]
   Config -. "not wired" .-> Width["render width"]
   Files["raw config files"] --> Prompt["independent rich prompt loader"]
   Files --> Reef["independent Reef parser"]
@@ -366,8 +366,9 @@ data for `config.get` and `config.all`. This is a startup snapshot, not a live f
 environment.
 
 That snapshot exposes inert fields too. A script can observe `config.journal.enabled = false` while
-the interactive host has already opened its journal, or see a Leash path that was never loaded. The
-value accurately describes the resolved schema object but not necessarily effective host behavior.
+the interactive host has already opened its journal, or see `render.width` even though the renderer
+uses terminal/context width. The value accurately describes the resolved schema object but not
+necessarily effective host behavior.
 Internal diagnostics should eventually expose both `configured` and `effective` state.
 
 Production child evaluators now build through one audited child context and inherit the parent's
@@ -449,8 +450,6 @@ the behavioral test must demonstrate the denied/redirected/disabled operation.
 
 | Priority | Gap | Why it matters | Minimum credible repair |
 |---:|---|---|---|
-| P0 | `leash.policy` is accepted but local hosts do not load it | a security-looking setting can create false assurance | load before any evaluation; fail closed on configured-policy errors; add denial integration tests |
-| P0 | child evaluators can lose config and authority state | parent and child observe/enforce different worlds | one audited child-context constructor with inheritance tests |
 | P1 | journal enable/path settings are inert | retention and state-location policy are misleading | honor both during REPL assembly; expose effective path |
 | P1 | rich prompt and core config use different project discovery | prompt can visibly disagree with `config.all` | share a discovered layer set or explicitly separate files |
 | P1 | Reef user config is reparsed independently | schema and precedence drift can surprise users | share raw parsed layers or expose a structured handoff |

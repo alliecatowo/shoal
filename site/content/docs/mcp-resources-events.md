@@ -444,11 +444,16 @@ The kernel gives each subscriber a queue of 256 pending events and a dedicated s
 
 This tells the consumer that its live stream has a gap. Read the channel from the last processed cursor; for a ring-only channel whose gap is older than retention, reconcile from authoritative state.
 
-### Current unsubscribe limitation
+### Unsubscribe lifetime
 
-The MCP facade currently answers `resources/unsubscribe` with `{}` but does not signal or close the dedicated subscription connection/thread. The subscription normally lives until the MCP process or kernel connection ends. Avoid repeatedly subscribing to the same URI in one long-lived facade, and use process disconnect as the reliable cleanup boundary.
+The MCP facade owns one worker per subscribed URI. `resources/unsubscribe` removes that worker,
+shuts down its dedicated kernel connection, and joins its forwarding thread; disconnecting that
+connection also removes the kernel-side subscription. Repeated subscription churn therefore does
+not leak dormant workers. Active subscriptions are still comparatively expensive—one Unix socket
+and one OS thread each—so consolidate channels and bound their count.
 
-This differs from the raw kernel `events.unsubscribe`, which does remove a subscription on that same kernel connection.
+The raw kernel `events.unsubscribe` remains the lighter same-connection operation: it removes the
+named channel from the current connection without closing that connection.
 
 ## Robust event-consumer algorithm
 

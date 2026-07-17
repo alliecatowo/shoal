@@ -160,8 +160,6 @@ Full impact/mitigation: [Security and trust boundaries](@/docs/security.md).
 | --- | --- | --- |
 | Raw retrieval size bypass | `value.get format=raw` materializes full string/bytes/CAS and returns full `raw`/`raw_base64`. | Client-side limit and slices; do not fetch untrusted full blobs. |
 | `blob.get` whole blob | No range parameter. | Use value slice path when possible; bound storage/client. |
-| DateTime wire mismatch | Tagged datetime `v` is Unix-seconds decimal string despite RFC3339 comment. | Parse current form explicitly; do not assume RFC3339. |
-| MCP unsubscribe | Returns success but does not stop dedicated subscription connection/thread. | Subscribe once; terminate facade for cleanup. |
 | MCP subscription cost | One kernel connection and OS thread per resource subscription. | Bound subscriptions; consolidate channels. |
 | MCP cwd resource stale | `shoal://session/cwd` is cached at attach. | Execute `pwd` or reconnect after `cd`. |
 | Task output not streaming | `/task/{id}/out` resolves whole result only after capture. | Use lifecycle events; no incremental byte cursor yet. |
@@ -206,7 +204,8 @@ The metadata registry used by method discovery/completion has drift from actual 
 
 ### Stream caveats
 
-- `buffer(n)` is currently an identity operation in the synchronous pull model; it does not create asynchronous prefetch.
+- `buffer(n)` creates a bounded asynchronous pump, but each pump consumes a thread and the evaluator
+  admits at most 64 concurrent stream pumps. Drop or consume buffered streams promptly.
 - `.distinct()` retains all previously seen distinct values and can grow without bound. Use a finite/taken stream or `.dedupe()` for adjacent suppression.
 - live `.tee(n)` uses 64-entry per-fork queues; overflow drops values and inserts a `{dropped:n}` marker rather than raising.
 - collecting/sorting/grouping an infinite stream without a bound never completes and can exhaust memory.
@@ -243,7 +242,8 @@ Wire paths preserve raw Unix bytes alongside lossy display strings. Some other v
 - Hermetic mode removes ambient PATH tail; it does not sandbox filesystem/network/environment/syscalls.
 - Provider availability and install commands depend on host managers; offline/missing providers remain honest resolution errors.
 - Hash pins protect selected content identity at resolution, but runtime spawn pinning remains preflight/TOCTOU-prone.
-- Child evaluator policy/Reef propagation is incomplete (critical above).
+- Child evaluators inherit policy, principal, Reef/config inputs, filesystem port, and cancellation
+  through the audited child-context constructor; divergence is a security regression.
 - Windows provider/path semantics are deferred.
 
 ## Journal, history, undo, and secret limitations
