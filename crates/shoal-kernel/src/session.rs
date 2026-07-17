@@ -107,6 +107,31 @@ pub(crate) struct WireStreamCursorEntry {
     pub(crate) inner: Mutex<WireStreamCursor>,
 }
 
+impl WireStreamCursorEntry {
+    pub(crate) fn quarantine(&self) {
+        self.quarantined.store(true, Ordering::SeqCst);
+        self.cancel.cancel();
+    }
+
+    pub(crate) fn lock_cursor(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, WireStreamCursor>, RpcError> {
+        if self.quarantined.load(Ordering::SeqCst) {
+            return Err(cursor_quarantined());
+        }
+        match self.inner.lock() {
+            Ok(cursor) => Ok(cursor),
+            Err(poisoned) => {
+                // Cursor-local failure: never inspect the unknown upstream or
+                // sequence state. Cancel and detach only this cursor.
+                drop(poisoned);
+                self.quarantine();
+                Err(cursor_quarantined())
+            }
+        }
+    }
+}
+
 impl Drop for WireStreamCursorEntry {
     fn drop(&mut self) {
         self.cancel.cancel();
@@ -127,38 +152,117 @@ impl Session {
     }
 
     pub(crate) fn ensure_healthy(&self) -> Result<(), RpcError> {
-        if self.quarantined.load(Ordering::SeqCst) {
-            Err(RpcError {
-                code: INTERNAL_ERROR,
-                message: "session is quarantined after an internal panic".into(),
-                data: Some(json!({"session": self.id, "session_quarantined": true})),
-            })
+        if self.quarantined.load(Ordering::SeqCst)
+            || self.evaluator.is_poisoned()
+            || self.transcript.is_poisoned()
+            || self.out_entries.is_poisoned()
+            || self.stream_cursors.is_poisoned()
+        {
+            self.quarantine();
+            Err(self.quarantined_error())
         } else {
             Ok(())
         }
     }
 
+    fn quarantined_error(&self) -> RpcError {
+        RpcError {
+            code: INTERNAL_ERROR,
+            message: "session is quarantined after an internal state failure".into(),
+            data: Some(json!({"session": self.id, "session_quarantined": true})),
+        }
+    }
+
+    pub(crate) fn lock_evaluator(&self) -> Result<std::sync::MutexGuard<'_, Evaluator>, RpcError> {
+        self.ensure_healthy()?;
+        match self.evaluator.lock() {
+            Ok(evaluator) => Ok(evaluator),
+            Err(poisoned) => {
+                drop(poisoned);
+                self.quarantine();
+                Err(self.quarantined_error())
+            }
+        }
+    }
+
+    pub(crate) fn lock_transcript(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, HashMap<Ref, Value>>, RpcError> {
+        self.ensure_healthy()?;
+        match self.transcript.lock() {
+            Ok(transcript) => Ok(transcript),
+            Err(poisoned) => {
+                drop(poisoned);
+                self.quarantine();
+                Err(self.quarantined_error())
+            }
+        }
+    }
+
+    fn lock_out_entries(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, VecDeque<Option<i64>>>, RpcError> {
+        self.ensure_healthy()?;
+        match self.out_entries.lock() {
+            Ok(entries) => Ok(entries),
+            Err(poisoned) => {
+                drop(poisoned);
+                self.quarantine();
+                Err(self.quarantined_error())
+            }
+        }
+    }
+
+    fn lock_stream_cursors(
+        &self,
+    ) -> Result<
+        std::sync::MutexGuard<'_, HashMap<StreamCursorRef, Arc<WireStreamCursorEntry>>>,
+        RpcError,
+    > {
+        self.ensure_healthy()?;
+        match self.stream_cursors.lock() {
+            Ok(cursors) => Ok(cursors),
+            Err(poisoned) => {
+                drop(poisoned);
+                self.quarantine();
+                Err(self.quarantined_error())
+            }
+        }
+    }
+
     pub(crate) fn insert_transcript(&self, value_ref: Ref, value: Value) {
+        let _ = self.insert_transcript_checked(value_ref, value);
+    }
+
+    pub(crate) fn insert_transcript_checked(
+        &self,
+        value_ref: Ref,
+        value: Value,
+    ) -> Result<(), RpcError> {
         let id = value_ref
             .0
             .split_once(':')
             .and_then(|(_, id)| id.parse::<u64>().ok());
-        let mut transcript = self.transcript.lock().unwrap();
+        let mut transcript = self.lock_transcript()?;
         transcript.insert(value_ref, value);
         if let Some(id) = id
             && id > MAX_TRANSCRIPT_PER_SESSION as u64
         {
             transcript.remove(&Ref::new("out", id - MAX_TRANSCRIPT_PER_SESSION as u64));
         }
+        Ok(())
     }
 
     pub(crate) fn rewrite_out_undo(&self, program: &mut Program) {
-        let mut entries = self.out_entries.lock().unwrap();
-        resolve_out_undo(program, entries.make_contiguous());
+        if let Ok(mut entries) = self.lock_out_entries() {
+            resolve_out_undo(program, entries.make_contiguous());
+        }
     }
 
     pub(crate) fn push_out_entry(&self, entry_id: Option<i64>) {
-        let mut entries = self.out_entries.lock().unwrap();
+        let Ok(mut entries) = self.lock_out_entries() else {
+            return;
+        };
         if entries.len() >= shoal_eval::MAX_REPL_TRANSCRIPT_VALUES {
             entries.pop_front();
         }
@@ -172,7 +276,7 @@ impl Session {
         &self,
         cursor: &StreamCursorRef,
     ) -> Result<Arc<WireStreamCursorEntry>, RpcError> {
-        let mut cursors = self.stream_cursors.lock().unwrap();
+        let mut cursors = self.lock_stream_cursors()?;
         if let Some(entry) = cursors.get(cursor) {
             return Ok(entry.clone());
         }
@@ -181,7 +285,14 @@ impl Session {
         // admission boundary so clients do not need to close after observing
         // `done:true` merely to make quota progress.
         if cursors.len() >= MAX_WIRE_STREAM_CURSORS {
-            cursors.retain(|_, entry| !entry.inner.lock().unwrap().done);
+            cursors.retain(|_, entry| match entry.inner.lock() {
+                Ok(cursor) => !cursor.done,
+                Err(poisoned) => {
+                    drop(poisoned);
+                    entry.quarantine();
+                    false
+                }
+            });
         }
         if cursors.len() >= MAX_WIRE_STREAM_CURSORS {
             return Err(RpcError {
@@ -213,13 +324,12 @@ impl Session {
     /// immediately drop its upstream so source threads/resources are closed
     /// and later pulls correctly observe single consumption.
     pub(crate) fn close_stream_cursor(&self, cursor: &StreamCursorRef) -> Result<bool, RpcError> {
-        if let Some(entry) = self.stream_cursors.lock().unwrap().remove(cursor) {
+        if let Some(entry) = self.lock_stream_cursors()?.remove(cursor) {
             // Never wait for an in-process upstream while serving close. A
             // cooperative worker observes cancellation; a non-cooperative
             // trusted extension retains this detached Arc only until its
             // globally-leased worker eventually returns.
-            entry.quarantined.store(true, Ordering::SeqCst);
-            entry.cancel.cancel();
+            entry.quarantine();
             return Ok(true);
         }
         let stream = self.resolve_stream_value(cursor)?;
@@ -238,14 +348,15 @@ impl Session {
         cursor: &StreamCursorRef,
         observed: &Arc<WireStreamCursorEntry>,
     ) {
-        observed.quarantined.store(true, Ordering::SeqCst);
-        observed.cancel.cancel();
+        observed.quarantine();
         if let Ok(mut cursor) = observed.inner.try_lock() {
             cursor.done = true;
             cursor.upstream.take();
         }
         let removed = {
-            let mut cursors = self.stream_cursors.lock().unwrap();
+            let Ok(mut cursors) = self.lock_stream_cursors() else {
+                return;
+            };
             cursors
                 .get(cursor)
                 .is_some_and(|current| Arc::ptr_eq(current, observed))
@@ -259,7 +370,7 @@ impl Session {
         &self,
         cursor: &StreamCursorRef,
     ) -> Result<shoal_value::StreamVal, RpcError> {
-        let transcript = self.transcript.lock().unwrap();
+        let transcript = self.lock_transcript()?;
         let root = transcript.get(&cursor.r#ref).ok_or_else(unknown_stream)?;
         let value = match cursor.path.as_deref() {
             Some(path) if !path.is_empty() => {
@@ -283,7 +394,8 @@ impl Session {
 
     #[cfg(test)]
     pub(crate) fn has_stream_cursor(&self, cursor: &StreamCursorRef) -> bool {
-        self.stream_cursors.lock().unwrap().contains_key(cursor)
+        self.lock_stream_cursors()
+            .is_ok_and(|cursors| cursors.contains_key(cursor))
     }
 }
 
@@ -292,6 +404,14 @@ fn unknown_stream() -> RpcError {
         code: UNKNOWN_REF,
         message: "unknown stream cursor".into(),
         data: None,
+    }
+}
+
+pub(crate) fn cursor_quarantined() -> RpcError {
+    RpcError {
+        code: INTERNAL_ERROR,
+        message: "stream cursor is quarantined after an internal state failure".into(),
+        data: Some(json!({"stream_cursor_quarantined": true})),
     }
 }
 
@@ -478,7 +598,7 @@ impl Kernel {
         attached: &Option<Attachment>,
     ) -> Result<Json, RpcError> {
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
-        let mut evaluator = attachment.session.evaluator.lock().unwrap();
+        let mut evaluator = attachment.session.lock_evaluator()?;
         let mut names = evaluator.env().visible_names();
         names.sort();
         let bindings = names
@@ -571,7 +691,7 @@ impl Kernel {
                 })?;
                 let meta = auth
                     .lock()
-                    .unwrap()
+                    .map_err(|_| poisoned_subsystem("authentication token store"))?
                     .validate(&token)
                     .ok_or_else(|| RpcError {
                         code: AUTH_FAILED,
@@ -614,13 +734,7 @@ impl Kernel {
         let name = params.session.unwrap_or_else(|| "default".into());
         let session = self.session(&name, &who)?;
         session.ensure_healthy()?;
-        let cwd = session
-            .evaluator
-            .lock()
-            .unwrap()
-            .cwd()
-            .as_os_str()
-            .to_owned();
+        let cwd = session.lock_evaluator()?.cwd().as_os_str().to_owned();
         // A connection may reattach to another principal-private session.
         // Subscriptions belong to the previous owner and must not silently
         // follow the socket into the new attachment.
@@ -689,7 +803,7 @@ impl Kernel {
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
         let session = &attachment.session;
         let pairs: Vec<(String, String)> = {
-            let evaluator = session.evaluator.lock().unwrap();
+            let evaluator = session.lock_evaluator()?;
             evaluator
                 .env_vars()
                 .iter()
@@ -729,7 +843,7 @@ impl Kernel {
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
         let session = &attachment.session;
         let snapshot = {
-            let mut evaluator = session.evaluator.lock().unwrap();
+            let mut evaluator = session.lock_evaluator()?;
             evaluator.prompt_reef_snapshot()
         };
         let bindings: Vec<Json> = snapshot
@@ -749,5 +863,57 @@ impl Kernel {
             "active_scope": snapshot.active_scope,
             "bindings": bindings,
         }))
+    }
+}
+
+pub(crate) fn poisoned_subsystem(subsystem: &str) -> RpcError {
+    RpcError {
+        code: INTERNAL_ERROR,
+        message: format!("{subsystem} is unavailable after an internal state failure"),
+        data: Some(json!({"subsystem": subsystem, "quarantined": true})),
+    }
+}
+
+#[cfg(test)]
+mod poison_tests {
+    use super::*;
+
+    fn attachment(session: Arc<Session>) -> Option<Attachment> {
+        Some(Attachment {
+            session,
+            principal: "principal:test".into(),
+            can_approve: false,
+            tty: false,
+            cancel_epoch: None,
+            bearer: None,
+            security_epoch: ATTACH_SECURITY_EPOCH,
+            connection_trust: ConnectionTrust::EmbeddedHuman,
+        })
+    }
+
+    #[test]
+    fn poisoned_evaluator_quarantines_only_its_session_with_stable_errors() {
+        let kernel = Kernel::new();
+        let poisoned = kernel.session("poisoned", "principal:test").unwrap();
+        let healthy = kernel.session("healthy", "principal:test").unwrap();
+        let poisoner = poisoned.clone();
+        let thread = std::thread::spawn(move || {
+            let _evaluator = poisoner.evaluator.lock().unwrap();
+            panic!("inject evaluator poison");
+        });
+        assert!(thread.join().is_err());
+
+        let attached = attachment(poisoned);
+        for _ in 0..2 {
+            let error = kernel
+                .handle_session_snapshot(&attached)
+                .expect_err("poisoned session must fail closed");
+            assert_eq!(error.code, INTERNAL_ERROR);
+            assert_eq!(error.data.unwrap()["session_quarantined"], true);
+        }
+
+        kernel
+            .handle_session_snapshot(&attachment(healthy))
+            .expect("a different session remains healthy");
     }
 }

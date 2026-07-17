@@ -89,7 +89,11 @@ impl Kernel {
                 );
             }
             match rx.recv_timeout(remaining.min(Duration::from_millis(25))) {
-                Ok(batch) => break batch,
+                Ok(Ok(batch)) => break batch,
+                Ok(Err(error)) => {
+                    session.quarantine_stream_cursor(&params.cursor, &entry);
+                    return Err(error);
+                }
                 Err(RecvTimeoutError::Timeout) => continue,
                 Err(RecvTimeoutError::Disconnected) => {
                     session.quarantine_stream_cursor(&params.cursor, &entry);
@@ -105,7 +109,7 @@ impl Kernel {
         let mut items = Vec::with_capacity(batch.values.len());
         for (seq, value) in batch.values {
             let value_ref = Ref::new("out", session.next_value.fetch_add(1, Ordering::Relaxed));
-            session.insert_transcript(value_ref.clone(), value.clone());
+            session.insert_transcript_checked(value_ref.clone(), value.clone())?;
             let uri = short_ref_to_uri(&value_ref, None);
             items.push(StreamItem {
                 seq,
@@ -140,26 +144,23 @@ fn drive_cursor(
     entry: Arc<WireStreamCursorEntry>,
     limit: usize,
     wait: Duration,
-) -> PulledBatch {
+) -> Result<PulledBatch, RpcError> {
     if entry.quarantined.load(Ordering::SeqCst) {
-        let mut cursor = entry.inner.lock().unwrap();
-        cursor.done = true;
-        cursor.upstream.take();
-        return deadline_batch("stream_closed", "stream cursor was closed");
+        return Ok(deadline_batch("stream_closed", "stream cursor was closed"));
     }
     // This worker boundary is the hard containment available in-process. Shoal
     // closures/builtins/processes cooperate with `CancelToken`; arbitrary host
     // extensions are trusted code and require process isolation for hard kill.
-    let mut evaluator = session.evaluator.lock().unwrap();
+    let mut evaluator = session.lock_evaluator()?;
     evaluator.set_cancellation_token(entry.cancel.clone());
-    let mut cursor = entry.inner.lock().unwrap();
+    let mut cursor = entry.lock_cursor()?;
     if cursor.done {
-        return PulledBatch {
+        return Ok(PulledBatch {
             values: Vec::new(),
             done: true,
             timed_out: false,
             error: None,
-        };
+        });
     }
     let deadline = Instant::now() + wait;
     let mut values = Vec::with_capacity(limit);
@@ -169,14 +170,14 @@ fn drive_cursor(
         if entry.quarantined.load(Ordering::SeqCst) || entry.cancel.is_cancelled() {
             break;
         }
-        let result = cursor
-            .upstream
-            .as_mut()
-            .expect("non-terminal stream cursor retains its upstream")
-            .pull(
-                &mut *evaluator,
-                Some(deadline.saturating_duration_since(Instant::now())),
-            );
+        let Some(upstream) = cursor.upstream.as_mut() else {
+            entry.quarantine();
+            return Err(cursor_quarantined());
+        };
+        let result = upstream.pull(
+            &mut *evaluator,
+            Some(deadline.saturating_duration_since(Instant::now())),
+        );
         match result {
             Ok(shoal_value::Pull::Item(value)) => {
                 let seq = cursor.next_seq;
@@ -207,12 +208,12 @@ fn drive_cursor(
         cursor.done = true;
         cursor.upstream.take();
     }
-    PulledBatch {
+    Ok(PulledBatch {
         values,
         done: cursor.done,
         timed_out,
         error,
-    }
+    })
 }
 
 fn deadline_batch(code: &str, message: &str) -> PulledBatch {
@@ -366,6 +367,33 @@ mod tests {
         session
             .stream_cursor(&cursor_refs[MAX_WIRE_STREAM_CURSORS])
             .expect("terminal cursor should be reaped at admission");
+    }
+
+    #[test]
+    fn poisoned_cursor_inner_quarantines_only_that_cursor() {
+        let kernel = Kernel::with_policy(Policy::permissive("wire-stream-test"));
+        let (session, mut attached) = attached(&kernel);
+        let cursor = exec_stream(&kernel, &mut attached, "[1, 2].stream()");
+        let entry = session.stream_cursor(&cursor).unwrap();
+        let poisoner = entry.clone();
+        let thread = std::thread::spawn(move || {
+            let _cursor = poisoner.inner.lock().unwrap();
+            panic!("inject cursor-inner poison");
+        });
+        assert!(thread.join().is_err());
+
+        let error = kernel
+            .handle_stream_pull(json!({"cursor":cursor}), &mut attached)
+            .expect_err("poisoned cursor must fail closed");
+        assert_eq!(error.code, INTERNAL_ERROR);
+        assert_eq!(error.data.unwrap()["stream_cursor_quarantined"], true);
+        assert!(session.ensure_healthy().is_ok());
+        assert!(!session.has_stream_cursor(&cursor));
+
+        let result = kernel
+            .handle_exec(json!({"src":"1 + 1","position":"value"}), 1, &mut attached)
+            .expect("the cursor poison must not quarantine its session");
+        assert_eq!(result["value"]["v"], 2);
     }
 
     #[test]

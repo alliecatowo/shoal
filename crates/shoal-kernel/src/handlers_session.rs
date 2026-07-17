@@ -51,7 +51,7 @@ impl Kernel {
         };
         let ast_json = serde_json::to_string(&ast).map_err(internal)?;
         let plan = {
-            let mut evaluator = session.evaluator.lock().unwrap();
+            let mut evaluator = session.lock_evaluator()?;
             derive_plan(&mut evaluator, &ast, &ast_json)
         };
         encode(json!({
@@ -78,7 +78,10 @@ impl Kernel {
                 data: None,
             })?
             .to_string();
-        let journal = self.journal.lock().unwrap();
+        let journal = self
+            .journal
+            .lock()
+            .map_err(|_| poisoned_subsystem("journal"))?;
         let owned = journal
             .output_owned_by(&hash, &attachment.session.id, &attachment.principal)
             .map_err(internal)?;
