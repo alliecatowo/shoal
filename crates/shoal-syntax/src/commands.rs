@@ -23,6 +23,7 @@ pub enum CommandSource {
     SpecialBuiltin,
     Script,
     Runner,
+    Plugin,
     Adapter,
     External,
 }
@@ -36,6 +37,7 @@ impl CommandSource {
             Self::SpecialBuiltin => "special_builtin",
             Self::Script => "script",
             Self::Runner => "runner",
+            Self::Plugin => "plugin",
             Self::Adapter => "adapter",
             Self::External => "external",
         }
@@ -49,6 +51,7 @@ impl CommandSource {
             Self::SpecialBuiltin => "the head is a session or control builtin",
             Self::Script => "the head names a .shl script",
             Self::Runner => "explicit run selected an interpreter for a script target",
+            Self::Plugin => "a validated component plugin claims the unforced head",
             Self::Adapter => "an adapter schema claims the unforced head",
             Self::External => "no earlier layer won; resolve through Reef or PATH",
         }
@@ -65,6 +68,7 @@ pub const COMMAND_PRECEDENCE: &[CommandSource] = &[
     CommandSource::SpecialBuiltin,
     CommandSource::Script,
     CommandSource::Runner,
+    CommandSource::Plugin,
     CommandSource::Adapter,
     CommandSource::External,
 ];
@@ -83,6 +87,7 @@ pub struct CommandFacts {
     pub dynamic_run: bool,
     /// The dynamic target is a script/path handled by runner or shebang logic.
     pub runner: bool,
+    pub plugin: bool,
     pub adapter: bool,
 }
 
@@ -114,6 +119,9 @@ pub fn resolve_command_source(name: &str, facts: CommandFacts) -> CommandSource 
     }
     if name.ends_with(".shl") {
         return CommandSource::Script;
+    }
+    if facts.plugin && !facts.forced {
+        return CommandSource::Plugin;
     }
     if facts.adapter && !facts.forced {
         return CommandSource::Adapter;
@@ -242,6 +250,7 @@ mod tests {
                 CommandSource::SpecialBuiltin,
                 CommandSource::Script,
                 CommandSource::Runner,
+                CommandSource::Plugin,
                 CommandSource::Adapter,
                 CommandSource::External,
             ]
@@ -256,6 +265,7 @@ mod tests {
             forced: true,
             dynamic_run: false,
             runner: false,
+            plugin: true,
             adapter: true,
             ..CommandFacts::default()
         };
@@ -288,6 +298,7 @@ mod tests {
             forced: false,
             dynamic_run: false,
             runner: false,
+            plugin: true,
             adapter: true,
         };
         assert_eq!(
@@ -346,6 +357,18 @@ mod tests {
                     ..all
                 }
             ),
+            CommandSource::Plugin
+        );
+        assert_eq!(
+            resolve_command_source(
+                "tool",
+                CommandFacts {
+                    session_callable: false,
+                    session_value: false,
+                    plugin: false,
+                    ..all
+                }
+            ),
             CommandSource::Adapter
         );
     }
@@ -361,6 +384,7 @@ mod tests {
                 forced: false,
                 dynamic_run: true,
                 runner: false,
+                plugin: true,
                 adapter: true,
             },
         );

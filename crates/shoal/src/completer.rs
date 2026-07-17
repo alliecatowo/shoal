@@ -164,6 +164,9 @@ impl ShoalCompleter {
                 forced: false,
                 dynamic_run: false,
                 runner: false,
+                // Plugin declarations are installed on the evaluator; this
+                // lightweight completion view has no registry snapshot yet.
+                plugin: false,
                 adapter: self.adapter_lookup(head).is_some(),
             },
         )

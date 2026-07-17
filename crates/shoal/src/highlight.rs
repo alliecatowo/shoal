@@ -229,6 +229,8 @@ impl Highlighter for ShoalHighlighter {
                         forced: false,
                         dynamic_run: false,
                         runner: false,
+                        // The highlighter has no plugin registry snapshot.
+                        plugin: false,
                         // The highlighter has no adapter catalog; known adapter
                         // names are still supplied by completion.
                         adapter: false,

@@ -77,6 +77,7 @@ pub(crate) const ROOT: Kind = Kind::Table(&[
         Kind::Table(&[("enabled", Kind::Bool), ("session", Kind::Str)]),
     ),
     ("adapters", Kind::Table(&[("dirs", Kind::StrArray)])),
+    ("plugins", Kind::Table(&[("dirs", Kind::StrArray)])),
     (
         "journal",
         Kind::Table(&[("enabled", Kind::Bool), ("state_dir", Kind::Str)]),

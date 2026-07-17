@@ -45,6 +45,7 @@ pub struct Config {
     pub editor: Editor,
     pub kernel: Kernel,
     pub adapters: Adapters,
+    pub plugins: Plugins,
     pub journal: Journal,
     pub leash: Leash,
     pub init: Init,
@@ -151,6 +152,14 @@ pub struct Adapters {
     pub dirs: Vec<PathBuf>,
 }
 
+/// WebAssembly component plugin discovery. Directories are scanned in this
+/// order; manifests within each directory are loaded in lexical path order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct Plugins {
+    pub dirs: Vec<PathBuf>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Journal {
@@ -225,6 +234,7 @@ impl Default for Config {
             editor: Editor::default(),
             kernel: Kernel::default(),
             adapters: Adapters::default(),
+            plugins: Plugins::default(),
             journal: Journal::default(),
             leash: Leash::default(),
             init: Init::default(),
@@ -327,6 +337,20 @@ mod tests {
         assert!(
             warnings.is_empty(),
             "Config::default() must not trip its own unknown-key scanner: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn plugin_directories_are_typed_and_ordered() {
+        let config: Config =
+            toml::from_str("[plugins]\ndirs = ['/opt/shoal/plugins', './project-plugins']\n")
+                .unwrap();
+        assert_eq!(
+            config.plugins.dirs,
+            vec![
+                PathBuf::from("/opt/shoal/plugins"),
+                PathBuf::from("./project-plugins")
+            ]
         );
     }
 }
