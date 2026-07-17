@@ -33,7 +33,11 @@ use std::path::Path;
 
 mod output;
 
-pub use output::parse_output;
+pub use output::{
+    MAX_PARSE_CELL_BYTES, MAX_PARSE_CELLS, MAX_PARSE_COLUMNS, MAX_PARSE_HINT_BYTES,
+    MAX_PARSE_INPUT_BYTES, MAX_PARSE_JSON_DEPTH, MAX_PARSE_JSON_NODES, MAX_PARSE_RETAINED_BYTES,
+    MAX_PARSE_ROWS, parse_output,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdapterClass {

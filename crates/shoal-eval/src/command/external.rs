@@ -8,6 +8,17 @@ enum ProcessMode {
     Redirected(Position),
 }
 
+fn parse_adapter_output(meta: &ExecMeta, result: &shoal_exec::ExecResult) -> Option<Value> {
+    // `stdout` is only a preview after a spill and can also be a truncated
+    // prefix when capture hit its resident cap. A prefix that happens to end
+    // on a row boundary must never masquerade as the command's complete
+    // structured result.
+    if result.truncated || result.stdout_spill.is_some() {
+        return None;
+    }
+    shoal_adapters::parse_output(&meta.parse, &result.stdout, meta.output_type.as_deref())
+}
+
 impl Evaluator {
     pub(crate) fn run_argv(
         &mut self,
@@ -219,9 +230,9 @@ impl Evaluator {
         }
         let ok_codes = meta.as_ref().map_or(&[0][..], |m| m.ok_codes.as_slice());
         let ok = r.status.is_some_and(|code| ok_codes.contains(&code));
-        let parsed = meta.as_ref().and_then(|m| {
-            shoal_adapters::parse_output(&m.parse, &r.stdout, m.output_type.as_deref())
-        });
+        let parsed = meta
+            .as_ref()
+            .and_then(|meta| parse_adapter_output(meta, &r));
         // Take the resident stdout once (it is the bounded preview when a spill
         // occurred, the whole thing otherwise) and share the one allocation
         // between the outcome's `.stdout` and any site/content/internals/language-conformance-contract.md ref-backed view.
@@ -351,5 +362,55 @@ impl Evaluator {
         };
         let bytes = self.host.fs.read(&resolved).ok()?;
         Some(shoal_reef::hashcache::hash_bytes(&bytes))
+    }
+}
+
+#[cfg(test)]
+mod adapter_output_boundary_tests {
+    use super::*;
+
+    fn result(stdout: &[u8]) -> shoal_exec::ExecResult {
+        shoal_exec::ExecResult {
+            status: Some(0),
+            signal: None,
+            stdout: stdout.to_vec(),
+            stderr: Vec::new(),
+            truncated: false,
+            stdout_spill: None,
+            dur: std::time::Duration::ZERO,
+            pid: 1,
+            pgid: 1,
+            stopped: false,
+            enforcement: None,
+        }
+    }
+
+    fn meta() -> ExecMeta {
+        ExecMeta {
+            ok_codes: vec![0],
+            class: AdapterClass::Cli,
+            parse: "ndjson".into(),
+            output_type: None,
+        }
+    }
+
+    #[test]
+    fn only_complete_resident_stdout_can_be_structured() {
+        let mut output = result(b"{\"a\":1}\n");
+        assert!(matches!(
+            parse_adapter_output(&meta(), &output),
+            Some(Value::Table(rows)) if rows.len() == 1
+        ));
+
+        output.truncated = true;
+        assert_eq!(parse_adapter_output(&meta(), &output), None);
+        output.truncated = false;
+        output.stdout_spill = Some(shoal_exec::CaptureSpill {
+            path: PathBuf::from("unused-test-spill"),
+            hash: "00".repeat(32),
+            len: output.stdout.len() as u64 + 1,
+            truncated: false,
+        });
+        assert_eq!(parse_adapter_output(&meta(), &output), None);
     }
 }
