@@ -82,6 +82,20 @@ fn env_value_with_braces_and_quotes_round_trips_through_seeding() {
 }
 
 #[test]
+fn render_width_from_config_bounds_block_tables() {
+    let home = tempfile::tempdir().unwrap();
+    let out = run_with_config(
+        home.path(),
+        "version = 1\n[render]\nwidth = 20\n",
+        "[{very_long_column: \"abcdefghijklmno\", second_column: \"1234567890\"}]",
+    );
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("very_lo…"), "stdout was {stdout:?}");
+    assert!(!stdout.contains("very_long_column"), "configured width was ignored: {stdout:?}");
+}
+
+#[test]
 fn render_color_false_in_config_suppresses_ansi_without_no_color_env() {
     // A parse error's diagnostic is always colorized unless suppressed
     // (`main.rs::format_diagnostic`); trigger one with a config that sets

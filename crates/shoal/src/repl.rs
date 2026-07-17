@@ -41,12 +41,14 @@ use editor::{FilteredHistory, ShoalValidator, build_edit_mode, history_path};
 #[cfg(test)]
 use editor::{glob_match, input_is_incomplete};
 
-pub(crate) use rendering::{PagerContext, print_value, render_result, render_result_paged};
+pub(crate) use rendering::{
+    PagerContext, print_value, render_result, render_result_paged, terminal_width,
+};
 #[cfg(test)]
 use rendering::{
     pager_command, protocol_render_text, should_page, spawn_pager, wrapped_line_count,
 };
-use rendering::{render_protocol_outcome, report_protocol_error, terminal_width};
+use rendering::{render_protocol_outcome, report_protocol_error};
 
 trait ReplProtocol {
     fn execute(
@@ -158,6 +160,7 @@ pub(crate) fn repl(standalone: bool) -> Result<i32, String> {
     let pager_ctx = PagerContext {
         enabled: config.render.paging == "auto",
         pager: config.render.pager.clone(),
+        configured_width: config.render.width,
     };
     let mut evaluator = Evaluator::new(cwd.clone());
     let bootstrap_report =
@@ -169,8 +172,10 @@ pub(crate) fn repl(standalone: bool) -> Result<i32, String> {
         );
     }
     if !protocol_backed {
-        evaluator.set_statement_sink(Box::new(|v: &Value| {
-            let _ = print_value(v);
+        let configured_width = config.render.width;
+        evaluator.set_statement_sink(Box::new(move |v: &Value| {
+            let width = configured_width.unwrap_or_else(terminal_width).max(1);
+            let _ = print_value(v, width);
         }));
     }
 
@@ -430,7 +435,8 @@ pub(crate) fn repl(standalone: bool) -> Result<i32, String> {
 
         // Refresh the frozen prompt snapshot once, here, between commands —
         // never inside reedline's per-keystroke render (site/content/internals/prompt-editor-lsp.md).
-        let width = u16::try_from(terminal_width()).unwrap_or(80);
+        let render_width = pager_ctx.width();
+        let width = u16::try_from(render_width).unwrap_or(u16::MAX);
         let ctx = match &protocol_snapshot {
             Some(snapshot) => prompt::build_context_from_protocol(snapshot, &static_facts, width),
             None => prompt::build_context(&mut evaluator, &static_facts, width),
@@ -454,7 +460,7 @@ pub(crate) fn repl(standalone: bool) -> Result<i32, String> {
                         session,
                         &src,
                         &protocol_interrupt,
-                        terminal_width(),
+                        render_width,
                     ) {
                         Ok(outcome) => {
                             if let Some(code) = outcome.exit_code {
@@ -1632,6 +1638,7 @@ mod tests {
         let pager = PagerContext {
             enabled: false,
             pager: None,
+            configured_width: Some(20),
         };
         let value = Value::Str("x".repeat(10_000));
         // Must not block on a real pager / TTY prompt — disabled short-

@@ -341,6 +341,9 @@ fn validate(c: &Config) -> Result<(), ConfigError> {
     if !matches!(c.render.paging.as_str(), "never" | "auto") {
         return Err(value_err("render.paging", "must be `never` or `auto`"));
     }
+    if c.render.width == Some(0) {
+        return Err(value_err("render.width", "must be greater than 0"));
+    }
     if let Some(echo) = &c.render.echo
         && !matches!(echo.as_str(), "quiet" | "commands" | "all")
     {
@@ -584,6 +587,22 @@ mod tests {
                 source: None,
                 key: "render.paging".into(),
                 message: "must be `never` or `auto`".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn render_width_must_be_positive() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("c");
+        fs::write(&p, "[render]\nwidth = 0\n").unwrap();
+        let err = load(&opts(None, Some(p), None, vec![])).unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::Value {
+                source: None,
+                key: "render.width".into(),
+                message: "must be greater than 0".into(),
             }
         );
     }

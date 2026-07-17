@@ -545,13 +545,14 @@ mod tests {
     }
 
     #[test]
-    fn build_context_populates_jobs_from_the_evaluator() {
+    fn build_context_separates_completed_job_history_from_active_jobs() {
         let dir = tempfile::tempdir().unwrap();
         let mut ev = shoal_eval::Evaluator::new(dir.path().to_path_buf());
-        ev.eval_program(&shoal_syntax::parse("spawn { 1 + 1 }").unwrap())
+        ev.eval_program(&shoal_syntax::parse("let t = spawn { 1 + 1 }\nt.await()").unwrap())
             .unwrap();
         let ctx = build_context(&mut ev, &test_facts(), 80);
-        assert_eq!(ctx.jobs.total, 1, "the spawned task is registered");
+        assert_eq!(ctx.jobs.total, 0, "completed work is not an active job");
+        assert_eq!(ctx.jobs.completed, 1, "completed history is retained");
     }
 
     #[test]

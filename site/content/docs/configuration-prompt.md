@@ -160,7 +160,7 @@ The table below reflects the schema and defaults in the current code. An empty â
 | `history.ignore` | string list, empty | Whole-line shell-style `*`/`?` patterns excluded from history. |
 | `history.ignore_space` | boolean, `true` | A line beginning with a space is not recorded. |
 | `render.color` | boolean, `true` | `NO_COLOR` can disable it. |
-| `render.width` | integer or absent | Schema-complete, but not presently applied by the shell renderer. |
+| `render.width` | positive integer or absent | Overrides terminal detection for block tables, prompt context, protocol rendering, wrapping, and pager decisions. |
 | `render.paging` | `"never"` or `"auto"`, `"never"` | Paging is interactive and TTY-sensitive. |
 | `render.pager` | command string or absent | Falls back to `$PAGER`, then `less -R`. |
 | `render.echo` | `"quiet"`, `"commands"`, `"all"`, or absent | Surface default: `all` in the REPL, `quiet` for scripts and `-c`. |

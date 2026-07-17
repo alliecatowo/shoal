@@ -12,16 +12,16 @@ pub(super) fn already_streamed(value: &Value, pty_was_live: bool) -> bool {
     pty_was_live && matches!(value, Value::Outcome(o) if o.streamed)
 }
 
-pub(crate) fn render_result(value: &Value, pty_was_live: bool) -> io::Result<()> {
+pub(crate) fn render_result(value: &Value, pty_was_live: bool, width: usize) -> io::Result<()> {
     if already_streamed(value, pty_was_live) {
         return Ok(());
     }
-    print_value(value)
+    print_value(value, width)
 }
 
 /// Render one value through the shared colorized block renderer.
-pub(crate) fn print_value(value: &Value) -> io::Result<()> {
-    let rendered = shoal_value::render::render_block(value, terminal_width());
+pub(crate) fn print_value(value: &Value, width: usize) -> io::Result<()> {
+    let rendered = shoal_value::render::render_block(value, width.max(1));
     if !rendered.is_empty() {
         println!("{}", maybe_strip(rendered));
     }
@@ -57,7 +57,7 @@ pub(super) fn protocol_render_text(outcome: &ProtocolOutcome) -> Option<&str> {
 }
 
 fn render_text_paged(rendered: &str, pager: &PagerContext) -> io::Result<()> {
-    let width = terminal_width();
+    let width = pager.width();
     let is_tty = io::stdout().is_terminal();
     let line_count = wrapped_line_count(rendered, width);
     if should_page(pager.enabled, is_tty, line_count, terminal_height()) {
@@ -75,6 +75,13 @@ fn render_text_paged(rendered: &str, pager: &PagerContext) -> io::Result<()> {
 pub(crate) struct PagerContext {
     pub(crate) enabled: bool,
     pub(crate) pager: Option<String>,
+    pub(crate) configured_width: Option<usize>,
+}
+
+impl PagerContext {
+    pub(crate) fn width(&self) -> usize {
+        self.configured_width.unwrap_or_else(terminal_width).max(1)
+    }
 }
 
 /// Render a final interactive result, paging only when configured and useful.
@@ -86,7 +93,7 @@ pub(crate) fn render_result_paged(
     if already_streamed(value, pty_was_live) {
         return Ok(());
     }
-    let width = terminal_width();
+    let width = pager.width();
     let rendered = shoal_value::render::render_block(value, width);
     if rendered.is_empty() {
         return Ok(());
@@ -156,7 +163,7 @@ pub(super) fn wrapped_line_count(text: &str, width: usize) -> usize {
     total.max(1)
 }
 
-pub(super) fn terminal_width() -> usize {
+pub(crate) fn terminal_width() -> usize {
     crossterm::terminal::size()
         .map(|(width, _)| usize::from(width))
         .unwrap_or(80)
@@ -166,4 +173,19 @@ fn terminal_height() -> usize {
     crossterm::terminal::size()
         .map(|(_, height)| usize::from(height))
         .unwrap_or(24)
+}
+
+#[cfg(test)]
+mod width_tests {
+    use super::*;
+
+    #[test]
+    fn configured_width_overrides_terminal_detection() {
+        let pager = PagerContext {
+            enabled: false,
+            pager: None,
+            configured_width: Some(37),
+        };
+        assert_eq!(pager.width(), 37);
+    }
 }

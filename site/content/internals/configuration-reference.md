@@ -117,7 +117,7 @@ The following is the exact public `Config` tree. “Default” means the value p
 | `history.dedup` | boolean | `true` | exclude an entry identical to its immediate predecessor |
 | `history.ignore` | string array | empty | host-matched exclusion patterns |
 | `history.ignore_space` | boolean | `true` | exclude lines beginning with a space |
-| `render.width` | optional unsigned integer | absent | requested output width |
+| `render.width` | optional positive integer | absent | output/prompt/pager width override; absent follows the live terminal |
 | `render.color` | boolean | `true` | ANSI color permission |
 | `render.paging` | string enum | `"never"` | `never` or interactive `auto` paging |
 | `render.pager` | optional string | absent | explicit pager command |
@@ -309,7 +309,7 @@ currently accepts and snapshots the field without applying its intended behavior
 | `render.color` | active | active | applied before diagnostics and rendering |
 | `render.paging`, `pager` | active for final REPL result | not used | pager is explicitly interactive-only |
 | `render.echo` | active | active | host-specific fallback: `all` interactive, `quiet` noninteractive |
-| `render.width` | not consumed | not consumed | **inert typed field**; renderers use terminal/context width |
+| `render.width` | active | active | one resolved override feeds block rendering, prompt context, protocol width, wrapping, and paging; absent follows terminal resize |
 | all `history.*` | active | no history | wraps Reedline history with exclusions/dedup |
 | `editor.mode`, `bracketed_paste`, `keybindings` | active | not applicable | edit-mode and binding builder consume them |
 | `adapters.dirs` | active | active | bundled adapters load first, configured directories later |
@@ -335,7 +335,7 @@ accDescr: Shows the components and relationships described in Host wiring matrix
   Config --> Kernel["private interactive kernel settings"]
   Config -. "not wired" .-> Journal["journal gate / state dir"]
   Config --> Leash["fail-closed policy load"]
-  Config -. "not wired" .-> Width["render width"]
+  Config --> Width["render / prompt / pager width"]
   Files["raw config files"] --> Prompt["independent rich prompt loader"]
   Files --> Reef["independent Reef parser"]
 ```
@@ -365,10 +365,10 @@ The host serializes the complete typed `Config` to JSON and converts that JSON i
 data for `config.get` and `config.all`. This is a startup snapshot, not a live facade over files or
 environment.
 
-That snapshot exposes inert fields too. A script can observe `config.journal.enabled = false` while
-the interactive host has already opened its journal, or see `render.width` even though the renderer
-uses terminal/context width. The value accurately describes the resolved schema object but not
-necessarily effective host behavior.
+That snapshot still exposes journal fields whose effective security-audit semantics differ by host.
+`render.width`, however, now reflects an active override; when absent, the host deliberately follows
+the current terminal width. The snapshot accurately describes the resolved schema object but does
+not expose a continuously refreshed effective terminal size.
 Internal diagnostics should eventually expose both `configured` and `effective` state.
 
 Production child evaluators now build through one audited child context and inherit the parent's
@@ -453,7 +453,6 @@ the behavioral test must demonstrate the denied/redirected/disabled operation.
 | P1 | journal enable/path settings are inert | retention and state-location policy are misleading | honor both during REPL assembly; expose effective path |
 | P1 | rich prompt and core config use different project discovery | prompt can visibly disagree with `config.all` | share a discovered layer set or explicitly separate files |
 | P1 | Reef user config is reparsed independently | schema and precedence drift can surprise users | share raw parsed layers or expose a structured handoff |
-| P2 | `render.width` is inert | configuration claims an output constraint that is ignored | thread an effective width through renderer entry points |
 | P2 | interactive and noninteractive kernel semantics differ | users may assume `-c`/scripts join the private REPL kernel path | keep `kernel.enabled/session`, `--standalone`, and surface boundaries explicit in CLI/config docs |
 | P2 | alias/env name validation differs from source injection | accepted config can fail later | validate exact consumer grammar and environment-name rules |
 | P3 | no live reload | long sessions retain stale configuration | define transactional reload and which state may change safely |
