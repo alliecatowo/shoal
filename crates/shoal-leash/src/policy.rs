@@ -175,6 +175,16 @@ impl Policy {
         };
         let mut verdict = Verdict::Allow;
         for effect in &plan.effects {
+            // An empty process allowlist means spawn pinning is disabled, not
+            // "deny every executable". The evaluator's concrete spawn gate
+            // already follows this contract; plan evaluation must apply the
+            // same semantics or a kernel rejects an ordinary command before
+            // execution reaches that gate.
+            if matches!(effect, Effect::ProcSpawn { .. })
+                && !self.spawn_pinning_active(principal)
+            {
+                continue;
+            }
             match self.evaluate_effect(principal, effect) {
                 Verdict::Deny => return Verdict::Deny,
                 Verdict::ApprovalRequired => verdict = Verdict::ApprovalRequired,

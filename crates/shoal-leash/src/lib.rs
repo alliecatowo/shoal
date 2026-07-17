@@ -181,6 +181,30 @@ opaque = "ask"
     }
 
     #[test]
+    fn plan_evaluation_uses_the_same_optional_spawn_pinning_contract() {
+        let spawn = Plan::new(
+            vec![Effect::ProcSpawn {
+                bin_hash: "anyhash".into(),
+                argv0: "/usr/bin/printf".into(),
+            }],
+            Reversibility::Irreversible,
+            Estimates::default(),
+        );
+        let permissive = Policy::permissive("uid:1000");
+        assert_eq!(
+            permissive.evaluate_plan("uid:1000", &spawn),
+            Verdict::Allow,
+            "the kernel plan gate must not contradict the concrete spawn gate"
+        );
+
+        let pinned = Policy::from_toml(
+            "[principal.agent]\nproc_spawn=['cargo']\nauto_apply='in-grant'\n",
+        )
+        .unwrap();
+        assert_eq!(pinned.evaluate_plan("agent", &spawn), Verdict::Deny);
+    }
+
+    #[test]
     fn opaque_and_unknown_principal() {
         let p = policy();
         assert_eq!(
