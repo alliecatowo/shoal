@@ -170,7 +170,9 @@ impl Kernel {
             message: "unknown or expired plan_ref".into(),
             data: Some(json!({ "plan_ref": p.plan_ref })),
         })?;
-        if stored.session != session.id || stored.principal != attachment.principal {
+        if (stored.session != session.id || stored.principal != attachment.principal)
+            && !attachment.can_approve
+        {
             return Err(RpcError {
                 code: LEASH_DENIED,
                 message: "plan belongs to another principal/session".into(),
@@ -190,11 +192,11 @@ impl Kernel {
             "effects": stored.plan.effects,
             "reversibility": reversibility_from_effects(&stored.plan.effects),
             "verdict": verdict_name(verdict),
-            "approval_pending": verdict == Verdict::ApprovalRequired,
-            "approved": stored.approved,
+            "approval_pending": stored.authorization.is_pending(),
+            "approved": stored.authorization.is_approved(),
             // HR-D2: the auditable approval binding, when this plan was approved
             // — requester, approver, scope, when, and the consuming execution.
-            "approval": approval_json(stored.approval.as_ref()),
+            "approval": approval_json(stored.authorization.approval()),
             "src": stored.src,
         }))
     }
@@ -221,8 +223,8 @@ impl Kernel {
                     "effects": sp.plan.effects,
                     "reversibility": reversibility_from_effects(&sp.plan.effects),
                     "verdict": verdict_name(verdict),
-                    "approval_pending": verdict == Verdict::ApprovalRequired,
-                    "approved": sp.approved,
+                    "approval_pending": sp.authorization.is_pending(),
+                    "approved": sp.authorization.is_approved(),
                 })
             })
             .collect();
@@ -252,17 +254,41 @@ impl Kernel {
                 data: None,
             });
         }
-        if !stored.approved
-            && self
-                .policy
-                .evaluate_plan(&attachment.principal, &stored.plan)
-                != Verdict::Allow
-        {
-            return Err(RpcError {
-                code: APPROVAL_REQUIRED,
-                message: "plan approval pending".into(),
-                data: None,
-            });
+        match &stored.authorization {
+            PlanAuthorization::PolicyAllowed
+                if self
+                    .policy
+                    .evaluate_plan(&attachment.principal, &stored.plan)
+                    == Verdict::Allow => {}
+            PlanAuthorization::Approved(_) => {}
+            PlanAuthorization::Pending => {
+                return Err(RpcError {
+                    code: APPROVAL_REQUIRED,
+                    message: "plan approval pending".into(),
+                    data: None,
+                });
+            }
+            PlanAuthorization::Claimed(_) => {
+                return Err(RpcError {
+                    code: LEASH_DENIED,
+                    message: "approved plan is already being applied".into(),
+                    data: None,
+                });
+            }
+            PlanAuthorization::Consumed(record) => {
+                return Err(RpcError {
+                    code: LEASH_DENIED,
+                    message: "approval was already consumed".into(),
+                    data: Some(json!({"consumed_by": record.consumed_by})),
+                });
+            }
+            PlanAuthorization::Denied | PlanAuthorization::PolicyAllowed => {
+                return Err(RpcError {
+                    code: LEASH_DENIED,
+                    message: "plan is denied by policy".into(),
+                    data: None,
+                });
+            }
         }
         let src = stored.src.clone();
         drop(plans);
@@ -326,7 +352,7 @@ impl Kernel {
         // Validate and mutate under ONE plans lock. No caller can replace or
         // mutate the object between authorization and approval, and the record
         // copies the immutable binding from the exact object we approved.
-        let (record, plan_effect_kinds, session, requester) = {
+        let (plan_effect_kinds, requester) = {
             let mut plans = self.plans.lock().unwrap();
             let stored = plans.get_mut(&plan_ref).ok_or_else(|| RpcError {
                 code: UNKNOWN_PLAN,
@@ -392,23 +418,63 @@ impl Kernel {
                 }
             }
 
-            let record = ApprovalRecord {
+            match &stored.authorization {
+                PlanAuthorization::Pending => {}
+                PlanAuthorization::Approved(_) | PlanAuthorization::Claimed(_) => {
+                    return Err(RpcError {
+                        code: LEASH_DENIED,
+                        message: "plan already has an approval".into(),
+                        data: Some(json!({"plan_ref": plan_ref})),
+                    });
+                }
+                PlanAuthorization::Consumed(record) => {
+                    return Err(RpcError {
+                        code: LEASH_DENIED,
+                        message: "approval was already consumed; create a new plan".into(),
+                        data: Some(json!({
+                            "plan_ref": plan_ref,
+                            "consumed_by": record.consumed_by,
+                        })),
+                    });
+                }
+                PlanAuthorization::Denied => {
+                    return Err(RpcError {
+                        code: LEASH_DENIED,
+                        message: "policy denies requested effects".into(),
+                        data: None,
+                    });
+                }
+                PlanAuthorization::PolicyAllowed => {
+                    return Err(RpcError {
+                        code: LEASH_DENIED,
+                        message: "plan is already allowed by policy and needs no approval".into(),
+                        data: None,
+                    });
+                }
+            }
+
+            let mut record = ApprovalRecord {
                 requester: requester.clone(),
                 approver: approver.clone(),
                 plan_ref: stored.plan.plan_ref.clone(),
                 plan_hash: stored.plan_hash.clone(),
                 source_hash: stored.source_hash.clone(),
                 session: stored.session.clone(),
-                scope: requested.clone(),
+                // Record the exact immutable plan scope, never a caller-supplied
+                // superset that could overstate what was actually approved.
+                scope: plan_effect_kinds.clone(),
                 approved_at_ns: now_ns(),
+                grant_audit_id: 0,
                 consumed_by: None,
             };
-            stored.approved = true;
-            stored.approval = Some(record.clone());
-            (record, plan_effect_kinds, stored.session.clone(), requester)
+            // Fail closed while the plans lock excludes a concurrent grant or
+            // apply. The state changes only after the completed audit row is
+            // durable.
+            record.grant_audit_id =
+                self.record_approval_audit(&record, &plan_effect_kinds, &stored.session)?;
+            stored.authorization = PlanAuthorization::Approved(record.clone());
+            (plan_effect_kinds, requester)
         };
-        // HR-D2: mirror the binding into the journal so it is durably auditable.
-        self.record_approval_audit(&record, &plan_effect_kinds, &session);
         // Same honest enforcement truth `session.attach`'s `caps_enforced`
         // reports (see `site/content/internals/security-threat-model.md`) — not a hardcoded `false`.
         // An agent that just unstuck an `approval_pending` plan via
@@ -420,7 +486,7 @@ impl Kernel {
             "grant": "approved",
             "plan_ref": plan_ref,
             "enforced": enforced,
-            "granted_effects": requested,
+            "granted_effects": plan_effect_kinds,
             "requester": requester,
             "approver": approver,
         }))

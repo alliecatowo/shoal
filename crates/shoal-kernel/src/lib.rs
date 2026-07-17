@@ -73,6 +73,8 @@ pub struct Kernel {
     /// single-operator setups that knowingly accept self-approval. See
     /// `site/content/internals/security-threat-model.md`.
     allow_self_ack: AtomicBool,
+    #[cfg(test)]
+    fail_approval_audit: AtomicBool,
 }
 
 /// Wire version of the AST node-kind vocabulary (site/content/internals/language-conformance-contract.md, site/content/internals/values-streams-execution.md). Bumped
@@ -122,19 +124,47 @@ struct StoredPlan {
     /// state exactly which source was authorized without copying source text.
     source_hash: String,
     plan: Plan,
-    approved: bool,
-    /// The auditable approval binding, present once a `cap.request` approved
-    /// this plan (HR-D2). Binds requester, plan ref/hash, approver, granted
-    /// scope, when it was approved, and — once the approved plan actually runs
-    /// — the journal entry id of the execution that consumed it.
-    approval: Option<ApprovalRecord>,
+    authorization: PlanAuthorization,
+}
+
+/// Authorization is a one-way state machine. An explicit approval is a
+/// single-use capability: claiming it excludes concurrent/replayed applies,
+/// and a completed execution can never be returned to the approved state.
+#[derive(Clone)]
+enum PlanAuthorization {
+    PolicyAllowed,
+    Pending,
+    Denied,
+    Approved(ApprovalRecord),
+    Claimed(ApprovalRecord),
+    Consumed(ApprovalRecord),
+}
+
+impl PlanAuthorization {
+    fn is_approved(&self) -> bool {
+        matches!(
+            self,
+            Self::PolicyAllowed | Self::Approved(_) | Self::Claimed(_) | Self::Consumed(_)
+        )
+    }
+
+    fn is_pending(&self) -> bool {
+        matches!(self, Self::Pending)
+    }
+
+    fn approval(&self) -> Option<&ApprovalRecord> {
+        match self {
+            Self::Approved(record) | Self::Claimed(record) | Self::Consumed(record) => Some(record),
+            Self::PolicyAllowed | Self::Pending | Self::Denied => None,
+        }
+    }
 }
 
 /// The auditable record binding an approval to its requester, plan, approver,
 /// scope, and consuming execution (HR-D2). Mirrored into the journal as an
 /// audit entry at approval time (`record_approval_audit`) and surfaced on
 /// `plan.get` so the whole chain is inspectable, never an unattributed bit.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct ApprovalRecord {
     /// The plan owner whose effects were approved.
     requester: String,
@@ -153,6 +183,8 @@ struct ApprovalRecord {
     scope: Vec<String>,
     /// When the approval was granted (ns since epoch).
     approved_at_ns: i64,
+    /// Completed journal row that durably records the grant itself.
+    grant_audit_id: i64,
     /// The journal entry id of the execution that consumed this approval, once
     /// an approved `exec` actually ran the plan. `None` until then.
     consumed_by: Option<i64>,
@@ -175,6 +207,8 @@ impl Kernel {
             events: Arc::new(EventBus::default()),
             auth: None,
             allow_self_ack: AtomicBool::new(self_ack_from_env()),
+            #[cfg(test)]
+            fail_approval_audit: AtomicBool::new(false),
         })
     }
 
@@ -205,6 +239,8 @@ impl Kernel {
             events: Arc::new(events),
             auth: Some(Mutex::new(TokenStore::open(state_dir.join("tokens.json"))?)),
             allow_self_ack: AtomicBool::new(self_ack_from_env()),
+            #[cfg(test)]
+            fail_approval_audit: AtomicBool::new(false),
         }))
     }
 
@@ -232,6 +268,8 @@ impl Kernel {
             events: Arc::new(events),
             auth: Some(Mutex::new(TokenStore::open(state_dir.join("tokens.json"))?)),
             allow_self_ack: AtomicBool::new(self_ack_from_env()),
+            #[cfg(test)]
+            fail_approval_audit: AtomicBool::new(false),
         }))
     }
 
@@ -251,6 +289,8 @@ impl Kernel {
             events: Arc::new(EventBus::default()),
             auth: None,
             allow_self_ack: AtomicBool::new(self_ack_from_env()),
+            #[cfg(test)]
+            fail_approval_audit: AtomicBool::new(false),
         })
     }
 
@@ -386,19 +426,20 @@ impl Kernel {
         format!("plan:{plan_hash}:{object_id:016x}")
     }
 
-    /// Append a journal audit entry for an approval decision (HR-D2), so the
+    /// Append a completed journal audit entry for an approval decision (HR-D2), so the
     /// requester→plan→approver→scope binding is durably queryable via
-    /// `journal.query`, not just live in the plan map. Best effort: an
-    /// audit-write failure must never fail the approval it records (the same
-    /// degrade-don't-brick stance the exec journal already takes). `session` is
-    /// the plan's session (so the record is queryable in context) and
-    /// `effect_kinds` is the plan's full effect set.
+    /// `journal.query`, not just live in the plan map. This is fail-closed: an
+    /// approval that could not be durably audited is not granted.
     fn record_approval_audit(
         &self,
         approval: &ApprovalRecord,
         effect_kinds: &[String],
         session: &str,
-    ) {
+    ) -> Result<i64, RpcError> {
+        #[cfg(test)]
+        if self.fail_approval_audit.load(Ordering::SeqCst) {
+            return Err(internal("injected approval audit failure"));
+        }
         let effects_json = serde_json::to_string(&json!([{
             "kind": "approval",
             "plan_ref": approval.plan_ref,
@@ -424,10 +465,11 @@ impl Kernel {
             effects_json,
             opaque: false,
         };
-        let journal = self.journal.lock().unwrap();
-        if let Ok(id) = journal.append(&record) {
-            let _ = journal.finish(id, Some(0), true, 0);
-        }
+        self.journal
+            .lock()
+            .unwrap()
+            .append_completed(&record, Some(0), true, 0)
+            .map_err(internal)
     }
 }
 
@@ -729,6 +771,7 @@ fn approval_json(approval: Option<&ApprovalRecord>) -> Json {
             "session": a.session,
             "scope": a.scope,
             "approved_at": a.approved_at_ns,
+            "grant_audit_id": a.grant_audit_id,
             "consumed_by": a.consumed_by,
         }),
     }
@@ -3363,6 +3406,157 @@ mod tests {
     }
 
     #[test]
+    fn cap_request_fails_closed_when_the_grant_audit_cannot_be_written() {
+        let policy = Policy::from_toml(&format!(
+            "[principal.\"{}\"]\nopaque='ask'\nauto_apply='never'\n",
+            principal()
+        ))
+        .unwrap();
+        let kernel = Kernel::with_policy(policy);
+        kernel.set_allow_self_ack(true);
+        let (mut client, mut reader, thread) = spawn(&kernel);
+        attach(&mut client, &mut reader);
+        let planned = call(
+            &mut client,
+            &mut reader,
+            2,
+            "exec",
+            json!({"src":"sh { echo hi }","mode":"plan","position":"stmt"}),
+        )
+        .result
+        .unwrap();
+        let plan_ref = planned["plan_ref"].as_str().unwrap().to_owned();
+
+        kernel.fail_approval_audit.store(true, Ordering::SeqCst);
+        let failed = call(
+            &mut client,
+            &mut reader,
+            3,
+            "cap.request",
+            json!({"plan_ref": plan_ref}),
+        );
+        assert_eq!(
+            failed.error.expect("audit failure must reject grant").code,
+            INTERNAL_ERROR
+        );
+        let apply = call(
+            &mut client,
+            &mut reader,
+            4,
+            "plan.apply",
+            json!({"plan_ref": plan_ref}),
+        );
+        assert_eq!(
+            apply
+                .error
+                .expect("failed audit must leave plan pending")
+                .code,
+            APPROVAL_REQUIRED
+        );
+
+        kernel.fail_approval_audit.store(false, Ordering::SeqCst);
+        let granted = call(
+            &mut client,
+            &mut reader,
+            5,
+            "cap.request",
+            json!({"plan_ref": plan_ref}),
+        );
+        assert!(
+            granted.error.is_none(),
+            "a later durable grant succeeds: {granted:?}"
+        );
+        drop(client);
+        drop(reader);
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn concurrent_plan_apply_consumes_an_explicit_approval_exactly_once() {
+        let policy = Policy::from_toml(&format!(
+            "[principal.\"{}\"]\nopaque='ask'\nauto_apply='never'\n",
+            principal()
+        ))
+        .unwrap();
+        let kernel = Kernel::with_policy(policy);
+        kernel.set_allow_self_ack(true);
+
+        let (mut owner, mut owner_reader, owner_server) = spawn(&kernel);
+        attach(&mut owner, &mut owner_reader);
+        let plan_ref = call(
+            &mut owner,
+            &mut owner_reader,
+            2,
+            "exec",
+            json!({"src":"sh { echo one-shot }","mode":"plan","position":"stmt"}),
+        )
+        .result
+        .unwrap()["plan_ref"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            call(
+                &mut owner,
+                &mut owner_reader,
+                3,
+                "cap.request",
+                json!({"plan_ref": plan_ref}),
+            )
+            .error
+            .is_none()
+        );
+
+        let (mut a, mut ar, a_server) = spawn(&kernel);
+        attach(&mut a, &mut ar);
+        let (mut b, mut br, b_server) = spawn(&kernel);
+        attach(&mut b, &mut br);
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let apply = |mut stream: UnixStream,
+                     mut reader: BufReader<UnixStream>,
+                     barrier: Arc<std::sync::Barrier>,
+                     plan_ref: String| {
+            std::thread::spawn(move || {
+                barrier.wait();
+                call(
+                    &mut stream,
+                    &mut reader,
+                    4,
+                    "plan.apply",
+                    json!({"plan_ref": plan_ref}),
+                )
+            })
+        };
+        let first = apply(a, ar, barrier.clone(), plan_ref.clone());
+        let second = apply(b, br, barrier.clone(), plan_ref);
+        barrier.wait();
+        let responses = [first.join().unwrap(), second.join().unwrap()];
+        assert_eq!(
+            responses
+                .iter()
+                .filter(|response| response.error.is_none())
+                .count(),
+            1,
+            "exactly one concurrent apply may execute: {responses:?}"
+        );
+        assert_eq!(
+            responses
+                .iter()
+                .filter_map(|response| response.error.as_ref())
+                .filter(|error| error.code == LEASH_DENIED)
+                .count(),
+            1,
+            "the loser is rejected as an already-consumed approval: {responses:?}"
+        );
+
+        drop(owner);
+        drop(owner_reader);
+        owner_server.join().unwrap();
+        a_server.join().unwrap();
+        b_server.join().unwrap();
+    }
+
+    #[test]
     fn distinct_agent_without_approver_role_is_denied_but_local_human_can_approve() {
         let dir = tempfile::tempdir().unwrap();
         let mut tokens = TokenStore::open(dir.path().join("tokens.json")).unwrap();
@@ -3579,9 +3773,63 @@ mod tests {
         assert_eq!(approval["session"], "pair", "{got}");
         assert_eq!(approval["plan_hash"].as_str().unwrap().len(), 64, "{got}");
         assert_eq!(approval["source_hash"].as_str().unwrap().len(), 64, "{got}");
+        assert!(approval["grant_audit_id"].is_i64(), "{got}");
         assert!(
             approval["consumed_by"].is_i64(),
             "the approval names the journal entry that consumed it: {got}"
+        );
+
+        // An explicit approval is single-use. A sequential replay through the
+        // public plan.apply path must be rejected before any effect runs.
+        let replay = call(
+            &mut a,
+            &mut a_reader,
+            7,
+            "plan.apply",
+            json!({"plan_ref": plan_ref}),
+        );
+        assert_eq!(
+            replay.error.expect("approval replay must fail").code,
+            LEASH_DENIED
+        );
+
+        // The durable execution row itself links back to the completed grant
+        // audit row. This survives loss of the in-memory plan map.
+        let history = call(
+            &mut a,
+            &mut a_reader,
+            8,
+            "journal.query",
+            json!({"limit": 100}),
+        )
+        .result
+        .unwrap();
+        let entries = history.as_array().unwrap();
+        let consumed_by = approval["consumed_by"].as_i64().unwrap();
+        let execution = entries
+            .iter()
+            .find(|entry| entry["id"] == consumed_by)
+            .expect("consuming execution is durable");
+        let consumption = execution["effects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|effect| effect["kind"] == "approval.consume")
+            .expect("execution embeds its approval linkage");
+        assert_eq!(consumption["plan_ref"], plan_ref);
+        assert_eq!(consumption["grant_audit_id"], approval["grant_audit_id"]);
+        let grant_id = approval["grant_audit_id"].as_i64().unwrap();
+        let grant_row = entries
+            .iter()
+            .find(|entry| entry["id"] == grant_id)
+            .expect("grant audit row is durable");
+        assert_eq!(grant_row["ok"], true);
+        assert!(
+            grant_row["effects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|effect| effect["kind"] == "approval")
         );
 
         drop(a);

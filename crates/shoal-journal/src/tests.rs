@@ -15,6 +15,24 @@ fn rec(session: &str, principal: &str, ts_ns: i64, src: &str) -> EntryRecord {
     }
 }
 
+#[test]
+fn append_completed_persists_a_finished_row_atomically() {
+    let journal = Journal::in_memory().unwrap();
+    let id = journal
+        .append_completed(
+            &rec("audit", "supervisor", 7, "# approval p"),
+            Some(0),
+            true,
+            0,
+        )
+        .unwrap();
+    let rows = journal.entries_by_id(&[id]).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, Some(0));
+    assert_eq!(rows[0].ok, Some(true));
+    assert_eq!(rows[0].dur_ns, Some(0));
+}
+
 /// Count regular files under `dir`, recursively.
 fn count_files(dir: &Path) -> usize {
     let mut n = 0;

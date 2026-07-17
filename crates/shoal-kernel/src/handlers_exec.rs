@@ -223,8 +223,11 @@ impl Kernel {
                     plan_hash,
                     source_hash,
                     plan,
-                    approved: verdict == Verdict::Allow,
-                    approval: None,
+                    authorization: match verdict {
+                        Verdict::Allow => PlanAuthorization::PolicyAllowed,
+                        Verdict::ApprovalRequired => PlanAuthorization::Pending,
+                        Verdict::Deny => PlanAuthorization::Denied,
+                    },
                 },
             );
             if verdict == Verdict::ApprovalRequired {
@@ -239,31 +242,7 @@ impl Kernel {
                 );
             }
             return encode(result);
-        } else if params.mode == "approved" {
-            // "approved" is `plan.apply`'s re-entry, NOT a caller-assertable
-            // privilege: without this check any attached principal could send
-            // `{"mode":"approved"}` and skip the leash verdict entirely. It
-            // must name a stored plan that is approved for THIS
-            // session/principal and carries the SAME source.
-            let verified = params.plan_ref.as_ref().is_some_and(|r| {
-                self.plans.lock().unwrap().get(r).is_some_and(|sp| {
-                    sp.session == session.id
-                        && sp.principal == actor
-                        && sp.src == params.src
-                        && (sp.approved
-                            || self.policy.evaluate_plan(&actor, &sp.plan) == Verdict::Allow)
-                })
-            });
-            if !verified {
-                return Err(RpcError {
-                    code: LEASH_DENIED,
-                    message: "mode \"approved\" requires an approved plan_ref for this \
-                              session/principal (use plan → cap.request → plan.apply)"
-                        .into(),
-                    data: None,
-                });
-            }
-        } else if params.mode != "run" {
+        } else if params.mode != "approved" && params.mode != "run" {
             return Err(RpcError {
                 code: INVALID_PARAMS,
                 message: "mode must be run or plan".into(),
@@ -283,7 +262,7 @@ impl Kernel {
         // resolves to no confinement, so the human path is unchanged.
         evaluator.set_leash_policy(self.policy.clone(), actor.clone());
         let run_plan = derive_plan(&mut evaluator, &ast, &ast_json);
-        if params.mode == "approved" {
+        let claimed_approval = if params.mode == "approved" {
             let Some(plan_ref) = params.plan_ref.as_ref() else {
                 return Err(RpcError {
                     code: LEASH_DENIED,
@@ -293,8 +272,8 @@ impl Kernel {
             };
             let actual_hash =
                 bound_plan_hash(&params.src, &ast_json, &run_plan, &session.id, &actor);
-            let plans = self.plans.lock().unwrap();
-            let stored = plans.get(plan_ref).ok_or_else(|| RpcError {
+            let mut plans = self.plans.lock().unwrap();
+            let stored = plans.get_mut(plan_ref).ok_or_else(|| RpcError {
                 code: UNKNOWN_PLAN,
                 message: "unknown plan_ref".into(),
                 data: None,
@@ -311,7 +290,52 @@ impl Kernel {
                     data: None,
                 });
             }
-        }
+            match &stored.authorization {
+                PlanAuthorization::PolicyAllowed
+                    if self.policy.evaluate_plan(&actor, &stored.plan) == Verdict::Allow =>
+                {
+                    None
+                }
+                PlanAuthorization::Approved(record) => {
+                    let record = record.clone();
+                    stored.authorization = PlanAuthorization::Claimed(record.clone());
+                    Some(record)
+                }
+                PlanAuthorization::Claimed(_) => {
+                    return Err(RpcError {
+                        code: LEASH_DENIED,
+                        message: "approved plan is already being applied".into(),
+                        data: Some(json!({"plan_ref": plan_ref})),
+                    });
+                }
+                PlanAuthorization::Consumed(record) => {
+                    return Err(RpcError {
+                        code: LEASH_DENIED,
+                        message: "approval was already consumed".into(),
+                        data: Some(json!({
+                            "plan_ref": plan_ref,
+                            "consumed_by": record.consumed_by,
+                        })),
+                    });
+                }
+                PlanAuthorization::Pending => {
+                    return Err(RpcError {
+                        code: APPROVAL_REQUIRED,
+                        message: "plan approval pending".into(),
+                        data: Some(json!({"plan_ref": plan_ref})),
+                    });
+                }
+                PlanAuthorization::Denied | PlanAuthorization::PolicyAllowed => {
+                    return Err(RpcError {
+                        code: LEASH_DENIED,
+                        message: "plan is not authorized for approved execution".into(),
+                        data: Some(json!({"plan_ref": plan_ref})),
+                    });
+                }
+            }
+        } else {
+            None
+        };
         if params.mode == "run" {
             match self.policy.evaluate_plan(&actor, &run_plan) {
                 Verdict::Deny => {
@@ -334,41 +358,78 @@ impl Kernel {
         evaluator.interactive = false;
         let started = Instant::now();
         let opaque = run_plan.effects.iter().any(|e| matches!(e, Effect::Opaque));
-        let effects_json = serde_json::to_string(&run_plan.effects).map_err(internal)?;
-        let entry_id = self
-            .journal
-            .lock()
-            .unwrap()
-            .append(&EntryRecord {
-                session: session.id.clone(),
-                // Cloned, not moved: both the error and success paths below
-                // publish a `journal` event (site/content/internals/kernel-protocol.md) carrying this
-                // same principal, well after this record is built.
-                principal: actor.clone(),
-                ts_ns: now_ns(),
-                cwd: evaluator.cwd().as_os_str().as_bytes().to_vec(),
-                src: params.src.clone(),
-                ast_json: ast_json.clone(),
-                effects_json,
-                opaque,
-            })
-            .map_err(internal)?;
-        // HR-D2: an approved re-entry consumes its plan's approval — bind the
-        // consuming execution (this journal entry) into the approval record so
-        // the requester→plan→approver→scope→execution chain is complete and
-        // auditable. `mode:"approved"` only reaches here after the branch above
-        // verified `plan_ref` names an approved plan for this session/principal.
-        if params.mode == "approved"
-            && let Some(plan_ref) = &params.plan_ref
-            && let Some(stored) = self.plans.lock().unwrap().get_mut(plan_ref)
-            && let Some(approval) = stored.approval.as_mut()
-            && approval.plan_ref == stored.plan.plan_ref
-            && approval.plan_hash == stored.plan_hash
-            && approval.source_hash == stored.source_hash
-            && approval.session == stored.session
-            && approval.requester == stored.principal
-        {
-            approval.consumed_by = Some(entry_id);
+        let mut journal_effects = run_plan
+            .effects
+            .iter()
+            .map(|effect| serde_json::to_value(effect).map_err(internal))
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Some(approval) = &claimed_approval {
+            journal_effects.push(json!({
+                "kind": "approval.consume",
+                "plan_ref": approval.plan_ref,
+                "plan_hash": approval.plan_hash,
+                "source_hash": approval.source_hash,
+                "requester": approval.requester,
+                "approver": approval.approver,
+                "scope": approval.scope,
+                "grant_audit_id": approval.grant_audit_id,
+            }));
+        }
+        let effects_json = serde_json::to_string(&journal_effects).map_err(internal)?;
+        let append_result = self.journal.lock().unwrap().append(&EntryRecord {
+            session: session.id.clone(),
+            // Cloned, not moved: both the error and success paths below
+            // publish a `journal` event (site/content/internals/kernel-protocol.md) carrying this
+            // same principal, well after this record is built.
+            principal: actor.clone(),
+            ts_ns: now_ns(),
+            cwd: evaluator.cwd().as_os_str().as_bytes().to_vec(),
+            src: params.src.clone(),
+            ast_json: ast_json.clone(),
+            effects_json,
+            opaque,
+        });
+        let entry_id = match append_result {
+            Ok(entry_id) => entry_id,
+            Err(error) => {
+                if let (Some(plan_ref), Some(approval)) = (&params.plan_ref, &claimed_approval) {
+                    let mut plans = self.plans.lock().unwrap();
+                    if let Some(stored) = plans.get_mut(plan_ref)
+                        && matches!(
+                            &stored.authorization,
+                            PlanAuthorization::Claimed(current) if current == approval
+                        )
+                    {
+                        stored.authorization = PlanAuthorization::Approved(approval.clone());
+                    }
+                }
+                return Err(internal(error));
+            }
+        };
+        if let (Some(plan_ref), Some(approval)) = (&params.plan_ref, claimed_approval) {
+            let mut plans = self.plans.lock().unwrap();
+            let Some(stored) = plans.get_mut(plan_ref) else {
+                let _ = self
+                    .journal
+                    .lock()
+                    .unwrap()
+                    .finish(entry_id, None, false, 0);
+                return Err(internal("claimed plan disappeared before execution"));
+            };
+            if !matches!(
+                &stored.authorization,
+                PlanAuthorization::Claimed(current) if current == &approval
+            ) {
+                let _ = self
+                    .journal
+                    .lock()
+                    .unwrap()
+                    .finish(entry_id, None, false, 0);
+                return Err(internal("claimed approval changed before execution"));
+            }
+            let mut consumed = approval;
+            consumed.consumed_by = Some(entry_id);
+            stored.authorization = PlanAuthorization::Consumed(consumed);
         }
         // Hand the evaluator this call's source so each journaled top-level
         // statement can slice its own `src` (site/content/internals/language-conformance-contract.md) — mirrors the REPL's fix

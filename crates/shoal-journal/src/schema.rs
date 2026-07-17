@@ -193,6 +193,39 @@ impl Journal {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// Record an entry whose outcome is already known in one atomic statement.
+    ///
+    /// Audit events do not have a running phase. Writing their completion
+    /// columns together with the row avoids the `append`/`finish` gap where a
+    /// crash or a second write failure could leave a grant looking unfinished.
+    pub fn append_completed(
+        &self,
+        e: &EntryRecord,
+        status: Option<i32>,
+        ok: bool,
+        dur_ns: i64,
+    ) -> rusqlite::Result<i64> {
+        self.conn.execute(
+            "INSERT INTO entry (session, principal, ts, dur_ns, cwd, env_hash, src, ast, effects,
+                                status, ok, opaque)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                e.session,
+                e.principal,
+                e.ts_ns,
+                dur_ns,
+                e.cwd,
+                e.src,
+                e.ast_json,
+                e.effects_json,
+                status,
+                ok,
+                e.opaque
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
     /// Fill in the completion columns of a previously appended entry.
     ///
     /// `status` is `None` for signal deaths (site/content/internals/language-conformance-contract.md: never 128+n encoded).
