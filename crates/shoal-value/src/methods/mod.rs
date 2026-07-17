@@ -745,6 +745,330 @@ mod tests {
         std::fs::remove_dir_all(d).unwrap();
     }
 
+    /// HR-C4: `path`/value `.save`/`.append` and stream `.save`/`.append` must
+    /// cross the injected [`Fs`] port, so a recording adapter observes every
+    /// write and a denying adapter can refuse it — with nothing landing on the
+    /// real filesystem behind the port's back.
+    mod fs_port_boundary {
+        use super::*;
+        use crate::StreamVal;
+        use crate::ports::{Fs, ReadSeek};
+        use std::io;
+        use std::path::Path;
+        use std::sync::{Arc, Mutex};
+
+        /// One observed filesystem write, recorded by [`SpyFs`].
+        #[derive(Debug, Clone, PartialEq)]
+        enum FsEvent {
+            Write(PathBuf, Vec<u8>),
+            OpenAppend(PathBuf),
+            Append(PathBuf, Vec<u8>),
+        }
+
+        /// A test [`Fs`] adapter that records the write sinks (`write`,
+        /// `append`, `open_append`) into a shared log and, when `deny` is set,
+        /// refuses them with a `PermissionDenied` error. Every other method is
+        /// `unreachable!` so any unexpected filesystem escape shows up loudly.
+        #[derive(Clone)]
+        struct SpyFs {
+            events: Arc<Mutex<Vec<FsEvent>>>,
+            deny: bool,
+        }
+
+        impl SpyFs {
+            fn recording() -> Self {
+                Self {
+                    events: Arc::default(),
+                    deny: false,
+                }
+            }
+            fn denying() -> Self {
+                Self {
+                    events: Arc::default(),
+                    deny: true,
+                }
+            }
+            fn events(&self) -> Vec<FsEvent> {
+                self.events.lock().unwrap().clone()
+            }
+            fn deny_err() -> io::Error {
+                io::Error::new(io::ErrorKind::PermissionDenied, "denied by policy")
+            }
+        }
+
+        /// The writer [`SpyFs::open_append`] hands back: each `write` is logged
+        /// as an `Append`, exactly modeling the incremental stream sink.
+        struct SpyWriter {
+            events: Arc<Mutex<Vec<FsEvent>>>,
+            path: PathBuf,
+        }
+        impl io::Write for SpyWriter {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.events
+                    .lock()
+                    .unwrap()
+                    .push(FsEvent::Append(self.path.clone(), buf.to_vec()));
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl Fs for SpyFs {
+            fn write(&self, path: &Path, data: &[u8]) -> io::Result<()> {
+                if self.deny {
+                    return Err(Self::deny_err());
+                }
+                self.events
+                    .lock()
+                    .unwrap()
+                    .push(FsEvent::Write(path.to_path_buf(), data.to_vec()));
+                Ok(())
+            }
+            fn append(&self, path: &Path, data: &[u8]) -> io::Result<()> {
+                if self.deny {
+                    return Err(Self::deny_err());
+                }
+                self.events
+                    .lock()
+                    .unwrap()
+                    .push(FsEvent::Append(path.to_path_buf(), data.to_vec()));
+                Ok(())
+            }
+            fn open_append(&self, path: &Path) -> io::Result<Box<dyn io::Write + Send>> {
+                if self.deny {
+                    return Err(Self::deny_err());
+                }
+                self.events
+                    .lock()
+                    .unwrap()
+                    .push(FsEvent::OpenAppend(path.to_path_buf()));
+                Ok(Box::new(SpyWriter {
+                    events: self.events.clone(),
+                    path: path.to_path_buf(),
+                }))
+            }
+            fn read(&self, _p: &Path) -> io::Result<Vec<u8>> {
+                unreachable!("read not exercised by the write-sink port test")
+            }
+            fn read_to_string(&self, _p: &Path) -> io::Result<String> {
+                unreachable!("read_to_string not exercised")
+            }
+            fn open_read(&self, _p: &Path) -> io::Result<Box<dyn ReadSeek + Send>> {
+                unreachable!("open_read not exercised")
+            }
+            fn touch(&self, _p: &Path) -> io::Result<()> {
+                unreachable!("touch not exercised")
+            }
+            fn metadata(&self, _p: &Path) -> io::Result<std::fs::Metadata> {
+                unreachable!("metadata not exercised")
+            }
+            fn symlink_metadata(&self, _p: &Path) -> io::Result<std::fs::Metadata> {
+                unreachable!("symlink_metadata not exercised")
+            }
+            fn read_dir(&self, _p: &Path) -> io::Result<Vec<PathBuf>> {
+                unreachable!("read_dir not exercised")
+            }
+            fn create_dir(&self, _p: &Path) -> io::Result<()> {
+                unreachable!("create_dir not exercised")
+            }
+            fn create_dir_all(&self, _p: &Path) -> io::Result<()> {
+                unreachable!("create_dir_all not exercised")
+            }
+            fn remove_file(&self, _p: &Path) -> io::Result<()> {
+                unreachable!("remove_file not exercised")
+            }
+            fn remove_dir_all(&self, _p: &Path) -> io::Result<()> {
+                unreachable!("remove_dir_all not exercised")
+            }
+            fn rename(&self, _f: &Path, _t: &Path) -> io::Result<()> {
+                unreachable!("rename not exercised")
+            }
+            fn copy(&self, _f: &Path, _t: &Path) -> io::Result<u64> {
+                unreachable!("copy not exercised")
+            }
+            fn hard_link(&self, _s: &Path, _d: &Path) -> io::Result<()> {
+                unreachable!("hard_link not exercised")
+            }
+            fn symlink(&self, _t: &Path, _l: &Path) -> io::Result<()> {
+                unreachable!("symlink not exercised")
+            }
+        }
+
+        /// A `CallCtx` whose `fs()` returns the injected [`SpyFs`], so the
+        /// value-method write sinks resolve to it.
+        struct SpyCtx {
+            fs: SpyFs,
+            cwd: PathBuf,
+        }
+        impl CallCtx for SpyCtx {
+            fn call_closure(&mut self, _f: &Value, _args: Vec<Value>) -> VResult<Value> {
+                Err(ErrorVal::new(
+                    "custom",
+                    "no closures in the port-boundary test",
+                ))
+            }
+            fn cwd(&self) -> PathBuf {
+                self.cwd.clone()
+            }
+            fn fs(&self) -> &dyn Fs {
+                &self.fs
+            }
+        }
+
+        fn int_stream() -> StreamVal {
+            StreamVal::from_iter("int", (1..=2).map(|i| Ok(Value::Int(i))))
+        }
+
+        #[test]
+        fn path_save_and_append_are_observed_by_the_port() {
+            let fs = SpyFs::recording();
+            let mut ctx = SpyCtx {
+                fs: fs.clone(),
+                cwd: PathBuf::from("/spy-root"),
+            };
+            call_method(
+                &mut ctx,
+                Value::Str("hello".into()),
+                "save",
+                a(vec![Value::Str("out.txt".into())]),
+                Span::default(),
+            )
+            .unwrap();
+            call_method(
+                &mut ctx,
+                Value::Str("more".into()),
+                "append",
+                a(vec![Value::Str("out.txt".into())]),
+                Span::default(),
+            )
+            .unwrap();
+            let p = PathBuf::from("/spy-root/out.txt");
+            assert_eq!(
+                fs.events(),
+                vec![
+                    FsEvent::Write(p.clone(), b"hello".to_vec()),
+                    FsEvent::Append(p, b"more".to_vec()),
+                ],
+                "path .save/.append must cross the Fs port with the resolved path + bytes"
+            );
+        }
+
+        #[test]
+        fn stream_save_is_observed_by_the_port() {
+            let fs = SpyFs::recording();
+            let mut ctx = SpyCtx {
+                fs: fs.clone(),
+                cwd: PathBuf::from("/spy-root"),
+            };
+            call_method(
+                &mut ctx,
+                Value::Stream(int_stream()),
+                "save",
+                a(vec![Value::Str("log".into())]),
+                Span::default(),
+            )
+            .unwrap();
+            let p = PathBuf::from("/spy-root/log");
+            assert_eq!(
+                fs.events(),
+                vec![
+                    FsEvent::OpenAppend(p.clone()),
+                    FsEvent::Append(p.clone(), b"1\n".to_vec()),
+                    FsEvent::Append(p, b"2\n".to_vec()),
+                ],
+                "stream .save must open once through the port and append each item"
+            );
+        }
+
+        #[test]
+        fn a_denying_port_refuses_path_save_and_writes_nothing_to_disk() {
+            // A REAL, writable tempdir: if the write bypassed the (denying) port
+            // and hit `std::fs` directly, the file WOULD appear here.
+            let dir = std::env::temp_dir().join(format!("shoal-lanec-deny-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut ctx = SpyCtx {
+                fs: SpyFs::denying(),
+                cwd: dir.clone(),
+            };
+            let err = call_method(
+                &mut ctx,
+                Value::Str("secret".into()),
+                "save",
+                a(vec![Value::Str("leak.txt".into())]),
+                Span::default(),
+            )
+            .unwrap_err();
+            assert_eq!(err.code, "custom");
+            assert!(
+                !dir.join("leak.txt").exists(),
+                "a denied .save must not write directly to disk"
+            );
+            // Append is denied and leaves nothing behind either.
+            let err = call_method(
+                &mut ctx,
+                Value::Str("secret".into()),
+                "append",
+                a(vec![Value::Str("leak.txt".into())]),
+                Span::default(),
+            )
+            .unwrap_err();
+            assert_eq!(err.code, "custom");
+            assert!(!dir.join("leak.txt").exists());
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn a_denying_port_refuses_stream_save_and_writes_nothing_to_disk() {
+            let dir =
+                std::env::temp_dir().join(format!("shoal-lanec-deny-s-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut ctx = SpyCtx {
+                fs: SpyFs::denying(),
+                cwd: dir.clone(),
+            };
+            let err = call_method(
+                &mut ctx,
+                Value::Stream(int_stream()),
+                "save",
+                a(vec![Value::Str("leak.log".into())]),
+                Span::default(),
+            )
+            .unwrap_err();
+            assert_eq!(err.code, "custom");
+            assert!(
+                !dir.join("leak.log").exists(),
+                "a denied stream .save must not write directly to disk"
+            );
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        /// Pin that the default `CallCtx::fs()` is the real filesystem, so a
+        /// context that never injects a port stays byte-identical to the
+        /// pre-port `OpenOptions` behavior (the `save_and_append` test above
+        /// exercises the happy path through the default; this nails the default
+        /// specifically).
+        #[test]
+        fn default_call_ctx_fs_is_std_fs() {
+            struct Bare;
+            impl CallCtx for Bare {
+                fn call_closure(&mut self, _f: &Value, _a: Vec<Value>) -> VResult<Value> {
+                    unreachable!()
+                }
+                fn cwd(&self) -> PathBuf {
+                    std::env::temp_dir()
+                }
+            }
+            let dir = std::env::temp_dir().join(format!("shoal-lanec-def-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let p = dir.join("real.txt");
+            Bare.fs().write(&p, b"on disk").unwrap();
+            assert_eq!(std::fs::read_to_string(&p).unwrap(), "on disk");
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
     #[test]
     fn group_by_is_an_alias_for_group() {
         let x = Value::List(vec![

@@ -102,7 +102,7 @@ Rules for implementers:
   `shoal-eval` value/method paths; route each through a port or record a justified exemption in
   the effects/security internals page. *(C2)*
   <br>Accept: the inventory list is committed; non-exempt sites are ported.
-- [ ] **HR-C4** — Tests: with a recording/denying Fs port installed, covered in-process writes
+- [x] **HR-C4** — Tests: with a recording/denying Fs port installed, covered in-process writes
   are observed and deniable; no covered route writes directly. *(C3)*
 
 ### Workstream D — attachment, approval, identity
