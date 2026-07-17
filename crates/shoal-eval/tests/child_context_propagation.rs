@@ -17,7 +17,10 @@
 
 use shoal_eval::Evaluator;
 use shoal_leash::Policy;
+use shoal_reef::Resolver;
+use shoal_reef::provider::SystemProvider;
 use shoal_value::{ConfigSnapshot, Record, Value};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -259,3 +262,129 @@ fn shl_script_child_observes_parent_cancellation() {
     );
     assert_eq!(out, Value::Int(7), "script: {out:?}");
 }
+
+// ---- Reef resolution inputs: a constrained tool resolves in every route -----
+//
+// The reef-half of finding B (the parent's reef resolver, scope chain, lock, and
+// lock path). A parent whose `.reef.toml` constrains `faketool` to a fixture
+// binary LOCKS it (an interactive foreground run auto-locks). Each child route
+// must inherit those reef inputs so the SAME constrained name resolves to the
+// SAME fixture binary from the inherited lock under the child's non-interactive
+// script policy. A child that dropped the reef inputs would not resolve
+// `faketool` at all — the fixture dir is not on the process `PATH`. This pins
+// the step-3 `ReefState` bundle (resolver + chain + lock + lock path)
+// behaviorally, complementing the white-box overlay pin in `child_context.rs`.
+
+/// Write an executable fixture `faketool` that answers `--version` and otherwise
+/// prints a fixed marker line, into `bindir`.
+fn fixture_faketool(bindir: &Path) {
+    let p = bindir.join("faketool");
+    std::fs::write(
+        &p,
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"faketool 1.2.3\"; exit 0; fi\necho \"faketool-ran\"\n",
+    )
+    .unwrap();
+    let mut perm = std::fs::metadata(&p).unwrap().permissions();
+    perm.set_mode(0o755);
+    std::fs::set_permissions(&p, perm).unwrap();
+}
+
+/// A parent rooted in a fresh project whose `.reef.toml` constrains `faketool`,
+/// with a fixture resolver rooted at the project `bin/`, and `faketool` already
+/// LOCKED (an interactive foreground run auto-locks) so a child resolves it from
+/// the inherited lock under the non-interactive script policy.
+fn reef_locked_parent() -> (tempfile::TempDir, Evaluator) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(".reef.toml"), "[tools]\nfaketool = \"*\"\n").unwrap();
+    let bindir = dir.path().join("bin");
+    std::fs::create_dir_all(&bindir).unwrap();
+    fixture_faketool(&bindir);
+    let mut ev = Evaluator::new(dir.path().to_path_buf());
+    ev.interactive = true; // interactive → auto-lock, no reef_unlocked
+    ev.set_reef_resolver(Arc::new(Resolver::new(vec![Box::new(
+        SystemProvider::new(vec![bindir], vec![]),
+    )])));
+    ev.eval_program(&parse("faketool"))
+        .expect("parent locks faketool foreground");
+    (dir, ev)
+}
+
+/// Whether `v` is the successful outcome of the resolved fixture binary.
+fn ran_fixture(v: &Value) -> bool {
+    matches!(v, Value::Outcome(o)
+        if o.ok && String::from_utf8_lossy(&o.stdout).contains("faketool-ran"))
+}
+
+#[test]
+fn spawn_block_inherits_reef_resolution() {
+    let (_d, mut ev) = reef_locked_parent();
+    let out = ev
+        .eval_program(&parse("(spawn { faketool }).await()"))
+        .expect("spawn faketool runs");
+    assert!(
+        ran_fixture(&out),
+        "a spawn child must resolve the constrained fixture, got {out:?}"
+    );
+}
+
+#[test]
+fn parallel_inherits_reef_resolution() {
+    let (_d, mut ev) = reef_locked_parent();
+    // A bare command in a lambda body needs a block so `faketool` is a command,
+    // not a variable read (an expression-position identifier).
+    let out = ev
+        .eval_program(&parse("parallel(() => { faketool })"))
+        .expect("parallel faketool runs");
+    let Value::List(xs) = &out else {
+        panic!("parallel returns a list, got {out:?}");
+    };
+    assert!(
+        xs.len() == 1 && ran_fixture(&xs[0]),
+        "a parallel child must resolve the constrained fixture, got {out:?}"
+    );
+}
+
+#[test]
+fn on_handler_inherits_reef_resolution() {
+    let (_d, mut ev) = reef_locked_parent();
+    // The handler reports a deterministic result over a channel (as the leash
+    // on-handler test does): `true` (the outcome's `.ok`) means `faketool`
+    // resolved to the fixture inside the handler's child; a child that dropped
+    // the reef inputs could not resolve it, so `(faketool).ok` raises and the
+    // handler reports `"MISS"`.
+    let src = "on(channel(\"cmd\"), (ev) => { channel(\"res\").emit(try { (faketool).ok } catch { \"MISS\" }) })\n\
+               channel(\"cmd\").emit(1)\n\
+               channel(\"res\").take(timeout: 5s)";
+    let out = ev
+        .eval_program(&parse(src))
+        .expect("on-handler reports a result");
+    assert_eq!(
+        out,
+        Value::Bool(true),
+        "an on-handler child must resolve the constrained fixture, got {out:?}"
+    );
+}
+
+#[test]
+fn shl_script_inherits_reef_resolution() {
+    let (d, mut ev) = reef_locked_parent();
+    std::fs::write(d.path().join("r.shl"), "faketool").unwrap();
+    let out = ev
+        .eval_program(&parse("run(\"r.shl\")"))
+        .expect("script faketool runs");
+    assert!(
+        ran_fixture(&out),
+        "a .shl child must resolve the constrained fixture, got {out:?}"
+    );
+}
+
+// ---- Event bus is shared across the child boundary --------------------------
+//
+// Session `channel(name)` coordination is one shared `Arc<EventBus>`. That the
+// child inherits the SAME `Arc` (not a private bus) is pinned white-box by
+// `Arc::ptr_eq` in `child_context.rs::decomposition_characterization`; the
+// `on`-handler routes above additionally exercise a child publishing onto a
+// channel the parent consumes. A late-subscriber behavioral variant (child emits
+// before the parent subscribes) is deliberately omitted: session channels are
+// pub/sub with no retention for a subscriber that arrives after the emit, so
+// such a test races rather than proving bus sharing.
