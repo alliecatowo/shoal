@@ -65,18 +65,15 @@ checks and exit codes 0, 1, or 2. It checks:
 - an isolated SQLite journal open/write cycle;
 - TOML syntax for core config and full policy parsing.
 
-`Options::from_env` currently derives `state_dir` from `$XDG_DATA_HOME` (or
-`~/.local/share/shoal`), while evaluator/kernel state uses `$XDG_STATE_HOME` (or
-`~/.local/state/shoal`). Its writable-state and isolated-journal probes can therefore validate a
-different tree from the live REPL/kernel, the same default-root divergence as `shoal-history`.
-Passing an explicit shared state directory avoids the mismatch; default doctor success does not
-currently prove the active state root is healthy.
+`Options::from_env`, the evaluator/kernel, and `shoal-history` use the shared `ShoalPaths` state root.
+Doctor also loads layered config and honors `journal.state_dir`, resolving relative values from its
+startup cwd. A caller that starts components from different cwd values while using a relative custom
+state path can still point them at different trees; the default path contract itself is shared.
 
 
 The journal probe uses a temporary subdirectory, so it proves SQLite/CAS prerequisites without
-polluting normal history. The config probe currently checks generic TOML syntax rather than running
-the full `shoal-config` layered schema loader, a diagnostic coverage gap for unknown/type-invalid
-core keys.
+polluting normal history. Config and policy file probes call the authoritative bounded core loaders;
+typed schema errors, structural limits, and policy-specific admission therefore match production.
 
 ## Normative conformance corpus
 

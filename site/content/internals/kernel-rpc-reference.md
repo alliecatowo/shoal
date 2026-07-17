@@ -185,8 +185,9 @@ version probe. Result:
 }
 ```
 
-A constrained but unlocked tool can have null version/provider fields. Correctness inherits the
-evaluator's current Reef cache invalidation limitations.
+A constrained but unlocked tool can have null version/provider fields. The evaluator checks its
+fixed-size candidate/lock metadata fingerprint before reusing the scope chain, so same-cwd
+create/edit/remove changes are visible without restarting the session.
 
 ## Syntax and introspection
 

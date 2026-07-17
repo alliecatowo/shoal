@@ -250,7 +250,7 @@ Wire paths preserve raw Unix bytes alongside lossy display strings. Some other v
 ## Reef limitations
 
 - Manifests activate only tool resolution; there are no shell activation hooks.
-- The evaluator caches scope discovery. Manual manifest edits while staying in the same cwd may remain stale until `reef add` invalidates, cwd changes away/back, or session restarts.
+- The evaluator caches parsed scope discovery behind a candidate/lock metadata fingerprint; same-cwd create/edit/remove changes invalidate it. Metadata-to-open identity races remain a filesystem-port limitation.
 - An unlocked constrained tool is tolerated/locked interactively but rejected under script policy; host-installed versions/providers make first resolution host-dependent.
 - Hermetic mode removes ambient PATH tail; it does not sandbox filesystem/network/environment/syscalls.
 - Provider availability and install commands depend on host managers; offline/missing providers remain honest resolution errors.
@@ -261,8 +261,7 @@ Wire paths preserve raw Unix bytes alongside lossy display strings. Some other v
 
 ## Journal, history, undo, and secret limitations
 
-- `shoal-history` defaults to XDG data while the main shell/kernel journal normally uses XDG state. Pass `--state-dir`.
-- `shoal-doctor` also labels an XDG data path as state and may probe a different socket fallback than kernel/MCP.
+- Shell, kernel, history, and doctor share the canonical XDG state default. Pass `--state-dir` when layered config deliberately moves the journal elsewhere.
 - GC may age out output blobs that journal entries still reference unless pinned; metadata remains but bytes become unavailable.
 - Undo covers only operations that recorded a typed inverse; it is not arbitrary command rollback.
 - Undo depends on surviving CAS bytes/current fingerprint and refuses stale/symlink-escaped targets.

@@ -23,44 +23,17 @@ pub fn query(journal: &Journal, filter: &QueryFilter) -> Result<Vec<EntryRow>, r
         head: filter.head.clone(),
         principal: filter.principal.clone(),
         ok: filter.ok,
-        limit: if filter.effect.is_some() {
-            usize::MAX
-        } else {
-            requested
-        },
+        limit: requested,
     };
-    let mut rows = journal.query(&q)?;
     if let Some(effect) = &filter.effect {
-        rows.retain(|r| {
-            serde_json::from_str::<Value>(&r.effects_json)
-                .ok()
-                .is_some_and(|v| effect_matches(&v, effect))
-        });
-        rows.truncate(requested);
-    }
-    Ok(rows)
-}
-
-fn effect_matches(value: &Value, wanted: &str) -> bool {
-    match value {
-        Value::Array(xs) => xs.iter().any(|v| effect_matches(v, wanted)),
-        Value::String(s) => s.contains(wanted),
-        Value::Object(m) => m
-            .get("kind")
-            .and_then(Value::as_str)
-            .is_some_and(|s| s.contains(wanted)),
-        _ => false,
+        journal.query_effect_contains(&q, effect)
+    } else {
+        journal.query(&q)
     }
 }
 
 pub fn entry(journal: &Journal, id: i64) -> Result<Option<EntryRow>, rusqlite::Error> {
-    Ok(journal
-        .query(&JournalQuery {
-            limit: usize::MAX,
-            ..Default::default()
-        })?
-        .into_iter()
-        .find(|r| r.id == id))
+    Ok(journal.entries_by_id(&[id])?.into_iter().next())
 }
 
 pub fn entry_json(journal: &Journal, row: &EntryRow) -> Value {
@@ -157,6 +130,44 @@ mod tests {
         .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, a);
+    }
+
+    #[test]
+    fn effect_filter_stops_at_requested_matches_and_ignores_non_kind_fields() {
+        let j = Journal::in_memory().unwrap();
+        for index in 0..20 {
+            let effects = if index % 2 == 0 {
+                r#"[{"kind":"fs.read","path":"net-decoy"}]"#
+            } else {
+                r#"[{"kind":"net.connect"}]"#
+            };
+            j.append(&rec(&format!("cmd-{index}"), effects)).unwrap();
+        }
+        let rows = query(
+            &j,
+            &QueryFilter {
+                effect: Some("net".into()),
+                limit: 3,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(
+            rows.iter()
+                .all(|row| row.effects_json.contains("net.connect"))
+        );
+    }
+
+    #[test]
+    fn entry_fetch_is_targeted_and_missing_ids_are_absent() {
+        let j = Journal::in_memory().unwrap();
+        let first = j.append(&rec("first", "[]")).unwrap();
+        for index in 0..200 {
+            j.append(&rec(&format!("noise-{index}"), "[]")).unwrap();
+        }
+        assert_eq!(entry(&j, first).unwrap().unwrap().src, "first");
+        assert!(entry(&j, i64::MAX).unwrap().is_none());
     }
     #[test]
     fn show_reports_available_and_aged_out() {

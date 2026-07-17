@@ -46,11 +46,10 @@ opened independently by each process/component. A five-second SQLite busy timeou
 dropped best-effort writes when the REPL, kernel, and history CLI contend. WAL permits concurrent
 readers and leaves an appended-but-unfinished row visible after a crash.
 
-Default roots currently diverge: `shoal-history` and `shoal-doctor::Options::from_env` choose
-`$XDG_DATA_HOME/shoal`, while evaluator and kernel state paths choose `$XDG_STATE_HOME/shoal`.
-Unless the caller passes a shared `--state-dir` or equivalent explicit path, history can inspect and
-doctor can probe a different database tree than the active shell/kernel. This is integration debt,
-not two interchangeable names for the same XDG location.
+The main shell, kernel, `shoal-history`, and `shoal-doctor` share `ShoalPaths::state_dir`: explicit
+`SHOAL_STATE_DIR`, otherwise `$XDG_STATE_HOME/shoal`, otherwise `~/.local/state/shoal`. A relative or
+absolute `journal.state_dir` in layered config can intentionally move the shell/doctor journal;
+`shoal-history` then needs the matching `--state-dir` because it does not load the shell config.
 
 Source: [`shoal-journal`](https://github.com/alliecatowo/shoal/tree/main/crates/shoal-journal/src).
 
@@ -76,9 +75,9 @@ Outputs are linked as ordered rows of kind `stdout`, `stderr`, `value`, or `rend
 entries newest-first and join output rows in recording order. `entries_by_id` preserves caller order
 and is used by targeted durable event replay.
 
-The standalone `shoal-history::entry` helper currently performs an unlimited newest-first query and
-then searches in memory even though `Journal::entries_by_id` exists. This is a concrete scaling debt
-for large journals.
+The standalone `shoal-history::entry` helper uses `Journal::entries_by_id`, so `show ID` fetches only
+the requested row and its outputs. Effect-filtered history steps SQLite rows and retains only matches,
+stopping at the requested result limit rather than materializing the whole journal.
 
 ## Content-addressed store
 

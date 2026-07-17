@@ -187,6 +187,26 @@ impl Journal {
     /// `limit == 0` means the default of 100. The `head` filter matches entries
     /// whose `src`'s first whitespace-separated word equals `head` exactly.
     pub fn query(&self, q: &JournalQuery) -> rusqlite::Result<Vec<EntryRow>> {
+        self.query_inner(q, None)
+    }
+
+    /// Query entries newest-first while retaining only rows whose structured
+    /// effects contain `wanted`. Filtering happens as SQLite rows are stepped,
+    /// before any row is retained, and stops once `q.limit` matches have been
+    /// collected. This is the bounded history-CLI counterpart to [`Self::query`].
+    pub fn query_effect_contains(
+        &self,
+        q: &JournalQuery,
+        wanted: &str,
+    ) -> rusqlite::Result<Vec<EntryRow>> {
+        self.query_inner(q, Some(wanted))
+    }
+
+    fn query_inner(
+        &self,
+        q: &JournalQuery,
+        effect_contains: Option<&str>,
+    ) -> rusqlite::Result<Vec<EntryRow>> {
         let limit = if q.limit == 0 {
             DEFAULT_QUERY_LIMIT
         } else {
@@ -221,9 +241,10 @@ impl Journal {
             sql.push_str(&clauses.join(" AND "));
         }
         sql.push_str(" ORDER BY id DESC");
-        // The head filter is applied in Rust (SQL cannot cheaply split on arbitrary
-        // whitespace), so SQL LIMIT is only usable when no head filter is set.
-        if q.head.is_none() {
+        // The head/effect filters are applied while stepping rows (SQL cannot
+        // cheaply express their exact semantics), so SQL LIMIT is usable only
+        // when neither filter is present.
+        if q.head.is_none() && effect_contains.is_none() {
             sql.push_str(" LIMIT ?");
             params.push(&limit_i64);
         }
@@ -238,6 +259,14 @@ impl Journal {
             {
                 continue;
             }
+            let effects_json: String = row.get(8)?;
+            if let Some(wanted) = effect_contains
+                && !serde_json::from_str::<serde_json::Value>(&effects_json)
+                    .ok()
+                    .is_some_and(|value| effect_matches(&value, wanted))
+            {
+                continue;
+            }
             out.push(EntryRow {
                 id: row.get(0)?,
                 session: row.get(1)?,
@@ -247,7 +276,7 @@ impl Journal {
                 cwd: row.get(5)?,
                 src,
                 ast_json: row.get(7)?,
-                effects_json: row.get(8)?,
+                effects_json,
                 status: row.get(9)?,
                 ok: row.get(10)?,
                 opaque: row.get(11)?,
@@ -338,5 +367,19 @@ impl Journal {
                 .collect::<rusqlite::Result<Vec<_>>>()?;
         }
         Ok(())
+    }
+}
+
+fn effect_matches(value: &serde_json::Value, wanted: &str) -> bool {
+    match value {
+        serde_json::Value::Array(values) => {
+            values.iter().any(|value| effect_matches(value, wanted))
+        }
+        serde_json::Value::String(value) => value.contains(wanted),
+        serde_json::Value::Object(fields) => fields
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|kind| kind.contains(wanted)),
+        _ => false,
     }
 }

@@ -278,7 +278,6 @@ solve drift by introducing dependency cycles.
 
 ### Low but concrete maintenance debt
 
-- `shoal-history::entry` scans all journal rows instead of `entries_by_id`.
 - Fuzz targets are shallow; PR compilation is blocking and scheduled runtime fuzzing is the
   behavioral gate.
 - Color/highlighter tests isolate ambient `NO_COLOR` while asserting ANSI output.

@@ -67,10 +67,9 @@ in `ScopeChain::warnings`. Direct parse APIs return errors. Evaluator discovery 
 filesystem capability and admits at most one MiB of regular UTF-8 input per file; best-effort
 fall-through remains a usability choice that callers should surface in diagnostics.
 
-Discovery also skips a manifest when its parsed `manifest.tools` map is empty. A manifest containing
-only runner declarations or Reef options therefore does **not** participate in the scope chain today;
-its runners/options cannot take effect through normal discovery. This behavior is in `scope.rs` and
-should be treated as an implementation gap until a test-backed scope-identity rule replaces it.
+Discovery admits a manifest when it constrains tools, defines runners, or requests hermetic execution.
+Runner-only and hermetic-only project/user manifests therefore participate without a dummy tool;
+completely empty or default-only manifests are omitted because they have no scope-level effect.
 
 Runner tables merge in the opposite traversal order—farthest first, then nearer overlays—so the
 nearest declaration wins. Hermetic intent is true if any active scope requests it.

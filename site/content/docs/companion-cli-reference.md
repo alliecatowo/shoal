@@ -102,19 +102,19 @@ done
 
 ## XDG path matrix
 
-The companions do not yet use one perfectly consistent root. This table is operationally important:
+State and data are intentionally separate. This table is operationally important:
 
 | Component | Default state/data path |
 | --- | --- |
 | `shoal-kernel` journal/tokens | `$XDG_STATE_HOME/shoal`, else `~/.local/state/shoal` |
 | main `shoal` journal/history | state-rooted (`XDG_STATE_HOME`) |
-| `shoal-history` | `$XDG_DATA_HOME/shoal`, else `~/.local/share/shoal` |
+| `shoal-history` | `$SHOAL_STATE_DIR`, else `$XDG_STATE_HOME/shoal`, else `~/.local/state/shoal` |
 | evaluator secrets | `$SHOAL_SECRET_DIR`, else `$XDG_DATA_HOME/shoal/secrets`, else `~/.local/share/shoal/secrets` |
 | `shoal-secret` | `$XDG_DATA_HOME/shoal/secrets`, else `~/.local/share/shoal/secrets` (ignores `SHOAL_SECRET_DIR`) |
-| `shoal-doctor` “state dir” probe | `$XDG_DATA_HOME/shoal`, else `~/.local/share/shoal` |
+| `shoal-doctor` “state dir” probe | effective `journal.state_dir`, else the shared state root above |
 | user config/policy/adapters | `$XDG_CONFIG_HOME/shoal`, else `~/.config/shoal` |
 
-When operating a kernel or the main shell journal, pass `shoal-history --state-dir` explicitly. When using `SHOAL_SECRET_DIR` for the evaluator, the CLI cannot target it by flag or environment today; temporarily align `XDG_DATA_HOME`, or manage the store with a process/environment layout that points both at the same directory.
+When layered config sets a custom `journal.state_dir`, pass the same path to `shoal-history --state-dir`. When using `SHOAL_SECRET_DIR` for the evaluator, the CLI cannot target it by flag or environment today; temporarily align `XDG_DATA_HOME`, or manage the store with a process/environment layout that points both at the same directory.
 
 ## `shoal-kernel`
 

@@ -381,16 +381,17 @@ changing only a comment: consumers need a transition story for any previously em
 ### P2.1 Reef strict discovery, cache identity, and probe authority
 
 Add a strict mode for scripts/agents that reports unreadable or malformed ancestor manifests,
-lock-write failure, unavailable providers, and ambiguous `latest` resolution. Decide whether a
-runner/hermetic-only manifest establishes scope even with no tools.
+lock-write failure, unavailable providers, and ambiguous `latest` resolution. Runner/hermetic-only
+manifests now establish scope without tool constraints.
 
-Replace cwd-only evaluator caching with a chain identity that includes discovered manifest paths and
-change tokens. Separate fast metadata caching from security-sensitive executable content identity.
-Version probes execute code; route them through the same Leash/spawn capability path before probing.
+The former cwd-only evaluator cache now uses a fixed-size metadata identity over every candidate and
+adjacent lock, including missing paths. Security-sensitive executable identity remains content-hashed.
+Version probes execute code; routing them through the same Leash/spawn capability path before probing
+remains open.
 
-**Exit tests.** Modify/create/delete a manifest while cwd stays fixed; replace an executable without
-changing its name; make the lock unwritable; present an empty-tools runner manifest; deny probe spawn;
-restart and prove deterministic lock/view behavior.
+**Evidence.** Same-cwd manifest/lock replacement, lock-write failure, executable replacement, and
+tool-free runner/hermetic scopes are covered. Remaining exit evidence is denied probe spawn plus
+restart-level deterministic lock/view behavior under strict mode.
 
 ### P2.2 Configuration contract honesty
 
