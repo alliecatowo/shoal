@@ -218,8 +218,12 @@ Rules for implementers:
   starving a silent side); zip pinned as synchronous pairing at the slower side's rate, now
   HOLDING an unpaired left item across a right-side timeout instead of discarding it; the
   consumed-then-discarded dangling item at end-of-stream is pinned and documented.
-- [ ] **HR-G7** — Incremental stream `.feed` is implemented, or its explicit unimplemented error
+- [x] **HR-G7** — Incremental stream `.feed` is implemented, or its explicit unimplemented error
   and docs status are kept accurate and linked from the streams page. *(I6)*
+  — shipped: status kept honest (not implemented). `shoal-exec`'s `StdinSpec` has no streaming
+  variant, so implementing requires exec-surface work; the pre-spawn `type_error` + collect hint
+  stay pinned by `feed-stream-is-unimplemented-with-collect-hint`, and the streams page now
+  states the status, the blocker, and the implementation shape explicitly.
 
 ### Workstream H — truthful surface statuses
 

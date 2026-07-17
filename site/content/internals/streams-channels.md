@@ -430,7 +430,14 @@ cancelled exec token and is killed.
 
 ## Cross-layer gaps
 
-- `feed_bytes(Stream)` refuses stream-to-process stdin; incremental child-stdin pumping is absent.
+- **Stream `.feed` status (HR-G7): unimplemented, deliberately and loudly.** `feed_bytes(Stream)`
+  raises `type_error` — "feeding a stream to a command's stdin is not implemented yet" — with the
+  workaround hint (`stream.collect().feed(cmd)`), *before* any process is spawned; the corpus case
+  `feed-stream-is-unimplemented-with-collect-hint` pins both the code and the hint. The blocker is
+  the exec surface: `shoal-exec`'s `StdinSpec` is `Null | Inherit | Bytes | File` — there is no
+  incremental child-stdin pump to drive a live pipeline into. Implementing it means adding a
+  streaming stdin variant to `shoal-exec` plus a drive loop honoring cancellation and child-exit
+  backpressure; until then the error stays, never a buffering fake.
 - Kernel `WireValue::Stream` carries only a label; there is no RPC cursor/pull/chunk lifecycle.
 - Dropped/coalesced markers widen stream element shapes without a static type system expressing it.
 - Timer and timing combinators use direct system time/sleep, reducing deterministic testability.
