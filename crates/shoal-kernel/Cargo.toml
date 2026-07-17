@@ -3,6 +3,9 @@ name = "shoal-kernel"
 version = "0.1.0"
 edition = "2024"
 
+[lints]
+workspace = true
+
 [dependencies]
 base64 = "0.22"
 blake3 = "1.8.5"

@@ -3,6 +3,9 @@ name = "shoal-lsp"
 version = "0.1.0"
 edition = "2024"
 
+[lints]
+workspace = true
+
 [dependencies]
 shoal-syntax = { path = "../shoal-syntax" }
 tower-lsp = "0.20"
