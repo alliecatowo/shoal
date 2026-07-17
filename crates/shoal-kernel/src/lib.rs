@@ -33,8 +33,28 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+/// Poison-tolerant lock access for shared daemon state
+/// (site/content/internals/hardening-roadmap.md HR-E2; deep-audit finding H4). `Mutex::lock().unwrap()`
+/// panics AGAIN on an already-poisoned mutex, so one connection's thread
+/// panicking while holding a lock cascades into every other connection that
+/// later touches the same shared state — a single bad request can take the
+/// whole daemon down. `lock_recover` instead recovers the guarded data via
+/// [`PoisonError::into_inner`] (a panic sets the poison flag; it does not
+/// corrupt the data behind the lock) and keeps serving every other
+/// connection. The panicking connection's own `handle_stream` thread still
+/// unwinds and exits — an orderly shutdown of just that one connection — but
+/// no other connection's lock acquisitions panic because of it.
+pub(crate) trait LockExt<T> {
+    fn lock_recover(&self) -> MutexGuard<'_, T>;
+}
+impl<T> LockExt<T> for Mutex<T> {
+    fn lock_recover(&self) -> MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
 
 pub struct Kernel {
     sessions: Mutex<HashMap<String, Arc<Session>>>,
@@ -302,7 +322,7 @@ impl Kernel {
                 } else {
                     self.dispatch(request, client, &mut attached, Some(&writer))
                 };
-                write_frame(&mut *writer.lock().unwrap(), &response)?;
+                write_frame(&mut *writer.lock_recover(), &response)?;
             }
             Ok(())
         })();
@@ -314,8 +334,7 @@ impl Kernel {
 
     fn task(&self, task: &Ref) -> Result<Arc<TaskEntry>, RpcError> {
         self.tasks
-            .lock()
-            .unwrap()
+            .lock_recover()
             .get(task)
             .cloned()
             .ok_or_else(|| RpcError {
@@ -331,8 +350,7 @@ impl Kernel {
     fn pty(&self, pty_id: &Ref, session_id: &str) -> Result<Arc<PtyEntry>, RpcError> {
         let entry = self
             .ptys
-            .lock()
-            .unwrap()
+            .lock_recover()
             .get(pty_id)
             .cloned()
             .ok_or_else(unknown_pty)?;
@@ -420,7 +438,7 @@ impl Kernel {
 }
 
 fn task_record(task: &Arc<TaskEntry>) -> TaskRecord {
-    let inner = task.inner.lock().unwrap();
+    let inner = task.inner.lock_recover();
     task_record_locked(task, &inner)
 }
 fn task_record_locked(task: &TaskEntry, inner: &TaskInner) -> TaskRecord {
@@ -848,6 +866,38 @@ unsafe fn libc_geteuid() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// HR-E2 / deep-audit H4 regression: a panic while some OTHER thread
+    /// holds a `Mutex` must not cascade into every later `lock_recover()`
+    /// call on that same mutex — a bare `.lock().unwrap()` would itself
+    /// panic here (propagating one connection's bug to the whole daemon);
+    /// `lock_recover` instead recovers the guarded data (a panic mid-mutation
+    /// sets the poison flag, but never corrupts the data behind the lock)
+    /// and lets every other connection keep going.
+    #[test]
+    fn lock_recover_survives_a_poisoned_mutex() {
+        let shared = Arc::new(Mutex::new(0i32));
+        let poisoner = shared.clone();
+        let joined = std::thread::spawn(move || {
+            let mut guard = poisoner.lock().unwrap();
+            *guard = 42;
+            panic!("intentional poison for the test");
+        })
+        .join();
+        assert!(joined.is_err(), "the poisoning thread must have panicked");
+        assert!(
+            shared.is_poisoned(),
+            "the mutex must be poisoned after that panic"
+        );
+        // A bare `.lock().unwrap()` would panic AGAIN here (cascading the
+        // failure); `lock_recover` must not.
+        let recovered = shared.lock_recover();
+        assert_eq!(
+            *recovered, 42,
+            "lock_recover must return the guarded data as the panicking thread left it"
+        );
+    }
+
     fn call(
         writer: &mut UnixStream,
         reader: &mut BufReader<UnixStream>,

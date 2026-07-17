@@ -38,7 +38,7 @@ impl Kernel {
     /// only caller, `handle_session_attach`, always knows `who` before
     /// calling this.
     pub(crate) fn session(&self, name: &str, principal: &str) -> io::Result<Arc<Session>> {
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = self.sessions.lock_recover();
         if let Some(session) = sessions.get(name) {
             return Ok(session.clone());
         }
@@ -201,7 +201,7 @@ impl Kernel {
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
         let session = &attachment.session;
         let pairs: Vec<(String, String)> = {
-            let evaluator = session.evaluator.lock().unwrap();
+            let evaluator = session.evaluator.lock_recover();
             evaluator
                 .env_vars()
                 .iter()
@@ -241,7 +241,7 @@ impl Kernel {
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
         let session = &attachment.session;
         let snapshot = {
-            let mut evaluator = session.evaluator.lock().unwrap();
+            let mut evaluator = session.evaluator.lock_recover();
             evaluator.prompt_reef_snapshot()
         };
         let bindings: Vec<Json> = snapshot

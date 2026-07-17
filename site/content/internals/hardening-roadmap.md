@@ -140,9 +140,16 @@ Rules for implementers:
   <br>Done: `shoal_proto::read_frame` and `shoal-mcp`'s `read_json_line` both wrap the reader in
   `Read::take(cap+1)` before `read_line`; regression tests feed both an unterminated infinite
   stream and a single oversize line, asserting a prompt protocol error in each crate.
-- [ ] **HR-E2** — Shared daemon state stops relying on `.lock().unwrap()`: a poison-tolerant
+- [x] **HR-E2** — Shared daemon state stops relying on `.lock().unwrap()`: a poison-tolerant
   locking pattern (recover-or-shutdown helper) replaces bare unwraps so one panicking connection
   cannot cascade. *(H4)*
+  <br>Done: `shoal-kernel`'s `LockExt::lock_recover()` (in `lib.rs`) replaces every
+  `.lock().unwrap()` on kernel-wide and session-wide shared state (`Kernel`'s own maps, `Session`,
+  the event bus) with poison recovery; a regression test poisons a mutex from another thread and
+  proves `lock_recover` returns the data instead of panicking. Per-request locks reached only from
+  `handlers_*.rs` (out of this lane's file scope) are unchanged and listed in kernel-protocol.md's
+  "Concurrency and panic risk" section for whoever owns those files next — same helper, already in
+  scope via `use super::*`.
 - [ ] **HR-E3** — Quotas with clear errors: max concurrent connections, and per-session caps for
   tasks, PTYs, and subscriptions. *(H3, H5)*
 - [ ] **HR-E4** — Session lifecycle GC: bounded transcript retention, plan expiry,

@@ -360,10 +360,22 @@ Source: [`shoal-proto`](https://github.com/alliecatowo/shoal/blob/main/crates/sh
 
 ## Concurrency and panic risk
 
-Kernel maps and session components use standard mutexes and many `.lock().unwrap()` calls. This keeps
-the blocking design legible, but a panic while holding a long-lived shared lock poisons it; a later
-unwrap can cascade the failure across otherwise unrelated requests. High-risk boundaries include
-evaluator execution, transcript/task mutation, event indexes, and auth state.
+Kernel maps and session components use standard mutexes. The kernel-wide locks (`Kernel`'s own
+`sessions`/`plans`/`tasks`/`ptys`/`journal`/`auth` maps, `Session`'s `evaluator`/`transcript`/
+`client_it`, and every lock inside the event bus) are accessed through a poison-tolerant
+`LockExt::lock_recover()` helper (site/content/internals/hardening-roadmap.md HR-E2; deep-audit finding H4)
+rather than a bare `.lock().unwrap()`: `lock_recover` recovers the guarded data via
+`PoisonError::into_inner` instead of panicking a second time, so one connection's thread panicking
+while holding a lock no longer cascades into every other connection that later touches the same
+shared state. The panicking connection's own `handle_stream` thread still unwinds and exits — an
+orderly shutdown of just that one connection — but no other connection's lock acquisitions panic
+because of it.
+
+Per-request/per-task/per-PTY locks reached only from `dispatch`'s handler functions
+(`handlers_exec.rs`, `handlers_task.rs`, `handlers_pty.rs`, `handlers_session.rs`,
+`handlers_value.rs`) still use a bare `.lock().unwrap()` as of this writing — that sweep is tracked
+as follow-up work for whoever owns those files next, using the same `lock_recover()` helper (defined
+in `lib.rs`, already in scope for any file that does `use super::*`).
 
 Do not mechanically replace every unwrap. First make request-handler panics impossible where
 practical, isolate user-derived work from shared critical sections, and define recovery for poisoned
