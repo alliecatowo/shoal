@@ -39,7 +39,7 @@ impl Kernel {
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
         let session = &attachment.session;
         let params: ValueGetParams = decode(params)?;
-        let values = session.transcript.lock().unwrap();
+        let values = session.transcript.lock_recover();
         let value = values.get(&params.r#ref).ok_or_else(|| RpcError {
             code: UNKNOWN_REF,
             message: "unknown value ref".into(),
@@ -207,8 +207,7 @@ impl Kernel {
         };
         let rows = self
             .journal
-            .lock()
-            .unwrap()
+            .lock_recover()
             .query(&JournalQuery {
                 since_ts_ns: p.since,
                 principal: p.principal,

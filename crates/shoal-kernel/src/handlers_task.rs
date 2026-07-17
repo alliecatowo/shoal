@@ -13,8 +13,7 @@ impl Kernel {
         let session = &attachment.session;
         let records: Vec<_> = self
             .tasks
-            .lock()
-            .unwrap()
+            .lock_recover()
             .values()
             .filter(|task| task.session.id == session.id)
             .map(task_record)
@@ -58,7 +57,7 @@ impl Kernel {
                 data: None,
             });
         }
-        let mut inner = task.inner.lock().unwrap();
+        let mut inner = task.inner.lock_recover();
         while matches!(inner.state, "running" | "cancelling") {
             inner = task.done.wait(inner).unwrap();
         }
@@ -83,7 +82,7 @@ impl Kernel {
         }
         task.cancel_requested.store(true, Ordering::SeqCst);
         {
-            let mut inner = task.inner.lock().unwrap();
+            let mut inner = task.inner.lock_recover();
             if inner.state == "running" {
                 inner.state = "cancelling";
             }
@@ -164,7 +163,7 @@ impl Kernel {
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
         let session = &attachment.session;
         let p: PlanApplyParams = decode(params)?;
-        let plans = self.plans.lock().unwrap();
+        let plans = self.plans.lock_recover();
         let stored = plans.get(&p.plan_ref).ok_or_else(|| RpcError {
             code: UNKNOWN_PLAN,
             message: "unknown or expired plan_ref".into(),
@@ -210,7 +209,7 @@ impl Kernel {
     ) -> Result<Json, RpcError> {
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
         let session = &attachment.session;
-        let plans = self.plans.lock().unwrap();
+        let plans = self.plans.lock_recover();
         let records: Vec<Json> = plans
             .values()
             .filter(|sp| sp.session == session.id && sp.principal == attachment.principal)
@@ -239,7 +238,7 @@ impl Kernel {
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
         let session = &attachment.session;
         let p: PlanApplyParams = decode(params)?;
-        let plans = self.plans.lock().unwrap();
+        let plans = self.plans.lock_recover();
         let stored = plans.get(&p.plan_ref).ok_or_else(|| RpcError {
             code: UNKNOWN_PLAN,
             message: "unknown plan_ref".into(),
@@ -318,7 +317,7 @@ impl Kernel {
         // Read what we need under the plans lock, then drop it before the
         // journal append (never hold two shared locks across an I/O call).
         let (requester, session, plan_effect_kinds, deny) = {
-            let plans = self.plans.lock().unwrap();
+            let plans = self.plans.lock_recover();
             let stored = plans.get(&plan_ref).ok_or_else(|| RpcError {
                 code: UNKNOWN_PLAN,
                 message: "unknown plan_ref".into(),
@@ -402,7 +401,7 @@ impl Kernel {
             consumed_by: None,
         };
         {
-            let mut plans = self.plans.lock().unwrap();
+            let mut plans = self.plans.lock_recover();
             let stored = plans.get_mut(&plan_ref).ok_or_else(|| RpcError {
                 code: UNKNOWN_PLAN,
                 message: "unknown plan_ref".into(),

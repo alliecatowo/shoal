@@ -48,7 +48,7 @@ impl Kernel {
         argv.push(OsString::from(&p.cmd));
         argv.extend(p.args.iter().map(OsString::from));
         let (cwd, mut env) = {
-            let evaluator = session.evaluator.lock().unwrap();
+            let evaluator = session.evaluator.lock_recover();
             (evaluator.cwd().to_path_buf(), evaluator.env_vars().to_vec())
         };
         for (k, v) in &p.env {
@@ -99,6 +99,7 @@ impl Kernel {
         }
         let sandbox = self.policy.sandbox_for(&actor);
 
+        self.check_pty_quota(&session.id)?;
         let pty_session = shoal_exec::PtySession::open(shoal_exec::PtyOpenSpec {
             argv,
             cwd,
@@ -120,7 +121,7 @@ impl Kernel {
 
         let pty_id = self.next_pty.fetch_add(1, Ordering::Relaxed);
         let pty_ref = Ref::new("pty", pty_id);
-        self.ptys.lock().unwrap().insert(
+        self.ptys.lock_recover().insert(
             pty_ref.clone(),
             Arc::new(PtyEntry {
                 session_id: session.id.clone(),
@@ -157,8 +158,7 @@ impl Kernel {
         })?;
         entry
             .session
-            .lock()
-            .unwrap()
+            .lock_recover()
             .send(&bytes)
             .map_err(|e| RpcError {
                 code: INTERNAL_ERROR,
@@ -182,7 +182,7 @@ impl Kernel {
         let session_id = attachment.session.id.clone();
         let p: PtyRefParams = decode(params)?;
         let entry = self.pty(&p.pty_id, &session_id)?;
-        let snap = entry.session.lock().unwrap().read_screen();
+        let snap = entry.session.lock_recover().read_screen();
         encode(json!({
             "pty_id": p.pty_id,
             "cmd": entry.cmd,
@@ -214,15 +214,14 @@ impl Kernel {
         let entry = self.pty(&p.pty_id, &session_id)?;
         entry
             .session
-            .lock()
-            .unwrap()
+            .lock_recover()
             .resize(p.cols, p.rows)
             .map_err(|e| RpcError {
                 code: INTERNAL_ERROR,
                 message: format!("pty resize failed: {e}"),
                 data: None,
             })?;
-        let snap = entry.session.lock().unwrap().read_screen();
+        let snap = entry.session.lock_recover().read_screen();
         encode(json!({"pty_id": p.pty_id, "cols": snap.cols, "rows": snap.rows}))
     }
 
@@ -239,8 +238,8 @@ impl Kernel {
         let p: PtyRefParams = decode(params)?;
         // Ownership check first, then remove: another session's ref stays put.
         let entry = self.pty(&p.pty_id, &session_id)?;
-        self.ptys.lock().unwrap().remove(&p.pty_id);
-        let (status, signal) = entry.session.lock().unwrap().close();
+        self.ptys.lock_recover().remove(&p.pty_id);
+        let (status, signal) = entry.session.lock_recover().close();
         encode(json!({
             "pty_id": p.pty_id,
             "closed": true,
@@ -269,8 +268,7 @@ impl Kernel {
         // `PtyEntry::session` lock at once.
         let mut entries: Vec<(u64, Arc<PtyEntry>)> = self
             .ptys
-            .lock()
-            .unwrap()
+            .lock_recover()
             .iter()
             .filter(|(_, entry)| entry.session_id == session_id)
             .map(|(pty_ref, entry)| (pty_id_num(pty_ref), entry.clone()))
@@ -280,7 +278,7 @@ impl Kernel {
         let ptys: Vec<Json> = entries
             .iter()
             .map(|(id, entry)| {
-                let mut session = entry.session.lock().unwrap();
+                let mut session = entry.session.lock_recover();
                 let (cols, rows) = session.size();
                 json!({
                     "pty_id": Ref::new("pty", id),

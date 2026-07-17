@@ -520,16 +520,10 @@ impl Kernel {
 
     /// `Ok(())` when `session_id` is under its per-session task quota
     /// (site/content/internals/hardening-roadmap.md HR-E3; deep-audit H3); otherwise a clear
-    /// `QUOTA_EXCEEDED` protocol error. **Wiring note for the integrator**:
-    /// this check exists (and is exercised directly by
-    /// `check_task_quota_rejects_at_the_per_session_cap`) but is not yet
-    /// called from production request handling — `handle_exec`'s
-    /// background/timed-task path (`handlers_exec.rs`, outside this lane's
-    /// file scope) must call it BEFORE constructing a new `TaskEntry` and
-    /// inserting it into `self.tasks`, returning the error instead of
-    /// spawning the task when it fails. `#[allow(dead_code)]` is temporary:
-    /// remove it in the same change that adds that call.
-    #[allow(dead_code)]
+    /// `QUOTA_EXCEEDED` protocol error. Called by `handle_exec`'s
+    /// background/timed-task path (`handlers_exec.rs`) before constructing a
+    /// new `TaskEntry`; also exercised directly by
+    /// `check_task_quota_rejects_at_the_per_session_cap`.
     pub(crate) fn check_task_quota(&self, session_id: &str) -> Result<(), RpcError> {
         let max = self.max_tasks_per_session.load(Ordering::Relaxed);
         if self.tasks_for_session(session_id) >= max {
@@ -554,13 +548,9 @@ impl Kernel {
     /// `Ok(())` when `session_id` is under its per-session PTY quota
     /// (site/content/internals/hardening-roadmap.md HR-E3; deep-audit H3); otherwise a clear
     /// `QUOTA_EXCEEDED` protocol error. **Wiring note for the integrator**:
-    /// like `check_task_quota`, this is exercised directly by a test but not
-    /// yet called from production request handling — `handle_pty_open`
-    /// (`handlers_pty.rs`, outside this lane's file scope) must call it
-    /// BEFORE spawning the child/PTY pair and inserting a new `PtyEntry` into
-    /// `self.ptys`. `#[allow(dead_code)]` is temporary: remove it in the same
-    /// change that adds that call.
-    #[allow(dead_code)]
+    /// like `check_task_quota`, but for the per-session PTY cap. Called by
+    /// `handle_pty_open` (`handlers_pty.rs`) before spawning the child/PTY
+    /// pair; also exercised directly by its unit test.
     pub(crate) fn check_pty_quota(&self, session_id: &str) -> Result<(), RpcError> {
         let max = self.max_ptys_per_session.load(Ordering::Relaxed);
         if self.ptys_for_session(session_id) >= max {
@@ -626,16 +616,10 @@ impl Kernel {
     }
 
     /// Record `plan_ref`'s creation time for plan-expiry GC (see
-    /// [`Kernel::gc_plans`]; site/content/internals/hardening-roadmap.md HR-E4). **Wiring note for
-    /// the integrator**: call this once, right after
-    /// `self.plans.lock_recover().insert(plan_ref.clone(), StoredPlan{..})`
-    /// in `handlers_exec.rs`'s plan-storage call site (outside this lane's
-    /// file scope). Until that call lands, a stored plan simply has no entry
-    /// here, and `gc_plans` correctly never expires a plan it has no
-    /// recorded age for — a safe, conservative default ("generous retention,
-    /// correctness first"), not silent breakage. `#[allow(dead_code)]` is
-    /// temporary: remove it in the same change that adds that call.
-    #[allow(dead_code)]
+    /// [`Kernel::gc_plans`]; site/content/internals/hardening-roadmap.md HR-E4). Called once by
+    /// `handlers_exec.rs`'s plan-storage site, right after the `StoredPlan`
+    /// insert. A plan with no recorded age is never expired by `gc_plans` —
+    /// a safe, conservative default.
     pub(crate) fn note_plan_created(&self, plan_ref: &str) {
         self.plan_created_ns
             .lock_recover()
@@ -1541,6 +1525,7 @@ mod tests {
                 Estimates::default(),
             ),
             approved: false,
+            approval: None,
         };
         {
             let mut plans = kernel.plans.lock_recover();

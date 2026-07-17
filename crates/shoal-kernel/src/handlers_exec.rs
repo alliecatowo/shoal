@@ -24,7 +24,7 @@ impl Kernel {
             let wait = params.timeout_ms.map(std::time::Duration::from_millis);
             let is_background = params.asynchronous;
             let cancel = {
-                let mut evaluator = session.evaluator.lock().unwrap();
+                let mut evaluator = session.evaluator.lock_recover();
                 evaluator.reset_cancel();
                 evaluator.cancellation_token()
             };
@@ -34,6 +34,7 @@ impl Kernel {
             // it directly instead of re-deriving it from `task_ref.0` (which
             // is already the `task:N`-prefixed ref string and would double
             // the prefix).
+            self.check_task_quota(&session.id)?;
             let task_id = self.next_task.fetch_add(1, Ordering::Relaxed);
             let task_ref = Ref::new("task", task_id);
             let task = Arc::new(TaskEntry {
@@ -51,8 +52,7 @@ impl Kernel {
                 cancel_requested: AtomicBool::new(false),
             });
             self.tasks
-                .lock()
-                .unwrap()
+                .lock_recover()
                 .insert(task_ref.clone(), task.clone());
             let waiter = task.clone();
             let kernel = self.clone();
@@ -80,7 +80,7 @@ impl Kernel {
                 );
                 let exit_payload;
                 {
-                    let mut inner = task.inner.lock().unwrap();
+                    let mut inner = task.inner.lock_recover();
                     inner.finished_ns = Some(now_ns());
                     if let Some(error) = response.error {
                         inner.state = if task.cancel_requested.load(Ordering::SeqCst) {
@@ -112,7 +112,7 @@ impl Kernel {
                         let outcome = inner
                             .result_ref
                             .as_ref()
-                            .and_then(|r| task.session.transcript.lock().unwrap().get(r).cloned());
+                            .and_then(|r| task.session.transcript.lock_recover().get(r).cloned());
                         inner.state = match &outcome {
                             Some(Value::Outcome(o)) if !o.ok => {
                                 if task.cancel_requested.load(Ordering::SeqCst)
@@ -147,7 +147,7 @@ impl Kernel {
             // to finish; return an inline result if it beats the clock,
             // otherwise hand back the still-running task ref.
             let deadline = wait.map(|d| Instant::now() + d);
-            let mut inner = waiter.inner.lock().unwrap();
+            let mut inner = waiter.inner.lock_recover();
             while matches!(inner.state, "running" | "cancelling") {
                 let Some(deadline) = deadline else { break };
                 let now = Instant::now();
@@ -171,7 +171,7 @@ impl Kernel {
                 return Err(error);
             }
             if let Some(result_ref) = result_ref {
-                let values = session.transcript.lock().unwrap();
+                let values = session.transcript.lock_recover();
                 if let Some(value) = values.get(&result_ref) {
                     let budget = ElideBudget::from_spec(elide_spec.as_ref());
                     let uri = short_ref_to_uri(&result_ref, None);
@@ -194,7 +194,7 @@ impl Kernel {
             })?;
             let ast_json = serde_json::to_string(&ast).map_err(internal)?;
             let plan = {
-                let mut evaluator = session.evaluator.lock().unwrap();
+                let mut evaluator = session.evaluator.lock_recover();
                 derive_plan(&mut evaluator, &ast, &ast_json)
             };
             let verdict = self.policy.evaluate_plan(&actor, &plan);
@@ -209,7 +209,8 @@ impl Kernel {
                 verdict: verdict_name(verdict).into(),
                 approval_pending: verdict == Verdict::ApprovalRequired,
             };
-            self.plans.lock().unwrap().insert(
+            let plan_ref_for_gc = plan.plan_ref.clone();
+            self.plans.lock_recover().insert(
                 plan.plan_ref.clone(),
                 StoredPlan {
                     src: params.src,
@@ -220,6 +221,7 @@ impl Kernel {
                     approval: None,
                 },
             );
+            self.note_plan_created(&plan_ref_for_gc);
             if verdict == Verdict::ApprovalRequired {
                 // site/content/internals/kernel-protocol.md: a plan stuck at `approval_pending` is
                 // exactly the moment another principal (a human's session, a
@@ -239,7 +241,7 @@ impl Kernel {
             // must name a stored plan that is approved for THIS
             // session/principal and carries the SAME source.
             let verified = params.plan_ref.as_ref().is_some_and(|r| {
-                self.plans.lock().unwrap().get(r).is_some_and(|sp| {
+                self.plans.lock_recover().get(r).is_some_and(|sp| {
                     sp.session == session.id
                         && sp.principal == actor
                         && sp.src == params.src
@@ -269,7 +271,7 @@ impl Kernel {
             data: Some(json!({"span":e.span,"hint":e.hint})),
         })?;
         let ast_json = serde_json::to_string(&ast).map_err(internal)?;
-        let mut evaluator = session.evaluator.lock().unwrap();
+        let mut evaluator = session.evaluator.lock_recover();
         // site/content/internals/language-conformance-contract.md leash activation: bind the session's evaluator to this
         // principal's policy so any external spawn resolves and applies
         // an OS sandbox for `actor`. The default-permissive policy
@@ -301,8 +303,7 @@ impl Kernel {
         let effects_json = serde_json::to_string(&run_plan.effects).map_err(internal)?;
         let entry_id = self
             .journal
-            .lock()
-            .unwrap()
+            .lock_recover()
             .append(&EntryRecord {
                 session: session.id.clone(),
                 // Cloned, not moved: both the error and success paths below
@@ -324,7 +325,7 @@ impl Kernel {
         // verified `plan_ref` names an approved plan for this session/principal.
         if params.mode == "approved"
             && let Some(plan_ref) = &params.plan_ref
-            && let Some(stored) = self.plans.lock().unwrap().get_mut(plan_ref)
+            && let Some(stored) = self.plans.lock_recover().get_mut(plan_ref)
             && let Some(approval) = stored.approval.as_mut()
         {
             approval.consumed_by = Some(entry_id);
@@ -346,7 +347,7 @@ impl Kernel {
             Ok(value) => value,
             Err(e) => {
                 {
-                    let journal = self.journal.lock().unwrap();
+                    let journal = self.journal.lock_recover();
                     let _ = journal.finish(entry_id, e.status, false, elapsed_ns(started));
                     if let Some(stderr) = &e.stderr {
                         let _ = journal.record_output(entry_id, "stderr", stderr.as_bytes());
@@ -361,14 +362,13 @@ impl Kernel {
                 // so the agent can `shoal_get` the structured error
                 // (code/msg/span/hint) instead of parsing message text.
                 let value_ref = Ref::new("out", session.next_value.fetch_add(1, Ordering::Relaxed));
-                session.transcript.lock().unwrap().insert(
+                session.transcript.lock_recover().insert(
                     value_ref.clone(),
                     Value::Error(std::sync::Arc::new(e.clone())),
                 );
                 session
                     .client_it
-                    .lock()
-                    .unwrap()
+                    .lock_recover()
                     .insert(client, value_ref.clone());
                 let uri = short_ref_to_uri(&value_ref, None);
                 return Err(RpcError {
@@ -385,13 +385,11 @@ impl Kernel {
         let value_ref = Ref::new("out", session.next_value.fetch_add(1, Ordering::Relaxed));
         session
             .transcript
-            .lock()
-            .unwrap()
+            .lock_recover()
             .insert(value_ref.clone(), value.clone());
         session
             .client_it
-            .lock()
-            .unwrap()
+            .lock_recover()
             .insert(client, value_ref.clone());
         let render = shoal_value::render::render_block(&value, 80);
         // Built once, up front: this SAME payload is both persisted durably
@@ -402,7 +400,7 @@ impl Kernel {
         let transcript_payload = transcript_event(&value_ref, &value);
         let transcript_ts = now_ns();
         {
-            let journal = self.journal.lock().unwrap();
+            let journal = self.journal.lock_recover();
             journal
                 .finish(entry_id, Some(0), true, elapsed_ns(started))
                 .map_err(internal)?;
@@ -509,7 +507,7 @@ mod tests {
             .session("set-source-probe", &actor)
             .expect("create session");
         {
-            let mut evaluator = session.evaluator.lock().unwrap();
+            let mut evaluator = session.evaluator.lock_recover();
             evaluator.set_journal(
                 Journal::in_memory().expect("in-memory journal"),
                 "set-source-probe",

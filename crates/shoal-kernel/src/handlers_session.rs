@@ -51,7 +51,7 @@ impl Kernel {
         };
         let ast_json = serde_json::to_string(&ast).map_err(internal)?;
         let plan = {
-            let mut evaluator = session.evaluator.lock().unwrap();
+            let mut evaluator = session.evaluator.lock_recover();
             derive_plan(&mut evaluator, &ast, &ast_json)
         };
         encode(json!({
@@ -80,8 +80,7 @@ impl Kernel {
             .to_string();
         let blob = self
             .journal
-            .lock()
-            .unwrap()
+            .lock_recover()
             .read_blob(&hash)
             .map_err(internal)?
             .ok_or_else(|| RpcError {

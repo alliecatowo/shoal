@@ -150,29 +150,23 @@ Rules for implementers:
   `handlers_*.rs` (out of this lane's file scope) are unchanged and listed in kernel-protocol.md's
   "Concurrency and panic risk" section for whoever owns those files next — same helper, already in
   scope via `use super::*`.
-- [ ] **HR-E3** — Quotas with clear errors: max concurrent connections, and per-session caps for
+- [x] **HR-E3** — Quotas with clear errors: max concurrent connections, and per-session caps for
   tasks, PTYs, and subscriptions. *(H3, H5)*
   <br>Status: `shoal_kernel::Limits` (defaults 64/128/32/256, CLI-overridable via
   `--max-connections`/`--max-tasks-per-session`/`--max-ptys-per-session`/
-  `--max-subscriptions-per-session`) plus a `QUOTA_EXCEEDED` (-32040) error code exist. Connections
-  (`serve_until`'s accept loop) and subscriptions (`EventBus::subscribe`, both in this lane's file
-  scope) are fully enforced and tested. Task and PTY quota CHECKS
-  (`Kernel::check_task_quota`/`check_pty_quota`) are implemented and unit-tested but NOT yet called
-  from `handle_exec`'s background-task path or `handle_pty_open` — those live in `handlers_exec.rs`/
-  `handlers_pty.rs`, outside this lane's strict file scope (owned concurrently by lane D). Leaving
-  unticked until that one-line guard call lands in each handler; see kernel-protocol.md's "Limits,
-  quotas, and lifecycle GC" and this task's final report for exact wiring instructions.
-- [ ] **HR-E4** — Session lifecycle GC: bounded transcript retention, plan expiry,
+  `--max-subscriptions-per-session`) plus a `QUOTA_EXCEEDED` (-32040) error code. Connections
+  (`serve_until`'s accept loop) and subscriptions (`EventBus::subscribe`) are enforced and tested;
+  `check_task_quota`/`check_pty_quota` are wired into `handle_exec`'s background-task path and
+  `handle_pty_open` at integration. Defaults in kernel-protocol.md's "Limits, quotas, and
+  lifecycle GC".
+- [x] **HR-E4** — Session lifecycle GC: bounded transcript retention, plan expiry,
   completed-task reaping; limits configurable, defaults documented. *(H5)*
   <br>Status: transcript retention (4096 entries/session, evict oldest) and completed-task reaping
-  (512 finished tasks/session, oldest-first, a `running` task never reaped) are fully implemented,
-  wired into `handle_stream`'s post-dispatch GC sweep, and tested — including a direct
-  ref-addressability regression proving recently-created values stay resolvable. Plan expiry
-  (`Kernel::note_plan_created` + `gc_plans`, 24h TTL) is implemented and tested but the one call that
-  records a plan's creation time is not yet wired into `handlers_exec.rs`'s plan-storage site (same
-  file-scope boundary as HR-E3) — until wired, `gc_plans` is a safe no-op (no plan is ever recorded
-  as aged, so none expire). Leaving unticked until that call lands; defaults documented in
-  kernel-protocol.md's "Limits, quotas, and lifecycle GC".
+  (512 finished tasks/session, oldest-first, a `running` task never reaped) are wired into
+  `handle_stream`'s post-dispatch GC sweep and tested — including a ref-addressability regression
+  proving recently-created values stay resolvable. Plan expiry (`note_plan_created` + `gc_plans`,
+  24h TTL) is recorded at `handlers_exec.rs`'s plan-storage site as of integration. Defaults
+  documented in kernel-protocol.md's "Limits, quotas, and lifecycle GC".
 
 ### Workstream F — workspace hygiene
 
