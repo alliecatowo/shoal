@@ -2417,6 +2417,7 @@ dependencies = [
  "shoal-eval",
  "shoal-journal",
  "shoal-leash",
+ "shoal-mcp",
  "shoal-paths",
  "shoal-prompt",
  "shoal-syntax",

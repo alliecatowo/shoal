@@ -12,7 +12,14 @@ use shoal_syntax::parse;
 
 use crate::prompt;
 
-pub(crate) const USAGE: &str = "shoal 0.1.0\n\nUsage: shoal [OPTIONS] [SCRIPT]\n       shoal <fmt|doctor|lsp|mcp|completions|prompt> ...\n\nOptions:\n  -c, --command <SOURCE>  Evaluate source and exit\n  -h, --help              Print help\n  -V, --version           Print version\n\nDeveloper commands:\n  fmt [--check] [FILES]   Format .shl source (stdin when no files)\n  doctor [--json]         Diagnose the installation\n  lsp                     Run the language server companion\n  mcp                     Run the MCP companion\n  completions SHELL       Print bash, zsh, or fish completions\n  prompt explain|bench|print [--side left|right|continuation|transient] [--n N]";
+pub(crate) const USAGE: &str = "shoal 0.1.0\n\nUsage: shoal [OPTIONS] [SCRIPT]\n       shoal <fmt|doctor|kernel|lsp|mcp|completions|prompt> ...\n\nOptions:\n  -c, --command <SOURCE>  Evaluate source and exit\n  -h, --help              Print help\n  -V, --version           Print version\n\nCommands:\n  kernel start|status|stop [--json]  Manage the resident kernel\n\nDeveloper commands:\n  fmt [--check] [FILES]   Format .shl source (stdin when no files)\n  doctor [--json]         Diagnose the installation\n  lsp                     Run the language server companion\n  mcp                     Run the MCP companion\n  completions SHELL       Print bash, zsh, or fish completions\n  prompt explain|bench|print [--side left|right|continuation|transient] [--n N]";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KernelAction {
+    Start { json: bool },
+    Status { json: bool },
+    Stop { json: bool },
+}
 
 pub(crate) enum Action {
     Command(String, Vec<OsString>),
@@ -23,6 +30,7 @@ pub(crate) enum Action {
     Version,
     Fmt { check: bool, files: Vec<PathBuf> },
     Doctor { json: bool },
+    Kernel(KernelAction),
     Companion(&'static str),
     Completions(String),
     Prompt(prompt::PromptAction),
@@ -60,6 +68,29 @@ pub(crate) fn parse_args(args: Vec<OsString>, stdin_is_tty: bool) -> Result<Acti
             Ok(Action::Doctor {
                 json: !args.is_empty(),
             })
+        }
+        Some("kernel") => {
+            let args = iter
+                .map(|arg| {
+                    arg.into_string()
+                        .map_err(|_| "kernel arguments must be UTF-8".to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let (verb, rest) = args
+                .split_first()
+                .ok_or("kernel requires start, status, or stop")?;
+            let json = match rest {
+                [] => false,
+                [flag] if flag == "--json" => true,
+                _ => return Err("kernel accepts only an optional --json after the action".into()),
+            };
+            let action = match verb.as_str() {
+                "start" => KernelAction::Start { json },
+                "status" => KernelAction::Status { json },
+                "stop" => KernelAction::Stop { json },
+                _ => return Err("kernel requires start, status, or stop".into()),
+            };
+            Ok(Action::Kernel(action))
         }
         Some("prompt") => {
             let args = iter.filter_map(|a| a.into_string().ok());
@@ -166,13 +197,13 @@ pub(crate) fn run_companion(name: &str) -> Result<i32, String> {
 pub(crate) fn completion_script(shell: &str) -> Result<&'static str, String> {
     match shell {
         "bash" => Ok(
-            "_shoal(){ COMPREPLY=( $(compgen -W 'fmt doctor lsp mcp completions --help --version --command' -- \"${COMP_WORDS[COMP_CWORD]}\") ); }\ncomplete -F _shoal shoal\n",
+            "_shoal(){ COMPREPLY=( $(compgen -W 'fmt doctor kernel lsp mcp completions --help --version --command' -- \"${COMP_WORDS[COMP_CWORD]}\") ); }\ncomplete -F _shoal shoal\n",
         ),
         "zsh" => Ok(
-            "#compdef shoal\n_arguments '1:command:(fmt doctor lsp mcp completions)' '*:file:_files'\n",
+            "#compdef shoal\n_arguments '1:command:(fmt doctor kernel lsp mcp completions)' '*:file:_files'\n",
         ),
         "fish" => Ok(
-            "complete -c shoal -f -a 'fmt doctor lsp mcp completions'\ncomplete -c shoal -s c -l command -r\n",
+            "complete -c shoal -f -a 'fmt doctor kernel lsp mcp completions'\ncomplete -c shoal -s c -l command -r\n",
         ),
         _ => Err(format!(
             "unsupported shell `{shell}`; expected bash, zsh, or fish"
@@ -203,6 +234,14 @@ mod tests {
         assert!(matches!(
             parse_args(vec!["fmt".into(), "--check".into(), "x.shl".into()], true).unwrap(),
             Action::Fmt { check: true, .. }
+        ));
+        assert!(matches!(
+            parse_args(
+                vec!["kernel".into(), "status".into(), "--json".into()],
+                true
+            )
+            .unwrap(),
+            Action::Kernel(KernelAction::Status { json: true })
         ));
         assert!(matches!(
             parse_args(vec!["doctor".into(), "--json".into()], true).unwrap(),

@@ -1,0 +1,45 @@
+//! Managed daemon status and authenticated shutdown RPCs.
+
+use super::*;
+
+impl Kernel {
+    pub(crate) fn handle_kernel_status(
+        &self,
+        attached: &Option<Attachment>,
+    ) -> Result<Json, RpcError> {
+        let attachment = attached.as_ref().ok_or_else(not_attached)?;
+        Ok(json!({
+            "pid": std::process::id(),
+            "principal": attachment.principal,
+            "uptime_ms": self.started_at.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            "durable": self.state_dir.is_some(),
+            "state_dir": self.state_dir.as_ref().map(|path| path.display().to_string()),
+            "connections": {
+                "active": self.connections.active(),
+                "max": self.connections.max(),
+            },
+            "security": {
+                "epoch": ATTACH_SECURITY_EPOCH,
+                "raw_local_human": self.allow_unauthenticated_local_human,
+                "human_credential_required": !self.allow_unauthenticated_local_human,
+            },
+            "shutdown_requested": self.shutdown_requested.load(Ordering::SeqCst),
+        }))
+    }
+
+    pub(crate) fn handle_kernel_shutdown(
+        &self,
+        attached: &Option<Attachment>,
+    ) -> Result<Json, RpcError> {
+        let attachment = attached.as_ref().ok_or_else(not_attached)?;
+        if !attachment.can_approve {
+            return Err(RpcError {
+                code: LEASH_DENIED,
+                message: "kernel shutdown requires an authenticated local-human, supervisor, or plan.approve credential".into(),
+                data: Some(json!({"principal": attachment.principal})),
+            });
+        }
+        let already = self.shutdown_requested.swap(true, Ordering::SeqCst);
+        Ok(json!({"stopping": true, "already_requested": already}))
+    }
+}

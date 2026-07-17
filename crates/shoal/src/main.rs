@@ -14,6 +14,7 @@ mod adapters;
 mod args;
 mod completer;
 mod highlight;
+mod kernel_cli;
 mod keybindings;
 mod prompt;
 mod repl;
@@ -152,6 +153,7 @@ fn real_main(args: Vec<OsString>) -> Result<i32, String> {
             }
             Ok(report.exit_code())
         }
+        Action::Kernel(action) => kernel_cli::run(action),
         Action::Companion(name) => args::run_companion(name),
         Action::Completions(shell) => {
             print!("{}", args::completion_script(&shell)?);

@@ -11,6 +11,7 @@ pub struct Inputs {
     pub xdg_config_home: Option<OsString>,
     pub xdg_runtime_dir: Option<OsString>,
     pub tmpdir: Option<OsString>,
+    pub explicit_state_dir: Option<OsString>,
     pub explicit_socket: Option<OsString>,
 }
 
@@ -23,6 +24,7 @@ impl Inputs {
             xdg_config_home: std::env::var_os("XDG_CONFIG_HOME"),
             xdg_runtime_dir: std::env::var_os("XDG_RUNTIME_DIR"),
             tmpdir: std::env::var_os("TMPDIR"),
+            explicit_state_dir: std::env::var_os("SHOAL_STATE_DIR"),
             explicit_socket: std::env::var_os("SHOAL_SOCKET"),
         }
     }
@@ -45,6 +47,10 @@ impl ShoalPaths {
     pub fn resolve(inputs: Inputs, uid: u32) -> Self {
         let home = inputs
             .home
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
+        let explicit_state_dir = inputs
+            .explicit_state_dir
             .filter(|value| !value.is_empty())
             .map(PathBuf::from);
         let state_root = inputs
@@ -81,7 +87,7 @@ impl ShoalPaths {
             PathBuf::from(format!("/tmp/shoal-{uid}"))
         };
         Self {
-            state_dir: state_root.join("shoal"),
+            state_dir: explicit_state_dir.unwrap_or_else(|| state_root.join("shoal")),
             data_dir: data_root.join("shoal"),
             config_dir: config_root.join("shoal"),
             runtime_dir,
@@ -193,6 +199,19 @@ mod tests {
             paths.socket("ignored"),
             PathBuf::from("/custom/kernel.sock")
         );
+    }
+
+    #[test]
+    fn explicit_state_directory_is_not_rewritten() {
+        let paths = ShoalPaths::resolve(
+            Inputs {
+                home: Some("/home/a".into()),
+                explicit_state_dir: Some("/srv/shoal-state".into()),
+                ..Inputs::default()
+            },
+            7,
+        );
+        assert_eq!(paths.state_dir(), Path::new("/srv/shoal-state"));
     }
 
     #[test]

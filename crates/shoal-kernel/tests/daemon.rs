@@ -116,9 +116,30 @@ fn daemon_binds_secure_socket_and_attaches() {
     reader.read_line(&mut line).unwrap();
     let response: Response = serde_json::from_str(&line).unwrap();
     assert!(response.error.is_none());
-    unsafe {
-        kill(child.id() as i32, 2);
-    }
+    write_frame(
+        &mut stream,
+        &Request {
+            jsonrpc: JSONRPC.into(),
+            id: 2.into(),
+            method: "kernel.status".into(),
+            params: serde_json::json!({}),
+        },
+    )
+    .unwrap();
+    let status = recv(&mut reader).result.unwrap();
+    assert_eq!(status["pid"], child.id());
+    assert_eq!(status["security"]["human_credential_required"], true);
+    write_frame(
+        &mut stream,
+        &Request {
+            jsonrpc: JSONRPC.into(),
+            id: 3.into(),
+            method: "kernel.shutdown".into(),
+            params: serde_json::json!({}),
+        },
+    )
+    .unwrap();
+    assert_eq!(recv(&mut reader).result.unwrap()["stopping"], true);
     assert!(
         child.wait().unwrap().success(),
         "daemon stderr:\n{}",

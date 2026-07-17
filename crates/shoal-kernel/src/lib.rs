@@ -8,6 +8,7 @@ mod handlers_session;
 mod handlers_stream;
 mod handlers_task;
 mod handlers_value;
+mod lifecycle;
 mod session;
 mod state;
 mod wire;
@@ -67,6 +68,8 @@ pub struct Kernel {
     /// merely asserting `local_auth: local-human`; it must present a bearer
     /// whose stored profile is `local-human`.
     allow_unauthenticated_local_human: bool,
+    shutdown_requested: AtomicBool,
+    started_at: Instant,
     events: Arc<EventBus>,
     /// Whether a plan's requester may acknowledge its own plan via
     /// `cap.request` (HR-D3 self-acknowledgement). Default `false`: the approver
@@ -462,6 +465,8 @@ impl Kernel {
             events: Arc::new(EventBus::default()),
             auth: None,
             allow_unauthenticated_local_human: true,
+            shutdown_requested: AtomicBool::new(false),
+            started_at: Instant::now(),
             allow_self_ack: AtomicBool::new(self_ack_from_env()),
             #[cfg(test)]
             fail_approval_audit: AtomicBool::new(false),
@@ -503,6 +508,8 @@ impl Kernel {
             events: Arc::new(events),
             auth: Some(Mutex::new(TokenStore::open(state_dir.join("tokens.json"))?)),
             allow_unauthenticated_local_human: false,
+            shutdown_requested: AtomicBool::new(false),
+            started_at: Instant::now(),
             allow_self_ack: AtomicBool::new(self_ack_from_env()),
             #[cfg(test)]
             fail_approval_audit: AtomicBool::new(false),
@@ -541,6 +548,8 @@ impl Kernel {
             events: Arc::new(events),
             auth: Some(Mutex::new(TokenStore::open(state_dir.join("tokens.json"))?)),
             allow_unauthenticated_local_human: false,
+            shutdown_requested: AtomicBool::new(false),
+            started_at: Instant::now(),
             allow_self_ack: AtomicBool::new(self_ack_from_env()),
             #[cfg(test)]
             fail_approval_audit: AtomicBool::new(false),
@@ -571,6 +580,8 @@ impl Kernel {
             events: Arc::new(EventBus::default()),
             auth: None,
             allow_unauthenticated_local_human: true,
+            shutdown_requested: AtomicBool::new(false),
+            started_at: Instant::now(),
             allow_self_ack: AtomicBool::new(self_ack_from_env()),
             #[cfg(test)]
             fail_approval_audit: AtomicBool::new(false),
@@ -613,7 +624,7 @@ impl Kernel {
         let _socket_guard = BoundSocket(path.to_path_buf());
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
         listener.set_nonblocking(true)?;
-        while !stop.load(Ordering::SeqCst) {
+        while !stop.load(Ordering::SeqCst) && !self.shutdown_requested.load(Ordering::SeqCst) {
             let kernel = self.clone();
             match listener.accept() {
                 Ok((stream, _)) => {

@@ -1561,6 +1561,18 @@ fn durable_kernel_rejects_asserted_human_and_accepts_credentialed_human() {
     assert_eq!(credentialed["auth_mode"], "bearer");
     assert_eq!(credentialed["caps"]["profile"], "local-human");
 
+    let status = call(&mut client, &mut reader, 3, "kernel.status", json!({}))
+        .result
+        .expect("every attached principal may inspect lifecycle status");
+    assert_eq!(status["durable"], true);
+    assert_eq!(status["security"]["human_credential_required"], true);
+
+    let shutdown = call(&mut client, &mut reader, 4, "kernel.shutdown", json!({}))
+        .result
+        .expect("the credentialed human may request managed shutdown");
+    assert_eq!(shutdown["stopping"], true);
+    assert!(kernel.shutdown_requested.load(Ordering::SeqCst));
+
     drop(client);
     drop(reader);
     thread.join().unwrap();
@@ -1662,6 +1674,10 @@ fn zero_token_attach_defaults_restricted_and_reports_security_metadata() {
 
     let denied = call(&mut client, &mut reader, 2, "exec", json!({"src":"1 + 2"}));
     assert_eq!(denied.error.unwrap().code, LEASH_DENIED);
+    let status = call(&mut client, &mut reader, 3, "kernel.status", json!({}));
+    assert!(status.error.is_none());
+    let shutdown = call(&mut client, &mut reader, 4, "kernel.shutdown", json!({}));
+    assert_eq!(shutdown.error.unwrap().code, LEASH_DENIED);
     drop(client);
     drop(reader);
     thread.join().unwrap();

@@ -158,17 +158,45 @@ fn sibling_kernel(current_exe: &Path) -> Option<PathBuf> {
 
 fn kernel_command(config: &Config, program: &Path) -> Command {
     let mut cmd = Command::new(program);
+    let paths = shoal_paths::ShoalPaths::discover();
     cmd.arg("--socket")
         .arg(&config.socket)
+        .arg("--state-dir")
+        .arg(paths.state_dir());
+    if let Some(session) = &config.session {
+        cmd.arg("--session").arg(session);
+    }
+    if let Some(policy) = std::env::var_os("SHOAL_POLICY").filter(|value| !value.is_empty()) {
+        cmd.arg("--policy").arg(policy);
+    }
+    for (env, flag) in [
+        ("SHOAL_MAX_CONNECTIONS", "--max-connections"),
+        ("SHOAL_MAX_TASKS_PER_SESSION", "--max-tasks-per-session"),
+        ("SHOAL_MAX_PTYS_PER_SESSION", "--max-ptys-per-session"),
+        ("SHOAL_MAX_PTYS_PER_PRINCIPAL", "--max-ptys-per-principal"),
+        ("SHOAL_MAX_PTYS_GLOBAL", "--max-ptys-global"),
+        (
+            "SHOAL_MAX_SUBSCRIPTIONS_PER_SESSION",
+            "--max-subscriptions-per-session",
+        ),
+        ("SHOAL_FRAME_READ_TIMEOUT_MS", "--frame-read-timeout-ms"),
+    ] {
+        if let Some(value) = std::env::var_os(env).filter(|value| !value.is_empty()) {
+            cmd.arg(flag).arg(value);
+        }
+    }
+    cmd
         // The facade already captured the bearer for its own attach request.
         // The daemon neither needs nor should inherit that secret: a kernel
         // evaluator and its child processes inherit the daemon environment.
         .env_remove("SHOAL_TOKEN")
-        // Detach: silence stdio and start a new process group so the daemon
+        // Detach stdout/stdin and start a new process group so the daemon
         // outlives this (per-session, per-agent) mcp process.
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        // Keep stderr inherited: startup/policy failures must remain diagnosable
+        // instead of becoming a bare connection-refused five seconds later.
+        .stderr(Stdio::inherit())
         .process_group(0);
     cmd
 }
@@ -385,12 +413,18 @@ mod tests {
 
         let config = Config {
             socket: dir.path().join("kernel.sock"),
-            session: None,
+            session: Some("test".into()),
             token: Some("must-not-reach-kernel".into()),
             local_auth: LocalAuthMode::RestrictedAgent,
         };
         let command = kernel_command(&config, &sibling);
         assert_eq!(command.get_program(), sibling.as_os_str());
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(args.windows(2).any(|pair| pair == ["--session", "test"]));
+        assert!(args.iter().any(|arg| arg == "--state-dir"));
         assert!(
             command.get_envs().any(|(key, value)| {
                 key == std::ffi::OsStr::new("SHOAL_TOKEN") && value.is_none()

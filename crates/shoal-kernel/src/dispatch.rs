@@ -43,6 +43,8 @@ impl Kernel {
                     "session.attach" => self.handle_session_attach(params, client, attached),
                     "session.env" => self.handle_session_env(attached),
                     "session.reef" => self.handle_session_reef(attached),
+                    "kernel.status" => self.handle_kernel_status(attached),
+                    "kernel.shutdown" => self.handle_kernel_shutdown(attached),
                     "parse" => self.handle_parse(params),
                     "exec" => self.handle_exec(params, client, attached),
                     "value.get" => self.handle_value_get(params, attached),

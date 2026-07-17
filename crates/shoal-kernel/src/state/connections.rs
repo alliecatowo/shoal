@@ -51,7 +51,6 @@ impl ConnectionRegistry {
             .map_err(|_| ())
     }
 
-    #[cfg(test)]
     pub(crate) fn active(&self) -> usize {
         self.active.load(Ordering::SeqCst)
     }
