@@ -168,13 +168,37 @@ impl Facade {
             .ok_or("only shoal://events/{ch} and shoal://task/{id}[/out] are subscribable")?;
         let config = self.config.clone();
         let forward_uri = uri.clone();
-        match KernelClient::connect(&config) {
-            Ok(client) => {
-                std::thread::spawn(move || client.run_event_forwarder(channel, forward_uri));
-                Ok(json!({}))
-            }
-            Err(e) => Err(e.to_string()),
+        if self.subscriptions.contains_key(&uri) {
+            return Ok(json!({}));
         }
+        let mut client = KernelClient::connect(&config).map_err(|error| error.to_string())?;
+        client
+            .subscribe_events(&channel)
+            .map_err(|error| error.to_string())?;
+        let interrupt = client
+            .shutdown_handle()
+            .map_err(|error| error.to_string())?;
+        let thread = std::thread::Builder::new()
+            .name(format!("shoal-mcp-sub-{channel}"))
+            .spawn(move || client.run_event_forwarder(forward_uri))
+            .map_err(|error| error.to_string())?;
+        self.subscriptions.insert(
+            uri,
+            crate::SubscriptionWorker {
+                interrupt,
+                thread: Some(thread),
+            },
+        );
+        Ok(json!({}))
+    }
+
+    pub(crate) fn resources_unsubscribe(&mut self, params: Value) -> Result<Value, String> {
+        let uri = params
+            .get("uri")
+            .and_then(Value::as_str)
+            .ok_or("resources/unsubscribe requires uri")?;
+        self.subscriptions.remove(uri);
+        Ok(json!({}))
     }
 }
 

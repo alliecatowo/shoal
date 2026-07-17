@@ -67,16 +67,19 @@ impl KernelClient {
         Ok(client)
     }
 
-    /// Subscribe on this (dedicated) connection and forward every pushed
-    /// `event` notification to MCP stdout as `notifications/resources/updated`
-    /// (site/content/internals/kernel-protocol.md). Runs until the connection closes.
-    pub(crate) fn run_event_forwarder(mut self, channel: String, uri: String) {
-        if self
-            .call("events.subscribe", json!({"channel": channel}))
-            .is_err()
-        {
-            return;
-        }
+    pub(crate) fn subscribe_events(&mut self, channel: &str) -> Result<(), BridgeError> {
+        self.call("events.subscribe", json!({"channel": channel}))?;
+        Ok(())
+    }
+
+    pub(crate) fn shutdown_handle(&self) -> io::Result<UnixStream> {
+        self.writer.try_clone()
+    }
+
+    /// Forward every pushed `event` notification from an already-subscribed,
+    /// dedicated connection to MCP stdout. Closing any clone of the connection
+    /// wakes this loop, which lets `resources/unsubscribe` own its lifetime.
+    pub(crate) fn run_event_forwarder(mut self, uri: String) {
         while let Ok(Some(frame)) = read_json_line(&mut self.reader) {
             if frame.get("method").and_then(Value::as_str) == Some("event") {
                 let p = frame.get("params").cloned().unwrap_or(Value::Null);

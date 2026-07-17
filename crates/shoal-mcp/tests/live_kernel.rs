@@ -112,6 +112,46 @@ fn read_resource_expecting_error(facade: &mut Facade, uri: &str) -> Value {
         .expect("resources/read has a response")
 }
 
+fn resource_subscription(facade: &mut Facade, method: &str, uri: &str) -> Value {
+    facade
+        .handle(&json!({
+            "jsonrpc":"2.0",
+            "id":77,
+            "method":method,
+            "params":{"uri":uri}
+        }))
+        .expect("subscription request has a response")
+}
+
+#[test]
+fn resources_unsubscribe_deterministically_reclaims_connection_workers() {
+    let live = LiveKernel::start();
+    let mut facade = Facade::connect(&live.config()).unwrap();
+    let uri = "shoal://events/user.lifecycle";
+
+    // More cycles than the kernel's global connection ceiling: a facade that
+    // merely acknowledges unsubscribe while retaining dedicated sockets fails
+    // partway through. Real teardown can reuse the capacity indefinitely.
+    for _ in 0..160 {
+        let subscribed = resource_subscription(&mut facade, "resources/subscribe", uri);
+        assert!(subscribed.get("error").is_none(), "{subscribed}");
+        assert_eq!(facade.active_subscriptions(), 1);
+
+        // Duplicate subscribe is idempotent and does not create another worker.
+        let duplicate = resource_subscription(&mut facade, "resources/subscribe", uri);
+        assert!(duplicate.get("error").is_none(), "{duplicate}");
+        assert_eq!(facade.active_subscriptions(), 1);
+
+        let unsubscribed = resource_subscription(&mut facade, "resources/unsubscribe", uri);
+        assert!(unsubscribed.get("error").is_none(), "{unsubscribed}");
+        assert_eq!(facade.active_subscriptions(), 0);
+    }
+
+    // Unsubscribe is idempotent, matching MCP resource lifecycle semantics.
+    let absent = resource_subscription(&mut facade, "resources/unsubscribe", uri);
+    assert!(absent.get("error").is_none(), "{absent}");
+}
+
 /// A >100-row table exec, over the real socket through the MCP facade: the
 /// structured value elides (site/content/internals/kernel-protocol.md), the human `text`/render is bounded and never
 /// carries the payload (site/content/internals/kernel-protocol.md — the elision-bypass fix), and a `resource_link`

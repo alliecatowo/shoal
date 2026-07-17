@@ -1,7 +1,9 @@
 //! MCP stdio facade for the shoal kernel protocol.
 
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::io::{self, BufRead, Read, Write};
+use std::net::Shutdown;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
@@ -21,12 +23,28 @@ const MAX_FRAME: usize = 16 * 1024 * 1024;
 pub struct Facade {
     kernel: KernelClient,
     config: Config,
+    subscriptions: HashMap<String, SubscriptionWorker>,
+}
+
+struct SubscriptionWorker {
+    interrupt: UnixStream,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for SubscriptionWorker {
+    fn drop(&mut self) {
+        let _ = self.interrupt.shutdown(Shutdown::Both);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 impl Facade {
     pub fn connect(config: &Config) -> Result<Self, BridgeError> {
         Ok(Self {
             kernel: KernelClient::connect(config)?,
             config: config.clone(),
+            subscriptions: HashMap::new(),
         })
     }
     pub fn handle(&mut self, request: &Value) -> Option<Value> {
@@ -54,7 +72,9 @@ impl Facade {
             Some("resources/subscribe") => {
                 self.resources_subscribe(request.get("params").cloned().unwrap_or(Value::Null))
             }
-            Some("resources/unsubscribe") => Ok(json!({})),
+            Some("resources/unsubscribe") => {
+                self.resources_unsubscribe(request.get("params").cloned().unwrap_or(Value::Null))
+            }
             Some(m) => {
                 return Some(rpc_error(
                     id,
@@ -76,6 +96,10 @@ impl Facade {
             Ok(v) => json!({"jsonrpc":"2.0","id":id,"result":v}),
             Err(e) => rpc_error(id, -32602, &e, None),
         })
+    }
+
+    pub fn active_subscriptions(&self) -> usize {
+        self.subscriptions.len()
     }
 }
 
