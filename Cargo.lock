@@ -2514,9 +2514,14 @@ dependencies = [
  "shoal-secret",
  "shoal-syntax",
  "shoal-value",
+ "shoal-wasm",
  "tempfile",
  "toml 0.9.12+spec-1.1.0",
  "ureq",
+ "wasmprinter",
+ "wat",
+ "wit-component",
+ "wit-parser",
 ]
 
 [[package]]

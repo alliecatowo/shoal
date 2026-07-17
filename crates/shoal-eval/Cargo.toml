@@ -18,6 +18,7 @@ shoal-journal = { version = "0.1.0", path = "../shoal-journal" }
 shoal-leash = { version = "0.1.0", path = "../shoal-leash" }
 shoal-syntax = { version = "0.1.0", path = "../shoal-syntax" }
 shoal-value = { version = "0.1.0", path = "../shoal-value" }
+shoal-wasm = { version = "0.1.0", path = "../shoal-wasm" }
 shoal-secret = { path = "../shoal-secret" }
 shoal-picker = { version = "0.1.0", path = "../shoal-picker" }
 shoal-paths = { path = "../shoal-paths" }
@@ -33,6 +34,10 @@ criterion = "0.8"
 tempfile = "3.20"
 toml = "0.9"
 serde = { version = "1", features = ["derive"] }
+wit-component = { version = "0.251", features = ["dummy-module"] }
+wit-parser = "0.251"
+wasmprinter = "0.251"
+wat = "1"
 
 [[bench]]
 name = "pipeline"

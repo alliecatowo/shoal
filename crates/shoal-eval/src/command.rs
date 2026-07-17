@@ -289,8 +289,11 @@ impl Evaluator {
             let args = self.collect_cmd_values(call)?;
             return self.run_script_file(&path, Some("shl"), args, position);
         }
-        // `^name` bypasses adapters too (language card): the forced head must
-        // reach the real command, not the adapter's flag/signature gate.
+        // `^name` bypasses plugins and adapters: only an unforced head can
+        // enter an extension-owned command surface.
+        if resolution.source == CommandSource::Plugin {
+            return self.eval_wasm_command(call);
+        }
         if resolution.source == CommandSource::Adapter {
             return self.eval_adapter(call, position);
         }
@@ -995,6 +998,7 @@ impl Evaluator {
             | CommandSource::SpecialBuiltin
             | CommandSource::Script
             | CommandSource::Runner
+            | CommandSource::Plugin
             | CommandSource::Adapter => return true,
             CommandSource::BoundValue => return false,
             CommandSource::External => {}
@@ -1046,6 +1050,9 @@ impl Evaluator {
             .map(|s| (*s).to_owned())
             .collect();
         candidates.extend(self.host.adapters.names().map(str::to_owned));
+        if let Some(registry) = &self.host.wasm {
+            candidates.extend(registry.command_names().map(str::to_owned));
+        }
         for name in self.exec.shell.env.visible_names() {
             if self
                 .exec

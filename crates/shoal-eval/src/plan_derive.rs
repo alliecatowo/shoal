@@ -471,6 +471,20 @@ impl Evaluator {
             }
             return Ok(());
         }
+        if resolution.source == CommandSource::Plugin {
+            let registry = self
+                .host
+                .wasm
+                .as_ref()
+                .expect("plugin resolution carries a registry");
+            let command = registry
+                .command(&call.head)
+                .expect("plugin resolution carries command metadata");
+            for effect in command.effects {
+                push_effect(out, effect.clone());
+            }
+            return Ok(());
+        }
         if resolution.source == CommandSource::Adapter {
             let adapter = self
                 .host

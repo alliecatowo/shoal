@@ -32,6 +32,7 @@ mod script;
 mod session_ctx;
 mod stmt;
 mod streams;
+mod wasm;
 
 pub use channels::{EventBus, EventForwarder};
 pub(crate) use child_context::ChildKind;
@@ -44,6 +45,9 @@ pub use reef::{PromptReefBinding, PromptReefSnapshot};
 // exec's process-control primitives via `shoal-eval`, its existing dependency).
 pub use shoal_exec::{
     PtyJob, install_shell_job_control_signals, shutdown_stopped_jobs, take_stopped_job,
+};
+pub use shoal_wasm::{
+    Limits as WasmLimits, PluginError as WasmPluginError, Registry as WasmRegistry,
 };
 
 use ports::{Exec, StdExec, StdSecret};
@@ -556,6 +560,27 @@ impl Evaluator {
 
     pub fn set_adapters(&mut self, adapters: AdapterCatalog) {
         Arc::make_mut(&mut self.host).adapters = adapters;
+    }
+
+    /// Install an immutable, fully validated WebAssembly plugin registry.
+    /// Children created afterward inherit the same retained artifacts.
+    pub fn set_wasm_registry(&mut self, registry: Arc<WasmRegistry>) {
+        Arc::make_mut(&mut self.host).wasm = Some(registry);
+    }
+
+    /// Deterministically discover configured plugin directories and install
+    /// every valid retained artifact. Per-manifest failures are returned for
+    /// host reporting; engine construction is the only fatal error.
+    pub fn load_wasm_plugins(
+        &mut self,
+        dirs: &[PathBuf],
+    ) -> Result<Vec<WasmPluginError>, WasmPluginError> {
+        if dirs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (registry, errors) = WasmRegistry::discover(dirs, WasmLimits::default())?;
+        self.set_wasm_registry(Arc::new(registry));
+        Ok(errors)
     }
 
     pub fn load_bundled_adapters(&mut self) -> Vec<String> {

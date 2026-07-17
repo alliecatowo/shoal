@@ -33,6 +33,11 @@ impl Evaluator {
                 forced,
                 dynamic_run: false,
                 runner: false,
+                plugin: self
+                    .host
+                    .wasm
+                    .as_ref()
+                    .is_some_and(|registry| registry.command(head).is_some()),
                 adapter: self.host.adapters.lookup(head).is_some(),
             },
         );
@@ -50,6 +55,11 @@ impl Evaluator {
                 forced: false,
                 dynamic_run: true,
                 runner,
+                plugin: self
+                    .host
+                    .wasm
+                    .as_ref()
+                    .is_some_and(|registry| registry.command(head).is_some()),
                 adapter: self.host.adapters.lookup(head).is_some(),
             },
         );
