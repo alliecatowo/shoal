@@ -54,6 +54,14 @@ impl CallCtx for BenchCallCtx {
         }
     }
 
+    fn buffer_stream(
+        &mut self,
+        _stream: shoal_value::StreamVal,
+        _capacity: usize,
+    ) -> VResult<shoal_value::StreamVal> {
+        unreachable!("table benchmark does not drive stream buffers")
+    }
+
     fn cwd(&self) -> PathBuf {
         PathBuf::from(".")
     }

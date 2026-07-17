@@ -169,11 +169,12 @@ fn enumerate_pairs() {
 }
 
 #[test]
-fn buffer_rejects_the_unimplemented_decoupling_contract() {
+fn buffer_decouples_through_a_bounded_owned_pump() {
     assert_eq!(
-        run_err("[1,2,3].stream().buffer(2).collect()"),
-        "stream_buffer_unsupported"
+        rendered("[1,2,3].stream().map(x => x * 2).buffer(2).collect()"),
+        "[2, 4, 6]"
     );
+    assert_eq!(run_err("[1].stream().buffer(0)"), "arg_error");
 }
 
 #[test]
@@ -261,11 +262,9 @@ channel("sink").take(timeout: 5s)"#,
 
 #[test]
 fn cancelling_idle_on_handler_terminates_its_task() {
-    let v = run(
-        r#"let task = on(channel("idle-on"), ev => ev)
+    let v = run(r#"let task = on(channel("idle-on"), ev => ev)
 task.cancel()
-task.await()"#,
-    );
+task.await()"#);
     assert_eq!(v, Value::Null);
 }
 

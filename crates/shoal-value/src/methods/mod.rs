@@ -343,6 +343,9 @@ mod tests {
                 _ => Err(ErrorVal::new("custom", "bad test callback")),
             }
         }
+        fn buffer_stream(&mut self, _stream: StreamVal, _capacity: usize) -> VResult<StreamVal> {
+            unreachable!("stream buffer is not exercised by generic method tests")
+        }
         fn cwd(&self) -> PathBuf {
             self.cwd.clone()
         }
@@ -913,6 +916,13 @@ mod tests {
                     "no closures in the port-boundary test",
                 ))
             }
+            fn buffer_stream(
+                &mut self,
+                _stream: StreamVal,
+                _capacity: usize,
+            ) -> VResult<StreamVal> {
+                unreachable!("stream buffer is not exercised by filesystem port tests")
+            }
             fn cwd(&self) -> PathBuf {
                 self.cwd.clone()
             }
@@ -1056,6 +1066,13 @@ mod tests {
             struct ExplicitStd;
             impl CallCtx for ExplicitStd {
                 fn call_closure(&mut self, _f: &Value, _a: Vec<Value>) -> VResult<Value> {
+                    unreachable!()
+                }
+                fn buffer_stream(
+                    &mut self,
+                    _stream: StreamVal,
+                    _capacity: usize,
+                ) -> VResult<StreamVal> {
                     unreachable!()
                 }
                 fn cwd(&self) -> PathBuf {

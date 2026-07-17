@@ -682,7 +682,7 @@ impl Upstream for Zip {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Fs, OutcomeVal, Record, StdFs};
+    use crate::{Fs, OutcomeVal, Record, StdFs, StreamVal};
     use shoal_ast::Span;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -691,6 +691,10 @@ mod tests {
     impl CallCtx for Ctx {
         fn call_closure(&mut self, _f: &Value, _args: Vec<Value>) -> VResult<Value> {
             Err(super::super::ErrorVal::new("custom", "unexpected closure"))
+        }
+
+        fn buffer_stream(&mut self, _stream: StreamVal, _capacity: usize) -> VResult<StreamVal> {
+            unreachable!("stream buffer is not exercised by operator unit tests")
         }
 
         fn cwd(&self) -> PathBuf {

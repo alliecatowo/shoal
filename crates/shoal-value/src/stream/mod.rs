@@ -123,6 +123,16 @@ impl StreamVal {
         StreamVal::from_source(label, false, Box::new(ChanSource(rx)))
     }
 
+    /// Build a channel-backed stream while preserving the producer's known
+    /// natural boundedness. Used by evaluator-owned pumps such as `.buffer`.
+    pub fn from_buffered_channel(
+        label: impl Into<String>,
+        bounded: bool,
+        rx: std::sync::mpsc::Receiver<VResult<Value>>,
+    ) -> StreamVal {
+        StreamVal::from_source(label, bounded, Box::new(ChanSource(rx)))
+    }
+
     /// Build a stream from an evaluator-owned source.
     ///
     /// This is the ownership seam for live sources whose receive or pump
@@ -282,18 +292,6 @@ impl StreamVal {
             })
         })
     }
-    pub fn buffer(self, _n: usize) -> VResult<StreamVal> {
-        // `Upstream::pull` needs the sink's borrowed evaluator context. A real
-        // decoupling buffer would have to drive that context on a producer
-        // thread, which the current ownership model deliberately cannot do.
-        // Reject the operation instead of preserving the old identity-stage
-        // lie or introducing synchronous lookahead under a concurrency name.
-        Err(ErrorVal::new(
-            "stream_buffer_unsupported",
-            "stream.buffer() cannot decouple producers in the current pull runtime",
-        )
-        .with_hint("use channel().events() for producer/consumer decoupling"))
-    }
     pub fn enumerate(self) -> VResult<StreamVal> {
         let b = self.bounded;
         self.wrap("list", b, |up| Box::new(ops::Enumerate { up, i: 0 }))
@@ -399,6 +397,9 @@ mod tests {
         fn call_closure(&mut self, _f: &Value, _args: Vec<Value>) -> VResult<Value> {
             Err(ErrorVal::new("custom", "no closures in these tests"))
         }
+        fn buffer_stream(&mut self, _stream: StreamVal, _capacity: usize) -> VResult<StreamVal> {
+            unreachable!("stream buffer is not exercised by this pull test context")
+        }
         fn cwd(&self) -> PathBuf {
             std::env::temp_dir()
         }
@@ -476,16 +477,5 @@ mod tests {
         let s = endless_marked(1);
         drain(&s);
         assert_eq!(s.tee(2).unwrap_err().code, "stream_consumed");
-    }
-
-    #[test]
-    fn unsupported_buffer_does_not_consume_its_source() {
-        let s = StreamVal::from_iter("int", (0..2).map(|i| Ok(Value::Int(i))));
-        let err = s.clone().buffer(2).unwrap_err();
-        assert_eq!(err.code, "stream_buffer_unsupported");
-        assert!(
-            s.take_upstream().is_ok(),
-            "rejecting buffer must not pull or consume the source"
-        );
     }
 }

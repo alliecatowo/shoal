@@ -34,6 +34,7 @@ pub(crate) enum ChildKind {
     Script,
     Parallel,
     OnHandler,
+    StreamPump,
 }
 
 /// A snapshot of the explicitly audited inheritable session capabilities,

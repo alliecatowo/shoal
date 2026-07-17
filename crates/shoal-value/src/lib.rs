@@ -375,6 +375,13 @@ impl CallArgs {
 
 pub trait CallCtx {
     fn call_closure(&mut self, f: &Value, args: Vec<Value>) -> VResult<Value>;
+    /// Transfer a stream into a context-owned bounded producer pump.
+    ///
+    /// A true `.buffer(n)` must move the upstream and an owned evaluator into
+    /// a producer thread; the value crate cannot manufacture that evaluator.
+    /// Requiring the embedding to provide this seam keeps the public method
+    /// honest and makes missing ownership policy a compile-time error.
+    fn buffer_stream(&mut self, stream: StreamVal, capacity: usize) -> VResult<StreamVal>;
     fn cwd(&self) -> PathBuf;
     /// The filesystem effect port backing the value-method write sinks —
     /// `path`/`str`/`bytes` `.save`/`.append` and stream `.save`/`.append`.

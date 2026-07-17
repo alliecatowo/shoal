@@ -39,7 +39,14 @@ pub(crate) fn stream_method(
                 "window expects a positive count or a duration",
             )),
         },
-        "buffer" => s.buffer(int_arg(&args, 0, 1)?).map(stream),
+        "buffer" => {
+            let capacity = int_arg(&args, 0, 1)?;
+            if capacity == 0 {
+                Err(ErrorVal::arg_error("buffer capacity must be positive"))
+            } else {
+                ctx.buffer_stream(s, capacity).map(stream)
+            }
+        }
         "enumerate" => no_args(&args).and_then(|_| s.enumerate()).map(stream),
         "merge" => match arg(&args, 0)? {
             Value::Stream(o) => s.merge(o.clone()).map(stream),

@@ -601,6 +601,13 @@ impl CallCtx for Evaluator {
             },
         )
     }
+    fn buffer_stream(
+        &mut self,
+        stream: shoal_value::StreamVal,
+        capacity: usize,
+    ) -> VResult<shoal_value::StreamVal> {
+        self.spawn_stream_buffer(stream, capacity)
+    }
     fn cwd(&self) -> PathBuf {
         self.exec.shell.cwd.clone()
     }

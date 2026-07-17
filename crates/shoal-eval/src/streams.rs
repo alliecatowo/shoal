@@ -22,9 +22,10 @@
 //! macOS — cross-platform, mac first-class), never a poll loop in language
 //! space.
 
-use crate::Evaluator;
+use crate::{ChildKind, Evaluator};
 use notify::{EventKind, RecursiveMode, Watcher};
-use shoal_value::{ErrorVal, Fs, Record, StreamVal, VResult, Value};
+use shoal_exec::CancelToken;
+use shoal_value::{ErrorVal, Fs, Pull, Record, StreamVal, VResult, Value};
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -38,8 +39,48 @@ use std::time::Duration;
 /// that documented default here for both. `every` instead uses a 1-slot
 /// buffer (site/content/internals/streams-channels.md: ticks coalesce, memory O(1) always).
 const SOURCE_BUF: usize = 64;
+const PUMP_POLL: Duration = Duration::from_millis(25);
 
 impl Evaluator {
+    /// Move `stream` and a fully-owned child evaluator into a producer thread,
+    /// decoupling upstream work from the downstream sink through exactly
+    /// `capacity` slots. Pulls use short deadlines so dropping the receiver or
+    /// cancelling the execution tears down even an idle live source promptly.
+    pub(crate) fn spawn_stream_buffer(
+        &mut self,
+        stream: StreamVal,
+        capacity: usize,
+    ) -> VResult<StreamVal> {
+        debug_assert!(capacity > 0);
+        let label = stream.label.clone();
+        let bounded = stream.is_bounded();
+        let mut upstream = stream.take_upstream()?;
+        let (tx, rx) = sync_channel(capacity);
+        let cancel = self.cancellation_token();
+        let child = self.child_context();
+
+        std::thread::spawn(move || {
+            let mut evaluator = child.build(ChildKind::StreamPump, cancel.clone());
+            loop {
+                if cancel.is_cancelled() {
+                    break;
+                }
+                let delivery = match upstream.pull(&mut evaluator, Some(PUMP_POLL)) {
+                    Ok(Pull::Item(value)) => Ok(value),
+                    Ok(Pull::Timeout) => continue,
+                    Ok(Pull::End) => break,
+                    Err(error) => Err(error),
+                };
+                let terminal = delivery.is_err();
+                if !send_to_buffer(&tx, &cancel, delivery) || terminal {
+                    break;
+                }
+            }
+        });
+
+        Ok(StreamVal::from_buffered_channel(label, bounded, rx))
+    }
+
     /// `every(interval) -> stream<datetime>` (site/content/internals/streams-channels.md): one timer thread,
     /// ticking the wall-clock `datetime` of each firing into a **1-slot
     /// bounded buffer** (`sync_channel(1)` + `try_send`). Ticks are never
@@ -217,6 +258,26 @@ impl Evaluator {
             p
         } else {
             self.exec.shell.cwd.join(p)
+        }
+    }
+}
+
+fn send_to_buffer(
+    tx: &SyncSender<VResult<Value>>,
+    cancel: &CancelToken,
+    mut delivery: VResult<Value>,
+) -> bool {
+    loop {
+        match tx.try_send(delivery) {
+            Ok(()) => return true,
+            Err(TrySendError::Disconnected(_)) => return false,
+            Err(TrySendError::Full(returned)) => {
+                if cancel.is_cancelled() {
+                    return false;
+                }
+                delivery = returned;
+                std::thread::park_timeout(Duration::from_millis(2));
+            }
         }
     }
 }
@@ -442,4 +503,82 @@ fn coalesced_event(root: &Path) -> Value {
     r.insert("ts".into(), now_datetime());
     r.insert("coalesced".into(), Value::Bool(true));
     Value::Record(r)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shoal_value::{CallCtx, Upstream};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    struct CountingSource {
+        pulls: Arc<AtomicUsize>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Upstream for CountingSource {
+        fn pull(&mut self, _ctx: &mut dyn CallCtx, _timeout: Option<Duration>) -> VResult<Pull> {
+            let n = self.pulls.fetch_add(1, Ordering::SeqCst);
+            Ok(Pull::Item(Value::Int(n as i64)))
+        }
+    }
+
+    impl Drop for CountingSource {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn wait_until(mut ready: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        while !ready() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(ready(), "background stream pump did not settle");
+    }
+
+    #[test]
+    fn owned_buffer_applies_exact_capacity_backpressure_and_stops_on_drop() {
+        let pulls = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let source = StreamVal::from_upstream(
+            "int",
+            false,
+            Box::new(CountingSource {
+                pulls: pulls.clone(),
+                dropped: dropped.clone(),
+            }),
+        );
+        let mut evaluator = Evaluator::new(std::env::temp_dir());
+        let buffered = evaluator.spawn_stream_buffer(source, 2).unwrap();
+
+        wait_until(|| pulls.load(Ordering::SeqCst) >= 3);
+        assert_eq!(
+            pulls.load(Ordering::SeqCst),
+            3,
+            "two queued items plus the producer's pending send is the hard bound"
+        );
+        drop(buffered);
+        wait_until(|| dropped.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn owned_buffer_stops_while_backpressured_when_execution_is_cancelled() {
+        let pulls = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let source = StreamVal::from_upstream(
+            "int",
+            false,
+            Box::new(CountingSource {
+                pulls: pulls.clone(),
+                dropped: dropped.clone(),
+            }),
+        );
+        let mut evaluator = Evaluator::new(std::env::temp_dir());
+        let _buffered = evaluator.spawn_stream_buffer(source, 1).unwrap();
+        wait_until(|| pulls.load(Ordering::SeqCst) >= 2);
+
+        evaluator.cancel_current();
+        wait_until(|| dropped.load(Ordering::SeqCst));
+    }
 }
