@@ -93,6 +93,32 @@ fn attached_idle_connection_is_not_subject_to_first_byte_deadline() {
 }
 
 #[test]
+fn hostile_parse_nesting_is_typed_and_connection_remains_healthy() {
+    let kernel = Kernel::new();
+    let (mut client, mut reader, server) = spawn(&kernel);
+    attach(&mut client, &mut reader);
+
+    let levels = shoal_syntax::MAX_PARSE_NESTING.saturating_mul(2);
+    let source = format!("{}0{}", "[".repeat(levels), "]".repeat(levels));
+    let rejected = call(&mut client, &mut reader, 2, "exec", json!({"src": source}));
+    let error = rejected
+        .error
+        .expect("over-nested source must fail as an RPC error");
+    assert_eq!(error.code, PARSE_ERROR);
+    assert!(error.message.contains("nesting limit"), "{error:?}");
+
+    let healthy = call(&mut client, &mut reader, 3, "exec", json!({"src":"1 + 2"}));
+    assert!(
+        healthy.error.is_none(),
+        "same connection must survive typed parse rejection: {healthy:?}"
+    );
+
+    drop(client);
+    drop(reader);
+    server.join().unwrap();
+}
+
+#[test]
 fn evaluator_panic_quarantines_only_that_session_and_keeps_connection_alive() {
     let kernel = Kernel::new();
     let (mut client, mut reader, server) = spawn(&kernel);
