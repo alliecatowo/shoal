@@ -70,7 +70,7 @@ Rules for implementers:
   <br>Accept: a unit test constructs each AST statement/expression variant and asserts the
   planner returns either concrete effects or the conservative unknown — never silently empty for
   effectful forms.
-- [ ] **HR-A11** — Negative-coverage suite: every dynamic probe from the audit becomes a pinned
+- [x] **HR-A11** — Negative-coverage suite: every dynamic probe from the audit becomes a pinned
   test/conformance case asserting non-empty, correct effects. *(A8, A11)*
   <br>Accept: all ten audit probes are cases; corpus passes.
 
