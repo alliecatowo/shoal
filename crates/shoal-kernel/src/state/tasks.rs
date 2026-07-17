@@ -485,7 +485,7 @@ impl TaskRegistry {
     }
 
     #[cfg(test)]
-    fn poison_entries_for_test(&self) {
+    pub(crate) fn poison_entries_for_test(&self) {
         std::thread::scope(|scope| {
             let handle = scope.spawn(|| {
                 let _entries = self

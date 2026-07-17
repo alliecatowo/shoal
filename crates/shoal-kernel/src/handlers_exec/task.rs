@@ -72,10 +72,7 @@ impl Kernel {
                 );
             });
         if let Err(error) = spawn_result {
-            // Release the permit and Session lease through the owned task even
-            // if a simultaneous registry failure makes removal unavailable.
-            waiter.fail_worker_panic();
-            self.tasks.remove(&task_ref);
+            self.cleanup_failed_task_launch(&task_ref, &waiter);
             return Err(internal(error));
         }
         let events_channel = format!("task.{task_id}");
@@ -129,6 +126,13 @@ impl Kernel {
             }
         }
         encode(json!({"task":task_ref,"events":events_channel}))
+    }
+
+    pub(super) fn cleanup_failed_task_launch(&self, task_ref: &Ref, task: &Arc<TaskEntry>) {
+        // Release the permit and Session lease through the owned task even if
+        // a simultaneous registry failure makes removal unavailable.
+        task.fail_worker_panic();
+        self.tasks.remove(task_ref);
     }
 }
 

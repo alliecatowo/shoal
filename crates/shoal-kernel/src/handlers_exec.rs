@@ -268,6 +268,49 @@ mod tests {
     }
 
     #[test]
+    fn failed_task_launch_releases_resources_even_if_registry_removal_is_unavailable() {
+        let kernel = Kernel::new();
+        kernel.tasks.configure(1);
+        let (session, _) = attached(&kernel, "spawn-cleanup");
+        let owner = session.key.owner();
+        let active_slot = kernel.tasks.reserve(&owner).unwrap();
+        let (_task_id, task_ref) = kernel.tasks.allocate();
+        let task = Arc::new(TaskEntry {
+            task: task_ref.clone(),
+            owner: owner.clone(),
+            session_id: session.id.clone(),
+            session_lease: Mutex::new(Some(session)),
+            started_ns: now_ns(),
+            inner: Mutex::new(TaskInner {
+                state: "running",
+                finished_ns: None,
+                result_ref: None,
+                exit_code: None,
+                error: None,
+                active_slot: Some(active_slot),
+            }),
+            done: Condvar::new(),
+            cancel: shoal_exec::CancelToken::new(),
+            cancel_requested: AtomicBool::new(false),
+        });
+        kernel.tasks.insert_checked(task.clone()).unwrap();
+        kernel.tasks.poison_entries_for_test();
+
+        kernel.cleanup_failed_task_launch(&task_ref, &task);
+
+        let inner = task.lock_inner().unwrap();
+        assert_eq!(inner.state, "failed");
+        assert!(inner.active_slot.is_none());
+        drop(inner);
+        assert!(task.session_lease.lock().unwrap().is_none());
+        let replacement = kernel
+            .tasks
+            .reserve(&owner)
+            .expect("direct cleanup must release the one active-task slot");
+        drop(replacement);
+    }
+
+    #[test]
     fn foreground_exec_starts_a_fresh_cancellation_epoch() {
         let kernel = Kernel::new();
         let (session, mut attached) = attached(&kernel, "cancel-epoch-foreground");
@@ -304,12 +347,12 @@ mod tests {
                 .env()
                 .declare(
                     "out",
-                    Value::List(vec![Value::Str("x".repeat(900 * 1024))]),
+                    Value::List(vec![Value::Str("x".repeat(1800 * 1024))]),
                     true,
                 )
                 .unwrap();
         }
-        let src = serde_json::to_string(&"y".repeat(200 * 1024)).unwrap();
+        let src = serde_json::to_string(&"y".repeat(400 * 1024)).unwrap();
         let error = kernel
             .handle_exec(json!({"src":src}), 1, &mut attached)
             .expect_err("the evaluator transcript value wall must reject the append");
