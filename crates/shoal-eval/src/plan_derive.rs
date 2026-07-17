@@ -145,8 +145,16 @@ impl Evaluator {
                 self.plan_expr(lhs, functions, aliases, out, depth)?;
                 self.plan_expr(rhs, functions, aliases, out, depth)
             }
-            Expr::Unary { expr, .. } | Expr::Field { recv: expr, .. } => {
-                self.plan_expr(expr, functions, aliases, out, depth)
+            Expr::Unary { expr, .. } => self.plan_expr(expr, functions, aliases, out, depth),
+            Expr::Field { recv, name, .. } => {
+                // A bare `path("f").read`/`.lines`/… (no parens) is a filesystem
+                // read of the receiver path (A4).
+                if is_path_read_method(name)
+                    && let Some(p) = self.path_literal(recv)
+                {
+                    push_effect(out, Effect::FsRead { paths: vec![p] });
+                }
+                self.plan_expr(recv, functions, aliases, out, depth)
             }
             Expr::Index { recv, index, .. } => {
                 self.plan_expr(recv, functions, aliases, out, depth)?;
@@ -155,6 +163,13 @@ impl Evaluator {
             Expr::MethodCall {
                 recv, name, args, ..
             } => {
+                // `.feed(cmd)` bypasses builtin/adapter dispatch and spawns the
+                // command via run_argv (A9): resolve the command operand as an
+                // external spawn, exactly like the runtime — handled before the
+                // generic traversal so it is not mis-resolved as a builtin.
+                if name == "feed" && args.pos.len() == 1 && args.named.is_empty() {
+                    return self.plan_feed(recv, &args.pos[0], functions, aliases, out, depth);
+                }
                 // `http.get/post/put/delete(url, …)` declares a `net.connect`
                 // effect for leash + plan (site/content/internals/roadmap-and-priorities.md). The host is parsed from a
                 // literal URL argument; a non-literal URL declares an
@@ -170,6 +185,19 @@ impl Evaluator {
                         .map(|u| url_host_port(&u))
                         .unwrap_or_else(|| ("*".into(), 443));
                     push_effect(out, Effect::NetConnect { host, port });
+                }
+                // `.save`/`.append` write the path argument (A4). A dynamic path
+                // cannot be bounded, so it plans as `Opaque` (approval).
+                if matches!(name.as_str(), "save" | "append") {
+                    let path = args.pos.first().and_then(|a| self.path_literal(a));
+                    self.plan_save(path, out);
+                }
+                // Filesystem-backed path reads (`.read`/`.lines`/…) of a path
+                // literal receiver (A4).
+                if is_path_read_method(name)
+                    && let Some(p) = self.path_literal(recv)
+                {
+                    push_effect(out, Effect::FsRead { paths: vec![p] });
                 }
                 self.plan_expr(recv, functions, aliases, out, depth)?;
                 for e in &args.pos {
@@ -371,6 +399,100 @@ impl Evaluator {
         };
         candidate.canonicalize().unwrap_or(candidate)
     }
+
+    /// The literal path an expression names — a string literal or a
+    /// `path("literal")` constructor — absolutized against cwd. `None` for a
+    /// dynamic expression the planner cannot statically resolve.
+    fn path_literal(&self, e: &Expr) -> Option<PathBuf> {
+        str_literal(e).map(|s| self.plan_abs(&s))
+    }
+
+    /// Push a concrete external `ProcSpawn` for `head`, resolving and hashing the
+    /// binary the same way the runtime spawn gate does (empty hash when the tool
+    /// is not locatable — name-only matching). Planning never spawns.
+    fn plan_external_spawn(&self, head: &str, out: &mut Vec<Effect>) {
+        let bin_hash = self.hash_resolved_bin(OsStr::new(head)).unwrap_or_default();
+        push_effect(
+            out,
+            Effect::ProcSpawn {
+                bin_hash,
+                argv0: head.to_string(),
+            },
+        );
+    }
+
+    /// A `.save`/`.append` sink: the resolved path writes, or an unbounded
+    /// (dynamic) destination requires approval.
+    fn plan_save(&self, path: Option<PathBuf>, out: &mut Vec<Effect>) {
+        match path {
+            Some(p) => push_effect(out, Effect::FsWrite { paths: vec![p] }),
+            None => push_effect(out, Effect::Opaque),
+        }
+    }
+
+    /// Mirror `eval_feed`'s operand classification: a command-shaped node (an
+    /// interpreter block, a command call, or a bare non-variable name) is the
+    /// command operand; the other operand is the value.
+    fn is_command_operand(&self, e: &Expr) -> bool {
+        match e {
+            Expr::LangBlock { .. } | Expr::Cmd { .. } => true,
+            Expr::Var { name, .. } => self.env.get(name).is_none(),
+            _ => false,
+        }
+    }
+
+    /// Plan `value.feed(cmd)` / `cmd.feed(value)` (A4, A9): plan the value
+    /// operand's effects and derive an **external** spawn for the command
+    /// operand, matching the runtime `.feed` path (which calls `run_argv`
+    /// directly and never consults builtin/adapter dispatch).
+    fn plan_feed(
+        &mut self,
+        recv: &Expr,
+        arg: &Expr,
+        functions: &std::collections::HashMap<String, Block>,
+        aliases: &std::collections::HashMap<String, CmdCall>,
+        out: &mut Vec<Effect>,
+        depth: usize,
+    ) -> VResult<()> {
+        let (value_expr, cmd_expr) = if self.is_command_operand(recv) {
+            (arg, recv)
+        } else {
+            (recv, arg)
+        };
+        self.plan_expr(value_expr, functions, aliases, out, depth)?;
+        match cmd_expr {
+            // An interpreter block runs an arbitrary program through its tool.
+            Expr::LangBlock { .. } => push_effect(out, Effect::Opaque),
+            Expr::Cmd { call, .. } => self.plan_external_spawn(&call.head, out),
+            Expr::Var { name, .. } => self.plan_external_spawn(name, out),
+            other => self.plan_expr(other, functions, aliases, out, depth)?,
+        }
+        Ok(())
+    }
+}
+
+/// The path-reading `path` methods, all routed through the Fs port at runtime
+/// (`path_fs_method`) and therefore filesystem reads for planning (A4).
+fn is_path_read_method(name: &str) -> bool {
+    matches!(
+        name,
+        "read" | "read_bytes" | "lines" | "exists" | "is_dir" | "is_file" | "size" | "modified"
+    )
+}
+
+/// The literal path/string an expression names, if statically knowable: a
+/// string literal, or a `path("literal")` constructor wrapping one. Used to
+/// resolve `.save`/`.read`/`run`/`open` targets without executing anything.
+fn str_literal(e: &Expr) -> Option<String> {
+    match e {
+        Expr::Str { value, .. } => Some(value.clone()),
+        Expr::FnCall { name, args, .. }
+            if name == "path" && args.named.is_empty() && args.pos.len() == 1 =>
+        {
+            str_literal(&args.pos[0])
+        }
+        _ => None,
+    }
 }
 
 /// The literal string value of an expression, if it is a plain string literal
@@ -547,6 +669,54 @@ effects=["proc.spawn(container)", "net.connect(registry:443)", "quantum.entangle
                 paths: vec![dir.path().join("in.txt")]
             }),
             "`< in.txt` did not plan a read: {read:?}"
+        );
+    }
+
+    /// A4: `.save`/`.append` write the path argument; path reads read it.
+    #[test]
+    fn method_save_append_and_path_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let save = effects_at(dir.path(), "\"x\".save(\"p\")");
+        assert!(
+            save.contains(&Effect::FsWrite {
+                paths: vec![dir.path().join("p")]
+            }),
+            ".save did not plan a write: {save:?}"
+        );
+        let append = effects_at(dir.path(), "\"x\".append(\"p\")");
+        assert!(
+            append.contains(&Effect::FsWrite {
+                paths: vec![dir.path().join("p")]
+            }),
+            ".append did not plan a write: {append:?}"
+        );
+        // Bare `.read` (Field form) and `.read()` (MethodCall form) both read.
+        for src in ["path(\"f\").read", "path(\"f\").read()"] {
+            let read = effects_at(dir.path(), src);
+            assert!(
+                read.contains(&Effect::FsRead {
+                    paths: vec![dir.path().join("f")]
+                }),
+                "`{src}` did not plan a read: {read:?}"
+            );
+        }
+    }
+
+    /// A9: `.feed(cat)` spawns cat externally (matching run_argv), not the
+    /// `cat` builtin — no FsRead, a concrete ProcSpawn.
+    #[test]
+    fn feed_resolves_command_as_external_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let effects = effects_at(dir.path(), "\"x\".feed(cat)");
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::ProcSpawn { argv0, .. } if argv0 == "cat")),
+            ".feed(cat) did not spawn cat: {effects:?}"
+        );
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::FsRead { .. })),
+            ".feed(cat) mis-resolved cat as the builtin (FsRead): {effects:?}"
         );
     }
 }

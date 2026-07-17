@@ -39,7 +39,7 @@ Rules for implementers:
 - [ ] **HR-A3** — `plan_call` traverses command redirects; `>` and `>>` derive `FsWrite` with
   the target path (append distinguished from truncate). *(A3)*
   <br>Accept: `plan { echo hi > p }` reports a write to `p`.
-- [ ] **HR-A4** — Method-call classification covers path/stream `.save` and `.append`, path
+- [x] **HR-A4** — Method-call classification covers path/stream `.save` and `.append`, path
   reads (`.read` and friends), and `.feed`. *(A4)*
   <br>Accept: each of `plan { "x".save("p") }`, `plan { path("f").read }`,
   `plan { "x".feed(cat) }` reports the correct effect kind and target.
@@ -61,7 +61,7 @@ Rules for implementers:
   bodies derive the effects of their bodies/arguments. *(A8)*
   <br>Accept: `plan { spawn { "x".save("p") } }` and `plan { parallel(() => "x".save("p")) }`
   report the write.
-- [ ] **HR-A9** — The planner resolves command position with the same resolution the runtime
+- [x] **HR-A9** — The planner resolves command position with the same resolution the runtime
   uses, fixing the `.feed(cat)` builtin-vs-external mismatch. *(A9)*
   <br>Accept: `plan { "x".feed(cat) }` reports a process spawn matching what runtime executes.
 - [ ] **HR-A10** — Derivation is structurally exhaustive: a match over every AST node with a
