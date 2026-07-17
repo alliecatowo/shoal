@@ -63,10 +63,12 @@ accDescr: Shows the components and relationships described in Envelope and conne
   T->>T: close this client's kernel subscriptions
 ```
 
-`read_frame` enforces the 16 MiB limit during the read with `Read::take(cap + 1)`; an oversized or
-unterminated peer cannot grow the line buffer beyond that bound. Public kernel connections also use a
-10-second first-byte/remainder read deadline by default. The MCP stdio reader uses the same bounded
-line shape without the socket deadline.
+`read_frame` enforces the 16 MiB JSON-content limit during the read; an oversized or unterminated
+peer cannot grow the line buffer beyond that bound plus the terminator sentinel. Before decoding,
+the shared request/response preflight caps structural depth (64), total values (65,536), per-container
+items (16,384), decoded object keys (64 KiB), and numeric tokens (1 KiB). Public kernel connections
+also use a 10-second first-byte/remainder read deadline by default. The MCP stdio reader uses the
+same bounded line and complexity shape without the socket deadline.
 
 ## Router and attachment matrix
 

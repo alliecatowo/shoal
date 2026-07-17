@@ -449,7 +449,10 @@ The standalone `shoal-secret` CLI does **not** currently honor `SHOAL_SECRET_DIR
 
 ## Resource and denial-of-service limits
 
-The protocol limits an input frame to 16 MiB and normally elides values around 8 KiB with a 64 KiB encoded hard cap. These are context protections, not comprehensive service quotas.
+The protocol limits JSON content to 16 MiB and performs a fixed-stack lexical preflight before tree
+allocation: depth 64, 65,536 values total, 16,384 items per container, 64 KiB decoded keys, and 1
+KiB numeric tokens. Outbound frames use the same limits. Values are normally elided around 8 KiB
+with a 64 KiB encoded hard cap. These are context protections, not comprehensive service quotas.
 
 Remaining high-cost surfaces include:
 

@@ -5,8 +5,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
-use std::io::{self, BufRead, Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+mod frame;
+pub use frame::{
+    MAX_FRAME_LEN, MAX_JSON_CONTAINER_ITEMS, MAX_JSON_DEPTH, MAX_JSON_KEY_BYTES, MAX_JSON_NODES,
+    MAX_JSON_NUMBER_BYTES, read_frame, read_json_frame, validate_json_frame, write_frame,
+};
 
 pub const JSONRPC: &str = "2.0";
 /// Maximum decoded content carried by one raw/blob retrieval response.
@@ -188,38 +193,6 @@ impl Response {
             }),
         }
     }
-}
-
-/// Maximum size of one newline-delimited JSON-RPC frame.
-///
-/// The limit is applied while reading, rather than after `read_line` has
-/// already buffered an arbitrarily large or unterminated input.
-pub const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
-
-pub fn read_frame<R: BufRead>(reader: &mut R) -> io::Result<Option<Request>> {
-    let mut line = String::new();
-    let n = reader
-        .by_ref()
-        .take(MAX_FRAME_LEN as u64 + 1)
-        .read_line(&mut line)?;
-    if n == 0 {
-        return Ok(None);
-    }
-    if line.len() > MAX_FRAME_LEN {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "JSON-RPC frame exceeds 16 MiB",
-        ));
-    }
-    serde_json::from_str(line.trim_end())
-        .map(Some)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-}
-
-pub fn write_frame<W: Write, T: Serialize>(writer: &mut W, frame: &T) -> io::Result<()> {
-    serde_json::to_writer(&mut *writer, frame).map_err(io::Error::other)?;
-    writer.write_all(b"\n")?;
-    writer.flush()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -786,6 +759,7 @@ pub struct JournalEntry {
 mod tests {
     use super::*;
     use serde::Serializer;
+    use std::io::{self, Read};
     #[test]
     fn frames_are_newline_delimited() {
         let response = Response::ok(Value::from(1), serde_json::json!({"ok":true}));

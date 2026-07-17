@@ -216,6 +216,8 @@ ID changes, support old clients through a versioned attach response or a deliber
 ### P0.3 Bounded frame ingestion and explicit raw retrieval
 
 **Status (2026-07-17): implemented.** Frame readers reject cap-plus-one during bounded ingestion.
+Before tree allocation, the shared request/response scanner also caps depth, node count, container
+width, decoded key bytes, and numeric-token bytes; outbound serialization uses the same limits.
 Raw values now use bounded `slice` pages and CAS blobs use byte `offset`/`length` pages, both with an
 8 KiB decoded-content wall and explicit continuation metadata. The adversarial suite covers resident
 and CAS values, exact boundaries, overflowed requests, owner denial, and MCP context size.

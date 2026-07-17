@@ -273,9 +273,12 @@ currently serializes `timestamp().to_string()`—Unix seconds as decimal text. T
 bytes and declared contract disagree; clients need a compatibility-tested correction rather than an
 assumption based on either comment alone.
 
-The JSON-RPC frame limit is 16 MiB. Kernel and MCP readers wrap input in `Read::take(cap + 1)` before
-`read_line`, so oversized or unterminated frames cannot grow the line buffer beyond the cap plus the
-sentinel byte. Public kernel frames also have a 10-second first-byte/remainder timeout by default.
+The JSON-RPC content limit is 16 MiB. Kernel and MCP readers wrap input in a bounded reader before
+`read_line`, so oversized or unterminated frames cannot grow the line buffer beyond the cap plus
+terminator sentinel. A fixed-stack lexical pass rejects depth above 64, more than 65,536 values,
+more than 16,384 items/members in one container, object keys over 64 KiB decoded, and numeric tokens
+over 1 KiB before `serde_json` tree allocation. The same limits apply to buffered outbound frames.
+Public kernel frames also have a 10-second first-byte/remainder timeout by default.
 
 ## Event bus
 

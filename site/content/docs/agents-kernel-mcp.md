@@ -416,7 +416,11 @@ Kernel errors are deliberately returned as a successful MCP `tools/call` envelop
 
 ## Raw wire clients
 
-Kernel transport is JSON-RPC 2.0, one JSON object per newline, on a Unix stream. The maximum input frame is 16 MiB. A connection that sends malformed JSON directly to the kernel is closed at framing; the MCP stdio bridge instead emits JSON-RPC parse error `-32700` and continues reading subsequent lines.
+Kernel transport is JSON-RPC 2.0, one JSON object per newline, on a Unix stream. JSON content is
+limited to 16 MiB, depth 64, 65,536 values, 16,384 items per container, 64 KiB decoded keys, and 1
+KiB numeric tokens before tree allocation. A connection that sends malformed or over-complex JSON
+directly to the kernel is closed at framing; the MCP stdio bridge instead emits JSON-RPC parse error
+`-32700` and continues reading subsequent lines.
 
 Raw clients must attach, preserve request IDs, and tolerate event notifications interleaved with responses. Pushed events are not ordered before/after the response to the action that produced them; subscription writers are intentionally asynchronous.
 

@@ -43,9 +43,11 @@ best-effort spawns a detached `shoal-kernel`, polls readiness for about five sec
 `SHOAL_NO_AUTOSTART` opts out for externally supervised kernels. Competing autostarts rely on the
 kernel's socket preparation to leave one winner.
 
-Both MCP stdio and kernel socket protocols use newline JSON frames with a 16 MiB limit enforced
-during the read via `Read::take(cap + 1)`, so an unterminated frame cannot grow memory past the
-bound. The public kernel additionally applies its configured frame-read deadline.
+Both MCP stdio and kernel socket protocols use newline JSON frames with a 16 MiB content limit
+enforced during the read, so an unterminated frame cannot grow the line buffer past the bound plus
+its terminator sentinel. Their shared fixed-stack JSON preflight rejects excessive depth, values,
+container width, keys, and numbers before allocating a `serde_json` tree. The public kernel
+additionally applies its configured frame-read deadline.
 
 Stdout is locked per complete frame. This lets the request loop and subscription-forwarder threads
 write without interleaving JSON bytes.

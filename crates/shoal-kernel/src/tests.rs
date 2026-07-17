@@ -45,6 +45,40 @@ fn connection_quota_reservation_is_atomic_and_released_on_drop() {
 }
 
 #[test]
+fn overcomplex_request_closes_only_that_connection_and_kernel_stays_live() {
+    use std::io::Write as _;
+
+    let kernel = Kernel::new();
+    let (mut hostile, server) = UnixStream::pair().unwrap();
+    let worker_kernel = kernel.clone();
+    let worker = std::thread::spawn(move || worker_kernel.handle_stream(server));
+    let wide = format!(
+        "[{}]\n",
+        std::iter::repeat_n("null", MAX_JSON_CONTAINER_ITEMS + 1)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    hostile.write_all(wide.as_bytes()).unwrap();
+    drop(hostile);
+    let error = worker.join().unwrap().unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("complexity limit"));
+
+    let (mut client, mut reader, healthy) = spawn(&kernel);
+    let response = call(
+        &mut client,
+        &mut reader,
+        1,
+        "session.attach",
+        json!({"client":{"kind":"test","tty":false}}),
+    );
+    assert!(response.error.is_none());
+    drop(client);
+    drop(reader);
+    healthy.join().unwrap();
+}
+
+#[test]
 fn read_deadline_evicts_silent_and_partial_unauthenticated_connections() {
     use std::io::{Read, Write};
 

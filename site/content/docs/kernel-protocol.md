@@ -37,7 +37,9 @@ Wire rules:
 - Unix-domain stream socket only;
 - UTF-8 JSON text;
 - exactly one JSON value per newline-delimited frame;
-- maximum input line length 16 MiB;
+- maximum JSON content length 16 MiB (the line terminator is not content);
+- maximum structural depth 64, 65,536 values total, and 16,384 items/members per container;
+- maximum decoded object key 64 KiB and numeric token 1 KiB;
 - JSON-RPC version string must be `"2.0"`;
 - request IDs are arbitrary JSON values and are echoed verbatim;
 - subscription notifications have no `id`;
@@ -69,10 +71,11 @@ Failure:
 }
 ```
 
-The raw kernel reader does not produce a `-32700` response for malformed JSON. A bad JSON frame or
-a line over 16 MiB ends that connection. The limit is applied during accumulation, and public
+The raw kernel reader does not produce a `-32700` response for malformed JSON. A bad, over-complex,
+or over-16-MiB JSON frame ends that connection. The byte limit is applied during accumulation and a
+nonallocating lexical preflight applies the complexity limits before tree decoding. Public
 connections default to a 10-second first-byte/remainder deadline. The MCP stdio facade instead
-reports malformed MCP JSON as `-32700`.
+reports malformed MCP JSON as `-32700` and uses the same framing preflight for kernel responses.
 
 Use one writer lock per connection. A subscription writer in the kernel may emit a complete `event` frame while ordinary request handling is active, but the kernel serializes whole frames so bytes do not interleave.
 

@@ -2,7 +2,7 @@
 
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, BufRead, Write};
 use std::net::Shutdown;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream;
@@ -18,7 +18,6 @@ mod tools;
 pub use client::{BridgeError, Config, KernelClient, LocalAuthMode, discover_socket};
 pub use tools::tools;
 
-const MAX_FRAME: usize = 16 * 1024 * 1024;
 /// Each subscription owns a kernel connection and a forwarding thread. This
 /// facade-local ceiling applies before consuming either resource; the kernel's
 /// principal/session quotas remain a second, shared admission boundary.
@@ -362,22 +361,32 @@ pub fn run_stdio(config: &Config) -> Result<(), BridgeError> {
                 "parse error",
                 Some(json!({"detail":error.to_string()})),
             ))?,
+            Err(BridgeError::Protocol(detail)) if is_frame_decode_error(&detail) => {
+                write_stdout_frame(&rpc_error(
+                    Value::Null,
+                    -32700,
+                    "parse error",
+                    Some(json!({"detail":detail})),
+                ))?
+            }
             Err(error) => return Err(error),
         }
     }
+}
+
+fn is_frame_decode_error(message: &str) -> bool {
+    message.starts_with("invalid JSON-RPC")
+        || message.starts_with("JSON-RPC frame complexity limit exceeded")
+        || message == "JSON-RPC frame exceeds 16 MiB"
 }
 
 /// Write one newline-framed JSON value to stdout atomically under the stdout
 /// lock. Both the main loop and any subscription forwarder use this, so their
 /// frames never interleave on the wire.
 pub(crate) fn write_stdout_frame(value: &Value) -> Result<(), BridgeError> {
-    let mut buf = serde_json::to_vec(value)?;
-    buf.push(b'\n');
     let stdout = io::stdout();
     let mut handle = stdout.lock();
-    handle.write_all(&buf)?;
-    handle.flush()?;
-    Ok(())
+    shoal_proto::write_frame(&mut handle, value).map_err(BridgeError::Io)
 }
 
 fn rpc_error(id: Value, code: i32, message: &str, data: Option<Value>) -> Value {
@@ -393,24 +402,16 @@ pub(crate) fn short_ref_to_uri(short: &str) -> String {
 }
 
 pub(crate) fn read_json_line<R: BufRead>(reader: &mut R) -> Result<Option<Value>, BridgeError> {
-    let mut line = String::new();
-    let n = reader
-        .by_ref()
-        .take(MAX_FRAME as u64 + 1)
-        .read_line(&mut line)?;
-    if n == 0 {
-        return Ok(None);
-    }
-    if line.len() > MAX_FRAME {
-        return Err(BridgeError::Protocol("frame exceeds 16 MiB".into()));
-    }
-    Ok(Some(serde_json::from_str(line.trim_end())?))
+    shoal_proto::read_json_frame(reader).map_err(|error| {
+        if error.kind() == io::ErrorKind::InvalidData {
+            BridgeError::Protocol(error.to_string())
+        } else {
+            BridgeError::Io(error)
+        }
+    })
 }
 pub(crate) fn write_json_line<W: Write>(writer: &mut W, value: &Value) -> Result<(), BridgeError> {
-    serde_json::to_writer(&mut *writer, value)?;
-    writer.write_all(b"\n")?;
-    writer.flush()?;
-    Ok(())
+    shoal_proto::write_frame(writer, value).map_err(BridgeError::Io)
 }
 
 pub fn socket_exists(path: &Path) -> bool {
@@ -424,6 +425,7 @@ fn fs_type(path: &Path) -> Option<std::fs::FileType> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shoal_proto::MAX_FRAME_LEN;
     use std::os::unix::net::UnixListener;
     use std::sync::mpsc;
     use std::thread;
@@ -486,7 +488,7 @@ mod tests {
 
     #[test]
     fn read_json_line_rejects_a_single_oversized_line() {
-        let mut body = "x".repeat(MAX_FRAME + 1024);
+        let mut body = "x".repeat(MAX_FRAME_LEN + 1024);
         body.push('\n');
         let mut reader = io::BufReader::new(body.as_bytes());
         let error = read_json_line(&mut reader).expect_err("an oversized frame must fail");
@@ -494,6 +496,33 @@ mod tests {
             BridgeError::Protocol(message) => assert!(message.contains("16 MiB"), "{message}"),
             other => panic!("expected a protocol error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn facade_frame_io_shares_complexity_limits_and_recovers_at_line_boundary() {
+        let wide = format!(
+            "[{}]",
+            std::iter::repeat_n("null", shoal_proto::MAX_JSON_CONTAINER_ITEMS + 1)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let good = json!({"jsonrpc":"2.0","id":1,"method":"ping"});
+        let mut bytes = wide.into_bytes();
+        bytes.push(b'\n');
+        bytes.extend_from_slice(serde_json::to_string(&good).unwrap().as_bytes());
+        bytes.push(b'\n');
+        let mut reader = io::BufReader::new(bytes.as_slice());
+        let error = read_json_line(&mut reader).unwrap_err();
+        match error {
+            BridgeError::Protocol(message) => assert!(message.contains("complexity limit")),
+            other => panic!("expected a protocol error, got {other:?}"),
+        }
+        assert_eq!(read_json_line(&mut reader).unwrap(), Some(good));
+
+        let mut output = Vec::new();
+        let wide = Value::Array(vec![Value::Null; shoal_proto::MAX_JSON_CONTAINER_ITEMS + 1]);
+        assert!(write_json_line(&mut output, &wide).is_err());
+        assert!(output.is_empty());
     }
 
     #[test]

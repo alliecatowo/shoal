@@ -264,8 +264,11 @@ Consumers may rely on:
 ## Wire framing contract
 
 `shoal-proto` uses JSON-RPC 2.0 objects separated by one newline over a Unix byte stream. A frame is
-read with `read_line`; EOF before another line returns no request; a line over 16 MiB is invalid.
-Writing serializes one object, appends newline, and flushes.
+read through a bounded `read_line`; EOF before another line returns no request; JSON content over
+16 MiB is invalid. Before `serde_json` allocates a tree, a fixed-stack lexical preflight enforces
+valid JSON strings/escapes/numbers plus depth 64, 65,536 total values, 16,384 members/items per
+container, 64 KiB decoded object keys, and 1 KiB numeric tokens. Writing first serializes into a
+16 MiB bounded buffer, applies the same complexity preflight, then appends newline and flushes.
 
 ```mermaid
 sequenceDiagram
@@ -280,9 +283,10 @@ accDescr: Shows the components and relationships described in Wire framing contr
   P-->>C: one JSON object + newline
 ```
 
-The 16 MiB check occurs after `read_line` has accumulated the line, so it limits accepted frames but
-does not prevent allocation proportional to an untrusted unterminated/oversized line. Socket peer
-authentication and filesystem permissions are therefore part of framing safety.
+The byte cap is applied during accumulation, so an untrusted unterminated/oversized line cannot grow
+the buffer beyond the cap and terminator sentinel. A wide-but-byte-valid JSON document cannot
+amplify into an unbounded `serde_json::Value` tree because complexity is checked before decoding.
+One large source/result string may still consume the full frame budget.
 
 Notifications and responses share the same stream. Clients must demultiplex by presence of response
 ID versus notification method, and must not assume a request gets the next physical frame when
