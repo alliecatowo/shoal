@@ -199,7 +199,7 @@ Rules for implementers:
   matches the documented backpressure story. *(I4)*
 - [ ] **HR-G4** — Cancelling an `on(channel, handler)` task interrupts a blocking `recv`
   (timeout, close, or wakeup token); no permanently stuck handler threads. *(I5)*
-- [ ] **HR-G5** — `distinct` uses hashing (amortized O(1) membership); its memory behavior on
+- [x] **HR-G5** — `distinct` uses hashing (amortized O(1) membership); its memory behavior on
   unbounded streams is documented. *(I13)*
 - [ ] **HR-G6** — `zip`/`merge` rate-skew and backpressure semantics are documented precisely
   with tests. *(I14)*

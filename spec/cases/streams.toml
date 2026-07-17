@@ -51,6 +51,14 @@ src = '[1, 1, 2, 2, 2, 3, 1].stream().distinct().collect()'
 value = "[1, 2, 3]"
 
 [[case]]
+# `distinct` membership is hash-bucketed (HR-G5) but keeps `Value` equality
+# exactly: `1 == 1.0` (numeric promotion), so the float duplicate is dropped
+# and the first occurrence (the int) is what's emitted.
+name = "stream-distinct-numeric-promotion-equality"
+src = '[1, 1.0, 2, 1].stream().distinct().collect()'
+value = "[1, 2]"
+
+[[case]]
 name = "stream-flat-map-lists"
 src = '[1, 2, 3].stream().flat_map(x => [x, x * 10]).collect()'
 value = "[1, 10, 2, 20, 3, 30]"

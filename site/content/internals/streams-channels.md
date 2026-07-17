@@ -220,7 +220,7 @@ length shrinks; rename/replacement behavior beyond that depends on platform `not
 | `take_until(predicate)` | consumes triggering item and ends without emitting it |
 | `take_until(stream)` | polls signal stream and primary source in 20 ms steps |
 | `dedupe` | stores last emitted item; removes adjacent equality duplicates |
-| `distinct` | stores all seen values in a vector; removes global duplicates |
+| `distinct` | stores all seen values hash-bucketed by a canonical hash; removes global duplicates |
 | `debounce(duration)` | retains latest pending value until quiet deadline |
 | `throttle(duration)` | emits first and drops items inside interval |
 | `window(count)` | sliding deque; emits only once full, then every item |
@@ -231,10 +231,13 @@ length shrinks; rename/replacement behavior beyond that depends on platform `not
 | `zip(other)` | pulls A then B and emits `[a,b]`; ends/times out with either pull |
 
 
-`distinct` has unbounded memory growth on an unbounded stream with continuously unique values. It
-does not use hashing, so membership is linear in the number seen. `window(duration)` is bounded only
-by event rate inside the duration. `.buffer(n)` currently communicates intent but has no operational
-backpressure effect.
+`distinct` membership is amortized O(1) (HR-G5): seen values are bucketed by a canonical hash whose
+contract is `a == b ⟹ same bucket`, and a bucket is confirmed with `Value`'s real `PartialEq`, so the
+cross-type equalities (`1 == 1.0`, `path` vs `str`, `table` vs `list<record>`) dedupe exactly as
+before. Its *memory* is still proportional to the number of distinct values seen: on an unbounded
+stream of continuously unique values the set grows without bound — bound the stream (`.take`,
+`.take_until`) or use `dedupe`/a window when long-lived cardinality is unknown. `window(duration)` is
+bounded only by event rate inside the duration.
 
 `debounce` ignores the caller-supplied outer timeout and uses its own pending deadline. This is worth
 re-auditing if time budgets become strict RPC cancellation contracts.

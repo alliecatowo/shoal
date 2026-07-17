@@ -223,7 +223,7 @@ impl StreamVal {
         self.wrap(l, b, |up| {
             Box::new(ops::Distinct {
                 up,
-                seen: Vec::new(),
+                seen: std::collections::HashMap::new(),
             })
         })
     }
@@ -431,6 +431,49 @@ mod tests {
                 Some(&Value::Int((200 - tee::TEE_QUEUE_CAP) as i64))
             ),
             other => panic!("expected a {{dropped: n}} marker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn distinct_hash_buckets_respect_cross_type_equality() {
+        // HR-G5: `distinct` now buckets by a canonical hash. The contract is
+        // `a == b ⟹ same bucket`, so every cross-type equality `Value` defines
+        // must still dedupe: Int/Float numeric promotion, Path/Str display
+        // equality, and −0.0/+0.0. First occurrence wins, as before.
+        let src = StreamVal::from_iter(
+            "value",
+            vec![
+                Ok(Value::Int(1)),
+                Ok(Value::Float(1.0)), // == Int(1)
+                Ok(Value::Str("a".into())),
+                Ok(Value::Path(PathBuf::from("a"))), // == Str("a")
+                Ok(Value::Float(0.0)),
+                Ok(Value::Float(-0.0)), // == 0.0
+                Ok(Value::Int(2)),
+            ]
+            .into_iter(),
+        );
+        let out = drain(&src.distinct().unwrap());
+        assert_eq!(
+            out,
+            vec![
+                Value::Int(1),
+                Value::Str("a".into()),
+                Value::Float(0.0),
+                Value::Int(2)
+            ]
+        );
+    }
+
+    #[test]
+    fn distinct_emits_each_unique_value_once_at_scale() {
+        // HR-G5: 10k items over 100 distinct keys — a smoke test that the
+        // hash-bucketed set behaves exactly like the old linear scan.
+        let src = StreamVal::from_iter("int", (0..10_000).map(|i| Ok(Value::Int(i % 100))));
+        let out = drain(&src.distinct().unwrap());
+        assert_eq!(out.len(), 100);
+        for (i, v) in out.iter().enumerate() {
+            assert_eq!(v, &Value::Int(i as i64), "first-occurrence order kept");
         }
     }
 
