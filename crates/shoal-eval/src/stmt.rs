@@ -18,7 +18,6 @@ impl Evaluator {
             let flow = self.journal_finish_stmt(journaled, result)?;
             match flow {
                 Flow::Value(v) => {
-                    self.exec.control.it = v.clone();
                     if is_last {
                         last = v;
                     } else if self.echo_intermediate(stmt) {

@@ -291,7 +291,18 @@ impl Kernel {
         // lockstep with the kernel's addressable Session transcript. Failed
         // evaluations intentionally do not reach this point, matching the
         // standalone REPL's successful-value-only contract.
+        // Reserve and hold the side-map transaction before advancing `it/out`:
+        // after this point insertion and retention are infallible HashMap
+        // operations, so a transcript-lock/reservation failure cannot leave
+        // evaluator state ahead of the addressable Session transcript.
+        let mut transcript = session.lock_transcript()?;
+        transcript.try_reserve(1).map_err(|error| RpcError {
+            code: INTERNAL_ERROR,
+            message: format!("cannot reserve session transcript entry: {error}"),
+            data: Some(json!({"resource": "session_transcript"})),
+        })?;
         if let Err(e) = evaluator.record_transcript(&value) {
+            drop(transcript);
             {
                 let journal = self
                     .journal
@@ -316,23 +327,8 @@ impl Kernel {
             });
         }
         let value_ref = Ref::new("out", session.next_value.fetch_add(1, Ordering::Relaxed));
-        if let Err(error) = session.insert_transcript_checked(value_ref.clone(), value.clone()) {
-            {
-                let journal = self
-                    .journal
-                    .lock()
-                    .map_err(|_| poisoned_subsystem("journal"))?;
-                journal
-                    .finish(entry_id, None, false, elapsed_ns(started))
-                    .map_err(internal)?;
-            }
-            self.events.publish_journal(
-                &session.key.owner(),
-                entry_id,
-                journal_event(entry_id, &params.src, false, actor),
-            );
-            return Err(error);
-        }
+        Session::insert_transcript_retained(&mut transcript, value_ref.clone(), value.clone());
+        drop(transcript);
         session.push_out_entry(evaluator_entry_id);
         let render = shoal_value::render::render_block(&value, 80);
         // Built once, up front: this SAME payload is both persisted durably

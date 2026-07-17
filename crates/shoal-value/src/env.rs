@@ -170,6 +170,87 @@ impl Env {
         Ok(())
     }
 
+    /// Validate and publish several bindings as one environment transaction.
+    /// Either every binding and its shared-budget charge is installed, or the
+    /// environment remains byte-for-byte unchanged.
+    pub fn declare_many(&self, bindings: Vec<(String, Value, bool)>) -> VResult<()> {
+        let mut measured = Vec::new();
+        measured.try_reserve(bindings.len()).map_err(|error| {
+            ErrorVal::new(
+                "binding_aggregate_limit",
+                format!("cannot stage environment binding transaction: {error}"),
+            )
+        })?;
+        for (index, (name, value, mutable)) in bindings.into_iter().enumerate() {
+            validate_binding_name(&name)?;
+            if measured
+                .iter()
+                .take(index)
+                .any(|(existing, _, _, _)| existing == &name)
+            {
+                return Err(ErrorVal::new(
+                    "binding_transaction",
+                    format!("binding transaction contains duplicate name `{name}`"),
+                ));
+            }
+            let value_bytes = measure_binding_value(&value)?;
+            measured.push((name, value, mutable, value_bytes));
+        }
+
+        let mut inner = self.lock_inner();
+        let shared_budget = Arc::clone(&inner.budget);
+        let new_identities = measured
+            .iter()
+            .filter(|(name, _, _, _)| !inner.vars.contains_key(name))
+            .count();
+        inner.vars.try_reserve(new_identities).map_err(|error| {
+            ErrorVal::new(
+                "binding_aggregate_limit",
+                format!("cannot reserve environment binding transaction: {error}"),
+            )
+        })?;
+
+        let mut budget = lock_budget(&shared_budget);
+        let next_identities = budget
+            .identities
+            .checked_add(new_identities)
+            .ok_or_else(binding_accounting_overflow)?;
+        if next_identities > ENV_BINDING_IDENTITY_CAP {
+            return Err(ErrorVal::new(
+                "binding_identity_limit",
+                format!(
+                    "environment binding identity limit ({ENV_BINDING_IDENTITY_CAP}) reached; replace or remove a binding before declaring another"
+                ),
+            ));
+        }
+
+        let mut next_bytes = budget.retained_bytes;
+        for (name, _, _, value_bytes) in &measured {
+            next_bytes = match inner.vars.get(name) {
+                Some(binding) => next_bytes
+                    .saturating_sub(binding.value_bytes)
+                    .checked_add(*value_bytes),
+                None => next_bytes.checked_add(binding_charge(name, *value_bytes)),
+            }
+            .ok_or_else(binding_accounting_overflow)?;
+        }
+        ensure_aggregate_bytes(next_bytes)?;
+
+        for (name, value, mutable, value_bytes) in measured {
+            inner.vars.insert(
+                name,
+                Binding {
+                    value,
+                    mutable,
+                    value_bytes,
+                },
+            );
+        }
+        budget.identities = next_identities;
+        budget.retained_bytes = next_bytes;
+        Ok(())
+    }
+
     /// Remove a binding declared in this exact scope, without walking into a
     /// parent. Hosts use this to refresh a mirrored remote-session namespace
     /// without accidentally deleting an inherited language binding.
@@ -483,6 +564,41 @@ mod tests {
         assert!(accepted > 1);
         assert!(accepted < ENV_BINDING_IDENTITY_CAP);
         assert_eq!(env.visible_names().len(), accepted);
+    }
+
+    #[test]
+    fn multi_binding_declarations_are_atomic() {
+        let env = Env::root();
+        env.declare("first", Value::Int(1), true).unwrap();
+        env.declare("second", Value::Int(2), true).unwrap();
+
+        env.declare_many(vec![
+            ("first".into(), Value::Int(10), true),
+            ("second".into(), Value::Int(20), false),
+        ])
+        .unwrap();
+        assert_eq!(env.get("first"), Some(Value::Int(10)));
+        assert_eq!(env.get("second"), Some(Value::Int(20)));
+
+        let huge = Value::Str("x".repeat(ENV_BINDING_VALUE_BYTES + 1));
+        let error = env
+            .declare_many(vec![
+                ("first".into(), Value::Int(99), true),
+                ("second".into(), huge, true),
+            ])
+            .unwrap_err();
+        assert_eq!(error.code, "binding_value_limit");
+        assert_eq!(env.get("first"), Some(Value::Int(10)));
+        assert_eq!(env.get("second"), Some(Value::Int(20)));
+
+        let error = env
+            .declare_many(vec![
+                ("first".into(), Value::Int(30), true),
+                ("first".into(), Value::Int(40), true),
+            ])
+            .unwrap_err();
+        assert_eq!(error.code, "binding_transaction");
+        assert_eq!(env.get("first"), Some(Value::Int(10)));
     }
 
     #[test]

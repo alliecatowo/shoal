@@ -342,7 +342,8 @@ mod tests {
         let kernel = Kernel::new();
         let (session, mut attached) = attached(&kernel, "transcript-limit");
         {
-            let evaluator = session.lock_evaluator().unwrap();
+            let mut evaluator = session.lock_evaluator().unwrap();
+            evaluator.record_transcript(&Value::Int(7)).unwrap();
             evaluator
                 .env()
                 .declare(
@@ -361,6 +362,19 @@ mod tests {
         };
         assert_eq!(error.code, RAISED);
         assert_eq!(error.data.unwrap()["code"], "binding_value_limit");
+        {
+            let evaluator = session.lock_evaluator().unwrap();
+            assert_eq!(evaluator.it(), &Value::Int(7));
+            assert_eq!(evaluator.env().get("it"), Some(Value::Int(7)));
+            assert!(
+                matches!(evaluator.env().get("out"), Some(Value::List(values))
+                if matches!(values.as_slice(), [Value::Str(value)] if value.len() == 3800 * 1024))
+            );
+        }
+        assert!(
+            session.lock_transcript().unwrap().is_empty(),
+            "the addressable side map must not publish a failed value"
+        );
 
         let rows = kernel
             .journal

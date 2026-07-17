@@ -354,18 +354,31 @@ impl Session {
         value_ref: Ref,
         value: Value,
     ) -> Result<(), RpcError> {
+        let mut transcript = self.lock_transcript()?;
+        transcript.try_reserve(1).map_err(|error| RpcError {
+            code: INTERNAL_ERROR,
+            message: format!("cannot reserve session transcript entry: {error}"),
+            data: Some(json!({"resource": "session_transcript"})),
+        })?;
+        Self::insert_transcript_retained(&mut transcript, value_ref, value);
+        Ok(())
+    }
+
+    pub(crate) fn insert_transcript_retained(
+        transcript: &mut HashMap<Ref, Value>,
+        value_ref: Ref,
+        value: Value,
+    ) {
         let id = value_ref
             .0
             .split_once(':')
             .and_then(|(_, id)| id.parse::<u64>().ok());
-        let mut transcript = self.lock_transcript()?;
         transcript.insert(value_ref, value);
         if let Some(id) = id
             && id > MAX_TRANSCRIPT_PER_SESSION as u64
         {
             transcript.remove(&Ref::new("out", id - MAX_TRANSCRIPT_PER_SESSION as u64));
         }
-        Ok(())
     }
 
     pub(crate) fn rewrite_out_undo(&self, program: &mut Program) {

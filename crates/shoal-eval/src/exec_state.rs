@@ -12,6 +12,8 @@ pub(crate) struct ShellState {
 }
 
 pub(crate) struct ControlState {
+    /// Last value committed by the host transcript boundary. Ordinary
+    /// evaluation returns a candidate value but does not publish it here.
     pub(crate) it: Value,
     pub(crate) cancel: CancelToken,
     pub(crate) call_depth: usize,

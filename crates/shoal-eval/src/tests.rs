@@ -709,6 +709,27 @@ fn record_transcript_bounds_it_and_out_together() {
 }
 
 #[test]
+fn record_transcript_failure_leaves_it_and_out_unchanged() {
+    let mut ev = Evaluator::new(std::env::current_dir().unwrap());
+    ev.record_transcript(&Value::Int(7)).unwrap();
+    let retained = Value::List(vec![
+        Value::Str("x".repeat(800));
+        MAX_REPL_TRANSCRIPT_VALUES
+    ]);
+    ev.env()
+        .declare("out", retained.clone(), true)
+        .expect("the baseline transcript fits its per-binding wall");
+
+    let error = ev
+        .record_transcript(&Value::Str("y".repeat(1024 * 1024)))
+        .expect_err("the expanded out list exceeds its per-binding wall");
+    assert_eq!(error.code, "binding_value_limit");
+    assert_eq!(ev.it(), &Value::Int(7));
+    assert_eq!(ev.env().get("it"), Some(Value::Int(7)));
+    assert_eq!(ev.env().get("out"), Some(retained));
+}
+
+#[test]
 fn builtin_retry_and_parallel_and_save() {
     assert_eq!(run("retry(3, () => 42)").unwrap(), Value::Int(42));
     assert_eq!(
