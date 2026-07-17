@@ -153,7 +153,7 @@ Rules for implementers:
 - [x] **HR-F5** — Benchmark honesty: delete or implement the prompt benchmark's per-PR/p99
   claims; make `table_1m_where_sort` exercise the real evaluator/table methods or rename/remove
   it. *(I12)*
-- [ ] **HR-F6** — Supply-chain advisories checked in CI (`cargo audit` or `cargo deny`) with a
+- [x] **HR-F6** — Supply-chain advisories checked in CI (`cargo audit` or `cargo deny`) with a
   documented allowlist. *(H9)*
 - [x] **HR-F7** — Unix-only support stated explicitly in README/docs; Windows recorded as out of
   scope for now. *(H8)*
