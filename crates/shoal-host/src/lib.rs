@@ -106,6 +106,14 @@ impl SessionBootstrap {
         }
 
         let mut report = BootstrapReport::default();
+        let plugin_errors = evaluator
+            .load_wasm_plugins(&self.loaded.config.plugins.dirs)
+            .map_err(|error| format!("plugin registry: {error}"))?;
+        report.warnings.extend(
+            plugin_errors
+                .into_iter()
+                .map(|error| format!("plugin: {error}")),
+        );
         seed_config_bindings(evaluator, &self.loaded.config, &mut report.warnings);
         load_adapters(evaluator, &self.loaded.config, &mut report);
 
