@@ -259,7 +259,8 @@ pub(crate) fn repl(standalone: bool) -> Result<i32, String> {
     // untouched. Uses no-op *handlers*, so spawned children reset to SIG_DFL on
     // exec and can still be stopped on their own pty (see shoal-exec).
     if io::stdin().is_terminal() {
-        shoal_eval::install_shell_job_control_signals();
+        shoal_eval::install_shell_job_control_signals()
+            .map_err(|error| format!("cannot install job-control signal handlers: {error}"))?;
     }
 
     let cwd_cell = Arc::new(Mutex::new(evaluator.cwd().to_path_buf()));

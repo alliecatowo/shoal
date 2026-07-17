@@ -19,6 +19,13 @@ impl Kernel {
     pub(crate) fn handle_complete(self: &Arc<Self>, params: Json) -> Result<Json, RpcError> {
         let p: CompleteParams = decode(params)?;
         let cursor = p.cursor.unwrap_or(p.src.len()).min(p.src.len());
+        if !p.src.is_char_boundary(cursor) {
+            return Err(RpcError {
+                code: INVALID_PARAMS,
+                message: "completion cursor must be a UTF-8 byte boundary".into(),
+                data: Some(json!({"cursor": cursor})),
+            });
+        }
         encode(json!({"candidates": complete_at(&p.src, cursor)}))
     }
 

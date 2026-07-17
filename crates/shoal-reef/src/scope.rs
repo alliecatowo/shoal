@@ -287,7 +287,7 @@ mod tests {
         let k1 = ScopeChain::discover(base, None).key();
         // Bump mtime forward deterministically.
         let later = SystemTime::now() + std::time::Duration::from_secs(120);
-        filetime_set(&p, later);
+        filetime_set(&p, later).unwrap();
         let k2 = ScopeChain::discover(base, None).key();
         assert_ne!(k1, k2, "mtime change must change the chain key");
     }
@@ -303,17 +303,39 @@ mod tests {
     }
 
     // Minimal mtime setter using libc utimes (avoids a filetime dependency).
-    fn filetime_set(p: &Path, t: SystemTime) {
+    fn filetime_set(p: &Path, t: SystemTime) -> std::io::Result<()> {
         use std::os::unix::ffi::OsStrExt;
-        let secs = t.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs() as libc::time_t;
+        let secs = match t.duration_since(SystemTime::UNIX_EPOCH) {
+            Ok(after) => after.as_secs() as libc::time_t,
+            Err(before) => -(before.duration().as_secs() as libc::time_t),
+        };
         let tv = libc::timeval {
             tv_sec: secs,
             tv_usec: 0,
         };
         let times = [tv, tv];
         let cpath = std::ffi::CString::new(p.as_os_str().as_bytes()).unwrap();
-        unsafe {
-            libc::utimes(cpath.as_ptr(), times.as_ptr());
+        // SAFETY: `cpath` is NUL-terminated and `times` contains two live
+        // timeval values for the duration of the call.
+        if unsafe { libc::utimes(cpath.as_ptr(), times.as_ptr()) } == -1 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
         }
+    }
+
+    #[test]
+    fn pre_epoch_manifest_mtime_is_safe_cache_key_data() {
+        let root = tempfile::tempdir().unwrap();
+        let manifest = root.path().join(".reef.toml");
+        write(&manifest, "[tools]\nnode = \"22\"\n");
+        let before_epoch = SystemTime::UNIX_EPOCH - std::time::Duration::from_secs(1);
+        if let Err(error) = filetime_set(&manifest, before_epoch) {
+            eprintln!("filesystem does not support pre-epoch mtimes: {error}");
+            return;
+        }
+        let chain = ScopeChain::discover(root.path(), None);
+        assert_eq!(chain.scopes[0].mtime, Some(before_epoch));
+        let _key = chain.key();
     }
 }

@@ -45,6 +45,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             )
             .into());
         }
+        validate_embedded_socket(fd).map_err(|error| {
+            format!("--embedded-fd {fd} is not a connected Unix stream socket: {error}")
+        })?;
         // Keep the private kernel alive when the terminal delivers Ctrl-C to
         // the foreground process group. This is a caught handler (not
         // SIG_IGN), so exec restores SIG_DFL in command children.
@@ -69,6 +72,50 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     ctrlc::set_handler(move || signal.store(true, Ordering::SeqCst))?;
     eprintln!("shoal-kernel: ready {}", socket.display());
     kernel.serve_until(&socket, stop)?;
+    Ok(())
+}
+
+fn validate_embedded_socket(fd: i32) -> io::Result<()> {
+    let mut socket_type: libc::c_int = 0;
+    let mut socket_type_len = std::mem::size_of_val(&socket_type) as libc::socklen_t;
+    // SAFETY: `fd` was proven open above; both output pointers refer to live,
+    // correctly-sized stack values. A non-socket fails with ENOTSOCK.
+    if unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            (&raw mut socket_type).cast(),
+            &raw mut socket_type_len,
+        )
+    } == -1
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if socket_type != libc::SOCK_STREAM {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "descriptor is not a stream socket",
+        ));
+    }
+
+    // `SO_TYPE` alone also accepts listeners and unrelated network sockets.
+    // Requiring a connected AF_UNIX peer pins the private transport shape
+    // before `from_raw_fd` turns it into trusted `UnixStream` ownership.
+    let mut peer = std::mem::MaybeUninit::<libc::sockaddr_storage>::zeroed();
+    let mut peer_len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    // SAFETY: the sockaddr storage and length slots are valid writable outputs.
+    if unsafe { libc::getpeername(fd, peer.as_mut_ptr().cast(), &raw mut peer_len) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: successful getpeername initialized at least the family field.
+    let peer = unsafe { peer.assume_init() };
+    if peer.ss_family as libc::c_int != libc::AF_UNIX {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "descriptor peer is not AF_UNIX",
+        ));
+    }
     Ok(())
 }
 
@@ -296,6 +343,7 @@ impl Args {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::AsRawFd as _;
 
     fn we_are_root() -> bool {
         unsafe { geteuid() == 0 }
@@ -375,6 +423,18 @@ mod tests {
             result.unwrap_err(),
             "--embedded-fd and --socket are mutually exclusive"
         );
+    }
+
+    #[test]
+    fn embedded_fd_requires_a_connected_unix_stream() {
+        let file = tempfile::tempfile().unwrap();
+        assert!(validate_embedded_socket(file.as_raw_fd()).is_err());
+
+        let datagram = std::os::unix::net::UnixDatagram::unbound().unwrap();
+        assert!(validate_embedded_socket(datagram.as_raw_fd()).is_err());
+
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        assert!(validate_embedded_socket(stream.as_raw_fd()).is_ok());
     }
 
     /// The bug: `--socket /tmp/x.sock` puts the socket's parent at `/tmp` —

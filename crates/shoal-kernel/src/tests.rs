@@ -5077,10 +5077,20 @@ fn complete_and_explain_methods() {
     let kernel = Kernel::new();
     let (mut client, mut reader, thread) = spawn(&kernel);
     attach(&mut client, &mut reader);
-    let c = call(
+    let invalid_cursor = call(
         &mut client,
         &mut reader,
         2,
+        "complete",
+        json!({"src":"é","cursor":1}),
+    )
+    .error
+    .expect("mid-codepoint completion cursor must be rejected");
+    assert_eq!(invalid_cursor.code, INVALID_PARAMS);
+    let c = call(
+        &mut client,
+        &mut reader,
+        3,
         "complete",
         json!({"src":"le","cursor":2}),
     )
@@ -5097,7 +5107,7 @@ fn complete_and_explain_methods() {
     let ex = call(
         &mut client,
         &mut reader,
-        3,
+        4,
         "explain",
         json!({"src":"rm gone.txt"}),
     )

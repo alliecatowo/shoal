@@ -376,7 +376,9 @@ pub struct ExecResult {
 /// while `SIG_IGN` would persist across exec — so spawned children still get the
 /// default disposition, which is exactly what lets Ctrl-Z stop them on their pty.
 /// Idempotent; a host (the REPL) calls this once at startup when interactive.
-pub fn install_shell_job_control_signals() {
+/// OS refusal is surfaced so the shell never claims job-control safety while
+/// still carrying the default stop dispositions.
+pub fn install_shell_job_control_signals() -> io::Result<()> {
     extern "C" fn noop(_sig: libc::c_int) {}
     for sig in [libc::SIGTSTP, libc::SIGTTOU, libc::SIGTTIN] {
         // SAFETY: installing a trivial (empty, async-signal-safe) handler with a
@@ -384,11 +386,16 @@ pub fn install_shell_job_control_signals() {
         unsafe {
             let mut sa: libc::sigaction = std::mem::zeroed();
             sa.sa_sigaction = noop as *const () as usize;
-            libc::sigemptyset(&raw mut sa.sa_mask);
+            if libc::sigemptyset(&raw mut sa.sa_mask) == -1 {
+                return Err(io::Error::last_os_error());
+            }
             sa.sa_flags = libc::SA_RESTART;
-            libc::sigaction(sig, &raw const sa, std::ptr::null_mut());
+            if libc::sigaction(sig, &raw const sa, std::ptr::null_mut()) == -1 {
+                return Err(io::Error::last_os_error());
+            }
         }
     }
+    Ok(())
 }
 
 /// Send `SIGTSTP` to a whole process group (`kill(-pgid, SIGTSTP)`) — the job-
