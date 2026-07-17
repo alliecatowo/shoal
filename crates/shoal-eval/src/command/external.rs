@@ -1,6 +1,7 @@
 //! External-process spawning, policy gating, and outcome construction.
 
 use super::*;
+use std::io::Read as _;
 
 #[derive(Clone, Copy)]
 enum ProcessMode {
@@ -369,7 +370,8 @@ impl Evaluator {
     /// a bare name via the ambient `$PATH` (`which`) — returning reef/leash's
     /// blake3-hex so a pin copied from `reef`/`which` output compares equal.
     /// `None` when the binary can't be located or read. Reads through the `Fs`
-    /// port so it stays testable without touching a real binary.
+    /// port in fixed chunks so policy preflight cannot retain an executable-
+    /// sized allocation.
     pub(crate) fn hash_resolved_bin(&self, argv0: &OsStr) -> Option<String> {
         let candidate = Path::new(argv0);
         let resolved = if candidate.is_absolute() {
@@ -377,8 +379,20 @@ impl Evaluator {
         } else {
             self.ambient_which(&argv0.to_string_lossy())?
         };
-        let bytes = self.host.fs.read(&resolved).ok()?;
-        Some(shoal_reef::hashcache::hash_bytes(&bytes))
+        if !self.host.fs.metadata(&resolved).ok()?.is_file() {
+            return None;
+        }
+        let mut file = self.host.fs.open_read(&resolved).ok()?;
+        let mut hasher = blake3::Hasher::new();
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let count = file.read(&mut buffer).ok()?;
+            if count == 0 {
+                break;
+            }
+            hasher.update(&buffer[..count]);
+        }
+        Some(hasher.finalize().to_hex().to_string())
     }
 }
 

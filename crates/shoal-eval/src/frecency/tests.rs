@@ -629,6 +629,11 @@ fn production_evaluator_has_only_explicit_ambient_filesystem_exceptions() {
             line: None,
             text: "metadata.is_file() && metadata.permissions().mode() & 0o111 != 0",
         },
+        ExpectedLine {
+            file: "command/external.rs",
+            line: None,
+            text: "if !self.host.fs.metadata(&resolved).ok()?.is_file() {",
+        },
     ];
 
     // The only ambient filesystem operations in evaluator production:

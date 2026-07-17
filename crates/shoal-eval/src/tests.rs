@@ -1032,6 +1032,34 @@ fn hash_resolved_bin_matches_reef_and_leash_encoding() {
     assert_eq!(got, shoal_leash::preflight_spawn(&bin, &[]).unwrap().hash);
 }
 
+#[test]
+fn hash_resolved_bin_streams_multi_chunk_files_and_rejects_directories() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("large-toolbin");
+    let bytes = vec![b'z'; 3 * 64 * 1024 + 19];
+    std::fs::write(&bin, &bytes).unwrap();
+    let evaluator = Evaluator::new(dir.path().into());
+    assert_eq!(
+        evaluator
+            .hash_resolved_bin(OsStr::new(bin.as_os_str()))
+            .unwrap(),
+        blake3::hash(&bytes).to_hex().to_string()
+    );
+    assert!(
+        evaluator
+            .hash_resolved_bin(OsStr::new(dir.path().as_os_str()))
+            .is_none()
+    );
+}
+
+#[test]
+fn production_spawn_gate_hashing_does_not_use_whole_file_fs_read() {
+    let source = include_str!("command/external.rs");
+    let production = source.split("#[cfg(test)]").next().unwrap();
+    assert!(!production.contains("self.host.fs.read(&resolved)"));
+    assert!(production.contains("[0u8; 64 * 1024]"));
+}
+
 /// The security-critical gate, exercised directly (a full external spawn is
 /// awkward in-harness): no policy and no-`proc_spawn` policy both allow every
 /// spawn (the no-regression guarantee); a pinned allowlist admits only the
