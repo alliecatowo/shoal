@@ -41,7 +41,6 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 pub struct Kernel {
     sessions: SessionRegistry,
     connections: ConnectionRegistry,
-    max_tasks_per_session: AtomicUsize,
     max_ptys_per_session: AtomicUsize,
     max_subscriptions_per_session: AtomicUsize,
     journal: Mutex<Journal>,
@@ -59,9 +58,7 @@ pub struct Kernel {
     /// immutable plan contents; this counter makes repeated storage of the
     /// exact same plan a distinct object instead of replacing the first one.
     next_plan: AtomicU64,
-    tasks: Mutex<HashMap<Ref, Arc<TaskEntry>>>,
-    task_slots: Arc<SessionQuota>,
-    next_task: AtomicU64,
+    tasks: TaskRegistry,
     /// Long-lived interactive PTY sessions (site/content/internals/kernel-protocol.md), keyed by their
     /// `pty:{id}` ref like `tasks`. Each holds a live child on a real PTY plus
     /// its `vt100` emulator; scoped to the session that opened it. Dropped (and
@@ -309,8 +306,6 @@ impl Drop for QuotaPermit {
     }
 }
 
-const MAX_FINISHED_TASKS_PER_SESSION: usize = 512;
-const TASK_RETENTION_NS: i64 = 24 * 60 * 60 * 1_000_000_000;
 const MAX_TERMINAL_PTYS_PER_SESSION: usize = 64;
 const PLAN_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 const MAX_STORED_PLANS_PER_OWNER: usize = 256;
@@ -409,7 +404,6 @@ impl Kernel {
                 limits.max_connections,
                 limits.frame_read_timeout_ms,
             ),
-            max_tasks_per_session: AtomicUsize::new(limits.max_tasks_per_session),
             max_ptys_per_session: AtomicUsize::new(limits.max_ptys_per_session),
             max_subscriptions_per_session: AtomicUsize::new(limits.max_subscriptions_per_session),
             journal: Mutex::new(Journal::in_memory().expect("in-memory journal")),
@@ -417,9 +411,7 @@ impl Kernel {
             policy: permissive_policy(),
             plans: Mutex::new(HashMap::new()),
             next_plan: AtomicU64::new(1),
-            tasks: Mutex::new(HashMap::new()),
-            task_slots: Arc::new(SessionQuota::default()),
-            next_task: AtomicU64::new(1),
+            tasks: TaskRegistry::new(limits.max_tasks_per_session),
             ptys: Mutex::new(HashMap::new()),
             pty_slots: Arc::new(SessionQuota::default()),
             next_pty: AtomicU64::new(1),
@@ -450,7 +442,6 @@ impl Kernel {
                 limits.max_connections,
                 limits.frame_read_timeout_ms,
             ),
-            max_tasks_per_session: AtomicUsize::new(limits.max_tasks_per_session),
             max_ptys_per_session: AtomicUsize::new(limits.max_ptys_per_session),
             max_subscriptions_per_session: AtomicUsize::new(limits.max_subscriptions_per_session),
             journal: Mutex::new(journal),
@@ -458,9 +449,7 @@ impl Kernel {
             policy: permissive_policy(),
             plans: Mutex::new(HashMap::new()),
             next_plan: AtomicU64::new(1),
-            tasks: Mutex::new(HashMap::new()),
-            task_slots: Arc::new(SessionQuota::default()),
-            next_task: AtomicU64::new(1),
+            tasks: TaskRegistry::new(limits.max_tasks_per_session),
             ptys: Mutex::new(HashMap::new()),
             pty_slots: Arc::new(SessionQuota::default()),
             next_pty: AtomicU64::new(1),
@@ -488,7 +477,6 @@ impl Kernel {
                 limits.max_connections,
                 limits.frame_read_timeout_ms,
             ),
-            max_tasks_per_session: AtomicUsize::new(limits.max_tasks_per_session),
             max_ptys_per_session: AtomicUsize::new(limits.max_ptys_per_session),
             max_subscriptions_per_session: AtomicUsize::new(limits.max_subscriptions_per_session),
             journal: Mutex::new(journal),
@@ -496,9 +484,7 @@ impl Kernel {
             policy,
             plans: Mutex::new(HashMap::new()),
             next_plan: AtomicU64::new(1),
-            tasks: Mutex::new(HashMap::new()),
-            task_slots: Arc::new(SessionQuota::default()),
-            next_task: AtomicU64::new(1),
+            tasks: TaskRegistry::new(limits.max_tasks_per_session),
             ptys: Mutex::new(HashMap::new()),
             pty_slots: Arc::new(SessionQuota::default()),
             next_pty: AtomicU64::new(1),
@@ -518,7 +504,6 @@ impl Kernel {
                 limits.max_connections,
                 limits.frame_read_timeout_ms,
             ),
-            max_tasks_per_session: AtomicUsize::new(limits.max_tasks_per_session),
             max_ptys_per_session: AtomicUsize::new(limits.max_ptys_per_session),
             max_subscriptions_per_session: AtomicUsize::new(limits.max_subscriptions_per_session),
             journal: Mutex::new(Journal::in_memory().expect("in-memory journal")),
@@ -526,9 +511,7 @@ impl Kernel {
             policy,
             plans: Mutex::new(HashMap::new()),
             next_plan: AtomicU64::new(1),
-            tasks: Mutex::new(HashMap::new()),
-            task_slots: Arc::new(SessionQuota::default()),
-            next_task: AtomicU64::new(1),
+            tasks: TaskRegistry::new(limits.max_tasks_per_session),
             ptys: Mutex::new(HashMap::new()),
             pty_slots: Arc::new(SessionQuota::default()),
             next_pty: AtomicU64::new(1),
@@ -543,8 +526,7 @@ impl Kernel {
     pub fn configure_limits(&self, limits: Limits) {
         self.connections
             .configure(limits.max_connections, limits.frame_read_timeout_ms);
-        self.max_tasks_per_session
-            .store(limits.max_tasks_per_session, Ordering::Relaxed);
+        self.tasks.configure(limits.max_tasks_per_session);
         self.max_ptys_per_session
             .store(limits.max_ptys_per_session, Ordering::Relaxed);
         self.max_subscriptions_per_session
@@ -656,16 +638,7 @@ impl Kernel {
     }
 
     fn task(&self, task: &Ref) -> Result<Arc<TaskEntry>, RpcError> {
-        self.tasks
-            .lock()
-            .unwrap()
-            .get(task)
-            .cloned()
-            .ok_or_else(|| RpcError {
-                code: UNKNOWN_TASK,
-                message: "unknown task ref".into(),
-                data: None,
-            })
+        self.tasks.get(task)
     }
 
     /// Look up a live PTY session by ref, enforcing that it belongs to the
@@ -700,62 +673,7 @@ impl Kernel {
     }
 
     fn reap_finished_tasks(&self, owner: &OwnerKey) {
-        // Registry locks never nest with per-task locks: snapshot Arc handles,
-        // inspect their independent state, then conditionally remove only the
-        // exact entries observed. This is the canonical registry -> object
-        // lock-order pattern used by the kernel's resource registries.
-        let entries = self
-            .tasks
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(_, task)| &task.owner == owner)
-            .map(|(task_ref, task)| (task_ref.clone(), task.clone()))
-            .collect::<Vec<_>>();
-        let cutoff = now_ns().saturating_sub(TASK_RETENTION_NS);
-        let mut finished = entries
-            .into_iter()
-            .filter_map(|(task_ref, task)| {
-                let finished_ns = task.inner.lock().unwrap().finished_ns;
-                finished_ns.map(|finished_ns| (task_ref, task, finished_ns))
-            })
-            .collect::<Vec<_>>();
-        finished.sort_unstable_by_key(|(_, _, finished_ns)| *finished_ns);
-        let retained = finished
-            .iter()
-            .filter(|(_, _, finished_ns)| *finished_ns >= cutoff)
-            .count();
-        let over_cap = retained.saturating_sub(MAX_FINISHED_TASKS_PER_SESSION);
-        let mut retained_removed = 0usize;
-        let remove = finished
-            .into_iter()
-            .filter(|(_, _, finished_ns)| {
-                if *finished_ns < cutoff {
-                    true
-                } else if retained_removed < over_cap {
-                    retained_removed += 1;
-                    true
-                } else {
-                    false
-                }
-            })
-            .collect::<Vec<_>>();
-        if remove.is_empty() {
-            return;
-        }
-        let removed = {
-            let mut tasks = self.tasks.lock().unwrap();
-            remove
-                .into_iter()
-                .filter_map(|(task_ref, observed, _)| {
-                    tasks
-                        .get(&task_ref)
-                        .is_some_and(|current| Arc::ptr_eq(current, &observed))
-                        .then(|| tasks.remove(&task_ref).expect("task was just observed"))
-                })
-                .collect::<Vec<_>>()
-        };
-        drop(removed);
+        self.tasks.reap_finished(owner);
     }
 
     /// Detect self-exited PTYs, release their active/session leases, and bound
@@ -1571,6 +1489,24 @@ mod tests {
         let principal = "agent:bounded-sessions";
         let first = kernel.session("s0", principal).unwrap();
         let first_owner = first.key.owner();
+        let stale_task_ref = Ref::new("task", 9090);
+        kernel.tasks.insert(Arc::new(TaskEntry {
+            task: stale_task_ref.clone(),
+            owner: first_owner.clone(),
+            session_id: first.id.clone(),
+            session_lease: Mutex::new(None),
+            started_ns: now_ns(),
+            inner: Mutex::new(TaskInner {
+                state: "completed",
+                finished_ns: Some(now_ns()),
+                result_ref: None,
+                error: None,
+                active_slot: None,
+            }),
+            done: Condvar::new(),
+            cancel: shoal_exec::CancelToken::new(),
+            cancel_requested: AtomicBool::new(false),
+        }));
         drop(first);
         std::thread::sleep(std::time::Duration::from_millis(1));
         for i in 1..MAX_SESSIONS_PER_PRINCIPAL {
@@ -1595,6 +1531,10 @@ mod tests {
             kernel.events.journal_published_count(&first_owner),
             0,
             "eviction removes the old owner's in-memory event indexes"
+        );
+        assert!(
+            !kernel.tasks.contains(&stale_task_ref),
+            "eviction removes terminal task metadata tied to the old transcript"
         );
 
         let active_kernel = Kernel::new();
@@ -1621,26 +1561,23 @@ mod tests {
         let task_ref = Ref::new("task", 4242);
         let alpha_owner = alpha.key.owner();
         let alpha_session_id = alpha.id.clone();
-        kernel.tasks.lock().unwrap().insert(
-            task_ref.clone(),
-            Arc::new(TaskEntry {
-                task: task_ref.clone(),
-                owner: alpha_owner,
-                session_id: alpha_session_id,
-                session_lease: Mutex::new(None),
-                started_ns: now_ns(),
-                inner: Mutex::new(TaskInner {
-                    state: "completed",
-                    finished_ns: Some(now_ns()),
-                    result_ref: None,
-                    error: None,
-                    active_slot: None,
-                }),
-                done: Condvar::new(),
-                cancel: shoal_exec::CancelToken::new(),
-                cancel_requested: AtomicBool::new(false),
+        kernel.tasks.insert(Arc::new(TaskEntry {
+            task: task_ref.clone(),
+            owner: alpha_owner,
+            session_id: alpha_session_id,
+            session_lease: Mutex::new(None),
+            started_ns: now_ns(),
+            inner: Mutex::new(TaskInner {
+                state: "completed",
+                finished_ns: Some(now_ns()),
+                result_ref: None,
+                error: None,
+                active_slot: None,
             }),
-        );
+            done: Condvar::new(),
+            cancel: shoal_exec::CancelToken::new(),
+            cancel_requested: AtomicBool::new(false),
+        }));
         let mut attached = Some(Attachment {
             session: beta,
             principal: "agent:beta".into(),
@@ -1772,9 +1709,9 @@ mod tests {
         assert_eq!(Arc::strong_count(&session), baseline + 1);
         task.release_session_lease();
         assert_eq!(Arc::strong_count(&session), baseline);
-        kernel.tasks.lock().unwrap().insert(task_ref.clone(), task);
+        kernel.tasks.insert(task);
         kernel.reap_finished_tasks(&owner);
-        assert!(!kernel.tasks.lock().unwrap().contains_key(&task_ref));
+        assert!(!kernel.tasks.contains(&task_ref));
     }
 
     #[test]

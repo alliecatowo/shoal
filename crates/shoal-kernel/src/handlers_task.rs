@@ -13,14 +13,7 @@ impl Kernel {
         let session = &attachment.session;
         let owner = session.key.owner();
         self.reap_finished_tasks(&owner);
-        let tasks: Vec<_> = self
-            .tasks
-            .lock()
-            .unwrap()
-            .values()
-            .filter(|task| task.owner == owner)
-            .cloned()
-            .collect();
+        let tasks = self.tasks.snapshot_owner(&owner);
         let records = tasks.iter().map(task_record).collect::<Vec<_>>();
         encode(records)
     }

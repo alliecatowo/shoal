@@ -20,12 +20,7 @@ impl Kernel {
         // never a blocked context. A bare timeout runs the work on a
         // task and waits up to the deadline for a fast inline answer.
         if params.asynchronous || params.timeout_ms.is_some() {
-            let active_slot = self.task_slots.reserve(
-                &session.key.owner(),
-                self.max_tasks_per_session.load(Ordering::Relaxed),
-                "tasks_per_session",
-                "task",
-            )?;
+            let active_slot = self.tasks.reserve(&session.key.owner())?;
             let elide_spec = params.elide;
             let wait = params.timeout_ms.map(std::time::Duration::from_millis);
             let is_background = params.asynchronous;
@@ -40,8 +35,7 @@ impl Kernel {
             // it directly instead of re-deriving it from `task_ref.0` (which
             // is already the `task:N`-prefixed ref string and would double
             // the prefix).
-            let task_id = self.next_task.fetch_add(1, Ordering::Relaxed);
-            let task_ref = Ref::new("task", task_id);
+            let (task_id, task_ref) = self.tasks.allocate();
             let task_owner = session.key.owner();
             let task = Arc::new(TaskEntry {
                 task: task_ref.clone(),
@@ -60,10 +54,7 @@ impl Kernel {
                 cancel: cancel.clone(),
                 cancel_requested: AtomicBool::new(false),
             });
-            self.tasks
-                .lock()
-                .unwrap()
-                .insert(task_ref.clone(), task.clone());
+            self.tasks.insert(task.clone());
             let waiter = task.clone();
             let worker_session = session.clone();
             let kernel = self.clone();
@@ -178,7 +169,7 @@ impl Kernel {
                     worker_guard.disarm();
                 });
             if let Err(error) = spawn_result {
-                self.tasks.lock().unwrap().remove(&task_ref);
+                self.tasks.remove(&task_ref);
                 return Err(internal(error));
             }
             let events_channel = format!("task.{task_id}");

@@ -196,7 +196,10 @@ impl Kernel {
                     next_value: AtomicU64::new(1),
                 }))
             },
-            |owner| self.events.remove_owner(owner),
+            |owner| {
+                self.events.remove_owner(owner);
+                self.tasks.remove_terminal_owner(owner);
+            },
         )
     }
 
