@@ -31,6 +31,45 @@ pub(crate) struct Session {
     pub(crate) next_value: AtomicU64,
 }
 
+/// Bounded transcript retention (site/content/internals/hardening-roadmap.md HR-E4; deep-audit H5):
+/// keep at most this many of a session's most-recently-created `out[n]`
+/// values addressable at once. `out` refs are assigned from a single
+/// monotonic counter (`Session::next_value`), so "most recent N" is exactly
+/// "the N highest-numbered refs" — generous enough that any realistic
+/// short-lived cross-reference (an agent immediately following up on a value
+/// it just got back) stays well inside the window, while an unbounded
+/// long-lived session's transcript no longer grows forever. Chosen
+/// conservatively per this task's own directive ("generous retention,
+/// correctness first"): every existing kernel test that creates transcript
+/// entries stays comfortably under this cap.
+pub(crate) const MAX_TRANSCRIPT_PER_SESSION: usize = 4096;
+
+impl Session {
+    /// Evict the oldest entries from this session's transcript once it grows
+    /// past [`MAX_TRANSCRIPT_PER_SESSION`], keeping the highest-numbered
+    /// (most recently created) `out[n]` refs. A no-op well under the cap —
+    /// the common case for any session that hasn't been running a very long
+    /// time. Called after every dispatched request on this session
+    /// (`Kernel::handle_stream`'s post-dispatch GC sweep), so growth is
+    /// bounded continuously rather than requiring any cooperation from the
+    /// handler that actually inserts transcript entries.
+    pub(crate) fn gc_transcript(&self) {
+        let mut transcript = self.transcript.lock_recover();
+        if transcript.len() <= MAX_TRANSCRIPT_PER_SESSION {
+            return;
+        }
+        let mut ids: Vec<u64> = transcript
+            .keys()
+            .filter_map(|r| r.0.rsplit_once(':').and_then(|(_, n)| n.parse().ok()))
+            .collect();
+        ids.sort_unstable();
+        let evict = ids.len() - MAX_TRANSCRIPT_PER_SESSION;
+        for id in &ids[..evict] {
+            transcript.remove(&Ref::new("out", *id));
+        }
+    }
+}
+
 impl Kernel {
     /// Get-or-create the named session. `principal` is only consulted the
     /// FIRST time this session name is created (an already-cached session

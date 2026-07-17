@@ -147,6 +147,12 @@ pub mod error_code {
     /// kernel has no `TokenStore` configured at all (an ephemeral kernel),
     /// or the given token is missing/expired/revoked.
     pub const AUTH_FAILED: i32 = -32030;
+    /// A resource quota was reached (site/content/internals/hardening-roadmap.md HR-E3; deep-audit
+    /// findings H3, H5): the kernel-wide concurrent-connection cap, or a
+    /// per-session cap on background tasks, live PTYs, or event
+    /// subscriptions. **Overloaded** across those four distinct limits — the
+    /// `message`/`data` on each `RpcError` names which one was hit.
+    pub const QUOTA_EXCEEDED: i32 = -32040;
 }
 
 impl Response {
@@ -761,5 +767,6 @@ mod tests {
         assert_eq!(UNKNOWN_PTY, -32022);
         assert_eq!(PTY_SPAWN_FAILED, -32023);
         assert_eq!(AUTH_FAILED, -32030);
+        assert_eq!(QUOTA_EXCEEDED, -32040);
     }
 }

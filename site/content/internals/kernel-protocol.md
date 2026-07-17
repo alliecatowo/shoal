@@ -339,6 +339,47 @@ PTY records instead own one concrete long-lived `PtySession`. Methods are sessio
 return a bounded rendered screen, cursor, change bit, liveness, and exit state—not raw escape bytes.
 PTY entries and task entries are in-memory only.
 
+## Limits, quotas, and lifecycle GC
+
+`shoal-kernel` bounds four kinds of resource growth so a misbehaving or malicious client cannot
+exhaust the daemon (site/content/internals/hardening-roadmap.md HR-E3/HR-E4; deep-audit findings H3, H5):
+
+| Limit | Default | Scope | Enforced by |
+|---|---:|---|---|
+| concurrent connections | 64 | kernel-wide | `serve_until`'s accept loop |
+| background/timed tasks | 128 | per session | `Kernel::check_task_quota` (mechanism; see status below) |
+| live PTYs | 32 | per session | `Kernel::check_pty_quota` (mechanism; see status below) |
+| event subscriptions | 256 | per session | `EventBus::subscribe` |
+
+A connection over the connection cap is accepted, sent one `QUOTA_EXCEEDED` (`-32040`) frame naming
+the limit (`id: null`, since it never sent a request), and closed — never silently hung or dropped.
+A rejected subscription gets the same error code on the `events.subscribe` response, without
+registering a subscriber. All four defaults are `shoal_kernel::Limits`, overridable per kernel via
+`Kernel::configure_limits` (called from `shoal-kernel`'s own CLI: `--max-connections`,
+`--max-tasks-per-session`, `--max-ptys-per-session`, `--max-subscriptions-per-session`).
+
+As of this writing, connection and subscription quotas are enforced in production request handling;
+the task and PTY quota CHECKS exist and are unit-tested but are not yet called from
+`handle_exec`'s background-task path or `handle_pty_open` (both outside the kernel-lock/quota/GC
+work's file scope) — wiring one guard call into each is tracked follow-up work.
+
+Independently of quotas, a long-lived session's own state is bounded by lifecycle GC, run after every
+dispatched request rather than on a timer:
+
+| What | Default | Rule |
+|---|---:|---|
+| session transcript (`out[n]` values) | 4096 entries | keep the highest-numbered (most recent) refs |
+| finished tasks per session | 512 entries | reap oldest-finished first; a `running` task is never reaped |
+| stored plan TTL | 24 hours | expire a plan once its recorded age exceeds the TTL |
+
+Transcript and task GC are fully active. Plan expiry additionally depends on a creation-time being
+recorded for each plan (`Kernel::note_plan_created`) at the point a plan is stored — that one call is
+not yet wired into `handlers_exec.rs`'s plan-storage path, so today no plan is ever recorded as aged
+and `gc_plans` is a safe no-op; once wired, the default 24h TTL takes effect. None of these defaults
+retroactively break ref-addressability: a value, task, or plan referenced shortly after creation stays
+resolvable well inside its retention window (see `shoal-kernel`'s `gc_transcript_evicts_oldest_beyond_the_cap_but_keeps_recent_refs_addressable`
+test).
+
 ## Error taxonomy
 
 The protocol centralizes numeric codes in `shoal-proto`:
@@ -354,6 +395,7 @@ The protocol centralizes numeric codes in `shoal-proto`:
 | -32020/-32021 | task control unavailable / unknown task | tasks |
 | -32022/-32023 | unknown PTY / PTY spawn failed | PTYs |
 | -32030 | auth failed | token attachment |
+| -32040 | `QUOTA_EXCEEDED` | connection/task/PTY/subscription quota (see "Limits, quotas, and lifecycle GC") |
 
 Some codes intentionally cover related cases; preserve numbers and structured `data` compatibility.
 Source: [`shoal-proto`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-proto/src/lib.rs).

@@ -32,7 +32,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -56,9 +56,45 @@ impl<T> LockExt<T> for Mutex<T> {
     }
 }
 
+/// Quota defaults (site/content/internals/hardening-roadmap.md HR-E3; deep-audit findings H3, H5):
+/// generous enough that a normal single-agent session never comes close,
+/// small enough to bound worst-case resource usage from a misbehaving or
+/// malicious client. See site/content/internals/kernel-protocol.md's limits section for the
+/// documented contract and `shoal-kernel`'s `--max-*` CLI flags for how an
+/// operator overrides them.
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    /// Kernel-wide cap on simultaneously open connections (default 64).
+    pub max_connections: usize,
+    /// Per-session cap on background/timed `exec` tasks (default 128).
+    pub max_tasks_per_session: usize,
+    /// Per-session cap on live interactive PTYs (default 32).
+    pub max_ptys_per_session: usize,
+    /// Per-session cap on live `events.subscribe` subscriptions (default 256).
+    pub max_subscriptions_per_session: usize,
+}
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_connections: 64,
+            max_tasks_per_session: 128,
+            max_ptys_per_session: 32,
+            max_subscriptions_per_session: 256,
+        }
+    }
+}
+
 pub struct Kernel {
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     next_client: AtomicU64,
+    /// Currently-open connections, reserved via `reserve_connection_slot`
+    /// before a handler thread is spawned and released when that thread's
+    /// `handle_stream` call returns (site/content/internals/hardening-roadmap.md HR-E3).
+    active_connections: AtomicUsize,
+    max_connections: AtomicUsize,
+    max_tasks_per_session: AtomicUsize,
+    max_ptys_per_session: AtomicUsize,
+    max_subscriptions_per_session: AtomicUsize,
     journal: Mutex<Journal>,
     /// The per-user state dir this kernel's own `journal` (above) was opened
     /// against, if any (`None` for the ephemeral in-memory kernels used by
@@ -70,6 +106,12 @@ pub struct Kernel {
     state_dir: Option<PathBuf>,
     policy: Policy,
     plans: Mutex<HashMap<String, StoredPlan>>,
+    /// Creation time (ns since epoch) for plan-expiry GC
+    /// (site/content/internals/hardening-roadmap.md HR-E4), keyed by `plan_ref`. See
+    /// `note_plan_created`'s doc comment for the integrator wiring note this
+    /// depends on — until wired, a plan simply has no entry here and
+    /// `gc_plans` correctly never expires it.
+    plan_created_ns: Mutex<HashMap<String, i64>>,
     tasks: Mutex<HashMap<Ref, Arc<TaskEntry>>>,
     next_task: AtomicU64,
     /// Long-lived interactive PTY sessions (site/content/internals/kernel-protocol.md), keyed by their
@@ -103,6 +145,19 @@ pub struct Kernel {
 /// from 1 to 2 when `sh_raw` was retired in favor of the general
 /// `lang_block` node — a breaking rename to the AST-kind enum.
 const AST_VERSION: u32 = 2;
+
+/// Completed-task retention cap per session (site/content/internals/hardening-roadmap.md HR-E4;
+/// deep-audit H5). See `Kernel::gc_tasks` for the eviction rule (oldest
+/// finished first, running tasks never touched). Generous per this task's own
+/// directive ("generous retention, correctness first").
+const MAX_FINISHED_TASKS_PER_SESSION: usize = 512;
+
+/// Default TTL for a stored, unapplied plan before it becomes eligible for
+/// expiry (site/content/internals/hardening-roadmap.md HR-E4; deep-audit H5): generous — a plan sits
+/// waiting for `cap.request`/`plan.apply` at conversational timescales, not
+/// months. See `Kernel::note_plan_created`'s doc comment for the integrator
+/// wiring this depends on to take effect at all.
+const PLAN_TTL_NS: i64 = 24 * 60 * 60 * 1_000_000_000;
 
 struct TaskEntry {
     task: Ref,
@@ -171,13 +226,20 @@ struct ApprovalRecord {
 
 impl Kernel {
     pub fn new() -> Arc<Self> {
+        let limits = Limits::default();
         Arc::new(Self {
             sessions: Mutex::new(HashMap::new()),
             next_client: AtomicU64::new(1),
+            active_connections: AtomicUsize::new(0),
+            max_connections: AtomicUsize::new(limits.max_connections),
+            max_tasks_per_session: AtomicUsize::new(limits.max_tasks_per_session),
+            max_ptys_per_session: AtomicUsize::new(limits.max_ptys_per_session),
+            max_subscriptions_per_session: AtomicUsize::new(limits.max_subscriptions_per_session),
             journal: Mutex::new(Journal::in_memory().expect("in-memory journal")),
             state_dir: None,
             policy: default_policy(),
             plans: Mutex::new(HashMap::new()),
+            plan_created_ns: Mutex::new(HashMap::new()),
             tasks: Mutex::new(HashMap::new()),
             next_task: AtomicU64::new(1),
             ptys: Mutex::new(HashMap::new()),
@@ -193,6 +255,7 @@ impl Kernel {
         let state_dir = state_dir.as_ref();
         let journal = Journal::open(state_dir)?;
         let events = EventBus::default();
+        let limits = Limits::default();
         // Reopening an EXISTING on-disk store must resume its
         // `journal`/`session.transcript` seq state, not restart both at 0 —
         // see `EventBus::seed_from_journal` for why (a reconnecting agent's
@@ -204,10 +267,16 @@ impl Kernel {
         Ok(Arc::new(Self {
             sessions: Mutex::new(HashMap::new()),
             next_client: AtomicU64::new(1),
+            active_connections: AtomicUsize::new(0),
+            max_connections: AtomicUsize::new(limits.max_connections),
+            max_tasks_per_session: AtomicUsize::new(limits.max_tasks_per_session),
+            max_ptys_per_session: AtomicUsize::new(limits.max_ptys_per_session),
+            max_subscriptions_per_session: AtomicUsize::new(limits.max_subscriptions_per_session),
             journal: Mutex::new(journal),
             state_dir: Some(state_dir.to_path_buf()),
             policy: default_policy(),
             plans: Mutex::new(HashMap::new()),
+            plan_created_ns: Mutex::new(HashMap::new()),
             tasks: Mutex::new(HashMap::new()),
             next_task: AtomicU64::new(1),
             ptys: Mutex::new(HashMap::new()),
@@ -226,15 +295,22 @@ impl Kernel {
         let state_dir = state_dir.as_ref();
         let journal = Journal::open(state_dir)?;
         let events = EventBus::default();
+        let limits = Limits::default();
         // Same restart-seq-continuity fix as `Kernel::open` above.
         events.seed_from_journal(&journal);
         Ok(Arc::new(Self {
             sessions: Mutex::new(HashMap::new()),
             next_client: AtomicU64::new(1),
+            active_connections: AtomicUsize::new(0),
+            max_connections: AtomicUsize::new(limits.max_connections),
+            max_tasks_per_session: AtomicUsize::new(limits.max_tasks_per_session),
+            max_ptys_per_session: AtomicUsize::new(limits.max_ptys_per_session),
+            max_subscriptions_per_session: AtomicUsize::new(limits.max_subscriptions_per_session),
             journal: Mutex::new(journal),
             state_dir: Some(state_dir.to_path_buf()),
             policy,
             plans: Mutex::new(HashMap::new()),
+            plan_created_ns: Mutex::new(HashMap::new()),
             tasks: Mutex::new(HashMap::new()),
             next_task: AtomicU64::new(1),
             ptys: Mutex::new(HashMap::new()),
@@ -247,13 +323,20 @@ impl Kernel {
     }
 
     pub fn with_policy(policy: Policy) -> Arc<Self> {
+        let limits = Limits::default();
         Arc::new(Self {
             sessions: Mutex::new(HashMap::new()),
             next_client: AtomicU64::new(1),
+            active_connections: AtomicUsize::new(0),
+            max_connections: AtomicUsize::new(limits.max_connections),
+            max_tasks_per_session: AtomicUsize::new(limits.max_tasks_per_session),
+            max_ptys_per_session: AtomicUsize::new(limits.max_ptys_per_session),
+            max_subscriptions_per_session: AtomicUsize::new(limits.max_subscriptions_per_session),
             journal: Mutex::new(Journal::in_memory().expect("in-memory journal")),
             state_dir: None,
             policy,
             plans: Mutex::new(HashMap::new()),
+            plan_created_ns: Mutex::new(HashMap::new()),
             tasks: Mutex::new(HashMap::new()),
             next_task: AtomicU64::new(1),
             ptys: Mutex::new(HashMap::new()),
@@ -263,6 +346,53 @@ impl Kernel {
             allow_self_ack: AtomicBool::new(self_ack_from_env()),
             permissive_mcp_attach: AtomicBool::new(mcp_permissive()),
         })
+    }
+
+    /// Override this kernel's quota limits (site/content/internals/hardening-roadmap.md HR-E3
+    /// defaults) after construction — used by `main.rs` to apply
+    /// CLI-configured overrides, and by tests that need a tiny cap to
+    /// exercise quota rejection without creating hundreds of real
+    /// connections/tasks/ptys/subscriptions. Every existing constructor
+    /// (`new`/`open`/`open_with_policy`/`with_policy`) already starts from
+    /// [`Limits::default`]; this only needs calling to change one or more of
+    /// them.
+    pub fn configure_limits(&self, limits: Limits) {
+        self.max_connections
+            .store(limits.max_connections, Ordering::Relaxed);
+        self.max_tasks_per_session
+            .store(limits.max_tasks_per_session, Ordering::Relaxed);
+        self.max_ptys_per_session
+            .store(limits.max_ptys_per_session, Ordering::Relaxed);
+        self.max_subscriptions_per_session
+            .store(limits.max_subscriptions_per_session, Ordering::Relaxed);
+    }
+
+    /// Atomically claim one of this kernel's `max_connections` slots, or
+    /// fail if the cap is already reached (site/content/internals/hardening-roadmap.md HR-E3;
+    /// deep-audit H3). `Ok(())` means the caller now owns a slot and MUST
+    /// release it exactly once (`serve_until` does so via the `ConnectionSlot`
+    /// RAII guard, which releases even if the handler thread panics).
+    fn reserve_connection_slot(&self) -> Result<(), ()> {
+        let max = self.max_connections.load(Ordering::Relaxed);
+        let mut current = self.active_connections.load(Ordering::Relaxed);
+        loop {
+            if current >= max {
+                return Err(());
+            }
+            match self.active_connections.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn release_connection_slot(&self) {
+        self.active_connections.fetch_sub(1, Ordering::SeqCst);
     }
 
     pub fn serve(self: Arc<Self>, path: impl AsRef<Path>) -> io::Result<()> {
@@ -296,7 +426,20 @@ impl Kernel {
                     // on every platform, instead of racing the client's next
                     // write and getting a transient `WouldBlock` misread as EOF.
                     stream.set_nonblocking(false)?;
+                    // HR-E3: cap concurrent connections so an unbounded number
+                    // of clients cannot exhaust threads/fds. A connection over
+                    // the cap gets a clear protocol error instead of a silent
+                    // hang or an unbounded thread-per-connection pile-up.
+                    if kernel.reserve_connection_slot().is_err() {
+                        let max = kernel.max_connections.load(Ordering::Relaxed);
+                        let _ = reject_connection_over_quota(stream, max);
+                        continue;
+                    }
                     std::thread::spawn(move || {
+                        // Releases the reserved slot on drop — including when
+                        // `handle_stream` panics, so a panicking connection
+                        // still frees its slot rather than leaking it.
+                        let _slot = ConnectionSlot(kernel.clone());
                         let _ = kernel.handle_stream(stream);
                     });
                 }
@@ -323,6 +466,9 @@ impl Kernel {
                     self.dispatch(request, client, &mut attached, Some(&writer))
                 };
                 write_frame(&mut *writer.lock_recover(), &response)?;
+                // HR-E4: session lifecycle GC, run after every request rather
+                // than on a timer (see `gc_sweep`'s own doc comment).
+                self.gc_sweep(attached.as_ref());
             }
             Ok(())
         })();
@@ -358,6 +504,169 @@ impl Kernel {
             return Err(unknown_pty());
         }
         Ok(entry)
+    }
+
+    /// Count of currently-tracked background/timed tasks belonging to
+    /// `session_id` — running or finished-but-not-yet-reaped (see
+    /// `gc_tasks`'s completed-task reaping for why this stays bounded over a
+    /// long session's lifetime rather than growing forever).
+    fn tasks_for_session(&self, session_id: &str) -> usize {
+        self.tasks
+            .lock_recover()
+            .values()
+            .filter(|t| t.session.id == session_id)
+            .count()
+    }
+
+    /// `Ok(())` when `session_id` is under its per-session task quota
+    /// (site/content/internals/hardening-roadmap.md HR-E3; deep-audit H3); otherwise a clear
+    /// `QUOTA_EXCEEDED` protocol error. **Wiring note for the integrator**:
+    /// this check exists (and is exercised directly by
+    /// `check_task_quota_rejects_at_the_per_session_cap`) but is not yet
+    /// called from production request handling — `handle_exec`'s
+    /// background/timed-task path (`handlers_exec.rs`, outside this lane's
+    /// file scope) must call it BEFORE constructing a new `TaskEntry` and
+    /// inserting it into `self.tasks`, returning the error instead of
+    /// spawning the task when it fails. `#[allow(dead_code)]` is temporary:
+    /// remove it in the same change that adds that call.
+    #[allow(dead_code)]
+    pub(crate) fn check_task_quota(&self, session_id: &str) -> Result<(), RpcError> {
+        let max = self.max_tasks_per_session.load(Ordering::Relaxed);
+        if self.tasks_for_session(session_id) >= max {
+            return Err(RpcError {
+                code: QUOTA_EXCEEDED,
+                message: format!("session has reached the {max}-task limit"),
+                data: Some(json!({"limit": "tasks_per_session", "max": max})),
+            });
+        }
+        Ok(())
+    }
+
+    /// Count of currently-open PTYs belonging to `session_id`.
+    fn ptys_for_session(&self, session_id: &str) -> usize {
+        self.ptys
+            .lock_recover()
+            .values()
+            .filter(|p| p.session_id == session_id)
+            .count()
+    }
+
+    /// `Ok(())` when `session_id` is under its per-session PTY quota
+    /// (site/content/internals/hardening-roadmap.md HR-E3; deep-audit H3); otherwise a clear
+    /// `QUOTA_EXCEEDED` protocol error. **Wiring note for the integrator**:
+    /// like `check_task_quota`, this is exercised directly by a test but not
+    /// yet called from production request handling — `handle_pty_open`
+    /// (`handlers_pty.rs`, outside this lane's file scope) must call it
+    /// BEFORE spawning the child/PTY pair and inserting a new `PtyEntry` into
+    /// `self.ptys`. `#[allow(dead_code)]` is temporary: remove it in the same
+    /// change that adds that call.
+    #[allow(dead_code)]
+    pub(crate) fn check_pty_quota(&self, session_id: &str) -> Result<(), RpcError> {
+        let max = self.max_ptys_per_session.load(Ordering::Relaxed);
+        if self.ptys_for_session(session_id) >= max {
+            return Err(RpcError {
+                code: QUOTA_EXCEEDED,
+                message: format!("session has reached the {max}-PTY limit"),
+                data: Some(json!({"limit": "ptys_per_session", "max": max})),
+            });
+        }
+        Ok(())
+    }
+
+    /// Session-lifecycle GC (site/content/internals/hardening-roadmap.md HR-E4; deep-audit H5): bounds
+    /// three kinds of otherwise-unbounded growth in a long-lived kernel
+    /// process — the attached session's transcript, finished tasks, and
+    /// stored plans. Run after every dispatched request (`handle_stream`)
+    /// rather than on a timer: cheap, idempotent, briefly-locked scans, no
+    /// background thread to start/stop/leak. `attached` is `None` before the
+    /// connection's first `session.attach`, in which case only the
+    /// kernel-wide sweeps run.
+    fn gc_sweep(&self, attached: Option<&Attachment>) {
+        if let Some(attachment) = attached {
+            attachment.session.gc_transcript();
+        }
+        self.gc_tasks();
+        self.gc_plans();
+    }
+
+    /// Reap old completed/failed/cancelled tasks once a session's
+    /// finished-task count exceeds [`MAX_FINISHED_TASKS_PER_SESSION`],
+    /// keeping the most-recently-finished ones (site/content/internals/hardening-roadmap.md HR-E4;
+    /// deep-audit H5). A task still `state == "running"` is NEVER reaped by
+    /// this, regardless of age — only entries a client could no longer
+    /// plausibly be waiting on are eligible. A no-op for any session well
+    /// under the cap.
+    fn gc_tasks(&self) {
+        let mut tasks = self.tasks.lock_recover();
+        // Group finished task refs by session so the cap applies PER
+        // session — one busy session must not starve another session's
+        // retention window.
+        let mut finished_by_session: HashMap<String, Vec<(Ref, i64)>> = HashMap::new();
+        for (task_ref, entry) in tasks.iter() {
+            let finished_ns = entry.inner.lock_recover().finished_ns;
+            if let Some(finished_ns) = finished_ns {
+                finished_by_session
+                    .entry(entry.session.id.clone())
+                    .or_default()
+                    .push((task_ref.clone(), finished_ns));
+            }
+        }
+        let mut to_remove = Vec::new();
+        for mut entries in finished_by_session.into_values() {
+            if entries.len() <= MAX_FINISHED_TASKS_PER_SESSION {
+                continue;
+            }
+            entries.sort_unstable_by_key(|(_, finished_ns)| *finished_ns);
+            let evict = entries.len() - MAX_FINISHED_TASKS_PER_SESSION;
+            to_remove.extend(entries.into_iter().take(evict).map(|(r, _)| r));
+        }
+        for task_ref in to_remove {
+            tasks.remove(&task_ref);
+        }
+    }
+
+    /// Record `plan_ref`'s creation time for plan-expiry GC (see
+    /// [`Kernel::gc_plans`]; site/content/internals/hardening-roadmap.md HR-E4). **Wiring note for
+    /// the integrator**: call this once, right after
+    /// `self.plans.lock_recover().insert(plan_ref.clone(), StoredPlan{..})`
+    /// in `handlers_exec.rs`'s plan-storage call site (outside this lane's
+    /// file scope). Until that call lands, a stored plan simply has no entry
+    /// here, and `gc_plans` correctly never expires a plan it has no
+    /// recorded age for — a safe, conservative default ("generous retention,
+    /// correctness first"), not silent breakage. `#[allow(dead_code)]` is
+    /// temporary: remove it in the same change that adds that call.
+    #[allow(dead_code)]
+    pub(crate) fn note_plan_created(&self, plan_ref: &str) {
+        self.plan_created_ns
+            .lock_recover()
+            .insert(plan_ref.to_string(), now_ns());
+    }
+
+    /// Expire stored plans older than [`PLAN_TTL_NS`] (site/content/internals/hardening-roadmap.md
+    /// HR-E4; deep-audit H5) — but ONLY plans with a recorded creation time
+    /// (see `note_plan_created`'s wiring note above). A plan is a small,
+    /// bounded record, but an agent session that repeatedly plans without
+    /// ever applying or being denied would otherwise accumulate them
+    /// forever.
+    fn gc_plans(&self) {
+        let now = now_ns();
+        let expired: Vec<String> = {
+            let created = self.plan_created_ns.lock_recover();
+            created
+                .iter()
+                .filter(|&(_, &ts)| now.saturating_sub(ts) > PLAN_TTL_NS)
+                .map(|(plan_ref, _)| plan_ref.clone())
+                .collect()
+        };
+        if expired.is_empty() {
+            return;
+        }
+        let mut plans = self.plans.lock_recover();
+        let mut created = self.plan_created_ns.lock_recover();
+        for plan_ref in expired {
+            plans.remove(&plan_ref);
+            created.remove(&plan_ref);
+        }
     }
 
     /// The real enforcement truth for `principal` (site/content/internals/language-conformance-contract.md tier honesty):
@@ -458,6 +767,35 @@ impl Drop for BoundSocket {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
     }
+}
+
+/// RAII guard for one reserved connection slot (site/content/internals/hardening-roadmap.md HR-E3):
+/// releases it on drop, so a `handle_stream` panic (the handler thread
+/// unwinds without ever reaching a manual decrement) still frees the slot
+/// instead of leaking it — and eventually starving every future connection
+/// once enough panics accumulate.
+struct ConnectionSlot(Arc<Kernel>);
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        self.0.release_connection_slot();
+    }
+}
+
+/// Write a single `QUOTA_EXCEEDED` protocol error frame to a connection
+/// rejected purely for being over the concurrent-connection cap
+/// (site/content/internals/hardening-roadmap.md HR-E3) — the client gets a clear, structured reason
+/// rather than a bare close. `id: Null` because the client hasn't sent any
+/// request yet on this brand-new connection to carry a real id.
+fn reject_connection_over_quota(mut stream: UnixStream, max_connections: usize) -> io::Result<()> {
+    write_frame(
+        &mut stream,
+        &Response::err(
+            Json::Null,
+            QUOTA_EXCEEDED,
+            format!("kernel connection limit ({max_connections}) reached"),
+            None,
+        ),
+    )
 }
 
 fn decode<T: serde::de::DeserializeOwned>(value: Json) -> Result<T, RpcError> {
@@ -895,6 +1233,343 @@ mod tests {
         assert_eq!(
             *recovered, 42,
             "lock_recover must return the guarded data as the panicking thread left it"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Quotas (site/content/internals/hardening-roadmap.md HR-E3).
+    // -----------------------------------------------------------------------
+
+    /// A connection past `max_connections` gets a clear `QUOTA_EXCEEDED`
+    /// protocol error instead of being served — proving `reserve_connection_slot`
+    /// / `serve_until`'s accept-loop gate actually rejects, and that freeing a
+    /// slot (closing a connection) lets a subsequent connection back in.
+    #[test]
+    fn serve_until_rejects_connections_past_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("kernel.sock");
+        let kernel = Kernel::new();
+        kernel.configure_limits(Limits {
+            max_connections: 1,
+            ..Limits::default()
+        });
+        let serve_kernel = kernel.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let serve_stop = stop.clone();
+        let serve_sock = sock.clone();
+        let server = std::thread::spawn(move || {
+            let _ = serve_kernel.serve_until(&serve_sock, serve_stop);
+        });
+        // Wait for the listener to come up.
+        let first = loop {
+            if let Ok(s) = UnixStream::connect(&sock) {
+                break s;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let mut first_reader = BufReader::new(first.try_clone().unwrap());
+        // The first connection is under the cap: session.attach succeeds.
+        assert!(
+            call(
+                &mut first.try_clone().unwrap(),
+                &mut first_reader,
+                1,
+                "session.attach",
+                json!({"client":{"kind":"test","tty":false}}),
+            )
+            .error
+            .is_none()
+        );
+        // A second, simultaneous connection is over the 1-connection cap: it
+        // gets a synthesized QUOTA_EXCEEDED frame (id: null, since it never
+        // sent a request) rather than being served.
+        let mut second = UnixStream::connect(&sock).unwrap();
+        let mut line = String::new();
+        std::io::BufRead::read_line(&mut BufReader::new(&mut second), &mut line).unwrap();
+        let rejection: Response = serde_json::from_str(&line).unwrap();
+        assert_eq!(rejection.error.unwrap().code, QUOTA_EXCEEDED);
+        drop(second);
+
+        // Freeing the first connection's slot lets a fresh connection back
+        // in. The server's release of that slot (its handle_stream thread
+        // noticing the EOF and the ConnectionSlot guard dropping) races with
+        // this thread, so retry with a FRESH connection each time — a
+        // connection accepted while the slot is still taken gets the exact
+        // same one-shot rejection frame as `second` above, not a hang.
+        drop(first);
+        drop(first_reader);
+        let mut attached = false;
+        for _ in 0..200 {
+            let Ok(mut attempt) = UnixStream::connect(&sock) else {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                continue;
+            };
+            let mut reader = BufReader::new(attempt.try_clone().unwrap());
+            let resp = call(
+                &mut attempt,
+                &mut reader,
+                1,
+                "session.attach",
+                json!({"client":{"kind":"test","tty":false}}),
+            );
+            if resp.error.is_none() {
+                attached = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            attached,
+            "a connection must be accepted again once a slot frees up"
+        );
+
+        stop.store(true, Ordering::SeqCst);
+        let _ = server.join();
+    }
+
+    /// `check_task_quota` rejects once a session's tracked task count reaches
+    /// the configured per-session cap (site/content/internals/hardening-roadmap.md HR-E3). The
+    /// mechanism is exercised directly here because wiring the actual guard
+    /// call into `handle_exec`'s background-task path lives in
+    /// `handlers_exec.rs`, outside this lane's file scope — see this
+    /// function's own doc comment for the exact wiring note.
+    #[test]
+    fn check_task_quota_rejects_at_the_per_session_cap() {
+        let kernel = Kernel::new();
+        kernel.configure_limits(Limits {
+            max_tasks_per_session: 2,
+            ..Limits::default()
+        });
+        let session = kernel.session("quota-tasks", "human").unwrap();
+        assert!(kernel.check_task_quota(&session.id).is_ok());
+        for i in 0..2u64 {
+            let task_ref = Ref::new("task", i);
+            let entry = Arc::new(TaskEntry {
+                task: task_ref.clone(),
+                session: session.clone(),
+                started_ns: now_ns(),
+                inner: Mutex::new(TaskInner {
+                    state: "running",
+                    finished_ns: None,
+                    result_ref: None,
+                    error: None,
+                }),
+                done: Condvar::new(),
+                cancel: shoal_exec::CancelToken::new(),
+                cancel_requested: AtomicBool::new(false),
+            });
+            kernel.tasks.lock_recover().insert(task_ref, entry);
+        }
+        let err = kernel
+            .check_task_quota(&session.id)
+            .expect_err("quota must reject once the cap is reached");
+        assert_eq!(err.code, QUOTA_EXCEEDED);
+        // A DIFFERENT session is unaffected — the quota is per-session.
+        let other = kernel.session("quota-tasks-other", "human").unwrap();
+        assert!(kernel.check_task_quota(&other.id).is_ok());
+    }
+
+    /// `check_pty_quota` rejects once a session's tracked PTY count reaches
+    /// the configured per-session cap — same shape as the task quota test
+    /// above, and the same wiring note applies (`handle_pty_open` in
+    /// `handlers_pty.rs` must call this before spawning).
+    #[test]
+    fn check_pty_quota_rejects_at_the_per_session_cap() {
+        let kernel = Kernel::new();
+        kernel.configure_limits(Limits {
+            max_ptys_per_session: 1,
+            ..Limits::default()
+        });
+        let session = kernel.session("quota-ptys", "human").unwrap();
+        assert!(kernel.check_pty_quota(&session.id).is_ok());
+        let pty_session = shoal_exec::PtySession::open(shoal_exec::PtyOpenSpec {
+            argv: vec![std::ffi::OsString::from("cat")],
+            cwd: std::env::current_dir().unwrap(),
+            env: vec![],
+            cols: 80,
+            rows: 24,
+            sandbox: None,
+        })
+        .expect("spawn cat on a pty");
+        let pty_ref = Ref::new("pty", 1u64);
+        kernel.ptys.lock_recover().insert(
+            pty_ref,
+            Arc::new(PtyEntry {
+                session_id: session.id.clone(),
+                principal: "human".into(),
+                cmd: "cat".into(),
+                session: Mutex::new(pty_session),
+            }),
+        );
+        let err = kernel
+            .check_pty_quota(&session.id)
+            .expect_err("quota must reject once the cap is reached");
+        assert_eq!(err.code, QUOTA_EXCEEDED);
+    }
+
+    // -----------------------------------------------------------------------
+    // Session lifecycle GC (site/content/internals/hardening-roadmap.md HR-E4).
+    // -----------------------------------------------------------------------
+
+    /// Bounded transcript retention: once a session's transcript grows past
+    /// `MAX_TRANSCRIPT_PER_SESSION`, `gc_transcript` evicts the OLDEST
+    /// (lowest-numbered) entries — but the most recently created ones stay
+    /// addressable, which is exactly the ref-addressability contract this
+    /// task must not break ("recently-referenced values stay addressable
+    /// within the retention window").
+    #[test]
+    fn gc_transcript_evicts_oldest_beyond_the_cap_but_keeps_recent_refs_addressable() {
+        let kernel = Kernel::new();
+        let session = kernel.session("gc-transcript", "human").unwrap();
+        let total = MAX_TRANSCRIPT_PER_SESSION + 10;
+        {
+            let mut transcript = session.transcript.lock_recover();
+            for i in 0..total {
+                transcript.insert(Ref::new("out", i as u64), Value::Int(i as i64));
+            }
+        }
+        session.gc_transcript();
+        let transcript = session.transcript.lock_recover();
+        assert_eq!(transcript.len(), MAX_TRANSCRIPT_PER_SESSION);
+        for i in (total - 10)..total {
+            assert!(
+                transcript.contains_key(&Ref::new("out", i as u64)),
+                "out:{i} was just created — it must stay addressable within the retention window"
+            );
+        }
+        assert!(
+            !transcript.contains_key(&Ref::new("out", 0u64)),
+            "the oldest entry must be the one evicted"
+        );
+    }
+
+    /// A transcript well under the cap is untouched (the common case for any
+    /// normal session).
+    #[test]
+    fn gc_transcript_is_a_no_op_under_the_cap() {
+        let kernel = Kernel::new();
+        let session = kernel.session("gc-transcript-small", "human").unwrap();
+        {
+            let mut transcript = session.transcript.lock_recover();
+            for i in 0..10u64 {
+                transcript.insert(Ref::new("out", i), Value::Int(i as i64));
+            }
+        }
+        session.gc_transcript();
+        assert_eq!(session.transcript.lock_recover().len(), 10);
+    }
+
+    /// Completed-task reaping: a session's finished tasks beyond
+    /// `MAX_FINISHED_TASKS_PER_SESSION` are reaped oldest-first, but a task
+    /// still `state == "running"` is NEVER reaped regardless of age, and a
+    /// DIFFERENT session's finished tasks are unaffected (the cap is
+    /// per-session).
+    #[test]
+    fn gc_tasks_reaps_oldest_finished_but_never_a_running_task() {
+        let kernel = Kernel::new();
+        let session = kernel.session("gc-tasks", "human").unwrap();
+        let other = kernel.session("gc-tasks-other", "human").unwrap();
+        let make_task = |task_id: u64, session: &Arc<Session>, state, finished_ns| {
+            Arc::new(TaskEntry {
+                task: Ref::new("task", task_id),
+                session: session.clone(),
+                started_ns: 0,
+                inner: Mutex::new(TaskInner {
+                    state,
+                    finished_ns,
+                    result_ref: None,
+                    error: None,
+                }),
+                done: Condvar::new(),
+                cancel: shoal_exec::CancelToken::new(),
+                cancel_requested: AtomicBool::new(false),
+            })
+        };
+        {
+            let mut tasks = kernel.tasks.lock_recover();
+            let total = MAX_FINISHED_TASKS_PER_SESSION + 10;
+            for i in 0..total as u64 {
+                let entry = make_task(i, &session, "completed", Some(i as i64));
+                tasks.insert(Ref::new("task", i), entry);
+            }
+            // A still-running task, older than everything above — must
+            // survive GC regardless.
+            let running = make_task(total as u64, &session, "running", None);
+            tasks.insert(Ref::new("task", total as u64), running);
+            // A different session's finished task — unaffected by this
+            // session's cap.
+            let other_task = make_task(9_000, &other, "completed", Some(1));
+            tasks.insert(Ref::new("task", 9_000), other_task);
+        }
+        kernel.gc_tasks();
+        let tasks = kernel.tasks.lock_recover();
+        let session_tasks: Vec<_> = tasks
+            .values()
+            .filter(|t| t.session.id == session.id)
+            .collect();
+        // Cap + 1 (the running task, never reaped) survive.
+        assert_eq!(session_tasks.len(), MAX_FINISHED_TASKS_PER_SESSION + 1);
+        assert!(
+            session_tasks
+                .iter()
+                .any(|t| t.inner.lock_recover().state == "running"),
+            "the running task must never be reaped"
+        );
+        assert!(
+            tasks.contains_key(&Ref::new("task", 9_000)),
+            "a different session's finished task must be unaffected by this session's cap"
+        );
+        // The oldest-finished tasks (lowest ids) were the ones reaped.
+        assert!(!tasks.contains_key(&Ref::new("task", 0)));
+    }
+
+    /// Plan expiry (`note_plan_created` + `gc_plans`): a plan whose recorded
+    /// creation time is older than `PLAN_TTL_NS` is expired; a plan with NO
+    /// recorded creation time (the unwired default — see `note_plan_created`'s
+    /// doc comment) is never touched, proving the mechanism is a safe no-op
+    /// until the integrator wires the one call it depends on.
+    #[test]
+    fn gc_plans_expires_only_plans_with_a_recorded_and_stale_creation_time() {
+        let kernel = Kernel::new();
+        let stored = |src: &str| StoredPlan {
+            src: src.into(),
+            session: "s".into(),
+            principal: "human".into(),
+            plan: Plan::new(
+                vec![Effect::Opaque],
+                Reversibility::Unknown,
+                Estimates::default(),
+            ),
+            approved: false,
+        };
+        {
+            let mut plans = kernel.plans.lock_recover();
+            plans.insert("plan:stale".into(), stored("stale"));
+            plans.insert("plan:fresh".into(), stored("fresh"));
+            plans.insert("plan:unrecorded".into(), stored("unrecorded"));
+        }
+        // Backdate "stale" well past the TTL; record "fresh" as just-created.
+        // "unrecorded" deliberately gets NO entry at all.
+        {
+            let mut created = kernel.plan_created_ns.lock_recover();
+            created.insert("plan:stale".into(), now_ns() - PLAN_TTL_NS - 1);
+        }
+        kernel.note_plan_created("plan:fresh");
+
+        kernel.gc_plans();
+
+        let plans = kernel.plans.lock_recover();
+        assert!(
+            !plans.contains_key("plan:stale"),
+            "a plan older than the TTL must be expired"
+        );
+        assert!(
+            plans.contains_key("plan:fresh"),
+            "a freshly-recorded plan must not be expired"
+        );
+        assert!(
+            plans.contains_key("plan:unrecorded"),
+            "a plan with no recorded creation time must never be expired — safe no-op until wired"
         );
     }
 
