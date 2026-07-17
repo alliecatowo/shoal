@@ -5,9 +5,68 @@ use std::path::{Path, PathBuf};
 
 use shoal_ast::{CmdArg, Expr, Program, Stmt, UnOp};
 use shoal_journal::{Journal, JournalQuery};
+use shoal_value::Value;
+
+use crate::maybe_strip;
 
 pub(super) const REPL_PRINCIPAL: &str = "human";
 pub(super) const REPL_SESSION: &str = "default";
+
+/// Journal handle plus the bounded host-only `out[n]` identity mirror.
+pub(super) struct TranscriptState {
+    reader: Option<Journal>,
+    entries: VecDeque<Option<i64>>,
+}
+
+impl TranscriptState {
+    pub(super) fn open(
+        evaluator: &mut shoal_eval::Evaluator,
+        state_dir: &Path,
+        enabled: bool,
+    ) -> Self {
+        let reader = if enabled {
+            match (Journal::open(state_dir), Journal::open(state_dir)) {
+                (Ok(write_handle), Ok(read_handle)) => {
+                    evaluator.set_journal(write_handle, REPL_SESSION, REPL_PRINCIPAL);
+                    Some(read_handle)
+                }
+                (Err(error), _) | (_, Err(error)) => {
+                    eprintln!(
+                        "{}",
+                        maybe_strip(format!(
+                            "\x1b[33;1mwarning:\x1b[0m journal unavailable ({error}); undo/journal/history disabled this session"
+                        ))
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        Self {
+            reader,
+            entries: VecDeque::new(),
+        }
+    }
+
+    pub(super) fn resolve_undo(&self, program: &mut Program) {
+        resolve_out_undo(program, &self.entries);
+    }
+
+    pub(super) fn record(
+        &mut self,
+        evaluator: &mut shoal_eval::Evaluator,
+        value: &Value,
+        started_ns: i64,
+    ) {
+        let entry_id = self
+            .reader
+            .as_ref()
+            .and_then(|journal| latest_entry_id(journal, REPL_PRINCIPAL, started_ns));
+        push_out_entry(&mut self.entries, entry_id);
+        evaluator.record_transcript(value);
+    }
+}
 
 fn shoal_state_dir() -> PathBuf {
     shoal_paths::ShoalPaths::discover()
