@@ -260,9 +260,12 @@ Rules for implementers:
 
 ### Workstream J — structural debt (promoted into this wave)
 
-- [ ] **HR-J2** — Evaluator decomposition plan: split the god-context into cohesive sub-contexts
+- [x] **HR-J2** — Evaluator decomposition plan: split the god-context into cohesive sub-contexts
   behind the HR-B1 seam; recorded as a design page with staged extraction steps. *(H1)*
-  — promoted 2026-07-16; design: evaluator-decomposition page.
+  — promoted 2026-07-16; design: evaluator-decomposition page. Status: all six extraction steps
+  landed — the Evaluator is the designed three-field façade (`Arc<HostServices>` + `SessionCtx` +
+  `ExecState`), every field private, children constructible only through `ChildContext`; zero
+  language- or wire-visible change (conformance and live_kernel unchanged).
 
 ## Wave 3 — structural debt (sequenced after waves 1–2)
 
