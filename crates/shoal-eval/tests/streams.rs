@@ -250,6 +250,34 @@ channel("sink").take(timeout: 5s)"#,
     assert_eq!(v, Value::Int(42));
 }
 
+#[test]
+fn cancelling_an_on_handler_interrupts_its_blocking_recv() {
+    // HR-G4 (audit I5): the handler task idles blocked in a channel receive —
+    // no event ever arrives on "silent". `t.cancel()` must interrupt that wait
+    // (the worker polls its cancellation token between bounded-timeout pulls)
+    // so the thread exits and `t.await()` returns `null` instead of parking
+    // forever. The program runs on a side thread so a regression fails the
+    // recv_timeout below rather than hanging the suite.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let program = shoal_syntax::parse(
+        r#"let t = on(channel("silent"), ev => ev)
+sleep 20ms
+t.cancel()
+t.await()"#,
+    )
+    .unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(Evaluator::new(root).eval_program(&program));
+    });
+    let v = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("task.cancel() must unblock an on-handler stuck in recv (HR-G4)")
+        .expect("program evaluates");
+    assert_eq!(v, Value::Null, "a cancelled handler finishes with null");
+}
+
 // --- `every` yields datetimes -------------------------------------------
 
 #[test]

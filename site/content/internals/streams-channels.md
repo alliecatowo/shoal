@@ -382,14 +382,18 @@ the newest dropped event.
 ## `on(channel, handler)` tasks
 
 `on` subscribes **before** spawning its worker so emits between setup and thread start are queued.
-It creates a `TaskVal`, installs a cancellation hook, snapshots environment/cwd/process env/adapters,
-shares selected ports and the EventBus, then drives the subscription and calls the handler for every
+It creates a `TaskVal`, wires a fresh cancellation token to the task's cancel hook, builds its child
+evaluator through the authoritative child-context constructor (HR-B5 — full session context: leash,
+reef, config, all ports, bus, identity), then drives the subscription and calls the handler for every
 full event record. The task is added to evaluator jobs and finishes with `null` or the first error.
 
-The worker is an OS thread. Its cancellation token is set by `task.cancel`, but channel receive/pull
-does not poll that token; if no further event arrives, the worker can remain blocked. It also manually
-copies evaluator capabilities, so new ports/state can be omitted—configuration is one current audit
-site.
+The worker is an OS thread. It never issues an uninterruptible blocking receive (HR-G4): the drive
+loop pulls with a bounded timeout (50 ms) and consults the task's cancellation token between pulls,
+so `task.cancel()` unblocks a handler idling on a quiet channel within one poll interval; the worker
+exits, finishes the task with `null` (same as a natural channel end), and its dropped subscription is
+pruned from the bus on the next publish. Cancellation is observed between pulls/handler calls: a
+handler mid-call completes its current event first, though external work it spawned shares the
+cancelled exec token and is killed.
 
 ## Cross-layer gaps
 
