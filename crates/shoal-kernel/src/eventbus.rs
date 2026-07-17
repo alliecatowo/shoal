@@ -125,7 +125,7 @@ impl SubQueue {
     /// calls per subscriber, and it is a plain in-memory push, never a
     /// socket write, so a stalled subscriber can never stall `publish()`.
     fn push(&self, event: Event) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock_recover();
         if state.events.len() < SUB_QUEUE_CAP {
             state.events.push_back(event);
         } else {
@@ -139,7 +139,7 @@ impl SubQueue {
     /// Mark this queue closed (connection gone / explicitly unsubscribed) so
     /// its writer thread stops waiting and exits instead of blocking forever.
     fn close(&self) {
-        self.state.lock().unwrap().closed = true;
+        self.state.lock_recover().closed = true;
         self.ready.notify_one();
     }
 
@@ -149,7 +149,7 @@ impl SubQueue {
     /// summary is always delivered before any event that arrives after it —
     /// the subscriber learns about the gap before it sees anything past it.
     fn next(&self) -> Option<Event> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock_recover();
         loop {
             if let Some(event) = state.events.pop_front() {
                 return Some(event);
@@ -186,7 +186,7 @@ fn spawn_subscriber_writer(queue: Arc<SubQueue>, writer: SharedWriter) {
                 "method": "event",
                 "params": &event,
             });
-            let mut w = writer.lock().unwrap();
+            let mut w = writer.lock_recover();
             let ok = write_json_notification(&mut w, &note).is_ok();
             drop(w);
             if !ok {
@@ -272,7 +272,7 @@ impl EventBus {
         durable: Option<(DurableChannel, i64)>,
     ) -> Event {
         let event = {
-            let mut channels = self.channels.lock().unwrap();
+            let mut channels = self.channels.lock_recover();
             let buf = channels.entry(channel.to_string()).or_default();
             let seq = buf.next_seq;
             buf.next_seq += 1;
@@ -281,7 +281,7 @@ impl EventBus {
                     DurableChannel::Journal => &self.journal_index,
                     DurableChannel::Transcript => &self.transcript_index,
                 };
-                let mut index = index.lock().unwrap();
+                let mut index = index.lock_recover();
                 debug_assert_eq!(
                     index.len() as u64,
                     seq,
@@ -301,7 +301,7 @@ impl EventBus {
             }
             event
         };
-        let subs = self.subs.lock().unwrap();
+        let subs = self.subs.lock_recover();
         for sub in subs.iter().filter(|s| s.channel == channel) {
             sub.queue.push(event.clone());
         }
@@ -332,7 +332,7 @@ impl EventBus {
     }
 
     fn index_len(index: &Mutex<Vec<i64>>) -> u64 {
-        index.lock().unwrap().len() as u64
+        index.lock_recover().len() as u64
     }
 
     /// The `(seq, entry_id)` pairs for journal-channel events whose `seq` is
@@ -351,7 +351,7 @@ impl EventBus {
     }
 
     fn index_range(index: &Mutex<Vec<i64>>, since: Option<u64>, upto: u64) -> Vec<(u64, i64)> {
-        let index = index.lock().unwrap();
+        let index = index.lock_recover();
         let start = since.map(|s| s.saturating_add(1)).unwrap_or(0);
         (start..upto)
             .filter_map(|seq| index.get(seq as usize).map(|&entry_id| (seq, entry_id)))
@@ -360,7 +360,7 @@ impl EventBus {
 
     /// Buffered tail of `channel` from `since` (exclusive), capped at `limit`.
     fn read(&self, channel: &str, since: Option<u64>, limit: Option<usize>) -> Vec<Event> {
-        let channels = self.channels.lock().unwrap();
+        let channels = self.channels.lock_recover();
         let Some(buf) = channels.get(channel) else {
             return Vec::new();
         };
@@ -387,7 +387,7 @@ impl EventBus {
     /// (dispatch) thread.
     fn subscribe(&self, conn: u64, channel: &str, since: Option<u64>, writer: &SharedWriter) {
         let queue = {
-            let mut subs = self.subs.lock().unwrap();
+            let mut subs = self.subs.lock_recover();
             if let Some(existing) = subs.iter().find(|s| s.conn == conn && s.channel == channel) {
                 existing.queue.clone()
             } else {
@@ -407,7 +407,7 @@ impl EventBus {
     }
 
     fn unsubscribe(&self, conn: u64, channel: &str) {
-        let mut subs = self.subs.lock().unwrap();
+        let mut subs = self.subs.lock_recover();
         subs.retain(|s| {
             let keep = !(s.conn == conn && s.channel == channel);
             if !keep {
@@ -418,7 +418,7 @@ impl EventBus {
     }
 
     pub(crate) fn remove_conn(&self, conn: u64) {
-        let mut subs = self.subs.lock().unwrap();
+        let mut subs = self.subs.lock_recover();
         subs.retain(|s| {
             let keep = s.conn != conn;
             if !keep {
@@ -516,9 +516,9 @@ impl EventBus {
         if entry_ids.is_empty() {
             return;
         }
-        let mut idx = index.lock().unwrap();
+        let mut idx = index.lock_recover();
         idx.extend_from_slice(entry_ids);
-        let mut channels = self.channels.lock().unwrap();
+        let mut channels = self.channels.lock_recover();
         let buf = channels.entry(channel.to_string()).or_default();
         buf.next_seq = idx.len() as u64;
     }
