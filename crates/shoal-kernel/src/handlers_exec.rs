@@ -347,15 +347,18 @@ mod tests {
                 .env()
                 .declare(
                     "out",
-                    Value::List(vec![Value::Str("x".repeat(1800 * 1024))]),
+                    // Keep the existing binding just under Env's 4 MiB per-binding
+                    // ceiling, then make the transcript append cross that ceiling.
+                    Value::List(vec![Value::Str("x".repeat(3800 * 1024))]),
                     true,
                 )
                 .unwrap();
         }
         let src = serde_json::to_string(&"y".repeat(400 * 1024)).unwrap();
-        let error = kernel
-            .handle_exec(json!({"src":src}), 1, &mut attached)
-            .expect_err("the evaluator transcript value wall must reject the append");
+        let error = match kernel.handle_exec(json!({"src":src}), 1, &mut attached) {
+            Err(error) => error,
+            Ok(_) => panic!("the evaluator transcript value wall must reject the append"),
+        };
         assert_eq!(error.code, RAISED);
         assert_eq!(error.data.unwrap()["code"], "binding_value_limit");
 
