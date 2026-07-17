@@ -320,8 +320,8 @@ impl Kernel {
                 }
                 PlanAuthorization::Pending => {
                     return Err(RpcError {
-                        code: APPROVAL_REQUIRED,
-                        message: "plan approval pending".into(),
+                        code: LEASH_DENIED,
+                        message: "mode \"approved\" requires a granted approval".into(),
                         data: Some(json!({"plan_ref": plan_ref})),
                     });
                 }

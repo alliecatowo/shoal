@@ -444,13 +444,10 @@ impl Kernel {
                         data: None,
                     });
                 }
-                PlanAuthorization::PolicyAllowed => {
-                    return Err(RpcError {
-                        code: LEASH_DENIED,
-                        message: "plan is already allowed by policy and needs no approval".into(),
-                        data: None,
-                    });
-                }
+                // A caller may still request an explicit, auditable one-shot
+                // approval for a plan policy would allow directly. This keeps
+                // cap.request useful as an acknowledgement/audit operation.
+                PlanAuthorization::PolicyAllowed => {}
             }
 
             let mut record = ApprovalRecord {
