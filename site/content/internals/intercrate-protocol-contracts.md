@@ -344,7 +344,10 @@ Important defaults include:
 - optional timeout can convert synchronous work into a task result;
 - elision overrides are optional and hard-clamped by the kernel;
 - `mode: approved` requires a verified stored plan and is not a caller-asserted privilege;
-- journal and event limits/defaults are applied above/below storage as documented by handlers.
+- `JournalQueryParams.limit` is `Option<usize>`: omitted → default page (100), explicit `0` → zero
+  rows, any value clamped to the server maximum (10,000). The `Option` exists so the kernel can
+  distinguish "no limit given" from "give me nothing"; `journal.query` also requires attachment;
+- event limits/defaults are applied above/below storage as documented by handlers.
 
 ## Stable JSON-RPC error taxonomy
 

@@ -291,8 +291,12 @@ Required repair:
 4. prevent equal-effect plans from overwriting one another;
 5. audit approval decisions and test two principals over real connections.
 
-`journal.query` has the same missing attachment shape and returns shared journal rows without caller
-scoping. Treat both issues as P0 authority work.
+`journal.query` had the same missing-attachment shape; **HR-D4 closed it**: the handler now rejects
+an unattached caller with `NOT_ATTACHED` before reading any row, and its `limit` is bounded (omitted →
+default page, explicit `0` → zero rows, any value clamped to a server maximum — HR-D5). Within a
+shared pair-shell session the journal is intentionally readable by every attached principal; the
+isolation boundary is the session name, not per-row principal scoping. `cap.request` approver identity
+remains open P0 authority work.
 
 ## Policy loading defaults
 
