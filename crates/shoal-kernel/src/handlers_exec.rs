@@ -217,6 +217,7 @@ impl Kernel {
                     principal: actor.clone(),
                     plan,
                     approved: verdict == Verdict::Allow,
+                    approval: None,
                 },
             );
             if verdict == Verdict::ApprovalRequired {
@@ -316,6 +317,18 @@ impl Kernel {
                 opaque,
             })
             .map_err(internal)?;
+        // HR-D2: an approved re-entry consumes its plan's approval — bind the
+        // consuming execution (this journal entry) into the approval record so
+        // the requester→plan→approver→scope→execution chain is complete and
+        // auditable. `mode:"approved"` only reaches here after the branch above
+        // verified `plan_ref` names an approved plan for this session/principal.
+        if params.mode == "approved"
+            && let Some(plan_ref) = &params.plan_ref
+            && let Some(stored) = self.plans.lock().unwrap().get_mut(plan_ref)
+            && let Some(approval) = stored.approval.as_mut()
+        {
+            approval.consumed_by = Some(entry_id);
+        }
         // Hand the evaluator this call's source so each journaled top-level
         // statement can slice its own `src` (site/content/internals/language-conformance-contract.md) — mirrors the REPL's fix
         // at `crates/shoal/src/repl.rs` (`evaluator.set_source(run_src...)`
