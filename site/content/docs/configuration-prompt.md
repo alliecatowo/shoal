@@ -345,7 +345,7 @@ Each static table supports `enabled` plus module-specific keys:
 | `module.git_state` | labels for `rebase`, `merge`, `cherry_pick`, `bisect`, `revert`, plus `style` |
 | `module.cmd_duration` | `min_ms`, `style` |
 | `module.exit_status` | `show_on_success`, `format`, `style` |
-| `module.jobs` | `symbol`, `threshold`, `format`, `style` |
+| `module.jobs` | `symbol`, `threshold`, `format`, `style`; formats may use active `${total}`, `${running}`, `${suspended}`, and bounded-history `${completed}` |
 | `module.time` | `format`, `style` |
 | `module.username` | `show_always`, `style`, `root_style` |
 | `module.hostname` | `show_always`, `symbol`, `style` |

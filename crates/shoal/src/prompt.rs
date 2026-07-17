@@ -305,6 +305,7 @@ pub fn build_context_from_protocol(
             running: snapshot.jobs.running,
             suspended: snapshot.jobs.suspended,
             total: snapshot.jobs.total,
+            completed: snapshot.jobs.completed,
         },
         principal: facts.principal.clone(),
         leash: facts.leash.clone(),
@@ -336,6 +337,7 @@ fn jobs_snapshot_from(ev: &Evaluator) -> shoal_prompt::JobsSnapshot {
         running: s.running,
         suspended: s.suspended,
         total: s.total,
+        completed: s.completed,
     }
 }
 
@@ -592,7 +594,7 @@ mod tests {
         let snapshot = ProtocolSnapshot::parse(serde_json::json!({
             "cwd": {"display": dir.path().to_string_lossy()},
             "bindings": [],
-            "jobs": {"running": 2, "suspended": 1, "total": 4},
+            "jobs": {"running": 2, "suspended": 1, "total": 3, "completed": 4},
             "reef": {"bindings": [{
                 "tool": "node",
                 "version": "22.1.0",
@@ -619,7 +621,8 @@ mod tests {
         assert_eq!(context.width, 93);
         assert_eq!(context.jobs.running, 2);
         assert_eq!(context.jobs.suspended, 1);
-        assert_eq!(context.jobs.total, 4);
+        assert_eq!(context.jobs.total, 3);
+        assert_eq!(context.jobs.completed, 4);
         let outcome = context.last_outcome.expect("kernel outcome reaches prompt");
         assert!(!outcome.ok);
         assert_eq!(outcome.status, Some(7));

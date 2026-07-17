@@ -581,13 +581,14 @@ fn defect14_task_methods_and_jobs() {
 }
 
 #[test]
-fn jobs_snapshot_counts_running_and_total() {
+fn jobs_snapshot_separates_active_work_from_completed_history() {
     let mut ev = Evaluator::new(std::env::current_dir().unwrap());
     // Nothing spawned yet: a sane, zero-I/O empty snapshot.
     let empty = ev.jobs_snapshot();
     assert_eq!(empty.total, 0);
     assert_eq!(empty.running, 0);
     assert_eq!(empty.suspended, 0);
+    assert_eq!(empty.completed, 0);
 
     // Awaiting every spawned task deterministically drives them to done,
     // so the post-await snapshot is a stable total/zero-running count.
@@ -597,8 +598,50 @@ fn jobs_snapshot_counts_running_and_total() {
     .unwrap();
     ev.eval_program(&prog).unwrap();
     let snap = ev.jobs_snapshot();
-    assert_eq!(snap.total, 2, "both spawned tasks are registered");
+    assert_eq!(snap.total, 0, "completed tasks are not active prompt jobs");
     assert_eq!(snap.running, 0, "both were awaited to completion");
+    assert_eq!(snap.completed, 2, "both remain in bounded job history");
+}
+
+#[test]
+fn completed_job_history_is_bounded_without_invalidating_handles() {
+    let ev = Evaluator::new(std::env::current_dir().unwrap());
+    let mut handles = Vec::new();
+    for index in 0..(crate::exec_state::MAX_COMPLETED_JOBS + 17) {
+        let task = shoal_value::TaskVal::new(format!("completed-{index}"));
+        task.finish(Ok(Value::Int(index as i64)));
+        ev.exec.jobs.register(task.clone());
+        handles.push(task);
+    }
+
+    let snapshot = ev.jobs_snapshot();
+    assert_eq!(snapshot.total, 0);
+    assert_eq!(snapshot.completed, crate::exec_state::MAX_COMPLETED_JOBS);
+    let Value::Table(rows) = ev.jobs_table() else {
+        panic!("jobs must remain a table")
+    };
+    assert_eq!(rows.len(), crate::exec_state::MAX_COMPLETED_JOBS);
+    assert_eq!(
+        handles[0].wait().unwrap(),
+        Value::Int(0),
+        "a handle remains valid after its registry row is pruned"
+    );
+}
+
+#[test]
+fn active_and_suspended_jobs_are_never_pruned() {
+    let ev = Evaluator::new(std::env::current_dir().unwrap());
+    let running = shoal_value::TaskVal::new("running");
+    let stopped = shoal_value::TaskVal::new("stopped");
+    stopped.mark_suspended();
+    ev.exec.jobs.register(running);
+    ev.exec.jobs.register(stopped);
+
+    let snapshot = ev.jobs_snapshot();
+    assert_eq!(snapshot.running, 1);
+    assert_eq!(snapshot.suspended, 1);
+    assert_eq!(snapshot.total, 2);
+    assert_eq!(snapshot.completed, 0);
 }
 
 #[test]

@@ -624,6 +624,7 @@ impl Kernel {
                 "running": jobs.running,
                 "suspended": jobs.suspended,
                 "total": jobs.total,
+                "completed": jobs.completed,
             },
             "reef": {
                 "active_scope": reef.active_scope,

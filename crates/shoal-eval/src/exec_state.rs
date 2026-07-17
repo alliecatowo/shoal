@@ -22,9 +22,51 @@ pub(crate) struct ControlState {
 }
 
 pub(crate) struct JobState {
-    pub(crate) tasks: Vec<shoal_value::TaskVal>,
+    tasks: std::cell::RefCell<Vec<shoal_value::TaskVal>>,
     pub(crate) external: std::collections::HashMap<u64, u32>,
     pub(crate) pending_stop: Option<(u64, String)>,
+}
+
+/// Completed rows are useful as short job history, but the evaluator may live
+/// for days and spawn an unbounded number of tasks. Active/stopped tasks are
+/// never pruned; cloned `TaskVal` handles remain valid after registry pruning.
+pub const MAX_COMPLETED_JOBS: usize = 256;
+
+impl JobState {
+    pub(crate) fn register(&self, task: shoal_value::TaskVal) {
+        let mut tasks = self.tasks.borrow_mut();
+        tasks.push(task);
+        prune_completed(&mut tasks);
+    }
+
+    pub(crate) fn with_tasks<R>(&self, read: impl FnOnce(&[shoal_value::TaskVal]) -> R) -> R {
+        let mut tasks = self.tasks.borrow_mut();
+        prune_completed(&mut tasks);
+        read(&tasks)
+    }
+
+    pub(crate) fn task(&self, id: u64) -> Option<shoal_value::TaskVal> {
+        self.with_tasks(|tasks| tasks.iter().find(|task| task.id == id).cloned())
+    }
+}
+
+fn prune_completed(tasks: &mut Vec<shoal_value::TaskVal>) {
+    let mut excess = tasks
+        .iter()
+        .filter(|task| task.is_done())
+        .count()
+        .saturating_sub(MAX_COMPLETED_JOBS);
+    if excess == 0 {
+        return;
+    }
+    tasks.retain(|task| {
+        if excess > 0 && task.is_done() {
+            excess -= 1;
+            false
+        } else {
+            true
+        }
+    });
 }
 
 pub(crate) struct ModuleState {
@@ -78,7 +120,7 @@ impl ExecState {
                 pending_exit: None,
             },
             jobs: JobState {
-                tasks: Vec::new(),
+                tasks: std::cell::RefCell::new(Vec::new()),
                 external: std::collections::HashMap::new(),
                 pending_stop: None,
             },

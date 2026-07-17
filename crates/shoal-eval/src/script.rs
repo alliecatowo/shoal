@@ -84,7 +84,7 @@ impl Evaluator {
             let mut ev = ctx.build(ChildKind::Spawn, child_cancel);
             worker.finish(ev.block_value(&body));
         });
-        self.exec.jobs.tasks.push(task.clone());
+        self.exec.jobs.register(task.clone());
         Ok(Value::Task(task))
     }
 

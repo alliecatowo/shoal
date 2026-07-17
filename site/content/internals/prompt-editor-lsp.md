@@ -202,7 +202,7 @@ style spec equals that name. They are not macros inside a compound spec such as 
 | `git_state` | Git operation state | rebase/merge/cherry-pick/bisect/revert label | active |
 | `cmd_duration` | last outcome duration | hides below `min_ms` | active |
 | `exit_status` | status/signal/ok | optional success display | active, disabled by default |
-| `jobs` | running/suspended/total | threshold + template | active |
+| `jobs` | running/suspended/active total + bounded completed history | active total drives threshold; `${completed}` is history | active |
 | `time` | local h:m:s | small `%H/%M/%S` formatter | active |
 | `username` | session identity | root/SSH/show-always gate | active |
 | `hostname` | session identity | SSH/show-always gate | active |

@@ -117,13 +117,14 @@ pub fn is_bare_command_stmt(stmt: &Stmt) -> bool {
 /// only, never a subprocess or the filesystem.
 ///
 /// `running` excludes stopped tasks; `suspended` counts unfinished tasks whose
-/// job-control flag is set. `total` includes running, stopped, and completed
-/// rows retained by the evaluator.
+/// job-control flag is set. `total` is the active count (`running + suspended`)
+/// used by the prompt. `completed` is bounded retained history, not active work.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct JobsSnapshot {
     pub running: usize,
     pub suspended: usize,
     pub total: usize,
+    pub completed: usize,
 }
 
 /// Host renderer for statement-position outcomes (defect #1).
@@ -382,26 +383,23 @@ impl Evaluator {
     /// (site/content/internals/kernel-protocol.md). Cheap and I/O-free: call it once per
     /// command when building a `PromptContext`, never per keystroke.
     pub fn jobs_snapshot(&self) -> JobsSnapshot {
-        let total = self.exec.jobs.tasks.len();
-        let running = self
-            .exec
-            .jobs
-            .tasks
-            .iter()
-            .filter(|t| !t.is_done() && !t.is_suspended())
-            .count();
-        let suspended = self
-            .exec
-            .jobs
-            .tasks
-            .iter()
-            .filter(|t| !t.is_done() && t.is_suspended())
-            .count();
-        JobsSnapshot {
-            running,
-            suspended,
-            total,
-        }
+        self.exec.jobs.with_tasks(|tasks| {
+            let running = tasks
+                .iter()
+                .filter(|task| !task.is_done() && !task.is_suspended())
+                .count();
+            let suspended = tasks
+                .iter()
+                .filter(|task| !task.is_done() && task.is_suspended())
+                .count();
+            let completed = tasks.iter().filter(|task| task.is_done()).count();
+            JobsSnapshot {
+                running,
+                suspended,
+                total: running + suspended,
+                completed,
+            }
+        })
     }
 
     /// The task table backing the `jobs` builtin (defect #14). Rows cover both
@@ -411,30 +409,29 @@ impl Evaluator {
     /// `done`/`suspended` booleans into one word (`running`/`stopped`/`done`)
     /// for legibility; the booleans remain for programmatic filtering.
     pub(crate) fn jobs_table(&self) -> Value {
-        let rows = self
-            .exec
-            .jobs
-            .tasks
-            .iter()
-            .map(|t| {
-                let done = t.is_done();
-                let suspended = t.is_suspended();
-                let state = if done {
-                    "done"
-                } else if suspended {
-                    "stopped"
-                } else {
-                    "running"
-                };
-                let mut r = Record::new();
-                r.insert("id".into(), Value::Int(t.id as i64));
-                r.insert("desc".into(), Value::Str(t.shared.desc.clone()));
-                r.insert("state".into(), Value::Str(state.into()));
-                r.insert("done".into(), Value::Bool(done));
-                r.insert("suspended".into(), Value::Bool(suspended));
-                r
-            })
-            .collect();
+        let rows = self.exec.jobs.with_tasks(|tasks| {
+            tasks
+                .iter()
+                .map(|t| {
+                    let done = t.is_done();
+                    let suspended = t.is_suspended();
+                    let state = if done {
+                        "done"
+                    } else if suspended {
+                        "stopped"
+                    } else {
+                        "running"
+                    };
+                    let mut r = Record::new();
+                    r.insert("id".into(), Value::Int(t.id as i64));
+                    r.insert("desc".into(), Value::Str(t.shared.desc.clone()));
+                    r.insert("state".into(), Value::Str(state.into()));
+                    r.insert("done".into(), Value::Bool(done));
+                    r.insert("suspended".into(), Value::Bool(suspended));
+                    r
+                })
+                .collect()
+        });
         Value::Table(rows)
     }
 
@@ -444,7 +441,7 @@ impl Evaluator {
     /// suspend hooks (`SIGTSTP` to the task's process group, when a spawner has
     /// registered one). Returns `false` if no task has that id.
     pub fn suspend_task(&self, id: u64) -> bool {
-        match self.exec.jobs.tasks.iter().find(|t| t.id == id) {
+        match self.exec.jobs.task(id) {
             Some(t) => {
                 t.suspend();
                 true
@@ -456,7 +453,7 @@ impl Evaluator {
     /// Resume a suspended task by id (`SIGCONT`). Counterpart to
     /// [`Evaluator::suspend_task`]. Returns `false` if no task has that id.
     pub fn resume_task(&self, id: u64) -> bool {
-        match self.exec.jobs.tasks.iter().find(|t| t.id == id) {
+        match self.exec.jobs.task(id) {
             Some(t) => {
                 t.resume();
                 true
@@ -468,7 +465,7 @@ impl Evaluator {
     /// Look up a live task by id (for the REPL `fg <task>` path, which re-fronts a
     /// background task and must first resolve it from the job table).
     pub fn task_by_id(&self, id: u64) -> Option<shoal_value::TaskVal> {
-        self.exec.jobs.tasks.iter().find(|t| t.id == id).cloned()
+        self.exec.jobs.task(id)
     }
 
     /// Record a foreground external command that the OS just *stopped* (Ctrl-Z →
@@ -486,7 +483,7 @@ impl Evaluator {
         task.on_resume(Box::new(move || shoal_exec::continue_group(pgid)));
         task.mark_suspended();
         let id = task.id;
-        self.exec.jobs.tasks.push(task);
+        self.exec.jobs.register(task);
         self.exec.jobs.external.insert(id, pid);
         self.exec.jobs.pending_stop = Some((id, desc));
         id
@@ -502,26 +499,28 @@ impl Evaluator {
     /// the "current job" a bare `fg`/`bg` (no id) targets, matching the shell
     /// convention. `None` when no external command is stopped.
     pub fn last_stopped_external(&self) -> Option<u64> {
-        self.exec
-            .jobs
-            .tasks
-            .iter()
-            .filter(|t| t.is_suspended() && self.exec.jobs.external.contains_key(&t.id))
-            .map(|t| t.id)
-            .max()
+        self.exec.jobs.with_tasks(|tasks| {
+            tasks
+                .iter()
+                .filter(|task| {
+                    task.is_suspended() && self.exec.jobs.external.contains_key(&task.id)
+                })
+                .map(|task| task.id)
+                .max()
+        })
     }
 
     /// Most recent unfinished external PTY job, whether stopped or currently
     /// detached in the background. This is the default target for bare `fg`;
     /// bare `bg` continues to select only a stopped job.
     pub fn last_external_job(&self) -> Option<u64> {
-        self.exec
-            .jobs
-            .tasks
-            .iter()
-            .filter(|task| !task.is_done() && self.exec.jobs.external.contains_key(&task.id))
-            .map(|task| task.id)
-            .max()
+        self.exec.jobs.with_tasks(|tasks| {
+            tasks
+                .iter()
+                .filter(|task| !task.is_done() && self.exec.jobs.external.contains_key(&task.id))
+                .map(|task| task.id)
+                .max()
+        })
     }
 
     /// The most recently stopped foreground external command (job id, display),
@@ -534,7 +533,7 @@ impl Evaluator {
     /// REPL `fg`/`bg` path performs the SIGCONT + terminal handoff itself, so
     /// this only updates the job-table state. Returns `false` for an unknown id.
     pub fn mark_external_resumed(&self, id: u64) -> bool {
-        match self.exec.jobs.tasks.iter().find(|t| t.id == id) {
+        match self.exec.jobs.task(id) {
             Some(t) => {
                 t.mark_resumed();
                 true
@@ -546,7 +545,7 @@ impl Evaluator {
     /// Re-mark a stopped-external job as stopped (it was `fg`'d and then Ctrl-Z'd
     /// again) and re-arm the pending-stop notice, without re-signalling.
     pub fn mark_external_stopped(&mut self, id: u64) {
-        if let Some(t) = self.exec.jobs.tasks.iter().find(|t| t.id == id) {
+        if let Some(t) = self.exec.jobs.task(id) {
             t.mark_suspended();
             let desc = t.shared.desc.clone();
             self.exec.jobs.pending_stop = Some((id, desc));
@@ -576,9 +575,7 @@ impl Evaluator {
             let command = self
                 .exec
                 .jobs
-                .tasks
-                .iter()
-                .find(|task| task.id == id)
+                .task(id)
                 .map_or_else(|| format!("job {id}"), |task| task.shared.desc.clone());
             let message = match (status, signal.as_deref()) {
                 (Some(code), _) => format!("`{command}` exited with status {code}"),
@@ -597,7 +594,7 @@ impl Evaluator {
 
     fn complete_external_job(&mut self, id: u64, result: VResult<Value>) -> bool {
         self.exec.jobs.external.remove(&id);
-        match self.exec.jobs.tasks.iter().find(|t| t.id == id) {
+        match self.exec.jobs.task(id) {
             Some(t) => {
                 t.finish(result);
                 true

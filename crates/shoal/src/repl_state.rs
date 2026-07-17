@@ -22,6 +22,7 @@ pub(crate) struct ProtocolJobs {
     pub(crate) running: usize,
     pub(crate) suspended: usize,
     pub(crate) total: usize,
+    pub(crate) completed: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,6 +83,11 @@ impl ProtocolSnapshot {
             running: required_usize(jobs, "running")?,
             suspended: required_usize(jobs, "suspended")?,
             total: required_usize(jobs, "total")?,
+            completed: jobs
+                .get("completed")
+                .and_then(Json::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or(0),
         };
         let reef = object
             .get("reef")
@@ -212,6 +218,20 @@ mod tests {
             "last_value":{"$":"null"}
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn snapshot_accepts_completed_history_and_defaults_it_for_older_kernels() {
+        let with_history = ProtocolSnapshot::parse(json!({
+            "cwd":{"display":"/work"},
+            "bindings":[],
+            "jobs":{"running":0,"suspended":0,"total":0,"completed":7},
+            "reef":{"bindings":[]},
+            "last_value":{"$":"null"}
+        }))
+        .unwrap();
+        assert_eq!(with_history.jobs.completed, 7);
+        assert_eq!(snapshot(json!([])).jobs.completed, 0);
     }
 
     #[test]

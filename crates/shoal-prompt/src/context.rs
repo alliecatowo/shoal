@@ -113,7 +113,10 @@ pub struct OutcomeSnapshot {
 pub struct JobsSnapshot {
     pub running: usize,
     pub suspended: usize,
+    /// Active jobs (`running + suspended`), used for threshold/display.
     pub total: usize,
+    /// Bounded completed history retained by the evaluator.
+    pub completed: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

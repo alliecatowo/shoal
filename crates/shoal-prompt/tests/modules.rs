@@ -243,10 +243,34 @@ fn jobs_threshold_and_format() {
         running: 0,
         suspended: 0,
         total: 0,
+        completed: 0,
     };
     assert_eq!(render(cfg.clone(), "jobs", &ctx), "");
     ctx.jobs.total = 2;
     assert_eq!(render(cfg, "jobs", &ctx), "✦2");
+}
+
+#[test]
+fn jobs_format_can_distinguish_active_work_from_completed_history() {
+    let mut cfg = PromptConfig::default();
+    cfg.module.jobs.format = "${running}/${suspended} (+${completed})".into();
+    let mut ctx = base_ctx();
+    ctx.jobs = JobsSnapshot {
+        running: 2,
+        suspended: 1,
+        total: 3,
+        completed: 8,
+    };
+    assert_eq!(render(cfg, "jobs", &ctx), "2/1 (+8)");
+}
+
+#[test]
+fn completed_history_alone_does_not_keep_the_jobs_module_visible() {
+    let mut cfg = PromptConfig::default();
+    cfg.module.jobs.format = "${total} (+${completed})".into();
+    let mut ctx = base_ctx();
+    ctx.jobs.completed = 8;
+    assert_eq!(render(cfg, "jobs", &ctx), "");
 }
 
 // -- time -------------------------------------------------------------------

@@ -192,7 +192,8 @@ impl Renderer {
             .replace("${symbol}", &m.symbol)
             .replace("${total}", &ctx.jobs.total.to_string())
             .replace("${running}", &ctx.jobs.running.to_string())
-            .replace("${suspended}", &ctx.jobs.suspended.to_string());
+            .replace("${suspended}", &ctx.jobs.suspended.to_string())
+            .replace("${completed}", &ctx.jobs.completed.to_string());
         self.paint(&m.style, &text, ctx)
     }
 
