@@ -14,6 +14,11 @@ pub(super) fn parse(bytes: &[u8], delimiter: u8, hint: Option<&str>) -> Option<V
                 || cells.len() > MAX_PARSE_COLUMNS
                 || cells.iter().any(String::is_empty)
                 || !all_unique(cells.iter().map(String::as_str))
+                || (!schema.is_empty()
+                    && (schema.len() != cells.len()
+                        || cells
+                            .iter()
+                            .any(|name| !schema.iter().any(|(expected, _)| expected == name))))
             {
                 return None;
             }

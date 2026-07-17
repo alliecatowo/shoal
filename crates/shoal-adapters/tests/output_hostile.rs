@@ -86,4 +86,20 @@ fn duplicate_headers_and_keys_never_create_partial_structures() {
     assert_eq!(parse_output("csv", b"a,a\n1,2\n", None), None);
     assert_eq!(parse_output("kv", b"a=1\na=2\n", None), None);
     assert_eq!(parse_output("csv", b"a,b\n1,2\n3\n", None), None);
+    assert_eq!(
+        parse_output("csv", b"actual\nvalue\n", Some("table<{promised: str}>")),
+        None
+    );
+    assert_eq!(
+        parse_output("tsv-headerless", b"value\n", Some("not-a-table-hint")),
+        None
+    );
+    assert_eq!(
+        parse_output(
+            "tsv-headerless",
+            b"value\n",
+            Some("table<{value: mystery}>")
+        ),
+        None
+    );
 }

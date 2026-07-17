@@ -108,12 +108,9 @@ fn hint_schema(hint: Option<&str>) -> Option<Vec<(String, String)>> {
     if hint.len() > MAX_PARSE_HINT_BYTES {
         return None;
     }
-    let Some(body) = hint
+    let body = hint
         .split_once("<{")
-        .and_then(|(_, body)| body.strip_suffix("}>"))
-    else {
-        return Some(Vec::new());
-    };
+        .and_then(|(_, body)| body.strip_suffix("}>"))?;
     let mut fields = Vec::new();
     for field in body.split(',') {
         let (name, ty) = field.split_once(':')?;
@@ -153,7 +150,7 @@ fn coerce_cell(raw: &str, ty: &str) -> Option<(Value, usize)> {
         "size_kb" => (Value::Size(parse_size_kb(raw)?), 0),
         "duration" => (Value::Duration(shoal_value::parse_duration(raw)?), 0),
         "time" => (Value::Time(shoal_value::parse_time(raw)?), 0),
-        _ => (Value::Str(raw.into()), raw.len()),
+        _ => return None,
     })
 }
 
