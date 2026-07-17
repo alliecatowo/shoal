@@ -187,3 +187,102 @@ impl ChildContext {
         child
     }
 }
+
+#[cfg(test)]
+mod decomposition_characterization {
+    //! Field-level child-inheritance characterization for the evaluator
+    //! decomposition (HR-J2, step 1). These pin, directly at the
+    //! `child_context().build` seam, the inheritance facts that steps 2
+    //! (`SessionCtx`) and 3 (`ReefState`) regroup: journal *identity* (not the
+    //! handle), the reef overlay, the leash, config, and the shared event bus —
+    //! plus the deliberately-fresh fields (journal handle, sink, interactive).
+    //! White-box, because journal identity has no in-language surface to observe
+    //! black-box; the behavioral half of step 1 lives in
+    //! `tests/child_context_propagation.rs`. After steps 2/3 move these fields
+    //! into sub-structs the assertions read through the new paths but their
+    //! values are unchanged — that identity is the proof each step is a no-op.
+    use super::ChildScope;
+    use crate::Evaluator;
+    use shoal_exec::CancelToken;
+    use shoal_value::{ConfigSnapshot, Record, Value};
+    use std::sync::Arc;
+
+    /// A one-tool `with reef:` overlay record (`{faketool: "*"}`).
+    fn override_record() -> Record {
+        let mut r = Record::new();
+        r.insert("faketool".into(), Value::Str("*".into()));
+        r
+    }
+
+    /// Build a parent carrying every inheritable capability, then assert a child
+    /// of `scope` inherits identity/authority/reef-overlay/bus/config and starts
+    /// the deliberately-fresh fields fresh.
+    fn assert_inheritance(scope: ChildScope) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut parent = Evaluator::new(dir.path().to_path_buf());
+
+        // Session identity via an installed journal (a root-only handle).
+        let journal = shoal_journal::Journal::open(dir.path()).expect("open journal");
+        parent.set_journal(journal, "sess-characterize", "agent:tester");
+        // Authority.
+        parent.set_leash_policy(
+            shoal_leash::Policy::permissive("agent:tester"),
+            "agent:tester",
+        );
+        // Presentation state that must NOT reach a child.
+        parent.set_statement_sink(Box::new(|_v: &Value| {}));
+        parent.interactive = true;
+        // Config + reef resolution inputs + a `with reef:` overlay layer.
+        let mut cfg = Record::new();
+        cfg.insert("k".into(), Value::Int(7));
+        parent.set_config(Arc::new(ConfigSnapshot::new(Value::Record(cfg))));
+        parent.set_reef_resolver(Arc::new(shoal_reef::Resolver::with_defaults()));
+        parent
+            .push_reef_override(&override_record())
+            .expect("override pushes");
+
+        let child = parent.child_context().build(scope, CancelToken::new());
+
+        // --- Inherited: journal IDENTITY (session_id + principal) -----------
+        assert_eq!(child.session_id, "sess-characterize");
+        assert_eq!(child.principal, "agent:tester");
+        // --- Inherited: authority (the security core) ----------------------
+        assert!(child.leash.is_some(), "leash policy must reach the child");
+        assert_eq!(child.leash.as_ref().unwrap().1, "agent:tester");
+        // --- Inherited: reef overlay + resolver (the step-3 bundle) ---------
+        assert_eq!(
+            child.reef_overrides.len(),
+            1,
+            "with reef: overlay inherited"
+        );
+        assert!(
+            child.reef_overrides[0]
+                .manifest
+                .tools
+                .contains_key("faketool"),
+            "the overlay's tool constraint is carried into the child"
+        );
+        assert!(child.reef_resolver.is_some(), "reef resolver inherited");
+        // --- Inherited (shared Arc): config + event bus --------------------
+        assert!(
+            Arc::ptr_eq(&parent.config, &child.config),
+            "config port shared"
+        );
+        assert!(Arc::ptr_eq(&parent.bus, &child.bus), "event bus shared");
+
+        // --- Deliberately NOT inherited (fresh per child) ------------------
+        assert!(child.journal.is_none(), "journal HANDLE stays root-only");
+        assert!(child.sink.is_none(), "no competing mutable renderer");
+        assert!(!child.interactive, "a child never owns the terminal");
+    }
+
+    #[test]
+    fn closure_child_inherits_session_and_reef_context() {
+        assert_inheritance(ChildScope::Inherit);
+    }
+
+    #[test]
+    fn script_child_inherits_session_and_reef_context() {
+        assert_inheritance(ChildScope::Fresh);
+    }
+}
