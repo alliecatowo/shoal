@@ -199,13 +199,17 @@ Rules for implementers:
 - [ ] **HR-I3** — Interprocess locking (file lock or equivalent) around secret-store and
   token-store read-modify-write. *(J3, J4)*
 
+### Workstream J — structural debt (promoted into this wave)
+
+- [ ] **HR-J2** — Evaluator decomposition plan: split the god-context into cohesive sub-contexts
+  behind the HR-B1 seam; recorded as a design page with staged extraction steps. *(H1)*
+  — promoted 2026-07-16; design: evaluator-decomposition page.
+
 ## Wave 3 — structural debt (sequenced after waves 1–2)
 
 - [ ] **HR-J1** — Centralized command resolution: one resolution function/table with an explicit
   precedence order consumed by the evaluator, planner, completion, and LSP. *(H2; closes the
   root cause behind A9)*
-- [ ] **HR-J2** — Evaluator decomposition plan: split the god-context into cohesive sub-contexts
-  behind the HR-B1 seam; recorded as a design page with staged extraction steps. *(H1)*
 - [ ] **HR-J3** — Kernel concurrency model review: documented limits of
   thread-per-connection + per-session mutex; bounded executor or explicit caps where needed
   beyond HR-E3. *(H3)*
