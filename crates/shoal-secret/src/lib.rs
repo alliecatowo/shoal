@@ -6,10 +6,18 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    fs, io,
+    fs,
+    fs::OpenOptions,
+    io,
     path::{Path, PathBuf},
 };
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
+
+/// Encrypted secret storage whose confidentiality boundary is the containing
+/// directory's OS permissions. `master.key` and `secrets.json` are deliberately
+/// colocated, so copying that directory copies both key and ciphertext; this is
+/// encrypted-at-rest hygiene, not protection from an actor that can read the
+/// store directory.
 #[derive(Clone)]
 pub struct SecretStore {
     dir: PathBuf,
@@ -27,46 +35,74 @@ struct Envelope {
     nonce: String,
     ciphertext: String,
 }
+
+/// Plaintext map with deterministic zeroization of every value on all exits,
+/// including parse/save errors and replacement/deletion paths.
+#[derive(Default, Serialize, Deserialize)]
+#[serde(transparent)]
+struct PlainSecrets(BTreeMap<String, Vec<u8>>);
+
+impl Drop for PlainSecrets {
+    fn drop(&mut self) {
+        for value in self.0.values_mut() {
+            value.zeroize();
+        }
+    }
+}
+
 impl SecretStore {
     pub fn open(dir: impl Into<PathBuf>) -> io::Result<Self> {
         let s = Self { dir: dir.into() };
         fs::create_dir_all(&s.dir)?;
         secure_dir(&s.dir)?;
-        if !s.key_path().exists() {
-            let mut k = Zeroizing::new([0u8; 32]);
-            OsRng.fill_bytes(&mut *k);
-            atomic(&s.key_path(), &*k)?
-        }
-        check_mode(&s.key_path())?;
+        // Key creation must share the same interprocess transaction lock as
+        // map updates: two first-openers must never install different keys.
+        s.with_exclusive_lock(|| {
+            if !s.key_path().exists() {
+                let mut k = Zeroizing::new([0u8; 32]);
+                OsRng.fill_bytes(&mut *k);
+                atomic(&s.key_path(), &*k)?
+            }
+            check_mode(&s.key_path())
+        })?;
         Ok(s)
     }
     pub fn set(&self, name: &str, value: &[u8]) -> io::Result<()> {
         valid(name)?;
-        let mut m = self.load()?;
-        m.insert(name.into(), value.to_vec());
-        self.save(&m)
+        self.with_exclusive_lock(|| {
+            let mut m = self.load_unlocked()?;
+            if let Some(old) = m.0.insert(name.into(), value.to_vec()) {
+                drop(Zeroizing::new(old));
+            }
+            self.save_unlocked(&m)
+        })
     }
     pub fn get(&self, name: &str) -> io::Result<Option<Zeroizing<Vec<u8>>>> {
         valid(name)?;
-        Ok(self.load()?.remove(name).map(Zeroizing::new))
+        self.with_shared_lock(|| Ok(self.load_unlocked()?.0.remove(name).map(Zeroizing::new)))
     }
     pub fn list(&self) -> io::Result<Vec<String>> {
-        Ok(self.load()?.into_keys().collect())
+        self.with_shared_lock(|| Ok(self.load_unlocked()?.0.keys().cloned().collect()))
     }
     pub fn delete(&self, name: &str) -> io::Result<bool> {
         valid(name)?;
-        let mut m = self.load()?;
-        let found = m.remove(name).is_some();
-        if found {
-            self.save(&m)?
-        }
-        Ok(found)
+        self.with_exclusive_lock(|| {
+            let mut m = self.load_unlocked()?;
+            let found = m.0.remove(name).map(Zeroizing::new);
+            if found.is_some() {
+                self.save_unlocked(&m)?
+            }
+            Ok(found.is_some())
+        })
     }
     fn key_path(&self) -> PathBuf {
         self.dir.join("master.key")
     }
     fn data_path(&self) -> PathBuf {
         self.dir.join("secrets.json")
+    }
+    fn lock_path(&self) -> PathBuf {
+        self.dir.join(".secrets.lock")
     }
     fn key(&self) -> io::Result<Zeroizing<Vec<u8>>> {
         let k = Zeroizing::new(fs::read(self.key_path())?);
@@ -78,12 +114,13 @@ impl SecretStore {
         }
         Ok(k)
     }
-    fn load(&self) -> io::Result<BTreeMap<String, Vec<u8>>> {
+    fn load_unlocked(&self) -> io::Result<PlainSecrets> {
         if !self.data_path().exists() {
-            return Ok(BTreeMap::new());
+            return Ok(PlainSecrets::default());
         }
         check_mode(&self.data_path())?;
-        let e: Envelope = serde_json::from_slice(&fs::read(self.data_path())?).map_err(invalid)?;
+        let envelope_bytes = Zeroizing::new(fs::read(self.data_path())?);
+        let e: Envelope = serde_json::from_slice(&envelope_bytes).map_err(invalid)?;
         if e.version != 1 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -93,9 +130,11 @@ impl SecretStore {
         let nonce = base64::engine::general_purpose::STANDARD
             .decode(e.nonce)
             .map_err(invalid)?;
-        let ct = base64::engine::general_purpose::STANDARD
-            .decode(e.ciphertext)
-            .map_err(invalid)?;
+        let ct = Zeroizing::new(
+            base64::engine::general_purpose::STANDARD
+                .decode(e.ciphertext)
+                .map_err(invalid)?,
+        );
         let key = self.key()?;
         let cipher = Aes256Gcm::new_from_slice(&key).map_err(invalid)?;
         let plain = Zeroizing::new(
@@ -110,21 +149,37 @@ impl SecretStore {
         );
         serde_json::from_slice(&plain).map_err(invalid)
     }
-    fn save(&self, m: &BTreeMap<String, Vec<u8>>) -> io::Result<()> {
+    fn save_unlocked(&self, m: &PlainSecrets) -> io::Result<()> {
         let plain = Zeroizing::new(serde_json::to_vec(m).map_err(invalid)?);
         let key = self.key()?;
         let cipher = Aes256Gcm::new_from_slice(&key).map_err(invalid)?;
         let mut nonce = [0u8; 12];
         OsRng.fill_bytes(&mut nonce);
-        let ct = cipher
-            .encrypt((&nonce).into(), plain.as_ref())
-            .map_err(invalid)?;
+        let ct = Zeroizing::new(
+            cipher
+                .encrypt((&nonce).into(), plain.as_ref())
+                .map_err(invalid)?,
+        );
         let e = Envelope {
             version: 1,
             nonce: base64::engine::general_purpose::STANDARD.encode(nonce),
-            ciphertext: base64::engine::general_purpose::STANDARD.encode(ct),
+            ciphertext: base64::engine::general_purpose::STANDARD.encode(ct.as_slice()),
         };
         atomic(&self.data_path(), &serde_json::to_vec(&e).map_err(invalid)?)
+    }
+
+    fn with_exclusive_lock<T>(&self, f: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+        let file = open_lock_file(&self.lock_path())?;
+        let mut lock = fd_lock::RwLock::new(file);
+        let _guard = lock.write()?;
+        f()
+    }
+
+    fn with_shared_lock<T>(&self, f: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+        let file = open_lock_file(&self.lock_path())?;
+        let lock = fd_lock::RwLock::new(file);
+        let _guard = lock.read()?;
+        f()
     }
 }
 fn valid(n: &str) -> io::Result<()> {
@@ -169,6 +224,24 @@ fn check_mode(p: &Path) -> io::Result<()> {
 fn check_mode(_: &Path) -> io::Result<()> {
     Ok(())
 }
+
+fn open_lock_file(path: &Path) -> io::Result<fs::File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
+}
+
 fn atomic(path: &Path, data: &[u8]) -> io::Result<()> {
     let parent = path.parent().unwrap();
     let mut t = tempfile::NamedTempFile::new_in(parent)?;
@@ -181,11 +254,15 @@ fn atomic(path: &Path, data: &[u8]) -> io::Result<()> {
     io::Write::write_all(&mut t, data)?;
     t.as_file().sync_all()?;
     t.persist(path).map_err(|e| e.error)?;
+    // Persist the directory entry as well as the temporary file contents.
+    fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
+
     #[test]
     fn lifecycle_and_redaction() {
         let t = tempfile::tempdir().unwrap();
@@ -210,5 +287,78 @@ mod tests {
         b[n - 2] ^= 1;
         fs::write(p, b).unwrap();
         assert!(s.list().is_err())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_permissions_are_the_confidentiality_boundary() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let t = tempfile::tempdir().unwrap();
+        let s = SecretStore::open(t.path()).unwrap();
+        s.set("TOKEN", b"secret").unwrap();
+        assert_eq!(
+            fs::metadata(t.path()).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        for name in ["master.key", "secrets.json", ".secrets.lock"] {
+            assert_eq!(
+                fs::metadata(t.path().join(name))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600,
+                "{name} must be owner-only"
+            );
+        }
+        // The encrypted file omits plaintext, but the same protected directory
+        // also contains its decryption key: OS ownership/mode is the boundary.
+        assert!(t.path().join("master.key").exists());
+        assert!(t.path().join("secrets.json").exists());
+    }
+
+    #[test]
+    fn concurrent_process_writers_preserve_every_secret() {
+        const WORKER_ENV: &str = "SHOAL_SECRET_LOCK_TEST_WORKER";
+        const DIR_ENV: &str = "SHOAL_SECRET_LOCK_TEST_DIR";
+
+        if let Some(name) = std::env::var_os(WORKER_ENV) {
+            let dir = PathBuf::from(std::env::var_os(DIR_ENV).expect("worker store dir"));
+            let store = SecretStore::open(dir).unwrap();
+            let name = name.to_string_lossy();
+            store.set(&name, name.as_bytes()).unwrap();
+            return;
+        }
+
+        let t = tempfile::tempdir().unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let mut children = Vec::new();
+        for i in 0..12 {
+            let name = format!("SECRET_{i}");
+            children.push(
+                Command::new(&exe)
+                    .args([
+                        "--exact",
+                        "tests::concurrent_process_writers_preserve_every_secret",
+                        "--nocapture",
+                    ])
+                    .env(WORKER_ENV, &name)
+                    .env(DIR_ENV, t.path())
+                    .spawn()
+                    .unwrap(),
+            );
+        }
+        for child in children {
+            assert!(child.wait_with_output().unwrap().status.success());
+        }
+
+        let store = SecretStore::open(t.path()).unwrap();
+        let names = store.list().unwrap();
+        assert_eq!(names.len(), 12, "a concurrent update was lost: {names:?}");
+        for i in 0..12 {
+            let name = format!("SECRET_{i}");
+            assert_eq!(&*store.get(&name).unwrap().unwrap(), name.as_bytes());
+        }
     }
 }

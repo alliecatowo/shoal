@@ -51,7 +51,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("created {} (secret shown once)", m.id)
         }
         "list" => {
-            for m in s.list() {
+            for m in s.try_list()? {
                 println!(
                     "{}\t{}\t{}\t{}",
                     m.id,

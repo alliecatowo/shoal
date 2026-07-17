@@ -36,6 +36,7 @@ dependencies = [
  "cfg-if",
  "cipher",
  "cpufeatures 0.2.17",
+ "zeroize",
 ]
 
 [[package]]
@@ -50,6 +51,7 @@ dependencies = [
  "ctr",
  "ghash",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -2412,11 +2414,13 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "blake3",
+ "fd-lock",
  "getrandom 0.4.3",
  "serde",
  "serde_json",
  "subtle",
  "tempfile",
+ "zeroize",
 ]
 
 [[package]]
@@ -2606,8 +2610,10 @@ dependencies = [
 name = "shoal-secret"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "aes-gcm",
  "base64",
+ "fd-lock",
  "rand",
  "serde",
  "serde_json",
