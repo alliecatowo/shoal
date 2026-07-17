@@ -61,6 +61,10 @@ Shoal is pre-release and is not ready to replace a login shell. The language eng
 runner, Reef resolver, journal/CAS, Leash policy path, streams/channels, kernel protocol, and MCP
 facade are implemented and tested on Linux and macOS.
 
+**Shoal is Unix-only.** It relies on Unix-domain sockets, POSIX process/signal/PTY semantics, and
+(where available) Landlock/Seatbelt sandboxing; Windows is out of scope for now and would need a
+deliberate port (see [Current status and limits](https://alliecatowo.github.io/shoal/docs/status-limits/)).
+
 ```bash
 # Interactive shell
 cargo run -p shoal
