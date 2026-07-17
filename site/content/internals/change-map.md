@@ -63,9 +63,11 @@ assert_failed permission recursion_limit overflow
 
 Extensions include Reef (`reef_unlocked`, `reef_drift`, `reef_conflict`, `reef_not_found`,
 `reef_provider`), IO (`feed_error`, `lang_block_unbalanced`, `runner_not_found`), and streams
-(`stream_unbounded`). Implementation also uses boundary-specific values such as `io_error`,
-`net_error`, and `channel_closed`; any corpus-assertable code must be added to the pinned contract
-rather than invented ad hoc at one call site.
+(`stream_unbounded`, `channel_closed`, `channel_poisoned`, `channel_name_limit`,
+`channel_registry_limit`, `channel_subscriber_limit`, `channel_payload_limit`, and
+`channel_payload_type`). Implementation also uses boundary-specific values such as `io_error` and
+`net_error`; any corpus-assertable code must be added to the pinned contract rather than invented ad
+hoc at one call site.
 
 `ErrorVal::or_span` preserves the innermost existing span. Higher evaluation layers should add a span
 only when the lower layer had none.

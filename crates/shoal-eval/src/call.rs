@@ -251,7 +251,7 @@ impl Evaluator {
             // itself yields a handle whose `.emit/.events/.latest/.take` the
             // evaluator intercepts.
             "channel" => match one()? {
-                Value::Str(name) => Ok(Some(crate::channels::channel_handle(name))),
+                Value::Str(name) => Ok(Some(crate::channels::channel_handle(name)?)),
                 v => Err(ErrorVal::type_error(format!(
                     "channel expects a str name, found {}",
                     v.type_name()

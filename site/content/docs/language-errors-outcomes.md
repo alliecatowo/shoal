@@ -157,7 +157,7 @@ Common currently emitted codes include:
 | Syntax/binding | `parse_error`, `undefined_var`, `arg_error`, `type_error` |
 | Data/access | `field_missing`, `index_range`, `utf8_error`, `overflow`, `div_zero` |
 | Commands/host | `not_found`, `cmd_failed`, `io_error`, `net_error`, `permission`, `timeout` |
-| Streams/channels | `stream_consumed`, `stream_unbounded`, `channel_closed`, `feed_error` |
+| Streams/channels | `stream_consumed`, `stream_unbounded`, `channel_closed`, `channel_poisoned`, `channel_name_limit`, `channel_registry_limit`, `channel_subscriber_limit`, `channel_payload_limit`, `channel_payload_type`, `feed_error` |
 | Reef | `reef_unlocked`, `reef_drift`, `reef_conflict`, `reef_not_found`, `reef_provider` |
 | Control | `assert_failed`, `recursion_limit`, `stale_undo` |
 

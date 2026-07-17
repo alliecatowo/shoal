@@ -130,7 +130,8 @@ It uses `IterSource`, which returns the iterator's next result and never times o
 `recv`; with one it maps `recv_timeout` to item, timeout, or end on disconnection. Timer, watch,
 tail, and `.buffer` use this adapter with their own capacity and shutdown policy. Language-channel
 subscriptions use `EventUpstream` instead: its mutex/condition-variable queue has a hard 256-item
-bound, explicit gap records, and cancellation-aware receives for `on` handlers.
+and 256 KiB retained-byte bound, explicit gap records, and cancellation-aware receives for `on`
+handlers. One evaluator admits at most 64 live subscriber queues.
 
 ## System source matrix
 
@@ -139,11 +140,12 @@ bound, explicit gap records, and cancellation-aware receives for `on` handlers.
 | `every(duration)` | one sleeping thread | `sync_channel(1)` | drop tick silently | `DateTime` |
 | `watch(path/glob)` | `notify` watcher thread | `sync_channel(64)` | count loss and owe one gap summary | event or gap record |
 | `tail(path)` | `notify` + `Fs` reads | `sync_channel(64)` | count and report dropped lines | string or gap record |
-| `channel(name).events()` | session EventBus | 256 deliveries per subscriber | discard oldest queued deliveries, insert exact gap before newest | event or gap record |
+| `channel(name).events()` | session EventBus | 256 deliveries and 256 KiB per subscriber | discard oldest queued deliveries, insert exact gap before newest | event or gap record |
 | finite value `.stream()` | caller pull | no producer buffer | exact | element |
 
 EventBus publishers never wait for a slow subscriber. A subscriber queue holds at most 256
-deliveries. When full, it removes the oldest entries until there is room for one coalesced
+deliveries and 256 KiB of measured retained data. When either bound fills, it removes the oldest
+entries until there is room for one coalesced
 `stream_gap` record and the newest event. If an evicted entry is itself a gap, its count and sequence
 range are absorbed, so loss remains explicit. Replay uses the same bounded queue: a large replay can
 also compact older deliveries into a gap rather than allocating in proportion to the 1,024-event
@@ -342,14 +344,28 @@ The evaluator owns an `Arc<EventBus>` shared into selected child tasks. Each cha
 | State | Purpose |
 |---|---|
 | `next_seq` | monotonically increasing per-channel sequence, beginning at zero |
-| `ring` | newest 1,024 stored events |
-| `subs` | live subscriber queues, each capped at 256 deliveries |
+| `ring` | newest 1,024 stored events, also capped at 256 KiB measured retained data |
+| `subs` | live subscriber queues, each capped at 256 deliveries and 256 KiB |
 
 Stored events contain sequence, nanosecond timestamp, and cloned payload. Consumer records are:
 
 ```text
 { channel: Str, seq: Int, ts: DateTime | null, payload: Value }
 ```
+
+The evaluator admits at most 64 channel identities and 64 live subscribers. Channel names are at
+most 256 UTF-8 bytes. Existing identities and their sequence/history state are never evicted to
+make room for a different name; only an empty subscribe-then-drop shell can be pruned. Admission
+failures are typed as `channel_name_limit`, `channel_registry_limit`, or
+`channel_subscriber_limit`.
+
+Before any ring append, sequence increment, subscriber clone, or `user.*` bridge callback, payloads
+pass a non-allocating structural measurement: at most 64 KiB retained data, depth 64, and 4,096
+nodes. Strings/bytes and recursive list/record/table/outcome/error storage are charged; opaque
+runtime handles whose retained graph cannot be bounded (`stream`, `task`, closure, command ref,
+compiled regex, CAS loader, secret) are rejected. Failures use `channel_payload_limit` or
+`channel_payload_type`. The two 64 × 256 KiB aggregate budgets put rings plus subscriber queues at
+about 32 MiB/session before fixed container overhead.
 
 Delivery loss uses a stable discriminated record. Sequence bounds are populated when the source has
 a public sequence space:
@@ -366,11 +382,11 @@ flowchart LR
 accTitle: EventBus buffering, replay, and delivery
 accDescr: Published events receive sequence numbers, enter a bounded replay ring, and fan out through bounded subscriber queues that report drops and support cursor-based replay.
   Emit["emit / kernel inject"] --> Seq["assign monotonic seq"]
-  Seq --> Ring["ring buffer: newest 1024"]
+  Seq --> Ring["ring: newest 1024 and at most 256 KiB"]
   Cursor["subscribe after cursor"] --> Replay["replay retained events"]
   Ring --> Replay
   Ring --> Fanout["live fan-out"]
-  Replay --> Queue["subscriber queue: at most 256 deliveries"]
+  Replay --> Queue["subscriber queue: at most 256 deliveries / 256 KiB"]
   Fanout --> Queue
   Queue --> Delivery["ordered delivery"]
   Queue -->|overflow| Drop["coalesced stream_gap + exact seq range"]
@@ -413,8 +429,9 @@ capability by evaluator method dispatch. Conversely adding any second field prev
 
 
 Replay is queued while the bus mutex is held, before the subscriber is registered as live, so there
-is no race between the ring snapshot and live registration. The queue remains capped at 256 during
-replay. If compaction is needed, an explicit gap accounts for evicted deliveries. A `since` cursor
+is no race between the ring snapshot and live registration. The queue remains capped at 256 entries
+and 256 KiB during replay. If compaction is needed, an explicit gap accounts for evicted
+deliveries. A `since` cursor
 older than the 1,024-event ring queues a `history_evicted` gap with the exact missing sequence range
 before retained records. If that replay itself exceeds 256 deliveries, compaction can absorb the
 history gap into a `mixed_overflow` record while preserving its count and widest sequence range.

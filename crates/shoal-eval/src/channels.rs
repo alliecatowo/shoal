@@ -31,10 +31,51 @@ use std::time::{Duration, Instant};
 /// journaled channel, never an unbounded ring.
 const RING_CAP: usize = 1024;
 
+/// Per-session channel identity ceiling. Existing identities are never
+/// evicted to admit a different name: that would silently discard history and
+/// reset its sequence space.
+const CHANNEL_CAP: usize = 64;
+
+/// UTF-8 byte ceiling for a channel identity.
+const CHANNEL_NAME_BYTES: usize = 256;
+
+/// In addition to [`RING_CAP`], one channel retains at most this many measured
+/// payload bytes. Together with [`CHANNEL_CAP`] this bounds replay rings to
+/// roughly 16 MiB per evaluator session.
+const RING_BYTE_CAP: usize = 256 * 1024;
+
 /// Per-subscriber live/replay capacity. Publishers never wait for a slow
 /// subscriber: when this fills, the oldest queued deliveries are discarded and
 /// represented by one in-band overflow record before the newest event.
 const SUBSCRIBER_CAP: usize = 256;
+
+/// Aggregate number of live subscription queues in one evaluator session.
+const LIVE_SUBSCRIBER_CAP: usize = 64;
+
+/// Per-subscriber retained delivery budget. Together with
+/// [`LIVE_SUBSCRIBER_CAP`] this bounds live queues to roughly 16 MiB/session.
+const SUBSCRIBER_BYTE_CAP: usize = 256 * 1024;
+
+/// A single publishable value must fit all three structural bounds before it
+/// is cloned into a ring or subscriber queue.
+const PAYLOAD_BYTE_CAP: usize = 64 * 1024;
+const PAYLOAD_DEPTH_CAP: usize = 64;
+const PAYLOAD_NODE_CAP: usize = 4096;
+
+/// Conservative allowance for the `{channel, seq, ts, payload}` record around
+/// a measured payload in each subscriber queue.
+const EVENT_RECORD_OVERHEAD: usize = 512;
+
+/// `StreamGap` has no heap fields today. Keeping an explicit conservative
+/// charge makes byte accounting stable if its scalar shape grows.
+const GAP_RETAINED_BYTES: usize = 128;
+
+// The payload/name/envelope policy must always leave room for a gap marker in
+// a subscriber queue, including the small extra Stored charge used on replay.
+const _: () = assert!(
+    PAYLOAD_BYTE_CAP + CHANNEL_NAME_BYTES + EVENT_RECORD_OVERHEAD + 1024 + GAP_RETAINED_BYTES
+        <= SUBSCRIBER_BYTE_CAP
+);
 
 /// Maximum time a cancellation-aware receiver sleeps without re-checking its
 /// token. A condvar notification still wakes it immediately for normal events.
@@ -71,23 +112,42 @@ struct Stored {
     seq: u64,
     ts_ns: i128,
     payload: Value,
+    retained_bytes: usize,
 }
 
 #[derive(Default)]
 struct ChannelState {
     next_seq: u64,
     ring: VecDeque<Stored>,
+    ring_bytes: usize,
     subs: Vec<Subscriber>,
 }
 
 enum Delivery {
-    Event(Value),
-    Gap(StreamGap),
+    Event {
+        value: Value,
+        retained_bytes: usize,
+    },
+    Gap {
+        gap: StreamGap,
+        retained_bytes: usize,
+    },
+}
+
+impl Delivery {
+    fn retained_bytes(&self) -> usize {
+        match self {
+            Self::Event { retained_bytes, .. } | Self::Gap { retained_bytes, .. } => {
+                *retained_bytes
+            }
+        }
+    }
 }
 
 #[derive(Default)]
 struct QueueState {
     items: VecDeque<Delivery>,
+    retained_bytes: usize,
     closed: bool,
     poisoned: bool,
 }
@@ -114,40 +174,72 @@ impl Subscriber {
         if state.closed {
             return false;
         }
-        state.items.push_back(Delivery::Gap(gap));
+        state.items.push_back(Delivery::Gap {
+            gap,
+            retained_bytes: GAP_RETAINED_BYTES,
+        });
+        state.retained_bytes = state.retained_bytes.saturating_add(GAP_RETAINED_BYTES);
         self.0.ready.notify_one();
         true
     }
 
-    fn push(&self, event: Value) -> bool {
+    fn push(&self, event: Value, event_bytes: usize) -> bool {
         let mut state = self.lock_state();
         if state.closed {
             return false;
         }
 
-        if state.items.len() >= SUBSCRIBER_CAP {
+        let count_overflow = state.items.len().saturating_add(1) > SUBSCRIBER_CAP;
+        let byte_overflow = state.retained_bytes.saturating_add(event_bytes) > SUBSCRIBER_BYTE_CAP;
+        if count_overflow || byte_overflow {
             // Reserve two tail slots: one exact gap marker and the newest
-            // event. If an older marker is evicted, carry its count forward so
-            // loss is never silently forgotten.
+            // event, and reserve their measured bytes. If an older marker is
+            // evicted, carry its count forward so loss is never forgotten.
             let mut gap = StreamGap::new(StreamGapReason::SubscriberOverflow, 0);
-            while state.items.len() > SUBSCRIBER_CAP.saturating_sub(2) {
+            while state.items.len().saturating_add(2) > SUBSCRIBER_CAP
+                || state
+                    .retained_bytes
+                    .saturating_add(GAP_RETAINED_BYTES)
+                    .saturating_add(event_bytes)
+                    > SUBSCRIBER_BYTE_CAP
+            {
                 match state.items.pop_front() {
-                    Some(Delivery::Event(event)) => {
-                        let mut dropped = StreamGap::new(StreamGapReason::SubscriberOverflow, 1);
-                        if let Some(seq) = event_seq(&event) {
-                            dropped = dropped.with_seq_range(seq, seq);
+                    Some(delivery) => {
+                        state.retained_bytes = state
+                            .retained_bytes
+                            .saturating_sub(delivery.retained_bytes());
+                        match delivery {
+                            Delivery::Event { value: event, .. } => {
+                                let mut dropped =
+                                    StreamGap::new(StreamGapReason::SubscriberOverflow, 1);
+                                if let Some(seq) = event_seq(&event) {
+                                    dropped = dropped.with_seq_range(seq, seq);
+                                }
+                                gap.absorb(dropped);
+                            }
+                            Delivery::Gap { gap: dropped, .. } => gap.absorb(dropped),
                         }
-                        gap.absorb(dropped);
                     }
-                    Some(Delivery::Gap(dropped)) => gap.absorb(dropped),
                     None => break,
                 }
             }
-            state.items.push_back(Delivery::Gap(gap));
+            state.items.push_back(Delivery::Gap {
+                gap,
+                retained_bytes: GAP_RETAINED_BYTES,
+            });
+            state.retained_bytes = state.retained_bytes.saturating_add(GAP_RETAINED_BYTES);
         }
-        state.items.push_back(Delivery::Event(event));
+        state.items.push_back(Delivery::Event {
+            value: event,
+            retained_bytes: event_bytes,
+        });
+        state.retained_bytes = state.retained_bytes.saturating_add(event_bytes);
         self.0.ready.notify_one();
         true
+    }
+
+    fn is_open(&self) -> bool {
+        !self.lock_state().closed
     }
 }
 
@@ -186,9 +278,10 @@ impl EventReceiver {
                 return Received::Poisoned;
             }
             if let Some(item) = state.items.pop_front() {
+                state.retained_bytes = state.retained_bytes.saturating_sub(item.retained_bytes());
                 return match item {
-                    Delivery::Event(v) => Received::Event(v),
-                    Delivery::Gap(gap) => Received::Gap(gap),
+                    Delivery::Event { value, .. } => Received::Event(value),
+                    Delivery::Gap { gap, .. } => Received::Gap(gap),
                 };
             }
             if state.closed {
@@ -241,6 +334,7 @@ impl SubscriberQueue {
         mut state: MutexGuard<'a, QueueState>,
     ) -> MutexGuard<'a, QueueState> {
         state.items.clear();
+        state.retained_bytes = 0;
         state.closed = true;
         state.poisoned = true;
         self.state.clear_poison();
@@ -279,6 +373,7 @@ impl SubscriberQueue {
     fn quarantine(&self) {
         let mut state = self.lock_state();
         state.items.clear();
+        state.retained_bytes = 0;
         state.closed = true;
         state.poisoned = true;
         self.ready.notify_all();
@@ -349,6 +444,8 @@ impl EventBus {
     /// code can never spoof a kernel-owned semantic channel
     /// (`journal`/`approval`/`session.transcript`/…) to wire subscribers.
     pub fn emit(&self, name: &str, payload: Value) -> VResult<u64> {
+        validate_channel_name(name)?;
+        let payload_bytes = payload_retained_size(&payload)?;
         // Resolve forwarder health before committing locally: a poisoned
         // bridge must not report failure after an event was already appended.
         let forwarder = if name.starts_with("user.") {
@@ -356,7 +453,7 @@ impl EventBus {
         } else {
             None
         };
-        let seq = self.publish_local(name, &payload)?;
+        let seq = self.publish_local(name, &payload, payload_bytes)?;
         if let Some(f) = forwarder
             && catch_unwind(AssertUnwindSafe(|| f(name, &payload))).is_err()
         {
@@ -382,11 +479,14 @@ impl EventBus {
     /// Fallible host-facing form of [`Self::inject`]. New hosts should use this
     /// so a quarantined language bus is surfaced at their request boundary.
     pub fn try_inject(&self, name: &str, payload: Value) -> VResult<u64> {
-        self.publish_local(name, &payload)
+        validate_channel_name(name)?;
+        let payload_bytes = payload_retained_size(&payload)?;
+        self.publish_local(name, &payload, payload_bytes)
     }
 
-    fn publish_local(&self, name: &str, payload: &Value) -> VResult<u64> {
+    fn publish_local(&self, name: &str, payload: &Value, payload_bytes: usize) -> VResult<u64> {
         let mut map = self.lock_channels()?;
+        prune_closed_subscribers(&mut map);
         if map
             .get(name)
             .is_some_and(|channel| channel.next_seq > i64::MAX as u64)
@@ -394,25 +494,33 @@ impl EventBus {
             self.quarantine_known_channels(&map);
             return Err(channel_poisoned("channel sequence"));
         }
+        admit_channel_identity(&map, name)?;
         let st = map.entry(name.to_string()).or_default();
         let seq = st.next_seq;
         st.next_seq += 1;
         let ts_ns = now_ns();
+        let stored_bytes = payload_bytes.saturating_add(std::mem::size_of::<Stored>());
         st.ring.push_back(Stored {
             seq,
             ts_ns,
             payload: payload.clone(),
+            retained_bytes: stored_bytes,
         });
-        while st.ring.len() > RING_CAP {
-            st.ring.pop_front();
+        st.ring_bytes = st.ring_bytes.saturating_add(stored_bytes);
+        while st.ring.len() > RING_CAP || st.ring_bytes > RING_BYTE_CAP {
+            if let Some(evicted) = st.ring.pop_front() {
+                st.ring_bytes = st.ring_bytes.saturating_sub(evicted.retained_bytes);
+            }
         }
         let event = event_record(name, seq, ts_ns, payload);
-        st.subs.retain(|sub| sub.push(event.clone()));
+        let event_bytes = event_retained_bytes(name, payload_bytes);
+        st.subs.retain(|sub| sub.push(event.clone(), event_bytes));
         Ok(seq)
     }
 
     /// The last payload published on `name`, or `null` if none (no wait).
     pub fn latest(&self, name: &str) -> VResult<Value> {
+        validate_channel_name(name)?;
         let map = self.lock_channels()?;
         Ok(map
             .get(name)
@@ -426,6 +534,7 @@ impl EventBus {
     /// whole ring then goes live; `since: Some(n)` replays only `seq > n` (the
     /// in-language `?since=` cursor, site/content/internals/streams-channels.md), then live.
     pub fn events(&self, name: &str, since: Option<u64>) -> VResult<EventReceiver> {
+        validate_channel_name(name)?;
         self.subscribe(name, Replay::from_since(since))
     }
 
@@ -433,21 +542,37 @@ impl EventBus {
     /// bounded queue's explicit overflow records instead of hiding it behind an
     /// unbounded `mpsc` adapter.
     pub fn event_stream(&self, name: &str, since: Option<u64>) -> VResult<StreamVal> {
+        let rx = self.events(name, since)?;
         Ok(StreamVal::from_upstream(
             "event",
             false,
             Box::new(EventUpstream {
                 channel: name.to_string(),
-                rx: self.events(name, since)?,
+                rx,
             }),
         ))
     }
 
     /// Register a subscriber with the given replay policy.
     fn subscribe(&self, name: &str, replay: Replay) -> VResult<EventReceiver> {
+        validate_channel_name(name)?;
         let queue = Arc::new(SubscriberQueue::default());
         let sub = Subscriber(queue.clone());
         let mut map = self.lock_channels()?;
+        prune_closed_subscribers(&mut map);
+        let live_subscribers = map
+            .values()
+            .map(|channel| channel.subs.len())
+            .sum::<usize>();
+        if live_subscribers >= LIVE_SUBSCRIBER_CAP {
+            return Err(ErrorVal::new(
+                "channel_subscriber_limit",
+                format!(
+                    "channel subscriber limit ({LIVE_SUBSCRIBER_CAP}) reached; drop a channel stream before subscribing again"
+                ),
+            ));
+        }
+        admit_channel_identity(&map, name)?;
         let st = map.entry(name.to_string()).or_default();
         if let Replay::Since(since) = replay {
             let expected = since.saturating_add(1);
@@ -461,7 +586,10 @@ impl EventBus {
         }
         for s in &st.ring {
             if replay.wants(s.seq) {
-                let _ = sub.push(event_record(name, s.seq, s.ts_ns, &s.payload));
+                let _ = sub.push(
+                    event_record(name, s.seq, s.ts_ns, &s.payload),
+                    event_retained_bytes(name, s.retained_bytes),
+                );
             }
         }
         st.subs.push(sub);
@@ -567,6 +695,206 @@ impl EventBus {
     }
 }
 
+fn validate_channel_name(name: &str) -> VResult<()> {
+    if name.len() <= CHANNEL_NAME_BYTES {
+        return Ok(());
+    }
+    Err(ErrorVal::new(
+        "channel_name_limit",
+        format!(
+            "channel name is {} UTF-8 bytes; maximum is {CHANNEL_NAME_BYTES}",
+            name.len()
+        ),
+    ))
+}
+
+fn admit_channel_identity(map: &HashMap<String, ChannelState>, name: &str) -> VResult<()> {
+    if map.contains_key(name) || map.len() < CHANNEL_CAP {
+        return Ok(());
+    }
+    Err(ErrorVal::new(
+        "channel_registry_limit",
+        format!(
+            "channel identity limit ({CHANNEL_CAP}) reached; existing channel history is never evicted to admit a new name"
+        ),
+    ))
+}
+
+fn prune_closed_subscribers(map: &mut HashMap<String, ChannelState>) {
+    for channel in map.values_mut() {
+        channel.subs.retain(Subscriber::is_open);
+    }
+    // A subscribe/drop cycle with no published history has no identity or
+    // sequence state to preserve. Removing only these empty shells prevents
+    // subscriber churn from exhausting the channel-identity budget. Any
+    // channel that has published retains its ring and monotonic sequence.
+    map.retain(|_, channel| !channel.ring.is_empty() || !channel.subs.is_empty());
+}
+
+fn event_retained_bytes(name: &str, payload_bytes: usize) -> usize {
+    payload_bytes
+        .saturating_add(name.len())
+        .saturating_add(EVENT_RECORD_OVERHEAD)
+}
+
+#[derive(Default)]
+struct PayloadMeasure {
+    bytes: usize,
+    nodes: usize,
+}
+
+impl PayloadMeasure {
+    fn add_bytes(&mut self, bytes: usize) -> VResult<()> {
+        self.bytes = self.bytes.checked_add(bytes).ok_or_else(|| {
+            ErrorVal::new(
+                "channel_payload_limit",
+                "channel payload retained-size accounting overflowed",
+            )
+        })?;
+        if self.bytes > PAYLOAD_BYTE_CAP {
+            return Err(ErrorVal::new(
+                "channel_payload_limit",
+                format!(
+                    "channel payload retains more than {PAYLOAD_BYTE_CAP} bytes (measured at least {})",
+                    self.bytes
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn enter_node(&mut self, depth: usize, resident_bytes: usize) -> VResult<()> {
+        if depth > PAYLOAD_DEPTH_CAP {
+            return Err(ErrorVal::new(
+                "channel_payload_limit",
+                format!("channel payload depth exceeds {PAYLOAD_DEPTH_CAP}"),
+            ));
+        }
+        self.nodes = self.nodes.checked_add(1).ok_or_else(|| {
+            ErrorVal::new(
+                "channel_payload_limit",
+                "channel payload node accounting overflowed",
+            )
+        })?;
+        if self.nodes > PAYLOAD_NODE_CAP {
+            return Err(ErrorVal::new(
+                "channel_payload_limit",
+                format!("channel payload has more than {PAYLOAD_NODE_CAP} nodes"),
+            ));
+        }
+        self.add_bytes(resident_bytes)
+    }
+
+    fn visit(&mut self, value: &Value, depth: usize) -> VResult<()> {
+        self.enter_node(depth, std::mem::size_of::<Value>())?;
+        match value {
+            Value::Null
+            | Value::Bool(_)
+            | Value::Int(_)
+            | Value::Float(_)
+            | Value::Size(_)
+            | Value::Duration(_)
+            | Value::Time(_)
+            | Value::Range(_) => Ok(()),
+            Value::DateTime(_) => self.add_bytes(512),
+            Value::Str(text) => self.add_bytes(text.capacity()),
+            Value::Path(path) => self.add_bytes(path.as_os_str().as_encoded_bytes().len()),
+            Value::Glob(glob) => {
+                self.add_bytes(glob.pattern.capacity())?;
+                self.add_bytes(glob.cwd.as_os_str().as_encoded_bytes().len())
+            }
+            Value::Bytes(bytes) => self.add_bytes(bytes.capacity()),
+            Value::List(values) => {
+                self.add_bytes(
+                    values
+                        .capacity()
+                        .saturating_sub(values.len())
+                        .saturating_mul(std::mem::size_of::<Value>()),
+                )?;
+                for value in values {
+                    self.visit(value, depth + 1)?;
+                }
+                Ok(())
+            }
+            Value::Record(record) => self.visit_record(record, depth),
+            Value::Table(rows) => {
+                self.add_bytes(
+                    rows.capacity()
+                        .saturating_mul(std::mem::size_of::<Record>()),
+                )?;
+                for row in rows {
+                    self.enter_node(depth + 1, std::mem::size_of::<Record>())?;
+                    self.visit_record(row, depth + 1)?;
+                }
+                Ok(())
+            }
+            Value::Error(error) => {
+                self.add_bytes(std::mem::size_of_val(error.as_ref()))?;
+                self.add_bytes(error.code.capacity())?;
+                self.add_bytes(error.msg.capacity())?;
+                if let Some(hint) = &error.hint {
+                    self.add_bytes(hint.capacity())?;
+                }
+                if let Some(stderr) = &error.stderr {
+                    self.add_bytes(stderr.capacity())?;
+                }
+                Ok(())
+            }
+            Value::Outcome(outcome) => {
+                self.add_bytes(std::mem::size_of_val(outcome.as_ref()))?;
+                self.add_bytes(outcome.stdout.capacity())?;
+                self.add_bytes(outcome.stderr.capacity())?;
+                self.add_bytes(outcome.cmd.capacity())?;
+                if let Some(signal) = &outcome.signal {
+                    self.add_bytes(signal.capacity())?;
+                }
+                if outcome.stdout_ref.is_some() {
+                    return Err(opaque_payload_error("CAS-backed outcome"));
+                }
+                if let Some(parsed) = &outcome.parsed {
+                    self.visit(parsed, depth + 1)?;
+                }
+                Ok(())
+            }
+            Value::Secret(_) => Err(opaque_payload_error("secret")),
+            Value::CasBytes(_) => Err(opaque_payload_error("CAS-backed bytes")),
+            Value::Regex(_) => Err(opaque_payload_error("compiled regex")),
+            Value::Stream(_) => Err(opaque_payload_error("stream")),
+            Value::Task(_) => Err(opaque_payload_error("task")),
+            Value::Closure(_) => Err(opaque_payload_error("closure")),
+            Value::CmdRef(_) => Err(opaque_payload_error("command reference")),
+        }
+    }
+
+    fn visit_record(&mut self, record: &Record, depth: usize) -> VResult<()> {
+        self.add_bytes(
+            record
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(String, Value)>()),
+        )?;
+        for (key, value) in record {
+            self.add_bytes(key.capacity())?;
+            self.visit(value, depth + 1)?;
+        }
+        Ok(())
+    }
+}
+
+fn payload_retained_size(value: &Value) -> VResult<usize> {
+    let mut measure = PayloadMeasure::default();
+    measure.visit(value, 1)?;
+    Ok(measure.bytes)
+}
+
+fn opaque_payload_error(kind: &str) -> ErrorVal {
+    ErrorVal::new(
+        "channel_payload_type",
+        format!(
+            "a {kind} cannot be retained in a bounded channel payload; publish materialized data instead"
+        ),
+    )
+}
+
 fn channel_poisoned(component: &str) -> ErrorVal {
     ErrorVal::new(
         "channel_poisoned",
@@ -620,10 +948,11 @@ fn event_seq(event: &Value) -> Option<u64> {
 /// modeled as a one-field record `{channel: <name>}` rather than a new variant.
 /// The evaluator intercepts `.emit/.events/.latest/.take` (and `.into(...)`) on
 /// values of this shape before generic method dispatch.
-pub(crate) fn channel_handle(name: &str) -> Value {
+pub(crate) fn channel_handle(name: &str) -> VResult<Value> {
+    validate_channel_name(name)?;
     let mut r = Record::new();
     r.insert("channel".into(), Value::Str(name.to_string()));
-    Value::Record(r)
+    Ok(Value::Record(r))
 }
 
 /// Recognize a channel handle (see [`channel_handle`]) and return its name.
@@ -651,6 +980,174 @@ fn datetime_from_ns(ns: i128) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn channel_names_and_identities_are_typed_and_bounded() {
+        let bus = EventBus::default();
+        let oversized = "é".repeat(CHANNEL_NAME_BYTES / 2 + 1);
+        assert_eq!(
+            bus.emit(&oversized, Value::Null).unwrap_err().code,
+            "channel_name_limit"
+        );
+        assert_eq!(
+            channel_handle(&oversized).unwrap_err().code,
+            "channel_name_limit"
+        );
+
+        for index in 0..CHANNEL_CAP {
+            assert_eq!(
+                bus.emit(&format!("identity-{index}"), Value::Int(index as i64))
+                    .unwrap(),
+                0
+            );
+        }
+        assert_eq!(
+            bus.emit("one-too-many", Value::Null).unwrap_err().code,
+            "channel_registry_limit"
+        );
+        assert_eq!(
+            bus.latest("identity-0").unwrap(),
+            Value::Int(0),
+            "admission failure must not evict or retarget an existing identity"
+        );
+        assert_eq!(bus.emit("identity-0", Value::Int(9)).unwrap(), 1);
+        assert_eq!(bus.channels.lock().unwrap().len(), CHANNEL_CAP);
+    }
+
+    #[test]
+    fn huge_deep_wide_and_opaque_payloads_fail_before_sequence_or_bridge_commit() {
+        let bus = EventBus::default();
+        let forwarded = Arc::new(AtomicBool::new(false));
+        let observed = forwarded.clone();
+        bus.set_forwarder(Box::new(move |_, _| {
+            observed.store(true, Ordering::Release);
+        }));
+
+        let huge = Value::Str("x".repeat(PAYLOAD_BYTE_CAP + 1));
+        assert_eq!(
+            bus.emit("user.hostile", huge).unwrap_err().code,
+            "channel_payload_limit"
+        );
+        assert!(!forwarded.load(Ordering::Acquire));
+
+        let mut deep = Value::Null;
+        for _ in 0..=PAYLOAD_DEPTH_CAP {
+            deep = Value::List(vec![deep]);
+        }
+        assert_eq!(
+            bus.emit("deep", deep).unwrap_err().code,
+            "channel_payload_limit"
+        );
+        assert_eq!(
+            bus.emit("wide", Value::List(vec![Value::Null; PAYLOAD_NODE_CAP + 1]))
+                .unwrap_err()
+                .code,
+            "channel_payload_limit"
+        );
+        assert_eq!(
+            bus.emit("opaque", Value::Task(TaskVal::new("retained")))
+                .unwrap_err()
+                .code,
+            "channel_payload_type"
+        );
+
+        assert_eq!(bus.emit("user.hostile", Value::Int(1)).unwrap(), 0);
+        assert!(forwarded.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn ring_byte_eviction_preserves_exact_cursor_gap_and_sequence() {
+        let bus = EventBus::default();
+        let payload = Value::Str("r".repeat(60_000));
+        let published = 10usize;
+        for _ in 0..published {
+            bus.emit("byte-ring", payload.clone()).unwrap();
+        }
+        {
+            let map = bus.channels.lock().unwrap();
+            let state = map.get("byte-ring").unwrap();
+            assert!(state.ring_bytes <= RING_BYTE_CAP);
+            assert!(state.ring.len() < RING_CAP, "byte cap must trigger first");
+            assert_eq!(state.next_seq, published as u64);
+        }
+
+        let rx = bus.events("byte-ring", Some(0)).unwrap();
+        let mut retained = 0usize;
+        let mut dropped = 0usize;
+        loop {
+            match rx.recv(Some(Duration::ZERO), None) {
+                Received::Event(_) => retained += 1,
+                Received::Gap(gap) => dropped += gap.dropped as usize,
+                Received::Timeout => break,
+                Received::Closed | Received::Cancelled | Received::Poisoned => {
+                    panic!("subscription ended early")
+                }
+            }
+        }
+        assert_eq!(retained + dropped, published - 1);
+        assert!(dropped > 0);
+    }
+
+    #[test]
+    fn subscriber_byte_overflow_is_bounded_and_exactly_accounted() {
+        let bus = EventBus::default();
+        let rx = bus.events("byte-queue", None).unwrap();
+        let payload = Value::Str("q".repeat(60_000));
+        let published = 10usize;
+        for _ in 0..published {
+            bus.emit("byte-queue", payload.clone()).unwrap();
+        }
+        {
+            let state = rx.queue.state.lock().unwrap();
+            assert!(state.retained_bytes <= SUBSCRIBER_BYTE_CAP);
+            assert!(
+                state.items.len() < SUBSCRIBER_CAP,
+                "byte cap must trigger first"
+            );
+        }
+
+        let mut retained = 0usize;
+        let mut dropped = 0usize;
+        loop {
+            match rx.recv(Some(Duration::ZERO), None) {
+                Received::Event(_) => retained += 1,
+                Received::Gap(gap) => dropped += gap.dropped as usize,
+                Received::Timeout => break,
+                Received::Closed | Received::Cancelled | Received::Poisoned => {
+                    panic!("subscription ended early")
+                }
+            }
+        }
+        assert_eq!(retained + dropped, published);
+        assert!(dropped > 0);
+    }
+
+    #[test]
+    fn global_subscriber_admission_prunes_closed_churn() {
+        let bus = EventBus::default();
+        let mut receivers = (0..LIVE_SUBSCRIBER_CAP)
+            .map(|index| bus.events(&format!("live-{index}"), None).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            bus.events("rejected", None).err().unwrap().code,
+            "channel_subscriber_limit"
+        );
+
+        drop(receivers.pop());
+        receivers.push(bus.events("replacement", None).unwrap());
+        drop(receivers);
+
+        for index in 0..(CHANNEL_CAP * 4) {
+            let receiver = bus.events(&format!("churn-{index}"), None).unwrap();
+            drop(receiver);
+        }
+        let mut map = bus.channels.lock().unwrap();
+        prune_closed_subscribers(&mut map);
+        assert!(
+            map.is_empty(),
+            "closed empty subscription shells must be pruned"
+        );
+    }
 
     #[test]
     fn slow_subscriber_is_bounded_and_every_gap_is_accounted_for() {
@@ -779,6 +1276,7 @@ mod tests {
         let state = rx.queue.state.lock().expect("poison must be repaired");
         assert!(state.closed && state.poisoned);
         assert!(state.items.is_empty(), "unknown backlog must be discarded");
+        assert_eq!(state.retained_bytes, 0);
         assert!(state.items.capacity() <= SUBSCRIBER_CAP.next_power_of_two());
     }
 
