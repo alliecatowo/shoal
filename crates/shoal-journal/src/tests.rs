@@ -88,6 +88,68 @@ fn read_blob_range_is_exact_bounded_and_overflow_safe() {
     assert!(past_end.is_empty());
 }
 
+#[test]
+fn verified_page_cache_serves_exact_hits_without_redecompression() {
+    let journal = Journal::in_memory().unwrap();
+    let id = journal
+        .append(&rec("cas", "human", 1, "cached output"))
+        .unwrap();
+    let payload = (0..(256 * 1024 + 31))
+        .map(|i| (i % 251) as u8)
+        .collect::<Vec<_>>();
+    let hash = journal.record_output(id, "stdout", &payload).unwrap();
+    let offset = 192 * 1024;
+    let expected = payload[offset..offset + 8192].to_vec();
+    assert_eq!(
+        journal
+            .read_blob_range(&hash, offset as u64, 8192)
+            .unwrap()
+            .unwrap()
+            .1,
+        expected
+    );
+
+    // Damage the legacy single-stream backing file after the verified page is
+    // cached. The exact hit remains trusted and needs no decompression, while
+    // a distinct distant page must reopen, reverify, and reject corruption.
+    fs::write(journal.blob_path(&hash), b"not a zstd stream").unwrap();
+    assert_eq!(
+        journal
+            .cached_blob_range(&hash, offset as u64, 8192)
+            .unwrap()
+            .unwrap()
+            .1,
+        expected
+    );
+    assert!(journal.read_blob_range(&hash, 0, 8192).is_err());
+}
+
+#[test]
+fn page_cache_enforces_byte_and_entry_bounds() {
+    let mut cache = BlobPageCache::default();
+    for index in 0..(BLOB_PAGE_CACHE_MAX_ENTRIES + 20) {
+        cache.insert(BlobPageCacheEntry {
+            hash: format!("{index:064x}"),
+            offset: 0,
+            length: 8192,
+            total: 8192,
+            bytes: vec![index as u8; 8192],
+        });
+    }
+    assert!(cache.entries.len() <= BLOB_PAGE_CACHE_MAX_ENTRIES);
+    assert!(cache.bytes <= BLOB_PAGE_CACHE_MAX_BYTES);
+    assert!(cache.get(&format!("{:064x}", 0), 0, 8192).is_none());
+    assert!(
+        cache
+            .get(
+                &format!("{:064x}", BLOB_PAGE_CACHE_MAX_ENTRIES + 19),
+                0,
+                8192,
+            )
+            .is_some()
+    );
+}
+
 /// Count regular files under `dir`, recursively.
 fn count_files(dir: &Path) -> usize {
     let mut n = 0;

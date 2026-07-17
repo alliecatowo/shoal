@@ -35,6 +35,8 @@
 //!   `entries_by_id` fetch.
 //! - [`transcript`] — durable `session.transcript` channel event payloads, keyed by `entry_id`.
 
+use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::fs;
 use std::io;
@@ -69,6 +71,60 @@ pub struct Journal {
     /// Keeps the CAS temp dir alive for the lifetime of an in-memory journal.
     _cas_tempdir: Option<tempfile::TempDir>,
     output_hard_cap: usize,
+    blob_page_cache: RefCell<BlobPageCache>,
+}
+
+const BLOB_PAGE_CACHE_MAX_BYTES: usize = 1024 * 1024;
+const BLOB_PAGE_CACHE_MAX_ENTRIES: usize = 256;
+
+struct BlobPageCacheEntry {
+    hash: String,
+    offset: u64,
+    length: usize,
+    total: u64,
+    bytes: Vec<u8>,
+}
+
+#[derive(Default)]
+struct BlobPageCache {
+    entries: VecDeque<BlobPageCacheEntry>,
+    bytes: usize,
+}
+
+impl BlobPageCache {
+    fn get(&mut self, hash: &str, offset: u64, length: usize) -> Option<(u64, Vec<u8>)> {
+        let index = self.entries.iter().position(|entry| {
+            entry.hash == hash && entry.offset == offset && entry.length == length
+        })?;
+        let entry = self.entries.remove(index)?;
+        let result = (entry.total, entry.bytes.clone());
+        self.entries.push_back(entry);
+        Some(result)
+    }
+
+    fn insert(&mut self, entry: BlobPageCacheEntry) {
+        if entry.bytes.len() > BLOB_PAGE_CACHE_MAX_BYTES {
+            return;
+        }
+        if let Some(index) = self.entries.iter().position(|existing| {
+            existing.hash == entry.hash
+                && existing.offset == entry.offset
+                && existing.length == entry.length
+        }) && let Some(replaced) = self.entries.remove(index)
+        {
+            self.bytes = self.bytes.saturating_sub(replaced.bytes.len());
+        }
+        self.bytes = self.bytes.saturating_add(entry.bytes.len());
+        self.entries.push_back(entry);
+        while self.bytes > BLOB_PAGE_CACHE_MAX_BYTES
+            || self.entries.len() > BLOB_PAGE_CACHE_MAX_ENTRIES
+        {
+            let Some(evicted) = self.entries.pop_front() else {
+                break;
+            };
+            self.bytes = self.bytes.saturating_sub(evicted.bytes.len());
+        }
+    }
 }
 
 impl Journal {
@@ -121,6 +177,7 @@ impl Journal {
             cas_root,
             _cas_tempdir: None,
             output_hard_cap: options.output_hard_cap,
+            blob_page_cache: RefCell::default(),
         })
     }
 
@@ -142,6 +199,7 @@ impl Journal {
             cas_root,
             _cas_tempdir: Some(tempdir),
             output_hard_cap: options.output_hard_cap,
+            blob_page_cache: RefCell::default(),
         })
     }
 }

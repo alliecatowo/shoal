@@ -1,3 +1,4 @@
+use shoal_journal::{Journal, JournalQuery};
 use shoal_proto::error_code::AUTH_FAILED;
 use shoal_proto::{AttachParams, ClientInfo, ExecParams, JSONRPC, Request, Response, write_frame};
 use std::io::{BufRead, BufReader, Write};
@@ -425,7 +426,7 @@ fn daemon_binds_secure_socket_and_attaches() {
     std::fs::write(
         config_dir.join("shoal.toml"),
         format!(
-            "[env]\nFROM_CONFIG = \"config-value\"\n[init]\nfiles = [{}]\n",
+            "[env]\nFROM_CONFIG = \"config-value\"\n[init]\nfiles = [{}]\n[journal]\nenabled = false\n",
             serde_json::to_string(init.to_str().unwrap()).unwrap()
         ),
     )
@@ -536,6 +537,30 @@ fn daemon_binds_secure_socket_and_attaches() {
         &Request {
             jsonrpc: JSONRPC.into(),
             id: 4.into(),
+            method: "exec".into(),
+            params: serde_json::to_value(ExecParams {
+                src: "journal".into(),
+                mode: "run".into(),
+                position: "value".into(),
+                asynchronous: false,
+                timeout_ms: None,
+                elide: None,
+                plan_ref: None,
+            })
+            .unwrap(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        recv(&mut reader).result.unwrap()["value"],
+        serde_json::json!({"$": "table", "cols": {}, "n": 0}),
+        "journal.enabled=false disables language-facing statement history"
+    );
+    write_frame(
+        &mut stream,
+        &Request {
+            jsonrpc: JSONRPC.into(),
+            id: 5.into(),
             method: "kernel.shutdown".into(),
             params: serde_json::json!({}),
         },
@@ -546,6 +571,17 @@ fn daemon_binds_secure_socket_and_attaches() {
         child.wait().unwrap().success(),
         "daemon stderr:\n{}",
         read_daemon_stderr(&stderr_path)
+    );
+    let audit_rows = Journal::open(&state)
+        .unwrap()
+        .query(&JournalQuery {
+            limit: 100,
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        audit_rows.iter().any(|row| row.src == "env.FROM_CONFIG"),
+        "kernel security/exec audit remains mandatory when language history is disabled"
     );
     assert!(!socket.exists());
 }

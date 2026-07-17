@@ -88,14 +88,23 @@ impl Kernel {
         let requested_offset = params.offset.unwrap_or(0);
         let requested_length = params.length.unwrap_or(RAW_PAGE_MAX_BYTES as u64);
         let effective_length = requested_length.min(RAW_PAGE_MAX_BYTES as u64) as usize;
-        let (total_len, blob) = journal
-            .read_blob_range(&hash, requested_offset, effective_length)
-            .map_err(internal)?
-            .ok_or_else(|| RpcError {
-                code: UNKNOWN_REF,
-                message: "unknown value hash".into(),
-                data: None,
-            })?;
+        let cached = journal
+            .cached_blob_range(&hash, requested_offset, effective_length)
+            .map_err(internal)?;
+        let (total_len, blob) = match cached {
+            Some(page) => page,
+            None => {
+                self.reserve_blob_decompression(&attachment.session)?;
+                journal
+                    .read_blob_range(&hash, requested_offset, effective_length)
+                    .map_err(internal)?
+                    .ok_or_else(|| RpcError {
+                        code: UNKNOWN_REF,
+                        message: "unknown value hash".into(),
+                        data: None,
+                    })?
+            }
+        };
         let offset = requested_offset.min(total_len);
         let returned_len = blob.len() as u64;
         let next = offset.saturating_add(returned_len).min(total_len);

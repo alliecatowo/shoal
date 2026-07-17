@@ -256,7 +256,10 @@ explicit-transfer path: `value.get {format:"raw"}` returns at most 8 KiB of deco
 response plus continuation metadata. Resident strings/bytes are sliced before encoding; CAS-backed
 bytes use a verified bounded-memory stream. Strings retain the existing Unicode-scalar slice units,
 while bytes use octets. `blob.get` likewise accepts byte `offset`/`length`, clamps length to the same
-wall, and never materializes the whole compressed-store object for a page.
+wall, and never materializes the whole compressed-store object for a page. An exact verified-page
+LRU (1 MiB/256 entries) removes repeat work; cache misses are admitted through a principal/session
+decompression rate window (64 starts per 10 seconds by default), so hostile random offsets cannot
+force unbounded repeated full-stream verification.
 
 A successful `Outcome` keeps status metadata inline while applying elision to its `.out` value.
 Headless attachments have ANSI removed before render bounding; a future true-TTY kernel client can

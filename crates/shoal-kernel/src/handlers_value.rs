@@ -233,6 +233,9 @@ impl Kernel {
         // ordinary value slicer so a hostile range can never allocate or
         // base64 the full resident/CAS-backed payload first.
         if params.format.as_deref() == Some("raw") {
+            if matches!(&resolved, Value::CasBytes(_)) {
+                self.reserve_blob_decompression(session)?;
+            }
             return encode(raw_page(&params.r#ref, &resolved, params.slice)?);
         }
         // Slicing is an explicit, targeted ask: apply it at the value
@@ -286,6 +289,7 @@ impl Kernel {
                         })),
                     });
                 }
+                self.reserve_blob_decompression(session)?;
                 Value::Bytes(std::sync::Arc::new(read_cas_range(
                     &params.r#ref,
                     &c,

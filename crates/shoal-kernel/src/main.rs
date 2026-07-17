@@ -149,6 +149,8 @@ struct Args {
     max_ptys_per_principal: Option<usize>,
     max_ptys_global: Option<usize>,
     max_subscriptions_per_session: Option<usize>,
+    max_blob_decompressions_per_window: Option<usize>,
+    blob_decompression_window_ms: Option<u64>,
     frame_read_timeout_ms: Option<u64>,
 }
 impl Args {
@@ -165,6 +167,8 @@ impl Args {
             max_ptys_per_principal: None,
             max_ptys_global: None,
             max_subscriptions_per_session: None,
+            max_blob_decompressions_per_window: None,
+            blob_decompression_window_ms: None,
             frame_read_timeout_ms: None,
         };
         let parse_usize = |key: &std::ffi::OsString,
@@ -215,6 +219,22 @@ impl Args {
                     a.max_subscriptions_per_session =
                         Some(parse_usize(&k, it.next().ok_or_else(&missing)?)?)
                 }
+                Some("--max-blob-decompressions-per-window") => {
+                    a.max_blob_decompressions_per_window =
+                        Some(parse_usize(&k, it.next().ok_or_else(&missing)?)?)
+                }
+                Some("--blob-decompression-window-ms") => {
+                    a.blob_decompression_window_ms = Some(
+                        it.next()
+                            .ok_or_else(&missing)?
+                            .to_str()
+                            .and_then(|text| text.parse().ok())
+                            .ok_or_else(|| {
+                                "--blob-decompression-window-ms requires a non-negative integer"
+                                    .to_string()
+                            })?,
+                    )
+                }
                 Some("--frame-read-timeout-ms") => {
                     a.frame_read_timeout_ms = Some(
                         it.next()
@@ -227,7 +247,7 @@ impl Args {
                             })?,
                     )
                 }
-                Some("-h" | "--help") => return Err("usage: shoal-kernel [--session NAME] [--socket PATH | --embedded-fd FD] [--state-dir PATH] [--policy FILE] [--max-connections N] [--max-tasks-per-session N] [--max-ptys-per-session N] [--max-ptys-per-principal N] [--max-ptys-global N] [--max-subscriptions-per-session N] [--frame-read-timeout-ms N]".into()),
+                Some("-h" | "--help") => return Err("usage: shoal-kernel [--session NAME] [--socket PATH | --embedded-fd FD] [--state-dir PATH] [--policy FILE] [--max-connections N] [--max-tasks-per-session N] [--max-ptys-per-session N] [--max-ptys-per-principal N] [--max-ptys-global N] [--max-subscriptions-per-session N] [--max-blob-decompressions-per-window N] [--blob-decompression-window-ms N] [--frame-read-timeout-ms N]".into()),
                 _ => return Err(format!("unknown argument {}", k.to_string_lossy())),
             }
         }
@@ -254,6 +274,12 @@ impl Args {
             max_subscriptions_per_session: self
                 .max_subscriptions_per_session
                 .unwrap_or(defaults.max_subscriptions_per_session),
+            max_blob_decompressions_per_window: self
+                .max_blob_decompressions_per_window
+                .unwrap_or(defaults.max_blob_decompressions_per_window),
+            blob_decompression_window_ms: self
+                .blob_decompression_window_ms
+                .unwrap_or(defaults.blob_decompression_window_ms),
             frame_read_timeout_ms: self
                 .frame_read_timeout_ms
                 .unwrap_or(defaults.frame_read_timeout_ms),
@@ -281,6 +307,10 @@ mod tests {
                 "5",
                 "--max-ptys-global",
                 "20",
+                "--max-blob-decompressions-per-window",
+                "7",
+                "--blob-decompression-window-ms",
+                "9000",
                 "--frame-read-timeout-ms",
                 "2500",
             ]
@@ -293,6 +323,8 @@ mod tests {
         assert_eq!(limits.max_ptys_per_session, 3);
         assert_eq!(limits.max_ptys_per_principal, 5);
         assert_eq!(limits.max_ptys_global, 20);
+        assert_eq!(limits.max_blob_decompressions_per_window, 7);
+        assert_eq!(limits.blob_decompression_window_ms, 9000);
         assert_eq!(limits.frame_read_timeout_ms, 2500);
         assert_eq!(
             limits.max_tasks_per_session,

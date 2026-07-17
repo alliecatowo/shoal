@@ -44,6 +44,8 @@ pub struct Kernel {
     sessions: SessionRegistry,
     connections: ConnectionRegistry,
     max_subscriptions_per_session: AtomicUsize,
+    max_blob_decompressions_per_window: AtomicUsize,
+    blob_decompression_window_ms: AtomicU64,
     journal: Mutex<Journal>,
     /// The per-user state dir this kernel's own `journal` (above) was opened
     /// against, if any (`None` for the ephemeral in-memory kernels used by
@@ -88,6 +90,10 @@ pub struct Limits {
     pub max_ptys_per_principal: usize,
     pub max_ptys_global: usize,
     pub max_subscriptions_per_session: usize,
+    /// Cache-miss CAS verification/decompression starts allowed per exact
+    /// principal/session during one rate window. Cache hits do not consume it.
+    pub max_blob_decompressions_per_window: usize,
+    pub blob_decompression_window_ms: u64,
     /// Deadline for an unauthenticated connection's first byte and for the
     /// remainder of any frame once its first byte arrives. Zero disables it.
     pub frame_read_timeout_ms: u64,
@@ -122,6 +128,8 @@ impl Default for Limits {
             max_ptys_per_principal: 64,
             max_ptys_global: 256,
             max_subscriptions_per_session: 256,
+            max_blob_decompressions_per_window: 64,
+            blob_decompression_window_ms: 10_000,
             frame_read_timeout_ms: 10_000,
         }
     }
@@ -582,6 +590,10 @@ impl Kernel {
                 limits.frame_read_timeout_ms,
             ),
             max_subscriptions_per_session: AtomicUsize::new(limits.max_subscriptions_per_session),
+            max_blob_decompressions_per_window: AtomicUsize::new(
+                limits.max_blob_decompressions_per_window,
+            ),
+            blob_decompression_window_ms: AtomicU64::new(limits.blob_decompression_window_ms),
             journal: Mutex::new(Journal::in_memory().expect("in-memory journal")),
             state_dir: None,
             policy: permissive_policy(),
@@ -624,6 +636,10 @@ impl Kernel {
                 limits.frame_read_timeout_ms,
             ),
             max_subscriptions_per_session: AtomicUsize::new(limits.max_subscriptions_per_session),
+            max_blob_decompressions_per_window: AtomicUsize::new(
+                limits.max_blob_decompressions_per_window,
+            ),
+            blob_decompression_window_ms: AtomicU64::new(limits.blob_decompression_window_ms),
             journal: Mutex::new(journal),
             state_dir: Some(state_dir.to_path_buf()),
             policy: permissive_policy(),
@@ -663,6 +679,10 @@ impl Kernel {
                 limits.frame_read_timeout_ms,
             ),
             max_subscriptions_per_session: AtomicUsize::new(limits.max_subscriptions_per_session),
+            max_blob_decompressions_per_window: AtomicUsize::new(
+                limits.max_blob_decompressions_per_window,
+            ),
+            blob_decompression_window_ms: AtomicU64::new(limits.blob_decompression_window_ms),
             journal: Mutex::new(journal),
             state_dir: Some(state_dir.to_path_buf()),
             policy,
@@ -694,6 +714,10 @@ impl Kernel {
                 limits.frame_read_timeout_ms,
             ),
             max_subscriptions_per_session: AtomicUsize::new(limits.max_subscriptions_per_session),
+            max_blob_decompressions_per_window: AtomicUsize::new(
+                limits.max_blob_decompressions_per_window,
+            ),
+            blob_decompression_window_ms: AtomicU64::new(limits.blob_decompression_window_ms),
             journal: Mutex::new(Journal::in_memory().expect("in-memory journal")),
             state_dir: None,
             policy,
@@ -727,6 +751,20 @@ impl Kernel {
         );
         self.max_subscriptions_per_session
             .store(limits.max_subscriptions_per_session, Ordering::Relaxed);
+        self.max_blob_decompressions_per_window
+            .store(limits.max_blob_decompressions_per_window, Ordering::Relaxed);
+        self.blob_decompression_window_ms
+            .store(limits.blob_decompression_window_ms, Ordering::Relaxed);
+    }
+
+    fn reserve_blob_decompression(&self, session: &Session) -> Result<(), RpcError> {
+        session.reserve_blob_decompression(
+            self.max_blob_decompressions_per_window
+                .load(Ordering::Relaxed),
+            std::time::Duration::from_millis(
+                self.blob_decompression_window_ms.load(Ordering::Relaxed),
+            ),
+        )
     }
 
     fn reserve_connection_slot(&self) -> Result<ConnectionPermit, ()> {

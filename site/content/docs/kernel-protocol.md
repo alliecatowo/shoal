@@ -360,7 +360,7 @@ Formats:
 - `render`: `{ref, render}` with bounded 80-column display;
 - `raw`: `{ref, raw}` for strings or `{ref, raw_base64}` for bytes/CAS bytes.
 
-`raw` returns at most 8 KiB of decoded content plus `page` metadata. String slice offsets and `total_len` use Unicode scalar units; bytes/CAS values use byte units. Follow `page.next_offset` until `page.done`. CAS pages are integrity-verified and streamed without materializing the full blob. Other types reject raw format with `BAD_PATH_OR_SLICE`.
+`raw` returns at most 8 KiB of decoded content plus `page` metadata. String slice offsets and `total_len` use Unicode scalar units; bytes/CAS values use byte units. Follow `page.next_offset` until `page.done`. CAS pages are integrity-verified and streamed without materializing the full blob. Verification/decompression starts are rate-limited per exact principal/session; the default is 64 per 10 seconds. Other types reject raw format with `BAD_PATH_OR_SLICE`.
 
 ### `blob.get`
 
@@ -368,7 +368,7 @@ Formats:
 {"hash":"8baef...","offset":0,"length":8192}
 ```
 
-Offset and length are uncompressed byte units and length is clamped to 8 KiB. Explicit ranges and oversized blobs return `{hash, encoding:"base64", raw_base64, page}`. Follow `page.next_offset` until done. For compatibility, an omitted range that contains the complete small blob still returns `{hash, value, page}`; tagged JSON is decoded structurally and other bytes use the tagged byte shape:
+Offset and length are uncompressed byte units and length is clamped to 8 KiB. Explicit ranges and oversized blobs return `{hash, encoding:"base64", raw_base64, page}`. Follow `page.next_offset` until done. Exact verified pages are cached in a process-local 1 MiB/256-entry LRU; a hit does not consume the owner's decompression budget. Distinct/random offsets miss the cache and the default 64-per-10-second exact-owner rate limit prevents unbounded repeated verification of compressed legacy blobs. Operators can tune this with `--max-blob-decompressions-per-window` and `--blob-decompression-window-ms`. For compatibility, an omitted range that contains the complete small blob still returns `{hash, value, page}`; tagged JSON is decoded structurally and other bytes use the tagged byte shape:
 
 ```json
 {"$":"bytes","len":1234,"v":"base64..."}

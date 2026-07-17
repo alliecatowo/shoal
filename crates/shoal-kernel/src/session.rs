@@ -88,6 +88,7 @@ pub(crate) struct Session {
     /// coarser outer exec rows.
     out_entries: Mutex<VecDeque<Option<i64>>>,
     stream_cursors: Mutex<HashMap<StreamCursorRef, Arc<WireStreamCursorEntry>>>,
+    blob_decompressions: Mutex<VecDeque<Instant>>,
 }
 
 pub(crate) const MAX_TRANSCRIPT_PER_SESSION: usize = 4096;
@@ -157,12 +158,58 @@ impl Session {
             || self.transcript.is_poisoned()
             || self.out_entries.is_poisoned()
             || self.stream_cursors.is_poisoned()
+            || self.blob_decompressions.is_poisoned()
         {
             self.quarantine();
             Err(self.quarantined_error())
         } else {
             Ok(())
         }
+    }
+
+    pub(crate) fn reserve_blob_decompression(
+        &self,
+        max: usize,
+        window: std::time::Duration,
+    ) -> Result<(), RpcError> {
+        self.ensure_healthy()?;
+        let now = Instant::now();
+        let mut recent = self.blob_decompressions.lock().map_err(|poisoned| {
+            drop(poisoned);
+            self.quarantine();
+            self.quarantined_error()
+        })?;
+        while recent
+            .front()
+            .is_some_and(|started| now.duration_since(*started) >= window)
+        {
+            recent.pop_front();
+        }
+        if recent.len() >= max {
+            let retry_after = recent
+                .front()
+                .map(|started| {
+                    started
+                        .checked_add(window)
+                        .unwrap_or(now)
+                        .saturating_duration_since(now)
+                        .as_millis() as u64
+                })
+                .unwrap_or(0);
+            return Err(RpcError {
+                code: QUOTA_EXCEEDED,
+                message: "CAS decompression rate limit exceeded".into(),
+                data: Some(json!({
+                    "limit": "blob_decompressions_per_window",
+                    "max": max,
+                    "window_ms": window.as_millis() as u64,
+                    "retry_after_ms": retry_after,
+                    "owner": {"principal": &self.key.principal, "session": &self.key.name},
+                })),
+            });
+        }
+        recent.push_back(now);
+        Ok(())
     }
 
     fn quarantined_error(&self) -> RpcError {
@@ -523,7 +570,7 @@ impl Kernel {
                 // recording is best-effort and never fails a cd).
                 evaluator.open_default_jump_history();
                 // Install a command journal on the session's own evaluator (site/content/internals/language-conformance-contract.md),
-                // mirroring `crates/shoal/src/repl.rs`'s `set_journal` call: without
+                // mirroring the local REPL's `set_journal` call: without
                 // this, the evaluator's per-statement journal integration
                 // (`journal_begin_stmt`/`stmt_source` in `shoal-eval/src/journal.rs`)
                 // never runs, so the in-language `history`/`journal` builtin is inert
@@ -547,7 +594,9 @@ impl Kernel {
                 // still works, just with the in-language history/journal builtin
                 // disabled, the same way an interactive REPL degrades when its own
                 // journal can't be opened.
-                if let Some(state_dir) = &self.state_dir {
+                if bootstrap.config().journal.enabled
+                    && let Some(state_dir) = &self.state_dir
+                {
                     match Journal::open(state_dir) {
                         Ok(journal) => evaluator.set_journal(journal, name, principal),
                         Err(error) => {
@@ -582,6 +631,7 @@ impl Kernel {
                     next_value: AtomicU64::new(1),
                     out_entries: Mutex::new(VecDeque::new()),
                     stream_cursors: Mutex::new(HashMap::new()),
+                    blob_decompressions: Mutex::new(VecDeque::new()),
                 }))
             },
             |owner| {

@@ -2847,6 +2847,178 @@ fn blob_get_pages_large_content_and_handles_offset_overflow() {
     thread.join().unwrap();
 }
 
+#[test]
+fn blob_page_cache_hits_are_free_but_random_misses_are_owner_rate_limited() {
+    let kernel = Kernel::new();
+    kernel.configure_limits(Limits {
+        max_blob_decompressions_per_window: 2,
+        blob_decompression_window_ms: 60_000,
+        ..Limits::default()
+    });
+    let (mut client, mut reader, thread) = spawn(&kernel);
+    call(
+        &mut client,
+        &mut reader,
+        1,
+        "session.attach",
+        json!({"local_auth":"local-human","session":"blob-rate","client":{"kind":"agent","tty":false}}),
+    );
+    let source = format!("\"{}\"", "r".repeat(RAW_PAGE_MAX_BYTES * 5));
+    assert!(
+        call(&mut client, &mut reader, 2, "exec", json!({"src":source}))
+            .error
+            .is_none()
+    );
+    let hash = {
+        let journal = kernel
+            .journal
+            .lock()
+            .expect("test lock should not be poisoned");
+        journal
+            .query(&JournalQuery::default())
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.session == "blob-rate")
+            .unwrap()
+            .outputs
+            .into_iter()
+            .find(|output| output.kind == "value")
+            .unwrap()
+            .hash
+    };
+
+    for (id, offset) in [(3, 0), (4, 0), (5, RAW_PAGE_MAX_BYTES as u64)] {
+        let page = call(
+            &mut client,
+            &mut reader,
+            id,
+            "blob.get",
+            json!({"hash":hash,"offset":offset,"length":RAW_PAGE_MAX_BYTES}),
+        );
+        assert!(
+            page.error.is_none(),
+            "page {offset} should be admitted: {page:?}"
+        );
+    }
+    let denied = call(
+        &mut client,
+        &mut reader,
+        6,
+        "blob.get",
+        json!({"hash":hash,"offset":u64::MAX,"length":u64::MAX}),
+    );
+    let error = denied
+        .error
+        .expect("third distinct decompression is limited");
+    assert_eq!(error.code, QUOTA_EXCEEDED);
+    assert_eq!(error.data.as_ref().unwrap()["max"], 2);
+    assert_eq!(
+        error.data.as_ref().unwrap()["owner"]["session"],
+        "blob-rate"
+    );
+
+    drop(client);
+    drop(reader);
+    thread.join().unwrap();
+}
+
+#[test]
+fn blob_decompression_budget_is_private_to_exact_session_owner() {
+    fn attach_and_exec(
+        client: &mut UnixStream,
+        reader: &mut BufReader<UnixStream>,
+        id: i64,
+        session: &str,
+        source: &str,
+    ) {
+        call(
+            client,
+            reader,
+            id,
+            "session.attach",
+            json!({"local_auth":"local-human","session":session,"client":{"kind":"agent","tty":false}}),
+        );
+        assert!(
+            call(client, reader, id + 1, "exec", json!({"src":source}))
+                .error
+                .is_none()
+        );
+    }
+
+    let kernel = Kernel::new();
+    kernel.configure_limits(Limits {
+        max_blob_decompressions_per_window: 1,
+        blob_decompression_window_ms: 60_000,
+        ..Limits::default()
+    });
+    let (mut client, mut reader, thread) = spawn(&kernel);
+    let source = format!("\"{}\"", "o".repeat(RAW_PAGE_MAX_BYTES * 5));
+
+    attach_and_exec(&mut client, &mut reader, 1, "owner-a", &source);
+    let hash = {
+        let journal = kernel
+            .journal
+            .lock()
+            .expect("test lock should not be poisoned");
+        journal
+            .query(&JournalQuery::default())
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.session == "owner-a")
+            .unwrap()
+            .outputs
+            .into_iter()
+            .find(|output| output.kind == "value")
+            .unwrap()
+            .hash
+    };
+    assert!(
+        call(
+            &mut client,
+            &mut reader,
+            3,
+            "blob.get",
+            json!({"hash":hash,"offset":0,"length":RAW_PAGE_MAX_BYTES}),
+        )
+        .error
+        .is_none()
+    );
+
+    attach_and_exec(&mut client, &mut reader, 4, "owner-b", &source);
+    assert!(
+        call(
+            &mut client,
+            &mut reader,
+            6,
+            "blob.get",
+            json!({"hash":hash,"offset":RAW_PAGE_MAX_BYTES,"length":RAW_PAGE_MAX_BYTES}),
+        )
+        .error
+        .is_none(),
+        "owner B has an independent decompression budget"
+    );
+
+    call(
+        &mut client,
+        &mut reader,
+        7,
+        "session.attach",
+        json!({"local_auth":"local-human","session":"owner-a","client":{"kind":"agent","tty":false}}),
+    );
+    let denied = call(
+        &mut client,
+        &mut reader,
+        8,
+        "blob.get",
+        json!({"hash":hash,"offset":RAW_PAGE_MAX_BYTES * 2,"length":RAW_PAGE_MAX_BYTES}),
+    );
+    assert_eq!(denied.error.unwrap().code, QUOTA_EXCEEDED);
+
+    drop(client);
+    drop(reader);
+    thread.join().unwrap();
+}
+
 /// Read one already-written frame off the socket (no request sent) — for
 /// asserting on pushed `event` notifications interleaved with responses.
 fn recv_line(reader: &mut BufReader<UnixStream>) -> Json {

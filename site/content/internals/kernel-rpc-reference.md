@@ -314,6 +314,13 @@ to 8 KiB with overflow-safe arithmetic. A complete small omitted-range request p
 foreign-owner hashes are both `UNKNOWN_REF`: attachment plus exact session/principal output
 ownership is checked before opening the CAS.
 
+The journal keeps an exact-range LRU capped at 1 MiB and 256 entries. Cached pages were already
+verified against the content hash and are served only while the blob remains live; hits do not
+reopen/decompress or consume rate budget. Cache misses and CAS-backed `value.get` reads reserve one
+of the exact owner's decompression starts (default 64 per 10 seconds). Excess random/distant pages
+fail `QUOTA_EXCEEDED` with `retry_after_ms` before opening the blob. Legacy single-stream `.zst`
+objects remain readable without migration.
+
 ## Tasks
 
 Task records contain `task`, `session`, `state`, `started_ns`, `finished_ns`, `result_ref`, and

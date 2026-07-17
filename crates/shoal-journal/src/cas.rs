@@ -15,6 +15,9 @@ use crate::{Journal, hex_bytes, io_to_sql, now_ns};
 
 /// zstd compression level for CAS blobs (3 = the zstd default: fast, good ratio).
 const ZSTD_LEVEL: i32 = 3;
+/// Absolute allocation ceiling of the journal's generic range API. Kernel raw
+/// pages use a smaller protocol wall; this protects direct embedders too.
+pub const BLOB_RANGE_MAX_BYTES: usize = 64 * 1024;
 
 const DEFAULT_OUTPUT_HARD_CAP: usize = 256 * 1024 * 1024;
 /// Default SQLite `busy_timeout`: how long a writer blocks waiting for a
@@ -189,6 +192,11 @@ impl Journal {
         offset: u64,
         length: usize,
     ) -> rusqlite::Result<Option<(u64, Vec<u8>)>> {
+        let requested_offset = offset;
+        let length = length.min(BLOB_RANGE_MAX_BYTES);
+        if let Some(cached) = self.cached_blob_range(hash, requested_offset, length)? {
+            return Ok(Some(cached));
+        }
         let Some(total) = self.blob_len(hash)? else {
             return Ok(None);
         };
@@ -220,7 +228,46 @@ impl Journal {
                 params![now_ns(), raw],
             )?;
         }
+        self.blob_page_cache
+            .borrow_mut()
+            .insert(crate::BlobPageCacheEntry {
+                hash: hash.to_ascii_lowercase(),
+                offset: requested_offset,
+                length,
+                total,
+                bytes: page.clone(),
+            });
         Ok(Some((total, page)))
+    }
+
+    /// Return a previously verified exact range without reopening or
+    /// decompressing the CAS object. Cache entries are bounded by both byte
+    /// and count ceilings and are only served while the backing blob remains
+    /// live in the journal and on disk.
+    pub fn cached_blob_range(
+        &self,
+        hash: &str,
+        offset: u64,
+        length: usize,
+    ) -> rusqlite::Result<Option<(u64, Vec<u8>)>> {
+        let length = length.min(BLOB_RANGE_MAX_BYTES);
+        let cached =
+            self.blob_page_cache
+                .borrow_mut()
+                .get(&hash.to_ascii_lowercase(), offset, length);
+        let Some((total, bytes)) = cached else {
+            return Ok(None);
+        };
+        if self.blob_len(hash)? != Some(total) || !self.blob_path(hash).is_file() {
+            return Ok(None);
+        }
+        if let Ok(raw) = hex_bytes(hash) {
+            self.conn.execute(
+                "UPDATE blob SET last_access_ns=?1 WHERE hash=?2",
+                params![now_ns(), raw],
+            )?;
+        }
+        Ok(Some((total, bytes)))
     }
 
     /// The stored (uncompressed) byte length of the CAS blob addressed by
