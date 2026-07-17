@@ -6,18 +6,29 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-fn local_human_attach_params() -> serde_json::Value {
-    let mut params = serde_json::to_value(AttachParams {
+fn credentialed_human_attach_params(token: &str) -> serde_json::Value {
+    serde_json::to_value(AttachParams {
         session: None,
-        token: None,
+        token: Some(token.to_string()),
         client: ClientInfo {
             kind: "test".into(),
             tty: false,
         },
     })
-    .unwrap();
-    params["local_auth"] = serde_json::json!("local-human");
-    params
+    .unwrap()
+}
+
+fn create_human_token(state: &Path) -> String {
+    shoal_auth::TokenStore::open(state.join("tokens.json"))
+        .unwrap()
+        .create(
+            format!("uid:{}", unsafe { geteuid() }),
+            "local-human".into(),
+            vec![],
+            None,
+        )
+        .unwrap()
+        .0
 }
 
 /// Route a spawned daemon's stderr to its own file inside its tempdir
@@ -62,13 +73,15 @@ fn daemon_binds_secure_socket_and_attaches() {
         .unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().unwrap();
     let socket = temp.path().join("run/session.sock");
+    let state = temp.path().join("state");
+    let human_token = create_human_token(&state);
     let (stderr_file, stderr_path) = daemon_stderr_file(temp.path());
     let mut child = Command::new(env!("CARGO_BIN_EXE_shoal-kernel"))
         .args([
             "--socket",
             socket.to_str().unwrap(),
             "--state-dir",
-            temp.path().join("state").to_str().unwrap(),
+            state.to_str().unwrap(),
         ])
         .stdout(Stdio::null())
         .stderr(stderr_file)
@@ -95,7 +108,7 @@ fn daemon_binds_secure_socket_and_attaches() {
             jsonrpc: JSONRPC.into(),
             id: 1.into(),
             method: "session.attach".into(),
-            params: local_human_attach_params(),
+            params: credentialed_human_attach_params(&human_token),
         },
     )
     .unwrap();
@@ -115,6 +128,7 @@ fn daemon_binds_secure_socket_and_attaches() {
 }
 unsafe extern "C" {
     fn kill(pid: i32, signal: i32) -> i32;
+    fn geteuid() -> u32;
 }
 
 /// Regression test for the accepted-socket non-blocking bug: `serve_until`
@@ -142,13 +156,15 @@ fn daemon_survives_a_paused_gap_between_two_sequential_requests() {
         .unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().unwrap();
     let socket = temp.path().join("run/session.sock");
+    let state = temp.path().join("state");
+    let human_token = create_human_token(&state);
     let (stderr_file, stderr_path) = daemon_stderr_file(temp.path());
     let mut child = Command::new(env!("CARGO_BIN_EXE_shoal-kernel"))
         .args([
             "--socket",
             socket.to_str().unwrap(),
             "--state-dir",
-            temp.path().join("state").to_str().unwrap(),
+            state.to_str().unwrap(),
         ])
         .stdout(Stdio::null())
         .stderr(stderr_file)
@@ -177,7 +193,7 @@ fn daemon_survives_a_paused_gap_between_two_sequential_requests() {
             jsonrpc: JSONRPC.into(),
             id: 1.into(),
             method: "session.attach".into(),
-            params: local_human_attach_params(),
+            params: credentialed_human_attach_params(&human_token),
         },
     )
     .unwrap();
@@ -257,6 +273,8 @@ fn live_kernel_elides_a_big_table_over_the_wire() {
         .unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().unwrap();
     let socket = temp.path().join("run/session.sock");
+    let state = temp.path().join("state");
+    let human_token = create_human_token(&state);
     let bigdir = temp.path().join("bigdir");
     std::fs::create_dir_all(&bigdir).unwrap();
     for i in 0..150 {
@@ -268,7 +286,7 @@ fn live_kernel_elides_a_big_table_over_the_wire() {
             "--socket",
             socket.to_str().unwrap(),
             "--state-dir",
-            temp.path().join("state").to_str().unwrap(),
+            state.to_str().unwrap(),
         ])
         .stdout(Stdio::null())
         .stderr(stderr_file)
@@ -324,7 +342,7 @@ fn live_kernel_elides_a_big_table_over_the_wire() {
             jsonrpc: JSONRPC.into(),
             id: 1.into(),
             method: "session.attach".into(),
-            params: local_human_attach_params(),
+            params: credentialed_human_attach_params(&human_token),
         };
         let exec_request = Request {
             jsonrpc: JSONRPC.into(),

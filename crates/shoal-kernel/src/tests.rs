@@ -1519,6 +1519,54 @@ fn bearer_attach_uses_token_principal_and_rejects_invalid() {
 }
 
 #[test]
+fn durable_kernel_rejects_asserted_human_and_accepts_credentialed_human() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut tokens = TokenStore::open(dir.path().join("tokens.json")).unwrap();
+    let (human_token, _) = tokens
+        .create("human:operator".into(), "local-human".into(), vec![], None)
+        .unwrap();
+    drop(tokens);
+    let kernel = Kernel::open(dir.path()).unwrap();
+    let (mut client, mut reader, thread) = spawn(&kernel);
+
+    let asserted = call(
+        &mut client,
+        &mut reader,
+        1,
+        "session.attach",
+        json!({
+            "local_auth":"local-human",
+            "client":{"kind":"raw-agent","tty":true}
+        }),
+    );
+    let error = asserted
+        .error
+        .expect("raw durable-socket callers cannot assert human authority");
+    assert_eq!(error.code, AUTH_FAILED);
+    assert_eq!(error.data.unwrap()["credential_required"], true);
+
+    let credentialed = call(
+        &mut client,
+        &mut reader,
+        2,
+        "session.attach",
+        json!({
+            "token":human_token,
+            "client":{"kind":"native-human","tty":true}
+        }),
+    )
+    .result
+    .expect("a validated local-human bearer is the authenticated human endpoint");
+    assert_eq!(credentialed["principal"], "human:operator");
+    assert_eq!(credentialed["auth_mode"], "bearer");
+    assert_eq!(credentialed["caps"]["profile"], "local-human");
+
+    drop(client);
+    drop(reader);
+    thread.join().unwrap();
+}
+
+#[test]
 fn idle_revoked_bearer_is_disconnected_and_loses_subscriptions() {
     use std::io::Read;
 
@@ -1660,18 +1708,13 @@ fn token_and_local_auth_cannot_be_combined() {
 #[test]
 fn kernel_open_installs_a_session_journal_so_history_builtin_sees_real_data() {
     let dir = tempfile::tempdir().unwrap();
+    let human_token = create_local_human_token(dir.path());
     let kernel = Kernel::open(dir.path()).unwrap();
     let (mut client, server) = UnixStream::pair().unwrap();
     let mut reader = BufReader::new(client.try_clone().unwrap());
     let server_kernel = kernel.clone();
     let thread = std::thread::spawn(move || server_kernel.handle_stream(server).unwrap());
-    call(
-        &mut client,
-        &mut reader,
-        1,
-        "session.attach",
-        json!({"local_auth":"local-human","client":{"kind":"agent","tty":false}}),
-    );
+    attach_bearer(&mut client, &mut reader, &human_token);
     let marker_src = "let kernel_journal_probe_4471 = 4471";
     let exec = call(
         &mut client,
@@ -2182,6 +2225,28 @@ fn attach(client: &mut UnixStream, reader: &mut BufReader<UnixStream>) -> Respon
     )
 }
 
+fn create_local_human_token(state_dir: &Path) -> String {
+    let mut tokens = TokenStore::open(state_dir.join("tokens.json")).unwrap();
+    tokens
+        .create(principal(), "local-human".into(), vec![], None)
+        .unwrap()
+        .0
+}
+
+fn attach_bearer(
+    client: &mut UnixStream,
+    reader: &mut BufReader<UnixStream>,
+    token: &str,
+) -> Response {
+    call(
+        client,
+        reader,
+        1,
+        "session.attach",
+        json!({"token":token,"client":{"kind":"native-human","tty":false}}),
+    )
+}
+
 fn spawn(
     kernel: &Arc<Kernel>,
 ) -> (
@@ -2510,9 +2575,10 @@ fn journal_channel_replays_aged_out_events_from_the_journal() {
 #[test]
 fn journal_channel_replay_excludes_evaluator_per_statement_entries() {
     let dir = tempfile::tempdir().unwrap();
+    let human_token = create_local_human_token(dir.path());
     let kernel = Kernel::open(dir.path()).unwrap();
     let (mut client, mut reader, thread) = spawn(&kernel);
-    attach(&mut client, &mut reader);
+    attach_bearer(&mut client, &mut reader, &human_token);
 
     // Three top-level statements per exec: on-disk, the store gets one
     // coarse entry + three per-statement entries per exec, but the channel
@@ -2819,6 +2885,7 @@ fn session_transcript_channel_replay_skips_entries_with_no_transcript_row() {
 #[test]
 fn event_bus_seq_state_survives_a_kernel_restart() {
     let dir = tempfile::tempdir().unwrap();
+    let human_token = create_local_human_token(dir.path());
     let pre_restart_execs = 5usize;
 
     // "Prior lifetime": open, run a few execs, then drop the kernel
@@ -2826,7 +2893,7 @@ fn event_bus_seq_state_survives_a_kernel_restart() {
     {
         let kernel = Kernel::open(dir.path()).unwrap();
         let (mut client, mut reader, thread) = spawn(&kernel);
-        attach(&mut client, &mut reader);
+        attach_bearer(&mut client, &mut reader, &human_token);
         for i in 0..pre_restart_execs {
             let r = call(
                 &mut client,
@@ -2862,7 +2929,7 @@ fn event_bus_seq_state_survives_a_kernel_restart() {
     // against the exact same on-disk state dir.
     let kernel2 = Kernel::open(dir.path()).unwrap();
     let (mut client2, mut reader2, thread2) = spawn(&kernel2);
-    attach(&mut client2, &mut reader2);
+    attach_bearer(&mut client2, &mut reader2, &human_token);
 
     // A newly published `journal` event must continue past the
     // pre-existing (coarse) journal-channel entry count — never reset
@@ -2962,9 +3029,10 @@ fn event_bus_seq_state_survives_a_kernel_restart() {
 #[test]
 fn kernel_open_on_a_fresh_store_still_starts_journal_channel_seqs_at_zero() {
     let dir = tempfile::tempdir().unwrap();
+    let human_token = create_local_human_token(dir.path());
     let kernel = Kernel::open(dir.path()).unwrap();
     let (mut client, mut reader, thread) = spawn(&kernel);
-    attach(&mut client, &mut reader);
+    attach_bearer(&mut client, &mut reader, &human_token);
     let exec = call(&mut client, &mut reader, 1, "exec", json!({"src":"1 + 1"}));
     assert!(exec.error.is_none());
     let read = call(
@@ -3741,6 +3809,9 @@ fn distinct_agent_without_approver_role_is_denied_but_local_human_can_approve() 
     let (unauthorized_token, _) = tokens
         .create("agent:other".into(), "agent".into(), vec![], None)
         .unwrap();
+    let (human_token, _) = tokens
+        .create("human:operator".into(), "local-human".into(), vec![], None)
+        .unwrap();
     drop(tokens);
     let policy =
         Policy::from_toml("[principal.\"agent:requester\"]\nopaque='ask'\nauto_apply='never'\n")
@@ -3794,7 +3865,7 @@ fn distinct_agent_without_approver_role_is_denied_but_local_human_can_approve() 
         &mut human_reader,
         1,
         "session.attach",
-        json!({"local_auth":"local-human","client":{"kind":"human","tty":false}}),
+        json!({"token":human_token,"client":{"kind":"human","tty":false}}),
     )
     .result
     .unwrap();
@@ -3807,7 +3878,7 @@ fn distinct_agent_without_approver_role_is_denied_but_local_human_can_approve() 
         json!({"plan_ref":plan_ref}),
     )
     .result
-    .expect("the trusted local-human path remains usable");
+    .expect("the credentialed local-human path remains usable");
     assert_eq!(approved["approver"], human_principal);
 
     drop(requester);

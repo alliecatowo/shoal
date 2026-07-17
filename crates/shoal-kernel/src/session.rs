@@ -398,6 +398,19 @@ impl Kernel {
                 data: None,
             });
         }
+        if params.token.is_none()
+            && local_auth == Some(LocalAuthMode::LocalHuman)
+            && !self.allow_unauthenticated_local_human
+        {
+            return Err(RpcError {
+                code: AUTH_FAILED,
+                message: "durable kernels require a bearer credential with profile `local-human`; raw local-human assertion is disabled".into(),
+                data: Some(json!({
+                    "auth_mode": "local-human",
+                    "credential_required": true,
+                })),
+            });
+        }
         let (who, token_caps, profile, local_human, auth_mode, bearer) =
             if let Some(token) = params.token {
                 let auth = self.auth.as_ref().ok_or_else(|| RpcError {
@@ -442,6 +455,7 @@ impl Kernel {
                 )
             };
         let can_approve = local_human
+            || profile == "local-human"
             || profile == "supervisor"
             || token_caps.iter().any(|cap| cap == "plan.approve");
         let name = params.session.unwrap_or_else(|| "default".into());

@@ -61,6 +61,12 @@ pub struct Kernel {
     /// so terminated + reaped) on `pty.close` or when the kernel is dropped.
     ptys: Arc<PtyRegistry>,
     auth: Option<Mutex<TokenStore>>,
+    /// In-memory embedded kernels have no token store and may deliberately use
+    /// the hosting process as their human trust root. Durable socket daemons
+    /// keep this false: a wire client cannot grant itself human authority by
+    /// merely asserting `local_auth: local-human`; it must present a bearer
+    /// whose stored profile is `local-human`.
+    allow_unauthenticated_local_human: bool,
     events: Arc<EventBus>,
     /// Whether a plan's requester may acknowledge its own plan via
     /// `cap.request` (HR-D3 self-acknowledgement). Default `false`: the approver
@@ -455,6 +461,7 @@ impl Kernel {
             )),
             events: Arc::new(EventBus::default()),
             auth: None,
+            allow_unauthenticated_local_human: true,
             allow_self_ack: AtomicBool::new(self_ack_from_env()),
             #[cfg(test)]
             fail_approval_audit: AtomicBool::new(false),
@@ -495,6 +502,7 @@ impl Kernel {
             )),
             events: Arc::new(events),
             auth: Some(Mutex::new(TokenStore::open(state_dir.join("tokens.json"))?)),
+            allow_unauthenticated_local_human: false,
             allow_self_ack: AtomicBool::new(self_ack_from_env()),
             #[cfg(test)]
             fail_approval_audit: AtomicBool::new(false),
@@ -532,6 +540,7 @@ impl Kernel {
             )),
             events: Arc::new(events),
             auth: Some(Mutex::new(TokenStore::open(state_dir.join("tokens.json"))?)),
+            allow_unauthenticated_local_human: false,
             allow_self_ack: AtomicBool::new(self_ack_from_env()),
             #[cfg(test)]
             fail_approval_audit: AtomicBool::new(false),
@@ -561,6 +570,7 @@ impl Kernel {
             )),
             events: Arc::new(EventBus::default()),
             auth: None,
+            allow_unauthenticated_local_human: true,
             allow_self_ack: AtomicBool::new(self_ack_from_env()),
             #[cfg(test)]
             fail_approval_audit: AtomicBool::new(false),
