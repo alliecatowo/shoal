@@ -61,9 +61,13 @@ accDescr: Shows the components and relationships described in Storage topology.
   Session --> CAS
 ```
 
-The busy timeout reduces—not eliminates—write loss under concurrent local/kernel/history handles.
-Many host journaling call sites deliberately swallow errors so command execution continues. There is
-no cross-process health record indicating that a row or inverse was dropped after the timeout.
+The busy timeout reduces—not eliminates—contention under concurrent local/kernel/history handles.
+The language evaluator treats an installed journal as an integrity boundary: failure to append the
+begin row rejects before statement effects, while a finish/output/undo failure after execution
+returns `journal_commit_indeterminate` and warns that effects may already have occurred. A missing
+journal remains the explicit no-history mode. Kernel approval auditing is a separate mandatory
+fail-closed layer. Some lower-level/direct journal embedders still choose their own error policy;
+there is no shared cross-process health record beyond the caller-visible error and unfinished row.
 
 ## Schema version and initialization
 
@@ -225,7 +229,8 @@ means partial combinations are valid storage states:
 - finish succeeds but an output insert fails;
 - CAS file exists but blob/output row insert fails;
 - blob/output rows exist but transcript event insert fails;
-- one of several undo inverses is missing after a swallowed busy error.
+- one of several undo inverses is missing after a storage error (the language evaluator reports the
+  statement as indeterminate rather than clean success).
 
 Consumers must handle those states without inventing data. If atomic execution finalization becomes
 a requirement, define a transaction boundary that does not hold SQLite locks across actual command
@@ -522,7 +527,7 @@ they do not independently rediscover a different path.
 | no entry kind/parent/ordinal | coarse/fine ambiguity and AST-shape replay heuristic | v2 execution identity columns/table |
 | `env_hash` permanently null | schema promises provenance not captured | wire a real digest or remove/deprecate |
 | no foreign keys | orphan logical rows possible | validate/migrate, then add intentional constraints |
-| host write errors often swallowed | silent durability/inverse loss | observable degraded-health event/status |
+| direct non-evaluator hosts choose their own write-error policy | inconsistent degraded-health reporting | shared health event/status contract |
 | global anonymous pins | permanent growth and no ownership | lease owner/reason/expiry table |
 | lazy `Cas::read` misses access updates | TTL can age actively read values | explicit lease or batched access telemetry |
 | duplicate-writer persist race | benign dedup can report failure | verify and accept an existing correct winner |

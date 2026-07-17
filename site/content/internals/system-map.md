@@ -257,8 +257,10 @@ and [`handlers_exec.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/s
    clients follow refs deliberately.
 7. **Reversibility is evidence-based.** If the journal cannot safely snapshot or invert a mutation,
    the plan must not call it reversible.
-8. **Durability is opt-in and named.** An in-memory transcript or event ring must not be mistaken for
-   journal durability.
+8. **Durability is opt-in and named.** An absent language journal is an explicit no-history mode; an
+   installed journal rejects before effects when its begin row cannot persist and reports
+   post-effect write failure as indeterminate. An in-memory transcript or event ring must not be
+   mistaken for journal durability.
 
 ## Where to continue
 

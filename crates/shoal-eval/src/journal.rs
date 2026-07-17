@@ -19,12 +19,63 @@
 //! effect set names references only — never secret material.
 
 use super::*;
+use serde::Serialize;
 use shoal_journal::{
     EntryRecord, FileFingerprint, Journal, JournalQuery, UndoError, UndoInverse, UndoIo,
     UndoReport, UndoStatus,
 };
 use std::os::unix::ffi::OsStrExt;
 use std::time::Instant;
+
+const MAX_JOURNAL_IDENTITY_BYTES: usize = 4 * 1024;
+const MAX_JOURNAL_PROGRAM_SOURCE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_JOURNAL_SOURCE_BYTES: usize = 256 * 1024;
+const MAX_JOURNAL_AST_BYTES: usize = 1024 * 1024;
+const MAX_JOURNAL_EFFECT_BYTES: usize = 256 * 1024;
+const MAX_JOURNAL_UNDO_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_JOURNAL_ERROR_BYTES: usize = 1024;
+const TRUNCATED_TEXT: &str = "\n[shoal: journal field truncated]\n";
+
+pub(crate) struct OpenJournalEntry {
+    id: i64,
+    started: Instant,
+}
+
+struct BoundedJsonWriter {
+    bytes: Vec<u8>,
+    limit: usize,
+    exceeded: bool,
+}
+
+impl BoundedJsonWriter {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(limit.min(8192)),
+            limit,
+            exceeded: false,
+        }
+    }
+}
+
+impl std::io::Write for BoundedJsonWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let remaining = self.limit.saturating_sub(self.bytes.len());
+        if bytes.len() > remaining {
+            self.bytes.extend_from_slice(&bytes[..remaining]);
+            self.exceeded = true;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "journal JSON field exceeds its byte limit",
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 /// A prior-state snapshot captured before an overwriting/moving fs mutation, to
 /// be turned into a typed [`UndoInverse`] once the mutation has run.
@@ -39,6 +90,96 @@ pub(crate) enum FsUndoPre {
 
 fn elapsed_ns(start: Instant) -> i64 {
     start.elapsed().as_nanos().min(i64::MAX as u128) as i64
+}
+
+fn bounded_text(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_string();
+    }
+    let mut keep = limit.saturating_sub(TRUNCATED_TEXT.len()).min(text.len());
+    while keep > 0 && !text.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    let mut bounded = String::with_capacity(limit);
+    bounded.push_str(&text[..keep]);
+    bounded.push_str(TRUNCATED_TEXT);
+    bounded
+}
+
+fn bounded_json<T: Serialize + ?Sized>(
+    value: &T,
+    limit: usize,
+    label: &str,
+) -> Result<String, String> {
+    let mut writer = BoundedJsonWriter::new(limit);
+    match serde_json::to_writer(&mut writer, value) {
+        Ok(()) => String::from_utf8(writer.bytes)
+            .map_err(|_| format!("serialized {label} was not valid UTF-8")),
+        Err(_) if writer.exceeded => Err(format!("{label} exceeds journal byte limit")),
+        Err(error) => Err(format!("could not serialize {label}: {error}")),
+    }
+}
+
+fn omitted_json(reason: String) -> String {
+    serde_json::json!({ "shoal_omitted": bounded_text(&reason, MAX_JOURNAL_ERROR_BYTES) })
+        .to_string()
+}
+
+fn bounded_error_detail(error: impl std::fmt::Display) -> String {
+    bounded_text(&error.to_string(), MAX_JOURNAL_ERROR_BYTES)
+}
+
+fn note_failure(
+    failure: &mut Option<(&'static str, String)>,
+    stage: &'static str,
+    error: impl std::fmt::Display,
+) {
+    if failure.is_none() {
+        *failure = Some((stage, bounded_error_detail(error)));
+    }
+}
+
+fn journal_begin_error(error: impl std::fmt::Display) -> ErrorVal {
+    ErrorVal::new(
+        "journal_begin_failed",
+        format!(
+            "journal begin row could not be persisted before statement execution: {}",
+            bounded_error_detail(error)
+        ),
+    )
+    .with_hint("no statement effects were executed; restore journal storage and retry")
+}
+
+fn finish_result(result: VResult<Flow>, failure: Option<(&'static str, String)>) -> VResult<Flow> {
+    let Some((stage, detail)) = failure else {
+        return result;
+    };
+    let primary = result.err();
+    let primary_detail = primary
+        .as_ref()
+        .map(|error| {
+            format!(
+                "; primary error was {}: {}",
+                error.code,
+                bounded_text(&error.msg, MAX_JOURNAL_ERROR_BYTES)
+            )
+        })
+        .unwrap_or_default();
+    let mut audit = ErrorVal::new(
+        "journal_commit_indeterminate",
+        format!(
+            "journal persistence failed at {stage} after statement execution: {detail}; effects may already have occurred{primary_detail}"
+        ),
+    )
+    .with_hint(
+        "do not blindly retry; inspect external state and repair journal storage before continuing",
+    );
+    if let Some(primary) = primary {
+        audit.span = primary.span;
+        audit.stderr = primary.stderr;
+        audit.status = primary.status;
+    }
+    Err(audit)
 }
 
 /// Journal undo's narrow filesystem view, backed by the evaluator's injected
@@ -116,9 +257,12 @@ impl Evaluator {
     }
 
     /// Provide the source text of the program about to be evaluated so each
-    /// top-level statement's `src` can be sliced from it for the journal.
+    /// top-level statement's `src` can be sliced from it for the journal. The
+    /// retained program copy is capped independently from each row's smaller
+    /// source projection.
     pub fn set_source(&mut self, src: impl Into<String>) {
-        self.exec.control.source = Some(src.into());
+        let src = src.into();
+        self.exec.control.source = Some(bounded_text(&src, MAX_JOURNAL_PROGRAM_SOURCE_BYTES));
     }
 
     /// Whether a journal is installed (for hosts/tests).
@@ -126,22 +270,37 @@ impl Evaluator {
         self.session.journal.is_some()
     }
 
+    /// Remember only the first persistence failure for the active statement.
+    /// Later failures are usually consequences of the same unavailable store;
+    /// bounding this state keeps a hostile multi-path command from amplifying
+    /// error text while preserving the earliest causal stage.
+    pub(crate) fn note_journal_failure(
+        &mut self,
+        stage: &'static str,
+        error: impl std::fmt::Display,
+    ) {
+        note_failure(&mut self.exec.control.journal_failure, stage, error);
+    }
+
     // --- per-statement recording ------------------------------------------
 
-    /// Append a journal entry for `stmt` and mark it current, returning the
-    /// entry id + start instant to finish it later. `None` (no journal) makes
-    /// the whole statement-recording path a no-op.
-    pub(crate) fn journal_begin_stmt(&mut self, stmt: &Stmt) -> Option<(i64, Instant)> {
+    /// Append a journal entry for `stmt` before evaluation starts. An absent
+    /// journal remains a no-op; an installed journal that cannot persist the
+    /// begin row rejects the statement before any effects execute.
+    pub(crate) fn journal_begin_stmt(&mut self, stmt: &Stmt) -> VResult<Option<OpenJournalEntry>> {
+        self.exec.control.current_entry = None;
+        self.exec.control.journal_failure = None;
         // Cheap gate: nothing to record without a journal (scripts/-c/tests).
         if !self.has_journal() {
-            return None;
+            return Ok(None);
         }
         let src = self.stmt_source(stmt);
-        let ast_json = serde_json::to_string(stmt).unwrap_or_default();
+        let ast_json =
+            bounded_json(stmt, MAX_JOURNAL_AST_BYTES, "AST").unwrap_or_else(omitted_json);
         let (effects_json, opaque) = self.stmt_effects(stmt);
         let record = EntryRecord {
-            session: self.session.session_id.clone(),
-            principal: self.session.principal.clone(),
+            session: bounded_text(&self.session.session_id, MAX_JOURNAL_IDENTITY_BYTES),
+            principal: bounded_text(&self.session.principal, MAX_JOURNAL_IDENTITY_BYTES),
             ts_ns: self.host.clock.now_ns(),
             cwd: self.exec.shell.cwd.as_os_str().as_bytes().to_vec(),
             src,
@@ -149,9 +308,18 @@ impl Evaluator {
             effects_json,
             opaque,
         };
-        let id = self.session.journal.as_ref()?.append(&record).ok()?;
+        let id = self
+            .session
+            .journal
+            .as_ref()
+            .expect("journal presence checked")
+            .append(&record)
+            .map_err(journal_begin_error)?;
         self.exec.control.current_entry = Some(id);
-        Some((id, Instant::now()))
+        Ok(Some(OpenJournalEntry {
+            id,
+            started: Instant::now(),
+        }))
     }
 
     /// Finish the entry opened by [`Evaluator::journal_begin_stmt`]: record the
@@ -159,18 +327,24 @@ impl Evaluator {
     /// stdout/stderr, or an error's stderr). Always clears `current_entry`.
     pub(crate) fn journal_finish_stmt(
         &mut self,
-        opened: Option<(i64, Instant)>,
-        result: &VResult<Flow>,
-    ) {
-        let Some((id, start)) = opened else {
-            return;
+        opened: Option<OpenJournalEntry>,
+        result: VResult<Flow>,
+    ) -> VResult<Flow> {
+        let Some(OpenJournalEntry { id, started }) = opened else {
+            return result;
         };
         self.exec.control.current_entry = None;
+        let mut failure = self.exec.control.journal_failure.take();
         let Some(journal) = self.session.journal.as_ref() else {
-            return;
+            note_failure(
+                &mut failure,
+                "finish",
+                "installed journal disappeared before statement completion",
+            );
+            return finish_result(result, failure);
         };
-        let dur = elapsed_ns(start);
-        match result {
+        let dur = elapsed_ns(started);
+        let (status, ok) = match &result {
             Ok(flow) => {
                 let value = match flow {
                     Flow::Value(v) | Flow::Return(v) => Some(v),
@@ -180,31 +354,52 @@ impl Evaluator {
                     Some(Value::Outcome(o)) => (o.ok, o.status),
                     _ => (true, Some(0)),
                 };
-                let _ = journal.finish(id, status, ok, dur);
                 if let Some(v) = value
                     && *v != Value::Null
                 {
                     let render = shoal_value::render::render_block(v, 80);
-                    if !render.is_empty() {
-                        let _ = journal.record_output(id, "render", render.as_bytes());
+                    if !render.is_empty()
+                        && let Err(error) = journal.record_output(id, "render", render.as_bytes())
+                    {
+                        note_failure(&mut failure, "render output", error);
                     }
                     if let Value::Outcome(o) = v {
-                        if !o.stdout.is_empty() {
-                            let _ = journal.record_output(id, "stdout", &o.stdout);
+                        if !o.stdout.is_empty()
+                            && let Err(error) = journal.record_output(id, "stdout", &o.stdout)
+                        {
+                            note_failure(&mut failure, "stdout output", error);
                         }
-                        if !o.stderr.is_empty() {
-                            let _ = journal.record_output(id, "stderr", &o.stderr);
+                        if !o.stderr.is_empty()
+                            && let Err(error) = journal.record_output(id, "stderr", &o.stderr)
+                        {
+                            note_failure(&mut failure, "stderr output", error);
                         }
                     }
                 }
+                (status, ok)
             }
             Err(err) => {
-                let _ = journal.finish(id, err.status, false, dur);
-                if let Some(stderr) = &err.stderr {
-                    let _ = journal.record_output(id, "stderr", stderr.as_bytes());
+                if let Some(stderr) = &err.stderr
+                    && let Err(error) = journal.record_output(id, "stderr", stderr.as_bytes())
+                {
+                    note_failure(&mut failure, "error stderr output", error);
                 }
+                (err.status, false)
             }
+        };
+        // Completion is the final persistence step. If any output/undo write
+        // failed, never stamp the row as a clean success: the returned value is
+        // indeterminate and the durable row is an explicit failure if this
+        // final update itself succeeds.
+        let (status, ok) = if failure.is_some() {
+            (None, false)
+        } else {
+            (status, ok)
+        };
+        if let Err(error) = journal.finish(id, status, ok, dur) {
+            note_failure(&mut failure, "finish", error);
         }
+        finish_result(result, failure)
     }
 
     /// Slice the statement's source text from the program source, if provided.
@@ -213,9 +408,11 @@ impl Evaluator {
             return String::new();
         };
         let span = stmt.span();
-        src.get(span.start as usize..span.end as usize)
-            .unwrap_or("")
-            .to_string()
+        bounded_text(
+            src.get(span.start as usize..span.end as usize)
+                .unwrap_or(""),
+            MAX_JOURNAL_SOURCE_BYTES,
+        )
     }
 
     /// Derive the concrete effect set of a single statement (best-effort) as the
@@ -227,8 +424,10 @@ impl Evaluator {
         match self.plan_program(&program) {
             Ok(plan) => {
                 let opaque = plan.effects.iter().any(|e| matches!(e, Effect::Opaque));
-                let json = serde_json::to_string(&plan.effects).unwrap_or_else(|_| "[]".into());
-                (json, opaque)
+                match bounded_json(&plan.effects, MAX_JOURNAL_EFFECT_BYTES, "effects") {
+                    Ok(json) => (json, opaque),
+                    Err(_) => ("[\"opaque\"]".into(), true),
+                }
             }
             // A statement whose plan cannot be derived is treated as opaque.
             Err(_) => ("[\"opaque\"]".into(), true),
@@ -289,44 +488,77 @@ impl Evaluator {
         let Some(entry) = self.exec.control.current_entry else {
             return;
         };
-        let Some(journal) = self.session.journal.as_ref() else {
-            return;
-        };
-        if head == "rm" {
-            record_trash_inverses(journal, &EvalUndoIo(self.host.fs.as_ref()), entry, result);
+        if self.session.journal.is_none() {
             return;
         }
+        if head == "rm" {
+            if let Err(error) = record_trash_inverses(
+                self.session.journal.as_ref().expect("presence checked"),
+                &EvalUndoIo(self.host.fs.as_ref()),
+                entry,
+                result,
+            ) {
+                self.note_journal_failure("trash undo inverse", error);
+            }
+            return;
+        }
+        let mut failure = None;
         for item in pre {
             match item {
                 FsUndoPre::Overwrite { path, prior_hash } => {
-                    if let Ok(fp) =
-                        FileFingerprint::capture_with(&EvalUndoIo(self.host.fs.as_ref()), &path)
-                    {
-                        let _ = journal.record_undo_inverse(
-                            entry,
-                            &UndoInverse::RestoreBytes {
-                                path,
-                                prior_hash,
-                                expected_current: fp,
-                            },
-                        );
+                    match FileFingerprint::capture_with(&EvalUndoIo(self.host.fs.as_ref()), &path) {
+                        Ok(fp) => {
+                            if let Err(error) = self
+                                .session
+                                .journal
+                                .as_ref()
+                                .expect("presence checked")
+                                .record_undo_inverse(
+                                    entry,
+                                    &UndoInverse::RestoreBytes {
+                                        path,
+                                        prior_hash,
+                                        expected_current: fp,
+                                    },
+                                )
+                            {
+                                failure.get_or_insert_with(|| error.to_string());
+                            }
+                        }
+                        Err(error) => {
+                            failure.get_or_insert_with(|| error.to_string());
+                        }
                     }
                 }
                 FsUndoPre::Moved { src, dest } => {
-                    if let Ok(fp) =
-                        FileFingerprint::capture_with(&EvalUndoIo(self.host.fs.as_ref()), &dest)
-                    {
-                        let _ = journal.record_undo_inverse(
-                            entry,
-                            &UndoInverse::MoveBack {
-                                from: dest,
-                                to: src,
-                                expected_from: fp,
-                            },
-                        );
+                    match FileFingerprint::capture_with(&EvalUndoIo(self.host.fs.as_ref()), &dest) {
+                        Ok(fp) => {
+                            if let Err(error) = self
+                                .session
+                                .journal
+                                .as_ref()
+                                .expect("presence checked")
+                                .record_undo_inverse(
+                                    entry,
+                                    &UndoInverse::MoveBack {
+                                        from: dest,
+                                        to: src,
+                                        expected_from: fp,
+                                    },
+                                )
+                            {
+                                failure.get_or_insert_with(|| error.to_string());
+                            }
+                        }
+                        Err(error) => {
+                            failure.get_or_insert_with(|| error.to_string());
+                        }
                     }
                 }
             }
+        }
+        if let Some(error) = failure {
+            self.note_journal_failure("filesystem undo inverse", error);
         }
     }
 
@@ -369,25 +601,37 @@ impl Evaluator {
 
     /// Turn an overwrite snapshot into a `RestoreBytes` inverse after the write
     /// has run. Shared by `save` and output-redirect (`>` / `>>`) writes.
-    /// Best-effort: a journaling failure never fails the caller's write.
+    /// A post-write persistence failure is retained until the statement
+    /// boundary, which reports an indeterminate result instead of clean success.
     pub(crate) fn overwrite_undo_post(&mut self, pre: Option<FsUndoPre>) {
         let (Some(entry), Some(FsUndoPre::Overwrite { path, prior_hash })) =
             (self.exec.control.current_entry, pre)
         else {
             return;
         };
-        let Some(journal) = self.session.journal.as_ref() else {
+        if self.session.journal.is_none() {
             return;
-        };
-        if let Ok(fp) = FileFingerprint::capture_with(&EvalUndoIo(self.host.fs.as_ref()), &path) {
-            let _ = journal.record_undo_inverse(
-                entry,
-                &UndoInverse::RestoreBytes {
-                    path,
-                    prior_hash,
-                    expected_current: fp,
-                },
-            );
+        }
+        match FileFingerprint::capture_with(&EvalUndoIo(self.host.fs.as_ref()), &path) {
+            Ok(fp) => {
+                if let Err(error) = self
+                    .session
+                    .journal
+                    .as_ref()
+                    .expect("presence checked")
+                    .record_undo_inverse(
+                        entry,
+                        &UndoInverse::RestoreBytes {
+                            path,
+                            prior_hash,
+                            expected_current: fp,
+                        },
+                    )
+                {
+                    self.note_journal_failure("overwrite undo inverse", error);
+                }
+            }
+            Err(error) => self.note_journal_failure("overwrite fingerprint", error),
         }
     }
 
@@ -395,20 +639,40 @@ impl Evaluator {
     /// blake3 hash to key an undo restore on. The output row keeps the blob
     /// referenced (safe from GC).
     ///
-    /// Returns `None` when the snapshot could not be recorded *faithfully*: a
-    /// file larger than the journal's `output_hard_cap` would be stored
-    /// truncated (partial bytes + a truncation marker), and keying a replayable
-    /// `RestoreBytes` inverse on that hash would make `undo` silently overwrite
-    /// the user's file with corrupt, partial content. Refusing the snapshot
-    /// leaves the op non-reversible — the correct, honest failure.
-    fn snapshot_prior(&self, entry: i64, path: &Path) -> Option<String> {
-        let bytes = self.host.fs.read(path).ok()?;
-        let (hash, meta) = self
-            .session
-            .journal
-            .as_ref()?
-            .record_output_meta(entry, "undo-snapshot", &bytes)
-            .ok()?;
+    /// Returns `None` when the snapshot could not be recorded *faithfully*: the
+    /// evaluator refuses files above its own bounded-read ceiling, and a file
+    /// above the journal's configured `output_hard_cap` is reported as
+    /// truncated. Keying a replayable `RestoreBytes` inverse on either would
+    /// let `undo` silently overwrite the user's file with partial content.
+    /// Refusing leaves the operation honestly non-reversible.
+    fn snapshot_prior(&mut self, entry: i64, path: &Path) -> Option<String> {
+        match self.host.fs.metadata(path) {
+            Ok(metadata) if metadata.len() > MAX_JOURNAL_UNDO_SNAPSHOT_BYTES as u64 => return None,
+            Ok(_) => {}
+            Err(error) => {
+                self.note_journal_failure("undo snapshot metadata", error);
+                return None;
+            }
+        }
+        let bytes = match self.host.fs.read(path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.note_journal_failure("undo snapshot read", error);
+                return None;
+            }
+        };
+        let recorded =
+            self.session
+                .journal
+                .as_ref()?
+                .record_output_meta(entry, "undo-snapshot", &bytes);
+        let (hash, meta) = match recorded {
+            Ok(recorded) => recorded,
+            Err(error) => {
+                self.note_journal_failure("undo snapshot output", error);
+                return None;
+            }
+        };
         if meta.is_some_and(|m| m.truncated) {
             return None;
         }
@@ -476,7 +740,7 @@ impl Evaluator {
         let journal = self.session.journal.as_ref().expect("checked");
         let entry_id = match target {
             Some(id) => id,
-            None => last_reversible_entry(journal).ok_or_else(|| {
+            None => last_reversible_entry(journal)?.ok_or_else(|| {
                 ErrorVal::new(
                     "custom",
                     "nothing to undo: no reversible entry in the journal",
@@ -571,9 +835,14 @@ fn literal_cmdarg_text(arg: &CmdArg) -> Option<String> {
 
 /// Walk an `rm` result (`[{path, trash}, …]`) and record a trash-move inverse
 /// for each trashed file so `undo` can move it back.
-fn record_trash_inverses(journal: &Journal, io: &dyn UndoIo, entry: i64, result: &Value) {
+fn record_trash_inverses(
+    journal: &Journal,
+    io: &dyn UndoIo,
+    entry: i64,
+    result: &Value,
+) -> Result<(), String> {
     let Value::List(rows) = result else {
-        return;
+        return Ok(());
     };
     for row in rows {
         let Value::Record(r) = row else { continue };
@@ -582,35 +851,49 @@ fn record_trash_inverses(journal: &Journal, io: &dyn UndoIo, entry: i64, result:
         else {
             continue;
         };
-        if let Ok(fp) = FileFingerprint::capture_with(io, trash) {
-            let _ = journal.record_undo_inverse(
+        let fp = FileFingerprint::capture_with(io, trash).map_err(|error| error.to_string())?;
+        journal
+            .record_undo_inverse(
                 entry,
                 &UndoInverse::TrashMove {
                     original: original.clone(),
                     trash: trash.clone(),
                     trash_fingerprint: fp,
                 },
-            );
-        }
+            )
+            .map_err(|error| error.to_string())?;
     }
+    Ok(())
 }
 
 /// The newest journal entry that has at least one recorded undo inverse.
-fn last_reversible_entry(journal: &Journal) -> Option<i64> {
+fn last_reversible_entry(journal: &Journal) -> VResult<Option<i64>> {
     let rows = journal
         .query(&JournalQuery {
             limit: 500,
             ..Default::default()
         })
-        .ok()?;
-    rows.into_iter()
-        .find(|r| {
-            journal
-                .undos_for(r.id)
-                .map(|u| !u.is_empty())
-                .unwrap_or(false)
-        })
-        .map(|r| r.id)
+        .map_err(|error| {
+            ErrorVal::new(
+                "journal_read_failed",
+                format!("could not inspect journal entries for undo: {error}"),
+            )
+        })?;
+    for row in rows {
+        let undos = journal.undos_for(row.id).map_err(|error| {
+            ErrorVal::new(
+                "journal_read_failed",
+                format!(
+                    "could not inspect undo metadata for entry {}: {error}",
+                    row.id
+                ),
+            )
+        })?;
+        if !undos.is_empty() {
+            return Ok(Some(row.id));
+        }
+    }
+    Ok(None)
 }
 
 /// Build the reported value for a completed undo: the entry, the count, and a
@@ -674,7 +957,113 @@ mod tests {
     use shoal_journal::{Journal, JournalOptions};
     use shoal_value::{ReadSeek, StdFs};
     use std::io;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+
+    struct LockAfterWriteFs {
+        db_path: PathBuf,
+        fail_after_write: bool,
+        blocker: Mutex<Option<rusqlite::Connection>>,
+        writes: AtomicUsize,
+    }
+
+    impl LockAfterWriteFs {
+        fn new(db_path: PathBuf, fail_after_write: bool) -> Self {
+            Self {
+                db_path,
+                fail_after_write,
+                blocker: Mutex::new(None),
+                writes: AtomicUsize::new(0),
+            }
+        }
+
+        fn lock_journal(&self) -> io::Result<()> {
+            let connection = rusqlite::Connection::open(&self.db_path).map_err(io::Error::other)?;
+            connection
+                .busy_timeout(std::time::Duration::ZERO)
+                .map_err(io::Error::other)?;
+            connection
+                .execute_batch("BEGIN IMMEDIATE")
+                .map_err(io::Error::other)?;
+            *self.blocker.lock().unwrap() = Some(connection);
+            Ok(())
+        }
+
+        fn release(&self) {
+            self.blocker.lock().unwrap().take();
+        }
+
+        fn unsupported<T>() -> io::Result<T> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "journal failure test filesystem only supports writes",
+            ))
+        }
+    }
+
+    impl Fs for LockAfterWriteFs {
+        fn read(&self, _path: &Path) -> io::Result<Vec<u8>> {
+            Self::unsupported()
+        }
+        fn read_to_string(&self, _path: &Path) -> io::Result<String> {
+            Self::unsupported()
+        }
+        fn open_read(&self, _path: &Path) -> io::Result<Box<dyn ReadSeek + Send>> {
+            Self::unsupported()
+        }
+        fn write(&self, path: &Path, data: &[u8]) -> io::Result<()> {
+            StdFs.write(path, data)?;
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            self.lock_journal()?;
+            if self.fail_after_write {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected primary write failure after bytes reached the filesystem",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        fn append(&self, _path: &Path, _data: &[u8]) -> io::Result<()> {
+            Self::unsupported()
+        }
+        fn touch(&self, _path: &Path) -> io::Result<()> {
+            Self::unsupported()
+        }
+        fn metadata(&self, _path: &Path) -> io::Result<std::fs::Metadata> {
+            Self::unsupported()
+        }
+        fn symlink_metadata(&self, _path: &Path) -> io::Result<std::fs::Metadata> {
+            Self::unsupported()
+        }
+        fn read_dir(&self, _path: &Path) -> io::Result<Vec<PathBuf>> {
+            Self::unsupported()
+        }
+        fn create_dir(&self, _path: &Path) -> io::Result<()> {
+            Self::unsupported()
+        }
+        fn create_dir_all(&self, _path: &Path) -> io::Result<()> {
+            Self::unsupported()
+        }
+        fn remove_file(&self, _path: &Path) -> io::Result<()> {
+            Self::unsupported()
+        }
+        fn remove_dir_all(&self, _path: &Path) -> io::Result<()> {
+            Self::unsupported()
+        }
+        fn rename(&self, _from: &Path, _to: &Path) -> io::Result<()> {
+            Self::unsupported()
+        }
+        fn copy(&self, _from: &Path, _to: &Path) -> io::Result<u64> {
+            Self::unsupported()
+        }
+        fn hard_link(&self, _src: &Path, _dst: &Path) -> io::Result<()> {
+            Self::unsupported()
+        }
+        fn symlink(&self, _target: &Path, _link: &Path) -> io::Result<()> {
+            Self::unsupported()
+        }
+    }
 
     #[derive(Default)]
     struct RecordingDenyAtomicFs {
@@ -816,6 +1205,149 @@ mod tests {
         let kinds: Vec<&str> = entry.outputs.iter().map(|o| o.kind.as_str()).collect();
         assert!(kinds.contains(&"render"), "outputs: {kinds:?}");
         assert!(kinds.contains(&"stdout"), "outputs: {kinds:?}");
+    }
+
+    fn zero_timeout_journal(state: &Path) -> Journal {
+        Journal::open_with_options(
+            state,
+            JournalOptions {
+                busy_timeout: std::time::Duration::ZERO,
+                ..JournalOptions::default()
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn installed_journal_begin_failure_prevents_statement_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let journal = zero_timeout_journal(&state);
+        let blocker = rusqlite::Connection::open(state.join("journal.db")).unwrap();
+        blocker.busy_timeout(std::time::Duration::ZERO).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let target = dir.path().join("must-not-exist");
+        let mut evaluator = Evaluator::new(dir.path().to_path_buf());
+        evaluator.set_journal(journal, "session", "human");
+        let error = run_journaled(
+            &mut evaluator,
+            &format!("save(\"{}\", \"payload\")", target.display()),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "journal_begin_failed");
+        assert!(error.msg.contains("before statement execution"));
+        assert!(!target.exists(), "the language effect must not have run");
+        drop(blocker);
+        let rows = evaluator
+            .session
+            .journal
+            .as_ref()
+            .unwrap()
+            .query(&JournalQuery::default())
+            .unwrap();
+        assert!(rows.is_empty(), "a failed begin cannot invent an entry");
+    }
+
+    #[test]
+    fn finish_failure_reports_that_effects_may_have_occurred() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let journal = zero_timeout_journal(&state);
+        let fs = Arc::new(LockAfterWriteFs::new(state.join("journal.db"), false));
+        let target = dir.path().join("written-before-finish");
+        let mut evaluator = Evaluator::new(dir.path().to_path_buf());
+        evaluator.set_journal(journal, "session", "human");
+        evaluator.set_fs(fs.clone());
+
+        let error = run_journaled(
+            &mut evaluator,
+            &format!("save(\"{}\", \"payload\")", target.display()),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "journal_commit_indeterminate");
+        assert!(error.msg.contains("effects may already have occurred"));
+        assert!(error.hint.unwrap().contains("do not blindly retry"));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "payload");
+        assert_eq!(fs.writes.load(Ordering::SeqCst), 1);
+
+        fs.release();
+        let rows = evaluator
+            .session
+            .journal
+            .as_ref()
+            .unwrap()
+            .query(&JournalQuery::default())
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].ok, None, "failed finish leaves an honest open row");
+    }
+
+    #[test]
+    fn primary_and_journal_failures_are_reported_deterministically() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let journal = zero_timeout_journal(&state);
+        let fs = Arc::new(LockAfterWriteFs::new(state.join("journal.db"), true));
+        let target = dir.path().join("possibly-written");
+        let mut evaluator = Evaluator::new(dir.path().to_path_buf());
+        evaluator.set_journal(journal, "session", "human");
+        evaluator.set_fs(fs.clone());
+
+        let error = run_journaled(
+            &mut evaluator,
+            &format!("save(\"{}\", \"payload\")", target.display()),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "journal_commit_indeterminate");
+        assert!(error.msg.contains("primary error was custom"));
+        assert!(error.msg.contains("injected primary write failure"));
+        assert!(error.msg.contains("effects may already have occurred"));
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "payload");
+        fs.release();
+    }
+
+    #[test]
+    fn disabled_language_journal_preserves_ordinary_evaluation() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("ordinary");
+        let mut evaluator = Evaluator::new(dir.path().to_path_buf());
+        let source = format!("save(\"{}\", \"payload\")", target.display());
+        let value = evaluator
+            .eval_program(&shoal_syntax::parse(&source).unwrap())
+            .unwrap();
+        assert_eq!(value, Value::Str("payload".into()));
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "payload");
+    }
+
+    #[test]
+    fn journal_entry_text_and_json_fields_are_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut evaluator = Evaluator::new(dir.path().to_path_buf());
+        evaluator.set_journal(
+            Journal::in_memory().unwrap(),
+            "s".repeat(MAX_JOURNAL_IDENTITY_BYTES * 2),
+            "p".repeat(MAX_JOURNAL_IDENTITY_BYTES * 2),
+        );
+        let source = format!("\"{}\"", "x".repeat(MAX_JOURNAL_AST_BYTES + 1024));
+        run_journaled(&mut evaluator, &source).unwrap();
+
+        let rows = evaluator
+            .session
+            .journal
+            .as_ref()
+            .unwrap()
+            .query(&JournalQuery::default())
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].session.len() <= MAX_JOURNAL_IDENTITY_BYTES);
+        assert!(rows[0].principal.len() <= MAX_JOURNAL_IDENTITY_BYTES);
+        assert!(rows[0].src.len() <= MAX_JOURNAL_SOURCE_BYTES);
+        assert!(rows[0].src.contains("journal field truncated"));
+        assert!(rows[0].ast_json.len() <= MAX_JOURNAL_AST_BYTES);
+        assert!(rows[0].ast_json.contains("AST exceeds journal byte limit"));
+        assert!(rows[0].effects_json.len() <= MAX_JOURNAL_EFFECT_BYTES);
     }
 
     #[test]

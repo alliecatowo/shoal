@@ -304,6 +304,7 @@ source-emitted families include:
 | execution/filesystem | `not_found`, `cmd_failed`, `io_error`, `permission`, `utf8_error`, `no_matches`, `feed_error` |
 | numeric/control | `div_zero`, `overflow`, `recursion_limit`, `assert_failed` |
 | lexical retention | `binding_name_limit`, `binding_identity_limit`, `binding_value_limit`, `binding_aggregate_limit` |
+| journal integrity | `journal_begin_failed`, `journal_commit_indeterminate`, `journal_read_failed` |
 | streams/events | `stream_consumed`, `stream_unbounded`, `channel_closed`, `channel_poisoned`, `channel_name_limit`, `channel_registry_limit`, `channel_subscriber_limit`, `channel_payload_limit`, `channel_payload_type` |
 | network/general | `net_error`, `custom` |
 | Reef | `reef_unlocked`, `reef_drift`, `reef_conflict`, `reef_not_found`, `reef_provider` |

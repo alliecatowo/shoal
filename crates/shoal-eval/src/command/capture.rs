@@ -7,26 +7,36 @@ impl Evaluator {
     /// CAS and hand back a lazy, ref-backed view of the full stdout. `preview`
     /// is the bounded resident prefix (shared with the outcome's `.stdout`).
     ///
-    /// Returns `None` — degrading to the resident preview — only if there is no
-    /// journal (so the spill can never have been produced in the first place)
-    /// or adoption fails on I/O; the orphaned spill file is cleaned up in that
-    /// case. On success the blob is durable under its real blake3 and pinned so
-    /// GC keeps it while the value is live.
+    /// Returns `None` only if there is no journal or adoption fails on I/O; the
+    /// orphaned spill file is cleaned up in that case. An active statement also
+    /// records adoption failure for the journal boundary, which reports an
+    /// indeterminate result rather than silently accepting the resident preview.
+    /// On success the blob is durable under its real blake3 and pinned so GC
+    /// keeps it while the value is live.
     pub(super) fn adopt_capture_spill(
-        &self,
+        &mut self,
         spill: &shoal_exec::CaptureSpill,
         preview: Arc<Vec<u8>>,
     ) -> Option<Arc<shoal_value::CasBytesVal>> {
-        let journal = self.session.journal.as_ref()?;
-        if journal
+        self.session.journal.as_ref()?;
+        if let Err(error) = self
+            .session
+            .journal
+            .as_ref()
+            .expect("presence checked")
             .ingest_spill(&spill.path, &spill.hash, spill.len, true)
-            .is_err()
         {
+            self.note_journal_failure("capture spill adoption", error);
             let _ = self.host.fs.remove_file(&spill.path);
             return None;
         }
         let loader = CasBytesLoader {
-            cas: journal.cas(),
+            cas: self
+                .session
+                .journal
+                .as_ref()
+                .expect("presence checked")
+                .cas(),
             hash: spill.hash.clone(),
         };
         Some(Arc::new(shoal_value::CasBytesVal {

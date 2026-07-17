@@ -13,10 +13,10 @@ impl Evaluator {
             // site/content/internals/language-conformance-contract.md: when a journal is installed, each top-level statement
             // becomes an entry (append → finish). A `None` journal makes this a
             // no-op, so scripts/-c/conformance are unaffected.
-            let journaled = self.journal_begin_stmt(stmt);
+            let journaled = self.journal_begin_stmt(stmt)?;
             let result = self.eval_stmt(stmt, true);
-            self.journal_finish_stmt(journaled, &result);
-            match result? {
+            let flow = self.journal_finish_stmt(journaled, result)?;
+            match flow {
                 Flow::Value(v) => {
                     self.exec.control.it = v.clone();
                     if is_last {

@@ -114,9 +114,10 @@ must opt in explicitly.
 
 `eval_program` walks `Program.stmts` in order. For every top-level statement it:
 
-1. opens a journal entry when a journal is installed;
+1. opens a journal entry when a journal is installed, rejecting before evaluation if persistence
+   fails;
 2. calls `eval_stmt(stmt, true)`;
-3. finishes the entry with either the value or error;
+3. records bounded outputs/undo metadata and finishes the entry with either the value or error;
 4. converts ordinary `Flow::Value` into the current `it`;
 5. emits eligible non-final values, or saves the final value for return;
 6. rejects `return`, `break`, or `continue` that escaped their legal context;
@@ -132,9 +133,15 @@ accDescr: Shows the components and relationships described in Program evaluation
   participant S as Statement sink
   H->>E: eval_program(program)
   loop each top-level statement
-    E->>J: begin(statement slice)
+    E->>J: begin(bounded statement slice)
+    alt installed journal begin fails
+      E-->>H: journal_begin_failed (no effects executed)
+    end
     E->>E: eval_stmt(top = true)
-    E->>J: finish(value or error)
+    E->>J: outputs / undo / finish(value or error)
+    alt post-effect persistence fails
+      E-->>H: journal_commit_indeterminate (do not blindly retry)
+    end
     alt non-final and echo-eligible
       E->>S: sink_value(value)
     else final
@@ -145,8 +152,12 @@ accDescr: Shows the components and relationships described in Program evaluation
   H->>E: take_exit()
 ```
 
-The journal finish call occurs before `result?`, so failed statements are recorded as failures.
-`it` is updated only after a successful ordinary value. The public `it` field and the transcript
+The journal completion path runs before the evaluator consumes the statement result, so failed
+statements are recorded as failures. Completion is the last persistence step: an earlier output or
+undo error cannot stamp a clean-success row. If completion itself fails, the durable append remains
+honestly unfinished and the caller receives an indeterminate error that retains the primary
+evaluation diagnostic. With no installed journal, all of this remains a no-op. `it` is updated only
+after a successful ordinary value. The public `it` field and the transcript
 bindings maintained by `record_transcript` are related but not identical: transcript recording is
 a host hook that declares `it` and appends to `out` in the environment.
 

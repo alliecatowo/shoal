@@ -416,8 +416,9 @@ Four current limitations deserve release-note visibility:
 
 1. kernel execution writes a coarse whole-submission row while the embedded evaluator writes fine
    per-statement rows into the same schema, without a row-kind or parent-exec column;
-2. journaling call sites often swallow storage failures to preserve command execution, so durability
-   is best effort unless the host surfaces a health event;
+2. the language evaluator now rejects an installed-journal begin failure before effects and reports
+   post-effect persistence failure as indeterminate, but direct journal embedders still define their
+   own degraded-health policy;
 3. evaluator spill adoption pins blobs without an automatic owner/release lifecycle;
 4. `shoal-history` and doctor derive a different default XDG root than evaluator/kernel state.
 

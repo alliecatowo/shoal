@@ -17,6 +17,10 @@ pub(crate) struct ControlState {
     pub(crate) call_depth: usize,
     pub(crate) in_fn_body: usize,
     pub(crate) current_entry: Option<i64>,
+    /// First post-begin persistence failure for the active journal entry. The
+    /// statement boundary consumes this and returns an explicit indeterminate
+    /// result after any already-started effects complete.
+    pub(crate) journal_failure: Option<(&'static str, String)>,
     pub(crate) source: Option<String>,
     pub(crate) pending_exit: Option<i32>,
 }
@@ -175,6 +179,7 @@ impl ExecState {
                 call_depth: 0,
                 in_fn_body: 0,
                 current_entry: None,
+                journal_failure: None,
                 source: None,
                 pending_exit: None,
             },

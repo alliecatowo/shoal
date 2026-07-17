@@ -2597,6 +2597,7 @@ dependencies = [
  "jiff",
  "libc",
  "notify",
+ "rusqlite",
  "serde",
  "serde_json",
  "serde_norway",
