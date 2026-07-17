@@ -9,7 +9,7 @@ use std::fs;
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -401,7 +401,7 @@ pub(crate) fn repl(standalone: bool) -> Result<i32, String> {
         }
     }
 
-    let (background_job_tx, background_job_rx) = mpsc::channel();
+    let (background_job_tx, background_job_rx) = mpsc::sync_channel(MAX_PENDING_BACKGROUND_EVENTS);
     let suppressed_task_notices = Arc::new(Mutex::new(BTreeSet::new()));
     let mut watched_tasks = BTreeSet::new();
     watch_new_tasks(
@@ -507,7 +507,11 @@ pub(crate) fn repl(standalone: bool) -> Result<i32, String> {
                 if let Some(name) = fg_task_name(&src)
                     && let Some(Value::Task(task)) = evaluator.env().get(name)
                     && let Ok(mut suppressed) = suppressed_task_notices.lock()
+                    && !task.is_done()
                 {
+                    // Hold the suppression lock across the done check and
+                    // insertion. A watcher that completes concurrently then
+                    // observes and consumes this ID instead of racing past it.
                     suppressed.insert(task.id);
                 }
                 let run_src = rewrite_fg(&src).unwrap_or_else(|| src.clone());
@@ -933,6 +937,10 @@ impl BackgroundJobEvent {
 }
 
 const MAX_BACKGROUND_OUTPUT_LINE: usize = 8 * 1024;
+/// Completion events carry identity-bearing transitions used to reconcile the
+/// evaluator job table. They cannot be dropped or coalesced, so use bounded
+/// backpressure rather than the standard library's unbounded channel.
+const MAX_PENDING_BACKGROUND_EVENTS: usize = 256;
 
 struct BackgroundOutputState {
     id: u64,
@@ -1025,10 +1033,13 @@ fn watch_new_tasks(
     final_value: Option<&Value>,
     watched: &mut BTreeSet<u64>,
     suppressed: &Arc<Mutex<BTreeSet<u64>>>,
-    events: &Sender<BackgroundJobEvent>,
+    events: &SyncSender<BackgroundJobEvent>,
     printer: &ExternalPrinter<String>,
 ) {
-    for task in evaluator.tasks_snapshot() {
+    let tasks = evaluator.tasks_snapshot();
+    let current_ids = tasks.iter().map(|task| task.id).collect::<BTreeSet<_>>();
+    retain_current_task_ids(watched, &current_ids);
+    for task in tasks {
         if !watched.insert(task.id) {
             continue;
         }
@@ -1049,10 +1060,7 @@ fn watch_new_tasks(
         let suppressed = suppressed.clone();
         std::thread::spawn(move || {
             let result = task.wait();
-            if suppressed
-                .lock()
-                .is_ok_and(|suppressed| suppressed.contains(&task.id))
-            {
+            if consume_task_suppression(&suppressed, task.id) {
                 return;
             }
             let error = result.err().map(|error| {
@@ -1072,6 +1080,19 @@ fn watch_new_tasks(
             let _ = events.send(event);
         });
     }
+}
+
+fn retain_current_task_ids(watched: &mut BTreeSet<u64>, current: &BTreeSet<u64>) {
+    watched.retain(|id| current.contains(id));
+}
+
+/// Suppression is a one-shot rendezvous between `fg <task>` and its completion
+/// watcher. Removing on observation prevents monotonic task IDs from becoming
+/// a second, host-only history.
+fn consume_task_suppression(suppressed: &Arc<Mutex<BTreeSet<u64>>>, id: u64) -> bool {
+    suppressed
+        .lock()
+        .is_ok_and(|mut suppressed| suppressed.remove(&id))
 }
 
 /// Reconcile terminal notifications from detached PTY workers on the REPL
@@ -1169,7 +1190,7 @@ fn print_stopped_notice(id: u64, desc: &str) {
 fn handle_job_control(
     evaluator: &mut shoal_eval::Evaluator,
     jc: JobControl,
-    background_events: &Sender<BackgroundJobEvent>,
+    background_events: &SyncSender<BackgroundJobEvent>,
     background_printer: &ExternalPrinter<String>,
 ) {
     let warn = |msg: &str| {
@@ -1544,7 +1565,7 @@ mod tests {
         let mut evaluator = Evaluator::new(PathBuf::from("/"));
         let completed = evaluator.register_stopped_external(41_001, 41_001, "done-job".into());
         assert!(evaluator.mark_external_resumed(completed));
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(MAX_PENDING_BACKGROUND_EVENTS);
         tx.send(BackgroundJobEvent::Completed {
             id: completed,
             command: "done-job".into(),
@@ -1622,6 +1643,65 @@ mod tests {
     }
 
     #[test]
+    fn background_transition_queue_applies_bounded_lossless_backpressure() {
+        let (tx, _rx) = mpsc::sync_channel(MAX_PENDING_BACKGROUND_EVENTS);
+        for id in 0..MAX_PENDING_BACKGROUND_EVENTS as u64 {
+            tx.try_send(BackgroundJobEvent::TaskCompleted {
+                id,
+                description: "done".into(),
+                error: None,
+                notified: true,
+            })
+            .unwrap();
+        }
+        assert!(matches!(
+            tx.try_send(BackgroundJobEvent::TaskCompleted {
+                id: u64::MAX,
+                description: "bounded".into(),
+                error: None,
+                notified: true,
+            }),
+            Err(mpsc::TrySendError::Full(_))
+        ));
+    }
+
+    #[test]
+    fn blocked_background_transition_producer_wakes_when_repl_receiver_drops() {
+        let (tx, rx) = mpsc::sync_channel(1);
+        tx.send(BackgroundJobEvent::TaskCompleted {
+            id: 1,
+            description: "fills queue".into(),
+            error: None,
+            notified: true,
+        })
+        .unwrap();
+        let exited = Arc::new(AtomicBool::new(false));
+        let worker_exited = exited.clone();
+        let worker = std::thread::spawn(move || {
+            assert!(
+                tx.send(BackgroundJobEvent::TaskCompleted {
+                    id: 2,
+                    description: "blocked until shutdown".into(),
+                    error: None,
+                    notified: true,
+                })
+                .is_err()
+            );
+            worker_exited.store(true, Ordering::Release);
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(!exited.load(Ordering::Acquire));
+
+        drop(rx);
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !exited.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(exited.load(Ordering::Acquire));
+        worker.join().unwrap();
+    }
+
+    #[test]
     fn background_output_is_line_bounded_and_terminal_control_safe() {
         let printer = ExternalPrinter::new(4);
         let mut output = BackgroundOutputState::new(12, printer.clone());
@@ -1652,7 +1732,7 @@ mod tests {
         let Value::Task(task) = &value else {
             panic!("spawn must return a task")
         };
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(MAX_PENDING_BACKGROUND_EVENTS);
         let printer = ExternalPrinter::new(4);
         let mut watched = BTreeSet::new();
         let suppressed = Arc::new(Mutex::new(BTreeSet::new()));
@@ -1689,7 +1769,7 @@ mod tests {
         let value = evaluator
             .eval_program(&shoal_syntax::parse("let t = spawn { 42 }\nt.await()").unwrap())
             .unwrap();
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(MAX_PENDING_BACKGROUND_EVENTS);
         let printer = ExternalPrinter::new(4);
         watch_new_tasks(
             &evaluator,
@@ -1701,6 +1781,24 @@ mod tests {
         );
         assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
         assert!(printer.get_line().is_none());
+    }
+
+    #[test]
+    fn host_task_id_mirrors_reclaim_monotonic_churn_without_retargeting() {
+        let mut watched = (0..10_000).collect::<BTreeSet<u64>>();
+        let current = [9_997, 9_999, 10_001].into_iter().collect();
+        retain_current_task_ids(&mut watched, &current);
+        assert_eq!(watched, [9_997, 9_999].into_iter().collect());
+
+        let suppressed = Arc::new(Mutex::new((0..10_000).collect::<BTreeSet<u64>>()));
+        for id in 0..10_000 {
+            assert!(consume_task_suppression(&suppressed, id));
+            assert!(
+                !consume_task_suppression(&suppressed, id),
+                "suppression IDs are one-shot and never retargeted"
+            );
+        }
+        assert!(suppressed.lock().unwrap().is_empty());
     }
 
     #[test]
