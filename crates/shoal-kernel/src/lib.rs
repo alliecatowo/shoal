@@ -60,12 +60,14 @@ pub struct Kernel {
     /// exact same plan a distinct object instead of replacing the first one.
     next_plan: AtomicU64,
     tasks: Mutex<HashMap<Ref, Arc<TaskEntry>>>,
+    task_slots: Arc<SessionQuota>,
     next_task: AtomicU64,
     /// Long-lived interactive PTY sessions (site/content/internals/kernel-protocol.md), keyed by their
     /// `pty:{id}` ref like `tasks`. Each holds a live child on a real PTY plus
     /// its `vt100` emulator; scoped to the session that opened it. Dropped (and
     /// so terminated + reaped) on `pty.close` or when the kernel is dropped.
     ptys: Mutex<HashMap<Ref, Arc<PtyEntry>>>,
+    pty_slots: Arc<SessionQuota>,
     next_pty: AtomicU64,
     auth: Option<Mutex<TokenStore>>,
     events: Arc<EventBus>,
@@ -120,6 +122,7 @@ struct TaskInner {
     finished_ns: Option<i64>,
     result_ref: Option<Ref>,
     error: Option<RpcError>,
+    active_slot: Option<QuotaPermit>,
 }
 
 /// A registered interactive PTY session (site/content/internals/kernel-protocol.md). The live
@@ -133,7 +136,58 @@ struct PtyEntry {
     principal: String,
     cmd: String,
     session: Mutex<shoal_exec::PtySession>,
+    _active_slot: QuotaPermit,
 }
+
+#[derive(Default)]
+struct SessionQuota {
+    counts: Mutex<HashMap<String, usize>>,
+}
+
+struct QuotaPermit {
+    quota: Arc<SessionQuota>,
+    session_id: String,
+}
+
+impl SessionQuota {
+    fn reserve(
+        self: &Arc<Self>,
+        session_id: &str,
+        max: usize,
+        limit: &'static str,
+        noun: &'static str,
+    ) -> Result<QuotaPermit, RpcError> {
+        let mut counts = self.counts.lock().unwrap();
+        let current = counts.entry(session_id.to_string()).or_default();
+        if *current >= max {
+            return Err(RpcError {
+                code: QUOTA_EXCEEDED,
+                message: format!("session has reached the {max}-{noun} limit"),
+                data: Some(json!({"limit": limit, "max": max})),
+            });
+        }
+        *current += 1;
+        Ok(QuotaPermit {
+            quota: self.clone(),
+            session_id: session_id.to_string(),
+        })
+    }
+}
+
+impl Drop for QuotaPermit {
+    fn drop(&mut self) {
+        let mut counts = self.quota.counts.lock().unwrap();
+        if let Some(current) = counts.get_mut(&self.session_id) {
+            debug_assert!(*current > 0, "session quota underflow");
+            *current = current.saturating_sub(1);
+            if *current == 0 {
+                counts.remove(&self.session_id);
+            }
+        }
+    }
+}
+
+const MAX_FINISHED_TASKS_PER_SESSION: usize = 512;
 
 struct StoredPlan {
     src: String,
@@ -231,8 +285,10 @@ impl Kernel {
             plans: Mutex::new(HashMap::new()),
             next_plan: AtomicU64::new(1),
             tasks: Mutex::new(HashMap::new()),
+            task_slots: Arc::new(SessionQuota::default()),
             next_task: AtomicU64::new(1),
             ptys: Mutex::new(HashMap::new()),
+            pty_slots: Arc::new(SessionQuota::default()),
             next_pty: AtomicU64::new(1),
             events: Arc::new(EventBus::default()),
             auth: None,
@@ -269,8 +325,10 @@ impl Kernel {
             plans: Mutex::new(HashMap::new()),
             next_plan: AtomicU64::new(1),
             tasks: Mutex::new(HashMap::new()),
+            task_slots: Arc::new(SessionQuota::default()),
             next_task: AtomicU64::new(1),
             ptys: Mutex::new(HashMap::new()),
+            pty_slots: Arc::new(SessionQuota::default()),
             next_pty: AtomicU64::new(1),
             events: Arc::new(events),
             auth: Some(Mutex::new(TokenStore::open(state_dir.join("tokens.json"))?)),
@@ -304,8 +362,10 @@ impl Kernel {
             plans: Mutex::new(HashMap::new()),
             next_plan: AtomicU64::new(1),
             tasks: Mutex::new(HashMap::new()),
+            task_slots: Arc::new(SessionQuota::default()),
             next_task: AtomicU64::new(1),
             ptys: Mutex::new(HashMap::new()),
+            pty_slots: Arc::new(SessionQuota::default()),
             next_pty: AtomicU64::new(1),
             events: Arc::new(events),
             auth: Some(Mutex::new(TokenStore::open(state_dir.join("tokens.json"))?)),
@@ -331,8 +391,10 @@ impl Kernel {
             plans: Mutex::new(HashMap::new()),
             next_plan: AtomicU64::new(1),
             tasks: Mutex::new(HashMap::new()),
+            task_slots: Arc::new(SessionQuota::default()),
             next_task: AtomicU64::new(1),
             ptys: Mutex::new(HashMap::new()),
+            pty_slots: Arc::new(SessionQuota::default()),
             next_pty: AtomicU64::new(1),
             events: Arc::new(EventBus::default()),
             auth: None,
@@ -469,6 +531,61 @@ impl Kernel {
             return Err(unknown_pty());
         }
         Ok(entry)
+    }
+
+    fn reap_finished_tasks(&self, session_id: &str) {
+        let mut tasks = self.tasks.lock().unwrap();
+        let mut finished = tasks
+            .iter()
+            .filter(|(_, task)| task.session.id == session_id)
+            .filter_map(|(task_ref, task)| {
+                task.inner
+                    .lock()
+                    .unwrap()
+                    .finished_ns
+                    .map(|finished_ns| (task_ref.clone(), finished_ns))
+            })
+            .collect::<Vec<_>>();
+        if finished.len() <= MAX_FINISHED_TASKS_PER_SESSION {
+            return;
+        }
+        finished.sort_unstable_by_key(|(_, finished_ns)| *finished_ns);
+        let remove = finished.len() - MAX_FINISHED_TASKS_PER_SESSION;
+        for (task_ref, _) in finished.into_iter().take(remove) {
+            tasks.remove(&task_ref);
+        }
+    }
+
+    /// Remove self-exited PTYs before reserving capacity for another live PTY.
+    /// Snapshot first so registry and per-PTY locks are never held together.
+    fn reap_terminal_ptys(&self, session_id: &str) {
+        let entries = self
+            .ptys
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, entry)| entry.session_id == session_id)
+            .map(|(pty_ref, entry)| (pty_ref.clone(), entry.clone()))
+            .collect::<Vec<_>>();
+        let terminal = entries
+            .into_iter()
+            .filter_map(|(pty_ref, entry)| {
+                let alive = entry.session.lock().unwrap().alive();
+                (!alive).then_some((pty_ref, entry))
+            })
+            .collect::<Vec<_>>();
+        if terminal.is_empty() {
+            return;
+        }
+        let mut ptys = self.ptys.lock().unwrap();
+        for (pty_ref, observed) in terminal {
+            if ptys
+                .get(&pty_ref)
+                .is_some_and(|current| Arc::ptr_eq(current, &observed))
+            {
+                ptys.remove(&pty_ref);
+            }
+        }
     }
 
     /// The real enforcement truth for `principal` (site/content/internals/language-conformance-contract.md tier honesty):
@@ -1051,6 +1168,156 @@ mod tests {
         assert_eq!(kernel.active_connections.load(Ordering::SeqCst), 1);
         drop(reservations);
         assert_eq!(kernel.active_connections.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn per_session_resource_reservation_is_atomic_under_race() {
+        let quota = Arc::new(SessionQuota::default());
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let reserve = |quota: Arc<SessionQuota>, barrier: Arc<std::sync::Barrier>| {
+            std::thread::spawn(move || {
+                barrier.wait();
+                quota.reserve("s", 1, "test", "resource")
+            })
+        };
+        let first = reserve(quota.clone(), barrier.clone());
+        let second = reserve(quota.clone(), barrier.clone());
+        barrier.wait();
+        let reservations = [first.join().unwrap(), second.join().unwrap()];
+        assert_eq!(
+            reservations.iter().filter(|result| result.is_ok()).count(),
+            1
+        );
+        assert_eq!(quota.counts.lock().unwrap().get("s"), Some(&1));
+        drop(reservations);
+        assert!(!quota.counts.lock().unwrap().contains_key("s"));
+    }
+
+    #[test]
+    fn active_task_quota_releases_when_a_task_becomes_terminal() {
+        let kernel = Kernel::new();
+        kernel.configure_limits(Limits {
+            max_tasks_per_session: 1,
+            ..Limits::default()
+        });
+        let (mut client, mut reader, server) = spawn(&kernel);
+        attach(&mut client, &mut reader);
+        let first = call(
+            &mut client,
+            &mut reader,
+            2,
+            "exec",
+            json!({"src":"sh { sleep 30 }","async":true}),
+        )
+        .result
+        .unwrap();
+        let task = first["task"].clone();
+        let rejected = call(
+            &mut client,
+            &mut reader,
+            3,
+            "exec",
+            json!({"src":"1 + 1","async":true}),
+        );
+        assert_eq!(rejected.error.unwrap().code, QUOTA_EXCEEDED);
+        call(
+            &mut client,
+            &mut reader,
+            4,
+            "task.cancel",
+            json!({"task": task}),
+        );
+        call(
+            &mut client,
+            &mut reader,
+            5,
+            "task.await",
+            json!({"task": task}),
+        );
+        let next = call(
+            &mut client,
+            &mut reader,
+            6,
+            "exec",
+            json!({"src":"1 + 1","async":true}),
+        );
+        assert!(
+            next.error.is_none(),
+            "terminal task released its slot: {next:?}"
+        );
+        let next_task = next.result.unwrap()["task"].clone();
+        call(
+            &mut client,
+            &mut reader,
+            7,
+            "task.await",
+            json!({"task": next_task}),
+        );
+        drop(client);
+        drop(reader);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn pty_quota_reserves_before_spawn_and_releases_on_close() {
+        let kernel = Kernel::new();
+        kernel.configure_limits(Limits {
+            max_ptys_per_session: 1,
+            ..Limits::default()
+        });
+        let (mut client, mut reader, server) = spawn(&kernel);
+        attach(&mut client, &mut reader);
+        let first = call(
+            &mut client,
+            &mut reader,
+            2,
+            "pty.open",
+            json!({"cmd":"cat"}),
+        )
+        .result
+        .unwrap();
+        let pty_id = first["pty_id"].clone();
+        let rejected = call(
+            &mut client,
+            &mut reader,
+            3,
+            "pty.open",
+            json!({"cmd":"cat"}),
+        );
+        assert_eq!(rejected.error.unwrap().code, QUOTA_EXCEEDED);
+        assert!(
+            call(
+                &mut client,
+                &mut reader,
+                4,
+                "pty.close",
+                json!({"pty_id": pty_id}),
+            )
+            .error
+            .is_none()
+        );
+        let next = call(
+            &mut client,
+            &mut reader,
+            5,
+            "pty.open",
+            json!({"cmd":"cat"}),
+        );
+        assert!(
+            next.error.is_none(),
+            "closed PTY released its slot: {next:?}"
+        );
+        let next_id = next.result.unwrap()["pty_id"].clone();
+        call(
+            &mut client,
+            &mut reader,
+            6,
+            "pty.close",
+            json!({"pty_id": next_id}),
+        );
+        drop(client);
+        drop(reader);
+        server.join().unwrap();
     }
 
     fn call(

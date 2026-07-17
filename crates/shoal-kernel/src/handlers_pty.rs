@@ -99,6 +99,14 @@ impl Kernel {
         }
         let sandbox = self.policy.sandbox_for(&actor);
 
+        self.reap_terminal_ptys(&session.id);
+        let active_slot = self.pty_slots.reserve(
+            &session.id,
+            self.max_ptys_per_session.load(Ordering::Relaxed),
+            "ptys_per_session",
+            "PTY",
+        )?;
+
         let pty_session = shoal_exec::PtySession::open(shoal_exec::PtyOpenSpec {
             argv,
             cwd,
@@ -127,6 +135,7 @@ impl Kernel {
                 principal: actor,
                 cmd: display.clone(),
                 session: Mutex::new(pty_session),
+                _active_slot: active_slot,
             }),
         );
         encode(json!({

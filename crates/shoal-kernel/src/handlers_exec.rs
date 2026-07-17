@@ -20,6 +20,12 @@ impl Kernel {
         // never a blocked context. A bare timeout runs the work on a
         // task and waits up to the deadline for a fast inline answer.
         if params.asynchronous || params.timeout_ms.is_some() {
+            let active_slot = self.task_slots.reserve(
+                &session.id,
+                self.max_tasks_per_session.load(Ordering::Relaxed),
+                "tasks_per_session",
+                "task",
+            )?;
             let elide_spec = params.elide;
             let wait = params.timeout_ms.map(std::time::Duration::from_millis);
             let is_background = params.asynchronous;
@@ -45,6 +51,7 @@ impl Kernel {
                     finished_ns: None,
                     result_ref: None,
                     error: None,
+                    active_slot: Some(active_slot),
                 }),
                 done: Condvar::new(),
                 cancel,
@@ -61,84 +68,105 @@ impl Kernel {
             kernel
                 .events
                 .publish(&task_channel, json!({"$":"str","v":"started"}));
-            std::thread::spawn(move || {
-                let response = kernel.dispatch(
-                    Request {
+            let spawn_result = std::thread::Builder::new()
+                .name(format!("shoal-task-{task_id}"))
+                .spawn(move || {
+                    let response = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        kernel.dispatch(
+                            Request {
+                                jsonrpc: JSONRPC.into(),
+                                id: Json::Null,
+                                method: "exec".into(),
+                                params: serde_json::to_value(ExecParams {
+                                    asynchronous: false,
+                                    timeout_ms: None,
+                                    ..params
+                                })
+                                .unwrap(),
+                            },
+                            client,
+                            &mut task_attached,
+                            None,
+                        )
+                    }))
+                    .unwrap_or_else(|_| Response {
                         jsonrpc: JSONRPC.into(),
                         id: Json::Null,
-                        method: "exec".into(),
-                        params: serde_json::to_value(ExecParams {
-                            asynchronous: false,
-                            timeout_ms: None,
-                            ..params
-                        })
-                        .unwrap(),
-                    },
-                    client,
-                    &mut task_attached,
-                    None,
-                );
-                let exit_payload;
-                {
-                    let mut inner = task.inner.lock().unwrap();
-                    inner.finished_ns = Some(now_ns());
-                    if let Some(error) = response.error {
-                        inner.state = if task.cancel_requested.load(Ordering::SeqCst) {
-                            "cancelled"
-                        } else {
-                            "failed"
-                        };
-                        inner.error = Some(error);
-                    } else {
-                        inner.result_ref = response
-                            .result
-                            .as_ref()
-                            .and_then(|r| r.get("ref"))
-                            .and_then(Json::as_str)
-                            .map(|s| Ref(s.into()));
-                        // The eval position most callers use for a
-                        // background/timed run (`position:"value"`, the MCP
-                        // facade's default) captures a failing or
-                        // signal-killed outcome as a normal RETURNED value
-                        // instead of raising it as an RpcError (site/content/internals/kernel-protocol.md: "a
-                        // failed outcome is captured, not raised") — so
-                        // `response.error` alone cannot tell a naturally
-                        // completed task from one that was killed via
-                        // `shoal_cancel`. Inspect the actual outcome the
-                        // task produced: a signal-killed outcome while
-                        // cancellation was requested is `cancelled`; any
-                        // other non-ok outcome is `failed`; only a truly
-                        // successful result is `completed`.
-                        let outcome = inner
-                            .result_ref
-                            .as_ref()
-                            .and_then(|r| task.session.transcript.lock().unwrap().get(r).cloned());
-                        inner.state = match &outcome {
-                            Some(Value::Outcome(o)) if !o.ok => {
-                                if task.cancel_requested.load(Ordering::SeqCst)
-                                    && o.signal.is_some()
-                                {
-                                    "cancelled"
-                                } else {
-                                    "failed"
-                                }
-                            }
-                            _ => "completed",
-                        };
-                    }
-                    exit_payload = json!({
-                        "$": "record",
-                        "v": {
-                            "state": {"$":"str","v": inner.state},
-                            "ref": inner.result_ref.as_ref()
-                                .map(|r| json!({"$":"str","v": r.0}))
-                                .unwrap_or(Json::Null),
-                        }
+                        result: None,
+                        error: Some(RpcError {
+                            code: INTERNAL_ERROR,
+                            message: "task worker panicked".into(),
+                            data: None,
+                        }),
                     });
+                    let exit_payload;
+                    let active_slot;
+                    {
+                        let mut inner = task.inner.lock().unwrap();
+                        inner.finished_ns = Some(now_ns());
+                        if let Some(error) = response.error {
+                            inner.state = if task.cancel_requested.load(Ordering::SeqCst) {
+                                "cancelled"
+                            } else {
+                                "failed"
+                            };
+                            inner.error = Some(error);
+                        } else {
+                            inner.result_ref = response
+                                .result
+                                .as_ref()
+                                .and_then(|r| r.get("ref"))
+                                .and_then(Json::as_str)
+                                .map(|s| Ref(s.into()));
+                            // The eval position most callers use for a
+                            // background/timed run (`position:"value"`, the MCP
+                            // facade's default) captures a failing or
+                            // signal-killed outcome as a normal RETURNED value
+                            // instead of raising it as an RpcError (site/content/internals/kernel-protocol.md: "a
+                            // failed outcome is captured, not raised") — so
+                            // `response.error` alone cannot tell a naturally
+                            // completed task from one that was killed via
+                            // `shoal_cancel`. Inspect the actual outcome the
+                            // task produced: a signal-killed outcome while
+                            // cancellation was requested is `cancelled`; any
+                            // other non-ok outcome is `failed`; only a truly
+                            // successful result is `completed`.
+                            let outcome = inner.result_ref.as_ref().and_then(|r| {
+                                task.session.transcript.lock().unwrap().get(r).cloned()
+                            });
+                            inner.state = match &outcome {
+                                Some(Value::Outcome(o)) if !o.ok => {
+                                    if task.cancel_requested.load(Ordering::SeqCst)
+                                        && o.signal.is_some()
+                                    {
+                                        "cancelled"
+                                    } else {
+                                        "failed"
+                                    }
+                                }
+                                _ => "completed",
+                            };
+                        }
+                        exit_payload = json!({
+                                "$": "record",
+                                "v": {
+                                    "state": {"$":"str","v": inner.state},
+                                    "ref": inner.result_ref.as_ref()
+                                        .map(|r| json!({"$":"str","v": r.0}))
+                                        .unwrap_or(Json::Null),
+                                }
+                        });
+                        active_slot = inner.active_slot.take();
+                    }
+                    drop(active_slot);
                     task.done.notify_all();
-                }
-                kernel.events.publish(&task_channel, exit_payload);
-            });
+                    kernel.events.publish(&task_channel, exit_payload);
+                    kernel.reap_finished_tasks(&task.session.id);
+                });
+            if let Err(error) = spawn_result {
+                self.tasks.lock().unwrap().remove(&task_ref);
+                return Err(internal(error));
+            }
             let events_channel = format!("task.{task_id}");
             if is_background {
                 return encode(json!({"task":task_ref,"events":events_channel}));
