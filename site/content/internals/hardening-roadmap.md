@@ -52,7 +52,7 @@ Rules for implementers:
   consistent with adapter spawns. *(A6)*
   <br>Accept: `plan { run("echo","hi") }` and a bare external both report `spawns: true` with
   the argv.
-- [ ] **HR-A7** — Adapter effect declarations parse against the full effect vocabulary; an
+- [x] **HR-A7** — Adapter effect declarations parse against the full effect vocabulary; an
   unrecognized declaration (e.g. `proc.spawn(container)`) is a load-time error or conservative
   unknown effect — never silently dropped. *(A7)*
   <br>Accept: a fixture adapter with an unknown effect declaration fails loudly or plans

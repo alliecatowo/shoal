@@ -65,9 +65,17 @@ can contribute concrete effect templates. Paths and arguments are resolved as fa
 current evaluator state allow. Dynamic calls, unknown external behavior, or constructs that cannot
 be bounded become `Opaque` and normally make reversibility unknown.
 
+Adapter effect declarations parse against the **full** effect vocabulary — `fs.read`, `fs.write`,
+`fs.delete`, `proc.spawn`, `net.connect`, `net.listen`, `env.read`, `env.write`, `secret.use`,
+`session.write`, `journal.read`, and `time` — in both parenthesized (`proc.spawn(container)`) and
+bare (`session.write`) forms. A declaration whose kind is outside the vocabulary is **never silently
+dropped**: it plans as `Opaque` so an unrecognized adapter effect forces approval rather than
+vanishing from the plan.
 
-Derivation is intentionally conservative. It is safer to require approval for an opaque program
-than to manufacture a precise-looking plan that omits a dynamic effect.
+Derivation is intentionally conservative and fail-closed: every effectful language form is
+classified, and an unrecognized or unbounded form becomes an approval-requiring effect rather than
+an empty effect set. It is safer to require approval for an opaque program than to manufacture a
+precise-looking plan that omits a dynamic effect.
 
 Sources: [`plan_derive.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-eval/src/plan_derive.rs)
 and [`plan_effects.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-eval/src/plan_effects.rs).
