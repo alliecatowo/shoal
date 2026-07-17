@@ -163,18 +163,6 @@ impl<'s> Parser<'s> {
                     break;
                 }
                 Tok::RedirIn => {
-                    if redirects
-                        .iter()
-                        .any(|redirect| redirect.kind == RedirectKind::In)
-                    {
-                        return Err(ParseError::new(
-                            "a command may have only one stdin redirect",
-                            s,
-                        )
-                        .hint(
-                            "choose one input source; compose typed input first and use `.feed(cmd)` when needed",
-                        ));
-                    }
                     // `<<` (heredoc) / `<<<` (here-string) — box-era spellings
                     // with curated teaching errors (site/content/internals/values-streams-execution.md).
                     if let Ok((Tok::RedirIn, s2)) = self.lx.token(s.end as usize, Mode::Cmd)
@@ -202,6 +190,18 @@ impl<'s> Parser<'s> {
                             )
                         });
                     }
+                    if redirects
+                        .iter()
+                        .any(|redirect| redirect.kind == RedirectKind::In)
+                    {
+                        return Err(ParseError::new(
+                            "a command may have only one stdin redirect",
+                            s,
+                        )
+                        .hint(
+                            "choose one input source; compose typed input first and use `.feed(cmd)` when needed",
+                        ));
+                    }
                     self.bump(Mode::Cmd)?;
                     let target = self.cmd_arg()?;
                     redirects.push(Redirect {
@@ -211,17 +211,6 @@ impl<'s> Parser<'s> {
                     });
                 }
                 Tok::RedirOut | Tok::RedirAppend => {
-                    if redirects.iter().any(|redirect| {
-                        matches!(redirect.kind, RedirectKind::Out | RedirectKind::Append)
-                    }) {
-                        return Err(ParseError::new(
-                            "a command may have only one stdout redirect",
-                            s,
-                        )
-                        .hint(
-                            "choose one target; for fan-out, capture `(cmd).out` and handle each write explicitly",
-                        ));
-                    }
                     // `2>` / `1>>` — fd-numbered redirects (site/content/internals/values-streams-execution.md): a bare
                     // digit word glued to the redirect. Without this check the
                     // digit silently passes as an ARGUMENT and the redirect
@@ -239,6 +228,17 @@ impl<'s> Parser<'s> {
                             "stderr is structured — `(cmd).stderr`, or \
                              `try { cmd } catch e { e.stderr }`; a statement-position \
                              PTY run already merges the streams",
+                        ));
+                    }
+                    if redirects.iter().any(|redirect| {
+                        matches!(redirect.kind, RedirectKind::Out | RedirectKind::Append)
+                    }) {
+                        return Err(ParseError::new(
+                            "a command may have only one stdout redirect",
+                            s,
+                        )
+                        .hint(
+                            "choose one target; for fan-out, capture `(cmd).out` and handle each write explicitly",
                         ));
                     }
                     let kind = match self.bump(Mode::Cmd)?.0 {

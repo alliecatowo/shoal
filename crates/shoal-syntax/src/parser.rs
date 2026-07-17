@@ -350,6 +350,21 @@ mod tests {
         let input = parse("tool < first < second").unwrap_err();
         assert!(input.msg.contains("only one stdin redirect"));
 
+        // More specific unsupported syntax keeps its teaching diagnostic even
+        // when it follows a valid redirect.
+        assert!(
+            parse("tool < first << EOF")
+                .unwrap_err()
+                .msg
+                .contains("heredoc")
+        );
+        assert!(
+            parse("tool > first 2> second")
+                .unwrap_err()
+                .msg
+                .contains("fd-numbered")
+        );
+
         // One redirect for each channel remains a well-defined shell shape.
         let parsed = parse("tool < input > output").unwrap();
         let Stmt::Expr {
