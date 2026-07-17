@@ -235,6 +235,29 @@ Rules for implementers:
   <br>Done: kernel-protocol records the thread/lock model and the exact global, principal, and
   owner quotas, including the retained-session cap and idle eviction policy.
 
+## Post-reconciliation input-admission sweep
+
+The reconciliation audit found boundedness gaps outside the original A1–J4 matrix. These are kept
+here so they survive branch handoffs and context compaction.
+
+- [x] **RA-INPUT-1** — Leash policy files have bounded byte/TOML/identity/string admission;
+  present-but-invalid authority policy enters explicit deny-all quarantine, while a genuinely
+  missing local policy preserves the documented permissive convenience default. (`8451361`)
+- [x] **RA-INPUT-2** — Runtime adapter catalogs bound manifest files, commands, bytes, TOML shape,
+  nodes, and strings; hostile siblings warn without hiding valid adapters. Completion enumerates
+  names through that same loader rather than an unbounded parser bypass. (`9294f18` plus prompt
+  admission follow-up)
+- [x] **RA-INPUT-3** — Reef manifests, scope chains, locks, runner/tool identities, shebang probes,
+  and executable hashing use bounded admission or streaming reads. Hostile nearer scopes retain a
+  warning and do not hide a valid farther scope. (`2035ed5`)
+- [x] **RA-INPUT-4** — Rich prompt files, merged TOML shape, dynamic module identities, recognized
+  environment values, and direct Git control reads are bounded. Advisory failures remain visible
+  and degrade to valid layers/defaults. (prompt admission follow-up)
+
+Remaining honesty constraint: regular-file classification and later open are not advertised as an
+atomic race-free security boundary. OS containment and executable preflight TOCTOU remain separate
+documented limitations.
+
 ## Traceability matrix
 
 Every audit finding → the task(s) that retire it.

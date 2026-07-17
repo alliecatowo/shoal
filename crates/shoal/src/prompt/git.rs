@@ -1,9 +1,12 @@
 //! Repository discovery and the once-per-command Git status snapshot.
 
 use super::*;
+use std::fs::{self, File};
+use std::io::Read;
 
 const GIT_STATUS_TIMEOUT: Duration = Duration::from_millis(300);
 const GIT_STATUS_OUTPUT_CAP: usize = 256 * 1024;
+const GIT_CONTROL_FILE_CAP: usize = 8 * 1024;
 
 // ---------------------------------------------------------------------------
 // Pure-Rust git reader — branch + in-progress state, zero subprocess (site/content/internals/prompt-editor-lsp.md)
@@ -146,7 +149,7 @@ pub(super) fn discover_repo(cwd: &Path) -> Option<(PathBuf, PathBuf)> {
         }
         if candidate.is_file() {
             // Worktree: `.git` file contains `gitdir: <path>`.
-            if let Ok(content) = std::fs::read_to_string(&candidate)
+            if let Some(content) = read_git_control_file(&candidate)
                 && let Some(rest) = content.trim().strip_prefix("gitdir:")
             {
                 let gd = PathBuf::from(rest.trim());
@@ -159,7 +162,7 @@ pub(super) fn discover_repo(cwd: &Path) -> Option<(PathBuf, PathBuf)> {
 }
 
 pub(super) fn read_head(git_dir: &Path) -> (Option<String>, Option<String>) {
-    let Ok(content) = std::fs::read_to_string(git_dir.join("HEAD")) else {
+    let Some(content) = read_git_control_file(&git_dir.join("HEAD")) else {
         return (None, None);
     };
     let content = content.trim();
@@ -176,6 +179,24 @@ pub(super) fn read_head(git_dir: &Path) -> (Option<String>, Option<String>) {
     } else {
         (None, None)
     }
+}
+
+fn read_git_control_file(path: &Path) -> Option<String> {
+    if !fs::metadata(path).ok()?.is_file() {
+        return None;
+    }
+    let file = File::open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(256);
+    file.take((GIT_CONTROL_FILE_CAP + 1) as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > GIT_CONTROL_FILE_CAP {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
 }
 
 pub(super) fn read_state(git_dir: &Path) -> RepoState {
@@ -227,6 +248,23 @@ mod bounded_probe_tests {
         assert_eq!(counts.behind, 3);
         assert_eq!(counts.staged, 1);
         assert_eq!(counts.untracked, 1);
+    }
+
+    #[test]
+    fn hostile_git_control_files_degrade_without_unbounded_reads() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("HEAD");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len((GIT_CONTROL_FILE_CAP + 1) as u64).unwrap();
+        assert!(read_git_control_file(&path).is_none());
+
+        fs::write(&path, [0xff]).unwrap();
+        assert!(read_git_control_file(&path).is_none());
+        assert!(read_git_control_file(directory.path()).is_none());
+
+        let source = include_str!("git.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        assert!(!production.contains("read_to_string"));
     }
 
     #[test]

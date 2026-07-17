@@ -77,10 +77,17 @@ are replayed on top. Therefore a theme supplies defaults but never defeats a use
 
 
 Unlike core configuration, a prompt deserialization error does not stop shell startup. It warns and
-falls back to all defaults. File reads also use a best-effort path: unreadable files are treated as
-absent; malformed files generate warnings. This is a deliberate “a broken prompt must not break the
-shell” policy, but it means permission failures and absence are not distinguishable in current
-diagnostics.
+falls back to all defaults. A missing optional file is silent; unreadable, non-regular, non-UTF-8,
+oversized, or malformed files emit path-specific warnings and that layer is ignored. This is a
+deliberate “a broken prompt must not break the shell” policy.
+
+Prompt admission is bounded before merge: each source is at most 1 MiB, TOML depth is at most 64,
+the merged graph is at most 16,384 nodes, strings are at most 64 KiB, and each of
+`module.language` and `module.custom` retains at most 128 identities. At most 16 layers are
+accepted, preserving the highest-precedence layers if an embedding caller supplies more. Prompt
+environment values are capped at 64 KiB and only the five recognized names are copied from the
+process environment. A rejected advisory layer remains visible as a warning while valid layers and
+the built-in defaults remain usable.
 
 ### Environment controls
 
@@ -95,6 +102,10 @@ diagnostics.
 Nerd-font `auto` detection checks, in order of a single boolean expression, `WEZTERM_PANE`,
 `KITTY_WINDOW_ID`, `WT_SESSION`, then `SHOAL_NERD_FONT=1`. Unicode and nerd-font support are
 separate: a nerd glyph is used only when both are true.
+
+The producer's direct Git control reads are also bounded: worktree `.git` pointers and `HEAD` are
+regular UTF-8 files of at most 8 KiB. A hostile control file degrades branch metadata instead of
+allocating an unbounded buffer or breaking the shell.
 
 ### Legacy template migration
 

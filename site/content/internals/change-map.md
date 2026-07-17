@@ -165,16 +165,16 @@ differences data rather than copy/pasted setup.
 
 ### High: policy and OS containment have sharp trust assumptions
 
-**Evidence:** malformed user Leash policy falls back to permissive in the convenience local loader;
-network grants are plan-only because no network backend exists; executable hash pinning has a
-preflight TOCTOU gap.
+**Evidence:** a present malformed user Leash policy now enters explicit deny-all quarantine (only a
+genuinely missing convenience policy keeps the local permissive default). Network grants remain
+plan-only because no network backend exists, and executable hash pinning has a preflight TOCTOU
+gap.
 
-**Risk:** a caller can mistake a parsed policy or “hermetic” label for stronger enforcement than the
-host actually supplies.
+**Risk:** a caller can still mistake a parsed policy or “hermetic” label for stronger OS enforcement
+than the host actually supplies, even though invalid authority input itself now fails closed.
 
-**Direction:** require an explicit fail-open/fail-closed loader mode by host, surface enforcement
-dimensions in every relevant attach/plan result, and keep hermetic refusal tests for unsupported
-network/spawn guarantees.
+**Direction:** surface enforcement dimensions in every relevant attach/plan result, and keep
+hermetic refusal tests for unsupported network/spawn guarantees.
 
 ### Medium-high: parser context parity is incomplete
 

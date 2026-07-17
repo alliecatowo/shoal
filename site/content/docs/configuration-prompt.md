@@ -295,6 +295,12 @@ Unlike main project configuration, the prompt loader currently checks only `cwd/
 
 The prompt-specific overrides are `SHOAL_PROMPT_LEFT`, `SHOAL_PROMPT_RIGHT`, `SHOAL_PROMPT_THEME`, and `SHOAL_NERD_FONT`. For the font variable, `1` means `always` and `0` means `never`.
 
+Prompt files are advisory and bounded. A missing file is ignored; an unreadable, non-regular,
+non-UTF-8, malformed, or larger-than-1-MiB file produces a warning and is skipped without stopping
+the shell. The loader also rejects excessively deep or wide TOML, strings or recognized prompt
+environment values above 64 KiB, and more than 128 custom or language modules. Other valid prompt
+layers and built-in defaults continue to work.
+
 ## Format placeholders
 
 A format string combines literal text with `$module_id` placeholders. The fixed IDs are:

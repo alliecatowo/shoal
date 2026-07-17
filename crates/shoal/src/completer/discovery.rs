@@ -170,28 +170,14 @@ fn resolve_dir(cwd: &Path, dir_part: &str) -> PathBuf {
     }
 }
 
-/// Enumerate `[cmd.<name>]` table keys from adapter configuration files.
+/// Enumerate adapter command names through the same bounded, validated loader
+/// used by execution. Completion is advisory, so malformed files simply
+/// contribute no candidates; startup reports the loader's warnings.
 pub(super) fn adapter_names(dirs: &[PathBuf]) -> Vec<String> {
     let mut names = BTreeSet::new();
     for dir in dirs {
-        let Ok(entries) = fs::read_dir(dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().is_none_or(|extension| extension != "toml") {
-                continue;
-            }
-            let Ok(source) = fs::read_to_string(path) else {
-                continue;
-            };
-            let Ok(document) = source.parse::<toml::Value>() else {
-                continue;
-            };
-            if let Some(commands) = document.get("cmd").and_then(toml::Value::as_table) {
-                names.extend(commands.keys().cloned());
-            }
-        }
+        let (catalog, _warnings) = shoal_adapters::AdapterCatalog::load_dir(dir);
+        names.extend(catalog.names().map(str::to_owned));
     }
     names.into_iter().collect()
 }
