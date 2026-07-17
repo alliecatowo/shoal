@@ -4,78 +4,29 @@
 //! `site/content/internals/kernel-protocol.md` for the wire contract.
 use super::*;
 
-/// A per-connection socket writer shared between the request/response path
-/// and any subscription push threads. Whole frames are serialized then
-/// written under this lock so a pushed `event` notification never
-/// interleaves with a response on the same fd.
-pub(crate) type SharedWriter = Arc<Mutex<UnixStream>>;
+mod channels;
+mod durable;
+mod subscriptions;
+
+use channels::ChannelRegistry;
+use durable::{DurableChannel, DurableIndexes};
+pub(crate) use subscriptions::SharedWriter;
+use subscriptions::SubscriptionRegistry;
+#[cfg(test)]
+use subscriptions::{SUB_QUEUE_CAP, SubQueue};
 
 /// One ring buffer per channel; `seq` is monotonic per channel. Subscribers
 /// get `event` notifications pushed on their own connection via a bounded,
 /// per-subscriber queue (site/content/internals/kernel-protocol.md) — see `SubQueue` below for why.
 #[derive(Default)]
 pub(crate) struct EventBus {
-    channels: Mutex<HashMap<(OwnerKey, String), ChannelBuf>>,
-    subs: Mutex<Vec<Subscriber>>,
-    /// The seq↔journal-entry correspondence for the `journal` channel, the
-    /// first channel whose events were made replayable past the in-memory
-    /// ring (see `site/content/internals/kernel-protocol.md`). Dense `Vec` indexed by the
-    /// journal channel's `seq` (0-based, contiguous), holding the journal
-    /// `entry_id` each seq was published for. This is only the *pointer* —
-    /// the event payload (`head`/`ok`/`principal`) is reconstructed from the
-    /// journal's `entry` table itself, not from here, so an aged-out
-    /// `journal` event costs one `i64` of memory, not a buffered event.
-    ///
-    /// Written (under the `channels` lock, so it can never diverge from the
-    /// seqs the ring hands out) only by `publish_journal`; read by the
-    /// kernel's `read_journal_channel` fallback. Also rebuilt WHOLESALE, once,
-    /// at kernel construction time by [`EventBus::seed_from_journal`] so
-    /// event-bus seqs survive a kernel restart when reopening an existing
-    /// on-disk store — see that method for how it recovers exactly this same
-    /// membership/order from durable state alone.
-    journal_index: Mutex<HashMap<OwnerKey, Vec<i64>>>,
-    /// The same dense-index idea as `journal_index`, for the
-    /// `session.transcript` channel: indexed
-    /// by that channel's own `seq`, holding the journal `entry_id` the
-    /// transcript event was published for. Unlike `journal_index`, the
-    /// payload this points at is NOT reconstructed from pre-existing journal
-    /// columns — `shoal-journal`'s `transcript_event` table (keyed by that
-    /// same `entry_id`) holds it verbatim, written by `record_transcript_event`
-    /// at the same call site that publishes the live event. Written only by
-    /// `publish_transcript`; read by `read_transcript_channel`. `approval`/
-    /// `render`/`user.*` still touch neither index — they stay ring-only.
-    /// Also rebuilt at construction time by [`EventBus::seed_from_journal`],
-    /// same as `journal_index` above.
-    transcript_index: Mutex<HashMap<OwnerKey, Vec<i64>>>,
-}
-
-/// Ring-buffered event log for one channel.
-#[derive(Default)]
-struct ChannelBuf {
-    next_seq: u64,
-    ring: VecDeque<Event>,
-}
-
-struct Subscriber {
-    conn: u64,
-    owner: OwnerKey,
-    channel: String,
-    queue: Arc<SubQueue>,
+    channels: ChannelRegistry,
+    durable: DurableIndexes,
+    subscriptions: SubscriptionRegistry,
 }
 
 /// Ring depth per channel (site/content/internals/kernel-protocol.md requires ≥1024).
 pub(crate) const EVENT_RING_CAP: usize = 1024;
-
-/// Bound on a subscriber's own outgoing queue — distinct from the per-channel
-/// ring buffer above. This is the backpressure boundary site/content/internals/kernel-protocol.md
-/// promises: `publish()` (below) only ever appends to this bounded, in-memory
-/// queue, never performs the blocking socket write itself, so a stalled
-/// subscriber can delay at most its own dedicated writer thread — never the
-/// producer, and never any other subscriber. Once a subscriber's queue holds
-/// this many not-yet-written events, further events for that subscriber are
-/// dropped and coalesced into a running `{dropped, latest_seq}` summary
-/// (`SubQueueState`) instead of buffered unboundedly.
-const SUB_QUEUE_CAP: usize = 256;
 
 /// The static channels a session may always subscribe to (site/content/internals/kernel-protocol.md).
 /// `task.{id}` and `user.{name}` are dynamic and not listed here.
@@ -90,179 +41,6 @@ const SUB_QUEUE_CAP: usize = 256;
 /// `site/content/internals/kernel-protocol.md`'s status section.
 pub(crate) const STATIC_CHANNELS: &[&str] =
     &["session.transcript", "journal", "approval", "render"];
-
-/// A subscriber's outgoing queue (site/content/internals/kernel-protocol.md): a bounded FIFO of
-/// not-yet-written events, plus a running count of events dropped since the
-/// queue last drained past capacity. Protected by its OWN lock — never
-/// `EventBus::subs` — so `publish()` appending to one subscriber's queue
-/// never contends with, let alone blocks on, another subscriber's slow
-/// writer thread doing a blocking socket write.
-struct SubQueue {
-    channel: String,
-    state: Mutex<SubQueueState>,
-    ready: Condvar,
-}
-
-#[derive(Default)]
-struct SubQueueState {
-    events: VecDeque<Event>,
-    dropped: u64,
-    latest_dropped_seq: u64,
-    closed: bool,
-}
-
-impl SubQueue {
-    fn new(channel: String) -> Arc<Self> {
-        Arc::new(Self {
-            channel,
-            state: Mutex::new(SubQueueState::default()),
-            ready: Condvar::new(),
-        })
-    }
-
-    /// Enqueue `event` for this subscriber. Never blocks: at capacity the
-    /// event is dropped and folded into the running `{dropped, latest_seq}`
-    /// summary rather than buffered — this is the only thing `publish()`
-    /// calls per subscriber, and it is a plain in-memory push, never a
-    /// socket write, so a stalled subscriber can never stall `publish()`.
-    fn push(&self, event: Event) {
-        let mut state = match self.state.lock() {
-            Ok(state) => state,
-            Err(poisoned) => {
-                self.discard_poisoned_state(poisoned.into_inner());
-                return;
-            }
-        };
-        if state.events.len() < SUB_QUEUE_CAP {
-            state.events.push_back(event);
-        } else {
-            state.dropped += 1;
-            state.latest_dropped_seq = event.seq;
-        }
-        drop(state);
-        self.ready.notify_one();
-    }
-
-    /// Mark this queue closed (connection gone / explicitly unsubscribed) so
-    /// its writer thread stops waiting and exits instead of blocking forever.
-    fn close(&self) {
-        match self.state.lock() {
-            Ok(mut state) => state.closed = true,
-            Err(poisoned) => self.discard_poisoned_state(poisoned.into_inner()),
-        }
-        self.ready.notify_one();
-    }
-
-    /// Block until there is something to write: a buffered event, a pending
-    /// dropped-summary (synthesized into an `Event` here so the writer thread
-    /// has one uniform thing to serialize), or closure (`None`). A pending
-    /// summary is always delivered before any event that arrives after it —
-    /// the subscriber learns about the gap before it sees anything past it.
-    fn next(&self) -> Option<Event> {
-        let mut state = match self.state.lock() {
-            Ok(state) => state,
-            Err(poisoned) => {
-                self.discard_poisoned_state(poisoned.into_inner());
-                return None;
-            }
-        };
-        loop {
-            if let Some(event) = state.events.pop_front() {
-                return Some(event);
-            }
-            if state.dropped > 0 {
-                let dropped = state.dropped;
-                let latest_seq = state.latest_dropped_seq;
-                state.dropped = 0;
-                return Some(Event {
-                    channel: self.channel.clone(),
-                    seq: latest_seq,
-                    ts: now_ns(),
-                    payload: json!({"dropped": dropped, "latest_seq": latest_seq}),
-                });
-            }
-            if state.closed {
-                return None;
-            }
-            state = match self.ready.wait(state) {
-                Ok(state) => state,
-                Err(poisoned) => {
-                    // The guard is already available here, so restore the
-                    // queue's only safe invariant directly: empty + closed.
-                    let mut state = poisoned.into_inner();
-                    *state = SubQueueState {
-                        closed: true,
-                        ..SubQueueState::default()
-                    };
-                    self.state.clear_poison();
-                    self.ready.notify_all();
-                    return None;
-                }
-            };
-        }
-    }
-
-    /// A subscriber queue is disposable delivery state, not authoritative
-    /// session state. If its mutex is poisoned, discard every buffered event
-    /// and close this subscriber. This restores a concrete invariant instead
-    /// of pretending the interrupted queue mutation completed.
-    fn discard_poisoned_state(&self, mut state: std::sync::MutexGuard<'_, SubQueueState>) {
-        *state = SubQueueState {
-            closed: true,
-            ..SubQueueState::default()
-        };
-        self.state.clear_poison();
-        drop(state);
-        self.ready.notify_all();
-    }
-}
-
-/// One dedicated thread per subscription, draining `queue` and performing
-/// the (potentially blocking) socket write — the ONLY place that write
-/// happens. Isolating it here, off any `EventBus`-wide lock and off the
-/// `publish()` call path entirely, is what makes a slow/stalled client's
-/// blocking `write_all` a problem for this one thread alone.
-fn spawn_subscriber_writer(queue: Arc<SubQueue>, writer: SharedWriter) {
-    std::thread::spawn(move || {
-        while let Some(event) = queue.next() {
-            let note = json!({
-                "jsonrpc": JSONRPC,
-                "method": "event",
-                "params": &event,
-            });
-            // A panic during a framed socket write may have left partial bytes
-            // on the stream. Continuing with the recovered guard could splice
-            // two JSON frames together, so abandon this subscriber instead.
-            let Ok(mut w) = writer.lock() else {
-                queue.close();
-                return;
-            };
-            let ok = write_json_notification(&mut w, &note).is_ok();
-            drop(w);
-            if !ok {
-                // Dead connection: stop trying. The subscriber entry itself
-                // is pruned from `EventBus::subs` by `remove_conn` when the
-                // read side of this same connection notices the disconnect
-                // (or by an explicit `unsubscribe`) — until then, `publish()`
-                // simply keeps pushing into a queue nothing drains, which is
-                // harmless: it is bounded, so it costs at most `SUB_QUEUE_CAP`
-                // events of memory, never unbounded growth or a blocked
-                // producer.
-                queue.close();
-                return;
-            }
-        }
-    });
-}
-
-/// Which of `EventBus`'s two durable indices (if any) a `publish_inner` call
-/// should record the `entry_id` pointer into — `journal` and
-/// `session.transcript` are the only two journal-backed channels
-/// (site/content/internals/kernel-protocol.md); every other channel stays ring-only.
-enum DurableChannel {
-    Journal,
-    Transcript,
-}
 
 impl EventBus {
     /// Append `payload` to `channel`'s ring and enqueue it for every live
@@ -329,46 +107,12 @@ impl EventBus {
         payload: Json,
         durable: Option<(DurableChannel, i64)>,
     ) -> Event {
-        let event = {
-            let mut channels = self.channels.lock().unwrap();
-            let buf = channels
-                .entry((owner.clone(), channel.to_string()))
-                .or_default();
-            let seq = buf.next_seq;
-            buf.next_seq += 1;
-            if let Some((which, entry_id)) = durable {
-                let index = match which {
-                    DurableChannel::Journal => &self.journal_index,
-                    DurableChannel::Transcript => &self.transcript_index,
-                };
-                let mut indexes = index.lock().unwrap();
-                let index = indexes.entry(owner.clone()).or_default();
-                debug_assert_eq!(
-                    index.len() as u64,
-                    seq,
-                    "a durable index must stay dense and aligned with its channel's seqs"
-                );
-                index.push(entry_id);
-            }
-            let event = Event {
-                channel: channel.to_string(),
-                seq,
-                ts: now_ns(),
-                payload,
-            };
-            buf.ring.push_back(event.clone());
-            while buf.ring.len() > EVENT_RING_CAP {
-                buf.ring.pop_front();
-            }
-            event
-        };
-        let subs = self.subs.lock().unwrap();
-        for sub in subs
-            .iter()
-            .filter(|s| s.owner == *owner && s.channel == channel)
-        {
-            sub.queue.push(event.clone());
-        }
+        // ChannelRegistry releases both its channel lock and (for durable
+        // events) the selected index lock before subscription delivery starts.
+        let event = self
+            .channels
+            .publish(&self.durable, owner, channel, payload, durable);
+        self.subscriptions.deliver(owner, channel, &event);
         event
     }
 
@@ -376,31 +120,19 @@ impl EventBus {
     /// channel has never published. Used by the journal-backed read path to
     /// find the boundary below which events have aged out of the ring.
     pub(crate) fn ring_oldest_seq(&self, owner: &OwnerKey, channel: &str) -> Option<u64> {
-        self.channels
-            .lock()
-            .unwrap()
-            .get(&(owner.clone(), channel.to_string()))
-            .and_then(|buf| buf.ring.front().map(|e| e.seq))
+        self.channels.oldest_seq(owner, channel)
     }
 
     /// Total number of events ever published on the `journal` channel this
     /// process (== the channel's `next_seq`). `journal_index` has exactly one
     /// entry per published journal event, so its length is that count.
     pub(crate) fn journal_published_count(&self, owner: &OwnerKey) -> u64 {
-        Self::index_len(&self.journal_index, owner)
+        self.durable.len(DurableChannel::Journal, owner)
     }
 
     /// As [`EventBus::journal_published_count`], for `session.transcript`.
     pub(crate) fn transcript_published_count(&self, owner: &OwnerKey) -> u64 {
-        Self::index_len(&self.transcript_index, owner)
-    }
-
-    fn index_len(index: &Mutex<HashMap<OwnerKey, Vec<i64>>>, owner: &OwnerKey) -> u64 {
-        index
-            .lock()
-            .unwrap()
-            .get(owner)
-            .map_or(0, |entries| entries.len() as u64)
+        self.durable.len(DurableChannel::Transcript, owner)
     }
 
     /// The `(seq, entry_id)` pairs for journal-channel events whose `seq` is
@@ -415,7 +147,8 @@ impl EventBus {
         since: Option<u64>,
         upto: u64,
     ) -> Vec<(u64, i64)> {
-        Self::index_range(&self.journal_index, owner, since, upto)
+        self.durable
+            .range(DurableChannel::Journal, owner, since, upto)
     }
 
     /// As [`EventBus::journal_index_range`], for `session.transcript`.
@@ -425,23 +158,8 @@ impl EventBus {
         since: Option<u64>,
         upto: u64,
     ) -> Vec<(u64, i64)> {
-        Self::index_range(&self.transcript_index, owner, since, upto)
-    }
-
-    fn index_range(
-        indexes: &Mutex<HashMap<OwnerKey, Vec<i64>>>,
-        owner: &OwnerKey,
-        since: Option<u64>,
-        upto: u64,
-    ) -> Vec<(u64, i64)> {
-        let indexes = indexes.lock().unwrap();
-        let Some(index) = indexes.get(owner) else {
-            return Vec::new();
-        };
-        let start = since.map(|s| s.saturating_add(1)).unwrap_or(0);
-        (start..upto)
-            .filter_map(|seq| index.get(seq as usize).map(|&entry_id| (seq, entry_id)))
-            .collect()
+        self.durable
+            .range(DurableChannel::Transcript, owner, since, upto)
     }
 
     /// Buffered tail of `channel` from `since` (exclusive), capped at `limit`.
@@ -452,22 +170,7 @@ impl EventBus {
         since: Option<u64>,
         limit: Option<usize>,
     ) -> Vec<Event> {
-        let channels = self.channels.lock().unwrap();
-        let Some(buf) = channels.get(&(owner.clone(), channel.to_string())) else {
-            return Vec::new();
-        };
-        let mut out: Vec<Event> = buf
-            .ring
-            .iter()
-            .filter(|e| since.is_none_or(|s| e.seq > s))
-            .cloned()
-            .collect();
-        if let Some(limit) = limit
-            && out.len() > limit
-        {
-            out = out.split_off(out.len() - limit);
-        }
-        out
+        self.channels.read(owner, channel, since, limit)
     }
 
     /// Register `writer` as a subscriber to `channel` (idempotent per
@@ -486,41 +189,10 @@ impl EventBus {
         writer: &SharedWriter,
         max_per_session: usize,
     ) -> Result<(), RpcError> {
-        let queue = {
-            let mut subs = self.subs.lock().unwrap();
-            if let Some(existing) = subs
-                .iter()
-                .find(|s| s.conn == conn && s.owner == *owner && s.channel == channel)
-            {
-                existing.queue.clone()
-            } else {
-                let current = subs
-                    .iter()
-                    .filter(|subscriber| subscriber.owner == *owner)
-                    .count();
-                if current >= max_per_session {
-                    return Err(RpcError {
-                        code: QUOTA_EXCEEDED,
-                        message: format!(
-                            "session has reached the {max_per_session}-subscription limit"
-                        ),
-                        data: Some(json!({
-                            "limit": "subscriptions_per_session",
-                            "max": max_per_session,
-                        })),
-                    });
-                }
-                let queue = SubQueue::new(channel.to_string());
-                subs.push(Subscriber {
-                    conn,
-                    owner: owner.clone(),
-                    channel: channel.to_string(),
-                    queue: queue.clone(),
-                });
-                spawn_subscriber_writer(queue.clone(), writer.clone());
-                queue
-            }
-        };
+        let queue = self
+            .subscriptions
+            .subscribe(conn, owner, channel, writer, max_per_session)?;
+        // SubscriptionRegistry has released its lock before channel replay.
         for event in self.read(owner, channel, since, None) {
             queue.push(event);
         }
@@ -528,50 +200,26 @@ impl EventBus {
     }
 
     fn unsubscribe(&self, conn: u64, owner: &OwnerKey, channel: &str) {
-        let mut subs = self.subs.lock().unwrap();
-        subs.retain(|s| {
-            let keep = !(s.conn == conn && s.owner == *owner && s.channel == channel);
-            if !keep {
-                s.queue.close();
-            }
-            keep
-        });
+        self.subscriptions.unsubscribe(conn, owner, channel);
     }
 
     pub(crate) fn remove_conn(&self, conn: u64) {
-        let mut subs = self.subs.lock().unwrap();
-        subs.retain(|s| {
-            let keep = s.conn != conn;
-            if !keep {
-                s.queue.close();
-            }
-            keep
-        });
+        self.subscriptions.remove_conn(conn);
     }
 
     /// Remove every in-memory channel cursor/index/subscription for an evicted
     /// idle owner. Durable command history remains in the journal; event cursors
     /// intentionally restart if that owner later recreates the session.
     pub(crate) fn remove_owner(&self, owner: &OwnerKey) {
-        self.channels
-            .lock()
-            .unwrap()
-            .retain(|(channel_owner, _), _| channel_owner != owner);
-        self.journal_index.lock().unwrap().remove(owner);
-        self.transcript_index.lock().unwrap().remove(owner);
-        let mut subs = self.subs.lock().unwrap();
-        subs.retain(|subscriber| {
-            let keep = &subscriber.owner != owner;
-            if !keep {
-                subscriber.queue.close();
-            }
-            keep
-        });
+        self.channels.remove_owner(owner);
+        self.durable.remove_owner(owner);
+        // Never overlap subscription state with channel or durable locks.
+        self.subscriptions.remove_owner(owner);
     }
 
     #[cfg(test)]
     pub(crate) fn subscriber_count(&self) -> usize {
-        self.subs.lock().unwrap().len()
+        self.subscriptions.len()
     }
 
     /// Rebuild `journal`/`session.transcript` seq state from an EXISTING
@@ -648,7 +296,7 @@ impl EventBus {
                 .push(*entry_id);
         }
         for (owner, entry_ids) in &journal_groups {
-            self.seed_index(&self.journal_index, owner, "journal", entry_ids);
+            self.seed_index(DurableChannel::Journal, owner, "journal", entry_ids);
         }
         let coarse_ids: Vec<i64> = coarse.iter().map(|(entry_id, _)| *entry_id).collect();
         if let Ok(rows) = journal.transcript_events_by_entry(&coarse_ids) {
@@ -664,7 +312,7 @@ impl EventBus {
             }
             for (owner, entry_ids) in &transcript_groups {
                 self.seed_index(
-                    &self.transcript_index,
+                    DurableChannel::Transcript,
                     owner,
                     "session.transcript",
                     entry_ids,
@@ -682,35 +330,14 @@ impl EventBus {
     /// no concurrent publish to race with.
     fn seed_index(
         &self,
-        indexes: &Mutex<HashMap<OwnerKey, Vec<i64>>>,
+        durable_channel: DurableChannel,
         owner: &OwnerKey,
         channel: &str,
         entry_ids: &[i64],
     ) {
-        if entry_ids.is_empty() {
-            return;
-        }
-        // Match `publish_inner`'s single global order: channels before the
-        // selected durable index. Seeding is startup-only today, but keeping
-        // the order identical prevents a latent ABBA if lifecycle work ever
-        // invokes it after the bus has been shared.
-        let mut channels = self.channels.lock().unwrap();
-        let mut indexes = indexes.lock().unwrap();
-        let idx = indexes.entry(owner.clone()).or_default();
-        idx.extend_from_slice(entry_ids);
-        let buf = channels
-            .entry((owner.clone(), channel.to_string()))
-            .or_default();
-        buf.next_seq = idx.len() as u64;
+        self.channels
+            .seed_durable(&self.durable, durable_channel, owner, channel, entry_ids);
     }
-}
-
-fn write_json_notification(writer: &mut UnixStream, value: &Json) -> io::Result<()> {
-    let mut buf = serde_json::to_vec(value).map_err(io::Error::other)?;
-    buf.push(b'\n');
-    use std::io::Write as _;
-    writer.write_all(&buf)?;
-    writer.flush()
 }
 
 impl Kernel {
@@ -1247,9 +874,9 @@ mod tests {
         let writer: SharedWriter = Arc::new(Mutex::new(server_end));
         bus.subscribe(1, &owner, "user.bye", None, &writer, usize::MAX)
             .unwrap();
-        assert_eq!(bus.subs.lock().unwrap().len(), 1);
+        assert_eq!(bus.subscriptions.len(), 1);
         bus.unsubscribe(1, &owner, "user.bye");
-        assert_eq!(bus.subs.lock().unwrap().len(), 0);
+        assert_eq!(bus.subscriptions.len(), 0);
         drop(client_end);
     }
 
@@ -1280,7 +907,7 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(bus.subs.lock().unwrap().len(), 1);
+        assert_eq!(bus.subscriptions.len(), 1);
         bus.remove_conn(1);
         bus.remove_conn(2);
     }
@@ -1409,7 +1036,7 @@ mod tests {
         let seed_done = done_tx.clone();
         let seed = std::thread::spawn(move || {
             seed_barrier.wait();
-            seed_bus.seed_index(&seed_bus.journal_index, &seed_owner, "journal", &[10, 11]);
+            seed_bus.seed_index(DurableChannel::Journal, &seed_owner, "journal", &[10, 11]);
             seed_done.send(()).unwrap();
         });
         let publish_bus = bus.clone();
