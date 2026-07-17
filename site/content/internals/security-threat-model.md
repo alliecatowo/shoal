@@ -496,8 +496,14 @@ accDescr: Shows the components and relationships described in Secret store desig
 ```
 
 Names must be nonempty ASCII alphanumeric, underscore, or hyphen. `get` returns `Zeroizing<Vec<u8>>`.
-Plain serialization and decrypted bytes use zeroizing wrappers in key paths, though intermediate map
-values and caller copies can still live in memory.
+The decrypted plaintext map (`PlainSecrets`), the serialized-plaintext and decrypted-plaintext
+buffers, and the key bytes are all wrapped in zeroizing types and are deterministically zeroized on
+drop — including early-return error paths inside `load`/`save`, and values displaced by `set`
+overwriting an existing name or removed by `delete`. That guarantee is scoped to `shoal-secret`
+itself: the evaluator's `SecretPort` copies the bytes into a plain `Vec<u8>`, the language-level
+`Value::Secret` payload is an ordinary `Arc<str>` with no zeroize-on-drop, and injecting a secret into
+a spawned process's environment hands the OS a further copy this crate cannot reach. Those are
+documented scope, not an oversight — see "Secret language boundary" below.
 
 AES-GCM detects envelope modification. **The real confidentiality boundary is the OS directory
 permission, not the encryption**: the master key sits beside the ciphertext in the same 0700

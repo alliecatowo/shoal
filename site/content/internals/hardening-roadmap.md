@@ -225,8 +225,12 @@ Rules for implementers:
   <br>Done: threat-model "Secret store design" states the OS-permission boundary plainly and
   records the OS-keyring evaluation/deferral rationale; `SecretStore` carries a matching doc
   comment.
-- [ ] **HR-I2** — Secret material zeroized where practical; env-injection copies noted in docs.
+- [x] **HR-I2** — Secret material zeroized where practical; env-injection copies noted in docs.
   *(J2)*
+  <br>Done: the decrypted plaintext map and key/buffer material in `shoal-secret` are wrapped in
+  zeroizing types and zeroized on drop (including error paths and replaced/deleted values); the
+  threat model documents that `Arc<str>` language values and env-injection copies fall outside that
+  guarantee.
 - [ ] **HR-I3** — Interprocess locking (file lock or equivalent) around secret-store and
   token-store read-modify-write. *(J3, J4)*
 

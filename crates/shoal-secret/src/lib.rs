@@ -9,7 +9,7 @@ use std::{
     fs, io,
     path::{Path, PathBuf},
 };
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Encrypted secret storage. The confidentiality boundary is the containing
 /// directory's OS permissions, not the AES-GCM envelope: `master.key` and
@@ -35,6 +35,21 @@ struct Envelope {
     nonce: String,
     ciphertext: String,
 }
+
+/// Plaintext map with deterministic zeroization of every value on all exits,
+/// including parse/save errors and replacement/deletion paths.
+#[derive(Default, Serialize, Deserialize)]
+#[serde(transparent)]
+struct PlainSecrets(BTreeMap<String, Vec<u8>>);
+
+impl Drop for PlainSecrets {
+    fn drop(&mut self) {
+        for value in self.0.values_mut() {
+            value.zeroize();
+        }
+    }
+}
+
 impl SecretStore {
     pub fn open(dir: impl Into<PathBuf>) -> io::Result<Self> {
         let s = Self { dir: dir.into() };
@@ -51,24 +66,26 @@ impl SecretStore {
     pub fn set(&self, name: &str, value: &[u8]) -> io::Result<()> {
         valid(name)?;
         let mut m = self.load()?;
-        m.insert(name.into(), value.to_vec());
+        if let Some(old) = m.0.insert(name.into(), value.to_vec()) {
+            drop(Zeroizing::new(old));
+        }
         self.save(&m)
     }
     pub fn get(&self, name: &str) -> io::Result<Option<Zeroizing<Vec<u8>>>> {
         valid(name)?;
-        Ok(self.load()?.remove(name).map(Zeroizing::new))
+        Ok(self.load()?.0.remove(name).map(Zeroizing::new))
     }
     pub fn list(&self) -> io::Result<Vec<String>> {
-        Ok(self.load()?.into_keys().collect())
+        Ok(self.load()?.0.keys().cloned().collect())
     }
     pub fn delete(&self, name: &str) -> io::Result<bool> {
         valid(name)?;
         let mut m = self.load()?;
-        let found = m.remove(name).is_some();
-        if found {
+        let found = m.0.remove(name).map(Zeroizing::new);
+        if found.is_some() {
             self.save(&m)?
         }
-        Ok(found)
+        Ok(found.is_some())
     }
     fn key_path(&self) -> PathBuf {
         self.dir.join("master.key")
@@ -86,9 +103,9 @@ impl SecretStore {
         }
         Ok(k)
     }
-    fn load(&self) -> io::Result<BTreeMap<String, Vec<u8>>> {
+    fn load(&self) -> io::Result<PlainSecrets> {
         if !self.data_path().exists() {
-            return Ok(BTreeMap::new());
+            return Ok(PlainSecrets::default());
         }
         check_mode(&self.data_path())?;
         let e: Envelope = serde_json::from_slice(&fs::read(self.data_path())?).map_err(invalid)?;
@@ -118,7 +135,7 @@ impl SecretStore {
         );
         serde_json::from_slice(&plain).map_err(invalid)
     }
-    fn save(&self, m: &BTreeMap<String, Vec<u8>>) -> io::Result<()> {
+    fn save(&self, m: &PlainSecrets) -> io::Result<()> {
         let plain = Zeroizing::new(serde_json::to_vec(m).map_err(invalid)?);
         let key = self.key()?;
         let cipher = Aes256Gcm::new_from_slice(&key).map_err(invalid)?;
