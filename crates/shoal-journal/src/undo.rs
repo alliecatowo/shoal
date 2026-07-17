@@ -1,5 +1,7 @@
 //! Typed undo inverses: recording them (`record_undo*`) and replaying them
-//! (`undo_entry`/`apply_inverse`) with TOCTOU-safe scope checks.
+//! (`undo_entry`/`apply_inverse`) with scope, symlink, and stale-state checks.
+//! These pathname-based checks fail closed on what they observe, but are not a
+//! dirfd/openat-style guarantee against every concurrent path-component swap.
 
 use std::fs;
 use std::io;
@@ -356,10 +358,10 @@ fn ensure_no_symlink_parents(io: &dyn UndoIo, root: &Path, path: &Path) -> Resul
 /// `/private/tmp`) that the other has already had resolved — see
 /// [`resolve_leading_symlink_prefix`] and the callers in this module that
 /// canonicalize `root` up front. Re-resolve `path`'s own leading prefix the
-/// same (deliberately partial) way and retry once. This never touches
-/// anything past that leading run, so an intra-scope symlink swap — the
-/// TOCTOU case this whole scope check exists for — still can't slip through
-/// either operand.
+/// same (deliberately partial) way and retry once. This never intentionally
+/// resolves anything past that leading run, avoiding an eager traversal of
+/// intra-scope symlinks; it does not eliminate the concurrent pathname-swap
+/// caveat described at module level.
 fn strip_root(io: &dyn UndoIo, root: &Path, path: &Path) -> Result<PathBuf, UndoError> {
     if let Ok(rel) = path.strip_prefix(root) {
         return Ok(rel.to_owned());
@@ -376,13 +378,15 @@ fn strip_root(io: &dyn UndoIo, root: &Path, path: &Path) -> Result<PathBuf, Undo
 /// the first component that is not itself a symlink (or doesn't exist).
 ///
 /// This is deliberately short of a full `canonicalize`: resolving the whole
-/// path would also silently follow a symlink planted *inside* the tracked
-/// scope, which is exactly the TOCTOU swap `ensure_no_symlink_parents`
-/// exists to catch. Restricting resolution to the unbroken run of symlinks
+/// path would also silently follow a symlink observed *inside* the tracked
+/// scope, which `ensure_no_symlink_parents` is intended to reject before the
+/// mutation. Restricting resolution to the unbroken run of symlinks
 /// right at the front only ever reaches genuine OS-level directory aliases
 /// (real filesystem hierarchies put those first, before any directory a
 /// user or a session could have created) and leaves everything below —
-/// scope and its descendants — exactly as given.
+/// scope and its descendants — exactly as given. The later parent walk rejects
+/// symlinks it observes, while the module-level caveat about concurrent
+/// pathname swaps still applies.
 fn resolve_leading_symlink_prefix(io: &dyn UndoIo, path: &Path) -> io::Result<PathBuf> {
     let mut resolved = PathBuf::new();
     let mut components = path.components();

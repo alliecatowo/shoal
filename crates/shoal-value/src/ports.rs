@@ -246,7 +246,13 @@ impl Fs for StdFs {
                 file.write_all(data)?;
                 file.sync_all()?;
                 drop(file);
-                fs::rename(&tmp, path)
+                fs::rename(&tmp, path)?;
+                // Persist the directory entry as well as the file contents.
+                // Unix permits opening a directory for fsync; other platforms
+                // do not expose one uniform directory-sync primitive.
+                #[cfg(unix)]
+                fs::File::open(parent)?.sync_all()?;
+                Ok(())
             })();
             if result.is_err() {
                 let _ = fs::remove_file(&tmp);
@@ -300,6 +306,67 @@ impl Fs for StdFs {
     }
     fn symlink(&self, target: &Path, link: &Path) -> io::Result<()> {
         std::os::unix::fs::symlink(target, link)
+    }
+}
+
+#[cfg(test)]
+mod fs_tests {
+    use super::*;
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            let seq = ATOMIC_REPLACE_SEQ.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "shoal-value-atomic-replace-test-{}-{seq}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).expect("create atomic-replace test directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn replacement_temps(dir: &Path) -> Vec<PathBuf> {
+        fs::read_dir(dir)
+            .expect("read test directory")
+            .map(|entry| entry.expect("read directory entry").path())
+            .filter(|path| {
+                path.file_name().is_some_and(|name| {
+                    name.as_encoded_bytes()
+                        .starts_with(b".shoal-atomic-replace-")
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn atomic_replace_succeeds_and_failed_rename_cleans_its_temp() {
+        let root = TestDir::new();
+        let target = root.0.join("target");
+        fs::write(&target, b"old").expect("write original");
+        StdFs
+            .atomic_replace(&target, b"new")
+            .expect("replace and sync");
+        assert_eq!(fs::read(&target).expect("read replacement"), b"new");
+        assert!(replacement_temps(&root.0).is_empty());
+
+        let directory_target = root.0.join("directory-target");
+        fs::create_dir(&directory_target).expect("create rename-error target");
+        StdFs
+            .atomic_replace(&directory_target, b"must-not-land")
+            .expect_err("a file cannot atomically replace a directory");
+        assert!(directory_target.is_dir());
+        assert!(
+            replacement_temps(&root.0).is_empty(),
+            "failed atomic replacement leaked a temporary file"
+        );
     }
 }
 
