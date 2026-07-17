@@ -1,7 +1,7 @@
 use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
 use base64::Engine as _;
 use rand::{TryRng, rngs::SysRng};
-use serde::{Deserialize, Deserializer, Serialize, de::MapAccess, de::Visitor};
+use serde::{Deserialize, Deserializer, Serialize, de::MapAccess, de::SeqAccess, de::Visitor};
 use std::{
     collections::BTreeMap,
     fs,
@@ -57,6 +57,47 @@ struct Envelope {
 #[serde(transparent)]
 struct PlainSecrets(BTreeMap<String, Vec<u8>>);
 
+struct SecretBytes(Zeroizing<Vec<u8>>);
+
+impl<'de> Deserialize<'de> for SecretBytes {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct SecretBytesVisitor;
+
+        impl<'de> Visitor<'de> for SecretBytesVisitor {
+            type Value = SecretBytes;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a bounded JSON byte array")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let capacity = sequence
+                    .size_hint()
+                    .unwrap_or(0)
+                    .min(MAX_SECRET_VALUE_BYTES);
+                let mut bytes = Zeroizing::new(Vec::with_capacity(capacity));
+                while let Some(byte) = sequence.next_element::<u8>()? {
+                    if bytes.len() >= MAX_SECRET_VALUE_BYTES {
+                        return Err(serde::de::Error::custom(
+                            "secret store value exceeds byte limit",
+                        ));
+                    }
+                    bytes.push(byte);
+                }
+                Ok(SecretBytes(bytes))
+            }
+        }
+
+        deserializer.deserialize_seq(SecretBytesVisitor)
+    }
+}
+
 impl<'de> Deserialize<'de> for PlainSecrets {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -87,9 +128,9 @@ impl<'de> Deserialize<'de> for PlainSecrets {
                     if secrets.0.contains_key(&name) {
                         return Err(serde::de::Error::custom("duplicate secret store identity"));
                     }
-                    let mut value = Zeroizing::new(map.next_value::<Vec<u8>>()?);
-                    validate_stored_value(&value).map_err(serde::de::Error::custom)?;
-                    aggregate = aggregate.checked_add(value.len()).ok_or_else(|| {
+                    let mut value = map.next_value::<SecretBytes>()?;
+                    validate_stored_value(&value.0).map_err(serde::de::Error::custom)?;
+                    aggregate = aggregate.checked_add(value.0.len()).ok_or_else(|| {
                         serde::de::Error::custom("secret store aggregate overflow")
                     })?;
                     if aggregate > MAX_SECRET_AGGREGATE_BYTES {
@@ -97,7 +138,7 @@ impl<'de> Deserialize<'de> for PlainSecrets {
                             "secret store exceeds aggregate value limit",
                         ));
                     }
-                    secrets.0.insert(name, std::mem::take(&mut *value));
+                    secrets.0.insert(name, std::mem::take(&mut *value.0));
                 }
                 Ok(secrets)
             }
@@ -324,7 +365,7 @@ fn validate_name_input(name: &str) -> io::Result<()> {
     {
         Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "secret name must contain only ASCII letters, digits, _ or -",
+            "secret name must be 1..=128 bytes of ASCII letters, digits, _ or -",
         ))
     } else {
         Ok(())
