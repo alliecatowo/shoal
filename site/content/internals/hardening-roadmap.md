@@ -76,13 +76,13 @@ Rules for implementers:
 
 ### Workstream B — one child-evaluator constructor
 
-- [ ] **HR-B1** — Introduce a single authoritative child-context constructor that necessarily
+- [x] **HR-B1** — Introduce a single authoritative child-context constructor that necessarily
   propagates: leash policy/principal, all effect ports, config, reef overrides/locks,
   journal/session identity, event bus, and cancellation. *(B1, B2, B3, H1)*
   <br>Accept: constructor exists in `shoal-eval`; a compile-visible seam (not ad-hoc field
   copies) is the only way to build a child evaluator.
-- [ ] **HR-B2** — `spawn_block` uses the constructor. *(B1)*
-- [ ] **HR-B3** — `run_script_file` uses the constructor. *(B1)*
+- [x] **HR-B2** — `spawn_block` uses the constructor. *(B1)*
+- [x] **HR-B3** — `run_script_file` uses the constructor. *(B1)*
 - [ ] **HR-B4** — `builtin_parallel` uses the constructor. *(B1)*
 - [ ] **HR-B5** — `builtin_on` (channel handlers) uses the constructor. *(B1)*
 - [ ] **HR-B6** — Remove or privatize `inherit_ports`-style partial copying so future call sites
