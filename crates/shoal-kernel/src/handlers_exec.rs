@@ -306,7 +306,7 @@ impl Kernel {
                     },
                 );
                 Ok(())
-            })?;
+            })??;
             if verdict == Verdict::ApprovalRequired {
                 // site/content/internals/kernel-protocol.md: a plan stuck at `approval_pending` is
                 // exactly the moment another principal (a human's session, a
@@ -447,7 +447,7 @@ impl Kernel {
                         }
                     };
                     Ok(claimed)
-                })?
+                })??
         } else {
             None
         };
@@ -513,7 +513,7 @@ impl Kernel {
             Ok(entry_id) => entry_id,
             Err(error) => {
                 if let (Some(plan_ref), Some(approval)) = (&params.plan_ref, &claimed_approval) {
-                    self.plans.transaction(|plans| {
+                    let _ = self.plans.transaction(|plans| {
                         if let Some(stored) = plans.get_mut(plan_ref)
                             && matches!(
                                 &stored.authorization,
@@ -543,6 +543,16 @@ impl Kernel {
                 stored.authorization = PlanAuthorization::Consumed(consumed);
                 Ok(())
             });
+            let consumed = match consumed {
+                Ok(consumed) => consumed,
+                Err(error) => {
+                    let _ = self
+                        .journal
+                        .lock()
+                        .map(|journal| journal.finish(entry_id, None, false, 0));
+                    return Err(error);
+                }
+            };
             if let Err(message) = consumed {
                 let _ = self
                     .journal

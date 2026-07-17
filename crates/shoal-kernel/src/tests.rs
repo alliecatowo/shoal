@@ -232,21 +232,24 @@ fn session_registry_evicts_idle_lru_but_never_active_leases() {
     let first = kernel.session("s0", principal).unwrap();
     let first_owner = first.key.owner();
     let stale_plan_ref = "plan:stale-session-generation".to_string();
-    kernel.plans.transaction(|plans| {
-        plans.insert(
-            stale_plan_ref.clone(),
-            StoredPlan {
-                src: "1 + 1".into(),
-                session: first.id.clone(),
-                principal: principal.into(),
-                plan_hash: "stale-plan-hash".into(),
-                source_hash: "stale-source-hash".into(),
-                plan: Plan::new(vec![], Reversibility::Reversible, Estimates::default()),
-                authorization: PlanAuthorization::Pending,
-                created_at: Instant::now(),
-            },
-        );
-    });
+    kernel
+        .plans
+        .transaction(|plans| {
+            plans.insert(
+                stale_plan_ref.clone(),
+                StoredPlan {
+                    src: "1 + 1".into(),
+                    session: first.id.clone(),
+                    principal: principal.into(),
+                    plan_hash: "stale-plan-hash".into(),
+                    source_hash: "stale-source-hash".into(),
+                    plan: Plan::new(vec![], Reversibility::Reversible, Estimates::default()),
+                    authorization: PlanAuthorization::Pending,
+                    created_at: Instant::now(),
+                },
+            );
+        })
+        .unwrap();
     let stale_task_ref = Ref::new("task", 9090);
     kernel.tasks.insert(Arc::new(TaskEntry {
         task: stale_task_ref.clone(),
@@ -404,6 +407,20 @@ fn pty_refs_are_hidden_from_another_principal_with_the_same_session_name() {
     kernel
         .handle_pty_close(json!({"pty_id": pty_id}), &mut alpha_attached)
         .expect("owner closes PTY");
+}
+
+#[test]
+fn poisoned_plan_registry_fails_closed_without_reentering_its_map() {
+    let plans = PlanRegistry::new();
+    plans.poison_for_test();
+
+    for _ in 0..2 {
+        let error = plans
+            .transaction(|entries| entries.len())
+            .expect_err("a poisoned plan registry must remain quarantined");
+        assert_eq!(error.code, INTERNAL_ERROR);
+        assert_eq!(error.data.unwrap()["subsystem"], "plans");
+    }
 }
 
 #[test]
@@ -750,10 +767,13 @@ fn expired_plan_is_rejected_before_it_can_execute() {
         "cap.request",
         json!({"plan_ref": plan_ref}),
     );
-    kernel.plans.transaction(|plans| {
-        plans.get_mut(&plan_ref).unwrap().created_at =
-            Instant::now() - PLAN_TTL - std::time::Duration::from_secs(1);
-    });
+    kernel
+        .plans
+        .transaction(|plans| {
+            plans.get_mut(&plan_ref).unwrap().created_at =
+                Instant::now() - PLAN_TTL - std::time::Duration::from_secs(1);
+        })
+        .unwrap();
     let apply = call(
         &mut client,
         &mut reader,
@@ -3900,12 +3920,15 @@ fn cap_request_unwind_restores_its_grant_reservation() {
         json!({"plan_ref": plan_ref}),
     );
     assert_eq!(failed.error.unwrap().code, INTERNAL_ERROR);
-    kernel.plans.transaction(|plans| {
-        assert!(matches!(
-            plans.get(&plan_ref).map(|plan| &plan.authorization),
-            Some(PlanAuthorization::Pending)
-        ));
-    });
+    kernel
+        .plans
+        .transaction(|plans| {
+            assert!(matches!(
+                plans.get(&plan_ref).map(|plan| &plan.authorization),
+                Some(PlanAuthorization::Pending)
+            ));
+        })
+        .unwrap();
     drop(client);
     drop(reader);
     thread.join().unwrap();
@@ -3932,27 +3955,30 @@ fn stale_grant_reservation_recovers_before_the_next_transaction() {
     .result
     .unwrap();
     let plan_ref = planned["plan_ref"].as_str().unwrap().to_owned();
-    kernel.plans.transaction(|plans| {
-        let stored = plans.get_mut(&plan_ref).unwrap();
-        let record = ApprovalRecord {
-            requester: stored.principal.clone(),
-            approver: stored.principal.clone(),
-            plan_ref: stored.plan.plan_ref.clone(),
-            plan_hash: stored.plan_hash.clone(),
-            source_hash: stored.source_hash.clone(),
-            session: stored.session.clone(),
-            scope: stored.plan.effects.iter().map(effect_kind).collect(),
-            approved_at_ns: now_ns(),
-            grant_audit_id: 0,
-            consumed_by: None,
-        };
-        stored.authorization = PlanAuthorization::Granting {
-            record,
-            restore_policy_allowed: false,
-            started_at: Instant::now() - GRANT_RESERVATION_TTL,
-            lease: std::sync::Weak::new(),
-        };
-    });
+    kernel
+        .plans
+        .transaction(|plans| {
+            let stored = plans.get_mut(&plan_ref).unwrap();
+            let record = ApprovalRecord {
+                requester: stored.principal.clone(),
+                approver: stored.principal.clone(),
+                plan_ref: stored.plan.plan_ref.clone(),
+                plan_hash: stored.plan_hash.clone(),
+                source_hash: stored.source_hash.clone(),
+                session: stored.session.clone(),
+                scope: stored.plan.effects.iter().map(effect_kind).collect(),
+                approved_at_ns: now_ns(),
+                grant_audit_id: 0,
+                consumed_by: None,
+            };
+            stored.authorization = PlanAuthorization::Granting {
+                record,
+                restore_policy_allowed: false,
+                started_at: Instant::now() - GRANT_RESERVATION_TTL,
+                lease: std::sync::Weak::new(),
+            };
+        })
+        .unwrap();
     let granted = call(
         &mut client,
         &mut reader,

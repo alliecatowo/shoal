@@ -42,7 +42,7 @@ impl ApprovalGrantReservation {
                 }
                 stored.authorization = PlanAuthorization::Approved(completed);
                 Ok(())
-            })?;
+            })??;
         self.armed = false;
         Ok(())
     }
@@ -58,7 +58,7 @@ impl ApprovalGrantReservation {
         // Drop may run during another unwind. A poisoned plan mutex is already
         // quarantined by dispatch; never turn best-effort rollback into abort.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            kernel.plans.transaction(|plans| {
+            let _ = kernel.plans.transaction(|plans| {
                 if let Some(stored) = plans.get_mut(&plan_ref) {
                     let restore = match &stored.authorization {
                         PlanAuthorization::Granting {
@@ -286,7 +286,7 @@ impl Kernel {
             "approval": approval_json(stored.authorization.approval()),
             "src": stored.src,
             }))
-        })
+        })?
     }
 
     /// `plan.list` (site/content/internals/kernel-protocol.md): the open plans this session/principal
@@ -318,7 +318,7 @@ impl Kernel {
                 })
                 .collect();
             encode(records)
-        })
+        })?
     }
 
     pub(crate) fn handle_plan_apply(
@@ -393,7 +393,7 @@ impl Kernel {
                     }
                 }
                 Ok(stored.src.clone())
-            })?;
+            })??;
         let connection_trust = attached
             .as_ref()
             .map_or(ConnectionTrust::Public, |attachment| {
@@ -598,7 +598,7 @@ impl Kernel {
                         lease: Arc::downgrade(&grant_lease),
                     };
                     Ok(Ok((record, plan_effect_kinds, requester, grant_lease)))
-                })?;
+                })??;
         let (mut record, plan_effect_kinds, requester, grant_lease) = match prepared {
             Ok(approved) => approved,
             Err(response) => return encode(response),
