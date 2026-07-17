@@ -18,7 +18,7 @@ impl Evaluator {
                     .first()
                     .cloned()
                     .ok_or_else(|| ErrorVal::arg_error("emit expects a value to publish"))?;
-                bus.emit(chan, payload);
+                bus.emit(chan, payload)?;
                 Ok(Value::Null)
             }
             "events" => {
@@ -32,9 +32,9 @@ impl Evaluator {
                         )));
                     }
                 };
-                Ok(Value::Stream(bus.event_stream(chan, since)))
+                Ok(Value::Stream(bus.event_stream(chan, since)?))
             }
-            "latest" => Ok(bus.latest(chan)),
+            "latest" => bus.latest(chan),
             "take" => {
                 let timeout = match args.get_named("timeout").or_else(|| args.pos.first()) {
                     Some(Value::Duration(ns)) if *ns >= 0 => Some(Duration::from_nanos(*ns as u64)),
@@ -90,7 +90,7 @@ impl Evaluator {
             match up.pull(self, None)? {
                 Pull::Item(v) => match &target {
                     Some(chan) => {
-                        bus.emit(chan, v);
+                        bus.emit(chan, v)?;
                     }
                     None => self.sink_value(&v),
                 },
@@ -125,7 +125,7 @@ impl Evaluator {
 
         // Subscribe now (before spawning) so no event emitted between here and the
         // task starting is missed.
-        let rx = self.bus().events(&chan, None);
+        let rx = self.bus().events(&chan, None)?;
 
         let task = TaskVal::new(format!("on channel({chan})"));
         // A FRESH cancel token wired to the task's cancel hook, so cancelling the
@@ -141,22 +141,33 @@ impl Evaluator {
         // dropping leash/reef/config (audit B1–B4). `Inherit` scope: the handler
         // sees the caller's bindings.
         let ctx = self.child_context();
-        std::thread::spawn(move || {
-            let mut ev = ctx.build(ChildKind::OnHandler, child_cancel.clone());
-            let result = loop {
-                let event = match rx.recv(None, Some(&child_cancel)) {
-                    Received::Event(event) => event,
-                    Received::Gap(gap) => overflow_record(&chan, gap),
-                    Received::Timeout => continue,
-                    Received::Closed | Received::Cancelled => break Ok(Value::Null),
-                };
-                if let Err(e) = ev.call_closure(&handler, vec![event]) {
-                    break Err(e);
-                }
-            };
-            worker.finish(result);
-        });
         self.exec.jobs.register(task.clone());
+        let launch = std::thread::Builder::new()
+            .name(format!("shoal-on-{chan}"))
+            .spawn(move || {
+                let mut ev = ctx.build(ChildKind::OnHandler, child_cancel.clone());
+                let result = loop {
+                    let event = match rx.recv(None, Some(&child_cancel)) {
+                        Received::Event(event) => event,
+                        Received::Gap(gap) => overflow_record(&chan, gap),
+                        Received::Timeout => continue,
+                        Received::Closed | Received::Cancelled => break Ok(Value::Null),
+                        Received::Poisoned => break Err(channel_poisoned("subscriber queue")),
+                    };
+                    if let Err(e) = ev.call_closure(&handler, vec![event]) {
+                        break Err(e);
+                    }
+                };
+                worker.finish(result);
+            });
+        if let Err(error) = launch {
+            let failure = ErrorVal::new(
+                "task_spawn",
+                format!("could not start channel handler task: {error}"),
+            );
+            task.finish(Err(failure.clone()));
+            return Err(failure);
+        }
         Ok(Value::Task(task))
     }
 }
