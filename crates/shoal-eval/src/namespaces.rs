@@ -425,7 +425,7 @@ impl Evaluator {
             "uptime" => Ok(os_uptime()),
             "env" => {
                 let mut r = Record::new();
-                for (k, v) in &self.process_env {
+                for (k, v) in &self.exec.shell.process_env {
                     if let (Some(k), Some(v)) = (k.to_str(), v.to_str()) {
                         r.insert(k.to_string(), Value::Str(v.to_string()));
                     }
@@ -439,6 +439,8 @@ impl Evaluator {
     fn os_username(&self) -> String {
         for key in ["USER", "LOGNAME", "USERNAME"] {
             if let Some(v) = self
+                .exec
+                .shell
                 .process_env
                 .iter()
                 .find(|(k, _)| k == std::ffi::OsStr::new(key))

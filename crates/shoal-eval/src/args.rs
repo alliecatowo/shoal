@@ -10,7 +10,7 @@ impl Evaluator {
             CmdArg::Path { text, .. } => Ok(Value::Path(self.resolve_path(text))),
             CmdArg::Glob { pattern, .. } => Ok(Value::Glob(shoal_value::GlobVal {
                 pattern: pattern.clone(),
-                cwd: self.cwd.clone(),
+                cwd: self.exec.shell.cwd.clone(),
                 hidden: false,
             })),
             CmdArg::Str { expr, .. } | CmdArg::Expr { expr, .. } => {
@@ -86,7 +86,7 @@ impl Evaluator {
     pub(crate) fn resolve_path(&self, text: &str) -> PathBuf {
         if let Some(rest) = text.strip_prefix("~/") {
             std::env::home_dir()
-                .unwrap_or_else(|| self.cwd.clone())
+                .unwrap_or_else(|| self.exec.shell.cwd.clone())
                 .join(rest)
         } else {
             PathBuf::from(text)
@@ -94,10 +94,18 @@ impl Evaluator {
     }
     pub(crate) fn arg_path(&mut self, a: &CmdArg) -> VResult<PathBuf> {
         match self.cmd_arg_value(a)? {
-            Value::Path(p) => Ok(if p.is_absolute() { p } else { self.cwd.join(p) }),
+            Value::Path(p) => Ok(if p.is_absolute() {
+                p
+            } else {
+                self.exec.shell.cwd.join(p)
+            }),
             Value::Str(s) => {
                 let p = PathBuf::from(s);
-                Ok(if p.is_absolute() { p } else { self.cwd.join(p) })
+                Ok(if p.is_absolute() {
+                    p
+                } else {
+                    self.exec.shell.cwd.join(p)
+                })
             }
             _ => Err(ErrorVal::new("arg_error", "redirect target must be a path")),
         }

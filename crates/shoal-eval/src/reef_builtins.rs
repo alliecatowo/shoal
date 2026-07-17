@@ -43,12 +43,12 @@ impl Evaluator {
 
         let chain = self.reef_chain_snapshot();
         let resolver = self.reef_resolver();
-        let mut lock = self.reef.lock.clone();
+        let mut lock = self.exec.reef.lock.clone();
         match resolver.resolve(&name, &chain, &mut lock, Policy::Interactive, &mut |_| {}) {
             Ok(res) => {
                 // Only keep a fresh lock when a manifest actually constrained it.
                 if res.constrained {
-                    self.reef.lock = lock;
+                    self.exec.reef.lock = lock;
                     if res.locked_now {
                         self.persist_reef_lock();
                     }
@@ -60,6 +60,8 @@ impl Evaluator {
             // behavior for an ordinary, unconstrained command.
             Err(e) if e.code == ReefCode::NotFound => {
                 let path_env = self
+                    .exec
+                    .shell
                     .process_env
                     .iter()
                     .find(|(k, _)| k == "PATH")
@@ -87,7 +89,7 @@ impl Evaluator {
     /// ever made or hidden, only a plain listing.
     fn which_all(&mut self, name: &str) -> VResult<Value> {
         let resolver = self.reef_resolver();
-        let ctx = ProviderCtx::new(self.cwd.clone());
+        let ctx = ProviderCtx::new(self.exec.shell.cwd.clone());
         let mut rows = Vec::new();
         for provider in resolver.providers() {
             for cand in provider.discover(name, &ctx) {
@@ -152,7 +154,7 @@ impl Evaluator {
         }
         names.sort();
         let resolver = self.reef_resolver();
-        let mut lock = self.reef.lock.clone();
+        let mut lock = self.exec.reef.lock.clone();
         let mut rows = Vec::new();
         for name in names {
             let mut r = Record::new();
@@ -185,7 +187,7 @@ impl Evaluator {
             }
             rows.push(r);
         }
-        self.reef.lock = lock;
+        self.exec.reef.lock = lock;
         Ok(Value::Table(rows))
     }
 
@@ -226,7 +228,7 @@ impl Evaluator {
         // Local manifest first (via the Fs port so a present-but-malformed one is
         // still seen, unlike the chain which skips it); then the nearest ancestor
         // Reef scope; then a fresh manifest in cwd.
-        let local = self.cwd.join(".reef.toml");
+        let local = self.exec.shell.cwd.join(".reef.toml");
         let manifest_path = if self.host.fs.is_file(&local) {
             local
         } else {
@@ -263,16 +265,16 @@ impl Evaluator {
             .map_err(|e| ErrorVal::new("reef_provider", format!("writing manifest: {e}")))?;
 
         // Re-discover so the fresh constraint is in scope, then lock it.
-        self.reef.chain = None;
+        self.exec.reef.chain = None;
         let chain = self.reef_chain_snapshot();
         let resolver = self.reef_resolver();
-        let mut lock = self.reef.lock.clone();
+        let mut lock = self.exec.reef.lock.clone();
         let mut r = Record::new();
         r.insert("added".into(), Value::Str(format!("{tool}@{ver}")));
         r.insert("manifest".into(), Value::Path(manifest_path.clone()));
         match resolver.refresh_lock(&tool, &chain, &mut lock, &mut |_| {}) {
             Ok(res) => {
-                self.reef.lock = lock;
+                self.exec.reef.lock = lock;
                 self.persist_reef_lock();
                 r.insert("version".into(), Value::Str(res.version.to_string()));
                 r.insert("path".into(), Value::Path(res.path.clone()));
@@ -306,7 +308,7 @@ impl Evaluator {
         }
         names.sort();
         let resolver = self.reef_resolver();
-        let mut lock = self.reef.lock.clone();
+        let mut lock = self.exec.reef.lock.clone();
         let mut rows = Vec::new();
         for name in names {
             let mut r = Record::new();
@@ -329,7 +331,7 @@ impl Evaluator {
             }
             rows.push(r);
         }
-        self.reef.lock = lock;
+        self.exec.reef.lock = lock;
         self.persist_reef_lock();
         Ok(Value::Table(rows))
     }
@@ -344,7 +346,7 @@ impl Evaluator {
             .map(|s| s.manifest.tools[tool].constraint.clone())
             .unwrap_or(shoal_reef::Constraint::Any);
         let resolver = self.reef_resolver();
-        let ctx = ProviderCtx::new(self.cwd.clone());
+        let ctx = ProviderCtx::new(self.exec.shell.cwd.clone());
         let mut r = Record::new();
         r.insert("tool".into(), Value::Str(tool.to_string()));
         for provider in resolver.providers() {
@@ -408,7 +410,7 @@ impl Evaluator {
             let mut r = Record::new();
             r.insert("name".into(), Value::Str(name.clone()));
             r.insert("check".into(), Value::Str("drift".into()));
-            match self.reef.lock.get(name) {
+            match self.exec.reef.lock.get(name) {
                 Some(entry) => {
                     let current = hashes.hash_file(&entry.path).ok();
                     let drifted = current.as_deref() != Some(entry.blake3.as_str());
@@ -435,7 +437,7 @@ impl Evaluator {
             }
             rows.push(r);
 
-            if let Some(entry) = self.reef.lock.get(name)
+            if let Some(entry) = self.exec.reef.lock.get(name)
                 && let Some(ambient) = self.ambient_which(name)
                 && ambient != entry.path
             {
@@ -449,7 +451,7 @@ impl Evaluator {
             }
         }
 
-        for (name, entry) in &self.reef.lock.tools {
+        for (name, entry) in &self.exec.reef.lock.tools {
             if names.contains(name) {
                 continue;
             }

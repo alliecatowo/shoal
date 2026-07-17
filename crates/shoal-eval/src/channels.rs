@@ -376,7 +376,7 @@ impl Evaluator {
             };
             worker.finish(result);
         });
-        self.jobs.push(task.clone());
+        self.exec.jobs.tasks.push(task.clone());
         Ok(Value::Task(task))
     }
 }

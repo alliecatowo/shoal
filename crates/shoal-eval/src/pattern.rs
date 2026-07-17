@@ -7,7 +7,7 @@ impl Evaluator {
         match p {
             Pattern::Wildcard { .. } => Ok(()),
             Pattern::Bind { name, .. } => {
-                self.env.declare(name.clone(), v, mutable);
+                self.exec.shell.env.declare(name.clone(), v, mutable);
                 Ok(())
             }
             Pattern::Lit { expr, .. } => {
@@ -28,7 +28,7 @@ impl Evaluator {
                     self.bind_pattern(p, v, mutable)?;
                 }
                 if let Some(n) = rest {
-                    self.env.declare(
+                    self.exec.shell.env.declare(
                         n.clone(),
                         Value::List(xs.into_iter().skip(items.len()).collect()),
                         mutable,
@@ -46,7 +46,7 @@ impl Evaluator {
         match p {
             Pattern::Wildcard { .. } => Ok(true),
             Pattern::Bind { name, .. } => {
-                self.env.declare(name.clone(), v.clone(), false);
+                self.exec.shell.env.declare(name.clone(), v.clone(), false);
                 Ok(true)
             }
             Pattern::Lit { expr, .. } => Ok(self.eval_expr(expr, Position::Value)? == *v),
@@ -71,7 +71,7 @@ impl Evaluator {
             Pattern::Type { ty, name, .. } => {
                 if v.type_name() == ty.name {
                     if let Some(n) = name {
-                        self.env.declare(n.clone(), v.clone(), false);
+                        self.exec.shell.env.declare(n.clone(), v.clone(), false);
                     }
                     Ok(true)
                 } else {
@@ -95,7 +95,7 @@ impl Evaluator {
                                 return Ok(false);
                             }
                         }
-                        None => self.env.declare(f.name.clone(), fv, false),
+                        None => self.exec.shell.env.declare(f.name.clone(), fv, false),
                     }
                 }
                 Ok(true)
@@ -119,8 +119,11 @@ impl Evaluator {
                     }
                 }
                 if let Some(r) = rest {
-                    self.env
-                        .declare(r.clone(), Value::List(xs[items.len()..].to_vec()), false);
+                    self.exec.shell.env.declare(
+                        r.clone(),
+                        Value::List(xs[items.len()..].to_vec()),
+                        false,
+                    );
                 }
                 Ok(true)
             }
@@ -129,8 +132,8 @@ impl Evaluator {
     pub(crate) fn eval_match(&mut self, scrutinee: &Expr, arms: &[MatchArm]) -> VResult<Value> {
         let v = self.eval_expr(scrutinee, Position::Value)?;
         for arm in arms {
-            let old = self.env.clone();
-            self.env = old.child();
+            let old = self.exec.shell.env.clone();
+            self.exec.shell.env = old.child();
             let mut matched = false;
             for p in &arm.patterns {
                 if self.pattern_matches(p, &v)? {
@@ -150,10 +153,10 @@ impl Evaluator {
                     .unwrap_or(true)
             {
                 let r = self.eval_expr(&arm.body, Position::Value);
-                self.env = old;
+                self.exec.shell.env = old;
                 return r;
             }
-            self.env = old;
+            self.exec.shell.env = old;
         }
         Ok(Value::Null)
     }

@@ -130,20 +130,6 @@ pub struct Evaluator {
     exec: exec_state::ExecState,
 }
 
-impl std::ops::Deref for Evaluator {
-    type Target = exec_state::ExecState;
-
-    fn deref(&self) -> &Self::Target {
-        &self.exec
-    }
-}
-
-impl std::ops::DerefMut for Evaluator {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.exec
-    }
-}
-
 enum Flow {
     Value(Value),
     Return(Value),
@@ -166,6 +152,26 @@ impl Evaluator {
             session: session_ctx::SessionCtx::default(),
             exec: exec_state::ExecState::root(cwd),
         }
+    }
+
+    /// The lexical environment exposed to hosts for parsing and completion.
+    pub fn env(&self) -> &Env {
+        &self.exec.shell.env
+    }
+
+    /// Mutable lexical environment for deliberate host-side bindings.
+    pub fn env_mut(&mut self) -> &mut Env {
+        &mut self.exec.shell.env
+    }
+
+    /// Most recently evaluated statement value.
+    pub fn it(&self) -> &Value {
+        &self.exec.control.it
+    }
+
+    /// Replace the most recently evaluated statement value.
+    pub fn set_it(&mut self, value: Value) {
+        self.exec.control.it = value;
     }
 
     /// Install a custom [`Fs`] adapter (site/content/internals/roadmap-and-priorities.md). Additive: the
@@ -258,7 +264,7 @@ impl Evaluator {
     /// loop, `-c`, script runner) should stop and surface that code. Clears the
     /// flag so a subsequent REPL line starts fresh.
     pub fn take_exit(&mut self) -> Option<i32> {
-        self.pending_exit.take()
+        self.exec.control.pending_exit.take()
     }
 
     /// Install the active leash policy and the principal spawns are evaluated
@@ -298,7 +304,7 @@ impl Evaluator {
     /// the chain with this path folded in.
     pub fn set_reef_user_manifest(&mut self, path: impl Into<PathBuf>) {
         Arc::make_mut(&mut self.host).reef_user_manifest = Some(path.into());
-        self.reef.chain = None;
+        self.exec.reef.chain = None;
     }
 
     /// Inject the reef provider stack (resolver). Additive: without it the
@@ -322,13 +328,13 @@ impl Evaluator {
     /// Bind `it` and append to the session `out` transcript list (REPL hook).
     /// `Var("it")` / `Var("out")` then resolve from the environment normally.
     pub fn record_transcript(&mut self, v: &Value) {
-        self.env.declare("it", v.clone(), true);
-        let mut out = match self.env.get("out") {
+        self.exec.shell.env.declare("it", v.clone(), true);
+        let mut out = match self.exec.shell.env.get("out") {
             Some(Value::List(xs)) => xs,
             _ => Vec::new(),
         };
         out.push(v.clone());
-        self.env.declare("out", Value::List(out), true);
+        self.exec.shell.env.declare("out", Value::List(out), true);
     }
 
     /// Route a value to the statement sink (or the default stdout renderer).
@@ -362,14 +368,18 @@ impl Evaluator {
     /// (site/content/internals/kernel-protocol.md). Cheap and I/O-free: call it once per
     /// command when building a `PromptContext`, never per keystroke.
     pub fn jobs_snapshot(&self) -> JobsSnapshot {
-        let total = self.jobs.len();
+        let total = self.exec.jobs.tasks.len();
         let running = self
+            .exec
             .jobs
+            .tasks
             .iter()
             .filter(|t| !t.is_done() && !t.is_suspended())
             .count();
         let suspended = self
+            .exec
             .jobs
+            .tasks
             .iter()
             .filter(|t| !t.is_done() && t.is_suspended())
             .count();
@@ -388,7 +398,9 @@ impl Evaluator {
     /// for legibility; the booleans remain for programmatic filtering.
     pub(crate) fn jobs_table(&self) -> Value {
         let rows = self
+            .exec
             .jobs
+            .tasks
             .iter()
             .map(|t| {
                 let done = t.is_done();
@@ -418,7 +430,7 @@ impl Evaluator {
     /// suspend hooks (`SIGTSTP` to the task's process group, when a spawner has
     /// registered one). Returns `false` if no task has that id.
     pub fn suspend_task(&self, id: u64) -> bool {
-        match self.jobs.iter().find(|t| t.id == id) {
+        match self.exec.jobs.tasks.iter().find(|t| t.id == id) {
             Some(t) => {
                 t.suspend();
                 true
@@ -430,7 +442,7 @@ impl Evaluator {
     /// Resume a suspended task by id (`SIGCONT`). Counterpart to
     /// [`Evaluator::suspend_task`]. Returns `false` if no task has that id.
     pub fn resume_task(&self, id: u64) -> bool {
-        match self.jobs.iter().find(|t| t.id == id) {
+        match self.exec.jobs.tasks.iter().find(|t| t.id == id) {
             Some(t) => {
                 t.resume();
                 true
@@ -442,7 +454,7 @@ impl Evaluator {
     /// Look up a live task by id (for the REPL `fg <task>` path, which re-fronts a
     /// background task and must first resolve it from the job table).
     pub fn task_by_id(&self, id: u64) -> Option<shoal_value::TaskVal> {
-        self.jobs.iter().find(|t| t.id == id).cloned()
+        self.exec.jobs.tasks.iter().find(|t| t.id == id).cloned()
     }
 
     /// Record a foreground external command that the OS just *stopped* (Ctrl-Z →
@@ -460,25 +472,27 @@ impl Evaluator {
         task.on_resume(Box::new(move || shoal_exec::continue_group(pgid)));
         task.mark_suspended();
         let id = task.id;
-        self.jobs.push(task);
-        self.external_jobs.insert(id, pid);
-        self.pending_stop = Some((id, desc));
+        self.exec.jobs.tasks.push(task);
+        self.exec.jobs.external.insert(id, pid);
+        self.exec.jobs.pending_stop = Some((id, desc));
         id
     }
 
     /// The child pid of a stopped-external job id, for the REPL `fg`/`bg` path to
     /// locate its parked PTY. `None` if `id` is not a stopped external command.
     pub fn external_job_pid(&self, id: u64) -> Option<u32> {
-        self.external_jobs.get(&id).copied()
+        self.exec.jobs.external.get(&id).copied()
     }
 
     /// The most recently registered external command that is currently stopped —
     /// the "current job" a bare `fg`/`bg` (no id) targets, matching the shell
     /// convention. `None` when no external command is stopped.
     pub fn last_stopped_external(&self) -> Option<u64> {
-        self.jobs
+        self.exec
+            .jobs
+            .tasks
             .iter()
-            .filter(|t| t.is_suspended() && self.external_jobs.contains_key(&t.id))
+            .filter(|t| t.is_suspended() && self.exec.jobs.external.contains_key(&t.id))
             .map(|t| t.id)
             .max()
     }
@@ -486,14 +500,14 @@ impl Evaluator {
     /// The most recently stopped foreground external command (job id, display),
     /// consumed once by the REPL after each command to print the stop notice.
     pub fn take_pending_stop(&mut self) -> Option<(u64, String)> {
-        self.pending_stop.take()
+        self.exec.jobs.pending_stop.take()
     }
 
     /// Mark a stopped-external job as running again WITHOUT signalling — the
     /// REPL `fg`/`bg` path performs the SIGCONT + terminal handoff itself, so
     /// this only updates the job-table state. Returns `false` for an unknown id.
     pub fn mark_external_resumed(&self, id: u64) -> bool {
-        match self.jobs.iter().find(|t| t.id == id) {
+        match self.exec.jobs.tasks.iter().find(|t| t.id == id) {
             Some(t) => {
                 t.mark_resumed();
                 true
@@ -505,10 +519,10 @@ impl Evaluator {
     /// Re-mark a stopped-external job as stopped (it was `fg`'d and then Ctrl-Z'd
     /// again) and re-arm the pending-stop notice, without re-signalling.
     pub fn mark_external_stopped(&mut self, id: u64) {
-        if let Some(t) = self.jobs.iter().find(|t| t.id == id) {
+        if let Some(t) = self.exec.jobs.tasks.iter().find(|t| t.id == id) {
             t.mark_suspended();
             let desc = t.shared.desc.clone();
-            self.pending_stop = Some((id, desc));
+            self.exec.jobs.pending_stop = Some((id, desc));
         }
     }
 
@@ -516,8 +530,8 @@ impl Evaluator {
     /// ran to completion): mark the task done so `jobs` shows it terminal, and
     /// drop the pid mapping. Returns `false` for an unknown id.
     pub fn finish_external_job(&mut self, id: u64) -> bool {
-        self.external_jobs.remove(&id);
-        match self.jobs.iter().find(|t| t.id == id) {
+        self.exec.jobs.external.remove(&id);
+        match self.exec.jobs.tasks.iter().find(|t| t.id == id) {
             Some(t) => {
                 t.finish(Ok(Value::Null));
                 true
@@ -527,7 +541,7 @@ impl Evaluator {
     }
 
     pub fn cwd(&self) -> &Path {
-        &self.cwd
+        &self.exec.shell.cwd
     }
 
     /// The session's process environment (name → value pairs) — the same
@@ -536,7 +550,7 @@ impl Evaluator {
     /// session-state accessor mirroring [`Evaluator::cwd`], used by the
     /// kernel's `shoal://session/env` resource view (site/content/internals/kernel-protocol.md).
     pub fn env_vars(&self) -> &[(OsString, OsString)] {
-        &self.process_env
+        &self.exec.shell.process_env
     }
 
     pub fn set_adapters(&mut self, adapters: AdapterCatalog) {
@@ -552,11 +566,11 @@ impl Evaluator {
 
     /// Cancel the currently executing foreground process tree.
     pub fn cancel_current(&self) {
-        self.cancel.cancel();
+        self.exec.control.cancel.cancel();
     }
 
     pub fn cancellation_token(&self) -> CancelToken {
-        self.cancel.clone()
+        self.exec.control.cancel.clone()
     }
 
     /// Install the cancellation epoch owned by the host's current execution.
@@ -567,12 +581,12 @@ impl Evaluator {
     /// evaluator's token before the queued execution starts, disconnecting
     /// that execution from its cancellation handle.
     pub fn set_cancellation_token(&mut self, cancel: CancelToken) {
-        self.cancel = cancel;
+        self.exec.control.cancel = cancel;
     }
 
     /// Install a fresh cancellation epoch before reading the next command.
     pub fn reset_cancel(&mut self) {
-        self.cancel = CancelToken::new();
+        self.exec.control.cancel = CancelToken::new();
     }
 }
 
@@ -587,7 +601,7 @@ impl CallCtx for Evaluator {
         )
     }
     fn cwd(&self) -> PathBuf {
-        self.cwd.clone()
+        self.exec.shell.cwd.clone()
     }
     /// Hand value methods the evaluator's *injected* Fs port, not the trait's
     /// `StdFs` default, so `.save`/`.append` write sinks are mediated by

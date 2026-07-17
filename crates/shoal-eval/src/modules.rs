@@ -29,7 +29,7 @@ impl Evaluator {
                     .with_span(span)
             })?;
         let exports = self.load_module(&canon).map_err(|e| e.or_span(span))?;
-        self.env.declare(stem, exports, false);
+        self.exec.shell.env.declare(stem, exports, false);
         Ok(())
     }
 
@@ -40,7 +40,7 @@ impl Evaluator {
         let base = if base.is_absolute() {
             base
         } else {
-            self.cwd.join(&base)
+            self.exec.shell.cwd.join(&base)
         };
         let candidates = if base.extension().is_some() {
             vec![base.clone()]
@@ -65,12 +65,14 @@ impl Evaluator {
 
     /// Load (or return the memoized) exports record for a canonical module path.
     fn load_module(&mut self, canon: &Path) -> VResult<Value> {
-        if let Some(cached) = self.modules.get(canon) {
+        if let Some(cached) = self.exec.modules.cache.get(canon) {
             return Ok(cached.clone());
         }
-        if self.module_stack.iter().any(|p| p == canon) {
+        if self.exec.modules.stack.iter().any(|p| p == canon) {
             let mut cycle: Vec<String> = self
-                .module_stack
+                .exec
+                .modules
+                .stack
                 .iter()
                 .map(|p| p.display().to_string())
                 .collect();
@@ -91,16 +93,16 @@ impl Evaluator {
         // Evaluate the module in a fresh scope: a new root env (so it cannot see
         // the caller's locals) rooted at the module file's own directory (so its
         // relative `use`/paths resolve against the module, not the caller).
-        let saved_env = std::mem::replace(&mut self.env, Env::root());
+        let saved_env = std::mem::replace(&mut self.exec.shell.env, Env::root());
         let module_dir = canon
             .parent()
             .map(Path::to_path_buf)
-            .unwrap_or_else(|| self.cwd.clone());
-        let saved_cwd = std::mem::replace(&mut self.cwd, module_dir);
+            .unwrap_or_else(|| self.exec.shell.cwd.clone());
+        let saved_cwd = std::mem::replace(&mut self.exec.shell.cwd, module_dir);
         // A module's top-level decls are not inside a fn body; reset the guard so
         // module setup can run, then restore.
-        let saved_in_fn = std::mem::replace(&mut self.in_fn_body, 0);
-        self.module_stack.push(canon.to_path_buf());
+        let saved_in_fn = std::mem::replace(&mut self.exec.control.in_fn_body, 0);
+        self.exec.modules.stack.push(canon.to_path_buf());
 
         let mut result = Ok(());
         for stmt in &program.stmts {
@@ -111,25 +113,28 @@ impl Evaluator {
         }
         let exports = result.map(|()| self.collect_exports(&program));
 
-        self.module_stack.pop();
-        self.env = saved_env;
-        self.cwd = saved_cwd;
-        self.in_fn_body = saved_in_fn;
+        self.exec.modules.stack.pop();
+        self.exec.shell.env = saved_env;
+        self.exec.shell.cwd = saved_cwd;
+        self.exec.control.in_fn_body = saved_in_fn;
 
         let exports = exports?;
-        self.modules.insert(canon.to_path_buf(), exports.clone());
+        self.exec
+            .modules
+            .cache
+            .insert(canon.to_path_buf(), exports.clone());
         Ok(exports)
     }
 
     /// After evaluating a module, lift its `export`ed top-level decls out of the
-    /// module env into a record. Reads from `self.env`, which is still the module
+    /// module env into a record. Reads from `self.exec.shell.env`, which is still the module
     /// scope when this is called.
     fn collect_exports(&self, program: &Program) -> Value {
         let mut exports = Record::new();
         for stmt in &program.stmts {
             match stmt {
                 Stmt::Fn { decl } if decl.exported => {
-                    if let Some(v) = self.env.get(&decl.name) {
+                    if let Some(v) = self.exec.shell.env.get(&decl.name) {
                         exports.insert(decl.name.clone(), v);
                     }
                 }
@@ -137,7 +142,7 @@ impl Evaluator {
                     pattern, exported, ..
                 } if *exported => {
                     for name in pattern_names(pattern) {
-                        if let Some(v) = self.env.get(&name) {
+                        if let Some(v) = self.exec.shell.env.get(&name) {
                             exports.insert(name, v);
                         }
                     }

@@ -216,7 +216,7 @@ impl Evaluator {
         if p.is_absolute() {
             p
         } else {
-            self.cwd().join(p)
+            self.exec.shell.cwd.join(p)
         }
     }
 }

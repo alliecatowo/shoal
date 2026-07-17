@@ -2,30 +2,47 @@
 
 use super::*;
 
-pub struct ExecState {
-    pub(crate) reef: reef_state::ReefState,
-    /// Public for source compatibility; the enclosing Evaluator dereferences to
-    /// ExecState. Child construction still controls whether this handle is
-    /// inherited or replaced with a fresh root.
-    pub env: Env,
+pub(crate) struct ShellState {
+    pub(crate) env: Env,
     pub(crate) cwd: PathBuf,
     pub(crate) process_env: Vec<(OsString, OsString)>,
-    pub it: Value,
-    pub(crate) cancel: CancelToken,
-    pub(crate) call_depth: usize,
-    pub(crate) in_fn_body: usize,
-    pub(crate) jobs: Vec<shoal_value::TaskVal>,
-    pub(crate) external_jobs: std::collections::HashMap<u64, u32>,
-    pub(crate) pending_stop: Option<(u64, String)>,
-    pub(crate) current_entry: Option<i64>,
-    pub(crate) source: Option<String>,
-    pub(crate) pending_exit: Option<i32>,
-    pub(crate) modules: std::collections::HashMap<PathBuf, Value>,
-    pub(crate) module_stack: Vec<PathBuf>,
-    pub(crate) plans: Vec<Program>,
     pub(crate) jump_store: Option<PathBuf>,
     pub(crate) oldpwd: Option<PathBuf>,
     pub(crate) dir_stack: Vec<PathBuf>,
+}
+
+pub(crate) struct ControlState {
+    pub(crate) it: Value,
+    pub(crate) cancel: CancelToken,
+    pub(crate) call_depth: usize,
+    pub(crate) in_fn_body: usize,
+    pub(crate) current_entry: Option<i64>,
+    pub(crate) source: Option<String>,
+    pub(crate) pending_exit: Option<i32>,
+}
+
+pub(crate) struct JobState {
+    pub(crate) tasks: Vec<shoal_value::TaskVal>,
+    pub(crate) external: std::collections::HashMap<u64, u32>,
+    pub(crate) pending_stop: Option<(u64, String)>,
+}
+
+pub(crate) struct ModuleState {
+    pub(crate) cache: std::collections::HashMap<PathBuf, Value>,
+    pub(crate) stack: Vec<PathBuf>,
+}
+
+pub(crate) struct PlanState {
+    pub(crate) programs: Vec<Program>,
+}
+
+pub(crate) struct ExecState {
+    pub(crate) reef: reef_state::ReefState,
+    pub(crate) shell: ShellState,
+    pub(crate) control: ControlState,
+    pub(crate) jobs: JobState,
+    pub(crate) modules: ModuleState,
+    pub(crate) plans: PlanState,
 }
 
 /// The complete mutable snapshot allowed to cross a parent→child boundary.
@@ -43,36 +60,46 @@ impl ExecState {
     pub(crate) fn root(cwd: PathBuf) -> Self {
         Self {
             reef: reef_state::ReefState::default(),
-            env: Env::root(),
-            cwd,
-            process_env: std::env::vars_os().collect(),
-            it: Value::Null,
-            cancel: CancelToken::new(),
-            call_depth: 0,
-            in_fn_body: 0,
-            jobs: Vec::new(),
-            external_jobs: std::collections::HashMap::new(),
-            pending_stop: None,
-            current_entry: None,
-            source: None,
-            pending_exit: None,
-            modules: std::collections::HashMap::new(),
-            module_stack: Vec::new(),
-            plans: Vec::new(),
-            jump_store: None,
-            oldpwd: None,
-            dir_stack: Vec::new(),
+            shell: ShellState {
+                env: Env::root(),
+                cwd,
+                process_env: std::env::vars_os().collect(),
+                jump_store: None,
+                oldpwd: None,
+                dir_stack: Vec::new(),
+            },
+            control: ControlState {
+                it: Value::Null,
+                cancel: CancelToken::new(),
+                call_depth: 0,
+                in_fn_body: 0,
+                current_entry: None,
+                source: None,
+                pending_exit: None,
+            },
+            jobs: JobState {
+                tasks: Vec::new(),
+                external: std::collections::HashMap::new(),
+                pending_stop: None,
+            },
+            modules: ModuleState {
+                cache: std::collections::HashMap::new(),
+                stack: Vec::new(),
+            },
+            plans: PlanState {
+                programs: Vec::new(),
+            },
         }
     }
 
     pub(crate) fn child_seed(&self) -> ChildExecSeed {
         ChildExecSeed {
             reef: self.reef.clone(),
-            cwd: self.cwd.clone(),
-            env: self.env.clone(),
-            process_env: self.process_env.clone(),
-            oldpwd: self.oldpwd.clone(),
-            dir_stack: self.dir_stack.clone(),
+            cwd: self.shell.cwd.clone(),
+            env: self.shell.env.clone(),
+            process_env: self.shell.process_env.clone(),
+            oldpwd: self.shell.oldpwd.clone(),
+            dir_stack: self.shell.dir_stack.clone(),
         }
     }
 
@@ -88,12 +115,12 @@ impl ExecState {
         let mut child = Self::root(cwd);
         child.reef = reef;
         if !matches!(kind, crate::ChildKind::Script) {
-            child.env = env;
+            child.shell.env = env;
         }
-        child.process_env = process_env;
-        child.oldpwd = oldpwd;
-        child.dir_stack = dir_stack;
-        child.cancel = cancel;
+        child.shell.process_env = process_env;
+        child.shell.oldpwd = oldpwd;
+        child.shell.dir_stack = dir_stack;
+        child.control.cancel = cancel;
         child
     }
 }
@@ -111,5 +138,25 @@ mod tests {
             exec,
         } = evaluator;
         drop((host, session, exec));
+    }
+
+    #[test]
+    fn execution_state_is_partitioned_into_typed_contexts() {
+        let ExecState {
+            reef,
+            shell,
+            control,
+            jobs,
+            modules,
+            plans,
+        } = ExecState::root(PathBuf::from("/"));
+        drop((reef, shell, control, jobs, modules, plans));
+    }
+
+    #[test]
+    fn evaluator_does_not_deref_into_execution_state() {
+        let facade = include_str!("lib.rs");
+        assert!(!facade.contains("impl std::ops::Deref for Evaluator"));
+        assert!(!facade.contains("impl std::ops::DerefMut for Evaluator"));
     }
 }

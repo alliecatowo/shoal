@@ -16,8 +16,8 @@ impl Evaluator {
     pub(crate) fn builtin_plan(&mut self, call: &CmdCall) -> VResult<Value> {
         let program = self.plan_target_program(call)?;
         let plan = self.plan_program(&program)?;
-        self.plans.push(program);
-        let id = self.plans.len() as i64;
+        self.exec.plans.programs.push(program);
+        let id = self.exec.plans.programs.len() as i64;
         Ok(plan_record(&plan, Some(id)))
     }
 
@@ -45,9 +45,9 @@ impl Evaluator {
         };
         let idx = usize::try_from(id - 1)
             .ok()
-            .filter(|i| *i < self.plans.len())
+            .filter(|i| *i < self.exec.plans.programs.len())
             .ok_or_else(|| ErrorVal::new("not_found", format!("no plan #{id} to apply")))?;
-        let program = self.plans[idx].clone();
+        let program = self.exec.plans.programs[idx].clone();
         self.eval_program(&program)
     }
 

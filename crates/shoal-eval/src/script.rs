@@ -12,12 +12,18 @@ impl Evaluator {
         reef_expr: Option<&Expr>,
         body: &Block,
     ) -> VResult<Value> {
-        let old_cwd = self.cwd.clone();
-        let old_env = self.process_env.clone();
+        let old_cwd = self.exec.shell.cwd.clone();
+        let old_env = self.exec.shell.process_env.clone();
         if let Some(e) = cwd {
             match self.eval_expr(e, Position::Value)? {
-                Value::Path(p) => self.cwd = if p.is_absolute() { p } else { self.cwd.join(p) },
-                Value::Str(s) => self.cwd = self.cwd.join(s),
+                Value::Path(p) => {
+                    self.exec.shell.cwd = if p.is_absolute() {
+                        p
+                    } else {
+                        self.exec.shell.cwd.join(p)
+                    }
+                }
+                Value::Str(s) => self.exec.shell.cwd = self.exec.shell.cwd.join(s),
                 _ => return Err(ErrorVal::new("type_error", "with cwd expects path")),
             }
         }
@@ -27,8 +33,11 @@ impl Evaluator {
             };
             for (k, v) in r {
                 let val = self.argv_value(v)?;
-                self.process_env.retain(|(n, _)| n != &OsString::from(&k));
-                self.process_env.push((k.into(), val));
+                self.exec
+                    .shell
+                    .process_env
+                    .retain(|(n, _)| n != &OsString::from(&k));
+                self.exec.shell.process_env.push((k.into(), val));
             }
         }
         // `with reef: {tool: constraint, …} { }` — dynamic reef scoping
@@ -37,13 +46,13 @@ impl Evaluator {
         let mut pushed_reef = false;
         if let Some(e) = reef_expr {
             let Value::Record(r) = self.eval_expr(e, Position::Value)? else {
-                self.cwd = old_cwd;
-                self.process_env = old_env;
+                self.exec.shell.cwd = old_cwd;
+                self.exec.shell.process_env = old_env;
                 return Err(ErrorVal::new("type_error", "with reef expects record"));
             };
             if let Err(err) = self.push_reef_override(&r) {
-                self.cwd = old_cwd;
-                self.process_env = old_env;
+                self.exec.shell.cwd = old_cwd;
+                self.exec.shell.process_env = old_env;
                 return Err(err);
             }
             pushed_reef = true;
@@ -52,8 +61,8 @@ impl Evaluator {
         if pushed_reef {
             self.pop_reef_override();
         }
-        self.cwd = old_cwd;
-        self.process_env = old_env;
+        self.exec.shell.cwd = old_cwd;
+        self.exec.shell.process_env = old_env;
         out
     }
     pub(crate) fn spawn_block(&mut self, body: Block) -> VResult<Value> {
@@ -75,7 +84,7 @@ impl Evaluator {
             let mut ev = ctx.build(ChildKind::Spawn, child_cancel);
             worker.finish(ev.block_value(&body));
         });
-        self.jobs.push(task.clone());
+        self.exec.jobs.tasks.push(task.clone());
         Ok(Value::Task(task))
     }
 
@@ -99,7 +108,11 @@ impl Evaluator {
         let is_path = name.contains('/') || name.starts_with('.') || name.starts_with('~');
         let resolved = {
             let p = self.resolve_path(&name);
-            if p.is_absolute() { p } else { self.cwd.join(p) }
+            if p.is_absolute() {
+                p
+            } else {
+                self.exec.shell.cwd.join(p)
+            }
         };
         let ext = Path::new(&name)
             .extension()
@@ -157,9 +170,9 @@ impl Evaluator {
                 // cancel interrupts the script.
                 let cancel = self.cancellation_token();
                 let mut child = self.child_context().build(ChildKind::Script, cancel);
-                child.env.declare("args", Value::List(args), false);
+                child.env_mut().declare("args", Value::List(args), false);
                 child
-                    .env
+                    .env_mut()
                     .declare("script", Value::Path(path.to_path_buf()), false);
                 child.eval_program(&program)
             }
@@ -268,6 +281,8 @@ impl Evaluator {
         position: Position,
     ) -> VResult<Value> {
         let path_env = self
+            .exec
+            .shell
             .process_env
             .iter()
             .find(|(k, _)| k == "PATH")

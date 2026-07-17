@@ -146,10 +146,12 @@ mod tests {
         parent.set_echo_mode(EchoMode::Quiet);
         parent.set_interactive(true);
         parent.set_statement_sink(Box::new(|_| {}));
-        parent.env.declare("parent_only", Value::Int(1), false);
-        parent.oldpwd = Some(dir.path().join("previous"));
-        parent.dir_stack.push(dir.path().join("stacked"));
-        parent.reef.lock.insert(LockEntry {
+        parent
+            .env_mut()
+            .declare("parent_only", Value::Int(1), false);
+        parent.exec.shell.oldpwd = Some(dir.path().join("previous"));
+        parent.exec.shell.dir_stack.push(dir.path().join("stacked"));
+        parent.exec.reef.lock.insert(LockEntry {
             name: "fixture".into(),
             version: "1.0.0".into(),
             provider: "system".into(),
@@ -157,7 +159,7 @@ mod tests {
             blake3: "deadbeef".into(),
             resolved_at: "2026-07-16T00:00:00Z".into(),
         });
-        parent.reef.lock_path = Some(dir.path().join("reef.lock"));
+        parent.exec.reef.lock_path = Some(dir.path().join("reef.lock"));
         parent.set_reef_user_manifest(dir.path().join("shoal.toml"));
         let scope = ScopeEntry {
             kind: ManifestKind::Reef,
@@ -165,14 +167,14 @@ mod tests {
             manifest: ReefManifest::parse_reef("[tools]\nfixture = \"*\"\n").unwrap(),
             mtime: None,
         };
-        parent.reef.chain = Some((
+        parent.exec.reef.chain = Some((
             dir.path().to_path_buf(),
             ScopeChain {
                 cwd: dir.path().to_path_buf(),
                 scopes: vec![scope.clone()],
             },
         ));
-        parent.reef.overrides.push(scope.clone());
+        parent.exec.reef.overrides.push(scope.clone());
         let resolver = Arc::new(Resolver::new(vec![Box::new(SystemProvider::new(
             vec![dir.path().join("bin")],
             vec![],
@@ -197,26 +199,26 @@ mod tests {
         );
         assert!(child.session.sink.is_none(), "a child has no host renderer");
         assert!(
-            child.env.get("parent_only").is_none(),
+            child.env().get("parent_only").is_none(),
             "a fresh-scope script child gets a new lexical root"
         );
-        assert_eq!(child.oldpwd, parent.oldpwd);
-        assert_eq!(child.dir_stack, parent.dir_stack);
+        assert_eq!(child.exec.shell.oldpwd, parent.exec.shell.oldpwd);
+        assert_eq!(child.exec.shell.dir_stack, parent.exec.shell.dir_stack);
         assert!(
             !child.has_journal(),
             "the outer parent statement owns journaling; nested entries are not implied"
         );
-        assert_eq!(child.reef.lock, parent.reef.lock);
-        assert_eq!(child.reef.lock_path, parent.reef.lock_path);
+        assert_eq!(child.exec.reef.lock, parent.exec.reef.lock);
+        assert_eq!(child.exec.reef.lock_path, parent.exec.reef.lock_path);
         assert_eq!(
             child.host.reef_user_manifest,
             parent.host.reef_user_manifest
         );
-        let (_, child_chain) = child.reef.chain.as_ref().unwrap();
+        let (_, child_chain) = child.exec.reef.chain.as_ref().unwrap();
         assert_eq!(child_chain.scopes.len(), 1);
         assert_eq!(child_chain.scopes[0].source, scope.source);
-        assert_eq!(child.reef.overrides.len(), 1);
-        assert_eq!(child.reef.overrides[0].source, scope.source);
+        assert_eq!(child.exec.reef.overrides.len(), 1);
+        assert_eq!(child.exec.reef.overrides[0].source, scope.source);
         assert!(Arc::ptr_eq(
             child.host.reef_resolver.get().unwrap(),
             &resolver
