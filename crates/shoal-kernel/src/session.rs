@@ -7,6 +7,10 @@ use super::*;
 pub(crate) struct Attachment {
     pub(crate) session: Arc<Session>,
     pub(crate) principal: String,
+    /// Whether this authenticated attachment may approve another principal's
+    /// plan. Local-human attachments are trusted; bearer attachments must opt
+    /// in through the `supervisor` profile or `plan.approve` capability.
+    pub(crate) can_approve: bool,
     /// Whether the attaching client declared itself a real interactive
     /// terminal (`session.attach`'s `client.tty`). Every client this
     /// codebase actually ships today (`shoal-mcp`, the test harness) attaches
@@ -115,7 +119,7 @@ impl Kernel {
     ) -> Result<Json, RpcError> {
         let params: AttachParams = decode(params)?;
         let tty = params.client.tty;
-        let (who, token_caps, profile) = if let Some(token) = params.token {
+        let (who, token_caps, profile, local_human) = if let Some(token) = params.token {
             let auth = self.auth.as_ref().ok_or_else(|| RpcError {
                 code: AUTH_FAILED,
                 message: "bearer tokens unavailable in ephemeral kernel".into(),
@@ -130,10 +134,13 @@ impl Kernel {
                     message: "invalid, expired, or revoked bearer token".into(),
                     data: None,
                 })?;
-            (meta.principal, meta.caps, meta.profile)
+            (meta.principal, meta.caps, meta.profile, false)
         } else {
-            (principal(), vec![], "local-human".into())
+            (principal(), vec![], "local-human".into(), true)
         };
+        let can_approve = local_human
+            || profile == "supervisor"
+            || token_caps.iter().any(|cap| cap == "plan.approve");
         let name = params.session.unwrap_or_else(|| "default".into());
         let session = self.session(&name, &who).map_err(internal)?;
         let cwd = session
@@ -146,6 +153,7 @@ impl Kernel {
         *attached = Some(Attachment {
             session,
             principal: who.clone(),
+            can_approve,
             tty,
         });
         // site/content/internals/language-conformance-contract.md tier honesty: report the REAL strongest OS backend

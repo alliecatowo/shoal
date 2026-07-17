@@ -50,6 +50,10 @@ pub struct Kernel {
     state_dir: Option<PathBuf>,
     policy: Policy,
     plans: Mutex<HashMap<String, StoredPlan>>,
+    /// Per-kernel object id for stored plans. The full BLAKE3 digest binds the
+    /// immutable plan contents; this counter makes repeated storage of the
+    /// exact same plan a distinct object instead of replacing the first one.
+    next_plan: AtomicU64,
     tasks: Mutex<HashMap<Ref, Arc<TaskEntry>>>,
     next_task: AtomicU64,
     /// Long-lived interactive PTY sessions (site/content/internals/kernel-protocol.md), keyed by their
@@ -111,6 +115,12 @@ struct StoredPlan {
     /// The plan owner / **requester** — the principal that derived this plan
     /// (`exec {mode:"plan"}`). Distinct from an `ApprovalRecord::approver`.
     principal: String,
+    /// Full (untruncated) BLAKE3 binding of source, canonical AST, derived plan,
+    /// session, and requester. Unlike `plan_ref`, this is content identity.
+    plan_hash: String,
+    /// Full source digest kept separately so approval/audit projections can
+    /// state exactly which source was authorized without copying source text.
+    source_hash: String,
     plan: Plan,
     approved: bool,
     /// The auditable approval binding, present once a `cap.request` approved
@@ -128,10 +138,17 @@ struct StoredPlan {
 struct ApprovalRecord {
     /// The plan owner whose effects were approved.
     requester: String,
-    /// The distinct principal that approved (the `cap.request` caller).
+    /// The authenticated, authorized principal that approved (the
+    /// `cap.request` caller; distinct unless self-ack was explicitly enabled).
     approver: String,
     /// The source-anchored plan ref/hash this approval is bound to.
     plan_ref: String,
+    /// Immutable full plan/content digest copied from [`StoredPlan`].
+    plan_hash: String,
+    /// Immutable full source digest copied from [`StoredPlan`].
+    source_hash: String,
+    /// Session in which the requester derived the plan.
+    session: String,
     /// The effect kinds the approval was scoped to (empty ⇒ the whole plan).
     scope: Vec<String>,
     /// When the approval was granted (ns since epoch).
@@ -150,6 +167,7 @@ impl Kernel {
             state_dir: None,
             policy: permissive_policy(),
             plans: Mutex::new(HashMap::new()),
+            next_plan: AtomicU64::new(1),
             tasks: Mutex::new(HashMap::new()),
             next_task: AtomicU64::new(1),
             ptys: Mutex::new(HashMap::new()),
@@ -179,6 +197,7 @@ impl Kernel {
             state_dir: Some(state_dir.to_path_buf()),
             policy: permissive_policy(),
             plans: Mutex::new(HashMap::new()),
+            next_plan: AtomicU64::new(1),
             tasks: Mutex::new(HashMap::new()),
             next_task: AtomicU64::new(1),
             ptys: Mutex::new(HashMap::new()),
@@ -205,6 +224,7 @@ impl Kernel {
             state_dir: Some(state_dir.to_path_buf()),
             policy,
             plans: Mutex::new(HashMap::new()),
+            next_plan: AtomicU64::new(1),
             tasks: Mutex::new(HashMap::new()),
             next_task: AtomicU64::new(1),
             ptys: Mutex::new(HashMap::new()),
@@ -223,6 +243,7 @@ impl Kernel {
             state_dir: None,
             policy,
             plans: Mutex::new(HashMap::new()),
+            next_plan: AtomicU64::new(1),
             tasks: Mutex::new(HashMap::new()),
             next_task: AtomicU64::new(1),
             ptys: Mutex::new(HashMap::new()),
@@ -357,6 +378,14 @@ impl Kernel {
         self.allow_self_ack.store(allow, Ordering::SeqCst);
     }
 
+    /// Allocate a distinct stored-plan object reference. The digest is the
+    /// immutable content binding; the monotonically increasing suffix prevents
+    /// a second storage of identical content from replacing the first object.
+    fn allocate_plan_ref(&self, plan_hash: &str) -> String {
+        let object_id = self.next_plan.fetch_add(1, Ordering::Relaxed);
+        format!("plan:{plan_hash}:{object_id:016x}")
+    }
+
     /// Append a journal audit entry for an approval decision (HR-D2), so the
     /// requester→plan→approver→scope binding is durably queryable via
     /// `journal.query`, not just live in the plan map. Best effort: an
@@ -373,6 +402,9 @@ impl Kernel {
         let effects_json = serde_json::to_string(&json!([{
             "kind": "approval",
             "plan_ref": approval.plan_ref,
+            "plan_hash": approval.plan_hash,
+            "source_hash": approval.source_hash,
+            "session": approval.session,
             "requester": approval.requester,
             "approver": approval.approver,
             "scope": approval.scope,
@@ -471,11 +503,23 @@ fn permissive_policy() -> Policy {
 }
 
 /// Whether self-acknowledgement (a plan's requester approving its own plan via
-/// `cap.request`) is permitted by process configuration (HR-D3). Off unless the
-/// operator sets a non-empty `SHOAL_ALLOW_SELF_ACK`. Read once per kernel at
-/// construction; `Kernel::set_allow_self_ack` overrides it at runtime.
+/// `cap.request`) is permitted by process configuration (HR-D3). Only explicit
+/// boolean true spellings enable it; notably `0`, `false`, and an empty value
+/// remain false. Read once per kernel at construction; `set_allow_self_ack`
+/// can override it at runtime.
 fn self_ack_from_env() -> bool {
-    std::env::var_os("SHOAL_ALLOW_SELF_ACK").is_some_and(|v| !v.is_empty())
+    parse_env_bool(std::env::var_os("SHOAL_ALLOW_SELF_ACK").as_deref())
+}
+
+fn parse_env_bool(value: Option<&std::ffi::OsStr>) -> bool {
+    value
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
 }
 
 /// The single-letter wire form of an enforcement tier (site/content/internals/language-conformance-contract.md): A (Landlock),
@@ -515,7 +559,37 @@ fn canonical_plan_ref(ast_json: &str, effects: &[Effect]) -> String {
     hasher.update(ast_json.as_bytes());
     hasher.update(b"\0");
     hasher.update(effects_json.as_bytes());
-    format!("plan:{}", &hasher.finalize().to_hex()[..16])
+    format!("plan:{}", hasher.finalize().to_hex())
+}
+
+fn source_hash(src: &str) -> String {
+    blake3::hash(src.as_bytes()).to_hex().to_string()
+}
+
+/// Full immutable approval binding. This deliberately excludes `plan_ref`
+/// because that contains the per-kernel object id; all semantic inputs are
+/// included explicitly and domain-separated.
+fn bound_plan_hash(
+    src: &str,
+    ast_json: &str,
+    plan: &Plan,
+    session: &str,
+    requester: &str,
+) -> String {
+    let canonical = serde_json::to_vec(&(
+        src,
+        ast_json,
+        &plan.effects,
+        plan.reversibility,
+        &plan.estimates,
+        session,
+        requester,
+    ))
+    .expect("plan binding is serializable");
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"shoal.kernel.plan-binding.v1\0");
+    hasher.update(&canonical);
+    hasher.finalize().to_hex().to_string()
 }
 
 /// `position: "value"` (site/content/internals/language-conformance-contract.md): evaluate the sole top-level command
@@ -650,6 +724,9 @@ fn approval_json(approval: Option<&ApprovalRecord>) -> Json {
             "requester": a.requester,
             "approver": a.approver,
             "plan_ref": a.plan_ref,
+            "plan_hash": a.plan_hash,
+            "source_hash": a.source_hash,
+            "session": a.session,
             "scope": a.scope,
             "approved_at": a.approved_at_ns,
             "consumed_by": a.consumed_by,
@@ -790,6 +867,20 @@ unsafe fn libc_geteuid() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn self_ack_env_is_an_explicit_boolean() {
+        use std::ffi::OsStr;
+
+        for enabled in ["1", "true", "TRUE", "yes", "on"] {
+            assert!(parse_env_bool(Some(OsStr::new(enabled))), "{enabled}");
+        }
+        for disabled in ["", "0", "false", "FALSE", "no", "off", "garbage"] {
+            assert!(!parse_env_bool(Some(OsStr::new(disabled))), "{disabled}");
+        }
+        assert!(!parse_env_bool(None));
+    }
+
     fn call(
         writer: &mut UnixStream,
         reader: &mut BufReader<UnixStream>,
@@ -1218,6 +1309,40 @@ mod tests {
         let out = applied.result.unwrap()["value"]["out"].clone();
         assert_eq!(out["$"], "str");
         assert_eq!(out["v"], "FIRST");
+        drop(client);
+        drop(reader);
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn storing_identical_plan_twice_creates_distinct_objects() {
+        let kernel = Kernel::new();
+        let (mut client, mut reader, thread) = spawn(&kernel);
+        attach(&mut client, &mut reader);
+        let src = "sh { echo SAME }";
+        let first = call(
+            &mut client,
+            &mut reader,
+            2,
+            "exec",
+            json!({"src":src,"mode":"plan"}),
+        )
+        .result
+        .unwrap();
+        let second = call(
+            &mut client,
+            &mut reader,
+            3,
+            "exec",
+            json!({"src":src,"mode":"plan"}),
+        )
+        .result
+        .unwrap();
+        let first_ref = first["plan_ref"].as_str().unwrap();
+        let second_ref = second["plan_ref"].as_str().unwrap();
+        assert_ne!(first_ref, second_ref, "stored objects must never replace");
+        assert!(first_ref.len() > 64, "plan refs carry the full digest");
+        assert!(second_ref.len() > 64, "plan refs carry the full digest");
         drop(client);
         drop(reader);
         thread.join().unwrap();
@@ -3237,6 +3362,97 @@ mod tests {
         thread.join().unwrap();
     }
 
+    #[test]
+    fn distinct_agent_without_approver_role_is_denied_but_local_human_can_approve() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tokens = TokenStore::open(dir.path().join("tokens.json")).unwrap();
+        let (requester_token, _) = tokens
+            .create("agent:requester".into(), "agent".into(), vec![], None)
+            .unwrap();
+        let (unauthorized_token, _) = tokens
+            .create("agent:other".into(), "agent".into(), vec![], None)
+            .unwrap();
+        drop(tokens);
+        let policy = Policy::from_toml(
+            "[principal.\"agent:requester\"]\nopaque='ask'\nauto_apply='never'\n",
+        )
+        .unwrap();
+        let kernel = Kernel::open_with_policy(dir.path(), policy).unwrap();
+
+        let (mut requester, mut requester_reader, requester_thread) = spawn(&kernel);
+        call(
+            &mut requester,
+            &mut requester_reader,
+            1,
+            "session.attach",
+            json!({"token":requester_token,"client":{"kind":"agent","tty":false}}),
+        );
+        let plan_ref = call(
+            &mut requester,
+            &mut requester_reader,
+            2,
+            "exec",
+            json!({"src":"sh { echo guarded }","mode":"plan"}),
+        )
+        .result
+        .unwrap()["plan_ref"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let (mut other, mut other_reader, other_thread) = spawn(&kernel);
+        call(
+            &mut other,
+            &mut other_reader,
+            1,
+            "session.attach",
+            json!({"token":unauthorized_token,"client":{"kind":"agent","tty":false}}),
+        );
+        let denied = call(
+            &mut other,
+            &mut other_reader,
+            2,
+            "cap.request",
+            json!({"plan_ref":plan_ref}),
+        )
+        .error
+        .expect("a distinct ordinary agent is not automatically an approver");
+        assert_eq!(denied.code, LEASH_DENIED);
+        assert!(denied.message.contains("not authorized"), "{denied:?}");
+
+        let (mut human, mut human_reader, human_thread) = spawn(&kernel);
+        let human_attach = call(
+            &mut human,
+            &mut human_reader,
+            1,
+            "session.attach",
+            json!({"client":{"kind":"human","tty":false}}),
+        )
+        .result
+        .unwrap();
+        let human_principal = human_attach["principal"].as_str().unwrap().to_owned();
+        let approved = call(
+            &mut human,
+            &mut human_reader,
+            2,
+            "cap.request",
+            json!({"plan_ref":plan_ref}),
+        )
+        .result
+        .expect("the trusted local-human path remains usable");
+        assert_eq!(approved["approver"], human_principal);
+
+        drop(requester);
+        drop(requester_reader);
+        requester_thread.join().unwrap();
+        drop(other);
+        drop(other_reader);
+        other_thread.join().unwrap();
+        drop(human);
+        drop(human_reader);
+        human_thread.join().unwrap();
+    }
+
     /// HR-D2/HR-D3 happy path: a DISTINCT approver (a second bearer principal)
     /// may approve a requester's plan, the grant reports both identities, the
     /// approval record binds requester→approver→scope on the plan, and once the
@@ -3308,11 +3524,37 @@ mod tests {
         assert_eq!(grant["requester"], "agent:alpha", "{grant}");
         assert_eq!(grant["approver"], "agent:beta", "{grant}");
 
+        // Storing an identical plan after approval creates another object; it
+        // cannot replace or steal the first object's approval.
+        let replacement = call(
+            &mut a,
+            &mut a_reader,
+            3,
+            "exec",
+            json!({"src":"sh { echo hi }","mode":"plan","position":"stmt"}),
+        )
+        .result
+        .unwrap();
+        let replacement_ref = replacement["plan_ref"].as_str().unwrap();
+        assert_ne!(replacement_ref, plan_ref);
+        let replacement_apply = call(
+            &mut a,
+            &mut a_reader,
+            4,
+            "plan.apply",
+            json!({"plan_ref": replacement_ref}),
+        );
+        assert_eq!(
+            replacement_apply.error.unwrap().code,
+            APPROVAL_REQUIRED,
+            "the later identical object must not inherit the first approval"
+        );
+
         // The requester applies the now-approved plan; it runs.
         let applied = call(
             &mut a,
             &mut a_reader,
-            3,
+            5,
             "plan.apply",
             json!({"plan_ref": plan_ref}),
         )
@@ -3324,7 +3566,7 @@ mod tests {
         let got = call(
             &mut a,
             &mut a_reader,
-            4,
+            6,
             "plan.get",
             json!({"plan_ref": plan_ref}),
         )
@@ -3333,6 +3575,10 @@ mod tests {
         let approval = &got["approval"];
         assert_eq!(approval["requester"], "agent:alpha", "{got}");
         assert_eq!(approval["approver"], "agent:beta", "{got}");
+        assert_eq!(approval["plan_ref"], plan_ref, "{got}");
+        assert_eq!(approval["session"], "pair", "{got}");
+        assert_eq!(approval["plan_hash"].as_str().unwrap().len(), 64, "{got}");
+        assert_eq!(approval["source_hash"].as_str().unwrap().len(), 64, "{got}");
         assert!(
             approval["consumed_by"].is_i64(),
             "the approval names the journal entry that consumed it: {got}"

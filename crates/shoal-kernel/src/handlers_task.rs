@@ -149,7 +149,7 @@ impl Kernel {
 
     /// `plan.get` (site/content/internals/kernel-protocol.md, `shoal://plan/{ref}`): the stored plan a
     /// prior `exec {mode:"plan"}` / `shoal_plan` derived and keyed by its
-    /// `plan:<hex16>` ref — its canonical AST (re-parsed from the stored
+    /// `plan:<full-hash>:<object-id>` ref — its canonical AST (re-parsed from the stored
     /// source), concrete effects, reversibility, and the *current* leash
     /// verdict, mirroring what `explain` returns plus the verdict fields
     /// `exec`'s plan mode reports. Session/principal-scoped like `plan.apply`
@@ -302,11 +302,9 @@ impl Kernel {
         // authenticated caller, never a bare unattached socket client (the
         // audit found this handler was dispatched with no attachment at all).
         // The attachment principal IS the approver, bound into the record below.
-        let approver = attached
-            .as_ref()
-            .ok_or_else(not_attached)?
-            .principal
-            .clone();
+        let attachment = attached.as_ref().ok_or_else(not_attached)?;
+        let approver = attachment.principal.clone();
+        let can_approve = attachment.can_approve;
         let p: CapRequestParams = decode(params)?;
         let Some(plan_ref) = p.plan_ref else {
             return Err(RpcError {
@@ -315,58 +313,6 @@ impl Kernel {
                 data: None,
             });
         };
-        // Read what we need under the plans lock, then drop it before the
-        // journal append (never hold two shared locks across an I/O call).
-        let (requester, session, plan_effect_kinds, deny) = {
-            let plans = self.plans.lock().unwrap();
-            let stored = plans.get(&plan_ref).ok_or_else(|| RpcError {
-                code: UNKNOWN_PLAN,
-                message: "unknown plan_ref".into(),
-                data: None,
-            })?;
-            (
-                stored.principal.clone(),
-                stored.session.clone(),
-                stored
-                    .plan
-                    .effects
-                    .iter()
-                    .map(effect_kind)
-                    .collect::<Vec<_>>(),
-                self.policy.evaluate_plan(&stored.principal, &stored.plan) == Verdict::Deny,
-            )
-        };
-        // HR-D3: separation of duties. The approver must differ from the
-        // requester unless self-acknowledgement is explicitly permitted — so by
-        // default a requesting agent cannot rubber-stamp its own plan; approval
-        // is a real second-party boundary (a supervising human/agent).
-        if approver == requester && !self.allow_self_ack.load(Ordering::SeqCst) {
-            return Err(RpcError {
-                code: LEASH_DENIED,
-                message: "self-approval is not permitted: a plan's approver must differ from its \
-                          requester (enable self-acknowledgement explicitly to override)"
-                    .into(),
-                data: Some(json!({
-                    "plan_ref": plan_ref,
-                    "requester": requester,
-                    "approver": approver,
-                })),
-            });
-        }
-        // Approval never overrides a hard denial: the plan owner's policy still
-        // decides whether these effects are permissible at all. Approval only
-        // acknowledges an approval-*required* plan.
-        if deny {
-            return Err(RpcError {
-                code: LEASH_DENIED,
-                message: "policy denies requested effects".into(),
-                data: None,
-            });
-        }
-        // site/content/internals/kernel-protocol.md: if the caller scoped the request to a set
-        // of effect kinds, the grant only covers those — a plan that
-        // needs an effect the caller did not name stays pending, so an
-        // approval can never silently widen past what was asked for.
         let requested: Vec<String> = p
             .effects
             .iter()
@@ -376,41 +322,91 @@ impl Kernel {
             })
             .map(|e| norm_effect(&e))
             .collect();
-        if !requested.is_empty() {
-            let missing: Vec<String> = plan_effect_kinds
-                .iter()
-                .filter(|k| !requested.contains(&norm_effect(k)))
-                .cloned()
-                .collect();
-            if !missing.is_empty() {
-                return encode(json!({
-                    "grant": "approval_pending",
-                    "plan_ref": plan_ref,
-                    "why": "requested effect scope does not cover the plan",
-                    "uncovered_effects": missing,
-                }));
-            }
-        }
-        // HR-D2: record the approval binding on the plan (requester, approver,
-        // plan ref/hash, granted scope, and — later — the consuming execution).
-        let record = ApprovalRecord {
-            requester: requester.clone(),
-            approver: approver.clone(),
-            plan_ref: plan_ref.clone(),
-            scope: requested.clone(),
-            approved_at_ns: now_ns(),
-            consumed_by: None,
-        };
-        {
+
+        // Validate and mutate under ONE plans lock. No caller can replace or
+        // mutate the object between authorization and approval, and the record
+        // copies the immutable binding from the exact object we approved.
+        let (record, plan_effect_kinds, session, requester) = {
             let mut plans = self.plans.lock().unwrap();
             let stored = plans.get_mut(&plan_ref).ok_or_else(|| RpcError {
                 code: UNKNOWN_PLAN,
                 message: "unknown plan_ref".into(),
                 data: None,
             })?;
+
+            let requester = stored.principal.clone();
+            let self_ack = approver == requester && self.allow_self_ack.load(Ordering::SeqCst);
+            if approver == requester && !self_ack {
+                return Err(RpcError {
+                    code: LEASH_DENIED,
+                    message: "self-approval is not permitted: a plan's approver must differ from \
+                              its requester (enable self-acknowledgement explicitly to override)"
+                        .into(),
+                    data: Some(json!({
+                        "plan_ref": plan_ref,
+                        "requester": requester,
+                        "approver": approver,
+                    })),
+                });
+            }
+            if approver != requester && !can_approve {
+                return Err(RpcError {
+                    code: LEASH_DENIED,
+                    message: "approver is not authorized: use a local-human attachment, the \
+                              supervisor profile, or the plan.approve capability"
+                        .into(),
+                    data: Some(json!({
+                        "plan_ref": plan_ref,
+                        "requester": requester,
+                        "approver": approver,
+                    })),
+                });
+            }
+            if self.policy.evaluate_plan(&stored.principal, &stored.plan) == Verdict::Deny {
+                return Err(RpcError {
+                    code: LEASH_DENIED,
+                    message: "policy denies requested effects".into(),
+                    data: None,
+                });
+            }
+
+            let plan_effect_kinds = stored
+                .plan
+                .effects
+                .iter()
+                .map(effect_kind)
+                .collect::<Vec<_>>();
+            if !requested.is_empty() {
+                let missing: Vec<String> = plan_effect_kinds
+                    .iter()
+                    .filter(|k| !requested.contains(&norm_effect(k)))
+                    .cloned()
+                    .collect();
+                if !missing.is_empty() {
+                    return encode(json!({
+                        "grant": "approval_pending",
+                        "plan_ref": plan_ref,
+                        "why": "requested effect scope does not cover the plan",
+                        "uncovered_effects": missing,
+                    }));
+                }
+            }
+
+            let record = ApprovalRecord {
+                requester: requester.clone(),
+                approver: approver.clone(),
+                plan_ref: stored.plan.plan_ref.clone(),
+                plan_hash: stored.plan_hash.clone(),
+                source_hash: stored.source_hash.clone(),
+                session: stored.session.clone(),
+                scope: requested.clone(),
+                approved_at_ns: now_ns(),
+                consumed_by: None,
+            };
             stored.approved = true;
             stored.approval = Some(record.clone());
-        }
+            (record, plan_effect_kinds, stored.session.clone(), requester)
+        };
         // HR-D2: mirror the binding into the journal so it is durably auditable.
         self.record_approval_audit(&record, &plan_effect_kinds, &session);
         // Same honest enforcement truth `session.attach`'s `caps_enforced`

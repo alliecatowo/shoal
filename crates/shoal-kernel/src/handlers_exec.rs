@@ -197,6 +197,11 @@ impl Kernel {
                 let mut evaluator = session.evaluator.lock().unwrap();
                 derive_plan(&mut evaluator, &ast, &ast_json)
             };
+            let source_hash = source_hash(&params.src);
+            let plan_hash = bound_plan_hash(&params.src, &ast_json, &plan, &session.id, &actor);
+            let plan_ref = self.allocate_plan_ref(&plan_hash);
+            let mut plan = plan;
+            plan.plan_ref.clone_from(&plan_ref);
             let verdict = self.policy.evaluate_plan(&actor, &plan);
             let result = PlanResult {
                 plan_ref: plan.plan_ref.clone(),
@@ -215,6 +220,8 @@ impl Kernel {
                     src: params.src,
                     session: session.id.clone(),
                     principal: actor.clone(),
+                    plan_hash,
+                    source_hash,
                     plan,
                     approved: verdict == Verdict::Allow,
                     approval: None,
@@ -276,6 +283,35 @@ impl Kernel {
         // resolves to no confinement, so the human path is unchanged.
         evaluator.set_leash_policy(self.policy.clone(), actor.clone());
         let run_plan = derive_plan(&mut evaluator, &ast, &ast_json);
+        if params.mode == "approved" {
+            let Some(plan_ref) = params.plan_ref.as_ref() else {
+                return Err(RpcError {
+                    code: LEASH_DENIED,
+                    message: "approved execution requires plan_ref".into(),
+                    data: None,
+                });
+            };
+            let actual_hash =
+                bound_plan_hash(&params.src, &ast_json, &run_plan, &session.id, &actor);
+            let plans = self.plans.lock().unwrap();
+            let stored = plans.get(plan_ref).ok_or_else(|| RpcError {
+                code: UNKNOWN_PLAN,
+                message: "unknown plan_ref".into(),
+                data: None,
+            })?;
+            if stored.plan_hash != actual_hash
+                || stored.source_hash != source_hash(&params.src)
+                || stored.session != session.id
+                || stored.principal != actor
+            {
+                return Err(RpcError {
+                    code: LEASH_DENIED,
+                    message: "approved plan binding no longer matches source/session/requester"
+                        .into(),
+                    data: None,
+                });
+            }
+        }
         if params.mode == "run" {
             match self.policy.evaluate_plan(&actor, &run_plan) {
                 Verdict::Deny => {
@@ -326,6 +362,11 @@ impl Kernel {
             && let Some(plan_ref) = &params.plan_ref
             && let Some(stored) = self.plans.lock().unwrap().get_mut(plan_ref)
             && let Some(approval) = stored.approval.as_mut()
+            && approval.plan_ref == stored.plan.plan_ref
+            && approval.plan_hash == stored.plan_hash
+            && approval.source_hash == stored.source_hash
+            && approval.session == stored.session
+            && approval.requester == stored.principal
         {
             approval.consumed_by = Some(entry_id);
         }
@@ -519,6 +560,7 @@ mod tests {
         let mut attached = Some(Attachment {
             session: session.clone(),
             principal: actor,
+            can_approve: true,
             tty: false,
         });
 
