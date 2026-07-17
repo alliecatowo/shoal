@@ -26,9 +26,9 @@ impl Kernel {
         // Pulling may execute map/where/scan closures, so it must own the same
         // evaluator context and serialization boundary as `exec`.
         let mut evaluator = session.evaluator.lock().unwrap();
-        evaluator.reset_cancel();
         let entry = session.stream_cursor(&params.cursor)?;
-        let mut cursor = entry.lock().unwrap();
+        evaluator.set_cancellation_token(entry.cancel.clone());
+        let mut cursor = entry.inner.lock().unwrap();
         if cursor.done {
             return encode(StreamPullResult {
                 cursor: params.cursor,
@@ -71,6 +71,17 @@ impl Kernel {
                     break;
                 }
             }
+        }
+        // `stream.close` cancels before waiting for this cursor lock. Do not
+        // leak a value that completed only because cancellation interrupted a
+        // closure (for example `sleep` or an external command), and make the
+        // racing pull's terminal state agree with the close.
+        if entry.cancel.is_cancelled() {
+            pulled.clear();
+            timed_out = false;
+            terminal_error = None;
+            cursor.done = true;
+            cursor.upstream.take();
         }
         let done = cursor.done;
         drop(cursor);
@@ -116,13 +127,21 @@ impl Kernel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     fn attached(kernel: &Arc<Kernel>) -> (Arc<Session>, Option<Attachment>) {
-        let principal = "wire-stream-test".to_string();
-        let session = kernel.session("wire-stream", &principal).unwrap();
+        attached_for(kernel, "wire-stream-test", "wire-stream")
+    }
+
+    fn attached_for(
+        kernel: &Arc<Kernel>,
+        principal: &str,
+        name: &str,
+    ) -> (Arc<Session>, Option<Attachment>) {
+        let session = kernel.session(name, principal).unwrap();
         let attachment = Attachment {
             session: session.clone(),
-            principal,
+            principal: principal.to_string(),
             can_approve: true,
             tty: false,
             cancel_epoch: None,
@@ -236,7 +255,7 @@ mod tests {
 
         let first = session.stream_cursor(&cursor_refs[0]).unwrap();
         {
-            let mut first = first.lock().unwrap();
+            let mut first = first.inner.lock().unwrap();
             first.upstream.take();
             first.done = true;
         }
@@ -244,5 +263,199 @@ mod tests {
         session
             .stream_cursor(&cursor_refs[MAX_WIRE_STREAM_CURSORS])
             .expect("terminal cursor should be reaped at admission");
+    }
+
+    #[test]
+    fn close_cancels_a_blocked_closure_pull_without_a_trailing_item() {
+        let kernel = Kernel::with_policy(Policy::permissive("wire-stream-test"));
+        let (session, mut attached) = attached(&kernel);
+        let cursor = exec_stream(&kernel, &mut attached, "[1].stream().map(x => sleep(30s))");
+        let pull_cursor = cursor.clone();
+        let pull_kernel = kernel.clone();
+        let pull = std::thread::spawn(move || {
+            pull_kernel.handle_stream_pull(json!({"cursor":pull_cursor,"limit":1}), &mut attached)
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !session.has_stream_cursor(&cursor) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            session.has_stream_cursor(&cursor),
+            "pull never claimed cursor"
+        );
+        let started = Instant::now();
+        assert!(session.close_stream_cursor(&cursor).unwrap());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "close must cancel closure work before waiting for the cursor lock"
+        );
+
+        let response = pull.join().unwrap().unwrap();
+        assert_eq!(response["items"], json!([]));
+        assert_eq!(response["done"], true);
+    }
+
+    #[test]
+    fn cursor_refs_are_private_to_the_exact_principal_session() {
+        let kernel = Kernel::new();
+        let (owner, _) = attached_for(&kernel, "owner-a", "shared-name");
+        let cursor = StreamCursorRef {
+            r#ref: Ref::new("out", 1),
+            path: None,
+        };
+        owner.insert_transcript(
+            cursor.r#ref.clone(),
+            Value::Stream(shoal_value::StreamVal::from_iter(
+                "int",
+                std::iter::once(Ok(Value::Int(1))),
+            )),
+        );
+        let (_, mut intruder) = attached_for(&kernel, "owner-b", "shared-name");
+
+        let error = kernel
+            .handle_stream_pull(json!({"cursor":cursor}), &mut intruder)
+            .unwrap_err();
+        assert_eq!(error.code, UNKNOWN_REF);
+    }
+
+    #[test]
+    fn cursor_lifetime_is_session_owned_across_attachment_disconnect() {
+        let kernel = Kernel::new();
+        let (session, first_attachment) = attached_for(&kernel, "owner-a", "reconnect");
+        let value_ref = Ref::new("out", 1);
+        let cursor = StreamCursorRef {
+            r#ref: value_ref.clone(),
+            path: None,
+        };
+        session.insert_transcript(
+            value_ref,
+            Value::Stream(shoal_value::StreamVal::from_iter(
+                "int",
+                std::iter::once(Ok(Value::Int(7))),
+            )),
+        );
+        drop(first_attachment);
+        drop(session);
+
+        let (_, mut reattached) = attached_for(&kernel, "owner-a", "reconnect");
+        let pulled = kernel
+            .handle_stream_pull(json!({"cursor":cursor}), &mut reattached)
+            .unwrap();
+        assert_eq!(pulled["items"][0]["value"]["v"], 7);
+    }
+
+    struct DropSource(Arc<AtomicBool>);
+
+    impl shoal_value::Upstream for DropSource {
+        fn pull(
+            &mut self,
+            _ctx: &mut dyn shoal_value::CallCtx,
+            _timeout: Option<Duration>,
+        ) -> shoal_value::VResult<shoal_value::Pull> {
+            Ok(shoal_value::Pull::Timeout)
+        }
+    }
+
+    impl Drop for DropSource {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn session_eviction_drops_retained_cursor_upstreams() {
+        let kernel = Kernel::new();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let session = kernel.session("oldest", "eviction-owner").unwrap();
+        let value_ref = Ref::new("out", 1);
+        let cursor = StreamCursorRef {
+            r#ref: value_ref.clone(),
+            path: None,
+        };
+        session.insert_transcript(
+            value_ref,
+            Value::Stream(shoal_value::StreamVal::from_upstream(
+                "idle",
+                false,
+                Box::new(DropSource(dropped.clone())),
+            )),
+        );
+        drop(session.stream_cursor(&cursor).unwrap());
+        drop(session);
+        std::thread::sleep(Duration::from_millis(1));
+
+        for id in 0..MAX_SESSIONS_PER_PRINCIPAL {
+            drop(
+                kernel
+                    .session(&format!("new-{id}"), "eviction-owner")
+                    .unwrap(),
+            );
+        }
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "evicting an unattached session must drop its live cursor sources"
+        );
+    }
+
+    struct FixedLoader {
+        bytes: Vec<u8>,
+        loads: Arc<AtomicUsize>,
+    }
+
+    impl shoal_value::BytesLoad for FixedLoader {
+        fn load(&self) -> std::io::Result<Vec<u8>> {
+            self.loads.fetch_add(1, Ordering::SeqCst);
+            Ok(self.bytes.clone())
+        }
+    }
+
+    #[test]
+    fn cas_stream_items_elide_without_loading_and_remain_fetchable() {
+        let kernel = Kernel::new();
+        let (session, mut attached) = attached(&kernel);
+        let bytes = vec![b'x'; 32 * 1024];
+        let loads = Arc::new(AtomicUsize::new(0));
+        let cas = Value::CasBytes(Arc::new(shoal_value::CasBytesVal {
+            hash: "a".repeat(64),
+            len: bytes.len() as u64,
+            preview: Arc::new(bytes[..64].to_vec()),
+            truncated: false,
+            loader: Arc::new(FixedLoader {
+                bytes: bytes.clone(),
+                loads: loads.clone(),
+            }),
+        }));
+        let value_ref = Ref::new("out", 100);
+        let cursor = StreamCursorRef {
+            r#ref: value_ref.clone(),
+            path: None,
+        };
+        session.insert_transcript(
+            value_ref,
+            Value::Stream(shoal_value::StreamVal::from_iter(
+                "bytes",
+                std::iter::once(Ok(cas)),
+            )),
+        );
+
+        let pulled = kernel
+            .handle_stream_pull(json!({"cursor":cursor,"limit":1}), &mut attached)
+            .unwrap();
+        assert_eq!(pulled["items"][0]["value"]["$"], "ref");
+        assert_eq!(pulled["items"][0]["value"]["of"], "bytes");
+        assert_eq!(loads.load(Ordering::SeqCst), 0);
+
+        let item_ref = pulled["items"][0]["ref"].clone();
+        let raw = kernel
+            .handle_value_get(json!({"ref":item_ref,"format":"raw"}), &mut attached)
+            .unwrap();
+        let decoded = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            raw["raw_base64"].as_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(decoded, bytes);
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
     }
 }

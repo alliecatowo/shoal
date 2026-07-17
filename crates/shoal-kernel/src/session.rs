@@ -79,7 +79,7 @@ pub(crate) struct Session {
     pub(crate) lang_bus: Arc<shoal_eval::EventBus>,
     pub(crate) transcript: Mutex<HashMap<Ref, Value>>,
     pub(crate) next_value: AtomicU64,
-    stream_cursors: Mutex<HashMap<StreamCursorRef, Arc<Mutex<WireStreamCursor>>>>,
+    stream_cursors: Mutex<HashMap<StreamCursorRef, Arc<WireStreamCursorEntry>>>,
 }
 
 pub(crate) const MAX_TRANSCRIPT_PER_SESSION: usize = 4096;
@@ -89,6 +89,17 @@ pub(crate) struct WireStreamCursor {
     pub(crate) upstream: Option<Box<dyn shoal_value::Upstream>>,
     pub(crate) next_seq: u64,
     pub(crate) done: bool,
+}
+
+pub(crate) struct WireStreamCursorEntry {
+    pub(crate) cancel: shoal_exec::CancelToken,
+    pub(crate) inner: Mutex<WireStreamCursor>,
+}
+
+impl Drop for WireStreamCursorEntry {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
 }
 
 impl Session {
@@ -136,7 +147,7 @@ impl Session {
     pub(crate) fn stream_cursor(
         &self,
         cursor: &StreamCursorRef,
-    ) -> Result<Arc<Mutex<WireStreamCursor>>, RpcError> {
+    ) -> Result<Arc<WireStreamCursorEntry>, RpcError> {
         let mut cursors = self.stream_cursors.lock().unwrap();
         if let Some(entry) = cursors.get(cursor) {
             return Ok(entry.clone());
@@ -146,7 +157,7 @@ impl Session {
         // admission boundary so clients do not need to close after observing
         // `done:true` merely to make quota progress.
         if cursors.len() >= MAX_WIRE_STREAM_CURSORS {
-            cursors.retain(|_, entry| !entry.lock().unwrap().done);
+            cursors.retain(|_, entry| !entry.inner.lock().unwrap().done);
         }
         if cursors.len() >= MAX_WIRE_STREAM_CURSORS {
             return Err(RpcError {
@@ -161,11 +172,14 @@ impl Session {
 
         let stream = self.resolve_stream_value(cursor)?;
         let upstream = stream.take_upstream().map_err(stream_error)?;
-        let entry = Arc::new(Mutex::new(WireStreamCursor {
-            upstream: Some(upstream),
-            next_seq: 0,
-            done: false,
-        }));
+        let entry = Arc::new(WireStreamCursorEntry {
+            cancel: shoal_exec::CancelToken::new(),
+            inner: Mutex::new(WireStreamCursor {
+                upstream: Some(upstream),
+                next_seq: 0,
+                done: false,
+            }),
+        });
         cursors.insert(cursor.clone(), entry.clone());
         Ok(entry)
     }
@@ -176,9 +190,11 @@ impl Session {
     pub(crate) fn close_stream_cursor(&self, cursor: &StreamCursorRef) -> Result<bool, RpcError> {
         if let Some(entry) = self.stream_cursors.lock().unwrap().remove(cursor) {
             // A concurrent pull may already hold this entry after releasing
-            // the registry map. Wait for that bounded pull, then take/drop the
-            // upstream before reporting close complete.
-            let mut entry = entry.lock().unwrap();
+            // the registry map. Cancel evaluator work before waiting for the
+            // cursor lock, then take/drop the upstream before reporting close
+            // complete.
+            entry.cancel.cancel();
+            let mut entry = entry.inner.lock().unwrap();
             entry.upstream.take();
             entry.done = true;
             return Ok(true);
@@ -218,6 +234,11 @@ impl Session {
                 data: Some(json!({"ref":cursor.r#ref,"path":cursor.path})),
             }),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_stream_cursor(&self, cursor: &StreamCursorRef) -> bool {
+        self.stream_cursors.lock().unwrap().contains_key(cursor)
     }
 }
 
