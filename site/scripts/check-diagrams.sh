@@ -54,8 +54,8 @@ for file in "$site_root"/content/internals/*.md; do
 done
 
 total=$((public_total + internal_total))
-if [ "$public_total" -ne 23 ] || [ "$internal_total" -ne 100 ] || [ "$total" -ne 123 ]; then
-  echo "diagram inventory mismatch: Manual=$public_total Architecture=$internal_total total=$total; expected 23/100/123" >&2
+if [ "$public_total" -ne 23 ] || [ "$internal_total" -ne 101 ] || [ "$total" -ne 124 ]; then
+  echo "diagram inventory mismatch: Manual=$public_total Architecture=$internal_total total=$total; expected 23/101/124" >&2
   exit 1
 fi
 

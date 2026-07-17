@@ -576,22 +576,9 @@ registers the subscription or starts the spawn is made under the session lock.
    would need to distinguish legitimate wide pipelines from runaway fan-out, which is a policy design
    question, not a mechanical `Limits` addition.
 
-```mermaid
-flowchart TB
-accTitle: Kernel concurrency model - threads, locks, and quota coverage
-accDescr: Every thread-spawn site in the kernel and evaluator, the lock each contends for, and which quota if any bounds it. The session evaluator mutex is the central serialization point; in-language spawn, parallel, on, and stream threads bypass it into their own child evaluators but are not counted by any kernel quota.
-  Accept["serve_until accept loop"]
-  Accept -->|"thread per connection, capped by max_connections"| Conn["connection thread: handle_stream"]
-  Conn -->|"session.attach: check_session_quota, capped by max_sessions"| Sessions["Kernel.sessions map"]
-  Sessions --> Eval["Session.evaluator mutex: the serialization point"]
-  Conn -->|"exec run or plan or approved: holds Eval for the whole call"| Eval
-  Conn -->|"exec background or timeout: thread per task, capped by max_tasks_per_session"| TaskThread["task thread"]
-  TaskThread -->|"re-enters dispatch, also locks"| Eval
-  Conn -->|"pty.open: thread per PTY, capped by max_ptys_per_session"| PtyThread["PTY reader thread: pump_into_parser"]
-  Conn -->|"events.subscribe: thread per subscription, capped by max_subscriptions_per_session"| SubThread["subscription writer thread"]
-  Eval -->|"on(), spawn{}, parallel(), stream buffer(n): not counted by any Limits quota"| ChildEval["child evaluator thread(s): own lock, HR-B1 constructor"]
-  ChildEval -.->|"parallel() only: caller joins before returning"| Eval
-```
+The thread-spawn sites and their quota coverage are enumerated in the thread-inventory and
+lock-scope tables above; the dynamic consequence — a slow eval on one principal blocking a
+session-mate through the shared per-session evaluator mutex — is what the sequence below shows.
 
 ```mermaid
 sequenceDiagram
