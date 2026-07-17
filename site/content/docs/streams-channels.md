@@ -103,7 +103,7 @@ Current stream-specific combinators are:
 | `map(f)` | transform each item |
 | `where(f)` / `filter(f)` | retain items whose predicate is true |
 | `scan(initial, f)` | emit running state |
-| `flat_map(f)` | emit items from each returned collection/stream shape supported by runtime |
+| `flat_map(f)` | emit items from each returned collection/substream, one source drained fully at a time (sequential, not interleaved) |
 | `take(n)` | stop after `n`; makes the stream bounded |
 | `take_until(f_or_stream)` | stop when predicate triggers or another stream produces |
 | `dedupe()` | drop adjacent duplicates |

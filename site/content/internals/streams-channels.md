@@ -215,7 +215,7 @@ length shrinks; rename/replacement behavior beyond that depends on platform `not
 | `map(f)` | one upstream item, returns `f(item)` |
 | `where`/`filter(f)` | loops until `f(item).as_condition()` is true |
 | `scan(init,f)` | stores accumulator, emits every updated accumulator |
-| `flat_map(f)` | drains returned stream or queued list/table/range before next outer item |
+| `flat_map(f)` | sequential: drains each returned stream or queued list/table/range to its end before the next outer item; substreams are never interleaved |
 | `take(n)` | decrements remaining count and ends at zero |
 | `take_until(predicate)` | consumes triggering item and ends without emitting it |
 | `take_until(stream)` | polls signal stream and primary source in 20 ms steps |
@@ -230,6 +230,14 @@ length shrinks; rename/replacement behavior beyond that depends on platform `not
 | `merge(other)` | polls A then B in 20 ms steps until both end |
 | `zip(other)` | pulls A then B and emits `[a,b]`; ends/times out with either pull |
 
+
+`flat_map` is pinned to sequential semantics (HR-G2, audit I3; case
+`stream-flat-map-substreams-drain-sequentially`): the current substream is drained to `End` before
+the next outer item is pulled, and substream items are never interleaved. Interleaving is not
+implementable under the synchronous pull model without a background pump per substream, and the
+sequential order is what existing corpus cases pin. Consequence: a live/endless substream blocks the
+whole `flat_map` on itself forever — bound substreams (`.take`/`.take_until`) before returning them
+from `f`.
 
 `distinct` membership is amortized O(1) (HR-G5): seen values are bucketed by a canonical hash whose
 contract is `a == b ⟹ same bucket`, and a bucket is confirmed with `Value`'s real `PartialEq`, so the
