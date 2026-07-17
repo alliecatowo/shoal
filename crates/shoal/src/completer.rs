@@ -60,6 +60,10 @@ enum Ctx {
 pub struct ShoalCompleter {
     env: Env,
     cwd: Arc<Mutex<PathBuf>>,
+    /// Executable search directories from the session that will execute the
+    /// command. Attached REPLs cannot use the client's process PATH: the
+    /// kernel session may have changed PATH independently.
+    path_dirs: Option<Arc<Mutex<Option<Vec<PathBuf>>>>>,
     adapters: Vec<AdapterCatalog>,
     adapter_names: Vec<String>,
     path_cache: HashMap<PathBuf, (Option<SystemTime>, Vec<String>)>,
@@ -90,6 +94,7 @@ impl ShoalCompleter {
         Self {
             env,
             cwd,
+            path_dirs: None,
             adapters,
             adapter_names,
             path_cache: HashMap::new(),
@@ -109,6 +114,14 @@ impl ShoalCompleter {
         self
     }
 
+    /// Use a live, sanitized session PATH projection. `None` inside the cell
+    /// means an older remote omitted the projection, in which case retaining
+    /// the process-PATH fallback preserves protocol compatibility.
+    pub(crate) fn with_path_dirs(mut self, path_dirs: Arc<Mutex<Option<Vec<PathBuf>>>>) -> Self {
+        self.path_dirs = Some(path_dirs);
+        self
+    }
+
     fn cwd(&self) -> PathBuf {
         self.cwd
             .lock()
@@ -121,16 +134,28 @@ impl ShoalCompleter {
     /// before) — cheap enough to call on every Tab press.
     fn path_names(&mut self) -> Vec<String> {
         let mut out = Vec::new();
-        let Some(path_var) = std::env::var_os("PATH") else {
-            return out;
-        };
-        let cwd = self.cwd();
-        for dir in std::env::split_paths(&path_var) {
-            let dir = if dir.is_absolute() {
-                dir
-            } else {
-                cwd.join(dir)
+        let configured = self
+            .path_dirs
+            .as_ref()
+            .and_then(|dirs| dirs.lock().ok().and_then(|dirs| dirs.clone()));
+        let dirs = if let Some(dirs) = configured {
+            dirs
+        } else {
+            let Some(path_var) = std::env::var_os("PATH") else {
+                return out;
             };
+            let cwd = self.cwd();
+            std::env::split_paths(&path_var)
+                .map(|dir| {
+                    if dir.is_absolute() {
+                        dir
+                    } else {
+                        cwd.join(dir)
+                    }
+                })
+                .collect()
+        };
+        for dir in dirs {
             out.extend(self.path_dir_names(&dir));
         }
         out
@@ -1248,6 +1273,26 @@ mod tests {
         let mut second = c.path_dir_names(dir.path());
         second.sort();
         assert_eq!(second, vec!["toolone".to_string(), "tooltwo".to_string()]);
+    }
+
+    #[test]
+    fn path_names_follow_the_executing_session_not_the_client_process() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("remote-only-tool"), b"").unwrap();
+        fs::set_permissions(
+            dir.path().join("remote-only-tool"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let session_dirs = Arc::new(Mutex::new(Some(vec![dir.path().to_path_buf()])));
+        let mut c = completer_at(Path::new(".")).with_path_dirs(session_dirs.clone());
+
+        assert_eq!(c.path_names(), vec!["remote-only-tool".to_string()]);
+
+        // An explicit empty PATH is different from an omitted old-protocol
+        // projection and must not silently fall back to the client's PATH.
+        *session_dirs.lock().unwrap() = Some(Vec::new());
+        assert!(c.path_names().is_empty());
     }
 
     #[test]

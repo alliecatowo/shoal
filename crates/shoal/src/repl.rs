@@ -4,6 +4,7 @@
 //! needs.
 
 use std::collections::VecDeque;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
@@ -94,10 +95,31 @@ fn refresh_protocol_state(
     mirror: &mut RemoteEnvMirror,
     env: &Env,
     cwd: &Arc<Mutex<PathBuf>>,
+    path_dirs: &Arc<Mutex<Option<Vec<PathBuf>>>>,
 ) -> Result<ProtocolSnapshot, String> {
     let snapshot = ProtocolSnapshot::parse(session.snapshot()?)?;
-    mirror.apply(&snapshot, env, cwd);
+    mirror.apply(&snapshot, env, cwd, path_dirs);
     Ok(snapshot)
+}
+
+fn session_path_dirs(env_vars: &[(OsString, OsString)], cwd: &std::path::Path) -> Vec<PathBuf> {
+    let Some((_, path)) = env_vars
+        .iter()
+        .rev()
+        .find(|(name, _)| name == OsStr::new("PATH"))
+    else {
+        return Vec::new();
+    };
+    std::env::split_paths(path)
+        .map(|dir| {
+            if dir.is_absolute() {
+                dir
+            } else {
+                cwd.join(dir)
+            }
+        })
+        .take(256)
+        .collect()
 }
 
 pub(crate) fn repl(standalone: bool) -> Result<i32, String> {
@@ -233,6 +255,7 @@ pub(crate) fn repl(standalone: bool) -> Result<i32, String> {
     }
 
     let cwd_cell = Arc::new(Mutex::new(evaluator.cwd().to_path_buf()));
+    let completion_path_dirs = Arc::new(Mutex::new(None));
     let mut remote_env = RemoteEnvMirror::default();
     let mut protocol_snapshot = if let Some(session) = protocol.as_mut() {
         Some(refresh_protocol_state(
@@ -240,8 +263,12 @@ pub(crate) fn repl(standalone: bool) -> Result<i32, String> {
             &mut remote_env,
             evaluator.env(),
             &cwd_cell,
+            &completion_path_dirs,
         )?)
     } else {
+        if let Ok(mut cell) = completion_path_dirs.lock() {
+            *cell = Some(session_path_dirs(evaluator.env_vars(), evaluator.cwd()));
+        }
         None
     };
     let completer = ShoalCompleter::new(
@@ -250,6 +277,7 @@ pub(crate) fn repl(standalone: bool) -> Result<i32, String> {
         catalogs,
         adapter_names,
     )
+    .with_path_dirs(completion_path_dirs.clone())
     .configure(
         config.completion.fuzzy,
         config.completion.case_insensitive,
@@ -375,7 +403,13 @@ pub(crate) fn repl(standalone: bool) -> Result<i32, String> {
         // Keep the completer's cwd view and the cancel handler's active
         // token fresh for the statement about to run.
         if let Some(session) = protocol.as_mut() {
-            match refresh_protocol_state(session, &mut remote_env, evaluator.env(), &cwd_cell) {
+            match refresh_protocol_state(
+                session,
+                &mut remote_env,
+                evaluator.env(),
+                &cwd_cell,
+                &completion_path_dirs,
+            ) {
                 Ok(snapshot) => {
                     protocol_snapshot = Some(snapshot);
                 }
@@ -385,6 +419,9 @@ pub(crate) fn repl(standalone: bool) -> Result<i32, String> {
             }
         } else if let Ok(mut cell) = cwd_cell.lock() {
             *cell = evaluator.cwd().to_path_buf();
+            if let Ok(mut paths) = completion_path_dirs.lock() {
+                *paths = Some(session_path_dirs(evaluator.env_vars(), evaluator.cwd()));
+            }
         }
         evaluator.reset_cancel();
         if let Ok(mut token) = cancel_slot.lock() {
@@ -841,10 +878,10 @@ fn drain_background_job_events(evaluator: &mut Evaluator, events: &Receiver<Back
             }
             BackgroundJobEvent::Stopped { id, notified, .. } => {
                 evaluator.mark_external_stopped(id);
-                if let Some((id, desc)) = evaluator.take_pending_stop() {
-                    if !notified {
-                        print_stopped_notice(id, &desc);
-                    }
+                if let Some((id, desc)) = evaluator.take_pending_stop()
+                    && !notified
+                {
+                    print_stopped_notice(id, &desc);
                 }
             }
             BackgroundJobEvent::Failed {
@@ -1166,6 +1203,7 @@ mod tests {
             outcome: Ok(protocol_outcome(None, "completed")),
             snapshot: Ok(serde_json::json!({
                 "cwd": {"display": "/remote/project"},
+                "completion": {"path_dirs": [{"display": "/remote/project/bin"}]},
                 "bindings": [
                     {"name": "deploy", "callable": true, "type": "command"},
                     {"name": "answer", "callable": false, "type": "int"}
@@ -1177,12 +1215,22 @@ mod tests {
         };
         let env = Env::root();
         let cwd = Arc::new(Mutex::new(PathBuf::new()));
-        let snapshot =
-            refresh_protocol_state(&mut protocol, &mut RemoteEnvMirror::default(), &env, &cwd)
-                .unwrap();
+        let path_dirs = Arc::new(Mutex::new(None));
+        let snapshot = refresh_protocol_state(
+            &mut protocol,
+            &mut RemoteEnvMirror::default(),
+            &env,
+            &cwd,
+            &path_dirs,
+        )
+        .unwrap();
 
         assert_eq!(snapshot.jobs.running, 1);
         assert_eq!(*cwd.lock().unwrap(), PathBuf::from("/remote/project"));
+        assert_eq!(
+            *path_dirs.lock().unwrap(),
+            Some(vec![PathBuf::from("/remote/project/bin")])
+        );
         assert!(env.get("deploy").is_some_and(|value| value.is_callable()));
         assert!(matches!(env.get("answer"), Some(Value::Int(0))));
     }

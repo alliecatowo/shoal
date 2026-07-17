@@ -37,6 +37,10 @@ pub(crate) struct ProtocolReefBinding {
 #[derive(Debug, Clone)]
 pub(crate) struct ProtocolSnapshot {
     pub(crate) cwd: PathBuf,
+    /// Absolute executable-search directories from the attached evaluator.
+    /// This deliberately projects only PATH semantics, never the session's
+    /// arbitrary environment variables.
+    pub(crate) completion_path_dirs: Option<Vec<PathBuf>>,
     pub(crate) bindings: Vec<ProtocolBinding>,
     pub(crate) jobs: ProtocolJobs,
     pub(crate) reef: Vec<ProtocolReefBinding>,
@@ -60,6 +64,28 @@ impl ProtocolSnapshot {
                 .decode()
                 .map_err(|error| format!("session.snapshot cwd encoding: {error}"))?,
         );
+        let completion_path_dirs = object
+            .get("completion")
+            .and_then(|completion| completion.get("path_dirs"))
+            .map(|paths| {
+                paths
+                    .as_array()
+                    .ok_or_else(|| {
+                        "session.snapshot completion.path_dirs is not an array".to_string()
+                    })?
+                    .iter()
+                    .map(|path| {
+                        let wire: WirePath =
+                            serde_json::from_value(path.clone()).map_err(|error| {
+                                format!("session.snapshot completion.path_dirs: {error}")
+                            })?;
+                        wire.decode().map(PathBuf::from).map_err(|error| {
+                            format!("session.snapshot completion.path_dirs encoding: {error}")
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()
+            })
+            .transpose()?;
         let bindings = object
             .get("bindings")
             .and_then(Json::as_array)
@@ -117,6 +143,7 @@ impl ProtocolSnapshot {
         .map_err(|error| format!("session.snapshot last_value: {error}"))?;
         Ok(Self {
             cwd,
+            completion_path_dirs,
             bindings,
             jobs,
             reef,
@@ -159,6 +186,7 @@ impl RemoteEnvMirror {
         snapshot: &ProtocolSnapshot,
         env: &Env,
         cwd: &Arc<Mutex<PathBuf>>,
+        path_dirs: &Arc<Mutex<Option<Vec<PathBuf>>>>,
     ) {
         let incoming = snapshot
             .bindings
@@ -174,6 +202,9 @@ impl RemoteEnvMirror {
         self.names = incoming;
         if let Ok(mut cell) = cwd.lock() {
             *cell = snapshot.cwd.clone();
+        }
+        if let Ok(mut cell) = path_dirs.lock() {
+            *cell = snapshot.completion_path_dirs.clone();
         }
     }
 }
@@ -238,6 +269,7 @@ mod tests {
     fn mirror_refreshes_callable_classification_and_removes_stale_names() {
         let env = Env::root();
         let cwd = Arc::new(Mutex::new(PathBuf::new()));
+        let path_dirs = Arc::new(Mutex::new(None));
         let mut mirror = RemoteEnvMirror::default();
         mirror.apply(
             &snapshot(json!([
@@ -246,13 +278,37 @@ mod tests {
             ])),
             &env,
             &cwd,
+            &path_dirs,
         );
         assert!(env.get("deploy").is_some_and(|value| value.is_callable()));
         assert!(matches!(env.get("count"), Some(Value::Int(0))));
-        mirror.apply(&snapshot(json!([])), &env, &cwd);
+        mirror.apply(&snapshot(json!([])), &env, &cwd, &path_dirs);
         assert!(env.get("deploy").is_none());
         assert!(env.get("count").is_none());
         assert_eq!(*cwd.lock().unwrap(), PathBuf::from("/work"));
+    }
+
+    #[test]
+    fn snapshot_decodes_only_the_explicit_completion_path_projection() {
+        let parsed = ProtocolSnapshot::parse(json!({
+            "cwd":{"display":"/remote"},
+            "completion":{"path_dirs":[
+                {"display":"/remote/bin"},
+                {"display":"/opt/tools"}
+            ]},
+            "bindings":[],
+            "jobs":{"running":0,"suspended":0,"total":0},
+            "reef":{"bindings":[]},
+            "last_value":{"$":"null"}
+        }))
+        .unwrap();
+        assert_eq!(
+            parsed.completion_path_dirs,
+            Some(vec![
+                PathBuf::from("/remote/bin"),
+                PathBuf::from("/opt/tools")
+            ])
+        );
     }
 
     #[test]

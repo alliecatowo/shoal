@@ -616,9 +616,38 @@ impl Kernel {
         let jobs = evaluator.jobs_snapshot();
         let last_value = wire_value(evaluator.it());
         let cwd = WirePath::encode(evaluator.cwd().as_os_str());
+        // Project only the information completion actually needs. Shipping
+        // the full process environment would expose unrelated secrets; raw
+        // PATH would also leave relative entries ambiguous on the client.
+        // Resolve, deduplicate, and bound the directory list server-side.
+        let mut completion_dirs = Vec::<PathBuf>::new();
+        if let Some((_, path)) = evaluator
+            .env_vars()
+            .iter()
+            .rev()
+            .find(|(name, _)| name.as_bytes() == b"PATH")
+        {
+            for dir in std::env::split_paths(path).take(256) {
+                let dir = if dir.is_absolute() {
+                    dir
+                } else {
+                    evaluator.cwd().join(dir)
+                };
+                if !completion_dirs.contains(&dir) {
+                    completion_dirs.push(dir);
+                }
+            }
+        }
+        let completion_dirs = completion_dirs
+            .iter()
+            .map(|dir| WirePath::encode(dir.as_os_str()))
+            .collect::<Vec<_>>();
         let reef = evaluator.prompt_reef_snapshot();
         Ok(json!({
             "cwd": cwd,
+            "completion": {
+                "path_dirs": completion_dirs,
+            },
             "bindings": bindings,
             "jobs": {
                 "running": jobs.running,
@@ -919,5 +948,29 @@ mod poison_tests {
         kernel
             .handle_session_snapshot(&attachment(healthy))
             .expect("a different session remains healthy");
+    }
+
+    #[test]
+    fn snapshot_exposes_a_bounded_path_projection_not_arbitrary_environment() {
+        let kernel = Kernel::new();
+        let session = kernel.session("completion", "principal:test").unwrap();
+        let snapshot = kernel
+            .handle_session_snapshot(&attachment(session))
+            .expect("healthy snapshot");
+
+        assert!(snapshot.get("env").is_none());
+        assert!(snapshot.get("environment").is_none());
+        let paths = snapshot["completion"]["path_dirs"]
+            .as_array()
+            .expect("completion path projection");
+        assert!(paths.len() <= 256);
+        for path in paths {
+            let path: WirePath = serde_json::from_value(path.clone()).unwrap();
+            let decoded = PathBuf::from(path.decode().unwrap());
+            assert!(
+                decoded.is_absolute(),
+                "projected path was relative: {decoded:?}"
+            );
+        }
     }
 }
