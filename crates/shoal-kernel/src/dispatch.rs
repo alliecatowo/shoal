@@ -120,7 +120,10 @@ impl Kernel {
 }
 
 impl Kernel {
-    fn ensure_attachment_current(&self, attachment: &Attachment) -> Result<(), RpcError> {
+    pub(crate) fn ensure_attachment_current(
+        &self,
+        attachment: &Attachment,
+    ) -> Result<(), RpcError> {
         if attachment.security_epoch != ATTACH_SECURITY_EPOCH {
             return Err(RpcError {
                 code: AUTH_FAILED,

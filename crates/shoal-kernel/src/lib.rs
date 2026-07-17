@@ -579,12 +579,38 @@ impl Kernel {
                 // within the deadline. Once attached, an entirely idle client
                 // may remain subscribed indefinitely; after the first byte of
                 // any new frame, however, the same deadline bounds completion.
-                set_read_deadline(
-                    reader.get_ref(),
-                    (attached.is_none() && timeout_ms != 0).then_some(timeout_ms),
-                )?;
-                if reader.fill_buf()?.is_empty() {
-                    break;
+                let bearer_idle_recheck = attached
+                    .as_ref()
+                    .is_some_and(|attachment| attachment.bearer.is_some());
+                let wait_timeout = if attached.is_none() && timeout_ms != 0 {
+                    Some(timeout_ms)
+                } else if bearer_idle_recheck {
+                    // Disabling the frame deadline must not disable bearer
+                    // revocation. Otherwise use the configured deadline as
+                    // the maximum stale-authority window as well.
+                    Some(if timeout_ms == 0 { 10_000 } else { timeout_ms })
+                } else {
+                    None
+                };
+                set_read_deadline(reader.get_ref(), wait_timeout)?;
+                match reader.fill_buf() {
+                    Ok([]) => break,
+                    Ok(_) => {}
+                    Err(error) if bearer_idle_recheck && is_read_timeout(&error) => {
+                        let validity = attached
+                            .as_ref()
+                            .expect("bearer recheck requires an attachment");
+                        if let Err(error) = self.ensure_attachment_current(validity) {
+                            self.events.remove_conn(client);
+                            attached = None;
+                            return Err(io::Error::new(
+                                io::ErrorKind::PermissionDenied,
+                                error.message,
+                            ));
+                        }
+                        continue;
+                    }
+                    Err(error) => return Err(error),
                 }
                 set_read_deadline(reader.get_ref(), (timeout_ms != 0).then_some(timeout_ms))?;
                 let Some(request) = read_frame(&mut reader)? else {
@@ -729,6 +755,13 @@ impl Kernel {
 
 fn set_read_deadline(stream: &UnixStream, timeout_ms: Option<u64>) -> io::Result<()> {
     stream.set_read_timeout(timeout_ms.map(std::time::Duration::from_millis))
+}
+
+fn is_read_timeout(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+    )
 }
 
 fn task_record(task: &Arc<TaskEntry>) -> TaskRecord {
@@ -2700,6 +2733,54 @@ mod tests {
         drop(client);
         drop(reader);
         thread.join().unwrap();
+    }
+
+    #[test]
+    fn idle_revoked_bearer_is_disconnected_and_loses_subscriptions() {
+        use std::io::Read;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut tokens = TokenStore::open(dir.path().join("tokens.json")).unwrap();
+        let (secret, meta) = tokens
+            .create("agent:idle".into(), "readonly".into(), vec![], None)
+            .unwrap();
+        let kernel = Kernel::open(dir.path()).unwrap();
+        kernel.configure_limits(Limits {
+            frame_read_timeout_ms: 40,
+            ..Limits::default()
+        });
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        let worker_kernel = kernel.clone();
+        let worker = std::thread::spawn(move || worker_kernel.handle_stream(server));
+        let attached = call(
+            &mut client,
+            &mut reader,
+            1,
+            "session.attach",
+            json!({"token":secret,"client":{"kind":"agent","tty":false}}),
+        );
+        assert!(attached.error.is_none());
+        let subscribed = call(
+            &mut client,
+            &mut reader,
+            2,
+            "events.subscribe",
+            json!({"channel":"user.revoked"}),
+        );
+        assert!(subscribed.error.is_none());
+        assert_eq!(kernel.events.subscriber_count(), 1);
+
+        let mut revoker = TokenStore::open(dir.path().join("tokens.json")).unwrap();
+        assert!(revoker.revoke(&meta.id).unwrap());
+        let mut byte = [0u8; 1];
+        assert_eq!(client.read(&mut byte).unwrap(), 0);
+        let error = worker.join().unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(kernel.events.subscriber_count(), 0);
     }
 
     #[test]
