@@ -53,7 +53,7 @@ use std::sync::{Arc, Mutex};
 
 pub use cancel::CancelToken;
 pub use capture::{StreamingChild, spawn_capture};
-pub use pty::{PtyJob, shutdown_stopped_jobs, take_stopped_job};
+pub use pty::{PtyJob, shutdown_stopped_jobs, take_background_job, take_stopped_job};
 pub use pty_session::{
     PTY_DEFAULT_COLS, PTY_DEFAULT_ROWS, PTY_MAX_COLS, PTY_MAX_ROWS, PtyOpenSpec, PtySession,
     ScreenSnapshot, named_key,

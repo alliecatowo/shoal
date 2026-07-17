@@ -35,6 +35,7 @@ use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -43,7 +44,9 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 use shoal_leash::EnforcementStatus;
 
 use crate::cancel::CancelToken;
-use crate::status::{decode_wait_status, is_stopped, waitpid_blocking, waitpid_untraced};
+use crate::status::{
+    decode_wait_status, is_stopped, waitpid_blocking, waitpid_untraced, waitpid_untraced_nohang,
+};
 use crate::watcher::spawn_cancel_watcher;
 use crate::which::resolve_program;
 use crate::{ExecResult, ExecSpec, StdinSpec};
@@ -63,6 +66,15 @@ const PUMP_DRAIN_GRACE: Duration = Duration::from_millis(500);
 /// because job control is inherently a per-process singleton (there is one
 /// controlling terminal). Keyed by pid at [`take_stopped_job`].
 static PARKED_JOBS: Mutex<VecDeque<PtyJob>> = Mutex::new(VecDeque::new());
+/// Detached background PTY workers that can transfer their live `PtyJob`
+/// ownership back to the host for `fg`. Only lightweight command senders live
+/// in this process-global registry; the worker remains the sole job owner.
+static BACKGROUND_JOBS: Mutex<Vec<(u32, Sender<BackgroundCommand>)>> = Mutex::new(Vec::new());
+
+enum BackgroundCommand {
+    Foreground(SyncSender<PtyJob>),
+    Shutdown,
+}
 
 fn pty_err(e: anyhow::Error) -> io::Error {
     // portable-pty wraps operating-system failures in anyhow. Preserve the
@@ -310,6 +322,8 @@ enum Feed {
 enum Wait {
     Exited(i32),
     Stopped,
+    Foreground(SyncSender<PtyJob>),
+    Shutdown,
 }
 
 /// A PTY foreground command and everything needed to keep it alive across a
@@ -376,7 +390,13 @@ impl PtyJob {
     /// Attach helpers (stdin forward + output pump + cancel watcher), optionally
     /// `SIGCONT` the group (on resume), then wait — observing a stop. Keeps the
     /// master and child alive on every path.
-    fn serve(&mut self, cancel: &CancelToken, foreground: bool, resume: bool) -> io::Result<Wait> {
+    fn serve(
+        &mut self,
+        cancel: &CancelToken,
+        foreground: bool,
+        resume: bool,
+        background_commands: Option<&Receiver<BackgroundCommand>>,
+    ) -> io::Result<Wait> {
         // Raw mode only when actually forwarding a real terminal; restored on
         // every exit path (panics included) when the guard drops.
         let _raw = if foreground && self.forward_tty {
@@ -447,9 +467,16 @@ impl PtyJob {
         // serve's helpers have observed shutdown. An early `?` here strands
         // the pump and cancellation watcher indefinitely.
         let waited = if resume {
-            self.signal_cont().and_then(|()| waitpid_untraced(self.pid))
+            self.signal_cont().and_then(|()| {
+                background_commands.map_or_else(
+                    || waitpid_untraced(self.pid).map(Wait::Exited),
+                    |commands| self.wait_background(commands),
+                )
+            })
+        } else if let Some(commands) = background_commands {
+            self.wait_background(commands)
         } else {
-            waitpid_untraced(self.pid)
+            waitpid_untraced(self.pid).map(Wait::Exited)
         };
 
         // Tear down this serve's helpers. Identical for stop and exit — the
@@ -473,14 +500,24 @@ impl PtyJob {
 
         // A stop does NOT reap the child; terminal statuses are decoded by the
         // caller after every helper belonging to this serve has retired.
-        let raw = waited?;
-        let stopped = is_stopped(raw);
+        match waited? {
+            Wait::Exited(raw) if is_stopped(raw) => Ok(Wait::Stopped),
+            transition => Ok(transition),
+        }
+    }
 
-        Ok(if stopped {
-            Wait::Stopped
-        } else {
-            Wait::Exited(raw)
-        })
+    fn wait_background(&self, commands: &Receiver<BackgroundCommand>) -> io::Result<Wait> {
+        loop {
+            if let Some(raw) = waitpid_untraced_nohang(self.pid)? {
+                return Ok(Wait::Exited(raw));
+            }
+            match commands.try_recv() {
+                Ok(BackgroundCommand::Foreground(reply)) => return Ok(Wait::Foreground(reply)),
+                Ok(BackgroundCommand::Shutdown) => return Ok(Wait::Shutdown),
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => {}
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
     }
 
     /// Build the terminal-exit result and mark the child reaped.
@@ -553,13 +590,29 @@ impl PtyJob {
     /// # Errors
     /// Propagates a `waitpid`/pty-plumbing [`io::Error`].
     pub fn resume_foreground(mut self, cancel: &CancelToken) -> io::Result<ExecResult> {
-        match self.serve(cancel, true, true)? {
+        match self.serve(cancel, true, true, None)? {
             Wait::Exited(raw) => Ok(self.exit_result(raw)),
             Wait::Stopped => {
                 let res = self.stopped_result();
                 park_job(self);
                 Ok(res)
             }
+            Wait::Foreground(_) | Wait::Shutdown => unreachable!("no background control channel"),
+        }
+    }
+
+    /// Attach the foreground terminal to a job already running in the
+    /// background. Unlike [`PtyJob::resume_foreground`], this does not send
+    /// SIGCONT: ownership transfer did not stop the process group.
+    pub fn foreground_running(mut self, cancel: &CancelToken) -> io::Result<ExecResult> {
+        match self.serve(cancel, true, false, None)? {
+            Wait::Exited(raw) => Ok(self.exit_result(raw)),
+            Wait::Stopped => {
+                let result = self.stopped_result();
+                park_job(self);
+                Ok(result)
+            }
+            Wait::Foreground(_) | Wait::Shutdown => unreachable!("no background control channel"),
         }
     }
 
@@ -581,21 +634,34 @@ impl PtyJob {
     where
         F: FnOnce(io::Result<ExecResult>) + Send + 'static,
     {
-        self.forward_tty = false;
+        let pid = self.pid();
+        let (commands_tx, commands_rx) = mpsc::channel();
+        register_background_job(pid, commands_tx);
         thread::spawn(move || {
             let cancel = CancelToken::new();
-            match self.serve(&cancel, false, true) {
+            match self.serve(&cancel, false, true, Some(&commands_rx)) {
                 Ok(Wait::Exited(raw)) => {
+                    remove_background_job(pid);
                     notify(Ok(self.exit_result(raw)));
                 }
                 // Stopped again in the background (unusual): re-park so a later
                 // `fg` can still find it.
                 Ok(Wait::Stopped) => {
+                    remove_background_job(pid);
                     let result = self.stopped_result();
                     park_job(self);
                     notify(Ok(result));
                 }
+                Ok(Wait::Foreground(reply)) => {
+                    remove_background_job(pid);
+                    let _ = reply.send(self);
+                }
+                Ok(Wait::Shutdown) => {
+                    remove_background_job(pid);
+                    self.kill_and_reap();
+                }
                 Err(error) => {
+                    remove_background_job(pid);
                     self.kill_and_reap();
                     notify(Err(error));
                 }
@@ -609,6 +675,49 @@ impl Drop for PtyJob {
         // A job dropped without a clean reap — e.g. a parked job abandoned when
         // the shell exits — must not leave a stopped child orphaned.
         self.kill_and_reap();
+    }
+}
+
+fn register_background_job(pid: u32, commands: Sender<BackgroundCommand>) {
+    if let Ok(mut jobs) = BACKGROUND_JOBS.lock() {
+        jobs.retain(|(registered, _)| *registered != pid);
+        jobs.push((pid, commands));
+    }
+}
+
+fn remove_background_job(pid: u32) {
+    if let Ok(mut jobs) = BACKGROUND_JOBS.lock() {
+        jobs.retain(|(registered, _)| *registered != pid);
+    }
+}
+
+/// Request ownership of a still-running background PTY. The worker first
+/// retires its detached output pump, then moves the live job through this
+/// one-shot channel. `None` means the child completed or stopped before the
+/// request won the race.
+pub fn take_background_job(pid: u32) -> io::Result<Option<PtyJob>> {
+    let commands = BACKGROUND_JOBS.lock().ok().and_then(|jobs| {
+        jobs.iter()
+            .find(|(registered, _)| *registered == pid)
+            .map(|(_, commands)| commands.clone())
+    });
+    let Some(commands) = commands else {
+        return Ok(None);
+    };
+    let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+    if commands
+        .send(BackgroundCommand::Foreground(reply_tx))
+        .is_err()
+    {
+        return Ok(None);
+    }
+    match reply_rx.recv_timeout(Duration::from_secs(2)) {
+        Ok(job) => Ok(Some(job)),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Ok(None),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "background PTY ownership transfer timed out",
+        )),
     }
 }
 
@@ -632,6 +741,11 @@ pub fn take_stopped_job(pid: u32) -> Option<PtyJob> {
 /// host calls this on shutdown so stopped children are not left orphaned when
 /// the shell exits (statics are not dropped at process exit).
 pub fn shutdown_stopped_jobs() {
+    if let Ok(mut jobs) = BACKGROUND_JOBS.lock() {
+        for (_, commands) in jobs.drain(..) {
+            let _ = commands.send(BackgroundCommand::Shutdown);
+        }
+    }
     if let Ok(mut jobs) = PARKED_JOBS.lock() {
         jobs.clear();
     }
@@ -752,13 +866,14 @@ pub(crate) fn run_pty(mut spec: ExecSpec, cancel: &CancelToken) -> io::Result<Ex
         reaped: false,
     };
 
-    match job.serve(cancel, true, false) {
+    match job.serve(cancel, true, false, None) {
         Ok(Wait::Exited(raw)) => Ok(job.exit_result(raw)),
         Ok(Wait::Stopped) => {
             let res = job.stopped_result();
             park_job(job);
             Ok(res)
         }
+        Ok(Wait::Foreground(_) | Wait::Shutdown) => unreachable!("no background control channel"),
         Err(e) => {
             job.kill_and_reap();
             Err(e)
@@ -1074,6 +1189,56 @@ mod tests {
         wait_until(
             Duration::from_secs(5),
             "a backgrounded job must run to completion and be reaped",
+            || process_is_gone(res.pid),
+        );
+    }
+
+    #[test]
+    fn running_background_job_transfers_back_to_foreground_ownership() {
+        let _serial = JOB_CONTROL_TEST_LOCK.lock().unwrap();
+        let cancel = CancelToken::new();
+        let res = run_pty(sh_spec("kill -STOP $$; sleep 30"), &cancel).expect("run_pty");
+        let job = take_stopped_job(res.pid).expect("parked job");
+        let (tx, rx) = std::sync::mpsc::channel();
+        job.resume_background_notify(move |result| {
+            let _ = tx.send(result);
+        });
+
+        let job = take_background_job(res.pid)
+            .expect("ownership request")
+            .expect("live background job");
+        assert_eq!(job.pid(), res.pid);
+        assert!(
+            matches!(rx.try_recv(), Err(mpsc::TryRecvError::Disconnected)),
+            "ownership transfer is not a terminal completion notification"
+        );
+
+        let foreground_cancel = CancelToken::new();
+        foreground_cancel.cancel();
+        let completed = job
+            .foreground_running(&foreground_cancel)
+            .expect("foreground attach and cancellation");
+        assert!(!completed.stopped);
+        assert_eq!(completed.signal.as_deref(), Some("SIGINT"));
+        assert!(process_is_gone(res.pid));
+        assert!(
+            take_background_job(res.pid).unwrap().is_none(),
+            "transferred job must leave the background registry"
+        );
+    }
+
+    #[test]
+    fn shutdown_reaps_a_running_background_job() {
+        let _serial = JOB_CONTROL_TEST_LOCK.lock().unwrap();
+        let cancel = CancelToken::new();
+        let res = run_pty(sh_spec("kill -STOP $$; sleep 30"), &cancel).expect("run_pty");
+        let job = take_stopped_job(res.pid).expect("parked job");
+        job.resume_background();
+
+        shutdown_stopped_jobs();
+        wait_until(
+            Duration::from_secs(5),
+            "shell shutdown must reap running background PTYs",
             || process_is_gone(res.pid),
         );
     }

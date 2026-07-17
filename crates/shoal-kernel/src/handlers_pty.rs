@@ -71,8 +71,7 @@ impl Kernel {
         // empty allowlist would default-deny every spawn. `sandbox_for` returns
         // `None` for the permissive human, so the child runs unconfined.
         if self.policy.spawn_pinning_active(&actor) {
-            let bin_hash =
-                shoal_exec::resolve_and_hash_in(&argv, &env, &cwd).unwrap_or_default();
+            let bin_hash = shoal_exec::resolve_and_hash_in(&argv, &env, &cwd).unwrap_or_default();
             let effect = Effect::ProcSpawn {
                 bin_hash,
                 argv0: p.cmd.clone(),

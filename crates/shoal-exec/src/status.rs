@@ -52,6 +52,29 @@ pub(crate) fn waitpid_untraced(pid: libc::pid_t) -> io::Result<i32> {
     waitpid_flags(pid, libc::WUNTRACED)
 }
 
+/// Non-blocking `WUNTRACED` probe used by a detached PTY worker that must also
+/// service ownership-transfer requests. `None` means the child has not changed
+/// state yet; a returned status has the same stop/exit meaning as
+/// [`waitpid_untraced`].
+pub(crate) fn waitpid_untraced_nohang(pid: libc::pid_t) -> io::Result<Option<i32>> {
+    loop {
+        let mut status: libc::c_int = 0;
+        // SAFETY: plain waitpid on a pid we spawned with a valid status slot.
+        let result =
+            unsafe { libc::waitpid(pid, &raw mut status, libc::WUNTRACED | libc::WNOHANG) };
+        if result == pid {
+            return Ok(Some(status));
+        }
+        if result == 0 {
+            return Ok(None);
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EINTR) {
+            return Err(error);
+        }
+    }
+}
+
 /// Shared `waitpid` core: retry on `EINTR`, return the raw status once the
 /// target pid is the one that changed state.
 fn waitpid_flags(pid: libc::pid_t, flags: libc::c_int) -> io::Result<i32> {

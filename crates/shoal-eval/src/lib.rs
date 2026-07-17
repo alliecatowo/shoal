@@ -44,7 +44,8 @@ pub use reef::{PromptReefBinding, PromptReefSnapshot};
 // edge (the crate-map DAG in site/content/internals/intercrate-protocol-contracts.md stays as pinned; `shoal` reaches
 // exec's process-control primitives via `shoal-eval`, its existing dependency).
 pub use shoal_exec::{
-    PtyJob, install_shell_job_control_signals, shutdown_stopped_jobs, take_stopped_job,
+    PtyJob, install_shell_job_control_signals, shutdown_stopped_jobs, take_background_job,
+    take_stopped_job,
 };
 pub use shoal_wasm::{
     Limits as WasmLimits, PluginError as WasmPluginError, Registry as WasmRegistry,
@@ -507,6 +508,19 @@ impl Evaluator {
             .iter()
             .filter(|t| t.is_suspended() && self.exec.jobs.external.contains_key(&t.id))
             .map(|t| t.id)
+            .max()
+    }
+
+    /// Most recent unfinished external PTY job, whether stopped or currently
+    /// detached in the background. This is the default target for bare `fg`;
+    /// bare `bg` continues to select only a stopped job.
+    pub fn last_external_job(&self) -> Option<u64> {
+        self.exec
+            .jobs
+            .tasks
+            .iter()
+            .filter(|task| !task.is_done() && self.exec.jobs.external.contains_key(&task.id))
+            .map(|task| task.id)
             .max()
     }
 

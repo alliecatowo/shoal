@@ -1440,6 +1440,7 @@ fn stopped_external_command_lists_and_transitions_in_the_jobs_table() {
 
     // It resolves to its pid (for `fg`/`bg`) and shows as `stopped`.
     assert_eq!(ev.external_job_pid(id), Some(4242));
+    assert_eq!(ev.last_external_job(), Some(id));
     assert_eq!(job_state(&ev, id).as_deref(), Some("stopped"));
     assert_eq!(ev.jobs_snapshot().suspended, 1);
 
@@ -1457,6 +1458,7 @@ fn stopped_external_command_lists_and_transitions_in_the_jobs_table() {
     assert!(ev.finish_external_job(id));
     assert_eq!(job_state(&ev, id).as_deref(), Some("done"));
     assert_eq!(ev.external_job_pid(id), None);
+    assert_eq!(ev.last_external_job(), None);
     assert!(!ev.mark_external_resumed(999_999), "unknown id is a no-op");
 }
 

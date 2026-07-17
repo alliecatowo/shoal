@@ -723,6 +723,7 @@ fn rewrite_fg(src: &str) -> Option<String> {
 }
 
 /// Which job-control verb was typed and its optional numeric target.
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum JobKind {
     Fg,
     Bg,
@@ -851,7 +852,11 @@ fn handle_job_control(
             maybe_strip(format!("\x1b[33;1m{}:\x1b[0m {msg}", jc.kind.name()))
         );
     };
-    let Some(id) = jc.id.or_else(|| evaluator.last_stopped_external()) else {
+    let current = match jc.kind {
+        JobKind::Fg => evaluator.last_external_job(),
+        JobKind::Bg => evaluator.last_stopped_external(),
+    };
+    let Some(id) = jc.id.or(current) else {
         warn("no current job");
         return;
     };
@@ -859,16 +864,29 @@ fn handle_job_control(
         warn(&format!("no such stopped job [{id}]"));
         return;
     };
-    let Some(job) = shoal_eval::take_stopped_job(pid) else {
-        if evaluator
-            .task_by_id(id)
-            .is_some_and(|task| !task.is_suspended() && !task.is_done())
-        {
-            warn(&format!(
-                "job [{id}] is already running in the background; foregrounding a live background PTY is not supported"
-            ));
-            return;
+    let running = evaluator
+        .task_by_id(id)
+        .is_some_and(|task| !task.is_suspended() && !task.is_done());
+    let (job, was_stopped) = if let Some(job) = shoal_eval::take_stopped_job(pid) {
+        (job, true)
+    } else if running && jc.kind == JobKind::Fg {
+        match shoal_eval::take_background_job(pid) {
+            Ok(Some(job)) => (job, false),
+            Ok(None) => {
+                warn(&format!(
+                    "job [{id}] changed state before it could be foregrounded"
+                ));
+                return;
+            }
+            Err(error) => {
+                warn(&format!("cannot foreground job [{id}]: {error}"));
+                return;
+            }
         }
+    } else if running {
+        warn(&format!("job [{id}] is already running in the background"));
+        return;
+    } else {
         // The eval-side record outlived its parked PTY and no worker still owns
         // it. Retire the stale row so it stops showing up.
         warn(&format!("job [{id}] is no longer available"));
@@ -883,7 +901,12 @@ fn handle_job_control(
             println!("{}", maybe_strip(job.command().to_string()));
             evaluator.mark_external_resumed(id);
             let cancel = evaluator.cancellation_token();
-            match job.resume_foreground(&cancel) {
+            let result = if was_stopped {
+                job.resume_foreground(&cancel)
+            } else {
+                job.foreground_running(&cancel)
+            };
+            match result {
                 Ok(res) if res.stopped => {
                     // Ctrl-Z'd again: back to a stopped job at the prompt.
                     evaluator.mark_external_stopped(id);
