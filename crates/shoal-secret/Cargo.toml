@@ -2,6 +2,10 @@
 name="shoal-secret"
 version="0.1.0"
 edition="2024"
+
+[lints]
+workspace = true
+
 [dependencies]
 aes-gcm="0.10"
 rand="0.9"

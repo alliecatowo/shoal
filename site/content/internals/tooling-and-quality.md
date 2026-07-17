@@ -221,8 +221,9 @@ checks fmt/Clippy, and performs release builds. Release automation produces bina
 AArch64 on Linux and macOS.
 
 
-The root manifest declares workspace lint settings, but member crates do not opt in with
-`[lints] workspace = true`; the effective lint gate today is the explicit Clippy CI command.
+Every member crate opts in with `[lints] workspace = true` (HR-F1,
+[hardening roadmap](@/internals/hardening-roadmap.md)), so the root manifest's lint table is
+actually active per-crate, not merely staged.
 
 ### Ambient-environment test debt
 

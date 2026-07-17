@@ -21,14 +21,13 @@ shoal-journal = { path = "crates/shoal-journal" }
 shoal-adapters = { path = "crates/shoal-adapters" }
 shoal-eval = { path = "crates/shoal-eval" }
 
-# Conservative, workspace-wide lint policy (site/content/internals/tooling-and-quality.md). NOT yet wired to any
-# crate: a member only inherits this table by adding `[lints] workspace = true` to its own
-# Cargo.toml, which is a per-crate opt-in landed in a follow-up wave (see
-# [workspace.metadata.lints] below for why it isn't done here). Every lint below was verified
-# to have zero violations workspace-wide (`cargo +stable clippy --workspace --all-targets --
-# -D warnings -D <lint>...`) before being added — if a lint you'd expect here is missing, check
-# [workspace.metadata.lints] first; it's likely a documented, currently-violated candidate for
-# the next cleanup wave, not an oversight.
+# Conservative, workspace-wide lint policy (site/content/internals/tooling-and-quality.md). Every
+# workspace member's Cargo.toml now carries `[lints] workspace = true` (HR-F1,
+# site/content/internals/hardening-roadmap.md), so this table is actually active gate-wide, not just
+# staged. Every lint below was verified to have zero violations workspace-wide (`cargo +stable
+# clippy --workspace --all-targets --locked -- -D warnings`) with every crate opted in — if a lint
+# you'd expect here is missing, check [workspace.metadata.lints] first; it's likely a documented,
+# currently-violated candidate for the next cleanup wave, not an oversight.
 [workspace.lints.rust]
 # `unsafe_code` is deliberately NOT set to "warn"/"deny": the tree has real, legitimate `unsafe`
 # today (PTY/signal/uid syscalls in shoal-exec/shoal-kernel/shoal-reef/shoal-doctor, the macOS
@@ -59,14 +58,13 @@ explicit_iter_loop = "warn"
 
 [workspace.metadata.lints]
 status = """
-[workspace.lints] above is staged, not enforced yet. Cargo only applies a workspace lints table
-to a crate that adds `[lints] workspace = true` to its own manifest, and this task's ownership is
-scoped to the root Cargo.toml only (not member manifests) — partly to avoid racing the parallel
-work landing at the same time this table was authored (shoal-eval's lib.rs module split; a new
-shoal-prompt crate). Land the opt-in crate-by-crate in a follow-up pass, confirming
-`cargo +stable clippy -p <crate> --all-targets -- -D warnings` stays green after each addition
-(a crate's own `#![allow(...)]`, e.g. shoal-syntax/src/lib.rs, takes precedence over the inherited
-workspace level per lint, so opting in is safe even for crates with existing suppressions).
+[workspace.lints] above is wired to every workspace member (HR-F1): each of the 22 crates under
+crates/*/Cargo.toml adds `[lints] workspace = true`. `cargo +stable clippy --workspace --all-targets
+--locked -- -D warnings` was re-verified zero-warning with the opt-in in place; no per-crate
+`#![allow(...)]` was needed. A crate's own `#![allow(...)]` still takes precedence per lint over the
+inherited workspace level, so a future crate-local suppression remains safe to add if a new lint is
+promoted here later. The `fuzz/` crate is a separate Cargo workspace (its own `[workspace]` table)
+and is intentionally not part of this inheritance.
 """
 deferred_pending_violations = """
 site/content/internals/tooling-and-quality.md proposes `clippy::missing_errors_doc` (88 warnings today),

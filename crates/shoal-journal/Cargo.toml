@@ -3,6 +3,9 @@ name = "shoal-journal"
 version = "0.1.0"
 edition = "2024"
 
+[lints]
+workspace = true
+
 [dependencies]
 blake3 = "1.8.5"
 rusqlite = { version = "0.40.1", features = ["bundled"] }

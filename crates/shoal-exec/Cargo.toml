@@ -3,6 +3,9 @@ name = "shoal-exec"
 version = "0.1.0"
 edition = "2024"
 
+[lints]
+workspace = true
+
 [dependencies]
 anyhow = "1"
 blake3 = "1.8.5"

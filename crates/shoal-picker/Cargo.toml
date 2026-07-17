@@ -2,6 +2,10 @@
 name="shoal-picker"
 version="0.1.0"
 edition="2024"
+
+[lints]
+workspace = true
+
 [dependencies]
 shoal-value={path="../shoal-value"}
 crossterm="0.29"
