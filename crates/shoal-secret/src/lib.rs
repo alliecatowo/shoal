@@ -6,7 +6,9 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    fs, io,
+    fs,
+    fs::OpenOptions,
+    io,
     path::{Path, PathBuf},
 };
 use zeroize::{Zeroize, Zeroizing};
@@ -55,43 +57,54 @@ impl SecretStore {
         let s = Self { dir: dir.into() };
         fs::create_dir_all(&s.dir)?;
         secure_dir(&s.dir)?;
-        if !s.key_path().exists() {
-            let mut k = Zeroizing::new([0u8; 32]);
-            OsRng.fill_bytes(&mut *k);
-            atomic(&s.key_path(), &*k)?
-        }
-        check_mode(&s.key_path())?;
+        // Key creation must share the same interprocess transaction lock as
+        // map updates: two first-openers must never install different keys.
+        s.with_exclusive_lock(|| {
+            if !s.key_path().exists() {
+                let mut k = Zeroizing::new([0u8; 32]);
+                OsRng.fill_bytes(&mut *k);
+                atomic(&s.key_path(), &*k)?
+            }
+            check_mode(&s.key_path())
+        })?;
         Ok(s)
     }
     pub fn set(&self, name: &str, value: &[u8]) -> io::Result<()> {
         valid(name)?;
-        let mut m = self.load()?;
-        if let Some(old) = m.0.insert(name.into(), value.to_vec()) {
-            drop(Zeroizing::new(old));
-        }
-        self.save(&m)
+        self.with_exclusive_lock(|| {
+            let mut m = self.load_unlocked()?;
+            if let Some(old) = m.0.insert(name.into(), value.to_vec()) {
+                drop(Zeroizing::new(old));
+            }
+            self.save_unlocked(&m)
+        })
     }
     pub fn get(&self, name: &str) -> io::Result<Option<Zeroizing<Vec<u8>>>> {
         valid(name)?;
-        Ok(self.load()?.0.remove(name).map(Zeroizing::new))
+        self.with_shared_lock(|| Ok(self.load_unlocked()?.0.remove(name).map(Zeroizing::new)))
     }
     pub fn list(&self) -> io::Result<Vec<String>> {
-        Ok(self.load()?.0.keys().cloned().collect())
+        self.with_shared_lock(|| Ok(self.load_unlocked()?.0.keys().cloned().collect()))
     }
     pub fn delete(&self, name: &str) -> io::Result<bool> {
         valid(name)?;
-        let mut m = self.load()?;
-        let found = m.0.remove(name).map(Zeroizing::new);
-        if found.is_some() {
-            self.save(&m)?
-        }
-        Ok(found.is_some())
+        self.with_exclusive_lock(|| {
+            let mut m = self.load_unlocked()?;
+            let found = m.0.remove(name).map(Zeroizing::new);
+            if found.is_some() {
+                self.save_unlocked(&m)?
+            }
+            Ok(found.is_some())
+        })
     }
     fn key_path(&self) -> PathBuf {
         self.dir.join("master.key")
     }
     fn data_path(&self) -> PathBuf {
         self.dir.join("secrets.json")
+    }
+    fn lock_path(&self) -> PathBuf {
+        self.dir.join(".secrets.lock")
     }
     fn key(&self) -> io::Result<Zeroizing<Vec<u8>>> {
         let k = Zeroizing::new(fs::read(self.key_path())?);
@@ -103,7 +116,7 @@ impl SecretStore {
         }
         Ok(k)
     }
-    fn load(&self) -> io::Result<PlainSecrets> {
+    fn load_unlocked(&self) -> io::Result<PlainSecrets> {
         if !self.data_path().exists() {
             return Ok(PlainSecrets::default());
         }
@@ -135,7 +148,7 @@ impl SecretStore {
         );
         serde_json::from_slice(&plain).map_err(invalid)
     }
-    fn save(&self, m: &PlainSecrets) -> io::Result<()> {
+    fn save_unlocked(&self, m: &PlainSecrets) -> io::Result<()> {
         let plain = Zeroizing::new(serde_json::to_vec(m).map_err(invalid)?);
         let key = self.key()?;
         let cipher = Aes256Gcm::new_from_slice(&key).map_err(invalid)?;
@@ -150,6 +163,26 @@ impl SecretStore {
             ciphertext: base64::engine::general_purpose::STANDARD.encode(ct),
         };
         atomic(&self.data_path(), &serde_json::to_vec(&e).map_err(invalid)?)
+    }
+
+    /// Run `f` while holding an exclusive interprocess lock, so a full
+    /// load-mutate-save read-modify-write cycle is atomic across processes.
+    /// Callers must go through this (or `with_shared_lock`) rather than call
+    /// `load_unlocked`/`save_unlocked` directly.
+    fn with_exclusive_lock<T>(&self, f: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+        let file = open_lock_file(&self.lock_path())?;
+        let mut lock = fd_lock::RwLock::new(file);
+        let _guard = lock.write()?;
+        f()
+    }
+
+    /// Run `f` while holding a shared interprocess lock: concurrent readers
+    /// may proceed together, but they exclude any in-flight exclusive writer.
+    fn with_shared_lock<T>(&self, f: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+        let file = open_lock_file(&self.lock_path())?;
+        let lock = fd_lock::RwLock::new(file);
+        let _guard = lock.read()?;
+        f()
     }
 }
 fn valid(n: &str) -> io::Result<()> {
@@ -194,6 +227,23 @@ fn check_mode(p: &Path) -> io::Result<()> {
 fn check_mode(_: &Path) -> io::Result<()> {
     Ok(())
 }
+fn open_lock_file(path: &Path) -> io::Result<fs::File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
+}
+
 fn atomic(path: &Path, data: &[u8]) -> io::Result<()> {
     let parent = path.parent().unwrap();
     let mut t = tempfile::NamedTempFile::new_in(parent)?;
@@ -235,5 +285,80 @@ mod tests {
         b[n - 2] ^= 1;
         fs::write(p, b).unwrap();
         assert!(s.list().is_err())
+    }
+
+    #[test]
+    fn concurrent_threads_preserve_every_secret() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().to_path_buf();
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let dir = dir.clone();
+                std::thread::spawn(move || {
+                    let store = SecretStore::open(&dir).unwrap();
+                    let name = format!("T{i}");
+                    store.set(&name, name.as_bytes()).unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let store = SecretStore::open(&dir).unwrap();
+        let names = store.list().unwrap();
+        assert_eq!(names.len(), 8, "a concurrent update was lost: {names:?}");
+        for i in 0..8 {
+            let name = format!("T{i}");
+            assert_eq!(&*store.get(&name).unwrap().unwrap(), name.as_bytes());
+        }
+    }
+
+    /// HR-I3: two OS processes racing to `set` distinct names must not lose
+    /// either other's write, proving the file lock is a real interprocess
+    /// boundary and not just an in-process mutex.
+    #[test]
+    fn concurrent_process_writers_preserve_every_secret() {
+        use std::process::Command;
+
+        const WORKER_ENV: &str = "SHOAL_SECRET_LOCK_TEST_WORKER";
+        const DIR_ENV: &str = "SHOAL_SECRET_LOCK_TEST_DIR";
+
+        if let Some(name) = std::env::var_os(WORKER_ENV) {
+            let dir = PathBuf::from(std::env::var_os(DIR_ENV).expect("worker store dir"));
+            let store = SecretStore::open(dir).unwrap();
+            let name = name.to_string_lossy();
+            store.set(&name, name.as_bytes()).unwrap();
+            return;
+        }
+
+        let t = tempfile::tempdir().unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let mut children = Vec::new();
+        for i in 0..12 {
+            let name = format!("SECRET_{i}");
+            children.push(
+                Command::new(&exe)
+                    .args([
+                        "--exact",
+                        "tests::concurrent_process_writers_preserve_every_secret",
+                        "--nocapture",
+                    ])
+                    .env(WORKER_ENV, &name)
+                    .env(DIR_ENV, t.path())
+                    .spawn()
+                    .unwrap(),
+            );
+        }
+        for child in children {
+            assert!(child.wait_with_output().unwrap().status.success());
+        }
+
+        let store = SecretStore::open(t.path()).unwrap();
+        let names = store.list().unwrap();
+        assert_eq!(names.len(), 12, "a concurrent update was lost: {names:?}");
+        for i in 0..12 {
+            let name = format!("SECRET_{i}");
+            assert_eq!(&*store.get(&name).unwrap().unwrap(), name.as_bytes());
+        }
     }
 }

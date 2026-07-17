@@ -110,13 +110,20 @@ Therefore:
 - a token created by `shoal-token` after kernel startup is rejected until that kernel restarts;
 - a token revoked by `shoal-token` after kernel startup remains accepted by that kernel until restart
   (unless its already-loaded expiry passes, which `validate` checks against current time);
-- listing in the CLI describes disk state, not necessarily the serving kernel's authentication state;
-- multiple management processes can load the same snapshot and atomically replace one another's
-  updates because the store has no interprocess lock or compare-and-swap generation.
+- listing in the CLI describes disk state, not necessarily the serving kernel's authentication state.
 
 This is a revocation-latency security boundary, not merely an administrative UX issue. Until live
 reload or a kernel-owned management path exists, token create/revoke instructions must explicitly
 require kernel restart and operational tooling must verify the serving generation.
+
+`create` and `revoke` (and the one-time key bootstrap inside `open`) hold an exclusive `fd-lock` file
+lock across a reload-mutate-persist cycle: each reloads the token list actually on disk before
+applying its own change, rather than trusting a possibly-stale in-memory snapshot, then persists and
+releases the lock (HR-I3). This closes the lost-update gap above — two processes racing to
+create/revoke tokens against the same file no longer silently clobber one another's write (a
+multi-process test pins twelve concurrent `create` calls all landing). It does not close the
+revocation-latency gap: `validate`/`list` still serve whatever this instance last loaded, not a live
+view of the file.
 
 Persist uses create-new temporary file mode 0600, writes and `sync_all`s, then renames. Opening an
 existing store actively sets its file permissions to 0600 before reading rather than rejecting a
@@ -479,6 +486,13 @@ On Unix, opening sets directory mode 0700; key/data files are written 0600 and r
 with group/other permission bits. The key is 32 random bytes. The entire sorted map of secret names
 to byte values is JSON-serialized, encrypted with AES-256-GCM under a fresh 12-byte random nonce, and
 stored in a versioned base64 envelope.
+
+Because every mutation is a whole-map load-mutate-save cycle, `set`/`delete` hold an exclusive
+`fd-lock` file lock on `<dir>/.secrets.lock` (0600) across the entire cycle, and `get`/`list` take
+the shared side, so two processes updating the store concurrently cannot lose each other's write
+(HR-I3; a multi-process test pins twelve concurrent writers all landing). The one-time master-key
+bootstrap inside `open` shares the same exclusive lock so racing first-openers cannot install
+different keys.
 
 ```mermaid
 sequenceDiagram

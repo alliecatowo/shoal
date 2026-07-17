@@ -231,8 +231,13 @@ Rules for implementers:
   zeroizing types and zeroized on drop (including error paths and replaced/deleted values); the
   threat model documents that `Arc<str>` language values and env-injection copies fall outside that
   guarantee.
-- [ ] **HR-I3** — Interprocess locking (file lock or equivalent) around secret-store and
+- [x] **HR-I3** — Interprocess locking (file lock or equivalent) around secret-store and
   token-store read-modify-write. *(J3, J4)*
+  <br>Done: `SecretStore` mutations hold an exclusive `fd-lock` on `.secrets.lock` across
+  load-mutate-save (reads take the shared side); `TokenStore` `create`/`revoke` reload the on-disk
+  list, mutate, and persist under an exclusive lock on `tokens.json.lock`. Both stores' one-time
+  key bootstrap shares the same lock. Multi-process tests pin twelve concurrent writers all
+  landing in each store.
 
 ### Workstream J — structural debt (promoted into this wave)
 

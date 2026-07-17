@@ -2412,6 +2412,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "blake3",
+ "fd-lock",
  "getrandom 0.4.3",
  "serde",
  "serde_json",
@@ -2608,6 +2609,7 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "base64",
+ "fd-lock",
  "rand",
  "serde",
  "serde_json",
