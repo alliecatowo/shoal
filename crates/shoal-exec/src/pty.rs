@@ -561,18 +561,36 @@ impl PtyJob {
     /// background job does not own the terminal input). A background job is not
     /// cancelled by the foreground Ctrl-C, so it runs under its own fresh,
     /// never-tripped [`CancelToken`].
-    pub fn resume_background(mut self) {
+    pub fn resume_background(self) {
+        self.resume_background_notify(|_| {});
+    }
+
+    /// Background resume with one terminal notification. The callback runs
+    /// after the child has either exited, stopped again and been re-parked, or
+    /// failed during PTY service. Hosts use this to reconcile their separate
+    /// job table without sharing evaluator state with the worker thread.
+    pub fn resume_background_notify<F>(mut self, notify: F)
+    where
+        F: FnOnce(io::Result<ExecResult>) + Send + 'static,
+    {
         self.forward_tty = false;
         thread::spawn(move || {
             let cancel = CancelToken::new();
             match self.serve(&cancel, false, true) {
                 Ok(Wait::Exited(raw)) => {
-                    let _ = self.exit_result(raw);
+                    notify(Ok(self.exit_result(raw)));
                 }
                 // Stopped again in the background (unusual): re-park so a later
                 // `fg` can still find it.
-                Ok(Wait::Stopped) => park_job(self),
-                Err(_) => self.kill_and_reap(),
+                Ok(Wait::Stopped) => {
+                    let result = self.stopped_result();
+                    park_job(self);
+                    notify(Ok(result));
+                }
+                Err(error) => {
+                    self.kill_and_reap();
+                    notify(Err(error));
+                }
             }
         });
     }
@@ -934,13 +952,23 @@ mod tests {
     /// thread (no fg terminal reattachment), and it is still reaped with no
     /// zombie left behind once it exits.
     #[test]
-    fn resume_background_runs_to_completion_and_is_reaped() {
+    fn resume_background_notifies_completion_and_is_reaped() {
         let _serial = JOB_CONTROL_TEST_LOCK.lock().unwrap();
         let cancel = CancelToken::new();
         let res = run_pty(sh_spec("kill -STOP $$"), &cancel).expect("run_pty");
         let job = take_stopped_job(res.pid).expect("parked job");
+        let (tx, rx) = std::sync::mpsc::channel();
 
-        job.resume_background();
+        job.resume_background_notify(move |result| {
+            let _ = tx.send(result);
+        });
+
+        let completed = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("background completion notification")
+            .expect("background resume result");
+        assert!(!completed.stopped);
+        assert_eq!(completed.status, Some(0));
 
         wait_until(
             Duration::from_secs(5),

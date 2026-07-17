@@ -8,6 +8,7 @@ use std::fs;
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, RwLock};
 
 use reedline::{
@@ -352,7 +353,10 @@ pub(crate) fn repl(standalone: bool) -> Result<i32, String> {
         }
     }
 
+    let (background_job_tx, background_job_rx) = mpsc::channel();
+
     loop {
+        drain_background_job_events(&mut evaluator, &background_job_rx);
         // Keep the completer's cwd view and the cancel handler's active
         // token fresh for the statement about to run.
         if let Some(session) = protocol.as_mut() {
@@ -384,6 +388,11 @@ pub(crate) fn repl(standalone: bool) -> Result<i32, String> {
         }
         match editor.read_line(&shoal_prompt) {
             Ok(Signal::Success(src)) => {
+                // A detached PTY may have changed state while Reedline owned
+                // the thread. Reconcile before interpreting this line so a
+                // `jobs` query cannot observe a completion that is already in
+                // the notification queue as still running.
+                drain_background_job_events(&mut evaluator, &background_job_rx);
                 if src.trim().is_empty() {
                     continue;
                 }
@@ -426,7 +435,7 @@ pub(crate) fn repl(standalone: bool) -> Result<i32, String> {
                     if let Ok(mut token) = cancel_slot.lock() {
                         *token = evaluator.cancellation_token();
                     }
-                    handle_job_control(&mut evaluator, jc);
+                    handle_job_control(&mut evaluator, jc, &background_job_tx);
                     continue;
                 }
                 // `fg <task>` (site/content/internals/roadmap-and-priorities.md): host-level sugar, resolved
@@ -708,6 +717,46 @@ struct JobControl {
     id: Option<u64>,
 }
 
+#[derive(Debug)]
+enum BackgroundJobEvent {
+    Completed { id: u64, command: String },
+    Stopped { id: u64 },
+    Failed { id: u64, error: String },
+}
+
+/// Reconcile terminal notifications from detached PTY workers on the REPL
+/// thread, which exclusively owns the evaluator's job map. Events are drained
+/// before each prompt snapshot so `jobs` and the prompt never retain a child
+/// as running after its completion has been observed.
+fn drain_background_job_events(evaluator: &mut Evaluator, events: &Receiver<BackgroundJobEvent>) {
+    while let Ok(event) = events.try_recv() {
+        match event {
+            BackgroundJobEvent::Completed { id, command } => {
+                evaluator.finish_external_job(id);
+                println!(
+                    "{}",
+                    maybe_strip(format!("\x1b[90m[{id}]+  Done\x1b[0m  {command}"))
+                );
+            }
+            BackgroundJobEvent::Stopped { id } => {
+                evaluator.mark_external_stopped(id);
+                if let Some((id, desc)) = evaluator.take_pending_stop() {
+                    print_stopped_notice(id, &desc);
+                }
+            }
+            BackgroundJobEvent::Failed { id, error } => {
+                evaluator.finish_external_job(id);
+                eprintln!(
+                    "{}",
+                    maybe_strip(format!(
+                        "\x1b[31;1m[{id}]+ background job failed:\x1b[0m {error}"
+                    ))
+                );
+            }
+        }
+    }
+}
+
 impl JobKind {
     fn name(&self) -> &'static str {
         match self {
@@ -752,7 +801,11 @@ fn print_stopped_notice(id: u64, desc: &str) {
 /// `bg` SIGCONTs it and lets it run detached. Job resources live in shoal-exec's
 /// parked-job registry (the live PTY, keyed by pid) and in the evaluator's job
 /// table (the listing + kernel suspend/resume) — this bridges the two by id.
-fn handle_job_control(evaluator: &mut shoal_eval::Evaluator, jc: JobControl) {
+fn handle_job_control(
+    evaluator: &mut shoal_eval::Evaluator,
+    jc: JobControl,
+    background_events: &Sender<BackgroundJobEvent>,
+) {
     let warn = |msg: &str| {
         eprintln!(
             "{}",
@@ -768,8 +821,17 @@ fn handle_job_control(evaluator: &mut shoal_eval::Evaluator, jc: JobControl) {
         return;
     };
     let Some(job) = shoal_eval::take_stopped_job(pid) else {
-        // The eval-side record outlived its parked PTY (already resumed/reaped);
-        // retire it so it stops showing up.
+        if evaluator
+            .task_by_id(id)
+            .is_some_and(|task| !task.is_suspended() && !task.is_done())
+        {
+            warn(&format!(
+                "job [{id}] is already running in the background; foregrounding a live background PTY is not supported"
+            ));
+            return;
+        }
+        // The eval-side record outlived its parked PTY and no worker still owns
+        // it. Retire the stale row so it stops showing up.
         warn(&format!("job [{id}] is no longer available"));
         evaluator.finish_external_job(id);
         return;
@@ -801,15 +863,27 @@ fn handle_job_control(evaluator: &mut shoal_eval::Evaluator, jc: JobControl) {
         }
         JobKind::Bg => {
             evaluator.mark_external_resumed(id);
+            let command = job.command().to_string();
             println!(
                 "{}",
-                maybe_strip(format!("\x1b[90m[{id}]+ {} &\x1b[0m", job.command()))
+                maybe_strip(format!("\x1b[90m[{id}]+ {command} &\x1b[0m"))
             );
             // SIGCONT + detach: output keeps flowing to the terminal, stdin is
-            // not forwarded. A backgrounded external's later completion is not
-            // reflected back into the jobs table (documented limitation) — it
-            // reads as running until the session ends or it is `fg`'d again.
-            job.resume_background();
+            // not forwarded. The worker reports its terminal transition back
+            // to this REPL through a channel; evaluator state remains owned by
+            // the prompt thread.
+            let events = background_events.clone();
+            job.resume_background_notify(move |result| {
+                let event = match result {
+                    Ok(result) if result.stopped => BackgroundJobEvent::Stopped { id },
+                    Ok(_) => BackgroundJobEvent::Completed { id, command },
+                    Err(error) => BackgroundJobEvent::Failed {
+                        id,
+                        error: error.to_string(),
+                    },
+                };
+                let _ = events.send(event);
+            });
         }
     }
 }
@@ -1015,6 +1089,31 @@ mod tests {
         assert!(parse_job_control("bgtool").is_none());
         assert!(parse_job_control("fg=1").is_none());
         assert!(parse_job_control("echo hi").is_none());
+    }
+
+    #[test]
+    fn background_job_events_reconcile_evaluator_rows() {
+        let mut evaluator = Evaluator::new(PathBuf::from("/"));
+        let completed = evaluator.register_stopped_external(41_001, 41_001, "done-job".into());
+        assert!(evaluator.mark_external_resumed(completed));
+        let (tx, rx) = mpsc::channel();
+        tx.send(BackgroundJobEvent::Completed {
+            id: completed,
+            command: "done-job".into(),
+        })
+        .unwrap();
+        drain_background_job_events(&mut evaluator, &rx);
+        assert_eq!(evaluator.external_job_pid(completed), None);
+        assert!(evaluator.task_by_id(completed).unwrap().is_done());
+
+        let stopped = evaluator.register_stopped_external(41_002, 41_002, "stopped-job".into());
+        assert!(evaluator.mark_external_resumed(stopped));
+        tx.send(BackgroundJobEvent::Stopped { id: stopped })
+            .unwrap();
+        drain_background_job_events(&mut evaluator, &rx);
+        assert_eq!(evaluator.external_job_pid(stopped), Some(41_002));
+        assert!(evaluator.task_by_id(stopped).unwrap().is_suspended());
+        assert_eq!(evaluator.last_stopped_external(), Some(stopped));
     }
 
     #[test]
