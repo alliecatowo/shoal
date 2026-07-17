@@ -4,8 +4,9 @@ use shoal_exec::CancelToken;
 use shoal_value::{ErrorVal, Fs, Record, VResult, Value};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // The canonical builtin command-head registry lives in the leaf `shoal-syntax`
 // crate (`shoal_syntax::commands`) — "is this token a command head?" is a
@@ -18,6 +19,9 @@ pub(crate) use shoal_syntax::commands::builtin_names;
 pub(crate) use shoal_syntax::commands::{is_builtin, is_special_head};
 
 static TRASH_SEQ: AtomicU64 = AtomicU64::new(1);
+static TRASH_SESSION: OnceLock<String> = OnceLock::new();
+const TRASH_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+const TRASH_PRUNE_SCAN_LIMIT: usize = 64;
 
 /// A builtin signature (defect #12): scalar param types by index, plus an
 /// optional variadic type applied to any remaining positional words. `None`
@@ -340,13 +344,25 @@ fn rm(
         ));
     }
     let ps = paths(cwd, args)?;
-    let trash = std::env::temp_dir()
-        .join("shoal-trash")
-        .join(std::process::id().to_string());
-    if !permanent {
-        fs.create_dir_all(&trash)
-            .map_err(|e| ioerr("trash", &trash, e))?;
-    }
+    let mut cleanup_warnings = Vec::new();
+    let primary_trash = if permanent {
+        None
+    } else {
+        let root = shoal_paths::ShoalPaths::discover()
+            .runtime_dir()
+            .join("shoal")
+            .join("trash");
+        match prepare_trash_session(fs, &root, &mut cleanup_warnings) {
+            Ok(path) => Some(path),
+            Err(error) => {
+                cleanup_warnings.push(format!(
+                    "central trash unavailable at {}: {error}; using a same-filesystem trash",
+                    root.display()
+                ));
+                None
+            }
+        }
+    };
     let mut out = Vec::new();
     for p in ps {
         let meta = fs
@@ -369,15 +385,202 @@ fn rm(
                 .file_name()
                 .unwrap_or_else(|| OsStr::new("item"))
                 .to_string_lossy();
-            let target = trash.join(format!("{seq}-{name}"));
-            fs.rename(&p, &target).map_err(|e| ioerr("trash", &p, e))?;
+            let entry_name = format!("{seq}-{name}");
+            let primary_target = primary_trash.as_ref().map(|root| root.join(&entry_name));
+            let target = move_to_trash(
+                &p,
+                primary_target,
+                |source, target| fs.rename(source, target),
+                || prepare_adjacent_trash(fs, &p, &entry_name, &mut cleanup_warnings),
+            )?;
             let mut r = Record::new();
             r.insert("path".into(), Value::Path(p));
             r.insert("trash".into(), Value::Path(target));
+            r.insert(
+                "trash_retention_days".into(),
+                Value::Int((TRASH_RETENTION.as_secs() / 86_400) as i64),
+            );
+            if !cleanup_warnings.is_empty() {
+                r.insert(
+                    "trash_cleanup_warnings".into(),
+                    Value::List(cleanup_warnings.iter().cloned().map(Value::Str).collect()),
+                );
+            }
             out.push(Value::Record(r));
         }
     }
     Ok(Value::List(out))
+}
+
+fn move_to_trash(
+    source: &Path,
+    primary_target: Option<PathBuf>,
+    mut rename: impl FnMut(&Path, &Path) -> std::io::Result<()>,
+    mut adjacent_target: impl FnMut() -> VResult<PathBuf>,
+) -> VResult<PathBuf> {
+    if let Some(target) = primary_target {
+        match rename(source, &target) {
+            Ok(()) => return Ok(target),
+            Err(error) if !is_cross_device(&error) => {
+                return Err(ioerr("trash", source, error));
+            }
+            Err(_) => {}
+        }
+    }
+
+    // A rename into a trash directory beside the source stays on the source
+    // filesystem. It is atomic and preserves directories, symlinks, metadata,
+    // and journal undo without the partial-copy states of a recursive EXDEV
+    // fallback.
+    let target = adjacent_target()?;
+    rename(source, &target).map_err(|error| ioerr("trash", source, error))?;
+    Ok(target)
+}
+
+fn trash_session_name() -> &'static str {
+    TRASH_SESSION.get_or_init(|| {
+        let started = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        format!("{}-{started:032x}", std::process::id())
+    })
+}
+
+fn prepare_trash_session(
+    fs: &dyn Fs,
+    root: &Path,
+    warnings: &mut Vec<String>,
+) -> std::io::Result<PathBuf> {
+    fs.create_private_dir_all(root)?;
+    validate_private_trash_dir(fs, root)?;
+    warnings.extend(prune_stale_trash_root(
+        fs,
+        root,
+        trash_session_name(),
+        TRASH_RETENTION,
+        TRASH_PRUNE_SCAN_LIMIT,
+    ));
+    let session = root.join(trash_session_name());
+    fs.create_private_dir_all(&session)?;
+    validate_private_trash_dir(fs, &session)?;
+    Ok(session)
+}
+
+fn prepare_adjacent_trash(
+    fs: &dyn Fs,
+    source: &Path,
+    entry_name: &str,
+    warnings: &mut Vec<String>,
+) -> VResult<PathBuf> {
+    let parent = source.parent().ok_or_else(|| {
+        ErrorVal::new(
+            "io_error",
+            format!("trash: {} has no parent directory", source.display()),
+        )
+    })?;
+    let root = parent.join(adjacent_trash_name());
+    let session =
+        prepare_trash_session(fs, &root, warnings).map_err(|error| ioerr("trash", &root, error))?;
+    Ok(session.join(entry_name))
+}
+
+#[cfg(unix)]
+fn adjacent_trash_name() -> String {
+    // SAFETY: `geteuid` has no preconditions and returns the effective UID.
+    format!(".shoal-trash-{}", unsafe { libc::geteuid() })
+}
+
+#[cfg(not(unix))]
+fn adjacent_trash_name() -> String {
+    ".shoal-trash".into()
+}
+
+#[cfg(unix)]
+fn validate_private_trash_dir(fs: &dyn Fs, path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = fs.symlink_metadata(path)?;
+    // SAFETY: `geteuid` has no preconditions and returns the effective UID.
+    let effective_uid = unsafe { libc::geteuid() };
+    if !metadata.is_dir() || metadata.uid() != effective_uid || metadata.mode() & 0o077 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "trash directory {} must be owned by uid {effective_uid} with mode 0700",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_private_trash_dir(fs: &dyn Fs, path: &Path) -> std::io::Result<()> {
+    if fs.symlink_metadata(path)?.is_dir() {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("trash directory {} is not a directory", path.display()),
+        ))
+    }
+}
+
+fn is_cross_device(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(libc::EXDEV)
+}
+
+fn prune_stale_trash_root(
+    fs: &dyn Fs,
+    root: &Path,
+    current_session: &str,
+    retention: Duration,
+    scan_limit: usize,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let entries = match fs.read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) => {
+            warnings.push(format!(
+                "cannot scan trash retention at {}: {error}",
+                root.display()
+            ));
+            return warnings;
+        }
+    };
+    let now = SystemTime::now();
+    for entry in entries.into_iter().take(scan_limit) {
+        if entry.file_name() == Some(OsStr::new(current_session)) {
+            continue;
+        }
+        let metadata = match fs.symlink_metadata(&entry) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                warnings.push(format!(
+                    "cannot inspect trash entry {}: {error}",
+                    entry.display()
+                ));
+                continue;
+            }
+        };
+        if !metadata.is_dir()
+            || metadata
+                .modified()
+                .ok()
+                .and_then(|modified| now.duration_since(modified).ok())
+                .is_none_or(|age| age < retention)
+        {
+            continue;
+        }
+        if let Err(error) = fs.remove_dir_all(&entry) {
+            warnings.push(format!(
+                "cannot prune trash entry {}: {error}",
+                entry.display()
+            ));
+        }
+    }
+    warnings
 }
 fn stat(fs: &dyn Fs, cwd: &Path, args: Vec<Value>) -> VResult<Value> {
     if args.is_empty() {
@@ -572,6 +775,100 @@ mod tests {
             panic!()
         };
         assert!(t.exists());
+        assert_eq!(r["trash_retention_days"], Value::Int(30));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let parent = std::fs::symlink_metadata(t.parent().unwrap()).unwrap();
+            assert_eq!(parent.mode() & 0o077, 0);
+            // SAFETY: `geteuid` has no preconditions.
+            assert_eq!(parent.uid(), unsafe { libc::geteuid() });
+        }
+    }
+    #[test]
+    fn trash_falls_back_to_an_atomic_adjacent_rename_on_exdev() {
+        let source = Path::new("/source/item");
+        let primary = PathBuf::from("/runtime/trash/item");
+        let adjacent = PathBuf::from("/source/.shoal-trash/session/item");
+        let mut calls = Vec::new();
+
+        let selected = move_to_trash(
+            source,
+            Some(primary.clone()),
+            |from, to| {
+                calls.push((from.to_path_buf(), to.to_path_buf()));
+                if to == primary {
+                    Err(std::io::Error::from_raw_os_error(libc::EXDEV))
+                } else {
+                    Ok(())
+                }
+            },
+            || Ok(adjacent.clone()),
+        )
+        .unwrap();
+
+        assert_eq!(selected, adjacent);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].1, primary);
+        assert_eq!(calls[1].1, selected);
+    }
+    #[test]
+    fn trash_retention_scan_is_bounded_and_preserves_current_session() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("trash");
+        std::fs::create_dir(&root).unwrap();
+        for name in ["current", "old-a", "old-b", "old-c", "old-d"] {
+            std::fs::create_dir(root.join(name)).unwrap();
+        }
+
+        let warnings = prune_stale_trash_root(&StdFs, &root, "current", Duration::ZERO, 2);
+        assert!(warnings.is_empty());
+        let remaining_after_bounded_scan = std::fs::read_dir(&root).unwrap().count();
+        assert!(
+            remaining_after_bounded_scan >= 3,
+            "a two-entry scan removed too many of five sessions"
+        );
+
+        let warnings = prune_stale_trash_root(&StdFs, &root, "current", Duration::ZERO, usize::MAX);
+        assert!(warnings.is_empty());
+        assert!(root.join("current").is_dir());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+    }
+    #[test]
+    fn trash_retention_failures_are_reported() {
+        let d = tempfile::tempdir().unwrap();
+        let not_a_directory = d.path().join("file");
+        std::fs::write(&not_a_directory, b"x").unwrap();
+
+        let warnings =
+            prune_stale_trash_root(&StdFs, &not_a_directory, "current", Duration::ZERO, 1);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("cannot scan trash retention"));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn trash_rejects_a_symlinked_or_public_directory() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let d = tempfile::tempdir().unwrap();
+        let real = d.path().join("real");
+        let linked = d.path().join("linked");
+        std::fs::create_dir(&real).unwrap();
+        symlink(&real, &linked).unwrap();
+        assert_eq!(
+            validate_private_trash_dir(&StdFs, &linked)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            validate_private_trash_dir(&StdFs, &real)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
     }
     // Linux allows arbitrary bytes in filenames; macOS (APFS/HFS+) rejects
     // non-UTF-8 names at the syscall, so the fixture can't be created there.

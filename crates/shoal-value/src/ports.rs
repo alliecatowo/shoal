@@ -97,6 +97,13 @@ pub trait Fs: Send + Sync {
     fn create_dir(&self, path: &Path) -> io::Result<()>;
     /// Create a directory and all parents (`std::fs::create_dir_all`).
     fn create_dir_all(&self, path: &Path) -> io::Result<()>;
+    /// Create a private directory tree for security-sensitive runtime data.
+    /// Adapters without permission concepts may use ordinary directory
+    /// creation; the production Unix adapter forces mode `0700` for newly
+    /// created directories.
+    fn create_private_dir_all(&self, path: &Path) -> io::Result<()> {
+        self.create_dir_all(path)
+    }
     /// Remove a file (`std::fs::remove_file`).
     fn remove_file(&self, path: &Path) -> io::Result<()>;
     /// Remove a directory and its contents (`std::fs::remove_dir_all`).
@@ -169,6 +176,16 @@ impl Fs for StdFs {
         fs::create_dir(path)
     }
     fn create_dir_all(&self, path: &Path) -> io::Result<()> {
+        fs::create_dir_all(path)
+    }
+    #[cfg(unix)]
+    fn create_private_dir_all(&self, path: &Path) -> io::Result<()> {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700).create(path)
+    }
+    #[cfg(not(unix))]
+    fn create_private_dir_all(&self, path: &Path) -> io::Result<()> {
         fs::create_dir_all(path)
     }
     fn remove_file(&self, path: &Path) -> io::Result<()> {

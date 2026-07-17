@@ -72,12 +72,12 @@ rm ./obsolete.txt
 | `cp` | list of destination paths |
 | `mv` | list of destination paths |
 | `ln` | `{target, link, symbolic}` |
-| default `rm` | list of `{path, trash}` records |
+| default `rm` | list of `{path, trash, trash_retention_days}` records, with cleanup warnings when applicable |
 | `rm --permanent` | list of removed paths |
 
 Directories require `cp --recursive` and `rm --recursive` where relevant. An unmatched/empty removal is an error rather than a silently successful destructive command.
 
-Default `rm` moves targets into a process-specific directory under the system temporary directory. It is designed to support same-session journal undo, not as a polished desktop trash with indefinite retention. `rm --permanent` deletes directly and has no restore inverse.
+Default `rm` atomically moves targets into a private, process-specific directory beneath Shoal's UID-qualified runtime directory. If that directory is on another filesystem (or is unavailable), Shoal instead uses a private, UID-qualified hidden `.shoal-trash-UID` directory beside the source so the move remains atomic and preserves directories, symlinks, metadata, and journal undo. On Unix, unsafe ownership, symlinks, or group/other permissions are rejected. A bounded best-effort cleanup pass removes trash sessions older than 30 days; cleanup failures are reported in `trash_cleanup_warnings` rather than hiding a successful move. Trash still consumes disk space until that cleanup runs. Use `rm --permanent` when space must be reclaimed immediately; it deletes directly and has no restore inverse.
 
 ## Path methods and save forms
 
