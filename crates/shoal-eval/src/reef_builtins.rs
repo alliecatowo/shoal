@@ -10,6 +10,7 @@ use shoal_reef::hashcache::HashCache;
 use shoal_reef::{
     ManifestKind, Policy, ProviderCtx, ReefCode, ReefError, ResolutionReport, ScopeChain,
 };
+use shoal_syntax::commands::CommandSource;
 
 impl Evaluator {
     // --- `which` (site/content/internals/reef-resolution.md) -------------------------------------------------
@@ -41,10 +42,19 @@ impl Evaluator {
             return self.which_all(&name);
         }
 
+        let command = self.resolve_head(&name, false, true);
+        if command.source != CommandSource::External {
+            return self.command_source_record(&name, &command);
+        }
+
+        self.executable_resolution_record(&name)
+    }
+
+    fn executable_resolution_record(&mut self, name: &str) -> VResult<Value> {
         let chain = self.reef_chain_snapshot();
         let resolver = self.reef_resolver();
         let mut lock = self.exec.reef.lock.clone();
-        match resolver.resolve(&name, &chain, &mut lock, Policy::Interactive, &mut |_| {}) {
+        match resolver.resolve(name, &chain, &mut lock, Policy::Interactive, &mut |_| {}) {
             Ok(res) => {
                 // Only keep a fresh lock when a manifest actually constrained it.
                 if res.constrained {
@@ -66,8 +76,11 @@ impl Evaluator {
                     .iter()
                     .find(|(k, _)| k == "PATH")
                     .map(|(_, v)| v.as_os_str());
-                match shoal_exec::which(OsStr::new(&name), path_env) {
-                    Some(p) => Ok(minimal_which_record(&name, &p)),
+                match shoal_exec::which(OsStr::new(name), path_env) {
+                    Some(p) => {
+                        let hash = self.hash_resolved_bin(p.as_os_str());
+                        Ok(minimal_which_record(name, &p, hash.as_deref()))
+                    }
                     None => Ok(Value::Null),
                 }
             }
@@ -77,8 +90,95 @@ impl Evaluator {
             // (the audit's single most user-misleading finding: `which`
             // actively lied about protection). Mirrors the "unresolved:
             // <code>" idiom `reef_binding_table` already uses below.
-            Err(e) => Ok(unresolved_which_record(&name, &e, &chain)),
+            Err(e) => Ok(unresolved_which_record(name, &e, &chain)),
         }
+    }
+
+    fn command_source_record(
+        &mut self,
+        name: &str,
+        resolution: &crate::resolution::CommandResolution,
+    ) -> VResult<Value> {
+        let source = resolution.source;
+        let mut record = Record::new();
+        record.insert("name".into(), Value::Str(name.to_string()));
+        record.insert("source".into(), Value::Str(source.as_str().into()));
+        record.insert("reason".into(), Value::Str(source.reason().into()));
+        record.insert("scope".into(), Value::Str(source.as_str().into()));
+        record.insert("constraint".into(), Value::Str("*".into()));
+        record.insert("version".into(), Value::Null);
+        record.insert("chain".into(), Value::Table(Vec::new()));
+
+        let mut path = None;
+        let mut hash = None;
+        if source == CommandSource::Script {
+            let candidate = PathBuf::from(name);
+            path = Some(if candidate.is_absolute() {
+                candidate
+            } else {
+                self.exec.shell.cwd.join(candidate)
+            });
+        }
+        if source == CommandSource::Adapter {
+            let adapter = self
+                .host
+                .adapters
+                .lookup(name)
+                .cloned()
+                .expect("adapter resolution carries a catalog entry");
+            let executable = self.executable_resolution_record(&adapter.bin)?;
+            if let Value::Record(executable_record) = &executable {
+                path = executable_record.get("path").and_then(|value| match value {
+                    Value::Path(path) => Some(path.clone()),
+                    _ => None,
+                });
+                hash = executable_record.get("hash").and_then(|value| match value {
+                    Value::Str(hash) => Some(hash.clone()),
+                    _ => None,
+                });
+                if let Some(provider) = executable_record.get("provider") {
+                    record.insert("executable_provider".into(), provider.clone());
+                }
+            }
+            record.insert("executable".into(), executable);
+
+            let mut schema = Record::new();
+            schema.insert("bin".into(), Value::Str(adapter.bin.clone()));
+            schema.insert(
+                "class".into(),
+                Value::Str(format!("{:?}", adapter.class).to_ascii_lowercase()),
+            );
+            schema.insert(
+                "params".into(),
+                Value::List(
+                    adapter
+                        .top
+                        .params
+                        .iter()
+                        .map(|param| Value::Str(param.name.clone()))
+                        .collect(),
+                ),
+            );
+            schema.insert(
+                "subcommands".into(),
+                Value::List(adapter.subs.keys().cloned().map(Value::Str).collect()),
+            );
+            record.insert("adapter".into(), Value::Record(schema));
+        }
+        if let Some(binding) = &resolution.binding {
+            record.insert("value_type".into(), Value::Str(binding.type_name().into()));
+        }
+
+        record.insert("path".into(), path.map(Value::Path).unwrap_or(Value::Null));
+        record.insert(
+            "hash8".into(),
+            hash.as_ref()
+                .map(|value| Value::Str(short_hash(value)))
+                .unwrap_or(Value::Null),
+        );
+        record.insert("hash".into(), hash.map(Value::Str).unwrap_or(Value::Null));
+        record.insert("provider".into(), Value::Str(source.as_str().into()));
+        Ok(Value::Record(record))
     }
 
     /// `which <tool> --all`: every candidate every provider offers, as a
@@ -471,11 +571,17 @@ impl Evaluator {
 fn report_to_record(report: &ResolutionReport) -> Value {
     let mut r = Record::new();
     r.insert("name".into(), Value::Str(report.name.clone()));
+    r.insert("source".into(), Value::Str("external".into()));
+    r.insert(
+        "reason".into(),
+        Value::Str(CommandSource::External.reason().into()),
+    );
     r.insert("scope".into(), Value::Str(report.scope.clone()));
     r.insert("constraint".into(), Value::Str(report.constraint.clone()));
     r.insert("version".into(), Value::Str(report.version.clone()));
     r.insert("path".into(), Value::Path(report.path.clone()));
     r.insert("hash8".into(), Value::Str(short_hash(&report.hash)));
+    r.insert("hash".into(), Value::Str(report.hash.clone()));
     r.insert("provider".into(), Value::Str(report.provider.clone()));
     let chain = report
         .chain
@@ -504,6 +610,11 @@ fn report_to_record(report: &ResolutionReport) -> Value {
 fn unresolved_which_record(name: &str, e: &ReefError, chain: &ScopeChain) -> Value {
     let mut r = Record::new();
     r.insert("name".into(), Value::Str(name.to_string()));
+    r.insert("source".into(), Value::Str("external".into()));
+    r.insert(
+        "reason".into(),
+        Value::Str(CommandSource::External.reason().into()),
+    );
     let constraint = chain
         .nearest_for(name)
         .map(|s| s.manifest.tools[name].constraint.to_string())
@@ -516,6 +627,7 @@ fn unresolved_which_record(name: &str, e: &ReefError, chain: &ScopeChain) -> Val
     r.insert("version".into(), Value::Null);
     r.insert("path".into(), Value::Null);
     r.insert("hash8".into(), Value::Null);
+    r.insert("hash".into(), Value::Null);
     r.insert("provider".into(), Value::Null);
     r.insert("chain".into(), Value::Table(Vec::new()));
     // The real error message (e.g. reef_drift's old/new hashes, reef_conflict's
@@ -529,14 +641,28 @@ fn unresolved_which_record(name: &str, e: &ReefError, chain: &ScopeChain) -> Val
 }
 
 /// The minimal `which` record for an ambient PATH hit (no manifest in scope).
-fn minimal_which_record(name: &str, path: &Path) -> Value {
+fn minimal_which_record(name: &str, path: &Path, hash: Option<&str>) -> Value {
     let mut r = Record::new();
     r.insert("name".into(), Value::Str(name.to_string()));
+    r.insert("source".into(), Value::Str("external".into()));
+    r.insert(
+        "reason".into(),
+        Value::Str(CommandSource::External.reason().into()),
+    );
     r.insert("scope".into(), Value::Str("ambient".into()));
     r.insert("constraint".into(), Value::Str("*".into()));
     r.insert("version".into(), Value::Str("unknown".into()));
     r.insert("path".into(), Value::Path(path.to_path_buf()));
-    r.insert("hash8".into(), Value::Null);
+    r.insert(
+        "hash8".into(),
+        hash.map(|value| Value::Str(short_hash(value)))
+            .unwrap_or(Value::Null),
+    );
+    r.insert(
+        "hash".into(),
+        hash.map(|value| Value::Str(value.to_string()))
+            .unwrap_or(Value::Null),
+    );
     r.insert("provider".into(), Value::Str("ambient".into()));
     r.insert("chain".into(), Value::Table(Vec::new()));
     Value::Record(r)
@@ -563,22 +689,83 @@ fn reef_value_word(v: &Value) -> VResult<String> {
 mod tests {
     use super::*;
 
+    fn eval_parsed(ev: &mut Evaluator, src: &str) -> Value {
+        let out = ev
+            .eval_program(&shoal_syntax::parse(src).unwrap())
+            .unwrap_or_else(|e| panic!("{src}: {e}"));
+        let Value::Outcome(outcome) = out else {
+            panic!("{src}: expected an outcome, got {out:?}")
+        };
+        outcome
+            .parsed
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| panic!("{src}: outcome carried no parsed value"))
+    }
+
     /// Run `src` in a fresh `Evaluator` rooted at `cwd`, returning the
     /// resolution/health record `which`/`reef` carry as an outcome's
     /// `.parsed` value (mirrors `crates/shoal-eval/tests/reef_integration.rs`'s
     /// own unwrap pattern).
     fn parsed(cwd: &Path, src: &str) -> Value {
         let mut ev = Evaluator::new(cwd.to_path_buf());
-        let out = ev
-            .eval_program(&shoal_syntax::parse(src).unwrap())
-            .unwrap_or_else(|e| panic!("{src}: {e}"));
-        let Value::Outcome(o) = out else {
-            panic!("{src}: expected an outcome, got {out:?}")
+        eval_parsed(&mut ev, src)
+    }
+
+    #[test]
+    fn which_reports_the_same_winning_source_as_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ev = Evaluator::new(dir.path().into());
+        ev.eval_program(&shoal_syntax::parse("fn deploy() { null }").unwrap())
+            .unwrap();
+        ev.env_mut().declare("answer", Value::Int(42), false);
+
+        for (head, expected) in [
+            ("deploy", "session_callable"),
+            ("answer", "bound_value"),
+            ("ls", "structured_builtin"),
+            ("cd", "special_builtin"),
+        ] {
+            let Value::Record(record) = eval_parsed(&mut ev, &format!("which {head}")) else {
+                panic!("which {head}: expected record")
+            };
+            assert_eq!(
+                record.get("source"),
+                Some(&Value::Str(expected.into())),
+                "which {head} diverged from runtime precedence"
+            );
+            assert!(matches!(record.get("reason"), Some(Value::Str(reason)) if !reason.is_empty()));
+        }
+    }
+
+    #[test]
+    fn which_adapter_trace_includes_schema_and_executable_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("tool.toml"),
+            r#"
+[cmd.audittool]
+bin = "sh"
+params = { verbose = "bool" }
+"#,
+        )
+        .unwrap();
+        let (catalog, warnings) = AdapterCatalog::load_dir(dir.path());
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        let mut ev = Evaluator::new(dir.path().into());
+        ev.set_adapters(catalog);
+        let Value::Record(record) = eval_parsed(&mut ev, "which audittool") else {
+            panic!("expected adapter resolution record")
         };
-        o.parsed
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| panic!("{src}: outcome carried no parsed value"))
+        assert_eq!(record.get("source"), Some(&Value::Str("adapter".into())));
+        assert!(matches!(record.get("adapter"), Some(Value::Record(schema))
+            if schema.get("bin") == Some(&Value::Str("sh".into()))));
+        assert!(
+            matches!(record.get("executable"), Some(Value::Record(executable))
+            if executable.get("path").is_some_and(|path| !matches!(path, Value::Null)))
+        );
+        assert!(matches!(record.get("hash"), Some(Value::Str(hash)) if !hash.is_empty()));
     }
 
     /// Fix 2: two scopes constraining `faketool` incompatibly is a pure

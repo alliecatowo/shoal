@@ -26,6 +26,32 @@ pub enum CommandSource {
     External,
 }
 
+impl CommandSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SessionCallable => "session_callable",
+            Self::BoundValue => "bound_value",
+            Self::StructuredBuiltin => "structured_builtin",
+            Self::SpecialBuiltin => "special_builtin",
+            Self::Script => "script",
+            Self::Adapter => "adapter",
+            Self::External => "external",
+        }
+    }
+
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::SessionCallable => "an in-scope callable binding has highest precedence",
+            Self::BoundValue => "an eligible bare non-callable binding evaluates as a value",
+            Self::StructuredBuiltin => "the head is a structured Shoal builtin",
+            Self::SpecialBuiltin => "the head is a session or control builtin",
+            Self::Script => "the head names a .shl script",
+            Self::Adapter => "an adapter schema claims the unforced head",
+            Self::External => "no earlier layer won; resolve through Reef or PATH",
+        }
+    }
+}
+
 /// Canonical command precedence. This is intentionally executable data rather
 /// than prose so evaluator, planner, completion, highlighting, and LSP can pin
 /// their presentation and collision tests to the same order.

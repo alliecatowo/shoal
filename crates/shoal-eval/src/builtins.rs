@@ -13,8 +13,9 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 // already links `shoal-syntax` for, so the LSP needn't pull the whole evaluator
 // in for a name list. Eval keeps its dispatch logic below (`run`/`dispatch`,
 // `eval_command`'s special-head guards) and just sources the name list here.
-// Re-exported so this crate's call sites stay `builtins::is_builtin(…)` etc.
-pub(crate) use shoal_syntax::commands::{builtin_names, is_builtin, is_special_head};
+pub(crate) use shoal_syntax::commands::builtin_names;
+#[cfg(test)]
+pub(crate) use shoal_syntax::commands::{is_builtin, is_special_head};
 
 static TRASH_SEQ: AtomicU64 = AtomicU64::new(1);
 

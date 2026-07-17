@@ -10,17 +10,28 @@ pub(crate) struct CommandResolution {
 
 impl Evaluator {
     pub(crate) fn resolve_command(&self, call: &CmdCall) -> CommandResolution {
-        let binding = self.exec.shell.env.get(&call.head);
-        let source = resolve_command_source(
+        self.resolve_head(
             &call.head,
+            call.forced,
+            call.args.is_empty() && call.redirects.is_empty() && call.env_prefix.is_empty(),
+        )
+    }
+
+    pub(crate) fn resolve_head(
+        &self,
+        head: &str,
+        forced: bool,
+        value_eligible: bool,
+    ) -> CommandResolution {
+        let binding = self.exec.shell.env.get(head);
+        let source = resolve_command_source(
+            head,
             CommandFacts {
                 session_callable: binding.as_ref().is_some_and(Value::is_callable),
                 session_value: binding.as_ref().is_some_and(|value| !value.is_callable()),
-                value_eligible: call.args.is_empty()
-                    && call.redirects.is_empty()
-                    && call.env_prefix.is_empty(),
-                forced: call.forced,
-                adapter: self.host.adapters.lookup(&call.head).is_some(),
+                value_eligible,
+                forced,
+                adapter: self.host.adapters.lookup(head).is_some(),
             },
         );
         CommandResolution { source, binding }

@@ -1,6 +1,6 @@
 use nu_ansi_term::{Color, Style};
 use reedline::{Highlighter, StyledText};
-use shoal_syntax::commands::builtin_names;
+use shoal_syntax::commands::{CommandFacts, CommandSource, builtin_names, resolve_command_source};
 use shoal_syntax::{Lexer, Mode, Tok};
 use shoal_value::{Env, Value};
 
@@ -218,8 +218,22 @@ impl Highlighter for ShoalHighlighter {
                 // (session `fn`/alias) dispatches CMD and is a known-valid
                 // command even though PATH has never heard of it.
                 let bound = self.binding(name);
-                let callable = bound.as_ref().is_some_and(Value::is_callable);
-                let value_bound = bound.is_some() && !callable;
+                let source = resolve_command_source(
+                    name,
+                    CommandFacts {
+                        session_callable: bound.as_ref().is_some_and(Value::is_callable),
+                        session_value: bound.as_ref().is_some_and(|value| !value.is_callable()),
+                        value_eligible: rest.is_empty()
+                            || rest.starts_with(';')
+                            || rest.starts_with('\n'),
+                        forced: false,
+                        // The highlighter has no adapter catalog; known adapter
+                        // names are still supplied by completion.
+                        adapter: false,
+                    },
+                );
+                let callable = source == CommandSource::SessionCallable;
+                let value_bound = source == CommandSource::BoundValue;
                 let chains = line[end..].starts_with('.')
                     && line.as_bytes()[end + 1..]
                         .first()
@@ -499,6 +513,20 @@ mod tests {
             Some(Color::LightBlue),
             "bound variable must style as a reference, got {spans:?}"
         );
+    }
+
+    #[test]
+    fn ineligible_value_shadow_falls_through_to_builtin_highlighting() {
+        let spans = with_forced_color(|| {
+            let env = Env::root();
+            env.declare("ls", Value::Int(42), false);
+            ShoalHighlighter::with_env(env).highlight("ls .", 4).buffer
+        });
+        let head = spans
+            .iter()
+            .find(|(_, text)| text == "ls")
+            .expect("head span");
+        assert_eq!(head.0.foreground, Some(Color::Green), "got {spans:?}");
     }
 
     #[test]

@@ -977,19 +977,17 @@ impl Evaluator {
     /// True when `name` resolves as a command (builtin, special head, adapter,
     /// or an executable on `PATH`) — drives command-in-expression (defect #5).
     pub(crate) fn is_command_name(&self, name: &str) -> bool {
-        // Builtin command heads come straight from the canonical registry
-        // (`shoal_syntax::commands`, re-exported through `builtins`): structured
-        // builtins via `is_builtin`, the heads special-cased in `eval_command`
-        // via `is_special_head`. Deriving both sides from the same data is what
-        // keeps this in step with dispatch.
-        if builtins::is_builtin(name) || builtins::is_special_head(name) {
-            return true;
+        match self.resolve_head(name, false, false).source {
+            CommandSource::SessionCallable
+            | CommandSource::StructuredBuiltin
+            | CommandSource::SpecialBuiltin
+            | CommandSource::Script
+            | CommandSource::Adapter => return true,
+            CommandSource::BoundValue => return false,
+            CommandSource::External => {}
         }
         if name.contains('/') || name.contains('.') {
             return false;
-        }
-        if self.host.adapters.lookup(name).is_some() {
-            return true;
         }
         let path = self
             .exec
