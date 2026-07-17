@@ -31,7 +31,6 @@ use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{self, Write};
 use std::mem;
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -40,7 +39,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{Child, CommandBuilder, MasterPty, native_pty_system};
 use shoal_leash::EnforcementStatus;
 
 use crate::cancel::CancelToken;
@@ -51,47 +50,16 @@ use crate::watcher::spawn_cancel_watcher;
 use crate::which::resolve_program;
 use crate::{ExecResult, ExecSpec, StdinSpec};
 
-/// How often the stdin forwarder / output pump wake to poll (also paces winsize
-/// checks). Data reads happen immediately on `POLLIN`; this only bounds the
-/// latency of noticing a teardown request when the pty is idle.
-const INPUT_POLL_MS: i32 = 50;
-/// Winsize is re-checked every N input polls (≈ every 200 ms).
-const WINSIZE_EVERY_N_POLLS: u32 = 4;
+mod terminal;
+
 /// After the child is reaped, how long we wait for the output pump to hit
 /// EOF before abandoning it (it exits on its own once the pty closes).
 const PUMP_DRAIN_GRACE: Duration = Duration::from_millis(500);
 
-type BackgroundOutputSink = Box<dyn FnMut(&[u8]) + Send>;
-
-struct OutputPumpConfig {
-    tee: Arc<Mutex<Vec<u8>>>,
-    tee_truncated: Arc<AtomicBool>,
-    passthrough: Option<File>,
-    background_output: Option<BackgroundOutputSink>,
-    cap: usize,
-    serve_done: Arc<AtomicBool>,
-    pump_done: Arc<AtomicBool>,
-}
-
-/// Lock the bounded human-facing tee. If a writer panicked while holding it,
-/// its captured prefix is unknowable: discard that prefix, force the result's
-/// truncation marker, repair the mutex, and continue capturing subsequent
-/// bytes. Raw terminal/background passthrough remains independent.
-fn lock_tee<'a>(
-    tee: &'a Mutex<Vec<u8>>,
-    tee_truncated: &AtomicBool,
-) -> std::sync::MutexGuard<'a, Vec<u8>> {
-    match tee.lock() {
-        Ok(bytes) => bytes,
-        Err(poisoned) => {
-            tee_truncated.store(true, Ordering::SeqCst);
-            let mut bytes = poisoned.into_inner();
-            bytes.clear();
-            tee.clear_poison();
-            bytes
-        }
-    }
-}
+use terminal::{
+    BackgroundOutputSink, OutputPumpConfig, RawModeGuard, dup_master_fd, dup_stdout,
+    forward_stdin_and_resize, initial_pty_size, is_tty, lock_tee, pty_err, pump_output,
+};
 
 /// Parked, still-running PTY foreground jobs that were stopped (Ctrl-Z /
 /// SIGTSTP) and can be resumed by the host via `fg`/`bg`. Process-global
@@ -106,243 +74,6 @@ static BACKGROUND_JOBS: Mutex<Vec<(u32, Sender<BackgroundCommand>)>> = Mutex::ne
 enum BackgroundCommand {
     Foreground(SyncSender<PtyJob>),
     Shutdown,
-}
-
-fn pty_err(e: anyhow::Error) -> io::Error {
-    // portable-pty wraps operating-system failures in anyhow. Preserve the
-    // original io::Error so callers can reliably distinguish ENOENT/E2BIG/etc.
-    match e.downcast::<io::Error>() {
-        Ok(error) => error,
-        Err(error) => io::Error::other(error.to_string()),
-    }
-}
-
-/// Restores the original termios of `fd` on drop — including on panic, so
-/// the user's terminal is never left in raw mode.
-struct RawModeGuard {
-    fd: RawFd,
-    orig: libc::termios,
-}
-
-impl RawModeGuard {
-    /// Put an already-validated terminal `fd` into raw mode.
-    fn new(fd: RawFd) -> io::Result<Self> {
-        // SAFETY: termios syscalls on a caller-owned fd with valid pointers.
-        unsafe {
-            let mut term = mem::zeroed::<libc::termios>();
-            if libc::tcgetattr(fd, &raw mut term) != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let orig = term;
-            libc::cfmakeraw(&raw mut term);
-            if libc::tcsetattr(fd, libc::TCSANOW, &raw const term) != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(RawModeGuard { fd, orig })
-        }
-    }
-}
-
-impl Drop for RawModeGuard {
-    fn drop(&mut self) {
-        // SAFETY: restoring the termios we captured in `new`.
-        unsafe {
-            libc::tcsetattr(self.fd, libc::TCSANOW, &raw const self.orig);
-        }
-    }
-}
-
-/// Current window size of the tty on `fd`, if it is one.
-fn tty_winsize(fd: RawFd) -> Option<PtySize> {
-    // SAFETY: TIOCGWINSZ with a valid winsize out-pointer.
-    unsafe {
-        let mut ws = mem::zeroed::<libc::winsize>();
-        if libc::ioctl(fd, libc::TIOCGWINSZ, &raw mut ws) == 0 && ws.ws_col > 0 && ws.ws_row > 0 {
-            Some(PtySize {
-                rows: ws.ws_row,
-                cols: ws.ws_col,
-                pixel_width: ws.ws_xpixel,
-                pixel_height: ws.ws_ypixel,
-            })
-        } else {
-            None
-        }
-    }
-}
-
-/// Push `sz` onto the pty whose master (or a dup of it) is `fd` via
-/// `TIOCSWINSZ` — the fd-only equivalent of `MasterPty::resize`, so the stdin
-/// forwarder can propagate resizes using only its dup'd writer fd (leaving the
-/// `MasterPty` owned by the job for resumption).
-fn set_winsize(fd: RawFd, sz: PtySize) {
-    let ws = libc::winsize {
-        ws_row: sz.rows,
-        ws_col: sz.cols,
-        ws_xpixel: sz.pixel_width,
-        ws_ypixel: sz.pixel_height,
-    };
-    // SAFETY: TIOCSWINSZ with a valid winsize pointer on a pty fd we own.
-    unsafe {
-        libc::ioctl(fd, libc::TIOCSWINSZ, &raw const ws);
-    }
-}
-
-/// A dup of fd 1 for raw byte passthrough (bypasses std's line buffering and
-/// leaves the real fd 1 open when dropped).
-fn dup_stdout() -> Option<File> {
-    // SAFETY: dup returns a fresh fd we then own; from_raw_fd takes it over.
-    let fd = unsafe { libc::dup(1) };
-    if fd < 0 {
-        None
-    } else {
-        Some(unsafe { File::from_raw_fd(fd) })
-    }
-}
-
-/// A `File` onto the pty master via a dup'd fd, usable for both reading the
-/// child's output and writing its input.
-///
-/// Deliberately NOT `MasterPty::take_writer()`: portable-pty's writer injects
-/// `"\n" + VEOF` into the pty when dropped, and the line discipline echoes
-/// that back as a stray `\r\n` in the teed output. A plain dup has no
-/// drop-time side effects; pty EOF, when wanted, must be conveyed in-band
-/// (a VEOF byte, usually `0x04`) by whoever feeds the input. Dup'ing (rather
-/// than moving the `MasterPty`) is also what lets the job keep the master alive
-/// across a stop so it can be resumed.
-fn dup_master_fd(master: &dyn MasterPty) -> io::Result<File> {
-    let fd = master
-        .as_raw_fd()
-        .ok_or_else(|| io::Error::other("pty master has no raw fd"))?;
-    // SAFETY: dup returns a fresh fd we then own; from_raw_fd takes it over.
-    let dup = unsafe { libc::dup(fd) };
-    if dup < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(unsafe { File::from_raw_fd(dup) })
-}
-
-/// Forward real-stdin bytes to the pty master and propagate window resizes.
-///
-/// Uses poll(2) with a short timeout instead of a blocking read so that once
-/// `done` is set (the serve loop is tearing down) the thread exits without
-/// stealing a keystroke that belongs to the shell. Resizes are pushed through
-/// the writer fd (a dup of the master) via `TIOCSWINSZ`, so this needs no
-/// reference to the `MasterPty` object — that stays owned by the job.
-fn forward_stdin_and_resize(mut writer: File, done: &AtomicBool) {
-    let wfd = writer.as_raw_fd();
-    let mut buf = [0u8; 4096];
-    let mut last = tty_winsize(0);
-    let mut ticks: u32 = 0;
-    while !done.load(Ordering::SeqCst) {
-        ticks = ticks.wrapping_add(1);
-        if ticks.is_multiple_of(WINSIZE_EVERY_N_POLLS)
-            && let Some(sz) = tty_winsize(0)
-        {
-            let changed = last.is_none_or(|l| l.rows != sz.rows || l.cols != sz.cols);
-            if changed {
-                set_winsize(wfd, sz);
-                last = Some(sz);
-            }
-        }
-        let mut pfd = libc::pollfd {
-            fd: 0,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: poll on one valid pollfd.
-        let n = unsafe { libc::poll(&raw mut pfd, 1, INPUT_POLL_MS) };
-        if n <= 0 || pfd.revents & (libc::POLLIN | libc::POLLHUP) == 0 {
-            continue;
-        }
-        // SAFETY: read into a valid buffer of the stated length.
-        let r = unsafe { libc::read(0, buf.as_mut_ptr().cast(), buf.len()) };
-        if r <= 0 {
-            break; // stdin EOF or error
-        }
-        #[allow(clippy::cast_sign_loss)] // r > 0 checked above
-        let n = r as usize;
-        if writer.write_all(&buf[..n]).is_err() {
-            break; // pty gone (child exited)
-        }
-        let _ = writer.flush();
-    }
-}
-
-/// The output pump: drain the pty master (a dup'd `reader` fd), tee into the
-/// bounded capture buffer, and — when the real terminal is a tty — pass the
-/// bytes through raw. Poll-based so a *stop* (child suspended, no EOF) can tear
-/// it down promptly: when the pty is idle and `serve_done` is set, the pump
-/// returns; otherwise it exits at EOF (`read` -> 0 / `EIO`, the slave closing).
-/// The tee is capped to [`crate::capture_hard_cap`] so a runaway child cannot
-/// OOM the shell; the real terminal still receives the full stream.
-fn pump_output(reader: File, config: OutputPumpConfig) {
-    let OutputPumpConfig {
-        tee,
-        tee_truncated,
-        mut passthrough,
-        mut background_output,
-        cap,
-        serve_done,
-        pump_done,
-    } = config;
-    let fd = reader.as_raw_fd();
-    let mut buf = [0u8; 8192];
-    loop {
-        let mut pfd = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: poll on one valid pollfd we own.
-        let n = unsafe { libc::poll(&raw mut pfd, 1, INPUT_POLL_MS) };
-        if n <= 0 {
-            // Timed out or was interrupted with no data ready: exit if the
-            // serve loop asked us to (a stop, where no EOF will ever arrive),
-            // otherwise keep waiting for the child's next output.
-            if serve_done.load(Ordering::SeqCst) {
-                break;
-            }
-            continue;
-        }
-        if pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) == 0 {
-            continue;
-        }
-        // SAFETY: read into a valid buffer of the stated length.
-        let r = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
-        if r == 0 {
-            break; // EOF: slave fully closed
-        }
-        if r < 0 {
-            match io::Error::last_os_error().raw_os_error() {
-                // EIO: the slave side has been closed — treat as EOF, exactly as
-                // portable-pty's own reader does.
-                Some(v) if v == libc::EIO => break,
-                Some(v) if v == libc::EINTR || v == libc::EAGAIN => continue,
-                _ => break,
-            }
-        }
-        #[allow(clippy::cast_sign_loss)] // r > 0 checked above
-        let n = r as usize;
-        {
-            let mut captured = lock_tee(&tee, &tee_truncated);
-            if captured.len() < cap {
-                let take = (cap - captured.len()).min(n);
-                captured.extend_from_slice(&buf[..take]);
-                if take < n {
-                    tee_truncated.store(true, Ordering::SeqCst);
-                }
-            } else {
-                tee_truncated.store(true, Ordering::SeqCst);
-            }
-        }
-        if let Some(out) = passthrough.as_mut() {
-            let _ = out.write_all(&buf[..n]);
-        }
-        if let Some(output) = background_output.as_mut() {
-            output(&buf[..n]);
-        }
-    }
-    pump_done.store(true, Ordering::SeqCst);
 }
 
 /// Non-tty stdin to feed into the pty exactly once (the first time the job is
@@ -849,9 +580,8 @@ pub(crate) fn run_pty(mut spec: ExecSpec, cancel: &CancelToken) -> io::Result<Ex
         return Err(io::Error::from_raw_os_error(libc::E2BIG));
     }
 
-    // SAFETY: isatty is a trivial fd query.
-    let stdin_is_tty = unsafe { libc::isatty(0) } == 1;
-    let stdout_is_tty = unsafe { libc::isatty(1) } == 1;
+    let stdin_is_tty = is_tty(0);
+    let stdout_is_tty = is_tty(1);
 
     // Open a File stdin source before spawning so errors surface early.
     let stdin_file = match &stdin {
@@ -859,14 +589,7 @@ pub(crate) fn run_pty(mut spec: ExecSpec, cancel: &CancelToken) -> io::Result<Ex
         _ => None,
     };
 
-    let size = tty_winsize(0)
-        .or_else(|| tty_winsize(1))
-        .unwrap_or(PtySize {
-            rows: 24,
-            cols: 80,
-            pixel_width: 0,
-            pixel_height: 0,
-        });
+    let size = initial_pty_size();
     let pty = native_pty_system();
     let pair = pty.openpty(size).map_err(pty_err)?;
 
@@ -948,7 +671,7 @@ mod tests {
     use crate::ExecMode;
     use std::ffi::OsString;
     use std::io::Read as _;
-    use std::os::fd::IntoRawFd as _;
+    use std::os::fd::{FromRawFd as _, IntoRawFd as _};
     use std::os::unix::net::UnixStream;
 
     fn stream_file(stream: UnixStream) -> File {
