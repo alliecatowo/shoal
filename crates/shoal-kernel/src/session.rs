@@ -30,6 +30,11 @@ pub(crate) struct Attachment {
 pub(crate) struct Session {
     pub(crate) id: String,
     pub(crate) evaluator: Mutex<Evaluator>,
+    /// A panic while dispatching against this session makes the evaluator's
+    /// logical invariants unknowable even when Rust can recover the poisoned
+    /// mutex guard. Fail closed instead of treating `PoisonError::into_inner`
+    /// as validation of evaluator state.
+    quarantined: AtomicBool,
     /// The evaluator's in-language event bus, cached so wire publishes can
     /// inject into it without taking the evaluator lock (a long-running exec
     /// must not stall `events.publish`).
@@ -41,6 +46,22 @@ pub(crate) struct Session {
 pub(crate) const MAX_TRANSCRIPT_PER_SESSION: usize = 4096;
 
 impl Session {
+    pub(crate) fn quarantine(&self) {
+        self.quarantined.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn ensure_healthy(&self) -> Result<(), RpcError> {
+        if self.quarantined.load(Ordering::SeqCst) {
+            Err(RpcError {
+                code: INTERNAL_ERROR,
+                message: "session is quarantined after an internal panic".into(),
+                data: Some(json!({"session": self.id, "session_quarantined": true})),
+            })
+        } else {
+            Ok(())
+        }
+    }
+
     pub(crate) fn insert_transcript(&self, value_ref: Ref, value: Value) {
         let id = value_ref
             .0
@@ -124,6 +145,7 @@ impl Kernel {
         let session = Arc::new(Session {
             id: name.into(),
             evaluator: Mutex::new(evaluator),
+            quarantined: AtomicBool::new(false),
             lang_bus,
             transcript: Mutex::new(HashMap::new()),
             next_value: AtomicU64::new(1),
@@ -163,6 +185,7 @@ impl Kernel {
             || token_caps.iter().any(|cap| cap == "plan.approve");
         let name = params.session.unwrap_or_else(|| "default".into());
         let session = self.session(&name, &who).map_err(internal)?;
+        session.ensure_healthy()?;
         let cwd = session
             .evaluator
             .lock()

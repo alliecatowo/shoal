@@ -73,6 +73,8 @@ impl Kernel {
             let spawn_result = std::thread::Builder::new()
                 .name(format!("shoal-task-{task_id}"))
                 .spawn(move || {
+                    let mut worker_guard =
+                        TaskWorkerGuard::new(task.clone(), kernel.clone(), task_channel.clone());
                     let response = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         kernel.dispatch(
                             Request {
@@ -164,6 +166,7 @@ impl Kernel {
                     task.done.notify_all();
                     kernel.events.publish(&task_channel, exit_payload);
                     kernel.reap_finished_tasks(&task.session.id);
+                    worker_guard.disarm();
                 });
             if let Err(error) = spawn_result {
                 self.tasks.lock().unwrap().remove(&task_ref);

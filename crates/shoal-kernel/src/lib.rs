@@ -125,6 +125,84 @@ struct TaskInner {
     active_slot: Option<QuotaPermit>,
 }
 
+impl TaskEntry {
+    /// Restore the complete terminal-task invariant after a worker panic.
+    /// Unlike evaluator state, TaskInner is a small host-owned record whose
+    /// safe failure state can be reconstructed in full: terminal timestamp,
+    /// no result, one explicit error, and no held active quota permit.
+    fn fail_worker_panic(&self) {
+        let active_slot = {
+            let mut inner = match self.inner.lock() {
+                Ok(inner) => inner,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            inner.state = "failed";
+            inner.finished_ns = Some(now_ns());
+            inner.result_ref = None;
+            inner.error = Some(RpcError {
+                code: INTERNAL_ERROR,
+                message: "task worker panicked".into(),
+                data: None,
+            });
+            let active_slot = inner.active_slot.take();
+            self.inner.clear_poison();
+            active_slot
+        };
+        drop(active_slot);
+        self.done.notify_all();
+    }
+}
+
+/// Ensures an unwind anywhere in task dispatch/completion cannot strand a
+/// running task, its waiters, or its quota permit. Disarmed only after the
+/// ordinary terminal transition and notifications have completed.
+struct TaskWorkerGuard {
+    task: Arc<TaskEntry>,
+    kernel: Arc<Kernel>,
+    channel: String,
+    armed: bool,
+}
+
+impl TaskWorkerGuard {
+    fn new(task: Arc<TaskEntry>, kernel: Arc<Kernel>, channel: String) -> Self {
+        Self {
+            task,
+            kernel,
+            channel,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TaskWorkerGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // A guard destructor runs during unwinding; never allow a secondary
+        // failure in best-effort event publication/reaping to become a double
+        // panic that aborts the process.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.task.fail_worker_panic();
+            self.kernel.events.publish(
+                &self.channel,
+                json!({
+                    "$": "record",
+                    "v": {
+                        "state": {"$":"str", "v":"failed"},
+                        "ref": Json::Null,
+                    }
+                }),
+            );
+            self.kernel.reap_finished_tasks(&self.task.session.id);
+        }));
+    }
+}
+
 /// A registered interactive PTY session (site/content/internals/kernel-protocol.md). The live
 /// [`shoal_exec::PtySession`] (child + PTY master + `vt100` emulator) sits
 /// behind a `Mutex` so `pty.send`/`pty.read`/`pty.resize`/`pty.close` from
@@ -501,7 +579,13 @@ impl Kernel {
                 } else {
                     self.dispatch(request, client, &mut attached, Some(&writer))
                 };
-                write_frame(&mut *writer.lock().unwrap(), &response)?;
+                // A poisoned writer may contain a partially-written JSON
+                // frame. Close this connection rather than recovering the
+                // guard and corrupting framing for subsequent responses.
+                let mut writer = writer
+                    .lock()
+                    .map_err(|_| io::Error::other("connection writer poisoned"))?;
+                write_frame(&mut *writer, &response)?;
             }
             Ok(())
         })();
@@ -1179,6 +1263,57 @@ mod tests {
     }
 
     #[test]
+    fn evaluator_panic_quarantines_only_that_session_and_keeps_connection_alive() {
+        let kernel = Kernel::new();
+        let (mut client, mut reader, server) = spawn(&kernel);
+        attach(&mut client, &mut reader);
+
+        let panic_response = call(
+            &mut client,
+            &mut reader,
+            2,
+            "test.panic_evaluator",
+            json!({}),
+        );
+        let panic_error = panic_response.error.expect("panic becomes RPC error");
+        assert_eq!(panic_error.code, INTERNAL_ERROR);
+        assert_eq!(panic_error.data.unwrap()["session_quarantined"], true);
+
+        let rejected = call(&mut client, &mut reader, 3, "session.env", json!({}));
+        let rejected_error = rejected.error.expect("poisoned session stays closed");
+        assert_eq!(rejected_error.code, INTERNAL_ERROR);
+        assert_eq!(rejected_error.data.unwrap()["session_quarantined"], true);
+
+        // Pure parsing needs no session state, so the request loop itself is
+        // demonstrably still alive after the panic.
+        assert!(
+            call(&mut client, &mut reader, 4, "parse", json!({"src":"1 + 2"}))
+                .error
+                .is_none()
+        );
+
+        // Reattach this same connection to an independent session and resume
+        // normal evaluation; the poisoned evaluator guard is never opened.
+        let attached = call(
+            &mut client,
+            &mut reader,
+            5,
+            "session.attach",
+            json!({"session":"after-panic","client":{"kind":"test","tty":false}}),
+        );
+        assert!(attached.error.is_none(), "reattach failed: {attached:?}");
+        let exec = call(&mut client, &mut reader, 6, "exec", json!({"src":"1 + 2"}));
+        assert!(
+            exec.error.is_none(),
+            "healthy session exec failed: {exec:?}"
+        );
+
+        drop(client);
+        drop(reader);
+        server.join().unwrap();
+    }
+
+    #[test]
     fn per_session_resource_reservation_is_atomic_under_race() {
         let quota = Arc::new(SessionQuota::default());
         let barrier = Arc::new(std::sync::Barrier::new(3));
@@ -1199,6 +1334,44 @@ mod tests {
         assert_eq!(quota.counts.lock().unwrap().get("s"), Some(&1));
         drop(reservations);
         assert!(!quota.counts.lock().unwrap().contains_key("s"));
+    }
+
+    #[test]
+    fn poisoned_task_record_is_rebuilt_as_terminal_failure() {
+        let kernel = Kernel::new();
+        let actor = principal();
+        let session = kernel.session("poisoned-task", &actor).unwrap();
+        let task = Arc::new(TaskEntry {
+            task: Ref::new("task", 999),
+            session,
+            started_ns: now_ns(),
+            inner: Mutex::new(TaskInner {
+                state: "running",
+                finished_ns: None,
+                result_ref: Some(Ref::new("out", 1)),
+                error: None,
+                active_slot: None,
+            }),
+            done: Condvar::new(),
+            cancel: shoal_exec::CancelToken::new(),
+            cancel_requested: AtomicBool::new(false),
+        });
+        let poisoner = task.clone();
+        let thread = std::thread::spawn(move || {
+            let _inner = poisoner.inner.lock().unwrap();
+            panic!("inject task-record poison");
+        });
+        assert!(thread.join().is_err());
+        assert!(task.inner.is_poisoned());
+
+        task.fail_worker_panic();
+        assert!(!task.inner.is_poisoned());
+        let inner = task.inner.lock().unwrap();
+        assert_eq!(inner.state, "failed");
+        assert!(inner.finished_ns.is_some());
+        assert!(inner.result_ref.is_none());
+        assert_eq!(inner.error.as_ref().unwrap().code, INTERNAL_ERROR);
+        assert!(inner.active_slot.is_none());
     }
 
     #[test]

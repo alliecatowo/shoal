@@ -126,7 +126,13 @@ impl SubQueue {
     /// calls per subscriber, and it is a plain in-memory push, never a
     /// socket write, so a stalled subscriber can never stall `publish()`.
     fn push(&self, event: Event) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                self.discard_poisoned_state(poisoned.into_inner());
+                return;
+            }
+        };
         if state.events.len() < SUB_QUEUE_CAP {
             state.events.push_back(event);
         } else {
@@ -140,7 +146,10 @@ impl SubQueue {
     /// Mark this queue closed (connection gone / explicitly unsubscribed) so
     /// its writer thread stops waiting and exits instead of blocking forever.
     fn close(&self) {
-        self.state.lock().unwrap().closed = true;
+        match self.state.lock() {
+            Ok(mut state) => state.closed = true,
+            Err(poisoned) => self.discard_poisoned_state(poisoned.into_inner()),
+        }
         self.ready.notify_one();
     }
 
@@ -150,7 +159,13 @@ impl SubQueue {
     /// summary is always delivered before any event that arrives after it —
     /// the subscriber learns about the gap before it sees anything past it.
     fn next(&self) -> Option<Event> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                self.discard_poisoned_state(poisoned.into_inner());
+                return None;
+            }
+        };
         loop {
             if let Some(event) = state.events.pop_front() {
                 return Some(event);
@@ -169,8 +184,36 @@ impl SubQueue {
             if state.closed {
                 return None;
             }
-            state = self.ready.wait(state).unwrap();
+            state = match self.ready.wait(state) {
+                Ok(state) => state,
+                Err(poisoned) => {
+                    // The guard is already available here, so restore the
+                    // queue's only safe invariant directly: empty + closed.
+                    let mut state = poisoned.into_inner();
+                    *state = SubQueueState {
+                        closed: true,
+                        ..SubQueueState::default()
+                    };
+                    self.state.clear_poison();
+                    self.ready.notify_all();
+                    return None;
+                }
+            };
         }
+    }
+
+    /// A subscriber queue is disposable delivery state, not authoritative
+    /// session state. If its mutex is poisoned, discard every buffered event
+    /// and close this subscriber. This restores a concrete invariant instead
+    /// of pretending the interrupted queue mutation completed.
+    fn discard_poisoned_state(&self, mut state: std::sync::MutexGuard<'_, SubQueueState>) {
+        *state = SubQueueState {
+            closed: true,
+            ..SubQueueState::default()
+        };
+        self.state.clear_poison();
+        drop(state);
+        self.ready.notify_all();
     }
 }
 
@@ -187,7 +230,13 @@ fn spawn_subscriber_writer(queue: Arc<SubQueue>, writer: SharedWriter) {
                 "method": "event",
                 "params": &event,
             });
-            let mut w = writer.lock().unwrap();
+            // A panic during a framed socket write may have left partial bytes
+            // on the stream. Continuing with the recovered guard could splice
+            // two JSON frames together, so abandon this subscriber instead.
+            let Ok(mut w) = writer.lock() else {
+                queue.close();
+                return;
+            };
             let ok = write_json_notification(&mut w, &note).is_ok();
             drop(w);
             if !ok {
@@ -845,6 +894,33 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    fn poisoned_subscriber_queue_is_discarded_and_closed() {
+        let queue = SubQueue::new("user.poison".into());
+        let poisoner = queue.clone();
+        let thread = std::thread::spawn(move || {
+            let _state = poisoner.state.lock().unwrap();
+            panic!("inject subscriber queue poison");
+        });
+        assert!(thread.join().is_err());
+        assert!(queue.state.is_poisoned());
+
+        queue.push(Event {
+            channel: "user.poison".into(),
+            seq: 1,
+            ts: now_ns(),
+            payload: json!({"never":"delivered"}),
+        });
+        assert!(
+            queue.next().is_none(),
+            "a poisoned subscriber must be dropped, not resumed"
+        );
+        assert!(
+            !queue.state.is_poisoned(),
+            "the closed/empty invariant was explicitly restored"
+        );
+    }
 
     /// Read one already-written frame off `reader` (blocking, with a bounded
     /// timeout so a bug that hangs the write path fails the test loudly
