@@ -27,8 +27,13 @@ chain and resolves each tool request against constraints, providers, and a lock.
 changes what the next resolution sees.
 
 ```mermaid
-flowchart LR
-  Cwd["session cwd"] --> Discover["ScopeChain::discover"]
+flowchart TB
+accTitle: Reef resolution and configuration boundaries
+accDescr: Core, prompt, and Reef configuration meet at the host; only Reef scope inputs feed locked executable resolution and the child PATH view.
+  Core["shoal-config core schema"] --> Host["Shoal host"]
+  Prompt["shoal-prompt config"] --> Host
+  Host --> Cwd["session cwd"]
+  Cwd --> Discover["ScopeChain::discover"]
   User["optional user shoal.toml [reef]"] --> Discover
   Discover --> Chain["nearest-first scope chain"]
   Chain --> Decision["effective constraint + provider pin"]
@@ -55,15 +60,6 @@ The resulting chain is nearest-first. Native Reef precedes foreign formats in th
 The optional user `[reef]` scope is appended last, so project scopes win. A scope's cache identity is
 its manifest path plus modification time.
 
-```mermaid
-flowchart TB
-  Cwd["/work/project/subdir"] --> Near["subdir manifests"]
-  Near --> Project["project manifests"]
-  Project --> Parent["ancestor manifests"]
-  Parent --> Root["root manifests"]
-  Root --> User["user Reef scope"]
-  Note["within one directory:\n.reef.toml → mise.toml → .mise.toml → .tool-versions"]
-```
 
 `ScopeChain::discover` silently skips unreadable or malformed native/foreign manifests. Direct parse
 APIs return errors, but normal discovery can therefore hide a typo and fall through to another scope
@@ -93,21 +89,6 @@ Scoped providers win ties over global/ambient providers. Candidates are version-
 timeout, filtered by constraints/provider pin, ranked by highest satisfying version, then provider
 precedence and path.
 
-```mermaid
-flowchart TD
-  Mentions["all scopes mentioning tool"] --> Compatible{"constraints and pins compatible?"}
-  Compatible -->|no| Conflict["reef_conflict"]
-  Compatible -->|yes| Effective["refined effective decision"]
-  Effective --> Locked{"valid lock entry?"}
-  Locked -->|yes| Rehash["rehash executable"]
-  Rehash -->|mismatch| Drift["reef_drift"]
-  Rehash -->|match| Return["locked resolution"]
-  Locked -->|no| Policy{"constrained script policy?"}
-  Policy -->|yes| Unlocked["reef_unlocked"]
-  Policy -->|no| Enumerate["enumerate, probe, rank candidates"]
-  Enumerate -->|none| Missing["reef_not_found"]
-  Enumerate -->|chosen| Hash["hash + optional new lock"]
-```
 
 Interactive resolution may auto-lock a constrained miss and emits a notice. Script policy refuses to
 guess and asks the user to lock first. Unconstrained ambient commands can resolve without creating a
@@ -132,13 +113,6 @@ Reef builds a content-addressed directory of links to resolved executables. That
 front of a child PATH. Non-hermetic scopes retain the ambient system tail; hermetic scopes omit it so
 only resolved tools appear.
 
-```mermaid
-flowchart LR
-  Bindings["tool → hashed executable bindings"] --> View["content-addressed link directory"]
-  View --> Hermetic{"scope hermetic?"}
-  Hermetic -->|yes| Only["PATH = Reef view"]
-  Hermetic -->|no| Tail["PATH = Reef view + system tail"]
-```
 
 Reef hermetic PATH and Leash hermetic OS enforcement are complementary. The first controls executable
 resolution; the second refuses a spawn when requested containment dimensions cannot be enforced.
@@ -168,6 +142,8 @@ specifications, parameters, flag aliases, invocation templates, parser, output t
 
 ```mermaid
 classDiagram
+accTitle: Adapter schema and call path
+accDescr: Shows the components and relationships described in Adapter schema and call path.
   class CmdAdapter { name bin class ok_codes invoke_payload top subs }
   class SubSpec { params positional short_flags invoke consumed parse output_type effects ok_codes }
   class ParamSpec { name type }
@@ -183,6 +159,8 @@ block heads is currently static and is not dynamically driven by catalog content
 
 ```mermaid
 flowchart LR
+accTitle: Adapter schema and call path
+accDescr: Shows the components and relationships described in Adapter schema and call path.
   Cmd["command AST"] --> Lookup["adapter lookup unless ^ forced"]
   Lookup --> Select["top spec or subcommand spec"]
   Select --> Bind["bind long/short/positional args"]
@@ -216,14 +194,6 @@ instead of copying the REPL sequence into session creation.
 
 ## Configuration boundaries
 
-```mermaid
-flowchart TB
-  Core["shoal-config\ncore host schema"] --> Host["shoal CLI assembly"]
-  Prompt["shoal-prompt/config\nprompt modules/themes"] --> Host
-  Reef["shoal-reef manifest parser\n[reef] native/foreign semantics"] --> Eval["Evaluator Reef state"]
-  Adapter["shoal-adapters TOML schema"] --> Eval
-  Host --> Eval
-```
 
 Core config treats `[reef.tools]` and `[reef.runners]` as opaque tables so Reef can own their schema.
 Prompt config is separately layered/validated. Adapter specs are not core config keys; core config

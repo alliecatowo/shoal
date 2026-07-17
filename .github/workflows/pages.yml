@@ -28,6 +28,9 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      - name: Check diagram governance
+        run: ./site/scripts/check-diagrams.sh
+
       - name: Configure GitHub Pages
         id: pages
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'

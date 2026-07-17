@@ -57,14 +57,6 @@ ls .
 
 The parentheses in `(ls .)` mean “use this command's result as a value.” At the top level, `ls .` is a command statement and renders naturally. Inside a larger expression, parenthesizing a command call makes the boundary explicit.
 
-```mermaid
-flowchart LR
-    A["ls ."] --> B["table&lt;record&gt;"]
-    B --> C[".where(.type == &quot;file&quot;)"]
-    C --> D["filtered table"]
-    D --> E[".map(.path)"]
-    E --> F["list&lt;path&gt;"]
-```
 
 ## Learn the two reading modes
 

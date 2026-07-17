@@ -20,6 +20,8 @@ methods, and writes bounded MCP results to stdout.
 
 ```mermaid
 flowchart LR
+accTitle: Bridge topology
+accDescr: Shows the components and relationships described in Bridge topology.
   Agent["MCP client"] -->|"stdio JSON-RPC"| Facade["shoal-mcp Facade"]
   Facade -->|"Unix socket JSON-RPC"| Kernel["shoal-kernel"]
   Facade --> Tools["tools mapper"]
@@ -75,18 +77,6 @@ caller-principal filter. A normal MCP call happens to arrive on an attached conn
 kernel client can call the same methods unattached, and an attached MCP principal is not checked as
 the approver. This must be fixed in the kernel boundary rather than papered over in the facade.
 
-```mermaid
-sequenceDiagram
-  participant A as agent
-  participant M as MCP facade
-  participant K as kernel
-  A->>M: tools/call shoal_exec
-  M->>M: validate and map arguments
-  M->>K: exec
-  K-->>M: ref + elided value + render
-  M->>M: bound text, then add resource_link
-  M-->>A: content + structuredContent + isError
-```
 
 Kernel RPC errors become successful MCP `tools/call` envelopes with `isError: true` and structured
 error content. Transport/argument mapping failures become MCP-level errors.
@@ -99,14 +89,13 @@ when possible and appends a marker describing remaining lines and the ref/URI to
 addressable ref is present, the result also includes an MCP `resource_link`.
 
 ```mermaid
-flowchart TD
-  Kernel["kernel result"] --> Structured["structuredContent\nalready elided"]
-  Kernel --> Text["render or pretty JSON"]
-  Text --> Cap{"≤ 64 KiB?"}
-  Cap -->|yes| Inline["text content"]
-  Cap -->|no| Head["line-bounded head + fetch marker"]
-  Kernel --> URI{"ref / uri?"}
-  URI -->|yes| Link["resource_link"]
+flowchart LR
+accTitle: Bounded agent context
+accDescr: Kernel results stay bounded inline and expose a resource link whenever the complete value must be fetched separately.
+  Kernel["kernel result"] --> Budget{"within inline budget?"}
+  Budget -->|yes| Inline["structured content + bounded text"]
+  Budget -->|no| Preview["bounded preview"]
+  Preview --> Link["shoal:// resource link"]
 ```
 
 This is a context-safety boundary: a command can produce gigabytes without forcing the whole payload
@@ -135,18 +124,6 @@ shoal://journal{?since,until,head,principal,ok,effects,limit}
 shoal://events/{channel}{?since,limit}
 ```
 
-```mermaid
-flowchart LR
-  URI["shoal:// URI"] --> Parse["ParsedUri"]
-  Parse --> Out["out → value.get"]
-  Parse --> Val["val → blob.get"]
-  Parse --> Task["task → task.get / value.get"]
-  Parse --> Plan["plan → plan.get"]
-  Parse --> Pty["pty → pty.list / pty.read"]
-  Parse --> Journal["journal → journal.query"]
-  Parse --> Events["events → events.read"]
-  Parse --> Session["session views"]
-```
 
 Resource reads return textual content plus `structuredContent`. `format=render` or `format=raw`
 becomes `text/plain`; structured data is pretty JSON text with the same bounded-text rule.
@@ -170,6 +147,8 @@ request/response reads.
 
 ```mermaid
 sequenceDiagram
+accTitle: Subscriptions
+accDescr: Shows the components and relationships described in Subscriptions.
   participant A as agent
   participant M as main facade
   participant S as subscription thread

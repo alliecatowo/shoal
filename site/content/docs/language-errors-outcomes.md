@@ -49,15 +49,6 @@ if !probe.ok {
 
 ## Statement position versus value position
 
-```mermaid
-flowchart TD
-    C["external command completes"] --> O["construct outcome"]
-    O --> P{"position"}
-    P -- "value" --> V["return outcome as-is"]
-    P -- "statement" --> K{"outcome.ok"}
-    K -- true --> R["render / continue"]
-    K -- false --> E["raise cmd_failed"]
-```
 
 ```text
 ^false                 # statement position: raises cmd_failed

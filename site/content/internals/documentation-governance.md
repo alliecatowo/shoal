@@ -24,6 +24,8 @@ The rule is simple:
 
 ```mermaid
 flowchart TD
+accTitle: What “canonical” means
+accDescr: Shows the components and relationships described in What “canonical” means.
   Zola["site/content — canonical narrative"]
   Source["public Rust types + executable registries"]
   Corpus["spec/cases — observable language behavior"]
@@ -137,13 +139,6 @@ silently preserve two copies.
 The man page is different from design prose because packages may install it. Do not simply delete it
 until packaging/install scripts are searched. The preferred model is:
 
-```mermaid
-flowchart LR
-  Args["canonical CLI argument schema"] --> Help["--help text"]
-  Args --> Man["generated shoal.1"]
-  Args --> Web["generated CLI reference data/page"]
-  Guides["hand-written Zola task guides"] --> Web
-```
 
 If current packaging consumes `docs/shoal.1`, retain the path but generate/verify its synopsis,
 options, subcommands, exit status, environment, files, and examples from the argument definition.

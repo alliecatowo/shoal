@@ -36,6 +36,8 @@ This page documents the MCP layer, not every method accepted by the kernel socke
 
 ```mermaid
 flowchart TB
+accTitle: Tool map
+accDescr: Shows the components and relationships described in Tool map.
     C["MCP client"] --> E["Execution tools"]
     C --> T["PTY tools"]
     E --> X["exec / plan / apply"]
@@ -224,6 +226,8 @@ A typical flow is:
 
 ```mermaid
 sequenceDiagram
+accTitle: shoal_plan
+accDescr: Shows the components and relationships described in shoal_plan.
     participant A as Agent
     participant M as shoal-mcp
     participant K as Kernel
@@ -388,6 +392,8 @@ The PTY tools are for programs whose behavior depends on a terminal: editors, in
 
 ```mermaid
 stateDiagram-v2
+accTitle: PTY lifecycle
+accDescr: Shows the components and relationships described in PTY lifecycle.
     [*] --> Open: shoal_pty_open
     Open --> Open: send / read / resize
     Open --> Exited: child exits

@@ -16,6 +16,8 @@ Shoal resources turn execution results and live session state into addressable n
 
 ```mermaid
 flowchart LR
+accTitle: Shoal architecture
+accDescr: Shows the components and relationships described in Shoal architecture.
     X["shoal_exec"] --> O["shoal://out/17"]
     O --> P["?path=.rows[0].name"]
     O --> S["?slice=20..40"]
@@ -353,6 +355,8 @@ When `limit` is smaller than the matching set, Shoal keeps the **newest tail**, 
 
 ```mermaid
 sequenceDiagram
+accTitle: Pull reads and cursors
+accDescr: Shows the components and relationships described in Pull reads and cursors.
     participant A as Agent
     participant K as Shoal
     A->>K: read events/journal?since=82
@@ -459,17 +463,5 @@ For each channel:
 7. After a jump or reconnect, pull from the last persisted cursor.
 8. Reconcile from a task/session/application snapshot if old ring-only events are unavailable.
 
-```mermaid
-flowchart TD
-    A["Load cursor"] --> B["Pull events since cursor"]
-    B --> C["Process in seq order"]
-    C --> D["Persist cursor"]
-    D --> E["Subscribe"]
-    E --> F{"next seq?"}
-    F -->|"duplicate / old"| E
-    F -->|"cursor + 1"| G["Process + persist"]
-    G --> E
-    F -->|"gap / dropped"| B
-```
 
 Continue with [Kernel JSON-RPC protocol](@/docs/kernel-protocol.md) for raw publishing and task-control methods, or [Agent workflows](@/docs/mcp-workflows.md) for practical orchestration patterns.

@@ -53,16 +53,6 @@ the kernel router and handlers, MCP mappings, configuration consumers, Reef reso
 producers, journal schema, and CI definitions. It does **not** certify every OS backend on every
 kernel version, every third-party adapter executable, or performance targets on release hardware.
 
-```mermaid
-flowchart LR
-  Claim["feature claim"] --> Leaf["leaf implementation"]
-  Leaf --> Reach["reachable composition root"]
-  Reach --> Focused["focused invariant test"]
-  Reach --> Boundary["real host / protocol test"]
-  Focused --> Status["status label"]
-  Boundary --> Status
-  Design["historical design prose"] -. "intent only" .-> Claim
-```
 
 ## Executive dashboard
 
@@ -124,6 +114,8 @@ prerequisite for claiming one language environment across human and agent surfac
 
 ```mermaid
 flowchart TB
+accTitle: Host-surface parity
+accDescr: Shows the components and relationships described in Host-surface parity.
   Core["AST + syntax + evaluator"] --> Local["local host builder"]
   Core --> Kernel["kernel Session::new"]
   Local --> LC["config + init + adapters + Reef + prompt + journal"]
@@ -282,17 +274,6 @@ against current time on each validation. `profile`/`--cap` values are echoed, no
 | secret rendering | Implemented | generic render is redacted; review every new serialization/stdin path |
 | cap-request honesty | Implemented | response uses the same enforcement truth as attach |
 
-```mermaid
-flowchart LR
-  Source --> Derive["derive Effect set"]
-  Derive --> Verdict["Policy: allow / ask / deny"]
-  Verdict --> Plan["stored plan + approval"]
-  Plan --> Spawn["spawn gate"]
-  Spawn --> Backend["Landlock/seccomp or Seatbelt"]
-  Backend --> Report["EnforcementStatus"]
-  Missing["network backend absent"] -.-> Backend
-  Escape["child evaluator inheritance gap"] -.-> Derive
-```
 
 No documentation should collapse these layers into the sentence “Leash sandboxes commands.” State
 the effect coverage, policy verdict, backend dimensions, and unsupported dimensions separately.
@@ -341,6 +322,8 @@ wire must preserve these distinctions:
 
 ```mermaid
 flowchart TB
+accTitle: Refs and elision
+accDescr: Shows the components and relationships described in Refs and elision.
   Value --> Small{"within recursive budget?"}
   Small -->|yes| Inline["typed inline WireValue"]
   Small -->|no| Ref["summary + scoped ref"]
@@ -561,14 +544,3 @@ Update this ledger in the same change that changes reachability or removes a qua
 replace an explicit caveat with “fixed” unless the new proof includes the lowest invariant and the
 real composition boundary. If a feature becomes intentionally unsupported, documenting and testing
 the error is better than preserving an unreachable status claim.
-
-```mermaid
-flowchart LR
-  Change["implementation change"] --> Tests["focused + boundary tests"]
-  Tests --> Ledger["status row"]
-  Change --> Atlas["owner / sequence diagrams"]
-  Change --> Contract["wire, config, schema, or corpus"]
-  Ledger --> Release["release claim"]
-  Atlas --> Release
-  Contract --> Release
-```

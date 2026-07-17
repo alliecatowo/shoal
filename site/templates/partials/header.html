@@ -9,9 +9,8 @@
     </a>
 
     <nav class="primary-nav" aria-label="Primary navigation">
-      <a href="{{ get_url(path="@/docs/_index.md") }}"{% if nav_path is starting_with("/docs") %} aria-current="page"{% endif %}>Docs</a>
-      <a href="{{ get_url(path="@/internals/_index.md") }}"{% if nav_path is starting_with("/internals") %} aria-current="page"{% endif %}>Internals</a>
-      <a href="{{ config.extra.repository_url }}" rel="noreferrer">Source</a>
+      <a href="{{ get_url(path="@/docs/_index.md") }}"{% if nav_path is starting_with("/docs") %} aria-current="page"{% endif %}>Manual</a>
+      <a href="{{ get_url(path="@/internals/_index.md") }}"{% if nav_path is starting_with("/internals") %} aria-current="page"{% endif %}>Architecture</a>
     </nav>
 
     <div class="header-actions">
@@ -32,8 +31,8 @@
     </div>
   </div>
   <nav class="mobile-menu" id="mobile-menu" data-mobile-menu aria-label="Mobile navigation" hidden>
-    <a href="{{ get_url(path="@/docs/_index.md") }}">User documentation <span>Learn Shoal</span></a>
-    <a href="{{ get_url(path="@/internals/_index.md") }}">Internals <span>Explore the architecture</span></a>
+    <a href="{{ get_url(path="@/docs/_index.md") }}">Manual <span>Use Shoal</span></a>
+    <a href="{{ get_url(path="@/internals/_index.md") }}">Architecture <span>Understand Shoal</span></a>
     <a href="{{ config.extra.repository_url }}">GitHub <span>Read the source</span></a>
   </nav>
 </header>

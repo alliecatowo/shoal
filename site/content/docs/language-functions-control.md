@@ -227,16 +227,6 @@ release.tag("candidate")
 
 `export let`, `export var`, and `export fn` are accepted at module top level. Exporting mutable state does not turn the module record into a general package manager; prefer function-mediated state where ownership matters.
 
-```mermaid
-flowchart LR
-    U["use ./lib/release"] --> R["resolve release.shl"]
-    R --> C{"cached canonical path?"}
-    C -- yes --> E["reuse exports record"]
-    C -- no --> F["fresh module scope + module cwd"]
-    F --> X["evaluate declarations"]
-    X --> E
-    E --> B["bind caller name `release`"]
-```
 
 ## `source`, direct `.shl`, and `run`
 

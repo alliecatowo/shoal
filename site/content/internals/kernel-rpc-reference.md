@@ -46,6 +46,8 @@ whole frames are serialized under its mutex so notifications and responses canno
 
 ```mermaid
 sequenceDiagram
+accTitle: Envelope and connection lifecycle
+accDescr: Shows the components and relationships described in Envelope and connection lifecycle.
   participant C as client
   participant T as connection thread
   participant D as dispatch
@@ -224,19 +226,6 @@ immediately. A timeout request waits; if work finishes before the deadline it re
 result from the transcript, otherwise it returns the still-running task and `timed_out:true`. Timeout
 does not cancel work.
 
-```mermaid
-flowchart TD
-  Params --> Async{"async or timeout present?"}
-  Async -->|yes| Make["allocate task:N + CancelToken"]
-  Make --> Worker["worker recursively dispatches sync exec"]
-  Worker --> Event["publish terminal state on task.N"]
-  Make --> BG{"async?"}
-  BG -->|yes| Ref["return task + events"]
-  BG -->|no| Wait["wait until deadline"]
-  Wait -->|finished| Inline["return result or task error"]
-  Wait -->|deadline| Ref2["return task + timed_out"]
-  Async -->|no| Mode["plan / run / approved"]
-```
 
 ### Plan mode
 
@@ -491,6 +480,8 @@ and closes the connection. The MCP stdio bridge does emit `-32700` for malformed
 
 ```mermaid
 flowchart TB
+accTitle: State and lock map
+accDescr: Shows the components and relationships described in State and lock map.
   Kernel --> Sessions["sessions Mutex<HashMap>"]
   Sessions --> Session["Session Arc"]
   Session --> Eval["evaluator Mutex"]

@@ -25,6 +25,8 @@ and [`env.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-value
 
 ```mermaid
 flowchart TD
+accTitle: Call surface map
+accDescr: Shows the components and relationships described in Call surface map.
   Syntax["name(args) / recv.method(args)"] --> EvalArgs
   EvalArgs --> Special["parallel / retry / on / now / today / assert / run / save / open"]
   EvalArgs --> Constructor["path / glob / regex / channel / every / watch / tail"]
@@ -62,16 +64,6 @@ inner dispatcher, and decrements afterward. The decrement happens for success an
 small stacks. The conformance corpus skips a deep-recursion case on a native test thread for this
 reason.
 
-```mermaid
-stateDiagram-v2
-  [*] --> Enter
-  Enter --> Rejected: depth > 10000
-  Enter --> Dispatch: depth <= 10000
-  Dispatch --> Leave: value or ErrorVal
-  Rejected --> Leave
-  Leave: decrement depth
-  Leave --> [*]
-```
 
 ## Strict closure binding
 
@@ -87,18 +79,6 @@ binding priority is:
 This means named arguments do not compact the positional list. A positional value at index `i`
 targets parameter `i` even if another parameter was supplied by name.
 
-```mermaid
-flowchart TD
-  Param --> Named{"matching named?"}
-  Named -->|yes| Candidate
-  Named -->|no| Pos{"positional at declaration index?"}
-  Pos -->|yes| Candidate
-  Pos -->|no| Default{"default expression?"}
-  Default -->|yes| EvalDefault["evaluate in call environment"] --> Candidate
-  Default -->|no| Missing["arg_error"]
-  Candidate --> Coerce["coerce list<T> elements"]
-  Coerce --> Bind["immutable declaration"]
-```
 
 Defaults execute after the evaluator has swapped to `captured_env.child()` and after earlier
 parameters have been declared. They can therefore reference earlier parameters and captured
@@ -120,6 +100,8 @@ arguments never flow into rest.
 
 ```mermaid
 sequenceDiagram
+accTitle: Closure environment lifecycle
+accDescr: Shows the components and relationships described in Closure environment lifecycle.
   participant D as Declaration
   participant E as Env handle
   participant C as Closure
@@ -181,20 +163,6 @@ must not fall through to an external command of the same name.
 the loader tries `<path>.shl` first and the exact path second. It canonicalizes the first existing
 candidate and uses that canonical path as both cache key and cycle identity.
 
-```mermaid
-flowchart TD
-  Use["use path"] --> Base{"absolute?"}
-  Base -->|no| Join["cwd.join(path)"]
-  Base -->|yes| Candidate
-  Join --> Candidate{"extension present?"}
-  Candidate -->|yes| Exact["exact candidate"]
-  Candidate -->|no| Two[".shl, then exact"]
-  Exact --> Exists
-  Two --> Exists{"first existing?"}
-  Exists -->|yes| Canon["canonicalize"]
-  Exists -->|no| NotFound["not_found"]
-  Canon --> Cache
-```
 
 Canonicalization means symlink and spelling aliases generally converge on one module identity. It
 also means module resolution requires the file to exist and can fail on filesystem permission or
@@ -203,29 +171,21 @@ canonicalization errors before evaluation begins.
 ## Module evaluation lifecycle
 
 ```mermaid
-sequenceDiagram
-  participant Caller
-  participant Loader
-  participant FS as Fs port
-  participant Parser
-  participant ModuleEnv
-  Caller->>Loader: eval_use(path)
-  Loader->>Loader: resolve canonical path
-  alt cached
-    Loader-->>Caller: cloned exports value
-  else loading
-    Loader->>Loader: reject path already on module_stack
-    Loader->>FS: read_to_string(canonical path)
-    Loader->>Parser: parse(source)
-    Loader->>ModuleEnv: swap in fresh root + module cwd
-    loop top-level statements
-      Loader->>ModuleEnv: eval_stmt(top = false)
-    end
-    Loader->>ModuleEnv: collect exported fn/let names
-    Loader->>Loader: restore caller env/cwd/function depth
-    Loader->>Loader: cache exports
-    Loader-->>Caller: bind record under file stem
-  end
+flowchart LR
+accTitle: Module evaluation lifecycle
+accDescr: A canonical module path is cycle-checked, evaluated in a fresh environment, reduced to explicit exports, cached, and bound into the caller as a record.
+  Use["use path"] --> Canon["canonical path"]
+  Canon --> Cached{"cached?"}
+  Cached -->|yes| Bind["bind cloned export record"]
+  Cached -->|no| Cycle{"already loading?"}
+  Cycle -->|yes| Error["module cycle error"]
+  Cycle -->|no| Parse["read + parse"]
+  Parse --> Fresh["fresh root env + module cwd"]
+  Fresh --> Eval["evaluate top-level statements"]
+  Eval --> Exports["collect exported fn / let names"]
+  Exports --> Record["ordered export record"]
+  Record --> Cache["cache by canonical path"]
+  Cache --> Bind
 ```
 
 The loader resets `in_fn_body` to zero during module top-level evaluation, allowing module setup to
@@ -246,16 +206,6 @@ Private declarations remain in the module environment. An exported closure captu
 and can continue reading private helpers after the loader restores the caller environment. Exported
 plain values are cloned into the record.
 
-```mermaid
-flowchart LR
-  FreshRoot --> Private["private bindings"]
-  FreshRoot --> Public["exported bindings"]
-  Public --> Record["module exports Record"]
-  Private --> Closure["captured by exported closure"]
-  Public --> Closure
-  Closure --> Record
-  Record --> Caller["caller binds file_stem"]
-```
 
 There is no module manifest, package identity, explicit import list, re-export mechanism, or cache
 invalidation protocol in this layer. Module naming is the file stem, so two files with the same stem
@@ -288,14 +238,6 @@ An environment binding shadows a namespace. This check is explicit: namespace di
 when `env.get(ns).is_none()`. Field access on a function-only namespace returns a diagnostic telling
 the caller to invoke it.
 
-```mermaid
-flowchart TD
-  Receiver["identifier receiver"] --> Bound{"bound in Env?"}
-  Bound -->|yes| Generic["ordinary field/method dispatch"]
-  Bound -->|no| Known{"known namespace?"}
-  Known -->|yes| Synthetic["namespace field/call"]
-  Known -->|no| Generic
-```
 
 ## Data namespace conversions
 

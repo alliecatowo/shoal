@@ -18,23 +18,6 @@ Structured values are Shoal's main alternative to text pipelines. Builtins and a
 
 These three values serve different roles:
 
-```mermaid
-classDiagram
-    class List {
-      ordered heterogeneous values
-      integer indexing
-    }
-    class Record {
-      ordered string keys
-      field or key access
-    }
-    class Table {
-      ordered record rows
-      column-oriented rendering
-    }
-    List "1" o-- "0..*" Record : may contain
-    Table "1" *-- "0..*" Record : rows
-```
 
 A table is semantically a record collection. It compares equal to an equivalent `list<record>` and uses the same eager transform vocabulary, but renders as columns and intentionally does not support `table[0]`.
 
@@ -70,16 +53,6 @@ let largest = (ls .)
 }
 ```
 
-```mermaid
-flowchart LR
-    T["table&lt;record&gt;"] --> W["where(predicate)"]
-    W --> S["sort_by(key)"]
-    S --> R["reverse()"]
-    R --> F["first(10)"]
-    F --> P["map(projection)"]
-    P --> L["list&lt;value&gt;"]
-    L --> A["sum / min / max"]
-```
 
 Aggregates have no projection parameter. Write `rows.map(.size).sum()`, not `rows.sum(.size)`.
 
@@ -269,15 +242,5 @@ config.history
 
 Keep data typed until a consumer actually needs bytes:
 
-```mermaid
-flowchart LR
-    P["parse once"] --> V["Shoal records / tables"]
-    V --> Q["filter + project + aggregate"]
-    Q --> B{"boundary"}
-    B -->|API| J["json.stringify"]
-    B -->|file| C["csv/yaml/toml stringify"]
-    B -->|stdin| F["feed serialization"]
-    B -->|human| R["renderer"]
-```
 
 This avoids the classic shell failure mode where a human-oriented rendering becomes an accidental protocol.

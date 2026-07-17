@@ -35,6 +35,8 @@ Sources: [`shoal-auth`](https://github.com/alliecatowo/shoal/tree/main/crates/sh
 
 ```mermaid
 flowchart LR
+accTitle: Trust-boundary map
+accDescr: Shows the components and relationships described in Trust-boundary map.
   Client --> Transport["local kernel transport"]
   Transport --> Auth["TokenStore::validate"]
   Auth --> Principal
@@ -96,19 +98,6 @@ bytes encoded URL-safe without padding. Token id is the first eight digest bytes
 | `expires_ns` | optional absolute expiry |
 | `revoked_ns` | optional revocation time |
 
-```mermaid
-sequenceDiagram
-  participant CLI as token creator
-  participant TS as TokenStore
-  participant Disk
-  TS->>TS: random bearer + keyed BLAKE3 digest
-  TS->>Disk: key + digest + metadata, mode 0600
-  TS-->>CLI: plaintext bearer once + metadata
-  participant K as kernel attach
-  K->>TS: validate(bearer)
-  TS->>TS: keyed digest + constant-time compare
-  TS-->>K: metadata iff match, unrevoked, unexpired
-```
 
 `validate` performs constant-time byte equality after decoding each stored digest, then checks
 revocation and strict `expires_ns > now`. It returns cloned metadata, not a mutable token object.
@@ -164,6 +153,8 @@ principal, but the underlying evaluator was created under the first principal's 
 
 ```mermaid
 sequenceDiagram
+accTitle: Named session principal hazard
+accDescr: Shows the components and relationships described in Named session principal hazard.
   participant A as agent:A
   participant K as Kernel sessions map
   participant S as named Session "default"
@@ -229,16 +220,21 @@ An unknown principal returns `Deny` for semantic effect and plan evaluation.
 
 ```mermaid
 flowchart TD
-  Effect --> Principal{"principal exists?"}
-  Principal -->|no| Deny
-  Principal -->|yes| Kind{"effect kind"}
-  Kind -->|path/name/net/spawn| All{"all requested values granted?"}
-  All -->|yes| Allow
-  All -->|no| Deny
-  Kind -->|opaque| Opaque{"deny / ask / allow"}
-  Opaque --> Deny
-  Opaque --> Approval["ApprovalRequired"]
-  Opaque --> Allow
+accTitle: Effect, plan, and approval verdicts
+accDescr: Individual effect grants roll up into a plan verdict; denied effects stop execution, approval-required effects bind approval to the plan, and only a current allow verdict executes.
+  Effect["derived effect"] --> EffectVerdict{"effect verdict"}
+  EffectVerdict -->|deny| PlanDeny["plan denied"]
+  EffectVerdict -->|ask| PlanAsk["plan requires approval"]
+  EffectVerdict -->|allow| More{"more effects?"}
+  More -->|yes| Effect
+  More -->|no| PlanAllow["plan allowed"]
+  PlanAsk --> Approval["principal approves bound plan_ref"]
+  Approval --> Recheck["re-derive + re-evaluate current plan"]
+  Recheck --> Current{"current verdict"}
+  Current -->|allow| Execute["execute"]
+  Current -->|ask / deny| Stop["do not execute"]
+  PlanAllow --> Execute
+  PlanDeny --> Stop
 ```
 
 Filesystem paths are lexically normalized before glob matching; `..` pops a component. Leading `~/`
@@ -268,20 +264,6 @@ then decides:
 | `reversible` + reversible plan | allow |
 | `reversible` + irreversible/unknown plan | approval required |
 
-```mermaid
-flowchart TD
-  Plan --> Effects["evaluate every effect"]
-  Effects --> AnyDeny{"any deny?"}
-  AnyDeny -->|yes| Deny
-  AnyDeny -->|no| AnyAsk{"any approval-required?"}
-  AnyAsk -->|yes| Approval
-  AnyAsk -->|no| Auto{"auto_apply"}
-  Auto -->|in-grant| Allow
-  Auto -->|never| Approval
-  Auto -->|reversible| Rev{"plan reversible?"}
-  Rev -->|yes| Allow
-  Rev -->|no| Approval
-```
 
 Policy evaluation is only as complete as plan derivation. An effect omitted or classified too
 narrowly cannot be recovered by the verdict engine. Opaque behavior should remain opaque rather than
@@ -343,6 +325,8 @@ considered unrestricted and returns no sandbox.
 
 ```mermaid
 flowchart TD
+accTitle: Lowering glob policy to OS roots
+accDescr: Shows the components and relationships described in Lowering glob policy to OS roots.
   Grants --> Unrestricted{"read+write+delete include /?"}
   Unrestricted -->|yes| None["None: no wrapper"]
   Unrestricted -->|no| Prefix["longest concrete prefix"]
@@ -421,6 +405,8 @@ for an external spawn. Fresh evaluators created by `spawn_block`, `.shl` `run_sc
 
 ```mermaid
 flowchart TD
+accTitle: Critical transitive-authority gap
+accDescr: Shows the components and relationships described in Critical transitive-authority gap.
   Parent["constrained Evaluator"] --> Feature["spawn / .shl / parallel / on"]
   Feature --> New["Evaluator::new"]
   New --> Child["leash = None"]
@@ -460,6 +446,8 @@ stored in a versioned base64 envelope.
 
 ```mermaid
 sequenceDiagram
+accTitle: Secret store design
+accDescr: Shows the components and relationships described in Secret store design.
   participant API
   participant Store
   participant Disk

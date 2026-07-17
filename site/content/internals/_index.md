@@ -1,5 +1,5 @@
 +++
-title = "Inside Shoal"
+title = "Architecture Atlas"
 description = "A maintainer's map of Shoal: crate boundaries, evaluation flow, kernel sessions, execution, protocols, persistence, security, and design invariants."
 sort_by = "weight"
 template = "docs/section.html"
@@ -7,8 +7,8 @@ page_template = "docs/page.html"
 insert_anchor_links = "right"
 
 [extra]
-eyebrow = "Maintainer handbook"
-audience = "Contributors and future maintainers"
+eyebrow = "Architecture"
+audience = "Contributors and maintainers"
 nav_scheme = "atlas"
 +++
 

@@ -62,6 +62,22 @@
   {% block body %}{% endblock body %}
   {% include "partials/footer.html" %}
   {% include "partials/search.html" %}
+  <dialog class="diagram-dialog" data-diagram-dialog aria-labelledby="diagram-dialog-title">
+    <div class="diagram-dialog-panel">
+      <header class="diagram-toolbar">
+        <strong id="diagram-dialog-title" data-diagram-dialog-title>Diagram</strong>
+        <div class="diagram-controls" aria-label="Expanded diagram controls">
+          <button type="button" data-diagram-action="zoom-out" aria-label="Zoom out">−</button>
+          <button type="button" data-diagram-action="fit">Fit</button>
+          <button type="button" data-diagram-action="zoom-in" aria-label="Zoom in">+</button>
+          <button type="button" data-diagram-close>Close</button>
+        </div>
+      </header>
+      <div class="mermaid-viewport" data-diagram-viewport tabindex="0">
+        <div class="mermaid-output" data-diagram-output></div>
+      </div>
+    </div>
+  </dialog>
   <div class="sidebar-scrim" data-sidebar-scrim hidden></div>
   <script src="{{ get_url(path="js/site.js", cachebust=true) }}" defer></script>
 </body>

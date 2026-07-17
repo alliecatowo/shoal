@@ -45,6 +45,8 @@ evaluator bridge.
 
 ```mermaid
 sequenceDiagram
+accTitle: Core pull protocol
+accDescr: Shows the components and relationships described in Core pull protocol.
   participant Sink
   participant Stage2
   participant Stage1
@@ -68,6 +70,8 @@ variants:
 
 ```mermaid
 stateDiagram-v2
+accTitle: Stream state and identity
+accDescr: Shows the components and relationships described in Stream state and identity.
   [*] --> Ready: source/combinator installed
   Ready --> Consumed: take_upstream()
   Consumed --> Error: second take_upstream()
@@ -147,14 +151,6 @@ section seen by every publisher/subscriber setup call.
 `every` rejects a zero interval, starts one thread, sleeps the interval, and tries to place the
 current zoned datetime into a one-slot channel.
 
-```mermaid
-stateDiagram-v2
-  [*] --> Sleep
-  Sleep --> Tick: interval elapsed
-  Tick --> Sleep: slot accepted
-  Tick --> Sleep: slot full, tick dropped
-  Tick --> [*]: receiver disconnected
-```
 
 The buffered tick is the earliest undelivered one, not a replacement with the latest missed tick.
 Ticks carry timestamps, so a slow consumer can observe one stale tick before current ones resume.
@@ -177,18 +173,6 @@ Only create, modify, and remove `notify` event families are projected. Each item
 The root existence check and notify watcher use direct path/OS APIs; event production itself is not
 fully virtualized by the evaluator's `Fs` port.
 
-```mermaid
-flowchart TD
-  Notify["notify event"] --> Kind{"create/modify/remove?"}
-  Kind -->|no| Drop
-  Kind -->|yes| Paths["each event path"]
-  Paths --> Match{"glob matcher accepts?"}
-  Match -->|no| Drop
-  Match -->|yes| Try["try_send into 64-slot buffer"]
-  Try -->|space| Event
-  Try -->|full| Owed["coalesced summary owed"]
-  Owed --> Flush["when space: root modified + coalesced:true"]
-```
 
 An overflow summary is
 `{path: root, kind: "modified", ts, coalesced: true}`. It communicates that detailed event identity
@@ -203,6 +187,8 @@ newline-terminated lines. A trailing partial line does not advance `pos` and wai
 
 ```mermaid
 stateDiagram-v2
+accTitle: Tail source
+accDescr: Shows the components and relationships described in Tail source.
   [*] --> Open
   Open --> Positioned: EOF or zero
   Positioned --> Read
@@ -244,15 +230,6 @@ length shrinks; rename/replacement behavior beyond that depends on platform `not
 | `merge(other)` | polls A then B in 20 ms steps until both end |
 | `zip(other)` | pulls A then B and emits `[a,b]`; ends/times out with either pull |
 
-```mermaid
-flowchart LR
-  Source --> Map --> Filter --> Window --> Take --> Sink
-  Ctx["CallCtx"] --> Map
-  Ctx --> Filter
-  Timeout["optional pull deadline"] --> Source
-  Timeout --> Window
-  Take --> Bound["bounded = true"]
-```
 
 `distinct` has unbounded memory growth on an unbounded stream with continuously unique values. It
 does not use hashing, so membership is linear in the number seen. `window(duration)` is bounded only
@@ -290,6 +267,8 @@ share one upstream with one 64-element queue per fork.
 
 ```mermaid
 flowchart TD
+accTitle: Tee behavior
+accDescr: Shows the components and relationships described in Tee behavior.
   Up["shared upstream"] --> Puller["fork that pulls next"]
   Puller --> Self["item returned directly"]
   Puller --> Q1["sibling queue 64"]
@@ -324,14 +303,20 @@ Stored events contain sequence, nanosecond timestamp, and cloned payload. Consum
 
 ```mermaid
 flowchart LR
-  Emit["emit(name,payload)"] --> Seq["assign seq, increment"]
-  Seq --> Ring["append, evict beyond 1024"]
-  Ring --> Subs["clone event to subscribers"]
-  Subs --> Prune["remove disconnected senders"]
-  Emit --> User{"name starts user.?"}
-  User -->|yes + forwarder| Kernel["mirror to kernel bus"]
-  Inject["kernel-origin inject"] --> Ring
-  Inject -. "never re-forward" .-> Kernel
+accTitle: EventBus buffering, replay, and delivery
+accDescr: Published events receive sequence numbers, enter a bounded replay ring, and fan out through bounded subscriber queues that report drops and support cursor-based replay.
+  Emit["emit / kernel inject"] --> Seq["assign monotonic seq"]
+  Seq --> Ring["ring buffer: newest 1024"]
+  Cursor["subscribe after cursor"] --> Replay["replay retained events"]
+  Ring --> Replay
+  Ring --> Fanout["live fan-out"]
+  Replay --> Queue["subscriber queue: 256"]
+  Fanout --> Queue
+  Queue --> Delivery["ordered delivery"]
+  Queue -->|overflow| Drop["coalesced dropped marker + latest seq"]
+  Drop --> Delivery
+  Seq --> User{"user.* channel?"}
+  User -->|yes| Kernel["mirror across kernel bridge"]
 ```
 
 Only `user.*` language emits cross an installed kernel forwarder. This prevents language code from
@@ -365,17 +350,6 @@ capability by evaluator method dispatch. Conversely adding any second field prev
 
 ## Replay and delivery guarantees
 
-```mermaid
-stateDiagram-v2
-  [*] --> Subscribe
-  Subscribe --> ReplayAll: events() no cursor
-  Subscribe --> ReplaySince: events(since=n)
-  Subscribe --> FutureOnly: take()
-  ReplayAll --> Live
-  ReplaySince --> Live
-  FutureOnly --> Live
-  Live --> [*]: receiver dropped
-```
 
 Replay occurs while the bus mutex is held, before the sender is registered as live, so there is no
 gap between the ring snapshot and subscription registration. Delivery is in-process clone-and-send.

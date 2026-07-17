@@ -20,6 +20,8 @@ The same parser and evaluator power scripts, the local REPL, and kernel-hosted a
 
 ```mermaid
 flowchart TB
+accTitle: One runtime, several surfaces
+accDescr: Shows the components and relationships described in One runtime, several surfaces.
     SRC["Shoal source"] --> PARSE["Parser: statement mode + AST"]
     PARSE --> EVAL["Evaluator: values, commands, effects"]
     EVAL --> PORTS["Host ports: fs, process, clock, network"]
@@ -43,6 +45,8 @@ At the beginning of a statement, Shoal applies a small dispatch rule:
 
 ```mermaid
 flowchart TD
+accTitle: How a statement chooses its mode
+accDescr: Shows the components and relationships described in How a statement chooses its mode.
     A["start of statement"] --> B{"reserved construct?"}
     B -- yes --> C["parse construct"]
     B -- no --> D{"literal / punctuation?"}
@@ -118,14 +122,6 @@ The next line may begin with `.` after an incomplete chain, so long transformati
 - a `stream` and stream combinators for asynchronous sequences;
 - channels to bridge named event flows across language and kernel sessions.
 
-```mermaid
-flowchart LR
-    V["typed value"] --> M["map / where / group / reduce"]
-    M --> V2["typed value"]
-    V2 -->|".feed(command)"| BYTES["serialized stdin bytes"]
-    BYTES --> PROC["external process"]
-    PROC --> O["outcome"]
-```
 
 Streams do not currently feed a process incrementally. Use `.take(n).collect()` or another bounded sink before `feed`; see [Streams and channels](@/docs/streams-channels.md).
 
@@ -143,15 +139,6 @@ This is a contextual policy, not two kinds of process. It makes the normal inter
 
 Builtins often also return outcomes, though a few evaluator-native operations such as `pwd` return a bare value. Use the visible type and documented fields rather than assuming every command has exactly the same wrapper.
 
-```mermaid
-flowchart TD
-    RUN["command runs"] --> OUT["outcome {status, out, stdout, stderr, ...}"]
-    OUT --> POS{"used where?"}
-    POS -- "value position" --> KEEP["retain outcome, even when non-ok"]
-    POS -- "statement position" --> OK{"ok status?"}
-    OK -- yes --> SHOW["render / continue"]
-    OK -- no --> ERR["raise cmd_failed"]
-```
 
 `&&` and `||` understand booleans and outcomes. They short-circuit and return the operand that decided the result rather than converting it to a generic boolean:
 
@@ -226,18 +213,6 @@ Shoal provides three levels of command knowledge:
 2. **Adapters** declare known flags, effects, invocation rules, and output parsers for a CLI.
 3. **Raw externals** receive argv and return a generic outcome.
 
-```mermaid
-flowchart TB
-    CALL["command call"] --> BUILTIN{"Shoal builtin?"}
-    BUILTIN -- yes --> BV["native typed value / outcome"]
-    BUILTIN -- no --> FORCE{"forced with ^ or dynamic run?"}
-    FORCE -- yes --> RAW["raw external argv"]
-    FORCE -- no --> ADAPT{"adapter loaded?"}
-    ADAPT -- yes --> AV["validated invocation + parsed output"]
-    ADAPT -- no --> RAW
-    AV --> O["outcome"]
-    RAW --> O
-```
 
 `^name` bypasses a non-callable value shadow and currently skips adapters. It does not bypass a function/alias/callable or a builtin, which resolve earlier. For an adapter-backed external such as `git`, this escape hatch matters when the adapter is incomplete or intentionally rejects a flag; it also gives up the adapter's precise effect and output knowledge. Use `run("name", ...)` to reach an executable that shares a builtin or callable name.
 
