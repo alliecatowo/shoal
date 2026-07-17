@@ -353,7 +353,11 @@ impl ParsedUri {
                     "principal": self.query.get("principal"),
                     "ok": self.query.get("ok").and_then(|s| s.parse::<bool>().ok()),
                     "effects": self.query.get("effects").map(|s| s.split(',').map(String::from).collect::<Vec<_>>()),
-                    "limit": self.query.get("limit").and_then(|s| s.parse::<usize>().ok()).unwrap_or(0),
+                    // Absent `limit` travels as `null` (not `0`): the kernel
+                    // reads a missing limit as "default page" and an explicit
+                    // `0` as "zero rows" (site/content/internals/kernel-rpc-reference.md). Sending
+                    // `0` here would silently return an empty journal.
+                    "limit": self.query.get("limit").and_then(|s| s.parse::<usize>().ok()),
                 }),
             )),
             "events" => {

@@ -556,8 +556,15 @@ pub struct JournalQueryParams {
     /// (e.g. `["fs.write","opaque"]`). Kernel-side post-filter.
     #[serde(default)]
     pub effects: Option<Vec<String>>,
+    /// Maximum rows to return. **Semantics (see kernel RPC reference):**
+    /// omitted/`null` → the kernel's default page size; explicit `0` → **zero
+    /// rows** (an empty page, never "unbounded"); any value is clamped down to
+    /// the kernel's server-side maximum page size. The distinction between
+    /// omitted and an explicit `0` is exactly why this is an `Option`: a bare
+    /// `usize` whose serde default is `0` cannot tell "no limit given" apart
+    /// from "give me nothing".
     #[serde(default)]
-    pub limit: usize,
+    pub limit: Option<usize>,
 }
 
 /// `events.read` — pull the buffered tail of a channel (site/content/internals/kernel-protocol.md).

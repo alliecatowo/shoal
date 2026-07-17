@@ -84,14 +84,14 @@ a newline. The MCP stdio reader has the same shape.
 | `pty.open/send/read/resize/close/list` | `handlers_pty.rs` | yes | session-scoped PTY registry |
 | `plan.get/list/apply` | `handlers_task.rs` | yes | session/principal-scoped plan registry |
 | `cap.request` | `handlers_task.rs` | **no** | global plan approval mutation |
-| `journal.query` | `handlers_value.rs` | **no** | shared persistent journal read |
+| `journal.query` | `handlers_value.rs` | yes | attached persistent journal read |
 | `events.read/publish/subscribe/unsubscribe` | `eventbus.rs` | yes | global bus plus session bridge |
 
-The two bold stateful exemptions are current authority defects. The only methods that are naturally
-public are attach, context-free parse, and context-free completion. `cap.request` neither authenticates
-an approver nor checks the plan owner against a caller. `journal.query` returns shared source/AST/
-effect/output metadata without caller scoping. The socket's `0600` mode limits OS users, not Shoal
-token principals.
+`journal.query` now requires attachment (HR-D4): a fresh unattached socket connection can no longer
+read stored journal rows. The only methods that are naturally public are attach, context-free parse,
+and context-free completion. `cap.request` remains the one bold exemption pending its approver-identity
+repair (see below); it neither authenticates an approver nor checks the plan owner against a caller.
+The socket's `0600` mode limits OS users, not Shoal token principals.
 
 ## `session.*`
 
@@ -411,20 +411,35 @@ There is no PTY-change subscription; clients poll `pty.read` and inspect `change
 
 ## Journal query
 
-`journal.query` accepts `{since,until,principal,head,ok,effects,limit}`. Timestamps are Unix epoch
-nanoseconds. Store-side filters are since/principal/head/ok/limit; `limit:0` means the journal default
-100. The kernel then post-filters `until` and requires every requested effect substring after dotted/
-snake normalization.
+`journal.query` **requires attachment** and accepts `{since,until,principal,head,ok,effects,limit}`.
+Timestamps are Unix epoch nanoseconds. Store-side filters are since/principal/head/ok/limit; the
+kernel then post-filters `until` and requires every requested effect substring after dotted/snake
+normalization.
+
+`limit` is an optional integer with three-way semantics enforced by the kernel above the store:
+
+| `limit` | Result |
+|---|---|
+| omitted / `null` | the default page size (100 rows) |
+| explicit `0` | **zero rows** — an empty page, never "unbounded" |
+| `n` | `min(n, `server maximum`)`; the ceiling is 10,000 rows |
+
+The explicit-zero case is short-circuited in the handler and never reaches the store (whose own
+`limit: 0` sentinel means "default 100"). The wire field is therefore `Option<usize>`, so an omitted
+limit is distinguishable from a caller who genuinely asked for nothing. The server-side maximum caps a
+hostile `limit: usize::MAX` so one query cannot stream the whole journal into a single frame.
 
 Rows are newest-first and contain ID, session, principal, timestamp/duration, lossless cwd, source,
 parsed AST/effects, status/ok/opaque, and output `{kind,hash,len}` entries. Output content is fetched
 separately through blob/value routes.
 
-The method currently has no attachment check. A caller can omit `principal` and receive shared rows.
-Also note that `until`/effects post-filter **after** the store limit: a request can return fewer than
-the requested limit even when older matching rows exist. Effect matching uses serialized JSON
-substring containment rather than parsed effect-kind equality, so the filter deserves replacement by
-a typed store query.
+Attachment is required for the caller-authentication side effect. A shared pair-shell session's
+journal is intentionally readable by every principal attached to that session (see
+[session identity](../kernel-protocol/#session-identity-and-the-pair-shell-model)); cross-session
+isolation is by using distinct session names. `until`/effects post-filter **after** the store limit,
+so a request can return fewer than its limit even when older matching rows exist. Effect matching uses
+serialized JSON substring containment rather than parsed effect-kind equality, so the filter deserves
+replacement by a typed store query.
 
 ## Events
 
