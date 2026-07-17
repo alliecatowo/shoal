@@ -276,7 +276,14 @@ impl std::fmt::Debug for StdinStream {
 
 impl StdinStream {
     fn take(&self) -> io::Result<Receiver<Vec<u8>>> {
-        self.0.lock().unwrap().take().ok_or_else(|| {
+        let mut receiver = self.0.lock().map_err(|_| {
+            // A panic while this one-shot cell was locked leaves it unknowable
+            // whether the receiver was already moved into an execution. Never
+            // recover the inner Option: doing so could duplicate ownership of
+            // the child stdin stream.
+            io::Error::other("incremental stdin stream ownership state is poisoned")
+        })?;
+        receiver.take().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "incremental stdin stream was already consumed",
@@ -497,4 +504,56 @@ fn sandbox_spec(
     let helper = sandbox::sandbox_helper()?;
     spec.argv = sandbox::wrap(helper, &sandbox, program, &spec.argv);
     Ok(spec)
+}
+
+#[cfg(test)]
+mod stdin_stream_poison_tests {
+    use super::*;
+
+    #[test]
+    fn poisoned_stdin_receiver_fails_closed_without_claiming_it() {
+        let (_sink, stdin) = stream_stdin(1);
+        let StdinSpec::Stream(stream) = stdin else {
+            panic!("stream_stdin must return an incremental stream");
+        };
+        let poison_target = stream.clone();
+        let poisoner = std::thread::Builder::new()
+            .name("poison-stdin-stream".into())
+            .spawn(move || {
+                let _receiver = poison_target
+                    .0
+                    .lock()
+                    .expect("stdin receiver starts healthy");
+                panic!("inject stdin receiver poison");
+            })
+            .expect("spawn stdin poisoner");
+        assert!(poisoner.join().is_err());
+
+        for _ in 0..2 {
+            let error = stream
+                .take()
+                .expect_err("poisoned ownership must fail closed");
+            assert_eq!(error.kind(), io::ErrorKind::Other);
+            assert_eq!(
+                error.to_string(),
+                "incremental stdin stream ownership state is poisoned"
+            );
+        }
+        assert!(stream.0.is_poisoned(), "ownership poison is never cleared");
+    }
+
+    #[test]
+    fn production_stdin_receiver_has_no_panicking_lock_access() {
+        let production = include_str!("lib.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source prefix");
+        let compact = production.split_whitespace().collect::<String>();
+        for forbidden in [".lock().unwrap(", ".lock().expect("] {
+            assert!(
+                !compact.contains(forbidden),
+                "production exec synchronization contains `{forbidden}`"
+            );
+        }
+    }
 }

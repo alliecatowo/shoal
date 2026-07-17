@@ -9,6 +9,56 @@ use std::io::Read as _;
 /// independent of the size of a resident or CAS-backed item.
 const STREAM_STDIN_CHUNK_BYTES: usize = 64 * 1024;
 
+#[derive(Default)]
+enum StreamPumpErrorState {
+    #[default]
+    Empty,
+    Pending(ErrorVal),
+    Delivered,
+}
+
+/// One terminal error handoff from the stream producer to the command-driving
+/// thread. A poisoned cell cannot preserve which error was being committed, so
+/// it reconstructs to one stable synchronization error and clears the poison.
+#[derive(Clone, Default)]
+struct StreamPumpError(Arc<std::sync::Mutex<StreamPumpErrorState>>);
+
+impl StreamPumpError {
+    fn record(&self, error: ErrorVal) {
+        let mut state = match self.0.lock() {
+            Ok(state) => state,
+            Err(poisoned) => self.repair(poisoned),
+        };
+        if matches!(*state, StreamPumpErrorState::Empty) {
+            *state = StreamPumpErrorState::Pending(error);
+        }
+    }
+
+    fn take_terminal(&self) -> Option<ErrorVal> {
+        let mut state = match self.0.lock() {
+            Ok(state) => state,
+            Err(poisoned) => self.repair(poisoned),
+        };
+        match std::mem::replace(&mut *state, StreamPumpErrorState::Delivered) {
+            StreamPumpErrorState::Pending(error) => Some(error),
+            StreamPumpErrorState::Empty | StreamPumpErrorState::Delivered => None,
+        }
+    }
+
+    fn repair<'a>(
+        &'a self,
+        poisoned: std::sync::PoisonError<std::sync::MutexGuard<'a, StreamPumpErrorState>>,
+    ) -> std::sync::MutexGuard<'a, StreamPumpErrorState> {
+        let mut state = poisoned.into_inner();
+        *state = StreamPumpErrorState::Pending(ErrorVal::new(
+            "stream_feed_sync",
+            "stream stdin pump synchronization state was poisoned",
+        ));
+        self.0.clear_poison();
+        state
+    }
+}
+
 impl Evaluator {
     /// Resolve `v.name` as a *field* — the direct, no-fallback accessor set.
     /// Callers that want the `.field` sugar to also reach zero-arg methods (so
@@ -453,7 +503,7 @@ impl Evaluator {
         let parent_cancel = self.cancellation_token();
         let pump_cancel = CancelToken::linked(&parent_cancel);
         let child = self.child_context();
-        let error = Arc::new(std::sync::Mutex::new(None));
+        let error = StreamPumpError::default();
         let pump_error = error.clone();
         let worker_cancel = pump_cancel.clone();
         let worker = std::thread::Builder::new()
@@ -470,7 +520,7 @@ impl Evaluator {
                         Ok(shoal_value::Pull::Timeout) => continue,
                         Ok(shoal_value::Pull::End) => break,
                         Err(e) => {
-                            *pump_error.lock().unwrap() = Some(e);
+                            pump_error.record(e);
                             break;
                         }
                     };
@@ -482,7 +532,7 @@ impl Evaluator {
                     ) {
                         Ok(sent) => sent,
                         Err(e) => {
-                            *pump_error.lock().unwrap() = Some(e);
+                            pump_error.record(e);
                             break;
                         }
                     };
@@ -500,7 +550,7 @@ impl Evaluator {
         if worker.join().is_err() {
             return Err(ErrorVal::new("custom", "stream stdin pump panicked").with_span(span));
         }
-        if let Some(e) = error.lock().unwrap().take() {
+        if let Some(e) = error.take_terminal() {
             return Err(e.or_span(span));
         }
         result
@@ -641,5 +691,51 @@ fn expr_noun(e: &Expr) -> &'static str {
         Expr::List { .. } => "a list",
         Expr::Record { .. } => "a record",
         _ => "that value",
+    }
+}
+
+#[cfg(test)]
+mod stream_pump_error_tests {
+    use super::*;
+
+    #[test]
+    fn poisoned_pump_error_reconstructs_one_stable_terminal_error() {
+        let error = StreamPumpError::default();
+        let poison_target = error.clone();
+        let poisoner = std::thread::Builder::new()
+            .name("poison-stream-pump-error".into())
+            .spawn(move || {
+                let _state = poison_target.0.lock().expect("error cell starts healthy");
+                panic!("inject stream pump error poison");
+            })
+            .expect("spawn stream pump poisoner");
+        assert!(poisoner.join().is_err());
+
+        error.record(ErrorVal::new("upstream", "must not replace sync failure"));
+        let terminal = error
+            .take_terminal()
+            .expect("poison reconstructs one terminal error");
+        assert_eq!(terminal.code, "stream_feed_sync");
+        assert_eq!(
+            terminal.msg,
+            "stream stdin pump synchronization state was poisoned"
+        );
+        assert!(error.take_terminal().is_none());
+        assert!(!error.0.is_poisoned(), "reconstructed state is healthy");
+    }
+
+    #[test]
+    fn production_stream_pump_has_no_panicking_lock_access() {
+        let production = include_str!("expr_access.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source prefix");
+        let compact = production.split_whitespace().collect::<String>();
+        for forbidden in [".lock().unwrap(", ".lock().expect("] {
+            assert!(
+                !compact.contains(forbidden),
+                "production stream-feed synchronization contains `{forbidden}`"
+            );
+        }
     }
 }

@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use super::{Candidate, Provider, ProviderCtx, is_executable, probe_version};
 use crate::version::Version;
@@ -42,6 +42,20 @@ impl SystemProvider {
         }
         SystemProvider::new(roots, ambient)
     }
+
+    fn lock_cache(&self) -> MutexGuard<'_, HashMap<PathBuf, Version>> {
+        match self.cache.lock() {
+            Ok(cache) => cache,
+            Err(poisoned) => {
+                // Version probes are advisory and repeatable. Never trust a
+                // partially-mutated cache left by a panic; clear and rebuild.
+                let mut cache = poisoned.into_inner();
+                cache.clear();
+                self.cache.clear_poison();
+                cache
+            }
+        }
+    }
 }
 
 impl Provider for SystemProvider {
@@ -66,14 +80,11 @@ impl Provider for SystemProvider {
     }
 
     fn version_of(&self, cand: &Candidate) -> Version {
-        if let Some(v) = self.cache.lock().unwrap().get(&cand.path) {
+        if let Some(v) = self.lock_cache().get(&cand.path) {
             return v.clone();
         }
         let v = probe_version(&cand.path);
-        self.cache
-            .lock()
-            .unwrap()
-            .insert(cand.path.clone(), v.clone());
+        self.lock_cache().insert(cand.path.clone(), v.clone());
         v
     }
 }
@@ -119,7 +130,7 @@ mod tests {
         let v = p.version_of(&cands[0]);
         assert_eq!(v.raw(), "4.5.6");
         // Cached path present.
-        assert!(p.cache.lock().unwrap().contains_key(&cands[0].path));
+        assert!(p.lock_cache().contains_key(&cands[0].path));
     }
 
     #[test]
@@ -128,5 +139,46 @@ mod tests {
         std::fs::write(root.path().join("plain"), b"not exec").unwrap();
         let p = SystemProvider::new(vec![root.path().into()], vec![]);
         assert!(p.discover("plain", &ProviderCtx::new("/")).is_empty());
+    }
+
+    #[test]
+    fn poisoned_version_cache_discards_untrusted_entries_and_reprobes() {
+        let root = tempfile::tempdir().unwrap();
+        make_exe(root.path(), "probed", "#!/bin/sh\necho 'probed 4.5.6'\n");
+        let provider = std::sync::Arc::new(SystemProvider::new(vec![root.path().into()], vec![]));
+        let candidate = provider.discover("probed", &ProviderCtx::new("/"))[0].clone();
+        let poison_target = provider.clone();
+        let poisoned_path = candidate.path.clone();
+        let poisoner = std::thread::Builder::new()
+            .name("poison-system-version-cache".into())
+            .spawn(move || {
+                let mut cache = poison_target
+                    .cache
+                    .lock()
+                    .expect("version cache starts healthy");
+                cache.insert(poisoned_path, Version::parse("99.99.99"));
+                panic!("inject system version cache poison");
+            })
+            .expect("spawn version cache poisoner");
+        assert!(poisoner.join().is_err());
+
+        assert_eq!(provider.version_of(&candidate).raw(), "4.5.6");
+        assert!(!provider.cache.is_poisoned());
+        assert_eq!(provider.lock_cache().len(), 1);
+    }
+
+    #[test]
+    fn production_system_cache_has_no_panicking_lock_access() {
+        let production = include_str!("system.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source prefix");
+        let compact = production.split_whitespace().collect::<String>();
+        for forbidden in [".lock().unwrap(", ".lock().expect("] {
+            assert!(
+                !compact.contains(forbidden),
+                "production system cache synchronization contains `{forbidden}`"
+            );
+        }
     }
 }

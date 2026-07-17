@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct IdKey {
@@ -30,6 +30,20 @@ impl HashCache {
         HashCache::default()
     }
 
+    fn lock_map(&self) -> MutexGuard<'_, HashMap<IdKey, String>> {
+        match self.map.lock() {
+            Ok(map) => map,
+            Err(poisoned) => {
+                // File hashes are an advisory acceleration only. Discard the
+                // unknowable snapshot and rebuild entries from file contents.
+                let mut map = poisoned.into_inner();
+                map.clear();
+                self.map.clear_poison();
+                map
+            }
+        }
+    }
+
     /// Return the blake3 hex digest of the file at `path`, using the identity
     /// cache. Reads the file only on a cache miss.
     pub fn hash_file(&self, path: &Path) -> io::Result<String> {
@@ -41,12 +55,12 @@ impl HashCache {
             mtime_ns: meta.mtime_nsec(),
             len: meta.len(),
         };
-        if let Some(h) = self.map.lock().unwrap().get(&key) {
+        if let Some(h) = self.lock_map().get(&key) {
             return Ok(h.clone());
         }
         let bytes = std::fs::read(path)?;
         let hex = blake3::hash(&bytes).to_hex().to_string();
-        self.map.lock().unwrap().insert(key, hex.clone());
+        self.lock_map().insert(key, hex.clone());
         Ok(hex)
     }
 }
@@ -83,5 +97,48 @@ mod tests {
         std::fs::write(&p, b"bbbbbb").unwrap();
         let h2 = cache.hash_file(&p).unwrap();
         assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn poisoned_hash_cache_discards_untrusted_entries_and_rebuilds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bin");
+        std::fs::write(&path, b"trusted bytes").unwrap();
+        let cache = std::sync::Arc::new(HashCache::new());
+        cache.hash_file(&path).unwrap();
+
+        let poison_target = cache.clone();
+        let poisoner = std::thread::Builder::new()
+            .name("poison-reef-hash-cache".into())
+            .spawn(move || {
+                let mut map = poison_target.map.lock().expect("hash cache starts healthy");
+                let key = *map.keys().next().expect("initial hash populated the cache");
+                map.insert(key, "poisoned-cache-value".into());
+                panic!("inject hash cache poison");
+            })
+            .expect("spawn hash cache poisoner");
+        assert!(poisoner.join().is_err());
+
+        assert_eq!(
+            cache.hash_file(&path).unwrap(),
+            hash_bytes(b"trusted bytes")
+        );
+        assert!(!cache.map.is_poisoned());
+        assert_eq!(cache.lock_map().len(), 1);
+    }
+
+    #[test]
+    fn production_hash_cache_has_no_panicking_lock_access() {
+        let production = include_str!("hashcache.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source prefix");
+        let compact = production.split_whitespace().collect::<String>();
+        for forbidden in [".lock().unwrap(", ".lock().expect("] {
+            assert!(
+                !compact.contains(forbidden),
+                "production hash cache synchronization contains `{forbidden}`"
+            );
+        }
     }
 }
