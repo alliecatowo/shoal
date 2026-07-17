@@ -2494,6 +2494,7 @@ dependencies = [
 name = "shoal-eval"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "csv",
  "glob",
  "jiff",
@@ -2578,6 +2579,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "blake3",
+ "criterion",
  "ctrlc",
  "serde",
  "serde_json",

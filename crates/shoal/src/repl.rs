@@ -25,7 +25,7 @@ use crate::highlight::ShoalHighlighter;
 use crate::prompt;
 use crate::{format_parse_error, maybe_strip, no_color, report_eval_error};
 
-pub(crate) fn repl() -> Result<i32, String> {
+pub(crate) fn repl(_standalone: bool) -> Result<i32, String> {
     let cwd = std::env::current_dir().map_err(|e| format!("cannot determine cwd: {e}"))?;
     let bootstrap = shoal_host::SessionBootstrap::discover(&cwd).map_err(|e| e.to_string())?;
     // Before anything else prints: feed `render.color` into `no_color()` so

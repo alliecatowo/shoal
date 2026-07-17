@@ -137,7 +137,7 @@ fn real_main(args: Vec<OsString>) -> Result<i32, String> {
                 .map_err(|e| format!("cannot read stdin: {e}"))?;
             run_source(&src, Some(Path::new("<stdin>")), false, Vec::new())
         }
-        Action::Interactive => repl::repl(),
+        Action::Interactive { standalone } => repl::repl(standalone),
         Action::Fmt { check, files } => args::fmt_command(check, files),
         Action::Doctor { json } => {
             let report = shoal_doctor::run(&shoal_doctor::Options::from_env());

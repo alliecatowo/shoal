@@ -12,7 +12,7 @@ use shoal_syntax::parse;
 
 use crate::prompt;
 
-pub(crate) const USAGE: &str = "shoal 0.1.0\n\nUsage: shoal [OPTIONS] [SCRIPT]\n       shoal <fmt|doctor|kernel|lsp|mcp|completions|prompt> ...\n\nOptions:\n  -c, --command <SOURCE>  Evaluate source and exit\n  -h, --help              Print help\n  -V, --version           Print version\n\nCommands:\n  kernel start|status|stop [--json]  Manage the resident kernel\n\nDeveloper commands:\n  fmt [--check] [FILES]   Format .shl source (stdin when no files)\n  doctor [--json]         Diagnose the installation\n  lsp                     Run the language server companion\n  mcp                     Run the MCP companion\n  completions SHELL       Print bash, zsh, or fish completions\n  prompt explain|bench|print [--side left|right|continuation|transient] [--n N]";
+pub(crate) const USAGE: &str = "shoal 0.1.0\n\nUsage: shoal [OPTIONS] [SCRIPT]\n       shoal <fmt|doctor|kernel|lsp|mcp|completions|prompt> ...\n\nOptions:\n  -c, --command <SOURCE>  Evaluate source and exit\n  --standalone            Run an explicit embedded/offline REPL\n  -h, --help              Print help\n  -V, --version           Print version\n\nCommands:\n  kernel start|status|stop [--json]  Manage the resident kernel\n\nDeveloper commands:\n  fmt [--check] [FILES]   Format .shl source (stdin when no files)\n  doctor [--json]         Diagnose the installation\n  lsp                     Run the language server companion\n  mcp                     Run the MCP companion\n  completions SHELL       Print bash, zsh, or fish completions\n  prompt explain|bench|print [--side left|right|continuation|transient] [--n N]";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KernelAction {
@@ -25,7 +25,7 @@ pub(crate) enum Action {
     Command(String, Vec<OsString>),
     Script(PathBuf, Vec<OsString>),
     Stdin,
-    Interactive,
+    Interactive { standalone: bool },
     Help,
     Version,
     Fmt { check: bool, files: Vec<PathBuf> },
@@ -40,12 +40,13 @@ pub(crate) fn parse_args(args: Vec<OsString>, stdin_is_tty: bool) -> Result<Acti
     let mut iter = args.into_iter();
     let Some(first) = iter.next() else {
         return Ok(if stdin_is_tty {
-            Action::Interactive
+            Action::Interactive { standalone: false }
         } else {
             Action::Stdin
         });
     };
     match first.to_str() {
+        Some("--standalone") => no_trailing(iter, Action::Interactive { standalone: true }),
         Some("fmt") => {
             let mut check = false;
             let mut files = vec![];
@@ -197,13 +198,13 @@ pub(crate) fn run_companion(name: &str) -> Result<i32, String> {
 pub(crate) fn completion_script(shell: &str) -> Result<&'static str, String> {
     match shell {
         "bash" => Ok(
-            "_shoal(){ COMPREPLY=( $(compgen -W 'fmt doctor kernel lsp mcp completions --help --version --command' -- \"${COMP_WORDS[COMP_CWORD]}\") ); }\ncomplete -F _shoal shoal\n",
+            "_shoal(){ COMPREPLY=( $(compgen -W 'fmt doctor kernel lsp mcp completions --help --version --command --standalone' -- \"${COMP_WORDS[COMP_CWORD]}\") ); }\ncomplete -F _shoal shoal\n",
         ),
         "zsh" => Ok(
-            "#compdef shoal\n_arguments '1:command:(fmt doctor kernel lsp mcp completions)' '*:file:_files'\n",
+            "#compdef shoal\n_arguments '--standalone[run embedded/offline REPL]' '1:command:(fmt doctor kernel lsp mcp completions)' '*:file:_files'\n",
         ),
         "fish" => Ok(
-            "complete -c shoal -f -a 'fmt doctor kernel lsp mcp completions'\ncomplete -c shoal -s c -l command -r\n",
+            "complete -c shoal -f -a 'fmt doctor kernel lsp mcp completions'\ncomplete -c shoal -s c -l command -r\ncomplete -c shoal -l standalone\n",
         ),
         _ => Err(format!(
             "unsupported shell `{shell}`; expected bash, zsh, or fish"
@@ -219,7 +220,11 @@ mod tests {
     fn argument_modes_are_deterministic() {
         assert!(matches!(
             parse_args(vec![], true).unwrap(),
-            Action::Interactive
+            Action::Interactive { standalone: false }
+        ));
+        assert!(matches!(
+            parse_args(vec!["--standalone".into()], true).unwrap(),
+            Action::Interactive { standalone: true }
         ));
         assert!(matches!(parse_args(vec![], false).unwrap(), Action::Stdin));
         assert!(matches!(
