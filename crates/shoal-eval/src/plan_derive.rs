@@ -461,7 +461,7 @@ impl Evaluator {
             }
             return Ok(());
         }
-        if let Some(adapter) = self.adapters.lookup(&call.head).cloned() {
+        if let Some(adapter) = self.host.adapters.lookup(&call.head).cloned() {
             let (spec, start) = match call.args.first() {
                 Some(CmdArg::Word { text, .. }) if adapter.subs.contains_key(text) => {
                     (adapter.subs[text].clone(), 1)

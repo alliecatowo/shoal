@@ -18,7 +18,8 @@ impl Evaluator {
                     // Undo (site/content/internals/language-conformance-contract.md): snapshot the target's prior bytes first, so
                     // `echo x > f` is reversible exactly like `cp`/`save`.
                     let undo_pre = self.redirect_undo_pre(&p);
-                    self.fs
+                    self.host
+                        .fs
                         .write(&p, &value_bytes(&value))
                         .map_err(|e| ErrorVal::new("custom", e.to_string()))?;
                     self.overwrite_undo_post(undo_pre);
@@ -27,7 +28,8 @@ impl Evaluator {
                 RedirectKind::Append => {
                     let p = self.arg_path(&r.target)?;
                     let undo_pre = self.redirect_undo_pre(&p);
-                    self.fs
+                    self.host
+                        .fs
                         .append(&p, &value_bytes(&value))
                         .map_err(|e| ErrorVal::new("custom", e.to_string()))?;
                     self.overwrite_undo_post(undo_pre);
@@ -82,7 +84,8 @@ impl Evaluator {
             }
         };
         let p = if p.is_absolute() { p } else { self.cwd.join(p) };
-        self.opener
+        self.host
+            .opener
             .open(&p)
             .map_err(|e| ErrorVal::new("custom", e))?;
         Ok(Value::Null)

@@ -177,7 +177,7 @@ impl Evaluator {
         // The tail producer reads through the `Fs` port (not `std::fs` directly)
         // so the streaming source is interposable/fakeable like every other
         // filesystem effect; the `Arc` clone rides into the producer thread.
-        let fs = self.fs.clone();
+        let fs = self.host.fs.clone();
         std::thread::spawn(move || tail_loop(&fs, &path, from_start, &tx));
         Ok(Value::Stream(StreamVal::from_channel("str", rx)))
     }

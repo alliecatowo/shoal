@@ -39,12 +39,12 @@ impl Evaluator {
                 } else if name == "now" {
                     // Relative anchor (site/content/internals/language-conformance-contract.md): live wall-clock datetime.
                     Ok(Value::DateTime(Box::new(crate::helpers::now_zoned(
-                        self.clock.as_ref(),
+                        self.host.clock.as_ref(),
                     ))))
                 } else if name == "today" {
                     // Relative anchor (site/content/internals/language-conformance-contract.md): today at midnight.
                     Ok(Value::DateTime(Box::new(crate::helpers::today_zoned(
-                        self.clock.as_ref(),
+                        self.host.clock.as_ref(),
                     ))))
                 } else if self.is_command_name(name) {
                     let call = CmdCall {
@@ -164,6 +164,7 @@ impl Evaluator {
                     // `SHOAL_SECRET_DIR`/`XDG_DATA_HOME`/`HOME` directory and
                     // opens the same `shoal_secret::SecretStore` as before.
                     let value = self
+                        .host
                         .secrets
                         .get(secret_name)
                         .map_err(|e| ErrorVal::new("permission", e))?
@@ -209,12 +210,12 @@ impl Evaluator {
                     // Relative anchors as functions (site/content/internals/language-conformance-contract.md): `now()`/`today()`.
                     "now" if args.pos.is_empty() && args.named.is_empty() => {
                         return Ok(Value::DateTime(Box::new(crate::helpers::now_zoned(
-                            self.clock.as_ref(),
+                            self.host.clock.as_ref(),
                         ))));
                     }
                     "today" if args.pos.is_empty() && args.named.is_empty() => {
                         return Ok(Value::DateTime(Box::new(crate::helpers::today_zoned(
-                            self.clock.as_ref(),
+                            self.host.clock.as_ref(),
                         ))));
                     }
                     "assert" => {

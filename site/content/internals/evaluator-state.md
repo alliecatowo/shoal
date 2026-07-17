@@ -98,21 +98,28 @@ dynamic, session-global, host-global, inherited into children, journaled, or res
 field without an explicit rule will eventually behave differently in `spawn`, `source`, module
 loading, and kernel sessions.
 
-**Field grouping (HR-J2 decomposition, steps 2–3).** The rows above still name the individual
+**Field grouping (HR-J2 decomposition, steps 2–4).** The rows above still name the individual
 state, but several fields now live in embedded sub-structs rather than flat on `Evaluator` — the
 grouping is behavior-identical, it just makes a child's inheritance rules enforceable by type (see
 [evaluator decomposition](@/internals/evaluator-decomposition.md)):
 
+- `host: Arc<HostServices>` holds the host-installed service handles — the effect ports (`fs`,
+  `exec`, `clock`, `opener`, `secrets`, `config`), the adapter `catalog`, the event `bus`, and the
+  reef resolution *inputs* `reef_resolver` and `reef_user_manifest` — accessed as
+  `self.host.<field>`. It is set once by the host before evaluation (the `set_*` setters call
+  `Arc::make_mut`, which never clones because setters run at refcount 1) and read-only thereafter; a
+  child clones the one `Arc` and so inherits every port/adapter/resolution input unconditionally.
+  `reef_resolver` is a `OnceLock<Arc<Resolver>>` so its lazy default build stays a one-shot
+  memoization visible through the shared `Arc` without a `&mut` seam.
 - `session: SessionCtx` holds `principal`, `session_id`, `leash`, `echo_mode`, `interactive`,
   `journal`, and `sink` (identity, authority, presentation) — accessed as `self.session.<field>`.
   `interactive` is no longer a `pub` field; hosts call `Evaluator::set_interactive`.
 - `reef: ReefState` holds the reef overlay + per-cwd cache — `reef_overrides` → `reef.overrides`,
   `reef_chain` → `reef.chain`, `reef_lock` → `reef.lock`, `reef_lock_path` → `reef.lock_path` — so
-  a child inherits the whole overlay as one unit. The resolution *inputs* `reef_resolver` and
-  `reef_user_manifest` stay top-level (host-installed, immutable per statement).
+  a child inherits the whole overlay as one unit.
 
-The remaining flat fields (`env`, `cwd`, `it`, effect ports, jobs, modules, …) are unchanged
-pending the later `HostServices`/`ExecState` extraction steps.
+The remaining flat fields (`env`, `cwd`, `it`, jobs, modules, …) are unchanged pending the later
+`ExecState` extraction step.
 
 ## Construction defaults are compatibility behavior
 

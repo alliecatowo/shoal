@@ -81,6 +81,7 @@ impl Evaluator {
             ));
         }
         let src = self
+            .host
             .fs
             .read_to_string(canon)
             .map_err(|e| ErrorVal::new("io_error", format!("cannot read module: {e}")))?;
