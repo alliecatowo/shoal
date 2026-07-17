@@ -113,8 +113,8 @@ Current stream-specific combinators are:
 | `window(count_or_duration)` | collect count/time windows |
 | `buffer(n)` | decouple: a producer thread runs the upstream up to `n` items ahead |
 | `enumerate()` | pair items with sequence positions |
-| `merge(other)` | interleave two streams |
-| `zip(other)` | pair two streams |
+| `merge(other)` | combine two streams as items arrive (left-biased polling, not fair interleaving) |
+| `zip(other)` | pair items positionally at the slower side's rate; ends with the shorter side |
 
 Every combinator consumes its input stream and returns a new one. Assign the new stream, not the old handle:
 

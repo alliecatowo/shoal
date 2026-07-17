@@ -678,8 +678,8 @@ A stream is single-consumer. Calling a lazy combinator moves its source into a n
 | `window` | `(positive_count|duration)` | list windows |
 | `buffer` | `(capacity = 1)` | decoupled stream: a producer thread runs the upstream up to `capacity` items ahead |
 | `enumerate` | `()` | `[index,item]` |
-| `merge` | `(stream)` | interleaved streams |
-| `zip` | `(stream)` | paired `[left,right]` until one ends |
+| `merge` | `(stream)` | combined stream, items as they arrive (left-biased polling) |
+| `zip` | `(stream)` | paired `[left,right]` at the slower side's rate, until one ends |
 
 ```shoal
 every(1s)

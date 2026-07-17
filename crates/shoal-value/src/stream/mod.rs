@@ -302,7 +302,11 @@ impl StreamVal {
         let bounded = self.bounded || other.bounded;
         let other_up = other.take_upstream()?;
         self.wrap("list", bounded, |up| {
-            Box::new(ops::Zip { a: up, b: other_up })
+            Box::new(ops::Zip {
+                a: up,
+                b: other_up,
+                pending_a: None,
+            })
         })
     }
 
@@ -402,6 +406,74 @@ mod tests {
         })
         .unwrap();
         out
+    }
+
+    #[test]
+    fn zip_holds_the_left_item_across_a_right_timeout() {
+        // HR-G6: zip pulls LEFT then RIGHT. When the right side times out, the
+        // already-pulled left item must be HELD for the next pull — a timeout
+        // is not the end of the stream, and discarding would be silent data
+        // loss under timing combinators. The next successful pull pairs the
+        // HELD item (1), not a freshly-pulled one (2).
+        let (tx, rx) = std::sync::mpsc::channel();
+        let a = StreamVal::from_iter("int", (1..=3).map(|i| Ok(Value::Int(i))));
+        let b = StreamVal::from_channel("int", rx);
+        let z = a.zip(b).unwrap();
+        let mut up = z.take_upstream().unwrap();
+        match up
+            .pull(&mut C, Some(std::time::Duration::from_millis(30)))
+            .unwrap()
+        {
+            Pull::Timeout => {}
+            Pull::Item(v) => panic!("right side is silent; got item {v:?}"),
+            Pull::End => panic!("stream is live; got End"),
+        }
+        tx.send(Ok(Value::Int(10))).unwrap();
+        match up
+            .pull(&mut C, Some(std::time::Duration::from_secs(5)))
+            .unwrap()
+        {
+            Pull::Item(v) => assert_eq!(
+                v,
+                Value::List(vec![Value::Int(1), Value::Int(10)]),
+                "the held left item pairs first — nothing was discarded"
+            ),
+            other => panic!(
+                "expected the pair, got {:?}",
+                matches!(other, Pull::End)
+                    .then_some("End")
+                    .unwrap_or("Timeout")
+            ),
+        }
+    }
+
+    #[test]
+    fn merge_sweeps_left_first_but_never_starves_a_silent_side() {
+        // HR-G6 precision: merge is a left-biased poll sweep, not fair
+        // interleaving. (1) Two ready in-memory sources drain left side first.
+        let a = StreamVal::from_iter("int", (1..=2).map(|i| Ok(Value::Int(i))));
+        let b = StreamVal::from_iter("int", (3..=4).map(|i| Ok(Value::Int(i))));
+        assert_eq!(
+            drain(&a.merge(b).unwrap()),
+            vec![Value::Int(1), Value::Int(2), Value::Int(3), Value::Int(4)],
+            "ready sources drain left-first"
+        );
+        // (2) A silent-but-live left side only delays the right by one poll
+        // step — the sweep moves on and delivers the ready right item.
+        let (_keep_a_alive, rx_a) = std::sync::mpsc::channel();
+        let (tx_b, rx_b) = std::sync::mpsc::channel();
+        tx_b.send(Ok(Value::Int(7))).unwrap();
+        let a = StreamVal::from_channel("int", rx_a);
+        let b = StreamVal::from_channel("int", rx_b);
+        let m = a.merge(b).unwrap();
+        let mut up = m.take_upstream().unwrap();
+        match up
+            .pull(&mut C, Some(std::time::Duration::from_secs(5)))
+            .unwrap()
+        {
+            Pull::Item(v) => assert_eq!(v, Value::Int(7), "right item flows past silent left"),
+            _ => panic!("expected the right side's item"),
+        }
     }
 
     #[test]
