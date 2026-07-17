@@ -8,8 +8,8 @@ use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
 mod client;
 mod resources;
@@ -47,6 +47,9 @@ pub struct Facade {
     kernel: KernelClient,
     config: Config,
     subscriptions: HashMap<String, SubscriptionWorker>,
+    // Keeps exactly the daemon this facade autostarted alive and owned. Drop
+    // terminates/reaps it after the facade's protocol connections are gone.
+    _autostart: KernelAutostart,
 }
 
 struct SubscriptionWorker {
@@ -64,10 +67,18 @@ impl Drop for SubscriptionWorker {
 }
 impl Facade {
     pub fn connect(config: &Config) -> Result<Self, BridgeError> {
+        Self::connect_with_autostart(config, KernelAutostart::empty())
+    }
+
+    fn connect_with_autostart(
+        config: &Config,
+        autostart: KernelAutostart,
+    ) -> Result<Self, BridgeError> {
         Ok(Self {
             kernel: KernelClient::connect(config)?,
             config: config.clone(),
             subscriptions: HashMap::new(),
+            _autostart: autostart,
         })
     }
     pub fn handle(&mut self, request: &Value) -> Option<Value> {
@@ -126,6 +137,67 @@ impl Facade {
     }
 }
 
+/// Ownership guard for a kernel process spawned by this MCP facade.
+///
+/// An empty guard represents an independently managed listener. A populated
+/// guard kills the spawned process group (and direct leader as a fallback)
+/// and reaps the leader on drop. Keeping it inside [`Facade`] prevents both
+/// premature daemon loss and abandoned child/zombie processes.
+pub struct KernelAutostart {
+    child: Option<Child>,
+    pgid: libc::pid_t,
+}
+
+impl KernelAutostart {
+    fn empty() -> Self {
+        Self {
+            child: None,
+            pgid: 0,
+        }
+    }
+
+    fn new(child: Child) -> Self {
+        let pgid = child.id() as libc::pid_t;
+        Self {
+            child: Some(child),
+            pgid,
+        }
+    }
+
+    fn terminate(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        if child.try_wait().ok().flatten().is_some() {
+            return;
+        }
+
+        // SAFETY: pgid is the positive pid of the child placed in a fresh
+        // process group by `kernel_command` / `start_kernel_command`.
+        let group_sent = unsafe { libc::kill(-self.pgid, libc::SIGKILL) } == 0;
+        let leader_sent = child.kill().is_ok();
+        if group_sent || leader_sent {
+            let _ = child.wait();
+        } else {
+            // If the OS refused both kill routes, do not replace a bounded
+            // shutdown with an unbounded wait. This still reaps an exit that
+            // raced the signals.
+            let _ = child.try_wait();
+        }
+    }
+
+    #[cfg(test)]
+    fn pid(&self) -> Option<u32> {
+        self.child.as_ref().map(Child::id)
+    }
+}
+
+impl Drop for KernelAutostart {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
 /// Best-effort: make sure a kernel is listening on `config.socket`, lazily
 /// bringing up a detached `shoal-kernel` daemon if none is. This is what makes
 /// the MCP plugin zero-config — registering `shoal mcp` as an MCP server is the
@@ -140,26 +212,56 @@ impl Facade {
 /// The kernel's own `prepare_socket` refuses to bind a socket another kernel is
 /// already listening on, so two agents racing to autostart just leave one live
 /// daemon — we connect to whichever won.
-pub fn ensure_kernel(config: &Config) {
+pub fn ensure_kernel(config: &Config) -> KernelAutostart {
     // Warm-daemon fast path: a listener is already up, nothing to do.
     if UnixStream::connect(&config.socket).is_ok() {
-        return;
+        return KernelAutostart::empty();
     }
     if std::env::var_os("SHOAL_NO_AUTOSTART").is_some_and(|v| !v.is_empty()) {
-        return;
+        return KernelAutostart::empty();
     }
     let program = kernel_program();
     let mut cmd = kernel_command(config, &program);
-    if cmd.spawn().is_err() {
-        return; // not on PATH / cannot exec — let Facade::connect surface it
-    }
-    // Poll for readiness (kernel binds its socket, then accepts). Bounded at
-    // ~5s so a genuinely broken kernel can't hang the agent forever.
-    for _ in 0..100 {
+    start_kernel_command(
+        config,
+        &mut cmd,
+        Duration::from_secs(5),
+        Duration::from_millis(50),
+    )
+}
+
+fn start_kernel_command(
+    config: &Config,
+    command: &mut Command,
+    readiness_timeout: Duration,
+    poll_interval: Duration,
+) -> KernelAutostart {
+    // Enforce the ownership boundary here too so test/custom commands cannot
+    // accidentally bypass group cleanup.
+    command.process_group(0);
+    let Ok(child) = command.spawn() else {
+        // Not on PATH / cannot exec — Facade::connect surfaces the real error.
+        return KernelAutostart::empty();
+    };
+    let mut ownership = KernelAutostart::new(child);
+    let start = Instant::now();
+    loop {
         if UnixStream::connect(&config.socket).is_ok() {
-            return;
+            return ownership;
         }
-        std::thread::sleep(Duration::from_millis(50));
+        let child_state = ownership.child.as_mut().map(std::process::Child::try_wait);
+        match child_state {
+            Some(Ok(Some(_))) | Some(Err(_)) | None => {
+                ownership.terminate();
+                return KernelAutostart::empty();
+            }
+            Some(Ok(None)) => {}
+        }
+        if start.elapsed() >= readiness_timeout {
+            ownership.terminate();
+            return KernelAutostart::empty();
+        }
+        std::thread::sleep(poll_interval.min(readiness_timeout.saturating_sub(start.elapsed())));
     }
 }
 
@@ -198,8 +300,9 @@ fn kernel_command(config: &Config, program: &Path) -> Command {
         // The daemon neither needs nor should inherit that secret: a kernel
         // evaluator and its child processes inherit the daemon environment.
         .env_remove("SHOAL_TOKEN")
-        // Detach stdout/stdin and start a new process group so the daemon
-        // outlives this (per-session, per-agent) mcp process.
+        // Detach stdout/stdin and start a new process group so the owning
+        // facade can terminate the whole autostarted tree without touching
+        // itself or an independently supervised kernel.
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         // Keep stderr inherited: startup/policy failures must remain diagnosable
@@ -233,8 +336,8 @@ fn append_kernel_limit_args(
 }
 
 pub fn run_stdio(config: &Config) -> Result<(), BridgeError> {
-    ensure_kernel(config);
-    let mut facade = Facade::connect(config)?;
+    let autostart = ensure_kernel(config);
+    let mut facade = Facade::connect_with_autostart(config, autostart)?;
     let stdin = io::stdin();
     let mut reader = stdin.lock();
     // stdout is written per-frame under its own lock (via `write_stdout_frame`)
@@ -317,7 +420,14 @@ fn fs_type(path: &Path) -> Option<std::fs::FileType> {
 mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
+    use std::sync::mpsc;
     use std::thread;
+
+    fn process_is_gone(pid: u32) -> bool {
+        // SAFETY: signal 0 only checks whether the recorded process exists.
+        let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        result == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    }
     fn mock() -> (tempfile::TempDir, Config, thread::JoinHandle<Vec<Value>>) {
         let d = tempfile::tempdir().unwrap();
         let path = d.path().join("kernel.sock");
@@ -430,7 +540,96 @@ mod tests {
         };
         // Returns immediately because the connect probe succeeds; a hang or a
         // stray spawn would show up as a test timeout / leaked process.
-        ensure_kernel(&c);
+        let guard = ensure_kernel(&c);
+        assert_eq!(guard.pid(), None);
+        drop(guard);
+        assert!(UnixStream::connect(&c.socket).is_ok());
+    }
+
+    #[test]
+    fn autostart_readiness_timeout_kills_and_reaps_owned_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_path = dir.path().join("kernel.pid");
+        let config = Config {
+            socket: dir.path().join("never-ready.sock"),
+            session: None,
+            token: None,
+            local_auth: LocalAuthMode::RestrictedAgent,
+        };
+        let script = format!("echo $$ > '{}'; sleep 30", pid_path.display());
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", &script]);
+
+        let start = Instant::now();
+        let guard = start_kernel_command(
+            &config,
+            &mut command,
+            Duration::from_millis(80),
+            Duration::from_millis(5),
+        );
+        assert_eq!(guard.pid(), None);
+        assert!(start.elapsed() < Duration::from_secs(1));
+        let pid = std::fs::read_to_string(pid_path)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        assert!(process_is_gone(pid));
+    }
+
+    #[test]
+    fn ready_autostart_remains_owned_until_guard_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("ready.sock");
+        let config = Config {
+            socket: socket.clone(),
+            session: None,
+            token: None,
+            local_auth: LocalAuthMode::RestrictedAgent,
+        };
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let listener_thread = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(30));
+            let listener = UnixListener::bind(socket).unwrap();
+            ready_tx.send(listener).unwrap();
+        });
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 30"]);
+        let guard = start_kernel_command(
+            &config,
+            &mut command,
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+        );
+        let listener = ready_rx.recv().unwrap();
+        listener_thread.join().unwrap();
+        let pid = guard.pid().expect("ready child remains owned");
+        assert!(!process_is_gone(pid));
+        drop(guard);
+        assert!(process_is_gone(pid));
+        drop(listener);
+    }
+
+    #[test]
+    fn facade_retains_then_reaps_its_autostarted_kernel() {
+        let (_dir, config, server) = mock();
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 30"]).process_group(0);
+        let child = command.spawn().unwrap();
+        let pid = child.id();
+        let guard = KernelAutostart::new(child);
+
+        let mut facade = Facade::connect_with_autostart(&config, guard).unwrap();
+        assert!(!process_is_gone(pid));
+        let _ = facade.handle(&json!({
+            "jsonrpc":"2.0",
+            "id":7,
+            "method":"tools/call",
+            "params":{"name":"shoal_exec","arguments":{"src":"1+2"}}
+        }));
+        drop(facade);
+        assert!(process_is_gone(pid));
+        server.join().unwrap();
     }
 
     #[test]
