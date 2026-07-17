@@ -203,8 +203,10 @@ Rules for implementers:
   — shipped: `sync_channel(replayed + 256)` per subscriber; replay never dropped; live overflow
   drops-newest with a coalesced in-order `{channel, seq, ts, payload: null, dropped: n}` marker
   (`seq` = newest dropped, a `since:` cursor); publishers never block.
-- [ ] **HR-G4** — Cancelling an `on(channel, handler)` task interrupts a blocking `recv`
+- [x] **HR-G4** — Cancelling an `on(channel, handler)` task interrupts a blocking `recv`
   (timeout, close, or wakeup token); no permanently stuck handler threads. *(I5)*
+  — shipped: 50 ms recv_timeout poll loop checking the task's cancel token between pulls; a
+  cancelled handler finishes with `null` and its subscription is pruned.
 - [x] **HR-G5** — `distinct` uses hashing (amortized O(1) membership); its memory behavior on
   unbounded streams is documented. *(I13)*
 - [ ] **HR-G6** — `zip`/`merge` rate-skew and backpressure semantics are documented precisely

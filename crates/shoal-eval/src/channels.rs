@@ -454,20 +454,53 @@ impl Evaluator {
         // dropping leash/reef/config (audit B1–B4). `Inherit` scope: the handler
         // sees the caller's bindings.
         let ctx = self.child_context();
+        let loop_cancel = child_cancel.clone();
         std::thread::spawn(move || {
             let mut ev = ctx.build(ChildScope::Inherit, child_cancel);
             let stream = StreamVal::from_channel("event", rx);
             let result = match stream.take_upstream() {
-                Ok(mut up) => shoal_value::drive_stream(&mut ev, &mut *up, |ctx, event| {
-                    ctx.call_closure(&handler, vec![event]).map(|_| ())
-                })
-                .map(|()| Value::Null),
+                Ok(mut up) => on_handler_loop(&mut ev, &mut *up, &handler, &loop_cancel),
                 Err(e) => Err(e),
             };
             worker.finish(result);
         });
         self.jobs.push(task.clone());
         Ok(Value::Task(task))
+    }
+}
+
+/// How often a blocked `on(channel, handler)` worker wakes to consult its
+/// cancellation token (HR-G4). The worst-case cancel latency for a handler
+/// blocked in an idle `recv`.
+const ON_CANCEL_POLL: Duration = Duration::from_millis(50);
+
+/// Drive an `on(channel, handler)` subscription, calling `handler` per event —
+/// like `drive_stream`, but pulls with a bounded timeout and consults `cancel`
+/// between pulls (HR-G4, audit I5). A blocking no-timeout `recv` could park the
+/// worker thread forever on a quiet channel with `task.cancel()` unable to
+/// reach it; here cancellation interrupts the wait within [`ON_CANCEL_POLL`]
+/// and the task finishes cleanly with `null` (the same result as the channel
+/// ending naturally). Cancellation is observed *between* pulls/handler calls —
+/// a handler already mid-call finishes its current event first (its exec
+/// cancellation token is the same one, so spawned work inside it is killed).
+fn on_handler_loop(
+    ev: &mut Evaluator,
+    up: &mut dyn shoal_value::Upstream,
+    handler: &Value,
+    cancel: &CancelToken,
+) -> VResult<Value> {
+    use shoal_value::{CallCtx, Pull};
+    loop {
+        if cancel.is_cancelled() {
+            return Ok(Value::Null);
+        }
+        match up.pull(ev, Some(ON_CANCEL_POLL))? {
+            Pull::Item(event) => {
+                ev.call_closure(handler, vec![event])?;
+            }
+            Pull::End => return Ok(Value::Null),
+            Pull::Timeout => continue,
+        }
     }
 }
 
