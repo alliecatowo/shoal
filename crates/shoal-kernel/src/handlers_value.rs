@@ -57,6 +57,47 @@ fn page_metadata(
     })
 }
 
+fn read_cas_range(
+    r#ref: &Ref,
+    cas: &shoal_value::CasBytesVal,
+    start: u64,
+    wanted: usize,
+) -> Result<Vec<u8>, RpcError> {
+    let mut reader = cas
+        .open()
+        .map_err(|error| cas_resolve_error(r#ref, error))?;
+    let skipped =
+        std::io::copy(&mut reader.by_ref().take(start), &mut std::io::sink()).map_err(|error| {
+            cas_resolve_error(
+                r#ref,
+                shoal_value::ErrorVal::new("io_error", error.to_string()),
+            )
+        })?;
+    if skipped != start {
+        return Err(cas_resolve_error(
+            r#ref,
+            shoal_value::ErrorVal::new("io_error", "CAS content ended before its recorded length"),
+        ));
+    }
+    let mut page = Vec::with_capacity(wanted);
+    reader
+        .take(wanted as u64)
+        .read_to_end(&mut page)
+        .map_err(|error| {
+            cas_resolve_error(
+                r#ref,
+                shoal_value::ErrorVal::new("io_error", error.to_string()),
+            )
+        })?;
+    if page.len() != wanted {
+        return Err(cas_resolve_error(
+            r#ref,
+            shoal_value::ErrorVal::new("io_error", "CAS content ended before its recorded length"),
+        ));
+    }
+    Ok(page)
+}
+
 fn raw_page(r#ref: &Ref, value: &Value, slice: Option<[usize; 2]>) -> Result<Json, RpcError> {
     match value {
         Value::Str(s) => {
@@ -133,44 +174,7 @@ fn raw_page(r#ref: &Ref, value: &Value, slice: Option<[usize; 2]>) -> Result<Jso
             let wanted = requested_end
                 .saturating_sub(start)
                 .min(RAW_PAGE_MAX_BYTES as u64) as usize;
-            let mut reader = cas
-                .open()
-                .map_err(|error| cas_resolve_error(r#ref, error))?;
-            let skipped = std::io::copy(&mut reader.by_ref().take(start), &mut std::io::sink())
-                .map_err(|error| {
-                    cas_resolve_error(
-                        r#ref,
-                        shoal_value::ErrorVal::new("io_error", error.to_string()),
-                    )
-                })?;
-            if skipped != start {
-                return Err(cas_resolve_error(
-                    r#ref,
-                    shoal_value::ErrorVal::new(
-                        "io_error",
-                        "CAS content ended before its recorded length",
-                    ),
-                ));
-            }
-            let mut page = Vec::with_capacity(wanted);
-            reader
-                .take(wanted as u64)
-                .read_to_end(&mut page)
-                .map_err(|error| {
-                    cas_resolve_error(
-                        r#ref,
-                        shoal_value::ErrorVal::new("io_error", error.to_string()),
-                    )
-                })?;
-            if page.len() != wanted {
-                return Err(cas_resolve_error(
-                    r#ref,
-                    shoal_value::ErrorVal::new(
-                        "io_error",
-                        "CAS content ended before its recorded length",
-                    ),
-                ));
-            }
+            let page = read_cas_range(r#ref, cas, start, wanted)?;
             let metadata = page_metadata(
                 total,
                 start,
@@ -261,19 +265,33 @@ impl Kernel {
                 let end = end.max(start).min(b.len());
                 Value::Bytes(std::sync::Arc::new(b[start..end].to_vec()))
             }
-            // site/content/internals/kernel-protocol.md: a slice of a CAS-backed bytes ref RESOLVES it. Slicing is
-            // an explicit "give me these bytes" ask, so materialize the full
-            // content from the CAS (through the value's own loader — the same
-            // `BytesLoad`/`Cas` seam the in-language path uses) and slice it.
-            // A small slice then travels inline; a slice that is itself still
-            // huge re-elides at the wall below, exactly like a plain `bytes`.
+            // A bounded JSON slice of CAS-backed bytes resolves through the
+            // verified stream. Reject a range above the structural hard wall
+            // before opening the blob; large transfers use pageable raw mode.
             (Some([start, end]), Value::CasBytes(c)) => {
-                let full = c
-                    .resolve()
-                    .map_err(|e| cas_resolve_error(&params.r#ref, e))?;
-                let start = start.min(full.len());
-                let end = end.max(start).min(full.len());
-                Value::Bytes(std::sync::Arc::new(full[start..end].to_vec()))
+                let start = (start as u64).min(c.len);
+                let end = (end as u64).max(start).min(c.len);
+                let wanted = end.saturating_sub(start);
+                if wanted > ELIDE_HARD_CAP as u64 {
+                    return Err(RpcError {
+                        code: BAD_PATH_OR_SLICE,
+                        message: format!(
+                            "CAS byte slice exceeds the {} byte JSON retrieval wall; use format \"raw\" and page with slice",
+                            ELIDE_HARD_CAP
+                        ),
+                        data: Some(json!({
+                            "ref": &params.r#ref,
+                            "requested_len": wanted,
+                            "max_bytes": ELIDE_HARD_CAP,
+                        })),
+                    });
+                }
+                Value::Bytes(std::sync::Arc::new(read_cas_range(
+                    &params.r#ref,
+                    &c,
+                    start,
+                    wanted as usize,
+                )?))
             }
             // Unordered/scalar values: a slice is a caller error — say so
             // instead of silently returning the unsliced value.

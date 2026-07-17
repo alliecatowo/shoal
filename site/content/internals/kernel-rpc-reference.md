@@ -292,6 +292,8 @@ Input:
 Resolution order is transcript lookup → path → slice → format. Slices work for lists, table rows,
 Unicode scalar positions in strings, resident byte offsets, and CAS-backed bytes. Slicing another
 kind is `BAD_PATH_OR_SLICE` rather than a silent no-op.
+CAS-backed JSON byte slices stream exactly when they fit the 64 KiB structural hard wall; larger
+ranges fail `BAD_PATH_OR_SLICE` before opening the blob and direct the caller to pageable raw mode.
 
 `json` returns `{ref,value}` with structural elision. `render` returns `{ref,render}` with the hard
 render cap. `raw` returns one page as `{ref,encoding,raw|raw_base64,page}`. A page contains at most

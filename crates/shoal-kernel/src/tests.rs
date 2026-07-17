@@ -2647,7 +2647,7 @@ fn raw_value_pages_are_bounded_pageable_and_stream_cas_content() {
 
     let decode =
         |s: &str| base64::Engine::decode(&base64::engine::general_purpose::STANDARD, s).unwrap();
-    let content = (0..(RAW_PAGE_MAX_BYTES * 3 + 11))
+    let content = (0..(ELIDE_HARD_CAP + RAW_PAGE_MAX_BYTES + 11))
         .map(|i| (i % 251) as u8)
         .collect::<Vec<_>>();
     let loads = Arc::new(AtomicUsize::new(0));
@@ -2736,10 +2736,21 @@ fn raw_value_pages_are_bounded_pageable_and_stream_cas_content() {
     assert_eq!(string["page"]["unit"], "unicode_scalar");
     assert!(string["raw"].as_str().unwrap().len() <= RAW_PAGE_MAX_BYTES);
 
-    let cas = call(
+    let oversized_json_slice = call(
         &mut client,
         &mut reader,
         5,
+        "value.get",
+        json!({"ref":"out:3","slice":[0, usize::MAX]}),
+    );
+    assert_eq!(oversized_json_slice.error.unwrap().code, BAD_PATH_OR_SLICE);
+    assert_eq!(loads.load(Ordering::SeqCst), 0);
+    assert_eq!(opens.load(Ordering::SeqCst), 0);
+
+    let cas = call(
+        &mut client,
+        &mut reader,
+        6,
         "value.get",
         json!({"ref":"out:3","format":"raw","slice":[13, usize::MAX]}),
     )
