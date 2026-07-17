@@ -8,8 +8,10 @@
 //! `setsid`-escaping descendant is outside that boundary.
 
 use std::io::{self, Read};
+use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -62,7 +64,10 @@ enum Stream {
 ///
 /// A leader that exits successfully but leaves descendants behind is also
 /// followed by a group kill. This keeps probes from leaking background helper
-/// processes or inherited pipe writers.
+/// processes or inherited pipe writers. A descendant that deliberately leaves
+/// the group (for example with `setsid`) cannot safely be signalled through
+/// group ownership; nonblocking, explicitly stoppable readers ensure such a
+/// process still cannot hold this function hostage through an inherited pipe.
 ///
 /// # Errors
 ///
@@ -101,18 +106,37 @@ pub fn run_bounded_command(
         Some(pipe) => pipe,
         None => return setup_failure(&mut child, pgid, "stderr pipe was not created"),
     };
+    if let Err(error) = set_nonblocking(&stdout).and_then(|()| set_nonblocking(&stderr)) {
+        kill_and_reap(&mut child, pgid);
+        return Err(error);
+    }
 
     let retained = Arc::new(Mutex::new(RetainedOutput::default()));
-    let stdout_reader = match spawn_reader(stdout, Stream::Stdout, output_cap, retained.clone()) {
+    let stop_readers = Arc::new(AtomicBool::new(false));
+    let stdout_reader = match spawn_reader(
+        stdout,
+        Stream::Stdout,
+        output_cap,
+        retained.clone(),
+        stop_readers.clone(),
+    ) {
         Ok(reader) => reader,
         Err(error) => {
+            stop_readers.store(true, Ordering::Release);
             kill_and_reap(&mut child, pgid);
             return Err(error);
         }
     };
-    let stderr_reader = match spawn_reader(stderr, Stream::Stderr, output_cap, retained.clone()) {
+    let stderr_reader = match spawn_reader(
+        stderr,
+        Stream::Stderr,
+        output_cap,
+        retained.clone(),
+        stop_readers.clone(),
+    ) {
         Ok(reader) => reader,
         Err(error) => {
+            stop_readers.store(true, Ordering::Release);
             kill_and_reap(&mut child, pgid);
             let _ = join_reader(stdout_reader);
             return Err(error);
@@ -129,7 +153,28 @@ pub fn run_bounded_command(
                 break (status, false, cleanup_error);
             }
             Ok(None) if start.elapsed() >= timeout => {
-                let cleanup_error = kill_group(pgid).err();
+                stop_readers.store(true, Ordering::Release);
+                let (signalled, cleanup_error) = signal_owned_processes(&mut child, pgid);
+                if !signalled {
+                    match child.try_wait() {
+                        Ok(Some(status)) => break (status, true, cleanup_error),
+                        Ok(None) => {
+                            let _ = join_reader(stdout_reader);
+                            let _ = join_reader(stderr_reader);
+                            return Err(cleanup_error.unwrap_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::PermissionDenied,
+                                    "could not terminate timed-out bounded command",
+                                )
+                            }));
+                        }
+                        Err(error) => {
+                            let _ = join_reader(stdout_reader);
+                            let _ = join_reader(stderr_reader);
+                            return Err(error);
+                        }
+                    }
+                }
                 let status = match child.wait() {
                     Ok(status) => status,
                     Err(error) => {
@@ -142,6 +187,7 @@ pub fn run_bounded_command(
             }
             Ok(None) => thread::sleep(Duration::from_millis(2)),
             Err(error) => {
+                stop_readers.store(true, Ordering::Release);
                 kill_and_reap(&mut child, pgid);
                 let _ = join_reader(stdout_reader);
                 let _ = join_reader(stderr_reader);
@@ -150,6 +196,7 @@ pub fn run_bounded_command(
         }
     };
 
+    stop_readers.store(true, Ordering::Release);
     let stdout_result = join_reader(stdout_reader);
     let stderr_result = join_reader(stderr_reader);
     if let Some(error) = cleanup_error {
@@ -181,6 +228,7 @@ fn spawn_reader<R: Read + Send + 'static>(
     stream: Stream,
     cap: usize,
     retained: Arc<Mutex<RetainedOutput>>,
+    stop: Arc<AtomicBool>,
 ) -> io::Result<JoinHandle<io::Result<()>>> {
     thread::Builder::new()
         .name(
@@ -190,7 +238,7 @@ fn spawn_reader<R: Read + Send + 'static>(
             }
             .to_string(),
         )
-        .spawn(move || drain_pipe(reader, stream, cap, &retained))
+        .spawn(move || drain_pipe(reader, stream, cap, &retained, &stop))
 }
 
 fn drain_pipe<R: Read>(
@@ -198,12 +246,24 @@ fn drain_pipe<R: Read>(
     stream: Stream,
     cap: usize,
     retained: &Mutex<RetainedOutput>,
+    stop: &AtomicBool,
 ) -> io::Result<()> {
     let mut chunk = [0_u8; 8192];
+    // Once the command is done, retain the already-buffered prefix and make a
+    // bounded effort to empty kernel pipe buffers. A continuously writing
+    // escaped descendant must not turn cleanup back into an unbounded drain.
+    let mut post_stop_budget: usize = 64 * 1024;
     loop {
+        let stopping = stop.load(Ordering::Acquire);
+        if stopping && post_stop_budget == 0 {
+            return Ok(());
+        }
         match reader.read(&mut chunk) {
             Ok(0) => return Ok(()),
             Ok(read) => {
+                if stopping {
+                    post_stop_budget = post_stop_budget.saturating_sub(read);
+                }
                 let mut output = match retained.lock() {
                     Ok(output) => output,
                     Err(poisoned) => poisoned.into_inner(),
@@ -218,7 +278,39 @@ fn drain_pipe<R: Read>(
                 output.truncated |= keep < read;
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if stopping {
+                    return Ok(());
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
             Err(error) => return Err(error),
+        }
+    }
+}
+
+fn set_nonblocking(fd: &impl AsRawFd) -> io::Result<()> {
+    let raw_fd = fd.as_raw_fd();
+    let flags = loop {
+        // SAFETY: F_GETFL only reads flags for a live pipe descriptor.
+        let flags = unsafe { libc::fcntl(raw_fd, libc::F_GETFL) };
+        if flags != -1 {
+            break flags;
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EINTR) {
+            return Err(error);
+        }
+    };
+    loop {
+        // SAFETY: F_SETFL mutates flags for the same live descriptor; keeping
+        // its existing flags and adding O_NONBLOCK is valid for a pipe.
+        if unsafe { libc::fcntl(raw_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } != -1 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EINTR) {
+            return Err(error);
         }
     }
 }
@@ -246,23 +338,55 @@ fn take_retained(retained: Arc<Mutex<RetainedOutput>>) -> RetainedOutput {
     }
 }
 
-fn kill_group(pgid: libc::pid_t) -> io::Result<()> {
+/// `true` means SIGKILL was delivered; `false` means the group no longer
+/// existed by the time it was signalled.
+fn kill_group(pgid: libc::pid_t) -> io::Result<bool> {
     // SAFETY: pgid is the positive pid of a child we placed in a fresh group.
     let result = unsafe { libc::kill(-pgid, libc::SIGKILL) };
     if result == 0 {
-        return Ok(());
+        return Ok(true);
     }
     let error = io::Error::last_os_error();
     if error.raw_os_error() == Some(libc::ESRCH) {
-        Ok(())
+        Ok(false)
     } else {
         Err(error)
     }
 }
 
 fn kill_and_reap(child: &mut Child, pgid: libc::pid_t) {
-    let _ = kill_group(pgid);
-    let _ = child.wait();
+    let (signalled, _) = signal_owned_processes(child, pgid);
+    if signalled {
+        let _ = child.wait();
+    } else {
+        // Never turn cleanup into an unbounded wait when the OS refused both
+        // kill routes. A final nonblocking probe still reaps an already-exited
+        // child in the common race.
+        let _ = child.try_wait();
+    }
+}
+
+/// `true` means SIGKILL was delivered; `false` means the leader had already
+/// exited by the time it was signalled.
+fn kill_leader(child: &mut Child) -> io::Result<bool> {
+    match child.kill() {
+        Ok(()) => Ok(true),
+        Err(error)
+            if error.kind() == io::ErrorKind::InvalidInput
+                || error.raw_os_error() == Some(libc::ESRCH) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn signal_owned_processes(child: &mut Child, pgid: libc::pid_t) -> (bool, Option<io::Error>) {
+    let group = kill_group(pgid);
+    let leader = kill_leader(child);
+    let signalled = matches!(group, Ok(true)) || matches!(leader, Ok(true));
+    let error = group.err().or_else(|| leader.err());
+    (signalled, error)
 }
 
 #[cfg(test)]
@@ -358,6 +482,50 @@ mod tests {
             assert!(
                 Instant::now() < deadline,
                 "descendant {descendant} survived"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn escaped_pipe_writer_cannot_hold_reader_joins_hostage() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let escaped_pid_path = dir.path().join("escaped.pid");
+        let script = format!(
+            "/usr/bin/setsid /bin/sh -c 'echo $$ > \"{}\"; while :; do printf x; done' & while [ ! -s '{}' ]; do :; done; exit 0",
+            escaped_pid_path.display(),
+            escaped_pid_path.display()
+        );
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", &script]);
+
+        let output = run_bounded_command(&mut command, Duration::from_secs(2), 1024)
+            .expect("escaped-writer probe");
+        assert!(output.status.success());
+        assert!(!output.timed_out);
+        assert!(output.duration < Duration::from_secs(1));
+
+        let escaped: libc::pid_t = fs::read_to_string(escaped_pid_path)
+            .expect("escaped pid")
+            .trim()
+            .parse()
+            .expect("numeric pid");
+        // The escaped process is outside the group ownership boundary. Close
+        // the adversarial fixture explicitly if dropping its inherited pipe
+        // did not already terminate it with SIGPIPE.
+        // SAFETY: this exact pid was written by the test fixture moments ago.
+        let _ = unsafe { libc::kill(escaped, libc::SIGKILL) };
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            // SAFETY: signal 0 only checks whether this recorded pid exists.
+            let result = unsafe { libc::kill(escaped, 0) };
+            if result == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "escaped writer {escaped} survived"
             );
             thread::sleep(Duration::from_millis(10));
         }
