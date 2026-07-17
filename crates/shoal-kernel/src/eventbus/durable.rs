@@ -135,7 +135,10 @@ impl DurableIndexes {
     pub(super) fn poison_journal_for_test(&self) {
         std::thread::scope(|scope| {
             let handle = scope.spawn(|| {
-                let _guard = self.journal.lock().unwrap();
+                let _guard = self
+                    .journal
+                    .lock()
+                    .expect("test lock should not be poisoned");
                 panic!("inject durable-index poison");
             });
             assert!(handle.join().is_err());

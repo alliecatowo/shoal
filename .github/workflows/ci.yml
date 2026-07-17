@@ -46,6 +46,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Format
         run: cargo fmt --all --check
+      - name: Reject raw kernel lock unwraps
+        run: |
+          if rg --multiline '\.(lock|read|write)\(\)\s*\.unwrap\(\)' crates/shoal-kernel/src; then
+            echo 'raw kernel lock unwraps bypass the subsystem poison policy'
+            exit 1
+          fi
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 

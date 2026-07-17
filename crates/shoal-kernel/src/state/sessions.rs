@@ -218,7 +218,10 @@ impl SessionRegistry {
     fn poison_lifecycle_for_test(&self) {
         std::thread::scope(|scope| {
             let handle = scope.spawn(|| {
-                let _lifecycle = self.lifecycle.lock().unwrap();
+                let _lifecycle = self
+                    .lifecycle
+                    .lock()
+                    .expect("test lock should not be poisoned");
                 panic!("inject session lifecycle poison");
             });
             assert!(handle.join().is_err());
@@ -229,7 +232,10 @@ impl SessionRegistry {
     fn poison_entries_for_test(&self) {
         std::thread::scope(|scope| {
             let handle = scope.spawn(|| {
-                let _entries = self.entries.lock().unwrap();
+                let _entries = self
+                    .entries
+                    .lock()
+                    .expect("test lock should not be poisoned");
                 panic!("inject session entries poison");
             });
             assert!(handle.join().is_err());

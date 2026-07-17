@@ -517,7 +517,15 @@ mod tests {
         drop(first);
         let replacement = registry.reserve(&owner("agent:a", "three")).unwrap();
         drop((second, third, replacement));
-        assert_eq!(registry.slots.state.lock().unwrap().global, 0);
+        assert_eq!(
+            registry
+                .slots
+                .state
+                .lock()
+                .expect("test lock should not be poisoned")
+                .global,
+            0
+        );
     }
 
     #[test]
@@ -536,7 +544,10 @@ mod tests {
         let poisoner = registry.clone();
         assert!(
             std::panic::catch_unwind(move || {
-                let _entries = poisoner.entries.lock().unwrap();
+                let _entries = poisoner
+                    .entries
+                    .lock()
+                    .expect("test lock should not be poisoned");
                 panic!("inject PTY registry poison");
             })
             .is_err()
@@ -564,7 +575,11 @@ mod tests {
         let poisoner = registry.clone();
         assert!(
             std::panic::catch_unwind(move || {
-                let _state = poisoner.slots.state.lock().unwrap();
+                let _state = poisoner
+                    .slots
+                    .state
+                    .lock()
+                    .expect("test lock should not be poisoned");
                 panic!("inject PTY quota poison");
             })
             .is_err()
@@ -587,7 +602,10 @@ mod tests {
         let poisoner = registry.clone();
         assert!(
             std::panic::catch_unwind(move || {
-                let _started = poisoner.reaper_started.lock().unwrap();
+                let _started = poisoner
+                    .reaper_started
+                    .lock()
+                    .expect("test lock should not be poisoned");
                 panic!("inject PTY reaper lifecycle poison");
             })
             .is_err()

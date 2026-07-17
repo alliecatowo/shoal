@@ -693,7 +693,10 @@ mod tests {
         let queue = SubQueue::new("user.poison".into());
         let poisoner = queue.clone();
         let thread = std::thread::spawn(move || {
-            let _state = poisoner.state.lock().unwrap();
+            let _state = poisoner
+                .state
+                .lock()
+                .expect("test lock should not be poisoned");
             panic!("inject subscriber queue poison");
         });
         assert!(thread.join().is_err());
@@ -956,7 +959,7 @@ mod tests {
         let hold = stalled_writer.clone();
         let (release_tx, release_rx) = mpsc::channel::<()>();
         let stall_thread = std::thread::spawn(move || {
-            let _guard = hold.lock().unwrap();
+            let _guard = hold.lock().expect("test lock should not be poisoned");
             let _ = release_rx.recv();
         });
         // Give the stall thread a moment to actually acquire the lock before
@@ -1006,7 +1009,7 @@ mod tests {
         let hold = writer.clone();
         let (release_tx, release_rx) = mpsc::channel::<()>();
         let stall_thread = std::thread::spawn(move || {
-            let _guard = hold.lock().unwrap();
+            let _guard = hold.lock().expect("test lock should not be poisoned");
             let _ = release_rx.recv();
         });
         std::thread::sleep(Duration::from_millis(50));

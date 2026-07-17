@@ -210,7 +210,10 @@ impl TaskRegistry {
     fn poison_entries_for_test(&self) {
         std::thread::scope(|scope| {
             let handle = scope.spawn(|| {
-                let _entries = self.entries.lock().unwrap();
+                let _entries = self
+                    .entries
+                    .lock()
+                    .expect("test lock should not be poisoned");
                 panic!("inject task registry poison");
             });
             assert!(handle.join().is_err());
@@ -251,7 +254,10 @@ mod poison_tests {
         let quota = registry.slots.clone();
         let poisoner = quota.clone();
         let thread = std::thread::spawn(move || {
-            let _counts = poisoner.counts.lock().unwrap();
+            let _counts = poisoner
+                .counts
+                .lock()
+                .expect("test lock should not be poisoned");
             panic!("inject task quota poison");
         });
         assert!(thread.join().is_err());

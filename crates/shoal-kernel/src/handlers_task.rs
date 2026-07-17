@@ -683,7 +683,10 @@ mod task_poison_tests {
         assert_eq!(Arc::strong_count(&session), baseline + 1);
         let poisoner = task.clone();
         let thread = std::thread::spawn(move || {
-            let _inner = poisoner.inner.lock().unwrap();
+            let _inner = poisoner
+                .inner
+                .lock()
+                .expect("test lock should not be poisoned");
             panic!("inject request-visible task poison");
         });
         assert!(thread.join().is_err());
@@ -704,7 +707,12 @@ mod task_poison_tests {
         assert_eq!(record["state"], "failed");
         assert_eq!(record["error"]["data"]["task_reconstructed"], true);
         assert_eq!(Arc::strong_count(&session), baseline + 1);
-        assert!(task.session_lease.lock().unwrap().is_none());
+        assert!(
+            task.session_lease
+                .lock()
+                .expect("test lock should not be poisoned")
+                .is_none()
+        );
 
         let replacement = kernel
             .tasks

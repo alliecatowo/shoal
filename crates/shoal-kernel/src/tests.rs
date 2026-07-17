@@ -162,9 +162,22 @@ fn per_session_resource_reservation_is_atomic_under_race() {
         reservations.iter().filter(|result| result.is_ok()).count(),
         1
     );
-    assert_eq!(quota.counts.lock().unwrap().get(&owner), Some(&1));
+    assert_eq!(
+        quota
+            .counts
+            .lock()
+            .expect("test lock should not be poisoned")
+            .get(&owner),
+        Some(&1)
+    );
     drop(reservations);
-    assert!(!quota.counts.lock().unwrap().contains_key(&owner));
+    assert!(
+        !quota
+            .counts
+            .lock()
+            .expect("test lock should not be poisoned")
+            .contains_key(&owner)
+    );
 }
 
 #[test]
@@ -448,7 +461,10 @@ fn poisoned_task_record_is_rebuilt_as_terminal_failure() {
     });
     let poisoner = task.clone();
     let thread = std::thread::spawn(move || {
-        let _inner = poisoner.inner.lock().unwrap();
+        let _inner = poisoner
+            .inner
+            .lock()
+            .expect("test lock should not be poisoned");
         panic!("inject task-record poison");
     });
     assert!(thread.join().is_err());
@@ -456,14 +472,19 @@ fn poisoned_task_record_is_rebuilt_as_terminal_failure() {
 
     task.fail_worker_panic();
     assert!(!task.inner.is_poisoned());
-    let inner = task.inner.lock().unwrap();
+    let inner = task.inner.lock().expect("test lock should not be poisoned");
     assert_eq!(inner.state, "failed");
     assert!(inner.finished_ns.is_some());
     assert!(inner.result_ref.is_none());
     assert_eq!(inner.error.as_ref().unwrap().code, INTERNAL_ERROR);
     assert!(inner.active_slot.is_none());
     drop(inner);
-    assert!(task.session_lease.lock().unwrap().is_none());
+    assert!(
+        task.session_lease
+            .lock()
+            .expect("test lock should not be poisoned")
+            .is_none()
+    );
 }
 
 #[test]
@@ -706,7 +727,10 @@ fn poisoned_pty_session_quarantines_only_that_entry_and_releases_quota() {
     let poisoner = entry.clone();
     assert!(
         std::thread::spawn(move || {
-            let _session = poisoner.session.lock().unwrap();
+            let _session = poisoner
+                .session
+                .lock()
+                .expect("test lock should not be poisoned");
             panic!("inject PTY session poison");
         })
         .join()
@@ -759,7 +783,10 @@ fn poisoned_pty_lifecycle_fails_typed_and_releases_on_entry_drop() {
     let poisoner = entry.clone();
     assert!(
         std::thread::spawn(move || {
-            let _lifecycle = poisoner.lifecycle.lock().unwrap();
+            let _lifecycle = poisoner
+                .lifecycle
+                .lock()
+                .expect("test lock should not be poisoned");
             panic!("inject PTY lifecycle poison");
         })
         .join()
@@ -816,7 +843,10 @@ fn self_exited_pty_releases_active_and_session_leases_without_a_request() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     let retained = kernel.ptys.get(&pty_ref).unwrap();
-    let lifecycle = retained.lifecycle.lock().unwrap();
+    let lifecycle = retained
+        .lifecycle
+        .lock()
+        .expect("test lock should not be poisoned");
     assert!(lifecycle.active_slot.is_none());
     assert!(lifecycle.session_lease.is_none());
     assert!(lifecycle.terminal_since.is_some());
@@ -837,7 +867,10 @@ fn transcript_is_bounded_at_insertion_time() {
     for id in 1..=(MAX_TRANSCRIPT_PER_SESSION as u64 + 1) {
         session.insert_transcript(Ref::new("out", id), Value::Int(id as i64));
     }
-    let transcript = session.transcript.lock().unwrap();
+    let transcript = session
+        .transcript
+        .lock()
+        .expect("test lock should not be poisoned");
     assert_eq!(transcript.len(), MAX_TRANSCRIPT_PER_SESSION);
     assert!(!transcript.contains_key(&Ref::new("out", 1)));
     assert!(transcript.contains_key(&Ref::new("out", MAX_TRANSCRIPT_PER_SESSION as u64 + 1)));
@@ -988,7 +1021,7 @@ fn unix_stream_session_roundtrip() {
     let blob = kernel
         .journal
         .lock()
-        .unwrap()
+        .expect("test lock should not be poisoned")
         .read_blob(value_hash)
         .unwrap()
         .unwrap();
@@ -2486,7 +2519,10 @@ fn value_get_resolves_cas_backed_bytes_ref() {
             truncated: false,
             loader: std::sync::Arc::new(FailLoader),
         });
-        let mut t = session.transcript.lock().unwrap();
+        let mut t = session
+            .transcript
+            .lock()
+            .expect("test lock should not be poisoned");
         t.insert(Ref::new("out", 1u64), Value::CasBytes(ok));
         t.insert(Ref::new("out", 2u64), Value::CasBytes(broken));
     }

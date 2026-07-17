@@ -217,7 +217,10 @@ impl ChannelRegistry {
     pub(super) fn poison_buffers_for_test(&self) {
         std::thread::scope(|scope| {
             let handle = scope.spawn(|| {
-                let _guard = self.buffers.lock().unwrap();
+                let _guard = self
+                    .buffers
+                    .lock()
+                    .expect("test lock should not be poisoned");
                 panic!("inject channel-registry poison");
             });
             assert!(handle.join().is_err());

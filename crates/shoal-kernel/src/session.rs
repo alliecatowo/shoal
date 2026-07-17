@@ -898,7 +898,10 @@ mod poison_tests {
         let healthy = kernel.session("healthy", "principal:test").unwrap();
         let poisoner = poisoned.clone();
         let thread = std::thread::spawn(move || {
-            let _evaluator = poisoner.evaluator.lock().unwrap();
+            let _evaluator = poisoner
+                .evaluator
+                .lock()
+                .expect("test lock should not be poisoned");
             panic!("inject evaluator poison");
         });
         assert!(thread.join().is_err());

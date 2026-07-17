@@ -280,7 +280,13 @@ mod tests {
         assert_eq!(first["items"][0]["value"]["v"], 1);
         assert_eq!(first["done"], false);
         let item_ref: Ref = serde_json::from_value(first["items"][0]["ref"].clone()).unwrap();
-        assert!(session.transcript.lock().unwrap().contains_key(&item_ref));
+        assert!(
+            session
+                .transcript
+                .lock()
+                .expect("test lock should not be poisoned")
+                .contains_key(&item_ref)
+        );
 
         let second = kernel
             .handle_stream_pull(json!({"cursor":cursor,"limit":64}), &mut attached)
@@ -359,7 +365,10 @@ mod tests {
 
         let first = session.stream_cursor(&cursor_refs[0]).unwrap();
         {
-            let mut first = first.inner.lock().unwrap();
+            let mut first = first
+                .inner
+                .lock()
+                .expect("test lock should not be poisoned");
             first.upstream.take();
             first.done = true;
         }
@@ -377,7 +386,10 @@ mod tests {
         let entry = session.stream_cursor(&cursor).unwrap();
         let poisoner = entry.clone();
         let thread = std::thread::spawn(move || {
-            let _cursor = poisoner.inner.lock().unwrap();
+            let _cursor = poisoner
+                .inner
+                .lock()
+                .expect("test lock should not be poisoned");
             panic!("inject cursor-inner poison");
         });
         assert!(thread.join().is_err());

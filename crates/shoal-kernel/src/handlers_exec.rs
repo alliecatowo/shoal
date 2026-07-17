@@ -843,7 +843,10 @@ mod tests {
 
         let poisoner = kernel.clone();
         let thread = std::thread::spawn(move || {
-            let _journal = poisoner.journal.lock().unwrap();
+            let _journal = poisoner
+                .journal
+                .lock()
+                .expect("test lock should not be poisoned");
             panic!("inject kernel journal poison");
         });
         assert!(thread.join().is_err());
@@ -891,7 +894,10 @@ mod tests {
         // unrelated epoch on the evaluator. The worker must replace that
         // unrelated epoch with the token stored in its TaskEntry once it owns
         // the evaluator. The old creation-time reset lost this cancellation.
-        let mut evaluator = session.evaluator.lock().unwrap();
+        let mut evaluator = session
+            .evaluator
+            .lock()
+            .expect("test lock should not be poisoned");
         let background = kernel
             .handle_exec(
                 json!({"src":"sh { sleep 30 }", "async":true}),
@@ -924,7 +930,10 @@ mod tests {
         let (session, mut attached) = attached(&kernel, "async-session-poison");
         let poisoner = session.clone();
         let thread = std::thread::spawn(move || {
-            let _evaluator = poisoner.evaluator.lock().unwrap();
+            let _evaluator = poisoner
+                .evaluator
+                .lock()
+                .expect("test lock should not be poisoned");
             panic!("inject async evaluator poison");
         });
         assert!(thread.join().is_err());
@@ -949,7 +958,10 @@ mod tests {
         let kernel = Kernel::new();
         let (session, mut attached) = attached(&kernel, "cancel-epoch-foreground");
         {
-            let evaluator = session.evaluator.lock().unwrap();
+            let evaluator = session
+                .evaluator
+                .lock()
+                .expect("test lock should not be poisoned");
             evaluator.cancel_current();
             assert!(evaluator.cancellation_token().is_cancelled());
         }
@@ -961,7 +973,7 @@ mod tests {
             !session
                 .evaluator
                 .lock()
-                .unwrap()
+                .expect("test lock should not be poisoned")
                 .cancellation_token()
                 .is_cancelled(),
             "foreground request inherited the previous cancelled epoch"
@@ -980,14 +992,19 @@ mod tests {
             session
                 .evaluator
                 .lock()
-                .unwrap()
+                .expect("test lock should not be poisoned")
                 .set_statement_sink(Box::new(move |value| {
-                    sink.lock().unwrap().push(value.clone());
+                    sink.lock()
+                        .expect("test lock should not be poisoned")
+                        .push(value.clone());
                 }));
             kernel
                 .handle_exec(json!({"src":"1 + 1\n42"}), 1, &mut attached_state)
                 .expect("multi-statement exec");
-            captured.lock().unwrap().clone()
+            captured
+                .lock()
+                .expect("test lock should not be poisoned")
+                .clone()
         }
 
         let kernel = Kernel::new();
@@ -1053,7 +1070,10 @@ mod tests {
             .session("set-source-probe", &actor)
             .expect("create session");
         {
-            let mut evaluator = session.evaluator.lock().unwrap();
+            let mut evaluator = session
+                .evaluator
+                .lock()
+                .expect("test lock should not be poisoned");
             evaluator.set_journal(
                 Journal::in_memory().expect("in-memory journal"),
                 "set-source-probe",

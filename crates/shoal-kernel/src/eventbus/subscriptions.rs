@@ -788,7 +788,10 @@ impl SubscriptionRegistry {
     pub(super) fn poison_connections_for_test(&self) {
         std::thread::scope(|scope| {
             let handle = scope.spawn(|| {
-                let _guard = self.connections.lock().unwrap();
+                let _guard = self
+                    .connections
+                    .lock()
+                    .expect("test lock should not be poisoned");
                 panic!("inject subscription-registry poison");
             });
             assert!(handle.join().is_err());
@@ -800,13 +803,17 @@ impl SubscriptionRegistry {
         let dispatcher = self
             .connections
             .lock()
-            .unwrap()
+            .expect("test lock should not be poisoned")
             .get(&conn)
             .expect("test dispatcher exists")
             .clone();
         std::thread::scope(|scope| {
             let handle = scope.spawn(|| {
-                let _guard = dispatcher.core.subscriptions.lock().unwrap();
+                let _guard = dispatcher
+                    .core
+                    .subscriptions
+                    .lock()
+                    .expect("test lock should not be poisoned");
                 panic!("inject connection-dispatcher poison");
             });
             assert!(handle.join().is_err());
