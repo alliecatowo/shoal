@@ -4,7 +4,6 @@
 //! the statement sink, or a child process) and never reach here.
 
 use super::*;
-use std::fs::OpenOptions;
 use std::io::Write as _;
 
 pub(crate) fn stream_method(
@@ -111,10 +110,14 @@ fn stream_save(ctx: &mut dyn CallCtx, s: StreamVal, path: &Value) -> VResult<Val
     } else {
         ctx.cwd().join(p)
     };
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&p)
+    // Open once through the injected `Fs` port instead of `std::fs::OpenOptions`
+    // (HR-C2): the sink keeps its open-once / append-each-item streaming shape,
+    // but the write now crosses the same enforceable boundary as `path.read`.
+    // `ctx.fs()` borrows `ctx` only for this call and hands back an owned
+    // writer, so `drive_stream` below can still take `ctx` mutably.
+    let mut file = ctx
+        .fs()
+        .open_append(&p)
         .map_err(|e| ErrorVal::new("custom", format!("{}: {e}", p.display())))?;
     let mut up = s.take_upstream()?;
     drive_stream(ctx, &mut *up, |_ctx, v| {

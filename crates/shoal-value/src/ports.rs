@@ -53,6 +53,28 @@ pub trait Fs: Send + Sync {
     /// Append bytes to a file, creating it if absent (`OpenOptions` create +
     /// append + `write_all`).
     fn append(&self, path: &Path, data: &[u8]) -> io::Result<()>;
+    /// Open a file for buffered, **incremental** appends, creating it if absent
+    /// (`OpenOptions::new().create(true).append(true)`). Backs the stream
+    /// `.save`/`.append` sink, which opens the file **once** and writes each
+    /// item as it arrives (live logging) rather than buffering the whole stream
+    /// — so it needs a long-lived writer, not the whole-buffer [`append`] above.
+    ///
+    /// [`StdFs`] returns the real appended `File`, preserving the open-once /
+    /// write-many syscall shape of the pre-port inline `OpenOptions` code. The
+    /// default fails **closed** with [`io::ErrorKind::Unsupported`]: an adapter
+    /// that mediates filesystem effects (a sandbox, a recording/denying test
+    /// fake) must override this to interpose on streamed appends, and one that
+    /// has not yet done so refuses the write rather than letting it escape the
+    /// port.
+    ///
+    /// [`append`]: Fs::append
+    fn open_append(&self, path: &Path) -> io::Result<Box<dyn io::Write + Send>> {
+        let _ = path;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this Fs adapter does not mediate streamed appends (open_append)",
+        ))
+    }
     /// Create a file if absent, updating its mtime otherwise — the `touch`
     /// builtin's `OpenOptions::new().create(true).append(true).open`.
     fn touch(&self, path: &Path) -> io::Result<()>;
@@ -114,6 +136,14 @@ impl Fs for StdFs {
             .append(true)
             .open(path)
             .and_then(|mut f| f.write_all(data))
+    }
+    fn open_append(&self, path: &Path) -> io::Result<Box<dyn io::Write + Send>> {
+        Ok(Box::new(
+            fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)?,
+        ))
     }
     fn touch(&self, path: &Path) -> io::Result<()> {
         fs::OpenOptions::new()
