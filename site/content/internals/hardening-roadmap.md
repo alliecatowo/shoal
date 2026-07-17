@@ -220,8 +220,11 @@ Rules for implementers:
 
 ### Workstream I — secrets and token store
 
-- [ ] **HR-I1** — Secret-store boundary documented honestly (key beside ciphertext ⇒ OS
+- [x] **HR-I1** — Secret-store boundary documented honestly (key beside ciphertext ⇒ OS
   permissions are the boundary), or key material moves to the OS keyring where available. *(J1)*
+  <br>Done: threat-model "Secret store design" states the OS-permission boundary plainly and
+  records the OS-keyring evaluation/deferral rationale; `SecretStore` carries a matching doc
+  comment.
 - [ ] **HR-I2** — Secret material zeroized where practical; env-injection copies noted in docs.
   *(J2)*
 - [ ] **HR-I3** — Interprocess locking (file lock or equivalent) around secret-store and

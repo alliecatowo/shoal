@@ -499,10 +499,23 @@ Names must be nonempty ASCII alphanumeric, underscore, or hyphen. `get` returns 
 Plain serialization and decrypted bytes use zeroizing wrappers in key paths, though intermediate map
 values and caller copies can still live in memory.
 
-AES-GCM detects envelope modification. The master key sits beside ciphertext under the same user
-permission boundary, so disk theft of both files yields decryption capability. This protects
-accidental plaintext disclosure and at-rest separation from the JSON data file; it does not protect
-against the same compromised user/process.
+AES-GCM detects envelope modification. **The real confidentiality boundary is the OS directory
+permission, not the encryption**: the master key sits beside the ciphertext in the same 0700
+directory, so copying that directory — or any read access available to the same user/process —
+yields both key and ciphertext. AES-GCM buys tamper detection and separates the store from
+accidental plaintext disclosure (e.g. a stray backup of only `secrets.json`, or a non-owner reader
+blocked by mode bits); it does not protect against the same compromised user or process that already
+has directory access.
+
+We evaluated moving the key into an OS keyring (the `keyring` crate, backed by the platform Secret
+Service/Keychain/Credential Manager) and decided to **defer** it, recorded here rather than silently
+dropped: `keyring` adds a per-platform D-Bus/Core Foundation/Windows Credential Manager dependency
+and requires a running desktop session or keychain daemon that headless servers, containers, and CI
+do not reliably have, and it would protect only the 32-byte AES key — the ciphertext stays in the
+same directory, so a same-user reader with an unlocked keyring available still recovers every secret.
+The added dependency/platform surface was judged larger than the boundary it would buy over stating
+the real boundary honestly. Revisit if shoal grows a primarily-interactive desktop deployment where a
+keyring daemon is already guaranteed present.
 
 ## Secret language boundary
 
