@@ -211,28 +211,31 @@ impl FrecencyStore {
         }
     }
 
-    /// Load the store from `path` through the [`Fs`] port. A missing or
-    /// unreadable file (or invalid UTF-8) is treated as an empty store — never
-    /// an error.
-    pub(crate) fn load(fs: &dyn Fs, path: &Path) -> Self {
-        match fs.read_to_string(path) {
+    /// Load the host-owned history database. This persistence path is control
+    /// plane state chosen by the embedding host, not a language-selected path,
+    /// so it deliberately uses the ambient adapter rather than the evaluator's
+    /// sandboxed/in-memory [`Fs`] capability. A missing or unreadable file (or
+    /// invalid UTF-8) is treated as an empty store — never an error.
+    pub(crate) fn load_host(path: &Path) -> Self {
+        match StdFs.read_to_string(path) {
             Ok(text) => Self::parse(&text),
             Err(_) => Self::default(),
         }
     }
 
-    /// Atomically persist the store to `path` through the [`Fs`] port (write to
-    /// a temp file, then rename). Returns the I/O result; callers on the `cd`
-    /// hot path swallow it (best-effort).
-    pub(crate) fn save(&self, fs: &dyn Fs, path: &Path) -> std::io::Result<()> {
+    /// Atomically persist the host-owned database (write to a temp file, then
+    /// rename). Candidate directories never use this ambient service; they are
+    /// always probed through the evaluator's inherited [`Fs`] below. Returns
+    /// the I/O result; callers on the `cd` hot path swallow it (best-effort).
+    pub(crate) fn save_host(&self, path: &Path) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
-            fs.create_dir_all(parent)?;
+            StdFs.create_dir_all(parent)?;
         }
         // Per-pid temp name so concurrent shells don't stomp each other's
         // in-progress write before the atomic rename publishes it.
         let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-        fs.write(&tmp, self.serialize().as_bytes())?;
-        fs.rename(&tmp, path)?;
+        StdFs.write(&tmp, self.serialize().as_bytes())?;
+        StdFs.rename(&tmp, path)?;
         Ok(())
     }
 }
@@ -289,9 +292,9 @@ impl Evaluator {
             return; // recording disabled (scripts / -c / conformance)
         };
         let now = self.host.clock.now_ns() / 1_000_000_000;
-        let mut store = FrecencyStore::load(self.host.fs.as_ref(), &path);
+        let mut store = FrecencyStore::load_host(&path);
         store.add(dir, now);
-        let _ = store.save(self.host.fs.as_ref(), &path);
+        let _ = store.save_host(&path);
     }
 
     /// The `j`/`jump` builtin: resolve the best matching stored directory for an
@@ -328,7 +331,7 @@ impl Evaluator {
         let target = self
             .jump_resolve(query.as_deref())
             .map_err(|e| e.or_span(call.span))?;
-        let canon = target.canonicalize().map_err(|e| {
+        let canon = self.host.fs.canonicalize(&target).map_err(|e| {
             ErrorVal::new(
                 "not_found",
                 format!("jump target {}: {e}", target.display()),
@@ -353,14 +356,14 @@ impl Evaluator {
             } else {
                 self.exec.shell.cwd.join(q)
             };
-            if direct.is_dir() {
+            if self.host.fs.is_dir(&direct) {
                 return Ok(direct);
             }
         }
         let now = self.host.clock.now_ns() / 1_000_000_000;
-        let store = FrecencyStore::load(self.host.fs.as_ref(), &self.jump_read_path());
+        let store = FrecencyStore::load_host(&self.jump_read_path());
         for e in store.ranked(query, now) {
-            if e.path.is_dir() {
+            if self.host.fs.is_dir(&e.path) {
                 return Ok(e.path.clone());
             }
         }
@@ -379,6 +382,104 @@ impl Evaluator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shoal_value::ReadSeek;
+    use std::collections::HashSet;
+    use std::io;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct JumpProbeFs {
+        directories: HashSet<PathBuf>,
+        probes: Mutex<Vec<String>>,
+    }
+
+    impl JumpProbeFs {
+        fn with_directory(path: PathBuf) -> Self {
+            Self {
+                directories: HashSet::from([path]),
+                probes: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn probes(&self) -> Vec<String> {
+            self.probes.lock().unwrap().clone()
+        }
+
+        fn unsupported<T>() -> io::Result<T> {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "jump test filesystem denies unmediated operation",
+            ))
+        }
+    }
+
+    impl Fs for JumpProbeFs {
+        fn read(&self, _path: &Path) -> io::Result<Vec<u8>> {
+            Self::unsupported()
+        }
+        fn read_to_string(&self, _path: &Path) -> io::Result<String> {
+            Self::unsupported()
+        }
+        fn open_read(&self, _path: &Path) -> io::Result<Box<dyn ReadSeek + Send>> {
+            Self::unsupported()
+        }
+        fn write(&self, _path: &Path, _data: &[u8]) -> io::Result<()> {
+            Self::unsupported()
+        }
+        fn append(&self, _path: &Path, _data: &[u8]) -> io::Result<()> {
+            Self::unsupported()
+        }
+        fn touch(&self, _path: &Path) -> io::Result<()> {
+            Self::unsupported()
+        }
+        fn metadata(&self, _path: &Path) -> io::Result<std::fs::Metadata> {
+            Self::unsupported()
+        }
+        fn symlink_metadata(&self, _path: &Path) -> io::Result<std::fs::Metadata> {
+            Self::unsupported()
+        }
+        fn is_dir(&self, path: &Path) -> bool {
+            self.probes
+                .lock()
+                .unwrap()
+                .push(format!("is_dir:{}", path.display()));
+            self.directories.contains(path)
+        }
+        fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
+            self.probes
+                .lock()
+                .unwrap()
+                .push(format!("canonicalize:{}", path.display()));
+            Self::unsupported()
+        }
+        fn read_dir(&self, _path: &Path) -> io::Result<Vec<PathBuf>> {
+            Self::unsupported()
+        }
+        fn create_dir(&self, _path: &Path) -> io::Result<()> {
+            Self::unsupported()
+        }
+        fn create_dir_all(&self, _path: &Path) -> io::Result<()> {
+            Self::unsupported()
+        }
+        fn remove_file(&self, _path: &Path) -> io::Result<()> {
+            Self::unsupported()
+        }
+        fn remove_dir_all(&self, _path: &Path) -> io::Result<()> {
+            Self::unsupported()
+        }
+        fn rename(&self, _from: &Path, _to: &Path) -> io::Result<()> {
+            Self::unsupported()
+        }
+        fn copy(&self, _from: &Path, _to: &Path) -> io::Result<u64> {
+            Self::unsupported()
+        }
+        fn hard_link(&self, _src: &Path, _dst: &Path) -> io::Result<()> {
+            Self::unsupported()
+        }
+        fn symlink(&self, _target: &Path, _link: &Path) -> io::Result<()> {
+            Self::unsupported()
+        }
+    }
 
     fn entry(path: &str, rank: f64, last_access: i64) -> Entry {
         Entry {
@@ -489,11 +590,11 @@ notanumber\t100\t/bad/rank
         let dir = tempfile::tempdir().unwrap();
         // Missing file.
         let missing = dir.path().join("does-not-exist");
-        assert!(FrecencyStore::load(&StdFs, &missing).entries.is_empty());
+        assert!(FrecencyStore::load_host(&missing).entries.is_empty());
         // A file of pure garbage (no valid line) loads as empty, not an error.
         let corrupt = dir.path().join("corrupt");
         std::fs::write(&corrupt, b"\x00\x01not at all valid\xff\xfe").unwrap();
-        assert!(FrecencyStore::load(&StdFs, &corrupt).entries.is_empty());
+        assert!(FrecencyStore::load_host(&corrupt).entries.is_empty());
     }
 
     #[test]
@@ -503,8 +604,8 @@ notanumber\t100\t/bad/rank
         let mut store = FrecencyStore::default();
         store.add(Path::new("/x/y"), 300);
         store.add(Path::new("/x/y"), 350);
-        store.save(&StdFs, &path).unwrap();
-        let reloaded = FrecencyStore::load(&StdFs, &path);
+        store.save_host(&path).unwrap();
+        let reloaded = FrecencyStore::load_host(&path);
         assert_eq!(reloaded.entries.len(), 1);
         assert_eq!(reloaded.entries[0].path, PathBuf::from("/x/y"));
         assert_eq!(reloaded.entries[0].rank, 2.0);
@@ -547,6 +648,59 @@ notanumber\t100\t/bad/rank
     }
 
     #[test]
+    fn direct_jump_candidate_cannot_bypass_inherited_fs_directory_denial() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let ambient_only = root.join("ambient-only-jump-target");
+        std::fs::create_dir(&ambient_only).unwrap();
+        let fs = Arc::new(JumpProbeFs::default());
+        let mut parent = Evaluator::new(root.clone());
+        parent.set_fs(fs.clone());
+        let child = parent
+            .child_context()
+            .build(ChildKind::Spawn, CancelToken::new());
+
+        let error = child
+            .jump_resolve(Some("ambient-only-jump-target"))
+            .unwrap_err();
+        assert_eq!(error.code, "not_found");
+        assert_eq!(
+            fs.probes(),
+            vec![format!("is_dir:{}", ambient_only.display())]
+        );
+    }
+
+    #[test]
+    fn history_candidate_uses_inherited_fs_and_canonicalization_denial() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let history_target = root.join("history-shoal-project");
+        std::fs::create_dir(&history_target).unwrap();
+        let store_path = root.join("jump.frecency");
+        let mut history = FrecencyStore::default();
+        history.add(&history_target, 1_000);
+        history.save_host(&store_path).unwrap();
+
+        let fs = Arc::new(JumpProbeFs::with_directory(history_target.clone()));
+        let mut evaluator = evaluator_at(&root, &store_path, 1_001);
+        evaluator.set_fs(fs.clone());
+        let error = evaluator
+            .eval_program(&shoal_syntax::parse("j shoal-project").unwrap())
+            .unwrap_err();
+
+        assert_eq!(error.code, "not_found");
+        assert_eq!(evaluator.cwd(), root);
+        assert_eq!(
+            fs.probes(),
+            vec![
+                format!("is_dir:{}", root.join("shoal-project").display()),
+                format!("is_dir:{}", history_target.display()),
+                format!("canonicalize:{}", history_target.display()),
+            ]
+        );
+    }
+
+    #[test]
     fn cd_records_and_jump_resolves() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
@@ -559,7 +713,7 @@ notanumber\t100\t/bad/rank
         run(&mut ev, "cd ../beta/shoal-project");
 
         // Both destinations were recorded by the plain `cd`s.
-        let recorded = FrecencyStore::load(&StdFs, &store);
+        let recorded = FrecencyStore::load_host(&store);
         assert_eq!(
             recorded.entries.len(),
             2,
@@ -610,7 +764,7 @@ notanumber\t100\t/bad/rank
         // cd still works despite the corrupt store, and rewrites it cleanly.
         run(&mut ev, "cd dir1");
         assert_eq!(ev.cwd(), root.join("dir1").as_path());
-        let reloaded = FrecencyStore::load(&StdFs, &store);
+        let reloaded = FrecencyStore::load_host(&store);
         assert_eq!(reloaded.entries.len(), 1);
         assert_eq!(reloaded.entries[0].path, root.join("dir1"));
     }
@@ -627,5 +781,201 @@ notanumber\t100\t/bad/rank
         assert_eq!(ev.cwd(), root.join("sub").as_path());
         // No store file was created anywhere under the temp root.
         assert!(!root.join("jump.frecency").exists());
+    }
+
+    #[test]
+    fn production_evaluator_has_only_explicit_ambient_filesystem_exceptions() {
+        #[derive(Clone, Copy)]
+        struct ExpectedLine {
+            file: &'static str,
+            line: usize,
+            text: &'static str,
+        }
+
+        // These are not ambient probes: each receiver is Metadata previously
+        // obtained through Fs::metadata/Fs::symlink_metadata. Keeping this
+        // exact inventory lets the lexical scan reject every new no-argument
+        // `.is_dir()`/`.is_file()` call, whose receiver would otherwise be
+        // impossible to classify without a Rust type checker.
+        const MEDIATED_METADATA_CLASSIFICATION: &[ExpectedLine] = &[
+            ExpectedLine {
+                file: "builtins.rs",
+                line: 179,
+                text: "if m.is_dir() {",
+            },
+            ExpectedLine {
+                file: "builtins.rs",
+                line: 183,
+                text: "} else if m.is_file() {",
+            },
+            ExpectedLine {
+                file: "builtins.rs",
+                line: 315,
+                text: "if m.is_dir() {",
+            },
+            ExpectedLine {
+                file: "builtins.rs",
+                line: 372,
+                text: "if meta.is_dir() {",
+            },
+            ExpectedLine {
+                file: "builtins.rs",
+                line: 506,
+                text: "if !metadata.is_dir() || metadata.uid() != effective_uid || metadata.mode() & 0o077 != 0 {",
+            },
+            ExpectedLine {
+                file: "builtins.rs",
+                line: 520,
+                text: "if fs.symlink_metadata(path)?.is_dir() {",
+            },
+            ExpectedLine {
+                file: "builtins.rs",
+                line: 567,
+                text: "if !metadata.is_dir()",
+            },
+            ExpectedLine {
+                file: "expr_access.rs",
+                line: 415,
+                text: ".map(|m| m.is_dir())",
+            },
+            ExpectedLine {
+                file: "expr_access.rs",
+                line: 422,
+                text: ".map(|m| m.is_file())",
+            },
+        ];
+
+        // The only ambient filesystem operations in evaluator production:
+        // four calls implement the explicitly host-owned frecency database,
+        // and one sets permissions on a TempDir the Rust-script runner itself
+        // just created. Language-selected paths may not join this inventory.
+        const AMBIENT_ALLOWLIST: &[ExpectedLine] = &[
+            ExpectedLine {
+                file: "frecency.rs",
+                line: 220,
+                text: "match StdFs.read_to_string(path) {",
+            },
+            ExpectedLine {
+                file: "frecency.rs",
+                line: 232,
+                text: "StdFs.create_dir_all(parent)?;",
+            },
+            ExpectedLine {
+                file: "frecency.rs",
+                line: 237,
+                text: "StdFs.write(&tmp, self.serialize().as_bytes())?;",
+            },
+            ExpectedLine {
+                file: "frecency.rs",
+                line: 238,
+                text: "StdFs.rename(&tmp, path)?;",
+            },
+            ExpectedLine {
+                file: "script.rs",
+                line: 367,
+                text: "std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))?;",
+            },
+        ];
+
+        fn collect_rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    collect_rust_files(&path, out);
+                } else if path.extension() == Some(OsStr::new("rs")) {
+                    out.push(path);
+                }
+            }
+        }
+
+        fn expected_index(
+            expected: &[ExpectedLine],
+            file: &str,
+            line: usize,
+            text: &str,
+        ) -> Option<usize> {
+            expected
+                .iter()
+                .position(|item| item.file == file && item.line == line && item.text == text.trim())
+        }
+
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        collect_rust_files(&src, &mut files);
+        files.sort();
+        let mut seen_metadata = vec![false; MEDIATED_METADATA_CLASSIFICATION.len()];
+        let mut seen_ambient = vec![false; AMBIENT_ALLOWLIST.len()];
+        let mut unexpected = Vec::new();
+
+        for path in files {
+            let relative = path.strip_prefix(&src).unwrap().to_string_lossy();
+            if relative == "tests.rs" {
+                continue; // the whole file is included only under cfg(test)
+            }
+            let source = std::fs::read_to_string(&path).unwrap();
+            let production = source
+                .find("\n#[cfg(test)]\nmod ")
+                .map_or(source.as_str(), |index| &source[..index]);
+            for (offset, line) in production.lines().enumerate() {
+                let line_number = offset + 1;
+                let trimmed = line.trim();
+                if trimmed.starts_with("//") {
+                    continue;
+                }
+                let metadata_classification =
+                    trimmed.contains(".is_dir()") || trimmed.contains(".is_file()");
+                if metadata_classification {
+                    if let Some(index) = expected_index(
+                        MEDIATED_METADATA_CLASSIFICATION,
+                        &relative,
+                        line_number,
+                        trimmed,
+                    ) {
+                        seen_metadata[index] = true;
+                    } else {
+                        unexpected.push(format!(
+                            "{relative}:{line_number}: unclassified no-argument path probe: {trimmed}"
+                        ));
+                    }
+                }
+
+                let without_type_names = trimmed
+                    .replace("std::fs::Metadata", "")
+                    .replace("std::fs::Permissions", "");
+                let ambient = trimmed.contains(".exists()")
+                    || trimmed.contains(".canonicalize()")
+                    || [
+                        "Path::exists(",
+                        "Path::is_file(",
+                        "Path::is_dir(",
+                        "Path::canonicalize(",
+                    ]
+                    .iter()
+                    .any(|needle| trimmed.contains(needle))
+                    || without_type_names.contains("std::fs")
+                    || trimmed.contains("StdFs.");
+                if ambient {
+                    if let Some(index) =
+                        expected_index(AMBIENT_ALLOWLIST, &relative, line_number, trimmed)
+                    {
+                        seen_ambient[index] = true;
+                    } else {
+                        unexpected.push(format!(
+                            "{relative}:{line_number}: ambient filesystem access: {trimmed}"
+                        ));
+                    }
+                }
+            }
+        }
+
+        assert!(unexpected.is_empty(), "{}", unexpected.join("\n"));
+        assert!(
+            seen_metadata.iter().all(|seen| *seen),
+            "mediated metadata inventory is stale: {seen_metadata:?}"
+        );
+        assert!(
+            seen_ambient.iter().all(|seen| *seen),
+            "ambient filesystem allowlist is stale: {seen_ambient:?}"
+        );
     }
 }
