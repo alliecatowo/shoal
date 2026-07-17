@@ -1,0 +1,45 @@
+# cargo-audit configuration (HR-F6, site/content/internals/hardening-roadmap.md).
+#
+# This is the single documented allowlist location for accepted RUSTSEC advisories. `cargo audit`
+# auto-discovers this file at `.cargo/audit.toml` relative to the invocation directory (NOT a
+# bare root-level `audit.toml`, which cargo-audit does not read); the `supply-chain-audit` CI job
+# (.github/workflows/ci.yml) runs bare `cargo audit` from the repository root with no other flags,
+# so everything it accepts or rejects is controlled by this file alone. Do NOT silence an advisory
+# by disabling or weakening that CI job instead of listing it here with a reason.
+#
+# Every entry below traces to the same root cause: `shoal-wasm` depends on `wasmtime = "37"`
+# (crates/shoal-wasm/Cargo.toml), and every advisory affecting 37.0.3 is only fixed by a jump to
+# wasmtime >=42.0.2 (a major-version dependency bump), not a same-major patch release. Bumping
+# that dependency is explicitly out of scope for the workstream that authored this file (lint/CI
+# hygiene only, no dependency changes) and is tracked as follow-up work, not silently dropped.
+# `shoal-wasm` itself has no other crate depending on it and does not process untrusted WASM
+# modules in any shipped path yet (see the HR-F8 note in tooling-and-quality.md and the WASM row on
+# the implementation-status page) — these are real vulnerabilities in a real dependency, but none
+# are currently reachable through shipped Shoal behavior. Re-run `cargo audit` after any wasmtime
+# version bump and prune whichever of these no longer apply; do not add new IDs here without the
+# same trace-to-root-cause reasoning.
+[advisories]
+ignore = [
+    "RUSTSEC-2026-0093", # wasmtime 37.0.3: component-model UTF-16 transcoding OOB read; fixed >=42.0.2
+    "RUSTSEC-2026-0094", # wasmtime 37.0.3: Winch table.grow masking; fixed >=42.0.2 (Winch backend unused here)
+    "RUSTSEC-2026-0095", # wasmtime 37.0.3: Winch sandbox-escaping memory access (critical); fixed >=42.0.2 (Winch backend unused here)
+    "RUSTSEC-2026-0096", # wasmtime 37.0.3: aarch64 Cranelift miscompiled heap access (critical); fixed >=42.0.2
+    "RUSTSEC-2026-0114", # wasmtime 37.0.3: table-allocation-size panic; fixed >=43.0.2
+    "RUSTSEC-2026-0006", # wasmtime 37.0.3: x86-64 f64.copysign OOB load; fixed >=36.0.5,<37 (this crate floats within 37.x)
+    "RUSTSEC-2026-0020", # wasmtime 37.0.3: WASI guest-controlled resource exhaustion; fixed >=36.0.6,<37 or >=40.0.4
+    "RUSTSEC-2026-0021", # wasmtime 37.0.3: wasi:http/types.fields panic; fixed >=36.0.6,<37 or >=40.0.4
+    "RUSTSEC-2026-0085", # wasmtime 37.0.3: component `flags` lift panic; fixed >=42.0.2
+    "RUSTSEC-2026-0086", # wasmtime 37.0.3: 64-bit table + Winch host data leak (low); fixed >=42.0.2 (Winch backend unused here)
+    "RUSTSEC-2026-0087", # wasmtime 37.0.3: x86-64 Cranelift f64x2.splat OOB load; fixed >=42.0.2
+    "RUSTSEC-2026-0088", # wasmtime 37.0.3: pooling-allocator instance data leak (low); fixed >=42.0.2
+    "RUSTSEC-2026-0089", # wasmtime 37.0.3: Winch table.fill host panic; fixed >=42.0.2 (Winch backend unused here)
+    "RUSTSEC-2026-0091", # wasmtime 37.0.3: component-model string transcoding OOB write/crash; fixed >=42.0.2
+    "RUSTSEC-2026-0092", # wasmtime 37.0.3: misaligned component-model UTF-16 transcoding panic; fixed >=42.0.2
+]
+
+[output]
+# Beyond known-CVE vulnerabilities (which fail regardless of this section), also fail the gate on
+# unmaintained/unsound informational advisories and yanked crate versions in Cargo.lock — none are
+# currently present, so this is forward-hardening, not a suppression.
+deny = ["unmaintained", "unsound", "yanked"]
+quiet = false
