@@ -559,13 +559,13 @@ fn send_stdin_chunk(
     mut chunk: Vec<u8>,
 ) -> bool {
     loop {
+        if stop.is_cancelled() || parent_cancel.is_cancelled() {
+            return false;
+        }
         match sink.try_send(chunk) {
             Ok(()) => return true,
             Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return false,
             Err(std::sync::mpsc::TrySendError::Full(returned)) => {
-                if stop.is_cancelled() || parent_cancel.is_cancelled() {
-                    return false;
-                }
                 chunk = returned;
                 std::thread::park_timeout(Duration::from_millis(2));
             }

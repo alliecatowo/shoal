@@ -272,13 +272,13 @@ fn send_to_buffer(
     mut delivery: VResult<Value>,
 ) -> bool {
     loop {
+        if cancel.is_cancelled() || stop.load(Ordering::SeqCst) {
+            return false;
+        }
         match tx.try_send(delivery) {
             Ok(()) => return true,
             Err(TrySendError::Disconnected(_)) => return false,
             Err(TrySendError::Full(returned)) => {
-                if cancel.is_cancelled() || stop.load(Ordering::SeqCst) {
-                    return false;
-                }
                 delivery = returned;
                 std::thread::park_timeout(Duration::from_millis(2));
             }
