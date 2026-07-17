@@ -11,11 +11,14 @@ use shoal_value::{ErrorVal, Value};
 
 mod args;
 mod completer;
+mod embedded_kernel;
 mod highlight;
 mod kernel_cli;
+mod kernel_repl;
 mod keybindings;
 mod prompt;
 mod repl;
+mod repl_state;
 use args::Action;
 
 fn main() {

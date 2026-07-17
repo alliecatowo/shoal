@@ -3,9 +3,11 @@
 //! signal-handling + reedline/prompt wiring that only the interactive path
 //! needs.
 
+use std::collections::VecDeque;
 use std::fs;
 use std::io::{self, IsTerminal, Write as _};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use reedline::{
@@ -22,10 +24,65 @@ use shoal_value::{Env, Value};
 
 use crate::completer::{self, ShoalCompleter};
 use crate::highlight::ShoalHighlighter;
+use crate::kernel_repl::{KernelRpc, ProtocolOutcome, ProtocolSession};
 use crate::prompt;
+use crate::repl_state::{ProtocolSnapshot, RemoteEnvMirror};
 use crate::{format_parse_error, maybe_strip, no_color, report_eval_error};
 
-pub(crate) fn repl(_standalone: bool) -> Result<i32, String> {
+trait ReplProtocol {
+    fn execute(
+        &mut self,
+        src: &str,
+        interrupt: &AtomicBool,
+        width: usize,
+    ) -> Result<ProtocolOutcome, String>;
+    fn snapshot(&mut self) -> Result<serde_json::Value, String>;
+}
+
+impl<R: KernelRpc> ReplProtocol for ProtocolSession<R> {
+    fn execute(
+        &mut self,
+        src: &str,
+        interrupt: &AtomicBool,
+        width: usize,
+    ) -> Result<ProtocolOutcome, String> {
+        ProtocolSession::execute(self, src, interrupt, width)
+    }
+
+    fn snapshot(&mut self) -> Result<serde_json::Value, String> {
+        ProtocolSession::snapshot(self)
+    }
+}
+
+fn protocol_requested(standalone: bool, kernel_enabled: bool) -> bool {
+    !standalone && kernel_enabled
+}
+
+fn execute_protocol_line(
+    session: &mut impl ReplProtocol,
+    src: &str,
+    interrupt: &AtomicBool,
+    width: usize,
+) -> Result<ProtocolOutcome, String> {
+    if parse_job_control(src).is_some() {
+        return Err("fg/bg process-group job control is available only with --standalone".into());
+    }
+    let run_src = rewrite_fg(src).unwrap_or_else(|| src.to_string());
+    session.execute(&run_src, interrupt, width)
+}
+
+fn refresh_protocol_state(
+    session: &mut impl ReplProtocol,
+    mirror: &mut RemoteEnvMirror,
+    env: &Env,
+    cwd: &Arc<Mutex<PathBuf>>,
+) -> Result<ProtocolSnapshot, String> {
+    let snapshot = ProtocolSnapshot::parse(session.snapshot()?)?;
+    mirror.apply(&snapshot, env, cwd);
+    Ok(snapshot)
+}
+
+pub(crate) fn repl(standalone: bool) -> Result<i32, String> {
     let cwd = std::env::current_dir().map_err(|e| format!("cannot determine cwd: {e}"))?;
     let bootstrap = shoal_host::SessionBootstrap::discover(&cwd).map_err(|e| e.to_string())?;
     // Before anything else prints: feed `render.color` into `no_color()` so
@@ -39,6 +96,23 @@ pub(crate) fn repl(_standalone: bool) -> Result<i32, String> {
         );
     }
     let config = bootstrap.config().clone();
+    let protocol_backed = protocol_requested(standalone, config.kernel.enabled);
+    let mut embedded_child = None;
+    let mut protocol = if protocol_backed {
+        let socket = shoal_paths::ShoalPaths::discover().socket(&config.kernel.session);
+        let (client, child) =
+            crate::embedded_kernel::connect(crate::embedded_kernel::EmbeddedKernelConfig {
+                session: config.kernel.session.clone(),
+                state_dir: shoal_state_dir(),
+                socket,
+                policy: config.leash.policy.clone(),
+                program: None,
+            })?;
+        embedded_child = Some(child);
+        Some(ProtocolSession::new(client))
+    } else {
+        None
+    };
     // `render.paging`/`render.pager` (site/content/internals/configuration-reference.md): resolved once, here,
     // from the loaded config — not re-read per keystroke/render. `enabled`
     // defaults to `false` (config default `"never"`), so an unconfigured
@@ -56,9 +130,11 @@ pub(crate) fn repl(_standalone: bool) -> Result<i32, String> {
             maybe_strip(format!("\x1b[33;1mwarning:\x1b[0m {warning}"))
         );
     }
-    evaluator.set_statement_sink(Box::new(|v: &Value| {
-        let _ = print_value(v);
-    }));
+    if !protocol_backed {
+        evaluator.set_statement_sink(Box::new(|v: &Value| {
+            let _ = print_value(v);
+        }));
+    }
 
     // Install the command journal (site/content/internals/language-conformance-contract.md): without one, `undo`/`journal`/
     // `history` are inert (no journal means nothing is ever recorded). Open a
@@ -73,30 +149,38 @@ pub(crate) fn repl(_standalone: bool) -> Result<i32, String> {
     // with the journal (`<state_dir>/jump.frecency`). Every interactive `cd`
     // now bumps directory history; best-effort, so a store write failure never
     // breaks navigation. Kept off for `-c`/scripts (they use `Evaluator::new`).
-    evaluator.set_jump_store(state_dir.join("jump.frecency"));
-    let journal_reader = match (Journal::open(&state_dir), Journal::open(&state_dir)) {
-        (Ok(write_handle), Ok(read_handle)) => {
-            evaluator.set_journal(write_handle, REPL_SESSION, REPL_PRINCIPAL);
-            Some(read_handle)
-        }
-        (Err(e), _) | (_, Err(e)) => {
-            eprintln!(
-                "{}",
-                maybe_strip(format!(
-                    "\x1b[33;1mwarning:\x1b[0m journal unavailable ({e}); undo/journal/history disabled this session"
-                ))
-            );
-            None
+    if !protocol_backed {
+        evaluator.set_jump_store(state_dir.join("jump.frecency"));
+    }
+    let journal_reader = if protocol_backed {
+        None
+    } else {
+        match (Journal::open(&state_dir), Journal::open(&state_dir)) {
+            (Ok(write_handle), Ok(read_handle)) => {
+                evaluator.set_journal(write_handle, REPL_SESSION, REPL_PRINCIPAL);
+                Some(read_handle)
+            }
+            (Err(e), _) | (_, Err(e)) => {
+                eprintln!(
+                    "{}",
+                    maybe_strip(format!(
+                        "\x1b[33;1mwarning:\x1b[0m journal unavailable ({e}); undo/journal/history disabled this session"
+                    ))
+                );
+                None
+            }
         }
     };
     // Parallels `out`'s growth 1:1 (one push per successful `record_transcript`
     // call below): `out_entries[n]` is the journal entry id (if any) the
     // statement that produced `out[n]` recorded.
-    let mut out_entries: Vec<Option<i64>> = Vec::new();
+    let mut out_entries = VecDeque::new();
 
     let catalogs = bootstrap_report.adapter_catalogs;
     let adapter_names = completer::scan_adapter_names(&bootstrap_report.adapter_dirs);
-    bootstrap.run_init(&mut evaluator)?;
+    if !protocol_backed {
+        bootstrap.run_init(&mut evaluator)?;
+    }
 
     // Ctrl-C must not kill the shell (site/content/internals/language-conformance-contract.md): install a real SIGINT
     // handler so the OS's default "terminate" disposition never fires while
@@ -107,12 +191,15 @@ pub(crate) fn repl(_standalone: bool) -> Result<i32, String> {
     // (and the exec layer under it) observe cancellation cooperatively and
     // unwind to an error instead of the process dying.
     let cancel_slot = Arc::new(Mutex::new(evaluator.cancellation_token()));
+    let protocol_interrupt = Arc::new(AtomicBool::new(false));
     if let Ok(mut signals) =
         signal_hook::iterator::Signals::new([signal_hook::consts::signal::SIGINT])
     {
         let slot = cancel_slot.clone();
+        let interrupt = protocol_interrupt.clone();
         std::thread::spawn(move || {
             for _ in signals.forever() {
+                interrupt.store(true, Ordering::SeqCst);
                 if let Ok(token) = slot.lock() {
                     token.cancel();
                 }
@@ -130,6 +217,17 @@ pub(crate) fn repl(_standalone: bool) -> Result<i32, String> {
     }
 
     let cwd_cell = Arc::new(Mutex::new(evaluator.cwd().to_path_buf()));
+    let mut remote_env = RemoteEnvMirror::default();
+    let mut protocol_snapshot = if let Some(session) = protocol.as_mut() {
+        Some(refresh_protocol_state(
+            session,
+            &mut remote_env,
+            evaluator.env(),
+            &cwd_cell,
+        )?)
+    } else {
+        None
+    };
     let completer = ShoalCompleter::new(
         evaluator.env().clone(),
         cwd_cell.clone(),
@@ -244,7 +342,16 @@ pub(crate) fn repl(_standalone: bool) -> Result<i32, String> {
     loop {
         // Keep the completer's cwd view and the cancel handler's active
         // token fresh for the statement about to run.
-        if let Ok(mut cell) = cwd_cell.lock() {
+        if let Some(session) = protocol.as_mut() {
+            match refresh_protocol_state(session, &mut remote_env, evaluator.env(), &cwd_cell) {
+                Ok(snapshot) => {
+                    protocol_snapshot = Some(snapshot);
+                }
+                Err(error) => report_protocol_error(&format!(
+                    "cannot refresh interactive session state: {error}"
+                )),
+            }
+        } else if let Ok(mut cell) = cwd_cell.lock() {
             *cell = evaluator.cwd().to_path_buf();
         }
         evaluator.reset_cancel();
@@ -255,13 +362,41 @@ pub(crate) fn repl(_standalone: bool) -> Result<i32, String> {
         // Refresh the frozen prompt snapshot once, here, between commands —
         // never inside reedline's per-keystroke render (site/content/internals/prompt-editor-lsp.md).
         let width = u16::try_from(terminal_width()).unwrap_or(80);
-        let ctx = prompt::build_context(&mut evaluator, &static_facts, width);
+        let ctx = match &protocol_snapshot {
+            Some(snapshot) => prompt::build_context_from_protocol(snapshot, &static_facts, width),
+            None => prompt::build_context(&mut evaluator, &static_facts, width),
+        };
         if let Ok(mut cell) = shared_ctx.write() {
             *cell = Arc::new(ctx);
         }
         match editor.read_line(&shoal_prompt) {
             Ok(Signal::Success(src)) => {
                 if src.trim().is_empty() {
+                    continue;
+                }
+                if let Some(session) = protocol.as_mut() {
+                    protocol_interrupt.store(false, Ordering::SeqCst);
+                    match execute_protocol_line(
+                        session,
+                        &src,
+                        &protocol_interrupt,
+                        terminal_width(),
+                    ) {
+                        Ok(outcome) => {
+                            if let Some(code) = outcome.exit_code {
+                                return Ok(code);
+                            }
+                            if let Err(error) = render_protocol_outcome(&outcome, &pager_ctx) {
+                                eprintln!(
+                                    "{}",
+                                    maybe_strip(format!(
+                                        "\x1b[31;1merror:\x1b[0m cannot write output: {error}"
+                                    ))
+                                );
+                            }
+                        }
+                        Err(error) => report_protocol_error(&error),
+                    }
                     continue;
                 }
                 // Job control (site/content/internals/language-conformance-contract.md): `fg`/`bg` with a numeric job id (or a
@@ -304,7 +439,7 @@ pub(crate) fn repl(_standalone: bool) -> Result<i32, String> {
                                 let entry_id = journal_reader.as_ref().and_then(|journal| {
                                     latest_entry_id(journal, REPL_PRINCIPAL, started_ns)
                                 });
-                                out_entries.push(entry_id);
+                                push_out_entry(&mut out_entries, entry_id);
                                 evaluator.record_transcript(&value);
                                 // Paging (site/content/internals/configuration-reference.md `render.paging`) applies
                                 // ONLY to this final per-line result — never to
@@ -349,12 +484,14 @@ pub(crate) fn repl(_standalone: bool) -> Result<i32, String> {
                 }
             }
             Ok(Signal::CtrlC) => {
+                protocol_interrupt.store(false, Ordering::SeqCst);
                 println!("{}", maybe_strip("\x1b[90m^C\x1b[0m".to_string()));
             }
             Ok(Signal::CtrlD) => {
                 println!();
                 // Reap any Ctrl-Z'd jobs so no stopped child is orphaned.
                 shoal_eval::shutdown_stopped_jobs();
+                drop(embedded_child.take());
                 return Ok(0);
             }
             Ok(_) => {}
@@ -563,7 +700,7 @@ fn latest_entry_id(journal: &Journal, principal: &str, since_ns: i64) -> Option<
 /// Any other shape — bare `undo`, `undo 12`, a non-literal index, an index
 /// with no recorded entry — is left untouched and falls through to the
 /// eval's existing behavior/diagnostics.
-fn resolve_out_undo(program: &mut Program, out_entries: &[Option<i64>]) {
+fn resolve_out_undo(program: &mut Program, out_entries: &VecDeque<Option<i64>>) {
     for stmt in &mut program.stmts {
         let Stmt::Expr {
             expr: Expr::Cmd { call, .. },
@@ -579,9 +716,18 @@ fn resolve_out_undo(program: &mut Program, out_entries: &[Option<i64>]) {
             continue;
         };
         let idx = if n >= 0 {
-            n as usize
+            let Ok(index) = usize::try_from(n) else {
+                continue;
+            };
+            index
         } else {
-            let Some(idx) = out_entries.len().checked_sub((-n) as usize) else {
+            let Some(distance) = n
+                .checked_abs()
+                .and_then(|distance| usize::try_from(distance).ok())
+            else {
+                continue;
+            };
+            let Some(idx) = out_entries.len().checked_sub(distance) else {
                 continue;
             };
             idx
@@ -598,6 +744,17 @@ fn resolve_out_undo(program: &mut Program, out_entries: &[Option<i64>]) {
             span,
         };
     }
+}
+
+/// Keep the host-only journal-id mirror aligned with the evaluator's bounded
+/// `out` window. Once the oldest value is evicted, index zero must refer to the
+/// next retained value in both collections or `undo out[n]` targets the wrong
+/// journal entry.
+fn push_out_entry(out_entries: &mut VecDeque<Option<i64>>, entry_id: Option<i64>) {
+    if out_entries.len() >= shoal_eval::MAX_REPL_TRANSCRIPT_VALUES {
+        out_entries.pop_front();
+    }
+    out_entries.push_back(entry_id);
 }
 
 /// The literal integer index `N` out of a `CmdArg` shaped like `out[N]` /
@@ -624,7 +781,7 @@ fn out_index_literal(arg: &CmdArg) -> Option<i64> {
             expr,
             ..
         } => match expr.as_ref() {
-            Expr::Int { value, .. } => Some(-*value),
+            Expr::Int { value, .. } => value.checked_neg(),
             _ => None,
         },
         _ => None,
@@ -844,6 +1001,46 @@ pub(crate) fn print_value(value: &Value) -> io::Result<()> {
     Ok(())
 }
 
+fn report_protocol_error(error: &str) {
+    eprintln!(
+        "{}",
+        maybe_strip(format!("\x1b[31;1merror:\x1b[0m {error}"))
+    );
+}
+
+fn render_protocol_outcome(outcome: &ProtocolOutcome, pager: &PagerContext) -> io::Result<()> {
+    if outcome.state == "cancelled" {
+        println!("{}", maybe_strip("\x1b[90m^C\x1b[0m".to_string()));
+        return Ok(());
+    }
+    let Some(rendered) = protocol_render_text(outcome) else {
+        return Ok(());
+    };
+    render_text_paged(rendered, pager)
+}
+
+fn protocol_render_text(outcome: &ProtocolOutcome) -> Option<&str> {
+    (outcome.state != "cancelled" && !outcome.streamed)
+        .then_some(outcome.render.as_deref())
+        .flatten()
+        .filter(|render| !render.is_empty())
+}
+
+fn render_text_paged(rendered: &str, pager: &PagerContext) -> io::Result<()> {
+    let width = terminal_width();
+    let is_tty = io::stdout().is_terminal();
+    let line_count = wrapped_line_count(rendered, width);
+    if should_page(pager.enabled, is_tty, line_count, terminal_height()) {
+        let env_pager = std::env::var("PAGER").ok();
+        let argv = pager_command(pager.pager.as_deref(), env_pager.as_deref());
+        if spawn_pager(&argv, &maybe_strip(rendered.to_string())) {
+            return Ok(());
+        }
+    }
+    println!("{}", maybe_strip(rendered.to_string()));
+    Ok(())
+}
+
 /// Resolved `render.paging`/`render.pager` state for one REPL session
 /// (site/content/internals/configuration-reference.md), built once in `repl()` from the loaded config —
 /// never re-read per line. Kept as an explicit, narrow struct threaded only
@@ -881,20 +1078,7 @@ pub(crate) fn render_result_paged(
     if rendered.is_empty() {
         return Ok(());
     }
-    let is_tty = io::stdout().is_terminal();
-    let line_count = wrapped_line_count(&rendered, width);
-    if should_page(pager.enabled, is_tty, line_count, terminal_height()) {
-        let env_pager = std::env::var("PAGER").ok();
-        let argv = pager_command(pager.pager.as_deref(), env_pager.as_deref());
-        if spawn_pager(&argv, &maybe_strip(rendered.clone())) {
-            return Ok(());
-        }
-        // The pager could not even be launched (missing binary, spawn
-        // error): nothing has reached the user yet, so fall through to the
-        // plain print below rather than lose the output.
-    }
-    println!("{}", maybe_strip(rendered));
-    Ok(())
+    render_text_paged(&rendered, pager)
 }
 
 /// Pure paging gate (unit-testable without a real terminal/TTY): page only
@@ -1098,6 +1282,151 @@ fn input_is_incomplete(src: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct FakeProtocol {
+        seen: Vec<String>,
+        outcome: Result<ProtocolOutcome, String>,
+        snapshot: Result<serde_json::Value, String>,
+    }
+
+    impl ReplProtocol for FakeProtocol {
+        fn execute(
+            &mut self,
+            src: &str,
+            _interrupt: &AtomicBool,
+            _width: usize,
+        ) -> Result<ProtocolOutcome, String> {
+            self.seen.push(src.to_string());
+            self.outcome.clone()
+        }
+
+        fn snapshot(&mut self) -> Result<serde_json::Value, String> {
+            self.snapshot.clone()
+        }
+    }
+
+    fn unused_snapshot() -> Result<serde_json::Value, String> {
+        Err("snapshot not used by line-level test".into())
+    }
+
+    fn protocol_outcome(render: Option<&str>, state: &str) -> ProtocolOutcome {
+        ProtocolOutcome {
+            value_ref: Some("out:1".into()),
+            render: render.map(str::to_owned),
+            state: state.into(),
+            exit_code: None,
+            streamed: false,
+        }
+    }
+
+    #[test]
+    fn explicit_standalone_and_disabled_kernel_never_route_to_protocol() {
+        assert!(!protocol_requested(true, true));
+        assert!(!protocol_requested(true, false));
+        assert!(!protocol_requested(false, false));
+        assert!(protocol_requested(false, true));
+    }
+
+    #[test]
+    fn protocol_line_preserves_source_and_applies_task_fg_sugar() {
+        let mut protocol = FakeProtocol {
+            seen: Vec::new(),
+            outcome: Ok(protocol_outcome(Some("42"), "completed")),
+            snapshot: unused_snapshot(),
+        };
+        let interrupt = AtomicBool::new(false);
+        assert_eq!(
+            execute_protocol_line(&mut protocol, "40 + 2", &interrupt, 120)
+                .unwrap()
+                .render
+                .as_deref(),
+            Some("42")
+        );
+        execute_protocol_line(&mut protocol, "fg worker", &interrupt, 120).unwrap();
+        assert_eq!(protocol.seen, ["40 + 2", "worker.resume()\nworker.await()"]);
+    }
+
+    #[test]
+    fn protocol_line_rejects_local_process_group_control_before_rpc() {
+        let mut protocol = FakeProtocol {
+            seen: Vec::new(),
+            outcome: Ok(protocol_outcome(None, "completed")),
+            snapshot: unused_snapshot(),
+        };
+        let error =
+            execute_protocol_line(&mut protocol, "fg %2", &AtomicBool::new(false), 80).unwrap_err();
+        assert!(error.contains("--standalone"));
+        assert!(protocol.seen.is_empty());
+    }
+
+    #[test]
+    fn cancelled_protocol_outcomes_never_render_stale_values() {
+        let completed = protocol_outcome(Some("done"), "completed");
+        assert_eq!(protocol_render_text(&completed), Some("done"));
+        let cancelled = protocol_outcome(Some("stale"), "cancelled");
+        assert_eq!(protocol_render_text(&cancelled), None);
+        let empty = protocol_outcome(Some(""), "completed");
+        assert_eq!(protocol_render_text(&empty), None);
+        let mut streamed = protocol_outcome(Some("already live"), "completed");
+        streamed.streamed = true;
+        assert_eq!(protocol_render_text(&streamed), None);
+    }
+
+    #[test]
+    fn protocol_exit_status_is_carried_to_the_ui_boundary() {
+        let mut outcome = protocol_outcome(None, "completed");
+        outcome.exit_code = Some(17);
+        let mut protocol = FakeProtocol {
+            seen: Vec::new(),
+            outcome: Ok(outcome),
+            snapshot: unused_snapshot(),
+        };
+        assert_eq!(
+            execute_protocol_line(&mut protocol, "exit 17", &AtomicBool::new(false), 80)
+                .unwrap()
+                .exit_code,
+            Some(17)
+        );
+    }
+
+    #[test]
+    fn protocol_snapshot_refreshes_completion_env_and_cwd() {
+        let mut protocol = FakeProtocol {
+            seen: Vec::new(),
+            outcome: Ok(protocol_outcome(None, "completed")),
+            snapshot: Ok(serde_json::json!({
+                "cwd": {"display": "/remote/project"},
+                "bindings": [
+                    {"name": "deploy", "callable": true, "type": "command"},
+                    {"name": "answer", "callable": false, "type": "int"}
+                ],
+                "jobs": {"running": 1, "suspended": 0, "total": 1},
+                "reef": {"bindings": []},
+                "last_value": {"$": "null"}
+            })),
+        };
+        let env = Env::root();
+        let cwd = Arc::new(Mutex::new(PathBuf::new()));
+        let snapshot =
+            refresh_protocol_state(&mut protocol, &mut RemoteEnvMirror::default(), &env, &cwd)
+                .unwrap();
+
+        assert_eq!(snapshot.jobs.running, 1);
+        assert_eq!(*cwd.lock().unwrap(), PathBuf::from("/remote/project"));
+        assert!(env.get("deploy").is_some_and(|value| value.is_callable()));
+        assert!(matches!(env.get("answer"), Some(Value::Int(0))));
+    }
+
+    #[test]
+    fn journal_id_mirror_evicts_in_lockstep_with_evaluator_out() {
+        let mut entries = (0..shoal_eval::MAX_REPL_TRANSCRIPT_VALUES)
+            .map(|id| Some(id as i64))
+            .collect::<VecDeque<_>>();
+        push_out_entry(&mut entries, Some(9_999));
+        assert_eq!(entries.len(), shoal_eval::MAX_REPL_TRANSCRIPT_VALUES);
+        assert_eq!(entries.front(), Some(&Some(1)));
+        assert_eq!(entries.back(), Some(&Some(9_999)));
+    }
 
     #[test]
     fn multiline_detection_ignores_balanced_delimiters_in_strings_and_comments() {

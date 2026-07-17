@@ -53,6 +53,13 @@ impl Env {
             .insert(name.into(), Binding { value, mutable });
     }
 
+    /// Remove a binding declared in this exact scope, without walking into a
+    /// parent. Hosts use this to refresh a mirrored remote-session namespace
+    /// without accidentally deleting an inherited language binding.
+    pub fn remove_local(&self, name: &str) -> Option<Binding> {
+        self.inner.lock().unwrap().vars.remove(name)
+    }
+
     pub fn get(&self, name: &str) -> Option<Value> {
         let parent = {
             let g = self.inner.lock().unwrap();
@@ -103,5 +110,23 @@ impl Env {
             cur = g.parent.clone();
         }
         names
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remove_local_never_deletes_an_inherited_binding() {
+        let root = Env::root();
+        root.declare("shared", Value::Int(1), false);
+        let child = root.child();
+        assert!(child.remove_local("shared").is_none());
+        assert!(matches!(root.get("shared"), Some(Value::Int(1))));
+
+        child.declare("shared", Value::Int(2), false);
+        assert!(child.remove_local("shared").is_some());
+        assert!(matches!(child.get("shared"), Some(Value::Int(1))));
     }
 }

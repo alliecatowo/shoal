@@ -35,6 +35,8 @@ use shoal_prompt::{
 };
 use shoal_value::Value;
 
+use crate::repl_state::ProtocolSnapshot;
+
 /// Shared, atomically-swappable snapshot cell. The REPL loop writes a fresh
 /// `Arc<PromptContext>` once per command; reedline's per-keystroke render reads
 /// it under a short read-lock (a lock, never I/O — inside site/content/internals/prompt-editor-lsp.md budget).
@@ -536,6 +538,71 @@ pub fn build_context(ev: &mut Evaluator, facts: &StaticFacts, width: u16) -> Pro
     }
 }
 
+/// Build the same frozen per-command prompt context from the authenticated
+/// kernel snapshot used by the protocol-backed REPL. Filesystem/git facts are
+/// resolved against the remote session cwd; language state comes only from
+/// the snapshot, never from the UI's local bootstrap evaluator.
+pub fn build_context_from_protocol(
+    snapshot: &ProtocolSnapshot,
+    facts: &StaticFacts,
+    width: u16,
+) -> PromptContext {
+    let cwd = snapshot.cwd.clone();
+    let (h, m, s) = local_hms();
+    let last_outcome = match &snapshot.last_value {
+        shoal_proto::WireValue::Outcome {
+            status,
+            ok,
+            signal,
+            dur_ns,
+            cmd,
+            ..
+        } => Some(OutcomeSnapshot {
+            ok: *ok,
+            status: *status,
+            signal: signal.clone(),
+            dur: Duration::from_nanos((*dur_ns).max(0) as u64),
+            cmd_head: cmd.split_whitespace().next().unwrap_or("").to_string(),
+        }),
+        _ => None,
+    };
+    PromptContext {
+        cwd: cwd.clone(),
+        home: facts.home.clone(),
+        read_only: is_read_only(&cwd),
+        width,
+        no_color: facts.no_color,
+        nerd_font: facts.nerd_font,
+        unicode: facts.unicode,
+        edit_mode: EditMode::Emacs,
+        multiline: false,
+        last_outcome,
+        jobs: shoal_prompt::JobsSnapshot {
+            running: snapshot.jobs.running,
+            suspended: snapshot.jobs.suspended,
+            total: snapshot.jobs.total,
+        },
+        principal: facts.principal.clone(),
+        leash: facts.leash.clone(),
+        session: facts.session.clone(),
+        time_local: (h, m, s),
+        git: read_git(&cwd),
+        reef: snapshot
+            .reef
+            .iter()
+            .map(|binding| shoal_prompt::ReefBinding {
+                tool: binding.tool.clone(),
+                version: binding.version.clone(),
+                provider: binding.provider.clone(),
+                scope: binding.scope.clone(),
+                constrained: binding.constrained,
+            })
+            .collect(),
+        battery: None,
+        custom: std::collections::BTreeMap::new(),
+    }
+}
+
 /// Map the evaluator's [`shoal_eval::JobsSnapshot`] onto the prompt's own
 /// (site/content/internals/prompt-editor-lsp.md): same shape, different crate, so the binary is the seam
 /// that converts.
@@ -977,5 +1044,50 @@ mod tests {
         let git = ctx.git.expect("root is a git repo");
         assert!(!git.degraded);
         assert_eq!(git.staged, 1);
+    }
+
+    #[test]
+    fn protocol_context_uses_the_authenticated_session_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = ProtocolSnapshot::parse(serde_json::json!({
+            "cwd": {"display": dir.path().to_string_lossy()},
+            "bindings": [],
+            "jobs": {"running": 2, "suspended": 1, "total": 4},
+            "reef": {"bindings": [{
+                "tool": "node",
+                "version": "22.1.0",
+                "provider": "mise",
+                "scope": "project",
+                "constrained": true
+            }]},
+            "last_value": {
+                "$": "outcome",
+                "status": 7,
+                "ok": false,
+                "signal": null,
+                "out": {"$": "null"},
+                "err": "",
+                "dur_ns": 12,
+                "pid": 99,
+                "cmd": "false --example"
+            }
+        }))
+        .unwrap();
+
+        let context = build_context_from_protocol(&snapshot, &test_facts(), 93);
+        assert_eq!(context.cwd, dir.path());
+        assert_eq!(context.width, 93);
+        assert_eq!(context.jobs.running, 2);
+        assert_eq!(context.jobs.suspended, 1);
+        assert_eq!(context.jobs.total, 4);
+        let outcome = context.last_outcome.expect("kernel outcome reaches prompt");
+        assert!(!outcome.ok);
+        assert_eq!(outcome.status, Some(7));
+        assert_eq!(outcome.cmd_head, "false");
+        assert_eq!(outcome.dur, Duration::from_nanos(12));
+        assert_eq!(context.reef.len(), 1);
+        assert_eq!(context.reef[0].tool, "node");
+        assert_eq!(context.reef[0].version.as_deref(), Some("22.1.0"));
+        assert!(context.reef[0].constrained);
     }
 }

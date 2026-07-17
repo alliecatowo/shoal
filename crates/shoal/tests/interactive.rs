@@ -115,6 +115,7 @@ fn repl_echo_renders_once_and_exit_sets_code() {
     cmd.env("HOME", home.path());
     cmd.env("XDG_CONFIG_HOME", home.path());
     cmd.env("XDG_STATE_HOME", home.path());
+    cmd.env("XDG_RUNTIME_DIR", home.path());
     cmd.env_remove("SHOAL_CONFIG");
 
     let mut child = pair.slave.spawn_command(cmd).expect("spawn repl");
@@ -156,39 +157,53 @@ fn repl_echo_renders_once_and_exit_sets_code() {
     // Pump until `marker` bytes appear in the accumulated output (or time out),
     // answering DSR queries along the way. An empty marker waits for the first
     // prompt (first DSR answered).
-    let mut pump_until = |writer: &mut Box<dyn Write + Send>, marker: &[u8]| -> bool {
-        let deadline = Instant::now() + Duration::from_secs(45);
-        loop {
-            answer_dsr(writer, &mut dsr_answered);
-            if marker.is_empty() {
-                if dsr_answered >= 1 {
+    let mut pump_until =
+        |writer: &mut Box<dyn Write + Send>, marker: &[u8], min_prompts: usize| -> bool {
+            let deadline = Instant::now() + Duration::from_secs(45);
+            loop {
+                answer_dsr(writer, &mut dsr_answered);
+                if marker.is_empty() {
+                    if dsr_answered >= min_prompts {
+                        return true;
+                    }
+                } else if buf
+                    .lock()
+                    .unwrap()
+                    .windows(marker.len())
+                    .any(|w| w == marker)
+                {
                     return true;
                 }
-            } else if buf
-                .lock()
-                .unwrap()
-                .windows(marker.len())
-                .any(|w| w == marker)
-            {
-                return true;
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(10));
             }
-            if Instant::now() >= deadline {
-                return false;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    };
+        };
 
     // Wait for the first prompt to be drawn (first DSR answered).
-    assert!(pump_until(&mut writer, b""), "REPL never drew a prompt");
+    assert!(
+        pump_until(&mut writer, b"", 1),
+        "REPL never drew a prompt; transcript:\n{}",
+        String::from_utf8_lossy(&buf.lock().unwrap())
+    );
 
     // A builtin whose rendered result (42001) differs from the typed input
     // (6*7000+1), so a match proves the *result* rendered, not the echoed line.
     writer.write_all(b"echo (6*7000+1)\r").unwrap();
     writer.flush().unwrap();
     assert!(
-        pump_until(&mut writer, b"42001"),
+        pump_until(&mut writer, b"42001", 1),
         "echo result did not render"
+    );
+
+    // Protocol mode refreshes the authenticated snapshot between commands.
+    // Wait for the next prompt before typing so the line cannot arrive before
+    // the line editor has resumed terminal input.
+    assert!(
+        pump_until(&mut writer, b"", 2),
+        "REPL never redrew after echo; transcript:\n{}",
+        String::from_utf8_lossy(&buf.lock().unwrap())
     );
 
     // An external command whose output (MK55446MK) differs from the typed line.
@@ -197,8 +212,9 @@ fn repl_echo_renders_once_and_exit_sets_code() {
         .unwrap();
     writer.flush().unwrap();
     assert!(
-        pump_until(&mut writer, b"MK55446MK"),
-        "external output did not appear"
+        pump_until(&mut writer, b"MK55446MK", 2),
+        "external output did not appear; transcript:\n{}",
+        String::from_utf8_lossy(&buf.lock().unwrap())
     );
 
     // `exit 5`, re-sent periodically: a line typed between the pty child's
@@ -273,6 +289,7 @@ fn repl_pty_child_reads_interactive_stdin() {
     cmd.env("HOME", home.path());
     cmd.env("XDG_CONFIG_HOME", home.path());
     cmd.env("XDG_STATE_HOME", home.path());
+    cmd.env("XDG_RUNTIME_DIR", home.path());
     cmd.env_remove("SHOAL_CONFIG");
 
     let mut child = pair.slave.spawn_command(cmd).expect("spawn repl");
@@ -306,30 +323,31 @@ fn repl_pty_child_reads_interactive_stdin() {
             *answered += 1;
         }
     };
-    let mut pump_until = |writer: &mut Box<dyn Write + Send>, marker: &[u8]| -> bool {
-        let deadline = Instant::now() + Duration::from_secs(45);
-        loop {
-            answer_dsr(writer, &mut dsr_answered);
-            if marker.is_empty() {
-                if dsr_answered >= 1 {
+    let mut pump_until =
+        |writer: &mut Box<dyn Write + Send>, marker: &[u8], min_prompts: usize| -> bool {
+            let deadline = Instant::now() + Duration::from_secs(45);
+            loop {
+                answer_dsr(writer, &mut dsr_answered);
+                if marker.is_empty() {
+                    if dsr_answered >= min_prompts {
+                        return true;
+                    }
+                } else if buf
+                    .lock()
+                    .unwrap()
+                    .windows(marker.len())
+                    .any(|w| w == marker)
+                {
                     return true;
                 }
-            } else if buf
-                .lock()
-                .unwrap()
-                .windows(marker.len())
-                .any(|w| w == marker)
-            {
-                return true;
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(10));
             }
-            if Instant::now() >= deadline {
-                return false;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    };
+        };
 
-    assert!(pump_until(&mut writer, b""), "REPL never drew a prompt");
+    assert!(pump_until(&mut writer, b"", 1), "REPL never drew a prompt");
 
     // The `""` splits keep the typed line (echoed by reedline) from matching
     // the markers, so a hit proves the CHILD produced them. `head -c 2` blocks
@@ -339,7 +357,7 @@ fn repl_pty_child_reads_interactive_stdin() {
         .unwrap();
     writer.flush().unwrap();
     assert!(
-        pump_until(&mut writer, b"READY"),
+        pump_until(&mut writer, b"READY", 1),
         "pty child did not start; transcript:\n{}",
         String::from_utf8_lossy(&buf.lock().unwrap())
     );
@@ -350,7 +368,7 @@ fn repl_pty_child_reads_interactive_stdin() {
     writer.write_all(b"hi\r").unwrap();
     writer.flush().unwrap();
     assert!(
-        pump_until(&mut writer, b":DONE"),
+        pump_until(&mut writer, b":DONE", 1),
         "typed stdin never reached the pty child; transcript:\n{}",
         String::from_utf8_lossy(&buf.lock().unwrap())
     );
@@ -377,6 +395,18 @@ fn repl_pty_child_reads_interactive_stdin() {
     }
     drop(writer);
     let _ = reader_thread.join();
+
+    let text = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+    assert_eq!(
+        text.matches("READY").count(),
+        1,
+        "live PTY output must not be rendered a second time; transcript:\n{text}"
+    );
+    assert_eq!(
+        text.matches(":DONE").count(),
+        1,
+        "live PTY output must not be rendered a second time; transcript:\n{text}"
+    );
 }
 
 /// site/content/internals/roadmap-and-priorities.md: `undo out[n]` resolves via the host's `out[n] ->
@@ -409,6 +439,7 @@ fn repl_undo_out_n_resolves_via_journal() {
     cmd.env("HOME", home.path());
     cmd.env("XDG_CONFIG_HOME", home.path());
     cmd.env("XDG_STATE_HOME", home.path());
+    cmd.env("XDG_RUNTIME_DIR", home.path());
     cmd.env_remove("SHOAL_CONFIG");
 
     let mut child = pair.slave.spawn_command(cmd).expect("spawn repl");
@@ -442,41 +473,46 @@ fn repl_undo_out_n_resolves_via_journal() {
             *answered += 1;
         }
     };
-    let mut pump_until = |writer: &mut Box<dyn Write + Send>, marker: &[u8]| -> bool {
-        let deadline = Instant::now() + Duration::from_secs(45);
-        loop {
-            answer_dsr(writer, &mut dsr_answered);
-            if marker.is_empty() {
-                if dsr_answered >= 1 {
+    let mut pump_until =
+        |writer: &mut Box<dyn Write + Send>, marker: &[u8], min_prompts: usize| -> bool {
+            let deadline = Instant::now() + Duration::from_secs(45);
+            loop {
+                answer_dsr(writer, &mut dsr_answered);
+                if marker.is_empty() {
+                    if dsr_answered >= min_prompts {
+                        return true;
+                    }
+                } else if buf
+                    .lock()
+                    .unwrap()
+                    .windows(marker.len())
+                    .any(|w| w == marker)
+                {
                     return true;
                 }
-            } else if buf
-                .lock()
-                .unwrap()
-                .windows(marker.len())
-                .any(|w| w == marker)
-            {
-                return true;
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(10));
             }
-            if Instant::now() >= deadline {
-                return false;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    };
+        };
 
-    assert!(pump_until(&mut writer, b""), "REPL never drew a prompt");
+    assert!(pump_until(&mut writer, b"", 1), "REPL never drew a prompt");
 
     // Three statements to fill out[0..2], each awaited via a distinct marker
     // before moving on (the REPL processes one line at a time).
-    for marker in ["811001", "811002", "811003"] {
+    for (index, marker) in ["811001", "811002", "811003"].into_iter().enumerate() {
         writer
             .write_all(format!("echo {marker}\r").as_bytes())
             .unwrap();
         writer.flush().unwrap();
         assert!(
-            pump_until(&mut writer, marker.as_bytes()),
+            pump_until(&mut writer, marker.as_bytes(), index + 1),
             "dummy echo {marker} did not render"
+        );
+        assert!(
+            pump_until(&mut writer, b"", index + 2),
+            "REPL did not redraw after dummy echo {marker}"
         );
     }
 
@@ -484,22 +520,42 @@ fn repl_undo_out_n_resolves_via_journal() {
     // than rm's own (empty) output.
     writer.write_all(b"rm victim\r").unwrap();
     writer.flush().unwrap();
+    assert!(
+        pump_until(&mut writer, b"", 5),
+        "REPL did not redraw after rm"
+    );
     writer.write_all(b"echo (811000+4)\r").unwrap();
     writer.flush().unwrap();
     assert!(
-        pump_until(&mut writer, b"811004"),
+        pump_until(&mut writer, b"811004", 5),
         "rm victim did not complete"
     );
-    assert!(!victim.exists(), "rm should have trashed the file");
+    assert!(
+        pump_until(&mut writer, b"", 6),
+        "REPL did not redraw after rm sentinel"
+    );
+    assert!(
+        !victim.exists(),
+        "rm should have trashed the file; transcript:\n{}",
+        String::from_utf8_lossy(&buf.lock().unwrap())
+    );
 
     // The fix under test: `out[3]` resolves to `rm`'s journal entry id.
     writer.write_all(b"undo out[3]\r").unwrap();
     writer.flush().unwrap();
+    assert!(
+        pump_until(&mut writer, b"", 7),
+        "REPL did not redraw after undo"
+    );
     writer.write_all(b"echo (811000+5)\r").unwrap();
     writer.flush().unwrap();
     assert!(
-        pump_until(&mut writer, b"811005"),
+        pump_until(&mut writer, b"811005", 7),
         "undo out[3] did not complete"
+    );
+    assert!(
+        pump_until(&mut writer, b"", 8),
+        "REPL did not redraw after undo sentinel"
     );
 
     writer.write_all(b"exit 0\r").unwrap();
@@ -576,6 +632,7 @@ fn repl_reef_user_scope_from_config_engages() {
     cmd.env("HOME", home.path());
     cmd.env("XDG_CONFIG_HOME", home.path().join(".config"));
     cmd.env("XDG_STATE_HOME", home.path());
+    cmd.env("XDG_RUNTIME_DIR", home.path());
     cmd.env_remove("SHOAL_CONFIG");
 
     let mut child = pair.slave.spawn_command(cmd).expect("spawn repl");
