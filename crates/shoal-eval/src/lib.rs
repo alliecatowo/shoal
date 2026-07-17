@@ -377,15 +377,11 @@ impl Evaluator {
     }
 
     /// The session event bus (site/content/internals/streams-channels.md). Shared into spawned tasks so
-    /// in-language channels are visible across `spawn`/`on(...)`.
+    /// in-language channels are visible across `spawn`/`on(...)`. Child
+    /// evaluators receive it through [`ChildContext`](child_context::ChildContext);
+    /// there is no partial `set_bus`-style seam a child site could under-inherit.
     pub(crate) fn bus(&self) -> Arc<channels::EventBus> {
         self.bus.clone()
-    }
-
-    /// Adopt a shared event bus (used when a child evaluator must see the parent
-    /// session's in-language channels — `spawn`, `on(...)`, script children).
-    pub(crate) fn set_bus(&mut self, bus: Arc<channels::EventBus>) {
-        self.bus = bus;
     }
 
     /// Install the hook that mirrors in-language `channel(x).emit(...)` onto a
