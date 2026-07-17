@@ -409,6 +409,24 @@ fn query_principal_filter() {
 }
 
 #[test]
+fn query_session_filter_is_exact() {
+    let j = Journal::in_memory().unwrap();
+    j.append(&rec("alpha", "human", 1, "first")).unwrap();
+    j.append(&rec("beta", "human", 2, "second")).unwrap();
+    j.append(&rec("alpha", "human", 3, "third")).unwrap();
+
+    let rows = j
+        .query(&JournalQuery {
+            session: Some("alpha".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].src, "third");
+    assert_eq!(rows[1].src, "first");
+}
+
+#[test]
 fn query_ok_filter_excludes_unfinished() {
     let j = Journal::in_memory().unwrap();
     let ok_id = j.append(&rec("s", "human", 1, "true")).unwrap();

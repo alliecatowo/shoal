@@ -70,24 +70,28 @@ fn wire_value() -> impl Strategy<Value = WireValue> {
                 any::<Option<i32>>(),
                 any::<bool>(),
                 any::<Option<String>>(),
+                any::<bool>(),
                 any::<String>(),
                 any::<i64>(),
                 any::<u32>(),
                 any::<String>(),
             )
-                .prop_map(|(out, status, ok, signal, err, dur_ns, pid, cmd)| {
-                    WireValue::Outcome {
-                        status,
-                        ok,
-                        signal,
-                        out: Box::new(out),
-                        err,
-                        dur_ns,
-                        pid,
-                        cmd,
-                        span: None,
+                .prop_map(
+                    |(out, status, ok, signal, streamed, err, dur_ns, pid, cmd)| {
+                        WireValue::Outcome {
+                            status,
+                            ok,
+                            signal,
+                            streamed,
+                            out: Box::new(out),
+                            err,
+                            dur_ns,
+                            pid,
+                            cmd,
+                            span: None,
+                        }
                     }
-                }),
+                ),
             prop::collection::vec(
                 (
                     prop::string::string_regex("[a-z]{1,6}").unwrap(),

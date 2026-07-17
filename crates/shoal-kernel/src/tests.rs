@@ -1077,6 +1077,59 @@ fn session_snapshot_tracks_exec_state_and_exit_codes() {
 }
 
 #[test]
+fn kernel_undo_out_index_targets_the_evaluator_statement_journal() {
+    let temp = tempfile::tempdir().unwrap();
+    let victim = temp.path().join("victim.txt");
+    std::fs::write(&victim, b"payload").unwrap();
+    let state = temp.path().join("state");
+    let kernel = Kernel::open(&state).unwrap();
+    let (mut client, mut reader, worker) = spawn(&kernel);
+    let attached = call(
+        &mut client,
+        &mut reader,
+        1,
+        "session.attach",
+        json!({
+            "local_auth":"local-human",
+            "session":"undo-index",
+            "client":{"kind":"shoal-repl","tty":true}
+        }),
+    );
+    assert!(attached.error.is_none(), "attach failed: {attached:?}");
+    let quoted_dir = serde_json::to_string(temp.path().to_str().unwrap()).unwrap();
+    let changed_dir = call(
+        &mut client,
+        &mut reader,
+        2,
+        "exec",
+        json!({"src":format!("cd {quoted_dir}")}),
+    );
+    assert!(changed_dir.error.is_none(), "cd failed: {changed_dir:?}");
+    let removed = call(
+        &mut client,
+        &mut reader,
+        3,
+        "exec",
+        json!({"src":"rm victim.txt"}),
+    );
+    assert!(removed.error.is_none(), "rm failed: {removed:?}");
+    assert!(!victim.exists(), "rm must move the victim out of place");
+
+    let undone = call(
+        &mut client,
+        &mut reader,
+        4,
+        "exec",
+        json!({"src":"undo out[1]"}),
+    );
+    assert!(undone.error.is_none(), "undo out[1] failed: {undone:?}");
+    assert_eq!(std::fs::read(&victim).unwrap(), b"payload");
+    drop(client);
+    drop(reader);
+    worker.join().unwrap();
+}
+
+#[test]
 fn leash_plan_approval_and_denial_flow() {
     for (opaque, expected, approvable) in
         [("ask", "approval_required", true), ("deny", "deny", false)]
@@ -4585,6 +4638,69 @@ fn spanned_outcome(ok: bool, stdout: &[u8], span: shoal_ast::Span) -> Value {
     let mut inner = Arc::try_unwrap(o).unwrap();
     inner.span = Some(span);
     Value::Outcome(Arc::new(inner))
+}
+
+fn streamed_outcome(stdout: &[u8]) -> Value {
+    let Value::Outcome(outcome) = bare_outcome(true, stdout) else {
+        unreachable!()
+    };
+    let mut outcome = Arc::try_unwrap(outcome).unwrap();
+    outcome.streamed = true;
+    Value::Outcome(Arc::new(outcome))
+}
+
+#[test]
+fn outcome_streamed_metadata_is_honest_in_full_and_elided_wire_values() {
+    let captured = serde_json::to_value(wire_value(&bare_outcome(true, b"builtin\n"))).unwrap();
+    assert_eq!(captured["streamed"], false);
+
+    let streamed = streamed_outcome(b"live pty\n");
+    let full = serde_json::to_value(wire_value(&streamed)).unwrap();
+    assert_eq!(full["streamed"], true);
+    let elided = serde_json::to_value(elide_wire_value(
+        &streamed,
+        "shoal://out/1",
+        &ElideBudget::default(),
+    ))
+    .unwrap();
+    assert_eq!(elided["streamed"], true);
+}
+
+#[test]
+fn value_get_render_reports_live_pty_streaming_without_guessing_from_type() {
+    let kernel = Kernel::new();
+    let (mut client, mut reader, worker) = spawn(&kernel);
+    let attached = call(
+        &mut client,
+        &mut reader,
+        1,
+        "session.attach",
+        json!({"local_auth":"local-human","client":{"kind":"shoal-repl","tty":true}}),
+    );
+    assert!(attached.error.is_none(), "attach failed: {attached:?}");
+    let exec = call(
+        &mut client,
+        &mut reader,
+        2,
+        "exec",
+        json!({"src":"sh { printf streamed-marker }"}),
+    )
+    .result
+    .expect("interactive command exec");
+    assert_eq!(exec["value"]["streamed"], true);
+    let rendered = call(
+        &mut client,
+        &mut reader,
+        3,
+        "value.get",
+        json!({"ref":exec["ref"],"format":"render"}),
+    )
+    .result
+    .expect("render fetch");
+    assert_eq!(rendered["streamed"], true);
+    drop(client);
+    drop(reader);
+    worker.join().unwrap();
 }
 
 /// Fix 1 (site/content/internals/roadmap-and-priorities.md #4): `OutcomeVal` now carries `Option<Span>`, stamped on

@@ -51,6 +51,8 @@ pub struct EntryRow {
 pub struct JournalQuery {
     /// Only entries with `ts_ns >= since_ts_ns`.
     pub since_ts_ns: Option<i64>,
+    /// Only entries recorded for this exact named session.
+    pub session: Option<String>,
     /// Only entries whose `src`'s first whitespace-separated word equals this.
     pub head: Option<String>,
     /// Only entries recorded by this principal.
@@ -109,6 +111,10 @@ impl Journal {
         if let Some(ts) = q.since_ts_ns.as_ref() {
             clauses.push("ts >= ?");
             params.push(ts);
+        }
+        if let Some(session) = q.session.as_ref() {
+            clauses.push("session = ?");
+            params.push(session);
         }
         if let Some(principal) = q.principal.as_ref() {
             clauses.push("principal = ?");

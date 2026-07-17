@@ -599,6 +599,24 @@ fn record_transcript_binds_it_and_out() {
 }
 
 #[test]
+fn record_transcript_bounds_it_and_out_together() {
+    let mut ev = Evaluator::new(std::env::current_dir().unwrap());
+    for value in 0..=MAX_REPL_TRANSCRIPT_VALUES {
+        ev.record_transcript(&Value::Int(value as i64));
+    }
+    assert_eq!(ev.it(), &Value::Int(MAX_REPL_TRANSCRIPT_VALUES as i64));
+    let Some(Value::List(out)) = ev.env().get("out") else {
+        panic!("out binding is not a list")
+    };
+    assert_eq!(out.len(), MAX_REPL_TRANSCRIPT_VALUES);
+    assert_eq!(out.first(), Some(&Value::Int(1)));
+    assert_eq!(
+        out.last(),
+        Some(&Value::Int(MAX_REPL_TRANSCRIPT_VALUES as i64))
+    );
+}
+
+#[test]
 fn builtin_retry_and_parallel_and_save() {
     assert_eq!(run("retry(3, () => 42)").unwrap(), Value::Int(42));
     assert_eq!(

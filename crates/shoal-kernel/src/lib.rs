@@ -19,7 +19,7 @@ use state::*;
 use wire::*;
 
 use serde_json::{Value as Json, json};
-use shoal_ast::{Program, Stmt};
+use shoal_ast::{CmdArg, Expr, Program, Stmt, UnOp};
 use shoal_auth::{TokenMeta, TokenStore};
 use shoal_eval::{EchoMode, Evaluator, Position};
 use shoal_journal::{EntryRecord, Journal, JournalQuery};

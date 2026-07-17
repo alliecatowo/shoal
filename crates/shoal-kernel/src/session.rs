@@ -83,6 +83,10 @@ pub(crate) struct Session {
     pub(crate) lang_bus: Arc<shoal_eval::EventBus>,
     pub(crate) transcript: Mutex<HashMap<Ref, Value>>,
     pub(crate) next_value: AtomicU64,
+    /// Success-only mapping aligned with the evaluator-visible bounded `out`
+    /// list. Entries are evaluator statement journal IDs, never the kernel's
+    /// coarser outer exec rows.
+    out_entries: Mutex<VecDeque<Option<i64>>>,
     stream_cursors: Mutex<HashMap<StreamCursorRef, Arc<WireStreamCursorEntry>>>,
 }
 
@@ -146,6 +150,19 @@ impl Session {
         {
             transcript.remove(&Ref::new("out", id - MAX_TRANSCRIPT_PER_SESSION as u64));
         }
+    }
+
+    pub(crate) fn rewrite_out_undo(&self, program: &mut Program) {
+        let mut entries = self.out_entries.lock().unwrap();
+        resolve_out_undo(program, entries.make_contiguous());
+    }
+
+    pub(crate) fn push_out_entry(&self, entry_id: Option<i64>) {
+        let mut entries = self.out_entries.lock().unwrap();
+        if entries.len() >= shoal_eval::MAX_REPL_TRANSCRIPT_VALUES {
+            entries.pop_front();
+        }
+        entries.push_back(entry_id);
     }
 
     /// Get or lazily claim a transcript stream's single-consumer upstream.
@@ -292,6 +309,71 @@ fn stream_error(error: shoal_value::ErrorVal) -> RpcError {
     }
 }
 
+fn resolve_out_undo(program: &mut Program, out_entries: &[Option<i64>]) {
+    for stmt in &mut program.stmts {
+        let Stmt::Expr {
+            expr: Expr::Cmd { call, .. },
+            ..
+        } = stmt
+        else {
+            continue;
+        };
+        if call.head != "undo" || call.args.len() != 1 {
+            continue;
+        }
+        let Some(index) = out_index_literal(&call.args[0]) else {
+            continue;
+        };
+        let resolved = if index >= 0 {
+            usize::try_from(index).ok()
+        } else {
+            index
+                .checked_abs()
+                .and_then(|distance| usize::try_from(distance).ok())
+                .and_then(|distance| out_entries.len().checked_sub(distance))
+        };
+        let Some(Some(entry_id)) = resolved.and_then(|index| out_entries.get(index)) else {
+            continue;
+        };
+        let span = call.args[0].span();
+        call.args[0] = CmdArg::Expr {
+            expr: Expr::Int {
+                value: *entry_id,
+                span,
+            },
+            span,
+        };
+    }
+}
+
+fn out_index_literal(arg: &CmdArg) -> Option<i64> {
+    let CmdArg::Expr {
+        expr: Expr::Index { recv, index, .. },
+        ..
+    } = arg
+    else {
+        return None;
+    };
+    let Expr::Var { name, .. } = recv.as_ref() else {
+        return None;
+    };
+    if name != "out" {
+        return None;
+    }
+    match index.as_ref() {
+        Expr::Int { value, .. } => Some(*value),
+        Expr::Unary {
+            op: UnOp::Neg,
+            expr,
+            ..
+        } => match expr.as_ref() {
+            Expr::Int { value, .. } => value.checked_neg(),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 impl Kernel {
     /// Get-or-create the principal-private named session.
     pub(crate) fn session(&self, name: &str, principal: &str) -> Result<Arc<Session>, RpcError> {
@@ -378,6 +460,7 @@ impl Kernel {
                     lang_bus,
                     transcript: Mutex::new(HashMap::new()),
                     next_value: AtomicU64::new(1),
+                    out_entries: Mutex::new(VecDeque::new()),
                     stream_cursors: Mutex::new(HashMap::new()),
                 }))
             },

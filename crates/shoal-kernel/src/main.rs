@@ -59,7 +59,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // so exec restores SIG_DFL in command children.
         ctrlc::set_handler(|| {})?;
     }
-    eprintln!("shoal-kernel: ready {}", socket.display());
+    if args.embedded_fd.is_none() {
+        eprintln!("shoal-kernel: ready {}", socket.display());
+    }
     kernel.serve_until(&socket, stop)?;
     Ok(())
 }

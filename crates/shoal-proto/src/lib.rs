@@ -276,6 +276,10 @@ pub enum WireValue {
         status: Option<i32>,
         ok: bool,
         signal: Option<String>,
+        /// True only when this outcome's bytes were already emitted live by
+        /// the interactive PTY tee. Builtins and captured commands are false.
+        #[serde(default)]
+        streamed: bool,
         out: Box<WireValue>,
         /// Lossy UTF-8 of stderr — not a CAS ref; large payloads are still
         /// truncated at the journal layer, this is the live wire copy.

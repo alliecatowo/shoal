@@ -19,6 +19,7 @@ pub fn query(journal: &Journal, filter: &QueryFilter) -> Result<Vec<EntryRow>, r
     let requested = if filter.limit == 0 { 100 } else { filter.limit };
     let q = JournalQuery {
         since_ts_ns: filter.since_ns,
+        session: None,
         head: filter.head.clone(),
         principal: filter.principal.clone(),
         ok: filter.ok,

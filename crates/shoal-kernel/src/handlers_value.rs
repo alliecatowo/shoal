@@ -136,6 +136,7 @@ impl Kernel {
                 encode(json!({
                     "ref": params.r#ref,
                     "render": bound_render(render, &uri, !attachment.tty),
+                    "streamed": matches!(&sliced, Value::Outcome(outcome) if outcome.streamed),
                 }))
             }
             Some("raw") => {
@@ -227,6 +228,7 @@ impl Kernel {
             .unwrap()
             .query(&JournalQuery {
                 since_ts_ns: p.since,
+                session: Some(attachment.session.id.clone()),
                 principal: Some(attachment.principal.clone()),
                 head: p.head,
                 ok: p.ok,

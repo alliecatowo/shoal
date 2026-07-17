@@ -97,6 +97,10 @@ pub enum EchoMode {
     Quiet,
 }
 
+/// Maximum successful values retained in the evaluator-visible `out` list.
+/// Hosts that keep side metadata for `out[n]` must use the same bound.
+pub const MAX_REPL_TRANSCRIPT_VALUES: usize = 4096;
+
 /// Whether `stmt` is a bare command statement (`ls`, `git status`, `a && b`) —
 /// the shape whose output shows in `quiet`/`commands` echo modes even when it
 /// is not the final statement. A public free function (not just the crate-
@@ -333,11 +337,15 @@ impl Evaluator {
     /// Bind `it` and append to the session `out` transcript list (REPL hook).
     /// `Var("it")` / `Var("out")` then resolve from the environment normally.
     pub fn record_transcript(&mut self, v: &Value) {
+        self.set_it(v.clone());
         self.exec.shell.env.declare("it", v.clone(), true);
         let mut out = match self.exec.shell.env.get("out") {
             Some(Value::List(xs)) => xs,
             _ => Vec::new(),
         };
+        if out.len() >= MAX_REPL_TRANSCRIPT_VALUES {
+            out.remove(0);
+        }
         out.push(v.clone());
         self.exec.shell.env.declare("out", Value::List(out), true);
     }

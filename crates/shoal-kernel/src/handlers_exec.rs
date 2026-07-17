@@ -234,7 +234,7 @@ impl Kernel {
         }
         if params.mode == "plan" {
             let mut evaluator = session.evaluator.lock().unwrap();
-            let ast = shoal_syntax::parse_with_ctx(
+            let mut ast = shoal_syntax::parse_with_ctx(
                 &params.src,
                 parse_ctx_for_kernel(evaluator.env(), interactive),
             )
@@ -243,6 +243,7 @@ impl Kernel {
                 message: e.msg,
                 data: Some(json!({"span":e.span,"hint":e.hint})),
             })?;
+            session.rewrite_out_undo(&mut ast);
             let ast_json = serde_json::to_string(&ast).map_err(internal)?;
             let plan = derive_plan(&mut evaluator, &ast, &ast_json);
             drop(evaluator);
@@ -331,7 +332,7 @@ impl Kernel {
         // dispatch. Hold the evaluator lock from context construction through
         // evaluation so an async worker cannot parse against a stale Env.
         let mut evaluator = session.evaluator.lock().unwrap();
-        let ast = shoal_syntax::parse_with_ctx(
+        let mut ast = shoal_syntax::parse_with_ctx(
             &params.src,
             parse_ctx_for_kernel(evaluator.env(), interactive),
         )
@@ -340,6 +341,7 @@ impl Kernel {
             message: e.msg,
             data: Some(json!({"span":e.span,"hint":e.hint})),
         })?;
+        session.rewrite_out_undo(&mut ast);
         let ast_json = serde_json::to_string(&ast).map_err(internal)?;
         if let Some(cancel) = attachment.cancel_epoch.clone() {
             evaluator.set_cancellation_token(cancel);
@@ -563,6 +565,7 @@ impl Kernel {
         // async/timeout wrapper above re-enters `handle_exec` with the same
         // `src` via `dispatch`, hitting this exact call again).
         evaluator.set_source(params.src.clone());
+        let evaluator_started_ns = now_ns();
         let value = match eval_with_position(&mut evaluator, &ast, &params.position) {
             Ok(value) => value,
             Err(e) => {
@@ -605,6 +608,21 @@ impl Kernel {
         // evaluations intentionally do not reach this point, matching the
         // standalone REPL's successful-value-only contract.
         evaluator.record_transcript(&value);
+        let evaluator_entry_id = self
+            .journal
+            .lock()
+            .unwrap()
+            .query(&JournalQuery {
+                since_ts_ns: Some(evaluator_started_ns),
+                session: Some(session.id.clone()),
+                principal: Some(actor.clone()),
+                ok: Some(true),
+                limit: 1,
+                ..Default::default()
+            })
+            .ok()
+            .and_then(|rows| rows.first().map(|row| row.id));
+        session.push_out_entry(evaluator_entry_id);
         let value_ref = Ref::new("out", session.next_value.fetch_add(1, Ordering::Relaxed));
         session.insert_transcript(value_ref.clone(), value.clone());
         let render = shoal_value::render::render_block(&value, 80);
