@@ -17,6 +17,9 @@ use crate::{Record, Value};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static ATOMIC_REPLACE_SEQ: AtomicU64 = AtomicU64::new(1);
 
 // ---------------------------------------------------------------------------
 // Fs — filesystem port
@@ -82,6 +85,12 @@ pub trait Fs: Send + Sync {
     fn metadata(&self, path: &Path) -> io::Result<fs::Metadata>;
     /// Metadata without following symlinks (`std::fs::symlink_metadata`).
     fn symlink_metadata(&self, path: &Path) -> io::Result<fs::Metadata>;
+    /// Whether `path` exists, following symlinks — the port form of
+    /// `Path::exists`. Never errors: a missing path or an IO failure is
+    /// `false`, preserving `Path::exists`' fail-closed behavior.
+    fn exists(&self, path: &Path) -> bool {
+        self.metadata(path).is_ok()
+    }
     /// Whether `path` is an existing regular file, following symlinks — the
     /// port form of `Path::is_file`. Never errors: a missing path or an IO
     /// failure is `false`. The default routes through [`metadata`](Fs::metadata)
@@ -89,6 +98,34 @@ pub trait Fs: Send + Sync {
     /// adapter overrides it to answer from its own store.
     fn is_file(&self, path: &Path) -> bool {
         self.metadata(path).map(|m| m.is_file()).unwrap_or(false)
+    }
+    /// Whether `path` is an existing directory, following symlinks — the port
+    /// form of `Path::is_dir`. Never errors: a missing path or an IO failure is
+    /// `false`.
+    fn is_dir(&self, path: &Path) -> bool {
+        self.metadata(path).map(|m| m.is_dir()).unwrap_or(false)
+    }
+    /// Resolve symlinks and normalize a path (`std::fs::canonicalize`). The
+    /// default fails closed: an adapter that mediates filesystem probes must
+    /// explicitly interpose on canonicalization rather than letting it escape
+    /// to the ambient filesystem.
+    fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
+        let _ = path;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this Fs adapter does not mediate canonicalization",
+        ))
+    }
+    /// Atomically replace `path` with `data` using a fully-written, fsynced
+    /// temporary file in the same directory. The default fails closed because
+    /// degrading undo restore to truncate-in-place would lose crash safety and
+    /// expose a partial file.
+    fn atomic_replace(&self, path: &Path, data: &[u8]) -> io::Result<()> {
+        let _ = (path, data);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this Fs adapter does not mediate atomic replacement",
+        ))
     }
     /// The (full) paths of a directory's entries (`std::fs::read_dir`, each
     /// entry's `.path()`). Order is unspecified, exactly as `read_dir` yields.
@@ -164,6 +201,64 @@ impl Fs for StdFs {
     }
     fn symlink_metadata(&self, path: &Path) -> io::Result<fs::Metadata> {
         fs::symlink_metadata(path)
+    }
+    fn exists(&self, path: &Path) -> bool {
+        path.exists()
+    }
+    fn is_file(&self, path: &Path) -> bool {
+        path.is_file()
+    }
+    fn is_dir(&self, path: &Path) -> bool {
+        path.is_dir()
+    }
+    fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
+        fs::canonicalize(path)
+    }
+    fn atomic_replace(&self, path: &Path, data: &[u8]) -> io::Result<()> {
+        use io::Write as _;
+
+        let parent = path
+            .parent()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))?;
+        let mut last_collision = None;
+        for _ in 0..128 {
+            let seq = ATOMIC_REPLACE_SEQ.fetch_add(1, Ordering::Relaxed);
+            let tmp = parent.join(format!(
+                ".shoal-atomic-replace-{}-{seq}",
+                std::process::id()
+            ));
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                options.mode(0o600);
+            }
+            let mut file = match options.open(&tmp) {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    last_collision = Some(error);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let result = (|| {
+                file.write_all(data)?;
+                file.sync_all()?;
+                drop(file);
+                fs::rename(&tmp, path)
+            })();
+            if result.is_err() {
+                let _ = fs::remove_file(&tmp);
+            }
+            return result;
+        }
+        Err(last_collision.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "could not allocate atomic replacement temporary file",
+            )
+        }))
     }
     fn read_dir(&self, path: &Path) -> io::Result<Vec<PathBuf>> {
         let mut out = Vec::new();

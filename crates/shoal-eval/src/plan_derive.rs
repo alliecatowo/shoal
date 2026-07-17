@@ -594,9 +594,13 @@ impl Evaluator {
             base
         } else {
             let with_shl = base.with_extension("shl");
-            if with_shl.is_file() { with_shl } else { base }
+            if self.host.fs.is_file(&with_shl) {
+                with_shl
+            } else {
+                base
+            }
         };
-        candidate.canonicalize().unwrap_or(candidate)
+        self.host.fs.canonicalize(&candidate).unwrap_or(candidate)
     }
 
     /// The literal path an expression names — a string literal or a
@@ -805,6 +809,206 @@ fn url_host_port(url: &str) -> (String, u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shoal_value::{Fs, ReadSeek};
+    use std::io;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct DenyProbeFs {
+        probes: Mutex<Vec<String>>,
+    }
+
+    impl DenyProbeFs {
+        fn deny<T>() -> io::Result<T> {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "filesystem adapter denied operation",
+            ))
+        }
+
+        fn probes(&self) -> Vec<String> {
+            self.probes.lock().unwrap().clone()
+        }
+    }
+
+    impl Fs for DenyProbeFs {
+        fn read(&self, _path: &Path) -> io::Result<Vec<u8>> {
+            Self::deny()
+        }
+        fn read_to_string(&self, _path: &Path) -> io::Result<String> {
+            Self::deny()
+        }
+        fn open_read(&self, _path: &Path) -> io::Result<Box<dyn ReadSeek + Send>> {
+            Self::deny()
+        }
+        fn write(&self, _path: &Path, _data: &[u8]) -> io::Result<()> {
+            Self::deny()
+        }
+        fn append(&self, _path: &Path, _data: &[u8]) -> io::Result<()> {
+            Self::deny()
+        }
+        fn touch(&self, _path: &Path) -> io::Result<()> {
+            Self::deny()
+        }
+        fn metadata(&self, _path: &Path) -> io::Result<std::fs::Metadata> {
+            Self::deny()
+        }
+        fn symlink_metadata(&self, _path: &Path) -> io::Result<std::fs::Metadata> {
+            Self::deny()
+        }
+        fn is_file(&self, path: &Path) -> bool {
+            self.probes
+                .lock()
+                .unwrap()
+                .push(format!("is_file:{}", path.display()));
+            false
+        }
+        fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
+            self.probes
+                .lock()
+                .unwrap()
+                .push(format!("canonicalize:{}", path.display()));
+            Self::deny()
+        }
+        fn read_dir(&self, _path: &Path) -> io::Result<Vec<PathBuf>> {
+            Self::deny()
+        }
+        fn create_dir(&self, _path: &Path) -> io::Result<()> {
+            Self::deny()
+        }
+        fn create_dir_all(&self, _path: &Path) -> io::Result<()> {
+            Self::deny()
+        }
+        fn remove_file(&self, _path: &Path) -> io::Result<()> {
+            Self::deny()
+        }
+        fn remove_dir_all(&self, _path: &Path) -> io::Result<()> {
+            Self::deny()
+        }
+        fn rename(&self, _from: &Path, _to: &Path) -> io::Result<()> {
+            Self::deny()
+        }
+        fn copy(&self, _from: &Path, _to: &Path) -> io::Result<u64> {
+            Self::deny()
+        }
+        fn hard_link(&self, _src: &Path, _dst: &Path) -> io::Result<()> {
+            Self::deny()
+        }
+        fn symlink(&self, _target: &Path, _link: &Path) -> io::Result<()> {
+            Self::deny()
+        }
+    }
+
+    #[test]
+    fn module_resolution_probes_only_the_injected_filesystem() {
+        let dir = tempfile::tempdir().unwrap();
+        let module = dir.path().join("module.shl");
+        std::fs::write(&module, "export let x = 1").unwrap();
+        let fs = Arc::new(DenyProbeFs::default());
+        let mut ev = Evaluator::new(dir.path().to_path_buf());
+        ev.set_fs(fs.clone());
+
+        let effects = ev
+            .plan_program(&shoal_syntax::parse("use ./module").unwrap())
+            .unwrap()
+            .effects;
+        let base = dir.path().join("./module");
+        assert!(
+            effects.contains(&Effect::FsRead {
+                paths: vec![base.clone()]
+            }),
+            "a denied adapter must not discover the ambient .shl file: {effects:?}"
+        );
+        assert_eq!(
+            fs.probes(),
+            vec![
+                format!("is_file:{}", base.with_extension("shl").display()),
+                format!("canonicalize:{}", base.display()),
+            ]
+        );
+    }
+
+    #[test]
+    fn cd_canonicalization_cannot_escape_a_denying_adapter() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("child")).unwrap();
+        let fs = Arc::new(DenyProbeFs::default());
+        let mut ev = Evaluator::new(dir.path().to_path_buf());
+        ev.set_fs(fs.clone());
+
+        let err = ev
+            .eval_program(&shoal_syntax::parse("cd child").unwrap())
+            .unwrap_err();
+        assert_eq!(err.code, "arg_error");
+        assert_eq!(ev.cwd(), dir.path());
+        assert_eq!(
+            fs.probes(),
+            vec![format!(
+                "canonicalize:{}",
+                dir.path().join("child").display()
+            )]
+        );
+    }
+
+    /// Production guard for the evaluator paths audited in HR-C. It is
+    /// intentionally scoped to path-probe spellings rather than metadata
+    /// classification (`Metadata::is_file/is_dir`), which is already obtained
+    /// through `Fs::metadata`/`Fs::symlink_metadata` and must remain available
+    /// for symlink-safe trash handling.
+    #[test]
+    fn audited_evaluator_paths_have_no_ambient_path_probes() {
+        fn production(source: &'static str) -> &'static str {
+            source
+                .rsplit_once("\n#[cfg(test)]\nmod tests")
+                .map_or(source, |(production, _)| production)
+        }
+
+        let audited = [
+            ("builtins.rs", production(include_str!("builtins.rs"))),
+            (
+                "command/navigation.rs",
+                production(include_str!("command/navigation.rs")),
+            ),
+            ("journal.rs", production(include_str!("journal.rs"))),
+            ("plan_derive.rs", production(include_str!("plan_derive.rs"))),
+            (
+                "reef_builtins.rs",
+                production(include_str!("reef_builtins.rs")),
+            ),
+        ];
+        let forbidden_everywhere = [
+            ".exists()",
+            ".canonicalize()",
+            "std::fs::metadata(",
+            "std::fs::symlink_metadata(",
+            "FileFingerprint::capture(",
+        ];
+        for &(name, source) in &audited {
+            for forbidden in forbidden_everywhere {
+                assert!(
+                    !source.contains(forbidden),
+                    "ambient filesystem probe `{forbidden}` reappeared in {name}"
+                );
+            }
+        }
+
+        for (name, forbidden) in [
+            ("builtins.rs", "root.is_dir()"),
+            ("builtins.rs", "dest.is_dir()"),
+            ("journal.rs", "dest.is_dir()"),
+            ("journal.rs", "target.is_file()"),
+            ("plan_derive.rs", "with_shl.is_file()"),
+        ] {
+            let source = audited
+                .iter()
+                .find_map(|(candidate, source)| (*candidate == name).then_some(*source))
+                .unwrap();
+            assert!(
+                !source.contains(forbidden),
+                "ambient filesystem probe `{forbidden}` reappeared in {name}"
+            );
+        }
+    }
 
     /// A7: an adapter that declares a now-recognized `proc.spawn(...)` plus an
     /// unrecognized effect kind. The spawn must be derived (it was silently

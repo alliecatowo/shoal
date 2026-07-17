@@ -76,8 +76,9 @@ impl Evaluator {
         } else {
             self.exec.shell.cwd.join(p)
         };
-        joined
-            .canonicalize()
+        self.host
+            .fs
+            .canonicalize(&joined)
             .map_err(|e| ErrorVal::new("arg_error", e.to_string()))
     }
 

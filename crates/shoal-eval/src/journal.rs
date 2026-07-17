@@ -20,8 +20,8 @@
 
 use super::*;
 use shoal_journal::{
-    EntryRecord, FileFingerprint, Journal, JournalQuery, UndoError, UndoInverse, UndoReport,
-    UndoStatus,
+    EntryRecord, FileFingerprint, Journal, JournalQuery, UndoError, UndoInverse, UndoIo,
+    UndoReport, UndoStatus,
 };
 use std::os::unix::ffi::OsStrExt;
 use std::time::Instant;
@@ -39,6 +39,42 @@ pub(crate) enum FsUndoPre {
 
 fn elapsed_ns(start: Instant) -> i64 {
     start.elapsed().as_nanos().min(i64::MAX as u128) as i64
+}
+
+/// Journal undo's narrow filesystem view, backed by the evaluator's injected
+/// filesystem port. This keeps the journal crate independent of shoal-value
+/// while ensuring recording and replay use the same mediated filesystem as the
+/// mutation being journaled.
+struct EvalUndoIo<'a>(&'a dyn Fs);
+
+impl UndoIo for EvalUndoIo<'_> {
+    fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+        self.0.read(path)
+    }
+
+    fn symlink_metadata(&self, path: &Path) -> std::io::Result<std::fs::Metadata> {
+        self.0.symlink_metadata(path)
+    }
+
+    fn exists(&self, path: &Path) -> bool {
+        self.0.exists(path)
+    }
+
+    fn canonicalize(&self, path: &Path) -> std::io::Result<PathBuf> {
+        self.0.canonicalize(path)
+    }
+
+    fn create_dir(&self, path: &Path) -> std::io::Result<()> {
+        self.0.create_dir(path)
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+        self.0.rename(from, to)
+    }
+
+    fn atomic_replace(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        self.0.atomic_replace(path, bytes)
+    }
 }
 
 /// The default per-user state dir the journal lives in, mirroring the kernel's
@@ -223,7 +259,7 @@ impl Evaluator {
         let sources = &paths[..paths.len() - 1];
         let mut out = Vec::new();
         for src in sources {
-            let target = if dest.is_dir() {
+            let target = if self.host.fs.is_dir(&dest) {
                 match src.file_name() {
                     Some(name) => dest.join(name),
                     None => continue,
@@ -231,14 +267,14 @@ impl Evaluator {
             } else {
                 dest.clone()
             };
-            if target.is_file()
+            if self.host.fs.is_file(&target)
                 && let Some(hash) = self.snapshot_prior(entry, &target)
             {
                 out.push(FsUndoPre::Overwrite {
                     path: target,
                     prior_hash: hash,
                 });
-            } else if head == "mv" && !target.exists() {
+            } else if head == "mv" && !self.host.fs.exists(&target) {
                 out.push(FsUndoPre::Moved {
                     src: src.clone(),
                     dest: target,
@@ -257,13 +293,15 @@ impl Evaluator {
             return;
         };
         if head == "rm" {
-            record_trash_inverses(journal, entry, result);
+            record_trash_inverses(journal, &EvalUndoIo(self.host.fs.as_ref()), entry, result);
             return;
         }
         for item in pre {
             match item {
                 FsUndoPre::Overwrite { path, prior_hash } => {
-                    if let Ok(fp) = FileFingerprint::capture(&path) {
+                    if let Ok(fp) =
+                        FileFingerprint::capture_with(&EvalUndoIo(self.host.fs.as_ref()), &path)
+                    {
                         let _ = journal.record_undo_inverse(
                             entry,
                             &UndoInverse::RestoreBytes {
@@ -275,7 +313,9 @@ impl Evaluator {
                     }
                 }
                 FsUndoPre::Moved { src, dest } => {
-                    if let Ok(fp) = FileFingerprint::capture(&dest) {
+                    if let Ok(fp) =
+                        FileFingerprint::capture_with(&EvalUndoIo(self.host.fs.as_ref()), &dest)
+                    {
                         let _ = journal.record_undo_inverse(
                             entry,
                             &UndoInverse::MoveBack {
@@ -317,7 +357,7 @@ impl Evaluator {
     fn overwrite_undo_pre(&mut self, target: &Path) -> Option<FsUndoPre> {
         let entry = self.exec.control.current_entry?;
         self.session.journal.as_ref()?;
-        if !target.is_file() {
+        if !self.host.fs.is_file(target) {
             return None;
         }
         let hash = self.snapshot_prior(entry, target)?;
@@ -339,7 +379,7 @@ impl Evaluator {
         let Some(journal) = self.session.journal.as_ref() else {
             return;
         };
-        if let Ok(fp) = FileFingerprint::capture(&path) {
+        if let Ok(fp) = FileFingerprint::capture_with(&EvalUndoIo(self.host.fs.as_ref()), &path) {
             let _ = journal.record_undo_inverse(
                 entry,
                 &UndoInverse::RestoreBytes {
@@ -445,13 +485,16 @@ impl Evaluator {
             })?,
         };
         let root = self.exec.shell.cwd.clone();
-        let report = journal.undo_entry(entry_id, &root).map_err(|e| {
-            let code = match e {
-                UndoError::Stale(_) => "stale_undo",
-                _ => "custom",
-            };
-            ErrorVal::new(code, format!("undo of out:{entry_id} refused: {e}")).with_span(call.span)
-        })?;
+        let report = journal
+            .undo_entry_with(entry_id, &root, &EvalUndoIo(self.host.fs.as_ref()))
+            .map_err(|e| {
+                let code = match e {
+                    UndoError::Stale(_) => "stale_undo",
+                    _ => "custom",
+                };
+                ErrorVal::new(code, format!("undo of out:{entry_id} refused: {e}"))
+                    .with_span(call.span)
+            })?;
         Ok(undo_report_value(&report))
     }
 
@@ -528,7 +571,7 @@ fn literal_cmdarg_text(arg: &CmdArg) -> Option<String> {
 
 /// Walk an `rm` result (`[{path, trash}, …]`) and record a trash-move inverse
 /// for each trashed file so `undo` can move it back.
-fn record_trash_inverses(journal: &Journal, entry: i64, result: &Value) {
+fn record_trash_inverses(journal: &Journal, io: &dyn UndoIo, entry: i64, result: &Value) {
     let Value::List(rows) = result else {
         return;
     };
@@ -539,7 +582,7 @@ fn record_trash_inverses(journal: &Journal, entry: i64, result: &Value) {
         else {
             continue;
         };
-        if let Ok(fp) = FileFingerprint::capture(trash) {
+        if let Ok(fp) = FileFingerprint::capture_with(io, trash) {
             let _ = journal.record_undo_inverse(
                 entry,
                 &UndoInverse::TrashMove {
@@ -629,6 +672,106 @@ fn entry_row_record(e: &shoal_journal::EntryRow) -> Record {
 mod tests {
     use super::*;
     use shoal_journal::{Journal, JournalOptions};
+    use shoal_value::{ReadSeek, StdFs};
+    use std::io;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct RecordingDenyAtomicFs {
+        operations: Mutex<Vec<String>>,
+    }
+
+    impl RecordingDenyAtomicFs {
+        fn record(&self, operation: &str, path: &Path) {
+            self.operations
+                .lock()
+                .unwrap()
+                .push(format!("{operation}:{}", path.display()));
+        }
+
+        fn operations(&self) -> Vec<String> {
+            self.operations.lock().unwrap().clone()
+        }
+    }
+
+    impl Fs for RecordingDenyAtomicFs {
+        fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
+            self.record("read", path);
+            StdFs.read(path)
+        }
+        fn read_to_string(&self, path: &Path) -> io::Result<String> {
+            StdFs.read_to_string(path)
+        }
+        fn open_read(&self, path: &Path) -> io::Result<Box<dyn ReadSeek + Send>> {
+            StdFs.open_read(path)
+        }
+        fn write(&self, path: &Path, data: &[u8]) -> io::Result<()> {
+            StdFs.write(path, data)
+        }
+        fn append(&self, path: &Path, data: &[u8]) -> io::Result<()> {
+            StdFs.append(path, data)
+        }
+        fn touch(&self, path: &Path) -> io::Result<()> {
+            StdFs.touch(path)
+        }
+        fn metadata(&self, path: &Path) -> io::Result<std::fs::Metadata> {
+            StdFs.metadata(path)
+        }
+        fn symlink_metadata(&self, path: &Path) -> io::Result<std::fs::Metadata> {
+            self.record("symlink_metadata", path);
+            StdFs.symlink_metadata(path)
+        }
+        fn exists(&self, path: &Path) -> bool {
+            self.record("exists", path);
+            StdFs.exists(path)
+        }
+        fn is_file(&self, path: &Path) -> bool {
+            StdFs.is_file(path)
+        }
+        fn is_dir(&self, path: &Path) -> bool {
+            StdFs.is_dir(path)
+        }
+        fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
+            self.record("canonicalize", path);
+            StdFs.canonicalize(path)
+        }
+        fn atomic_replace(&self, path: &Path, _data: &[u8]) -> io::Result<()> {
+            self.record("atomic_replace", path);
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "test adapter denied atomic replacement",
+            ))
+        }
+        fn read_dir(&self, path: &Path) -> io::Result<Vec<PathBuf>> {
+            StdFs.read_dir(path)
+        }
+        fn create_dir(&self, path: &Path) -> io::Result<()> {
+            self.record("create_dir", path);
+            StdFs.create_dir(path)
+        }
+        fn create_dir_all(&self, path: &Path) -> io::Result<()> {
+            StdFs.create_dir_all(path)
+        }
+        fn remove_file(&self, path: &Path) -> io::Result<()> {
+            StdFs.remove_file(path)
+        }
+        fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
+            StdFs.remove_dir_all(path)
+        }
+        fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+            self.record("rename", from);
+            StdFs.rename(from, to)
+        }
+        fn copy(&self, from: &Path, to: &Path) -> io::Result<u64> {
+            StdFs.copy(from, to)
+        }
+        fn hard_link(&self, src: &Path, dst: &Path) -> io::Result<()> {
+            StdFs.hard_link(src, dst)
+        }
+        fn symlink(&self, target: &Path, link: &Path) -> io::Result<()> {
+            StdFs.symlink(target, link)
+        }
+    }
 
     /// Build a journaled evaluator rooted at `cwd` with an in-memory journal.
     ///
@@ -739,6 +882,46 @@ mod tests {
         assert_eq!(
             std::fs::read(dir.path().join("f.txt")).unwrap(),
             b"original"
+        );
+    }
+
+    #[test]
+    fn undo_replay_is_mediated_and_atomic_replace_denial_is_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("f.txt");
+        std::fs::write(&target, b"original").unwrap();
+        let mut ev = journaled(dir.path());
+        run_journaled(&mut ev, r#"save("f.txt", "replacement")"#).unwrap();
+
+        let fs = Arc::new(RecordingDenyAtomicFs::default());
+        ev.set_fs(fs.clone());
+        let error = run_journaled(&mut ev, "undo").unwrap_err();
+        assert_eq!(error.code, "custom");
+        assert!(
+            error.msg.contains("test adapter denied atomic replacement"),
+            "{}",
+            error.msg
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"replacement");
+
+        let operations = fs.operations();
+        assert!(
+            operations
+                .iter()
+                .any(|op| op == &format!("exists:{}", target.display())),
+            "existence probe escaped the adapter: {operations:?}"
+        );
+        assert!(
+            operations
+                .iter()
+                .any(|op| op == &format!("read:{}", target.display())),
+            "fingerprint read escaped the adapter: {operations:?}"
+        );
+        assert!(
+            operations
+                .iter()
+                .any(|op| op == &format!("atomic_replace:{}", target.display())),
+            "restore escaped the adapter: {operations:?}"
         );
     }
 

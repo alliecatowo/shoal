@@ -209,7 +209,7 @@ fn ls(fs: &dyn Fs, cwd: &Path, args: Vec<Value>, all: bool) -> VResult<Value> {
     };
     let mut rows = Vec::new();
     for root in roots {
-        if root.is_dir() {
+        if fs.is_dir(&root) {
             for entry in fs.read_dir(&root).map_err(|e| ioerr("list", &root, e))? {
                 if !all
                     && entry
@@ -283,14 +283,14 @@ fn copy_move(
     }
     let mut ps = paths(cwd, args)?;
     let dest = ps.pop().expect("length checked");
-    if ps.len() > 1 && !dest.is_dir() {
+    if ps.len() > 1 && !fs.is_dir(&dest) {
         return Err(ErrorVal::arg_error(
             "destination must be a directory for multiple sources",
         ));
     }
     let mut out = Vec::new();
     for src in ps {
-        let target = if dest.is_dir() {
+        let target = if fs.is_dir(&dest) {
             dest.join(
                 src.file_name()
                     .ok_or_else(|| ErrorVal::arg_error("source has no name"))?,

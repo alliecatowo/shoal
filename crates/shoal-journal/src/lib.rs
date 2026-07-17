@@ -59,7 +59,7 @@ pub use gc::{GcBlob, GcOptions, GcReport};
 pub use query::{EntryRow, JournalQuery};
 pub use schema::EntryRecord;
 pub use transcript::TranscriptEventRow;
-pub use undo::{FileFingerprint, UndoError, UndoInverse, UndoReport, UndoStatus, UndoStep};
+pub use undo::{FileFingerprint, UndoError, UndoInverse, UndoIo, UndoReport, UndoStatus, UndoStep};
 
 /// Handle to a journal: a SQLite database plus an on-disk CAS directory.
 ///
