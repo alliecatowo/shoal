@@ -1,12 +1,11 @@
-# Further stream hardening beyond streams.toml/streams-more.toml: `.buffer`
-# requires positive bounded capacity, and `.window` on an empty source produces
-# no windows rather than an error.
+# Further stream hardening beyond streams.toml/streams-more.toml: `.buffer(0)`
+# is a lossless rendezvous handoff with no readahead, and `.window` on an empty
+# source produces no windows rather than an error.
 
 [[case]]
-name = "stream3-buffer-zero-is-rejected"
+name = "stream3-buffer-zero-is-lossless-rendezvous"
 src = "[1, 2].stream().buffer(0).collect()"
-error = "arg_error"
-error_contains = "positive"
+value = "[1, 2]"
 
 [[case]]
 name = "stream3-window-on-empty-source-is-empty"

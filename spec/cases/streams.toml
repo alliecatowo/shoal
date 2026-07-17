@@ -51,6 +51,11 @@ src = '[1, 1, 2, 2, 2, 3, 1].stream().distinct().collect()'
 value = "[1, 2, 3]"
 
 [[case]]
+name = "stream-distinct-numeric-promotion-equality"
+src = '[1, 1.0, 2, 1].stream().distinct().collect()'
+value = "[1, 2]"
+
+[[case]]
 name = "stream-flat-map-lists"
 src = '[1, 2, 3].stream().flat_map(x => [x, x * 10]).collect()'
 value = "[1, 10, 2, 20, 3, 30]"
@@ -59,6 +64,11 @@ value = "[1, 10, 2, 20, 3, 30]"
 name = "stream-flat-map-substreams"
 src = '[1, 2].stream().flat_map(x => [x].stream()).collect()'
 value = "[1, 2]"
+
+[[case]]
+name = "stream-flat-map-substreams-drain-sequentially"
+src = '[1, 2].stream().flat_map(x => [x * 10, x * 10 + 1].stream()).collect()'
+value = "[10, 11, 20, 21]"
 
 [[case]]
 name = "stream-enumerate"
@@ -71,9 +81,23 @@ src = '[1, 2, 3].stream().buffer(2).collect()'
 value = "[1, 2, 3]"
 
 [[case]]
+name = "stream-buffer-composes-with-closure-stages"
+src = '[1, 2, 3].stream().map(x => x * 2).buffer(2).map(x => x + 1).collect()'
+value = "[3, 5, 7]"
+
+[[case]]
 name = "stream-zip"
 src = '[1, 2, 3].stream().zip([10, 20].stream()).collect()'
 value = "[[1, 10], [2, 20]]"
+
+[[case]]
+name = "stream-zip-consumes-one-left-item-past-the-shorter-end"
+src = '''
+let pairs = [1, 2, 3].stream().map(x => { channel("pulled").emit(x)
+x }).zip([10].stream()).collect()
+[pairs, channel("pulled").latest()]
+'''
+value = "[[[1, 10]], 2]"
 
 [[case]]
 name = "stream-merge-sum"

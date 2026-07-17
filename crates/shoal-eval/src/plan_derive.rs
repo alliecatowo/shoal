@@ -462,8 +462,11 @@ impl Evaluator {
                 // from a read-only table to manifest writes/provider fetches.
                 // Without the runtime object/subcommand, both stay fail-closed.
                 "apply" | "reef" => push_effect(out, Effect::Opaque),
-                // Runtime-local reads or validation/planning operations.
-                "jobs" | "dirs" | "pwd" | "assert" | "plan" | "explain" => {}
+                // `plan` stores the parsed program in session execution state
+                // for a later `apply`; the other heads are local reads or
+                // validation-only operations.
+                "plan" => push_effect(out, Effect::SessionWrite),
+                "jobs" | "dirs" | "pwd" | "assert" | "explain" => {}
                 // Effectful special heads are handled above. Keeping a
                 // conservative fallback means a future registry entry cannot
                 // silently become effect-free before planner semantics land.
@@ -928,6 +931,11 @@ effects=["proc.spawn(container)", "net.connect(registry:443)", "quantum.entangle
             effects_at(dir.path(), "journal"),
             vec![Effect::JournalRead],
             "journal must plan the journal read performed by runtime dispatch"
+        );
+        assert_eq!(
+            effects_at(dir.path(), "plan { echo hi }"),
+            vec![Effect::SessionWrite],
+            "plan must declare the stored-program mutation used by apply"
         );
         assert!(
             effects_at(dir.path(), "interact echo")

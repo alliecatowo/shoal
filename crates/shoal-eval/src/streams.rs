@@ -89,7 +89,6 @@ impl Evaluator {
         stream: StreamVal,
         capacity: usize,
     ) -> VResult<StreamVal> {
-        debug_assert!(capacity > 0);
         let lease = acquire_stream_pump()?;
         let label = stream.label.clone();
         let bounded = stream.is_bounded();

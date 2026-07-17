@@ -556,7 +556,7 @@ fn stream_cursor_from_uri(uri: &str) -> Option<StreamCursorRef> {
 /// ANSI (`color_for_value` et al. in `shoal-value/src/render.rs`) — fine for
 /// `shoal`'s own interactive REPL, which reads a real terminal and wants the
 /// color, but agent-hostile noise on the kernel/MCP wire: `session.attach`
-/// forces every kernel exec headless (`evaluator.interactive = false`,
+/// forces every kernel exec headless (`evaluator.set_interactive(false)`,
 /// `handlers_exec.rs`) and a cold-agent field test found the escape bytes
 /// still landing verbatim in `structuredContent.render` and `content[].text`
 /// — an agent has no terminal to interpret them, so they read as junk

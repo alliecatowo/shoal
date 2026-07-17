@@ -174,7 +174,10 @@ fn buffer_decouples_through_a_bounded_owned_pump() {
         rendered("[1,2,3].stream().map(x => x * 2).buffer(2).collect()"),
         "[2, 4, 6]"
     );
-    assert_eq!(run_err("[1].stream().buffer(0)"), "arg_error");
+    assert_eq!(
+        rendered("[1,2,3].stream().buffer(0).collect()"),
+        "[1, 2, 3]"
+    );
 }
 
 #[test]
