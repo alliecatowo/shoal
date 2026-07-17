@@ -28,6 +28,8 @@ not sufficient evidence that the local shell, kernel, and MCP surface all expose
 
 ```mermaid
 flowchart LR
+accTitle: System context
+accDescr: Shows the components and relationships described in System context.
   Human["Human at a terminal"] --> Shell["shoal\nReedline host"]
   Editor["Editor"] --> LSP["shoal-lsp"]
   Agent["MCP client / agent"] --> MCP["shoal-mcp\nstdio facade"]
@@ -67,6 +69,8 @@ the AST and syntax crates do not know about execution, policies, or hosts.
 
 ```mermaid
 flowchart TB
+accTitle: Dependency strata
+accDescr: Shows the components and relationships described in Dependency strata.
   subgraph Hosts["Composition roots"]
     CLI["shoal"]
     Kernel["shoal-kernel"]
@@ -130,6 +134,8 @@ The stable mental model is a sequence of representations, not a single “run co
 
 ```mermaid
 flowchart LR
+accTitle: The source-to-effect path
+accDescr: Shows the components and relationships described in The source-to-effect path.
   Source["UTF-8 source"] --> Lex["mode-aware tokens"]
   Lex --> Parse["Program / Stmt / Expr AST"]
   Parse --> Plan["derived effects + reversibility"]
@@ -173,6 +179,8 @@ and isolation bugs.
 
 ```mermaid
 flowchart TB
+accTitle: State ownership
+accDescr: Shows the components and relationships described in State ownership.
   Disk["Persistent filesystem"]
   Kernel["Kernel process"]
   Session["Named session"]
@@ -197,6 +205,8 @@ The local CLI performs host assembly that `Kernel::session` does not currently m
 
 ```mermaid
 flowchart TD
+accTitle: Two host paths, not yet full parity
+accDescr: Shows the components and relationships described in Two host paths, not yet full parity.
   Config["layered shoal config"] --> CLI["local shoal host"]
   Prompt["prompt config"] --> CLI
   Bundled["bundled + extra adapters"] --> CLI

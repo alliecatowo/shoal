@@ -21,6 +21,8 @@ AST through callables, language verbs, builtins, adapters, scripts, Reef, or ext
 
 ```mermaid
 flowchart LR
+accTitle: Representation pipeline
+accDescr: Shows the components and relationships described in Representation pipeline.
   Bytes["source bytes"] --> Lexer["Lexer\nEXPR or CMD mode"]
   Lexer --> Tokens["tokens + byte spans"]
   Tokens --> Parser["recursive descent + Pratt expressions"]
@@ -53,23 +55,6 @@ field, index, method, and function calls; command calls; lambdas; lists and reco
 `match`; `try`/`catch`; `with`; `spawn`; interpreter blocks; unary/binary operators; and ranges.
 Patterns cover wildcard, binding, literal, range, type, record, and list destructuring.
 
-```mermaid
-classDiagram
-  class Program { Vec~Stmt~ stmts }
-  class Stmt { binding control expression }
-  class Expr { literals access calls blocks commands }
-  class CmdCall { head forced args redirects env background }
-  class CmdArg { word path glob string expression flags }
-  class Pattern { bind literal type record list range }
-  class Span { start end }
-  Program *-- Stmt
-  Stmt *-- Expr
-  Stmt *-- Pattern
-  Expr *-- CmdCall
-  CmdCall *-- CmdArg
-  Stmt --> Span
-  Expr --> Span
-```
 
 The AST intentionally records syntax-level intent. It does not contain open files, resolved
 executables, policy decisions, journal IDs, or live values.
@@ -89,18 +74,6 @@ both modes and at transitions such as a command argument containing `{ expressio
 
 The parser uses syntax and a `ParseCtx` to choose expression or command interpretation.
 
-```mermaid
-flowchart TD
-  Head["statement head"] --> Reserved{"reserved statement form?"}
-  Reserved -->|yes| Form["parse let/fn/if/loop/etc."]
-  Reserved -->|no| Forced{"leading ^ ?"}
-  Forced -->|yes| Cmd["forced command AST"]
-  Forced -->|no| Literal{"literal/control/adjacent postfix?"}
-  Literal -->|yes| Expr["expression parser"]
-  Literal -->|no| Bound{"head binding in ParseCtx"}
-  Bound -->|value or callable syntax| Expr
-  Bound -->|command / unbound| Cmd
-```
 
 The real decision tree has additional cases for environment prefixes, assignments, path heads,
 interpreter blocks, and REPL dot-chains, but the binding-sensitive fork is the architectural one.
@@ -137,6 +110,8 @@ An `Evaluator` is a session runtime, not a stateless `eval(source)` function.
 
 ```mermaid
 flowchart TB
+accTitle: The evaluator state machine
+accDescr: Shows the components and relationships described in The evaluator state machine.
   Evaluator["Evaluator"] --> Env["lexical Env chain"]
   Evaluator --> Cwd["logical cwd + directory stack"]
   Evaluator --> ProcEnv["session process environment"]
@@ -171,18 +146,6 @@ Conditions are intentionally strict: boolean values and command outcomes have tr
 arbitrary strings, numbers, and containers do not become truthy or falsy. This prevents empty-string
 or zero conventions from leaking unpredictably between structured data and process status.
 
-```mermaid
-sequenceDiagram
-  participant S as Stmt evaluator
-  participant E as Expr evaluator
-  participant V as Value methods
-  participant C as CallCtx
-  S->>E: evaluate expression
-  E->>V: dispatch receiver.method(args)
-  V->>C: invoke closure / load bytes / perform port action
-  C->>E: callback into evaluator-owned capability
-  E-->>S: Value or ErrorVal
-```
 
 `CallCtx` is the dependency inversion that lets generic value methods call closures or capabilities
 without making `shoal-value` depend on `shoal-eval`.
@@ -194,6 +157,8 @@ an existing program invokes.
 
 ```mermaid
 flowchart TD
+accTitle: Command dispatch
+accDescr: Shows the components and relationships described in Command dispatch.
   Start["CmdCall"] --> Background{"trailing &?"}
   Background -->|yes| Spawn["desugar to spawn block → Task"]
   Background -->|no| Callable{"session binding callable?"}
@@ -252,13 +217,6 @@ The kernel translates a raised `ErrorVal` into the RPC `RAISED` numeric code whi
 language value in the session transcript, so an agent can follow its `out[n]` ref. Keep these layers
 distinct:
 
-```mermaid
-flowchart LR
-  ParseFailure["syntax ParseError"] --> RpcParse["RPC PARSE_ERROR -32001"]
-  EvalFailure["language ErrorVal\ncode + span + details"] --> Transcript["stored Value::Error"]
-  Transcript --> RpcRaised["RPC RAISED -32002\nwith ref in data"]
-  TransportFailure["bad JSON-RPC frame"] --> IO["connection/frame error"]
-```
 
 ## Checklist for a language feature
 

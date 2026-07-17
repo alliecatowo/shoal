@@ -18,21 +18,6 @@ This page describes the **local REPL**. A kernel-hosted agent session shares lan
 
 ## The interactive loop
 
-```mermaid
-sequenceDiagram
-    participant U as User
-    participant E as Line editor
-    participant P as Parser / evaluator
-    participant J as Journal
-    participant R as Renderer
-    U->>E: edit + submit source
-    E->>P: complete statement(s)
-    P->>P: evaluate with session state
-    P->>J: record source, result, effects
-    P->>R: final per-line result
-    R-->>U: render or page
-    P->>E: refresh completion + prompt snapshot
-```
 
 Open delimiters, trailing operators or commas, a trailing backslash, and a next line beginning with `.`, `catch`, or `else` keep the input open. This lets blocks and method chains span lines without a special multiline command.
 
@@ -145,13 +130,6 @@ Kernel tasks are different: current MCP/kernel suspend and resume operations ret
 
 Line-editing history and the structured command journal are related but distinct:
 
-```mermaid
-flowchart LR
-    SRC["submitted source"] --> H["line history\nrecall + search"]
-    SRC --> J["journal entry\nprincipal + result + effects"]
-    J --> U["undo eligibility"]
-    J --> CAS["captured values / CAS refs"]
-```
 
 History defaults to a file under `$XDG_STATE_HOME/shoal`, falling back to `~/.local/state/shoal`. It can deduplicate adjacent identical entries, ignore leading-space commands, and ignore configured patterns.
 

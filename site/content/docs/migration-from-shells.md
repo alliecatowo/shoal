@@ -14,15 +14,6 @@ toc = true
 
 Shoal is not a Bash-compatible shell with nicer objects. It keeps command-line ergonomics, but replaces expansion and byte pipelines with expression evaluation and typed values. The fastest migration strategy is to preserve external commands at the edges and rewrite the data transformations between them.
 
-```mermaid
-flowchart LR
-    B["traditional shell"] --> T["command emits bytes"]
-    T --> P["pipe + grep/awk/sed/jq"]
-    P --> S["string result"]
-    H["Shoal"] --> O["command returns outcome/value"]
-    O --> M["map/where/group/methods"]
-    M --> V["typed value"]
-```
 
 ## The five biggest mental shifts
 

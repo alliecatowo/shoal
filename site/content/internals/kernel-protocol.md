@@ -25,17 +25,22 @@ threads. Frames are newline-delimited JSON-RPC 2.0.
 
 ```mermaid
 flowchart TB
-  Listener["UnixListener"] --> ConnA["connection thread A"]
-  Listener --> ConnB["connection thread B"]
-  ConnA --> AttachA["optional Attachment\nprincipal + tty + Session"]
-  ConnB --> AttachB["optional Attachment\nprincipal + tty + Session"]
+accTitle: Connection, authentication, attachment, and session topology
+accDescr: Each socket connection authenticates a principal, attaches client-local state to a shared session, and uses a dedicated writer path for responses and subscriptions.
+  Listener["Unix socket listener"] --> ConnA["connection A"]
+  Listener --> ConnB["connection B"]
+  ConnA --> AuthA["authenticate token → principal A"]
+  ConnB --> AuthB["authenticate token → principal B"]
+  AuthA --> AttachA["attachment: principal + tty + client id"]
+  AuthB --> AttachB["attachment: principal + tty + client id"]
   AttachA --> Session["Arc Session"]
   AttachB --> Session
   Session --> Eval["Mutex Evaluator"]
   Session --> Transcript["Mutex transcript"]
-  Session --> ClientIt["client_id → last ref"]
-  ConnA --> WriterA["shared writer"]
-  SubA["subscription writer thread"] --> WriterA
+  Session --> Bus["EventBus"]
+  ConnA --> WriterA["shared response writer A"]
+  Bus --> SubA["subscription writer thread A"]
+  SubA --> WriterA
 ```
 
 On disconnect, subscriptions associated with that connection are removed. The named session remains
@@ -48,23 +53,6 @@ and [`session.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-k
 
 `session.attach` is the identity and feature-negotiation boundary.
 
-```mermaid
-sequenceDiagram
-  participant C as client
-  participant K as kernel
-  participant A as auth store
-  participant S as session map
-  C->>K: session.attach(token?, session?, client.tty)
-  alt token supplied
-    K->>A: validate bearer
-    A-->>K: principal, profile, caps metadata
-  else local attachment
-    K->>K: derive local principal
-  end
-  K->>S: get or create named Session
-  S-->>K: shared evaluator/transcript
-  K-->>C: principal, cwd, AST version, enforcement status, elision defaults, channels
-```
 
 The response reports the actual available enforcement tier and whether this principal resolves to a
 real sandbox. Token capability metadata is returned separately from the policy principal.
@@ -93,6 +81,8 @@ principals and the same name; two different names do not exercise this risk.
 
 ```mermaid
 classDiagram
+accTitle: Session contents
+accDescr: Shows the components and relationships described in Session contents.
   class Session { id next_value }
   class Evaluator { env cwd process_env jobs reef journal policy }
   class Transcript { Ref to Value }
@@ -163,22 +153,6 @@ and caller-scoped journal policy. See the [roadmap P0](../roadmap-and-priorities
 `exec` has three modes: `plan`, ordinary `run`, and internal approved re-entry. Position is `stmt` or
 `value`; background and timeout options can turn execution into a task.
 
-```mermaid
-flowchart TD
-  Exec["exec params"] --> Async{"background or timeout?"}
-  Async -->|yes| Task["create TaskEntry + worker thread\nrecursively dispatch sync exec"]
-  Task --> Wait{"timeout and finished before deadline?"}
-  Wait -->|yes| Inline["return inline result"]
-  Wait -->|no| TaskRef["return task ref + event channel"]
-  Async -->|no| Mode{"mode"}
-  Mode -->|plan| Derive["parse → derive → evaluate → store plan"]
-  Mode -->|approved| Verify["verify plan/session/principal/source/approval"]
-  Mode -->|run| Gate["parse → derive → policy verdict"]
-  Verify --> Evaluate["serialized evaluator run"]
-  Gate -->|allow| Evaluate
-  Gate -->|deny/ask| RpcError["leash error"]
-  Evaluate --> Journal["journal + transcript + refs + events"]
-```
 
 ### Synchronous run details
 
@@ -195,6 +169,8 @@ flowchart TD
 
 ```mermaid
 sequenceDiagram
+accTitle: Synchronous run details
+accDescr: Shows the components and relationships described in Synchronous run details.
   participant C as client
   participant K as exec handler
   participant E as session evaluator
@@ -258,6 +234,8 @@ Default automatic elision thresholds are:
 
 ```mermaid
 flowchart TD
+accTitle: Wire values and elision
+accDescr: Shows the components and relationships described in Wire values and elision.
   Value["runtime Value"] --> Encode["typed WireValue"]
   Encode --> Budget{"within byte + shape budget?"}
   Budget -->|yes| Inline["inline tagged value"]
@@ -293,6 +271,8 @@ wired; do not document channels that never emit.
 
 ```mermaid
 flowchart LR
+accTitle: Event bus
+accDescr: Shows the components and relationships described in Event bus.
   Publisher["kernel/evaluator publisher"] --> Ring["per-channel ring\n1024 events"]
   Publisher --> QA["subscriber A queue\n256 events"]
   Publisher --> QB["subscriber B queue\n256 events"]

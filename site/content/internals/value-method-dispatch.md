@@ -34,6 +34,8 @@ spawn a command or inspect a filesystem. Those operations remain evaluator respo
 
 ```mermaid
 flowchart LR
+accTitle: Capability boundary
+accDescr: Shows the components and relationships described in Capability boundary.
   AST["recv.method(args)"] --> Eval["evaluator intercepts"]
   Eval --> Feed["feed / channel / namespace / fs path methods"]
   Eval --> Core["shoal_value::methods::call_method"]
@@ -60,12 +62,18 @@ Order is observable:
 
 ```mermaid
 flowchart TD
+accTitle: Dispatch precedence
+accDescr: Method dispatch checks special wrappers and type surfaces in order; Outcome methods use metadata first and otherwise forward to their parsed payload before general lookup.
   Method --> Tap{"tap/also?"}
   Tap -->|yes| TapRun["call f(recv), return unchanged recv"]
   Tap -->|no| CAS{"CasBytes?"}
   CAS -->|yes| CheapOrLoad
   CAS -->|no| Outcome{"Outcome?"}
-  Outcome -->|yes| Forward
+  Outcome -->|yes| Native{"outcome-native method?"}
+  Native -->|yes| Metadata["status / ok / stdout / stderr / duration"]
+  Native -->|no| Parsed{"parsed payload supports method?"}
+  Parsed -->|yes| Forward["forward to outcome.out"]
+  Parsed -->|no| Unknown
   Outcome -->|no| Stream{"Stream?"}
   Stream -->|yes| StreamSurface
   Stream -->|no| Path{"Path component method?"}
@@ -214,13 +222,6 @@ ls.where(row => row.size > 1mb).sort_by(row => row.name)
 
 while raw stdout/stderr remain explicitly accessible.
 
-```mermaid
-flowchart TD
-  O["Outcome.method"] --> Native{"outcome-native method?"}
-  Native -->|yes| Metadata["status/ok/stdout/stderr/etc."]
-  Native -->|no| Out["Outcome::out_value"]
-  Out --> Dispatch["redispatch method on structured/raw output"]
-```
 
 Forwarding means a newly added general method can automatically become available on outcomes. Test
 both a parsed structured outcome and an unparsed text outcome.

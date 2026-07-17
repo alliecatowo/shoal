@@ -18,6 +18,8 @@ A stream is a single-consumer sequence that may produce values over time. A chan
 
 ```mermaid
 flowchart LR
+accTitle: Lifecycle first
+accDescr: Shows the components and relationships described in Lifecycle first.
     SRC["source producer"] -->|"bounded queue"| S["stream&lt;T&gt;"]
     S --> C["lazy combinators"]
     C --> K{"explicit sink"}
@@ -208,6 +210,8 @@ In a kernel-hosted session, only channels beginning with `user.` bridge bidirect
 
 ```mermaid
 flowchart LR
+accTitle: Kernel bridge
+accDescr: Shows the components and relationships described in Kernel bridge.
     L["language channel user.x"] <-->|"mirrored payloads"| K["kernel EventBus user.x"]
     K <-->|"events subscribe/read"| A["agent client"]
     OWN["kernel-owned channels"] --> K

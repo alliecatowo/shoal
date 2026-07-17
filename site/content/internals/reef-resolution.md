@@ -19,18 +19,14 @@ synthesized view.
 
 ```mermaid
 flowchart LR
-  Cwd["cwd + optional user shoal.toml"] --> Scope["discover nearest-first scopes"]
-  Scope --> Decision["refine constraints + provider pin"]
-  Decision --> Lock{"valid lock entry?"}
-  Lock -->|yes| Drift["rehash locked path"]
-  Lock -->|no| Policy{"interactive or script?"}
-  Policy -->|script + constrained| Unlocked["reef_unlocked"]
-  Policy -->|interactive| Providers["enumerate/rank candidates"]
-  Drift -->|matches| Resolution["path/version/provider/hash/report"]
-  Drift -->|changed| DriftErr["reef_drift"]
-  Providers --> Resolution
-  Resolution --> View["view symlinks + child PATH"]
-  Resolution --> Spawn["absolute argv[0] + Leash hash reuse"]
+accTitle: Reef resolution decision
+accDescr: Nearest-first scopes produce one effective constraint, which is satisfied by a verified lock or an allowed provider search before creating the executable view.
+  Scope["nearest-first scopes"] --> Decision["effective constraint + provider pin"]
+  Decision --> Lock{"verified lock?"}
+  Lock -->|yes| Resolution["path + version + provider + hash"]
+  Lock -->|no| Search["policy-gated provider search"]
+  Search --> Resolution
+  Resolution --> View["content-addressed executable view"]
 ```
 
 ## Crate/module ownership
@@ -102,13 +98,6 @@ Starting at cwd and walking to filesystem root, each directory is checked in thi
 Every accepted scope is appended nearest first. Native Reef therefore wins over foreign formats in
 the same directory. The optional user `[reef]` scope is appended last.
 
-```mermaid
-flowchart TB
-  C["/work/repo/sub"] --> Near["sub manifests: reef → mise → .mise → tool-versions"]
-  Near --> Repo["repo manifests in same ordering"]
-  Repo --> Parents["remaining ancestors"]
-  Parents --> User["optional user [reef]"]
-```
 
 There is no Git/home boundary and no “nearest manifest only” rule: all accepted scopes participate
 in compatibility checking. This differs from `shoal-config`'s single nearest `.shoal.toml`.
@@ -153,18 +142,6 @@ For one tool, the nearest mentioning scope supplies the base constraint and init
 Every farther mention must be compatible. Compatible constraints refine to the more specific value.
 Any farther provider pin is adopted if none exists, or must equal the existing pin.
 
-```mermaid
-flowchart TD
-  Mentions["nearest-first scopes mentioning tool"] --> Base["nearest base constraint/pin"]
-  Base --> Next{"farther mention compatible?"}
-  Next -->|no| Conflict["reef_conflict + source hint"]
-  Next -->|yes| Refine["choose more specific constraint"]
-  Refine --> Pin{"provider pins agree?"}
-  Pin -->|no| Conflict
-  Pin -->|yes| More{"more mentions?"}
-  More -->|yes| Next
-  More -->|no| Decision["effective constraint + pin + nearest scope label"]
-```
 
 An unmentioned tool gets unconstrained `Any`, no provider pin, and a provider/ambient scope label.
 The evaluator spawn hook deliberately bypasses Reef for such a head even when other tools are
@@ -277,14 +254,6 @@ or a UID-scoped temp fallback. The `bin` directory contains name → absolute ex
 Construction uses a unique staging sibling and atomic rename; a losing concurrent builder discards
 its staging directory and reuses the winner.
 
-```mermaid
-flowchart LR
-  Bindings["name → absolute path bindings"] --> Sort["sort by name/path"]
-  Sort --> Hash["BLAKE3 of names + path bytes"]
-  Hash --> Stage[".staging-pid-counter/bin symlinks"]
-  Stage --> Rename["atomic rename to views/hash"]
-  Rename --> Path["view/bin + ambient tail, or view-only"]
-```
 
 The view hash addresses the **binding definition** (names and paths), not executable file contents.
 Changing bytes at the same path keeps the same view directory, while lock drift still detects the

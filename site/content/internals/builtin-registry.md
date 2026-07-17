@@ -50,6 +50,8 @@ host integration, operate on plans/journals/Reef, or have nonuniform argument se
 
 ```mermaid
 flowchart LR
+accTitle: Special heads
+accDescr: Shows the components and relationships described in Special heads.
   Registry["shoal-syntax commands.rs"] --> Eval["command-name recognition"]
   Registry --> Complete["shell completion"]
   Registry --> Highlight["shell highlighting"]
@@ -69,6 +71,8 @@ special-head registry.
 
 ```mermaid
 flowchart TD
+accTitle: Command dispatch precedence
+accDescr: Shows the components and relationships described in Command dispatch precedence.
   Call["CmdCall"] --> BG{"background &?"}
   BG -->|yes| Spawn["desugar to spawn block"]
   BG -->|no| Callable{"bound callable?"}
@@ -107,22 +111,6 @@ statement renderer. This behavior is runtime dispatch, not a separate documentat
 
 ## Structured builtin input pipeline
 
-```mermaid
-sequenceDiagram
-  participant C as CmdCall
-  participant R as builtins::run
-  participant A as arg expansion
-  participant D as dispatch
-  participant O as Outcome wrapper
-  C->>R: structured head + AST args
-  R->>R: collect long/short flag names
-  R->>A: expand non-flag args
-  R->>R: variadic type coercion
-  R->>D: fs, cwd, process env, values, flags, cancel
-  D-->>R: typed Value or ErrorVal
-  R-->>O: structured result
-  O-->>C: Outcome(parsed = result)
-```
 
 `DashDash` is ignored by the structured collector after parsing has classified later tokens. Long
 and short flags are reduced to names; most builtins use a simple presence test and do not reject
@@ -287,14 +275,6 @@ lack one, uses outcome stdout, emits nothing for `null`, and top-renders other v
 Builtin redirects write these bytes through `Fs`; once an output redirect captures a result, the
 command returns `null` so it is not rendered a second time.
 
-```mermaid
-flowchart LR
-  Raw["structured Value"] --> Bytes["value_bytes"]
-  Raw --> Parsed["Outcome.parsed"]
-  Bytes --> Stdout["Outcome.stdout"]
-  Stdout --> Redirect["> / >> via Fs"]
-  Parsed --> Methods[".out / structured composition"]
-```
 
 ## Registry change workflow
 

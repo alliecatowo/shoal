@@ -25,6 +25,8 @@ Primary sources: [`lib.rs`](https://github.com/alliecatowo/shoal/blob/main/crate
 
 ```mermaid
 flowchart LR
+accTitle: The interpreter boundary
+accDescr: Shows the components and relationships described in The interpreter boundary.
   Source --> Parser["shoal-syntax::parse"]
   Parser --> Program["shoal_ast::Program"]
   Program --> Eval["Evaluator::eval_program"]
@@ -103,19 +105,6 @@ loading, and kernel sessions.
 or Leash policy. It installs standard effect ports, creates a shared language bus, and selects
 `EchoMode::All`.
 
-```mermaid
-stateDiagram-v2
-  [*] --> New
-  New: root Env
-  New: OS env snapshot
-  New: no journal or sandbox
-  New: standard ports
-  New: EchoMode&#58;&#58;All
-  New --> Configured: host setters
-  Configured --> Evaluating: eval_program
-  Evaluating --> Configured: value or error
-  Configured --> [*]: host drops session
-```
 
 The absence of a journal or Leash policy is meaningful. It preserves the embedding and test path:
 plain evaluator construction performs no journaling setup and adds no sandbox wrapper. Host code
@@ -135,6 +124,8 @@ must opt in explicitly.
 
 ```mermaid
 sequenceDiagram
+accTitle: Program evaluation transaction
+accDescr: Shows the components and relationships described in Program evaluation transaction.
   participant H as Host
   participant E as Evaluator
   participant J as Journal
@@ -175,22 +166,6 @@ That distinction prevents `return` and loop control from being confused with an 
 language `try` might catch. `eval_expr_flow` exists for expressions such as blocks and conditionals
 which must preserve the flow marker when evaluated in statement context.
 
-```mermaid
-flowchart TD
-  Stmt --> EvalStmt
-  EvalStmt --> Value
-  EvalStmt --> Return
-  EvalStmt --> Break
-  EvalStmt --> Continue
-  Value --> Parent
-  Return --> FunctionBoundary
-  Break --> LoopBoundary
-  Continue --> LoopBoundary
-  FunctionBoundary --> RuntimeValue
-  LoopBoundary --> RuntimeValue2["null / next iteration"]
-  Return -. escapes .-> TopError["return outside function"]
-  Break -. escapes .-> TopError2["loop control outside loop"]
-```
 
 ## Statement semantics
 
@@ -228,16 +203,6 @@ resolution rules.
 
 For a variable:
 
-```mermaid
-flowchart TD
-  Name --> Binding{"env.get(name)?"}
-  Binding -->|yes| Bound["return bound value"]
-  Binding -->|no| Anchor{"now or today?"}
-  Anchor -->|yes| Clock["read Clock port"]
-  Anchor -->|no| Command{"known command?"}
-  Command -->|yes| Invoke["invoke zero-argument command in value position"]
-  Command -->|no| Undefined["undefined_var"]
-```
 
 For a function-call node, closure-aware builtins (`parallel`, `retry`, `on`) and evaluator builtins
 (`now`, `today`, `assert`, `run`, `save`, `open`) are intercepted before constructors, environment
@@ -253,13 +218,6 @@ binding unless the implementation applies the same shadowing rule as namespaces.
 belongs to a top-level rendering context or must remain a composable value. The AST deliberately
 does not encode this distinction.
 
-```mermaid
-flowchart LR
-  ExprStmt["Stmt::Expr"] -->|top-level| Statement
-  ExprStmt -->|inside value block| Value
-  Statement --> Commands["command may stream/emit"]
-  Value --> Capture["command outcome remains a value"]
-```
 
 Blocks add another subtlety. They evaluate in a child environment. Intermediate statements can be
 discarded or routed to the sink, while the consumed tail expression becomes the block value. Bare
@@ -288,6 +246,8 @@ kernel, tests, and library embeddings.
 
 ```mermaid
 flowchart TD
+accTitle: Scope transitions
+accDescr: Shows the components and relationships described in Scope transitions.
   Root["session root Env"] --> Block["block child Env"]
   Root --> Closure["closure captures Env handle"]
   Closure --> Call["captured_env.child()"]
@@ -344,6 +304,8 @@ parent's Reef scope/resolver/overrides; config namespace reads can return the em
 
 ```mermaid
 flowchart TD
+accTitle: Critical: current children do not satisfy that matrix
+accDescr: Shows the components and relationships described in Critical: current children do not satisfy that matrix.
   Parent["parent Evaluator\nLeash + Reef + Config"] --> ChildNew["Evaluator::new(cwd)"]
   ChildNew --> Manual["manual field/port copies"]
   Manual --> Missing["Leash=None\nReef defaults\npossibly empty Config"]

@@ -26,13 +26,22 @@ The main loader deep-merges four layers from lowest to highest precedence:
 Only the nearest project file participates. Tables merge key by key, so a project can replace `history.max_entries` without copying the rest of `[history]`.
 
 ```mermaid
-flowchart LR
-    S["system shoal.toml"] --> M["deep merge"]
-    U["user shoal.toml"] --> M
-    P["nearest ancestor .shoal.toml"] --> M
-    E["SHOAL_* and NO_COLOR"] --> M
-    M --> V["schema and semantic validation"]
-    V --> C["typed runtime config"]
+flowchart TB
+accTitle: Configuration and prompt precedence
+accDescr: Core configuration merges system, user, project, and environment layers; prompt configuration then applies its theme and prompt-specific layers.
+    subgraph Core["Core configuration"]
+      S["system shoal.toml"] --> M["deep merge"]
+      U["user shoal.toml"] --> M
+      P["nearest ancestor .shoal.toml"] --> M
+      E["SHOAL_* and NO_COLOR"] --> M
+      M --> V["validate typed runtime config"]
+    end
+    subgraph Prompt["Prompt configuration"]
+      T["built-in theme"] --> PM["prompt merge"]
+      V --> PM
+      PP["prompt-specific project settings"] --> PM
+      PM --> R["prompt snapshot and renderer"]
+    end
 ```
 
 A missing file is normal. Malformed TOML, a wrong value type, or an invalid constrained value is a startup error. Unknown keys produce warnings, including a spelling suggestion when one is close enough; they are not accepted silently.
@@ -280,15 +289,6 @@ The prompt loader merges these sources from low to high:
 
 Unlike main project configuration, the prompt loader currently checks only `cwd/.shoal.toml`; it does not walk ancestors. Rich keys placed under `[prompt]` in `shoal.toml` may also trigger false “unknown key” warnings from the generic configuration schema, which formally knows only `prompt.template`. `prompt.toml` avoids both ambiguity and warning noise.
 
-```mermaid
-flowchart TD
-    T["built-in theme"] --> S["system [prompt]"]
-    S --> U["user [prompt]"]
-    U --> D["user prompt.toml"]
-    D --> P["cwd/.shoal.toml [prompt]"]
-    P --> E["prompt environment"]
-    E --> R["parsed formats and cached renderer"]
-```
 
 The prompt-specific overrides are `SHOAL_PROMPT_LEFT`, `SHOAL_PROMPT_RIGHT`, `SHOAL_PROMPT_THEME`, and `SHOAL_NERD_FONT`. For the font variable, `1` means `always` and `0` means `never`.
 
@@ -357,20 +357,6 @@ Style strings accept color names and attributes such as `bold` and `dim`. A styl
 
 Prompt rendering is snapshot-based. Shoal collects mutable facts once after a command completes and the renderer formats that immutable snapshot while the line editor redraws. A redraw therefore does not repeatedly inspect the filesystem or launch commands. In a Git repository, status collection runs at most one `git status` subprocess per completed command.
 
-```mermaid
-sequenceDiagram
-    participant U as User command
-    participant E as Evaluator
-    participant S as Snapshot collector
-    participant R as Prompt renderer
-    participant L as Line editor redraws
-    U->>E: execute
-    E-->>S: outcome, cwd, jobs, Reef state
-    S->>S: collect Git and session facts once
-    S-->>R: immutable PromptContext
-    R-->>L: left/right prompt strings
-    L->>L: redraw from cached strings
-```
 
 Inspect or benchmark the result without opening an interactive shell:
 

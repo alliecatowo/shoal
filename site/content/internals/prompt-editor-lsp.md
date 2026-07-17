@@ -24,24 +24,17 @@ This chapter is the stable replacement for the prompt design notes previously ci
 ## Interactive stack at a glance
 
 ```mermaid
-flowchart TB
-  Config["shoal-config + prompt-specific layers"] --> REPL["shoal REPL composition root"]
-  Env["shared evaluator Env"] --> Complete["ShoalCompleter"]
-  Env --> Highlight["ShoalHighlighter"]
-  Eval["Evaluator state"] --> Context["build PromptContext once per command"]
-  Context --> Cell["Arc<RwLock<Arc<PromptContext>>>"]
-  PromptCfg["PromptConfig + parsed format tokens"] --> Renderer["pure Renderer"]
-  Cell --> Prompt["ShoalPrompt / Reedline Prompt"]
-  Renderer --> Prompt
-  Config --> Keys["Emacs/Vi + custom keybindings"]
-  Config --> History["FilteredHistory"]
-  Complete --> Reedline["Reedline"]
-  Highlight --> Reedline
-  Prompt --> Reedline
-  Keys --> Reedline
-  History --> Reedline
-  Values["Value receiver"] --> Picker["shoal-picker alternate-screen UI"]
-  Syntax["shoal-syntax parser + formatter"] --> LSP["shoal-lsp"]
+flowchart LR
+accTitle: Prompt producer, snapshot, and renderer
+accDescr: The REPL gathers effectful facts once per command into an immutable snapshot; repainting only reads that snapshot through the pure prompt renderer.
+  Config["core + prompt configuration"] --> Producer["REPL fact producer"]
+  Eval["cwd + jobs + Reef + last outcome"] --> Producer
+  OS["time + width + permissions + Git"] --> Producer
+  Producer --> Snapshot["immutable PromptContext snapshot"]
+  Snapshot --> Cell["shared Arc cell"]
+  Format["parsed prompt format"] --> Renderer["pure Renderer"]
+  Cell --> Renderer
+  Renderer --> Reedline["Reedline repaint"]
 ```
 
 The pieces are related but have different latency contracts:
@@ -63,26 +56,6 @@ The pieces are related but have different latency contracts:
 filesystem I/O, and spawns no process. The binary owns the conversion from live session state into
 the prompt crate's own snapshot types.
 
-```mermaid
-flowchart LR
-  subgraph Producer["shoal binary — effectful producer"]
-    FS["cwd / permissions / .git files"]
-    Git["one git status subprocess"]
-    EV["jobs + cached Reef state"]
-    OS["user / host / tty / clock / Leash support"]
-    Build["build_context"]
-    FS --> Build
-    Git --> Build
-    EV --> Build
-    OS --> Build
-  end
-  Build --> Snapshot["PromptContext"]
-  subgraph Pure["shoal-prompt — pure consumer"]
-    Tokens["cached format tokens"] --> Render["Renderer::render_side"]
-    Snapshot --> Render
-    Render --> ANSI["styled string"]
-  end
-```
 
 The type boundary prevents the prompt renderer from quietly adding a Git command or state lookup.
 It does not prevent the producer from becoming slow; producer work is budgeted once per command,
@@ -102,19 +75,6 @@ is currently independent. Lowest to highest precedence:
 After ordinary layers merge, the selected built-in theme is loaded underneath them and the layers
 are replayed on top. Therefore a theme supplies defaults but never defeats a user setting.
 
-```mermaid
-flowchart TD
-  Layers["merge explicit layers"] --> ThemeName["read final theme name"]
-  ThemeName --> Known{"default / rich / minimal?"}
-  Known -->|yes| Theme["parse embedded theme TOML"]
-  Theme --> Replay["theme base + replay explicit layers"]
-  Known -->|no| Warn["warning; continue without theme"]
-  Replay --> Keys["unknown-key validation"]
-  Warn --> Keys
-  Keys --> Decode{"deserialize PromptConfig"}
-  Decode -->|success| Config["PromptConfig"]
-  Decode -->|failure| Defaults["warning + complete defaults"]
-```
 
 Unlike core configuration, a prompt deserialization error does not stop shell startup. It warns and
 falls back to all defaults. File reads also use a best-effort path: unreadable files are treated as
@@ -201,16 +161,6 @@ Whitespace-only literals adjacent to an empty module are dropped. This prevents 
 `$cmd_duration $jobs $time` from accumulating leading or double spaces as conditional modules hide.
 Non-whitespace literals are never implicitly removed.
 
-```mermaid
-flowchart LR
-  Source["format source"] --> Parse["parse_format once"]
-  Parse --> Tokens["FormatToken tree"]
-  Tokens --> Walk["recursive render walk"]
-  Context["PromptContext"] --> Walk
-  Walk --> Segments["literal / whitespace / module segments"]
-  Segments --> Collapse["drop whitespace adjacent to empty modules"]
-  Collapse --> String["ANSI or plain string"]
-```
 
 ### Deadline behavior
 
@@ -331,6 +281,8 @@ Arc and invokes only the pure renderer. A poisoned lock recovers its contained s
 
 ```mermaid
 sequenceDiagram
+accTitle: Per-command facts
+accDescr: Shows the components and relationships described in Per-command facts.
   participant Host as REPL loop
   participant Eval as Evaluator
   participant OS as OS/Git
@@ -428,6 +380,8 @@ It classifies the cursor into five contexts without a full parse:
 
 ```mermaid
 flowchart TD
+accTitle: Completion architecture
+accDescr: Shows the components and relationships described in Completion architecture.
   Buffer["buffer + cursor"] --> Classify["modal lexical classifier"]
   Classify --> Head["command head"]
   Classify --> Arg["command argument"]
@@ -559,18 +513,6 @@ surface. Their path/state semantics are mapped in [Persistence internals](@/inte
 `shoal-picker` is not part of Reedline completion. It is an explicit modal selector reached through
 the evaluator-hosted `.pick(multi:, prompt:)` method.
 
-```mermaid
-stateDiagram-v2
-  [*] --> Filtered: Model&#58;&#58;new / empty query
-  Filtered --> Filtered: character / refine
-  Filtered --> Filtered: backspace / refine
-  Filtered --> Filtered: up/down/page
-  Filtered --> Filtered: Tab toggles selection in multi mode
-  Filtered --> Accepted: Enter
-  Filtered --> Cancelled: Escape
-  Accepted --> [*]
-  Cancelled --> [*]
-```
 
 Inputs normalize as follows: a list becomes its elements; a table becomes record values; a record
 or scalar becomes a one-element candidate list. Display uses inline value rendering, with record
@@ -597,22 +539,17 @@ beyond that range. There is no viewport offset, so a cursor below the first page
 formatting, completion, and hover.
 
 ```mermaid
-sequenceDiagram
-  participant E as Editor
-  participant B as Backend
-  participant D as in-memory docs
-  participant S as shoal-syntax
-
-  E->>B: didOpen / didChange(full text)
-  B->>D: replace text
-  B->>S: parse_status(text)
-  B-->>E: publish diagnostics
-  E->>B: formatting
-  B->>S: parse complete + format_program
-  B-->>E: one whole-document TextEdit
-  E->>B: completion / hover
-  B->>D: read current text
-  B-->>E: lexical vocabulary or static help
+flowchart LR
+accTitle: LSP request and semantic-drift pipeline
+accDescr: Editor text flows through authoritative parser and formatter services, while completion and hover approximations are checked against shared language registries to expose drift.
+  Editor["editor document"] --> Docs["in-memory full text"]
+  Docs --> Parser["authoritative parse_status"]
+  Parser --> Diagnostics["published diagnostics"]
+  Docs --> Formatter["parse + canonical formatter"]
+  Formatter --> Edit["whole-document TextEdit"]
+  Docs --> Assist["completion + hover"]
+  Grammar["commands + methods + adapter registries"] --> Assist
+  Parser -. "drift check" .-> Assist
 ```
 
 ### Diagnostics
@@ -666,18 +603,6 @@ cleanup.
 The parser, REPL validator, completion classifier, highlighter dispatcher, and LSP declaration
 scanner each answer related syntax questions at different fidelity:
 
-```mermaid
-flowchart LR
-  Grammar["language grammar"] --> Parser["authoritative parser"]
-  Grammar -. "manual approximation" .-> Validator
-  Grammar -. "manual approximation" .-> Completer
-  Grammar -. "manual approximation" .-> Highlighter
-  Grammar -. "lexical heuristic" .-> LSP
-  Registry["builtin registry"] --> Parser
-  Registry --> Completer
-  Registry --> Highlighter
-  Registry --> LSP
-```
 
 The builtin list is now shared, which is a strong anti-drift improvement. Statement dispatch,
 incompleteness, and declaration/scope logic remain duplicated. Changes to path-head rules, new

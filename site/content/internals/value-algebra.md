@@ -54,6 +54,8 @@ Sources: [`lib.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-
 
 ```mermaid
 classDiagram
+accTitle: Complete variant inventory
+accDescr: Shows the components and relationships described in Complete variant inventory.
   class Value
   class Data { Null Bool Int Float Str Path Size Duration DateTime Time Bytes List Record Table Range }
   class Deferred { Glob Regex CasBytes Stream }
@@ -104,18 +106,6 @@ fields, and some compare shared identity.
 | secrets | name and secret content |
 | all unlisted mixed pairs | false |
 
-```mermaid
-flowchart TD
-  Eq["Value == Value"] --> Same{"same structural family?"}
-  Same -->|yes| Structural["payload/recursive comparison"]
-  Same -->|identity family| Identity["same Arc/shared handle"]
-  Same -->|CAS bytes| Hash["hash + length"]
-  Same -->|no| Mixed{"approved mixed pair?"}
-  Mixed -->|int/float| Numeric
-  Mixed -->|path/string| Display
-  Mixed -->|table/list records| Rows
-  Mixed -->|no| False
-```
 
 Path/string equality is pragmatic but lossy on platforms with non-UTF-8 path bytes. Glob equality
 ignores captured cwd/options, so it is pattern equality rather than full execution identity. Secret
@@ -131,14 +121,6 @@ equality compares the protected value internally even though render/JSON never r
 Everything else is `type_error` with a hint toward explicit predicates such as `.is_empty()`,
 `.is_some()`, or comparison with `null`. Empty strings, zero, empty lists, and `null` are not false.
 
-```mermaid
-flowchart LR
-  Value --> Bool{"Bool?"}
-  Bool -->|yes| B["contained bool"]
-  Bool -->|no| Outcome{"Outcome?"}
-  Outcome -->|yes| O["outcome.ok"]
-  Outcome -->|no| Error["type_error: no truthiness"]
-```
 
 This rule is relied on by `if`, `while`, predicate methods, logical operators, and assertion paths.
 Adding truthiness in one caller would fragment the language.
@@ -183,16 +165,6 @@ inline and block display.
 | task/closure/error/glob/regex | `feed_error` |
 | null/command reference/other | `type_error` |
 
-```mermaid
-flowchart TD
-  Feed["feed_bytes(value)"] --> Raw{"str/bytes/scalar?"}
-  Raw -->|yes| Serialize["verbatim or inline bytes"]
-  Raw -->|no| Collection{"collection?"}
-  Collection -->|list of strings| Lines["newline records"]
-  Collection -->|other collection| JSON
-  Collection -->|outcome| Out["structured out or stdout"]
-  Collection -->|path/stream/secret/handle| Refuse["typed error"]
-```
 
 A path's `.read` must be invoked before feed. A stream must currently be bounded and collected first.
 These refusals prevent accidental filename-as-data behavior and unbounded buffering.
@@ -228,6 +200,8 @@ preview, true length, content hash/reference, and a loader capability. Its cheap
 
 ```mermaid
 stateDiagram-v2
+accTitle: Lazy CAS bytes
+accDescr: Shows the components and relationships described in Lazy CAS bytes.
   [*] --> Resident: small capture
   [*] --> Lazy: spill over RAM cap
   Lazy --> Metadata: len / ref / preview render
@@ -250,15 +224,6 @@ Do not simplify this distinction without re-auditing memory bounds and user expe
 `json_to_value` maps JSON primitives normally. JSON arrays become a `Table` when every element is an
 object, otherwise a `List`. Objects become ordered `Record` values.
 
-```mermaid
-flowchart TD
-  J["serde_json::Value"] --> A{"array?"}
-  A -->|all objects| Table
-  A -->|otherwise| List
-  J -->|object| Record
-  J -->|number| IntOrFloat["int/u64-if-fit/float path"]
-  J -->|string/bool/null| Scalar
-```
 
 This array heuristic is semantic: an empty array vacuously satisfies "all objects" only if the
 implementation's explicit handling says so; callers should consult tests before depending on empty

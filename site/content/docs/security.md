@@ -28,6 +28,8 @@ Do not expose the raw socket through TCP, a web gateway, a shared container volu
 
 ```mermaid
 flowchart TB
+accTitle: Threat-model summary
+accDescr: Shows the components and relationships described in Threat-model summary.
     subgraph Trusted["One trusted OS user boundary"]
         H["human / trusted local processes"]
         M["shoal-mcp"]
@@ -85,13 +87,6 @@ This protects against other Unix users when the containing filesystem and owners
 
 The kernel does not validate connecting peer credentials with `SO_PEERCRED`. A connection that calls `session.attach` without a token becomes the kernel process's `uid:<effective uid>` local-human principal. Therefore an untrusted process that can reach the socket can simply omit a token; token issuance does not force it into an agent policy.
 
-```mermaid
-flowchart LR
-    C["can connect to socket"] --> Q{"sends token?"}
-    Q -->|"yes"| A["token principal"]
-    Q -->|"no"| H["local-human principal"]
-    H --> D["default kernel: permissive policy"]
-```
 
 Tokens are useful for a trusted facade choosing a scoped identity. They are not a replacement for socket isolation and are not currently a mandatory-auth mode.
 
@@ -280,21 +275,6 @@ Approving an opaque effect does not teach the OS sandbox what the program will d
 
 Shoal can derive these semantic effect variants:
 
-```mermaid
-flowchart TB
-    P["Plan"] --> F["Filesystem"]
-    P --> N["Network"]
-    P --> R["Process"]
-    P --> E["Environment"]
-    P --> S["Secrets / session / journal / time"]
-    P --> O["Opaque"]
-    F --> FR["fs_read"]
-    F --> FW["fs_write"]
-    F --> FD["fs_delete"]
-    N --> NC["net_connect"]
-    N --> NL["net_listen"]
-    R --> PS["proc_spawn"]
-```
 
 | Effect | Concrete data |
 | --- | --- |
@@ -322,6 +302,8 @@ The reference generation and approval router undermine its use as a strong autho
 
 ```mermaid
 flowchart LR
+accTitle: Plan/approval integrity limitations
+accDescr: Shows the components and relationships described in Plan/approval integrity limitations.
     A["source A / session A"] --> H["hash effects + reversibility + estimates"]
     B["source B / session B"] --> H
     H --> R["same plan:16hex possible"]

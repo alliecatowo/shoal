@@ -30,16 +30,18 @@ Shoal has four compatibility layers that must not be conflated:
 
 ```mermaid
 flowchart TB
-  Script["Shoal source"] --> Syntax["shoal-syntax / AST"]
+accTitle: Contract layers
+accDescr: Leaf crates point toward value and syntax foundations, while evaluator, kernel, protocol, MCP, and host layers compose them without reversing dependency ownership.
+  Script["Shoal source"] --> Syntax["shoal-syntax + shoal-ast"]
   Syntax --> Eval["shoal-eval"]
-  Eval --> Value["shoal-value"]
-  Eval --> Exec["shoal-exec"]
-  Eval --> Journal["shoal-journal"]
-  Eval --> Reef["shoal-reef"]
-  Kernel["shoal-kernel"] --> Eval
-  Kernel --> Proto["shoal-proto wire"]
-  MCP["shoal-mcp"] --> Proto
-  Host["shoal CLI"] --> Eval
+  Value["shoal-value"] --> Eval
+  Exec["shoal-exec"] --> Eval
+  Journal["shoal-journal"] --> Eval
+  Reef["shoal-reef"] --> Eval
+  Eval --> Kernel["shoal-kernel"]
+  Proto["shoal-proto wire"] --> Kernel
+  Proto --> MCP["shoal-mcp"]
+  Eval --> Host["shoal CLI"]
   Config["shoal-config"] --> Host
   Prompt["shoal-prompt"] --> Host
 ```
@@ -61,22 +63,6 @@ The durable direction rules are:
 - `shoal` and `shoal-kernel` are alternative composition roots, not mutually dependent hosts;
 - optional/live integration test dependencies do not become production DAG edges.
 
-```mermaid
-flowchart BT
-  Leaf["AST / auth / config / journal / leash / proto / Reef / secret / WASM / prompt"]
-  Foundation["value / syntax / exec / history / LSP"]
-  Structured["adapters / picker"]
-  Domain["eval"]
-  Roots["shoal / kernel / doctor / MCP"]
-  Foundation --> Leaf
-  Structured --> Foundation
-  Domain --> Structured
-  Domain --> Foundation
-  Domain --> Leaf
-  Roots --> Domain
-  Roots --> Foundation
-  Roots --> Leaf
-```
 
 This diagram describes direction, not a promise that every crate fits only one numerical tier. The
 actual Cargo manifests decide the graph. CI/Cargo prevents cycles but does not prevent an
@@ -123,6 +109,8 @@ planning, auditing, and alternate hosts.
 
 ```mermaid
 flowchart LR
+accTitle: Evaluator port contract
+accDescr: Shows the components and relationships described in Evaluator port contract.
   Eval["Evaluator domain logic"] --> Fs["dyn Fs"]
   Eval --> Clock["dyn Clock"]
   Eval --> Open["dyn Opener"]
@@ -271,6 +259,8 @@ Writing serializes one object, appends newline, and flushes.
 
 ```mermaid
 sequenceDiagram
+accTitle: Wire framing contract
+accDescr: Shows the components and relationships described in Wire framing contract.
   participant C as Client
   participant P as shoal-proto framing
   participant K as Kernel dispatch

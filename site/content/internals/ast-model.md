@@ -24,6 +24,8 @@ and [`span.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-ast/
 
 ```mermaid
 flowchart LR
+accTitle: Ownership boundary
+accDescr: Shows the components and relationships described in Ownership boundary.
   Source["source text"] --> Syntax["shoal-syntax"]
   Syntax --> AST["shoal-ast\nProgram / Stmt / Expr / Pattern"]
   AST --> Eval["shoal-eval"]
@@ -55,18 +57,23 @@ context, or AST version. Hosts keep those separately.
 | `Expr` | expression and statement span | statement/value position behavior |
 
 ```mermaid
-classDiagram
-  class Program { Vec~Stmt~ stmts }
-  class Stmt
-  class FnDecl { name params rest ret body doc exported span }
-  class Param { name type default span }
-  class Type { name args optional span }
-  class Block { Vec~Stmt~ stmts span }
-  Program *-- Stmt
-  Stmt *-- FnDecl
-  FnDecl *-- Param
-  FnDecl *-- Type
-  FnDecl *-- Block
+flowchart TB
+accTitle: Program, statement, expression, and pattern families
+accDescr: A Program owns statements; statements contain declarations and control forms, while expressions and patterns supply values and binding shapes throughout the tree.
+  Program --> Statement
+  Statement --> Declaration["let / var / fn / alias / use"]
+  Statement --> Control["if / match / loops / return"]
+  Statement --> Expression
+  Expression --> Literal["literal / collection / interpolation"]
+  Expression --> Access["name / field / index / call"]
+  Expression --> Operation["unary / binary / assignment"]
+  Expression --> Command["structured command call"]
+  Declaration --> Pattern
+  Control --> Pattern
+  Pattern --> Bind["name / typed / rest"]
+  Pattern --> Destructure["list / record / variant"]
+  Statement --> Block
+  Block --> Statement
 ```
 
 Function doc comments are syntax data because the evaluator synthesizes callable `--help` from the
@@ -89,16 +96,6 @@ top-level variant carries its covering span.
 | foreign language | `LangBlock` | interpreter tool name plus raw source body |
 | operators | `Binary`, `Unary`, `Range` | operator enums and inclusive flag |
 
-```mermaid
-flowchart TB
-  Expr["Expr"] --> Literal["literal / interpolated"]
-  Expr --> Access["var / field / index / call"]
-  Expr --> Command["structured CmdCall"]
-  Expr --> Data["lambda / list / record / block"]
-  Expr --> Control["if / match / try / catch / with / spawn"]
-  Expr --> Lang["raw LangBlock"]
-  Expr --> Ops["unary / binary / range"]
-```
 
 Position is not stored on `Expr::Cmd`. The evaluator supplies `Position::Statement` or
 `Position::Value` from the surrounding evaluation path. Reusing one AST in a different position can
@@ -116,14 +113,6 @@ Patterns are a separate algebra rather than arbitrary expressions:
 - record fields with shorthand or nested patterns;
 - fixed/list-rest destructuring.
 
-```mermaid
-classDiagram
-  class Pattern
-  class FieldPat { name pattern? }
-  class Type { name args optional span }
-  Pattern *-- FieldPat
-  Pattern --> Type
-```
 
 This separation lets parser and evaluator enumerate binders without executing source. A new pattern
 variant requires updates to parser binding collection, runtime matching, formatter, serde tests, and
@@ -135,6 +124,8 @@ A `CmdCall` preserves the command head and all shell-like syntax as typed fields
 
 ```mermaid
 classDiagram
+accTitle: Commands remain structured
+accDescr: Shows the components and relationships described in Commands remain structured.
   class CmdCall { head forced args redirects env_prefix background trailing span }
   class CmdArg
   class Redirect { kind target span }
@@ -168,14 +159,6 @@ scoped process environment at execution.
 
 `Span { start: u32, end: u32 }` is a half-open range of **UTF-8 source bytes**.
 
-```mermaid
-flowchart LR
-  Src["UTF-8 source"] --> Bytes["byte offsets"]
-  Bytes --> Span["start inclusive / end exclusive"]
-  Span --> Slice["src.get(start..end)"]
-  Span --> Join["min start / max end"]
-  Span --> LSP["host converts to line + UTF-16 column"]
-```
 
 Invariants:
 
@@ -224,15 +207,6 @@ The formatter's `canonical_equivalent` serializes two ASTs, recursively removes 
 and compares remaining JSON. This distinguishes semantic syntax structure from expected span changes
 after formatting.
 
-```mermaid
-flowchart LR
-  AST1["original AST"] --> JSON1["serde JSON"]
-  AST2["formatted/reparsed AST"] --> JSON2["serde JSON"]
-  JSON1 --> Strip1["remove all span fields"]
-  JSON2 --> Strip2["remove all span fields"]
-  Strip1 --> Eq{"structurally equal?"}
-  Strip2 --> Eq
-```
 
 It is not runtime semantic equivalence: two different AST shapes that happen to evaluate to the same
 value remain unequal, and context-dependent command dispatch is already resolved by parsing.

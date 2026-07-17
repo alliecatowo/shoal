@@ -6,17 +6,14 @@
 {% block body %}
 <main id="main-content">
   <section class="hero">
-    <div class="hero-atmosphere" aria-hidden="true">
-      <span class="glow glow-one"></span><span class="glow glow-two"></span><span class="depth-grid"></span>
-    </div>
     <div class="hero-inner">
       <div class="hero-copy">
         <p class="hero-kicker"><span></span>{{ section.extra.eyebrow }}</p>
         <h1>Structure all the way <em>down.</em></h1>
         <p class="hero-lede">A shell where values stay typed, tools resolve reproducibly, capabilities are explicit, and agents never have to scrape a wall of terminal text.</p>
         <div class="hero-actions">
-          <a class="button button-primary" href="{{ get_url(path="@/docs/_index.md") }}">Start exploring <span aria-hidden="true">→</span></a>
-          <a class="button button-secondary" href="{{ config.extra.repository_url }}">{{ icons::icon(name="github") }} View source</a>
+          <a class="button button-primary" href="{{ get_url(path="@/docs/quickstart.md") }}">Start with the manual <span aria-hidden="true">→</span></a>
+          <a class="button button-secondary" href="{{ get_url(path="@/internals/system-map.md") }}">Explore architecture <span aria-hidden="true">→</span></a>
         </div>
         <div class="hero-proof" aria-label="Project highlights">
           <span><b>typed</b> values</span><span><b>real</b> PTYs</span><span><b>structured</b> protocol</span>
@@ -24,7 +21,6 @@
       </div>
 
       <div class="hero-console-wrap">
-        <div class="console-halo" aria-hidden="true"></div>
         <div class="hero-console" aria-label="Example Shoal session">
           <div class="console-bar"><span class="console-dots"><i></i><i></i><i></i></span><span>shoal · interactive</span><span class="console-live"><i></i> live</span></div>
           <div class="console-body">
@@ -63,78 +59,39 @@
     </div>
   </section>
 
-  <section class="pillars">
-    <div class="section-heading">
-      <div><p class="eyebrow">Four connected systems</p><h2>One coherent environment.</h2></div>
-      <p>The language, resolver, sandbox, and kernel share a model instead of meeting through layers of text.</p>
-    </div>
-    <div class="pillar-grid">
-      <a class="pillar-card card-language" href="{{ get_url(path="@/docs/mental-model.md") }}">
-        <div class="pillar-top"><span>01 / language</span><i>→</i></div>
-        <div class="pillar-symbol" aria-hidden="true"><span>[</span><b>·</b><span>]</span></div>
-        <h3>Data composes with dots.</h3>
-        <p>Filter, map, match, and transform typed values directly. Laziness belongs to the stream type—not a punctuation mark.</p>
-        <code>users.where(.active).map(.name)</code>
-      </a>
-      <a class="pillar-card card-reef" href="{{ get_url(path="@/docs/reef.md") }}">
-        <div class="pillar-top"><span>02 / reef</span><i>→</i></div>
-        <div class="reef-orbits" aria-hidden="true"><i></i><i></i><i></i><b></b></div>
-        <h3>Tools resolve, then stay resolved.</h3>
-        <p>Names flow through explicit scopes to content-addressed binaries. A lock records exactly what ran.</p>
-        <code>project → user → system → ambient</code>
-      </a>
-      <a class="pillar-card card-leash" href="{{ get_url(path="@/docs/security.md") }}">
-        <div class="pillar-top"><span>03 / leash</span><i>→</i></div>
-        <div class="capability-rings" aria-hidden="true"><span></span><span></span><b>allow</b></div>
-        <h3>Authority has a visible shape.</h3>
-        <p>Capabilities describe the semantic call, not merely which process touched which path.</p>
-        <code>fs.read("./src/**") · net.none</code>
-      </a>
-      <a class="pillar-card card-kernel" href="{{ get_url(path="@/docs/agents-kernel-mcp.md") }}">
-        <div class="pillar-top"><span>04 / kernel</span><i>→</i></div>
-        <div class="kernel-map" aria-hidden="true"><b></b><i></i><i></i><i></i><i></i></div>
-        <h3>Humans and agents share the session.</h3>
-        <p>Values have stable refs. Diagnostics have fields. State is browsable, actions are verbs, and changes arrive as events.</p>
-        <code>shape · preview · ref · event</code>
-      </a>
+  <section class="feature-ledger" aria-labelledby="feature-ledger-title">
+    <header>
+      <p class="eyebrow">What Shoal connects</p>
+      <h2 id="feature-ledger-title">One structured environment.</h2>
+    </header>
+    <div class="feature-ledger-grid">
+      <div><h3>Typed values and dot composition</h3><p>Filter, map, match, and transform values without flattening them into text.</p></div>
+      <div><h3>Real shell execution</h3><p>Run external commands with real PTYs, foreground jobs, suspension, and history.</p></div>
+      <div><h3>Outcomes and adapters</h3><p>Keep status, output, diagnostics, and command-specific structure together.</p></div>
+      <div><h3>Reproducible Reef scopes</h3><p>Resolve tools through explicit scopes and record the exact locked executable.</p></div>
+      <div><h3>Effects and security boundaries</h3><p>Inspect plans, approvals, journal entries, undo data, and semantic authority.</p></div>
+      <div><h3>Shared kernel and MCP sessions</h3><p>Give humans and agents the same typed refs, session state, tasks, and events.</p></div>
     </div>
   </section>
 
-  <section class="atlas-callout">
-    <div class="atlas-visual" aria-hidden="true">
-      <span class="atlas-line line-a"></span><span class="atlas-line line-b"></span><span class="atlas-line line-c"></span>
-      <span class="atlas-node node-source">source</span><span class="atlas-node node-ast">AST</span><span class="atlas-node node-value">value</span><span class="atlas-node node-kernel">kernel</span><span class="atlas-node node-human">human</span><span class="atlas-node node-agent">agent</span>
+  <section class="audience-split" aria-label="Documentation paths">
+    <div>
+      <p class="eyebrow">Manual</p>
+      <h2>Use Shoal</h2>
+      <p>Quickstart, language, shell, tools, agents, and protocol workflows.</p>
+      <a class="text-link" href="{{ get_url(path="@/docs/quickstart.md") }}">Start the manual <span>→</span></a>
     </div>
-    <div class="atlas-copy">
-      <p class="eyebrow">The code atlas</p>
-      <h2>See the whole machine.</h2>
-      <p>The internal manual maps every crate boundary, execution path, protocol transition, and persistence layer—complete with diagrams that stay beside the code they explain.</p>
-      <a class="text-link" href="{{ get_url(path="@/internals/_index.md") }}">Open the maintainer handbook <span>→</span></a>
-    </div>
-  </section>
-
-  <section class="manual-gateway">
-    <div class="section-heading">
-      <div><p class="eyebrow">Choose a current</p><h2>Two ways into Shoal.</h2></div>
-      <p>A task-first manual for using the shell. A code-first atlas for understanding and changing it.</p>
-    </div>
-    <div class="gateway-grid">
-      <a href="{{ get_url(path="@/docs/_index.md") }}" class="gateway-card gateway-user">
-        <span class="gateway-label">User manual · external</span><h3>Learn the language.<br>Work the shell.</h3><p>Installation, interactive use, syntax, typed data, external programs, reef, configuration, and agent integration.</p><span class="gateway-action">Read the manual <i>→</i></span>
-      </a>
-      <a href="{{ get_url(path="@/internals/_index.md") }}" class="gateway-card gateway-internal">
-        <span class="gateway-label">Code atlas · internal</span><h3>Trace every value.<br>Map every boundary.</h3><p>Architecture, crate ownership, parser and evaluator flows, execution, kernel, wire protocol, persistence, and security invariants.</p><span class="gateway-action">Explore internals <i>→</i></span>
-      </a>
+    <div>
+      <p class="eyebrow">Architecture</p>
+      <h2>Understand Shoal</h2>
+      <p>System map, crate ownership, execution paths, protocols, and security.</p>
+      <a class="text-link" href="{{ get_url(path="@/internals/system-map.md") }}">Explore the atlas <span>→</span></a>
     </div>
   </section>
 
-  <section class="closing-cta">
-    <div class="closing-current" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></div>
-    <img src="{{ get_url(path="img/logo-512.webp") }}" width="92" height="92" alt="">
-    <p class="eyebrow">Early, real, and testable</p>
-    <h2>Come shape the shell after the shell.</h2>
-    <p>Shoal is not ready to be your login shell yet. It is ready to explore, question, benchmark, and improve.</p>
-    <div><a class="button button-primary" href="{{ get_url(path="@/docs/_index.md") }}">Get started <span>→</span></a><a class="button button-secondary" href="{{ config.extra.repository_url }}">Star on GitHub</a></div>
+  <section class="closing-row" aria-label="Get started">
+    <div><strong>Ready to try Shoal?</strong><span>The Quickstart gets you to a working prompt.</span></div>
+    <nav><a href="{{ get_url(path="@/docs/quickstart.md") }}">Quickstart <span aria-hidden="true">→</span></a><a href="{{ config.extra.repository_url }}">GitHub <span aria-hidden="true">↗</span></a></nav>
   </section>
 </main>
 {% endblock body %}

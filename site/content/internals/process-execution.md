@@ -45,6 +45,8 @@ constructs the spec.
 
 ```mermaid
 flowchart LR
+accTitle: Execution request contract
+accDescr: Shows the components and relationships described in Execution request contract.
   AST["structured CmdCall"] --> Eval["shoal-eval resolution"]
   Eval --> Reef
   Eval --> Adapter
@@ -64,20 +66,6 @@ the host process `PATH`.
 `which` treats an empty PATH component as `.`. A hit must be a regular file with at least one execute
 bit. Resolution uses native `OsStr` bytes and does not require UTF-8.
 
-```mermaid
-flowchart TD
-  Argv0 --> Empty{"empty?"}
-  Empty -->|yes| Invalid
-  Empty -->|no| Slash{"contains /?"}
-  Slash -->|yes| Direct["path as supplied"]
-  Slash -->|no| SpecPath{"PATH in spec env?"}
-  SpecPath -->|yes| SearchSpec
-  SpecPath -->|no| SearchHost
-  SearchSpec --> ExecFile{"regular + any execute bit?"}
-  SearchHost --> ExecFile
-  ExecFile -->|no match| NotFound
-  ExecFile -->|match| Spawn
-```
 
 The direct-slash path is not prevalidated by `which`; OS spawn errors remain authoritative. Search
 does not apply shell builtins, functions, aliases, extensions, PATHEXT, or shebang parsing itself.
@@ -102,6 +90,8 @@ failure occurs before spawn. A `Stream` cannot currently become a live stdin pro
 
 ```mermaid
 sequenceDiagram
+accTitle: Capture-mode spawn
+accDescr: Shows the components and relationships described in Capture-mode spawn.
   participant E as Evaluator
   participant X as shoal-exec
   participant S as Sandbox wrapper
@@ -155,6 +145,8 @@ A watcher polls every 50 ms. Once any watched token trips, exactly one watcher c
 
 ```mermaid
 stateDiagram-v2
+accTitle: Cancellation ladder
+accDescr: Shows the components and relationships described in Cancellation ladder.
   [*] --> Poll
   Poll --> Poll: not cancelled / child not done
   Poll --> INT: token cancelled
@@ -217,17 +209,6 @@ setting `truncated`. Continuing the drain prevents pipe backpressure from blocki
 Stdout and stderr each have a resident buffer, so the normal maximum is approximately twice the cap
 plus overhead. PTY has one merged buffer.
 
-```mermaid
-flowchart TD
-  Chunk --> Room{"resident len < cap?"}
-  Room -->|yes| Prefix["copy available prefix"]
-  Room -->|no| Drop["discard chunk"]
-  Prefix --> Overflow{"chunk remainder?"}
-  Overflow -->|yes| Mark["truncated = true"]
-  Drop --> Mark
-  Overflow -->|no| Next
-  Mark --> Next["continue reading to EOF"]
-```
 
 ## Disk-spill state machine
 
@@ -237,6 +218,8 @@ directory. The default spill cap is 1 GiB, resolved from positive
 
 ```mermaid
 stateDiagram-v2
+accTitle: Disk-spill state machine
+accDescr: Shows the components and relationships described in Disk-spill state machine.
   [*] --> Preview
   Preview --> ResidentComplete: EOF at or under RAM cap
   Preview --> CreateSpill: first byte beyond RAM cap

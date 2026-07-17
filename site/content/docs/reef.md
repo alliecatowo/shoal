@@ -18,6 +18,8 @@ It does not require activation hooks or shell shims. Changing directories change
 
 ```mermaid
 flowchart LR
+accTitle: Shoal architecture
+accDescr: Shows the components and relationships described in Shoal architecture.
     C["cwd"] --> W["walk manifests nearest-first"]
     W --> Q["combine compatible constraints"]
     Q --> P["enumerate provider candidates"]
@@ -56,7 +58,7 @@ hermetic = false
 
 Then inspect and lock it:
 
-```shl
+```shoal
 reef
 reef lock
 which node
@@ -64,7 +66,7 @@ which node
 
 The first interactive execution of a constrained tool can also create its lock automatically:
 
-```shl
+```shoal
 node --version
 # reef: locked node@22.x.y via mise (.../node)
 ```
@@ -81,20 +83,10 @@ Reef only takes over a spawn when all of these are true:
 
 If no manifest mentions `git`, then `git` retains ordinary ambient command behavior even when the same project constrains `node`. This makes adoption incremental.
 
-```mermaid
-flowchart TD
-    A["spawn head"] --> M{"any tools-bearing scope?"}
-    M -- no --> O["ordinary external resolution"]
-    M -- yes --> X{"head contains / ?"}
-    X -- yes --> O
-    X -- no --> T{"scope mentions head?"}
-    T -- no --> O
-    T -- yes --> R["Reef resolve, lock, and synthesize PATH"]
-```
 
 An explicit path bypasses Reef name resolution:
 
-```shl
+```shoal
 /usr/bin/node --version
 ./vendor/tool --help
 ```
@@ -120,15 +112,6 @@ $XDG_CONFIG_HOME/shoal/shoal.toml
 
 Its `[reef]` table becomes the lowest-priority user scope.
 
-```mermaid
-flowchart TB
-    C["cwd/.reef.toml"] --> CH["nearest-first scope chain"]
-    CM["cwd/mise.toml"] --> CH
-    P["parent/.reef.toml"] --> CH
-    PT["parent/.tool-versions"] --> CH
-    U["user shoal.toml [reef]"] --> CH
-    CH --> E["effective per-tool decision"]
-```
 
 Discovery is best-effort. Unreadable or malformed files are silently skipped by the scope walk. Use `reef add` or validate TOML directly when diagnosing a file that seems absent; `reef add` deliberately notices a malformed local `.reef.toml` and reports `reef_provider` instead of quietly editing an ancestor.
 
@@ -374,28 +357,6 @@ For a constrained name, Reef performs these steps:
 9. Break ties by provider order, then lexicographically by path.
 10. Hash the selected executable and update the lock.
 
-```mermaid
-sequenceDiagram
-    participant E as Evaluator
-    participant S as Scope chain
-    participant R as Resolver
-    participant L as reef.lock
-    participant P as Providers
-    E->>S: nearest_for(name)
-    S-->>E: effective constraints
-    E->>R: resolve(name, policy)
-    R->>L: satisfying entry?
-    alt valid entry
-        R->>R: hash current file
-        R-->>E: absolute path + hash
-    else unlocked
-        R->>P: discover candidates
-        P-->>R: paths + versions
-        R->>R: rank and hash
-        R->>L: insert binding
-        R-->>E: absolute path + hash
-    end
-```
 
 ## Synthesized PATH views
 
@@ -465,7 +426,7 @@ Rust is intentionally special: `.rs` has no table default because compile-versus
 
 ### Examples
 
-```shl
+```shoal
 run("scripts/check.py", "--quick")
 run(path("tools/build.ts"), "--release")
 run("local.rb")
@@ -495,7 +456,7 @@ A `.shl` script receives a fresh language scope with `args` and `script` binding
 
 ## `which`
 
-```shl
+```shoal
 which node
 which node --all
 which -a node
@@ -536,7 +497,7 @@ An unresolved row has null binding fields and a scope such as `unresolved: reef_
 
 ### `reef add TOOL@VERSION`
 
-```shl
+```shoal
 reef add node@22
 ```
 
@@ -572,7 +533,7 @@ Delegates explicit acquisition to providers as described above. A successful rec
 
 Use it in repository diagnostics:
 
-```shl
+```shoal
 let findings = (reef doctor)
 findings.where(.status != "ok")
 ```
@@ -581,7 +542,7 @@ findings.where(.status != "ok")
 
 `with reef:` creates a highest-priority constraint scope for the dynamic extent of a block:
 
-```shl
+```shoal
 with reef: {node: "20", python: "3.11"} {
   node --version
   python --version
