@@ -1113,6 +1113,10 @@ impl shoal_value::BytesLoad for CasBytesLoader {
     fn load(&self) -> std::io::Result<Vec<u8>> {
         self.cas.read(&self.hash)
     }
+
+    fn open(&self) -> std::io::Result<Box<dyn std::io::Read + Send>> {
+        self.cas.open_verified(&self.hash)
+    }
 }
 
 #[cfg(test)]

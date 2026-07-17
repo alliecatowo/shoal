@@ -278,6 +278,14 @@ pub trait BytesLoad: Send + Sync {
     /// Materialize the full content. Errors are I/O or integrity failures
     /// (a missing/corrupt CAS blob); the caller maps them to an `io_error`.
     fn load(&self) -> std::io::Result<Vec<u8>>;
+
+    /// Open a bounded-memory reader over the content. Adapters backed by a
+    /// real blob store override this to stream; the compatibility default
+    /// materializes once and wraps a cursor, preserving existing embedders.
+    fn open(&self) -> std::io::Result<Box<dyn std::io::Read + Send>> {
+        self.load()
+            .map(|bytes| Box::new(std::io::Cursor::new(bytes)) as Box<dyn std::io::Read + Send>)
+    }
 }
 
 // ---------------------------------------------------------------------------

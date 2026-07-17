@@ -2,6 +2,12 @@
 //! [`crate::expr`] for the split rationale).
 
 use super::*;
+use std::io::Read as _;
+
+/// Maximum chunk admitted to the bounded child-stdin queue. Combined with the
+/// 16-slot queue below, stream feed owns at most 1 MiB of queued byte buffers,
+/// independent of the size of a resident or CAS-backed item.
+const STREAM_STDIN_CHUNK_BYTES: usize = 64 * 1024;
 
 impl Evaluator {
     /// Resolve `v.name` as a *field* — the direct, no-fallback accessor set.
@@ -464,14 +470,15 @@ impl Evaluator {
                         break;
                     }
                 };
-                let chunk = match stream_feed_chunk(&item) {
-                    Ok(chunk) => chunk,
-                    Err(e) => {
-                        *pump_error.lock().unwrap() = Some(e);
-                        break;
-                    }
-                };
-                if !send_stdin_chunk(&stdin_sink, &worker_cancel, &parent_cancel, chunk) {
+                let sent =
+                    match send_stream_item(&stdin_sink, &worker_cancel, &parent_cancel, &item) {
+                        Ok(sent) => sent,
+                        Err(e) => {
+                            *pump_error.lock().unwrap() = Some(e);
+                            break;
+                        }
+                    };
+                if !sent {
                     break;
                 }
             }
@@ -537,11 +544,41 @@ impl Evaluator {
     }
 }
 
-fn stream_feed_chunk(value: &Value) -> VResult<Vec<u8>> {
-    let raw_chunk = matches!(
-        value,
-        Value::Bytes(_) | Value::CasBytes(_) | Value::Outcome(_)
-    );
+fn send_stream_item(
+    sink: &StdinSink,
+    stop: &CancelToken,
+    parent_cancel: &CancelToken,
+    value: &Value,
+) -> VResult<bool> {
+    match value {
+        Value::Bytes(bytes) => {
+            return Ok(send_stdin_bytes(
+                sink,
+                stop,
+                parent_cancel,
+                bytes.as_slice(),
+            ));
+        }
+        Value::CasBytes(bytes) => {
+            let mut reader = bytes.open()?;
+            loop {
+                let mut chunk = vec![0u8; STREAM_STDIN_CHUNK_BYTES];
+                let n = reader
+                    .read(&mut chunk)
+                    .map_err(|e| ErrorVal::new("io_error", format!("stream feed: {e}")))?;
+                if n == 0 {
+                    return Ok(true);
+                }
+                chunk.truncate(n);
+                if !send_stdin_chunk(sink, stop, parent_cancel, chunk) {
+                    return Ok(false);
+                }
+            }
+        }
+        _ => {}
+    }
+
+    let raw_chunk = matches!(value, Value::Outcome(_));
     let mut bytes = shoal_value::feed_bytes(value)?;
     // Streams of values are line-framed so item boundaries survive the byte
     // boundary (tail strings become lines; records become NDJSON). Explicit
@@ -549,7 +586,21 @@ fn stream_feed_chunk(value: &Value) -> VResult<Vec<u8>> {
     if !raw_chunk && !bytes.ends_with(b"\n") {
         bytes.push(b'\n');
     }
-    Ok(bytes)
+    Ok(send_stdin_bytes(sink, stop, parent_cancel, &bytes))
+}
+
+fn send_stdin_bytes(
+    sink: &StdinSink,
+    stop: &CancelToken,
+    parent_cancel: &CancelToken,
+    bytes: &[u8],
+) -> bool {
+    for chunk in bytes.chunks(STREAM_STDIN_CHUNK_BYTES) {
+        if !send_stdin_chunk(sink, stop, parent_cancel, chunk.to_vec()) {
+            return false;
+        }
+    }
+    true
 }
 
 fn send_stdin_chunk(

@@ -1,6 +1,7 @@
 use super::*;
 use crate::cas::TRUNCATION_MARKER;
 use crate::schema::CURRENT_SCHEMA_VERSION;
+use std::io::Read as _;
 
 fn rec(session: &str, principal: &str, ts_ns: i64, src: &str) -> EntryRecord {
     EntryRecord {
@@ -31,6 +32,29 @@ fn append_completed_persists_a_finished_row_atomically() {
     assert_eq!(rows[0].status, Some(0));
     assert_eq!(rows[0].ok, Some(true));
     assert_eq!(rows[0].dur_ns, Some(0));
+}
+
+#[test]
+fn cas_verified_reader_streams_large_content_without_materializing_api() {
+    let journal = Journal::in_memory().unwrap();
+    let id = journal
+        .append(&rec("cas", "human", 1, "large output"))
+        .unwrap();
+    let payload = (0..(2 * 1024 * 1024 + 17))
+        .map(|i| (i % 251) as u8)
+        .collect::<Vec<_>>();
+    let hash = journal.record_output(id, "stdout", &payload).unwrap();
+    let mut reader = journal.cas().open_verified(&hash).unwrap();
+    let mut observed = Vec::new();
+    let mut chunk = [0u8; 31 * 1024];
+    loop {
+        let n = reader.read(&mut chunk).unwrap();
+        if n == 0 {
+            break;
+        }
+        observed.extend_from_slice(&chunk[..n]);
+    }
+    assert_eq!(observed, payload);
 }
 
 /// Count regular files under `dir`, recursively.
@@ -1138,6 +1162,11 @@ fn read_blob_rejects_corrupted_content() {
     assert!(
         format!("{:?}", err.unwrap_err()).contains("integrity"),
         "error should name the integrity failure"
+    );
+    let stream_err = j.cas().open_verified(&hash);
+    assert!(
+        stream_err.is_err(),
+        "streaming reads must verify before exposing corrupt bytes"
     );
 }
 

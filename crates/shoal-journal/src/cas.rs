@@ -316,4 +316,46 @@ impl Cas {
         }
         Ok(bytes)
     }
+
+    /// Open a streaming decoder after verifying the full decompressed content
+    /// hash in a bounded-memory first pass. Verification precedes delivery, so
+    /// a consumer that intentionally stops early never observes bytes from a
+    /// corrupt content-addressed blob. The second pass trades additional disk
+    /// and decompression work for bounded memory and fail-closed integrity.
+    pub fn open_verified(&self, hash: &str) -> io::Result<Box<dyn io::Read + Send>> {
+        let mut verify = self.open_decoder(hash)?;
+        let mut hasher = blake3::Hasher::new();
+        let mut chunk = [0u8; 64 * 1024];
+        loop {
+            let n = verify.read(&mut chunk)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&chunk[..n]);
+        }
+        if !hasher
+            .finalize()
+            .to_hex()
+            .as_str()
+            .eq_ignore_ascii_case(hash)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("CAS blob {hash} failed integrity check: content hash mismatch"),
+            ));
+        }
+        self.open_decoder(hash)
+    }
+
+    fn open_decoder(&self, hash: &str) -> io::Result<Box<dyn io::Read + Send>> {
+        if hash.len() < 4 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{hash} does not address a CAS blob"),
+            ));
+        }
+        let file = fs::File::open(self.blob_path(hash))?;
+        let decoder = zstd::Decoder::new(io::BufReader::new(file))?;
+        Ok(Box::new(decoder))
+    }
 }

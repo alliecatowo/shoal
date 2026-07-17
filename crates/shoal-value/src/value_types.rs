@@ -92,6 +92,16 @@ impl CasBytesVal {
         })
     }
 
+    /// Open the full content for bounded-memory sequential consumption.
+    pub fn open(&self) -> VResult<Box<dyn std::io::Read + Send>> {
+        self.loader.open().map_err(|e| {
+            ErrorVal::new(
+                "io_error",
+                format!("failed to open CAS-backed bytes {}: {e}", self.reference()),
+            )
+        })
+    }
+
     /// The recoverable content ref, e.g. `val:blake3:<hash>`.
     pub fn reference(&self) -> String {
         format!("{}{}", Self::REF_PREFIX, self.hash)
