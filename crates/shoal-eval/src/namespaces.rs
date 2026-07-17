@@ -484,22 +484,46 @@ fn os_hostname() -> String {
 }
 
 fn os_username_libc() -> Option<String> {
-    // SAFETY: `getpwuid` returns a pointer into a static buffer; we copy the name
-    // out immediately without retaining the pointer.
-    unsafe {
-        let pw = libc::getpwuid(libc::getuid());
-        if pw.is_null() {
+    const FALLBACK_BYTES: usize = 16 * 1024;
+    const MAX_BYTES: usize = 1024 * 1024;
+    // `getpwuid` uses process-global static storage and is unsafe under the
+    // kernel's concurrent evaluator threads. The reentrant API writes both the
+    // passwd record and all pointed-to strings into this caller-owned buffer.
+    let hint = unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) };
+    let mut bytes = usize::try_from(hint)
+        .unwrap_or(FALLBACK_BYTES)
+        .clamp(1024, MAX_BYTES);
+    loop {
+        let mut buffer = vec![0u8; bytes];
+        // SAFETY: an all-zero passwd is a valid output slot; getpwuid_r fills it
+        // and points its string fields into `buffer` on success.
+        let mut record = unsafe { std::mem::zeroed::<libc::passwd>() };
+        let mut result = std::ptr::null_mut();
+        let rc = unsafe {
+            libc::getpwuid_r(
+                libc::getuid(),
+                &raw mut record,
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &raw mut result,
+            )
+        };
+        if rc == libc::ERANGE && bytes < MAX_BYTES {
+            bytes = bytes.saturating_mul(2).min(MAX_BYTES);
+            continue;
+        }
+        if rc != 0 || result.is_null() || record.pw_name.is_null() {
             return None;
         }
-        let name = (*pw).pw_name;
-        if name.is_null() {
+        let base = buffer.as_ptr() as usize;
+        let name = record.pw_name as usize;
+        let offset = name.checked_sub(base)?;
+        let tail = buffer.get(offset..)?;
+        let end = tail.iter().position(|byte| *byte == 0)?;
+        if end == 0 {
             return None;
         }
-        Some(
-            std::ffi::CStr::from_ptr(name)
-                .to_string_lossy()
-                .into_owned(),
-        )
+        return Some(String::from_utf8_lossy(&tail[..end]).into_owned());
     }
 }
 
@@ -549,5 +573,23 @@ fn config_ns(ev: &mut Evaluator, method: &str, args: CallArgs) -> VResult<Value>
             config_get(ev, key)
         }
         _ => unknown_method("config", method),
+    }
+}
+
+#[cfg(test)]
+mod os_boundary_tests {
+    use super::os_username_libc;
+
+    #[test]
+    fn concurrent_username_lookup_uses_only_caller_owned_storage() {
+        let expected = os_username_libc();
+        let threads = (0..32)
+            .map(|_| {
+                std::thread::spawn(|| (0..100).map(|_| os_username_libc()).collect::<Vec<_>>())
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            assert!(thread.join().unwrap().iter().all(|name| name == &expected));
+        }
     }
 }
