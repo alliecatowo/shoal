@@ -200,6 +200,7 @@ impl Kernel {
                 self.events.remove_owner(owner);
                 self.tasks.remove_terminal_owner(owner);
                 self.ptys.remove_terminal_owner(owner);
+                self.plans.remove_owner(owner);
             },
         )
     }

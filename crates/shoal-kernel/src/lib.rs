@@ -1410,6 +1410,22 @@ mod tests {
         let principal = "agent:bounded-sessions";
         let first = kernel.session("s0", principal).unwrap();
         let first_owner = first.key.owner();
+        let stale_plan_ref = "plan:stale-session-generation".to_string();
+        kernel.plans.transaction(|plans| {
+            plans.insert(
+                stale_plan_ref.clone(),
+                StoredPlan {
+                    src: "1 + 1".into(),
+                    session: first.id.clone(),
+                    principal: principal.into(),
+                    plan_hash: "stale-plan-hash".into(),
+                    source_hash: "stale-source-hash".into(),
+                    plan: Plan::new(vec![], Reversibility::Reversible, Estimates::default()),
+                    authorization: PlanAuthorization::Pending,
+                    created_at: Instant::now(),
+                },
+            );
+        });
         let stale_task_ref = Ref::new("task", 9090);
         kernel.tasks.insert(Arc::new(TaskEntry {
             task: stale_task_ref.clone(),
@@ -1456,6 +1472,10 @@ mod tests {
         assert!(
             !kernel.tasks.contains(&stale_task_ref),
             "eviction removes terminal task metadata tied to the old transcript"
+        );
+        assert!(
+            !kernel.plans.contains(&stale_plan_ref),
+            "eviction removes plans bound to the old session generation"
         );
 
         let active_kernel = Kernel::new();

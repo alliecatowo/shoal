@@ -1,3 +1,4 @@
+use super::super::OwnerKey;
 use super::super::StoredPlan;
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -29,6 +30,26 @@ impl PlanRegistry {
         operation: impl FnOnce(&mut HashMap<String, StoredPlan>) -> R,
     ) -> R {
         operation(&mut self.entries.lock().unwrap())
+    }
+
+    /// Plan refs are session-scoped state. Remove them with an evicted session
+    /// rather than letting a later session generation inherit stale pending or
+    /// approved objects that merely share its visible name.
+    pub(crate) fn remove_owner(&self, owner: &OwnerKey) {
+        let removed = {
+            let mut entries = self.entries.lock().unwrap();
+            let refs = entries
+                .iter()
+                .filter(|(_, plan)| {
+                    plan.principal == owner.0.principal && plan.session == owner.0.name
+                })
+                .map(|(plan_ref, _)| plan_ref.clone())
+                .collect::<Vec<_>>();
+            refs.into_iter()
+                .filter_map(|plan_ref| entries.remove(&plan_ref))
+                .collect::<Vec<_>>()
+        };
+        drop(removed);
     }
 
     #[cfg(test)]
