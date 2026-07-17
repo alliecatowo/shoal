@@ -380,36 +380,62 @@ fn probe_effective_config(o: &Options, out: &mut Vec<Check>) {
     });
 }
 fn probe_configs(o: &Options, out: &mut Vec<Check>) {
-    for (name, path, policy) in [
-        ("config", o.config_dir.join("shoal.toml"), false),
-        ("policy", o.config_dir.join("leash.toml"), true),
+    let config_path = o.config_dir.join("shoal.toml");
+    let policy_path = o.config_dir.join("leash.toml");
+    for (name, path, result) in [
+        ("config", &config_path, probe_config_file(&config_path)),
+        ("policy", &policy_path, probe_policy_file(&policy_path)),
     ] {
-        let (level, detail) = match fs::read_to_string(&path) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                (Level::Warn, format!("{} absent", path.display()))
-            }
-            Err(e) => (Level::Fail, e.to_string()),
-            Ok(s) => {
-                let r = if policy {
-                    shoal_leash::Policy::from_toml(&s)
-                        .map(|_| ())
-                        .map_err(|e| e.to_string())
-                } else {
-                    toml::from_str::<toml::Value>(&s)
-                        .map(|_| ())
-                        .map_err(|e| e.to_string())
-                };
-                match r {
-                    Ok(()) => (Level::Ok, format!("{} valid", path.display())),
-                    Err(e) => (Level::Fail, e),
-                }
-            }
+        let (level, detail) = match result {
+            Ok(ProbeFile::Absent) => (Level::Warn, format!("{} absent", path.display())),
+            Ok(ProbeFile::Valid(detail)) => (Level::Ok, detail),
+            Err(error) => (Level::Fail, error),
         };
         out.push(Check {
             name: name.into(),
             level,
             detail,
         })
+    }
+}
+
+#[derive(Debug)]
+enum ProbeFile {
+    Absent,
+    Valid(String),
+}
+
+fn probe_config_file(path: &Path) -> Result<ProbeFile, String> {
+    let loaded = shoal_config::load(&shoal_config::LoadOptions {
+        system: None,
+        user: Some(path.to_path_buf()),
+        project: None,
+        env: Vec::new(),
+    })
+    .map_err(|error| error.to_string())?;
+    if loaded.sources.is_empty() {
+        return Ok(ProbeFile::Absent);
+    }
+    let suffix = if loaded.warnings.is_empty() {
+        String::new()
+    } else {
+        format!("; {} schema warning(s)", loaded.warnings.len())
+    };
+    Ok(ProbeFile::Valid(format!(
+        "{} valid{suffix}",
+        path.display()
+    )))
+}
+
+fn probe_policy_file(path: &Path) -> Result<ProbeFile, String> {
+    match shoal_leash::Policy::load(path) {
+        Ok(_) => Ok(ProbeFile::Valid(format!("{} valid", path.display()))),
+        Err(shoal_leash::PolicyLoadError::Io { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            Ok(ProbeFile::Absent)
+        }
+        Err(error) => Err(error.to_string()),
     }
 }
 
@@ -494,5 +520,48 @@ mod tests {
         assert!(tool_available_on_path("audit-tool", Some(&path)));
         assert!(!tool_available_on_path("missing", Some(&path)));
         assert!(!tool_available_on_path("audit-tool", None));
+    }
+
+    #[test]
+    fn config_probes_use_authoritative_bounded_loaders() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("shoal.toml");
+        let policy = directory.path().join("leash.toml");
+
+        assert!(matches!(probe_config_file(&config), Ok(ProbeFile::Absent)));
+        assert!(matches!(probe_policy_file(&policy), Ok(ProbeFile::Absent)));
+
+        let sparse = fs::File::create(&config).unwrap();
+        sparse
+            .set_len((shoal_config::CONFIG_FILE_MAX_BYTES + 1) as u64)
+            .unwrap();
+        assert!(
+            probe_config_file(&config)
+                .unwrap_err()
+                .contains("configuration exceeds")
+        );
+
+        fs::write(&config, b"[history]\nenabled = 'yes'\n").unwrap();
+        assert!(
+            probe_config_file(&config)
+                .unwrap_err()
+                .contains("expected a boolean")
+        );
+
+        fs::write(&policy, [0xff]).unwrap();
+        assert!(
+            probe_policy_file(&policy)
+                .unwrap_err()
+                .contains("not valid UTF-8")
+        );
+    }
+
+    #[test]
+    fn production_config_probe_does_not_bypass_core_loaders() {
+        let source = include_str!("lib.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        assert!(!production.contains("fs::read_to_string"));
+        assert!(production.contains("shoal_config::load"));
+        assert!(production.contains("shoal_leash::Policy::load"));
     }
 }

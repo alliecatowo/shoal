@@ -30,7 +30,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 pub use error::ConfigError;
-pub use load::{LoadOptions, Loaded, find_project_config, load};
+pub use load::{CONFIG_FILE_MAX_BYTES, LoadOptions, Loaded, find_project_config, load};
 
 /// The full, typed shoal configuration — the merged result of every layer.
 /// Every field has a default, so `Config::default()` is itself a valid,
