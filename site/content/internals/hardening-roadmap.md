@@ -145,7 +145,7 @@ Rules for implementers:
 
 - [x] **HR-F1** — Every member crate inherits the root `[workspace.lints]` policy
   (`lints.workspace = true`), making the staged policy actually active. *(H7)*
-- [ ] **HR-F2** — `rust-toolchain.toml` pins the stable toolchain CI uses. *(H11)*
+- [x] **HR-F2** — `rust-toolchain.toml` pins the stable toolchain CI uses. *(H11)*
 - [ ] **HR-F3** — Syntax-highlighter tests force their color environment explicitly; the suite
   passes with and without `NO_COLOR=1`. *(H13)*
 - [ ] **HR-F4** — A scheduled CI job runs the fuzz targets on a short nightly budget and
