@@ -37,6 +37,10 @@ jobs:
   fuzz:
     name: fuzz (${{ matrix.target }})
     runs-on: ubuntu-latest
+    # rust-toolchain.toml pins stable repo-wide; cargo-fuzz needs -Z sanitizer
+    # flags, so force the nightly rustup resolved by dtolnay/rust-toolchain.
+    env:
+      RUSTUP_TOOLCHAIN: nightly
     strategy:
       fail-fast: false
       matrix:

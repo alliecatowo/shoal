@@ -69,6 +69,10 @@ jobs:
     name: fuzz targets build
     runs-on: ubuntu-latest
     continue-on-error: true
+    # rust-toolchain.toml pins stable for every other job; cargo-fuzz needs
+    # -Z sanitizer flags, so force the nightly rustup resolved above.
+    env:
+      RUSTUP_TOOLCHAIN: nightly
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
