@@ -59,8 +59,10 @@ real sandbox. Token capability metadata is returned separately from the policy p
 
 The token store is a startup snapshot. A separate `shoal-token create` or `revoke` rewrites the file,
 but a running kernel does not reload it; creation and revocation take effect only after restart (live
-expiry still uses current time). Token `profile` and `caps` are echoed metadata only. Authorization
-continues through the token's principal name, Leash policy, and handler ownership checks.
+expiry still uses current time). Most token metadata does not directly grant language effects:
+authorization continues through the token's principal name, Leash policy, and handler ownership
+checks. One narrow exception is approval authority: the `supervisor` profile or a `plan.approve`
+capability authorizes that attachment to approve another principal's stored plan.
 
 Every stateful method requires attachment: `journal.query` (HR-D4) and `cap.request` (HR-D1) were the
 last exemptions and now reject an unattached caller with `NOT_ATTACHED`. The only naturally public
@@ -130,7 +132,7 @@ The router does not apply one central attachment middleware; each handler asks f
 |---|---|
 | `session.attach` | creates/replaces the connection attachment |
 | `parse`, `complete` | intentionally context-free and public to a socket client |
-| `cap.request` | requires attachment (HR-D1); the caller is the approver, bound into the record |
+| `cap.request` | requires attachment (HR-D1); the caller must be local-human, `supervisor`, or hold `plan.approve`, and is bound as approver |
 | `journal.query` | requires attachment (HR-D4); rejects with `NOT_ATTACHED` before reading rows |
 | every other current method | handler rejects with `NOT_ATTACHED` before its main operation |
 
@@ -139,17 +141,19 @@ Both former exemptions are closed: a fresh socket connection that never attached
 mutation. A socket mode of `0600` protects against other OS users; the attachment gate authenticates
 the token principal, and `cap.request` additionally binds the approver identity.
 
-`cap.request` used to be especially sensitive because the stored plan map is global and plan refs are
-not unique object IDs (`Plan::new` hashes effects/reversibility/estimates, truncated to 16 hex
-characters, so equal-effect plans overwrite). The residual hardening (unique owner-bound plan object
-identity) is tracked in the roadmap, but approval is no longer unauthenticated: the approver must be
-attached and — by default — distinct from the requester (HR-D3), and every approval writes an
-auditable `ApprovalRecord` (HR-D2). Apply/approved execution still checks the currently stored
-source/session/principal.
+Stored plans now have a full BLAKE3 binding over source, canonical AST, derived plan, session, and
+requester plus a per-kernel object id, so storing identical source twice creates two objects instead
+of replacing the first. `cap.request` validates and mutates the exact stored object under one lock.
+The approver must be attached, authorized, and — by default — distinct from the requester (HR-D3).
+Only explicit true spellings of `SHOAL_ALLOW_SELF_ACK` opt into self-acknowledgement. The in-memory
+`ApprovalRecord` binds requester, approver, full plan/source hashes, session, scope, timestamp, and
+the consuming execution id; on-disk journal mirroring is currently best-effort and therefore is not
+yet a fail-closed durable-audit guarantee.
 
 The target invariant is a short explicit public-method allowlist (`session.attach`, `parse`, and
-`complete`), attachment for everything else, approver identity distinct from the requester, and
-auditable approval records. See the [roadmap P0](../roadmap-and-priorities/).
+`complete`), attachment for everything else, explicit approver authority, default requester/approver
+separation, immutable plan binding, and durably auditable approval records. See the
+[roadmap P0](../roadmap-and-priorities/).
 
 ## Execution lifecycle
 

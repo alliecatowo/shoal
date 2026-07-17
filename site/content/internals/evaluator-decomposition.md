@@ -269,7 +269,8 @@ The decomposition is only worth doing if it makes these true **by construction**
   `Arc<HostServices>` and `SessionCtx` as required, typed parameters. There is no
   `Evaluator::new`-plus-manual-copy path reachable from a child site once HR-B6 removes
   `inherit_ports` and the four hand-copies. Omitting the leash, config, reef inputs, or principal
-  becomes a compile error, not a review miss. (Retires H1 → B1–B4.)
+  from the already-captured child context becomes a compile error. Adding evaluator state still requires an explicit
+  inheritance review. (Retires the route-by-route portion of H1 → B1–B4.)
 - **I2 — planner and runtime consult the same resolution inputs.** `adapters`,
   `reef_resolver`, and `reef_user_manifest` live in the single `Arc<HostServices>` that both the
   `eval_*` and `plan_*` paths borrow. There is no second resolution table for the planner to

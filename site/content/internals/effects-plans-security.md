@@ -86,6 +86,15 @@ expanded — a session-stored closure, or any unrecognized name — becomes an a
 (literals, pure constructors, and control-flow scaffolding). It is safer to require approval for an
 opaque program than to manufacture a precise-looking plan that omits a dynamic effect.
 
+Command-head resolution consumes the same canonical builtin registry as runtime dispatch,
+completion, and the LSP. Structured builtins derive their declared filesystem/environment effects;
+special heads derive their runtime meaning (`history`/`journal` → `JournalRead`, directory/session
+mutation → `SessionWrite`, `interact cmd` → the command's `ProcSpawn`). A special head whose behavior
+cannot be bounded, such as a stored-plan `apply` or effectful `reef` subcommand, becomes `Opaque`.
+It never falls through as an external process merely because it has no entry in the structured
+builtin effect table. The HR-A11 regression suite iterates every canonical builtin name and pins all
+original audit probes to their meaningful effect and target.
+
 Sources: [`plan_derive.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-eval/src/plan_derive.rs)
 and [`plan_effects.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-eval/src/plan_effects.rs).
 
@@ -184,17 +193,19 @@ follow-up, not part of lane C's write-effect mandate:
 | `streams.rs` watch/tail `root.exists()` / `path.exists()` | `Path::exists` | source-existence guard; the source read uses `self.fs.open_read` |
 | `journal.rs` undo target `is_file`/`exists`/`is_dir` | `Path::*` | read-only guards choosing the undo inverse; the mutation is ported |
 
-The `Fs` port also mediates the `CallCtx::fs()` seam value methods reach through. Its default is the
-real filesystem (`StdFs`) so a portless context is byte-identical to the pre-port `OpenOptions`
-code. The evaluator's `impl CallCtx` overrides `fs()` to return its injected `Arc<dyn Fs>`
-(`set_fs`), so value-method writes consult the session's actual port; a denying injected adapter
-blocks `"x".save(...)` end to end (`value_method_saves_go_through_the_injected_fs_port`).
+The `Fs` port also mediates the `CallCtx::fs()` seam value methods reach through. `CallCtx::fs()` is
+required: an embedding must explicitly return either `StdFs` (real host authority) or an injected
+adapter, so forgetting the wire is a compile error. The evaluator returns its `Arc<dyn Fs>`
+(`set_fs`), and recording/denying tests prove scalar and stream saves reach that adapter end to end.
+Production hosts currently leave the evaluator on `StdFs`; this seam is not itself a Leash-backed
+in-process sandbox.
 
 Child evaluators created by `spawn_block`, `.shl` `run_script_file`, `parallel`, and `on` inherit
 the parent's Leash policy/principal, all ports (including `ConfigPort`), Reef state, event bus, and
 cancellation through the single `ChildContext` constructor (HR-B1–B6); cross-route propagation is
-pinned by `child_context_propagation.rs`. Leash is transitive across child construction by
-compile-enforced design rather than per-site convention.
+pinned by `child_context_propagation.rs`. Destructuring makes omission of an already-captured field
+a compile error. Adding a new `Evaluator` field still requires an explicit inheritance audit because
+Rust cannot infer that the separate `ChildContext` must grow with it.
 
 ```mermaid
 flowchart LR

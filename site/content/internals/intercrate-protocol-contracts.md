@@ -144,8 +144,8 @@ vs. exempt). The architectural contract is the desired single boundary; the obse
 it must not yet be described as fully hexagonal.
 
 `CallCtx` (the eval↔methods bridge) exposes `fs() -> &dyn Fs` so value methods reach the same port;
-its default is `StdFs`, and a host with an injected/sandboxed port must override it in its `CallCtx`
-impl for value-method writes to consult that port.
+it is compile-required, and a host must explicitly return `StdFs` or its injected port in its
+`CallCtx` impl for value-method writes to consult that port.
 
 Adding an effectful filesystem operation should extend `Fs` and its fakes unless there is a
 documented host-only reason. A repair needs a port-spy test proving the operation crosses the port,

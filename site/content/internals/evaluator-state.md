@@ -267,11 +267,13 @@ does share the evaluator's effect ports and most session machinery because it ru
 Fresh child evaluators used by concurrency/script features — `spawn { }` (`script.rs::spawn_block`),
 a `.shl` script (`script.rs::run_script_file`), `parallel(...)` (`host.rs::builtin_parallel`), and
 `on(channel, handler)` (`channels.rs::builtin_on`) — are built through **one authoritative
-constructor** (`child_context.rs`). `Evaluator::child_context` captures the whole inheritable session
-context in one place; `ChildContext::build(scope, cancel)` re-applies it to a fresh evaluator. This
-is the *only* supported way to derive a child from a parent: there is no partial `inherit_ports`/
+constructor** (`child_context.rs`). `Evaluator::child_context` captures the session context currently
+audited for inheritance in one place; `ChildContext::build(scope, cancel)` re-applies it to a fresh
+evaluator. This is the *only* supported way to derive a child from a parent: there is no partial `inherit_ports`/
 `set_bus` seam a call site can under-inherit, and because `build` destructures the captured struct,
-forgetting to re-apply a captured field is a compile error rather than a silent security regression.
+forgetting to re-apply a field already captured there is a compile error. A newly added `Evaluator`
+field still requires an explicit inheritance decision; the compiler cannot infer that it belongs in
+the separate `ChildContext`.
 
 `ChildContext` propagates, by construction: the lexical env (per `ChildScope`), process env, cwd,
 adapter catalog, all effect ports (`Fs`/`Exec`/`Clock`/`Opener`/`SecretPort`/`ConfigPort`), the leash
@@ -294,7 +296,7 @@ Deliberately *not* inherited — a child gets fresh state, each documented inlin
 | lexical env | per `ChildScope` | closure/`spawn`/`parallel`/`on` children inherit; a `.shl` script gets a fresh root so its `let`s do not leak |
 | process env / cwd | yes (snapshot) | commands need the caller's dynamic context |
 | cancellation token | explicit arg | fresh + task-wired for `spawn`/`on`; parent's for script/`parallel` |
-| journal handle | no | single-handle ownership / not `Sync` (identity is still inherited) |
+| journal handle | no | parent records the outer invocation; nested/concurrent entry semantics need a synchronized handle or connection factory |
 | sink / interactive / echo mode | no | a child returns a value; it never owns the terminal or a renderer |
 | per-session tables (`jobs`, `modules`, `plans`, `dir_stack`, `it`, …) | no | a child is its own session |
 
@@ -304,7 +306,7 @@ accTitle: One authoritative child-evaluator constructor
 accDescr: Shows how every child route builds through ChildContext.
   Parent["parent Evaluator\nLeash + Reef + Config + Bus"] --> Ctx["Evaluator::child_context()"]
   Ctx --> Build["ChildContext::build(scope, cancel)"]
-  Build --> Child["child Evaluator\nfull context inherited"]
+  Build --> Child["child Evaluator\naudited context inherited"]
   Spawn["spawn { }"] --> Ctx
   Script[".shl run_script_file"] --> Ctx
   Parallel["parallel(...)"] --> Ctx
@@ -358,9 +360,9 @@ Do not erase a nested error's span merely to attach the outer expression.
 - `JobsSnapshot`'s source comment says suspended is always zero, but implementation now counts
   suspended tasks. The code behavior is authoritative; the comment needs correction.
 - The evaluator is a large state aggregate, but child creation is funneled through the single
-  `ChildContext` constructor (`child_context.rs`): adding an inheritable field is a two-site edit
-  (capture in `child_context`, re-apply in `build`), and forgetting to re-apply a captured field is
-  a compile error, not silent inheritance drift.
+  `ChildContext` constructor (`child_context.rs`). Destructuring prevents forgetting to re-apply a
+  field already captured there; adding an `Evaluator` field still requires an inheritance audit and
+  an explicit capture when appropriate.
 - Module lexical isolation is stronger than effect isolation; a module can still perform effects.
 - Command names can be invoked by an otherwise-unbound variable expression, so adding a builtin can
   change an `undefined_var` into execution.

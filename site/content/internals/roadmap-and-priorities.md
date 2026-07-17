@@ -189,7 +189,8 @@ accidentally widen capabilities.
 - fake `Fs`, `Exec`, `Clock`, opener, secret, and config ports observe child operations;
 - cancellation reaches a process tree and a waiting stream;
 - child-local cwd/env mutation does not mutate the parent unless the construct promises it;
-- adding a new capability field causes a compile error or a single exhaustive builder update.
+- adding a new capability field requires one explicit child-inheritance audit and, when inherited,
+  one capture plus one exhaustively destructured builder update.
 
 **Exit.** No direct `Evaluator::new` remains at semantic child sites; a repository check enumerates
 and permits only composition-root construction. The security tests run through real `spawn`,

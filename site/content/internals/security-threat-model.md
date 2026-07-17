@@ -277,22 +277,25 @@ authorized. `cap.request` now enforces that:
 - **Attachment required (HR-D1).** An unattached caller is rejected with `NOT_ATTACHED` before any
   approval logic runs; the attachment principal is the **approver**. The Unix socket's `0600` mode
   restricts access to the OS user; the attachment gate preserves the token-principal boundary.
-- **Separation of duties (HR-D3).** The approver must differ from the plan's requester (owner). A
+- **Separation and authority (HR-D3).** The approver must be a local-human attachment, use the
+  `supervisor` profile, or hold the `plan.approve` capability, and must differ from the plan's
+  requester (owner). A
   requester approving its own plan is `LEASH_DENIED` ("self-approval is not permitted") **by
   default**. Self-acknowledgement is an explicit opt-in (`SHOAL_ALLOW_SELF_ACK`, or
-  `Kernel::set_allow_self_ack`) for single-operator deployments that knowingly accept it. This is the
-  chosen model: *default separation, opt-in self-ack.* Approval still never overrides a hard `Deny`
-  from the plan owner's policy — it only lifts an approval-*required* verdict.
+  `Kernel::set_allow_self_ack`) for single-operator deployments that knowingly accept it; the
+  environment variable accepts only explicit true spellings (`1`, `true`, `yes`, `on`). Approval
+  still never overrides a hard `Deny` from the plan owner's policy — it only lifts an
+  approval-*required* verdict.
 - **Auditable binding (HR-D2).** On approval the kernel writes an `ApprovalRecord` onto the plan
-  binding requester, approver, plan ref/hash, granted scope, timestamp, and — once the approved plan
-  runs — the journal entry id of the consuming execution. The record is mirrored into the journal as
-  a `# approval …` audit row (queryable via `journal.query`) and surfaced on `plan.get.approval`.
+  binding requester, authorized approver, full plan/source hashes, session, granted scope,
+  timestamp, and — once the approved plan runs — the journal entry id of the consuming execution.
+  It is surfaced on `plan.get.approval`. The journal mirror is currently best-effort; a durable
+  append failure does not roll back approval, so fail-closed audit durability remains open.
 
-Residual hardening (tracked in the roadmap, not yet done): the plan key is still a 16-hex-character
-prefix of a hash over effects/reversibility/estimates, excluding source/session/principal, so
-equal-shape plans overwrite one another in the global map. `plan.apply` and approved `exec` verify the
-currently stored source/session/principal, which limits direct reuse; unique owner-bound plan object
-identity is the remaining step.
+Plan identity is a full BLAKE3 binding over source, canonical AST, effects/estimates, session, and
+requester plus a unique per-kernel object id. Identical plans stored twice remain distinct objects;
+approval and execution revalidate the immutable binding. Remaining questions are approval replay
+(whether a grant is intentionally reusable) and making the journal audit append fail closed.
 
 `journal.query` had the same missing-attachment shape; **HR-D4 closed it**: the handler now rejects
 an unattached caller with `NOT_ATTACHED` before reading any row, and its `limit` is bounded (omitted →
@@ -403,28 +406,30 @@ file-descriptor exec pin closes the race.
 Hash identity still provides valuable drift detection and normal replacement refusal. It is not an
 atomic proof of the executed inode.
 
-## Critical transitive-authority gap
+## Child authority propagation
 
 The evaluator installs Leash as optional `(Policy, principal)` state. `resolve_sandbox` is consulted
 for an external spawn. Fresh evaluators created by `spawn_block`, `.shl` `run_script_file`,
-`builtin_parallel`, and `builtin_on` do **not** inherit that field.
+`builtin_parallel`, and `builtin_on` now build through one `ChildContext` and inherit that policy,
+the effect ports, config, Reef state, event bus, and session attribution.
 
 ```mermaid
 flowchart TD
-accTitle: Critical transitive-authority gap
-accDescr: Shows the components and relationships described in Critical transitive-authority gap.
+accTitle: Child authority propagation
+accDescr: Shows the constrained parent context explicitly captured for each child route.
   Parent["constrained Evaluator"] --> Feature["spawn / .shl / parallel / on"]
-  Feature --> New["Evaluator::new"]
-  New --> Child["leash = None"]
+  Feature --> Snapshot["ChildContext snapshot"]
+  Snapshot --> Child["fresh Evaluator + inherited Leash"]
   Child --> External["external command"]
   External --> Resolve["resolve_sandbox()"]
-  Resolve --> None["None → unconfined ExecSpec"]
+  Resolve --> Policy["parent policy / principal"]
 ```
 
-This is a policy escape: source running under a constrained parent can move external work into a
-fresh evaluator and lose OS sandbox state. The same sites omit Reef scope/resolver data, and some
-omit ConfigPort. Fixing it requires a single capability-complete child constructor plus tests that
-assert policy principal and resolved sandbox at every child path.
+The constructor removes the route-by-route partial-copy escape. It is not magically exhaustive for
+future evaluator fields: its destructuring forces every field already captured in `ChildContext` to
+be applied, but contributors must still decide whether each newly added `Evaluator` field belongs in
+that separate snapshot. The owned journal handle is deliberately not inherited; the parent journals
+the outer concurrent/script invocation, while session/principal attribution is copied.
 
 ## In-process effects are not OS-sandboxed
 
@@ -435,13 +440,12 @@ They must be gated by semantic policy and routed through enforceable ports.
 Current filesystem port coverage is incomplete on the **read** side: several
 `Path::exists/is_dir/canonicalize` observations still bypass injected `Fs`. Every language-visible
 **write** now crosses the port — value `.save`/`.append` and stream `.save` route through
-`CallCtx::fs()` (HR-C1/HR-C2), so a fake can observe or deny them (inventory in the HR-C3 ledger in
-[effects, plans, ports, and authority](@/internals/effects-plans-security.md)), and the evaluator's
-`CallCtx::fs()` override returns its injected `Arc<dyn Fs>`, so those writes hit the session's
-actual (sandboxed) port rather than the `StdFs` default — a denying injected adapter blocks
-`"x".save(...)` end to end. A child sandbox still cannot protect the parent from its own
-builtin/method effects outside the ported routes, and read-side probes remain unported, so any
-claim that Leash confines **all** language I/O is still too strong today.
+`CallCtx::fs()` (HR-C1/HR-C2), so an injected fake can observe or deny them (inventory in the HR-C3
+ledger in [effects, plans, ports, and authority](@/internals/effects-plans-security.md)). The
+evaluator returns its configured `Arc<dyn Fs>` and tests prove denial end to end, but production
+hosts currently configure no policy-aware filesystem adapter: the default remains `StdFs`, with
+real parent-process authority. Landlock/Seatbelt only wraps external children. Port routing is the
+necessary enforcement seam, not a claim that Leash presently confines in-process I/O.
 
 ## Secret store design
 
@@ -577,11 +581,12 @@ For a new externally reachable effect:
 
 ## Priority debt
 
-1. **Unique owner-bound plan identity.** `cap.request` and `journal.query` now require attachment
-   (HR-D1/D4), approval binds a distinct approver and an auditable record (HR-D2/D3), and journal
-   limits are bounded (HR-D5). The remaining step is replacing colliding 16-hex plan refs with a
-   unique owner-bound object identity so equal-shape plans cannot overwrite one another.
-2. **Close child evaluator Leash inheritance escape.** This is a direct transitive-policy failure.
+1. **Finish approval durability and replay semantics.** Plan objects now have full owner-bound
+   identity and authorized approvers, but the journal audit append is best-effort and an approved
+   object may be applied repeatedly unless the intended grant scope says otherwise.
+2. **Keep child-context inheritance audited.** The direct Leash escape is closed; newly added
+   evaluator state still needs an explicit inheritance decision and nested journal entries remain
+   intentionally absent.
 3. **Scope named kernel sessions by principal.** Existing session reuse crosses first-creator state.
 4. **Make token revocation live and generation-safe.** A running kernel currently retains its startup
    snapshot while external management rewrites disk.

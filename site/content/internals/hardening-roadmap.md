@@ -70,15 +70,19 @@ Rules for implementers:
   <br>Accept: a unit test constructs each AST statement/expression variant and asserts the
   planner returns either concrete effects or the conservative unknown — never silently empty for
   effectful forms.
-- [ ] **HR-A11** — Negative-coverage suite: every dynamic probe from the audit becomes a pinned
+- [x] **HR-A11** — Negative-coverage suite: every dynamic probe from the audit becomes a pinned
   test/conformance case asserting non-empty, correct effects. *(A8, A11)*
   <br>Accept: all ten audit probes are cases; corpus passes.
+  <br>Done: `original_audit_probes_have_meaningful_effects` pins each probe's concrete effect and
+  target; `canonical_builtins_never_fall_through_as_external_spawns` additionally keeps planner
+  resolution in lockstep with the canonical builtin registry.
 
 ### Workstream B — one child-evaluator constructor
 
 - [x] **HR-B1** — Introduce a single authoritative child-context constructor that necessarily
   propagates: leash policy/principal, all effect ports, config, reef overrides/locks,
-  journal/session identity, event bus, and cancellation. *(B1, B2, B3, H1)*
+  journal attribution identity (not the owned journal handle), event bus, and cancellation.
+  The outer statement remains the journal entry for concurrent child work. *(B1, B2, B3, H1)*
   <br>Accept: constructor exists in `shoal-eval`; a compile-visible seam (not ad-hoc field
   copies) is the only way to build a child evaluator.
 - [x] **HR-B2** — `spawn_block` uses the constructor. *(B1)*
@@ -90,8 +94,9 @@ Rules for implementers:
   <br>Accept: no public API constructs a child evaluator without the full-context constructor.
 - [x] **HR-B7** — Tests: a restrictive leash policy observably constrains work run via `spawn`,
   `parallel`, an `on` handler, and a `.shl` script exactly as it does foreground; reef/config/
-  journal settings propagate identically; the config port reaches `spawn` blocks (B5); parent
-  cancellation reaches `parallel` children and `.shl` script children (B6). *(B4, B5, B6)*
+  session-attribution state is captured by the constructor; the config port reaches every child
+  route; the owned journal handle is deliberately absent and that non-inheritance is pinned; parent
+  cancellation reaches `parallel` children and `.shl` script children. *(B4, B5, B6)*
 
 ### Workstream C — effects through enforceable ports
 
@@ -109,8 +114,11 @@ Rules for implementers:
 
 - [x] **HR-D1** — `cap.request` requires an authenticated attachment and receives the caller
   principal. *(D1)*
-- [x] **HR-D2** — Approval records bind requester, plan hash, approver principal, scope, and the
+- [ ] **HR-D2** — Approval records bind requester, plan hash, approver principal, scope, and the
   execution that consumes the approval; the binding is journal-auditable. *(D3)*
+  <br>Partial: immutable owner-bound objects and in-memory records are implemented. Journal mirroring
+  remains best-effort rather than fail-closed, and reusable-vs-single-use approval semantics need an
+  explicit decision.
 - [x] **HR-D3** — Approver identity must differ from the requester unless policy explicitly
   permits self-acknowledgement; default policy separates them. Document the chosen model in the
   security threat model page. *(D2, D4)*

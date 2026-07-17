@@ -27,15 +27,16 @@ The value crate's `CallCtx` exposes:
 ```text
 call_closure(function, positional_values) -> VResult<Value>
 cwd() -> PathBuf
-fs() -> &dyn Fs        // defaults to StdFs
+fs() -> &dyn Fs        // required: embedding chooses StdFs or an injected adapter
 ```
 
 This is enough for functional collection stages, pure path absolutization, and the explicit write
 sinks (`.save`/`.append`), which route through the `fs()` port rather than `std::fs` directly. It is
 still not enough to spawn a command or inspect arbitrary filesystem state (reads, stat, globbing);
-those operations remain evaluator responsibilities. `fs()` defaults to `StdFs` (the real
-filesystem), so a portless context is byte-identical to the pre-port behavior; an evaluator with an
-injected/sandboxed `Fs` port overrides `fs()` in its `CallCtx` impl so value writes cross that port.
+those operations remain evaluator responsibilities. `fs()` is compile-required so a new context
+cannot silently acquire ambient real-filesystem authority by forgetting the wire. A plain evaluator
+explicitly returns its configured port, which defaults to `StdFs`; tests can replace it with a
+recording/denying adapter. No production Leash-backed `Fs` adapter exists yet.
 
 ```mermaid
 flowchart LR
@@ -204,9 +205,9 @@ completion metadata: both sets are language-visible methods on `path`.
 The general `save` and `append` methods write a receiver to a supplied path through
 `CallCtx::fs().write`/`.append` in `methods/path.rs`; stream `.save`/`.append` opens once through
 `CallCtx::fs().open_append` in `methods/stream.rs` (HR-C1/HR-C2). `CallCtx::fs()` is the filesystem
-capability: it defaults to `StdFs` (byte-identical to the pre-port `OpenOptions` code) and a host
-returns its injected/sandboxed `Fs` port from the `fs()` override so a fake can observe or deny the
-write. Evaluator call sites still surround some value saves with journal undo hooks. The eval-side
+capability: every `CallCtx` must explicitly return a port, and the evaluator returns its configured
+`Arc<dyn Fs>` (default `StdFs`; injectable through `set_fs`) so a fake can observe or deny the write.
+Evaluator call sites still surround some value saves with journal undo hooks. The eval-side
 wire is in place: `impl CallCtx for Evaluator` overrides `fs()` to return the evaluator's injected
 `Arc<dyn Fs>` (installed via `set_fs`), so value-method writes are mediated by the session's actual
 port — a denying injected adapter blocks `"x".save(...)` end to end, pinned by
@@ -298,9 +299,9 @@ arguments rather than accidentally ignoring them.
 
 - Dispatch is a hand-ordered chain; moving an arm can change meaning on path, outcome, stream, or
   lazy bytes receivers.
-- `save`/`append` and stream `.save` route through `CallCtx::fs()` (`.write`/`.append`/
-  `.open_append`), preserving streaming and append semantics; the port default is `StdFs`, so the
-  evaluator's `CallCtx::fs()` override to return its injected/sandboxed port is the remaining wire.
+- `save`/`append` and stream `.save` route through the compile-required `CallCtx::fs()`
+  (`.write`/`.append`/`.open_append`), preserving streaming and append semantics. The evaluator wire
+  is complete, but its production default is still ambient `StdFs`, not a Leash enforcement adapter.
 - Some method aliases expand the discoverable surface (`reduce`/`fold`, `where`/`filter`,
   `group`/`group_by`, `tap`/`also`). Registry/help must include both.
 - Unicode string length counts scalar values, not graphemes.

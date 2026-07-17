@@ -254,8 +254,10 @@ re-auditing if time budgets become strict RPC cancellation contracts.
 Despite two names, stream `.save` and `.append` both open with create+append. They open once through
 the `Fs` port (`CallCtx::fs().open_append`, HR-C2) — a fake can observe or deny the write — rather
 than `std::fs::OpenOptions` directly; the write still bypasses the journal undo model, and consults
-the evaluator's *sandboxed* port only once the evaluator overrides `CallCtx::fs()`. Strings and bytes
-are written verbatim per item; other values become JSON; every item gets an added newline.
+the evaluator's configured port through its `CallCtx::fs()` implementation. Production currently
+uses `StdFs`; an injected denying adapter is proven by tests, but Leash does not yet supply such an
+adapter. Strings and bytes are written verbatim per item; other values become JSON; every item gets
+an added newline.
 
 `drive_stream` blocks with no timeout until end/error. Cancellation is documented as dropping the
 pipeline/receiver, but a sink currently holding and blocking on a live receiver needs its surrounding
@@ -381,8 +383,8 @@ site.
 - Dropped/coalesced markers widen stream element shapes without a static type system expressing it.
 - Timer and timing combinators use direct system time/sleep, reducing deterministic testability.
 - Watch existence/root discovery bypasses `Fs`; tail content reads use it.
-- Stream save/append cross the `Fs` port (`open_append`, HR-C2) but still bypass journal undo; they
-  reach the evaluator's sandboxed port only once its `CallCtx::fs()` override lands.
+- Stream save/append cross the evaluator's configured `Fs` port (`open_append`, HR-C2) but still
+  bypass journal undo; production's configured port is currently `StdFs`, not Leash confinement.
 - Predicate/signal `take_until` does not mark an unbounded stream collectable.
 - No explicit `Upstream` cancellation/deadline context spans an entire sink.
 - Event rings are memory-only and sequence spaces are local to each bus side.
