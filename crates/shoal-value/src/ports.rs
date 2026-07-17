@@ -485,8 +485,17 @@ fn take_child(owner: &ChildOwner) -> Option<std::process::Child> {
 }
 
 fn kill_and_reap_exact(child: &mut std::process::Child) {
-    let _ = child.kill();
-    let _ = child.wait();
+    if child.try_wait().ok().flatten().is_some() {
+        return;
+    }
+    if child.kill().is_ok() {
+        let _ = child.wait();
+    } else {
+        // A refused kill must not turn the bounded reaper into an unbounded
+        // wait. This final nonblocking probe still reaps an exit that raced
+        // the signal attempt.
+        let _ = child.try_wait();
+    }
 }
 
 #[cfg(test)]
