@@ -16,6 +16,7 @@ shoal-ast = { version = "0.1.0", path = "../shoal-ast" }
 unicode-width = "0.2.2"
 [dev-dependencies]
 criterion="0.8"
+libc="0.2.186"
 [[bench]]
 name="table"
 harness=false

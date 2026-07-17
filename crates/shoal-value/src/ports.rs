@@ -18,6 +18,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 static ATOMIC_REPLACE_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -407,20 +409,154 @@ pub trait Opener: Send + Sync {
 }
 
 /// The default [`Opener`]: a detached `xdg-open` with null stdio, exactly as the
-/// `open` builtin spawned it inline.
+/// `open` builtin spawned it inline. A bounded background owner reaps the
+/// process (or kills it after a generous dispatch timeout), so repeated opens
+/// cannot accumulate zombies or permanent waiter threads.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StdOpener;
 
+const OPENER_REAPER_TIMEOUT: Duration = Duration::from_secs(30);
+type ChildOwner = Arc<Mutex<Option<std::process::Child>>>;
+
 impl Opener for StdOpener {
     fn open(&self, path: &Path) -> Result<(), String> {
-        std::process::Command::new("xdg-open")
+        let mut command = std::process::Command::new("xdg-open");
+        command
             .arg(path)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .map(|_| ())
-            .map_err(|e| format!("open: {e}"))
+            .stderr(std::process::Stdio::null());
+        spawn_detached_with(&mut command, OPENER_REAPER_TIMEOUT, |owner, timeout| {
+            std::thread::Builder::new()
+                .name("shoal-open-reaper".into())
+                .spawn(move || reap_open_child(&owner, timeout))
+                .map(|_| ())
+        })
+        .map(|_| ())
+    }
+}
+
+fn spawn_detached_with(
+    command: &mut std::process::Command,
+    timeout: Duration,
+    launch_reaper: impl FnOnce(ChildOwner, Duration) -> io::Result<()>,
+) -> Result<u32, String> {
+    let child = command.spawn().map_err(|error| format!("open: {error}"))?;
+    let pid = child.id();
+    let owner = Arc::new(Mutex::new(Some(child)));
+    if let Err(error) = launch_reaper(owner.clone(), timeout) {
+        // A failed thread launch never ran the closure, so ownership remains
+        // here. Kill and reap this exact child synchronously before reporting
+        // failure; dropping Child alone would leave a zombie after it exits.
+        if let Some(mut child) = take_child(&owner) {
+            kill_and_reap_exact(&mut child);
+        }
+        return Err(format!("open: cannot launch child reaper: {error}"));
+    }
+    Ok(pid)
+}
+
+fn reap_open_child(owner: &ChildOwner, timeout: Duration) {
+    let Some(mut child) = take_child(owner) else {
+        return;
+    };
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if start.elapsed() >= timeout => {
+                kill_and_reap_exact(&mut child);
+                return;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(_) => {
+                kill_and_reap_exact(&mut child);
+                return;
+            }
+        }
+    }
+}
+
+fn take_child(owner: &ChildOwner) -> Option<std::process::Child> {
+    match owner.lock() {
+        Ok(mut guard) => guard.take(),
+        Err(poisoned) => poisoned.into_inner().take(),
+    }
+}
+
+fn kill_and_reap_exact(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(test)]
+mod opener_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    fn process_is_gone(pid: u32) -> bool {
+        // SAFETY: signal 0 only checks whether the recorded process exists.
+        let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        result == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    }
+
+    fn wait_until_gone(pid: u32) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !process_is_gone(pid) {
+            assert!(
+                Instant::now() < deadline,
+                "opener child {pid} was not reaped"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn quick_exit_is_reaped_by_background_owner() {
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", "exit 0"]);
+        let pid = spawn_detached_with(&mut command, Duration::from_secs(1), |owner, timeout| {
+            std::thread::Builder::new()
+                .spawn(move || reap_open_child(&owner, timeout))
+                .map(|_| ())
+        })
+        .expect("spawn quick opener");
+        wait_until_gone(pid);
+    }
+
+    #[test]
+    fn bounded_reaper_kills_and_reaps_a_hung_opener() {
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", "sleep 30"]);
+        let pid = spawn_detached_with(&mut command, Duration::from_millis(50), |owner, timeout| {
+            std::thread::Builder::new()
+                .spawn(move || reap_open_child(&owner, timeout))
+                .map(|_| ())
+        })
+        .expect("spawn hung opener");
+        wait_until_gone(pid);
+    }
+
+    #[test]
+    fn reaper_launch_failure_kills_and_reaps_exact_spawned_child() {
+        let observed_pid = Arc::new(AtomicU32::new(0));
+        let observer = observed_pid.clone();
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", "sleep 30"]);
+        let error = spawn_detached_with(&mut command, Duration::from_secs(1), move |owner, _| {
+            let pid = match owner.lock() {
+                Ok(guard) => guard.as_ref().map(std::process::Child::id),
+                Err(poisoned) => poisoned.into_inner().as_ref().map(std::process::Child::id),
+            }
+            .expect("launcher observes owned child");
+            observer.store(pid, Ordering::SeqCst);
+            Err(io::Error::other("injected thread exhaustion"))
+        })
+        .expect_err("reaper launch must fail closed");
+        assert!(error.contains("child reaper"));
+        let pid = observed_pid.load(Ordering::SeqCst);
+        assert_ne!(pid, 0);
+        assert!(process_is_gone(pid));
     }
 }
 

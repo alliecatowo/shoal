@@ -2823,6 +2823,7 @@ dependencies = [
  "glob",
  "indexmap",
  "jiff",
+ "libc",
  "regex",
  "serde_json",
  "shoal-ast",
