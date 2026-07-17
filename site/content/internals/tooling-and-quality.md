@@ -24,6 +24,8 @@ advertises full-document sync, diagnostics, whole-document formatting, completio
 
 ```mermaid
 flowchart LR
+accTitle: Editor service
+accDescr: Shows the components and relationships described in Editor service.
   Editor["LSP editor"] --> Backend["shoal-lsp Backend"]
   Backend --> Docs["URI → full text map"]
   Docs --> ParseStatus["shoal_syntax::parse_status"]
@@ -65,17 +67,6 @@ different tree from the live REPL/kernel, the same default-root divergence as `s
 Passing an explicit shared state directory avoids the mismatch; default doctor success does not
 currently prove the active state root is healthy.
 
-```mermaid
-flowchart TD
-  Env["XDG/HOME/session environment"] --> Options["Doctor Options"]
-  Options --> Probes["independent probes"]
-  Probes --> Checks["Check {name, level, detail}"]
-  Checks --> Report["human or serialized report"]
-  Report --> Exit{"worst level"}
-  Exit -->|all ok| E0["0"]
-  Exit -->|any warning| E1["1"]
-  Exit -->|any failure| E2["2"]
-```
 
 The journal probe uses a temporary subdirectory, so it proves SQLite/CAS prerequisites without
 polluting normal history. The config probe currently checks generic TOML syntax rather than running
@@ -90,6 +81,8 @@ expectation, filesystem fixtures, and an explicit skip reason.
 
 ```mermaid
 flowchart LR
+accTitle: Normative conformance corpus
+accDescr: Shows the components and relationships described in Normative conformance corpus.
   TOML["spec/cases/*.toml"] --> Load["sorted deterministic load"]
   Load --> Fixture["fresh temp cwd + fixture tree per case"]
   Fixture --> Parse["script-mode parse"]
@@ -151,6 +144,8 @@ truncation, spills, undo safety, pins/GC, queries, and transcript rows.
 
 ```mermaid
 flowchart TB
+accTitle: Why the live tests are separate
+accDescr: Shows the components and relationships described in Why the live tests are separate.
   Pure["unit / property"] --> Fast["fast, deterministic invariant feedback"]
   Ports["fake-port evaluator tests"] --> Semantic["semantic side-effect intent"]
   Process["real process / PTY"] --> OS["signals, groups, terminal, sandbox"]
@@ -184,7 +179,7 @@ release gate and no timed fuzz run occurs.
 
 The repository defines four Criterion entrypoints for the expensive representative workloads:
 
-```sh
+```bash
 cargo bench -p shoal-syntax --bench syntax
 cargo bench -p shoal-value --bench table
 cargo bench -p shoal-journal --bench journal
@@ -225,15 +220,6 @@ GitHub CI builds/tests on Ubuntu and macOS with locked dependencies, runs the co
 checks fmt/Clippy, and performs release builds. Release automation produces binaries for x86_64 and
 AArch64 on Linux and macOS.
 
-```mermaid
-flowchart LR
-  Change["change"] --> Build["workspace all-target build"]
-  Build --> Tests["workspace tests"]
-  Tests --> Corpus["conformance summary"]
-  Change --> Lint["rustfmt + Clippy -D warnings"]
-  Change --> Release["workspace release build"]
-  Change -.-> Fuzz["nightly fuzz-target build\nnon-blocking"]
-```
 
 The root manifest declares workspace lint settings, but member crates do not opt in with
 `[lints] workspace = true`; the effective lint gate today is the explicit Clippy CI command.

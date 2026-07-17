@@ -31,6 +31,8 @@ truth for local-shell wiring is
 
 ```mermaid
 flowchart LR
+accTitle: Configuration dataflow
+accDescr: Shows the components and relationships described in Configuration dataflow.
   Defaults["Config::default()"] --> Merge["deep TOML merge"]
   System["/etc/shoal/shoal.toml"] --> Merge
   User["$XDG_CONFIG_HOME/shoal/shoal.toml"] --> Merge
@@ -76,15 +78,6 @@ directory `/a/b/c`, the search is `/a/b/c/.shoal.toml`, `/a/b/.shoal.toml`,
 `/a/.shoal.toml`, then `/.shoal.toml`. This differs from Reef's multi-scope tool chain and from the
 prompt loader's current-directory-only project prompt layer.
 
-```mermaid
-flowchart TB
-  C["cwd"] --> A{".shoal.toml here?"}
-  A -->|yes| Found["select this single project file"]
-  A -->|no| Parent["parent directory"]
-  Parent --> Root{"at filesystem root?"}
-  Root -->|no| A
-  Root -->|yes| None["no project layer"]
-```
 
 ### Merge semantics
 
@@ -332,6 +325,8 @@ currently accepts and snapshots the field without applying its intended behavior
 
 ```mermaid
 flowchart TD
+accTitle: Host wiring matrix
+accDescr: Shows the components and relationships described in Host wiring matrix.
   Config["typed Config"] --> Render["color / pager / echo"]
   Config --> Editor["history / editing / completion"]
   Config --> Bindings["aliases / env / ConfigSnapshot"]
@@ -425,22 +420,6 @@ scope and locking behavior.
 
 ## Failure and observability model
 
-```mermaid
-flowchart TD
-  Read["read layer"] --> Parse{"valid TOML?"}
-  Parse -->|no| Hard["ConfigError: stop startup"]
-  Parse -->|yes| Shape{"schema type correct?"}
-  Shape -->|no| Hard
-  Shape -->|yes| Unknown{"unknown fixed keys?"}
-  Unknown -->|yes| Warn["record source-qualified warning"]
-  Unknown -->|no| Merge["merge layer"]
-  Warn --> Merge
-  Merge --> Env{"env values valid?"}
-  Env -->|no| Hard
-  Env -->|yes| Semantic{"semantic constraints pass?"}
-  Semantic -->|no| Hard
-  Semantic -->|yes| Loaded["return Loaded"]
-```
 
 The loader does not log. Returning warnings and source paths keeps it usable in CLI, tests, and
 future kernel hosts, but every host must choose how and when to render them. `shoal doctor` should

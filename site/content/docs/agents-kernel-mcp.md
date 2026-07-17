@@ -22,6 +22,8 @@ An agent receives a compact value shape and a stable reference, then fetches onl
 
 ```mermaid
 flowchart LR
+accTitle: Shoal architecture
+accDescr: Shows the components and relationships described in Shoal architecture.
     A["MCP client / agent"] <-->|"newline JSON-RPC over stdio"| M["shoal-mcp"]
     M <-->|"newline JSON-RPC over Unix socket"| K["shoal-kernel"]
     K --> S["named Session + Evaluator"]
@@ -271,24 +273,6 @@ The position distinction does not turn every syntactic statement into an express
 
 Planning parses source and derives concrete effect records without executing it:
 
-```mermaid
-sequenceDiagram
-    participant A as Agent
-    participant K as Kernel
-    participant P as Policy
-    A->>K: shoal_plan(src)
-    K->>P: evaluate derived effects
-    K-->>A: plan_ref, effects, reversibility, verdict
-    alt verdict allow
-        A->>K: shoal_apply(plan_ref)
-        K-->>A: out ref + value
-    else approval required
-        A->>K: shoal_cap_request(plan_ref, effects)
-        K-->>A: approved / pending / denied
-        A->>K: shoal_apply(plan_ref)
-        K-->>A: out ref + value
-    end
-```
 
 Plan references currently hash only the derived effects, reversibility, and estimates, truncated to 16 hex characters after `plan:`. Source, session, and principal are stored as plan metadata but are **not** inputs to that reference. Because the kernel uses one map keyed by the short reference, two same-shape plans can overwrite one another even across sessions or principals. Application rechecks the stored session, principal, and source metadata, which prevents a simple source swap, but the collision can invalidate a caller's plan and combines dangerously with the raw unauthenticated `cap.request` defect documented in [Security and trust boundaries](@/docs/security.md). A caller cannot safely treat `plan_ref` as a globally unique or cryptographic identity.
 
@@ -352,6 +336,8 @@ PTY tools are for Vim, installers, REPLs, TUIs, and any program whose interface 
 
 ```mermaid
 sequenceDiagram
+accTitle: PTY surface
+accDescr: Shows the components and relationships described in PTY surface.
     participant A as Agent
     participant K as Kernel
     participant T as PTY + emulator

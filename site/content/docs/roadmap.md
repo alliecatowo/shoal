@@ -20,6 +20,8 @@ This roadmap is priority-ordered, not date-ordered. Items move only when code an
 
 ```mermaid
 flowchart TB
+accTitle: Dependency map
+accDescr: Shows the components and relationships described in Dependency map.
     P0["P0 — authority and isolation"] --> P1A["P1 — agent protocol/lifecycle"]
     P0 --> P1B["P1 — execution consistency"]
     P1A --> P2A["P2 — stable public contracts"]
@@ -497,26 +499,6 @@ Within available parallelism:
 9. stable contracts, distribution, editor/UX work;
 10. broader platforms/remote ecosystem only after security gate.
 
-```mermaid
-gantt
-    title Priority sequence (relative, not calendar dates)
-    dateFormat X
-    axisFormat %s
-    section Authority
-    Attachment gate        :crit, a1, 0, 2
-    Journal + approval auth :crit, a2, after a1, 3
-    Plan identity           :crit, a3, after a1, 3
-    Child context           :crit, a4, after a1, 4
-    Session/auth model      :crit, a5, after a2, 3
-    section Reliability
-    Bounds + token reload   :b1, after a3, 3
-    Subscription lifecycle  :b2, after a2, 3
-    Resolution unification  :b3, after a4, 4
-    Protocol stabilization  :b4, after b1, 4
-    section Product
-    Distribution + LSP      :c1, after b4, 5
-    New platforms           :c2, after c1, 6
-```
 
 The chart conveys dependency/priority only; its numeric axis is not weeks, sprints, or a commitment.
 

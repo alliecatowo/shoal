@@ -1,5 +1,5 @@
 +++
-title = "Shoal documentation"
+title = "Shoal Manual"
 description = "Learn the Shoal language, run the interactive shell, compose typed data, manage tools with reef, and connect agents through the structured kernel protocol."
 sort_by = "weight"
 template = "docs/section.html"
@@ -7,8 +7,8 @@ page_template = "docs/page.html"
 insert_anchor_links = "right"
 
 [extra]
-eyebrow = "User guide"
-audience = "Humans, operators, and agent authors"
+eyebrow = "Manual"
+audience = "Users, operators, and agent authors"
 nav_scheme = "manual"
 +++
 

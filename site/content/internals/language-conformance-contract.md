@@ -36,16 +36,6 @@ When two artifacts disagree, resolve the dispute using this order and then repai
 5. Historical root docs, comments, examples, and roadmap prose are migration inputs, not competing
    sources of truth.
 
-```mermaid
-flowchart TD
-  Case["reviewed spec/cases behavior"] --> Contract["observable contract"]
-  Source["parser/evaluator/value source + tests"] --> Contract
-  Registry["executable registries/schemas"] --> Contract
-  Narrative["canonical Zola architecture narrative"] --> Intent["intent + invariant context"]
-  Intent --> Review["review a behavior change"]
-  Contract --> Review
-  Review --> Sync["update case, source, tests, narrative together"]
-```
 
 This does not mean an accidental test can permanently override design. A behavior change begins by
 deciding the intended result, updating or adding the corpus case, then changing implementation. It
@@ -123,20 +113,6 @@ positions.
 
 Statement dispatch is the language's central ambiguity rule:
 
-```mermaid
-flowchart TD
-  First["first syntactic token"] --> Reserved{"reserved construct?"}
-  Reserved -->|yes| Construct["parse declaration/control form"]
-  Reserved -->|no| Ident{"identifier head?"}
-  Ident -->|no| Expr["parse expression"]
-  Ident -->|yes| Assign{"assignment operator next?"}
-  Assign -->|yes| Assignment["parse assignment"]
-  Assign -->|no| Chain{"immediate .identifier?"}
-  Chain -->|yes| InvokeChain["expression / invoke-then-chain"]
-  Chain -->|no| Binding{"ParseCtx says value-bound?"}
-  Binding -->|yes| Expr
-  Binding -->|callable or absent| Command["parse command"]
-```
 
 The parser accepts a `ParseCtx` classification because lexical scope changes whether an identifier
 head is a value expression or command. This is the one intentional parse-time environment seam.
@@ -369,6 +345,8 @@ skip = "specific host-dependent reason"
 
 ```mermaid
 sequenceDiagram
+accTitle: Harness lifecycle
+accDescr: Shows the components and relationships described in Harness lifecycle.
   participant H as conformance harness
   participant T as fresh temp directory
   participant P as shoal-syntax

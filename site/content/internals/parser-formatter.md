@@ -29,6 +29,8 @@ parser branches can restore `Parser.pos` and ask for a different interpretation.
 
 ```mermaid
 sequenceDiagram
+accTitle: Position-addressed modal lexer
+accDescr: Shows the components and relationships described in Position-addressed modal lexer.
   participant P as Parser
   participant L as Lexer
   P->>L: token(pos, Expr)
@@ -67,14 +69,6 @@ raw, interpolated, regex, datetime, and raw language-block text respectively.
 
 ## Parser state
 
-```mermaid
-classDiagram
-  class Parser { Lexer lx; usize pos; scopes; cmd_scopes; repl; no_trailing_block }
-  class ParseCtx { repl; value_bound; cmd_bound }
-  class Lexer { source bytes; token(pos, mode) }
-  Parser *-- Lexer
-  ParseCtx --> Parser : seeds
-```
 
 Value-binding scopes contain `let`/`var`/parameters/pattern binders and make a bare head parse as an
 expression. Command-binding scopes contain functions/aliases and leave command-head interpretation.
@@ -106,6 +100,8 @@ The decision is ordered; earlier rules win.
 
 ```mermaid
 flowchart TD
+accTitle: Statement dispatch table
+accDescr: Shows the components and relationships described in Statement dispatch table.
   Head["next statement"] --> Repl{"REPL leading dot?"}
   Repl -->|yes| It["it postfix expression"]
   Repl -->|no| Path{"path-shaped head?"}
@@ -142,13 +138,6 @@ Unary `!` and `-` bind before the binary loop; field/index/call/method postfixes
 primary before binary operators. Binary parsing recurses with `bp + 1`, making these operators
 left-associative. Comparisons are deliberately non-chainable: use explicit `&&`.
 
-```mermaid
-flowchart LR
-  Primary["primary"] --> Postfix["field / optional field / index / call"]
-  Postfix --> Unary["unary wrapper"]
-  Unary --> Pratt["binary loop by binding power"]
-  Pratt --> Catch["postfix catch at outer precedence"]
-```
 
 `&&` and `||` operands use `expr_or_command`, so a command can participate in outcome truth semantics.
 A single pipe anywhere outside raw/interpreter and pattern-alternation contexts gets a curated error.
@@ -170,14 +159,6 @@ callee expression.
 
 ## Command parser
 
-```mermaid
-flowchart LR
-  Prefix["zero or more EnvAssign heads"] --> Force["optional ^"]
-  Force --> Head["Word or PathWord"]
-  Head --> Items["args / redirects / trailing block"]
-  Items --> End["newline, ;, delimiter, &&, ||, EOF"]
-  Items --> Background["optional terminal &"]
-```
 
 Environment-shape tokens are prefixes only before the head; after it, `NAME=value` becomes an
 ordinary word (`make CC=gcc`). Parenthesized command arguments recursively parse expression or
@@ -214,14 +195,6 @@ unterminated input, an expected token at EOF, an unclosed quote/delimiter stack,
 operator/comma/dot. Reedline uses this result to continue input; LSP publishes the error as a
 diagnostic.
 
-```mermaid
-flowchart TD
-  Source["buffer"] --> Parse["full parse"]
-  Parse -->|success| Complete
-  Parse -->|failure| Inspect["message/span + quote/delimiter scan + trailing char"]
-  Inspect -->|can continue| Incomplete
-  Inspect -->|definitive| Error
-```
 
 The heuristic scan is deliberately safe for every UTF-8 prefix, but it is not a separate formal
 incremental grammar. New delimiter/string/operator forms require prefix tests.
@@ -235,6 +208,8 @@ them. It does not preserve comments or original whitespace because those are not
 
 ```mermaid
 flowchart LR
+accTitle: Canonical formatter
+accDescr: Shows the components and relationships described in Canonical formatter.
   Source1["source A"] --> Parse1["AST with spans"]
   Parse1 --> Format["canonical source B"]
   Format --> Parse2["AST with new spans"]

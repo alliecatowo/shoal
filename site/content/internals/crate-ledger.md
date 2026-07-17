@@ -49,6 +49,8 @@ because that is where a symptom appears.
 
 ```mermaid
 flowchart LR
+accTitle: Syntax and representation
+accDescr: Shows the components and relationships described in Syntax and representation.
   Span["shoal-ast/span.rs\nbyte-offset spans"] --> AST["shoal-ast/ast.rs\nProgram, Stmt, Expr, Pattern"]
   Lexer["shoal-syntax/lexer.rs\nEXPR and CMD modes"] --> Parser["parser.rs + stmt/expr/command/pattern"]
   Parser --> AST
@@ -64,6 +66,8 @@ shared builtin-name registry used by evaluator and editor-facing classification.
 
 ```mermaid
 flowchart TB
+accTitle: Values and generic operations
+accDescr: Shows the components and relationships described in Values and generic operations.
   Value["lib.rs\nValue algebra + feed_bytes"]
   Env["env.rs\nlexical bindings"]
   Methods["methods/*\ntype-directed methods"]
@@ -92,6 +96,8 @@ single-consumption, and tee buffering rather than only method name dispatch.
 
 ```mermaid
 flowchart TB
+accTitle: Evaluation
+accDescr: Shows the components and relationships described in Evaluation.
   Entry["lib.rs\nEvaluator state + program loop"]
   Stmt["stmt.rs"] --> Expr["expr.rs / expr_access / expr_binop"]
   Expr --> Call["call.rs"]
@@ -122,6 +128,8 @@ unsafe and Unix-specific code should remain concentrated and reviewable.
 
 ```mermaid
 flowchart LR
+accTitle: Execution and policy
+accDescr: Shows the components and relationships described in Execution and policy.
   Effects["leash/effects.rs"] --> Policy["leash/policy.rs"]
   Policy --> Lower["leash/enforce.rs"]
   Lower --> Request["exec/lib.rs\nExecSpec"]
@@ -148,6 +156,8 @@ kernel memory.
 
 ```mermaid
 flowchart TB
+accTitle: Reef, adapters, and configuration
+accDescr: Shows the components and relationships described in Reef, adapters, and configuration.
   Scope["reef/scope.rs\nnearest-first discovery"] --> Manifest["manifest.rs"]
   Manifest --> Resolve["resolve.rs"]
   Resolve --> Providers["npm / venv / mise / cargo / system"]

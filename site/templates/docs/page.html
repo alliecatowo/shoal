@@ -33,7 +33,7 @@
         {% if page.description %}<p class="lede">{{ page.description }}</p>{% endif %}
         {% if page.extra.status or page.extra.audience %}
         <dl class="article-facts">
-          {% if page.extra.status %}<div><dt>Status</dt><dd><span class="fact-pip"></span>{{ page.extra.status }}</dd></div>{% endif %}
+          {% if page.extra.status %}<div><dt>Status</dt><dd>{{ page.extra.status }}</dd></div>{% endif %}
           {% if page.extra.audience %}<div><dt>For</dt><dd>{{ page.extra.audience }}</dd></div>{% endif %}
         </dl>
         {% endif %}

@@ -18,6 +18,8 @@ The bundled catalog currently covers 49 command heads. A bare adapted head still
 
 ```mermaid
 flowchart LR
+accTitle: Shoal architecture
+accDescr: Shows the components and relationships described in Shoal architecture.
     S["Shoal command call"] --> D{"adapter exists?"}
     D -- no --> X["ordinary external dispatch"]
     D -- yes --> A["validate declared arguments"]
@@ -37,14 +39,14 @@ Traditional shells treat almost every command boundary as text. That is flexible
 
 Compare an adapted call:
 
-```shl
+```shoal
 let changes = (git status)
 changes.out.where(.state == "modified").select("path", "status")
 ```
 
 with an explicitly raw external call:
 
-```shl
+```shoal
 let raw = (^git status --short)
 raw.stdout
 ```
@@ -75,7 +77,7 @@ The force marker has a precise scope. `^git` bypasses the `git` adapter and a no
 
 An adapter subcommand is selected only when the first command word exactly matches a key in its `sub` table. Flattened names are ordinary adapter keys, not automatic underscore expansion. For example, the bundled `gh` adapter declares `pr_list` and rewrites it to `pr list`:
 
-```shl
+```shoal
 gh pr_list --limit 20
 ```
 
@@ -85,7 +87,7 @@ If the first word is not a declared subcommand, the adapter's top-level specific
 
 An adapted process still returns an `outcome`. The adapter changes `out`, not the fundamental process result:
 
-```shl
+```shoal
 let result = (git status)
 
 result.ok       # true when status is accepted
@@ -101,7 +103,7 @@ This lets code inspect the original process evidence even after a successful str
 
 Adapter parameters are declarations, not permissive documentation. A declared long flag is type-checked before spawn:
 
-```shl
+```shoal
 cargo build --jobs 8
 
 # Fails before cargo starts: jobs is declared int?.
@@ -110,7 +112,7 @@ cargo build --jobs "many"
 
 An undeclared long or short flag is an `arg_error` on an adapted subcommand. This is intentional: the adapter can only make claims about the interface it models.
 
-```shl
+```shoal
 # If a newly released git flag is not in the adapter yet:
 ^git log --brand-new-upstream-flag
 ```
@@ -196,7 +198,7 @@ invoke = ["metadata", "--format-version", "1"]
 
 The call:
 
-```shl
+```shoal
 cargo metadata --no_deps
 ```
 
@@ -323,7 +325,7 @@ Every adapter launch also has the process-spawn reality of its executable. Effec
 
 An adapter with `class = "interpreter"` changes how a raw block immediately following the command head is parsed:
 
-```shl
+```shoal
 python {
 import json
 print(json.dumps({"answer": 42}))
@@ -409,22 +411,6 @@ Treat warnings as release failures for a maintained catalog even though the inte
 
 Use this decision process:
 
-```mermaid
-flowchart TD
-    A["Does the tool expose a stable machine format?"] -->|no| L["Use lines or none"]
-    A -->|yes| J{"JSON family?"}
-    J -->|whole document| JS["json"]
-    J -->|one object per line| N["ndjson"]
-    J -->|no| D{"Delimited with a header?"}
-    D -->|CSV or TSV| DT["csv / tsv"]
-    D -->|no header, tabs| TH["tsv-headerless"]
-    D -->|no| W{"Fixed whitespace columns?"}
-    W -->|one header| C["cols"]
-    W -->|two-line preamble| C2["cols2"]
-    W -->|no| Z{"NUL records?"}
-    Z -->|yes| ZR["z-records"]
-    Z -->|no| L
-```
 
 Pin every format-changing option in `invoke`. If a useful user flag competes with the pinned format, either omit it or declare it as `consumed` only when the structured result genuinely contains at least the same information.
 
@@ -602,7 +588,7 @@ The adapter catalog does not emulate missing ecosystem tools. On macOS, a Linux-
 
 ### Filter changed paths
 
-```shl
+```shoal
 (git status)
   .out
   .where(row => row.state == "modified" || row.state == "added")
@@ -611,7 +597,7 @@ The adapter catalog does not emulate missing ecosystem tools. On macOS, a Linux-
 
 ### Inspect large directories
 
-```shl
+```shoal
 (du .)
   .out
   .where(.size > 100mb)
@@ -621,7 +607,7 @@ The adapter catalog does not emulate missing ecosystem tools. On macOS, a Linux-
 
 ### Query pull requests
 
-```shl
+```shoal
 (gh pr_list --limit 100)
   .out
   .where(.state == "OPEN")
@@ -630,7 +616,7 @@ The adapter catalog does not emulate missing ecosystem tools. On macOS, a Linux-
 
 ### Keep both structured and raw evidence
 
-```shl
+```shoal
 let r = (rg "TODO" .)
 
 if (r.ok) {
@@ -646,7 +632,7 @@ if (r.ok) {
 
 ### Bypass a stale adapter
 
-```shl
+```shoal
 ^kubectl get widgets --output=custom-columns=NAME:.metadata.name
 ```
 

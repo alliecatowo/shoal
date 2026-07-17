@@ -20,6 +20,8 @@ toc = true
 
 ```mermaid
 sequenceDiagram
+accTitle: Transport
+accDescr: Shows the components and relationships described in Transport.
     participant C as Raw client
     participant K as shoal-kernel
     C->>K: connect Unix socket

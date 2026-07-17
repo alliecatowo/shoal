@@ -49,6 +49,8 @@ lifetime is held by the journal. It does not enable WAL because there is no data
 
 ```mermaid
 flowchart LR
+accTitle: Storage topology
+accDescr: Shows the components and relationships described in Storage topology.
   REPL["local evaluator Journal"] --> DB["journal.db in WAL mode"]
   Kernel["kernel coarse Journal"] --> DB
   Session["kernel Session evaluator Journal"] --> DB
@@ -97,6 +99,8 @@ The first non-additive migration should:
 
 ```mermaid
 erDiagram
+accTitle: Relationship map
+accDescr: Shows the components and relationships described in Relationship map.
   entry ||--o{ output : "entry_id (logical, no FK)"
   entry ||--o{ undo : "entry_id (logical, no FK)"
   entry ||--o| transcript_event : "entry_id primary key (logical, no FK)"
@@ -212,18 +216,6 @@ from value-output bytes because it contains the live summary/ref shape used by a
 `append` inserts identity/source/AST/effects with completion columns null and returns `last_insert_rowid`.
 `finish` updates status/ok/duration and errors when no row changed.
 
-```mermaid
-stateDiagram-v2
-  [*] --> Appended: append
-  Appended --> Unfinished: process/kernel crashes
-  Appended --> Failed: finish(status?, false, dur)
-  Appended --> Succeeded: finish(Some(0), true, dur)
-  Failed --> [*]
-  Succeeded --> Outputs: record_output one or more times
-  Outputs --> Transcript: record_transcript_event (kernel success)
-  Transcript --> [*]
-  Unfinished --> [*]: visible with NULL completion
-```
 
 The lifecycle is **not one SQLite transaction**. Append, finish, each output, each undo, and transcript
 event are separate statements. This is deliberate enough to make crash evidence visible, but it
@@ -246,6 +238,8 @@ through the evaluator's second handle. On the coarse path:
 
 ```mermaid
 sequenceDiagram
+accTitle: Kernel dual-write sequence
+accDescr: Shows the components and relationships described in Kernel dual-write sequence.
   participant K as kernel handler
   participant J as kernel Journal
   participant E as session evaluator
@@ -425,6 +419,8 @@ Before mutation:
 
 ```mermaid
 flowchart TD
+accTitle: Scope and TOCTOU checks
+accDescr: Shows the components and relationships described in Scope and TOCTOU checks.
   Inverse --> Root["resolve leading root aliases"]
   Root --> Scope{"absolute + lexically under root?"}
   Scope -->|no| Escaped
@@ -461,18 +457,6 @@ Pins are the only hard protection. Output references influence order but do not 
 That means journal metadata can intentionally outlive output content. Callers must handle a listed
 hash whose blob has aged out.
 
-```mermaid
-flowchart LR
-  Blobs --> Sort["unreferenced first; oldest access"]
-  Sort --> TTL["TTL-select unpinned"]
-  TTL --> Budget["budget-select more unpinned"]
-  Budget --> Dry{"dry_run?"}
-  Dry -->|yes| Report
-  Dry -->|no| Tomb["rename to .gc-PID"]
-  Tomb --> Remove["remove file"]
-  Remove --> Row["delete blob row"]
-  Row --> Report
-```
 
 GC is not a database transaction with filesystem deletion. The tombstone rename avoids exposing a
 partially removed final path and attempts to restore on remove failure. A crash after file removal but

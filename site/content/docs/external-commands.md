@@ -18,6 +18,8 @@ Shoal treats process invocation as a typed boundary: command arguments become ar
 
 ```mermaid
 flowchart TD
+accTitle: The three command tiers
+accDescr: Shows the components and relationships described in The three command tiers.
     C["command head"] --> B{"Shoal builtin?"}
     B -- yes --> N["native implementation"]
     B -- no --> F{"forced with ^ / dynamic run?"}

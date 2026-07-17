@@ -24,18 +24,6 @@ doctor, shell completions, prompt support, or companion processes such as LSP/MC
 source paths create their own evaluator and host assembly; they do not send work to a resident
 kernel.
 
-```mermaid
-flowchart TD
-  Args["shoal argv"] --> Action{"action"}
-  Action --> REPL["interactive REPL"]
-  Action --> Source["-c / script"]
-  Action --> Fmt["formatter"]
-  Action --> Doctor["doctor"]
-  Action --> Completion["generate shell completions"]
-  Action --> Companion["spawn lsp / mcp companion"]
-  REPL --> EvalA["embedded Evaluator"]
-  Source --> EvalB["embedded Evaluator"]
-```
 
 ## REPL assembly sequence
 
@@ -44,6 +32,8 @@ and warnings must honor the resolved color policy.
 
 ```mermaid
 sequenceDiagram
+accTitle: REPL assembly sequence
+accDescr: Shows the components and relationships described in REPL assembly sequence.
   participant H as shoal host
   participant C as shoal-config
   participant E as Evaluator
@@ -78,15 +68,6 @@ Source: [`shoal/src/repl.rs`](https://github.com/alliecatowo/shoal/blob/main/cra
 merge key-by-key rather than replacing whole tables. The loader validates
 types, reports unknown keys with suggestions, and returns paths of layers that contributed.
 
-```mermaid
-flowchart LR
-  Defaults["typed defaults"] --> Merge["recursive merge"]
-  User["user shoal.toml"] --> Merge
-  Project["nearest ancestor .shoal.toml only"] --> Merge
-  Env["NO_COLOR / SHOAL_* overrides"] --> Merge
-  Merge --> Schema["shape + type validation"]
-  Schema --> Config["typed Config + warnings + sources"]
-```
 
 The `[reef]` subtree is only shape-checked as opaque by `shoal-config` and parsed independently by
 `shoal-reef`. Prompt rendering likewise has its own richer loader in `shoal/src/prompt.rs`. That
@@ -126,6 +107,8 @@ Reedline owns terminal line editing. Shoal supplies:
 
 ```mermaid
 flowchart TB
+accTitle: Editor boundary
+accDescr: Shows the components and relationships described in Editor boundary.
   Buffer["current editor buffer"] --> Validator["parse_status"]
   Buffer --> Classifier["completion context"]
   Classifier --> Env["session bindings"]
@@ -151,15 +134,6 @@ repository state, jobs, Reef/tool context, status, timing, and static session da
 `PromptContext`. Reedline may render that snapshot repeatedly per keystroke without filesystem or
 subprocess IO.
 
-```mermaid
-flowchart LR
-  OS["filesystem / git / jobs / Reef"] --> Gather["host fact collection\nonce per command"]
-  Gather --> Snapshot["Arc PromptContext"]
-  Snapshot --> Normal["normal prompt render"]
-  Snapshot --> Transient["transient prompt render"]
-  Config["prompt config + theme/modules"] --> Normal
-  Config --> Transient
-```
 
 This invariant is performance-critical. New prompt modules should extend the gather phase and pure
 formatter separately, with a test ensuring render does no IO.
@@ -190,6 +164,8 @@ signals while children reset dispositions and own their PTY/process group.
 
 ```mermaid
 stateDiagram-v2
+accTitle: Local job control
+accDescr: Shows the components and relationships described in Local job control.
   [*] --> Editing
   Editing --> Evaluating: Enter
   Evaluating --> Editing: value / language error

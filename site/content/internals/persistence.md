@@ -27,6 +27,8 @@ events. A filesystem CAS stores compressed content by BLAKE3 hash.
 
 ```mermaid
 flowchart TB
+accTitle: Storage layout
+accDescr: Shows the components and relationships described in Storage layout.
   Journal["Journal handle"] --> DB["journal.db\nSQLite WAL, synchronous NORMAL"]
   Journal --> CAS["cas/\nBLAKE3-addressed zstd blobs"]
   Exec["capture spill"] --> Spill["spill/ temporary file"]
@@ -54,55 +56,6 @@ Source: [`shoal-journal`](https://github.com/alliecatowo/shoal/tree/main/crates/
 
 ## Schema
 
-```mermaid
-erDiagram
-  ENTRY ||--o{ OUTPUT : has
-  ENTRY ||--o{ UNDO : has
-  ENTRY ||--o| TRANSCRIPT_EVENT : anchors
-  BLOB ||--o{ OUTPUT : referenced_by
-  BLOB ||--o| PIN : protected_by
-
-  ENTRY {
-    integer id PK
-    text session
-    text principal
-    integer ts
-    integer dur_ns
-    blob cwd
-    text src
-    blob ast
-    text effects
-    integer status
-    bool ok
-    bool opaque
-  }
-  OUTPUT {
-    integer entry_id
-    text kind
-    blob hash
-    integer len
-    text meta
-  }
-  UNDO {
-    integer entry_id
-    text op
-    text inverse
-  }
-  BLOB {
-    blob hash PK
-    integer stored_len
-    integer created_ns
-    integer last_access_ns
-  }
-  PIN {
-    blob hash PK
-  }
-  TRANSCRIPT_EVENT {
-    integer entry_id PK
-    integer ts
-    text payload
-  }
-```
 
 Foreign keys are represented by values but are not declared as SQLite foreign-key constraints in
 the current DDL. This permits metadata to outlive GC'd bytes and lets history report an output as
@@ -118,14 +71,6 @@ An entry is appended before execution with session, principal, timestamp, byte-b
 source, canonical AST JSON, effects JSON, and opacity. Completion later fills duration, status, and
 success. Signal deaths retain `status = NULL` rather than fabricating `128 + signal`.
 
-```mermaid
-stateDiagram-v2
-  [*] --> Appended: append metadata
-  Appended --> Finished: finish(status, ok, duration)
-  Appended --> UnfinishedOnDisk: crash / interrupted writer
-  Finished --> [*]
-  UnfinishedOnDisk --> [*]: visible after reopen with NULL completion
-```
 
 Outputs are linked as ordered rows of kind `stdout`, `stderr`, `value`, or `render`. Queries return
 entries newest-first and join output rows in recording order. `entries_by_id` preserves caller order
@@ -142,6 +87,8 @@ file plus rename. Identical content gets multiple `output` references but one bl
 
 ```mermaid
 sequenceDiagram
+accTitle: Content-addressed store
+accDescr: Shows the components and relationships described in Content-addressed store.
   participant C as caller
   participant J as Journal
   participant F as filesystem CAS
@@ -173,6 +120,8 @@ blob metadata, optionally pins it, and removes the spill file.
 
 ```mermaid
 flowchart LR
+accTitle: Spill and lazy CAS bytes
+accDescr: Shows the components and relationships described in Spill and lazy CAS bytes.
   Child["child stdout"] --> RAM["resident capture up to evaluator threshold"]
   RAM -->|"overflow with journal available"| Spill["spill file\nup to exec ceiling"]
   Spill --> Ingest["streamed zstd CAS ingest"]
@@ -201,17 +150,6 @@ Undo stores typed inverses, not reverse shell strings:
 
 Inverses replay newest-first so a multi-step command unwinds in reverse order.
 
-```mermaid
-flowchart TD
-  Request["undo entry inside root"] --> Decode["decode inverses newest-first"]
-  Decode --> Scope["normalize and require absolute target under root"]
-  Scope --> Parents["reject symlink parents / create safe directories"]
-  Parents --> Fingerprint{"expected filesystem state?"}
-  Fingerprint -->|no| Stale["UndoError::Stale / Escaped"]
-  Fingerprint -->|already prior state| Done["AlreadyApplied"]
-  Fingerprint -->|yes| Apply["rename or atomic replace"]
-  Apply --> Done2["Applied"]
-```
 
 The implementation resolves only leading OS-level symlink aliases when aligning roots, then refuses
 symlink traversal inside the tracked scope. Fingerprints include size, modification time, and a file
@@ -226,17 +164,6 @@ GC supports TTL, maximum-byte budget, dry-run, and pins. Candidates are ordered 
 blobs before referenced blobs, then least-recent access. TTL selection can include referenced blobs;
 pins are the only hard retention mechanism.
 
-```mermaid
-flowchart TD
-  Blobs["all blob rows"] --> RemovePins["exclude pinned"]
-  RemovePins --> TTL["select older than TTL"]
-  TTL --> Budget["then select orphan-first/LRU until under budget"]
-  Budget --> Dry{"dry run?"}
-  Dry -->|yes| Report["candidate/reclaimed report"]
-  Dry -->|no| Tomb["rename blob to tombstone"]
-  Tomb --> Delete["delete file then blob row"]
-  Delete --> Report
-```
 
 Deleting a referenced blob intentionally leaves its output metadata. History checks availability and
 reports `aged_out`; a later `blob.get` cannot retrieve it. A failed tombstone deletion attempts to
@@ -251,6 +178,8 @@ keyed by the corresponding coarse entry ID.
 
 ```mermaid
 flowchart LR
+accTitle: Durable transcript and event replay
+accDescr: Shows the components and relationships described in Durable transcript and event replay.
   Seq["event seq requested"] --> Index["in-memory seq → entry_id index"]
   Index --> Kind{"channel"}
   Kind -->|journal| Entries["entries_by_id → rebuild event"]

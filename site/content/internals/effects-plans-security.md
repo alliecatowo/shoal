@@ -42,14 +42,18 @@ Every `Plan` also carries `Reversibility` (`Reversible`, `Irreversible`, or `Unk
 and item estimates, and a stable `plan_ref` derived from canonical serialized contents.
 
 ```mermaid
-classDiagram
-  class Plan { plan_ref effects reversibility estimates }
-  class Effect { fs proc net env secret session journal time opaque }
-  class Estimates { bytes? items? }
-  class Reversibility { Reversible Irreversible Unknown }
-  Plan *-- Effect
-  Plan *-- Estimates
-  Plan --> Reversibility
+flowchart LR
+accTitle: Effect derivation and plan model
+accDescr: Source structure, builtin effect knowledge, and current evaluator state combine into a plan containing effects, estimates, and reversibility.
+  Source["Program AST"] --> Walk["plan derivation"]
+  Registry["builtin + adapter effect registry"] --> Walk
+  State["cwd + environment + principal state"] --> Walk
+  Walk --> Effects["fs / proc / net / env / secret / session / journal / time / opaque"]
+  Effects --> Plan["Plan: plan_ref + ordered effects"]
+  Walk --> Estimate["bytes / items estimates"]
+  Walk --> Reverse["reversible / irreversible / unknown"]
+  Estimate --> Plan
+  Reverse --> Plan
 ```
 
 Source: [`shoal-leash/src/effects.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-leash/src/effects.rs).
@@ -61,19 +65,6 @@ can contribute concrete effect templates. Paths and arguments are resolved as fa
 current evaluator state allow. Dynamic calls, unknown external behavior, or constructs that cannot
 be bounded become `Opaque` and normally make reversibility unknown.
 
-```mermaid
-flowchart TD
-  AST["Program AST"] --> Walk["plan_derive walk"]
-  Registry["builtin effect knowledge"] --> Walk
-  Adapter["adapter effect templates"] --> Walk
-  State["cwd / env / known bindings"] --> Walk
-  Walk --> Known{"all behavior statically known?"}
-  Known -->|yes| Effects["concrete Effect set"]
-  Known -->|no| Opaque["include Opaque"]
-  Effects --> Reverse["classify reversibility"]
-  Opaque --> Reverse
-  Reverse --> Hash["canonical hash → plan ref"]
-```
 
 Derivation is intentionally conservative. It is safer to require approval for an opaque program
 than to manufacture a precise-looking plan that omits a dynamic effect.
@@ -87,20 +78,6 @@ Policy is keyed by principal. Each principal can grant path globs, executable na
 destinations, environment names, secrets, session/journal/time access, an opaque mode, hermetic
 intent, and an automatic-apply rule.
 
-```mermaid
-flowchart TD
-  Plan["Plan"] --> Each["evaluate each effect"]
-  Principal["PrincipalPolicy"] --> Each
-  Each --> Deny{"any deny?"}
-  Deny -->|yes| D["Deny"]
-  Deny -->|no| Ask{"any opaque ask?"}
-  Ask -->|yes| A["ApprovalRequired"]
-  Ask -->|no| Auto{"auto_apply"}
-  Auto -->|never| A
-  Auto -->|in-grant| L["Allow"]
-  Auto -->|reversible + plan reversible| L
-  Auto -->|reversible + otherwise| A
-```
 
 Denial dominates approval, which dominates allow. Unknown principals deny at this evaluator. Local
 human operation ordinarily installs a built-in permissive principal policy to preserve normal shell
@@ -117,6 +94,8 @@ tests if plan evaluation is refactored.
 
 ```mermaid
 sequenceDiagram
+accTitle: Approval lifecycle in the kernel
+accDescr: Shows the components and relationships described in Approval lifecycle in the kernel.
   participant C as client
   participant K as kernel
   participant P as policy
@@ -158,6 +137,8 @@ Until one audited child-construction API closes this, Leash is not a transitive 
 
 ```mermaid
 flowchart LR
+accTitle: Ports
+accDescr: Shows the components and relationships described in Ports.
   Builtin["evaluator builtin / method"] --> Trait["port trait"]
   Trait --> Std["standard host implementation"]
   Trait --> Fake["recording / in-memory test port"]
@@ -177,6 +158,8 @@ The plan verdict remains the authority in those cases.
 
 ```mermaid
 flowchart TD
+accTitle: Lowering grants to an OS sandbox
+accDescr: Shows the components and relationships described in Lowering grants to an OS sandbox.
   Grants["principal fs glob grants"] --> Root["extract concrete roots"]
   Root --> Existing["retain existing paths"]
   Existing --> Useful{"restricted, non-empty roots?"}
@@ -214,15 +197,6 @@ Kernel bearer tokens authenticate a principal. Token records also carry advertis
 metadata, but Leash authorization is evaluated against principal policy. Do not describe the token's
 capability list as if it directly grants an effect.
 
-```mermaid
-flowchart LR
-  Bearer["bearer token"] --> Auth["TokenStore::validate"]
-  Auth --> Principal["principal identity"]
-  Principal --> Session["session attachment"]
-  Principal --> Policy["Leash principal policy"]
-  Caps["token caps metadata"] -. "advertised context" .-> Session
-  Policy --> Verdict["effect/plan verdict"]
-```
 
 The auth store persists a keyed hash, expiry, revocation state, and the keyed-hash secret in the same
 mode-restricted store. It does not persist the original bearer token. Verification uses a

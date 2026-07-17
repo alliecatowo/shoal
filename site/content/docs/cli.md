@@ -37,18 +37,6 @@ shoal --version
 
 ## Dispatch rules
 
-```mermaid
-flowchart TD
-    START["shoal invocation"] --> DEV{"first arg is a developer subcommand?"}
-    DEV -- yes --> TOOL["fmt / doctor / completions / prompt / lsp / mcp"]
-    DEV -- no --> C{"-c / --command?"}
-    C -- yes --> ONE["evaluate supplied source"]
-    C -- no --> FILE{"script path present?"}
-    FILE -- yes --> SCRIPT["read script; expose remaining args"]
-    FILE -- no --> TTY{"stdin is a TTY?"}
-    TTY -- yes --> REPL["interactive REPL"]
-    TTY -- no --> STDIN["read Shoal source from stdin"]
-```
 
 ## Evaluate a one-liner
 

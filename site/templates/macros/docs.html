@@ -1,7 +1,6 @@
 {% macro page_link(page, current_path) %}
 <a href="{{ page.permalink }}"{% if current_path == page.path %} class="is-current" aria-current="page"{% endif %}>
   <span>{{ page.title }}</span>
-  {% if page.extra.status %}<small class="docs-nav-status" title="Status: {{ page.extra.status }}" aria-hidden="true"></small>{% endif %}
 </a>
 {% endmacro page_link %}
 
@@ -89,7 +88,6 @@
         <a href="{{ guide.permalink }}">
           <span class="guide-number">{% if loop.index < 10 %}0{% endif %}{{ loop.index }}</span>
           <span class="guide-copy"><strong>{{ guide.title }}</strong>{% if guide.description %}<small>{{ guide.description }}</small>{% endif %}</span>
-          {% if guide.extra.status %}<span class="guide-status" title="{{ guide.extra.status }}">{{ guide.extra.status }}</span>{% endif %}
           <span class="guide-arrow" aria-hidden="true">→</span>
         </a>
         {% endif %}

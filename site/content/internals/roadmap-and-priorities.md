@@ -47,6 +47,8 @@ compatibility thought; a large identity fix can be P0 because everything above i
 
 ```mermaid
 flowchart TB
+accTitle: Dependency spine
+accDescr: Shows the components and relationships described in Dependency spine.
   A0["P0.0 authenticated approval + journal reads"] --> I1["P0.2 principal-owned sessions"]
   A0 --> J1["P1.4 explicit journal execution identity"]
   TK["P0.5 live token lifecycle + capability semantics"] --> I1
@@ -676,16 +678,3 @@ A package moves to complete only when its stated exit tests exist and the
 If implementation reveals a new dependency, update the dependency spine before starting dependent
 work. If a product decision removes a feature, replace the package with an explicit unsupported
 contract and test; deletion can be a valid completion.
-
-```mermaid
-stateDiagram-v2
-  [*] --> Audited
-  Audited --> Designed: owner + contract + threat/failure model
-  Designed --> Characterized: current and target tests
-  Characterized --> Integrated: leaf plus every promised host
-  Integrated --> Verified: adversarial and restart/platform evidence
-  Verified --> Documented: status qualification removed
-  Documented --> [*]
-  Integrated --> Audited: boundary mismatch discovered
-  Verified --> Audited: evidence disproves claim
-```

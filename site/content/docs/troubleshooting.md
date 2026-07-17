@@ -14,17 +14,6 @@ toc = true
 
 Start by identifying the failing layer. Shoal can run as a standalone REPL/script host, a long-lived kernel, or an MCP facade; those processes do not automatically share state.
 
-```mermaid
-flowchart TD
-    A["What failed?"] --> B{"ordinary shoal CLI?"}
-    B -->|"yes"| C["parse / evaluation / resolution / config"]
-    B -->|"no"| D{"MCP client starts?"}
-    D -->|"no"| E["PATH / facade / stdio framing"]
-    D -->|"yes, tool error"| F["kernel attach / policy / session / refs"]
-    F --> G{"external program interactive?"}
-    G -->|"yes"| H["PTY lifecycle"]
-    G -->|"no"| I["exec / task / event / value retrieval"]
-```
 
 ## Capture a useful diagnostic bundle
 

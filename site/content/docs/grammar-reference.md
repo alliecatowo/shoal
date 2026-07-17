@@ -59,20 +59,6 @@ A line beginning with `.` is special only in the interactive REPL: it continues 
 
 Shoal has expression tokens and command words, but no separate “command substitution language.” The parser decides the mode from syntax and its lexical binding scope.
 
-```mermaid
-flowchart TD
-    A["start of statement"] --> B{"reserved construct?"}
-    B -- yes --> C["parse let/fn/for/while/use/etc."]
-    B -- no --> D{"path head or ^head?"}
-    D -- yes --> E["COMMAND"]
-    D -- no --> F{"identifier?"}
-    F -- no --> G["EXPRESSION"]
-    F -- yes --> H{"adjacent . ?. ( [ or => ?"}
-    H -- yes --> G
-    H -- no --> I{"value-bound name?"}
-    I -- yes --> G
-    I -- no --> E
-```
 
 The rules, in order, are:
 

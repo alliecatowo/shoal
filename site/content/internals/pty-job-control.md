@@ -57,6 +57,8 @@ The child is session leader on **its own** PTY. It is not in the real terminal's
 
 ```mermaid
 flowchart LR
+accTitle: Terminal handoff model
+accDescr: Shows the components and relationships described in Terminal handoff model.
   Human["real tty stdin"] --> Raw["RawModeGuard"]
   Raw --> Forward["poll/read/write"]
   Forward --> Master["PTY master"]
@@ -94,6 +96,8 @@ One `PtyJob::serve` represents an initial foreground run or a resume stint.
 
 ```mermaid
 sequenceDiagram
+accTitle: Foreground serve lifecycle
+accDescr: Shows the components and relationships described in Foreground serve lifecycle.
   participant H as REPL/host
   participant J as PtyJob
   participant I as stdin+resize thread
@@ -146,6 +150,8 @@ exit/signal and does not reap the child.
 
 ```mermaid
 stateDiagram-v2
+accTitle: Stop versus exit
+accDescr: Shows the components and relationships described in Stop versus exit.
   [*] --> Running
   Running --> Exited: normal exit / fatal signal
   Running --> Stopped: SIGTSTP or SIGSTOP
@@ -186,6 +192,8 @@ foreground command returns `stopped = true`, it:
 
 ```mermaid
 flowchart LR
+accTitle: Evaluator job-table bridge
+accDescr: Shows the components and relationships described in Evaluator job-table bridge.
   Exec["PtyJob parked by PID"] --> Bridge["register_stopped_external"]
   Bridge --> Task["TaskVal by job id"]
   Bridge --> Map["job id → PID"]
@@ -243,6 +251,8 @@ are 80×24. If no `TERM` is supplied, the open path injects a usable terminal ty
 
 ```mermaid
 flowchart LR
+accTitle: Long-lived PtySession
+accDescr: Shows the components and relationships described in Long-lived PtySession.
   Open["PtySession::open"] --> PTY["master/slave + child"]
   PTY --> Reader["polling reader thread"]
   Reader --> Parser["vt100::Parser\nzero scrollback"]

@@ -20,18 +20,6 @@ The most reliable way to use Shoal from an agent is to treat execution, retrieva
 4. observe long-running state through task records and event cursors;
 5. re-plan when identity or live state is no longer trustworthy.
 
-```mermaid
-flowchart LR
-    I["Intent"] --> P{"side effects need review?"}
-    P -->|"yes"| L["shoal_plan"]
-    P -->|"no"| X["shoal_exec"]
-    L --> A["approval / shoal_apply"]
-    A --> R["out:N or task:N"]
-    X --> R
-    R --> G["shoal_get / resource path"]
-    R --> E["events / task resource"]
-    R --> T["PTY loop when interactive"]
-```
 
 Before deploying an agent, read [Security and trust boundaries](@/docs/security.md). In the current preview, the kernel socket must be fully trusted; session names are collaboration boundaries, not tenant isolation.
 
@@ -168,6 +156,8 @@ shoal://out/41?path=.rows&slice=50..100
 
 ```mermaid
 sequenceDiagram
+accTitle: Execute once, inspect many times
+accDescr: Shows the components and relationships described in Execute once, inspect many times.
     participant A as Agent
     participant S as Shoal
     A->>S: shoal_exec(large query)
@@ -337,6 +327,8 @@ Recommended loop:
 
 ```mermaid
 stateDiagram-v2
+accTitle: Resumable event processing
+accDescr: Shows the components and relationships described in Resumable event processing.
     [*] --> CatchUp
     CatchUp --> Subscribe: process + persist last seq
     Subscribe --> Live
@@ -432,21 +424,6 @@ Always close. It terminates/reaps a live child; it does not detach and leave it 
 
 ### Example: editor transaction
 
-```mermaid
-sequenceDiagram
-    participant A as Agent
-    participant P as Shoal PTY
-    A->>P: open(vim, notes.md)
-    A->>P: read screen
-    P-->>A: normal mode, file loaded
-    A->>P: send ["i", text, Escape, ":wq", Enter]
-    loop bounded poll
-        A->>P: read
-        P-->>A: screen + alive/exit
-    end
-    A->>P: close
-    A->>A: verify file through structured read
-```
 
 Do not send passwords or bearer tokens through a PTY unless the threat model accepts child/process-screen exposure. Prefer purpose-built secret channels.
 

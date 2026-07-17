@@ -36,6 +36,8 @@ Shoal has four error spaces. They should be translated at boundaries, not merged
 
 ```mermaid
 flowchart LR
+accTitle: Error layers
+accDescr: Shows the components and relationships described in Error layers.
   LexParse["LexError / ParseError\nmsg + byte span + hint"] --> LocalDiag["REPL/LSP diagnostic"]
   LexParse --> RpcParse["RpcError PARSE_ERROR -32001\nspan/hint in data"]
 
@@ -127,16 +129,6 @@ raised while evaluating valid source; the latter means the method call itself wa
 | MCP surface | `shoal-mcp` tool/resource mapper | kernel method, bounded text/ref, subscription lifecycle | schema unit + live-kernel end-to-end |
 | LSP semantic feature | reusable semantic index (new boundary) | parser context, UTF-16 mapping, workspace/document lifecycle | multi-document scope tests; do not extend lexical splitter alone |
 
-```mermaid
-flowchart TB
-  Canonical["canonical owner"] --> Semantics["semantic implementation"]
-  Canonical --> Contracts["serialized/public contract"]
-  Semantics --> Hosts["local shell + kernel"]
-  Contracts --> Clients["MCP/LSP/history/external clients"]
-  Hosts --> Integration["real boundary tests"]
-  Clients --> Integration
-  Canonical --> Corpus["normative or focused contract tests"]
-```
 
 ## Current architecture debt
 
@@ -336,27 +328,6 @@ solve drift by introducing dependency cycles.
 
 ## Prioritization map
 
-```mermaid
-quadrantChart
-  title Architecture debt by impact and effort
-  x-axis Lower effort --> Higher effort
-  y-axis Lower impact --> Higher impact
-  quadrant-1 Plan and stage
-  quadrant-2 Do first
-  quadrant-3 Opportunistic
-  quadrant-4 Invest deliberately
-  "session principal isolation": [0.55, 0.95]
-  "shared host builder": [0.65, 0.85]
-  "kernel ParseCtx parity": [0.45, 0.75]
-  "MCP unsubscribe lifecycle": [0.35, 0.68]
-  "journal row relationship": [0.55, 0.65]
-  "bounded frame reader": [0.32, 0.55]
-  "automatic CAS pin leases": [0.55, 0.58]
-  "stream wire + stdin": [0.82, 0.62]
-  "WASM host integration": [0.90, 0.50]
-  "config field honesty": [0.25, 0.42]
-  "history by-id query": [0.12, 0.25]
-```
 
 The coordinates are qualitative triage, not measured project estimates. Re-rank them against the
 next product goal, but preserve the dependency ordering: identity and host parity should be resolved

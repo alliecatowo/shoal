@@ -14,8 +14,9 @@ resolution instead of ambient `PATH`. One typed core across terminal, scripts, a
 [![Rust edition 2024](https://img.shields.io/badge/rust-edition%202024-orange)](#)
 [![Platforms: Linux · macOS](https://img.shields.io/badge/platforms-Linux%20%C2%B7%20macOS-success)](#)
 
+[Quickstart](https://alliecatowo.github.io/shoal/docs/quickstart/) ·
 [Manual](https://alliecatowo.github.io/shoal/docs/) ·
-[Architecture atlas](https://alliecatowo.github.io/shoal/internals/) ·
+[Architecture](https://alliecatowo.github.io/shoal/internals/) ·
 [Status and limits](https://alliecatowo.github.io/shoal/docs/status-limits/) ·
 [Roadmap](https://alliecatowo.github.io/shoal/docs/roadmap/)
 
@@ -32,7 +33,7 @@ password input, job control, and full-screen TUIs. When a command participates i
 its result becomes a typed value that can be filtered, sorted, transformed, journaled, shared, or
 queried by an agent without reparsing rendered text.
 
-```text
+```shoal
 # Collections and command output compose with methods, not a byte pipe.
 ls.where(.size > 1mb).sort_by(.size).map(.name)
 
@@ -60,7 +61,7 @@ Shoal is pre-release and is not ready to replace a login shell. The language eng
 runner, Reef resolver, journal/CAS, Leash policy path, streams/channels, kernel protocol, and MCP
 facade are implemented and tested on Linux and macOS.
 
-```sh
+```bash
 # Interactive shell
 cargo run -p shoal
 
@@ -118,6 +119,18 @@ absent. Set a non-empty `SHOAL_NO_AUTOSTART` when supervising the kernel yoursel
 [agent workflow manual](https://alliecatowo.github.io/shoal/docs/mcp-workflows/) and
 [MCP reference](https://alliecatowo.github.io/shoal/docs/mcp-tools-reference/).
 
+## Documentation
+
+The [Shoal Manual](https://alliecatowo.github.io/shoal/docs/) is for users, operators, and agent
+authors. Start with the [Quickstart](https://alliecatowo.github.io/shoal/docs/quickstart/), then use
+the language, shell, tools, agent, and reference chapters as needed.
+
+The [Architecture Atlas](https://alliecatowo.github.io/shoal/internals/) is for contributors and
+maintainers. Its [system map](https://alliecatowo.github.io/shoal/internals/system-map/) leads into
+crate ownership, execution, protocols, persistence, and security. The site keeps 123 curated,
+accessible relationship diagrams in compact pan/zoom viewers while preserving every existing
+`/docs/` and `/internals/` URL.
+
 ## Workspace
 
 | Area | Responsibility |
@@ -131,12 +144,12 @@ absent. Set a non-empty `SHOAL_NO_AUTOSTART` when supervising the kernel yoursel
 | `shoal-proto`, `shoal-kernel`, `shoal-mcp` | shared sessions and agent protocols |
 | `shoal-prompt`, `shoal-lsp`, `shoal` | prompt, editor tooling, CLI and REPL host |
 
-The [architecture atlas](https://alliecatowo.github.io/shoal/internals/) traces crate boundaries,
+The [Architecture Atlas](https://alliecatowo.github.io/shoal/internals/) traces crate boundaries,
 runtime flows, security boundaries, protocol contracts, and implementation status back to source.
 
 ## Build and test
 
-```sh
+```bash
 cargo fmt --all --check
 cargo +stable clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
@@ -144,7 +157,7 @@ cargo test --workspace --locked
 
 Run only the executable language contract with:
 
-```sh
+```bash
 cargo test -p shoal --test conformance --locked -- --nocapture
 ```
 

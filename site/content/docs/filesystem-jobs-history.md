@@ -156,6 +156,8 @@ This is local REPL behavior. Kernel task suspend/resume currently returns `TASK_
 
 ```mermaid
 flowchart TB
+accTitle: Line history versus journal
+accDescr: Shows the components and relationships described in Line history versus journal.
     S["submitted statement"] --> H["line history"]
     S --> J["journal entry"]
     H --> R["recall / search"]
@@ -189,6 +191,8 @@ Undo first validates that the target still matches the fingerprint recorded afte
 
 ```mermaid
 sequenceDiagram
+accTitle: Undo protocol
+accDescr: Shows the components and relationships described in Undo protocol.
     participant C as Command
     participant J as Journal
     participant F as Filesystem
