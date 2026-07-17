@@ -3,23 +3,402 @@
 
 use crate::{BridgeError, Facade, short_ref_to_uri};
 use serde_json::{Value, json};
+use std::collections::HashSet;
+
+const MAX_TOOL_NAME_BYTES: usize = 64;
+const MAX_TOOL_ARGUMENT_BYTES: usize = 4 * 1024 * 1024 + 64 * 1024;
+const MAX_TOOL_SOURCE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_TOOL_IDENTIFIER_BYTES: usize = 4 * 1024;
+const MAX_TOOL_COLLECTION_ITEMS: usize = 256;
+const MAX_TOOL_RESULT_BYTES: usize = 8 * 1024 * 1024;
 
 impl Facade {
-    pub(crate) fn tools_call(&mut self, params: Value) -> Result<Value, String> {
+    pub(crate) fn tools_call(&mut self, mut params: Value) -> Result<Value, String> {
         let name = params
             .get("name")
             .and_then(Value::as_str)
             .ok_or("tools/call requires name")?;
+        admit_tool_name(name)?;
+        let name = name.to_string();
         let args = params
-            .get("arguments")
-            .cloned()
+            .get_mut("arguments")
+            .map(Value::take)
             .unwrap_or_else(|| json!({}));
-        let (method, kparams) = map_tool(name, args)?;
+        admit_value_size(&args, MAX_TOOL_ARGUMENT_BYTES, "tool arguments")?;
+        validate_tool_arguments(&name, &args)?;
+        let (method, kparams) = map_tool(&name, args)?;
         match self.kernel.call(method, kparams) {
             Ok(result) => Ok(tool_result(result, false)),
-            Err(BridgeError::Kernel(error)) => Ok(tool_result(error, true)),
-            Err(error) => Err(error.to_string()),
+            Err(BridgeError::Kernel(error)) => Ok(tool_result(safe_tool_error(&error), true)),
+            Err(_) => Err("kernel transport failed while calling tool".into()),
         }
+    }
+}
+
+fn admit_tool_name(name: &str) -> Result<(), String> {
+    if name.len() > MAX_TOOL_NAME_BYTES {
+        return Err("tool name exceeds the admission limit".into());
+    }
+    if !matches!(
+        name,
+        "shoal_exec"
+            | "shoal_plan"
+            | "shoal_apply"
+            | "shoal_get"
+            | "shoal_stream_pull"
+            | "shoal_stream_close"
+            | "shoal_journal"
+            | "shoal_cancel"
+            | "shoal_cap_request"
+            | "shoal_pty_open"
+            | "shoal_pty_send"
+            | "shoal_pty_read"
+            | "shoal_pty_resize"
+            | "shoal_pty_close"
+            | "shoal_pty_list"
+    ) {
+        return Err("unknown tool".into());
+    }
+    Ok(())
+}
+
+fn admit_value_size(value: &Value, limit: usize, label: &str) -> Result<(), String> {
+    struct LimitWriter {
+        remaining: usize,
+    }
+
+    impl std::io::Write for LimitWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > self.remaining {
+                return Err(std::io::Error::other("JSON byte limit exceeded"));
+            }
+            self.remaining -= bytes.len();
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn visit(value: &Value, remaining: &mut usize) -> bool {
+        let cost = match value {
+            Value::Null => 4,
+            Value::Bool(_) => 5,
+            Value::Number(number) => number.to_string().len(),
+            Value::String(string) => string.len().saturating_add(2),
+            Value::Array(values) => {
+                if values.len() > MAX_TOOL_COLLECTION_ITEMS || !take(remaining, 2 + values.len()) {
+                    return false;
+                }
+                return values.iter().all(|value| visit(value, remaining));
+            }
+            Value::Object(values) => {
+                if values.len() > MAX_TOOL_COLLECTION_ITEMS || !take(remaining, 2 + values.len()) {
+                    return false;
+                }
+                for (key, value) in values {
+                    if !take(remaining, key.len().saturating_add(3)) || !visit(value, remaining) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+        };
+        take(remaining, cost)
+    }
+    fn take(remaining: &mut usize, cost: usize) -> bool {
+        if let Some(next) = remaining.checked_sub(cost) {
+            *remaining = next;
+            true
+        } else {
+            false
+        }
+    }
+
+    let mut remaining = limit;
+    let mut writer = LimitWriter { remaining: limit };
+    if visit(value, &mut remaining) && serde_json::to_writer(&mut writer, value).is_ok() {
+        Ok(())
+    } else {
+        Err(format!("{label} exceed the admission limit"))
+    }
+}
+
+pub(crate) fn value_within_admission(value: &Value, limit: usize) -> bool {
+    admit_value_size(value, limit, "value").is_ok()
+}
+
+fn validate_tool_arguments(name: &str, args: &Value) -> Result<(), String> {
+    let object = args.as_object().ok_or("tool arguments must be an object")?;
+    let allowed: &[&str] = match name {
+        "shoal_exec" => &[
+            "src",
+            "mode",
+            "position",
+            "background",
+            "timeout_ms",
+            "elide",
+        ],
+        "shoal_plan" => &["src"],
+        "shoal_apply" => &["plan_ref"],
+        "shoal_get" => &["ref", "path", "slice", "elide"],
+        "shoal_stream_pull" => &["cursor", "limit", "wait_ms", "deadline_ms", "elide"],
+        "shoal_stream_close" => &["cursor"],
+        "shoal_journal" => &[
+            "since",
+            "until",
+            "principal",
+            "ok",
+            "effects",
+            "head",
+            "limit",
+        ],
+        "shoal_cancel" => &["task"],
+        "shoal_cap_request" => &["plan_ref", "effects"],
+        "shoal_pty_open" => &["cmd", "args", "cols", "rows", "env"],
+        "shoal_pty_send" => &["pty_id", "input"],
+        "shoal_pty_read" | "shoal_pty_close" => &["pty_id"],
+        "shoal_pty_resize" => &["pty_id", "cols", "rows"],
+        "shoal_pty_list" => &[],
+        _ => return Err("unknown tool".into()),
+    };
+    if object.keys().any(|key| !allowed.contains(&key.as_str())) {
+        return Err("tool arguments contain an unsupported field".into());
+    }
+
+    match name {
+        "shoal_exec" => {
+            bounded_string(object, "src", MAX_TOOL_SOURCE_BYTES)?;
+            optional_enum(object, "mode", &["run", "plan"])?;
+            optional_enum(object, "position", &["stmt", "value"])?;
+            optional_bool(object, "background")?;
+            optional_u64(object, "timeout_ms", 1, u64::MAX, false)?;
+            optional_elide(object.get("elide"))?;
+        }
+        "shoal_plan" => bounded_string(object, "src", MAX_TOOL_SOURCE_BYTES)?,
+        "shoal_apply" | "shoal_cap_request" => {
+            bounded_string(object, "plan_ref", MAX_TOOL_IDENTIFIER_BYTES)?
+        }
+        "shoal_get" => {
+            bounded_string(object, "ref", MAX_TOOL_IDENTIFIER_BYTES)?;
+            optional_bounded_string(object, "path", MAX_TOOL_IDENTIFIER_BYTES)?;
+            optional_slice(object.get("slice"))?;
+            optional_elide(object.get("elide"))?;
+        }
+        "shoal_cancel" => bounded_string(object, "task", MAX_TOOL_IDENTIFIER_BYTES)?,
+        "shoal_pty_open" => {
+            bounded_string(object, "cmd", MAX_TOOL_IDENTIFIER_BYTES)?;
+            validate_string_array(
+                object.get("args"),
+                MAX_TOOL_COLLECTION_ITEMS,
+                MAX_TOOL_IDENTIFIER_BYTES,
+            )?;
+            validate_string_map(object.get("env"), MAX_TOOL_COLLECTION_ITEMS)?;
+            optional_u64(object, "cols", 1, 1000, false)?;
+            optional_u64(object, "rows", 1, 1000, false)?;
+        }
+        "shoal_pty_send" => {
+            bounded_string(object, "pty_id", MAX_TOOL_IDENTIFIER_BYTES)?;
+            if !object.contains_key("input") {
+                return Err("missing pty input".into());
+            }
+        }
+        "shoal_pty_read" | "shoal_pty_close" => {
+            bounded_string(object, "pty_id", MAX_TOOL_IDENTIFIER_BYTES)?
+        }
+        "shoal_pty_resize" => {
+            bounded_string(object, "pty_id", MAX_TOOL_IDENTIFIER_BYTES)?;
+            optional_u64(object, "cols", 1, 1000, true)?;
+            optional_u64(object, "rows", 1, 1000, true)?;
+        }
+        "shoal_journal" => {
+            optional_bounded_string(object, "principal", MAX_TOOL_IDENTIFIER_BYTES)?;
+            optional_bounded_string(object, "head", MAX_TOOL_IDENTIFIER_BYTES)?;
+            validate_string_array(object.get("effects"), 64, 128)?;
+            optional_i64(object, "since")?;
+            optional_i64(object, "until")?;
+            optional_bool(object, "ok")?;
+            optional_u64(object, "limit", 1, u64::MAX, false)?;
+        }
+        "shoal_stream_pull" => {
+            validate_cursor(object.get("cursor"))?;
+            optional_u64(object, "limit", 1, 64, false)?;
+            optional_u64(object, "wait_ms", 0, 1000, false)?;
+            optional_u64(object, "deadline_ms", 1, 30_000, false)?;
+            optional_elide(object.get("elide"))?;
+        }
+        "shoal_stream_close" => validate_cursor(object.get("cursor"))?,
+        "shoal_pty_list" => {}
+        _ => {}
+    }
+    if name == "shoal_cap_request" {
+        validate_string_array(object.get("effects"), 128, 128)?;
+    }
+    Ok(())
+}
+
+fn bounded_string(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+    max_bytes: usize,
+) -> Result<(), String> {
+    let value = object
+        .get(field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("missing string argument {field:?}"))?;
+    if value.len() > max_bytes {
+        return Err(format!("string argument {field:?} exceeds its byte limit"));
+    }
+    Ok(())
+}
+
+fn optional_bounded_string(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+    max_bytes: usize,
+) -> Result<(), String> {
+    match object.get(field) {
+        Some(Value::String(value)) if value.len() <= max_bytes => Ok(()),
+        Some(Value::String(_)) => Err(format!("string argument {field:?} exceeds its byte limit")),
+        Some(_) => Err(format!("argument {field:?} must be a string")),
+        None => Ok(()),
+    }
+}
+
+fn validate_string_array(
+    value: Option<&Value>,
+    max_items: usize,
+    max_bytes: usize,
+) -> Result<(), String> {
+    let Some(value) = value else { return Ok(()) };
+    let values = value
+        .as_array()
+        .ok_or("tool string list must be an array")?;
+    if values.len() > max_items
+        || values
+            .iter()
+            .any(|value| value.as_str().is_none_or(|string| string.len() > max_bytes))
+    {
+        return Err("tool string list exceeds its item or byte limit".into());
+    }
+    Ok(())
+}
+
+fn optional_enum(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+    allowed: &[&str],
+) -> Result<(), String> {
+    match object.get(field) {
+        Some(Value::String(value)) if allowed.contains(&value.as_str()) => Ok(()),
+        Some(_) => Err(format!("argument {field:?} is invalid")),
+        None => Ok(()),
+    }
+}
+
+fn optional_bool(object: &serde_json::Map<String, Value>, field: &str) -> Result<(), String> {
+    match object.get(field) {
+        Some(Value::Bool(_)) | None => Ok(()),
+        Some(_) => Err(format!("argument {field:?} must be a boolean")),
+    }
+}
+
+fn optional_u64(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+    min: u64,
+    max: u64,
+    required: bool,
+) -> Result<(), String> {
+    match object.get(field).and_then(Value::as_u64) {
+        Some(value) if (min..=max).contains(&value) => Ok(()),
+        Some(_) => Err(format!("argument {field:?} is outside its numeric range")),
+        None if object.contains_key(field) => Err(format!("argument {field:?} must be an integer")),
+        None if required => Err(format!("missing integer argument {field:?}")),
+        None => Ok(()),
+    }
+}
+
+fn optional_i64(object: &serde_json::Map<String, Value>, field: &str) -> Result<(), String> {
+    match object.get(field) {
+        Some(value) if value.as_i64().is_some() => Ok(()),
+        Some(_) => Err(format!("argument {field:?} must be a signed integer")),
+        None => Ok(()),
+    }
+}
+
+fn optional_elide(value: Option<&Value>) -> Result<(), String> {
+    let Some(value) = value else { return Ok(()) };
+    let object = value
+        .as_object()
+        .ok_or("elide argument must be an object")?;
+    if object
+        .keys()
+        .any(|key| !matches!(key.as_str(), "max_bytes" | "max_rows" | "max_items"))
+    {
+        return Err("elide argument contains an unsupported field".into());
+    }
+    for field in ["max_bytes", "max_rows", "max_items"] {
+        optional_u64(object, field, 1, u64::MAX, false)?;
+    }
+    Ok(())
+}
+
+fn optional_slice(value: Option<&Value>) -> Result<(), String> {
+    let Some(value) = value else { return Ok(()) };
+    let values = value
+        .as_array()
+        .filter(|values| values.len() == 2)
+        .ok_or("slice argument must contain exactly two integers")?;
+    let start = values[0]
+        .as_u64()
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or("slice start is invalid")?;
+    let end = values[1]
+        .as_u64()
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or("slice end is invalid")?;
+    if start > end {
+        return Err("slice start exceeds its end".into());
+    }
+    Ok(())
+}
+
+fn validate_string_map(value: Option<&Value>, max_items: usize) -> Result<(), String> {
+    let Some(value) = value else { return Ok(()) };
+    let values = value
+        .as_object()
+        .ok_or("tool environment must be an object")?;
+    if values.len() > max_items
+        || values.iter().any(|(key, value)| {
+            key.len() > 256
+                || value
+                    .as_str()
+                    .is_none_or(|string| string.len() > MAX_TOOL_IDENTIFIER_BYTES)
+        })
+    {
+        return Err("tool environment exceeds its item or byte limit".into());
+    }
+    Ok(())
+}
+
+fn validate_cursor(value: Option<&Value>) -> Result<(), String> {
+    let cursor = value
+        .and_then(Value::as_object)
+        .ok_or("missing cursor object")?;
+    let allowed = HashSet::from(["ref", "path"]);
+    if cursor.keys().any(|key| !allowed.contains(key.as_str())) {
+        return Err("cursor contains an unsupported field".into());
+    }
+    bounded_string(cursor, "ref", MAX_TOOL_IDENTIFIER_BYTES)?;
+    optional_bounded_string(cursor, "path", MAX_TOOL_IDENTIFIER_BYTES)
+}
+
+fn safe_tool_error(error: &Value) -> Value {
+    match error.get("code").and_then(Value::as_i64) {
+        Some(code) => json!({"code":code,"message":"kernel rejected tool request"}),
+        None => json!({"message":"kernel rejected tool request"}),
     }
 }
 
@@ -124,7 +503,7 @@ fn map_tool(name: &str, args: Value) -> Result<(&'static str, Value), String> {
         // Enumerate this session's open ptys — the discovery verb behind the
         // `shoal://pty` resource root.
         "shoal_pty_list" => ("pty.list", json!({})),
-        _ => return Err(format!("unknown tool {name:?}")),
+        _ => return Err("unknown tool".into()),
     })
 }
 fn required_str<'a>(o: &'a serde_json::Map<String, Value>, name: &str) -> Result<&'a str, String> {
@@ -144,24 +523,33 @@ const RESULT_TEXT_HARD_CAP: usize = 64 * 1024;
 /// `resource_link` points at the value's ref so the agent can drill in for
 /// zero tokens rather than receiving the payload inline.
 fn tool_result(value: Value, is_error: bool) -> Value {
+    let value = if admit_value_size(&value, MAX_TOOL_RESULT_BYTES, "tool result").is_ok() {
+        value
+    } else {
+        json!({"$":"elided","reason":"kernel result exceeded MCP structured-content limit"})
+    };
     // Find the ref/uri this result is addressable by, for the link + marker.
     let uri = value
         .get("uri")
         .and_then(Value::as_str)
+        .filter(|uri| uri.len() <= crate::resources::MAX_RESOURCE_URI_BYTES)
         .map(String::from)
         .or_else(|| {
             value
                 .get("value")
                 .and_then(|v| v.get("uri"))
                 .and_then(Value::as_str)
+                .filter(|uri| uri.len() <= crate::resources::MAX_RESOURCE_URI_BYTES)
                 .map(String::from)
         })
         .or_else(|| {
             value
                 .get("ref")
                 .and_then(Value::as_str)
+                .filter(|short| short.len() <= MAX_TOOL_IDENTIFIER_BYTES)
                 .map(short_ref_to_uri)
-        });
+        })
+        .filter(|uri| crate::resources::resource_uri_admitted(uri));
     // Prefer the kernel's human render; fall back to compact JSON. Either way
     // it is bounded — the render string is NOT trusted to be small (a 150-row
     // table renders to many KiB), which is exactly the elision bypass site/content/internals/kernel-protocol.md closes.
@@ -186,8 +574,13 @@ pub(crate) fn bound_text(text: &str, uri: Option<&str>) -> String {
     if text.len() <= RESULT_TEXT_HARD_CAP {
         return text.to_string();
     }
-    let budget = RESULT_TEXT_HARD_CAP.saturating_sub(96);
     let total_lines = text.lines().count();
+    let via = match uri.filter(|uri| uri.len() <= 512) {
+        Some(uri) => format!("fetch via {uri}"),
+        None => "fetch via ref".into(),
+    };
+    let marker = format!("…({total_lines} more lines, {via})");
+    let budget = RESULT_TEXT_HARD_CAP.saturating_sub(marker.len());
     let mut head = String::new();
     let mut kept = 0usize;
     for line in text.lines() {
@@ -200,13 +593,13 @@ pub(crate) fn bound_text(text: &str, uri: Option<&str>) -> String {
     }
     // Degenerate case: a single line longer than the budget — hard byte cut.
     if head.is_empty() {
-        head = text.chars().take(budget).collect();
+        let mut end = budget.min(text.len());
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        head.push_str(&text[..end]);
     }
     let remaining = total_lines.saturating_sub(kept);
-    let via = match uri {
-        Some(uri) => format!("fetch via {uri}"),
-        None => "fetch via ref".into(),
-    };
     format!("{head}…({remaining} more lines, {via})")
 }
 
@@ -433,5 +826,93 @@ mod tests {
             .iter()
             .any(|c| c["type"] == "resource_link" && c["uri"] == "shoal://out/12");
         assert!(has_link, "result must carry a resource_link to the ref");
+    }
+
+    #[test]
+    fn tool_admission_rejects_huge_names_identifiers_and_argument_floods_without_echo() {
+        let secret_name = "SECRET_TOOL".repeat(100);
+        let error = admit_tool_name(&secret_name).unwrap_err();
+        assert!(!error.contains("SECRET_TOOL"));
+        assert_eq!(
+            admit_tool_name("shoal_exec_typo").unwrap_err(),
+            "unknown tool"
+        );
+
+        let huge_id = "PRIVATE_REF".repeat(MAX_TOOL_IDENTIFIER_BYTES);
+        let error = validate_tool_arguments("shoal_get", &json!({"ref": huge_id})).unwrap_err();
+        assert!(!error.contains("PRIVATE_REF"));
+
+        let flooded = json!({"src":"1", "unexpected":"x"});
+        assert!(validate_tool_arguments("shoal_exec", &flooded).is_err());
+        assert!(
+            validate_tool_arguments("shoal_exec", &json!({"src":"1", "timeout_ms":u64::MAX}))
+                .is_ok()
+        );
+        assert!(
+            validate_tool_arguments("shoal_exec", &json!({"src":"1", "timeout_ms":-1})).is_err()
+        );
+        assert!(
+            validate_tool_arguments(
+                "shoal_stream_pull",
+                &json!({"cursor":{"ref":"out:1"},"limit":65})
+            )
+            .is_err()
+        );
+        assert!(
+            validate_tool_arguments("shoal_pty_resize", &json!({"pty_id":"pty:1","cols":80}))
+                .is_err()
+        );
+        let wide = Value::Array(vec![Value::Null; MAX_TOOL_COLLECTION_ITEMS + 1]);
+        assert!(admit_value_size(&wide, MAX_TOOL_ARGUMENT_BYTES, "tool arguments").is_err());
+        let escaped = Value::String("\0".repeat(1024 * 1024));
+        assert!(admit_value_size(&escaped, MAX_TOOL_ARGUMENT_BYTES, "tool arguments").is_err());
+    }
+
+    #[test]
+    fn tool_admission_preserves_exact_source_limit_and_bounds_collections() {
+        let exact = json!({"src":"x".repeat(MAX_TOOL_SOURCE_BYTES)});
+        validate_tool_arguments("shoal_exec", &exact).unwrap();
+        let oversized = json!({"src":"x".repeat(MAX_TOOL_SOURCE_BYTES + 1)});
+        assert!(validate_tool_arguments("shoal_exec", &oversized).is_err());
+
+        let argv = json!({
+            "cmd":"echo",
+            "args": vec!["x"; MAX_TOOL_COLLECTION_ITEMS],
+            "env": {"A":"B"},
+        });
+        validate_tool_arguments("shoal_pty_open", &argv).unwrap();
+    }
+
+    #[test]
+    fn tool_errors_and_links_do_not_reflect_kernel_secrets_or_oversized_uris() {
+        let error = safe_tool_error(&json!({
+            "code": -32000,
+            "message": "failed at /private/path with bearer SECRET",
+            "data": {"body":"SECRET_BODY"},
+        }));
+        let encoded = serde_json::to_string(&error).unwrap();
+        assert!(!encoded.contains("SECRET"));
+        assert!(!encoded.contains("private/path"));
+
+        let result = tool_result(
+            json!({"uri":format!("shoal://out/{}", "x".repeat(crate::resources::MAX_RESOURCE_URI_BYTES)), "value":1}),
+            false,
+        );
+        assert_eq!(result["content"].as_array().unwrap().len(), 1);
+
+        let result = tool_result(
+            Value::Array(vec![Value::Null; MAX_TOOL_COLLECTION_ITEMS + 1]),
+            false,
+        );
+        assert_eq!(result["structuredContent"]["$"], "elided");
+    }
+
+    #[test]
+    fn bound_text_is_a_utf8_byte_cap_even_for_one_multibyte_line() {
+        let text = "🪸".repeat(RESULT_TEXT_HARD_CAP);
+        let bounded = bound_text(&text, Some(&format!("shoal://out/{}", "x".repeat(2048))));
+        assert!(bounded.len() <= RESULT_TEXT_HARD_CAP);
+        assert!(bounded.is_char_boundary(bounded.len()));
+        assert!(bounded.contains("fetch via ref"));
     }
 }

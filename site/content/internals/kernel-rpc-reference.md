@@ -68,7 +68,11 @@ peer cannot grow the line buffer beyond that bound plus the terminator sentinel.
 the shared request/response preflight caps structural depth (64), total values (65,536), per-container
 items (16,384), decoded object keys (64 KiB), and numeric tokens (1 KiB). Public kernel connections
 also use a 10-second first-byte/remainder read deadline by default. The MCP stdio reader uses the
-same bounded line and complexity shape without the socket deadline.
+same bounded line and complexity shape without the socket deadline. Its facade then applies a 4 KiB
+resource-URI wall, strict percent/UTF-8 decoding, bounded path/query cardinality, per-resource path
+and parameter schemas, and exact numeric parsing before dispatch. Tool calls accept only advertised
+names and fields, with a 4 MiB source wall and bounded identifiers/collections. Admission and kernel
+error messages never quote the rejected URI, tool name, path, body, or bearer.
 
 ## Router and attachment matrix
 
@@ -510,8 +514,10 @@ payload into the attached evaluator's language EventBus without holding the eval
 Language-originated `user.*` emits pass through the same wire-bus admission and do not echo on
 injection. These limits are per exact principal/session.
 
-Kernel unsubscribe correctly closes its writer queue. MCP `resources/unsubscribe` is a separate known
-gap: the facade does not retain the dedicated connection/thread handle needed to issue this method.
+Kernel unsubscribe correctly closes its writer queue. MCP subscriptions retain their dedicated
+connection, interrupt handle, and forwarding thread; `resources/unsubscribe` closes and joins the
+worker deterministically. The facade admits at most 64 concurrent subscription workers, and the
+same resource-URI schema is checked for subscribe and unsubscribe.
 
 ## Error mapping by method family
 

@@ -4,6 +4,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use std::net::Shutdown;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
@@ -22,13 +23,16 @@ pub use tools::tools;
 /// facade-local ceiling applies before consuming either resource; the kernel's
 /// principal/session quotas remain a second, shared admission boundary.
 const MAX_FACADE_SUBSCRIPTIONS: usize = 64;
-const MAX_SUBSCRIPTION_URI_BYTES: usize = 4 * 1024;
+const MAX_AUTOSTART_PATH_BYTES: usize = 4 * 1024;
+const MAX_AUTOSTART_SESSION_BYTES: usize = 256;
+const MAX_AUTOSTART_NUMBER_BYTES: usize = 20;
 
 fn subscription_admission(active: usize, uri: &str, duplicate: bool) -> Result<bool, String> {
-    if uri.len() > MAX_SUBSCRIPTION_URI_BYTES {
+    if uri.len() > resources::MAX_RESOURCE_URI_BYTES {
         return Err(format!(
-            "subscription URI is {} bytes; maximum is {MAX_SUBSCRIPTION_URI_BYTES}",
-            uri.len()
+            "subscription URI is {} bytes; maximum is {}",
+            uri.len(),
+            resources::MAX_RESOURCE_URI_BYTES
         ));
     }
     if duplicate {
@@ -108,13 +112,8 @@ impl Facade {
             Some("resources/unsubscribe") => {
                 self.resources_unsubscribe(request.get("params").cloned().unwrap_or(Value::Null))
             }
-            Some(m) => {
-                return Some(rpc_error(
-                    id,
-                    -32601,
-                    "method not found",
-                    Some(json!({"method":m})),
-                ));
+            Some(_) => {
+                return Some(rpc_error(id, -32601, "method not found", None));
             }
             None => {
                 return Some(rpc_error(
@@ -224,6 +223,9 @@ pub fn ensure_kernel(config: &Config) -> KernelAutostart {
     if std::env::var_os("SHOAL_NO_AUTOSTART").is_some_and(|v| !v.is_empty()) {
         return KernelAutostart::empty();
     }
+    if !autostart_config_admitted(config) {
+        return KernelAutostart::empty();
+    }
     let program = kernel_program();
     let mut cmd = kernel_command(config, &program);
     start_kernel_command(
@@ -295,7 +297,9 @@ fn kernel_command(config: &Config, program: &Path) -> Command {
     if let Some(session) = &config.session {
         cmd.arg("--session").arg(session);
     }
-    if let Some(policy) = std::env::var_os("SHOAL_POLICY").filter(|value| !value.is_empty()) {
+    if let Some(policy) = std::env::var_os("SHOAL_POLICY").filter(|value| {
+        !value.is_empty() && value.as_os_str().as_bytes().len() <= MAX_AUTOSTART_PATH_BYTES
+    }) {
         cmd.arg("--policy").arg(policy);
     }
     append_kernel_limit_args(&mut cmd, |name| std::env::var_os(name));
@@ -333,10 +337,29 @@ fn append_kernel_limit_args(
         ),
         ("SHOAL_FRAME_READ_TIMEOUT_MS", "--frame-read-timeout-ms"),
     ] {
-        if let Some(value) = read_env(env).filter(|value| !value.is_empty()) {
+        if let Some(value) = read_env(env).filter(|value| valid_autostart_number(value.as_os_str()))
+        {
             cmd.arg(flag).arg(value);
         }
     }
+}
+
+fn autostart_config_admitted(config: &Config) -> bool {
+    config.socket.as_os_str().as_bytes().len() <= MAX_AUTOSTART_PATH_BYTES
+        && config
+            .session
+            .as_ref()
+            .is_none_or(|session| session.len() <= MAX_AUTOSTART_SESSION_BYTES)
+}
+
+fn valid_autostart_number(value: &std::ffi::OsStr) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= MAX_AUTOSTART_NUMBER_BYTES
+        && bytes.iter().all(u8::is_ascii_digit)
+        && value
+            .to_str()
+            .is_some_and(|value| value.parse::<u64>().is_ok())
 }
 
 pub fn run_stdio(config: &Config) -> Result<(), BridgeError> {
@@ -741,6 +764,30 @@ mod tests {
     }
 
     #[test]
+    fn autostart_rejects_environment_to_argv_amplification() {
+        for invalid in [
+            std::ffi::OsString::from("-1"),
+            std::ffi::OsString::from("1x"),
+            std::ffi::OsString::from("9".repeat(MAX_AUTOSTART_NUMBER_BYTES + 1)),
+            std::ffi::OsString::from("18446744073709551616"),
+        ] {
+            let mut command = Command::new("shoal-kernel");
+            append_kernel_limit_args(&mut command, |name| {
+                (name == "SHOAL_MAX_SESSIONS").then(|| invalid.clone())
+            });
+            assert!(command.get_args().next().is_none());
+        }
+
+        let config = Config {
+            socket: PathBuf::from("/tmp/kernel.sock"),
+            session: Some("s".repeat(MAX_AUTOSTART_SESSION_BYTES + 1)),
+            token: None,
+            local_auth: LocalAuthMode::RestrictedAgent,
+        };
+        assert!(!autostart_config_admitted(&config));
+    }
+
+    #[test]
     fn subscription_admission_is_bounded_and_duplicate_idempotent() {
         assert!(
             !subscription_admission(MAX_FACADE_SUBSCRIPTIONS, "shoal://events/same", true).unwrap()
@@ -751,7 +798,10 @@ mod tests {
         assert!(
             subscription_admission(
                 0,
-                &format!("shoal://events/{}", "x".repeat(MAX_SUBSCRIPTION_URI_BYTES)),
+                &format!(
+                    "shoal://events/{}",
+                    "x".repeat(resources::MAX_RESOURCE_URI_BYTES)
+                ),
                 false,
             )
             .unwrap_err()

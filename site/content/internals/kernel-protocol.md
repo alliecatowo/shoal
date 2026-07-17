@@ -280,6 +280,18 @@ more than 16,384 items/members in one container, object keys over 64 KiB decoded
 over 1 KiB before `serde_json` tree allocation. The same limits apply to buffered outbound frames.
 Public kernel frames also have a 10-second first-byte/remainder timeout by default.
 
+The MCP facade adds semantic admission before dispatch. Every resource operation admits at most a
+4 KiB raw URI, four path segments, sixteen query pairs, 512 decoded bytes per path segment, 64 per
+query key, and 2 KiB per query value. Percent escapes and UTF-8 are strict; decoded duplicate keys,
+unknown parameters, and path shapes outside that resource's advertised schema fail without quoting
+the URI. Numeric extremes are parsed exactly and then reach the kernel's existing raw-page,
+event-page, and journal-page clamps. Tool names are limited to the fixed advertised set, source is
+limited to the parser's 4 MiB wall, identifier strings and argument collections are bounded, and
+unknown fields fail before a kernel call. MCP text remains a 64 KiB UTF-8 byte cap. Kernel error
+data is not reflected through the facade, so a rejected path, body, or bearer cannot become an MCP
+error amplification channel. Tool and resource structured content has an 8 MiB serialized ceiling,
+leaving framing headroom when the facade wraps a bounded kernel response in MCP result metadata.
+
 ## Event bus
 
 Static channels are `session.transcript`, `journal`, `approval`, and `render`. `task.{id}` and
