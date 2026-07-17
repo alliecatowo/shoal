@@ -143,7 +143,7 @@ Rules for implementers:
 
 ### Workstream F — workspace hygiene
 
-- [ ] **HR-F1** — Every member crate inherits the root `[workspace.lints]` policy
+- [x] **HR-F1** — Every member crate inherits the root `[workspace.lints]` policy
   (`lints.workspace = true`), making the staged policy actually active. *(H7)*
 - [ ] **HR-F2** — `rust-toolchain.toml` pins the stable toolchain CI uses. *(H11)*
 - [ ] **HR-F3** — Syntax-highlighter tests force their color environment explicitly; the suite
