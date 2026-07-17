@@ -27,14 +27,13 @@
 //! resets caught signals to `SIG_DFL`, which is exactly why Ctrl-Z can stop
 //! them.
 
-use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{self, Write};
 use std::mem;
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -50,31 +49,19 @@ use crate::watcher::spawn_cancel_watcher;
 use crate::which::resolve_program;
 use crate::{ExecResult, ExecSpec, StdinSpec};
 
+mod registry;
 mod terminal;
 
 /// After the child is reaped, how long we wait for the output pump to hit
 /// EOF before abandoning it (it exits on its own once the pty closes).
 const PUMP_DRAIN_GRACE: Duration = Duration::from_millis(500);
 
+use registry::{BackgroundCommand, park_job, register_background_job, remove_background_job};
+pub use registry::{shutdown_stopped_jobs, take_background_job, take_stopped_job};
 use terminal::{
     BackgroundOutputSink, OutputPumpConfig, RawModeGuard, dup_master_fd, dup_stdout,
     forward_stdin_and_resize, initial_pty_size, is_tty, lock_tee, pty_err, pump_output,
 };
-
-/// Parked, still-running PTY foreground jobs that were stopped (Ctrl-Z /
-/// SIGTSTP) and can be resumed by the host via `fg`/`bg`. Process-global
-/// because job control is inherently a per-process singleton (there is one
-/// controlling terminal). Keyed by pid at [`take_stopped_job`].
-static PARKED_JOBS: Mutex<VecDeque<PtyJob>> = Mutex::new(VecDeque::new());
-/// Detached background PTY workers that can transfer their live `PtyJob`
-/// ownership back to the host for `fg`. Only lightweight command senders live
-/// in this process-global registry; the worker remains the sole job owner.
-static BACKGROUND_JOBS: Mutex<Vec<(u32, Sender<BackgroundCommand>)>> = Mutex::new(Vec::new());
-
-enum BackgroundCommand {
-    Foreground(SyncSender<PtyJob>),
-    Shutdown,
-}
 
 /// Non-tty stdin to feed into the pty exactly once (the first time the job is
 /// served). `Inherit`-tty forwarding is handled separately and re-engages on
@@ -94,8 +81,8 @@ enum Wait {
 }
 
 /// A PTY foreground command and everything needed to keep it alive across a
-/// stop and later resume it (site/content/internals/language-conformance-contract.md). Created for every PtyTee run; parked in
-/// [`PARKED_JOBS`] only when the child is stopped rather than finishing.
+/// stop and later resume it (site/content/internals/language-conformance-contract.md). Created for every PtyTee run; held by
+/// the stopped-job registry only when the child stops rather than finishes.
 ///
 /// The `master` is retained (never moved into a helper thread) precisely so the
 /// child's pty slave stays open while it is stopped — dropping the master would
@@ -467,79 +454,6 @@ impl Drop for PtyJob {
         // A job dropped without a clean reap — e.g. a parked job abandoned when
         // the shell exits — must not leave a stopped child orphaned.
         self.kill_and_reap();
-    }
-}
-
-fn register_background_job(pid: u32, commands: Sender<BackgroundCommand>) {
-    if let Ok(mut jobs) = BACKGROUND_JOBS.lock() {
-        jobs.retain(|(registered, _)| *registered != pid);
-        jobs.push((pid, commands));
-    }
-}
-
-fn remove_background_job(pid: u32) {
-    if let Ok(mut jobs) = BACKGROUND_JOBS.lock() {
-        jobs.retain(|(registered, _)| *registered != pid);
-    }
-}
-
-/// Request ownership of a still-running background PTY. The worker first
-/// retires its detached output pump, then moves the live job through this
-/// one-shot channel. `None` means the child completed or stopped before the
-/// request won the race.
-pub fn take_background_job(pid: u32) -> io::Result<Option<PtyJob>> {
-    let commands = BACKGROUND_JOBS.lock().ok().and_then(|jobs| {
-        jobs.iter()
-            .find(|(registered, _)| *registered == pid)
-            .map(|(_, commands)| commands.clone())
-    });
-    let Some(commands) = commands else {
-        return Ok(None);
-    };
-    let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-    if commands
-        .send(BackgroundCommand::Foreground(reply_tx))
-        .is_err()
-    {
-        return Ok(None);
-    }
-    match reply_rx.recv_timeout(Duration::from_secs(2)) {
-        Ok(job) => Ok(Some(job)),
-        Err(mpsc::RecvTimeoutError::Disconnected) => Ok(None),
-        Err(mpsc::RecvTimeoutError::Timeout) => Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "background PTY ownership transfer timed out",
-        )),
-    }
-}
-
-/// Park a stopped job so the host can later resume it by pid.
-fn park_job(job: PtyJob) {
-    if let Ok(mut jobs) = PARKED_JOBS.lock() {
-        jobs.push_back(job);
-    }
-}
-
-/// Remove and return the parked (stopped) PTY job for `pid`, if any. The host
-/// (REPL) calls this to resume a Ctrl-Z'd foreground command via `fg`/`bg`.
-#[must_use]
-pub fn take_stopped_job(pid: u32) -> Option<PtyJob> {
-    let mut jobs = PARKED_JOBS.lock().ok()?;
-    let idx = jobs.iter().position(|j| j.pid() == pid)?;
-    jobs.remove(idx)
-}
-
-/// Drain every parked job, killing and reaping each (via `PtyJob::drop`). The
-/// host calls this on shutdown so stopped children are not left orphaned when
-/// the shell exits (statics are not dropped at process exit).
-pub fn shutdown_stopped_jobs() {
-    if let Ok(mut jobs) = BACKGROUND_JOBS.lock() {
-        for (_, commands) in jobs.drain(..) {
-            let _ = commands.send(BackgroundCommand::Shutdown);
-        }
-    }
-    if let Ok(mut jobs) = PARKED_JOBS.lock() {
-        jobs.clear();
     }
 }
 
