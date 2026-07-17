@@ -141,14 +141,17 @@ impl EventReceiver {
         let deadline = timeout.map(|d| Instant::now() + d);
         let mut state = self.queue.state.lock().unwrap();
         loop {
+            // Cancellation wins over replay/live backlog. A cancelled `on`
+            // task must not run hundreds of already-queued handlers before it
+            // is allowed to terminate.
+            if cancel.is_some_and(CancelToken::is_cancelled) {
+                return Received::Cancelled;
+            }
             if let Some(item) = state.items.pop_front() {
                 return match item {
                     Delivery::Event(v) => Received::Event(v),
                     Delivery::Overflow(n) => Received::Overflow(n),
                 };
-            }
-            if cancel.is_some_and(CancelToken::is_cancelled) {
-                return Received::Cancelled;
             }
             if state.closed {
                 return Received::Closed;
@@ -173,9 +176,7 @@ impl EventReceiver {
             };
             let (next, timed) = self.queue.ready.wait_timeout(state, wait).unwrap();
             state = next;
-            if timed.timed_out()
-                && deadline.is_some_and(|end| Instant::now() >= end)
-            {
+            if timed.timed_out() && deadline.is_some_and(|end| Instant::now() >= end) {
                 return Received::Timeout;
             }
         }
@@ -638,5 +639,17 @@ mod tests {
             start.elapsed() < Duration::from_millis(250),
             "cancelled receive stayed blocked"
         );
+    }
+
+    #[test]
+    fn cancellation_preempts_a_subscription_backlog() {
+        let bus = EventBus::default();
+        let rx = bus.events("backlog", None);
+        for i in 0..SUBSCRIBER_CAP {
+            bus.emit("backlog", Value::Int(i as i64));
+        }
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        assert!(matches!(rx.recv(None, Some(&cancel)), Received::Cancelled));
     }
 }
