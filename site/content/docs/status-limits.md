@@ -285,12 +285,18 @@ Wire paths preserve raw Unix bytes alongside lossy display strings. Some other v
 
 ## Platform support
 
+Shoal is explicitly Unix-only for now. The kernel/CLI/MCP stack is built directly on Unix-domain
+sockets, POSIX process groups/signals, `/dev/ptmx` PTYs, and (where available) Linux Landlock or
+macOS Seatbelt sandboxing — none of which have a Windows equivalent wired up. Windows support is
+recorded as **out of scope for now**, not silently deferred; CI only builds/tests on Ubuntu and
+macOS (see [Tooling and quality](@/internals/tooling-and-quality.md)).
+
 | Platform | Status |
 | --- | --- |
 | Linux | Primary development target; Unix socket/PTTY, Landlock when kernel supports it. |
 | macOS | First-class intended target; Unix socket/PTTY, Seatbelt filesystem backend, `/tmp` aliases need tests. |
 | Other Unix | May compile partially; enforcement tier D and behavior not promised. |
-| Windows | Unsupported: Unix paths/sockets/PTY/process semantics and enforcement need design/port. |
+| Windows | Out of scope for now: Unix paths/sockets/PTY/process semantics and enforcement need a deliberate design/port that has not been scheduled. |
 
 External tool behavior remains host-specific even on supported OSes. A script that depends on GNU flags may fail against BSD tools. Adapters and Reef can pin/normalize some of this, but scripts should state tool/version requirements.
 

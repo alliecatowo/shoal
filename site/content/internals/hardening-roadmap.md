@@ -155,7 +155,7 @@ Rules for implementers:
   it. *(I12)*
 - [ ] **HR-F6** — Supply-chain advisories checked in CI (`cargo audit` or `cargo deny`) with a
   documented allowlist. *(H9)*
-- [ ] **HR-F7** — Unix-only support stated explicitly in README/docs; Windows recorded as out of
+- [x] **HR-F7** — Unix-only support stated explicitly in README/docs; Windows recorded as out of
   scope for now. *(H8)*
 - [ ] **HR-F8** — Decide and document how CI pays (or stops paying) the wasmtime compile cost
   for the unwired `shoal-wasm` crate: keep, feature-gate, or a separate job. *(H10)*
