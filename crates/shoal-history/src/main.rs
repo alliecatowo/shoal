@@ -105,6 +105,43 @@ fn run(mut args: Vec<String>) -> Result<(), (i32, String)> {
                 serde_json::json!({"dry_run":!apply,"candidates":r.candidates.len(),"deleted":r.deleted.len(),"reclaimed_bytes":r.reclaimed_bytes,"remaining_bytes":r.remaining_bytes})
             )
         }
+        "status" => {
+            let status = journal.storage_status().map_err(op)?;
+            let value = serde_json::json!({
+                "database_bytes": status.database_bytes,
+                "wal_bytes": status.wal_bytes,
+                "shm_bytes": status.shm_bytes,
+                "database_admission_bytes": status.database_admission_bytes(),
+                "database_max_bytes": status.database_max_bytes,
+                "cas_logical_bytes": status.cas_logical_bytes,
+                "cas_physical_bytes": status.cas_physical_bytes,
+                "spill_physical_bytes": status.spill_physical_bytes,
+                "cas_admission_bytes": status.cas_admission_bytes(),
+                "cas_max_bytes": status.cas_max_bytes,
+                "pinned_logical_bytes": status.pinned_logical_bytes,
+            });
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&value).expect("JSON value")
+                );
+            } else {
+                println!(
+                    "database: {} / {} bytes (main {}, WAL {}, SHM {})\nCAS: {} / {} bytes (logical {}, physical {}, spill {}, pinned {})",
+                    status.database_admission_bytes(),
+                    status.database_max_bytes,
+                    status.database_bytes,
+                    status.wal_bytes,
+                    status.shm_bytes,
+                    status.cas_admission_bytes(),
+                    status.cas_max_bytes,
+                    status.cas_logical_bytes,
+                    status.cas_physical_bytes,
+                    status.spill_physical_bytes,
+                    status.pinned_logical_bytes,
+                );
+            }
+        }
         "undo" => {
             let id = parse_id(args.get(1))?;
             let root = args

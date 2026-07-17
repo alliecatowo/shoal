@@ -2,6 +2,9 @@
 
 use std::fs;
 
+use rusqlite::{Transaction, TransactionBehavior};
+
+use crate::storage::DB_WRITE_RESERVE_BYTES;
 use crate::{Journal, hash_string, hex_bytes, io_to_sql, now_ns};
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -28,10 +31,9 @@ impl Journal {
     pub fn pin(&self, hash: &str) -> rusqlite::Result<bool> {
         let raw = hex_bytes(hash)
             .map_err(|_| rusqlite::Error::InvalidParameterName("invalid hash".into()))?;
-        Ok(self
-            .conn
-            .execute("INSERT OR IGNORE INTO pin(hash) VALUES(?1)", [raw])?
-            > 0)
+        self.with_database_admission(DB_WRITE_RESERVE_BYTES, |tx| {
+            Ok(tx.execute("INSERT OR IGNORE INTO pin(hash) VALUES(?1)", [raw])? > 0)
+        })
     }
 
     pub fn unpin(&self, hash: &str) -> rusqlite::Result<bool> {
@@ -50,7 +52,10 @@ impl Journal {
     }
 
     pub fn gc(&self, options: GcOptions) -> rusqlite::Result<GcReport> {
-        let mut stmt=self.conn.prepare("SELECT b.hash,b.stored_len,b.last_access_ns,EXISTS(SELECT 1 FROM output o WHERE o.hash=b.hash),EXISTS(SELECT 1 FROM pin p WHERE p.hash=b.hash) FROM blob b ORDER BY 4 ASC,b.last_access_ns ASC")?;
+        // Serialize candidate selection with pin/unpin and CAS admission so a
+        // blob cannot become pinned after selection but before deletion.
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let mut stmt=tx.prepare("SELECT b.hash,b.stored_len,b.last_access_ns,EXISTS(SELECT 1 FROM output o WHERE o.hash=b.hash),EXISTS(SELECT 1 FROM pin p WHERE p.hash=b.hash) FROM blob b ORDER BY 4 ASC,b.last_access_ns ASC")?;
         let blobs = stmt
             .query_map([], |r| {
                 let len: i64 = r.get(1)?;
@@ -63,16 +68,19 @@ impl Journal {
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        let total = blobs.iter().map(|x| x.1).sum::<u64>();
+        drop(stmt);
+        let total = blobs
+            .iter()
+            .fold(0u64, |total, blob| total.saturating_add(blob.1));
         let cutoff = options
             .ttl
             .map(|ttl| now_ns().saturating_sub(ttl.as_nanos().min(i64::MAX as u128) as i64));
         let mut chosen = Vec::new();
-        let mut chosen_bytes = 0;
+        let mut chosen_bytes = 0u64;
         for (hash, bytes, access, referenced, pinned) in &blobs {
             if !pinned && cutoff.is_some_and(|c| *access <= c) {
                 chosen.push((hash.clone(), *bytes, *referenced));
-                chosen_bytes += bytes;
+                chosen_bytes = chosen_bytes.saturating_add(*bytes);
             }
         }
         if let Some(budget) = options.max_bytes {
@@ -82,7 +90,7 @@ impl Journal {
                 }
                 if !pinned && !chosen.iter().any(|x| x.0 == *hash) {
                     chosen.push((hash.clone(), *bytes, *referenced));
-                    chosen_bytes += bytes;
+                    chosen_bytes = chosen_bytes.saturating_add(*bytes);
                 }
             }
         }
@@ -97,22 +105,42 @@ impl Journal {
             })
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let mut deleted = Vec::new();
+        let mut tombs = Vec::new();
         if !options.dry_run {
-            for blob in &candidates {
-                let path = self.blob_path(&blob.hash);
-                if path.exists() {
-                    let tomb = path.with_extension(format!("gc-{}", std::process::id()));
-                    fs::rename(&path, &tomb).map_err(io_to_sql)?;
-                    if let Err(e) = fs::remove_file(&tomb) {
-                        let _ = fs::rename(&tomb, &path);
-                        return Err(io_to_sql(e));
+            let mutation = (|| {
+                for (index, blob) in candidates.iter().enumerate() {
+                    let path = self.blob_path(&blob.hash);
+                    if path.exists() {
+                        let tomb =
+                            path.with_extension(format!("gc-{}-{index}", std::process::id()));
+                        fs::rename(&path, &tomb).map_err(io_to_sql)?;
+                        tombs.push((path, tomb));
                     }
+                    let raw = hex_bytes(&blob.hash).map_err(|_| {
+                        rusqlite::Error::InvalidParameterName("invalid database hash".into())
+                    })?;
+                    tx.execute("DELETE FROM blob WHERE hash=?1", [raw])?;
+                    deleted.push(blob.clone());
                 }
-                let raw = hex_bytes(&blob.hash).map_err(|_| {
-                    rusqlite::Error::InvalidParameterName("invalid database hash".into())
-                })?;
-                self.conn.execute("DELETE FROM blob WHERE hash=?1", [raw])?;
-                deleted.push(blob.clone());
+                Ok::<(), rusqlite::Error>(())
+            })();
+            if let Err(error) = mutation {
+                drop(tx);
+                restore_tombs(&tombs);
+                return Err(error);
+            }
+        }
+        if let Err(error) = tx.commit() {
+            restore_tombs(&tombs);
+            return Err(error);
+        }
+        for (path, tomb) in tombs {
+            if let Err(error) = fs::remove_file(&tomb) {
+                // The metadata deletion committed, so restoring the verified
+                // content-addressed path is safer than losing the bytes. It is
+                // now an orphan and remains visible to physical CAS admission.
+                let _ = fs::rename(&tomb, &path);
+                return Err(io_to_sql(error));
             }
         }
         Ok(GcReport {
@@ -121,5 +149,11 @@ impl Journal {
             remaining_bytes: total.saturating_sub(chosen_bytes),
             deleted,
         })
+    }
+}
+
+fn restore_tombs(tombs: &[(std::path::PathBuf, std::path::PathBuf)]) {
+    for (path, tomb) in tombs.iter().rev() {
+        let _ = fs::rename(tomb, path);
     }
 }

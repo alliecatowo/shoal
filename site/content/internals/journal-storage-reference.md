@@ -7,7 +7,7 @@ template = "docs/page.html"
 [extra]
 group = "Storage & tooling"
 eyebrow = "Persistence atlas"
-status = "Source-audited: 2026-07-16"
+status = "Source-audited: 2026-07-17"
 audience = "Journal, evaluator, kernel, history, and migration maintainers"
 wide = true
 +++
@@ -46,6 +46,45 @@ mutex or open independent connections.
 
 `Journal::in_memory` uses an in-memory SQLite database and a temporary on-disk CAS directory whose
 lifetime is held by the journal. It does not enable WAL because there is no database file.
+
+## Storage admission and exhaustion policy
+
+Durable history is bounded by two independent admissions:
+
+| Domain | Default | Hard maximum | Environment override |
+|---|---:|---:|---|
+| SQLite main database plus current WAL | 1 GiB | 64 GiB | `SHOAL_JOURNAL_DATABASE_MAX_BYTES` |
+| CAS logical uncompressed content | 4 GiB | 64 GiB | `SHOAL_JOURNAL_CAS_MAX_BYTES` |
+
+Invalid/zero environment values use the default; values above the hard maximum clamp. Embedders can
+set the same fields through `JournalOptions`. Different processes can choose different soft limits,
+but no cooperating handle can configure above the compiled hard maxima.
+
+Before an `entry` begin insert, Shoal takes an SQLite `IMMEDIATE` transaction, measures the main DB
+and WAL files, and admits the bounded row payload plus 64 KiB of write overhead and a further 64 KiB
+completion reserve. Failure returns a typed `StorageAdmissionError`. The evaluator maps that to
+`journal_begin_failed` and executes no statement effects; the kernel's mandatory coarse audit append
+also fails closed. Later output, undo, pin, and transcript writes repeat the serialized check. Finish
+is allowed to spend the completion headroom; if SQLite or the filesystem nevertheless refuses it,
+the caller reports an indeterminate completion rather than a clean success.
+
+CAS insertion performs its logical-budget check inside the same serialized writer transaction. A
+known hash costs no new logical bytes. A new hash is admitted against the greater of tracked
+uncompressed bytes and the CAS+spill physical size reconciled when that handle opened, which makes
+restart-visible orphan files at least partly visible without imposing an O(number-of-blobs) tree walk
+on every command. Pins count and are never evicted automatically. Explicit `shoal-history gc
+--apply` can reclaim only unpinned CAS content; it never deletes `entry`, `undo`, or transcript audit
+rows. The status command performs a fresh physical walk.
+
+SQLite is additionally configured with `max_page_count`, a 128-page WAL autocheckpoint, and a bounded
+`journal_size_limit`. These are defense in depth. They are not a perfect filesystem quota: an active
+reader can delay WAL recycling, compression needs temporary headroom, filesystem metadata consumes
+space, and another program can write into the state directory. Every write still handles
+`SQLITE_FULL`/I/O errors honestly.
+
+Operators can inspect the reconciled counters with `shoal-history status [--json]`; `shoal doctor`
+reports current utilization and the two environment controls. Approaching 90% is a warning and
+exhaustion is a failure.
 
 ```mermaid
 flowchart LR
@@ -221,7 +260,7 @@ from value-output bytes because it contains the live summary/ref shape used by a
 `finish` updates status/ok/duration and errors when no row changed.
 
 
-The lifecycle is **not one SQLite transaction**. Append, finish, each output, each undo, and transcript
+The lifecycle is **not one execution-wide SQLite transaction**. Append, finish, each output, each undo, and transcript
 event are separate statements. This is deliberate enough to make crash evidence visible, but it
 means partial combinations are valid storage states:
 
@@ -280,10 +319,10 @@ On normal output insertion:
 
 1. truncate if above the hard cap;
 2. hash stored bytes;
-3. if path appears absent, zstd-compress into a temp file in the target directory;
-4. atomically persist/rename to the final content path;
-5. `INSERT OR IGNORE` the blob metadata;
-6. insert the output link.
+3. take serialized DB/CAS admission;
+4. if the content is new or its file is absent, zstd-compress into a temp file in the target directory;
+5. atomically persist/rename to the final content path;
+6. insert blob metadata and the output link in the admitting SQLite transaction.
 
 The default hard cap is 256 MiB, much larger than kernel/MCP wire caps. Truncation preserves a prefix
 plus `\n[shoal: output truncated; see journal metadata]\n`, shortened if the configured cap is smaller
@@ -310,11 +349,9 @@ through `Cas`.
 
 ### Concurrency edges
 
-The temp-file-plus-persist sequence protects readers from partial bytes. There is still a duplicate
-writer race: two processes can both observe `!path.exists()` and attempt to persist the same hash;
-depending on tempfile persist semantics, the loser can receive an already-exists error even though
-the desired content now exists. The hash makes accepting a verified winner safe, but that recovery is
-not explicit in `record_output_meta` or `ingest_spill` today.
+The temp-file-plus-persist sequence protects readers from partial bytes. Cooperating writers serialize
+admission and deduplication with `BEGIN IMMEDIATE`, so they cannot both spend the same remaining CAS
+budget. A non-Shoal writer can still race the path; integrity reads remain the final authority.
 
 CAS file creation and SQLite blob/output insertion are not one atomic filesystem/database operation.
 Orphan files are acceptable GC candidates; orphan DB rows or missing files surface as a read miss.
@@ -325,9 +362,9 @@ Large captured stdout can land in `<state>/spill` before journal adoption. `inge
 precomputed hash and length from `shoal-exec`, streams zstd compression to a temp file, inserts blob
 metadata, optionally pins the hash, and best-effort deletes the spill file.
 
-The method trusts the supplied hash/length while ingesting; a later CAS read verifies content against
-the hash, but ingestion does not re-hash the source itself. The producer contract with
-`CaptureSpill` is therefore load-bearing.
+Ingestion checks the opened source file's type and length, hashes it before admission, and hashes the
+exact bytes again while compressing. A mismatch leaves the source under its RAII owner and commits no
+blob or pin. This closes the former path-swap/corruption gap between executor metadata and CAS naming.
 
 `Journal::cas()` returns a cloneable path-only reader used by lazy `CasBytes` values. This keeps
 SQLite out of value objects and allows thread-safe reads. It also means:

@@ -49,6 +49,7 @@ mod cas;
 mod gc;
 mod query;
 mod schema;
+mod storage;
 #[cfg(test)]
 mod tests;
 mod transcript;
@@ -58,6 +59,11 @@ pub use cas::{Cas, JournalOptions, OutputMeta, OutputRow};
 pub use gc::{GcBlob, GcOptions, GcReport};
 pub use query::{DurableEventSeed, EntryRow, JournalQuery};
 pub use schema::EntryRecord;
+pub use storage::{
+    DEFAULT_JOURNAL_CAS_MAX_BYTES, DEFAULT_JOURNAL_DATABASE_MAX_BYTES, JournalStorageLimits,
+    JournalStorageStatus, MAX_JOURNAL_CAS_MAX_BYTES, MAX_JOURNAL_DATABASE_MAX_BYTES,
+    StorageAdmissionError, StorageDomain,
+};
 pub use transcript::TranscriptEventRow;
 pub use undo::{FileFingerprint, UndoError, UndoInverse, UndoIo, UndoReport, UndoStatus, UndoStep};
 
@@ -71,6 +77,10 @@ pub struct Journal {
     /// Keeps the CAS temp dir alive for the lifetime of an in-memory journal.
     _cas_tempdir: Option<tempfile::TempDir>,
     output_hard_cap: usize,
+    storage_limits: JournalStorageLimits,
+    /// CAS+spill bytes observed when this handle opened. This makes crash
+    /// orphans admission-visible without an O(number-of-blobs) walk per write.
+    reconciled_cas_physical_bytes: u64,
     blob_page_cache: RefCell<BlobPageCache>,
 }
 
@@ -154,6 +164,7 @@ impl Journal {
                 conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))?;
                 conn.pragma_update(None, "synchronous", "NORMAL")?;
                 Self::migrate(&conn)?;
+                Self::configure_storage_pragmas(&conn, options.storage_limits())?;
                 Ok(conn)
             })();
             match attempt {
@@ -172,11 +183,14 @@ impl Journal {
                 Err(error) => return Err(error),
             }
         };
+        let reconciled_cas_physical_bytes = storage::reconciled_physical_bytes(&cas_root)?;
         Ok(Journal {
             conn,
             cas_root,
             _cas_tempdir: None,
             output_hard_cap: options.output_hard_cap,
+            storage_limits: options.storage_limits(),
+            reconciled_cas_physical_bytes,
             blob_page_cache: RefCell::default(),
         })
     }
@@ -194,11 +208,15 @@ impl Journal {
         let conn = Connection::open_in_memory()?;
         conn.busy_timeout(options.busy_timeout)?;
         Self::migrate(&conn)?;
+        Self::configure_storage_pragmas(&conn, options.storage_limits())?;
+        let reconciled_cas_physical_bytes = storage::reconciled_physical_bytes(&cas_root)?;
         Ok(Journal {
             conn,
             cas_root,
             _cas_tempdir: Some(tempdir),
             output_hard_cap: options.output_hard_cap,
+            storage_limits: options.storage_limits(),
+            reconciled_cas_physical_bytes,
             blob_page_cache: RefCell::default(),
         })
     }

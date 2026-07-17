@@ -25,6 +25,7 @@
 use rusqlite::{ToSql, params};
 use std::collections::HashMap;
 
+use crate::storage::DB_WRITE_RESERVE_BYTES;
 use crate::{DurableEventSeed, Journal};
 
 fn sql_i64_from_usize(value: usize) -> rusqlite::Result<i64> {
@@ -138,11 +139,14 @@ impl Journal {
         ts_ns: i64,
         payload_json: &str,
     ) -> rusqlite::Result<()> {
-        self.conn.execute(
-            "INSERT INTO transcript_event (entry_id, ts, payload) VALUES (?1, ?2, ?3)",
-            params![entry_id, ts_ns, payload_json],
-        )?;
-        Ok(())
+        let requested = DB_WRITE_RESERVE_BYTES.saturating_add(payload_json.len() as u64);
+        self.with_database_admission(requested, |tx| {
+            tx.execute(
+                "INSERT INTO transcript_event (entry_id, ts, payload) VALUES (?1, ?2, ?3)",
+                params![entry_id, ts_ns, payload_json],
+            )?;
+            Ok(())
+        })
     }
 
     /// Fetch persisted transcript-event rows for the given entry ids, in the

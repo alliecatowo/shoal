@@ -3679,14 +3679,17 @@ fn journal_channel_replay_excludes_evaluator_per_statement_entries() {
     // Sanity: the store itself holds far more rows than the channel
     // published (the evaluator's per-statement entries), so a naive
     // "reconstruct every journal row" would over-produce.
-    let jq = call(
-        &mut client,
-        &mut reader,
-        9000,
-        "journal.query",
-        json!({"limit": 1_000_000}),
-    );
-    let rows = jq.result.unwrap().as_array().unwrap().len();
+    // Count through the store API. Asking the wire for every detailed row is
+    // intentionally rejected by the frame's aggregate JSON-node bound; this
+    // setup assertion is about durable row multiplicity, not pagination.
+    let rows = Journal::open(dir.path())
+        .unwrap()
+        .query(&JournalQuery {
+            limit: usize::MAX,
+            ..Default::default()
+        })
+        .unwrap()
+        .len();
     assert!(
         rows >= execs * 3,
         "on-disk store should also hold the finer per-statement entries: {rows} rows for \

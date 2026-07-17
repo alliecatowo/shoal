@@ -144,9 +144,57 @@ pub fn run(o: &Options) -> Report {
     probe_adapters(o, &mut c);
     probe_tools(&mut c);
     probe_journal(o, &mut c);
+    probe_journal_storage(o, &mut c);
     probe_effective_config(o, &mut c);
     probe_configs(o, &mut c);
     Report { checks: c }
+}
+
+fn probe_journal_storage(o: &Options, out: &mut Vec<Check>) {
+    let database = o.state_dir.join("journal.db");
+    let result = if database.exists() {
+        shoal_journal::Journal::open(&o.state_dir)
+            .and_then(|journal| journal.storage_status())
+            .map(Some)
+    } else {
+        Ok(None)
+    };
+    let (level, detail) = match result {
+        Ok(Some(status)) => {
+            let database_used = status.database_admission_bytes();
+            let cas_used = status.cas_admission_bytes();
+            let exhausted = database_used >= status.database_max_bytes
+                || cas_used >= status.cas_max_bytes;
+            let nearing = database_used.saturating_mul(10)
+                >= status.database_max_bytes.saturating_mul(9)
+                || cas_used.saturating_mul(10) >= status.cas_max_bytes.saturating_mul(9);
+            (
+                if exhausted {
+                    Level::Fail
+                } else if nearing {
+                    Level::Warn
+                } else {
+                    Level::Ok
+                },
+                format!(
+                    "database {database_used}/{} bytes; CAS {cas_used}/{} bytes ({} pinned); configure SHOAL_JOURNAL_DATABASE_MAX_BYTES and SHOAL_JOURNAL_CAS_MAX_BYTES",
+                    status.database_max_bytes,
+                    status.cas_max_bytes,
+                    status.pinned_logical_bytes,
+                ),
+            )
+        }
+        Ok(None) => (
+            Level::Ok,
+            "no durable journal yet; storage limits come from SHOAL_JOURNAL_DATABASE_MAX_BYTES and SHOAL_JOURNAL_CAS_MAX_BYTES".into(),
+        ),
+        Err(error) => (Level::Fail, error.to_string()),
+    };
+    out.push(Check {
+        name: "journal storage".into(),
+        level,
+        detail,
+    });
 }
 
 fn probe_pty(out: &mut Vec<Check>) {

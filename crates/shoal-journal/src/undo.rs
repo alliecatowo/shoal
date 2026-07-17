@@ -11,6 +11,7 @@ use rusqlite::params;
 use serde::{Deserialize, Serialize};
 
 use crate::Journal;
+use crate::storage::DB_WRITE_RESERVE_BYTES;
 
 /// Narrow filesystem boundary used by undo recording and replay. The
 /// evaluator adapts its injected filesystem port to this trait; the ordinary
@@ -170,11 +171,16 @@ impl Journal {
     /// Record an undo inverse for entry `id`. `op` names the inverse operation
     /// (`"trash"`, `"restore_bytes"`, …); `inverse_json` is its JSON payload.
     pub fn record_undo(&self, id: i64, op: &str, inverse_json: &str) -> rusqlite::Result<()> {
-        self.conn.execute(
-            "INSERT INTO undo (entry_id, op, inverse) VALUES (?1, ?2, ?3)",
-            params![id, op, inverse_json],
-        )?;
-        Ok(())
+        let requested = DB_WRITE_RESERVE_BYTES
+            .saturating_add(op.len() as u64)
+            .saturating_add(inverse_json.len() as u64);
+        self.with_database_admission(requested, |tx| {
+            tx.execute(
+                "INSERT INTO undo (entry_id, op, inverse) VALUES (?1, ?2, ?3)",
+                params![id, op, inverse_json],
+            )?;
+            Ok(())
+        })
     }
 
     pub fn record_undo_inverse(&self, id: i64, inverse: &UndoInverse) -> rusqlite::Result<()> {

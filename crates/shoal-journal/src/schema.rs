@@ -21,6 +21,7 @@ use std::io;
 
 use rusqlite::{Connection, params};
 
+use crate::storage::DB_WRITE_RESERVE_BYTES;
 use crate::{Journal, io_to_sql};
 
 /// The schema version this build of `shoal-journal` understands, stamped into
@@ -175,22 +176,25 @@ impl Journal {
     /// Record an entry at execution start. Status, success verdict, and duration
     /// are `NULL` until [`Journal::finish`]. Returns the new entry id.
     pub fn append(&self, e: &EntryRecord) -> rusqlite::Result<i64> {
-        self.conn.execute(
-            "INSERT INTO entry (session, principal, ts, dur_ns, cwd, env_hash, src, ast, effects,
-                                status, ok, opaque)
-             VALUES (?1, ?2, ?3, NULL, ?4, NULL, ?5, ?6, ?7, NULL, NULL, ?8)",
-            params![
-                e.session,
-                e.principal,
-                e.ts_ns,
-                e.cwd,
-                e.src,
-                e.ast_json,
-                e.effects_json,
-                e.opaque
-            ],
-        )?;
-        Ok(self.conn.last_insert_rowid())
+        let requested = entry_payload_bytes(e).saturating_add(DB_WRITE_RESERVE_BYTES);
+        self.with_database_admission(requested, |tx| {
+            tx.execute(
+                "INSERT INTO entry (session, principal, ts, dur_ns, cwd, env_hash, src, ast, effects,
+                                    status, ok, opaque)
+                 VALUES (?1, ?2, ?3, NULL, ?4, NULL, ?5, ?6, ?7, NULL, NULL, ?8)",
+                params![
+                    e.session,
+                    e.principal,
+                    e.ts_ns,
+                    e.cwd,
+                    e.src,
+                    e.ast_json,
+                    e.effects_json,
+                    e.opaque
+                ],
+            )?;
+            Ok(tx.last_insert_rowid())
+        })
     }
 
     /// Record an entry whose outcome is already known in one atomic statement.
@@ -205,25 +209,28 @@ impl Journal {
         ok: bool,
         dur_ns: i64,
     ) -> rusqlite::Result<i64> {
-        self.conn.execute(
-            "INSERT INTO entry (session, principal, ts, dur_ns, cwd, env_hash, src, ast, effects,
-                                status, ok, opaque)
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![
-                e.session,
-                e.principal,
-                e.ts_ns,
-                dur_ns,
-                e.cwd,
-                e.src,
-                e.ast_json,
-                e.effects_json,
-                status,
-                ok,
-                e.opaque
-            ],
-        )?;
-        Ok(self.conn.last_insert_rowid())
+        let requested = entry_payload_bytes(e).saturating_add(DB_WRITE_RESERVE_BYTES);
+        self.with_database_admission(requested, |tx| {
+            tx.execute(
+                "INSERT INTO entry (session, principal, ts, dur_ns, cwd, env_hash, src, ast, effects,
+                                    status, ok, opaque)
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    e.session,
+                    e.principal,
+                    e.ts_ns,
+                    dur_ns,
+                    e.cwd,
+                    e.src,
+                    e.ast_json,
+                    e.effects_json,
+                    status,
+                    ok,
+                    e.opaque
+                ],
+            )?;
+            Ok(tx.last_insert_rowid())
+        })
     }
 
     /// Fill in the completion columns of a previously appended entry.
@@ -246,4 +253,17 @@ impl Journal {
         }
         Ok(())
     }
+}
+
+fn entry_payload_bytes(entry: &EntryRecord) -> u64 {
+    [
+        entry.session.len(),
+        entry.principal.len(),
+        entry.cwd.len(),
+        entry.src.len(),
+        entry.ast_json.len(),
+        entry.effects_json.len(),
+    ]
+    .into_iter()
+    .fold(0u64, |total, bytes| total.saturating_add(bytes as u64))
 }

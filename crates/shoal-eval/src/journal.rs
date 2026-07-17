@@ -1251,6 +1251,68 @@ mod tests {
     }
 
     #[test]
+    fn exhausted_journal_budget_refuses_before_filesystem_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let journal = Journal::open_with_options(
+            &state,
+            JournalOptions {
+                database_max_bytes: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let target = dir.path().join("must-not-exist-budget");
+        let mut evaluator = Evaluator::new(dir.path().to_path_buf());
+        evaluator.set_journal(journal, "session", "human");
+        let error = run_journaled(
+            &mut evaluator,
+            &format!("save(\"{}\", \"payload\")", target.display()),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "journal_begin_failed");
+        assert!(!target.exists(), "begin refusal must precede the effect");
+        assert!(
+            evaluator
+                .session
+                .journal
+                .as_ref()
+                .unwrap()
+                .query(&JournalQuery::default())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn exhausted_cas_budget_marks_post_effect_completion_indeterminate() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut evaluator = Evaluator::new(dir.path().to_path_buf());
+        evaluator.set_journal(
+            Journal::in_memory_with_options(JournalOptions {
+                cas_max_bytes: 1,
+                ..Default::default()
+            })
+            .unwrap(),
+            "session",
+            "human",
+        );
+        let error = run_journaled(&mut evaluator, "echo output").unwrap_err();
+        assert_eq!(error.code, "journal_commit_indeterminate");
+        assert!(error.msg.contains("output"), "{}", error.msg);
+        let rows = evaluator
+            .session
+            .journal
+            .as_ref()
+            .unwrap()
+            .query(&JournalQuery::default())
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].ok, Some(false));
+        assert!(rows[0].outputs.is_empty());
+    }
+
+    #[test]
     fn finish_failure_reports_that_effects_may_have_occurred() {
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path().join("state");
