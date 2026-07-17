@@ -147,6 +147,9 @@ pub mod error_code {
     /// kernel has no `TokenStore` configured at all (an ephemeral kernel),
     /// or the given token is missing/expired/revoked.
     pub const AUTH_FAILED: i32 = -32030;
+    /// A configured kernel resource quota was reached. The error data names
+    /// the specific connection/task/PTY/subscription limit.
+    pub const QUOTA_EXCEEDED: i32 = -32040;
 }
 
 impl Response {
@@ -739,5 +742,6 @@ mod tests {
         assert_eq!(UNKNOWN_PTY, -32022);
         assert_eq!(PTY_SPAWN_FAILED, -32023);
         assert_eq!(AUTH_FAILED, -32030);
+        assert_eq!(QUOTA_EXCEEDED, -32040);
     }
 }

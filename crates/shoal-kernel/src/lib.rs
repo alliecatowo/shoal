@@ -32,13 +32,18 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub struct Kernel {
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     next_client: AtomicU64,
+    active_connections: AtomicUsize,
+    max_connections: AtomicUsize,
+    max_tasks_per_session: AtomicUsize,
+    max_ptys_per_session: AtomicUsize,
+    max_subscriptions_per_session: AtomicUsize,
     journal: Mutex<Journal>,
     /// The per-user state dir this kernel's own `journal` (above) was opened
     /// against, if any (`None` for the ephemeral in-memory kernels used by
@@ -75,6 +80,25 @@ pub struct Kernel {
     allow_self_ack: AtomicBool,
     #[cfg(test)]
     fail_approval_audit: AtomicBool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    pub max_connections: usize,
+    pub max_tasks_per_session: usize,
+    pub max_ptys_per_session: usize,
+    pub max_subscriptions_per_session: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_connections: 64,
+            max_tasks_per_session: 128,
+            max_ptys_per_session: 32,
+            max_subscriptions_per_session: 256,
+        }
+    }
 }
 
 /// Wire version of the AST node-kind vocabulary (site/content/internals/language-conformance-contract.md, site/content/internals/values-streams-execution.md). Bumped
@@ -192,9 +216,15 @@ struct ApprovalRecord {
 
 impl Kernel {
     pub fn new() -> Arc<Self> {
+        let limits = Limits::default();
         Arc::new(Self {
             sessions: Mutex::new(HashMap::new()),
             next_client: AtomicU64::new(1),
+            active_connections: AtomicUsize::new(0),
+            max_connections: AtomicUsize::new(limits.max_connections),
+            max_tasks_per_session: AtomicUsize::new(limits.max_tasks_per_session),
+            max_ptys_per_session: AtomicUsize::new(limits.max_ptys_per_session),
+            max_subscriptions_per_session: AtomicUsize::new(limits.max_subscriptions_per_session),
             journal: Mutex::new(Journal::in_memory().expect("in-memory journal")),
             state_dir: None,
             policy: permissive_policy(),
@@ -216,6 +246,7 @@ impl Kernel {
         let state_dir = state_dir.as_ref();
         let journal = Journal::open(state_dir)?;
         let events = EventBus::default();
+        let limits = Limits::default();
         // Reopening an EXISTING on-disk store must resume its
         // `journal`/`session.transcript` seq state, not restart both at 0 —
         // see `EventBus::seed_from_journal` for why (a reconnecting agent's
@@ -227,6 +258,11 @@ impl Kernel {
         Ok(Arc::new(Self {
             sessions: Mutex::new(HashMap::new()),
             next_client: AtomicU64::new(1),
+            active_connections: AtomicUsize::new(0),
+            max_connections: AtomicUsize::new(limits.max_connections),
+            max_tasks_per_session: AtomicUsize::new(limits.max_tasks_per_session),
+            max_ptys_per_session: AtomicUsize::new(limits.max_ptys_per_session),
+            max_subscriptions_per_session: AtomicUsize::new(limits.max_subscriptions_per_session),
             journal: Mutex::new(journal),
             state_dir: Some(state_dir.to_path_buf()),
             policy: permissive_policy(),
@@ -251,11 +287,17 @@ impl Kernel {
         let state_dir = state_dir.as_ref();
         let journal = Journal::open(state_dir)?;
         let events = EventBus::default();
+        let limits = Limits::default();
         // Same restart-seq-continuity fix as `Kernel::open` above.
         events.seed_from_journal(&journal);
         Ok(Arc::new(Self {
             sessions: Mutex::new(HashMap::new()),
             next_client: AtomicU64::new(1),
+            active_connections: AtomicUsize::new(0),
+            max_connections: AtomicUsize::new(limits.max_connections),
+            max_tasks_per_session: AtomicUsize::new(limits.max_tasks_per_session),
+            max_ptys_per_session: AtomicUsize::new(limits.max_ptys_per_session),
+            max_subscriptions_per_session: AtomicUsize::new(limits.max_subscriptions_per_session),
             journal: Mutex::new(journal),
             state_dir: Some(state_dir.to_path_buf()),
             policy,
@@ -274,9 +316,15 @@ impl Kernel {
     }
 
     pub fn with_policy(policy: Policy) -> Arc<Self> {
+        let limits = Limits::default();
         Arc::new(Self {
             sessions: Mutex::new(HashMap::new()),
             next_client: AtomicU64::new(1),
+            active_connections: AtomicUsize::new(0),
+            max_connections: AtomicUsize::new(limits.max_connections),
+            max_tasks_per_session: AtomicUsize::new(limits.max_tasks_per_session),
+            max_ptys_per_session: AtomicUsize::new(limits.max_ptys_per_session),
+            max_subscriptions_per_session: AtomicUsize::new(limits.max_subscriptions_per_session),
             journal: Mutex::new(Journal::in_memory().expect("in-memory journal")),
             state_dir: None,
             policy,
@@ -292,6 +340,27 @@ impl Kernel {
             #[cfg(test)]
             fail_approval_audit: AtomicBool::new(false),
         })
+    }
+
+    pub fn configure_limits(&self, limits: Limits) {
+        self.max_connections
+            .store(limits.max_connections, Ordering::Relaxed);
+        self.max_tasks_per_session
+            .store(limits.max_tasks_per_session, Ordering::Relaxed);
+        self.max_ptys_per_session
+            .store(limits.max_ptys_per_session, Ordering::Relaxed);
+        self.max_subscriptions_per_session
+            .store(limits.max_subscriptions_per_session, Ordering::Relaxed);
+    }
+
+    fn reserve_connection_slot(self: &Arc<Self>) -> Result<ConnectionSlot, ()> {
+        let max = self.max_connections.load(Ordering::Relaxed);
+        self.active_connections
+            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |current| {
+                (current < max).then_some(current + 1)
+            })
+            .map(|_| ConnectionSlot(self.clone()))
+            .map_err(|_| ())
     }
 
     pub fn serve(self: Arc<Self>, path: impl AsRef<Path>) -> io::Result<()> {
@@ -325,9 +394,20 @@ impl Kernel {
                     // on every platform, instead of racing the client's next
                     // write and getting a transient `WouldBlock` misread as EOF.
                     stream.set_nonblocking(false)?;
-                    std::thread::spawn(move || {
-                        let _ = kernel.handle_stream(stream);
-                    });
+                    let slot = match kernel.reserve_connection_slot() {
+                        Ok(slot) => slot,
+                        Err(()) => {
+                            let max = kernel.max_connections.load(Ordering::Relaxed);
+                            let _ = reject_connection_over_quota(stream, max);
+                            continue;
+                        }
+                    };
+                    std::thread::Builder::new()
+                        .name("shoal-kernel-connection".into())
+                        .spawn(move || {
+                            let _slot = slot;
+                            let _ = kernel.handle_stream(stream);
+                        })?;
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     std::thread::sleep(std::time::Duration::from_millis(25))
@@ -494,6 +574,28 @@ impl Drop for BoundSocket {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
     }
+}
+
+struct ConnectionSlot(Arc<Kernel>);
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        let previous = self.0.active_connections.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "connection slot underflow");
+    }
+}
+
+fn reject_connection_over_quota(mut stream: UnixStream, max_connections: usize) -> io::Result<()> {
+    stream.set_write_timeout(Some(std::time::Duration::from_millis(100)))?;
+    write_frame(
+        &mut stream,
+        &Response::err(
+            Json::Null,
+            QUOTA_EXCEEDED,
+            format!("kernel connection limit ({max_connections}) reached"),
+            Some(json!({"limit":"connections", "max":max_connections})),
+        ),
+    )
 }
 
 fn decode<T: serde::de::DeserializeOwned>(value: Json) -> Result<T, RpcError> {
@@ -922,6 +1024,33 @@ mod tests {
             assert!(!parse_env_bool(Some(OsStr::new(disabled))), "{disabled}");
         }
         assert!(!parse_env_bool(None));
+    }
+
+    #[test]
+    fn connection_quota_reservation_is_atomic_and_released_on_drop() {
+        let kernel = Kernel::new();
+        kernel.configure_limits(Limits {
+            max_connections: 1,
+            ..Limits::default()
+        });
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let reserve = |kernel: Arc<Kernel>, barrier: Arc<std::sync::Barrier>| {
+            std::thread::spawn(move || {
+                barrier.wait();
+                kernel.reserve_connection_slot()
+            })
+        };
+        let first = reserve(kernel.clone(), barrier.clone());
+        let second = reserve(kernel.clone(), barrier.clone());
+        barrier.wait();
+        let reservations = [first.join().unwrap(), second.join().unwrap()];
+        assert_eq!(
+            reservations.iter().filter(|result| result.is_ok()).count(),
+            1
+        );
+        assert_eq!(kernel.active_connections.load(Ordering::SeqCst), 1);
+        drop(reservations);
+        assert_eq!(kernel.active_connections.load(Ordering::SeqCst), 0);
     }
 
     fn call(

@@ -1,4 +1,4 @@
-use shoal_kernel::Kernel;
+use shoal_kernel::{Kernel, Limits};
 use shoal_leash::Policy;
 use std::fs;
 use std::io;
@@ -17,6 +17,7 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse(std::env::args_os().skip(1))?;
+    let limits = args.resolved_limits();
     let socket = args.socket.unwrap_or_else(|| runtime_socket(&args.session));
     prepare_socket(&socket)?;
     let state = args.state_dir.unwrap_or_else(state_dir);
@@ -25,6 +26,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         Kernel::open(&state)?
     };
+    kernel.configure_limits(limits);
     let stop = Arc::new(AtomicBool::new(false));
     let signal = stop.clone();
     ctrlc::set_handler(move || signal.store(true, Ordering::SeqCst))?;
@@ -123,11 +125,16 @@ fn state_dir() -> PathBuf {
         .join("shoal")
 }
 
+#[derive(Debug)]
 struct Args {
     session: String,
     socket: Option<PathBuf>,
     state_dir: Option<PathBuf>,
     policy: Option<PathBuf>,
+    max_connections: Option<usize>,
+    max_tasks_per_session: Option<usize>,
+    max_ptys_per_session: Option<usize>,
+    max_subscriptions_per_session: Option<usize>,
 }
 impl Args {
     fn parse(mut it: impl Iterator<Item = std::ffi::OsString>) -> Result<Self, String> {
@@ -136,6 +143,18 @@ impl Args {
             socket: None,
             state_dir: None,
             policy: None,
+            max_connections: None,
+            max_tasks_per_session: None,
+            max_ptys_per_session: None,
+            max_subscriptions_per_session: None,
+        };
+        let parse_usize = |key: &std::ffi::OsString,
+                           value: std::ffi::OsString|
+         -> Result<usize, String> {
+            value
+                .to_str()
+                .and_then(|text| text.parse().ok())
+                .ok_or_else(|| format!("{} requires a non-negative integer", key.to_string_lossy()))
         };
         while let Some(k) = it.next() {
             let missing = || format!("{} requires a value", k.to_string_lossy());
@@ -144,11 +163,42 @@ impl Args {
                 Some("--socket") => a.socket = Some(it.next().ok_or_else(&missing)?.into()),
                 Some("--state-dir") => a.state_dir = Some(it.next().ok_or_else(&missing)?.into()),
                 Some("--policy") => a.policy = Some(it.next().ok_or_else(&missing)?.into()),
-                Some("-h" | "--help") => return Err("usage: shoal-kernel [--session NAME] [--socket PATH] [--state-dir PATH] [--policy FILE]".into()),
+                Some("--max-connections") => {
+                    a.max_connections = Some(parse_usize(&k, it.next().ok_or_else(&missing)?)?)
+                }
+                Some("--max-tasks-per-session") => {
+                    a.max_tasks_per_session =
+                        Some(parse_usize(&k, it.next().ok_or_else(&missing)?)?)
+                }
+                Some("--max-ptys-per-session") => {
+                    a.max_ptys_per_session =
+                        Some(parse_usize(&k, it.next().ok_or_else(&missing)?)?)
+                }
+                Some("--max-subscriptions-per-session") => {
+                    a.max_subscriptions_per_session =
+                        Some(parse_usize(&k, it.next().ok_or_else(&missing)?)?)
+                }
+                Some("-h" | "--help") => return Err("usage: shoal-kernel [--session NAME] [--socket PATH] [--state-dir PATH] [--policy FILE] [--max-connections N] [--max-tasks-per-session N] [--max-ptys-per-session N] [--max-subscriptions-per-session N]".into()),
                 _ => return Err(format!("unknown argument {}", k.to_string_lossy())),
             }
         }
         Ok(a)
+    }
+
+    fn resolved_limits(&self) -> Limits {
+        let defaults = Limits::default();
+        Limits {
+            max_connections: self.max_connections.unwrap_or(defaults.max_connections),
+            max_tasks_per_session: self
+                .max_tasks_per_session
+                .unwrap_or(defaults.max_tasks_per_session),
+            max_ptys_per_session: self
+                .max_ptys_per_session
+                .unwrap_or(defaults.max_ptys_per_session),
+            max_subscriptions_per_session: self
+                .max_subscriptions_per_session
+                .unwrap_or(defaults.max_subscriptions_per_session),
+        }
     }
 }
 
@@ -158,6 +208,33 @@ mod tests {
 
     fn we_are_root() -> bool {
         unsafe { geteuid() == 0 }
+    }
+
+    #[test]
+    fn quota_flags_override_only_the_named_limits() {
+        let args = Args::parse(
+            ["--max-connections", "10", "--max-ptys-per-session", "3"]
+                .into_iter()
+                .map(std::ffi::OsString::from),
+        )
+        .unwrap();
+        let limits = args.resolved_limits();
+        assert_eq!(limits.max_connections, 10);
+        assert_eq!(limits.max_ptys_per_session, 3);
+        assert_eq!(
+            limits.max_tasks_per_session,
+            Limits::default().max_tasks_per_session
+        );
+    }
+
+    #[test]
+    fn quota_flags_reject_non_numeric_values() {
+        let result = Args::parse(
+            ["--max-connections", "many"]
+                .into_iter()
+                .map(std::ffi::OsString::from),
+        );
+        assert!(result.unwrap_err().contains("--max-connections"));
     }
 
     /// The bug: `--socket /tmp/x.sock` puts the socket's parent at `/tmp` —

@@ -58,6 +58,7 @@ struct ChannelBuf {
 
 struct Subscriber {
     conn: u64,
+    session_id: String,
     channel: String,
     queue: Arc<SubQueue>,
 }
@@ -385,15 +386,40 @@ impl EventBus {
     /// and dedicated writer thread live events use, so replay and live
     /// delivery are never a separate, ad hoc blocking write on the calling
     /// (dispatch) thread.
-    fn subscribe(&self, conn: u64, channel: &str, since: Option<u64>, writer: &SharedWriter) {
+    fn subscribe(
+        &self,
+        conn: u64,
+        session_id: &str,
+        channel: &str,
+        since: Option<u64>,
+        writer: &SharedWriter,
+        max_per_session: usize,
+    ) -> Result<(), RpcError> {
         let queue = {
             let mut subs = self.subs.lock().unwrap();
             if let Some(existing) = subs.iter().find(|s| s.conn == conn && s.channel == channel) {
                 existing.queue.clone()
             } else {
+                let current = subs
+                    .iter()
+                    .filter(|subscriber| subscriber.session_id == session_id)
+                    .count();
+                if current >= max_per_session {
+                    return Err(RpcError {
+                        code: QUOTA_EXCEEDED,
+                        message: format!(
+                            "session has reached the {max_per_session}-subscription limit"
+                        ),
+                        data: Some(json!({
+                            "limit": "subscriptions_per_session",
+                            "max": max_per_session,
+                        })),
+                    });
+                }
                 let queue = SubQueue::new(channel.to_string());
                 subs.push(Subscriber {
                     conn,
+                    session_id: session_id.to_string(),
                     channel: channel.to_string(),
                     queue: queue.clone(),
                 });
@@ -404,6 +430,7 @@ impl EventBus {
         for event in self.read(channel, since, None) {
             queue.push(event);
         }
+        Ok(())
     }
 
     fn unsubscribe(&self, conn: u64, channel: &str) {
@@ -780,7 +807,7 @@ impl Kernel {
         attached: &mut Option<Attachment>,
         conn: Option<&SharedWriter>,
     ) -> Result<Json, RpcError> {
-        attached.as_ref().ok_or_else(not_attached)?;
+        let attachment = attached.as_ref().ok_or_else(not_attached)?;
         let p: EventsSubParams = decode(params)?;
         let Some(writer) = conn else {
             return Err(RpcError {
@@ -789,7 +816,14 @@ impl Kernel {
                 data: None,
             });
         };
-        self.events.subscribe(client, &p.channel, p.since, writer);
+        self.events.subscribe(
+            client,
+            &attachment.session.id,
+            &p.channel,
+            p.since,
+            writer,
+            self.max_subscriptions_per_session.load(Ordering::Relaxed),
+        )?;
         encode(json!({"channel": p.channel, "subscribed": true}))
     }
 
@@ -843,7 +877,8 @@ mod tests {
         let bus = EventBus::default();
         let (client_end, server_end) = UnixStream::pair().unwrap();
         let writer: SharedWriter = Arc::new(Mutex::new(server_end));
-        bus.subscribe(1, "user.stress", None, &writer);
+        bus.subscribe(1, "s", "user.stress", None, &writer, usize::MAX)
+            .unwrap();
 
         let start = Instant::now();
         for i in 0..500 {
@@ -875,8 +910,10 @@ mod tests {
         let (healthy_client, healthy_server) = UnixStream::pair().unwrap();
         let healthy_writer: SharedWriter = Arc::new(Mutex::new(healthy_server));
 
-        bus.subscribe(1, "user.race", None, &stalled_writer);
-        bus.subscribe(2, "user.race", None, &healthy_writer);
+        bus.subscribe(1, "s1", "user.race", None, &stalled_writer, usize::MAX)
+            .unwrap();
+        bus.subscribe(2, "s2", "user.race", None, &healthy_writer, usize::MAX)
+            .unwrap();
 
         // Simulate the stalled subscriber's writer thread being stuck mid
         // blocking-write by holding its writer's mutex from here.
@@ -926,7 +963,8 @@ mod tests {
         let bus = Arc::new(EventBus::default());
         let (client_end, server_end) = UnixStream::pair().unwrap();
         let writer: SharedWriter = Arc::new(Mutex::new(server_end));
-        bus.subscribe(1, "user.overflow", None, &writer);
+        bus.subscribe(1, "s", "user.overflow", None, &writer, usize::MAX)
+            .unwrap();
 
         let hold = writer.clone();
         let (release_tx, release_rx) = mpsc::channel::<()>();
@@ -978,11 +1016,49 @@ mod tests {
         let bus = EventBus::default();
         let (client_end, server_end) = UnixStream::pair().unwrap();
         let writer: SharedWriter = Arc::new(Mutex::new(server_end));
-        bus.subscribe(1, "user.bye", None, &writer);
+        bus.subscribe(1, "s", "user.bye", None, &writer, usize::MAX)
+            .unwrap();
         assert_eq!(bus.subs.lock().unwrap().len(), 1);
         bus.unsubscribe(1, "user.bye");
         assert_eq!(bus.subs.lock().unwrap().len(), 0);
         drop(client_end);
+    }
+
+    #[test]
+    fn subscribe_reserves_the_per_session_quota_atomically() {
+        let bus = Arc::new(EventBus::default());
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let subscribe = |conn: u64, bus: Arc<EventBus>, barrier: Arc<std::sync::Barrier>| {
+            std::thread::spawn(move || {
+                let (_client, server) = UnixStream::pair().unwrap();
+                let writer: SharedWriter = Arc::new(Mutex::new(server));
+                barrier.wait();
+                bus.subscribe(
+                    conn,
+                    "same-session",
+                    &format!("user.{conn}"),
+                    None,
+                    &writer,
+                    1,
+                )
+            })
+        };
+        let first = subscribe(1, bus.clone(), barrier.clone());
+        let second = subscribe(2, bus.clone(), barrier.clone());
+        barrier.wait();
+        let results = [first.join().unwrap(), second.join().unwrap()];
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter_map(|result| result.as_ref().err())
+                .filter(|error| error.code == QUOTA_EXCEEDED)
+                .count(),
+            1
+        );
+        assert_eq!(bus.subs.lock().unwrap().len(), 1);
+        bus.remove_conn(1);
+        bus.remove_conn(2);
     }
 
     // -----------------------------------------------------------------------
