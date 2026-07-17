@@ -1086,3 +1086,30 @@ fn raw_journal_query_limit_zero_is_empty_and_omitted_is_default() {
         "an oversized limit is clamped, not an error: {huge:?}"
     );
 }
+
+/// HR-D1/HR-D8: `cap.request` requires an authenticated attachment. A fresh raw
+/// socket connection that never attached must NOT be able to flip a plan's
+/// `approved` bit — approving is a state mutation the audit found was reachable
+/// with no caller identity at all. It now gets `NOT_ATTACHED`.
+#[test]
+fn raw_unattached_cap_request_is_rejected() {
+    let live = LiveKernel::start();
+    let mut stream = UnixStream::connect(&live.socket).unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+
+    // Never attached: cap.request is refused before any approval logic runs.
+    let denied = raw_call(
+        &mut stream,
+        &mut reader,
+        1,
+        "cap.request",
+        json!({ "plan_ref": "plan:deadbeefdeadbeef", "effects": [] }),
+    );
+    let err = denied
+        .error
+        .expect("unattached cap.request must be rejected, not processed");
+    assert_eq!(
+        err.code, NOT_ATTACHED,
+        "unattached cap.request must be NOT_ATTACHED: {err:?}"
+    );
+}

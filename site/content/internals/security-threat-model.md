@@ -269,34 +269,36 @@ Policy evaluation is only as complete as plan derivation. An effect omitted or c
 narrowly cannot be recovered by the verdict engine. Opaque behavior should remain opaque rather than
 inventing a false concrete effect.
 
-### Current kernel approval-boundary defect
+### Kernel approval boundary (HR-D1/D2/D3)
 
 The verdict engine above is sound only when the actor changing approval state is authenticated and
-authorized. Today `cap.request` is dispatched without requiring `session.attach`; its handler has no
-caller identity and sets a stored plan's `approved` bit after evaluating the **plan owner's** policy.
-The Unix socket's `0600` mode restricts access to the OS user, but it does not preserve the
-token-principal boundaries the kernel otherwise exposes.
+authorized. `cap.request` now enforces that:
 
-The plan key is a second weakness: it is a 16-hex-character prefix of a hash over effects,
-reversibility, and estimates, excluding source/session/principal. Equal-shape plans replace one
-another in the global plan map. `plan.apply` and approved `exec` do verify the currently stored
-source/session/principal, which limits direct reuse, but does not make creation or approval identity
-safe.
+- **Attachment required (HR-D1).** An unattached caller is rejected with `NOT_ATTACHED` before any
+  approval logic runs; the attachment principal is the **approver**. The Unix socket's `0600` mode
+  restricts access to the OS user; the attachment gate preserves the token-principal boundary.
+- **Separation of duties (HR-D3).** The approver must differ from the plan's requester (owner). A
+  requester approving its own plan is `LEASH_DENIED` ("self-approval is not permitted") **by
+  default**. Self-acknowledgement is an explicit opt-in (`SHOAL_ALLOW_SELF_ACK`, or
+  `Kernel::set_allow_self_ack`) for single-operator deployments that knowingly accept it. This is the
+  chosen model: *default separation, opt-in self-ack.* Approval still never overrides a hard `Deny`
+  from the plan owner's policy — it only lifts an approval-*required* verdict.
+- **Auditable binding (HR-D2).** On approval the kernel writes an `ApprovalRecord` onto the plan
+  binding requester, approver, plan ref/hash, granted scope, timestamp, and — once the approved plan
+  runs — the journal entry id of the consuming execution. The record is mirrored into the journal as
+  a `# approval …` audit row (queryable via `journal.query`) and surfaced on `plan.get.approval`.
 
-Required repair:
-
-1. attach and authenticate the caller;
-2. require an explicit approver capability distinct from owning a plan;
-3. bind an approval record to a unique stored object plus exact owner/session/source/effect digest;
-4. prevent equal-effect plans from overwriting one another;
-5. audit approval decisions and test two principals over real connections.
+Residual hardening (tracked in the roadmap, not yet done): the plan key is still a 16-hex-character
+prefix of a hash over effects/reversibility/estimates, excluding source/session/principal, so
+equal-shape plans overwrite one another in the global map. `plan.apply` and approved `exec` verify the
+currently stored source/session/principal, which limits direct reuse; unique owner-bound plan object
+identity is the remaining step.
 
 `journal.query` had the same missing-attachment shape; **HR-D4 closed it**: the handler now rejects
 an unattached caller with `NOT_ATTACHED` before reading any row, and its `limit` is bounded (omitted →
 default page, explicit `0` → zero rows, any value clamped to a server maximum — HR-D5). Within a
 shared pair-shell session the journal is intentionally readable by every attached principal; the
-isolation boundary is the session name, not per-row principal scoping. `cap.request` approver identity
-remains open P0 authority work.
+isolation boundary is the session name, not per-row principal scoping.
 
 ## Policy loading defaults
 
@@ -540,6 +542,9 @@ limits/authorization to each invocation.
 | no proc-spawn allowlist at spawn gate | no pinning; allow ordinary spawn path |
 | nonhermetic sandbox unavailable | run with honest degraded status |
 | hermetic requested dimension unavailable | fail closed before spawn |
+| unattached `cap.request` / `journal.query` | reject with `NOT_ATTACHED` (HR-D1/D4) |
+| requester approving its own plan | reject `LEASH_DENIED` unless self-ack explicitly enabled (HR-D3) |
+| `journal.query` `limit` omitted vs. `0` | omitted → default page; explicit `0` → zero rows; clamped to server max (HR-D5) |
 | malformed/unknown bearer | reject attach |
 | ephemeral kernel bearer | reject as unavailable |
 | expired bearer or bearer marked revoked in the kernel's loaded snapshot | reject |
@@ -572,8 +577,10 @@ For a new externally reachable effect:
 
 ## Priority debt
 
-1. **Authenticate `cap.request` and scope `journal.query`.** Current handlers mutate/read shared
-   state without attachment; replace colliding plan refs with unique owner-bound object identity.
+1. **Unique owner-bound plan identity.** `cap.request` and `journal.query` now require attachment
+   (HR-D1/D4), approval binds a distinct approver and an auditable record (HR-D2/D3), and journal
+   limits are bounded (HR-D5). The remaining step is replacing colliding 16-hex plan refs with a
+   unique owner-bound object identity so equal-shape plans cannot overwrite one another.
 2. **Close child evaluator Leash inheritance escape.** This is a direct transitive-policy failure.
 3. **Scope named kernel sessions by principal.** Existing session reuse crosses first-creator state.
 4. **Make token revocation live and generation-safe.** A running kernel currently retains its startup

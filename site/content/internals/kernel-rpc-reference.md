@@ -83,15 +83,14 @@ a newline. The MCP stdio reader has the same shape.
 | `task.list/get/await/cancel/suspend/resume` | `handlers_task.rs` | yes | session-scoped task registry |
 | `pty.open/send/read/resize/close/list` | `handlers_pty.rs` | yes | session-scoped PTY registry |
 | `plan.get/list/apply` | `handlers_task.rs` | yes | session/principal-scoped plan registry |
-| `cap.request` | `handlers_task.rs` | **no** | global plan approval mutation |
+| `cap.request` | `handlers_task.rs` | yes | attached approval mutation, approver-bound |
 | `journal.query` | `handlers_value.rs` | yes | attached persistent journal read |
 | `events.read/publish/subscribe/unsubscribe` | `eventbus.rs` | yes | global bus plus session bridge |
 
-`journal.query` now requires attachment (HR-D4): a fresh unattached socket connection can no longer
-read stored journal rows. The only methods that are naturally public are attach, context-free parse,
-and context-free completion. `cap.request` remains the one bold exemption pending its approver-identity
-repair (see below); it neither authenticates an approver nor checks the plan owner against a caller.
-The socket's `0600` mode limits OS users, not Shoal token principals.
+Both former exemptions are closed: `journal.query` requires attachment (HR-D4), and `cap.request`
+requires attachment and binds an approver identity distinct from the requester (HR-D1/D2/D3). The only
+methods that remain naturally public are attach, context-free parse, and context-free completion. The
+socket's `0600` mode limits OS users, not Shoal token principals — the approver-identity binding does.
 
 ## `session.*`
 
@@ -347,15 +346,28 @@ principal verification and re-derives the execution plan.
 
 ### `cap.request`
 
-Input `{plan_ref?, effects: [...]}`; `plan_ref` is operationally required. Effect entries can be
-strings or objects with `kind`. Dotted and snake-case spellings are normalized. If a nonempty request
-omits a plan effect, result remains `approval_pending` and lists uncovered effects. A denied plan is
-`LEASH_DENIED`; otherwise it sets `approved:true` and reports `{grant:"approved", enforced,
-granted_effects}`.
+**Requires attachment** (HR-D1). Input `{plan_ref?, effects: [...]}`; `plan_ref` is operationally
+required. The attachment principal is the **approver**. Effect entries can be strings or objects with
+`kind`; dotted and snake-case spellings are normalized.
 
-**Current critical defect:** no attachment or caller identity reaches this handler. It mutates the
-global plan named by ref after evaluating the stored owner's policy, not an approver policy. The
-method must not be treated as safe just because normal MCP connections attach first.
+Authority model (HR-D2/HR-D3):
+
+1. an unattached caller is rejected with `NOT_ATTACHED` before any approval logic;
+2. **separation of duties** — the approver must differ from the plan's requester (owner). A requester
+   approving its own plan is `LEASH_DENIED` ("self-approval is not permitted") unless
+   self-acknowledgement is explicitly enabled (`SHOAL_ALLOW_SELF_ACK`, or
+   `Kernel::set_allow_self_ack`); the default is separation;
+3. approval never overrides a hard denial: the plan owner's policy must not evaluate the plan to
+   `Deny`, else `LEASH_DENIED`;
+4. if a nonempty request omits a plan effect, the result stays `approval_pending` and lists the
+   uncovered effects (approval never silently widens past the requested scope);
+5. otherwise the plan is approved. An **`ApprovalRecord`** is bound onto the plan — requester,
+   approver, plan ref/hash, granted scope, approval timestamp, and (once the approved plan actually
+   runs) the journal entry id of the consuming execution. The binding is mirrored into the journal as
+   an audit entry (`journal.query` sees a `# approval …` row) and surfaced on `plan.get.approval`.
+
+Response: `{grant:"approved", plan_ref, enforced, granted_effects, requester, approver}`. `enforced`
+reports the same honest OS-enforcement truth `session.attach.caps_enforced` does for the requester.
 
 ## PTYs
 

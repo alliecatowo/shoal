@@ -380,13 +380,17 @@ split only with a protocol compatibility plan and client fallbacks.
 
 ## Session and authority contract
 
-Most kernel handlers require `session.attach`. Attach establishes session, principal, capabilities,
-cwd/environment identity, AST version, enforcement honesty, elision defaults, and channel list.
+Every stateful kernel handler requires `session.attach`; only `session.attach`, `parse`, and
+`complete` are public. Attach establishes session, principal, capabilities, cwd/environment identity,
+AST version, enforcement honesty, elision defaults, and channel list.
 
 Stable security properties:
 
 - Unix socket ownership/permissions and peer UID are the first boundary;
 - agent tokens are validated through `TokenStore::validate`;
+- `cap.request` and `journal.query` require attachment (no unattached approval mutation or journal
+  read); `cap.request` binds the attached principal as the approver, distinct from the requester by
+  default (self-acknowledgement is an explicit opt-in), and writes an auditable approval record;
 - a named session does not make refs globally visible—handlers still scope every lookup;
 - plans, tasks, PTYs, events, values, and approvals are checked against session/principal rules;
 - `caps_enforced` states actual OS enforcement availability, not merely policy configuration;

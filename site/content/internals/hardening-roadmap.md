@@ -107,11 +107,11 @@ Rules for implementers:
 
 ### Workstream D — attachment, approval, identity
 
-- [ ] **HR-D1** — `cap.request` requires an authenticated attachment and receives the caller
+- [x] **HR-D1** — `cap.request` requires an authenticated attachment and receives the caller
   principal. *(D1)*
-- [ ] **HR-D2** — Approval records bind requester, plan hash, approver principal, scope, and the
+- [x] **HR-D2** — Approval records bind requester, plan hash, approver principal, scope, and the
   execution that consumes the approval; the binding is journal-auditable. *(D3)*
-- [ ] **HR-D3** — Approver identity must differ from the requester unless policy explicitly
+- [x] **HR-D3** — Approver identity must differ from the requester unless policy explicitly
   permits self-acknowledgement; default policy separates them. Document the chosen model in the
   security threat model page. *(D2, D4)*
 - [x] **HR-D4** — `journal.query` requires attachment, matching the documented rule. *(F1)*

@@ -60,6 +60,15 @@ pub struct Kernel {
     next_pty: AtomicU64,
     auth: Option<Mutex<TokenStore>>,
     events: Arc<EventBus>,
+    /// Whether a plan's requester may acknowledge its own plan via
+    /// `cap.request` (HR-D3 self-acknowledgement). Default `false`: the approver
+    /// principal MUST differ from the requester, so approval is a genuine
+    /// separation-of-duties boundary (a supervising human/agent), not a
+    /// rubber stamp the requesting agent applies to itself. Enabled explicitly
+    /// (env `SHOAL_ALLOW_SELF_ACK`, or [`Kernel::set_allow_self_ack`]) for
+    /// single-operator setups that knowingly accept self-approval. See
+    /// `site/content/internals/security-threat-model.md`.
+    allow_self_ack: AtomicBool,
 }
 
 /// Wire version of the AST node-kind vocabulary (site/content/internals/language-conformance-contract.md, site/content/internals/values-streams-execution.md). Bumped
@@ -99,9 +108,37 @@ struct PtyEntry {
 struct StoredPlan {
     src: String,
     session: String,
+    /// The plan owner / **requester** — the principal that derived this plan
+    /// (`exec {mode:"plan"}`). Distinct from an `ApprovalRecord::approver`.
     principal: String,
     plan: Plan,
     approved: bool,
+    /// The auditable approval binding, present once a `cap.request` approved
+    /// this plan (HR-D2). Binds requester, plan ref/hash, approver, granted
+    /// scope, when it was approved, and — once the approved plan actually runs
+    /// — the journal entry id of the execution that consumed it.
+    approval: Option<ApprovalRecord>,
+}
+
+/// The auditable record binding an approval to its requester, plan, approver,
+/// scope, and consuming execution (HR-D2). Mirrored into the journal as an
+/// audit entry at approval time (`record_approval_audit`) and surfaced on
+/// `plan.get` so the whole chain is inspectable, never an unattributed bit.
+#[derive(Clone)]
+struct ApprovalRecord {
+    /// The plan owner whose effects were approved.
+    requester: String,
+    /// The distinct principal that approved (the `cap.request` caller).
+    approver: String,
+    /// The source-anchored plan ref/hash this approval is bound to.
+    plan_ref: String,
+    /// The effect kinds the approval was scoped to (empty ⇒ the whole plan).
+    scope: Vec<String>,
+    /// When the approval was granted (ns since epoch).
+    approved_at_ns: i64,
+    /// The journal entry id of the execution that consumed this approval, once
+    /// an approved `exec` actually ran the plan. `None` until then.
+    consumed_by: Option<i64>,
 }
 
 impl Kernel {
@@ -119,6 +156,7 @@ impl Kernel {
             next_pty: AtomicU64::new(1),
             events: Arc::new(EventBus::default()),
             auth: None,
+            allow_self_ack: AtomicBool::new(self_ack_from_env()),
         })
     }
 
@@ -147,6 +185,7 @@ impl Kernel {
             next_pty: AtomicU64::new(1),
             events: Arc::new(events),
             auth: Some(Mutex::new(TokenStore::open(state_dir.join("tokens.json"))?)),
+            allow_self_ack: AtomicBool::new(self_ack_from_env()),
         }))
     }
 
@@ -172,6 +211,7 @@ impl Kernel {
             next_pty: AtomicU64::new(1),
             events: Arc::new(events),
             auth: Some(Mutex::new(TokenStore::open(state_dir.join("tokens.json"))?)),
+            allow_self_ack: AtomicBool::new(self_ack_from_env()),
         }))
     }
 
@@ -189,6 +229,7 @@ impl Kernel {
             next_pty: AtomicU64::new(1),
             events: Arc::new(EventBus::default()),
             auth: None,
+            allow_self_ack: AtomicBool::new(self_ack_from_env()),
         })
     }
 
@@ -306,6 +347,56 @@ impl Kernel {
         );
         backend_present && self.policy.sandbox_for(principal).is_some()
     }
+
+    /// Permit (or forbid) a plan's requester to acknowledge its own plan via
+    /// `cap.request` (HR-D3). Default is forbidden — approval must come from a
+    /// distinct principal. Enable only for single-operator setups that knowingly
+    /// accept self-approval; the kernel binary honors `SHOAL_ALLOW_SELF_ACK` for
+    /// the same purpose.
+    pub fn set_allow_self_ack(&self, allow: bool) {
+        self.allow_self_ack.store(allow, Ordering::SeqCst);
+    }
+
+    /// Append a journal audit entry for an approval decision (HR-D2), so the
+    /// requester→plan→approver→scope binding is durably queryable via
+    /// `journal.query`, not just live in the plan map. Best effort: an
+    /// audit-write failure must never fail the approval it records (the same
+    /// degrade-don't-brick stance the exec journal already takes). `session` is
+    /// the plan's session (so the record is queryable in context) and
+    /// `effect_kinds` is the plan's full effect set.
+    fn record_approval_audit(
+        &self,
+        approval: &ApprovalRecord,
+        effect_kinds: &[String],
+        session: &str,
+    ) {
+        let effects_json = serde_json::to_string(&json!([{
+            "kind": "approval",
+            "plan_ref": approval.plan_ref,
+            "requester": approval.requester,
+            "approver": approval.approver,
+            "scope": approval.scope,
+            "effects": effect_kinds,
+        }]))
+        .unwrap_or_else(|_| "[]".into());
+        let record = EntryRecord {
+            session: session.to_string(),
+            principal: approval.approver.clone(),
+            ts_ns: approval.approved_at_ns,
+            cwd: Vec::new(),
+            src: format!(
+                "# approval {} by {} for {}",
+                approval.plan_ref, approval.approver, approval.requester
+            ),
+            ast_json: "null".into(),
+            effects_json,
+            opaque: false,
+        };
+        let journal = self.journal.lock().unwrap();
+        if let Ok(id) = journal.append(&record) {
+            let _ = journal.finish(id, Some(0), true, 0);
+        }
+    }
 }
 
 fn task_record(task: &Arc<TaskEntry>) -> TaskRecord {
@@ -377,6 +468,14 @@ fn elapsed_ns(start: Instant) -> i64 {
 }
 fn permissive_policy() -> Policy {
     Policy::permissive(&principal())
+}
+
+/// Whether self-acknowledgement (a plan's requester approving its own plan via
+/// `cap.request`) is permitted by process configuration (HR-D3). Off unless the
+/// operator sets a non-empty `SHOAL_ALLOW_SELF_ACK`. Read once per kernel at
+/// construction; `Kernel::set_allow_self_ack` overrides it at runtime.
+fn self_ack_from_env() -> bool {
+    std::env::var_os("SHOAL_ALLOW_SELF_ACK").is_some_and(|v| !v.is_empty())
 }
 
 /// The single-letter wire form of an enforcement tier (site/content/internals/language-conformance-contract.md): A (Landlock),
@@ -538,6 +637,24 @@ fn elide_defaults_json() -> Json {
         "max_items": ELIDE_DEFAULT_MAX_ITEMS,
         "hard_cap": ELIDE_HARD_CAP,
     })
+}
+
+/// The wire projection of a plan's [`ApprovalRecord`] (HR-D2), or `null` when
+/// the plan has not been approved. Surfaced by `plan.get` so the full
+/// requester→approver→scope→consuming-execution binding is inspectable, not
+/// just an unattributed `approved: true` bit.
+fn approval_json(approval: Option<&ApprovalRecord>) -> Json {
+    match approval {
+        None => Json::Null,
+        Some(a) => json!({
+            "requester": a.requester,
+            "approver": a.approver,
+            "plan_ref": a.plan_ref,
+            "scope": a.scope,
+            "approved_at": a.approved_at_ns,
+            "consumed_by": a.consumed_by,
+        }),
+    }
 }
 
 /// The `session.transcript` event payload for a new `out[n]` (see
@@ -856,6 +973,9 @@ mod tests {
             ))
             .unwrap();
             let kernel = Kernel::with_policy(policy);
+            // Single-connection approve→apply flow: opt into self-ack (HR-D3);
+            // the cross-principal separation gate is tested on its own.
+            kernel.set_allow_self_ack(true);
             let (mut client, server) = UnixStream::pair().unwrap();
             let mut reader = BufReader::new(client.try_clone().unwrap());
             let server_kernel = kernel.clone();
@@ -931,6 +1051,9 @@ mod tests {
         ))
         .unwrap();
         let kernel = Kernel::with_policy(policy);
+        // Approves its own plan over one connection to reach the approved
+        // re-entry it is really testing: opt into self-ack (HR-D3).
+        kernel.set_allow_self_ack(true);
         let (mut client, server) = UnixStream::pair().unwrap();
         let mut reader = BufReader::new(client.try_clone().unwrap());
         let server_kernel = kernel.clone();
@@ -3008,6 +3131,10 @@ mod tests {
     #[test]
     fn cap_request_scopes_the_grant_to_requested_effects() {
         let kernel = Kernel::new();
+        // This test drives the requester and approver over ONE connection, so
+        // it opts into self-acknowledgement (HR-D3); it exercises scope
+        // narrowing, not the separation-of-duties gate (covered separately).
+        kernel.set_allow_self_ack(true);
         let (mut client, mut reader, thread) = spawn(&kernel);
         attach(&mut client, &mut reader);
         let plan = call(
@@ -3046,6 +3173,177 @@ mod tests {
         drop(client);
         drop(reader);
         thread.join().unwrap();
+    }
+
+    /// HR-D3: with self-acknowledgement OFF (the default), a plan's requester
+    /// cannot approve its own plan. `cap.request` from the same principal that
+    /// derived the plan is rejected with `LEASH_DENIED`, and the plan stays
+    /// unapproved (`plan.apply` still fails) — approval is a genuine
+    /// second-party boundary, not a rubber stamp the requester applies itself.
+    #[test]
+    fn cap_request_default_denies_self_approval() {
+        let policy = Policy::from_toml(&format!(
+            "[principal.\"{}\"]\nopaque='ask'\nauto_apply='never'\n",
+            principal()
+        ))
+        .unwrap();
+        // No `set_allow_self_ack` — self-ack defaults OFF.
+        let kernel = Kernel::with_policy(policy);
+        let (mut client, mut reader, thread) = spawn(&kernel);
+        attach(&mut client, &mut reader);
+        let plan = call(
+            &mut client,
+            &mut reader,
+            2,
+            "exec",
+            json!({"src":"sh { echo hi }","mode":"plan"}),
+        )
+        .result
+        .unwrap();
+        let plan_ref = plan["plan_ref"].as_str().unwrap().to_owned();
+        let denied = call(
+            &mut client,
+            &mut reader,
+            3,
+            "cap.request",
+            json!({"plan_ref": plan_ref, "effects": []}),
+        );
+        let err = denied
+            .error
+            .expect("a requester approving its own plan must be denied by default");
+        assert_eq!(
+            err.code, LEASH_DENIED,
+            "self-approval must be LEASH_DENIED: {err:?}"
+        );
+        assert!(
+            err.message.contains("self-approval"),
+            "the denial names the reason: {}",
+            err.message
+        );
+        // The plan is still unapproved: plan.apply refuses it.
+        let apply = call(
+            &mut client,
+            &mut reader,
+            4,
+            "plan.apply",
+            json!({"plan_ref": plan_ref}),
+        );
+        assert!(
+            apply.error.is_some(),
+            "a plan that was never validly approved must not apply"
+        );
+        drop(client);
+        drop(reader);
+        thread.join().unwrap();
+    }
+
+    /// HR-D2/HR-D3 happy path: a DISTINCT approver (a second bearer principal)
+    /// may approve a requester's plan, the grant reports both identities, the
+    /// approval record binds requester→approver→scope on the plan, and once the
+    /// requester applies the approved plan the record names the consuming
+    /// execution's journal entry. Two real bearer principals over two
+    /// connections — the separation-of-duties boundary working as intended.
+    #[test]
+    fn cap_request_cross_principal_approval_binds_the_full_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tokens = TokenStore::open(dir.path().join("tokens.json")).unwrap();
+        let (alpha_tok, _) = tokens
+            .create("agent:alpha".into(), "agent".into(), vec![], None)
+            .unwrap();
+        let (beta_tok, _) = tokens
+            .create("agent:beta".into(), "supervisor".into(), vec![], None)
+            .unwrap();
+        drop(tokens);
+        // Both principals must ask for opaque effects (so the plan lands
+        // approval_required), and alpha's effects must not be a hard Deny (ask,
+        // not deny) so approval can lift it.
+        let policy = Policy::from_toml(
+            "[principal.\"agent:alpha\"]\nopaque='ask'\nauto_apply='never'\n\n\
+             [principal.\"agent:beta\"]\nopaque='ask'\nauto_apply='never'\n",
+        )
+        .unwrap();
+        let kernel = Kernel::open_with_policy(dir.path(), policy).unwrap();
+        // self-ack stays OFF: this is a genuine two-principal approval.
+
+        // Requester alpha derives an approval-required plan.
+        let (mut a, mut a_reader, a_thread) = spawn(&kernel);
+        call(
+            &mut a,
+            &mut a_reader,
+            1,
+            "session.attach",
+            json!({"token":alpha_tok,"session":"pair","client":{"kind":"agent","tty":false}}),
+        );
+        let planned = call(
+            &mut a,
+            &mut a_reader,
+            2,
+            "exec",
+            json!({"src":"sh { echo hi }","mode":"plan","position":"stmt"}),
+        )
+        .result
+        .unwrap();
+        assert_eq!(planned["verdict"], "approval_required", "{planned}");
+        let plan_ref = planned["plan_ref"].as_str().unwrap().to_owned();
+
+        // Approver beta (a distinct principal) approves it.
+        let (mut b, mut b_reader, b_thread) = spawn(&kernel);
+        call(
+            &mut b,
+            &mut b_reader,
+            1,
+            "session.attach",
+            json!({"token":beta_tok,"client":{"kind":"agent","tty":false}}),
+        );
+        let grant = call(
+            &mut b,
+            &mut b_reader,
+            2,
+            "cap.request",
+            json!({"plan_ref": plan_ref, "effects": []}),
+        )
+        .result
+        .expect("a distinct approver may approve");
+        assert_eq!(grant["grant"], "approved", "{grant}");
+        assert_eq!(grant["requester"], "agent:alpha", "{grant}");
+        assert_eq!(grant["approver"], "agent:beta", "{grant}");
+
+        // The requester applies the now-approved plan; it runs.
+        let applied = call(
+            &mut a,
+            &mut a_reader,
+            3,
+            "plan.apply",
+            json!({"plan_ref": plan_ref}),
+        )
+        .result
+        .expect("the requester applies its approved plan");
+        assert_eq!(applied["value"]["ok"], true, "{applied}");
+
+        // plan.get surfaces the full binding, including the consuming execution.
+        let got = call(
+            &mut a,
+            &mut a_reader,
+            4,
+            "plan.get",
+            json!({"plan_ref": plan_ref}),
+        )
+        .result
+        .unwrap();
+        let approval = &got["approval"];
+        assert_eq!(approval["requester"], "agent:alpha", "{got}");
+        assert_eq!(approval["approver"], "agent:beta", "{got}");
+        assert!(
+            approval["consumed_by"].is_i64(),
+            "the approval names the journal entry that consumed it: {got}"
+        );
+
+        drop(a);
+        drop(a_reader);
+        a_thread.join().unwrap();
+        drop(b);
+        drop(b_reader);
+        b_thread.join().unwrap();
     }
 
     #[test]
@@ -3437,6 +3735,9 @@ mod tests {
         ))
         .unwrap();
         let kernel = Kernel::with_policy(policy);
+        // One-connection request→approve: opt into self-ack (HR-D3). This test
+        // is about the enforcement-truth field, not the separation gate.
+        kernel.set_allow_self_ack(true);
         let (mut client, mut reader, thread) = spawn(&kernel);
         let attach_result = attach(&mut client, &mut reader).result.unwrap();
         let status = EnforcementStatus::detect();
@@ -3480,6 +3781,9 @@ mod tests {
     #[test]
     fn cap_request_reports_false_for_the_default_permissive_principal() {
         let kernel = Kernel::new();
+        // Single-connection self-approval to reach the grant response under
+        // test: opt into self-ack (HR-D3).
+        kernel.set_allow_self_ack(true);
         let (mut client, mut reader, thread) = spawn(&kernel);
         let attach_result = attach(&mut client, &mut reader).result.unwrap();
         assert_eq!(attach_result["caps_enforced"], false);
