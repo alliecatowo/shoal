@@ -234,8 +234,8 @@ length shrinks; rename/replacement behavior beyond that depends on platform `not
 | `window(duration)` | stores timestamp/value pairs; emits current time window per item |
 | `buffer(n)` | real decoupler (HR-G1): producer thread + `sync_channel(n)`; runs at most `n` ahead, paces (never drops), preserves boundedness |
 | `enumerate` | emits `[zero_based_index, value]` |
-| `merge(other)` | polls A then B in 20 ms steps until both end |
-| `zip(other)` | pulls A then B and emits `[a,b]`; ends/times out with either pull |
+| `merge(other)` | left-biased poll sweep (A then B, 20 ms steps) until both end; ready in-memory sources drain left-first |
+| `zip(other)` | pulls A then B, emits `[a,b]`; ends with either side; holds an unpaired left item across a right timeout |
 
 
 `flat_map` is pinned to sequential semantics (HR-G2, audit I3; case
@@ -263,6 +263,27 @@ lose language-visible data — unlike the lossy *source* buffers whose items are
 Construction is eager (like the system sources); `n == 0` is a rendezvous handoff; upstream errors
 cross the channel and end the stream; parent cancellation or a dropped consumer stops the producer
 within one poll, dropping the wrapped upstream so shutdown cascades to nested sources.
+
+`merge`/`zip` rate-skew and backpressure, precisely (HR-G6, audit I14; pinned by
+`merge_sweeps_left_first_but_never_starves_a_silent_side`,
+`zip_holds_the_left_item_across_a_right_timeout`, and the corpus cases
+`stream-merge-ready-sources-drain-left-first` / `stream-zip-consumes-one-left-item-past-the-shorter-end`):
+
+- **`merge` is a left-biased poll sweep, not fair interleaving.** Each pull probes A with a 20 ms
+  bounded read, then B; a ready A item always wins its sweep. Two already-ready in-memory sources
+  therefore drain the left one completely first, and a ready B item can wait up to one poll step
+  behind a live-but-slow A. Live sources approximate arrival order at 20 ms granularity. Neither
+  side backpressures the other beyond that serialization — skew lands in each source's own
+  buffer under that source's overflow contract. An outer deadline is checked after a full sweep,
+  so a timed pull may overshoot its budget by up to ~40 ms.
+- **`zip` is synchronous pairing at the slower side's rate.** Each pull takes left then right,
+  applying the caller's timeout to each side in turn (a timed pull can spend up to twice the
+  budget). The faster side is simply not pulled while its partner lags, so skew accumulates in
+  that side's producer buffer under its own drop/coalesce/pacing contract — `zip` itself buffers
+  at most one item: a left item whose right partner *timed out* is held for the next pull, never
+  discarded. When a side *ends*, the stream ends; one dangling left item may have been consumed
+  in the same pull and is discarded (it has no partner). Side effects in stages below the zip
+  (e.g. an emitting `map`) do observe that consumed-then-discarded item.
 
 `debounce` ignores the caller-supplied outer timeout and uses its own pending deadline. This is worth
 re-auditing if time budgets become strict RPC cancellation contracts.

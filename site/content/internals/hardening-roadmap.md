@@ -212,8 +212,12 @@ Rules for implementers:
   cancelled handler finishes with `null` and its subscription is pruned.
 - [x] **HR-G5** — `distinct` uses hashing (amortized O(1) membership); its memory behavior on
   unbounded streams is documented. *(I13)*
-- [ ] **HR-G6** — `zip`/`merge` rate-skew and backpressure semantics are documented precisely
+- [x] **HR-G6** — `zip`/`merge` rate-skew and backpressure semantics are documented precisely
   with tests. *(I14)*
+  — shipped: merge pinned as a left-biased 20 ms poll sweep (never fair interleaving, never
+  starving a silent side); zip pinned as synchronous pairing at the slower side's rate, now
+  HOLDING an unpaired left item across a right-side timeout instead of discarding it; the
+  consumed-then-discarded dangling item at end-of-stream is pinned and documented.
 - [ ] **HR-G7** — Incremental stream `.feed` is implemented, or its explicit unimplemented error
   and docs status are kept accurate and linked from the streams page. *(I6)*
 

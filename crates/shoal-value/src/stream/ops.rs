@@ -492,6 +492,16 @@ impl Upstream for Enumerate {
     }
 }
 
+/// Combine two streams as items become available (HR-G6,
+/// site/content/internals/streams-channels.md). NOT fair interleaving: each
+/// pull sweeps A then B with a [`POLL`]-bounded read each — a ready A item
+/// always wins the sweep, so two already-ready in-memory sources drain left
+/// side first, and a ready B item can wait up to one poll step while A is
+/// probed. Live sources approximate arrival order at [`POLL`] granularity.
+/// Neither side backpressures the other beyond that serialization; skew is
+/// absorbed by each source's own buffer/overflow contract. An outer deadline
+/// is checked after a full sweep, so a timed pull can overshoot its budget by
+/// up to ~2×[`POLL`].
 pub struct Merge {
     pub a: Box<dyn Upstream>,
     pub b: Box<dyn Upstream>,
@@ -526,20 +536,38 @@ impl Upstream for Merge {
     }
 }
 
+/// Positional pairing (HR-G6, site/content/internals/streams-channels.md). Synchronous and
+/// unbuffered beyond one held item: each pull takes LEFT then RIGHT with the
+/// caller's timeout applied to each side in turn (a timed pull can therefore
+/// spend up to 2× the budget). The pair rate is the slower side's rate — the
+/// faster side is simply not pulled again until its partner arrives, so its
+/// producer buffer absorbs skew under that source's own overflow contract.
 pub struct Zip {
     pub a: Box<dyn Upstream>,
     pub b: Box<dyn Upstream>,
+    /// A left item whose right partner timed out — HELD for the next pull
+    /// rather than silently discarded (a timeout is not the end of the
+    /// stream; dropping data on it would be invisible loss under timing
+    /// combinators). When a side instead ENDS, one dangling left item may be
+    /// consumed-and-discarded: the stream is over and the item has no partner.
+    pub pending_a: Option<Value>,
 }
 impl Upstream for Zip {
     fn pull(&mut self, ctx: &mut dyn CallCtx, t: Option<Duration>) -> VResult<Pull> {
-        let va = match self.a.pull(ctx, t)? {
-            Pull::Item(v) => v,
-            other => return Ok(other),
+        let va = match self.pending_a.take() {
+            Some(v) => v,
+            None => match self.a.pull(ctx, t)? {
+                Pull::Item(v) => v,
+                other => return Ok(other),
+            },
         };
-        let vb = match self.b.pull(ctx, t)? {
-            Pull::Item(v) => v,
-            other => return Ok(other),
-        };
-        Ok(Pull::Item(Value::List(vec![va, vb])))
+        match self.b.pull(ctx, t)? {
+            Pull::Item(vb) => Ok(Pull::Item(Value::List(vec![va, vb]))),
+            Pull::Timeout => {
+                self.pending_a = Some(va);
+                Ok(Pull::Timeout)
+            }
+            Pull::End => Ok(Pull::End),
+        }
     }
 }

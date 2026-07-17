@@ -109,6 +109,30 @@ src = '[1, 2].stream().merge([3, 4].stream()).sum()'
 value = "10"
 
 [[case]]
+# `merge` is a left-biased poll sweep, not fair interleaving (HR-G6): each
+# pull probes the left stream first, so two already-ready in-memory sources
+# drain the left one completely before the right. Live sources instead
+# approximate arrival order at the 20 ms poll granularity (unit-tested in
+# shoal-value; timing keeps it out of the corpus).
+name = "stream-merge-ready-sources-drain-left-first"
+src = '[1, 2].stream().merge([3, 4].stream()).collect()'
+value = "[1, 2, 3, 4]"
+
+[[case]]
+# `zip` pulls LEFT then RIGHT each pair and ends when EITHER side ends
+# (HR-G6). The end-of-right pull happens after one more left item was
+# already consumed: that dangling item (2) is discarded — it has no partner
+# and the stream is over. The emit side effect makes the consumption
+# visible: the "pulled" channel saw 2, but the result only pairs 1.
+name = "stream-zip-consumes-one-left-item-past-the-shorter-end"
+src = '''
+let pairs = [1, 2, 3].stream().map(x => { channel("pulled").emit(x)
+x }).zip([10].stream()).collect()
+[pairs, channel("pulled").latest()]
+'''
+value = "[[[1, 10]], 2]"
+
+[[case]]
 name = "stream-throttle-finite-first"
 src = '[1, 2, 3].stream().throttle(1s).collect()'
 value = "[1]"
