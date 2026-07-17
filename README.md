@@ -66,8 +66,12 @@ facade are implemented and tested on Linux and macOS.
 deliberate port (see [Current status and limits](https://alliecatowo.github.io/shoal/docs/status-limits/)).
 
 ```bash
+# Install the pinned tools, then all ten binaries and man pages
+mise install
+mise run install
+
 # Interactive shell
-cargo run -p shoal
+shoal
 
 # Evaluate source
 cargo run -p shoal -- -c $'let answer = 6 * 7\nanswer'
@@ -107,9 +111,9 @@ optional span instead of inventing one.
 
 ## Agents and interactive programs
 
-The local CLI/REPL currently hosts its evaluator directly; it does not yet route execution through
-the long-lived kernel. `shoal-kernel` separately exposes shared newline-framed JSON-RPC sessions,
-and `shoal-mcp` provides the MCP facade. The
+The default CLI/REPL starts an isolated private `shoal-kernel` over an inherited descriptor;
+`shoal --standalone` selects the embedded evaluator. A separate durable named-socket kernel serves
+agent Sessions, and `shoal-mcp` provides the MCP facade. The
 installable Claude Code [plugin](plugin/) adds the full language card and **13 tools** for structured
 execution, plans, approvals, refs, journal queries, cancellation, and interactive PTYs.
 
@@ -154,10 +158,13 @@ runtime flows, security boundaries, protocol contracts, and implementation statu
 ## Build and test
 
 ```bash
-cargo fmt --all --check
-cargo +stable clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --locked
+mise install
+mise run check
 ```
+
+The gate itself is a checked-in Shoal program. It drives formatting, strict Clippy, workspace and
+conformance tests, release builds, dependency audits, Reef validation, source-policy checks, man
+page/help execution, diagram governance, and the documentation build.
 
 Run only the executable language contract with:
 

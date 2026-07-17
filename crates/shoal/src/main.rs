@@ -105,8 +105,8 @@ fn run() -> Result<(), String> {
 
 fn real_main(args: Vec<OsString>) -> Result<i32, String> {
     match args::parse_args(args, io::stdin().is_terminal())? {
-        Action::Help => {
-            println!("{}", args::USAGE);
+        Action::Help(usage) => {
+            println!("{usage}");
             Ok(0)
         }
         Action::Version => {

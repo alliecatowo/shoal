@@ -28,15 +28,14 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
+      - uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: ${{ matrix.os }}
-      - name: Build
-        run: cargo build --workspace --all-targets --locked
-      - name: Test
-        run: cargo test --workspace --locked
-      - name: Conformance corpus
-        run: cargo test -p shoal --test conformance --locked -- --nocapture
+      - name: Bootstrap Shoal
+        run: cargo build -p shoal --locked
+      - name: Test through Shoal
+        run: target/debug/shoal scripts/ci-test.shl
 
   lint:
     name: fmt + clippy
@@ -46,17 +45,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
         with:
           components: rustfmt, clippy
+      - uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - name: Format
-        run: cargo fmt --all --check
-      - name: Reject raw kernel lock unwraps
-        run: |
-          if rg --multiline '\.(lock|read|write)\(\)\s*\.unwrap\(\)' crates/shoal-kernel/src; then
-            echo 'raw kernel lock unwraps bypass the subsystem poison policy'
-            exit 1
-          fi
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Bootstrap Shoal
+        run: cargo build -p shoal --locked
+      - name: Lint through Shoal
+        run: target/debug/shoal scripts/ci-lint.shl
 
   release-build:
     name: release build (${{ matrix.os }})
@@ -68,11 +62,14 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
+      - uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: release-${{ matrix.os }}
-      - name: Build release
-        run: cargo build --workspace --release --locked
+      - name: Bootstrap Shoal
+        run: cargo build -p shoal --locked
+      - name: Build release through Shoal
+        run: target/debug/shoal scripts/ci-release-build.shl
 
   fuzz-build:
     name: fuzz targets build
@@ -86,13 +83,11 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # nightly 2026-07-17
-      - run: sudo apt-get update && sudo apt-get install -y clang
-      # Pin installed tools too: `--locked` alone only locks the selected release's dependencies.
-      - run: cargo install cargo-fuzz --version 0.13.2 --locked
-      # cargo-fuzz has no --locked option. Reject a stale fuzz workspace
-      # lockfile before its build can resolve and rewrite dependencies.
-      - run: cargo metadata --manifest-path fuzz/Cargo.toml --locked --no-deps --format-version 1 > /dev/null
-      - run: cargo fuzz build --fuzz-dir fuzz
+      - uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
+      - name: Bootstrap Shoal
+        run: cargo build -p shoal --locked
+      - name: Build fuzz targets through Shoal
+        run: target/debug/shoal scripts/ci-fuzz-build.shl
 
   supply-chain-audit:
     # HR-F6 (site/content/internals/hardening-roadmap.md): RUSTSEC advisory checks over the root and
@@ -104,9 +99,11 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
+      - uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: supply-chain-audit
-      - run: cargo install cargo-audit --version 0.22.2 --locked
-      - run: cargo audit
-      - run: cargo audit --file fuzz/Cargo.lock
+      - name: Bootstrap Shoal
+        run: cargo build -p shoal --locked
+      - name: Audit through Shoal
+        run: target/debug/shoal scripts/ci-audit.shl

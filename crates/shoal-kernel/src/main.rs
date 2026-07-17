@@ -10,8 +10,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 const EMBEDDED_READY_FRAME: &[u8] = b"{\"shoal_embedded\":{\"ready\":true,\"protocol\":1}}\n";
+const HELP: &str = "Shoal resident kernel\n\nUsage: shoal-kernel [OPTIONS]\n\nOptions:\n  --session NAME\n  --socket PATH\n  --state-dir PATH\n  --policy FILE\n  --embedded-fd FD\n  --max-connections N\n  --max-sessions N\n  --max-tasks-per-session N\n  --max-ptys-per-session N\n  --max-ptys-per-principal N\n  --max-ptys-global N\n  --max-subscriptions-per-session N\n  --max-blob-decompressions-per-window N\n  --blob-decompression-window-ms N\n  --frame-read-timeout-ms N\n  -h, --help\n  -V, --version";
 
 fn main() {
+    let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if args.as_slice() == ["-h"] || args.as_slice() == ["--help"] {
+        println!("{HELP}");
+        return;
+    }
+    if args.as_slice() == ["-V"] || args.as_slice() == ["--version"] {
+        println!("shoal-kernel {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     if let Err(error) = run() {
         eprintln!("shoal-kernel: {error}");
         std::process::exit(1);
@@ -231,16 +241,23 @@ impl Args {
         while let Some(k) = it.next() {
             let missing = || format!("{} requires a value", k.to_string_lossy());
             match k.to_str() {
-                Some("--session") => a.session = it.next().ok_or_else(&missing)?.into_string().map_err(|_| "invalid session")?,
+                Some("--session") => {
+                    a.session = it
+                        .next()
+                        .ok_or_else(&missing)?
+                        .into_string()
+                        .map_err(|_| "invalid session")?
+                }
                 Some("--socket") => a.socket = Some(it.next().ok_or_else(&missing)?.into()),
                 Some("--state-dir") => a.state_dir = Some(it.next().ok_or_else(&missing)?.into()),
                 Some("--policy") => a.policy = Some(it.next().ok_or_else(&missing)?.into()),
                 Some("--embedded-fd") => {
-                    let fd = it.next()
-                            .ok_or_else(&missing)?
-                            .to_str()
-                            .and_then(|text| text.parse().ok())
-                            .ok_or_else(|| "--embedded-fd requires an integer".to_string())?;
+                    let fd = it
+                        .next()
+                        .ok_or_else(&missing)?
+                        .to_str()
+                        .and_then(|text| text.parse().ok())
+                        .ok_or_else(|| "--embedded-fd requires an integer".to_string())?;
                     if a.embedded_fd.replace(fd).is_some() {
                         return Err("--embedded-fd may be specified only once".into());
                     }
@@ -256,16 +273,14 @@ impl Args {
                         Some(parse_usize(&k, it.next().ok_or_else(&missing)?)?)
                 }
                 Some("--max-ptys-per-session") => {
-                    a.max_ptys_per_session =
-                        Some(parse_usize(&k, it.next().ok_or_else(&missing)?)?)
+                    a.max_ptys_per_session = Some(parse_usize(&k, it.next().ok_or_else(&missing)?)?)
                 }
                 Some("--max-ptys-per-principal") => {
                     a.max_ptys_per_principal =
                         Some(parse_usize(&k, it.next().ok_or_else(&missing)?)?)
                 }
                 Some("--max-ptys-global") => {
-                    a.max_ptys_global =
-                        Some(parse_usize(&k, it.next().ok_or_else(&missing)?)?)
+                    a.max_ptys_global = Some(parse_usize(&k, it.next().ok_or_else(&missing)?)?)
                 }
                 Some("--max-subscriptions-per-session") => {
                     a.max_subscriptions_per_session =
@@ -299,7 +314,6 @@ impl Args {
                             })?,
                     )
                 }
-                Some("-h" | "--help") => return Err("usage: shoal-kernel [--session NAME] [--socket PATH | --embedded-fd FD] [--state-dir PATH] [--policy FILE] [--max-connections N] [--max-sessions N] [--max-tasks-per-session N] [--max-ptys-per-session N] [--max-ptys-per-principal N] [--max-ptys-global N] [--max-subscriptions-per-session N] [--max-blob-decompressions-per-window N] [--blob-decompression-window-ms N] [--frame-read-timeout-ms N]".into()),
                 _ => return Err(format!("unknown argument {}", k.to_string_lossy())),
             }
         }

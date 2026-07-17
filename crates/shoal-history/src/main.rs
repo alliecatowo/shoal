@@ -13,6 +13,16 @@ fn main() {
     }
 }
 fn run(mut args: Vec<String>) -> Result<(), (i32, String)> {
+    if args.as_slice() == ["-h"] || args.as_slice() == ["--help"] {
+        println!(
+            "Shoal journal history\n\nUsage: shoal-history [--state-dir PATH] [--json] COMMAND [OPTIONS]\n\nCommands:\n  query   Filter journal entries\n  show    Show one entry\n  pin     Retain a CAS object\n  unpin   Release a CAS object\n  gc      Collect journal storage\n  status  Show storage use\n  undo    Apply an entry's inverse operations"
+        );
+        return Ok(());
+    }
+    if args.as_slice() == ["-V"] || args.as_slice() == ["--version"] {
+        println!("shoal-history {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     let mut state = shoal_paths::ShoalPaths::discover()
         .state_dir()
         .to_path_buf();

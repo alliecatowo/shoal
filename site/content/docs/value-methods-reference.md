@@ -97,7 +97,7 @@ report.save("report.json")
 "next line\n".append("events.log")
 ```
 
-Current security boundary: these value methods call `std::fs::OpenOptions` directly. They do not use the evaluator `Fs` port, do not inherently consult Leash policy, and do not automatically install journal undo. Treat them as direct host filesystem effects in the preview implementation.
+Security boundary: these value methods write through the evaluator's injected `Fs` port, so an embedding host can observe or deny them. The default production port is still `StdFs`; port routing does not by itself apply Leash policy or install journal undo.
 
 ### `feed`
 

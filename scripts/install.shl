@@ -1,0 +1,78 @@
+#!/usr/bin/env shoal
+# Build, install, and byte-verify every shipped Shoal executable.
+
+let options = args.map(.str())
+let supported = ["--clean", "--check"]
+let unknown = options.where(option => !(option in supported))
+assert(unknown.is_empty(), "usage: install.shl [--clean|--check]")
+assert(options.len() <= 1, "usage: install.shl [--clean|--check]")
+
+let clean = options.contains("--clean")
+let check_only = options.contains("--check")
+let home = (env HOME).out
+assert(home != null, "HOME is not set")
+let cargo_home = (env CARGO_HOME).out ?? "{home}/.cargo"
+let install_override = (env SHOAL_INSTALL_DIR).out
+let install_dir = path(install_override ?? "{cargo_home}/bin")
+assert(install_dir.display() != "" && install_dir.display() != "/", "unsafe install directory: {install_dir}")
+let man_override = (env SHOAL_MAN_DIR).out
+let prefix = install_dir.parent ?? path(cargo_home)
+let man_dir = path(man_override ?? prefix.join("share/man/man1").display())
+assert(man_dir.display() != "" && man_dir.display() != "/", "unsafe man directory: {man_dir}")
+
+let binaries = [
+  "shoal",
+  "shoal-kernel",
+  "shoal-mcp",
+  "shoal-lsp",
+  "shoal-token",
+  "shoal-secret",
+  "shoal-history",
+  "shoal-doctor",
+  "shoal-sandbox-exec",
+  "shoal-landlock-helper",
+]
+
+let lock_rows = (reef lock)
+let lock_failures = lock_rows.where(row => row.locked != true)
+assert(lock_failures.is_empty(), "Reef could not lock the repository toolchain: {lock_failures}")
+let pages = glob("man/*.1").expand()
+assert(pages.len() == binaries.len(), "expected {binaries.len()} man pages, found {pages.len()}")
+
+if !check_only {
+  if clean { run("cargo", "clean", "--release") }
+  run("cargo", "build", "--workspace", "--release", "--locked")
+  run("install", "-d", "-m", "0755", install_dir)
+  run("install", "-d", "-m", "0755", man_dir)
+  for binary in binaries {
+    let release = path("target/release").join(binary)
+    let destination = install_dir.join(binary)
+    assert(release.is_file, "missing release artifact: {release}")
+    run("install", "-m", "0755", release, destination)
+  }
+  for page in pages {
+    run("install", "-m", "0644", page, man_dir.join(page.name))
+  }
+}
+
+for binary in binaries {
+  let release = path("target/release").join(binary)
+  let installed = install_dir.join(binary)
+  assert(release.is_file, "missing release artifact: {release}")
+  assert(installed.is_file, "missing installed executable: {installed}")
+  let comparison = run("cmp", "-s", release, installed)
+  assert(comparison.ok, "installed executable differs from release artifact: {installed}")
+}
+
+for page in pages {
+  let installed = man_dir.join(page.name)
+  assert(installed.is_file, "missing installed man page: {installed}")
+  let comparison = run("cmp", "-s", page, installed)
+  assert(comparison.ok, "installed man page differs from source: {installed}")
+}
+
+env.SHOAL_BIN_DIR = install_dir.display()
+run("scripts/help-audit.shl")
+let version = run(install_dir.join("shoal"), "--version").out.trim()
+echo "{version}; installed {binaries.len()} executables and man pages under {prefix}"
+echo "restart an existing durable shoal-kernel when you are ready to discard its in-memory sessions"

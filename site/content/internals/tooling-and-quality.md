@@ -235,7 +235,7 @@ When reporting a result, record CPU/OS, build profile, sample count, dataset con
 revision, and whether caches are warm. A raw local wall-clock number without that context is not a
 release guarantee.
 
-`scripts/check.sh` runs:
+`scripts/check.shl` runs through Shoal:
 
 ```text
 cargo fmt --all -- --check

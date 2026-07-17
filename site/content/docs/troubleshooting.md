@@ -97,8 +97,9 @@ mise run install
 mise run install:clean
 ```
 
-`mise run install:check` verifies that every installed executable is identical
-to its current `target/release` artifact.
+`mise run install:check` executes every installed help/version contract and
+verifies that all ten executables and man pages are byte-identical to their
+current source artifacts.
 
 `rehash` is useful in zsh after a new executable appears; it is harmlessly skipped elsewhere.
 

@@ -1,0 +1,21 @@
+#!/usr/bin/env shoal
+# Run each fuzz target for the requested bounded number of seconds.
+
+let seconds_text = (env SHOAL_FUZZ_SECONDS).out ?? (if (args.is_empty()) { "120" } else { args.first().str() })
+let seconds = seconds_text.parse_int()
+assert(seconds >= 1 && seconds <= 3600, "fuzz budget must be between 1 and 3600 seconds")
+let targets = ["lexer", "parser", "proto_frame", "planner", "value_wire", "stream", "policy"]
+let locks = (reef lock)
+let cargo_lock = locks.find(.name == "cargo")
+assert(cargo_lock != null && cargo_lock.locked, "CI could not lock cargo through Reef: {locks}")
+if ((which clang).out == null) {
+  run("sudo", "apt-get", "update")
+  run("sudo", "apt-get", "install", "-y", "clang")
+}
+let fuzz_lock = locks.find(.name == "cargo-fuzz")
+assert(fuzz_lock != null && fuzz_lock.locked, "CI could not lock cargo-fuzz through Reef: {locks}")
+for target in targets {
+  echo "fuzzing {target} for {seconds}s"
+  run("cargo", "fuzz", "run", target, "--fuzz-dir", "fuzz", "--", "-max_total_time={seconds}")
+}
+echo "nightly fuzz smoke passed for {targets.len()} targets"

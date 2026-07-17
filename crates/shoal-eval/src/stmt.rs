@@ -300,12 +300,14 @@ impl Evaluator {
             if !matches!(last, Flow::Value(_)) {
                 break;
             }
-            // A discarded tail whose value is not a bare command (e.g. a nested
-            // `if`/block that produced a command outcome) still routes to the
-            // sink so loop-body side effects are not swallowed.
+            // A discarded tail whose value is a nested command outcome still
+            // routes to the sink so loop-body command output is not swallowed.
+            // Do not sink arbitrary values here: assignment is itself the tail
+            // of common `if` branches and printing every assigned scalar makes
+            // operational loops unusably noisy.
             if is_tail
                 && sink_tail
-                && let Flow::Value(v) = &last
+                && let Flow::Value(v @ Value::Outcome(_)) = &last
             {
                 self.sink_value(v);
             }

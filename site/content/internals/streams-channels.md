@@ -458,7 +458,7 @@ the same cancellation token.
 - Kernel `WireValue::Stream` carries only a label; there is no RPC cursor/pull/chunk lifecycle.
 - Dropped/coalesced markers widen stream element shapes without a static type system expressing it.
 - Timer and timing combinators use direct system time/sleep, reducing deterministic testability.
-- Watch existence/root discovery bypasses `Fs`; tail content reads use it.
+- Watch existence/root discovery and tail content reads use the inherited `Fs` port.
 - Stream save/append cross the evaluator's configured `Fs` port (`open_append`, HR-C2) but still
   bypass journal undo; production's configured port is currently `StdFs`, not Leash confinement.
 - Predicate/signal `take_until` does not mark an unbounded stream collectable.

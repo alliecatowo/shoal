@@ -442,15 +442,15 @@ Landlock/Seatbelt wraps external children. Builtins, value `.save`, module disco
 journal access, network namespace methods, and other evaluator work occur in the parent process.
 They must be gated by semantic policy and routed through enforceable ports.
 
-Current filesystem port coverage is incomplete on the **read** side: several
-`Path::exists/is_dir/canonicalize` observations still bypass injected `Fs`. Every language-visible
-**write** now crosses the port — value `.save`/`.append` and stream `.save` route through
+Language-visible reads, path probes/canonicalization, watchers, and writes now cross the injected
+filesystem port. Value `.save`/`.append` and stream `.save` route through
 `CallCtx::fs()` (HR-C1/HR-C2), so an injected fake can observe or deny them (inventory in the HR-C3
 ledger in [effects, plans, ports, and authority](@/internals/effects-plans-security.md)). The
 evaluator returns its configured `Arc<dyn Fs>` and tests prove denial end to end, but production
 hosts currently configure no policy-aware filesystem adapter: the default remains `StdFs`, with
-real parent-process authority. Landlock/Seatbelt only wraps external children. Port routing is the
-necessary enforcement seam, not a claim that Leash presently confines in-process I/O.
+real parent-process authority. Host-owned persistence/artifact code retains narrow explicit ambient
+exceptions. Landlock/Seatbelt only wraps external children. Port routing is the necessary
+enforcement seam, not a claim that Leash presently confines in-process I/O.
 
 ## Secret store design
 

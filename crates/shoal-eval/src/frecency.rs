@@ -1147,6 +1147,11 @@ notanumber\t100\t/bad/rank
                 line: Some(422),
                 text: ".map(|m| m.is_file())",
             },
+            ExpectedLine {
+                file: "script.rs",
+                line: None,
+                text: "metadata.is_file() && metadata.permissions().mode() & 0o111 != 0",
+            },
         ];
 
         // The only ambient filesystem operations in evaluator production:

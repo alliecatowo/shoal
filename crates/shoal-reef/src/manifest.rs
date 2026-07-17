@@ -117,8 +117,20 @@ impl ReefManifest {
         }
         let mut tools = BTreeMap::new();
         for (name, val) in raw.tools {
-            if let Some(constraint) = val.constraint() {
-                tools.insert(name, ToolReq::new(constraint));
+            let Some(constraint) = val.constraint() else {
+                continue;
+            };
+            // mise keys name plugins/backends, while Reef keys name actual
+            // executable heads. Normalize cargo backends and expand the Rust
+            // toolchain plugin into the commands repository automation uses.
+            if name == "rust" {
+                tools.insert("cargo".into(), ToolReq::new(constraint.clone()));
+                tools.insert("rustc".into(), ToolReq::new(constraint));
+            } else {
+                let command = name
+                    .rsplit_once(':')
+                    .map_or(name.as_str(), |(_, tail)| tail);
+                tools.insert(command.to_string(), ToolReq::new(constraint));
             }
         }
         let manifest = ReefManifest {
@@ -425,6 +437,24 @@ go = { version = "1.21" }
         assert_eq!(m.tools["node"].constraint, Constraint::parse("22"));
         assert_eq!(m.tools["python"].constraint, Constraint::parse("3.12"));
         assert_eq!(m.tools["go"].constraint, Constraint::parse("1.21"));
+    }
+
+    #[test]
+    fn parse_foreign_mise_normalizes_backend_and_toolchain_names() {
+        let text = r#"
+[tools]
+rust = "1.97.0"
+"cargo:cargo-audit" = "0.22.2"
+"#;
+        let m = ReefManifest::parse_mise(text).unwrap();
+        assert_eq!(m.tools["cargo"].constraint, Constraint::parse("1.97.0"));
+        assert_eq!(m.tools["rustc"].constraint, Constraint::parse("1.97.0"));
+        assert_eq!(
+            m.tools["cargo-audit"].constraint,
+            Constraint::parse("0.22.2")
+        );
+        assert!(!m.tools.contains_key("rust"));
+        assert!(!m.tools.contains_key("cargo:cargo-audit"));
     }
 
     #[test]

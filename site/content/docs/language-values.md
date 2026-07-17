@@ -240,7 +240,7 @@ p.abs()
 "more".append(p)
 ```
 
-Most file content reads and mutations go through the evaluator's host filesystem port, which supports embedding and testing. The boundary is not complete today: some path classification, canonicalization/navigation, watcher checks, and value/stream `.save` paths call the platform filesystem directly. Do not treat the port as a complete sandbox boundary. Mutation participates in journaling/undo only where the host installs those facilities and the operation has a recorded inverse.
+Language-visible file reads, probes, navigation, watchers, and mutations go through the evaluator's host filesystem port, which supports embedding and denial tests. The production host currently installs `StdFs`, so this seam is not itself an in-process sandbox. Mutation participates in journaling/undo only where the host installs those facilities and the operation has a recorded inverse.
 
 ## Interactive picking
 

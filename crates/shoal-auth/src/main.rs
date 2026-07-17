@@ -9,6 +9,16 @@ fn main() {
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut a = std::env::args().skip(1);
     let cmd = a.next().ok_or("usage: shoal-token create|list|revoke")?;
+    if cmd == "-h" || cmd == "--help" {
+        println!(
+            "Shoal capability tokens\n\nUsage:\n  shoal-token create PRINCIPAL [PROFILE] [--cap CAP] [--ttl SECONDS]\n  shoal-token list\n  shoal-token revoke ID"
+        );
+        return Ok(());
+    }
+    if cmd == "-V" || cmd == "--version" {
+        println!("shoal-token {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     let path = std::env::var_os("SHOAL_TOKEN_STORE")
         .map(PathBuf::from)
         .unwrap_or_else(|| {

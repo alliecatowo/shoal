@@ -1,0 +1,30 @@
+#!/usr/bin/env shoal
+# Guard architectural invariants that are awkward to express as Rust tests.
+
+let kernel_sources = glob("crates/shoal-kernel/src/**/*.rs").expand()
+let raw_lock_pattern = re"(?s)\\\\.(lock|read|write)\\\\(\\\\)\\\\s*\\\\.unwrap\\\\(\\\\)"
+let raw_lock_violations = kernel_sources.where((file) => (file.read.match(raw_lock_pattern) != null))
+assert(raw_lock_violations.is_empty(), "raw kernel lock unwraps bypass poison policy: {raw_lock_violations}")
+let rust_sources = glob("crates/**/*.rs").expand()
+let source_rows = rust_sources.map(file => ({path: file, lines: file.read.lines().len()}))
+let production_oversized = source_rows
+  .where(row => !row.path.name.ends_with("tests.rs") && !row.path.display().contains("/benches/"))
+  .where(row => row.lines > 2100)
+let test_oversized = source_rows
+  .where(row => row.path.name.ends_with("tests.rs"))
+  .where(row => row.lines > 6000)
+assert(production_oversized.is_empty(), "production Rust files exceed 2100 lines: {production_oversized}")
+assert(test_oversized.is_empty(), "Rust test modules exceed 6000 lines: {test_oversized}")
+let shell_files = run("git", "ls-files", "*.sh").out.str().lines()
+  .where(line => !line.is_empty() && path(line).exists)
+assert(shell_files.is_empty(), "repository-owned shell scripts remain: {shell_files}")
+
+let workflows = glob(".github/workflows/*.yml", hidden: true).expand()
+let workflow_lines = workflows.flat_map(file => file.read.lines().map(line => "{file}:{line.trim()}"))
+let shell_blocks = workflow_lines.where(line => line.contains("run: |") || line.contains("run: >") || line.contains("shell: bash") || line.contains("shell: sh"))
+assert(shell_blocks.is_empty(), "workflow shell blocks remain: {shell_blocks}")
+let raw_runs = workflow_lines.where(.contains(":run: "))
+let foreign_runs = raw_runs.where(line => !line.contains("run: cargo build -p shoal --locked") && !line.contains("run: target/debug/shoal "))
+assert(foreign_runs.is_empty(), "workflow logic bypasses Shoal: {foreign_runs}")
+
+echo "source audit: {kernel_sources.len()} kernel files, {rust_sources.len()} Rust files, {workflows.len()} Shoal-driven workflows"

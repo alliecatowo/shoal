@@ -7,16 +7,40 @@ zola = "0.22.1"
 
 [tasks.check]
 description = "Run the exact local CI/release gate"
-run = "./scripts/check.sh"
+depends = ["bootstrap:debug"]
+run = "target/debug/shoal scripts/check.shl"
+
+[tasks."bootstrap:debug"]
+description = "Compile the Shoal executable needed to run repository automation"
+hide = true
+run = "cargo build -p shoal --locked"
+
+[tasks."bootstrap:release"]
+description = "Compile the optimized Shoal executable needed for installation"
+hide = true
+run = "cargo build -p shoal --release --locked"
 
 [tasks.install]
 description = "Build and install every Shoal executable"
-run = "./scripts/install.sh"
+depends = ["bootstrap:release"]
+run = "target/release/shoal scripts/install.shl"
 
 [tasks."install:clean"]
 description = "Remove release artifacts, then rebuild and install every Shoal executable"
-run = "./scripts/install.sh --clean"
+depends = ["bootstrap:release"]
+run = "target/release/shoal scripts/install.shl --clean"
 
 [tasks."install:check"]
 description = "Verify installed Shoal executables match the current release artifacts"
-run = "./scripts/install.sh --check"
+depends = ["bootstrap:release"]
+run = "target/release/shoal scripts/install.shl --check"
+
+[tasks."reef:lock"]
+description = "Resolve and lock the repository toolchain through Reef"
+depends = ["bootstrap:debug"]
+run = "target/debug/shoal -c 'reef lock'"
+
+[tasks."help:audit"]
+description = "Execute every binary help/version contract and validate man pages"
+depends = ["bootstrap:debug"]
+run = "target/debug/shoal scripts/help-audit.shl"

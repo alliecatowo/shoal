@@ -28,18 +28,38 @@ impl MiseProvider {
         MiseProvider { data_dir }
     }
 
-    fn installs_dir(&self, tool: &str) -> PathBuf {
-        self.data_dir.join("installs").join(tool)
+    fn installs_root(&self) -> PathBuf {
+        self.data_dir.join("installs")
     }
 
-    /// Path to the tool binary for an installed version, if present.
-    fn binary_for(&self, tool: &str, version_dir: &str) -> Option<PathBuf> {
-        let bin = self
-            .installs_dir(tool)
-            .join(version_dir)
-            .join("bin")
-            .join(tool);
-        is_executable(&bin).then_some(bin)
+    /// mise plugins use both `<version>/<tool>` (downloaded binaries) and
+    /// `<version>/bin/<tool>` (language/cargo installs). Backend-qualified
+    /// plugin directories such as `cargo-cargo-audit` still expose the
+    /// executable as `cargo-audit`.
+    fn binary_for(&self, tool: &str, version_dir: &std::path::Path) -> Option<PathBuf> {
+        [version_dir.join(tool), version_dir.join("bin").join(tool)]
+            .into_iter()
+            .find(|path| is_executable(path))
+    }
+
+    fn install_dirs(&self, tool: &str) -> Vec<PathBuf> {
+        let root = self.installs_root();
+        let mut dirs = vec![root.join(tool)];
+        if matches!(tool, "cargo" | "rustc") {
+            dirs.push(root.join("rust"));
+        }
+        let suffix = format!("-{tool}");
+        if let Ok(entries) = std::fs::read_dir(&root) {
+            for entry in entries.flatten().take(1024) {
+                let name = entry.file_name();
+                if name.to_str().is_some_and(|name| name.ends_with(&suffix))
+                    && !dirs.iter().any(|path| path == &entry.path())
+                {
+                    dirs.push(entry.path());
+                }
+            }
+        }
+        dirs
     }
 }
 
@@ -49,22 +69,23 @@ impl Provider for MiseProvider {
     }
 
     fn discover(&self, tool: &str, _ctx: &ProviderCtx) -> Vec<Candidate> {
-        let dir = self.installs_dir(tool);
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            return Vec::new();
-        };
         let mut out = Vec::new();
-        for entry in entries.flatten() {
-            let Ok(ft) = entry.file_type() else { continue };
-            if !ft.is_dir() && !ft.is_symlink() {
-                continue;
-            }
-            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+        for dir in self.install_dirs(tool) {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
                 continue;
             };
-            if let Some(bin) = self.binary_for(tool, &name) {
-                // Version comes free from the directory name — no probe needed.
-                out.push(Candidate::new(tool, Version::parse(&name), bin, "mise"));
+            for entry in entries.flatten().take(1024) {
+                let Ok(ft) = entry.file_type() else { continue };
+                if !ft.is_dir() && !ft.is_symlink() {
+                    continue;
+                }
+                let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                    continue;
+                };
+                if let Some(bin) = self.binary_for(tool, &entry.path()) {
+                    // Version comes free from the directory name — no probe needed.
+                    out.push(Candidate::new(tool, Version::parse(&name), bin, "mise"));
+                }
             }
         }
         out
@@ -167,6 +188,40 @@ mod tests {
         let data = tempfile::tempdir().unwrap();
         let p = MiseProvider::new(data.path().into());
         assert!(p.discover("ghost", &ProviderCtx::new("/")).is_empty());
+    }
+
+    #[test]
+    fn discovers_root_level_and_backend_qualified_binaries() {
+        let data = tempfile::tempdir().unwrap();
+        let root = data.path().join("installs/actionlint/1.7.12");
+        std::fs::create_dir_all(&root).unwrap();
+        let bin = root.join("actionlint");
+        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        let mut permissions = std::fs::metadata(&bin).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&bin, permissions).unwrap();
+
+        let cargo_root = data.path().join("installs/cargo-cargo-audit/0.22.2/bin");
+        std::fs::create_dir_all(&cargo_root).unwrap();
+        let cargo_bin = cargo_root.join("cargo-audit");
+        std::fs::write(&cargo_bin, b"#!/bin/sh\n").unwrap();
+        let mut permissions = std::fs::metadata(&cargo_bin).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&cargo_bin, permissions).unwrap();
+
+        let provider = MiseProvider::new(data.path().into());
+        assert_eq!(
+            provider
+                .discover("actionlint", &ProviderCtx::new("/"))
+                .len(),
+            1
+        );
+        assert_eq!(
+            provider
+                .discover("cargo-audit", &ProviderCtx::new("/"))
+                .len(),
+            1
+        );
     }
 
     #[test]

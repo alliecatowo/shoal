@@ -27,6 +27,17 @@ fn secret_name(name: &OsStr) -> std::io::Result<&str> {
 }
 
 fn main() {
+    let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if args.as_slice() == ["-h"] || args.as_slice() == ["--help"] {
+        println!(
+            "Shoal secret store\n\nUsage:\n  shoal-secret set NAME < VALUE\n  shoal-secret list\n  shoal-secret delete NAME"
+        );
+        return;
+    }
+    if args.as_slice() == ["-V"] || args.as_slice() == ["--version"] {
+        println!("shoal-secret {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     let dir = shoal_paths::ShoalPaths::discover()
         .data_dir()
         .join("secrets");
@@ -37,7 +48,6 @@ fn main() {
             std::process::exit(2)
         }
     };
-    let args = std::env::args_os().skip(1).collect::<Vec<_>>();
     let r = match args.as_slice() {
         [cmd] if cmd == OsStr::new("list") => store.list().map(|v| {
             for n in v {

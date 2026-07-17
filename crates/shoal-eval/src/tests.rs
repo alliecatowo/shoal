@@ -57,6 +57,20 @@ fn defect1_nonfinal_and_block_commands_reach_sink() {
     );
 }
 
+#[test]
+fn loop_assignment_branches_do_not_leak_values_to_output() {
+    let (out, captured) =
+        run_capturing("var total = 0\nfor n in [1, 2, 3] { if n > 0 { total += n } }\ntotal");
+    assert_eq!(out.unwrap(), Value::Int(6));
+    assert!(captured.is_empty(), "assigned values leaked: {captured:?}");
+
+    let (_out, captured) = run_capturing("for n in [1, 2] { if n > 0 { echo (n) } }");
+    assert_eq!(
+        captured.iter().map(out_of).collect::<Vec<_>>(),
+        vec![Value::Str("1".into()), Value::Str("2".into()),]
+    );
+}
+
 /// `render.echo` (site/content/internals/configuration-reference.md): [`EchoMode`] gates which non-final
 /// top-level statement values route to the statement sink. `Quiet`/
 /// `Commands` suppress intermediate pure expressions (`1+1`) but still echo

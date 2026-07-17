@@ -8,9 +8,9 @@ name: Scheduled fuzz
 # instead of silently sitting unexercised.
 #
 # Budget choice: 120s per target is a deliberate smoke, not exhaustive, tradeoff. Targets run as a
-# matrix so syntax, planner, value/wire, frame, stream, and policy failures are isolated and can run
-# concurrently. Checked-in seeds provide useful starting states; longer corpus-accumulating
-# campaigns remain complementary to this bounded nightly gate.
+# sequentially in one real Shoal program so target enumeration and failure handling are dogfooded.
+# Checked-in seeds provide useful starting states; longer corpus-accumulating campaigns remain
+# complementary to this bounded nightly gate.
 
 on:
   schedule:
@@ -36,35 +36,29 @@ env:
 
 jobs:
   fuzz:
-    name: fuzz (${{ matrix.target }})
+    name: fuzz through Shoal
     runs-on: ubuntu-latest
     # Override the repository's pinned stable toolchain for cargo-fuzz.
     env:
       RUSTUP_TOOLCHAIN: nightly
-    strategy:
-      fail-fast: false
-      matrix:
-        target: [lexer, parser, proto_frame, planner, value_wire, stream, policy]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # nightly 2026-07-17
+      - uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          key: fuzz-${{ matrix.target }}
+          key: fuzz-nightly
           workspaces: fuzz -> target
-      - run: sudo apt-get update && sudo apt-get install -y clang
-      # Keep this synchronized with ci.yml; `--locked` does not select the tool release.
-      - run: cargo install cargo-fuzz --version 0.13.2 --locked
-      # cargo-fuzz has no --locked option; reject fuzz/Cargo.lock drift first.
-      - run: cargo metadata --manifest-path fuzz/Cargo.toml --locked --no-deps --format-version 1 > /dev/null
-      - name: Run ${{ matrix.target }} for a bounded budget
-        run: |
-          cargo fuzz run "${{ matrix.target }}" --fuzz-dir fuzz -- \
-            -max_total_time="${{ github.event.inputs.seconds_per_target || '120' }}"
+      - name: Bootstrap Shoal
+        run: cargo build -p shoal --locked
+      - name: Run bounded campaigns through Shoal
+        env:
+          SHOAL_FUZZ_SECONDS: ${{ github.event.inputs.seconds_per_target || '120' }}
+        run: target/debug/shoal scripts/ci-fuzz-nightly.shl
       - name: Upload crash artifacts
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: fuzz-crash-${{ matrix.target }}
-          path: fuzz/artifacts/${{ matrix.target }}/
+          name: fuzz-crashes
+          path: fuzz/artifacts/
           if-no-files-found: ignore

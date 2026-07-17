@@ -12,7 +12,17 @@ use shoal_syntax::parse;
 
 use crate::prompt;
 
-pub(crate) const USAGE: &str = "shoal 0.1.0\n\nUsage: shoal [OPTIONS] [SCRIPT]\n       shoal <fmt|doctor|kernel|lsp|mcp|completions|prompt> ...\n\nOptions:\n  -c, --command <SOURCE>  Evaluate source and exit\n  --standalone            Run an explicit embedded/offline REPL\n  -h, --help              Print help\n  -V, --version           Print version\n\nCommands:\n  kernel start|status|stop [--json]  Manage the resident kernel\n\nDeveloper commands:\n  fmt [--check] [FILES]   Format .shl source (stdin when no files)\n  doctor [--json]         Diagnose the installation\n  lsp                     Run the language server companion\n  mcp                     Run the MCP companion\n  completions SHELL       Print bash, zsh, or fish completions\n  prompt explain|bench|print [--side left|right|continuation|transient] [--n N]";
+pub(crate) const USAGE: &str = "Shoal language and interactive shell\n\nUsage: shoal [OPTIONS] [SCRIPT [ARGS...]]\n       shoal <COMMAND> [ARGS...]\n\nOptions:\n  -c, --command SOURCE  Evaluate source\n  --standalone          Use an embedded kernel\n  -h, --help            Print help\n  -V, --version         Print version\n\nCommands:\n  kernel      Manage the resident kernel\n  fmt         Format .shl source\n  doctor      Diagnose the installation\n  lsp         Run the language server\n  mcp         Run the MCP server\n  completions Generate shell completions\n  prompt      Inspect and benchmark the prompt";
+pub(crate) const FMT_USAGE: &str = "Format Shoal source\n\nUsage: shoal fmt [--check] [FILE...]\n\nWith no files, reads standard input.";
+pub(crate) const DOCTOR_USAGE: &str =
+    "Diagnose the Shoal installation\n\nUsage: shoal doctor [--json]";
+pub(crate) const KERNEL_USAGE: &str =
+    "Manage the resident kernel\n\nUsage: shoal kernel <start|status|stop> [--json]";
+pub(crate) const LSP_USAGE: &str = "Run the language server\n\nUsage: shoal lsp";
+pub(crate) const MCP_USAGE: &str = "Run the MCP server\n\nUsage: shoal mcp";
+pub(crate) const COMPLETIONS_USAGE: &str =
+    "Generate shell completions\n\nUsage: shoal completions <bash|zsh|fish>";
+pub(crate) const PROMPT_USAGE: &str = "Inspect and benchmark the prompt\n\nUsage: shoal prompt <explain|print|bench> [--side SIDE] [--n N]\n\nSIDE is left, right, continuation, or transient.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KernelAction {
@@ -26,7 +36,7 @@ pub(crate) enum Action {
     Script(PathBuf, Vec<OsString>),
     Stdin,
     Interactive { standalone: bool },
-    Help,
+    Help(&'static str),
     Version,
     Fmt { check: bool, files: Vec<PathBuf> },
     Doctor { json: bool },
@@ -51,7 +61,9 @@ pub(crate) fn parse_args(args: Vec<OsString>, stdin_is_tty: bool) -> Result<Acti
             let mut check = false;
             let mut files = vec![];
             for a in iter {
-                if a == "--check" {
+                if a == "-h" || a == "--help" {
+                    return Ok(Action::Help(FMT_USAGE));
+                } else if a == "--check" {
                     check = true
                 } else if a.to_str().is_some_and(|s| s.starts_with('-')) {
                     return Err(format!("unknown fmt option `{}`", a.to_string_lossy()));
@@ -63,6 +75,9 @@ pub(crate) fn parse_args(args: Vec<OsString>, stdin_is_tty: bool) -> Result<Acti
         }
         Some("doctor") => {
             let args = iter.collect::<Vec<_>>();
+            if args.as_slice() == ["-h"] || args.as_slice() == ["--help"] {
+                return Ok(Action::Help(DOCTOR_USAGE));
+            }
             if args.iter().any(|a| a != "--json") {
                 return Err("doctor accepts only --json".into());
             }
@@ -77,6 +92,9 @@ pub(crate) fn parse_args(args: Vec<OsString>, stdin_is_tty: bool) -> Result<Acti
                         .map_err(|_| "kernel arguments must be UTF-8".to_string())
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            if args.as_slice() == ["-h"] || args.as_slice() == ["--help"] {
+                return Ok(Action::Help(KERNEL_USAGE));
+            }
             let (verb, rest) = args
                 .split_first()
                 .ok_or("kernel requires start, status, or stop")?;
@@ -94,23 +112,33 @@ pub(crate) fn parse_args(args: Vec<OsString>, stdin_is_tty: bool) -> Result<Acti
             Ok(Action::Kernel(action))
         }
         Some("prompt") => {
-            let args = iter.filter_map(|a| a.into_string().ok());
-            Ok(Action::Prompt(prompt::parse_action(args)?))
+            let args = iter
+                .filter_map(|a| a.into_string().ok())
+                .collect::<Vec<_>>();
+            if args.as_slice() == ["-h"] || args.as_slice() == ["--help"] {
+                Ok(Action::Help(PROMPT_USAGE))
+            } else {
+                Ok(Action::Prompt(prompt::parse_action(args.into_iter())?))
+            }
         }
-        Some("lsp") => no_trailing(iter, Action::Companion("shoal-lsp")),
-        Some("mcp") => no_trailing(iter, Action::Companion("shoal-mcp")),
+        Some("lsp") => companion_or_help(iter, "shoal-lsp", LSP_USAGE),
+        Some("mcp") => companion_or_help(iter, "shoal-mcp", MCP_USAGE),
         Some("completions") => {
-            let shell = iter
+            let first = iter
                 .next()
                 .ok_or("completions requires bash, zsh, or fish")?
                 .into_string()
                 .map_err(|_| "shell name is not UTF-8")?;
+            if first == "-h" || first == "--help" {
+                return no_trailing(iter, Action::Help(COMPLETIONS_USAGE));
+            }
+            let shell = first;
             if iter.next().is_some() {
                 return Err("unexpected completion argument".into());
             }
             Ok(Action::Completions(shell))
         }
-        Some("-h" | "--help") => no_trailing(iter, Action::Help),
+        Some("-h" | "--help") => no_trailing(iter, Action::Help(USAGE)),
         Some("-V" | "--version") => no_trailing(iter, Action::Version),
         Some("-c" | "--command") => {
             let source = iter
@@ -131,6 +159,18 @@ pub(crate) fn parse_args(args: Vec<OsString>, stdin_is_tty: bool) -> Result<Acti
     }
 }
 
+fn companion_or_help(
+    mut iter: impl Iterator<Item = OsString>,
+    name: &'static str,
+    usage: &'static str,
+) -> Result<Action, String> {
+    match iter.next() {
+        None => Ok(Action::Companion(name)),
+        Some(arg) if arg == "-h" || arg == "--help" => no_trailing(iter, Action::Help(usage)),
+        Some(_) => Err("unexpected argument".into()),
+    }
+}
+
 fn no_trailing(mut iter: impl Iterator<Item = OsString>, action: Action) -> Result<Action, String> {
     if iter.next().is_some() {
         Err("unexpected argument".into())
@@ -143,7 +183,7 @@ pub(crate) fn fmt_command(check: bool, files: Vec<PathBuf>) -> Result<i32, Strin
     if files.is_empty() {
         let src = read_source_stream(io::stdin().lock(), "stdin")?;
         let ast = parse(&src).map_err(|e| format!("stdin: {e}"))?;
-        let formatted = shoal_syntax::format_program(&ast);
+        let formatted = format_source_safely(&src, &ast);
         if check {
             return Ok(i32::from(formatted != src));
         }
@@ -154,7 +194,7 @@ pub(crate) fn fmt_command(check: bool, files: Vec<PathBuf>) -> Result<i32, Strin
     for path in files {
         let src = read_source_path(&path)?;
         let ast = parse(&src).map_err(|e| format!("{}: {e}", path.display()))?;
-        let formatted = shoal_syntax::format_program(&ast);
+        let formatted = format_source_safely(&src, &ast);
         if formatted != src {
             changed = true;
             if !check {
@@ -163,6 +203,18 @@ pub(crate) fn fmt_command(check: bool, files: Vec<PathBuf>) -> Result<i32, Strin
         }
     }
     Ok(if check && changed { 1 } else { 0 })
+}
+
+/// The current AST intentionally omits free comments/trivia. Until that model
+/// grows lossless trivia, never rewrite a source containing `#`: doing so
+/// would silently delete shebangs, operational notes, and inline comments.
+/// A false positive for `#` inside a string merely leaves valid source alone.
+fn format_source_safely(src: &str, ast: &shoal_ast::Program) -> String {
+    if src.contains('#') {
+        src.to_owned()
+    } else {
+        shoal_syntax::format_program(ast)
+    }
 }
 
 pub(crate) fn read_source_path(path: &Path) -> Result<String, String> {
@@ -304,6 +356,12 @@ mod tests {
         assert_eq!(fmt_command(true, vec![path.clone()]).unwrap(), 1);
         assert_eq!(fmt_command(false, vec![path.clone()]).unwrap(), 0);
         assert_eq!(fmt_command(true, vec![path]).unwrap(), 0);
+
+        let commented = t.path().join("commented.shl");
+        let original = "#!/usr/bin/env shoal\nlet x=1 # keep this note\n";
+        fs::write(&commented, original).unwrap();
+        assert_eq!(fmt_command(false, vec![commented.clone()]).unwrap(), 0);
+        assert_eq!(fs::read_to_string(commented).unwrap(), original);
     }
 
     #[test]

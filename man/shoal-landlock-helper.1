@@ -1,0 +1,12 @@
+.TH SHOAL-LANDLOCK-HELPER 1 "July 2026" "Shoal 0.1.0" "User Commands"
+.SH NAME
+shoal-landlock-helper \- probe Shoal Landlock enforcement
+.SH SYNOPSIS
+.B shoal-landlock-helper
+.I allowed_path denied_path
+.SH DESCRIPTION
+Internal installation diagnostic that verifies an allowed path remains readable while a denied path does not.
+Its exit status is intended for Shoal Doctor rather than interactive use.
+.SH SEE ALSO
+.BR shoal-doctor (1),
+.BR shoal-sandbox-exec (1)

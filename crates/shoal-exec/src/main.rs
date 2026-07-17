@@ -1,7 +1,18 @@
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 fn main() {
-    let mut a = std::env::args_os().skip(1);
+    let raw = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if raw.as_slice() == ["-h"] || raw.as_slice() == ["--help"] {
+        println!(
+            "Run a command in a Shoal filesystem sandbox\n\nUsage: shoal-sandbox-exec [--read PATH] [--write PATH] [--delete PATH] -- COMMAND [ARG...]"
+        );
+        return;
+    }
+    if raw.as_slice() == ["-V"] || raw.as_slice() == ["--version"] {
+        println!("shoal-sandbox-exec {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+    let mut a = raw.into_iter();
     let mut s = shoal_leash::FsSandbox::default();
     let mut cmd = Vec::new();
     while let Some(x) = a.next() {

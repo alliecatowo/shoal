@@ -147,6 +147,13 @@ impl Evaluator {
         let scripty = ext.as_deref().is_some_and(|e| {
             e == "rs" || self.reef_chain_snapshot().runner_table().get(e).is_some()
         });
+        if is_path && ext.is_none() && self.looks_like_native_executable(&resolved) {
+            let mut argv = vec![resolved.into_os_string()];
+            for value in args {
+                argv.push(self.argv_value(value)?);
+            }
+            return self.run_argv(argv, position, StdinSpec::Null, &[], Span::default(), None);
+        }
         if is_path || (scripty && self.host.fs.exists(&resolved)) {
             debug_assert_eq!(
                 self.resolve_dynamic_run(&name, true).source,
@@ -164,6 +171,39 @@ impl Evaluator {
             argv.push(self.argv_value(v)?);
         }
         self.run_argv(argv, position, StdinSpec::Null, &[], Span::default(), None)
+    }
+
+    /// Distinguish an extensionless native executable from extensionless
+    /// Shoal source without escaping the session's filesystem capability.
+    fn looks_like_native_executable(&self, path: &Path) -> bool {
+        use std::io::Read;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if !self.host.fs.metadata(path).is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            }) {
+                return false;
+            }
+        }
+        let mut magic = [0u8; 4];
+        let Ok(mut file) = self.host.fs.open_read(path) else {
+            return false;
+        };
+        if file.read_exact(&mut magic).is_err() {
+            return false;
+        }
+        matches!(
+            magic,
+            [0x7f, b'E', b'L', b'F']
+                | [0xfe, 0xed, 0xfa, 0xce]
+                | [0xfe, 0xed, 0xfa, 0xcf]
+                | [0xce, 0xfa, 0xed, 0xfe]
+                | [0xcf, 0xfa, 0xed, 0xfe]
+                | [0xca, 0xfe, 0xba, 0xbe]
+                | [0xbe, 0xba, 0xfe, 0xca]
+        )
     }
 
     pub(crate) fn run_script_file(
@@ -391,6 +431,16 @@ mod tests {
                 .unwrap(),
             Value::Int(42)
         );
+    }
+
+    #[test]
+    fn extensionless_native_executable_path_runs_as_a_process() {
+        let mut evaluator = Evaluator::new(std::env::current_dir().unwrap());
+        let program = shoal_syntax::parse(r#"run("/bin/true")"#).unwrap();
+        let Value::Outcome(outcome) = evaluator.eval_program(&program).unwrap() else {
+            panic!("native executable should return an outcome")
+        };
+        assert!(outcome.ok);
     }
 
     #[test]

@@ -1,0 +1,34 @@
+.TH SHOAL 1 "July 2026" "Shoal 0.1.0" "User Commands"
+.SH NAME
+shoal \- run the Shoal language and interactive shell
+.SH SYNOPSIS
+.B shoal
+.RI [ options ]
+.RI [ script
+.IR args ...]
+.br
+.B shoal
+.I command
+.RI [ args ...]
+.SH DESCRIPTION
+Shoal is a structured, typed shell language backed by a resident execution kernel.
+.SH OPTIONS
+.TP
+.BR \-c , " \-\-command " SOURCE
+Evaluate source and exit.
+.TP
+.B \-\-standalone
+Use an embedded kernel.
+.TP
+.BR \-h , " \-\-help"
+Print help.
+.TP
+.BR \-V , " \-\-version"
+Print the version.
+.SH COMMANDS
+.BR kernel , fmt , doctor , lsp , mcp , completions , prompt .
+.SH SEE ALSO
+.BR shoal-kernel (1),
+.BR shoal-history (1),
+.BR shoal-secret (1),
+.BR shoal-token (1)

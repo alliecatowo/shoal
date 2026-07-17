@@ -62,7 +62,7 @@ a Pages artifact.
 
 ## Diagram governance
 
-Run `./site/scripts/check-diagrams.sh` before building. The dependency-free check enforces the
+Run `target/debug/shoal site/scripts/check-diagrams.shl` before building. The Shoal program enforces the
 curated 123-diagram inventory, per-page limits (three in the Manual, six in Architecture), and
 native Mermaid `accTitle`/`accDescr` metadata. Diagrams must explain a relationship already covered
 by adjacent prose; they are not decorative substitutes for the text.

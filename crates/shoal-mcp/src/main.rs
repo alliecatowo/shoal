@@ -1,3 +1,5 @@
+const HELP: &str = "Shoal MCP server\n\nUsage: shoal-mcp [OPTIONS]\n\nOptions:\n  --socket PATH\n  --session NAME\n  --token TOKEN\n  --local-human\n  -h, --help\n  -V, --version";
+
 fn main() {
     let mut config = shoal_mcp::Config {
         socket: std::env::var_os("SHOAL_SOCKET")
@@ -14,7 +16,14 @@ fn main() {
             "--session" => config.session = Some(args.next().unwrap_or_else(|| usage())),
             "--token" => config.token = Some(args.next().unwrap_or_else(|| usage())),
             "--local-human" => config.local_auth = shoal_mcp::LocalAuthMode::LocalHuman,
-            "-h" | "--help" => usage(),
+            "-h" | "--help" => {
+                println!("{HELP}");
+                return;
+            }
+            "-V" | "--version" => {
+                println!("shoal-mcp {}", env!("CARGO_PKG_VERSION"));
+                return;
+            }
             _ => usage(),
         }
     }

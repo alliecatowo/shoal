@@ -1,0 +1,14 @@
+#!/usr/bin/env shoal
+# Verify that the repository toolchain resolves through a valid Reef lock.
+
+let expected = ["actionlint", "cargo", "cargo-audit", "cargo-fuzz", "rustc", "zola"]
+let bindings = (reef)
+let names = bindings.map(.name).sort()
+assert(names == expected.sort(), "Reef binding set differs: {names}")
+
+let findings = (reef doctor)
+let broken = findings.where(row => row.status != "ok" && row.status != "shadowed")
+assert(broken.is_empty(), "Reef has drift, unlocked tools, or orphaned locks: {broken}")
+
+let shadow_count = findings.where(.status == "shadowed").len()
+echo "reef health: {bindings.len()} locked tools; {shadow_count} intentional ambient shadows"

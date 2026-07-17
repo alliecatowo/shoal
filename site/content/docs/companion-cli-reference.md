@@ -68,6 +68,7 @@ cargo install --path crates/shoal-secret
 cargo install --path crates/shoal-history
 cargo install --path crates/shoal-doctor
 cargo install --path crates/shoal-exec
+cargo install --path crates/shoal-leash
 ```
 
 The repository's mise tasks build and install the complete set together, so a
@@ -77,11 +78,12 @@ main binary cannot be updated while its required companions remain stale:
 mise install
 mise run install          # incremental release build + verified install
 mise run install:clean    # clean release rebuild + verified install
-mise run install:check    # compare installed binaries with target/release
+mise run install:check    # compare installed binaries/man pages with source artifacts
 ```
 
-The destination is `${CARGO_HOME:-$HOME/.cargo}/bin`; set
-`SHOAL_INSTALL_DIR` to choose another executable directory. Installation does
+Executables go to `${CARGO_HOME:-$HOME/.cargo}/bin` and section-1 man pages to
+the sibling `share/man/man1`; set `SHOAL_INSTALL_DIR` or `SHOAL_MAN_DIR` to
+override either destination. Installation does
 not restart an existing durable kernel because that would discard its live
 in-memory Sessions. Restart it explicitly after an upgrade when appropriate.
 
@@ -92,7 +94,7 @@ Check:
 ```bash
 for bin in shoal shoal-kernel shoal-mcp shoal-lsp \
            shoal-token shoal-secret shoal-history shoal-doctor \
-           shoal-sandbox-exec
+           shoal-sandbox-exec shoal-landlock-helper
 do
   command -v "$bin" || printf 'missing: %s\n' "$bin"
 done
