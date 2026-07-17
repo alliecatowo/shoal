@@ -88,7 +88,14 @@ impl Evaluator {
                 self.plan_expr(cond, functions, aliases, out, depth)?;
                 self.plan_block(body, functions, aliases, out, depth)
             }
-            _ => Ok(()),
+            // Declarations and control-flow markers execute no effect at this
+            // point; a declared fn's body effects surface where it is called. No
+            // wildcard arm — a new `Stmt` variant must be classified here (A10).
+            Stmt::Fn { .. }
+            | Stmt::Alias { .. }
+            | Stmt::Return { value: None, .. }
+            | Stmt::Break { .. }
+            | Stmt::Continue { .. } => Ok(()),
         }
     }
 
@@ -208,15 +215,55 @@ impl Evaluator {
                 }
                 Ok(())
             }
-            Expr::FnCall { name, args, .. } => {
+            Expr::FnCall { name, args, span } => {
+                // Arguments always contribute their own effects — including the
+                // bodies of lambda arguments to `parallel`/`retry`/`on`/`map`
+                // (A8), via the `Expr::Lambda` arm.
                 for e in &args.pos {
                     self.plan_expr(e, functions, aliases, out, depth)?;
                 }
                 for n in &args.named {
                     self.plan_expr(&n.value, functions, aliases, out, depth)?;
                 }
-                if let Some(body) = functions.get(name) {
-                    self.plan_block(body, functions, aliases, out, depth + 1)?;
+                match name.as_str() {
+                    // Effectful builtins invoked as functions (A8).
+                    "run" => self.plan_run_target(args.pos.first().and_then(str_literal), out),
+                    // `save(path, value)` writes the first argument.
+                    "save" => {
+                        let path = args.pos.first().and_then(|a| self.path_literal(a));
+                        self.plan_save(path, out);
+                    }
+                    "open" => {
+                        let path = args.pos.first().and_then(|a| self.path_literal(a));
+                        self.plan_open(path, out);
+                    }
+                    // Clock reads.
+                    "now" | "today" => push_effect(out, Effect::Time),
+                    // Higher-order builtins: their closure bodies are already
+                    // planned above via the Lambda arm; `assert` is pure.
+                    "parallel" | "retry" | "on" | "assert" => {}
+                    // Provably pure value constructors (no IO at construction).
+                    "path" | "glob" | "regex" | "channel" => {}
+                    other => {
+                        if let Some(body) = functions.get(other) {
+                            // A function declared in this program: expand it.
+                            self.plan_block(body, functions, aliases, out, depth + 1)?;
+                        } else if self.env.get(other).is_some_and(|v| v.is_callable()) {
+                            // A session-stored closure/function that cannot be
+                            // statically expanded (A5): require approval, never
+                            // report nothing.
+                            push_effect(out, Effect::Opaque);
+                        } else if self.is_command_name(other) {
+                            // A bare name that resolves as a command runs as one
+                            // (defect #5); plan it with command resolution.
+                            self.plan_command_ref(other, *span, functions, aliases, out, depth)?;
+                        } else {
+                            // Not a known pure form, an expandable function, a
+                            // session closure, or a command — cannot be proven
+                            // effect-free (A5/A10).
+                            push_effect(out, Effect::Opaque);
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -266,7 +313,31 @@ impl Evaluator {
                 }
                 Ok(())
             }
-            _ => Ok(()),
+            // A lambda's body effects surface wherever the lambda is used — the
+            // higher-order builtins (`parallel`, `map`, …) will invoke it (A8).
+            Expr::Lambda { body, .. } => self.plan_expr(body, functions, aliases, out, depth),
+            Expr::StrInterp { parts, .. } => {
+                for part in parts {
+                    if let StrPart::Expr { expr } = part {
+                        self.plan_expr(expr, functions, aliases, out, depth)?;
+                    }
+                }
+                Ok(())
+            }
+            // Provably effect-free atoms: an empty effect set is correct here.
+            // No wildcard arm — a new `Expr` variant must be classified here,
+            // so an effectful form can never silently derive no effects (A10).
+            Expr::Null { .. }
+            | Expr::Bool { .. }
+            | Expr::Int { .. }
+            | Expr::Float { .. }
+            | Expr::Str { .. }
+            | Expr::Size { .. }
+            | Expr::Duration { .. }
+            | Expr::Time { .. }
+            | Expr::DateTime { .. }
+            | Expr::Regex { .. }
+            | Expr::Var { .. } => Ok(()),
         }
     }
 
@@ -294,6 +365,51 @@ impl Evaluator {
         }
         if let Some(body) = functions.get(&call.head) {
             return self.plan_block(body, functions, aliases, out, depth + 1);
+        }
+        // A bound session closure/fn (not one declared in this program) shadows
+        // builtin/adapter/external dispatch and cannot be statically expanded
+        // (A5): require approval rather than reporting nothing.
+        if self.env.get(&call.head).is_some_and(|v| v.is_callable()) {
+            push_effect(out, Effect::Opaque);
+            return Ok(());
+        }
+        // Effectful heads the runtime intercepts before builtin/adapter dispatch
+        // (A8), mirroring `eval_command`'s special-head order.
+        match call.head.as_str() {
+            "open" => {
+                let path = call.args.first().and_then(|a| self.cmd_arg_path_literal(a));
+                self.plan_open(path, out);
+                return Ok(());
+            }
+            "save" => {
+                let path = call.args.first().and_then(|a| self.cmd_arg_path_literal(a));
+                self.plan_save(path, out);
+                return Ok(());
+            }
+            "run" => {
+                self.plan_run_target(call.args.first().and_then(cmd_arg_str_literal), out);
+                return Ok(());
+            }
+            "source" => {
+                // `source <path>` reads and runs a script in this session.
+                if let Some(p) = call.args.first().and_then(|a| self.cmd_arg_path_literal(a)) {
+                    push_effect(out, Effect::FsRead { paths: vec![p] });
+                }
+                push_effect(out, Effect::Opaque);
+                return Ok(());
+            }
+            _ => {}
+        }
+        // A `.shl` head runs a script file in a child evaluator (arbitrary code).
+        if call.head.ends_with(".shl") {
+            push_effect(
+                out,
+                Effect::FsRead {
+                    paths: vec![self.plan_abs(&call.head)],
+                },
+            );
+            push_effect(out, Effect::Opaque);
+            return Ok(());
         }
         if builtins::is_builtin(&call.head)
             || matches!(call.head.as_str(), "cd" | "pwd" | "j" | "jump")
@@ -332,7 +448,10 @@ impl Evaluator {
                 },
             );
         } else {
-            push_effect(out, Effect::Opaque);
+            // A generic external command spawns concretely (A6): resolve and
+            // hash the binary like an adapter spawn, rather than collapsing to
+            // Opaque and hiding what actually runs.
+            self.plan_external_spawn(&call.head, out);
         }
         Ok(())
     }
@@ -430,6 +549,68 @@ impl Evaluator {
         }
     }
 
+    /// `open <path>` hands the file to the desktop opener, which reads it and
+    /// launches an arbitrary handler application (A8): record the read and cover
+    /// the unbounded handler with `Opaque`.
+    fn plan_open(&self, path: Option<PathBuf>, out: &mut Vec<Effect>) {
+        if let Some(p) = path {
+            push_effect(out, Effect::FsRead { paths: vec![p] });
+        }
+        push_effect(out, Effect::Opaque);
+    }
+
+    /// `run <target>` (A6/A8): a bare command name spawns externally; a
+    /// path/script target reads the file and runs arbitrary code; a dynamic
+    /// (non-literal) target cannot be bounded.
+    fn plan_run_target(&self, target: Option<String>, out: &mut Vec<Effect>) {
+        match target {
+            Some(name)
+                if !name.is_empty()
+                    && !name.contains('/')
+                    && !name.starts_with('.')
+                    && !name.starts_with('~')
+                    && Path::new(&name).extension().is_none() =>
+            {
+                self.plan_external_spawn(&name, out);
+            }
+            Some(name) => {
+                push_effect(
+                    out,
+                    Effect::FsRead {
+                        paths: vec![self.plan_abs(&name)],
+                    },
+                );
+                push_effect(out, Effect::Opaque);
+            }
+            None => push_effect(out, Effect::Opaque),
+        }
+    }
+
+    /// Plan a bare `name(args)` that resolves as a command (defect #5) by
+    /// planning the equivalent command head with the same resolution the
+    /// runtime uses.
+    fn plan_command_ref(
+        &mut self,
+        name: &str,
+        span: Span,
+        functions: &std::collections::HashMap<String, Block>,
+        aliases: &std::collections::HashMap<String, CmdCall>,
+        out: &mut Vec<Effect>,
+        depth: usize,
+    ) -> VResult<()> {
+        let call = CmdCall {
+            head: name.to_string(),
+            forced: false,
+            args: Vec::new(),
+            redirects: Vec::new(),
+            env_prefix: Vec::new(),
+            background: false,
+            trailing: None,
+            span,
+        };
+        self.plan_call(&call, functions, aliases, out, depth + 1)
+    }
+
     /// Mirror `eval_feed`'s operand classification: a command-shaped node (an
     /// interpreter block, a command call, or a bare non-variable name) is the
     /// command operand; the other operand is the value.
@@ -491,6 +672,16 @@ fn str_literal(e: &Expr) -> Option<String> {
         {
             str_literal(&args.pos[0])
         }
+        _ => None,
+    }
+}
+
+/// The literal string a command argument names (for `run <name>` resolution),
+/// without absolutizing — a bare word/path, or a quoted string literal.
+fn cmd_arg_str_literal(arg: &CmdArg) -> Option<String> {
+    match arg {
+        CmdArg::Word { text, .. } | CmdArg::Path { text, .. } => Some(text.clone()),
+        CmdArg::Str { expr, .. } | CmdArg::Expr { expr, .. } => str_literal(expr),
         _ => None,
     }
 }
@@ -718,5 +909,127 @@ effects=["proc.spawn(container)", "net.connect(registry:443)", "quantum.entangle
             !effects.iter().any(|e| matches!(e, Effect::FsRead { .. })),
             ".feed(cat) mis-resolved cat as the builtin (FsRead): {effects:?}"
         );
+    }
+
+    /// A5: a call to a previously-defined session function that cannot be
+    /// statically expanded derives an approval-requiring effect, never nothing.
+    #[test]
+    fn session_closure_call_is_opaque() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ev = Evaluator::new(dir.path().into());
+        // Define a session function with an effect, as a prior REPL line would.
+        ev.eval_program(&shoal_syntax::parse("fn danger() { \"x\".save(\"p\") }").unwrap())
+            .unwrap();
+        // A later program that only *calls* it cannot expand the closure body.
+        for src in ["danger()", "danger"] {
+            let effects = ev
+                .plan_program(&shoal_syntax::parse(src).unwrap())
+                .unwrap()
+                .effects;
+            assert!(
+                effects.contains(&Effect::Opaque),
+                "session closure `{src}` was reported effect-free: {effects:?}"
+            );
+        }
+    }
+
+    /// A6: generic external commands derive a concrete ProcSpawn (like adapter
+    /// spawns), both via `run(...)` and as a bare external.
+    #[test]
+    fn generic_external_commands_spawn_concretely() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = effects_at(dir.path(), "run(\"echo\", \"hi\")");
+        assert!(
+            run.iter()
+                .any(|e| matches!(e, Effect::ProcSpawn { argv0, .. } if argv0 == "echo")),
+            "run(echo) did not spawn echo: {run:?}"
+        );
+        let bare = effects_at(dir.path(), "some_external_tool_xyz");
+        assert!(
+            bare.iter()
+                .any(|e| matches!(e, Effect::ProcSpawn { argv0, .. } if argv0 == "some_external_tool_xyz")),
+            "bare external did not spawn: {bare:?}"
+        );
+    }
+
+    /// A8: effectful builtins and `spawn`/`parallel` bodies derive their
+    /// bodies'/arguments' effects.
+    #[test]
+    fn effectful_builtins_and_task_bodies() {
+        let dir = tempfile::tempdir().unwrap();
+        let spawned = effects_at(dir.path(), "spawn { \"x\".save(\"p\") }");
+        assert!(
+            spawned.contains(&Effect::FsWrite {
+                paths: vec![dir.path().join("p")]
+            }),
+            "spawn body write missing: {spawned:?}"
+        );
+        let par = effects_at(dir.path(), "parallel(() => \"x\".save(\"p\"))");
+        assert!(
+            par.contains(&Effect::FsWrite {
+                paths: vec![dir.path().join("p")]
+            }),
+            "parallel body write missing: {par:?}"
+        );
+        let save = effects_at(dir.path(), "save(\"x\", \"p\")");
+        assert!(
+            save.contains(&Effect::FsWrite {
+                paths: vec![dir.path().join("x")]
+            }),
+            "builtin save write missing: {save:?}"
+        );
+        let open = effects_at(dir.path(), "open(\"Cargo.toml\")");
+        assert!(
+            open.contains(&Effect::FsRead {
+                paths: vec![dir.path().join("Cargo.toml")]
+            }) && open.contains(&Effect::Opaque),
+            "open effects missing: {open:?}"
+        );
+    }
+
+    /// A10: no effectful form silently derives an empty effect set, and pure
+    /// forms derive nothing. (The compile-time exhaustive match — no wildcard —
+    /// is the structural guarantee; this pins the behavior.)
+    #[test]
+    fn effectful_forms_are_never_silently_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        for src in [
+            "echo hi > out",
+            "cat < in",
+            "rm x",
+            "\"x\".save(\"p\")",
+            "\"x\".append(\"p\")",
+            "path(\"f\").read",
+            "env.X = \"y\"",
+            "use ./m",
+            "open(\"f\")",
+            "save(\"x\", \"p\")",
+            "run(\"echo\", \"hi\")",
+            "unknown_external_tool_xyz",
+            "\"x\".feed(cat)",
+            "spawn { \"x\".save(\"p\") }",
+            "parallel(() => \"x\".save(\"p\"))",
+            "http.get(\"https://example.com\")",
+            "sh { echo hi }",
+        ] {
+            let effects = effects_at(dir.path(), src);
+            assert!(
+                !effects.is_empty(),
+                "effectful form `{src}` derived no effects"
+            );
+        }
+        for src in [
+            "1 + 2",
+            "let x = [1, 2, 3]",
+            "\"a\".upper()",
+            "{a: 1, b: 2}",
+            "path(\"f\")",
+        ] {
+            let effects = effects_at(dir.path(), src);
+            assert!(
+                effects.is_empty(),
+                "pure form `{src}` derived spurious effects: {effects:?}"
+            );
+        }
     }
 }

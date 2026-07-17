@@ -30,25 +30,25 @@ Rules for implementers:
 
 ### Workstream A — fail-closed effect planning
 
-- [ ] **HR-A1** — `plan` classifies `Stmt::Use`: an `FsRead` of the module path plus effects
+- [x] **HR-A1** — `plan` classifies `Stmt::Use`: an `FsRead` of the module path plus effects
   derived from (or an `Opaque` covering) the module's top-level statements. *(A1)*
   <br>Accept: `plan { use ./module }` reports non-empty effects including the module read.
-- [ ] **HR-A2** — `plan` emits `EnvWrite` for persistent `env.NAME = …` assignment targets, not
+- [x] **HR-A2** — `plan` emits `EnvWrite` for persistent `env.NAME = …` assignment targets, not
   just RHS effects. *(A2)*
   <br>Accept: `plan { env.X = "y" }` reports an env write naming `X`.
-- [ ] **HR-A3** — `plan_call` traverses command redirects; `>` and `>>` derive `FsWrite` with
+- [x] **HR-A3** — `plan_call` traverses command redirects; `>` and `>>` derive `FsWrite` with
   the target path (append distinguished from truncate). *(A3)*
   <br>Accept: `plan { echo hi > p }` reports a write to `p`.
 - [x] **HR-A4** — Method-call classification covers path/stream `.save` and `.append`, path
   reads (`.read` and friends), and `.feed`. *(A4)*
   <br>Accept: each of `plan { "x".save("p") }`, `plan { path("f").read }`,
   `plan { "x".feed(cat) }` reports the correct effect kind and target.
-- [ ] **HR-A5** — `FnCall` derivation handles session-stored closures/functions: any call that
+- [x] **HR-A5** — `FnCall` derivation handles session-stored closures/functions: any call that
   cannot be statically expanded derives an approval-requiring unknown effect, never nothing.
   *(A5, A10)*
   <br>Accept: planning a call to a previously-defined session function with effects is not
   reported as effect-free.
-- [ ] **HR-A6** — Generic external commands derive a concrete `ProcSpawn` (argv + resolution),
+- [x] **HR-A6** — Generic external commands derive a concrete `ProcSpawn` (argv + resolution),
   consistent with adapter spawns. *(A6)*
   <br>Accept: `plan { run("echo","hi") }` and a bare external both report `spawns: true` with
   the argv.
@@ -57,14 +57,14 @@ Rules for implementers:
   unknown effect — never silently dropped. *(A7)*
   <br>Accept: a fixture adapter with an unknown effect declaration fails loudly or plans
   conservatively; test pins it.
-- [ ] **HR-A8** — Effectful builtins (`run`, `open`, `save`, …) and `spawn`/`parallel`/task
+- [x] **HR-A8** — Effectful builtins (`run`, `open`, `save`, …) and `spawn`/`parallel`/task
   bodies derive the effects of their bodies/arguments. *(A8)*
   <br>Accept: `plan { spawn { "x".save("p") } }` and `plan { parallel(() => "x".save("p")) }`
   report the write.
 - [x] **HR-A9** — The planner resolves command position with the same resolution the runtime
   uses, fixing the `.feed(cat)` builtin-vs-external mismatch. *(A9)*
   <br>Accept: `plan { "x".feed(cat) }` reports a process spawn matching what runtime executes.
-- [ ] **HR-A10** — Derivation is structurally exhaustive: a match over every AST node with a
+- [x] **HR-A10** — Derivation is structurally exhaustive: a match over every AST node with a
   deny-by-default arm (unknown ⇒ approval-requiring effect). No wildcard that silently returns
   empty. *(A10)*
   <br>Accept: a unit test constructs each AST statement/expression variant and asserts the
