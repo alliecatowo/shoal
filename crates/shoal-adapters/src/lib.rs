@@ -28,10 +28,17 @@
 #[cfg(test)]
 use shoal_value::{Record, Value};
 use std::collections::HashMap;
+#[cfg(test)]
 use std::fs;
 use std::path::Path;
 
+mod catalog_input;
 mod output;
+
+pub use catalog_input::{
+    MAX_ADAPTER_CATALOG_COMMANDS, MAX_ADAPTER_MANIFEST_BYTES, MAX_ADAPTER_MANIFEST_FILES,
+    MAX_ADAPTER_MANIFEST_NODES, MAX_ADAPTER_MANIFEST_STRING_BYTES, MAX_ADAPTER_TOML_NESTING,
+};
 
 pub use output::{
     MAX_PARSE_CELL_BYTES, MAX_PARSE_CELLS, MAX_PARSE_COLUMNS, MAX_PARSE_HINT_BYTES,
@@ -118,12 +125,17 @@ impl AdapterCatalog {
     pub fn load_dir(dir: &Path) -> (Self, Vec<String>) {
         let mut catalog = Self::empty();
         let mut warnings = Vec::new();
-        let mut paths = match fs::read_dir(dir) {
-            Ok(xs) => xs
-                .filter_map(Result::ok)
-                .map(|x| x.path())
-                .filter(|p| p.extension().is_some_and(|x| x == "toml"))
-                .collect::<Vec<_>>(),
+        let mut paths = match catalog_input::manifest_paths(dir) {
+            Ok((paths, omitted)) => {
+                if omitted > 0 {
+                    warnings.push(format!(
+                        "{}: {omitted} adapter manifests omitted above the {}-file limit",
+                        dir.display(),
+                        MAX_ADAPTER_MANIFEST_FILES
+                    ));
+                }
+                paths
+            }
             Err(e) => {
                 warnings.push(format!("{}: {e}", dir.display()));
                 return (catalog, warnings);
@@ -131,7 +143,7 @@ impl AdapterCatalog {
         };
         paths.sort();
         for path in paths {
-            let src = match fs::read_to_string(&path) {
+            let src = match catalog_input::read_manifest(&path) {
                 Ok(s) => s,
                 Err(e) => {
                     warnings.push(format!("{}: {e}", path.display()));
@@ -145,11 +157,24 @@ impl AdapterCatalog {
                     continue;
                 }
             };
+            if let Err(error) = catalog_input::validate_document(&doc) {
+                warnings.push(format!("{}: {error}", path.display()));
+                continue;
+            }
             let Some(cmds) = doc.get("cmd").and_then(toml::Value::as_table) else {
                 warnings.push(format!("{}: missing [cmd.<name>] table", path.display()));
                 continue;
             };
             for (name, raw) in cmds {
+                if !catalog.cmds.contains_key(name)
+                    && catalog.cmds.len() >= MAX_ADAPTER_CATALOG_COMMANDS
+                {
+                    warnings.push(format!(
+                        "{}: cmd.{name}: catalog command limit reached ({MAX_ADAPTER_CATALOG_COMMANDS})",
+                        path.display()
+                    ));
+                    continue;
+                }
                 match parse_cmd(name, raw) {
                     Ok(cmd) => {
                         if catalog.cmds.insert(name.clone(), cmd).is_some() {
@@ -436,6 +461,93 @@ output={parse="porcelain-v2", type="table<{status: str, path: path}>"}
         let git = c.lookup("git").unwrap();
         assert_eq!(git.ok_codes, [0, 1]);
         assert_eq!(git.subs["status"].short_flags["s"], "short");
+    }
+
+    #[test]
+    fn hostile_catalog_files_warn_without_hiding_valid_siblings() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("good.toml"),
+            "[cmd.good]\nbin='true'\nunknown_future_field='preserved'\n",
+        )
+        .unwrap();
+        let large = directory.path().join("large.toml");
+        let file = fs::File::create(&large).unwrap();
+        file.set_len((MAX_ADAPTER_MANIFEST_BYTES + 1) as u64)
+            .unwrap();
+        fs::write(directory.path().join("binary.toml"), [0xff]).unwrap();
+        fs::write(
+            directory.path().join("deep.toml"),
+            format!(
+                "x={}0{}\n",
+                "[".repeat(MAX_ADAPTER_TOML_NESTING + 1),
+                "]".repeat(MAX_ADAPTER_TOML_NESTING + 1)
+            ),
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("duplicate.toml"),
+            "[cmd.duplicate]\nbin='one'\nbin='two'\n",
+        )
+        .unwrap();
+
+        let (catalog, warnings) = AdapterCatalog::load_dir(directory.path());
+        assert!(catalog.lookup("good").is_some());
+        assert_eq!(catalog.len(), 1);
+        for needle in ["byte limit", "UTF-8", "nesting limit", "duplicate key"] {
+            assert!(
+                warnings.iter().any(|warning| warning.contains(needle)),
+                "missing {needle:?} warning: {warnings:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_command_identities_are_bounded() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = (0..=MAX_ADAPTER_CATALOG_COMMANDS)
+            .map(|index| format!("[cmd.c{index:04}]\nbin='true'\n"))
+            .collect::<String>();
+        fs::write(directory.path().join("wide.toml"), source).unwrap();
+        let (catalog, warnings) = AdapterCatalog::load_dir(directory.path());
+        assert_eq!(catalog.len(), MAX_ADAPTER_CATALOG_COMMANDS);
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("catalog command limit"))
+        );
+    }
+
+    #[test]
+    fn catalog_manifest_identities_are_bounded_deterministically() {
+        let directory = tempfile::tempdir().unwrap();
+        for index in 0..=MAX_ADAPTER_MANIFEST_FILES {
+            fs::write(
+                directory.path().join(format!("m{index:04}.toml")),
+                format!("[cmd.c{index:04}]\nbin='true'\n"),
+            )
+            .unwrap();
+        }
+        let (catalog, warnings) = AdapterCatalog::load_dir(directory.path());
+        assert_eq!(catalog.len(), MAX_ADAPTER_MANIFEST_FILES);
+        assert!(catalog.lookup("c0000").is_some());
+        assert!(
+            catalog
+                .lookup(&format!("c{:04}", MAX_ADAPTER_MANIFEST_FILES))
+                .is_none()
+        );
+        assert!(warnings.iter().any(|warning| warning.contains("omitted")));
+    }
+
+    #[test]
+    fn production_catalog_loader_has_no_whole_file_read() {
+        let production = include_str!("lib.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(!production.contains("fs::read_to_string"));
+        let input = include_str!("catalog_input.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(input.contains("MAX_ADAPTER_MANIFEST_BYTES + 1"));
     }
     #[test]
     fn parses_json_ndjson_and_lines() {
