@@ -193,8 +193,11 @@ Rules for implementers:
 
 - [ ] **HR-G1** — `StreamVal::buffer(n)` becomes a real bounded decoupling buffer, or is removed
   and its docs state the unimplemented status. *(I2)*
-- [ ] **HR-G2** — `flat_map` interleaves substreams as documented, or the docs are corrected to
+- [x] **HR-G2** — `flat_map` interleaves substreams as documented, or the docs are corrected to
   sequential semantics; a test pins whichever behavior ships. *(I3)*
+  — shipped: sequential semantics (interleaving is unimplementable under the sync pull model
+  without a per-substream pump, and the corpus already pins sequential order); docs state it
+  explicitly and `stream-flat-map-substreams-drain-sequentially` discriminates the order.
 - [ ] **HR-G3** — In-language subscriber queues are bounded with a defined overflow policy that
   matches the documented backpressure story. *(I4)*
 - [ ] **HR-G4** — Cancelling an `on(channel, handler)` task interrupts a blocking `recv`

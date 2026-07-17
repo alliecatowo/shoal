@@ -69,6 +69,15 @@ src = '[1, 2].stream().flat_map(x => [x].stream()).collect()'
 value = "[1, 2]"
 
 [[case]]
+# `flat_map` drains each returned substream to its natural end BEFORE pulling
+# the next outer item — SEQUENTIAL semantics, never interleaved (HR-G2, audit
+# I3; site/content/internals/streams-channels.md). Multi-element substreams
+# discriminate the two orders: interleaving would give [10, 20, 11, 21].
+name = "stream-flat-map-substreams-drain-sequentially"
+src = '[1, 2].stream().flat_map(x => [x * 10, x * 10 + 1].stream()).collect()'
+value = "[10, 11, 20, 21]"
+
+[[case]]
 name = "stream-enumerate"
 src = '["a", "b", "c"].stream().enumerate().collect()'
 value = '[[0, "a"], [1, "b"], [2, "c"]]'
