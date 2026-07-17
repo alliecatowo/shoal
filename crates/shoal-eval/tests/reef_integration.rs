@@ -119,6 +119,95 @@ fn constrained_tool_resolves_to_fixture_and_spawns() {
 }
 
 #[test]
+fn interactive_auto_lock_refuses_to_spawn_when_persistence_fails() {
+    let (dir, bindir) = project("[tools]\nfaketool = \"*\"\n", &[("faketool", "1.2.3")]);
+    let lock_path = dir.path().join("reef.lock");
+    std::fs::write(&lock_path, "").unwrap();
+    let mut permissions = std::fs::metadata(&lock_path).unwrap().permissions();
+    permissions.set_mode(0o400);
+    std::fs::set_permissions(&lock_path, permissions).unwrap();
+    let mut ev = Evaluator::new(dir.path().to_path_buf());
+    ev.set_interactive(true);
+    ev.set_reef_resolver(fixture_resolver(&bindir));
+
+    let passthrough = ev
+        .eval_program(&parse("^sh -c 'exit 0'"))
+        .expect("an unmentioned ambient tool does not consume Reef lock state");
+    assert!(matches!(passthrough, Value::Outcome(outcome) if outcome.ok));
+
+    let error = ev
+        .eval_program(&parse("faketool"))
+        .expect_err("a non-durable auto-lock must stop before process spawn");
+    assert_eq!(error.code, "reef_provider");
+    assert!(error.msg.contains("persisting Reef lock"), "{error:?}");
+    assert!(error.span.is_some());
+}
+
+#[test]
+fn explicit_lock_reports_persistence_failure_instead_of_locked_rows() {
+    let (dir, bindir) = project("[tools]\nfaketool = \"*\"\n", &[("faketool", "1.2.3")]);
+    let lock_path = dir.path().join("reef.lock");
+    std::fs::write(&lock_path, "").unwrap();
+    let mut permissions = std::fs::metadata(&lock_path).unwrap().permissions();
+    permissions.set_mode(0o400);
+    std::fs::set_permissions(&lock_path, permissions).unwrap();
+    let mut ev = Evaluator::new(dir.path().to_path_buf());
+    ev.set_interactive(true);
+    ev.set_reef_resolver(fixture_resolver(&bindir));
+
+    let error = ev
+        .eval_program(&parse("reef lock"))
+        .expect_err("reef lock must not claim success when its file was not written");
+    assert_eq!(error.code, "reef_provider");
+    assert!(error.msg.contains("persisting Reef lock"), "{error:?}");
+}
+
+#[test]
+fn malformed_lock_is_not_treated_as_an_unlocked_file_or_overwritten() {
+    let (dir, bindir) = project("[tools]\nfaketool = \"*\"\n", &[("faketool", "1.2.3")]);
+    let lock_path = dir.path().join("reef.lock");
+    let malformed = b"[tool.faketool\nthis is not toml\n";
+    std::fs::write(&lock_path, malformed).unwrap();
+    let mut ev = Evaluator::new(dir.path().to_path_buf());
+    ev.set_interactive(true);
+    ev.set_reef_resolver(fixture_resolver(&bindir));
+
+    let passthrough = ev
+        .eval_program(&parse("^sh -c 'exit 0'"))
+        .expect("an unmentioned ambient tool does not consume malformed lock state");
+    assert!(matches!(passthrough, Value::Outcome(outcome) if outcome.ok));
+
+    let error = ev
+        .eval_program(&parse("faketool"))
+        .expect_err("malformed protection state must fail closed before spawn");
+    assert_eq!(error.code, "reef_provider");
+    assert!(error.msg.contains("malformed Reef lock"), "{error:?}");
+    assert_eq!(std::fs::read(&lock_path).unwrap(), malformed);
+}
+
+#[test]
+fn reef_doctor_reports_a_malformed_lockfile() {
+    let (dir, bindir) = project("[tools]\nfaketool = \"*\"\n", &[("faketool", "1.2.3")]);
+    std::fs::write(dir.path().join("reef.lock"), "not = [valid").unwrap();
+    let mut ev = Evaluator::new(dir.path().to_path_buf());
+    ev.set_interactive(true);
+    ev.set_reef_resolver(fixture_resolver(&bindir));
+
+    let out = ev
+        .eval_program(&parse("reef doctor"))
+        .expect("doctor reports health instead of raising");
+    let Value::Outcome(outcome) = out else {
+        panic!("expected outcome")
+    };
+    let Some(Value::Table(rows)) = outcome.parsed.as_ref() else {
+        panic!("doctor should return a table")
+    };
+    assert!(matches!(rows.as_slice(), [row]
+        if row.get("check") == Some(&Value::Str("lockfile".into()))
+            && row.get("status") == Some(&Value::Str("invalid".into()))));
+}
+
+#[test]
 fn which_shows_the_resolution_chain() {
     let (dir, bindir) = project("[tools]\nfaketool = \"*\"\n", &[("faketool", "1.2.3")]);
     let mut ev = Evaluator::new(dir.path().to_path_buf());

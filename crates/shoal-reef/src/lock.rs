@@ -1,6 +1,7 @@
-//! The lock — `reef.lock`, a committed TOML file recording every resolved tool
-//! (site/content/internals/reef-resolution.md). Lives next to the project manifest, or in the user state dir
-//! for the user scope.
+//! The lock — `reef.lock`, a host-local TOML file recording every materialized
+//! tool binding (site/content/internals/reef-resolution.md). It lives next to
+//! the project manifest and is intentionally not a portable dependency lock:
+//! absolute paths and executable-byte hashes are properties of one host.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

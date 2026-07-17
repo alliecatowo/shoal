@@ -52,16 +52,17 @@ impl Evaluator {
 
     fn executable_resolution_record(&mut self, name: &str) -> VResult<Value> {
         let chain = self.reef_chain_snapshot();
+        self.reef_lock_loaded()?;
         let resolver = self.reef_resolver();
         let mut lock = self.exec.reef.lock.clone();
         match resolver.resolve(name, &chain, &mut lock, Policy::Interactive, &mut |_| {}) {
             Ok(res) => {
                 // Only keep a fresh lock when a manifest actually constrained it.
                 if res.constrained {
-                    self.exec.reef.lock = lock;
                     if res.locked_now {
-                        self.persist_reef_lock();
+                        self.persist_reef_lock_value(&lock)?;
                     }
+                    self.exec.reef.lock = lock;
                 }
                 Ok(report_to_record(&res.report))
             }
@@ -254,7 +255,8 @@ impl Evaluator {
         }
         names.sort();
         let resolver = self.reef_resolver();
-        let mut lock = self.exec.reef.lock.clone();
+        let original_lock = self.exec.reef.lock.clone();
+        let mut lock = original_lock.clone();
         let mut rows = Vec::new();
         for name in names {
             let mut r = Record::new();
@@ -286,6 +288,9 @@ impl Evaluator {
                 }
             }
             rows.push(r);
+        }
+        if lock != original_lock {
+            self.persist_reef_lock_value(&lock)?;
         }
         self.exec.reef.lock = lock;
         Ok(Value::Table(rows))
@@ -373,13 +378,18 @@ impl Evaluator {
         r.insert("added".into(), Value::Str(format!("{tool}@{ver}")));
         r.insert("manifest".into(), Value::Path(manifest_path.clone()));
         match resolver.refresh_lock(&tool, &chain, &mut lock, &mut |_| {}) {
-            Ok(res) => {
-                self.exec.reef.lock = lock;
-                self.persist_reef_lock();
-                r.insert("version".into(), Value::Str(res.version.to_string()));
-                r.insert("path".into(), Value::Path(res.path.clone()));
-                r.insert("locked".into(), Value::Bool(true));
-            }
+            Ok(res) => match self.persist_reef_lock_value(&lock) {
+                Ok(()) => {
+                    self.exec.reef.lock = lock;
+                    r.insert("version".into(), Value::Str(res.version.to_string()));
+                    r.insert("path".into(), Value::Path(res.path.clone()));
+                    r.insert("locked".into(), Value::Bool(true));
+                }
+                Err(error) => {
+                    r.insert("locked".into(), Value::Bool(false));
+                    r.insert("note".into(), Value::Str(error.to_string()));
+                }
+            },
             Err(e) => {
                 // The manifest edit stands; the lock could not be written.
                 r.insert("locked".into(), Value::Bool(false));
@@ -431,8 +441,8 @@ impl Evaluator {
             }
             rows.push(r);
         }
+        self.persist_reef_lock_value(&lock)?;
         self.exec.reef.lock = lock;
-        self.persist_reef_lock();
         Ok(Value::Table(rows))
     }
 
@@ -493,6 +503,14 @@ impl Evaluator {
     ///   forgot the project pin exists.
     fn reef_doctor(&mut self) -> VResult<Value> {
         let chain = self.reef_chain_snapshot();
+        if let Some(error) = self.exec.reef.lock_load_error.clone() {
+            let mut row = Record::new();
+            row.insert("name".into(), Value::Str("reef.lock".into()));
+            row.insert("check".into(), Value::Str("lockfile".into()));
+            row.insert("status".into(), Value::Str("invalid".into()));
+            row.insert("note".into(), Value::Str(error));
+            return Ok(Value::Table(vec![row]));
+        }
         let mut names: Vec<String> = Vec::new();
         for scope in &chain.scopes {
             for tool in scope.manifest.tools.keys() {

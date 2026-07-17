@@ -196,7 +196,10 @@ show `unknown` even when singular constrained resolution would probe.
 
 A `LockEntry` records tool name, version, provider, absolute path, BLAKE3 hash, and resolution
 timestamp. `Lockfile` serializes under repeated `[[tool]]`-style TOML according to its serde model and
-lives conventionally beside a chosen manifest as `reef.lock`.
+lives conventionally beside a chosen manifest as `reef.lock`. Because the path and executable bytes
+are installation- and platform-specific, this is a host-local materialization record rather than a
+portable dependency lock; repositories commit exact manifest constraints and materialize the lock
+after installing tools on each host.
 
 The evaluator chooses the lock path beside the nearest native `.reef.toml`; if none exists, beside
 the first discovered foreign/user scope. One in-memory lock therefore serves the whole active scope
@@ -221,15 +224,19 @@ the constraint relies on the stored version string.
 | interactive | resolve fresh, insert lock, emit one notice | resolve fresh without meaningful project lock use |
 | script | `reef_unlocked` with lock hint | resolve fresh if called directly; evaluator normally bypasses unconstrained heads |
 
-`refresh_lock` removes the entry and forces fresh resolution. Interactive spawn writes a fresh
-in-memory entry and calls best-effort persistence. `persist_reef_lock` deliberately swallows save
-errors, so a command can run after printing an auto-lock notice even when the lock did not reach
-disk. A later script can then fail `reef_unlocked`. Persistence failure should become observable.
+`refresh_lock` removes the entry and forces fresh resolution. Interactive spawn persists a fresh
+candidate lock before rewriting `argv[0]` or publishing the lock in evaluator state. Save failure is
+`reef_provider` and stops before process spawn.
 
-`reef lock` iterates every uniquely constrained name, optionally refreshes, records per-row success
-or code, replaces in-memory lock, and best-effort saves. `reef add` edits the nearest native manifest
-or local `.reef.toml`, invalidates the chain, and attempts a refresh lock; the manifest edit remains
-even if locking fails.
+`reef lock` iterates every uniquely constrained name, optionally refreshes, records per-row
+resolution results, then persists the candidate lock before replacing evaluator state. A save error
+fails the command rather than returning misleading successful rows. `reef add` edits the nearest
+native manifest or local `.reef.toml`, invalidates the chain, and attempts a refresh lock; the
+manifest edit remains when locking or persistence fails, and the returned record says `locked:
+false`. Bare `reef` and `which` use the same persistence-before-publication rule for fresh entries.
+Malformed or inadmissible existing locks remain a retained load error: constrained execution fails
+before resolution/spawn, persistence cannot overwrite the bad file, and `reef doctor` reports it as
+an invalid lockfile.
 
 ## Hash cache
 
@@ -307,7 +314,7 @@ the underlying discovered chain; with no discovered manifest, persistence may ha
 | `which <tool> --all` | raw candidates from all providers, no lock/constraint decision |
 | bare `reef` | binding table from current scopes/lock |
 | `reef add tool@ver` | edit manifest and attempt fresh lock |
-| `reef lock [--refresh]` | resolve every constrained name and persist results best-effort |
+| `reef lock [--refresh]` | resolve every constrained name; publish successful rows only after the host-local lock persists |
 | `reef fetch <tool>` | ask providers in order; currently only mise installs |
 | `reef doctor` | rows for drift/unlocked, orphan lock entries, shadowed ambient binaries, malformed local manifests |
 

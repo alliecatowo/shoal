@@ -71,7 +71,7 @@ node --version
 # reef: locked node@22.x.y via mise (.../node)
 ```
 
-Commit both `.reef.toml` and `reef.lock` when the repository expects repeatable tool bindings.
+Commit `.reef.toml` with exact constraints when the repository expects repeatable versions. Generate `reef.lock` on each host after installing tools; the lock binds that host's absolute executable paths and byte hashes and is ignored by Git by default.
 
 ## What engages Reef
 
@@ -336,11 +336,13 @@ An unreadable locked binary becomes `reef_not_found` with the same refresh hint.
 
 Hashing is cached by file identity/metadata to avoid repeatedly reading unchanged binaries.
 
-### Lock persistence caveats
+### Lock persistence and portability
 
-The evaluator writes spawn-time interactive auto-locks and explicit `reef lock` results to disk. Lock persistence is currently best-effort: a write error is ignored by the spawn path after the in-memory resolution succeeds. Treat the presence and committed contents of `reef.lock` as a deployment precondition rather than assuming an auto-lock notice proves durable storage.
+The evaluator persists spawn-time interactive auto-locks, bare `reef` resolutions, `which TOOL`, `reef add`, and explicit `reef lock` results before publishing them as locked evaluator state. A write failure is `reef_provider`; an auto-lock failure stops before process spawn, and `reef lock` cannot return successful rows for a file it did not write.
 
-The bare `reef` binding-table command resolves entries interactively into its working in-memory lock, but does not currently persist newly created entries at the end of that command. `which TOOL`, an actual interactive spawn, `reef add`, or `reef lock` does persist when their normal write path runs.
+An invalid, oversized, non-UTF-8, or non-regular existing lock also fails closed instead of being treated as an unlocked project and overwritten. `reef doctor` reports the invalid lockfile; inspect or remove it before intentionally rebuilding it.
+
+`reef.lock` is a host-local materialization record, not a cross-platform dependency lock. Its absolute paths and BLAKE3 executable hashes are deliberately specific to the installed artifacts on one machine. Keep it ignored, commit exact constraints in `.reef.toml` or a supported foreign manifest, install those versions on each host, and run `reef lock` during environment/CI setup. Requiring one committed digest across Linux and macOS would either reject legitimate platform artifacts or weaken the byte-identity guarantee, so Reef does neither implicitly.
 
 ## Candidate selection in detail
 
@@ -574,11 +576,11 @@ For a repository adopting Reef:
 2. Use exact major/minor prefixes your project can support; do not write unsupported semver operators.
 3. Run `which TOOL --all` to understand available candidates.
 4. Run `reef lock` and review paths/providers/hashes.
-5. Commit `.reef.toml` and `reef.lock` together.
-6. Run `reef doctor` in local diagnostics and CI setup.
+5. Commit `.reef.toml`; keep the host-local `reef.lock` ignored.
+6. Install the constrained versions, run `reef lock`, and run `reef doctor` in local diagnostics and CI setup.
 7. Use `hermetic = true` only after all nested tool dependencies are represented by locked bindings.
 8. Configure runners and exercise each script extension with `run(...)`.
-9. Treat lock refreshes like dependency changes: review executable provenance, not only version text.
+9. Treat manifest constraint changes like dependency changes and review local lock refresh provenance, not only version text.
 10. Add Leash policy separately when you need enforced filesystem/network/process capabilities.
 
 ## Current boundaries
@@ -589,7 +591,7 @@ Reef is implemented and actively used for constrained external spawns, but it is
 - Scope discovery silently skips malformed/unreadable manifests.
 - A manifest without tools is ignored, including its runners/options.
 - Evaluator scope cache does not notice manual same-directory edits.
-- Lock persistence after auto-resolution is best-effort.
+- Lockfiles are deliberately host-local; portable multi-platform artifact locking is not implied.
 - `reef fetch` is mise-only and does not enforce the declared provider pin.
 - General bare-path command heads do not use runners; spell `run(PATH)`.
 - Runner defaults outside the fixed fallback require an active tools-bearing scope.

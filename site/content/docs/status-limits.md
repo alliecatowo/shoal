@@ -307,7 +307,7 @@ All workspace packages are currently `0.1.0`. There is no promised stable langua
 Practical guidance:
 
 - pin a Git commit/release for scripts and integrations;
-- commit Reef lockfiles and custom adapters;
+- commit exact Reef constraints and custom adapters; materialize the host-local `reef.lock` after installing tools;
 - test `cargo test -p shoal --test conformance --locked` when contributing;
 - use tagged fields/numeric error codes rather than display prose;
 - ignore unknown additive JSON fields;

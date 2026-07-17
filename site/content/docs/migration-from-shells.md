@@ -647,7 +647,7 @@ Move shell variables to `let`/`var`, `$()` to captured values, conditional statu
 
 ### Phase 4: add reproducibility/safety
 
-Declare Reef tools, commit locks, add plan/effect review for mutation, enable journal/undo where supported, and write conformance/integration tests.
+Declare Reef tools with exact committed constraints, materialize the host-local Reef lock during setup, add plan/effect review for mutation, enable journal/undo where supported, and write conformance/integration tests.
 
 ### Phase 5: remove compatibility islands selectively
 

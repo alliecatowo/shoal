@@ -462,7 +462,7 @@ Read `shoal://session/reef` before assuming a tool version/provider. Reef resolu
 
 When reproducibility matters:
 
-- commit the manifest and lockfile;
+- commit exact manifest constraints and materialize the host-local lock during setup;
 - verify hash-pinned tools;
 - use hermetic Reef scope intentionally;
 - distinguish Reef's tool selection from Leash's behavior policy;

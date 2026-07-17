@@ -312,7 +312,7 @@ or restart the session. `reef add` explicitly invalidates the cache. This is a c
 
 ### Tool works interactively but script says unlocked
 
-Interactive policy can resolve/write a lock; script policy requires reproducibility and rejects an unlocked constrained tool. Run `reef lock` intentionally, inspect/commit the lockfile, then rerun the script.
+Interactive policy can resolve/write a lock; script policy rejects an unmaterialized constrained tool. Run `reef lock` intentionally on that host, inspect it, then rerun the script. Commit exact manifest constraints, not `reef.lock`: its absolute paths and byte hashes are host-local.
 
 ### Hermetic Reef cannot find ordinary tools
 

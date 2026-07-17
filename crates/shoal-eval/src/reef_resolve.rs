@@ -39,13 +39,26 @@ impl Evaluator {
             .find(|s| s.kind == ManifestKind::Reef)
             .or_else(|| chain.scopes.first())
             .map(|s| shoal_reef::Lockfile::path_next_to(&s.source));
-        self.exec.reef.lock = self
+        let loaded = self
             .exec
             .reef
             .lock_path
             .as_ref()
-            .and_then(|p| shoal_reef::Lockfile::load(p).ok())
-            .unwrap_or_default();
+            .map(|path| shoal_reef::Lockfile::load(path));
+        match loaded {
+            Some(Ok(lock)) => {
+                self.exec.reef.lock = lock;
+                self.exec.reef.lock_load_error = None;
+            }
+            Some(Err(error)) => {
+                self.exec.reef.lock = shoal_reef::Lockfile::new();
+                self.exec.reef.lock_load_error = Some(error.to_string());
+            }
+            None => {
+                self.exec.reef.lock = shoal_reef::Lockfile::new();
+                self.exec.reef.lock_load_error = None;
+            }
+        }
         self.exec.reef.chain = Some((self.exec.shell.cwd.clone(), chain));
     }
 
@@ -140,11 +153,33 @@ impl Evaluator {
             .is_empty()
     }
 
-    /// Persist the in-memory lock next to its manifest, best-effort. A failure
-    /// to write never fails a spawn — the lock is an optimization, not a gate.
-    pub(crate) fn persist_reef_lock(&self) {
-        if let Some(path) = &self.exec.reef.lock_path {
-            let _ = self.exec.reef.lock.save(path);
+    /// Persist a candidate lock next to its manifest before publishing it as
+    /// evaluator state. A constrained resolution is not durably locked until
+    /// this succeeds.
+    pub(crate) fn persist_reef_lock_value(&self, lock: &shoal_reef::Lockfile) -> VResult<()> {
+        self.reef_lock_loaded()?;
+        let path = self.exec.reef.lock_path.as_ref().ok_or_else(|| {
+            ErrorVal::new(
+                "reef_provider",
+                "cannot persist Reef lock: no manifest-backed lockfile target",
+            )
+        })?;
+        lock.save(path).map_err(|error| {
+            ErrorVal::new(
+                "reef_provider",
+                format!("persisting Reef lock {}: {error}", path.display()),
+            )
+        })
+    }
+
+    pub(crate) fn reef_lock_loaded(&self) -> VResult<()> {
+        match &self.exec.reef.lock_load_error {
+            Some(error) => Err(ErrorVal::new(
+                "reef_provider",
+                format!("cannot use malformed Reef lock: {error}"),
+            )
+            .with_hint("inspect or remove reef.lock, then run `reef lock --refresh`")),
+            None => Ok(()),
         }
     }
 
@@ -209,6 +244,8 @@ impl Evaluator {
             // today's behavior: ambient PATH, PATH/which resolution, untouched.
             return Ok(None);
         }
+        self.reef_lock_loaded()
+            .map_err(|error| error.with_span(span))?;
 
         let policy = if self.session.interactive {
             Policy::Interactive
@@ -234,10 +271,14 @@ impl Evaluator {
             }
         };
 
+        if notice.is_some() {
+            self.persist_reef_lock_value(&lock)
+                .map_err(|error| error.with_span(span))?;
+        }
+
         argv[0] = resolution.path.clone().into_os_string();
         self.exec.reef.lock = lock;
         if let Some(n) = notice {
-            self.persist_reef_lock();
             self.emit_lock_notice(&n);
         }
 
