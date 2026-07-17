@@ -128,13 +128,10 @@ shoal://events/{channel}{?since,limit}
 Resource reads return textual content plus `structuredContent`. `format=render` or `format=raw`
 becomes `text/plain`; structured data is pretty JSON text with the same bounded-text rule.
 
-There is a current raw-value escape in that mapping. Kernel `value.get {format:"raw"}` returns
-complete bytes as `raw_base64`, without normal elision. The MCP resource reader recognizes a field
-named `raw` for plain-text handling but does not special-case `raw_base64`; the entire base64 payload
-therefore remains in `structuredContent` and its JSON text representation. A CAS ref that looked
-context-cheap can expand to the full blob in both kernel memory and agent context. Raw fetch needs a
-bounded slice/stream or explicit out-of-band resource contract before it is safe to advertise as an
-elision exception.
+Raw-value reads remain explicit but are bounded. Kernel `value.get {format:"raw"}` returns at most
+8 KiB of decoded string/bytes content and continuation metadata; `blob.get` applies the same wall to
+byte `offset`/`length` pages. MCP therefore places only one bounded page in `structuredContent`, and
+the caller follows `page.next_offset` until `page.done`.
 
 Session env is names-only unless the kernel policy grants reading all requested names. The facade
 does not reimplement that authority decision.

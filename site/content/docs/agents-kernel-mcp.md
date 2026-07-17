@@ -328,7 +328,7 @@ An elided value still carries type, count, table column types, a five-item/row o
 
 Per-call `elide` can tighten or loosen `max_bytes`, `max_rows`, and `max_items`; only the byte budget is clamped to the 64 KiB hard cap. Row/item limits can currently be set arbitrarily high, though encoded-size elision still applies.
 
-Human renders are stripped of ANSI for headless clients and capped to 64 KiB. See [Resources and events](@/docs/mcp-resources-events.md#formats) for caveats, including the current `format=raw` full-base64 bypass.
+Human renders are stripped of ANSI for headless clients and capped to 64 KiB. See [Resources and events](@/docs/mcp-resources-events.md#formats) for the separate 8 KiB pageable raw-transfer contract.
 
 ## PTY surface
 
@@ -420,7 +420,7 @@ The raw method set is broader than MCP tools and includes parsing, completion, e
   still have no item-pull representation on the kernel wire.
 - Task output is captured as one value on completion, not incrementally cursor-readable.
 - Task suspend/resume is unavailable on the kernel wire.
-- `format=raw` bytes can currently place full base64 in `structuredContent`, bypassing the nominal 64 KiB wall.
+- `format=raw` and `blob.get` expose only one 8 KiB decoded-content page at a time; clients must follow `page.next_offset` for complete transfer.
 - Session `cwd` in MCP resources is cached from attach rather than refreshed from the kernel, while env/Reef views are live.
 - Each active MCP resource subscription owns one dedicated kernel connection and OS thread;
   `resources/unsubscribe` shuts down and joins that worker.

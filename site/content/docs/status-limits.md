@@ -158,8 +158,8 @@ Full impact/mitigation: [Security and trust boundaries](@/docs/security.md).
 
 | Limitation | Current behavior | Impact/workaround |
 | --- | --- | --- |
-| Raw retrieval size bypass | `value.get format=raw` materializes full string/bytes/CAS and returns full `raw`/`raw_base64`. | Client-side limit and slices; do not fetch untrusted full blobs. |
-| `blob.get` whole blob | No range parameter. | Use value slice path when possible; bound storage/client. |
+| Raw retrieval throughput | `value.get format=raw` returns at most 8 KiB of decoded content per page. | Follow `page.next_offset`; string offsets are Unicode scalars and byte/CAS offsets are octets. |
+| `blob.get` throughput | Byte `offset`/`length` pages are capped at 8 KiB after exact owner authorization. | Follow `page.next_offset`; many pages require repeated verified decompression because CAS files are compressed. |
 | MCP subscription cost | One kernel connection and OS thread per resource subscription. | Bound subscriptions; consolidate channels. |
 | MCP cwd resource stale | `shoal://session/cwd` is cached at attach. | Execute `pwd` or reconnect after `cd`. |
 | Task output not streaming | `/task/{id}/out` resolves whole result only after capture. | Use lifecycle events; no incremental byte cursor yet. |

@@ -69,15 +69,8 @@ impl Kernel {
         attached: &mut Option<Attachment>,
     ) -> Result<Json, RpcError> {
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
-        let hash = params
-            .get("hash")
-            .and_then(Json::as_str)
-            .ok_or_else(|| RpcError {
-                code: INVALID_PARAMS,
-                message: "blob.get requires a hash".into(),
-                data: None,
-            })?
-            .to_string();
+        let params: BlobGetParams = decode(params)?;
+        let hash = params.hash;
         let journal = self
             .journal
             .lock()
@@ -92,25 +85,57 @@ impl Kernel {
                 data: None,
             });
         }
-        let blob = journal
-            .read_blob(&hash)
+        let requested_offset = params.offset.unwrap_or(0);
+        let requested_length = params.length.unwrap_or(RAW_PAGE_MAX_BYTES as u64);
+        let effective_length = requested_length.min(RAW_PAGE_MAX_BYTES as u64) as usize;
+        let (total_len, blob) = journal
+            .read_blob_range(&hash, requested_offset, effective_length)
             .map_err(internal)?
             .ok_or_else(|| RpcError {
                 code: UNKNOWN_REF,
                 message: "unknown value hash".into(),
                 data: None,
             })?;
-        // Content-addressed value blobs are stored as their `$`-tagged
-        // JSON encoding; hand it back structurally. A non-JSON blob
-        // (stdout/stderr) comes back as tagged bytes.
-        let value = serde_json::from_slice::<Json>(&blob).unwrap_or_else(|_| {
-            json!({
-                "$": "bytes",
-                "len": blob.len(),
-                "v": base64::Engine::encode(
-                    &base64::engine::general_purpose::STANDARD, &blob),
-            })
+        let offset = requested_offset.min(total_len);
+        let returned_len = blob.len() as u64;
+        let next = offset.saturating_add(returned_len).min(total_len);
+        let requested_end = offset.saturating_add(requested_length).min(total_len);
+        let page = json!({
+            "total_len": total_len,
+            "offset": offset,
+            "returned_len": returned_len,
+            "content_bytes": blob.len(),
+            "next_offset": (next < total_len).then_some(next),
+            "done": next >= total_len,
+            "truncated": next < total_len,
+            "request_truncated": next < requested_end,
+            "unit": "byte",
+            "max_content_bytes": RAW_PAGE_MAX_BYTES,
         });
-        encode(json!({"hash": hash, "value": value}))
+
+        // Preserve the historical structured response for a complete small
+        // omitted-range request. Larger blobs and every explicit range return
+        // a byte page; neither path ever allocates more than the page wall.
+        if params.offset.is_none() && params.length.is_none() && next == total_len {
+            let value = serde_json::from_slice::<Json>(&blob).unwrap_or_else(|_| {
+                json!({
+                    "$": "bytes",
+                    "len": blob.len(),
+                    "v": base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD, &blob),
+                })
+            });
+            encode(json!({"hash": hash, "value": value, "page": page}))
+        } else {
+            encode(json!({
+                "hash": hash,
+                "encoding": "base64",
+                "raw_base64": base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    &blob,
+                ),
+                "page": page,
+            }))
+        }
     }
 }

@@ -9,6 +9,13 @@ use std::io::{self, BufRead, Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
 pub const JSONRPC: &str = "2.0";
+/// Maximum decoded content carried by one raw/blob retrieval response.
+///
+/// This is intentionally below the general 64 KiB encoded-value wall: JSON
+/// escaping can expand a UTF-8 string by up to six times, while base64 expands
+/// bytes by four thirds. Keeping the decoded page at 8 KiB therefore leaves a
+/// hard safety margin for metadata and JSON-RPC framing in both cases.
+pub const RAW_PAGE_MAX_BYTES: usize = 8 * 1024;
 pub type RequestId = Value;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -610,6 +617,19 @@ pub struct ValueGetParams {
     pub width: Option<usize>,
 }
 
+/// `blob.get` — retrieve one bounded byte page from an owner-scoped CAS blob.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlobGetParams {
+    pub hash: String,
+    /// Byte offset in the uncompressed content. Omitted means zero.
+    #[serde(default)]
+    pub offset: Option<u64>,
+    /// Requested byte count. The server clamps this to
+    /// [`RAW_PAGE_MAX_BYTES`]. Omitted requests one maximum-size page.
+    #[serde(default)]
+    pub length: Option<u64>,
+}
+
 /// `stream.pull` — pull a bounded batch from a session-owned live stream.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamPullParams {
@@ -836,6 +856,24 @@ mod tests {
         let wire = WirePath::encode(&original);
         assert!(wire.raw.is_some());
         assert_eq!(wire.decode().unwrap(), original);
+    }
+
+    #[test]
+    fn blob_get_params_decode_additive_range_fields() {
+        let legacy: BlobGetParams =
+            serde_json::from_value(serde_json::json!({"hash":"abc123"})).unwrap();
+        assert_eq!(legacy.hash, "abc123");
+        assert_eq!(legacy.offset, None);
+        assert_eq!(legacy.length, None);
+
+        let paged: BlobGetParams = serde_json::from_value(serde_json::json!({
+            "hash":"abc123",
+            "offset": u64::MAX,
+            "length": u64::MAX,
+        }))
+        .unwrap();
+        assert_eq!(paged.offset, Some(u64::MAX));
+        assert_eq!(paged.length, Some(u64::MAX));
     }
 
     /// Locks the wire contract (refactor guard): every named `error_code`

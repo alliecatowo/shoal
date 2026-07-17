@@ -11,7 +11,7 @@ use shoal_kernel::Kernel;
 use shoal_leash::Policy;
 use shoal_mcp::{Config, Facade};
 use shoal_proto::error_code::NOT_ATTACHED;
-use shoal_proto::{JSONRPC, Request, Response, write_frame};
+use shoal_proto::{JSONRPC, RAW_PAGE_MAX_BYTES, Request, Response, write_frame};
 use std::io::BufReader;
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
@@ -230,6 +230,43 @@ fn mcp_exec_elides_render_and_text_then_resource_read_drills_in() {
     assert!(
         value["v"]["name"].is_object(),
         "drilled row keeps its fields"
+    );
+}
+
+#[test]
+fn mcp_raw_resource_returns_only_a_page_in_structured_content() {
+    let live = LiveKernel::start();
+    let mut facade = Facade::connect(&live.config()).unwrap();
+    let source = format!("\"{}\"", "z".repeat(RAW_PAGE_MAX_BYTES * 4));
+    let exec = call_tool(
+        &mut facade,
+        "shoal_exec",
+        json!({"src":source,"position":"value"}),
+    );
+    let r#ref = exec["structuredContent"]["ref"].as_str().unwrap();
+    let index = r#ref.strip_prefix("out:").unwrap();
+    let first = read_resource(&mut facade, &format!("shoal://out/{index}?format=raw"));
+    assert!(serde_json::to_vec(&first).unwrap().len() < 64 * 1024);
+    let structured = &first["structuredContent"];
+    assert_eq!(structured["page"]["returned_len"], RAW_PAGE_MAX_BYTES);
+    assert_eq!(structured["page"]["next_offset"], RAW_PAGE_MAX_BYTES);
+    assert_eq!(structured["page"]["done"], false);
+    assert_eq!(
+        structured["raw"].as_str().unwrap().len(),
+        RAW_PAGE_MAX_BYTES
+    );
+
+    let second = read_resource(
+        &mut facade,
+        &format!(
+            "shoal://out/{index}?format=raw&slice={}..{}",
+            RAW_PAGE_MAX_BYTES,
+            RAW_PAGE_MAX_BYTES * 2
+        ),
+    );
+    assert_eq!(
+        second["structuredContent"]["page"]["offset"],
+        RAW_PAGE_MAX_BYTES
     );
 }
 

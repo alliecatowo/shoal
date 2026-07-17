@@ -317,15 +317,16 @@ Key serialization rules:
   aspirational;
 - `Ref` elision retains type/count/schema/preview/render head plus a fetch URI.
 
-Two current byte-level discrepancies must be treated as contract debt:
+One current byte-level discrepancy remains contract debt:
 
 - `WireValue::DateTime` is documented by the protocol type as RFC 3339, but kernel conversion in
   `wire.rs` currently emits `timestamp().to_string()`: a Unix-seconds decimal string. Clients must
   not assume the declared RFC 3339 shape until conversion and compatibility tests are repaired.
-- `value.get {format:"raw"}` materializes the complete resident or CAS-backed byte value and returns
-  `raw_base64` without the ordinary 64 KiB elision clamp. The MCP resource adapter special-cases
-  `raw` but not `raw_base64`, leaving the full payload in `structuredContent`. This is a context- and
-  memory-boundary bypass, not an endorsed exception to elision.
+
+Raw retrieval is now an explicit bounded contract: `value.get format=raw` pages by the existing
+Unicode-scalar/byte `slice`, `blob.get` pages by byte `offset`/`length`, and both carry at most 8 KiB
+of decoded content plus `total_len`/`next_offset`/`done` metadata. The MCP facade forwards only that
+bounded page in `structuredContent`.
 
 Wire-value evolution is a client compatibility change. Add serde round trips, old fixture decoding,
 kernel conversion tests, and MCP live tests before shipping a variant/field change.

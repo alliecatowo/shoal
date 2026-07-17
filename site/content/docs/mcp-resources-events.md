@@ -157,9 +157,9 @@ It maps to the raw kernel array `[0, 50]`. Bounds are nonnegative and the end is
 | --- | --- |
 | omitted or `json` | Tagged wire JSON with normal elision. |
 | `render` | Human display string in `text/plain`. |
-| `raw` | Verbatim string, or base64 for bytes/CAS blobs; other value types reject it. |
+| `raw` | One bounded verbatim-string or base64 byte page; other value types reject it. |
 
-`format=raw` is intended for explicit data transfer, not casual inspection. In the current implementation, raw string/byte retrieval bypasses the normal encoded 64 KiB value ceiling: the MCP `contents[].text` presentation is bounded, but `structuredContent.raw` or `structuredContent.raw_base64` can contain the full payload. Treat the URI as potentially large and apply client-side limits. This is a known current behavior, not a guarantee that future versions will remain unbounded.
+`format=raw` is intended for explicit data transfer, not casual inspection. Each response carries at most 8 KiB of decoded content. `page.unit` is `unicode_scalar` for strings and `byte` for bytes; resume with `slice=<next_offset>..<end>` until `page.done`. `page.total_len`, `returned_len`, `truncated`, and `request_truncated` distinguish the complete value, the returned page, remaining content, and a server-shortened requested range. The bounded page—not the complete payload—is exposed in MCP `structuredContent`.
 
 The `shoal_get` MCP tool intentionally does not advertise `format`; representation selection is available through the URI or raw kernel method.
 
@@ -173,7 +173,7 @@ shoal://out/17?elide=%7B%22max_rows%22%3A20%7D
 
 Because it is not part of the published URI template, portable MCP clients should prefer `shoal_get` for a custom elision budget. The stable drill-down mechanisms are `path` and `slice`.
 
-## Content values: `shoal://val/{hash}`
+## Content values: `shoal://val/{hash}{?offset,length}`
 
 Large immutable values may be stored in the content-addressed store and referenced as:
 
@@ -181,11 +181,12 @@ Large immutable values may be stored in the content-addressed store and referenc
 val:blake3:8baef...
 shoal://val/blake3:8baef...
 shoal://val/8baef...
+shoal://val/8baef...?offset=8192&length=8192
 ```
 
-The resource layer accepts the bare hash or strips the `blake3:` prefix before calling `blob.get`. Content references are backed by the kernel's CAS and can survive evaluator/session recreation when the journal/state directory survives. Their availability is still subject to garbage collection and state-directory selection.
+The resource layer accepts the bare hash or strips the `blake3:` prefix before calling `blob.get`. Offset and length are byte units; the server clamps length to 8 KiB and returns base64 plus the same continuation metadata. An omitted range preserves the legacy structured result only when the complete stored value fits in one page. Content references are backed by the kernel's CAS and can survive evaluator/session recreation when the journal/state directory survives. Their availability is still subject to garbage collection and state-directory selection.
 
-A content hash identifies bytes, not authorization. The local socket/token/session policy remains the access boundary around `blob.get`.
+A content hash identifies bytes, not authorization. `blob.get` additionally requires the hash to be linked to an output owned by the exact attached session and principal; foreign and unknown hashes are deliberately indistinguishable.
 
 ## Tasks: `shoal://task/{id}`
 

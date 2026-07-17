@@ -2566,7 +2566,7 @@ fn value_get_resolves_cas_backed_bytes_ref() {
     assert_eq!(v["$"], "bytes", "a small slice resolves inline: {v}");
     assert_eq!(decode(v["v"].as_str().unwrap()), content[0..10]);
 
-    // format=raw resolves the FULL content (base64).
+    // This value fits under one raw page, so format=raw resolves it completely.
     let raw = call(
         &mut client,
         &mut reader,
@@ -2618,6 +2618,218 @@ fn value_get_resolves_cas_backed_bytes_ref() {
         bad.error.is_some(),
         "a failed CAS resolution surfaces an error, not a panic"
     );
+
+    drop(client);
+    drop(reader);
+    thread.join().unwrap();
+}
+
+#[test]
+fn raw_value_pages_are_bounded_pageable_and_stream_cas_content() {
+    struct StreamingLoader {
+        bytes: Vec<u8>,
+        loads: Arc<AtomicUsize>,
+        opens: Arc<AtomicUsize>,
+    }
+    impl shoal_value::BytesLoad for StreamingLoader {
+        fn load(&self) -> std::io::Result<Vec<u8>> {
+            self.loads.fetch_add(1, Ordering::SeqCst);
+            Err(std::io::Error::other(
+                "raw paging must not materialize the complete CAS value",
+            ))
+        }
+
+        fn open(&self) -> std::io::Result<Box<dyn std::io::Read + Send>> {
+            self.opens.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(std::io::Cursor::new(self.bytes.clone())))
+        }
+    }
+
+    let decode =
+        |s: &str| base64::Engine::decode(&base64::engine::general_purpose::STANDARD, s).unwrap();
+    let content = (0..(RAW_PAGE_MAX_BYTES * 3 + 11))
+        .map(|i| (i % 251) as u8)
+        .collect::<Vec<_>>();
+    let loads = Arc::new(AtomicUsize::new(0));
+    let opens = Arc::new(AtomicUsize::new(0));
+    let kernel = Kernel::new();
+    let session = kernel.session("paged", &principal()).unwrap();
+    {
+        let mut transcript = session
+            .transcript
+            .lock()
+            .expect("test lock should not be poisoned");
+        transcript.insert(
+            Ref::new("out", 1u64),
+            Value::Bytes(Arc::new(content.clone())),
+        );
+        transcript.insert(
+            Ref::new("out", 2u64),
+            Value::Str("\u{0000}\u{0001}🦀".repeat(RAW_PAGE_MAX_BYTES)),
+        );
+        transcript.insert(
+            Ref::new("out", 3u64),
+            Value::CasBytes(Arc::new(shoal_value::CasBytesVal {
+                hash: "c".repeat(64),
+                len: content.len() as u64,
+                preview: Arc::new(content[..64].to_vec()),
+                truncated: false,
+                loader: Arc::new(StreamingLoader {
+                    bytes: content.clone(),
+                    loads: loads.clone(),
+                    opens: opens.clone(),
+                }),
+            })),
+        );
+    }
+    let (mut client, mut reader, thread) = spawn(&kernel);
+    call(
+        &mut client,
+        &mut reader,
+        1,
+        "session.attach",
+        json!({"local_auth":"local-human","session":"paged","client":{"kind":"agent","tty":false}}),
+    );
+
+    let first = call(
+        &mut client,
+        &mut reader,
+        2,
+        "value.get",
+        json!({"ref":"out:1","format":"raw"}),
+    );
+    let first_json = serde_json::to_vec(&first).unwrap();
+    assert!(
+        first_json.len() < 64 * 1024,
+        "raw wire page is hard bounded"
+    );
+    let first = first.result.unwrap();
+    assert_eq!(first["page"]["returned_len"], RAW_PAGE_MAX_BYTES);
+    assert_eq!(first["page"]["next_offset"], RAW_PAGE_MAX_BYTES);
+    assert_eq!(first["page"]["done"], false);
+    assert_eq!(
+        decode(first["raw_base64"].as_str().unwrap()),
+        content[..RAW_PAGE_MAX_BYTES]
+    );
+
+    let huge_end = call(
+        &mut client,
+        &mut reader,
+        3,
+        "value.get",
+        json!({"ref":"out:1","format":"raw","slice":[RAW_PAGE_MAX_BYTES, usize::MAX]}),
+    )
+    .result
+    .unwrap();
+    assert_eq!(huge_end["page"]["offset"], RAW_PAGE_MAX_BYTES);
+    assert_eq!(huge_end["page"]["returned_len"], RAW_PAGE_MAX_BYTES);
+
+    let string = call(
+        &mut client,
+        &mut reader,
+        4,
+        "value.get",
+        json!({"ref":"out:2","format":"raw"}),
+    );
+    assert!(serde_json::to_vec(&string).unwrap().len() < 64 * 1024);
+    let string = string.result.unwrap();
+    assert_eq!(string["page"]["unit"], "unicode_scalar");
+    assert!(string["raw"].as_str().unwrap().len() <= RAW_PAGE_MAX_BYTES);
+
+    let cas = call(
+        &mut client,
+        &mut reader,
+        5,
+        "value.get",
+        json!({"ref":"out:3","format":"raw","slice":[13, usize::MAX]}),
+    )
+    .result
+    .unwrap();
+    assert_eq!(
+        decode(cas["raw_base64"].as_str().unwrap()),
+        content[13..13 + RAW_PAGE_MAX_BYTES]
+    );
+    assert_eq!(loads.load(Ordering::SeqCst), 0);
+    assert_eq!(opens.load(Ordering::SeqCst), 1);
+
+    drop(client);
+    drop(reader);
+    thread.join().unwrap();
+}
+
+#[test]
+fn blob_get_pages_large_content_and_handles_offset_overflow() {
+    let kernel = Kernel::new();
+    let (mut client, mut reader, thread) = spawn(&kernel);
+    call(
+        &mut client,
+        &mut reader,
+        1,
+        "session.attach",
+        json!({"local_auth":"local-human","session":"blob-pages","client":{"kind":"agent","tty":false}}),
+    );
+    let source = format!("\"{}\"", "z".repeat(RAW_PAGE_MAX_BYTES * 3));
+    let exec = call(&mut client, &mut reader, 2, "exec", json!({"src": source}));
+    assert!(exec.error.is_none(), "large string exec succeeds: {exec:?}");
+    let hash = {
+        let journal = kernel
+            .journal
+            .lock()
+            .expect("test lock should not be poisoned");
+        journal
+            .query(&JournalQuery::default())
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.session == "blob-pages")
+            .unwrap()
+            .outputs
+            .into_iter()
+            .find(|output| output.kind == "value")
+            .unwrap()
+            .hash
+    };
+
+    let first = call(
+        &mut client,
+        &mut reader,
+        3,
+        "blob.get",
+        json!({"hash":hash,"offset":0,"length":u64::MAX}),
+    );
+    assert!(serde_json::to_vec(&first).unwrap().len() < 64 * 1024);
+    let first = first.result.unwrap();
+    assert_eq!(first["page"]["returned_len"], RAW_PAGE_MAX_BYTES);
+    assert_eq!(first["page"]["request_truncated"], true);
+    let total = first["page"]["total_len"].as_u64().unwrap();
+    assert!(total > RAW_PAGE_MAX_BYTES as u64);
+
+    let last_offset = total - RAW_PAGE_MAX_BYTES as u64;
+    let last = call(
+        &mut client,
+        &mut reader,
+        4,
+        "blob.get",
+        json!({"hash":hash,"offset":last_offset,"length":RAW_PAGE_MAX_BYTES}),
+    )
+    .result
+    .unwrap();
+    assert_eq!(last["page"]["offset"], last_offset);
+    assert_eq!(last["page"]["returned_len"], RAW_PAGE_MAX_BYTES);
+    assert_eq!(last["page"]["done"], true);
+    assert_eq!(last["page"]["next_offset"], Json::Null);
+
+    let overflow = call(
+        &mut client,
+        &mut reader,
+        5,
+        "blob.get",
+        json!({"hash":hash,"offset":u64::MAX,"length":u64::MAX}),
+    )
+    .result
+    .unwrap();
+    assert_eq!(overflow["page"]["offset"], total);
+    assert_eq!(overflow["page"]["returned_len"], 0);
+    assert_eq!(overflow["page"]["done"], true);
 
     drop(client);
     drop(reader);
@@ -2809,7 +3021,7 @@ fn reattach_scopes_journal_blobs_and_subscriptions_to_the_new_owner() {
         &mut reader,
         7,
         "blob.get",
-        json!({"hash":hash}),
+        json!({"hash":hash,"offset":u64::MAX,"length":u64::MAX}),
     );
     assert_eq!(
         denied.error.expect("foreign blob is opaque").code,

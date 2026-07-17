@@ -57,6 +57,37 @@ fn cas_verified_reader_streams_large_content_without_materializing_api() {
     assert_eq!(observed, payload);
 }
 
+#[test]
+fn read_blob_range_is_exact_bounded_and_overflow_safe() {
+    let journal = Journal::in_memory().unwrap();
+    let id = journal
+        .append(&rec("cas", "human", 1, "paged output"))
+        .unwrap();
+    let payload = (0..(256 * 1024 + 31))
+        .map(|i| (i % 251) as u8)
+        .collect::<Vec<_>>();
+    let hash = journal.record_output(id, "stdout", &payload).unwrap();
+
+    let (total, middle) = journal
+        .read_blob_range(&hash, 12_345, 8_192)
+        .unwrap()
+        .unwrap();
+    assert_eq!(total, payload.len() as u64);
+    assert_eq!(middle, payload[12_345..12_345 + 8_192]);
+
+    let (_, boundary) = journal
+        .read_blob_range(&hash, payload.len() as u64 - 17, 17)
+        .unwrap()
+        .unwrap();
+    assert_eq!(boundary, payload[payload.len() - 17..]);
+
+    let (_, past_end) = journal
+        .read_blob_range(&hash, u64::MAX, usize::MAX)
+        .unwrap()
+        .unwrap();
+    assert!(past_end.is_empty());
+}
+
 /// Count regular files under `dir`, recursively.
 fn count_files(dir: &Path) -> usize {
     let mut n = 0;

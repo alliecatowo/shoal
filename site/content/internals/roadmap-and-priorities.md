@@ -215,7 +215,12 @@ ID changes, support old clients through a versioned attach response or a deliber
 
 ### P0.3 Bounded frame ingestion and explicit raw retrieval
 
-**Problem.** Kernel and MCP readers call `read_line` before checking the 16 MiB cap. A peer can force
+**Status (2026-07-17): implemented.** Frame readers reject cap-plus-one during bounded ingestion.
+Raw values now use bounded `slice` pages and CAS blobs use byte `offset`/`length` pages, both with an
+8 KiB decoded-content wall and explicit continuation metadata. The adversarial suite covers resident
+and CAS values, exact boundaries, overflowed requests, owner denial, and MCP context size.
+
+**Original problem.** Kernel and MCP readers called `read_line` before checking the 16 MiB cap. A peer could force
 larger allocation with a newline-free frame. `value.get {format:"raw"}` returns full base64 without
 the ordinary 64 KiB elision clamp, and MCP forwards it.
 

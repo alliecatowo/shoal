@@ -243,7 +243,7 @@ fn value_read_result(uri: &str, value: Value) -> Value {
 pub(crate) fn resource_templates() -> Value {
     json!({"resourceTemplates":[
         {"uriTemplate":"shoal://out/{n}{?path,slice,format}","name":"transcript-value","description":"A transcript value, drillable by field-path/slice","mimeType":"application/json"},
-        {"uriTemplate":"shoal://val/{hash}","name":"content-value","description":"An immutable content-addressed value","mimeType":"application/json"},
+        {"uriTemplate":"shoal://val/{hash}{?offset,length}","name":"content-value","description":"An immutable content-addressed value, retrieved in bounded byte pages","mimeType":"application/json"},
         {"uriTemplate":"shoal://task/{id}","name":"task","description":"A background task record","mimeType":"application/json"},
         {"uriTemplate":"shoal://task/{id}/out{?path,slice,format}","name":"task-output","description":"A task's captured output, drillable by field-path/slice","mimeType":"application/json"},
         {"uriTemplate":"shoal://plan/{ref}","name":"plan","description":"A derived plan: effects, reversibility, verdict","mimeType":"application/json"},
@@ -323,7 +323,14 @@ impl ParsedUri {
                 // (site/content/internals/kernel-protocol.md): the kernel's CAS keys on the raw hex, so
                 // strip the `blake3:` algorithm prefix before `blob.get`.
                 let hash = hash.strip_prefix("blake3:").unwrap_or(hash);
-                Ok(("blob.get", json!({ "hash": hash })))
+                Ok((
+                    "blob.get",
+                    json!({
+                        "hash": hash,
+                        "offset": self.query.get("offset").and_then(|s| s.parse::<u64>().ok()),
+                        "length": self.query.get("length").and_then(|s| s.parse::<u64>().ok()),
+                    }),
+                ))
             }
             "plan" => {
                 let plan_ref = self
@@ -464,6 +471,13 @@ mod tests {
         assert_eq!(method, "blob.get");
         assert_eq!(params["hash"], "abc123");
 
+        let val_page =
+            ParsedUri::parse("shoal://val/abc123?offset=8192&length=18446744073709551615").unwrap();
+        let (method, params) = val_page.to_kernel_call().unwrap();
+        assert_eq!(method, "blob.get");
+        assert_eq!(params["offset"], 8192);
+        assert_eq!(params["length"], u64::MAX);
+
         // The spec short-ref form `val:blake3:<hex>` → `shoal://val/blake3:<hex>`
         // must strip the algorithm prefix so the CAS lookup keys on raw hex.
         let val_prefixed = ParsedUri::parse("shoal://val/blake3:abc123").unwrap();
@@ -494,5 +508,32 @@ mod tests {
         // A pty URI is not subscribable (the push event is a documented
         // follow-up, not wired here).
         assert!(pty_one.event_channel().is_none());
+    }
+
+    #[test]
+    fn raw_resource_structured_content_stays_below_context_wall() {
+        let encoded_len = shoal_proto::RAW_PAGE_MAX_BYTES.div_ceil(3) * 4;
+        let value = json!({
+            "hash": "a".repeat(64),
+            "encoding": "base64",
+            "raw_base64": "q".repeat(encoded_len),
+            "page": {
+                "total_len": shoal_proto::RAW_PAGE_MAX_BYTES * 4,
+                "offset": 0,
+                "returned_len": shoal_proto::RAW_PAGE_MAX_BYTES,
+                "next_offset": shoal_proto::RAW_PAGE_MAX_BYTES,
+                "done": false,
+                "truncated": true,
+                "unit": "byte",
+            },
+        });
+        let result = value_read_result("shoal://val/a", value);
+        assert!(
+            serde_json::to_vec(&result["structuredContent"])
+                .unwrap()
+                .len()
+                < 64 * 1024
+        );
+        assert!(result["contents"][0]["text"].as_str().unwrap().len() < 64 * 1024);
     }
 }

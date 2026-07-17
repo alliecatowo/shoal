@@ -3,6 +3,7 @@
 
 use std::fs;
 use std::io;
+use std::io::Read as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -172,6 +173,54 @@ impl Journal {
             )?;
         }
         Ok(Some(bytes))
+    }
+
+    /// Read at most `length` uncompressed bytes beginning at `offset` without
+    /// materializing the complete blob. Integrity is verified before any
+    /// bytes are returned; compressed content is then streamed and discarded
+    /// up to the requested offset using bounded memory.
+    ///
+    /// The returned tuple is `(total_uncompressed_len, page)`. An offset past
+    /// EOF is clamped to EOF and returns an empty page. Missing/malformed hashes
+    /// return `Ok(None)`, matching [`Self::read_blob`].
+    pub fn read_blob_range(
+        &self,
+        hash: &str,
+        offset: u64,
+        length: usize,
+    ) -> rusqlite::Result<Option<(u64, Vec<u8>)>> {
+        let Some(total) = self.blob_len(hash)? else {
+            return Ok(None);
+        };
+        let offset = offset.min(total);
+        let wanted = total.saturating_sub(offset).min(length as u64) as usize;
+        let mut reader = self.cas().open_verified(hash).map_err(io_to_sql)?;
+        let skipped =
+            io::copy(&mut reader.by_ref().take(offset), &mut io::sink()).map_err(io_to_sql)?;
+        if skipped != offset {
+            return Err(io_to_sql(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("CAS blob {hash} ended before its recorded length"),
+            )));
+        }
+        let mut page = Vec::with_capacity(wanted);
+        reader
+            .take(wanted as u64)
+            .read_to_end(&mut page)
+            .map_err(io_to_sql)?;
+        if page.len() != wanted {
+            return Err(io_to_sql(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("CAS blob {hash} ended before its recorded length"),
+            )));
+        }
+        if let Ok(raw) = hex_bytes(hash) {
+            self.conn.execute(
+                "UPDATE blob SET last_access_ns=?1 WHERE hash=?2",
+                params![now_ns(), raw],
+            )?;
+        }
+        Ok(Some((total, page)))
     }
 
     /// The stored (uncompressed) byte length of the CAS blob addressed by

@@ -3,6 +3,7 @@
 //! the `EventBus` they operate on. Wire behavior is documented in
 //! `site/content/internals/kernel-protocol.md`.
 use super::*;
+use std::io::Read as _;
 
 /// Default `journal.query` page size when the caller omits `limit` — matches
 /// the journal store's own historical default so an omitted limit behaves
@@ -33,6 +34,172 @@ fn cas_resolve_error(r#ref: &Ref, err: shoal_value::ErrorVal) -> RpcError {
     }
 }
 
+fn page_metadata(
+    total_len: u64,
+    offset: u64,
+    returned_len: u64,
+    requested_end: u64,
+    unit: &str,
+    content_bytes: usize,
+) -> Json {
+    let next = offset.saturating_add(returned_len).min(total_len);
+    json!({
+        "total_len": total_len,
+        "offset": offset,
+        "returned_len": returned_len,
+        "content_bytes": content_bytes,
+        "next_offset": (next < total_len).then_some(next),
+        "done": next >= total_len,
+        "truncated": next < total_len,
+        "request_truncated": next < requested_end,
+        "unit": unit,
+        "max_content_bytes": RAW_PAGE_MAX_BYTES,
+    })
+}
+
+fn raw_page(r#ref: &Ref, value: &Value, slice: Option<[usize; 2]>) -> Result<Json, RpcError> {
+    match value {
+        Value::Str(s) => {
+            // String offsets are Unicode scalar-value indexes, matching the
+            // existing `slice` contract. The hard page budget is UTF-8 bytes,
+            // and we stop only at a scalar boundary.
+            let total = s.chars().count();
+            let (start, requested_end) = slice
+                .map(|[start, end]| {
+                    let start = start.min(total);
+                    (start, end.max(start).min(total))
+                })
+                .unwrap_or((0, total));
+            let mut raw = String::new();
+            let mut returned = 0usize;
+            for ch in s.chars().skip(start).take(requested_end - start) {
+                if raw.len().saturating_add(ch.len_utf8()) > RAW_PAGE_MAX_BYTES {
+                    break;
+                }
+                raw.push(ch);
+                returned += 1;
+            }
+            let metadata = page_metadata(
+                total as u64,
+                start as u64,
+                returned as u64,
+                requested_end as u64,
+                "unicode_scalar",
+                raw.len(),
+            );
+            Ok(json!({
+                "ref": r#ref,
+                "encoding": "utf-8",
+                "raw": raw,
+                "page": metadata,
+            }))
+        }
+        Value::Bytes(bytes) => {
+            let total = bytes.len();
+            let (start, requested_end) = slice
+                .map(|[start, end]| {
+                    let start = start.min(total);
+                    (start, end.max(start).min(total))
+                })
+                .unwrap_or((0, total));
+            let end = start.saturating_add(RAW_PAGE_MAX_BYTES).min(requested_end);
+            let page = &bytes[start..end];
+            let metadata = page_metadata(
+                total as u64,
+                start as u64,
+                page.len() as u64,
+                requested_end as u64,
+                "byte",
+                page.len(),
+            );
+            Ok(json!({
+                "ref": r#ref,
+                "encoding": "base64",
+                "raw_base64": base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    page,
+                ),
+                "page": metadata,
+            }))
+        }
+        Value::CasBytes(cas) => {
+            let total = cas.len;
+            let (start, requested_end) = slice
+                .map(|[start, end]| {
+                    let start = (start as u64).min(total);
+                    (start, (end as u64).max(start).min(total))
+                })
+                .unwrap_or((0, total));
+            let wanted = requested_end
+                .saturating_sub(start)
+                .min(RAW_PAGE_MAX_BYTES as u64) as usize;
+            let mut reader = cas
+                .open()
+                .map_err(|error| cas_resolve_error(r#ref, error))?;
+            let skipped = std::io::copy(&mut reader.by_ref().take(start), &mut std::io::sink())
+                .map_err(|error| {
+                    cas_resolve_error(
+                        r#ref,
+                        shoal_value::ErrorVal::new("io_error", error.to_string()),
+                    )
+                })?;
+            if skipped != start {
+                return Err(cas_resolve_error(
+                    r#ref,
+                    shoal_value::ErrorVal::new(
+                        "io_error",
+                        "CAS content ended before its recorded length",
+                    ),
+                ));
+            }
+            let mut page = Vec::with_capacity(wanted);
+            reader
+                .take(wanted as u64)
+                .read_to_end(&mut page)
+                .map_err(|error| {
+                    cas_resolve_error(
+                        r#ref,
+                        shoal_value::ErrorVal::new("io_error", error.to_string()),
+                    )
+                })?;
+            if page.len() != wanted {
+                return Err(cas_resolve_error(
+                    r#ref,
+                    shoal_value::ErrorVal::new(
+                        "io_error",
+                        "CAS content ended before its recorded length",
+                    ),
+                ));
+            }
+            let metadata = page_metadata(
+                total,
+                start,
+                page.len() as u64,
+                requested_end,
+                "byte",
+                page.len(),
+            );
+            Ok(json!({
+                "ref": r#ref,
+                "encoding": "base64",
+                "raw_base64": base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    &page,
+                ),
+                "page": metadata,
+            }))
+        }
+        other => Err(RpcError {
+            code: BAD_PATH_OR_SLICE,
+            message: format!(
+                "format \"raw\" applies to str/bytes, not {}",
+                other.type_name()
+            ),
+            data: None,
+        }),
+    }
+}
+
 impl Kernel {
     pub(crate) fn handle_value_get(
         self: &Arc<Self>,
@@ -58,6 +225,12 @@ impl Kernel {
             }
             _ => value.clone(),
         };
+        // Raw retrieval has its own mandatory page wall. Handle it before the
+        // ordinary value slicer so a hostile range can never allocate or
+        // base64 the full resident/CAS-backed payload first.
+        if params.format.as_deref() == Some("raw") {
+            return encode(raw_page(&params.r#ref, &resolved, params.slice)?);
+        }
         // Slicing is an explicit, targeted ask: apply it at the value
         // level *before* the elision check, so a small slice of a
         // huge list is never spuriously elided (and a slice that is
@@ -138,46 +311,6 @@ impl Kernel {
                     "render": bound_render(render, &uri, !attachment.tty),
                     "streamed": matches!(&sliced, Value::Outcome(outcome) if outcome.streamed),
                 }))
-            }
-            Some("raw") => {
-                let raw = match &sliced {
-                    Value::Str(s) => json!({"ref":params.r#ref,"raw":s}),
-                    Value::Bytes(b) => json!({
-                        "ref": params.r#ref,
-                        "raw_base64": base64::Engine::encode(
-                            &base64::engine::general_purpose::STANDARD,
-                            &***b,
-                        ),
-                    }),
-                    // site/content/internals/kernel-protocol.md: `format=raw` on a CAS-backed bytes ref resolves it —
-                    // materialize the full content from the CAS and hand back its
-                    // base64, exactly as for a resident `bytes`. (An unsliced
-                    // CasBytes only reaches here under `format=raw`; the default
-                    // `format=json` path still elides it to a ref, above.)
-                    Value::CasBytes(c) => {
-                        let full = c
-                            .resolve()
-                            .map_err(|e| cas_resolve_error(&params.r#ref, e))?;
-                        json!({
-                            "ref": params.r#ref,
-                            "raw_base64": base64::Engine::encode(
-                                &base64::engine::general_purpose::STANDARD,
-                                &full,
-                            ),
-                        })
-                    }
-                    other => {
-                        return Err(RpcError {
-                            code: BAD_PATH_OR_SLICE,
-                            message: format!(
-                                "format \"raw\" applies to str/bytes, not {}",
-                                other.type_name()
-                            ),
-                            data: None,
-                        });
-                    }
-                };
-                encode(raw)
             }
             Some(other) => Err(RpcError {
                 code: INVALID_PARAMS,

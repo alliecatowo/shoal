@@ -618,6 +618,11 @@ mod tests {
             self.loads.fetch_add(1, Ordering::SeqCst);
             Ok(self.bytes.clone())
         }
+
+        fn open(&self) -> std::io::Result<Box<dyn std::io::Read + Send>> {
+            self.loads.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(std::io::Cursor::new(self.bytes.clone())))
+        }
     }
 
     #[test]
@@ -665,7 +670,9 @@ mod tests {
             raw["raw_base64"].as_str().unwrap(),
         )
         .unwrap();
-        assert_eq!(decoded, bytes);
+        assert_eq!(decoded, bytes[..RAW_PAGE_MAX_BYTES]);
+        assert_eq!(raw["page"]["next_offset"], RAW_PAGE_MAX_BYTES);
+        assert_eq!(raw["page"]["done"], false);
         assert_eq!(loads.load(Ordering::SeqCst), 1);
     }
 }

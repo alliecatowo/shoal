@@ -290,23 +290,27 @@ Input:
 | `format` | `json` default, `render`, or `raw` |
 
 Resolution order is transcript lookup → path → slice → format. Slices work for lists, table rows,
-Unicode scalar positions in strings, resident byte offsets, and CAS-backed bytes after full
-resolution. Slicing another kind is `BAD_PATH_OR_SLICE` rather than a silent no-op.
+Unicode scalar positions in strings, resident byte offsets, and CAS-backed bytes. Slicing another
+kind is `BAD_PATH_OR_SLICE` rather than a silent no-op.
 
 `json` returns `{ref,value}` with structural elision. `render` returns `{ref,render}` with the hard
-render cap. `raw` returns `{ref,raw}` for strings or `{ref,raw_base64}` for bytes. Raw bytes currently
-bypass the 64 KiB normal value wall, and a CAS-backed raw request materializes the complete blob
-before base64 encoding. This needs offset/length or chunked blob retrieval.
+render cap. `raw` returns one page as `{ref,encoding,raw|raw_base64,page}`. A page contains at most
+8 KiB of decoded content; `page` reports `total_len`, `offset`, `returned_len`, `next_offset`,
+`done`, `truncated`, and the offset `unit`. String offsets are Unicode scalar indexes while byte and
+CAS offsets are octets. CAS pages use the verified streaming reader and never materialize the full
+blob before applying the page wall.
 
 Refs are looked up only in the attached session's transcript map. A missing ref or failed CAS
 resolution is `UNKNOWN_REF`; invalid path/slice/type format is `BAD_PATH_OR_SLICE`.
 
 ### `blob.get`
 
-Input is `{hash}`. It reads from the kernel journal's CAS. If bytes parse as JSON, result is
-`{hash,value:<that JSON>}`. Otherwise it produces a `$:"bytes"` tagged object with length and full
-base64. Unknown hash is `UNKNOWN_REF`. The method requires attachment, but the blob lookup itself is
-global to the shared CAS and does not prove the caller learned the hash from an authorized row.
+Input is `{hash,offset?,length?}`. Offset and length are uncompressed byte units; length is clamped
+to 8 KiB with overflow-safe arithmetic. A complete small omitted-range request preserves the legacy
+`{hash,value}` result. Explicit ranges and oversized values return
+`{hash,encoding:"base64",raw_base64,page}` and can be continued at `page.next_offset`. Unknown or
+foreign-owner hashes are both `UNKNOWN_REF`: attachment plus exact session/principal output
+ownership is checked before opening the CAS.
 
 ## Tasks
 

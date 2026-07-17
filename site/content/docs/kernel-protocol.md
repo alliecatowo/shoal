@@ -360,15 +360,15 @@ Formats:
 - `render`: `{ref, render}` with bounded 80-column display;
 - `raw`: `{ref, raw}` for strings or `{ref, raw_base64}` for bytes/CAS bytes.
 
-Current `raw` behavior materializes and returns the complete string/bytes and does not apply the normal 64 KiB encoded hard cap. Callers must impose their own bound. Other types reject raw format with `BAD_PATH_OR_SLICE`.
+`raw` returns at most 8 KiB of decoded content plus `page` metadata. String slice offsets and `total_len` use Unicode scalar units; bytes/CAS values use byte units. Follow `page.next_offset` until `page.done`. CAS pages are integrity-verified and streamed without materializing the full blob. Other types reject raw format with `BAD_PATH_OR_SLICE`.
 
 ### `blob.get`
 
 ```json
-{"hash":"8baef..."}
+{"hash":"8baef...","offset":0,"length":8192}
 ```
 
-Returns `{hash, value}`. A CAS blob containing tagged JSON is decoded structurally; other bytes return:
+Offset and length are uncompressed byte units and length is clamped to 8 KiB. Explicit ranges and oversized blobs return `{hash, encoding:"base64", raw_base64, page}`. Follow `page.next_offset` until done. For compatibility, an omitted range that contains the complete small blob still returns `{hash, value, page}`; tagged JSON is decoded structurally and other bytes use the tagged byte shape:
 
 ```json
 {"$":"bytes","len":1234,"v":"base64..."}

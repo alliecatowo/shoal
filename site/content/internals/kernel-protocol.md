@@ -252,10 +252,11 @@ accDescr: Shows the components and relationships described in Wire values and el
 ```
 
 Ordinary tagged-value encoding and elision clamp bytes to the 64 KiB hard cap. There is one current
-exception: `value.get {format:"raw"}` in `handlers_value.rs` materializes complete resident or
-CAS-backed bytes and returns a `raw_base64` field without passing through that clamp. This can turn a
-small ref lookup into an arbitrarily large allocation, base64 expansion, JSON frame, and client
-context payload. It is a boundary bypass to repair, not a supported way to opt out of elision.
+explicit-transfer path: `value.get {format:"raw"}` returns at most 8 KiB of decoded content per
+response plus continuation metadata. Resident strings/bytes are sliced before encoding; CAS-backed
+bytes use a verified bounded-memory stream. Strings retain the existing Unicode-scalar slice units,
+while bytes use octets. `blob.get` likewise accepts byte `offset`/`length`, clamps length to the same
+wall, and never materializes the whole compressed-store object for a page.
 
 A successful `Outcome` keeps status metadata inline while applying elision to its `.out` value.
 Headless attachments have ANSI removed before render bounding; a future true-TTY kernel client can
