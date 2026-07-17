@@ -66,6 +66,18 @@ impl<T> LockExt<T> for Mutex<T> {
 pub struct Limits {
     /// Kernel-wide cap on simultaneously open connections (default 64).
     pub max_connections: usize,
+    /// Kernel-wide cap on distinct live NAMED sessions (default 256; HR-J3).
+    /// Unlike connections, a session outlives its connection — it "remains in
+    /// the kernel map until process exit"
+    /// (site/content/internals/kernel-protocol.md) — and each one brings its own `Evaluator`
+    /// plus up to `max_tasks_per_session` background threads and
+    /// `max_ptys_per_session` PTY children. Without this cap the connection
+    /// quota above does nothing to bound total kernel-tracked thread count:
+    /// one connection attaching under many distinct session names could
+    /// still create an unbounded number of sessions, each with its own
+    /// full per-session thread budget. See kernel-protocol.md's
+    /// "Concurrency model, threads, and their limits" section.
+    pub max_sessions: usize,
     /// Per-session cap on background/timed `exec` tasks (default 128).
     pub max_tasks_per_session: usize,
     /// Per-session cap on live interactive PTYs (default 32).
@@ -77,6 +89,7 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             max_connections: 64,
+            max_sessions: 256,
             max_tasks_per_session: 128,
             max_ptys_per_session: 32,
             max_subscriptions_per_session: 256,
@@ -92,6 +105,7 @@ pub struct Kernel {
     /// `handle_stream` call returns (site/content/internals/hardening-roadmap.md HR-E3).
     active_connections: AtomicUsize,
     max_connections: AtomicUsize,
+    max_sessions: AtomicUsize,
     max_tasks_per_session: AtomicUsize,
     max_ptys_per_session: AtomicUsize,
     max_subscriptions_per_session: AtomicUsize,
@@ -107,10 +121,11 @@ pub struct Kernel {
     policy: Policy,
     plans: Mutex<HashMap<String, StoredPlan>>,
     /// Creation time (ns since epoch) for plan-expiry GC
-    /// (site/content/internals/hardening-roadmap.md HR-E4), keyed by `plan_ref`. See
-    /// `note_plan_created`'s doc comment for the integrator wiring note this
-    /// depends on — until wired, a plan simply has no entry here and
-    /// `gc_plans` correctly never expires it.
+    /// (site/content/internals/hardening-roadmap.md HR-E4), keyed by `plan_ref`. Populated by
+    /// `handle_exec`'s `mode == "plan"` branch (`handlers_exec.rs`) via
+    /// `note_plan_created` at the same point the plan is stored, so every
+    /// plan created through the normal `exec {mode:"plan"}` path has a
+    /// recorded age and is eligible for `gc_plans`'s TTL expiry.
     plan_created_ns: Mutex<HashMap<String, i64>>,
     tasks: Mutex<HashMap<Ref, Arc<TaskEntry>>>,
     next_task: AtomicU64,
@@ -155,8 +170,7 @@ const MAX_FINISHED_TASKS_PER_SESSION: usize = 512;
 /// Default TTL for a stored, unapplied plan before it becomes eligible for
 /// expiry (site/content/internals/hardening-roadmap.md HR-E4; deep-audit H5): generous — a plan sits
 /// waiting for `cap.request`/`plan.apply` at conversational timescales, not
-/// months. See `Kernel::note_plan_created`'s doc comment for the integrator
-/// wiring this depends on to take effect at all.
+/// months.
 const PLAN_TTL_NS: i64 = 24 * 60 * 60 * 1_000_000_000;
 
 struct TaskEntry {
@@ -232,6 +246,7 @@ impl Kernel {
             next_client: AtomicU64::new(1),
             active_connections: AtomicUsize::new(0),
             max_connections: AtomicUsize::new(limits.max_connections),
+            max_sessions: AtomicUsize::new(limits.max_sessions),
             max_tasks_per_session: AtomicUsize::new(limits.max_tasks_per_session),
             max_ptys_per_session: AtomicUsize::new(limits.max_ptys_per_session),
             max_subscriptions_per_session: AtomicUsize::new(limits.max_subscriptions_per_session),
@@ -269,6 +284,7 @@ impl Kernel {
             next_client: AtomicU64::new(1),
             active_connections: AtomicUsize::new(0),
             max_connections: AtomicUsize::new(limits.max_connections),
+            max_sessions: AtomicUsize::new(limits.max_sessions),
             max_tasks_per_session: AtomicUsize::new(limits.max_tasks_per_session),
             max_ptys_per_session: AtomicUsize::new(limits.max_ptys_per_session),
             max_subscriptions_per_session: AtomicUsize::new(limits.max_subscriptions_per_session),
@@ -303,6 +319,7 @@ impl Kernel {
             next_client: AtomicU64::new(1),
             active_connections: AtomicUsize::new(0),
             max_connections: AtomicUsize::new(limits.max_connections),
+            max_sessions: AtomicUsize::new(limits.max_sessions),
             max_tasks_per_session: AtomicUsize::new(limits.max_tasks_per_session),
             max_ptys_per_session: AtomicUsize::new(limits.max_ptys_per_session),
             max_subscriptions_per_session: AtomicUsize::new(limits.max_subscriptions_per_session),
@@ -329,6 +346,7 @@ impl Kernel {
             next_client: AtomicU64::new(1),
             active_connections: AtomicUsize::new(0),
             max_connections: AtomicUsize::new(limits.max_connections),
+            max_sessions: AtomicUsize::new(limits.max_sessions),
             max_tasks_per_session: AtomicUsize::new(limits.max_tasks_per_session),
             max_ptys_per_session: AtomicUsize::new(limits.max_ptys_per_session),
             max_subscriptions_per_session: AtomicUsize::new(limits.max_subscriptions_per_session),
@@ -359,6 +377,8 @@ impl Kernel {
     pub fn configure_limits(&self, limits: Limits) {
         self.max_connections
             .store(limits.max_connections, Ordering::Relaxed);
+        self.max_sessions
+            .store(limits.max_sessions, Ordering::Relaxed);
         self.max_tasks_per_session
             .store(limits.max_tasks_per_session, Ordering::Relaxed);
         self.max_ptys_per_session
@@ -563,6 +583,37 @@ impl Kernel {
         Ok(())
     }
 
+    /// `Ok(())` when attaching to session `name` would keep the kernel's
+    /// total live NAMED-session count at or under its cap
+    /// (site/content/internals/hardening-roadmap.md HR-E3, HR-J3; deep-audit H3); otherwise a clear
+    /// `QUOTA_EXCEEDED` protocol error. A session already open under `name`
+    /// is unaffected — this only guards growth from a brand-new name, since
+    /// the connection quota alone does not bound the number of DISTINCT
+    /// session names one (or a few, capped) connections can create over
+    /// their lifetime, and a session — unlike a connection — is never
+    /// dropped once created (site/content/internals/kernel-protocol.md: it "remains in the
+    /// kernel map until process exit"), each bringing its own `Evaluator`
+    /// plus up to `max_tasks_per_session` background threads and
+    /// `max_ptys_per_session` PTY children. Called by `handle_session_attach`
+    /// before `Kernel::session()` would insert a new entry. Same shape as
+    /// `check_task_quota`/`check_pty_quota` above, including their same
+    /// benign check-then-create race under concurrent attaches of two
+    /// DIFFERENT new names (growth is capped near the limit, not exactly at
+    /// it) — consistent with, not a new risk beyond, those two existing
+    /// quotas.
+    pub(crate) fn check_session_quota(&self, name: &str) -> Result<(), RpcError> {
+        let max = self.max_sessions.load(Ordering::Relaxed);
+        let sessions = self.sessions.lock_recover();
+        if sessions.contains_key(name) || sessions.len() < max {
+            return Ok(());
+        }
+        Err(RpcError {
+            code: QUOTA_EXCEEDED,
+            message: format!("kernel has reached the {max}-session limit"),
+            data: Some(json!({"limit": "sessions", "max": max})),
+        })
+    }
+
     /// Session-lifecycle GC (site/content/internals/hardening-roadmap.md HR-E4; deep-audit H5): bounds
     /// three kinds of otherwise-unbounded growth in a long-lived kernel
     /// process — the attached session's transcript, finished tasks, and
@@ -723,7 +774,7 @@ impl Kernel {
             effects_json,
             opaque: false,
         };
-        let journal = self.journal.lock().unwrap();
+        let journal = self.journal.lock_recover();
         if let Ok(id) = journal.append(&record) {
             let _ = journal.finish(id, Some(0), true, 0);
         }
@@ -1312,11 +1363,10 @@ mod tests {
     }
 
     /// `check_task_quota` rejects once a session's tracked task count reaches
-    /// the configured per-session cap (site/content/internals/hardening-roadmap.md HR-E3). The
-    /// mechanism is exercised directly here because wiring the actual guard
-    /// call into `handle_exec`'s background-task path lives in
-    /// `handlers_exec.rs`, outside this lane's file scope — see this
-    /// function's own doc comment for the exact wiring note.
+    /// the configured per-session cap (site/content/internals/hardening-roadmap.md HR-E3). Exercised
+    /// directly against the kernel method here; `handlers_exec.rs`'s
+    /// `handle_exec` calls this same guard before constructing a new
+    /// `TaskEntry` for its background/timed-task path.
     #[test]
     fn check_task_quota_rejects_at_the_per_session_cap() {
         let kernel = Kernel::new();
@@ -1355,8 +1405,8 @@ mod tests {
 
     /// `check_pty_quota` rejects once a session's tracked PTY count reaches
     /// the configured per-session cap — same shape as the task quota test
-    /// above, and the same wiring note applies (`handle_pty_open` in
-    /// `handlers_pty.rs` must call this before spawning).
+    /// above. `handlers_pty.rs`'s `handle_pty_open` calls this same guard
+    /// before spawning the child/PTY pair.
     #[test]
     fn check_pty_quota_rejects_at_the_per_session_cap() {
         let kernel = Kernel::new();
@@ -1389,6 +1439,47 @@ mod tests {
             .check_pty_quota(&session.id)
             .expect_err("quota must reject once the cap is reached");
         assert_eq!(err.code, QUOTA_EXCEEDED);
+    }
+
+    /// `check_session_quota` (HR-J3): once the kernel's total live session
+    /// count reaches the cap, a brand-new session name is rejected with
+    /// `QUOTA_EXCEEDED` — but an ALREADY-open name keeps working (attaching
+    /// to an existing pair-shell session must never break because some
+    /// OTHER session filled the cap), and `handle_session_attach` calls this
+    /// same guard before `Kernel::session()` would grow the map.
+    #[test]
+    fn check_session_quota_rejects_a_new_name_past_the_cap_but_allows_an_existing_one() {
+        let kernel = Kernel::new();
+        kernel.configure_limits(Limits {
+            max_sessions: 2,
+            ..Limits::default()
+        });
+        let first = kernel.session("quota-sessions-a", "human").unwrap();
+        assert!(kernel.check_session_quota(&first.id).is_ok());
+        let _second = kernel.session("quota-sessions-b", "human").unwrap();
+
+        // At the cap: a brand-new name is rejected.
+        let err = kernel
+            .check_session_quota("quota-sessions-c")
+            .expect_err("quota must reject a new session name once the cap is reached");
+        assert_eq!(err.code, QUOTA_EXCEEDED);
+
+        // Re-attaching an EXISTING name is unaffected by the cap.
+        assert!(
+            kernel.check_session_quota("quota-sessions-a").is_ok(),
+            "an already-open session name must stay attachable at the cap"
+        );
+
+        // The real handler-level path rejects the same way.
+        let mut attached = None;
+        let err = kernel
+            .handle_session_attach(
+                json!({"session": "quota-sessions-c", "client": {"kind": "test", "tty": false}}),
+                &mut attached,
+            )
+            .expect_err("session.attach must reject a new session name past the cap");
+        assert_eq!(err.code, QUOTA_EXCEEDED);
+        assert!(attached.is_none());
     }
 
     // -----------------------------------------------------------------------
@@ -1509,9 +1600,10 @@ mod tests {
 
     /// Plan expiry (`note_plan_created` + `gc_plans`): a plan whose recorded
     /// creation time is older than `PLAN_TTL_NS` is expired; a plan with NO
-    /// recorded creation time (the unwired default — see `note_plan_created`'s
-    /// doc comment) is never touched, proving the mechanism is a safe no-op
-    /// until the integrator wires the one call it depends on.
+    /// recorded creation time is never touched — the conservative fallback
+    /// for any plan that reaches `plans` without going through
+    /// `handle_exec`'s `mode == "plan"` branch (`note_plan_created`'s real
+    /// call site), constructed directly here to exercise that fallback.
     #[test]
     fn gc_plans_expires_only_plans_with_a_recorded_and_stale_creation_time() {
         let kernel = Kernel::new();

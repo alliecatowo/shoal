@@ -131,9 +131,11 @@ struct Args {
     socket: Option<PathBuf>,
     state_dir: Option<PathBuf>,
     policy: Option<PathBuf>,
-    /// Quota overrides (site/content/internals/hardening-roadmap.md HR-E3): `None` for a field means
-    /// "keep `Limits::default()`". Parsed into a `Limits` by `resolved_limits`.
+    /// Quota overrides (site/content/internals/hardening-roadmap.md HR-E3, HR-J3): `None` for a
+    /// field means "keep `Limits::default()`". Parsed into a `Limits` by
+    /// `resolved_limits`.
     max_connections: Option<usize>,
+    max_sessions: Option<usize>,
     max_tasks_per_session: Option<usize>,
     max_ptys_per_session: Option<usize>,
     max_subscriptions_per_session: Option<usize>,
@@ -146,6 +148,7 @@ impl Args {
             state_dir: None,
             policy: None,
             max_connections: None,
+            max_sessions: None,
             max_tasks_per_session: None,
             max_ptys_per_session: None,
             max_subscriptions_per_session: None,
@@ -164,10 +167,11 @@ impl Args {
                 Some("--state-dir") => a.state_dir = Some(it.next().ok_or_else(&missing)?.into()),
                 Some("--policy") => a.policy = Some(it.next().ok_or_else(&missing)?.into()),
                 Some("--max-connections") => a.max_connections = Some(parse_usize(&k, it.next().ok_or_else(&missing)?)?),
+                Some("--max-sessions") => a.max_sessions = Some(parse_usize(&k, it.next().ok_or_else(&missing)?)?),
                 Some("--max-tasks-per-session") => a.max_tasks_per_session = Some(parse_usize(&k, it.next().ok_or_else(&missing)?)?),
                 Some("--max-ptys-per-session") => a.max_ptys_per_session = Some(parse_usize(&k, it.next().ok_or_else(&missing)?)?),
                 Some("--max-subscriptions-per-session") => a.max_subscriptions_per_session = Some(parse_usize(&k, it.next().ok_or_else(&missing)?)?),
-                Some("-h" | "--help") => return Err("usage: shoal-kernel [--session NAME] [--socket PATH] [--state-dir PATH] [--policy FILE] [--max-connections N] [--max-tasks-per-session N] [--max-ptys-per-session N] [--max-subscriptions-per-session N]".into()),
+                Some("-h" | "--help") => return Err("usage: shoal-kernel [--session NAME] [--socket PATH] [--state-dir PATH] [--policy FILE] [--max-connections N] [--max-sessions N] [--max-tasks-per-session N] [--max-ptys-per-session N] [--max-subscriptions-per-session N]".into()),
                 _ => return Err(format!("unknown argument {}", k.to_string_lossy())),
             }
         }
@@ -180,6 +184,7 @@ impl Args {
         let defaults = shoal_kernel::Limits::default();
         shoal_kernel::Limits {
             max_connections: self.max_connections.unwrap_or(defaults.max_connections),
+            max_sessions: self.max_sessions.unwrap_or(defaults.max_sessions),
             max_tasks_per_session: self
                 .max_tasks_per_session
                 .unwrap_or(defaults.max_tasks_per_session),
@@ -201,19 +206,27 @@ mod tests {
         unsafe { geteuid() == 0 }
     }
 
-    /// HR-E3: `--max-*` flags override just the fields given; everything
+    /// HR-E3/HR-J3: `--max-*` flags override just the fields given; everything
     /// else keeps `Limits::default()`.
     #[test]
     fn resolved_limits_applies_only_the_given_overrides() {
         let args = Args::parse(
-            ["--max-connections", "10", "--max-ptys-per-session", "3"]
-                .iter()
-                .map(std::ffi::OsString::from),
+            [
+                "--max-connections",
+                "10",
+                "--max-sessions",
+                "5",
+                "--max-ptys-per-session",
+                "3",
+            ]
+            .iter()
+            .map(std::ffi::OsString::from),
         )
         .unwrap();
         let limits = args.resolved_limits();
         let defaults = shoal_kernel::Limits::default();
         assert_eq!(limits.max_connections, 10);
+        assert_eq!(limits.max_sessions, 5);
         assert_eq!(limits.max_ptys_per_session, 3);
         assert_eq!(
             limits.max_tasks_per_session, defaults.max_tasks_per_session,

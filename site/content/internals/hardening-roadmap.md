@@ -269,9 +269,22 @@ Rules for implementers:
 - [ ] **HR-J1** — Centralized command resolution: one resolution function/table with an explicit
   precedence order consumed by the evaluator, planner, completion, and LSP. *(H2; closes the
   root cause behind A9)*
-- [ ] **HR-J3** — Kernel concurrency model review: documented limits of
+- [x] **HR-J3** — Kernel concurrency model review: documented limits of
   thread-per-connection + per-session mutex; bounded executor or explicit caps where needed
   beyond HR-E3. *(H3)*
+  <br>Status: kernel-protocol.md's "Concurrency model, threads, and their limits" section is the
+  review — a thread/lock inventory, two mermaid diagrams, and the honest failure modes (pair-shell
+  slow-eval still blocks a session-mate; in-language `spawn`/`parallel`/`on`/stream threads are
+  entirely outside the quota system). One small, safe, additive gap the review found was wired: a
+  kernel-wide `max_sessions` cap (`shoal_kernel::Limits`, default 256, `--max-sessions`), since a
+  session — unlike a connection — is retained forever and each one carries its own per-session
+  thread budget, so the session count was the one uncapped multiplier over every other HR-E3 quota.
+  A bounded executor for in-language thread fan-out is recorded as a recommendation, not wired: it
+  needs cross-crate design work in `shoal-eval`, not a `Limits` field. Incidental: closed the last
+  three production `.lock().unwrap()` sites (`session.rs`'s `handle_session_attach`, `lib.rs`'s
+  `record_approval_audit`) and corrected stale "not yet wired" doc claims about the task/PTY quota
+  and plan-expiry wiring that HR-E3/HR-E4's own follow-through (see their status notes above) had
+  already closed.
 
 ## Traceability matrix
 

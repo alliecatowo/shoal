@@ -161,8 +161,7 @@ impl Kernel {
                 data: None,
             })?;
             let meta = auth
-                .lock()
-                .unwrap()
+                .lock_recover()
                 .validate(&token)
                 .ok_or_else(|| RpcError {
                     code: AUTH_FAILED,
@@ -190,11 +189,16 @@ impl Kernel {
             (principal(), vec![], "local-human".into())
         };
         let name = params.session.unwrap_or_else(|| "default".into());
+        // HR-J3: bound the number of DISTINCT session names the kernel will
+        // ever create, not just the connection creating them — see
+        // `check_session_quota`'s doc comment for why an unbounded session
+        // count is an unbounded thread count even with every per-session
+        // quota in place.
+        self.check_session_quota(&name)?;
         let session = self.session(&name, &who).map_err(internal)?;
         let cwd = session
             .evaluator
-            .lock()
-            .unwrap()
+            .lock_recover()
             .cwd()
             .as_os_str()
             .to_owned();
