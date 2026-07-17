@@ -11,7 +11,7 @@
 //! over one substrate. The bus lives on the `Evaluator` (session-scoped) and is
 //! shared into spawned tasks so `on(...)`/`spawn` handlers see the same channels.
 
-use crate::Evaluator;
+use crate::{ChildScope, Evaluator};
 use shoal_ast::Args;
 use shoal_exec::CancelToken;
 use shoal_value::{CallArgs, ErrorVal, Record, StreamVal, TaskVal, VResult, Value};
@@ -351,34 +351,21 @@ impl Evaluator {
         let rx = self.bus().events(&chan, None);
 
         let task = TaskVal::new(format!("on channel({chan})"));
+        // A FRESH cancel token wired to the task's cancel hook, so cancelling the
+        // task interrupts the handler's exec tokens.
         let child_cancel = CancelToken::new();
         let hook_cancel = child_cancel.clone();
         task.on_cancel(Box::new(move || hook_cancel.cancel()));
         let worker = task.clone();
-        let env = self.env.clone();
-        let cwd = self.cwd.clone();
-        let penv = self.process_env.clone();
-        let adapters = self.adapters.clone();
-        let bus = self.bus();
-        // Share the host's effect ports (site/content/internals/roadmap-and-priorities.md) with the handler
-        // task; `Arc` clones, identical under the `Std*` defaults.
-        let fs = self.fs.clone();
-        let exec = self.exec.clone();
-        let clock = self.clock.clone();
-        let opener = self.opener.clone();
-        let secrets = self.secrets.clone();
+        // The one authoritative child constructor (HR-B1): the handler task runs
+        // in a child that inherits the full session context — leash policy/
+        // principal, reef state, config, all effect ports, the event bus, and
+        // session identity. The old hand-copy shared only the ports and bus,
+        // dropping leash/reef/config (audit B1–B4). `Inherit` scope: the handler
+        // sees the caller's bindings.
+        let ctx = self.child_context();
         std::thread::spawn(move || {
-            let mut ev = Evaluator::new(cwd);
-            ev.env = env;
-            ev.process_env = penv;
-            ev.adapters = adapters;
-            ev.cancel = child_cancel;
-            ev.set_bus(bus);
-            ev.fs = fs;
-            ev.exec = exec;
-            ev.clock = clock;
-            ev.opener = opener;
-            ev.secrets = secrets;
+            let mut ev = ctx.build(ChildScope::Inherit, child_cancel);
             let stream = StreamVal::from_channel("event", rx);
             let result = match stream.take_upstream() {
                 Ok(mut up) => shoal_value::drive_stream(&mut ev, &mut *up, |ctx, event| {

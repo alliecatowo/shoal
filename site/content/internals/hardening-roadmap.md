@@ -84,8 +84,8 @@ Rules for implementers:
 - [x] **HR-B2** — `spawn_block` uses the constructor. *(B1)*
 - [x] **HR-B3** — `run_script_file` uses the constructor. *(B1)*
 - [x] **HR-B4** — `builtin_parallel` uses the constructor. *(B1)*
-- [ ] **HR-B5** — `builtin_on` (channel handlers) uses the constructor. *(B1)*
-- [ ] **HR-B6** — Remove or privatize `inherit_ports`-style partial copying so future call sites
+- [x] **HR-B5** — `builtin_on` (channel handlers) uses the constructor. *(B1)*
+- [x] **HR-B6** — Remove or privatize `inherit_ports`-style partial copying so future call sites
   cannot under-inherit. *(B1, B3)*
   <br>Accept: no public API constructs a child evaluator without the full-context constructor.
 - [ ] **HR-B7** — Tests: a restrictive leash policy observably constrains work run via `spawn`,
