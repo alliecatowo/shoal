@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::io::Read;
 use zeroize::Zeroizing;
 
@@ -16,6 +17,15 @@ fn read_secret_value(mut reader: impl Read) -> std::io::Result<Zeroizing<Vec<u8>
     }
 }
 
+fn secret_name(name: &OsStr) -> std::io::Result<&str> {
+    name.to_str().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "secret name is not valid UTF-8",
+        )
+    })
+}
+
 fn main() {
     let dir = shoal_paths::ShoalPaths::discover()
         .data_dir()
@@ -27,17 +37,19 @@ fn main() {
             std::process::exit(2)
         }
     };
-    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    let args = std::env::args_os().skip(1).collect::<Vec<_>>();
     let r = match args.as_slice() {
-        [cmd] if cmd == "list" => store.list().map(|v| {
+        [cmd] if cmd == OsStr::new("list") => store.list().map(|v| {
             for n in v {
                 println!("{n}")
             }
         }),
-        [cmd, name] if cmd == "set" => {
+        [cmd, name] if cmd == OsStr::new("set") => secret_name(name).and_then(|name| {
             read_secret_value(std::io::stdin().lock()).and_then(|value| store.set(name, &value))
+        }),
+        [cmd, name] if cmd == OsStr::new("delete") => {
+            secret_name(name).and_then(|name| store.delete(name).map(|_| ()))
         }
-        [cmd, name] if cmd == "delete" => store.delete(name).map(|_| ()),
         _ => {
             eprintln!("usage: shoal-secret set NAME < value | list | delete NAME");
             std::process::exit(2)
@@ -61,6 +73,17 @@ mod tests {
         let hostile = vec![0u8; shoal_secret::MAX_SECRET_VALUE_BYTES + 1];
         assert_eq!(
             read_secret_value(hostile.as_slice()).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_name_is_a_typed_input_error() {
+        use std::os::unix::ffi::OsStrExt;
+
+        assert_eq!(
+            secret_name(OsStr::from_bytes(&[0xff])).unwrap_err().kind(),
             std::io::ErrorKind::InvalidInput
         );
     }
