@@ -115,21 +115,14 @@ Its `[reef]` table becomes the lowest-priority user scope.
 
 Discovery is best-effort. Unreadable or malformed files are skipped by the scope walk and retained as warnings. Evaluator-hosted discovery reads through the installed filesystem capability with a one MiB regular-file/UTF-8 wall. Use `reef add` or validate TOML directly when diagnosing a file that seems absent; `reef add` deliberately notices a malformed local `.reef.toml` and reports `reef_provider` instead of quietly editing an ancestor.
 
-### An important tools-table requirement
+### Tool-free scopes
 
-The current discovery implementation adds a manifest to the chain only when its parsed `[tools]` table is non-empty. A file containing only `[runners]` or `[options]` is ignored completely. The same is true of a user `[reef]` table with runners/options but no tools.
-
-Use at least one genuine tool constraint in any manifest meant to activate runners or hermetic behavior:
+A native project manifest containing only `[runners]` or `hermetic = true` is an active scope. The same applies to a user `[reef]` table, so runner and isolation policy do not require a dummy tool constraint:
 
 ```toml
-[tools]
-python = "3.12"
-
 [runners]
 py = "python"
 ```
-
-This is a current implementation limitation, not a recommended schema convention.
 
 ### Cache behavior
 
@@ -589,7 +582,7 @@ Reef is implemented and actively used for constrained external spawns, but it is
 
 - Windows provider executability, symlink views, and resolution semantics are deferred.
 - Scope discovery silently skips malformed/unreadable manifests.
-- A manifest without tools is ignored, including its runners/options.
+- A completely empty manifest, or one whose options retain their defaults, has no scope effect.
 - Evaluator scope cache does not notice manual same-directory edits.
 - Lockfiles are deliberately host-local; portable multi-platform artifact locking is not implied.
 - `reef fetch` is mise-only and does not enforce the declared provider pin.

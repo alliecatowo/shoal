@@ -77,6 +77,12 @@ impl fmt::Display for ManifestError {
 impl std::error::Error for ManifestError {}
 
 impl ReefManifest {
+    /// Whether this manifest has any scope-level effect. Runner-only and
+    /// hermetic-only manifests are active even when they constrain no tools.
+    pub fn is_active(&self) -> bool {
+        !self.tools.is_empty() || !self.runners.is_empty() || self.hermetic
+    }
+
     /// Parse a native `.reef.toml`.
     pub fn parse_reef(text: &str) -> Result<ReefManifest, ManifestError> {
         crate::input::validate_toml_text(text).map_err(manifest_error)?;

@@ -7,7 +7,7 @@ template = "docs/page.html"
 [extra]
 group = "Storage & tooling"
 eyebrow = "Reproducible tool resolution"
-status = "Implemented with an explicit runner-only activation gap"
+status = "Implemented"
 audience = "Reef, execution, Leash, prompt, and tooling contributors"
 wide = true
 +++
@@ -103,12 +103,12 @@ the same directory. The optional user `[reef]` scope is appended last.
 There is no Git/home boundary and no “nearest manifest only” rule: all accepted scopes participate
 in compatibility checking. This differs from `shoal-config`'s single nearest `.shoal.toml`.
 
-### Empty-tools discovery bug
+### Active-scope admission
 
-`collect_dir` and user-scope discovery only retain a manifest when `manifest.tools` is nonempty. A
-manifest containing only `[runners]` or `[options] hermetic = true` disappears entirely, so its
-runner or hermetic intent cannot take effect. This is a source-level behavior gap; the parser itself
-successfully returns the data.
+Discovery retains a normalized manifest when it constrains a tool, defines a runner, or requests
+hermetic execution. This applies equally to native project manifests and the user `[reef]` scope;
+runner-only and hermetic-only policy therefore takes effect without a dummy tool entry. A completely
+empty/default-only manifest is parsed but omitted because it has no scope-level effect.
 
 ### Discovery fingerprint and evaluator cache
 
@@ -298,8 +298,8 @@ known extension, Reef reads only the first line and recognizes direct interprete
 `/usr/bin/env <tool>`; shebang flags beyond the selected tool are not preserved.
 
 The runner tool is itself a normal command head and is Reef-resolved before spawn. The `self`
-sentinel returns control to Shoal's native `.shl` path. Because runner-only manifests are currently
-dropped during discovery, custom runners require at least one tool entry in the same manifest.
+sentinel returns control to Shoal's native `.shl` path. Runner-only project and user manifests are
+active scopes.
 
 ## Dynamic `with reef:` overrides
 
@@ -371,9 +371,9 @@ versus interactive lock policy, builtin tables/errors, ambient shadowing, doctor
 integration. Corpus suites `reef.toml` and `reef-provider-errors.toml` pin user-visible behavior.
 
 Same-cwd creation/edit/removal fingerprints, lock-save failure propagation, oversized manifest
-admission, provider flood/timeout descendants, cache identity churn, and poisoned-cache recovery are
-covered. Remaining high-value evidence includes runner-only/hermetic-only manifest discovery,
-hostile view-directory mutation, and more explicit policy tests for version probes/fetch.
+admission, provider flood/timeout descendants, cache identity churn, poisoned-cache recovery, and
+runner-only/hermetic-only project and user scope discovery are covered. Remaining high-value evidence
+includes hostile view-directory mutation and more explicit policy tests for version probes/fetch.
 
 ## Change checklist
 

@@ -523,16 +523,13 @@ mod tests {
     /// the runner machinery — even though `RunnerTable::defaults()` has known
     /// this extension all along. Remapping `rb` to `sh` in this fixture's own
     /// manifest keeps the assertion host-independent (no real ruby install
-    /// needed): the point is proving the bare name reached the runner
-    /// dispatch at all, not that any particular interpreter is present.
+    /// needed). The runner-only manifest also proves discovery does not require
+    /// a dummy `[tools]` entry: the point is proving the bare name reached the
+    /// runner dispatch at all, not that any particular interpreter is present.
     #[test]
     fn bare_filename_scripty_gate_honors_full_runner_table() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join(".reef.toml"),
-            "[tools]\nplaceholder = \"*\"\n\n[runners]\nrb = \"sh\"\n",
-        )
-        .unwrap();
+        std::fs::write(dir.path().join(".reef.toml"), "[runners]\nrb = \"sh\"\n").unwrap();
         std::fs::write(dir.path().join("x.rb"), b"echo bare-rb-ran\n").unwrap();
 
         let mut ev = Evaluator::new(dir.path().to_path_buf());

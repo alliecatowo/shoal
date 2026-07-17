@@ -2,8 +2,7 @@
 //!
 //! [`ScopeChain::discover`] is a **pure function of `(cwd, filesystem)`**: it
 //! walks up from a directory collecting reef manifests (native and foreign),
-//! then appends the user scope. No activation, no hooks, no env mutation. `cd`
-//! re-scopes the next resolution and nothing else.
+//! then appends the user scope. No activation, no hooks, no env mutation.
 //!
 //! The chain is ordered nearest-first. Within a single directory, a native
 //! `.reef.toml` is ordered before foreign manifests so it wins. The chain
@@ -89,7 +88,7 @@ impl ScopeChain {
         if let Some(user) = user_manifest {
             match crate::input::read_optional_with(fs, user) {
                 Ok(Some(text)) => match ReefManifest::parse_shoal_reef(&text) {
-                    Ok(manifest) if !manifest.tools.is_empty() => push_scope(
+                    Ok(manifest) if manifest.is_active() => push_scope(
                         &mut scopes,
                         &mut warnings,
                         ScopeEntry {
@@ -198,7 +197,7 @@ fn collect_dir(fs: &dyn Fs, d: &Path, scopes: &mut Vec<ScopeEntry>, warnings: &m
             ManifestKind::ShoalUser => unreachable!("user scope not discovered by walk"),
         };
         match parsed {
-            Ok(manifest) if !manifest.tools.is_empty() => push_scope(
+            Ok(manifest) if manifest.is_active() => push_scope(
                 scopes,
                 warnings,
                 ScopeEntry {
@@ -420,6 +419,24 @@ mod tests {
     }
 
     #[test]
+    fn runner_only_project_and_user_manifests_are_active() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path();
+        write(
+            &base.join(".reef.toml"),
+            "[runners]\nfoo = \"project-runner\"\n",
+        );
+        let user = base.join("home/shoal.toml");
+        write(&user, "[reef.runners]\nbar = \"user-runner\"\n");
+
+        let chain = ScopeChain::discover(base, Some(&user));
+        assert_eq!(chain.scopes.len(), 2);
+        let runners = chain.runner_table();
+        assert_eq!(runners.get("foo").unwrap().tool, "project-runner");
+        assert_eq!(runners.get("bar").unwrap().tool, "user-runner");
+    }
+
+    #[test]
     fn hermetic_true_if_any_scope_requests_it() {
         let root = tempfile::tempdir().unwrap();
         let base = root.path();
@@ -431,6 +448,25 @@ mod tests {
         );
         let chain = ScopeChain::discover(&sub, None);
         assert!(chain.hermetic(), "any scope requesting hermetic wins");
+    }
+
+    #[test]
+    fn hermetic_only_project_and_user_manifests_are_active() {
+        let project = tempfile::tempdir().unwrap();
+        write(
+            &project.path().join(".reef.toml"),
+            "[options]\nhermetic = true\n",
+        );
+        let project_chain = ScopeChain::discover(project.path(), None);
+        assert_eq!(project_chain.scopes.len(), 1);
+        assert!(project_chain.hermetic());
+
+        let user_root = tempfile::tempdir().unwrap();
+        let user = user_root.path().join("shoal.toml");
+        write(&user, "[reef.options]\nhermetic = true\n");
+        let user_chain = ScopeChain::discover(user_root.path(), Some(&user));
+        assert_eq!(user_chain.scopes.len(), 1);
+        assert!(user_chain.hermetic());
     }
 
     #[test]
