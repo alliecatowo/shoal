@@ -10,6 +10,14 @@ use std::{
     path::{Path, PathBuf},
 };
 use zeroize::Zeroizing;
+
+/// Encrypted secret storage. The confidentiality boundary is the containing
+/// directory's OS permissions, not the AES-GCM envelope: `master.key` and
+/// `secrets.json` are deliberately colocated, so any reader of this directory
+/// (same user/process, a directory copy, a backup) recovers both the key and
+/// the ciphertext. See "Secret store design" in
+/// `site/content/internals/security-threat-model.md` for the full boundary
+/// statement and the OS-keyring evaluation/deferral rationale.
 #[derive(Clone)]
 pub struct SecretStore {
     dir: PathBuf,
