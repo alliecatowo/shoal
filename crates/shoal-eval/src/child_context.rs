@@ -45,6 +45,7 @@ pub(crate) enum ChildScope {
 /// the context can be moved into a worker thread and built there.
 pub(crate) struct ChildContext {
     session: session_ctx::SessionCtx,
+    reef: reef_state::ReefState,
     cwd: PathBuf,
     env: Env,
     process_env: Vec<(OsString, OsString)>,
@@ -56,12 +57,8 @@ pub(crate) struct ChildContext {
     opener: Arc<dyn Opener>,
     secrets: Arc<dyn SecretPort>,
     config: Arc<dyn ConfigPort>,
-    reef_chain: Option<(PathBuf, shoal_reef::ScopeChain)>,
     reef_resolver: Option<Arc<shoal_reef::Resolver>>,
-    reef_lock: shoal_reef::Lockfile,
-    reef_lock_path: Option<PathBuf>,
     reef_user_manifest: Option<PathBuf>,
-    reef_overrides: Vec<shoal_reef::ScopeEntry>,
 }
 
 impl Evaluator {
@@ -72,6 +69,7 @@ impl Evaluator {
     pub(crate) fn child_context(&self) -> ChildContext {
         ChildContext {
             session: self.session.for_child(),
+            reef: self.reef.clone(),
             cwd: self.cwd.clone(),
             env: self.env.clone(),
             process_env: self.process_env.clone(),
@@ -83,12 +81,8 @@ impl Evaluator {
             opener: self.opener.clone(),
             secrets: self.secrets.clone(),
             config: self.config.clone(),
-            reef_chain: self.reef_chain.clone(),
             reef_resolver: self.reef_resolver.clone(),
-            reef_lock: self.reef_lock.clone(),
-            reef_lock_path: self.reef_lock_path.clone(),
             reef_user_manifest: self.reef_user_manifest.clone(),
-            reef_overrides: self.reef_overrides.clone(),
         }
     }
 }
@@ -107,6 +101,7 @@ impl ChildContext {
     pub(crate) fn build(self, scope: ChildScope, cancel: CancelToken) -> Evaluator {
         let ChildContext {
             session,
+            reef,
             cwd,
             env,
             process_env,
@@ -118,18 +113,15 @@ impl ChildContext {
             opener,
             secrets,
             config,
-            reef_chain,
             reef_resolver,
-            reef_lock,
-            reef_lock_path,
             reef_user_manifest,
-            reef_overrides,
         } = self;
 
         let mut child = Evaluator::new(cwd);
         // Session identity, policy, echo mode, and the deliberate clearing of
         // terminal/root-only handles arrive as one required typed value.
         child.session = session;
+        child.reef = reef;
 
         // --- Inherited by construction -------------------------------------
         // Lexical env: closure/spawn/parallel/on bodies inherit the caller's
@@ -151,12 +143,8 @@ impl ChildContext {
         child.config = config;
         // Reef scope/resolver/lock/overrides: constrained tool resolution must
         // resolve identically inside a child, or a pinned tool diverges.
-        child.reef_chain = reef_chain;
         child.reef_resolver = reef_resolver;
-        child.reef_lock = reef_lock;
-        child.reef_lock_path = reef_lock_path;
         child.reef_user_manifest = reef_user_manifest;
-        child.reef_overrides = reef_overrides;
 
         // --- Deliberately NOT inherited (fresh state per child) ------------
         // journal handle:  the current `Journal` is an owned, single-connection
@@ -200,7 +188,7 @@ mod tests {
         parent.set_echo_mode(EchoMode::Quiet);
         parent.set_interactive(true);
         parent.set_statement_sink(Box::new(|_| {}));
-        parent.reef_lock.insert(LockEntry {
+        parent.reef.lock.insert(LockEntry {
             name: "fixture".into(),
             version: "1.0.0".into(),
             provider: "system".into(),
@@ -208,7 +196,7 @@ mod tests {
             blake3: "deadbeef".into(),
             resolved_at: "2026-07-16T00:00:00Z".into(),
         });
-        parent.reef_lock_path = Some(dir.path().join("reef.lock"));
+        parent.reef.lock_path = Some(dir.path().join("reef.lock"));
         parent.reef_user_manifest = Some(dir.path().join("shoal.toml"));
         let scope = ScopeEntry {
             kind: ManifestKind::Reef,
@@ -216,14 +204,14 @@ mod tests {
             manifest: ReefManifest::parse_reef("[tools]\nfixture = \"*\"\n").unwrap(),
             mtime: None,
         };
-        parent.reef_chain = Some((
+        parent.reef.chain = Some((
             dir.path().to_path_buf(),
             ScopeChain {
                 cwd: dir.path().to_path_buf(),
                 scopes: vec![scope.clone()],
             },
         ));
-        parent.reef_overrides.push(scope.clone());
+        parent.reef.overrides.push(scope.clone());
         let resolver = Arc::new(Resolver::new(vec![Box::new(SystemProvider::new(
             vec![dir.path().join("bin")],
             vec![],
@@ -247,14 +235,14 @@ mod tests {
             !child.has_journal(),
             "the outer parent statement owns journaling; nested entries are not implied"
         );
-        assert_eq!(child.reef_lock, parent.reef_lock);
-        assert_eq!(child.reef_lock_path, parent.reef_lock_path);
+        assert_eq!(child.reef.lock, parent.reef.lock);
+        assert_eq!(child.reef.lock_path, parent.reef.lock_path);
         assert_eq!(child.reef_user_manifest, parent.reef_user_manifest);
-        let (_, child_chain) = child.reef_chain.as_ref().unwrap();
+        let (_, child_chain) = child.reef.chain.as_ref().unwrap();
         assert_eq!(child_chain.scopes.len(), 1);
         assert_eq!(child_chain.scopes[0].source, scope.source);
-        assert_eq!(child.reef_overrides.len(), 1);
-        assert_eq!(child.reef_overrides[0].source, scope.source);
+        assert_eq!(child.reef.overrides.len(), 1);
+        assert_eq!(child.reef.overrides[0].source, scope.source);
         assert!(Arc::ptr_eq(
             child.reef_resolver.as_ref().unwrap(),
             &resolver

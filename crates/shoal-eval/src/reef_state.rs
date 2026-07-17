@@ -1,0 +1,22 @@
+//! Mutable reef overlay, cwd-derived cache, and lock state.
+
+use super::*;
+
+#[derive(Clone)]
+pub(crate) struct ReefState {
+    pub(crate) chain: Option<(PathBuf, shoal_reef::ScopeChain)>,
+    pub(crate) lock: shoal_reef::Lockfile,
+    pub(crate) lock_path: Option<PathBuf>,
+    pub(crate) overrides: Vec<shoal_reef::ScopeEntry>,
+}
+
+impl Default for ReefState {
+    fn default() -> Self {
+        Self {
+            chain: None,
+            lock: shoal_reef::Lockfile::new(),
+            lock_path: None,
+            overrides: Vec::new(),
+        }
+    }
+}

@@ -24,6 +24,7 @@ mod ports;
 mod reef;
 mod reef_builtins;
 mod reef_resolve;
+mod reef_state;
 mod script;
 mod session_ctx;
 mod stmt;
@@ -120,6 +121,9 @@ pub struct Evaluator {
     /// Session identity, authority, and presentation policy. Kept as one typed
     /// unit so child construction cannot copy only a subset.
     session: session_ctx::SessionCtx,
+    /// Child-inherited reef overlay/cache/lock state. Grouped so no child can
+    /// inherit only part of the resolver's mutable view.
+    reef: reef_state::ReefState,
     pub env: Env,
     cwd: PathBuf,
     process_env: Vec<(OsString, OsString)>,
@@ -149,15 +153,11 @@ pub struct Evaluator {
     /// discovered for. Rebuilt only when the cwd changes (cd / `with cwd:`).
     /// `None` until the first spawn/`which`/`reef` touches it; cheap when no
     /// manifest is in scope (a pure filesystem walk with an empty result).
-    reef_chain: Option<(PathBuf, shoal_reef::ScopeChain)>,
     /// reef: the provider stack, built lazily on the first *constrained*
     /// resolution — never touched on the hot path when no manifest is in scope.
     reef_resolver: Option<Arc<shoal_reef::Resolver>>,
     /// reef: the in-memory lock, loaded from (and persisted next to) the nearest
     /// manifest. Empty and inert when no manifest is in scope.
-    reef_lock: shoal_reef::Lockfile,
-    /// reef: filesystem path the current lock loads from / persists to.
-    reef_lock_path: Option<PathBuf>,
     /// reef: optional user-scope `shoal.toml` whose `[reef]` table forms the
     /// user scope. `None` (the default) means no user scope — the zero-config,
     /// zero-regression path. Hosts wire a real path via
@@ -166,7 +166,6 @@ pub struct Evaluator {
     /// reef: `with reef: {tool: constraint, …} { }` override layers (see
     /// `site/content/internals/reef-resolution.md`), nearest-first (innermost `with reef:` block wins). Empty and inert
     /// when no `with reef:` is on the dynamic stack — zero-regression.
-    reef_overrides: Vec<shoal_reef::ScopeEntry>,
     /// The journal entry id of the top-level statement currently executing, so
     /// nested fs mutations (rm/cp/mv/save) can attach undo inverses to it.
     /// `None` outside a journaled statement.
@@ -256,6 +255,7 @@ impl Evaluator {
     pub fn new(cwd: PathBuf) -> Self {
         Self {
             session: session_ctx::SessionCtx::default(),
+            reef: reef_state::ReefState::default(),
             env: Env::root(),
             cwd,
             process_env: std::env::vars_os().collect(),
@@ -267,12 +267,8 @@ impl Evaluator {
             jobs: Vec::new(),
             external_jobs: std::collections::HashMap::new(),
             pending_stop: None,
-            reef_chain: None,
             reef_resolver: None,
-            reef_lock: shoal_reef::Lockfile::new(),
-            reef_lock_path: None,
             reef_user_manifest: None,
-            reef_overrides: Vec::new(),
             current_entry: None,
             source: None,
             bus: channels::EventBus::shared(),
@@ -422,7 +418,7 @@ impl Evaluator {
     /// the chain with this path folded in.
     pub fn set_reef_user_manifest(&mut self, path: impl Into<PathBuf>) {
         self.reef_user_manifest = Some(path.into());
-        self.reef_chain = None;
+        self.reef.chain = None;
     }
 
     /// Inject the reef provider stack (resolver). Additive: without it the
