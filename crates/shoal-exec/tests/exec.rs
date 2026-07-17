@@ -514,15 +514,14 @@ fn pty_stdin_bytes_drive_an_interactive_child() {
 }
 
 #[test]
-fn pty_stream_stdin_delivers_eof_when_the_producer_finishes() {
+fn pty_stream_stdin_fails_closed_before_spawning() {
     let (sink, stdin) = stream_stdin(2);
     sink.try_send(b"streamed\n".to_vec()).unwrap();
     drop(sink);
     let mut s = spec(&["/bin/cat"], ExecMode::PtyTee);
     s.stdin = stdin;
-    let res = run(s, &CancelToken::new()).expect("run");
-    assert_eq!(res.status, Some(0));
-    assert!(res.stdout.windows(8).any(|w| w == b"streamed"));
+    let err = run(s, &CancelToken::new()).expect_err("PTY stream stdin must be rejected");
+    assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
 }
 
 #[test]

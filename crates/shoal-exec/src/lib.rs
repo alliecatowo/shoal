@@ -220,7 +220,8 @@ pub struct CaptureSpill {
 /// In [`ExecMode::PtyTee`] the child's stdin is always the PTY slave;
 /// `Inherit` forwards the real terminal's input (when it is a tty), while
 /// `Bytes`/`File` write the given data into the PTY master and `Null` sends
-/// nothing.
+/// nothing. `Stream` is Capture-only because a PTY has no portable input
+/// half-close with which to signal the end of a finite stream.
 #[derive(Debug, Clone)]
 pub enum StdinSpec {
     /// `/dev/null` (Capture) / nothing forwarded (PtyTee).
@@ -232,6 +233,7 @@ pub enum StdinSpec {
     /// Feed the contents of a file.
     File(PathBuf),
     /// Feed bounded chunks supplied incrementally by an owning producer.
+    /// Supported only by [`ExecMode::Capture`].
     Stream(StdinStream),
 }
 

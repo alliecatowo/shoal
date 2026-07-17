@@ -71,6 +71,24 @@ fn ptytee_external_is_streamed() {
     );
 }
 
+/// Finite input needs a real pipe so its end is an actual EOF. Even in an
+/// interactive statement, stream `.feed` must therefore use Capture rather
+/// than a PTY (whose master has no portable write-half-close).
+#[test]
+fn interactive_stream_feed_uses_capture_and_delivers_eof() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut ev = Evaluator::new(dir.path().to_path_buf());
+    ev.set_interactive(true);
+    let out = ev
+        .eval_program(&parse(r#"["alpha", "beta"].stream().feed(/bin/cat)"#))
+        .expect("finite stream feed terminates");
+    let Value::Outcome(o) = out else {
+        panic!("expected a captured outcome, got {out:?}");
+    };
+    assert!(!o.streamed, "finite stdin forces pipe-based Capture mode");
+    assert_eq!(String::from_utf8_lossy(&o.stdout), "alpha\nbeta\n");
+}
+
 /// `exit <code>` surfaces the code via `take_exit`; eval never exits the
 /// process (bug 2).
 #[test]

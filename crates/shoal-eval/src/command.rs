@@ -636,7 +636,19 @@ impl Evaluator {
         // gate below can reuse it rather than re-hashing the same file.
         let reef_hash = self.reef_apply(&mut argv, &mut env, span)?;
         let force_tui = meta.as_ref().is_some_and(|m| m.class == AdapterClass::Tui);
-        let mode = if force_tui || (self.session.interactive && position == Position::Statement) {
+        // A PTY has no portable input half-close: after finite bytes, a file,
+        // or a stream have been written, merely dropping the master writer
+        // cannot deliver EOF because the output reader still owns the master.
+        // VEOF injection is line-discipline-specific and becomes literal data
+        // in raw mode. Use a real stdin pipe for every finite input source so
+        // `.feed` and `< file` terminate correctly even in statement position.
+        let finite_stdin = matches!(
+            &stdin,
+            StdinSpec::Bytes(_) | StdinSpec::File(_) | StdinSpec::Stream(_)
+        );
+        let mode = if !finite_stdin
+            && (force_tui || (self.session.interactive && position == Position::Statement))
+        {
             ExecMode::PtyTee
         } else {
             ExecMode::Capture
