@@ -9,7 +9,7 @@ in the Zola sources; do not grow a second manual here.
 
 Read the smallest relevant set before changing behavior:
 
-1. [`spec/cases/*.toml`](spec/cases) is the executable language contract: **1,310 cases across 77
+1. [`spec/cases/*.toml`](spec/cases) is the executable language contract: **1,326 cases across 78
    suites**. If prose and a case disagree, investigate, but do not silently change a case to match a
    regression.
 2. [`site/content/internals/language-conformance-contract.md`](site/content/internals/language-conformance-contract.md)
