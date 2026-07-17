@@ -882,4 +882,51 @@ params = { adapter_only = "bool" }
         let suggestions = finish(names, 0, 0, 3);
         assert_eq!(suggestions.len(), 3, "finish() truncates to max_results");
     }
+
+    #[test]
+    fn production_completion_ownership_stays_decomposed() {
+        let root = include_str!("completer.rs");
+        let production_root = root
+            .split_once("\n#[cfg(test)]\nmod tests")
+            .expect("inline completion tests remain after production")
+            .0;
+        let candidates = include_str!("completer/candidates.rs");
+        let context = include_str!("completer/context.rs");
+        let discovery = include_str!("completer/discovery.rs");
+        let inference = include_str!("completer/inference.rs");
+
+        assert!(
+            production_root.lines().count() <= 180,
+            "completion root must remain Reedline orchestration"
+        );
+        assert!(candidates.lines().count() <= 220);
+        assert!(context.lines().count() <= 190);
+        assert!(discovery.lines().count() <= 230);
+        assert!(inference.lines().count() <= 150);
+
+        for forbidden in [
+            "fs::read_dir",
+            "Lexer::new",
+            "resolve_command_source",
+            "method_names",
+            "PATH_CACHE_REVALIDATE: Duration",
+        ] {
+            assert!(
+                !production_root.contains(forbidden),
+                "responsibility `{forbidden}` leaked back into the root"
+            );
+        }
+
+        let complete = production_root
+            .split_once("fn complete")
+            .expect("Reedline completion entrypoint")
+            .1
+            .split_once("\n    }\n}")
+            .expect("completion impl boundary")
+            .0;
+        assert!(
+            complete.lines().count() <= 35,
+            "Reedline entrypoint should only classify and dispatch"
+        );
+    }
 }
