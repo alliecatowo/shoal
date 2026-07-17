@@ -20,12 +20,24 @@ pub(crate) struct EmbeddedKernelConfig {
 
 pub(crate) struct EmbeddedKernelChild {
     child: Child,
+    shutdown: UnixStream,
 }
 
 impl EmbeddedKernelChild {
     fn terminate(&mut self) {
         if self.child.try_wait().ok().flatten().is_some() {
             return;
+        }
+        // Closing either clone shuts down this endpoint and wakes the child's
+        // private request loop. The child then stops its public accept loop,
+        // drops the journal/WAL cleanly, and removes the socket path.
+        let _ = self.shutdown.shutdown(std::net::Shutdown::Both);
+        let graceful_deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < graceful_deadline {
+            if self.child.try_wait().ok().flatten().is_some() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
         let pid = self.child.id() as i32;
         unsafe {
@@ -55,6 +67,7 @@ pub(crate) fn connect(
     config: EmbeddedKernelConfig,
 ) -> Result<(KernelClient, EmbeddedKernelChild), String> {
     let (parent, child_end) = UnixStream::pair().map_err(|error| error.to_string())?;
+    let shutdown = parent.try_clone().map_err(|error| error.to_string())?;
     let child_fd = child_end.as_raw_fd();
     let program = config.program.unwrap_or_else(kernel_program);
     let mut command = Command::new(&program);
@@ -96,7 +109,7 @@ pub(crate) fn connect(
         )
     })?;
     drop(child_end);
-    let guard = EmbeddedKernelChild { child };
+    let guard = EmbeddedKernelChild { child, shutdown };
     let client_config = Config {
         socket: PathBuf::new(),
         session: Some(config.session),

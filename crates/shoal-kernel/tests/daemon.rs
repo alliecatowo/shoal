@@ -73,7 +73,6 @@ static ONLY_ONE_DAEMON_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new((
 fn embedded_fd_is_private_trust_while_public_listener_stays_untrusted_and_live() {
     const EMBEDDED_FD: i32 = 3;
     const SIGINT: i32 = 2;
-    const SIGKILL: i32 = 9;
     const F_GETFD: i32 = 1;
     const F_SETFD: i32 = 2;
     const FD_CLOEXEC: i32 = 1;
@@ -192,8 +191,6 @@ fn embedded_fd_is_private_trust_while_public_listener_stays_untrusted_and_live()
     .unwrap();
     assert!(recv(&mut private_reader).error.is_none());
 
-    drop(private);
-    drop(private_reader);
     write_frame(
         &mut public,
         &Request {
@@ -205,8 +202,23 @@ fn embedded_fd_is_private_trust_while_public_listener_stays_untrusted_and_live()
     )
     .unwrap();
     assert!(recv(&mut public_reader).error.is_none());
-    assert_eq!(unsafe { kill(child.id() as i32, SIGKILL) }, 0);
-    let _ = child.wait();
+    drop(public);
+    drop(public_reader);
+    drop(private);
+    drop(private_reader);
+    let exit_deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < exit_deadline,
+            "embedded kernel did not exit after private endpoint closed"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(status.success(), "embedded kernel exit: {status}");
+    assert!(!socket.exists(), "clean exit removes the public socket");
 }
 
 #[test]

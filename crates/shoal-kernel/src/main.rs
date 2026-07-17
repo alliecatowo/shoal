@@ -31,6 +31,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     kernel.configure_limits(limits);
     let socket = args.socket.unwrap_or_else(|| paths.socket(&args.session));
     prepare_socket(&socket)?;
+    let stop = Arc::new(AtomicBool::new(false));
     if let Some(fd) = args.embedded_fd {
         if fd < 3 {
             return Err("--embedded-fd must name a non-stdio descriptor".into());
@@ -39,6 +40,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // exactly once and the one-shot embedded process exits with the stream.
         let stream = unsafe { UnixStream::from_raw_fd(fd) };
         let embedded = kernel.clone();
+        let embedded_stop = stop.clone();
         std::thread::Builder::new()
             .name("shoal-kernel-embedded-human".into())
             .spawn(move || {
@@ -47,9 +49,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 {
                     eprintln!("shoal-kernel: embedded connection: {error}");
                 }
+                // The inherited connection owns this embedded daemon's
+                // lifetime. Public MCP connections coexist while the REPL is
+                // live, then the accept loop drains and exits cleanly when
+                // the private parent endpoint closes.
+                embedded_stop.store(true, Ordering::SeqCst);
             })?;
     }
-    let stop = Arc::new(AtomicBool::new(false));
     if args.embedded_fd.is_none() {
         let signal = stop.clone();
         ctrlc::set_handler(move || signal.store(true, Ordering::SeqCst))?;
