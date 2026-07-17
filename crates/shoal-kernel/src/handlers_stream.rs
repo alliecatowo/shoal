@@ -1,11 +1,47 @@
 //! Bounded pull/close lifecycle for evaluator-backed wire streams.
 
 use super::*;
+use std::sync::mpsc::{RecvTimeoutError, sync_channel};
 use std::time::Duration;
 
 const DEFAULT_PULL_ITEMS: usize = 16;
 const MAX_PULL_ITEMS: usize = 64;
 const MAX_PULL_WAIT: Duration = Duration::from_secs(1);
+const DEFAULT_PULL_DEADLINE: Duration = Duration::from_secs(1);
+const MAX_PULL_DEADLINE: Duration = Duration::from_secs(30);
+const MAX_WIRE_PULL_WORKERS: usize = 16;
+static ACTIVE_WIRE_PULL_WORKERS: AtomicUsize = AtomicUsize::new(0);
+
+struct PullWorkerLease;
+
+impl Drop for PullWorkerLease {
+    fn drop(&mut self) {
+        ACTIVE_WIRE_PULL_WORKERS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+fn acquire_pull_worker() -> Result<PullWorkerLease, RpcError> {
+    ACTIVE_WIRE_PULL_WORKERS
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |active| {
+            (active < MAX_WIRE_PULL_WORKERS).then_some(active + 1)
+        })
+        .map(|_| PullWorkerLease)
+        .map_err(|_| RpcError {
+            code: QUOTA_EXCEEDED,
+            message: "wire stream pull worker quota reached".into(),
+            data: Some(json!({
+                "limit": "wire_stream_pull_workers_global",
+                "max": MAX_WIRE_PULL_WORKERS,
+            })),
+        })
+}
+
+struct PulledBatch {
+    values: Vec<(u64, Value)>,
+    done: bool,
+    timed_out: bool,
+    error: Option<WireValue>,
+}
 
 impl Kernel {
     pub(crate) fn handle_stream_pull(
@@ -14,85 +50,60 @@ impl Kernel {
         attached: &mut Option<Attachment>,
     ) -> Result<Json, RpcError> {
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
-        let session = &attachment.session;
+        let session = attachment.session.clone();
         let params: StreamPullParams = decode(params)?;
         let limit = params
             .limit
             .unwrap_or(DEFAULT_PULL_ITEMS)
             .clamp(1, MAX_PULL_ITEMS);
         let wait = Duration::from_millis(params.wait_ms.unwrap_or(0)).min(MAX_PULL_WAIT);
-        let deadline = Instant::now() + wait;
-
-        // Pulling may execute map/where/scan closures, so it must own the same
-        // evaluator context and serialization boundary as `exec`.
-        let mut evaluator = session.evaluator.lock().unwrap();
+        let hard_deadline = params.deadline_ms.map_or(DEFAULT_PULL_DEADLINE, |ms| {
+            Duration::from_millis(ms.max(1)).min(MAX_PULL_DEADLINE)
+        });
+        let lease = acquire_pull_worker()?;
         let entry = session.stream_cursor(&params.cursor)?;
-        evaluator.set_cancellation_token(entry.cancel.clone());
-        let mut cursor = entry.inner.lock().unwrap();
-        if cursor.done {
-            return encode(StreamPullResult {
-                cursor: params.cursor,
-                items: Vec::new(),
-                done: true,
-                timed_out: false,
-                error: None,
-            });
-        }
+        let worker_session = session.clone();
+        let worker_entry = entry.clone();
+        let (tx, rx) = sync_channel(1);
+        std::thread::Builder::new()
+            .name("shoal-wire-stream-pull".into())
+            .spawn(move || {
+                let _lease = lease;
+                let batch = drive_cursor(worker_session, worker_entry, limit, wait);
+                let _ = tx.send(batch);
+            })
+            .map_err(internal)?;
 
-        let mut pulled = Vec::with_capacity(limit);
-        let mut timed_out = false;
-        let mut terminal_error = None;
-        for _ in 0..limit {
-            let timeout = deadline.saturating_duration_since(Instant::now());
-            let result = cursor
-                .upstream
-                .as_mut()
-                .expect("non-terminal stream cursor retains its upstream")
-                .pull(&mut *evaluator, Some(timeout));
-            match result {
-                Ok(shoal_value::Pull::Item(value)) => {
-                    let seq = cursor.next_seq;
-                    cursor.next_seq = cursor.next_seq.saturating_add(1);
-                    pulled.push((seq, value));
-                }
-                Ok(shoal_value::Pull::Timeout) => {
-                    timed_out = true;
-                    break;
-                }
-                Ok(shoal_value::Pull::End) => {
-                    cursor.done = true;
-                    cursor.upstream.take();
-                    break;
-                }
-                Err(error) => {
-                    terminal_error = Some(wire_value(&Value::Error(Arc::new(error))));
-                    cursor.done = true;
-                    cursor.upstream.take();
-                    break;
+        let deadline = Instant::now() + hard_deadline;
+        let batch = loop {
+            if entry.quarantined.load(Ordering::SeqCst) || entry.cancel.is_cancelled() {
+                session.quarantine_stream_cursor(&params.cursor, &entry);
+                break deadline_batch("stream_closed", "stream cursor was closed");
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                session.quarantine_stream_cursor(&params.cursor, &entry);
+                break deadline_batch(
+                    "stream_pull_deadline",
+                    "stream pull exceeded its execution deadline",
+                );
+            }
+            match rx.recv_timeout(remaining.min(Duration::from_millis(25))) {
+                Ok(batch) => break batch,
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => {
+                    session.quarantine_stream_cursor(&params.cursor, &entry);
+                    return Err(internal("stream pull worker exited without a result"));
                 }
             }
-        }
-        // `stream.close` cancels before waiting for this cursor lock. Do not
-        // leak a value that completed only because cancellation interrupted a
-        // closure (for example `sleep` or an external command), and make the
-        // racing pull's terminal state agree with the close.
-        if entry.cancel.is_cancelled() {
-            pulled.clear();
-            timed_out = false;
-            terminal_error = None;
-            cursor.done = true;
-            cursor.upstream.take();
-        }
-        let done = cursor.done;
-        drop(cursor);
-        drop(evaluator);
+        };
 
         // Every item receives its own transcript ref. This is essential for a
         // large/elided item: its returned ref remains fetchable by value.get
         // instead of pointing into an already-advanced ephemeral cursor.
         let budget = ElideBudget::from_spec(params.elide.as_ref());
-        let mut items = Vec::with_capacity(pulled.len());
-        for (seq, value) in pulled {
+        let mut items = Vec::with_capacity(batch.values.len());
+        for (seq, value) in batch.values {
             let value_ref = Ref::new("out", session.next_value.fetch_add(1, Ordering::Relaxed));
             session.insert_transcript(value_ref.clone(), value.clone());
             let uri = short_ref_to_uri(&value_ref, None);
@@ -106,9 +117,9 @@ impl Kernel {
         encode(StreamPullResult {
             cursor: params.cursor,
             items,
-            done,
-            timed_out,
-            error: terminal_error,
+            done: batch.done,
+            timed_out: batch.timed_out,
+            error: batch.error,
         })
     }
 
@@ -121,6 +132,97 @@ impl Kernel {
         let params: StreamCloseParams = decode(params)?;
         let closed = attachment.session.close_stream_cursor(&params.cursor)?;
         encode(json!({"cursor": params.cursor, "closed": closed}))
+    }
+}
+
+fn drive_cursor(
+    session: Arc<Session>,
+    entry: Arc<WireStreamCursorEntry>,
+    limit: usize,
+    wait: Duration,
+) -> PulledBatch {
+    if entry.quarantined.load(Ordering::SeqCst) {
+        let mut cursor = entry.inner.lock().unwrap();
+        cursor.done = true;
+        cursor.upstream.take();
+        return deadline_batch("stream_closed", "stream cursor was closed");
+    }
+    // This worker boundary is the hard containment available in-process. Shoal
+    // closures/builtins/processes cooperate with `CancelToken`; arbitrary host
+    // extensions are trusted code and require process isolation for hard kill.
+    let mut evaluator = session.evaluator.lock().unwrap();
+    evaluator.set_cancellation_token(entry.cancel.clone());
+    let mut cursor = entry.inner.lock().unwrap();
+    if cursor.done {
+        return PulledBatch {
+            values: Vec::new(),
+            done: true,
+            timed_out: false,
+            error: None,
+        };
+    }
+    let deadline = Instant::now() + wait;
+    let mut values = Vec::with_capacity(limit);
+    let mut timed_out = false;
+    let mut error = None;
+    for _ in 0..limit {
+        if entry.quarantined.load(Ordering::SeqCst) || entry.cancel.is_cancelled() {
+            break;
+        }
+        let result = cursor
+            .upstream
+            .as_mut()
+            .expect("non-terminal stream cursor retains its upstream")
+            .pull(
+                &mut *evaluator,
+                Some(deadline.saturating_duration_since(Instant::now())),
+            );
+        match result {
+            Ok(shoal_value::Pull::Item(value)) => {
+                let seq = cursor.next_seq;
+                cursor.next_seq = cursor.next_seq.saturating_add(1);
+                values.push((seq, value));
+            }
+            Ok(shoal_value::Pull::Timeout) => {
+                timed_out = true;
+                break;
+            }
+            Ok(shoal_value::Pull::End) => {
+                cursor.done = true;
+                cursor.upstream.take();
+                break;
+            }
+            Err(source_error) => {
+                error = Some(wire_value(&Value::Error(Arc::new(source_error))));
+                cursor.done = true;
+                cursor.upstream.take();
+                break;
+            }
+        }
+    }
+    if entry.quarantined.load(Ordering::SeqCst) || entry.cancel.is_cancelled() {
+        values.clear();
+        timed_out = false;
+        error = None;
+        cursor.done = true;
+        cursor.upstream.take();
+    }
+    PulledBatch {
+        values,
+        done: cursor.done,
+        timed_out,
+        error,
+    }
+}
+
+fn deadline_batch(code: &str, message: &str) -> PulledBatch {
+    PulledBatch {
+        values: Vec::new(),
+        done: true,
+        timed_out: code == "stream_pull_deadline",
+        error: Some(wire_value(&Value::Error(Arc::new(
+            shoal_value::ErrorVal::new(code, message),
+        )))),
     }
 }
 
@@ -361,6 +463,73 @@ mod tests {
         fn drop(&mut self) {
             self.0.store(true, Ordering::SeqCst);
         }
+    }
+
+    struct NonCooperativeSource {
+        dropped: Arc<AtomicBool>,
+        started: Arc<AtomicBool>,
+    }
+
+    impl shoal_value::Upstream for NonCooperativeSource {
+        fn pull(
+            &mut self,
+            _ctx: &mut dyn shoal_value::CallCtx,
+            _timeout: Option<Duration>,
+        ) -> shoal_value::VResult<shoal_value::Pull> {
+            self.started.store(true, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(250));
+            Ok(shoal_value::Pull::Item(Value::Int(1)))
+        }
+    }
+
+    impl Drop for NonCooperativeSource {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn hard_deadline_detaches_a_non_cooperative_in_process_source() {
+        let kernel = Kernel::new();
+        let (session, mut attached) = attached(&kernel);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let pull_started = Arc::new(AtomicBool::new(false));
+        let value_ref = Ref::new("out", 90);
+        let cursor = StreamCursorRef {
+            r#ref: value_ref.clone(),
+            path: None,
+        };
+        session.insert_transcript(
+            value_ref,
+            Value::Stream(shoal_value::StreamVal::from_upstream(
+                "slow",
+                false,
+                Box::new(NonCooperativeSource {
+                    dropped: dropped.clone(),
+                    started: pull_started.clone(),
+                }),
+            )),
+        );
+
+        let started = Instant::now();
+        let response = kernel
+            .handle_stream_pull(json!({"cursor":cursor,"deadline_ms":20}), &mut attached)
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_millis(150));
+        assert_eq!(response["done"], true);
+        assert_eq!(response["timed_out"], true);
+        assert_eq!(response["error"]["code"], "stream_pull_deadline");
+        assert!(!session.has_stream_cursor(&cursor));
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !dropped.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "source was not dropped (pull_started={})",
+            pull_started.load(Ordering::SeqCst)
+        );
     }
 
     #[test]

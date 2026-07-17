@@ -605,6 +605,10 @@ pub struct StreamPullParams {
     /// second; omitted means a non-blocking poll.
     #[serde(default)]
     pub wait_ms: Option<u64>,
+    /// Hard RPC execution deadline, independent of source wait. A timed-out
+    /// cursor is cancelled and detached. Omitted defaults to one second.
+    #[serde(default)]
+    pub deadline_ms: Option<u64>,
     #[serde(default)]
     pub elide: Option<ElideSpec>,
 }

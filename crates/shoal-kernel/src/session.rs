@@ -93,6 +93,9 @@ pub(crate) struct WireStreamCursor {
 
 pub(crate) struct WireStreamCursorEntry {
     pub(crate) cancel: shoal_exec::CancelToken,
+    /// Set before a deadline/close detaches the cursor. Workers check it at
+    /// cooperative boundaries and must never publish a result after it flips.
+    pub(crate) quarantined: AtomicBool,
     pub(crate) inner: Mutex<WireStreamCursor>,
 }
 
@@ -174,6 +177,7 @@ impl Session {
         let upstream = stream.take_upstream().map_err(stream_error)?;
         let entry = Arc::new(WireStreamCursorEntry {
             cancel: shoal_exec::CancelToken::new(),
+            quarantined: AtomicBool::new(false),
             inner: Mutex::new(WireStreamCursor {
                 upstream: Some(upstream),
                 next_seq: 0,
@@ -189,14 +193,12 @@ impl Session {
     /// and later pulls correctly observe single consumption.
     pub(crate) fn close_stream_cursor(&self, cursor: &StreamCursorRef) -> Result<bool, RpcError> {
         if let Some(entry) = self.stream_cursors.lock().unwrap().remove(cursor) {
-            // A concurrent pull may already hold this entry after releasing
-            // the registry map. Cancel evaluator work before waiting for the
-            // cursor lock, then take/drop the upstream before reporting close
-            // complete.
+            // Never wait for an in-process upstream while serving close. A
+            // cooperative worker observes cancellation; a non-cooperative
+            // trusted extension retains this detached Arc only until its
+            // globally-leased worker eventually returns.
+            entry.quarantined.store(true, Ordering::SeqCst);
             entry.cancel.cancel();
-            let mut entry = entry.inner.lock().unwrap();
-            entry.upstream.take();
-            entry.done = true;
             return Ok(true);
         }
         let stream = self.resolve_stream_value(cursor)?;
@@ -208,6 +210,28 @@ impl Session {
             Err(error) if error.code == "stream_consumed" => Ok(false),
             Err(error) => Err(stream_error(error)),
         }
+    }
+
+    pub(crate) fn quarantine_stream_cursor(
+        &self,
+        cursor: &StreamCursorRef,
+        observed: &Arc<WireStreamCursorEntry>,
+    ) {
+        observed.quarantined.store(true, Ordering::SeqCst);
+        observed.cancel.cancel();
+        if let Ok(mut cursor) = observed.inner.try_lock() {
+            cursor.done = true;
+            cursor.upstream.take();
+        }
+        let removed = {
+            let mut cursors = self.stream_cursors.lock().unwrap();
+            cursors
+                .get(cursor)
+                .is_some_and(|current| Arc::ptr_eq(current, observed))
+                .then(|| cursors.remove(cursor))
+                .flatten()
+        };
+        drop(removed);
     }
 
     fn resolve_stream_value(

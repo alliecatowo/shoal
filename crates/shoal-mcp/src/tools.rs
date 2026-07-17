@@ -64,6 +64,7 @@ fn map_tool(name: &str, args: Value) -> Result<(&'static str, Value), String> {
                 "cursor": object.get("cursor").cloned().ok_or("missing cursor")?,
                 "limit": object.get("limit"),
                 "wait_ms": object.get("wait_ms"),
+                "deadline_ms": object.get("deadline_ms"),
                 "elide": object.get("elide"),
             }),
         ),
@@ -234,7 +235,7 @@ pub fn tools() -> Vec<Value> {
         tool(
             "shoal_stream_pull",
             "Pull the next bounded batch from a stream cursor returned by shoal_exec or shoal_get. Items are individually addressable transcript values; done and timed_out are explicit.",
-            json!({"type":"object","properties":{"cursor":{"type":"object","properties":{"ref":{"type":"string"},"path":{"type":"string"}},"required":["ref"],"additionalProperties":false},"limit":{"type":"integer","minimum":1,"maximum":64},"wait_ms":{"type":"integer","minimum":0,"maximum":1000},"elide":{"type":"object","properties":{"max_bytes":{"type":"integer"},"max_rows":{"type":"integer"},"max_items":{"type":"integer"}}}},"required":["cursor"],"additionalProperties":false}),
+            json!({"type":"object","properties":{"cursor":{"type":"object","properties":{"ref":{"type":"string"},"path":{"type":"string"}},"required":["ref"],"additionalProperties":false},"limit":{"type":"integer","minimum":1,"maximum":64},"wait_ms":{"type":"integer","minimum":0,"maximum":1000},"deadline_ms":{"type":"integer","minimum":1,"maximum":30000},"elide":{"type":"object","properties":{"max_bytes":{"type":"integer"},"max_rows":{"type":"integer"},"max_items":{"type":"integer"}}}},"required":["cursor"],"additionalProperties":false}),
         ),
         tool(
             "shoal_stream_close",
