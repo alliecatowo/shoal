@@ -59,9 +59,11 @@ accDescr: Shows the components and relationships described in Core pull protocol
   Stage2-->>Sink: transformed Pull
 ```
 
-No stage runs until a sink pulls. Constructing a `watch`/`tail`/`every` source does start its producer
-thread today, but no closure stage or downstream method work runs until consumption. Dropping the
-receiver is the producer-stop mechanism for those sources.
+No stage runs until a sink pulls, with two eager exceptions: constructing a `watch`/`tail`/`every`
+source starts its producer thread, and constructing a `.buffer(n)` stage (HR-G1) starts its
+decoupling producer — which eagerly drives everything *below* it (including closure stages, run on
+that thread in a child evaluator) up to `n` items ahead. Stages above a buffer stay lazy. Dropping
+the receiver is the producer-stop mechanism for all of these.
 
 ## Stream state and identity
 
@@ -92,7 +94,7 @@ propagate or alter the bit:
 
 | Stage | Result boundedness |
 |---|---|
-| `map`, `filter`, `scan`, `flat_map`, `dedupe`, `distinct`, timing/window stages | same as input |
+| `map`, `filter`, `scan`, `flat_map`, `dedupe`, `distinct`, `buffer`, timing/window stages | same as input |
 | `take(n)` | always bounded |
 | predicate `take_until` | currently same as input, even though predicate may stop it |
 | stream `take_until` | currently same as primary input |
@@ -230,7 +232,7 @@ length shrinks; rename/replacement behavior beyond that depends on platform `not
 | `throttle(duration)` | emits first and drops items inside interval |
 | `window(count)` | sliding deque; emits only once full, then every item |
 | `window(duration)` | stores timestamp/value pairs; emits current time window per item |
-| `buffer(n)` | identity in synchronous pull model; no queue or pacing effect |
+| `buffer(n)` | real decoupler (HR-G1): producer thread + `sync_channel(n)`; runs at most `n` ahead, paces (never drops), preserves boundedness |
 | `enumerate` | emits `[zero_based_index, value]` |
 | `merge(other)` | polls A then B in 20 ms steps until both end |
 | `zip(other)` | pulls A then B and emits `[a,b]`; ends/times out with either pull |
@@ -251,6 +253,16 @@ before. Its *memory* is still proportional to the number of distinct values seen
 stream of continuously unique values the set grows without bound — bound the stream (`.take`,
 `.take_until`) or use `dedupe`/a window when long-lived cardinality is unknown. `window(duration)` is
 bounded only by event rate inside the duration.
+
+`buffer(n)` (HR-G1) is the one thread-backed combinator: the evaluator intercepts it (shoal-value
+alone cannot build it) and spawns a producer that drives the consumed upstream through a
+child-evaluator (HR-B1 seam, `Inherit` scope — same confinement as `spawn`/`parallel`/`on` bodies)
+into a `sync_channel(n)`. It is a pacing decoupler, never lossy: a full queue blocks the producer in
+a cancel-aware retry loop (10 ms poll) rather than dropping, because dropping here would silently
+lose language-visible data — unlike the lossy *source* buffers whose items are observations.
+Construction is eager (like the system sources); `n == 0` is a rendezvous handoff; upstream errors
+cross the channel and end the stream; parent cancellation or a dropped consumer stops the producer
+within one poll, dropping the wrapped upstream so shutdown cascades to nested sources.
 
 `debounce` ignores the caller-supplied outer timeout and uses its own pending deadline. This is worth
 re-auditing if time budgets become strict RPC cancellation contracts.

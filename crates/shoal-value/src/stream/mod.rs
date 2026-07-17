@@ -123,6 +123,19 @@ impl StreamVal {
         StreamVal::from_source(label, false, Box::new(ChanSource(rx)))
     }
 
+    /// Like [`Self::from_channel`], but with an explicit boundedness bit — for
+    /// thread-backed decoupling stages (`.buffer(n)`, HR-G1) that wrap an
+    /// existing stream and must PRESERVE its boundedness: a buffered finite
+    /// stream still has a natural end (`.collect()` stays legal), while a
+    /// buffered live source stays endless.
+    pub fn from_channel_bounded(
+        label: impl Into<String>,
+        bounded: bool,
+        rx: std::sync::mpsc::Receiver<VResult<Value>>,
+    ) -> StreamVal {
+        StreamVal::from_source(label, bounded, Box::new(ChanSource(rx)))
+    }
+
     fn from_source(label: impl Into<String>, bounded: bool, up: Box<dyn Upstream>) -> StreamVal {
         StreamVal {
             label: label.into(),
@@ -267,12 +280,6 @@ impl StreamVal {
                 buf: Vec::new(),
             })
         })
-    }
-    pub fn buffer(self, _n: usize) -> VResult<StreamVal> {
-        // Pure pacing decoupler: in a synchronous pull model it has no observable
-        // effect on the item sequence, so it is an identity stage. It exists so
-        // `.buffer(n)` type-checks and reads intentionally in a chain.
-        Ok(self)
     }
     pub fn enumerate(self) -> VResult<StreamVal> {
         let b = self.bounded;

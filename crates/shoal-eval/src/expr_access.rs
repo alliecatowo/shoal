@@ -222,6 +222,24 @@ impl Evaluator {
             let a = self.eval_args(args)?;
             self.eval_stream_sink(v, name, a)
                 .map_err(|e| e.or_span(span))
+        } else if matches!(v, Value::Stream(_)) && name == "buffer" {
+            // `.buffer(n)` needs the evaluator too (HR-G1): its decoupling
+            // producer thread drives the upstream through a child evaluator
+            // built from the child-context seam — shoal-value can't build one.
+            let Value::Stream(s) = v else { unreachable!() };
+            let a = self.eval_args(args)?;
+            let n = match a.pos.first() {
+                None => 1,
+                Some(Value::Int(i)) if *i >= 0 => *i as usize,
+                Some(other) => {
+                    return Err(ErrorVal::type_error(format!(
+                        "buffer expects a non-negative int capacity, found {}",
+                        other.type_name()
+                    ))
+                    .with_span(span));
+                }
+            };
+            self.stream_buffer(s, n).map_err(|e| e.or_span(span))
         } else if let Value::Path(p) = &v
             && matches!(
                 name,

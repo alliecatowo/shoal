@@ -191,8 +191,11 @@ Rules for implementers:
 
 ### Workstream G — stream and channel semantics
 
-- [ ] **HR-G1** — `StreamVal::buffer(n)` becomes a real bounded decoupling buffer, or is removed
+- [x] **HR-G1** — `StreamVal::buffer(n)` becomes a real bounded decoupling buffer, or is removed
   and its docs state the unimplemented status. *(I2)*
+  — shipped: evaluator-intercepted stage; child-evaluator producer thread + `sync_channel(n)`;
+  at most `n` items of readahead, pacing (lossless) with a cancel-aware retry loop; boundedness
+  preserved; eager construction like the system sources.
 - [x] **HR-G2** — `flat_map` interleaves substreams as documented, or the docs are corrected to
   sequential semantics; a test pins whichever behavior ships. *(I3)*
   — shipped: sequential semantics (interleaving is unimplementable under the sync pull model

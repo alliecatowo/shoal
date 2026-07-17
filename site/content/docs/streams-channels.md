@@ -111,7 +111,7 @@ Current stream-specific combinators are:
 | `debounce(duration)` | emit after quiet interval |
 | `throttle(duration)` | rate-limit emissions |
 | `window(count_or_duration)` | collect count/time windows |
-| `buffer(n)` | identity stage in the current synchronous pull model |
+| `buffer(n)` | decouple: a producer thread runs the upstream up to `n` items ahead |
 | `enumerate()` | pair items with sequence positions |
 | `merge(other)` | interleave two streams |
 | `zip(other)` | pair two streams |
@@ -142,7 +142,7 @@ stream.into(channel("user.events"))
 
 For streams, both `.save(path)` and `.append(path)` currently open the file in append mode and write one line per item. Strings and bytes are written as their content; other values become JSON per line. `.save` does not truncate, despite its name—this is an important preview behavior.
 
-`buffer(n)` currently type-checks and documents intent, but it does not create a queue, background producer, or pacing boundary. Shoal's stream runtime is synchronously pulled today, so the operation returns the same stream unchanged.
+`buffer(n)` is a real decoupling stage: it starts a background producer that eagerly drives everything below it — closures included — and stays at most `n` items ahead of the consumer. Items are paced, never dropped, so the sequence is exactly preserved; `buffer(0)` is a rendezvous handoff between the two threads. Construction is eager (production begins immediately, like `every`/`watch`/`tail`), stages written after the buffer stay lazy, and a bounded stream stays collectable through it. Cancelling the session or dropping the stream stops the producer promptly.
 
 `tee(n)` returns independently drivable streams. A bounded stream materializes once for exact replay. A live stream uses a queue of at most 64 pending items per fork. When a slow fork falls behind, overflowed values are dropped and later represented in order by a `{dropped: n}` marker. The marker appears as soon as that fork's queue has room, or after its buffered items drain; overflow does not raise an error and is never silent.
 
