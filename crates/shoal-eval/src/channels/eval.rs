@@ -123,6 +123,9 @@ impl Evaluator {
                 ErrorVal::arg_error("on expects a handler: `on(channel(\"x\"), f)`")
             })?;
 
+        // Reserve before subscribing or creating task state. A rejected
+        // handler leaves neither an idle subscriber nor a job row behind.
+        let lease = self.host.native_workers.acquire()?;
         // Subscribe now (before spawning) so no event emitted between here and the
         // task starting is missed.
         let rx = self.bus().events(&chan, None)?;
@@ -141,10 +144,14 @@ impl Evaluator {
         // dropping leash/reef/config (audit B1–B4). `Inherit` scope: the handler
         // sees the caller's bindings.
         let ctx = self.child_context();
+        // Registry visibility must precede launch: a fast worker may otherwise
+        // finish before its TaskVal can be discovered through jobs/task APIs.
+        // A Builder failure completes this already-registered task below.
         self.exec.jobs.register(task.clone());
         let launch = std::thread::Builder::new()
             .name(format!("shoal-on-{chan}"))
             .spawn(move || {
+                let _lease = lease;
                 let mut ev = ctx.build(ChildKind::OnHandler, child_cancel.clone());
                 let result = loop {
                     let event = match rx.recv(None, Some(&child_cancel)) {

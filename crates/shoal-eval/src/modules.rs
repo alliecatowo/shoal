@@ -48,8 +48,8 @@ impl Evaluator {
             vec![base.with_extension("shl"), base.clone()]
         };
         for c in &candidates {
-            if c.is_file() {
-                return c.canonicalize().map_err(|e| {
+            if self.host.fs.is_file(c) {
+                return self.host.fs.canonicalize(c).map_err(|e| {
                     ErrorVal::new("io_error", format!("cannot resolve module `{path}`: {e}"))
                 });
             }
@@ -81,6 +81,27 @@ impl Evaluator {
                 "custom",
                 format!("circular `use`: {}", cycle.join(" -> ")),
             ));
+        }
+        // Reserve capacity conceptually for every module currently evaluating:
+        // nested `use`s must not over-admit merely because their parents have not
+        // reached the memo table yet. This check precedes both file reads and AST
+        // execution, so rejecting a new unique module cannot replay side effects.
+        if self
+            .exec
+            .modules
+            .cache
+            .len()
+            .saturating_add(self.exec.modules.stack.len())
+            >= crate::exec_state::MAX_CACHED_MODULES
+        {
+            return Err(ErrorVal::new(
+                "module_cache_limit",
+                format!(
+                    "session module memo limit reached ({})",
+                    crate::exec_state::MAX_CACHED_MODULES
+                ),
+            )
+            .with_hint("reuse a cached module or start a new evaluator session"));
         }
         let src = self
             .host
@@ -181,5 +202,94 @@ fn collect_pattern_names(pattern: &Pattern, out: &mut Vec<String>) {
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::exec_state::MAX_CACHED_MODULES;
+
+    fn fill_cache(evaluator: &mut Evaluator, count: usize) {
+        for index in 0..count {
+            evaluator.exec.modules.cache.insert(
+                PathBuf::from(format!("/memoized/module-{index}.shl")),
+                Value::Record(Record::new()),
+            );
+        }
+    }
+
+    #[test]
+    fn new_module_at_cap_is_rejected_before_top_level_side_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        let module = dir.path().join("new.shl");
+        std::fs::write(
+            &module,
+            r#""ran".save("module-side-effect")
+export let answer = 42"#,
+        )
+        .unwrap();
+        let mut evaluator = Evaluator::new(dir.path().to_path_buf());
+        fill_cache(&mut evaluator, MAX_CACHED_MODULES);
+
+        let error = evaluator.eval_use("./new", Span::default()).unwrap_err();
+        assert_eq!(error.code, "module_cache_limit");
+        assert!(!dir.path().join("module-side-effect").exists());
+        assert_eq!(evaluator.exec.modules.cache.len(), MAX_CACHED_MODULES);
+    }
+
+    #[test]
+    fn cached_module_remains_usable_at_cap_without_reexecution() {
+        let dir = tempfile::tempdir().unwrap();
+        let module = dir.path().join("cached.shl");
+        std::fs::write(
+            &module,
+            r#""replayed".save("module-side-effect")
+export let answer = 1"#,
+        )
+        .unwrap();
+        let canon = module.canonicalize().unwrap();
+        let mut evaluator = Evaluator::new(dir.path().to_path_buf());
+        fill_cache(&mut evaluator, MAX_CACHED_MODULES - 1);
+        let mut exports = Record::new();
+        exports.insert("answer".into(), Value::Int(42));
+        evaluator
+            .exec
+            .modules
+            .cache
+            .insert(canon, Value::Record(exports));
+
+        evaluator
+            .eval_use("./cached", Span::default())
+            .expect("cached module should remain admissible at the cap");
+        let Value::Record(bound) = evaluator.exec.shell.env.get("cached").unwrap() else {
+            panic!("cached module binding should be a record");
+        };
+        assert_eq!(bound.get("answer"), Some(&Value::Int(42)));
+        assert!(!dir.path().join("module-side-effect").exists());
+        assert_eq!(evaluator.exec.modules.cache.len(), MAX_CACHED_MODULES);
+    }
+
+    #[test]
+    fn owned_production_paths_have_no_ambient_existence_or_canonicalization_probes() {
+        let modules = include_str!("modules.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(!modules.contains("c.is_file()"));
+        assert!(!modules.contains("c.canonicalize()"));
+
+        let streams = include_str!("streams.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(!streams.contains("root.exists()"));
+        assert!(!streams.contains("path.exists()"));
+
+        let script = include_str!("script.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(!script.contains("resolved.exists()"));
     }
 }

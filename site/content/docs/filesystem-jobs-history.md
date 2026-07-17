@@ -132,6 +132,8 @@ await wait cancel is_done suspend resume is_suspended
 
 `await`/`wait` return the task result or propagate its error. `cancel` requests cancellation. Local suspension methods are meaningful where the task owns controllable local process state.
 
+Native evaluator workers created by `spawn`, each `parallel` lane, and `on` handlers share a 64-worker session budget, including work started by child evaluators. A 512-worker process ceiling also bounds many concurrent sessions. Admission happens before fallible thread creation; `parallel` reserves its entire batch before any closure runs. Exhaustion returns `session_worker_limit` or `process_worker_limit` with a retry hint, and task completion or cancellation releases the slot.
+
 ## Local process-group job control
 
 The interactive Unix REPL gives foreground externals a process group:

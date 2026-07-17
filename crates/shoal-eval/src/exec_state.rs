@@ -74,8 +74,67 @@ pub(crate) struct ModuleState {
     pub(crate) stack: Vec<PathBuf>,
 }
 
+/// A session may memoize at most this many distinct modules. The deliberately
+/// high cap bounds long-lived evaluators without perturbing ordinary module
+/// graphs. Cached entries remain usable at the cap; only a new canonical path
+/// is rejected.
+pub(crate) const MAX_CACHED_MODULES: usize = 1_024;
+
+/// Retained executable plans are bounded independently from their identities.
+/// IDs are monotonic session-local handles, so removing an old program can
+/// never make its ID name a newer program.
+pub(crate) const MAX_STORED_PLANS: usize = 256;
+
+pub(crate) struct StoredPlan {
+    id: i64,
+    program: Program,
+}
+
 pub(crate) struct PlanState {
-    pub(crate) programs: Vec<Program>,
+    next_id: i64,
+    programs: std::collections::VecDeque<StoredPlan>,
+}
+
+impl PlanState {
+    fn new() -> Self {
+        Self {
+            next_id: 1,
+            programs: std::collections::VecDeque::new(),
+        }
+    }
+
+    pub(crate) fn store(&mut self, program: Program) -> VResult<i64> {
+        self.store_with_limit(program, MAX_STORED_PLANS)
+    }
+
+    fn store_with_limit(&mut self, program: Program, limit: usize) -> VResult<i64> {
+        let id = self.next_id;
+        self.next_id = self.next_id.checked_add(1).ok_or_else(|| {
+            ErrorVal::new("plan_id_exhausted", "plan identity space exhausted")
+                .with_hint("start a new evaluator session before deriving another plan")
+        })?;
+        self.programs.push_back(StoredPlan { id, program });
+        while self.programs.len() > limit {
+            self.programs.pop_front();
+        }
+        Ok(id)
+    }
+
+    pub(crate) fn program(&self, id: i64) -> VResult<Program> {
+        if let Some(stored) = self.programs.iter().find(|stored| stored.id == id) {
+            return Ok(stored.program.clone());
+        }
+        if id > 0 && id < self.next_id {
+            return Err(
+                ErrorVal::new("plan_expired", format!("plan #{id} is no longer retained"))
+                    .with_hint("derive a fresh plan and apply its new id"),
+            );
+        }
+        Err(ErrorVal::new(
+            "plan_not_found",
+            format!("no plan #{id} has been derived in this session"),
+        ))
+    }
 }
 
 pub(crate) struct ExecState {
@@ -128,9 +187,7 @@ impl ExecState {
                 cache: std::collections::HashMap::new(),
                 stack: Vec::new(),
             },
-            plans: PlanState {
-                programs: Vec::new(),
-            },
+            plans: PlanState::new(),
         }
     }
 
@@ -200,5 +257,25 @@ mod tests {
         let facade = include_str!("lib.rs");
         assert!(!facade.contains("impl std::ops::Deref for Evaluator"));
         assert!(!facade.contains("impl std::ops::DerefMut for Evaluator"));
+    }
+
+    #[test]
+    fn plan_eviction_preserves_monotonic_identity_without_retargeting() {
+        let mut plans = PlanState::new();
+        let first = plans
+            .store_with_limit(shoal_syntax::parse("1").unwrap(), 2)
+            .unwrap();
+        let second = plans
+            .store_with_limit(shoal_syntax::parse("2").unwrap(), 2)
+            .unwrap();
+        let third = plans
+            .store_with_limit(shoal_syntax::parse("3").unwrap(), 2)
+            .unwrap();
+
+        assert_eq!((first, second, third), (1, 2, 3));
+        assert_eq!(plans.program(first).unwrap_err().code, "plan_expired");
+        assert!(plans.program(second).is_ok());
+        assert!(plans.program(third).is_ok());
+        assert_eq!(plans.program(4).unwrap_err().code, "plan_not_found");
     }
 }

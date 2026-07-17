@@ -130,8 +130,24 @@ impl Evaluator {
             .find(|(n, _)| n == "settle")
             .map(|(_, v)| matches!(v, Value::Bool(true)))
             .unwrap_or(false);
+        // Reserve the whole batch before starting any thread. A quota failure
+        // drops these RAII leases and runs zero closures, so retrying cannot
+        // duplicate a partially-executed fan-out.
+        let mut leases = Vec::with_capacity(a.pos.len());
+        for _ in 0..a.pos.len() {
+            leases.push(self.host.native_workers.acquire()?);
+        }
+
+        // Threads wait behind an atomic launch gate until every fallible named
+        // spawn succeeds. An OS spawn failure aborts already-created workers
+        // before they call user code, preserving the same all-or-none boundary
+        // as quota admission without a poisonable mutex/condvar barrier.
+        const WAITING: u8 = 0;
+        const RUN: u8 = 1;
+        const ABORT: u8 = 2;
+        let gate = Arc::new(std::sync::atomic::AtomicU8::new(WAITING));
         let mut handles = Vec::new();
-        for f in a.pos {
+        for (index, (f, lease)) in a.pos.into_iter().zip(leases).enumerate() {
             // The one authoritative child constructor (HR-B1): each `parallel`
             // closure runs in a child that inherits the audited session context —
             // leash policy/principal, reef state, config, all effect ports, the
@@ -143,11 +159,40 @@ impl Evaluator {
             // token makes cancelling the parent cancel the whole batch.
             let ctx = self.child_context();
             let cancel = self.cancellation_token();
-            handles.push(std::thread::spawn(move || {
-                let mut ev = ctx.build(ChildKind::Parallel, cancel);
-                ev.call_value(&f, CallArgs::default())
-            }));
+            let worker_gate = gate.clone();
+            match std::thread::Builder::new()
+                .name(format!("shoal-parallel-{index}"))
+                .spawn(move || {
+                    let _lease = lease;
+                    loop {
+                        match worker_gate.load(std::sync::atomic::Ordering::Acquire) {
+                            RUN => break,
+                            ABORT => {
+                                return Err(ErrorVal::new(
+                                    "task_spawn",
+                                    "parallel batch aborted before launch",
+                                ));
+                            }
+                            _ => std::thread::park_timeout(Duration::from_millis(1)),
+                        }
+                    }
+                    let mut ev = ctx.build(ChildKind::Parallel, cancel);
+                    ev.call_value(&f, CallArgs::default())
+                }) {
+                Ok(handle) => handles.push(handle),
+                Err(error) => {
+                    gate.store(ABORT, std::sync::atomic::Ordering::Release);
+                    for handle in handles {
+                        let _ = handle.join();
+                    }
+                    return Err(ErrorVal::new(
+                        "task_spawn",
+                        format!("could not start parallel worker: {error}"),
+                    ));
+                }
+            }
         }
+        gate.store(RUN, std::sync::atomic::Ordering::Release);
         let mut results = Vec::new();
         let mut first_err: Option<ErrorVal> = None;
         for h in handles {
@@ -268,5 +313,31 @@ pub(crate) fn value_bytes(v: &Value) -> Vec<u8> {
             b.push(b'\n');
             b
         }
+    }
+}
+
+#[cfg(test)]
+mod worker_tests {
+    use super::*;
+    use crate::host_services::NativeWorkerBudget;
+    use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn parallel_quota_rejection_starts_no_closure() {
+        static PROCESS: AtomicUsize = AtomicUsize::new(0);
+        let dir = tempfile::tempdir().unwrap();
+        let mut evaluator = Evaluator::new(dir.path().to_path_buf());
+        Arc::make_mut(&mut evaluator.host).native_workers =
+            NativeWorkerBudget::with_limits(1, &PROCESS, 8);
+        let program = shoal_syntax::parse(
+            r#"parallel(() => "first".save("one"), () => "second".save("two"))"#,
+        )
+        .unwrap();
+
+        let error = evaluator.eval_program(&program).unwrap_err();
+        assert_eq!(error.code, "session_worker_limit");
+        assert!(!dir.path().join("one").exists());
+        assert!(!dir.path().join("two").exists());
+        assert_eq!(PROCESS.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 }

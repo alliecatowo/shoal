@@ -66,6 +66,7 @@ impl Evaluator {
         out
     }
     pub(crate) fn spawn_block(&mut self, body: Block) -> VResult<Value> {
+        let lease = self.host.native_workers.acquire()?;
         let task = shoal_value::TaskVal::new("spawn block");
         // Structured cancellation: cancelling the task cancels the child's exec
         // tokens (defect #14) — a FRESH token wired to the task's cancel hook.
@@ -80,11 +81,25 @@ impl Evaluator {
         // (B1–B4) found here dropping leash/reef/config. `Inherit` scope: a
         // `spawn` body sees the caller's bindings.
         let ctx = self.child_context();
-        std::thread::spawn(move || {
-            let mut ev = ctx.build(ChildKind::Spawn, child_cancel);
-            worker.finish(ev.block_value(&body));
-        });
+        // Register before launch so a fast worker cannot finish before the task
+        // becomes discoverable. If launch itself fails, finish that registered
+        // task with the same stable failure returned to the caller.
         self.exec.jobs.register(task.clone());
+        let launch = std::thread::Builder::new()
+            .name("shoal-spawn-block".into())
+            .spawn(move || {
+                let _lease = lease;
+                let mut ev = ctx.build(ChildKind::Spawn, child_cancel);
+                worker.finish(ev.block_value(&body));
+            });
+        if let Err(error) = launch {
+            let failure = ErrorVal::new(
+                "task_spawn",
+                format!("could not start spawn worker: {error}"),
+            );
+            task.finish(Err(failure.clone()));
+            return Err(failure);
+        }
         Ok(Value::Task(task))
     }
 
@@ -132,7 +147,7 @@ impl Evaluator {
         let scripty = ext.as_deref().is_some_and(|e| {
             e == "rs" || self.reef_chain_snapshot().runner_table().get(e).is_some()
         });
-        if is_path || (scripty && resolved.exists()) {
+        if is_path || (scripty && self.host.fs.exists(&resolved)) {
             debug_assert_eq!(
                 self.resolve_dynamic_run(&name, true).source,
                 shoal_syntax::commands::CommandSource::Runner
@@ -357,6 +372,39 @@ fn rust_script_artifact_in(parent: &Path) -> std::io::Result<(tempfile::TempDir,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host_services::NativeWorkerBudget;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn spawn_quota_rejects_then_reclaims_after_task_cancellation() {
+        static PROCESS: AtomicUsize = AtomicUsize::new(0);
+        let mut evaluator = Evaluator::new(std::env::temp_dir());
+        Arc::make_mut(&mut evaluator.host).native_workers =
+            NativeWorkerBudget::with_limits(1, &PROCESS, 8);
+
+        let program =
+            shoal_syntax::parse("let held = spawn { sleep 10s }\nspawn { null }").unwrap();
+        let error = evaluator.eval_program(&program).unwrap_err();
+        assert_eq!(error.code, "session_worker_limit");
+        let Value::Task(held) = evaluator.exec.shell.env.get("held").unwrap() else {
+            panic!("the admitted spawn should remain bound as a task");
+        };
+        held.cancel();
+        held.wait().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        while PROCESS.load(Ordering::Relaxed) != 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(PROCESS.load(Ordering::Relaxed), 0);
+
+        let replacement = evaluator
+            .eval_program(&shoal_syntax::parse("spawn { null }").unwrap())
+            .expect("completed/cancelled spawn should return its worker slot");
+        let Value::Task(replacement) = replacement else {
+            panic!("replacement spawn should return a task");
+        };
+        replacement.wait().unwrap();
+    }
 
     #[test]
     fn rust_script_artifacts_are_unique_private_and_removed_on_drop() {

@@ -660,7 +660,7 @@ plan { STATEMENTS }
 -> {id: int, effects: list<str>, reversible: bool, spawns: bool}
 ```
 
-Derives conservative effects without spawning or mutating, stores the parsed program in the evaluator, and returns a session-local integer plan id.
+Derives conservative effects without spawning or mutating, stores the parsed program in the evaluator, and returns a monotonic session-local integer plan id. The evaluator retains the newest 256 executable plans. Eviction removes only the program: ids are never reused or retargeted.
 
 ```shoal
 let p = (plan rm build.log)
@@ -685,7 +685,7 @@ let p = (plan { touch marker })
 apply p
 ```
 
-An invalid value is `arg_error`; an unknown/expired evaluator-local id is `not_found`. The stored program is scoped to that evaluator process and is not durable.
+An invalid value is `arg_error`; an id never issued in this evaluator is `plan_not_found`; an issued id whose program aged out is `plan_expired` with a hint to derive a fresh plan. The stored program is scoped to that evaluator process and is not durable.
 
 ### `explain`
 

@@ -3,10 +3,10 @@
 //! Each returns a lazy `stream<T>` over a live, channel-backed source fed by a
 //! background producer. The producer sends into a **bounded** `sync_channel`
 //! (bounded buffers, never unbounded) wrapped by
-//! [`StreamVal::from_channel`]; when the consumer drops the stream (a satisfied
-//! `.take`, `Ctrl-C`, end of `.each`), the receiver drops, the producer's send
-//! fails, and it exits — releasing the OS resource (timer / inotify / kqueue
-//! watch). This provides sink-to-source cancellation for free.
+//! [`StreamVal::from_buffered_channel`]; when the consumer drops the stream (a
+//! satisfied `.take`, `Ctrl-C`, end of `.each`), an explicit stop flag wakes
+//! even idle producers, releasing the OS resource (timer / inotify / kqueue
+//! watch) and its process-safe worker lease.
 //!
 //! Backpressure discipline: a producer never blocks on a slow
 //! consumer and never buffers without bound — it `try_send`s, and on a full
@@ -32,8 +32,8 @@ use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{SyncSender, TrySendError, channel, sync_channel};
-use std::time::Duration;
+use std::sync::mpsc::{RecvTimeoutError, SyncSender, TrySendError, channel, sync_channel};
+use std::time::{Duration, Instant};
 
 /// Consumer-facing buffer cap for `watch` and `tail` (site/content/internals/streams-channels.md —
 /// "bounded ring buffer" / "bounded line buffer"). The spec sizes `watch`'s
@@ -69,9 +69,11 @@ fn try_acquire_stream_pump(
         .map_err(|_| {
             ErrorVal::new(
                 "stream_pump_limit",
-                format!("stream pump limit reached ({limit})"),
+                format!("stream worker limit reached ({limit})"),
             )
-            .with_hint("consume or drop an existing buffered/feed stream before creating another")
+            .with_hint(
+                "consume or drop an existing live/buffered/feed stream before creating another",
+            )
         })
 }
 
@@ -146,22 +148,45 @@ impl Evaluator {
     /// occupant. Ticks are indistinguishable apart from their timestamp, so no
     /// marker is emitted, as required by `site/content/internals/streams-channels.md`.
     pub(crate) fn source_every(&self, interval: Duration) -> VResult<Value> {
+        self.source_every_with_budget(interval, &ACTIVE_STREAM_PUMPS, MAX_STREAM_PUMPS)
+    }
+
+    fn source_every_with_budget(
+        &self,
+        interval: Duration,
+        counter: &'static AtomicUsize,
+        limit: usize,
+    ) -> VResult<Value> {
         if interval.is_zero() {
             return Err(ErrorVal::arg_error("every expects a positive interval"));
         }
+        let lease = try_acquire_stream_pump(counter, limit)?;
         let (tx, rx) = sync_channel(1);
-        std::thread::spawn(move || {
-            loop {
-                std::thread::sleep(interval);
-                let now = jiff::Zoned::now();
-                match tx.try_send(Ok(Value::DateTime(Box::new(now)))) {
-                    Ok(()) => {}
-                    Err(TrySendError::Full(_)) => {} // consumer busy → tick coalesced away
-                    Err(TrySendError::Disconnected(_)) => break, // consumer gone → stop the timer
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        std::thread::Builder::new()
+            .name("shoal-stream-every".into())
+            .spawn(move || {
+                let _lease = lease;
+                while wait_interval_or_stop(interval, &worker_stop) {
+                    let now = jiff::Zoned::now();
+                    match tx.try_send(Ok(Value::DateTime(Box::new(now)))) {
+                        Ok(()) => {}
+                        Err(TrySendError::Full(_)) => {} // consumer busy → tick coalesced away
+                        Err(TrySendError::Disconnected(_)) => break, // consumer gone → stop the timer
+                    }
                 }
-            }
-        });
-        Ok(Value::Stream(StreamVal::from_channel("datetime", rx)))
+            })
+            .map_err(|error| {
+                ErrorVal::new("io_error", format!("spawn every stream worker: {error}"))
+            })?;
+        Ok(Value::Stream(StreamVal::from_buffered_channel(
+            "datetime",
+            false,
+            rx,
+            stop,
+            Box::new(|| {}),
+        )))
     }
 
     /// `watch(target, recursive: bool = true) -> stream<event>` (site/content/internals/streams-channels.md).
@@ -173,7 +198,7 @@ impl Evaluator {
     /// coalesced: true}` summary event (site/content/internals/streams-channels.md) via [`send_coalescing`].
     pub(crate) fn source_watch(&self, target: &Value, recursive: bool) -> VResult<Value> {
         let (root, matcher) = self.watch_root_and_matcher(target)?;
-        if !root.exists() {
+        if !self.host.fs.exists(&root) {
             return Err(ErrorVal::new(
                 "not_found",
                 format!("watch target does not exist: {}", root.display()),
@@ -185,64 +210,85 @@ impl Evaluator {
         } else {
             RecursiveMode::NonRecursive
         };
-        std::thread::spawn(move || {
-            // notify pushes raw events onto its own channel; we translate + filter
-            // and forward. Keeping `watcher` alive in this scope keeps the OS watch
-            // open; both drop together when the loop ends.
-            let (raw_tx, raw_rx) = channel();
-            let mut watcher = match notify::recommended_watcher(move |res| {
-                let _ = raw_tx.send(res);
-            }) {
-                Ok(w) => w,
-                Err(e) => {
+        let lease = acquire_stream_pump()?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        std::thread::Builder::new()
+            .name("shoal-stream-watch".into())
+            .spawn(move || {
+                let _lease = lease;
+                // notify pushes raw events onto its own channel; we translate + filter
+                // and forward. Keeping `watcher` alive in this scope keeps the OS watch
+                // open; both drop together when the loop ends.
+                let (raw_tx, raw_rx) = channel();
+                let mut watcher = match notify::recommended_watcher(move |res| {
+                    let _ = raw_tx.send(res);
+                }) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        let _ = tx.send(Err(ErrorVal::new("io_error", format!("watch: {e}"))));
+                        return;
+                    }
+                };
+                if let Err(e) = watcher.watch(&root, mode) {
                     let _ = tx.send(Err(ErrorVal::new("io_error", format!("watch: {e}"))));
                     return;
                 }
-            };
-            if let Err(e) = watcher.watch(&root, mode) {
-                let _ = tx.send(Err(ErrorVal::new("io_error", format!("watch: {e}"))));
-                return;
-            }
-            // Coalesce state: `true` when at least one event was dropped on a
-            // full buffer and the consumer is owed the documented coalescing summary event.
-            let mut coalesce_owed = 0u64;
-            for res in raw_rx {
-                let event = match res {
-                    Ok(ev) => ev,
-                    Err(e) => {
-                        // Errors are rare and must not be lost: a blocking
-                        // send here is bounded by the consumer's next pull
-                        // (and fails immediately if the consumer is gone).
-                        if tx
-                            .send(Err(ErrorVal::new("io_error", format!("watch: {e}"))))
-                            .is_err()
+                // Coalesce state: `true` when at least one event was dropped on a
+                // full buffer and the consumer is owed the documented coalescing summary event.
+                let mut coalesce_owed = 0u64;
+                while !worker_stop.load(Ordering::SeqCst) {
+                    let res = match raw_rx.recv_timeout(PUMP_POLL) {
+                        Ok(result) => result,
+                        Err(RecvTimeoutError::Timeout) => continue,
+                        Err(RecvTimeoutError::Disconnected) => break,
+                    };
+                    let event = match res {
+                        Ok(ev) => ev,
+                        Err(e) => {
+                            // Errors are rare and must not be lost: a blocking
+                            // send here is bounded by the consumer's next pull
+                            // (and fails immediately if the consumer is gone).
+                            if tx
+                                .send(Err(ErrorVal::new("io_error", format!("watch: {e}"))))
+                                .is_err()
+                            {
+                                break;
+                            }
+                            continue;
+                        }
+                    };
+                    let Some(kind) = event_kind(&event.kind) else {
+                        continue;
+                    };
+                    let mut consumer_gone = false;
+                    for path in &event.paths {
+                        if let Some(m) = &matcher
+                            && !m.matches_path(path)
                         {
+                            continue;
+                        }
+                        if !send_coalescing(&tx, &mut coalesce_owed, &root, watch_event(path, kind))
+                        {
+                            consumer_gone = true;
                             break;
                         }
-                        continue;
                     }
-                };
-                let Some(kind) = event_kind(&event.kind) else {
-                    continue;
-                };
-                let mut consumer_gone = false;
-                for path in &event.paths {
-                    if let Some(m) = &matcher
-                        && !m.matches_path(path)
-                    {
-                        continue;
-                    }
-                    if !send_coalescing(&tx, &mut coalesce_owed, &root, watch_event(path, kind)) {
-                        consumer_gone = true;
-                        break;
+                    if consumer_gone {
+                        break; // consumer gone → drop the watch
                     }
                 }
-                if consumer_gone {
-                    break; // consumer gone → drop the watch
-                }
-            }
-        });
-        Ok(Value::Stream(StreamVal::from_channel("event", rx)))
+            })
+            .map_err(|error| {
+                ErrorVal::new("io_error", format!("spawn watch stream worker: {error}"))
+            })?;
+        Ok(Value::Stream(StreamVal::from_buffered_channel(
+            "event",
+            false,
+            rx,
+            stop,
+            Box::new(|| {}),
+        )))
     }
 
     /// `tail(file, from_start: bool = false) -> stream<str>` (site/content/internals/streams-channels.md):
@@ -254,7 +300,7 @@ impl Evaluator {
     /// line-count marker element (site/content/internals/streams-channels.md) via [`send_line_bounded`].
     pub(crate) fn source_tail(&self, file: &Value, from_start: bool) -> VResult<Value> {
         let path = self.stream_path_arg(file)?;
-        if !path.exists() {
+        if !self.host.fs.exists(&path) {
             return Err(ErrorVal::new(
                 "not_found",
                 format!("tail target does not exist: {}", path.display()),
@@ -265,8 +311,25 @@ impl Evaluator {
         // so the streaming source is interposable/fakeable like every other
         // filesystem effect; the `Arc` clone rides into the producer thread.
         let fs = self.host.fs.clone();
-        std::thread::spawn(move || tail_loop(&fs, &path, from_start, &tx));
-        Ok(Value::Stream(StreamVal::from_channel("str", rx)))
+        let lease = acquire_stream_pump()?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        std::thread::Builder::new()
+            .name("shoal-stream-tail".into())
+            .spawn(move || {
+                let _lease = lease;
+                tail_loop(&fs, &path, from_start, &tx, &worker_stop);
+            })
+            .map_err(|error| {
+                ErrorVal::new("io_error", format!("spawn tail stream worker: {error}"))
+            })?;
+        Ok(Value::Stream(StreamVal::from_buffered_channel(
+            "str",
+            false,
+            rx,
+            stop,
+            Box::new(|| {}),
+        )))
     }
 
     /// Split a `watch` target into the directory to watch and an optional glob
@@ -311,6 +374,23 @@ impl Evaluator {
         } else {
             self.exec.shell.cwd.join(p)
         }
+    }
+}
+
+fn wait_interval_or_stop(interval: Duration, stop: &AtomicBool) -> bool {
+    let deadline = Instant::now().checked_add(interval);
+    let Some(deadline) = deadline else {
+        return false;
+    };
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return false;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return true;
+        }
+        std::thread::park_timeout(remaining.min(PUMP_POLL));
     }
 }
 
@@ -378,7 +458,13 @@ fn glob_prefix(pattern: &str) -> PathBuf {
 
 /// The tail producer: seek, then wait on `notify` for appends, reading whole
 /// lines as they land. Exits when the consumer drops `tx`.
-fn tail_loop(fs: &Arc<dyn Fs>, path: &Path, from_start: bool, tx: &SyncSender<VResult<Value>>) {
+fn tail_loop(
+    fs: &Arc<dyn Fs>,
+    path: &Path,
+    from_start: bool,
+    tx: &SyncSender<VResult<Value>>,
+    stop: &AtomicBool,
+) {
     let mut file = match fs.open_read(path) {
         Ok(f) => f,
         Err(e) => {
@@ -415,7 +501,12 @@ fn tail_loop(fs: &Arc<dyn Fs>, path: &Path, from_start: bool, tx: &SyncSender<VR
     if !read_new_lines(fs, path, &mut pos, tx, &mut dropped) {
         return;
     }
-    for res in raw_rx {
+    while !stop.load(Ordering::SeqCst) {
+        let res = match raw_rx.recv_timeout(PUMP_POLL) {
+            Ok(result) => result,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
         match res {
             Ok(ev) if matches!(ev.kind, EventKind::Modify(_) | EventKind::Create(_)) => {
                 // Truncation/rotation: file shrank → restart from its new EOF.
@@ -622,6 +713,34 @@ mod tests {
         drop(second);
         drop(replacement);
         assert_eq!(ACTIVE.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn retained_idle_every_sources_hit_quota_and_dropping_reclaims_it() {
+        static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+        let evaluator = Evaluator::new(std::env::temp_dir());
+        let interval = Duration::from_secs(60 * 60);
+
+        let first = evaluator
+            .source_every_with_budget(interval, &ACTIVE, 2)
+            .unwrap();
+        let second = evaluator
+            .source_every_with_budget(interval, &ACTIVE, 2)
+            .unwrap();
+        let error = evaluator
+            .source_every_with_budget(interval, &ACTIVE, 2)
+            .unwrap_err();
+        assert_eq!(error.code, "stream_pump_limit");
+        assert!(error.hint.as_deref().unwrap_or_default().contains("drop"));
+
+        drop(first);
+        wait_until(|| ACTIVE.load(Ordering::Relaxed) == 1);
+        let replacement = evaluator
+            .source_every_with_budget(interval, &ACTIVE, 2)
+            .unwrap();
+        drop(second);
+        drop(replacement);
+        wait_until(|| ACTIVE.load(Ordering::Relaxed) == 0);
     }
 
     #[test]

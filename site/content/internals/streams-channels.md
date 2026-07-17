@@ -260,7 +260,9 @@ Full queues pace in a cancel-aware retry loop and never drop values. Capacity ze
 rendezvous: the producer can hold one pending item but no item is queued. The result preserves the
 input's boundedness. Parent cancellation, dropping the returned stream, or receiver disconnection
 stops the pump and releases the upstream. Buffer and stream-feed pumps share a process-wide maximum
-of 64 active pumps; the 65th returns `stream_pump_limit` until a lease is released.
+of 64 active workers with live `every`, `watch`, and `tail` sources; the 65th returns
+`stream_pump_limit` until a stream finishes or is dropped and its lease is released. Idle sources
+poll their stop flag, so retaining and dropping them has the same quota semantics as an active pump.
 
 `merge` alternates first refusal after every item. Two always-ready inputs therefore produce strict
 round-robin order; when one side times out or ends, the ready side continues without a skew queue.

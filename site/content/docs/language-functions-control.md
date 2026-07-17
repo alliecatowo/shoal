@@ -225,6 +225,8 @@ release.tag("candidate")
 - keeps private declarations available to exported closures;
 - rejects circular imports with a cycle diagnostic.
 
+The per-evaluator memo retains at most 1,024 distinct canonical module paths. At the cap, cached modules remain usable, while a new unique module is rejected with `module_cache_limit` before its source is read or any top-level code executes. Start a fresh evaluator session to load a different graph rather than evicting and replaying modules with side effects.
+
 `export let`, `export var`, and `export fn` are accepted at module top level. Exporting mutable state does not turn the module record into a general package manager; prefer function-mediated state where ownership matters.
 
 
