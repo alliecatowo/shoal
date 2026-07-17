@@ -136,15 +136,20 @@ channel capacity upstream.
 | `every(duration)` | one sleeping thread | `sync_channel(1)` | drop tick silently | `DateTime` |
 | `watch(path/glob)` | `notify` watcher thread | `sync_channel(64)` | owe one coalesced summary | event record |
 | `tail(path)` | `notify` + `Fs` reads | `sync_channel(64)` | count and report dropped lines | string or dropped marker |
-| `channel(name).events()` | session EventBus | unbounded `mpsc::channel` per subscriber | no subscriber backpressure bound | event record |
+| `channel(name).events()` | session EventBus | `sync_channel(replayed + 256)` per subscriber | drop + owed `{dropped: n}` marker event | event record |
 | finite value `.stream()` | caller pull | no producer buffer | exact | element |
 
-The last live-channel row is a significant exception to the general “bounded buffers” aspiration:
-EventBus subscribers use unbounded standard channels. `publish_local` holds the bus mutex while it
-clones and synchronously sends every event to every subscriber. Sends do not block only because each
-subscriber queue is unbounded; a stalled language subscriber can therefore accumulate unbounded live
-events even though replay history is capped, and large payload/fan-out cloning extends the critical
-section seen by every publisher/subscriber setup call.
+Live subscriber queues are bounded (HR-G3): each subscription's `sync_channel` capacity is its
+replay prefix (always delivered whole — replay is ring-bounded at 1,024 and never dropped) plus 256
+slots of live headroom. `publish_local` holds the bus mutex while it clones and `try_send`s to every
+subscriber; it never blocks on a slow consumer. A live event that finds a subscriber's queue full is
+dropped for that subscriber and counted; the debt is flushed — as one coalesced marker record
+`{channel, seq, ts, payload: null, dropped: n}` whose `seq` is the newest dropped event's sequence —
+by the first later publish that finds room. The marker travels with a publish, so a fully-drained
+queue with no further traffic holds the marker until the next event; `seq` is a cursor the consumer
+can hand to `.events(since: seq)` to replay whatever the ring still retains of the gap. Large
+payload/fan-out cloning still extends the bus critical section seen by every publisher/subscriber
+setup call.
 
 ## Timer state machine
 
@@ -305,7 +310,7 @@ The evaluator owns an `Arc<EventBus>` shared into selected child tasks. Each cha
 |---|---|
 | `next_seq` | monotonically increasing per-channel sequence, beginning at zero |
 | `ring` | newest 1,024 stored events |
-| `subs` | live sender list |
+| `subs` | live subscriber list: bounded sender + per-subscriber drop debt |
 
 Stored events contain sequence, nanosecond timestamp, and cloned payload. Consumer records are:
 
@@ -322,7 +327,7 @@ accDescr: Published events receive sequence numbers, enter a bounded replay ring
   Cursor["subscribe after cursor"] --> Replay["replay retained events"]
   Ring --> Replay
   Ring --> Fanout["live fan-out"]
-  Replay --> Queue["subscriber queue: 256"]
+  Replay --> Queue["subscriber queue: replay + 256"]
   Fanout --> Queue
   Queue --> Delivery["ordered delivery"]
   Queue -->|overflow| Drop["coalesced dropped marker + latest seq"]
@@ -370,7 +375,9 @@ recovery. “At least once” behavior comes from replaying retained records, no
 protocol.
 
 A cursor older than the retained ring silently starts at the oldest still-retained record; there is
-no explicit gap marker.
+no explicit gap marker for *replay*. A **live** delivery gap (subscriber-queue overflow, HR-G3) does
+get an explicit in-order marker: `{channel, seq, ts, payload: null, dropped: n}` with `seq` naming
+the newest dropped event.
 
 ## `on(channel, handler)` tasks
 
@@ -388,7 +395,6 @@ site.
 
 - `feed_bytes(Stream)` refuses stream-to-process stdin; incremental child-stdin pumping is absent.
 - Kernel `WireValue::Stream` carries only a label; there is no RPC cursor/pull/chunk lifecycle.
-- EventBus live subscriber queues are unbounded even though replay rings are bounded.
 - Dropped/coalesced markers widen stream element shapes without a static type system expressing it.
 - Timer and timing combinators use direct system time/sleep, reducing deterministic testability.
 - Watch existence/root discovery bypasses `Fs`; tail content reads use it.

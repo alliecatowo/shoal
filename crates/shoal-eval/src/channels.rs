@@ -16,7 +16,7 @@ use shoal_ast::Args;
 use shoal_exec::CancelToken;
 use shoal_value::{CallArgs, ErrorVal, Record, StreamVal, TaskVal, VResult, Value};
 use std::collections::{HashMap, VecDeque};
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -24,6 +24,16 @@ use std::time::Duration;
 /// user channel is evicted once past this — durable history is `.save(path)` or a
 /// journaled channel, never an unbounded ring.
 const RING_CAP: usize = 1024;
+
+/// Live headroom of each subscriber queue past its replay prefix (HR-G3,
+/// site/content/internals/streams-channels.md). A subscriber's `sync_channel`
+/// capacity is `replayed + SUB_QUEUE_CAP`: the replay prefix (ring-bounded, ≤
+/// [`RING_CAP`]) is always delivered whole, and live delivery then has at least
+/// this much slack before the overflow policy engages. Publishers only ever
+/// `try_send` — [`EventBus::emit`] must never block on a slow subscriber (it
+/// runs under the bus mutex, and a blocking send would deadlock the common
+/// single-threaded emit-then-drain pattern).
+const SUB_QUEUE_CAP: usize = 256;
 
 /// Which buffered events a new subscriber replays before going live.
 enum Replay {
@@ -57,11 +67,59 @@ struct Stored {
     payload: Value,
 }
 
+/// One live subscription: a bounded queue plus the drop debt owed to it
+/// (HR-G3). The overflow policy is the codebase-standard coalesce/drop
+/// discipline (`tee` forks, `tail` lines, `watch` events): a live event that
+/// finds the queue full is DROPPED (never blocked on) and counted, and the debt
+/// is flushed — as a single `{channel, seq, ts, dropped, payload: null}` marker
+/// record carrying the newest dropped `seq` — as soon as a later publish finds
+/// room. Loss is bounded-memory and never silent; `seq` lets the consumer
+/// resubscribe with `.events(since: seq)` to replay what the ring still holds.
+struct Subscriber {
+    tx: SyncSender<VResult<Value>>,
+    /// Live events dropped on a full queue since the last flushed marker.
+    dropped: u64,
+    /// `seq` of the newest dropped event (the marker's replay cursor).
+    last_dropped_seq: u64,
+}
+
+impl Subscriber {
+    /// Deliver one live event, honoring the bound. Returns `false` only when
+    /// the consumer is gone (its stream dropped) so the bus prunes this entry.
+    fn push(&mut self, name: &str, seq: u64, event: &Value) -> bool {
+        if self.dropped > 0 {
+            match self.tx.try_send(Ok(dropped_event_marker(
+                name,
+                self.last_dropped_seq,
+                self.dropped,
+            ))) {
+                Ok(()) => self.dropped = 0,
+                Err(TrySendError::Full(_)) => {
+                    // Still no room: this event joins the debt, marker stays owed.
+                    self.dropped += 1;
+                    self.last_dropped_seq = seq;
+                    return true;
+                }
+                Err(TrySendError::Disconnected(_)) => return false,
+            }
+        }
+        match self.tx.try_send(Ok(event.clone())) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) => {
+                self.dropped += 1;
+                self.last_dropped_seq = seq;
+                true
+            }
+            Err(TrySendError::Disconnected(_)) => false,
+        }
+    }
+}
+
 #[derive(Default)]
 struct ChannelState {
     next_seq: u64,
     ring: VecDeque<Stored>,
-    subs: Vec<Sender<VResult<Value>>>,
+    subs: Vec<Subscriber>,
 }
 
 /// A host-installed hook mirroring in-language emits onto an external bus
@@ -127,7 +185,7 @@ impl EventBus {
             st.ring.pop_front();
         }
         let event = event_record(name, seq, ts_ns, payload);
-        st.subs.retain(|tx| tx.send(Ok(event.clone())).is_ok());
+        st.subs.retain_mut(|sub| sub.push(name, seq, &event));
         seq
     }
 
@@ -148,17 +206,30 @@ impl EventBus {
         self.subscribe(name, Replay::from_since(since))
     }
 
-    /// Register a subscriber with the given replay policy.
+    /// Register a subscriber with the given replay policy. The queue is BOUNDED
+    /// (HR-G3): its capacity is the replay prefix (ring-bounded, ≤ [`RING_CAP`],
+    /// always delivered whole — replay is never dropped) plus
+    /// [`SUB_QUEUE_CAP`] slots of live headroom; live overflow follows
+    /// [`Subscriber`]'s drop-and-marker policy.
     fn subscribe(&self, name: &str, replay: Replay) -> Receiver<VResult<Value>> {
-        let (tx, rx) = channel();
         let mut map = self.channels.lock().unwrap();
         let st = map.entry(name.to_string()).or_default();
-        for s in &st.ring {
-            if replay.wants(s.seq) {
-                let _ = tx.send(Ok(event_record(name, s.seq, s.ts_ns, &s.payload)));
-            }
+        let replayed: Vec<_> = st
+            .ring
+            .iter()
+            .filter(|s| replay.wants(s.seq))
+            .map(|s| event_record(name, s.seq, s.ts_ns, &s.payload))
+            .collect();
+        let (tx, rx) = sync_channel(replayed.len() + SUB_QUEUE_CAP);
+        for event in replayed {
+            // Capacity covers the whole replay prefix, so this never blocks.
+            let _ = tx.try_send(Ok(event));
         }
-        st.subs.push(tx);
+        st.subs.push(Subscriber {
+            tx,
+            dropped: 0,
+            last_dropped_seq: 0,
+        });
         rx
     }
 
@@ -191,6 +262,25 @@ fn event_record(name: &str, seq: u64, ts_ns: i128, payload: &Value) -> Value {
     r.insert("seq".into(), Value::Int(seq as i64));
     r.insert("ts".into(), datetime_from_ns(ts_ns));
     r.insert("payload".into(), payload.clone());
+    Value::Record(r)
+}
+
+/// The subscriber-overflow marker record (HR-G3): the event shape widened with
+/// a `dropped` count, `payload: null` (so `.payload` projections stay total),
+/// and `seq` = the newest DROPPED event's sequence — the cursor to hand back to
+/// `.events(since: seq)` if the consumer wants the ring's retained copy of what
+/// it missed. Distinguish it from a real event by the `dropped` field, exactly
+/// like `tail`'s `{dropped: n}` line marker.
+fn dropped_event_marker(name: &str, seq: u64, dropped: u64) -> Value {
+    let mut r = Record::new();
+    r.insert("channel".into(), Value::Str(name.to_string()));
+    r.insert("seq".into(), Value::Int(seq as i64));
+    r.insert("ts".into(), datetime_from_ns(now_ns()));
+    r.insert("payload".into(), Value::Null);
+    r.insert(
+        "dropped".into(),
+        Value::Int(dropped.min(i64::MAX as u64) as i64),
+    );
     Value::Record(r)
 }
 
@@ -389,5 +479,107 @@ fn datetime_from_ns(ns: i128) -> Value {
     match jiff::Timestamp::from_nanosecond(ns) {
         Ok(ts) => Value::DateTime(Box::new(ts.to_zoned(jiff::tz::TimeZone::system()))),
         Err(_) => Value::Null,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn field(v: &Value, key: &str) -> Value {
+        match v {
+            Value::Record(r) => r.get(key).cloned().unwrap_or(Value::Null),
+            other => panic!("expected an event record, got {other:?}"),
+        }
+    }
+
+    /// HR-G3: a stalled live subscriber accumulates at most `SUB_QUEUE_CAP`
+    /// events; the overflow is dropped (the publisher never blocks) and owed as
+    /// one coalesced `{dropped: n, seq: <newest dropped>}` marker, flushed by
+    /// the first publish that finds room again.
+    #[test]
+    fn stalled_subscriber_queue_is_bounded_with_a_coalesced_drop_marker() {
+        let bus = EventBus::default();
+        let rx = bus.events("c", None); // empty ring → capacity is exactly SUB_QUEUE_CAP
+        let burst = SUB_QUEUE_CAP as i64 + 44;
+        for i in 0..burst {
+            bus.emit("c", Value::Int(i)); // never blocks, even with no consumer
+        }
+        // The queued prefix is intact and in order.
+        for i in 0..SUB_QUEUE_CAP as i64 {
+            let ev = rx.try_recv().expect("queued event").expect("ok event");
+            assert_eq!(field(&ev, "payload"), Value::Int(i));
+        }
+        // Nothing else is buffered: the 44 overflowed events were dropped, and
+        // the owed marker travels with the NEXT publish (not before).
+        assert!(rx.try_recv().is_err(), "no unbounded backlog");
+        bus.emit("c", Value::Int(999));
+        let marker = rx.try_recv().expect("marker").expect("ok");
+        assert_eq!(field(&marker, "dropped"), Value::Int(44));
+        assert_eq!(
+            field(&marker, "seq"),
+            Value::Int(burst - 1),
+            "marker seq is the newest dropped event's seq (a since-cursor)"
+        );
+        assert_eq!(field(&marker, "payload"), Value::Null);
+        let live = rx.try_recv().expect("live event").expect("ok");
+        assert_eq!(field(&live, "payload"), Value::Int(999));
+    }
+
+    /// HR-G3: while the queue stays full, further drops COALESCE into the owed
+    /// marker (its count grows, its seq advances) — one marker per gap, not one
+    /// per dropped event.
+    #[test]
+    fn drops_coalesce_into_one_marker_while_the_queue_stays_full() {
+        let bus = EventBus::default();
+        let rx = bus.events("c", None);
+        for i in 0..(SUB_QUEUE_CAP as i64 + 10) {
+            bus.emit("c", Value::Int(i));
+        }
+        for _ in 0..SUB_QUEUE_CAP {
+            rx.try_recv().expect("queued").expect("ok");
+        }
+        bus.emit("c", Value::Int(-1)); // flushes marker, then delivers this event
+        let marker = rx.try_recv().expect("marker").expect("ok");
+        assert_eq!(field(&marker, "dropped"), Value::Int(10));
+        assert_eq!(
+            field(&rx.try_recv().expect("live").expect("ok"), "payload"),
+            Value::Int(-1)
+        );
+    }
+
+    /// HR-G3: the replay prefix is NEVER subject to the live bound — a full
+    /// ring (RING_CAP > SUB_QUEUE_CAP) replays whole, with no drop marker.
+    #[test]
+    fn full_ring_replay_is_delivered_whole_without_drops() {
+        let bus = EventBus::default();
+        for i in 0..RING_CAP as i64 {
+            bus.emit("c", Value::Int(i));
+        }
+        let rx = bus.events("c", None);
+        let mut n = 0;
+        while let Ok(ev) = rx.try_recv() {
+            let ev = ev.expect("ok event");
+            assert_eq!(field(&ev, "payload"), Value::Int(n), "in order, no marker");
+            n += 1;
+        }
+        assert_eq!(n, RING_CAP as i64, "the whole retained ring replayed");
+    }
+
+    /// A dead subscriber (receiver dropped) is pruned on the next publish
+    /// rather than accumulating; live siblings are unaffected.
+    #[test]
+    fn dead_subscribers_are_pruned_and_siblings_unaffected() {
+        let bus = EventBus::default();
+        let dead = bus.events("c", None);
+        let live = bus.events("c", None);
+        drop(dead);
+        bus.emit("c", Value::Int(7));
+        assert_eq!(
+            field(&live.try_recv().expect("live").expect("ok"), "payload"),
+            Value::Int(7)
+        );
+        let map = bus.channels.lock().unwrap();
+        assert_eq!(map.get("c").unwrap().subs.len(), 1, "dead sub pruned");
     }
 }
