@@ -246,15 +246,16 @@ AArch64 on Linux and macOS.
 
 The documented allowlist lives at **`.cargo/audit.toml`** — this is `cargo-audit`'s own
 auto-discovered config path (a bare root-level `audit.toml` is silently ignored by the tool; this
-was verified locally before landing the CI job). Every ignored `RUSTSEC-*` ID carries an inline
-comment with its root cause and the condition for revisiting it. As of this writing every ignored
-advisory traces to one dependency: `shoal-wasm`'s `wasmtime = "37"` pin, whose fix for each current
-advisory requires a major-version bump (to `>=42.0.2`) rather than a same-major patch — a dependency
-change intentionally left to a separate pass rather than bundled into lint/CI hygiene work. The
-config also sets `output.deny = ["unmaintained", "unsound", "yanked"]`, so an unmaintained/unsound
-crate or a yanked version newly appearing in `Cargo.lock` fails the gate even though none exist
-today. Re-run `cargo audit` locally (same command CI uses) after any dependency bump and prune
-allowlist entries that no longer apply.
+was verified locally before landing the CI job). Any ignored `RUSTSEC-*` ID must carry an inline
+comment with its root cause and the condition for revisiting it. The allowlist previously held 15
+entries, every one tracing to `shoal-wasm`'s `wasmtime = "37"` pin, whose fix for each advisory
+required a major-version bump (to `>=42.0.2`, two entries needed `>=43.0.2`) rather than a
+same-major patch. That bump has landed — `shoal-wasm` now depends on `wasmtime = "46.0.1"` — and
+`cargo audit` against the resulting `Cargo.lock` reports zero vulnerabilities, so the allowlist is
+empty again. The config also sets `output.deny = ["unmaintained", "unsound", "yanked"]`, so an
+unmaintained/unsound crate or a yanked version newly appearing in `Cargo.lock` fails the gate even
+though none exist today. Re-run `cargo audit` locally (same command CI uses) after any dependency
+bump and prune allowlist entries that no longer apply.
 
 ### The `shoal-wasm` compile cost decision (HR-F8)
 
@@ -283,6 +284,13 @@ lands.** Reasoning:
 
 Revisit this decision (separate job, feature flag, or drop from `--workspace` defaults) if the
 compile/cache cost becomes a measured CI bottleneck before WASM dispatch integration begins.
+
+`wasmtime` was bumped from `37` to `46.0.1` to clear the RUSTSEC allowlist above (Supply-chain
+advisories, HR-F6). That bump did not materially change this decision's inputs: the
+`wasmtime`/`cranelift`-family dependency subtree shrank slightly, from 37 to 34 crates (`Cargo.lock`
+dropped `wasmtime-internal-asm-macros`, `-math`, `-slab`, and `-winch`, adding only
+`wasmtime-internal-core`), and total workspace packages went from 418 to 417. `shoal-wasm`'s own
+source needed no API adaptation across the jump.
 
 
 Every member crate opts in with `[lints] workspace = true` (HR-F1,
