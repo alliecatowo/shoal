@@ -219,6 +219,8 @@ There is no `on channel(...) { ... }` keyword form; `on(...)` is a function call
 
 In a kernel-hosted session, only channels beginning with `user.` bridge bidirectionally between language code and the external event bus. This prevents language code from spoofing kernel-owned semantic channels such as approvals, journal notifications, or session transcript events.
 
+Wire `events.publish` treats the wire event as authoritative and reports the language-side result in `language_mirror`. A full or quarantined bounded language bus returns `language_mirror.ok = false`; the wire event remains committed, so clients should not retry it as though the publish itself failed.
+
 ```mermaid
 flowchart LR
 accTitle: Kernel bridge

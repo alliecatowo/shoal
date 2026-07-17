@@ -772,6 +772,42 @@ fn user_publish_rejects_huge_deep_and_invalid_channels_before_retention() {
 }
 
 #[test]
+fn wire_publish_reports_language_mirror_degradation_without_duplicate_retry_signal() {
+    let kernel = Kernel::new();
+    let mut attached = attachment(&kernel, "language-mirror-cap");
+    let session = attached.as_ref().unwrap().session.clone();
+    for n in 0..64 {
+        session
+            .lang_bus
+            .try_inject(&format!("user.language-{n}"), shoal_value::Value::Null)
+            .unwrap();
+    }
+
+    let published = kernel
+        .handle_events_publish(
+            json!({"channel":"user.wire-only","payload":{"n":65}}),
+            &mut attached,
+        )
+        .expect("the authoritative wire publish remains successful");
+    assert_eq!(published["seq"], 0);
+    assert_eq!(published["language_mirror"]["ok"], false);
+    assert_eq!(
+        published["language_mirror"]["error"]["code"],
+        "channel_registry_limit"
+    );
+    assert_eq!(
+        session.lang_bus.latest("user.wire-only").unwrap(),
+        shoal_value::Value::Null
+    );
+
+    let read = kernel
+        .handle_events_read(json!({"channel":"user.wire-only"}), &mut attached)
+        .unwrap();
+    assert_eq!(read["events"].as_array().unwrap().len(), 1);
+    assert_eq!(read["events"][0]["payload"], json!({"n":65}));
+}
+
+#[test]
 fn user_channel_identity_churn_is_bounded_per_exact_owner() {
     let bus = EventBus::default();
     let alpha = owner("channel-churn-alpha");

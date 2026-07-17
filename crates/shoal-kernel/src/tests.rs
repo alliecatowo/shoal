@@ -3375,7 +3375,10 @@ fn events_publish_read_roundtrips_on_a_user_channel() {
             "events.publish",
             json!({"channel":"user.deploy","payload":{"$":"str","v":v}}),
         );
-        assert_eq!(published.result.unwrap()["seq"], i as i64);
+        let published = published.result.unwrap();
+        assert_eq!(published["seq"], i as i64);
+        assert_eq!(published["language_mirror"]["ok"], true);
+        assert_eq!(published["language_mirror"]["seq"], i as i64);
     }
     let read = call(
         &mut client,

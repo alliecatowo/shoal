@@ -887,14 +887,27 @@ impl Kernel {
             &p.channel,
             p.payload.clone(),
         )?;
-        // One substrate, reverse direction: a wire publish is also visible to
-        // the session's in-language channels (`channel("user.x").latest()` /
-        // `.events()`), via `inject` — which never re-forwards, so the event
-        // cannot echo back onto the wire bus. Uses the cached bus handle, NOT
-        // the evaluator lock — a long-running exec must not stall publishes.
+        // Reverse direction: a wire publish is normally also visible to the
+        // session's in-language channels (`channel("user.x").latest()` /
+        // `.events()`). The wire event is already authoritative at this point,
+        // so a quarantined/full language bus is reported as mirror degradation
+        // in the successful result rather than turning a committed publish into
+        // a retryable RPC error. `try_inject` never re-forwards, so no echo loop
+        // is possible. The cached bus avoids waiting on the evaluator lock.
         let payload = shoal_value::json_to_value(&p.payload);
-        attachment.session.lang_bus.inject(&p.channel, payload);
-        encode(json!({"channel": event.channel, "seq": event.seq, "ts": event.ts}))
+        let language_mirror = match attachment.session.lang_bus.try_inject(&p.channel, payload) {
+            Ok(seq) => json!({"ok":true,"seq":seq}),
+            Err(error) => json!({
+                "ok":false,
+                "error":{"code":error.code,"message":error.msg},
+            }),
+        };
+        encode(json!({
+            "channel": event.channel,
+            "seq": event.seq,
+            "ts": event.ts,
+            "language_mirror": language_mirror,
+        }))
     }
 
     pub(crate) fn handle_events_subscribe(

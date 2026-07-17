@@ -401,7 +401,10 @@ calling the forwarder, preventing echo loops.
 
 The promise is a bridged shape and naming rule, not one shared in-memory bus implementation: kernel
 and evaluator maintain their own ring/sequence state. Forwarded events can therefore receive a
-different sequence on the other side.
+different sequence on the other side. A wire `events.publish` result reports `language_mirror.ok`
+and the language-side sequence. The wire publish remains committed if the bounded language bus is
+full or quarantined; the result reports a typed mirror error so clients do not retry and duplicate
+the authoritative wire event.
 
 ## Channel handle and methods
 

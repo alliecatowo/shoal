@@ -495,7 +495,7 @@ exact owner, so an accidentally permissive configuration cannot make subscriptio
 | Method | Params | Result/behavior |
 |---|---|---|
 | `events.read` | `{channel,since?,limit?}` | `{channel,events,page}`; forward page, `since` exclusive; omitted limit 256, zero empty, maximum 256 |
-| `events.publish` | `{channel,payload}` | only `user.*`; returns channel/seq/ts and injects language bus |
+| `events.publish` | `{channel,payload}` | only `user.*`; returns channel/seq/ts plus `language_mirror:{ok,seq?}` |
 | `events.subscribe` | `{channel,since?}` | registers this connection; replays ring then pushes notifications |
 | `events.unsubscribe` | `{channel,since?}` | closes/removes this connection/channel queue; `since` ignored |
 
@@ -510,7 +510,11 @@ sequence cursor. Approval, render, task, and `user.*` channels are ring-only and
 `events.publish` rejects kernel-owned names and validates before the first retained clone: channel
 names are at most 128 ASCII bytes, user payloads at most 64 KiB encoded and 64 levels deep, and one
 exact owner may retain at most 256 distinct `user.*` channel identities. It then mirrors the JSON
-payload into the attached evaluator's language EventBus without holding the evaluator lock.
+payload into the attached evaluator's language EventBus without holding the evaluator lock. The wire
+event is the authoritative RPC commit. `language_mirror.ok` is `true` with that bus's local sequence
+when injection succeeds; if the language bus is full or quarantined, the publish still succeeds and
+returns `ok:false` with a typed bounded error instead of inviting a retry that would duplicate the
+already-committed wire event.
 Language-originated `user.*` emits pass through the same wire-bus admission and do not echo on
 injection. These limits are per exact principal/session.
 
