@@ -1,13 +1,17 @@
 use serde::Deserialize;
 use std::{
     collections::BTreeMap,
-    fs,
+    fs::{self, File},
+    io::Read,
     path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
 };
 use wasmtime::{
     Config, Engine, Store, StoreLimits, StoreLimitsBuilder,
     component::{Component, Linker},
 };
+
 #[derive(Debug, thiserror::Error)]
 pub enum PluginError {
     #[error("manifest {path}: {message}")]
@@ -19,6 +23,7 @@ pub enum PluginError {
     #[error("plugin `{0}` not found")]
     NotFound(String),
 }
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
@@ -32,12 +37,14 @@ pub struct Manifest {
     #[serde(default)]
     pub effects: Vec<String>,
 }
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommandDecl {
     pub name: String,
     pub signature: String,
 }
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MethodDecl {
@@ -45,71 +52,162 @@ pub struct MethodDecl {
     pub name: String,
     pub signature: String,
 }
+
 impl Manifest {
     pub fn load(path: &Path) -> Result<Self, PluginError> {
-        let src = fs::read_to_string(path).map_err(|e| PluginError::Manifest {
+        Self::load_bounded(path, Limits::default().manifest_bytes)
+    }
+
+    fn load_bounded(path: &Path, max_bytes: usize) -> Result<Self, PluginError> {
+        let bytes = read_at_most(path, max_bytes).map_err(|message| PluginError::Manifest {
             path: path.into(),
-            message: e.to_string(),
+            message,
         })?;
-        let mut m: Self = toml::from_str(&src).map_err(|e| PluginError::Manifest {
+        let src = String::from_utf8(bytes).map_err(|error| PluginError::Manifest {
             path: path.into(),
-            message: e.to_string(),
+            message: format!("manifest is not UTF-8: {error}"),
         })?;
-        if m.name.is_empty() || m.version.is_empty() {
+        let mut manifest: Self = toml::from_str(&src).map_err(|error| PluginError::Manifest {
+            path: path.into(),
+            message: error.to_string(),
+        })?;
+        if manifest.name.trim().is_empty() || manifest.version.trim().is_empty() {
             return Err(PluginError::Manifest {
                 path: path.into(),
                 message: "name and version are required".into(),
             });
         }
-        if m.component.is_relative() {
-            m.component = path.parent().unwrap_or(Path::new(".")).join(&m.component)
+        if manifest.component.is_relative() {
+            manifest.component = path
+                .parent()
+                .unwrap_or(Path::new("."))
+                .join(&manifest.component);
         }
-        Ok(m)
+        Ok(manifest)
     }
 }
+
+fn read_at_most(path: &Path, max_bytes: usize) -> Result<Vec<u8>, String> {
+    let file = File::open(path).map_err(|error| error.to_string())?;
+    let read_limit = max_bytes.saturating_add(1);
+    let mut bytes = Vec::with_capacity(read_limit.min(64 * 1024));
+    file.take(read_limit as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() > max_bytes {
+        return Err(format!(
+            "file exceeds the {max_bytes}-byte validation limit"
+        ));
+    }
+    Ok(bytes)
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
     pub fuel: u64,
+    /// Maximum bytes in each linear memory. `memories` separately bounds how
+    /// many memories may exist, making the aggregate ceiling explicit.
     pub memory_bytes: usize,
+    pub memories: usize,
+    /// Maximum elements in each table. `tables` separately bounds the count.
     pub table_elements: usize,
+    pub tables: usize,
     pub instances: usize,
+    pub manifest_bytes: usize,
+    pub component_bytes: usize,
+    /// Coarse wall deadline for guest code run during instantiation. Component
+    /// compilation is instead bounded by `component_bytes` because Wasmtime's
+    /// synchronous compiler is not epoch-interruptible.
+    pub wall_time: Duration,
 }
+
 impl Default for Limits {
     fn default() -> Self {
         Self {
             fuel: 10_000_000,
             memory_bytes: 64 * 1024 * 1024,
+            memories: 1,
             table_elements: 10_000,
+            tables: 4,
             instances: 16,
+            manifest_bytes: 256 * 1024,
+            component_bytes: 16 * 1024 * 1024,
+            wall_time: Duration::from_secs(2),
         }
     }
 }
+
 struct State {
     limits: StoreLimits,
 }
+
+/// A component whose exact bytes were bounded, hashed, compiled, and
+/// instantiated under the configured validation limits. Invocation must use
+/// `component`, never re-read `manifest.component`, so a later file or symlink
+/// replacement cannot swap in unvalidated code.
+pub struct ValidatedPlugin {
+    manifest: Manifest,
+    bytes: Arc<[u8]>,
+    digest: blake3::Hash,
+    component: Component,
+}
+
+impl ValidatedPlugin {
+    pub fn manifest(&self) -> &Manifest {
+        &self.manifest
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn digest(&self) -> blake3::Hash {
+        self.digest
+    }
+
+    pub fn component(&self) -> &Component {
+        &self.component
+    }
+}
+
 pub struct Host {
     engine: Engine,
     limits: Limits,
 }
+
 impl Host {
     pub fn new(limits: Limits) -> Result<Self, PluginError> {
-        let mut c = Config::new();
-        c.wasm_component_model(true).consume_fuel(true);
-        let engine = Engine::new(&c).map_err(|e| PluginError::Component {
+        let mut config = Config::new();
+        config
+            .wasm_component_model(true)
+            .consume_fuel(true)
+            .epoch_interruption(true);
+        let engine = Engine::new(&config).map_err(|error| PluginError::Component {
             name: "engine".into(),
-            message: e.to_string(),
+            message: error.to_string(),
         })?;
         Ok(Self { engine, limits })
     }
-    pub fn validate(&self, manifest: &Manifest) -> Result<(), PluginError> {
-        let bytes = fs::read(&manifest.component).map_err(|e| PluginError::Component {
-            name: manifest.name.clone(),
-            message: e.to_string(),
-        })?;
-        let component =
-            Component::new(&self.engine, bytes).map_err(|e| PluginError::Component {
+
+    pub fn validate(&self, manifest: Manifest) -> Result<ValidatedPlugin, PluginError> {
+        let bytes =
+            read_at_most(&manifest.component, self.limits.component_bytes).map_err(|message| {
+                PluginError::Component {
+                    name: manifest.name.clone(),
+                    message,
+                }
+            })?;
+        if bytes.is_empty() {
+            return Err(PluginError::Component {
                 name: manifest.name.clone(),
-                message: e.to_string(),
+                message: "component file is empty".into(),
+            });
+        }
+        let digest = blake3::hash(&bytes);
+        let component =
+            Component::new(&self.engine, &bytes).map_err(|error| PluginError::Component {
+                name: manifest.name.clone(),
+                message: error.to_string(),
             })?;
         let imports = component
             .component_type()
@@ -122,33 +220,95 @@ impl Host {
                 message: format!("no ambient imports are available: {}", imports.join(", ")),
             });
         }
-        let limits = StoreLimitsBuilder::new()
+
+        let store_limits = StoreLimitsBuilder::new()
             .memory_size(self.limits.memory_bytes)
+            .memories(self.limits.memories)
             .table_elements(self.limits.table_elements)
+            .tables(self.limits.tables)
             .instances(self.limits.instances)
+            .trap_on_grow_failure(true)
             .build();
-        let mut store = Store::new(&self.engine, State { limits });
-        store.limiter(|s| &mut s.limits);
+        let mut store = Store::new(
+            &self.engine,
+            State {
+                limits: store_limits,
+            },
+        );
+        store.limiter(|state| &mut state.limits);
         store
             .set_fuel(self.limits.fuel)
-            .map_err(|e| PluginError::Component {
+            .map_err(|error| PluginError::Component {
                 name: manifest.name.clone(),
-                message: e.to_string(),
+                message: error.to_string(),
             })?;
+        #[cfg(target_has_atomic = "64")]
+        store.set_epoch_deadline(1);
+
         let linker = Linker::<State>::new(&self.engine);
-        linker
-            .instantiate(&mut store, &component)
-            .map_err(|e| PluginError::Component {
-                name: manifest.name.clone(),
-                message: format!("no ambient imports are available: {e}"),
-            })?;
-        Ok(())
+        self.instantiate_with_deadline(&manifest.name, &mut store, &linker, &component)?;
+        Ok(ValidatedPlugin {
+            manifest,
+            bytes: bytes.into(),
+            digest,
+            component,
+        })
+    }
+
+    fn instantiate_with_deadline(
+        &self,
+        name: &str,
+        store: &mut Store<State>,
+        linker: &Linker<State>,
+        component: &Component,
+    ) -> Result<(), PluginError> {
+        let instantiate = || {
+            linker
+                .instantiate(store, component)
+                .map(|_| ())
+                .map_err(|error| PluginError::Component {
+                    name: name.to_string(),
+                    message: error.to_string(),
+                })
+        };
+
+        #[cfg(target_has_atomic = "64")]
+        {
+            let (cancel_tx, cancel_rx) = std::sync::mpsc::channel();
+            std::thread::scope(|scope| {
+                let engine = self.engine.clone();
+                let wall_time = self.limits.wall_time;
+                let timer = std::thread::Builder::new()
+                    .name("shoal-wasm-deadline".into())
+                    .spawn_scoped(scope, move || {
+                        if cancel_rx.recv_timeout(wall_time).is_err() {
+                            engine.increment_epoch();
+                        }
+                    })
+                    .map_err(|error| PluginError::Component {
+                        name: name.to_string(),
+                        message: format!("failed to start deadline guard: {error}"),
+                    })?;
+                let result = instantiate();
+                let _ = cancel_tx.send(());
+                timer.join().map_err(|_| PluginError::Component {
+                    name: name.to_string(),
+                    message: "deadline guard panicked".into(),
+                })?;
+                result
+            })
+        }
+
+        #[cfg(not(target_has_atomic = "64"))]
+        instantiate()
     }
 }
+
 pub struct Registry {
     host: Host,
-    plugins: BTreeMap<String, Manifest>,
+    plugins: BTreeMap<String, ValidatedPlugin>,
 }
+
 impl Registry {
     pub fn new(limits: Limits) -> Result<Self, PluginError> {
         Ok(Self {
@@ -156,92 +316,215 @@ impl Registry {
             plugins: BTreeMap::new(),
         })
     }
+
     pub fn load_manifest(&mut self, path: &Path) -> Result<(), PluginError> {
-        let m = Manifest::load(path)?;
-        if self.plugins.contains_key(&m.name) {
-            return Err(PluginError::Duplicate(m.name));
+        let manifest = Manifest::load_bounded(path, self.host.limits.manifest_bytes)?;
+        if self.plugins.contains_key(&manifest.name) {
+            return Err(PluginError::Duplicate(manifest.name));
         }
-        self.host.validate(&m)?;
-        self.plugins.insert(m.name.clone(), m);
+        let plugin = self.host.validate(manifest)?;
+        self.plugins.insert(plugin.manifest.name.clone(), plugin);
         Ok(())
     }
+
     pub fn load_dir(&mut self, dir: &Path) -> Vec<PluginError> {
-        let mut paths = match fs::read_dir(dir) {
-            Ok(x) => x
-                .filter_map(Result::ok)
-                .map(|x| x.path())
-                .filter(|p| p.extension().is_some_and(|x| x == "toml"))
-                .collect::<Vec<_>>(),
-            Err(e) => {
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) => {
                 return vec![PluginError::Manifest {
                     path: dir.into(),
-                    message: e.to_string(),
+                    message: error.to_string(),
                 }];
             }
         };
+        let mut paths = Vec::new();
+        let mut errors = Vec::new();
+        for entry in entries {
+            match entry {
+                Ok(entry) => {
+                    let path = entry.path();
+                    if path
+                        .extension()
+                        .is_some_and(|extension| extension == "toml")
+                    {
+                        paths.push(path);
+                    }
+                }
+                Err(error) => errors.push(PluginError::Manifest {
+                    path: dir.into(),
+                    message: format!("cannot read directory entry: {error}"),
+                }),
+            }
+        }
         paths.sort();
-        paths
-            .into_iter()
-            .filter_map(|p| self.load_manifest(&p).err())
-            .collect()
+        errors.extend(
+            paths
+                .into_iter()
+                .filter_map(|path| self.load_manifest(&path).err()),
+        );
+        errors
     }
-    pub fn get(&self, name: &str) -> Option<&Manifest> {
+
+    pub fn get(&self, name: &str) -> Option<&ValidatedPlugin> {
         self.plugins.get(name)
     }
+
     pub fn len(&self) -> usize {
         self.plugins.len()
     }
+
     pub fn is_empty(&self) -> bool {
         self.plugins.is_empty()
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
+
     fn fixture(wat: &str) -> (tempfile::TempDir, PathBuf) {
-        let t = tempfile::tempdir().unwrap();
-        let component = t.path().join("p.wasm");
+        let temp = tempfile::tempdir().unwrap();
+        let component = temp.path().join("p.wasm");
         fs::write(&component, wat).unwrap();
-        let manifest = t.path().join("p.toml");
+        let manifest = temp.path().join("p.toml");
         fs::write(
             &manifest,
             "name='test'\nversion='0.1'\ncomponent='p.wasm'\neffects=[]\n",
         )
         .unwrap();
-        (t, manifest)
+        (temp, manifest)
     }
+
     #[test]
-    fn accepts_empty_component_without_imports() {
-        let (_t, p) = fixture("(component)");
-        let mut r = Registry::new(Limits::default()).unwrap();
-        r.load_manifest(&p).unwrap();
-        assert_eq!(r.len(), 1)
+    fn accepts_component_without_imports() {
+        let (_temp, path) = fixture("(component)");
+        let mut registry = Registry::new(Limits::default()).unwrap();
+        registry.load_manifest(&path).unwrap();
+        assert_eq!(registry.len(), 1);
+        assert!(!registry.get("test").unwrap().bytes().is_empty());
     }
+
     #[test]
     fn rejects_ambient_import() {
-        let (_t, p) = fixture("(component (import \"wasi:filesystem/types@0.2.0\" (instance)))");
-        let mut r = Registry::new(Limits::default()).unwrap();
-        let e = r.load_manifest(&p).unwrap_err().to_string();
-        assert!(e.contains("no ambient imports"))
+        let (_temp, path) =
+            fixture("(component (import \"wasi:filesystem/types@0.2.0\" (instance)))");
+        let mut registry = Registry::new(Limits::default()).unwrap();
+        let error = registry.load_manifest(&path).unwrap_err().to_string();
+        assert!(error.contains("no ambient imports"));
     }
+
     #[test]
-    fn rejects_core_module_and_bad_manifest() {
-        let (_t, p) = fixture("(module)");
-        let mut r = Registry::new(Limits::default()).unwrap();
-        assert!(r.load_manifest(&p).is_err());
-        let t = tempfile::tempdir().unwrap();
-        let p = t.path().join("x.toml");
-        fs::write(&p, "name='x'\nunknown=1").unwrap();
-        assert!(Manifest::load(&p).is_err())
+    fn rejects_core_module_bad_manifest_and_empty_file() {
+        let (_temp, path) = fixture("(module)");
+        let mut registry = Registry::new(Limits::default()).unwrap();
+        assert!(registry.load_manifest(&path).is_err());
+
+        let temp = tempfile::tempdir().unwrap();
+        let bad_manifest = temp.path().join("x.toml");
+        fs::write(&bad_manifest, "name='x'\nunknown=1").unwrap();
+        assert!(Manifest::load(&bad_manifest).is_err());
+
+        let (_temp, path) = fixture("");
+        assert!(registry.load_manifest(&path).is_err());
     }
+
     #[test]
     fn duplicate_is_deterministic() {
-        let (_t, p) = fixture("(component)");
-        let mut r = Registry::new(Limits::default()).unwrap();
-        r.load_manifest(&p).unwrap();
+        let (_temp, path) = fixture("(component)");
+        let mut registry = Registry::new(Limits::default()).unwrap();
+        registry.load_manifest(&path).unwrap();
         assert!(matches!(
-            r.load_manifest(&p),
+            registry.load_manifest(&path),
             Err(PluginError::Duplicate(_))
-        ))
+        ));
+    }
+
+    #[test]
+    fn artifact_is_bound_to_the_validated_bytes_and_digest() {
+        let (temp, path) = fixture("(component)");
+        let original = fs::read(temp.path().join("p.wasm")).unwrap();
+        let mut registry = Registry::new(Limits::default()).unwrap();
+        registry.load_manifest(&path).unwrap();
+        fs::write(temp.path().join("p.wasm"), b"not wasm anymore").unwrap();
+
+        let plugin = registry.get("test").unwrap();
+        assert_eq!(plugin.bytes(), original);
+        assert_eq!(plugin.digest(), blake3::hash(&original));
+        assert_eq!(
+            plugin
+                .component()
+                .component_type()
+                .imports(plugin.component().engine())
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn manifest_and_component_reads_are_bounded() {
+        let (_temp, path) = fixture("(component)");
+        let mut registry = Registry::new(Limits {
+            manifest_bytes: 8,
+            ..Limits::default()
+        })
+        .unwrap();
+        assert!(registry.load_manifest(&path).is_err());
+
+        let (_temp, path) = fixture("(component)");
+        let mut registry = Registry::new(Limits {
+            component_bytes: 4,
+            ..Limits::default()
+        })
+        .unwrap();
+        let error = registry.load_manifest(&path).unwrap_err().to_string();
+        assert!(error.contains("4-byte validation limit"), "{error}");
+    }
+
+    #[test]
+    fn aggregate_memory_count_and_per_memory_size_are_enforced() {
+        let (_temp, path) =
+            fixture("(component (core module $m (memory 2)) (core instance (instantiate $m)))");
+        let mut registry = Registry::new(Limits {
+            memory_bytes: 64 * 1024,
+            ..Limits::default()
+        })
+        .unwrap();
+        assert!(registry.load_manifest(&path).is_err());
+
+        let (_temp, path) = fixture(
+            "(component
+                (core module $m (memory 1))
+                (core instance (instantiate $m))
+                (core instance (instantiate $m)))",
+        );
+        let mut registry = Registry::new(Limits {
+            memories: 1,
+            instances: 4,
+            ..Limits::default()
+        })
+        .unwrap();
+        assert!(registry.load_manifest(&path).is_err());
+    }
+
+    #[cfg(target_has_atomic = "64")]
+    #[test]
+    fn wall_deadline_interrupts_nonterminating_start_code() {
+        let (_temp, path) = fixture(
+            "(component
+                (core module $m
+                    (func $start (loop $forever (br $forever)))
+                    (start $start))
+                (core instance (instantiate $m)))",
+        );
+        let mut registry = Registry::new(Limits {
+            fuel: u64::MAX,
+            wall_time: Duration::from_millis(20),
+            ..Limits::default()
+        })
+        .unwrap();
+        let start = Instant::now();
+        assert!(registry.load_manifest(&path).is_err());
+        assert!(start.elapsed() < Duration::from_secs(1));
     }
 }
