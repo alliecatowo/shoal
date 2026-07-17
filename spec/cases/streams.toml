@@ -66,10 +66,9 @@ src = '["a", "b", "c"].stream().enumerate().collect()'
 value = '[[0, "a"], [1, "b"], [2, "c"]]'
 
 [[case]]
-name = "stream-buffer-explicitly-unsupported"
+name = "stream-buffer-preserves-finite-values"
 src = '[1, 2, 3].stream().buffer(2).collect()'
-error = "stream_buffer_unsupported"
-error_contains = "cannot decouple"
+value = "[1, 2, 3]"
 
 [[case]]
 name = "stream-zip"
