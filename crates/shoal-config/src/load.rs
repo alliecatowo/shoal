@@ -103,23 +103,20 @@ pub fn load(o: &LoadOptions) -> Result<Loaded, ConfigError> {
     let mut sources = Vec::new();
 
     for path in [&o.system, &o.user, &o.project].into_iter().flatten() {
-        match read_config_file(path)? {
-            Some(text) => {
-                check_toml_nesting(path, &text)?;
-                let value: toml::Value = toml::from_str(&text).map_err(|e| ConfigError::Parse {
-                    path: path.clone(),
-                    message: e.to_string(),
-                })?;
-                let mut layer_warnings = Vec::new();
-                crate::schema::check(&value, crate::schema::ROOT, "", &mut layer_warnings)
-                    .map_err(|e| e.with_source(path))?;
-                for w in layer_warnings {
-                    warnings.push(format!("{}: {w}", path.display()));
-                }
-                merge(&mut merged, value);
-                sources.push(path.clone());
+        if let Some(text) = read_config_file(path)? {
+            check_toml_nesting(path, &text)?;
+            let value: toml::Value = toml::from_str(&text).map_err(|e| ConfigError::Parse {
+                path: path.clone(),
+                message: e.to_string(),
+            })?;
+            let mut layer_warnings = Vec::new();
+            crate::schema::check(&value, crate::schema::ROOT, "", &mut layer_warnings)
+                .map_err(|e| e.with_source(path))?;
+            for w in layer_warnings {
+                warnings.push(format!("{}: {w}", path.display()));
             }
-            None => {}
+            merge(&mut merged, value);
+            sources.push(path.clone());
         }
     }
 
