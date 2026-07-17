@@ -29,7 +29,11 @@ impl PlanRegistry {
         &self,
         operation: impl FnOnce(&mut HashMap<String, StoredPlan>) -> R,
     ) -> R {
-        operation(&mut self.entries.lock().unwrap())
+        let mut entries = self.entries.lock().unwrap();
+        for plan in entries.values_mut() {
+            plan.recover_stale_grant();
+        }
+        operation(&mut entries)
     }
 
     /// Plan refs are session-scoped state. Remove them with an evicted session

@@ -72,6 +72,8 @@ pub struct Kernel {
     allow_self_ack: AtomicBool,
     #[cfg(test)]
     fail_approval_audit: AtomicBool,
+    #[cfg(test)]
+    panic_approval_audit: AtomicBool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -304,6 +306,7 @@ impl Drop for QuotaPermit {
 }
 
 const PLAN_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+const GRANT_RESERVATION_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 const MAX_STORED_PLANS_PER_OWNER: usize = 256;
 const MAX_PLAN_SOURCE_BYTES_PER_OWNER: usize = 64 * 1024 * 1024;
 
@@ -334,6 +337,29 @@ fn plan_expired(plan: &StoredPlan) -> bool {
     ) && plan.created_at.elapsed() > PLAN_TTL
 }
 
+impl StoredPlan {
+    fn recover_stale_grant(&mut self) {
+        let restore_policy_allowed = match &self.authorization {
+            PlanAuthorization::Granting {
+                restore_policy_allowed,
+                started_at,
+                lease,
+                ..
+            } if lease.upgrade().is_none() && started_at.elapsed() >= GRANT_RESERVATION_TTL => {
+                Some(*restore_policy_allowed)
+            }
+            _ => None,
+        };
+        if let Some(restore_policy_allowed) = restore_policy_allowed {
+            self.authorization = if restore_policy_allowed {
+                PlanAuthorization::PolicyAllowed
+            } else {
+                PlanAuthorization::Pending
+            };
+        }
+    }
+}
+
 /// Authorization is a one-way state machine. An explicit approval is a
 /// single-use capability: claiming it excludes concurrent/replayed applies,
 /// and a completed execution can never be returned to the approved state.
@@ -348,6 +374,8 @@ enum PlanAuthorization {
     Granting {
         record: ApprovalRecord,
         restore_policy_allowed: bool,
+        started_at: Instant,
+        lease: std::sync::Weak<()>,
     },
     Approved(ApprovalRecord),
     Claimed(ApprovalRecord),
@@ -429,6 +457,8 @@ impl Kernel {
             allow_self_ack: AtomicBool::new(self_ack_from_env()),
             #[cfg(test)]
             fail_approval_audit: AtomicBool::new(false),
+            #[cfg(test)]
+            panic_approval_audit: AtomicBool::new(false),
         })
     }
 
@@ -467,6 +497,8 @@ impl Kernel {
             allow_self_ack: AtomicBool::new(self_ack_from_env()),
             #[cfg(test)]
             fail_approval_audit: AtomicBool::new(false),
+            #[cfg(test)]
+            panic_approval_audit: AtomicBool::new(false),
         }))
     }
 
@@ -502,6 +534,8 @@ impl Kernel {
             allow_self_ack: AtomicBool::new(self_ack_from_env()),
             #[cfg(test)]
             fail_approval_audit: AtomicBool::new(false),
+            #[cfg(test)]
+            panic_approval_audit: AtomicBool::new(false),
         }))
     }
 
@@ -529,6 +563,8 @@ impl Kernel {
             allow_self_ack: AtomicBool::new(self_ack_from_env()),
             #[cfg(test)]
             fail_approval_audit: AtomicBool::new(false),
+            #[cfg(test)]
+            panic_approval_audit: AtomicBool::new(false),
         })
     }
 
@@ -752,6 +788,10 @@ impl Kernel {
         #[cfg(test)]
         if self.fail_approval_audit.load(Ordering::SeqCst) {
             return Err(internal("injected approval audit failure"));
+        }
+        #[cfg(test)]
+        if self.panic_approval_audit.load(Ordering::SeqCst) {
+            panic!("injected approval audit panic");
         }
         let effects_json = serde_json::to_string(&json!([{
             "kind": "approval",

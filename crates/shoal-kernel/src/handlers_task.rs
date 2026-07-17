@@ -4,6 +4,89 @@
 //! Wire behavior is documented in `site/content/internals/kernel-protocol.md`.
 use super::*;
 
+/// Unwind-safe ownership of the transient `Granting` state. Ordinary errors,
+/// handler panics, and dropped requests restore the exact pre-grant state. A
+/// stale-state timeout in `PlanRegistry` is the deterministic backstop if the
+/// process abandons a request without running destructors.
+struct ApprovalGrantReservation {
+    kernel: Arc<Kernel>,
+    plan_ref: String,
+    record: ApprovalRecord,
+    _lease: Arc<()>,
+    armed: bool,
+}
+
+impl ApprovalGrantReservation {
+    fn new(kernel: Arc<Kernel>, plan_ref: String, record: ApprovalRecord, lease: Arc<()>) -> Self {
+        Self {
+            kernel,
+            plan_ref,
+            record,
+            _lease: lease,
+            armed: true,
+        }
+    }
+
+    fn commit(&mut self, completed: ApprovalRecord) -> Result<(), RpcError> {
+        self.kernel
+            .plans
+            .transaction(|plans| -> Result<(), RpcError> {
+                let stored = plans.get_mut(&self.plan_ref).ok_or_else(|| {
+                    internal("approval reservation disappeared after durable audit")
+                })?;
+                if !matches!(
+                    &stored.authorization,
+                    PlanAuthorization::Granting { record, .. } if record == &self.record
+                ) {
+                    return Err(internal("approval reservation changed after durable audit"));
+                }
+                stored.authorization = PlanAuthorization::Approved(completed);
+                Ok(())
+            })?;
+        self.armed = false;
+        Ok(())
+    }
+
+    fn rollback(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        let plan_ref = self.plan_ref.clone();
+        let record = self.record.clone();
+        let kernel = self.kernel.clone();
+        // Drop may run during another unwind. A poisoned plan mutex is already
+        // quarantined by dispatch; never turn best-effort rollback into abort.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            kernel.plans.transaction(|plans| {
+                if let Some(stored) = plans.get_mut(&plan_ref) {
+                    let restore = match &stored.authorization {
+                        PlanAuthorization::Granting {
+                            record: current,
+                            restore_policy_allowed,
+                            ..
+                        } if current == &record => Some(*restore_policy_allowed),
+                        _ => None,
+                    };
+                    if let Some(restore_policy_allowed) = restore {
+                        stored.authorization = if restore_policy_allowed {
+                            PlanAuthorization::PolicyAllowed
+                        } else {
+                            PlanAuthorization::Pending
+                        };
+                    }
+                }
+            });
+        }));
+    }
+}
+
+impl Drop for ApprovalGrantReservation {
+    fn drop(&mut self) {
+        self.rollback();
+    }
+}
+
 impl Kernel {
     pub(crate) fn handle_task_list(
         self: &Arc<Self>,
@@ -367,12 +450,13 @@ impl Kernel {
             })
             .map(|e| norm_effect(&e))
             .collect();
-        type PreparedApproval = (ApprovalRecord, Vec<String>, String);
+        type PreparedApproval = (ApprovalRecord, Vec<String>, String, Arc<()>);
         type ApprovalPreparation = Result<PreparedApproval, Json>;
 
         // Phase one validates and reserves the transition under ONE plans
         // lock. Durable journal I/O deliberately happens after this
         // transaction; `Granting` excludes concurrent grants and applies.
+        let grant_lease = Arc::new(());
         let prepared =
             self.plans
                 .transaction(|plans| -> Result<ApprovalPreparation, RpcError> {
@@ -504,60 +588,32 @@ impl Kernel {
                     stored.authorization = PlanAuthorization::Granting {
                         record: record.clone(),
                         restore_policy_allowed,
+                        started_at: Instant::now(),
+                        lease: Arc::downgrade(&grant_lease),
                     };
-                    Ok(Ok((record, plan_effect_kinds, requester)))
+                    Ok(Ok((record, plan_effect_kinds, requester, grant_lease)))
                 })?;
-        let (mut record, plan_effect_kinds, requester) = match prepared {
+        let (mut record, plan_effect_kinds, requester, grant_lease) = match prepared {
             Ok(approved) => approved,
             Err(response) => return encode(response),
         };
+        let mut reservation = ApprovalGrantReservation::new(
+            self.clone(),
+            plan_ref.clone(),
+            record.clone(),
+            grant_lease,
+        );
 
         // Phase two performs the potentially blocking durable append with no
-        // plan-registry guard held. On failure, restore the exact source state
-        // only if our reservation is still present; the grant remains closed.
-        let audit_result = self.record_approval_audit(&record, &plan_effect_kinds, &record.session);
-        let grant_audit_id = match audit_result {
-            Ok(id) => id,
-            Err(error) => {
-                self.plans.transaction(|plans| {
-                    if let Some(stored) = plans.get_mut(&plan_ref) {
-                        let restore = match &stored.authorization {
-                            PlanAuthorization::Granting {
-                                record: current,
-                                restore_policy_allowed,
-                            } if current == &record => Some(*restore_policy_allowed),
-                            _ => None,
-                        };
-                        if let Some(restore_policy_allowed) = restore {
-                            stored.authorization = if restore_policy_allowed {
-                                PlanAuthorization::PolicyAllowed
-                            } else {
-                                PlanAuthorization::Pending
-                            };
-                        }
-                    }
-                });
-                return Err(error);
-            }
-        };
+        // plan-registry guard held. The reservation guard restores the exact
+        // source state on both ordinary errors and unwinding panics.
+        let grant_audit_id =
+            self.record_approval_audit(&record, &plan_effect_kinds, &record.session)?;
 
         // Phase three publishes the durable grant into the plan state. The
         // identity comparison makes this a compare-and-set, not a blind write.
-        let reserved_record = record.clone();
         record.grant_audit_id = grant_audit_id;
-        self.plans.transaction(|plans| -> Result<(), RpcError> {
-            let stored = plans
-                .get_mut(&plan_ref)
-                .ok_or_else(|| internal("approval reservation disappeared after durable audit"))?;
-            if !matches!(
-                &stored.authorization,
-                PlanAuthorization::Granting { record, .. } if record == &reserved_record
-            ) {
-                return Err(internal("approval reservation changed after durable audit"));
-            }
-            stored.authorization = PlanAuthorization::Approved(record.clone());
-            Ok(())
-        })?;
+        reservation.commit(record.clone())?;
         // Same honest enforcement truth `session.attach`'s `caps_enforced`
         // reports (see `site/content/internals/security-threat-model.md`) — not a hardcoded `false`.
         // An agent that just unstuck an `approval_pending` plan via

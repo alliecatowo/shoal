@@ -3547,6 +3547,106 @@ fn cap_request_fails_closed_when_the_grant_audit_cannot_be_written() {
 }
 
 #[test]
+fn cap_request_unwind_restores_its_grant_reservation() {
+    let policy = Policy::from_toml(&format!(
+        "[principal.\"{}\"]\nopaque='ask'\nauto_apply='never'\n",
+        principal()
+    ))
+    .unwrap();
+    let kernel = Kernel::with_policy(policy);
+    kernel.set_allow_self_ack(true);
+    let (mut client, mut reader, thread) = spawn(&kernel);
+    attach(&mut client, &mut reader);
+    let planned = call(
+        &mut client,
+        &mut reader,
+        2,
+        "exec",
+        json!({"src":"sh { echo hi }","mode":"plan","position":"stmt"}),
+    )
+    .result
+    .unwrap();
+    let plan_ref = planned["plan_ref"].as_str().unwrap().to_owned();
+
+    kernel.panic_approval_audit.store(true, Ordering::SeqCst);
+    let failed = call(
+        &mut client,
+        &mut reader,
+        3,
+        "cap.request",
+        json!({"plan_ref": plan_ref}),
+    );
+    assert_eq!(failed.error.unwrap().code, INTERNAL_ERROR);
+    kernel.plans.transaction(|plans| {
+        assert!(matches!(
+            plans.get(&plan_ref).map(|plan| &plan.authorization),
+            Some(PlanAuthorization::Pending)
+        ));
+    });
+    drop(client);
+    drop(reader);
+    thread.join().unwrap();
+}
+
+#[test]
+fn stale_grant_reservation_recovers_before_the_next_transaction() {
+    let policy = Policy::from_toml(&format!(
+        "[principal.\"{}\"]\nopaque='ask'\nauto_apply='never'\n",
+        principal()
+    ))
+    .unwrap();
+    let kernel = Kernel::with_policy(policy);
+    kernel.set_allow_self_ack(true);
+    let (mut client, mut reader, thread) = spawn(&kernel);
+    attach(&mut client, &mut reader);
+    let planned = call(
+        &mut client,
+        &mut reader,
+        2,
+        "exec",
+        json!({"src":"sh { echo hi }","mode":"plan","position":"stmt"}),
+    )
+    .result
+    .unwrap();
+    let plan_ref = planned["plan_ref"].as_str().unwrap().to_owned();
+    kernel.plans.transaction(|plans| {
+        let stored = plans.get_mut(&plan_ref).unwrap();
+        let record = ApprovalRecord {
+            requester: stored.principal.clone(),
+            approver: stored.principal.clone(),
+            plan_ref: stored.plan.plan_ref.clone(),
+            plan_hash: stored.plan_hash.clone(),
+            source_hash: stored.source_hash.clone(),
+            session: stored.session.clone(),
+            scope: stored.plan.effects.iter().map(effect_kind).collect(),
+            approved_at_ns: now_ns(),
+            grant_audit_id: 0,
+            consumed_by: None,
+        };
+        stored.authorization = PlanAuthorization::Granting {
+            record,
+            restore_policy_allowed: false,
+            started_at: Instant::now() - GRANT_RESERVATION_TTL,
+            lease: std::sync::Weak::new(),
+        };
+    });
+    let granted = call(
+        &mut client,
+        &mut reader,
+        3,
+        "cap.request",
+        json!({"plan_ref": plan_ref}),
+    );
+    assert!(
+        granted.error.is_none(),
+        "stale reservation recovered: {granted:?}"
+    );
+    drop(client);
+    drop(reader);
+    thread.join().unwrap();
+}
+
+#[test]
 fn concurrent_plan_apply_consumes_an_explicit_approval_exactly_once() {
     let policy = Policy::from_toml(&format!(
         "[principal.\"{}\"]\nopaque='ask'\nauto_apply='never'\n",
