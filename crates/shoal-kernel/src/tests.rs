@@ -239,6 +239,88 @@ fn concurrent_session_creation_returns_one_registry_object() {
 }
 
 #[test]
+fn global_session_limit_is_atomic_across_principals() {
+    let kernel = Kernel::new();
+    kernel.configure_limits(Limits {
+        max_sessions: 1,
+        ..Limits::default()
+    });
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+    let open = |kernel: Arc<Kernel>, principal: &'static str, barrier: Arc<std::sync::Barrier>| {
+        std::thread::spawn(move || {
+            barrier.wait();
+            kernel.session("raced", principal)
+        })
+    };
+    let alpha = open(kernel.clone(), "agent:alpha", barrier.clone());
+    let beta = open(kernel.clone(), "agent:beta", barrier.clone());
+    barrier.wait();
+    let sessions = [alpha.join().unwrap(), beta.join().unwrap()];
+
+    assert_eq!(
+        sessions.iter().filter(|result| result.is_ok()).count(),
+        1,
+        "serialized admission must reserve exactly one global slot"
+    );
+    let error = sessions
+        .iter()
+        .find_map(|result| result.as_ref().err())
+        .expect("one racing admission must be rejected");
+    assert_eq!(error.code, QUOTA_EXCEEDED);
+    assert_eq!(error.data.as_ref().unwrap()["limit"], "sessions_global");
+    assert_eq!(kernel.sessions.snapshot().len(), 1);
+}
+
+#[test]
+fn global_session_limit_keeps_existing_keys_and_rejects_when_all_are_active() {
+    let kernel = Kernel::new();
+    kernel.configure_limits(Limits {
+        max_sessions: 2,
+        ..Limits::default()
+    });
+    let alpha = kernel.session("one", "agent:alpha").unwrap();
+    let beta = kernel.session("two", "agent:beta").unwrap();
+
+    let alpha_again = kernel.session("one", "agent:alpha").unwrap();
+    assert!(
+        Arc::ptr_eq(&alpha, &alpha_again),
+        "an existing principal/name key remains attachable at the cap"
+    );
+    let error = match kernel.session("three", "agent:gamma") {
+        Ok(_) => panic!("a new key cannot displace an active session"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, QUOTA_EXCEEDED);
+    assert_eq!(error.data.as_ref().unwrap()["limit"], "sessions_global");
+    assert_eq!(kernel.sessions.snapshot().len(), 2);
+    drop((alpha, alpha_again, beta));
+}
+
+#[test]
+fn global_session_limit_evicts_the_idle_lru_across_principals() {
+    let kernel = Kernel::new();
+    kernel.configure_limits(Limits {
+        max_sessions: 2,
+        ..Limits::default()
+    });
+    let alpha_key = SessionKey::new("agent:alpha", "oldest");
+    drop(
+        kernel
+            .session(&alpha_key.name, &alpha_key.principal)
+            .unwrap(),
+    );
+    std::thread::sleep(std::time::Duration::from_millis(1));
+    let beta = kernel.session("newer", "agent:beta").unwrap();
+
+    let gamma = kernel.session("newest", "agent:gamma").unwrap();
+    let sessions = kernel.sessions.snapshot();
+    assert_eq!(sessions.len(), 2);
+    assert!(!sessions.contains_key(&alpha_key));
+    assert!(sessions.contains_key(&beta.key));
+    assert!(sessions.contains_key(&gamma.key));
+}
+
+#[test]
 fn session_registry_evicts_idle_lru_but_never_active_leases() {
     let kernel = Kernel::new();
     let principal = "agent:bounded-sessions";

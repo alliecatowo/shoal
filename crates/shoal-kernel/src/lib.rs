@@ -85,6 +85,8 @@ pub struct Kernel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     pub max_connections: usize,
+    /// Maximum principal-private evaluator sessions retained by the kernel.
+    pub max_sessions: usize,
     pub max_tasks_per_session: usize,
     pub max_ptys_per_session: usize,
     pub max_ptys_per_principal: usize,
@@ -123,6 +125,7 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             max_connections: 64,
+            max_sessions: 256,
             max_tasks_per_session: 128,
             max_ptys_per_session: 32,
             max_ptys_per_principal: 64,
@@ -584,7 +587,7 @@ impl Kernel {
     pub fn new() -> Arc<Self> {
         let limits = Limits::default();
         Arc::new(Self {
-            sessions: SessionRegistry::new(),
+            sessions: SessionRegistry::new(limits.max_sessions),
             connections: ConnectionRegistry::new(
                 limits.max_connections,
                 limits.frame_read_timeout_ms,
@@ -630,7 +633,7 @@ impl Kernel {
         // correctly still start at 0.
         events.seed_from_journal(&journal);
         Ok(Arc::new(Self {
-            sessions: SessionRegistry::new(),
+            sessions: SessionRegistry::new(limits.max_sessions),
             connections: ConnectionRegistry::new(
                 limits.max_connections,
                 limits.frame_read_timeout_ms,
@@ -673,7 +676,7 @@ impl Kernel {
         // Same restart-seq-continuity fix as `Kernel::open` above.
         events.seed_from_journal(&journal);
         Ok(Arc::new(Self {
-            sessions: SessionRegistry::new(),
+            sessions: SessionRegistry::new(limits.max_sessions),
             connections: ConnectionRegistry::new(
                 limits.max_connections,
                 limits.frame_read_timeout_ms,
@@ -708,7 +711,7 @@ impl Kernel {
     pub fn with_policy(policy: Policy) -> Arc<Self> {
         let limits = Limits::default();
         Arc::new(Self {
-            sessions: SessionRegistry::new(),
+            sessions: SessionRegistry::new(limits.max_sessions),
             connections: ConnectionRegistry::new(
                 limits.max_connections,
                 limits.frame_read_timeout_ms,
@@ -741,6 +744,7 @@ impl Kernel {
     }
 
     pub fn configure_limits(&self, limits: Limits) {
+        self.sessions.configure(limits.max_sessions);
         self.connections
             .configure(limits.max_connections, limits.frame_read_timeout_ms);
         self.tasks.configure(limits.max_tasks_per_session);

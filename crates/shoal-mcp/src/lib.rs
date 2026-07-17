@@ -169,22 +169,7 @@ fn kernel_command(config: &Config, program: &Path) -> Command {
     if let Some(policy) = std::env::var_os("SHOAL_POLICY").filter(|value| !value.is_empty()) {
         cmd.arg("--policy").arg(policy);
     }
-    for (env, flag) in [
-        ("SHOAL_MAX_CONNECTIONS", "--max-connections"),
-        ("SHOAL_MAX_TASKS_PER_SESSION", "--max-tasks-per-session"),
-        ("SHOAL_MAX_PTYS_PER_SESSION", "--max-ptys-per-session"),
-        ("SHOAL_MAX_PTYS_PER_PRINCIPAL", "--max-ptys-per-principal"),
-        ("SHOAL_MAX_PTYS_GLOBAL", "--max-ptys-global"),
-        (
-            "SHOAL_MAX_SUBSCRIPTIONS_PER_SESSION",
-            "--max-subscriptions-per-session",
-        ),
-        ("SHOAL_FRAME_READ_TIMEOUT_MS", "--frame-read-timeout-ms"),
-    ] {
-        if let Some(value) = std::env::var_os(env).filter(|value| !value.is_empty()) {
-            cmd.arg(flag).arg(value);
-        }
-    }
+    append_kernel_limit_args(&mut cmd, |name| std::env::var_os(name));
     cmd
         // The facade already captured the bearer for its own attach request.
         // The daemon neither needs nor should inherit that secret: a kernel
@@ -199,6 +184,29 @@ fn kernel_command(config: &Config, program: &Path) -> Command {
         .stderr(Stdio::inherit())
         .process_group(0);
     cmd
+}
+
+fn append_kernel_limit_args(
+    cmd: &mut Command,
+    read_env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) {
+    for (env, flag) in [
+        ("SHOAL_MAX_CONNECTIONS", "--max-connections"),
+        ("SHOAL_MAX_SESSIONS", "--max-sessions"),
+        ("SHOAL_MAX_TASKS_PER_SESSION", "--max-tasks-per-session"),
+        ("SHOAL_MAX_PTYS_PER_SESSION", "--max-ptys-per-session"),
+        ("SHOAL_MAX_PTYS_PER_PRINCIPAL", "--max-ptys-per-principal"),
+        ("SHOAL_MAX_PTYS_GLOBAL", "--max-ptys-global"),
+        (
+            "SHOAL_MAX_SUBSCRIPTIONS_PER_SESSION",
+            "--max-subscriptions-per-session",
+        ),
+        ("SHOAL_FRAME_READ_TIMEOUT_MS", "--frame-read-timeout-ms"),
+    ] {
+        if let Some(value) = read_env(env).filter(|value| !value.is_empty()) {
+            cmd.arg(flag).arg(value);
+        }
+    }
 }
 
 pub fn run_stdio(config: &Config) -> Result<(), BridgeError> {
@@ -430,5 +438,18 @@ mod tests {
                 key == std::ffi::OsStr::new("SHOAL_TOKEN") && value.is_none()
             })
         );
+    }
+
+    #[test]
+    fn autostart_forwards_the_global_session_limit() {
+        let mut command = Command::new("shoal-kernel");
+        append_kernel_limit_args(&mut command, |name| {
+            (name == "SHOAL_MAX_SESSIONS").then(|| std::ffi::OsString::from("19"))
+        });
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(args, ["--max-sessions", "19"]);
     }
 }

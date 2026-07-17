@@ -144,6 +144,7 @@ struct Args {
     policy: Option<PathBuf>,
     embedded_fd: Option<i32>,
     max_connections: Option<usize>,
+    max_sessions: Option<usize>,
     max_tasks_per_session: Option<usize>,
     max_ptys_per_session: Option<usize>,
     max_ptys_per_principal: Option<usize>,
@@ -162,6 +163,7 @@ impl Args {
             policy: None,
             embedded_fd: None,
             max_connections: None,
+            max_sessions: None,
             max_tasks_per_session: None,
             max_ptys_per_session: None,
             max_ptys_per_principal: None,
@@ -198,6 +200,9 @@ impl Args {
                 }
                 Some("--max-connections") => {
                     a.max_connections = Some(parse_usize(&k, it.next().ok_or_else(&missing)?)?)
+                }
+                Some("--max-sessions") => {
+                    a.max_sessions = Some(parse_usize(&k, it.next().ok_or_else(&missing)?)?)
                 }
                 Some("--max-tasks-per-session") => {
                     a.max_tasks_per_session =
@@ -247,7 +252,7 @@ impl Args {
                             })?,
                     )
                 }
-                Some("-h" | "--help") => return Err("usage: shoal-kernel [--session NAME] [--socket PATH | --embedded-fd FD] [--state-dir PATH] [--policy FILE] [--max-connections N] [--max-tasks-per-session N] [--max-ptys-per-session N] [--max-ptys-per-principal N] [--max-ptys-global N] [--max-subscriptions-per-session N] [--max-blob-decompressions-per-window N] [--blob-decompression-window-ms N] [--frame-read-timeout-ms N]".into()),
+                Some("-h" | "--help") => return Err("usage: shoal-kernel [--session NAME] [--socket PATH | --embedded-fd FD] [--state-dir PATH] [--policy FILE] [--max-connections N] [--max-sessions N] [--max-tasks-per-session N] [--max-ptys-per-session N] [--max-ptys-per-principal N] [--max-ptys-global N] [--max-subscriptions-per-session N] [--max-blob-decompressions-per-window N] [--blob-decompression-window-ms N] [--frame-read-timeout-ms N]".into()),
                 _ => return Err(format!("unknown argument {}", k.to_string_lossy())),
             }
         }
@@ -261,6 +266,7 @@ impl Args {
         let defaults = Limits::default();
         Limits {
             max_connections: self.max_connections.unwrap_or(defaults.max_connections),
+            max_sessions: self.max_sessions.unwrap_or(defaults.max_sessions),
             max_tasks_per_session: self
                 .max_tasks_per_session
                 .unwrap_or(defaults.max_tasks_per_session),
@@ -301,6 +307,8 @@ mod tests {
             [
                 "--max-connections",
                 "10",
+                "--max-sessions",
+                "12",
                 "--max-ptys-per-session",
                 "3",
                 "--max-ptys-per-principal",
@@ -320,6 +328,7 @@ mod tests {
         .unwrap();
         let limits = args.resolved_limits();
         assert_eq!(limits.max_connections, 10);
+        assert_eq!(limits.max_sessions, 12);
         assert_eq!(limits.max_ptys_per_session, 3);
         assert_eq!(limits.max_ptys_per_principal, 5);
         assert_eq!(limits.max_ptys_global, 20);

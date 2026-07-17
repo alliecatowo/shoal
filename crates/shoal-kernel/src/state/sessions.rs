@@ -3,7 +3,7 @@ use serde_json::json;
 use shoal_proto::RpcError;
 use shoal_proto::error_code::{INTERNAL_ERROR, QUOTA_EXCEEDED};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 pub(crate) const MAX_SESSIONS_PER_PRINCIPAL: usize = 64;
@@ -15,6 +15,7 @@ const IDLE_SESSION_TTL_NS: i64 = 24 * 60 * 60 * 1_000_000_000;
 /// happen after the map guard is released.
 pub(crate) struct SessionRegistry {
     entries: Mutex<HashMap<SessionKey, Arc<Session>>>,
+    max_sessions: AtomicUsize,
     /// A logical admission lease serializes get/create/evict decisions, but
     /// its mutex guard is never held while entries, callbacks, constructors,
     /// or Session destructors run.
@@ -47,13 +48,18 @@ impl Drop for AdmissionLease<'_> {
 }
 
 impl SessionRegistry {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(max_sessions: usize) -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
+            max_sessions: AtomicUsize::new(max_sessions),
             lifecycle: Mutex::new(false),
             lifecycle_ready: Condvar::new(),
             quarantined: AtomicBool::new(false),
         }
+    }
+
+    pub(crate) fn configure(&self, max_sessions: usize) {
+        self.max_sessions.store(max_sessions, Ordering::Relaxed);
     }
 
     fn unavailable(&self) -> RpcError {
@@ -157,6 +163,11 @@ impl SessionRegistry {
                 }));
             }
 
+            let max_sessions = self.max_sessions.load(Ordering::Relaxed);
+            if max_sessions == 0 {
+                return Err(global_quota_exceeded(max_sessions));
+            }
+
             let owned = self
                 .lock_entries()?
                 .keys()
@@ -185,6 +196,32 @@ impl SessionRegistry {
                             "max": MAX_SESSIONS_PER_PRINCIPAL,
                         })),
                     });
+                };
+                if let Some(session) = self.lock_entries()?.remove(&victim) {
+                    evicted.push((victim, session));
+                }
+            }
+
+            // Enforce the process-wide budget under the same logical admission
+            // lease as lookup and insertion. This makes the cap exact even when
+            // different principals race to create different session names.
+            // Existing keys returned above remain attachable after the cap is
+            // reached (or lowered).
+            loop {
+                let (len, victim) = {
+                    let entries = self.lock_entries()?;
+                    let victim = entries
+                        .iter()
+                        .filter(|(_, session)| Arc::strong_count(session) == 1)
+                        .min_by_key(|(_, session)| session.last_used_ns())
+                        .map(|(session_key, _)| session_key.clone());
+                    (entries.len(), victim)
+                };
+                if len < max_sessions {
+                    break;
+                }
+                let Some(victim) = victim else {
+                    return Err(global_quota_exceeded(max_sessions));
                 };
                 if let Some(session) = self.lock_entries()?.remove(&victim) {
                     evicted.push((victim, session));
@@ -240,6 +277,17 @@ impl SessionRegistry {
             });
             assert!(handle.join().is_err());
         });
+    }
+}
+
+fn global_quota_exceeded(max_sessions: usize) -> RpcError {
+    RpcError {
+        code: QUOTA_EXCEEDED,
+        message: format!("kernel has reached the {max_sessions}-session global limit"),
+        data: Some(json!({
+            "limit": "sessions_global",
+            "max": max_sessions,
+        })),
     }
 }
 
