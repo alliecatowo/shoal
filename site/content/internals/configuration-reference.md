@@ -59,6 +59,12 @@ Malformed TOML, filesystem errors other than not-found, type mismatches, malform
 values, unsupported versions, and invalid semantic values are hard errors. Unknown keys are
 warnings; they are not silently treated as valid future fields.
 
+Each layered file is a regular-file control-plane input capped at 1 MiB and 64 levels of TOML
+bracket/inline-table nesting. Reads retain at most the limit plus one sentinel byte, so a sparse file
+or a file that grows during startup cannot force an unbounded allocation before rejection. Files
+must be UTF-8; symlinks to regular files remain supported. Each recognized string environment
+override is capped at 64 KiB before it is copied into the merged TOML tree.
+
 ## Discovery and precedence
 
 `LoadOptions::discover(cwd)` proposes these layers, in ascending precedence:
@@ -461,6 +467,7 @@ the behavioral test must demonstrate the denied/redirected/disabled operation.
 
 - An absent configuration is a complete, usable configuration.
 - Missing optional files are not errors; unreadable present files are.
+- Oversized, non-UTF-8, non-regular, or excessively nested present files fail before merging.
 - A file's type error cannot be hidden by a later layer.
 - Tables merge deeply; scalars and arrays replace.
 - Only the nearest ancestor project config participates.

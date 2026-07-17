@@ -194,6 +194,11 @@ The loader resets `in_fn_body` to zero during module top-level evaluation, allow
 use top-level-only operations. It restores the prior environment, cwd, and function nesting after
 success or failure. The module-stack entry is also popped before propagating an evaluation error.
 
+An uncached module reserves against the bounded module identity budget before I/O, then reads at
+most the parser's 4 MiB source wall plus one sentinel byte through the inherited `Fs` port. Invalid
+UTF-8 or oversized source never enters the cache or active module stack; correcting the file permits
+a later load in the same healthy evaluator.
+
 A module is evaluated at most once per evaluator. Its exports value is cloned from the cache on
 subsequent `use` statements, and then declared under the canonical file's stem. Caching means changes
 to the file are not observed until a new evaluator/session.
@@ -281,8 +286,6 @@ type projects into `Value`; do not expose arbitrary internal configuration seria
 - Namespace functions are not first-class values.
 - `glob(..., follow: ...)` is accepted by constructor validation, but the stored `GlobVal` shown in
   `call.rs` only records `hidden`; contributors should verify the intended follow-symlink contract.
-- Module loading uses `Path::is_file` directly during candidate discovery while content reads go
-  through the `Fs` port. A fully virtual filesystem cannot currently control the whole operation.
 - Module evaluation has a fresh lexical root, not a pure/effect-isolated sandbox.
 - Cache lifetime is the evaluator lifetime; no file watcher or content hash invalidates modules.
 - Synthetic namespace precedence is hand-coded in expression evaluation. A new access path can omit

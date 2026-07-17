@@ -62,6 +62,10 @@ does mean prose alone cannot declare an unimplemented feature “done.”
 
 Shoal source is UTF-8 and lexing is modal. The parser requests tokens in expression or command mode
 according to grammar position; the lexer does not inspect runtime bindings.
+All file/stdin entry points admit at most 4 MiB, the parser's own source wall. CLI scripts and
+formatter input stream through a limit-plus-sentinel reader; evaluator `source`, `.shl` scripts,
+modules, and interactive init files use the same wall through the evaluator's inherited filesystem
+port. Oversized and non-UTF-8 inputs fail with path-aware diagnostics before parsing.
 
 ### Common lexical invariants
 
