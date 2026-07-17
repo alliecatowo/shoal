@@ -99,12 +99,10 @@ pub(crate) fn repl(standalone: bool) -> Result<i32, String> {
     let protocol_backed = protocol_requested(standalone, config.kernel.enabled);
     let mut embedded_child = None;
     let mut protocol = if protocol_backed {
-        let socket = shoal_paths::ShoalPaths::discover().socket(&config.kernel.session);
         let (client, child) =
             crate::embedded_kernel::connect(crate::embedded_kernel::EmbeddedKernelConfig {
                 session: config.kernel.session.clone(),
                 state_dir: shoal_state_dir(),
-                socket,
                 policy: config.leash.policy.clone(),
                 program: None,
             })?;

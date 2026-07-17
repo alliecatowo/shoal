@@ -2587,6 +2587,7 @@ dependencies = [
  "blake3",
  "criterion",
  "ctrlc",
+ "libc",
  "serde",
  "serde_json",
  "shoal-ast",

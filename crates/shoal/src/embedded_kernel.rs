@@ -13,7 +13,6 @@ const EMBEDDED_FD: i32 = 3;
 pub(crate) struct EmbeddedKernelConfig {
     pub(crate) session: String,
     pub(crate) state_dir: PathBuf,
-    pub(crate) socket: PathBuf,
     pub(crate) policy: Option<PathBuf>,
     pub(crate) program: Option<PathBuf>,
 }
@@ -76,8 +75,6 @@ pub(crate) fn connect(
         .arg(EMBEDDED_FD.to_string())
         .arg("--state-dir")
         .arg(&config.state_dir)
-        .arg("--socket")
-        .arg(&config.socket)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());

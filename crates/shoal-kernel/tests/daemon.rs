@@ -5,8 +5,8 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
-use std::path::Path;
-use std::process::{Command, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 fn credentialed_admin_attach_params(token: &str) -> serde_json::Value {
@@ -51,7 +51,8 @@ fn read_daemon_stderr(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|e| format!("<could not read {path:?}: {e}>"))
 }
 
-/// Only one live `shoal-kernel` daemon per test binary at a time.
+/// Serialize tests that signal or intentionally coexist with real kernel
+/// children. Individual tests can still spawn multiple kernels deliberately.
 ///
 /// Both tests below spawn a real daemon child process, talk to it over a
 /// real Unix socket, and signal it directly by PID (`kill(child.id(), ...)`)
@@ -70,32 +71,225 @@ fn read_daemon_stderr(path: &Path) -> String {
 static ONLY_ONE_DAEMON_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[test]
-fn embedded_fd_is_private_trust_while_public_listener_stays_untrusted_and_live() {
-    const EMBEDDED_FD: i32 = 3;
+fn embedded_fd_is_private_trust_without_a_public_listener() {
     const SIGINT: i32 = 2;
-    const F_GETFD: i32 = 1;
-    const F_SETFD: i32 = 2;
-    const FD_CLOEXEC: i32 = 1;
 
     let _serialize = ONLY_ONE_DAEMON_AT_A_TIME
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     let temp = tempfile::tempdir().unwrap();
-    let socket = temp.path().join("run/embedded.sock");
     let state = temp.path().join("state");
-    let (mut private, child_end) = UnixStream::pair().unwrap();
-    let inherited_fd = child_end.as_raw_fd();
-    let (stderr_file, stderr_path) = daemon_stderr_file(temp.path());
-    let mut command = Command::new(env!("CARGO_BIN_EXE_shoal-kernel"));
-    command
+    let runtime = temp.path().join("runtime");
+    let expected_socket = runtime.join("shoal/default.sock");
+    let (mut child, mut private, stderr_path) =
+        spawn_embedded_kernel(temp.path(), &state, &runtime, "single");
+    let mut private_reader = BufReader::new(private.try_clone().unwrap());
+    attach_embedded(&mut private, &mut private_reader, 1, "embedded");
+
+    assert!(
+        !expected_socket.exists(),
+        "private embedded mode must not create a listener"
+    );
+    assert_eq!(unsafe { kill(child.id() as i32, SIGINT) }, 0);
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "SIGINT killed embedded kernel:\n{}",
+        read_daemon_stderr(&stderr_path)
+    );
+    write_frame(
+        &mut private,
+        &Request {
+            jsonrpc: JSONRPC.into(),
+            id: 2.into(),
+            method: "parse".into(),
+            params: serde_json::json!({"src":"1 + 2"}),
+        },
+    )
+    .unwrap();
+    assert!(recv(&mut private_reader).error.is_none());
+
+    drop(private);
+    drop(private_reader);
+    wait_for_embedded_exit(&mut child, &stderr_path);
+    assert!(!expected_socket.exists());
+}
+
+#[test]
+fn two_private_embedded_kernels_can_share_state_without_contending_on_a_socket() {
+    let _serialize = ONLY_ONE_DAEMON_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state");
+    let runtime = temp.path().join("runtime");
+    let expected_socket = runtime.join("shoal/default.sock");
+    let (mut child_a, mut private_a, stderr_a) =
+        spawn_embedded_kernel(temp.path(), &state, &runtime, "a");
+    let (mut child_b, mut private_b, stderr_b) =
+        spawn_embedded_kernel(temp.path(), &state, &runtime, "b");
+    let mut reader_a = BufReader::new(private_a.try_clone().unwrap());
+    let mut reader_b = BufReader::new(private_b.try_clone().unwrap());
+
+    attach_embedded(&mut private_a, &mut reader_a, 1, "human-a");
+    attach_embedded(&mut private_b, &mut reader_b, 2, "human-b");
+    assert_ne!(child_a.id(), child_b.id());
+    assert!(child_a.try_wait().unwrap().is_none());
+    assert!(child_b.try_wait().unwrap().is_none());
+    assert!(
+        !expected_socket.exists(),
+        "isolated embedded kernels must not contend on a listener"
+    );
+
+    drop(private_a);
+    drop(reader_a);
+    drop(private_b);
+    drop(reader_b);
+    wait_for_embedded_exit(&mut child_a, &stderr_a);
+    wait_for_embedded_exit(&mut child_b, &stderr_b);
+}
+
+#[test]
+fn private_embedded_kernel_coexists_with_a_durable_public_kernel() {
+    let _serialize = ONLY_ONE_DAEMON_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("run/public.sock");
+    let state = temp.path().join("state");
+    let runtime = temp.path().join("runtime");
+    let admin_token = create_admin_token(&state);
+    let (public_stderr_file, public_stderr_path) = daemon_stderr_file(temp.path());
+    let mut public_child = Command::new(env!("CARGO_BIN_EXE_shoal-kernel"))
         .args([
-            "--embedded-fd",
-            "3",
             "--socket",
             socket.to_str().unwrap(),
             "--state-dir",
             state.to_str().unwrap(),
         ])
+        .stdout(Stdio::null())
+        .stderr(public_stderr_file)
+        .spawn()
+        .unwrap();
+    wait_for_socket(&socket, &public_stderr_path);
+
+    let (mut embedded_child, mut private, embedded_stderr) =
+        spawn_embedded_kernel(temp.path(), &state, &runtime, "coexist");
+    let mut private_reader = BufReader::new(private.try_clone().unwrap());
+    attach_embedded(&mut private, &mut private_reader, 1, "human");
+
+    let mut public = UnixStream::connect(&socket).unwrap();
+    let mut public_reader = BufReader::new(public.try_clone().unwrap());
+    write_frame(
+        &mut public,
+        &Request {
+            jsonrpc: JSONRPC.into(),
+            id: 2.into(),
+            method: "session.attach".into(),
+            params: credentialed_admin_attach_params(&admin_token),
+        },
+    )
+    .unwrap();
+    assert!(recv(&mut public_reader).error.is_none());
+    write_frame(
+        &mut public,
+        &Request {
+            jsonrpc: JSONRPC.into(),
+            id: 3.into(),
+            method: "kernel.status".into(),
+            params: serde_json::json!({}),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        recv(&mut public_reader).result.unwrap()["pid"],
+        public_child.id()
+    );
+    assert_ne!(public_child.id(), embedded_child.id());
+
+    drop(private);
+    drop(private_reader);
+    wait_for_embedded_exit(&mut embedded_child, &embedded_stderr);
+    write_frame(
+        &mut public,
+        &Request {
+            jsonrpc: JSONRPC.into(),
+            id: 4.into(),
+            method: "kernel.status".into(),
+            params: serde_json::json!({}),
+        },
+    )
+    .unwrap();
+    assert!(recv(&mut public_reader).error.is_none());
+    write_frame(
+        &mut public,
+        &Request {
+            jsonrpc: JSONRPC.into(),
+            id: 5.into(),
+            method: "kernel.shutdown".into(),
+            params: serde_json::json!({}),
+        },
+    )
+    .unwrap();
+    assert_eq!(recv(&mut public_reader).result.unwrap()["stopping"], true);
+    assert!(
+        public_child.wait().unwrap().success(),
+        "public daemon stderr:\n{}",
+        read_daemon_stderr(&public_stderr_path)
+    );
+}
+
+#[test]
+fn embedded_fd_rejects_a_descriptor_that_was_not_inherited() {
+    let _serialize = ONLY_ONE_DAEMON_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state");
+    let runtime = temp.path().join("runtime");
+    let output = Command::new(env!("CARGO_BIN_EXE_shoal-kernel"))
+        .args([
+            "--embedded-fd",
+            "999999",
+            "--state-dir",
+            state.to_str().unwrap(),
+        ])
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env_remove("SHOAL_SOCKET")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("is not an inherited open descriptor"),
+        "unexpected error: {stderr}"
+    );
+    assert!(!runtime.join("shoal/default.sock").exists());
+}
+
+fn spawn_embedded_kernel(
+    dir: &Path,
+    state: &Path,
+    runtime: &Path,
+    label: &str,
+) -> (Child, UnixStream, PathBuf) {
+    const EMBEDDED_FD: i32 = 3;
+    const F_GETFD: i32 = 1;
+    const F_SETFD: i32 = 2;
+    const FD_CLOEXEC: i32 = 1;
+
+    let (private, child_end) = UnixStream::pair().unwrap();
+    private
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let inherited_fd = child_end.as_raw_fd();
+    let stderr_path = dir.join(format!("embedded-{label}-stderr.log"));
+    let stderr_file = std::fs::File::create(&stderr_path).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_shoal-kernel"));
+    command
+        .args(["--embedded-fd", "3", "--state-dir", state.to_str().unwrap()])
+        .env("XDG_RUNTIME_DIR", runtime)
+        .env_remove("SHOAL_SOCKET")
         .stdout(Stdio::null())
         .stderr(stderr_file);
     // SAFETY: only descriptor syscalls run between fork and exec. `dup2`
@@ -113,99 +307,48 @@ fn embedded_fd_is_private_trust_while_public_listener_stays_untrusted_and_live()
             Ok(())
         });
     }
-    let mut child = command.spawn().unwrap();
+    let child = command.spawn().unwrap();
     drop(child_end);
-    let mut private_reader = BufReader::new(private.try_clone().unwrap());
+    (child, private, stderr_path)
+}
+
+fn attach_embedded(
+    private: &mut UnixStream,
+    reader: &mut BufReader<UnixStream>,
+    id: u64,
+    session: &str,
+) {
     write_frame(
-        &mut private,
+        private,
         &Request {
             jsonrpc: JSONRPC.into(),
-            id: 1.into(),
+            id: id.into(),
             method: "session.attach".into(),
             params: serde_json::json!({
                 "local_auth":"local-human",
-                "session":"embedded",
+                "session":session,
                 "client":{"kind":"shoal-repl","tty":true}
             }),
         },
     )
     .unwrap();
-    let trusted = recv(&mut private_reader).result.unwrap();
+    let trusted = recv(reader).result.unwrap();
     assert_eq!(trusted["connection_trust"], "embedded-human");
+}
 
+fn wait_for_socket(socket: &Path, stderr_path: &Path) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while !socket.exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert!(
         socket.exists(),
-        "embedded daemon did not bind public listener:\n{}",
-        read_daemon_stderr(&stderr_path)
+        "daemon did not bind listener:\n{}",
+        read_daemon_stderr(stderr_path)
     );
-    let mut public = UnixStream::connect(&socket).unwrap();
-    let mut public_reader = BufReader::new(public.try_clone().unwrap());
-    write_frame(
-        &mut public,
-        &Request {
-            jsonrpc: JSONRPC.into(),
-            id: 2.into(),
-            method: "session.attach".into(),
-            params: serde_json::json!({
-                "local_auth":"local-human",
-                "client":{"kind":"same-uid-adversary","tty":true}
-            }),
-        },
-    )
-    .unwrap();
-    assert_eq!(recv(&mut public_reader).error.unwrap().code, AUTH_FAILED);
-    write_frame(
-        &mut public,
-        &Request {
-            jsonrpc: JSONRPC.into(),
-            id: 3.into(),
-            method: "session.attach".into(),
-            params: serde_json::json!({"client":{"kind":"mcp","tty":false}}),
-        },
-    )
-    .unwrap();
-    assert_eq!(
-        recv(&mut public_reader).result.unwrap()["connection_trust"],
-        "public"
-    );
+}
 
-    assert_eq!(unsafe { kill(child.id() as i32, SIGINT) }, 0);
-    std::thread::sleep(Duration::from_millis(50));
-    assert!(
-        child.try_wait().unwrap().is_none(),
-        "SIGINT killed embedded kernel"
-    );
-    write_frame(
-        &mut private,
-        &Request {
-            jsonrpc: JSONRPC.into(),
-            id: 4.into(),
-            method: "parse".into(),
-            params: serde_json::json!({"src":"1 + 2"}),
-        },
-    )
-    .unwrap();
-    assert!(recv(&mut private_reader).error.is_none());
-
-    write_frame(
-        &mut public,
-        &Request {
-            jsonrpc: JSONRPC.into(),
-            id: 5.into(),
-            method: "kernel.status".into(),
-            params: serde_json::json!({}),
-        },
-    )
-    .unwrap();
-    assert!(recv(&mut public_reader).error.is_none());
-    drop(public);
-    drop(public_reader);
-    drop(private);
-    drop(private_reader);
+fn wait_for_embedded_exit(child: &mut Child, stderr_path: &Path) {
     let exit_deadline = Instant::now() + Duration::from_secs(5);
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
@@ -213,12 +356,16 @@ fn embedded_fd_is_private_trust_while_public_listener_stays_untrusted_and_live()
         }
         assert!(
             Instant::now() < exit_deadline,
-            "embedded kernel did not exit after private endpoint closed"
+            "embedded kernel did not exit after private endpoint closed:\n{}",
+            read_daemon_stderr(stderr_path)
         );
         std::thread::sleep(Duration::from_millis(10));
     };
-    assert!(status.success(), "embedded kernel exit: {status}");
-    assert!(!socket.exists(), "clean exit removes the public socket");
+    assert!(
+        status.success(),
+        "embedded kernel exit: {status}; stderr:\n{}",
+        read_daemon_stderr(stderr_path)
+    );
 }
 
 #[test]

@@ -29,45 +29,37 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Kernel::open(&state)?
     };
     kernel.configure_limits(limits);
-    let socket = args.socket.unwrap_or_else(|| paths.socket(&args.session));
-    prepare_socket(&socket)?;
-    let stop = Arc::new(AtomicBool::new(false));
     if let Some(fd) = args.embedded_fd {
+        if args.socket.is_some() {
+            return Err("--embedded-fd and --socket are mutually exclusive".into());
+        }
         if fd < 3 {
             return Err("--embedded-fd must name a non-stdio descriptor".into());
         }
-        // SAFETY: the spawning parent passes ownership of this descriptor
-        // exactly once and the one-shot embedded process exits with the stream.
-        let stream = unsafe { UnixStream::from_raw_fd(fd) };
-        let embedded = kernel.clone();
-        let embedded_stop = stop.clone();
-        std::thread::Builder::new()
-            .name("shoal-kernel-embedded-human".into())
-            .spawn(move || {
-                if let Err(error) =
-                    embedded.handle_stream_with_trust(stream, ConnectionTrust::EmbeddedHuman)
-                {
-                    eprintln!("shoal-kernel: embedded connection: {error}");
-                }
-                // The inherited connection owns this embedded daemon's
-                // lifetime. Public MCP connections coexist while the REPL is
-                // live, then the accept loop drains and exits cleanly when
-                // the private parent endpoint closes.
-                embedded_stop.store(true, Ordering::SeqCst);
-            })?;
-    }
-    if args.embedded_fd.is_none() {
-        let signal = stop.clone();
-        ctrlc::set_handler(move || signal.store(true, Ordering::SeqCst))?;
-    } else {
-        // Keep the daemon alive when the terminal delivers Ctrl-C to the
-        // foreground process group. This is a caught handler (not SIG_IGN),
-        // so exec restores SIG_DFL in command children.
+        if unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
+            return Err(format!(
+                "--embedded-fd {fd} is not an inherited open descriptor: {}",
+                io::Error::last_os_error()
+            )
+            .into());
+        }
+        // Keep the private kernel alive when the terminal delivers Ctrl-C to
+        // the foreground process group. This is a caught handler (not
+        // SIG_IGN), so exec restores SIG_DFL in command children.
         ctrlc::set_handler(|| {})?;
+        // SAFETY: the spawning parent passes ownership of this descriptor
+        // exactly once; fcntl above proved it is open in this process.
+        let stream = unsafe { UnixStream::from_raw_fd(fd) };
+        kernel.handle_stream_with_trust(stream, ConnectionTrust::EmbeddedHuman)?;
+        return Ok(());
     }
-    if args.embedded_fd.is_none() {
-        eprintln!("shoal-kernel: ready {}", socket.display());
-    }
+
+    let socket = args.socket.unwrap_or_else(|| paths.socket(&args.session));
+    prepare_socket(&socket)?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let signal = stop.clone();
+    ctrlc::set_handler(move || signal.store(true, Ordering::SeqCst))?;
+    eprintln!("shoal-kernel: ready {}", socket.display());
     kernel.serve_until(&socket, stop)?;
     Ok(())
 }
@@ -183,13 +175,14 @@ impl Args {
                 Some("--state-dir") => a.state_dir = Some(it.next().ok_or_else(&missing)?.into()),
                 Some("--policy") => a.policy = Some(it.next().ok_or_else(&missing)?.into()),
                 Some("--embedded-fd") => {
-                    a.embedded_fd = Some(
-                        it.next()
+                    let fd = it.next()
                             .ok_or_else(&missing)?
                             .to_str()
                             .and_then(|text| text.parse().ok())
-                            .ok_or_else(|| "--embedded-fd requires an integer".to_string())?,
-                    )
+                            .ok_or_else(|| "--embedded-fd requires an integer".to_string())?;
+                    if a.embedded_fd.replace(fd).is_some() {
+                        return Err("--embedded-fd may be specified only once".into());
+                    }
                 }
                 Some("--max-connections") => {
                     a.max_connections = Some(parse_usize(&k, it.next().ok_or_else(&missing)?)?)
@@ -229,6 +222,9 @@ impl Args {
                 Some("-h" | "--help") => return Err("usage: shoal-kernel [--session NAME] [--socket PATH | --embedded-fd FD] [--state-dir PATH] [--policy FILE] [--max-connections N] [--max-tasks-per-session N] [--max-ptys-per-session N] [--max-ptys-per-principal N] [--max-ptys-global N] [--max-subscriptions-per-session N] [--frame-read-timeout-ms N]".into()),
                 _ => return Err(format!("unknown argument {}", k.to_string_lossy())),
             }
+        }
+        if a.embedded_fd.is_some() && a.socket.is_some() {
+            return Err("--embedded-fd and --socket are mutually exclusive".into());
         }
         Ok(a)
     }
@@ -304,6 +300,32 @@ mod tests {
                 .map(std::ffi::OsString::from),
         );
         assert!(result.unwrap_err().contains("--max-connections"));
+    }
+
+    #[test]
+    fn embedded_fd_may_only_be_supplied_once() {
+        let result = Args::parse(
+            ["--embedded-fd", "3", "--embedded-fd", "4"]
+                .into_iter()
+                .map(std::ffi::OsString::from),
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            "--embedded-fd may be specified only once"
+        );
+    }
+
+    #[test]
+    fn embedded_fd_excludes_a_named_socket() {
+        let result = Args::parse(
+            ["--embedded-fd", "3", "--socket", "/tmp/shoal.sock"]
+                .into_iter()
+                .map(std::ffi::OsString::from),
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            "--embedded-fd and --socket are mutually exclusive"
+        );
     }
 
     /// The bug: `--socket /tmp/x.sock` puts the socket's parent at `/tmp` —
