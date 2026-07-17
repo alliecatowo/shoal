@@ -198,6 +198,15 @@ cargo bench -p shoal-exec --bench spawn
 The table benchmark retains one million rows and the journal benchmark seeds 100,000 entries, so
 these are review jobs rather than ordinary unit tests. The inherited performance budgets are:
 
+`table_1m_where_sort` (HR-F5, deep audit I12) now builds a real `shoal_value::Value::Table` and
+drives it through the actual `shoal_value::methods::call_method` dispatcher — the same `where`/
+`sort` entry point `shoal-eval` calls for every language-level `.where(...)`/`.sort(...)` — instead
+of hand-filtering/sorting a bare `Vec<i64>` with plain Rust code, which is what it did before and
+which measured nothing about table-method performance. Closure evaluation itself is stood in by a
+small bench-local `CallCtx` (mirroring `shoal-value`'s own unit-test harness) because interpreting a
+real AST closure needs `shoal-eval`, which sits above `shoal-value` in the dependency graph; the
+bench file's own doc comment states exactly what is and is not measured.
+
 | Workload | Review budget |
 |---|---:|
 | reparse a 10 kB interactive buffer | p99 below 1 ms |
