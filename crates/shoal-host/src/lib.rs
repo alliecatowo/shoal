@@ -333,6 +333,13 @@ mod tests {
     }
 
     #[test]
+    fn init_bootstrap_cannot_bypass_the_evaluator_source_reader() {
+        let production = include_str!("lib.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(!production.contains("std::fs::read_to_string"));
+        assert!(production.contains("eval_source_file(init)"));
+    }
+
+    #[test]
     fn configured_adapter_directories_are_all_active_not_just_the_last() {
         let dir = tempfile::tempdir().unwrap();
         let first = dir.path().join("first");

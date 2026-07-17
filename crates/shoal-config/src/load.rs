@@ -704,6 +704,16 @@ mod tests {
     }
 
     #[test]
+    fn layered_loader_cannot_regress_to_whole_file_reads() {
+        let production = include_str!("load.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(!production.contains("fs::read_to_string"));
+        assert!(production.contains("CONFIG_FILE_MAX_BYTES + 1"));
+    }
+
+    #[test]
     fn non_utf8_layer_has_a_path_aware_error() {
         let t = tempfile::tempdir().unwrap();
         let p = t.path().join("binary.toml");

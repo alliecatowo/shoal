@@ -338,4 +338,18 @@ mod tests {
         symlink(&target, &link).unwrap();
         assert_eq!(read_source_path(&link).unwrap(), "42\n");
     }
+
+    #[test]
+    fn cli_entry_points_cannot_regress_to_whole_source_reads() {
+        for (name, source) in [
+            ("args", include_str!("args.rs")),
+            ("main", include_str!("main.rs")),
+        ] {
+            let production = source.split("#[cfg(test)]").next().unwrap();
+            assert!(
+                !production.contains("read_to_string"),
+                "{name} reintroduced an unbounded whole-source read"
+            );
+        }
+    }
 }
