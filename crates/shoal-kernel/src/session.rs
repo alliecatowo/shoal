@@ -72,7 +72,7 @@ pub(crate) struct Session {
     /// mutex guard. Fail closed instead of treating `PoisonError::into_inner`
     /// as validation of evaluator state.
     quarantined: AtomicBool,
-    last_used: Mutex<Instant>,
+    last_used_ns: AtomicI64,
     /// The evaluator's in-language event bus, cached so wire publishes can
     /// inject into it without taking the evaluator lock (a long-running exec
     /// must not stall `events.publish`).
@@ -82,12 +82,14 @@ pub(crate) struct Session {
 }
 
 pub(crate) const MAX_TRANSCRIPT_PER_SESSION: usize = 4096;
-pub(crate) const MAX_SESSIONS_PER_PRINCIPAL: usize = 64;
-const IDLE_SESSION_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
 impl Session {
     pub(crate) fn touch(&self) {
-        *self.last_used.lock().unwrap() = Instant::now();
+        self.last_used_ns.store(now_ns(), Ordering::Relaxed);
+    }
+
+    pub(crate) fn last_used_ns(&self) -> i64 {
+        self.last_used_ns.load(Ordering::Relaxed)
     }
 
     pub(crate) fn quarantine(&self) {
@@ -125,120 +127,77 @@ impl Kernel {
     /// Get-or-create the principal-private named session.
     pub(crate) fn session(&self, name: &str, principal: &str) -> Result<Arc<Session>, RpcError> {
         let key = SessionKey::new(principal, name);
-        let mut sessions = self.sessions.lock().unwrap();
-        if let Some(session) = sessions.get(&key) {
-            session.touch();
-            return Ok(session.clone());
-        }
-
-        // Drop expired sessions only when the registry owns the final Arc:
-        // attachments, running/retained tasks, and live PTYs all hold leases.
-        let expired = sessions
-            .iter()
-            .filter(|(_, session)| Arc::strong_count(session) == 1)
-            .filter(|(_, session)| session.last_used.lock().unwrap().elapsed() > IDLE_SESSION_TTL)
-            .map(|(key, _)| key.clone())
-            .collect::<Vec<_>>();
-        for expired_key in expired {
-            sessions.remove(&expired_key);
-            self.events.remove_owner(&expired_key.owner());
-        }
-
-        let owned = sessions
-            .iter()
-            .filter(|(session_key, _)| session_key.principal == principal)
-            .count();
-        if owned >= MAX_SESSIONS_PER_PRINCIPAL {
-            let victim = sessions
-                .iter()
-                .filter(|(session_key, session)| {
-                    session_key.principal == principal && Arc::strong_count(session) == 1
-                })
-                .min_by_key(|(_, session)| *session.last_used.lock().unwrap())
-                .map(|(session_key, _)| session_key.clone());
-            let Some(victim) = victim else {
-                return Err(RpcError {
-                    code: QUOTA_EXCEEDED,
-                    message: format!(
-                        "principal has reached the {MAX_SESSIONS_PER_PRINCIPAL}-session limit"
-                    ),
-                    data: Some(json!({
-                        "limit": "sessions_per_principal",
-                        "max": MAX_SESSIONS_PER_PRINCIPAL,
-                    })),
-                });
-            };
-            sessions.remove(&victim);
-            self.events.remove_owner(&victim.owner());
-        }
-
-        let cwd = std::env::current_dir().map_err(internal)?;
-        let mut evaluator = Evaluator::new(cwd);
-        // Long-lived agent/interactive sessions build up `j`/`jump` directory
-        // history against the shared per-user store, same as the REPL (frecency
-        // recording is best-effort and never fails a cd).
-        evaluator.open_default_jump_history();
-        // Install a command journal on the session's own evaluator (site/content/internals/language-conformance-contract.md),
-        // mirroring `crates/shoal/src/repl.rs`'s `set_journal` call: without
-        // this, the evaluator's per-statement journal integration
-        // (`journal_begin_stmt`/`stmt_source` in `shoal-eval/src/journal.rs`)
-        // never runs, so the in-language `history`/`journal` builtin is inert
-        // in every kernel session — even though `handle_exec` already
-        // records the same statement in the kernel's own separate,
-        // coarser exec-level journal (`self.journal` above, unaffected by
-        // this change).
-        //
-        // `Journal::open` here opens a SECOND, independent handle onto the
-        // exact same on-disk state dir `self.journal` was opened against
-        // (SQLite/WAL supports concurrent handles on one store fine) — never
-        // a divergent path: `self.state_dir` is `Some` only when this
-        // `Kernel` was itself built via `Kernel::open`/`open_with_policy`
-        // against that same dir. An ephemeral in-memory kernel
-        // (`Kernel::new`/`with_policy`, what most unit tests use) has no
-        // on-disk state dir at all, so this is skipped entirely there,
-        // exactly as before this change.
-        //
-        // Best-effort, like the REPL: a real open failure (permissions, a
-        // corrupt store, …) must never fail session creation — the session
-        // still works, just with the in-language history/journal builtin
-        // disabled, the same way an interactive REPL degrades when its own
-        // journal can't be opened.
-        if let Some(state_dir) = &self.state_dir {
-            match Journal::open(state_dir) {
-                Ok(journal) => evaluator.set_journal(journal, name, principal),
-                Err(error) => {
-                    eprintln!(
-                        "shoal-kernel: warning: journal unavailable for session {name:?} \
+        self.sessions.get_or_try_insert_with(
+            key.clone(),
+            || {
+                let cwd = std::env::current_dir().map_err(internal)?;
+                let mut evaluator = Evaluator::new(cwd);
+                // Long-lived agent/interactive sessions build up `j`/`jump` directory
+                // history against the shared per-user store, same as the REPL (frecency
+                // recording is best-effort and never fails a cd).
+                evaluator.open_default_jump_history();
+                // Install a command journal on the session's own evaluator (site/content/internals/language-conformance-contract.md),
+                // mirroring `crates/shoal/src/repl.rs`'s `set_journal` call: without
+                // this, the evaluator's per-statement journal integration
+                // (`journal_begin_stmt`/`stmt_source` in `shoal-eval/src/journal.rs`)
+                // never runs, so the in-language `history`/`journal` builtin is inert
+                // in every kernel session — even though `handle_exec` already
+                // records the same statement in the kernel's own separate,
+                // coarser exec-level journal (`self.journal` above, unaffected by
+                // this change).
+                //
+                // `Journal::open` here opens a SECOND, independent handle onto the
+                // exact same on-disk state dir `self.journal` was opened against
+                // (SQLite/WAL supports concurrent handles on one store fine) — never
+                // a divergent path: `self.state_dir` is `Some` only when this
+                // `Kernel` was itself built via `Kernel::open`/`open_with_policy`
+                // against that same dir. An ephemeral in-memory kernel
+                // (`Kernel::new`/`with_policy`, what most unit tests use) has no
+                // on-disk state dir at all, so this is skipped entirely there,
+                // exactly as before this change.
+                //
+                // Best-effort, like the REPL: a real open failure (permissions, a
+                // corrupt store, …) must never fail session creation — the session
+                // still works, just with the in-language history/journal builtin
+                // disabled, the same way an interactive REPL degrades when its own
+                // journal can't be opened.
+                if let Some(state_dir) = &self.state_dir {
+                    match Journal::open(state_dir) {
+                        Ok(journal) => evaluator.set_journal(journal, name, principal),
+                        Err(error) => {
+                            eprintln!(
+                                "shoal-kernel: warning: journal unavailable for session {name:?} \
                          ({error}); in-language history/journal disabled this session"
-                    );
+                            );
+                        }
+                    }
                 }
-            }
-        }
-        // Bridge in-language channels onto the kernel wire bus (see
-        // `site/content/internals/kernel-protocol.md`): `channel("user.x").emit(v)` in evaluated
-        // source reaches `events.subscribe`/`resources/subscribe` clients.
-        // The evaluator forwards only `user.*` (its own guard), so language
-        // code cannot spoof kernel-owned semantic channels.
-        let wire_bus = self.events.clone();
-        let wire_owner = key.owner();
-        evaluator.set_event_forwarder(Box::new(move |channel, payload| {
-            let json = serde_json::to_value(crate::wire::wire_value(payload))
-                .unwrap_or(serde_json::Value::Null);
-            wire_bus.publish(&wire_owner, channel, json);
-        }));
-        let lang_bus = evaluator.event_bus();
-        let session = Arc::new(Session {
-            key: key.clone(),
-            id: name.into(),
-            evaluator: Mutex::new(evaluator),
-            quarantined: AtomicBool::new(false),
-            last_used: Mutex::new(Instant::now()),
-            lang_bus,
-            transcript: Mutex::new(HashMap::new()),
-            next_value: AtomicU64::new(1),
-        });
-        sessions.insert(key, session.clone());
-        Ok(session)
+                // Bridge in-language channels onto the kernel wire bus (see
+                // `site/content/internals/kernel-protocol.md`): `channel("user.x").emit(v)` in evaluated
+                // source reaches `events.subscribe`/`resources/subscribe` clients.
+                // The evaluator forwards only `user.*` (its own guard), so language
+                // code cannot spoof kernel-owned semantic channels.
+                let wire_bus = self.events.clone();
+                let wire_owner = key.owner();
+                evaluator.set_event_forwarder(Box::new(move |channel, payload| {
+                    let json = serde_json::to_value(crate::wire::wire_value(payload))
+                        .unwrap_or(serde_json::Value::Null);
+                    wire_bus.publish(&wire_owner, channel, json);
+                }));
+                let lang_bus = evaluator.event_bus();
+                Ok(Arc::new(Session {
+                    key: key.clone(),
+                    id: name.into(),
+                    evaluator: Mutex::new(evaluator),
+                    quarantined: AtomicBool::new(false),
+                    last_used_ns: AtomicI64::new(now_ns()),
+                    lang_bus,
+                    transcript: Mutex::new(HashMap::new()),
+                    next_value: AtomicU64::new(1),
+                }))
+            },
+            |owner| self.events.remove_owner(owner),
+        )
     }
 
     pub(crate) fn handle_session_attach(

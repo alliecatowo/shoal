@@ -34,12 +34,12 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub struct Kernel {
-    sessions: Mutex<HashMap<SessionKey, Arc<Session>>>,
+    sessions: SessionRegistry,
     connections: ConnectionRegistry,
     max_tasks_per_session: AtomicUsize,
     max_ptys_per_session: AtomicUsize,
@@ -404,7 +404,7 @@ impl Kernel {
     pub fn new() -> Arc<Self> {
         let limits = Limits::default();
         Arc::new(Self {
-            sessions: Mutex::new(HashMap::new()),
+            sessions: SessionRegistry::new(),
             connections: ConnectionRegistry::new(
                 limits.max_connections,
                 limits.frame_read_timeout_ms,
@@ -445,7 +445,7 @@ impl Kernel {
         // correctly still start at 0.
         events.seed_from_journal(&journal);
         Ok(Arc::new(Self {
-            sessions: Mutex::new(HashMap::new()),
+            sessions: SessionRegistry::new(),
             connections: ConnectionRegistry::new(
                 limits.max_connections,
                 limits.frame_read_timeout_ms,
@@ -483,7 +483,7 @@ impl Kernel {
         // Same restart-seq-continuity fix as `Kernel::open` above.
         events.seed_from_journal(&journal);
         Ok(Arc::new(Self {
-            sessions: Mutex::new(HashMap::new()),
+            sessions: SessionRegistry::new(),
             connections: ConnectionRegistry::new(
                 limits.max_connections,
                 limits.frame_read_timeout_ms,
@@ -513,7 +513,7 @@ impl Kernel {
     pub fn with_policy(policy: Policy) -> Arc<Self> {
         let limits = Limits::default();
         Arc::new(Self {
-            sessions: Mutex::new(HashMap::new()),
+            sessions: SessionRegistry::new(),
             connections: ConnectionRegistry::new(
                 limits.max_connections,
                 limits.frame_read_timeout_ms,
@@ -1539,6 +1539,33 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_session_creation_returns_one_registry_object() {
+        let kernel = Kernel::new();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let open = |kernel: Arc<Kernel>, barrier: Arc<std::sync::Barrier>| {
+            std::thread::spawn(move || {
+                barrier.wait();
+                kernel.session("same", "agent:concurrent").unwrap()
+            })
+        };
+        let first = open(kernel.clone(), barrier.clone());
+        let second = open(kernel.clone(), barrier.clone());
+        barrier.wait();
+        let first = first.join().unwrap();
+        let second = second.join().unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(
+            kernel
+                .sessions
+                .snapshot()
+                .keys()
+                .filter(|key| key.principal == "agent:concurrent")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn session_registry_evicts_idle_lru_but_never_active_leases() {
         let kernel = Kernel::new();
         let principal = "agent:bounded-sessions";
@@ -1555,7 +1582,7 @@ mod tests {
         assert_eq!(kernel.events.journal_published_count(&first_owner), 1);
 
         drop(kernel.session("new", principal).unwrap());
-        let sessions = kernel.sessions.lock().unwrap();
+        let sessions = kernel.sessions.snapshot();
         assert_eq!(
             sessions
                 .keys()
@@ -1564,7 +1591,6 @@ mod tests {
             MAX_SESSIONS_PER_PRINCIPAL
         );
         assert!(!sessions.contains_key(&SessionKey::new(principal, "s0")));
-        drop(sessions);
         assert_eq!(
             kernel.events.journal_published_count(&first_owner),
             0,
