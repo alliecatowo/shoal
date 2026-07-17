@@ -202,6 +202,11 @@ shoal lsp
 
 Both forms run an LSP server over stdin/stdout; the dispatcher resolves the companion through `PATH` and accepts no trailing options.
 
+The stdio transport accepts at most 16 KiB/64 headers and a 32 MiB body before tower-lsp sees a
+frame. Invalid, duplicate/missing `Content-Length`, oversized, or truncated frames close the server
+cleanly without echoing request content. Document analysis uses four blocking workers, coalesces one
+latest pending update per URI, and bounds queued analysis source to 32 MiB/64 URI jobs.
+
 Current server capabilities:
 
 | Capability | Behavior |

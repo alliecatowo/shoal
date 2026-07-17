@@ -1,8 +1,11 @@
 mod analysis;
 mod document;
+mod scheduler;
+pub mod transport;
 
 use analysis::{Symbol, collect_symbols};
 use document::*;
+use scheduler::{AnalysisAdmission, AnalysisJob, AnalysisQueue};
 use shoal_ast::{Program, Span};
 use shoal_syntax::commands::{CommandFacts, CommandSource, resolve_command_source};
 use std::{collections::HashMap, sync::Arc};
@@ -15,11 +18,15 @@ const MAX_OPEN_DOCUMENTS: usize = 128;
 pub(crate) const MAX_DOCUMENT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_OPEN_SOURCE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_DOCUMENT_URI_BYTES: usize = 4 * 1024;
+const MAX_SYMBOLS: usize = 1_024;
+const MAX_COMPLETIONS: usize = 1_024;
+const MAX_DIAGNOSTICS: usize = 256;
 
 pub struct Backend {
     client: Client,
     docs: Arc<RwLock<HashMap<Url, DocumentState>>>,
     updates: Arc<Mutex<()>>,
+    analyses: Arc<AnalysisQueue>,
 }
 
 #[derive(Clone)]
@@ -36,6 +43,7 @@ impl Backend {
             client,
             docs: Default::default(),
             updates: Default::default(),
+            analyses: Arc::new(AnalysisQueue::new()),
         }
     }
 
@@ -48,26 +56,75 @@ impl Backend {
             ..Default::default()
         }
     }
-    async fn analyze_and_publish(&self, uri: Url, text: String, version: i32) {
-        let analyze_uri = uri.clone();
-        let fallback_text = text.clone();
-        let state =
-            tokio::task::spawn_blocking(move || analyze_document(&analyze_uri, text, version))
-                .await
-                .unwrap_or_else(|_| analyze_document(&uri, fallback_text, version));
-        let _update = self.updates.lock().await;
-        let current = self.docs.read().await.get(&uri).cloned();
-        if !current
-            .as_ref()
-            .is_some_and(|current| analysis_is_current(current, &state))
-        {
-            return;
+    async fn schedule_analysis(&self, job: AnalysisJob) {
+        match self.analyses.admit(&job).await {
+            AnalysisAdmission::Start => {
+                let client = self.client.clone();
+                let docs = Arc::clone(&self.docs);
+                let updates = Arc::clone(&self.updates);
+                let analyses = Arc::clone(&self.analyses);
+                tokio::spawn(run_analysis_worker(job, client, docs, updates, analyses));
+            }
+            AnalysisAdmission::Rejected(message) => {
+                self.client.log_message(MessageType::WARNING, message).await;
+            }
+            AnalysisAdmission::Queued | AnalysisAdmission::Ignored => {}
         }
-        let diagnostics = state.diagnostics.clone();
-        self.docs.write().await.insert(uri.clone(), state);
-        self.client
-            .publish_diagnostics(uri, diagnostics, Some(version))
-            .await;
+    }
+}
+
+async fn run_analysis_worker(
+    mut job: AnalysisJob,
+    client: Client,
+    docs: Arc<RwLock<HashMap<Url, DocumentState>>>,
+    updates: Arc<Mutex<()>>,
+    analyses: Arc<AnalysisQueue>,
+) {
+    loop {
+        let permit = match Arc::clone(&analyses.permits).acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => return,
+        };
+        let analyze_job = job.clone();
+        let analyzed = tokio::task::spawn_blocking(move || {
+            analyze_document(&analyze_job.uri, analyze_job.text, analyze_job.version)
+        })
+        .await;
+        drop(permit);
+        match analyzed {
+            Ok(state) => {
+                let publish = {
+                    let _update = updates.lock().await;
+                    let current = docs.read().await.get(&job.uri).cloned();
+                    if current
+                        .as_ref()
+                        .is_some_and(|current| analysis_is_current(current, &state))
+                    {
+                        let diagnostics = state.diagnostics.clone();
+                        docs.write().await.insert(job.uri.clone(), state);
+                        Some(diagnostics)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(diagnostics) = publish {
+                    client
+                        .publish_diagnostics(job.uri.clone(), diagnostics, Some(job.version))
+                        .await;
+                }
+            }
+            Err(_) => {
+                client
+                    .log_message(MessageType::ERROR, "document analysis task failed")
+                    .await;
+            }
+        }
+        let completed_uri = job.uri.clone();
+        let completed_version = job.version;
+        let Some(next) = analyses.complete(&completed_uri, completed_version).await else {
+            return;
+        };
+        job = next;
     }
 }
 
@@ -126,7 +183,8 @@ impl LanguageServer for Backend {
                 .await;
             return;
         }
-        self.analyze_and_publish(uri, text, version).await;
+        self.schedule_analysis(AnalysisJob { uri, text, version })
+            .await;
     }
     async fn did_change(&self, p: DidChangeTextDocumentParams) {
         let uri = p.text_document.uri;
@@ -157,9 +215,15 @@ impl LanguageServer for Backend {
                 return;
             }
         };
-        self.analyze_and_publish(uri, next_text, version).await;
+        self.schedule_analysis(AnalysisJob {
+            uri,
+            text: next_text,
+            version,
+        })
+        .await;
     }
     async fn did_close(&self, p: DidCloseTextDocumentParams) {
+        self.analyses.cancel_pending(&p.text_document.uri).await;
         let _update = self.updates.lock().await;
         self.docs.write().await.remove(&p.text_document.uri);
         self.client
@@ -202,6 +266,7 @@ impl LanguageServer for Backend {
         );
         names.sort();
         names.dedup();
+        names.truncate(MAX_COMPLETIONS);
         Ok(Some(CompletionResponse::Array(
             names
                 .into_iter()
@@ -373,6 +438,21 @@ mod tests {
             std::env::temp_dir().join(format!("shoal-lsp-{label}-{}-{nonce}", std::process::id()));
         std::fs::create_dir(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn hostile_symbol_volume_is_bounded_before_responses() {
+        let mut text = String::new();
+        for index in 0..(MAX_SYMBOLS * 2) {
+            text.push_str(&format!("let symbol_{index} = {index}\n"));
+        }
+        let state = analyze_document(
+            &Url::parse("file:///tmp/many-symbols.shl").unwrap(),
+            text,
+            1,
+        );
+        assert_eq!(state.symbols.len(), MAX_SYMBOLS);
+        assert!(state.diagnostics.len() <= MAX_DIAGNOSTICS);
     }
 
     #[test]

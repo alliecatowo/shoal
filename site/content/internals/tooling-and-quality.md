@@ -39,9 +39,11 @@ accDescr: Shows the components and relationships described in Editor service.
 
 Completion and symbols walk the parsed AST, respect lexical scope/visibility and shadowing, and
 include bindings, functions, parameters, aliases, and destructuring patterns. Incremental edits are
-applied sequentially using strict UTF-16 positions and analyzed off the async request thread; stale
-analysis cannot overwrite a newer version. Definition lookup resolves local declarations and the
-exported members/paths of directly used file modules.
+applied sequentially using strict UTF-16 positions and analyzed off the async request thread through
+a four-worker, 32 MiB/64-job scheduler. Same-URI floods retain only the latest pending version; stale
+analysis cannot overwrite a newer version. A bounded stdio pump rejects excessive LSP headers or
+bodies before tower-lsp's codec allocates them. Definition lookup resolves local declarations and
+the exported members/paths of directly used file modules.
 
 It does not currently implement a workspace/project index, references, rename, signature help,
 semantic tokens, code actions, file watching, or type-aware completion. Those features require a

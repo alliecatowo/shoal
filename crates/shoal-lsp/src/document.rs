@@ -367,6 +367,16 @@ pub(super) fn analyze_document(uri: &Url, text: String, version: i32) -> Documen
             Ok(_) => {}
         }
     }
+    diagnostics.truncate(MAX_DIAGNOSTICS);
+    for diagnostic in &mut diagnostics {
+        if diagnostic.message.len() > 4 * 1024 {
+            let mut end = 4 * 1024;
+            while !diagnostic.message.is_char_boundary(end) {
+                end -= 1;
+            }
+            diagnostic.message.truncate(end);
+        }
+    }
     DocumentState {
         text,
         version,

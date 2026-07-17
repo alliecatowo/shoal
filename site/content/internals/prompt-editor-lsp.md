@@ -549,6 +549,12 @@ beyond that range. There is no viewport offset, so a cursor below the first page
 diagnostics, and scoped symbols. The advertised capabilities are incremental sync, formatting,
 completion, hover, goto definition, and document symbols.
 
+Tower-lsp's private codec sits behind Shoal's bounded transport pump: at most 16 KiB/64 headers and
+a 32 MiB JSON body reach it. The body allowance covers worst-case escaping of a 4 MiB document;
+accepted bodies stream through a 64 KiB pipe instead of being copied by the pump. Malformed,
+duplicate/missing-length, over-limit, or truncated frames close stdin processing with a constant
+error and never echo body content.
+
 ```mermaid
 flowchart LR
 accTitle: LSP request and semantic-drift pipeline
@@ -612,10 +618,13 @@ changes sequentially. Internal spans remain UTF-8 bytes and are converted back t
 
 ### Concurrency and lifecycle
 
-Open/change stages a pending version, analyzes outside the document lock on a blocking worker, and
-publishes only if still current. A short update mutex serializes version installation; close removes
-the document and clears diagnostics. Shutdown has no persisted index because there is no workspace
-database.
+Open/change stages a pending version, then enters a 4-worker analysis scheduler with at most 64 URI
+jobs and 32 MiB of active/pending source clones. Repeated changes for one URI replace its single
+pending job with the latest arrival. Budget rejection is logged, blocking-worker panic releases its
+permit, and results publish only when version and text still match; older work cannot install over a
+new edit. Close discards pending analysis, removes the document, and clears diagnostics. Symbol and
+completion projections are capped at 1,024 entries and diagnostics at 256. Shutdown has no persisted
+index because there is no workspace database.
 
 ## Shared semantic drift risks
 

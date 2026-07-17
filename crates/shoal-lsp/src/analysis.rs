@@ -1,3 +1,4 @@
+use crate::MAX_SYMBOLS;
 use shoal_ast::{Block, Expr, Pattern, Program, Span, Stmt, StrPart};
 use tower_lsp::lsp_types::{DocumentSymbol, SymbolKind};
 
@@ -49,6 +50,29 @@ pub(crate) fn collect_symbols(program: &Program, text: &str) -> Vec<Symbol> {
     symbols
 }
 
+fn push_symbol(symbols: &mut Vec<Symbol>, mut symbol: Symbol) {
+    if symbols.len() >= MAX_SYMBOLS || symbol.name.len() > 256 {
+        return;
+    }
+    if symbol.detail.len() > 512 {
+        symbol.detail = truncate_utf8(&symbol.detail, 512);
+    }
+    if let Some(doc) = &mut symbol.doc
+        && doc.len() > 1_024
+    {
+        *doc = truncate_utf8(doc, 1_024);
+    }
+    symbols.push(symbol);
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> String {
+    let mut end = value.len().min(max_bytes);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
+}
+
 fn walk_block_like(stmts: &[Stmt], text: &str, scope: Span, symbols: &mut Vec<Symbol>) {
     for stmt in stmts {
         match stmt {
@@ -74,40 +98,49 @@ fn walk_block_like(stmts: &[Stmt], text: &str, scope: Span, symbols: &mut Vec<Sy
                 walk_expr(init, text, symbols);
             }
             Stmt::Fn { decl } => {
-                symbols.push(Symbol {
-                    name: decl.name.clone(),
-                    span: identifier_span(text, decl.span, &decl.name),
-                    flavor: SymbolFlavor::Function,
-                    detail: format!("fn {}({} params)", decl.name, decl.params.len()),
-                    doc: decl.doc.clone(),
-                    scope,
-                    visible_from: decl.span.start as usize,
-                });
+                push_symbol(
+                    symbols,
+                    Symbol {
+                        name: decl.name.clone(),
+                        span: identifier_span(text, decl.span, &decl.name),
+                        flavor: SymbolFlavor::Function,
+                        detail: format!("fn {}({} params)", decl.name, decl.params.len()),
+                        doc: decl.doc.clone(),
+                        scope,
+                        visible_from: decl.span.start as usize,
+                    },
+                );
                 for param in &decl.params {
-                    symbols.push(Symbol {
-                        name: param.name.clone(),
-                        span: identifier_span(text, param.span, &param.name),
-                        flavor: SymbolFlavor::Parameter,
-                        detail: "function parameter".into(),
-                        doc: None,
-                        scope: decl.body.span,
-                        visible_from: decl.body.span.start as usize,
-                    });
+                    push_symbol(
+                        symbols,
+                        Symbol {
+                            name: param.name.clone(),
+                            span: identifier_span(text, param.span, &param.name),
+                            flavor: SymbolFlavor::Parameter,
+                            detail: "function parameter".into(),
+                            doc: None,
+                            scope: decl.body.span,
+                            visible_from: decl.body.span.start as usize,
+                        },
+                    );
                     if let Some(default) = &param.default {
                         walk_expr(default, text, symbols);
                     }
                 }
                 walk_block_like(&decl.body.stmts, text, decl.body.span, symbols);
             }
-            Stmt::Alias { name, span, .. } => symbols.push(Symbol {
-                name: name.clone(),
-                span: identifier_span(text, *span, name),
-                flavor: SymbolFlavor::Alias,
-                detail: "command alias".into(),
-                doc: None,
-                scope,
-                visible_from: span.end as usize,
-            }),
+            Stmt::Alias { name, span, .. } => push_symbol(
+                symbols,
+                Symbol {
+                    name: name.clone(),
+                    span: identifier_span(text, *span, name),
+                    flavor: SymbolFlavor::Alias,
+                    detail: "command alias".into(),
+                    doc: None,
+                    scope,
+                    visible_from: span.end as usize,
+                },
+            ),
             Stmt::Assign { target, value, .. } => {
                 walk_expr(target, text, symbols);
                 walk_expr(value, text, symbols);
@@ -153,46 +186,55 @@ fn pattern_symbols(
     out: &mut Vec<Symbol>,
 ) {
     match pattern {
-        Pattern::Bind { name, span } => out.push(Symbol {
-            name: name.clone(),
-            span: identifier_span(text, *span, name),
-            flavor,
-            detail: match flavor {
-                SymbolFlavor::MutableBinding => "mutable binding",
-                _ => "immutable binding",
-            }
-            .into(),
-            doc: None,
-            scope,
-            visible_from,
-        }),
+        Pattern::Bind { name, span } => push_symbol(
+            out,
+            Symbol {
+                name: name.clone(),
+                span: identifier_span(text, *span, name),
+                flavor,
+                detail: match flavor {
+                    SymbolFlavor::MutableBinding => "mutable binding",
+                    _ => "immutable binding",
+                }
+                .into(),
+                doc: None,
+                scope,
+                visible_from,
+            },
+        ),
         Pattern::Type {
             name: Some(name),
             span,
             ..
-        } => out.push(Symbol {
-            name: name.clone(),
-            span: identifier_span(text, *span, name),
-            flavor,
-            detail: "typed binding".into(),
-            doc: None,
-            scope,
-            visible_from,
-        }),
+        } => push_symbol(
+            out,
+            Symbol {
+                name: name.clone(),
+                span: identifier_span(text, *span, name),
+                flavor,
+                detail: "typed binding".into(),
+                doc: None,
+                scope,
+                visible_from,
+            },
+        ),
         Pattern::Record { fields, .. } => {
             for field in fields {
                 if let Some(pattern) = &field.pattern {
                     pattern_symbols(pattern, flavor, scope, visible_from, text, out);
                 } else {
-                    out.push(Symbol {
-                        name: field.name.clone(),
-                        span: identifier_span(text, pattern.span(), &field.name),
-                        flavor,
-                        detail: "record destructure binding".into(),
-                        doc: None,
-                        scope,
-                        visible_from,
-                    });
+                    push_symbol(
+                        out,
+                        Symbol {
+                            name: field.name.clone(),
+                            span: identifier_span(text, pattern.span(), &field.name),
+                            flavor,
+                            detail: "record destructure binding".into(),
+                            doc: None,
+                            scope,
+                            visible_from,
+                        },
+                    );
                 }
             }
         }
@@ -201,15 +243,18 @@ fn pattern_symbols(
                 pattern_symbols(pattern, flavor, scope, visible_from, text, out);
             }
             if let Some(name) = rest {
-                out.push(Symbol {
-                    name: name.clone(),
-                    span: last_identifier_span(text, pattern.span(), name),
-                    flavor,
-                    detail: "list rest binding".into(),
-                    doc: None,
-                    scope,
-                    visible_from,
-                });
+                push_symbol(
+                    out,
+                    Symbol {
+                        name: name.clone(),
+                        span: last_identifier_span(text, pattern.span(), name),
+                        flavor,
+                        detail: "list rest binding".into(),
+                        doc: None,
+                        scope,
+                        visible_from,
+                    },
+                );
             }
         }
         _ => {}
@@ -255,15 +300,18 @@ fn walk_expr(expr: &Expr, text: &str, out: &mut Vec<Symbol>) {
         }
         Expr::Lambda { params, body, .. } => {
             for param in params {
-                out.push(Symbol {
-                    name: param.name.clone(),
-                    span: identifier_span(text, param.span, &param.name),
-                    flavor: SymbolFlavor::Parameter,
-                    detail: "lambda parameter".into(),
-                    doc: None,
-                    scope: expr.span(),
-                    visible_from: body.span().start as usize,
-                });
+                push_symbol(
+                    out,
+                    Symbol {
+                        name: param.name.clone(),
+                        span: identifier_span(text, param.span, &param.name),
+                        flavor: SymbolFlavor::Parameter,
+                        detail: "lambda parameter".into(),
+                        doc: None,
+                        scope: expr.span(),
+                        visible_from: body.span().start as usize,
+                    },
+                );
             }
             walk_expr(body, text, out);
         }
@@ -335,15 +383,18 @@ fn walk_expr(expr: &Expr, text: &str, out: &mut Vec<Symbol>) {
         } => {
             walk_expr(expr, text, out);
             if let Some(name) = binder {
-                out.push(Symbol {
-                    name: name.clone(),
-                    span: identifier_span(text, *span, name),
-                    flavor: SymbolFlavor::Binding,
-                    detail: "error binding".into(),
-                    doc: None,
-                    scope: handler.span(),
-                    visible_from: handler.span().start as usize,
-                });
+                push_symbol(
+                    out,
+                    Symbol {
+                        name: name.clone(),
+                        span: identifier_span(text, *span, name),
+                        flavor: SymbolFlavor::Binding,
+                        detail: "error binding".into(),
+                        doc: None,
+                        scope: handler.span(),
+                        visible_from: handler.span().start as usize,
+                    },
+                );
             }
             walk_expr(handler, text, out);
         }
