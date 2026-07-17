@@ -53,6 +53,14 @@ pub(crate) struct Attachment {
     /// installs it only after acquiring the session evaluator, so a later
     /// request cannot replace its cancellation handle while it is queued.
     pub(crate) cancel_epoch: Option<shoal_exec::CancelToken>,
+    /// Authenticated bearer metadata contains no secret but is sufficient to
+    /// refresh revocation/expiry status against the token store before every
+    /// subsequent request. Local attachment modes leave this empty.
+    pub(crate) bearer: Option<TokenMeta>,
+    /// Runtime security contract under which this attachment was created.
+    /// Keeping it on the live attachment makes future epoch bumps fail closed
+    /// instead of silently carrying old authority forward.
+    pub(crate) security_epoch: u32,
 }
 
 pub(crate) struct Session {
@@ -260,39 +268,49 @@ impl Kernel {
                 data: None,
             });
         }
-        let (who, token_caps, profile, local_human, auth_mode) = if let Some(token) = params.token {
-            let auth = self.auth.as_ref().ok_or_else(|| RpcError {
-                code: AUTH_FAILED,
-                message: "bearer tokens unavailable in ephemeral kernel".into(),
-                data: None,
-            })?;
-            let meta = auth
-                .lock()
-                .unwrap()
-                .validate(&token)
-                .ok_or_else(|| RpcError {
+        let (who, token_caps, profile, local_human, auth_mode, bearer) =
+            if let Some(token) = params.token {
+                let auth = self.auth.as_ref().ok_or_else(|| RpcError {
                     code: AUTH_FAILED,
-                    message: "invalid, expired, or revoked bearer token".into(),
+                    message: "bearer tokens unavailable in ephemeral kernel".into(),
                     data: None,
                 })?;
-            (meta.principal, meta.caps, meta.profile, false, "bearer")
-        } else if local_auth.unwrap_or_default() == LocalAuthMode::LocalHuman {
-            (
-                principal(),
-                vec![],
-                "local-human".into(),
-                true,
-                "local-human",
-            )
-        } else {
-            (
-                "agent:mcp".into(),
-                vec![],
-                "restricted-agent".into(),
-                false,
-                "restricted-agent",
-            )
-        };
+                let meta = auth
+                    .lock()
+                    .unwrap()
+                    .validate(&token)
+                    .ok_or_else(|| RpcError {
+                        code: AUTH_FAILED,
+                        message: "invalid, expired, or revoked bearer token".into(),
+                        data: None,
+                    })?;
+                (
+                    meta.principal.clone(),
+                    meta.caps.clone(),
+                    meta.profile.clone(),
+                    false,
+                    "bearer",
+                    Some(meta),
+                )
+            } else if local_auth.unwrap_or_default() == LocalAuthMode::LocalHuman {
+                (
+                    principal(),
+                    vec![],
+                    "local-human".into(),
+                    true,
+                    "local-human",
+                    None,
+                )
+            } else {
+                (
+                    "agent:mcp".into(),
+                    vec![],
+                    "restricted-agent".into(),
+                    false,
+                    "restricted-agent",
+                    None,
+                )
+            };
         let can_approve = local_human
             || profile == "supervisor"
             || token_caps.iter().any(|cap| cap == "plan.approve");
@@ -318,6 +336,8 @@ impl Kernel {
             can_approve,
             tty,
             cancel_epoch: None,
+            bearer,
+            security_epoch: ATTACH_SECURITY_EPOCH,
         });
         // site/content/internals/language-conformance-contract.md tier honesty: report the REAL strongest OS backend
         // available on this host (Landlock → A, Seatbelt → C, else

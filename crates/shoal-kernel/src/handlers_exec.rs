@@ -658,6 +658,8 @@ mod tests {
             can_approve: true,
             tty: false,
             cancel_epoch: None,
+            bearer: None,
+            security_epoch: ATTACH_SECURITY_EPOCH,
         };
         (session, Some(attachment))
     }
@@ -776,6 +778,8 @@ mod tests {
             can_approve: true,
             tty: false,
             cancel_epoch: None,
+            bearer: None,
+            security_epoch: ATTACH_SECURITY_EPOCH,
         });
 
         let marker_src = "let set_source_probe_9182 = 9182";

@@ -136,6 +136,32 @@ impl TokenStore {
             .map(|t| t.meta.clone())
     }
 
+    /// Refresh the status of a token that was already authenticated with its
+    /// bearer. This deliberately accepts the prior private [`TokenMeta`]
+    /// record rather than a public token id alone, so it cannot become an
+    /// alternate bearer-authentication path. The disk snapshot is fresh and
+    /// storage failures, revocation, expiry, or identity replacement all fail
+    /// closed.
+    pub fn refresh_authenticated(&self, attached: &TokenMeta) -> Option<TokenMeta> {
+        let (_, tokens) = with_shared_lock(&self.path, || load_unlocked(&self.path)).ok()?;
+        let now = now_ns();
+        tokens
+            .into_iter()
+            .find(|token| {
+                token.meta.id == attached.id
+                    && token.meta.created_ns == attached.created_ns
+                    && token.meta.principal == attached.principal
+                    && token.meta.profile == attached.profile
+                    && token.meta.caps == attached.caps
+                    && token.meta.expires_ns == attached.expires_ns
+            })
+            .filter(|token| {
+                token.meta.revoked_ns.is_none()
+                    && token.meta.expires_ns.is_none_or(|expires| expires > now)
+            })
+            .map(|token| token.meta)
+    }
+
     /// Fallible, fresh list for callers that need storage errors surfaced.
     pub fn try_list(&self) -> io::Result<Vec<TokenMeta>> {
         with_shared_lock(&self.path, || {
@@ -350,12 +376,14 @@ mod tests {
 
         let reader = TokenStore::open(&p).unwrap();
         assert_eq!(reader.validate(&bearer).unwrap().id, meta.id);
+        assert_eq!(reader.refresh_authenticated(&meta).unwrap().id, meta.id);
         let mut revoker = TokenStore::open(&p).unwrap();
         assert!(revoker.revoke(&meta.id).unwrap());
         // validate reloads under a shared file lock, so the already-open reader
         // observes another process/store's revoke rather than trusting a stale
         // startup snapshot.
         assert!(reader.validate(&bearer).is_none());
+        assert!(reader.refresh_authenticated(&meta).is_none());
     }
 
     #[test]

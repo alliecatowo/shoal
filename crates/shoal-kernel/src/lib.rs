@@ -16,7 +16,7 @@ use wire::*;
 
 use serde_json::{Value as Json, json};
 use shoal_ast::{Program, Stmt};
-use shoal_auth::TokenStore;
+use shoal_auth::{TokenMeta, TokenStore};
 use shoal_eval::{Evaluator, Position};
 use shoal_journal::{EntryRecord, Journal, JournalQuery};
 use shoal_leash::{
@@ -1617,6 +1617,8 @@ mod tests {
             can_approve: false,
             tty: false,
             cancel_epoch: None,
+            bearer: None,
+            security_epoch: ATTACH_SECURITY_EPOCH,
         });
 
         let listed = kernel.handle_task_list(&mut attached).unwrap();
@@ -1638,6 +1640,8 @@ mod tests {
             can_approve: false,
             tty: false,
             cancel_epoch: None,
+            bearer: None,
+            security_epoch: ATTACH_SECURITY_EPOCH,
         });
         let mut beta_attached = Some(Attachment {
             session: beta,
@@ -1645,6 +1649,8 @@ mod tests {
             can_approve: false,
             tty: false,
             cancel_epoch: None,
+            bearer: None,
+            security_epoch: ATTACH_SECURITY_EPOCH,
         });
 
         let opened = kernel
@@ -1883,6 +1889,8 @@ mod tests {
             can_approve: false,
             tty: false,
             cancel_epoch: None,
+            bearer: None,
+            security_epoch: ATTACH_SECURITY_EPOCH,
         });
         let opened = kernel
             .handle_pty_open(json!({"cmd":"sh", "args":["-c", "exit 0"]}), &mut attached)
@@ -2685,7 +2693,7 @@ mod tests {
     fn bearer_attach_uses_token_principal_and_rejects_invalid() {
         let dir = tempfile::tempdir().unwrap();
         let mut tokens = TokenStore::open(dir.path().join("tokens.json")).unwrap();
-        let (secret, _) = tokens
+        let (secret, meta) = tokens
             .create(
                 "agent:codex".into(),
                 "readonly".into(),
@@ -2707,10 +2715,29 @@ mod tests {
             json!({"token":secret,"client":{"kind":"agent","tty":false}}),
         );
         assert_eq!(attached.result.unwrap()["principal"], "agent:codex");
+        assert!(
+            call(&mut client, &mut reader, 2, "parse", json!({"src":"1 + 2"}))
+                .error
+                .is_none()
+        );
+        let mut revoker = TokenStore::open(dir.path().join("tokens.json")).unwrap();
+        assert!(revoker.revoke(&meta.id).unwrap());
+        let revoked = call(&mut client, &mut reader, 3, "parse", json!({"src":"1 + 2"}));
+        assert_eq!(revoked.error.unwrap().code, AUTH_FAILED);
+        let detached = call(&mut client, &mut reader, 4, "session.env", json!({}));
+        assert_eq!(detached.error.unwrap().code, NOT_ATTACHED);
+        let reattached = call(
+            &mut client,
+            &mut reader,
+            5,
+            "session.attach",
+            json!({"client":{"kind":"agent","tty":false}}),
+        );
+        assert_eq!(reattached.result.unwrap()["auth_mode"], "restricted-agent");
         let denied = call(
             &mut client,
             &mut reader,
-            2,
+            6,
             "session.attach",
             json!({"token":"not-a-token","client":{"kind":"agent","tty":false}}),
         );
@@ -2718,6 +2745,34 @@ mod tests {
         drop(client);
         drop(reader);
         thread.join().unwrap();
+    }
+
+    #[test]
+    fn stale_attachment_security_epoch_fails_closed_and_detaches() {
+        let kernel = Kernel::new();
+        let session = kernel.session("stale-epoch", "agent:mcp").unwrap();
+        let mut attached = Some(Attachment {
+            session,
+            principal: "agent:mcp".into(),
+            can_approve: false,
+            tty: false,
+            cancel_epoch: None,
+            bearer: None,
+            security_epoch: ATTACH_SECURITY_EPOCH.saturating_sub(1),
+        });
+        let response = kernel.dispatch(
+            Request {
+                jsonrpc: JSONRPC.into(),
+                id: json!(1),
+                method: "parse".into(),
+                params: json!({"src":"1 + 2"}),
+            },
+            77,
+            &mut attached,
+            None,
+        );
+        assert_eq!(response.error.unwrap().code, AUTH_FAILED);
+        assert!(attached.is_none());
     }
 
     #[test]

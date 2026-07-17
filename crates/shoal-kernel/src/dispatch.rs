@@ -19,6 +19,17 @@ impl Kernel {
         let method = request.method;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
             || -> Result<Json, RpcError> {
+                // Reattachment is always available as the recovery path. All
+                // other requests, including pure parse/complete calls, must
+                // revalidate the authority of an established attachment.
+                if method != "session.attach"
+                    && let Some(attachment) = attached.as_ref()
+                    && let Err(error) = self.ensure_attachment_current(attachment)
+                {
+                    self.events.remove_conn(client);
+                    *attached = None;
+                    return Err(error);
+                }
                 // `parse` and `complete` are session-independent, and
                 // `session.attach` must remain available so this connection
                 // can move to a different healthy session.
@@ -104,6 +115,39 @@ impl Kernel {
                 result: None,
                 error: Some(error),
             },
+        }
+    }
+}
+
+impl Kernel {
+    fn ensure_attachment_current(&self, attachment: &Attachment) -> Result<(), RpcError> {
+        if attachment.security_epoch != ATTACH_SECURITY_EPOCH {
+            return Err(RpcError {
+                code: AUTH_FAILED,
+                message: "attachment security epoch is no longer accepted".into(),
+                data: Some(json!({
+                    "attached_epoch": attachment.security_epoch,
+                    "required_epoch": ATTACH_SECURITY_EPOCH,
+                })),
+            });
+        }
+        let Some(meta) = &attachment.bearer else {
+            return Ok(());
+        };
+        let valid = self
+            .auth
+            .as_ref()
+            .and_then(|store| store.lock().ok())
+            .and_then(|store| store.refresh_authenticated(meta))
+            .is_some();
+        if valid {
+            Ok(())
+        } else {
+            Err(RpcError {
+                code: AUTH_FAILED,
+                message: "attached bearer is expired, revoked, or unavailable".into(),
+                data: Some(json!({"reauthenticate": true})),
+            })
         }
     }
 }
