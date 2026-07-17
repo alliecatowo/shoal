@@ -26,6 +26,9 @@ pub(crate) struct ProtocolOutcome {
     pub render: Option<String>,
     pub state: String,
     pub exit_code: Option<i32>,
+    /// The evaluator already delivered an interactive PTY outcome directly to
+    /// the inherited terminal, so printing `render` would duplicate it.
+    pub streamed: bool,
 }
 
 pub(crate) struct ProtocolSession<R> {
@@ -84,33 +87,35 @@ impl<R: KernelRpc> ProtocolSession<R> {
             if state != "cancelled"
                 && let Some(error) = record.get("error").filter(|error| !error.is_null())
             {
-                let message = error
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("kernel task failed");
-                return Err(message.to_string());
+                return Err(task_error_message(error));
             }
             let value_ref = record
                 .get("result_ref")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
-            let render = if let Some(value_ref) = &value_ref {
-                self.rpc
-                    .call(
-                        "value.get",
-                        json!({
-                            "ref": value_ref,
-                            "path": null,
-                            "slice": null,
-                            "format": "render",
-                            "width": width,
-                        }),
-                    )?
-                    .get("render")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
+            let (render, streamed) = if let Some(value_ref) = &value_ref {
+                let rendered = self.rpc.call(
+                    "value.get",
+                    json!({
+                        "ref": value_ref,
+                        "path": null,
+                        "slice": null,
+                        "format": "render",
+                        "width": width,
+                    }),
+                )?;
+                (
+                    rendered
+                        .get("render")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    rendered
+                        .get("streamed")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                )
             } else {
-                None
+                (None, false)
             };
             return Ok(ProtocolOutcome {
                 value_ref,
@@ -120,6 +125,7 @@ impl<R: KernelRpc> ProtocolSession<R> {
                     .get("exit_code")
                     .and_then(Value::as_i64)
                     .and_then(|code| i32::try_from(code).ok()),
+                streamed,
             });
         }
     }
@@ -132,6 +138,27 @@ impl<R: KernelRpc> ProtocolSession<R> {
     fn into_inner(self) -> R {
         self.rpc
     }
+}
+
+fn task_error_message(error: &Value) -> String {
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("kernel task failed");
+    let data = error.get("data");
+    let code = data
+        .and_then(|data| data.get("code"))
+        .and_then(Value::as_str);
+    let hint = data
+        .and_then(|data| data.get("hint"))
+        .and_then(Value::as_str);
+    let mut rendered =
+        code.map_or_else(|| message.to_string(), |code| format!("{code}: {message}"));
+    if let Some(hint) = hint {
+        rendered.push_str("\nhint: ");
+        rendered.push_str(hint);
+    }
+    rendered
 }
 
 #[cfg(test)]
@@ -165,7 +192,7 @@ mod tests {
                     "result_ref":"out:1",
                     "error":null
                 })),
-                Ok(json!({"ref":"out:1","render":"42"})),
+                Ok(json!({"ref":"out:1","render":"42","streamed":false})),
             ]),
             ..FakeRpc::default()
         };
@@ -180,6 +207,7 @@ mod tests {
                 render: Some("42".into()),
                 state: "completed".into(),
                 exit_code: None,
+                streamed: false,
             }
         );
         let rpc = session.into_inner();
@@ -214,6 +242,7 @@ mod tests {
             .unwrap();
         assert_eq!(outcome.state, "cancelled");
         assert_eq!(outcome.exit_code, None);
+        assert!(!outcome.streamed);
         let rpc = session.into_inner();
         assert_eq!(
             rpc.calls
@@ -248,6 +277,31 @@ mod tests {
     }
 
     #[test]
+    fn structured_task_error_keeps_language_code_and_hint() {
+        let rpc = FakeRpc {
+            responses: VecDeque::from([
+                Ok(json!({"task":"task:5"})),
+                Ok(json!({
+                    "state":"failed",
+                    "result_ref":null,
+                    "error":{
+                        "message":"unknown name `deploy`",
+                        "data":{"code":"name_error","hint":"define it first"}
+                    }
+                })),
+            ]),
+            ..FakeRpc::default()
+        };
+        let mut session = ProtocolSession::with_poll_interval(rpc, Duration::ZERO);
+        assert_eq!(
+            session
+                .execute("deploy", &AtomicBool::new(false), 80)
+                .unwrap_err(),
+            "name_error: unknown name `deploy`\nhint: define it first"
+        );
+    }
+
+    #[test]
     fn exit_code_is_preserved_for_the_interactive_driver() {
         let rpc = FakeRpc {
             responses: VecDeque::from([
@@ -266,5 +320,35 @@ mod tests {
             .execute("exit 7", &AtomicBool::new(false), 80)
             .unwrap();
         assert_eq!(outcome.exit_code, Some(7));
+    }
+
+    #[test]
+    fn live_pty_metadata_is_preserved_for_exactly_once_rendering() {
+        let rpc = FakeRpc {
+            responses: VecDeque::from([
+                Ok(json!({"task":"task:4"})),
+                Ok(json!({
+                    "state":"completed",
+                    "result_ref":"out:4",
+                    "error":null
+                })),
+                Ok(json!({
+                    "ref":"out:4",
+                    "render":"already printed",
+                    "streamed":true
+                })),
+            ]),
+            ..FakeRpc::default()
+        };
+        let mut session = ProtocolSession::with_poll_interval(rpc, Duration::ZERO);
+        let outcome = session
+            .execute(
+                "/usr/bin/printf already\\ printed",
+                &AtomicBool::new(false),
+                80,
+            )
+            .unwrap();
+        assert!(outcome.streamed);
+        assert_eq!(outcome.render.as_deref(), Some("already printed"));
     }
 }
