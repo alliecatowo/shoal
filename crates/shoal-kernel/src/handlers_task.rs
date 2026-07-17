@@ -165,31 +165,31 @@ impl Kernel {
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
         let session = &attachment.session;
         let p: PlanApplyParams = decode(params)?;
-        let mut plans = self.plans.lock().unwrap();
-        if plans.get(&p.plan_ref).is_some_and(plan_expired) {
-            plans.remove(&p.plan_ref);
-        }
-        let stored = plans.get(&p.plan_ref).ok_or_else(|| RpcError {
-            code: UNKNOWN_PLAN,
-            message: "unknown or expired plan_ref".into(),
-            data: Some(json!({ "plan_ref": p.plan_ref })),
-        })?;
-        if (stored.session != session.id || stored.principal != attachment.principal)
-            && !attachment.can_approve
-        {
-            return Err(RpcError {
-                code: LEASH_DENIED,
-                message: "plan belongs to another principal/session".into(),
-                data: None,
-            });
-        }
-        // Re-parse the stored source so the canonical AST travels alongside the
-        // derived effects (the plan record itself keeps only source + effects).
-        // The source parsed cleanly when the plan was stored, so this succeeds;
-        // an `ast: null` is an honest gap, never a fabricated tree.
-        let ast = shoal_syntax::parse(&stored.src).ok();
-        let verdict = self.policy.evaluate_plan(&stored.principal, &stored.plan);
-        encode(json!({
+        self.plans.transaction(|plans| {
+            if plans.get(&p.plan_ref).is_some_and(plan_expired) {
+                plans.remove(&p.plan_ref);
+            }
+            let stored = plans.get(&p.plan_ref).ok_or_else(|| RpcError {
+                code: UNKNOWN_PLAN,
+                message: "unknown or expired plan_ref".into(),
+                data: Some(json!({ "plan_ref": p.plan_ref })),
+            })?;
+            if (stored.session != session.id || stored.principal != attachment.principal)
+                && !attachment.can_approve
+            {
+                return Err(RpcError {
+                    code: LEASH_DENIED,
+                    message: "plan belongs to another principal/session".into(),
+                    data: None,
+                });
+            }
+            // Re-parse the stored source so the canonical AST travels alongside the
+            // derived effects (the plan record itself keeps only source + effects).
+            // The source parsed cleanly when the plan was stored, so this succeeds;
+            // an `ast: null` is an honest gap, never a fabricated tree.
+            let ast = shoal_syntax::parse(&stored.src).ok();
+            let verdict = self.policy.evaluate_plan(&stored.principal, &stored.plan);
+            encode(json!({
             "ast_version": AST_VERSION,
             "ast": ast,
             "plan_ref": stored.plan.plan_ref,
@@ -202,7 +202,8 @@ impl Kernel {
             // — requester, approver, scope, when, and the consuming execution.
             "approval": approval_json(stored.authorization.approval()),
             "src": stored.src,
-        }))
+            }))
+        })
     }
 
     /// `plan.list` (site/content/internals/kernel-protocol.md): the open plans this session/principal
@@ -216,24 +217,25 @@ impl Kernel {
     ) -> Result<Json, RpcError> {
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
         let session = &attachment.session;
-        let mut plans = self.plans.lock().unwrap();
-        plans.retain(|_, stored| !plan_expired(stored));
-        let records: Vec<Json> = plans
-            .values()
-            .filter(|sp| sp.session == session.id && sp.principal == attachment.principal)
-            .map(|sp| {
-                let verdict = self.policy.evaluate_plan(&sp.principal, &sp.plan);
-                json!({
-                    "plan_ref": sp.plan.plan_ref,
-                    "effects": sp.plan.effects,
-                    "reversibility": reversibility_from_effects(&sp.plan.effects),
-                    "verdict": verdict_name(verdict),
-                    "approval_pending": sp.authorization.is_pending(),
-                    "approved": sp.authorization.is_approved(),
+        self.plans.transaction(|plans| {
+            plans.retain(|_, stored| !plan_expired(stored));
+            let records: Vec<Json> = plans
+                .values()
+                .filter(|sp| sp.session == session.id && sp.principal == attachment.principal)
+                .map(|sp| {
+                    let verdict = self.policy.evaluate_plan(&sp.principal, &sp.plan);
+                    json!({
+                        "plan_ref": sp.plan.plan_ref,
+                        "effects": sp.plan.effects,
+                        "reversibility": reversibility_from_effects(&sp.plan.effects),
+                        "verdict": verdict_name(verdict),
+                        "approval_pending": sp.authorization.is_pending(),
+                        "approved": sp.authorization.is_approved(),
+                    })
                 })
-            })
-            .collect();
-        encode(records)
+                .collect();
+            encode(records)
+        })
     }
 
     pub(crate) fn handle_plan_apply(
@@ -246,60 +248,62 @@ impl Kernel {
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
         let session = &attachment.session;
         let p: PlanApplyParams = decode(params)?;
-        let mut plans = self.plans.lock().unwrap();
-        if plans.get(&p.plan_ref).is_some_and(plan_expired) {
-            plans.remove(&p.plan_ref);
-        }
-        let stored = plans.get(&p.plan_ref).ok_or_else(|| RpcError {
-            code: UNKNOWN_PLAN,
-            message: "unknown plan_ref".into(),
-            data: None,
-        })?;
-        if stored.session != session.id || stored.principal != attachment.principal {
-            return Err(RpcError {
-                code: LEASH_DENIED,
-                message: "plan belongs to another principal/session".into(),
-                data: None,
-            });
-        }
-        match &stored.authorization {
-            PlanAuthorization::PolicyAllowed
-                if self
-                    .policy
-                    .evaluate_plan(&attachment.principal, &stored.plan)
-                    == Verdict::Allow => {}
-            PlanAuthorization::Approved(_) => {}
-            PlanAuthorization::Pending => {
-                return Err(RpcError {
-                    code: APPROVAL_REQUIRED,
-                    message: "plan approval pending".into(),
+        let src = self
+            .plans
+            .transaction(|plans| -> Result<String, RpcError> {
+                if plans.get(&p.plan_ref).is_some_and(plan_expired) {
+                    plans.remove(&p.plan_ref);
+                }
+                let stored = plans.get(&p.plan_ref).ok_or_else(|| RpcError {
+                    code: UNKNOWN_PLAN,
+                    message: "unknown plan_ref".into(),
                     data: None,
-                });
-            }
-            PlanAuthorization::Claimed(_) => {
-                return Err(RpcError {
-                    code: LEASH_DENIED,
-                    message: "approved plan is already being applied".into(),
-                    data: None,
-                });
-            }
-            PlanAuthorization::Consumed(record) => {
-                return Err(RpcError {
-                    code: LEASH_DENIED,
-                    message: "approval was already consumed".into(),
-                    data: Some(json!({"consumed_by": record.consumed_by})),
-                });
-            }
-            PlanAuthorization::Denied | PlanAuthorization::PolicyAllowed => {
-                return Err(RpcError {
-                    code: LEASH_DENIED,
-                    message: "plan is denied by policy".into(),
-                    data: None,
-                });
-            }
-        }
-        let src = stored.src.clone();
-        drop(plans);
+                })?;
+                if stored.session != session.id || stored.principal != attachment.principal {
+                    return Err(RpcError {
+                        code: LEASH_DENIED,
+                        message: "plan belongs to another principal/session".into(),
+                        data: None,
+                    });
+                }
+                match &stored.authorization {
+                    PlanAuthorization::PolicyAllowed
+                        if self
+                            .policy
+                            .evaluate_plan(&attachment.principal, &stored.plan)
+                            == Verdict::Allow => {}
+                    PlanAuthorization::Approved(_) => {}
+                    PlanAuthorization::Pending => {
+                        return Err(RpcError {
+                            code: APPROVAL_REQUIRED,
+                            message: "plan approval pending".into(),
+                            data: None,
+                        });
+                    }
+                    PlanAuthorization::Claimed(_) => {
+                        return Err(RpcError {
+                            code: LEASH_DENIED,
+                            message: "approved plan is already being applied".into(),
+                            data: None,
+                        });
+                    }
+                    PlanAuthorization::Consumed(record) => {
+                        return Err(RpcError {
+                            code: LEASH_DENIED,
+                            message: "approval was already consumed".into(),
+                            data: Some(json!({"consumed_by": record.consumed_by})),
+                        });
+                    }
+                    PlanAuthorization::Denied | PlanAuthorization::PolicyAllowed => {
+                        return Err(RpcError {
+                            code: LEASH_DENIED,
+                            message: "plan is denied by policy".into(),
+                            data: None,
+                        });
+                    }
+                }
+                Ok(stored.src.clone())
+            })?;
         let response = self.dispatch(
             Request {
                 jsonrpc: JSONRPC.into(),
@@ -360,128 +364,134 @@ impl Kernel {
         // Validate and mutate under ONE plans lock. No caller can replace or
         // mutate the object between authorization and approval, and the record
         // copies the immutable binding from the exact object we approved.
-        let (plan_effect_kinds, requester) = {
-            let mut plans = self.plans.lock().unwrap();
-            if plans.get(&plan_ref).is_some_and(plan_expired) {
-                plans.remove(&plan_ref);
-            }
-            let stored = plans.get_mut(&plan_ref).ok_or_else(|| RpcError {
-                code: UNKNOWN_PLAN,
-                message: "unknown plan_ref".into(),
-                data: None,
-            })?;
-
-            let requester = stored.principal.clone();
-            let self_ack = approver == requester && self.allow_self_ack.load(Ordering::SeqCst);
-            if approver == requester && !self_ack {
-                return Err(RpcError {
-                    code: LEASH_DENIED,
-                    message: "self-approval is not permitted: a plan's approver must differ from \
-                              its requester (enable self-acknowledgement explicitly to override)"
-                        .into(),
-                    data: Some(json!({
-                        "plan_ref": plan_ref,
-                        "requester": requester,
-                        "approver": approver,
-                    })),
-                });
-            }
-            if approver != requester && !can_approve {
-                return Err(RpcError {
-                    code: LEASH_DENIED,
-                    message: "approver is not authorized: use a local-human attachment, the \
-                              supervisor profile, or the plan.approve capability"
-                        .into(),
-                    data: Some(json!({
-                        "plan_ref": plan_ref,
-                        "requester": requester,
-                        "approver": approver,
-                    })),
-                });
-            }
-            if self.policy.evaluate_plan(&stored.principal, &stored.plan) == Verdict::Deny {
-                return Err(RpcError {
-                    code: LEASH_DENIED,
-                    message: "policy denies requested effects".into(),
+        let approval = self.plans.transaction(
+            |plans| -> Result<Result<(Vec<String>, String), Json>, RpcError> {
+                if plans.get(&plan_ref).is_some_and(plan_expired) {
+                    plans.remove(&plan_ref);
+                }
+                let stored = plans.get_mut(&plan_ref).ok_or_else(|| RpcError {
+                    code: UNKNOWN_PLAN,
+                    message: "unknown plan_ref".into(),
                     data: None,
-                });
-            }
+                })?;
 
-            let plan_effect_kinds = stored
-                .plan
-                .effects
-                .iter()
-                .map(effect_kind)
-                .collect::<Vec<_>>();
-            if !requested.is_empty() {
-                let missing: Vec<String> = plan_effect_kinds
-                    .iter()
-                    .filter(|k| !requested.contains(&norm_effect(k)))
-                    .cloned()
-                    .collect();
-                if !missing.is_empty() {
-                    return encode(json!({
-                        "grant": "approval_pending",
-                        "plan_ref": plan_ref,
-                        "why": "requested effect scope does not cover the plan",
-                        "uncovered_effects": missing,
-                    }));
-                }
-            }
-
-            match &stored.authorization {
-                PlanAuthorization::Pending => {}
-                PlanAuthorization::Approved(_) | PlanAuthorization::Claimed(_) => {
+                let requester = stored.principal.clone();
+                let self_ack = approver == requester && self.allow_self_ack.load(Ordering::SeqCst);
+                if approver == requester && !self_ack {
                     return Err(RpcError {
                         code: LEASH_DENIED,
-                        message: "plan already has an approval".into(),
-                        data: Some(json!({"plan_ref": plan_ref})),
-                    });
-                }
-                PlanAuthorization::Consumed(record) => {
-                    return Err(RpcError {
-                        code: LEASH_DENIED,
-                        message: "approval was already consumed; create a new plan".into(),
+                        message:
+                            "self-approval is not permitted: a plan's approver must differ from \
+                              its requester (enable self-acknowledgement explicitly to override)"
+                                .into(),
                         data: Some(json!({
                             "plan_ref": plan_ref,
-                            "consumed_by": record.consumed_by,
+                            "requester": requester,
+                            "approver": approver,
                         })),
                     });
                 }
-                PlanAuthorization::Denied => {
+                if approver != requester && !can_approve {
+                    return Err(RpcError {
+                        code: LEASH_DENIED,
+                        message: "approver is not authorized: use a local-human attachment, the \
+                              supervisor profile, or the plan.approve capability"
+                            .into(),
+                        data: Some(json!({
+                            "plan_ref": plan_ref,
+                            "requester": requester,
+                            "approver": approver,
+                        })),
+                    });
+                }
+                if self.policy.evaluate_plan(&stored.principal, &stored.plan) == Verdict::Deny {
                     return Err(RpcError {
                         code: LEASH_DENIED,
                         message: "policy denies requested effects".into(),
                         data: None,
                     });
                 }
-                // A caller may still request an explicit, auditable one-shot
-                // approval for a plan policy would allow directly. This keeps
-                // cap.request useful as an acknowledgement/audit operation.
-                PlanAuthorization::PolicyAllowed => {}
-            }
 
-            let mut record = ApprovalRecord {
-                requester: requester.clone(),
-                approver: approver.clone(),
-                plan_ref: stored.plan.plan_ref.clone(),
-                plan_hash: stored.plan_hash.clone(),
-                source_hash: stored.source_hash.clone(),
-                session: stored.session.clone(),
-                // Record the exact immutable plan scope, never a caller-supplied
-                // superset that could overstate what was actually approved.
-                scope: plan_effect_kinds.clone(),
-                approved_at_ns: now_ns(),
-                grant_audit_id: 0,
-                consumed_by: None,
-            };
-            // Fail closed while the plans lock excludes a concurrent grant or
-            // apply. The state changes only after the completed audit row is
-            // durable.
-            record.grant_audit_id =
-                self.record_approval_audit(&record, &plan_effect_kinds, &stored.session)?;
-            stored.authorization = PlanAuthorization::Approved(record.clone());
-            (plan_effect_kinds, requester)
+                let plan_effect_kinds = stored
+                    .plan
+                    .effects
+                    .iter()
+                    .map(effect_kind)
+                    .collect::<Vec<_>>();
+                if !requested.is_empty() {
+                    let missing: Vec<String> = plan_effect_kinds
+                        .iter()
+                        .filter(|k| !requested.contains(&norm_effect(k)))
+                        .cloned()
+                        .collect();
+                    if !missing.is_empty() {
+                        return Ok(Err(json!({
+                            "grant": "approval_pending",
+                            "plan_ref": plan_ref,
+                            "why": "requested effect scope does not cover the plan",
+                            "uncovered_effects": missing,
+                        })));
+                    }
+                }
+
+                match &stored.authorization {
+                    PlanAuthorization::Pending => {}
+                    PlanAuthorization::Approved(_) | PlanAuthorization::Claimed(_) => {
+                        return Err(RpcError {
+                            code: LEASH_DENIED,
+                            message: "plan already has an approval".into(),
+                            data: Some(json!({"plan_ref": plan_ref})),
+                        });
+                    }
+                    PlanAuthorization::Consumed(record) => {
+                        return Err(RpcError {
+                            code: LEASH_DENIED,
+                            message: "approval was already consumed; create a new plan".into(),
+                            data: Some(json!({
+                                "plan_ref": plan_ref,
+                                "consumed_by": record.consumed_by,
+                            })),
+                        });
+                    }
+                    PlanAuthorization::Denied => {
+                        return Err(RpcError {
+                            code: LEASH_DENIED,
+                            message: "policy denies requested effects".into(),
+                            data: None,
+                        });
+                    }
+                    // A caller may still request an explicit, auditable one-shot
+                    // approval for a plan policy would allow directly. This keeps
+                    // cap.request useful as an acknowledgement/audit operation.
+                    PlanAuthorization::PolicyAllowed => {}
+                }
+
+                let mut record = ApprovalRecord {
+                    requester: requester.clone(),
+                    approver: approver.clone(),
+                    plan_ref: stored.plan.plan_ref.clone(),
+                    plan_hash: stored.plan_hash.clone(),
+                    source_hash: stored.source_hash.clone(),
+                    session: stored.session.clone(),
+                    // Record the exact immutable plan scope, never a caller-supplied
+                    // superset that could overstate what was actually approved.
+                    scope: plan_effect_kinds.clone(),
+                    approved_at_ns: now_ns(),
+                    grant_audit_id: 0,
+                    consumed_by: None,
+                };
+                // Fail closed while the plans lock excludes a concurrent grant or
+                // apply. The state changes only after the completed audit row is
+                // durable.
+                record.grant_audit_id =
+                    self.record_approval_audit(&record, &plan_effect_kinds, &stored.session)?;
+                stored.authorization = PlanAuthorization::Approved(record.clone());
+                Ok(Ok((plan_effect_kinds, requester)))
+            },
+        )?;
+        let (plan_effect_kinds, requester) = match approval {
+            Ok(approved) => approved,
+            Err(response) => return encode(response),
         };
         // Same honest enforcement truth `session.attach`'s `caps_enforced`
         // reports (see `site/content/internals/security-threat-model.md`) — not a hardcoded `false`.

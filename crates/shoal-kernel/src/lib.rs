@@ -52,11 +52,7 @@ pub struct Kernel {
     /// pattern) — never a divergent path from the kernel's own journal.
     state_dir: Option<PathBuf>,
     policy: Policy,
-    plans: Mutex<HashMap<String, StoredPlan>>,
-    /// Per-kernel object id for stored plans. The full BLAKE3 digest binds the
-    /// immutable plan contents; this counter makes repeated storage of the
-    /// exact same plan a distinct object instead of replacing the first one.
-    next_plan: AtomicU64,
+    plans: PlanRegistry,
     tasks: TaskRegistry,
     /// Long-lived interactive PTY sessions (site/content/internals/kernel-protocol.md), keyed by their
     /// `pty:{id}` ref like `tasks`. Each holds a live child on a real PTY plus
@@ -404,8 +400,7 @@ impl Kernel {
             journal: Mutex::new(Journal::in_memory().expect("in-memory journal")),
             state_dir: None,
             policy: permissive_policy(),
-            plans: Mutex::new(HashMap::new()),
-            next_plan: AtomicU64::new(1),
+            plans: PlanRegistry::new(),
             tasks: TaskRegistry::new(limits.max_tasks_per_session),
             ptys: PtyRegistry::new(limits.max_ptys_per_session),
             events: Arc::new(EventBus::default()),
@@ -439,8 +434,7 @@ impl Kernel {
             journal: Mutex::new(journal),
             state_dir: Some(state_dir.to_path_buf()),
             policy: permissive_policy(),
-            plans: Mutex::new(HashMap::new()),
-            next_plan: AtomicU64::new(1),
+            plans: PlanRegistry::new(),
             tasks: TaskRegistry::new(limits.max_tasks_per_session),
             ptys: PtyRegistry::new(limits.max_ptys_per_session),
             events: Arc::new(events),
@@ -471,8 +465,7 @@ impl Kernel {
             journal: Mutex::new(journal),
             state_dir: Some(state_dir.to_path_buf()),
             policy,
-            plans: Mutex::new(HashMap::new()),
-            next_plan: AtomicU64::new(1),
+            plans: PlanRegistry::new(),
             tasks: TaskRegistry::new(limits.max_tasks_per_session),
             ptys: PtyRegistry::new(limits.max_ptys_per_session),
             events: Arc::new(events),
@@ -495,8 +488,7 @@ impl Kernel {
             journal: Mutex::new(Journal::in_memory().expect("in-memory journal")),
             state_dir: None,
             policy,
-            plans: Mutex::new(HashMap::new()),
-            next_plan: AtomicU64::new(1),
+            plans: PlanRegistry::new(),
             tasks: TaskRegistry::new(limits.max_tasks_per_session),
             ptys: PtyRegistry::new(limits.max_ptys_per_session),
             events: Arc::new(EventBus::default()),
@@ -681,8 +673,7 @@ impl Kernel {
     /// immutable content binding; the monotonically increasing suffix prevents
     /// a second storage of identical content from replacing the first object.
     fn allocate_plan_ref(&self, plan_hash: &str) -> String {
-        let object_id = self.next_plan.fetch_add(1, Ordering::Relaxed);
-        format!("plan:{plan_hash}:{object_id:016x}")
+        self.plans.allocate_ref(plan_hash)
     }
 
     /// Append a completed journal audit entry for an approval decision (HR-D2), so the
@@ -1909,13 +1900,10 @@ mod tests {
             "cap.request",
             json!({"plan_ref": plan_ref}),
         );
-        kernel
-            .plans
-            .lock()
-            .unwrap()
-            .get_mut(&plan_ref)
-            .unwrap()
-            .created_at = Instant::now() - PLAN_TTL - std::time::Duration::from_secs(1);
+        kernel.plans.transaction(|plans| {
+            plans.get_mut(&plan_ref).unwrap().created_at =
+                Instant::now() - PLAN_TTL - std::time::Duration::from_secs(1);
+        });
         let apply = call(
             &mut client,
             &mut reader,
@@ -1924,7 +1912,7 @@ mod tests {
             json!({"plan_ref": plan_ref}),
         );
         assert_eq!(apply.error.unwrap().code, UNKNOWN_PLAN);
-        assert!(!kernel.plans.lock().unwrap().contains_key(&plan_ref));
+        assert!(!kernel.plans.contains(&plan_ref));
         drop(client);
         drop(reader);
         server.join().unwrap();

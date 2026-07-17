@@ -247,48 +247,49 @@ impl Kernel {
                 verdict: verdict_name(verdict).into(),
                 approval_pending: verdict == Verdict::ApprovalRequired,
             };
-            let mut plans = self.plans.lock().unwrap();
-            plans.retain(|_, stored| !plan_expired(stored));
-            let owner_plans = plans
-                .values()
-                .filter(|stored| stored.session == session.id && stored.principal == actor)
-                .collect::<Vec<_>>();
-            let owner_source_bytes = owner_plans
-                .iter()
-                .map(|stored| stored.src.len())
-                .sum::<usize>();
-            if owner_plans.len() >= MAX_STORED_PLANS_PER_OWNER
-                || owner_source_bytes.saturating_add(params.src.len())
-                    > MAX_PLAN_SOURCE_BYTES_PER_OWNER
-            {
-                return Err(RpcError {
-                    code: QUOTA_EXCEEDED,
-                    message: "stored plan quota reached".into(),
-                    data: Some(json!({
-                        "limit": "stored_plans_per_owner",
-                        "max_count": MAX_STORED_PLANS_PER_OWNER,
-                        "max_source_bytes": MAX_PLAN_SOURCE_BYTES_PER_OWNER,
-                    })),
-                });
-            }
-            plans.insert(
-                plan.plan_ref.clone(),
-                StoredPlan {
-                    src: params.src,
-                    session: session.id.clone(),
-                    principal: actor.clone(),
-                    plan_hash,
-                    source_hash,
-                    plan,
-                    authorization: match verdict {
-                        Verdict::Allow => PlanAuthorization::PolicyAllowed,
-                        Verdict::ApprovalRequired => PlanAuthorization::Pending,
-                        Verdict::Deny => PlanAuthorization::Denied,
+            self.plans.transaction(|plans| -> Result<(), RpcError> {
+                plans.retain(|_, stored| !plan_expired(stored));
+                let owner_plans = plans
+                    .values()
+                    .filter(|stored| stored.session == session.id && stored.principal == actor)
+                    .collect::<Vec<_>>();
+                let owner_source_bytes = owner_plans
+                    .iter()
+                    .map(|stored| stored.src.len())
+                    .sum::<usize>();
+                if owner_plans.len() >= MAX_STORED_PLANS_PER_OWNER
+                    || owner_source_bytes.saturating_add(params.src.len())
+                        > MAX_PLAN_SOURCE_BYTES_PER_OWNER
+                {
+                    return Err(RpcError {
+                        code: QUOTA_EXCEEDED,
+                        message: "stored plan quota reached".into(),
+                        data: Some(json!({
+                            "limit": "stored_plans_per_owner",
+                            "max_count": MAX_STORED_PLANS_PER_OWNER,
+                            "max_source_bytes": MAX_PLAN_SOURCE_BYTES_PER_OWNER,
+                        })),
+                    });
+                }
+                plans.insert(
+                    plan.plan_ref.clone(),
+                    StoredPlan {
+                        src: params.src,
+                        session: session.id.clone(),
+                        principal: actor.clone(),
+                        plan_hash,
+                        source_hash,
+                        plan,
+                        authorization: match verdict {
+                            Verdict::Allow => PlanAuthorization::PolicyAllowed,
+                            Verdict::ApprovalRequired => PlanAuthorization::Pending,
+                            Verdict::Deny => PlanAuthorization::Denied,
+                        },
+                        created_at: Instant::now(),
                     },
-                    created_at: Instant::now(),
-                },
-            );
-            drop(plans);
+                );
+                Ok(())
+            })?;
             if verdict == Verdict::ApprovalRequired {
                 // site/content/internals/kernel-protocol.md: a plan stuck at `approval_pending` is
                 // exactly the moment another principal (a human's session, a
@@ -340,75 +341,80 @@ impl Kernel {
             };
             let actual_hash =
                 bound_plan_hash(&params.src, &ast_json, &run_plan, &session.id, &actor);
-            let mut plans = self.plans.lock().unwrap();
-            if plans.get(plan_ref).is_some_and(plan_expired) {
-                plans.remove(plan_ref);
-                return Err(RpcError {
-                    code: UNKNOWN_PLAN,
-                    message: "unknown or expired plan_ref".into(),
-                    data: Some(json!({"plan_ref": plan_ref})),
-                });
-            }
-            let stored = plans.get_mut(plan_ref).ok_or_else(|| RpcError {
-                code: UNKNOWN_PLAN,
-                message: "unknown plan_ref".into(),
-                data: None,
-            })?;
-            if stored.plan_hash != actual_hash
-                || stored.source_hash != source_hash(&params.src)
-                || stored.session != session.id
-                || stored.principal != actor
-            {
-                return Err(RpcError {
-                    code: LEASH_DENIED,
-                    message: "approved plan binding no longer matches source/session/requester"
-                        .into(),
-                    data: None,
-                });
-            }
-            match &stored.authorization {
-                PlanAuthorization::PolicyAllowed
-                    if self.policy.evaluate_plan(&actor, &stored.plan) == Verdict::Allow =>
-                {
-                    None
-                }
-                PlanAuthorization::Approved(record) => {
-                    let record = record.clone();
-                    stored.authorization = PlanAuthorization::Claimed(record.clone());
-                    Some(record)
-                }
-                PlanAuthorization::Claimed(_) => {
-                    return Err(RpcError {
-                        code: LEASH_DENIED,
-                        message: "approved plan is already being applied".into(),
-                        data: Some(json!({"plan_ref": plan_ref})),
-                    });
-                }
-                PlanAuthorization::Consumed(record) => {
-                    return Err(RpcError {
-                        code: LEASH_DENIED,
-                        message: "approval was already consumed".into(),
-                        data: Some(json!({
-                            "plan_ref": plan_ref,
-                            "consumed_by": record.consumed_by,
-                        })),
-                    });
-                }
-                PlanAuthorization::Pending => {
-                    return Err(RpcError {
-                        code: LEASH_DENIED,
-                        message: "mode \"approved\" requires a granted approval".into(),
-                        data: Some(json!({"plan_ref": plan_ref})),
-                    });
-                }
-                PlanAuthorization::Denied | PlanAuthorization::PolicyAllowed => {
-                    return Err(RpcError {
-                        code: LEASH_DENIED,
-                        message: "plan is not authorized for approved execution".into(),
-                        data: Some(json!({"plan_ref": plan_ref})),
-                    });
-                }
-            }
+            self.plans
+                .transaction(|plans| -> Result<Option<ApprovalRecord>, RpcError> {
+                    if plans.get(plan_ref).is_some_and(plan_expired) {
+                        plans.remove(plan_ref);
+                        return Err(RpcError {
+                            code: UNKNOWN_PLAN,
+                            message: "unknown or expired plan_ref".into(),
+                            data: Some(json!({"plan_ref": plan_ref})),
+                        });
+                    }
+                    let stored = plans.get_mut(plan_ref).ok_or_else(|| RpcError {
+                        code: UNKNOWN_PLAN,
+                        message: "unknown plan_ref".into(),
+                        data: None,
+                    })?;
+                    if stored.plan_hash != actual_hash
+                        || stored.source_hash != source_hash(&params.src)
+                        || stored.session != session.id
+                        || stored.principal != actor
+                    {
+                        return Err(RpcError {
+                            code: LEASH_DENIED,
+                            message:
+                                "approved plan binding no longer matches source/session/requester"
+                                    .into(),
+                            data: None,
+                        });
+                    }
+                    let claimed = match &stored.authorization {
+                        PlanAuthorization::PolicyAllowed
+                            if self.policy.evaluate_plan(&actor, &stored.plan)
+                                == Verdict::Allow =>
+                        {
+                            None
+                        }
+                        PlanAuthorization::Approved(record) => {
+                            let record = record.clone();
+                            stored.authorization = PlanAuthorization::Claimed(record.clone());
+                            Some(record)
+                        }
+                        PlanAuthorization::Claimed(_) => {
+                            return Err(RpcError {
+                                code: LEASH_DENIED,
+                                message: "approved plan is already being applied".into(),
+                                data: Some(json!({"plan_ref": plan_ref})),
+                            });
+                        }
+                        PlanAuthorization::Consumed(record) => {
+                            return Err(RpcError {
+                                code: LEASH_DENIED,
+                                message: "approval was already consumed".into(),
+                                data: Some(json!({
+                                    "plan_ref": plan_ref,
+                                    "consumed_by": record.consumed_by,
+                                })),
+                            });
+                        }
+                        PlanAuthorization::Pending => {
+                            return Err(RpcError {
+                                code: LEASH_DENIED,
+                                message: "mode \"approved\" requires a granted approval".into(),
+                                data: Some(json!({"plan_ref": plan_ref})),
+                            });
+                        }
+                        PlanAuthorization::Denied | PlanAuthorization::PolicyAllowed => {
+                            return Err(RpcError {
+                                code: LEASH_DENIED,
+                                message: "plan is not authorized for approved execution".into(),
+                                data: Some(json!({"plan_ref": plan_ref})),
+                            });
+                        }
+                    };
+                    Ok(claimed)
+                })?
         } else {
             None
         };
@@ -469,43 +475,44 @@ impl Kernel {
             Ok(entry_id) => entry_id,
             Err(error) => {
                 if let (Some(plan_ref), Some(approval)) = (&params.plan_ref, &claimed_approval) {
-                    let mut plans = self.plans.lock().unwrap();
-                    if let Some(stored) = plans.get_mut(plan_ref)
-                        && matches!(
-                            &stored.authorization,
-                            PlanAuthorization::Claimed(current) if current == approval
-                        )
-                    {
-                        stored.authorization = PlanAuthorization::Approved(approval.clone());
-                    }
+                    self.plans.transaction(|plans| {
+                        if let Some(stored) = plans.get_mut(plan_ref)
+                            && matches!(
+                                &stored.authorization,
+                                PlanAuthorization::Claimed(current) if current == approval
+                            )
+                        {
+                            stored.authorization = PlanAuthorization::Approved(approval.clone());
+                        }
+                    });
                 }
                 return Err(internal(error));
             }
         };
         if let (Some(plan_ref), Some(approval)) = (&params.plan_ref, claimed_approval) {
-            let mut plans = self.plans.lock().unwrap();
-            let Some(stored) = plans.get_mut(plan_ref) else {
+            let consumed = self.plans.transaction(|plans| {
+                let Some(stored) = plans.get_mut(plan_ref) else {
+                    return Err("claimed plan disappeared before execution");
+                };
+                if !matches!(
+                    &stored.authorization,
+                    PlanAuthorization::Claimed(current) if current == &approval
+                ) {
+                    return Err("claimed approval changed before execution");
+                }
+                let mut consumed = approval;
+                consumed.consumed_by = Some(entry_id);
+                stored.authorization = PlanAuthorization::Consumed(consumed);
+                Ok(())
+            });
+            if let Err(message) = consumed {
                 let _ = self
                     .journal
                     .lock()
                     .unwrap()
                     .finish(entry_id, None, false, 0);
-                return Err(internal("claimed plan disappeared before execution"));
-            };
-            if !matches!(
-                &stored.authorization,
-                PlanAuthorization::Claimed(current) if current == &approval
-            ) {
-                let _ = self
-                    .journal
-                    .lock()
-                    .unwrap()
-                    .finish(entry_id, None, false, 0);
-                return Err(internal("claimed approval changed before execution"));
+                return Err(internal(message));
             }
-            let mut consumed = approval;
-            consumed.consumed_by = Some(entry_id);
-            stored.authorization = PlanAuthorization::Consumed(consumed);
         }
         // Hand the evaluator this call's source so each journaled top-level
         // statement can slice its own `src` (site/content/internals/language-conformance-contract.md) — mirrors the REPL's fix
