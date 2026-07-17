@@ -64,9 +64,10 @@ pub struct Kernel {
     auth: Option<Mutex<TokenStore>>,
     /// In-memory embedded kernels have no token store and may deliberately use
     /// the hosting process as their human trust root. Durable socket daemons
-    /// keep this false: a wire client cannot grant itself human authority by
-    /// merely asserting `local_auth: local-human`; it must present a bearer
-    /// whose stored profile is `local-human`.
+    /// keep this false: neither a wire assertion nor an ordinary bearer proves
+    /// that a human is present. Bearers can grant explicit machine-admin roles
+    /// (`supervisor` / `plan.approve`), but never acquire human semantics merely
+    /// by naming their profile `local-human`.
     allow_unauthenticated_local_human: bool,
     shutdown_requested: AtomicBool,
     started_at: Instant,

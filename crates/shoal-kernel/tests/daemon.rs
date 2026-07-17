@@ -1,3 +1,4 @@
+use shoal_proto::error_code::AUTH_FAILED;
 use shoal_proto::{AttachParams, ClientInfo, ExecParams, JSONRPC, Request, Response, write_frame};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -6,7 +7,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-fn credentialed_human_attach_params(token: &str) -> serde_json::Value {
+fn credentialed_admin_attach_params(token: &str) -> serde_json::Value {
     serde_json::to_value(AttachParams {
         session: None,
         token: Some(token.to_string()),
@@ -18,12 +19,12 @@ fn credentialed_human_attach_params(token: &str) -> serde_json::Value {
     .unwrap()
 }
 
-fn create_human_token(state: &Path) -> String {
+fn create_admin_token(state: &Path) -> String {
     shoal_auth::TokenStore::open(state.join("tokens.json"))
         .unwrap()
         .create(
             format!("uid:{}", unsafe { geteuid() }),
-            "local-human".into(),
+            "supervisor".into(),
             vec![],
             None,
         )
@@ -74,7 +75,7 @@ fn daemon_binds_secure_socket_and_attaches() {
     let temp = tempfile::tempdir().unwrap();
     let socket = temp.path().join("run/session.sock");
     let state = temp.path().join("state");
-    let human_token = create_human_token(&state);
+    let admin_token = create_admin_token(&state);
     let (stderr_file, stderr_path) = daemon_stderr_file(temp.path());
     let mut child = Command::new(env!("CARGO_BIN_EXE_shoal-kernel"))
         .args([
@@ -102,13 +103,33 @@ fn daemon_binds_secure_socket_and_attaches() {
     );
     let mut stream = UnixStream::connect(&socket).unwrap();
     let mut reader = BufReader::new(stream.try_clone().unwrap());
+    // This test process has the exact same effective UID as its daemon child.
+    // Owning the socket file and truthfully claiming a TTY therefore still
+    // must not let an arbitrary sibling process manufacture human authority.
+    write_frame(
+        &mut stream,
+        &Request {
+            jsonrpc: JSONRPC.into(),
+            id: 0.into(),
+            method: "session.attach".into(),
+            params: serde_json::json!({
+                "local_auth": "local-human",
+                "client": {"kind": "same-uid-adversary", "tty": true}
+            }),
+        },
+    )
+    .unwrap();
+    let raw_denial = recv(&mut reader).error.unwrap();
+    assert_eq!(raw_denial.code, AUTH_FAILED);
+    assert_eq!(raw_denial.data.unwrap()["human_presence_supported"], false);
+
     write_frame(
         &mut stream,
         &Request {
             jsonrpc: JSONRPC.into(),
             id: 1.into(),
             method: "session.attach".into(),
-            params: credentialed_human_attach_params(&human_token),
+            params: credentialed_admin_attach_params(&admin_token),
         },
     )
     .unwrap();
@@ -128,7 +149,10 @@ fn daemon_binds_secure_socket_and_attaches() {
     .unwrap();
     let status = recv(&mut reader).result.unwrap();
     assert_eq!(status["pid"], child.id());
-    assert_eq!(status["security"]["human_credential_required"], true);
+    assert_eq!(
+        status["security"]["bearer_establishes_human_presence"],
+        false
+    );
     write_frame(
         &mut stream,
         &Request {
@@ -178,7 +202,7 @@ fn daemon_survives_a_paused_gap_between_two_sequential_requests() {
     let temp = tempfile::tempdir().unwrap();
     let socket = temp.path().join("run/session.sock");
     let state = temp.path().join("state");
-    let human_token = create_human_token(&state);
+    let admin_token = create_admin_token(&state);
     let (stderr_file, stderr_path) = daemon_stderr_file(temp.path());
     let mut child = Command::new(env!("CARGO_BIN_EXE_shoal-kernel"))
         .args([
@@ -214,7 +238,7 @@ fn daemon_survives_a_paused_gap_between_two_sequential_requests() {
             jsonrpc: JSONRPC.into(),
             id: 1.into(),
             method: "session.attach".into(),
-            params: credentialed_human_attach_params(&human_token),
+            params: credentialed_admin_attach_params(&admin_token),
         },
     )
     .unwrap();
@@ -295,7 +319,7 @@ fn live_kernel_elides_a_big_table_over_the_wire() {
     let temp = tempfile::tempdir().unwrap();
     let socket = temp.path().join("run/session.sock");
     let state = temp.path().join("state");
-    let human_token = create_human_token(&state);
+    let admin_token = create_admin_token(&state);
     let bigdir = temp.path().join("bigdir");
     std::fs::create_dir_all(&bigdir).unwrap();
     for i in 0..150 {
@@ -363,7 +387,7 @@ fn live_kernel_elides_a_big_table_over_the_wire() {
             jsonrpc: JSONRPC.into(),
             id: 1.into(),
             method: "session.attach".into(),
-            params: credentialed_human_attach_params(&human_token),
+            params: credentialed_admin_attach_params(&admin_token),
         };
         let exec_request = Request {
             jsonrpc: JSONRPC.into(),

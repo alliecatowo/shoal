@@ -490,8 +490,8 @@ impl Kernel {
                         return Err(RpcError {
                             code: LEASH_DENIED,
                             message:
-                                "approver is not authorized: use a local-human attachment, the \
-                              supervisor profile, or the plan.approve capability"
+                                "approver is not authorized: use the embedded human trust root, \
+                              supervisor profile, or plan.approve capability"
                                     .into(),
                             data: Some(json!({
                                 "plan_ref": plan_ref,

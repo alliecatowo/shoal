@@ -1519,11 +1519,14 @@ fn bearer_attach_uses_token_principal_and_rejects_invalid() {
 }
 
 #[test]
-fn durable_kernel_rejects_asserted_human_and_accepts_credentialed_human() {
+fn durable_kernel_rejects_asserted_and_bearer_named_human_authority() {
     let dir = tempfile::tempdir().unwrap();
     let mut tokens = TokenStore::open(dir.path().join("tokens.json")).unwrap();
     let (human_token, _) = tokens
         .create("human:operator".into(), "local-human".into(), vec![], None)
+        .unwrap();
+    let (supervisor_token, _) = tokens
+        .create("agent:supervisor".into(), "supervisor".into(), vec![], None)
         .unwrap();
     drop(tokens);
     let kernel = Kernel::open(dir.path()).unwrap();
@@ -1543,7 +1546,7 @@ fn durable_kernel_rejects_asserted_human_and_accepts_credentialed_human() {
         .error
         .expect("raw durable-socket callers cannot assert human authority");
     assert_eq!(error.code, AUTH_FAILED);
-    assert_eq!(error.data.unwrap()["credential_required"], true);
+    assert_eq!(error.data.unwrap()["human_presence_supported"], false);
 
     let credentialed = call(
         &mut client,
@@ -1556,7 +1559,7 @@ fn durable_kernel_rejects_asserted_human_and_accepts_credentialed_human() {
         }),
     )
     .result
-    .expect("a validated local-human bearer is the authenticated human endpoint");
+    .expect("the bearer remains a valid machine credential");
     assert_eq!(credentialed["principal"], "human:operator");
     assert_eq!(credentialed["auth_mode"], "bearer");
     assert_eq!(credentialed["caps"]["profile"], "local-human");
@@ -1565,11 +1568,31 @@ fn durable_kernel_rejects_asserted_human_and_accepts_credentialed_human() {
         .result
         .expect("every attached principal may inspect lifecycle status");
     assert_eq!(status["durable"], true);
-    assert_eq!(status["security"]["human_credential_required"], true);
+    assert_eq!(
+        status["security"]["bearer_establishes_human_presence"],
+        false
+    );
 
-    let shutdown = call(&mut client, &mut reader, 4, "kernel.shutdown", json!({}))
+    let denied = call(&mut client, &mut reader, 4, "kernel.shutdown", json!({}))
+        .error
+        .expect("a bearer cannot gain authority from a human-sounding profile");
+    assert_eq!(denied.code, LEASH_DENIED);
+
+    call(
+        &mut client,
+        &mut reader,
+        5,
+        "session.attach",
+        json!({
+            "token":supervisor_token,
+            "client":{"kind":"machine-supervisor","tty":false}
+        }),
+    )
+    .result
+    .expect("explicit machine administration remains available");
+    let shutdown = call(&mut client, &mut reader, 6, "kernel.shutdown", json!({}))
         .result
-        .expect("the credentialed human may request managed shutdown");
+        .expect("the supervisor machine credential may request managed shutdown");
     assert_eq!(shutdown["stopping"], true);
     assert!(kernel.shutdown_requested.load(Ordering::SeqCst));
 
@@ -3816,7 +3839,7 @@ fn concurrent_plan_apply_consumes_an_explicit_approval_exactly_once() {
 }
 
 #[test]
-fn distinct_agent_without_approver_role_is_denied_but_local_human_can_approve() {
+fn only_explicit_machine_approver_role_can_approve_on_durable_kernel() {
     let dir = tempfile::tempdir().unwrap();
     let mut tokens = TokenStore::open(dir.path().join("tokens.json")).unwrap();
     let (requester_token, _) = tokens
@@ -3827,6 +3850,9 @@ fn distinct_agent_without_approver_role_is_denied_but_local_human_can_approve() 
         .unwrap();
     let (human_token, _) = tokens
         .create("human:operator".into(), "local-human".into(), vec![], None)
+        .unwrap();
+    let (supervisor_token, _) = tokens
+        .create("agent:supervisor".into(), "supervisor".into(), vec![], None)
         .unwrap();
     drop(tokens);
     let policy =
@@ -3885,17 +3911,39 @@ fn distinct_agent_without_approver_role_is_denied_but_local_human_can_approve() 
     )
     .result
     .unwrap();
-    let human_principal = human_attach["principal"].as_str().unwrap().to_owned();
-    let approved = call(
+    assert_eq!(human_attach["caps"]["profile"], "local-human");
+    let denied = call(
         &mut human,
         &mut human_reader,
         2,
         "cap.request",
         json!({"plan_ref":plan_ref}),
     )
+    .error
+    .expect("a human-sounding bearer profile is not human-presence evidence");
+    assert_eq!(denied.code, LEASH_DENIED);
+
+    let (mut supervisor, mut supervisor_reader, supervisor_thread) = spawn(&kernel);
+    let supervisor_attach = call(
+        &mut supervisor,
+        &mut supervisor_reader,
+        1,
+        "session.attach",
+        json!({"token":supervisor_token,"client":{"kind":"supervisor","tty":false}}),
+    )
     .result
-    .expect("the credentialed local-human path remains usable");
-    assert_eq!(approved["approver"], human_principal);
+    .unwrap();
+    let supervisor_principal = supervisor_attach["principal"].as_str().unwrap().to_owned();
+    let approved = call(
+        &mut supervisor,
+        &mut supervisor_reader,
+        2,
+        "cap.request",
+        json!({"plan_ref":plan_ref}),
+    )
+    .result
+    .expect("the explicit supervisor machine role can approve");
+    assert_eq!(approved["approver"], supervisor_principal);
 
     drop(requester);
     drop(requester_reader);
@@ -3906,6 +3954,9 @@ fn distinct_agent_without_approver_role_is_denied_but_local_human_can_approve() 
     drop(human);
     drop(human_reader);
     human_thread.join().unwrap();
+    drop(supervisor);
+    drop(supervisor_reader);
+    supervisor_thread.join().unwrap();
 }
 
 /// HR-D2/HR-D3 happy path: a DISTINCT approver (a second bearer principal)

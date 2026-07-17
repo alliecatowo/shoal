@@ -36,8 +36,10 @@ pub(crate) struct Attachment {
     pub(crate) session: Arc<Session>,
     pub(crate) principal: String,
     /// Whether this authenticated attachment may approve another principal's
-    /// plan. Local-human attachments are trusted; bearer attachments must opt
-    /// in through the `supervisor` profile or `plan.approve` capability.
+    /// plan. An embedded process-trust-root local human is trusted; bearer
+    /// attachments must opt in through the machine-admin `supervisor` profile
+    /// or `plan.approve` capability. A bearer profile named `local-human` is
+    /// intentionally not human-presence evidence.
     pub(crate) can_approve: bool,
     /// Whether the attaching client declared itself a real interactive
     /// terminal (`session.attach`'s `client.tty`). Every client this
@@ -404,10 +406,11 @@ impl Kernel {
         {
             return Err(RpcError {
                 code: AUTH_FAILED,
-                message: "durable kernels require a bearer credential with profile `local-human`; raw local-human assertion is disabled".into(),
+                message: "durable kernels do not accept client-asserted human presence; use an explicit supervisor or plan.approve bearer for machine administration".into(),
                 data: Some(json!({
                     "auth_mode": "local-human",
-                    "credential_required": true,
+                    "human_presence_supported": false,
+                    "machine_admin_profiles": ["supervisor", "plan.approve"],
                 })),
             });
         }
@@ -454,8 +457,10 @@ impl Kernel {
                     None,
                 )
             };
+        // An ordinary bearer is a machine credential, not proof that a human
+        // is at the keyboard. In particular, a profile string controlled by
+        // token creation must not manufacture human-presence authority.
         let can_approve = local_human
-            || profile == "local-human"
             || profile == "supervisor"
             || token_caps.iter().any(|cap| cap == "plan.approve");
         let name = params.session.unwrap_or_else(|| "default".into());

@@ -424,7 +424,10 @@ pub struct AttachSecurityMetadata {
     pub security_epoch: u32,
 }
 
-pub const ATTACH_SECURITY_EPOCH: u32 = 1;
+/// Bumped when attachment authority semantics change incompatibly. Epoch 2
+/// makes explicit that a bearer profile named `local-human` is not evidence
+/// of human presence and carries no implicit approval/admin authority.
+pub const ATTACH_SECURITY_EPOCH: u32 = 2;
 pub const PRINCIPAL_SESSION_ISOLATION: &str = "principal";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -767,7 +770,7 @@ mod tests {
             serde_json::json!({
                 "auth_mode": "restricted-agent",
                 "session_isolation": "principal",
-                "security_epoch": 1,
+                "security_epoch": 2,
             })
         );
     }

@@ -21,7 +21,8 @@ impl Kernel {
             "security": {
                 "epoch": ATTACH_SECURITY_EPOCH,
                 "raw_local_human": self.allow_unauthenticated_local_human,
-                "human_credential_required": !self.allow_unauthenticated_local_human,
+                "bearer_establishes_human_presence": false,
+                "machine_admin_credential_required": !self.allow_unauthenticated_local_human,
             },
             "shutdown_requested": self.shutdown_requested.load(Ordering::SeqCst),
         }))
@@ -35,7 +36,7 @@ impl Kernel {
         if !attachment.can_approve {
             return Err(RpcError {
                 code: LEASH_DENIED,
-                message: "kernel shutdown requires an authenticated local-human, supervisor, or plan.approve credential".into(),
+                message: "kernel shutdown requires an embedded human trust root or an explicit supervisor/plan.approve machine credential".into(),
                 data: Some(json!({"principal": attachment.principal})),
             });
         }
