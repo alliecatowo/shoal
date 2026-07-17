@@ -115,9 +115,9 @@ pub fn is_bare_command_stmt(stmt: &Stmt) -> bool {
 /// (site/content/internals/kernel-protocol.md). Zero I/O: reads the in-memory task registry
 /// only, never a subprocess or the filesystem.
 ///
-/// `suspended` is always `0` today — the task registry has no suspended state
-/// yet (only `Running`/`Done`); the field exists so this is additive, not a
-/// breaking change, the day a suspend state lands.
+/// `running` excludes stopped tasks; `suspended` counts unfinished tasks whose
+/// job-control flag is set. `total` includes running, stopped, and completed
+/// rows retained by the evaluator.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct JobsSnapshot {
     pub running: usize,
@@ -543,10 +543,49 @@ impl Evaluator {
     /// ran to completion): mark the task done so `jobs` shows it terminal, and
     /// drop the pid mapping. Returns `false` for an unknown id.
     pub fn finish_external_job(&mut self, id: u64) -> bool {
+        self.complete_external_job(id, Ok(Value::Null))
+    }
+
+    /// Retire a resumed external job while preserving its terminal process
+    /// result. A nonzero exit or signal becomes the same typed `cmd_failed`
+    /// error a foreground statement would produce, so awaiting a job cannot
+    /// silently turn process failure into `null` success.
+    pub fn finish_external_job_result(
+        &mut self,
+        id: u64,
+        status: Option<i32>,
+        signal: Option<String>,
+    ) -> bool {
+        let result = if status == Some(0) {
+            Ok(Value::Null)
+        } else {
+            let command = self
+                .exec
+                .jobs
+                .tasks
+                .iter()
+                .find(|task| task.id == id)
+                .map_or_else(|| format!("job {id}"), |task| task.shared.desc.clone());
+            let message = match (status, signal.as_deref()) {
+                (Some(code), _) => format!("`{command}` exited with status {code}"),
+                (_, Some(signal)) => format!("`{command}` died from {signal}"),
+                _ => format!("`{command}` failed"),
+            };
+            Err(ErrorVal::new("cmd_failed", message).with_status(status))
+        };
+        self.complete_external_job(id, result)
+    }
+
+    /// Retire a job whose PTY service failed independently of child status.
+    pub fn fail_external_job(&mut self, id: u64, message: impl Into<String>) -> bool {
+        self.complete_external_job(id, Err(ErrorVal::new("io_error", message)))
+    }
+
+    fn complete_external_job(&mut self, id: u64, result: VResult<Value>) -> bool {
         self.exec.jobs.external.remove(&id);
         match self.exec.jobs.tasks.iter().find(|t| t.id == id) {
             Some(t) => {
-                t.finish(Ok(Value::Null));
+                t.finish(result);
                 true
             }
             None => false,

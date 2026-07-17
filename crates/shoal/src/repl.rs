@@ -719,9 +719,19 @@ struct JobControl {
 
 #[derive(Debug)]
 enum BackgroundJobEvent {
-    Completed { id: u64, command: String },
-    Stopped { id: u64 },
-    Failed { id: u64, error: String },
+    Completed {
+        id: u64,
+        command: String,
+        status: Option<i32>,
+        signal: Option<String>,
+    },
+    Stopped {
+        id: u64,
+    },
+    Failed {
+        id: u64,
+        error: String,
+    },
 }
 
 /// Reconcile terminal notifications from detached PTY workers on the REPL
@@ -731,11 +741,22 @@ enum BackgroundJobEvent {
 fn drain_background_job_events(evaluator: &mut Evaluator, events: &Receiver<BackgroundJobEvent>) {
     while let Ok(event) = events.try_recv() {
         match event {
-            BackgroundJobEvent::Completed { id, command } => {
-                evaluator.finish_external_job(id);
+            BackgroundJobEvent::Completed {
+                id,
+                command,
+                status,
+                signal,
+            } => {
+                evaluator.finish_external_job_result(id, status, signal.clone());
+                let terminal = match (status, signal.as_deref()) {
+                    (Some(0), _) => "Done".to_string(),
+                    (Some(code), _) => format!("Exit {code}"),
+                    (_, Some(signal)) => signal.to_string(),
+                    _ => "Failed".to_string(),
+                };
                 println!(
                     "{}",
-                    maybe_strip(format!("\x1b[90m[{id}]+  Done\x1b[0m  {command}"))
+                    maybe_strip(format!("\x1b[90m[{id}]+  {terminal}\x1b[0m  {command}"))
                 );
             }
             BackgroundJobEvent::Stopped { id } => {
@@ -745,7 +766,7 @@ fn drain_background_job_events(evaluator: &mut Evaluator, events: &Receiver<Back
                 }
             }
             BackgroundJobEvent::Failed { id, error } => {
-                evaluator.finish_external_job(id);
+                evaluator.fail_external_job(id, error.clone());
                 eprintln!(
                     "{}",
                     maybe_strip(format!(
@@ -852,12 +873,12 @@ fn handle_job_control(
                         print_stopped_notice(sid, &desc);
                     }
                 }
-                Ok(_) => {
-                    evaluator.finish_external_job(id);
+                Ok(res) => {
+                    evaluator.finish_external_job_result(id, res.status, res.signal);
                 }
                 Err(error) => {
                     eprintln!("{}", maybe_strip(format!("\x1b[31;1mfg:\x1b[0m {error}")));
-                    evaluator.finish_external_job(id);
+                    evaluator.fail_external_job(id, error.to_string());
                 }
             }
         }
@@ -876,7 +897,12 @@ fn handle_job_control(
             job.resume_background_notify(move |result| {
                 let event = match result {
                     Ok(result) if result.stopped => BackgroundJobEvent::Stopped { id },
-                    Ok(_) => BackgroundJobEvent::Completed { id, command },
+                    Ok(result) => BackgroundJobEvent::Completed {
+                        id,
+                        command,
+                        status: result.status,
+                        signal: result.signal,
+                    },
                     Err(error) => BackgroundJobEvent::Failed {
                         id,
                         error: error.to_string(),
@@ -1100,11 +1126,31 @@ mod tests {
         tx.send(BackgroundJobEvent::Completed {
             id: completed,
             command: "done-job".into(),
+            status: Some(0),
+            signal: None,
         })
         .unwrap();
         drain_background_job_events(&mut evaluator, &rx);
         assert_eq!(evaluator.external_job_pid(completed), None);
         assert!(evaluator.task_by_id(completed).unwrap().is_done());
+
+        let failed = evaluator.register_stopped_external(41_003, 41_003, "failed-job".into());
+        assert!(evaluator.mark_external_resumed(failed));
+        tx.send(BackgroundJobEvent::Completed {
+            id: failed,
+            command: "failed-job".into(),
+            status: Some(7),
+            signal: None,
+        })
+        .unwrap();
+        drain_background_job_events(&mut evaluator, &rx);
+        let error = evaluator
+            .task_by_id(failed)
+            .unwrap()
+            .wait()
+            .expect_err("nonzero background exit must remain a failed task");
+        assert_eq!(error.code, "cmd_failed");
+        assert_eq!(error.status, Some(7));
 
         let stopped = evaluator.register_stopped_external(41_002, 41_002, "stopped-job".into());
         assert!(evaluator.mark_external_resumed(stopped));
