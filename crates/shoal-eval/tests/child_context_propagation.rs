@@ -129,10 +129,17 @@ fn on_handler_inherits_the_spawn_gate() {
     // outcome's `.ok`) would mean the child ran unconfined.
     let (d, ok) = scene();
     let mut ev = restricted_evaluator(d.path());
+    // Subscribe to the result channel BEFORE triggering the handler: `on` runs
+    // its handler on another thread, so the handler's `res` emit can race ahead
+    // of a bare `channel("res").take(...)` subscription and be missed (channels
+    // don't retain for late subscribers) — flaky on slower schedulers. A held
+    // `.events()` subscription is live before the trigger and buffers the emit,
+    // and `.take(1)` bounds the read.
     let src = format!(
-        "on(channel(\"cmd\"), (ev) => {{ channel(\"res\").emit(try {{ ({}).ok }} catch {{ \"DENIED\" }}) }})\n\
+        "let sub = channel(\"res\").events()\n\
+         on(channel(\"cmd\"), (ev) => {{ channel(\"res\").emit(try {{ ({}).ok }} catch {{ \"DENIED\" }}) }})\n\
          channel(\"cmd\").emit(1)\n\
-         channel(\"res\").take(timeout: 5s)",
+         sub.take(1).collect().first().payload",
         cat_src(&ok)
     );
     let out = ev
@@ -198,9 +205,12 @@ fn parallel_inherits_config() {
 fn on_handler_inherits_config() {
     let (d, _ok) = scene();
     let mut ev = config_evaluator(d.path());
-    let src = "on(channel(\"cmd\"), (ev) => { channel(\"cfg\").emit(config.get(\"b_marker\")) })\n\
+    // Hold the result subscription before the trigger so the async handler's
+    // emit can't race ahead of it (see on_handler_inherits_the_spawn_gate).
+    let src = "let sub = channel(\"cfg\").events()\n\
+               on(channel(\"cmd\"), (ev) => { channel(\"cfg\").emit(config.get(\"b_marker\")) })\n\
                channel(\"cmd\").emit(1)\n\
-               channel(\"cfg\").take(timeout: 5s)";
+               sub.take(1).collect().first().payload";
     let out = ev.eval_program(&parse(src)).expect("handler config read");
     assert_eq!(out, Value::Str("propagated".into()), "on: {out:?}");
 }
