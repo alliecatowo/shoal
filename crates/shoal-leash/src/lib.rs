@@ -119,6 +119,13 @@ opaque = "ask"
             assert_eq!(p.evaluate_effect("agent", &e), Verdict::Allow)
         }
     }
+
+    #[test]
+    fn spawn_preflight_rejects_non_regular_inputs() {
+        let directory = tempfile::tempdir().unwrap();
+        let error = preflight_spawn(directory.path(), &[]).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
     #[test]
     fn spawn_pinning_active_only_when_proc_spawn_is_set() {
         // The load-bearing no-regression guard: a principal is "pinning" iff it

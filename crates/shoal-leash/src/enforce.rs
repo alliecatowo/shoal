@@ -186,7 +186,20 @@ pub struct SpawnPreflight {
 }
 pub fn preflight_spawn(binary: &Path, allowlist: &[String]) -> std::io::Result<SpawnPreflight> {
     use std::io::Read;
+    let expected = fs::metadata(binary)?;
+    if !expected.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "spawn hash target is not a regular file",
+        ));
+    }
     let mut f = fs::File::open(binary)?;
+    if !f.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "opened spawn hash target is not a regular file",
+        ));
+    }
     let mut h = blake3::Hasher::new();
     let mut b = [0; 65536];
     loop {

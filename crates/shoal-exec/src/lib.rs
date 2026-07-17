@@ -47,7 +47,7 @@ mod watcher;
 mod which;
 
 use std::ffi::OsString;
-use std::io;
+use std::io::{self, Read};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
@@ -95,8 +95,34 @@ pub fn resolve_and_hash_in(
     cwd: &std::path::Path,
 ) -> Option<String> {
     let program = which::resolve_program(argv, env, cwd).ok()?;
-    let bytes = std::fs::read(&program).ok()?;
-    Some(blake3::hash(&bytes).to_hex().to_string())
+    hash_regular_file(&program).ok()
+}
+
+fn hash_regular_file(path: &std::path::Path) -> io::Result<String> {
+    let expected = std::fs::metadata(path)?;
+    if !expected.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "hash target is not a regular file",
+        ));
+    }
+    let mut file = std::fs::File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "opened hash target is not a regular file",
+        ));
+    }
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 /// Default hard cap on the bytes buffered in memory when capturing a command's
@@ -626,5 +652,28 @@ mod stdin_stream_poison_tests {
                 "production exec synchronization contains `{forbidden}`"
             );
         }
+    }
+
+    #[test]
+    fn executable_hashing_streams_regular_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("program");
+        let bytes = vec![b'x'; 3 * 64 * 1024 + 17];
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(
+            hash_regular_file(&path).unwrap(),
+            blake3::hash(&bytes).to_hex().to_string()
+        );
+        assert_eq!(
+            hash_regular_file(directory.path()).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn production_executable_hashing_never_reads_whole_files() {
+        let production = include_str!("lib.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(!production.contains("std::fs::read(&program)"));
+        assert!(production.contains("[0u8; 64 * 1024]"));
     }
 }
