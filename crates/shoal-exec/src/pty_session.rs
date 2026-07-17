@@ -56,6 +56,7 @@ const READ_POLL_MS: i32 = 50;
 /// Explicit close gives cooperative terminal programs a short chance to flush
 /// state at each rung. Drop remains an immediate kill backstop.
 const CLOSE_SIGNAL_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
+const RENDERER_POISONED_MESSAGE: &str = "PTY renderer state is quarantined";
 
 /// Hard bounds on the screen grid an agent may request, so a `pty.open`/
 /// `pty.resize` can never allocate an unbounded emulator or produce an
@@ -123,6 +124,9 @@ struct Shared {
     /// The terminal emulator. The reader thread feeds it output bytes; readers
     /// snapshot the rendered screen. One `Mutex` guards both directions.
     parser: Mutex<vt100::Parser>,
+    /// Sticky once the parser mutex is poisoned. The terminal grid is then an
+    /// uncertain partial state and must never be rendered or resized again.
+    renderer_quarantined: AtomicBool,
     /// Set by the reader thread once the master hit EOF/EIO (the child's slave
     /// fully closed) — the honest "child's terminal stream ended" signal.
     child_exited: AtomicBool,
@@ -249,6 +253,7 @@ impl PtySession {
         let shared = Arc::new(Shared {
             // Zero scrollback: only the visible (bounded) screen is ever read.
             parser: Mutex::new(vt100::Parser::new(rows, cols, 0)),
+            renderer_quarantined: AtomicBool::new(false),
             child_exited: AtomicBool::new(false),
         });
         let reader_stop = Arc::new(AtomicBool::new(false));
@@ -310,6 +315,7 @@ impl PtySession {
     pub fn resize(&mut self, cols: u16, rows: u16) -> io::Result<()> {
         let cols = cols.clamp(1, PTY_MAX_COLS);
         let rows = rows.clamp(1, PTY_MAX_ROWS);
+        let mut parser = lock_parser(&self.shared)?;
         self.master
             .resize(PtySize {
                 rows,
@@ -318,12 +324,7 @@ impl PtySession {
                 pixel_height: 0,
             })
             .map_err(pty_err)?;
-        self.shared
-            .parser
-            .lock()
-            .expect("parser lock")
-            .screen_mut()
-            .set_size(rows, cols);
+        parser.screen_mut().set_size(rows, cols);
         self.cols = cols;
         self.rows = rows;
         // A resized grid is a changed grid; force the next read to report it.
@@ -335,13 +336,18 @@ impl PtySession {
     /// whether the screen changed since the previous call. Opportunistically
     /// reaps the child if it has exited so `alive`/`exit_*` are accurate and no
     /// zombie lingers before an explicit [`PtySession::close`].
-    pub fn read_screen(&mut self) -> ScreenSnapshot {
+    ///
+    /// # Errors
+    /// Returns a stable renderer-quarantined error if the long-lived terminal
+    /// parser was poisoned. Its partial grid is never exposed as a valid
+    /// snapshot; repeated calls return the same failure without panicking.
+    pub fn read_screen(&mut self) -> io::Result<ScreenSnapshot> {
         // If the reader saw EOF, the child's terminal stream ended: reap it
         // (non-blocking) so its exit is reflected and it never lingers.
         self.reap_if_exited();
 
         let (cursor_row, cursor_col, cursor_hidden, rows_text, hash) = {
-            let parser = self.shared.parser.lock().expect("parser lock");
+            let parser = lock_parser(&self.shared)?;
             let screen = parser.screen();
             let (cursor_row, cursor_col) = screen.cursor_position();
             let cursor_hidden = screen.hide_cursor();
@@ -360,7 +366,7 @@ impl PtySession {
         let changed = self.last_screen_hash != Some(hash);
         self.last_screen_hash = Some(hash);
 
-        ScreenSnapshot {
+        Ok(ScreenSnapshot {
             cols: self.cols,
             rows: self.rows,
             cursor_row,
@@ -372,7 +378,17 @@ impl PtySession {
             exit_status: self.exit_status,
             exit_signal: self.exit_signal.clone(),
             pid: self.pid(),
-        }
+        })
+    }
+
+    /// Whether an I/O failure came from a poisoned terminal renderer. Kernel
+    /// hosts use this stable discriminator to quarantine only the affected PTY
+    /// entry; ordinary PTY syscall failures keep their existing mapping.
+    #[must_use]
+    pub fn is_renderer_quarantined_error(error: &io::Error) -> bool {
+        error
+            .get_ref()
+            .is_some_and(|source| source.downcast_ref::<RendererQuarantined>().is_some())
     }
 
     /// If the reader thread saw the child's terminal stream end, reap the child
@@ -511,13 +527,48 @@ fn pump_into_parser(reader: File, shared: &Shared, reader_stop: &AtomicBool) {
         }
         #[allow(clippy::cast_sign_loss)] // r > 0 checked above
         let n = r as usize;
-        shared
-            .parser
-            .lock()
-            .expect("parser lock")
-            .process(&buf[..n]);
+        let Ok(mut parser) = lock_parser(shared) else {
+            break;
+        };
+        parser.process(&buf[..n]);
     }
     shared.child_exited.store(true, Ordering::SeqCst);
+}
+
+#[derive(Debug)]
+struct RendererQuarantined;
+
+impl std::fmt::Display for RendererQuarantined {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(RENDERER_POISONED_MESSAGE)
+    }
+}
+
+impl std::error::Error for RendererQuarantined {}
+
+fn renderer_quarantined_error() -> io::Error {
+    io::Error::other(RendererQuarantined)
+}
+
+fn lock_parser(shared: &Shared) -> io::Result<std::sync::MutexGuard<'_, vt100::Parser>> {
+    if shared.renderer_quarantined.load(Ordering::Acquire) {
+        return Err(renderer_quarantined_error());
+    }
+    match shared.parser.lock() {
+        Ok(parser) => {
+            if shared.renderer_quarantined.load(Ordering::Acquire) {
+                drop(parser);
+                Err(renderer_quarantined_error())
+            } else {
+                Ok(parser)
+            }
+        }
+        Err(poisoned) => {
+            shared.renderer_quarantined.store(true, Ordering::Release);
+            drop(poisoned);
+            Err(renderer_quarantined_error())
+        }
+    }
 }
 
 /// A `File` onto the PTY master via a dup'd fd (no drop-time side effects,
@@ -655,7 +706,7 @@ mod tests {
     fn read_until(session: &mut PtySession, needle: &str, timeout: Duration) -> ScreenSnapshot {
         let deadline = Instant::now() + timeout;
         loop {
-            let snap = session.read_screen();
+            let snap = session.read_screen().expect("read rendered screen");
             if snap.rows_text.iter().any(|r| r.contains(needle)) {
                 return snap;
             }
@@ -736,7 +787,7 @@ mod tests {
         let pid = session.pid();
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            let snap = session.read_screen();
+            let snap = session.read_screen().expect("read rendered screen");
             if !snap.alive {
                 assert_eq!(snap.exit_status, Some(0), "clean exit reported");
                 break;
@@ -759,7 +810,7 @@ mod tests {
         assert!(first.changed, "first sighting of new output is a change");
         // No new input; the next read sees an unchanged screen.
         thread::sleep(Duration::from_millis(80));
-        let second = session.read_screen();
+        let second = session.read_screen().expect("read rendered screen");
         assert!(!second.changed, "no new output ⇒ not changed");
         session.close();
     }
@@ -776,5 +827,67 @@ mod tests {
         assert_eq!(named_key("C-d"), Some(vec![0x04]));
         assert_eq!(named_key("Ctrl-["), Some(vec![0x1b]));
         assert_eq!(named_key("nonsense-key"), None);
+    }
+
+    #[test]
+    fn poisoned_renderer_fails_read_and_resize_stably_then_reaps() {
+        let mut session = PtySession::open(spec(&["cat"], 80, 24)).expect("open cat");
+        let pid = session.pid();
+        let shared = Arc::clone(&session.shared);
+        assert!(
+            thread::spawn(move || {
+                let _parser = shared.parser.lock().expect("inject renderer poison");
+                panic!("inject renderer poison");
+            })
+            .join()
+            .is_err()
+        );
+
+        let first = session.read_screen().expect_err("poison must fail read");
+        let second = session
+            .read_screen()
+            .expect_err("repeat read must fail stably");
+        let resized = session
+            .resize(100, 40)
+            .expect_err("poison must fail resize");
+        for error in [&first, &second, &resized] {
+            assert!(PtySession::is_renderer_quarantined_error(error));
+            assert_eq!(error.to_string(), RENDERER_POISONED_MESSAGE);
+        }
+        assert_eq!(
+            session.size(),
+            (80, 24),
+            "failed resize changes no grid state"
+        );
+
+        session.close();
+        assert!(process_is_gone(pid), "quarantined renderer child is reaped");
+    }
+
+    #[test]
+    fn production_parser_and_tee_locks_have_no_panicking_access() {
+        fn production(source: &'static str) -> &'static str {
+            source
+                .rsplit_once("\n#[cfg(test)]\nmod tests")
+                .map_or(source, |(production, _)| production)
+        }
+
+        let parser = production(include_str!("pty_session.rs"));
+        for forbidden in [
+            "expect(\"parser lock\")",
+            "unwrap_or_else(|poisoned| poisoned.into_inner())",
+        ] {
+            assert!(
+                !parser.contains(forbidden),
+                "panicking/recovering parser access reappeared: {forbidden}"
+            );
+        }
+        let tee = production(include_str!("pty.rs"));
+        for forbidden in ["expect(\"tee lock\")", "unwrap(\"tee lock\")"] {
+            assert!(
+                !tee.contains(forbidden),
+                "panicking tee access reappeared: {forbidden}"
+            );
+        }
     }
 }

@@ -147,7 +147,7 @@ impl PtyRegistry {
             .map_err(|_| self.quarantine_entry(pty_ref, entry, "lifecycle"))
     }
 
-    fn quarantine_entry(
+    pub(crate) fn quarantine_entry(
         &self,
         pty_ref: &Ref,
         observed: &Arc<PtyEntry>,

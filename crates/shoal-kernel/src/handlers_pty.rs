@@ -202,7 +202,24 @@ impl Kernel {
         let owner = attachment.session.key.owner();
         let p: PtyRefParams = decode(params)?;
         let entry = self.pty(&p.pty_id, &owner)?;
-        let snap = self.ptys.lock_session(&p.pty_id, &entry)?.read_screen();
+        let snap = {
+            let mut session = self.ptys.lock_session(&p.pty_id, &entry)?;
+            match session.read_screen() {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    if !shoal_exec::PtySession::is_renderer_quarantined_error(&error) {
+                        return Err(RpcError {
+                            code: INTERNAL_ERROR,
+                            message: format!("pty read failed: {error}"),
+                            data: None,
+                        });
+                    }
+                    let rpc = self.ptys.quarantine_entry(&p.pty_id, &entry, "renderer");
+                    let _ = session.close();
+                    return Err(rpc);
+                }
+            }
+        };
         if !snap.alive {
             self.ptys.mark_terminal(&p.pty_id, &entry)?;
             self.reap_terminal_ptys(&owner)?;
@@ -238,12 +255,33 @@ impl Kernel {
         let entry = self.pty(&p.pty_id, &owner)?;
         let snap = {
             let mut session = self.ptys.lock_session(&p.pty_id, &entry)?;
-            session.resize(p.cols, p.rows).map_err(|e| RpcError {
-                code: INTERNAL_ERROR,
-                message: format!("pty resize failed: {e}"),
-                data: None,
-            })?;
-            session.read_screen()
+            if let Err(error) = session.resize(p.cols, p.rows) {
+                if shoal_exec::PtySession::is_renderer_quarantined_error(&error) {
+                    let rpc = self.ptys.quarantine_entry(&p.pty_id, &entry, "renderer");
+                    let _ = session.close();
+                    return Err(rpc);
+                }
+                return Err(RpcError {
+                    code: INTERNAL_ERROR,
+                    message: format!("pty resize failed: {error}"),
+                    data: None,
+                });
+            }
+            match session.read_screen() {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    if !shoal_exec::PtySession::is_renderer_quarantined_error(&error) {
+                        return Err(RpcError {
+                            code: INTERNAL_ERROR,
+                            message: format!("pty read after resize failed: {error}"),
+                            data: None,
+                        });
+                    }
+                    let rpc = self.ptys.quarantine_entry(&p.pty_id, &entry, "renderer");
+                    let _ = session.close();
+                    return Err(rpc);
+                }
+            }
         };
         if !snap.alive {
             self.ptys.mark_terminal(&p.pty_id, &entry)?;

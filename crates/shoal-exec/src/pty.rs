@@ -73,6 +73,26 @@ struct OutputPumpConfig {
     pump_done: Arc<AtomicBool>,
 }
 
+/// Lock the bounded human-facing tee. If a writer panicked while holding it,
+/// its captured prefix is unknowable: discard that prefix, force the result's
+/// truncation marker, repair the mutex, and continue capturing subsequent
+/// bytes. Raw terminal/background passthrough remains independent.
+fn lock_tee<'a>(
+    tee: &'a Mutex<Vec<u8>>,
+    tee_truncated: &AtomicBool,
+) -> std::sync::MutexGuard<'a, Vec<u8>> {
+    match tee.lock() {
+        Ok(bytes) => bytes,
+        Err(poisoned) => {
+            tee_truncated.store(true, Ordering::SeqCst);
+            let mut bytes = poisoned.into_inner();
+            bytes.clear();
+            tee.clear_poison();
+            bytes
+        }
+    }
+}
+
 /// Parked, still-running PTY foreground jobs that were stopped (Ctrl-Z /
 /// SIGTSTP) and can be resumed by the host via `fg`/`bg`. Process-global
 /// because job control is inherently a per-process singleton (there is one
@@ -304,10 +324,10 @@ fn pump_output(reader: File, config: OutputPumpConfig) {
         #[allow(clippy::cast_sign_loss)] // r > 0 checked above
         let n = r as usize;
         {
-            let mut tee = tee.lock().expect("tee lock");
-            if tee.len() < cap {
-                let take = (cap - tee.len()).min(n);
-                tee.extend_from_slice(&buf[..take]);
+            let mut captured = lock_tee(&tee, &tee_truncated);
+            if captured.len() < cap {
+                let take = (cap - captured.len()).min(n);
+                captured.extend_from_slice(&buf[..take]);
                 if take < n {
                     tee_truncated.store(true, Ordering::SeqCst);
                 }
@@ -546,7 +566,7 @@ impl PtyJob {
     /// Build the terminal-exit result and mark the child reaped.
     fn exit_result(&mut self, raw: i32) -> ExecResult {
         let (status, signal) = decode_wait_status(raw);
-        let stdout = mem::take(&mut *self.tee.lock().expect("tee lock"));
+        let stdout = mem::take(&mut *lock_tee(&self.tee, &self.tee_truncated));
         let truncated = self.tee_truncated.load(Ordering::SeqCst);
         self.reaped = true;
         #[allow(clippy::cast_sign_loss)] // pids are positive
@@ -571,7 +591,7 @@ impl PtyJob {
     /// Build the *stopped* result (child alive, suspended). Snapshots the tee
     /// (clone, not take) so a later resume keeps appending to the same buffer.
     fn stopped_result(&self) -> ExecResult {
-        let stdout = self.tee.lock().expect("tee lock").clone();
+        let stdout = lock_tee(&self.tee, &self.tee_truncated).clone();
         let truncated = self.tee_truncated.load(Ordering::SeqCst);
         #[allow(clippy::cast_sign_loss)] // pids are positive
         ExecResult {
@@ -927,6 +947,66 @@ mod tests {
     use super::*;
     use crate::ExecMode;
     use std::ffi::OsString;
+    use std::io::Read as _;
+    use std::os::fd::IntoRawFd as _;
+    use std::os::unix::net::UnixStream;
+
+    fn stream_file(stream: UnixStream) -> File {
+        // SAFETY: `into_raw_fd` transfers ownership and `File` takes it over.
+        unsafe { File::from_raw_fd(stream.into_raw_fd()) }
+    }
+
+    #[test]
+    fn poisoned_tee_discards_uncertain_prefix_but_preserves_raw_passthrough() {
+        let tee = Arc::new(Mutex::new(b"uncertain-prefix".to_vec()));
+        let poisoner = Arc::clone(&tee);
+        assert!(
+            thread::spawn(move || {
+                let _bytes = poisoner.lock().expect("inject tee poison");
+                panic!("inject tee poison");
+            })
+            .join()
+            .is_err()
+        );
+
+        let truncated = Arc::new(AtomicBool::new(false));
+        let serve_done = Arc::new(AtomicBool::new(false));
+        let pump_done = Arc::new(AtomicBool::new(false));
+        let (reader, mut writer) = UnixStream::pair().expect("input pipe");
+        let (mut passthrough_reader, passthrough) = UnixStream::pair().expect("passthrough pipe");
+        let pump = {
+            let tee = Arc::clone(&tee);
+            let truncated = Arc::clone(&truncated);
+            let serve_done = Arc::clone(&serve_done);
+            let pump_done = Arc::clone(&pump_done);
+            thread::spawn(move || {
+                pump_output(
+                    stream_file(reader),
+                    OutputPumpConfig {
+                        tee,
+                        tee_truncated: truncated,
+                        passthrough: Some(stream_file(passthrough)),
+                        background_output: None,
+                        cap: 1024,
+                        serve_done,
+                        pump_done,
+                    },
+                );
+            })
+        };
+        writer.write_all(b"certain-output").expect("write input");
+        drop(writer);
+        pump.join().expect("pump contains tee poison");
+
+        let mut passed = Vec::new();
+        passthrough_reader
+            .read_to_end(&mut passed)
+            .expect("read passthrough");
+        assert_eq!(passed, b"certain-output");
+        assert_eq!(*tee.lock().expect("repaired tee"), b"certain-output");
+        assert!(truncated.load(Ordering::SeqCst));
+        assert!(pump_done.load(Ordering::SeqCst));
+    }
 
     /// Serializes every test below that parks/takes/drains the process-global
     /// `PARKED_JOBS` registry. Without this, cargo test's default thread

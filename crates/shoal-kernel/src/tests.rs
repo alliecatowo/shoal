@@ -785,7 +785,7 @@ fn concurrent_pty_close_has_exactly_one_teardown_owner() {
 fn poisoned_pty_session_quarantines_only_that_entry_and_releases_quota() {
     let kernel = Kernel::new();
     kernel.configure_limits(Limits {
-        max_ptys_per_session: 1,
+        max_ptys_per_session: 2,
         ..Limits::default()
     });
     let actor = principal();
@@ -805,6 +805,11 @@ fn poisoned_pty_session_quarantines_only_that_entry_and_releases_quota() {
         .handle_pty_open(json!({"cmd":"cat"}), &mut attached)
         .unwrap();
     let pty_ref: Ref = serde_json::from_value(opened["pty_id"].clone()).unwrap();
+    let poisoned_pid = opened["pid"].as_u64().unwrap() as libc::pid_t;
+    let neighbor = kernel
+        .handle_pty_open(json!({"cmd":"cat"}), &mut attached)
+        .expect("open healthy neighbor");
+    let neighbor_ref: Ref = serde_json::from_value(neighbor["pty_id"].clone()).unwrap();
     let entry = kernel.ptys.get(&pty_ref).unwrap();
     let poisoner = entry.clone();
     assert!(
@@ -827,15 +832,43 @@ fn poisoned_pty_session_quarantines_only_that_entry_and_releases_quota() {
     assert_eq!(error.data.as_ref().unwrap()["component"], "session");
     assert_eq!(error.data.unwrap()["scope"], "entry");
     assert!(kernel.ptys.get(&pty_ref).is_none());
-    assert!(!kernel.ptys.active_for(&owner));
     drop(entry);
+
+    let deadline = Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        // SAFETY: signal 0 only probes the pid and delivers no signal.
+        let gone = unsafe { libc::kill(poisoned_pid, 0) } == -1
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        if gone {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "quarantined PTY child was not reaped"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    kernel
+        .handle_pty_send(
+            json!({"pty_id":neighbor_ref, "input":"healthy-neighbor\r"}),
+            &mut attached,
+        )
+        .expect("poisoned entry must not disrupt its healthy neighbor");
+    kernel
+        .handle_pty_read(json!({"pty_id":neighbor_ref}), &mut attached)
+        .expect("healthy neighbor remains readable");
 
     let replacement = kernel
         .handle_pty_open(json!({"cmd":"cat"}), &mut attached)
-        .expect("one poisoned PTY must not quarantine healthy PTY admission");
+        .expect("quarantined PTY must release exactly its quota slot");
     kernel
         .handle_pty_close(json!({"pty_id":replacement["pty_id"]}), &mut attached)
         .unwrap();
+    kernel
+        .handle_pty_close(json!({"pty_id":neighbor_ref}), &mut attached)
+        .unwrap();
+    assert!(!kernel.ptys.active_for(&owner));
 }
 
 #[test]
