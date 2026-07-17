@@ -227,11 +227,13 @@ same PTY and marks the row suspended again.
 
 The host marks the row running, prints a background notice, and calls `resume_background`. A detached
 thread attaches an output pump, does not forward stdin, and uses a fresh never-cancelled token so
-foreground Ctrl-C does not kill it. If it stops again, it is re-parked.
+foreground Ctrl-C does not kill it. The worker reports exit, failure, or a later stop through a
+channel; the REPL drains those notifications at prompt/read boundaries and reconciles its evaluator
+row on the owning thread. If the job stops again, it is re-parked and marked suspended.
 
-Current limitation: background completion does not update the evaluator task row. It can remain
-shown as running until session shutdown or another host path retires it. This is a cross-thread
-lifecycle gap, not merely stale rendering.
+A running background PTY still cannot be reattached with `fg`: the detached worker owns the live
+`PtyJob`, so the host reports that limitation instead of retiring the evaluator row. Foregrounding
+would require a control channel into the worker and an explicit terminal-ownership handoff.
 
 ## Task lifecycle versus external jobs
 
@@ -348,7 +350,9 @@ different ownership and output contracts.
 ## Known sharp edges
 
 - Job control is Unix/process-global and assumes one local controlling terminal.
-- Background completion does not retire the evaluator row.
+- Background completion notices are reconciled only when the REPL regains control at a read/prompt
+  boundary; they do not asynchronously repaint a currently blocked Reedline prompt.
+- A live background PTY cannot yet be moved back to the foreground.
 - A pump missing its 500 ms drain grace may outlive the serve briefly.
 - PTY tee only retains a bounded prefix and never spills.
 - Programmatic sessions retain no scrollback and expose no push change subscription.
