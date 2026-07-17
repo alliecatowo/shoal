@@ -124,29 +124,38 @@ fn two_private_embedded_kernels_can_share_state_without_contending_on_a_socket()
     let state = temp.path().join("state");
     let runtime = temp.path().join("runtime");
     let expected_socket = runtime.join("shoal/default.sock");
-    let (mut child_a, mut private_a, stderr_a) =
-        spawn_embedded_kernel(temp.path(), &state, &runtime, "a");
-    let (mut child_b, mut private_b, stderr_b) =
-        spawn_embedded_kernel(temp.path(), &state, &runtime, "b");
-    let mut reader_a = BufReader::new(private_a.try_clone().unwrap());
-    let mut reader_b = BufReader::new(private_b.try_clone().unwrap());
+    for round in 0..20 {
+        // Spawn both before waiting for either readiness frame. This is real
+        // concurrent state initialization, not two sequential starts whose
+        // lifetimes merely overlap.
+        let label_a = format!("stress-{round}-a");
+        let label_b = format!("stress-{round}-b");
+        let (mut child_a, mut private_a, stderr_a) =
+            spawn_embedded_kernel_unready(temp.path(), &state, &runtime, &label_a);
+        let (mut child_b, mut private_b, stderr_b) =
+            spawn_embedded_kernel_unready(temp.path(), &state, &runtime, &label_b);
+        await_embedded_ready(&mut child_a, &private_a, &stderr_a);
+        await_embedded_ready(&mut child_b, &private_b, &stderr_b);
+        let mut reader_a = BufReader::new(private_a.try_clone().unwrap());
+        let mut reader_b = BufReader::new(private_b.try_clone().unwrap());
 
-    attach_embedded(&mut private_a, &mut reader_a, 1, "human-a");
-    attach_embedded(&mut private_b, &mut reader_b, 2, "human-b");
-    assert_ne!(child_a.id(), child_b.id());
-    assert!(child_a.try_wait().unwrap().is_none());
-    assert!(child_b.try_wait().unwrap().is_none());
-    assert!(
-        !expected_socket.exists(),
-        "isolated embedded kernels must not contend on a listener"
-    );
+        attach_embedded(&mut private_a, &mut reader_a, 1, "human-a");
+        attach_embedded(&mut private_b, &mut reader_b, 2, "human-b");
+        assert_ne!(child_a.id(), child_b.id());
+        assert!(child_a.try_wait().unwrap().is_none());
+        assert!(child_b.try_wait().unwrap().is_none());
+        assert!(
+            !expected_socket.exists(),
+            "isolated embedded kernels must not contend on a listener"
+        );
 
-    drop(private_a);
-    drop(reader_a);
-    drop(private_b);
-    drop(reader_b);
-    wait_for_embedded_exit(&mut child_a, &stderr_a);
-    wait_for_embedded_exit(&mut child_b, &stderr_b);
+        drop(private_a);
+        drop(reader_a);
+        drop(private_b);
+        drop(reader_b);
+        wait_for_embedded_exit(&mut child_a, &stderr_a);
+        wait_for_embedded_exit(&mut child_b, &stderr_b);
+    }
 }
 
 #[test]
@@ -172,11 +181,6 @@ fn private_embedded_kernel_coexists_with_a_durable_public_kernel() {
         .spawn()
         .unwrap();
     wait_for_socket(&socket, &public_stderr_path);
-
-    let (mut embedded_child, mut private, embedded_stderr) =
-        spawn_embedded_kernel(temp.path(), &state, &runtime, "coexist");
-    let mut private_reader = BufReader::new(private.try_clone().unwrap());
-    attach_embedded(&mut private, &mut private_reader, 1, "human");
 
     let mut public = UnixStream::connect(&socket).unwrap();
     let mut public_reader = BufReader::new(public.try_clone().unwrap());
@@ -205,27 +209,34 @@ fn private_embedded_kernel_coexists_with_a_durable_public_kernel() {
         recv(&mut public_reader).result.unwrap()["pid"],
         public_child.id()
     );
-    assert_ne!(public_child.id(), embedded_child.id());
+    for round in 0..10_u64 {
+        let label = format!("coexist-{round}");
+        let (mut embedded_child, mut private, embedded_stderr) =
+            spawn_embedded_kernel(temp.path(), &state, &runtime, &label);
+        let mut private_reader = BufReader::new(private.try_clone().unwrap());
+        attach_embedded(&mut private, &mut private_reader, 10 + round, "human");
+        assert_ne!(public_child.id(), embedded_child.id());
 
-    drop(private);
-    drop(private_reader);
-    wait_for_embedded_exit(&mut embedded_child, &embedded_stderr);
+        drop(private);
+        drop(private_reader);
+        wait_for_embedded_exit(&mut embedded_child, &embedded_stderr);
+        write_frame(
+            &mut public,
+            &Request {
+                jsonrpc: JSONRPC.into(),
+                id: (100 + round).into(),
+                method: "kernel.status".into(),
+                params: serde_json::json!({}),
+            },
+        )
+        .unwrap();
+        assert!(recv(&mut public_reader).error.is_none());
+    }
     write_frame(
         &mut public,
         &Request {
             jsonrpc: JSONRPC.into(),
-            id: 4.into(),
-            method: "kernel.status".into(),
-            params: serde_json::json!({}),
-        },
-    )
-    .unwrap();
-    assert!(recv(&mut public_reader).error.is_none());
-    write_frame(
-        &mut public,
-        &Request {
-            jsonrpc: JSONRPC.into(),
-            id: 5.into(),
+            id: 200.into(),
             method: "kernel.shutdown".into(),
             params: serde_json::json!({}),
         },
@@ -273,6 +284,18 @@ fn spawn_embedded_kernel(
     runtime: &Path,
     label: &str,
 ) -> (Child, UnixStream, PathBuf) {
+    let (mut child, private, stderr_path) =
+        spawn_embedded_kernel_unready(dir, state, runtime, label);
+    await_embedded_ready(&mut child, &private, &stderr_path);
+    (child, private, stderr_path)
+}
+
+fn spawn_embedded_kernel_unready(
+    dir: &Path,
+    state: &Path,
+    runtime: &Path,
+    label: &str,
+) -> (Child, UnixStream, PathBuf) {
     const EMBEDDED_FD: i32 = 3;
     const F_GETFD: i32 = 1;
     const F_SETFD: i32 = 2;
@@ -310,6 +333,21 @@ fn spawn_embedded_kernel(
     let child = command.spawn().unwrap();
     drop(child_end);
     (child, private, stderr_path)
+}
+
+fn await_embedded_ready(child: &mut Child, private: &UnixStream, stderr_path: &Path) {
+    let mut ready_reader = BufReader::new(private.try_clone().unwrap());
+    let mut ready_line = String::new();
+    let ready_result = ready_reader.read_line(&mut ready_line);
+    assert!(
+        ready_result.is_ok_and(|bytes| bytes > 0),
+        "embedded child failed before readiness (status {:?}):\n{}",
+        child.try_wait(),
+        read_daemon_stderr(stderr_path)
+    );
+    let ready: serde_json::Value = serde_json::from_str(ready_line.trim_end()).unwrap();
+    assert_eq!(ready["shoal_embedded"]["ready"], true);
+    assert_eq!(ready["shoal_embedded"]["protocol"], 1);
 }
 
 fn attach_embedded(

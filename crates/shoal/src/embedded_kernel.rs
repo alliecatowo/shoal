@@ -1,6 +1,7 @@
 //! Private one-shot kernel transport for the interactive shell.
 
 use shoal_mcp::{Config, KernelClient, LocalAuthMode};
+use std::io::{BufRead, BufReader};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
@@ -9,6 +10,8 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 const EMBEDDED_FD: i32 = 3;
+const EMBEDDED_READY_PROTOCOL: u64 = 1;
+const EMBEDDED_READY_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) struct EmbeddedKernelConfig {
     pub(crate) session: String,
@@ -106,7 +109,8 @@ pub(crate) fn connect(
         )
     })?;
     drop(child_end);
-    let guard = EmbeddedKernelChild { child, shutdown };
+    let mut guard = EmbeddedKernelChild { child, shutdown };
+    wait_until_ready(&parent, &mut guard)?;
     let client_config = Config {
         socket: PathBuf::new(),
         session: Some(config.session),
@@ -116,6 +120,52 @@ pub(crate) fn connect(
     let client = KernelClient::from_stream(parent, &client_config, "shoal-repl", true)
         .map_err(|error| error.to_string())?;
     Ok((client, guard))
+}
+
+fn wait_until_ready(stream: &UnixStream, guard: &mut EmbeddedKernelChild) -> Result<(), String> {
+    let reader_stream = stream.try_clone().map_err(|error| error.to_string())?;
+    reader_stream
+        .set_read_timeout(Some(EMBEDDED_READY_TIMEOUT))
+        .map_err(|error| error.to_string())?;
+    let mut reader = BufReader::new(reader_stream);
+    let mut line = String::new();
+    let read = reader.read_line(&mut line).map_err(|error| {
+        format!(
+            "embedded kernel did not become ready within {}s: {error}{}",
+            EMBEDDED_READY_TIMEOUT.as_secs(),
+            child_status_suffix(&mut guard.child)
+        )
+    })?;
+    if read == 0 {
+        return Err(format!(
+            "embedded kernel closed its private transport before readiness{}",
+            child_status_suffix(&mut guard.child)
+        ));
+    }
+    let frame: serde_json::Value = serde_json::from_str(line.trim_end())
+        .map_err(|error| format!("embedded kernel sent an invalid readiness frame: {error}"))?;
+    if frame["shoal_embedded"]["ready"] != true
+        || frame["shoal_embedded"]["protocol"] != EMBEDDED_READY_PROTOCOL
+    {
+        return Err(format!(
+            "embedded kernel readiness protocol mismatch: expected version {EMBEDDED_READY_PROTOCOL}"
+        ));
+    }
+    // `set_read_timeout` is a socket option shared by descriptor clones.
+    // Restore ordinary blocking RPC behavior before handing the endpoint to
+    // KernelClient.
+    stream
+        .set_read_timeout(None)
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn child_status_suffix(child: &mut Child) -> String {
+    match child.try_wait() {
+        Ok(Some(status)) => format!(" (child exited with {status})"),
+        Ok(None) => String::new(),
+        Err(error) => format!(" (child status unavailable: {error})"),
+    }
 }
 
 fn kernel_program() -> PathBuf {
@@ -131,4 +181,28 @@ fn kernel_program() -> PathBuf {
         }
     }
     Path::new("shoal-kernel").to_path_buf()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn early_child_exit_is_reported_before_rpc_client_construction() {
+        let temp = tempfile::tempdir().unwrap();
+        let result = connect(EmbeddedKernelConfig {
+            session: "early-exit".into(),
+            state_dir: temp.path().join("state"),
+            policy: None,
+            program: Some(PathBuf::from("/bin/false")),
+        });
+        let error = match result {
+            Ok(_) => panic!("a child that never sends readiness must not connect"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("before readiness") || error.contains("did not become ready"),
+            "unexpected startup error: {error}"
+        );
+    }
 }

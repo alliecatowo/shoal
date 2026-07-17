@@ -1,13 +1,15 @@
 use shoal_kernel::{ConnectionTrust, Kernel, Limits};
 use shoal_leash::Policy;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::io::FromRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+const EMBEDDED_READY_FRAME: &[u8] = b"{\"shoal_embedded\":{\"ready\":true,\"protocol\":1}}\n";
 
 fn main() {
     if let Err(error) = run() {
@@ -49,7 +51,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         ctrlc::set_handler(|| {})?;
         // SAFETY: the spawning parent passes ownership of this descriptor
         // exactly once; fcntl above proved it is open in this process.
-        let stream = unsafe { UnixStream::from_raw_fd(fd) };
+        let mut stream = unsafe { UnixStream::from_raw_fd(fd) };
+        // This transport is private and the host consumes this versioned
+        // prelude before constructing its JSON-RPC client. Emitting it only
+        // after state/configuration and fd validation makes readiness
+        // deterministic and turns early child death into a startup error.
+        stream.write_all(EMBEDDED_READY_FRAME)?;
+        stream.flush()?;
         kernel.handle_stream_with_trust(stream, ConnectionTrust::EmbeddedHuman)?;
         return Ok(());
     }

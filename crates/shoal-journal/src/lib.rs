@@ -39,8 +39,9 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, ErrorCode};
 
 mod cas;
 mod gc;
@@ -85,16 +86,36 @@ impl Journal {
     ) -> rusqlite::Result<Journal> {
         let cas_root = state_dir.join("cas");
         fs::create_dir_all(&cas_root).map_err(io_to_sql)?;
-        let conn = Connection::open(state_dir.join("journal.db"))?;
-        // `PRAGMA journal_mode=WAL` returns a result row; consume it.
-        conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))?;
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
-        // Wait (rather than immediately fail with SQLITE_BUSY) for a competing
-        // writer's lock: the journal is shared across processes and every
-        // journaling call site swallows errors, so a busy failure here silently
-        // drops the entry and its undo inverse. See `JournalOptions::busy_timeout`.
-        conn.busy_timeout(options.busy_timeout)?;
-        Self::migrate(&conn)?;
+        let db_path = state_dir.join("journal.db");
+        let started = Instant::now();
+        let conn = loop {
+            let attempt = (|| {
+                let conn = Connection::open(&db_path)?;
+                // Install contention handling before *any* pragma or schema
+                // write. `journal_mode=WAL` itself takes a database lock.
+                conn.busy_timeout(options.busy_timeout.saturating_sub(started.elapsed()))?;
+                // `PRAGMA journal_mode=WAL` returns a result row; consume it.
+                conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))?;
+                conn.pragma_update(None, "synchronous", "NORMAL")?;
+                Self::migrate(&conn)?;
+                Ok(conn)
+            })();
+            match attempt {
+                Ok(conn) => break conn,
+                Err(error)
+                    if is_sqlite_contention(&error)
+                        && !options.busy_timeout.is_zero()
+                        && started.elapsed() < options.busy_timeout =>
+                {
+                    // SQLite's busy handler covers SQLITE_BUSY while waiting
+                    // on a lock, but concurrent first-open DDL/journal-mode
+                    // transitions can also return SQLITE_LOCKED immediately.
+                    // Reopen and retry within the same bounded policy window.
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => return Err(error),
+            }
+        };
         Ok(Journal {
             conn,
             cas_root,
@@ -123,6 +144,14 @@ impl Journal {
             output_hard_cap: options.output_hard_cap,
         })
     }
+}
+
+fn is_sqlite_contention(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(code, _)
+            if matches!(code.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+    )
 }
 
 /// rusqlite has no dedicated I/O error variant; `ToSqlConversionFailure` is the

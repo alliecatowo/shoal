@@ -1189,6 +1189,34 @@ fn read_blob_rejects_corrupted_content() {
 }
 
 #[test]
+fn concurrent_first_open_waits_through_wal_and_schema_initialization() {
+    let dir = tempfile::tempdir().unwrap();
+    for round in 0..10 {
+        let state = dir.path().join(format!("concurrent-open-{round}"));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles = (0..8)
+            .map(|_| {
+                let state = state.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    Journal::open(&state)
+                })
+            })
+            .collect::<Vec<_>>();
+        let opened = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Result<Vec<_>, _>>();
+        assert!(
+            opened.is_ok(),
+            "concurrent first-open round {round} failed: {:?}",
+            opened.err()
+        );
+    }
+}
+
+#[test]
 fn busy_timeout_zero_fails_fast_on_contended_write() {
     // Baseline: with busy_timeout = 0 (rusqlite's
     // default), a write that meets a held writer lock fails immediately with
