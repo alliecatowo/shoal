@@ -4,15 +4,25 @@
 
 use super::*;
 
-use crate::plan_effects::{parse_declared_effect, push_effect};
-use shoal_syntax::commands::CommandSource;
+use crate::plan_effects::push_effect;
+
+mod attribution;
+mod commands;
+mod statements;
+
+use attribution::{
+    cmd_arg_str_literal, is_path_read_method, str_literal, url_host_port, url_literal,
+};
+
+type Functions = std::collections::HashMap<String, Block>;
+type Aliases = std::collections::HashMap<String, CmdCall>;
 
 impl Evaluator {
     /// Derive a conservative, concrete plan without spawning or mutating.
     pub fn plan_program(&mut self, program: &Program) -> VResult<Plan> {
         let mut effects = Vec::new();
-        let mut functions = std::collections::HashMap::new();
-        let mut aliases = std::collections::HashMap::new();
+        let mut functions = Functions::new();
+        let mut aliases = Aliases::new();
         for stmt in &program.stmts {
             if let Stmt::Fn { decl } = stmt {
                 functions.insert(decl.name.clone(), decl.body.clone());
@@ -33,85 +43,6 @@ impl Evaluator {
             Reversibility::Reversible
         };
         Ok(Plan::new(effects, reversibility, Estimates::default()))
-    }
-
-    pub(crate) fn plan_stmt(
-        &mut self,
-        stmt: &Stmt,
-        functions: &std::collections::HashMap<String, Block>,
-        aliases: &std::collections::HashMap<String, CmdCall>,
-        out: &mut Vec<Effect>,
-        depth: usize,
-    ) -> VResult<()> {
-        match stmt {
-            Stmt::Expr { expr, .. } => self.plan_expr(expr, functions, aliases, out, depth),
-            Stmt::Let { init, .. } => self.plan_expr(init, functions, aliases, out, depth),
-            Stmt::Assign { target, value, .. } => {
-                self.plan_expr(value, functions, aliases, out, depth)?;
-                // Persistent `env.NAME = …` is an environment write, not only
-                // its RHS effects (A2). Any other target is traversed for
-                // nested effects (e.g. `xs[f()] = v`).
-                if let Expr::Field { recv, name, .. } = target
-                    && matches!(&**recv, Expr::Var { name: ns, .. } if ns == "env")
-                {
-                    push_effect(
-                        out,
-                        Effect::EnvWrite {
-                            names: vec![name.clone()],
-                        },
-                    );
-                    Ok(())
-                } else {
-                    self.plan_expr(target, functions, aliases, out, depth)
-                }
-            }
-            Stmt::Use { path, .. } => {
-                // `use ./mod` reads the module file and executes every top-level
-                // statement (A1). Record the read concretely; the module body is
-                // arbitrary code, so cover it conservatively with `Opaque`.
-                push_effect(
-                    out,
-                    Effect::FsRead {
-                        paths: vec![self.plan_module_path(path)],
-                    },
-                );
-                push_effect(out, Effect::Opaque);
-                Ok(())
-            }
-            Stmt::Return {
-                value: Some(expr), ..
-            } => self.plan_expr(expr, functions, aliases, out, depth),
-            Stmt::For { iter, body, .. } => {
-                self.plan_expr(iter, functions, aliases, out, depth)?;
-                self.plan_block(body, functions, aliases, out, depth)
-            }
-            Stmt::While { cond, body, .. } => {
-                self.plan_expr(cond, functions, aliases, out, depth)?;
-                self.plan_block(body, functions, aliases, out, depth)
-            }
-            // Declarations and control-flow markers execute no effect at this
-            // point; a declared fn's body effects surface where it is called. No
-            // wildcard arm — a new `Stmt` variant must be classified here (A10).
-            Stmt::Fn { .. }
-            | Stmt::Alias { .. }
-            | Stmt::Return { value: None, .. }
-            | Stmt::Break { .. }
-            | Stmt::Continue { .. } => Ok(()),
-        }
-    }
-
-    pub(crate) fn plan_block(
-        &mut self,
-        block: &Block,
-        functions: &std::collections::HashMap<String, Block>,
-        aliases: &std::collections::HashMap<String, CmdCall>,
-        out: &mut Vec<Effect>,
-        depth: usize,
-    ) -> VResult<()> {
-        for stmt in &block.stmts {
-            self.plan_stmt(stmt, functions, aliases, out, depth)?;
-        }
-        Ok(())
     }
 
     pub(crate) fn plan_expr(
@@ -347,463 +278,6 @@ impl Evaluator {
             | Expr::Var { .. } => Ok(()),
         }
     }
-
-    pub(crate) fn plan_call(
-        &mut self,
-        call: &CmdCall,
-        functions: &std::collections::HashMap<String, Block>,
-        aliases: &std::collections::HashMap<String, CmdCall>,
-        out: &mut Vec<Effect>,
-        depth: usize,
-    ) -> VResult<()> {
-        if depth > 64 {
-            return Err(ErrorVal::new(
-                "recursion_limit",
-                "planning function recursion exceeded 64",
-            ));
-        }
-        // Redirects are effects independent of the head (A3): `>`/`>>` write the
-        // target, `< file` reads it. Recorded first so an aliased/functioned head
-        // (whose body redirects belong to a different call) still gets this call's
-        // redirects.
-        self.plan_redirects(call, out);
-        if let Some(target) = aliases.get(&call.head) {
-            return self.plan_call(target, functions, aliases, out, depth + 1);
-        }
-        if let Some(body) = functions.get(&call.head) {
-            return self.plan_block(body, functions, aliases, out, depth + 1);
-        }
-        let resolution = self.resolve_command(call);
-        // A bound session closure/fn (not one declared in this program) shadows
-        // builtin/adapter/external dispatch and cannot be statically expanded
-        // (A5): require approval rather than reporting nothing.
-        if resolution.source == CommandSource::SessionCallable {
-            push_effect(out, Effect::Opaque);
-            return Ok(());
-        }
-        // A bare non-callable binding evaluates as a value at runtime. The
-        // planner must not invent an external spawn for the same command shape.
-        if resolution.source == CommandSource::BoundValue {
-            return Ok(());
-        }
-        // Effectful heads the runtime intercepts before builtin/adapter dispatch
-        // (A8), mirroring `eval_command`'s special-head order.
-        match (resolution.source, call.head.as_str()) {
-            (CommandSource::SpecialBuiltin, "interact") => {
-                // `interact <cmd ...>` bypasses normal command dispatch and
-                // runs the first argument through `run_argv` in PTY mode. The
-                // process is the argument, not a fictitious external binary
-                // named `interact`.
-                match call.args.first().and_then(cmd_arg_str_literal) {
-                    Some(head) => self.plan_external_spawn(&head, out),
-                    None => push_effect(out, Effect::Opaque),
-                }
-                return Ok(());
-            }
-            (CommandSource::SpecialBuiltin, "open") => {
-                let path = call.args.first().and_then(|a| self.cmd_arg_path_literal(a));
-                self.plan_open(path, out);
-                return Ok(());
-            }
-            (CommandSource::SpecialBuiltin, "save") => {
-                let path = call.args.first().and_then(|a| self.cmd_arg_path_literal(a));
-                self.plan_save(path, out);
-                return Ok(());
-            }
-            (CommandSource::SpecialBuiltin, "run") => {
-                self.plan_run_target(call.args.first().and_then(cmd_arg_str_literal), out);
-                return Ok(());
-            }
-            (CommandSource::SpecialBuiltin, "source") => {
-                // `source <path>` reads and runs a script in this session.
-                if let Some(p) = call.args.first().and_then(|a| self.cmd_arg_path_literal(a)) {
-                    push_effect(out, Effect::FsRead { paths: vec![p] });
-                }
-                push_effect(out, Effect::Opaque);
-                return Ok(());
-            }
-            _ => {}
-        }
-        // A `.shl` head runs a script file in a child evaluator (arbitrary code).
-        if resolution.source == CommandSource::Script {
-            push_effect(
-                out,
-                Effect::FsRead {
-                    paths: vec![self.plan_abs(&call.head)],
-                },
-            );
-            push_effect(out, Effect::Opaque);
-            return Ok(());
-        }
-        if resolution.source == CommandSource::StructuredBuiltin {
-            for effect in self.builtin_effects(call)? {
-                push_effect(out, effect);
-            }
-            return Ok(());
-        }
-        // Every command head intercepted by `eval_command` must also resolve
-        // as an in-language command here. This gate deliberately consumes the
-        // canonical registry rather than maintaining a planner-only name list:
-        // `history` previously fell through as an external ProcSpawn even
-        // though runtime dispatch reads the journal, causing Leash to deny it.
-        if resolution.source == CommandSource::SpecialBuiltin {
-            match call.head.as_str() {
-                "cd" | "pushd" | "popd" | "j" | "jump" | "exit" | "quit" => {
-                    push_effect(out, Effect::SessionWrite);
-                }
-                "journal" | "history" => push_effect(out, Effect::JournalRead),
-                // Undo consults durable history and may restore/delete paths
-                // that cannot be identified without the selected journal row.
-                "undo" => {
-                    push_effect(out, Effect::JournalRead);
-                    push_effect(out, Effect::Opaque);
-                }
-                // `apply` executes a previously stored program; `reef` ranges
-                // from a read-only table to manifest writes/provider fetches.
-                // Without the runtime object/subcommand, both stay fail-closed.
-                "apply" | "reef" => push_effect(out, Effect::Opaque),
-                // `plan` stores the parsed program in session execution state
-                // for a later `apply`; the other heads are local reads or
-                // validation-only operations.
-                "plan" => push_effect(out, Effect::SessionWrite),
-                "jobs" | "dirs" | "pwd" | "assert" | "explain" => {}
-                // Effectful special heads are handled above. Keeping a
-                // conservative fallback means a future registry entry cannot
-                // silently become effect-free before planner semantics land.
-                _ => push_effect(out, Effect::Opaque),
-            }
-            return Ok(());
-        }
-        if resolution.source == CommandSource::Plugin {
-            let registry = self
-                .host
-                .wasm
-                .as_ref()
-                .expect("plugin resolution carries a registry");
-            let command = registry
-                .command(&call.head)
-                .expect("plugin resolution carries command metadata");
-            for effect in command.effects {
-                push_effect(out, effect.clone());
-            }
-            return Ok(());
-        }
-        if resolution.source == CommandSource::Adapter {
-            let adapter = self
-                .host
-                .adapters
-                .lookup(&call.head)
-                .cloned()
-                .expect("adapter resolution carries a catalog entry");
-            let (spec, start) = match call.args.first() {
-                Some(CmdArg::Word { text, .. }) if adapter.subs.contains_key(text) => {
-                    (adapter.subs[text].clone(), 1)
-                }
-                _ => (adapter.top.clone(), 0),
-            };
-            let bindings = self.plan_bindings(call, &spec, start)?;
-            for declared in &spec.effects {
-                for effect in parse_declared_effect(declared, &bindings, &self.exec.shell.cwd) {
-                    push_effect(out, effect);
-                }
-            }
-            // Derive a real binary-content hash for the plan (site/content/internals/language-conformance-contract.md): resolve
-            // the adapter's bin and hash it, matching reef/leash's blake3-hex so
-            // the hash a plan renders is the one a `proc_spawn` pin would check.
-            // Falls back to an empty hash when the tool isn't installed/locatable
-            // (name-only matching, as before) — planning never spawns or mutates.
-            let bin_hash = self
-                .hash_resolved_bin(OsStr::new(&adapter.bin))
-                .unwrap_or_default();
-            push_effect(
-                out,
-                Effect::ProcSpawn {
-                    bin_hash,
-                    argv0: adapter.bin,
-                },
-            );
-        } else {
-            debug_assert_eq!(resolution.source, CommandSource::External);
-            // A generic external command spawns concretely (A6): resolve and
-            // hash the binary like an adapter spawn, rather than collapsing to
-            // Opaque and hiding what actually runs.
-            self.plan_external_spawn(&call.head, out);
-        }
-        Ok(())
-    }
-
-    /// Command redirects are filesystem effects independent of the head (A3):
-    /// `>`/`>>` write the target path, `< file` reads it. A dynamic (non-literal)
-    /// write target cannot be bounded, so it plans as `Opaque` (approval).
-    fn plan_redirects(&self, call: &CmdCall, out: &mut Vec<Effect>) {
-        for r in &call.redirects {
-            match r.kind {
-                // Truncate (`>`) and append (`>>`) both write the target; the
-                // effect vocabulary records the write, and append vs truncate is
-                // distinguished only in that a truncate clobbers prior bytes.
-                RedirectKind::Out | RedirectKind::Append => {
-                    match self.cmd_arg_path_literal(&r.target) {
-                        Some(p) => push_effect(out, Effect::FsWrite { paths: vec![p] }),
-                        None => push_effect(out, Effect::Opaque),
-                    }
-                }
-                RedirectKind::In => {
-                    if let Some(p) = self.cmd_arg_path_literal(&r.target) {
-                        push_effect(out, Effect::FsRead { paths: vec![p] });
-                    }
-                }
-            }
-        }
-    }
-
-    /// Absolutize a literal path string against the session cwd.
-    fn plan_abs(&self, s: &str) -> PathBuf {
-        let p = PathBuf::from(s);
-        if p.is_absolute() {
-            p
-        } else {
-            self.exec.shell.cwd.join(p)
-        }
-    }
-
-    /// The literal path a command argument names, absolutized against cwd, or
-    /// `None` when the argument is not a static literal.
-    fn cmd_arg_path_literal(&self, arg: &CmdArg) -> Option<PathBuf> {
-        let s = match arg {
-            CmdArg::Word { text, .. } | CmdArg::Path { text, .. } => text.clone(),
-            CmdArg::Str { expr, .. } | CmdArg::Expr { expr, .. } => match expr {
-                Expr::Str { value, .. } => value.clone(),
-                _ => return None,
-            },
-            _ => return None,
-        };
-        Some(self.plan_abs(&s))
-    }
-
-    /// Resolve a `use <path>` module string to the file the loader will read
-    /// (A1): cwd-relative, preferring a `.shl` sibling, canonicalized best-effort.
-    /// Planning never touches the file's contents.
-    fn plan_module_path(&self, path: &str) -> PathBuf {
-        let base = PathBuf::from(path);
-        let base = if base.is_absolute() {
-            base
-        } else {
-            self.exec.shell.cwd.join(&base)
-        };
-        let candidate = if base.extension().is_some() {
-            base
-        } else {
-            let with_shl = base.with_extension("shl");
-            if self.host.fs.is_file(&with_shl) {
-                with_shl
-            } else {
-                base
-            }
-        };
-        self.host.fs.canonicalize(&candidate).unwrap_or(candidate)
-    }
-
-    /// The literal path an expression names — a string literal or a
-    /// `path("literal")` constructor — absolutized against cwd. `None` for a
-    /// dynamic expression the planner cannot statically resolve.
-    fn path_literal(&self, e: &Expr) -> Option<PathBuf> {
-        str_literal(e).map(|s| self.plan_abs(&s))
-    }
-
-    /// Push a concrete external `ProcSpawn` for `head`, resolving and hashing the
-    /// binary the same way the runtime spawn gate does (empty hash when the tool
-    /// is not locatable — name-only matching). Planning never spawns.
-    fn plan_external_spawn(&self, head: &str, out: &mut Vec<Effect>) {
-        let bin_hash = self.hash_resolved_bin(OsStr::new(head)).unwrap_or_default();
-        push_effect(
-            out,
-            Effect::ProcSpawn {
-                bin_hash,
-                argv0: head.to_string(),
-            },
-        );
-    }
-
-    /// A `.save`/`.append` sink: the resolved path writes, or an unbounded
-    /// (dynamic) destination requires approval.
-    fn plan_save(&self, path: Option<PathBuf>, out: &mut Vec<Effect>) {
-        match path {
-            Some(p) => push_effect(out, Effect::FsWrite { paths: vec![p] }),
-            None => push_effect(out, Effect::Opaque),
-        }
-    }
-
-    /// `open <path>` hands the file to the desktop opener, which reads it and
-    /// launches an arbitrary handler application (A8): record the read and cover
-    /// the unbounded handler with `Opaque`.
-    fn plan_open(&self, path: Option<PathBuf>, out: &mut Vec<Effect>) {
-        if let Some(p) = path {
-            push_effect(out, Effect::FsRead { paths: vec![p] });
-        }
-        push_effect(out, Effect::Opaque);
-    }
-
-    /// `run <target>` (A6/A8): a bare command name spawns externally; a
-    /// path/script target reads the file and runs arbitrary code; a dynamic
-    /// (non-literal) target cannot be bounded.
-    fn plan_run_target(&self, target: Option<String>, out: &mut Vec<Effect>) {
-        match target {
-            Some(name)
-                if !name.is_empty()
-                    && !name.contains('/')
-                    && !name.starts_with('.')
-                    && !name.starts_with('~')
-                    && Path::new(&name).extension().is_none() =>
-            {
-                debug_assert_eq!(
-                    self.resolve_dynamic_run(&name, false).source,
-                    CommandSource::External
-                );
-                self.plan_external_spawn(&name, out);
-            }
-            Some(name) => {
-                debug_assert_eq!(
-                    self.resolve_dynamic_run(&name, true).source,
-                    CommandSource::Runner
-                );
-                push_effect(
-                    out,
-                    Effect::FsRead {
-                        paths: vec![self.plan_abs(&name)],
-                    },
-                );
-                push_effect(out, Effect::Opaque);
-            }
-            None => push_effect(out, Effect::Opaque),
-        }
-    }
-
-    /// Plan a bare `name(args)` that resolves as a command (defect #5) by
-    /// planning the equivalent command head with the same resolution the
-    /// runtime uses.
-    fn plan_command_ref(
-        &mut self,
-        name: &str,
-        span: Span,
-        functions: &std::collections::HashMap<String, Block>,
-        aliases: &std::collections::HashMap<String, CmdCall>,
-        out: &mut Vec<Effect>,
-        depth: usize,
-    ) -> VResult<()> {
-        let call = CmdCall {
-            head: name.to_string(),
-            forced: false,
-            args: Vec::new(),
-            redirects: Vec::new(),
-            env_prefix: Vec::new(),
-            background: false,
-            trailing: None,
-            span,
-        };
-        self.plan_call(&call, functions, aliases, out, depth + 1)
-    }
-
-    /// Mirror `eval_feed`'s operand classification: a command-shaped node (an
-    /// interpreter block, a command call, or a bare non-variable name) is the
-    /// command operand; the other operand is the value.
-    fn is_command_operand(&self, e: &Expr) -> bool {
-        match e {
-            Expr::LangBlock { .. } | Expr::Cmd { .. } => true,
-            Expr::Var { name, .. } => self.exec.shell.env.get(name).is_none(),
-            _ => false,
-        }
-    }
-
-    /// Plan `value.feed(cmd)` / `cmd.feed(value)` (A4, A9): plan the value
-    /// operand's effects and derive an **external** spawn for the command
-    /// operand, matching the runtime `.feed` path (which calls `run_argv`
-    /// directly and never consults builtin/adapter dispatch).
-    fn plan_feed(
-        &mut self,
-        recv: &Expr,
-        arg: &Expr,
-        functions: &std::collections::HashMap<String, Block>,
-        aliases: &std::collections::HashMap<String, CmdCall>,
-        out: &mut Vec<Effect>,
-        depth: usize,
-    ) -> VResult<()> {
-        let (value_expr, cmd_expr) = if self.is_command_operand(recv) {
-            (arg, recv)
-        } else {
-            (recv, arg)
-        };
-        self.plan_expr(value_expr, functions, aliases, out, depth)?;
-        match cmd_expr {
-            // An interpreter block runs an arbitrary program through its tool.
-            Expr::LangBlock { .. } => push_effect(out, Effect::Opaque),
-            Expr::Cmd { call, .. } => self.plan_external_spawn(&call.head, out),
-            Expr::Var { name, .. } => self.plan_external_spawn(name, out),
-            other => self.plan_expr(other, functions, aliases, out, depth)?,
-        }
-        Ok(())
-    }
-}
-
-/// The path-reading `path` methods, all routed through the Fs port at runtime
-/// (`path_fs_method`) and therefore filesystem reads for planning (A4).
-fn is_path_read_method(name: &str) -> bool {
-    matches!(
-        name,
-        "read" | "read_bytes" | "lines" | "exists" | "is_dir" | "is_file" | "size" | "modified"
-    )
-}
-
-/// The literal path/string an expression names, if statically knowable: a
-/// string literal, or a `path("literal")` constructor wrapping one. Used to
-/// resolve `.save`/`.read`/`run`/`open` targets without executing anything.
-fn str_literal(e: &Expr) -> Option<String> {
-    match e {
-        Expr::Str { value, .. } => Some(value.clone()),
-        Expr::FnCall { name, args, .. }
-            if name == "path" && args.named.is_empty() && args.pos.len() == 1 =>
-        {
-            str_literal(&args.pos[0])
-        }
-        _ => None,
-    }
-}
-
-/// The literal string a command argument names (for `run <name>` resolution),
-/// without absolutizing — a bare word/path, or a quoted string literal.
-fn cmd_arg_str_literal(arg: &CmdArg) -> Option<String> {
-    match arg {
-        CmdArg::Word { text, .. } | CmdArg::Path { text, .. } => Some(text.clone()),
-        CmdArg::Str { expr, .. } | CmdArg::Expr { expr, .. } => str_literal(expr),
-        _ => None,
-    }
-}
-
-/// The literal string value of an expression, if it is a plain string literal
-/// (for extracting a `net.connect` host from `http.get("https://…")`).
-fn url_literal(e: &Expr) -> Option<String> {
-    match e {
-        Expr::Str { value, .. } => Some(value.clone()),
-        _ => None,
-    }
-}
-
-/// Parse `host` and `port` from a URL for a `net.connect` effect. Defaults to the
-/// scheme port (443 for https, 80 otherwise) when the URL has no explicit port.
-fn url_host_port(url: &str) -> (String, u16) {
-    let default_port = if url.starts_with("https") { 443 } else { 80 };
-    let after_scheme = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
-    let authority = after_scheme
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or(after_scheme);
-    // Strip any userinfo (`user:pass@host`).
-    let host_port = authority.rsplit('@').next().unwrap_or(authority);
-    match host_port.rsplit_once(':') {
-        Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty() => {
-            (h.to_string(), p.parse().unwrap_or(default_port))
-        }
-        _ => (host_port.to_string(), default_port),
-    }
 }
 
 #[cfg(test)]
@@ -1008,6 +482,68 @@ mod tests {
                 "ambient filesystem probe `{forbidden}` reappeared in {name}"
             );
         }
+    }
+
+    /// Keep effect attribution split by responsibility. The planner is an
+    /// exhaustive security boundary, so allowing its command dispatcher or AST
+    /// walk to grow back into a single review-hostile unit is a regression even
+    /// when the immediate behavior still passes.
+    #[test]
+    fn planner_responsibilities_stay_bounded() {
+        let root = include_str!("plan_derive.rs");
+        let production = root
+            .split_once("\n#[cfg(test)]\nmod tests")
+            .expect("planner keeps production and tests separated")
+            .0;
+        let commands = include_str!("plan_derive/commands.rs");
+        let attribution = include_str!("plan_derive/attribution.rs");
+        let statements = include_str!("plan_derive/statements.rs");
+
+        for (name, source, ceiling) in [
+            ("plan_derive.rs production", production, 320),
+            ("commands.rs", commands, 350),
+            ("attribution.rs", attribution, 140),
+            ("statements.rs", statements, 100),
+        ] {
+            let lines = source.lines().count();
+            assert!(
+                lines <= ceiling,
+                "{name} grew to {lines} lines (ceiling {ceiling}); split the new responsibility"
+            );
+        }
+
+        let plan_call = commands
+            .split_once("pub(super) fn plan_call")
+            .expect("command coordinator exists")
+            .1
+            .split_once("\n    /// Heads intercepted")
+            .expect("command helpers remain separate")
+            .0;
+        assert!(
+            plan_call.lines().count() <= 80,
+            "plan_call became a dispatcher god function; extract a command concern"
+        );
+
+        for forbidden in [
+            "parse_declared_effect",
+            "resolve_command(call)",
+            "RedirectKind::",
+            "hash_resolved_bin",
+            "canonicalize(&candidate)",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "planner root reclaimed delegated responsibility `{forbidden}`"
+            );
+        }
+        assert!(
+            !commands.contains("Stmt::"),
+            "command planning must not absorb statement traversal"
+        );
+        assert!(
+            !attribution.contains("push_effect"),
+            "literal attribution must remain effect-free"
+        );
     }
 
     /// A7: an adapter that declares a now-recognized `proc.spawn(...)` plus an
