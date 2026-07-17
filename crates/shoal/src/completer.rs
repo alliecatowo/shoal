@@ -14,24 +14,25 @@
 //! - **expr** (anywhere else — after `let x = `, inside `(...)`, a bare
 //!   expression statement): in-scope variable/function names.
 
-use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use reedline::{Completer, Span as RlSpan, Suggestion};
-use shoal_adapters::{AdapterCatalog, CmdAdapter};
-use shoal_syntax::commands::{CommandFacts, CommandSource, builtin_names, resolve_command_source};
-use shoal_syntax::lexer::RESERVED;
-use shoal_value::{Env, Value, method_names, methods_for};
+use reedline::{Completer, Suggestion};
+use shoal_adapters::AdapterCatalog;
+use shoal_value::Env;
 
+mod candidates;
 mod context;
 mod discovery;
 mod inference;
 
+use candidates::finish;
+#[cfg(test)]
+use candidates::subsequence_match;
 use context::{Ctx, classify};
 #[cfg(test)]
 use discovery::{MAX_PATH_CACHE_DIRS, PATH_CACHE_REVALIDATE};
-use discovery::{PathDiscovery, adapter_names, filesystem_candidates};
+use discovery::{PathDiscovery, adapter_names};
 
 pub struct ShoalCompleter {
     env: Env,
@@ -101,156 +102,6 @@ impl ShoalCompleter {
             .map(|g| g.clone())
             .unwrap_or_else(|_| PathBuf::from("."))
     }
-
-    /// Live `PATH` executable names. Each directory is re-scanned only when
-    /// its mtime has changed since the last call (or it hasn't been seen
-    /// before) — cheap enough to call on every Tab press.
-    fn path_names(&mut self) -> Vec<String> {
-        let cwd = self.cwd();
-        self.discovery.path_names(&cwd)
-    }
-
-    fn path_dir_names(&mut self, dir: &Path) -> Vec<String> {
-        self.discovery.path_dir_names(dir)
-    }
-
-    fn adapter_lookup(&self, head: &str) -> Option<&CmdAdapter> {
-        self.adapters.iter().find_map(|c| c.lookup(head))
-    }
-
-    fn head_source(&self, head: &str) -> CommandSource {
-        let binding = self.env.get(head);
-        resolve_command_source(
-            head,
-            CommandFacts {
-                session_callable: binding.as_ref().is_some_and(Value::is_callable),
-                session_value: binding.as_ref().is_some_and(|value| !value.is_callable()),
-                // Flag completion means the head already has an argument, so a
-                // non-callable lexical value cannot win this command shape.
-                value_eligible: false,
-                forced: false,
-                dynamic_run: false,
-                runner: false,
-                // Plugin declarations are installed on the evaluator; this
-                // lightweight completion view has no registry snapshot yet.
-                plugin: false,
-                adapter: self.adapter_lookup(head).is_some(),
-            },
-        )
-    }
-
-    /// Match `name` against `prefix` per `[completion]` config
-    /// (site/content/internals/configuration-reference.md): case-(in)sensitively per `case_insensitive`, and
-    /// via a non-contiguous subsequence test — a strict superset of prefix
-    /// matching, so it's exactly "typo-tolerant / non-contiguous matches,
-    /// not just prefix" — rather than a strict prefix when `fuzzy` is set.
-    fn candidate_matches(&self, name: &str, prefix: &str) -> bool {
-        if prefix.is_empty() {
-            return true;
-        }
-        if self.case_insensitive {
-            let name = name.to_lowercase();
-            let prefix = prefix.to_lowercase();
-            if self.fuzzy {
-                subsequence_match(&name, &prefix)
-            } else {
-                name.starts_with(&prefix)
-            }
-        } else if self.fuzzy {
-            subsequence_match(name, prefix)
-        } else {
-            name.starts_with(prefix)
-        }
-    }
-
-    fn head_candidates(&mut self, prefix: &str) -> Vec<String> {
-        let mut names: BTreeSet<String> = BTreeSet::new();
-        names.extend(RESERVED.iter().map(|s| s.to_string()));
-        names.extend(builtin_names().iter().map(|s| s.to_string()));
-        for name in self.env.visible_names() {
-            if self.env.get(&name).is_some_and(|v| v.is_callable()) {
-                names.insert(name);
-            }
-        }
-        names.extend(self.adapter_names.iter().cloned());
-        names.extend(self.path_names());
-        names.retain(|n| self.candidate_matches(n, prefix));
-        names.into_iter().collect()
-    }
-
-    fn expr_candidates(&self, prefix: &str) -> Vec<String> {
-        let mut names: BTreeSet<String> = self.env.visible_names().into_iter().collect();
-        names.extend(RESERVED.iter().map(|s| s.to_string()));
-        names.retain(|n| self.candidate_matches(n, prefix));
-        names.into_iter().collect()
-    }
-
-    /// Method/field candidates for a `.`-position word (`recv.<prefix>`),
-    /// filtered per `[completion]` config. When the receiver's type was inferred
-    /// (`recv` is `Some`) we offer only that type's methods
-    /// (`shoal_value::methods_for`) — so `[1,2,3].` proposes `where`/`map`/`sum`
-    /// and not `upper`/`split`. When it wasn't (a chained/computed/unknown
-    /// receiver), we fall back to the flat union across every type
-    /// (`method_names`), which is exactly the old, type-agnostic behavior — never
-    /// fewer or wrong candidates than before.
-    fn method_candidates(&self, prefix: &str, recv: Option<&str>) -> Vec<String> {
-        let per_type = recv.and_then(methods_for);
-        let names: &[&str] = per_type.as_deref().unwrap_or_else(|| method_names());
-        names
-            .iter()
-            .filter(|n| self.candidate_matches(n, prefix))
-            .map(|s| s.to_string())
-            .collect()
-    }
-
-    /// `--flag`/`-x` candidates for a known command head: adapter params
-    /// (top-level + all subcommands) and short flags, plus a session
-    /// function's own parameter names (site/content/internals/language-conformance-contract.md: "flag parsing derived from
-    /// the signature").
-    fn flag_candidates(&self, head: &str, prefix: &str) -> Vec<String> {
-        let mut names: BTreeSet<String> = BTreeSet::new();
-        match self.head_source(head) {
-            CommandSource::Adapter => {
-                let adapter = self
-                    .adapter_lookup(head)
-                    .expect("adapter resolution carries its catalog entry");
-                for p in &adapter.top.params {
-                    names.insert(format!("--{}", p.name));
-                }
-                for short in adapter.top.short_flags.keys() {
-                    names.insert(format!("-{short}"));
-                }
-                for sub in adapter.subs.values() {
-                    for p in &sub.params {
-                        names.insert(format!("--{}", p.name));
-                    }
-                    for short in sub.short_flags.keys() {
-                        names.insert(format!("-{short}"));
-                    }
-                }
-            }
-            CommandSource::SessionCallable => {
-                if let Some(Value::Closure(c)) = self.env.get(head) {
-                    for p in &c.params {
-                        names.insert(format!("--{}", p.name));
-                    }
-                }
-            }
-            _ => {}
-        }
-        names.retain(|n| self.candidate_matches(n, prefix));
-        names.into_iter().collect()
-    }
-
-    /// Live filesystem candidates for a CMD-mode argument word, resolved
-    /// against the word's own directory prefix — `crates/sho` re-scans
-    /// `crates/` fresh, so newly created files/directories show up.
-    fn fs_candidates(&self, word: &str) -> Vec<String> {
-        let cwd = self.cwd();
-        filesystem_candidates(&cwd, word, |name, prefix| {
-            self.candidate_matches(name, prefix)
-        })
-    }
 }
 
 impl Completer for ShoalCompleter {
@@ -282,38 +133,6 @@ impl Completer for ShoalCompleter {
     }
 }
 
-/// Does every character of `needle` appear in `haystack`, in order, not
-/// necessarily contiguously? Any prefix match is also a subsequence match
-/// (each needle character is trivially found at the next haystack
-/// position), so using this predicate when `completion.fuzzy` is set is a
-/// strict superset of prefix matching — it never *rejects* what plain prefix
-/// matching would accept, only adds typo-tolerant/non-contiguous matches on
-/// top.
-fn subsequence_match(haystack: &str, needle: &str) -> bool {
-    let mut chars = haystack.chars();
-    needle.chars().all(|nc| chars.any(|hc| hc == nc))
-}
-
-/// Sort, dedup, cap to `completion.max_results` (site/content/internals/configuration-reference.md), and
-/// convert to reedline `Suggestion`s.
-fn finish(mut names: Vec<String>, start: usize, pos: usize, max_results: usize) -> Vec<Suggestion> {
-    names.sort();
-    names.dedup();
-    names.truncate(max_results);
-    names
-        .into_iter()
-        .map(|value| {
-            let append_whitespace = !value.ends_with('/');
-            Suggestion {
-                value,
-                span: RlSpan::new(start, pos),
-                append_whitespace,
-                ..Default::default()
-            }
-        })
-        .collect()
-}
-
 /// Scan adapter config directories for `[cmd.<name>]` table keys — just the
 /// name enumeration `AdapterCatalog` doesn't expose publicly (see
 /// api_changes); flag/subcommand data still goes through the real
@@ -325,7 +144,7 @@ pub fn scan_adapter_names(dirs: &[PathBuf]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shoal_value::Env;
+    use shoal_value::{Env, Value};
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
