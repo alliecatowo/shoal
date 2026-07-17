@@ -12,17 +12,55 @@ pub struct Options {
     pub config_dir: PathBuf,
     pub socket: PathBuf,
     pub session: String,
+    pub language_journal_enabled: bool,
+    pub render_width: Option<usize>,
+    pub config_error: Option<String>,
 }
 impl Options {
     pub fn from_env() -> Self {
         let paths = shoal_paths::ShoalPaths::discover();
         let session = std::env::var("SHOAL_SESSION").unwrap_or_else(|_| "default".into());
+        let cwd = std::env::current_dir().ok();
+        let loaded = cwd
+            .as_deref()
+            .map(shoal_config::LoadOptions::discover)
+            .map(|options| shoal_config::load(&options));
+        let (state_dir, language_journal_enabled, render_width, config_error) = match loaded {
+            Some(Ok(loaded)) => {
+                let state_dir = match loaded.config.journal.state_dir.as_deref() {
+                    Some(path) if path.is_absolute() => path.to_path_buf(),
+                    Some(path) => cwd.as_deref().unwrap_or_else(|| Path::new(".")).join(path),
+                    None => paths.state_dir().to_path_buf(),
+                };
+                (
+                    state_dir,
+                    loaded.config.journal.enabled,
+                    loaded.config.render.width,
+                    None,
+                )
+            }
+            Some(Err(error)) => (
+                paths.state_dir().to_path_buf(),
+                true,
+                None,
+                Some(error.to_string()),
+            ),
+            None => (
+                paths.state_dir().to_path_buf(),
+                true,
+                None,
+                Some("cannot determine cwd for layered config discovery".into()),
+            ),
+        };
         Self {
             runtime_dir: paths.runtime_dir().to_path_buf(),
-            state_dir: paths.state_dir().to_path_buf(),
+            state_dir,
             config_dir: paths.config_dir().to_path_buf(),
             socket: paths.socket(&session),
             session,
+            language_journal_enabled,
+            render_width,
+            config_error,
         }
     }
 }
@@ -107,6 +145,7 @@ pub fn run(o: &Options) -> Report {
     probe_adapters(o, &mut c);
     probe_tools(&mut c);
     probe_journal(o, &mut c);
+    probe_effective_config(o, &mut c);
     probe_configs(o, &mut c);
     Report { checks: c }
 }
@@ -246,9 +285,44 @@ fn probe_journal(o: &Options, out: &mut Vec<Check>) {
             Level::Fail
         },
         detail: result
-            .map(|()| "SQLite open/write probe passed".into())
+            .map(|()| {
+                format!(
+                    "mandatory kernel audit SQLite open/write passed at {}; language history={}",
+                    o.state_dir.display(),
+                    if o.language_journal_enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                )
+            })
             .unwrap_or_else(|e| e),
     })
+}
+
+fn probe_effective_config(o: &Options, out: &mut Vec<Check>) {
+    let (level, detail) = match &o.config_error {
+        Some(error) => (Level::Fail, error.clone()),
+        None => (
+            Level::Ok,
+            format!(
+                "render width={}; language history={}; kernel security audit=mandatory; state={}",
+                o.render_width
+                    .map_or_else(|| "terminal".into(), |width| width.to_string()),
+                if o.language_journal_enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+                o.state_dir.display()
+            ),
+        ),
+    };
+    out.push(Check {
+        name: "effective config".into(),
+        level,
+        detail,
+    });
 }
 fn probe_configs(o: &Options, out: &mut Vec<Check>) {
     for (name, path, policy) in [
@@ -296,6 +370,9 @@ mod tests {
             config_dir: t.path().join("config"),
             socket: t.path().join("run/shoal/none.sock"),
             session: "none".into(),
+            language_journal_enabled: false,
+            render_width: Some(100),
+            config_error: None,
         };
         for p in [&o.runtime_dir, &o.state_dir, &o.config_dir] {
             fs::create_dir_all(p).unwrap()
@@ -311,6 +388,11 @@ mod tests {
                 .iter()
                 .any(|c| c.name == "kernel socket" && c.level == Level::Warn)
         );
+        assert!(r.checks.iter().any(|c| {
+            c.name == "effective config"
+                && c.detail.contains("language history=disabled")
+                && c.detail.contains("kernel security audit=mandatory")
+        }));
         assert_eq!(r.exit_code(), 1)
     }
     #[cfg(unix)]
@@ -327,6 +409,9 @@ mod tests {
             config_dir: t.path().join("config"),
             socket: sock.join("s.sock"),
             session: "s".into(),
+            language_journal_enabled: true,
+            render_width: None,
+            config_error: None,
         };
         for p in [&o.state_dir, &o.config_dir] {
             fs::create_dir_all(p).unwrap()

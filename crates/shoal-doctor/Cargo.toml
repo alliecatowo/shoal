@@ -16,6 +16,7 @@ shoal-leash={path="../shoal-leash"}
 shoal-adapters={path="../shoal-adapters"}
 shoal-journal={path="../shoal-journal"}
 shoal-paths={path="../shoal-paths"}
+shoal-config={path="../shoal-config"}
 portable-pty="0.9"
 [[bin]]
 name="shoal-doctor"

@@ -7,7 +7,7 @@ use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, IsTerminal};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, RwLock};
@@ -138,13 +138,14 @@ pub(crate) fn repl(standalone: bool) -> Result<i32, String> {
         );
     }
     let config = bootstrap.config().clone();
+    let state_dir = effective_journal_state_dir(config.journal.state_dir.as_deref(), &cwd);
     let protocol_backed = protocol_requested(standalone, config.kernel.enabled);
     let mut embedded_child = None;
     let mut protocol = if protocol_backed {
         let (client, child) =
             crate::embedded_kernel::connect(crate::embedded_kernel::EmbeddedKernelConfig {
                 session: config.kernel.session.clone(),
-                state_dir: shoal_state_dir(),
+                state_dir: state_dir.clone(),
                 policy: config.leash.policy.clone(),
                 program: None,
             })?;
@@ -187,7 +188,6 @@ pub(crate) fn repl(standalone: bool) -> Result<i32, String> {
     // `out[n] -> journal entry id` map `undo out[n]` needs (site/content/internals/roadmap-and-priorities.md
     // (site/content/internals/persistence.md): the evaluator's own journal handle is private, and `out` itself is
     // just a plain REPL-side list of past values with no tie to entry ids.
-    let state_dir = shoal_state_dir();
     // Enable `j`/`jump` directory-frecency recording against a store colocated
     // with the journal (`<state_dir>/jump.frecency`). Every interactive `cd`
     // now bumps directory history; best-effort, so a store write failure never
@@ -195,7 +195,7 @@ pub(crate) fn repl(standalone: bool) -> Result<i32, String> {
     if !protocol_backed {
         evaluator.set_jump_store(state_dir.join("jump.frecency"));
     }
-    let journal_reader = if protocol_backed {
+    let journal_reader = if !language_journal_requested(config.journal.enabled, protocol_backed) {
         None
     } else {
         match (Journal::open(&state_dir), Journal::open(&state_dir)) {
@@ -456,12 +456,7 @@ pub(crate) fn repl(standalone: bool) -> Result<i32, String> {
                 }
                 if let Some(session) = protocol.as_mut() {
                     protocol_interrupt.store(false, Ordering::SeqCst);
-                    match execute_protocol_line(
-                        session,
-                        &src,
-                        &protocol_interrupt,
-                        render_width,
-                    ) {
+                    match execute_protocol_line(session, &src, &protocol_interrupt, render_width) {
                         Ok(outcome) => {
                             if let Some(code) = outcome.exit_code {
                                 return Ok(code);
@@ -608,6 +603,18 @@ fn shoal_state_dir() -> PathBuf {
     shoal_paths::ShoalPaths::discover()
         .state_dir()
         .to_path_buf()
+}
+
+fn effective_journal_state_dir(configured: Option<&Path>, cwd: &Path) -> PathBuf {
+    match configured {
+        Some(path) if path.is_absolute() => path.to_path_buf(),
+        Some(path) => cwd.join(path),
+        None => shoal_state_dir(),
+    }
+}
+
+fn language_journal_requested(configured: bool, protocol_backed: bool) -> bool {
+    configured && !protocol_backed
 }
 
 fn now_ns() -> i64 {
@@ -1095,6 +1102,25 @@ fn parse_ctx_for(env: &Env) -> ParseCtx {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn journal_config_resolves_paths_and_only_gates_language_history() {
+        let cwd = Path::new("/work/project");
+        assert_eq!(
+            effective_journal_state_dir(Some(Path::new(".state/shoal")), cwd),
+            PathBuf::from("/work/project/.state/shoal")
+        );
+        assert_eq!(
+            effective_journal_state_dir(Some(Path::new("/var/lib/shoal")), cwd),
+            PathBuf::from("/var/lib/shoal")
+        );
+        assert!(language_journal_requested(true, false));
+        assert!(!language_journal_requested(false, false));
+        assert!(
+            !language_journal_requested(true, true),
+            "protocol sessions install language history in the kernel"
+        );
+    }
 
     struct FakeProtocol {
         seen: Vec<String>,

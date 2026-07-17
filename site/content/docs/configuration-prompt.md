@@ -180,8 +180,8 @@ The table below reflects the schema and defaults in the current code. An empty â
 | `reef.options.hermetic` | boolean, `false` | Removes the ambient `PATH` tail when engaged. |
 | `kernel.enabled` | boolean, `true` | The default interactive REPL runs through an isolated private `shoal-kernel` child. Set false (or pass `--standalone`) for the local evaluator path. |
 | `kernel.session` | string, `"default"` | Names the principal-private Session inside the default REPL's private kernel. It does not attach to a durable public kernel socket. |
-| `journal.enabled` | boolean, `true` | Not currently honored by the local REPL, which opens its journal directly. |
-| `journal.state_dir` | path or absent | Not currently used by the local REPL journal path. |
+| `journal.enabled` | boolean, `true` | Enables language-facing `history`/`journal`/`undo`; it never disables mandatory kernel security/approval/event audit. |
+| `journal.state_dir` | path or absent | Local language journal/jump and embedded-kernel state root; relative paths resolve from startup cwd. |
 | `leash.policy` | path or absent | Loaded fail-closed by the shared host bootstrap for local/kernel evaluators and passed to the default private REPL kernel. |
 
 `history.dedup` compares with the immediately preceding entry, including the last entry read from a previous session. An environment name that is nonempty but cannot be expressed as a Shoal identifier can pass generic validation yet produce a startup warning when the host tries to apply it.

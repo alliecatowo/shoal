@@ -128,8 +128,8 @@ The following is the exact public `Config` tree. “Default” means the value p
 | `kernel.enabled` | boolean | `true` | intended resident-kernel gate |
 | `kernel.session` | string | `"default"` | intended named kernel session |
 | `adapters.dirs` | path-string array | empty | extra adapter directories, in order |
-| `journal.enabled` | boolean | `true` | intended journal gate |
-| `journal.state_dir` | optional path string | absent | intended journal state root |
+| `journal.enabled` | boolean | `true` | language-facing statement history/undo gate; never disables mandatory kernel security audit |
+| `journal.state_dir` | optional path string | absent | local language journal/jump and embedded-kernel state root |
 | `leash.policy` | optional path string | absent | intended Leash policy file |
 | `init.files` | path-string array | empty | interactive startup scripts, in order |
 | `completion.fuzzy` | boolean | `true` | enable fuzzy ranking |
@@ -320,7 +320,7 @@ currently accepts and snapshots the field without applying its intended behavior
 | `prompt.template` | parallel path | not applicable | rich prompt loader independently reads and migrates it |
 | `reef.*` | parallel path | parallel path | Reef reparses raw user config with its own schema |
 | `kernel.enabled`, `kernel.session` | active | not consumed | default interactive execution uses an isolated private kernel; `false` selects local evaluation; session names that private principal-owned Session |
-| `journal.enabled`, `journal.state_dir` | not honored | no journal | **inert**; REPL opens default journal unconditionally |
+| `journal.enabled`, `journal.state_dir` | active | no language journal | `enabled` gates language history/undo only; state root feeds local storage and private kernel; kernel security audit remains mandatory |
 | `leash.policy` | active | active | shared bootstrap loads configured policy before evaluation; malformed configured policy fails startup rather than degrading permissively |
 
 ```mermaid
@@ -333,7 +333,8 @@ accDescr: Shows the components and relationships described in Host wiring matrix
   Config --> Adapters["adapter search dirs"]
   Config --> Init["interactive init files"]
   Config --> Kernel["private interactive kernel settings"]
-  Config -. "not wired" .-> Journal["journal gate / state dir"]
+  Config --> Journal["language history gate / effective state root"]
+  Kernel --> Audit["mandatory security / approval / event audit"]
   Config --> Leash["fail-closed policy load"]
   Config --> Width["render / prompt / pager width"]
   Files["raw config files"] --> Prompt["independent rich prompt loader"]
@@ -347,10 +348,11 @@ config snapshot, seeds aliases and environment, adds user Reef config, opens jou
 loads adapters, evaluates init files, then builds completion, keybindings, history, and prompt. A
 change on disk is not automatically reloaded into an existing session.
 
-The journal behavior is especially important: interactive startup currently opens the default
-state directory regardless of `journal.enabled` and ignores `journal.state_dir`. Noninteractive
-evaluation does not install a journal. The schema therefore promises configurability that the host
-does not yet implement.
+The journal distinction is important: `journal.enabled` controls the language-facing statement
+journal behind `history`, `journal`, and `undo`. It does not and cannot disable the durable kernel
+security/approval/event audit required for fail-closed authorization. `journal.state_dir` selects
+the local statement/jump store and the private embedded kernel's state root; relative paths resolve
+from startup cwd. Noninteractive evaluation does not install a language journal.
 
 ### Noninteractive assembly
 
@@ -365,11 +367,10 @@ The host serializes the complete typed `Config` to JSON and converts that JSON i
 data for `config.get` and `config.all`. This is a startup snapshot, not a live facade over files or
 environment.
 
-That snapshot still exposes journal fields whose effective security-audit semantics differ by host.
-`render.width`, however, now reflects an active override; when absent, the host deliberately follows
-the current terminal width. The snapshot accurately describes the resolved schema object but does
-not expose a continuously refreshed effective terminal size.
-Internal diagnostics should eventually expose both `configured` and `effective` state.
+The snapshot's journal gate describes language history, not the kernel's mandatory security audit.
+`render.width` reflects an active override; when absent, the host deliberately follows the current
+terminal width. `shoal doctor` reports effective state root, language-history state, width source,
+and the mandatory audit distinction.
 
 Production child evaluators now build through one audited child context and inherit the parent's
 config port/snapshot together with Reef, event bus, filesystem, cancellation, and Leash state. The
@@ -450,7 +451,6 @@ the behavioral test must demonstrate the denied/redirected/disabled operation.
 
 | Priority | Gap | Why it matters | Minimum credible repair |
 |---:|---|---|---|
-| P1 | journal enable/path settings are inert | retention and state-location policy are misleading | honor both during REPL assembly; expose effective path |
 | P1 | rich prompt and core config use different project discovery | prompt can visibly disagree with `config.all` | share a discovered layer set or explicitly separate files |
 | P1 | Reef user config is reparsed independently | schema and precedence drift can surprise users | share raw parsed layers or expose a structured handoff |
 | P2 | interactive and noninteractive kernel semantics differ | users may assume `-c`/scripts join the private REPL kernel path | keep `kernel.enabled/session`, `--standalone`, and surface boundaries explicit in CLI/config docs |

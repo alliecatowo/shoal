@@ -2516,6 +2516,7 @@ dependencies = [
  "serde",
  "serde_json",
  "shoal-adapters",
+ "shoal-config",
  "shoal-journal",
  "shoal-leash",
  "shoal-paths",

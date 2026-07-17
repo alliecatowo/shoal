@@ -163,8 +163,12 @@ pub struct Plugins {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Journal {
+    /// Enable the language-facing statement journal used by `history`,
+    /// `journal`, and `undo`. Durable kernel security/approval/event auditing
+    /// is mandatory infrastructure and is never disabled by this setting.
     pub enabled: bool,
-    /// `None` = the host's platform default state directory.
+    /// Language journal and embedded-kernel state root. `None` uses the host's
+    /// platform state directory; relative paths resolve from startup cwd.
     pub state_dir: Option<PathBuf>,
 }
 
