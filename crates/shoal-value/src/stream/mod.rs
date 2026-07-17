@@ -123,6 +123,20 @@ impl StreamVal {
         StreamVal::from_source(label, false, Box::new(ChanSource(rx)))
     }
 
+    /// Build a stream from an evaluator-owned source.
+    ///
+    /// This is the ownership seam for live sources whose receive or pump
+    /// policy cannot be represented by `std::sync::mpsc` (for example a
+    /// bounded event subscription with explicit overflow records). The source
+    /// remains single-consumption and is driven through the normal `CallCtx`.
+    pub fn from_upstream(
+        label: impl Into<String>,
+        bounded: bool,
+        up: Box<dyn Upstream>,
+    ) -> StreamVal {
+        StreamVal::from_source(label, bounded, up)
+    }
+
     fn from_source(label: impl Into<String>, bounded: bool, up: Box<dyn Upstream>) -> StreamVal {
         StreamVal {
             label: label.into(),

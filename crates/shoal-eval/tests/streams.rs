@@ -259,6 +259,16 @@ channel("sink").take(timeout: 5s)"#,
     assert_eq!(v, Value::Int(42));
 }
 
+#[test]
+fn cancelling_idle_on_handler_terminates_its_task() {
+    let v = run(
+        r#"let task = on(channel("idle-on"), ev => ev)
+task.cancel()
+task.await()"#,
+    );
+    assert_eq!(v, Value::Null);
+}
+
 // --- `every` yields datetimes -------------------------------------------
 
 #[test]

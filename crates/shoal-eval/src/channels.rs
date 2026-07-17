@@ -14,16 +14,26 @@
 use crate::{ChildKind, Evaluator};
 use shoal_ast::Args;
 use shoal_exec::CancelToken;
-use shoal_value::{CallArgs, ErrorVal, Record, StreamVal, TaskVal, VResult, Value};
+use shoal_value::{
+    CallArgs, CallCtx, ErrorVal, Pull, Record, StreamVal, TaskVal, Upstream, VResult, Value,
+};
 use std::collections::{HashMap, VecDeque};
-use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 /// Ring depth per channel (site/content/internals/kernel-protocol.md requires ≥1024). Older history for a
 /// user channel is evicted once past this — durable history is `.save(path)` or a
 /// journaled channel, never an unbounded ring.
 const RING_CAP: usize = 1024;
+
+/// Per-subscriber live/replay capacity. Publishers never wait for a slow
+/// subscriber: when this fills, the oldest queued deliveries are discarded and
+/// represented by one in-band overflow record before the newest event.
+const SUBSCRIBER_CAP: usize = 256;
+
+/// Maximum time a cancellation-aware receiver sleeps without re-checking its
+/// token. A condvar notification still wakes it immediately for normal events.
+const CANCEL_POLL: Duration = Duration::from_millis(25);
 
 /// Which buffered events a new subscriber replays before going live.
 enum Replay {
@@ -61,7 +71,143 @@ struct Stored {
 struct ChannelState {
     next_seq: u64,
     ring: VecDeque<Stored>,
-    subs: Vec<Sender<VResult<Value>>>,
+    subs: Vec<Subscriber>,
+}
+
+enum Delivery {
+    Event(Value),
+    Overflow(u64),
+}
+
+#[derive(Default)]
+struct QueueState {
+    items: VecDeque<Delivery>,
+    closed: bool,
+}
+
+#[derive(Default)]
+struct SubscriberQueue {
+    state: Mutex<QueueState>,
+    ready: Condvar,
+}
+
+#[derive(Clone)]
+struct Subscriber(Arc<SubscriberQueue>);
+
+impl Subscriber {
+    fn push(&self, event: Value) -> bool {
+        let mut state = self.0.state.lock().unwrap();
+        if state.closed {
+            return false;
+        }
+
+        if state.items.len() >= SUBSCRIBER_CAP {
+            // Reserve two tail slots: one exact gap marker and the newest
+            // event. If an older marker is evicted, carry its count forward so
+            // loss is never silently forgotten.
+            let mut dropped = 0u64;
+            while state.items.len() > SUBSCRIBER_CAP.saturating_sub(2) {
+                match state.items.pop_front() {
+                    Some(Delivery::Event(_)) => dropped += 1,
+                    Some(Delivery::Overflow(n)) => dropped += n,
+                    None => break,
+                }
+            }
+            state.items.push_back(Delivery::Overflow(dropped));
+        }
+        state.items.push_back(Delivery::Event(event));
+        self.0.ready.notify_one();
+        true
+    }
+}
+
+enum Received {
+    Event(Value),
+    Overflow(u64),
+    Timeout,
+    Closed,
+    Cancelled,
+}
+
+/// The single-consumer handle for an in-language channel subscription.
+/// Delivery is bounded by [`SUBSCRIBER_CAP`]; gaps are returned explicitly as
+/// overflow records by the stream adapter.
+pub struct EventReceiver {
+    queue: Arc<SubscriberQueue>,
+}
+
+impl EventReceiver {
+    fn recv(&self, timeout: Option<Duration>, cancel: Option<&CancelToken>) -> Received {
+        let deadline = timeout.map(|d| Instant::now() + d);
+        let mut state = self.queue.state.lock().unwrap();
+        loop {
+            if let Some(item) = state.items.pop_front() {
+                return match item {
+                    Delivery::Event(v) => Received::Event(v),
+                    Delivery::Overflow(n) => Received::Overflow(n),
+                };
+            }
+            if cancel.is_some_and(CancelToken::is_cancelled) {
+                return Received::Cancelled;
+            }
+            if state.closed {
+                return Received::Closed;
+            }
+
+            let wait = match deadline {
+                Some(end) => {
+                    let Some(remaining) = end.checked_duration_since(Instant::now()) else {
+                        return Received::Timeout;
+                    };
+                    if cancel.is_some() {
+                        remaining.min(CANCEL_POLL)
+                    } else {
+                        remaining
+                    }
+                }
+                None if cancel.is_some() => CANCEL_POLL,
+                None => {
+                    state = self.queue.ready.wait(state).unwrap();
+                    continue;
+                }
+            };
+            let (next, timed) = self.queue.ready.wait_timeout(state, wait).unwrap();
+            state = next;
+            if timed.timed_out()
+                && deadline.is_some_and(|end| Instant::now() >= end)
+            {
+                return Received::Timeout;
+            }
+        }
+    }
+}
+
+impl Drop for EventReceiver {
+    fn drop(&mut self) {
+        let mut state = self.queue.state.lock().unwrap();
+        state.closed = true;
+        self.queue.ready.notify_all();
+    }
+}
+
+struct EventUpstream {
+    channel: String,
+    rx: EventReceiver,
+}
+
+impl Upstream for EventUpstream {
+    fn pull(
+        &mut self,
+        _ctx: &mut dyn shoal_value::CallCtx,
+        timeout: Option<Duration>,
+    ) -> VResult<Pull> {
+        Ok(match self.rx.recv(timeout, None) {
+            Received::Event(v) => Pull::Item(v),
+            Received::Overflow(n) => Pull::Item(overflow_record(&self.channel, n)),
+            Received::Timeout => Pull::Timeout,
+            Received::Closed | Received::Cancelled => Pull::End,
+        })
+    }
 }
 
 /// A host-installed hook mirroring in-language emits onto an external bus
@@ -127,7 +273,7 @@ impl EventBus {
             st.ring.pop_front();
         }
         let event = event_record(name, seq, ts_ns, payload);
-        st.subs.retain(|tx| tx.send(Ok(event.clone())).is_ok());
+        st.subs.retain(|sub| sub.push(event.clone()));
         seq
     }
 
@@ -144,22 +290,37 @@ impl EventBus {
     /// mirrors the kernel EventBus (site/content/internals/kernel-protocol.md): `since: None` replays the
     /// whole ring then goes live; `since: Some(n)` replays only `seq > n` (the
     /// in-language `?since=` cursor, site/content/internals/streams-channels.md), then live.
-    pub fn events(&self, name: &str, since: Option<u64>) -> Receiver<VResult<Value>> {
+    pub fn events(&self, name: &str, since: Option<u64>) -> EventReceiver {
         self.subscribe(name, Replay::from_since(since))
     }
 
+    /// Subscribe as a language stream. The custom upstream preserves the
+    /// bounded queue's explicit overflow records instead of hiding it behind an
+    /// unbounded `mpsc` adapter.
+    pub fn event_stream(&self, name: &str, since: Option<u64>) -> StreamVal {
+        StreamVal::from_upstream(
+            "event",
+            false,
+            Box::new(EventUpstream {
+                channel: name.to_string(),
+                rx: self.events(name, since),
+            }),
+        )
+    }
+
     /// Register a subscriber with the given replay policy.
-    fn subscribe(&self, name: &str, replay: Replay) -> Receiver<VResult<Value>> {
-        let (tx, rx) = channel();
+    fn subscribe(&self, name: &str, replay: Replay) -> EventReceiver {
+        let queue = Arc::new(SubscriberQueue::default());
+        let sub = Subscriber(queue.clone());
         let mut map = self.channels.lock().unwrap();
         let st = map.entry(name.to_string()).or_default();
         for s in &st.ring {
             if replay.wants(s.seq) {
-                let _ = tx.send(Ok(event_record(name, s.seq, s.ts_ns, &s.payload)));
+                let _ = sub.push(event_record(name, s.seq, s.ts_ns, &s.payload));
             }
         }
-        st.subs.push(tx);
-        rx
+        st.subs.push(sub);
+        EventReceiver { queue }
     }
 
     /// Block for the next payload on `name` (site/content/internals/streams-channels.md). `timeout` bounds the
@@ -167,19 +328,44 @@ impl EventBus {
     /// forever. Subscribes with no replay, so only events published *after* this
     /// call are seen.
     pub fn take(&self, name: &str, timeout: Option<Duration>) -> VResult<Value> {
+        self.take_cancelled(name, timeout, None)
+    }
+
+    fn take_cancelled(
+        &self,
+        name: &str,
+        timeout: Option<Duration>,
+        cancel: Option<&CancelToken>,
+    ) -> VResult<Value> {
         let rx = self.subscribe(name, Replay::None);
-        let event = match timeout {
-            Some(d) => rx.recv_timeout(d).map_err(|_| {
-                ErrorVal::new(
-                    "timeout",
-                    format!("channel `{name}`: no event within timeout"),
-                )
-            })?,
-            None => rx
-                .recv()
-                .map_err(|_| ErrorVal::new("channel_closed", format!("channel `{name}` closed")))?,
-        };
-        event.map(|e| payload_of(&e))
+        let deadline = timeout.map(|d| Instant::now() + d);
+        loop {
+            let remaining = deadline.map(|end| end.saturating_duration_since(Instant::now()));
+            match rx.recv(remaining, cancel) {
+                Received::Event(event) => return Ok(payload_of(&event)),
+                // `.take` promises a payload rather than a delivery-status
+                // record. Skip the marker and return the oldest retained event.
+                Received::Overflow(_) => continue,
+                Received::Timeout => {
+                    return Err(ErrorVal::new(
+                        "timeout",
+                        format!("channel `{name}`: no event within timeout"),
+                    ));
+                }
+                Received::Closed => {
+                    return Err(ErrorVal::new(
+                        "channel_closed",
+                        format!("channel `{name}` closed"),
+                    ));
+                }
+                Received::Cancelled => {
+                    return Err(ErrorVal::new(
+                        "cancelled",
+                        format!("channel `{name}` wait cancelled"),
+                    ));
+                }
+            }
+        }
     }
 }
 
@@ -191,6 +377,20 @@ fn event_record(name: &str, seq: u64, ts_ns: i128, payload: &Value) -> Value {
     r.insert("seq".into(), Value::Int(seq as i64));
     r.insert("ts".into(), datetime_from_ns(ts_ns));
     r.insert("payload".into(), payload.clone());
+    Value::Record(r)
+}
+
+/// In-band indication that this subscriber fell behind. The normal event keys
+/// remain present for shape compatibility; `seq: null` means this is not a
+/// published event, while `overflow` and `dropped` describe the local gap.
+fn overflow_record(name: &str, dropped: u64) -> Value {
+    let mut r = Record::new();
+    r.insert("channel".into(), Value::Str(name.to_string()));
+    r.insert("seq".into(), Value::Null);
+    r.insert("ts".into(), datetime_from_ns(now_ns()));
+    r.insert("payload".into(), Value::Null);
+    r.insert("overflow".into(), Value::Bool(true));
+    r.insert("dropped".into(), Value::Int(dropped as i64));
     Value::Record(r)
 }
 
@@ -253,10 +453,7 @@ impl Evaluator {
                         )));
                     }
                 };
-                Ok(Value::Stream(StreamVal::from_channel(
-                    "event",
-                    bus.events(chan, since),
-                )))
+                Ok(Value::Stream(bus.event_stream(chan, since)))
             }
             "latest" => Ok(bus.latest(chan)),
             "take" => {
@@ -270,7 +467,8 @@ impl Evaluator {
                         )));
                     }
                 };
-                bus.take(chan, timeout)
+                let cancel = self.cancellation_token();
+                bus.take_cancelled(chan, timeout, Some(&cancel))
             }
             _ => Err(ErrorVal::new(
                 "field_missing",
@@ -365,14 +563,17 @@ impl Evaluator {
         // sees the caller's bindings.
         let ctx = self.child_context();
         std::thread::spawn(move || {
-            let mut ev = ctx.build(ChildKind::OnHandler, child_cancel);
-            let stream = StreamVal::from_channel("event", rx);
-            let result = match stream.take_upstream() {
-                Ok(mut up) => shoal_value::drive_stream(&mut ev, &mut *up, |ctx, event| {
-                    ctx.call_closure(&handler, vec![event]).map(|_| ())
-                })
-                .map(|()| Value::Null),
-                Err(e) => Err(e),
+            let mut ev = ctx.build(ChildKind::OnHandler, child_cancel.clone());
+            let result = loop {
+                let event = match rx.recv(None, Some(&child_cancel)) {
+                    Received::Event(event) => event,
+                    Received::Overflow(n) => overflow_record(&chan, n),
+                    Received::Timeout => continue,
+                    Received::Closed | Received::Cancelled => break Ok(Value::Null),
+                };
+                if let Err(e) = ev.call_closure(&handler, vec![event]) {
+                    break Err(e);
+                }
             };
             worker.finish(result);
         });
@@ -389,5 +590,53 @@ fn datetime_from_ns(ns: i128) -> Value {
     match jiff::Timestamp::from_nanosecond(ns) {
         Ok(ts) => Value::DateTime(Box::new(ts.to_zoned(jiff::tz::TimeZone::system()))),
         Err(_) => Value::Null,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slow_subscriber_is_bounded_and_every_gap_is_accounted_for() {
+        let bus = EventBus::default();
+        let rx = bus.events("burst", None);
+        let published = SUBSCRIBER_CAP + 80;
+        for i in 0..published {
+            bus.emit("burst", Value::Int(i as i64));
+        }
+
+        let mut retained = 0usize;
+        let mut dropped = 0usize;
+        loop {
+            match rx.recv(Some(Duration::ZERO), None) {
+                Received::Event(_) => retained += 1,
+                Received::Overflow(n) => dropped += n as usize,
+                Received::Timeout => break,
+                Received::Closed | Received::Cancelled => panic!("subscription ended early"),
+            }
+        }
+        assert!(retained <= SUBSCRIBER_CAP);
+        assert!(dropped > 0, "overflow must be explicit, never silent");
+        assert_eq!(retained + dropped, published);
+    }
+
+    #[test]
+    fn cancellation_wakes_an_idle_subscription_promptly() {
+        let bus = EventBus::default();
+        let rx = bus.events("idle", None);
+        let cancel = CancelToken::new();
+        let trip = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            trip.cancel();
+        });
+
+        let start = Instant::now();
+        assert!(matches!(rx.recv(None, Some(&cancel)), Received::Cancelled));
+        assert!(
+            start.elapsed() < Duration::from_millis(250),
+            "cancelled receive stayed blocked"
+        );
     }
 }
