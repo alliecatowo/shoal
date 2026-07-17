@@ -21,7 +21,7 @@ impl Kernel {
         // task and waits up to the deadline for a fast inline answer.
         if params.asynchronous || params.timeout_ms.is_some() {
             let active_slot = self.task_slots.reserve(
-                &session.id,
+                &session.key.owner(),
                 self.max_tasks_per_session.load(Ordering::Relaxed),
                 "tasks_per_session",
                 "task",
@@ -165,7 +165,7 @@ impl Kernel {
                     drop(active_slot);
                     task.done.notify_all();
                     kernel.events.publish(&task_channel, exit_payload);
-                    kernel.reap_finished_tasks(&task.session.id);
+                    kernel.reap_finished_tasks(&task.session.key.owner());
                     worker_guard.disarm();
                 });
             if let Err(error) = spawn_result {

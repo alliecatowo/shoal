@@ -37,7 +37,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub struct Kernel {
-    sessions: Mutex<HashMap<String, Arc<Session>>>,
+    sessions: Mutex<HashMap<SessionKey, Arc<Session>>>,
     next_client: AtomicU64,
     active_connections: AtomicUsize,
     max_connections: AtomicUsize,
@@ -198,7 +198,8 @@ impl Drop for TaskWorkerGuard {
                     }
                 }),
             );
-            self.kernel.reap_finished_tasks(&self.task.session.id);
+            self.kernel
+                .reap_finished_tasks(&self.task.session.key.owner());
         }));
     }
 }
@@ -209,9 +210,7 @@ impl Drop for TaskWorkerGuard {
 /// different connections serialize on it. `session_id`/`principal` scope it to
 /// its opener the same way [`TaskEntry`] scopes a task.
 struct PtyEntry {
-    session_id: String,
-    #[allow(dead_code)] // recorded for parity with tasks / future auditing
-    principal: String,
+    owner: OwnerKey,
     cmd: String,
     session: Mutex<shoal_exec::PtySession>,
     _active_slot: QuotaPermit,
@@ -219,24 +218,24 @@ struct PtyEntry {
 
 #[derive(Default)]
 struct SessionQuota {
-    counts: Mutex<HashMap<String, usize>>,
+    counts: Mutex<HashMap<OwnerKey, usize>>,
 }
 
 struct QuotaPermit {
     quota: Arc<SessionQuota>,
-    session_id: String,
+    owner: OwnerKey,
 }
 
 impl SessionQuota {
     fn reserve(
         self: &Arc<Self>,
-        session_id: &str,
+        owner: &OwnerKey,
         max: usize,
         limit: &'static str,
         noun: &'static str,
     ) -> Result<QuotaPermit, RpcError> {
         let mut counts = self.counts.lock().unwrap();
-        let current = counts.entry(session_id.to_string()).or_default();
+        let current = counts.entry(owner.clone()).or_default();
         if *current >= max {
             return Err(RpcError {
                 code: QUOTA_EXCEEDED,
@@ -247,7 +246,7 @@ impl SessionQuota {
         *current += 1;
         Ok(QuotaPermit {
             quota: self.clone(),
-            session_id: session_id.to_string(),
+            owner: owner.clone(),
         })
     }
 }
@@ -255,11 +254,11 @@ impl SessionQuota {
 impl Drop for QuotaPermit {
     fn drop(&mut self) {
         let mut counts = self.quota.counts.lock().unwrap();
-        if let Some(current) = counts.get_mut(&self.session_id) {
+        if let Some(current) = counts.get_mut(&self.owner) {
             debug_assert!(*current > 0, "session quota underflow");
             *current = current.saturating_sub(1);
             if *current == 0 {
-                counts.remove(&self.session_id);
+                counts.remove(&self.owner);
             }
         }
     }
@@ -611,7 +610,7 @@ impl Kernel {
     /// Look up a live PTY session by ref, enforcing that it belongs to the
     /// calling session (an unknown ref and another session's ref are the same
     /// opaque not-found, mirroring `task`).
-    fn pty(&self, pty_id: &Ref, session_id: &str) -> Result<Arc<PtyEntry>, RpcError> {
+    fn pty(&self, pty_id: &Ref, owner: &OwnerKey) -> Result<Arc<PtyEntry>, RpcError> {
         let entry = self
             .ptys
             .lock()
@@ -619,17 +618,17 @@ impl Kernel {
             .get(pty_id)
             .cloned()
             .ok_or_else(unknown_pty)?;
-        if entry.session_id != session_id {
+        if &entry.owner != owner {
             return Err(unknown_pty());
         }
         Ok(entry)
     }
 
-    fn reap_finished_tasks(&self, session_id: &str) {
+    fn reap_finished_tasks(&self, owner: &OwnerKey) {
         let mut tasks = self.tasks.lock().unwrap();
         let mut finished = tasks
             .iter()
-            .filter(|(_, task)| task.session.id == session_id)
+            .filter(|(_, task)| &task.session.key.owner() == owner)
             .filter_map(|(task_ref, task)| {
                 task.inner
                     .lock()
@@ -650,13 +649,13 @@ impl Kernel {
 
     /// Remove self-exited PTYs before reserving capacity for another live PTY.
     /// Snapshot first so registry and per-PTY locks are never held together.
-    fn reap_terminal_ptys(&self, session_id: &str) {
+    fn reap_terminal_ptys(&self, owner: &OwnerKey) {
         let entries = self
             .ptys
             .lock()
             .unwrap()
             .iter()
-            .filter(|(_, entry)| entry.session_id == session_id)
+            .filter(|(_, entry)| &entry.owner == owner)
             .map(|(pty_ref, entry)| (pty_ref.clone(), entry.clone()))
             .collect::<Vec<_>>();
         let terminal = entries
@@ -1316,24 +1315,136 @@ mod tests {
     #[test]
     fn per_session_resource_reservation_is_atomic_under_race() {
         let quota = Arc::new(SessionQuota::default());
+        let owner = SessionKey::new("principal:test", "s").owner();
         let barrier = Arc::new(std::sync::Barrier::new(3));
-        let reserve = |quota: Arc<SessionQuota>, barrier: Arc<std::sync::Barrier>| {
-            std::thread::spawn(move || {
-                barrier.wait();
-                quota.reserve("s", 1, "test", "resource")
-            })
-        };
-        let first = reserve(quota.clone(), barrier.clone());
-        let second = reserve(quota.clone(), barrier.clone());
+        let reserve =
+            |quota: Arc<SessionQuota>, owner: OwnerKey, barrier: Arc<std::sync::Barrier>| {
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    quota.reserve(&owner, 1, "test", "resource")
+                })
+            };
+        let first = reserve(quota.clone(), owner.clone(), barrier.clone());
+        let second = reserve(quota.clone(), owner.clone(), barrier.clone());
         barrier.wait();
         let reservations = [first.join().unwrap(), second.join().unwrap()];
         assert_eq!(
             reservations.iter().filter(|result| result.is_ok()).count(),
             1
         );
-        assert_eq!(quota.counts.lock().unwrap().get("s"), Some(&1));
+        assert_eq!(quota.counts.lock().unwrap().get(&owner), Some(&1));
         drop(reservations);
-        assert!(!quota.counts.lock().unwrap().contains_key("s"));
+        assert!(!quota.counts.lock().unwrap().contains_key(&owner));
+    }
+
+    #[test]
+    fn same_visible_session_name_is_private_to_each_principal() {
+        let kernel = Kernel::new();
+        let alpha = kernel.session("shared", "agent:alpha").unwrap();
+        let alpha_again = kernel.session("shared", "agent:alpha").unwrap();
+        let beta = kernel.session("shared", "agent:beta").unwrap();
+
+        assert!(Arc::ptr_eq(&alpha, &alpha_again));
+        assert!(!Arc::ptr_eq(&alpha, &beta));
+        assert_eq!(alpha.id, beta.id, "the wire-visible name stays stable");
+        assert_ne!(
+            alpha.key, beta.key,
+            "the registry identity includes principal"
+        );
+
+        let quota = Arc::new(SessionQuota::default());
+        let alpha_slot = quota
+            .reserve(&alpha.key.owner(), 1, "test", "resource")
+            .unwrap();
+        let beta_slot = quota
+            .reserve(&beta.key.owner(), 1, "test", "resource")
+            .expect("same session name under another principal has its own quota");
+        assert!(
+            quota
+                .reserve(&alpha.key.owner(), 1, "test", "resource")
+                .is_err(),
+            "the limit still applies within one exact owner"
+        );
+        drop((alpha_slot, beta_slot));
+    }
+
+    #[test]
+    fn task_refs_are_hidden_from_another_principal_with_the_same_session_name() {
+        let kernel = Kernel::new();
+        let alpha = kernel.session("shared-tasks", "agent:alpha").unwrap();
+        let beta = kernel.session("shared-tasks", "agent:beta").unwrap();
+        let task_ref = Ref::new("task", 4242);
+        kernel.tasks.lock().unwrap().insert(
+            task_ref.clone(),
+            Arc::new(TaskEntry {
+                task: task_ref.clone(),
+                session: alpha,
+                started_ns: now_ns(),
+                inner: Mutex::new(TaskInner {
+                    state: "completed",
+                    finished_ns: Some(now_ns()),
+                    result_ref: None,
+                    error: None,
+                    active_slot: None,
+                }),
+                done: Condvar::new(),
+                cancel: shoal_exec::CancelToken::new(),
+                cancel_requested: AtomicBool::new(false),
+            }),
+        );
+        let mut attached = Some(Attachment {
+            session: beta,
+            principal: "agent:beta".into(),
+            can_approve: false,
+            tty: false,
+            cancel_epoch: None,
+        });
+
+        let listed = kernel.handle_task_list(&mut attached).unwrap();
+        assert!(listed.as_array().unwrap().is_empty());
+        let error = kernel
+            .handle_task_get(json!({"task": task_ref}), &mut attached)
+            .unwrap_err();
+        assert_eq!(error.code, UNKNOWN_TASK);
+    }
+
+    #[test]
+    fn pty_refs_are_hidden_from_another_principal_with_the_same_session_name() {
+        let kernel = Kernel::new();
+        let alpha = kernel.session("shared-pty", "agent:alpha").unwrap();
+        let beta = kernel.session("shared-pty", "agent:beta").unwrap();
+        let mut alpha_attached = Some(Attachment {
+            session: alpha,
+            principal: "agent:alpha".into(),
+            can_approve: false,
+            tty: false,
+            cancel_epoch: None,
+        });
+        let mut beta_attached = Some(Attachment {
+            session: beta,
+            principal: "agent:beta".into(),
+            can_approve: false,
+            tty: false,
+            cancel_epoch: None,
+        });
+
+        let opened = kernel
+            .handle_pty_open(json!({"cmd":"cat"}), &mut alpha_attached)
+            .expect("open alpha PTY");
+        let pty_id = opened["pty_id"].clone();
+        assert!(
+            kernel.handle_pty_list(&mut beta_attached).unwrap()["ptys"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let error = kernel
+            .handle_pty_read(json!({"pty_id": pty_id}), &mut beta_attached)
+            .unwrap_err();
+        assert_eq!(error.code, UNKNOWN_PTY);
+        kernel
+            .handle_pty_close(json!({"pty_id": pty_id}), &mut alpha_attached)
+            .expect("owner closes PTY");
     }
 
     #[test]
@@ -2717,7 +2828,7 @@ mod tests {
         // bytes — well over the raw budget, so the default fetch must elide) and
         // a second one whose loader fails (an unresolvable ref).
         let content: Vec<u8> = (0u32..5000).map(|i| (i % 251) as u8).collect();
-        let session = kernel.session("casb", "human").unwrap();
+        let session = kernel.session("casb", &principal()).unwrap();
         {
             let ok = std::sync::Arc::new(shoal_value::CasBytesVal {
                 hash: "a".repeat(64),

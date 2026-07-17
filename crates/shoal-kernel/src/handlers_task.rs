@@ -16,7 +16,7 @@ impl Kernel {
             .lock()
             .unwrap()
             .values()
-            .filter(|task| task.session.id == session.id)
+            .filter(|task| task.session.key == session.key)
             .map(task_record)
             .collect();
         encode(records)
@@ -31,7 +31,7 @@ impl Kernel {
         let session = &attachment.session;
         let p: TaskParams = decode(params)?;
         let task = self.task(&p.task)?;
-        if task.session.id != session.id {
+        if task.session.key != session.key {
             return Err(RpcError {
                 code: UNKNOWN_TASK,
                 message: "unknown task ref".into(),
@@ -51,7 +51,7 @@ impl Kernel {
         let session = &attachment.session;
         let p: TaskParams = decode(params)?;
         let task = self.task(&p.task)?;
-        if task.session.id != session.id {
+        if task.session.key != session.key {
             return Err(RpcError {
                 code: UNKNOWN_TASK,
                 message: "unknown task ref".into(),
@@ -74,7 +74,7 @@ impl Kernel {
         let session = &attachment.session;
         let p: TaskParams = decode(params)?;
         let task = self.task(&p.task)?;
-        if task.session.id != session.id {
+        if task.session.key != session.key {
             return Err(RpcError {
                 code: UNKNOWN_TASK,
                 message: "unknown task ref".into(),
@@ -101,7 +101,7 @@ impl Kernel {
         let session = &attachment.session;
         let p: TaskParams = decode(params)?;
         let task = self.task(&p.task)?;
-        if task.session.id != session.id {
+        if task.session.key != session.key {
             return Err(RpcError {
                 code: UNKNOWN_TASK,
                 message: "unknown task ref".into(),
@@ -133,7 +133,7 @@ impl Kernel {
         let session = &attachment.session;
         let p: TaskParams = decode(params)?;
         let task = self.task(&p.task)?;
-        if task.session.id != session.id {
+        if task.session.key != session.key {
             return Err(RpcError {
                 code: UNKNOWN_TASK,
                 message: "unknown task ref".into(),

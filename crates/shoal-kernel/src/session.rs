@@ -3,6 +3,34 @@
 //! `site/content/internals/change-map.md`; pure mechanical move, zero wire/behavior change.
 use super::*;
 
+/// Principal-private identity for a named evaluator session. The wire still
+/// exposes only `name`; `principal` prevents two authenticated callers that
+/// choose the same name from sharing mutable evaluator state.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct SessionKey {
+    pub(crate) principal: String,
+    pub(crate) name: String,
+}
+
+impl SessionKey {
+    pub(crate) fn new(principal: &str, name: &str) -> Self {
+        Self {
+            principal: principal.to_string(),
+            name: name.to_string(),
+        }
+    }
+
+    pub(crate) fn owner(&self) -> OwnerKey {
+        OwnerKey(self.clone())
+    }
+}
+
+/// Exact owner of task/PTY/subscription quota state. Kept distinct from the
+/// session registry key so ownership checks cannot accidentally regress to a
+/// comparison of user-chosen session names alone.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct OwnerKey(pub(crate) SessionKey);
+
 #[derive(Clone)]
 pub(crate) struct Attachment {
     pub(crate) session: Arc<Session>,
@@ -28,6 +56,7 @@ pub(crate) struct Attachment {
 }
 
 pub(crate) struct Session {
+    pub(crate) key: SessionKey,
     pub(crate) id: String,
     pub(crate) evaluator: Mutex<Evaluator>,
     /// A panic while dispatching against this session makes the evaluator's
@@ -78,14 +107,11 @@ impl Session {
 }
 
 impl Kernel {
-    /// Get-or-create the named session. `principal` is only consulted the
-    /// FIRST time this session name is created (an already-cached session
-    /// keeps whatever `Evaluator` it was built with, journal included) — its
-    /// only caller, `handle_session_attach`, always knows `who` before
-    /// calling this.
+    /// Get-or-create the principal-private named session.
     pub(crate) fn session(&self, name: &str, principal: &str) -> io::Result<Arc<Session>> {
+        let key = SessionKey::new(principal, name);
         let mut sessions = self.sessions.lock().unwrap();
-        if let Some(session) = sessions.get(name) {
+        if let Some(session) = sessions.get(&key) {
             return Ok(session.clone());
         }
         let cwd = std::env::current_dir()?;
@@ -143,6 +169,7 @@ impl Kernel {
         }));
         let lang_bus = evaluator.event_bus();
         let session = Arc::new(Session {
+            key: key.clone(),
             id: name.into(),
             evaluator: Mutex::new(evaluator),
             quarantined: AtomicBool::new(false),
@@ -150,7 +177,7 @@ impl Kernel {
             transcript: Mutex::new(HashMap::new()),
             next_value: AtomicU64::new(1),
         });
-        sessions.insert(name.into(), session.clone());
+        sessions.insert(key, session.clone());
         Ok(session)
     }
 

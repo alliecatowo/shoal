@@ -99,9 +99,10 @@ impl Kernel {
         }
         let sandbox = self.policy.sandbox_for(&actor);
 
-        self.reap_terminal_ptys(&session.id);
+        let owner = session.key.owner();
+        self.reap_terminal_ptys(&owner);
         let active_slot = self.pty_slots.reserve(
-            &session.id,
+            &owner,
             self.max_ptys_per_session.load(Ordering::Relaxed),
             "ptys_per_session",
             "PTY",
@@ -131,8 +132,7 @@ impl Kernel {
         self.ptys.lock().unwrap().insert(
             pty_ref.clone(),
             Arc::new(PtyEntry {
-                session_id: session.id.clone(),
-                principal: actor,
+                owner,
                 cmd: display.clone(),
                 session: Mutex::new(pty_session),
                 _active_slot: active_slot,
@@ -156,9 +156,9 @@ impl Kernel {
         attached: &mut Option<Attachment>,
     ) -> Result<Json, RpcError> {
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
-        let session_id = attachment.session.id.clone();
+        let owner = attachment.session.key.owner();
         let p: PtySendParams = decode(params)?;
-        let entry = self.pty(&p.pty_id, &session_id)?;
+        let entry = self.pty(&p.pty_id, &owner)?;
         let bytes = encode_input(&p.input).map_err(|message| RpcError {
             code: INVALID_PARAMS,
             message,
@@ -188,9 +188,9 @@ impl Kernel {
         attached: &mut Option<Attachment>,
     ) -> Result<Json, RpcError> {
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
-        let session_id = attachment.session.id.clone();
+        let owner = attachment.session.key.owner();
         let p: PtyRefParams = decode(params)?;
-        let entry = self.pty(&p.pty_id, &session_id)?;
+        let entry = self.pty(&p.pty_id, &owner)?;
         let snap = entry.session.lock().unwrap().read_screen();
         encode(json!({
             "pty_id": p.pty_id,
@@ -218,9 +218,9 @@ impl Kernel {
         attached: &mut Option<Attachment>,
     ) -> Result<Json, RpcError> {
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
-        let session_id = attachment.session.id.clone();
+        let owner = attachment.session.key.owner();
         let p: PtyResizeParams = decode(params)?;
-        let entry = self.pty(&p.pty_id, &session_id)?;
+        let entry = self.pty(&p.pty_id, &owner)?;
         entry
             .session
             .lock()
@@ -244,10 +244,10 @@ impl Kernel {
         attached: &mut Option<Attachment>,
     ) -> Result<Json, RpcError> {
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
-        let session_id = attachment.session.id.clone();
+        let owner = attachment.session.key.owner();
         let p: PtyRefParams = decode(params)?;
         // Ownership check first, then remove: another session's ref stays put.
-        let entry = self.pty(&p.pty_id, &session_id)?;
+        let entry = self.pty(&p.pty_id, &owner)?;
         self.ptys.lock().unwrap().remove(&p.pty_id);
         let (status, signal) = entry.session.lock().unwrap().close();
         encode(json!({
@@ -272,7 +272,7 @@ impl Kernel {
         attached: &mut Option<Attachment>,
     ) -> Result<Json, RpcError> {
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
-        let session_id = attachment.session.id.clone();
+        let owner = attachment.session.key.owner();
         // Snapshot the matching entries (clone the Arcs, drop the registry lock)
         // before touching any per-session lock, so this never holds `ptys` and a
         // `PtyEntry::session` lock at once.
@@ -281,7 +281,7 @@ impl Kernel {
             .lock()
             .unwrap()
             .iter()
-            .filter(|(_, entry)| entry.session_id == session_id)
+            .filter(|(_, entry)| entry.owner == owner)
             .map(|(pty_ref, entry)| (pty_id_num(pty_ref), entry.clone()))
             .collect();
         // Stable, ascending order (open order) so the list is deterministic.
