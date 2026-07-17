@@ -375,6 +375,24 @@ impl CallArgs {
 pub trait CallCtx {
     fn call_closure(&mut self, f: &Value, args: Vec<Value>) -> VResult<Value>;
     fn cwd(&self) -> PathBuf;
+    /// The filesystem effect port backing the value-method write sinks —
+    /// `path`/`str`/`bytes` `.save`/`.append` and stream `.save`/`.append`.
+    /// Routing those writes through this port instead of `std::fs` directly is
+    /// what makes an in-process value write observable and deniable at the same
+    /// boundary the read paths (`path.read`, command redirects) already honor
+    /// (HR-C1/HR-C2, site/content/internals/effects-plans-security.md).
+    ///
+    /// The default is [`StdFs`] — the real filesystem — so a `CallCtx` that
+    /// never injected a port (a `-c` run, a plain test) stays byte-identical to
+    /// the pre-port `OpenOptions` code. A host that holds a sandboxed/injected
+    /// `Fs` port MUST override this to return that port; otherwise in-process
+    /// value writes bypass the very boundary the read paths already cross. See
+    /// the port-boundary ledger in
+    /// site/content/internals/effects-plans-security.md.
+    fn fs(&self) -> &dyn Fs {
+        static STD: StdFs = StdFs;
+        &STD
+    }
 }
 
 #[cfg(test)]
