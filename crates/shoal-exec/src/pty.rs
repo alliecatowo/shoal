@@ -588,7 +588,12 @@ mod tests {
         assert_eq!(after.c_iflag, before.c_iflag);
         assert_eq!(after.c_oflag, before.c_oflag);
         assert_eq!(after.c_cflag, before.c_cflag);
-        assert_eq!(after.c_lflag, before.c_lflag);
+        // PENDIN is transient kernel state, not a terminal-mode setting. BSD
+        // kernels may set it while applying an otherwise exact restoration.
+        assert_eq!(
+            after.c_lflag & !libc::PENDIN,
+            before.c_lflag & !libc::PENDIN
+        );
         assert_eq!(after.c_cc, before.c_cc);
     }
 

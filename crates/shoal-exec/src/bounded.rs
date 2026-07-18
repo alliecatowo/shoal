@@ -446,13 +446,17 @@ mod tests {
     #[test]
     fn bounded_exec_spec_honors_explicit_environment_and_cwd() {
         let directory = tempfile::tempdir().expect("tempdir");
+        // macOS presents its temporary-directory symlink as `/var/...` while
+        // a child shell reports the physical `/private/var/...` path in PWD.
+        // Compare the same canonical identity on every host.
+        let cwd = fs::canonicalize(directory.path()).expect("canonical tempdir");
         let spec = bounded_spec(
             vec![
                 "/bin/sh".into(),
                 "-c".into(),
                 "printf '%s:%s' \"$REEF_SENTINEL\" \"$PWD\"".into(),
             ],
-            directory.path().to_path_buf(),
+            cwd.clone(),
         );
         let mut spec = spec;
         spec.env.push(("REEF_SENTINEL".into(), "bounded".into()));
@@ -466,7 +470,7 @@ mod tests {
         assert!(output.status.success());
         assert_eq!(
             String::from_utf8(output.stdout).unwrap(),
-            format!("bounded:{}", directory.path().display())
+            format!("bounded:{}", cwd.display())
         );
     }
 

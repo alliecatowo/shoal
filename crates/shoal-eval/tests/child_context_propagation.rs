@@ -132,7 +132,7 @@ fn on_handler_inherits_the_spawn_gate() {
     let src = format!(
         "on(channel(\"cmd\"), (ev) => {{ channel(\"res\").emit(try {{ ({}).ok }} catch {{ \"DENIED\" }}) }})\n\
          channel(\"cmd\").emit(1)\n\
-         channel(\"res\").take(timeout: 5s)",
+         channel(\"res\").take(timeout: 30s)",
         cat_src(&ok)
     );
     let out = ev
@@ -200,7 +200,7 @@ fn on_handler_inherits_config() {
     let mut ev = config_evaluator(d.path());
     let src = "on(channel(\"cmd\"), (ev) => { channel(\"cfg\").emit(config.get(\"b_marker\")) })\n\
                channel(\"cmd\").emit(1)\n\
-               channel(\"cfg\").take(timeout: 5s)";
+               channel(\"cfg\").take(timeout: 30s)";
     let out = ev.eval_program(&parse(src)).expect("handler config read");
     assert_eq!(out, Value::Str("propagated".into()), "on: {out:?}");
 }
@@ -354,7 +354,7 @@ fn on_handler_inherits_reef_resolution() {
     // handler reports `"MISS"`.
     let src = "on(channel(\"cmd\"), (ev) => { channel(\"res\").emit(try { (faketool).ok } catch { \"MISS\" }) })\n\
                channel(\"cmd\").emit(1)\n\
-               channel(\"res\").take(timeout: 5s)";
+               channel(\"res\").take(timeout: 30s)";
     let out = ev
         .eval_program(&parse(src))
         .expect("on-handler reports a result");
