@@ -24,6 +24,8 @@ struct VersionKey {
     ino: u64,
     mtime: i64,
     mtime_ns: i64,
+    ctime: i64,
+    ctime_ns: i64,
     len: u64,
 }
 
@@ -36,6 +38,8 @@ impl VersionKey {
             ino: meta.ino(),
             mtime: meta.mtime(),
             mtime_ns: meta.mtime_nsec(),
+            ctime: meta.ctime(),
+            ctime_ns: meta.ctime_nsec(),
             len: meta.len(),
         })
     }
@@ -248,6 +252,42 @@ mod tests {
     }
 
     #[test]
+    fn same_length_rewrite_with_restored_mtime_reprobes_the_version() {
+        let root = tempfile::tempdir().unwrap();
+        let path = make_exe(
+            root.path(),
+            "changing",
+            "#!/bin/sh\necho 'changing 1.0.0'\n",
+        );
+        let original_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let provider = SystemProvider::new(vec![root.path().into()], vec![]);
+        let candidate = provider.discover("changing", &ProviderCtx::new("/"))[0].clone();
+        assert_eq!(
+            provider
+                .version_of(&candidate, &ProviderCtx::new("/"))
+                .raw(),
+            "1.0.0"
+        );
+
+        make_exe(
+            root.path(),
+            "changing",
+            "#!/bin/sh\necho 'changing 2.0.0'\n",
+        );
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(original_mtime))
+            .unwrap();
+        drop(file);
+
+        assert_eq!(
+            provider
+                .version_of(&candidate, &ProviderCtx::new("/"))
+                .raw(),
+            "2.0.0"
+        );
+    }
+
+    #[test]
     fn version_cache_churn_clears_at_its_ceiling() {
         let provider = SystemProvider::new(Vec::new(), Vec::new());
         let mut cache = provider.lock_cache();
@@ -259,6 +299,8 @@ mod tests {
                     ino,
                     mtime: 1,
                     mtime_ns: 0,
+                    ctime: 1,
+                    ctime_ns: 0,
                     len: 1,
                 },
                 Version::parse("1.0.0"),

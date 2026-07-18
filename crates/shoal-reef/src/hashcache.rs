@@ -1,8 +1,10 @@
-//! Content hashing with an identity cache keyed by `(dev, inode, mtime, len)`.
+//! Content hashing with an identity cache keyed by
+//! `(dev, inode, mtime, ctime, len)`.
 //!
 //! Re-hashing a binary on every spawn would be wasteful; a binary is identified
 //! by its filesystem identity so a cache hit avoids the read. The key includes
-//! `len` and `mtime` so an in-place rewrite (same inode) still invalidates.
+//! `len`, `mtime`, and `ctime` so same-inode rewrites still invalidate even if
+//! their byte length and modification time are preserved.
 
 use std::collections::HashMap;
 use std::io::{self, Read};
@@ -21,6 +23,8 @@ struct IdKey {
     ino: u64,
     mtime: i64,
     mtime_ns: i64,
+    ctime: i64,
+    ctime_ns: i64,
     len: u64,
 }
 
@@ -72,6 +76,8 @@ impl HashCache {
             ino: meta.ino(),
             mtime: meta.mtime(),
             mtime_ns: meta.mtime_nsec(),
+            ctime: meta.ctime(),
+            ctime_ns: meta.ctime_nsec(),
             len: meta.len(),
         };
         if let Some(h) = self.lock_map().get(&key) {
@@ -141,6 +147,8 @@ mod tests {
                     ino,
                     mtime: 1,
                     mtime_ns: 0,
+                    ctime: 1,
+                    ctime_ns: 0,
                     len: 1,
                 },
                 "old".into(),
@@ -156,6 +164,24 @@ mod tests {
             hash_bytes(b"authoritative bytes")
         );
         assert_eq!(cache.lock_map().len(), 1);
+    }
+
+    #[test]
+    fn same_length_rewrite_with_restored_mtime_still_invalidates_on_ctime() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bin");
+        std::fs::write(&path, b"aaaa").unwrap();
+        let original_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let cache = HashCache::new();
+        let first = cache.hash_file(&path).unwrap();
+
+        std::fs::write(&path, b"bbbb").unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(original_mtime))
+            .unwrap();
+
+        assert_ne!(cache.hash_file(&path).unwrap(), first);
+        assert_eq!(cache.hash_file(&path).unwrap(), hash_bytes(b"bbbb"));
     }
 
     #[test]

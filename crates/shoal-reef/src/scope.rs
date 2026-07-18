@@ -6,15 +6,20 @@
 //!
 //! The chain is ordered nearest-first. Within a single directory, a native
 //! `.reef.toml` is ordered before foreign manifests so it wins. The chain
-//! records each manifest's path and mtime so callers can cache a chain and
-//! detect staleness by comparing the [`ChainKey`] (paths + mtimes) — there is no
-//! internal cache to invalidate.
+//! records each accepted manifest's path and mtime for the narrow [`ChainKey`].
+//! Evaluator cache reuse instead compares the candidate metadata identity from
+//! [`ScopeChain::discovery_key`] so missing, replaced, and repaired files are
+//! noticed without reparsing every candidate on every command.
 
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::manifest::{ManifestKind, ReefManifest};
 use shoal_value::{Fs, StdFs};
+
+const MAX_DISCOVERY_WARNINGS: usize = 64;
+const MAX_DISCOVERY_WARNING_BYTES: usize = 4 * 1024;
 
 /// One scope in the chain.
 #[derive(Debug, Clone)]
@@ -40,13 +45,15 @@ pub struct ScopeChain {
     pub cwd: PathBuf,
     pub scopes: Vec<ScopeEntry>,
     /// Advisory discovery diagnostics. A malformed/oversized manifest is
-    /// skipped so farther scopes remain usable, but the reason is retained.
+    /// skipped so interactive callers can keep farther scopes usable, but the
+    /// reason is retained within fixed entry/byte ceilings.
     pub warnings: Vec<String>,
 }
 
 /// A fixed-size metadata cache key. Equality permits reuse under the documented
-/// path/kind/length/mtime identity model; it is not a hostile-filesystem content
-/// proof, so parsing still validates every file after an identity change.
+/// path/kind/device/inode/length/mtime/ctime identity model; it is not a
+/// hostile-filesystem content proof, so parsing still validates every file
+/// after an identity change.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChainKey {
     digest: blake3::Hash,
@@ -99,10 +106,12 @@ impl ScopeChain {
                         },
                     ),
                     Ok(_) => {}
-                    Err(error) => warnings.push(format!("{}: {error}", user.display())),
+                    Err(error) => {
+                        push_warning(&mut warnings, format!("{}: {error}", user.display()))
+                    }
                 },
                 Ok(None) => {}
-                Err(error) => warnings.push(error.to_string()),
+                Err(error) => push_warning(&mut warnings, error.to_string()),
             }
         }
         ScopeChain {
@@ -112,7 +121,7 @@ impl ScopeChain {
         }
     }
 
-    /// The cache key for this chain (paths + mtimes).
+    /// The narrow cache key for already accepted scopes (paths + mtimes).
     pub fn key(&self) -> ChainKey {
         let mut hasher = blake3::Hasher::new();
         for scope in &self.scopes {
@@ -186,7 +195,7 @@ fn collect_dir(fs: &dyn Fs, d: &Path, scopes: &mut Vec<ScopeEntry>, warnings: &m
             Ok(Some(text)) => text,
             Ok(None) => continue,
             Err(error) => {
-                warnings.push(error.to_string());
+                push_warning(warnings, error.to_string());
                 continue;
             }
         };
@@ -208,7 +217,7 @@ fn collect_dir(fs: &dyn Fs, d: &Path, scopes: &mut Vec<ScopeEntry>, warnings: &m
                 },
             ),
             Ok(_) => {}
-            Err(error) => warnings.push(format!("{}: {error}", path.display())),
+            Err(error) => push_warning(warnings, format!("{}: {error}", path.display())),
         }
     }
 }
@@ -219,11 +228,14 @@ fn push_scope(scopes: &mut Vec<ScopeEntry>, warnings: &mut Vec<String>, entry: S
             .iter()
             .any(|warning| warning.contains("scope identity limit"))
         {
-            warnings.push(format!(
-                "{}: scope identity limit reached ({})",
-                entry.source.display(),
-                crate::input::REEF_MAX_SCOPES
-            ));
+            push_warning(
+                warnings,
+                format!(
+                    "{}: scope identity limit reached ({})",
+                    entry.source.display(),
+                    crate::input::REEF_MAX_SCOPES
+                ),
+            );
         }
         return;
     }
@@ -263,6 +275,10 @@ fn hash_file_state(hasher: &mut blake3::Hasher, fs: &dyn Fs, path: &Path) {
         Ok(metadata) => {
             hasher.update(&[1, u8::from(metadata.is_file()), u8::from(metadata.is_dir())]);
             hasher.update(&metadata.len().to_le_bytes());
+            hasher.update(&metadata.dev().to_le_bytes());
+            hasher.update(&metadata.ino().to_le_bytes());
+            hasher.update(&metadata.ctime().to_le_bytes());
+            hasher.update(&metadata.ctime_nsec().to_le_bytes());
             hash_time(hasher, metadata.modified().ok());
         }
         Err(error) => {
@@ -270,6 +286,32 @@ fn hash_file_state(hasher: &mut blake3::Hasher, fs: &dyn Fs, path: &Path) {
             hasher.update(&error.raw_os_error().unwrap_or_default().to_le_bytes());
         }
     }
+}
+
+fn push_warning(warnings: &mut Vec<String>, warning: String) {
+    if warnings.len() >= MAX_DISCOVERY_WARNINGS {
+        return;
+    }
+    if warnings.len() == MAX_DISCOVERY_WARNINGS - 1 {
+        warnings.push("additional Reef discovery warnings suppressed".into());
+        return;
+    }
+    let original_len = warning.len();
+    let truncated = original_len > MAX_DISCOVERY_WARNING_BYTES;
+    let limit = if truncated {
+        MAX_DISCOVERY_WARNING_BYTES - '…'.len_utf8()
+    } else {
+        MAX_DISCOVERY_WARNING_BYTES
+    };
+    let mut end = original_len.min(limit);
+    while !warning.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut warning = warning[..end].to_string();
+    if truncated {
+        warning.push('…');
+    }
+    warnings.push(warning);
 }
 
 #[cfg(test)]
@@ -519,6 +561,52 @@ mod tests {
         assert_ne!(changed, lock_created);
         fs::remove_file(&manifest).unwrap();
         assert_ne!(lock_created, ScopeChain::discovery_key(base, None));
+    }
+
+    #[test]
+    fn discovery_key_detects_same_length_rewrite_with_restored_mtime() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join(".reef.toml");
+        let original = "[tools]\nx='1'\n";
+        let replacement = "[tools]\ny='2'\n";
+        assert_eq!(original.len(), replacement.len());
+        fs::write(&path, original).unwrap();
+        let original_mtime = fs::metadata(&path).unwrap().modified().unwrap();
+        let first = ScopeChain::discovery_key(root.path(), None);
+
+        fs::write(&path, replacement).unwrap();
+        let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(original_mtime))
+            .unwrap();
+
+        assert_ne!(first, ScopeChain::discovery_key(root.path(), None));
+    }
+
+    #[test]
+    fn discovery_warning_retention_is_bounded_with_a_suppression_marker() {
+        let root = tempfile::tempdir().unwrap();
+        let mut current = root.path().to_path_buf();
+        for depth in 0..20 {
+            current = current.join(format!("d{depth}"));
+            fs::create_dir(&current).unwrap();
+            for (name, _) in MANIFEST_CANDIDATES {
+                let file = fs::File::create(current.join(name)).unwrap();
+                file.set_len((crate::input::REEF_MANIFEST_MAX_BYTES + 1) as u64)
+                    .unwrap();
+            }
+        }
+        let chain = ScopeChain::discover(&current, None);
+        assert_eq!(chain.warnings.len(), MAX_DISCOVERY_WARNINGS);
+        assert_eq!(
+            chain.warnings.last().unwrap(),
+            "additional Reef discovery warnings suppressed"
+        );
+        assert!(
+            chain
+                .warnings
+                .iter()
+                .all(|warning| warning.len() <= MAX_DISCOVERY_WARNING_BYTES)
+        );
     }
 
     // Minimal mtime setter using libc utimes (avoids a filetime dependency).

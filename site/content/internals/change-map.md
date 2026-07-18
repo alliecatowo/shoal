@@ -273,12 +273,17 @@ rows inside its candidate-selection transaction, then evaluates retention. Tests
 refcounts, two independent owners, evaluator-outliving values, last-value release, and stale-owner
 recovery.
 
-### Medium: Reef discovery and identity can hide changes
+### Resolved: Reef discovery errors are visible and identity keys detect rewrites
 
-Normal scope discovery silently skips malformed/unreadable manifests. Hash caching keys on file
-identity metadata rather than content every time. Together these favor speed/best-effort operation
-over conspicuous failure. Record discovery diagnostics and make strict script/agent mode surface
-them; harden cache identity without hashing every executable on every prompt render.
+Scope discovery retains at most 64 diagnostics of at most 4 KiB each. Interactive evaluation emits
+them once per unchanged discovery identity and can keep using valid farther scopes; noninteractive
+script/agent execution refuses an external spawn until the malformed or unreadable authority is
+fixed. Repairing a manifest in the same cwd immediately clears that refusal.
+
+Candidate/lock discovery, executable hashing, and system-version probes now include Unix change time
+alongside device, inode, modification time, and length. Tests rewrite files to equal-length content,
+restore the old mtime, and require cache invalidation. Metadata-to-open and hash-to-exec races remain
+honest filesystem/process boundaries; these caches are acceleration, not bearer authority.
 
 ### Medium-low: configuration discovery still has two prompt paths
 

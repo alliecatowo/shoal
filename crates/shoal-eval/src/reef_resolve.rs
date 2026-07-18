@@ -155,6 +155,16 @@ impl Evaluator {
             self.host.reef_user_manifest.as_deref(),
             self.host.fs.as_ref(),
         );
+        let warnings = chain.warnings.clone();
+        self.exec.reef.discovery_error = if self.session.interactive || warnings.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "Reef discovery retained {} warning(s) for invalid or unreadable manifests; first: {}",
+                warnings.len(),
+                warnings[0]
+            ))
+        };
         self.exec.reef.lock_path = chain
             .scopes
             .iter()
@@ -183,6 +193,17 @@ impl Evaluator {
         }
         self.exec.reef.chain = Some((self.exec.shell.cwd.clone(), chain));
         self.exec.reef.chain_key = Some(observed_key);
+        if self.session.interactive {
+            for warning in warnings.iter().take(8) {
+                self.emit_line(&format!("reef: warning: {warning}"));
+            }
+            if warnings.len() > 8 {
+                self.emit_line(&format!(
+                    "reef: warning: {} additional discovery warning(s)",
+                    warnings.len() - 8
+                ));
+            }
+        }
     }
 
     /// A clone of the current scope chain (cheap: manifests are small maps),
@@ -349,6 +370,14 @@ impl Evaluator {
         env: &mut Vec<(OsString, OsString)>,
         span: Span,
     ) -> VResult<Option<String>> {
+        self.ensure_reef_chain();
+        if let Some(error) = &self.exec.reef.discovery_error {
+            return Err(ErrorVal::new("reef_provider", error.clone())
+                .with_hint(
+                    "fix or remove the reported manifest before running a script/agent command",
+                )
+                .with_span(span));
+        }
         // Fast bail: no manifest in scope ⇒ never touch the resolver.
         if !self.reef_manifest_in_scope() {
             return Ok(None);
@@ -599,5 +628,52 @@ mod tests {
             "no real ambient hit exists; the hint must not fire, got {:?}",
             err.msg
         );
+    }
+
+    #[test]
+    fn noninteractive_discovery_fails_closed_and_recovers_after_manifest_fix() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join(".reef.toml");
+        std::fs::write(&manifest, "[tools").unwrap();
+        let mut evaluator = Evaluator::new(dir.path().to_path_buf());
+        let program = shoal_syntax::parse("/bin/true").unwrap();
+
+        let error = evaluator
+            .eval_program(&program)
+            .expect_err("script/agent execution must not skip malformed authority");
+        assert_eq!(error.code, "reef_provider");
+        assert!(error.msg.contains("invalid or unreadable manifests"));
+
+        std::fs::write(&manifest, "").unwrap();
+        let value = evaluator
+            .eval_program(&program)
+            .expect("same-cwd metadata identity must notice the repaired manifest");
+        let Value::Outcome(outcome) = value else {
+            panic!("expected external outcome");
+        };
+        assert!(outcome.ok);
+        assert!(evaluator.exec.reef.discovery_error.is_none());
+    }
+
+    #[test]
+    fn interactive_discovery_warns_once_and_remains_best_effort() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".reef.toml"), "[tools").unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let capture = seen.clone();
+        let mut evaluator = Evaluator::new(dir.path().to_path_buf());
+        evaluator.set_interactive(true);
+        evaluator.set_statement_sink(Box::new(move |value| {
+            if let Value::Str(line) = value {
+                capture.lock().unwrap().push(line.clone());
+            }
+        }));
+
+        evaluator.ensure_reef_chain();
+        evaluator.ensure_reef_chain();
+        assert!(evaluator.exec.reef.discovery_error.is_none());
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "an unchanged bad scope warns only once");
+        assert!(seen[0].contains("reef: warning:"));
     }
 }

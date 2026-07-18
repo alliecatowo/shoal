@@ -113,7 +113,7 @@ $XDG_CONFIG_HOME/shoal/shoal.toml
 Its `[reef]` table becomes the lowest-priority user scope.
 
 
-Discovery is best-effort. Unreadable or malformed files are skipped by the scope walk and retained as warnings. Evaluator-hosted discovery reads through the installed filesystem capability with a one MiB regular-file/UTF-8 wall. Use `reef add` or validate TOML directly when diagnosing a file that seems absent; `reef add` deliberately notices a malformed local `.reef.toml` and reports `reef_provider` instead of quietly editing an ancestor.
+Discovery parsing is best-effort. Unreadable or malformed files are skipped by the scope walk and retained within fixed warning limits. Interactive evaluation prints those warnings once per unchanged scope identity and can keep using valid farther scopes. Noninteractive scripts and agent sessions refuse external execution with `reef_provider` until the bad manifest is fixed, so a malformed nearer authority cannot silently expose an ambient or farther tool. Evaluator-hosted discovery reads through the installed filesystem capability with a one MiB regular-file/UTF-8 wall. Use `reef doctor`, `reef add`, or validate TOML directly when diagnosing a file that seems absent; `reef add` deliberately notices a malformed local `.reef.toml` instead of quietly editing an ancestor.
 
 ### Tool-free scopes
 
@@ -126,7 +126,7 @@ py = "python"
 
 ### Cache behavior
 
-The evaluator caches parsed scopes, but checks a fixed-size metadata fingerprint covering every candidate and adjacent `reef.lock` path from `cwd` to the root plus the user scope. Creating, editing, replacing, or removing a manifest or lock invalidates the cache without requiring `cd` or a session restart. The fingerprint includes file kind, byte length, and modification time; contents are reparsed only after that identity changes.
+The evaluator caches parsed scopes, but checks a fixed-size metadata fingerprint covering every candidate and adjacent `reef.lock` path from `cwd` to the root plus the user scope. Creating, editing, repairing, replacing, or removing a manifest or lock invalidates the cache without requiring `cd` or a session restart. The fingerprint includes file kind, device, inode, byte length, modification time, and Unix change time; contents are reparsed only after that identity changes.
 
 ## Native manifest schema
 

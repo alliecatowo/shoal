@@ -250,7 +250,7 @@ Wire paths preserve raw Unix bytes alongside lossy display strings. Some other v
 ## Reef limitations
 
 - Manifests activate only tool resolution; there are no shell activation hooks.
-- The evaluator caches parsed scope discovery behind a candidate/lock metadata fingerprint; same-cwd create/edit/remove changes invalidate it. Metadata-to-open identity races remain a filesystem-port limitation.
+- The evaluator caches parsed scope discovery behind a candidate/lock metadata fingerprint including device/inode/mtime/ctime/length; same-cwd create/edit/repair/remove changes invalidate it. Interactive discovery warns and remains best-effort, while noninteractive external execution refuses retained discovery errors. Metadata-to-open identity races remain a filesystem-port limitation.
 - An unlocked constrained tool is tolerated/locked interactively but rejected under script policy; host-installed versions/providers make first resolution host-dependent.
 - Hermetic mode removes ambient PATH tail; it does not sandbox filesystem/network/environment/syscalls.
 - Provider availability and install commands depend on host managers; offline/missing providers remain honest resolution errors.

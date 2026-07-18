@@ -83,9 +83,13 @@ Foreign adapters are read-only:
 | user `shoal.toml` | `[reef]` native shape | all other host config |
 
 Parsing APIs return a `ManifestError`; normal scope discovery skips unreadable or malformed files so
-farther scopes remain usable and retains each reason in `ScopeChain::warnings`. Evaluator discovery
-uses the installed filesystem capability and bounded regular-file/UTF-8 reads rather than ambient
-whole-file calls. `reef doctor` adds focused invalid-lock and local-manifest reporting.
+farther scopes remain usable and retains each reason in `ScopeChain::warnings`. Retention is capped at
+64 entries of at most 4 KiB each, with a suppression marker at the ceiling. Interactive evaluation
+emits retained warnings once per unchanged discovery identity and remains best-effort. Noninteractive
+script/agent evaluation fails closed before an external spawn until the bad authority is repaired.
+Evaluator discovery uses the installed filesystem capability and bounded regular-file/UTF-8 reads
+rather than ambient whole-file calls. `reef doctor` adds focused invalid-lock and local-manifest
+reporting and remains available for diagnosis.
 
 ## Scope discovery
 
@@ -114,9 +118,10 @@ empty/default-only manifest is parsed but omitted because it has no scope-level 
 
 The evaluator compares a fixed-size BLAKE3 metadata fingerprint before reusing its parsed chain. It
 covers every possible manifest and adjacent lock path from cwd to root, including missing candidates,
-plus the user scope; file kind, byte length, and mtime participate. Creating, editing, replacing, or removing a
-manifest or lock therefore reloads both in the same cwd. `ScopeChain::key()` remains
-the narrower identity of already accepted scopes, while `discovery_key_with` is the cache guard.
+plus the user scope; file kind, device, inode, byte length, mtime, and ctime participate. Creating,
+editing, replacing, repairing, or removing a manifest or lock therefore reloads both in the same cwd,
+including an equal-length rewrite whose mtime is restored. `ScopeChain::key()` remains the narrower
+identity of already accepted scopes, while `discovery_key_with` is the cache guard.
 
 ## Constraint algebra
 
@@ -175,7 +180,7 @@ Regular-file and Unix executable bits are required. Windows/ConPTY layouts are n
 `<binary> --version` is run with null stdin while bounded reader workers drain both pipes. Polling
 uses a 300 ms hard deadline, kills the process group and reaps on timeout, and extracts the first
 dotted version-shaped token, falling back to a bare integer. Failure or unparseable output becomes
-`Version::unknown`. Results cache by path plus device/inode/mtime/length identity, clear at 1,024
+`Version::unknown`. Results cache by path plus device/inode/mtime/ctime/length identity, clear at 1,024
 entries, and discard uncertain state after lock poison.
 
 Library callers can install a pre-probe guard and an explicit provider subprocess context. Evaluator
@@ -251,10 +256,12 @@ replacement before invalidating discovery.
 
 ## Hash cache
 
-File hashing reads BLAKE3 on a cache miss keyed by Unix device, inode, mtime seconds/nanoseconds, and
-length. This invalidates normal in-place rewrites while avoiding repeated reads. It is process-local
-and clears at 4,096 identities rather than growing for process lifetime. An adversarial rewrite preserving all identity fields could fool the cache; policy
-paths requiring hostile-file guarantees should not rely solely on metadata identity.
+File hashing reads BLAKE3 on a cache miss keyed by Unix device, inode, mtime and ctime
+seconds/nanoseconds, and length. This invalidates ordinary same-inode rewrites, including an
+equal-length rewrite whose mtime is restored, while avoiding repeated reads. It is process-local and
+clears at 4,096 identities rather than growing for process lifetime. A hostile filesystem able to
+preserve or falsify every identity field could still fool this acceleration cache; policy paths
+requiring hostile-file guarantees must not treat metadata identity as content authority.
 
 The same resolution hash is returned to evaluator execution so Leash spawn preflight can reuse it
 instead of reading the executable again. That equality is an important cross-subsystem contract.
@@ -385,8 +392,10 @@ idempotence/races, runners, reports, and error strings. Evaluator tests cover sp
 versus interactive lock policy, builtin tables/errors, ambient shadowing, doctor findings, and runner
 integration. Corpus suites `reef.toml` and `reef-provider-errors.toml` pin user-visible behavior.
 
-Same-cwd creation/edit/removal fingerprints, lock-save failure propagation, oversized manifest
-admission, provider flood/timeout descendants, cache identity churn, poisoned-cache recovery, and
+Same-cwd creation/edit/removal/repair fingerprints, equal-length restored-mtime rewrites,
+interactive warning-once and strict noninteractive refusal, bounded warning floods, lock-save
+failure propagation, oversized manifest admission, provider flood/timeout descendants, cache
+identity churn, poisoned-cache recovery, and
 runner-only/hermetic-only project and user scope discovery, denied version probes/fetch hooks,
 provider-pinned fetch selection, hostile view-link replacement/extra entries, binding path traversal,
 symlinked view roots, and live Landlock denial from both version probes and mise installers are
