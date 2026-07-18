@@ -298,29 +298,25 @@ real private and durable kernel processes, and assert both parity and deliberate
 Composition roots now primarily parse CLI/protocol inputs, select a profile, and wire their owned
 transport/presentation services.
 
-### P1.2 Subscription ownership and bounded EventBus delivery
+### Delivered: subscription ownership and bounded EventBus delivery
 
 **Current split.** The kernel bus has a count/byte-bounded replay ring and subscriber queues, one
 isolated writer thread per connection, coalesced `{dropped, dropped_bytes, latest_seq}` summaries,
-and explicit queue closure on kernel unsubscribe/disconnect. The evaluator bus now independently
-bounds channel identities, rings, subscribers, queues, and publishable retained values. Two adjacent
-ownership/coordination gaps remain:
+and explicit queue closure on kernel unsubscribe/disconnect. The evaluator bus independently bounds
+channel identities, rings, subscribers, queues, and publishable retained values. MCP now multiplexes
+its bounded URI registry over one facade connection/thread. One adjacent coordination gap remains:
 
-- evaluator publication still clones/fans out while holding its global channel-map mutex;
-- MCP `resources/subscribe` creates a dedicated connection/thread, but
-  `resources/unsubscribe` has no facade-side registry or handle with which to stop it.
+- evaluator publication still clones/fans out while holding its global channel-map mutex.
 
-**Design.** Reuse the kernel semantics as the cross-bus vocabulary: owner, subscription ID,
-capacity, overflow/gap marker, cancellation token, and close/join path. Give MCP a URI-keyed registry
-whose unsubscribe closes the dedicated connection and joins or supervises its worker. Release the
-language bus's global map lock before fan-out where practical. Keep the two bus implementations'
-different payload types and admission policies explicit.
+**Delivered design.** MCP has a URI-keyed registry whose exact unsubscribe updates a single
+connection-owned worker; last-URI removal unsubscribes the kernel channel, and facade drop
+closes/joins the hub. Release the language bus's global map lock before fan-out where practical.
+Keep the bus implementations' different payload types and admission policies explicit.
 
-**Acceptance tests.** Preserve the kernel and language stalled-consumer, bounded-retention,
-coalesced-gap, unsubscribe, and disconnect tests. Through real MCP stdio, prove that unsubscribe
-stops notifications and the forwarding worker, disconnect cleans all owned
-subscriptions, and repeated cycles return thread/task counts to baseline. A durable-channel gap must
-remain repairable through cursor read.
+**Evidence.** Kernel/language stalled-consumer, bounded-retention, coalesced-gap, unsubscribe, and
+disconnect tests remain. A live kernel with a two-connection ceiling admits the ordinary facade
+transport plus multiple resource URIs, repeated lifecycle churn retains no URI routes, and one event
+fans out to every exact URI mapped to its channel. Durable gaps remain repairable through cursor read.
 
 ### Delivered: parser-context and host parity
 

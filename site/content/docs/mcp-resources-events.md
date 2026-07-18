@@ -438,7 +438,7 @@ Delivery should be treated as at-least-once from the consumer's perspective. Ded
 
 ### Backpressure and dropped summaries
 
-The kernel gives each subscriber a queue of 256 pending events and a dedicated socket-writer thread. Publishing never waits on a slow subscriber. When that subscriber's queue is full, additional events are dropped and coalesced. Once delivery resumes, it receives a synthetic event payload:
+The kernel gives each subscribed channel a queue of 256 pending events and uses one socket-writer dispatcher per connection. Publishing never waits on a slow queue. When that queue is full, additional events are dropped and coalesced. Once delivery resumes, it receives a synthetic event payload:
 
 ```json
 {
@@ -451,11 +451,11 @@ This tells the consumer that its live stream has a gap. Read the channel from th
 
 ### Unsubscribe lifetime
 
-The MCP facade owns one worker per subscribed URI. `resources/unsubscribe` removes that worker,
-shuts down its dedicated kernel connection, and joins its forwarding thread; disconnecting that
-connection also removes the kernel-side subscription. Repeated subscription churn therefore does
-not leak dormant workers. Active subscriptions are still comparatively expensive—one Unix socket
-and one OS thread each—so consolidate channels and bound their count.
+The MCP facade owns one multiplexed worker and one kernel connection for its bounded 64-URI registry.
+`resources/unsubscribe` removes the exact route and asks the kernel to remove a channel when its final
+URI disappears. Duplicate subscribe and absent unsubscribe are idempotent. Facade drop shuts down the
+connection and joins the worker; a disconnected hub requires resubscription and cursor-based
+reconciliation, but adding URIs does not add sockets or threads.
 
 The raw kernel `events.unsubscribe` remains the lighter same-connection operation: it removes the
 named channel from the current connection without closing that connection.

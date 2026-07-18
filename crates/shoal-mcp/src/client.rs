@@ -1,13 +1,15 @@
 //! Kernel connection: `Config`, Unix-socket discovery, and the JSON-RPC
 //! `KernelClient` used to talk to `shoal-kernel` over its Unix socket.
 
-use crate::{read_json_line, write_json_line, write_stdout_frame};
+use crate::{read_json_line, write_json_line};
 use serde_json::{Value, json};
 pub use shoal_proto::LocalAuthMode;
 use shoal_proto::{ATTACH_SECURITY_EPOCH, PRINCIPAL_SESSION_ISOLATION};
 use std::io::{self, BufReader};
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -78,37 +80,35 @@ impl KernelClient {
         Ok(client)
     }
 
-    pub(crate) fn subscribe_events(&mut self, channel: &str) -> Result<(), BridgeError> {
-        self.call("events.subscribe", json!({"channel": channel}))?;
-        Ok(())
-    }
-
     pub(crate) fn shutdown_handle(&self) -> io::Result<UnixStream> {
         self.writer.try_clone()
     }
 
-    /// Forward every pushed `event` notification from an already-subscribed,
-    /// dedicated connection to MCP stdout. Closing any clone of the connection
-    /// wakes this loop, which lets `resources/unsubscribe` own its lifetime.
-    pub(crate) fn run_event_forwarder(mut self, uri: String) {
-        while let Ok(Some(frame)) = read_json_line(&mut self.reader) {
-            if frame.get("method").and_then(Value::as_str) == Some("event") {
-                let p = frame.get("params").cloned().unwrap_or(Value::Null);
-                let note = json!({
-                    "jsonrpc": "2.0",
-                    "method": "notifications/resources/updated",
-                    "params": {
-                        "uri": uri,
-                        "seq": p.get("seq"),
-                        "payload": p.get("payload"),
-                    }
-                });
-                let _ = write_stdout_frame(&note);
-            }
-        }
+    pub(crate) fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.reader.get_ref().set_read_timeout(timeout)
+    }
+
+    pub(crate) fn read_frame(&mut self) -> Result<Option<Value>, BridgeError> {
+        read_json_line(&mut self.reader)
+    }
+
+    pub(crate) fn read_fd(&self) -> RawFd {
+        self.reader.get_ref().as_raw_fd()
     }
 
     pub fn call(&mut self, method: &str, params: Value) -> Result<Value, BridgeError> {
+        self.call_with_notifications(method, params, |_| {})
+    }
+
+    /// Make one request while preserving interleaved push notifications.
+    /// The multiplexed subscription owner uses this so adding/removing one
+    /// channel cannot drop an event already queued for another channel.
+    pub(crate) fn call_with_notifications(
+        &mut self,
+        method: &str,
+        params: Value,
+        mut notification: impl FnMut(&Value),
+    ) -> Result<Value, BridgeError> {
         let id = self.next_id;
         self.next_id += 1;
         write_json_line(
@@ -119,6 +119,7 @@ impl KernelClient {
             let frame = read_json_line(&mut self.reader)?.ok_or(BridgeError::Disconnected)?;
             // Kernel notifications can be interleaved with the response.
             if frame.get("id") != Some(&json!(id)) {
+                notification(&frame);
                 continue;
             }
             if let Some(error) = frame.get("error") {

@@ -3,7 +3,7 @@
 //! parser they share (site/content/internals/kernel-protocol.md).
 
 use crate::tools::{bound_text, value_within_admission};
-use crate::{BridgeError, Facade, KernelClient, short_ref_to_uri};
+use crate::{BridgeError, Facade, short_ref_to_uri};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 
@@ -182,14 +182,23 @@ impl Facade {
 
     /// `resources/subscribe` (site/content/internals/kernel-protocol.md): map a `shoal://events/{ch}` or
     /// `shoal://task/{id}/out` URI to a kernel channel and forward pushes as
-    /// `notifications/resources/updated`. A dedicated background connection
-    /// owns the subscription so it never contends with request/response reads.
+    /// `notifications/resources/updated`. One facade-owned background
+    /// connection multiplexes every subscribed channel, separate from the
+    /// ordinary request/response transport.
     pub(crate) fn resources_subscribe(&mut self, params: Value) -> Result<Value, String> {
         let uri = params
             .get("uri")
             .and_then(Value::as_str)
             .ok_or("resources/subscribe requires uri")?;
         let parsed = ParsedUri::parse(uri)?;
+        if self
+            .subscription_hub
+            .as_ref()
+            .is_some_and(crate::subscriptions::SubscriptionHub::is_finished)
+        {
+            self.subscription_hub.take();
+            self.subscriptions.clear();
+        }
         let duplicate = self.subscriptions.contains_key(uri);
         if !crate::subscription_admission(self.subscriptions.len(), uri, duplicate)? {
             return Ok(json!({}));
@@ -197,28 +206,22 @@ impl Facade {
         let channel = parsed
             .event_channel()
             .ok_or("only shoal://events/{ch} and shoal://task/{id}[/out] are subscribable")?;
-        let config = self.config.clone();
         let uri = uri.to_string();
-        let forward_uri = uri.clone();
-        let mut client = KernelClient::connect(&config)
-            .map_err(|error| safe_bridge_error(&error, "subscription connection"))?;
-        client
-            .subscribe_events(&channel)
-            .map_err(|error| safe_bridge_error(&error, "subscription"))?;
-        let interrupt = client
-            .shutdown_handle()
-            .map_err(|_| "kernel subscription shutdown handle failed".to_string())?;
-        let thread = std::thread::Builder::new()
-            .name(format!("shoal-mcp-sub-{channel}"))
-            .spawn(move || client.run_event_forwarder(forward_uri))
-            .map_err(|error| error.to_string())?;
-        self.subscriptions.insert(
-            uri,
-            crate::SubscriptionWorker {
-                interrupt,
-                thread: Some(thread),
-            },
-        );
+        if self.subscription_hub.is_none() {
+            self.subscription_hub = Some(crate::subscriptions::SubscriptionHub::connect(
+                &self.config,
+            )?);
+        }
+        let Some(hub) = self.subscription_hub.as_ref() else {
+            return Err("kernel subscription worker initialization failed".into());
+        };
+        if let Err(error) = hub.add(uri.clone(), channel.clone()) {
+            if self.subscriptions.is_empty() {
+                self.subscription_hub.take();
+            }
+            return Err(error);
+        }
+        self.subscriptions.insert(uri, channel);
         Ok(json!({}))
     }
 
@@ -227,10 +230,27 @@ impl Facade {
             .get("uri")
             .and_then(Value::as_str)
             .ok_or("resources/unsubscribe requires uri")?;
-        ParsedUri::parse(uri)?
+        let channel = ParsedUri::parse(uri)?
             .event_channel()
             .ok_or("only subscribable resource URIs may be unsubscribed")?;
-        self.subscriptions.remove(uri);
+        if self
+            .subscription_hub
+            .as_ref()
+            .is_some_and(crate::subscriptions::SubscriptionHub::is_finished)
+        {
+            self.subscription_hub.take();
+            self.subscriptions.clear();
+            return Ok(json!({}));
+        }
+        if let Some(stored_channel) = self.subscriptions.get(uri) {
+            debug_assert_eq!(stored_channel, &channel);
+            let hub = self
+                .subscription_hub
+                .as_ref()
+                .ok_or("kernel subscription worker is unavailable")?;
+            hub.remove(uri.to_string(), stored_channel.clone())?;
+            self.subscriptions.remove(uri);
+        }
         Ok(json!({}))
     }
 }
@@ -612,13 +632,6 @@ fn safe_kernel_error(error: &Value, operation: &str) -> String {
     match error.get("code").and_then(Value::as_i64) {
         Some(code) => format!("kernel rejected {operation} request (code {code})"),
         None => format!("kernel rejected {operation} request"),
-    }
-}
-
-fn safe_bridge_error(error: &BridgeError, operation: &str) -> String {
-    match error {
-        BridgeError::Kernel(error) => safe_kernel_error(error, operation),
-        _ => format!("kernel {operation} failed"),
     }
 }
 

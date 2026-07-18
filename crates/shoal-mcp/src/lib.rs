@@ -3,7 +3,6 @@
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
-use std::net::Shutdown;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream;
@@ -14,13 +13,14 @@ use std::time::{Duration, Instant};
 
 mod client;
 mod resources;
+mod subscriptions;
 mod tools;
 
 pub use client::{BridgeError, Config, KernelClient, LocalAuthMode, discover_socket};
 pub use tools::tools;
 
-/// Each subscription owns a kernel connection and a forwarding thread. This
-/// facade-local ceiling applies before consuming either resource; the kernel's
+/// All facade subscriptions share one kernel connection and forwarding thread.
+/// This URI ceiling bounds the worker's routing map; the kernel's
 /// principal/session quotas remain a second, shared admission boundary.
 const MAX_FACADE_SUBSCRIPTIONS: usize = 64;
 const MAX_AUTOSTART_PATH_BYTES: usize = 4 * 1024;
@@ -49,25 +49,13 @@ fn subscription_admission(active: usize, uri: &str, duplicate: bool) -> Result<b
 pub struct Facade {
     kernel: KernelClient,
     config: Config,
-    subscriptions: HashMap<String, SubscriptionWorker>,
+    subscriptions: HashMap<String, String>,
+    subscription_hub: Option<subscriptions::SubscriptionHub>,
     // Keeps exactly the daemon this facade autostarted alive and owned. Drop
     // terminates/reaps it after the facade's protocol connections are gone.
     _autostart: KernelAutostart,
 }
 
-struct SubscriptionWorker {
-    interrupt: UnixStream,
-    thread: Option<std::thread::JoinHandle<()>>,
-}
-
-impl Drop for SubscriptionWorker {
-    fn drop(&mut self) {
-        let _ = self.interrupt.shutdown(Shutdown::Both);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
 impl Facade {
     pub fn connect(config: &Config) -> Result<Self, BridgeError> {
         Self::connect_with_autostart(config, KernelAutostart::empty())
@@ -81,6 +69,7 @@ impl Facade {
             kernel: KernelClient::connect(config)?,
             config: config.clone(),
             subscriptions: HashMap::new(),
+            subscription_hub: None,
             _autostart: autostart,
         })
     }
@@ -131,7 +120,15 @@ impl Facade {
     }
 
     pub fn active_subscriptions(&self) -> usize {
-        self.subscriptions.len()
+        if self
+            .subscription_hub
+            .as_ref()
+            .is_some_and(subscriptions::SubscriptionHub::is_finished)
+        {
+            0
+        } else {
+            self.subscriptions.len()
+        }
     }
 }
 

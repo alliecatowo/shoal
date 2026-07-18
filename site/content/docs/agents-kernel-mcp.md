@@ -443,8 +443,8 @@ The raw method set is broader than MCP tools and includes parsing, completion, e
   work has no stoppable OS owner, and MCP exposes only cancellation.
 - `format=raw` and `blob.get` expose only one 8 KiB decoded-content page at a time; clients must follow `page.next_offset` for complete transfer.
 - Session `cwd` in MCP resources is cached from attach rather than refreshed from the kernel, while env/Reef views are live.
-- Each active MCP resource subscription owns one dedicated kernel connection and OS thread;
-  `resources/unsubscribe` shuts down and joins that worker.
+- One facade-owned kernel connection and OS thread multiplexes up to 64 MCP resource URIs;
+  `resources/unsubscribe` removes exact routing state, and facade drop shuts down/joins the hub.
 - Plans, tasks, PTYs, transcript maps, and evaluator bindings are in-memory.
 - Per-client last `it` is tracked internally but has no read method.
 - Configured WebAssembly component plugins load through the shared host bootstrap and are callable in

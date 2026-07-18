@@ -160,7 +160,7 @@ Full impact/mitigation: [Security and trust boundaries](@/docs/security.md).
 | --- | --- | --- |
 | Raw retrieval throughput | `value.get format=raw` returns at most 8 KiB of decoded content per page. | Follow `page.next_offset`; string offsets are Unicode scalars and byte/CAS offsets are octets. |
 | `blob.get` throughput | Byte `offset`/`length` pages are capped at 8 KiB after exact owner authorization. | Follow `page.next_offset`; many pages require repeated verified decompression because CAS files are compressed. |
-| MCP subscription cost | One kernel connection and OS thread per resource subscription. | Bound subscriptions; consolidate channels. |
+| MCP subscription cost | One kernel connection and OS thread per facade, routing at most 64 resource URIs. | A disconnected hub requires resubscribe/cursor reconciliation. |
 | MCP cwd resource stale | `shoal://session/cwd` is cached at attach. | Execute `pwd` or reconnect after `cd`. |
 | Task output not streaming | `/task/{id}/out` resolves whole result only after capture. | Use lifecycle events; no incremental byte cursor yet. |
 | Streams on wire | Wire stream contains only label; no chunk-pull method. | Collect/bound in language or use tasks/resources. |

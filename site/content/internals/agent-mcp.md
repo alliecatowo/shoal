@@ -26,9 +26,9 @@ accDescr: Shows the components and relationships described in Bridge topology.
   Facade -->|"Unix socket JSON-RPC"| Kernel["shoal-kernel"]
   Facade --> Tools["tools mapper"]
   Facade --> Resources["shoal:// resource mapper"]
-  Resources --> SubConn["dedicated subscription connection"]
-  SubConn --> Kernel
-  SubConn -->|"notifications/resources/updated"| Agent
+  Resources --> SubHub["one multiplexed subscription hub"]
+  SubHub -->|"one attached connection"| Kernel
+  SubHub -->|"notifications/resources/updated"| Agent
 ```
 
 The facade advertises MCP protocol version `2025-06-18`, tools, resources, and resource
@@ -49,7 +49,7 @@ its terminator sentinel. Their shared fixed-stack JSON preflight rejects excessi
 container width, keys, and numbers before allocating a `serde_json` tree. The public kernel
 additionally applies its configured frame-read deadline.
 
-Stdout is locked per complete frame. This lets the request loop and subscription-forwarder threads
+Stdout is locked per complete frame. This lets the request loop and subscription-forwarder thread
 write without interleaving JSON bytes.
 
 ## Tool projection
@@ -142,9 +142,10 @@ does not reimplement that authority decision.
 
 ## Subscriptions
 
-Only `shoal://events/{channel}` and task URIs map to event channels. Each subscription opens a
-dedicated kernel client connection and starts a forwarding thread, avoiding contention with normal
-request/response reads.
+Only `shoal://events/{channel}` and task URIs map to event channels. All subscriptions use one
+facade-owned hub with a separate kernel connection and forwarding thread, avoiding contention with
+normal request/response reads without multiplying sockets/threads by URI. A bounded wakeup channel
+serializes lifecycle changes; the routing map holds at most 64 exact URIs.
 
 ```mermaid
 sequenceDiagram
@@ -152,11 +153,11 @@ accTitle: Subscriptions
 accDescr: Shows the components and relationships described in Subscriptions.
   participant A as agent
   participant M as main facade
-  participant S as subscription thread
+  participant S as multiplexed subscription hub
   participant K as kernel
   A->>M: resources/subscribe(uri)
-  M->>S: create dedicated KernelClient
-  S->>K: attach + events.subscribe(channel)
+  M->>S: add exact URI → channel route
+  S->>K: attach once; events.subscribe(channel)
   K-->>S: event notifications
   S-->>A: notifications/resources/updated(uri)
   A->>M: resources/read(uri)
@@ -170,8 +171,7 @@ incrementally streamed: once the kernel task has a result ref, `/out` resolves t
 
 PTY resources are **not** subscribable. `shoal_pty_read` must be polled, and its `changed` bit tells
 the caller whether the rendered screen changed since its last read. MCP `resources/unsubscribe`
-currently acknowledges without an explicit facade-side thread registry; kernel disconnect cleanup
-ultimately removes a subscription when its connection ends.
+removes the exact URI route and unsubscribes the kernel channel when no URI still maps to it.
 
 ## Agent-relevant semantic boundaries
 

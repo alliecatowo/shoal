@@ -529,10 +529,11 @@ already-committed wire event.
 Language-originated `user.*` emits pass through the same wire-bus admission and do not echo on
 injection. These limits are per exact principal/session.
 
-Kernel unsubscribe correctly closes its writer queue. MCP subscriptions retain their dedicated
-connection, interrupt handle, and forwarding thread; `resources/unsubscribe` closes and joins the
-worker deterministically. The facade admits at most 64 concurrent subscription workers, and the
-same resource-URI schema is checked for subscribe and unsubscribe.
+Kernel unsubscribe closes the named channel queue while one connection-owned dispatcher continues
+serving its remaining channels. MCP mirrors that shape: one facade-owned attached connection/thread
+multiplexes at most 64 resource URIs, and `resources/unsubscribe` removes the exact URI plus the
+kernel channel when its final URI disappears. Facade drop closes and joins the hub deterministically.
+The same resource-URI schema is checked for subscribe and unsubscribe.
 
 ## Error mapping by method family
 

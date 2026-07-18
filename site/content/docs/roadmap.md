@@ -203,16 +203,16 @@ cleanup is vocabulary/path configuration consistency, not serving-state correctn
 
 Acceptance: no single request can force an unbounded response or full blob allocation beyond configured server limits.
 
-### Multiplex MCP subscriptions
+### Delivered: multiplex MCP subscriptions
 
-Replace one kernel connection/thread per resource subscription with one managed event connection and registry:
+One managed event connection and registry now replaces the former connection/thread per resource:
 
 - real `resources/unsubscribe`;
 - idempotent duplicate subscription;
-- connection cleanup and subscription count metrics;
-- cursor replay on reconnect;
+- connection cleanup and subscription counts;
+- explicit resubscribe/cursor reconciliation after a disconnected hub;
 - bounded queue/drop reporting preserved;
-- no writer/thread leaks in long-lived MCP hosts.
+- no URI-proportional writer/thread growth in long-lived MCP hosts.
 
 ### Live session resources
 

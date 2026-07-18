@@ -198,16 +198,20 @@ value/callable partitioning, and structural guards prohibit either host from reb
 The public `parse` and completion endpoints remain intentionally context-free because they do not
 name an attached evaluator session; that is an explicit API distinction, not exec-host drift.
 
-### Medium-high: MCP subscriptions retain a thread-per-URI cost
+### Resolved: MCP subscriptions share one connection and worker
 
-**Evidence:** each subscribe stores a dedicated connection/thread in the facade's URI-keyed worker
-registry. `resources/unsubscribe` removes the worker, shuts down its socket, and joins the thread.
+One facade-owned hub multiplexes its bounded 64-URI routing map over one attached kernel connection
+and one forwarding thread. A wakeup socket makes subscribe/unsubscribe lifecycle commands immediate
+without an idle polling loop. The worker preserves interleaved events while waiting for kernel RPC
+responses, routes one channel notification to every exact subscribed URI in stable order, and calls
+kernel unsubscribe only when the final URI for that channel is removed.
 
-**Risk:** lifecycle ownership is now correct, but many simultaneously active URIs still scale as one
-kernel connection plus one forwarding thread each.
-
-**Direction:** retain the tested unsubscribe ownership invariant; introduce multiplexing or a bounded
-executor only if measured active-subscription scale justifies the protocol change.
+A live kernel capped at two connections admits the facade's ordinary request transport plus multiple
+resource subscriptions; the former per-URI model fails on the second URI. Repeated idempotent
+subscribe/unsubscribe cycles reuse the hub without retaining URI routes. Facade drop shuts down the
+single socket and joins the worker. A disconnected worker is reported as inactive and rebuilt on the
+next subscription; automatic cursor replay across that disconnect remains a client reconciliation
+concern.
 
 ### Resolved: explicit dual journal granularity and execution identity
 
@@ -264,13 +268,13 @@ advisory because a child may exit immediately afterward, so callers still handle
 `TASK_CONTROL_UNAVAILABLE`. Poison reconstruction clears both uncertain group identities and the
 suspended bit; the first inspection fails honestly and the next returns a clean empty snapshot.
 
-### Medium: thread-per-subscription scaling
+### Resolved: subscription threads are bounded by owning connections
 
-Kernel subscription queues and writes are bounded, MCP unsubscribe owns and joins its worker, and
-poison-sensitive state now has explicit recovery or quarantine policy. The remaining cost is
-structural: each kernel event subscription adds a blocking writer thread and each MCP subscription
-adds another forwarding connection/thread. Consider multiplexing or a bounded executor if measured
-scale requires it; preserve slow-consumer isolation and exact lifecycle cleanup.
+The kernel uses one bounded dispatcher/writer thread per connection, not per channel subscription;
+all channels on that connection share it while retaining separate bounded queues and slow-consumer
+gap accounting. MCP now likewise uses one connection/thread per facade, not per resource URI.
+Connection, per-session subscription, and facade URI quotas therefore bound both layers without
+thread amplification from adding channels. Disconnect/facade drop owns dispatcher shutdown and join.
 
 ### Resolved: spill pins have automatic multi-owner release
 

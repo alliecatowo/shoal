@@ -39,7 +39,7 @@ accDescr: Each socket connection authenticates a principal, attaches to that pri
   SessionA --> Transcript["Mutex transcript"]
   SessionA --> Bus["EventBus"]
   ConnA --> WriterA["shared response writer A"]
-  Bus --> SubA["subscription writer thread A"]
+  Bus --> SubA["connection dispatcher thread A"]
   SubA --> WriterA
 ```
 
