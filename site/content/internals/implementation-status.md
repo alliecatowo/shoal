@@ -69,7 +69,7 @@ kernel version, every third-party adapter executable, or performance targets on 
 | Leash filesystem sandbox | Implemented, host-limited | Linux/macOS backend tests and enforcement reporting | network enforcement is unavailable; local malformed-policy mode is permissive |
 | task lifecycle | Implemented, execution-form limited | evaluator jobs and kernel process-control tests | pure evaluator tasks have no independently suspendable OS owner |
 | modules and script runners | Implemented, host-limited | module/corpus tests and `.shl` execution | non-`.shl` bare path heads require explicit `run` |
-| Reef environments | Implemented | resolver/provider/lock/view tests and evaluator integration | discovery/cache/persistence fail-soft edges remain |
+| Reef environments | Implemented | resolver/provider/lock/view tests, bounded provider runners, and live sandbox integration | discovery/persistence fail-soft edges and platform portability remain |
 | adapters | Implemented | schema fixtures, bundled catalog, evaluator bindings | external tools and output dialects remain inherently environment-dependent |
 | configuration | Implemented, host-limited | typed loader tests and shared host-bootstrap integration | host-specific editor/history/prompt consumers remain intentionally local |
 | prompt | Implemented, host-limited | pure renderer snapshots and CLI producer | several context fields are hardcoded or never produced |

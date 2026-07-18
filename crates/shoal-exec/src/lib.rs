@@ -52,6 +52,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 pub use bounded::{BoundedCommandOutput, run_bounded_command};
 pub use cancel::CancelToken;
@@ -70,7 +71,7 @@ pub use pty_session::{
     PTY_DEFAULT_COLS, PTY_DEFAULT_ROWS, PTY_MAX_COLS, PTY_MAX_ROWS, PtyOpenSpec, PtySession,
     ScreenSnapshot, named_key,
 };
-pub use which::which;
+pub use which::{which, which_in};
 
 /// Resolve `argv[0]` (an absolute path as-is, or a bare name via the `PATH`
 /// entry of `env`) and return the blake3-hex of its on-disk bytes — the same
@@ -559,6 +560,59 @@ pub fn run(spec: ExecSpec, cancel: &CancelToken) -> io::Result<ExecResult> {
         ExecMode::Capture => capture::run_capture(spec, cancel),
         ExecMode::PtyTee => pty::run_pty(spec, cancel),
     }
+}
+
+/// Run a capture-only [`ExecSpec`] with the hostile-helper guarantees of
+/// [`run_bounded_command`], while still applying [`ExecSpec::sandbox`] and the
+/// caller's complete environment/cwd. A requested filesystem sandbox is a hard
+/// requirement here: because this small result type has no enforcement-status
+/// channel, the command is refused rather than silently running unconfined.
+/// The retained stdout+stderr prefix is capped at `output_cap`; `timeout` and
+/// `cancel` terminate and reap the whole process group.
+///
+/// This is intended for short control-plane probes and provider hooks. It
+/// rejects PTY mode, non-null stdin, and spill requests rather than silently
+/// changing their semantics.
+pub fn run_bounded(
+    mut spec: ExecSpec,
+    timeout: Duration,
+    output_cap: usize,
+    cancel: &CancelToken,
+) -> io::Result<BoundedCommandOutput> {
+    if spec.mode != ExecMode::Capture
+        || !matches!(&spec.stdin, StdinSpec::Null)
+        || spec.spill.is_some()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "bounded execution requires capture mode, null stdin, and no spill",
+        ));
+    }
+    if spec.argv.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "bounded execution requires argv[0]",
+        ));
+    }
+    let sandbox_requested = spec.sandbox.is_some();
+    let enforcement = sandbox::apply(&mut spec)?;
+    if sandbox_requested
+        && !enforcement
+            .as_ref()
+            .is_some_and(|status| status.filesystem_enforced)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "bounded provider command requires filesystem sandbox enforcement",
+        ));
+    }
+    let mut command = std::process::Command::new(&spec.argv[0]);
+    command
+        .args(&spec.argv[1..])
+        .current_dir(&spec.cwd)
+        .env_clear()
+        .envs(spec.env);
+    bounded::run_bounded_command_cancellable(&mut command, timeout, output_cap, cancel)
 }
 
 /// Run through the child-only Landlock/Seatbelt launcher, always with a

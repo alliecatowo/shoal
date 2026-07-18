@@ -178,11 +178,12 @@ dotted version-shaped token, falling back to a bare integer. Failure or unparsea
 `Version::unknown`. Results cache by path plus device/inode/mtime/length identity, clear at 1,024
 entries, and discard uncertain state after lock poison.
 
-Library callers can install a pre-probe guard. Evaluator callers always do: a restricted principal
-must allow the opaque effect and any active executable name/hash pin. If its policy requires an OS
-filesystem sandbox, the probe fails closed because the provider probe runner cannot yet apply that
-sandbox. The candidate is never executed after a guard error. Unrestricted library/CLI callers retain
-the bounded direct-probe behavior.
+Library callers can install a pre-probe guard and an explicit provider subprocess context. Evaluator
+callers always do: a restricted principal must allow the opaque effect and any active executable
+name/hash pin, then the probe runs through the evaluator's complete environment, cancellation epoch,
+and Leash filesystem sandbox. A requested filesystem sandbox is fail-closed when the OS backend is
+unavailable. The candidate is never executed after a guard error. Unrestricted library/CLI callers
+retain the bounded direct-probe behavior.
 
 ### Candidate ranking
 
@@ -359,12 +360,15 @@ copying stable code/message/hint and adding the source span.
 - Provider installation layouts, executable hashing, version probes, and view construction remain
   host tooling boundaries rather than evaluator `Fs` operations.
 - Provider version probing can execute candidate binaries for numeric/raw constraints. Evaluator
-  integration guards that execution with opaque/spawn-pin policy and refuses probes that would need
-  an unavailable filesystem sandbox; unrestricted standalone Reef APIs intentionally permit it.
+  integration guards that execution with opaque/spawn-pin policy and runs shipped probes through a
+  300 ms, 16 KiB, cancellation-aware filesystem-sandboxed capability. A requested sandbox is
+  fail-closed if enforcement is unavailable; unrestricted standalone Reef APIs intentionally use
+  the bounded ambient runner.
 - `reef fetch` can invoke network-capable `mise install`. Evaluator execution rechecks opaque policy,
-  spawn pins, and sandbox requirements before entering any provider hook; provider pins restrict which
-  hook may run. A required filesystem sandbox fails closed because installer wrapping is not yet in
-  the provider API.
+  spawn pins, and sandbox requirements before entering any provider hook; provider pins restrict
+  which hook may run. The shipped mise hook uses the same injected runner with a 15-minute wall and
+  256 KiB combined-output cap. Leash filesystem grants are OS-enforced or the installer is refused;
+  network access remains represented by the opaque policy decision rather than an OS network sandbox.
 - View symlinks are created beneath an owned, real directory forced to mode `0700`. Binding names
   must be one non-empty normal path component, targets must be absolute executable regular files,
   and a reused view must contain exactly the expected symlinks. A mismatch is atomically quarantined,
@@ -385,8 +389,8 @@ Same-cwd creation/edit/removal fingerprints, lock-save failure propagation, over
 admission, provider flood/timeout descendants, cache identity churn, poisoned-cache recovery, and
 runner-only/hermetic-only project and user scope discovery, denied version probes/fetch hooks,
 provider-pinned fetch selection, hostile view-link replacement/extra entries, binding path traversal,
-and symlinked view roots are covered. Remaining high-value evidence includes OS-sandboxed provider
-process execution and platform-specific view behavior beyond Unix.
+symlinked view roots, and live Landlock denial from both version probes and mise installers are
+covered. Remaining high-value evidence includes platform-specific provider/view behavior beyond Unix.
 
 ## Change checklist
 

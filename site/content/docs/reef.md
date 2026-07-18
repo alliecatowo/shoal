@@ -583,11 +583,9 @@ Reef is implemented and actively used for constrained external spawns, but it is
 - Windows provider executability, symlink views, and resolution semantics are deferred.
 - Scope discovery silently skips malformed/unreadable manifests.
 - A completely empty manifest, or one whose options retain their defaults, has no scope effect.
-- Evaluator scope cache does not notice manual same-directory edits.
 - Lockfiles are deliberately host-local; portable multi-platform artifact locking is not implied.
-- `reef fetch` is mise-only in the shipped provider stack. Restricted principals must allow its opaque installer effect and spawn pin; policies requiring a filesystem sandbox fail closed because provider installers cannot yet be wrapped by that backend.
+- `reef fetch` is mise-only in the shipped provider stack. Restricted principals must allow its opaque installer effect and spawn pin. Version probes and mise installers use bounded, cancellation-aware evaluator process authority; requested filesystem scopes are OS-sandboxed or fail closed when enforcement is unavailable. This does not provide an OS network sandbox.
 - General bare-path command heads do not use runners; spell `run(PATH)`.
-- Runner defaults outside the fixed fallback require an active tools-bearing scope.
 - Child evaluators inherit Reef/Leash context through the audited unified child constructor; future child routes must join that inventory.
 - Hermetic controls only the emitted `PATH`, not all process effects.
 - Provider inventory and `which --all` are host-dependent by design.

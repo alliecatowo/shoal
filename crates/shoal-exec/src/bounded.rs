@@ -78,6 +78,30 @@ pub fn run_bounded_command(
     timeout: Duration,
     output_cap: usize,
 ) -> io::Result<BoundedCommandOutput> {
+    run_bounded_command_inner(command, timeout, output_cap, None)
+}
+
+pub(crate) fn run_bounded_command_cancellable(
+    command: &mut Command,
+    timeout: Duration,
+    output_cap: usize,
+    cancel: &crate::CancelToken,
+) -> io::Result<BoundedCommandOutput> {
+    run_bounded_command_inner(command, timeout, output_cap, Some(cancel))
+}
+
+fn run_bounded_command_inner(
+    command: &mut Command,
+    timeout: Duration,
+    output_cap: usize,
+    cancel: Option<&crate::CancelToken>,
+) -> io::Result<BoundedCommandOutput> {
+    if cancel.is_some_and(crate::CancelToken::is_cancelled) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "bounded command cancelled before spawn",
+        ));
+    }
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -98,6 +122,7 @@ pub fn run_bounded_command(
     let start = Instant::now();
     let mut child = command.spawn()?;
     let pgid = child.id() as libc::pid_t;
+    let _process_group = cancel.map(|cancel| cancel.register_process_group(pgid));
     let stdout = match child.stdout.take() {
         Some(pipe) => pipe,
         None => return setup_failure(&mut child, pgid, "stdout pipe was not created"),
@@ -143,21 +168,27 @@ pub fn run_bounded_command(
         }
     };
 
-    let (status, timed_out, cleanup_error) = loop {
+    let (status, timed_out, cancelled, cleanup_error) = loop {
         match child.try_wait() {
             Ok(Some(status)) => {
                 // The leader may have forked background descendants which
                 // still hold the pipes. Terminate the remaining group before
                 // joining the readers.
                 let cleanup_error = kill_group(pgid).err();
-                break (status, false, cleanup_error);
+                break (status, false, false, cleanup_error);
             }
-            Ok(None) if start.elapsed() >= timeout => {
+            Ok(None)
+                if cancel.is_some_and(crate::CancelToken::is_cancelled)
+                    || start.elapsed() >= timeout =>
+            {
+                let cancelled = cancel.is_some_and(crate::CancelToken::is_cancelled);
                 stop_readers.store(true, Ordering::Release);
                 let (signalled, cleanup_error) = signal_owned_processes(&mut child, pgid);
                 if !signalled {
                     match child.try_wait() {
-                        Ok(Some(status)) => break (status, true, cleanup_error),
+                        Ok(Some(status)) => {
+                            break (status, !cancelled, cancelled, cleanup_error);
+                        }
                         Ok(None) => {
                             let _ = join_reader(stdout_reader);
                             let _ = join_reader(stderr_reader);
@@ -183,7 +214,7 @@ pub fn run_bounded_command(
                         return Err(error);
                     }
                 };
-                break (status, true, cleanup_error);
+                break (status, !cancelled, cancelled, cleanup_error);
             }
             Ok(None) => thread::sleep(Duration::from_millis(2)),
             Err(error) => {
@@ -204,6 +235,12 @@ pub fn run_bounded_command(
     }
     stdout_result?;
     stderr_result?;
+    if cancelled {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "bounded command cancelled",
+        ));
+    }
 
     let retained = take_retained(retained);
     Ok(BoundedCommandOutput {
@@ -393,6 +430,65 @@ fn signal_owned_processes(child: &mut Child, pgid: libc::pid_t) -> (bool, Option
 mod tests {
     use super::*;
     use std::fs;
+
+    fn bounded_spec(argv: Vec<std::ffi::OsString>, cwd: std::path::PathBuf) -> crate::ExecSpec {
+        crate::ExecSpec {
+            argv,
+            cwd,
+            env: Vec::new(),
+            stdin: crate::StdinSpec::Null,
+            mode: crate::ExecMode::Capture,
+            sandbox: None,
+            spill: None,
+        }
+    }
+
+    #[test]
+    fn bounded_exec_spec_honors_explicit_environment_and_cwd() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let spec = bounded_spec(
+            vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf '%s:%s' \"$REEF_SENTINEL\" \"$PWD\"".into(),
+            ],
+            directory.path().to_path_buf(),
+        );
+        let mut spec = spec;
+        spec.env.push(("REEF_SENTINEL".into(), "bounded".into()));
+        let output = crate::run_bounded(
+            spec,
+            Duration::from_secs(1),
+            1024,
+            &crate::CancelToken::new(),
+        )
+        .expect("bounded spec");
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("bounded:{}", directory.path().display())
+        );
+    }
+
+    #[test]
+    fn pre_cancelled_bounded_exec_spec_never_spawns() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let marker = directory.path().join("spawned");
+        let spec = bounded_spec(
+            vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                format!("touch '{}'", marker.display()).into(),
+            ],
+            directory.path().to_path_buf(),
+        );
+        let cancel = crate::CancelToken::new();
+        cancel.cancel();
+        let error = crate::run_bounded(spec, Duration::from_secs(1), 1024, &cancel)
+            .expect_err("cancelled bounded command");
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(!marker.exists());
+    }
 
     #[test]
     fn drains_both_pipes_while_retaining_only_combined_cap() {

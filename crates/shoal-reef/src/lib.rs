@@ -84,7 +84,7 @@ pub use lock::{LockEntry, LockError, Lockfile};
 pub use manifest::{ManifestError, ManifestKind, ReefManifest, ToolReq};
 pub use provider::{Candidate, Provider, ProviderCtx, ProviderError};
 pub use report::{ResolutionReport, ScopeDecision};
-pub use resolve::{LockNotice, Policy, Resolution, Resolver};
+pub use resolve::{LockNotice, Policy, ProbeExecution, Resolution, Resolver};
 pub use runner::{Invocation, RunnerTable, resolve_runner, sniff_shebang};
 pub use scope::{ChainKey, ScopeChain, ScopeEntry};
 pub use version::{Constraint, Version};

@@ -34,6 +34,12 @@ pub struct LockNotice {
     pub path: PathBuf,
 }
 
+/// Authority check and subprocess context used for one fresh probe pass.
+pub struct ProbeExecution<'a> {
+    pub guard: &'a mut dyn FnMut(&Candidate) -> ReefResult<()>,
+    pub context: &'a ProviderCtx,
+}
+
 /// A completed resolution.
 #[derive(Debug, Clone)]
 pub struct Resolution {
@@ -121,6 +127,32 @@ impl Resolver {
         notice: &mut dyn FnMut(&LockNotice),
         probe_guard: &mut dyn FnMut(&Candidate) -> ReefResult<()>,
     ) -> ReefResult<Resolution> {
+        let context = ProviderCtx::new(chain.cwd.clone());
+        self.resolve_with_probe_context(
+            name,
+            chain,
+            lock,
+            policy,
+            notice,
+            ProbeExecution {
+                guard: probe_guard,
+                context: &context,
+            },
+        )
+    }
+
+    /// Resolve through an explicitly supplied provider subprocess context.
+    /// Embedders use this to carry their environment, sandbox, and
+    /// cancellation authority into lazy version probes.
+    pub fn resolve_with_probe_context(
+        &self,
+        name: &str,
+        chain: &ScopeChain,
+        lock: &mut Lockfile,
+        policy: Policy,
+        notice: &mut dyn FnMut(&LockNotice),
+        probe: ProbeExecution<'_>,
+    ) -> ReefResult<Resolution> {
         let decision = self.effective_decision(chain, name)?;
 
         // Honor a valid, satisfying lock entry (with a drift check).
@@ -139,7 +171,14 @@ impl Resolver {
             .with_hint("run `reef lock` (or resolve interactively) to pin it"));
         }
 
-        self.resolve_fresh(name, chain, &decision, Some((lock, notice)), probe_guard)
+        self.resolve_fresh(
+            name,
+            chain,
+            &decision,
+            Some((lock, notice)),
+            probe.guard,
+            probe.context,
+        )
     }
 
     /// Force a fresh resolution and rewrite the lock entry (the `reef lock
@@ -164,9 +203,30 @@ impl Resolver {
         notice: &mut dyn FnMut(&LockNotice),
         probe_guard: &mut dyn FnMut(&Candidate) -> ReefResult<()>,
     ) -> ReefResult<Resolution> {
+        let context = ProviderCtx::new(chain.cwd.clone());
+        self.refresh_lock_with_probe_context(name, chain, lock, notice, probe_guard, &context)
+    }
+
+    /// Refresh through an explicitly supplied provider subprocess context.
+    pub fn refresh_lock_with_probe_context(
+        &self,
+        name: &str,
+        chain: &ScopeChain,
+        lock: &mut Lockfile,
+        notice: &mut dyn FnMut(&LockNotice),
+        probe_guard: &mut dyn FnMut(&Candidate) -> ReefResult<()>,
+        context: &ProviderCtx,
+    ) -> ReefResult<Resolution> {
         let decision = self.effective_decision(chain, name)?;
         lock.remove(name);
-        self.resolve_fresh(name, chain, &decision, Some((lock, notice)), probe_guard)
+        self.resolve_fresh(
+            name,
+            chain,
+            &decision,
+            Some((lock, notice)),
+            probe_guard,
+            context,
+        )
     }
 
     // --- internals ---------------------------------------------------------
@@ -299,14 +359,14 @@ impl Resolver {
         decision: &Decision,
         lock_and_notice: Option<(&mut Lockfile, &mut dyn FnMut(&LockNotice))>,
         probe_guard: &mut dyn FnMut(&Candidate) -> ReefResult<()>,
+        context: &ProviderCtx,
     ) -> ReefResult<Resolution> {
-        let ctx = ProviderCtx::new(chain.cwd.clone());
         let chosen = self
             .best_candidate(
                 name,
                 &decision.constraint,
                 decision.provider_pin.as_deref(),
-                &ctx,
+                context,
                 probe_guard,
             )?
             .ok_or_else(|| {
@@ -399,7 +459,7 @@ impl Resolver {
                 // Probe a version only when the constraint actually needs one.
                 if constraint.needs_version() && cand.version.is_unknown() {
                     probe_guard(&cand)?;
-                    cand.version = provider.version_of(&cand);
+                    cand.version = provider.version_of(&cand, ctx);
                 }
                 if constraint.satisfies(&cand.version) {
                     ranked.push((cand.version.clone(), idx, cand.path.clone(), cand));
@@ -543,7 +603,7 @@ mod tests {
                 )]
             }
 
-            fn version_of(&self, _candidate: &Candidate) -> Version {
+            fn version_of(&self, _candidate: &Candidate, _ctx: &ProviderCtx) -> Version {
                 self.called.store(true, Ordering::SeqCst);
                 Version::parse("1.2.3")
             }

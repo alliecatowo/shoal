@@ -46,6 +46,14 @@ pub fn which(name: &OsStr, path_var: Option<&OsStr>) -> Option<PathBuf> {
     None
 }
 
+/// Resolve an executable exactly as a child rooted at `cwd` would: relative
+/// and empty `PATH` entries are interpreted against that cwd rather than the
+/// host process's current directory.
+#[must_use]
+pub fn which_in(name: &OsStr, path_var: Option<&OsStr>, cwd: &Path) -> Option<PathBuf> {
+    which_from(name, path_var, cwd).ok().flatten()
+}
+
 fn is_executable_file(p: &Path) -> bool {
     match std::fs::metadata(p) {
         Ok(m) => m.is_file() && m.permissions().mode() & 0o111 != 0,
@@ -125,5 +133,32 @@ fn absolute_cwd(cwd: &Path) -> io::Result<PathBuf> {
         Ok(cwd.to_path_buf())
     } else {
         Ok(std::env::current_dir()?.join(cwd))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn which_in_resolves_relative_path_entries_from_child_cwd() {
+        let directory = tempfile::tempdir().unwrap();
+        let bin = directory.path().join("relative-bin");
+        std::fs::create_dir(&bin).unwrap();
+        let tool = bin.join("tool");
+        std::fs::write(&tool, b"fixture").unwrap();
+        let mut permissions = std::fs::metadata(&tool).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&tool, permissions).unwrap();
+
+        assert_eq!(
+            which_in(
+                OsStr::new("tool"),
+                Some(OsStr::new("relative-bin")),
+                directory.path(),
+            ),
+            Some(tool)
+        );
     }
 }

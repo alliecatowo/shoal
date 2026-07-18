@@ -108,14 +108,14 @@ impl Provider for SystemProvider {
         out
     }
 
-    fn version_of(&self, cand: &Candidate) -> Version {
+    fn version_of(&self, cand: &Candidate, ctx: &ProviderCtx) -> Version {
         let Ok(key) = VersionKey::for_path(&cand.path) else {
-            return probe_version(&cand.path);
+            return probe_version(&cand.path, ctx);
         };
         if let Some(v) = self.lock_cache().get(&key) {
             return v.clone();
         }
-        let v = probe_version(&cand.path);
+        let v = probe_version(&cand.path, ctx);
         let mut cache = self.lock_cache();
         if cache.len() >= MAX_VERSION_CACHE_ENTRIES && !cache.contains_key(&key) {
             cache.clear();
@@ -163,7 +163,7 @@ mod tests {
         make_exe(root.path(), "probed", "#!/bin/sh\necho 'probed 4.5.6'\n");
         let p = SystemProvider::new(vec![root.path().into()], vec![]);
         let cands = p.discover("probed", &ProviderCtx::new("/"));
-        let v = p.version_of(&cands[0]);
+        let v = p.version_of(&cands[0], &ProviderCtx::new("/"));
         assert_eq!(v.raw(), "4.5.6");
         // Cached path present.
         assert!(
@@ -204,7 +204,12 @@ mod tests {
             .expect("spawn version cache poisoner");
         assert!(poisoner.join().is_err());
 
-        assert_eq!(provider.version_of(&candidate).raw(), "4.5.6");
+        assert_eq!(
+            provider
+                .version_of(&candidate, &ProviderCtx::new("/"))
+                .raw(),
+            "4.5.6"
+        );
         assert!(!provider.cache.is_poisoned());
         assert_eq!(provider.lock_cache().len(), 1);
     }
@@ -219,7 +224,12 @@ mod tests {
         );
         let provider = SystemProvider::new(vec![root.path().into()], vec![]);
         let candidate = provider.discover("changing", &ProviderCtx::new("/"))[0].clone();
-        assert_eq!(provider.version_of(&candidate).raw(), "1.0.0");
+        assert_eq!(
+            provider
+                .version_of(&candidate, &ProviderCtx::new("/"))
+                .raw(),
+            "1.0.0"
+        );
 
         // A different length is part of the identity even on filesystems with
         // coarse mtimes, so an in-place replacement must be reprobed.
@@ -228,7 +238,12 @@ mod tests {
             "changing",
             "#!/bin/sh\necho 'changing 22.33.44'\n",
         );
-        assert_eq!(provider.version_of(&candidate).raw(), "22.33.44");
+        assert_eq!(
+            provider
+                .version_of(&candidate, &ProviderCtx::new("/"))
+                .raw(),
+            "22.33.44"
+        );
         assert_eq!(path, candidate.path);
     }
 
@@ -260,7 +275,12 @@ mod tests {
             root.path().join("current"),
             "system",
         );
-        assert_eq!(provider.version_of(&candidate).raw(), "3.2.1");
+        assert_eq!(
+            provider
+                .version_of(&candidate, &ProviderCtx::new("/"))
+                .raw(),
+            "3.2.1"
+        );
         assert_eq!(provider.lock_cache().len(), 1);
     }
 

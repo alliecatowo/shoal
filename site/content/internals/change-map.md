@@ -209,20 +209,25 @@ kinds without a schema discriminator.
 **Direction:** add an entry kind/parent-exec relation or choose one canonical lifecycle. Return IDs
 directly instead of inferring latest rows.
 
-### Medium: remaining WASM ABI and provider paths
+### Medium: WASM ABI evolution
 
-These are two separate, explicitly unimplemented surfaces:
+The remaining plugin surface is evolutionary rather than a missing execution path:
 
 | Gap | Source evidence | Architectural work required |
 |---|---|---|
 | WASM ABI evolution | preview ABI v1 is integrated with declared+authorized hostcalls and bounded values | keep new hostcalls effect-scoped, versioned, cancellable, and adversarially tested |
-| Reef provider subprocess sandboxing | restricted evaluator probes/installers fail closed when policy requires an OS filesystem sandbox | carry the sandboxed spawn capability into allowed provider subprocesses |
 
 Compilation admission is now closed as a concurrency-amplification gap: at most two component
 compilers run process-wide, callers wait at most a configured two seconds by default (with an
 immutable ten-second ceiling), and Wasmtime's optional parallel-compilation feature is disabled.
 The admitted compiler remains synchronous and cannot be epoch-interrupted; hard per-compilation
 preemption would require an isolated compiler process or trusted precompiled artifacts.
+
+Reef's shipped provider subprocess gap is also closed. Evaluator version probes and `mise install`
+receive an injected bounded runner carrying the session environment, cancellation epoch, and Leash
+filesystem sandbox. A requested provider sandbox is fail-closed when OS enforcement is unavailable;
+probe/install wall time and retained output are bounded. Third-party in-process `Provider`
+implementations remain trusted host code, as do all Rust trait implementations injected by a host.
 
 PTY change subscription is also absent; MCP callers poll rendered screens. Do not paper over these
 gaps with eager materialization or background threads without a lifecycle protocol.

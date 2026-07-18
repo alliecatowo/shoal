@@ -10,7 +10,10 @@
 //! probing is factored into [`Provider::version_of`] so the resolver can probe
 //! lazily, only when a constraint actually needs a concrete version.
 
-use std::path::PathBuf;
+use std::ffi::{OsStr, OsString};
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::version::{Constraint, Version};
@@ -56,15 +59,90 @@ impl Candidate {
     }
 }
 
+/// One bounded provider-side subprocess request. The runner, rather than the
+/// provider, owns environment, sandbox, and cancellation authority.
+pub struct ProviderCommand<'a> {
+    pub program: &'a Path,
+    pub args: &'a [OsString],
+    pub cwd: &'a Path,
+    pub timeout: Duration,
+    pub output_cap: usize,
+}
+
+/// Injectable authority for provider probes and installers.
+pub trait ProviderRunner: Send + Sync {
+    fn run(&self, command: ProviderCommand<'_>) -> io::Result<shoal_exec::BoundedCommandOutput>;
+}
+
+#[derive(Debug, Default)]
+struct AmbientProviderRunner;
+
+impl ProviderRunner for AmbientProviderRunner {
+    fn run(&self, command: ProviderCommand<'_>) -> io::Result<shoal_exec::BoundedCommandOutput> {
+        let mut process = std::process::Command::new(command.program);
+        process.args(command.args).current_dir(command.cwd);
+        shoal_exec::run_bounded_command(&mut process, command.timeout, command.output_cap)
+    }
+}
+
 /// Context passed to provider operations.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ProviderCtx {
     pub cwd: PathBuf,
+    runner: Arc<dyn ProviderRunner>,
+    path_env: Option<OsString>,
+}
+
+impl std::fmt::Debug for ProviderCtx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderCtx")
+            .field("cwd", &self.cwd)
+            .field("path_env", &self.path_env)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ProviderCtx {
     pub fn new(cwd: impl Into<PathBuf>) -> ProviderCtx {
-        ProviderCtx { cwd: cwd.into() }
+        ProviderCtx {
+            cwd: cwd.into(),
+            runner: Arc::new(AmbientProviderRunner),
+            path_env: std::env::var_os("PATH"),
+        }
+    }
+
+    pub fn with_runner(
+        cwd: impl Into<PathBuf>,
+        path_env: Option<OsString>,
+        runner: Arc<dyn ProviderRunner>,
+    ) -> ProviderCtx {
+        ProviderCtx {
+            cwd: cwd.into(),
+            runner,
+            path_env,
+        }
+    }
+
+    pub fn run(
+        &self,
+        program: &Path,
+        args: &[OsString],
+        timeout: Duration,
+        output_cap: usize,
+    ) -> io::Result<shoal_exec::BoundedCommandOutput> {
+        self.runner.run(ProviderCommand {
+            program,
+            args,
+            cwd: &self.cwd,
+            timeout,
+            output_cap,
+        })
+    }
+
+    /// Resolve a provider helper against this context's exact `PATH`, treating
+    /// relative and empty components relative to the provider cwd.
+    pub fn which(&self, name: &OsStr) -> Option<PathBuf> {
+        shoal_exec::which_in(name, self.path_env.as_deref(), &self.cwd)
     }
 }
 
@@ -103,7 +181,7 @@ pub trait Provider: Send + Sync {
 
     /// Resolve the concrete version of a candidate, probing if necessary and
     /// caching the result. Default: return whatever `discover` already knew.
-    fn version_of(&self, cand: &Candidate) -> Version {
+    fn version_of(&self, cand: &Candidate, _ctx: &ProviderCtx) -> Version {
         cand.version.clone()
     }
 
@@ -131,15 +209,13 @@ const PROBE_OUTPUT_CAP: usize = 16 * 1024;
 /// Run `<path> --version` with a hard timeout and parse a version leniently from
 /// its output. Returns [`Version::unknown`] on timeout, spawn failure, or when no
 /// version-shaped token is found. Never blocks longer than [`PROBE_TIMEOUT`].
-pub(crate) fn probe_version(path: &std::path::Path) -> Version {
-    let mut command = std::process::Command::new(path);
-    command.arg("--version");
-    let output =
-        match shoal_exec::run_bounded_command(&mut command, PROBE_TIMEOUT, PROBE_OUTPUT_CAP) {
-            Ok(output) if !output.timed_out => output,
-            Err(_) => return Version::unknown(),
-            Ok(_) => return Version::unknown(),
-        };
+pub(crate) fn probe_version(path: &std::path::Path, ctx: &ProviderCtx) -> Version {
+    let args = [OsString::from("--version")];
+    let output = match ctx.run(path, &args, PROBE_TIMEOUT, PROBE_OUTPUT_CAP) {
+        Ok(output) if !output.timed_out => output,
+        Err(_) => return Version::unknown(),
+        Ok(_) => return Version::unknown(),
+    };
 
     let mut out = String::from_utf8_lossy(&output.stdout).into_owned();
     out.push(' ');
@@ -186,6 +262,8 @@ mod tests {
     use std::fs;
     use std::io;
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::ExitStatusExt;
+    use std::sync::Mutex;
     use std::thread;
     use std::time::Instant;
 
@@ -199,6 +277,42 @@ mod tests {
         (dir, path)
     }
 
+    #[derive(Default)]
+    struct RecordingRunner {
+        calls: Mutex<Vec<RecordedCall>>,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct RecordedCall {
+        program: PathBuf,
+        args: Vec<OsString>,
+        timeout: Duration,
+        output_cap: usize,
+    }
+
+    impl ProviderRunner for RecordingRunner {
+        fn run(
+            &self,
+            command: ProviderCommand<'_>,
+        ) -> io::Result<shoal_exec::BoundedCommandOutput> {
+            self.calls.lock().unwrap().push(RecordedCall {
+                program: command.program.to_path_buf(),
+                args: command.args.to_vec(),
+                timeout: command.timeout,
+                output_cap: command.output_cap,
+            });
+            Ok(shoal_exec::BoundedCommandOutput {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: b"fixture 7.8.9\n".to_vec(),
+                stderr: Vec::new(),
+                truncated: false,
+                timed_out: false,
+                pgid: 1,
+                duration: Duration::ZERO,
+            })
+        }
+    }
+
     #[test]
     fn parse_version_token_variants() {
         assert_eq!(parse_version_token("git version 2.43.0").raw(), "2.43.0");
@@ -210,8 +324,48 @@ mod tests {
 
     #[test]
     fn probe_missing_binary_is_unknown() {
-        let v = probe_version(std::path::Path::new("/nonexistent/tool/xyz"));
+        let v = probe_version(
+            std::path::Path::new("/nonexistent/tool/xyz"),
+            &ProviderCtx::new("/"),
+        );
         assert!(v.is_unknown());
+    }
+
+    #[test]
+    fn probe_uses_injected_runner_with_exact_resource_budget() {
+        let runner = Arc::new(RecordingRunner::default());
+        let context = ProviderCtx::with_runner("/work", None, runner.clone());
+        let version = probe_version(Path::new("/fixture/tool"), &context);
+        assert_eq!(version.raw(), "7.8.9");
+        assert_eq!(
+            *runner.calls.lock().unwrap(),
+            vec![RecordedCall {
+                program: PathBuf::from("/fixture/tool"),
+                args: vec![OsString::from("--version")],
+                timeout: PROBE_TIMEOUT,
+                output_cap: PROBE_OUTPUT_CAP,
+            }]
+        );
+    }
+
+    #[test]
+    fn shipped_provider_hooks_do_not_reacquire_process_authority() {
+        for (name, source) in [
+            ("mise", include_str!("mise.rs")),
+            ("system", include_str!("system.rs")),
+        ] {
+            for forbidden in [
+                "std::process::Command",
+                "Command::new(",
+                ".status()",
+                ".output()",
+            ] {
+                assert!(
+                    !source.contains(forbidden),
+                    "{name} provider bypasses ProviderRunner with `{forbidden}`"
+                );
+            }
+        }
     }
 
     #[test]
@@ -220,7 +374,7 @@ mod tests {
             "printf 'hostile-tool 1.2.3\\n'; i=0; while [ $i -lt 50000 ]; do printf 0123456789; i=$((i+1)); done",
         );
         let start = Instant::now();
-        let version = probe_version(&tool);
+        let version = probe_version(&tool, &ProviderCtx::new("/"));
         assert_eq!(version.raw(), "1.2.3");
         assert!(start.elapsed() < Duration::from_secs(1));
     }
@@ -233,7 +387,7 @@ mod tests {
         let (_tool_dir, tool) = executable_script(&script);
 
         let start = Instant::now();
-        assert!(probe_version(&tool).is_unknown());
+        assert!(probe_version(&tool, &ProviderCtx::new("/")).is_unknown());
         assert!(start.elapsed() < Duration::from_secs(1));
 
         let descendant: libc::pid_t = fs::read_to_string(descendant_path)

@@ -460,7 +460,7 @@ See [Command adapters](@/docs/adapters.md) for parser and schema contracts.
 
 ## Reef-aware agent work
 
-Read `shoal://session/reef` before assuming a tool version/provider. Reef resolution is lazy and the evaluator caches its discovered scope; same-cwd manifest changes may not be noticed until a relevant state transition/restart.
+Read `shoal://session/reef` before assuming a tool version/provider. Reef resolution is lazy. The evaluator fingerprints every manifest candidate and adjacent lock from cwd to root, so same-cwd creation, edits, replacement, and removal invalidate its cached scope on the next relevant resolution.
 
 When reproducibility matters:
 

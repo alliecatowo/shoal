@@ -12,7 +12,9 @@ use std::sync::Arc;
 
 use shoal_eval::Evaluator;
 use shoal_leash::Policy as LeashPolicy;
-use shoal_reef::provider::{Candidate, Provider, ProviderCtx, ProviderError, SystemProvider};
+use shoal_reef::provider::{
+    Candidate, MiseProvider, Provider, ProviderCtx, ProviderError, SystemProvider,
+};
 use shoal_reef::{Constraint, Resolver, Version};
 use shoal_value::Value;
 
@@ -41,6 +43,52 @@ fn fixture_resolver(bindir: &Path) -> Arc<Resolver> {
 
 fn parse(src: &str) -> shoal_ast::Program {
     shoal_syntax::parse(src).expect("fixture source parses")
+}
+
+fn ensure_sandbox_helper() {
+    let executable = std::env::current_exe().unwrap();
+    let deps = executable.parent().unwrap();
+    let debug = deps.parent().unwrap();
+    if debug.join("shoal-sandbox-exec").is_file() || deps.join("shoal-sandbox-exec").is_file() {
+        return;
+    }
+    let target = debug.parent().unwrap();
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let status = std::process::Command::new(cargo)
+        .args(["build", "-p", "shoal-exec", "--bin", "shoal-sandbox-exec"])
+        .env("CARGO_TARGET_DIR", target)
+        .status()
+        .expect("build sandbox helper");
+    assert!(status.success(), "sandbox helper build failed");
+}
+
+fn scoped_provider_policy(read: &[&Path], write: &[&Path]) -> LeashPolicy {
+    let mut read_grants: Vec<String> = read
+        .iter()
+        .map(|path| format!("{}/**", path.display()))
+        .collect();
+    for system in ["/usr", "/bin", "/lib", "/lib64", "/etc"] {
+        if Path::new(system).exists() {
+            read_grants.push(format!("{system}/**"));
+        }
+    }
+    let render = |grants: &[String]| {
+        grants
+            .iter()
+            .map(|grant| format!("\"{grant}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let write_grants: Vec<String> = write
+        .iter()
+        .map(|path| format!("{}/**", path.display()))
+        .collect();
+    LeashPolicy::from_toml(&format!(
+        "[principal.agent]\nopaque='allow'\n\n[principal.agent.fs]\nread=[{}]\nwrite=[{}]\n",
+        render(&read_grants),
+        render(&write_grants),
+    ))
+    .expect("provider sandbox policy")
 }
 
 /// The manifest filenames `ScopeChain::discover` (site/content/internals/reef-resolution.md) looks for
@@ -205,6 +253,124 @@ fn restricted_principal_denies_provider_fetch_before_installer_hook() {
         .expect_err("opaque-denying principal must reject provider fetch");
     assert_eq!(error.code, "spawn_denied");
     assert!(!marker.exists(), "denied provider hook must never run");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn scoped_principal_runs_version_probe_inside_filesystem_sandbox() {
+    if shoal_leash::landlock_abi().is_none() {
+        eprintln!("Landlock unavailable; skipping provider sandbox assertion");
+        return;
+    }
+    ensure_sandbox_helper();
+    let directory = tempfile::tempdir().unwrap();
+    let binaries = directory.path().join("bin");
+    std::fs::create_dir(&binaries).unwrap();
+    std::fs::write(
+        directory.path().join(".reef.toml"),
+        "[tools]\nguarded = '1.2.3'\n",
+    )
+    .unwrap();
+    let forbidden = directory.path().join("probe-escaped");
+    let binary = binaries.join("guarded");
+    std::fs::write(
+        &binary,
+        format!(
+            "#!/bin/sh\nif touch '{}'; then exit 91; fi\necho 'guarded 1.2.3'\n",
+            forbidden.display()
+        ),
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&binary).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&binary, permissions).unwrap();
+
+    let mut evaluator = Evaluator::new(directory.path().to_path_buf());
+    evaluator.set_interactive(true);
+    evaluator.set_reef_resolver(fixture_resolver(&binaries));
+    evaluator.set_leash_policy(scoped_provider_policy(&[&binaries], &[]), "agent");
+    let Value::Outcome(outcome) = evaluator
+        .eval_program(&parse("which guarded"))
+        .expect("sandboxed probe resolves")
+    else {
+        panic!("which must return an outcome");
+    };
+    let Some(Value::Record(result)) = outcome.parsed.as_ref() else {
+        panic!("which must carry a record");
+    };
+    assert_eq!(result.get("version"), Some(&Value::Str("1.2.3".into())));
+    assert!(!forbidden.exists(), "probe escaped its filesystem sandbox");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn scoped_principal_runs_mise_installer_inside_filesystem_sandbox() {
+    if shoal_leash::landlock_abi().is_none() {
+        eprintln!("Landlock unavailable; skipping provider sandbox assertion");
+        return;
+    }
+    ensure_sandbox_helper();
+    let directory = tempfile::tempdir().unwrap();
+    let helpers = directory.path().join("helpers");
+    let data = directory.path().join("mise-data");
+    std::fs::create_dir(&helpers).unwrap();
+    std::fs::create_dir(&data).unwrap();
+    std::fs::write(
+        directory.path().join(".reef.toml"),
+        "[tools]\nguarded = { version = '1.2.3', provider = 'mise' }\n",
+    )
+    .unwrap();
+    let forbidden = directory.path().join("installer-escaped");
+    let installed = data.join("installs/guarded/1.2.3/bin/guarded");
+    let mise = helpers.join("mise");
+    std::fs::write(
+        &mise,
+        format!(
+            "#!/bin/sh\n\
+             if touch '{}'; then exit 91; fi\n\
+             mkdir -p '{}'\n\
+             printf '#!/bin/sh\\necho guarded\\n' > '{}'\n\
+             chmod 755 '{}'\n",
+            forbidden.display(),
+            installed.parent().unwrap().display(),
+            installed.display(),
+            installed.display(),
+        ),
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&mise).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&mise, permissions).unwrap();
+
+    let mut evaluator = Evaluator::new(directory.path().to_path_buf());
+    evaluator.set_reef_resolver(Arc::new(Resolver::new(vec![Box::new(MiseProvider::new(
+        data.clone(),
+    ))])));
+    evaluator.set_leash_policy(
+        scoped_provider_policy(&[&helpers, &data], &[&data]),
+        "agent",
+    );
+    evaluator
+        .eval_program(&parse(&format!(
+            "env.PATH = \"{}:/usr/bin:/bin\"",
+            helpers.display()
+        )))
+        .expect("set session PATH");
+    let Value::Outcome(outcome) = evaluator
+        .eval_program(&parse("reef fetch guarded"))
+        .expect("sandboxed installer succeeds")
+    else {
+        panic!("reef fetch must return an outcome");
+    };
+    let Some(Value::Record(result)) = outcome.parsed.as_ref() else {
+        panic!("reef fetch must carry a record");
+    };
+    assert_eq!(result.get("fetched"), Some(&Value::Bool(true)));
+    assert!(installed.is_file());
+    assert!(
+        !forbidden.exists(),
+        "installer escaped its filesystem sandbox"
+    );
 }
 
 #[test]

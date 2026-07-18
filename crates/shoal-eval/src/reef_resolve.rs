@@ -9,17 +9,50 @@
 
 use super::*;
 
+use shoal_reef::provider::{ProviderCommand, ProviderCtx, ProviderRunner};
 use shoal_reef::{
-    Binding, Candidate, LockNotice, ManifestKind, Policy, ReefError, ReefResult, Resolver,
-    ScopeChain, ScopeEntry, ViewConfig, default_view_root, synth_path,
+    Binding, Candidate, LockNotice, ManifestKind, Policy, ProbeExecution, ReefError, ReefResult,
+    Resolver, ScopeChain, ScopeEntry, ViewConfig, default_view_root, synth_path,
 };
+
+struct EvaluatorProviderRunner {
+    exec: Arc<dyn Exec>,
+    env: Vec<(OsString, OsString)>,
+    sandbox: Option<SandboxPolicy>,
+    cancel: CancelToken,
+}
+
+impl ProviderRunner for EvaluatorProviderRunner {
+    fn run(
+        &self,
+        command: ProviderCommand<'_>,
+    ) -> std::io::Result<shoal_exec::BoundedCommandOutput> {
+        let mut argv = Vec::with_capacity(command.args.len() + 1);
+        argv.push(command.program.as_os_str().to_owned());
+        argv.extend(command.args.iter().cloned());
+        self.exec.run_bounded(
+            ExecSpec {
+                argv,
+                cwd: command.cwd.to_path_buf(),
+                env: self.env.clone(),
+                stdin: StdinSpec::Null,
+                mode: ExecMode::Capture,
+                sandbox: self.sandbox.clone(),
+                spill: None,
+            },
+            command.timeout,
+            command.output_cap,
+            &self.cancel,
+        )
+    }
+}
 
 impl Evaluator {
     /// Fail closed before Reef executes an unknown-version candidate as
     /// `<candidate> --version`. Probes are opaque code execution: a restricted
-    /// principal must allow opaque effects and any active spawn pin, and a
-    /// principal requiring an OS filesystem sandbox cannot use this currently
-    /// unwrapped probe path.
+    /// principal must allow opaque effects and any active spawn pin. Execution
+    /// happens separately through [`EvaluatorProviderRunner`], which carries
+    /// the active filesystem sandbox and cancellation epoch.
     pub(crate) fn reef_probe_guard(&self, candidate: &Candidate) -> ReefResult<()> {
         let Some((policy, principal)) = self.session.leash.as_ref() else {
             return Ok(());
@@ -27,13 +60,6 @@ impl Evaluator {
         if policy.evaluate_effect(principal, &Effect::Opaque) != shoal_leash::Verdict::Allow {
             return Err(ReefError::provider(format!(
                 "version probe for {} denied: principal `{principal}` does not allow opaque effects",
-                candidate.path.display()
-            ))
-            .with_hint("lock the tool in an unrestricted trusted session before using it here"));
-        }
-        if policy.sandbox_for(principal).is_some() {
-            return Err(ReefError::provider(format!(
-                "version probe for {} denied: the principal requires filesystem sandboxing that Reef probes cannot yet apply",
                 candidate.path.display()
             ))
             .with_hint("lock the tool in an unrestricted trusted session before using it here"));
@@ -58,9 +84,8 @@ impl Evaluator {
 
     /// `fetch` is an explicit but opaque installer spawn. Enforce the active
     /// evaluator policy again at execution time so embedded/non-kernel hosts
-    /// cannot bypass the plan verdict. The current provider API cannot wrap
-    /// install commands in the OS sandbox, so scoped filesystem principals
-    /// fail closed instead of running an unconfined installer.
+    /// cannot bypass the plan verdict. Provider execution separately carries
+    /// the active filesystem sandbox and cancellation epoch.
     pub(crate) fn reef_fetch_guard(&self) -> VResult<()> {
         let Some((policy, principal)) = self.session.leash.as_ref() else {
             return Ok(());
@@ -69,12 +94,6 @@ impl Evaluator {
             return Err(ErrorVal::new(
                 "spawn_denied",
                 format!("reef fetch denied: principal `{principal}` does not allow opaque effects"),
-            ));
-        }
-        if policy.sandbox_for(principal).is_some() {
-            return Err(ErrorVal::new(
-                "spawn_denied",
-                "reef fetch denied: the principal requires filesystem sandboxing that provider installers cannot yet apply",
             ));
         }
         if policy.spawn_pinning_active(principal) {
@@ -87,6 +106,26 @@ impl Evaluator {
             self.spawn_gate(mise.as_os_str(), None, Span::default())?;
         }
         Ok(())
+    }
+
+    pub(crate) fn reef_provider_context(&self, cwd: PathBuf) -> ProviderCtx {
+        let path_env = self
+            .exec
+            .shell
+            .process_env
+            .iter()
+            .find(|(name, _)| name == "PATH")
+            .map(|(_, value)| value.clone());
+        ProviderCtx::with_runner(
+            cwd,
+            path_env,
+            Arc::new(EvaluatorProviderRunner {
+                exec: self.host.exec.clone(),
+                env: self.exec.shell.process_env.clone(),
+                sandbox: self.resolve_sandbox(),
+                cancel: self.exec.control.cancel.clone(),
+            }),
+        )
     }
 
     // --- chain cache -------------------------------------------------------
@@ -282,7 +321,7 @@ impl Evaluator {
             .iter()
             .find(|(k, _)| k == "PATH")
             .map(|(_, v)| v.as_os_str());
-        shoal_exec::which(OsStr::new(name), path_env)
+        shoal_exec::which_in(OsStr::new(name), path_env, &self.exec.shell.cwd)
     }
 
     // --- spawn-time resolution (site/content/internals/reef-resolution.md) -------------------------------
@@ -340,13 +379,17 @@ impl Evaluator {
         let resolver = self.reef_resolver();
         let mut lock = self.exec.reef.lock.clone();
         let mut notice: Option<LockNotice> = None;
-        let outcome = resolver.resolve_with_probe_guard(
+        let provider_context = self.reef_provider_context(chain.cwd.clone());
+        let outcome = resolver.resolve_with_probe_context(
             &name,
             &chain,
             &mut lock,
             policy,
             &mut |n| notice = Some(n.clone()),
-            &mut |candidate| self.reef_probe_guard(candidate),
+            ProbeExecution {
+                guard: &mut |candidate| self.reef_probe_guard(candidate),
+                context: &provider_context,
+            },
         );
         let resolution = match outcome {
             Ok(r) => r,

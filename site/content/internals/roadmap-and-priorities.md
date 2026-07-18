@@ -386,13 +386,14 @@ manifests now establish scope without tool constraints.
 The former cwd-only evaluator cache now uses a fixed-size metadata identity over every candidate and
 adjacent lock, including missing paths. Security-sensitive executable identity remains content-hashed.
 Version probes execute code. Evaluator integration now checks opaque authority and spawn pins before
-execution and fails closed when policy would require an unavailable OS sandbox. Applying the sandbox
-to provider probe/installer processes, rather than refusing them, remains open.
+execution. Shipped probes and mise installers run through an injected bounded provider-command
+capability carrying the evaluator's environment, cancellation, and Leash filesystem sandbox; a
+requested sandbox remains fail-closed when OS enforcement is unavailable.
 
 **Evidence.** Same-cwd manifest/lock replacement, lock-write failure, executable/view replacement,
-tool-free runner/hermetic scopes, denied probe/fetch hooks, and pinned-provider fetch selection are
-covered. Remaining exit evidence is restart-level deterministic lock/view behavior under strict mode
-and actual sandbox wrapping for allowed provider subprocesses.
+tool-free runner/hermetic scopes, denied probe/fetch hooks, pinned-provider fetch selection, and live
+Landlock wrapping for allowed probes/installers are covered. Remaining exit evidence is restart-level
+deterministic lock/view behavior under strict mode.
 
 ### P2.2 Configuration contract honesty
 

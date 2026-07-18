@@ -11,6 +11,7 @@
 use shoal_exec::{CancelToken, ExecResult, ExecSpec};
 use shoal_value::SecretPort;
 use std::path::PathBuf;
+use std::time::Duration;
 
 // ---------------------------------------------------------------------------
 // Exec — external-process spawn port
@@ -23,6 +24,22 @@ pub trait Exec: Send + Sync {
     /// Spawn a child per `spec`, honoring `cancel`, returning the captured
     /// result — a thin wrapper over [`shoal_exec::run`].
     fn run(&self, spec: ExecSpec, cancel: &CancelToken) -> std::io::Result<ExecResult>;
+
+    /// Run a hostile-input-safe short provider command. The default denies the
+    /// capability so custom hosts cannot accidentally route provider hooks
+    /// around their process adapter.
+    fn run_bounded(
+        &self,
+        _spec: ExecSpec,
+        _timeout: Duration,
+        _output_cap: usize,
+        _cancel: &CancelToken,
+    ) -> std::io::Result<shoal_exec::BoundedCommandOutput> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "the installed execution port does not support bounded provider commands",
+        ))
+    }
 }
 
 /// The default [`Exec`] adapter: [`shoal_exec::run`] verbatim.
@@ -32,6 +49,16 @@ pub struct StdExec;
 impl Exec for StdExec {
     fn run(&self, spec: ExecSpec, cancel: &CancelToken) -> std::io::Result<ExecResult> {
         shoal_exec::run(spec, cancel)
+    }
+
+    fn run_bounded(
+        &self,
+        spec: ExecSpec,
+        timeout: Duration,
+        output_cap: usize,
+        cancel: &CancelToken,
+    ) -> std::io::Result<shoal_exec::BoundedCommandOutput> {
+        shoal_exec::run_bounded(spec, timeout, output_cap, cancel)
     }
 }
 
