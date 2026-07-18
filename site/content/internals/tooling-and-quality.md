@@ -77,7 +77,7 @@ typed schema errors, structural limits, and policy-specific admission therefore 
 
 ## Normative conformance corpus
 
-`spec/cases/` contains 79 TOML suite files and 1,363 `[[case]]` records. Cases declare globally named
+`spec/cases/` contains 79 TOML suite files and 1,364 `[[case]]` records. Cases declare globally named
 source, expected rendered value or stable error code, optional message substring, parse-error
 expectation, filesystem fixtures, and an explicit skip reason.
 

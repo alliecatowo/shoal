@@ -16,6 +16,7 @@
 //! `methods/stream.rs`), which preserves exact whole-stream replay.
 
 use super::{CallCtx, Pull, StreamGap, StreamGapReason, Upstream, VResult, Value};
+use crate::{OpaqueHandling, RetainedLimits, retained_size};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -24,12 +25,14 @@ use std::time::Duration;
 /// bounded but name no size for tee forks; this matches the live sources'
 /// default buffer cap (shoal-eval's `streams.rs`).
 pub(super) const TEE_QUEUE_CAP: usize = 64;
+const TEE_QUEUE_MAX_RETAINED_BYTES: usize = 1024 * 1024;
 
 /// One fork's pending items plus the count of items coalesced away while the
 /// queue was full — owed to the fork as a single `{dropped: n}` marker.
 #[derive(Default)]
 struct ForkQueue {
-    buf: VecDeque<Value>,
+    buf: VecDeque<(Value, usize)>,
+    retained_bytes: usize,
     dropped: u64,
 }
 
@@ -38,22 +41,49 @@ impl ForkQueue {
     /// queue drops the item and counts it. An owed marker is enqueued first
     /// (keeping the marker *in order*, before any post-gap item) as soon as
     /// room appears.
-    fn push(&mut self, v: Value) {
+    fn push(&mut self, v: &Value) {
         if self.dropped > 0 && self.buf.len() < TEE_QUEUE_CAP {
             let n = std::mem::take(&mut self.dropped);
-            self.buf.push_back(dropped_marker(n));
+            let marker = dropped_marker(n);
+            if !self.try_push(&marker, TEE_QUEUE_CAP, TEE_QUEUE_MAX_RETAINED_BYTES) {
+                self.dropped = n.saturating_add(1);
+                return;
+            }
         }
-        if self.buf.len() < TEE_QUEUE_CAP {
-            self.buf.push_back(v);
-        } else {
-            self.dropped += 1;
+        if !self.try_push(v, TEE_QUEUE_CAP, TEE_QUEUE_MAX_RETAINED_BYTES) {
+            self.dropped = self.dropped.saturating_add(1);
         }
+    }
+
+    fn try_push(&mut self, v: &Value, max_items: usize, max_bytes: usize) -> bool {
+        if self.buf.len() >= max_items {
+            return false;
+        }
+        let Ok(retained) = retained_size(
+            v,
+            RetainedLimits {
+                max_bytes: max_bytes.saturating_sub(self.retained_bytes),
+                max_depth: 64,
+                max_nodes: 16_384,
+                opaque: OpaqueHandling::Charge(256),
+                allow_secret: true,
+            },
+        ) else {
+            return false;
+        };
+        let Some(total) = self.retained_bytes.checked_add(retained) else {
+            return false;
+        };
+        self.retained_bytes = total;
+        self.buf.push_back((v.clone(), retained));
+        true
     }
 
     /// Next queued element: a buffered item, or the owed `{dropped: n}` marker
     /// when the queue drained while drops were still pending.
     fn pop(&mut self) -> Option<Value> {
-        if let Some(v) = self.buf.pop_front() {
+        if let Some((v, retained)) = self.buf.pop_front() {
+            self.retained_bytes = self.retained_bytes.saturating_sub(retained);
             return Some(v);
         }
         (self.dropped > 0).then(|| dropped_marker(std::mem::take(&mut self.dropped)))
@@ -117,7 +147,7 @@ impl Upstream for TeeHandle {
                 let idx = self.idx;
                 for (i, q) in g.queues.iter_mut().enumerate() {
                     if i != idx {
-                        q.push(v.clone());
+                        q.push(&v);
                     }
                 }
                 Ok(Pull::Item(v))
@@ -227,5 +257,19 @@ mod tests {
             .expect("test module marker remains present");
         assert!(!production.contains(".lock().unwrap()"));
         assert!(!production.contains(".lock().expect("));
+    }
+
+    #[test]
+    fn oversized_fork_item_becomes_an_explicit_gap_without_retention() {
+        let mut queue = ForkQueue::default();
+        queue.push(&Value::Str("x".repeat(TEE_QUEUE_MAX_RETAINED_BYTES + 1)));
+        assert!(queue.buf.is_empty());
+        assert_eq!(queue.retained_bytes, 0);
+        assert_eq!(queue.dropped, 1);
+        let marker = queue.pop().expect("an oversized item leaves a gap marker");
+        match marker {
+            Value::Record(record) => assert_eq!(record["dropped"], Value::Int(1)),
+            other => panic!("expected stream gap, got {other:?}"),
+        }
     }
 }

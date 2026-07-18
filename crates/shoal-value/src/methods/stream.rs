@@ -80,6 +80,12 @@ pub(crate) fn stream_method(
         // bounded per-fork queues (`stream/tee.rs`).
         "tee" => {
             let n = int_arg(&args, 0, 2)?;
+            if n == 0 || n > StreamVal::TEE_MAX_FORKS {
+                return Err(ErrorVal::arg_error(format!(
+                    "tee count must be between 1 and {}",
+                    StreamVal::TEE_MAX_FORKS
+                )));
+            }
             if s.is_bounded() {
                 super::list::tee(Value::List(collect_stream(ctx, &s)?), n)
             } else {

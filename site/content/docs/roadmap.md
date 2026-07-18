@@ -446,7 +446,7 @@ These happen alongside priority waves:
 
 ### Conformance growth
 
-The current 1,363 cases exceed the original 1,000-case target, but every bug fix/feature needs a minimal regression. Focus new cases on:
+The current 1,364 cases exceed the original 1,000-case target, but every bug fix/feature needs a minimal regression. Focus new cases on:
 
 - precedence and command-resolution collisions;
 - error spans/hints and method receiver boundaries;

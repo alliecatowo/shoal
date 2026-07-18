@@ -14,7 +14,7 @@ toc = true
 
 Shoal is a substantial, working preview—not a production-hardened login shell or multi-tenant agent sandbox. The language, structured shell, adapters, Reef resolver, journal/undo, kernel, MCP tools/resources/events, PTYs, LSP, prompt, and configuration system all execute real code today. The current security model still requires a fully trusted local kernel socket, and several protocol/operational contracts need hardening before consequential unattended deployment.
 
-This page is dated because status prose goes stale. It was checked against the source tree and the 1,363-case conformance corpus on **2026-07-18**.
+This page is dated because status prose goes stale. It was checked against the source tree and the 1,364-case conformance corpus on **2026-07-18**.
 
 ## Readiness in one table
 
@@ -49,8 +49,8 @@ The documentation uses these labels:
 The language contract lives in `spec/cases/*.toml`:
 
 ```text
-1,363 cases
-1,359 passed
+1,364 cases
+1,360 passed
 0 failed
 4 skipped
 ```
@@ -230,6 +230,7 @@ constraints. New methods must update metadata and executable coverage together.
 - `.distinct(limit?)` defaults to 4,096 identities and is exact up to that caller/default limit and a 16 MiB retained-history ceiling, then raises `stream_distinct_limit`; use a smaller limit, finite/taken stream, or `.dedupe()` for adjacent suppression.
 - count and duration `.window(...)` stages retain at most 4,096 items and 16 MiB; count admission rejects larger requests and live duration windows raise `stream_window_limit` rather than evicting within the requested time range.
 - bounded stream collection retains at most 16,384 values and 16 MiB; explicit `.collect()`, bounded exact `.tee()`, `for` over a stream, and eager method fallback share `stream_collect_limit`.
+- `.tee(n)` admits at most 64 forks. Live forks queue at most 64 values / 1 MiB each and surface item/byte overflow as ordered `tee_overflow` gap records.
 - live `.tee(n)` uses 64-entry per-fork queues; overflow drops values and inserts a `{dropped:n}` marker rather than raising.
 - collecting/sorting/grouping a stream marked unbounded raises `stream_unbounded`; inaccurate custom-source boundedness metadata remains an embedder responsibility.
 - live timing/filesystem sources remain host-dependent despite deterministic core combinators.

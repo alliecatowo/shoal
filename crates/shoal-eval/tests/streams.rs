@@ -305,6 +305,11 @@ fn single_consumption_enforced() {
 }
 
 #[test]
+fn tee_fork_count_is_bounded_before_source_consumption() {
+    assert_eq!(run_err("[1].stream().tee(65)"), "arg_error");
+}
+
+#[test]
 fn each_drives_a_stream_to_a_channel() {
     // `.each` sink runs the closure per item; combined with `channel.emit`, it is
     // a fully in-language side-effecting consumer.

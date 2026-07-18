@@ -704,7 +704,7 @@ Durations must be non-negative. Window count must be positive. `merge`/`zip` req
 | `collect()` | list | requires bounded metadata; capped at 16,384 values / 16 MiB |
 | `save(path)` | path | appends one encoded line per item |
 | `append(path)` | path | same implementation as stream `save` today |
-| `tee(n=2)` | list of streams | bounded replay or live shared queues |
+| `tee(n=2)` | list of streams | 1–64 forks; bounded replay or live shared queues |
 | `into(channel)` | `null` | emit every item to named channel |
 | `render()` | `null` | drive items to evaluator statement sink |
 
@@ -723,7 +723,7 @@ stdin, or a serialization/upstream error. Buffer and feed pumps share a maximum 
 
 ### Live `tee`
 
-Bounded streams materialize once within the collection walls and create independent replay streams. A live stream uses one shared upstream with a queue capped at 64 items for each fork. If a fork is not driven and its queue fills, later values for that fork are dropped and counted. The fork subsequently receives an in-order `{marker: "stream_gap", reason: "tee_overflow", dropped: n, from_seq: null, to_seq: null}` record once space is available or the queue drains; overflow does not raise. All forks still obey single-consumer semantics.
+Bounded streams materialize once within the collection walls and create independent replay streams. A live stream uses one shared upstream with a queue capped at 64 items and 1 MiB per fork. If a fork is not driven, its queue fills, or a value exceeds the byte wall, later values for that fork are dropped and counted. The fork subsequently receives an in-order `{marker: "stream_gap", reason: "tee_overflow", dropped: n, from_seq: null, to_seq: null}` record once space is available or the queue drains; overflow does not raise. All forks still obey single-consumer semantics, and `n > 64` is rejected before source consumption.
 
 ## Channel handle methods
 

@@ -119,7 +119,7 @@ runtime channel/time/file producers implemented by the evaluator.
 ### Tee behavior
 
 For a bounded stream, tee can materialize once within the collection walls and replay exact values to each branch. A live stream
-uses a bounded queue per fork (currently 64 items). A slow fork can lose items and receives an
+uses a bounded queue per fork (64 items / 1 MiB), with at most 64 forks. A slow fork or oversized item can lose values and receives an
 explicit dropped marker rather than silently pretending delivery was lossless.
 
 

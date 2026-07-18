@@ -291,7 +291,7 @@ re-auditing if time budgets become strict RPC cancellation contracts.
 | `.each(f)` | drives every item and calls closure, discarding closure result | `null` |
 | `.collect()` | rejects unbounded metadata; otherwise drains up to 16,384 values / 16 MiB | `List` |
 | `.save(path)` / `.append(path)` | appends each item and newline as it arrives | resolved `Path` |
-| `.tee(n)` | exact materialized replay within collection walls for bounded; lazy bounded queues for live | list of streams |
+| `.tee(n)` | 1–64 forks; exact materialized replay within collection walls for bounded; lazy 64-item / 1 MiB queues for live | list of streams |
 | `.into(channel)` | evaluator drives and publishes payloads | `null` |
 | `.render()` | evaluator drives and sends each item to statement sink | `null` |
 | `.feed(command)` | pumps serialized items into bounded child stdin | command outcome |
@@ -321,7 +321,9 @@ being dropped.
 ## Tee behavior
 
 Bounded streams are collected once within the 16,384-value / 16 MiB walls and each fork replays the complete list. Live/unbounded streams
-share one upstream with one 64-element queue per fork.
+share one upstream with one 64-element / 1 MiB queue per fork. Fork count is capped at 64 before
+source consumption; values that cannot fit a fork's byte wall become ordered gap debt without first
+being cloned into that queue.
 
 ```mermaid
 flowchart TD

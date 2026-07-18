@@ -126,8 +126,11 @@ pub(crate) fn to_stream(v: Value) -> VResult<Value> {
 }
 
 pub(crate) fn tee(v: Value, n: usize) -> VResult<Value> {
-    if n == 0 {
-        return Err(ErrorVal::arg_error("tee count must be positive"));
+    if n == 0 || n > StreamVal::TEE_MAX_FORKS {
+        return Err(ErrorVal::arg_error(format!(
+            "tee count must be between 1 and {}",
+            StreamVal::TEE_MAX_FORKS
+        )));
     }
     let x = seq(v)?;
     Ok(Value::List(

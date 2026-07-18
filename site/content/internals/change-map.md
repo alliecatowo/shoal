@@ -342,7 +342,7 @@ solve drift by introducing dependency cycles.
 - Color/highlighter tests isolate ambient `NO_COLOR` while asserting ANSI output.
 - Workspace lints are declared at the root and every member crate inherits them with
   `[lints] workspace = true`.
-- Historical root-doc counts must remain explicitly dated relative to the current 1,363-case corpus.
+- Historical root-doc counts must remain explicitly dated relative to the current 1,364-case corpus.
 
 ## Prioritization map
 

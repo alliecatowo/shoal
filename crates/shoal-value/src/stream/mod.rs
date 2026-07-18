@@ -235,6 +235,7 @@ impl StreamVal {
     const WINDOW_MAX_RETAINED_BYTES: usize = 16 * 1024 * 1024;
     pub const COLLECT_MAX_VALUES: usize = 16_384;
     const COLLECT_MAX_RETAINED_BYTES: usize = 16 * 1024 * 1024;
+    pub const TEE_MAX_FORKS: usize = 64;
     /// Build a stream from an in-memory / lazy iterator (a bounded source).
     pub fn from_iter<I>(label: impl Into<String>, iter: I) -> StreamVal
     where
@@ -515,8 +516,11 @@ impl StreamVal {
     /// them once and replays the full list per fork, preserving exact
     /// whole-stream replay with no cap.
     pub fn tee(self, n: usize) -> VResult<Vec<StreamVal>> {
-        if n == 0 {
-            return Err(ErrorVal::arg_error("tee count must be positive"));
+        if n == 0 || n > Self::TEE_MAX_FORKS {
+            return Err(ErrorVal::arg_error(format!(
+                "tee count must be between 1 and {}",
+                Self::TEE_MAX_FORKS
+            )));
         }
         let (label, bounded) = (self.label.clone(), self.bounded);
         let up = self.take_upstream()?;
@@ -696,6 +700,16 @@ mod tests {
         let s = endless_marked(1);
         drain(&s);
         assert_eq!(s.tee(2).unwrap_err().code, "stream_consumed");
+
+        let s = endless_marked(1);
+        assert_eq!(
+            s.clone()
+                .tee(StreamVal::TEE_MAX_FORKS + 1)
+                .unwrap_err()
+                .code,
+            "arg_error"
+        );
+        assert_eq!(drain(&s), vec![Value::Int(0)]);
     }
 
     #[test]
