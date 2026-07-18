@@ -50,10 +50,14 @@ pub struct CandidateDiscovery {
     provider: &'static str,
     candidates: Vec<Candidate>,
     retained_bytes: usize,
+    visited_paths: usize,
+    visited_path_bytes: usize,
 }
 
 pub const MAX_DISCOVERY_CANDIDATES: usize = 4_096;
 pub const MAX_DISCOVERY_RETAINED_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_DISCOVERY_VISITED_PATHS: usize = 4_096;
+pub const MAX_DISCOVERY_VISITED_PATH_BYTES: usize = 16 * 1024 * 1024;
 
 impl CandidateDiscovery {
     pub fn new(provider: &'static str) -> Self {
@@ -61,7 +65,36 @@ impl CandidateDiscovery {
             provider,
             candidates: Vec::new(),
             retained_bytes: 0,
+            visited_paths: 0,
+            visited_path_bytes: 0,
         }
+    }
+
+    /// Admit one filesystem identity before a provider probes it. This bounds
+    /// work that does not produce a candidate (missing executables, unrelated
+    /// mise backends, and malformed version directories) as well as retained
+    /// result state.
+    pub(crate) fn visit_path(&mut self, path: &Path) -> Result<(), ProviderError> {
+        if self.visited_paths >= MAX_DISCOVERY_VISITED_PATHS {
+            return Err(ProviderError::new(
+                self.provider,
+                format!("filesystem visit limit reached ({MAX_DISCOVERY_VISITED_PATHS})"),
+            ));
+        }
+        let bytes = path.as_os_str().as_encoded_bytes().len();
+        let next = self
+            .visited_path_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| ProviderError::new(self.provider, "path accounting overflowed"))?;
+        if next > MAX_DISCOVERY_VISITED_PATH_BYTES {
+            return Err(ProviderError::new(
+                self.provider,
+                format!("visited path state exceeds {MAX_DISCOVERY_VISITED_PATH_BYTES} bytes"),
+            ));
+        }
+        self.visited_paths += 1;
+        self.visited_path_bytes = next;
+        Ok(())
     }
 
     pub fn from_candidates(
@@ -325,6 +358,26 @@ pub(crate) fn is_executable(path: &std::path::Path) -> bool {
     }
 }
 
+/// Provider discovery distinguishes an absent executable from a path that
+/// exists but cannot be inspected. The former is an ordinary miss; collapsing
+/// permission, symlink-loop, or malformed-path errors into "not installed"
+/// would make resolution silently incomplete.
+pub(crate) fn inspect_executable(
+    provider: &'static str,
+    path: &Path,
+) -> Result<bool, ProviderError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.is_file() && (metadata.permissions().mode() & 0o111 != 0)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(ProviderError::new(
+            provider,
+            format!("cannot inspect {}: {error}", path.display()),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,6 +468,25 @@ mod tests {
             .unwrap_err();
         assert!(error.msg.contains("retained state"));
         assert!(discovery.into_candidates().is_empty());
+    }
+
+    #[test]
+    fn candidate_discovery_bounds_non_candidate_filesystem_work() {
+        let mut discovery = CandidateDiscovery::new("fixture");
+        for index in 0..MAX_DISCOVERY_VISITED_PATHS {
+            discovery
+                .visit_path(Path::new(&format!("/missing/{index}")))
+                .unwrap();
+        }
+        let error = discovery
+            .visit_path(Path::new("/one-too-many"))
+            .unwrap_err();
+        assert!(error.msg.contains("filesystem visit limit"));
+
+        let mut discovery = CandidateDiscovery::new("fixture");
+        let oversized = PathBuf::from("x".repeat(MAX_DISCOVERY_VISITED_PATH_BYTES + 1));
+        let error = discovery.visit_path(&oversized).unwrap_err();
+        assert!(error.msg.contains("visited path state"));
     }
 
     #[test]

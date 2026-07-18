@@ -249,8 +249,11 @@ Provider order breaks ties; it does not always choose the winner first. Reef col
 Each provider must build an admitted discovery result rather than return a raw vector. One discovery
 is limited to 4,096 candidates and 16 MiB of measured identity/path state; crossing either wall is a
 `reef_provider` error, never silent truncation. This bounds provider enumeration before resolver
-ranking or `which --all` result admission begins. Resolution keeps only the current best satisfying
-candidate instead of cloning every candidate into a second ranking vector.
+ranking or `which --all` result admission begins. Built-in providers also meter at most 4,096
+filesystem visits and 16 MiB of encoded visited paths, including entries that do not become
+candidates. Filesystem enumeration and inspection errors are explicit provider failures. Resolution
+keeps only the current best satisfying candidate instead of cloning every candidate into a second
+ranking vector.
 
 | Provider | Discovery | Version knowledge | Fetch support |
 | --- | --- | --- | --- |

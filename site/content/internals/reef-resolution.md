@@ -160,8 +160,11 @@ The trait returns `Result<CandidateDiscovery, ProviderError>`, not `Vec<Candidat
 `CandidateDiscovery::push` admits at most 4,096 identities / 16 MiB of tool, version, provider, and
 encoded-path state. Built-in providers use it while enumerating, and external implementations cannot
 construct an accepted discovery without the same admission. Overflow maps to `reef_provider` rather
-than an incomplete candidate set. The resolver folds admitted candidates into one current best
-value; it does not duplicate the discovery into a second ranked collection.
+than an incomplete candidate set. The same object admits at most 4,096 filesystem visits / 16 MiB
+of encoded visited paths, including misses and malformed entries, before built-in providers inspect
+them. Mise enumeration surfaces iterator and metadata failures instead of silently flattening or
+truncating them. The resolver folds admitted candidates into one current best value; it does not
+duplicate the discovery into a second ranked collection.
 Version probing is separated so the resolver invokes it only for constraints that require a
 concrete version. Fetch is optional and only explicitly invoked by `reef fetch` today.
 

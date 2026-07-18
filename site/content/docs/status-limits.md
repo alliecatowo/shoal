@@ -304,6 +304,9 @@ Wire paths preserve raw Unix bytes alongside lossy display strings. Some other v
 
 ## Reef limitations
 
+- Each built-in provider discovery admits at most 4,096 candidates / 16 MiB of candidate state and
+  4,096 filesystem visits / 16 MiB of encoded visited paths. Crossing a wall or encountering a real
+  enumeration/inspection error raises `reef_provider`; results are never silently truncated.
 - Manifests activate only tool resolution; there are no shell activation hooks.
 - The evaluator caches parsed scope discovery behind a candidate/lock metadata fingerprint including device/inode/mtime/ctime/length; same-cwd create/edit/repair/remove changes invalidate it. Interactive discovery warns and remains best-effort, while noninteractive external execution refuses retained discovery errors. Metadata-to-open identity races remain a filesystem-port limitation.
 - An unlocked constrained tool is tolerated/locked interactively but rejected under script policy; host-installed versions/providers make first resolution host-dependent.

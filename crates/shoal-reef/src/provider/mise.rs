@@ -6,7 +6,9 @@ use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use super::{Candidate, CandidateDiscovery, Provider, ProviderCtx, ProviderError, is_executable};
+use super::{
+    Candidate, CandidateDiscovery, Provider, ProviderCtx, ProviderError, inspect_executable,
+};
 use crate::version::{Constraint, Version};
 
 const FETCH_TIMEOUT: Duration = Duration::from_secs(15 * 60);
@@ -42,30 +44,60 @@ impl MiseProvider {
     /// `<version>/bin/<tool>` (language/cargo installs). Backend-qualified
     /// plugin directories such as `cargo-cargo-audit` still expose the
     /// executable as `cargo-audit`.
-    fn binary_for(&self, tool: &str, version_dir: &std::path::Path) -> Option<PathBuf> {
-        [version_dir.join(tool), version_dir.join("bin").join(tool)]
-            .into_iter()
-            .find(|path| is_executable(path))
+    fn binary_for(
+        &self,
+        tool: &str,
+        version_dir: &std::path::Path,
+        discovery: &mut CandidateDiscovery,
+    ) -> Result<Option<PathBuf>, ProviderError> {
+        for path in [version_dir.join(tool), version_dir.join("bin").join(tool)] {
+            discovery.visit_path(&path)?;
+            if inspect_executable(self.name(), &path)? {
+                return Ok(Some(path));
+            }
+        }
+        Ok(None)
     }
 
-    fn install_dirs(&self, tool: &str) -> Vec<PathBuf> {
+    fn install_dirs(
+        &self,
+        tool: &str,
+        discovery: &mut CandidateDiscovery,
+    ) -> Result<Vec<PathBuf>, ProviderError> {
         let root = self.installs_root();
         let mut dirs = vec![root.join(tool)];
         if matches!(tool, "cargo" | "rustc") {
             dirs.push(root.join("rust"));
         }
         let suffix = format!("-{tool}");
-        if let Ok(entries) = std::fs::read_dir(&root) {
-            for entry in entries.flatten().take(1024) {
-                let name = entry.file_name();
-                if name.to_str().is_some_and(|name| name.ends_with(&suffix))
-                    && !dirs.iter().any(|path| path == &entry.path())
-                {
-                    dirs.push(entry.path());
+        match std::fs::read_dir(&root) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry.map_err(|error| {
+                        ProviderError::new(
+                            "mise",
+                            format!("cannot enumerate {}: {error}", root.display()),
+                        )
+                    })?;
+                    let path = entry.path();
+                    discovery.visit_path(&path)?;
+                    let name = entry.file_name();
+                    if name.to_str().is_some_and(|name| name.ends_with(&suffix))
+                        && !dirs.iter().any(|known| known == &path)
+                    {
+                        dirs.push(path);
+                    }
                 }
             }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(ProviderError::new(
+                    "mise",
+                    format!("cannot enumerate {}: {error}", root.display()),
+                ));
+            }
         }
-        dirs
+        Ok(dirs)
     }
 }
 
@@ -80,19 +112,39 @@ impl Provider for MiseProvider {
         _ctx: &ProviderCtx,
     ) -> Result<CandidateDiscovery, ProviderError> {
         let mut out = CandidateDiscovery::new(self.name());
-        for dir in self.install_dirs(tool) {
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                continue;
+        for dir in self.install_dirs(tool, &mut out)? {
+            let entries = match std::fs::read_dir(&dir) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(ProviderError::new(
+                        self.name(),
+                        format!("cannot enumerate {}: {error}", dir.display()),
+                    ));
+                }
             };
-            for entry in entries.flatten().take(1024) {
-                let Ok(ft) = entry.file_type() else { continue };
+            for entry in entries {
+                let entry = entry.map_err(|error| {
+                    ProviderError::new(
+                        self.name(),
+                        format!("cannot enumerate {}: {error}", dir.display()),
+                    )
+                })?;
+                let path = entry.path();
+                out.visit_path(&path)?;
+                let ft = entry.file_type().map_err(|error| {
+                    ProviderError::new(
+                        self.name(),
+                        format!("cannot inspect {}: {error}", path.display()),
+                    )
+                })?;
                 if !ft.is_dir() && !ft.is_symlink() {
                     continue;
                 }
                 let Some(name) = entry.file_name().to_str().map(str::to_string) else {
                     continue;
                 };
-                if let Some(bin) = self.binary_for(tool, &entry.path()) {
+                if let Some(bin) = self.binary_for(tool, &path, &mut out)? {
                     // Version comes free from the directory name — no probe needed.
                     out.push(Candidate::new(tool, Version::parse(&name), bin, "mise"))?;
                 }
@@ -250,6 +302,17 @@ mod tests {
                 .into_candidates()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn malformed_installs_root_is_an_explicit_provider_error() {
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(data.path().join("installs"), b"not a directory").unwrap();
+        let error = MiseProvider::new(data.path().into())
+            .discover("ghost", &ProviderCtx::new("/"))
+            .unwrap_err();
+        assert!(error.msg.contains("cannot enumerate"));
+        assert!(error.msg.contains("installs"));
     }
 
     #[test]

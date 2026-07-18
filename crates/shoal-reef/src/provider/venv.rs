@@ -1,7 +1,9 @@
 //! venv provider: a project virtualenv's `.venv/bin/<tool>` when present. Walks
 //! up from the cwd. Versions are opaque-unknown.
 
-use super::{Candidate, CandidateDiscovery, Provider, ProviderCtx, ProviderError, is_executable};
+use super::{
+    Candidate, CandidateDiscovery, Provider, ProviderCtx, ProviderError, inspect_executable,
+};
 use crate::version::Version;
 
 pub struct VenvProvider;
@@ -28,7 +30,8 @@ impl Provider for VenvProvider {
         let mut dir = Some(ctx.cwd.as_path());
         while let Some(d) = dir {
             let bin = d.join(".venv").join("bin").join(tool);
-            if is_executable(&bin) {
+            discovery.visit_path(&bin)?;
+            if inspect_executable(self.name(), &bin)? {
                 discovery.push(Candidate::new(tool, Version::unknown(), bin, "venv"))?;
                 return Ok(discovery);
             }

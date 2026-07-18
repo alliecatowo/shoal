@@ -84,7 +84,8 @@ pub use lock::{LockEntry, LockError, Lockfile};
 pub use manifest::{ManifestError, ManifestKind, ReefManifest, ToolReq};
 pub use provider::{
     Candidate, CandidateDiscovery, MAX_DISCOVERY_CANDIDATES, MAX_DISCOVERY_RETAINED_BYTES,
-    Provider, ProviderCtx, ProviderError,
+    MAX_DISCOVERY_VISITED_PATH_BYTES, MAX_DISCOVERY_VISITED_PATHS, Provider, ProviderCtx,
+    ProviderError,
 };
 pub use report::{ResolutionReport, ScopeDecision};
 pub use resolve::{LockNotice, Policy, ProbeExecution, Resolution, Resolver};

@@ -4,7 +4,9 @@
 
 use std::path::PathBuf;
 
-use super::{Candidate, CandidateDiscovery, Provider, ProviderCtx, ProviderError, is_executable};
+use super::{
+    Candidate, CandidateDiscovery, Provider, ProviderCtx, ProviderError, inspect_executable,
+};
 use crate::version::Version;
 
 pub struct CargoProvider {
@@ -38,7 +40,8 @@ impl Provider for CargoProvider {
     ) -> Result<CandidateDiscovery, ProviderError> {
         let path = self.bin_dir.join(tool);
         let mut discovery = CandidateDiscovery::new(self.name());
-        if is_executable(&path) {
+        discovery.visit_path(&path)?;
+        if inspect_executable(self.name(), &path)? {
             discovery.push(Candidate::new(tool, Version::unknown(), path, "cargo"))?;
         }
         Ok(discovery)
@@ -69,5 +72,16 @@ mod tests {
         assert_eq!(cands.len(), 1);
         assert!(cands[0].version.is_unknown());
         assert_eq!(cands[0].provider, "cargo");
+    }
+
+    #[test]
+    fn inaccessible_candidate_path_is_not_reported_as_absent() {
+        let home = tempfile::tempdir().unwrap();
+        let not_a_directory = home.path().join("bin");
+        std::fs::write(&not_a_directory, b"file").unwrap();
+        let error = CargoProvider::new(not_a_directory)
+            .discover("rg", &ProviderCtx::new("/"))
+            .unwrap_err();
+        assert!(error.msg.contains("cannot inspect"));
     }
 }

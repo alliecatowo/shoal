@@ -2,12 +2,12 @@
 //! are probed lazily via `<tool> --version` (300 ms timeout), parsed leniently,
 //! and cached in-memory keyed by path. Enumeration never probes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 
-use super::{Candidate, Provider, ProviderCtx, is_executable, probe_version};
+use super::{Candidate, Provider, ProviderCtx, inspect_executable, probe_version};
 use crate::version::Version;
 
 /// Canonical system roots, always scope `system` (not `ambient`).
@@ -66,9 +66,10 @@ impl SystemProvider {
     pub fn from_env() -> SystemProvider {
         let roots: Vec<PathBuf> = CANONICAL_ROOTS.iter().map(PathBuf::from).collect();
         let mut ambient = Vec::new();
+        let mut seen: HashSet<PathBuf> = roots.iter().cloned().collect();
         if let Some(path) = std::env::var_os("PATH") {
             for dir in std::env::split_paths(&path) {
-                if !roots.iter().any(|r| r == &dir) && !ambient.contains(&dir) {
+                if seen.insert(dir.clone()) {
                     ambient.push(dir);
                 }
             }
@@ -106,7 +107,8 @@ impl Provider for SystemProvider {
         for (dirs, ambient) in [(&self.roots, false), (&self.ambient, true)] {
             for dir in dirs {
                 let path = dir.join(tool);
-                if is_executable(&path) && seen.insert(path.clone()) {
+                out.visit_path(&path)?;
+                if inspect_executable(self.name(), &path)? && seen.insert(path.clone()) {
                     let mut c = Candidate::new(tool, Version::unknown(), path, "system");
                     c.ambient = ambient;
                     out.push(c)?;
@@ -218,6 +220,17 @@ mod tests {
                 .into_candidates()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn configured_root_probes_share_the_discovery_work_limit() {
+        let roots = (0..=super::super::MAX_DISCOVERY_VISITED_PATHS)
+            .map(|index| PathBuf::from(format!("/definitely-missing/{index}")))
+            .collect();
+        let error = SystemProvider::new(roots, Vec::new())
+            .discover("tool", &ProviderCtx::new("/"))
+            .unwrap_err();
+        assert!(error.msg.contains("filesystem visit limit"));
     }
 
     #[test]

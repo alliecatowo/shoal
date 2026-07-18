@@ -3,7 +3,9 @@
 //! Versions are opaque-unknown (npm bin scripts have no stable `--version`
 //! contract worth probing here).
 
-use super::{Candidate, CandidateDiscovery, Provider, ProviderCtx, ProviderError, is_executable};
+use super::{
+    Candidate, CandidateDiscovery, Provider, ProviderCtx, ProviderError, inspect_executable,
+};
 use crate::version::Version;
 
 pub struct NpmLocalProvider;
@@ -30,7 +32,8 @@ impl Provider for NpmLocalProvider {
         let mut dir = Some(ctx.cwd.as_path());
         while let Some(d) = dir {
             let bin = d.join("node_modules").join(".bin").join(tool);
-            if is_executable(&bin) {
+            discovery.visit_path(&bin)?;
+            if inspect_executable(self.name(), &bin)? {
                 discovery.push(Candidate::new(tool, Version::unknown(), bin, "npm-local"))?;
                 return Ok(discovery);
             }
