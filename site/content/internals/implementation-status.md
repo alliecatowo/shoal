@@ -248,6 +248,7 @@ new direct child construction. Future child factories must extend that explicit 
 | token profile/cap strings | Informational | returned in attach metadata; no Leash/handler authorization consumes them |
 | named-session ownership | Implemented principal-private identity | registry keys are `(principal, visible Session name)`; equal visible names do not share evaluators or quotas |
 | task/PTY ref scoping | Implemented exact-owner model | handlers and registries use the same principal+Session owner key |
+| task await worker bound | Implemented | default 30s, hard 60s ceiling, zero nonblocking; timeout never cancels task |
 | live state after restart | intentionally absent | sessions, plans, approvals, tasks, PTYs, refs, and subscriptions are memory-only |
 
 Principal-private keys close the former cross-principal aliasing defect, but they do not turn one

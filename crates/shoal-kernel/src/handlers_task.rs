@@ -4,6 +4,9 @@
 //! Wire behavior is documented in `site/content/internals/kernel-protocol.md`.
 use super::*;
 
+const TASK_AWAIT_DEFAULT_MS: u64 = 30_000;
+const TASK_AWAIT_MAX_MS: u64 = 60_000;
+
 fn task_control_unavailable(task: &Ref, action: &str, reason: &str) -> RpcError {
     RpcError {
         code: TASK_CONTROL_UNAVAILABLE,
@@ -141,7 +144,7 @@ impl Kernel {
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
         let session = &attachment.session;
         self.reap_finished_tasks(&session.key.owner());
-        let p: TaskParams = decode(params)?;
+        let p: TaskAwaitParams = decode(params)?;
         let task = self.task(&p.task)?;
         if task.owner != session.key.owner() {
             return Err(RpcError {
@@ -150,14 +153,44 @@ impl Kernel {
                 data: None,
             });
         }
+        let requested_ms = p.timeout_ms.unwrap_or(TASK_AWAIT_DEFAULT_MS);
+        let wait_ms = requested_ms.min(TASK_AWAIT_MAX_MS);
+        let deadline = Instant::now() + std::time::Duration::from_millis(wait_ms);
         let mut inner = task.lock_inner()?;
+        let mut timed_out = false;
         while matches!(inner.state, "running" | "suspended" | "cancelling") {
-            inner = match task.done.wait(inner) {
-                Ok(inner) => inner,
-                Err(poisoned) => return Err(task.repair_wait_poison(poisoned)),
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                timed_out = true;
+                break;
             };
+            if remaining.is_zero() {
+                timed_out = true;
+                break;
+            }
+            let (next, wait) = match task.done.wait_timeout(inner, remaining) {
+                Ok(result) => result,
+                Err(poisoned) => {
+                    let (inner, _) = poisoned.into_inner();
+                    return Err(task.repair_wait_poison(std::sync::PoisonError::new(inner)));
+                }
+            };
+            inner = next;
+            if wait.timed_out() && matches!(inner.state, "running" | "suspended" | "cancelling") {
+                timed_out = true;
+                break;
+            }
         }
-        encode(task_record_locked(&task, &inner)?)
+        let mut record = encode(task_record_locked(&task, &inner)?)?;
+        let fields = record
+            .as_object_mut()
+            .expect("TaskRecord always serializes as an object");
+        fields.insert("timed_out".into(), Json::Bool(timed_out));
+        fields.insert("wait_ms".into(), Json::from(wait_ms));
+        fields.insert(
+            "request_clamped".into(),
+            Json::Bool(requested_ms > TASK_AWAIT_MAX_MS),
+        );
+        Ok(record)
     }
 
     pub(crate) fn handle_task_cancel(

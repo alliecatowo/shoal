@@ -236,3 +236,77 @@ fn suspend_remains_honest_for_evaluator_only_work() {
     drop(reader);
     thread.join().unwrap();
 }
+
+#[test]
+fn task_await_bounds_connection_wait_without_cancelling_work() {
+    let kernel = Kernel::new();
+    let (mut client, mut reader, thread) = spawn(&kernel);
+    attach(&mut client, &mut reader);
+    let task = call(
+        &mut client,
+        &mut reader,
+        2,
+        "exec",
+        json!({"src":"sleep 30s","background":true}),
+    )
+    .result
+    .unwrap()["task"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let started = Instant::now();
+    let snapshot = call(
+        &mut client,
+        &mut reader,
+        3,
+        "task.await",
+        json!({"task":task,"timeout_ms":5}),
+    )
+    .result
+    .unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    assert_eq!(snapshot["timed_out"], true);
+    assert_eq!(snapshot["wait_ms"], 5);
+    assert_eq!(snapshot["request_clamped"], false);
+    assert!(matches!(
+        snapshot["state"].as_str(),
+        Some("running" | "suspended" | "cancelling")
+    ));
+
+    call(
+        &mut client,
+        &mut reader,
+        4,
+        "task.cancel",
+        json!({"task":task}),
+    );
+    let terminal = call(
+        &mut client,
+        &mut reader,
+        5,
+        "task.await",
+        json!({"task":task,"timeout_ms":5000}),
+    )
+    .result
+    .unwrap();
+    assert_eq!(terminal["timed_out"], false);
+    assert_eq!(terminal["state"], "cancelled");
+
+    let clamped = call(
+        &mut client,
+        &mut reader,
+        6,
+        "task.await",
+        json!({"task":task,"timeout_ms":u64::MAX}),
+    )
+    .result
+    .unwrap();
+    assert_eq!(clamped["timed_out"], false);
+    assert_eq!(clamped["wait_ms"], 60_000);
+    assert_eq!(clamped["request_clamped"], true);
+
+    drop(client);
+    drop(reader);
+    thread.join().unwrap();
+}

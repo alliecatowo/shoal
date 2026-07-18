@@ -356,7 +356,7 @@ is `running`, `suspended`, `cancelling`, `cancelled`, `failed`, and `completed`.
 |---|---|---|
 | `task.list` | `{}` | all task records whose `task.session.id` equals attached session ID |
 | `task.get` | `{task}` | nonblocking snapshot |
-| `task.await` | `{task}` | waits on condvar until terminal, including across suspension |
+| `task.await` | `{task,timeout_ms?}` | waits across suspension; default 30s, hard maximum 60s, zero nonblocking; timeout leaves task running |
 | `task.cancel` | `{task}` | marks cancelling, resumes stopped groups, fires cancel token |
 | `task.suspend` | `{task}` | `SIGSTOP` every active process group; unavailable for evaluator-only work |
 | `task.resume` | `{task}` | `SIGCONT` every group owned by a suspended process-backed task |
@@ -369,6 +369,9 @@ reaped oldest-first.
 Cancellation is cooperative through the evaluator/exec cancellation token. A failed outcome returned
 in value position is inspected so the task becomes failed; a signal-killed outcome after a requested
 cancel becomes cancelled rather than completed.
+
+Every await response adds `timed_out`, effective `wait_ms`, and `request_clamped`. This bounds one
+request's connection-worker occupancy without pretending the wait budget is an execution deadline.
 
 ## Plans and capability approval
 

@@ -232,6 +232,9 @@ The metadata registry used by method discovery/completion has drift from actual 
 
 Cancellation is cooperative through evaluator tokens and process handles. It is not a universal transaction or guaranteed descendant-process-tree cleanup on every platform. Side effects completed before cancellation remain.
 
+Raw `task.await` occupies its connection worker for at most 30 seconds by default and 60 seconds
+when explicitly requested. A timeout returns the live record and does not cancel the task.
+
 ### Module/session cache lifetime
 
 Loaded module/evaluator state lives in the process/session and can become stale relative to files. Restart/reload semantics are not a hot-reload system.

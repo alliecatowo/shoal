@@ -499,6 +499,17 @@ pub struct ElideSpec {
 pub struct TaskParams {
     pub task: Ref,
 }
+
+/// `task.await` has a bounded connection-worker wait. The task itself keeps
+/// running when the wait budget expires.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskAwaitParams {
+    pub task: Ref,
+    /// Omitted uses the kernel default, zero is a nonblocking snapshot, and
+    /// oversized values are clamped to the server's hard wait ceiling.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
 /// `pty.open` (site/content/internals/kernel-protocol.md): spawn an interactive program on a real PTY
 /// as a long-lived, keyed kernel session with a `vt100`-rendered screen.
 #[derive(Debug, Clone, Serialize, Deserialize)]

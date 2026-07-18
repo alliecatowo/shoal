@@ -485,12 +485,15 @@ with a 64 KiB encoded hard cap. These are context protections, not comprehensive
 
 Remaining high-cost surfaces include:
 
-- `task.await` blocking a connection indefinitely;
 - PTY child resource consumption;
 - journal/CAS disk growth until garbage collection;
 - CPU/memory consumed by evaluated source or child processes.
 
 Connections, retained principal Sessions, active tasks, PTYs (per Session/principal/global), subscriptions, plan/source bytes, transcripts, stream cursors, frames, and event queues have explicit bounds. There is still no general per-principal rate, memory, CPU, or descendant-process-tree meter. Use OS service controls (cgroups/launchd limits/container quotas where appropriate), supervise the daemon, and keep hostile code outside a shared kernel process.
+
+`task.await` no longer holds a connection worker indefinitely: it defaults to 30 seconds and has a
+60-second server ceiling. A timed-out wait leaves the underlying task running for later poll,
+subscription, cancellation, or another bounded await.
 
 ## Security review priorities
 

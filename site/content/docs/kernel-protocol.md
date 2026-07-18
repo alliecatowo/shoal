@@ -181,7 +181,7 @@ unattached caller before approval or storage access.
 | `journal.query` | yes | Query the attached principal/session's durable journal view. |
 | `task.list` | yes | List session tasks. |
 | `task.get` | yes | Snapshot a task. |
-| `task.await` | yes | Block until a task terminal state. |
+| `task.await` | yes | Bounded wait for terminal state; task continues on timeout. |
 | `task.cancel` | yes | Request cancellation. |
 | `task.suspend` | yes | Stops active process groups; evaluator-only work is unavailable. |
 | `task.resume` | yes | Continues a suspended process-backed task. |
@@ -415,7 +415,7 @@ All task selectors use `{ "task": "task:7" }`.
 | --- | --- |
 | `task.list {}` | Returns records whose exact principal/session owner matches the attachment. |
 | `task.get` | Nonblocking record and current-control snapshot. |
-| `task.await` | Blocks the connection across running/suspended/cancelling states until terminal. |
+| `task.await` | Waits up to `timeout_ms`; returns a current record with timeout metadata. |
 | `task.cancel` | Continues stopped groups, sets cancellation, and returns `{task, cancel_requested:true}`. |
 | `task.suspend` | Sends `SIGSTOP` to every process group active under the task epoch. |
 | `task.resume` | Sends `SIGCONT` to groups owned by a suspended task. |
@@ -447,7 +447,10 @@ finish after the record is read, so handle `TASK_CONTROL_UNAVAILABLE` even after
 Task access checks the exact `(principal, session name)` owner. Another principal using the same
 visible name has a different evaluator, task namespace, and quota account.
 
-`task.await` has no timeout param and occupies the request path until terminal state. Prefer subscriptions/polling when the client must stay responsive.
+`task.await {task,timeout_ms?}` waits 30 seconds by default and clamps any requested wait to 60
+seconds. Explicit zero is a nonblocking snapshot. The additive `timed_out`, `wait_ms`, and
+`request_clamped` fields describe the wait; expiration does not cancel or otherwise mutate the task.
+Prefer subscriptions/polling when the client must stay continuously responsive.
 
 ## Plans and approval
 

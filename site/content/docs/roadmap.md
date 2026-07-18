@@ -226,12 +226,13 @@ One managed event connection and registry now replaces the former connection/thr
 
 ### Task and process-tree lifecycle
 
-- Track process group/tree ownership per task.
-- Give cancel a defined grace/kill escalation and terminal guarantee.
-- Implement raw kernel suspend/resume only when it controls the real group; otherwise remove/stabilize explicit unsupported capability.
+- Process-group ownership per task, cancel escalation, truthful suspend/resume, bounded active/retained task counts, and a bounded `task.await` worker wait are implemented.
+
+Remaining work:
+
 - Add deadline distinct from “wait timeout.”
-- Add task TTL/reaping and maximum counts.
 - Add incremental output cursor where a child produces streams.
+- Extend descendant-tree guarantees beyond owned process groups on platforms where children can escape them.
 
 ### PTY lifecycle
 
