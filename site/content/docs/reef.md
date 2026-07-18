@@ -368,7 +368,7 @@ $TMPDIR/shoal-views-<uid>
 # /tmp is used when TMPDIR is absent
 ```
 
-The binding-set hash is order-independent and covers each tool name and path. Construction uses a staging directory and atomic rename, so concurrent identical builders converge on one view.
+The binding-set hash is order-independent and covers each tool name and path. Construction uses a staging directory and atomic rename, so concurrent identical builders converge on one view. Reuse is verified rather than trusted: the root must be an owned real `0700` directory, binding names cannot contain traversal/separators, targets must be absolute executable regular files, and `bin` must contain exactly the expected symlinks. A tampered view is quarantined and rebuilt before its path is returned.
 
 The spawned child's `PATH` becomes:
 

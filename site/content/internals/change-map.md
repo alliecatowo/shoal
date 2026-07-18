@@ -222,8 +222,8 @@ These are four separate, explicitly unimplemented surfaces:
 | kernel task suspend/resume | handlers return `TASK_CONTROL_UNAVAILABLE` | task runtime that can identify/control owned child groups, or remove verbs |
 | WASM ABI evolution | preview ABI v1 is integrated with declared+authorized hostcalls and bounded values | keep new hostcalls effect-scoped, versioned, cancellable, and adversarially tested |
 | WASM compilation latency | invocation has fuel/epoch/cancellation/wall-time limits, but synchronous compilation is only byte-capped | cache/admission policy if compile latency becomes an operational problem |
-| Reef runner/options-only scope | scope discovery ignores manifests whose `tools` map is empty | decide whether non-tool Reef configuration constitutes a scope; add discovery tests |
-| companion state-root parity | `shoal-history` and doctor defaults use XDG data while evaluator/kernel use XDG state | one shared root resolver or mandatory explicit state-dir plumbing |
+| Reef provider subprocess sandboxing | restricted evaluator probes/installers fail closed when policy requires an OS filesystem sandbox | carry the sandboxed spawn capability into allowed provider subprocesses |
+| custom journal-root parity | defaults share `ShoalPaths`, but `shoal-history` does not load layered `journal.state_dir` | pass `--state-dir`, or add explicit shared config loading without changing CLI precedence |
 
 PTY change subscription is also absent; MCP callers poll rendered screens. Do not paper over these
 gaps with eager materialization or background threads without a lifecycle protocol.

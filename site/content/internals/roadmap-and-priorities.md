@@ -390,7 +390,7 @@ Version probes execute code. Evaluator integration now checks opaque authority a
 execution and fails closed when policy would require an unavailable OS sandbox. Applying the sandbox
 to provider probe/installer processes, rather than refusing them, remains open.
 
-**Evidence.** Same-cwd manifest/lock replacement, lock-write failure, executable replacement,
+**Evidence.** Same-cwd manifest/lock replacement, lock-write failure, executable/view replacement,
 tool-free runner/hermetic scopes, denied probe/fetch hooks, and pinned-provider fetch selection are
 covered. Remaining exit evidence is restart-level deterministic lock/view behavior under strict mode
 and actual sandbox wrapping for allowed provider subprocesses.

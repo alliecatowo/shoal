@@ -365,8 +365,10 @@ copying stable code/message/hint and adding the source span.
   spawn pins, and sandbox requirements before entering any provider hook; provider pins restrict which
   hook may run. A required filesystem sandbox fails closed because installer wrapping is not yet in
   the provider API.
-- View symlinks are created in a user runtime/temp tree; directory permissions and symlink integrity
-  are part of executable selection security.
+- View symlinks are created beneath an owned, real directory forced to mode `0700`. Binding names
+  must be one non-empty normal path component, targets must be absolute executable regular files,
+  and a reused view must contain exactly the expected symlinks. A mismatch is atomically quarantined,
+  removed, rebuilt, and post-publication validated.
 - Persistence failures are typed and fail before lock state or spawn publication; manifest and lock
   replacement is atomic, but provider acquisition itself can still have external partial effects.
 - “Hermetic” controls PATH tail only; it is not a filesystem/network/process sandbox.
@@ -381,9 +383,10 @@ integration. Corpus suites `reef.toml` and `reef-provider-errors.toml` pin user-
 
 Same-cwd creation/edit/removal fingerprints, lock-save failure propagation, oversized manifest
 admission, provider flood/timeout descendants, cache identity churn, poisoned-cache recovery, and
-runner-only/hermetic-only project and user scope discovery, denied version probes/fetch hooks, and
-provider-pinned fetch selection are covered. Remaining high-value evidence includes hostile
-view-directory mutation and OS-sandboxed provider process execution.
+runner-only/hermetic-only project and user scope discovery, denied version probes/fetch hooks,
+provider-pinned fetch selection, hostile view-link replacement/extra entries, binding path traversal,
+and symlinked view roots are covered. Remaining high-value evidence includes OS-sandboxed provider
+process execution and platform-specific view behavior beyond Unix.
 
 ## Change checklist
 
