@@ -178,8 +178,6 @@ pub struct GitSnapshot {
     pub stashed: u32,
     /// Last recompute failed or is still pending; counts are stale.
     pub degraded: bool,
-    /// Wall-clock age of this snapshot at construction time.
-    pub age: Duration,
 }
 
 impl GitSnapshot {
@@ -200,7 +198,6 @@ impl GitSnapshot {
             conflicted: 0,
             stashed: 0,
             degraded: true,
-            age: Duration::ZERO,
         }
     }
 }

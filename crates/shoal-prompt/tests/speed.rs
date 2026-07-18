@@ -37,7 +37,6 @@ fn fixture() -> PromptContext {
         conflicted: 0,
         stashed: 0,
         degraded: false,
-        age: Duration::ZERO,
     });
     ctx.reef = vec![ReefBinding {
         tool: "rust".into(),

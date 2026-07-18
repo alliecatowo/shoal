@@ -214,7 +214,7 @@ style spec equals that name. They are not macros inside a compound spec such as 
 | `character` | last outcome, edit mode, Unicode | success/error/Vi-normal-or-visual symbol | lock-free live Reedline mode bridge |
 | `directory` | cwd, home, repo-relative path, read-only | home collapse; `start`/`middle`/`end` component truncation | active |
 | `git_branch` | branch or detached SHA | symbol, truncation, template | active |
-| `git_status` | counts/degraded flag | staged/worktree/untracked/conflict/stash/ahead/behind | stash always zero; one explicit Git CLI reader |
+| `git_status` | counts/degraded flag | staged/worktree/untracked/conflict/stash/ahead/behind | one explicit bounded Git CLI reader |
 | `git_state` | Git operation state | rebase/merge/cherry-pick/bisect/revert label | active |
 | `cmd_duration` | last outcome duration | hides below `min_ms` | active |
 | `exit_status` | status/signal/ok | optional success display | active, disabled by default |
@@ -321,28 +321,20 @@ accDescr: Shows the components and relationships described in Per-command facts.
 
 Repository discovery walks ancestors for `.git`, supporting both directories and worktree
 `gitdir:` files. `HEAD` and in-progress operation markers are read directly. One
-`git -C <cwd> status --porcelain=v2 --branch` subprocess per context build supplies ahead/behind,
-staged, unstaged, untracked, and conflict counts. Failure leaves branch/state available, zeros
+`git -C <cwd> status --porcelain=v2 --branch --show-stash` subprocess per context build supplies
+ahead/behind, staged, unstaged, untracked, conflict, and stash counts. Failure leaves branch/state available, zeros
 counts, and sets `degraded = true`—it never reports a failed status lookup as confidently clean.
 
-Stash count is always zero because it would require another command. Snapshot age is also always
-zero; there is no asynchronous stale-cache engine today.
-
-### Known hardcoded context gaps
-
-The remaining deliberately incomplete Git facts are:
-
-```text
-git.stashed = 0
-git.age = 0
-```
+`--show-stash` keeps stash truth inside the existing single-process budget; Shoal does not launch a
+second `git stash` command. The former always-zero `GitSnapshot.age` field had no renderer consumer
+or asynchronous cache behind it and was removed rather than preserving inert schema.
 
 The Reedline adapter wraps the selected edit mode and publishes Emacs/Vi insert/normal/visual state
 through a lock-free scalar before each paint; the pure renderer accepts that state as an overlay on
 the frozen context. Kernel-backed contexts require an authenticated `authority` projection and use
 its human/agent identity plus real Leash tier/enforcement forecast. Standalone mode is explicitly a
-local-human evaluator. Stash and stale-age remain producer-incomplete. Battery and custom values
-are host-produced only when their modules are configured.
+local-human evaluator. Battery and custom values are host-produced only when their modules are
+configured.
 
 ## Reedline prompt adapter
 

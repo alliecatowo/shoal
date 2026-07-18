@@ -14,7 +14,7 @@ const GIT_CONTROL_FILE_CAP: usize = 8 * 1024;
 
 /// Read branch + repo state from `.git` directly (no subprocess, no git lib),
 /// then fill in status counts with exactly one `git status --porcelain=v2
-/// --branch` subprocess (site/content/internals/prompt-editor-lsp.md) — the one deliberate exception to "no
+/// --branch --show-stash` subprocess (site/content/internals/prompt-editor-lsp.md) — the one deliberate exception to "no
 /// subprocess" in this reader, budgeted because [`read_git`] itself only ever
 /// runs once per command (site/content/internals/prompt-editor-lsp.md), never per keystroke. A repo whose git binary
 /// can't run (missing, non-zero exit, unparseable output) still gets an
@@ -45,13 +45,8 @@ pub fn read_git(cwd: &Path) -> Option<GitSnapshot> {
         unstaged: counts.unstaged,
         untracked: counts.untracked,
         conflicted: counts.conflicted,
-        // Not derivable from a single `git status`; a second subprocess
-        // (`git stash list`) would be needed and the budget here is one call
-        // per command. Left at zero — an honest gap (site/content/internals/prompt-editor-lsp.md fuller engine can
-        // add it later without breaking this contract).
-        stashed: 0,
+        stashed: counts.stashed,
         degraded,
-        age: Duration::ZERO,
     })
 }
 
@@ -64,6 +59,7 @@ pub(super) struct GitCounts {
     pub(super) unstaged: u32,
     pub(super) untracked: u32,
     pub(super) conflicted: u32,
+    pub(super) stashed: u32,
 }
 
 /// Run the one status subprocess this reader budgets and parse it into
@@ -78,7 +74,7 @@ fn git_status_counts_with_program(cwd: &Path, program: &std::ffi::OsStr) -> Opti
     command
         .arg("-C")
         .arg(cwd)
-        .args(["status", "--porcelain=v2", "--branch"]);
+        .args(["status", "--porcelain=v2", "--branch", "--show-stash"]);
     let output =
         shoal_exec::run_bounded_command(&mut command, GIT_STATUS_TIMEOUT, GIT_STATUS_OUTPUT_CAP)
             .ok()?;
@@ -91,7 +87,7 @@ fn git_status_counts_with_program(cwd: &Path, program: &std::ffi::OsStr) -> Opti
 /// Parse `git status --porcelain=v2 --branch` bytes into [`GitCounts`].
 ///
 /// Line shapes (git-status(1)): `# branch.ab +<ahead> -<behind>` (absent with
-/// no upstream); `1 <XY> …` ordinary changed entry; `2 <XY> …` renamed/copied
+/// no upstream); `# stash <count>`; `1 <XY> …` ordinary changed entry; `2 <XY> …` renamed/copied
 /// entry (`X`/`Y` = index/worktree status chars, `.` means unchanged); `u …`
 /// unmerged/conflicted entry; `? <path>` untracked; `! <path>` ignored
 /// (skipped). Every count only ever needs the marker byte and, for `1`/`2`,
@@ -113,6 +109,10 @@ pub(super) fn parse_porcelain_v2_counts(bytes: &[u8]) -> GitCounts {
                     c.behind = n.parse().unwrap_or(0);
                 }
             }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("# stash ") {
+            c.stashed = rest.trim().parse().unwrap_or(0);
             continue;
         }
         if line.starts_with('#') || line.is_empty() {

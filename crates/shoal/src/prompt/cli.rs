@@ -199,7 +199,6 @@ fn bench_fixture(facts: &StaticFacts) -> PromptContext {
         conflicted: 0,
         stashed: 0,
         degraded: false,
-        age: Duration::ZERO,
     });
     ctx
 }

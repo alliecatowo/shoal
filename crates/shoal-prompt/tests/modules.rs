@@ -40,7 +40,6 @@ fn git(branch: &str) -> GitSnapshot {
         conflicted: 0,
         stashed: 0,
         degraded: false,
-        age: Duration::ZERO,
     }
 }
 

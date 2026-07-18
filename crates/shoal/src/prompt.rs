@@ -15,7 +15,8 @@
 //! registry; the cached reef `ScopeChain` + already-loaded `Lockfile`), so
 //! folding them into [`build_context`] costs no I/O beyond what the evaluator
 //! already pays elsewhere. Git status *counts* (staged/unstaged/untracked/
-//! ahead/behind) come from exactly one `git status --porcelain=v2 --branch`
+//! ahead/behind/stash) come from exactly one `git status --porcelain=v2 --branch
+//! --show-stash`
 //! subprocess per call to [`build_context`] — i.e. once per command, never
 //! per keystroke (site/content/internals/prompt-editor-lsp.md); a non-git `cwd` never spawns it at all (`.git`
 //! discovery is a pure filesystem walk that bails out first). Branch name and
@@ -496,6 +497,7 @@ mod tests {
         assert_eq!(c.unstaged, 1, "the `1 .M` entry is unstaged");
         assert_eq!(c.conflicted, 1);
         assert_eq!(c.untracked, 1);
+        assert_eq!(c.stashed, 0);
     }
 
     #[test]
@@ -530,6 +532,23 @@ mod tests {
         assert_eq!(counts.staged, 1, "a.txt is staged (added, uncommitted)");
         assert_eq!(counts.unstaged, 0);
         assert_eq!(counts.untracked, 1, "b.txt is untracked");
+    }
+
+    #[test]
+    fn git_status_counts_stashes_in_the_same_bounded_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        run_git(root, &["init", "-q"]);
+        run_git(root, &["config", "user.email", "t@example.com"]);
+        run_git(root, &["config", "user.name", "Test"]);
+        std::fs::write(root.join("tracked.txt"), "base\n").unwrap();
+        run_git(root, &["add", "tracked.txt"]);
+        run_git(root, &["commit", "-qm", "base"]);
+        std::fs::write(root.join("tracked.txt"), "changed\n").unwrap();
+        run_git(root, &["stash", "push", "-qm", "prompt-test"]);
+
+        let counts = git_status_counts(root).expect("git status succeeds");
+        assert_eq!(counts.stashed, 1);
     }
 
     #[test]
