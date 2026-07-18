@@ -169,6 +169,16 @@ fn flat_map_over_lists() {
         "[1, 2, 3]",
         "compact range expansions must stay lazy inside flat_map"
     );
+    assert_eq!(
+        run_err("[0].stream().flat_map(_ => every(1s)).collect()"),
+        "stream_unbounded",
+        "a finite outer stream must not disguise an endless child as bounded"
+    );
+    assert_eq!(
+        run("[0].stream().flat_map(_ => every(5ms).take(1)).collect().len()"),
+        Value::Int(1),
+        "callers can explicitly bound a live child inside the closure"
+    );
 }
 
 #[test]

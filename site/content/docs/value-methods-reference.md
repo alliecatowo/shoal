@@ -138,14 +138,14 @@ The eager collection core accepts `list`, `table`, and `range`. Many operations 
 | `each` | `(item => any)` | `null` |
 | `any`, `all` | `(item => bool)` | bool |
 | `find` | `(item => bool)` | item or null |
-| `flat_map` | `(item => collection)` | flattened list |
+| `flat_map` | `(item => collection)` | flattened list; eager output is limited to 16,384 values / 16 MiB |
 | `sort` | `()` or `(item => key)` | list |
 | `sort_by` | `(item => key)` | list |
 | `reverse` | `()` | list |
 | `uniq` | `()` | list |
 | `sum` | `()` | accumulated value; empty is integer 0 |
 | `min`, `max` | `()` | item or null |
-| `flatten` | `()` | one-level flattened list |
+| `flatten` | `()` | one-level flattened list; eager output is limited to 16,384 values / 16 MiB |
 | `enumerate` | `()` | list of `[index, item]` |
 | `skip`, `take` | `(n)` | list |
 | `chunks` | `(positive_n)` | list of lists |

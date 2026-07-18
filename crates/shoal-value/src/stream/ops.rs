@@ -68,6 +68,10 @@ impl Upstream for Scan {
 pub struct FlatMapSequential {
     pub up: Box<dyn Upstream>,
     pub f: Value,
+    /// A bounded outer stream advertises a natural end to sinks such as
+    /// `.collect()`. Preserve that contract by refusing a dynamically-returned
+    /// child stream that has no natural end.
+    pub require_bounded_children: bool,
     pub sub: Option<Box<dyn Upstream>>,
     pub queue: VecDeque<Value>,
 }
@@ -89,7 +93,18 @@ impl Upstream for FlatMapSequential {
                 Pull::Item(v) => {
                     let r = ctx.call_closure(&self.f, vec![v])?;
                     match r {
-                        Value::Stream(s) => self.sub = Some(s.take_upstream()?),
+                        Value::Stream(s) => {
+                            if self.require_bounded_children && !s.is_bounded() {
+                                return Err(ErrorVal::new(
+                                    "stream_unbounded",
+                                    "a bounded flat_map returned a child stream with no natural end",
+                                )
+                                .with_hint(
+                                    "bound the child inside the closure with `.take(n)` or `.take_until(...)`",
+                                ));
+                            }
+                            self.sub = Some(s.take_upstream()?);
+                        }
                         Value::List(xs) => self.queue.extend(xs),
                         Value::Table(rows) => {
                             self.queue.extend(rows.into_iter().map(Value::Record));

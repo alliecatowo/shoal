@@ -5,6 +5,73 @@
 use super::*;
 use std::cmp::Ordering;
 
+const EAGER_COLLECTION_MAX_VALUES: usize = 16_384;
+const EAGER_COLLECTION_MAX_RETAINED_BYTES: usize = 16 * 1024 * 1024;
+
+/// Incrementally admit a collection result before retaining each next value.
+/// This protects multiplicative operations (`flat_map`/`flatten`) from
+/// constructing an unbounded transient value before the environment's binding
+/// quota gets a chance to inspect it.
+struct MaterializedCollection {
+    values: Vec<Value>,
+    retained_bytes: usize,
+    max_values: usize,
+    max_retained_bytes: usize,
+}
+
+impl MaterializedCollection {
+    fn new(max_values: usize, max_retained_bytes: usize) -> Self {
+        Self {
+            values: Vec::new(),
+            retained_bytes: 0,
+            max_values,
+            max_retained_bytes,
+        }
+    }
+
+    fn extend(&mut self, values: impl IntoIterator<Item = Value>) -> VResult<()> {
+        for value in values {
+            if self.values.len() >= self.max_values {
+                return Err(collection_materialization_limit(format!(
+                    "eager collection reached its {}-value limit",
+                    self.max_values
+                )));
+            }
+            let retained = retained_size(
+                &value,
+                RetainedLimits {
+                    max_bytes: self.max_retained_bytes.saturating_sub(self.retained_bytes),
+                    max_depth: 64,
+                    max_nodes: 16_384,
+                    opaque: OpaqueHandling::Charge(256),
+                    allow_secret: true,
+                },
+            )
+            .map_err(|_| {
+                collection_materialization_limit(format!(
+                    "eager collection exceeds its {}-byte retained-value limit",
+                    self.max_retained_bytes
+                ))
+            })?;
+            self.retained_bytes = self.retained_bytes.checked_add(retained).ok_or_else(|| {
+                collection_materialization_limit("eager collection accounting overflowed")
+            })?;
+            self.values.push(value);
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Value {
+        Value::List(self.values)
+    }
+}
+
+fn collection_materialization_limit(message: impl Into<String>) -> ErrorVal {
+    ErrorVal::new("collection_materialization_limit", message).with_hint(
+        "use `.stream()` with incremental transforms/sinks, or reduce the input before flattening",
+    )
+}
+
 pub(crate) fn seq(v: Value) -> VResult<Vec<Value>> {
     match v {
         Value::List(x) => Ok(x),
@@ -191,11 +258,27 @@ pub(crate) fn find(ctx: &mut dyn CallCtx, v: Value, f: &Value) -> VResult<Value>
     Ok(Value::Null)
 }
 pub(crate) fn flat_map(ctx: &mut dyn CallCtx, v: Value, f: &Value) -> VResult<Value> {
-    let mut o = vec![];
+    flat_map_with_limits(
+        ctx,
+        v,
+        f,
+        EAGER_COLLECTION_MAX_VALUES,
+        EAGER_COLLECTION_MAX_RETAINED_BYTES,
+    )
+}
+
+fn flat_map_with_limits(
+    ctx: &mut dyn CallCtx,
+    v: Value,
+    f: &Value,
+    max_values: usize,
+    max_retained_bytes: usize,
+) -> VResult<Value> {
+    let mut out = MaterializedCollection::new(max_values, max_retained_bytes);
     for x in seq(v)? {
-        o.extend(seq(ctx.call_closure(f, vec![x])?)?)
+        out.extend(seq(ctx.call_closure(f, vec![x])?)?)?;
     }
-    Ok(Value::List(o))
+    Ok(out.finish())
 }
 pub(crate) fn sort_by(ctx: &mut dyn CallCtx, v: Value, f: &Value) -> VResult<Value> {
     let mut keyed = vec![];
@@ -266,11 +349,19 @@ pub(crate) fn minmax(v: Value, max: bool) -> VResult<Value> {
     Ok(best)
 }
 pub(crate) fn flatten(v: Value) -> VResult<Value> {
-    let mut o = vec![];
+    flatten_with_limits(
+        v,
+        EAGER_COLLECTION_MAX_VALUES,
+        EAGER_COLLECTION_MAX_RETAINED_BYTES,
+    )
+}
+
+fn flatten_with_limits(v: Value, max_values: usize, max_retained_bytes: usize) -> VResult<Value> {
+    let mut out = MaterializedCollection::new(max_values, max_retained_bytes);
     for x in seq(v)? {
-        o.extend(seq(x)?)
+        out.extend(seq(x)?)?;
     }
-    Ok(Value::List(o))
+    Ok(out.finish())
 }
 pub(crate) fn enumerate(v: Value) -> VResult<Value> {
     Ok(Value::List(
@@ -397,6 +488,53 @@ fn index(index: i64, len: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct RepeatCtx;
+
+    impl CallCtx for RepeatCtx {
+        fn call_closure(&mut self, _f: &Value, args: Vec<Value>) -> VResult<Value> {
+            Ok(Value::List(vec![args[0].clone(), args[0].clone()]))
+        }
+
+        fn buffer_stream(&mut self, _stream: StreamVal, _capacity: usize) -> VResult<StreamVal> {
+            unreachable!("collection tests do not buffer streams")
+        }
+
+        fn cwd(&self) -> std::path::PathBuf {
+            std::env::temp_dir()
+        }
+
+        fn fs(&self) -> &dyn Fs {
+            static FS: StdFs = StdFs;
+            &FS
+        }
+    }
+
+    #[test]
+    fn multiplicative_collections_fail_at_incremental_limits() {
+        let input = Value::List(vec![Value::Int(1), Value::Int(2)]);
+        assert_eq!(
+            flat_map_with_limits(&mut RepeatCtx, input, &Value::Null, 3, 1024)
+                .unwrap_err()
+                .code,
+            "collection_materialization_limit"
+        );
+
+        let nested = Value::List(vec![
+            Value::List(vec![Value::Int(1), Value::Int(2)]),
+            Value::List(vec![Value::Int(3), Value::Int(4)]),
+        ]);
+        assert_eq!(
+            flatten_with_limits(nested, 3, 1024).unwrap_err().code,
+            "collection_materialization_limit"
+        );
+
+        let oversized = Value::List(vec![Value::List(vec![Value::Str("x".repeat(128))])]);
+        assert_eq!(
+            flatten_with_limits(oversized, 8, 64).unwrap_err().code,
+            "collection_materialization_limit"
+        );
+    }
 
     #[test]
     fn get_indexes_tables_and_ranges_without_materializing() {

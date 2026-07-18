@@ -94,7 +94,7 @@ propagate or alter the bit:
 
 | Stage | Result boundedness |
 |---|---|
-| `map`, `filter`, `scan`, `flat_map`, `dedupe`, `distinct`, `buffer`, timing/window stages | same as input |
+| `map`, `filter`, `scan`, `flat_map`, `dedupe`, `distinct`, `buffer`, timing/window stages | same as input; a bounded `flat_map` rejects a dynamically returned unbounded child |
 | `take(n)` | always bounded |
 | predicate `take_until` | currently same as input, even though predicate may stop it |
 | stream `take_until` | currently same as primary input |
@@ -254,8 +254,10 @@ length shrinks; rename/replacement behavior beyond that depends on platform `not
 | `merge(other)` | nonblocking probes with alternating preference; round-robin when both are ready, free-running when only one is ready |
 | `zip(other)` | positional pairs with at most one pending item per side; ends when either side ends |
 
-`flat_map` is concat-map, not concurrent merge: an endless returned substream prevents the next
-outer item from being pulled. `distinct` preserves `Value` equality across representations such as
+`flat_map` is concat-map, not concurrent merge. A bounded outer stream rejects an endless returned
+substream with `stream_unbounded`, preserving its advertised natural end; bound that child inside
+the closure with `.take(n)` or `.take_until(...)`. An unbounded outer stream may return an endless
+child, which then prevents the next outer item from being pulled. `distinct` preserves `Value` equality across representations such as
 `1`/`1.0`, path/string, and table/list-of-records by using an equality-compatible semantic hash and
 confirming candidates within each bucket. Its membership checks are amortized O(1). Exact history
 retains at most the requested/default 4,096 identities and 16 MiB of measured values; reaching

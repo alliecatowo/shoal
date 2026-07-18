@@ -364,6 +364,7 @@ impl StreamVal {
             Box::new(ops::FlatMapSequential {
                 up,
                 f,
+                require_bounded_children: b,
                 sub: None,
                 queue: std::collections::VecDeque::new(),
             })
