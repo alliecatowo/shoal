@@ -352,13 +352,87 @@ pub(crate) fn contains(v: Value, q: &Value) -> VResult<Value> {
 pub(crate) fn get(v: Value, key: &Value, default: Value) -> VResult<Value> {
     match (v, key) {
         (Value::Record(r), Value::Str(k)) => Ok(r.get(k).cloned().unwrap_or(default)),
-        (Value::List(x), Value::Int(i)) => Ok(if *i >= 0 {
-            x.get(*i as usize)
-        } else {
-            x.get(x.len().wrapping_sub((-i) as usize))
+        (Value::List(x), Value::Int(i)) => Ok(index(*i, x.len())
+            .and_then(|i| x.get(i).cloned())
+            .unwrap_or(default)),
+        (Value::Table(x), Value::Int(i)) => Ok(index(*i, x.len())
+            .and_then(|i| x.get(i).cloned())
+            .map(Value::Record)
+            .unwrap_or(default)),
+        (Value::Range(r), Value::Int(i)) => {
+            let last = if r.inclusive {
+                r.end
+            } else {
+                r.end.saturating_sub(1)
+            };
+            let candidate = if *i >= 0 {
+                i128::from(r.start) + i128::from(*i)
+            } else {
+                i128::from(last) + i128::from(*i) + 1
+            };
+            Ok(
+                if candidate >= i128::from(r.start) && candidate <= i128::from(last) {
+                    Value::Int(candidate as i64)
+                } else {
+                    default
+                },
+            )
         }
-        .cloned()
-        .unwrap_or(default)),
-        _ => Err(ErrorVal::type_error("get expects record+str or list+int")),
+        _ => Err(ErrorVal::type_error(
+            "get expects record+str or list/table/range+int",
+        )),
+    }
+}
+
+fn index(index: i64, len: usize) -> Option<usize> {
+    if index >= 0 {
+        usize::try_from(index).ok().filter(|index| *index < len)
+    } else {
+        usize::try_from(index.unsigned_abs())
+            .ok()
+            .and_then(|distance| len.checked_sub(distance))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_indexes_tables_and_ranges_without_materializing() {
+        let mut row = Record::new();
+        row.insert("name".into(), Value::Str("shoal".into()));
+        assert_eq!(
+            get(Value::Table(vec![row.clone()]), &Value::Int(0), Value::Null).unwrap(),
+            Value::Record(row)
+        );
+        let range = || {
+            Value::Range(RangeVal {
+                start: 10,
+                end: 13,
+                inclusive: false,
+            })
+        };
+        assert_eq!(
+            get(range(), &Value::Int(1), Value::Null).unwrap(),
+            Value::Int(11)
+        );
+        assert_eq!(
+            get(range(), &Value::Int(-1), Value::Null).unwrap(),
+            Value::Int(12)
+        );
+        assert_eq!(
+            get(range(), &Value::Int(8), Value::Int(99)).unwrap(),
+            Value::Int(99)
+        );
+        assert_eq!(
+            get(
+                Value::List(vec![Value::Int(1)]),
+                &Value::Int(i64::MIN),
+                Value::Int(99),
+            )
+            .unwrap(),
+            Value::Int(99)
+        );
     }
 }

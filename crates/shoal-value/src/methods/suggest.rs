@@ -136,6 +136,8 @@ const BYTES_METHODS: &[&str] = &[
     "len", "count", "is_empty", "str", "display", "stream", "json", "save", "append", "feed",
 ];
 
+const BOOL_METHODS: &[&str] = &["str", "display", "json", "save", "append", "feed"];
+
 /// Quantity/temporal scalars: no unary method surface of their own beyond the
 /// universal serializers.
 const SCALAR_METHODS: &[&str] = &["json", "save", "append", "feed"];
@@ -159,6 +161,7 @@ static METHOD_NAMES: std::sync::LazyLock<Vec<&'static str>> = std::sync::LazyLoc
         .chain(PATH_METHODS)
         .chain(TASK_METHODS)
         .chain(BYTES_METHODS)
+        .chain(BOOL_METHODS)
         .chain(SCALAR_METHODS)
         .chain(POLY_METHODS)
         .copied()
@@ -197,7 +200,8 @@ fn type_table(type_name: &str) -> Option<&'static [&'static str]> {
         "path" => PATH_METHODS,
         "task" => TASK_METHODS,
         "bytes" => BYTES_METHODS,
-        "bool" | "size" | "duration" | "datetime" | "time" => SCALAR_METHODS,
+        "bool" => BOOL_METHODS,
+        "size" | "duration" | "datetime" | "time" => SCALAR_METHODS,
         _ => return None,
     })
 }
@@ -406,6 +410,9 @@ mod tests {
         for m in ["upper", "map", "where"] {
             assert!(!r.contains(&m), "record must NOT offer `{m}`");
         }
+        let b = methods_for("bool").unwrap();
+        assert!(b.contains(&"str"));
+        assert!(b.contains(&"display"));
     }
 
     #[test]

@@ -217,7 +217,6 @@ These are four separate, explicitly unimplemented surfaces:
 |---|---|---|
 | stream → process stdin | `feed_bytes(Value::Stream)` returns a type error | bounded backpressure/cancellation-aware producer-to-child pipe |
 | incomplete filesystem port | value/stream writes now route through `Fs` (HR-C1/C2); direct path metadata/canonicalize/exists/watch *reads* still coexist with injected `Fs` | expand capability traits to the read-side probes and prohibit direct host path access in evaluator/value effect paths |
-| method metadata/dispatch parity | sequence metadata advertises table/range `.get` that dispatch rejects; bool omits valid `.str`/`.display` | generate receiver metadata from executable dispatch tests or pin bidirectional parity fixtures |
 | function type soundness | scalar parameter and return annotations are not consistently enforced; non-string command arguments can bypass coercion | one runtime validator shared by expression/command calls plus return checking and conformance cases |
 | kernel task suspend/resume | handlers return `TASK_CONTROL_UNAVAILABLE` | task runtime that can identify/control owned child groups, or remove verbs |
 | WASM ABI evolution | preview ABI v1 is integrated with declared+authorized hostcalls and bounded values | keep new hostcalls effect-scoped, versioned, cancellable, and adversarially tested |
