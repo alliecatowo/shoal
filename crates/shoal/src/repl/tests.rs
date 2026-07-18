@@ -167,6 +167,11 @@ fn protocol_snapshot_refreshes_completion_env_and_cwd() {
         seen: Vec::new(),
         outcome: Ok(protocol_outcome(None, "completed")),
         snapshot: Ok(serde_json::json!({
+            "authority": {
+                "principal": "agent:remote",
+                "kind": "agent",
+                "leash": {"tier": "B", "enforced": true}
+            },
             "cwd": {"display": "/remote/project"},
             "completion": {"path_dirs": [{"display": "/remote/project/bin"}]},
             "bindings": [
@@ -191,6 +196,8 @@ fn protocol_snapshot_refreshes_completion_env_and_cwd() {
     .unwrap();
 
     assert_eq!(snapshot.jobs.running, 1);
+    assert_eq!(snapshot.authority.principal, "agent:remote");
+    assert!(!snapshot.authority.human);
     assert_eq!(*cwd.lock().unwrap(), PathBuf::from("/remote/project"));
     assert_eq!(
         *path_dirs.lock().unwrap(),
@@ -675,17 +682,28 @@ fn filtered_history_dedup_seeds_from_the_last_persisted_entry() {
 /// mode, anything else (including the default `"emacs"`) selects `Emacs`.
 #[test]
 fn build_edit_mode_selects_vi_or_emacs_from_config() {
+    use crossterm::event::{Event, KeyEvent};
+
     let mut config = shoal_config::Config::default();
     config.editor.mode = "vi".to_string();
-    let vi_mode = build_edit_mode(&config, &[]);
+    let (mut vi_mode, vi_tracker) = build_edit_mode(&config, &[]);
     assert!(matches!(
         vi_mode.edit_mode(),
         reedline::PromptEditMode::Vi(_)
     ));
+    assert_eq!(vi_tracker.current(), shoal_prompt::EditMode::ViInsert);
+    let escape: reedline::ReedlineRawEvent =
+        Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .try_into()
+            .unwrap();
+    let transition = vi_mode.parse_event(escape);
+    assert!(matches!(transition, ReedlineEvent::Multiple(_)));
+    assert_eq!(vi_tracker.current(), shoal_prompt::EditMode::ViNormal);
 
     config.editor.mode = "emacs".to_string();
-    let emacs_mode = build_edit_mode(&config, &[]);
+    let (emacs_mode, emacs_tracker) = build_edit_mode(&config, &[]);
     assert_eq!(emacs_mode.edit_mode(), reedline::PromptEditMode::Emacs);
+    assert_eq!(emacs_tracker.current(), shoal_prompt::EditMode::Emacs);
 }
 
 /// `editor.keybindings` (site/content/internals/configuration-reference.md): a custom chord actually
@@ -707,7 +725,7 @@ fn build_edit_mode_applies_custom_bindings() {
     };
 
     let config = shoal_config::Config::default();
-    let mut emacs_mode = build_edit_mode(&config, &custom);
+    let (mut emacs_mode, _) = build_edit_mode(&config, &custom);
     assert_eq!(
         emacs_mode.parse_event(raw_event()),
         ReedlineEvent::ClearScreen
@@ -715,7 +733,7 @@ fn build_edit_mode_applies_custom_bindings() {
 
     let mut vi_config = shoal_config::Config::default();
     vi_config.editor.mode = "vi".to_string();
-    let mut vi_mode = build_edit_mode(&vi_config, &custom);
+    let (mut vi_mode, _) = build_edit_mode(&vi_config, &custom);
     assert_eq!(vi_mode.parse_event(raw_event()), ReedlineEvent::ClearScreen);
 }
 

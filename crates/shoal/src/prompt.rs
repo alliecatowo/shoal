@@ -44,6 +44,7 @@ mod budget;
 mod cli;
 mod config;
 mod custom;
+mod edit_mode;
 mod git;
 
 pub(crate) use battery::BatterySampler;
@@ -51,6 +52,7 @@ pub(crate) use budget::PromptBudgetWarnings;
 pub use cli::{PromptAction, parse_action, run};
 pub use config::load_prompt_config;
 pub(crate) use custom::{CUSTOM_ONE_SHOT_WAIT, CustomScheduler};
+pub(crate) use edit_mode::EditModeTracker;
 pub use git::read_git;
 #[cfg(test)]
 use git::{discover_repo, git_status_counts, parse_porcelain_v2_counts, read_head, read_state};
@@ -64,15 +66,22 @@ pub type SharedCtx = Arc<RwLock<Arc<PromptContext>>>;
 pub struct ShoalPrompt {
     renderer: Arc<Renderer>,
     ctx: SharedCtx,
+    edit_mode: EditModeTracker,
     /// When true this is the transient (post-Enter) prompt (site/content/internals/prompt-editor-lsp.md).
     transient: bool,
 }
 
 impl ShoalPrompt {
-    pub fn new(renderer: Arc<Renderer>, ctx: SharedCtx, transient: bool) -> Self {
+    pub fn new(
+        renderer: Arc<Renderer>,
+        ctx: SharedCtx,
+        edit_mode: EditModeTracker,
+        transient: bool,
+    ) -> Self {
         Self {
             renderer,
             ctx,
+            edit_mode,
             transient,
         }
     }
@@ -93,7 +102,10 @@ impl Prompt for ShoalPrompt {
         } else {
             Side::Left
         };
-        Cow::Owned(self.renderer.render_side(side, &ctx))
+        Cow::Owned(
+            self.renderer
+                .render_side_with_edit_mode(side, &ctx, self.edit_mode.current()),
+        )
     }
 
     fn render_prompt_right(&self) -> Cow<'_, str> {
@@ -101,7 +113,11 @@ impl Prompt for ShoalPrompt {
             return Cow::Borrowed("");
         }
         let ctx = self.snapshot();
-        Cow::Owned(self.renderer.render_side(Side::Right, &ctx))
+        Cow::Owned(self.renderer.render_side_with_edit_mode(
+            Side::Right,
+            &ctx,
+            self.edit_mode.current(),
+        ))
     }
 
     fn render_prompt_indicator(&self, _mode: PromptEditMode) -> Cow<'_, str> {
@@ -113,7 +129,11 @@ impl Prompt for ShoalPrompt {
 
     fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> {
         let ctx = self.snapshot();
-        Cow::Owned(self.renderer.render_side(Side::Continuation, &ctx))
+        Cow::Owned(self.renderer.render_side_with_edit_mode(
+            Side::Continuation,
+            &ctx,
+            self.edit_mode.current(),
+        ))
     }
 
     fn render_prompt_history_search_indicator(
@@ -313,8 +333,20 @@ pub fn build_context_from_protocol(
             total: snapshot.jobs.total,
             completed: snapshot.jobs.completed,
         },
-        principal: facts.principal.clone(),
-        leash: facts.leash.clone(),
+        principal: if snapshot.authority.human {
+            Principal::Human
+        } else {
+            Principal::Agent(snapshot.authority.principal.clone())
+        },
+        leash: LeashSnapshot {
+            tier: match snapshot.authority.leash_tier.as_str() {
+                "A" => LeashTier::A,
+                "B" => LeashTier::B,
+                "C" => LeashTier::C,
+                _ => LeashTier::D,
+            },
+            enforced: snapshot.authority.leash_enforced,
+        },
         session: facts.session.clone(),
         time_local: (h, m, s),
         git: read_git(&cwd),
@@ -599,6 +631,11 @@ mod tests {
     fn protocol_context_uses_the_authenticated_session_snapshot() {
         let dir = tempfile::tempdir().unwrap();
         let snapshot = ProtocolSnapshot::parse(serde_json::json!({
+            "authority": {
+                "principal": "agent:prompt-test",
+                "kind": "agent",
+                "leash": {"tier": "C", "enforced": true}
+            },
             "cwd": {"display": dir.path().to_string_lossy()},
             "bindings": [],
             "jobs": {"running": 2, "suspended": 1, "total": 3, "completed": 4},
@@ -630,6 +667,12 @@ mod tests {
         assert_eq!(context.jobs.suspended, 1);
         assert_eq!(context.jobs.total, 3);
         assert_eq!(context.jobs.completed, 4);
+        assert!(matches!(
+            context.principal,
+            Principal::Agent(ref name) if name == "agent:prompt-test"
+        ));
+        assert_eq!(context.leash.tier, LeashTier::C);
+        assert!(context.leash.enforced);
         let outcome = context.last_outcome.expect("kernel outcome reaches prompt");
         assert!(!outcome.ok);
         assert_eq!(outcome.status, Some(7));
@@ -639,5 +682,26 @@ mod tests {
         assert_eq!(context.reef[0].tool, "node");
         assert_eq!(context.reef[0].version.as_deref(), Some("22.1.0"));
         assert!(context.reef[0].constrained);
+    }
+
+    #[test]
+    fn reedline_prompt_reads_the_live_tracked_vi_mode() {
+        let mut config = PromptConfig::default();
+        config.format.left = "$character".into();
+        let (renderer, _) = Renderer::new(config);
+        let mut context = PromptContext::empty(PathBuf::from("/"));
+        context.no_color = true;
+        let shared: SharedCtx = Arc::new(RwLock::new(Arc::new(context)));
+        let tracker = EditModeTracker::default();
+        let prompt = ShoalPrompt::new(Arc::new(renderer), shared, tracker.clone(), false);
+
+        tracker.observe(&reedline::PromptEditMode::Vi(
+            reedline::PromptViMode::Normal,
+        ));
+        assert_eq!(prompt.render_prompt_left(), "❮");
+        tracker.observe(&reedline::PromptEditMode::Vi(
+            reedline::PromptViMode::Insert,
+        ));
+        assert_eq!(prompt.render_prompt_left(), "❯");
     }
 }

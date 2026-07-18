@@ -211,7 +211,7 @@ style spec equals that name. They are not macros inside a compound spec such as 
 
 | Placeholder | Snapshot input | Visibility/format behavior | Wiring status |
 |---|---|---|---|
-| `character` | last outcome, edit mode, Unicode | success/error/Vi-normal symbol | edit mode producer is hardcoded Emacs |
+| `character` | last outcome, edit mode, Unicode | success/error/Vi-normal-or-visual symbol | lock-free live Reedline mode bridge |
 | `directory` | cwd, home, repo-relative path, read-only | home collapse; `start`/`middle`/`end` component truncation | active |
 | `git_branch` | branch or detached SHA | symbol, truncation, template | active |
 | `git_status` | counts/degraded flag | staged/worktree/untracked/conflict/stash/ahead/behind | stash always zero; one explicit Git CLI reader |
@@ -223,8 +223,8 @@ style spec equals that name. They are not macros inside a compound spec such as 
 | `username` | session identity | root/SSH/show-always gate | active |
 | `hostname` | session identity | SSH/show-always gate | active |
 | `reef` | cached bindings | constrained by default; version shortened | active |
-| `principal` | human/agent | symbols and optional agent name | producer always Human |
-| `leash` | detected tier/enforced | per-tier style/symbol | capability snapshot, not loaded policy identity |
+| `principal` | authenticated human/agent | symbols and optional agent name | kernel snapshot authority; standalone is local human |
+| `leash` | actual authority tier/enforced | per-tier style/symbol | kernel policy/backend forecast or standalone detection |
 | `battery` | optional battery snapshot | charging/low threshold | cached Linux/macOS host producer when enabled |
 | `language_<name>` | matching Reef binding | exact constrained/resolved visibility | consumes Reef-owned discovery/cache state |
 | `custom_<name>` | `Ready/Pending/Stale/Error` segment | ready/stale output only | bounded background producer with TTL cache |
@@ -330,19 +330,19 @@ zero; there is no asynchronous stale-cache engine today.
 
 ### Known hardcoded context gaps
 
-The host currently builds every live context with:
+The remaining deliberately incomplete Git facts are:
 
 ```text
-edit_mode = Emacs
-principal = Human
 git.stashed = 0
 git.age = 0
 ```
 
-The shell can genuinely run Reedline in Vi mode, but the prompt never sees Vi normal/insert/visual
-state. Consequently `character.vicmd_symbol` is non-operational in the real shell. Agent principal,
-stash, and stale-age render branches remain producer-incomplete. Battery and custom values are
-host-produced only when their modules are configured.
+The Reedline adapter wraps the selected edit mode and publishes Emacs/Vi insert/normal/visual state
+through a lock-free scalar before each paint; the pure renderer accepts that state as an overlay on
+the frozen context. Kernel-backed contexts require an authenticated `authority` projection and use
+its human/agent identity plus real Leash tier/enforcement forecast. Standalone mode is explicitly a
+local-human evaluator. Stash and stale-age remain producer-incomplete. Battery and custom values
+are host-produced only when their modules are configured.
 
 ## Reedline prompt adapter
 
@@ -649,26 +649,22 @@ deliberate audit across consumers.
 | jobs/Reef prompt | renderer tests | evaluator mapping tests | implemented |
 | custom prompt | renderer + scheduler admission/cache tests | real config → bounded worker → CLI/render integration | implemented, host-side only |
 | battery prompt | renderer + platform parser tests | cached Linux/macOS producer | implemented when enabled |
-| Vi/principal prompt | renderer tests | no complete authority/editor-state producer | scaffolded/inert |
+| Vi/principal/Leash prompt | renderer + tracker/projection tests | live editor state and authenticated kernel authority | implemented |
 | completion | large context/matching/cache test set | Reedline composition | strong heuristic implementation |
 | highlighting | broad token/dispatch tests | environment-sensitive color tests | implemented; PATH repaint cost |
-| keybindings | chord/action tests | edit-mode construction tests | implemented, mode-state prompt gap |
+| keybindings | chord/action/tracked-mode tests | edit-mode construction and live prompt bridge | implemented |
 | picker | pure model/scoring/Unicode tests | terminal loop has no pseudo-TTY integration | implemented with viewport issue |
 | LSP | AST scope/definition/incremental/diagnostic unit tests | no editor protocol integration suite | useful local semantic baseline |
 
 ## Prioritized improvements
 
-1. **Bridge real editor state into prompt context.** Expose Emacs/Vi normal/insert/visual and
-   multiline state without adding I/O to rendering.
-2. **Either implement or remove security/status-like prompt producers.** Agent principal and Leash
-   display must represent the actual evaluator/client authority, not only process defaults.
-3. **Keep prompt schema tied to real owners.** New fields need a consuming host path and producer
+1. **Keep prompt schema tied to real owners.** New fields need a consuming host path and producer
    tests before being advertised; do not reintroduce speculative engine/probe toggles.
-4. **Unify project prompt discovery with core configuration.** The current-directory-only prompt
+2. **Unify project prompt discovery with core configuration.** The current-directory-only prompt
    layer visibly disagrees with nearest-ancestor typed config.
-5. **Move command-resolution checks out of repaint.** Share the completer's cache or a host command
+3. **Move command-resolution checks out of repaint.** Share the completer's cache or a host command
    index with highlighting, including Reef and adapters.
-6. **Give the picker a scrolling viewport** and add pseudo-TTY restoration/cancellation tests.
+4. **Give the picker a scrolling viewport** and add pseudo-TTY restoration/cancellation tests.
 7. **Build a syntax-service layer** for incomplete-state, cursor context, declarations, symbols, and
    docs so REPL and LSP stop hand-copying grammar decisions.
 8. **Extend the scoped LSP into a workspace graph** for references/rename and add type/method hover

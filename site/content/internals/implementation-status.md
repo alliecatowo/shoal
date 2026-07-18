@@ -363,14 +363,16 @@ typed ownership rather than keeping two independent parsers.
 
 ## Prompt, editor, and LSP status
 
-The prompt crate is correctly pure: a `PromptContext` snapshot enters and rendered lines/styles
-leave. This is a strong boundary. The local producer does not yet populate the entire model:
+The prompt crate is correctly pure: a `PromptContext` snapshot plus a scalar live edit-mode overlay
+enter and rendered lines/styles leave. This is a strong boundary. Remaining model gaps are narrow:
 
-- editing mode is hardcoded to Emacs;
-- output mode is hardcoded Human;
 - stash count is zero;
 - battery and trusted custom module data are gathered outside the render path when configured;
 - git status is gathered synchronously rather than from a deferred/event-driven cache.
+
+The kernel session snapshot carries authenticated human/agent identity and actual Leash
+tier/enforcement forecast; standalone mode is explicitly local-human. Reedline's selected editor
+mode is tracked live across Emacs and Vi insert/normal/visual paints without I/O.
 
 Reedline completion, highlighting, history, menu/picker, and keybinding paths are implemented. They
 share builtin names but duplicate context heuristics. LSP diagnostics and completion work, while

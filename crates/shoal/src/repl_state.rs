@@ -34,8 +34,17 @@ pub(crate) struct ProtocolReefBinding {
     pub(crate) constrained: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProtocolAuthority {
+    pub(crate) principal: String,
+    pub(crate) human: bool,
+    pub(crate) leash_tier: String,
+    pub(crate) leash_enforced: bool,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ProtocolSnapshot {
+    pub(crate) authority: ProtocolAuthority,
     pub(crate) cwd: PathBuf,
     /// Absolute executable-search directories from the attached evaluator.
     /// This deliberately projects only PATH semantics, never the session's
@@ -52,6 +61,31 @@ impl ProtocolSnapshot {
         let object = value
             .as_object()
             .ok_or_else(|| "session.snapshot response is not an object".to_string())?;
+        let authority = object
+            .get("authority")
+            .ok_or_else(|| "session.snapshot omitted authority".to_string())?;
+        let leash = authority
+            .get("leash")
+            .ok_or_else(|| "session.snapshot authority omitted leash".to_string())?;
+        let kind = required_str(authority, "kind")?;
+        let human = match kind {
+            "human" => true,
+            "agent" => false,
+            other => {
+                return Err(format!(
+                    "session.snapshot authority kind is invalid: {other}"
+                ));
+            }
+        };
+        let authority = ProtocolAuthority {
+            principal: required_str(authority, "principal")?.to_string(),
+            human,
+            leash_tier: required_str(leash, "tier")?.to_string(),
+            leash_enforced: leash
+                .get("enforced")
+                .and_then(Json::as_bool)
+                .ok_or_else(|| "session.snapshot authority leash omitted enforced".to_string())?,
+        };
         let wire_path: WirePath = serde_json::from_value(
             object
                 .get("cwd")
@@ -142,6 +176,7 @@ impl ProtocolSnapshot {
         )
         .map_err(|error| format!("session.snapshot last_value: {error}"))?;
         Ok(Self {
+            authority,
             cwd,
             completion_path_dirs,
             bindings,
@@ -243,6 +278,7 @@ mod tests {
 
     fn snapshot(bindings: Json) -> ProtocolSnapshot {
         ProtocolSnapshot::parse(json!({
+            "authority":{"principal":"agent:test","kind":"agent","leash":{"tier":"A","enforced":true}},
             "cwd":{"display":"/work"},
             "bindings":bindings,
             "jobs":{"running":1,"suspended":0,"total":1},
@@ -255,6 +291,7 @@ mod tests {
     #[test]
     fn snapshot_accepts_completed_history_and_defaults_it_for_older_kernels() {
         let with_history = ProtocolSnapshot::parse(json!({
+            "authority":{"principal":"agent:test","kind":"agent","leash":{"tier":"A","enforced":true}},
             "cwd":{"display":"/work"},
             "bindings":[],
             "jobs":{"running":0,"suspended":0,"total":0,"completed":7},
@@ -296,6 +333,7 @@ mod tests {
     #[test]
     fn snapshot_decodes_only_the_explicit_completion_path_projection() {
         let parsed = ProtocolSnapshot::parse(json!({
+            "authority":{"principal":"agent:test","kind":"agent","leash":{"tier":"A","enforced":true}},
             "cwd":{"display":"/remote"},
             "completion":{"path_dirs":[
                 {"display":"/remote/bin"},

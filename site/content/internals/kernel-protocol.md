@@ -87,6 +87,13 @@ global resource ceilings; use separate OS users/kernels for mutually hostile ten
 
 ## Session contents
 
+`session.snapshot` is an attached, typed UI projection. In addition to cwd, bounded completion PATH
+directories, visible binding classifications, jobs, Reef bindings, and the last value, it includes
+an `authority` object: exact principal, server-established `human`/`agent` kind, and the current
+Leash tier/enforcement forecast. Clients must not infer human presence from a principal string or
+bearer profile. Shoal's kernel-backed prompt requires this projection and therefore cannot silently
+display ambient process identity for an authenticated agent session.
+
 ```mermaid
 classDiagram
 accTitle: Session contents

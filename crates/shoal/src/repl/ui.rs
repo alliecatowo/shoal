@@ -49,7 +49,7 @@ impl ReplUi {
         let (custom_bindings, keybinding_warnings) =
             crate::keybindings::parse_bindings(&config.editor.keybindings);
         warn_each(&keybinding_warnings);
-        let edit_mode = build_edit_mode(config, &custom_bindings);
+        let (edit_mode, edit_mode_tracker) = build_edit_mode(config, &custom_bindings);
 
         let (prompt_config, prompt_warnings) = prompt::load_prompt_config(cwd);
         warn_each(&prompt_warnings);
@@ -67,7 +67,12 @@ impl ReplUi {
         let shared_ctx: prompt::SharedCtx = Arc::new(RwLock::new(Arc::new(
             shoal_prompt::PromptContext::empty(cwd.to_path_buf()),
         )));
-        let prompt = prompt::ShoalPrompt::new(renderer.clone(), shared_ctx.clone(), false);
+        let prompt = prompt::ShoalPrompt::new(
+            renderer.clone(),
+            shared_ctx.clone(),
+            edit_mode_tracker.clone(),
+            false,
+        );
 
         let background_printer = ExternalPrinter::new(64);
         let mut editor = Reedline::create()
@@ -91,6 +96,7 @@ impl ReplUi {
             editor = editor.with_transient_prompt(Box::new(prompt::ShoalPrompt::new(
                 renderer.clone(),
                 shared_ctx.clone(),
+                edit_mode_tracker,
                 true,
             )));
         }

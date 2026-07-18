@@ -8,13 +8,13 @@ use super::Renderer;
 use super::helpers::{collapse_home, short_version, strftime_hms, truncate_branch, truncate_path};
 
 impl Renderer {
-    pub(super) fn render_character(&self, ctx: &PromptContext) -> String {
+    pub(super) fn render_character(&self, ctx: &PromptContext, edit_mode: EditMode) -> String {
         let m = &self.config.module.character;
         if !m.enabled {
             return String::new();
         }
         let ok = ctx.last_outcome.as_ref().map(|o| o.ok).unwrap_or(true);
-        let vicmd = ctx.edit_mode == EditMode::ViNormal;
+        let vicmd = matches!(edit_mode, EditMode::ViNormal | EditMode::ViVisual);
         let (symbol, style) = if vicmd {
             (m.vicmd_symbol.as_str(), m.vicmd_style.as_str())
         } else if ok {

@@ -801,7 +801,23 @@ impl Kernel {
             .map(|dir| WirePath::encode(dir.as_os_str()))
             .collect::<Vec<_>>();
         let reef = evaluator.prompt_reef_snapshot();
+        let status = EnforcementStatus::detect();
+        let authority_tier = tier_letter(status.available_tier);
+        let authority_enforced = self.caps_enforced_for(&attachment.principal);
+        let authority_kind = if attachment.connection_trust == ConnectionTrust::EmbeddedHuman {
+            "human"
+        } else {
+            "agent"
+        };
         Ok(json!({
+            "authority": {
+                "principal": attachment.principal,
+                "kind": authority_kind,
+                "leash": {
+                    "tier": authority_tier,
+                    "enforced": authority_enforced,
+                },
+            },
             "cwd": cwd,
             "completion": {
                 "path_dirs": completion_dirs,
@@ -1124,6 +1140,10 @@ mod poison_tests {
 
         assert!(snapshot.get("env").is_none());
         assert!(snapshot.get("environment").is_none());
+        assert_eq!(snapshot["authority"]["principal"], "principal:test");
+        assert_eq!(snapshot["authority"]["kind"], "human");
+        assert!(snapshot["authority"]["leash"]["tier"].is_string());
+        assert!(snapshot["authority"]["leash"]["enforced"].is_boolean());
         let paths = snapshot["completion"]["path_dirs"]
             .as_array()
             .expect("completion path projection");

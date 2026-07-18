@@ -70,6 +70,18 @@ fn character_success_error_vicmd() {
 }
 
 #[test]
+fn character_live_edit_mode_override_covers_vi_visual() {
+    let mut config = PromptConfig::default();
+    config.format.left = "$character".into();
+    let (renderer, _) = Renderer::new(config);
+    let ctx = base_ctx();
+    assert_eq!(
+        renderer.render_side_with_edit_mode(shoal_prompt::Side::Left, &ctx, EditMode::ViVisual),
+        "❮"
+    );
+}
+
+#[test]
 fn character_ascii_fallback_when_unicode_off() {
     let cfg = PromptConfig::default();
     let mut ctx = base_ctx();

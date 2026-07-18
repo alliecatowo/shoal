@@ -6,20 +6,22 @@ use std::path::{Path, PathBuf};
 
 use reedline::{
     EditMode, Emacs, FileBackedHistory, History, HistoryItem, HistoryItemId, HistorySessionId,
-    KeyCode, KeyModifiers, ReedlineEvent, SearchDirection, SearchQuery, ValidationResult,
-    Validator, Vi, default_emacs_keybindings, default_vi_insert_keybindings,
-    default_vi_normal_keybindings,
+    KeyCode, KeyModifiers, PromptEditMode, ReedlineEvent, ReedlineRawEvent, SearchDirection,
+    SearchQuery, ValidationResult, Validator, Vi, default_emacs_keybindings,
+    default_vi_insert_keybindings, default_vi_normal_keybindings,
 };
+
+use crate::prompt::EditModeTracker;
 
 pub(super) fn build_edit_mode(
     config: &shoal_config::Config,
     custom: &[crate::keybindings::ParsedBinding],
-) -> Box<dyn EditMode> {
+) -> (Box<dyn EditMode>, EditModeTracker) {
     let tab_event = ReedlineEvent::UntilFound(vec![
         ReedlineEvent::Menu("completion_menu".to_string()),
         ReedlineEvent::MenuNext,
     ]);
-    if config.editor.mode == "vi" {
+    let inner: Box<dyn EditMode> = if config.editor.mode == "vi" {
         let mut insert = default_vi_insert_keybindings();
         let mut normal = default_vi_normal_keybindings();
         insert.add_binding(KeyModifiers::NONE, KeyCode::Tab, tab_event);
@@ -35,6 +37,41 @@ pub(super) fn build_edit_mode(
             keybindings.add_binding(binding.modifiers, binding.code, binding.event.clone());
         }
         Box::new(Emacs::new(keybindings))
+    };
+    let tracker = EditModeTracker::default();
+    tracker.observe(&inner.edit_mode());
+    (
+        Box::new(TrackedEditMode {
+            inner,
+            tracker: tracker.clone(),
+        }),
+        tracker,
+    )
+}
+
+struct TrackedEditMode {
+    inner: Box<dyn EditMode>,
+    tracker: EditModeTracker,
+}
+
+impl EditMode for TrackedEditMode {
+    fn parse_event(&mut self, event: ReedlineRawEvent) -> ReedlineEvent {
+        let event = self.inner.parse_event(event);
+        // Reedline does not export EventStatus, so an external decorator
+        // cannot override handle_mode_specific_event. Apply Vi transitions to
+        // the wrapped owner here; the engine's later default-handler call is a
+        // harmless no-op on this decorator.
+        if matches!(event, ReedlineEvent::ViChangeMode(_)) {
+            let _ = self.inner.handle_mode_specific_event(event.clone());
+        }
+        self.tracker.observe(&self.inner.edit_mode());
+        event
+    }
+
+    fn edit_mode(&self) -> PromptEditMode {
+        let mode = self.inner.edit_mode();
+        self.tracker.observe(&mode);
+        mode
     }
 }
 
