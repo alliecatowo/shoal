@@ -663,9 +663,12 @@ Kernel/MCP use `$TMPDIR/shoal-UID/...`; doctor may probe `$TMPDIR/shoal/...` ins
 
 The running kernel may lack Landlock or usable ABI; there is no namespace fallback installed. `caps_enforced` remains false. Upgrade/use an appropriate kernel or contain the entire service externally; do not treat advisory policy as OS confinement.
 
-### Network policy is not enforced by OS
+### A network allowlist is not enforced by OS
 
-Even with Landlock/Seatbelt filesystem enforcement, current `network_enforced` is false. Use an external network namespace/firewall/container/service sandbox for a hard network boundary.
+Shoal can enforce coarse network denial with Landlock ABI 4+ (TCP bind/connect) or Seatbelt, and
+reports that as `network_enforced`. It cannot enforce hostname/port allowlists for opaque children.
+Use an external network namespace/firewall/container/service sandbox when you need selective access
+or coverage beyond the platform backend.
 
 ### GNU/BSD command differences
 

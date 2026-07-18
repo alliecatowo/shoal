@@ -688,7 +688,13 @@ fn sandbox_spec(
         }
     }
     let helper = sandbox::sandbox_helper()?;
-    spec.argv = sandbox::wrap(helper, &sandbox, program, &spec.argv);
+    spec.argv = sandbox::wrap(
+        helper,
+        &sandbox,
+        shoal_leash::NetPolicy::Unrestricted,
+        program,
+        &spec.argv,
+    );
     Ok(spec)
 }
 

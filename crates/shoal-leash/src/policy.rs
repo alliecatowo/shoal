@@ -177,14 +177,14 @@ impl Policy {
                 .is_some_and(|p| !p.is_fs_unrestricted())
     }
 
-    /// Whether a network destination allowlist is configured. Leash can
-    /// authorize declared `net.connect` effects, but no current OS backend can
-    /// confine an opaque child to this allowlist.
+    /// Whether a network destination/listener allowlist is configured. Leash
+    /// can authorize declared network effects, but the OS backends can only
+    /// enforce coarse all-or-nothing denial, not hostname/port allowlists.
     pub fn network_scoping_active(&self, principal: &str) -> bool {
         self.fail_closed
             || self
                 .principal(principal)
-                .is_some_and(|p| !p.net_connect.is_empty())
+                .is_some_and(|p| !p.net_connect.is_empty() || !p.net_listen.is_empty())
     }
 
     /// Whether this principal requires requested OS dimensions to be hard
@@ -361,10 +361,11 @@ impl PrincipalPolicy {
     /// longest concrete leading path (`/work/**` → `/work`) and non-existent
     /// roots are dropped so the backend never fails closed on a typo'd path.
     ///
-    /// Net policy is left [`NetPolicy::Unrestricted`] because no seccomp/netns
-    /// backend exists in this build — the plan-layer `NetConnect` verdict is
-    /// the honest gate; [`crate::EnforcementStatus::network_enforced`] already
-    /// reports `false`. `hermetic` is carried through from the principal.
+    /// A hermetic principal with no network grants lowers to coarse
+    /// [`NetPolicy::Deny`], which Landlock ABI 4+ or Seatbelt can enforce. Any
+    /// declared hostname/port/listener allowlist remains unrestricted here:
+    /// the evaluator refuses that hermetic request before spawn because the OS
+    /// backends cannot express it. `hermetic` is carried through unchanged.
     pub fn to_sandbox_policy(&self) -> Option<SandboxPolicy> {
         if self.is_fs_unrestricted() {
             return None;
@@ -381,7 +382,11 @@ impl PrincipalPolicy {
                 write,
                 delete,
             },
-            net: NetPolicy::Unrestricted,
+            net: if self.hermetic && self.net_connect.is_empty() && self.net_listen.is_empty() {
+                NetPolicy::Deny
+            } else {
+                NetPolicy::Unrestricted
+            },
             spawn_hash: None,
             hermetic: self.hermetic,
         })

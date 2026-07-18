@@ -368,8 +368,9 @@ impl Evaluator {
     }
 
     /// Refuse configured hard guarantees that the current spawn stack cannot
-    /// honestly provide. Network allowlists are plan-only today, and spawn
-    /// hashes are checked before `exec` with a documented TOCTOU window.
+    /// honestly provide. Host/port network allowlists are plan-only (coarse
+    /// deny is enforced separately), and spawn hashes are checked before
+    /// `exec` with a documented TOCTOU window.
     fn hermetic_spawn_guarantees(&self, span: Span) -> VResult<()> {
         let Some((policy, principal)) = self.session.leash.as_ref() else {
             return Ok(());
@@ -380,7 +381,7 @@ impl Evaluator {
         if policy.network_scoping_active(principal) {
             return Err(ErrorVal::new(
                 "spawn_denied",
-                "leash: hermetic network scoping is unavailable on this host",
+                "leash: hermetic hostname/port network allowlists are unavailable",
             )
             .with_span(span));
         }

@@ -4,7 +4,7 @@ fn main() {
     let raw = std::env::args_os().skip(1).collect::<Vec<_>>();
     if raw.as_slice() == ["-h"] || raw.as_slice() == ["--help"] {
         println!(
-            "Run a command in a Shoal filesystem sandbox\n\nUsage: shoal-sandbox-exec [--read PATH] [--write PATH] [--delete PATH] -- COMMAND [ARG...]"
+            "Run a command in a Shoal filesystem/network sandbox\n\nUsage: shoal-sandbox-exec [--deny-net] [--read PATH] [--write PATH] [--delete PATH] -- COMMAND [ARG...]"
         );
         return;
     }
@@ -14,11 +14,16 @@ fn main() {
     }
     let mut a = raw.into_iter();
     let mut s = shoal_leash::FsSandbox::default();
+    let mut net = shoal_leash::NetPolicy::Unrestricted;
     let mut cmd = Vec::new();
     while let Some(x) = a.next() {
         if x == "--" {
             cmd.extend(a);
             break;
+        }
+        if x == "--deny-net" {
+            net = shoal_leash::NetPolicy::Deny;
+            continue;
         }
         let path = PathBuf::from(
             a.next()
@@ -34,7 +39,7 @@ fn main() {
     if cmd.is_empty() {
         fail("missing command")
     }
-    if let Err(e) = shoal_leash::apply_sandbox(&s) {
+    if let Err(e) = shoal_leash::apply_sandbox_policy(&s, net) {
         fail(&format!("sandbox enforcement failed: {e}"))
     }
     let e = std::process::Command::new(&cmd[0]).args(&cmd[1..]).exec();

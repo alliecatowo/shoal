@@ -281,17 +281,18 @@ program, verifies an optional executable-content pin, and may rewrite argv throu
 
 | Platform/path | Filesystem enforcement | Network enforcement |
 |---|---|---|
-| Linux with Landlock ABI/helper | applied, tier A | not enforced |
-| macOS helper/Seatbelt | applied, reported tier C | not enforced |
+| Linux with Landlock ABI/helper | applied, tier A | TCP deny with ABI 4+ when requested |
+| macOS helper/Seatbelt | applied, reported tier C | deny-by-default when requested |
 | unsupported host | child may run unconfined with honest degraded status | not enforced |
 | any host with `hermetic` and unmet request | spawn fails closed | spawn fails closed |
 
-`net = deny` is advisory unless a future backend reports `network_enforced`. A hermetic request
-rejects execution when filesystem or requested network enforcement cannot be fully applied.
+`net = deny` is coarse: it does not express destination allowlists. A hermetic request rejects
+execution when filesystem or requested network enforcement cannot be fully applied.
 
 The helper is searched beside the current executable or its parent. Missing helper can fail a path
 that otherwise has an enforcement mechanism. Wrapped argv encodes read/write/delete grants, then
-`--`, resolved program, and original arguments after argv zero.
+`--deny-net` when requested, read/write/delete grants, then `--`, resolved program, and original
+arguments after argv zero.
 
 Executable pinning hashes before exec. There is a documented TOCTOU window between hash verification
 and the kernel executing the path; the status must not claim atomic verified execution.

@@ -299,7 +299,7 @@ fn hermetic_network_scope_refuses_before_an_opaque_child_spawn() {
         .eval_program(&parse(&cat_src(&allowed.join("ok.txt"))))
         .expect_err("an unenforceable hermetic network allowlist must refuse the spawn");
     assert_eq!(err.code, "spawn_denied");
-    assert!(err.msg.contains("network scoping"));
+    assert!(err.msg.contains("hostname/port network allowlists"));
 }
 
 #[test]

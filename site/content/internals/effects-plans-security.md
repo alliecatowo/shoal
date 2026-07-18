@@ -240,14 +240,16 @@ enforced; non-hermetic execution uses the strongest available backend and return
 | filesystem on supported Linux | Landlock backend |
 | filesystem on macOS | Seatbelt backend |
 | executable identity | preflight BLAKE3 check; no exec-time pin |
-| network | plan/policy gate only; no seccomp/network-namespace backend |
+| coarse network deny | Landlock ABI 4+ TCP bind/connect denial; Seatbelt deny-by-default |
+| hostname/port allowlist | plan/policy gate only; no OS backend |
 | unsupported OS | advisory policy, no strong OS sandbox |
 
 The spawn hash has a documented time-of-check/time-of-use gap: the path is hashed before `exec`, so
 the file can theoretically change between those events. Enforcement reports this rather than
 claiming an exec-time guarantee. Hermetic principals therefore refuse configured spawn pinning until
-an atomic backend exists. They also refuse configured network scoping because the current semantic
-allowlist cannot confine an opaque child.
+an atomic backend exists. They also refuse configured hostname/port network scoping because the
+current semantic allowlist cannot confine an opaque child; an empty network grant set instead lowers
+to enforceable coarse denial on supported hosts.
 
 Source: [`shoal-leash/src/enforce.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-leash/src/enforce.rs).
 

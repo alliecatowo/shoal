@@ -12,14 +12,15 @@ mod seatbelt;
 pub use effects::{Effect, Estimates, Plan, Reversibility};
 pub use enforce::{
     EnforcementStatus, EnforcementTier, FsSandbox, NetPolicy, SandboxPolicy, SpawnPreflight,
-    apply_landlock, apply_macos_sandbox, apply_sandbox, landlock_abi, preflight_spawn,
+    apply_landlock, apply_landlock_policy, apply_macos_sandbox, apply_macos_sandbox_policy,
+    apply_sandbox, apply_sandbox_policy, landlock_abi, preflight_spawn,
 };
 pub use policy::{
     AutoApply, OpaqueMode, POLICY_MAX_ASSIGNMENTS, POLICY_MAX_BYTES, POLICY_MAX_GRANT_BYTES,
     POLICY_MAX_GRANTS_PER_KIND, POLICY_MAX_NESTING, POLICY_MAX_PRINCIPALS, Policy, PolicyLoadError,
     PolicyParseError, PrincipalPolicy, Verdict,
 };
-pub use seatbelt::seatbelt_profile;
+pub use seatbelt::{seatbelt_profile, seatbelt_profile_with_net};
 
 #[cfg(test)]
 mod tests {
@@ -270,18 +271,12 @@ opaque = "ask"
         assert!(!s.enforced);
         assert_eq!(s.active_tier, None);
         // `detect()`'s wording of *why* nothing is enforced is intentionally
-        // platform-specific (this crate installs no backend itself, so the
-        // message just describes what host mechanism is missing): Linux
-        // phrases it as a landlock/seccomp/network mechanism being
-        // "unavailable"; macOS phrases it as the Seatbelt backend being "not
-        // installed"; anything else falls back to "advisory". All three
-        // honestly report the same underlying fact (no OS-level enforcement
-        // is active) in the phrasing appropriate to that platform's branch
-        // in `detect()`.
-        if cfg!(target_os = "linux") {
+        // platform-specific. Detection reports available capability, but does
+        // not claim that a restriction has already been installed.
+        if cfg!(target_os = "linux") && s.landlock_abi.is_none() {
             assert!(s.detail.contains("unavailable"), "{}", s.detail);
-        } else if cfg!(target_os = "macos") {
-            assert!(s.detail.contains("not installed"), "{}", s.detail);
+        } else if cfg!(any(target_os = "linux", target_os = "macos")) {
+            assert!(s.detail.contains("no sandbox applied"), "{}", s.detail);
         } else {
             assert!(s.detail.contains("advisory"), "{}", s.detail);
         }
@@ -314,6 +309,17 @@ opaque = "ask"
         assert!(profile.starts_with("(version 1)\n(deny default)"));
         assert_eq!(profile.matches("file-read* (subpath").count(), 1);
         assert!(profile.contains("quote\\\"and\\\\slash"));
+        assert!(profile.contains("(allow network*)"));
+        let denied = seatbelt_profile_with_net(
+            &FsSandbox {
+                read: vec![weird],
+                write: vec![],
+                delete: vec![],
+            },
+            NetPolicy::Deny,
+        )
+        .unwrap();
+        assert!(!denied.contains("(allow network*)"));
     }
     #[cfg(not(target_os = "macos"))]
     #[test]
@@ -381,6 +387,7 @@ opaque = "ask"
         assert!(sandbox.fs.delete.is_empty());
         // `hermetic` is carried through from the principal.
         assert!(sandbox.hermetic);
+        assert_eq!(sandbox.net, NetPolicy::Deny);
         assert!(!policy.principal("agent").unwrap().is_fs_unrestricted());
     }
 
@@ -425,6 +432,9 @@ opaque = "ask"
         assert!(policy.network_scoping_active("agent"));
         assert!(policy.spawn_pinning_active("agent"));
         assert!(!Policy::permissive("human").hermetic_active("human"));
+
+        let listener = Policy::from_toml("[principal.agent]\nnet_listen=[8080]\n").unwrap();
+        assert!(listener.network_scoping_active("agent"));
     }
 
     #[test]

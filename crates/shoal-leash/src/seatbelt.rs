@@ -1,13 +1,20 @@
 //! macOS Seatbelt profile generation: a deterministic, deny-by-default
 //! `(sandbox-init)` profile built from canonicalized filesystem grants.
 
-use crate::enforce::FsSandbox;
+use crate::enforce::{FsSandbox, NetPolicy};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Deterministic deny-by-default Seatbelt profile. Grants must exist so
 /// canonicalization cannot silently broaden a symlinked or lexical path.
 pub fn seatbelt_profile(grants: &FsSandbox) -> Result<String, String> {
+    seatbelt_profile_with_net(grants, NetPolicy::Unrestricted)
+}
+
+/// Build the filesystem profile plus an explicit coarse network policy.
+/// Seatbelt starts from `deny default`, so unrestricted networking must be
+/// granted deliberately; `Deny` leaves network operations ungranted.
+pub fn seatbelt_profile_with_net(grants: &FsSandbox, net: NetPolicy) -> Result<String, String> {
     let mut read = canonical_grants(&grants.read)?;
     let mut write = canonical_grants(&grants.write)?;
     let mut delete = canonical_grants(&grants.delete)?;
@@ -20,6 +27,9 @@ pub fn seatbelt_profile(grants: &FsSandbox) -> Result<String, String> {
     let mut out = String::from(
         "(version 1)\n(deny default)\n(allow process*)\n(allow signal (target self))\n",
     );
+    if net == NetPolicy::Unrestricted {
+        out.push_str("(allow network*)\n");
+    }
     for p in read {
         out.push_str(&format!(
             "(allow file-read* (subpath \"{}\"))\n",

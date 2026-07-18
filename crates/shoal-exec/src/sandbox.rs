@@ -25,7 +25,6 @@ pub(crate) fn apply(spec: &mut ExecSpec) -> io::Result<Option<EnforcementStatus>
         return Ok(None);
     };
     if policy.hermetic
-        && policy.net != NetPolicy::Deny
         && policy.fs.read.is_empty()
         && policy.fs.write.is_empty()
         && policy.fs.delete.is_empty()
@@ -46,33 +45,57 @@ pub(crate) fn apply(spec: &mut ExecSpec) -> io::Result<Option<EnforcementStatus>
         verify_pin(&program, pin)?;
     }
 
-    let mut status = if cfg!(target_os = "linux") && shoal_leash::landlock_abi().is_some() {
-        spec.argv = wrap(sandbox_helper()?, &policy.fs, program, &spec.argv);
+    let linux_backend = cfg!(target_os = "linux")
+        && shoal_leash::landlock_abi().is_some_and(|abi| policy.net != NetPolicy::Deny || abi >= 4);
+    let mut status = if linux_backend {
+        spec.argv = wrap(
+            sandbox_helper()?,
+            &policy.fs,
+            policy.net,
+            program,
+            &spec.argv,
+        );
         EnforcementStatus {
             available_tier: EnforcementTier::A,
             active_tier: Some(EnforcementTier::A),
             enforced: true,
-            detail: "Landlock applied to the spawned child before exec; seccomp/netns \
-                      unavailable so net policy is advisory only"
-                .into(),
+            detail: format!(
+                "Landlock applied to the spawned child before exec; TCP deny {}",
+                if policy.net == NetPolicy::Deny {
+                    "active"
+                } else {
+                    "not requested"
+                }
+            ),
             landlock_abi: shoal_leash::landlock_abi(),
             filesystem_enforced: true,
             spawn_exec_enforced: policy.spawn_hash.is_some(),
-            network_enforced: false,
+            network_enforced: policy.net == NetPolicy::Deny,
         }
     } else if cfg!(target_os = "macos") {
-        spec.argv = wrap(sandbox_helper()?, &policy.fs, program, &spec.argv);
+        spec.argv = wrap(
+            sandbox_helper()?,
+            &policy.fs,
+            policy.net,
+            program,
+            &spec.argv,
+        );
         EnforcementStatus {
             available_tier: EnforcementTier::C,
             active_tier: Some(EnforcementTier::C),
             enforced: true,
-            detail: "Seatbelt profile applied to the spawned child before exec; net policy \
-                      is advisory only"
-                .into(),
+            detail: format!(
+                "Seatbelt profile applied to the spawned child before exec; network {}",
+                if policy.net == NetPolicy::Deny {
+                    "denied"
+                } else {
+                    "unrestricted"
+                }
+            ),
             landlock_abi: None,
             filesystem_enforced: true,
             spawn_exec_enforced: policy.spawn_hash.is_some(),
-            network_enforced: false,
+            network_enforced: policy.net == NetPolicy::Deny,
         }
     } else {
         let mut degraded = EnforcementStatus::detect();
@@ -86,7 +109,7 @@ pub(crate) fn apply(spec: &mut ExecSpec) -> io::Result<Option<EnforcementStatus>
     if policy.net == NetPolicy::Deny && !status.network_enforced {
         status
             .detail
-            .push_str("; net.deny requested but no seccomp/netns backend exists to enforce it");
+            .push_str("; net.deny requested but this host has no compatible OS backend");
     }
 
     if policy.hermetic {
@@ -151,10 +174,14 @@ pub(crate) fn sandbox_helper() -> io::Result<PathBuf> {
 pub(crate) fn wrap(
     helper: PathBuf,
     fs: &FsSandbox,
+    net: NetPolicy,
     program: PathBuf,
     argv: &[OsString],
 ) -> Vec<OsString> {
     let mut out = vec![helper.into_os_string()];
+    if net == NetPolicy::Deny {
+        out.push("--deny-net".into());
+    }
     for path in &fs.read {
         out.push("--read".into());
         out.push(path.clone().into_os_string());

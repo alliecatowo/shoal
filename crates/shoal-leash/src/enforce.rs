@@ -3,7 +3,7 @@
 //! backends (Landlock on Linux, Seatbelt on macOS) that apply it.
 
 #[cfg(target_os = "macos")]
-use crate::seatbelt::seatbelt_profile;
+use crate::seatbelt::seatbelt_profile_with_net;
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -29,16 +29,14 @@ pub struct EnforcementStatus {
 }
 
 impl EnforcementStatus {
-    /// Detect the strongest plausible platform tier. Since this crate installs
-    /// no backend, `enforced` remains false and `active_tier` remains `None`.
+    /// Detect the strongest plausible platform tier. Detection does not apply
+    /// a sandbox, so `enforced` remains false and `active_tier` remains `None`.
     pub fn detect() -> Self {
         let (available_tier, detail) = if cfg!(target_os = "linux") {
             match landlock_abi() {
                 Some(abi) => (
                     EnforcementTier::A,
-                    format!(
-                        "Landlock ABI {abi} available; seccomp/network enforcement unavailable"
-                    ),
+                    format!("Landlock ABI {abi} available; no sandbox applied to this process"),
                 ),
                 None => (
                     EnforcementTier::B,
@@ -46,7 +44,10 @@ impl EnforcementStatus {
                 ),
             }
         } else if cfg!(target_os = "macos") {
-            (EnforcementTier::C, "Seatbelt backend not installed".into())
+            (
+                EnforcementTier::C,
+                "Seatbelt available; no sandbox applied".into(),
+            )
         } else {
             (EnforcementTier::D, "advisory policy only".into())
         };
@@ -73,10 +74,9 @@ pub struct FsSandbox {
     pub delete: Vec<PathBuf>,
 }
 
-/// Coarse network policy carried by [`SandboxPolicy`]. This crate has no
-/// seccomp/netns backend, so `Deny` is never independently OS-enforced today
-/// — [`EnforcementStatus::network_enforced`] reports that honestly rather
-/// than pretending the restriction took effect.
+/// Coarse network policy carried by [`SandboxPolicy`]. `Deny` is enforceable
+/// with Landlock ABI 4+ on Linux and deny-by-default Seatbelt on macOS. It is
+/// deliberately not a hostname/port allowlist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NetPolicy {
     #[default]
@@ -122,16 +122,34 @@ pub fn landlock_abi() -> Option<i32> {
 
 #[cfg(target_os = "linux")]
 pub fn apply_landlock(grants: &FsSandbox) -> Result<EnforcementStatus, String> {
+    apply_landlock_policy(grants, NetPolicy::Unrestricted)
+}
+
+#[cfg(target_os = "linux")]
+pub fn apply_landlock_policy(
+    grants: &FsSandbox,
+    net: NetPolicy,
+) -> Result<EnforcementStatus, String> {
     use landlock::{
-        ABI, Access, AccessFs, CompatLevel, Compatible, LandlockStatus, Ruleset, RulesetAttr,
-        RulesetCreatedAttr, RulesetStatus, path_beneath_rules,
+        ABI, Access, AccessFs, AccessNet, CompatLevel, Compatible, LandlockStatus, Ruleset,
+        RulesetAttr, RulesetCreatedAttr, RulesetStatus, path_beneath_rules,
     };
-    let abi = ABI::V7;
-    let mut ruleset = Ruleset::default()
+    // Build the exact rights mask supported by this kernel. Requesting V7
+    // under hard compatibility would reject an otherwise usable ABI 4–6
+    // kernel even though all coarse TCP rights already exist at ABI 4.
+    let abi = ABI::from(landlock_abi().unwrap_or_default());
+    let ruleset = Ruleset::default()
+        .set_compatibility(CompatLevel::HardRequirement)
         .handle_access(AccessFs::from_all(abi))
-        .map_err(|e| e.to_string())?
-        .create()
         .map_err(|e| e.to_string())?;
+    let ruleset = if net == NetPolicy::Deny {
+        ruleset
+            .handle_access(AccessNet::from_all(abi))
+            .map_err(|e| e.to_string())?
+    } else {
+        ruleset
+    };
+    let mut ruleset = ruleset.create().map_err(|e| e.to_string())?;
     ruleset = ruleset
         .add_rules(path_beneath_rules(
             grants.read.iter(),
@@ -148,10 +166,7 @@ pub fn apply_landlock(grants: &FsSandbox) -> Result<EnforcementStatus, String> {
     ruleset = ruleset
         .add_rules(path_beneath_rules(grants.delete.iter(), delete))
         .map_err(|e| e.to_string())?;
-    let status = ruleset
-        .set_compatibility(CompatLevel::HardRequirement)
-        .restrict_self()
-        .map_err(|e| e.to_string())?;
+    let status = ruleset.restrict_self().map_err(|e| e.to_string())?;
     let active = matches!(status.landlock, LandlockStatus::Available { .. })
         && matches!(status.ruleset, RulesetStatus::FullyEnforced);
     if !active {
@@ -164,17 +179,26 @@ pub fn apply_landlock(grants: &FsSandbox) -> Result<EnforcementStatus, String> {
         active_tier: Some(EnforcementTier::A),
         enforced: true,
         detail: format!(
-            "Landlock active ({:?}); spawn hash preflight is TOCTOU-prone; seccomp/netns unavailable",
-            status.landlock
+            "Landlock active ({:?}); TCP deny {}; spawn hash preflight is TOCTOU-prone",
+            status.landlock,
+            if net == NetPolicy::Deny {
+                "active"
+            } else {
+                "not requested"
+            }
         ),
         landlock_abi: landlock_abi(),
         filesystem_enforced: true,
         spawn_exec_enforced: false,
-        network_enforced: false,
+        network_enforced: net == NetPolicy::Deny,
     })
 }
 #[cfg(not(target_os = "linux"))]
 pub fn apply_landlock(_: &FsSandbox) -> Result<EnforcementStatus, String> {
+    Err("Landlock is only available on Linux".into())
+}
+#[cfg(not(target_os = "linux"))]
+pub fn apply_landlock_policy(_: &FsSandbox, _: NetPolicy) -> Result<EnforcementStatus, String> {
     Err("Landlock is only available on Linux".into())
 }
 
@@ -221,9 +245,17 @@ pub fn preflight_spawn(binary: &Path, allowlist: &[String]) -> std::io::Result<S
 
 #[cfg(target_os = "macos")]
 pub fn apply_macos_sandbox(grants: &FsSandbox) -> Result<EnforcementStatus, String> {
+    apply_macos_sandbox_policy(grants, NetPolicy::Unrestricted)
+}
+
+#[cfg(target_os = "macos")]
+pub fn apply_macos_sandbox_policy(
+    grants: &FsSandbox,
+    net: NetPolicy,
+) -> Result<EnforcementStatus, String> {
     use std::ffi::{CStr, CString, c_char};
-    let profile =
-        CString::new(seatbelt_profile(grants)?).map_err(|_| "Seatbelt profile contains NUL")?;
+    let profile = CString::new(seatbelt_profile_with_net(grants, net)?)
+        .map_err(|_| "Seatbelt profile contains NUL")?;
     let mut error: *mut c_char = std::ptr::null_mut();
     let result = unsafe { sandbox_init(profile.as_ptr(), 0, &mut error) };
     if result != 0 {
@@ -239,7 +271,23 @@ pub fn apply_macos_sandbox(grants: &FsSandbox) -> Result<EnforcementStatus, Stri
         }
         return Err(message);
     }
-    Ok(EnforcementStatus{available_tier:EnforcementTier::C,active_tier:Some(EnforcementTier::C),enforced:true,detail:"Seatbelt filesystem profile active; spawn preflight is TOCTOU-prone; network enforcement unavailable".into(),landlock_abi:None,filesystem_enforced:true,spawn_exec_enforced:false,network_enforced:false})
+    Ok(EnforcementStatus {
+        available_tier: EnforcementTier::C,
+        active_tier: Some(EnforcementTier::C),
+        enforced: true,
+        detail: format!(
+            "Seatbelt filesystem profile active; network {}; spawn preflight is TOCTOU-prone",
+            if net == NetPolicy::Deny {
+                "denied"
+            } else {
+                "unrestricted"
+            }
+        ),
+        landlock_abi: None,
+        filesystem_enforced: true,
+        spawn_exec_enforced: false,
+        network_enforced: net == NetPolicy::Deny,
+    })
 }
 #[cfg(target_os = "macos")]
 #[link(name = "sandbox")]
@@ -255,10 +303,17 @@ unsafe extern "C" {
 pub fn apply_macos_sandbox(_: &FsSandbox) -> Result<EnforcementStatus, String> {
     Err("Seatbelt enforcement is only available on macOS".into())
 }
+#[cfg(not(target_os = "macos"))]
+pub fn apply_macos_sandbox_policy(
+    _: &FsSandbox,
+    _: NetPolicy,
+) -> Result<EnforcementStatus, String> {
+    Err("Seatbelt enforcement is only available on macOS".into())
+}
 
 /// Apply the strongest OS filesystem sandbox this platform has to the current
-/// process, immediately before exec in a child: Linux → [`apply_landlock`],
-/// macOS → [`apply_macos_sandbox`] (Seatbelt), otherwise an honest error.
+/// process, immediately before exec in a child: Linux → Landlock, macOS →
+/// Seatbelt, otherwise an honest error.
 ///
 /// This is the single per-platform entry point a spawn launcher (the
 /// `shoal-sandbox-exec` helper the exec layer wraps children through) should
@@ -267,17 +322,24 @@ pub fn apply_macos_sandbox(_: &FsSandbox) -> Result<EnforcementStatus, String> {
 /// this irreversibly restricts the calling thread/process and must only run in
 /// the child after fork.
 pub fn apply_sandbox(grants: &FsSandbox) -> Result<EnforcementStatus, String> {
+    apply_sandbox_policy(grants, NetPolicy::Unrestricted)
+}
+
+pub fn apply_sandbox_policy(
+    grants: &FsSandbox,
+    net: NetPolicy,
+) -> Result<EnforcementStatus, String> {
     #[cfg(target_os = "linux")]
     {
-        apply_landlock(grants)
+        apply_landlock_policy(grants, net)
     }
     #[cfg(target_os = "macos")]
     {
-        apply_macos_sandbox(grants)
+        apply_macos_sandbox_policy(grants, net)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let _ = grants;
+        let _ = (grants, net);
         Err("no OS sandbox backend for this platform".into())
     }
 }

@@ -368,8 +368,9 @@ Shoal reports the strongest available platform tier and whether a concrete sandb
 
 Even when `caps_enforced` is true:
 
-- filesystem access is the enforced dimension;
-- network enforcement reports false—there is no seccomp/network-namespace backend;
+- filesystem access is enforced when scoped;
+- coarse network denial is enforceable with Landlock ABI 4+ or Seatbelt, but host/port allowlists
+  are not;
 - spawn content hashing is a preflight, not exec-time pinning;
 - the binary can change between hash and exec (TOCTOU);
 - policy analysis can miss behavior and emit `opaque`;
@@ -383,13 +384,19 @@ Every production child-evaluator route (`spawn`, `.shl` scripts, parallel closur
 
 ### Linux Landlock
 
-The child applies read/write/delete path-beneath rules after fork and immediately before exec. The implementation requests a hard compatibility level and errors if Landlock is not fully active. It does not install seccomp or a network namespace.
+The child applies read/write/delete path-beneath rules after fork and immediately before exec. With
+ABI 4+, a requested coarse network denial also handles TCP bind/connect without adding allow rules.
+The implementation requests a hard compatibility level and errors if Landlock is not fully active.
+It does not install seccomp or a network namespace, so destination allowlists remain unavailable.
 
 Landlock is unprivileged and useful, but its exact coverage depends on kernel ABI and filesystem behavior. Test the policy on the production kernel/filesystem combination.
 
 ### macOS Seatbelt
 
-The child applies a generated filesystem profile with `sandbox_init`. It reports active tier C when successful. Network restrictions are not installed. Apple considers this interface legacy/private for some contexts, so validate behavior across target macOS releases.
+The child applies a generated profile with `sandbox_init`. The profile explicitly allows networking
+for unrestricted requests and leaves it denied for coarse-deny requests. It reports active tier C
+when successful. Apple considers this interface legacy/private for some contexts, so validate
+behavior across target macOS releases.
 
 ### Hermetic intent
 

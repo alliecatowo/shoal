@@ -30,6 +30,15 @@ fn grants(path: std::path::PathBuf) -> FsSandbox {
         delete: vec![],
     }
 }
+
+fn unrestricted_fs_grants() -> FsSandbox {
+    let root = std::path::PathBuf::from("/");
+    FsSandbox {
+        read: vec![root.clone()],
+        write: vec![root.clone()],
+        delete: vec![root],
+    }
+}
 #[test]
 fn sandboxed_capture_and_pty_allow_one_file_deny_sibling() {
     if shoal_leash::landlock_abi().is_none() {
@@ -172,22 +181,90 @@ fn execspec_sandbox_degrades_honestly_when_no_backend_is_available() {
 }
 
 #[test]
-fn execspec_sandbox_hermetic_fails_closed_when_net_deny_cannot_be_enforced() {
-    // net.deny has no enforcement backend anywhere in this crate today, on
-    // any platform — so a `hermetic: true` request for it must always
-    // refuse to spawn rather than silently run with network still open.
+fn execspec_sandbox_hermetic_net_deny_is_enforced_or_fails_closed() {
     let policy = SandboxPolicy {
-        fs: FsSandbox::default(),
+        fs: unrestricted_fs_grants(),
         net: NetPolicy::Deny,
         spawn_hash: None,
         hermetic: true,
     };
-    let e = run(
-        sandboxed("true", ExecMode::Capture, policy),
+    let supported = cfg!(target_os = "macos")
+        || (cfg!(target_os = "linux") && shoal_leash::landlock_abi().is_some_and(|abi| abi >= 4));
+    if supported {
+        let result = run(
+            sandboxed("true", ExecMode::Capture, policy),
+            &CancelToken::new(),
+        )
+        .expect("coarse network denial should be available");
+        let status = result.enforcement.expect("sandbox status");
+        assert!(status.network_enforced);
+        assert!(status.enforced);
+    } else {
+        let error = run(
+            sandboxed("true", ExecMode::Capture, policy),
+            &CancelToken::new(),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn landlock_net_deny_blocks_a_real_local_tcp_connection() {
+    if shoal_leash::landlock_abi().is_none_or(|abi| abi < 4) {
+        eprintln!("Landlock network access control requires ABI 4; skipping");
+        return;
+    }
+    let Some(python) = ["/usr/bin/python3", "/bin/python3"]
+        .into_iter()
+        .map(std::path::PathBuf::from)
+        .find(|path| path.is_file())
+    else {
+        eprintln!("python3 unavailable; skipping real TCP probe");
+        return;
+    };
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let code =
+        format!("import socket; s=socket.create_connection(('127.0.0.1', {port}), 1); s.close()");
+    let python_spec = |sandbox| ExecSpec {
+        argv: vec![
+            python.clone().into_os_string(),
+            "-c".into(),
+            code.clone().into(),
+        ],
+        cwd: std::env::current_dir().unwrap(),
+        env: std::env::vars_os().collect(),
+        stdin: StdinSpec::Null,
+        mode: ExecMode::Capture,
+        sandbox,
+        spill: None,
+    };
+
+    let baseline = run(python_spec(None), &CancelToken::new()).unwrap();
+    assert_eq!(
+        baseline.status,
+        Some(0),
+        "the local endpoint must be reachable"
+    );
+
+    let denied = run(
+        python_spec(Some(SandboxPolicy {
+            fs: unrestricted_fs_grants(),
+            net: NetPolicy::Deny,
+            spawn_hash: None,
+            hermetic: true,
+        })),
         &CancelToken::new(),
     )
-    .unwrap_err();
-    assert_eq!(e.kind(), std::io::ErrorKind::Unsupported);
+    .unwrap();
+    assert_ne!(
+        denied.status,
+        Some(0),
+        "Landlock must block a connection that succeeds without the sandbox"
+    );
+    assert!(denied.enforcement.unwrap().network_enforced);
 }
 
 #[test]

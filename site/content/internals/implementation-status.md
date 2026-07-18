@@ -65,8 +65,8 @@ kernel version, every third-party adapter executable, or performance targets on 
 | process capture | Implemented | real process-group and dual-pipe tests | hash preflight has an exec-time TOCTOU window |
 | interactive PTY execution | Implemented, host-limited | Unix PTY integration and REPL tests | Windows/ConPTY is deferred; kernel PTYs are poll-based |
 | streams and channels | Implemented, host-limited | evaluator stream/feed tests and live kernel bridge | local process stdin is bounded; wire stream pulling remains unavailable |
-| effects and plans | Implemented with enforcement limits | static derivation, policy tests, plan/apply handlers | planning cannot describe every native-program effect; network enforcement is absent |
-| Leash filesystem sandbox | Implemented, host-limited | Linux/macOS backend tests and enforcement reporting | network enforcement is unavailable; local malformed-policy mode is permissive |
+| effects and plans | Implemented with enforcement limits | static derivation, policy tests, plan/apply handlers | planning cannot describe every native-program effect; network allowlists are semantic-only |
+| Leash OS sandbox | Implemented, host-limited | Linux/macOS backend tests, live TCP-denial test, and enforcement reporting | coarse network denial requires Landlock ABI 4+ or Seatbelt; hostname/port allowlists are unavailable |
 | task lifecycle | Implemented, execution-form limited | evaluator jobs and kernel process-control tests | pure evaluator tasks have no independently suspendable OS owner |
 | modules and script runners | Implemented, host-limited | module/corpus tests and `.shl` execution | non-`.shl` bare path heads require explicit `run` |
 | Reef environments | Implemented | resolver/provider/lock/view tests, strict discovery tests, bounded provider runners, and live sandbox integration | metadata-to-open/hash-to-exec races and platform portability remain |
@@ -394,7 +394,8 @@ Important qualifications:
   metadata-to-open or hash-to-exec race against a hostile concurrent writer;
 - an unknown tool constrained to `latest` does not imply exhaustive remote probing;
 - provider acquisition can have external partial effects even though lock publication is atomic;
-- filesystem sandbox enforcement is platform-dependent and network containment is unavailable.
+- filesystem sandbox enforcement is platform-dependent; coarse network denial requires Landlock
+  ABI 4+ or Seatbelt, while hostname/port allowlists remain unavailable.
 
 See the [Reef resolution reference](../reef-resolution/) for the exact pipeline.
 

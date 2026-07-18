@@ -355,8 +355,10 @@ scope retains the best-effort behavior and reaches no OS wrapper; a hermetic sco
 to the exec boundary as an unresolved request and refused before the target spawns. The semantic plan
 layer remains authoritative for modeled effects in both cases.
 
-Network policy from `to_sandbox_policy` is currently `Unrestricted` because there is no enforcing
-backend; network intent remains a semantic plan verdict.
+A hermetic scoped principal with no network grants lowers to coarse `Deny`. Linux Landlock ABI 4+
+denies TCP bind/connect and macOS Seatbelt retains deny-by-default networking. Declared host/port
+allowlists cannot be expressed by either backend and remain semantic plan verdicts; hermetic opaque
+spawns with such an allowlist are refused.
 
 ## Enforcement tiers and honesty
 
@@ -385,15 +387,16 @@ Landlock handles all filesystem access kinds for the detected/supported ABI. Rea
 access; write roots receive the implementation's full filesystem access set; delete roots receive
 remove-file/remove-dir. Full enforcement is checked after `restrict_self`; partial status is an error.
 
-Landlock does not provide the current network enforcement. A `net.deny` request appends an honest
-caveat. With `hermetic = true`, an unenforced requested network denial makes spawn fail closed. A
-configured principal network allowlist likewise refuses opaque external spawning in hermetic mode;
-nonhermetic mode remains policy-only and the kernel preview reports that limitation.
+Landlock ABI 4+ handles TCP bind/connect access. A coarse `net.deny` ruleset handles those rights and
+adds no allow rules, so new TCP listeners and connections fail. Older ABIs report the request as
+unenforced, and hermetic execution fails closed. Hostname/port allowlists remain inexpressible: a
+configured principal allowlist refuses opaque external spawning in hermetic mode; nonhermetic mode
+remains policy-only and the kernel preview reports that limitation.
 
 ## macOS Seatbelt mapping
 
 The generated profile begins with deny-default, allows process operations and signals to self, then
-adds canonical subpath rules:
+explicitly grants networking only for `Unrestricted` and adds canonical subpath rules:
 
 - read grants allow `file-read*`;
 - write grants allow read and write;
@@ -402,7 +405,8 @@ adds canonical subpath rules:
 Every grant must canonicalize and be UTF-8 encodable without control characters. Backslashes and
 quotes are escaped. These restrictions can reject policy paths that semantic glob matching accepted.
 
-Seatbelt is reported as tier C filesystem enforcement; network remains unenforced.
+Seatbelt is reported as tier C filesystem enforcement and reports coarse network denial when that
+deny-by-default profile was requested.
 
 ## Executable pinning and TOCTOU
 
@@ -625,8 +629,8 @@ For a new externally reachable effect:
    sandbox enforcement.
 3. **Unify token caps and policy semantics or clearly keep caps informational.** Parallel authority
    vocabularies invite false assumptions.
-4. **Add real network enforcement or keep hermetic network requests failing.** Never report advisory
-   denial as enforced.
+4. **Keep network reporting dimension-specific.** Coarse denial is real on Landlock ABI 4+ and
+   Seatbelt; hostname/port allowlists remain semantic-only and must keep hermetic spawns failing.
 5. **Design atomic executable identity if strong pinning is required.** Current hash-before-exec is
    TOCTOU-prone.
 6. **Keep the WASM ABI narrow and versioned.** Every new hostcall needs canonical effects, scoped
