@@ -106,7 +106,8 @@ if !result.ok { exit (result.status) }
 
 ## Format source
 
-`shoal fmt` parses and formats Shoal source. With file arguments it rewrites them atomically:
+`shoal fmt` parses and formats Shoal source. With file arguments it preflights every input before
+making changes, then replaces each changed file atomically:
 
 ```bash
 shoal fmt src/main.shl scripts/release.shl
@@ -128,6 +129,15 @@ The current AST does not retain free comments or shebangs. The formatter therefo
 source unchanged when its token-aware safety pass finds either one; it never silently deletes them.
 A semantic `#` inside a quoted value, record key, `use` path, or raw command word is not mistaken for
 a comment and does not block formatting.
+
+File rewrites refuse symbolic links instead of replacing the link itself. On Unix they preserve the
+complete permission mode and refuse files owned by another user or carrying extended metadata that
+atomic replacement would discard (including Linux ACL xattrs and macOS ACLs). Linux security labels
+are accepted only when a replacement created in the same directory receives an identical label.
+Shoal syncs both the replacement contents and its parent directory. These checks are intentionally
+stricter than script execution; pass the regular target path explicitly when a link should be
+formatted. A failure during a later write can still leave already committed earlier files changed,
+because there is no portable transaction spanning multiple directory entries.
 
 ## Run diagnostics
 

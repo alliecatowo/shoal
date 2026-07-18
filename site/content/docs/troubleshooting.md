@@ -268,6 +268,14 @@ uses the same decision and leaves the source unchanged. Remove the trivia only i
 otherwise wait for the planned lossless formatter. A `#` inside a string or command word does not
 trigger this refusal.
 
+### Formatter refuses a file's link or metadata
+
+`shoal fmt` will not replace a symbolic link, a file owned by another Unix user, or a changed file
+whose ACLs/extended attributes cannot survive atomic replacement. Format the regular target path
+directly. If metadata is intentional, copy the source to an ordinary file, format and review it,
+then apply the result with a metadata-aware deployment tool. `shoal fmt --check` makes no replacement
+and can inspect an extended-metadata file, but it still refuses links so the checked path is explicit.
+
 ### Error span looks like bytes, not characters
 
 Kernel/language spans are UTF-8 byte offsets. LSP converts them to UTF-16 positions for editors. A raw client must perform the same conversion rather than treating offsets as Unicode scalar indexes.

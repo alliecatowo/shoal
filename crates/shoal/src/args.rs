@@ -5,10 +5,8 @@
 
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-
-use shoal_syntax::parse;
 
 use crate::prompt;
 
@@ -180,37 +178,7 @@ fn no_trailing(mut iter: impl Iterator<Item = OsString>, action: Action) -> Resu
 }
 
 pub(crate) fn fmt_command(check: bool, files: Vec<PathBuf>) -> Result<i32, String> {
-    if files.is_empty() {
-        let src = read_source_stream(io::stdin().lock(), "stdin")?;
-        let ast = parse(&src).map_err(|e| format!("stdin: {e}"))?;
-        let formatted = format_source_safely(&src, &ast);
-        if check {
-            return Ok(i32::from(formatted != src));
-        }
-        print!("{formatted}");
-        return Ok(0);
-    }
-    let mut changed = false;
-    for path in files {
-        let src = read_source_path(&path)?;
-        let ast = parse(&src).map_err(|e| format!("{}: {e}", path.display()))?;
-        let formatted = format_source_safely(&src, &ast);
-        if formatted != src {
-            changed = true;
-            if !check {
-                atomic_write(&path, formatted.as_bytes())?
-            }
-        }
-    }
-    Ok(if check && changed { 1 } else { 0 })
-}
-
-/// The current AST intentionally omits free comments/trivia. Delegate to the
-/// syntax crate's token-aware policy so CLI and LSP cannot disagree: comments
-/// and shebangs refuse formatting, while semantic `#` characters in strings
-/// and command words remain formatable.
-fn format_source_safely(src: &str, ast: &shoal_ast::Program) -> String {
-    shoal_syntax::format_source_preserving_trivia(src, ast).unwrap_or_else(|_| src.to_owned())
+    crate::format_files::run(check, files)
 }
 
 pub(crate) fn read_source_path(path: &Path) -> Result<String, String> {
@@ -242,27 +210,6 @@ pub(crate) fn read_source_stream(reader: impl Read, label: &str) -> Result<Strin
     String::from_utf8(bytes).map_err(|_| format!("{label}: source is not valid UTF-8"))
 }
 
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let name = path
-        .file_name()
-        .ok_or_else(|| format!("invalid path {}", path.display()))?
-        .to_string_lossy();
-    let tmp = parent.join(format!(".{name}.shoal-fmt-{}", std::process::id()));
-    let result = (|| {
-        let mut f = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-        fs::rename(&tmp, path)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
-    result.map_err(|e: io::Error| format!("cannot write {}: {e}", path.display()))
-}
 pub(crate) fn run_companion(name: &str) -> Result<i32, String> {
     let status = std::process::Command::new(name).status().map_err(|e| {
         format!("cannot launch `{name}`: {e}; install the companion binary or add it to PATH")
@@ -289,6 +236,7 @@ pub(crate) fn completion_script(shell: &str) -> Result<&'static str, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
 
     struct GrowingReader(usize);
 
