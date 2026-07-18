@@ -199,10 +199,10 @@ A style is a whitespace-separated set of attributes and colors:
 - `none`: explicit no-op.
 
 Tokens are order-independent and the last foreground/background color wins. Unknown tokens are
-ignored; a spec with no recognized token produces a warning when parsed through a warning-aware
-call. Rendering currently calls `parse_style` with a throwaway warning vector, so a style typo can
-be warned in direct tests but is not necessarily surfaced during a normal render. `NO_COLOR` or an
-empty/plain style returns the original text without SGR escapes.
+ignored; a spec with no recognized token produces a startup warning. `Renderer::new` walks every
+palette entry, fixed/dynamic module style, Leash tier style, and recursively nested format-group
+style, then caches the parsed result. Per-keystroke rendering performs no style parsing or warning
+side effects. `NO_COLOR` or an empty/plain style returns the original text without SGR escapes.
 
 Palette names `ok`, `error`, `warn`, `info`, `muted`, and `accent` expand only when the **whole**
 style spec equals that name. They are not macros inside a compound spec such as `muted bold`.
@@ -375,14 +375,13 @@ style groups. The renderer still handles nested placeholders; this is an observa
 
 ## Validator and multiline decisions
 
-`ShoalValidator` currently uses the host's `input_is_incomplete` scanner rather than
-`shoal_syntax::parse_status`. It tracks quotes, triple quotes, escapes, comments, and delimiter
-balance to decide whether Enter should submit or continue. That keeps incomplete editing cheap but
-duplicates part of lexical/parser knowledge.
+`ShoalValidator` asks `shoal_syntax::parse` first. A complete modal AST submits immediately,
+including command arguments ending in `/`; an `Incomplete` parse continues the line. Only a parse
+error falls back to the host's bounded quote/comment/delimiter scanner, preserving tolerant editing
+for malformed text without overriding a successful grammar decision.
 
-The LSP diagnostics path does use `parse_status`, and the formatter requires a complete AST. A
-future unification should preserve interactive tolerance while eliminating disagreement about novel
-syntax.
+The LSP diagnostics path uses `parse_status`, and the formatter requires a complete AST. The small
+fallback scanner is deliberately recovery-only rather than a competing primary grammar.
 
 ## Completion architecture
 

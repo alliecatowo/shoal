@@ -134,7 +134,11 @@ effects = ["fs.read(cwd)"]
 
 Supported output parsers are `json`, `ndjson`, `csv`, `tsv`, `z-records`, `porcelain-v2`, `cols`, `cols2`, `tsv-headerless`, `lines`, `kv`, and `none`.
 
-Malformed adapter files produce warnings while valid siblings continue loading. Current preview caveat: the host loads the bundled directory and configured directories in order, but the evaluator catalog setter replaces the active catalog; with custom directories configured, the final directory can become the active execution catalog rather than a true merged overlay. Completion may still see names from all catalogs. Treat cross-directory layering as unfinished and keep a needed combined pack in one directory for now.
+Malformed adapter files produce warnings while valid siblings continue loading. The host overlays
+the bundled directory followed by configured directories into one evaluator catalog: later commands
+replace same-named earlier commands, while disjoint commands remain. It emits an override warning
+for each replaced command. Completion retains the per-directory catalogs with the same later-wins
+lookup order, so execution and completion agree.
 
 ## Feed a finite value to stdin
 

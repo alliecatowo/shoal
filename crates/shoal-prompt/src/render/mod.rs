@@ -3,12 +3,13 @@
 //! logging, no side effects — a golden/snapshot suite drives it with hand-built
 //! `PromptContext` values, no kernel required.
 
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use crate::config::{ParsedFormats, PromptConfig};
 use crate::context::{EditMode, PromptContext};
 use crate::format::FormatToken;
-use crate::style::parse_style;
+use crate::style::{Style, parse_style};
 
 mod helpers;
 mod modules;
@@ -48,6 +49,7 @@ pub enum Side {
 pub struct Renderer {
     config: PromptConfig,
     formats: ParsedFormats,
+    styles: BTreeMap<String, Style>,
 }
 
 /// Classification of a rendered segment for the whitespace-collapse pass.
@@ -99,7 +101,15 @@ impl Renderer {
             }
         }
         let formats = config.parse_formats(&mut warnings);
-        (Self { config, formats }, warnings)
+        let styles = cache_styles(&config, &formats, &mut warnings);
+        (
+            Self {
+                config,
+                formats,
+                styles,
+            },
+            warnings,
+        )
     }
 
     pub fn config(&self) -> &PromptConfig {
@@ -249,9 +259,13 @@ impl Renderer {
         if text.is_empty() {
             return String::new();
         }
-        let resolved = self.config.style.resolve(spec);
-        let style = parse_style(resolved, &mut Vec::new());
-        style.paint(text, ctx.no_color)
+        if let Some(style) = self.styles.get(spec) {
+            return style.paint(text, ctx.no_color);
+        }
+        // Every config-owned style is admitted into `styles` at construction.
+        // Keep this total for future internal callers without introducing
+        // logging or mutable cache state into the pure render path.
+        parse_style(self.config.style.resolve(spec), &mut Vec::new()).paint(text, ctx.no_color)
     }
 
     /// nerd-font symbol when available (site/content/internals/prompt-editor-lsp.md), else the ascii fallback.
@@ -266,6 +280,84 @@ impl Renderer {
     fn ellipsis(&self, ctx: &PromptContext) -> &'static str {
         if ctx.unicode { "…" } else { "..." }
     }
+}
+
+fn cache_styles(
+    config: &PromptConfig,
+    formats: &ParsedFormats,
+    warnings: &mut Vec<String>,
+) -> BTreeMap<String, Style> {
+    let mut styles = BTreeMap::new();
+    let module = &config.module;
+    let mut specs = vec![
+        "ok",
+        "error",
+        "warn",
+        "info",
+        "muted",
+        "accent",
+        &module.character.success_style,
+        &module.character.error_style,
+        &module.character.vicmd_style,
+        &module.directory.style,
+        &module.git_branch.style,
+        &module.git_status.style,
+        &module.git_state.style,
+        &module.cmd_duration.style,
+        &module.exit_status.style,
+        &module.jobs.style,
+        &module.time.style,
+        &module.username.style,
+        &module.username.root_style,
+        &module.hostname.style,
+        &module.reef.style,
+        &module.principal.style,
+        &module.principal.agent_style,
+        &module.battery.low_style,
+        &module.battery.style,
+    ];
+    specs.extend(module.leash.style_by_tier.values().map(String::as_str));
+    specs.extend(module.language.values().map(|entry| entry.style.as_str()));
+    specs.extend(module.custom.values().map(|entry| entry.style.as_str()));
+    for spec in specs {
+        cache_style(config, spec, &mut styles, warnings);
+    }
+    for tokens in [
+        &formats.left,
+        &formats.right,
+        &formats.continuation,
+        &formats.transient,
+    ] {
+        cache_format_styles(config, tokens, &mut styles, warnings);
+    }
+    styles
+}
+
+fn cache_format_styles(
+    config: &PromptConfig,
+    tokens: &[FormatToken],
+    styles: &mut BTreeMap<String, Style>,
+    warnings: &mut Vec<String>,
+) {
+    for token in tokens {
+        if let FormatToken::Group { inner, style } = token {
+            cache_style(config, style, styles, warnings);
+            cache_format_styles(config, inner, styles, warnings);
+        }
+    }
+}
+
+fn cache_style(
+    config: &PromptConfig,
+    spec: &str,
+    styles: &mut BTreeMap<String, Style>,
+    warnings: &mut Vec<String>,
+) {
+    if styles.contains_key(spec) {
+        return;
+    }
+    let style = parse_style(config.style.resolve(spec), warnings);
+    styles.insert(spec.to_string(), style);
 }
 
 /// Join rendered segments applying the whitespace-collapse rule (site/content/internals/prompt-editor-lsp.md): a
