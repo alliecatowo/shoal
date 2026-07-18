@@ -106,6 +106,21 @@ impl Resolver {
         policy: Policy,
         notice: &mut dyn FnMut(&LockNotice),
     ) -> ReefResult<Resolution> {
+        self.resolve_with_probe_guard(name, chain, lock, policy, notice, &mut |_| Ok(()))
+    }
+
+    /// Resolve with an authority check immediately before any candidate whose
+    /// version is unknown would be executed as `<candidate> --version`.
+    /// Returning an error prevents that probe and aborts resolution.
+    pub fn resolve_with_probe_guard(
+        &self,
+        name: &str,
+        chain: &ScopeChain,
+        lock: &mut Lockfile,
+        policy: Policy,
+        notice: &mut dyn FnMut(&LockNotice),
+        probe_guard: &mut dyn FnMut(&Candidate) -> ReefResult<()>,
+    ) -> ReefResult<Resolution> {
         let decision = self.effective_decision(chain, name)?;
 
         // Honor a valid, satisfying lock entry (with a drift check).
@@ -124,7 +139,7 @@ impl Resolver {
             .with_hint("run `reef lock` (or resolve interactively) to pin it"));
         }
 
-        self.resolve_fresh(name, chain, &decision, Some((lock, notice)))
+        self.resolve_fresh(name, chain, &decision, Some((lock, notice)), probe_guard)
     }
 
     /// Force a fresh resolution and rewrite the lock entry (the `reef lock
@@ -136,9 +151,22 @@ impl Resolver {
         lock: &mut Lockfile,
         notice: &mut dyn FnMut(&LockNotice),
     ) -> ReefResult<Resolution> {
+        self.refresh_lock_with_probe_guard(name, chain, lock, notice, &mut |_| Ok(()))
+    }
+
+    /// Force a fresh resolution with the same pre-probe authority callback as
+    /// [`Self::resolve_with_probe_guard`].
+    pub fn refresh_lock_with_probe_guard(
+        &self,
+        name: &str,
+        chain: &ScopeChain,
+        lock: &mut Lockfile,
+        notice: &mut dyn FnMut(&LockNotice),
+        probe_guard: &mut dyn FnMut(&Candidate) -> ReefResult<()>,
+    ) -> ReefResult<Resolution> {
         let decision = self.effective_decision(chain, name)?;
         lock.remove(name);
-        self.resolve_fresh(name, chain, &decision, Some((lock, notice)))
+        self.resolve_fresh(name, chain, &decision, Some((lock, notice)), probe_guard)
     }
 
     // --- internals ---------------------------------------------------------
@@ -270,6 +298,7 @@ impl Resolver {
         chain: &ScopeChain,
         decision: &Decision,
         lock_and_notice: Option<(&mut Lockfile, &mut dyn FnMut(&LockNotice))>,
+        probe_guard: &mut dyn FnMut(&Candidate) -> ReefResult<()>,
     ) -> ReefResult<Resolution> {
         let ctx = ProviderCtx::new(chain.cwd.clone());
         let chosen = self
@@ -278,7 +307,8 @@ impl Resolver {
                 &decision.constraint,
                 decision.provider_pin.as_deref(),
                 &ctx,
-            )
+                probe_guard,
+            )?
             .ok_or_else(|| {
                 ReefError::not_found(format!(
                     "no candidate for {name} satisfying {}",
@@ -356,7 +386,8 @@ impl Resolver {
         constraint: &Constraint,
         provider_pin: Option<&str>,
         ctx: &ProviderCtx,
-    ) -> Option<Candidate> {
+        probe_guard: &mut dyn FnMut(&Candidate) -> ReefResult<()>,
+    ) -> ReefResult<Option<Candidate>> {
         let mut ranked: Vec<(Version, usize, PathBuf, Candidate)> = Vec::new();
         for (idx, provider) in self.providers.iter().enumerate() {
             if let Some(pin) = provider_pin
@@ -367,6 +398,7 @@ impl Resolver {
             for mut cand in provider.discover(name, ctx) {
                 // Probe a version only when the constraint actually needs one.
                 if constraint.needs_version() && cand.version.is_unknown() {
+                    probe_guard(&cand)?;
                     cand.version = provider.version_of(&cand);
                 }
                 if constraint.satisfies(&cand.version) {
@@ -374,13 +406,13 @@ impl Resolver {
                 }
             }
         }
-        ranked
+        Ok(ranked
             .into_iter()
             .max_by(|a, b| {
                 // Higher version wins; then lower provider index; then lower path.
                 a.0.cmp(&b.0).then(b.1.cmp(&a.1)).then(b.2.cmp(&a.2))
             })
-            .map(|(_, _, _, c)| c)
+            .map(|(_, _, _, c)| c))
     }
 
     fn chain_decisions(
@@ -439,6 +471,8 @@ mod tests {
     use super::*;
     use crate::provider::{Candidate, ProviderError};
     use std::path::Path;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     // A deterministic fake provider backed by an in-memory candidate table.
     struct FakeProvider {
@@ -487,6 +521,56 @@ mod tests {
             .map(|(name, c)| Box::new(FakeProvider { name, cands: c }) as Box<dyn Provider>)
             .collect();
         Resolver::new(providers)
+    }
+
+    #[test]
+    fn denied_probe_never_executes_candidate_version_hook() {
+        struct ProbeProvider {
+            path: PathBuf,
+            called: Arc<AtomicBool>,
+        }
+        impl Provider for ProbeProvider {
+            fn name(&self) -> &'static str {
+                "probe"
+            }
+
+            fn discover(&self, tool: &str, _ctx: &ProviderCtx) -> Vec<Candidate> {
+                vec![Candidate::new(
+                    tool,
+                    Version::unknown(),
+                    self.path.clone(),
+                    "probe",
+                )]
+            }
+
+            fn version_of(&self, _candidate: &Candidate) -> Version {
+                self.called.store(true, Ordering::SeqCst);
+                Version::parse("1.2.3")
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let binary = write_exe(directory.path(), "guarded", "bytes");
+        let chain = chain_with("[tools]\nguarded = \"1.2.3\"\n", directory.path());
+        let called = Arc::new(AtomicBool::new(false));
+        let resolver = Resolver::new(vec![Box::new(ProbeProvider {
+            path: binary,
+            called: called.clone(),
+        })]);
+        let mut lock = Lockfile::new();
+        let error = resolver
+            .resolve_with_probe_guard(
+                "guarded",
+                &chain,
+                &mut lock,
+                Policy::Interactive,
+                &mut |_| {},
+                &mut |_| Err(ReefError::provider("probe denied by test policy")),
+            )
+            .unwrap_err();
+        assert!(error.msg.contains("probe denied"));
+        assert!(!called.load(Ordering::SeqCst));
+        assert!(lock.get("guarded").is_none());
     }
 
     #[test]

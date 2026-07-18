@@ -56,7 +56,14 @@ impl Evaluator {
         self.reef_lock_loaded()?;
         let resolver = self.reef_resolver();
         let mut lock = self.exec.reef.lock.clone();
-        match resolver.resolve(name, &chain, &mut lock, Policy::Interactive, &mut |_| {}) {
+        match resolver.resolve_with_probe_guard(
+            name,
+            &chain,
+            &mut lock,
+            Policy::Interactive,
+            &mut |_| {},
+            &mut |candidate| self.reef_probe_guard(candidate),
+        ) {
             Ok(res) => {
                 // Only keep a fresh lock when a manifest actually constrained it.
                 if res.constrained {
@@ -262,7 +269,14 @@ impl Evaluator {
         for name in names {
             let mut r = Record::new();
             r.insert("name".into(), Value::Str(name.clone()));
-            match resolver.resolve(&name, &chain, &mut lock, Policy::Interactive, &mut |_| {}) {
+            match resolver.resolve_with_probe_guard(
+                &name,
+                &chain,
+                &mut lock,
+                Policy::Interactive,
+                &mut |_| {},
+                &mut |candidate| self.reef_probe_guard(candidate),
+            ) {
                 Ok(res) => {
                     r.insert(
                         "constraint".into(),
@@ -397,7 +411,13 @@ impl Evaluator {
         let mut r = Record::new();
         r.insert("added".into(), Value::Str(format!("{tool}@{ver}")));
         r.insert("manifest".into(), Value::Path(manifest_path.clone()));
-        match resolver.refresh_lock(&tool, &chain, &mut lock, &mut |_| {}) {
+        match resolver.refresh_lock_with_probe_guard(
+            &tool,
+            &chain,
+            &mut lock,
+            &mut |_| {},
+            &mut |candidate| self.reef_probe_guard(candidate),
+        ) {
             Ok(res) => match self.persist_reef_lock_value(&lock) {
                 Ok(()) => {
                     self.exec.reef.lock = lock;
@@ -444,9 +464,22 @@ impl Evaluator {
             let mut r = Record::new();
             r.insert("name".into(), Value::Str(name.clone()));
             let res = if refresh {
-                resolver.refresh_lock(&name, &chain, &mut lock, &mut |_| {})
+                resolver.refresh_lock_with_probe_guard(
+                    &name,
+                    &chain,
+                    &mut lock,
+                    &mut |_| {},
+                    &mut |candidate| self.reef_probe_guard(candidate),
+                )
             } else {
-                resolver.resolve(&name, &chain, &mut lock, Policy::Interactive, &mut |_| {})
+                resolver.resolve_with_probe_guard(
+                    &name,
+                    &chain,
+                    &mut lock,
+                    Policy::Interactive,
+                    &mut |_| {},
+                    &mut |candidate| self.reef_probe_guard(candidate),
+                )
             };
             match res {
                 Ok(res) => {
@@ -470,16 +503,23 @@ impl Evaluator {
     /// no provider can install.
     fn reef_fetch(&mut self, tool: Option<&str>) -> VResult<Value> {
         let tool = tool.ok_or_else(|| ErrorVal::arg_error("reef fetch expects a tool name"))?;
+        self.reef_fetch_guard()?;
         let chain = self.reef_chain_snapshot();
-        let constraint = chain
+        let requirement = chain
             .nearest_for(tool)
-            .map(|s| s.manifest.tools[tool].constraint.clone())
+            .map(|scope| &scope.manifest.tools[tool]);
+        let constraint = requirement
+            .map(|requirement| requirement.constraint.clone())
             .unwrap_or(shoal_reef::Constraint::Any);
+        let provider_pin = requirement.and_then(|requirement| requirement.provider.as_deref());
         let resolver = self.reef_resolver();
         let ctx = ProviderCtx::new(self.exec.shell.cwd.clone());
         let mut r = Record::new();
         r.insert("tool".into(), Value::Str(tool.to_string()));
         for provider in resolver.providers() {
+            if provider_pin.is_some_and(|pin| provider.name() != pin) {
+                continue;
+            }
             match provider.fetch(tool, &constraint, &ctx) {
                 Some(Ok(cand)) => {
                     r.insert("fetched".into(), Value::Bool(true));
@@ -499,7 +539,10 @@ impl Evaluator {
         r.insert("fetched".into(), Value::Bool(false));
         r.insert(
             "note".into(),
-            Value::Str("no provider can fetch this tool".into()),
+            Value::Str(match provider_pin {
+                Some(pin) => format!("pinned provider `{pin}` cannot fetch this tool"),
+                None => "no provider can fetch this tool".into(),
+            }),
         );
         Ok(Value::Record(r))
     }

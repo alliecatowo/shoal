@@ -178,6 +178,12 @@ dotted version-shaped token, falling back to a bare integer. Failure or unparsea
 `Version::unknown`. Results cache by path plus device/inode/mtime/length identity, clear at 1,024
 entries, and discard uncertain state after lock poison.
 
+Library callers can install a pre-probe guard. Evaluator callers always do: a restricted principal
+must allow the opaque effect and any active executable name/hash pin. If its policy requires an OS
+filesystem sandbox, the probe fails closed because the provider probe runner cannot yet apply that
+sandbox. The candidate is never executed after a guard error. Unrestricted library/CLI callers retain
+the bounded direct-probe behavior.
+
 ### Candidate ranking
 
 For every allowed provider, the resolver discovers candidates, fills an unknown version only when
@@ -352,10 +358,13 @@ copying stable code/message/hint and adding the source span.
   standalone `shoal-reef` APIs intentionally select the ambient `StdFs` adapter.
 - Provider installation layouts, executable hashing, version probes, and view construction remain
   host tooling boundaries rather than evaluator `Fs` operations.
-- Provider version probing executes candidate binaries before the final command's Leash spawn gate;
-  constrained `Any/latest` usually avoids the probe, but numeric/raw constraints can run it.
-- `reef fetch` can invoke network-capable `mise install`; it is a builtin path that needs explicit
-  effect/policy auditing.
+- Provider version probing can execute candidate binaries for numeric/raw constraints. Evaluator
+  integration guards that execution with opaque/spawn-pin policy and refuses probes that would need
+  an unavailable filesystem sandbox; unrestricted standalone Reef APIs intentionally permit it.
+- `reef fetch` can invoke network-capable `mise install`. Evaluator execution rechecks opaque policy,
+  spawn pins, and sandbox requirements before entering any provider hook; provider pins restrict which
+  hook may run. A required filesystem sandbox fails closed because installer wrapping is not yet in
+  the provider API.
 - View symlinks are created in a user runtime/temp tree; directory permissions and symlink integrity
   are part of executable selection security.
 - Persistence failures are typed and fail before lock state or spawn publication; manifest and lock
@@ -372,8 +381,9 @@ integration. Corpus suites `reef.toml` and `reef-provider-errors.toml` pin user-
 
 Same-cwd creation/edit/removal fingerprints, lock-save failure propagation, oversized manifest
 admission, provider flood/timeout descendants, cache identity churn, poisoned-cache recovery, and
-runner-only/hermetic-only project and user scope discovery are covered. Remaining high-value evidence
-includes hostile view-directory mutation and more explicit policy tests for version probes/fetch.
+runner-only/hermetic-only project and user scope discovery, denied version probes/fetch hooks, and
+provider-pinned fetch selection are covered. Remaining high-value evidence includes hostile
+view-directory mutation and OS-sandboxed provider process execution.
 
 ## Change checklist
 

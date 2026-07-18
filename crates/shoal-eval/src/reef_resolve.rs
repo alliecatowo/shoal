@@ -10,11 +10,85 @@
 use super::*;
 
 use shoal_reef::{
-    Binding, LockNotice, ManifestKind, Policy, Resolver, ScopeChain, ScopeEntry, ViewConfig,
-    default_view_root, synth_path,
+    Binding, Candidate, LockNotice, ManifestKind, Policy, ReefError, ReefResult, Resolver,
+    ScopeChain, ScopeEntry, ViewConfig, default_view_root, synth_path,
 };
 
 impl Evaluator {
+    /// Fail closed before Reef executes an unknown-version candidate as
+    /// `<candidate> --version`. Probes are opaque code execution: a restricted
+    /// principal must allow opaque effects and any active spawn pin, and a
+    /// principal requiring an OS filesystem sandbox cannot use this currently
+    /// unwrapped probe path.
+    pub(crate) fn reef_probe_guard(&self, candidate: &Candidate) -> ReefResult<()> {
+        let Some((policy, principal)) = self.session.leash.as_ref() else {
+            return Ok(());
+        };
+        if policy.evaluate_effect(principal, &Effect::Opaque) != shoal_leash::Verdict::Allow {
+            return Err(ReefError::provider(format!(
+                "version probe for {} denied: principal `{principal}` does not allow opaque effects",
+                candidate.path.display()
+            ))
+            .with_hint("lock the tool in an unrestricted trusted session before using it here"));
+        }
+        if policy.sandbox_for(principal).is_some() {
+            return Err(ReefError::provider(format!(
+                "version probe for {} denied: the principal requires filesystem sandboxing that Reef probes cannot yet apply",
+                candidate.path.display()
+            ))
+            .with_hint("lock the tool in an unrestricted trusted session before using it here"));
+        }
+        if policy.spawn_pinning_active(principal) {
+            let effect = Effect::ProcSpawn {
+                bin_hash: self
+                    .hash_resolved_bin(candidate.path.as_os_str())
+                    .unwrap_or_default(),
+                argv0: candidate.path.to_string_lossy().into_owned(),
+            };
+            if policy.evaluate_effect(principal, &effect) != shoal_leash::Verdict::Allow {
+                return Err(ReefError::provider(format!(
+                    "version probe for {} denied by principal `{principal}` spawn pins",
+                    candidate.path.display()
+                ))
+                .with_hint("allow the candidate name/hash or materialize the lock elsewhere"));
+            }
+        }
+        Ok(())
+    }
+
+    /// `fetch` is an explicit but opaque installer spawn. Enforce the active
+    /// evaluator policy again at execution time so embedded/non-kernel hosts
+    /// cannot bypass the plan verdict. The current provider API cannot wrap
+    /// install commands in the OS sandbox, so scoped filesystem principals
+    /// fail closed instead of running an unconfined installer.
+    pub(crate) fn reef_fetch_guard(&self) -> VResult<()> {
+        let Some((policy, principal)) = self.session.leash.as_ref() else {
+            return Ok(());
+        };
+        if policy.evaluate_effect(principal, &Effect::Opaque) != shoal_leash::Verdict::Allow {
+            return Err(ErrorVal::new(
+                "spawn_denied",
+                format!("reef fetch denied: principal `{principal}` does not allow opaque effects"),
+            ));
+        }
+        if policy.sandbox_for(principal).is_some() {
+            return Err(ErrorVal::new(
+                "spawn_denied",
+                "reef fetch denied: the principal requires filesystem sandboxing that provider installers cannot yet apply",
+            ));
+        }
+        if policy.spawn_pinning_active(principal) {
+            let mise = self.ambient_which("mise").ok_or_else(|| {
+                ErrorVal::new(
+                    "spawn_denied",
+                    "reef fetch denied: no `mise` executable is available for spawn-pin verification",
+                )
+            })?;
+            self.spawn_gate(mise.as_os_str(), None, Span::default())?;
+        }
+        Ok(())
+    }
+
     // --- chain cache -------------------------------------------------------
 
     /// Ensure the cached scope chain matches the current cwd and manifest
@@ -266,9 +340,14 @@ impl Evaluator {
         let resolver = self.reef_resolver();
         let mut lock = self.exec.reef.lock.clone();
         let mut notice: Option<LockNotice> = None;
-        let outcome = resolver.resolve(&name, &chain, &mut lock, policy, &mut |n| {
-            notice = Some(n.clone());
-        });
+        let outcome = resolver.resolve_with_probe_guard(
+            &name,
+            &chain,
+            &mut lock,
+            policy,
+            &mut |n| notice = Some(n.clone()),
+            &mut |candidate| self.reef_probe_guard(candidate),
+        );
         let resolution = match outcome {
             Ok(r) => r,
             Err(e) => {

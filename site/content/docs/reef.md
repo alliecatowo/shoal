@@ -276,7 +276,7 @@ mise install TOOL@CONSTRAINT
 
 Then it rediscovers candidates and returns the highest satisfying installed version. Reef never fetches during normal resolution.
 
-`reef fetch TOOL` loops providers in the default order and uses the nearest constraint. Since only mise implements fetch, it normally delegates there or reports `{fetched: false, note: "no provider can fetch this tool"}`. The current command does not enforce a manifest's provider pin while choosing the fetching provider; inspect the returned provider and follow with `reef lock`.
+`reef fetch TOOL` loops providers in the default order and uses the nearest constraint and provider pin. Since only mise implements fetch, it normally delegates there or reports `{fetched: false, note: "no provider can fetch this tool"}`. Follow a successful fetch with `reef lock`.
 
 ## Lockfiles
 
@@ -585,7 +585,7 @@ Reef is implemented and actively used for constrained external spawns, but it is
 - A completely empty manifest, or one whose options retain their defaults, has no scope effect.
 - Evaluator scope cache does not notice manual same-directory edits.
 - Lockfiles are deliberately host-local; portable multi-platform artifact locking is not implied.
-- `reef fetch` is mise-only and does not enforce the declared provider pin.
+- `reef fetch` is mise-only in the shipped provider stack. Restricted principals must allow its opaque installer effect and spawn pin; policies requiring a filesystem sandbox fail closed because provider installers cannot yet be wrapped by that backend.
 - General bare-path command heads do not use runners; spell `run(PATH)`.
 - Runner defaults outside the fixed fallback require an active tools-bearing scope.
 - Child evaluators inherit Reef/Leash context through the audited unified child constructor; future child routes must join that inventory.

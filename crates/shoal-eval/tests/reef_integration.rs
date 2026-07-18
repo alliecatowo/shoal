@@ -11,8 +11,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use shoal_eval::Evaluator;
-use shoal_reef::Resolver;
-use shoal_reef::provider::SystemProvider;
+use shoal_leash::Policy as LeashPolicy;
+use shoal_reef::provider::{Candidate, Provider, ProviderCtx, ProviderError, SystemProvider};
+use shoal_reef::{Constraint, Resolver, Version};
 use shoal_value::Value;
 
 /// Write an executable fixture "binary": a shell script that answers
@@ -116,6 +117,157 @@ fn constrained_tool_resolves_to_fixture_and_spawns() {
     );
     // Interactive auto-lock wrote reef.lock next to the manifest.
     assert!(dir.path().join("reef.lock").exists(), "auto-lock persisted");
+}
+
+#[test]
+fn restricted_principal_denies_automatic_version_probe_before_execution() {
+    let dir = tempfile::tempdir().unwrap();
+    let bindir = dir.path().join("bin");
+    std::fs::create_dir_all(&bindir).unwrap();
+    std::fs::write(
+        dir.path().join(".reef.toml"),
+        "[tools]\nguarded = \"1.2.3\"\n",
+    )
+    .unwrap();
+    let marker = dir.path().join("probe-ran");
+    let binary = bindir.join("guarded");
+    std::fs::write(
+        &binary,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then touch '{}'; echo 'guarded 1.2.3'; exit 0; fi\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&binary).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&binary, permissions).unwrap();
+
+    let mut evaluator = Evaluator::new(dir.path().to_path_buf());
+    evaluator.set_interactive(true);
+    evaluator.set_reef_resolver(fixture_resolver(&bindir));
+    evaluator.set_leash_policy(
+        LeashPolicy::from_toml("[principal.agent]\nopaque = 'deny'\n").unwrap(),
+        "agent",
+    );
+    let error = evaluator
+        .eval_program(&parse("guarded"))
+        .expect_err("opaque-denying principal must reject the implicit probe");
+    assert_eq!(error.code, "reef_provider");
+    assert!(error.msg.contains("version probe"), "{error:?}");
+    assert!(!marker.exists(), "denied candidate must never execute");
+    assert!(!dir.path().join("reef.lock").exists());
+}
+
+#[test]
+fn restricted_principal_denies_provider_fetch_before_installer_hook() {
+    struct FetchProvider {
+        marker: PathBuf,
+    }
+    impl Provider for FetchProvider {
+        fn name(&self) -> &'static str {
+            "fetch-fixture"
+        }
+
+        fn discover(&self, _tool: &str, _ctx: &ProviderCtx) -> Vec<Candidate> {
+            Vec::new()
+        }
+
+        fn fetch(
+            &self,
+            _tool: &str,
+            _requirement: &Constraint,
+            _ctx: &ProviderCtx,
+        ) -> Option<Result<Candidate, ProviderError>> {
+            std::fs::write(&self.marker, b"installer hook ran").unwrap();
+            Some(Err(ProviderError::new("fetch-fixture", "injected")))
+        }
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join(".reef.toml"),
+        "[tools]\nguarded = \"1.2.3\"\n",
+    )
+    .unwrap();
+    let marker = directory.path().join("fetch-ran");
+    let resolver = Arc::new(Resolver::new(vec![Box::new(FetchProvider {
+        marker: marker.clone(),
+    })]));
+    let mut evaluator = Evaluator::new(directory.path().to_path_buf());
+    evaluator.set_reef_resolver(resolver);
+    evaluator.set_leash_policy(
+        LeashPolicy::from_toml("[principal.agent]\nopaque = 'deny'\n").unwrap(),
+        "agent",
+    );
+    let error = evaluator
+        .eval_program(&parse("reef fetch guarded"))
+        .expect_err("opaque-denying principal must reject provider fetch");
+    assert_eq!(error.code, "spawn_denied");
+    assert!(!marker.exists(), "denied provider hook must never run");
+}
+
+#[test]
+fn provider_pinned_fetch_never_invokes_other_installers() {
+    struct PinProvider {
+        name: &'static str,
+        marker: PathBuf,
+        binary: PathBuf,
+    }
+    impl Provider for PinProvider {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn discover(&self, _tool: &str, _ctx: &ProviderCtx) -> Vec<Candidate> {
+            Vec::new()
+        }
+
+        fn fetch(
+            &self,
+            tool: &str,
+            _requirement: &Constraint,
+            _ctx: &ProviderCtx,
+        ) -> Option<Result<Candidate, ProviderError>> {
+            std::fs::write(&self.marker, self.name.as_bytes()).unwrap();
+            Some(Ok(Candidate::new(
+                tool,
+                Version::parse("1.2.3"),
+                self.binary.clone(),
+                self.name,
+            )))
+        }
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join(".reef.toml"),
+        "[tools]\nguarded = { version = \"1.2.3\", provider = \"chosen\" }\n",
+    )
+    .unwrap();
+    let skipped_marker = directory.path().join("skipped-ran");
+    let chosen_marker = directory.path().join("chosen-ran");
+    let binary = directory.path().join("guarded");
+    std::fs::write(&binary, b"fixture").unwrap();
+    let resolver = Arc::new(Resolver::new(vec![
+        Box::new(PinProvider {
+            name: "skipped",
+            marker: skipped_marker.clone(),
+            binary: binary.clone(),
+        }),
+        Box::new(PinProvider {
+            name: "chosen",
+            marker: chosen_marker.clone(),
+            binary,
+        }),
+    ]));
+    let mut evaluator = Evaluator::new(directory.path().to_path_buf());
+    evaluator.set_reef_resolver(resolver);
+    evaluator
+        .eval_program(&parse("reef fetch guarded"))
+        .expect("pinned provider fetch succeeds");
+    assert!(!skipped_marker.exists(), "unpinned provider must not run");
+    assert!(chosen_marker.exists(), "pinned provider must run");
 }
 
 #[test]
