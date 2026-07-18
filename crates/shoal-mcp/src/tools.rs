@@ -138,6 +138,7 @@ fn validate_tool_arguments(name: &str, args: &Value) -> Result<(), String> {
             "position",
             "background",
             "timeout_ms",
+            "deadline_ms",
             "elide",
         ],
         "shoal_plan" => &["src"],
@@ -174,6 +175,7 @@ fn validate_tool_arguments(name: &str, args: &Value) -> Result<(), String> {
             optional_enum(object, "position", &["stmt", "value"])?;
             optional_bool(object, "background")?;
             optional_u64(object, "timeout_ms", 1, u64::MAX, false)?;
+            optional_u64(object, "deadline_ms", 1, u64::MAX, false)?;
             optional_elide(object.get("elide"))?;
         }
         "shoal_plan" => bounded_string(object, "src", MAX_TOOL_SOURCE_BYTES)?,
@@ -405,7 +407,7 @@ fn safe_tool_error(error: &Value) -> Value {
 fn map_tool(name: &str, args: Value) -> Result<(&'static str, Value), String> {
     let object = args.as_object().ok_or("tool arguments must be an object")?;
     Ok(match name {
-        // site/content/internals/kernel-protocol.md exec signature: mode/position/background/timeout_ms/
+        // site/content/internals/kernel-protocol.md exec signature: mode/position/background/timeout_ms/deadline_ms/
         // elide are all forwarded (no more silently-dropped params).
         "shoal_exec" => (
             "exec",
@@ -415,6 +417,7 @@ fn map_tool(name: &str, args: Value) -> Result<(&'static str, Value), String> {
                 "position": object.get("position").and_then(Value::as_str).unwrap_or("value"),
                 "background": object.get("background").and_then(Value::as_bool).unwrap_or(false),
                 "timeout_ms": object.get("timeout_ms"),
+                "deadline_ms": object.get("deadline_ms"),
                 "elide": object.get("elide"),
             }),
         ),
@@ -608,7 +611,7 @@ pub fn tools() -> Vec<Value> {
         tool(
             "shoal_exec",
             "Execute shoal source and return a stable transcript reference (or a task ref when background/timed-out)",
-            json!({"type":"object","properties":{"src":{"type":"string"},"mode":{"enum":["run","plan"]},"position":{"enum":["stmt","value"]},"background":{"type":"boolean"},"timeout_ms":{"type":"integer","minimum":1},"elide":{"type":"object","properties":{"max_bytes":{"type":"integer"},"max_rows":{"type":"integer"},"max_items":{"type":"integer"}}}},"required":["src"],"additionalProperties":false}),
+            json!({"type":"object","properties":{"src":{"type":"string"},"mode":{"enum":["run","plan"]},"position":{"enum":["stmt","value"]},"background":{"type":"boolean"},"timeout_ms":{"type":"integer","minimum":1},"deadline_ms":{"type":"integer","minimum":1},"elide":{"type":"object","properties":{"max_bytes":{"type":"integer"},"max_rows":{"type":"integer"},"max_items":{"type":"integer"}}}},"required":["src"],"additionalProperties":false}),
         ),
         tool(
             "shoal_plan",
@@ -849,6 +852,10 @@ mod tests {
                 .is_ok()
         );
         assert!(
+            validate_tool_arguments("shoal_exec", &json!({"src":"1", "deadline_ms":u64::MAX}))
+                .is_ok()
+        );
+        assert!(
             validate_tool_arguments("shoal_exec", &json!({"src":"1", "timeout_ms":-1})).is_err()
         );
         assert!(
@@ -866,6 +873,18 @@ mod tests {
         assert!(admit_value_size(&wide, MAX_TOOL_ARGUMENT_BYTES, "tool arguments").is_err());
         let escaped = Value::String("\0".repeat(1024 * 1024));
         assert!(admit_value_size(&escaped, MAX_TOOL_ARGUMENT_BYTES, "tool arguments").is_err());
+    }
+
+    #[test]
+    fn exec_forwards_wait_and_execution_budgets_separately() {
+        let (method, params) = map_tool(
+            "shoal_exec",
+            json!({"src":"sleep 1s","timeout_ms":5,"deadline_ms":10}),
+        )
+        .unwrap();
+        assert_eq!(method, "exec");
+        assert_eq!(params["timeout_ms"], 5);
+        assert_eq!(params["deadline_ms"], 10);
     }
 
     #[test]

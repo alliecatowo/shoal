@@ -310,3 +310,64 @@ fn task_await_bounds_connection_wait_without_cancelling_work() {
     drop(reader);
     thread.join().unwrap();
 }
+
+#[test]
+fn exec_deadline_cancels_work_and_is_distinct_from_wait_timeout() {
+    let kernel = Kernel::new();
+    let (mut client, mut reader, thread) = spawn(&kernel);
+    attach(&mut client, &mut reader);
+
+    let started = call(
+        &mut client,
+        &mut reader,
+        2,
+        "exec",
+        json!({"src":"sleep 30s","background":true,"deadline_ms":20}),
+    )
+    .result
+    .unwrap();
+    assert_eq!(started["deadline_ms"], 20);
+    assert_eq!(started["deadline_clamped"], false);
+    let task = started["task"].as_str().unwrap().to_owned();
+    let terminal = call(
+        &mut client,
+        &mut reader,
+        3,
+        "task.await",
+        json!({"task":task,"timeout_ms":5000}),
+    )
+    .result
+    .unwrap();
+    assert_eq!(terminal["state"], "cancelled");
+    assert_eq!(terminal["deadline_ms"], 20);
+    assert_eq!(terminal["deadline_exceeded"], true);
+    assert_eq!(terminal["timed_out"], false);
+
+    let clamped_start = call(
+        &mut client,
+        &mut reader,
+        4,
+        "exec",
+        json!({"src":"1 + 2","background":true,"deadline_ms":u64::MAX}),
+    )
+    .result
+    .unwrap();
+    assert_eq!(clamped_start["deadline_ms"], 86_400_000);
+    assert_eq!(clamped_start["deadline_clamped"], true);
+    let completed = call(
+        &mut client,
+        &mut reader,
+        5,
+        "task.await",
+        json!({"task":clamped_start["task"],"timeout_ms":5000}),
+    )
+    .result
+    .unwrap();
+    assert_eq!(completed["state"], "completed");
+    assert_eq!(completed["deadline_ms"], 86_400_000);
+    assert_eq!(completed["deadline_exceeded"], false);
+
+    drop(client);
+    drop(reader);
+    thread.join().unwrap();
+}

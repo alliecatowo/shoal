@@ -22,11 +22,9 @@ impl Kernel {
         let interactive =
             attachment.tty && attachment.connection_trust == ConnectionTrust::EmbeddedHuman;
         let params: ExecParams = decode(params)?;
-        // site/content/internals/kernel-protocol.md: `background:true`, or a synchronous run that
-        // exceeds `timeout_ms`, becomes a task ref + events channel —
-        // never a blocked context. A bare timeout runs the work on a
-        // task and waits up to the deadline for a fast inline answer.
-        if params.asynchronous || params.timeout_ms.is_some() {
+        // Background work, caller wait budgets, and hard execution deadlines
+        // all use the owned task/cancellation lifecycle.
+        if params.asynchronous || params.timeout_ms.is_some() || params.deadline_ms.is_some() {
             return self.handle_exec_task(params, client, attachment, session);
         }
         if params.mode == "plan" {
@@ -285,6 +283,8 @@ mod tests {
             done: Condvar::new(),
             cancel: shoal_exec::CancelToken::new(),
             cancel_requested: AtomicBool::new(false),
+            deadline_ms: None,
+            deadline_exceeded: AtomicBool::new(false),
         });
         kernel.tasks.insert_checked(task.clone()).unwrap();
         kernel.tasks.poison_entries_for_test();

@@ -230,7 +230,7 @@ One managed event connection and registry now replaces the former connection/thr
 
 Remaining work:
 
-- Add deadline distinct from “wait timeout.”
+- Hard `deadline_ms` distinct from the caller wait timeout is implemented with a 24-hour server ceiling and observable expiry.
 - Add incremental output cursor where a child produces streams.
 - Extend descendant-tree guarantees beyond owned process groups on platforms where children can escape them.
 

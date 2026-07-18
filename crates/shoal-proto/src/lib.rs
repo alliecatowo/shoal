@@ -469,6 +469,11 @@ pub struct ExecParams {
     /// ref instead of blocking the caller's context.
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+    /// Hard execution budget. Unlike `timeout_ms`, expiry requests task
+    /// cancellation and remains visible on the task record. The kernel clamps
+    /// extreme values to its server ceiling.
+    #[serde(default)]
+    pub deadline_ms: Option<u64>,
     /// Per-call elision budget (site/content/internals/kernel-protocol.md). Tightens or loosens the
     /// kernel defaults; never loosens past the hard cap (64 KiB).
     #[serde(default)]
@@ -573,6 +578,13 @@ pub struct TaskRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
     pub error: Option<RpcError>,
+    /// Effective hard execution budget installed for this task, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_ms: Option<u64>,
+    /// True only when the deadline watchdog, rather than an explicit client
+    /// cancellation, requested termination.
+    #[serde(default)]
+    pub deadline_exceeded: bool,
     /// Race-honest control discovery for `task.cancel/suspend/resume`.
     #[serde(default)]
     pub controls: TaskControls,

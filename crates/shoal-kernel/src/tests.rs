@@ -427,6 +427,8 @@ fn session_registry_evicts_idle_lru_but_never_active_leases() {
         done: Condvar::new(),
         cancel: shoal_exec::CancelToken::new(),
         cancel_requested: AtomicBool::new(false),
+        deadline_ms: None,
+        deadline_exceeded: AtomicBool::new(false),
     }));
     drop(first);
     std::thread::sleep(std::time::Duration::from_millis(1));
@@ -503,6 +505,8 @@ fn task_refs_are_hidden_from_another_principal_with_the_same_session_name() {
         done: Condvar::new(),
         cancel: shoal_exec::CancelToken::new(),
         cancel_requested: AtomicBool::new(false),
+        deadline_ms: None,
+        deadline_exceeded: AtomicBool::new(false),
     }));
     let mut attached = Some(Attachment {
         session: beta,
@@ -604,6 +608,8 @@ fn poisoned_task_record_is_rebuilt_as_terminal_failure() {
         done: Condvar::new(),
         cancel: shoal_exec::CancelToken::new(),
         cancel_requested: AtomicBool::new(false),
+        deadline_ms: None,
+        deadline_exceeded: AtomicBool::new(false),
     });
     let poisoner = task.clone();
     let thread = std::thread::spawn(move || {
@@ -658,6 +664,8 @@ fn terminal_tasks_release_sessions_and_stale_records_are_reaped() {
         done: Condvar::new(),
         cancel: shoal_exec::CancelToken::new(),
         cancel_requested: AtomicBool::new(false),
+        deadline_ms: None,
+        deadline_exceeded: AtomicBool::new(false),
     });
     assert_eq!(Arc::strong_count(&session), baseline + 1);
     task.release_session_lease();

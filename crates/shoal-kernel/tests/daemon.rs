@@ -558,6 +558,7 @@ fn daemon_binds_secure_socket_and_attaches() {
                 position: "value".into(),
                 asynchronous: false,
                 timeout_ms: None,
+                deadline_ms: None,
                 elide: None,
                 plan_ref: None,
             })
@@ -581,6 +582,7 @@ fn daemon_binds_secure_socket_and_attaches() {
                 position: "value".into(),
                 asynchronous: false,
                 timeout_ms: None,
+                deadline_ms: None,
                 elide: None,
                 plan_ref: None,
             })
@@ -793,6 +795,7 @@ fn daemon_survives_a_paused_gap_between_two_sequential_requests() {
                 position: "stmt".into(),
                 asynchronous: false,
                 timeout_ms: None,
+                deadline_ms: None,
                 elide: None,
                 plan_ref: None,
             })
@@ -921,6 +924,7 @@ fn live_kernel_elides_a_big_table_over_the_wire() {
                 position: "stmt".into(),
                 asynchronous: false,
                 timeout_ms: None,
+                deadline_ms: None,
                 elide: None,
                 plan_ref: None,
             })

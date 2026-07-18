@@ -2,6 +2,9 @@
 
 use super::*;
 
+mod deadline;
+use deadline::{EXEC_DEADLINE_MAX_MS, spawn_deadline_watchdog};
+
 impl Kernel {
     pub(super) fn handle_exec_task(
         self: &Arc<Self>,
@@ -13,6 +16,9 @@ impl Kernel {
         let active_slot = self.tasks.reserve(&session.key.owner())?;
         let elide_spec = params.elide;
         let wait = params.timeout_ms.map(std::time::Duration::from_millis);
+        let requested_deadline_ms = params.deadline_ms;
+        let deadline_ms = requested_deadline_ms.map(|ms| ms.min(EXEC_DEADLINE_MAX_MS));
+        let deadline_clamped = requested_deadline_ms != deadline_ms;
         let is_background = params.asynchronous;
         // The worker may queue behind another execution on this session's
         // evaluator. Keep its epoch request-local until the worker owns
@@ -27,24 +33,14 @@ impl Kernel {
         // the prefix).
         let (task_id, task_ref) = self.tasks.allocate();
         let task_owner = session.key.owner();
-        let task = Arc::new(TaskEntry {
-            task: task_ref.clone(),
-            owner: task_owner.clone(),
-            session_id: session.id.clone(),
-            session_lease: Mutex::new(Some(session.clone())),
-            started_ns: now_ns(),
-            inner: Mutex::new(TaskInner {
-                state: "running",
-                finished_ns: None,
-                result_ref: None,
-                exit_code: None,
-                error: None,
-                active_slot: Some(active_slot),
-            }),
-            done: Condvar::new(),
-            cancel: cancel.clone(),
-            cancel_requested: AtomicBool::new(false),
-        });
+        let task = Arc::new(TaskEntry::new_running(
+            task_ref.clone(),
+            task_owner.clone(),
+            session.clone(),
+            cancel.clone(),
+            active_slot,
+            deadline_ms,
+        ));
         self.tasks.insert_checked(task.clone())?;
         let waiter = task.clone();
         let worker_session = session.clone();
@@ -58,6 +54,12 @@ impl Kernel {
             &task_channel,
             json!({"$":"str","v":"started"}),
         );
+        if let Some(deadline_ms) = deadline_ms
+            && let Err(error) = spawn_deadline_watchdog(task.clone(), deadline_ms)
+        {
+            self.cleanup_failed_task_launch(&task_ref, &waiter);
+            return Err(internal(error));
+        }
         let spawn_result = std::thread::Builder::new()
             .name(format!("shoal-task-{task_id}"))
             .spawn(move || {
@@ -77,7 +79,12 @@ impl Kernel {
         }
         let events_channel = format!("task.{task_id}");
         if is_background {
-            return encode(json!({"task":task_ref,"events":events_channel}));
+            return encode(json!({
+                "task":task_ref,
+                "events":events_channel,
+                "deadline_ms":deadline_ms,
+                "deadline_clamped":deadline_clamped,
+            }));
         }
         // Synchronous timeout: wait up to the deadline for the task
         // to finish; return an inline result if it beats the clock,
@@ -101,7 +108,13 @@ impl Kernel {
         }
         if matches!(inner.state, "running" | "cancelling") {
             drop(inner);
-            return encode(json!({"task":task_ref,"events":events_channel,"timed_out":true}));
+            return encode(json!({
+                "task":task_ref,
+                "events":events_channel,
+                "timed_out":true,
+                "deadline_ms":deadline_ms,
+                "deadline_clamped":deadline_clamped,
+            }));
         }
         let result_ref = inner.result_ref.clone();
         let exit_code = inner.exit_code;
@@ -125,7 +138,12 @@ impl Kernel {
                 });
             }
         }
-        encode(json!({"task":task_ref,"events":events_channel}))
+        encode(json!({
+            "task":task_ref,
+            "events":events_channel,
+            "deadline_ms":deadline_ms,
+            "deadline_clamped":deadline_clamped,
+        }))
     }
 
     pub(super) fn cleanup_failed_task_launch(&self, task_ref: &Ref, task: &Arc<TaskEntry>) {
@@ -160,6 +178,7 @@ fn run_task_worker(
                 params: serde_json::to_value(ExecParams {
                     asynchronous: false,
                     timeout_ms: None,
+                    deadline_ms: None,
                     ..params
                 })
                 .unwrap(),

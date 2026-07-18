@@ -210,16 +210,9 @@ impl Kernel {
                 data: None,
             });
         }
-        task.cancel_requested.store(true, Ordering::SeqCst);
-        {
-            let mut inner = task.lock_inner()?;
-            if matches!(inner.state, "running" | "suspended") {
-                inner.state = "cancelling";
-            }
-        }
         // CancelToken continues groups only when this epoch actually suspended
         // them, before tripping the existing INT/TERM/KILL watcher ladder.
-        task.cancel.cancel();
+        task.request_cancel()?;
         encode(json!({"task":p.task,"cancel_requested":true}))
     }
 
@@ -490,6 +483,7 @@ impl Kernel {
                     position: "stmt".into(),
                     asynchronous: false,
                     timeout_ms: None,
+                    deadline_ms: None,
                     elide: None,
                     plan_ref: Some(p.plan_ref.clone()),
                 })
@@ -752,6 +746,8 @@ mod task_poison_tests {
             done: Condvar::new(),
             cancel: shoal_exec::CancelToken::new(),
             cancel_requested: AtomicBool::new(false),
+            deadline_ms: None,
+            deadline_exceeded: AtomicBool::new(false),
         });
         kernel.tasks.insert_checked(task.clone()).unwrap();
         assert_eq!(Arc::strong_count(&session), baseline + 1);

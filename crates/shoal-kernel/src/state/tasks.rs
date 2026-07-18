@@ -17,6 +17,8 @@ pub(crate) struct TaskEntry {
     pub(crate) done: Condvar,
     pub(crate) cancel: shoal_exec::CancelToken,
     pub(crate) cancel_requested: AtomicBool,
+    pub(crate) deadline_ms: Option<u64>,
+    pub(crate) deadline_exceeded: AtomicBool,
 }
 
 pub(crate) struct TaskInner {
@@ -29,6 +31,62 @@ pub(crate) struct TaskInner {
 }
 
 impl TaskEntry {
+    pub(crate) fn new_running(
+        task: Ref,
+        owner: OwnerKey,
+        session: Arc<Session>,
+        cancel: shoal_exec::CancelToken,
+        active_slot: QuotaPermit,
+        deadline_ms: Option<u64>,
+    ) -> Self {
+        Self {
+            task,
+            owner,
+            session_id: session.id.clone(),
+            session_lease: Mutex::new(Some(session)),
+            started_ns: now_ns(),
+            inner: Mutex::new(TaskInner {
+                state: "running",
+                finished_ns: None,
+                result_ref: None,
+                exit_code: None,
+                error: None,
+                active_slot: Some(active_slot),
+            }),
+            done: Condvar::new(),
+            cancel,
+            cancel_requested: AtomicBool::new(false),
+            deadline_ms,
+            deadline_exceeded: AtomicBool::new(false),
+        }
+    }
+
+    pub(crate) fn request_cancel(&self) -> Result<(), RpcError> {
+        self.cancel_requested.store(true, Ordering::SeqCst);
+        {
+            let mut inner = self.lock_inner()?;
+            if matches!(inner.state, "running" | "suspended") {
+                inner.state = "cancelling";
+            }
+        }
+        self.cancel.cancel();
+        Ok(())
+    }
+
+    pub(crate) fn request_deadline_cancel(&self) -> Result<bool, RpcError> {
+        {
+            let mut inner = self.lock_inner()?;
+            if !matches!(inner.state, "running" | "suspended" | "cancelling") {
+                return Ok(false);
+            }
+            self.deadline_exceeded.store(true, Ordering::SeqCst);
+            self.cancel_requested.store(true, Ordering::SeqCst);
+            inner.state = "cancelling";
+        }
+        self.cancel.cancel();
+        Ok(true)
+    }
+
     pub(crate) fn release_session_lease(&self) {
         let mut lease = match self.session_lease.lock() {
             Ok(lease) => lease,
@@ -305,6 +363,8 @@ pub(crate) fn task_record_locked(
         result_ref: inner.result_ref.clone(),
         exit_code: inner.exit_code,
         error: inner.error.clone(),
+        deadline_ms: task.deadline_ms,
+        deadline_exceeded: task.deadline_exceeded.load(Ordering::SeqCst),
         controls,
     })
 }

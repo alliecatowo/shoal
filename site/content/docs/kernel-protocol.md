@@ -304,6 +304,7 @@ Raw params:
   "position": "stmt",
   "async": false,
   "timeout_ms": 5000,
+  "deadline_ms": 30000,
   "elide": {
     "max_bytes": 8192,
     "max_rows": 100,
@@ -320,10 +321,17 @@ Raw params:
 | `position` | `stmt` | `stmt` raises a failed final outcome; `value` captures it. |
 | `async` | false | Alias `background` is also accepted during deserialization. |
 | `timeout_ms` | none | Converts unfinished work to a task; does not kill it. |
+| `deadline_ms` | none | Hard execution budget; expiry requests cancellation. Maximum 24 hours. |
 | `elide` | defaults | Optional thresholds. |
 | `plan_ref` | none | Required and verified for `mode: "approved"`. |
 
 Unlike MCP `shoal_exec`, the raw default position is `stmt`. Make position explicit in cross-surface code.
+
+`timeout_ms` is only a caller wait budget. `deadline_ms` is distinct: any request carrying it uses
+the owned task lifecycle, and a bounded watchdog requests the same continue/INT/TERM/KILL
+cancellation path as `task.cancel` when the budget expires. The effective value is capped at
+86,400,000 ms (24 hours). Task-start responses report `deadline_ms`/`deadline_clamped`; task records
+retain `deadline_ms` and `deadline_exceeded` so explicit cancellation is distinguishable from expiry.
 
 Completed success:
 

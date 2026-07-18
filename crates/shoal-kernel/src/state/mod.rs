@@ -16,7 +16,5 @@ pub(crate) use ptys::{PtyEntry, PtyLifecycle, PtyRegistry};
 pub(crate) use sessions::MAX_SESSIONS_PER_PRINCIPAL;
 pub(crate) use sessions::SessionRegistry;
 #[cfg(test)]
-pub(crate) use tasks::{RETENTION_NS as TASK_RETENTION_NS, SessionQuota};
-pub(crate) use tasks::{
-    TaskEntry, TaskInner, TaskRegistry, TaskWorkerGuard, task_record, task_record_locked,
-};
+pub(crate) use tasks::{RETENTION_NS as TASK_RETENTION_NS, SessionQuota, TaskInner};
+pub(crate) use tasks::{TaskEntry, TaskRegistry, TaskWorkerGuard, task_record, task_record_locked};

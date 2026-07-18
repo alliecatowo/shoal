@@ -495,6 +495,10 @@ Connections, retained principal Sessions, active tasks, PTYs (per Session/princi
 60-second server ceiling. A timed-out wait leaves the underlying task running for later poll,
 subscription, cancellation, or another bounded await.
 
+Callers can separately set `exec.deadline_ms` to request cancellation after a hard execution
+budget. The kernel caps it at 24 hours and records whether the deadline actually fired; this uses
+the existing cooperative/process-group escalation path and is not a transaction rollback guarantee.
+
 ## Security review priorities
 
 Before describing Shoal as safe for mutually untrusted agents, the remaining minimum work is:

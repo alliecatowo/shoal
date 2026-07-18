@@ -245,14 +245,20 @@ be assumed applicable through `plan.apply`.
 | `position` | `stmt` by default | `stmt` raises failed outcomes; `value` captures them |
 | `async` | false; `background` accepted alias | immediately return a task |
 | `timeout_ms` | null | run on a task and wait only this long |
+| `deadline_ms` | null | hard task execution budget; server-capped at 24h; expiry requests cancellation |
 | `elide` | null | optional max bytes/rows/items, still under hard cap |
 | `plan_ref` | null | required for `approved` re-entry |
 
-Any async request or request carrying `timeout_ms` first creates a `task:N`, publishes `started` on
+Any async request or request carrying `timeout_ms`/`deadline_ms` first creates a `task:N`, publishes `started` on
 `task.N`, and recursively dispatches a synchronous exec in a worker thread. `async:true` returns
 immediately. A timeout request waits; if work finishes before the deadline it reconstructs an inline
 result from the transcript, otherwise it returns the still-running task and `timed_out:true`. Timeout
 does not cancel work.
+
+A deadline installs one bounded watchdog per active task. Completion wakes it immediately; expiry
+atomically marks `deadline_exceeded`, transitions the task to cancelling, and trips the existing
+process-group escalation path. The effective `deadline_ms` is capped at 24 hours and remains in the
+task record.
 
 
 ### Plan mode
