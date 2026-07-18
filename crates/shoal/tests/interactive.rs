@@ -92,6 +92,23 @@ fn dash_c_intermediate_structured_output_is_tabular() {
     assert!(stdout.trim_end().ends_with("done"), "stdout was {stdout:?}");
 }
 
+#[test]
+fn dash_c_failed_external_preserves_stdout_and_status() {
+    let output = Command::new(BIN)
+        .args([
+            "-c",
+            "/bin/sh -c 'printf stdout-evidence; printf stderr-evidence >&2; exit 7'",
+        ])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("spawn shoal -c");
+    assert_eq!(output.status.code(), Some(7));
+    assert_eq!(output.stdout, b"stdout-evidence\n");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("stderr-evidence"), "stderr was {stderr:?}");
+    assert!(stderr.contains("cmd_failed"), "stderr was {stderr:?}");
+}
+
 /// Drive the interactive REPL over a PTY: `echo` renders exactly once, an
 /// external command prints exactly once, and `exit <code>` sets the status.
 #[test]

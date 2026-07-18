@@ -81,3 +81,36 @@ fn failed_statement_commits_redirect_before_raising() {
     assert_eq!(error.status, Some(1));
     assert_eq!(std::fs::read(dir.path().join("failed.txt")).unwrap(), b"");
 }
+
+#[test]
+fn failed_redirect_does_not_also_route_stdout_to_statement_sink() {
+    use std::sync::{Arc, Mutex};
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut evaluator = Evaluator::new(dir.path().to_path_buf());
+    let captured: Arc<Mutex<Vec<Value>>> = Arc::default();
+    let sink = captured.clone();
+    evaluator.set_statement_sink(Box::new(move |value| {
+        sink.lock().unwrap().push(value.clone());
+    }));
+
+    let error = evaluator
+        .eval_program(
+            &shoal_syntax::parse(
+                "/bin/sh -c 'printf redirected-before-failure; exit 7' > failed.txt",
+            )
+            .unwrap(),
+        )
+        .expect_err("nonzero redirected statement must still raise");
+
+    assert_eq!(error.code, "cmd_failed");
+    assert_eq!(error.status, Some(7));
+    assert_eq!(
+        std::fs::read(dir.path().join("failed.txt")).unwrap(),
+        b"redirected-before-failure"
+    );
+    assert!(
+        captured.lock().unwrap().is_empty(),
+        "redirected stdout must not also reach the statement sink"
+    );
+}

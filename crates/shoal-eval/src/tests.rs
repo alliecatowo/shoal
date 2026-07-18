@@ -792,6 +792,23 @@ fn failed_statement_preserves_process_diagnostics() {
 }
 
 #[test]
+fn failed_statement_routes_captured_stdout_before_raising() {
+    let (result, captured) = run_capturing("/bin/sh -c 'printf stdout-before-failure; exit 7'");
+    let error = result.expect_err("nonzero statement must still raise");
+    assert_eq!(error.code, "cmd_failed");
+    assert_eq!(error.status, Some(7));
+    assert_eq!(captured.len(), 1);
+    let Value::Outcome(outcome) = &captured[0] else {
+        panic!(
+            "failed external must route its outcome, got {:?}",
+            captured[0]
+        );
+    };
+    assert!(!outcome.ok);
+    assert_eq!(outcome.stdout.as_slice(), b"stdout-before-failure");
+}
+
+#[test]
 fn typed_builtins_dispatch_before_path() {
     let dir = tempfile::tempdir().unwrap();
     let program = shoal_syntax::parse("touch a\nls").unwrap();

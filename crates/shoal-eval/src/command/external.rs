@@ -83,9 +83,9 @@ impl Evaluator {
         span: Span,
         meta: Option<ExecMeta>,
     ) -> VResult<Value> {
-        let (position, force_capture) = match process_mode {
-            ProcessMode::Auto(position) => (position, false),
-            ProcessMode::Redirected(position) => (position, true),
+        let (position, force_capture, emit_failed_output) = match process_mode {
+            ProcessMode::Auto(position) => (position, false, true),
+            ProcessMode::Redirected(position) => (position, true, false),
         };
         let mut env = self.exec.shell.process_env.clone();
         for p in prefixes {
@@ -281,7 +281,7 @@ impl Evaluator {
             // (site/content/internals/kernel-protocol.md).
             span: Some(span),
         }));
-        self.enforce_command_position(out, position)
+        self.enforce_command_position(out, position, emit_failed_output)
     }
 
     /// Promote an unsuccessful outcome to Shoal's statement-position
@@ -289,14 +289,26 @@ impl Evaluator {
     /// Redirect callers run in value position until bytes have been committed,
     /// then apply the original position through this shared gate.
     pub(super) fn enforce_command_position(
-        &self,
+        &mut self,
         out: Value,
         position: Position,
+        emit_failed_output: bool,
     ) -> VResult<Value> {
         if position == Position::Statement
             && let Value::Outcome(failed) = &out
             && !failed.ok
         {
+            // A captured command can write useful stdout before returning a
+            // failure (libtest is a prominent example). Ordinary shells do
+            // not erase those bytes. Route the outcome through the same sink
+            // a successful statement uses before raising `cmd_failed`.
+            //
+            // Redirected callers already committed stdout to their target and
+            // pass `false`; PTY children have already teed their merged bytes
+            // and `sink_value` suppresses them via `streamed`.
+            if emit_failed_output {
+                self.sink_value(&out);
+            }
             let message = match (failed.status, failed.signal.as_deref()) {
                 (Some(code), _) => format!("`{}` exited with status {code}", failed.cmd),
                 (_, Some(signal)) => format!("`{}` died from {signal}", failed.cmd),

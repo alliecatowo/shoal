@@ -312,6 +312,12 @@ and the kernel executing the path; the status must not claim atomic verified exe
 | caller drops streaming child | kill group and reap |
 | process exits nonzero | return `ExecResult`, not `io::Error` |
 
+When a captured command fails in statement position, stdout produced before
+the failure is routed through the normal statement sink before `cmd_failed` is
+raised. PTY output is not repeated, and stdout already committed by `>`/`>>`
+is not also sent to the sink. This preserves build/test diagnostics in
+noninteractive Shoal automation without weakening typed failure semantics.
+
 ## Global configuration caveat
 
 Capture limits are process-global atomics, not fields in `ExecSpec` or evaluator/session config.

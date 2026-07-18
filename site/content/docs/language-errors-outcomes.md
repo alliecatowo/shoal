@@ -56,6 +56,11 @@ let probe = (^false)   # value position: binds a failed outcome
 (^false).ok            # value expression: false
 ```
 
+An unredirected statement can write stdout before it fails. Shoal preserves
+those bytes through the normal output sink and then reports `cmd_failed`, like
+traditional shells. PTY output and redirected stdout are never printed a
+second time.
+
 Parentheses are the clearest way to place a command inside an expression. This rule lets ordinary interactive failures stop the line while allowing probes, retries, fallbacks, and exact status propagation.
 
 Most structured builtins also return successful outcomes so external and builtin transformations can chain similarly. Evaluator-native session operations such as `pwd` can return a bare value.

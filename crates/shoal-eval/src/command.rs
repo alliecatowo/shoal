@@ -291,7 +291,7 @@ impl Evaluator {
         if resolution.source == CommandSource::Adapter {
             let value = self.eval_adapter(call, position)?;
             let value = self.apply_external_redirects(call, value)?;
-            return self.enforce_command_position(value, position);
+            return self.enforce_command_position(value, position, false);
         }
         debug_assert_eq!(resolution.source, CommandSource::External);
         let mut argv = vec![OsString::from(&call.head)];
@@ -324,7 +324,7 @@ impl Evaluator {
             self.run_argv(argv, run_position, stdin, &call.env_prefix, call.span, None)?
         };
         let value = self.apply_external_redirects(call, value)?;
-        self.enforce_command_position(value, position)
+        self.enforce_command_position(value, position, false)
     }
 
     /// Commit output redirects for any process-backed command (raw external or
