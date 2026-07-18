@@ -86,26 +86,35 @@ impl OutputValues {
 pub(crate) struct OutputBudget {
     values: usize,
     retained_bytes: usize,
+    max_values: usize,
+    max_retained_bytes: usize,
 }
 
 impl OutputBudget {
     pub(crate) fn new() -> Self {
+        Self::with_limits(MAX_VALUES, MAX_RETAINED_BYTES)
+    }
+
+    pub(crate) fn with_limits(max_values: usize, max_retained_bytes: usize) -> Self {
         Self {
             values: 0,
             retained_bytes: 0,
+            max_values,
+            max_retained_bytes,
         }
     }
 
     pub(crate) fn admit_value(&mut self, value: &Value) -> VResult<()> {
-        if self.values >= MAX_VALUES {
+        if self.values >= self.max_values {
             return Err(output_limit(format!(
-                "builtin result reached its {MAX_VALUES}-value limit"
+                "builtin result reached its {}-value limit",
+                self.max_values
             )));
         }
         let retained = retained_size(
             value,
             RetainedLimits {
-                max_bytes: MAX_RETAINED_BYTES.saturating_sub(self.retained_bytes),
+                max_bytes: self.max_retained_bytes.saturating_sub(self.retained_bytes),
                 max_depth: 64,
                 max_nodes: 16_384,
                 opaque: OpaqueHandling::Charge(256),
@@ -114,7 +123,8 @@ impl OutputBudget {
         )
         .map_err(|_| {
             output_limit(format!(
-                "builtin result exceeds its {MAX_RETAINED_BYTES}-byte retained-value limit"
+                "builtin result exceeds its {}-byte retained-value limit",
+                self.max_retained_bytes
             ))
         })?;
         self.retained_bytes = self

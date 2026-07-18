@@ -585,28 +585,36 @@ fn production_evaluator_has_only_explicit_ambient_filesystem_exceptions() {
             text: "} else if m.is_file() {",
         },
         ExpectedLine {
-            file: "builtins.rs",
-            text: "if meta.is_dir() {",
-        },
-        ExpectedLine {
-            file: "builtins.rs",
-            text: "if !metadata.is_dir() || metadata.uid() != effective_uid || metadata.mode() & 0o077 != 0 {",
-        },
-        ExpectedLine {
-            file: "builtins.rs",
-            text: "if fs.symlink_metadata(path)?.is_dir() {",
-        },
-        ExpectedLine {
-            file: "builtins.rs",
-            text: "if !metadata.is_dir()",
-        },
-        ExpectedLine {
             file: "builtins/copy.rs",
             text: "if metadata.is_dir() {",
         },
         ExpectedLine {
             file: "builtins/copy.rs",
             text: "if source_metadata.is_dir() && canonical_destination.starts_with(&canonical_source) {",
+        },
+        ExpectedLine {
+            file: "builtins/trash.rs",
+            text: "if metadata.is_dir() && !recursive {",
+        },
+        ExpectedLine {
+            file: "builtins/trash.rs",
+            text: "is_dir: metadata.is_dir(),",
+        },
+        ExpectedLine {
+            file: "builtins/trash.rs",
+            text: "is_dir: metadata.is_dir(),",
+        },
+        ExpectedLine {
+            file: "builtins/trash.rs",
+            text: "if !metadata.is_dir() || metadata.uid() != effective_uid || metadata.mode() & 0o077 != 0 {",
+        },
+        ExpectedLine {
+            file: "builtins/trash.rs",
+            text: "if fs.symlink_metadata(path)?.is_dir() {",
+        },
+        ExpectedLine {
+            file: "builtins/trash.rs",
+            text: "if !metadata.is_dir()",
         },
         ExpectedLine {
             file: "path_access.rs",
