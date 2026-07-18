@@ -13,6 +13,7 @@ pub struct Inputs {
     pub tmpdir: Option<OsString>,
     pub explicit_state_dir: Option<OsString>,
     pub explicit_socket: Option<OsString>,
+    pub explicit_secret_dir: Option<OsString>,
 }
 
 impl Inputs {
@@ -26,6 +27,7 @@ impl Inputs {
             tmpdir: std::env::var_os("TMPDIR"),
             explicit_state_dir: std::env::var_os("SHOAL_STATE_DIR"),
             explicit_socket: std::env::var_os("SHOAL_SOCKET"),
+            explicit_secret_dir: std::env::var_os("SHOAL_SECRET_DIR"),
         }
     }
 }
@@ -37,6 +39,7 @@ pub struct ShoalPaths {
     config_dir: PathBuf,
     runtime_dir: PathBuf,
     explicit_socket: Option<PathBuf>,
+    secret_dir: PathBuf,
 }
 
 impl ShoalPaths {
@@ -86,15 +89,22 @@ impl ShoalPaths {
         } else {
             PathBuf::from(format!("/tmp/shoal-{uid}"))
         };
+        let data_dir = data_root.join("shoal");
+        let secret_dir = inputs
+            .explicit_secret_dir
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| data_dir.join("secrets"));
         Self {
             state_dir: explicit_state_dir.unwrap_or_else(|| state_root.join("shoal")),
-            data_dir: data_root.join("shoal"),
+            data_dir,
             config_dir: config_root.join("shoal"),
             runtime_dir,
             explicit_socket: inputs
                 .explicit_socket
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from),
+            secret_dir,
         }
     }
 
@@ -112,6 +122,15 @@ impl ShoalPaths {
 
     pub fn runtime_dir(&self) -> &Path {
         &self.runtime_dir
+    }
+
+    /// Directory containing the encrypted Shoal secret store.
+    ///
+    /// `SHOAL_SECRET_DIR` is an exact override shared by the evaluator and
+    /// the administrative CLI. An empty override is ignored rather than
+    /// accidentally selecting the process working directory.
+    pub fn secret_dir(&self) -> &Path {
+        &self.secret_dir
     }
 
     pub fn socket(&self, session: &str) -> PathBuf {
@@ -215,6 +234,21 @@ mod tests {
     }
 
     #[test]
+    fn explicit_secret_directory_is_shared_and_not_rewritten() {
+        let paths = ShoalPaths::resolve(
+            Inputs {
+                home: Some("/home/a".into()),
+                xdg_data_home: Some("/data".into()),
+                explicit_secret_dir: Some("relative/private-secrets".into()),
+                ..Inputs::default()
+            },
+            7,
+        );
+        assert_eq!(paths.secret_dir(), Path::new("relative/private-secrets"));
+        assert_eq!(paths.data_dir(), Path::new("/data/shoal"));
+    }
+
+    #[test]
     fn empty_environment_values_do_not_override_fallbacks() {
         let paths = ShoalPaths::resolve(
             Inputs {
@@ -223,6 +257,7 @@ mod tests {
                 xdg_runtime_dir: Some(OsString::new()),
                 tmpdir: Some(OsString::new()),
                 explicit_socket: Some(OsString::new()),
+                explicit_secret_dir: Some(OsString::new()),
                 ..Inputs::default()
             },
             9,
@@ -234,6 +269,10 @@ mod tests {
         assert_eq!(
             paths.socket("s"),
             PathBuf::from("/tmp/shoal-9/shoal/s.sock")
+        );
+        assert_eq!(
+            paths.secret_dir(),
+            Path::new("/home/a/.local/share/shoal/secrets")
         );
     }
 }

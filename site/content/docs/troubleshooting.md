@@ -395,14 +395,14 @@ That entry recorded no typed inverse. Undo is not command replay in reverse and 
 
 ### `secret.get` cannot find a value set by `shoal-secret`
 
-Check path mismatch:
+Check discovery inputs:
 
 ```bash
 printf 'SHOAL_SECRET_DIR=%s\n' "${SHOAL_SECRET_DIR-}"
 printf 'XDG_DATA_HOME=%s\n' "${XDG_DATA_HOME-}"
 ```
 
-The evaluator honors `SHOAL_SECRET_DIR`; the CLI ignores it and writes under XDG data. Align the stores as described in [Companion CLI reference](@/docs/companion-cli-reference.md#path-mismatch).
+The evaluator and CLI both honor `SHOAL_SECRET_DIR`, then use the XDG data fallback. Make sure both processes receive the same nonempty override and start from the same directory if it is relative.
 
 ### Stored secret has an unexpected newline
 

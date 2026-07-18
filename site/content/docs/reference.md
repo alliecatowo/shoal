@@ -147,7 +147,7 @@ Shell, history, and doctor share the XDG state fallback and layered `journal.sta
 | `SHOAL_CAPTURE_CAP_BYTES` | Resident process-output capture cap (default 64 MiB). |
 | `SHOAL_CAPTURE_SPILL_CAP_BYTES` | CAS spill cap (default 1 GiB). |
 | `SHOAL_ADAPTER_PATH` | Replacement custom adapter search path; not simple append. |
-| `SHOAL_SECRET_DIR` | Evaluator secret-store override; `shoal-secret` CLI ignores it. |
+| `SHOAL_SECRET_DIR` | Shared evaluator and `shoal-secret` store override; empty values are ignored. |
 
 ### Configuration overrides
 

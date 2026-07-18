@@ -454,7 +454,7 @@ $XDG_DATA_HOME/shoal/secrets
 ~/.local/share/shoal/secrets
 ```
 
-The standalone `shoal-secret` CLI does **not** currently honor `SHOAL_SECRET_DIR`; it uses its XDG/HOME default. This path mismatch can cause operators to update one store while the evaluator reads another. See [Companion CLI reference](@/docs/companion-cli-reference.md).
+The standalone `shoal-secret` CLI and evaluator use the same discovery contract. A nonempty `SHOAL_SECRET_DIR` wins over the XDG/HOME default; relative values resolve from each process's startup directory.
 
 ## Resource and denial-of-service limits
 

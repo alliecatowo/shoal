@@ -109,12 +109,11 @@ State and data are intentionally separate. This table is operationally important
 | `shoal-kernel` journal/tokens | `$XDG_STATE_HOME/shoal`, else `~/.local/state/shoal` |
 | main `shoal` journal/history | state-rooted (`XDG_STATE_HOME`) |
 | `shoal-history` | explicit `--state-dir`, else layered `journal.state_dir`, else the shared XDG state root |
-| evaluator secrets | `$SHOAL_SECRET_DIR`, else `$XDG_DATA_HOME/shoal/secrets`, else `~/.local/share/shoal/secrets` |
-| `shoal-secret` | `$XDG_DATA_HOME/shoal/secrets`, else `~/.local/share/shoal/secrets` (ignores `SHOAL_SECRET_DIR`) |
+| evaluator and `shoal-secret` | `$SHOAL_SECRET_DIR`, else `$XDG_DATA_HOME/shoal/secrets`, else `~/.local/share/shoal/secrets` |
 | `shoal-doctor` “state dir” probe | effective `journal.state_dir`, else the shared state root above |
 | user config/policy/adapters | `$XDG_CONFIG_HOME/shoal`, else `~/.config/shoal` |
 
-Relative `journal.state_dir` values resolve from each process's startup cwd. Use explicit `--state-dir` for a durable kernel launched with its own root, to override config, or to recover while layered config is malformed. When using `SHOAL_SECRET_DIR` for the evaluator, the CLI cannot target it by flag or environment today; temporarily align `XDG_DATA_HOME`, or manage the store with a process/environment layout that points both at the same directory.
+Relative `journal.state_dir` and `SHOAL_SECRET_DIR` values resolve from each process's startup cwd. Use explicit `--state-dir` for a durable kernel launched with its own root, to override config, or to recover while layered config is malformed. The evaluator and `shoal-secret` share the same secret-directory discovery contract.
 
 ## `shoal-kernel`
 
@@ -370,9 +369,12 @@ Names are printed sorted. Deleting a missing name is a successful no-op from the
 Directory:
 
 ```text
+$SHOAL_SECRET_DIR
 $XDG_DATA_HOME/shoal/secrets
 ~/.local/share/shoal/secrets
 ```
+
+An empty `SHOAL_SECRET_DIR` is ignored. A nonempty value is used exactly; relative values are relative to the process startup directory.
 
 The directory is set to `0700`. `master.key` is 32 raw random bytes (there is no password or KDF)
 and `secrets.json` is an AES-256-GCM authenticated envelope with a new 12-byte nonce for each save;
@@ -393,12 +395,6 @@ identity cap, provided the value and aggregate limits still hold.
 The key is stored beside the ciphertext. Encryption prevents accidental plaintext inspection and detects tampering; it does not protect against an attacker who can read the whole directory. Filesystem permissions and OS-user isolation remain the boundary.
 
 Every set/delete decrypts and rewrites the complete map. This store is appropriate for a modest number of local secrets, not a high-concurrency remote vault.
-
-### Path mismatch
-
-The evaluator honors `SHOAL_SECRET_DIR` before XDG/HOME. This CLI does not. If `SHOAL_SECRET_DIR=/custom` is set, `shoal-secret set` still writes to the XDG location while `secret.get` reads `/custom`.
-
-Until the CLI gains a directory option, align by choosing `XDG_DATA_HOME` such that its `shoal/secrets` equals the intended store, avoid the override, or populate the custom store using a trusted program built on the library.
 
 Exit codes: usage/store-open failure 2, set/list/delete operation failure 1, success 0. At the
 library boundary, caller admission failures use `InvalidInput`; malformed/ambiguous persisted state

@@ -269,7 +269,7 @@ Wire paths preserve raw Unix bytes alongside lossy display strings. Some other v
 - `shoal-secret` has no print/get command, bounds encrypted/decrypted store admission, and leaves
   invalid snapshots intact; its key is still stored beside ciphertext, so OS permissions are the
   true at-rest boundary.
-- Evaluator honors `SHOAL_SECRET_DIR`; CLI does not, so stores can diverge.
+- Evaluator and `shoal-secret` share `SHOAL_SECRET_DIR`/XDG/HOME discovery. Relative overrides can still diverge when the processes start in different directories, so absolute overrides are preferable operationally.
 - An authorized child can print a typed secret into captured output; redacted wire encoding cannot prevent downstream exfiltration.
 
 ## Configuration, prompt, and editor limits

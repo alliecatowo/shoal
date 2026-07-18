@@ -74,15 +74,11 @@ impl Exec for StdExec {
 pub struct StdSecret;
 
 impl StdSecret {
-    /// The secret directory, mirroring the original inline resolution order.
+    /// The secret directory shared with the administrative CLI.
     fn dir() -> PathBuf {
-        std::env::var_os("SHOAL_SECRET_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                shoal_paths::ShoalPaths::discover()
-                    .data_dir()
-                    .join("secrets")
-            })
+        shoal_paths::ShoalPaths::discover()
+            .secret_dir()
+            .to_path_buf()
     }
 }
 

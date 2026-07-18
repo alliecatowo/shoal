@@ -39,8 +39,8 @@ fn main() {
         return;
     }
     let dir = shoal_paths::ShoalPaths::discover()
-        .data_dir()
-        .join("secrets");
+        .secret_dir()
+        .to_path_buf();
     let store = match shoal_secret::SecretStore::open(dir) {
         Ok(s) => s,
         Err(e) => {
