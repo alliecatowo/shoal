@@ -73,7 +73,7 @@ kernel version, every third-party adapter executable, or performance targets on 
 | adapters | Implemented | schema fixtures, bundled catalog, evaluator bindings | external tools and output dialects remain inherently environment-dependent |
 | configuration | Implemented, host-limited | typed loader tests and shared host-bootstrap integration | host-specific editor/history/prompt consumers remain intentionally local |
 | prompt | Implemented, host-limited | pure renderer snapshots and CLI producer | several context fields are hardcoded or never produced |
-| journal and CAS | Implemented | SQLite/CAS/undo/GC tests | dual row granularity and permanent spill pins complicate lifecycle |
+| journal and CAS | Implemented | SQLite/CAS/undo/GC/lease tests | live spill ownership is automatic; migrated parent links and archival remain limited |
 | kernel JSON-RPC | Implemented with boundedness limits | router/handler tests and daemon tests | raw/blob pages are bounded; most live objects are restart-ephemeral |
 | MCP facade | Implemented | live-kernel integration | each active resource subscription still costs one connection and thread |
 | LSP | Partial | protocol tests and shared builtin names | declarations/completion remain mostly lexical, not evaluator-semantic |
@@ -413,14 +413,17 @@ SQLite WAL, version stamping, unfinished rows, zstd-compressed blake3 CAS, outpu
 inverses, pins, garbage collection, query filters, and durable transcript payloads are implemented.
 The [journal storage reference](../journal-storage-reference/) records the schema and lifecycle.
 
-Three current limitations deserve release-note visibility:
+Two current limitations deserve release-note visibility:
 
 1. schema v2 distinguishes coarse `exec`, fine `statement`, and `approval` rows and links new kernel
    statements to their parent exec, but migrated v1 rows cannot recover historical parent links;
 2. the language evaluator now rejects an installed-journal begin failure before effects and reports
    post-effect persistence failure as indeterminate, but direct journal embedders still define their
-   own degraded-health policy;
-3. evaluator spill adoption pins blobs without an automatic owner/release lifecycle.
+   own degraded-health policy.
+
+Evaluator spill adoption now uses counted owner leases. Lazy value drop releases them, independent
+owners cannot release one another, and applied GC detects crash-stale owner lockfiles before selecting
+blobs. Permanent history pins remain explicitly manual.
 
 Crash persistence is intentionally asymmetric: an appended row with `NULL` completion columns
 survives; live task/PTY/ref/session objects do not.

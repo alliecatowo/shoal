@@ -185,7 +185,9 @@ impl Journal {
                 row.get(0)
             })?;
         let pinned_logical: i64 = conn.query_row(
-            "SELECT COALESCE(SUM(b.stored_len), 0) FROM blob b JOIN pin p ON p.hash=b.hash",
+            "SELECT COALESCE(SUM(b.stored_len), 0) FROM blob b
+             WHERE EXISTS(SELECT 1 FROM pin p WHERE p.hash=b.hash)
+                OR EXISTS(SELECT 1 FROM pin_lease l WHERE l.hash=b.hash)",
             [],
             |row| row.get(0),
         )?;

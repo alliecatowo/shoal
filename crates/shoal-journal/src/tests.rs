@@ -333,6 +333,7 @@ fn open_creates_tree_and_wal_mode() {
     }
     assert!(state.join("journal.db").is_file());
     assert!(state.join("cas").is_dir());
+    assert!(state.join("leases").is_dir());
     // WAL mode is persisted in the database header.
     let conn = Connection::open(state.join("journal.db")).unwrap();
     let mode: String = conn
@@ -469,6 +470,40 @@ fn version_one_entry_metadata_migration_preserves_and_classifies_rows() {
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
     assert_eq!(version, CURRENT_SCHEMA_VERSION);
+}
+
+#[test]
+fn version_two_migration_adds_leases_without_touching_permanent_pins() {
+    let dir = tempfile::tempdir().unwrap();
+    let hash;
+    {
+        let journal = Journal::open(dir.path()).unwrap();
+        let id = journal.append(&rec("s", "human", 1, "pinned")).unwrap();
+        hash = journal.record_output(id, "stdout", b"keep me").unwrap();
+        journal.pin(&hash).unwrap();
+    }
+    {
+        let conn = Connection::open(dir.path().join("journal.db")).unwrap();
+        conn.execute_batch("DROP TABLE pin_lease; PRAGMA user_version=2;")
+            .unwrap();
+    }
+
+    let journal = Journal::open(dir.path()).expect("v2 journal must gain lease storage");
+    assert_eq!(journal.pins().unwrap(), vec![hash]);
+    let version: i64 = journal
+        .conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, CURRENT_SCHEMA_VERSION);
+    let lease_table: i64 = journal
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='pin_lease'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(lease_table, 1);
 }
 
 #[test]
@@ -1394,6 +1429,149 @@ fn pins_are_idempotent_and_exempt_from_gc() {
     assert!(report.deleted.is_empty());
     assert!(j.read_blob(&hash).unwrap().is_some());
     assert!(j.unpin(&hash).unwrap());
+}
+
+#[test]
+fn live_spill_leases_are_counted_and_release_on_last_value_drop() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::open(dir.path()).unwrap();
+    let payload = b"one deduplicated live capture".repeat(1024);
+    let hash = blake3::hash(&payload).to_hex().to_string();
+    let spill = journal.spill_dir().unwrap();
+
+    let first_path = spill.join("first");
+    fs::write(&first_path, &payload).unwrap();
+    let first = journal
+        .ingest_spill_leased(&first_path, &hash, payload.len() as u64)
+        .unwrap();
+    let second_path = spill.join("second");
+    fs::write(&second_path, &payload).unwrap();
+    let second = journal
+        .ingest_spill_leased(&second_path, &hash, payload.len() as u64)
+        .unwrap();
+
+    assert_eq!(journal.protected_hashes().unwrap(), vec![hash.clone()]);
+    let count: i64 = journal
+        .conn
+        .query_row(
+            "SELECT ref_count FROM pin_lease WHERE hash=?1",
+            [hex_bytes(&hash).unwrap()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 2);
+    assert!(
+        journal
+            .gc(GcOptions {
+                max_bytes: Some(0),
+                ..Default::default()
+            })
+            .unwrap()
+            .deleted
+            .is_empty()
+    );
+
+    drop(first);
+    assert_eq!(journal.protected_hashes().unwrap(), vec![hash.clone()]);
+    drop(second);
+    assert!(journal.protected_hashes().unwrap().is_empty());
+    let report = journal
+        .gc(GcOptions {
+            max_bytes: Some(0),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(report.deleted.len(), 1);
+    assert_eq!(report.deleted[0].hash, hash);
+}
+
+#[test]
+fn gc_reaps_a_crashed_owner_lease_before_selecting_blobs() {
+    let journal = Journal::in_memory().unwrap();
+    let id = journal.append(&rec("s", "human", 1, "spill")).unwrap();
+    let hash = journal
+        .record_output(id, "stdout", b"orphaned lease")
+        .unwrap();
+    journal
+        .conn
+        .execute(
+            "DELETE FROM output WHERE hash=?1",
+            [hex_bytes(&hash).unwrap()],
+        )
+        .unwrap();
+    journal
+        .conn
+        .execute(
+            "INSERT INTO pin_lease(hash,owner,ref_count) VALUES(?1,'dead-beef',1)",
+            [hex_bytes(&hash).unwrap()],
+        )
+        .unwrap();
+
+    let report = journal
+        .gc(GcOptions {
+            max_bytes: Some(0),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(report.deleted.len(), 1);
+    assert_eq!(report.deleted[0].hash, hash);
+    let leases: i64 = journal
+        .conn
+        .query_row("SELECT COUNT(*) FROM pin_lease", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(leases, 0);
+}
+
+#[test]
+fn one_journal_owner_cannot_release_another_owners_live_blob() {
+    let dir = tempfile::tempdir().unwrap();
+    let first_journal = Journal::open(dir.path()).unwrap();
+    let second_journal = Journal::open(dir.path()).unwrap();
+    let payload = b"shared across two live sessions".repeat(1024);
+    let hash = blake3::hash(&payload).to_hex().to_string();
+
+    let first_path = first_journal.spill_dir().unwrap().join("owner-one");
+    fs::write(&first_path, &payload).unwrap();
+    let first = first_journal
+        .ingest_spill_leased(&first_path, &hash, payload.len() as u64)
+        .unwrap();
+    let second_path = second_journal.spill_dir().unwrap().join("owner-two");
+    fs::write(&second_path, &payload).unwrap();
+    let second = second_journal
+        .ingest_spill_leased(&second_path, &hash, payload.len() as u64)
+        .unwrap();
+
+    drop(first);
+    drop(first_journal);
+    assert_eq!(
+        second_journal.protected_hashes().unwrap(),
+        vec![hash.clone()]
+    );
+    assert!(
+        second_journal
+            .gc(GcOptions {
+                max_bytes: Some(0),
+                ..Default::default()
+            })
+            .unwrap()
+            .deleted
+            .is_empty(),
+        "the second owner's OS lock must keep its lease live"
+    );
+
+    drop(second);
+    assert!(second_journal.protected_hashes().unwrap().is_empty());
+    assert_eq!(
+        second_journal
+            .gc(GcOptions {
+                max_bytes: Some(0),
+                ..Default::default()
+            })
+            .unwrap()
+            .deleted
+            .len(),
+        1
+    );
 }
 
 #[test]

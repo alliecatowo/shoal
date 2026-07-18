@@ -1,6 +1,7 @@
 //! Pins and garbage collection over the CAS `blob` table.
 
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io;
 
 use rusqlite::{Transaction, TransactionBehavior};
 
@@ -51,11 +52,28 @@ impl Journal {
         .collect()
     }
 
+    /// Every blob currently protected from GC, including permanent operator
+    /// pins and automatic live-value leases. Unlike [`Journal::pins`], this is
+    /// observational: a live lease cannot be removed by manual `unpin`.
+    pub fn protected_hashes(&self) -> rusqlite::Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT hash FROM pin UNION SELECT hash FROM pin_lease ORDER BY hash")?;
+        stmt.query_map([], |r| {
+            let raw: Vec<u8> = r.get(0)?;
+            hash_string(&raw, 0)
+        })?
+        .collect()
+    }
+
     pub fn gc(&self, options: GcOptions) -> rusqlite::Result<GcReport> {
         // Serialize candidate selection with pin/unpin and CAS admission so a
         // blob cannot become pinned after selection but before deletion.
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        let mut stmt=tx.prepare("SELECT b.hash,b.stored_len,b.last_access_ns,EXISTS(SELECT 1 FROM output o WHERE o.hash=b.hash),EXISTS(SELECT 1 FROM pin p WHERE p.hash=b.hash) FROM blob b ORDER BY 4 ASC,b.last_access_ns ASC")?;
+        if !options.dry_run {
+            self.reap_stale_pin_leases(&tx)?;
+        }
+        let mut stmt=tx.prepare("SELECT b.hash,b.stored_len,b.last_access_ns,EXISTS(SELECT 1 FROM output o WHERE o.hash=b.hash),(EXISTS(SELECT 1 FROM pin p WHERE p.hash=b.hash) OR EXISTS(SELECT 1 FROM pin_lease l WHERE l.hash=b.hash)) FROM blob b ORDER BY 4 ASC,b.last_access_ns ASC")?;
         let blobs = stmt
             .query_map([], |r| {
                 let len: i64 = r.get(1)?;
@@ -149,6 +167,52 @@ impl Journal {
             remaining_bytes: total.saturating_sub(chosen_bytes),
             deleted,
         })
+    }
+
+    /// Remove leases whose owning handle/value graph is no longer alive. The
+    /// database transaction serializes this with lease admission/release; the
+    /// OS lock distinguishes a crashed owner from one in another process.
+    fn reap_stale_pin_leases(&self, tx: &Transaction<'_>) -> rusqlite::Result<()> {
+        let mut statement = tx.prepare("SELECT DISTINCT owner FROM pin_lease")?;
+        let owners = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        let lease_dir = self
+            .cas_root
+            .parent()
+            .unwrap_or(self.cas_root.as_path())
+            .join("leases");
+        for owner in owners {
+            // Malformed authority rows stay pinned. Never turn database
+            // corruption into a path traversal or an accidental unpin.
+            if owner.is_empty()
+                || owner.len() > 128
+                || !owner
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+            {
+                continue;
+            }
+            let lock_path = lease_dir.join(format!("{owner}.lock"));
+            let stale = match OpenOptions::new().read(true).write(true).open(&lock_path) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+                Err(_) => false,
+                Ok(lock) => match lock.try_lock() {
+                    Ok(()) => {
+                        let _ = File::unlock(&lock);
+                        true
+                    }
+                    Err(std::fs::TryLockError::WouldBlock) => false,
+                    Err(_) => false,
+                },
+            };
+            if stale {
+                tx.execute("DELETE FROM pin_lease WHERE owner=?1", [&owner])?;
+                let _ = fs::remove_file(lock_path);
+            }
+        }
+        Ok(())
     }
 }
 

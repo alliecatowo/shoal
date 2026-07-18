@@ -48,6 +48,7 @@ use rusqlite::{Connection, ErrorCode};
 
 mod cas;
 mod gc;
+mod lease;
 mod query;
 mod schema;
 mod storage;
@@ -58,6 +59,7 @@ mod undo;
 
 pub use cas::{Cas, JournalOptions, OutputMeta, OutputRow};
 pub use gc::{GcBlob, GcOptions, GcReport};
+pub use lease::PinLease;
 pub use query::{DurableEventSeed, EntryRow, JournalQuery};
 pub use schema::{EntryKind, EntryRecord};
 pub use storage::{
@@ -75,8 +77,10 @@ pub use undo::{FileFingerprint, UndoError, UndoInverse, UndoIo, UndoReport, Undo
 pub struct Journal {
     conn: Connection,
     cas_root: PathBuf,
-    /// Keeps the CAS temp dir alive for the lifetime of an in-memory journal.
-    _cas_tempdir: Option<tempfile::TempDir>,
+    /// Owns the process-visible lease lock and keeps throwaway storage alive.
+    /// Ref-backed values clone this owner through [`PinLease`], so their CAS
+    /// cannot disappear merely because the originating evaluator is dropped.
+    lease_owner: std::sync::Arc<lease::LeaseOwner>,
     output_hard_cap: usize,
     storage_limits: JournalStorageLimits,
     /// CAS+spill bytes observed when this handle opened. This makes crash
@@ -151,8 +155,12 @@ impl Journal {
         state_dir: &Path,
         options: JournalOptions,
     ) -> rusqlite::Result<Journal> {
+        fs::create_dir_all(state_dir.join("cas")).map_err(io_to_sql)?;
+        // Pin guards may outlive the caller and reopen SQLite from `Drop`.
+        // Anchor them to an absolute stable path even if an embedding later
+        // changes its process cwd after opening a relative state directory.
+        let state_dir = fs::canonicalize(state_dir).map_err(io_to_sql)?;
         let cas_root = state_dir.join("cas");
-        fs::create_dir_all(&cas_root).map_err(io_to_sql)?;
         let db_path = state_dir.join("journal.db");
         let started = Instant::now();
         let conn = loop {
@@ -185,10 +193,11 @@ impl Journal {
             }
         };
         let reconciled_cas_physical_bytes = storage::reconciled_physical_bytes(&cas_root)?;
+        let lease_owner = lease::LeaseOwner::new(&state_dir, db_path, None)?;
         Ok(Journal {
             conn,
             cas_root,
-            _cas_tempdir: None,
+            lease_owner,
             output_hard_cap: options.output_hard_cap,
             storage_limits: options.storage_limits(),
             reconciled_cas_physical_bytes,
@@ -196,25 +205,31 @@ impl Journal {
         })
     }
 
-    /// Open a throwaway journal: in-memory SQLite database, CAS in a fresh
-    /// temporary directory that lives exactly as long as the returned `Journal`.
+    /// Open a throwaway journal in a fresh temporary directory. The SQLite
+    /// file is temporary too (rather than process-memory-only) so lazy values
+    /// can own and release the same crash-safe pin leases as persistent stores.
     pub fn in_memory() -> rusqlite::Result<Journal> {
         Self::in_memory_with_options(JournalOptions::default())
     }
 
     pub fn in_memory_with_options(options: JournalOptions) -> rusqlite::Result<Journal> {
         let tempdir = tempfile::tempdir().map_err(io_to_sql)?;
-        let cas_root = tempdir.path().join("cas");
+        let state_dir = tempdir.path().to_path_buf();
+        let cas_root = state_dir.join("cas");
         fs::create_dir_all(&cas_root).map_err(io_to_sql)?;
-        let conn = Connection::open_in_memory()?;
+        let db_path = state_dir.join("journal.db");
+        let conn = Connection::open(&db_path)?;
         conn.busy_timeout(options.busy_timeout)?;
+        conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
         Self::migrate(&conn)?;
         Self::configure_storage_pragmas(&conn, options.storage_limits())?;
         let reconciled_cas_physical_bytes = storage::reconciled_physical_bytes(&cas_root)?;
+        let lease_owner = lease::LeaseOwner::new(&state_dir, db_path, Some(tempdir))?;
         Ok(Journal {
             conn,
             cas_root,
-            _cas_tempdir: Some(tempdir),
+            lease_owner,
             output_hard_cap: options.output_hard_cap,
             storage_limits: options.storage_limits(),
             reconciled_cas_physical_bytes,

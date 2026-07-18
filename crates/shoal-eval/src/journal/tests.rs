@@ -944,7 +944,8 @@ fn value_capture_over_cap_spills_to_cas_ref_backed() {
     let dir = tempfile::tempdir().unwrap();
     let prev_cap = shoal_exec::capture_hard_cap();
     shoal_exec::set_capture_hard_cap(4096);
-    let mut ev = journaled(dir.path());
+    let mut ev = Evaluator::new(dir.path().to_path_buf());
+    ev.set_journal(Journal::open(dir.path()).unwrap(), "s1", "human");
 
     // A deterministic 200_000-byte capture (200_000 NUL bytes) past the cap.
     let v = run_journaled(&mut ev, "let x = sh { head -c 200000 /dev/zero }\nx.stdout").unwrap();
@@ -996,6 +997,17 @@ fn value_capture_over_cap_spills_to_cas_ref_backed() {
     let loaded = run_journaled(&mut ev, "x.stdout.load()").unwrap();
     assert_eq!(loaded, Value::Bytes(std::sync::Arc::new(expected)));
 
+    // The lazy value, not the evaluator/session, owns the final lease. It
+    // remains protected after its originating evaluator is gone and releases
+    // automatically when the last ref-backed value clone is dropped.
+    drop(ev);
+    let observer = shoal_journal::Journal::open(dir.path()).unwrap();
+    assert_eq!(observer.protected_hashes().unwrap(), vec![hash.clone()]);
+    drop(observer);
+    drop(v);
+    let observer = shoal_journal::Journal::open(dir.path()).unwrap();
+    assert!(observer.protected_hashes().unwrap().is_empty());
+
     shoal_exec::set_capture_hard_cap(prev_cap);
 }
 
@@ -1020,7 +1032,7 @@ fn value_capture_under_cap_stays_resident() {
             .journal
             .as_ref()
             .unwrap()
-            .pins()
+            .protected_hashes()
             .unwrap()
             .is_empty(),
         "no spill blob is pinned for a sub-cap capture"

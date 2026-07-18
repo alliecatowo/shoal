@@ -12,6 +12,7 @@
 //! [`Journal::migrate`] uses SQLite's built-in `PRAGMA user_version`. Version 2 added explicit
 //! entry kinds and parent-execution links; earlier builds inferred coarse kernel entries from the
 //! serialized AST shape, which made durable event queries depend on an incidental JSON layout.
+//! Version 3 adds crash-reapable, owner-scoped leases beside permanent manual pins.
 
 use std::io;
 
@@ -27,7 +28,7 @@ use crate::{Journal, io_to_sql};
 /// Bump this when existing tables need new columns or changed semantics. A new independent
 /// `CREATE TABLE IF NOT EXISTS` may remain an idempotent unversioned addition when old readers do
 /// not need to understand it.
-pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 2;
+pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 3;
 
 /// Durable semantic role of a journal entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,6 +205,12 @@ impl Journal {
              );
              CREATE TABLE IF NOT EXISTS pin(
                  hash BLOB PRIMARY KEY
+             );
+             CREATE TABLE IF NOT EXISTS pin_lease(
+                 hash      BLOB    NOT NULL,
+                 owner     TEXT    NOT NULL,
+                 ref_count INTEGER NOT NULL CHECK(ref_count > 0),
+                 PRIMARY KEY(hash, owner)
              );
              CREATE TABLE IF NOT EXISTS blob(
                  hash BLOB PRIMARY KEY,

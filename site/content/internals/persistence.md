@@ -23,6 +23,7 @@ events. A filesystem CAS stores compressed content by BLAKE3 hash.
 <state-dir>/journal.db-wal              # while WAL has live pages
 <state-dir>/cas/aa/bb/<full-hash>.zst
 <state-dir>/spill/                       # transient capture files
+<state-dir>/leases/<owner-token>.lock    # live-value owner locks
 ```
 
 ```mermaid
@@ -61,9 +62,9 @@ Foreign keys are represented by values but are not declared as SQLite foreign-ke
 the current DDL. This permits metadata to outlive GC'd bytes and lets history report an output as
 “aged out.”
 
-Schema version uses SQLite `PRAGMA user_version`, currently 1. All changes so far were additive; the
-migration dispatcher is scaffolded but no real version-to-version migration has shipped. A database
-from a newer schema version is rejected rather than guessed at.
+Schema version uses SQLite `PRAGMA user_version`, currently 3. V2 migrated explicit entry
+kind/parent identity; v3 adds owner-scoped live-value leases. A database from a newer schema version
+is rejected rather than guessed at.
 
 ## Entry lifecycle
 
@@ -115,8 +116,8 @@ from reaching arbitrary paths.
 ## Spill and lazy CAS bytes
 
 The execution layer can keep moderate captured stdout resident, then stream a larger capture to a
-temporary spill file. `ingest_spill` zstd-streams it into CAS without loading it all into RAM, records
-blob metadata, optionally pins it, and removes the spill file.
+temporary spill file. Evaluator adoption zstd-streams it into CAS without loading it all into RAM,
+records blob metadata plus an owner lease atomically, and removes the spill file.
 
 ```mermaid
 flowchart LR
@@ -130,13 +131,14 @@ accDescr: Shows the components and relationships described in Spill and lazy CAS
 ```
 
 `CasBytes` answers type/length/preview without materializing the payload. The loader is a cheap,
-cloneable, database-independent handle to the CAS directory so the value can cross threads without
-holding a SQLite connection.
+cloneable CAS handle plus a live `PinLease`, so the value can cross threads without holding a SQLite
+connection while GC still sees its ownership.
 
-Evaluator spills are ingested with a pin to keep a live ref safe from GC. No evaluator lifecycle path
-currently calls `unpin`; only the history CLI and direct API/tests do. This can turn spill pins into
-permanent retention until an operator intervenes. A future ownership model needs explicit ref
-leases or a durable reason/lifetime on each pin.
+Each journal handle owns a unique exclusively locked file. Identical content can have counted leases
+from multiple owners; dropping one value/session cannot release another's content. The final value
+drop removes its row. After a crash the OS releases the owner lock and the next applied GC removes
+the stale lease before selecting blobs. Permanent history pins remain a separate operator-managed
+set.
 
 ## Undo model
 
@@ -160,9 +162,9 @@ for an untruncated CAS snapshot, the mutation cannot honestly be labeled reversi
 
 ## Garbage collection
 
-GC supports TTL, maximum-byte budget, dry-run, and pins. Candidates are ordered with unreferenced
+GC supports TTL, maximum-byte budget, dry-run, permanent pins, and live leases. Candidates are ordered with unreferenced
 blobs before referenced blobs, then least-recent access. TTL selection can include referenced blobs;
-pins are the only hard retention mechanism.
+pins and live leases are the hard retention mechanisms.
 
 
 Deleting a referenced blob intentionally leaves its output metadata. History checks availability and
@@ -199,7 +201,8 @@ event log. Only these two channels have the journal-backed cold path.
 - Truncation is represented in both content marker and structured metadata.
 - Undo never restores truncated bytes as if complete.
 - Undo targets remain within the supplied root and fail on stale fingerprints or symlink parents.
-- GC never removes pins, but may age out referenced unpinned blobs.
+- GC never removes permanent pins or live leases, but may age out referenced unprotected blobs;
+  applied GC first reaps crash-stale lease owners.
 - A newer database schema is refused by an older build.
 - Multiple components open independent SQLite handles; never share a `Journal` concurrently as if it
   were `Sync`.

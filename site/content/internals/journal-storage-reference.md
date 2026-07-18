@@ -35,8 +35,10 @@ This page records the exact schema and algorithms. The higher-level
 │   └── ab/
 │       └── cd/
 │           └── <full-hex>.zst
-└── spill/
-    └── <capture temporary files>
+├── spill/
+│   └── <capture temporary files>
+└── leases/
+    └── <owner-token>.lock          # exclusively locked while values/handle live
 ```
 
 `Journal::open` creates the directory and CAS root, opens `journal.db`, requests WAL mode, sets
@@ -72,9 +74,10 @@ CAS insertion performs its logical-budget check inside the same serialized write
 known hash costs no new logical bytes. A new hash is admitted against the greater of tracked
 uncompressed bytes and the CAS+spill physical size reconciled when that handle opened, which makes
 restart-visible orphan files at least partly visible without imposing an O(number-of-blobs) tree walk
-on every command. Pins count and are never evicted automatically. Explicit `shoal-history gc
---apply` can reclaim only unpinned CAS content; it never deletes `entry`, `undo`, or transcript audit
-rows. The status command performs a fresh physical walk.
+on every command. Permanent pins and live leases count; permanent pins are never evicted
+automatically, while crash-stale leases are reaped by applied GC. Explicit `shoal-history gc --apply`
+can reclaim only unprotected CAS content; it never deletes `entry`, `undo`, or transcript audit rows.
+The status command performs a fresh physical walk.
 
 SQLite is additionally configured with `max_page_count`, a 128-page WAL autocheckpoint, and a bounded
 `journal_size_limit`. These are defense in depth. They are not a perfect filesystem quota: an active
@@ -94,7 +97,7 @@ accDescr: Shows the components and relationships described in Storage topology.
   Kernel["kernel coarse Journal"] --> DB
   Session["kernel Session evaluator Journal"] --> DB
   History["shoal-history Journal"] --> DB
-  DB --> Rows["entry / output / undo / pin / blob / transcript_event"]
+  DB --> Rows["entry / output / undo / pin / pin_lease / blob / transcript_event"]
   Kernel --> CAS["cas/<2>/<2>/<hash>.zst"]
   REPL --> CAS
   Session --> CAS
@@ -110,21 +113,22 @@ there is no shared cross-process health record beyond the caller-visible error a
 
 ## Schema version and initialization
 
-`PRAGMA user_version` is currently `1`. On every open the code first runs idempotent
+`PRAGMA user_version` is currently `3`. On every open the code first runs idempotent
 `CREATE TABLE/INDEX IF NOT EXISTS`, then reads the version:
 
 | Stored version | Behavior |
 |---:|---|
-| 0 | treat as fresh or legacy-compatible; stamp 1 |
-| 1 | accept unchanged |
-| greater than 1 | refuse as newer than this build |
-| between 1 and current | future migration dispatch; currently unreachable |
+| 0 | adopt a fresh/legacy-compatible database, migrate entry identity when needed, stamp 3 |
+| 1 | migrate entry kind/parent metadata, create lease storage, stamp 3 |
+| 2 | create owner-scoped lease storage and stamp 3 |
+| 3 | accept unchanged |
+| greater than 3 | refuse as newer than this build |
 
-There has not yet been a real stepwise migration. Version-zero adoption assumes existing tables have
-the current additive shape; it does not interrogate every column. Also, table initialization happens
-before the too-new version refusal, so opening a newer database can still execute idempotent current
-`CREATE ... IF NOT EXISTS` statements before returning the error. They should be non-destructive, but
-“refuse without touching schema” would require reading `user_version` first.
+The v1→v2 entry migration adds and classifies explicit row kinds transactionally; historical parent
+links remain null because they cannot be reconstructed. V3 adds `pin_lease`; the table is created
+idempotently before stamping. Table initialization still happens before the too-new version refusal,
+so opening a newer database can execute non-destructive `CREATE ... IF NOT EXISTS` statements before
+returning the error.
 
 The first non-additive migration should:
 
@@ -149,6 +153,7 @@ accDescr: Shows the components and relationships described in Relationship map.
   entry ||--o| transcript_event : "entry_id primary key (logical, no FK)"
   blob ||--o{ output : "hash (logical, no FK)"
   blob ||--o| pin : "hash (logical, no FK)"
+  blob ||--o{ pin_lease : "hash (logical, no FK)"
 
   entry {
     integer id PK
@@ -164,6 +169,8 @@ accDescr: Shows the components and relationships described in Relationship map.
     integer status nullable
     bool ok nullable
     bool opaque
+    text kind
+    integer parent_id nullable
   }
   output {
     integer entry_id
@@ -179,6 +186,11 @@ accDescr: Shows the components and relationships described in Relationship map.
   }
   pin {
     blob hash PK
+  }
+  pin_lease {
+    blob hash PK
+    text owner PK
+    integer ref_count
   }
   blob {
     blob hash PK
@@ -199,8 +211,8 @@ unless their caller validates it. GC can delete a `blob` record/file while old `
 the hash; that is how output metadata can survive content aging.
 
 Indexes exist on `entry(ts)`, `entry(parent_id)`, `(principal,session,kind,id)`,
-`output(entry_id)`, and `undo(entry_id)`. SQLite primary-key indexes cover entry, pin, blob, and
-transcript event IDs. Success/head filtering is not separately indexed.
+`output(entry_id)`, and `undo(entry_id)`. SQLite primary-key indexes cover entry, permanent pin,
+owner+hash lease, blob, and transcript event IDs. Success/head filtering is not separately indexed.
 
 ### `entry`
 
@@ -245,11 +257,17 @@ same entry/kind/hash from being inserted repeatedly.
 tag as its executable authority and orders by SQLite rowid descending. The table does not record
 whether a step was later applied; idempotence is inferred from filesystem state and fingerprints.
 
-### `pin` and `blob`
+### `pin`, `pin_lease`, and `blob`
 
-`pin` is a set of raw hashes with no owner, reason, creation time, or expiry. `blob.stored_len` is the
-uncompressed content length despite the name; the physical `.zst` file size is not stored.
-`last_access_ns` is updated by `Journal::read_blob` but not by the DB-independent `Cas::read`.
+`pin` remains the permanent operator-managed set exposed by history `pin`/`unpin`. `pin_lease` holds
+an owner token and positive reference count for lazy values. Each journal handle exclusively locks
+`leases/<owner>.lock`; the lock remains owned by `PinLease` after the handle drops. Last value drop
+decrements/deletes its row. GC removes rows whose owner lock is missing or acquirable, covering
+process crashes without letting one live session unpin another.
+
+`blob.stored_len` is the uncompressed content length despite the name; the physical `.zst` file size
+is not stored. `last_access_ns` is updated by `Journal::read_blob` but not by the DB-independent
+`Cas::read`.
 
 ### `transcript_event`
 
@@ -361,24 +379,26 @@ Orphan files are acceptable GC candidates; orphan DB rows or missing files surfa
 
 ## Spill and lazy bytes
 
-Large captured stdout can land in `<state>/spill` before journal adoption. `ingest_spill` receives a
-precomputed hash and length from `shoal-exec`, streams zstd compression to a temp file, inserts blob
-metadata, optionally pins the hash, and best-effort deletes the spill file.
+Large captured stdout can land in `<state>/spill` before journal adoption. `ingest_spill` retains
+the explicit permanent-pin API. Evaluator adoption uses `ingest_spill_leased`, which streams zstd
+compression, inserts blob metadata, increments its owner+hash reference count in the same writer
+transaction, and returns a guard held by the lazy loader.
 
 Ingestion checks the opened source file's type and length, hashes it before admission, and hashes the
 exact bytes again while compressing. A mismatch leaves the source under its RAII owner and commits no
-blob or pin. This closes the former path-swap/corruption gap between executor metadata and CAS naming.
+blob or lease. This closes the former path-swap/corruption gap between executor metadata and CAS naming.
 
-`Journal::cas()` returns a cloneable path-only reader used by lazy `CasBytes` values. This keeps
-SQLite out of value objects and allows thread-safe reads. It also means:
+`Journal::cas()` returns a cloneable path-only reader used by lazy `CasBytes` values. The loader also
+owns a small `PinLease` guard but no live SQLite connection, so reads remain thread-safe. This means:
 
 - access time is not refreshed;
-- deletion can race a lazy read unless pinned;
-- pins are global anonymous rows;
-- evaluator spill adoption has no automatic unpin when the value/session dies.
+- deletion cannot select content protected by a live lease;
+- operator pins remain global and intentionally permanent;
+- a best-effort lease-drop database failure may retain a row until the owning lock becomes stale and
+  a later applied GC reaps it.
 
-The long-term model should be owner leases—manual, history-retention, live-session, or another named
-class—rather than a boolean global pin.
+Dry-run GC observes existing lease rows but does not reap stale owners because dry-run performs no
+mutation. Applied GC performs stale-owner cleanup before candidate selection.
 
 ## Query behavior
 
@@ -554,7 +574,7 @@ they do not independently rediscover a different path.
 5. signal death keeps `status = NULL`; it is not encoded as `128 + signal`.
 6. replay order follows inverse rowid descending.
 7. scope escape, symlink parent traversal, and stale fingerprints are hard undo failures.
-8. pins, not output references, are the hard GC retention mechanism.
+8. permanent pins and live leases, not output references, are the hard GC retention mechanisms.
 9. `limit = 0` means 100, never unbounded, for public journal queries.
 10. a transcript event payload is exact persisted JSON, not a lossy re-derivation.
 11. a live `out:N`, task, plan, or PTY ref is not reconstructed merely because journal bytes survive.
@@ -564,19 +584,17 @@ they do not independently rediscover a different path.
 
 | Finding | Consequence | Preferred repair |
 |---|---|---|
-| no entry kind/parent/ordinal | coarse/fine ambiguity and AST-shape replay heuristic | v2 execution identity columns/table |
+| no statement ordinal | per-exec statement ordering requires row-ID inference | add an ordinal only when a concrete query needs it |
 | `env_hash` permanently null | schema promises provenance not captured | wire a real digest or remove/deprecate |
 | no foreign keys | orphan logical rows possible | validate/migrate, then add intentional constraints |
 | direct non-evaluator hosts choose their own write-error policy | inconsistent degraded-health reporting | shared health event/status contract |
-| global anonymous pins | permanent growth and no ownership | lease owner/reason/expiry table |
+| permanent manual pins have no reason metadata | operators cannot distinguish retention intent from the hash alone | add optional reason/created-at without merging them with live leases |
 | lazy `Cas::read` misses access updates | TTL can age actively read values | explicit lease or batched access telemetry |
 | duplicate-writer persist race | benign dedup can report failure | verify and accept an existing correct winner |
 | kernel post-filters after limit | incomplete `until`/effects results | typed indexed store filters |
 | effect filter is JSON substring | false match risk | normalized effect-kind relation/index |
 | GC file/DB steps nontransactional | tombstone/missing-file recovery cases | startup reconciliation and GC lock/protocol |
 | replay seed scans/materializes all rows | startup cost grows with history | durable channel sequence/index table |
-| state-root drift | tools inspect different databases | shared resolver |
-| no automatic spill unpin | CAS growth | owner-scoped live-value leases |
 | directory rename lacks parent fsync | weaker power-loss guarantee | document or add platform-aware fsync |
 
 ## Migration review checklist

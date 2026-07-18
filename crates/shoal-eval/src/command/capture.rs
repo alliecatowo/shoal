@@ -19,17 +19,20 @@ impl Evaluator {
         preview: Arc<Vec<u8>>,
     ) -> Option<Arc<shoal_value::CasBytesVal>> {
         self.session.journal.as_ref()?;
-        if let Err(error) = self
+        let lease = match self
             .session
             .journal
             .as_ref()
             .expect("presence checked")
-            .ingest_spill(&spill.path, &spill.hash, spill.len, true)
+            .ingest_spill_leased(&spill.path, &spill.hash, spill.len)
         {
-            self.note_journal_failure("capture spill adoption", error);
-            let _ = self.host.fs.remove_file(&spill.path);
-            return None;
-        }
+            Ok(lease) => lease,
+            Err(error) => {
+                self.note_journal_failure("capture spill adoption", error);
+                let _ = self.host.fs.remove_file(&spill.path);
+                return None;
+            }
+        };
         let loader = CasBytesLoader {
             cas: self
                 .session
@@ -38,6 +41,7 @@ impl Evaluator {
                 .expect("presence checked")
                 .cas(),
             hash: spill.hash.clone(),
+            _lease: Some(lease),
         };
         Some(Arc::new(shoal_value::CasBytesVal {
             hash: spill.hash.clone(),
@@ -119,11 +123,16 @@ impl Evaluator {
 pub(crate) struct CasBytesLoader {
     cas: shoal_journal::Cas,
     hash: String,
+    _lease: Option<shoal_journal::PinLease>,
 }
 
 impl CasBytesLoader {
     pub(crate) fn new(cas: shoal_journal::Cas, hash: String) -> Self {
-        Self { cas, hash }
+        Self {
+            cas,
+            hash,
+            _lease: None,
+        }
     }
 }
 

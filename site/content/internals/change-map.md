@@ -260,11 +260,18 @@ structural: each kernel event subscription adds a blocking writer thread and eac
 adds another forwarding connection/thread. Consider multiplexing or a bounded executor if measured
 scale requires it; preserve slow-consumer isolation and exact lifecycle cleanup.
 
-### Medium: spill pins lack automatic release
+### Resolved: spill pins have automatic multi-owner release
 
-Evaluator spill adoption pins CAS blobs, but no evaluator/session/value-drop path unpins them. Manual
-history CLI operations can unpin. Model pins as named leases/owners or persist ref counts so live
-values stay safe without permanent growth.
+Evaluator spill adoption now atomically increments a `(hash, owner)` refcount and returns a guard
+owned by the lazy `CasBytes` loader. The final value clone drops the guard and releases its row;
+identical content leased by another journal owner remains protected. Permanent history pins stay in
+their existing operator-managed table and cannot impersonate or remove a live lease.
+
+Each owner holds an exclusive per-owner lockfile through an `Arc` shared by its journal handle and
+value guards. Applied GC treats a missing/acquirable owner lock as crash-stale, deletes those lease
+rows inside its candidate-selection transaction, then evaluates retention. Tests cover same-owner
+refcounts, two independent owners, evaluator-outliving values, last-value release, and stale-owner
+recovery.
 
 ### Medium: Reef discovery and identity can hide changes
 

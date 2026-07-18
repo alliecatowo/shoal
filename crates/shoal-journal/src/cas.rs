@@ -457,15 +457,39 @@ impl Journal {
     /// `len` come from [`shoal_exec::CaptureSpill`] — the blake3 and byte length
     /// of the file's contents. The blob is written (zstd-streamed, so RAM stays
     /// bounded) only if not already present; a `blob` row is recorded and,
-    /// when `pin` is set, the blob is pinned so GC keeps it while the
-    /// in-language ref-backed value is live. The source file is removed on
-    /// success.
+    /// when `pin` is set, a permanent operator-style pin is added. Evaluator
+    /// lazy values use [`Journal::ingest_spill_leased`] instead. The source
+    /// file is removed on success.
     pub fn ingest_spill(
         &self,
         src: &Path,
         hash: &str,
         len: u64,
         pin: bool,
+    ) -> rusqlite::Result<()> {
+        self.ingest_spill_inner(src, hash, len, pin, false)
+    }
+
+    /// Adopt a spill and acquire one owner-scoped live-value lease atomically
+    /// with its blob row. Dropping the returned guard decrements the lease;
+    /// GC reaps it after a crash by observing the owner's released lockfile.
+    pub fn ingest_spill_leased(
+        &self,
+        src: &Path,
+        hash: &str,
+        len: u64,
+    ) -> rusqlite::Result<crate::PinLease> {
+        self.ingest_spill_inner(src, hash, len, false, true)?;
+        self.lease_owner.lease(hash)
+    }
+
+    fn ingest_spill_inner(
+        &self,
+        src: &Path,
+        hash: &str,
+        len: u64,
+        pin: bool,
+        lease: bool,
     ) -> rusqlite::Result<()> {
         let raw = hex_bytes(hash)
             .map_err(|_| rusqlite::Error::InvalidParameterName("invalid hash".into()))?;
@@ -505,6 +529,13 @@ impl Journal {
                 tx.execute(
                     "INSERT OR IGNORE INTO pin(hash) VALUES(?1)",
                     params![raw.as_slice()],
+                )?;
+            }
+            if lease {
+                tx.execute(
+                    "INSERT INTO pin_lease(hash,owner,ref_count) VALUES(?1,?2,1)
+                     ON CONFLICT(hash,owner) DO UPDATE SET ref_count=ref_count+1",
+                    params![raw.as_slice(), self.lease_owner.id()],
                 )?;
             }
             Ok(())
