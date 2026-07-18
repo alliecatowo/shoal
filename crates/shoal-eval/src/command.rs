@@ -272,7 +272,7 @@ impl Evaluator {
             };
             if is_source {
                 let src = self.read_shoal_source(&path, "script")?;
-                let program = shoal_syntax::parse(&src)
+                let program = shoal_syntax::parse_with_ctx(&src, self.parse_context(false))
                     .map_err(|e| ErrorVal::new("parse_error", e.to_string()))?;
                 return self.eval_program(&program);
             }

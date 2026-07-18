@@ -217,6 +217,16 @@ impl AdapterCatalog {
         self.cmds.keys().map(String::as_str)
     }
 
+    /// Adapter heads that opt into raw interpreter-block parsing. Hosts feed
+    /// this exact set into `shoal_syntax::ParseCtx`, so configured adapters are
+    /// grammar-reachable instead of merely carrying inert class metadata.
+    pub fn interpreter_names(&self) -> impl Iterator<Item = &str> {
+        self.cmds
+            .iter()
+            .filter(|(_, command)| command.class == AdapterClass::Interpreter)
+            .map(|(name, _)| name.as_str())
+    }
+
     pub fn len(&self) -> usize {
         self.cmds.len()
     }

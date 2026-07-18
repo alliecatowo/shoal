@@ -104,8 +104,8 @@ impl Evaluator {
             .with_hint("reuse a cached module or start a new evaluator session"));
         }
         let src = self.read_shoal_source(canon, "module")?;
-        let program =
-            shoal_syntax::parse(&src).map_err(|e| ErrorVal::new("parse_error", e.to_string()))?;
+        let program = shoal_syntax::parse_with_ctx(&src, self.isolated_parse_context())
+            .map_err(|e| ErrorVal::new("parse_error", e.to_string()))?;
 
         // Evaluate the module in a fresh scope: a new root env (so it cannot see
         // the caller's locals) rooted at the module file's own directory (so its

@@ -79,7 +79,7 @@ impl<'s> Parser<'s> {
             // a command. A head in the set *without* a following block falls
             // through to normal command dispatch (`python script.py` still runs
             // as a command).
-            if INTERPRETERS.contains(&name.as_str()) && self.interp_block_follows(s) {
+            if self.is_interpreter(&name) && self.interp_block_follows(s) {
                 let expr = self.expr(0)?;
                 let span = expr.span();
                 return Ok(Stmt::Expr { expr, span });

@@ -325,7 +325,8 @@ performs detailed validation and removes project executable custom modules.
 
 ### Medium-low: duplicated classifications invite drift
 
-- parser interpreter block names are static while adapters declare an interpreter class;
+- standalone interpreter names and configured adapter classes meet through explicit parser context
+  plus a generated bundled-pack parity test;
 - completer and highlighter reimplement parser/dispatch context heuristics;
 - LSP declarations are token-split rather than semantically indexed;
 - prompt config and core prompt fields are separate;

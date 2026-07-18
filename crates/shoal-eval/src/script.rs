@@ -216,8 +216,6 @@ impl Evaluator {
         match ext {
             Some("shl") | None => {
                 let src = self.read_shoal_source(path, "script")?;
-                let program = shoal_syntax::parse(&src)
-                    .map_err(|e| ErrorVal::new("parse_error", e.to_string()))?;
                 // A `.shl` script is a separate program (see
                 // `site/content/internals/values-streams-execution.md`):
                 // `ChildKind::Script` keeps a fresh root lexical scope,
@@ -234,6 +232,8 @@ impl Evaluator {
                 child
                     .env_mut()
                     .declare("script", Value::Path(path.to_path_buf()), false)?;
+                let program = shoal_syntax::parse_with_ctx(&src, child.parse_context(false))
+                    .map_err(|e| ErrorVal::new("parse_error", e.to_string()))?;
                 child.eval_program(&program)
             }
             _ => {

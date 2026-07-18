@@ -348,6 +348,13 @@ Declaring `invoke_payload` on a non-interpreter command is a schema error. The b
 | `bash` | `bash -c BODY` |
 | `deno` | `deno eval BODY` |
 | `jq` | `jq FILTER` with its declared input interface |
+| `yq` | `yq -o=json FILTER` with JSON output parsing |
+
+The active host passes configured interpreter heads into the parser context, so a custom head is as
+grammar-reachable as a bundled one. Its block execution uses the same adapter `bin`, `invoke`,
+payload mode, accepted status codes, and structured-output declaration as an ordinary adapter call.
+Standalone formatter/editor parsing has no project catalog, so the shipped pack is guarded by a
+generated parity test against the parser's canonical default names.
 | `node` | `node -e BODY` |
 | `python` | `python3 -c BODY` |
 | `ruby` | `ruby -e BODY` |

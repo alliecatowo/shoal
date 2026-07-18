@@ -181,12 +181,16 @@ temporary value scope before parsing the guard and body, preventing command misc
 
 ## Raw interpreter blocks
 
-The parser has a static `INTERPRETERS` list. A listed head followed by `{ … }` or raw quote syntax is
-read as balanced/verbatim source into `Expr::LangBlock`; the body is not lexed as Shoal. The same head
-without a block remains a normal command.
+The parser has a default `INTERPRETERS` list for standalone parsing, formatting, and editor tools. A
+listed head followed by `{ … }` or raw quote syntax is read as balanced/verbatim source into
+`Expr::LangBlock`; the body is not lexed as Shoal. The same head without a block remains a normal
+command.
 
-Adapter specs can declare `class = "interpreter"`, but they do not extend this list dynamically.
-That seam must be solved with parser context/generated registry, not a syntax → adapter dependency.
+Runtime composition roots add every loaded adapter with `class = "interpreter"` through
+`ParseCtx.interpreter_bound`. The evaluator's context snapshot supplies that set for REPL, kernel,
+source, script, module, and explain parsing. A generated bundled-pack test requires every shipped
+interpreter adapter to remain in the standalone parser list, while configured custom heads remain a
+host-context extension rather than a syntax → adapter dependency.
 
 ## Incomplete-input classification
 

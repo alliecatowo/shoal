@@ -22,6 +22,12 @@ pub use parser::{
     Parser, parse, parse_with_ctx, parse_with_scope,
 };
 
+/// Canonical raw-block interpreter heads understood without host-provided
+/// adapter context. Exposed for generated adapter/parser parity checks.
+pub fn parser_interpreters() -> &'static [&'static str] {
+    parser::INTERPRETERS
+}
+
 #[derive(Debug)]
 pub enum ParseStatus {
     Complete(shoal_ast::Program),

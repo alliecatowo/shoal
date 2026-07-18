@@ -55,8 +55,8 @@ impl Evaluator {
             Some(Value::Path(p)) => p.to_string_lossy().into_owned(),
             _ => return Err(ErrorVal::arg_error("explain expects a source string")),
         };
-        let program =
-            shoal_syntax::parse(&src).map_err(|e| ErrorVal::new("parse_error", e.to_string()))?;
+        let program = shoal_syntax::parse_with_ctx(&src, self.parse_context(false))
+            .map_err(|e| ErrorVal::new("parse_error", e.to_string()))?;
         let plan = self.plan_program(&program)?;
         let mut r = match plan_record(&plan, None) {
             Value::Record(r) => r,

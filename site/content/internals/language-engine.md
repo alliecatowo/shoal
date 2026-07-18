@@ -205,13 +205,14 @@ The evaluator is told whether a command appears in statement or value position.
 Kernel evaluators are non-interactive, so normal kernel `exec` captures output even when evaluating
 a statement. Long-lived interactive programs use the kernel's separate `pty.*` API.
 
-## Interpreter blocks and adapter discovery are not fully dynamic
+## Interpreter blocks consume explicit host context
 
-Parser recognition of interpreter block names uses a static list in `shoal-syntax`. Adapter specs
-have an `Interpreter` class, but the syntax crate cannot consult the adapter registry through its
-current dependency direction. Therefore adding an interpreter adapter alone does not necessarily
-teach the parser a new block head. This is a real architecture seam: solve it through an explicit
-parser context or generated registry rather than introducing a syntax → adapters dependency cycle.
+Standalone parsing recognizes the canonical interpreter list in `shoal-syntax`. A configured host
+adds the loaded catalog's `Interpreter` heads to `ParseCtx`, just as it adds live value/callable
+bindings for statement dispatch. Evaluation then lowers `Expr::LangBlock` through the same adapter's
+`bin`, `invoke`, `invoke_payload`, output parser, output type, and accepted exit codes. The syntax
+crate remains independent of adapters; a generated pack parity test keeps shipped default names
+reachable when no host context is present.
 
 ## Language-error boundary
 

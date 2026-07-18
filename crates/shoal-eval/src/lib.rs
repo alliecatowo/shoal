@@ -57,7 +57,7 @@ pub use shoal_wasm::{
 };
 
 use ports::{Exec, StdExec, StdSecret};
-use shoal_adapters::{AdapterCatalog, AdapterClass, SubSpec};
+use shoal_adapters::{AdapterCatalog, AdapterClass, InvokePayload, SubSpec};
 use shoal_ast::*;
 use shoal_exec::{CancelToken, ExecMode, ExecSpec, StdinSink, StdinSpec};
 use shoal_journal::Journal;
@@ -198,6 +198,27 @@ impl Evaluator {
             repl,
             value_bound,
             cmd_bound,
+            interpreter_bound: self
+                .host
+                .adapters
+                .interpreter_names()
+                .map(str::to_owned)
+                .collect(),
+        }
+    }
+
+    /// Parser context for a fresh lexical scope (modules and script children):
+    /// adapter-declared grammar is host state and follows the child, while the
+    /// caller's value/callable bindings deliberately do not.
+    pub(crate) fn isolated_parse_context(&self) -> shoal_syntax::ParseCtx {
+        shoal_syntax::ParseCtx {
+            interpreter_bound: self
+                .host
+                .adapters
+                .interpreter_names()
+                .map(str::to_owned)
+                .collect(),
+            ..Default::default()
         }
     }
 

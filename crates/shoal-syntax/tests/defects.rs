@@ -14,6 +14,7 @@ fn vb(names: &[&str]) -> ParseCtx {
         repl: false,
         value_bound: names.iter().map(|s| s.to_string()).collect(),
         cmd_bound: vec![],
+        interpreter_bound: vec![],
     }
 }
 fn last(p: &Program) -> &Stmt {

@@ -23,6 +23,7 @@ pub const INTERPRETERS: &[&str] = &[
     "deno",
     "ruby",
     "jq",
+    "yq",
     "perl",
     "php",
     "lua",
@@ -86,6 +87,9 @@ pub struct ParseCtx {
     pub repl: bool,
     pub value_bound: Vec<String>,
     pub cmd_bound: Vec<String>,
+    /// Adapter-declared interpreter heads available at this composition root.
+    /// The built-in [`INTERPRETERS`] remain available in every parse mode.
+    pub interpreter_bound: Vec<String>,
 }
 
 pub fn parse(src: &str) -> ParseResult<Program> {
@@ -115,6 +119,7 @@ pub fn parse_with_ctx(src: &str, ctx: ParseCtx) -> ParseResult<Program> {
     for name in ctx.cmd_bound {
         parser.bind_cmd(name);
     }
+    parser.interpreters.extend(ctx.interpreter_bound);
     parser.parse_program()
 }
 
@@ -126,6 +131,8 @@ pub struct Parser<'s> {
     /// Command bindings — user `fn`s and aliases. A name here (and not also a
     /// value binding) dispatches CMD.
     cmd_scopes: Vec<HashSet<String>>,
+    /// Built-in plus host-provided raw interpreter-block heads.
+    interpreters: HashSet<String>,
     /// REPL context: `it`/`out` are legal and a leading `.` chains on `it`.
     repl: bool,
     /// Suppresses the `f(a){…}` trailing-block-lambda desugar (site/content/internals/language-conformance-contract.md) at the
@@ -154,6 +161,10 @@ impl<'s> Parser<'s> {
             pos: 0,
             scopes: vec![builtins],
             cmd_scopes: vec![HashSet::new()],
+            interpreters: INTERPRETERS
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
             repl: false,
             no_trailing_block: false,
             tokens_consumed: 0,
@@ -162,6 +173,9 @@ impl<'s> Parser<'s> {
     }
     pub(crate) fn peek(&self, m: Mode) -> ParseResult<(Tok, Span)> {
         Ok(self.lx.token(self.pos, m)?)
+    }
+    pub(crate) fn is_interpreter(&self, name: &str) -> bool {
+        self.interpreters.contains(name)
     }
     pub(crate) fn bump(&mut self, m: Mode) -> ParseResult<(Tok, Span)> {
         let x = self.peek(m)?;
@@ -494,6 +508,35 @@ mod tests {
             ..Default::default()
         };
         assert!(parse_with_ctx("it", ctx).is_ok());
+    }
+    #[test]
+    fn host_interpreter_binding_enables_raw_blocks_in_command_and_expression_positions() {
+        let context = || ParseCtx {
+            interpreter_bound: vec!["embedded".into()],
+            ..Default::default()
+        };
+        let command = parse_with_ctx("embedded { printf('command') }", context()).unwrap();
+        assert!(matches!(
+            &command.stmts[0],
+            Stmt::Expr {
+                expr: Expr::LangBlock { tool, src, .. },
+                ..
+            } if tool == "embedded" && src.contains("command")
+        ));
+
+        let nested = parse_with_ctx("[1].feed(embedded { raw nested body })", context()).unwrap();
+        let Stmt::Expr {
+            expr: Expr::MethodCall { args, .. },
+            ..
+        } = &nested.stmts[0]
+        else {
+            panic!("expected feed method call");
+        };
+        assert!(matches!(
+            args.pos.as_slice(),
+            [Expr::LangBlock { tool, src, .. }]
+                if tool == "embedded" && src.contains("raw nested body")
+        ));
     }
     #[test]
     fn feed_parses_arg_bearing_command_in_cmd_mode() {

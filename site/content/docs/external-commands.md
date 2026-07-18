@@ -226,7 +226,12 @@ Known inline conventions are:
 | `php` | `-r PROGRAM` |
 | `deno` | `eval PROGRAM` |
 | `jq` | program as positional argument |
-| unknown interpreter-class convention | program on stdin |
+| `yq` | `-o=json PROGRAM` |
+| configured interpreter adapter | its declared `invoke` plus `invoke_payload` |
+
+The fallback conventions apply when an AST is evaluated without a matching adapter. In a normal
+configured host, an interpreter-class adapter is authoritative for the executable, invocation
+prefix, argument-vs-stdin delivery, output parser, and accepted status codes.
 
 Source and data are separate channels when the interpreter supports an inline-program argument:
 

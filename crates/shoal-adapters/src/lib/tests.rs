@@ -666,6 +666,12 @@ fn bundled_adapter_pack_loads_without_warnings() {
             InvokePayload::Arg
         );
     }
+    for interpreter in catalog.interpreter_names() {
+        assert!(
+            shoal_syntax::parser_interpreters().contains(&interpreter),
+            "adapter interpreter `{interpreter}` is unreachable from the default parser"
+        );
+    }
     // python/node/ruby/deno/bash each declare the flag template that
     // precedes their raw block's payload argv word (see
     // `site/content/internals/values-streams-execution.md`);

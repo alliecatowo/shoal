@@ -399,7 +399,37 @@ impl Evaluator {
         position: Position,
         span: Span,
     ) -> VResult<Value> {
-        let (tail, stdin_src) = lang_block_invocation(tool, src);
+        let adapter = self
+            .host
+            .adapters
+            .lookup(tool)
+            .filter(|adapter| adapter.class == AdapterClass::Interpreter)
+            .cloned();
+        let (argv, stdin_src, meta) = if let Some(adapter) = adapter {
+            let mut argv = vec![OsString::from(&adapter.bin)];
+            if let Some(invoke) = &adapter.top.invoke {
+                argv.extend(invoke.iter().map(OsString::from));
+            }
+            let stdin_src = match adapter.invoke_payload {
+                InvokePayload::Arg => {
+                    argv.push(OsString::from(src));
+                    None
+                }
+                InvokePayload::Stdin => Some(src.as_bytes().to_vec()),
+            };
+            let meta = ExecMeta {
+                ok_codes: adapter.top.ok_codes.clone().unwrap_or(adapter.ok_codes),
+                class: adapter.class,
+                parse: adapter.top.parse,
+                output_type: adapter.top.output_type,
+            };
+            (argv, stdin_src, Some(meta))
+        } else {
+            let (tail, stdin_src) = lang_block_invocation(tool, src);
+            let mut argv = vec![OsString::from(tool)];
+            argv.extend(tail);
+            (argv, stdin_src, None)
+        };
         // A tool whose convention is "program on stdin" cannot also accept fed
         // bytes — the two would collide on the single stdin channel.
         let stdin = match (stdin_src, &stdin) {
@@ -412,9 +442,7 @@ impl Evaluator {
             (Some(bytes), _) => StdinSpec::Bytes(bytes),
             (None, _) => stdin,
         };
-        let mut argv = vec![OsString::from(tool)];
-        argv.extend(tail);
-        self.run_argv(argv, position, stdin, &[], span, None)
+        self.run_argv(argv, position, stdin, &[], span, meta)
     }
 }
 
@@ -432,6 +460,7 @@ pub fn lang_block_invocation(tool: &str, src: &str) -> (Vec<OsString>, Option<Ve
         "php" => flag("-r"),
         "deno" => (vec![OsString::from("eval"), OsString::from(src)], None),
         "jq" => (vec![OsString::from(src)], None),
+        "yq" => (vec![OsString::from("-o=json"), OsString::from(src)], None),
         _ => (vec![], Some(src.as_bytes().to_vec())),
     }
 }
@@ -471,6 +500,7 @@ mod lang_block_tests {
         assert_eq!(lang_block_invocation("deno", "X").0, os(&["eval", "X"]));
         // jq: filter as the sole arg, data left for stdin.
         assert_eq!(lang_block_invocation("jq", ".a").0, os(&[".a"]));
+        assert_eq!(lang_block_invocation("yq", ".a").0, os(&["-o=json", ".a"]));
     }
 
     #[test]
@@ -478,5 +508,44 @@ mod lang_block_tests {
         let (tail, stdin) = lang_block_invocation("wat", "prog");
         assert!(tail.is_empty());
         assert_eq!(stdin.as_deref(), Some(b"prog".as_slice()));
+    }
+
+    #[test]
+    fn configured_interpreter_is_parsed_and_lowered_through_its_adapter() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("embedded.toml"),
+            r#"
+[cmd.embedded]
+bin = "/bin/sh"
+class = "interpreter"
+invoke = ["-c"]
+output = { parse = "lines", type = "list<str>" }
+"#,
+        )
+        .unwrap();
+        let (catalog, warnings) = shoal_adapters::AdapterCatalog::load_dir(directory.path());
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let mut evaluator = crate::Evaluator::new(directory.path().to_path_buf());
+        evaluator.set_adapters(catalog);
+
+        let program = shoal_syntax::parse_with_ctx(
+            "embedded { printf 'alpha\\nbeta\\n' }",
+            evaluator.parse_context(false),
+        )
+        .unwrap();
+        let value = evaluator.eval_program(&program).unwrap();
+        let shoal_value::Value::Outcome(outcome) = value else {
+            panic!("expected adapter outcome");
+        };
+        assert_eq!(outcome.stdout.as_slice(), b"alpha\nbeta\n");
+        assert_eq!(
+            outcome.parsed,
+            Some(shoal_value::Value::List(vec![
+                shoal_value::Value::Str("alpha".into()),
+                shoal_value::Value::Str("beta".into()),
+            ]))
+        );
+        assert!(outcome.cmd.starts_with("/bin/sh -c "), "{}", outcome.cmd);
     }
 }

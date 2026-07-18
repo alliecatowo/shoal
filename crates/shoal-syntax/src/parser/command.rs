@@ -20,7 +20,7 @@ impl<'s> Parser<'s> {
             Ok((Tok::Ident(name), s)) => {
                 if RESERVED.contains(&name.as_str()) || matches!(name.as_str(), "with" | "spawn") {
                     false
-                } else if INTERPRETERS.contains(&name.as_str()) && self.interp_block_follows(s) {
+                } else if self.is_interpreter(&name) && self.interp_block_follows(s) {
                     // `tool { … }` / `tool ''' … '''` is an interpreter block
                     // expression, not a command — dispatch EXPR.
                     false

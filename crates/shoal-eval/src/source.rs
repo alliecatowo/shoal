@@ -56,7 +56,7 @@ impl Evaluator {
     /// so a host cannot accidentally bypass an installed `Fs` adapter.
     pub fn eval_source_file(&mut self, path: &Path) -> VResult<Value> {
         let source = self.read_shoal_source(path, "source")?;
-        let program = shoal_syntax::parse(&source)
+        let program = shoal_syntax::parse_with_ctx(&source, self.parse_context(false))
             .map_err(|error| ErrorVal::new("parse_error", error.to_string()))?;
         self.eval_program(&program)
     }

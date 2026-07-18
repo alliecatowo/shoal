@@ -188,6 +188,7 @@ fn dispatch_matrix() {
             repl: r.repl,
             value_bound: r.value_bound.iter().map(|s| s.to_string()).collect(),
             cmd_bound: r.cmd_bound.iter().map(|s| s.to_string()).collect(),
+            interpreter_bound: Vec::new(),
         };
         match parse_with_ctx(r.src, ctx) {
             Ok(p) => {
