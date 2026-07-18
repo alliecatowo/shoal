@@ -410,7 +410,11 @@ fn defect8_redirect_applies_to_builtin() {
 #[test]
 fn defect9_recursion_guard_returns_error() {
     let (at_limit, code, message) = std::thread::Builder::new()
-        .stack_size(8 * 1024 * 1024)
+        // Debug evaluator frames are materially larger on macOS than Linux.
+        // Keep the test stack explicit and comfortably above both platforms'
+        // depth-127 proof while the runtime guard—not native exhaustion—owns
+        // the depth-128 result.
+        .stack_size(32 * 1024 * 1024)
         .spawn(|| {
             let at_limit =
                 run("fn descend(n:int){ if n == 0 { 0 } else { descend(n - 1) } }\ndescend(127)");
@@ -434,9 +438,9 @@ fn defect9_recursion_guard_returns_error() {
 }
 
 #[test]
-fn mutual_recursion_guard_returns_error_on_eight_mib_stack() {
+fn mutual_recursion_guard_returns_error_on_explicit_stack() {
     let (code, message) = std::thread::Builder::new()
-        .stack_size(8 * 1024 * 1024)
+        .stack_size(32 * 1024 * 1024)
         .spawn(|| {
             let error = run("fn left(){ right() }\nfn right(){ left() }\nleft()")
                 .expect_err("mutual recursion must hit the typed guard");

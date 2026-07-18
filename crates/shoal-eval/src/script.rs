@@ -436,7 +436,7 @@ mod tests {
     #[test]
     fn extensionless_native_executable_path_runs_as_a_process() {
         let mut evaluator = Evaluator::new(std::env::current_dir().unwrap());
-        let program = shoal_syntax::parse(r#"run("/bin/true")"#).unwrap();
+        let program = shoal_syntax::parse(r#"run("/usr/bin/true")"#).unwrap();
         let Value::Outcome(outcome) = evaluator.eval_program(&program).unwrap() else {
             panic!("native executable should return an outcome")
         };

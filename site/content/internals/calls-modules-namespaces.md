@@ -62,7 +62,7 @@ does not yield a function; namespace functions must be called through their synt
 `recursion_limit`, calls the inner dispatcher, and decrements afterward. The decrement happens for
 success and returned `VResult` errors. Function-call expressions dispatch without retaining the
 large non-call expression frame, and closure blocks enter block evaluation directly; exact-boundary
-and mutual-recursion regressions reach the typed error on an 8 MiB native thread stack. The
+and mutual-recursion regressions reach the typed error on an explicit 32 MiB native thread stack. The
 conformance corpus still skips its unbounded-recursion case because its default Rust test worker has
 a smaller native stack than that explicitly tested runtime boundary.
 

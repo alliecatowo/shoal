@@ -560,9 +560,13 @@ fn overwrite_records_restore_bytes_and_undo_restores_prior() {
 #[test]
 fn undo_replay_is_mediated_and_atomic_replace_denial_is_fail_closed() {
     let dir = tempfile::tempdir().unwrap();
-    let target = dir.path().join("f.txt");
+    // macOS exposes temporary paths through a `/var` symlink whose canonical
+    // identity begins `/private/var`. Journal inverses are root-canonical, so
+    // compare adapter observations against that same authority identity.
+    let root = dir.path().canonicalize().unwrap();
+    let target = root.join("f.txt");
     std::fs::write(&target, b"original").unwrap();
-    let mut ev = journaled(dir.path());
+    let mut ev = journaled(&root);
     run_journaled(&mut ev, r#"save("f.txt", "replacement")"#).unwrap();
 
     let fs = Arc::new(RecordingDenyAtomicFs::default());

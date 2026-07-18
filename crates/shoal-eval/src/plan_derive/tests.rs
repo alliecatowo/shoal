@@ -683,20 +683,21 @@ fn effectful_forms_are_never_silently_empty() {
 #[test]
 fn original_audit_probes_have_meaningful_effects() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("module.shl"), "export let x = 1").unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    std::fs::write(root.join("module.shl"), "export let x = 1").unwrap();
 
     let has_write = |src: &str, path: &str| {
-        effects_at(dir.path(), src).iter().any(
-            |e| matches!(e, Effect::FsWrite { paths } if paths.contains(&dir.path().join(path))),
-        )
+        effects_at(&root, src)
+            .iter()
+            .any(|e| matches!(e, Effect::FsWrite { paths } if paths.contains(&root.join(path))))
     };
     let has_read = |src: &str, path: &str| {
-        effects_at(dir.path(), src).iter().any(
-            |e| matches!(e, Effect::FsRead { paths } if paths.contains(&dir.path().join(path))),
-        )
+        effects_at(&root, src)
+            .iter()
+            .any(|e| matches!(e, Effect::FsRead { paths } if paths.contains(&root.join(path))))
     };
     let spawns = |src: &str, head: &str| {
-        effects_at(dir.path(), src)
+        effects_at(&root, src)
             .iter()
             .any(|e| matches!(e, Effect::ProcSpawn { argv0, .. } if argv0 == head))
     };
@@ -704,7 +705,7 @@ fn original_audit_probes_have_meaningful_effects() {
     assert!(has_write("\"x\".save(\"p\")", "p"), "method save");
     assert!(has_write("echo hi > p", "p"), "redirect write");
     assert!(
-        effects_at(dir.path(), "env.AUDIT_ONLY = \"y\"").contains(&Effect::EnvWrite {
+        effects_at(&root, "env.AUDIT_ONLY = \"y\"").contains(&Effect::EnvWrite {
             names: vec!["AUDIT_ONLY".into()]
         }),
         "persistent env assignment"
@@ -713,10 +714,10 @@ fn original_audit_probes_have_meaningful_effects() {
         has_read("path(\"Cargo.toml\").read", "Cargo.toml"),
         "path read"
     );
-    let module = effects_at(dir.path(), "use ./module");
+    let module = effects_at(&root, "use ./module");
     assert!(
         module.iter().any(
-            |e| matches!(e, Effect::FsRead { paths } if paths.contains(&dir.path().join("module.shl")))
+            |e| matches!(e, Effect::FsRead { paths } if paths.contains(&root.join("module.shl")))
         ) && module.contains(&Effect::Opaque),
         "module read/body coverage: {module:?}"
     );
@@ -727,10 +728,10 @@ fn original_audit_probes_have_meaningful_effects() {
     );
     assert!(spawns("run(\"echo\", \"hi\")", "echo"), "run builtin");
 
-    let open = effects_at(dir.path(), "open(\"Cargo.toml\")");
+    let open = effects_at(&root, "open(\"Cargo.toml\")");
     assert!(
         open.iter().any(
-            |e| matches!(e, Effect::FsRead { paths } if paths.contains(&dir.path().join("Cargo.toml")))
+            |e| matches!(e, Effect::FsRead { paths } if paths.contains(&root.join("Cargo.toml")))
         ) && open.contains(&Effect::Opaque),
         "open read/handler coverage: {open:?}"
     );

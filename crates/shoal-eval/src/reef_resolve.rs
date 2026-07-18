@@ -636,7 +636,7 @@ mod tests {
         let manifest = dir.path().join(".reef.toml");
         std::fs::write(&manifest, "[tools").unwrap();
         let mut evaluator = Evaluator::new(dir.path().to_path_buf());
-        let program = shoal_syntax::parse("/bin/true").unwrap();
+        let program = shoal_syntax::parse("/usr/bin/true").unwrap();
 
         let error = evaluator
             .eval_program(&program)
