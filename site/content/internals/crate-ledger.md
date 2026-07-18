@@ -144,7 +144,8 @@ accDescr: Shows the components and relationships described in Execution and poli
 ### Kernel and agent bridge
 
 The kernel's `dispatch.rs` is a thin method router. Handler modules own session, execution/plan,
-value/event, task, and PTY families. `session.rs` owns shared evaluator/transcript state; `wire.rs`
+value/event, task, and PTY families. `session.rs` owns attachment/session composition while
+`session/state.rs` owns evaluator health, transcript, output-undo, and stream-cursor state; `wire.rs`
 does bounded `Value` conversion; `eventbus.rs` owns rings, durable replay integration, and subscriber
 queues. `lib.rs` owns connection lifecycle and shared maps.
 

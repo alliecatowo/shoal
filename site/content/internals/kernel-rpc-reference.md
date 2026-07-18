@@ -78,7 +78,7 @@ error messages never quote the rejected URI, tool name, path, body, or bearer.
 
 | Method | Handler module | Attached? | State class |
 |---|---|---:|---|
-| `session.attach` | `session.rs` | creates it | session/auth mutation |
+| `session.attach` | `session.rs` | creates it | session/auth mutation; local retained state is isolated in `session/state.rs` |
 | `session.env/snapshot`, `kernel.status/shutdown` | `session.rs`/`lifecycle.rs` | yes | owner/session and process lifecycle |
 | `auth.token.list/create/revoke` | `handlers_auth.rs` | yes | durable credential administration with explicit `token.admin` authority |
 | `session.reef` | `session.rs` | yes | evaluator cache read |
