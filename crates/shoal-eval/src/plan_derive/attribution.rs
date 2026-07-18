@@ -85,22 +85,44 @@ pub(super) fn url_literal(expr: &Expr) -> Option<String> {
     }
 }
 
-/// Extract authority and port without accepting malformed ports as numeric.
-/// An out-of-range port degrades to the scheme default instead of panicking.
+/// Parse the exact `http::Uri` authority representation consumed by ureq.
+/// Malformed, relative, and non-HTTP(S) URLs plan as wildcard authority rather
+/// than letting a bespoke parser authorize a different endpoint than runtime.
 pub(super) fn url_host_port(url: &str) -> (String, u16) {
-    let default_port = if url.starts_with("https") { 443 } else { 80 };
-    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
-    let authority = after_scheme
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or(after_scheme);
-    let host_port = authority.rsplit('@').next().unwrap_or(authority);
-    match host_port.rsplit_once(':') {
-        Some((host, port))
-            if !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()) =>
-        {
-            (host.to_string(), port.parse().unwrap_or(default_port))
-        }
-        _ => (host_port.to_string(), default_port),
+    let Ok(uri) = url.parse::<http::Uri>() else {
+        return ("*".into(), 443);
+    };
+    let Some(scheme) = uri.scheme_str() else {
+        return ("*".into(), 443);
+    };
+    let default_port = match scheme {
+        "http" => 80,
+        "https" => 443,
+        _ => return ("*".into(), 443),
+    };
+    let Some(authority) = uri.authority() else {
+        return ("*".into(), 443);
+    };
+    let host = authority.host();
+    if host.is_empty() {
+        return ("*".into(), 443);
     }
+    let host_port = authority
+        .as_str()
+        .rsplit('@')
+        .next()
+        .unwrap_or(authority.as_str());
+    let has_explicit_port = if host_port.starts_with('[') {
+        host_port
+            .find(']')
+            .is_some_and(|close| host_port.len() > close + 1)
+    } else {
+        host_port.contains(':')
+    };
+    let port = match authority.port_u16() {
+        Some(port) => port,
+        None if has_explicit_port => return ("*".into(), 443),
+        None => default_port,
+    };
+    (host.to_ascii_lowercase(), port)
 }

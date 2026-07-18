@@ -95,6 +95,12 @@ It never falls through as an external process merely because it has no entry in 
 builtin effect table. The HR-A11 regression suite iterates every canonical builtin name and pins all
 original audit probes to their meaningful effect and target.
 
+HTTP namespace calls derive one `NetConnect` from the same `http::Uri` authority representation the
+ureq runtime consumes. Malformed or non-HTTP(S) literals become wildcard authority. Runtime follows
+zero redirects and disables ambient proxy discovery: a `Location` response is returned to the
+program, and a reviewed target must be requested explicitly so every actual socket destination has
+its own plan entry. A two-listener regression proves a redirect target receives zero connections.
+
 Sources: [`plan_derive.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-eval/src/plan_derive.rs)
 and [`plan_effects.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-eval/src/plan_effects.rs).
 

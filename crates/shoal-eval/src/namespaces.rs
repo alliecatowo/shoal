@@ -323,6 +323,19 @@ const HTTP_BODY_CAP: u64 = 64 * 1024 * 1024;
 /// Global per-request timeout (site/content/internals/roadmap-and-priorities.md "timeout").
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Build the evaluator's capability-safe HTTP transport. Planning authorizes
+/// the literal request authority only, so ambient proxy routing and automatic
+/// redirects would connect to endpoints absent from the approved plan.
+pub(crate) fn http_agent() -> ureq::Agent {
+    let config = ureq::Agent::config_builder()
+        .timeout_global(Some(HTTP_TIMEOUT))
+        .http_status_as_error(false)
+        .proxy(None)
+        .max_redirects(0)
+        .build();
+    ureq::Agent::new_with_config(config)
+}
+
 impl Evaluator {
     pub(crate) fn http_ns(&mut self, method: &str, args: CallArgs) -> VResult<Value> {
         let has_body = match method {
@@ -357,11 +370,7 @@ impl Evaluator {
             Vec::new()
         };
 
-        let config = ureq::Agent::config_builder()
-            .timeout_global(Some(HTTP_TIMEOUT))
-            .http_status_as_error(false)
-            .build();
-        let agent = ureq::Agent::new_with_config(config);
+        let agent = http_agent();
 
         let mut resp = match method {
             "get" => with_headers(agent.get(&url), &headers_rec).call(),

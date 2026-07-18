@@ -352,6 +352,36 @@ fn effects_at(cwd: &Path, src: &str) -> Vec<Effect> {
         .effects
 }
 
+#[test]
+fn http_planning_uses_the_runtime_uri_authority_parser() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(
+        effects_at(
+            dir.path(),
+            r#"http.get("HTTP://EXAMPLE.COM:8080/resource")"#
+        ),
+        vec![Effect::NetConnect {
+            host: "example.com".into(),
+            port: 8080,
+        }]
+    );
+    assert_eq!(
+        effects_at(dir.path(), r#"http.get("https://example.com/resource")"#),
+        vec![Effect::NetConnect {
+            host: "example.com".into(),
+            port: 443,
+        }]
+    );
+    assert_eq!(
+        effects_at(dir.path(), r#"http.get("http://example.com:99999/")"#),
+        vec![Effect::NetConnect {
+            host: "*".into(),
+            port: 443,
+        }],
+        "an invalid runtime authority must plan as wildcard, not a different concrete endpoint"
+    );
+}
+
 /// Planner/runtime resolution lockstep: no name in the canonical builtin
 /// registry may fall through to the generic external-spawn branch. This is
 /// the regression that made the in-language `history` command look like an

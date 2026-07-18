@@ -282,6 +282,12 @@ Every HTTP call returns:
 
 HTTP 4xx/5xx statuses are not raised as errors; inspect `.ok` or `.status`. Transport, timeout, and body-read failures raise `net_error`.
 
+Redirect responses are returned as ordinary 3xx response records and are never followed. The effect
+plan authorizes only the requested URL authority; following `Location` or an ambient process proxy
+would create an unplanned network connection. Fetch a reviewed redirect target explicitly so it
+receives its own `net.connect(host:port)` plan entry. Shoal's HTTP transport ignores ambient
+`HTTP_PROXY`/`HTTPS_PROXY` settings for the same reason.
+
 Request body serialization uses the same feedability rules as `.feed`: strings are UTF-8 bytes, bytes are raw, scalar data renders to text, and records/tables/lists become compact JSON. A path is a name, not file content; use `path.read` or `path.read_bytes`.
 
 Header values accept strings, secrets, and other renderable values. A secret is intentionally permitted here for authentication header injection, but remains redacted in ordinary output.
@@ -290,7 +296,7 @@ Current limitations:
 
 - no custom timeout argument;
 - no streaming request or response body;
-- no explicit redirect/TLS/proxy configuration surface;
+- no automatic redirects, proxy routing, or custom TLS configuration surface;
 - response body must decode as text for the returned record;
 - repeated response header names collapse into one record key.
 

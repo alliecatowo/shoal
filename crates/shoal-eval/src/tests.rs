@@ -1373,6 +1373,54 @@ fn http_get_is_typed() {
     assert!(matches!(r.get("body"), Some(Value::Str(_))));
 }
 
+#[test]
+fn http_redirects_never_connect_to_an_unplanned_second_authority() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::time::Duration;
+
+    let denied = TcpListener::bind("127.0.0.1:0").unwrap();
+    denied.set_nonblocking(true).unwrap();
+    let denied_address = denied.local_addr().unwrap();
+
+    let redirect = TcpListener::bind("127.0.0.1:0").unwrap();
+    let redirect_address = redirect.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = redirect.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut request = [0u8; 1024];
+        let read = stream.read(&mut request).unwrap();
+        assert!(request[..read].starts_with(b"GET /start HTTP/1.1"));
+        write!(
+            stream,
+            "HTTP/1.1 302 Found\r\nLocation: http://{denied_address}/secret\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        stream.flush().unwrap();
+    });
+
+    let response = run(&format!("http.get(\"http://{redirect_address}/start\")")).unwrap();
+    server.join().unwrap();
+    let Value::Record(response) = response else {
+        panic!("HTTP response must remain typed")
+    };
+    assert_eq!(response["status"], Value::Int(302));
+    assert_eq!(response["ok"], Value::Bool(false));
+    assert!(
+        matches!(denied.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "the redirect target received a connection absent from the effect plan"
+    );
+
+    let agent = crate::namespaces::http_agent();
+    assert_eq!(agent.config().max_redirects(), 0);
+    assert!(
+        agent.config().proxy().is_none(),
+        "ambient process proxy authority must not bypass the request plan"
+    );
+}
+
 // --- structured builtins head / ln ----------------------------------------
 
 #[test]
