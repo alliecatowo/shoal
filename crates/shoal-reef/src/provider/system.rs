@@ -134,7 +134,28 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::ExitStatusExt;
     use std::path::Path;
+    use std::sync::Arc;
+
+    struct FixedVersionRunner;
+
+    impl super::super::ProviderRunner for FixedVersionRunner {
+        fn run(
+            &self,
+            _command: super::super::ProviderCommand<'_>,
+        ) -> std::io::Result<shoal_exec::BoundedCommandOutput> {
+            Ok(shoal_exec::BoundedCommandOutput {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: b"current 3.2.1\n".to_vec(),
+                stderr: Vec::new(),
+                truncated: false,
+                timed_out: false,
+                pgid: 1,
+                duration: std::time::Duration::ZERO,
+            })
+        }
+    }
 
     fn make_exe(dir: &Path, name: &str, body: &str) -> PathBuf {
         let p = dir.join(name);
@@ -317,12 +338,8 @@ mod tests {
             root.path().join("current"),
             "system",
         );
-        assert_eq!(
-            provider
-                .version_of(&candidate, &ProviderCtx::new("/"))
-                .raw(),
-            "3.2.1"
-        );
+        let context = ProviderCtx::with_runner("/", None, Arc::new(FixedVersionRunner));
+        assert_eq!(provider.version_of(&candidate, &context).raw(), "3.2.1");
         assert_eq!(provider.lock_cache().len(), 1);
     }
 

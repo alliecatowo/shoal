@@ -331,11 +331,6 @@ fn spawn_embedded_kernel_unready(
     config_root: Option<&Path>,
     label: &str,
 ) -> (Child, UnixStream, PathBuf) {
-    const EMBEDDED_FD: i32 = 3;
-    const F_GETFD: i32 = 1;
-    const F_SETFD: i32 = 2;
-    const FD_CLOEXEC: i32 = 1;
-
     let (private, child_end) = UnixStream::pair().unwrap();
     private
         .set_read_timeout(Some(Duration::from_secs(5)))
@@ -343,9 +338,15 @@ fn spawn_embedded_kernel_unready(
     let inherited_fd = child_end.as_raw_fd();
     let stderr_path = dir.join(format!("embedded-{label}-stderr.log"));
     let stderr_file = std::fs::File::create(&stderr_path).unwrap();
+    let inherited_fd_arg = inherited_fd.to_string();
     let mut command = Command::new(env!("CARGO_BIN_EXE_shoal-kernel"));
     command
-        .args(["--embedded-fd", "3", "--state-dir", state.to_str().unwrap()])
+        .args([
+            "--embedded-fd",
+            &inherited_fd_arg,
+            "--state-dir",
+            state.to_str().unwrap(),
+        ])
         .env("XDG_RUNTIME_DIR", runtime)
         .env_remove("SHOAL_SOCKET")
         .stdout(Stdio::null())
@@ -353,16 +354,15 @@ fn spawn_embedded_kernel_unready(
     if let Some(config_root) = config_root {
         command.env("XDG_CONFIG_HOME", config_root);
     }
-    // SAFETY: only descriptor syscalls run between fork and exec. `dup2`
-    // clears close-on-exec unless source and destination are already equal;
-    // the explicit fcntl covers that edge case too.
+    // SAFETY: only descriptor syscalls run between fork and exec. Preserve the
+    // socket's actual descriptor instead of duplicating it onto hardcoded fd 3,
+    // which may belong to the platform's process-spawn bookkeeping.
     unsafe {
         command.pre_exec(move || {
-            if dup2(inherited_fd, EMBEDDED_FD) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            let flags = fcntl(EMBEDDED_FD, F_GETFD, 0);
-            if flags == -1 || fcntl(EMBEDDED_FD, F_SETFD, flags & !FD_CLOEXEC) == -1 {
+            let flags = libc::fcntl(inherited_fd, libc::F_GETFD);
+            if flags == -1
+                || libc::fcntl(inherited_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1
+            {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
@@ -696,8 +696,6 @@ fn daemon_honors_the_shared_token_store_environment_override() {
 unsafe extern "C" {
     fn kill(pid: i32, signal: i32) -> i32;
     fn geteuid() -> u32;
-    fn dup2(oldfd: i32, newfd: i32) -> i32;
-    fn fcntl(fd: i32, command: i32, argument: i32) -> i32;
 }
 
 /// Regression test for the accepted-socket non-blocking bug: `serve_until`
