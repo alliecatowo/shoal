@@ -89,7 +89,15 @@ pub fn run(action: PromptAction) -> Result<i32, String> {
     }
 
     let mut ev = Evaluator::new(cwd.clone());
-    let live = build_context(&mut ev, &facts, 80);
+    let mut live = build_context(&mut ev, &facts, 80);
+    if !matches!(&action, PromptAction::Bench { .. }) {
+        let mut custom_warnings = Vec::new();
+        let mut custom = CustomScheduler::new(renderer.config(), &mut custom_warnings);
+        for warning in custom_warnings {
+            eprintln!("warning: {warning}");
+        }
+        live.custom = custom.refresh_until(&cwd, ev.env_vars(), CUSTOM_ONE_SHOT_WAIT);
+    }
 
     match action {
         PromptAction::Print { side } => {

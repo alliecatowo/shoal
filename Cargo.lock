@@ -2504,6 +2504,7 @@ dependencies = [
  "reedline",
  "serde",
  "serde_json",
+ "shell-words",
  "shoal-adapters",
  "shoal-ast",
  "shoal-config",

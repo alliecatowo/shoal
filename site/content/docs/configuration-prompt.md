@@ -334,7 +334,11 @@ format = "${output} "
 
 These dynamic tables have a sharp type boundary: `language.when`, `custom.command`, `custom.when`, and `custom.cache_ttl` are strings, not arrays or numeric durations. A wrong type makes the rich prompt fail deserialization and fall back to the complete default prompt, with a warning.
 
-The schema is ahead of the host wiring here. Language modules can render an existing Reef binding; only the exact value `when = "constrained"` has distinct behavior, while every other string currently uses the same “resolved or constrained” test. `probe_ttl_s` is not consumed by the host. The host currently supplies no custom-command snapshots and no battery snapshot, so `$custom_NAME` and `$battery` render empty; `custom.command`, `custom.when`, and `custom.cache_ttl` describe planned scheduling rather than an operational background runner. Keep those tables out of a production prompt unless you are testing renderer input directly.
+Language modules can render an existing Reef binding; only the exact value `when = "constrained"` has distinct behavior, while every other string currently uses the same “resolved or constrained” test. `probe_ttl_s` is not consumed by the host. The host still supplies no battery snapshot, so `$battery` renders empty.
+
+Custom modules are operational in the interactive host and in one-shot `shoal prompt print|explain`. Because they execute with the UI host's ambient filesystem/network authority, executable custom tables are accepted only from trusted system/user configuration; `module.custom` in a project `.shoal.toml` is removed with a warning before layers merge and cannot add or override a command merely by entering a repository.
+
+`command` is split as quoted external argv; it is **not** evaluated by a shell, so redirects, pipelines, substitutions, environment assignments, and shell operators have no special meaning. It admits at most 64 arguments and 4 KiB of command text. `when` is empty for unconditional execution or one exact environment-variable name; the command runs only while that variable has a nonempty value. `cache_ttl` accepts a Shoal duration from zero through one hour. Two background workers run probes after command completion with a 250 ms process-group deadline and a 4 KiB combined-output wall. The first refresh is pending, a successful value is cached, and an expired value remains visible as stale while it refreshes. One-shot inspection waits at most 525 ms for the first bounded results. Nonzero, timed-out, truncated, non-UTF-8, multiline, or terminal-control-bearing output is hidden as an error. Rendering itself remains subprocess-free on every keystroke.
 
 Unknown format module IDs and unknown prompt keys warn rather than preventing the shell from starting. Invalid prompt data falls back to defaults with a warning.
 
@@ -375,7 +379,7 @@ shoal prompt explain --side right
 shoal prompt bench --side left --n 1000
 ```
 
-If the prompt exceeds `budget.render_deadline_ms`, Shoal can warn when `warn_on_exceed` is enabled. Static/Git/Reef snapshot work should stay cheap. The custom-command/cache configuration is future-shaped and inert in the current host because no custom snapshot scheduler populates it; do not rely on `custom.command`, `custom.when`, or `custom.cache_ttl` executing anything yet.
+If the prompt exceeds `budget.render_deadline_ms`, Shoal can warn when `warn_on_exceed` is enabled. Static/Git/Reef snapshot work should stay cheap. Custom commands run on the bounded post-command scheduler and never inside the renderer; their 250 ms execution budget is separate from the pure render deadline.
 
 ## Troubleshooting configuration
 

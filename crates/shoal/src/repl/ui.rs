@@ -21,6 +21,7 @@ pub(super) struct ReplUi {
     pub(super) prompt: prompt::ShoalPrompt,
     pub(super) shared_ctx: prompt::SharedCtx,
     pub(super) static_facts: prompt::StaticFacts,
+    custom: prompt::CustomScheduler,
     pub(super) pager: PagerContext,
 }
 
@@ -54,6 +55,9 @@ impl ReplUi {
         let transient_enabled = prompt_config.transient.enabled;
         let (renderer, renderer_warnings) = shoal_prompt::Renderer::new(prompt_config);
         warn_each(&renderer_warnings);
+        let mut custom_warnings = Vec::new();
+        let custom = prompt::CustomScheduler::new(renderer.config(), &mut custom_warnings);
+        warn_each(&custom_warnings);
         let renderer = Arc::new(renderer);
         let shared_ctx: prompt::SharedCtx = Arc::new(RwLock::new(Arc::new(
             shoal_prompt::PromptContext::empty(cwd.to_path_buf()),
@@ -111,6 +115,7 @@ impl ReplUi {
                 prompt,
                 shared_ctx,
                 static_facts,
+                custom,
                 pager: PagerContext {
                     enabled: config.render.paging == "auto",
                     pager: config.render.pager.clone(),
@@ -122,17 +127,18 @@ impl ReplUi {
     }
 
     pub(super) fn refresh_prompt(
-        &self,
+        &mut self,
         evaluator: &mut Evaluator,
         snapshot: Option<&crate::repl_state::ProtocolSnapshot>,
     ) {
         let width = u16::try_from(self.pager.width()).unwrap_or(u16::MAX);
-        let context = match snapshot {
+        let mut context = match snapshot {
             Some(snapshot) => {
                 prompt::build_context_from_protocol(snapshot, &self.static_facts, width)
             }
             None => prompt::build_context(evaluator, &self.static_facts, width),
         };
+        context.custom = self.custom.refresh(&context.cwd, evaluator.env_vars());
         if let Ok(mut cell) = self.shared_ctx.write() {
             *cell = Arc::new(context);
         }

@@ -43,7 +43,8 @@ pub fn load_prompt_config(cwd: &Path) -> (PromptConfig, Vec<String>) {
         }
     }
     // project .shoal.toml [prompt] table
-    if let Some(v) = read_prompt_table(&cwd.join(".shoal.toml"), &mut warnings) {
+    if let Some(mut v) = read_prompt_table(&cwd.join(".shoal.toml"), &mut warnings) {
+        remove_project_custom_commands(&mut v, &mut warnings);
         layers.push(v);
     }
 
@@ -53,6 +54,23 @@ pub fn load_prompt_config(cwd: &Path) -> (PromptConfig, Vec<String>) {
 
     let config = shoal_prompt::load(layers, &mut warnings);
     (config, warnings)
+}
+
+/// Project config is discovered merely by entering a directory, so it must
+/// never acquire the user-config trust required to launch prompt processes.
+/// Remove the whole dynamic custom table: otherwise a project could override
+/// the `command` of an otherwise trusted user-defined identity through merge.
+fn remove_project_custom_commands(prompt: &mut toml::Value, warnings: &mut Vec<String>) {
+    let removed = prompt
+        .get_mut("module")
+        .and_then(toml::Value::as_table_mut)
+        .and_then(|module| module.remove("custom"));
+    if removed.is_some() {
+        warnings.push(
+            "prompt: project .shoal.toml module.custom ignored; executable prompt commands are trusted system/user configuration only"
+                .into(),
+        );
+    }
 }
 
 /// Read a config file's `[prompt]` sub-table as a prompt-contents-shaped value,
@@ -204,6 +222,32 @@ mod bounded_input_tests {
             warnings
                 .iter()
                 .any(|warning| warning.contains("deprecated"))
+        );
+    }
+
+    #[test]
+    fn project_custom_commands_are_removed_before_layer_merge() {
+        let mut layer = shoal_prompt::parse_layer(
+            r#"
+[format]
+left = "$custom_project"
+[module.custom.project]
+command = "touch should-not-run"
+"#,
+        )
+        .unwrap();
+        let mut warnings = Vec::new();
+        remove_project_custom_commands(&mut layer, &mut warnings);
+        assert!(
+            layer
+                .get("module")
+                .and_then(|module| module.get("custom"))
+                .is_none()
+        );
+        assert!(warnings.iter().any(|warning| warning.contains("ignored")));
+        assert_eq!(
+            layer.get("format").unwrap().get("left").unwrap().as_str(),
+            Some("$custom_project")
         );
     }
 

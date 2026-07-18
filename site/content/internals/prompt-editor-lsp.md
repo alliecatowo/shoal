@@ -222,7 +222,7 @@ style spec equals that name. They are not macros inside a compound spec such as 
 | `leash` | detected tier/enforced | per-tier style/symbol | capability snapshot, not loaded policy identity |
 | `battery` | optional battery snapshot | charging/low threshold | producer always `None` |
 | `language_<name>` | matching Reef binding | constrained/resolved visibility | no independent probe/TTL producer |
-| `custom_<name>` | `Ready/Pending/Stale/Error` segment | ready/stale output only | producer map always empty |
+| `custom_<name>` | `Ready/Pending/Stale/Error` segment | ready/stale output only | bounded background producer with TTL cache |
 | `indent` | none | empty reserved placeholder | active as no-op |
 
 This split is crucial: renderer unit tests can prove that a hand-built battery or agent snapshot
@@ -238,11 +238,9 @@ The current source contains several schema promises without a consuming path:
 - `budget.warn_on_exceed` does not emit a runtime warning;
 - `battery.sample_interval_s` has no sampler;
 - `language.probe_ttl_s` has no prompt-side probe cache;
-- custom `command`, `when`, and `cache_ttl` have no host task/cache;
-- custom `when` is not evaluated by the pure renderer either;
 - `PromptContext.multiline` exists but no module currently reads it.
 
-These fields are preserved as intended extension points, not documented as operational behavior.
+The remaining fields are preserved as intended extension points, not documented as operational behavior. Custom modules are different: trusted system/user configuration may define them, while automatically discovered project config has its entire `module.custom` table removed before merge. The interactive host owns two bounded workers, treats `command` as quoted argv rather than shell source, gates it on one exact nonempty environment variable, enforces a 250 ms process-group deadline and 4 KiB output cap, and publishes only sanitized snapshots to the pure renderer.
 
 ## PromptContext snapshot
 
@@ -645,7 +643,8 @@ deliberate audit across consumers.
 | prompt latency | speed test + Criterion bench + CLI bench | context producer cost not fully gated | strong render, medium end-to-end |
 | Git prompt | parser/reader tests | once-per-command producer tests | implemented with deliberate stash gap |
 | jobs/Reef prompt | renderer tests | evaluator mapping tests | implemented |
-| Vi/principal/battery/custom prompt | renderer tests | no real producer | scaffolded/inert |
+| custom prompt | renderer + scheduler admission/cache tests | real config → bounded worker → CLI/render integration | implemented, host-side only |
+| Vi/principal/battery prompt | renderer tests | no complete real producer | scaffolded/inert |
 | completion | large context/matching/cache test set | Reedline composition | strong heuristic implementation |
 | highlighting | broad token/dispatch tests | environment-sensitive color tests | implemented; PATH repaint cost |
 | keybindings | chord/action tests | edit-mode construction tests | implemented, mode-state prompt gap |

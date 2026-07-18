@@ -20,7 +20,9 @@
 //! per keystroke (site/content/internals/prompt-editor-lsp.md); a non-git `cwd` never spawns it at all (`.git`
 //! discovery is a pure filesystem walk that bails out first). Branch name and
 //! in-progress state (`rebase`/`merge`/…) stay `gix`-free, read straight out
-//! of `.git`.
+//! of `.git`. Configured custom modules run on a separate bounded post-command
+//! scheduler; only their immutable `Ready/Pending/Stale/Error` snapshots enter
+//! this module's render context.
 
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
@@ -39,10 +41,12 @@ use crate::repl_state::ProtocolSnapshot;
 
 mod cli;
 mod config;
+mod custom;
 mod git;
 
 pub use cli::{PromptAction, parse_action, run};
 pub use config::load_prompt_config;
+pub(crate) use custom::{CUSTOM_ONE_SHOT_WAIT, CustomScheduler};
 pub use git::read_git;
 #[cfg(test)]
 use git::{discover_repo, git_status_counts, parse_porcelain_v2_counts, read_head, read_state};
