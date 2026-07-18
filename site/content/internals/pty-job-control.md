@@ -241,9 +241,9 @@ would require a control channel into the worker and an explicit terminal-ownersh
 external PTYs share the `jobs` table shape but do not share one execution mechanism. External task
 hooks signal PGIDs. A generic spawned task may only have a cancellation token or other hooks.
 
-Kernel `task.suspend`/`task.resume` availability must be read against the actual session/handler
-implementation: the local evaluator has methods, while some kernel paths intentionally report task
-control unavailable. Do not infer RPC support from `TaskVal` alone.
+Kernel `task.suspend`/`task.resume` track and signal process groups registered under a task's
+cancellation epoch. They work for process-backed tasks and intentionally report control unavailable
+for evaluator-only computation. Do not infer RPC capability from `TaskVal` hooks alone.
 
 ## Long-lived `PtySession`
 

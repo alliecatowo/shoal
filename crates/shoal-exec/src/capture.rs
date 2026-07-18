@@ -12,7 +12,7 @@ use std::sync::mpsc::RecvTimeoutError;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::cancel::CancelToken;
+use crate::cancel::{CancelToken, ProcessGroupLease};
 use crate::capture_budget::{MemoryLease, SpillLease};
 use crate::status::decode_wait_status;
 use crate::watcher::spawn_cancel_watcher;
@@ -50,6 +50,14 @@ impl StreamingChild {
     /// Propagates OS errors from `waitpid`; these do not occur in normal
     /// operation. The child is reaped either way.
     pub fn wait(self, cancel: &CancelToken) -> io::Result<ExecResult> {
+        let (result, _process_group) = self.wait_retain_process_group(cancel);
+        result
+    }
+
+    fn wait_retain_process_group(
+        self,
+        cancel: &CancelToken,
+    ) -> (io::Result<ExecResult>, Option<ProcessGroupLease>) {
         let StreamingChild {
             stdout,
             stderr,
@@ -58,7 +66,9 @@ impl StreamingChild {
         } = self;
         drop(stdout);
         drop(stderr);
-        inner.wait_reap(cancel)
+        let result = inner.wait_reap(cancel);
+        let process_group = inner.process_group.take();
+        (result, process_group)
     }
 }
 
@@ -75,6 +85,7 @@ struct StreamInner {
     /// What [`crate::sandbox::apply`] actually did before this child's exec,
     /// if `ExecSpec::sandbox` was set. Carried through to [`ExecResult`].
     enforcement: Option<shoal_leash::EnforcementStatus>,
+    process_group: Option<ProcessGroupLease>,
 }
 
 impl StreamInner {
@@ -198,6 +209,7 @@ pub fn spawn_capture(mut spec: ExecSpec, cancel: &CancelToken) -> io::Result<Str
     let mut child = cmd.spawn()?;
     let pid = child.id();
     let pgid = pid as libc::pid_t;
+    let process_group = cancel.register_process_group(pgid);
 
     let done = Arc::new(AtomicBool::new(false));
     let mut threads = Vec::new();
@@ -251,6 +263,7 @@ pub fn spawn_capture(mut spec: ExecSpec, cancel: &CancelToken) -> io::Result<Str
             threads,
             reaped: false,
             enforcement,
+            process_group: Some(process_group),
         },
     })
 }
@@ -298,7 +311,10 @@ pub(crate) fn run_capture(spec: ExecSpec, cancel: &CancelToken) -> io::Result<Ex
     };
     // Join both readers even if waiting fails; otherwise their reservations,
     // descriptors, or an in-progress spill could outlive this operation.
-    let wait_result = child.wait(cancel);
+    // Keep the process-group lease until stdout/stderr descendants have also
+    // closed and every helper has joined. The group remains task-controllable
+    // during this post-leader drain window.
+    let (wait_result, _process_group) = child.wait_retain_process_group(cancel);
     let out = t_out.join().unwrap_or_else(|_| DrainOut {
         buf: Vec::new(),
         spill: None,

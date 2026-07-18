@@ -4,6 +4,14 @@
 //! Wire behavior is documented in `site/content/internals/kernel-protocol.md`.
 use super::*;
 
+fn task_control_unavailable(task: &Ref, action: &str, reason: &str) -> RpcError {
+    RpcError {
+        code: TASK_CONTROL_UNAVAILABLE,
+        message: format!("task {action} is unavailable: {reason}"),
+        data: Some(json!({"task": task, "action": action, "reason": reason})),
+    }
+}
+
 /// Unwind-safe ownership of the transient `Granting` state. Ordinary errors,
 /// handler panics, and dropped requests restore the exact pre-grant state. A
 /// stale-state timeout in `PlanRegistry` is the deterministic backstop if the
@@ -143,7 +151,7 @@ impl Kernel {
             });
         }
         let mut inner = task.lock_inner()?;
-        while matches!(inner.state, "running" | "cancelling") {
+        while matches!(inner.state, "running" | "suspended" | "cancelling") {
             inner = match task.done.wait(inner) {
                 Ok(inner) => inner,
                 Err(poisoned) => return Err(task.repair_wait_poison(poisoned)),
@@ -172,10 +180,12 @@ impl Kernel {
         task.cancel_requested.store(true, Ordering::SeqCst);
         {
             let mut inner = task.lock_inner()?;
-            if inner.state == "running" {
+            if matches!(inner.state, "running" | "suspended") {
                 inner.state = "cancelling";
             }
         }
+        // CancelToken continues groups only when this epoch actually suspended
+        // them, before tripping the existing INT/TERM/KILL watcher ladder.
         task.cancel.cancel();
         encode(json!({"task":p.task,"cancel_requested":true}))
     }
@@ -197,22 +207,33 @@ impl Kernel {
                 data: None,
             });
         }
-        Err(RpcError {
-            code: TASK_CONTROL_UNAVAILABLE,
-            message: "task suspension is unavailable for evaluator-owned processes".into(),
-            data: Some(json!({"task":p.task})),
-        })
+        let mut inner = task.lock_inner()?;
+        if !matches!(inner.state, "running" | "suspended") {
+            return Err(task_control_unavailable(
+                &p.task,
+                "suspend",
+                "task is not running",
+            ));
+        }
+        let process_groups = task
+            .cancel
+            .suspend_processes()
+            .map_err(|error| task_control_unavailable(&p.task, "suspend", &error.to_string()))?;
+        if process_groups == 0 {
+            return Err(task_control_unavailable(
+                &p.task,
+                "suspend",
+                "task has no active child process group",
+            ));
+        }
+        inner.state = "suspended";
+        encode(json!({
+            "task": p.task,
+            "suspended": true,
+            "process_groups": process_groups,
+        }))
     }
 
-    // site/content/internals/roadmap-and-priorities.md: added alongside the pre-existing
-    // `task.suspend` above, honest in the same way — a kernel task is
-    // a Rust thread recursively calling back into `dispatch`, not a
-    // single tracked child process/group, so there is nothing here to
-    // send `SIGCONT` to yet. Real suspend/resume for a task's spawned
-    // children lands with the eval sibling's task-lifecycle methods
-    // (`.suspend()`/`.resume()`); once a task's process handle is
-    // reachable from here, this stub becomes the real thing without
-    // changing the wire shape.
     pub(crate) fn handle_task_resume(
         self: &Arc<Self>,
         params: Json,
@@ -230,11 +251,31 @@ impl Kernel {
                 data: None,
             });
         }
-        Err(RpcError {
-            code: TASK_CONTROL_UNAVAILABLE,
-            message: "task resume is unavailable for evaluator-owned processes".into(),
-            data: Some(json!({"task":p.task})),
-        })
+        let mut inner = task.lock_inner()?;
+        if inner.state != "suspended" {
+            return Err(task_control_unavailable(
+                &p.task,
+                "resume",
+                "task is not suspended",
+            ));
+        }
+        let process_groups = task
+            .cancel
+            .resume_processes()
+            .map_err(|error| task_control_unavailable(&p.task, "resume", &error.to_string()))?;
+        if process_groups == 0 {
+            return Err(task_control_unavailable(
+                &p.task,
+                "resume",
+                "task has no active child process group",
+            ));
+        }
+        inner.state = "running";
+        encode(json!({
+            "task": p.task,
+            "suspended": false,
+            "process_groups": process_groups,
+        }))
     }
 
     /// `plan.get` (site/content/internals/kernel-protocol.md, `shoal://plan/{ref}`): the stored plan a

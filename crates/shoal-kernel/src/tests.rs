@@ -1,5 +1,7 @@
 use super::*;
 
+mod task_control;
+
 fn serve_embedded_test_stream(kernel: Arc<Kernel>, stream: UnixStream) -> io::Result<()> {
     kernel.handle_stream_with_trust(stream, ConnectionTrust::EmbeddedHuman)
 }
@@ -5321,80 +5323,6 @@ fn background_exec_returns_task_and_events_channel() {
     let task_ref = bg["task"].as_str().unwrap();
     let bare_id = task_ref.strip_prefix("task:").unwrap();
     assert_eq!(bg["events"], format!("task.{bare_id}"));
-    drop(client);
-    drop(reader);
-    thread.join().unwrap();
-}
-
-/// site/content/internals/roadmap-and-priorities.md: `task.resume` exists alongside `task.suspend`,
-/// wired the same honest way — never a silent no-op, always a clear
-/// error until a task's process handle is actually reachable here.
-#[test]
-fn task_resume_wire_method_is_honest_and_symmetric_with_suspend() {
-    let kernel = Kernel::new();
-    let (mut client, mut reader, thread) = spawn(&kernel);
-    attach(&mut client, &mut reader);
-    let bg = call(
-        &mut client,
-        &mut reader,
-        2,
-        "exec",
-        json!({"src":"sh { sleep 0.05 }","background":true}),
-    )
-    .result
-    .unwrap();
-    let task = bg["task"].clone();
-
-    let resume = call(
-        &mut client,
-        &mut reader,
-        3,
-        "task.resume",
-        json!({"task": task}),
-    );
-    let error = resume.error.expect("task.resume is not yet implemented");
-    assert_eq!(error.code, TASK_CONTROL_UNAVAILABLE);
-    assert!(
-        error.message.contains("resume"),
-        "message: {}",
-        error.message
-    );
-
-    // Same shape as `task.suspend` for the same task.
-    let suspend = call(
-        &mut client,
-        &mut reader,
-        4,
-        "task.suspend",
-        json!({"task": task}),
-    );
-    assert_eq!(suspend.error.unwrap().code, TASK_CONTROL_UNAVAILABLE);
-
-    // An unknown task ref is rejected before the honest-stub error, for
-    // both methods.
-    let unknown = json!({"task": "task:999999"});
-    assert_eq!(
-        call(&mut client, &mut reader, 5, "task.resume", unknown.clone())
-            .error
-            .unwrap()
-            .code,
-        UNKNOWN_TASK
-    );
-    assert_eq!(
-        call(&mut client, &mut reader, 6, "task.suspend", unknown)
-            .error
-            .unwrap()
-            .code,
-        UNKNOWN_TASK
-    );
-
-    call(
-        &mut client,
-        &mut reader,
-        7,
-        "task.cancel",
-        json!({"task": task}),
-    );
     drop(client);
     drop(reader);
     thread.join().unwrap();

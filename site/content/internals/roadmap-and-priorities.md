@@ -463,12 +463,12 @@ unbounded stream to simulate support.
 
 ### P3.2 Unified owned task runtime
 
-Evaluator jobs and kernel async tasks currently expose overlapping but different control. Define one
-task abstraction around owned process groups/async computation, state transitions, output refs,
-cancellation, suspend/resume capability, and terminal association.
-
-If suspend/resume cannot be provided for a task class, capability discovery should say so before the
-operation. Preserve the current honest `TASK_CONTROL_UNAVAILABLE` until a real backend exists.
+Evaluator jobs and kernel async tasks still expose overlapping but different value/identity models.
+Kernel cancellation epochs now own active capture/PTY process groups and provide real
+suspend/resume for process-backed work; evaluator-only work remains cooperatively cancellable but
+cannot be independently stopped while it owns the shared session evaluator. A future unified task
+abstraction should converge identity, output refs, terminal association, and capability discovery
+without pretending pure computation has an OS process-control backend.
 
 ### P3.3 Semantic editor index
 

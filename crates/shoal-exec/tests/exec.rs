@@ -127,6 +127,26 @@ fn capture_stream_stdin_consumes_bounded_chunks_until_producer_close() {
 }
 
 #[test]
+fn cancellation_epoch_controls_its_live_capture_process_group() {
+    let token = CancelToken::new();
+    let child = spawn_capture(spec(&["/bin/sleep", "30"], ExecMode::Capture), &token)
+        .expect("spawn controlled child");
+
+    assert_eq!(token.suspend_processes().unwrap(), 1);
+    assert_eq!(token.resume_processes().unwrap(), 1);
+    assert_eq!(token.suspend_processes().unwrap(), 1);
+
+    let started = Instant::now();
+    token.cancel();
+    let result = child
+        .wait(&token)
+        .expect("cancel and reap controlled child");
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(result.signal.is_some(), "cancel must terminate the child");
+    assert_eq!(token.resume_processes().unwrap(), 0);
+}
+
+#[test]
 fn stream_stdin_capacity_applies_before_execution_claims_the_receiver() {
     let (sink, _stdin) = stream_stdin(1);
     sink.try_send(vec![1]).unwrap();

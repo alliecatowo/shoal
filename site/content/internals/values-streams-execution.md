@@ -122,8 +122,8 @@ uses a bounded queue per fork (currently 64 items). A slow fork can lose items a
 explicit dropped marker rather than silently pretending delivery was lossless.
 
 
-`buffer(n)` is currently an identity operation in the synchronous pull model; do not infer an
-independent asynchronous prefetch worker from its name.
+`buffer(n)` owns an asynchronous, cancellation-aware producer pump with exact bounded backpressure;
+`buffer(0)` is a lossless rendezvous and positive `n` retains exactly `n` queued items.
 
 ## Tasks
 
@@ -131,10 +131,11 @@ independent asynchronous prefetch worker from its name.
 and resume hooks. Evaluator-spawned language tasks and parked local external jobs can install useful
 control hooks. A task's value is identity-bearing and may resolve to a value or error.
 
-Kernel task wrappers are different: async/timeout RPC execution runs recursive dispatch on a Rust
-thread. The wrapper cannot identify one child process group to signal, so kernel `task.suspend` and
-`task.resume` intentionally return `TASK_CONTROL_UNAVAILABLE`. Cancellation is supported through
-the task path; suspend/resume are not.
+Kernel async/timeout wrappers run recursive dispatch on a Rust thread. External children register
+their process groups with the task's cancellation epoch, so raw kernel `task.suspend`/`task.resume`
+control process-backed work. Pure evaluator computation cannot be stopped independently without
+freezing the shared session evaluator and therefore returns `TASK_CONTROL_UNAVAILABLE`. Cancellation
+is supported for both forms.
 
 ## External execution modes
 

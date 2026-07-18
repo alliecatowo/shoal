@@ -616,12 +616,12 @@ fn production_evaluator_has_only_explicit_ambient_filesystem_exceptions() {
         },
         ExpectedLine {
             file: "expr_access.rs",
-            line: Some(415),
+            line: Some(410),
             text: ".map(|m| m.is_dir())",
         },
         ExpectedLine {
             file: "expr_access.rs",
-            line: Some(422),
+            line: Some(417),
             text: ".map(|m| m.is_file())",
         },
         ExpectedLine {

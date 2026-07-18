@@ -67,7 +67,7 @@ kernel version, every third-party adapter executable, or performance targets on 
 | streams and channels | Implemented, host-limited | evaluator stream/feed tests and live kernel bridge | local process stdin is bounded; wire stream pulling remains unavailable |
 | effects and plans | Implemented with enforcement limits | static derivation, policy tests, plan/apply handlers | planning cannot describe every native-program effect; network enforcement is absent |
 | Leash filesystem sandbox | Implemented, host-limited | Linux/macOS backend tests and enforcement reporting | network enforcement is unavailable; local malformed-policy mode is permissive |
-| task lifecycle | Partial | evaluator jobs and kernel async task tests | kernel suspend/resume returns `TASK_CONTROL_UNAVAILABLE` |
+| task lifecycle | Implemented, execution-form limited | evaluator jobs and kernel process-control tests | pure evaluator tasks have no independently suspendable OS owner |
 | modules and script runners | Implemented, host-limited | module/corpus tests and `.shl` execution | non-`.shl` bare path heads require explicit `run` |
 | Reef environments | Implemented | resolver/provider/lock/view tests and evaluator integration | discovery/cache/persistence fail-soft edges remain |
 | adapters | Implemented | schema fixtures, bundled catalog, evaluator bindings | external tools and output dialects remain inherently environment-dependent |
@@ -298,7 +298,7 @@ contract limitations remain:
   repeated pages trade memory safety for extra I/O and CPU;
 - outcome spans now travel when `OutcomeVal` carries one, including through elision, and are omitted
   honestly when the producer has no source anchor;
-- `task.suspend` and `task.resume` return `TASK_CONTROL_UNAVAILABLE`;
+- `task.suspend`/`task.resume` control process-backed tasks and return `TASK_CONTROL_UNAVAILABLE` for evaluator-only work;
 - kernel and in-language events both use count- and byte-bounded subscriber queues with
   explicit/coalesced gap summaries;
 - journal and transcript cursors survive restart through durable indexes, while most other state
@@ -498,7 +498,7 @@ internal atlas; their counts and status language are not current authority.
 | R0 interactive ergonomics | Implemented on the local shell; host-specific exit/render behavior remains deliberately owned there. |
 | R1 streams/channels | Core language path and bounded stream stdin are implemented; wire pulling and cross-surface scaling remain open. |
 | R2 namespaces/builtins | Implemented; security meaning of network effects remains policy-only. |
-| R3 modules/tasks/plan/undo | Mostly implemented; unified child authority inheritance is complete, while kernel task suspend/resume remains unavailable. |
+| R3 modules/tasks/plan/undo | Mostly implemented; child authority inheritance and process-backed kernel task control are complete, while task identity models remain split. |
 | R4 ports/modularization | Structural split, effect ports, canonical command-source precedence, and method metadata parity are implemented; some direct host calls remain. |
 | R5 corpus/docs/polish | Corpus target exceeded; this Zola atlas replaces duplicated wiki/root status prose; polish is continuous. |
 
@@ -523,7 +523,7 @@ This is a status list, not the work order; ordering and exit criteria live in th
 
 1. journal coarse/fine rows lack an explicit parent relationship;
 2. Reef discovery, caching, probe authority, and lock persistence retain fail-soft edges;
-3. kernel task suspend/resume remains unavailable even though local evaluator job control exists;
+3. kernel task suspend/resume is process-backed only and has no pre-operation capability discovery;
 4. MCP subscriptions remain one connection/thread per active URI;
 5. filesystem/network sandbox coverage is platform- and effect-limited;
 6. plugin ABI v1 is deliberately narrow and synchronous component compilation is only byte-bounded;

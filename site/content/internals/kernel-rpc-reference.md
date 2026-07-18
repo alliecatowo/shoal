@@ -331,17 +331,17 @@ objects remain readable without migration.
 ## Tasks
 
 Task records contain `task`, `session`, `state`, `started_ns`, `finished_ns`, `result_ref`, and
-optional `RpcError`. State vocabulary observed in the handler is `running`, `cancelling`,
+optional `RpcError`. State vocabulary observed in the handler is `running`, `suspended`, `cancelling`,
 `cancelled`, `failed`, and `completed`.
 
 | Method | Params | Behavior/result |
 |---|---|---|
 | `task.list` | `{}` | all task records whose `task.session.id` equals attached session ID |
 | `task.get` | `{task}` | nonblocking snapshot |
-| `task.await` | `{task}` | waits on condvar until not running/cancelling |
-| `task.cancel` | `{task}` | marks cancelling, sets requested flag, fires cancel token |
-| `task.suspend` | `{task}` | validates ownership, then `TASK_CONTROL_UNAVAILABLE` |
-| `task.resume` | `{task}` | validates ownership, then `TASK_CONTROL_UNAVAILABLE` |
+| `task.await` | `{task}` | waits on condvar until terminal, including across suspension |
+| `task.cancel` | `{task}` | marks cancelling, resumes stopped groups, fires cancel token |
+| `task.suspend` | `{task}` | `SIGSTOP` every active process group; unavailable for evaluator-only work |
+| `task.resume` | `{task}` | `SIGCONT` every group owned by a suspended process-backed task |
 
 Ownership is the exact `(principal, visible session name)` owner captured by the attachment. Wrong
 owners receive the same opaque unknown-task result as nonexistent entries. Active-task permits are

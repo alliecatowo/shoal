@@ -152,7 +152,9 @@ fg %1
 
 `fg task_variable` is rewritten to resume and await a language task. A known preview gap is incomplete asynchronous state refresh for an external resumed with `bg`; after it exits, its table state may stay “running” until foregrounded or session shutdown.
 
-This is local REPL behavior. Kernel task suspend/resume currently returns `TASK_CONTROL_UNAVAILABLE`, and MCP PTY control is a separate rendered-terminal protocol.
+This is local REPL behavior. Raw kernel task control can stop/resume process-backed work but returns
+`TASK_CONTROL_UNAVAILABLE` for evaluator-only tasks; MCP PTY control remains a separate
+rendered-terminal protocol.
 
 ## Line history versus journal
 

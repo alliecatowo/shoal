@@ -256,22 +256,23 @@ fn run_task_worker(
             // signal-killed outcome as a normal RETURNED value
             // instead of raising it as an RpcError (site/content/internals/kernel-protocol.md: "a
             // failed outcome is captured, not raised") — so
-            // `response.error` alone cannot tell a naturally
-            // completed task from one that was killed via
-            // `shoal_cancel`. Inspect the actual outcome the
-            // task produced: a signal-killed outcome while
-            // cancellation was requested is `cancelled`; any
-            // other non-ok outcome is `failed`; only a truly
-            // successful result is `completed`.
-            inner.state = match &outcome {
-                Some(Value::Outcome(o)) if !o.ok => {
-                    if task.cancel_requested.load(Ordering::SeqCst) && o.signal.is_some() {
-                        "cancelled"
-                    } else {
-                        "failed"
-                    }
+            // `response.error` alone cannot tell a naturally completed task
+            // from one ended cooperatively or by signal after `shoal_cancel`.
+            // The state-mutex race is authoritative: a handler that first
+            // transitioned this record to `cancelling` owns the terminal
+            // `cancelled` state; otherwise the actual outcome decides between
+            // `failed` and `completed`.
+            inner.state = if task.cancel_requested.load(Ordering::SeqCst) {
+                // The cancel handler transitions the record to `cancelling`
+                // under this same mutex before tripping the token. If it won
+                // that race, cooperative evaluator operations may return a
+                // normal value early; the lifecycle result is still cancelled.
+                "cancelled"
+            } else {
+                match &outcome {
+                    Some(Value::Outcome(o)) if !o.ok => "failed",
+                    _ => "completed",
                 }
-                _ => "completed",
             };
         }
         exit_payload = json!({

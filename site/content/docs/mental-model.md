@@ -31,7 +31,10 @@ accDescr: Shows the components and relationships described in One runtime, sever
     KERNEL --> MCP["MCP bridge\ntools + resources + PTYs"]
 ```
 
-The language is shared. Host behavior is not always identical: for example, the local REPL can suspend a foreground process group with `Ctrl-Z`, while kernel task suspend/resume currently returns `TASK_CONTROL_UNAVAILABLE`. The manual calls out those boundaries rather than treating every host as interchangeable.
+The language is shared. Host behavior is not always identical: the local REPL owns terminal
+reattachment and `Ctrl-Z`, while raw kernel task control can stop/resume process-backed work but not
+pure evaluator computation. The manual calls out those boundaries rather than treating every host
+as interchangeable.
 
 ## How a statement chooses its mode
 

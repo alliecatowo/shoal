@@ -142,9 +142,8 @@ pub mod error_code {
     /// The named `plan_ref` (`plan.get`/`plan.apply`/`cap.request`) is
     /// unknown or has expired.
     pub const UNKNOWN_PLAN: i32 = -32012;
-    /// Task suspend/resume is unavailable: a kernel task is a Rust thread
-    /// recursively re-entering `dispatch`, not a single tracked child
-    /// process/group, so there is nothing to signal yet.
+    /// Task suspend/resume is unavailable for the requested execution form or
+    /// state, such as evaluator-only work with no active child process group.
     pub const TASK_CONTROL_UNAVAILABLE: i32 = -32020;
     /// The named `task` ref is unknown, or belongs to another session.
     pub const UNKNOWN_TASK: i32 = -32021;

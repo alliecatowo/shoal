@@ -209,13 +209,12 @@ kinds without a schema discriminator.
 **Direction:** add an entry kind/parent-exec relation or choose one canonical lifecycle. Return IDs
 directly instead of inferring latest rows.
 
-### Medium: remaining stream, task, filesystem, and WASM paths
+### Medium: remaining WASM and provider paths
 
-These are four separate, explicitly unimplemented surfaces:
+These are three separate, explicitly unimplemented surfaces:
 
 | Gap | Source evidence | Architectural work required |
 |---|---|---|
-| kernel task suspend/resume | handlers return `TASK_CONTROL_UNAVAILABLE` | task runtime that can identify/control owned child groups, or remove verbs |
 | WASM ABI evolution | preview ABI v1 is integrated with declared+authorized hostcalls and bounded values | keep new hostcalls effect-scoped, versioned, cancellable, and adversarially tested |
 | WASM compilation latency | invocation has fuel/epoch/cancellation/wall-time limits, but synchronous compilation is only byte-capped | cache/admission policy if compile latency becomes an operational problem |
 | Reef provider subprocess sandboxing | restricted evaluator probes/installers fail closed when policy requires an OS filesystem sandbox | carry the sandboxed spawn capability into allowed provider subprocesses |

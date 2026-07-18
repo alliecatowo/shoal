@@ -84,6 +84,7 @@ pub struct PtyJob {
     /// `true` once our own `waitpid` has reaped the child, so `Drop`/`kill_and_
     /// reap` know not to signal a dead (possibly pid-reused) process.
     reaped: bool,
+    _process_group: crate::cancel::ProcessGroupLease,
 }
 
 impl PtyJob {
@@ -365,6 +366,7 @@ pub(crate) fn run_pty(mut spec: ExecSpec, cancel: &CancelToken) -> io::Result<Ex
     // another group (EPERM), and setsid already gives the isolated group job
     // control needs.
     let pgid = pid;
+    let process_group = cancel.register_process_group(pgid);
 
     let forward_tty = stdin_is_tty && matches!(stdin, StdinSpec::Inherit);
     let pending_feed = match stdin {
@@ -391,6 +393,7 @@ pub(crate) fn run_pty(mut spec: ExecSpec, cancel: &CancelToken) -> io::Result<Ex
         display,
         stdout_is_tty,
         reaped: false,
+        _process_group: process_group,
     };
 
     match serve(&mut job, cancel, ServeOptions::foreground(false)) {

@@ -655,7 +655,9 @@ if (!t.is_done()) { t.cancel() }
 t.await()
 ```
 
-Task handles compare by identity. Awaiting observes the stored completion. Local evaluator suspension can signal registered process groups; kernel wire suspend/resume currently returns `TASK_CONTROL_UNAVAILABLE` and is not equivalent.
+Task handles compare by identity. Awaiting observes the stored completion. Local evaluator task
+hooks and raw kernel task control can both signal owned process groups, but they use different task
+identities; kernel evaluator-only work still returns `TASK_CONTROL_UNAVAILABLE`.
 
 ## Stream methods
 

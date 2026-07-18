@@ -183,8 +183,8 @@ unattached caller before approval or storage access.
 | `task.get` | yes | Snapshot a task. |
 | `task.await` | yes | Block until a task terminal state. |
 | `task.cancel` | yes | Request cancellation. |
-| `task.suspend` | yes | Present but currently always unavailable. |
-| `task.resume` | yes | Present but currently always unavailable. |
+| `task.suspend` | yes | Stops active process groups; evaluator-only work is unavailable. |
+| `task.resume` | yes | Continues a suspended process-backed task. |
 | `plan.get` | yes | Inspect stored plan. |
 | `plan.list` | yes | List plans matching stored caller metadata. |
 | `plan.apply` | yes | Apply an allowed/approved stored plan. |
@@ -396,10 +396,10 @@ All task selectors use `{ "task": "task:7" }`.
 | --- | --- |
 | `task.list {}` | Returns records whose exact principal/session owner matches the attachment. |
 | `task.get` | Nonblocking record snapshot. |
-| `task.await` | Blocks the connection until state is no longer `running`/`cancelling`. |
-| `task.cancel` | Sets the cancellation token and returns `{task, cancel_requested:true}`. |
-| `task.suspend` | Always returns `-32020` today. |
-| `task.resume` | Always returns `-32020` today. |
+| `task.await` | Blocks the connection across running/suspended/cancelling states until terminal. |
+| `task.cancel` | Continues stopped groups, sets cancellation, and returns `{task, cancel_requested:true}`. |
+| `task.suspend` | Sends `SIGSTOP` to every process group active under the task epoch. |
+| `task.resume` | Sends `SIGCONT` to groups owned by a suspended task. |
 
 Record:
 
@@ -642,7 +642,7 @@ RPC errors and Shoal language `error` values are separate. The former control th
 | `-32010` | Leash denied | Policy denial or cross-session/principal plan access. |
 | `-32011` | approval required | Plan/effects need approval. |
 | `-32012` | unknown plan | Stored plan missing/expired/overwritten. |
-| `-32020` | task control unavailable | Suspend/resume not implemented for kernel task. |
+| `-32020` | task control unavailable | Task/state has no active process-control backend. |
 | `-32021` | unknown task | Missing or other-session task. |
 | `-32022` | unknown PTY | Missing, closed, or other-session PTY. |
 | `-32023` | PTY spawn failed | Executable/sandbox/PTY setup failure. |

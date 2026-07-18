@@ -332,12 +332,12 @@ and 256 retained user-channel identities per exact owner before cloning into liv
 ## Tasks and PTYs
 
 Kernel background/timeout tasks are `TaskEntry` records around a worker thread, completion condition
-variable, result ref/error, and evaluator cancellation token. Task events publish start and final
-state. `task.await` waits for completion; cancel requests evaluator cancellation.
-
-Suspend and resume are deliberate stubs returning `TASK_CONTROL_UNAVAILABLE`: a worker may execute
-arbitrary language and recursively dispatch, not one known process group. Do not expose these as
-working merely because the method names exist.
+variable, result ref/error, and evaluator cancellation epoch. Capture/PTY execution registers its
+process group with that epoch; linked child evaluators share the same registry. `task.suspend` uses
+`SIGSTOP` and `task.resume` uses `SIGCONT` for all currently registered groups. Evaluator-only work
+has no independently stoppable OS owner and returns `TASK_CONTROL_UNAVAILABLE` honestly. Cancellation
+continues stopped groups before the existing INT → TERM → KILL ladder. `task.await` waits across the
+`suspended` state until terminal completion.
 
 PTY records instead own one concrete long-lived `PtySession`. Methods are owner-scoped, and reads
 return a bounded rendered screen, cursor, change bit, liveness, and exit state—not raw escape bytes.

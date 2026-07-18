@@ -124,7 +124,9 @@ fg %1
 
 `fg <task-variable>` is rewritten to resume and await that task. Local process-group job control depends on Unix terminal facilities. A known preview limitation is that a stopped external resumed with `bg` may remain displayed as running after it exits until it is foregrounded again or the session ends; background completion tracking is not yet fully event-driven.
 
-Kernel tasks are different: current MCP/kernel suspend and resume operations return `TASK_CONTROL_UNAVAILABLE`, even though local REPL process control works. Do not build remote-agent workflows around the local `Ctrl-Z` model.
+Kernel tasks are different: raw kernel suspend/resume controls process-backed tasks through their
+owned process groups, while evaluator-only work returns `TASK_CONTROL_UNAVAILABLE`. MCP does not
+expose those raw controls. This is not the local REPL's terminal-reattachment/`Ctrl-Z` model.
 
 ## History and journal
 

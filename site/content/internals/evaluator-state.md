@@ -354,8 +354,6 @@ Do not erase a nested error's span merely to attach the outer expression.
 
 ## Known sharp edges
 
-- `JobsSnapshot`'s source comment says suspended is always zero, but implementation now counts
-  suspended tasks. The code behavior is authoritative; the comment needs correction.
 - The evaluator is a large state aggregate, but child creation is funneled through the single
   `ChildContext` constructor (`child_context.rs`). Destructuring prevents forgetting to re-apply a
   field already captured there; adding an `Evaluator` field still requires an inheritance audit and

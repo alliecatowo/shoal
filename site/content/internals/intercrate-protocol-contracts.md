@@ -373,7 +373,7 @@ Numeric codes are centralized in `shoal_proto::error_code` and pinned by a unit 
 | -32010 | `LEASH_DENIED` | denied or invalid-cross-authority approved/plan access |
 | -32011 | `APPROVAL_REQUIRED` | policy requires an approval flow |
 | -32012 | `UNKNOWN_PLAN` | missing/expired plan ref |
-| -32020 | `TASK_CONTROL_UNAVAILABLE` | suspend/resume unavailable for task model |
+| -32020 | `TASK_CONTROL_UNAVAILABLE` | requested task/state has no process-control backend |
 | -32021 | `UNKNOWN_TASK` | absent or cross-session task |
 | -32022 | `UNKNOWN_PTY` | absent/closed/cross-session PTY |
 | -32023 | `PTY_SPAWN_FAILED` | resolution, sandbox, PTY, or spawn failure |

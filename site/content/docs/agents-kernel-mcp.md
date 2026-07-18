@@ -307,9 +307,14 @@ Plans are in-memory and disappear on kernel restart.
 
 Timeout is a context handoff, not a kill switch. Subscribe to the task resource/channel, await/read it later, or cancel explicitly.
 
-Task states include `running`, `cancelling`, `completed`, `failed`, and `cancelled`. Cancellation signals the evaluator's cancellation token; the final state still reflects what the actual returned outcome/error shows.
+Task states include `running`, `suspended`, `cancelling`, `completed`, `failed`, and `cancelled`.
+Cancellation continues stopped child groups, signals the evaluator's cancellation token, and leaves
+the final state to reflect the actual returned outcome/error.
 
-Kernel `task.suspend` and `task.resume` currently return `TASK_CONTROL_UNAVAILABLE`. A kernel task is a Rust thread recursively dispatching an execution, not one tracked process group. Local REPL job control is a different implementation and can suspend actual foreground process groups.
+Raw kernel `task.suspend` and `task.resume` track capture/PTY process groups owned by the task's
+cancellation epoch. Pure evaluator work has no separate OS owner and returns
+`TASK_CONTROL_UNAVAILABLE`. Local REPL job control additionally owns terminal reattachment;
+kernel task control does not.
 
 ## Stable references
 
