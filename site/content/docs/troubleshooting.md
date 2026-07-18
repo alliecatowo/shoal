@@ -101,6 +101,12 @@ mise run install:clean
 verifies that all ten executables and man pages are byte-identical to their
 current source artifacts.
 
+The repository-managed install and verification tasks deliberately build the
+entire release workspace. Do not replace that bootstrap with a package-only
+`cargo build -p shoal --release`: Cargo feature unification can select a
+different cached top-level artifact, making a correct installation appear
+stale (or allowing a stale companion artifact to escape verification).
+
 `rehash` is useful in zsh after a new executable appears; it is harmlessly skipped elsewhere.
 
 ### `shoal lsp` or `shoal mcp` cannot launch companion

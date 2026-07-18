@@ -16,9 +16,9 @@ hide = true
 run = "cargo build -p shoal --locked"
 
 [tasks."bootstrap:release"]
-description = "Compile the optimized Shoal executable needed for installation"
+description = "Compile the exact optimized workspace artifacts used for installation"
 hide = true
-run = "cargo build -p shoal --release --locked"
+run = "cargo build --workspace --release --locked"
 
 [tasks.install]
 description = "Build and install every Shoal executable"

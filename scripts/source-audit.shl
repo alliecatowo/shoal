@@ -27,4 +27,8 @@ let raw_runs = workflow_lines.where(.contains(":run: "))
 let foreign_runs = raw_runs.where(line => !line.contains("run: cargo build -p shoal --locked") && !line.contains("run: target/debug/shoal "))
 assert(foreign_runs.is_empty(), "workflow logic bypasses Shoal: {foreign_runs}")
 
+let mise = path("mise.toml").read
+assert(mise.contains('run = "cargo build --workspace --release --locked"'), "release bootstrap must build the same workspace artifact set the installer copies")
+assert(!mise.contains("cargo build -p shoal --release"), "package-only release bootstrap can swap target/release artifacts after installation")
+
 echo "source audit: {kernel_sources.len()} kernel files, {rust_sources.len()} Rust files, {workflows.len()} Shoal-driven workflows"
