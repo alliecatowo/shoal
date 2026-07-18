@@ -166,7 +166,7 @@ Full impact/mitigation: [Security and trust boundaries](@/docs/security.md).
 | Streams on wire | Wire stream contains only label; no chunk-pull method. | Collect/bound in language or use tasks/resources. |
 | Timeout semantics | Converts unfinished execution into task; does not terminate. | Cancel and observe terminal state explicitly. |
 | Task await | Raw method can block a connection indefinitely. | Subscribe/poll task resource. |
-| Kernel task suspend/resume | Raw methods control process-backed tasks only. | Evaluator-only work returns `TASK_CONTROL_UNAVAILABLE`; MCP exposes cancel, not pause/resume. |
+| Kernel task suspend/resume | Task records advertise current controls; raw methods control process-backed tasks only. | The snapshot is advisory; evaluator-only work is never advertised as suspendable, and MCP exposes cancel, not pause/resume. |
 | PTY subscriptions | PTYs are poll-read only. | Bounded delayed polling + deadline + close. |
 | PTY output | Current rendered grid, no raw ANSI or durable scrollback stream. | Use ordinary exec for audit capture. |
 | Resource/session lifetime | Plans/tasks/PTys/transcript refs disappear on kernel restart. | Reconcile journal/artifacts and recreate. |

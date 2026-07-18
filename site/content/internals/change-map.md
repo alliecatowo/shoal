@@ -252,6 +252,18 @@ lost at restart. Journal and CAS remain, but identity-bearing values cannot simp
 A recovery design should explicitly classify reconstructible summaries, immutable CAS data, and
 non-recoverable live objects rather than imply full session durability.
 
+### Resolved: task records advertise useful control operations
+
+`task.list`, `task.get`, and terminal `task.await` records include an additive `controls` object with
+`cancel`, `suspend`, `resume`, and `active_process_groups`. A process-backed running task advertises
+suspend only after its group is registered; while stopped it advertises resume; evaluator-only and
+terminal work never claims process control. Legacy records decode with all controls false.
+
+The snapshot reads the same cancellation-epoch process registry used by the signal operations. It is
+advisory because a child may exit immediately afterward, so callers still handle
+`TASK_CONTROL_UNAVAILABLE`. Poison reconstruction clears both uncertain group identities and the
+suspended bit; the first inspection fails honestly and the next returns a clean empty snapshot.
+
 ### Medium: thread-per-subscription scaling
 
 Kernel subscription queues and writes are bounded, MCP unsubscribe owns and joins its worker, and

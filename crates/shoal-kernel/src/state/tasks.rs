@@ -1,7 +1,7 @@
 use super::super::{Kernel, OwnerKey, Session, now_ns};
 use serde_json::{Value as Json, json};
 use shoal_proto::error_code::{INTERNAL_ERROR, UNKNOWN_TASK};
-use shoal_proto::{Ref, RpcError, TaskRecord};
+use shoal_proto::{Ref, RpcError, TaskControls, TaskRecord};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -267,11 +267,36 @@ pub(crate) fn task_record(task: &Arc<TaskEntry>) -> Result<TaskRecord, RpcError>
         // The first failure reconstructs and unpoisons the terminal record.
         Err(_) => task.lock_inner()?,
     };
-    Ok(task_record_locked(task, &inner))
+    task_record_locked(task, &inner)
 }
 
-pub(crate) fn task_record_locked(task: &TaskEntry, inner: &TaskInner) -> TaskRecord {
-    TaskRecord {
+pub(crate) fn task_record_locked(
+    task: &TaskEntry,
+    inner: &TaskInner,
+) -> Result<TaskRecord, RpcError> {
+    let process = task
+        .cancel
+        .process_control_snapshot()
+        .map_err(|error| RpcError {
+            code: INTERNAL_ERROR,
+            message: error.to_string(),
+            data: Some(json!({
+                "task": task.task,
+                "subsystem": "task_process_control",
+                "reconstructed": true,
+            })),
+        })?;
+    let controls = TaskControls {
+        cancel: matches!(inner.state, "running" | "suspended" | "cancelling"),
+        suspend: inner.state == "running"
+            && process.active_process_groups > 0
+            && !process.suspended,
+        resume: inner.state == "suspended"
+            && process.active_process_groups > 0
+            && process.suspended,
+        active_process_groups: process.active_process_groups,
+    };
+    Ok(TaskRecord {
         task: task.task.clone(),
         session: task.session_id.clone(),
         state: inner.state.into(),
@@ -280,7 +305,8 @@ pub(crate) fn task_record_locked(task: &TaskEntry, inner: &TaskInner) -> TaskRec
         result_ref: inner.result_ref.clone(),
         exit_code: inner.exit_code,
         error: inner.error.clone(),
-    }
+        controls,
+    })
 }
 
 const MAX_FINISHED_PER_OWNER: usize = 512;

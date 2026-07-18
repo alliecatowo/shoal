@@ -395,7 +395,7 @@ All task selectors use `{ "task": "task:7" }`.
 | Method | Behavior |
 | --- | --- |
 | `task.list {}` | Returns records whose exact principal/session owner matches the attachment. |
-| `task.get` | Nonblocking record snapshot. |
+| `task.get` | Nonblocking record and current-control snapshot. |
 | `task.await` | Blocks the connection across running/suspended/cancelling states until terminal. |
 | `task.cancel` | Continues stopped groups, sets cancellation, and returns `{task, cancel_requested:true}`. |
 | `task.suspend` | Sends `SIGSTOP` to every process group active under the task epoch. |
@@ -411,9 +411,19 @@ Record:
   "started_ns": 1750000000000000000,
   "finished_ns": 1750000000123000000,
   "result_ref": "out:12",
-  "error": null
+  "error": null,
+  "controls": {
+    "cancel": false,
+    "suspend": false,
+    "resume": false,
+    "active_process_groups": 0
+  }
 }
 ```
+
+`controls` is discovery, not a reservation. A running process-backed task advertises `suspend`; a
+suspended one advertises `resume`; evaluator-only and terminal work advertise neither. The child can
+finish after the record is read, so handle `TASK_CONTROL_UNAVAILABLE` even after a `true` snapshot.
 
 Task access checks the exact `(principal, session name)` owner. Another principal using the same
 visible name has a different evaluator, task namespace, and quota account.

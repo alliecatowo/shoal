@@ -197,7 +197,10 @@ Read the current record for background or timed-out execution:
 shoal://task/9
 ```
 
-The URI restores the short `task:9` form and calls `task.get`. A record exposes state, source/description metadata, timestamps, and—after successful capture—a `result_ref`. Task registry state is live-memory state and disappears on kernel restart.
+The URI restores the short `task:9` form and calls `task.get`. A record exposes state, session,
+timestamps, an advisory cancel/suspend/resume control snapshot, and—after successful capture—a
+`result_ref`. Task registry state is live-memory state and disappears on kernel restart. MCP can
+cancel a task but does not expose the raw kernel suspend/resume calls.
 
 ### Task output
 

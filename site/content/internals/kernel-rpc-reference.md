@@ -338,9 +338,11 @@ objects remain readable without migration.
 
 ## Tasks
 
-Task records contain `task`, `session`, `state`, `started_ns`, `finished_ns`, `result_ref`, and
-optional `RpcError`. State vocabulary observed in the handler is `running`, `suspended`, `cancelling`,
-`cancelled`, `failed`, and `completed`.
+Task records contain `task`, `session`, `state`, `started_ns`, `finished_ns`, `result_ref`, optional
+`RpcError`, and an advisory `controls` snapshot. `controls` reports whether cancel/suspend/resume is
+currently useful plus the active process-group count; work can finish immediately after inspection,
+so callers must still handle `TASK_CONTROL_UNAVAILABLE`. State vocabulary observed in the handler
+is `running`, `suspended`, `cancelling`, `cancelled`, `failed`, and `completed`.
 
 | Method | Params | Behavior/result |
 |---|---|---|

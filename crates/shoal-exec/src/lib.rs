@@ -55,7 +55,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub use bounded::{BoundedCommandOutput, run_bounded_command};
-pub use cancel::CancelToken;
+pub use cancel::{CancelToken, ProcessControlSnapshot};
 pub use capture::{StreamingChild, spawn_capture};
 pub use capture_budget::{
     DEFAULT_CAPTURE_AGGREGATE_MEMORY_CAP, DEFAULT_CAPTURE_AGGREGATE_SPILL_CAP,

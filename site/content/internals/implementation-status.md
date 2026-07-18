@@ -222,7 +222,7 @@ planned/denied without a claim that allowed traffic is network-confined.
 | interactive foreground PTY | Implemented on Unix | process group / terminal control | terminal streaming, host-owned | local shell path differs from captured execution |
 | kernel long-lived PTY | Implemented | close/drop terminates | read is polling over vt100 screen | scoped to session ID; no change subscription |
 | evaluator background task | Implemented | token and job control | output representation is bounded by normal capture | suspend/resume available for owned process |
-| kernel async task | Partial | cancel exists | result stored behind ref | suspend/resume explicitly unavailable |
+| kernel async task | Implemented, execution-form limited | cancellation plus process-group suspend/resume | result stored behind ref; task records advertise current controls | evaluator-only work has no independently stoppable OS owner |
 | list/table stream source | Implemented | consumer lifecycle | finite | single-consumption semantics |
 | watch/tail/every | Implemented | sink-to-source propagation | bounded/coalescing source queues | filesystem watch still touches host APIs directly |
 | language channel | Implemented | stream consumer lifecycle | replay/live model | `user.*` bridge prevents spoofing kernel channels |
@@ -299,7 +299,9 @@ contract limitations remain:
   repeated pages trade memory safety for extra I/O and CPU;
 - outcome spans now travel when `OutcomeVal` carries one, including through elision, and are omitted
   honestly when the producer has no source anchor;
-- `task.suspend`/`task.resume` control process-backed tasks and return `TASK_CONTROL_UNAVAILABLE` for evaluator-only work;
+- task records advertise race-honest cancel/suspend/resume availability; process-backed control may
+  still return `TASK_CONTROL_UNAVAILABLE` after a child exits, and evaluator-only work is never
+  advertised as suspendable;
 - kernel and in-language events both use count- and byte-bounded subscriber queues with
   explicit/coalesced gap summaries;
 - journal and transcript cursors survive restart through durable indexes, while most other state
@@ -523,18 +525,16 @@ Before calling a subsystem “done,” answer all of these with links to executa
 
 This is a status list, not the work order; ordering and exit criteria live in the roadmap.
 
-1. journal coarse/fine rows lack an explicit parent relationship;
-2. Reef metadata-to-open/hash-to-exec atomicity and cross-platform containment remain incomplete;
-3. kernel task suspend/resume is process-backed only and has no pre-operation capability discovery;
-4. MCP subscriptions remain one connection/thread per active URI;
-5. filesystem/network sandbox coverage is platform- and effect-limited;
-6. plugin ABI v1 is deliberately narrow, and admitted synchronous component compilation cannot be
+1. Reef metadata-to-open/hash-to-exec atomicity and cross-platform containment remain incomplete;
+2. MCP subscriptions remain one connection/thread per active URI;
+3. filesystem/network sandbox coverage is platform- and effect-limited;
+4. plugin ABI v1 is deliberately narrow, and admitted synchronous component compilation cannot be
    preempted even though input bytes, concurrent jobs, and admission wait are bounded;
-7. auth has no live token-administration RPC even though file changes are observed immediately;
-8. kernel quotas and separate evaluator budgets bound retained sessions, 64 native workers per
+5. auth has no live token-administration RPC even though file changes are observed immediately;
+6. kernel quotas and separate evaluator budgets bound retained sessions, 64 native workers per
    session (512 process-wide), 256 executable plans, and 1,024 memoized modules; these remain
    independent admission systems rather than one universal executor;
-9. Windows remains a separate architecture project.
+7. Windows remains a separate architecture project.
 
 ## Audit maintenance protocol
 

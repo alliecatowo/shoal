@@ -539,6 +539,18 @@ pub struct PtyResizeParams {
     pub rows: u16,
 }
 
+/// Operations that are useful for a task at the instant its record is read.
+/// These are advisory: process-backed work can start or finish immediately
+/// after the snapshot, so control calls must still handle an availability
+/// error.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct TaskControls {
+    pub cancel: bool,
+    pub suspend: bool,
+    pub resume: bool,
+    pub active_process_groups: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskRecord {
     pub task: Ref,
@@ -550,6 +562,9 @@ pub struct TaskRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
     pub error: Option<RpcError>,
+    /// Race-honest control discovery for `task.cancel/suspend/resume`.
+    #[serde(default)]
+    pub controls: TaskControls,
 }
 fn run_mode() -> String {
     "run".into()
@@ -926,6 +941,21 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(plan.enforcement, EnforcementPreview::default());
+    }
+
+    #[test]
+    fn legacy_task_record_defaults_to_no_advertised_controls() {
+        let record: TaskRecord = serde_json::from_value(serde_json::json!({
+            "task": "task:1",
+            "session": "session",
+            "state": "running",
+            "started_ns": 1,
+            "finished_ns": null,
+            "result_ref": null,
+            "error": null
+        }))
+        .unwrap();
+        assert_eq!(record.controls, TaskControls::default());
     }
 
     /// Locks the wire contract (refactor guard): every named `error_code`

@@ -31,26 +31,40 @@ fn suspend_resume_controls_process_backed_work_and_rejects_unknown_tasks() {
 
     let deadline = Instant::now() + std::time::Duration::from_secs(2);
     let mut request_id = 4;
-    let suspended = loop {
-        let response = call(
+    let ready = loop {
+        let record = call(
             &mut client,
             &mut reader,
             request_id,
-            "task.suspend",
+            "task.get",
             json!({"task": task}),
-        );
+        )
+        .result
+        .unwrap();
         request_id += 1;
-        if let Some(result) = response.result {
-            break result;
+        if record["controls"]["suspend"] == true {
+            break record;
         }
-        let error = response.error.unwrap();
-        assert_eq!(error.code, TASK_CONTROL_UNAVAILABLE);
         assert!(
             Instant::now() < deadline,
-            "child process group never became active"
+            "task record never advertised its child process group"
         );
         std::thread::sleep(std::time::Duration::from_millis(10));
     };
+    assert_eq!(ready["controls"]["cancel"], true);
+    assert_eq!(ready["controls"]["resume"], false);
+    assert_eq!(ready["controls"]["active_process_groups"], 1);
+
+    let suspended = call(
+        &mut client,
+        &mut reader,
+        request_id,
+        "task.suspend",
+        json!({"task": task}),
+    )
+    .result
+    .expect("advertised suspension should succeed while the group stays active");
+    request_id += 1;
     assert_eq!(suspended["suspended"], true);
     assert_eq!(suspended["process_groups"], 1);
 
@@ -65,6 +79,10 @@ fn suspend_resume_controls_process_backed_work_and_rejects_unknown_tasks() {
     .unwrap();
     request_id += 1;
     assert_eq!(snapshot["state"], "suspended");
+    assert_eq!(snapshot["controls"]["cancel"], true);
+    assert_eq!(snapshot["controls"]["suspend"], false);
+    assert_eq!(snapshot["controls"]["resume"], true);
+    assert_eq!(snapshot["controls"]["active_process_groups"], 1);
 
     let resumed = call(
         &mut client,
@@ -164,10 +182,24 @@ fn suspend_remains_honest_for_evaluator_only_work() {
     let task = started["task"].clone();
     std::thread::sleep(std::time::Duration::from_millis(20));
 
-    let error = call(
+    let record = call(
         &mut client,
         &mut reader,
         3,
+        "task.get",
+        json!({"task": task}),
+    )
+    .result
+    .unwrap();
+    assert_eq!(record["controls"]["cancel"], true);
+    assert_eq!(record["controls"]["suspend"], false);
+    assert_eq!(record["controls"]["resume"], false);
+    assert_eq!(record["controls"]["active_process_groups"], 0);
+
+    let error = call(
+        &mut client,
+        &mut reader,
+        4,
         "task.suspend",
         json!({"task": task}),
     )
@@ -182,20 +214,24 @@ fn suspend_remains_honest_for_evaluator_only_work() {
     call(
         &mut client,
         &mut reader,
-        4,
+        5,
         "task.cancel",
         json!({"task": task}),
     );
     let cancelled = call(
         &mut client,
         &mut reader,
-        5,
+        6,
         "task.await",
         json!({"task": task}),
     )
     .result
     .unwrap();
     assert_eq!(cancelled["state"], "cancelled");
+    assert_eq!(cancelled["controls"]["cancel"], false);
+    assert_eq!(cancelled["controls"]["suspend"], false);
+    assert_eq!(cancelled["controls"]["resume"], false);
+    assert_eq!(cancelled["controls"]["active_process_groups"], 0);
     drop(client);
     drop(reader);
     thread.join().unwrap();

@@ -26,6 +26,7 @@ impl Drop for ProcessGroupLease {
             Err(poisoned) => {
                 let mut active = poisoned.into_inner();
                 active.clear();
+                self.groups.suspended.store(false, Ordering::Release);
                 self.groups.active.clear_poison();
                 return;
             }
@@ -52,6 +53,17 @@ struct CancelInner {
 /// of a parent token. Clones share the exact same cancellation identity.
 #[derive(Debug, Clone)]
 pub struct CancelToken(Arc<CancelInner>);
+
+/// Advisory process-control membership for one cancellation epoch.
+///
+/// The snapshot is exact while the registry lock is held, but a child may
+/// register or finish immediately afterward. Callers must still handle a
+/// control operation becoming unavailable after discovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessControlSnapshot {
+    pub active_process_groups: usize,
+    pub suspended: bool,
+}
 
 impl Default for CancelToken {
     fn default() -> Self {
@@ -116,6 +128,28 @@ impl CancelToken {
         self.signal_processes(libc::SIGCONT, libc::SIGSTOP)
     }
 
+    /// Inspect whether this epoch currently owns process-backed work without
+    /// sending a signal. A poisoned membership registry is discarded and
+    /// reported once instead of exposing uncertain process identities.
+    pub fn process_control_snapshot(&self) -> io::Result<ProcessControlSnapshot> {
+        let active = match self.0.groups.active.lock() {
+            Ok(active) => active,
+            Err(poisoned) => {
+                let mut active = poisoned.into_inner();
+                active.clear();
+                self.0.groups.suspended.store(false, Ordering::Release);
+                self.0.groups.active.clear_poison();
+                return Err(io::Error::other(
+                    "task process-control registry was reconstructed after poison",
+                ));
+            }
+        };
+        Ok(ProcessControlSnapshot {
+            active_process_groups: active.len(),
+            suspended: self.0.groups.suspended.load(Ordering::Acquire),
+        })
+    }
+
     pub(crate) fn register_process_group(&self, pgid: libc::pid_t) -> ProcessGroupLease {
         let mut active = match self.0.groups.active.lock() {
             Ok(active) => active,
@@ -125,6 +159,7 @@ impl CancelToken {
                 // unwind its old membership is uncertain, so discard it rather
                 // than risking a signal to a later pid reuse.
                 active.clear();
+                self.0.groups.suspended.store(false, Ordering::Release);
                 self.0.groups.active.clear_poison();
                 active
             }
@@ -149,6 +184,7 @@ impl CancelToken {
             Err(poisoned) => {
                 let mut active = poisoned.into_inner();
                 active.clear();
+                self.0.groups.suspended.store(false, Ordering::Release);
                 self.0.groups.active.clear_poison();
                 return Err(io::Error::other(
                     "task process-control registry was reconstructed after poison",
@@ -227,5 +263,28 @@ mod tests {
         // No such process group exists, so it is pruned rather than counted.
         assert_eq!(parent.suspend_processes().unwrap(), 0);
         drop(lease);
+    }
+
+    #[test]
+    fn process_control_snapshot_reconstructs_poison_without_stale_suspension() {
+        let token = CancelToken::new();
+        token.0.groups.suspended.store(true, Ordering::Release);
+        let poison_target = token.clone();
+        let poisoner = std::thread::spawn(move || {
+            let mut active = poison_target.0.groups.active.lock().unwrap();
+            active.insert(i32::MAX);
+            panic!("inject process-control registry poison");
+        });
+        assert!(poisoner.join().is_err());
+
+        let error = token.process_control_snapshot().unwrap_err();
+        assert!(error.to_string().contains("reconstructed after poison"));
+        assert_eq!(
+            token.process_control_snapshot().unwrap(),
+            ProcessControlSnapshot {
+                active_process_groups: 0,
+                suspended: false,
+            }
+        );
     }
 }

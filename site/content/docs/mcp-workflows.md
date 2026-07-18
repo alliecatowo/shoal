@@ -312,9 +312,10 @@ Task output is captured as a whole transcript value after completion; it is not 
 
 The response means cancellation was requested, not necessarily that every descendant is already gone. Continue observing until a terminal state. Decide how partial filesystem/network effects will be reconciled; cancellation is not rollback.
 
-Raw kernel task suspend/resume controls process-backed tasks; it reports unavailable for pure
-evaluator work. MCP intentionally exposes cancellation but not those raw pause/resume methods, so do
-not design an MCP workflow around pausing tasks.
+Raw kernel task suspend/resume controls process-backed tasks; the task record's `controls` object
+advertises current availability and pure evaluator work reports neither operation. MCP task resources
+can display that record, but MCP intentionally exposes cancellation—not the raw pause/resume methods—
+so do not design an MCP workflow around pausing tasks.
 
 ## Resumable event processing
 

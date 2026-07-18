@@ -157,7 +157,7 @@ impl Kernel {
                 Err(poisoned) => return Err(task.repair_wait_poison(poisoned)),
             };
         }
-        encode(task_record_locked(&task, &inner))
+        encode(task_record_locked(&task, &inner)?)
     }
 
     pub(crate) fn handle_task_cancel(

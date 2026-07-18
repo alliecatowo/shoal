@@ -439,7 +439,8 @@ The raw method set is broader than MCP tools and includes parsing, completion, e
 - Language streams can feed captured commands through a bounded incremental stdin queue; streams
   still have no item-pull representation on the kernel wire.
 - Task output is captured as one value on completion, not incrementally cursor-readable.
-- Task suspend/resume is unavailable on the kernel wire.
+- Raw kernel task records advertise and control suspend/resume for process-backed work; evaluator-only
+  work has no stoppable OS owner, and MCP exposes only cancellation.
 - `format=raw` and `blob.get` expose only one 8 KiB decoded-content page at a time; clients must follow `page.next_offset` for complete transfer.
 - Session `cwd` in MCP resources is cached from attach rather than refreshed from the kernel, while env/Reef views are live.
 - Each active MCP resource subscription owns one dedicated kernel connection and OS thread;

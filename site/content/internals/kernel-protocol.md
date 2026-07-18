@@ -343,7 +343,10 @@ process group with that epoch; linked child evaluators share the same registry. 
 `SIGSTOP` and `task.resume` uses `SIGCONT` for all currently registered groups. Evaluator-only work
 has no independently stoppable OS owner and returns `TASK_CONTROL_UNAVAILABLE` honestly. Cancellation
 continues stopped groups before the existing INT → TERM → KILL ladder. `task.await` waits across the
-`suspended` state until terminal completion.
+`suspended` state until terminal completion. Every task record includes an advisory `controls`
+snapshot (`cancel`, `suspend`, `resume`, and `active_process_groups`) so clients can discover useful
+operations before attempting them. Membership can change immediately after a read, so the control
+RPC remains authoritative and may still return unavailable.
 
 PTY records instead own one concrete long-lived `PtySession`. Methods are owner-scoped, and reads
 return a bounded rendered screen, cursor, change bit, liveness, and exit state—not raw escape bytes.

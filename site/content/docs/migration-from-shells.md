@@ -484,7 +484,9 @@ sleep 30s &
 jobs
 ```
 
-The interactive Unix host has `fg`/`bg` process-group behavior. Kernel tasks are a different surface; raw kernel suspend/resume is currently unavailable.
+The interactive Unix host has `fg`/`bg` process-group behavior. Kernel tasks are a different surface:
+raw task records advertise suspend/resume only while the task owns a process group, and pure
+evaluator work remains cooperatively cancellable rather than independently stoppable.
 
 ## Functions should not mutate global cwd
 
