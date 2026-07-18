@@ -126,7 +126,9 @@ The next line may begin with `.` after an incomplete chain, so long transformati
 - channels to bridge named event flows across language and kernel sessions.
 
 
-Streams do not currently feed a process incrementally. Use `.take(n).collect()` or another bounded sink before `feed`; see [Streams and channels](@/docs/streams-channels.md).
+Streams feed captured process stdin incrementally through a bounded, cancellation-aware pump; they
+do not need to be collected first. Use `.take(n)` when the producer is live and the consumer should
+receive only a bounded prefix; see [Streams and channels](@/docs/streams-channels.md).
 
 ## Results depend on position
 

@@ -125,7 +125,11 @@ fn mcp_exec_elides_render_and_text_then_resource_read_drills_in() {
     // so bounding at the MCP boundary is actually exercised (not a no-op).
     let bigdir = live._dir.path().join("bigdir");
     std::fs::create_dir_all(&bigdir).unwrap();
-    for i in 0..2000 {
+    // One thousand rows render comfortably above 64 KiB while staying below
+    // the evaluator's 1 MiB single-binding wall even under macOS's much longer
+    // temporary-directory paths. Two thousand made this fixture test the
+    // unrelated binding quota on macOS before it reached MCP elision.
+    for i in 0..1000 {
         std::fs::write(bigdir.join(format!("file{i:05}.txt")), b"x").unwrap();
     }
     let mut facade = Facade::connect(&live.config()).unwrap();
@@ -135,12 +139,17 @@ fn mcp_exec_elides_render_and_text_then_resource_read_drills_in() {
         "shoal_exec",
         json!({"src": format!("ls {}", bigdir.display()), "position":"stmt"}),
     );
+    assert_eq!(
+        result["isError"], false,
+        "large-table exec failed before elision: {}",
+        result["structuredContent"]
+    );
 
     // Structured value: the outcome's `.out` table is elided to a ref.
     let out = &result["structuredContent"]["value"]["out"];
-    assert_eq!(out["$"], "ref", "a 2000-row table must elide: {out}");
+    assert_eq!(out["$"], "ref", "a 1000-row table must elide: {out}");
     assert_eq!(out["of"], "table");
-    assert_eq!(out["n"], 2000);
+    assert_eq!(out["n"], 1000);
 
     // site/content/internals/kernel-protocol.md: the human text content is bounded (<= 64 KiB) even though the raw
     // render of 2000 rows is far larger — the render string cannot bypass the

@@ -25,7 +25,7 @@ Use this page to find the authoritative chapter for a symbol or subsystem. It al
 | How does the interactive editor/session behave? | [Interactive shell](@/docs/repl.md) |
 | What does every `shoal` CLI form do? | [Command-line interface](@/docs/cli.md) |
 | How do I translate Bash/zsh/fish/Nushell habits? | [Migrating from traditional shells](@/docs/migration-from-shells.md) |
-| Show practical patterns. | [Recipes](@/docs/recipes.md) |
+| Show practical patterns. | [Recipes](@/docs/recipes.md) and the repository's executable `scripts/*.shl` operations programs |
 
 ### Language
 
@@ -431,7 +431,9 @@ Top-level command/control context where a non-ok outcome normally raises `cmd_fa
 
 ### Stream
 
-Lazy/single-consumption sequence, potentially live. Live sources have bounded/coalescing behavior; streams currently do not chunk over the kernel wire or feed a process incrementally.
+Lazy/single-consumption sequence, potentially live. Live sources have bounded/coalescing behavior;
+streams can feed captured process stdin incrementally and can be pulled over the kernel wire in
+bounded, addressable batches.
 
 ### Task
 

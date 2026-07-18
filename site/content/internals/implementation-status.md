@@ -64,7 +64,7 @@ kernel version, every third-party adapter executable, or performance targets on 
 | builtins and namespaces | Implemented | canonical command precedence plus corpus | namespaces are not first-class callable values |
 | process capture | Implemented | real process-group and dual-pipe tests | hash preflight has an exec-time TOCTOU window |
 | interactive PTY execution | Implemented, host-limited | Unix PTY integration and REPL tests | Windows/ConPTY is deferred; kernel PTYs are poll-based |
-| streams and channels | Implemented, host-limited | evaluator stream/feed tests and live kernel bridge | local process stdin is bounded; wire stream pulling remains unavailable |
+| streams and channels | Implemented, host-limited | evaluator stream/feed tests and live kernel bridge | local process stdin and bounded wire cursor pulls are available; reconnect replay remains client-driven |
 | effects and plans | Implemented with enforcement limits | static derivation, policy tests, plan/apply handlers | planning cannot describe every native-program effect; network allowlists are semantic-only |
 | Leash OS sandbox | Implemented, host-limited | Linux/macOS backend tests, live TCP-denial test, and enforcement reporting | coarse network denial requires Landlock ABI 4+ or Seatbelt; hostname/port allowlists are unavailable |
 | task lifecycle | Implemented, execution-form limited | evaluator jobs and kernel process-control tests | pure evaluator tasks have no independently suspendable OS owner |

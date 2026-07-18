@@ -101,6 +101,14 @@ src = '"hello".len'
 value = "5"
 
 [[case]]
+name = "errcode-truncated-content-ref-display-remains-a-string"
+# Human-facing previews and documentation commonly abbreviate hashes. Only a
+# canonical 64-digit lowercase hash is a resolvable content ref; prefix-shaped
+# prose must retain ordinary string semantics.
+src = '"val:blake3:8baef...".len'
+value = "19"
+
+[[case]]
 name = "errcode-lang-block-unbalanced-braces-is-a-parse-error"
 # site/content/internals/values-streams-execution.md: brace-scanning `sh { … }` that reaches EOF with an unterminated
 # `{` is `lang_block_unbalanced` — surfaced as a PARSE-time diagnostic (the

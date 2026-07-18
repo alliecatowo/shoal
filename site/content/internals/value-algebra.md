@@ -260,7 +260,9 @@ function when round-trip fidelity matters.
 - sizes use decimal SI units with up to two trimmed decimals;
 - durations decompose across weeks through nanoseconds;
 - datetimes render their timestamp; times use `HH:MM` or `HH:MM:SS`;
-- bytes render a size marker; lazy bytes also show their content reference;
+- bytes render a size marker; lazy bytes also show their canonical
+  `val:blake3:` reference (exactly 64 lowercase hexadecimal digits; abbreviated displays remain
+  ordinary strings);
 - records preserve insertion order and quote non-identifier-shaped keys;
 - streams/tasks/functions/commands/secrets render opaque descriptors;
 - outcomes render compact status/signal and `ok`, not captured output.

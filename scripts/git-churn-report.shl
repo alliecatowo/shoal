@@ -1,0 +1,29 @@
+#!/usr/bin/env shoal
+# Rank files by line churn over a caller-selected Git history window.
+
+let since = if (args.is_empty()) { "30 days ago" } else { args.first().str() }
+let history = run("git", "log", "--format=", "--numstat", "--since={since}")
+assert(history.ok, "git log failed: {history.stderr}")
+
+let changes = history.out.str().lines()
+  .map(.words())
+  .where(parts => parts.len() >= 3 && parts[0] != "-" && parts[1] != "-")
+  .map(parts => ({
+    path: parts.skip(2).join(" "),
+    additions: parts[0].parse_int(),
+    deletions: parts[1].parse_int(),
+  }))
+
+let files = changes.group_by(.path).map(group => {
+  let additions = group.values.map(.additions).sum()
+  let deletions = group.values.map(.deletions).sum()
+  {path: group.key, additions: additions, deletions: deletions, churn: additions + deletions}
+}).sort_by(row => -row.churn)
+
+{
+  since: since,
+  changed_files: files.len(),
+  additions: files.map(.additions).sum(),
+  deletions: files.map(.deletions).sum(),
+  hottest_files: files.first(30),
+}

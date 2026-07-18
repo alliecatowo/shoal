@@ -44,3 +44,48 @@ run = "target/debug/shoal -c 'reef lock'"
 description = "Execute every binary help/version contract and validate man pages"
 depends = ["bootstrap:debug"]
 run = "target/debug/shoal scripts/help-audit.shl"
+
+[tasks."audit:docs"]
+description = "Validate every internal documentation link through Shoal"
+depends = ["bootstrap:debug"]
+run = "target/debug/shoal scripts/doc-link-audit.shl"
+
+[tasks."report:workspace"]
+description = "Report crate, source, target, and dependency counts"
+depends = ["bootstrap:debug"]
+run = "target/debug/shoal scripts/workspace-report.shl"
+
+[tasks."report:conformance"]
+description = "Report normative language corpus coverage"
+depends = ["bootstrap:debug"]
+run = "target/debug/shoal scripts/conformance-report.shl"
+
+[tasks."report:dependencies"]
+description = "Report direct dependency edges across workspace crates"
+depends = ["bootstrap:debug"]
+run = "target/debug/shoal scripts/dependency-report.shl"
+
+[tasks."report:disk"]
+description = "Report filesystem capacity and repository disk consumers"
+depends = ["bootstrap:debug"]
+run = "target/debug/shoal scripts/disk-report.shl"
+
+[tasks."report:churn"]
+description = "Report the hottest files in recent Git history"
+depends = ["bootstrap:debug"]
+run = "target/debug/shoal scripts/git-churn-report.shl"
+
+[tasks."report:debt"]
+description = "Inventory explicit TODO/FIXME/HACK debt"
+depends = ["bootstrap:debug"]
+run = "target/debug/shoal scripts/debt-report.shl"
+
+[tasks."report:dashboard"]
+description = "Show a fast operational dashboard for this checkout"
+depends = ["bootstrap:debug"]
+run = "target/debug/shoal scripts/repo-dashboard.shl"
+
+[tasks."release:ready"]
+description = "Run the strict Git/Cargo/Reef/man-page release preflight"
+depends = ["bootstrap:debug"]
+run = "target/debug/shoal scripts/release-readiness.shl --strict"

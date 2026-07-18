@@ -74,12 +74,17 @@ impl CasBytesVal {
     /// `.ref` yields and the in-language dispatch path recognizes (site/content/internals/language-conformance-contract.md).
     pub const REF_PREFIX: &'static str = "val:blake3:";
 
-    /// Parse a `val:blake3:<hash>` content short-ref, returning the bare blake3
-    /// hex on a match. `None` when `s` is not a content ref of this scheme — the
-    /// single place the ref grammar is decoded, mirroring [`Self::reference`]
-    /// (which encodes it), so the wire form and the in-language resolver agree.
+    /// Parse a canonical `val:blake3:<hash>` content short-ref, returning the
+    /// bare 64-digit lowercase blake3 hex on a match. Prefix-shaped prose and
+    /// truncated display refs must remain ordinary strings rather than being
+    /// intercepted by method dispatch.
     pub fn parse_ref(s: &str) -> Option<&str> {
-        s.strip_prefix(Self::REF_PREFIX)
+        let hash = s.strip_prefix(Self::REF_PREFIX)?;
+        (hash.len() == 64
+            && hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+        .then_some(hash)
     }
 
     /// Load the full content from the CAS, mapping any I/O/integrity failure to
@@ -516,18 +521,27 @@ mod tests {
 
     #[test]
     fn content_ref_encode_decode_roundtrip() {
-        // `parse_ref` strips exactly the prefix `reference()` writes.
+        // `parse_ref` accepts exactly the canonical shape `reference()` writes.
         assert_eq!(CasBytesVal::REF_PREFIX, "val:blake3:");
+        let hash = "deadbeef".repeat(8);
         assert_eq!(
-            CasBytesVal::parse_ref("val:blake3:deadbeef"),
-            Some("deadbeef")
+            CasBytesVal::parse_ref(&format!("val:blake3:{hash}")),
+            Some(hash.as_str())
         );
+        let other_hash = "cafef00d".repeat(8);
         assert_eq!(
-            CasBytesVal::parse_ref(&format!("{}cafef00d", CasBytesVal::REF_PREFIX)),
-            Some("cafef00d")
+            CasBytesVal::parse_ref(&format!("{}{other_hash}", CasBytesVal::REF_PREFIX)),
+            Some(other_hash.as_str())
         );
-        // Non-refs (a transcript short-ref, a bare algorithm tag, plain text)
-        // are left alone so ordinary strings keep dispatching string methods.
+        // Truncated displays, prose placeholders, non-canonical case, and
+        // unrelated refs remain strings so their methods cannot spuriously
+        // perform a CAS lookup.
+        assert_eq!(CasBytesVal::parse_ref("val:blake3:8baef..."), None);
+        assert_eq!(CasBytesVal::parse_ref("val:blake3:HASH"), None);
+        assert_eq!(
+            CasBytesVal::parse_ref(&format!("val:blake3:{}", "A".repeat(64))),
+            None
+        );
         assert_eq!(CasBytesVal::parse_ref("out:5"), None);
         assert_eq!(CasBytesVal::parse_ref("blake3:deadbeef"), None);
         assert_eq!(CasBytesVal::parse_ref("val:blake2:deadbeef"), None);
