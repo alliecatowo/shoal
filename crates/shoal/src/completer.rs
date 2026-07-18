@@ -24,15 +24,17 @@ use shoal_value::Env;
 mod candidates;
 mod context;
 mod discovery;
+mod filesystem;
 mod inference;
+mod matching;
 
 use candidates::finish;
-#[cfg(test)]
-use candidates::subsequence_match;
 use context::{Ctx, classify};
 #[cfg(test)]
 use discovery::{MAX_PATH_CACHE_DIRS, PATH_CACHE_REVALIDATE};
 use discovery::{PathDiscovery, adapter_names};
+#[cfg(test)]
+use matching::subsequence_match;
 
 pub struct ShoalCompleter {
     env: Env,
@@ -645,6 +647,35 @@ mod tests {
     }
 
     #[test]
+    fn misspelled_directory_completion_replaces_the_argument_and_descends() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("example")).unwrap();
+        fs::write(dir.path().join("example/inside.txt"), b"").unwrap();
+        let mut completer = completer_at(dir.path());
+        let line = "ls exampel";
+        let suggestion = completer
+            .complete(line, line.len())
+            .into_iter()
+            .find(|suggestion| suggestion.value == "example/")
+            .expect("adjacent transposition should find the directory");
+        assert_eq!(suggestion.span.start, 3);
+        assert_eq!(suggestion.span.end, line.len());
+        assert!(!suggestion.append_whitespace);
+
+        let completed = format!(
+            "{}{}{}",
+            &line[..suggestion.span.start],
+            suggestion.value,
+            &line[suggestion.span.end..]
+        );
+        assert_eq!(completed, "ls example/");
+        assert_eq!(
+            cands(&mut completer, &completed),
+            vec!["example/inside.txt".to_string()]
+        );
+    }
+
+    #[test]
     fn fs_candidates_hide_dotfiles_unless_prefix_asks() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join(".hidden"), b"").unwrap();
@@ -882,7 +913,7 @@ params = { adapter_only = "bool" }
 
     /// `completion.max_results` caps the candidate list (site/content/internals/configuration-reference.md).
     #[test]
-    fn max_results_caps_the_candidate_list() {
+    fn max_results_bounds_discovery_before_reedline_assembly() {
         let dir = tempfile::tempdir().unwrap();
         for i in 0..10 {
             fs::write(dir.path().join(format!("file{i}.txt")), b"").unwrap();
@@ -895,7 +926,11 @@ params = { adapter_only = "bool" }
         )
         .configure(true, true, 3);
         let names = c.fs_candidates("");
-        assert_eq!(names.len(), 10, "fs_candidates itself is uncapped");
+        assert_eq!(
+            names.len(),
+            3,
+            "live filesystem discovery must not materialize beyond the configured result cap"
+        );
         let suggestions = finish(names, 0, 0, 3);
         assert_eq!(suggestions.len(), 3, "finish() truncates to max_results");
     }
@@ -910,7 +945,9 @@ params = { adapter_only = "bool" }
         let candidates = include_str!("completer/candidates.rs");
         let context = include_str!("completer/context.rs");
         let discovery = include_str!("completer/discovery.rs");
+        let filesystem = include_str!("completer/filesystem.rs");
         let inference = include_str!("completer/inference.rs");
+        let matching = include_str!("completer/matching.rs");
 
         assert!(
             production_root.lines().count() <= 180,
@@ -919,7 +956,9 @@ params = { adapter_only = "bool" }
         assert!(candidates.lines().count() <= 220);
         assert!(context.lines().count() <= 190);
         assert!(discovery.lines().count() <= 230);
+        assert!(filesystem.lines().count() <= 140);
         assert!(inference.lines().count() <= 150);
+        assert!(matching.lines().count() <= 100);
 
         for forbidden in [
             "fs::read_dir",

@@ -1,4 +1,4 @@
-//! Bounded executable discovery and live filesystem candidate scans.
+//! Bounded executable discovery from the executing session's PATH.
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
@@ -12,6 +12,12 @@ use std::time::{Duration, Instant, SystemTime};
 pub(super) const PATH_CACHE_REVALIDATE: Duration = Duration::from_millis(200);
 /// Bound retained keys when a session repeatedly replaces its PATH.
 pub(super) const MAX_PATH_CACHE_DIRS: usize = 64;
+/// Completion is advisory, but a single keystroke must not enumerate or
+/// retain an attacker-sized directory before the configured result cap is
+/// applied.
+pub(super) const MAX_COMPLETION_SCAN_ENTRIES: usize = 4_096;
+pub(super) const MAX_COMPLETION_RETAINED_BYTES: usize = 4 * 1024 * 1024;
+const MAX_PATH_REQUEST_SCAN_ENTRIES: usize = 16_384;
 
 struct PathCacheEntry {
     dir_mtime: Option<SystemTime>,
@@ -36,8 +42,16 @@ impl PathDiscovery {
         self.session_dirs = Some(dirs);
     }
 
-    pub(super) fn path_names(&mut self, cwd: &Path) -> Vec<String> {
-        let mut out = Vec::new();
+    pub(super) fn path_names(
+        &mut self,
+        cwd: &Path,
+        prefix: &str,
+        max_results: usize,
+        mut matches: impl FnMut(&str, &str) -> bool,
+    ) -> Vec<String> {
+        let mut out = BTreeSet::new();
+        let mut retained_bytes = 0usize;
+        let mut visited_names = 0usize;
         let configured = self
             .session_dirs
             .as_ref()
@@ -46,7 +60,7 @@ impl PathDiscovery {
             dirs
         } else {
             let Some(path_var) = std::env::var_os("PATH") else {
-                return out;
+                return out.into_iter().collect();
             };
             std::env::split_paths(&path_var)
                 .map(|dir| {
@@ -56,12 +70,35 @@ impl PathDiscovery {
                         cwd.join(dir)
                     }
                 })
+                .take(MAX_PATH_CACHE_DIRS)
                 .collect()
         };
-        for dir in dirs {
-            out.extend(self.path_dir_names(&dir));
+        for dir in dirs.into_iter().take(MAX_PATH_CACHE_DIRS) {
+            for name in self.path_dir_names(&dir) {
+                if visited_names >= MAX_PATH_REQUEST_SCAN_ENTRIES {
+                    return out.into_iter().collect();
+                }
+                visited_names += 1;
+                if !matches(&name, prefix) {
+                    continue;
+                }
+                let Some(next) = retained_bytes.checked_add(name.len()) else {
+                    return out.into_iter().collect();
+                };
+                if next > MAX_COMPLETION_RETAINED_BYTES {
+                    return out.into_iter().collect();
+                }
+                if out.insert(name) {
+                    retained_bytes = next;
+                }
+                if out.len() > max_results
+                    && let Some(removed) = out.pop_last()
+                {
+                    retained_bytes = retained_bytes.saturating_sub(removed.len());
+                }
+            }
         }
-        out
+        out.into_iter().collect()
     }
 
     pub(super) fn path_dir_names(&mut self, dir: &Path) -> Vec<String> {
@@ -76,12 +113,21 @@ impl PathDiscovery {
         };
         if stale {
             let mut names = Vec::new();
+            let mut retained_bytes = 0usize;
             if let Ok(entries) = fs::read_dir(dir) {
-                for entry in entries.flatten().take(4000) {
+                for entry in entries.take(MAX_COMPLETION_SCAN_ENTRIES) {
+                    let Ok(entry) = entry else { continue };
                     let executable = entry.metadata().is_ok_and(|metadata| {
                         metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
                     });
                     if executable && let Some(name) = entry.file_name().to_str() {
+                        let Some(next) = retained_bytes.checked_add(name.len()) else {
+                            break;
+                        };
+                        if next > MAX_COMPLETION_RETAINED_BYTES {
+                            break;
+                        }
+                        retained_bytes = next;
                         names.push(name.to_string());
                     }
                 }
@@ -111,62 +157,6 @@ impl PathDiscovery {
     #[cfg(test)]
     pub(super) fn cache_contains(&self, dir: &Path) -> bool {
         self.cache.contains_key(dir)
-    }
-}
-
-/// Scan one command-argument directory fresh. Filesystem completion is live;
-/// only executable PATH scans retain bounded advisory state.
-pub(super) fn filesystem_candidates(
-    cwd: &Path,
-    word: &str,
-    mut matches: impl FnMut(&str, &str) -> bool,
-) -> Vec<String> {
-    let (dir_part, file_prefix) = split_dir_prefix(word);
-    let base_dir = resolve_dir(cwd, &dir_part);
-    let mut out = Vec::new();
-    let Ok(entries) = fs::read_dir(base_dir) else {
-        return out;
-    };
-    let show_hidden = file_prefix.starts_with('.');
-    for entry in entries.flatten() {
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        if (!show_hidden && name.starts_with('.')) || !matches(&name, &file_prefix) {
-            continue;
-        }
-        let mut value = format!("{dir_part}{name}");
-        if entry.path().is_dir() {
-            value.push('/');
-        }
-        out.push(value);
-    }
-    out
-}
-
-fn split_dir_prefix(word: &str) -> (String, String) {
-    match word.rfind('/') {
-        Some(index) => (word[..=index].to_string(), word[index + 1..].to_string()),
-        None => (String::new(), word.to_string()),
-    }
-}
-
-fn resolve_dir(cwd: &Path, dir_part: &str) -> PathBuf {
-    if dir_part.is_empty() {
-        return cwd.to_path_buf();
-    }
-    let expanded = if let Some(tail) = dir_part.strip_prefix("~/") {
-        match std::env::var_os("HOME") {
-            Some(home) => PathBuf::from(home).join(tail),
-            None => PathBuf::from(dir_part),
-        }
-    } else {
-        PathBuf::from(dir_part)
-    };
-    if expanded.is_absolute() {
-        expanded
-    } else {
-        cwd.join(expanded)
     }
 }
 

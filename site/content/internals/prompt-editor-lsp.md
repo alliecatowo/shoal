@@ -434,9 +434,14 @@ conversion pairs; exact arity and value constraints still belong to executable d
 
 ### Matching and result shaping
 
-With fuzzy mode enabled, matching is a case-sensitive or folded non-contiguous subsequence test—not
-edit-distance typo correction. Results sort lexically, deduplicate, truncate to `max_results`, and
-replace exactly the detected word span. A directory suggestion suppresses appended whitespace.
+With fuzzy mode enabled, matching accepts a case-sensitive or folded non-contiguous subsequence and
+one adjacent transposition (for example, `exampel` → `example`). It does not run a general
+edit-distance search on every repaint. Results sort lexically, deduplicate, and are admitted to
+`max_results` during discovery rather than materialized and truncated afterward. One completion
+request scans at most 4,096 argument-directory entries and retains at most 4 MiB of candidate text;
+PATH discovery also caps directories, executable names, and retained text. A suggestion replaces
+exactly the detected word span. Directory suggestions retain `/`, suppress appended whitespace, and
+offer their children on the next completion request.
 
 When `completion.menu = false`, Reedline quick and partial completion are enabled. Multiple
 candidates with no common prefix can still cause a popup because Reedline has no separate completer

@@ -77,6 +77,12 @@ bracketed_paste = true
 
 When `completion.menu = false`, the current line-editor integration approximates menu-free completion by inserting unique matches or a shared prefix. If several candidates have no common prefix, the popup can still appear because the editor has no separate cycle-only completion path.
 
+Fuzzy matching accepts non-contiguous subsequences and one adjacent transposition, so a directory
+typed as `exampel` can complete to `example/`. The selected value replaces the current argument; it
+is never appended as a second argument. Directories do not gain a trailing space, and another Tab
+continues completion inside them. Discovery applies `max_results` incrementally and bounds each live
+directory scan to 4,096 entries / 4 MiB of retained candidate text.
+
 ### Custom keybindings
 
 Keybindings map a chord string to a curated action name:

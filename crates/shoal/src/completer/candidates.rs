@@ -11,13 +11,20 @@ use shoal_syntax::lexer::RESERVED;
 use shoal_value::{Value, method_names, methods_for};
 
 use super::ShoalCompleter;
-use super::discovery::filesystem_candidates;
+use super::filesystem::filesystem_candidates;
+use super::matching::candidate_matches as matches_candidate;
 
 impl ShoalCompleter {
     /// Live executable names from the executing session's PATH projection.
+    #[cfg(test)]
     pub(super) fn path_names(&mut self) -> Vec<String> {
         let cwd = self.cwd();
-        self.discovery.path_names(&cwd)
+        let fuzzy = self.fuzzy;
+        let case_insensitive = self.case_insensitive;
+        self.discovery
+            .path_names(&cwd, "", self.max_results, move |name, prefix| {
+                matches_candidate(name, prefix, fuzzy, case_insensitive)
+            })
     }
 
     #[cfg(test)]
@@ -49,22 +56,7 @@ impl ShoalCompleter {
     }
 
     pub(super) fn candidate_matches(&self, name: &str, prefix: &str) -> bool {
-        if prefix.is_empty() {
-            return true;
-        }
-        if self.case_insensitive {
-            let name = name.to_lowercase();
-            let prefix = prefix.to_lowercase();
-            if self.fuzzy {
-                subsequence_match(&name, &prefix)
-            } else {
-                name.starts_with(&prefix)
-            }
-        } else if self.fuzzy {
-            subsequence_match(name, prefix)
-        } else {
-            name.starts_with(prefix)
-        }
+        matches_candidate(name, prefix, self.fuzzy, self.case_insensitive)
     }
 
     pub(super) fn head_candidates(&mut self, prefix: &str) -> Vec<String> {
@@ -77,7 +69,15 @@ impl ShoalCompleter {
             }
         }
         names.extend(self.adapter_names.iter().cloned());
-        names.extend(self.path_names());
+        let cwd = self.cwd();
+        let fuzzy = self.fuzzy;
+        let case_insensitive = self.case_insensitive;
+        names.extend(self.discovery.path_names(
+            &cwd,
+            prefix,
+            self.max_results,
+            move |name, prefix| matches_candidate(name, prefix, fuzzy, case_insensitive),
+        ));
         names.retain(|name| self.candidate_matches(name, prefix));
         names.into_iter().collect()
     }
@@ -125,7 +125,7 @@ impl ShoalCompleter {
 
     pub(super) fn fs_candidates(&self, word: &str) -> Vec<String> {
         let cwd = self.cwd();
-        filesystem_candidates(&cwd, word, |name, prefix| {
+        filesystem_candidates(&cwd, word, self.max_results, |name, prefix| {
             self.candidate_matches(name, prefix)
         })
     }
@@ -146,13 +146,6 @@ fn extend_adapter_flags(names: &mut BTreeSet<String>, adapter: &CmdAdapter) {
             names.insert(format!("-{short}"));
         }
     }
-}
-
-pub(super) fn subsequence_match(haystack: &str, needle: &str) -> bool {
-    let mut chars = haystack.chars();
-    needle
-        .chars()
-        .all(|needle| chars.any(|item| item == needle))
 }
 
 /// Sort, deduplicate, cap, and convert candidates into Reedline suggestions.
