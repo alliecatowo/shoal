@@ -143,14 +143,18 @@ The corpus is broad executable language coverage, not a security proof. Kernel/M
 
 The first deep-audit P0s are now closed in code and covered by adversarial tests:
 
-- `journal.query` requires attachment, is principal+Session scoped, and has a hard page cap;
+- `journal.query` requires attachment plus `JournalRead`, is principal+Session scoped, and has a hard page cap;
 - `cap.request` requires an authenticated approver, denies self-approval by default, durably audits the immutable grant binding, and grants one-shot state;
 - plan references carry a full source/AST/effects/Session/principal digest plus a unique object suffix, so same-shape or identical repeated plans cannot overwrite one another;
 - every production child evaluator is created through one audited context that propagates principal, policy, Reef, filesystem, and cancellation state;
 - public sockets reject asserted local-human authority and default tokenless clients to restricted `agent:mcp`; only the server-selected anonymous private REPL transport is a human trust root;
 - evaluator Sessions and their refs/tasks/PTYS/quotas are keyed by principal plus visible Session name.
 
-These changes do not make one kernel process a hard multi-tenant boundary. Same-process principals still share global resources and persisted state files, public transport has no `SO_PEERCRED` binding, tokens load at startup, and arbitrary native code is only constrained along dimensions the OS backend actually enforces. Use separate OS users/processes/state roots for mutually hostile tenants.
+These changes do not make one kernel process a hard multi-tenant boundary. Same-process principals
+still share global resources and persisted state files, public transport has no `SO_PEERCRED`
+binding, and arbitrary native code is only constrained along dimensions the OS backend actually
+enforces. Bearers are revalidated against the durable store before every attached request. Use
+separate OS users/processes/state roots for mutually hostile tenants.
 
 Full impact/mitigation: [Security and trust boundaries](@/docs/security.md).
 

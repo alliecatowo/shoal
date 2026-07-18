@@ -334,7 +334,11 @@ Exact current behavior:
 
 ## Journal query boundary
 
-`journal.query` requires an attachment, caps each page server-side, treats `limit:0` as an empty page, and forces principal/Session filters to the exact attached owner. An unattached or cross-principal query is rejected. Journal rows and CAS remain sensitive persisted data, so filesystem/state-directory permissions and bearer handling still matter.
+`journal.query` requires an attachment and an allowed `JournalRead` policy effect before decoding
+filters. It caps each page server-side, treats `limit:0` as an empty page, and forces
+principal/Session filters to the exact attached owner. An ungranted, unattached, or cross-principal
+query is rejected. Journal rows and CAS remain sensitive persisted data, so
+filesystem/state-directory permissions and bearer handling still matter.
 
 ## Named sessions are principal-private
 
@@ -484,7 +488,7 @@ Connections, retained principal Sessions, active tasks, PTYs (per Session/princi
 Before describing Shoal as safe for mutually untrusted agents, the remaining minimum work is:
 
 1. add optional peer-credential binding beyond the current public machine-only attach contract;
-2. decide and enforce explicit `JournalRead` policy beyond exact-owner scoping;
+2. align separately addressed output/CAS and durable replay reads with explicit journal policy;
 3. add stronger network/process/CPU/memory enforcement while preserving per-dimension truth;
 4. add a portable OS-keyring backend only with explicit migration and unavailable-backend behavior;
 5. extend adversarial multi-principal, fault-injection, and long-duration lifecycle testing.

@@ -310,7 +310,9 @@ events.read     events.publish
 events.subscribe events.unsubscribe
 ```
 
-`journal.query` and `cap.request` currently lack the required attachment gate; treat that as a security defect, not a pre-auth API. See [Kernel method index](@/docs/kernel-protocol.md#method-index).
+`journal.query` and `cap.request` require attachment. Journal query additionally requires the
+attached principal's `JournalRead` policy grant before filter decoding; capability approval requires
+an authorized approver. See [Kernel method index](@/docs/kernel-protocol.md#method-index).
 
 ## Short-reference inventory
 

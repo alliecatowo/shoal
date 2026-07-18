@@ -77,10 +77,10 @@ Include malformed params tests so decoding cannot occur before the authorization
 
 ### Authorize journal reads
 
-Attachment alone is insufficient. `journal.query` must enforce `JournalRead` and define scope:
+The direct query baseline is implemented: `journal.query` checks attachment and `JournalRead`
+before decoding filters, then forces the attached principal-private Session and caps the page.
+Remaining work is to define broader administration and align adjacent read surfaces:
 
-- a principal's own coarse entries;
-- the attachment's principal-private Session entries;
 - supervisor/admin cross-principal query through a distinct grant;
 - output/CAS access aligned with the same policy.
 

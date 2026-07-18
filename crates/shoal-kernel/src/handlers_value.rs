@@ -355,6 +355,21 @@ impl Kernel {
         // the exact attached owner; a caller cannot widen the query by naming
         // another principal in the optional filter.
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
+        if self
+            .policy
+            .evaluate_effect(&attachment.principal, &Effect::JournalRead)
+            != Verdict::Allow
+        {
+            return Err(RpcError {
+                code: LEASH_DENIED,
+                message: "journal read is not granted for the attached principal".into(),
+                data: Some(json!({
+                    "effect": "journal.read",
+                    "principal": attachment.principal,
+                    "session": attachment.session.id,
+                })),
+            });
+        }
         let p: JournalQueryParams = decode(params)?;
         if p.principal
             .as_ref()

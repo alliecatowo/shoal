@@ -472,7 +472,8 @@ There is no PTY-change subscription; clients poll `pty.read` and inspect `change
 
 ## Journal query
 
-`journal.query` **requires attachment** and accepts `{since,until,principal,head,ok,effects,limit}`.
+`journal.query` **requires attachment and an allowed `JournalRead` effect** before its parameters
+are decoded. It accepts `{since,until,principal,head,ok,effects,limit}`.
 Timestamps are Unix epoch nanoseconds. Store-side filters are since/principal/head/ok/limit; the
 kernel then post-filters `until` and requires every requested effect substring after dotted/snake
 normalization.
@@ -494,8 +495,8 @@ Rows are newest-first and contain ID, session, principal, timestamp/duration, lo
 parsed AST/effects, status/ok/opaque, and output `{kind,hash,len}` entries. Output content is fetched
 separately through blob/value routes.
 
-Attachment is required and the kernel forces the exact attached principal and session into the
-journal query. A caller-provided principal filter can narrow but cannot widen that owner boundary;
+The kernel forces the exact policy-authorized attached principal and session into the journal query.
+A caller-provided principal filter can narrow but cannot widen that owner boundary;
 another principal choosing the same visible session name sees a distinct private session and rows.
 `until`/effects post-filter **after** the store limit,
 so a request can return fewer than its limit even when older matching rows exist. Effect matching uses

@@ -5141,7 +5141,7 @@ fn cap_request_cross_principal_approval_binds_the_full_record() {
     // approval_required), and alpha's effects must not be a hard Deny (ask,
     // not deny) so approval can lift it.
     let policy = Policy::from_toml(
-        "[principal.\"agent:alpha\"]\nopaque='ask'\nauto_apply='never'\n\n\
+        "[principal.\"agent:alpha\"]\nopaque='ask'\nauto_apply='never'\njournal_read=true\n\n\
              [principal.\"agent:beta\"]\nopaque='ask'\nauto_apply='never'\n",
     )
     .unwrap();
@@ -5359,6 +5359,43 @@ fn complete_and_explain_methods() {
     // agree with `shoal_plan`'s answer here.
     assert_eq!(ex["reversibility"], "reversible");
     assert!(ex["ast"].is_object() || ex["ast"].is_array() || ex["ast"]["stmts"].is_array());
+    drop(client);
+    drop(reader);
+    thread.join().unwrap();
+}
+
+#[test]
+fn journal_query_requires_policy_before_decoding_filters() {
+    let policy = Policy::from_toml(&format!(
+        "[principal.\"{}\"]\nopaque='allow'\njournal_read=false\n",
+        principal()
+    ))
+    .unwrap();
+    let kernel = Kernel::with_policy(policy);
+    let (mut client, mut reader, thread) = spawn(&kernel);
+    let attached = call(
+        &mut client,
+        &mut reader,
+        1,
+        "session.attach",
+        json!({"local_auth":"local-human","client":{"kind":"test","tty":false}}),
+    );
+    assert!(attached.error.is_none(), "{attached:?}");
+
+    // Authorization precedes parameter decoding: a denied caller learns
+    // neither the journal schema nor whether any rows exist.
+    let denied = call(
+        &mut client,
+        &mut reader,
+        2,
+        "journal.query",
+        Json::String("deliberately-invalid-params".into()),
+    )
+    .error
+    .expect("JournalRead=false must fail closed");
+    assert_eq!(denied.code, LEASH_DENIED);
+    assert_eq!(denied.data.unwrap()["effect"], "journal.read");
+
     drop(client);
     drop(reader);
     thread.join().unwrap();

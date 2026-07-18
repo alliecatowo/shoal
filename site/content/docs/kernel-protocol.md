@@ -497,6 +497,10 @@ Strings and object `kind` fields are normalized. When a nonempty requested set d
 
 Returns entries containing ID, session, principal, nanosecond timestamp/duration, encoded cwd, original source, AST, effect data, status/ok/opaque, and output descriptors `{kind, hash, len}`.
 
+The handler checks attachment and the principal's `JournalRead` policy before decoding filters. A
+missing grant returns `LEASH_DENIED`; a caller therefore cannot use malformed filters to probe the
+journal schema or existence of rows.
+
 `effects` uses all-of matching after normalizing dotted/snake-case names. `until` and effects are post-filters applied after the store query and its limit, so a tight limit can yield fewer results than requested even when older matching rows exist.
 
 Attachment is mandatory. The kernel overwrites the query's principal/session filters with the exact

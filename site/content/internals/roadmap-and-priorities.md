@@ -113,21 +113,23 @@ Building it before those contracts would multiply later migration work.
 
 ### P0.0 Authenticate approval and journal reads; fix plan identity — baseline complete
 
-**Resolved baseline.** `cap.request` and `journal.query` now require attachments. Journal pages are
-hard-capped and exact-owner scoped. Approval requires a distinct authorized approver by default,
+**Resolved baseline.** `cap.request` and `journal.query` require attachments; journal authorization
+also requires the attached principal's explicit `JournalRead` policy grant before query decoding.
+Journal pages are hard-capped and exact-owner scoped. Approval requires a distinct authorized approver by default,
 binds requester/approver/source/plan/Session/scope into a durable audit row, and is consumed once.
 Plan refs use a full caller/content-bound digest plus a unique object suffix, so equal-effect and
 identical repeated plans cannot overwrite one another. Public tokenless clients are restricted and
 cannot assert local-human presence.
 
 **Remaining design.** Centralize method attachment classes so new handlers cannot regress; add
-optional peer-credential/mandatory-bearer modes and richer `JournalRead` policy. Continue to evolve
-approver routing, expiration/reason metadata, and cross-principal journal grants without weakening
-the existing exact-owner default.
+optional peer-credential/mandatory-bearer modes. Continue to evolve approver routing,
+expiration/reason metadata, cross-principal journal grants, and policy alignment for separately
+addressed output/CAS/event-replay surfaces without weakening the existing exact-owner default.
 
 **Acceptance tests.** Through raw kernel connections and MCP:
 
 - unattached `cap.request` and `journal.query` return `NOT_ATTACHED`;
+- an attachment without `JournalRead` cannot decode a query or read rows;
 - an attached non-approver cannot approve another principal's plan or query its rows;
 - an authorized supervisor can approve only the exact allowed owner/session/effect/source record;
 - two principals and two sources with identical effect sets receive independent stored plan IDs;
