@@ -481,7 +481,12 @@ p.parent.join("lib.rs")
 p.read.lines()
 ```
 
-Relative filesystem methods resolve against the session cwd. `read` and `lines` use strict UTF-8 and raise `utf8_error`; `read_bytes` does not. `exists`/`is_dir`/`is_file` convert metadata errors to false, while `size` raises. `modified` may return null when the timestamp cannot be represented.
+Relative filesystem methods resolve against the session cwd. `read` and `read_bytes` stop at 16 MiB;
+`lines` reads incrementally and stops at 16 MiB of input, 16,384 lines, or 16 MiB of retained line
+values. Crossing any eager-read wall raises `path_read_limit` with a `.stream()`/`head` hint rather
+than partially returning data. `read` and `lines` use strict UTF-8 and raise `utf8_error`;
+`read_bytes` does not. `exists`/`is_dir`/`is_file` convert metadata errors to false, while `size`
+raises. `modified` may return null when the timestamp cannot be represented.
 
 A bare path is not feedable because it denotes a name, not contents:
 

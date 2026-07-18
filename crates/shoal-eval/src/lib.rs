@@ -18,6 +18,7 @@ mod host_services;
 mod journal;
 mod modules;
 mod namespaces;
+mod path_access;
 mod pattern;
 mod plan;
 mod plan_derive;

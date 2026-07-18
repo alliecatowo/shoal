@@ -218,6 +218,11 @@ vector across fork cursors instead of multiplying the full allocation. String co
 `string_materialization_limit`; replacement capture expansion is written directly into the bounded
 destination rather than creating an unchecked intermediate.
 
+Filesystem-backed path accessors have their own eager-read boundary. `.read` and `.read_bytes` use
+the injected streaming filesystem port and a 16 MiB plus-one sentinel. `.lines` additionally admits
+at most 16,384 lines and 16 MiB of retained line values while reading. Overflow is
+`path_read_limit`; `.stream()` and `head` remain the incremental/bounded alternatives.
+
 Structured builtins apply a separate transient result boundary before ordinary outcome wrapping or
 lexical binding. Eager results stop at 16,384 values / 16 MiB retained state with
 `builtin_output_limit`. `ls` bounds production directory iteration, `cat` reads against the

@@ -605,11 +605,11 @@ fn production_evaluator_has_only_explicit_ambient_filesystem_exceptions() {
             text: "if metadata.is_dir() {",
         },
         ExpectedLine {
-            file: "expr_access.rs",
+            file: "path_access.rs",
             text: ".map(|m| m.is_dir())",
         },
         ExpectedLine {
-            file: "expr_access.rs",
+            file: "path_access.rs",
             text: ".map(|m| m.is_file())",
         },
         ExpectedLine {

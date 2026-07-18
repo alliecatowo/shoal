@@ -1814,6 +1814,35 @@ fn path_filesystem_methods_read_lines_and_metadata() {
 }
 
 #[test]
+fn oversized_sparse_path_read_is_typed_and_the_evaluator_recovers() {
+    let directory = tempfile::tempdir().unwrap();
+    let file = std::fs::File::create(directory.path().join("sparse.bin")).unwrap();
+    file.set_len((crate::path_access::MAX_PATH_READ_BYTES + 1) as u64)
+        .unwrap();
+    drop(file);
+
+    let mut evaluator = Evaluator::new(directory.path().to_path_buf());
+    let read = shoal_syntax::parse(r#"path("sparse.bin").read()"#).unwrap();
+    let error = evaluator.eval_program(&read).unwrap_err();
+    assert_eq!(error.code, "path_read_limit");
+    assert!(error.msg.contains("sparse.bin"));
+    assert!(
+        error
+            .hint
+            .as_deref()
+            .is_some_and(|hint| hint.contains("stream"))
+    );
+
+    assert_eq!(
+        evaluator
+            .eval_program(&shoal_syntax::parse("40 + 2").unwrap())
+            .unwrap(),
+        Value::Int(42),
+        "rejecting an oversized eager read must leave the evaluator usable"
+    );
+}
+
+#[test]
 fn path_pure_component_methods() {
     // Pure component accessors need no filesystem.
     assert_eq!(
