@@ -27,7 +27,9 @@ pub(crate) fn stream_method(
             f => s.take_until_pred(f.clone()).map(stream),
         },
         "dedupe" => no_args(&args).and_then(|_| s.dedupe()).map(stream),
-        "distinct" => no_args(&args).and_then(|_| s.distinct()).map(stream),
+        "distinct" => distinct_limit(&args)
+            .and_then(|limit| s.distinct_bounded(limit))
+            .map(stream),
         "debounce" => s.debounce(dur_arg(&args, 0)?).map(stream),
         "throttle" => s.throttle(dur_arg(&args, 0)?).map(stream),
         "window" => match arg(&args, 0)? {
@@ -147,5 +149,24 @@ fn dur_arg(args: &CallArgs, n: usize) -> VResult<std::time::Duration> {
     match args.pos.get(n) {
         Some(Value::Duration(ns)) if *ns >= 0 => Ok(std::time::Duration::from_nanos(*ns as u64)),
         _ => Err(ErrorVal::arg_error("expected a non-negative duration")),
+    }
+}
+
+fn distinct_limit(args: &CallArgs) -> VResult<usize> {
+    if !args.named.is_empty() || args.pos.len() > 1 {
+        return Err(ErrorVal::arg_error(
+            "distinct accepts at most one positional history limit",
+        ));
+    }
+    match args.pos.first() {
+        None => Ok(StreamVal::DISTINCT_MAX_VALUES),
+        Some(Value::Int(limit)) if *limit > 0 => {
+            usize::try_from(*limit).map_err(|_| ErrorVal::arg_error("distinct limit is too large"))
+        }
+        Some(Value::Int(_)) => Err(ErrorVal::arg_error("distinct limit must be positive")),
+        Some(value) => Err(ErrorVal::type_error(format!(
+            "distinct limit must be int, found {}",
+            value.type_name()
+        ))),
     }
 }

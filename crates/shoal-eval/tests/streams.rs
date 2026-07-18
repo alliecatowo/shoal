@@ -147,6 +147,11 @@ fn dedupe_and_distinct() {
         "[1, [2]]",
         "distinct must preserve mixed numeric equality recursively"
     );
+    assert_eq!(
+        run_err("[1,1,2,3].stream().distinct(2).collect()"),
+        "stream_distinct_limit"
+    );
+    assert_eq!(run_err("[1].stream().distinct(0).collect()"), "arg_error");
 }
 
 #[test]

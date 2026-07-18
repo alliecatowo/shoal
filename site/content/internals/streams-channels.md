@@ -242,7 +242,7 @@ length shrinks; rename/replacement behavior beyond that depends on platform `not
 | `take_until(predicate)` | consumes triggering item and ends without emitting it |
 | `take_until(stream)` | polls signal stream and primary source in 20 ms steps |
 | `dedupe` | stores last emitted item; removes adjacent equality duplicates |
-| `distinct` | hashes into equality-compatible buckets, then verifies with `Value` equality |
+| `distinct` | hashes into equality-compatible buckets, verifies with `Value` equality, and fails typed at its identity/byte history bounds |
 | `debounce(duration)` | retains latest pending value until quiet deadline |
 | `throttle(duration)` | emits first and drops items inside interval |
 | `window(count)` | sliding deque; emits only once full, then every item |
@@ -255,9 +255,10 @@ length shrinks; rename/replacement behavior beyond that depends on platform `not
 `flat_map` is concat-map, not concurrent merge: an endless returned substream prevents the next
 outer item from being pulled. `distinct` preserves `Value` equality across representations such as
 `1`/`1.0`, path/string, and table/list-of-records by using an equality-compatible semantic hash and
-confirming candidates within each bucket. Its membership checks are amortized O(1), but exact
-history still grows with the number of distinct values on an unbounded stream. `window(duration)`
-is bounded only by event rate inside the duration.
+confirming candidates within each bucket. Its membership checks are amortized O(1). Exact history
+retains at most the requested/default 4,096 identities and 16 MiB of measured values; reaching
+either bound raises `stream_distinct_limit` instead of evicting and violating distinctness.
+`window(duration)` is bounded only by event rate inside the duration.
 
 `.buffer(n)` consumes its input and starts a child evaluator on a producer thread. The channel has
 exactly `n` slots; the producer can additionally hold the item it is currently trying to enqueue.

@@ -282,14 +282,17 @@ Acceptance:
 - Include runner path/version/hash in plan and Reef/Leash checks.
 - Test shebang, extension, executable bit, spaces/non-UTF-8 paths, and project adapters.
 
-### Make method metadata authoritative
+### Keep method metadata and dispatch aligned
 
-Generate dispatch, completion, docs inventory, receiver validation, arity, and signatures from one registry—or test the registry exhaustively against dispatch. Fix current table/range `get` false positives and bool string/display omissions.
+The known table/range `.get()` and boolean conversion drift is fixed and covered by owning
+behavioral fixtures. The remaining evolution path is to generate richer signature/arity metadata
+from one registry, or add a bidirectional executable fixture for every advertised receiver-method
+pair as the surface grows.
 
 ### Stream semantics
 
 - Decide whether `buffer(n)` remains a documented synchronous no-op or becomes real bounded prefetch.
-- Add an explicitly bounded distinct variant (`distinct(max:)` or eviction policy).
+- Keep exact `distinct(max_values)` limits and retained-byte accounting aligned with the session resource model.
 - Make live overflow marker types part of a stable schema.
 - Expose stream chunks over kernel protocol with cancellation/backpressure.
 - Add deterministic virtual-clock/filesystem tests for live operators.
@@ -443,7 +446,7 @@ These happen alongside priority waves:
 
 ### Conformance growth
 
-The current 1,355 cases exceed the original 1,000-case target, but every bug fix/feature needs a minimal regression. Focus new cases on:
+The current 1,357 cases exceed the original 1,000-case target, but every bug fix/feature needs a minimal regression. Focus new cases on:
 
 - precedence and command-resolution collisions;
 - error spans/hints and method receiver boundaries;

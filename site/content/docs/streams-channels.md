@@ -110,7 +110,7 @@ Current stream-specific combinators are:
 | `take(n)` | stop after `n`; makes the stream bounded |
 | `take_until(f_or_stream)` | stop when predicate triggers or another stream produces |
 | `dedupe()` | drop adjacent duplicates |
-| `distinct()` | hash and drop all previously seen equal values; history can grow |
+| `distinct(limit?)` | hash and drop all previously seen equal values; default 4,096, fail typed at the caller/default identity limit or 16 MiB retained history |
 | `debounce(duration)` | emit after quiet interval |
 | `throttle(duration)` | rate-limit emissions |
 | `window(count_or_duration)` | collect count/time windows |

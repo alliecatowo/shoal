@@ -226,6 +226,11 @@ impl std::fmt::Debug for StreamVal {
 }
 
 impl StreamVal {
+    /// Hard admission ceiling for exact distinct history. Exactness requires
+    /// retaining every previously observed identity, so live streams must fail
+    /// explicitly at a bound rather than evicting and re-emitting old values.
+    pub const DISTINCT_MAX_VALUES: usize = 4_096;
+    const DISTINCT_MAX_RETAINED_BYTES: usize = 16 * 1024 * 1024;
     /// Build a stream from an in-memory / lazy iterator (a bounded source).
     pub fn from_iter<I>(label: impl Into<String>, iter: I) -> StreamVal
     where
@@ -386,11 +391,24 @@ impl StreamVal {
         self.wrap(l, b, |up| Box::new(ops::Dedupe { up, last: None }))
     }
     pub fn distinct(self) -> VResult<StreamVal> {
+        self.distinct_bounded(Self::DISTINCT_MAX_VALUES)
+    }
+    pub fn distinct_bounded(self, max_values: usize) -> VResult<StreamVal> {
+        if max_values == 0 || max_values > Self::DISTINCT_MAX_VALUES {
+            return Err(ErrorVal::arg_error(format!(
+                "distinct limit must be between 1 and {}",
+                Self::DISTINCT_MAX_VALUES
+            )));
+        }
         let (b, l) = (self.bounded, self.label.clone());
         self.wrap(l, b, |up| {
             Box::new(ops::Distinct {
                 up,
                 seen: std::collections::HashMap::new(),
+                seen_values: 0,
+                retained_bytes: 0,
+                max_values,
+                max_retained_bytes: Self::DISTINCT_MAX_RETAINED_BYTES,
             })
         })
     }
@@ -620,6 +638,40 @@ mod tests {
         let s = endless_marked(1);
         drain(&s);
         assert_eq!(s.tee(2).unwrap_err().code, "stream_consumed");
+    }
+
+    #[test]
+    fn distinct_history_is_exact_until_its_typed_limit() {
+        let stream = StreamVal::from_iter(
+            "int",
+            [1, 1, 2, 3].into_iter().map(|value| Ok(Value::Int(value))),
+        )
+        .distinct_bounded(2)
+        .unwrap();
+        let mut upstream = stream.take_upstream().unwrap();
+        assert!(matches!(
+            upstream.pull(&mut C, None).unwrap(),
+            Pull::Item(Value::Int(1))
+        ));
+        assert!(matches!(
+            upstream.pull(&mut C, None).unwrap(),
+            Pull::Item(Value::Int(2))
+        ));
+        let error = match upstream.pull(&mut C, None) {
+            Err(error) => error,
+            Ok(_) => panic!("a third distinct value must exceed the configured limit"),
+        };
+        assert_eq!(error.code, "stream_distinct_limit");
+    }
+
+    #[test]
+    fn invalid_distinct_limit_does_not_consume_the_source() {
+        let stream = StreamVal::from_iter("int", [Ok(Value::Int(1))].into_iter());
+        assert_eq!(
+            stream.clone().distinct_bounded(0).unwrap_err().code,
+            "arg_error"
+        );
+        assert_eq!(drain(&stream), vec![Value::Int(1)]);
     }
 
     #[test]

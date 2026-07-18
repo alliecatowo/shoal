@@ -51,7 +51,7 @@ enumerations and observable behaviors remain executable:
 | Information | Normative authority | Narrative treatment |
 |---|---|---|
 | builtin names | `shoal_syntax::commands::builtin_names()` | explain categories and lifecycle; do not hand-copy as authority |
-| value methods | metadata in `methods/suggest.rs` plus real dispatch | publish generated tables and call out drift |
+| value methods | metadata in `methods/suggest.rs` plus real dispatch and behavioral fixtures | publish generated tables; treat dispatch as exact arity/value authority |
 | AST/wire/config structs | public serde/Rust types | explain invariants, compatibility, and examples |
 | RPC integer codes | `shoal_proto::error_code` + pinned test | explain meaning and client handling |
 | adapter/manifest grammar | deserializers and fixture corpus | explain precedence and extension process |

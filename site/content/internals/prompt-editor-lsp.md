@@ -428,7 +428,8 @@ trailing dot/optional-chain position and tries to infer the receiver type from:
 
 Computed calls, chains, indexing, and unknown receiver forms fall back to the union of all method
 names. This is deliberately conservative: uncertainty yields broader results rather than false
-precision. The method registry still has known metadata/dispatch drift documented in
+precision. Receiver-aware metadata matches the formerly drifted table/range `.get` and boolean
+conversion pairs; exact arity and value constraints still belong to executable dispatch. See
 [Value method dispatch](@/internals/value-method-dispatch.md).
 
 ### Matching and result shaping

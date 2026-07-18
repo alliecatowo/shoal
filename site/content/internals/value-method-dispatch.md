@@ -309,8 +309,7 @@ arguments rather than accidentally ignoring them.
   between structured and raw output.
 - Generic `.json()` on lazy bytes materializes, while nested `value_to_json` is bounded; the call-site
   distinction is intentional but nonobvious.
-- Receiver metadata currently advertises `.get` across the shared sequence family, but dispatch
-  implements only list+integer and record+string lookup; table/range `.get` type-errors. Completion
-  is broader than behavior.
-- Boolean `.str()`/`.display()` succeeds in `strops::to_str`, but bool's receiver-specific method
-  table omits both, so valid calls are absent from completion/unknown-method hints.
+- Receiver metadata and dispatch both cover list/table/range integer `.get` plus record string
+  `.get`; owning fixtures pin negative indexing and default values for the sequence variants.
+- Boolean `.str()`/`.display()` is present in both dispatch and the receiver-specific metadata, so
+  completion and unknown-method hints expose the executable conversion surface.

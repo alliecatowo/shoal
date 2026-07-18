@@ -14,7 +14,7 @@ toc = true
 
 Shoal is a substantial, working preview—not a production-hardened login shell or multi-tenant agent sandbox. The language, structured shell, adapters, Reef resolver, journal/undo, kernel, MCP tools/resources/events, PTYs, LSP, prompt, and configuration system all execute real code today. The current security model still requires a fully trusted local kernel socket, and several protocol/operational contracts need hardening before consequential unattended deployment.
 
-This page is dated because status prose goes stale. It was checked against the source tree and the 1,331-case conformance corpus on **2026-07-18**.
+This page is dated because status prose goes stale. It was checked against the source tree and the 1,357-case conformance corpus on **2026-07-18**.
 
 ## Readiness in one table
 
@@ -49,8 +49,8 @@ The documentation uses these labels:
 The language contract lives in `spec/cases/*.toml`:
 
 ```text
-1,331 cases
-1,327 passed
+1,357 cases
+1,353 passed
 0 failed
 4 skipped
 ```
@@ -168,8 +168,8 @@ Full impact/mitigation: [Security and trust boundaries](@/docs/security.md).
 | MCP cwd resource stale | `shoal://session/cwd` is cached at attach. | Execute `pwd` or reconnect after `cd`. |
 | Task output not streaming | `/task/{id}/out` resolves whole result only after capture. | Use lifecycle events; no incremental byte cursor yet. |
 | Streams on wire | Wire stream contains only label; no chunk-pull method. | Collect/bound in language or use tasks/resources. |
-| Timeout semantics | Converts unfinished execution into task; does not terminate. | Cancel and observe terminal state explicitly. |
-| Task await | Raw method can block a connection indefinitely. | Subscribe/poll task resource. |
+| Wait versus execution deadline | `timeout_ms` only bounds the initial response wait; optional `deadline_ms` cancels owned execution at expiry. | Inspect `deadline_exceeded`; cancellation is not rollback and escaped descendants remain platform-limited. |
+| Task await | Raw `task.await` defaults to 30 seconds and is clamped to a 60-second server ceiling. | A timed-out response leaves the task running; subscribe, poll, cancel, or await again. |
 | Kernel task suspend/resume | Task records advertise current controls; raw methods control process-backed tasks only. | The snapshot is advisory; evaluator-only work is never advertised as suspendable, and MCP exposes cancel, not pause/resume. |
 | PTY subscriptions | PTYs are poll-read only. | Bounded delayed polling + deadline + close. |
 | PTY output | Current rendered grid, no raw ANSI or durable scrollback stream. | Use ordinary exec for audit capture. |
@@ -215,15 +215,18 @@ mutually hostile workloads.
 
 A bare `./script.shl` path has language runner support. Other interpreter extensions generally require explicit `run path` or an interpreter block even when an adapter declares a runner.
 
-### Method metadata is not the sole truth
+### Method metadata is executable behavior
 
-The metadata registry used by method discovery/completion has drift from actual dispatch: it advertises some `get` combinations not dispatched (notably table/range) and omits some valid bool display/string methods. The public method reference follows implementation/tests, not metadata alone. Completion can therefore omit a valid method or suggest an invalid receiver combination.
+Receiver-aware metadata now matches the formerly drifted dispatch pairs: table/range `.get()` and
+boolean `.str()`/`.display()` are both implemented and advertised. Behavioral fixtures pin those
+pairs, while the generic dispatch table remains the final runtime authority for arity and value
+constraints. New methods must update metadata and executable coverage together.
 
 ### Stream caveats
 
 - `buffer(n)` creates a bounded asynchronous pump, but each pump consumes a thread and the evaluator
   admits at most 64 concurrent stream pumps. Drop or consume buffered streams promptly.
-- `.distinct()` retains all previously seen distinct values and can grow without bound. Use a finite/taken stream or `.dedupe()` for adjacent suppression.
+- `.distinct(limit?)` defaults to 4,096 identities and is exact up to that caller/default limit and a 16 MiB retained-history ceiling, then raises `stream_distinct_limit`; use a smaller limit, finite/taken stream, or `.dedupe()` for adjacent suppression.
 - live `.tee(n)` uses 64-entry per-fork queues; overflow drops values and inserts a `{dropped:n}` marker rather than raising.
 - collecting/sorting/grouping an infinite stream without a bound never completes and can exhaust memory.
 - live timing/filesystem sources remain host-dependent despite deterministic core combinators.

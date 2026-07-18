@@ -3,6 +3,7 @@
 //! itself an [`Upstream`], so a chain composes by nesting.
 
 use super::{CallCtx, Pull, Upstream, VResult, Value};
+use crate::{ErrorVal, OpaqueHandling, RetainedLimits, retained_size};
 use std::collections::{HashMap, VecDeque, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
@@ -213,9 +214,12 @@ pub struct Distinct {
     pub up: Box<dyn Upstream>,
     /// Equality-compatible semantic hash to collision bucket. The final check
     /// always uses `Value::eq`, so hashing is an accelerator rather than a new
-    /// definition of language equality. Like every exact `distinct`, this
-    /// retains one clone per unique value until the stream ends.
+    /// definition of language equality.
     pub seen: HashMap<u64, Vec<Value>>,
+    pub seen_values: usize,
+    pub retained_bytes: usize,
+    pub max_values: usize,
+    pub max_retained_bytes: usize,
 }
 impl Upstream for Distinct {
     fn pull(&mut self, ctx: &mut dyn CallCtx, t: Option<Duration>) -> VResult<Pull> {
@@ -226,6 +230,37 @@ impl Upstream for Distinct {
                     if bucket.contains(&v) {
                         continue;
                     }
+                    if self.seen_values >= self.max_values {
+                        return Err(distinct_limit(format!(
+                            "distinct history reached its {}-value limit",
+                            self.max_values
+                        )));
+                    }
+                    let remaining = self.max_retained_bytes.saturating_sub(self.retained_bytes);
+                    let retained = retained_size(
+                        &v,
+                        RetainedLimits {
+                            max_bytes: remaining,
+                            max_depth: 64,
+                            max_nodes: 16_384,
+                            // Identity-bearing handles are separately bounded
+                            // by their owning subsystems; charge the retained
+                            // Arc/handle here without walking foreign state.
+                            opaque: OpaqueHandling::Charge(256),
+                            allow_secret: true,
+                        },
+                    )
+                    .map_err(|_| {
+                        distinct_limit(format!(
+                            "distinct history exceeds its {}-byte retained-value limit",
+                            self.max_retained_bytes
+                        ))
+                    })?;
+                    self.retained_bytes = self
+                        .retained_bytes
+                        .checked_add(retained)
+                        .ok_or_else(|| distinct_limit("distinct history accounting overflowed"))?;
+                    self.seen_values += 1;
                     bucket.push(v.clone());
                     return Ok(Pull::Item(v));
                 }
@@ -233,6 +268,11 @@ impl Upstream for Distinct {
             }
         }
     }
+}
+
+fn distinct_limit(message: impl Into<String>) -> ErrorVal {
+    ErrorVal::new("stream_distinct_limit", message)
+        .with_hint("use `.distinct(smaller_limit)`, bound the source, or use `.dedupe()`")
 }
 
 /// Hash exactly the equality semantics implemented by `Value::eq` where a
@@ -844,5 +884,25 @@ mod tests {
             span: None,
         });
         assert_equal_hash(Value::Outcome(outcome.clone()), Value::Outcome(outcome));
+    }
+
+    #[test]
+    fn distinct_rejects_history_that_exceeds_its_retained_byte_wall() {
+        let source = StreamVal::from_iter("str", [Ok(Value::Str("x".repeat(128)))].into_iter());
+        let mut distinct = Distinct {
+            up: source.take_upstream().unwrap(),
+            seen: HashMap::new(),
+            seen_values: 0,
+            retained_bytes: 0,
+            max_values: 8,
+            max_retained_bytes: 64,
+        };
+        let error = match distinct.pull(&mut Ctx, None) {
+            Err(error) => error,
+            Ok(_) => panic!("an over-budget distinct value must be rejected"),
+        };
+        assert_eq!(error.code, "stream_distinct_limit");
+        assert_eq!(distinct.seen_values, 0);
+        assert_eq!(distinct.retained_bytes, 0);
     }
 }
