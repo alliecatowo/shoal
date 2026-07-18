@@ -198,7 +198,14 @@ operation is cancelled.
 ^tool < ./input.txt
 ```
 
-Redirection applies to builtins and externals. If captured stdout spilled to content-addressed storage, output redirection loads the full content rather than writing only its resident preview.
+Output redirection applies to builtins and externals. Redirect targets are evaluated and type-checked
+once before dispatch, so an invalid target cannot be discovered only after a command has already
+mutated state or spawned. Process-backed externals and adapters accept `<`; structured builtins reject
+redirected stdin before performing any effect because they do not expose a byte-stdin contract.
+
+If captured stdout spilled to content-addressed storage, output redirection copies the full content
+incrementally from its verified reader rather than materializing the blob or writing only its resident
+preview.
 
 Overwriting an existing file can participate in journal undo when the prior bytes fit the journal cap. Creating a new file by redirection currently records no delete-on-undo inverse. Append/overwrite behavior and limitations are in [Filesystem, jobs, history, and undo](@/docs/filesystem-jobs-history.md).
 

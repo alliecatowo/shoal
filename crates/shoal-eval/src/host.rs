@@ -7,14 +7,14 @@ use super::*;
 impl Evaluator {
     pub(crate) fn apply_builtin_redirects(
         &mut self,
-        call: &CmdCall,
+        redirects: &crate::command::PreparedRedirects,
         value: Value,
     ) -> VResult<Value> {
         let mut captured = false;
-        for r in &call.redirects {
-            match r.kind {
+        if let Some(output) = redirects.output() {
+            match output.kind {
                 RedirectKind::Out => {
-                    let p = self.arg_path(&r.target)?;
+                    let p = output.path.clone();
                     // Undo (site/content/internals/language-conformance-contract.md): snapshot the target's prior bytes first, so
                     // `echo x > f` is reversible exactly like `cp`/`save`.
                     let undo_pre = self.redirect_undo_pre(&p);
@@ -26,7 +26,7 @@ impl Evaluator {
                     captured = true;
                 }
                 RedirectKind::Append => {
-                    let p = self.arg_path(&r.target)?;
+                    let p = output.path.clone();
                     let undo_pre = self.redirect_undo_pre(&p);
                     self.host
                         .fs

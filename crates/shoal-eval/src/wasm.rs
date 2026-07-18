@@ -260,6 +260,11 @@ impl Evaluator {
             ));
         }
 
+        // Resolve every output target before argument expansion, capability
+        // construction, or guest invocation, then reuse that exact path when
+        // committing the result.
+        let redirects = self.prepare_redirects(call, true)?;
+
         let registry = self
             .host
             .wasm
@@ -312,8 +317,8 @@ impl Evaluator {
             .map_err(plugin_error)
             .and_then(from_plugin_value)?;
 
-        for redirect in &call.redirects {
-            let target = self.arg_path(&redirect.target)?;
+        if let Some(redirect) = redirects.output() {
+            let target = redirect.path.clone();
             let bytes = shoal_value::feed_bytes(&value)?;
             match redirect.kind {
                 RedirectKind::Out => {

@@ -3,7 +3,12 @@
 use super::*;
 
 impl Evaluator {
-    pub(crate) fn eval_adapter(&mut self, call: &CmdCall, position: Position) -> VResult<Value> {
+    pub(crate) fn eval_adapter(
+        &mut self,
+        call: &CmdCall,
+        position: Position,
+        redirects: &PreparedRedirects,
+    ) -> VResult<Value> {
         let adapter = self
             .host
             .adapters
@@ -127,16 +132,8 @@ impl Evaluator {
             parse: spec.parse,
             output_type: spec.output_type,
         };
-        let mut stdin = StdinSpec::Null;
-        for redirect in &call.redirects {
-            if redirect.kind == RedirectKind::In {
-                stdin = StdinSpec::File(self.arg_path(&redirect.target)?);
-            }
-        }
-        let output_redirected = call
-            .redirects
-            .iter()
-            .any(|redirect| matches!(redirect.kind, RedirectKind::Out | RedirectKind::Append));
+        let stdin = redirects.stdin_spec();
+        let output_redirected = redirects.has_output();
         // Preserve statement failure semantics only after redirected bytes have
         // been committed by the dispatch layer. Running as Value here keeps a
         // non-zero child outcome available for that write-first ordering.

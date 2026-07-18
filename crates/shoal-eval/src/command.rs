@@ -11,7 +11,10 @@ mod adapter;
 mod capture;
 mod external;
 mod navigation;
+mod redirects;
 mod resolution;
+
+pub(crate) use redirects::PreparedRedirects;
 
 impl Evaluator {
     pub(crate) fn eval_command(&mut self, call: &CmdCall, position: Position) -> VResult<Value> {
@@ -195,15 +198,17 @@ impl Evaluator {
         // bare path. Intercepted before the generic builtin dispatch so it can
         // reach the scope chain; still wrapped as an outcome + redirect-capable.
         if call.head == "which" {
+            let redirects = self.prepare_redirects(call, false)?;
             let value = self.builtin_which(call)?;
             let outcome = builtin_outcome("which", value);
-            return self.apply_builtin_redirects(call, outcome);
+            return self.apply_builtin_redirects(&redirects, outcome);
         }
         // `reef` builtin family (site/content/internals/reef-resolution.md): binding table, add, lock, fetch.
         if call.head == "reef" {
+            let redirects = self.prepare_redirects(call, false)?;
             let value = self.builtin_reef(call)?;
             let outcome = builtin_outcome("reef", value);
-            return self.apply_builtin_redirects(call, outcome);
+            return self.apply_builtin_redirects(&redirects, outcome);
         }
         if call.head == "undo" {
             return self.builtin_undo(call);
@@ -220,12 +225,13 @@ impl Evaluator {
             // site/content/internals/language-conformance-contract.md undo: capture prior state of an overwriting cp/mv/save
             // BEFORE the mutation, then record the typed inverse AFTER. All a
             // no-op unless a journal is installed and a statement is executing.
+            let redirects = self.prepare_redirects(call, false)?;
             let undo_pre = self.fs_undo_pre(&call.head, call);
             let value = builtins::run(self, call)?;
             self.fs_undo_post(&call.head, undo_pre, &value);
             let outcome = builtin_outcome(&call.head, value);
             // Redirects apply to builtin results too (defect #8).
-            return self.apply_builtin_redirects(call, outcome);
+            return self.apply_builtin_redirects(&redirects, outcome);
         }
         if call.head == "cd" {
             return self.eval_cd(call);
@@ -303,11 +309,13 @@ impl Evaluator {
             return self.eval_wasm_command(call);
         }
         if resolution.source == CommandSource::Adapter {
-            let value = self.eval_adapter(call, position)?;
-            let value = self.apply_external_redirects(call, value)?;
+            let redirects = self.prepare_redirects(call, true)?;
+            let value = self.eval_adapter(call, position, &redirects)?;
+            let value = self.apply_external_redirects(&redirects, value)?;
             return self.enforce_command_position(value, position, false);
         }
         debug_assert_eq!(resolution.source, CommandSource::External);
+        let redirects = self.prepare_redirects(call, true)?;
         let mut argv = crate::args::ArgvBuilder::new(OsString::from(&call.head))?;
         for a in &call.args {
             for v in self.expand_arg(a)? {
@@ -315,16 +323,8 @@ impl Evaluator {
             }
         }
         let argv = argv.finish();
-        let mut stdin = StdinSpec::Null;
-        for r in &call.redirects {
-            if r.kind == RedirectKind::In {
-                stdin = StdinSpec::File(self.arg_path(&r.target)?);
-            }
-        }
-        let output_redirected = call
-            .redirects
-            .iter()
-            .any(|redirect| matches!(redirect.kind, RedirectKind::Out | RedirectKind::Append));
+        let stdin = redirects.stdin_spec();
+        let output_redirected = redirects.has_output();
         // A redirected command must finish capture and commit its bytes before
         // statement-position failure promotion. This matches shell ordering:
         // `false > file` still creates/truncates `file`, then reports failure.
@@ -338,36 +338,46 @@ impl Evaluator {
         } else {
             self.run_argv(argv, run_position, stdin, &call.env_prefix, call.span, None)?
         };
-        let value = self.apply_external_redirects(call, value)?;
+        let value = self.apply_external_redirects(&redirects, value)?;
         self.enforce_command_position(value, position, false)
     }
 
     /// Commit output redirects for any process-backed command (raw external or
     /// adapter) from the outcome's complete stdout, including lazy CAS spills.
-    fn apply_external_redirects(&mut self, call: &CmdCall, value: Value) -> VResult<Value> {
+    fn apply_external_redirects(
+        &mut self,
+        redirects: &PreparedRedirects,
+        value: Value,
+    ) -> VResult<Value> {
         let Value::Outcome(out) = &value else {
             return Ok(value);
         };
         let fs = self.host.fs.clone();
-        for r in &call.redirects {
-            match r.kind {
+        if let Some(output) = redirects.output() {
+            match output.kind {
                 // Undo (site/content/internals/language-conformance-contract.md): an external command's `> file` / `>> file`
                 // clobbers the target's contents just like `cp` — snapshot the
                 // prior bytes first, record the restore inverse after, so
                 // `some-cmd > f` and `sh { … } > f` are reversible too.
                 RedirectKind::Out => {
-                    let target = self.arg_path(&r.target)?;
+                    let target = output.path.clone();
                     let undo_pre = self.redirect_undo_pre(&target);
-                    // site/content/internals/language-conformance-contract.md: write the FULL stdout (load from CAS when it
-                    // spilled), never just the resident preview.
-                    fs.write(&target, &out.stdout_bytes()?)
+                    let mut reader = out.open_stdout()?;
+                    let mut writer = fs
+                        .open_write(&target)
+                        .map_err(|e| ErrorVal::new("custom", e.to_string()))?;
+                    std::io::copy(&mut reader, &mut writer)
                         .map_err(|e| ErrorVal::new("custom", e.to_string()))?;
                     self.overwrite_undo_post(undo_pre);
                 }
                 RedirectKind::Append => {
-                    let target = self.arg_path(&r.target)?;
+                    let target = output.path.clone();
                     let undo_pre = self.redirect_undo_pre(&target);
-                    fs.append(&target, &out.stdout_bytes()?)
+                    let mut reader = out.open_stdout()?;
+                    let mut writer = fs
+                        .open_append(&target)
+                        .map_err(|e| ErrorVal::new("custom", e.to_string()))?;
+                    std::io::copy(&mut reader, &mut writer)
                         .map_err(|e| ErrorVal::new("custom", e.to_string()))?;
                     self.overwrite_undo_post(undo_pre);
                 }

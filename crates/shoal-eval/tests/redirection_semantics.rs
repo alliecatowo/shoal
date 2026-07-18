@@ -68,6 +68,40 @@ ok_codes = [0]
 }
 
 #[test]
+fn builtin_input_redirect_is_rejected_before_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut evaluator = Evaluator::new(dir.path().to_path_buf());
+
+    let error = evaluator
+        .eval_program(&shoal_syntax::parse("touch victim < input.txt").unwrap())
+        .expect_err("structured builtins do not own a stdin contract");
+
+    assert_eq!(error.code, "arg_error");
+    assert!(error.msg.contains("does not consume redirected stdin"));
+    assert!(
+        !dir.path().join("victim").exists(),
+        "redirect rejection happened after the builtin mutation"
+    );
+}
+
+#[test]
+fn invalid_builtin_output_target_is_rejected_before_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut evaluator = Evaluator::new(dir.path().to_path_buf());
+
+    let error = evaluator
+        .eval_program(&shoal_syntax::parse("touch victim > (1 + 1)").unwrap())
+        .expect_err("a redirect target must be a path before dispatch");
+
+    assert_eq!(error.code, "arg_error");
+    assert_eq!(error.msg, "redirect target must be a path");
+    assert!(
+        !dir.path().join("victim").exists(),
+        "the builtin ran before its redirect target was admitted"
+    );
+}
+
+#[test]
 fn failed_statement_commits_redirect_before_raising() {
     let dir = tempfile::tempdir().unwrap();
     let mut evaluator = Evaluator::new(dir.path().to_path_buf());

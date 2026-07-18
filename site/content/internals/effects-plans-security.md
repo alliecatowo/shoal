@@ -112,6 +112,9 @@ trailing blocks contribute their own network, filesystem, environment, secret, p
 effects. Literal input redirects derive the exact `FsRead`; a dynamic target is `Opaque` after its
 expression subtree is traversed, never an empty effect. The same rule applies to dynamic receivers
 of `read`, `read_bytes`, and `lines`, while literal path receivers retain exact `FsRead` paths.
+Runtime evaluates each supported redirect target once before the owning builtin/plugin/adapter/process
+dispatch and reuses the prepared path for stdin setup or output commit. Structured builtins reject
+input redirects before argument expansion or mutation instead of silently ignoring them.
 
 Planner path attribution and runtime argument coercion share evaluator-scoped tilde expansion:
 `~/x` uses the session process-environment snapshot (including `env.HOME` changes), not a fresh read
