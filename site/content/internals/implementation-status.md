@@ -367,10 +367,9 @@ The prompt crate is correctly pure: a `PromptContext` snapshot enters and render
 leave. This is a strong boundary. The local producer does not yet populate the entire model:
 
 - editing mode is hardcoded to Emacs;
-- multiline is hardcoded false;
 - output mode is hardcoded Human;
 - stash count is zero;
-- battery and custom module data are not gathered;
+- battery and trusted custom module data are gathered outside the render path when configured;
 - git status is gathered synchronously rather than from a deferred/event-driven cache.
 
 Reedline completion, highlighting, history, menu/picker, and keybinding paths are implemented. They

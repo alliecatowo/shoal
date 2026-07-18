@@ -82,6 +82,11 @@ pub fn run(action: PromptAction) -> Result<i32, String> {
         eprintln!("warning: {w}");
     }
     let facts = StaticFacts::resolve(&config, no_color);
+    let mut battery_warnings = Vec::new();
+    let mut battery = BatterySampler::new(&config, &mut battery_warnings);
+    for warning in battery_warnings {
+        eprintln!("warning: {warning}");
+    }
     let deadline_ms = config.budget.render_deadline_ms;
     let (renderer, more_warnings) = Renderer::new(config);
     for w in &more_warnings {
@@ -91,6 +96,7 @@ pub fn run(action: PromptAction) -> Result<i32, String> {
     let mut ev = Evaluator::new(cwd.clone());
     let mut live = build_context(&mut ev, &facts, 80);
     if !matches!(&action, PromptAction::Bench { .. }) {
+        live.battery = battery.sample();
         let mut custom_warnings = Vec::new();
         let mut custom = CustomScheduler::new(renderer.config(), &mut custom_warnings);
         for warning in custom_warnings {

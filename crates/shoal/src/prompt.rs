@@ -39,12 +39,14 @@ use shoal_value::Value;
 
 use crate::repl_state::ProtocolSnapshot;
 
+mod battery;
 mod budget;
 mod cli;
 mod config;
 mod custom;
 mod git;
 
+pub(crate) use battery::BatterySampler;
 pub(crate) use budget::PromptBudgetWarnings;
 pub use cli::{PromptAction, parse_action, run};
 pub use config::load_prompt_config;
@@ -254,7 +256,6 @@ pub fn build_context(ev: &mut Evaluator, facts: &StaticFacts, width: u16) -> Pro
         nerd_font: facts.nerd_font,
         unicode: facts.unicode,
         edit_mode: EditMode::Emacs,
-        multiline: false,
         last_outcome,
         jobs,
         principal: facts.principal.clone(),
@@ -305,7 +306,6 @@ pub fn build_context_from_protocol(
         nerd_font: facts.nerd_font,
         unicode: facts.unicode,
         edit_mode: EditMode::Emacs,
-        multiline: false,
         last_outcome,
         jobs: shoal_prompt::JobsSnapshot {
             running: snapshot.jobs.running,

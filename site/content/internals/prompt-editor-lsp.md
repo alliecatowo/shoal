@@ -212,9 +212,9 @@ style spec equals that name. They are not macros inside a compound spec such as 
 | Placeholder | Snapshot input | Visibility/format behavior | Wiring status |
 |---|---|---|---|
 | `character` | last outcome, edit mode, Unicode | success/error/Vi-normal symbol | edit mode producer is hardcoded Emacs |
-| `directory` | cwd, home, repo-relative path, read-only | home collapse, component truncation | `truncate_style` accepted but ignored |
+| `directory` | cwd, home, repo-relative path, read-only | home collapse; `start`/`middle`/`end` component truncation | active |
 | `git_branch` | branch or detached SHA | symbol, truncation, template | active |
-| `git_status` | counts/degraded flag | staged/worktree/untracked/conflict/stash/ahead/behind | stash always zero; `engine` ignored |
+| `git_status` | counts/degraded flag | staged/worktree/untracked/conflict/stash/ahead/behind | stash always zero; one explicit Git CLI reader |
 | `git_state` | Git operation state | rebase/merge/cherry-pick/bisect/revert label | active |
 | `cmd_duration` | last outcome duration | hides below `min_ms` | active |
 | `exit_status` | status/signal/ok | optional success display | active, disabled by default |
@@ -225,26 +225,29 @@ style spec equals that name. They are not macros inside a compound spec such as 
 | `reef` | cached bindings | constrained by default; version shortened | active |
 | `principal` | human/agent | symbols and optional agent name | producer always Human |
 | `leash` | detected tier/enforced | per-tier style/symbol | capability snapshot, not loaded policy identity |
-| `battery` | optional battery snapshot | charging/low threshold | producer always `None` |
-| `language_<name>` | matching Reef binding | constrained/resolved visibility | no independent probe/TTL producer |
+| `battery` | optional battery snapshot | charging/low threshold | cached Linux/macOS host producer when enabled |
+| `language_<name>` | matching Reef binding | exact constrained/resolved visibility | consumes Reef-owned discovery/cache state |
 | `custom_<name>` | `Ready/Pending/Stale/Error` segment | ready/stale output only | bounded background producer with TTL cache |
 | `indent` | none | empty reserved placeholder | active as no-op |
 
-This split is crucial: renderer unit tests can prove that a hand-built battery or agent snapshot
-renders correctly even though the real host never produces one. Renderer completeness and
-end-to-end feature completeness are different maturity claims.
+This split is crucial: renderer unit tests can prove that a hand-built agent snapshot renders
+correctly even though the real host does not yet produce one. Renderer completeness and end-to-end
+feature completeness are different maturity claims.
 
-### Module-specific inert fields
+### Trimmed schema and host-owned producers
 
-The current source contains several schema promises without a consuming path:
+The former `git_status.engine`, `language.probe_ttl_s`, and `PromptContext.multiline` fields were
+removed instead of preserving choices with no consuming implementation. Git status has one honest
+CLI-backed acquisition path. Language modules consume Reef-owned resolution/cache state and accept
+only `constrained` or `resolved`. Reedline chooses the continuation side directly, so a duplicate
+unused multiline bit was not a meaningful snapshot fact.
 
-- `directory.truncate_style` does not choose another truncation algorithm;
-- `git_status.engine` does not select an engine; the host always uses its current reader;
-- `battery.sample_interval_s` has no sampler;
-- `language.probe_ttl_s` has no prompt-side probe cache;
-- `PromptContext.multiline` exists but no module currently reads it.
-
-The remaining fields are preserved as intended extension points, not documented as operational behavior. Custom modules are different: trusted system/user configuration may define them, while automatically discovered project config has its entire `module.custom` table removed before merge. The interactive host owns two bounded workers, treats `command` as quoted argv rather than shell source, gates it on one exact nonempty environment variable, enforces a 250 ms process-group deadline and 4 KiB output cap, and publishes only sanitized snapshots to the pure renderer.
+Directory truncation now implements all three advertised edge-selection modes. Battery sampling is
+cached by the host when enabled. Trusted system/user configuration may also define custom modules,
+while automatically discovered project config has its entire `module.custom` table removed before
+merge. The interactive host owns two bounded workers, treats `command` as quoted argv rather than
+shell source, gates it on one exact nonempty environment variable, enforces a 250 ms process-group
+deadline and 4 KiB output cap, and publishes only sanitized snapshots to the pure renderer.
 
 ## PromptContext snapshot
 
@@ -331,18 +334,15 @@ The host currently builds every live context with:
 
 ```text
 edit_mode = Emacs
-multiline = false
 principal = Human
-battery = None
-custom = {}
 git.stashed = 0
 git.age = 0
 ```
 
 The shell can genuinely run Reedline in Vi mode, but the prompt never sees Vi normal/insert/visual
 state. Consequently `character.vicmd_symbol` is non-operational in the real shell. Agent principal,
-battery, custom-command, stash, and stale-age render branches are similarly renderer-complete but
-producer-incomplete.
+stash, and stale-age render branches remain producer-incomplete. Battery and custom values are
+host-produced only when their modules are configured.
 
 ## Reedline prompt adapter
 
@@ -648,7 +648,8 @@ deliberate audit across consumers.
 | Git prompt | parser/reader tests | once-per-command producer tests | implemented with deliberate stash gap |
 | jobs/Reef prompt | renderer tests | evaluator mapping tests | implemented |
 | custom prompt | renderer + scheduler admission/cache tests | real config → bounded worker → CLI/render integration | implemented, host-side only |
-| Vi/principal/battery prompt | renderer tests | no complete real producer | scaffolded/inert |
+| battery prompt | renderer + platform parser tests | cached Linux/macOS producer | implemented when enabled |
+| Vi/principal prompt | renderer tests | no complete authority/editor-state producer | scaffolded/inert |
 | completion | large context/matching/cache test set | Reedline composition | strong heuristic implementation |
 | highlighting | broad token/dispatch tests | environment-sensitive color tests | implemented; PATH repaint cost |
 | keybindings | chord/action tests | edit-mode construction tests | implemented, mode-state prompt gap |
@@ -661,8 +662,8 @@ deliberate audit across consumers.
    multiline state without adding I/O to rendering.
 2. **Either implement or remove security/status-like prompt producers.** Agent principal and Leash
    display must represent the actual evaluator/client authority, not only process defaults.
-3. **Complete or trim inert prompt schema.** Battery/custom caches, language probes, engine choice,
-   deadline warnings, and truncation strategy need producer tests before being advertised.
+3. **Keep prompt schema tied to real owners.** New fields need a consuming host path and producer
+   tests before being advertised; do not reintroduce speculative engine/probe toggles.
 4. **Unify project prompt discovery with core configuration.** The current-directory-only prompt
    layer visibly disagrees with nearest-ancestor typed config.
 5. **Move command-resolution checks out of repaint.** Share the completer's cache or a host command

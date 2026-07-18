@@ -22,6 +22,7 @@ pub(super) struct ReplUi {
     pub(super) shared_ctx: prompt::SharedCtx,
     pub(super) static_facts: prompt::StaticFacts,
     custom: prompt::CustomScheduler,
+    battery: prompt::BatterySampler,
     budget_warnings: prompt::PromptBudgetWarnings,
     pub(super) pager: PagerContext,
 }
@@ -54,6 +55,9 @@ impl ReplUi {
         warn_each(&prompt_warnings);
         let static_facts = prompt::StaticFacts::resolve(&prompt_config, no_color());
         let transient_enabled = prompt_config.transient.enabled;
+        let mut battery_warnings = Vec::new();
+        let battery = prompt::BatterySampler::new(&prompt_config, &mut battery_warnings);
+        warn_each(&battery_warnings);
         let (renderer, renderer_warnings) = shoal_prompt::Renderer::new(prompt_config);
         warn_each(&renderer_warnings);
         let mut custom_warnings = Vec::new();
@@ -117,6 +121,7 @@ impl ReplUi {
                 shared_ctx,
                 static_facts,
                 custom,
+                battery,
                 budget_warnings: prompt::PromptBudgetWarnings::new(
                     renderer,
                     background_printer.clone(),
@@ -143,6 +148,7 @@ impl ReplUi {
             }
             None => prompt::build_context(evaluator, &self.static_facts, width),
         };
+        context.battery = self.battery.sample();
         context.custom = self.custom.refresh(&context.cwd, evaluator.env_vars());
         self.budget_warnings.observe(&context);
         if let Ok(mut cell) = self.shared_ctx.write() {

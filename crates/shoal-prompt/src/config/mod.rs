@@ -559,6 +559,26 @@ mod tests {
     }
 
     #[test]
+    fn removed_speculative_prompt_keys_warn() {
+        let v: toml::Value = toml::from_str(
+            "[module.git_status]\nengine = 'gix'\n[module.language.rust]\nprobe_ttl_s = 30",
+        )
+        .unwrap();
+        let mut warnings = Vec::new();
+        load(vec![v], &mut warnings);
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.ends_with("git_status.engine"))
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.ends_with("<name>.probe_ttl_s"))
+        );
+    }
+
+    #[test]
     fn theme_is_lowest_precedence() {
         // minimal theme sets unicode=false; a user override of unicode=true wins.
         let user: toml::Value = toml::from_str("theme = 'minimal'\nunicode = true").unwrap();

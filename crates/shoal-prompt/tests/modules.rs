@@ -93,6 +93,35 @@ fn directory_home_collapse_and_truncate() {
 }
 
 #[test]
+fn directory_truncate_style_selects_the_retained_edges() {
+    let mut cfg = PromptConfig::default();
+    cfg.module.directory.repo_relative = false;
+    cfg.module.directory.truncate_to = 2;
+    cfg.module.directory.truncate_style = "end".into();
+    assert_eq!(render(cfg.clone(), "directory", &base_ctx()), "~/develop/…");
+    cfg.module.directory.truncate_style = "middle".into();
+    assert_eq!(render(cfg, "directory", &base_ctx()), "~/…/shoal");
+}
+
+#[test]
+fn invalid_truncate_style_warns_and_uses_middle() {
+    let mut cfg = PromptConfig::default();
+    cfg.module.directory.repo_relative = false;
+    cfg.module.directory.truncate_to = 2;
+    cfg.module.directory.truncate_style = "mystery".into();
+    let (renderer, warnings) = Renderer::new(cfg);
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("truncate_style"))
+    );
+    assert_eq!(
+        renderer.render_placeholder("directory", &base_ctx()),
+        "~/…/shoal"
+    );
+}
+
+#[test]
 fn directory_repo_relative() {
     let cfg = PromptConfig::default();
     let mut ctx = base_ctx();
@@ -365,6 +394,56 @@ fn language_module_reads_reef_binding() {
     // hidden when the tool isn't constrained (default `when`)
     ctx.reef[0].constrained = false;
     assert_eq!(render(cfg, "language_rust", &ctx), "");
+}
+
+#[test]
+fn language_resolved_visibility_does_not_require_a_constraint() {
+    let mut cfg = PromptConfig::default();
+    cfg.module.language.insert(
+        "rust".into(),
+        shoal_prompt::LanguageModule {
+            tool: "rust".into(),
+            when: "resolved".into(),
+            ..Default::default()
+        },
+    );
+    let mut ctx = base_ctx();
+    ctx.reef = vec![ReefBinding {
+        tool: "rust".into(),
+        version: Some("1.97.0".into()),
+        provider: None,
+        scope: None,
+        constrained: false,
+    }];
+    assert_eq!(render(cfg, "language_rust", &ctx), "1.97.0");
+}
+
+#[test]
+fn invalid_language_visibility_warns_and_fails_back_to_constrained() {
+    let mut cfg = PromptConfig::default();
+    cfg.module.language.insert(
+        "rust".into(),
+        shoal_prompt::LanguageModule {
+            tool: "rust".into(),
+            when: "probe".into(),
+            ..Default::default()
+        },
+    );
+    let (renderer, warnings) = Renderer::new(cfg);
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("language.rust.when"))
+    );
+    let mut ctx = base_ctx();
+    ctx.reef = vec![ReefBinding {
+        tool: "rust".into(),
+        version: Some("1.97.0".into()),
+        provider: None,
+        scope: None,
+        constrained: false,
+    }];
+    assert_eq!(renderer.render_placeholder("language_rust", &ctx), "");
 }
 
 // -- principal --------------------------------------------------------------

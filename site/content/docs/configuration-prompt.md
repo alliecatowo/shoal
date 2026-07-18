@@ -277,6 +277,8 @@ format = "%H:%M:%S"
 style = "dim"
 ```
 
+Directory `truncate_style` is exact: `start` removes leading components, `end` removes trailing components, and `middle` retains both edges while favoring the trailing half. Invalid values warn and use `middle`.
+
 Built-in themes are `default`, `minimal`, and `rich`. A theme is the lowest-precedence prompt layer; your explicit settings override it.
 
 ### Prompt precedence is slightly different
@@ -321,7 +323,6 @@ tool = "rustc"
 symbol = "rs "
 style = "red"
 when = "constrained"
-probe_ttl_s = 30
 format = "${symbol}${version} "
 
 [module.custom.cluster]
@@ -334,7 +335,9 @@ format = "${output} "
 
 These dynamic tables have a sharp type boundary: `language.when`, `custom.command`, `custom.when`, and `custom.cache_ttl` are strings, not arrays or numeric durations. A wrong type makes the rich prompt fail deserialization and fall back to the complete default prompt, with a warning.
 
-Language modules can render an existing Reef binding; only the exact value `when = "constrained"` has distinct behavior, while every other string currently uses the same “resolved or constrained” test. `probe_ttl_s` is not consumed by the host. The host still supplies no battery snapshot, so `$battery` renders empty.
+Language modules render existing Reef bindings rather than launching a second prompt-specific probe. `when = "constrained"` requires a constrained binding; `when = "resolved"` requires a resolved version. Any other value warns and falls back to `constrained`. The former `probe_ttl_s` field was removed because Reef already owns discovery/cache freshness and the prompt had no independent probe to cache.
+
+When the battery module is enabled, the host samples Linux power-supply attributes directly or a bounded `pmset -g batt` call on macOS. Sampling happens outside rendering and is cached for `sample_interval_s` (clamped to one day); zero requests a fresh sample after every command. Multiple batteries are averaged, and unsupported/no-battery systems simply leave the module hidden.
 
 Custom modules are operational in the interactive host and in one-shot `shoal prompt print|explain`. Because they execute with the UI host's ambient filesystem/network authority, executable custom tables are accepted only from trusted system/user configuration; `module.custom` in a project `.shoal.toml` is removed with a warning before layers merge and cannot add or override a command merely by entering a repository.
 
@@ -351,7 +354,7 @@ Each static table supports `enabled` plus module-specific keys:
 | `module.character` | `success_symbol`, `error_symbol`, `vicmd_symbol`, and their styles |
 | `module.directory` | `truncate_to`, `truncate_style`, `repo_relative`, `read_only_symbol`, `symbol`, `style`, `home_symbol` |
 | `module.git_branch` | `symbol`, `ascii_symbol`, `style`, `truncate_to`, `truncate_symbol`, `format` |
-| `module.git_status` | `ahead`, `behind`, `diverged`, `staged`, `unstaged`, `untracked`, `conflicted`, `stashed`, `stale_symbol`, `engine`, `style` |
+| `module.git_status` | `ahead`, `behind`, `diverged`, `staged`, `unstaged`, `untracked`, `conflicted`, `stashed`, `stale_symbol`, `style` |
 | `module.git_state` | labels for `rebase`, `merge`, `cherry_pick`, `bisect`, `revert`, plus `style` |
 | `module.cmd_duration` | `min_ms`, `style` |
 | `module.exit_status` | `show_on_success`, `format`, `style` |

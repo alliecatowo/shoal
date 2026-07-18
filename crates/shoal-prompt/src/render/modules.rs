@@ -54,7 +54,12 @@ impl Renderer {
             collapse_home(ctx, &m.home_symbol)
         };
         if m.truncate_to > 0 {
-            display = truncate_path(&display, m.truncate_to, self.ellipsis(ctx));
+            display = truncate_path(
+                &display,
+                m.truncate_to,
+                self.ellipsis(ctx),
+                &m.truncate_style,
+            );
         }
         let symbol = &m.symbol;
         let ro = if ctx.read_only {
@@ -323,10 +328,8 @@ impl Renderer {
         };
         let show = match m.when.as_str() {
             "constrained" => binding.constrained,
-            // "resolved" and "probe" both surface any resolved binding on the
-            // render path; the actual probe subprocess (probe mode) runs in a
-            // background task and only ever populates `ctx.reef`, never here.
-            _ => binding.version.is_some() || binding.constrained,
+            "resolved" => binding.version.is_some(),
+            _ => unreachable!("language visibility is validated by Renderer::new"),
         };
         if !show {
             return String::new();

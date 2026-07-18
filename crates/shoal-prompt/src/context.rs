@@ -27,8 +27,6 @@ pub struct PromptContext {
     /// Unicode allowed; ascii fallback when false (site/content/internals/prompt-editor-lsp.md).
     pub unicode: bool,
     pub edit_mode: EditMode,
-    /// Buffer currently spans more than one line.
-    pub multiline: bool,
 
     /// `None`: no command has run yet this session.
     pub last_outcome: Option<OutcomeSnapshot>,
@@ -63,7 +61,6 @@ impl PromptContext {
             nerd_font: false,
             unicode: true,
             edit_mode: EditMode::Emacs,
-            multiline: false,
             last_outcome: None,
             jobs: JobsSnapshot::default(),
             principal: Principal::Human,

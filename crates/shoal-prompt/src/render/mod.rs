@@ -69,6 +69,35 @@ impl Renderer {
     /// unknown-module / style warnings (site/content/internals/prompt-editor-lsp.md).
     pub fn new(config: PromptConfig) -> (Self, Vec<String>) {
         let mut warnings = Vec::new();
+        if !matches!(
+            config.module.directory.truncate_style.as_str(),
+            "start" | "middle" | "end"
+        ) {
+            warnings.push(format!(
+                "invalid prompt.module.directory.truncate_style `{}`; using `middle`",
+                config.module.directory.truncate_style
+            ));
+        }
+        for (name, module) in &config.module.language {
+            if !matches!(module.when.as_str(), "constrained" | "resolved") {
+                warnings.push(format!(
+                    "invalid prompt.module.language.{name}.when `{}`; using `constrained`",
+                    module.when
+                ));
+            }
+        }
+        let mut config = config;
+        if !matches!(
+            config.module.directory.truncate_style.as_str(),
+            "start" | "middle" | "end"
+        ) {
+            config.module.directory.truncate_style = "middle".into();
+        }
+        for module in config.module.language.values_mut() {
+            if !matches!(module.when.as_str(), "constrained" | "resolved") {
+                module.when = "constrained".into();
+            }
+        }
         let formats = config.parse_formats(&mut warnings);
         (Self { config, formats }, warnings)
     }
