@@ -233,7 +233,7 @@ Current server capabilities:
 | --- | --- |
 | Text sync | True incremental UTF-16 range edits, with full-document replacement accepted when clients send it. Malformed/stale edits are rejected without corrupting the stored document. |
 | Diagnostics | Syntax diagnostics plus side-effect-free planner analysis; cleared/refreshed for the latest document version. |
-| Formatting | Whole-document edit using the Shoal formatter, only when parse is complete. |
+| Formatting | Whole-document edit only when parse is complete and the shared token-aware safety pass can preserve all semantic source. Comments/shebangs return no edit and publish `format_trivia`. |
 | Completion | Keywords, canonical builtin heads, and parser-derived visible bindings/functions/parameters/aliases with source details/docs. |
 | Hover | Declaration details/docs for visible symbols plus language/builtin resolution help. |
 | Goto definition | Scope-aware local declarations and exported members/paths of directly used file modules. |

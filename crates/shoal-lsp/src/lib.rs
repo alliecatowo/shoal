@@ -37,6 +37,18 @@ struct DocumentState {
     diagnostics: Vec<Diagnostic>,
     symbols: Vec<Symbol>,
 }
+
+fn formatting_edit(
+    text: &str,
+    ast: &Program,
+) -> std::result::Result<TextEdit, shoal_syntax::FormatRefusal> {
+    let new_text = shoal_syntax::format_source_preserving_trivia(text, ast)?;
+    Ok(TextEdit {
+        range: Range::new(Position::new(0, 0), byte_to_position(text, text.len())),
+        new_text,
+    })
+}
+
 impl Backend {
     pub fn new(client: Client) -> Self {
         Self {
@@ -231,18 +243,42 @@ impl LanguageServer for Backend {
             .await;
     }
     async fn formatting(&self, p: DocumentFormattingParams) -> Result<Option<Vec<TextEdit>>> {
-        let docs = self.docs.read().await;
-        let Some(doc) = docs.get(&p.text_document.uri) else {
-            return Ok(None);
+        let decision = {
+            let docs = self.docs.read().await;
+            let Some(doc) = docs.get(&p.text_document.uri) else {
+                return Ok(None);
+            };
+            let Some(ast) = &doc.ast else {
+                return Ok(None);
+            };
+            match formatting_edit(&doc.text, ast) {
+                Ok(edit) => Ok(edit),
+                Err(refusal) => Err((
+                    doc.version,
+                    doc.text.clone(),
+                    doc.diagnostics.clone(),
+                    refusal,
+                )),
+            }
         };
-        let Some(ast) = &doc.ast else {
-            return Ok(None);
-        };
-        let end = byte_to_position(&doc.text, doc.text.len());
-        Ok(Some(vec![TextEdit {
-            range: Range::new(Position::new(0, 0), end),
-            new_text: shoal_syntax::format_program(ast),
-        }]))
+        match decision {
+            Ok(edit) => Ok(Some(vec![edit])),
+            Err((version, text, mut diagnostics, refusal)) => {
+                diagnostics.truncate(MAX_DIAGNOSTICS.saturating_sub(1));
+                diagnostics.push(Diagnostic {
+                    range: span_range(&text, refusal.span),
+                    severity: Some(DiagnosticSeverity::WARNING),
+                    code: Some(NumberOrString::String("format_trivia".into())),
+                    source: Some("shoal-formatter".into()),
+                    message: refusal.message.into(),
+                    ..Default::default()
+                });
+                self.client
+                    .publish_diagnostics(p.text_document.uri, diagnostics, Some(version))
+                    .await;
+                Ok(None)
+            }
+        }
     }
     async fn completion(&self, p: CompletionParams) -> Result<Option<CompletionResponse>> {
         let docs = self.docs.read().await;
@@ -438,6 +474,21 @@ mod tests {
             std::env::temp_dir().join(format!("shoal-lsp-{label}-{}-{nonce}", std::process::id()));
         std::fs::create_dir(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn formatting_refuses_trivia_but_formats_hashes_inside_strings() {
+        let commented = "#!/usr/bin/env shoal\nlet x=1 # keep\n";
+        let ast = shoal_syntax::parse(commented).unwrap();
+        let refusal = formatting_edit(commented, &ast).unwrap_err();
+        assert_eq!(refusal.span.start, 0);
+        assert!(refusal.message.contains("cannot yet be preserved"));
+
+        let semantic_hash = "let hash=\"#\"";
+        let ast = shoal_syntax::parse(semantic_hash).unwrap();
+        let edit = formatting_edit(semantic_hash, &ast).unwrap();
+        assert_eq!(edit.new_text, "let hash = \"#\"\n");
+        assert_eq!(edit.range.end, Position::new(0, 12));
     }
 
     #[test]

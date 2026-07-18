@@ -262,6 +262,12 @@ shoal fmt --check file.shl
 
 Formatting is available only for a complete parse. Fix the single published syntax diagnostic, save, then format. The LSP does not currently offer recovery code actions.
 
+If the parse is complete but the document contains a comment or shebang, the LSP deliberately
+returns no edit and publishes a `format_trivia` warning at the first unpreservable `#`. `shoal fmt`
+uses the same decision and leaves the source unchanged. Remove the trivia only if that is intended;
+otherwise wait for the planned lossless formatter. A `#` inside a string or command word does not
+trigger this refusal.
+
 ### Error span looks like bytes, not characters
 
 Kernel/language spans are UTF-8 byte offsets. LSP converts them to UTF-16 positions for editors. A raw client must perform the same conversion rather than treating offsets as Unicode scalar indexes.

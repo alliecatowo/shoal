@@ -124,6 +124,11 @@ Use check mode in CI. It makes no edits and exits `1` if any input would change:
 shoal fmt --check scripts/*.shl
 ```
 
+The current AST does not retain free comments or shebangs. The formatter therefore leaves a parsed
+source unchanged when its token-aware safety pass finds either one; it never silently deletes them.
+A semantic `#` inside a quoted value, record key, `use` path, or raw command word is not mistaken for
+a comment and does not block formatting.
+
 ## Run diagnostics
 
 `shoal doctor` reports host and Shoal integration health:

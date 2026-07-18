@@ -205,16 +205,12 @@ pub(crate) fn fmt_command(check: bool, files: Vec<PathBuf>) -> Result<i32, Strin
     Ok(if check && changed { 1 } else { 0 })
 }
 
-/// The current AST intentionally omits free comments/trivia. Until that model
-/// grows lossless trivia, never rewrite a source containing `#`: doing so
-/// would silently delete shebangs, operational notes, and inline comments.
-/// A false positive for `#` inside a string merely leaves valid source alone.
+/// The current AST intentionally omits free comments/trivia. Delegate to the
+/// syntax crate's token-aware policy so CLI and LSP cannot disagree: comments
+/// and shebangs refuse formatting, while semantic `#` characters in strings
+/// and command words remain formatable.
 fn format_source_safely(src: &str, ast: &shoal_ast::Program) -> String {
-    if src.contains('#') {
-        src.to_owned()
-    } else {
-        shoal_syntax::format_program(ast)
-    }
+    shoal_syntax::format_source_preserving_trivia(src, ast).unwrap_or_else(|_| src.to_owned())
 }
 
 pub(crate) fn read_source_path(path: &Path) -> Result<String, String> {
@@ -362,6 +358,14 @@ mod tests {
         fs::write(&commented, original).unwrap();
         assert_eq!(fmt_command(false, vec![commented.clone()]).unwrap(), 0);
         assert_eq!(fs::read_to_string(commented).unwrap(), original);
+
+        let semantic_hash = t.path().join("semantic-hash.shl");
+        fs::write(&semantic_hash, "let hash=\"#\"").unwrap();
+        assert_eq!(fmt_command(false, vec![semantic_hash.clone()]).unwrap(), 0);
+        assert_eq!(
+            fs::read_to_string(semantic_hash).unwrap(),
+            "let hash = \"#\"\n"
+        );
     }
 
     #[test]

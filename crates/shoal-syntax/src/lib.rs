@@ -12,10 +12,12 @@
 
 pub mod commands;
 mod format;
+mod format_safety;
 pub mod lexer;
 mod parser;
 
 pub use format::{canonical_equivalent, format_program};
+pub use format_safety::{FormatRefusal, format_source_preserving_trivia};
 pub use lexer::{LexError, Lexer, Mode, Seg, Tok};
 pub use parser::{
     MAX_PARSE_NESTING, MAX_PARSE_TOKENS, MAX_SOURCE_BYTES, ParseCtx, ParseError, ParseResult,

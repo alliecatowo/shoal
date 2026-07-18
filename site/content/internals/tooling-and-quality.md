@@ -31,7 +31,9 @@ accDescr: Shows the components and relationships described in Editor service.
   Backend --> Docs["URI → versioned text + AST + symbols"]
   Docs --> ParseStatus["shoal_syntax::parse_status"]
   ParseStatus --> Diagnostics["one parse diagnostic"]
-  ParseStatus --> Format["canonical AST formatter"]
+  ParseStatus --> FormatSafety["token-aware trivia admission"]
+  FormatSafety --> Format["canonical AST formatter"]
+  FormatSafety --> Refuse["no edit + format_trivia"]
   Docs --> Completion["vocabulary + visible scoped symbols"]
   Docs --> Hover["symbol docs + language help"]
   Docs --> Definition["local + direct used-module definitions"]
@@ -44,6 +46,11 @@ a four-worker, 32 MiB/64-job scheduler. Same-URI floods retain only the latest p
 analysis cannot overwrite a newer version. A bounded stdio pump rejects excessive LSP headers or
 bodies before tower-lsp's codec allocates them. Definition lookup resolves local declarations and
 the exported members/paths of directly used file modules.
+
+Formatting and `shoal fmt` share `shoal-syntax`'s token-aware admission. Because the current AST
+does not retain free trivia, comments/shebangs produce no LSP edit and a located `format_trivia`
+warning instead of a destructive whole-document replacement. Semantic hashes inside quoted values
+and raw command tokens remain formatable.
 
 It does not currently implement a workspace/project index, references, rename, signature help,
 semantic tokens, code actions, file watching, or type-aware completion. Those features require a

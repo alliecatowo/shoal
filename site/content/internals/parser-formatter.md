@@ -210,6 +210,13 @@ indentation, normalized spaces/commas/operators, escaped double-quoted strings, 
 base units, quoted non-identifier record keys, and explicit parentheses where atom precedence needs
 them. It does not preserve comments or original whitespace because those are not in the AST.
 
+`format_source_preserving_trivia` is the shared CLI/LSP admission boundary in front of that printer.
+It maps every `#` to semantic AST leaf spans (quoted values/keys, `use` paths, and raw command
+heads/arguments). A hash outside those owned tokens is a comment or shebang and returns a located
+`FormatRefusal`; no replacement text is produced. Interpreter-block payloads containing `#` also
+refuse conservatively until the AST carries the exact payload span. This is a fail-safe bridge, not a
+substitute for the future lossless trivia model.
+
 ```mermaid
 flowchart LR
 accTitle: Canonical formatter
@@ -224,7 +231,7 @@ accDescr: Shows the components and relationships described in Canonical formatte
 ```
 
 Lossless distinctions that matter for formatting remain separate nodes—most visibly postfix `Catch`.
-Comments/doc comments are an exception: only function doc text is retained.
+Only function doc text is retained today; free comments/shebangs are protected by the refusal path.
 
 ## Grammar-change checklist
 

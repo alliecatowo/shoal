@@ -117,6 +117,98 @@ fn real_stdio_transport_supports_an_ordinary_editor_lifecycle() {
 }
 
 #[test]
+fn real_stdio_formatting_refuses_to_delete_comments_and_publishes_a_diagnostic() {
+    let mut child = spawn_lsp();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    write_frame(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"initialize",
+            "params":{"processId":null,"rootUri":null,"capabilities":{}}
+        }),
+    );
+    assert_eq!(read_frame(&mut stdout)["id"], 1);
+    write_frame(
+        &mut stdin,
+        &json!({"jsonrpc":"2.0","method":"initialized","params":{}}),
+    );
+
+    let uri = "file:///tmp/format-trivia.shl";
+    write_frame(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "method":"textDocument/didOpen",
+            "params":{"textDocument":{
+                "uri":uri,
+                "languageId":"shoal",
+                "version":7,
+                "text":"#!/usr/bin/env shoal\nlet x=1 # keep\n"
+            }}
+        }),
+    );
+    (0..4)
+        .map(|_| read_frame(&mut stdout))
+        .find(|frame| frame["method"] == "textDocument/publishDiagnostics")
+        .expect("initial analysis must publish diagnostics");
+
+    write_frame(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":2,
+            "method":"textDocument/formatting",
+            "params":{
+                "textDocument":{"uri":uri},
+                "options":{"tabSize":2,"insertSpaces":true}
+            }
+        }),
+    );
+    let mut response = None;
+    let mut diagnostic = None;
+    for _ in 0..6 {
+        let frame = read_frame(&mut stdout);
+        if frame["id"] == 2 {
+            response = Some(frame);
+        } else if frame["method"] == "textDocument/publishDiagnostics"
+            && frame["params"]["diagnostics"]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| item["code"] == "format_trivia"))
+        {
+            diagnostic = Some(frame);
+        }
+        if response.is_some() && diagnostic.is_some() {
+            break;
+        }
+    }
+    assert_eq!(
+        response.expect("formatting response")["result"],
+        Value::Null
+    );
+    let diagnostic = diagnostic.expect("format refusal diagnostic");
+    assert_eq!(diagnostic["params"]["version"], 7);
+    assert_eq!(
+        diagnostic["params"]["diagnostics"][0]["range"]["start"],
+        json!({"line":0,"character":0})
+    );
+
+    write_frame(
+        &mut stdin,
+        &json!({"jsonrpc":"2.0","id":3,"method":"shutdown","params":null}),
+    );
+    assert_eq!(read_frame(&mut stdout)["id"], 3);
+    write_frame(
+        &mut stdin,
+        &json!({"jsonrpc":"2.0","method":"exit","params":null}),
+    );
+    drop(stdin);
+    assert!(wait_for_exit(&mut child));
+}
+
+#[test]
 fn real_stdio_transport_rejects_absurd_content_length_without_a_body() {
     let mut child = spawn_lsp();
     let mut stdin = child.stdin.take().unwrap();
