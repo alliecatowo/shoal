@@ -556,12 +556,16 @@ Default limits are:
 | metadata bytes | 1 MiB |
 | declarations | 256 |
 | arguments | 256 |
+| compilation jobs | 2 process-wide |
+| compilation admission wait | 2 s (10 s hard ceiling) |
 | wall time | 2 s |
 
 Fuel, store limits, epoch deadlines, and cancellation bound guest execution. Synchronous Wasmtime
-compilation is bounded by the component-byte cap but is not itself epoch-interruptible, so admission
-size and compile cost remain relevant operational limits. Native host code, Wasmtime bugs, and the
-authority of an incorrectly implemented hostcall remain outside the guest sandbox claim.
+compilation is byte-bounded and admitted through a two-slot process-wide semaphore; admission wait
+is bounded, and Wasmtime's optional internal parallel compilation is disabled. The admitted compile
+is not itself epoch-interruptible, so its duration remains an operational limit. Native host code,
+Wasmtime bugs, and the authority of an incorrectly implemented hostcall remain outside the guest
+sandbox claim.
 
 ## Fail-open/fail-closed ledger
 

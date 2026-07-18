@@ -1,13 +1,16 @@
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
+    sync::{Arc, Condvar, Mutex},
+    time::{Duration, Instant},
 };
 use wasmtime::{
     Config, Engine, Store, StoreLimits, StoreLimitsBuilder, UpdateDeadline,
     component::{Component, HasSelf, Linker},
 };
+
+const MAX_COMPILATION_JOBS: usize = 2;
+const MAX_COMPILATION_WAIT: Duration = Duration::from_secs(10);
 
 mod abi {
     wasmtime::component::bindgen!({
@@ -128,6 +131,14 @@ pub struct Limits {
     pub plugins: usize,
     pub registry_component_bytes: usize,
     pub discovery_entries: usize,
+    /// Maximum component compilations admitted concurrently across this
+    /// process. This may be lowered from the hard ceiling of two; Wasmtime's
+    /// optional parallel-compiler feature is disabled.
+    pub compilation_jobs: usize,
+    /// Maximum time a registry load may wait for a compilation slot. This
+    /// bounds admission latency without pretending the synchronous compiler
+    /// itself can be interrupted. The hard ceiling is ten seconds.
+    pub compilation_wait: Duration,
     /// Coarse wall deadline for guest code run during instantiation. Component
     /// compilation is instead bounded by `component_bytes` because Wasmtime's
     /// synchronous compiler is not epoch-interruptible.
@@ -158,6 +169,8 @@ impl Default for Limits {
             plugins: 64,
             registry_component_bytes: 64 * 1024 * 1024,
             discovery_entries: 1024,
+            compilation_jobs: MAX_COMPILATION_JOBS,
+            compilation_wait: Duration::from_secs(2),
             wall_time: Duration::from_secs(2),
         }
     }
@@ -328,6 +341,79 @@ pub struct Host {
     _deadline_ticker: DeadlineTicker,
 }
 
+#[derive(Default)]
+struct CompilationAdmission {
+    active: Mutex<usize>,
+    changed: Condvar,
+}
+
+static COMPILATION_ADMISSION: std::sync::LazyLock<CompilationAdmission> =
+    std::sync::LazyLock::new(CompilationAdmission::default);
+
+struct CompilationLease<'a> {
+    admission: &'a CompilationAdmission,
+}
+
+impl Drop for CompilationLease<'_> {
+    fn drop(&mut self) {
+        let mut active = match self.admission.active.lock() {
+            Ok(active) => active,
+            Err(poisoned) => {
+                let active = poisoned.into_inner();
+                self.admission.active.clear_poison();
+                active
+            }
+        };
+        *active = active.saturating_sub(1);
+        self.admission.changed.notify_one();
+    }
+}
+
+fn acquire_compilation<'a>(
+    admission: &'a CompilationAdmission,
+    limit: usize,
+    wait: Duration,
+    name: &str,
+) -> Result<CompilationLease<'a>, PluginError> {
+    let error = |message: String| PluginError::Component {
+        name: name.into(),
+        message,
+    };
+    let mut active = admission.active.lock().map_err(|_| {
+        error("WASM compilation admission state is unavailable after an internal failure".into())
+    })?;
+    let deadline = Instant::now().checked_add(wait).ok_or_else(|| {
+        error(format!(
+            "WASM compilation admission wait {wait:?} exceeds the clock range"
+        ))
+    })?;
+    while *active >= limit {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(error(format!(
+                "WASM compilation admission limit ({limit}) remained full for {wait:?}"
+            )));
+        }
+        let (next, timed) = admission
+            .changed
+            .wait_timeout(active, remaining)
+            .map_err(|_| {
+                error(
+                    "WASM compilation admission state is unavailable after an internal failure"
+                        .into(),
+                )
+            })?;
+        active = next;
+        if timed.timed_out() && *active >= limit {
+            return Err(error(format!(
+                "WASM compilation admission limit ({limit}) remained full for {wait:?}"
+            )));
+        }
+    }
+    *active += 1;
+    Ok(CompilationLease { admission })
+}
+
 #[cfg(target_has_atomic = "64")]
 struct DeadlineTicker {
     cancel: Option<std::sync::mpsc::Sender<()>>,
@@ -419,11 +505,18 @@ impl Host {
             });
         }
         let digest = blake3::hash(&bytes);
+        let compilation = acquire_compilation(
+            &COMPILATION_ADMISSION,
+            self.limits.compilation_jobs,
+            self.limits.compilation_wait,
+            &manifest.name,
+        )?;
         let component =
             Component::new(&self.engine, &bytes).map_err(|error| PluginError::Component {
                 name: manifest.name.clone(),
                 message: bounded_text(error.to_string(), self.limits.metadata_bytes),
             })?;
+        drop(compilation);
         let mut store = self.new_store(
             &manifest.name,
             &manifest.effects,
@@ -843,6 +936,7 @@ fn validate_limits(limits: Limits) -> Result<(), PluginError> {
         ("plugins", limits.plugins),
         ("registry_component_bytes", limits.registry_component_bytes),
         ("discovery_entries", limits.discovery_entries),
+        ("compilation_jobs", limits.compilation_jobs),
     ] {
         if value == 0 {
             return Err(invalid(&format!("WASM limit `{name}` must be non-zero")));
@@ -865,6 +959,19 @@ fn validate_limits(limits: Limits) -> Result<(), PluginError> {
         return Err(invalid(
             "per-component byte limit exceeds registry component budget",
         ));
+    }
+    if limits.compilation_jobs > MAX_COMPILATION_JOBS {
+        return Err(invalid(&format!(
+            "WASM compilation_jobs exceeds the process-wide ceiling of {MAX_COMPILATION_JOBS}"
+        )));
+    }
+    if limits.compilation_wait.is_zero() {
+        return Err(invalid("WASM compilation_wait must be non-zero"));
+    }
+    if limits.compilation_wait > MAX_COMPILATION_WAIT {
+        return Err(invalid(&format!(
+            "WASM compilation_wait exceeds the process-wide ceiling of {MAX_COMPILATION_WAIT:?}"
+        )));
     }
     if limits.wall_time.is_zero() {
         return Err(invalid("WASM wall_time must be non-zero"));

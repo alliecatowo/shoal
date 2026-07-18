@@ -78,7 +78,7 @@ kernel version, every third-party adapter executable, or performance targets on 
 | MCP facade | Implemented | live-kernel integration | each active resource subscription still costs one connection and thread |
 | LSP | Partial | protocol tests and shared builtin names | declarations/completion remain mostly lexical, not evaluator-semantic |
 | secrets | Implemented, host-limited | secret value redaction and port tests | storage backend and host coverage are narrow by design |
-| WASM | Implemented, preview ABI | evaluator invocation and Wasmtime limit/deadline tests | synchronous component compilation is byte-bounded rather than interruptible; ABI surface is intentionally narrow |
+| WASM | Implemented, preview ABI | evaluator invocation and Wasmtime limit/deadline/admission tests | compilation is byte-bounded and limited to two process-wide jobs with bounded admission wait, but an admitted compile is not interruptible; ABI surface is intentionally narrow |
 | Windows | Aspirational | explicit deferred branches | Unix sockets, job control, PTY, sandbox, and path rules need a separate port |
 
 ## Host-surface parity
@@ -230,7 +230,7 @@ planned/denied without a claim that allowed traffic is network-confined.
 | language EventBus | Implemented with scale limits | stream drop closes/prunes its queue | 1,024-event/256 KiB replay ring; 256-event/256 KiB subscriber queues with explicit gap records | 64 channel identities and 64 live subscribers per evaluator; publish fan-out still holds the channel-map mutex |
 | stream to command stdin | Implemented for capture mode | command/caller cancellation stops the pump | 16 queued chunks, each at most 64 KiB | PTY mode rejects stream stdin; no wire stream-pull protocol |
 | stream over wire | Scaffolded label | no pull cancellation | no cursor/item budget | `WireValue::Stream` is descriptive only |
-| WASM invocation | Implemented preview ABI | fuel, epoch deadline, and session cancellation | memory/table/instance/argument/value/hostcall limits | synchronous component compilation is bounded by component bytes, not a wall interrupt |
+| WASM invocation | Implemented preview ABI | fuel, epoch deadline, and session cancellation | memory/table/instance/argument/value/hostcall limits plus a two-slot process-wide compiler semaphore | an admitted synchronous component compile is not wall-interruptible |
 
 The former child-context escalation defect is closed: production child evaluators for `spawn`,
 parallel, channels, scripts, and streams build through one audited constructor carrying Leash,
@@ -526,7 +526,8 @@ This is a status list, not the work order; ordering and exit criteria live in th
 3. kernel task suspend/resume is process-backed only and has no pre-operation capability discovery;
 4. MCP subscriptions remain one connection/thread per active URI;
 5. filesystem/network sandbox coverage is platform- and effect-limited;
-6. plugin ABI v1 is deliberately narrow and synchronous component compilation is only byte-bounded;
+6. plugin ABI v1 is deliberately narrow, and admitted synchronous component compilation cannot be
+   preempted even though input bytes, concurrent jobs, and admission wait are bounded;
 7. auth has no live token-administration RPC even though file changes are observed immediately;
 8. kernel quotas and separate evaluator budgets bound retained sessions, 64 native workers per
    session (512 process-wide), 256 executable plans, and 1,024 memoized modules; these remain

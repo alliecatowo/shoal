@@ -202,6 +202,56 @@ fn accepts_component_implementing_the_versioned_world() {
 }
 
 #[test]
+fn compilation_admission_wait_is_bounded_and_slots_are_reclaimed() {
+    let admission = CompilationAdmission::default();
+    let first = acquire_compilation(&admission, 1, Duration::from_millis(1), "first").unwrap();
+    let error = acquire_compilation(&admission, 1, Duration::from_millis(1), "second")
+        .err()
+        .expect("a full compiler budget must time out");
+    assert!(error.to_string().contains("admission limit (1)"));
+    drop(first);
+    let replacement =
+        acquire_compilation(&admission, 1, Duration::from_millis(1), "replacement").unwrap();
+    assert_eq!(*admission.active.lock().unwrap(), 1);
+    drop(replacement);
+    assert_eq!(*admission.active.lock().unwrap(), 0);
+}
+
+#[test]
+fn compilation_configuration_cannot_raise_process_wide_ceilings() {
+    let too_many = Limits {
+        compilation_jobs: MAX_COMPILATION_JOBS + 1,
+        ..Limits::default()
+    };
+    assert!(
+        Host::new(too_many)
+            .err()
+            .expect("an excessive compilation limit must fail")
+            .to_string()
+            .contains("ceiling")
+    );
+
+    let too_long = Limits {
+        compilation_wait: MAX_COMPILATION_WAIT + Duration::from_nanos(1),
+        ..Limits::default()
+    };
+    assert!(
+        Host::new(too_long)
+            .err()
+            .expect("an excessive compilation wait must fail")
+            .to_string()
+            .contains("ceiling")
+    );
+}
+
+#[test]
+fn wasmtime_parallel_compilation_feature_stays_disabled() {
+    let manifest = include_str!("../../Cargo.toml");
+    assert!(manifest.contains("default-features=false"));
+    assert!(!manifest.contains("parallel-compilation"));
+}
+
+#[test]
 fn rejects_ambient_import() {
     let (_temp, path) = fixture("(component (import \"wasi:filesystem/types@0.2.0\" (instance)))");
     let mut registry = Registry::new(Limits::default()).unwrap();

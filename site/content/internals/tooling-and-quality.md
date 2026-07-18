@@ -292,11 +292,19 @@ Decision: **keep it in ordinary workspace CI; the runtime path is load-bearing.*
   `Cargo.toml`/`Cargo.lock` and CI matrix changes (a dependency-shape change, not a lint/doc one);
   evaluator integration needs the same locked graph and gate as other command dispatch paths;
   splitting it into a separate job would no longer test the real workspace composition.
-- The crate is small (single `lib.rs`, ~250 lines) and its own compile is fast; the cost is entirely
-  `wasmtime`/`cranelift`'s, and `Swatinem/rust-cache` already amortizes that across CI runs on the
+- Shoal's host wrapper is split across a few small modules and is much cheaper to compile than its
+  backend; the cost is dominated by `wasmtime`/`cranelift`, and `Swatinem/rust-cache` already
+  amortizes that across CI runs on the
   same OS/lockfile, so the marginal per-PR cost after a cache hit is low.
 - Runtime/evaluator tests exercise validation, resource limits, deadlines, cancellation, and the
   declared host calls; compiling only the leaf crate would miss that integration.
+
+Runtime component compilation has a separate admission boundary: a process-wide semaphore admits
+at most two synchronous compilers, the configurable wait defaults to two seconds and cannot exceed
+ten seconds, and Wasmtime's optional parallel-compilation feature is not enabled. Component and
+registry byte ceilings still apply. An admitted `Component::new` call is not epoch-interruptible;
+this policy bounds concurrency amplification and admission delay, not the duration of the compiler
+call itself.
 
 Revisit this decision (feature flag or a carefully equivalent matrix) only if measured CI cost
 justifies preserving the same evaluator integration coverage another way.

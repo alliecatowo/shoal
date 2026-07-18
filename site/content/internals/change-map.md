@@ -209,15 +209,20 @@ kinds without a schema discriminator.
 **Direction:** add an entry kind/parent-exec relation or choose one canonical lifecycle. Return IDs
 directly instead of inferring latest rows.
 
-### Medium: remaining WASM and provider paths
+### Medium: remaining WASM ABI and provider paths
 
-These are three separate, explicitly unimplemented surfaces:
+These are two separate, explicitly unimplemented surfaces:
 
 | Gap | Source evidence | Architectural work required |
 |---|---|---|
 | WASM ABI evolution | preview ABI v1 is integrated with declared+authorized hostcalls and bounded values | keep new hostcalls effect-scoped, versioned, cancellable, and adversarially tested |
-| WASM compilation latency | invocation has fuel/epoch/cancellation/wall-time limits, but synchronous compilation is only byte-capped | cache/admission policy if compile latency becomes an operational problem |
 | Reef provider subprocess sandboxing | restricted evaluator probes/installers fail closed when policy requires an OS filesystem sandbox | carry the sandboxed spawn capability into allowed provider subprocesses |
+
+Compilation admission is now closed as a concurrency-amplification gap: at most two component
+compilers run process-wide, callers wait at most a configured two seconds by default (with an
+immutable ten-second ceiling), and Wasmtime's optional parallel-compilation feature is disabled.
+The admitted compiler remains synchronous and cannot be epoch-interrupted; hard per-compilation
+preemption would require an isolated compiler process or trusted precompiled artifacts.
 
 PTY change subscription is also absent; MCP callers poll rendered screens. Do not paper over these
 gaps with eager materialization or background threads without a lifecycle protocol.
