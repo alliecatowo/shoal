@@ -80,6 +80,7 @@ error messages never quote the rejected URI, tool name, path, body, or bearer.
 |---|---|---:|---|
 | `session.attach` | `session.rs` | creates it | session/auth mutation |
 | `session.env/snapshot`, `kernel.status/shutdown` | `session.rs`/`lifecycle.rs` | yes | owner/session and process lifecycle |
+| `auth.token.list/create/revoke` | `handlers_auth.rs` | yes | durable credential administration with explicit `token.admin` authority |
 | `session.reef` | `session.rs` | yes | evaluator cache read |
 | `parse` | `handlers_session.rs` | no | pure syntax |
 | `complete` | `handlers_session.rs` | no | lexical completion |
@@ -98,6 +99,13 @@ Both former exemptions are closed: `journal.query` requires attachment (HR-D4), 
 requires attachment and binds an approver identity distinct from the requester (HR-D1/D2/D3). The only
 methods that remain naturally public are attach, context-free parse, and context-free completion. The
 socket's `0600` mode limits OS users, not Shoal token principals — the approver-identity binding does.
+
+Live token administration is available only on durable kernels. An embedded server-established
+human or a bearer carrying the exact `token.admin` capability may list metadata, create a bearer, or
+revoke by public token ID. Create returns the random bearer exactly once; list never exposes bearer
+or digest material. The `supervisor` profile and `plan.approve` capability deliberately do not imply
+credential minting authority. Revocation uses the token store's locked atomic transaction and the
+existing per-request attachment revalidation invalidates a live bearer on its next call.
 
 ## `session.*`
 

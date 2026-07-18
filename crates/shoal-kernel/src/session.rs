@@ -132,6 +132,19 @@ pub(crate) struct Attachment {
     pub(crate) connection_trust: ConnectionTrust,
 }
 
+impl Attachment {
+    /// Token administration is narrower than plan approval/shutdown. A public
+    /// machine credential must carry the explicit `token.admin` capability;
+    /// profile strings and `plan.approve` do not imply credential issuance.
+    pub(crate) fn can_admin_tokens(&self) -> bool {
+        self.connection_trust == ConnectionTrust::EmbeddedHuman
+            || self
+                .bearer
+                .as_ref()
+                .is_some_and(|meta| meta.caps.iter().any(|cap| cap == "token.admin"))
+    }
+}
+
 pub(crate) struct Session {
     pub(crate) key: SessionKey,
     pub(crate) id: String,

@@ -3,6 +3,7 @@
 mod dispatch;
 mod enforcement;
 mod eventbus;
+mod handlers_auth;
 mod handlers_exec;
 mod handlers_pty;
 mod handlers_session;

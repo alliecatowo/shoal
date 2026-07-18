@@ -1,6 +1,7 @@
 use super::*;
 
 mod task_control;
+mod token_admin;
 
 fn serve_embedded_test_stream(kernel: Arc<Kernel>, stream: UnixStream) -> io::Result<()> {
     kernel.handle_stream_with_trust(stream, ConnectionTrust::EmbeddedHuman)

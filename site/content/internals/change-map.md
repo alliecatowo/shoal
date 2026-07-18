@@ -147,9 +147,9 @@ The former approval, journal, plan-identity, named-session, and token-snapshot d
 - token operations use shared/exclusive fd locks and fresh disk reads, while attached requests
   revalidate live and fail closed on revocation, expiry, or store failure.
 
-Regression work belongs in collision, concurrency, audit-failure, and live-revocation tests. Token
-`profile` and `caps` remain descriptive attach metadata: principal Leash policy and explicit handler
-checks are the authorization boundary.
+Regression work belongs in collision, concurrency, audit-failure, and live-revocation tests. Most
+token labels remain descriptive attach metadata; principal Leash policy plus the exact
+`plan.approve` and `token.admin` handler checks are the authorization boundary.
 
 ### Resolved: shared evaluator composition with enforced surface profiles
 
@@ -165,6 +165,19 @@ terminal startup code. Prompt/editor/history UI remains correctly owned by the C
 **Proof:** host tests apply the same env, aliases, and configured adapter directories across all
 profiles and pin the init omission. Real daemon tests prove private interactive init execution and
 durable public-kernel omission of a configured malformed init file.
+
+### Resolved: live token administration has separate explicit authority
+
+Durable kernels expose metadata list, one-time bearer creation, and ID-based revocation through raw
+RPC. The handlers reuse `TokenStore`'s fresh-load interprocess locks and atomic publication, so the
+standalone CLI and a live kernel cannot overwrite each other's updates. List never exposes bearer or
+digest material, and ephemeral kernels refuse because they have no durable credential store.
+
+Credential administration is deliberately narrower than plan approval and shutdown: public bearer
+attachments require exact `token.admin`. Neither the `supervisor` profile nor `plan.approve` can mint
+credentials. Tests create and attach a worker through the live RPC, revoke it, and require its next
+request to fail existing revalidation; public supervisor denial and embedded-human ephemeral refusal
+cover both trust boundaries.
 
 ### Resolved: policy and OS containment report sharp trust assumptions
 

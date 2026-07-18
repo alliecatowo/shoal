@@ -178,7 +178,7 @@ unattached caller before approval or storage access.
 | `exec` | yes | Run, plan, or internally apply source. |
 | `value.get` | yes | Select/slice/render a transcript value. |
 | `blob.get` | yes | Read CAS content by hash. |
-| `journal.query` | **currently no** | Query global durable journal; missing gate is a defect. |
+| `journal.query` | yes | Query the attached principal/session's durable journal view. |
 | `task.list` | yes | List session tasks. |
 | `task.get` | yes | Snapshot a task. |
 | `task.await` | yes | Block until a task terminal state. |
@@ -188,7 +188,10 @@ unattached caller before approval or storage access.
 | `plan.get` | yes | Inspect stored plan. |
 | `plan.list` | yes | List plans matching stored caller metadata. |
 | `plan.apply` | yes | Apply an allowed/approved stored plan. |
-| `cap.request` | **currently no** | Approve known plan; missing gate is a defect. |
+| `cap.request` | yes | Approve a known plan with explicit approver authority. |
+| `auth.token.list` | yes + `token.admin` | List durable token metadata. |
+| `auth.token.create` | yes + `token.admin` | Create and return one bearer exactly once. |
+| `auth.token.revoke` | yes + `token.admin` | Revoke a public token ID. |
 | `pty.open` | yes | Spawn interactive child. |
 | `pty.send` | yes | Write terminal input. |
 | `pty.read` | yes | Read emulated screen. |
@@ -199,6 +202,18 @@ unattached caller before approval or storage access.
 | `events.publish` | yes | Publish `user.*`. |
 | `events.subscribe` | yes | Push channel events on connection. |
 | `events.unsubscribe` | yes | Remove same-connection subscription. |
+
+## Token administration
+
+Durable kernels accept raw `auth.token.list {}`, `auth.token.create`, and `auth.token.revoke` only
+from an embedded server-established human or a bearer with exact `token.admin`. `supervisor` and
+`plan.approve` do not imply credential minting. MCP does not expose these as ordinary tools.
+
+Create params are `principal`, optional `profile` (default `default`), bounded `caps`, and optional
+positive `ttl_seconds`. Its result contains `token`, public `meta`, and `secret_shown_once:true`;
+the bearer/digest/key never appears in list. Revoke takes `{ "id": "16-hex-id" }` and returns a
+boolean, including `false` for a well-formed absent ID. Revocation invalidates a live attachment on
+its next request.
 
 ## Session inspection
 

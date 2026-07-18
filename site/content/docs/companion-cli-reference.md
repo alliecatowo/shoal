@@ -290,7 +290,9 @@ more than 128 capability labels, a full 4,096-record store, or a candidate docum
 Capability labels are stored in deterministic sorted order. Rejection is transactional: the prior
 authority file remains unchanged.
 
-Important: profile/capability values are metadata reported at attachment, not grants. Leash authorization uses the principal's policy entry. See [Security and trust boundaries](@/docs/security.md#profile-and-cap-are-metadata-today).
+Important: profile/capability values do not grant Leash effects; those use the principal's policy
+entry. Exact administrative labels such as `token.admin` are consumed by their named handlers. See
+[Security and trust boundaries](@/docs/security.md#profile-and-cap-mostly-describe-metadata).
 
 ### List
 

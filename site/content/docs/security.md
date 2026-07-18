@@ -134,9 +134,18 @@ snapshot. Shoal does not repair, truncate, or evict authority records automatica
 file intact for operator diagnosis. Creation rejects invalid/capacity-exceeding input before
 publishing any in-memory or on-disk change.
 
-### Profile and `--cap` are metadata today
+A durable kernel also exposes raw `auth.token.list`, `auth.token.create`, and `auth.token.revoke`
+RPCs. They require either the server-established embedded-human trust root or a bearer created with
+the exact `token.admin` capability. `supervisor` and `plan.approve` cannot mint credentials. Create
+returns the bearer once; list exposes metadata only. Revoking an attached bearer invalidates that
+connection's authority on its next request. MCP does not project these operator methods as tools.
 
-The kernel copies token `profile` and `caps` into the `session.attach` result, but authorization does not derive grants from them. Leash evaluates the token's **principal string** against `[principal."..."]` in the policy file.
+### Profile and `--cap` mostly describe metadata
+
+The kernel copies token `profile` and `caps` into the `session.attach` result. Leash grants still come
+from the token's **principal string** in `[principal."..."]`, not those labels. Exact administrative
+exceptions exist: `plan.approve` enables cross-principal plan approval, and `token.admin` enables the
+live management RPCs. The legacy `supervisor` profile enables approval/shutdown, not token creation.
 
 This means:
 
@@ -145,7 +154,7 @@ This means:
 - two tokens with the same principal share the same Leash policy even if their metadata labels differ;
 - operators must keep token metadata and policy entries consistent themselves.
 
-Treat the fields as claims/labels for clients and auditing, not enforced capability objects.
+Treat other fields as claims/labels for clients and auditing, not enforced capability objects.
 
 ### Live revocation and fail-closed reload
 

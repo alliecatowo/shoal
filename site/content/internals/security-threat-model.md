@@ -132,21 +132,21 @@ separation. A process that can modify this file can change principals/cap string
 
 ## Token capabilities versus policy authority
 
-At `session.attach`, the kernel reports token `caps` and `profile`, but policy evaluation uses the
-token's `principal`. The cap strings are metadata in the shown attach path, not an independent
-enforced intersection with Leash grants. Security review must follow principal policy, handler
-checks, and resource ownership—not assume the returned token-cap array is a capability engine.
+At `session.attach`, the kernel reports token `caps` and `profile`, but Leash policy evaluation uses
+the token's `principal`; labels do not independently intersect filesystem/process policy. Two exact
+machine-administration labels are consumed by handlers: `plan.approve` authorizes approval of another
+principal's plan, and `token.admin` authorizes live durable-token management. The legacy `supervisor`
+profile also authorizes plan approval/shutdown but deliberately does not authorize token minting.
 
 No-token attach on a public socket uses restricted `agent:mcp`; public clients cannot assert
 `local-human`. Only the private REPL's inherited anonymous descriptor supplies the server-selected
 local-human identity. A durable kernel validates a provided bearer with `TokenStore::validate`;
 invalid, expired, or revoked tokens share an auth-failed response.
 
-`PROFILE` and repeated `--cap` values accepted by `shoal-token create` are not authorization rules.
-They are copied into `AttachResult.caps.profile`/`token_caps` for client metadata. No handler
-intersects them with Leash, and no resource check consumes them; the token's `principal` is the value
-used to look up policy. Creating a token with `--cap fs.read` grants nothing unless that principal's
-Leash policy and handler ownership rules already allow the operation.
+`PROFILE` and repeated `--cap` values accepted by `shoal-token create` do not alter Leash rules. They
+are copied into `AttachResult.caps.profile`/`token_caps`; only the exact administrative exceptions
+above are handler-consumed. Creating a token with `--cap fs.read` grants nothing unless that
+principal's Leash policy and handler ownership rules already allow the operation.
 
 ## Named session isolation
 
