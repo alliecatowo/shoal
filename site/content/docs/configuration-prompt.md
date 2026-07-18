@@ -379,7 +379,7 @@ shoal prompt explain --side right
 shoal prompt bench --side left --n 1000
 ```
 
-If the prompt exceeds `budget.render_deadline_ms`, Shoal can warn when `warn_on_exceed` is enabled. Static/Git/Reef snapshot work should stay cheap. Custom commands run on the bounded post-command scheduler and never inside the renderer; their 250 ms execution budget is separate from the pure render deadline.
+If the prompt exceeds `budget.render_deadline_ms`, Shoal warns once per refreshed interactive snapshot when `warn_on_exceed` is enabled. The warning uses Reedline's bounded, nonblocking notice queue; saturation is counted and reported by a later warning instead of delaying input. Static/Git/Reef snapshot work should stay cheap. Custom commands run on the bounded post-command scheduler and never inside the renderer; their 250 ms execution budget is separate from the pure render deadline.
 
 ## Troubleshooting configuration
 

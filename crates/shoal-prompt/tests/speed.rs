@@ -84,3 +84,15 @@ fn common_path_render_is_sub_millisecond() {
         "p99 render {p99}ns exceeded the 5ms hard deadline"
     );
 }
+
+#[test]
+fn budget_report_observes_an_impossible_deadline() {
+    let mut config = PromptConfig::default();
+    config.budget.render_deadline_ms = 0;
+    let (renderer, warnings) = Renderer::new(config);
+    assert!(warnings.is_empty());
+
+    let report = renderer.budget_report(&PromptContext::empty("/".into()));
+    assert!(report.over_budget);
+    assert!(report.slowest > Duration::ZERO);
+}

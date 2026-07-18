@@ -129,7 +129,7 @@ Top-level configuration is:
 | `format.transient` | `$character ` | post-submit replacement prompt |
 | `transient.enabled` | `false` | install Reedline transient prompt |
 | `budget.render_deadline_ms` | `5` | stop rendering later modules after elapsed budget |
-| `budget.warn_on_exceed` | `true` | accepted but **not observed by renderer/host** |
+| `budget.warn_on_exceed` | `true` | sample once per refreshed snapshot and enqueue a bounded warning on overrun |
 | `style.*` | semantic palette | named style indirection |
 | `module.*` | per-module defaults | visibility, symbols, format, style |
 
@@ -181,8 +181,13 @@ This is a degradation budget, not preemption: one unexpectedly slow module can i
 deadline before later modules are skipped. Today modules are pure and small, so the main protection
 is against future renderer regressions.
 
-`warn_on_exceed` is not consulted. The standalone `shoal prompt bench` command returns a failure
-status when measured p99 exceeds the deadline, but ordinary prompt rendering does not warn.
+Between commands, the interactive host renders all three interactive sides once against the newly
+refreshed snapshot and compares the slowest call with the configured deadline. When
+`warn_on_exceed` is enabled, an overrun is sent through Reedline's bounded nonblocking notice
+queue. Queue saturation never delays input; a later warning reports how many notices were
+suppressed. This sampling does not add logging or mutable state to per-keystroke rendering. The
+standalone `shoal prompt bench` command separately returns failure when measured p99 exceeds the
+deadline.
 
 ## Style grammar
 
@@ -235,7 +240,6 @@ The current source contains several schema promises without a consuming path:
 
 - `directory.truncate_style` does not choose another truncation algorithm;
 - `git_status.engine` does not select an engine; the host always uses its current reader;
-- `budget.warn_on_exceed` does not emit a runtime warning;
 - `battery.sample_interval_s` has no sampler;
 - `language.probe_ttl_s` has no prompt-side probe cache;
 - `PromptContext.multiline` exists but no module currently reads it.

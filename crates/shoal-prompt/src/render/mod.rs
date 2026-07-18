@@ -23,6 +23,16 @@ pub struct RenderedPrompt {
     pub indicator: String,
 }
 
+/// Timing result from rendering every interactive prompt side once.
+///
+/// Hosts can sample this between commands and surface a bounded warning without
+/// putting logging or other side effects in the per-keystroke render path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenderBudgetReport {
+    pub slowest: Duration,
+    pub over_budget: bool,
+}
+
 /// Which format string to render.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side {
@@ -74,6 +84,20 @@ impl Renderer {
             right: self.render_side(Side::Right, ctx),
             continuation: self.render_side(Side::Continuation, ctx),
             indicator: String::new(),
+        }
+    }
+
+    /// Render each interactive side once and report the slowest call.
+    pub fn budget_report(&self, ctx: &PromptContext) -> RenderBudgetReport {
+        let mut slowest = Duration::ZERO;
+        for side in [Side::Left, Side::Right, Side::Continuation] {
+            let start = Instant::now();
+            let _ = self.render_side(side, ctx);
+            slowest = slowest.max(start.elapsed());
+        }
+        RenderBudgetReport {
+            slowest,
+            over_budget: slowest > Duration::from_millis(self.config.budget.render_deadline_ms),
         }
     }
 

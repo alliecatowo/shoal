@@ -39,11 +39,13 @@ use shoal_value::Value;
 
 use crate::repl_state::ProtocolSnapshot;
 
+mod budget;
 mod cli;
 mod config;
 mod custom;
 mod git;
 
+pub(crate) use budget::PromptBudgetWarnings;
 pub use cli::{PromptAction, parse_action, run};
 pub use config::load_prompt_config;
 pub(crate) use custom::{CUSTOM_ONE_SHOT_WAIT, CustomScheduler};

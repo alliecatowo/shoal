@@ -44,4 +44,4 @@ pub use context::{
 };
 pub use fmt::{format_duration, format_duration_ns, format_size};
 pub use format::{FormatToken, parse_format, referenced_ids};
-pub use render::{RenderedPrompt, Renderer, Side};
+pub use render::{RenderBudgetReport, RenderedPrompt, Renderer, Side};

@@ -22,6 +22,7 @@ pub(super) struct ReplUi {
     pub(super) shared_ctx: prompt::SharedCtx,
     pub(super) static_facts: prompt::StaticFacts,
     custom: prompt::CustomScheduler,
+    budget_warnings: prompt::PromptBudgetWarnings,
     pub(super) pager: PagerContext,
 }
 
@@ -84,7 +85,7 @@ impl ReplUi {
             .with_history_exclusion_prefix(config.history.ignore_space.then(|| " ".to_string()));
         if transient_enabled {
             editor = editor.with_transient_prompt(Box::new(prompt::ShoalPrompt::new(
-                renderer,
+                renderer.clone(),
                 shared_ctx.clone(),
                 true,
             )));
@@ -116,6 +117,10 @@ impl ReplUi {
                 shared_ctx,
                 static_facts,
                 custom,
+                budget_warnings: prompt::PromptBudgetWarnings::new(
+                    renderer,
+                    background_printer.clone(),
+                ),
                 pager: PagerContext {
                     enabled: config.render.paging == "auto",
                     pager: config.render.pager.clone(),
@@ -139,6 +144,7 @@ impl ReplUi {
             None => prompt::build_context(evaluator, &self.static_facts, width),
         };
         context.custom = self.custom.refresh(&context.cwd, evaluator.env_vars());
+        self.budget_warnings.observe(&context);
         if let Ok(mut cell) = self.shared_ctx.write() {
             *cell = Arc::new(context);
         }
