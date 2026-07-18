@@ -132,7 +132,7 @@ fn on_handler_inherits_the_spawn_gate() {
     let src = format!(
         "on(channel(\"cmd\"), (ev) => {{ channel(\"res\").emit(try {{ ({}).ok }} catch {{ \"DENIED\" }}) }})\n\
          channel(\"cmd\").emit(1)\n\
-         channel(\"res\").take(timeout: 30s)",
+         channel(\"res\").events(since: 0).take(1).take_until(every(30s)).map(ev => ev.payload).collect().first()",
         cat_src(&ok)
     );
     let out = ev
@@ -200,7 +200,7 @@ fn on_handler_inherits_config() {
     let mut ev = config_evaluator(d.path());
     let src = "on(channel(\"cmd\"), (ev) => { channel(\"cfg\").emit(config.get(\"b_marker\")) })\n\
                channel(\"cmd\").emit(1)\n\
-               channel(\"cfg\").take(timeout: 30s)";
+               channel(\"cfg\").events(since: 0).take(1).take_until(every(30s)).map(ev => ev.payload).collect().first()";
     let out = ev.eval_program(&parse(src)).expect("handler config read");
     assert_eq!(out, Value::Str("propagated".into()), "on: {out:?}");
 }
@@ -354,7 +354,7 @@ fn on_handler_inherits_reef_resolution() {
     // handler reports `"MISS"`.
     let src = "on(channel(\"cmd\"), (ev) => { channel(\"res\").emit(try { (faketool).ok } catch { \"MISS\" }) })\n\
                channel(\"cmd\").emit(1)\n\
-               channel(\"res\").take(timeout: 30s)";
+               channel(\"res\").events(since: 0).take(1).take_until(every(30s)).map(ev => ev.payload).collect().first()";
     let out = ev
         .eval_program(&parse(src))
         .expect("on-handler reports a result");
@@ -384,7 +384,7 @@ fn shl_script_inherits_reef_resolution() {
 // child inherits the SAME `Arc` (not a private bus) is pinned white-box by
 // `Arc::ptr_eq` in `child_context.rs::decomposition_characterization`; the
 // `on`-handler routes above additionally exercise a child publishing onto a
-// channel the parent consumes. A late-subscriber behavioral variant (child emits
-// before the parent subscribes) is deliberately omitted: session channels are
-// pub/sub with no retention for a subscriber that arrives after the emit, so
-// such a test races rather than proving bus sharing.
+// channel the parent consumes. Those assertions use the bounded channel ring's
+// `since: 0` replay, so a fast child cannot publish between the trigger and a
+// late `.take()` subscription and turn context propagation into a scheduler
+// race. A 30-second timer keeps a real missing publication bounded.
