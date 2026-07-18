@@ -26,8 +26,10 @@ use reedline::{
     SearchDirection, SearchQuery,
 };
 use shoal_eval::Evaluator;
-use shoal_syntax::{ParseCtx, parse_with_ctx};
-use shoal_value::{Env, Value};
+use shoal_syntax::parse_with_ctx;
+#[cfg(test)]
+use shoal_value::Env;
+use shoal_value::Value;
 
 use crate::completer;
 #[cfg(test)]
@@ -271,7 +273,7 @@ fn handle_submitted_line(
         background.suppress(&task);
     }
     let run_src = rewrite_fg(&src).unwrap_or(src);
-    let context = parse_ctx_for(evaluator.env());
+    let context = evaluator.parse_context(true);
     let mut program = match parse_with_ctx(&run_src, context) {
         Ok(program) => program,
         Err(error) => {
@@ -310,25 +312,6 @@ fn handle_submitted_line(
         Err(error) => report_eval_error(&run_src, None, &error),
     }
     None
-}
-
-/// Build the parser's dispatch context from the live session environment.
-/// Value bindings dispatch expressions; callables dispatch commands.
-fn parse_ctx_for(env: &Env) -> ParseCtx {
-    let mut value_bound = Vec::new();
-    let mut cmd_bound = Vec::new();
-    for name in env.visible_names() {
-        match env.get(&name) {
-            Some(v) if v.is_callable() => cmd_bound.push(name),
-            Some(_) => value_bound.push(name),
-            None => {}
-        }
-    }
-    ParseCtx {
-        repl: true,
-        value_bound,
-        cmd_bound,
-    }
 }
 
 #[cfg(test)]

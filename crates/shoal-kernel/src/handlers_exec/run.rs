@@ -26,15 +26,13 @@ impl Kernel {
         // dispatch. Hold the evaluator lock from context construction through
         // evaluation so an async worker cannot parse against a stale Env.
         let mut evaluator = session.lock_evaluator()?;
-        let mut ast = shoal_syntax::parse_with_ctx(
-            &params.src,
-            parse_ctx_for_kernel(evaluator.env(), interactive),
-        )
-        .map_err(|e| RpcError {
-            code: PARSE_ERROR,
-            message: e.msg,
-            data: Some(json!({"span":e.span,"hint":e.hint})),
-        })?;
+        let mut ast =
+            shoal_syntax::parse_with_ctx(&params.src, evaluator.parse_context(interactive))
+                .map_err(|e| RpcError {
+                    code: PARSE_ERROR,
+                    message: e.msg,
+                    data: Some(json!({"span":e.span,"hint":e.hint})),
+                })?;
         session.rewrite_out_undo(&mut ast);
         let ast_json = serde_json::to_string(&ast).map_err(internal)?;
         if let Some(cancel) = attachment.cancel_epoch.clone() {

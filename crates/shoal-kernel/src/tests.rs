@@ -4504,6 +4504,49 @@ fn value_position_captures_final_expr_of_multi_statement_src() {
 }
 
 #[test]
+fn later_kernel_requests_parse_with_live_session_bindings() {
+    let kernel = Kernel::new();
+    let (mut client, mut reader, thread) = spawn(&kernel);
+    attach(&mut client, &mut reader);
+
+    let define = call(
+        &mut client,
+        &mut reader,
+        2,
+        "exec",
+        json!({"src":"let persisted = 40","position":"value"}),
+    );
+    assert!(define.error.is_none(), "binding request failed: {define:?}");
+
+    // A context-free parse treats an unadorned word at statement head as an
+    // external command. The live evaluator snapshot must instead classify
+    // this as an expression in both plan and run modes.
+    let plan = call(
+        &mut client,
+        &mut reader,
+        3,
+        "exec",
+        json!({"src":"persisted + 2","mode":"plan","position":"value"}),
+    );
+    assert!(plan.error.is_none(), "bound-value plan failed: {plan:?}");
+    assert_eq!(plan.result.unwrap()["effects"], json!([]));
+
+    let run = call(
+        &mut client,
+        &mut reader,
+        4,
+        "exec",
+        json!({"src":"persisted + 2","position":"value"}),
+    );
+    assert!(run.error.is_none(), "bound-value run failed: {run:?}");
+    assert_eq!(run.result.unwrap()["value"], json!({"$":"int","v":42}));
+
+    drop(client);
+    drop(reader);
+    thread.join().unwrap();
+}
+
+#[test]
 fn raised_error_still_yields_an_inspectable_transcript_ref() {
     let kernel = Kernel::new();
     let (mut client, mut reader, thread) = spawn(&kernel);

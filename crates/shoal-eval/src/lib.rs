@@ -180,6 +180,27 @@ impl Evaluator {
         &mut self.exec.shell.env
     }
 
+    /// Snapshot the live lexical names that affect statement-head parsing.
+    /// Hosts use this immediately before parsing while they retain exclusive
+    /// access to the evaluator, so local and protocol-backed sessions apply
+    /// one command-vs-expression classification rule.
+    pub fn parse_context(&self, repl: bool) -> shoal_syntax::ParseCtx {
+        let mut value_bound = Vec::new();
+        let mut cmd_bound = Vec::new();
+        for name in self.exec.shell.env.visible_names() {
+            match self.exec.shell.env.get(&name) {
+                Some(value) if value.is_callable() => cmd_bound.push(name),
+                Some(_) => value_bound.push(name),
+                None => {}
+            }
+        }
+        shoal_syntax::ParseCtx {
+            repl,
+            value_bound,
+            cmd_bound,
+        }
+    }
+
     /// Most recently evaluated statement value.
     pub fn it(&self) -> &Value {
         &self.exec.control.it

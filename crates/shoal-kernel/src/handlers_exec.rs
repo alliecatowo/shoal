@@ -42,23 +42,6 @@ impl Kernel {
     }
 }
 
-fn parse_ctx_for_kernel(env: &shoal_value::Env, repl: bool) -> shoal_syntax::ParseCtx {
-    let mut value_bound = Vec::new();
-    let mut cmd_bound = Vec::new();
-    for name in env.visible_names() {
-        match env.get(&name) {
-            Some(value) if value.is_callable() => cmd_bound.push(name),
-            Some(_) => value_bound.push(name),
-            None => {}
-        }
-    }
-    shoal_syntax::ParseCtx {
-        repl,
-        value_bound,
-        cmd_bound,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,6 +89,16 @@ mod tests {
             assert!(
                 lines <= max_lines,
                 "exec {name} production surface grew to {lines} lines (limit {max_lines}); extract the owning phase"
+            );
+        }
+        for (name, source) in [("plan", plan), ("run", run)] {
+            assert!(
+                source.contains("evaluator.parse_context(interactive)"),
+                "kernel {name} must parse from the evaluator-owned binding snapshot"
+            );
+            assert!(
+                !source.contains("visible_names()"),
+                "kernel {name} must not rebuild parser classification independently"
             );
         }
         for (name, source, signature, max_lines) in [

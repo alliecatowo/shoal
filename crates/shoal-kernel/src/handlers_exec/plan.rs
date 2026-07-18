@@ -11,15 +11,13 @@ impl Kernel {
         interactive: bool,
     ) -> Result<Json, RpcError> {
         let mut evaluator = session.lock_evaluator()?;
-        let mut ast = shoal_syntax::parse_with_ctx(
-            &params.src,
-            parse_ctx_for_kernel(evaluator.env(), interactive),
-        )
-        .map_err(|error| RpcError {
-            code: PARSE_ERROR,
-            message: error.msg,
-            data: Some(json!({"span":error.span,"hint":error.hint})),
-        })?;
+        let mut ast =
+            shoal_syntax::parse_with_ctx(&params.src, evaluator.parse_context(interactive))
+                .map_err(|error| RpcError {
+                    code: PARSE_ERROR,
+                    message: error.msg,
+                    data: Some(json!({"span":error.span,"hint":error.hint})),
+                })?;
         session.rewrite_out_undo(&mut ast);
         let ast_json = serde_json::to_string(&ast).map_err(internal)?;
         let plan = derive_plan(&mut evaluator, &ast, &ast_json);

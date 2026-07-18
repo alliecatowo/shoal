@@ -176,16 +176,18 @@ than the host actually supplies, even though invalid authority input itself now 
 **Direction:** surface enforcement dimensions in every relevant attach/plan result, and keep
 hermetic refusal tests for unsupported network/spawn guarantees.
 
-### Medium-high: parser context parity is incomplete
+### Resolved: evaluator-owned parser-context parity
 
-**Evidence:** the local REPL parses with current evaluator bindings; kernel exec uses the context-free
-parse entry point per request.
+**Resolution:** `Evaluator::parse_context` is the single read-only snapshot of value-bound and
+callable names. The standalone REPL and both kernel `exec` plan/run paths call it immediately before
+`parse_with_ctx`; the kernel holds the evaluator lock from snapshot through evaluation.
 
-**Risk:** a session binding at statement head can be classified differently across local source and
-multi-request kernel execution.
+**Proof:** a real two-request kernel test defines a value, then plans and runs a later expression
+whose head would be an external command under context-free parsing. Local classification tests cover
+value/callable partitioning, and structural guards prohibit either host from rebuilding the scan.
 
-**Direction:** expose a read-only evaluator parse snapshot or move binding-neutral disambiguation into
-a shared post-parse dispatch, with exact host-parity cases.
+The public `parse` and completion endpoints remain intentionally context-free because they do not
+name an attached evaluator session; that is an explicit API distinction, not exec-host drift.
 
 ### Medium-high: MCP subscriptions retain a thread-per-URI cost
 

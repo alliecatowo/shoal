@@ -231,5 +231,6 @@ Comments/doc comments are an exception: only function doc text is retained.
 - Give rejected shell syntax a precise span and teaching hint.
 - Update formatter output and canonical-equivalence round trips.
 - Exercise every valid UTF-8 prefix through `parse_status`.
-- Verify binding-aware local parsing and context-free/kernel parsing explicitly.
+- Verify binding-aware local and kernel-exec parsing plus intentionally context-free public parse
+  endpoints explicitly.
 - Update static interpreter and builtin registries only through their documented workflows.

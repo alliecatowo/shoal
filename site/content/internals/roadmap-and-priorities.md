@@ -321,18 +321,15 @@ stops notifications and the forwarding worker, disconnect cleans all owned
 subscriptions, and repeated cycles return thread/task counts to baseline. A durable-channel gap must
 remain repairable through cursor read.
 
-### P1.3 Parser-context and host parity
+### Delivered: parser-context and host parity
 
-**Problem.** Local parsing can use evaluator bindings through `ParseCtx`; kernel exec parses each
-request context-free. A name bound as a command/function can therefore classify differently.
+`Evaluator::parse_context` now owns the immutable value/callable snapshot. Local REPL and kernel
+plan/run parsing share it, while public parse/completion endpoints remain explicitly context-free.
 
-**Options.** Either expose an immutable parse snapshot from evaluator state, or make initial parsing
-binding-neutral and perform shared post-parse statement-head resolution. Do not place evaluator
-dependencies in the syntax leaf.
+This keeps evaluator dependencies out of the syntax leaf and prevents host copies from drifting.
 
-**Acceptance tests.** Build a table of aliases, functions, module exports, Reef tools, adapters,
-builtins, unknown names, and shadowing cases. Parse/evaluate each through local source, script,
-kernel, and MCP. Pin the same AST or the same documented semantic result.
+Tests cover value/callable partitioning and a real multi-request kernel value binding through both
+plan and run. Structural guards require each host to use the evaluator snapshot.
 
 ### Delivered: explicit journal execution identity
 

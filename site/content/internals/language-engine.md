@@ -83,13 +83,14 @@ command head. `^` explicitly requests command interpretation.
 At the interactive prompt, a leading method chain is attached to the current `it` value. `it` and
 `out` are REPL/session concepts and are rejected in source contexts that do not provide them.
 
-### Context parity warning
+### Context parity
 
-The local REPL builds parser context from its evaluator bindings. Kernel `exec` currently calls the
-context-free parse entry point for each request. Evaluator dispatch can recover some cases—most
-notably command-shaped user functions and bare bound values—but the hosts do not have identical
-statement-head classification. When adding a binding-sensitive syntax rule, write both a multi-line
-local test and a multi-request kernel test.
+The evaluator owns the read-only parser-context snapshot. Both the local REPL and kernel `exec`
+plan/run paths take that snapshot immediately before parsing, so persisted values and callables use
+the same statement-head classification across hosts. The kernel retains its evaluator lock from
+snapshot through execution. Public `parse`/completion endpoints remain context-free because they do
+not operate on an attached session. Binding-sensitive rules require both a multi-line local test and
+a multi-request kernel test.
 
 ## Incomplete input and canonical formatting
 

@@ -10,7 +10,7 @@ fn repl_orchestration_stays_decomposed() {
     for (start, end, limit) in [
         ("pub(crate) fn repl(", "struct InterruptState", 130),
         ("fn run_repl_loop(", "fn handle_submitted_line(", 70),
-        ("fn handle_submitted_line(", "fn parse_ctx_for(", 110),
+        ("fn handle_submitted_line(", "#[cfg(test)]\nmod tests;", 110),
     ] {
         let body = root
             .split_once(start)
@@ -515,28 +515,39 @@ fn production_repl_has_no_infallible_thread_launches() {
 
 #[test]
 fn parse_ctx_splits_values_from_callables() {
-    let env = Env::root();
-    env.declare("mydata", Value::Int(3), false).unwrap();
-    env.declare(
-        "deploy",
-        Value::CmdRef(Arc::new(shoal_ast::CmdCall {
-            head: "echo".into(),
-            forced: false,
-            env_prefix: Vec::new(),
-            args: Vec::new(),
-            redirects: Vec::new(),
-            background: false,
-            trailing: None,
-            span: shoal_ast::Span::new(0, 0),
-        })),
-        false,
-    )
-    .unwrap();
-    let ctx = parse_ctx_for(&env);
+    let mut evaluator = Evaluator::new(PathBuf::from("/"));
+    evaluator
+        .env_mut()
+        .declare("mydata", Value::Int(3), false)
+        .unwrap();
+    evaluator
+        .env_mut()
+        .declare(
+            "deploy",
+            Value::CmdRef(Arc::new(shoal_ast::CmdCall {
+                head: "echo".into(),
+                forced: false,
+                env_prefix: Vec::new(),
+                args: Vec::new(),
+                redirects: Vec::new(),
+                background: false,
+                trailing: None,
+                span: shoal_ast::Span::new(0, 0),
+            })),
+            false,
+        )
+        .unwrap();
+    let ctx = evaluator.parse_context(true);
     assert!(ctx.repl);
     assert!(ctx.value_bound.iter().any(|n| n == "mydata"));
     assert!(ctx.cmd_bound.iter().any(|n| n == "deploy"));
     assert!(!ctx.cmd_bound.iter().any(|n| n == "mydata"));
+    let production = include_str!("../repl.rs")
+        .split("#[cfg(test)]\nmod tests;")
+        .next()
+        .unwrap();
+    assert!(production.contains("evaluator.parse_context(true)"));
+    assert!(!production.contains("visible_names()"));
 }
 
 #[test]

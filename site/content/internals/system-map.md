@@ -233,10 +233,9 @@ forwarder, but does not load the CLI's layered config, aliases, environment over
 bundled/extra adapter directories, or user Reef manifest. This is a parity boundary, not merely a
 documentation omission. Test a feature through the intended host before describing it as universal.
 
-There is a second parsing difference: the local REPL constructs a `ParseCtx` from session bindings,
-while the kernel `exec` handler parses submitted source without that context. Evaluation can still
-resolve command-shaped callable names, but statement-head classification of session-bound values can
-differ across requests.
+Parser-context parity is shared: the evaluator constructs the live value/callable snapshot used by
+both the local REPL and kernel `exec` plan/run handlers. Public context-free parse/completion RPCs do
+not claim session-bound classification.
 
 Sources: [`shoal/src/repl.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal/src/repl.rs),
 [`shoal-kernel/src/session.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-kernel/src/session.rs),
