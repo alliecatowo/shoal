@@ -1,5 +1,5 @@
 use shoal_history::{QueryFilter, entry, entry_json, gc, query, render_human, undo};
-use shoal_journal::Journal;
+use shoal_journal::{EntryKind, Journal};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -211,6 +211,14 @@ fn parse_query(args: &[String]) -> Result<QueryFilter, (i32, String)> {
             }
             "--principal" => {
                 f.principal = Some(value(args.get(i + 1), "principal")?);
+                i += 2
+            }
+            "--kind" => {
+                f.kind = Some(
+                    value(args.get(i + 1), "kind")?
+                        .parse::<EntryKind>()
+                        .map_err(|error| (2, error))?,
+                );
                 i += 2
             }
             "--effects" => {

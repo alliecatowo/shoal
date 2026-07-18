@@ -3693,13 +3693,34 @@ fn journal_channel_replay_excludes_evaluator_per_statement_entries() {
             limit: usize::MAX,
             ..Default::default()
         })
-        .unwrap()
-        .len();
+        .unwrap();
+    let row_count = rows.len();
     assert!(
-        rows >= execs * 3,
-        "on-disk store should also hold the finer per-statement entries: {rows} rows for \
+        row_count >= execs * 3,
+        "on-disk store should also hold the finer per-statement entries: {row_count} rows for \
              {execs} execs"
     );
+    let kinds_by_id = rows
+        .iter()
+        .map(|row| (row.id, row.kind))
+        .collect::<std::collections::HashMap<_, _>>();
+    for row in &rows {
+        match row.kind {
+            shoal_journal::EntryKind::Exec => assert_eq!(row.parent_id, None),
+            shoal_journal::EntryKind::Statement => {
+                let parent = row
+                    .parent_id
+                    .expect("each kernel evaluator row names its exact coarse execution");
+                assert_eq!(
+                    kinds_by_id.get(&parent),
+                    Some(&shoal_journal::EntryKind::Exec)
+                );
+            }
+            shoal_journal::EntryKind::Approval => {
+                panic!("this test did not issue an approval")
+            }
+        }
+    }
 
     // Replay from seq 0 (aged out): EXACTLY one event per exec, contiguous
     // seqs, each the coarse whole-submission entry (head "let") — no

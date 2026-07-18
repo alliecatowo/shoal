@@ -157,6 +157,8 @@ The genuinely mutable state that advances as a program runs. Sub-grouped by fine
 |---|---|---|---|
 | `source` | `Option<String>` | journal | current program source, for statement slicing |
 | `current_entry` | `Option<i64>` | journal | open top-level entry id for undo attachment |
+| `journal_parent_entry` | `Option<i64>` | host/journal | coarse host execution owning new rows |
+| `last_completed_entry` | `Option<i64>` | journal | exact final durable row returned to the host |
 
 **Persistence path** (root-only):
 
@@ -259,7 +261,7 @@ a `.shl` script child takes a **fresh root `env`** (intended isolation) but stil
 | jobs, external_jobs | fresh (empty) | a child has its own task table |
 | modules, module_stack | fresh | a child re-memoizes its own imports |
 | plans | fresh (root-only in practice) | `plan { … }`/`apply` is a REPL/root verb |
-| source, current_entry | fresh | set at the child's own `eval_program` / per-statement |
+| source, current_entry, journal parent/last entry | fresh | set at the child's own host execution / per-statement |
 | jump_store | **fresh = None** | never write frecency from a background thread; avoids a file race on inherited `cwd` |
 
 ## Invariants the split must enforce

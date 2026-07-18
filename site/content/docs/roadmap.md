@@ -337,7 +337,8 @@ Evaluate platform-appropriate mechanisms (Linux namespaces/seccomp/eBPF/cgroups,
 
 - Version migrations with backup/rollback testing.
 - Define retention/archival/export/import.
-- Distinguish coarse submission rows and fine per-statement rows explicitly in schema/API.
+- Continue evolving schema-v2 execution identity with optional statement ordinals/host vocabulary;
+  coarse exec and fine statement rows are already explicit and parent-linked.
 - Preserve principal attribution across shared/nested execution.
 - Add query indexes/streaming for large stores and scoped access.
 

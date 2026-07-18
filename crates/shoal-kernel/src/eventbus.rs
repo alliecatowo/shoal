@@ -726,6 +726,16 @@ impl Kernel {
                 message: format!("durable journal event {id} is missing"),
                 data: Some(json!({"subsystem":"events","entry_id":id,"quarantined":true})),
             })?;
+            if row.kind != shoal_journal::EntryKind::Exec {
+                return Err(RpcError {
+                    code: INTERNAL_ERROR,
+                    message: format!(
+                        "durable journal event {} references a {} row instead of an exec row",
+                        row.id, row.kind
+                    ),
+                    data: Some(json!({"subsystem":"events","entry_id":row.id,"quarantined":true})),
+                });
+            }
             serde_json::from_str::<Program>(&row.ast_json).map_err(|error| RpcError {
                 code: INTERNAL_ERROR,
                 message: format!(

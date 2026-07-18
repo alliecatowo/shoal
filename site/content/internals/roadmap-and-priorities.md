@@ -334,27 +334,24 @@ dependencies in the syntax leaf.
 builtins, unknown names, and shadowing cases. Parse/evaluate each through local source, script,
 kernel, and MCP. Pin the same AST or the same documented semantic result.
 
-### P1.4 Explicit journal execution identity
+### Delivered: explicit journal execution identity
 
-**Problem.** Kernel runs add a coarse whole-submission entry while the embedded evaluator adds
-per-statement rows to the same `entry` table. Code reconstructs journal-channel membership by
-inspecting AST shape because there is no row kind or parent relationship.
+Schema v2 now records `kind = exec|statement|approval` and `parent_id`. Journal-channel membership
+uses `kind=exec`, evaluator hosts receive exact completed IDs, and the kernel supplies its coarse
+execution ID as the parent of every statement row.
 
-**Design.** Add stable columns or a related execution table:
+Possible future metadata, if queries justify it:
 
 ```text
-kind       = submission | statement
-parent_id  = NULL for submission; submission id for statements
 ordinal    = statement order inside the submission
 host       = local | kernel | other stable vocabulary
 ```
 
-Choose whether local multi-statement source also receives a submission row. Queries should require
-or clearly default a granularity. Event payloads return IDs directly instead of discovering “latest.”
+Local multi-statement source continues to emit statement rows without a synthetic exec parent.
+Unfiltered queries deliberately return every kind; callers can select a granularity.
 
-**Migration.** Bump `PRAGMA user_version`; migrate in one transaction; preserve v1 rows. AST-shape
-classification may backfill known kernel coarse rows, but ambiguous historical rows must remain
-explicitly unknown rather than guessed as authoritative.
+**Migration.** v1 and unversioned legacy stores migrate transactionally. Known old producer shapes
+backfill kind; unreconstructable historical parent links remain null.
 
 **Acceptance tests.** Create a v1 fixture, migrate, execute multi-statement success/failure/crash
 cases, reopen, query each granularity, replay journal/transcript channels, and verify no duplicate or

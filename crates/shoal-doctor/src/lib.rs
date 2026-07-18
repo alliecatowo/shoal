@@ -319,6 +319,8 @@ fn probe_journal(o: &Options, out: &mut Vec<Check>) {
         let j = shoal_journal::Journal::open(d.path()).map_err(|e| e.to_string())?;
         let id = j
             .append(&shoal_journal::EntryRecord {
+                kind: shoal_journal::EntryKind::Statement,
+                parent_id: None,
                 session: "doctor".into(),
                 principal: "human".into(),
                 ts_ns: 0,

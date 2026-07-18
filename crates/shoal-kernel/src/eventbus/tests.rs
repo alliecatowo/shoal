@@ -490,6 +490,8 @@ fn append_simulated_exec(journal: &Journal, with_fine_row: bool, with_transcript
     if with_fine_row {
         let fine_id = journal
             .append(&EntryRecord {
+                kind: shoal_journal::EntryKind::Statement,
+                parent_id: None,
                 session: "s".into(),
                 principal: "human".into(),
                 ts_ns: 0,
@@ -505,6 +507,8 @@ fn append_simulated_exec(journal: &Journal, with_fine_row: bool, with_transcript
     let program = Program { stmts: vec![stmt] };
     let coarse_id = journal
         .append(&EntryRecord {
+            kind: shoal_journal::EntryKind::Exec,
+            parent_id: None,
             session: "s".into(),
             principal: "human".into(),
             ts_ns: 0,
@@ -929,6 +933,8 @@ fn corrupt_program_shaped_ast_is_never_replayed_as_an_event() {
         let journal = kernel.journal.lock().unwrap();
         let id = journal
             .append(&EntryRecord {
+                kind: shoal_journal::EntryKind::Exec,
+                parent_id: None,
                 session: owner.0.name.clone(),
                 principal: owner.0.principal.clone(),
                 ts_ns: 0,
@@ -959,6 +965,8 @@ fn historical_large_transcripts_stop_before_materializing_a_whole_row_page() {
         for n in 0..3 {
             let id = journal
                 .append(&EntryRecord {
+                    kind: shoal_journal::EntryKind::Exec,
+                    parent_id: None,
                     session: owner.0.name.clone(),
                     principal: owner.0.principal.clone(),
                     ts_ns: n,

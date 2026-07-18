@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use rusqlite::ToSql;
 
-use crate::{Journal, OutputMeta, OutputRow, hash_string, hex_bytes};
+use crate::{EntryKind, Journal, OutputMeta, OutputRow, hash_string, hex_bytes};
 
 /// Default number of rows returned by [`Journal::query`] when
 /// [`JournalQuery::limit`] is `0`.
@@ -37,6 +37,10 @@ fn count_as_u64(value: i64) -> rusqlite::Result<u64> {
 pub struct EntryRow {
     /// Rowid of the entry (stable reference, e.g. `out:12`).
     pub id: i64,
+    /// Semantic role of this row.
+    pub kind: EntryKind,
+    /// Owning coarse execution row, for evaluator statements.
+    pub parent_id: Option<i64>,
     /// Session identifier.
     pub session: String,
     /// Acting principal.
@@ -84,6 +88,8 @@ pub struct JournalQuery {
     pub head: Option<String>,
     /// Only entries recorded by this principal.
     pub principal: Option<String>,
+    /// Only entries with this semantic role.
+    pub kind: Option<EntryKind>,
     /// Only finished entries with this success verdict (unfinished entries have
     /// `NULL` ok and never match).
     pub ok: Option<bool>,
@@ -93,8 +99,7 @@ pub struct JournalQuery {
 
 impl Journal {
     /// Count coarse exec-level journal events for one exact owner and return
-    /// only the newest `tail_limit` pointers. Whole-program entries serialize
-    /// with a top-level `stmts` array; evaluator per-statement rows do not.
+    /// only the newest `tail_limit` pointers.
     pub fn journal_event_seed(
         &self,
         principal: &str,
@@ -103,15 +108,13 @@ impl Journal {
     ) -> rusqlite::Result<DurableEventSeed> {
         let published: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM entry
-              WHERE principal = ?1 AND session = ?2
-                AND json_type(ast, '$.stmts') = 'array'",
+              WHERE principal = ?1 AND session = ?2 AND kind = 'exec'",
             rusqlite::params![principal, session],
             |row| row.get(0),
         )?;
         let mut stmt = self.conn.prepare(
             "SELECT id FROM entry
-              WHERE principal = ?1 AND session = ?2
-                AND json_type(ast, '$.stmts') = 'array'
+              WHERE principal = ?1 AND session = ?2 AND kind = 'exec'
               ORDER BY id DESC LIMIT ?3",
         )?;
         let mut tail_entry_ids = stmt
@@ -141,8 +144,7 @@ impl Journal {
         }
         let mut stmt = self.conn.prepare(
             "SELECT id FROM entry
-              WHERE principal = ?1 AND session = ?2
-                AND json_type(ast, '$.stmts') = 'array'
+              WHERE principal = ?1 AND session = ?2 AND kind = 'exec'
               ORDER BY id ASC LIMIT ?3 OFFSET ?4",
         )?;
         stmt.query_map(
@@ -215,7 +217,8 @@ impl Journal {
         let limit_i64 = limit as i64;
 
         let mut sql = String::from(
-            "SELECT id, session, principal, ts, dur_ns, cwd, src, ast, effects, status, ok, opaque
+            "SELECT id, session, principal, ts, dur_ns, cwd, src, ast, effects, status, ok, opaque,
+                    kind, parent_id
              FROM entry",
         );
         let mut clauses: Vec<&str> = Vec::new();
@@ -231,6 +234,10 @@ impl Journal {
         if let Some(principal) = q.principal.as_ref() {
             clauses.push("principal = ?");
             params.push(principal);
+        }
+        if let Some(kind) = q.kind.as_ref() {
+            clauses.push("kind = ?");
+            params.push(kind);
         }
         if let Some(ok) = q.ok.as_ref() {
             clauses.push("ok = ?");
@@ -269,6 +276,8 @@ impl Journal {
             }
             out.push(EntryRow {
                 id: row.get(0)?,
+                kind: row.get(12)?,
+                parent_id: row.get(13)?,
                 session: row.get(1)?,
                 principal: row.get(2)?,
                 ts_ns: row.get(3)?,
@@ -306,7 +315,8 @@ impl Journal {
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(
-            "SELECT id, session, principal, ts, dur_ns, cwd, src, ast, effects, status, ok, opaque
+            "SELECT id, session, principal, ts, dur_ns, cwd, src, ast, effects, status, ok, opaque,
+                    kind, parent_id
              FROM entry WHERE id IN ({placeholders})"
         );
         let params: Vec<&dyn ToSql> = ids.iter().map(|id| id as &dyn ToSql).collect();
@@ -316,6 +326,8 @@ impl Journal {
         while let Some(row) = rows.next()? {
             let entry = EntryRow {
                 id: row.get(0)?,
+                kind: row.get(12)?,
+                parent_id: row.get(13)?,
                 session: row.get(1)?,
                 principal: row.get(2)?,
                 ts_ns: row.get(3)?,

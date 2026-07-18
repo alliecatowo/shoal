@@ -5,6 +5,8 @@ use std::io::Read as _;
 
 fn rec(session: &str, principal: &str, ts_ns: i64, src: &str) -> EntryRecord {
     EntryRecord {
+        kind: EntryKind::Statement,
+        parent_id: None,
         session: session.to_string(),
         principal: principal.to_string(),
         ts_ns,
@@ -428,6 +430,48 @@ fn legacy_zero_version_db_is_adopted_without_losing_rows() {
 }
 
 #[test]
+fn version_one_entry_metadata_migration_preserves_and_classifies_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("journal.db");
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE entry(
+                 id INTEGER PRIMARY KEY, session TEXT NOT NULL, principal TEXT NOT NULL,
+                 ts INTEGER NOT NULL, dur_ns INTEGER, cwd BLOB NOT NULL, env_hash BLOB,
+                 src TEXT NOT NULL, ast BLOB NOT NULL, effects TEXT NOT NULL,
+                 status INTEGER, ok BOOL, opaque BOOL NOT NULL
+             );
+             INSERT INTO entry(session,principal,ts,cwd,src,ast,effects,opaque)
+                 VALUES ('s','human',1,X'2f','statement','{}','[]',0);
+             INSERT INTO entry(session,principal,ts,cwd,src,ast,effects,opaque)
+                 VALUES ('s','human',2,X'2f','exec','{\"stmts\":[]}','[]',0);
+             INSERT INTO entry(session,principal,ts,cwd,src,ast,effects,opaque)
+                 VALUES ('s','human',3,X'2f','approval','null','[{\"kind\":\"approval\"}]',0);
+             INSERT INTO entry(session,principal,ts,cwd,src,ast,effects,opaque)
+                 VALUES ('s','human',4,X'2f','malformed','not json','also not json',0);
+             PRAGMA user_version=1;",
+        )
+        .unwrap();
+    }
+
+    let journal = Journal::open(dir.path()).expect("v1 journal must migrate without data loss");
+    let rows = journal.query(&JournalQuery::default()).unwrap();
+    assert_eq!(rows.len(), 4);
+    let kind_for = |src: &str| rows.iter().find(|row| row.src == src).unwrap().kind;
+    assert_eq!(kind_for("statement"), EntryKind::Statement);
+    assert_eq!(kind_for("exec"), EntryKind::Exec);
+    assert_eq!(kind_for("approval"), EntryKind::Approval);
+    assert_eq!(kind_for("malformed"), EntryKind::Statement);
+    assert!(rows.iter().all(|row| row.parent_id.is_none()));
+    let version: i64 = journal
+        .conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, CURRENT_SCHEMA_VERSION);
+}
+
+#[test]
 fn cas_roundtrip_and_dedup() {
     let dir = tempfile::tempdir().unwrap();
     let j = Journal::open(dir.path()).unwrap();
@@ -629,6 +673,32 @@ fn query_principal_filter() {
 }
 
 #[test]
+fn entry_kind_and_parent_round_trip_and_filter_explicitly() {
+    let j = Journal::in_memory().unwrap();
+    let mut exec = rec("s", "human", 1, "whole program");
+    exec.kind = EntryKind::Exec;
+    let exec_id = j.append(&exec).unwrap();
+    let mut statement = rec("s", "human", 2, "one statement");
+    statement.parent_id = Some(exec_id);
+    let statement_id = j.append(&statement).unwrap();
+
+    let rows = j
+        .query(&JournalQuery {
+            kind: Some(EntryKind::Statement),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, statement_id);
+    assert_eq!(rows[0].kind, EntryKind::Statement);
+    assert_eq!(rows[0].parent_id, Some(exec_id));
+
+    let exec_row = j.entries_by_id(&[exec_id]).unwrap().pop().unwrap();
+    assert_eq!(exec_row.kind, EntryKind::Exec);
+    assert_eq!(exec_row.parent_id, None);
+}
+
+#[test]
 fn query_session_filter_is_exact() {
     let j = Journal::in_memory().unwrap();
     j.append(&rec("alpha", "human", 1, "first")).unwrap();
@@ -817,6 +887,7 @@ fn durable_event_seed_and_ranges_are_owner_scoped_and_bounded() {
     let mut coarse_ids = Vec::new();
     for n in 0..6 {
         let mut entry = rec("s", "human", n, "return");
+        entry.kind = EntryKind::Exec;
         entry.ast_json = r#"{"stmts":[]}"#.into();
         let id = j.append(&entry).unwrap();
         j.finish(id, Some(0), true, 1).unwrap();
@@ -830,12 +901,22 @@ fn durable_event_seed_and_ranges_are_owner_scoped_and_bounded() {
         j.finish(fine, Some(0), true, 1).unwrap();
     }
     let mut foreign = rec("s", "agent:other", 99, "return");
+    foreign.kind = EntryKind::Exec;
     foreign.ast_json = r#"{"stmts":[]}"#.into();
     j.append(&foreign).unwrap();
 
+    // Semantic type, not incidental JSON shape, defines channel membership.
+    let mut program_shaped_statement = rec("s", "human", 100, "not an exec");
+    program_shaped_statement.ast_json = r#"{"stmts":[]}"#.into();
+    j.append(&program_shaped_statement).unwrap();
+    let mut non_program_shaped_exec = rec("s", "human", 101, "still an exec");
+    non_program_shaped_exec.kind = EntryKind::Exec;
+    non_program_shaped_exec.ast_json = "null".into();
+    let semantic_exec = j.append(&non_program_shaped_exec).unwrap();
+
     let seed = j.journal_event_seed("human", "s", 2).unwrap();
-    assert_eq!(seed.published, 6);
-    assert_eq!(seed.tail_entry_ids, coarse_ids[4..]);
+    assert_eq!(seed.published, 7);
+    assert_eq!(seed.tail_entry_ids, vec![coarse_ids[5], semantic_exec]);
     assert_eq!(
         j.journal_event_entry_ids("human", "s", 1, 3).unwrap(),
         coarse_ids[1..4]

@@ -198,16 +198,18 @@ kernel connection plus one forwarding thread each.
 **Direction:** retain the tested unsubscribe ownership invariant; introduce multiplexing or a bounded
 executor only if measured active-subscription scale justifies the protocol change.
 
-### Medium-high: dual kernel journal granularity is easy to misquery
+### Resolved: explicit dual journal granularity and execution identity
 
-**Evidence:** each RPC run appends a coarse entry while the evaluator writes per-top-level-statement
-entries to the same store; the event index tracks only coarse IDs.
+**Resolution:** schema v2 stores an explicit `statement|exec|approval` kind and nullable parent exec
+ID. Kernel statement rows name their coarse execution, journal-channel queries filter `kind=exec`,
+and both kernel and standalone REPL consume the evaluator's exact completed entry ID directly.
 
-**Risk:** counts, “latest” logic, principal attribution, and history UI can double-count or mix row
-kinds without a schema discriminator.
+**Proof:** v1 and legacy-v0 migration fixtures preserve data and classify old producer shapes;
+round-trip/query tests cover kind and parent; event tests prove JSON shape cannot enroll a statement
+or exclude an exec; kernel multi-statement/restart tests verify exact parentage and replay counts.
 
-**Direction:** add an entry kind/parent-exec relation or choose one canonical lifecycle. Return IDs
-directly instead of inferring latest rows.
+**Remaining evolution:** historical parent IDs are honestly null because they cannot be reconstructed;
+statement ordinals and host vocabulary can be added if a concrete query needs them.
 
 ### Medium: WASM ABI evolution
 

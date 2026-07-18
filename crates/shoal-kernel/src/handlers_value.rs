@@ -377,6 +377,16 @@ impl Kernel {
             Some(n) => n.min(JOURNAL_MAX_PAGE),
             None => JOURNAL_DEFAULT_PAGE,
         };
+        let kind = p
+            .kind
+            .as_deref()
+            .map(str::parse::<shoal_journal::EntryKind>)
+            .transpose()
+            .map_err(|message| RpcError {
+                code: INVALID_PARAMS,
+                message,
+                data: Some(json!({"field":"kind","expected":["statement","exec","approval"]})),
+            })?;
         let rows = self
             .journal
             .lock()
@@ -386,6 +396,7 @@ impl Kernel {
                 session: Some(attachment.session.id.clone()),
                 principal: Some(attachment.principal.clone()),
                 head: p.head,
+                kind,
                 ok: p.ok,
                 limit: effective_limit,
             })
@@ -415,6 +426,8 @@ impl Kernel {
             })
             .map(|r| JournalEntry {
                 id: r.id,
+                kind: Some(r.kind.as_str().into()),
+                parent_id: r.parent_id,
                 session: r.session,
                 principal: r.principal,
                 ts: r.ts_ns,

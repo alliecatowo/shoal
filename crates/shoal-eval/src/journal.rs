@@ -270,6 +270,21 @@ impl Evaluator {
         self.session.journal.is_some()
     }
 
+    /// Start one host-visible evaluation and explicitly bind its statement
+    /// rows to an optional coarse execution row. This also prevents a host
+    /// from accidentally reusing the previous evaluation's final entry id.
+    pub fn begin_journal_execution(&mut self, parent_id: Option<i64>) {
+        self.exec.control.journal_parent_entry = parent_id;
+        self.exec.control.last_completed_entry = None;
+    }
+
+    /// End the active host-visible evaluation and return its final durably
+    /// completed statement id. Parentage is cleared even on evaluation error.
+    pub fn take_last_journal_entry(&mut self) -> Option<i64> {
+        self.exec.control.journal_parent_entry = None;
+        self.exec.control.last_completed_entry.take()
+    }
+
     /// Remember only the first persistence failure for the active statement.
     /// Later failures are usually consequences of the same unavailable store;
     /// bounding this state keeps a hostile multi-path command from amplifying
@@ -299,6 +314,8 @@ impl Evaluator {
             bounded_json(stmt, MAX_JOURNAL_AST_BYTES, "AST").unwrap_or_else(omitted_json);
         let (effects_json, opaque) = self.stmt_effects(stmt);
         let record = EntryRecord {
+            kind: shoal_journal::EntryKind::Statement,
+            parent_id: self.exec.control.journal_parent_entry,
             session: bounded_text(&self.session.session_id, MAX_JOURNAL_IDENTITY_BYTES),
             principal: bounded_text(&self.session.principal, MAX_JOURNAL_IDENTITY_BYTES),
             ts_ns: self.host.clock.now_ns(),
@@ -398,6 +415,8 @@ impl Evaluator {
             if let Err(error) = journal.finish(id, None, false, dur) {
                 note_failure(&mut failure, "failed completion marker", error);
             }
+        } else {
+            self.exec.control.last_completed_entry = Some(id);
         }
         finish_result(result, failure)
     }
@@ -930,6 +949,11 @@ fn undo_report_value(report: &UndoReport) -> Value {
 fn entry_row_record(e: &shoal_journal::EntryRow) -> Record {
     let mut r = Record::new();
     r.insert("id".into(), Value::Int(e.id));
+    r.insert("kind".into(), Value::Str(e.kind.as_str().into()));
+    r.insert(
+        "parent".into(),
+        e.parent_id.map(Value::Int).unwrap_or(Value::Null),
+    );
     let ts = jiff::Timestamp::from_nanosecond(e.ts_ns as i128)
         .ok()
         .map(|t| Value::DateTime(Box::new(t.to_zoned(jiff::tz::TimeZone::system()))))

@@ -430,7 +430,7 @@ An empty result can still mean the history process started from a different cwd 
 ### Query
 
 ```text
-query [--since NS] [--principal NAME] [--effects TEXT]
+query [--since NS] [--principal NAME] [--kind statement|exec|approval] [--effects TEXT]
       [--head COMMAND] [--status ok|failed] [--limit N]
 ```
 
@@ -440,14 +440,15 @@ Example:
 shoal-history --state-dir "$STATE" --json query \
   --since 1750000000000000000 \
   --principal agent:reviewer \
+  --kind statement \
   --effects fs_write \
   --status failed \
   --limit 50
 ```
 
-`--since` is a signed nanosecond timestamp. `--effects` is one structured effect-kind matcher, despite the plural spelling; repeat/multiple all-of matching is not implemented. Default limit is 100. The journal steps candidates and stops after retaining the requested number of matching entries rather than materializing the entire history.
+`--since` is a signed nanosecond timestamp. `--kind` selects one schema-v2 granularity. `--effects` is one structured effect-kind matcher, despite the plural spelling; repeat/multiple all-of matching is not implemented. Default limit is 100. The journal steps candidates and stops after retaining the requested number of matching entries rather than materializing the entire history.
 
-Human output prints ID, principal, verdict, and first source line. `--json` adds AST, effects, cwd, timing/status, and output descriptors. Treat it as sensitive.
+Human output prints ID, kind, principal, verdict, and first source line. `--json` adds `parent_id`, AST, effects, cwd, timing/status, and output descriptors. Treat it as sensitive.
 
 ### Show
 

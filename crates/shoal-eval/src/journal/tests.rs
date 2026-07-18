@@ -252,6 +252,39 @@ fn statement_records_entry_finish_and_output() {
     assert!(kinds.contains(&"stdout"), "outputs: {kinds:?}");
 }
 
+#[test]
+fn host_execution_returns_exact_last_entry_and_records_parentage() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut ev = journaled(dir.path());
+    let program = shoal_syntax::parse("let first = 1\nfirst + 1").unwrap();
+    ev.set_source("let first = 1\nfirst + 1");
+    ev.begin_journal_execution(Some(42));
+    ev.eval_program(&program).unwrap();
+    let last_id = ev
+        .take_last_journal_entry()
+        .expect("a successful journaled evaluation returns its exact final row");
+    assert_eq!(
+        ev.take_last_journal_entry(),
+        None,
+        "entry ids are consumed once"
+    );
+
+    let rows = ev
+        .session
+        .journal
+        .as_ref()
+        .unwrap()
+        .query(&JournalQuery::default())
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].id, last_id);
+    assert!(
+        rows.iter()
+            .all(|row| row.kind == shoal_journal::EntryKind::Statement)
+    );
+    assert!(rows.iter().all(|row| row.parent_id == Some(42)));
+}
+
 fn zero_timeout_journal(state: &Path) -> Journal {
     Journal::open_with_options(
         state,

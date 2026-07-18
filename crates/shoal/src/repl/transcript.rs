@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 
 use shoal_ast::{CmdArg, Expr, Program, Stmt, UnOp};
-use shoal_journal::{Journal, JournalQuery};
+use shoal_journal::Journal;
 use shoal_value::{VResult, Value};
 
 use crate::maybe_strip;
@@ -14,7 +14,6 @@ pub(super) const REPL_SESSION: &str = "default";
 
 /// Journal handle plus the bounded host-only `out[n]` identity mirror.
 pub(super) struct TranscriptState {
-    reader: Option<Journal>,
     entries: VecDeque<Option<i64>>,
 }
 
@@ -24,27 +23,22 @@ impl TranscriptState {
         state_dir: &Path,
         enabled: bool,
     ) -> Self {
-        let reader = if enabled {
-            match (Journal::open(state_dir), Journal::open(state_dir)) {
-                (Ok(write_handle), Ok(read_handle)) => {
+        if enabled {
+            match Journal::open(state_dir) {
+                Ok(write_handle) => {
                     evaluator.set_journal(write_handle, REPL_SESSION, REPL_PRINCIPAL);
-                    Some(read_handle)
                 }
-                (Err(error), _) | (_, Err(error)) => {
+                Err(error) => {
                     eprintln!(
                         "{}",
                         maybe_strip(format!(
                             "\x1b[33;1mwarning:\x1b[0m journal unavailable ({error}); undo/journal/history disabled this session"
                         ))
                     );
-                    None
                 }
             }
-        } else {
-            None
-        };
+        }
         Self {
-            reader,
             entries: VecDeque::new(),
         }
     }
@@ -57,13 +51,9 @@ impl TranscriptState {
         &mut self,
         evaluator: &mut shoal_eval::Evaluator,
         value: &Value,
-        started_ns: i64,
+        entry_id: Option<i64>,
     ) -> VResult<()> {
         evaluator.record_transcript(value)?;
-        let entry_id = self
-            .reader
-            .as_ref()
-            .and_then(|journal| latest_entry_id(journal, REPL_PRINCIPAL, started_ns));
         push_out_entry(&mut self.entries, entry_id);
         Ok(())
     }
@@ -85,28 +75,6 @@ pub(super) fn effective_journal_state_dir(configured: Option<&Path>, cwd: &Path)
 
 pub(super) fn language_journal_requested(configured: bool, protocol_backed: bool) -> bool {
     configured && !protocol_backed
-}
-
-pub(super) fn now_ns() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
-        .min(i64::MAX as u128) as i64
-}
-
-/// Newest entry for `principal` at or after `since_ns`, used to associate a
-/// successful interactive value with the journal record just written.
-pub(super) fn latest_entry_id(journal: &Journal, principal: &str, since_ns: i64) -> Option<i64> {
-    let rows = journal
-        .query(&JournalQuery {
-            since_ts_ns: Some(since_ns),
-            principal: Some(principal.to_string()),
-            limit: 1,
-            ..Default::default()
-        })
-        .ok()?;
-    rows.first().map(|row| row.id)
 }
 
 /// Rewrite literal `undo out[N]` / `undo out[-N]` through the host's bounded

@@ -263,14 +263,17 @@ merely write `mode:"approved"` to skip the gate.
 The evaluator is locked for the synchronous run. The handler:
 
 1. installs this actor's Leash policy on the evaluator;
-2. derives the plan and appends a coarse journal row;
-3. stores current source for per-statement evaluator journaling;
+2. derives the plan and appends a coarse `kind=exec` journal row;
+3. stores current source and the coarse parent ID for per-statement evaluator journaling;
 4. evaluates at the requested position;
 5. finishes the coarse row and records output blobs;
 6. stores the value under `out:N` in the session transcript;
 7. records a durable transcript-event payload;
 8. publishes `journal`, `session.transcript`, and `render` events;
 9. returns the structural value and bounded human render.
+
+`journal.query` rows expose `kind` and nullable `parent_id`; its optional `kind` filter accepts
+`statement`, `exec`, or `approval`.
 
 A raised language error is still inserted as an addressable `out:N`; the RPC error is `RAISED
 (-32002)` and its data includes language code/span/hint/status/stderr/ref/URI. The coarse journal row

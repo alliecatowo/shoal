@@ -557,6 +557,8 @@ impl Kernel {
         }]))
         .unwrap_or_else(|_| "[]".into());
         let record = EntryRecord {
+            kind: shoal_journal::EntryKind::Approval,
+            parent_id: None,
             session: session.to_string(),
             // The grant mutates the requester's plan and is consumed by the
             // requester's later execution, so store it in that exact owner's

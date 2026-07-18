@@ -204,8 +204,10 @@ accDescr: Shows the components and relationships described in Synchronous run de
 
 An on-disk kernel run writes a coarse RPC-exec entry and the evaluator can also write one entry per
 top-level statement. The `journal` event channel indexes the coarse entry, deliberately not every
-evaluator row. Queries and counts must therefore state which granularity they mean; treating all
-rows as one-exec-per-row can double-count or misattribute multi-statement requests.
+evaluator row. Schema v2 records `kind = exec|statement|approval`; evaluator rows also store the
+coarse exec ID in `parent_id`. Kernel and standalone hosts receive the final statement ID directly
+from the evaluator instead of discovering a timestamp-adjacent row. Queries can filter by kind;
+unfiltered counts still intentionally include both granularities.
 
 ## References and paths
 

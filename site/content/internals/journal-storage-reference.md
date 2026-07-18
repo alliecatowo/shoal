@@ -198,15 +198,17 @@ output/undo, or cascade rules. Public methods can insert an output or undo row f
 unless their caller validates it. GC can delete a `blob` record/file while old `output` rows retain
 the hash; that is how output metadata can survive content aging.
 
-Indexes exist only on `entry(ts)`, `output(entry_id)`, and `undo(entry_id)`. SQLite primary-key
-indexes cover entry, pin, blob, and transcript event IDs. Principal/session/ok/head filtering is not
-separately indexed.
+Indexes exist on `entry(ts)`, `entry(parent_id)`, `(principal,session,kind,id)`,
+`output(entry_id)`, and `undo(entry_id)`. SQLite primary-key indexes cover entry, pin, blob, and
+transcript event IDs. Success/head filtering is not separately indexed.
 
 ### `entry`
 
 | Column | Written at append? | Completion meaning |
 |---|---:|---|
 | `id` | SQLite rowid | durable entry identity |
+| `kind` | yes | `statement`, `exec`, or `approval` |
+| `parent_id` | yes/null | owning coarse exec for evaluator statements; null otherwise |
 | `session`, `principal` | yes | provenance strings supplied by host |
 | `ts` | yes | start time, Unix epoch nanoseconds |
 | `dur_ns` | null | elapsed duration on finish |
@@ -219,10 +221,11 @@ separately indexed.
 | `ok` | null | semantic success after finish |
 | `opaque` | yes | whether effect derivation contained opaque behavior |
 
-The schema has no `kind`, `parent_id`, or statement ordinal. The kernel records a whole `Program` row
-per `exec`, while the session evaluator records a bare `Stmt` row per top-level statement. Event
-replay distinguishes them by deserializing AST shape. This heuristic is the strongest reason for the
-planned v2 execution-identity migration.
+Schema v2 added `kind` and `parent_id`. The kernel records a whole `Program` `exec` row, while the
+session evaluator records `statement` rows whose parent is that exec. Approval grants use
+`approval`. Durable event membership filters `kind = exec`; AST decoding remains a corruption check,
+not a type heuristic. The v1 migration classifies historical rows from the old producer shapes and
+leaves their unreconstructable parent IDs null. Statement ordinal and host vocabulary remain absent.
 
 ### `output`
 

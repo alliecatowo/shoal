@@ -9,7 +9,7 @@ struct ExecCompletion<'a> {
     actor: &'a str,
     entry_id: i64,
     started: Instant,
-    evaluator_started_ns: i64,
+    evaluator_entry_id: Option<i64>,
 }
 
 impl Kernel {
@@ -107,6 +107,8 @@ impl Kernel {
                 .map_err(|_| poisoned_subsystem("journal"))?;
             journal
                 .append(&EntryRecord {
+                    kind: shoal_journal::EntryKind::Exec,
+                    parent_id: None,
                     session: session.id.clone(),
                     // Cloned, not moved: both the error and success paths below
                     // publish a `journal` event (site/content/internals/kernel-protocol.md) carrying this
@@ -188,8 +190,10 @@ impl Kernel {
         // async/timeout wrapper above re-enters `handle_exec` with the same
         // `src` via `dispatch`, hitting this exact call again).
         evaluator.set_source(params.src.clone());
-        let evaluator_started_ns = now_ns();
-        let value = match eval_with_position(&mut evaluator, &ast, &params.position) {
+        evaluator.begin_journal_execution(Some(entry_id));
+        let evaluation = eval_with_position(&mut evaluator, &ast, &params.position);
+        let evaluator_entry_id = evaluator.take_last_journal_entry();
+        let value = match evaluation {
             Ok(value) => value,
             Err(e) => {
                 {
@@ -260,7 +264,7 @@ impl Kernel {
                 actor: &actor,
                 entry_id,
                 started,
-                evaluator_started_ns,
+                evaluator_entry_id,
             },
         )
     }
@@ -278,23 +282,9 @@ impl Kernel {
             actor,
             entry_id,
             started,
-            evaluator_started_ns,
+            evaluator_entry_id,
         } = completion;
         let exit_code = evaluator.take_exit();
-        let evaluator_entry_id = self
-            .journal
-            .lock()
-            .map_err(|_| poisoned_subsystem("journal"))?
-            .query(&JournalQuery {
-                since_ts_ns: Some(evaluator_started_ns),
-                session: Some(session.id.clone()),
-                principal: Some(actor.to_owned()),
-                ok: Some(true),
-                limit: 1,
-                ..Default::default()
-            })
-            .ok()
-            .and_then(|rows| rows.first().map(|row| row.id));
         // Keep the evaluator-visible REPL transcript (`it` and `out`) in
         // lockstep with the kernel's addressable Session transcript. Failed
         // evaluations intentionally do not reach this point, matching the

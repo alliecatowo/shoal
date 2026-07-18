@@ -97,7 +97,8 @@ impl ChildContext {
         // interactive:     false — a child never owns the real terminal.
         // sink:            no competing mutable renderer; a child returns its
         //                  value through its task/return channel, not a sink.
-        // it / plans / modules / jobs / current_entry / source / pending_exit /
+        // it / plans / modules / jobs / current_entry / journal parent + last
+        // completed entry / source / pending_exit /
         // pending_stop / external_jobs / call_depth /
         // in_fn_body:      per-evaluator session state; a child gets its own.
         // oldpwd / dir_stack: inherited snapshots, because they are part of the

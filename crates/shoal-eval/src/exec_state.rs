@@ -19,6 +19,10 @@ pub(crate) struct ControlState {
     pub(crate) call_depth: usize,
     pub(crate) in_fn_body: usize,
     pub(crate) current_entry: Option<i64>,
+    /// Coarse host execution that owns newly journaled statement rows.
+    pub(crate) journal_parent_entry: Option<i64>,
+    /// Most recently durably completed statement in the active host execution.
+    pub(crate) last_completed_entry: Option<i64>,
     /// First post-begin persistence failure for the active journal entry. The
     /// statement boundary consumes this and returns an explicit indeterminate
     /// result after any already-started effects complete.
@@ -181,6 +185,8 @@ impl ExecState {
                 call_depth: 0,
                 in_fn_body: 0,
                 current_entry: None,
+                journal_parent_entry: None,
+                last_completed_entry: None,
                 journal_failure: None,
                 source: None,
                 pending_exit: None,

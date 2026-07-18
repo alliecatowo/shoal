@@ -59,7 +59,7 @@ mod undo;
 pub use cas::{Cas, JournalOptions, OutputMeta, OutputRow};
 pub use gc::{GcBlob, GcOptions, GcReport};
 pub use query::{DurableEventSeed, EntryRow, JournalQuery};
-pub use schema::EntryRecord;
+pub use schema::{EntryKind, EntryRecord};
 pub use storage::{
     DEFAULT_JOURNAL_CAS_MAX_BYTES, DEFAULT_JOURNAL_DATABASE_MAX_BYTES, JournalStorageLimits,
     JournalStorageStatus, MAX_JOURNAL_CAS_MAX_BYTES, MAX_JOURNAL_DATABASE_MAX_BYTES,

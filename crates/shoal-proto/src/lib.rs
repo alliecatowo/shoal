@@ -659,6 +659,8 @@ pub struct JournalQueryParams {
     /// dropped. Filtered in the kernel, above the journal store.
     pub until: Option<i64>,
     pub principal: Option<String>,
+    /// Exact semantic entry kind: `statement`, `exec`, or `approval`.
+    pub kind: Option<String>,
     pub head: Option<String>,
     pub ok: Option<bool>,
     /// Keep only entries whose effect set contains every listed effect kind
@@ -740,6 +742,12 @@ pub struct JournalOutput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JournalEntry {
     pub id: i64,
+    /// Semantic role: `statement`, `exec`, or `approval`.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Owning coarse execution id for statement rows, when recorded.
+    #[serde(default)]
+    pub parent_id: Option<i64>,
     pub session: String,
     pub principal: String,
     pub ts: i64,

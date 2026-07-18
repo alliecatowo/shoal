@@ -66,9 +66,7 @@ pub(crate) use rendering::{print_value, render_result, render_result_paged, term
 use rendering::{render_protocol_outcome, report_protocol_error};
 #[cfg(test)]
 use transcript::push_out_entry;
-use transcript::{
-    TranscriptState, effective_journal_state_dir, language_journal_requested, now_ns,
-};
+use transcript::{TranscriptState, effective_journal_state_dir, language_journal_requested};
 use ui::ReplUi;
 
 pub(crate) fn repl(standalone: bool) -> Result<i32, String> {
@@ -283,12 +281,13 @@ fn handle_submitted_line(
     };
     transcript.resolve_undo(&mut program);
     evaluator.set_source(run_src.clone());
-    let started_ns = now_ns();
+    evaluator.begin_journal_execution(None);
     let evaluation = evaluator.eval_program(&program);
+    let journal_entry_id = evaluator.take_last_journal_entry();
     background.watch(evaluator, evaluation.as_ref().ok());
     match evaluation {
         Ok(value) => {
-            if let Err(error) = transcript.record(evaluator, &value, started_ns) {
+            if let Err(error) = transcript.record(evaluator, &value, journal_entry_id) {
                 report_eval_error(&run_src, None, &error);
                 return None;
             }
