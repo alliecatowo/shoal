@@ -12,10 +12,10 @@ on:
       - ".github/workflows/pages.yml"
   workflow_dispatch:
 
-permissions:
-  contents: read
-  pages: write
-  id-token: write
+permissions: {}
+
+env:
+  MISE_JOBS: 1
 
 concurrency:
   group: pages-${{ github.workflow }}-${{ github.ref }}
@@ -24,25 +24,32 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Check diagram governance
-        run: ./site/scripts/check-diagrams.sh
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
+      - uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Bootstrap Shoal
+        run: cargo build -p shoal --locked
 
       - name: Configure GitHub Pages
         id: pages
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
 
-      - name: Check, build, and upload documentation
-        uses: getzola/github-pages@435a833fd3f1edcb28d70576c89e30a6365cd8f7
+      - name: Check and build documentation through Shoal
+        env:
+          SHOAL_PAGES_BASE_URL: ${{ steps.pages.outputs.base_url }}
+        run: target/debug/shoal scripts/ci-pages.shl
+      - name: Upload documentation
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4
         with:
-          zola_version: v0.22.1
-          working_directory: site
-          check_links: "true"
-          build_flags: ${{ github.event_name == 'push' && format('--base-url {0}', steps.pages.outputs.base_url) || '' }}
+          path: site/public
 
   deploy:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -51,7 +58,10 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
     needs: build
+    permissions:
+      pages: write
+      id-token: write
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4

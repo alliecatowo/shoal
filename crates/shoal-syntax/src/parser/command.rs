@@ -20,7 +20,7 @@ impl<'s> Parser<'s> {
             Ok((Tok::Ident(name), s)) => {
                 if RESERVED.contains(&name.as_str()) || matches!(name.as_str(), "with" | "spawn") {
                     false
-                } else if INTERPRETERS.contains(&name.as_str()) && self.interp_block_follows(s) {
+                } else if self.is_interpreter(&name) && self.interp_block_follows(s) {
                     // `tool { … }` / `tool ''' … '''` is an interpreter block
                     // expression, not a command — dispatch EXPR.
                     false
@@ -103,7 +103,7 @@ impl<'s> Parser<'s> {
             }
         };
         let mut args = vec![];
-        let mut redirects = vec![];
+        let mut redirects: Vec<Redirect> = vec![];
         let mut background = false;
         let mut trailing = None;
         loop {
@@ -190,6 +190,18 @@ impl<'s> Parser<'s> {
                             )
                         });
                     }
+                    if redirects
+                        .iter()
+                        .any(|redirect| redirect.kind == RedirectKind::In)
+                    {
+                        return Err(ParseError::new(
+                            "a command may have only one stdin redirect",
+                            s,
+                        )
+                        .hint(
+                            "choose one input source; compose typed input first and use `.feed(cmd)` when needed",
+                        ));
+                    }
                     self.bump(Mode::Cmd)?;
                     let target = self.cmd_arg()?;
                     redirects.push(Redirect {
@@ -216,6 +228,17 @@ impl<'s> Parser<'s> {
                             "stderr is structured — `(cmd).stderr`, or \
                              `try { cmd } catch e { e.stderr }`; a statement-position \
                              PTY run already merges the streams",
+                        ));
+                    }
+                    if redirects.iter().any(|redirect| {
+                        matches!(redirect.kind, RedirectKind::Out | RedirectKind::Append)
+                    }) {
+                        return Err(ParseError::new(
+                            "a command may have only one stdout redirect",
+                            s,
+                        )
+                        .hint(
+                            "choose one target; for fan-out, capture `(cmd).out` and handle each write explicitly",
                         ));
                     }
                     let kind = match self.bump(Mode::Cmd)?.0 {

@@ -19,9 +19,17 @@
 //! three times last month (`3 × 0.25 = 0.75`): recency dominates raw frequency,
 //! which is the whole point of frecency over a plain visit counter.
 //!
-//! To keep the store bounded, once the summed rank crosses [`MAX_TOTAL_RANK`]
-//! every rank is scaled by `0.9` and entries that fall below `1.0` are dropped
-//! (zoxide's aging), so a long-lived shell never grows the file without limit.
+//! To keep the advisory store bounded, Shoal admits at most [`MAX_ENTRIES`]
+//! identities, [`MAX_PATH_BYTES`] per serialized path, and
+//! [`MAX_TOTAL_PATH_BYTES`] across all paths. Parsed rows are admitted in file
+//! order; duplicates of an admitted path are coalesced. A new successful visit
+//! evicts the weakest admitted identity when it needs room (lowest rank, then
+//! oldest access, then lexically largest path). This makes recovery from a
+//! hostile or hand-edited file deterministic without making navigation fail.
+//!
+//! Rank is bounded too. Before a visit would cross [`MAX_TOTAL_RANK`], existing
+//! ranks are aged and faint entries are dropped. Loaded ranks are renormalized
+//! in one finite pass, so individually finite rows cannot sum to infinity.
 //!
 //! # Query matching
 //!
@@ -38,14 +46,22 @@
 //!
 //! The store is a small line-based text file (`<rank>\t<last_access>\t<path>`
 //! per line) colocated with the journal under the per-user state dir
-//! (`<state_dir>/jump.frecency`). A missing file, an unreadable file, or any
-//! individual malformed line degrades to "not present" rather than an error —
-//! a corrupt store never crashes the shell. Writing is best-effort and atomic
-//! (temp file + rename); a failed write must never fail the `cd` that triggered
-//! it.
+//! (`<state_dir>/jump.frecency`). Reads stop after [`MAX_STORE_FILE_BYTES`]
+//! rather than trusting the host file's size. A missing file, an unreadable
+//! file, or any individual malformed line degrades to "not present" rather
+//! than an error — a corrupt store never crashes the shell. Writing is bounded,
+//! best-effort, and atomically replaces the prior file; a failed write must
+//! never fail the `cd` that triggered it.
 
 use super::*;
 use std::cmp::Ordering;
+use std::collections::HashMap;
+use std::fmt::Write as _;
+use std::fs::{self, OpenOptions};
+use std::io;
+use std::io::Read as _;
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+use std::time::{Duration, Instant};
 
 /// Recency-bucket boundaries, in seconds.
 const HOUR: i64 = 3_600;
@@ -55,8 +71,24 @@ const WEEK: i64 = 604_800;
 /// Summed-rank ceiling past which the store ages/prunes itself.
 const MAX_TOTAL_RANK: f64 = 10_000.0;
 
+/// Maximum bytes read from or written to the host-owned history file.
+const MAX_STORE_FILE_BYTES: usize = 1024 * 1024;
+
+/// Maximum number of distinct directory identities retained.
+const MAX_ENTRIES: usize = 4096;
+
+/// Maximum UTF-8 bytes in one serialized (lossy, display-form) path.
+const MAX_PATH_BYTES: usize = 4096;
+
+/// Maximum serialized path bytes retained across the whole store.
+const MAX_TOTAL_PATH_BYTES: usize = 512 * 1024;
+
 /// Basename of the frecency store within the per-user state dir.
 const STORE_FILE: &str = "jump.frecency";
+
+/// Navigation is latency-sensitive and history is advisory. A stuck
+/// same-user process may delay an update briefly, but cannot hang `cd`.
+const LOCK_WAIT: Duration = Duration::from_millis(250);
 
 /// One visited directory: an accumulated visit `rank` and the `last_access`
 /// time (Unix seconds) used for recency weighting.
@@ -86,8 +118,12 @@ impl Entry {
 }
 
 /// The in-memory directory-frecency table. Cheap to load/serialize; each `cd`
-/// loads it, [`add`](FrecencyStore::add)s the destination, and saves it back so
-/// concurrent shells converge (last write wins, each write is load-then-modify).
+/// loads it, [`add`](FrecencyStore::add)s the destination, and saves it back.
+/// Publications are atomic. Successful navigation takes a bounded advisory
+/// file lock around reload, merge, and replacement, so cooperative concurrent
+/// sessions preserve one another's visits. Lock failure or prolonged
+/// contention degrades to a dropped advisory update rather than blocking
+/// navigation indefinitely.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct FrecencyStore {
     entries: Vec<Entry>,
@@ -97,31 +133,85 @@ impl FrecencyStore {
     /// Record a visit to `dir` at `now` (Unix seconds): bump an existing entry's
     /// rank and stamp its access time, or insert a fresh one at rank `1.0`.
     pub(crate) fn add(&mut self, dir: &Path, now: i64) {
+        if !admissible_path(dir) {
+            return;
+        }
+        self.make_rank_headroom();
         match self.entries.iter_mut().find(|e| e.path == dir) {
             Some(e) => {
-                e.rank += 1.0;
+                e.rank = finite_rank_add(e.rank, 1.0);
                 e.last_access = now;
             }
-            None => self.entries.push(Entry {
-                path: dir.to_path_buf(),
-                rank: 1.0,
-                last_access: now,
-            }),
+            None => {
+                let path_bytes = serialized_path_bytes(dir);
+                while self.entries.len() >= MAX_ENTRIES
+                    || self.total_path_bytes().saturating_add(path_bytes) > MAX_TOTAL_PATH_BYTES
+                {
+                    let Some(index) = self.weakest_index() else {
+                        return;
+                    };
+                    self.entries.remove(index);
+                }
+                self.entries.push(Entry {
+                    path: dir.to_path_buf(),
+                    rank: 1.0,
+                    last_access: now,
+                });
+            }
         }
-        self.age();
     }
 
-    /// zoxide-style aging: once the store's total rank exceeds
-    /// [`MAX_TOTAL_RANK`], decay every rank and forget the faintest entries so
-    /// the file stays bounded no matter how long a session runs.
-    fn age(&mut self) {
-        let total: f64 = self.entries.iter().map(|e| e.rank).sum();
-        if total > MAX_TOTAL_RANK {
-            for e in &mut self.entries {
-                e.rank *= 0.9;
+    /// Age before adding, so a newly visited identity is not immediately
+    /// discarded merely because its `1.0` crossed the total-rank ceiling.
+    fn make_rank_headroom(&mut self) {
+        let total = self.total_rank();
+        if total + 1.0 > MAX_TOTAL_RANK {
+            let factor = (MAX_TOTAL_RANK * 0.9 / total).min(0.9);
+            for entry in &mut self.entries {
+                entry.rank *= factor;
             }
-            self.entries.retain(|e| e.rank >= 1.0);
+            self.entries.retain(|entry| entry.rank >= 1.0);
         }
+    }
+
+    /// Normalize an arbitrary parsed store in one pass. This is deliberately
+    /// stronger than ordinary visit aging: hostile finite inputs may otherwise
+    /// overflow when summed or require thousands of 0.9 aging passes.
+    fn normalize_loaded_ranks(&mut self) {
+        let total = self.total_rank();
+        if total > MAX_TOTAL_RANK {
+            let factor = (MAX_TOTAL_RANK * 0.9) / total;
+            for entry in &mut self.entries {
+                entry.rank *= factor;
+            }
+            self.entries.retain(|entry| entry.rank >= 1.0);
+        }
+    }
+
+    fn total_rank(&self) -> f64 {
+        self.entries
+            .iter()
+            .fold(0.0, |total, entry| total + sanitize_rank(entry.rank))
+    }
+
+    fn total_path_bytes(&self) -> usize {
+        self.entries.iter().fold(0usize, |total, entry| {
+            total.saturating_add(serialized_path_bytes(&entry.path))
+        })
+    }
+
+    fn weakest_index(&self) -> Option<usize> {
+        self.entries
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| {
+                a.rank
+                    .total_cmp(&b.rank)
+                    .then_with(|| a.last_access.cmp(&b.last_access))
+                    // On a full tie, evict the lexically largest identity.
+                    .then_with(|| b.path.cmp(&a.path))
+            })
+            .map(|(index, _)| index)
     }
 
     /// All entries matching `query` (or every entry when `query` is `None`),
@@ -155,24 +245,40 @@ impl FrecencyStore {
         out
     }
 
-    /// Serialize to the `<rank>\t<last_access>\t<path>` line format.
+    /// Serialize to the `<rank>\t<last_access>\t<path>` line format. The
+    /// explicit output ceiling is a final defense even if an internal test or
+    /// future caller constructs an invalid store without using [`Self::add`].
     fn serialize(&self) -> String {
-        let mut s = String::new();
-        for e in &self.entries {
-            s.push_str(&format!(
-                "{:.6}\t{}\t{}\n",
-                e.rank,
-                e.last_access,
-                e.path.display()
-            ));
+        let mut output = String::with_capacity(MAX_STORE_FILE_BYTES.min(8192));
+        let mut identities = 0usize;
+        let mut path_bytes = 0usize;
+        for entry in &self.entries {
+            if identities >= MAX_ENTRIES || !admissible_path(&entry.path) {
+                continue;
+            }
+            let path = entry.path.to_string_lossy();
+            if path_bytes.saturating_add(path.len()) > MAX_TOTAL_PATH_BYTES {
+                continue;
+            }
+            let rank = sanitize_rank(entry.rank);
+            let mut line = String::with_capacity(path.len().saturating_add(48));
+            let _ = writeln!(line, "{rank:.6}\t{}\t{path}", entry.last_access);
+            if output.len().saturating_add(line.len()) > MAX_STORE_FILE_BYTES {
+                break;
+            }
+            output.push_str(&line);
+            identities += 1;
+            path_bytes += path.len();
         }
-        s
+        output
     }
 
     /// Parse the line format, skipping any blank or malformed line so a
     /// partially-corrupt file still yields every entry it can.
     fn parse(text: &str) -> Self {
         let mut store = Self::default();
+        let mut indexes = HashMap::<PathBuf, usize>::new();
+        let mut path_bytes = 0usize;
         for line in text.lines() {
             if line.trim().is_empty() {
                 continue;
@@ -186,54 +292,239 @@ impl FrecencyStore {
             let (Ok(rank), Ok(last_access)) = (r.parse::<f64>(), t.parse::<i64>()) else {
                 continue;
             };
-            if !rank.is_finite() || rank < 0.0 {
+            if !rank.is_finite() || rank <= 0.0 {
                 continue;
             }
-            store.merge(PathBuf::from(p), rank, last_access);
+            if p.is_empty() || p.len() > MAX_PATH_BYTES || p.contains('\n') || p.contains('\r') {
+                continue;
+            }
+            let borrowed = Path::new(p);
+            if let Some(&index) = indexes.get(borrowed) {
+                let entry = &mut store.entries[index];
+                entry.rank = finite_rank_add(entry.rank, rank);
+                entry.last_access = entry.last_access.max(last_access);
+                continue;
+            }
+            if store.entries.len() >= MAX_ENTRIES
+                || path_bytes.saturating_add(p.len()) > MAX_TOTAL_PATH_BYTES
+            {
+                continue;
+            }
+            let path = PathBuf::from(p);
+            indexes.insert(path.clone(), store.entries.len());
+            store.entries.push(Entry {
+                path,
+                rank: sanitize_rank(rank),
+                last_access,
+            });
+            path_bytes += p.len();
         }
+        store.normalize_loaded_ranks();
         store
     }
 
-    /// Fold a parsed row in, coalescing duplicate paths (sum rank, keep the
-    /// newest access) so a hand-edited or double-written file never yields the
-    /// same directory twice in the ranking.
-    fn merge(&mut self, path: PathBuf, rank: f64, last_access: i64) {
-        match self.entries.iter_mut().find(|e| e.path == path) {
-            Some(e) => {
-                e.rank += rank;
-                e.last_access = e.last_access.max(last_access);
-            }
-            None => self.entries.push(Entry {
-                path,
-                rank,
-                last_access,
-            }),
-        }
+    /// Load the host-owned history database. This persistence path is control
+    /// plane state chosen by the embedding host, not a language-selected path,
+    /// so it deliberately uses the ambient adapter rather than the evaluator's
+    /// sandboxed/in-memory [`Fs`] capability. A missing or unreadable file (or
+    /// invalid UTF-8) is treated as an empty store — never an error. Oversized
+    /// files contribute only complete lines from their bounded prefix.
+    pub(crate) fn load_host(path: &Path) -> Self {
+        with_store_lock(path, LockKind::Shared, || Self::load_host_unlocked(path))
+            .unwrap_or_default()
     }
 
-    /// Load the store from `path` through the [`Fs`] port. A missing or
-    /// unreadable file (or invalid UTF-8) is treated as an empty store — never
-    /// an error.
-    pub(crate) fn load(fs: &dyn Fs, path: &Path) -> Self {
-        match fs.read_to_string(path) {
-            Ok(text) => Self::parse(&text),
-            Err(_) => Self::default(),
+    fn load_host_unlocked(path: &Path) -> io::Result<Self> {
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        let mut reader = match options.open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(error) => return Err(error),
+        };
+        harden_private_regular_file(&reader)?;
+        let mut bytes = Vec::with_capacity(8192);
+        if reader
+            .by_ref()
+            .take((MAX_STORE_FILE_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .is_err()
+        {
+            return Ok(Self::default());
         }
+        if bytes.len() > MAX_STORE_FILE_BYTES {
+            bytes.truncate(MAX_STORE_FILE_BYTES);
+            let Some(last_newline) = bytes.iter().rposition(|byte| *byte == b'\n') else {
+                return Ok(Self::default());
+            };
+            bytes.truncate(last_newline + 1);
+        }
+        Ok(std::str::from_utf8(&bytes).map_or_else(|_| Self::default(), Self::parse))
     }
 
-    /// Atomically persist the store to `path` through the [`Fs`] port (write to
-    /// a temp file, then rename). Returns the I/O result; callers on the `cd`
-    /// hot path swallow it (best-effort).
-    pub(crate) fn save(&self, fs: &dyn Fs, path: &Path) -> std::io::Result<()> {
+    /// Atomically persist the host-owned database (write to a temp file, then
+    /// rename). Candidate directories never use this ambient service; they are
+    /// always probed through the evaluator's inherited [`Fs`] below. Returns
+    /// the I/O result; callers on the `cd` hot path swallow it (best-effort).
+    #[cfg(test)]
+    pub(crate) fn save_host(&self, path: &Path) -> std::io::Result<()> {
+        with_store_lock(path, LockKind::Exclusive, || self.save_host_unlocked(path))
+    }
+
+    fn save_host_unlocked(&self, path: &Path) -> io::Result<()> {
         if let Some(parent) = path.parent() {
-            fs.create_dir_all(parent)?;
+            StdFs.create_dir_all(parent)?;
         }
-        // Per-pid temp name so concurrent shells don't stomp each other's
-        // in-progress write before the atomic rename publishes it.
-        let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-        fs.write(&tmp, self.serialize().as_bytes())?;
-        fs.rename(&tmp, path)?;
-        Ok(())
+        reject_symlink_or_unsafe_file(path)?;
+        let output = self.serialize();
+        debug_assert!(output.len() <= MAX_STORE_FILE_BYTES);
+        StdFs.atomic_replace(path, output.as_bytes())
+    }
+
+    /// Merge one successful visit while holding the store's exclusive lock.
+    /// Reloading inside the lock is what prevents concurrent evaluators from
+    /// publishing snapshots derived from stale history.
+    fn record_host(path: &Path, dir: &Path, now: i64) -> io::Result<()> {
+        with_store_lock(path, LockKind::Exclusive, || {
+            let mut store = Self::load_host_unlocked(path)?;
+            store.add(dir, now);
+            store.save_host_unlocked(path)
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum LockKind {
+    Shared,
+    Exclusive,
+}
+
+fn lock_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".lock");
+    PathBuf::from(name)
+}
+
+fn open_lock_file(path: &Path) -> io::Result<fs::File> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "jump store needs a parent directory",
+        )
+    })?;
+    StdFs.create_dir_all(parent)?;
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let file = options.open(lock_path(path))?;
+    harden_private_regular_file(&file)?;
+    Ok(file)
+}
+
+fn with_store_lock<T>(
+    path: &Path,
+    kind: LockKind,
+    operation: impl FnOnce() -> io::Result<T>,
+) -> io::Result<T> {
+    let file = open_lock_file(path)?;
+    let mut lock = fd_lock::RwLock::new(file);
+    let deadline = Instant::now() + LOCK_WAIT;
+    match kind {
+        LockKind::Shared => loop {
+            match lock.try_read() {
+                Ok(_guard) => return operation(),
+                Err(error)
+                    if error.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => return Err(error),
+            }
+        },
+        LockKind::Exclusive => loop {
+            match lock.try_write() {
+                Ok(_guard) => return operation(),
+                Err(error)
+                    if error.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => return Err(error),
+            }
+        },
+    }
+}
+
+fn harden_private_regular_file(file: &fs::File) -> io::Result<()> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() } || metadata.nlink() != 1
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "jump history is not a singly-linked regular file owned by this user",
+        ));
+    }
+    // Historical Shoal builds did not promise a mode. Repair an otherwise
+    // safe owned file before consuming potentially sensitive paths.
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    if file.metadata()?.mode() & 0o077 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "jump history permissions could not be restricted",
+        ));
+    }
+    Ok(())
+}
+
+fn reject_symlink_or_unsafe_file(path: &Path) -> io::Result<()> {
+    let metadata = match StdFs.symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.nlink() != 1
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "refusing unsafe jump history path",
+        ));
+    }
+    Ok(())
+}
+
+fn serialized_path_bytes(path: &Path) -> usize {
+    path.to_string_lossy().len()
+}
+
+fn admissible_path(path: &Path) -> bool {
+    let path = path.to_string_lossy();
+    !path.is_empty() && path.len() <= MAX_PATH_BYTES && !path.contains('\n') && !path.contains('\r')
+}
+
+fn sanitize_rank(rank: f64) -> f64 {
+    if rank.is_finite() && rank >= 0.0 {
+        rank.min(MAX_TOTAL_RANK)
+    } else {
+        0.0
+    }
+}
+
+fn finite_rank_add(left: f64, right: f64) -> f64 {
+    let sum = sanitize_rank(left) + sanitize_rank(right);
+    if sum.is_finite() {
+        sum.min(MAX_TOTAL_RANK)
+    } else {
+        MAX_TOTAL_RANK
     }
 }
 
@@ -259,23 +550,29 @@ impl Evaluator {
     /// once so `cd` builds up jump history; `-c`/scripts/conformance leave it
     /// off and never write.
     pub fn open_default_jump_history(&mut self) {
-        self.jump_store = Some(crate::journal::default_state_dir().join(STORE_FILE));
+        self.set_jump_store(crate::journal::default_state_dir().join(STORE_FILE));
     }
 
     /// Point the frecency store at a specific file (hosts that manage their own
     /// state dir, and hermetic tests). Enables recording, like
     /// [`Evaluator::open_default_jump_history`].
     pub fn set_jump_store(&mut self, path: PathBuf) {
-        self.jump_store = Some(path);
+        self.exec.shell.jump_read_store = Some(path.clone());
+        self.exec.shell.jump_write_store = Some(path);
     }
 
-    /// The store file to *read* for a `j` query: the installed store when
-    /// recording is enabled, else the shared per-user default so a one-shot
-    /// `shoal -c 'j foo'` still resolves against real history.
-    fn jump_read_path(&self) -> PathBuf {
-        self.jump_store
-            .clone()
-            .unwrap_or_else(|| crate::journal::default_state_dir().join(STORE_FILE))
+    /// Disable both durable frecency observation and recording. Hosts use this
+    /// for tokenless/restricted sessions whose identity is not safe to persist.
+    pub fn disable_jump_history(&mut self) {
+        self.exec.shell.jump_read_store = None;
+        self.exec.shell.jump_write_store = None;
+    }
+
+    /// The host-selected store file to read for a `j` query. Fresh standalone
+    /// evaluators start with the per-user default; security-sensitive hosts
+    /// may replace it with a partition or explicitly disable it.
+    fn jump_read_path(&self) -> Option<PathBuf> {
+        self.exec.shell.jump_read_store.clone()
     }
 
     /// Record a successful `cd`/`j` into the frecency store (best-effort). A
@@ -283,13 +580,11 @@ impl Evaluator {
     /// it can never fail the navigation that triggered it. Uses the [`Clock`]
     /// port for "now" so tests can pin recency.
     pub(crate) fn record_cd(&mut self, dir: &Path) {
-        let Some(path) = self.jump_store.clone() else {
+        let Some(path) = self.exec.shell.jump_write_store.clone() else {
             return; // recording disabled (scripts / -c / conformance)
         };
-        let now = self.clock.now_ns() / 1_000_000_000;
-        let mut store = FrecencyStore::load(self.fs.as_ref(), &path);
-        store.add(dir, now);
-        let _ = store.save(self.fs.as_ref(), &path);
+        let now = self.host.clock.now_ns() / 1_000_000_000;
+        let _ = FrecencyStore::record_host(&path, dir, now);
     }
 
     /// The `j`/`jump` builtin: resolve the best matching stored directory for an
@@ -299,7 +594,7 @@ impl Evaluator {
     pub(crate) fn eval_jump(&mut self, call: &CmdCall) -> VResult<Value> {
         // Same session-scope rule as `cd`: mutating the session cwd inside a
         // `fn` body is illegal (use `with cwd:` for a scoped change).
-        if self.in_fn_body > 0 {
+        if self.exec.control.in_fn_body > 0 {
             return Err(ErrorVal::new(
                 "custom",
                 "jump is only allowed at session top level; use `with cwd:` inside a fn body",
@@ -326,7 +621,7 @@ impl Evaluator {
         let target = self
             .jump_resolve(query.as_deref())
             .map_err(|e| e.or_span(call.span))?;
-        let canon = target.canonicalize().map_err(|e| {
+        let canon = self.host.fs.canonicalize(&target).map_err(|e| {
             ErrorVal::new(
                 "not_found",
                 format!("jump target {}: {e}", target.display()),
@@ -336,7 +631,7 @@ impl Evaluator {
         // Route through `change_cwd` so a jump also updates OLDPWD (a later
         // `cd -` returns to where the jump left from) and records frecency.
         self.change_cwd(canon);
-        Ok(Value::Path(self.cwd.clone()))
+        Ok(Value::Path(self.exec.shell.cwd.clone()))
     }
 
     /// Resolve the directory a `j <query>` should land in, without changing the
@@ -349,16 +644,20 @@ impl Evaluator {
             let direct = if Path::new(q).is_absolute() {
                 PathBuf::from(q)
             } else {
-                self.cwd.join(q)
+                self.exec.shell.cwd.join(q)
             };
-            if direct.is_dir() {
+            if self.host.fs.is_dir(&direct) {
                 return Ok(direct);
             }
         }
-        let now = self.clock.now_ns() / 1_000_000_000;
-        let store = FrecencyStore::load(self.fs.as_ref(), &self.jump_read_path());
+        let now = self.host.clock.now_ns() / 1_000_000_000;
+        let store = self
+            .jump_read_path()
+            .map_or_else(FrecencyStore::default, |path| {
+                FrecencyStore::load_host(&path)
+            });
         for e in store.ranked(query, now) {
-            if e.path.is_dir() {
+            if self.host.fs.is_dir(&e.path) {
                 return Ok(e.path.clone());
             }
         }
@@ -375,255 +674,5 @@ impl Evaluator {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn entry(path: &str, rank: f64, last_access: i64) -> Entry {
-        Entry {
-            path: PathBuf::from(path),
-            rank,
-            last_access,
-        }
-    }
-
-    /// A single recent visit outranks many stale ones: recency beats raw
-    /// frequency, which is the defining property of frecency.
-    #[test]
-    fn recency_outweighs_stale_frequency() {
-        let now = 1_000_000_000;
-        let mut store = FrecencyStore::default();
-        // Ten visits, but all over a week old (→ ×0.25): frecency 10 × 0.25 = 2.5.
-        store.entries.push(entry("/home/old", 10.0, now - 2 * WEEK));
-        // One visit within the hour (→ ×4): frecency 1 × 4 = 4.0.
-        store.entries.push(entry("/home/fresh", 1.0, now - 60));
-        let ranked = store.ranked(None, now);
-        assert_eq!(ranked[0].path, PathBuf::from("/home/fresh"));
-        assert_eq!(ranked[1].path, PathBuf::from("/home/old"));
-    }
-
-    #[test]
-    fn frecency_bucket_weights() {
-        let now = 1_000_000_000;
-        assert_eq!(entry("/a", 1.0, now - 60).frecency(now), 4.0); // < 1h
-        assert_eq!(entry("/a", 1.0, now - 2 * HOUR).frecency(now), 2.0); // < 1d
-        assert_eq!(entry("/a", 1.0, now - 2 * DAY).frecency(now), 0.5); // < 1w
-        assert_eq!(entry("/a", 1.0, now - 2 * WEEK).frecency(now), 0.25); // older
-    }
-
-    #[test]
-    fn add_bumps_rank_and_access() {
-        let mut store = FrecencyStore::default();
-        store.add(Path::new("/proj"), 100);
-        store.add(Path::new("/proj"), 200);
-        assert_eq!(store.entries.len(), 1);
-        assert_eq!(store.entries[0].rank, 2.0);
-        assert_eq!(store.entries[0].last_access, 200);
-    }
-
-    #[test]
-    fn query_is_case_insensitive_substring() {
-        let now = 500;
-        let mut store = FrecencyStore::default();
-        store.add(Path::new("/home/allie/Develop/Shoal"), now);
-        store.add(Path::new("/home/allie/downloads"), now);
-        let hit = store.ranked(Some("shoal"), now);
-        assert_eq!(hit.len(), 1);
-        assert_eq!(hit[0].path, PathBuf::from("/home/allie/Develop/Shoal"));
-        // A substring that matches nothing yields no candidates.
-        assert!(store.ranked(Some("zzz"), now).is_empty());
-    }
-
-    #[test]
-    fn last_component_match_breaks_frecency_ties() {
-        let now = 1000;
-        let mut store = FrecencyStore::default();
-        // Equal rank + access → equal frecency; the leaf-name match wins.
-        store
-            .entries
-            .push(entry("/work/api/service", 3.0, now - 10));
-        store
-            .entries
-            .push(entry("/work/service/api", 3.0, now - 10));
-        let ranked = store.ranked(Some("service"), now);
-        assert_eq!(ranked.len(), 2);
-        assert_eq!(ranked[0].path, PathBuf::from("/work/api/service"));
-    }
-
-    #[test]
-    fn serialize_parse_roundtrip() {
-        let mut store = FrecencyStore::default();
-        store.add(Path::new("/a/b"), 100);
-        store.add(Path::new("/a/b"), 150);
-        store.add(Path::new("/c/d"), 120);
-        let text = store.serialize();
-        let reloaded = FrecencyStore::parse(&text);
-        let mut a = store.entries.clone();
-        let mut b = reloaded.entries.clone();
-        a.sort_by(|x, y| x.path.cmp(&y.path));
-        b.sort_by(|x, y| x.path.cmp(&y.path));
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn parse_skips_malformed_lines() {
-        let text = "\
-2.5\t100\t/good/one
-garbage line with no tabs
-notanumber\t100\t/bad/rank
-1.0\tnotanint\t/bad/access
-3.0\t200\t/good/two
-";
-        let store = FrecencyStore::parse(text);
-        let mut paths: Vec<_> = store.entries.iter().map(|e| e.path.clone()).collect();
-        paths.sort();
-        assert_eq!(
-            paths,
-            vec![PathBuf::from("/good/one"), PathBuf::from("/good/two")]
-        );
-    }
-
-    #[test]
-    fn load_missing_or_corrupt_is_empty() {
-        let dir = tempfile::tempdir().unwrap();
-        // Missing file.
-        let missing = dir.path().join("does-not-exist");
-        assert!(FrecencyStore::load(&StdFs, &missing).entries.is_empty());
-        // A file of pure garbage (no valid line) loads as empty, not an error.
-        let corrupt = dir.path().join("corrupt");
-        std::fs::write(&corrupt, b"\x00\x01not at all valid\xff\xfe").unwrap();
-        assert!(FrecencyStore::load(&StdFs, &corrupt).entries.is_empty());
-    }
-
-    #[test]
-    fn save_load_roundtrips_to_disk() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("nested").join("jump.frecency");
-        let mut store = FrecencyStore::default();
-        store.add(Path::new("/x/y"), 300);
-        store.add(Path::new("/x/y"), 350);
-        store.save(&StdFs, &path).unwrap();
-        let reloaded = FrecencyStore::load(&StdFs, &path);
-        assert_eq!(reloaded.entries.len(), 1);
-        assert_eq!(reloaded.entries[0].path, PathBuf::from("/x/y"));
-        assert_eq!(reloaded.entries[0].rank, 2.0);
-        assert_eq!(reloaded.entries[0].last_access, 350);
-    }
-
-    #[test]
-    fn merge_coalesces_duplicate_paths() {
-        let text = "\
-1.0\t100\t/dup
-2.0\t250\t/dup
-";
-        let store = FrecencyStore::parse(text);
-        assert_eq!(store.entries.len(), 1);
-        assert_eq!(store.entries[0].rank, 3.0);
-        assert_eq!(store.entries[0].last_access, 250);
-    }
-
-    // --- end-to-end through the evaluator (cd records, j resolves) ----------
-
-    /// A clock pinned to a fixed instant so recency weighting is deterministic.
-    struct FixedClock(i64);
-    impl Clock for FixedClock {
-        fn now_ns(&self) -> i64 {
-            self.0
-        }
-    }
-
-    fn run(ev: &mut Evaluator, src: &str) {
-        let program = shoal_syntax::parse(src).unwrap_or_else(|e| panic!("parse {src:?}: {e:?}"));
-        ev.eval_program(&program)
-            .unwrap_or_else(|e| panic!("eval {src:?}: {}", e.msg));
-    }
-
-    fn evaluator_at(root: &Path, store: &Path, now_secs: i64) -> Evaluator {
-        let mut ev = Evaluator::new(root.to_path_buf());
-        ev.set_jump_store(store.to_path_buf());
-        ev.set_clock(std::sync::Arc::new(FixedClock(now_secs * 1_000_000_000)));
-        ev
-    }
-
-    #[test]
-    fn cd_records_and_jump_resolves() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
-        std::fs::create_dir_all(root.join("alpha")).unwrap();
-        std::fs::create_dir_all(root.join("beta/shoal-project")).unwrap();
-        let store = root.join("jump.frecency");
-
-        let mut ev = evaluator_at(&root, &store, 1_000);
-        run(&mut ev, "cd alpha");
-        run(&mut ev, "cd ../beta/shoal-project");
-
-        // Both destinations were recorded by the plain `cd`s.
-        let recorded = FrecencyStore::load(&StdFs, &store);
-        assert_eq!(
-            recorded.entries.len(),
-            2,
-            "each cd should record its target"
-        );
-
-        // Jump by a leaf-name substring, then by a mid-path substring.
-        run(&mut ev, "j shoal");
-        assert_eq!(ev.cwd(), root.join("beta/shoal-project").as_path());
-        run(&mut ev, "j alpha");
-        assert_eq!(ev.cwd(), root.join("alpha").as_path());
-
-        // A query that matches nothing is a clean `not_found`, never a panic.
-        let err = ev
-            .eval_program(&shoal_syntax::parse("j no-such-dir-xyz").unwrap())
-            .unwrap_err();
-        assert_eq!(err.code, "not_found");
-    }
-
-    #[test]
-    fn history_survives_across_sessions() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
-        std::fs::create_dir_all(root.join("workspace")).unwrap();
-        let store = root.join("jump.frecency");
-
-        // Session A records a visit, then goes away.
-        {
-            let mut a = evaluator_at(&root, &store, 500);
-            run(&mut a, "cd workspace");
-        }
-        // Session B, a fresh evaluator on the same store, jumps using A's history.
-        let mut b = evaluator_at(&root, &store, 600);
-        run(&mut b, "j work");
-        assert_eq!(b.cwd(), root.join("workspace").as_path());
-    }
-
-    #[test]
-    fn corrupt_store_does_not_break_navigation() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
-        std::fs::create_dir_all(root.join("dir1")).unwrap();
-        let store = root.join("jump.frecency");
-        // Pre-seed the store with pure garbage.
-        std::fs::write(&store, b"\xff\xfegarbage\x00not valid").unwrap();
-
-        let mut ev = evaluator_at(&root, &store, 1_000);
-        // cd still works despite the corrupt store, and rewrites it cleanly.
-        run(&mut ev, "cd dir1");
-        assert_eq!(ev.cwd(), root.join("dir1").as_path());
-        let reloaded = FrecencyStore::load(&StdFs, &store);
-        assert_eq!(reloaded.entries.len(), 1);
-        assert_eq!(reloaded.entries[0].path, root.join("dir1"));
-    }
-
-    #[test]
-    fn recording_off_by_default_keeps_store_untouched() {
-        // A fresh `Evaluator` (the `-c`/script/conformance path) must not write
-        // any jump store when it `cd`s — recording is opt-in per host.
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
-        std::fs::create_dir_all(root.join("sub")).unwrap();
-        let mut ev = Evaluator::new(root.clone());
-        run(&mut ev, "cd sub");
-        assert_eq!(ev.cwd(), root.join("sub").as_path());
-        // No store file was created anywhere under the temp root.
-        assert!(!root.join("jump.frecency").exists());
-    }
-}
+#[path = "frecency/tests.rs"]
+mod tests;

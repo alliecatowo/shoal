@@ -3,6 +3,16 @@ use std::path::PathBuf;
 
 fn main() {
     let a: Vec<_> = std::env::args_os().skip(1).map(PathBuf::from).collect();
+    if a.as_slice() == [PathBuf::from("-h")] || a.as_slice() == [PathBuf::from("--help")] {
+        println!(
+            "Probe Shoal Landlock enforcement\n\nUsage: shoal-landlock-helper ALLOWED_PATH DENIED_PATH\n\nThis executable is an internal installation diagnostic."
+        );
+        return;
+    }
+    if a.as_slice() == [PathBuf::from("-V")] || a.as_slice() == [PathBuf::from("--version")] {
+        println!("shoal-landlock-helper {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     if a.len() != 2 {
         std::process::exit(64)
     };

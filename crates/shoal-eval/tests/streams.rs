@@ -130,6 +130,7 @@ fn window_slides() {
         rendered("[1,2,3,4].stream().window(2).collect()"),
         "[[1, 2], [2, 3], [3, 4]]"
     );
+    assert_eq!(run_err("[1].stream().window(4097).collect()"), "arg_error");
 }
 
 #[test]
@@ -142,13 +143,61 @@ fn dedupe_and_distinct() {
         rendered("[1,1,2,2,2,3,1].stream().distinct().collect()"),
         "[1, 2, 3]"
     );
+    assert_eq!(
+        rendered("[1,1.0,[2],[2.0]].stream().distinct().collect()"),
+        "[1, [2]]",
+        "distinct must preserve mixed numeric equality recursively"
+    );
+    assert_eq!(
+        run_err("[1,1,2,3].stream().distinct(2).collect()"),
+        "stream_distinct_limit"
+    );
+    assert_eq!(run_err("[1].stream().distinct(0).collect()"), "arg_error");
 }
 
 #[test]
 fn flat_map_over_lists() {
+    // `flat_map` is deliberately concat-map: each expansion is exhausted
+    // before the next outer item is pulled. It does not claim concurrent
+    // interleaving of child streams.
     assert_eq!(
         rendered("[1,2,3].stream().flat_map(x => [x, x * 10]).collect()"),
         "[1, 10, 2, 20, 3, 30]"
+    );
+    assert_eq!(
+        rendered("[0].stream().flat_map(_ => 1..1000000).take(3).collect()"),
+        "[1, 2, 3]",
+        "compact range expansions must stay lazy inside flat_map"
+    );
+    assert_eq!(
+        run_err("[0].stream().flat_map(_ => every(1s)).collect()"),
+        "stream_unbounded",
+        "a finite outer stream must not disguise an endless child as bounded"
+    );
+    assert_eq!(
+        run("[0].stream().flat_map(_ => every(5ms).take(1)).collect().len()"),
+        Value::Int(1),
+        "callers can explicitly bound a live child inside the closure"
+    );
+}
+
+#[test]
+fn compact_ranges_bound_eager_materialization_but_stream_lazily() {
+    assert_eq!(
+        run_err("(1..1000000).collect()"),
+        "range_materialization_limit"
+    );
+    assert_eq!(
+        run_err("json.stringify(1..1000000)"),
+        "range_materialization_limit"
+    );
+    assert_eq!(
+        rendered("(1..1000000).stream().take(3).collect()"),
+        "[1, 2, 3]"
+    );
+    assert_eq!(
+        run_err("(0..16385).stream().collect()"),
+        "stream_collect_limit"
     );
 }
 
@@ -161,10 +210,64 @@ fn enumerate_pairs() {
 }
 
 #[test]
-fn buffer_is_identity() {
+fn buffer_decouples_through_a_bounded_owned_pump() {
     assert_eq!(
-        rendered("[1,2,3].stream().buffer(2).collect()"),
+        rendered("[1,2,3].stream().map(x => x * 2).buffer(2).collect()"),
+        "[2, 4, 6]"
+    );
+    assert_eq!(
+        rendered("[1,2,3].stream().buffer(0).collect()"),
         "[1, 2, 3]"
+    );
+}
+
+#[test]
+fn finite_stream_feeds_command_stdin_as_line_framed_chunks() {
+    let Value::Outcome(outcome) = run(r#"["alpha", "beta"].stream().feed(cat)"#) else {
+        panic!("stream feed must return an outcome");
+    };
+    assert_eq!(outcome.stdout.as_slice(), b"alpha\nbeta\n");
+}
+
+#[test]
+fn live_stream_feeds_items_that_arrive_after_the_child_starts() {
+    let Value::Outcome(outcome) = run(
+        r#"spawn { sleep 10ms; channel("feed-live").emit("one"); sleep 10ms; channel("feed-live").emit("two") }
+channel("feed-live").events().map(ev => ev.payload).take(2).feed(cat)"#,
+    ) else {
+        panic!("stream feed must return an outcome");
+    };
+    assert_eq!(outcome.stdout.as_slice(), b"one\ntwo\n");
+}
+
+#[test]
+fn command_early_exit_disconnects_an_endless_stream_feed() {
+    let start = Instant::now();
+    let Value::Outcome(outcome) = run(r#"every(5ms).map(x => "tick").feed(head -n 2)"#) else {
+        panic!("stream feed must return an outcome");
+    };
+    assert_eq!(outcome.stdout.as_slice(), b"tick\ntick\n");
+    assert!(start.elapsed() < Duration::from_secs(5));
+}
+
+#[test]
+fn stream_feed_surfaces_item_serialization_errors() {
+    assert_eq!(
+        run_err(r#"[path("not-content")].stream().feed(cat)"#),
+        "type_error"
+    );
+}
+
+#[test]
+fn stream_feed_stops_an_idle_pump_when_command_spawn_fails() {
+    let start = Instant::now();
+    assert_eq!(
+        run_err("every(1s).feed(definitely-not-a-command-xyz)"),
+        "not_found"
+    );
+    assert!(
+        start.elapsed() < Duration::from_millis(500),
+        "spawn failure left the live stream pump blocked"
     );
 }
 
@@ -178,10 +281,11 @@ fn zip_pairs_positionally() {
 
 #[test]
 fn merge_interleaves_finite_streams() {
-    // Two in-memory sources are both immediately ready; merge drains them
-    // (order documented as arrival order — for finite in-memory, pull order).
-    let v = run("[1,2].stream().merge([3,4].stream()).sum()");
-    assert_eq!(v, Value::Int(10));
+    // Both sides are immediately ready, so round-robin preference is exact.
+    assert_eq!(
+        rendered("[1,2].stream().merge([3,4].stream()).collect()"),
+        "[1, 3, 2, 4]"
+    );
 }
 
 #[test]
@@ -208,6 +312,11 @@ fn single_consumption_enforced() {
         run_err("let s = [1,2,3].stream()\ns.collect()\ns.collect()"),
         "stream_consumed"
     );
+}
+
+#[test]
+fn tee_fork_count_is_bounded_before_source_consumption() {
+    assert_eq!(run_err("[1].stream().tee(65)"), "arg_error");
 }
 
 #[test]
@@ -248,6 +357,14 @@ channel("src").emit(21)
 channel("sink").take(timeout: 5s)"#,
     );
     assert_eq!(v, Value::Int(42));
+}
+
+#[test]
+fn cancelling_idle_on_handler_terminates_its_task() {
+    let v = run(r#"let task = on(channel("idle-on"), ev => ev)
+task.cancel()
+task.await()"#);
+    assert_eq!(v, Value::Null);
 }
 
 // --- `every` yields datetimes -------------------------------------------

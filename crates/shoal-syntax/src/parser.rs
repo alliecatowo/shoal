@@ -23,6 +23,7 @@ pub const INTERPRETERS: &[&str] = &[
     "deno",
     "ruby",
     "jq",
+    "yq",
     "perl",
     "php",
     "lua",
@@ -68,6 +69,15 @@ impl std::fmt::Display for ParseError {
 impl std::error::Error for ParseError {}
 pub type ParseResult<T> = Result<T, ParseError>;
 
+/// Hard walls on one parse. The wire layer permits larger envelopes because an
+/// RPC carries metadata as well as source, but constructing an AST from an
+/// unbounded source/token stream would let one connection consume arbitrary
+/// memory. Nesting is bounded separately because native-stack exhaustion aborts
+/// the process rather than producing a catchable Rust panic.
+pub const MAX_SOURCE_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_PARSE_TOKENS: usize = 262_144;
+pub const MAX_PARSE_NESTING: usize = 64;
+
 /// Parse context carrying the dispatch inputs the parser cannot infer from the
 /// source alone (site/content/internals/language-conformance-contract.md): whether we are at a REPL prompt (so `it`/`out` are
 /// legal and a leading `.` chains on `it`), plus the pre-seeded value-bindings
@@ -77,6 +87,9 @@ pub struct ParseCtx {
     pub repl: bool,
     pub value_bound: Vec<String>,
     pub cmd_bound: Vec<String>,
+    /// Adapter-declared interpreter heads available at this composition root.
+    /// The built-in [`INTERPRETERS`] remain available in every parse mode.
+    pub interpreter_bound: Vec<String>,
 }
 
 pub fn parse(src: &str) -> ParseResult<Program> {
@@ -106,6 +119,7 @@ pub fn parse_with_ctx(src: &str, ctx: ParseCtx) -> ParseResult<Program> {
     for name in ctx.cmd_bound {
         parser.bind_cmd(name);
     }
+    parser.interpreters.extend(ctx.interpreter_bound);
     parser.parse_program()
 }
 
@@ -117,6 +131,8 @@ pub struct Parser<'s> {
     /// Command bindings — user `fn`s and aliases. A name here (and not also a
     /// value binding) dispatches CMD.
     cmd_scopes: Vec<HashSet<String>>,
+    /// Built-in plus host-provided raw interpreter-block heads.
+    interpreters: HashSet<String>,
     /// REPL context: `it`/`out` are legal and a leading `.` chains on `it`.
     repl: bool,
     /// Suppresses the `f(a){…}` trailing-block-lambda desugar (site/content/internals/language-conformance-contract.md) at the
@@ -130,6 +146,8 @@ pub struct Parser<'s> {
     /// matching delimiter (call args, `[…]`, parenthesised groups), where a
     /// trailing block can never be confused for the outer construct's block.
     no_trailing_block: bool,
+    tokens_consumed: usize,
+    nesting: usize,
 }
 
 impl<'s> Parser<'s> {
@@ -143,26 +161,64 @@ impl<'s> Parser<'s> {
             pos: 0,
             scopes: vec![builtins],
             cmd_scopes: vec![HashSet::new()],
+            interpreters: INTERPRETERS
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
             repl: false,
             no_trailing_block: false,
+            tokens_consumed: 0,
+            nesting: 0,
         }
     }
     pub(crate) fn peek(&self, m: Mode) -> ParseResult<(Tok, Span)> {
         Ok(self.lx.token(self.pos, m)?)
     }
+    pub(crate) fn is_interpreter(&self, name: &str) -> bool {
+        self.interpreters.contains(name)
+    }
     pub(crate) fn bump(&mut self, m: Mode) -> ParseResult<(Tok, Span)> {
         let x = self.peek(m)?;
+        self.charge_token(x.1)?;
         self.pos = x.1.end as usize;
         Ok(x)
     }
     pub(crate) fn eat(&mut self, m: Mode, want: &Tok) -> ParseResult<Option<Span>> {
         let (t, s) = self.peek(m)?;
         if std::mem::discriminant(&t) == std::mem::discriminant(want) {
+            self.charge_token(s)?;
             self.pos = s.end as usize;
             Ok(Some(s))
         } else {
             Ok(None)
         }
+    }
+    fn charge_token(&mut self, span: Span) -> ParseResult<()> {
+        self.tokens_consumed = self.tokens_consumed.saturating_add(1);
+        if self.tokens_consumed > MAX_PARSE_TOKENS {
+            Err(ParseError::new(
+                format!("source exceeds the {MAX_PARSE_TOKENS}-token parse limit"),
+                span,
+            ))
+        } else {
+            Ok(())
+        }
+    }
+    pub(crate) fn with_nesting<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> ParseResult<T>,
+    ) -> ParseResult<T> {
+        if self.nesting >= MAX_PARSE_NESTING {
+            return Err(ParseError::new(
+                format!("source exceeds the {MAX_PARSE_NESTING}-level nesting limit"),
+                Span::new(self.pos, self.pos),
+            ));
+        }
+        self.nesting += 1;
+        let result = f(self);
+        // Deliberately outside `?`: every typed error path restores the budget.
+        self.nesting -= 1;
+        result
     }
     pub(crate) fn expect(&mut self, m: Mode, want: Tok, text: &str) -> ParseResult<Span> {
         self.eat(m, &want)?.ok_or_else(|| {
@@ -268,6 +324,12 @@ impl<'s> Parser<'s> {
     }
 
     pub fn parse_program(mut self) -> ParseResult<Program> {
+        if self.lx.src.len() > MAX_SOURCE_BYTES {
+            return Err(ParseError::new(
+                format!("source exceeds the {MAX_SOURCE_BYTES}-byte parse limit"),
+                Span::new(0, 0),
+            ));
+        }
         let mut stmts = vec![];
         self.term()?;
         while !self.peek_is(|t| matches!(t, Tok::Eof)) {
@@ -335,6 +397,46 @@ mod tests {
             }
             x => panic!("{x:?}"),
         }
+    }
+    #[test]
+    fn duplicate_redirect_channels_are_rejected_before_evaluation() {
+        let output = parse("echo hi > first >> second").unwrap_err();
+        assert!(output.msg.contains("only one stdout redirect"));
+        assert!(
+            output
+                .hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("capture `(cmd).out`"))
+        );
+
+        let input = parse("tool < first < second").unwrap_err();
+        assert!(input.msg.contains("only one stdin redirect"));
+
+        // More specific unsupported syntax keeps its teaching diagnostic even
+        // when it follows a valid redirect.
+        assert!(
+            parse("tool < first << EOF")
+                .unwrap_err()
+                .msg
+                .contains("heredoc")
+        );
+        assert!(
+            parse("tool > first 2> second")
+                .unwrap_err()
+                .msg
+                .contains("fd-numbered")
+        );
+
+        // One redirect for each channel remains a well-defined shell shape.
+        let parsed = parse("tool < input > output").unwrap();
+        let Stmt::Expr {
+            expr: Expr::Cmd { call, .. },
+            ..
+        } = &parsed.stmts[0]
+        else {
+            panic!("expected command")
+        };
+        assert_eq!(call.redirects.len(), 2);
     }
     #[test]
     fn declarations_and_fn() {
@@ -406,6 +508,35 @@ mod tests {
             ..Default::default()
         };
         assert!(parse_with_ctx("it", ctx).is_ok());
+    }
+    #[test]
+    fn host_interpreter_binding_enables_raw_blocks_in_command_and_expression_positions() {
+        let context = || ParseCtx {
+            interpreter_bound: vec!["embedded".into()],
+            ..Default::default()
+        };
+        let command = parse_with_ctx("embedded { printf('command') }", context()).unwrap();
+        assert!(matches!(
+            &command.stmts[0],
+            Stmt::Expr {
+                expr: Expr::LangBlock { tool, src, .. },
+                ..
+            } if tool == "embedded" && src.contains("command")
+        ));
+
+        let nested = parse_with_ctx("[1].feed(embedded { raw nested body })", context()).unwrap();
+        let Stmt::Expr {
+            expr: Expr::MethodCall { args, .. },
+            ..
+        } = &nested.stmts[0]
+        else {
+            panic!("expected feed method call");
+        };
+        assert!(matches!(
+            args.pos.as_slice(),
+            [Expr::LangBlock { tool, src, .. }]
+                if tool == "embedded" && src.contains("raw nested body")
+        ));
     }
     #[test]
     fn feed_parses_arg_bearing_command_in_cmd_mode() {

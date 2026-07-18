@@ -1,0 +1,10 @@
+#!/usr/bin/env shoal
+# Audit the root and independently locked fuzz dependency graphs.
+
+let locks = (reef lock)
+let required = ["cargo", "cargo-audit"]
+let missing = required.where(name => locks.find(row => row.name == name && row.locked) == null)
+assert(missing.is_empty(), "CI could not lock audit tools through Reef: {missing}")
+run("cargo", "audit")
+run("cargo", "audit", "--file", "fuzz/Cargo.lock")
+echo "dependency audit passed"

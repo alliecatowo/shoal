@@ -1,6 +1,6 @@
 +++
 title = "Kernel, sessions, and protocol"
-description = "The Unix-socket server, session and connection lifetimes, RPC router, exec lifecycle, wire elision, events, tasks, plans, and PTYs."
+description = "The Unix-socket server, principal-private sessions, RPC lifecycle, bounded transport, quotas, concurrency, plans, tasks, and PTYs."
 weight = 70
 template = "docs/page.html"
 
@@ -26,58 +26,76 @@ threads. Frames are newline-delimited JSON-RPC 2.0.
 ```mermaid
 flowchart TB
 accTitle: Connection, authentication, attachment, and session topology
-accDescr: Each socket connection authenticates a principal, attaches client-local state to a shared session, and uses a dedicated writer path for responses and subscriptions.
+accDescr: Each socket connection authenticates a principal, attaches to that principal's private named session, and uses a dedicated writer path for responses and subscriptions.
   Listener["Unix socket listener"] --> ConnA["connection A"]
   Listener --> ConnB["connection B"]
   ConnA --> AuthA["authenticate token → principal A"]
   ConnB --> AuthB["authenticate token → principal B"]
   AuthA --> AttachA["attachment: principal + tty + client id"]
   AuthB --> AttachB["attachment: principal + tty + client id"]
-  AttachA --> Session["Arc Session"]
-  AttachB --> Session
-  Session --> Eval["Mutex Evaluator"]
-  Session --> Transcript["Mutex transcript"]
-  Session --> Bus["EventBus"]
+  AttachA --> SessionA["Session (principal A, name)"]
+  AttachB --> SessionB["Session (principal B, name)"]
+  SessionA --> Eval["Mutex Evaluator"]
+  SessionA --> Transcript["Mutex transcript"]
+  SessionA --> Bus["EventBus"]
   ConnA --> WriterA["shared response writer A"]
-  Bus --> SubA["subscription writer thread A"]
+  Bus --> SubA["connection dispatcher thread A"]
   SubA --> WriterA
 ```
 
-On disconnect, subscriptions associated with that connection are removed. The named session remains
-in the kernel map until process exit.
+On disconnect, subscriptions associated with that connection are removed. An unattached idle session
+can be evicted after 24 hours or to admit another session under the configured process/principal cap.
+After attachment, peer-close transport errors are normalized to an ordinary disconnect; this includes
+Darwin's `EINVAL` race when the peer closes while the server updates `SO_RCVTIMEO`. Pre-attachment
+framing/admission errors and permission/revocation failures remain observable errors.
 
 Sources: [`shoal-kernel/src/lib.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-kernel/src/lib.rs)
 and [`session.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-kernel/src/session.rs).
 
 ## Session attachment
 
-`session.attach` is the identity and feature-negotiation boundary.
+`session.attach` is the identity and feature-negotiation boundary. A public filesystem-socket
+connection is machine-only: an explicit bearer selects its machine principal, while tokenless MCP
+attaches as restricted `agent:mcp`. Public clients cannot assert `local-human`, even by claiming a
+TTY or a bearer profile with that name. Human authority exists only on the server-selected anonymous
+descriptor inherited by the private interactive REPL. `shoal-mcp` verifies the returned
+`auth_mode`, `connection_trust`, `session_isolation`, and security epoch before exposing tools.
 
+Bearer validation takes a shared fd lock and loads the current token file. After attachment the
+kernel refreshes the authenticated token metadata from that fresh locked snapshot before every
+request; revocation, expiry, replacement, corruption, or I/O failure detaches the connection and
+fails with `AUTH_FAILED`. Token create/revoke take an exclusive fd lock, reload under the lock, and
+atomically replace the file, so concurrent CLIs cannot overwrite one another. Profile/cap metadata
+does not directly grant language effects: Leash still evaluates the principal. The explicit
+machine-admin exceptions are `supervisor` or `plan.approve`, which permit cross-principal approval.
 
 The response reports the actual available enforcement tier and whether this principal resolves to a
-real sandbox. Token capability metadata is returned separately from the policy principal.
+real sandbox. Its typed `enforcement` preview separately reports filesystem intent/enforceability,
+network-policy-only scope, pre-exec spawn pinning, hermetic disposition, and limitations. Preview
+activation is always `deferred-to-spawn`; only the child execution result can report an active
+backend. Token capability metadata is returned separately from the policy principal.
 
-The token store is a startup snapshot. A separate `shoal-token create` or `revoke` rewrites the file,
-but a running kernel does not reload it; creation and revocation take effect only after restart (live
-expiry still uses current time). Token `profile` and `caps` are echoed metadata only. Authorization
-continues through the token's principal name, Leash policy, and handler ownership checks.
+Every stateful method requires attachment: `journal.query` (HR-D4) and `cap.request` (HR-D1) were the
+last exemptions and now reject an unattached caller with `NOT_ATTACHED`. The only naturally public
+methods are `session.attach`, `parse`, and `complete`.
 
-Most stateful methods require attachment. The current `cap.request` and `journal.query` exceptions
-are unsafe and audited explicitly below; they must not be generalized as intended public methods.
+### Principal-private session identity
 
-### Shared-name principal caveat
-
-Session creation consults the principal only the first time a name is seen. A later principal can
-attach to the same named `Session` and share its evaluator environment/transcript. The exec handler
-does install the current actor's Leash policy before each serialized evaluation, and coarse journal
-records use the current actor, but the evaluator's own journal principal was fixed when the session
-was created.
-
-This creates an identity/provenance seam. Until sessions are keyed or access-controlled by principal,
-hosts should avoid reusing a session name across trust boundaries. Tests for isolation must use two
-principals and the same name; two different names do not exercise this risk.
+The registry key is `(principal, visible name)`, not the caller-chosen name alone. Two principals
+attaching to `"work"` receive different evaluators, transcripts, refs, tasks, PTYs, event replay, and
+quota owners. Journal queries force the attached principal and session into the store query, so a
+caller-provided `principal` filter cannot widen access. This is strong in-process object ownership,
+not hostile-tenant isolation: all principals still share one process, configured state root, and
+global resource ceilings; use separate OS users/kernels for mutually hostile tenants.
 
 ## Session contents
+
+`session.snapshot` is an attached, typed UI projection. In addition to cwd, bounded completion PATH
+directories, visible binding classifications, jobs, Reef bindings, and the last value, it includes
+an `authority` object: exact principal, server-established `human`/`agent` kind, and the current
+Leash tier/enforcement forecast. Clients must not infer human presence from a principal string or
+bearer profile. Shoal's kernel-backed prompt requires this projection and therefore cannot silently
+display ambient process identity for an authenticated agent session.
 
 ```mermaid
 classDiagram
@@ -98,10 +116,13 @@ The evaluator lock serializes evaluation and session mutation. Transcript/value 
 lock. The language event bus is cached separately so publishing `user.*` events does not wait behind
 a long-running evaluation.
 
-Creation installs jump frecency, an evaluator journal when the kernel has an on-disk state directory,
-and an evaluator-to-wire `user.*` event forwarder. It does not currently load local CLI config,
-aliases/env overrides, init files, bundled/extra adapters, or the user Reef manifest. See the
-[system map](../system-map/#two-host-paths-not-yet-full-parity).
+Creation uses the shared host bootstrap: layered config, aliases/environment, adapters, WebAssembly
+plugins, Reef inputs, the evaluator journal, and the `user.*` event forwarder. Jump frecency is then
+selected from authenticated host facts: the inherited private human keeps the local per-user store,
+bearers receive a digest-named principal/trust/profile partition, and tokenless restricted sessions
+receive no durable query or update path. Init files run only for an inherited private-human TTY
+profile; durable/headless agent Sessions skip them. Local terminal UI remains deliberately outside
+the kernel.
 
 ## RPC surface
 
@@ -129,24 +150,30 @@ The router does not apply one central attachment middleware; each handler asks f
 |---|---|
 | `session.attach` | creates/replaces the connection attachment |
 | `parse`, `complete` | intentionally context-free and public to a socket client |
-| `cap.request` | **unattached state mutation**; approves by global plan ref without caller identity |
-| `journal.query` | **unattached data read**; queries shared rows without caller scoping |
+| `cap.request` | requires attachment (HR-D1); an embedded human or explicit machine approver is bound as approver |
+| `journal.query` | requires attachment (HR-D4); rejects with `NOT_ATTACHED` before reading rows |
 | every other current method | handler rejects with `NOT_ATTACHED` before its main operation |
 
-This differs from the comment in `shoal-proto::error_code::NOT_ATTACHED`, which lists
-`cap.request` as exempt but omits the also-exempt `journal.query`. More importantly, the two stateful
-exemptions are authority defects, not merely documentation drift. A socket mode of `0600` protects
-against other OS users; it does not authenticate the token principal or approver role within Shoal.
+Both former exemptions are closed: a fresh socket connection that never attached now gets
+`NOT_ATTACHED` from `journal.query` and `cap.request` alike, instead of a data read or an approval
+mutation. A socket mode of `0600` protects against other OS users; the attachment gate authenticates
+the token principal, and `cap.request` additionally binds the approver identity.
 
-`cap.request` is especially sensitive because the stored plan map is global and plan refs are not
-unique object IDs. `Plan::new` hashes effects, reversibility, and estimates—not source, session, or
-principal—and truncates the digest to 16 hex characters. Equal-effect plans overwrite the same map
-entry. Apply/approved execution later checks the *currently stored* source/session/principal, which
-prevents a simple source substitution but does not repair unauthenticated approval or ref collision.
+Stored plans now have a full BLAKE3 binding over source, canonical AST, derived plan, session, and
+requester plus a per-kernel object id, so storing identical source twice creates two objects instead
+of replacing the first. `cap.request` validates and mutates the exact stored object under one lock.
+The approver must be attached, authorized, and — by default — distinct from the requester (HR-D3).
+Only explicit true spellings of `SHOAL_ALLOW_SELF_ACK` opt into self-acknowledgement. Approval first
+reserves the exact plan transition under the plan lock, then writes a durable grant audit row; an
+audit error or panic restores the reservation and grants nothing. Only after that write succeeds is
+the `ApprovalRecord` published. It binds requester, approver, full plan/source hashes, owner, scope,
+timestamp, grant audit ID, and consuming execution ID. Approved application atomically consumes the
+one-shot grant, so concurrent or sequential replay cannot reuse it; the execution journal row links
+back to the grant audit.
 
-The target invariant is a short explicit public-method allowlist (`session.attach`, `parse`, and
-`complete`), attachment middleware for everything else, approver capabilities for approval mutation,
-and caller-scoped journal policy. See the [roadmap P0](../roadmap-and-priorities/).
+The invariant is a short public-method allowlist (`session.attach`, `parse`, and `complete`), fresh
+authority checking on every attached request, explicit approver authority, default separation,
+immutable plan binding, and durably auditable one-shot approval.
 
 ## Execution lifecycle
 
@@ -194,8 +221,10 @@ accDescr: Shows the components and relationships described in Synchronous run de
 
 An on-disk kernel run writes a coarse RPC-exec entry and the evaluator can also write one entry per
 top-level statement. The `journal` event channel indexes the coarse entry, deliberately not every
-evaluator row. Queries and counts must therefore state which granularity they mean; treating all
-rows as one-exec-per-row can double-count or misattribute multi-statement requests.
+evaluator row. Schema v2 records `kind = exec|statement|approval`; evaluator rows also store the
+coarse exec ID in `parent_id`. Kernel and standalone hosts receive the final statement ID directly
+from the evaluator instead of discovering a timestamp-adjacent row. Queries can filter by kind;
+unfiltered counts still intentionally include both granularities.
 
 ## References and paths
 
@@ -245,10 +274,14 @@ accDescr: Shows the components and relationships described in Wire values and el
 ```
 
 Ordinary tagged-value encoding and elision clamp bytes to the 64 KiB hard cap. There is one current
-exception: `value.get {format:"raw"}` in `handlers_value.rs` materializes complete resident or
-CAS-backed bytes and returns a `raw_base64` field without passing through that clamp. This can turn a
-small ref lookup into an arbitrarily large allocation, base64 expansion, JSON frame, and client
-context payload. It is a boundary bypass to repair, not a supported way to opt out of elision.
+explicit-transfer path: `value.get {format:"raw"}` returns at most 8 KiB of decoded content per
+response plus continuation metadata. Resident strings/bytes are sliced before encoding; CAS-backed
+bytes use a verified bounded-memory stream. Strings retain the existing Unicode-scalar slice units,
+while bytes use octets. `blob.get` likewise accepts byte `offset`/`length`, clamps length to the same
+wall, and never materializes the whole compressed-store object for a page. An exact verified-page
+LRU (1 MiB/256 entries) removes repeat work; cache misses are admitted through a principal/session
+decompression rate window (64 starts per 10 seconds by default), so hostile random offsets cannot
+force unbounded repeated full-stream verification.
 
 A successful `Outcome` keeps status metadata inline while applying elision to its `.out` value.
 Headless attachments have ANSI removed before render bounding; a future true-TTY kernel client can
@@ -259,9 +292,24 @@ currently serializes `timestamp().to_string()`—Unix seconds as decimal text. T
 bytes and declared contract disagree; clients need a compatibility-tested correction rather than an
 assumption based on either comment alone.
 
-The JSON-RPC frame limit is 16 MiB. `read_frame` currently uses `read_line` before checking length,
-so the limit rejects oversized completed frames but does not prevent the temporary string allocation.
-A length-delimited/bounded reader would harden hostile-client behavior.
+The JSON-RPC content limit is 16 MiB. Kernel and MCP readers wrap input in a bounded reader before
+`read_line`, so oversized or unterminated frames cannot grow the line buffer beyond the cap plus
+terminator sentinel. A fixed-stack lexical pass rejects depth above 64, more than 65,536 values,
+more than 16,384 items/members in one container, object keys over 64 KiB decoded, and numeric tokens
+over 1 KiB before `serde_json` tree allocation. The same limits apply to buffered outbound frames.
+Public kernel frames also have a 10-second first-byte/remainder timeout by default.
+
+The MCP facade adds semantic admission before dispatch. Every resource operation admits at most a
+4 KiB raw URI, four path segments, sixteen query pairs, 512 decoded bytes per path segment, 64 per
+query key, and 2 KiB per query value. Percent escapes and UTF-8 are strict; decoded duplicate keys,
+unknown parameters, and path shapes outside that resource's advertised schema fail without quoting
+the URI. Numeric extremes are parsed exactly and then reach the kernel's existing raw-page,
+event-page, and journal-page clamps. Tool names are limited to the fixed advertised set, source is
+limited to the parser's 4 MiB wall, identifier strings and argument collections are bounded, and
+unknown fields fail before a kernel call. MCP text remains a 64 KiB UTF-8 byte cap. Kernel error
+data is not reflected through the facade, so a rejected path, body, or bearer cannot become an MCP
+error amplification channel. Tool and resource structured content has an 8 MiB serialized ceiling,
+leaving framing headroom when the facade wraps a bounded kernel response in MCP result metadata.
 
 ## Event bus
 
@@ -273,38 +321,47 @@ wired; do not document channels that never emit.
 flowchart LR
 accTitle: Event bus
 accDescr: Shows the components and relationships described in Event bus.
-  Publisher["kernel/evaluator publisher"] --> Ring["per-channel ring\n1024 events"]
-  Publisher --> QA["subscriber A queue\n256 events"]
-  Publisher --> QB["subscriber B queue\n256 events"]
-  QA --> WA["dedicated writer thread A"]
-  QB --> WB["dedicated writer thread B"]
-  Overflow["overflow"] --> Marker["coalesced dropped + latest_seq"]
+  Publisher["kernel/evaluator publisher"] --> Ring["per-channel ring\n1024 events / 2 MiB"]
+  Publisher --> QA["subscriber A queue\n256 events / 512 KiB"]
+  Publisher --> QB["subscriber B queue\n256 events / 512 KiB"]
+  QA --> Dispatcher["fair per-connection dispatcher"]
+  QB --> Dispatcher
+  Dispatcher --> Writer["shared connection writer"]
+  Overflow["overflow"] --> Marker["dropped + dropped_bytes + latest_seq"]
   Marker --> QA
 ```
 
-Publishing never performs a blocking socket write. Each subscriber queue is bounded; overflow
-coalesces dropped counts and the latest sequence so slow readers can detect gaps. This prevents one
-stalled client from blocking producers or other subscribers, but the one-thread-per-subscription
+Publishing never performs a blocking socket write. Each subscriber queue is count- and byte-bounded;
+overflow coalesces exact dropped counts/bytes and the latest sequence so slow readers detect gaps. This prevents one
+stalled client from blocking producers or other subscribers, but the one-thread-per-connection
 model is a scaling boundary.
 
-Only `journal` and `session.transcript` have durable replay reconstruction through journal-backed
-indexes. Approval, render, task, and `user.*` channels are ring-only and lose old events/restart
-state. A cursor read from durable channels can recover events older than the 1024-event ring.
+Only `journal` and `session.transcript` have durable replay reconstruction. Their in-memory pointer
+windows are capped at 1,024 per exact owner; older bounded pages resolve from the journal. Owners are
+hydrated lazily on first use, so kernel startup never loads every historical event. `events.read`
+returns at most 256 events and 8 MiB per forward page; follow `page.next_since` while
+`page.truncated` is true. Approval, render, task, and `user.*` channels are ring-only and report
+`page.history_lost` when the requested cursor predates their retained tail.
 
 Language `channel("user.x").emit(value)` reaches the wire bus through the session forwarder. Both
 layers enforce the `user.*` namespace so language code cannot spoof kernel-owned semantic channels.
+The kernel additionally admits at most 64 KiB/64 levels per user payload, 128 bytes per channel name,
+and 256 retained user-channel identities per exact owner before cloning into live state.
 
 ## Tasks and PTYs
 
 Kernel background/timeout tasks are `TaskEntry` records around a worker thread, completion condition
-variable, result ref/error, and evaluator cancellation token. Task events publish start and final
-state. `task.await` waits for completion; cancel requests evaluator cancellation.
+variable, result ref/error, and evaluator cancellation epoch. Capture/PTY execution registers its
+process group with that epoch; linked child evaluators share the same registry. `task.suspend` uses
+`SIGSTOP` and `task.resume` uses `SIGCONT` for all currently registered groups. Evaluator-only work
+has no independently stoppable OS owner and returns `TASK_CONTROL_UNAVAILABLE` honestly. Cancellation
+continues stopped groups before the existing INT → TERM → KILL ladder. `task.await` waits across the
+`suspended` state until terminal completion. Every task record includes an advisory `controls`
+snapshot (`cancel`, `suspend`, `resume`, and `active_process_groups`) so clients can discover useful
+operations before attempting them. Membership can change immediately after a read, so the control
+RPC remains authoritative and may still return unavailable.
 
-Suspend and resume are deliberate stubs returning `TASK_CONTROL_UNAVAILABLE`: a worker may execute
-arbitrary language and recursively dispatch, not one known process group. Do not expose these as
-working merely because the method names exist.
-
-PTY records instead own one concrete long-lived `PtySession`. Methods are session-scoped, and reads
+PTY records instead own one concrete long-lived `PtySession`. Methods are owner-scoped, and reads
 return a bounded rendered screen, cursor, change bit, liveness, and exit state—not raw escape bytes.
 PTY entries and task entries are in-memory only.
 
@@ -327,17 +384,34 @@ The protocol centralizes numeric codes in `shoal-proto`:
 Some codes intentionally cover related cases; preserve numbers and structured `data` compatibility.
 Source: [`shoal-proto`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-proto/src/lib.rs).
 
-## Concurrency and panic risk
+## Concurrency model, quotas, and lifecycle
 
-Kernel maps and session components use standard mutexes and many `.lock().unwrap()` calls. This keeps
-the blocking design legible, but a panic while holding a long-lived shared lock poisons it; a later
-unwrap can cascade the failure across otherwise unrelated requests. High-risk boundaries include
-evaluator execution, transcript/task mutation, event indexes, and auth state.
+The kernel uses one OS thread per accepted connection, one worker per active background task, and one
+writer thread per active subscription. A session evaluator mutex serializes commands for one exact
+`(principal, name)` owner; a slow command does not block another principal's same-named session, but
+it does queue the owner's other commands. PTYs own independent mutexes. Request panics quarantine the
+affected session; poison-sensitive registries either reconstruct a terminal record or quarantine the
+subsystem instead of treating poisoned state as valid.
 
-Do not mechanically replace every unwrap. First make request-handler panics impossible where
-practical, isolate user-derived work from shared critical sections, and define recovery for poisoned
-state. Lock-order changes also require multi-client stress tests because evaluation, journal, events,
-and transcript publication cross several locks.
+Default admission limits are:
+
+| Resource | Default | Scope and release semantics |
+|---|---:|---|
+| connections | 64 | process-wide permit, released on disconnect |
+| retained sessions | 256 | process-wide; fixed 64 per principal; idle/LRU eviction only when no external lease remains |
+| active background tasks | 128 | exact principal/session owner; permit released at terminal state |
+| active PTYs | 32 / 64 / 256 | exact owner / principal aggregate / process-wide; reserved before spawn, released on close/drop |
+| subscriptions | 256 | exact owner; released on unsubscribe/disconnect |
+| CAS verification starts | 64 per 10 s | exact owner; cache hits are free |
+| frame read deadline | 10 s | first byte and remainder; zero disables |
+
+The configurable process/session ceilings use `QUOTA_EXCEEDED` with structured `limit`/`max` data.
+Session admission first removes unleased sessions idle for 24 hours, then evicts the least-recently
+used unleased owner session when a principal/process ceiling is full; if every candidate is leased,
+the new attach is rejected. Existing sessions remain attachable after a ceiling is lowered.
+In-language `spawn`/`parallel`/`on` and stream pump threads are not counted by these kernel
+registries, but evaluator admission separately caps native workers at 64 per session and 512 per
+process. The systems are independently bounded rather than one universal thread executor.
 
 ## Restart contract
 

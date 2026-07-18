@@ -13,8 +13,9 @@ use crate::ports::BytesLoad;
 /// bounded [`preview`](CasBytesVal::preview) is resident, and the full content
 /// is loaded from the CAS on demand via [`loader`](CasBytesVal::loader).
 ///
-/// `.len` and `render` answer from the metadata alone (never loading); methods
-/// that need the whole bytes materialize them through [`CasBytesVal::resolve`].
+/// `.len` and `render` answer from metadata alone (never loading). Line streams
+/// and filesystem sinks use [`CasBytesVal::open`]; explicit `.load()`/`.bytes()`
+/// and size-admitted resident methods use [`CasBytesVal::resolve`].
 /// A small (sub-cap) capture is a plain [`Value::Bytes`] and never becomes one
 /// of these — there is zero change to the common, fully-resident path.
 ///
@@ -35,13 +36,13 @@ use crate::ports::BytesLoad;
 ///   unconditionally there — a value the caller never asked to see in full
 ///   could silently pull up to the full spill cap (~1 GiB) into memory just
 ///   because it happened to be a field of something being serialized. That
-///   was the main risk this audit flagged; `json_preview` fixes it by
+///   was the first risk this audit flagged; `json_preview` fixes it by
 ///   answering from the resident preview + metadata only, exactly like
-///   `render()` does, never touching the CAS. A bare top-level `.json()` on
-///   the bytes themselves is unaffected: `methods::dispatch`'s CasBytes
-///   fallback already fully materializes (and converts to `Value::Bytes`)
-///   *before* `value_to_json` is ever reached, so that call site keeps its
-///   existing, deliberate full-load behavior.
+///   `render()` does, never touching the CAS. A later audit pass also bounded
+///   bare method fallback: top-level `.json()` and other resident operations
+///   resolve only blobs within the eager byte wall. `.stream()` and filesystem
+///   sinks read incrementally, while `.load()`/`.bytes()` remain the explicit
+///   full-load escape hatch.
 ///
 /// Everywhere else this type's awareness turned out to already be correct and
 /// singular, not scattered: `ops.rs`'s arithmetic/comparison/`contains` tables
@@ -73,12 +74,17 @@ impl CasBytesVal {
     /// `.ref` yields and the in-language dispatch path recognizes (site/content/internals/language-conformance-contract.md).
     pub const REF_PREFIX: &'static str = "val:blake3:";
 
-    /// Parse a `val:blake3:<hash>` content short-ref, returning the bare blake3
-    /// hex on a match. `None` when `s` is not a content ref of this scheme — the
-    /// single place the ref grammar is decoded, mirroring [`Self::reference`]
-    /// (which encodes it), so the wire form and the in-language resolver agree.
+    /// Parse a canonical `val:blake3:<hash>` content short-ref, returning the
+    /// bare 64-digit lowercase blake3 hex on a match. Prefix-shaped prose and
+    /// truncated display refs must remain ordinary strings rather than being
+    /// intercepted by method dispatch.
     pub fn parse_ref(s: &str) -> Option<&str> {
-        s.strip_prefix(Self::REF_PREFIX)
+        let hash = s.strip_prefix(Self::REF_PREFIX)?;
+        (hash.len() == 64
+            && hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+        .then_some(hash)
     }
 
     /// Load the full content from the CAS, mapping any I/O/integrity failure to
@@ -92,6 +98,16 @@ impl CasBytesVal {
         })
     }
 
+    /// Open the full content for bounded-memory sequential consumption.
+    pub fn open(&self) -> VResult<Box<dyn std::io::Read + Send>> {
+        self.loader.open().map_err(|e| {
+            ErrorVal::new(
+                "io_error",
+                format!("failed to open CAS-backed bytes {}: {e}", self.reference()),
+            )
+        })
+    }
+
     /// The recoverable content ref, e.g. `val:blake3:<hash>`.
     pub fn reference(&self) -> String {
         format!("{}{}", Self::REF_PREFIX, self.hash)
@@ -100,23 +116,26 @@ impl CasBytesVal {
     /// The metadata-only answer for a method name, when one exists — never
     /// loads from the CAS. The single chokepoint for the cheap-answer table
     /// (`len`/`count`/`is_empty`/`ref`); `None` means the caller needs the
-    /// actual bytes (`methods::dispatch` then either loads explicitly for
-    /// `load`/`bytes`, or fully materializes and re-dispatches as a plain
-    /// `Value::Bytes` for anything else).
-    pub fn cheap_method(&self, name: &str) -> Option<Value> {
-        match name {
-            "len" | "count" => Some(Value::Int(self.len as i64)),
+    /// actual bytes or an incremental reader.
+    pub fn cheap_method(&self, name: &str) -> VResult<Option<Value>> {
+        Ok(match name {
+            "len" | "count" => Some(Value::Int(i64::try_from(self.len).map_err(|_| {
+                ErrorVal::new(
+                    "collection_length_overflow",
+                    "CAS-backed byte length exceeds the language integer limit",
+                )
+            })?)),
             "is_empty" => Some(Value::Bool(self.len == 0)),
             "ref" => Some(Value::Str(self.reference())),
             _ => None,
-        }
+        })
     }
 
     /// The bounded, lazy JSON representation used when this value is
     /// encountered NESTED inside a larger value being JSON-encoded (see the
     /// struct doc's "Central CAS-bytes chokepoint" section for why this exists and why it's safe
-    /// relative to the bare top-level `.json()` method, which fully
-    /// materializes through a different, deliberate call site). Never loads
+    /// relative to a bare top-level `.json()` method, which may materialize
+    /// only within the eager byte wall). Never loads
     /// from the CAS: just the recoverable ref, the true length, the
     /// truncation flag, and the already-resident preview — the same
     /// information `render()` shows, shaped as JSON instead of a display
@@ -182,30 +201,92 @@ pub struct RangeVal {
     pub inclusive: bool,
 }
 
-impl RangeVal {
-    pub fn iter(&self) -> impl Iterator<Item = i64> + Send + use<> {
-        let (start, end, inclusive) = (self.start, self.end, self.inclusive);
-        let last = if inclusive {
-            end
+/// Maximum number of scalar values a compact range may expand into at one
+/// eager materialization boundary. Lazy iteration/streaming remains available
+/// for larger ranges.
+pub const RANGE_MATERIALIZATION_MAX_VALUES: usize = 16_384;
+
+pub struct RangeIter {
+    next: Option<i64>,
+    end: i64,
+    inclusive: bool,
+}
+
+impl Iterator for RangeIter {
+    type Item = i64;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let current = self.next?;
+        let in_range = if self.inclusive {
+            current <= self.end
         } else {
-            end.saturating_sub(1)
+            current < self.end
         };
-        start..=last
+        if !in_range {
+            self.next = None;
+            return None;
+        }
+        self.next = current.checked_add(1);
+        Some(current)
     }
-    pub fn len(&self) -> usize {
-        let last = if self.inclusive {
-            self.end
-        } else {
-            self.end - 1
-        };
-        if last < self.start {
+}
+
+impl RangeVal {
+    pub fn iter(&self) -> RangeIter {
+        RangeIter {
+            next: Some(self.start),
+            end: self.end,
+            inclusive: self.inclusive,
+        }
+    }
+    pub fn len(&self) -> u128 {
+        let start = i128::from(self.start);
+        let end = i128::from(self.end);
+        if self.inclusive {
+            if end < start {
+                0
+            } else {
+                (end - start + 1) as u128
+            }
+        } else if end <= start {
             0
         } else {
-            (last - self.start + 1) as usize
+            (end - start) as u128
         }
     }
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+    pub fn materialization_len(&self) -> VResult<usize> {
+        let len = self.len();
+        if len > RANGE_MATERIALIZATION_MAX_VALUES as u128 {
+            return Err(ErrorVal::new(
+                "range_materialization_limit",
+                format!(
+                    "range has {len} values; eager materialization is limited to {RANGE_MATERIALIZATION_MAX_VALUES}"
+                ),
+            )
+            .with_hint("iterate lazily with `.stream()`, then use `.take(n)` when a list is required"));
+        }
+        Ok(usize::try_from(len).expect("admitted range length fits usize"))
+    }
+    pub fn materialize(&self) -> VResult<Vec<Value>> {
+        let len = self.materialization_len()?;
+        let mut values = Vec::with_capacity(len);
+        values.extend(self.iter().map(Value::Int));
+        Ok(values)
+    }
+    pub fn value_at(&self, index: i64) -> Option<i64> {
+        let start = i128::from(self.start);
+        let end_exclusive = i128::from(self.end) + i128::from(self.inclusive);
+        let candidate = if index >= 0 {
+            start + i128::from(index)
+        } else {
+            end_exclusive + i128::from(index)
+        };
+        (candidate >= start && candidate < end_exclusive)
+            .then(|| i64::try_from(candidate).ok())
+            .flatten()
     }
     pub fn contains(&self, v: i64) -> bool {
         v >= self.start
@@ -384,6 +465,11 @@ pub(crate) mod test_support {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(self.data.clone())
         }
+
+        fn open(&self) -> std::io::Result<Box<dyn std::io::Read + Send>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(std::io::Cursor::new(self.data.clone())))
+        }
     }
 
     /// Build a `CasBytesVal` with `preview` resident and `full` as the
@@ -409,19 +495,58 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
+    fn ranges_are_exact_at_integer_edges_and_bound_eager_expansion() {
+        let empty = RangeVal {
+            start: i64::MIN,
+            end: i64::MIN,
+            inclusive: false,
+        };
+        assert!(empty.is_empty());
+        assert_eq!(empty.iter().next(), None);
+        assert_eq!(empty.value_at(0), None);
+        assert_eq!(empty.value_at(-1), None);
+
+        let full = RangeVal {
+            start: i64::MIN,
+            end: i64::MAX,
+            inclusive: true,
+        };
+        assert_eq!(full.len(), u64::MAX as u128 + 1);
+        assert_eq!(
+            full.iter().take(2).collect::<Vec<_>>(),
+            [i64::MIN, i64::MIN + 1]
+        );
+        assert_eq!(full.value_at(0), Some(i64::MIN));
+        assert_eq!(full.value_at(-1), Some(i64::MAX));
+        assert_eq!(
+            full.materialize().unwrap_err().code,
+            "range_materialization_limit"
+        );
+    }
+
+    #[test]
     fn content_ref_encode_decode_roundtrip() {
-        // `parse_ref` strips exactly the prefix `reference()` writes.
+        // `parse_ref` accepts exactly the canonical shape `reference()` writes.
         assert_eq!(CasBytesVal::REF_PREFIX, "val:blake3:");
+        let hash = "deadbeef".repeat(8);
         assert_eq!(
-            CasBytesVal::parse_ref("val:blake3:deadbeef"),
-            Some("deadbeef")
+            CasBytesVal::parse_ref(&format!("val:blake3:{hash}")),
+            Some(hash.as_str())
         );
+        let other_hash = "cafef00d".repeat(8);
         assert_eq!(
-            CasBytesVal::parse_ref(&format!("{}cafef00d", CasBytesVal::REF_PREFIX)),
-            Some("cafef00d")
+            CasBytesVal::parse_ref(&format!("{}{other_hash}", CasBytesVal::REF_PREFIX)),
+            Some(other_hash.as_str())
         );
-        // Non-refs (a transcript short-ref, a bare algorithm tag, plain text)
-        // are left alone so ordinary strings keep dispatching string methods.
+        // Truncated displays, prose placeholders, non-canonical case, and
+        // unrelated refs remain strings so their methods cannot spuriously
+        // perform a CAS lookup.
+        assert_eq!(CasBytesVal::parse_ref("val:blake3:8baef..."), None);
+        assert_eq!(CasBytesVal::parse_ref("val:blake3:HASH"), None);
+        assert_eq!(
+            CasBytesVal::parse_ref(&format!("val:blake3:{}", "A".repeat(64))),
+            None
+        );
         assert_eq!(CasBytesVal::parse_ref("out:5"), None);
         assert_eq!(CasBytesVal::parse_ref("blake3:deadbeef"), None);
         assert_eq!(CasBytesVal::parse_ref("val:blake2:deadbeef"), None);
@@ -434,15 +559,18 @@ mod tests {
     fn cheap_method_never_loads() {
         let calls = Arc::new(AtomicUsize::new(0));
         let c = test_support::cas_bytes(b"hel", b"hello world", calls.clone());
-        assert_eq!(c.cheap_method("len"), Some(Value::Int(11)));
-        assert_eq!(c.cheap_method("count"), Some(Value::Int(11)));
-        assert_eq!(c.cheap_method("is_empty"), Some(Value::Bool(false)));
+        assert_eq!(c.cheap_method("len").unwrap(), Some(Value::Int(11)));
+        assert_eq!(c.cheap_method("count").unwrap(), Some(Value::Int(11)));
         assert_eq!(
-            c.cheap_method("ref"),
+            c.cheap_method("is_empty").unwrap(),
+            Some(Value::Bool(false))
+        );
+        assert_eq!(
+            c.cheap_method("ref").unwrap(),
             Some(Value::Str("val:blake3:deadbeefcafef00d".into()))
         );
         // A name outside the cheap table defers to the caller.
-        assert_eq!(c.cheap_method("upper"), None);
+        assert_eq!(c.cheap_method("upper").unwrap(), None);
         assert_eq!(
             calls.load(Ordering::SeqCst),
             0,
@@ -454,7 +582,19 @@ mod tests {
     fn empty_cas_bytes_is_empty() {
         let calls = Arc::new(AtomicUsize::new(0));
         let c = test_support::cas_bytes(b"", b"", calls.clone());
-        assert_eq!(c.cheap_method("is_empty"), Some(Value::Bool(true)));
+        assert_eq!(c.cheap_method("is_empty").unwrap(), Some(Value::Bool(true)));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn cas_length_does_not_wrap_outside_the_language_integer_domain() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut c = test_support::cas_bytes(b"", b"", calls.clone());
+        c.len = u64::MAX;
+        assert_eq!(
+            c.cheap_method("len").unwrap_err().code,
+            "collection_length_overflow"
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
@@ -477,9 +617,9 @@ mod tests {
         );
     }
 
-    /// `resolve()` — the deliberate full-materialize chokepoint used by the
-    /// bare top-level `.json()`/`.load`/`.bytes`/`.feed` call sites — loads
-    /// exactly once and returns the true full content, not just the preview.
+    /// `resolve()` — the deliberate full-materialize chokepoint used by
+    /// `.load()`/`.bytes()` and size-admitted resident methods — loads exactly
+    /// once and returns the true full content, not just the preview.
     #[test]
     fn resolve_loads_full_content_once() {
         let calls = Arc::new(AtomicUsize::new(0));

@@ -27,8 +27,6 @@ pub struct PromptContext {
     /// Unicode allowed; ascii fallback when false (site/content/internals/prompt-editor-lsp.md).
     pub unicode: bool,
     pub edit_mode: EditMode,
-    /// Buffer currently spans more than one line.
-    pub multiline: bool,
 
     /// `None`: no command has run yet this session.
     pub last_outcome: Option<OutcomeSnapshot>,
@@ -63,7 +61,6 @@ impl PromptContext {
             nerd_font: false,
             unicode: true,
             edit_mode: EditMode::Emacs,
-            multiline: false,
             last_outcome: None,
             jobs: JobsSnapshot::default(),
             principal: Principal::Human,
@@ -113,7 +110,10 @@ pub struct OutcomeSnapshot {
 pub struct JobsSnapshot {
     pub running: usize,
     pub suspended: usize,
+    /// Active jobs (`running + suspended`), used for threshold/display.
     pub total: usize,
+    /// Bounded completed history retained by the evaluator.
+    pub completed: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,8 +178,6 @@ pub struct GitSnapshot {
     pub stashed: u32,
     /// Last recompute failed or is still pending; counts are stale.
     pub degraded: bool,
-    /// Wall-clock age of this snapshot at construction time.
-    pub age: Duration,
 }
 
 impl GitSnapshot {
@@ -200,7 +198,6 @@ impl GitSnapshot {
             conflicted: 0,
             stashed: 0,
             degraded: true,
-            age: Duration::ZERO,
         }
     }
 }

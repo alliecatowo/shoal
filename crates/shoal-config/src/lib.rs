@@ -30,7 +30,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 pub use error::ConfigError;
-pub use load::{LoadOptions, Loaded, find_project_config, load};
+pub use load::{CONFIG_FILE_MAX_BYTES, LoadOptions, Loaded, find_project_config, load};
 
 /// The full, typed shoal configuration — the merged result of every layer.
 /// Every field has a default, so `Config::default()` is itself a valid,
@@ -45,6 +45,7 @@ pub struct Config {
     pub editor: Editor,
     pub kernel: Kernel,
     pub adapters: Adapters,
+    pub plugins: Plugins,
     pub journal: Journal,
     pub leash: Leash,
     pub init: Init,
@@ -151,11 +152,23 @@ pub struct Adapters {
     pub dirs: Vec<PathBuf>,
 }
 
+/// WebAssembly component plugin discovery. Directories are scanned in this
+/// order; manifests within each directory are loaded in lexical path order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct Plugins {
+    pub dirs: Vec<PathBuf>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Journal {
+    /// Enable the language-facing statement journal used by `history`,
+    /// `journal`, and `undo`. Durable kernel security/approval/event auditing
+    /// is mandatory infrastructure and is never disabled by this setting.
     pub enabled: bool,
-    /// `None` = the host's platform default state directory.
+    /// Language journal and embedded-kernel state root. `None` uses the host's
+    /// platform state directory; relative paths resolve from startup cwd.
     pub state_dir: Option<PathBuf>,
 }
 
@@ -225,6 +238,7 @@ impl Default for Config {
             editor: Editor::default(),
             kernel: Kernel::default(),
             adapters: Adapters::default(),
+            plugins: Plugins::default(),
             journal: Journal::default(),
             leash: Leash::default(),
             init: Init::default(),
@@ -327,6 +341,20 @@ mod tests {
         assert!(
             warnings.is_empty(),
             "Config::default() must not trip its own unknown-key scanner: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn plugin_directories_are_typed_and_ordered() {
+        let config: Config =
+            toml::from_str("[plugins]\ndirs = ['/opt/shoal/plugins', './project-plugins']\n")
+                .unwrap();
+        assert_eq!(
+            config.plugins.dirs,
+            vec![
+                PathBuf::from("/opt/shoal/plugins"),
+                PathBuf::from("./project-plugins")
+            ]
         );
     }
 }

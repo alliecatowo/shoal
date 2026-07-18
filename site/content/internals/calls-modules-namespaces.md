@@ -58,11 +58,13 @@ does not yield a function; namespace functions must be called through their synt
 
 ## Recursion guard
 
-`call_value` increments `call_depth`, rejects depth above 10,000 with `recursion_limit`, calls the
-inner dispatcher, and decrements afterward. The decrement happens for success and returned
-`VResult` errors, but native stack exhaustion can still precede a friendly limit on platforms with
-small stacks. The conformance corpus skips a deep-recursion case on a native test thread for this
-reason.
+`call_value` increments `call_depth`, rejects depth above the named 128-call ceiling with
+`recursion_limit`, calls the inner dispatcher, and decrements afterward. The decrement happens for
+success and returned `VResult` errors. Function-call expressions dispatch without retaining the
+large non-call expression frame, and closure blocks enter block evaluation directly; exact-boundary
+and mutual-recursion regressions reach the typed error on an explicit 32 MiB native thread stack. The
+conformance corpus still skips its unbounded-recursion case because its default Rust test worker has
+a smaller native stack than that explicitly tested runtime boundary.
 
 
 ## Strict closure binding
@@ -85,16 +87,17 @@ parameters have been declared. They can therefore reference earlier parameters a
 bindings. On binding/coercion failure, the previous evaluator environment is restored before the
 error returns.
 
-`list<T>` is special: the evaluator coerces each element through `coerce_list_param`. This applies
-to expression calls too, while command-originated typed words may already have been coerced. Scalar
-parameter annotations are **not** validated by `call_value_inner` on expression calls. Even on the
-command path, `coerce_word` parses strings but passes an already non-string runtime value through, so
-an expression-valued argument can bypass a declared scalar type. Return annotations are stored in
-the closure but are likewise not enforced. Types are therefore parsing/coercion hints today, not a
-sound runtime contract.
+`call_value_inner` is the authoritative annotation boundary for both expression and command calls.
+It applies shell-word parsing to string inputs and strict UTF-8 `path` to `str` conversion for
+path-shaped command words; every other already-tagged value must match its declared runtime type.
+`list<T>` is checked/coerced recursively, `table<T>` is restricted to record rows, optional `T?`
+accepts `null`, defaults pass through the same path, and invalid annotation names/shapes fail closed.
+Declared returns reuse the validator in exact-check mode: no string parsing or numeric widening is
+performed after the body returns.
 
 The rest parameter receives a `List` of positional values after the fixed parameter count. Named
-arguments never flow into rest.
+arguments never flow into rest. Both `...xs: T` and `...xs: list<T>` apply `T` to every collected
+item, including expression-valued arguments.
 
 ## Closure environment lifecycle
 
@@ -192,6 +195,11 @@ The loader resets `in_fn_body` to zero during module top-level evaluation, allow
 use top-level-only operations. It restores the prior environment, cwd, and function nesting after
 success or failure. The module-stack entry is also popped before propagating an evaluation error.
 
+An uncached module reserves against the bounded module identity budget before I/O, then reads at
+most the parser's 4 MiB source wall plus one sentinel byte through the inherited `Fs` port. Invalid
+UTF-8 or oversized source never enters the cache or active module stack; correcting the file permits
+a later load in the same healthy evaluator.
+
 A module is evaluated at most once per evaluator. Its exports value is cloned from the cache on
 subsequent `use` statements, and then declared under the canonical file's stem. Caching means changes
 to the file are not observed until a new evaluator/session.
@@ -238,13 +246,26 @@ An environment binding shadows a namespace. This check is explicit: namespace di
 when `env.get(ns).is_none()`. Field access on a function-only namespace returns a diagnostic telling
 the caller to invoke it.
 
+Names and argument shapes live in one evaluator registry shared by runtime admission, the REPL
+completer, and the LSP vocabulary. Every method rejects extra positional arguments and unknown named
+arguments before codec allocation, network setup, configuration access, or other dispatch. Optional
+forms remain explicit: `json.stringify(value, pretty)`/`pretty:`, HTTP's body/header positions, and
+the `headers:` HTTP named argument. This prevents `math.sqrt(4, 999)`-style typos from silently
+changing meaning as implementations evolve.
 
 ## Data namespace conversions
 
 JSON, YAML, and TOML parsing first deserialize into `serde_json::Value`, then use the shared
-`json_to_value` projection. Stringification performs the reverse `value_to_json` projection. That
-common bridge means unsupported or lossy runtime types have the same JSON-shaped fallback concerns
-across all three formats.
+fallible `json_to_value` projection. Stringification performs the reverse `value_to_json`
+projection. Integer values outside Shoal's signed 64-bit range fail with `number_range`; the JSON
+source path additionally checks exact number tokens before serde's generic value representation can
+round them. That common bridge gives all three formats the same non-lossy numeric boundary.
+
+All four data namespaces route through `data_codecs.rs`. Parsing admits no more than 16 MiB of input,
+131,072 structural nodes, depth 128, or 16 MiB of retained Shoal values. JSON, YAML, and CSV encode
+through a writer that cannot cross 16 MiB. TOML preflights a conservative escape and repeated table
+path bound before its internally buffered serializer runs, then renders through that same writer.
+Limit failures are typed `data_materialization_limit` errors and leave the evaluator reusable.
 
 `json.stringify` accepts `pretty` either as a named boolean or second positional `true`. TOML
 stringification can reject values which are legal Shoal/JSON but invalid at TOML's top level.
@@ -252,14 +273,16 @@ stringification can reject values which are legal Shoal/JSON but invalid at TOML
 CSV parse treats the first row as headers and returns a `Table`; all fields are strings. CSV
 stringify accepts a table, a list of records, or one record. It chooses header order from the first
 record and renders non-string cells inline. Missing fields become empty cells, and later-record keys
-that were absent from the first record are omitted.
+that were absent from the first record are omitted. CSV also stops at 16,384 rows and 131,072 cells.
 
 ## HTTP namespace limits
 
 HTTP calls are synchronous evaluator effects. The implementation applies a 30-second request timeout
-and caps response bodies at 64 MiB before projecting the response. `get` and `delete` do not take a
-body; `post` and `put` do. Changes here belong in the effect/security audit because namespace syntax
-can otherwise make network access look like a pure method.
+and caps response bodies at 64 MiB before projecting the response. Its convenience JSON projection
+uses the data-codec input/tree walls and becomes `null` when the body is invalid or outside them; the
+raw bounded body remains available. `get` and `delete` do not take a body; `post` and `put` do. Changes
+here belong in the effect/security audit because namespace syntax can otherwise make network access
+look like a pure method.
 
 ## Configuration namespace
 
@@ -273,14 +296,9 @@ type projects into `Value`; do not expose arbitrary internal configuration seria
 
 ## Known sharp edges
 
-- Return type annotations are carried by closures but not enforced in the core call path.
-- Scalar parameter annotations are not soundly enforced: expression calls skip them and command
-  coercion accepts already non-string values without validating the target type.
 - Namespace functions are not first-class values.
 - `glob(..., follow: ...)` is accepted by constructor validation, but the stored `GlobVal` shown in
   `call.rs` only records `hidden`; contributors should verify the intended follow-symlink contract.
-- Module loading uses `Path::is_file` directly during candidate discovery while content reads go
-  through the `Fs` port. A fully virtual filesystem cannot currently control the whole operation.
 - Module evaluation has a fresh lexical root, not a pure/effect-isolated sandbox.
 - Cache lifetime is the evaluator lifetime; no file watcher or content hash invalidates modules.
 - Synthetic namespace precedence is hand-coded in expression evaluation. A new access path can omit

@@ -1,6 +1,22 @@
 //! `OutcomeVal` — a command's result (site/content/internals/language-conformance-contract.md), moved verbatim out of `lib.rs`.
 
 use super::*;
+use std::io::Read;
+
+struct SharedStdoutReader {
+    bytes: Arc<Vec<u8>>,
+    position: usize,
+}
+
+impl Read for SharedStdoutReader {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        let remaining = &self.bytes[self.position..];
+        let count = remaining.len().min(output.len());
+        output[..count].copy_from_slice(&remaining[..count]);
+        self.position += count;
+        Ok(count)
+    }
+}
 
 /// A command's result (site/content/internals/language-conformance-contract.md). `out` is parsed lazily on first structured
 /// access; the raw bytes are always retained.
@@ -71,6 +87,20 @@ impl OutcomeVal {
         }
     }
 
+    /// Open stdout for incremental sinks without loading a CAS spill or
+    /// cloning resident capture bytes. Redirects and other file consumers use
+    /// this path; [`stdout_bytes`](Self::stdout_bytes) remains the explicit
+    /// materializing API.
+    pub fn open_stdout(&self) -> VResult<Box<dyn Read + Send>> {
+        match &self.stdout_ref {
+            Some(bytes) => bytes.open(),
+            None => Ok(Box::new(SharedStdoutReader {
+                bytes: self.stdout.clone(),
+                position: 0,
+            })),
+        }
+    }
+
     /// `outcome.out` — utf-8 text with the trailing newline trimmed; if the
     /// payload parses as JSON it becomes structured data (T1, lazy).
     pub fn out_value(&self) -> Value {
@@ -82,8 +112,10 @@ impl OutcomeVal {
         let first = trimmed.trim_start().chars().next();
         if matches!(first, Some('{') | Some('['))
             && let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed)
+            && preflight_json_numbers(trimmed, "command output JSON").is_ok()
+            && let Ok(value) = json_to_value(&json)
         {
-            return json_to_value(&json);
+            return value;
         }
         Value::Str(trimmed.to_string())
     }
@@ -92,6 +124,7 @@ impl OutcomeVal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn bare() -> OutcomeVal {
         OutcomeVal {
@@ -115,5 +148,63 @@ mod tests {
         assert_eq!(bare().span, None);
         let stamped = bare().with_span(Span::new(3, 9));
         assert_eq!(stamped.span, Some(Span::new(3, 9)));
+    }
+
+    #[test]
+    fn structured_stdout_never_substitutes_a_rounded_integer() {
+        let exact = br#"{"id":18446744073709551615}"#.to_vec();
+        let mut outcome = bare();
+        outcome.stdout = Arc::new(exact.clone());
+        assert_eq!(
+            outcome.out_value(),
+            Value::Str(String::from_utf8(exact).unwrap())
+        );
+
+        let underflow = br#"{"id":-9223372036854775809}"#.to_vec();
+        outcome.stdout = Arc::new(underflow.clone());
+        assert_eq!(
+            outcome.out_value(),
+            Value::Str(String::from_utf8(underflow).unwrap())
+        );
+    }
+
+    #[test]
+    fn stdout_reader_streams_cas_without_materializing() {
+        struct OpenOnly {
+            opens: Arc<AtomicUsize>,
+        }
+
+        impl BytesLoad for OpenOnly {
+            fn load(&self) -> std::io::Result<Vec<u8>> {
+                panic!("incremental stdout must not call load")
+            }
+
+            fn open(&self) -> std::io::Result<Box<dyn Read + Send>> {
+                self.opens.fetch_add(1, Ordering::SeqCst);
+                Ok(Box::new(std::io::Cursor::new(b"spilled".to_vec())))
+            }
+        }
+
+        let opens = Arc::new(AtomicUsize::new(0));
+        let mut outcome = bare();
+        outcome.stdout = Arc::new(b"preview".to_vec());
+        outcome.stdout_ref = Some(Arc::new(CasBytesVal {
+            hash: "a".repeat(64),
+            len: 7,
+            preview: Arc::new(b"preview".to_vec()),
+            truncated: false,
+            loader: Arc::new(OpenOnly {
+                opens: opens.clone(),
+            }),
+        }));
+
+        let mut bytes = Vec::new();
+        outcome
+            .open_stdout()
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        assert_eq!(bytes, b"spilled");
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
     }
 }

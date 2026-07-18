@@ -4,7 +4,9 @@
 
 use std::path::PathBuf;
 
-use super::{Candidate, Provider, ProviderCtx, is_executable};
+use super::{
+    Candidate, CandidateDiscovery, Provider, ProviderCtx, ProviderError, inspect_executable,
+};
 use crate::version::Version;
 
 pub struct CargoProvider {
@@ -31,13 +33,18 @@ impl Provider for CargoProvider {
         "cargo"
     }
 
-    fn discover(&self, tool: &str, _ctx: &ProviderCtx) -> Vec<Candidate> {
+    fn discover(
+        &self,
+        tool: &str,
+        _ctx: &ProviderCtx,
+    ) -> Result<CandidateDiscovery, ProviderError> {
         let path = self.bin_dir.join(tool);
-        if is_executable(&path) {
-            vec![Candidate::new(tool, Version::unknown(), path, "cargo")]
-        } else {
-            Vec::new()
+        let mut discovery = CandidateDiscovery::new(self.name());
+        discovery.visit_path(&path)?;
+        if inspect_executable(self.name(), &path)? {
+            discovery.push(Candidate::new(tool, Version::unknown(), path, "cargo"))?;
         }
+        Ok(discovery)
     }
 }
 
@@ -58,9 +65,23 @@ mod tests {
         std::fs::set_permissions(&bin, perm).unwrap();
 
         let p = CargoProvider::new(bindir);
-        let cands = p.discover("rg", &ProviderCtx::new("/"));
+        let cands = p
+            .discover("rg", &ProviderCtx::new("/"))
+            .unwrap()
+            .into_candidates();
         assert_eq!(cands.len(), 1);
         assert!(cands[0].version.is_unknown());
         assert_eq!(cands[0].provider, "cargo");
+    }
+
+    #[test]
+    fn inaccessible_candidate_path_is_not_reported_as_absent() {
+        let home = tempfile::tempdir().unwrap();
+        let not_a_directory = home.path().join("bin");
+        std::fs::write(&not_a_directory, b"file").unwrap();
+        let error = CargoProvider::new(not_a_directory)
+            .discover("rg", &ProviderCtx::new("/"))
+            .unwrap_err();
+        assert!(error.msg.contains("cannot inspect"));
     }
 }

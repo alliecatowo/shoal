@@ -19,6 +19,13 @@ impl Kernel {
     pub(crate) fn handle_complete(self: &Arc<Self>, params: Json) -> Result<Json, RpcError> {
         let p: CompleteParams = decode(params)?;
         let cursor = p.cursor.unwrap_or(p.src.len()).min(p.src.len());
+        if !p.src.is_char_boundary(cursor) {
+            return Err(RpcError {
+                code: INVALID_PARAMS,
+                message: "completion cursor must be a UTF-8 byte boundary".into(),
+                data: Some(json!({"cursor": cursor})),
+            });
+        }
         encode(json!({"candidates": complete_at(&p.src, cursor)}))
     }
 
@@ -51,7 +58,7 @@ impl Kernel {
         };
         let ast_json = serde_json::to_string(&ast).map_err(internal)?;
         let plan = {
-            let mut evaluator = session.evaluator.lock().unwrap();
+            let mut evaluator = session.lock_evaluator()?;
             derive_plan(&mut evaluator, &ast, &ast_json)
         };
         encode(json!({
@@ -68,38 +75,87 @@ impl Kernel {
         params: Json,
         attached: &mut Option<Attachment>,
     ) -> Result<Json, RpcError> {
-        attached.as_ref().ok_or_else(not_attached)?;
-        let hash = params
-            .get("hash")
-            .and_then(Json::as_str)
-            .ok_or_else(|| RpcError {
-                code: INVALID_PARAMS,
-                message: "blob.get requires a hash".into(),
-                data: None,
-            })?
-            .to_string();
-        let blob = self
+        let attachment = attached.as_ref().ok_or_else(not_attached)?;
+        // A content hash learned out of band must not bypass the policy that
+        // protects the exact journal row authorizing it. Live transcript refs
+        // use `value.get`; this route is exclusively journal-output CAS.
+        self.require_journal_read(attachment)?;
+        let params: BlobGetParams = decode(params)?;
+        let hash = params.hash;
+        let journal = self
             .journal
             .lock()
-            .unwrap()
-            .read_blob(&hash)
-            .map_err(internal)?
-            .ok_or_else(|| RpcError {
+            .map_err(|_| poisoned_subsystem("journal"))?;
+        let owned = journal
+            .output_owned_by(&hash, &attachment.session.id, &attachment.principal)
+            .map_err(internal)?;
+        if !owned {
+            return Err(RpcError {
                 code: UNKNOWN_REF,
                 message: "unknown value hash".into(),
                 data: None,
-            })?;
-        // Content-addressed value blobs are stored as their `$`-tagged
-        // JSON encoding; hand it back structurally. A non-JSON blob
-        // (stdout/stderr) comes back as tagged bytes.
-        let value = serde_json::from_slice::<Json>(&blob).unwrap_or_else(|_| {
-            json!({
-                "$": "bytes",
-                "len": blob.len(),
-                "v": base64::Engine::encode(
-                    &base64::engine::general_purpose::STANDARD, &blob),
-            })
+            });
+        }
+        let requested_offset = params.offset.unwrap_or(0);
+        let requested_length = params.length.unwrap_or(RAW_PAGE_MAX_BYTES as u64);
+        let effective_length = requested_length.min(RAW_PAGE_MAX_BYTES as u64) as usize;
+        let cached = journal
+            .cached_blob_range(&hash, requested_offset, effective_length)
+            .map_err(internal)?;
+        let (total_len, blob) = match cached {
+            Some(page) => page,
+            None => {
+                self.reserve_blob_decompression(&attachment.session)?;
+                journal
+                    .read_blob_range(&hash, requested_offset, effective_length)
+                    .map_err(internal)?
+                    .ok_or_else(|| RpcError {
+                        code: UNKNOWN_REF,
+                        message: "unknown value hash".into(),
+                        data: None,
+                    })?
+            }
+        };
+        let offset = requested_offset.min(total_len);
+        let returned_len = blob.len() as u64;
+        let next = offset.saturating_add(returned_len).min(total_len);
+        let requested_end = offset.saturating_add(requested_length).min(total_len);
+        let page = json!({
+            "total_len": total_len,
+            "offset": offset,
+            "returned_len": returned_len,
+            "content_bytes": blob.len(),
+            "next_offset": (next < total_len).then_some(next),
+            "done": next >= total_len,
+            "truncated": next < total_len,
+            "request_truncated": next < requested_end,
+            "unit": "byte",
+            "max_content_bytes": RAW_PAGE_MAX_BYTES,
         });
-        encode(json!({"hash": hash, "value": value}))
+
+        // Preserve the historical structured response for a complete small
+        // omitted-range request. Larger blobs and every explicit range return
+        // a byte page; neither path ever allocates more than the page wall.
+        if params.offset.is_none() && params.length.is_none() && next == total_len {
+            let value = serde_json::from_slice::<Json>(&blob).unwrap_or_else(|_| {
+                json!({
+                    "$": "bytes",
+                    "len": blob.len(),
+                    "v": base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD, &blob),
+                })
+            });
+            encode(json!({"hash": hash, "value": value, "page": page}))
+        } else {
+            encode(json!({
+                "hash": hash,
+                "encoding": "base64",
+                "raw_base64": base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    &blob,
+                ),
+                "page": page,
+            }))
+        }
     }
 }

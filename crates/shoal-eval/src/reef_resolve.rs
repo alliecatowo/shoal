@@ -9,39 +9,201 @@
 
 use super::*;
 
+use shoal_reef::provider::{ProviderCommand, ProviderCtx, ProviderRunner};
 use shoal_reef::{
-    Binding, LockNotice, ManifestKind, Policy, Resolver, ScopeChain, ScopeEntry, ViewConfig,
-    default_view_root, synth_path,
+    Binding, Candidate, LockNotice, ManifestKind, Policy, ProbeExecution, ReefError, ReefResult,
+    Resolver, ScopeChain, ScopeEntry, ViewConfig, default_view_root, synth_path,
 };
 
+struct EvaluatorProviderRunner {
+    exec: Arc<dyn Exec>,
+    env: Vec<(OsString, OsString)>,
+    sandbox: Option<SandboxPolicy>,
+    cancel: CancelToken,
+}
+
+impl ProviderRunner for EvaluatorProviderRunner {
+    fn run(
+        &self,
+        command: ProviderCommand<'_>,
+    ) -> std::io::Result<shoal_exec::BoundedCommandOutput> {
+        let mut argv = Vec::with_capacity(command.args.len() + 1);
+        argv.push(command.program.as_os_str().to_owned());
+        argv.extend(command.args.iter().cloned());
+        self.exec.run_bounded(
+            ExecSpec {
+                argv,
+                cwd: command.cwd.to_path_buf(),
+                env: self.env.clone(),
+                stdin: StdinSpec::Null,
+                mode: ExecMode::Capture,
+                sandbox: self.sandbox.clone(),
+                spill: None,
+            },
+            command.timeout,
+            command.output_cap,
+            &self.cancel,
+        )
+    }
+}
+
 impl Evaluator {
+    /// Fail closed before Reef executes an unknown-version candidate as
+    /// `<candidate> --version`. Probes are opaque code execution: a restricted
+    /// principal must allow opaque effects and any active spawn pin. Execution
+    /// happens separately through [`EvaluatorProviderRunner`], which carries
+    /// the active filesystem sandbox and cancellation epoch.
+    pub(crate) fn reef_probe_guard(&self, candidate: &Candidate) -> ReefResult<()> {
+        let Some((policy, principal)) = self.session.leash.as_ref() else {
+            return Ok(());
+        };
+        if policy.evaluate_effect(principal, &Effect::Opaque) != shoal_leash::Verdict::Allow {
+            return Err(ReefError::provider(format!(
+                "version probe for {} denied: principal `{principal}` does not allow opaque effects",
+                candidate.path.display()
+            ))
+            .with_hint("lock the tool in an unrestricted trusted session before using it here"));
+        }
+        if policy.spawn_pinning_active(principal) {
+            let effect = Effect::ProcSpawn {
+                bin_hash: self
+                    .hash_resolved_bin(candidate.path.as_os_str())
+                    .unwrap_or_default(),
+                argv0: candidate.path.to_string_lossy().into_owned(),
+            };
+            if policy.evaluate_effect(principal, &effect) != shoal_leash::Verdict::Allow {
+                return Err(ReefError::provider(format!(
+                    "version probe for {} denied by principal `{principal}` spawn pins",
+                    candidate.path.display()
+                ))
+                .with_hint("allow the candidate name/hash or materialize the lock elsewhere"));
+            }
+        }
+        Ok(())
+    }
+
+    /// `fetch` is an explicit but opaque installer spawn. Enforce the active
+    /// evaluator policy again at execution time so embedded/non-kernel hosts
+    /// cannot bypass the plan verdict. Provider execution separately carries
+    /// the active filesystem sandbox and cancellation epoch.
+    pub(crate) fn reef_fetch_guard(&self) -> VResult<()> {
+        let Some((policy, principal)) = self.session.leash.as_ref() else {
+            return Ok(());
+        };
+        if policy.evaluate_effect(principal, &Effect::Opaque) != shoal_leash::Verdict::Allow {
+            return Err(ErrorVal::new(
+                "spawn_denied",
+                format!("reef fetch denied: principal `{principal}` does not allow opaque effects"),
+            ));
+        }
+        if policy.spawn_pinning_active(principal) {
+            let mise = self.ambient_which("mise").ok_or_else(|| {
+                ErrorVal::new(
+                    "spawn_denied",
+                    "reef fetch denied: no `mise` executable is available for spawn-pin verification",
+                )
+            })?;
+            self.spawn_gate(mise.as_os_str(), None, Span::default())?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn reef_provider_context(&self, cwd: PathBuf) -> ProviderCtx {
+        let path_env = self
+            .exec
+            .shell
+            .process_env
+            .iter()
+            .find(|(name, _)| name == "PATH")
+            .map(|(_, value)| value.clone());
+        ProviderCtx::with_runner(
+            cwd,
+            path_env,
+            Arc::new(EvaluatorProviderRunner {
+                exec: self.host.exec.clone(),
+                env: self.exec.shell.process_env.clone(),
+                sandbox: self.resolve_sandbox(),
+                cancel: self.exec.control.cancel.clone(),
+            }),
+        )
+    }
+
     // --- chain cache -------------------------------------------------------
 
-    /// Ensure the cached scope chain matches the current cwd. Rebuilds only when
-    /// the cwd changed since the last discovery (so `cd` / `with cwd:` re-scope
-    /// the next resolution and nothing else does). Reloads the lock next to the
-    /// nearest manifest at the same time.
+    /// Ensure the cached scope chain matches the current cwd and manifest
+    /// metadata. A new, edited, removed, or replaced candidate invalidates the
+    /// cache without requiring a directory change. Reloads the adjacent lock at
+    /// the same time.
     pub(crate) fn ensure_reef_chain(&mut self) {
-        let fresh = match &self.reef_chain {
-            Some((cwd, _)) => cwd != &self.cwd,
+        let observed_key = ScopeChain::discovery_key_with(
+            &self.exec.shell.cwd,
+            self.host.reef_user_manifest.as_deref(),
+            self.host.fs.as_ref(),
+        );
+        let fresh = match &self.exec.reef.chain {
+            Some((cwd, _)) => {
+                cwd != &self.exec.shell.cwd
+                    || self.exec.reef.chain_key.as_ref() != Some(&observed_key)
+            }
             None => true,
         };
         if !fresh {
             return;
         }
-        let chain = ScopeChain::discover(&self.cwd, self.reef_user_manifest.as_deref());
-        self.reef_lock_path = chain
+        let chain = ScopeChain::discover_with(
+            &self.exec.shell.cwd,
+            self.host.reef_user_manifest.as_deref(),
+            self.host.fs.as_ref(),
+        );
+        let warnings = chain.warnings.clone();
+        self.exec.reef.discovery_error = if self.session.interactive || warnings.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "Reef discovery retained {} warning(s) for invalid or unreadable manifests; first: {}",
+                warnings.len(),
+                warnings[0]
+            ))
+        };
+        self.exec.reef.lock_path = chain
             .scopes
             .iter()
             .find(|s| s.kind == ManifestKind::Reef)
             .or_else(|| chain.scopes.first())
             .map(|s| shoal_reef::Lockfile::path_next_to(&s.source));
-        self.reef_lock = self
-            .reef_lock_path
+        let loaded = self
+            .exec
+            .reef
+            .lock_path
             .as_ref()
-            .and_then(|p| shoal_reef::Lockfile::load(p).ok())
-            .unwrap_or_default();
-        self.reef_chain = Some((self.cwd.clone(), chain));
+            .map(|path| shoal_reef::Lockfile::load_with(path, self.host.fs.as_ref()));
+        match loaded {
+            Some(Ok(lock)) => {
+                self.exec.reef.lock = lock;
+                self.exec.reef.lock_load_error = None;
+            }
+            Some(Err(error)) => {
+                self.exec.reef.lock = shoal_reef::Lockfile::new();
+                self.exec.reef.lock_load_error = Some(error.to_string());
+            }
+            None => {
+                self.exec.reef.lock = shoal_reef::Lockfile::new();
+                self.exec.reef.lock_load_error = None;
+            }
+        }
+        self.exec.reef.chain = Some((self.exec.shell.cwd.clone(), chain));
+        self.exec.reef.chain_key = Some(observed_key);
+        if self.session.interactive {
+            for warning in warnings.iter().take(8) {
+                self.emit_line(&format!("reef: warning: {warning}"));
+            }
+            if warnings.len() > 8 {
+                self.emit_line(&format!(
+                    "reef: warning: {} additional discovery warning(s)",
+                    warnings.len() - 8
+                ));
+            }
+        }
     }
 
     /// A clone of the current scope chain (cheap: manifests are small maps),
@@ -52,9 +214,17 @@ impl Evaluator {
     /// popping an override always restores exactly the cached chain).
     pub(crate) fn reef_chain_snapshot(&mut self) -> ScopeChain {
         self.ensure_reef_chain();
-        let mut chain = self.reef_chain.as_ref().expect("just ensured").1.clone();
-        if !self.reef_overrides.is_empty() {
-            let mut scopes: Vec<ScopeEntry> = self.reef_overrides.iter().rev().cloned().collect();
+        let mut chain = self
+            .exec
+            .reef
+            .chain
+            .as_ref()
+            .expect("just ensured")
+            .1
+            .clone();
+        if !self.exec.reef.overrides.is_empty() {
+            let mut scopes: Vec<ScopeEntry> =
+                self.exec.reef.overrides.iter().rev().cloned().collect();
             scopes.append(&mut chain.scopes);
             chain.scopes = scopes;
         }
@@ -80,7 +250,7 @@ impl Evaluator {
                 shoal_reef::ToolReq::new(shoal_reef::Constraint::parse(s)),
             );
         }
-        self.reef_overrides.push(ScopeEntry {
+        self.exec.reef.overrides.push(ScopeEntry {
             kind: ManifestKind::Reef,
             source: PathBuf::from("<with reef:>"),
             manifest: shoal_reef::ReefManifest {
@@ -96,28 +266,30 @@ impl Evaluator {
     /// Pop the most recently pushed `with reef:` override layer. A no-op past
     /// the bottom of the stack (defensive; callers always balance push/pop).
     pub(crate) fn pop_reef_override(&mut self) {
-        self.reef_overrides.pop();
+        self.exec.reef.overrides.pop();
     }
 
     /// The lazily-built provider stack (site/content/internals/reef-resolution.md). Only ever called once a
     /// manifest is in scope, so the no-manifest hot path never constructs it.
-    pub(crate) fn reef_resolver(&mut self) -> Arc<Resolver> {
-        if self.reef_resolver.is_none() {
-            self.reef_resolver = Some(Arc::new(Resolver::with_defaults()));
-        }
-        self.reef_resolver.as_ref().expect("just set").clone()
+    pub(crate) fn reef_resolver(&self) -> Arc<Resolver> {
+        self.host
+            .reef_resolver
+            .get_or_init(|| Arc::new(Resolver::with_defaults()))
+            .clone()
     }
 
     /// True when at least one manifest — discovered or a `with reef:`
     /// override — constrains something in the current scope. The single gate
     /// that keeps the no-manifest world untouched.
     pub(crate) fn reef_manifest_in_scope(&mut self) -> bool {
-        if !self.reef_overrides.is_empty() {
+        if !self.exec.reef.overrides.is_empty() {
             return true;
         }
         self.ensure_reef_chain();
         !self
-            .reef_chain
+            .exec
+            .reef
+            .chain
             .as_ref()
             .expect("ensured")
             .1
@@ -125,11 +297,34 @@ impl Evaluator {
             .is_empty()
     }
 
-    /// Persist the in-memory lock next to its manifest, best-effort. A failure
-    /// to write never fails a spawn — the lock is an optimization, not a gate.
-    pub(crate) fn persist_reef_lock(&self) {
-        if let Some(path) = &self.reef_lock_path {
-            let _ = self.reef_lock.save(path);
+    /// Persist a candidate lock next to its manifest before publishing it as
+    /// evaluator state. A constrained resolution is not durably locked until
+    /// this succeeds.
+    pub(crate) fn persist_reef_lock_value(&self, lock: &shoal_reef::Lockfile) -> VResult<()> {
+        self.reef_lock_loaded()?;
+        let path = self.exec.reef.lock_path.as_ref().ok_or_else(|| {
+            ErrorVal::new(
+                "reef_provider",
+                "cannot persist Reef lock: no manifest-backed lockfile target",
+            )
+        })?;
+        lock.save_with(path, self.host.fs.as_ref())
+            .map_err(|error| {
+                ErrorVal::new(
+                    "reef_provider",
+                    format!("persisting Reef lock {}: {error}", path.display()),
+                )
+            })
+    }
+
+    pub(crate) fn reef_lock_loaded(&self) -> VResult<()> {
+        match &self.exec.reef.lock_load_error {
+            Some(error) => Err(ErrorVal::new(
+                "reef_provider",
+                format!("cannot use malformed Reef lock: {error}"),
+            )
+            .with_hint("inspect or remove reef.lock, then run `reef lock --refresh`")),
+            None => Ok(()),
         }
     }
 
@@ -141,11 +336,13 @@ impl Evaluator {
     /// outside reef's view" fact.
     pub(crate) fn ambient_which(&self, name: &str) -> Option<PathBuf> {
         let path_env = self
+            .exec
+            .shell
             .process_env
             .iter()
             .find(|(k, _)| k == "PATH")
             .map(|(_, v)| v.as_os_str());
-        shoal_exec::which(OsStr::new(name), path_env)
+        shoal_exec::which_in(OsStr::new(name), path_env, &self.exec.shell.cwd)
     }
 
     // --- spawn-time resolution (site/content/internals/reef-resolution.md) -------------------------------
@@ -173,6 +370,14 @@ impl Evaluator {
         env: &mut Vec<(OsString, OsString)>,
         span: Span,
     ) -> VResult<Option<String>> {
+        self.ensure_reef_chain();
+        if let Some(error) = &self.exec.reef.discovery_error {
+            return Err(ErrorVal::new("reef_provider", error.clone())
+                .with_hint(
+                    "fix or remove the reported manifest before running a script/agent command",
+                )
+                .with_span(span));
+        }
         // Fast bail: no manifest in scope ⇒ never touch the resolver.
         if !self.reef_manifest_in_scope() {
             return Ok(None);
@@ -192,18 +397,29 @@ impl Evaluator {
             // today's behavior: ambient PATH, PATH/which resolution, untouched.
             return Ok(None);
         }
+        self.reef_lock_loaded()
+            .map_err(|error| error.with_span(span))?;
 
-        let policy = if self.interactive {
+        let policy = if self.session.interactive {
             Policy::Interactive
         } else {
             Policy::Script
         };
         let resolver = self.reef_resolver();
-        let mut lock = self.reef_lock.clone();
+        let mut lock = self.exec.reef.lock.clone();
         let mut notice: Option<LockNotice> = None;
-        let outcome = resolver.resolve(&name, &chain, &mut lock, policy, &mut |n| {
-            notice = Some(n.clone());
-        });
+        let provider_context = self.reef_provider_context(chain.cwd.clone());
+        let outcome = resolver.resolve_with_probe_context(
+            &name,
+            &chain,
+            &mut lock,
+            policy,
+            &mut |n| notice = Some(n.clone()),
+            ProbeExecution {
+                guard: &mut |candidate| self.reef_probe_guard(candidate),
+                context: &provider_context,
+            },
+        );
         let resolution = match outcome {
             Ok(r) => r,
             Err(e) => {
@@ -217,10 +433,14 @@ impl Evaluator {
             }
         };
 
+        if notice.is_some() {
+            self.persist_reef_lock_value(&lock)
+                .map_err(|error| error.with_span(span))?;
+        }
+
         argv[0] = resolution.path.clone().into_os_string();
-        self.reef_lock = lock;
+        self.exec.reef.lock = lock;
         if let Some(n) = notice {
-            self.persist_reef_lock();
             self.emit_lock_notice(&n);
         }
 
@@ -249,7 +469,7 @@ impl Evaluator {
             resolution.report.name.clone(),
             resolution.path.clone(),
         )];
-        for (tool, entry) in &self.reef_lock.tools {
+        for (tool, entry) in &self.exec.reef.lock.tools {
             if tool != &resolution.report.name {
                 bindings.push(Binding::new(tool.clone(), entry.path.clone()));
             }
@@ -287,7 +507,7 @@ impl Evaluator {
 
     /// Route a one-line diagnostic through the sink (or stderr without one).
     fn emit_line(&mut self, msg: &str) {
-        if self.sink.is_some() {
+        if self.session.sink.is_some() {
             let v = Value::Str(msg.to_string());
             self.emit(&v);
         } else {
@@ -365,7 +585,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(".reef.toml"), "[tools]\nsh = \"*\"\n").unwrap();
         let mut ev = Evaluator::new(dir.path().to_path_buf());
-        ev.interactive = true; // reach resolve_fresh, not reef_unlocked
+        ev.set_interactive(true); // reach resolve_fresh, not reef_unlocked
         ev.set_reef_resolver(empty_fixture_resolver());
 
         let err = ev
@@ -396,7 +616,7 @@ mod tests {
         )
         .unwrap();
         let mut ev = Evaluator::new(dir.path().to_path_buf());
-        ev.interactive = true;
+        ev.set_interactive(true);
         ev.set_reef_resolver(empty_fixture_resolver());
 
         let err = ev
@@ -408,5 +628,52 @@ mod tests {
             "no real ambient hit exists; the hint must not fire, got {:?}",
             err.msg
         );
+    }
+
+    #[test]
+    fn noninteractive_discovery_fails_closed_and_recovers_after_manifest_fix() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join(".reef.toml");
+        std::fs::write(&manifest, "[tools").unwrap();
+        let mut evaluator = Evaluator::new(dir.path().to_path_buf());
+        let program = shoal_syntax::parse("/usr/bin/true").unwrap();
+
+        let error = evaluator
+            .eval_program(&program)
+            .expect_err("script/agent execution must not skip malformed authority");
+        assert_eq!(error.code, "reef_provider");
+        assert!(error.msg.contains("invalid or unreadable manifests"));
+
+        std::fs::write(&manifest, "").unwrap();
+        let value = evaluator
+            .eval_program(&program)
+            .expect("same-cwd metadata identity must notice the repaired manifest");
+        let Value::Outcome(outcome) = value else {
+            panic!("expected external outcome");
+        };
+        assert!(outcome.ok);
+        assert!(evaluator.exec.reef.discovery_error.is_none());
+    }
+
+    #[test]
+    fn interactive_discovery_warns_once_and_remains_best_effort() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".reef.toml"), "[tools").unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let capture = seen.clone();
+        let mut evaluator = Evaluator::new(dir.path().to_path_buf());
+        evaluator.set_interactive(true);
+        evaluator.set_statement_sink(Box::new(move |value| {
+            if let Value::Str(line) = value {
+                capture.lock().unwrap().push(line.clone());
+            }
+        }));
+
+        evaluator.ensure_reef_chain();
+        evaluator.ensure_reef_chain();
+        assert!(evaluator.exec.reef.discovery_error.is_none());
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "an unchanged bad scope warns only once");
+        assert!(seen[0].contains("reef: warning:"));
     }
 }

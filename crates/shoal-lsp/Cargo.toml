@@ -3,10 +3,19 @@ name = "shoal-lsp"
 version = "0.1.0"
 edition = "2024"
 
+[lints]
+workspace = true
+
 [dependencies]
+shoal-ast = { path = "../shoal-ast" }
+shoal-eval = { path = "../shoal-eval" }
+shoal-leash = { path = "../shoal-leash" }
 shoal-syntax = { path = "../shoal-syntax" }
 tower-lsp = "0.20"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "sync"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "sync", "time"] }
+
+[dev-dependencies]
+serde_json = "1"
 
 [[bin]]
 name = "shoal-lsp"

@@ -16,8 +16,7 @@ impl Evaluator {
     pub(crate) fn builtin_plan(&mut self, call: &CmdCall) -> VResult<Value> {
         let program = self.plan_target_program(call)?;
         let plan = self.plan_program(&program)?;
-        self.plans.push(program);
-        let id = self.plans.len() as i64;
+        let id = self.exec.plans.store(program)?;
         Ok(plan_record(&plan, Some(id)))
     }
 
@@ -43,11 +42,7 @@ impl Evaluator {
                 ));
             }
         };
-        let idx = usize::try_from(id - 1)
-            .ok()
-            .filter(|i| *i < self.plans.len())
-            .ok_or_else(|| ErrorVal::new("not_found", format!("no plan #{id} to apply")))?;
-        let program = self.plans[idx].clone();
+        let program = self.exec.plans.program(id)?;
         self.eval_program(&program)
     }
 
@@ -60,8 +55,8 @@ impl Evaluator {
             Some(Value::Path(p)) => p.to_string_lossy().into_owned(),
             _ => return Err(ErrorVal::arg_error("explain expects a source string")),
         };
-        let program =
-            shoal_syntax::parse(&src).map_err(|e| ErrorVal::new("parse_error", e.to_string()))?;
+        let program = shoal_syntax::parse_with_ctx(&src, self.parse_context(false))
+            .map_err(|e| ErrorVal::new("parse_error", e.to_string()))?;
         let plan = self.plan_program(&program)?;
         let mut r = match plan_record(&plan, None) {
             Value::Record(r) => r,
@@ -162,5 +157,31 @@ fn effect_str(e: &Effect) -> String {
         Effect::JournalRead => "journal-read".to_string(),
         Effect::Time => "read-clock".to_string(),
         Effect::Opaque => "opaque (effects unknown)".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::exec_state::MAX_STORED_PLANS;
+
+    #[test]
+    fn applying_an_aged_out_plan_returns_stable_explicit_error() {
+        let mut evaluator = Evaluator::new(std::env::temp_dir());
+        let derive = shoal_syntax::parse("plan { null }").unwrap();
+        for _ in 0..=MAX_STORED_PLANS {
+            evaluator.eval_program(&derive).unwrap();
+        }
+
+        let apply = shoal_syntax::parse("apply 1").unwrap();
+        let error = evaluator.eval_program(&apply).unwrap_err();
+        assert_eq!(error.code, "plan_expired");
+        assert!(
+            error
+                .hint
+                .as_deref()
+                .unwrap_or_default()
+                .contains("fresh plan")
+        );
     }
 }

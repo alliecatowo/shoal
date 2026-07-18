@@ -6,12 +6,18 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
+  # Cargo-backed mise installs may both invoke rustup. Serializing avoids
+  # races over shared component download/rename paths on macOS runners.
+  MISE_JOBS: 1
   RUST_BACKTRACE: 1
 
 jobs:
@@ -23,31 +29,31 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
+      - uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: ${{ matrix.os }}
-      - name: Build
-        run: cargo build --workspace --all-targets --locked
-      - name: Test
-        run: cargo test --workspace --locked
-      - name: Conformance corpus
-        run: cargo test -p shoal --test conformance --locked -- --nocapture
+      - name: Bootstrap Shoal
+        run: cargo build -p shoal --locked
+      - name: Test through Shoal
+        run: target/debug/shoal scripts/ci-test.shl
 
   lint:
     name: fmt + clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: Format
-        run: cargo fmt --all --check
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Bootstrap Shoal
+        run: cargo build -p shoal --locked
+      - name: Lint through Shoal
+        run: target/debug/shoal scripts/ci-lint.shl
 
   release-build:
     name: release build (${{ matrix.os }})
@@ -57,21 +63,56 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
+      - uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: release-${{ matrix.os }}
-      - name: Build release
-        run: cargo build --workspace --release --locked
+      - name: Bootstrap Shoal
+        run: cargo build -p shoal --locked
+      - name: Build release through Shoal
+        run: target/debug/shoal scripts/ci-release-build.shl
+      - name: Verify temporary-prefix install lifecycle through Shoal
+        run: target/debug/shoal scripts/install-test.shl
 
   fuzz-build:
     name: fuzz targets build
     runs-on: ubuntu-latest
-    continue-on-error: true
+    # Blocking per-PR compile smoke: every declared target must keep building.
+    # The scheduled workflow below is the behavioral runtime fuzz gate.
+    # rust-toolchain.toml pins stable repo-wide; cargo-fuzz needs nightly
+    # sanitizer flags, so explicitly select the nightly installed below.
+    env:
+      RUSTUP_TOOLCHAIN: nightly
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      - run: sudo apt-get update && sudo apt-get install -y clang
-      - run: cargo install cargo-fuzz --locked
-      - run: cargo fuzz build --fuzz-dir fuzz
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # nightly 2026-07-17
+      - uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
+      - name: Bootstrap Shoal
+        run: cargo build -p shoal --locked
+      - name: Build fuzz targets through Shoal
+        env:
+          # mise-action activates the repository's stable Rust after its own
+          # install step; cargo-fuzz itself requires nightly sanitizer flags.
+          RUSTUP_TOOLCHAIN: nightly
+        run: target/debug/shoal scripts/ci-fuzz-build.shl
+
+  supply-chain-audit:
+    # HR-F6 (site/content/internals/hardening-roadmap.md): RUSTSEC advisory checks over the root and
+    # independently locked fuzz dependency graphs. The allowlist for accepted advisories lives in
+    # `.cargo/audit.toml` (cargo-audit's own auto-discovered config path) with a reason and revisit
+    # condition per entry — do not weaken this job with ad-hoc `--ignore` flags.
+    name: supply-chain audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
+      - uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: supply-chain-audit
+      - name: Bootstrap Shoal
+        run: cargo build -p shoal --locked
+      - name: Audit through Shoal
+        run: target/debug/shoal scripts/ci-audit.shl

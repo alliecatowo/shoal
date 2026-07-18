@@ -5,6 +5,9 @@ use super::*;
 
 impl<'s> Parser<'s> {
     pub(crate) fn match_pattern(&mut self) -> ParseResult<Pattern> {
+        self.with_nesting(Self::match_pattern_inner)
+    }
+    fn match_pattern_inner(&mut self) -> ParseResult<Pattern> {
         let (t, s) = self.bump(Mode::Expr)?;
         Ok(match t {
             Tok::Ident(x) if x == "_" => Pattern::Wildcard { span: s },

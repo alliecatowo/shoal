@@ -108,6 +108,7 @@ Execute Shoal source in the attached named session.
   "position": "value",
   "background": false,
   "timeout_ms": 5000,
+  "deadline_ms": 30000,
   "elide": {
     "max_bytes": 8192,
     "max_rows": 100,
@@ -123,6 +124,7 @@ Execute Shoal source in the attached named session.
 | `position` | `"stmt"` or `"value"` | no | `"value"` | Decide whether a final failed outcome raises or remains inspectable. |
 | `background` | boolean | no | `false` | Return a task immediately instead of waiting. |
 | `timeout_ms` | integer ≥ 1 | no | no timeout | Wait this long, then return the still-running work as a task. |
+| `deadline_ms` | integer ≥ 1 | no | no deadline | Cancel work after this execution budget; kernel clamps to 24 hours. |
 | `elide` | object | no | server defaults | Override `max_bytes`, `max_rows`, and/or `max_items` for this response. |
 
 Unknown properties are rejected by the advertised schema.
@@ -167,6 +169,10 @@ Planning is meaningful for command-shaped work. Pure expressions can have no ext
 With `background: true`, Shoal returns a `task:N` reference without waiting for completion. The task runs in the session's evaluator worker and emits `task.N` events.
 
 With `timeout_ms`, Shoal waits up to the given duration. If execution finishes, the ordinary transcript result is returned. If it is still running, Shoal returns the task rather than killing it. Timeout is therefore a wait budget, not an execution deadline. Follow with task resources/events or `shoal_cancel`.
+
+With `deadline_ms`, execution always uses task ownership even when `background` is false. Expiry
+requests cancellation and is reported as `deadline_exceeded:true` on the task record. Combine it
+with `timeout_ms` when the client wants a short response wait but a longer hard execution budget.
 
 Do not set both options merely to make a task: `background: true` already returns immediately, so a timeout does not add a useful deadline.
 
@@ -256,7 +262,7 @@ Apply a previously stored plan:
 
 `plan_ref` is the only argument. Applying does not accept replacement source, altered arguments, or an alternate effect list. The kernel checks the selected stored plan's session, principal, source, and policy state before application.
 
-The reference itself is not a complete identity: it is currently a 16-hex-character truncation of a hash over effects, reversibility, and estimates, excluding source/session/principal. A same-shape plan can overwrite another entry in the kernel's global plan map. The metadata check prevents a direct source substitution at apply time, but collisions can invalidate references or make them select another plan's metadata. Until this is fixed, derive and apply promptly, inspect the selected plan resource, and do not use `plan_ref` as an authorization token or durable unique ID.
+The reference contains a full digest over source, canonical AST, effects, reversibility, estimates, Session, and principal plus a unique per-kernel object suffix. Same-shape and identical repeated plans cannot overwrite one another, and application rechecks the stored owner/source binding. The object remains ephemeral and disappears on restart; do not use `plan_ref` as a durable ID, secret, or transferable authorization token.
 
 Plans are ephemeral kernel state. They do not survive daemon restart. An unknown or expired-in-memory reference produces `UNKNOWN_PLAN` (`-32012`). A plan that still needs approval produces `APPROVAL_REQUIRED` (`-32011`).
 
@@ -348,7 +354,7 @@ All arguments are optional.
 
 Journal entries describe executions and plans; they are not raw terminal transcripts. Treat field additions as forward-compatible. A client should select the fields it understands rather than requiring byte-for-byte object equality.
 
-The kernel journal and the standalone `shoal-history` CLI use compatible storage code but can default to different XDG roots. See [Companion CLI reference](@/docs/companion-cli-reference.md) before diagnosing an apparently empty journal.
+The kernel journal and standalone `shoal-history` use compatible storage. History loads layered `journal.state_dir` and the shared XDG fallback; a durable kernel launched with an explicit root can still differ. See [Companion CLI reference](@/docs/companion-cli-reference.md) before diagnosing an apparently empty journal.
 
 ## `shoal_cancel`
 

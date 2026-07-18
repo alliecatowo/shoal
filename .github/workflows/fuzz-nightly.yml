@@ -1,0 +1,66 @@
+name: Scheduled fuzz
+
+# HR-F4 (site/content/internals/hardening-roadmap.md): the `fuzz-build` job in ci.yml only
+# compiles the libFuzzer targets as a blocking check on every push/PR (no timed run) — deep audit
+# finding H12 is that fuzz targets exist but nothing ever actually runs them. This workflow runs
+# each target for a short, fixed budget on a nightly schedule and fails the job (no
+# continue-on-error) if libFuzzer finds a crash, timeout, or OOM, so a regression surfaces here
+# instead of silently sitting unexercised.
+#
+# Budget choice: 120s per target is a deliberate smoke, not exhaustive, tradeoff. Targets run as a
+# sequentially in one real Shoal program so target enumeration and failure handling are dogfooded.
+# Checked-in seeds provide useful starting states; longer corpus-accumulating campaigns remain
+# complementary to this bounded nightly gate.
+
+on:
+  schedule:
+    # 07:00 UTC daily.
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+    inputs:
+      seconds_per_target:
+        description: "libFuzzer max_total_time per target, in seconds"
+        default: "120"
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-nightly
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  MISE_JOBS: 1
+  RUST_BACKTRACE: 1
+
+jobs:
+  fuzz:
+    name: fuzz through Shoal
+    runs-on: ubuntu-latest
+    # Override the repository's pinned stable toolchain for cargo-fuzz.
+    env:
+      RUSTUP_TOOLCHAIN: nightly
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # nightly 2026-07-17
+      - uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: fuzz-nightly
+          workspaces: fuzz -> target
+      - name: Bootstrap Shoal
+        run: cargo build -p shoal --locked
+      - name: Run bounded campaigns through Shoal
+        env:
+          RUSTUP_TOOLCHAIN: nightly
+          SHOAL_FUZZ_SECONDS: ${{ github.event.inputs.seconds_per_target || '120' }}
+        run: target/debug/shoal scripts/ci-fuzz-nightly.shl
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fuzz-crashes
+          path: fuzz/artifacts/
+          if-no-files-found: ignore

@@ -1,6 +1,8 @@
 /target
 /target-*
+/fuzz/target
 **/*.rs.bk
 *.pdb
 scratch/
+# Reef locks bind absolute executable paths and byte hashes for one host.
 reef.lock

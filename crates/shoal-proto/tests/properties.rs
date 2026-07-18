@@ -6,8 +6,8 @@ use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
 proptest! {
  #![proptest_config(ProptestConfig::with_cases(128))]
- #[test]fn tagged_value_roundtrip(value in wire_value()){let bytes=serde_json::to_vec(&value).unwrap();let back:WireValue=serde_json::from_slice(&bytes).unwrap();prop_assert_eq!(back,value);}
- #[test]fn frame_decode_never_panics(bytes in prop::collection::vec(any::<u8>(),0..4096)){let mut framed=bytes;framed.push(b'\n');let _=shoal_proto::read_frame(&mut std::io::Cursor::new(framed));}
+ #[test]fn tagged_value_roundtrip(value in wire_value()){let bytes=serde_json::to_vec(&value).unwrap();shoal_proto::validate_json_frame(&bytes).unwrap();let back:WireValue=serde_json::from_slice(&bytes).unwrap();prop_assert_eq!(back,value);}
+ #[test]fn frame_decode_never_panics(bytes in prop::collection::vec(any::<u8>(),0..4096)){let _=shoal_proto::validate_json_frame(&bytes);let mut framed=bytes;framed.push(b'\n');let _=shoal_proto::read_frame(&mut std::io::Cursor::new(framed));}
  #[cfg(unix)]#[test]fn unix_path_bytes_roundtrip(bytes in prop::collection::vec(any::<u8>(),0..512)){let path=OsString::from_vec(bytes);prop_assert_eq!(WirePath::encode(&path).decode().unwrap(),path);}
 }
 fn leaf() -> impl Strategy<Value = WireValue> {
@@ -22,7 +22,10 @@ fn leaf() -> impl Strategy<Value = WireValue> {
         any::<String>().prop_map(|pattern| WireValue::Glob { pattern }),
         any::<String>().prop_map(|src| WireValue::Regex { src }),
         any::<String>().prop_map(|repr| WireValue::Closure { repr }),
-        any::<String>().prop_map(|label| WireValue::Stream { label }),
+        any::<String>().prop_map(|label| WireValue::Stream {
+            label,
+            cursor: None
+        }),
         any::<String>().prop_map(|name| WireValue::Secret { name }),
         any::<String>().prop_map(|repr| WireValue::Cmd { repr }),
         (any::<i64>(), any::<i64>(), any::<bool>()).prop_map(|(start, end, inclusive)| {
@@ -67,24 +70,28 @@ fn wire_value() -> impl Strategy<Value = WireValue> {
                 any::<Option<i32>>(),
                 any::<bool>(),
                 any::<Option<String>>(),
+                any::<bool>(),
                 any::<String>(),
                 any::<i64>(),
                 any::<u32>(),
                 any::<String>(),
             )
-                .prop_map(|(out, status, ok, signal, err, dur_ns, pid, cmd)| {
-                    WireValue::Outcome {
-                        status,
-                        ok,
-                        signal,
-                        out: Box::new(out),
-                        err,
-                        dur_ns,
-                        pid,
-                        cmd,
-                        span: None,
+                .prop_map(
+                    |(out, status, ok, signal, streamed, err, dur_ns, pid, cmd)| {
+                        WireValue::Outcome {
+                            status,
+                            ok,
+                            signal,
+                            streamed,
+                            out: Box::new(out),
+                            err,
+                            dur_ns,
+                            pid,
+                            cmd,
+                            span: None,
+                        }
                     }
-                }),
+                ),
             prop::collection::vec(
                 (
                     prop::string::string_regex("[a-z]{1,6}").unwrap(),

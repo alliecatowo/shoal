@@ -88,6 +88,25 @@ export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
 rehash 2>/dev/null || true
 ```
 
+For a complete repository-managed install (main shell plus every companion and
+sandbox helper), prefer:
+
+```bash
+mise run install
+# or force a clean release rebuild first:
+mise run install:clean
+```
+
+`mise run install:check` executes every installed help/version contract and
+verifies that all ten executables and man pages are byte-identical to their
+current source artifacts.
+
+The repository-managed install and verification tasks deliberately build the
+entire release workspace. Do not replace that bootstrap with a package-only
+`cargo build -p shoal --release`: Cargo feature unification can select a
+different cached top-level artifact, making a correct installation appear
+stale (or allowing a stale companion artifact to escape verification).
+
 `rehash` is useful in zsh after a new executable appears; it is harmlessly skipped elsewhere.
 
 ### `shoal lsp` or `shoal mcp` cannot launch companion
@@ -243,6 +262,20 @@ shoal fmt --check file.shl
 
 Formatting is available only for a complete parse. Fix the single published syntax diagnostic, save, then format. The LSP does not currently offer recovery code actions.
 
+If the parse is complete but the document contains a comment or shebang, the LSP deliberately
+returns no edit and publishes a `format_trivia` warning at the first unpreservable `#`. `shoal fmt`
+uses the same decision and leaves the source unchanged. Remove the trivia only if that is intended;
+otherwise wait for the planned lossless formatter. A `#` inside a string or command word does not
+trigger this refusal.
+
+### Formatter refuses a file's link or metadata
+
+`shoal fmt` will not replace a symbolic link, a file owned by another Unix user, or a changed file
+whose ACLs/extended attributes cannot survive atomic replacement. Format the regular target path
+directly. If metadata is intentional, copy the source to an ordinary file, format and review it,
+then apply the result with a metadata-aware deployment tool. `shoal fmt --check` makes no replacement
+and can inspect an extended-metadata file, but it still refuses links so the checked path is explicit.
+
 ### Error span looks like bytes, not characters
 
 Kernel/language spans are UTF-8 byte offsets. LSP converts them to UTF-16 positions for editors. A raw client must perform the same conversion rather than treating offsets as Unicode scalar indexes.
@@ -299,7 +332,7 @@ or restart the session. `reef add` explicitly invalidates the cache. This is a c
 
 ### Tool works interactively but script says unlocked
 
-Interactive policy can resolve/write a lock; script policy requires reproducibility and rejects an unlocked constrained tool. Run `reef lock` intentionally, inspect/commit the lockfile, then rerun the script.
+Interactive policy can resolve/write a lock; script policy rejects an unmaterialized constrained tool. Run `reef lock` intentionally on that host, inspect it, then rerun the script. Commit exact manifest constraints, not `reef.lock`: its absolute paths and byte hashes are host-local.
 
 ### Hermetic Reef cannot find ordinary tools
 
@@ -320,13 +353,14 @@ Read the structured error instead of deleting the lock reflexively. A lock misma
 
 ### Nested `spawn` resolves differently
 
-Nested evaluators do not consistently inherit parent Reef/Leash context in the current preview. This is a security/reproducibility defect. Avoid scoped-agent nested execution and use OS process isolation; do not “fix” it by widening policy. See [Security](@/docs/security.md#nested-evaluator-policy-propagation-is-incomplete).
+Nested evaluators now build through one audited child context that carries Reef, Leash identity/policy, filesystem port, and cancellation behavior. If nested behavior differs, treat it as a regression: capture the exact route (`spawn`, script, parallel, stream, or channel), compare the top-level and nested denial, and do not “fix” it by widening policy. See [Security](@/docs/security.md#nested-evaluator-policy-propagation).
 
 ## Journal, history, GC, and undo
 
 ### `shoal-history` returns nothing
 
-It defaults to XDG **data**, while main shell/kernel normally use XDG **state**:
+It loads layered `journal.state_dir`, then falls back to the same XDG state root as the shell. Check
+for a relative configured root and the process startup cwd. For an explicitly rooted durable kernel:
 
 ```bash
 STATE="${XDG_STATE_HOME:-$HOME/.local/state}/shoal"
@@ -381,14 +415,14 @@ That entry recorded no typed inverse. Undo is not command replay in reverse and 
 
 ### `secret.get` cannot find a value set by `shoal-secret`
 
-Check path mismatch:
+Check discovery inputs:
 
 ```bash
 printf 'SHOAL_SECRET_DIR=%s\n' "${SHOAL_SECRET_DIR-}"
 printf 'XDG_DATA_HOME=%s\n' "${XDG_DATA_HOME-}"
 ```
 
-The evaluator honors `SHOAL_SECRET_DIR`; the CLI ignores it and writes under XDG data. Align the stores as described in [Companion CLI reference](@/docs/companion-cli-reference.md#path-mismatch).
+The evaluator and CLI both honor `SHOAL_SECRET_DIR`, then use the XDG data fallback. Make sure both processes receive the same nonempty override and start from the same directory if it is relative.
 
 ### Stored secret has an unexpected newline
 
@@ -481,17 +515,18 @@ and start/supervise `shoal-kernel --policy ... --state-dir ...` yourself.
 
 ### New token is rejected
 
-Check store alignment and restart:
+Check store alignment:
 
 ```bash
 printf 'CLI store=%s\n' "${SHOAL_TOKEN_STORE:-${XDG_STATE_HOME:-$HOME/.local/state}/shoal/tokens.json}"
 ```
 
-Kernel reads `<--state-dir>/tokens.json` once at startup. A token created afterward is invisible until kernel restart.
+Kernel validation reads explicit `--token-store`, then nonempty `SHOAL_TOKEN_STORE`, then `<--state-dir>/tokens.json` under a shared lock. A newly created token is visible immediately; if attach still fails, confirm the CLI and supervised kernel inherited the same absolute override.
 
 ### Revoked token still works
 
-Same reload limitation: restart the kernel, and stop existing MCP processes carrying the bearer. Expiry is checked live, but file revocation is not reloaded.
+Revocation is checked before every attached request. The next request fails `AUTH_FAILED` and clears
+the attachment; if it does not, compare the kernel's explicit flag/environment with the CLI override.
 
 ### Token lists `--cap`, but action denied
 
@@ -510,7 +545,7 @@ Inspect structured `data`, current principal/session, plan resource, and policy.
 
 ### `APPROVAL_REQUIRED` (`-32011`)
 
-Plan first, display source/effects, obtain authorized review, then apply. Current raw approval routing is not secure against an untrusted socket peer; keep the socket fully trusted.
+Plan first, display source/effects, obtain review from an authenticated distinct approver (or an explicitly enabled self-ack setup), then apply. Check the structured error for requester/approver identity and required `supervisor`/`plan.approve` authority.
 
 ### `UNKNOWN_PLAN` after planning
 
@@ -519,9 +554,9 @@ Causes:
 - kernel restart;
 - wrong kernel/socket/session;
 - reference typo;
-- same-shape plan collision overwrote the process-global map.
+- the owning principal+Session generation was evicted or replaced.
 
-Derive a fresh plan, inspect it, and apply promptly. Do not persist plan refs as durable IDs.
+Derive a fresh plan, inspect it, and apply. Plan refs are collision-resistant distinct objects but remain in-memory; do not persist them as durable IDs.
 
 ### `caps_enforced` is false
 
@@ -584,7 +619,7 @@ By design, `timeout_ms` limits synchronous waiting and returns a task if work co
 
 Cancellation is requested/cooperative; descendant cleanup is not a universal transaction. Wait for task terminal state and inspect system processes/artifacts. Do not call the same effectful operation again until reconciled.
 
-### Missing event sequence or `{dropped, latest_seq}`
+### Missing event sequence or `{dropped, dropped_bytes, latest_seq}`
 
 The per-subscriber queue overflowed or ring history aged out. Pull from the last persisted cursor:
 
@@ -648,9 +683,12 @@ Kernel/MCP use `$TMPDIR/shoal-UID/...`; doctor may probe `$TMPDIR/shoal/...` ins
 
 The running kernel may lack Landlock or usable ABI; there is no namespace fallback installed. `caps_enforced` remains false. Upgrade/use an appropriate kernel or contain the entire service externally; do not treat advisory policy as OS confinement.
 
-### Network policy is not enforced by OS
+### A network allowlist is not enforced by OS
 
-Even with Landlock/Seatbelt filesystem enforcement, current `network_enforced` is false. Use an external network namespace/firewall/container/service sandbox for a hard network boundary.
+Shoal can enforce coarse network denial with Landlock ABI 4+ (TCP bind/connect) or Seatbelt, and
+reports that as `network_enforced`. It cannot enforce hostname/port allowlists for opaque children.
+Use an external network namespace/firewall/container/service sandbox when you need selective access
+or coverage beyond the platform backend.
 
 ### GNU/BSD command differences
 

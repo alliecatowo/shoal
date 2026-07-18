@@ -7,7 +7,7 @@
 //! namespace has no runtime representation of its own, only its members do.
 
 use crate::Evaluator;
-use shoal_value::{CallArgs, ErrorVal, Record, VResult, Value, json_to_value, value_to_json};
+use shoal_value::{CallArgs, ErrorVal, Record, VResult, Value};
 use std::time::Duration;
 
 /// The namespace names intercepted before ordinary variable resolution. A name
@@ -41,11 +41,9 @@ pub(crate) fn call_method(
     method: &str,
     args: CallArgs,
 ) -> VResult<Value> {
+    crate::namespace_signatures::validate(ns, method, &args)?;
     match ns {
-        "json" => json_ns(method, args),
-        "yaml" => yaml_ns(method, args),
-        "toml" => toml_ns(method, args),
-        "csv" => csv_ns(method, args),
+        "json" | "yaml" | "toml" | "csv" => crate::data_codecs::call(ns, method, args),
         "math" => math_ns(method, args),
         "http" => ev.http_ns(method, args),
         "os" => ev.os_ns(method, args),
@@ -57,7 +55,52 @@ pub(crate) fn call_method(
     }
 }
 
-// --- json / yaml / toml / csv -------------------------------------------------
+#[cfg(test)]
+mod signature_tests {
+    use super::*;
+
+    #[test]
+    fn namespace_calls_reject_extra_or_unknown_arguments_before_dispatch() {
+        let mut evaluator = Evaluator::new("/".into());
+        for (namespace, method, args) in [
+            (
+                "math",
+                "sqrt",
+                CallArgs {
+                    pos: vec![Value::Int(4), Value::Int(999)],
+                    named: vec![],
+                },
+            ),
+            (
+                "json",
+                "parse",
+                CallArgs {
+                    pos: vec![Value::Str("1".into()), Value::Int(999)],
+                    named: vec![],
+                },
+            ),
+            (
+                "http",
+                "get",
+                CallArgs {
+                    pos: vec![Value::Str("https://example.invalid".into())],
+                    named: vec![("surprise".into(), Value::Bool(true))],
+                },
+            ),
+            (
+                "config",
+                "all",
+                CallArgs {
+                    pos: vec![Value::Null],
+                    named: vec![],
+                },
+            ),
+        ] {
+            let error = call_method(&mut evaluator, namespace, method, args).unwrap_err();
+            assert_eq!(error.code, "arg_error", "{namespace}.{method}: {error:?}");
+        }
+    }
+}
 
 fn one_str<'a>(args: &'a CallArgs, what: &str) -> VResult<&'a str> {
     match args.pos.first() {
@@ -70,161 +113,6 @@ fn one_str<'a>(args: &'a CallArgs, what: &str) -> VResult<&'a str> {
             "{what} expects a str argument"
         ))),
     }
-}
-
-fn json_ns(method: &str, args: CallArgs) -> VResult<Value> {
-    match method {
-        "parse" => {
-            let s = one_str(&args, "json.parse")?;
-            let j: serde_json::Value = serde_json::from_str(s)
-                .map_err(|e| ErrorVal::arg_error(format!("json.parse: {e}")))?;
-            Ok(json_to_value(&j))
-        }
-        "stringify" => {
-            let v = args
-                .pos
-                .first()
-                .ok_or_else(|| ErrorVal::arg_error("json.stringify expects a value"))?;
-            let pretty =
-                named_bool(&args, "pretty") || matches!(args.pos.get(1), Some(Value::Bool(true)));
-            let j = value_to_json(v);
-            let out = if pretty {
-                serde_json::to_string_pretty(&j)
-            } else {
-                serde_json::to_string(&j)
-            }
-            .map_err(|e| ErrorVal::new("custom", format!("json.stringify: {e}")))?;
-            Ok(Value::Str(out))
-        }
-        _ => unknown_method("json", method),
-    }
-}
-
-fn yaml_ns(method: &str, args: CallArgs) -> VResult<Value> {
-    match method {
-        "parse" => {
-            let s = one_str(&args, "yaml.parse")?;
-            let j: serde_json::Value = serde_norway::from_str(s)
-                .map_err(|e| ErrorVal::arg_error(format!("yaml.parse: {e}")))?;
-            Ok(json_to_value(&j))
-        }
-        "stringify" => {
-            let v = args
-                .pos
-                .first()
-                .ok_or_else(|| ErrorVal::arg_error("yaml.stringify expects a value"))?;
-            serde_norway::to_string(&value_to_json(v))
-                .map(Value::Str)
-                .map_err(|e| ErrorVal::new("custom", format!("yaml.stringify: {e}")))
-        }
-        _ => unknown_method("yaml", method),
-    }
-}
-
-fn toml_ns(method: &str, args: CallArgs) -> VResult<Value> {
-    match method {
-        "parse" => {
-            let s = one_str(&args, "toml.parse")?;
-            let j: serde_json::Value =
-                toml::from_str(s).map_err(|e| ErrorVal::arg_error(format!("toml.parse: {e}")))?;
-            Ok(json_to_value(&j))
-        }
-        "stringify" => {
-            let v = args
-                .pos
-                .first()
-                .ok_or_else(|| ErrorVal::arg_error("toml.stringify expects a value"))?;
-            toml::to_string(&value_to_json(v))
-                .map(Value::Str)
-                .map_err(|e| {
-                    ErrorVal::new(
-                        "arg_error",
-                        format!("toml.stringify: {e} (toml needs a record/table at the top level)"),
-                    )
-                })
-        }
-        _ => unknown_method("toml", method),
-    }
-}
-
-fn csv_ns(method: &str, args: CallArgs) -> VResult<Value> {
-    match method {
-        "parse" => {
-            let s = one_str(&args, "csv.parse")?;
-            let mut rdr = csv::ReaderBuilder::new()
-                .has_headers(true)
-                .from_reader(s.as_bytes());
-            let headers = rdr
-                .headers()
-                .map_err(|e| ErrorVal::arg_error(format!("csv.parse: {e}")))?
-                .clone();
-            let mut rows = Vec::new();
-            for rec in rdr.records() {
-                let rec = rec.map_err(|e| ErrorVal::arg_error(format!("csv.parse: {e}")))?;
-                let mut r = Record::new();
-                for (h, field) in headers.iter().zip(rec.iter()) {
-                    r.insert(h.to_string(), Value::Str(field.to_string()));
-                }
-                rows.push(r);
-            }
-            Ok(Value::Table(rows))
-        }
-        "stringify" => {
-            let v = args
-                .pos
-                .first()
-                .ok_or_else(|| ErrorVal::arg_error("csv.stringify expects a table"))?;
-            csv_stringify(v)
-        }
-        _ => unknown_method("csv", method),
-    }
-}
-
-fn csv_stringify(v: &Value) -> VResult<Value> {
-    let rows: Vec<&Record> = match v {
-        Value::Table(rows) => rows.iter().collect(),
-        Value::List(xs) => xs
-            .iter()
-            .map(|x| match x {
-                Value::Record(r) => Ok(r),
-                other => Err(ErrorVal::type_error(format!(
-                    "csv.stringify expects a list of records, found a {}",
-                    other.type_name()
-                ))),
-            })
-            .collect::<VResult<Vec<_>>>()?,
-        Value::Record(r) => vec![r],
-        other => {
-            return Err(ErrorVal::type_error(format!(
-                "csv.stringify expects a table, found {}",
-                other.type_name()
-            )));
-        }
-    };
-    let mut wtr = csv::Writer::from_writer(Vec::new());
-    if let Some(first) = rows.first() {
-        let headers: Vec<&str> = first.keys().map(String::as_str).collect();
-        wtr.write_record(&headers)
-            .map_err(|e| ErrorVal::new("custom", format!("csv.stringify: {e}")))?;
-        for row in &rows {
-            let fields: Vec<String> = first
-                .keys()
-                .map(|k| match row.get(k) {
-                    Some(Value::Str(s)) => s.clone(),
-                    Some(other) => shoal_value::render::render_inline(other),
-                    None => String::new(),
-                })
-                .collect();
-            wtr.write_record(&fields)
-                .map_err(|e| ErrorVal::new("custom", format!("csv.stringify: {e}")))?;
-        }
-    }
-    let bytes = wtr
-        .into_inner()
-        .map_err(|e| ErrorVal::new("custom", format!("csv.stringify: {e}")))?;
-    String::from_utf8(bytes)
-        .map(Value::Str)
-        .map_err(|_| ErrorVal::new("utf8_error", "csv.stringify produced non-UTF-8"))
 }
 
 // --- math ---------------------------------------------------------------------
@@ -302,12 +190,6 @@ fn math_ns(method: &str, args: CallArgs) -> VResult<Value> {
     Ok(Value::Float(r))
 }
 
-// --- shared helpers -----------------------------------------------------------
-
-fn named_bool(args: &CallArgs, name: &str) -> bool {
-    matches!(args.get_named(name), Some(Value::Bool(true)))
-}
-
 fn unknown_method(ns: &str, method: &str) -> VResult<Value> {
     Err(ErrorVal::new(
         "field_missing",
@@ -322,6 +204,19 @@ fn unknown_method(ns: &str, method: &str) -> VResult<Value> {
 const HTTP_BODY_CAP: u64 = 64 * 1024 * 1024;
 /// Global per-request timeout (site/content/internals/roadmap-and-priorities.md "timeout").
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Build the evaluator's capability-safe HTTP transport. Planning authorizes
+/// the literal request authority only, so ambient proxy routing and automatic
+/// redirects would connect to endpoints absent from the approved plan.
+pub(crate) fn http_agent() -> ureq::Agent {
+    let config = ureq::Agent::config_builder()
+        .timeout_global(Some(HTTP_TIMEOUT))
+        .http_status_as_error(false)
+        .proxy(None)
+        .max_redirects(0)
+        .build();
+    ureq::Agent::new_with_config(config)
+}
 
 impl Evaluator {
     pub(crate) fn http_ns(&mut self, method: &str, args: CallArgs) -> VResult<Value> {
@@ -347,30 +242,51 @@ impl Evaluator {
                 args.pos.get(idx)
             })
             .cloned();
-        let body_bytes = if has_body {
-            match args.pos.get(1) {
-                Some(v) => shoal_value::feed_bytes(v)
-                    .map_err(|e| ErrorVal::arg_error(format!("http.{method} body: {e}")))?,
-                None => Vec::new(),
-            }
+        let body_what = format!("http.{method} body");
+        let mut body_input = if has_body {
+            let value = args
+                .pos
+                .get(1)
+                .cloned()
+                .unwrap_or(Value::Str(String::new()));
+            let body = crate::finite_io::FiniteBody::from_value(value, &body_what).map_err(
+                |mut error| {
+                    error.msg = format!("{body_what}: {}", error.msg);
+                    error
+                },
+            )?;
+            Some(body.into_http_input(&body_what)?)
         } else {
-            Vec::new()
+            None
         };
 
-        let config = ureq::Agent::config_builder()
-            .timeout_global(Some(HTTP_TIMEOUT))
-            .http_status_as_error(false)
-            .build();
-        let agent = ureq::Agent::new_with_config(config);
+        let agent = http_agent();
 
-        let mut resp = match method {
+        let response = match method {
             "get" => with_headers(agent.get(&url), &headers_rec).call(),
             "delete" => with_headers(agent.delete(&url), &headers_rec).call(),
-            "post" => with_headers(agent.post(&url), &headers_rec).send(&body_bytes[..]),
-            "put" => with_headers(agent.put(&url), &headers_rec).send(&body_bytes[..]),
+            "post" => send_http_body(
+                with_headers(agent.post(&url), &headers_rec),
+                body_input.as_mut().expect("POST request body was prepared"),
+            ),
+            "put" => send_http_body(
+                with_headers(agent.put(&url), &headers_rec),
+                body_input.as_mut().expect("PUT request body was prepared"),
+            ),
             _ => unreachable!(),
-        }
-        .map_err(|e| ErrorVal::new("net_error", format!("http.{method}: {e}")))?;
+        };
+        let mut resp = match response {
+            Ok(response) => response,
+            Err(_) if body_input.as_ref().is_some_and(|body| body.exceeded()) => {
+                return Err(crate::finite_io::http_body_limit(&body_what));
+            }
+            Err(error) => {
+                return Err(ErrorVal::new(
+                    "net_error",
+                    format!("http.{method}: {error}"),
+                ));
+            }
+        };
 
         let status = resp.status().as_u16() as i64;
         let ok = (200..300).contains(&status);
@@ -389,9 +305,7 @@ impl Evaluator {
             .map_err(|e| ErrorVal::new("net_error", format!("http.{method} body: {e}")))?;
         // `json`: the body parsed as JSON when it is valid JSON, else null. This
         // is the `resp.json` accessor of the typed response (site/content/internals/roadmap-and-priorities.md).
-        let json = serde_json::from_str::<serde_json::Value>(body.trim())
-            .map(|j| json_to_value(&j))
-            .unwrap_or(Value::Null);
+        let json = crate::data_codecs::http_json_projection(body.trim());
 
         let mut r = Record::new();
         r.insert("status".into(), Value::Int(status));
@@ -425,7 +339,7 @@ impl Evaluator {
             "uptime" => Ok(os_uptime()),
             "env" => {
                 let mut r = Record::new();
-                for (k, v) in &self.process_env {
+                for (k, v) in &self.exec.shell.process_env {
                     if let (Some(k), Some(v)) = (k.to_str(), v.to_str()) {
                         r.insert(k.to_string(), Value::Str(v.to_string()));
                     }
@@ -439,6 +353,8 @@ impl Evaluator {
     fn os_username(&self) -> String {
         for key in ["USER", "LOGNAME", "USERNAME"] {
             if let Some(v) = self
+                .exec
+                .shell
                 .process_env
                 .iter()
                 .find(|(k, _)| k == std::ffi::OsStr::new(key))
@@ -470,6 +386,19 @@ fn with_headers<T>(
     b
 }
 
+fn send_http_body(
+    request: ureq::RequestBuilder<ureq::typestate::WithBody>,
+    body: &mut crate::finite_io::HttpInput,
+) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+    match body {
+        crate::finite_io::HttpInput::Owned(bytes) => request.send(bytes.as_slice()),
+        crate::finite_io::HttpInput::Shared(bytes) => request.send(bytes.as_slice()),
+        crate::finite_io::HttpInput::Reader(reader) => {
+            request.send(ureq::SendBody::from_reader(reader))
+        }
+    }
+}
+
 fn os_hostname() -> String {
     let mut buf = vec![0u8; 256];
     // SAFETY: `gethostname` writes at most `buf.len()` bytes into `buf`.
@@ -482,22 +411,46 @@ fn os_hostname() -> String {
 }
 
 fn os_username_libc() -> Option<String> {
-    // SAFETY: `getpwuid` returns a pointer into a static buffer; we copy the name
-    // out immediately without retaining the pointer.
-    unsafe {
-        let pw = libc::getpwuid(libc::getuid());
-        if pw.is_null() {
+    const FALLBACK_BYTES: usize = 16 * 1024;
+    const MAX_BYTES: usize = 1024 * 1024;
+    // `getpwuid` uses process-global static storage and is unsafe under the
+    // kernel's concurrent evaluator threads. The reentrant API writes both the
+    // passwd record and all pointed-to strings into this caller-owned buffer.
+    let hint = unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) };
+    let mut bytes = usize::try_from(hint)
+        .unwrap_or(FALLBACK_BYTES)
+        .clamp(1024, MAX_BYTES);
+    loop {
+        let mut buffer = vec![0u8; bytes];
+        // SAFETY: an all-zero passwd is a valid output slot; getpwuid_r fills it
+        // and points its string fields into `buffer` on success.
+        let mut record = unsafe { std::mem::zeroed::<libc::passwd>() };
+        let mut result = std::ptr::null_mut();
+        let rc = unsafe {
+            libc::getpwuid_r(
+                libc::getuid(),
+                &raw mut record,
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &raw mut result,
+            )
+        };
+        if rc == libc::ERANGE && bytes < MAX_BYTES {
+            bytes = bytes.saturating_mul(2).min(MAX_BYTES);
+            continue;
+        }
+        if rc != 0 || result.is_null() || record.pw_name.is_null() {
             return None;
         }
-        let name = (*pw).pw_name;
-        if name.is_null() {
+        let base = buffer.as_ptr() as usize;
+        let name = record.pw_name as usize;
+        let offset = name.checked_sub(base)?;
+        let tail = buffer.get(offset..)?;
+        let end = tail.iter().position(|byte| *byte == 0)?;
+        if end == 0 {
             return None;
         }
-        Some(
-            std::ffi::CStr::from_ptr(name)
-                .to_string_lossy()
-                .into_owned(),
-        )
+        return Some(String::from_utf8_lossy(&tail[..end]).into_owned());
     }
 }
 
@@ -529,11 +482,11 @@ fn os_uptime() -> Value {
 /// this is an empty record, so `config.all` is `{}` and `config.get(key)` is
 /// `null` — the same zero-config answer as before, with no filesystem walk.
 fn config_record(ev: &Evaluator) -> VResult<Value> {
-    Ok(ev.config.snapshot().clone())
+    Ok(ev.host.config.snapshot().clone())
 }
 
 fn config_get(ev: &Evaluator, key: &str) -> VResult<Value> {
-    match ev.config.snapshot() {
+    match ev.host.config.snapshot() {
         Value::Record(r) => Ok(r.get(key).cloned().unwrap_or(Value::Null)),
         _ => Ok(Value::Null),
     }
@@ -547,5 +500,180 @@ fn config_ns(ev: &mut Evaluator, method: &str, args: CallArgs) -> VResult<Value>
             config_get(ev, key)
         }
         _ => unknown_method("config", method),
+    }
+}
+
+#[cfg(test)]
+mod os_boundary_tests {
+    use super::os_username_libc;
+
+    #[test]
+    fn concurrent_username_lookup_uses_only_caller_owned_storage() {
+        let expected = os_username_libc();
+        let threads = (0..32)
+            .map(|_| {
+                std::thread::spawn(|| (0..100).map(|_| os_username_libc()).collect::<Vec<_>>())
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            assert!(thread.join().unwrap().iter().all(|name| name == &expected));
+        }
+    }
+}
+
+#[cfg(test)]
+mod http_body_tests {
+    use super::*;
+    use shoal_value::{BytesLoad, CasBytesVal};
+    use std::io::{Read as _, Write as _};
+    use std::sync::Arc;
+
+    struct MustNotOpen;
+
+    impl BytesLoad for MustNotOpen {
+        fn load(&self) -> std::io::Result<Vec<u8>> {
+            panic!("oversized HTTP body must not load its CAS blob")
+        }
+
+        fn open(&self) -> std::io::Result<Box<dyn std::io::Read + Send>> {
+            panic!("oversized HTTP body must not open its CAS blob")
+        }
+    }
+
+    struct StreamingLoader(Vec<u8>);
+
+    impl BytesLoad for StreamingLoader {
+        fn load(&self) -> std::io::Result<Vec<u8>> {
+            panic!("HTTP CAS transport must use open(), not load()")
+        }
+
+        fn open(&self) -> std::io::Result<Box<dyn std::io::Read + Send>> {
+            Ok(Box::new(std::io::Cursor::new(self.0.clone())))
+        }
+    }
+
+    #[test]
+    fn oversized_cas_request_is_denied_before_socket_connection() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = Value::CasBytes(Arc::new(CasBytesVal {
+            hash: "b".repeat(64),
+            len: crate::finite_io::FINITE_BODY_MAX_BYTES as u64 + 1,
+            preview: Arc::new(Vec::new()),
+            truncated: false,
+            loader: Arc::new(MustNotOpen),
+        }));
+        let mut evaluator = Evaluator::new(std::env::current_dir().unwrap());
+        let error = evaluator
+            .http_ns(
+                "post",
+                CallArgs {
+                    pos: vec![Value::Str(format!("http://{address}/")), body],
+                    named: Vec::new(),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "http_body_limit");
+        assert!(matches!(
+            listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+    }
+
+    #[test]
+    fn small_resident_http_body_roundtrips_with_content_length() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !request.windows(b"hello".len()).any(|part| part == b"hello") {
+                let count = socket.read(&mut chunk).unwrap();
+                assert!(count > 0, "request ended before its body arrived");
+                request.extend_from_slice(&chunk[..count]);
+            }
+            let request_text = String::from_utf8_lossy(&request).to_ascii_lowercase();
+            assert!(
+                request_text.contains("content-length: 5"),
+                "resident bodies keep the sized transport path: {request_text}"
+            );
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+        });
+
+        let mut evaluator = Evaluator::new(std::env::current_dir().unwrap());
+        let response = evaluator
+            .http_ns(
+                "post",
+                CallArgs {
+                    pos: vec![
+                        Value::Str(format!("http://{address}/")),
+                        Value::Str("hello".into()),
+                    ],
+                    named: Vec::new(),
+                },
+            )
+            .unwrap();
+        server.join().unwrap();
+        let Value::Record(response) = response else {
+            panic!("HTTP response must be a record")
+        };
+        assert_eq!(response.get("status"), Some(&Value::Int(200)));
+        assert_eq!(response.get("body"), Some(&Value::Str("ok".into())));
+    }
+
+    #[test]
+    fn small_cas_http_body_uses_incremental_chunked_transport() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !request
+                .windows(b"cas-body".len())
+                .any(|part| part == b"cas-body")
+            {
+                let count = socket.read(&mut chunk).unwrap();
+                assert!(count > 0, "request ended before its CAS body arrived");
+                request.extend_from_slice(&chunk[..count]);
+            }
+            let request_text = String::from_utf8_lossy(&request).to_ascii_lowercase();
+            assert!(request_text.contains("transfer-encoding: chunked"));
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+        });
+        let body = Value::CasBytes(Arc::new(CasBytesVal {
+            hash: "c".repeat(64),
+            len: 8,
+            preview: Arc::new(b"cas".to_vec()),
+            truncated: false,
+            loader: Arc::new(StreamingLoader(b"cas-body".to_vec())),
+        }));
+        let mut evaluator = Evaluator::new(std::env::current_dir().unwrap());
+        let response = evaluator
+            .http_ns(
+                "post",
+                CallArgs {
+                    pos: vec![Value::Str(format!("http://{address}/")), body],
+                    named: Vec::new(),
+                },
+            )
+            .unwrap();
+        server.join().unwrap();
+        let Value::Record(response) = response else {
+            panic!("HTTP response must be a record")
+        };
+        assert_eq!(response.get("status"), Some(&Value::Int(200)));
     }
 }

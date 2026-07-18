@@ -8,13 +8,13 @@ template = "docs/page.html"
 eyebrow = "Protocol reference"
 group = "Agents & protocol"
 audience = "Kernel client implementers and Shoal maintainers"
-status = "Current implementation, including known security defects"
+status = "Current implementation, including explicit security boundaries"
 toc = true
 +++
 
 `shoal-kernel` serves JSON-RPC 2.0 over a Unix-domain socket. Each request or response is one compact JSON object followed by a newline. The API is useful for native clients that need methods not exposed by MCP, but it is a lower-level and less protected boundary: clients own framing, attachment, notification demultiplexing, resource limits, and reconnect behavior.
 
-> **Security warning:** socket possession must currently be treated as full kernel trust. `cap.request` and `journal.query` are mistakenly routed without requiring `session.attach`; the latter can disclose global journal source/AST/effects/output hashes, while the former can approve a known non-denied plan without authenticating its caller. Keep the socket in a private `0700` directory with a `0600` socket, do not proxy it to untrusted peers, and read [Security and trust boundaries](@/docs/security.md).
+> **Security boundary:** every stateful method, including `journal.query` and `cap.request`, requires an attachment and enforces its owner/approver rules. Tokenless public attachment becomes restricted `agent:mcp`; a public client cannot assert local-human authority. Named kernels can require bearers and same-effective-UID OS peer credentials with `--require-token --require-peer-uid`. Keep the socket in a private `0700` directory with mode `0600` anyway: same-UID processes, credential theft, shared-process resources, and incomplete OS enforcement still make arbitrary forwarding unsafe. See [Security and trust boundaries](@/docs/security.md).
 
 ## Transport
 
@@ -37,11 +37,18 @@ Wire rules:
 - Unix-domain stream socket only;
 - UTF-8 JSON text;
 - exactly one JSON value per newline-delimited frame;
-- maximum input line length 16 MiB;
+- maximum JSON content length 16 MiB (the line terminator is not content);
+- maximum structural depth 64, 65,536 values total, and 16,384 items/members per container;
+- maximum decoded object key 64 KiB and numeric token 1 KiB;
 - JSON-RPC version string must be `"2.0"`;
 - request IDs are arbitrary JSON values and are echoed verbatim;
 - subscription notifications have no `id`;
 - multiple requests may share a connection, but clients must demultiplex responses by `id` because event notifications can interleave.
+
+The dispatcher classifies every routed method before entering a handler. Only `session.attach`,
+`parse`, and `complete` are reachable without an attachment; every stateful method returns
+`NOT_ATTACHED` before decoding its parameters. Unknown names remain `METHOD_NOT_FOUND` regardless
+of attachment state.
 
 Request:
 
@@ -69,7 +76,14 @@ Failure:
 }
 ```
 
-The raw kernel reader does not produce a `-32700` response for malformed JSON. A bad JSON frame or a line over 16 MiB ends that connection. The MCP stdio facade, by contrast, reports malformed MCP JSON as `-32700`.
+The raw kernel reader does not produce a `-32700` response for malformed JSON. A bad, over-complex,
+or over-16-MiB JSON frame ends that connection. The byte limit is applied during accumulation and a
+nonallocating lexical preflight applies the complexity limits before tree decoding. Public
+connections default to a 10-second first-byte/remainder deadline. The MCP stdio facade instead
+reports malformed MCP JSON as `-32700` and uses the same framing preflight for kernel responses.
+Once attached, closing the client socket is a normal disconnect even when the host reports a
+reset/broken-pipe (or macOS timeout-update `EINVAL`) race; the kernel removes that connection's
+subscriptions without treating peer departure as a daemon failure.
 
 Use one writer lock per connection. A subscription writer in the kernel may emit a complete `event` frame while ordinary request handling is active, but the kernel serializes whole frames so bytes do not interleave.
 
@@ -110,7 +124,11 @@ Most methods require one successful attachment per connection:
 | `client.kind` | string | empty | Informational client kind. |
 | `client.tty` | boolean | `false` | Preserve terminal color in bounded renders when true. |
 
-Without a token, attachment grants the kernel process's local `uid:<euid>` principal and `local-human` profile. The kernel does not authenticate the Unix peer with `SO_PEERCRED`; ability to reach the private socket is what protects this path. With a token, the token store supplies principal, profile, declared capabilities, expiry, and revocation state.
+Without a token, public attachment grants restricted `agent:mcp`, never local-human authority.
+`local-human` is accepted only on the anonymous endpoint inherited by the private REPL; public
+clients cannot manufacture it with `client.kind`, `tty`, or a bearer profile string. With a token,
+the current locked store supplies machine principal/profile/caps and the kernel revalidates that
+immutable identity before every later request.
 
 Representative result:
 
@@ -152,7 +170,8 @@ Intended read-only pre-attachment methods are:
 - `parse`;
 - `complete`.
 
-Current routing also permits `cap.request` and `journal.query` before attachment. That behavior is a P0 defect, not a supported anonymous API. A secure client or proxy must not reproduce it as an authorization rule.
+No other current method is public. In particular, `cap.request` and `journal.query` reject an
+unattached caller before approval or storage access.
 
 ## Method index
 
@@ -166,28 +185,43 @@ Current routing also permits `cap.request` and `journal.query` before attachment
 | `explain` | yes | Parse/accept AST and derive effects without storing/applying. |
 | `exec` | yes | Run, plan, or internally apply source. |
 | `value.get` | yes | Select/slice/render a transcript value. |
-| `blob.get` | yes | Read CAS content by hash. |
-| `journal.query` | **currently no** | Query global durable journal; missing gate is a defect. |
+| `blob.get` | yes | Read exact-owner journal CAS content; requires `JournalRead`. |
+| `journal.query` | yes | Query the attached principal/session's durable journal view. |
 | `task.list` | yes | List session tasks. |
 | `task.get` | yes | Snapshot a task. |
-| `task.await` | yes | Block until a task terminal state. |
+| `task.await` | yes | Bounded wait for terminal state; task continues on timeout. |
 | `task.cancel` | yes | Request cancellation. |
-| `task.suspend` | yes | Present but currently always unavailable. |
-| `task.resume` | yes | Present but currently always unavailable. |
+| `task.suspend` | yes | Stops active process groups; evaluator-only work is unavailable. |
+| `task.resume` | yes | Continues a suspended process-backed task. |
 | `plan.get` | yes | Inspect stored plan. |
 | `plan.list` | yes | List plans matching stored caller metadata. |
 | `plan.apply` | yes | Apply an allowed/approved stored plan. |
-| `cap.request` | **currently no** | Approve known plan; missing gate is a defect. |
+| `cap.request` | yes | Approve a known plan with explicit approver authority. |
+| `auth.token.list` | yes + `token.admin` | List durable token metadata. |
+| `auth.token.create` | yes + `token.admin` | Create and return one bearer exactly once. |
+| `auth.token.revoke` | yes + `token.admin` | Revoke a public token ID. |
 | `pty.open` | yes | Spawn interactive child. |
 | `pty.send` | yes | Write terminal input. |
 | `pty.read` | yes | Read emulated screen. |
 | `pty.resize` | yes | Resize grid/window. |
 | `pty.close` | yes | Terminate and reap. |
 | `pty.list` | yes | List session PTYs. |
-| `events.read` | yes | Cursor-read channel. |
+| `events.read` | yes | Cursor-read channel; `journal` requires `JournalRead`. |
 | `events.publish` | yes | Publish `user.*`. |
-| `events.subscribe` | yes | Push channel events on connection. |
+| `events.subscribe` | yes | Push channel events; `journal` requires `JournalRead`. |
 | `events.unsubscribe` | yes | Remove same-connection subscription. |
+
+## Token administration
+
+Durable kernels accept raw `auth.token.list {}`, `auth.token.create`, and `auth.token.revoke` only
+from an embedded server-established human or a bearer with exact `token.admin`. `supervisor` and
+`plan.approve` do not imply credential minting. MCP does not expose these as ordinary tools.
+
+Create params are `principal`, optional `profile` (default `default`), bounded `caps`, and optional
+positive `ttl_seconds`. Its result contains `token`, public `meta`, and `secret_shown_once:true`;
+the bearer/digest/key never appears in list. Revoke takes `{ "id": "16-hex-id" }` and returns a
+boolean, including `false` for a well-formed absent ID. Revocation invalidates a live attachment on
+its next request.
 
 ## Session inspection
 
@@ -273,6 +307,7 @@ Raw params:
   "position": "stmt",
   "async": false,
   "timeout_ms": 5000,
+  "deadline_ms": 30000,
   "elide": {
     "max_bytes": 8192,
     "max_rows": 100,
@@ -289,10 +324,17 @@ Raw params:
 | `position` | `stmt` | `stmt` raises a failed final outcome; `value` captures it. |
 | `async` | false | Alias `background` is also accepted during deserialization. |
 | `timeout_ms` | none | Converts unfinished work to a task; does not kill it. |
+| `deadline_ms` | none | Hard execution budget; expiry requests cancellation. Maximum 24 hours. |
 | `elide` | defaults | Optional thresholds. |
 | `plan_ref` | none | Required and verified for `mode: "approved"`. |
 
 Unlike MCP `shoal_exec`, the raw default position is `stmt`. Make position explicit in cross-surface code.
+
+`timeout_ms` is only a caller wait budget. `deadline_ms` is distinct: any request carrying it uses
+the owned task lifecycle, and a bounded watchdog requests the same continue/INT/TERM/KILL
+cancellation path as `task.cancel` when the budget expires. The effective value is capped at
+86,400,000 ms (24 hours). Task-start responses report `deadline_ms`/`deadline_clamped`; task records
+retain `deadline_ms` and `deadline_exceeded` so explicit cancellation is distinguishable from expiry.
 
 Completed success:
 
@@ -322,11 +364,11 @@ If timeout-backed work finishes before the deadline, the result is returned inli
 
 ### Planning and internal approval mode
 
-`mode: "plan"` derives policy effects, stores source/session/principal metadata, and inserts the plan under `plan:<16 hex>`. It returns:
+`mode: "plan"` derives policy effects, stores immutable source/AST/Session/principal metadata, and inserts a distinct in-memory plan object. It returns a reference shaped as `plan:<64-hex digest>:<16-hex object id>`:
 
 ```json
 {
-  "plan_ref": "plan:7b2fd854cb805ba1",
+  "plan_ref": "plan:<full-digest>:0000000000000001",
   "effects": [{"kind":"fs_write","path":"./out"}],
   "reversibility": "conditional",
   "verdict": "approval_required",
@@ -334,7 +376,7 @@ If timeout-backed work finishes before the deadline, the result is returned inli
 }
 ```
 
-The reference hashes effects, reversibility, and estimates—not source, session, or principal—and is truncated to 16 hex characters. One global map uses it as the key, so same-shape plans can overwrite across callers. Stored metadata is checked during get/apply/approved execution and prevents a direct source swap, but the handle is collision-prone and ephemeral.
+The digest binds full source, canonical AST, effects, reversibility, estimates, Session, and requester. The object suffix prevents even identical repeated plans from overwriting one another. Stored metadata is rechecked during get/apply/approved execution. The handle is still ephemeral and disappears on restart.
 
 Clients should never send `mode: "approved"` directly as a privilege assertion. The handler requires a stored plan whose session, principal, exact source, and approval/allow state match. Use `plan.apply`.
 
@@ -360,21 +402,26 @@ Formats:
 - `render`: `{ref, render}` with bounded 80-column display;
 - `raw`: `{ref, raw}` for strings or `{ref, raw_base64}` for bytes/CAS bytes.
 
-Current `raw` behavior materializes and returns the complete string/bytes and does not apply the normal 64 KiB encoded hard cap. Callers must impose their own bound. Other types reject raw format with `BAD_PATH_OR_SLICE`.
+`raw` returns at most 8 KiB of decoded content plus `page` metadata. String slice offsets and `total_len` use Unicode scalar units; bytes/CAS values use byte units. Follow `page.next_offset` until `page.done`. CAS pages are integrity-verified and streamed without materializing the full blob. Verification/decompression starts are rate-limited per exact principal/session; the default is 64 per 10 seconds. Other types reject raw format with `BAD_PATH_OR_SLICE`.
+
+`blob.get` hashes are authorized only through output rows owned by the exact attached
+principal/Session and require the same `JournalRead` grant as `journal.query`, before hash/offset
+parameters are decoded. Live transcript content remains addressed through owner-scoped `value.get`.
 
 ### `blob.get`
 
 ```json
-{"hash":"8baef..."}
+{"hash":"8baef...","offset":0,"length":8192}
 ```
 
-Returns `{hash, value}`. A CAS blob containing tagged JSON is decoded structurally; other bytes return:
+Offset and length are uncompressed byte units and length is clamped to 8 KiB. Explicit ranges and oversized blobs return `{hash, encoding:"base64", raw_base64, page}`. Follow `page.next_offset` until done. Exact verified pages are cached in a process-local 1 MiB/256-entry LRU; a hit does not consume the owner's decompression budget. Distinct/random offsets miss the cache and the default 64-per-10-second exact-owner rate limit prevents unbounded repeated verification of compressed legacy blobs. Operators can tune this with `--max-blob-decompressions-per-window` and `--blob-decompression-window-ms`. For compatibility, an omitted range that contains the complete small blob still returns `{hash, value, page}`; tagged JSON is decoded structurally and other bytes use the tagged byte shape:
 
 ```json
 {"$":"bytes","len":1234,"v":"base64..."}
 ```
 
-The method currently reads a complete blob into the response and has no range parameter. Use content refs deliberately and account for response size.
+The complete-small-blob compatibility response is still bounded by the same page ceiling; larger
+objects require explicit continuation.
 
 ## Tasks
 
@@ -382,12 +429,12 @@ All task selectors use `{ "task": "task:7" }`.
 
 | Method | Behavior |
 | --- | --- |
-| `task.list {}` | Returns records whose session ID matches the attached session. |
-| `task.get` | Nonblocking record snapshot. |
-| `task.await` | Blocks the connection until state is no longer `running`/`cancelling`. |
-| `task.cancel` | Sets the cancellation token and returns `{task, cancel_requested:true}`. |
-| `task.suspend` | Always returns `-32020` today. |
-| `task.resume` | Always returns `-32020` today. |
+| `task.list {}` | Returns records whose exact principal/session owner matches the attachment. |
+| `task.get` | Nonblocking record and current-control snapshot. |
+| `task.await` | Waits up to `timeout_ms`; returns a current record with timeout metadata. |
+| `task.cancel` | Continues stopped groups, sets cancellation, and returns `{task, cancel_requested:true}`. |
+| `task.suspend` | Sends `SIGSTOP` to every process group active under the task epoch. |
+| `task.resume` | Sends `SIGCONT` to groups owned by a suspended task. |
 
 Record:
 
@@ -399,13 +446,27 @@ Record:
   "started_ns": 1750000000000000000,
   "finished_ns": 1750000000123000000,
   "result_ref": "out:12",
-  "error": null
+  "error": null,
+  "controls": {
+    "cancel": false,
+    "suspend": false,
+    "resume": false,
+    "active_process_groups": 0
+  }
 }
 ```
 
-Task access checks session name, not principal. Because multiple principals can attach to the same named session, a session is a collaboration/trust boundary rather than a principal-isolation boundary.
+`controls` is discovery, not a reservation. A running process-backed task advertises `suspend`; a
+suspended one advertises `resume`; evaluator-only and terminal work advertise neither. The child can
+finish after the record is read, so handle `TASK_CONTROL_UNAVAILABLE` even after a `true` snapshot.
 
-`task.await` has no timeout param and occupies the request path until terminal state. Prefer subscriptions/polling when the client must stay responsive.
+Task access checks the exact `(principal, session name)` owner. Another principal using the same
+visible name has a different evaluator, task namespace, and quota account.
+
+`task.await {task,timeout_ms?}` waits 30 seconds by default and clamps any requested wait to 60
+seconds. Explicit zero is a nonblocking snapshot. The additive `timed_out`, `wait_ms`, and
+`request_clamped` fields describe the wait; expiration does not cancel or otherwise mutate the task.
+Prefer subscriptions/polling when the client must stay continuously responsive.
 
 ## Plans and approval
 
@@ -419,7 +480,8 @@ Returns stored source, reparsed AST, effects, reversibility, current policy verd
 
 ### `plan.list`
 
-Params `{}`. Returns summaries whose stored metadata matches attached session and principal. A colliding insertion may already have overwritten an earlier plan, so absence does not necessarily mean it was never derived.
+Params `{}`. Returns summaries whose stored owner matches the attachment. Plan refs include a full
+content digest plus a unique object suffix, so identical plans remain distinct rather than colliding.
 
 ### `plan.apply`
 
@@ -438,9 +500,7 @@ Checks stored session/principal and approval/current allow verdict, then interna
 }
 ```
 
-Strings and object `kind` fields are normalized. When a nonempty requested set does not cover every stored plan effect kind, the result remains `approval_pending` and lists uncovered effects. If policy is `Deny`, the method returns `LEASH_DENIED`. Otherwise it sets `approved: true` and returns enforcement truth.
-
-**Current P0 defect:** the handler receives no attachment and verifies no caller principal/session. Anyone who can reach the socket and guess/learn a live plan reference can invoke it, including before `session.attach`. The MCP facade attaches its kernel connection first, but the kernel still does not use that attachment for this method. Do not expose the raw socket across a trust boundary.
+Strings and object `kind` fields are normalized. When a nonempty requested set does not cover every stored plan effect kind, the result remains `approval_pending` and lists uncovered effects. If policy is `Deny`, the method returns `LEASH_DENIED`. Otherwise the kernel reserves the transition, durably audits the immutable requester/approver/plan/source/Session/scope binding, and commits one-shot approval before returning enforcement truth. The method requires attachment. Self-approval is denied by default; a distinct approver needs embedded-human trust or an explicit `supervisor`/`plan.approve` bearer.
 
 ## Journal
 
@@ -460,9 +520,15 @@ Strings and object `kind` fields are normalized. When a nonempty requested set d
 
 Returns entries containing ID, session, principal, nanosecond timestamp/duration, encoded cwd, original source, AST, effect data, status/ok/opaque, and output descriptors `{kind, hash, len}`.
 
+The handler checks attachment and the principal's `JournalRead` policy before decoding filters. A
+missing grant returns `LEASH_DENIED`; a caller therefore cannot use malformed filters to probe the
+journal schema or existence of rows.
+
 `effects` uses all-of matching after normalizing dotted/snake-case names. `until` and effects are post-filters applied after the store query and its limit, so a tight limit can yield fewer results than requested even when older matching rows exist.
 
-**Current P0 disclosure defect:** this handler has no attachment check and queries the process-wide journal. An unauthenticated socket client can read source, AST, effects, principals, paths, and output hashes. Socket filesystem permissions are presently the only reliable boundary.
+Attachment is mandatory. The kernel overwrites the query's principal/session filters with the exact
+attachment owner before reading, so caller filters can narrow results but cannot cross principal or
+same-visible-name session boundaries.
 
 ## PTYs
 
@@ -484,7 +550,7 @@ Raw PTY params match the [MCP tool reference](@/docs/mcp-tools-reference.md#pty-
 {"pty_id":"pty:2","cols":120,"rows":40}
 ```
 
-`pty.read` returns screen rows, cursor, change/liveness/exit metadata; no raw ANSI stream is available. `pty.list {}` and all selectors are session-scoped, not principal-scoped. `pty.close` terminates and reaps rather than detaching.
+`pty.read` returns screen rows, cursor, change/liveness/exit metadata; no raw ANSI stream is available. `pty.list {}` and all selectors are scoped to the exact principal+Session owner. `pty.close` terminates and reaps rather than detaching.
 
 ## Events
 
@@ -531,7 +597,11 @@ Then the same connection receives:
 }
 ```
 
-Replay from `since` is enqueued through the same 256-entry subscriber queue as live events. Overflow emits a synthetic `{dropped, latest_seq}` payload. `journal` and `session.transcript` support journal-backed older replay; other channels retain only 1,024 in memory.
+Replay from `since` is enqueued through the same subscriber queue as live events, bounded at 256 entries and 512 KiB. Overflow emits `{dropped, dropped_bytes, latest_seq}`. Channel rings are bounded at 1,024 entries and 2 MiB. Pull-based `events.read` returns forward pages of at most 256 events (and 8 MiB); continue with `page.next_since`. `journal` and `session.transcript` support journal-backed older replay with bounded in-memory pointer windows; other channels lose history evicted by either ring wall. User publishes are admitted before cloning: 128-byte ASCII channel names, 64 KiB/64-level payloads, and 256 distinct user channels per exact owner.
+
+Reading or subscribing to the kernel-owned `journal` channel requires the attached principal's
+`JournalRead` grant before cursor fields are decoded or durable state is touched. Other channels keep
+their exact principal/Session attachment boundary; `events.unsubscribe` remains available for cleanup.
 
 ### Unsubscribe
 
@@ -539,7 +609,10 @@ Replay from `since` is enqueued through the same 256-entry subscriber queue as l
 {"channel":"task.7"}
 ```
 
-Removes that channel subscription for the current connection and stops its kernel writer queue. It cannot unsubscribe a separate connection. This raw method works; the MCP facade's `resources/unsubscribe` currently does not forward it.
+Removes that channel subscription for the current connection and stops its kernel writer queue. It
+cannot unsubscribe a separate connection. The MCP facade uses a separate connection per resource
+subscription; its `resources/unsubscribe` closes and joins that URI's owned worker instead of trying
+to issue this method on the request connection.
 
 ## Wire values
 
@@ -577,15 +650,16 @@ Tables are columnar. Every column array has exactly `n` entries, and a missing f
 
 Paths preserve non-UTF-8 Unix bytes by including lossy `v`/`display` plus optional base64 `raw`. When `raw` exists, it is authoritative for round-trip filesystem operations.
 
-### Current DateTime mismatch
+### DateTime encoding
 
-The protocol type comment promises RFC 3339, but the encoder currently emits Unix epoch seconds as a decimal string:
+DateTime values use the protocol type's RFC 3339 string form. The encoder formats the underlying
+`jiff::Timestamp`, including fractional seconds when present:
 
 ```json
-{"$":"datetime","v":"1750000123"}
+{"$":"datetime","v":"2026-07-17T08:42:48.127638635Z"}
 ```
 
-Clients should accept this exact current behavior and avoid presenting it as RFC 3339 without conversion. This mismatch is tracked as a protocol defect and may be corrected in a future incompatible/negotiated revision.
+Clients should parse `v` as RFC 3339 rather than assuming a fixed fractional-second precision.
 
 ### Elided references
 
@@ -624,11 +698,12 @@ RPC errors and Shoal language `error` values are separate. The former control th
 | `-32010` | Leash denied | Policy denial or cross-session/principal plan access. |
 | `-32011` | approval required | Plan/effects need approval. |
 | `-32012` | unknown plan | Stored plan missing/expired/overwritten. |
-| `-32020` | task control unavailable | Suspend/resume not implemented for kernel task. |
+| `-32020` | task control unavailable | Task/state has no active process-control backend. |
 | `-32021` | unknown task | Missing or other-session task. |
 | `-32022` | unknown PTY | Missing, closed, or other-session PTY. |
 | `-32023` | PTY spawn failed | Executable/sandbox/PTY setup failure. |
 | `-32030` | auth failed | Token unavailable/invalid/expired/revoked. |
+| `-32040` | quota exceeded | A connection/session/task/PTY/subscription budget is full. |
 
 Do not branch on error message prose. Branch on numeric code, then use structured `data` when present. Preserve unknown codes for forward compatibility.
 

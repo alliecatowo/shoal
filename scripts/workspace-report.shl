@@ -1,0 +1,30 @@
+#!/usr/bin/env shoal
+# Build a live workspace inventory from Cargo metadata and the Rust source tree.
+
+let metadata_result = run("cargo", "metadata", "--format-version", "1", "--no-deps")
+assert(metadata_result.ok, "cargo metadata failed: {metadata_result.stderr}")
+let metadata = metadata_result.out
+
+let rows = metadata.packages.map(package => {
+  let root = path(package.manifest_path).parent
+  let sources = glob(root.join("src/**/*.rs").display()).expand()
+  let source_lines = sources.map(file => file.read.lines().len()).sum()
+  {
+    crate: package.name,
+    version: package.version,
+    rust_files: sources.len(),
+    rust_lines: source_lines,
+    targets: package.targets.len(),
+    direct_dependencies: package.dependencies.len(),
+  }
+}).sort_by(.crate)
+
+{
+  workspace: metadata.workspace_root,
+  crates: rows.len(),
+  rust_files: rows.map(.rust_files).sum(),
+  rust_lines: rows.map(.rust_lines).sum(),
+  direct_dependency_edges: rows.map(.direct_dependencies).sum(),
+  largest_crates: rows.sort_by(row => -row.rust_lines).first(10),
+  packages: rows,
+}

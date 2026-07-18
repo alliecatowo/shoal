@@ -32,9 +32,11 @@ pub mod themes;
 pub use config::{
     BatteryModule, BudgetConfig, CharacterModule, CmdDurationModule, CustomModule, DirectoryModule,
     ExitStatusModule, FormatConfig, GitBranchModule, GitStateModule, GitStatusModule,
-    HostnameModule, JobsModule, LanguageModule, LeashModule, ModuleConfig, ParsedFormats,
+    HostnameModule, JobsModule, LanguageModule, LeashModule, ModuleConfig,
+    PROMPT_MAX_DYNAMIC_MODULES, PROMPT_MAX_ENV_VALUE_BYTES, PROMPT_MAX_LAYERS, PROMPT_MAX_NESTING,
+    PROMPT_MAX_NODES, PROMPT_MAX_SOURCE_BYTES, PROMPT_MAX_STRING_BYTES, ParsedFormats,
     PrincipalModule, PromptConfig, ReefModule, STATIC_MODULE_IDS, StylePalette, TimeModule,
-    TransientConfig, UsernameModule, env_overrides, load,
+    TransientConfig, UsernameModule, env_overrides, env_overrides_checked, load, parse_layer,
 };
 pub use context::{
     BatterySnapshot, CustomSegment, EditMode, GitSnapshot, JobsSnapshot, LeashSnapshot, LeashTier,
@@ -42,4 +44,4 @@ pub use context::{
 };
 pub use fmt::{format_duration, format_duration_ns, format_size};
 pub use format::{FormatToken, parse_format, referenced_ids};
-pub use render::{RenderedPrompt, Renderer, Side};
+pub use render::{RenderBudgetReport, RenderedPrompt, Renderer, Side};

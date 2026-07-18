@@ -3,12 +3,17 @@ name = "shoal"
 version = "0.1.0"
 edition = "2024"
 
+[lints]
+workspace = true
+
 [dependencies]
 crossterm = "0.29.0"
 libc = "0.2.186"
-reedline = "0.49.0"
+reedline = { version = "0.49.0", features = ["external_printer"] }
+shell-words = "1.1.1"
 shoal-ast = { version = "0.1.0", path = "../shoal-ast" }
 shoal-eval = { version = "0.1.0", path = "../shoal-eval" }
+shoal-exec = { version = "0.1.0", path = "../shoal-exec" }
 shoal-syntax = { version = "0.1.0", path = "../shoal-syntax" }
 shoal-value = { version = "0.1.0", path = "../shoal-value" }
 shoal-config = { path = "../shoal-config" }
@@ -20,7 +25,11 @@ toml = "1"
 signal-hook = "0.4"
 shoal-prompt = { version = "0.1.0", path = "../shoal-prompt" }
 shoal-leash = { version = "0.1.0", path = "../shoal-leash" }
+shoal-mcp = { path = "../shoal-mcp" }
+shoal-proto = { path = "../shoal-proto" }
 shoal-journal = { version = "0.1.0", path = "../shoal-journal" }
+shoal-host = { path = "../shoal-host" }
+shoal-paths = { path = "../shoal-paths" }
 unicode-width = "0.2.2"
 
 [dev-dependencies]

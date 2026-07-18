@@ -34,6 +34,12 @@ pub struct LockNotice {
     pub path: PathBuf,
 }
 
+/// Authority check and subprocess context used for one fresh probe pass.
+pub struct ProbeExecution<'a> {
+    pub guard: &'a mut dyn FnMut(&Candidate) -> ReefResult<()>,
+    pub context: &'a ProviderCtx,
+}
+
 /// A completed resolution.
 #[derive(Debug, Clone)]
 pub struct Resolution {
@@ -106,6 +112,47 @@ impl Resolver {
         policy: Policy,
         notice: &mut dyn FnMut(&LockNotice),
     ) -> ReefResult<Resolution> {
+        self.resolve_with_probe_guard(name, chain, lock, policy, notice, &mut |_| Ok(()))
+    }
+
+    /// Resolve with an authority check immediately before any candidate whose
+    /// version is unknown would be executed as `<candidate> --version`.
+    /// Returning an error prevents that probe and aborts resolution.
+    pub fn resolve_with_probe_guard(
+        &self,
+        name: &str,
+        chain: &ScopeChain,
+        lock: &mut Lockfile,
+        policy: Policy,
+        notice: &mut dyn FnMut(&LockNotice),
+        probe_guard: &mut dyn FnMut(&Candidate) -> ReefResult<()>,
+    ) -> ReefResult<Resolution> {
+        let context = ProviderCtx::new(chain.cwd.clone());
+        self.resolve_with_probe_context(
+            name,
+            chain,
+            lock,
+            policy,
+            notice,
+            ProbeExecution {
+                guard: probe_guard,
+                context: &context,
+            },
+        )
+    }
+
+    /// Resolve through an explicitly supplied provider subprocess context.
+    /// Embedders use this to carry their environment, sandbox, and
+    /// cancellation authority into lazy version probes.
+    pub fn resolve_with_probe_context(
+        &self,
+        name: &str,
+        chain: &ScopeChain,
+        lock: &mut Lockfile,
+        policy: Policy,
+        notice: &mut dyn FnMut(&LockNotice),
+        probe: ProbeExecution<'_>,
+    ) -> ReefResult<Resolution> {
         let decision = self.effective_decision(chain, name)?;
 
         // Honor a valid, satisfying lock entry (with a drift check).
@@ -124,7 +171,14 @@ impl Resolver {
             .with_hint("run `reef lock` (or resolve interactively) to pin it"));
         }
 
-        self.resolve_fresh(name, chain, &decision, Some((lock, notice)))
+        self.resolve_fresh(
+            name,
+            chain,
+            &decision,
+            Some((lock, notice)),
+            probe.guard,
+            probe.context,
+        )
     }
 
     /// Force a fresh resolution and rewrite the lock entry (the `reef lock
@@ -136,9 +190,43 @@ impl Resolver {
         lock: &mut Lockfile,
         notice: &mut dyn FnMut(&LockNotice),
     ) -> ReefResult<Resolution> {
+        self.refresh_lock_with_probe_guard(name, chain, lock, notice, &mut |_| Ok(()))
+    }
+
+    /// Force a fresh resolution with the same pre-probe authority callback as
+    /// [`Self::resolve_with_probe_guard`].
+    pub fn refresh_lock_with_probe_guard(
+        &self,
+        name: &str,
+        chain: &ScopeChain,
+        lock: &mut Lockfile,
+        notice: &mut dyn FnMut(&LockNotice),
+        probe_guard: &mut dyn FnMut(&Candidate) -> ReefResult<()>,
+    ) -> ReefResult<Resolution> {
+        let context = ProviderCtx::new(chain.cwd.clone());
+        self.refresh_lock_with_probe_context(name, chain, lock, notice, probe_guard, &context)
+    }
+
+    /// Refresh through an explicitly supplied provider subprocess context.
+    pub fn refresh_lock_with_probe_context(
+        &self,
+        name: &str,
+        chain: &ScopeChain,
+        lock: &mut Lockfile,
+        notice: &mut dyn FnMut(&LockNotice),
+        probe_guard: &mut dyn FnMut(&Candidate) -> ReefResult<()>,
+        context: &ProviderCtx,
+    ) -> ReefResult<Resolution> {
         let decision = self.effective_decision(chain, name)?;
         lock.remove(name);
-        self.resolve_fresh(name, chain, &decision, Some((lock, notice)))
+        self.resolve_fresh(
+            name,
+            chain,
+            &decision,
+            Some((lock, notice)),
+            probe_guard,
+            context,
+        )
     }
 
     // --- internals ---------------------------------------------------------
@@ -270,15 +358,17 @@ impl Resolver {
         chain: &ScopeChain,
         decision: &Decision,
         lock_and_notice: Option<(&mut Lockfile, &mut dyn FnMut(&LockNotice))>,
+        probe_guard: &mut dyn FnMut(&Candidate) -> ReefResult<()>,
+        context: &ProviderCtx,
     ) -> ReefResult<Resolution> {
-        let ctx = ProviderCtx::new(chain.cwd.clone());
         let chosen = self
             .best_candidate(
                 name,
                 &decision.constraint,
                 decision.provider_pin.as_deref(),
-                &ctx,
-            )
+                context,
+                probe_guard,
+            )?
             .ok_or_else(|| {
                 ReefError::not_found(format!(
                     "no candidate for {name} satisfying {}",
@@ -314,7 +404,9 @@ impl Resolver {
                 blake3: hash.clone(),
                 resolved_at: now_rfc3339(),
             };
-            lock.insert(entry.clone());
+            lock.try_insert(entry.clone()).map_err(|error| {
+                ReefError::provider(format!("retaining lock entry for {name}: {error}"))
+            })?;
             notice(&LockNotice {
                 name: entry.name,
                 version: entry.version,
@@ -354,31 +446,38 @@ impl Resolver {
         constraint: &Constraint,
         provider_pin: Option<&str>,
         ctx: &ProviderCtx,
-    ) -> Option<Candidate> {
-        let mut ranked: Vec<(Version, usize, PathBuf, Candidate)> = Vec::new();
+        probe_guard: &mut dyn FnMut(&Candidate) -> ReefResult<()>,
+    ) -> ReefResult<Option<Candidate>> {
+        let mut best: Option<(usize, Candidate)> = None;
         for (idx, provider) in self.providers.iter().enumerate() {
             if let Some(pin) = provider_pin
                 && provider.name() != pin
             {
                 continue;
             }
-            for mut cand in provider.discover(name, ctx) {
+            let discovery = provider
+                .discover(name, ctx)
+                .map_err(|error| ReefError::provider(error.to_string()))?;
+            for mut cand in discovery.into_candidates() {
                 // Probe a version only when the constraint actually needs one.
                 if constraint.needs_version() && cand.version.is_unknown() {
-                    cand.version = provider.version_of(&cand);
+                    probe_guard(&cand)?;
+                    cand.version = provider.version_of(&cand, ctx);
                 }
                 if constraint.satisfies(&cand.version) {
-                    ranked.push((cand.version.clone(), idx, cand.path.clone(), cand));
+                    let replace = best.as_ref().is_none_or(|(best_idx, current)| {
+                        cand.version > current.version
+                            || (cand.version == current.version
+                                && (idx < *best_idx
+                                    || (idx == *best_idx && cand.path < current.path)))
+                    });
+                    if replace {
+                        best = Some((idx, cand));
+                    }
                 }
             }
         }
-        ranked
-            .into_iter()
-            .max_by(|a, b| {
-                // Higher version wins; then lower provider index; then lower path.
-                a.0.cmp(&b.0).then(b.1.cmp(&a.1)).then(b.2.cmp(&a.2))
-            })
-            .map(|(_, _, _, c)| c)
+        Ok(best.map(|(_, candidate)| candidate))
     }
 
     fn chain_decisions(
@@ -433,427 +532,4 @@ fn short(hash: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::provider::{Candidate, ProviderError};
-    use std::path::Path;
-
-    // A deterministic fake provider backed by an in-memory candidate table.
-    struct FakeProvider {
-        name: &'static str,
-        cands: Vec<Candidate>,
-    }
-    impl Provider for FakeProvider {
-        fn name(&self) -> &'static str {
-            self.name
-        }
-        fn discover(&self, tool: &str, _ctx: &ProviderCtx) -> Vec<Candidate> {
-            self.cands
-                .iter()
-                .filter(|c| c.tool == tool)
-                .cloned()
-                .collect()
-        }
-        fn fetch(
-            &self,
-            _t: &str,
-            _r: &Constraint,
-            _c: &ProviderCtx,
-        ) -> Option<Result<Candidate, ProviderError>> {
-            None
-        }
-    }
-
-    fn write_exe(dir: &Path, name: &str, body: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let p = dir.join(name);
-        std::fs::write(&p, body.as_bytes()).unwrap();
-        let mut perm = std::fs::metadata(&p).unwrap().permissions();
-        perm.set_mode(0o755);
-        std::fs::set_permissions(&p, perm).unwrap();
-        p
-    }
-
-    fn chain_with(text: &str, cwd: &Path) -> ScopeChain {
-        std::fs::write(cwd.join(".reef.toml"), text).unwrap();
-        ScopeChain::discover(cwd, None)
-    }
-
-    fn resolver_with(cands: Vec<(&'static str, Vec<Candidate>)>) -> Resolver {
-        let providers: Vec<Box<dyn Provider>> = cands
-            .into_iter()
-            .map(|(name, c)| Box::new(FakeProvider { name, cands: c }) as Box<dyn Provider>)
-            .collect();
-        Resolver::new(providers)
-    }
-
-    #[test]
-    fn interactive_auto_locks_on_miss() {
-        let dir = tempfile::tempdir().unwrap();
-        let bin = write_exe(dir.path(), "node", "node-22");
-        let chain = chain_with("[tools]\nnode = \"22\"\n", dir.path());
-        let r = resolver_with(vec![(
-            "mise",
-            vec![Candidate::new(
-                "node",
-                Version::parse("22.3.0"),
-                bin.clone(),
-                "mise",
-            )],
-        )]);
-        let mut lock = Lockfile::new();
-        let mut notices = Vec::new();
-        let res = r
-            .resolve("node", &chain, &mut lock, Policy::Interactive, &mut |n| {
-                notices.push(n.name.clone())
-            })
-            .unwrap();
-        assert!(res.locked_now);
-        assert_eq!(res.version.raw(), "22.3.0");
-        assert_eq!(notices, vec!["node".to_string()]);
-        assert!(lock.get("node").is_some());
-    }
-
-    #[test]
-    fn script_errors_on_unlocked_constraint() {
-        let dir = tempfile::tempdir().unwrap();
-        let bin = write_exe(dir.path(), "node", "node-22");
-        let chain = chain_with("[tools]\nnode = \"22\"\n", dir.path());
-        let r = resolver_with(vec![(
-            "mise",
-            vec![Candidate::new(
-                "node",
-                Version::parse("22.3.0"),
-                bin,
-                "mise",
-            )],
-        )]);
-        let mut lock = Lockfile::new();
-        let err = r
-            .resolve("node", &chain, &mut lock, Policy::Script, &mut |_| {})
-            .unwrap_err();
-        assert_eq!(err.code_str(), "reef_unlocked");
-    }
-
-    #[test]
-    fn script_resolves_locked_tool() {
-        let dir = tempfile::tempdir().unwrap();
-        let bin = write_exe(dir.path(), "node", "node-22");
-        let chain = chain_with("[tools]\nnode = \"22\"\n", dir.path());
-        let r = resolver_with(vec![(
-            "mise",
-            vec![Candidate::new(
-                "node",
-                Version::parse("22.3.0"),
-                bin.clone(),
-                "mise",
-            )],
-        )]);
-        // Pre-lock interactively, then resolve under script policy.
-        let mut lock = Lockfile::new();
-        r.resolve("node", &chain, &mut lock, Policy::Interactive, &mut |_| {})
-            .unwrap();
-        let res = r
-            .resolve("node", &chain, &mut lock, Policy::Script, &mut |_| {})
-            .unwrap();
-        assert!(!res.locked_now);
-        assert_eq!(res.path, bin);
-    }
-
-    #[test]
-    fn drift_detected_when_binary_changes() {
-        let dir = tempfile::tempdir().unwrap();
-        let bin = write_exe(dir.path(), "node", "node-22-orig");
-        let chain = chain_with("[tools]\nnode = \"22\"\n", dir.path());
-        let r = resolver_with(vec![(
-            "mise",
-            vec![Candidate::new(
-                "node",
-                Version::parse("22.3.0"),
-                bin.clone(),
-                "mise",
-            )],
-        )]);
-        let mut lock = Lockfile::new();
-        r.resolve("node", &chain, &mut lock, Policy::Interactive, &mut |_| {})
-            .unwrap();
-        // Flip a byte in the "binary".
-        write_exe(dir.path(), "node", "node-22-TAMPERED");
-        let err = r
-            .resolve("node", &chain, &mut lock, Policy::Script, &mut |_| {})
-            .unwrap_err();
-        assert_eq!(err.code_str(), "reef_drift");
-        // The error names *both* the stale locked hash and the current on-disk
-        // hash, per site/content/internals/reef-resolution.md ("a hard error naming old/new hashes").
-        let msg = err.to_string();
-        let old_hash = short(&crate::hashcache::hash_bytes(b"node-22-orig"));
-        let new_hash = short(&crate::hashcache::hash_bytes(b"node-22-TAMPERED"));
-        assert_ne!(old_hash, new_hash);
-        assert!(
-            msg.contains(&old_hash),
-            "message {msg:?} missing old hash {old_hash}"
-        );
-        assert!(
-            msg.contains(&new_hash),
-            "message {msg:?} missing new hash {new_hash}"
-        );
-        assert!(
-            err.hint
-                .as_deref()
-                .unwrap_or("")
-                .contains("reef lock --refresh")
-        );
-    }
-
-    #[test]
-    fn refresh_lock_heals_drift() {
-        let dir = tempfile::tempdir().unwrap();
-        let bin = write_exe(dir.path(), "node", "orig");
-        let chain = chain_with("[tools]\nnode = \"22\"\n", dir.path());
-        let r = resolver_with(vec![(
-            "mise",
-            vec![Candidate::new(
-                "node",
-                Version::parse("22.3.0"),
-                bin.clone(),
-                "mise",
-            )],
-        )]);
-        let mut lock = Lockfile::new();
-        r.resolve("node", &chain, &mut lock, Policy::Interactive, &mut |_| {})
-            .unwrap();
-        write_exe(dir.path(), "node", "changed");
-        // resolve now drifts…
-        assert_eq!(
-            r.resolve("node", &chain, &mut lock, Policy::Script, &mut |_| {})
-                .unwrap_err()
-                .code_str(),
-            "reef_drift"
-        );
-        // …refresh heals it.
-        r.refresh_lock("node", &chain, &mut lock, &mut |_| {})
-            .unwrap();
-        assert!(
-            r.resolve("node", &chain, &mut lock, Policy::Script, &mut |_| {})
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn conflict_across_scopes() {
-        let root = tempfile::tempdir().unwrap();
-        let base = root.path();
-        std::fs::write(base.join(".reef.toml"), "[tools]\nnode = \"18\"\n").unwrap();
-        let sub = base.join("proj");
-        std::fs::create_dir_all(&sub).unwrap();
-        std::fs::write(sub.join(".reef.toml"), "[tools]\nnode = \"22\"\n").unwrap();
-        let chain = ScopeChain::discover(&sub, None);
-        let r = resolver_with(vec![("mise", vec![])]);
-        let mut lock = Lockfile::new();
-        let err = r
-            .resolve("node", &chain, &mut lock, Policy::Interactive, &mut |_| {})
-            .unwrap_err();
-        assert_eq!(err.code_str(), "reef_conflict");
-        // site/content/internals/reef-resolution.md: "the error lists both sources" — no silent first-wins.
-        let msg = err.to_string();
-        assert!(msg.contains("18"), "message should cite the 18 constraint");
-        assert!(msg.contains("22"), "message should cite the 22 constraint");
-        let hint = err.hint.clone().unwrap_or_default();
-        assert!(hint.contains(base.join(".reef.toml").to_string_lossy().as_ref()));
-        assert!(hint.contains(sub.join(".reef.toml").to_string_lossy().as_ref()));
-    }
-
-    #[test]
-    fn conflicting_provider_pins_across_scopes() {
-        let root = tempfile::tempdir().unwrap();
-        let base = root.path();
-        std::fs::write(
-            base.join(".reef.toml"),
-            "[tools]\ngo = { provider = \"mise\" }\n",
-        )
-        .unwrap();
-        let sub = base.join("proj");
-        std::fs::create_dir_all(&sub).unwrap();
-        std::fs::write(
-            sub.join(".reef.toml"),
-            "[tools]\ngo = { provider = \"system\" }\n",
-        )
-        .unwrap();
-        let chain = ScopeChain::discover(&sub, None);
-        let r = resolver_with(vec![("mise", vec![]), ("system", vec![])]);
-        let mut lock = Lockfile::new();
-        let err = r
-            .resolve("go", &chain, &mut lock, Policy::Interactive, &mut |_| {})
-            .unwrap_err();
-        assert_eq!(err.code_str(), "reef_conflict");
-        let msg = err.to_string();
-        assert!(msg.contains("mise"));
-        assert!(msg.contains("system"));
-    }
-
-    #[test]
-    fn compatible_scopes_refine_not_conflict() {
-        let root = tempfile::tempdir().unwrap();
-        let base = root.path();
-        let bin = write_exe(base, "node", "n");
-        std::fs::write(base.join(".reef.toml"), "[tools]\nnode = \"22\"\n").unwrap();
-        let sub = base.join("proj");
-        std::fs::create_dir_all(&sub).unwrap();
-        std::fs::write(sub.join(".reef.toml"), "[tools]\nnode = \"22.3\"\n").unwrap();
-        let chain = ScopeChain::discover(&sub, None);
-        let r = resolver_with(vec![(
-            "mise",
-            vec![Candidate::new(
-                "node",
-                Version::parse("22.3.9"),
-                bin,
-                "mise",
-            )],
-        )]);
-        let mut lock = Lockfile::new();
-        let res = r
-            .resolve("node", &chain, &mut lock, Policy::Interactive, &mut |_| {})
-            .unwrap();
-        // Effective constraint is the more specific 22.3.
-        assert_eq!(res.report.constraint, "22.3");
-    }
-
-    #[test]
-    fn ranking_prefers_highest_then_provider_order() {
-        let dir = tempfile::tempdir().unwrap();
-        let a = write_exe(dir.path(), "toolA", "a");
-        let b = write_exe(dir.path(), "toolB", "b");
-        let chain = ScopeChain::discover(dir.path(), None);
-        // Same version from two providers → provider order (index 0) wins.
-        let r = resolver_with(vec![
-            (
-                "mise",
-                vec![Candidate::new(
-                    "t",
-                    Version::parse("1.0.0"),
-                    a.clone(),
-                    "mise",
-                )],
-            ),
-            (
-                "system",
-                vec![Candidate::new("t", Version::parse("1.0.0"), b, "system")],
-            ),
-        ]);
-        let mut lock = Lockfile::new();
-        let res = r
-            .resolve("t", &chain, &mut lock, Policy::Interactive, &mut |_| {})
-            .unwrap();
-        assert_eq!(res.provider, "mise");
-        assert_eq!(res.path, a);
-    }
-
-    #[test]
-    fn highest_version_wins() {
-        let dir = tempfile::tempdir().unwrap();
-        let lo = write_exe(dir.path(), "lo", "lo");
-        let hi = write_exe(dir.path(), "hi", "hi");
-        let chain = ScopeChain::discover(dir.path(), None);
-        let r = resolver_with(vec![(
-            "mise",
-            vec![
-                Candidate::new("t", Version::parse("1.2.0"), lo, "mise"),
-                Candidate::new("t", Version::parse("1.10.0"), hi.clone(), "mise"),
-            ],
-        )]);
-        let mut lock = Lockfile::new();
-        let res = r
-            .resolve("t", &chain, &mut lock, Policy::Interactive, &mut |_| {})
-            .unwrap();
-        assert_eq!(res.path, hi);
-        assert_eq!(res.version.raw(), "1.10.0");
-    }
-
-    #[test]
-    fn unconstrained_resolves_without_lock() {
-        let dir = tempfile::tempdir().unwrap();
-        let bin = write_exe(dir.path(), "ls", "ls");
-        let chain = ScopeChain::discover(dir.path(), None);
-        let r = resolver_with(vec![(
-            "system",
-            vec![Candidate::new("ls", Version::unknown(), bin, "system")],
-        )]);
-        let mut lock = Lockfile::new();
-        // Even under Script policy, unconstrained tools resolve fine.
-        let res = r
-            .resolve("ls", &chain, &mut lock, Policy::Script, &mut |_| {})
-            .unwrap();
-        assert!(!res.constrained);
-        assert!(!res.locked_now);
-        assert!(lock.get("ls").is_none());
-        assert_eq!(res.report.scope, "system");
-    }
-
-    #[test]
-    fn not_found_when_no_candidate() {
-        let dir = tempfile::tempdir().unwrap();
-        let chain = chain_with("[tools]\nghost = \"9\"\n", dir.path());
-        let r = resolver_with(vec![("mise", vec![])]);
-        let mut lock = Lockfile::new();
-        let err = r
-            .resolve("ghost", &chain, &mut lock, Policy::Interactive, &mut |_| {})
-            .unwrap_err();
-        assert_eq!(err.code_str(), "reef_not_found");
-    }
-
-    #[test]
-    fn provider_pin_filters_candidates() {
-        let dir = tempfile::tempdir().unwrap();
-        let m = write_exe(dir.path(), "m", "m");
-        let s = write_exe(dir.path(), "s", "s");
-        let chain = chain_with("[tools]\ngo = { provider = \"mise\" }\n", dir.path());
-        let r = resolver_with(vec![
-            (
-                "system",
-                vec![Candidate::new("go", Version::unknown(), s, "system")],
-            ),
-            (
-                "mise",
-                vec![Candidate::new(
-                    "go",
-                    Version::parse("1.21"),
-                    m.clone(),
-                    "mise",
-                )],
-            ),
-        ]);
-        let mut lock = Lockfile::new();
-        let res = r
-            .resolve("go", &chain, &mut lock, Policy::Interactive, &mut |_| {})
-            .unwrap();
-        assert_eq!(res.provider, "mise");
-        assert_eq!(res.path, m);
-    }
-
-    #[test]
-    fn report_chain_marks_selected_and_absent() {
-        let dir = tempfile::tempdir().unwrap();
-        let bin = write_exe(dir.path(), "node", "n");
-        let chain = chain_with("[tools]\nnode = \"22\"\nother = \"1\"\n", dir.path());
-        let r = resolver_with(vec![(
-            "mise",
-            vec![Candidate::new(
-                "node",
-                Version::parse("22.0.0"),
-                bin,
-                "mise",
-            )],
-        )]);
-        let mut lock = Lockfile::new();
-        let res = r
-            .resolve("node", &chain, &mut lock, Policy::Interactive, &mut |_| {})
-            .unwrap();
-        let sel = res
-            .report
-            .chain
-            .iter()
-            .find(|d| d.outcome == "selected")
-            .unwrap();
-        assert_eq!(sel.constraint.as_deref(), Some("22"));
-    }
-}
+mod tests;

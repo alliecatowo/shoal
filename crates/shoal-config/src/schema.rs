@@ -42,7 +42,11 @@ fn describe(kind: Kind) -> &'static str {
 
 pub(crate) const ROOT: Kind = Kind::Table(&[
     ("version", Kind::UInt),
-    ("prompt", Kind::Table(&[("template", Kind::Str)])),
+    // The rich prompt subsystem validates this complete table against its own
+    // bounded dynamic schema. Core config only owns the legacy `template`
+    // projection and must not emit false unknown-key warnings for valid rich
+    // keys before the prompt owner sees them.
+    ("prompt", Kind::Opaque),
     (
         "history",
         Kind::Table(&[
@@ -77,6 +81,7 @@ pub(crate) const ROOT: Kind = Kind::Table(&[
         Kind::Table(&[("enabled", Kind::Bool), ("session", Kind::Str)]),
     ),
     ("adapters", Kind::Table(&[("dirs", Kind::StrArray)])),
+    ("plugins", Kind::Table(&[("dirs", Kind::StrArray)])),
     (
         "journal",
         Kind::Table(&[("enabled", Kind::Bool), ("state_dir", Kind::Str)]),
@@ -323,12 +328,12 @@ mod tests {
 
     #[test]
     fn unknown_key_warns_with_suggestion() {
-        let v: toml::Value = toml::from_str("[prompt]\ntempalte = \"x\"").unwrap();
+        let v: toml::Value = toml::from_str("[render]\npagng = \"auto\"").unwrap();
         let mut warnings = Vec::new();
         check(&v, ROOT, "", &mut warnings).unwrap();
         assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("prompt.tempalte"));
-        assert!(warnings[0].contains("did you mean `prompt.template`?"));
+        assert!(warnings[0].contains("render.pagng"));
+        assert!(warnings[0].contains("did you mean `render.paging`?"));
     }
 
     #[test]
@@ -339,6 +344,17 @@ mod tests {
         .unwrap();
         let mut warnings = Vec::new();
         check(&v, ROOT, "", &mut warnings).unwrap();
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn rich_prompt_table_is_owned_without_false_core_warnings() {
+        let value: toml::Value = toml::from_str(
+            "[prompt.format]\nleft = '$directory$character'\n[prompt.module.directory]\ntruncate_style = 'middle'",
+        )
+        .unwrap();
+        let mut warnings = Vec::new();
+        check(&value, ROOT, "", &mut warnings).unwrap();
         assert!(warnings.is_empty());
     }
 

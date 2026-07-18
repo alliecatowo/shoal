@@ -27,294 +27,37 @@
 //! resets caught signals to `SIG_DFL`, which is exactly why Ctrl-Z can stop
 //! them.
 
-use std::collections::VecDeque;
 use std::fs::File;
-use std::io::{self, Write};
+use std::io;
 use std::mem;
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{Child, CommandBuilder, MasterPty, native_pty_system};
 use shoal_leash::EnforcementStatus;
 
 use crate::cancel::CancelToken;
-use crate::status::{decode_wait_status, is_stopped, waitpid_blocking, waitpid_untraced};
-use crate::watcher::spawn_cancel_watcher;
+use crate::status::{decode_wait_status, waitpid_blocking};
 use crate::which::resolve_program;
 use crate::{ExecResult, ExecSpec, StdinSpec};
 
-/// How often the stdin forwarder / output pump wake to poll (also paces winsize
-/// checks). Data reads happen immediately on `POLLIN`; this only bounds the
-/// latency of noticing a teardown request when the pty is idle.
-const INPUT_POLL_MS: i32 = 50;
-/// Winsize is re-checked every N input polls (≈ every 200 ms).
-const WINSIZE_EVERY_N_POLLS: u32 = 4;
-/// After the child is reaped, how long we wait for the output pump to hit
-/// EOF before abandoning it (it exits on its own once the pty closes).
-const PUMP_DRAIN_GRACE: Duration = Duration::from_millis(500);
+mod registry;
+mod service;
+mod terminal;
 
-/// Parked, still-running PTY foreground jobs that were stopped (Ctrl-Z /
-/// SIGTSTP) and can be resumed by the host via `fg`/`bg`. Process-global
-/// because job control is inherently a per-process singleton (there is one
-/// controlling terminal). Keyed by pid at [`take_stopped_job`].
-static PARKED_JOBS: Mutex<VecDeque<PtyJob>> = Mutex::new(VecDeque::new());
-
-fn pty_err(e: anyhow::Error) -> io::Error {
-    // portable-pty wraps operating-system failures in anyhow. Preserve the
-    // original io::Error so callers can reliably distinguish ENOENT/E2BIG/etc.
-    match e.downcast::<io::Error>() {
-        Ok(error) => error,
-        Err(error) => io::Error::other(error.to_string()),
-    }
-}
-
-/// Restores the original termios of `fd` on drop — including on panic, so
-/// the user's terminal is never left in raw mode.
-struct RawModeGuard {
-    fd: RawFd,
-    orig: libc::termios,
-}
-
-impl RawModeGuard {
-    /// Put `fd` into raw mode; `None` if it is not a tty or termios fails.
-    fn new(fd: RawFd) -> Option<Self> {
-        // SAFETY: termios syscalls on a caller-owned fd with valid pointers.
-        unsafe {
-            let mut term = mem::zeroed::<libc::termios>();
-            if libc::tcgetattr(fd, &raw mut term) != 0 {
-                return None;
-            }
-            let orig = term;
-            libc::cfmakeraw(&raw mut term);
-            if libc::tcsetattr(fd, libc::TCSANOW, &raw const term) != 0 {
-                return None;
-            }
-            Some(RawModeGuard { fd, orig })
-        }
-    }
-}
-
-impl Drop for RawModeGuard {
-    fn drop(&mut self) {
-        // SAFETY: restoring the termios we captured in `new`.
-        unsafe {
-            libc::tcsetattr(self.fd, libc::TCSANOW, &raw const self.orig);
-        }
-    }
-}
-
-/// Current window size of the tty on `fd`, if it is one.
-fn tty_winsize(fd: RawFd) -> Option<PtySize> {
-    // SAFETY: TIOCGWINSZ with a valid winsize out-pointer.
-    unsafe {
-        let mut ws = mem::zeroed::<libc::winsize>();
-        if libc::ioctl(fd, libc::TIOCGWINSZ, &raw mut ws) == 0 && ws.ws_col > 0 && ws.ws_row > 0 {
-            Some(PtySize {
-                rows: ws.ws_row,
-                cols: ws.ws_col,
-                pixel_width: ws.ws_xpixel,
-                pixel_height: ws.ws_ypixel,
-            })
-        } else {
-            None
-        }
-    }
-}
-
-/// Push `sz` onto the pty whose master (or a dup of it) is `fd` via
-/// `TIOCSWINSZ` — the fd-only equivalent of `MasterPty::resize`, so the stdin
-/// forwarder can propagate resizes using only its dup'd writer fd (leaving the
-/// `MasterPty` owned by the job for resumption).
-fn set_winsize(fd: RawFd, sz: PtySize) {
-    let ws = libc::winsize {
-        ws_row: sz.rows,
-        ws_col: sz.cols,
-        ws_xpixel: sz.pixel_width,
-        ws_ypixel: sz.pixel_height,
-    };
-    // SAFETY: TIOCSWINSZ with a valid winsize pointer on a pty fd we own.
-    unsafe {
-        libc::ioctl(fd, libc::TIOCSWINSZ, &raw const ws);
-    }
-}
-
-/// A dup of fd 1 for raw byte passthrough (bypasses std's line buffering and
-/// leaves the real fd 1 open when dropped).
-fn dup_stdout() -> Option<File> {
-    // SAFETY: dup returns a fresh fd we then own; from_raw_fd takes it over.
-    let fd = unsafe { libc::dup(1) };
-    if fd < 0 {
-        None
-    } else {
-        Some(unsafe { File::from_raw_fd(fd) })
-    }
-}
-
-/// A `File` onto the pty master via a dup'd fd, usable for both reading the
-/// child's output and writing its input.
-///
-/// Deliberately NOT `MasterPty::take_writer()`: portable-pty's writer injects
-/// `"\n" + VEOF` into the pty when dropped, and the line discipline echoes
-/// that back as a stray `\r\n` in the teed output. A plain dup has no
-/// drop-time side effects; pty EOF, when wanted, must be conveyed in-band
-/// (a VEOF byte, usually `0x04`) by whoever feeds the input. Dup'ing (rather
-/// than moving the `MasterPty`) is also what lets the job keep the master alive
-/// across a stop so it can be resumed.
-fn dup_master_fd(master: &dyn MasterPty) -> io::Result<File> {
-    let fd = master
-        .as_raw_fd()
-        .ok_or_else(|| io::Error::other("pty master has no raw fd"))?;
-    // SAFETY: dup returns a fresh fd we then own; from_raw_fd takes it over.
-    let dup = unsafe { libc::dup(fd) };
-    if dup < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(unsafe { File::from_raw_fd(dup) })
-}
-
-/// Forward real-stdin bytes to the pty master and propagate window resizes.
-///
-/// Uses poll(2) with a short timeout instead of a blocking read so that once
-/// `done` is set (the serve loop is tearing down) the thread exits without
-/// stealing a keystroke that belongs to the shell. Resizes are pushed through
-/// the writer fd (a dup of the master) via `TIOCSWINSZ`, so this needs no
-/// reference to the `MasterPty` object — that stays owned by the job.
-fn forward_stdin_and_resize(mut writer: File, done: &AtomicBool) {
-    let wfd = writer.as_raw_fd();
-    let mut buf = [0u8; 4096];
-    let mut last = tty_winsize(0);
-    let mut ticks: u32 = 0;
-    while !done.load(Ordering::SeqCst) {
-        ticks = ticks.wrapping_add(1);
-        if ticks.is_multiple_of(WINSIZE_EVERY_N_POLLS)
-            && let Some(sz) = tty_winsize(0)
-        {
-            let changed = last.is_none_or(|l| l.rows != sz.rows || l.cols != sz.cols);
-            if changed {
-                set_winsize(wfd, sz);
-                last = Some(sz);
-            }
-        }
-        let mut pfd = libc::pollfd {
-            fd: 0,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: poll on one valid pollfd.
-        let n = unsafe { libc::poll(&raw mut pfd, 1, INPUT_POLL_MS) };
-        if n <= 0 || pfd.revents & (libc::POLLIN | libc::POLLHUP) == 0 {
-            continue;
-        }
-        // SAFETY: read into a valid buffer of the stated length.
-        let r = unsafe { libc::read(0, buf.as_mut_ptr().cast(), buf.len()) };
-        if r <= 0 {
-            break; // stdin EOF or error
-        }
-        #[allow(clippy::cast_sign_loss)] // r > 0 checked above
-        let n = r as usize;
-        if writer.write_all(&buf[..n]).is_err() {
-            break; // pty gone (child exited)
-        }
-        let _ = writer.flush();
-    }
-}
-
-/// The output pump: drain the pty master (a dup'd `reader` fd), tee into the
-/// bounded capture buffer, and — when the real terminal is a tty — pass the
-/// bytes through raw. Poll-based so a *stop* (child suspended, no EOF) can tear
-/// it down promptly: when the pty is idle and `serve_done` is set, the pump
-/// returns; otherwise it exits at EOF (`read` -> 0 / `EIO`, the slave closing).
-/// The tee is capped to [`crate::capture_hard_cap`] so a runaway child cannot
-/// OOM the shell; the real terminal still receives the full stream.
-fn pump_output(
-    reader: File,
-    tee: Arc<Mutex<Vec<u8>>>,
-    tee_truncated: Arc<AtomicBool>,
-    mut passthrough: Option<File>,
-    cap: usize,
-    serve_done: Arc<AtomicBool>,
-    pump_done: Arc<AtomicBool>,
-) {
-    let fd = reader.as_raw_fd();
-    let mut buf = [0u8; 8192];
-    loop {
-        let mut pfd = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: poll on one valid pollfd we own.
-        let n = unsafe { libc::poll(&raw mut pfd, 1, INPUT_POLL_MS) };
-        if n <= 0 {
-            // Timed out or was interrupted with no data ready: exit if the
-            // serve loop asked us to (a stop, where no EOF will ever arrive),
-            // otherwise keep waiting for the child's next output.
-            if serve_done.load(Ordering::SeqCst) {
-                break;
-            }
-            continue;
-        }
-        if pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) == 0 {
-            continue;
-        }
-        // SAFETY: read into a valid buffer of the stated length.
-        let r = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
-        if r == 0 {
-            break; // EOF: slave fully closed
-        }
-        if r < 0 {
-            match io::Error::last_os_error().raw_os_error() {
-                // EIO: the slave side has been closed — treat as EOF, exactly as
-                // portable-pty's own reader does.
-                Some(v) if v == libc::EIO => break,
-                Some(v) if v == libc::EINTR || v == libc::EAGAIN => continue,
-                _ => break,
-            }
-        }
-        #[allow(clippy::cast_sign_loss)] // r > 0 checked above
-        let n = r as usize;
-        {
-            let mut tee = tee.lock().expect("tee lock");
-            if tee.len() < cap {
-                let take = (cap - tee.len()).min(n);
-                tee.extend_from_slice(&buf[..take]);
-                if take < n {
-                    tee_truncated.store(true, Ordering::SeqCst);
-                }
-            } else {
-                tee_truncated.store(true, Ordering::SeqCst);
-            }
-        }
-        if let Some(out) = passthrough.as_mut() {
-            let _ = out.write_all(&buf[..n]);
-        }
-    }
-    pump_done.store(true, Ordering::SeqCst);
-}
-
-/// Non-tty stdin to feed into the pty exactly once (the first time the job is
-/// served). `Inherit`-tty forwarding is handled separately and re-engages on
-/// every foreground serve.
-enum Feed {
-    Bytes(Vec<u8>),
-    File(File),
-}
-
-/// The result of serving (waiting on) a PTY child for one foreground/background
-/// stint: it either terminated (raw wait status) or *stopped* (suspended).
-enum Wait {
-    Exited(i32),
-    Stopped,
-}
+use registry::{park_job, register_background_job, remove_background_job};
+pub use registry::{shutdown_stopped_jobs, take_background_job, take_stopped_job};
+use service::{Feed, ServeOptions, Wait, serve};
+use terminal::{BackgroundOutputSink, initial_pty_size, is_tty, lock_tee, pty_err};
 
 /// A PTY foreground command and everything needed to keep it alive across a
-/// stop and later resume it (site/content/internals/language-conformance-contract.md). Created for every PtyTee run; parked in
-/// [`PARKED_JOBS`] only when the child is stopped rather than finishing.
+/// stop and later resume it (site/content/internals/language-conformance-contract.md). Created for every PtyTee run; held by
+/// the stopped-job registry only when the child stops rather than finishes.
 ///
 /// The `master` is retained (never moved into a helper thread) precisely so the
 /// child's pty slave stays open while it is stopped — dropping the master would
@@ -341,6 +84,7 @@ pub struct PtyJob {
     /// `true` once our own `waitpid` has reaped the child, so `Drop`/`kill_and_
     /// reap` know not to signal a dead (possibly pid-reused) process.
     reaped: bool,
+    _process_group: crate::cancel::ProcessGroupLease,
 }
 
 impl PtyJob {
@@ -363,122 +107,10 @@ impl PtyJob {
         &self.display
     }
 
-    /// `SIGCONT` the whole process group.
-    fn signal_cont(&self) {
-        // SAFETY: signalling a process group is memory-safe.
-        unsafe {
-            libc::kill(-self.pgid, libc::SIGCONT);
-        }
-    }
-
-    /// Attach helpers (stdin forward + output pump + cancel watcher), optionally
-    /// `SIGCONT` the group (on resume), then wait — observing a stop. Keeps the
-    /// master and child alive on every path.
-    fn serve(&mut self, cancel: &CancelToken, foreground: bool, resume: bool) -> io::Result<Wait> {
-        // Raw mode only when actually forwarding a real terminal; restored on
-        // every exit path (panics included) when the guard drops.
-        let _raw = if foreground && self.forward_tty {
-            RawModeGuard::new(0)
-        } else {
-            None
-        };
-
-        let serve_done = Arc::new(AtomicBool::new(false));
-        let mut helpers: Vec<thread::JoinHandle<()>> = Vec::new();
-
-        // Stdin plumbing. One-shot Bytes/File feed happens on the first serve;
-        // tty forwarding re-engages on every foreground serve.
-        if let Some(feed) = self.pending_feed.take() {
-            let mut w = dup_master_fd(self.master.as_ref())?;
-            helpers.push(thread::spawn(move || match feed {
-                Feed::Bytes(bytes) => {
-                    let _ = w.write_all(&bytes);
-                    let _ = w.flush();
-                }
-                Feed::File(mut f) => {
-                    let _ = io::copy(&mut f, &mut w);
-                    let _ = w.flush();
-                }
-            }));
-        } else if foreground && self.forward_tty {
-            let w = dup_master_fd(self.master.as_ref())?;
-            let d = serve_done.clone();
-            helpers.push(thread::spawn(move || forward_stdin_and_resize(w, &d)));
-        }
-
-        // Output pump (poll-based, over a dup of the master fd so it can be torn
-        // down on a stop without dropping the master itself).
-        let reader = dup_master_fd(self.master.as_ref())?;
-        let pump_done = Arc::new(AtomicBool::new(false));
-        let pump = {
-            let tee = Arc::clone(&self.tee);
-            let tee_truncated = Arc::clone(&self.tee_truncated);
-            let pump_done = Arc::clone(&pump_done);
-            let serve_done = Arc::clone(&serve_done);
-            let passthrough = if self.stdout_is_tty {
-                dup_stdout()
-            } else {
-                None
-            };
-            let cap = self.cap;
-            thread::spawn(move || {
-                pump_output(
-                    reader,
-                    tee,
-                    tee_truncated,
-                    passthrough,
-                    cap,
-                    serve_done,
-                    pump_done,
-                );
-            })
-        };
-
-        // Cancellation watcher (INT → TERM → KILL against the child's group).
-        let claimed = Arc::new(AtomicBool::new(false));
-        let watcher =
-            spawn_cancel_watcher(self.pgid, vec![cancel.clone()], claimed, serve_done.clone());
-
-        // On resume, continue the group now that output/input are re-attached
-        // (spawning the pump first means no output is lost to the gap).
-        if resume {
-            self.signal_cont();
-        }
-
-        // Wait, observing stops (WUNTRACED). A stop does NOT reap the child.
-        let raw = waitpid_untraced(self.pid)?;
-        let stopped = is_stopped(raw);
-
-        // Tear down this serve's helpers. Identical for stop and exit — the
-        // master and child are always left intact; on a stop they are parked.
-        serve_done.store(true, Ordering::SeqCst);
-        let deadline = Instant::now() + PUMP_DRAIN_GRACE;
-        while !pump_done.load(Ordering::SeqCst) && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(10));
-        }
-        if pump_done.load(Ordering::SeqCst) {
-            let _ = pump.join();
-        }
-        // If a grandchild is holding the slave open and flooding it, the pump
-        // may not have drained within the grace window; leave it (it exits on
-        // its own once serve_done is observed on the next idle poll) rather than
-        // block the prompt — the same policy the pre-job-control code used.
-        let _ = watcher.join();
-        for h in helpers {
-            let _ = h.join();
-        }
-
-        Ok(if stopped {
-            Wait::Stopped
-        } else {
-            Wait::Exited(raw)
-        })
-    }
-
     /// Build the terminal-exit result and mark the child reaped.
     fn exit_result(&mut self, raw: i32) -> ExecResult {
         let (status, signal) = decode_wait_status(raw);
-        let stdout = mem::take(&mut *self.tee.lock().expect("tee lock"));
+        let stdout = mem::take(&mut *lock_tee(&self.tee, &self.tee_truncated));
         let truncated = self.tee_truncated.load(Ordering::SeqCst);
         self.reaped = true;
         #[allow(clippy::cast_sign_loss)] // pids are positive
@@ -503,7 +135,7 @@ impl PtyJob {
     /// Build the *stopped* result (child alive, suspended). Snapshots the tee
     /// (clone, not take) so a later resume keeps appending to the same buffer.
     fn stopped_result(&self) -> ExecResult {
-        let stdout = self.tee.lock().expect("tee lock").clone();
+        let stdout = lock_tee(&self.tee, &self.tee_truncated).clone();
         let truncated = self.tee_truncated.load(Ordering::SeqCst);
         #[allow(clippy::cast_sign_loss)] // pids are positive
         ExecResult {
@@ -545,13 +177,29 @@ impl PtyJob {
     /// # Errors
     /// Propagates a `waitpid`/pty-plumbing [`io::Error`].
     pub fn resume_foreground(mut self, cancel: &CancelToken) -> io::Result<ExecResult> {
-        match self.serve(cancel, true, true)? {
+        match serve(&mut self, cancel, ServeOptions::foreground(true))? {
             Wait::Exited(raw) => Ok(self.exit_result(raw)),
             Wait::Stopped => {
                 let res = self.stopped_result();
                 park_job(self);
                 Ok(res)
             }
+            Wait::Foreground(_) | Wait::Shutdown => unreachable!("no background control channel"),
+        }
+    }
+
+    /// Attach the foreground terminal to a job already running in the
+    /// background. Unlike [`PtyJob::resume_foreground`], this does not send
+    /// SIGCONT: ownership transfer did not stop the process group.
+    pub fn foreground_running(mut self, cancel: &CancelToken) -> io::Result<ExecResult> {
+        match serve(&mut self, cancel, ServeOptions::foreground(false))? {
+            Wait::Exited(raw) => Ok(self.exit_result(raw)),
+            Wait::Stopped => {
+                let result = self.stopped_result();
+                park_job(self);
+                Ok(result)
+            }
+            Wait::Foreground(_) | Wait::Shutdown => unreachable!("no background control channel"),
         }
     }
 
@@ -561,18 +209,71 @@ impl PtyJob {
     /// background job does not own the terminal input). A background job is not
     /// cancelled by the foreground Ctrl-C, so it runs under its own fresh,
     /// never-tripped [`CancelToken`].
-    pub fn resume_background(mut self) {
-        self.forward_tty = false;
+    pub fn resume_background(self) {
+        self.resume_background_notify(|_| {});
+    }
+
+    /// Background resume with one terminal notification. The callback runs
+    /// after the child has either exited, stopped again and been re-parked, or
+    /// failed during PTY service. Hosts use this to reconcile their separate
+    /// job table without sharing evaluator state with the worker thread.
+    pub fn resume_background_notify<F>(self, notify: F)
+    where
+        F: FnOnce(io::Result<ExecResult>) + Send + 'static,
+    {
+        self.resume_background_notify_inner(None, notify);
+    }
+
+    /// Background resume whose output is delivered to a host-owned bounded
+    /// presentation path instead of being written concurrently to fd 1. The
+    /// callback runs on the PTY pump thread and must remain nonblocking.
+    pub fn resume_background_notify_with_output<F, O>(self, output: O, notify: F)
+    where
+        F: FnOnce(io::Result<ExecResult>) + Send + 'static,
+        O: FnMut(&[u8]) + Send + 'static,
+    {
+        self.resume_background_notify_inner(Some(Box::new(output)), notify);
+    }
+
+    fn resume_background_notify_inner<F>(mut self, output: Option<BackgroundOutputSink>, notify: F)
+    where
+        F: FnOnce(io::Result<ExecResult>) + Send + 'static,
+    {
+        let pid = self.pid();
+        let (commands_tx, commands_rx) = mpsc::channel();
+        register_background_job(pid, commands_tx);
         thread::spawn(move || {
             let cancel = CancelToken::new();
-            match self.serve(&cancel, false, true) {
+            match serve(
+                &mut self,
+                &cancel,
+                ServeOptions::background(&commands_rx, output),
+            ) {
                 Ok(Wait::Exited(raw)) => {
-                    let _ = self.exit_result(raw);
+                    remove_background_job(pid);
+                    notify(Ok(self.exit_result(raw)));
                 }
                 // Stopped again in the background (unusual): re-park so a later
                 // `fg` can still find it.
-                Ok(Wait::Stopped) => park_job(self),
-                Err(_) => self.kill_and_reap(),
+                Ok(Wait::Stopped) => {
+                    remove_background_job(pid);
+                    let result = self.stopped_result();
+                    park_job(self);
+                    notify(Ok(result));
+                }
+                Ok(Wait::Foreground(reply)) => {
+                    remove_background_job(pid);
+                    let _ = reply.send(self);
+                }
+                Ok(Wait::Shutdown) => {
+                    remove_background_job(pid);
+                    self.kill_and_reap();
+                }
+                Err(error) => {
+                    remove_background_job(pid);
+                    self.kill_and_reap();
+                    notify(Err(error));
+                }
             }
         });
     }
@@ -586,36 +287,21 @@ impl Drop for PtyJob {
     }
 }
 
-/// Park a stopped job so the host can later resume it by pid.
-fn park_job(job: PtyJob) {
-    if let Ok(mut jobs) = PARKED_JOBS.lock() {
-        jobs.push_back(job);
-    }
-}
-
-/// Remove and return the parked (stopped) PTY job for `pid`, if any. The host
-/// (REPL) calls this to resume a Ctrl-Z'd foreground command via `fg`/`bg`.
-#[must_use]
-pub fn take_stopped_job(pid: u32) -> Option<PtyJob> {
-    let mut jobs = PARKED_JOBS.lock().ok()?;
-    let idx = jobs.iter().position(|j| j.pid() == pid)?;
-    jobs.remove(idx)
-}
-
-/// Drain every parked job, killing and reaping each (via `PtyJob::drop`). The
-/// host calls this on shutdown so stopped children are not left orphaned when
-/// the shell exits (statics are not dropped at process exit).
-pub fn shutdown_stopped_jobs() {
-    if let Ok(mut jobs) = PARKED_JOBS.lock() {
-        jobs.clear();
-    }
-}
-
 /// Run `spec` on a real PTY, teeing the merged output stream. In interactive
 /// foreground use the child may be *stopped* (Ctrl-Z) instead of finishing, in
 /// which case the returned [`ExecResult`] has `stopped: true` and the live PTY
 /// is parked for resumption (see the module docs and [`take_stopped_job`]).
 pub(crate) fn run_pty(mut spec: ExecSpec, cancel: &CancelToken) -> io::Result<ExecResult> {
+    // A PTY master has no portable write-half-close. Injecting the terminal's
+    // canonical VEOF byte is not an EOF in raw/noncanonical child modes and
+    // may instead corrupt the input stream. Incremental finite stdin therefore
+    // requires Capture's real pipe; reject it before sandboxing or spawning.
+    if matches!(&spec.stdin, StdinSpec::Stream(_)) {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "incremental stdin requires Capture mode; a PTY cannot half-close input",
+        ));
+    }
     let enforcement = crate::sandbox::apply(&mut spec)?;
     let ExecSpec {
         argv,
@@ -624,7 +310,7 @@ pub(crate) fn run_pty(mut spec: ExecSpec, cancel: &CancelToken) -> io::Result<Ex
         stdin,
         ..
     } = spec;
-    let program = resolve_program(&argv, &env)?;
+    let program = resolve_program(&argv, &env, &cwd)?;
 
     // portable-pty's Unix fork helper currently aborts in the child when its
     // exec-error report itself cannot be written after E2BIG. Reject Linux's
@@ -638,9 +324,8 @@ pub(crate) fn run_pty(mut spec: ExecSpec, cancel: &CancelToken) -> io::Result<Ex
         return Err(io::Error::from_raw_os_error(libc::E2BIG));
     }
 
-    // SAFETY: isatty is a trivial fd query.
-    let stdin_is_tty = unsafe { libc::isatty(0) } == 1;
-    let stdout_is_tty = unsafe { libc::isatty(1) } == 1;
+    let stdin_is_tty = is_tty(0);
+    let stdout_is_tty = is_tty(1);
 
     // Open a File stdin source before spawning so errors surface early.
     let stdin_file = match &stdin {
@@ -648,14 +333,7 @@ pub(crate) fn run_pty(mut spec: ExecSpec, cancel: &CancelToken) -> io::Result<Ex
         _ => None,
     };
 
-    let size = tty_winsize(0)
-        .or_else(|| tty_winsize(1))
-        .unwrap_or(PtySize {
-            rows: 24,
-            cols: 80,
-            pixel_width: 0,
-            pixel_height: 0,
-        });
+    let size = initial_pty_size();
     let pty = native_pty_system();
     let pair = pty.openpty(size).map_err(pty_err)?;
 
@@ -688,6 +366,7 @@ pub(crate) fn run_pty(mut spec: ExecSpec, cancel: &CancelToken) -> io::Result<Ex
     // another group (EPERM), and setsid already gives the isolated group job
     // control needs.
     let pgid = pid;
+    let process_group = cancel.register_process_group(pgid);
 
     let forward_tty = stdin_is_tty && matches!(stdin, StdinSpec::Inherit);
     let pending_feed = match stdin {
@@ -695,6 +374,7 @@ pub(crate) fn run_pty(mut spec: ExecSpec, cancel: &CancelToken) -> io::Result<Ex
         StdinSpec::File(_) => Some(Feed::File(
             stdin_file.expect("opened above for StdinSpec::File"),
         )),
+        StdinSpec::Stream(_) => unreachable!("stream stdin rejected before PTY spawn"),
         StdinSpec::Null | StdinSpec::Inherit => None,
     };
 
@@ -713,15 +393,17 @@ pub(crate) fn run_pty(mut spec: ExecSpec, cancel: &CancelToken) -> io::Result<Ex
         display,
         stdout_is_tty,
         reaped: false,
+        _process_group: process_group,
     };
 
-    match job.serve(cancel, true, false) {
+    match serve(&mut job, cancel, ServeOptions::foreground(false)) {
         Ok(Wait::Exited(raw)) => Ok(job.exit_result(raw)),
         Ok(Wait::Stopped) => {
             let res = job.stopped_result();
             park_job(job);
             Ok(res)
         }
+        Ok(Wait::Foreground(_) | Wait::Shutdown) => unreachable!("no background control channel"),
         Err(e) => {
             job.kill_and_reap();
             Err(e)
@@ -734,6 +416,69 @@ mod tests {
     use super::*;
     use crate::ExecMode;
     use std::ffi::OsString;
+    use std::io::{Read as _, Write as _};
+    use std::os::fd::{FromRawFd as _, IntoRawFd as _};
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+
+    use super::terminal::{OutputPumpConfig, RawModeGuard, pump_output};
+
+    fn stream_file(stream: UnixStream) -> File {
+        // SAFETY: `into_raw_fd` transfers ownership and `File` takes it over.
+        unsafe { File::from_raw_fd(stream.into_raw_fd()) }
+    }
+
+    #[test]
+    fn poisoned_tee_discards_uncertain_prefix_but_preserves_raw_passthrough() {
+        let tee = Arc::new(Mutex::new(b"uncertain-prefix".to_vec()));
+        let poisoner = Arc::clone(&tee);
+        assert!(
+            thread::spawn(move || {
+                let _bytes = poisoner.lock().expect("inject tee poison");
+                panic!("inject tee poison");
+            })
+            .join()
+            .is_err()
+        );
+
+        let truncated = Arc::new(AtomicBool::new(false));
+        let serve_done = Arc::new(AtomicBool::new(false));
+        let pump_done = Arc::new(AtomicBool::new(false));
+        let (reader, mut writer) = UnixStream::pair().expect("input pipe");
+        let (mut passthrough_reader, passthrough) = UnixStream::pair().expect("passthrough pipe");
+        let pump = {
+            let tee = Arc::clone(&tee);
+            let truncated = Arc::clone(&truncated);
+            let serve_done = Arc::clone(&serve_done);
+            let pump_done = Arc::clone(&pump_done);
+            thread::spawn(move || {
+                pump_output(
+                    stream_file(reader),
+                    OutputPumpConfig {
+                        tee,
+                        tee_truncated: truncated,
+                        passthrough: Some(stream_file(passthrough)),
+                        background_output: None,
+                        cap: 1024,
+                        serve_done,
+                        pump_done,
+                    },
+                );
+            })
+        };
+        writer.write_all(b"certain-output").expect("write input");
+        drop(writer);
+        pump.join().expect("pump contains tee poison");
+
+        let mut passed = Vec::new();
+        passthrough_reader
+            .read_to_end(&mut passed)
+            .expect("read passthrough");
+        assert_eq!(passed, b"certain-output");
+        assert_eq!(*tee.lock().expect("repaired tee"), b"certain-output");
+        assert!(truncated.load(Ordering::SeqCst));
+        assert!(pump_done.load(Ordering::SeqCst));
+    }
 
     /// Serializes every test below that parks/takes/drains the process-global
     /// `PARKED_JOBS` registry. Without this, cargo test's default thread
@@ -789,6 +534,76 @@ mod tests {
             libc::kill(pid, 0) == -1
                 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
         }
+    }
+
+    /// Raw-mode ownership is scoped, not process-lifetime state. In
+    /// particular an evaluator/host panic while a PTY is foreground must not
+    /// leave the user's terminal without echo or canonical input.
+    #[test]
+    fn raw_mode_guard_restores_termios_during_unwind() {
+        struct Fds(libc::c_int, libc::c_int);
+        impl Drop for Fds {
+            fn drop(&mut self) {
+                // SAFETY: both descriptors were returned by `openpty` and are
+                // closed exactly once by this owner.
+                unsafe {
+                    libc::close(self.0);
+                    libc::close(self.1);
+                }
+            }
+        }
+
+        let mut master = -1;
+        let mut slave = -1;
+        // SAFETY: valid output pointers; null optional name/termios/winsize
+        // requests the platform defaults for a fresh pseudo-terminal.
+        let opened = unsafe {
+            libc::openpty(
+                &raw mut master,
+                &raw mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(opened, 0, "openpty: {}", io::Error::last_os_error());
+        let _fds = Fds(master, slave);
+
+        // SAFETY: `slave` is the live terminal descriptor owned above.
+        let mut before = unsafe { mem::zeroed::<libc::termios>() };
+        assert_eq!(unsafe { libc::tcgetattr(slave, &raw mut before) }, 0);
+        let unwind = std::panic::catch_unwind(|| {
+            let _raw = RawModeGuard::new(slave).expect("pty slave supports raw mode");
+            // SAFETY: same live terminal descriptor.
+            let mut during = unsafe { mem::zeroed::<libc::termios>() };
+            assert_eq!(unsafe { libc::tcgetattr(slave, &raw mut during) }, 0);
+            assert_eq!(during.c_lflag & (libc::ECHO | libc::ICANON), 0);
+            panic!("exercise unwind restoration");
+        });
+        assert!(unwind.is_err());
+
+        // SAFETY: same live terminal descriptor, after the guard was dropped.
+        let mut after = unsafe { mem::zeroed::<libc::termios>() };
+        assert_eq!(unsafe { libc::tcgetattr(slave, &raw mut after) }, 0);
+        assert_eq!(after.c_iflag, before.c_iflag);
+        assert_eq!(after.c_oflag, before.c_oflag);
+        assert_eq!(after.c_cflag, before.c_cflag);
+        // PENDIN is transient kernel state, not a terminal-mode setting. BSD
+        // kernels may set it while applying an otherwise exact restoration.
+        assert_eq!(
+            after.c_lflag & !libc::PENDIN,
+            before.c_lflag & !libc::PENDIN
+        );
+        assert_eq!(after.c_cc, before.c_cc);
+    }
+
+    #[test]
+    fn raw_mode_setup_preserves_the_os_error() {
+        let error = match RawModeGuard::new(-1) {
+            Ok(_) => panic!("invalid terminal fd must fail closed"),
+            Err(error) => error,
+        };
+        assert_eq!(error.raw_os_error(), Some(libc::EBADF));
     }
 
     /// The core job-control contract this module implements: a child that
@@ -919,22 +734,196 @@ mod tests {
         assert!(job.reaped);
     }
 
-    /// `resume_background`: `SIGCONT` lets the job finish off the calling
-    /// thread (no fg terminal reattachment), and it is still reaped with no
-    /// zombie left behind once it exits.
+    /// A resume can race with external termination (or an administrator
+    /// killing the process group). The failed SIGCONT must be returned and,
+    /// critically, every helper attached before that signal must still stop.
     #[test]
-    fn resume_background_runs_to_completion_and_is_reaped() {
+    fn failed_resume_signal_retires_serve_helpers_and_reaps() {
         let _serial = JOB_CONTROL_TEST_LOCK.lock().unwrap();
         let cancel = CancelToken::new();
         let res = run_pty(sh_spec("kill -STOP $$"), &cancel).expect("run_pty");
         let job = take_stopped_job(res.pid).expect("parked job");
+        let pgid = job.pgid;
 
-        job.resume_background();
+        // SAFETY: this is the stopped process group owned by `job`.
+        assert_eq!(unsafe { libc::kill(-pgid, libc::SIGKILL) }, 0);
+        waitpid_blocking(job.pid).expect("reap externally terminated child");
+        assert!(process_is_gone(res.pid));
+
+        let start = Instant::now();
+        let error = job
+            .resume_foreground(&cancel)
+            .expect_err("SIGCONT of a vanished group must fail");
+        assert_eq!(error.raw_os_error(), Some(libc::ESRCH));
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "failed resume must not strand helper threads"
+        );
+        assert!(process_is_gone(res.pid), "the dead child must be reaped");
+    }
+
+    /// `resume_background`: `SIGCONT` lets the job finish off the calling
+    /// thread (no fg terminal reattachment), and it is still reaped with no
+    /// zombie left behind once it exits.
+    #[test]
+    fn resume_background_notifies_completion_and_is_reaped() {
+        let _serial = JOB_CONTROL_TEST_LOCK.lock().unwrap();
+        let cancel = CancelToken::new();
+        let res = run_pty(sh_spec("kill -STOP $$"), &cancel).expect("run_pty");
+        let job = take_stopped_job(res.pid).expect("parked job");
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        job.resume_background_notify(move |result| {
+            let _ = tx.send(result);
+        });
+
+        let completed = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("background completion notification")
+            .expect("background resume result");
+        assert!(!completed.stopped);
+        assert_eq!(completed.status, Some(0));
 
         wait_until(
             Duration::from_secs(5),
             "a backgrounded job must run to completion and be reaped",
             || process_is_gone(res.pid),
+        );
+    }
+
+    #[test]
+    fn running_background_job_transfers_back_to_foreground_ownership() {
+        let _serial = JOB_CONTROL_TEST_LOCK.lock().unwrap();
+        let cancel = CancelToken::new();
+        let res = run_pty(sh_spec("kill -STOP $$; sleep 30"), &cancel).expect("run_pty");
+        let job = take_stopped_job(res.pid).expect("parked job");
+        let (tx, rx) = std::sync::mpsc::channel();
+        job.resume_background_notify(move |result| {
+            let _ = tx.send(result);
+        });
+
+        let job = take_background_job(res.pid)
+            .expect("ownership request")
+            .expect("live background job");
+        assert_eq!(job.pid(), res.pid);
+        assert!(
+            matches!(rx.try_recv(), Err(mpsc::TryRecvError::Disconnected)),
+            "ownership transfer is not a terminal completion notification"
+        );
+
+        let foreground_cancel = CancelToken::new();
+        foreground_cancel.cancel();
+        let completed = job
+            .foreground_running(&foreground_cancel)
+            .expect("foreground attach and cancellation");
+        assert!(!completed.stopped);
+        assert_eq!(completed.signal.as_deref(), Some("SIGINT"));
+        assert!(process_is_gone(res.pid));
+        assert!(
+            take_background_job(res.pid).unwrap().is_none(),
+            "transferred job must leave the background registry"
+        );
+    }
+
+    #[test]
+    fn background_output_can_be_routed_to_a_host_sink() {
+        let _serial = JOB_CONTROL_TEST_LOCK.lock().unwrap();
+        let cancel = CancelToken::new();
+        let res =
+            run_pty(sh_spec("kill -STOP $$; printf background-safe"), &cancel).expect("run_pty");
+        let job = take_stopped_job(res.pid).expect("parked job");
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let sink = output.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        job.resume_background_notify_with_output(
+            move |bytes| sink.lock().unwrap().extend_from_slice(bytes),
+            move |result| {
+                let _ = tx.send(result);
+            },
+        );
+
+        let completed = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("background completion")
+            .expect("background result");
+        assert_eq!(completed.status, Some(0));
+        assert!(
+            output
+                .lock()
+                .unwrap()
+                .windows(b"background-safe".len())
+                .any(|window| window == b"background-safe")
+        );
+        assert!(process_is_gone(res.pid));
+    }
+
+    #[test]
+    fn shutdown_reaps_a_running_background_job() {
+        let _serial = JOB_CONTROL_TEST_LOCK.lock().unwrap();
+        let cancel = CancelToken::new();
+        let res = run_pty(sh_spec("kill -STOP $$; sleep 30"), &cancel).expect("run_pty");
+        let job = take_stopped_job(res.pid).expect("parked job");
+        job.resume_background();
+
+        shutdown_stopped_jobs();
+        wait_until(
+            Duration::from_secs(5),
+            "shell shutdown must reap running background PTYs",
+            || process_is_gone(res.pid),
+        );
+    }
+
+    #[test]
+    fn production_pty_ownership_stays_decomposed() {
+        let root = include_str!("pty.rs");
+        let production_root = root
+            .split_once("#[cfg(test)]")
+            .map_or(root, |(production, _)| production);
+        let registry = include_str!("pty/registry.rs");
+        let service = include_str!("pty/service.rs");
+        let terminal = include_str!("pty/terminal.rs");
+
+        assert!(
+            production_root.lines().count() <= 430,
+            "PTY production root grew past its orchestration boundary"
+        );
+        assert!(
+            registry.lines().count() <= 120,
+            "PTY registry grew too broad"
+        );
+        assert!(service.lines().count() <= 250, "PTY service grew too broad");
+        assert!(
+            terminal.lines().count() <= 300,
+            "PTY terminal I/O grew too broad"
+        );
+
+        assert!(
+            !production_root.contains("libc::poll")
+                && !production_root.contains("libc::tcgetattr")
+                && !production_root.contains("static PARKED_JOBS")
+                && !production_root.contains("static BACKGROUND_JOBS"),
+            "OS pumps and process-global registries belong in owned submodules"
+        );
+
+        let run_pty = production_root
+            .split_once("pub(crate) fn run_pty")
+            .expect("run_pty remains in the orchestration root")
+            .1;
+        assert!(
+            run_pty.lines().count() <= 125,
+            "run_pty should remain spawn-and-dispatch orchestration"
+        );
+        let serve_span = service
+            .split_once("pub(super) fn serve")
+            .expect("service entrypoint")
+            .1
+            .split_once("\nfn attach_input")
+            .expect("input helper boundary")
+            .0;
+        assert!(
+            serve_span.lines().count() <= 65,
+            "one service stint should delegate helper ownership"
         );
     }
 }

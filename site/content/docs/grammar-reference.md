@@ -714,7 +714,10 @@ A final `&` desugars to background task execution. It is not a binary operator a
 
 ## Interpreter blocks
 
-The parser recognizes interpreter-class heads before an immediately following raw block. Built-in adapter metadata currently declares common interpreters including `sh`, `bash`, `python`, `node`, `deno`, and `ruby`.
+The parser recognizes interpreter-class heads before an immediately following raw block. It has a
+canonical default set for standalone tools, while configured REPL/kernel/script parsing adds every
+loaded adapter declared as an interpreter. Built-in metadata includes `sh`, `bash`, `python`,
+`node`, `deno`, `ruby`, `jq`, and `yq`.
 
 ```shoal
 python {

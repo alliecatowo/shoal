@@ -5,11 +5,29 @@ use std::collections::HashMap;
 
 use rusqlite::ToSql;
 
-use crate::{Journal, OutputMeta, OutputRow, hex_string};
+use crate::{EntryKind, Journal, OutputMeta, OutputRow, hash_string, hex_bytes};
 
 /// Default number of rows returned by [`Journal::query`] when
 /// [`JournalQuery::limit`] is `0`.
 const DEFAULT_QUERY_LIMIT: usize = 100;
+
+fn sql_i64_from_usize(value: usize) -> rusqlite::Result<i64> {
+    i64::try_from(value).map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+}
+
+fn sql_i64_from_u64(value: u64) -> rusqlite::Result<i64> {
+    i64::try_from(value).map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+}
+
+fn count_as_u64(value: i64) -> rusqlite::Result<u64> {
+    u64::try_from(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Integer,
+            Box::new(error),
+        )
+    })
+}
 
 /// A fully materialized journal entry as returned by [`Journal::query`].
 ///
@@ -19,6 +37,10 @@ const DEFAULT_QUERY_LIMIT: usize = 100;
 pub struct EntryRow {
     /// Rowid of the entry (stable reference, e.g. `out:12`).
     pub id: i64,
+    /// Semantic role of this row.
+    pub kind: EntryKind,
+    /// Owning coarse execution row, for evaluator statements.
+    pub parent_id: Option<i64>,
     /// Session identifier.
     pub session: String,
     /// Acting principal.
@@ -45,16 +67,29 @@ pub struct EntryRow {
     pub outputs: Vec<OutputRow>,
 }
 
+/// Bounded cursor state used to lazily hydrate one durable event channel.
+/// `published` is the full historical count; `tail_entry_ids` contains only
+/// the newest caller-requested pointers, in ascending sequence order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableEventSeed {
+    pub published: u64,
+    pub tail_entry_ids: Vec<i64>,
+}
+
 /// Filter set for [`Journal::query`]. `Default` matches everything with the
 /// default limit.
 #[derive(Default)]
 pub struct JournalQuery {
     /// Only entries with `ts_ns >= since_ts_ns`.
     pub since_ts_ns: Option<i64>,
+    /// Only entries recorded for this exact named session.
+    pub session: Option<String>,
     /// Only entries whose `src`'s first whitespace-separated word equals this.
     pub head: Option<String>,
     /// Only entries recorded by this principal.
     pub principal: Option<String>,
+    /// Only entries with this semantic role.
+    pub kind: Option<EntryKind>,
     /// Only finished entries with this success verdict (unfinished entries have
     /// `NULL` ok and never match).
     pub ok: Option<bool>,
@@ -63,11 +98,117 @@ pub struct JournalQuery {
 }
 
 impl Journal {
+    /// Count coarse exec-level journal events for one exact owner and return
+    /// only the newest `tail_limit` pointers.
+    pub fn journal_event_seed(
+        &self,
+        principal: &str,
+        session: &str,
+        tail_limit: usize,
+    ) -> rusqlite::Result<DurableEventSeed> {
+        let published: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM entry
+              WHERE principal = ?1 AND session = ?2 AND kind = 'exec'",
+            rusqlite::params![principal, session],
+            |row| row.get(0),
+        )?;
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM entry
+              WHERE principal = ?1 AND session = ?2 AND kind = 'exec'
+              ORDER BY id DESC LIMIT ?3",
+        )?;
+        let mut tail_entry_ids = stmt
+            .query_map(
+                rusqlite::params![principal, session, sql_i64_from_usize(tail_limit)?],
+                |row| row.get(0),
+            )?
+            .collect::<rusqlite::Result<Vec<i64>>>()?;
+        tail_entry_ids.reverse();
+        Ok(DurableEventSeed {
+            published: count_as_u64(published)?,
+            tail_entry_ids,
+        })
+    }
+
+    /// Resolve an exact half-open sequence page for one owner's durable
+    /// `journal` channel without materializing preceding history.
+    pub fn journal_event_entry_ids(
+        &self,
+        principal: &str,
+        session: &str,
+        start_seq: u64,
+        limit: usize,
+    ) -> rusqlite::Result<Vec<i64>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM entry
+              WHERE principal = ?1 AND session = ?2 AND kind = 'exec'
+              ORDER BY id ASC LIMIT ?3 OFFSET ?4",
+        )?;
+        stmt.query_map(
+            rusqlite::params![
+                principal,
+                session,
+                sql_i64_from_usize(limit)?,
+                sql_i64_from_u64(start_seq)?
+            ],
+            |row| row.get(0),
+        )?
+        .collect()
+    }
+
+    /// Whether `hash` is linked from an output row owned by the exact
+    /// principal-private session. This is the authorization lookup used before
+    /// serving CAS bytes over `blob.get`; it avoids materializing an owner's
+    /// entire journal merely to check one content address.
+    pub fn output_owned_by(
+        &self,
+        hash: &str,
+        session: &str,
+        principal: &str,
+    ) -> rusqlite::Result<bool> {
+        let Ok(hash) = hex_bytes(hash) else {
+            return Ok(false);
+        };
+        self.conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1
+                   FROM output o
+                   JOIN entry e ON e.id = o.entry_id
+                  WHERE o.hash = ?1 AND e.session = ?2 AND e.principal = ?3
+             )",
+            rusqlite::params![hash, session, principal],
+            |row| row.get(0),
+        )
+    }
+
     /// Query entries newest-first with the filters in `q`, outputs joined in.
     ///
     /// `limit == 0` means the default of 100. The `head` filter matches entries
     /// whose `src`'s first whitespace-separated word equals `head` exactly.
     pub fn query(&self, q: &JournalQuery) -> rusqlite::Result<Vec<EntryRow>> {
+        self.query_inner(q, None)
+    }
+
+    /// Query entries newest-first while retaining only rows whose structured
+    /// effects contain `wanted`. Filtering happens as SQLite rows are stepped,
+    /// before any row is retained, and stops once `q.limit` matches have been
+    /// collected. This is the bounded history-CLI counterpart to [`Self::query`].
+    pub fn query_effect_contains(
+        &self,
+        q: &JournalQuery,
+        wanted: &str,
+    ) -> rusqlite::Result<Vec<EntryRow>> {
+        self.query_inner(q, Some(wanted))
+    }
+
+    fn query_inner(
+        &self,
+        q: &JournalQuery,
+        effect_contains: Option<&str>,
+    ) -> rusqlite::Result<Vec<EntryRow>> {
         let limit = if q.limit == 0 {
             DEFAULT_QUERY_LIMIT
         } else {
@@ -76,7 +217,8 @@ impl Journal {
         let limit_i64 = limit as i64;
 
         let mut sql = String::from(
-            "SELECT id, session, principal, ts, dur_ns, cwd, src, ast, effects, status, ok, opaque
+            "SELECT id, session, principal, ts, dur_ns, cwd, src, ast, effects, status, ok, opaque,
+                    kind, parent_id
              FROM entry",
         );
         let mut clauses: Vec<&str> = Vec::new();
@@ -85,9 +227,17 @@ impl Journal {
             clauses.push("ts >= ?");
             params.push(ts);
         }
+        if let Some(session) = q.session.as_ref() {
+            clauses.push("session = ?");
+            params.push(session);
+        }
         if let Some(principal) = q.principal.as_ref() {
             clauses.push("principal = ?");
             params.push(principal);
+        }
+        if let Some(kind) = q.kind.as_ref() {
+            clauses.push("kind = ?");
+            params.push(kind);
         }
         if let Some(ok) = q.ok.as_ref() {
             clauses.push("ok = ?");
@@ -98,9 +248,10 @@ impl Journal {
             sql.push_str(&clauses.join(" AND "));
         }
         sql.push_str(" ORDER BY id DESC");
-        // The head filter is applied in Rust (SQL cannot cheaply split on arbitrary
-        // whitespace), so SQL LIMIT is only usable when no head filter is set.
-        if q.head.is_none() {
+        // The head/effect filters are applied while stepping rows (SQL cannot
+        // cheaply express their exact semantics), so SQL LIMIT is usable only
+        // when neither filter is present.
+        if q.head.is_none() && effect_contains.is_none() {
             sql.push_str(" LIMIT ?");
             params.push(&limit_i64);
         }
@@ -115,8 +266,18 @@ impl Journal {
             {
                 continue;
             }
+            let effects_json: String = row.get(8)?;
+            if let Some(wanted) = effect_contains
+                && !serde_json::from_str::<serde_json::Value>(&effects_json)
+                    .ok()
+                    .is_some_and(|value| effect_matches(&value, wanted))
+            {
+                continue;
+            }
             out.push(EntryRow {
                 id: row.get(0)?,
+                kind: row.get(12)?,
+                parent_id: row.get(13)?,
                 session: row.get(1)?,
                 principal: row.get(2)?,
                 ts_ns: row.get(3)?,
@@ -124,7 +285,7 @@ impl Journal {
                 cwd: row.get(5)?,
                 src,
                 ast_json: row.get(7)?,
-                effects_json: row.get(8)?,
+                effects_json,
                 status: row.get(9)?,
                 ok: row.get(10)?,
                 opaque: row.get(11)?,
@@ -154,7 +315,8 @@ impl Journal {
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(
-            "SELECT id, session, principal, ts, dur_ns, cwd, src, ast, effects, status, ok, opaque
+            "SELECT id, session, principal, ts, dur_ns, cwd, src, ast, effects, status, ok, opaque,
+                    kind, parent_id
              FROM entry WHERE id IN ({placeholders})"
         );
         let params: Vec<&dyn ToSql> = ids.iter().map(|id| id as &dyn ToSql).collect();
@@ -164,6 +326,8 @@ impl Journal {
         while let Some(row) = rows.next()? {
             let entry = EntryRow {
                 id: row.get(0)?,
+                kind: row.get(12)?,
+                parent_id: row.get(13)?,
                 session: row.get(1)?,
                 principal: row.get(2)?,
                 ts_ns: row.get(3)?,
@@ -207,7 +371,7 @@ impl Journal {
                         })?;
                     Ok(OutputRow {
                         kind: r.get(0)?,
-                        hash: hex_string(&raw),
+                        hash: hash_string(&raw, 1)?,
                         len: r.get(2)?,
                         meta,
                     })
@@ -215,5 +379,19 @@ impl Journal {
                 .collect::<rusqlite::Result<Vec<_>>>()?;
         }
         Ok(())
+    }
+}
+
+fn effect_matches(value: &serde_json::Value, wanted: &str) -> bool {
+    match value {
+        serde_json::Value::Array(values) => {
+            values.iter().any(|value| effect_matches(value, wanted))
+        }
+        serde_json::Value::String(value) => value.contains(wanted),
+        serde_json::Value::Object(fields) => fields
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|kind| kind.contains(wanted)),
+        _ => false,
     }
 }

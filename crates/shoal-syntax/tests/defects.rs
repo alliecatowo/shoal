@@ -4,13 +4,17 @@
 //! parser/formatter design record is `site/content/internals/parser-formatter.md`.
 
 use shoal_ast::*;
-use shoal_syntax::{ParseCtx, canonical_equivalent, format_program, parse, parse_with_ctx};
+use shoal_syntax::{
+    MAX_PARSE_NESTING, MAX_SOURCE_BYTES, ParseCtx, canonical_equivalent, format_program, parse,
+    parse_with_ctx,
+};
 
 fn vb(names: &[&str]) -> ParseCtx {
     ParseCtx {
         repl: false,
         value_bound: names.iter().map(|s| s.to_string()).collect(),
         cmd_bound: vec![],
+        interpreter_bound: vec![],
     }
 }
 fn last(p: &Program) -> &Stmt {
@@ -575,4 +579,23 @@ fn call_trailing_block_lambda_still_works_outside_a_for_iterable() {
         }
         other => panic!("{other:?}"),
     }
+}
+
+#[test]
+fn hostile_nesting_is_a_typed_error_not_a_stack_abort() {
+    let levels = MAX_PARSE_NESTING.saturating_mul(2);
+    let nested_list = format!("{}0{}", "[".repeat(levels), "]".repeat(levels));
+    let error = parse(&nested_list).expect_err("nesting beyond the wall must be rejected");
+    assert!(error.msg.contains("nesting limit"), "{error:?}");
+
+    let unary = format!("{}1", "!".repeat(levels));
+    let error = parse(&unary).expect_err("recursive unary parsing shares the nesting wall");
+    assert!(error.msg.contains("nesting limit"), "{error:?}");
+}
+
+#[test]
+fn hostile_source_size_is_rejected_before_ast_construction() {
+    let source = "x".repeat(MAX_SOURCE_BYTES + 1);
+    let error = parse(&source).expect_err("oversized source must be rejected");
+    assert!(error.msg.contains("byte parse limit"), "{error:?}");
 }

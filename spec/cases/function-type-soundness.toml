@@ -1,0 +1,215 @@
+# Runtime contracts for user-function annotations. Parameter inputs share one
+# coercing call boundary for EXPR and CMD surfaces; return values are checked
+# exactly rather than converted on exit.
+
+[[case]]
+name = "fn-type-expr-string-coerces-to-int"
+src = '''
+fn f(x: int) -> int { x }
+f("3")
+'''
+value = "3"
+
+[[case]]
+name = "fn-type-expr-tag-mismatch-rejected"
+src = '''
+fn f(x: int) { x }
+f(true)
+'''
+error = "type_error"
+error_contains = 'argument `x`: expected int, found bool'
+
+[[case]]
+name = "fn-type-command-expression-cannot-bypass-check"
+src = '''
+fn f(x: int) { x }
+f (true)
+'''
+error = "type_error"
+error_contains = 'argument `x`: expected int, found bool'
+
+[[case]]
+name = "fn-type-named-expression-cannot-bypass-check"
+src = '''
+fn f(x: int) { x }
+f(x: false)
+'''
+error = "type_error"
+error_contains = 'argument `x`: expected int, found bool'
+
+[[case]]
+name = "fn-type-default-runs-through-shared-coercion"
+src = '''
+fn f(x: int = "7") -> int { x }
+f()
+'''
+value = "7"
+
+[[case]]
+name = "fn-type-failed-default-restores-caller-environment"
+src = '''
+fn f(a: int, b: int = missing) { a + b }
+try { f(1) } catch { null }
+a
+'''
+error = "not_found"
+error_contains = "command not found: a"
+
+[[case]]
+name = "fn-type-int-input-does-not-silently-lose-precision"
+src = '''
+fn f(x: float) -> float { x }
+f(3)
+'''
+error = "type_error"
+error_contains = 'argument `x`: expected float, found int'
+
+[[case]]
+name = "fn-type-path-input-strictly-coerces-to-str"
+src = '''
+fn f(x: str) -> str { x }
+f(path("a.txt"))
+'''
+value = '"a.txt"'
+
+[[case]]
+name = "fn-type-list-input-must-be-list"
+src = '''
+fn f(xs: list<int>) { xs }
+f(3)
+'''
+error = "type_error"
+error_contains = 'argument `xs`: expected list<int>, found int'
+
+[[case]]
+name = "fn-type-string-does-not-bypass-noncoercible-tag"
+src = '''
+fn f(x: bytes) { x }
+f("not bytes")
+'''
+error = "type_error"
+error_contains = 'argument `x`: expected bytes, found str'
+
+[[case]]
+name = "fn-type-nested-list-recursively-coerces"
+src = '''
+fn f(xs: list<list<int>>) -> list<list<int>> { xs }
+f([["1"], ["2", 3]])
+'''
+value = "[[1], [2, 3]]"
+
+[[case]]
+name = "fn-type-nested-list-mismatch-rejected"
+src = '''
+fn f(xs: list<list<int>>) { xs }
+f([[1], [true]])
+'''
+error = "type_error"
+error_contains = "expected int, found bool"
+
+[[case]]
+name = "fn-type-scalar-variadic-coerces-each-item"
+src = '''
+fn f(...xs: int) -> list<int> { xs }
+f 1 2 3
+'''
+value = "[1, 2, 3]"
+
+[[case]]
+name = "fn-type-list-variadic-expression-mismatch-rejected"
+src = '''
+fn f(...xs: list<int>) { xs }
+f(1, true)
+'''
+error = "type_error"
+error_contains = 'variadic argument `xs`: expected int, found bool'
+
+[[case]]
+name = "fn-type-empty-invalid-variadic-annotation-rejected"
+src = '''
+fn f(...xs: imaginary) { xs }
+f()
+'''
+error = "type_error"
+error_contains = 'unknown type annotation `imaginary`'
+
+[[case]]
+name = "fn-type-optional-param-accepts-null"
+src = '''
+fn f(x: int?) { x }
+f(null)
+'''
+value = "null"
+
+[[case]]
+name = "fn-type-required-param-rejects-null"
+src = '''
+fn f(x: int) { x }
+f(null)
+'''
+error = "type_error"
+error_contains = "expected int, found null"
+
+[[case]]
+name = "fn-type-return-mismatch-rejected"
+src = '''
+fn f() -> int { "3" }
+f()
+'''
+error = "type_error"
+error_contains = 'function `f` return: expected int, found str'
+
+[[case]]
+name = "fn-type-nested-return-mismatch-rejected"
+src = '''
+fn f() -> list<int> { [1, "2"] }
+f()
+'''
+error = "type_error"
+error_contains = 'function `f` return: expected int, found str'
+
+[[case]]
+name = "fn-type-optional-return-accepts-null"
+src = '''
+fn f() -> int? { null }
+f()
+'''
+value = "null"
+
+[[case]]
+name = "fn-type-return-does-not-widen-int-to-float"
+src = '''
+fn f() -> float { 3 }
+f()
+'''
+error = "type_error"
+error_contains = 'function `f` return: expected float, found int'
+
+[[case]]
+name = "fn-type-invalid-return-contract-fails-before-body-effects"
+src = '''
+var touched = 0
+fn f() -> imaginary { touched = 1
+  1 }
+try { f() } catch { null }
+touched
+'''
+value = "0"
+
+[[case]]
+name = "fn-type-invalid-generic-arity-rejected"
+src = '''
+fn f(xs: list<int, str>) { xs }
+f([])
+'''
+error = "type_error"
+error_contains = 'type `list` accepts at most 1 type argument'
+
+[[case]]
+name = "fn-type-table-element-annotation-is-record"
+src = '''
+fn f(xs: table<str>) { xs }
+f([])
+'''
+error = "type_error"
+error_contains = 'table element annotation must be `record`'

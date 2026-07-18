@@ -40,6 +40,14 @@ pub(crate) fn spawn_cancel_watcher(
         if claimed.swap(true, Ordering::SeqCst) {
             return; // another watcher owns the escalation
         }
+        if tokens.iter().any(CancelToken::has_suspended_processes) {
+            // Normally `CancelToken::cancel` has already resumed the registry.
+            // This per-child fallback also unsticks cancellation if the
+            // advisory multi-group registry had to reject a poisoned access.
+            unsafe {
+                libc::kill(-pgid, libc::SIGCONT);
+            }
+        }
         let ladder = [
             (libc::SIGINT, Some(ESCALATION_GRACE)),
             (libc::SIGTERM, Some(ESCALATION_GRACE)),

@@ -1,0 +1,21 @@
+#!/usr/bin/env shoal
+# Run the complete repository gate through Shoal command dispatch.
+
+let lock_rows = (reef lock)
+let lock_failures = lock_rows.where(row => row.locked != true)
+assert(lock_failures.is_empty(), "Reef could not lock the repository toolchain: {lock_failures}")
+run("scripts/reef-health.shl")
+run("cargo", "fmt", "--all", "--check")
+run("cargo", "clippy", "--workspace", "--all-targets", "--locked", "--", "-D", "warnings")
+run("cargo", "test", "--workspace", "--locked")
+run("cargo", "build", "--workspace", "--release", "--locked")
+run("target/release/shoal", "scripts/install-test.shl")
+run("cargo", "audit")
+run("cargo", "audit", "--file", "fuzz/Cargo.lock")
+run("site/scripts/check-diagrams.shl")
+run("scripts/source-audit.shl")
+run("scripts/doc-link-audit.shl")
+run("scripts/help-audit.shl")
+run("zola", "--root", "site", "check")
+run("actionlint")
+echo "repository gate passed"

@@ -8,7 +8,7 @@ description: Complete operating manual for driving shoal — the agent-first str
 shoal is a **typed value graph over one session kernel**, not a text-stream router. You never pipe
 bytes between processes and re-parse them; you get back **structured values** with **addressable refs**,
 and you drill into them by field path. This card is derived from the stable Zola sources under
-`site/content/docs/` and `site/content/internals/`, the 1,310-case corpus across 77 suites at
+`site/content/docs/` and `site/content/internals/`, the 1,355-case corpus across 79 suites at
 `spec/cases/*.toml`, and the current `shoal-mcp`/`shoal-proto`/`shoal-kernel` source. When prose and
 the corpus disagree, the corpus is the behavioral authority.
 
@@ -17,8 +17,8 @@ already structured on the wire. Reach for `structuredContent` / `value.get` / `s
 `content[0].text` or the human `render` string.
 
 > **Current surface snapshot.** The MCP facade ships 13 tools, including six PTY tools; resources,
-> templates, reads, and subscriptions are live. `resources/unsubscribe` is acknowledged but does
-> not stop its dedicated forwarding connection/thread; cleanup is scoped to MCP process exit.
+> templates, reads, and subscriptions are live. `resources/unsubscribe` removes the URI worker,
+> closes its dedicated kernel connection, and joins the forwarding thread.
 > `user.*` channels bridge in both directions; background cancellation and timeout-to-task
 > conversion work; and render/text
 > previews are capped at 64 KiB. Kernel autostart is on unless a non-empty
@@ -322,9 +322,9 @@ documented anyway — it still works and is your escape hatch if a *particular* 
 - `resources/subscribe {uri}` on `shoal://events/{channel}` or `shoal://task/{id}[/out]` starts a push
   subscription; the server sends `notifications/resources/updated` with `{uri, seq, payload}` as
   events occur. **Never poll a resource you could instead subscribe to.**
-- `resources/unsubscribe {uri}` currently returns success without stopping the dedicated kernel
-  connection or forwarding thread created by `resources/subscribe`. Subscribe once per URI in a
-  long-lived facade; cleanup occurs when the MCP process exits.
+- `resources/unsubscribe {uri}` removes that URI's worker; dropping the worker shuts down its
+  dedicated kernel connection and joins the forwarding thread. Facade teardown performs the same
+  cleanup for every remaining subscription.
 - **The language-channel→kernel-bus bridge now works, both directions, `user.*`-scoped (fixed —
   this card previously and wrongly called this a gap).** Verified live: an in-language
   `channel("user.x").emit(v)` (evaluated inside `src`) is forwarded to the kernel's wire bus and
@@ -869,8 +869,8 @@ Each rule: what's forbidden, why, the corpus/source proof, and the correct alter
 15. **An elided value's embedded `uri` (`shoal://...`) is independently fetchable via
     `resources/read` (DONE, §0.8)** — `resources/*` is confirmed dispatched
     (`crates/shoal-mcp/src/lib.rs`'s `handle` handles `resources/list`/`read`/`subscribe`), so this is
-    the preferred path, not a maybe. Its `resources/unsubscribe` acknowledgement does not cancel
-    the forwarding worker; that lifecycle limitation is documented in §0.8. If a *particular* URI
+    the preferred path, not a maybe. Its `resources/unsubscribe` removes and joins the URI's
+    forwarding worker as documented in §0.8. If a *particular* URI
     still 404s, fall back to translating it yourself: the part before `?path=` is the short `ref`
     you already have; the part after is the `path` argument to `shoal_get`.
 16. **Background execution and task management are now fully reachable through MCP** (updated —
@@ -977,7 +977,7 @@ pins it — just verify empirically if you hit an edge).
 | `custom` ✓ | a named, ad-hoc error with a specific message (e.g. the `cd`-in-`fn`/`env`-in-`fn` fix-its) | `reef.toml:reef-cd-inside-fn-body-is-illegal` |
 | `assert_failed` | (pinned; no corpus case reviewed) | — |
 | `permission` | (pinned; no corpus case reviewed) | — |
-| `recursion_limit` | recursion/loop depth exceeded (depth 10k, site/content/internals/language-conformance-contract.md) | restructure; loop limit is off in script mode |
+| `recursion_limit` | function recursion exceeded the native-stack-safe depth of 128 | restructure the recursion; loop iteration limits are a separate policy |
 | `overflow` ✓ | numeric/quantity arithmetic overflowed its representation (pinned in site/content/internals/intercrate-protocol-contracts.md; **corpus** `numbers-more.toml`; verified against the binary: `52w * 200000000` → `overflow: duration overflow`) | keep duration/size arithmetic inside i64-ns / u64-byte bounds |
 | `reef_unlocked` ✓ | a `with reef:`-constrained tool used in a non-interactive/script context without a lock | `reef.toml:reef-with-reef-constrains-a-spawn-inside-the-block` |
 | `reef_drift` | resolved binary's hash no longer matches the lock | `reef lock --refresh` (site/content/internals/reef-resolution.md; not verified reachable in this pass) |
@@ -993,21 +993,21 @@ pins it — just verify empirically if you hit an edge).
 
 ## 6. Implementation status — what works, what to skip
 
-This snapshot is grounded in current source and the 1,310-case/77-suite corpus. The structured MCP
+This snapshot is grounded in current source and the 1,355-case/79-suite corpus. The structured MCP
 surface, resources, PTYs, channels, CAS-backed refs, spawn pin gate, and platform filesystem
 sandboxes are shipped. Important boundaries remain: `task.suspend` is not implemented; network
 sandboxing is not enforced; some in-process filesystem effects bypass the child-process sandbox;
 and non-hermetic policies degrade honestly when a requested OS dimension is unavailable.
 
-- **SHIPPED, with an unsubscribe lifecycle limit — The MCP `resources/*`/events subsystem.**
+- **SHIPPED — The MCP `resources/*`/events subsystem.**
   `crates/shoal-mcp/src/lib.rs`'s `handle()` dispatches `resources/list`/`read`/`subscribe`, and
   `initialize` advertises
   `capabilities.resources.subscribe = true`; event notifications forward as
   `notifications/resources/updated` (`client.rs::run_event_forwarder`). Use `resources/read` on a
   `shoal://…` uri to drill into an elided value directly — the `shoal_get`+manual-URI translation
   (§0.2, §4 rule 15) is now just a fallback. Confirmed by the live e2e test
-  `crates/shoal-mcp/tests/live_kernel.rs`. `resources/unsubscribe` returns success but does not stop
-  that dedicated connection/worker; MCP process exit remains the cleanup boundary.
+  `crates/shoal-mcp/tests/live_kernel.rs`. `resources/unsubscribe` stops and joins that dedicated
+  connection/worker; process exit also cleans up any subscriptions still registered.
 - **DONE — `shoal_cancel`.** Present in the 13-tool surface. Note `task.suspend` still errors
   (unimplemented even over raw JSON-RPC).
 - **DONE — background/async execution via MCP.** `shoal_exec`'s schema exposes `background` and
@@ -1069,5 +1069,5 @@ and non-hermetic policies degrade honestly when a requested OS dimension is unav
 ---
 
 *Canonical prose lives in `site/content/docs/` and `site/content/internals/`; executable semantics
-live in the 1,310 cases across `spec/cases/*.toml`. Re-check the current source and corpus when this
+live in the 1,355 cases across `spec/cases/*.toml`. Re-check the current source and corpus when this
 card and a running binary disagree.*

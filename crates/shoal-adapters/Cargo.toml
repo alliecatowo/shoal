@@ -3,6 +3,9 @@ name = "shoal-adapters"
 version = "0.1.0"
 edition = "2024"
 
+[lints]
+workspace = true
+
 [dependencies]
 serde = "1.0.228"
 serde_json = "1.0.150"
@@ -11,4 +14,5 @@ shoal-value = { version = "0.1.0", path = "../shoal-value" }
 toml = "1.1.2"
 
 [dev-dependencies]
+shoal-syntax = { version = "0.1.0", path = "../shoal-syntax" }
 tempfile = "3.27.0"

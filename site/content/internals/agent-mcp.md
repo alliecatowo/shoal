@@ -26,9 +26,9 @@ accDescr: Shows the components and relationships described in Bridge topology.
   Facade -->|"Unix socket JSON-RPC"| Kernel["shoal-kernel"]
   Facade --> Tools["tools mapper"]
   Facade --> Resources["shoal:// resource mapper"]
-  Resources --> SubConn["dedicated subscription connection"]
-  SubConn --> Kernel
-  SubConn -->|"notifications/resources/updated"| Agent
+  Resources --> SubHub["one multiplexed subscription hub"]
+  SubHub -->|"one attached connection"| Kernel
+  SubHub -->|"notifications/resources/updated"| Agent
 ```
 
 The facade advertises MCP protocol version `2025-06-18`, tools, resources, and resource
@@ -43,11 +43,13 @@ best-effort spawns a detached `shoal-kernel`, polls readiness for about five sec
 `SHOAL_NO_AUTOSTART` opts out for externally supervised kernels. Competing autostarts rely on the
 kernel's socket preparation to leave one winner.
 
-Both MCP stdio and kernel socket protocols use newline JSON frames with a 16 MiB completed-frame
-limit. Like the kernel reader, the MCP reader calls `read_line` before checking size, so memory is not
-strictly bounded while the line is being accumulated.
+Both MCP stdio and kernel socket protocols use newline JSON frames with a 16 MiB content limit
+enforced during the read, so an unterminated frame cannot grow the line buffer past the bound plus
+its terminator sentinel. Their shared fixed-stack JSON preflight rejects excessive depth, values,
+container width, keys, and numbers before allocating a `serde_json` tree. The public kernel
+additionally applies its configured frame-read deadline.
 
-Stdout is locked per complete frame. This lets the request loop and subscription-forwarder threads
+Stdout is locked per complete frame. This lets the request loop and subscription-forwarder thread
 write without interleaving JSON bytes.
 
 ## Tool projection
@@ -70,12 +72,14 @@ The facade currently exposes 13 tools:
 | `shoal_pty_close` | `pty.close` | terminate and reap a PTY |
 | `shoal_pty_list` | `pty.list` | enumerate session PTYs |
 
-The facade's main `KernelClient` attaches before calling these methods, but that does not make every
-kernel handler authorization-safe. In particular, `cap.request` ignores the attachment because its
-router/handler signature receives none, and `journal.query` likewise has no attachment or
-caller-principal filter. A normal MCP call happens to arrive on an attached connection; a direct
-kernel client can call the same methods unattached, and an attached MCP principal is not checked as
-the approver. This must be fixed in the kernel boundary rather than papered over in the facade.
+The facade's main `KernelClient` attaches as restricted `agent:mcp` unless given an explicit bearer,
+then verifies the returned auth mode, public connection provenance, principal-private session
+isolation, and security epoch before calling these methods. The kernel boundary
+enforces attachment for every stateful method: `journal.query` (HR-D4) and `cap.request` (HR-D1) were
+the last exemptions and now reject an unattached direct kernel client with `NOT_ATTACHED`.
+`cap.request` additionally binds the attached principal as the **approver** and, by default, refuses a
+requester approving its own plan (HR-D3). The facade does not reimplement any of this authority — it
+is enforced in the kernel, not papered over in the bridge.
 
 
 Kernel RPC errors become successful MCP `tools/call` envelopes with `isError: true` and structured
@@ -128,22 +132,20 @@ shoal://events/{channel}{?since,limit}
 Resource reads return textual content plus `structuredContent`. `format=render` or `format=raw`
 becomes `text/plain`; structured data is pretty JSON text with the same bounded-text rule.
 
-There is a current raw-value escape in that mapping. Kernel `value.get {format:"raw"}` returns
-complete bytes as `raw_base64`, without normal elision. The MCP resource reader recognizes a field
-named `raw` for plain-text handling but does not special-case `raw_base64`; the entire base64 payload
-therefore remains in `structuredContent` and its JSON text representation. A CAS ref that looked
-context-cheap can expand to the full blob in both kernel memory and agent context. Raw fetch needs a
-bounded slice/stream or explicit out-of-band resource contract before it is safe to advertise as an
-elision exception.
+Raw-value reads remain explicit but are bounded. Kernel `value.get {format:"raw"}` returns at most
+8 KiB of decoded string/bytes content and continuation metadata; `blob.get` applies the same wall to
+byte `offset`/`length` pages. MCP therefore places only one bounded page in `structuredContent`, and
+the caller follows `page.next_offset` until `page.done`.
 
 Session env is names-only unless the kernel policy grants reading all requested names. The facade
 does not reimplement that authority decision.
 
 ## Subscriptions
 
-Only `shoal://events/{channel}` and task URIs map to event channels. Each subscription opens a
-dedicated kernel client connection and starts a forwarding thread, avoiding contention with normal
-request/response reads.
+Only `shoal://events/{channel}` and task URIs map to event channels. All subscriptions use one
+facade-owned hub with a separate kernel connection and forwarding thread, avoiding contention with
+normal request/response reads without multiplying sockets/threads by URI. A bounded wakeup channel
+serializes lifecycle changes; the routing map holds at most 64 exact URIs.
 
 ```mermaid
 sequenceDiagram
@@ -151,11 +153,11 @@ accTitle: Subscriptions
 accDescr: Shows the components and relationships described in Subscriptions.
   participant A as agent
   participant M as main facade
-  participant S as subscription thread
+  participant S as multiplexed subscription hub
   participant K as kernel
   A->>M: resources/subscribe(uri)
-  M->>S: create dedicated KernelClient
-  S->>K: attach + events.subscribe(channel)
+  M->>S: add exact URI → channel route
+  S->>K: attach once; events.subscribe(channel)
   K-->>S: event notifications
   S-->>A: notifications/resources/updated(uri)
   A->>M: resources/read(uri)
@@ -169,8 +171,7 @@ incrementally streamed: once the kernel task has a result ref, `/out` resolves t
 
 PTY resources are **not** subscribable. `shoal_pty_read` must be polled, and its `changed` bit tells
 the caller whether the rendered screen changed since its last read. MCP `resources/unsubscribe`
-currently acknowledges without an explicit facade-side thread registry; kernel disconnect cleanup
-ultimately removes a subscription when its connection ends.
+removes the exact URI route and unsubscribes the kernel channel when no URI still maps to it.
 
 ## Agent-relevant semantic boundaries
 

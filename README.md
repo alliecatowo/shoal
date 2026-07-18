@@ -61,9 +61,17 @@ Shoal is pre-release and is not ready to replace a login shell. The language eng
 runner, Reef resolver, journal/CAS, Leash policy path, streams/channels, kernel protocol, and MCP
 facade are implemented and tested on Linux and macOS.
 
+**Shoal is Unix-only.** It relies on Unix-domain sockets, POSIX process/signal/PTY semantics, and
+(where available) Landlock/Seatbelt sandboxing; Windows is out of scope for now and would need a
+deliberate port (see [Current status and limits](https://alliecatowo.github.io/shoal/docs/status-limits/)).
+
 ```bash
+# Install the pinned tools, then all binaries, man pages, and host-shell completions
+mise install
+mise run install
+
 # Interactive shell
-cargo run -p shoal
+shoal
 
 # Evaluate source
 cargo run -p shoal -- -c $'let answer = 6 * 7\nanswer'
@@ -72,8 +80,8 @@ cargo run -p shoal -- -c $'let answer = 6 * 7\nanswer'
 cargo run -p shoal -- examples/example.shl
 ```
 
-The repository currently ships **49 declarative adapters** and a normative corpus of **1,310
-cases across 77 suites**. The corpus is the executable language contract.
+The repository currently ships **49 declarative adapters** and a normative corpus of **1,355
+cases across 79 suites**. The corpus is the executable language contract.
 
 ## The model
 
@@ -103,9 +111,9 @@ optional span instead of inventing one.
 
 ## Agents and interactive programs
 
-The local CLI/REPL currently hosts its evaluator directly; it does not yet route execution through
-the long-lived kernel. `shoal-kernel` separately exposes shared newline-framed JSON-RPC sessions,
-and `shoal-mcp` provides the MCP facade. The
+The default CLI/REPL starts an isolated private `shoal-kernel` over an inherited descriptor;
+`shoal --standalone` selects the embedded evaluator. A separate durable named-socket kernel serves
+agent Sessions, and `shoal-mcp` provides the MCP facade. The
 installable Claude Code [plugin](plugin/) adds the full language card and **13 tools** for structured
 execution, plans, approvals, refs, journal queries, cancellation, and interactive PTYs.
 
@@ -141,7 +149,7 @@ accessible relationship diagrams in compact pan/zoom viewers while preserving ev
 | `shoal-reef`, `shoal-adapters` | reproducible tool resolution and typed CLI schemas |
 | `shoal-journal` | SQLite journal and blake3 content-addressed storage |
 | `shoal-leash` | plans, grants, hash pins, OS enforcement |
-| `shoal-proto`, `shoal-kernel`, `shoal-mcp` | shared sessions and agent protocols |
+| `shoal-proto`, `shoal-kernel`, `shoal-mcp` | principal-private sessions and agent protocols |
 | `shoal-prompt`, `shoal-lsp`, `shoal` | prompt, editor tooling, CLI and REPL host |
 
 The [Architecture Atlas](https://alliecatowo.github.io/shoal/internals/) traces crate boundaries,
@@ -150,10 +158,13 @@ runtime flows, security boundaries, protocol contracts, and implementation statu
 ## Build and test
 
 ```bash
-cargo fmt --all --check
-cargo +stable clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --locked
+mise install
+mise run check
 ```
+
+The gate itself is a checked-in Shoal program. It drives formatting, strict Clippy, workspace and
+conformance tests, release builds, dependency audits, Reef validation, source-policy checks, man
+page/help execution, diagram governance, and the documentation build.
 
 Run only the executable language contract with:
 

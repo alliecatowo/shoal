@@ -1,0 +1,29 @@
+.TH SHOAL-KERNEL 1 "July 2026" "Shoal 0.1.0" "User Commands"
+.SH NAME
+shoal-kernel \- run the resident Shoal execution kernel
+.SH SYNOPSIS
+.B shoal-kernel
+.RI [ options ]
+.SH DESCRIPTION
+Serves authenticated Shoal sessions over a private Unix socket or inherited embedded descriptor.
+.SH OPTIONS
+.TP
+.BI \-\-session " NAME"
+Select a named session.
+.TP
+.BI \-\-socket " PATH"
+Listen on PATH.
+.TP
+.BI \-\-state-dir " PATH"
+Store durable state below PATH.
+.TP
+.BI \-\-token-store " PATH"
+Use PATH as the credential authority file; overrides SHOAL_TOKEN_STORE.
+.TP
+.BI \-\-policy " FILE"
+Load a sandbox policy.
+.TP
+.BR \-h , " \-\-help"
+Print all limit and transport options.
+.SH SEE ALSO
+.BR shoal (1)

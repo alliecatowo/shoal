@@ -12,14 +12,23 @@
 
 pub mod commands;
 mod format;
+mod format_safety;
 pub mod lexer;
 mod parser;
 
 pub use format::{canonical_equivalent, format_program};
+pub use format_safety::{FormatRefusal, format_source_preserving_trivia};
 pub use lexer::{LexError, Lexer, Mode, Seg, Tok};
 pub use parser::{
-    ParseCtx, ParseError, ParseResult, Parser, parse, parse_with_ctx, parse_with_scope,
+    MAX_PARSE_NESTING, MAX_PARSE_TOKENS, MAX_SOURCE_BYTES, ParseCtx, ParseError, ParseResult,
+    Parser, parse, parse_with_ctx, parse_with_scope,
 };
+
+/// Canonical raw-block interpreter heads understood without host-provided
+/// adapter context. Exposed for generated adapter/parser parity checks.
+pub fn parser_interpreters() -> &'static [&'static str] {
+    parser::INTERPRETERS
+}
 
 #[derive(Debug)]
 pub enum ParseStatus {

@@ -32,7 +32,8 @@ The MCP facade implements:
 - `resources/templates/list` for parameterized URI forms;
 - `resources/read` for current content;
 - `resources/subscribe` for event and task update notifications;
-- `resources/unsubscribe`, currently acknowledged but not connected to the background forwarder.
+- `resources/unsubscribe`, which removes the URI worker, shuts down its dedicated kernel socket,
+  and joins the background forwarder.
 
 ## Listed resources
 
@@ -157,9 +158,9 @@ It maps to the raw kernel array `[0, 50]`. Bounds are nonnegative and the end is
 | --- | --- |
 | omitted or `json` | Tagged wire JSON with normal elision. |
 | `render` | Human display string in `text/plain`. |
-| `raw` | Verbatim string, or base64 for bytes/CAS blobs; other value types reject it. |
+| `raw` | One bounded verbatim-string or base64 byte page; other value types reject it. |
 
-`format=raw` is intended for explicit data transfer, not casual inspection. In the current implementation, raw string/byte retrieval bypasses the normal encoded 64 KiB value ceiling: the MCP `contents[].text` presentation is bounded, but `structuredContent.raw` or `structuredContent.raw_base64` can contain the full payload. Treat the URI as potentially large and apply client-side limits. This is a known current behavior, not a guarantee that future versions will remain unbounded.
+`format=raw` is intended for explicit data transfer, not casual inspection. Each response carries at most 8 KiB of decoded content. `page.unit` is `unicode_scalar` for strings and `byte` for bytes; resume with `slice=<next_offset>..<end>` until `page.done`. `page.total_len`, `returned_len`, `truncated`, and `request_truncated` distinguish the complete value, the returned page, remaining content, and a server-shortened requested range. The bounded page—not the complete payload—is exposed in MCP `structuredContent`.
 
 The `shoal_get` MCP tool intentionally does not advertise `format`; representation selection is available through the URI or raw kernel method.
 
@@ -173,7 +174,7 @@ shoal://out/17?elide=%7B%22max_rows%22%3A20%7D
 
 Because it is not part of the published URI template, portable MCP clients should prefer `shoal_get` for a custom elision budget. The stable drill-down mechanisms are `path` and `slice`.
 
-## Content values: `shoal://val/{hash}`
+## Content values: `shoal://val/{hash}{?offset,length}`
 
 Large immutable values may be stored in the content-addressed store and referenced as:
 
@@ -181,11 +182,12 @@ Large immutable values may be stored in the content-addressed store and referenc
 val:blake3:8baef...
 shoal://val/blake3:8baef...
 shoal://val/8baef...
+shoal://val/8baef...?offset=8192&length=8192
 ```
 
-The resource layer accepts the bare hash or strips the `blake3:` prefix before calling `blob.get`. Content references are backed by the kernel's CAS and can survive evaluator/session recreation when the journal/state directory survives. Their availability is still subject to garbage collection and state-directory selection.
+The resource layer accepts the bare hash or strips the `blake3:` prefix before calling `blob.get`. Offset and length are byte units; the server clamps length to 8 KiB and returns base64 plus the same continuation metadata. An omitted range preserves the legacy structured result only when the complete stored value fits in one page. Content references are backed by the kernel's CAS and can survive evaluator/session recreation when the journal/state directory survives. Their availability is still subject to garbage collection and state-directory selection.
 
-A content hash identifies bytes, not authorization. The local socket/token/session policy remains the access boundary around `blob.get`.
+A content hash identifies bytes, not authorization. `blob.get` additionally requires the hash to be linked to an output owned by the exact attached session and principal; foreign and unknown hashes are deliberately indistinguishable.
 
 ## Tasks: `shoal://task/{id}`
 
@@ -195,7 +197,10 @@ Read the current record for background or timed-out execution:
 shoal://task/9
 ```
 
-The URI restores the short `task:9` form and calls `task.get`. A record exposes state, source/description metadata, timestamps, and—after successful capture—a `result_ref`. Task registry state is live-memory state and disappears on kernel restart.
+The URI restores the short `task:9` form and calls `task.get`. A record exposes state, session,
+timestamps, an advisory cancel/suspend/resume control snapshot, and—after successful capture—a
+`result_ref`. Task registry state is live-memory state and disappears on kernel restart. MCP can
+cancel a task but does not expose the raw kernel suspend/resume calls.
 
 ### Task output
 
@@ -433,7 +438,7 @@ Delivery should be treated as at-least-once from the consumer's perspective. Ded
 
 ### Backpressure and dropped summaries
 
-The kernel gives each subscriber a queue of 256 pending events and a dedicated socket-writer thread. Publishing never waits on a slow subscriber. When that subscriber's queue is full, additional events are dropped and coalesced. Once delivery resumes, it receives a synthetic event payload:
+The kernel gives each subscribed channel a queue of 256 pending events and uses one socket-writer dispatcher per connection. Publishing never waits on a slow queue. When that queue is full, additional events are dropped and coalesced. Once delivery resumes, it receives a synthetic event payload:
 
 ```json
 {
@@ -444,11 +449,16 @@ The kernel gives each subscriber a queue of 256 pending events and a dedicated s
 
 This tells the consumer that its live stream has a gap. Read the channel from the last processed cursor; for a ring-only channel whose gap is older than retention, reconcile from authoritative state.
 
-### Current unsubscribe limitation
+### Unsubscribe lifetime
 
-The MCP facade currently answers `resources/unsubscribe` with `{}` but does not signal or close the dedicated subscription connection/thread. The subscription normally lives until the MCP process or kernel connection ends. Avoid repeatedly subscribing to the same URI in one long-lived facade, and use process disconnect as the reliable cleanup boundary.
+The MCP facade owns one multiplexed worker and one kernel connection for its bounded 64-URI registry.
+`resources/unsubscribe` removes the exact route and asks the kernel to remove a channel when its final
+URI disappears. Duplicate subscribe and absent unsubscribe are idempotent. Facade drop shuts down the
+connection and joins the worker; a disconnected hub requires resubscription and cursor-based
+reconciliation, but adding URIs does not add sockets or threads.
 
-This differs from the raw kernel `events.unsubscribe`, which does remove a subscription on that same kernel connection.
+The raw kernel `events.unsubscribe` remains the lighter same-connection operation: it removes the
+named channel from the current connection without closing that connection.
 
 ## Robust event-consumer algorithm
 

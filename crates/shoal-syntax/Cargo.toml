@@ -3,6 +3,9 @@ name = "shoal-syntax"
 version = "0.1.0"
 edition = "2024"
 
+[lints]
+workspace = true
+
 [dependencies]
 shoal-ast = { version = "0.1.0", path = "../shoal-ast" }
 serde_json = "1"

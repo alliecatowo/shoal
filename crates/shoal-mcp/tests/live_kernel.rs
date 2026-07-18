@@ -8,8 +8,10 @@
 
 use serde_json::{Value, json};
 use shoal_kernel::Kernel;
+use shoal_leash::Policy;
 use shoal_mcp::{Config, Facade};
-use shoal_proto::{JSONRPC, Request, Response, write_frame};
+use shoal_proto::error_code::NOT_ATTACHED;
+use shoal_proto::{JSONRPC, RAW_PAGE_MAX_BYTES, Request, Response, write_frame};
 use std::io::BufReader;
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
@@ -28,7 +30,10 @@ impl LiveKernel {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("run/kernel.sock");
         let stop = Arc::new(AtomicBool::new(false));
-        let kernel = Kernel::new();
+        // MCP reaches the public listener as a restricted agent. Give that
+        // principal a permissive test policy rather than manufacturing human
+        // presence from possession of the socket path.
+        let kernel = Kernel::with_policy(Policy::permissive("agent:mcp"));
         let serve_socket = socket.clone();
         let serve_stop = stop.clone();
         let handle = std::thread::spawn(move || {
@@ -62,6 +67,7 @@ impl LiveKernel {
             socket: self.socket.clone(),
             session: Some("default".into()),
             token: None,
+            local_auth: shoal_mcp::LocalAuthMode::RestrictedAgent,
         }
     }
 }
@@ -119,7 +125,11 @@ fn mcp_exec_elides_render_and_text_then_resource_read_drills_in() {
     // so bounding at the MCP boundary is actually exercised (not a no-op).
     let bigdir = live._dir.path().join("bigdir");
     std::fs::create_dir_all(&bigdir).unwrap();
-    for i in 0..2000 {
+    // One thousand rows render comfortably above 64 KiB while staying below
+    // the evaluator's 1 MiB single-binding wall even under macOS's much longer
+    // temporary-directory paths. Two thousand made this fixture test the
+    // unrelated binding quota on macOS before it reached MCP elision.
+    for i in 0..1000 {
         std::fs::write(bigdir.join(format!("file{i:05}.txt")), b"x").unwrap();
     }
     let mut facade = Facade::connect(&live.config()).unwrap();
@@ -129,12 +139,17 @@ fn mcp_exec_elides_render_and_text_then_resource_read_drills_in() {
         "shoal_exec",
         json!({"src": format!("ls {}", bigdir.display()), "position":"stmt"}),
     );
+    assert_eq!(
+        result["isError"], false,
+        "large-table exec failed before elision: {}",
+        result["structuredContent"]
+    );
 
     // Structured value: the outcome's `.out` table is elided to a ref.
     let out = &result["structuredContent"]["value"]["out"];
-    assert_eq!(out["$"], "ref", "a 2000-row table must elide: {out}");
+    assert_eq!(out["$"], "ref", "a 1000-row table must elide: {out}");
     assert_eq!(out["of"], "table");
-    assert_eq!(out["n"], 2000);
+    assert_eq!(out["n"], 1000);
 
     // site/content/internals/kernel-protocol.md: the human text content is bounded (<= 64 KiB) even though the raw
     // render of 2000 rows is far larger — the render string cannot bypass the
@@ -184,6 +199,43 @@ fn mcp_exec_elides_render_and_text_then_resource_read_drills_in() {
     assert!(
         value["v"]["name"].is_object(),
         "drilled row keeps its fields"
+    );
+}
+
+#[test]
+fn mcp_raw_resource_returns_only_a_page_in_structured_content() {
+    let live = LiveKernel::start();
+    let mut facade = Facade::connect(&live.config()).unwrap();
+    let source = format!("\"{}\"", "z".repeat(RAW_PAGE_MAX_BYTES * 4));
+    let exec = call_tool(
+        &mut facade,
+        "shoal_exec",
+        json!({"src":source,"position":"value"}),
+    );
+    let r#ref = exec["structuredContent"]["ref"].as_str().unwrap();
+    let index = r#ref.strip_prefix("out:").unwrap();
+    let first = read_resource(&mut facade, &format!("shoal://out/{index}?format=raw"));
+    assert!(serde_json::to_vec(&first).unwrap().len() < 64 * 1024);
+    let structured = &first["structuredContent"];
+    assert_eq!(structured["page"]["returned_len"], RAW_PAGE_MAX_BYTES);
+    assert_eq!(structured["page"]["next_offset"], RAW_PAGE_MAX_BYTES);
+    assert_eq!(structured["page"]["done"], false);
+    assert_eq!(
+        structured["raw"].as_str().unwrap().len(),
+        RAW_PAGE_MAX_BYTES
+    );
+
+    let second = read_resource(
+        &mut facade,
+        &format!(
+            "shoal://out/{index}?format=raw&slice={}..{}",
+            RAW_PAGE_MAX_BYTES,
+            RAW_PAGE_MAX_BYTES * 2
+        ),
+    );
+    assert_eq!(
+        second["structuredContent"]["page"]["offset"],
+        RAW_PAGE_MAX_BYTES
     );
 }
 
@@ -334,11 +386,11 @@ fn mcp_shoal_plan_distinguishes_trash_rm_from_opaque_rm() {
 }
 
 /// site/content/internals/kernel-protocol.md (`shoal://session/env`): the session environment view is
-/// served from the session evaluator. A default-permissive human is granted a
+/// served from the session evaluator. The explicitly permissive test agent is granted a
 /// value read (`env_read=["*"]`), so `granted:true` and the values travel
 /// alongside the names.
 #[test]
-fn mcp_session_env_resource_is_served_with_values_for_the_default_human() {
+fn mcp_session_env_resource_is_served_with_values_for_permitted_agent() {
     let live = LiveKernel::start();
     let mut facade = Facade::connect(&live.config()).unwrap();
 
@@ -346,7 +398,7 @@ fn mcp_session_env_resource_is_served_with_values_for_the_default_human() {
     let sc = &env["structuredContent"];
     assert_eq!(
         sc["granted"], true,
-        "the default-permissive human is granted an env value read: {sc}"
+        "the explicitly permitted agent is granted an env value read: {sc}"
     );
     let names = sc["names"].as_array().expect("env names is a list");
     assert!(!names.is_empty(), "the session env is not empty: {sc}");
@@ -970,5 +1022,145 @@ fn mcp_pty_list_and_resources_track_open_sessions() {
     assert!(
         missing.get("error").is_some(),
         "reading a closed pty's screen must error: {missing}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Workstream D — kernel attachment/authority contracts over the real socket.
+// site/content/internals/kernel-protocol.md / kernel-rpc-reference.md.
+// ---------------------------------------------------------------------------
+
+/// HR-D4/HR-D8: `journal.query` requires an authenticated attachment. A fresh
+/// raw socket connection that never called `session.attach` must NOT be able to
+/// read stored journal rows — the audit confirmed it previously could. It now
+/// gets `NOT_ATTACHED`; the same connection, once attached, reads the journal.
+#[test]
+fn raw_unattached_journal_query_is_rejected_then_allowed_after_attach() {
+    let live = LiveKernel::start();
+    let mut stream = UnixStream::connect(&live.socket).unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+
+    // Never attached: journal.query is refused with NOT_ATTACHED, not served.
+    let denied = raw_call(
+        &mut stream,
+        &mut reader,
+        1,
+        "journal.query",
+        json!({ "limit": 10 }),
+    );
+    let err = denied
+        .error
+        .expect("unattached journal.query must be rejected, not served");
+    assert_eq!(
+        err.code, NOT_ATTACHED,
+        "unattached journal.query must be NOT_ATTACHED: {err:?}"
+    );
+
+    // After attaching on the same connection, journal.query works.
+    let attached = raw_call(
+        &mut stream,
+        &mut reader,
+        2,
+        "session.attach",
+        json!({"client":{"kind":"test","tty":false}}),
+    );
+    assert!(attached.error.is_none(), "attach failed: {attached:?}");
+    let ok = raw_call(
+        &mut stream,
+        &mut reader,
+        3,
+        "journal.query",
+        json!({ "limit": 10 }),
+    );
+    assert!(
+        ok.error.is_none(),
+        "an attached journal.query must succeed: {ok:?}"
+    );
+    assert!(ok.result.unwrap().is_array(), "journal.query returns rows");
+}
+
+/// HR-D5/HR-D8: `journal.query` limit semantics over the real socket. An
+/// explicit `limit: 0` returns zero rows (an empty page, not the whole
+/// history); an omitted limit returns the default page (the just-run entry is
+/// visible); and an absurd limit is clamped rather than streaming everything.
+#[test]
+fn raw_journal_query_limit_zero_is_empty_and_omitted_is_default() {
+    let live = LiveKernel::start();
+    let mut stream = UnixStream::connect(&live.socket).unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    raw_call(
+        &mut stream,
+        &mut reader,
+        1,
+        "session.attach",
+        json!({"client":{"kind":"test","tty":false}}),
+    );
+    // Produce a journal entry.
+    let exec = raw_call(&mut stream, &mut reader, 2, "exec", json!({"src":"1 + 2"}));
+    assert!(exec.error.is_none(), "exec failed: {exec:?}");
+
+    // Explicit limit:0 → zero rows (the audit's surprising edge case, fixed).
+    let zero = raw_call(
+        &mut stream,
+        &mut reader,
+        3,
+        "journal.query",
+        json!({ "limit": 0 }),
+    );
+    let zero_rows = zero.result.unwrap();
+    assert_eq!(
+        zero_rows.as_array().unwrap().len(),
+        0,
+        "limit:0 must return zero rows, not the full history: {zero_rows}"
+    );
+
+    // Omitted limit → default page: the just-run entry is present.
+    let default = raw_call(&mut stream, &mut reader, 4, "journal.query", json!({}));
+    let default_rows = default.result.unwrap();
+    let rows = default_rows.as_array().unwrap();
+    assert!(
+        rows.iter().any(|e| e["src"] == "1 + 2"),
+        "an omitted limit returns the default page including the just-run entry: {default_rows}"
+    );
+
+    // An absurd limit is accepted but clamped by the server-side maximum: the
+    // query still succeeds and returns the (few) real rows, never erroring.
+    let huge = raw_call(
+        &mut stream,
+        &mut reader,
+        5,
+        "journal.query",
+        json!({ "limit": 100_000_000usize }),
+    );
+    assert!(
+        huge.error.is_none(),
+        "an oversized limit is clamped, not an error: {huge:?}"
+    );
+}
+
+/// HR-D1/HR-D8: `cap.request` requires an authenticated attachment. A fresh raw
+/// socket connection that never attached must NOT be able to flip a plan's
+/// `approved` bit — approving is a state mutation the audit found was reachable
+/// with no caller identity at all. It now gets `NOT_ATTACHED`.
+#[test]
+fn raw_unattached_cap_request_is_rejected() {
+    let live = LiveKernel::start();
+    let mut stream = UnixStream::connect(&live.socket).unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+
+    // Never attached: cap.request is refused before any approval logic runs.
+    let denied = raw_call(
+        &mut stream,
+        &mut reader,
+        1,
+        "cap.request",
+        json!({ "plan_ref": "plan:deadbeefdeadbeef", "effects": [] }),
+    );
+    let err = denied
+        .error
+        .expect("unattached cap.request must be rejected, not processed");
+    assert_eq!(
+        err.code, NOT_ATTACHED,
+        "unattached cap.request must be NOT_ATTACHED: {err:?}"
     );
 }

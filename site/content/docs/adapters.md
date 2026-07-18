@@ -348,6 +348,13 @@ Declaring `invoke_payload` on a non-interpreter command is a schema error. The b
 | `bash` | `bash -c BODY` |
 | `deno` | `deno eval BODY` |
 | `jq` | `jq FILTER` with its declared input interface |
+| `yq` | `yq -o=json FILTER` with JSON output parsing |
+
+The active host passes configured interpreter heads into the parser context, so a custom head is as
+grammar-reachable as a bundled one. Its block execution uses the same adapter `bin`, `invoke`,
+payload mode, accepted status codes, and structured-output declaration as an ordinary adapter call.
+Standalone formatter/editor parsing has no project catalog, so the shipped pack is guarded by a
+generated parity test against the parser's canonical default names.
 | `node` | `node -e BODY` |
 | `python` | `python3 -c BODY` |
 | `ruby` | `ruby -e BODY` |
@@ -425,9 +432,11 @@ Main configuration accepts:
 dirs = ["/home/me/.config/shoal/adapters"]
 ```
 
-There is an important current limitation: each loaded directory replaces the evaluator's active catalog rather than merging into it. The bundled directory is loaded first, followed by configured directories in order, so the last successfully loaded directory may be the only catalog used for actual dispatch. The completer can still discover names from all loaded catalogs, which can make completion appear broader than execution.
-
-Until catalog merging is implemented, make the last custom directory a complete catalog, including any bundled definitions you need. This behavior is tracked in [Current status and compatibility](@/docs/status-limits.md#adapter-limitations).
+The bundled directory loads first, then configured directories overlay it in order. A later command
+definition replaces only the same command head; unrelated earlier definitions remain active. Shoal
+warns when a later directory overrides a head. Completion retains the individual catalogs for
+metadata/name discovery, while evaluator dispatch receives the merged catalog built from that same
+ordered list.
 
 ## Bundled catalog at a glance
 
@@ -648,9 +657,11 @@ The active adapter does not declare that option for the selected subcommand. Che
 
 The child ran, but stdout did not satisfy the promised parser. Inspect `result.stdout`, the executable version, locale/configuration, and whether a format-changing option escaped the pinned interface. Raw fallback is the safety behavior.
 
-### Completion knows a command that dispatch does not adapt
+### A custom adapter unexpectedly overrides a bundled command
 
-With custom adapter directories configured, completion can scan several catalogs while evaluation uses only the last one loaded. Consolidate definitions into the final directory until catalog merging is fixed.
+Configured directories overlay the bundled catalog in order, and a later definition of the same
+head wins. Read the startup override warning, inspect the configured directory order, or rename the
+custom head. Other bundled commands remain active.
 
 ### A platform-specific adapter fails
 

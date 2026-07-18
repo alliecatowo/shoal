@@ -1,5 +1,5 @@
 use shoal_history::{QueryFilter, entry, entry_json, gc, query, render_human, undo};
-use shoal_journal::Journal;
+use shoal_journal::{EntryKind, Journal};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -13,7 +13,17 @@ fn main() {
     }
 }
 fn run(mut args: Vec<String>) -> Result<(), (i32, String)> {
-    let mut state = default_state()?;
+    if args.as_slice() == ["-h"] || args.as_slice() == ["--help"] {
+        println!(
+            "Shoal journal history\n\nUsage: shoal-history [--state-dir PATH] [--json] COMMAND [OPTIONS]\n\nState: explicit --state-dir, else layered journal.state_dir, else the shared XDG state root\n\nCommands:\n  query   Filter journal entries\n  show    Show one entry\n  pin     Retain a CAS object\n  unpin   Release a CAS object\n  gc      Collect journal storage\n  status  Show storage use\n  undo    Apply an entry's inverse operations"
+        );
+        return Ok(());
+    }
+    if args.as_slice() == ["-V"] || args.as_slice() == ["--version"] {
+        println!("shoal-history {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    let mut state_override = None;
     let mut json = false;
     let mut i = 0;
     while i < args.len() {
@@ -22,7 +32,7 @@ fn run(mut args: Vec<String>) -> Result<(), (i32, String)> {
                 if i + 1 >= args.len() {
                     return Err((2, "--state-dir requires PATH".into()));
                 }
-                state = PathBuf::from(args.remove(i + 1));
+                state_override = Some(PathBuf::from(args.remove(i + 1)));
                 args.remove(i);
             }
             "--json" => {
@@ -32,6 +42,16 @@ fn run(mut args: Vec<String>) -> Result<(), (i32, String)> {
             _ => i += 1,
         }
     }
+    let state = match state_override {
+        Some(state) => state,
+        None => {
+            let cwd = std::env::current_dir().map_err(op)?;
+            let fallback = shoal_paths::ShoalPaths::discover()
+                .state_dir()
+                .to_path_buf();
+            configured_state_dir(&cwd, fallback, shoal_config::LoadOptions::discover(&cwd))?
+        }
+    };
     let command = args.first().map(String::as_str).unwrap_or("query");
     let journal = Journal::open(&state).map_err(op)?;
     match command {
@@ -39,16 +59,11 @@ fn run(mut args: Vec<String>) -> Result<(), (i32, String)> {
             let f = parse_query(&args[1..])?;
             let rows = query(&journal, &f).map_err(op)?;
             if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(
-                        &rows
-                            .iter()
-                            .map(|r| entry_json(&journal, r))
-                            .collect::<Vec<_>>()
-                    )
-                    .unwrap()
-                )
+                let value = rows
+                    .iter()
+                    .map(|row| entry_json(&journal, row))
+                    .collect::<Vec<_>>();
+                println!("{}", serde_json::to_string_pretty(&value).map_err(op)?)
             } else {
                 print!("{}", render_human(&journal, &rows, false))
             }
@@ -61,7 +76,7 @@ fn run(mut args: Vec<String>) -> Result<(), (i32, String)> {
             if json {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&entry_json(&journal, &row)).unwrap()
+                    serde_json::to_string_pretty(&entry_json(&journal, &row)).map_err(op)?
                 )
             } else {
                 print!("{}", render_human(&journal, &[row], true))
@@ -103,6 +118,40 @@ fn run(mut args: Vec<String>) -> Result<(), (i32, String)> {
                 serde_json::json!({"dry_run":!apply,"candidates":r.candidates.len(),"deleted":r.deleted.len(),"reclaimed_bytes":r.reclaimed_bytes,"remaining_bytes":r.remaining_bytes})
             )
         }
+        "status" => {
+            let status = journal.storage_status().map_err(op)?;
+            let value = serde_json::json!({
+                "database_bytes": status.database_bytes,
+                "wal_bytes": status.wal_bytes,
+                "shm_bytes": status.shm_bytes,
+                "database_admission_bytes": status.database_admission_bytes(),
+                "database_max_bytes": status.database_max_bytes,
+                "cas_logical_bytes": status.cas_logical_bytes,
+                "cas_physical_bytes": status.cas_physical_bytes,
+                "spill_physical_bytes": status.spill_physical_bytes,
+                "cas_admission_bytes": status.cas_admission_bytes(),
+                "cas_max_bytes": status.cas_max_bytes,
+                "pinned_logical_bytes": status.pinned_logical_bytes,
+            });
+            if json {
+                println!("{}", serde_json::to_string_pretty(&value).map_err(op)?);
+            } else {
+                println!(
+                    "database: {} / {} bytes (main {}, WAL {}, SHM {})\nCAS: {} / {} bytes (logical {}, physical {}, spill {}, pinned {})",
+                    status.database_admission_bytes(),
+                    status.database_max_bytes,
+                    status.database_bytes,
+                    status.wal_bytes,
+                    status.shm_bytes,
+                    status.cas_admission_bytes(),
+                    status.cas_max_bytes,
+                    status.cas_logical_bytes,
+                    status.cas_physical_bytes,
+                    status.spill_physical_bytes,
+                    status.pinned_logical_bytes,
+                );
+            }
+        }
         "undo" => {
             let id = parse_id(args.get(1))?;
             let root = args
@@ -112,9 +161,22 @@ fn run(mut args: Vec<String>) -> Result<(), (i32, String)> {
                 .ok_or((2, "undo requires --root PATH".into()))?;
             let r = undo(&journal, id, &root).map_err(|e| (1, e.to_string()))?;
             if json {
+                let steps = r
+                    .steps
+                    .iter()
+                    .map(|step| {
+                        serde_json::to_value(&step.inverse).map(|inverse| {
+                            serde_json::json!({
+                                "status": format!("{:?}", step.status).to_lowercase(),
+                                "inverse": inverse,
+                            })
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(op)?;
                 println!(
                     "{}",
-                    serde_json::json!({"entry_id":r.entry_id,"steps":r.steps.iter().map(|s|serde_json::json!({"status":format!("{:?}",s.status).to_lowercase(),"inverse":serde_json::to_value(&s.inverse).expect("serializable inverse")})).collect::<Vec<_>>() })
+                    serde_json::json!({"entry_id":r.entry_id,"steps":steps})
                 );
             } else {
                 println!("undid entry {} ({} steps)", r.entry_id, r.steps.len())
@@ -123,6 +185,20 @@ fn run(mut args: Vec<String>) -> Result<(), (i32, String)> {
         _ => return Err((2, format!("unknown command {command}"))),
     }
     Ok(())
+}
+
+fn configured_state_dir(
+    cwd: &std::path::Path,
+    fallback: PathBuf,
+    options: shoal_config::LoadOptions,
+) -> Result<PathBuf, (i32, String)> {
+    let loaded =
+        shoal_config::load(&options).map_err(|error| (1, format!("configuration: {error}")))?;
+    Ok(match loaded.config.journal.state_dir {
+        Some(path) if path.is_absolute() => path,
+        Some(path) => cwd.join(path),
+        None => fallback,
+    })
 }
 fn parse_query(args: &[String]) -> Result<QueryFilter, (i32, String)> {
     let mut f = QueryFilter::default();
@@ -135,6 +211,14 @@ fn parse_query(args: &[String]) -> Result<QueryFilter, (i32, String)> {
             }
             "--principal" => {
                 f.principal = Some(value(args.get(i + 1), "principal")?);
+                i += 2
+            }
+            "--kind" => {
+                f.kind = Some(
+                    value(args.get(i + 1), "kind")?
+                        .parse::<EntryKind>()
+                        .map_err(|error| (2, error))?,
+                );
                 i += 2
             }
             "--effects" => {
@@ -162,15 +246,6 @@ fn parse_query(args: &[String]) -> Result<QueryFilter, (i32, String)> {
     }
     Ok(f)
 }
-fn default_state() -> Result<PathBuf, (i32, String)> {
-    if let Some(p) = std::env::var_os("XDG_DATA_HOME") {
-        Ok(PathBuf::from(p).join("shoal"))
-    } else if let Some(h) = std::env::var_os("HOME") {
-        Ok(PathBuf::from(h).join(".local/share/shoal"))
-    } else {
-        Err((2, "set --state-dir, XDG_DATA_HOME, or HOME".into()))
-    }
-}
 fn value(v: Option<&String>, n: &str) -> Result<String, (i32, String)> {
     v.cloned().ok_or((2, format!("--{n} requires value")))
 }
@@ -189,4 +264,59 @@ fn parse_id(v: Option<&String>) -> Result<i64, (i32, String)> {
 }
 fn op(e: impl std::fmt::Display) -> (i32, String) {
     (1, e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn production_cli_has_no_json_serialization_panics() {
+        let source = include_str!("main.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        for forbidden in ["serde_json::to_string_pretty", "serde_json::to_value"] {
+            for line in production.lines().filter(|line| line.contains(forbidden)) {
+                assert!(
+                    !line.contains("unwrap") && !line.contains("expect"),
+                    "{line}"
+                );
+            }
+        }
+        assert!(!production.contains("serializable inverse"));
+    }
+
+    #[test]
+    fn layered_journal_state_dir_resolves_from_startup_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join(".shoal.toml");
+        std::fs::write(&config, "[journal]\nstate_dir = 'relative-state'\n").unwrap();
+        let options = shoal_config::LoadOptions {
+            system: None,
+            user: None,
+            project: Some(config),
+            env: vec![],
+        };
+        assert_eq!(
+            configured_state_dir(dir.path(), dir.path().join("fallback"), options).unwrap(),
+            dir.path().join("relative-state")
+        );
+    }
+
+    #[test]
+    fn invalid_layered_config_fails_instead_of_opening_fallback_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join(".shoal.toml");
+        std::fs::write(&config, "[journal]\nstate_dir = 5\n").unwrap();
+        let options = shoal_config::LoadOptions {
+            system: None,
+            user: None,
+            project: Some(config),
+            env: vec![],
+        };
+        let error =
+            configured_state_dir(dir.path(), dir.path().join("fallback"), options).unwrap_err();
+        assert_eq!(error.0, 1);
+        assert!(error.1.contains("configuration:"));
+        assert!(error.1.contains("journal.state_dir"));
+    }
 }

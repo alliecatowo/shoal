@@ -1,0 +1,18 @@
+#!/usr/bin/env shoal
+# Resolve every Zola @/ Markdown link target against site/content.
+
+let pages = glob("site/content/**/*.md").expand()
+let links = pages.flat_map(page => page.read.matches(re"@/[A-Za-z0-9_./-]+\.md").map(link => ({
+  source: page,
+  link: link,
+  target: path("site/content").join(link.replace("@/", "")),
+})))
+let broken = links.where(row => !row.target.is_file).uniq().sort_by(row => "{row.source}:{row.link}")
+
+assert(broken.is_empty(), "broken internal Markdown links: {broken}")
+{
+  pages: pages.len(),
+  links_checked: links.len(),
+  unique_targets: links.map(.target).uniq().len(),
+  broken: broken,
+}

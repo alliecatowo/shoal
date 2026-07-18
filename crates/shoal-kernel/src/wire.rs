@@ -281,6 +281,7 @@ pub(crate) fn wire_value(value: &Value) -> WireValue {
         },
         Value::Stream(s) => WireValue::Stream {
             label: s.label.clone(),
+            cursor: None,
         },
         Value::Error(e) => WireValue::Error {
             code: e.code.clone(),
@@ -296,6 +297,7 @@ pub(crate) fn wire_value(value: &Value) -> WireValue {
             status: o.status,
             ok: o.ok,
             signal: o.signal.clone(),
+            streamed: o.streamed,
             out: Box::new(wire_value(&o.out_value())),
             err: String::from_utf8_lossy(&o.stderr).into_owned(),
             dur_ns: o.dur_ns,
@@ -459,6 +461,12 @@ fn join_path_uri(uri: &str, sub_path: &str) -> String {
 /// `outcome` wrapper. The outer outcome fields (`status`/`ok`/`cmd`/…)
 /// always travel; only `.out` itself is replaced with the elided form.
 pub(crate) fn elide_wire_value(value: &Value, uri: &str, budget: &ElideBudget) -> WireValue {
+    if let Value::Stream(stream) = value {
+        return WireValue::Stream {
+            label: stream.label.clone(),
+            cursor: stream_cursor_from_uri(uri),
+        };
+    }
     if let Value::Outcome(o) = value
         && o.ok
     {
@@ -468,6 +476,7 @@ pub(crate) fn elide_wire_value(value: &Value, uri: &str, budget: &ElideBudget) -
             status: o.status,
             ok: o.ok,
             signal: o.signal.clone(),
+            streamed: o.streamed,
             out: Box::new(elide_wire_value(&out_value, &out_uri, budget)),
             err: String::from_utf8_lossy(&o.stderr).into_owned(),
             dur_ns: o.dur_ns,
@@ -520,6 +529,26 @@ pub(crate) fn elide_wire_value(value: &Value, uri: &str, budget: &ElideBudget) -
     }
 }
 
+/// Recover the structured transcript ref/path from URIs produced exclusively
+/// by `short_ref_to_uri`/`join_path_uri`. Malformed or foreign URIs simply
+/// leave a context-free stream projection non-pullable.
+fn stream_cursor_from_uri(uri: &str) -> Option<StreamCursorRef> {
+    let rest = uri.strip_prefix("shoal://")?;
+    let (base, path) = match rest.split_once("?path=") {
+        Some((base, path)) if !path.is_empty() => (base, Some(path.to_string())),
+        Some((base, _)) => (base, None),
+        None => (rest, None),
+    };
+    let (kind, id) = base.split_once('/')?;
+    if kind.is_empty() || id.is_empty() || id.contains('/') {
+        return None;
+    }
+    Some(StreamCursorRef {
+        r#ref: Ref(format!("{kind}:{id}")),
+        path,
+    })
+}
+
 /// Strip ANSI escape sequences (SGR color codes and other CSI-final-byte
 /// sequences — cursor movement, etc.) from `s`.
 ///
@@ -527,7 +556,7 @@ pub(crate) fn elide_wire_value(value: &Value, uri: &str, budget: &ElideBudget) -
 /// ANSI (`color_for_value` et al. in `shoal-value/src/render.rs`) — fine for
 /// `shoal`'s own interactive REPL, which reads a real terminal and wants the
 /// color, but agent-hostile noise on the kernel/MCP wire: `session.attach`
-/// forces every kernel exec headless (`evaluator.interactive = false`,
+/// forces every kernel exec headless (`evaluator.set_interactive(false)`,
 /// `handlers_exec.rs`) and a cold-agent field test found the escape bytes
 /// still landing verbatim in `structuredContent.render` and `content[].text`
 /// — an agent has no terminal to interpret them, so they read as junk

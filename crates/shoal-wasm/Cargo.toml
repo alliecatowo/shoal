@@ -2,10 +2,21 @@
 name="shoal-wasm"
 version="0.1.0"
 edition="2024"
+
+[lints]
+workspace = true
+
 [dependencies]
 serde={version="1",features=["derive"]}
+serde_json="1"
 toml="1"
 thiserror="2"
-wasmtime={version="37",default-features=false,features=["component-model","cranelift","runtime","wat"]}
+blake3="1"
+shoal-leash={path="../shoal-leash"}
+wasmtime={version="46",default-features=false,features=["component-model","cranelift","runtime","wat"]}
 [dev-dependencies]
 tempfile="3"
+wit-component={version="0.251",features=["dummy-module"]}
+wit-parser="0.251"
+wasmprinter="0.251"
+wat="1"

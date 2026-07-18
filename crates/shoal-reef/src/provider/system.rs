@@ -2,20 +2,53 @@
 //! are probed lazily via `<tool> --version` (300 ms timeout), parsed leniently,
 //! and cached in-memory keyed by path. Enumeration never probes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
-use super::{Candidate, Provider, ProviderCtx, is_executable, probe_version};
+use super::{Candidate, Provider, ProviderCtx, inspect_executable, probe_version};
 use crate::version::Version;
 
 /// Canonical system roots, always scope `system` (not `ambient`).
 pub const CANONICAL_ROOTS: &[&str] = &["/usr/bin", "/usr/local/bin", "/bin"];
 
+/// Version probes are advisory and repeatable. Bound retained executable
+/// identities so repeated PATH churn cannot grow a long-lived resolver.
+const MAX_VERSION_CACHE_ENTRIES: usize = 1_024;
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct VersionKey {
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
+    mtime: i64,
+    mtime_ns: i64,
+    ctime: i64,
+    ctime_ns: i64,
+    len: u64,
+}
+
+impl VersionKey {
+    fn for_path(path: &std::path::Path) -> std::io::Result<Self> {
+        let meta = std::fs::metadata(path)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            dev: meta.dev(),
+            ino: meta.ino(),
+            mtime: meta.mtime(),
+            mtime_ns: meta.mtime_nsec(),
+            ctime: meta.ctime(),
+            ctime_ns: meta.ctime_nsec(),
+            len: meta.len(),
+        })
+    }
+}
+
 pub struct SystemProvider {
     roots: Vec<PathBuf>,
     ambient: Vec<PathBuf>,
-    cache: Mutex<HashMap<PathBuf, Version>>,
+    cache: Mutex<HashMap<VersionKey, Version>>,
 }
 
 impl SystemProvider {
@@ -33,14 +66,29 @@ impl SystemProvider {
     pub fn from_env() -> SystemProvider {
         let roots: Vec<PathBuf> = CANONICAL_ROOTS.iter().map(PathBuf::from).collect();
         let mut ambient = Vec::new();
+        let mut seen: HashSet<PathBuf> = roots.iter().cloned().collect();
         if let Some(path) = std::env::var_os("PATH") {
             for dir in std::env::split_paths(&path) {
-                if !roots.iter().any(|r| r == &dir) && !ambient.contains(&dir) {
+                if seen.insert(dir.clone()) {
                     ambient.push(dir);
                 }
             }
         }
         SystemProvider::new(roots, ambient)
+    }
+
+    fn lock_cache(&self) -> MutexGuard<'_, HashMap<VersionKey, Version>> {
+        match self.cache.lock() {
+            Ok(cache) => cache,
+            Err(poisoned) => {
+                // Version probes are advisory and repeatable. Never trust a
+                // partially-mutated cache left by a panic; clear and rebuild.
+                let mut cache = poisoned.into_inner();
+                cache.clear();
+                self.cache.clear_poison();
+                cache
+            }
+        }
     }
 }
 
@@ -49,31 +97,40 @@ impl Provider for SystemProvider {
         "system"
     }
 
-    fn discover(&self, tool: &str, _ctx: &ProviderCtx) -> Vec<Candidate> {
-        let mut out = Vec::new();
+    fn discover(
+        &self,
+        tool: &str,
+        _ctx: &ProviderCtx,
+    ) -> Result<super::CandidateDiscovery, super::ProviderError> {
+        let mut out = super::CandidateDiscovery::new(self.name());
         let mut seen = std::collections::HashSet::new();
         for (dirs, ambient) in [(&self.roots, false), (&self.ambient, true)] {
             for dir in dirs {
                 let path = dir.join(tool);
-                if is_executable(&path) && seen.insert(path.clone()) {
+                out.visit_path(&path)?;
+                if inspect_executable(self.name(), &path)? && seen.insert(path.clone()) {
                     let mut c = Candidate::new(tool, Version::unknown(), path, "system");
                     c.ambient = ambient;
-                    out.push(c);
+                    out.push(c)?;
                 }
             }
         }
-        out
+        Ok(out)
     }
 
-    fn version_of(&self, cand: &Candidate) -> Version {
-        if let Some(v) = self.cache.lock().unwrap().get(&cand.path) {
+    fn version_of(&self, cand: &Candidate, ctx: &ProviderCtx) -> Version {
+        let Ok(key) = VersionKey::for_path(&cand.path) else {
+            return probe_version(&cand.path, ctx);
+        };
+        if let Some(v) = self.lock_cache().get(&key) {
             return v.clone();
         }
-        let v = probe_version(&cand.path);
-        self.cache
-            .lock()
-            .unwrap()
-            .insert(cand.path.clone(), v.clone());
+        let v = probe_version(&cand.path, ctx);
+        let mut cache = self.lock_cache();
+        if cache.len() >= MAX_VERSION_CACHE_ENTRIES && !cache.contains_key(&key) {
+            cache.clear();
+        }
+        cache.insert(key, v.clone());
         v
     }
 }
@@ -83,7 +140,28 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::ExitStatusExt;
     use std::path::Path;
+    use std::sync::Arc;
+
+    struct FixedVersionRunner;
+
+    impl super::super::ProviderRunner for FixedVersionRunner {
+        fn run(
+            &self,
+            _command: super::super::ProviderCommand<'_>,
+        ) -> std::io::Result<shoal_exec::BoundedCommandOutput> {
+            Ok(shoal_exec::BoundedCommandOutput {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: b"current 3.2.1\n".to_vec(),
+                stderr: Vec::new(),
+                truncated: false,
+                timed_out: false,
+                pgid: 1,
+                duration: std::time::Duration::ZERO,
+            })
+        }
+    }
 
     fn make_exe(dir: &Path, name: &str, body: &str) -> PathBuf {
         let p = dir.join(name);
@@ -102,7 +180,10 @@ mod tests {
         make_exe(root.path(), "mytool", "#!/bin/sh\necho 1.0.0\n");
         make_exe(amb.path(), "mytool", "#!/bin/sh\necho 2.0.0\n");
         let p = SystemProvider::new(vec![root.path().into()], vec![amb.path().into()]);
-        let cands = p.discover("mytool", &ProviderCtx::new("/"));
+        let cands = p
+            .discover("mytool", &ProviderCtx::new("/"))
+            .unwrap()
+            .into_candidates();
         assert_eq!(cands.len(), 2);
         // discover must not probe: versions stay unknown.
         assert!(cands.iter().all(|c| c.version.is_unknown()));
@@ -115,11 +196,17 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         make_exe(root.path(), "probed", "#!/bin/sh\necho 'probed 4.5.6'\n");
         let p = SystemProvider::new(vec![root.path().into()], vec![]);
-        let cands = p.discover("probed", &ProviderCtx::new("/"));
-        let v = p.version_of(&cands[0]);
+        let cands = p
+            .discover("probed", &ProviderCtx::new("/"))
+            .unwrap()
+            .into_candidates();
+        let v = p.version_of(&cands[0], &ProviderCtx::new("/"));
         assert_eq!(v.raw(), "4.5.6");
         // Cached path present.
-        assert!(p.cache.lock().unwrap().contains_key(&cands[0].path));
+        assert!(
+            p.lock_cache()
+                .contains_key(&VersionKey::for_path(&cands[0].path).unwrap())
+        );
     }
 
     #[test]
@@ -127,6 +214,187 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("plain"), b"not exec").unwrap();
         let p = SystemProvider::new(vec![root.path().into()], vec![]);
-        assert!(p.discover("plain", &ProviderCtx::new("/")).is_empty());
+        assert!(
+            p.discover("plain", &ProviderCtx::new("/"))
+                .unwrap()
+                .into_candidates()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn configured_root_probes_share_the_discovery_work_limit() {
+        let roots = (0..=super::super::MAX_DISCOVERY_VISITED_PATHS)
+            .map(|index| PathBuf::from(format!("/definitely-missing/{index}")))
+            .collect();
+        let error = SystemProvider::new(roots, Vec::new())
+            .discover("tool", &ProviderCtx::new("/"))
+            .unwrap_err();
+        assert!(error.msg.contains("filesystem visit limit"));
+    }
+
+    #[test]
+    fn poisoned_version_cache_discards_untrusted_entries_and_reprobes() {
+        let root = tempfile::tempdir().unwrap();
+        make_exe(root.path(), "probed", "#!/bin/sh\necho 'probed 4.5.6'\n");
+        let provider = std::sync::Arc::new(SystemProvider::new(vec![root.path().into()], vec![]));
+        let candidate = provider
+            .discover("probed", &ProviderCtx::new("/"))
+            .unwrap()
+            .into_candidates()[0]
+            .clone();
+        let poison_target = provider.clone();
+        let poisoned_path = candidate.path.clone();
+        let poisoner = std::thread::Builder::new()
+            .name("poison-system-version-cache".into())
+            .spawn(move || {
+                let mut cache = poison_target
+                    .cache
+                    .lock()
+                    .expect("version cache starts healthy");
+                cache.insert(
+                    VersionKey::for_path(&poisoned_path).unwrap(),
+                    Version::parse("99.99.99"),
+                );
+                panic!("inject system version cache poison");
+            })
+            .expect("spawn version cache poisoner");
+        assert!(poisoner.join().is_err());
+
+        assert_eq!(
+            provider
+                .version_of(&candidate, &ProviderCtx::new("/"))
+                .raw(),
+            "4.5.6"
+        );
+        assert!(!provider.cache.is_poisoned());
+        assert_eq!(provider.lock_cache().len(), 1);
+    }
+
+    #[test]
+    fn executable_replacement_invalidates_the_cached_version() {
+        let root = tempfile::tempdir().unwrap();
+        let path = make_exe(
+            root.path(),
+            "changing",
+            "#!/bin/sh\necho 'changing 1.0.0'\n",
+        );
+        let provider = SystemProvider::new(vec![root.path().into()], vec![]);
+        let candidate = provider
+            .discover("changing", &ProviderCtx::new("/"))
+            .unwrap()
+            .into_candidates()[0]
+            .clone();
+        assert_eq!(
+            provider
+                .version_of(&candidate, &ProviderCtx::new("/"))
+                .raw(),
+            "1.0.0"
+        );
+
+        // A different length is part of the identity even on filesystems with
+        // coarse mtimes, so an in-place replacement must be reprobed.
+        make_exe(
+            root.path(),
+            "changing",
+            "#!/bin/sh\necho 'changing 22.33.44'\n",
+        );
+        assert_eq!(
+            provider
+                .version_of(&candidate, &ProviderCtx::new("/"))
+                .raw(),
+            "22.33.44"
+        );
+        assert_eq!(path, candidate.path);
+    }
+
+    #[test]
+    fn same_length_rewrite_with_restored_mtime_reprobes_the_version() {
+        let root = tempfile::tempdir().unwrap();
+        let path = make_exe(
+            root.path(),
+            "changing",
+            "#!/bin/sh\necho 'changing 1.0.0'\n",
+        );
+        let original_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let provider = SystemProvider::new(vec![root.path().into()], vec![]);
+        let candidate = provider
+            .discover("changing", &ProviderCtx::new("/"))
+            .unwrap()
+            .into_candidates()[0]
+            .clone();
+        assert_eq!(
+            provider
+                .version_of(&candidate, &ProviderCtx::new("/"))
+                .raw(),
+            "1.0.0"
+        );
+
+        make_exe(
+            root.path(),
+            "changing",
+            "#!/bin/sh\necho 'changing 2.0.0'\n",
+        );
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(original_mtime))
+            .unwrap();
+        drop(file);
+
+        assert_eq!(
+            provider
+                .version_of(&candidate, &ProviderCtx::new("/"))
+                .raw(),
+            "2.0.0"
+        );
+    }
+
+    #[test]
+    fn version_cache_churn_clears_at_its_ceiling() {
+        let provider = SystemProvider::new(Vec::new(), Vec::new());
+        let mut cache = provider.lock_cache();
+        for ino in 0..MAX_VERSION_CACHE_ENTRIES as u64 {
+            cache.insert(
+                VersionKey {
+                    path: PathBuf::from(format!("/old/{ino}")),
+                    dev: 1,
+                    ino,
+                    mtime: 1,
+                    mtime_ns: 0,
+                    ctime: 1,
+                    ctime_ns: 0,
+                    len: 1,
+                },
+                Version::parse("1.0.0"),
+            );
+        }
+        drop(cache);
+
+        let root = tempfile::tempdir().unwrap();
+        make_exe(root.path(), "current", "#!/bin/sh\necho 'current 3.2.1'\n");
+        // Use the same provider so admission exercises its full cache.
+        let candidate = Candidate::new(
+            "current",
+            Version::unknown(),
+            root.path().join("current"),
+            "system",
+        );
+        let context = ProviderCtx::with_runner("/", None, Arc::new(FixedVersionRunner));
+        assert_eq!(provider.version_of(&candidate, &context).raw(), "3.2.1");
+        assert_eq!(provider.lock_cache().len(), 1);
+    }
+
+    #[test]
+    fn production_system_cache_has_no_panicking_lock_access() {
+        let production = include_str!("system.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source prefix");
+        let compact = production.split_whitespace().collect::<String>();
+        for forbidden in [".lock().unwrap(", ".lock().expect("] {
+            assert!(
+                !compact.contains(forbidden),
+                "production system cache synchronization contains `{forbidden}`"
+            );
+        }
     }
 }

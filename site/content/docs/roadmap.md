@@ -52,9 +52,11 @@ Every roadmap change should preserve these constraints:
 
 These block any claim of hostile/multi-tenant agent safety.
 
-### Central attachment gate
+### Consolidate the attachment gate
 
-Move authorization out of individual handlers into a router/method-policy table so a new sensitive method cannot accidentally omit `Attachment`.
+The audited stateful handlers now require attachment, including the former `journal.query` and
+`cap.request` holes. Consolidate that property into a router/method-policy table so a new sensitive
+method cannot accidentally omit `Attachment`.
 
 Required changes:
 
@@ -75,32 +77,31 @@ Include malformed params tests so decoding cannot occur before the authorization
 
 ### Authorize journal reads
 
-Attachment alone is insufficient. `journal.query` must enforce `JournalRead` and define scope:
+The exact-owner read baseline is implemented: `journal.query`, journal-backed `blob.get`, and the
+`journal` event channel require attachment plus `JournalRead`, then remain scoped to the attached
+principal-private Session. Remaining work is broader administration:
 
-- a principal's own coarse entries;
-- explicitly shared session entries;
 - supervisor/admin cross-principal query through a distinct grant;
-- output/CAS access aligned with the same policy.
 
 Acceptance:
 
 - unauthenticated query denied;
 - principal A cannot search principal B by omitting filters;
 - filtering cannot widen scope;
-- output hashes/blobs inherit entry authorization;
-- durable event replay does not bypass query policy;
+- output hashes/blobs inherit entry authorization; **implemented for `blob.get`**;
+- durable journal-event replay does not bypass query policy; **implemented**;
 - tests include same session/different principal and different session/same principal.
 
-### Bind approval authority
+### Extend the bound approval workflow
 
-Redesign `cap.request` as an authenticated supervision action:
+`cap.request` is now an authenticated, one-shot supervision action with immutable requester,
+approver, plan/source hash, Session, exact scope, timestamp, and durable journal audit. It denies
+self-approval by default and requires explicit cross-principal authority. Remaining extensions are:
 
-- require attachment;
-- define which principals/profiles can approve which target principals;
-- record approver, exact effect set, plan/source identity, timestamp, optional expiry, and reason;
-- separate “request approval” from “grant approval” if agents and humans have different roles;
-- publish an auditable approval event/journal row;
-- prevent a plan owner from self-approving unless policy explicitly allows it.
+- make approver routing policy more expressive than the current embedded-human / `supervisor` / `plan.approve` rule;
+- add optional expiry and human reason metadata;
+- separate “request approval” from “grant approval” if asynchronous agents and humans need different roles;
+- define notification/UI flows around the already durable grant row.
 
 Acceptance:
 
@@ -110,34 +111,19 @@ Acceptance:
 - concurrent replacement/collision cannot transfer approval;
 - every grant is queryable with approver identity.
 
-### Replace plan identities
+### Evolve plan identity lifecycle
 
-The current 16-hex hash excludes source/session/principal and keys a global overwriting map. Replace it with one of:
+The audit's overwriting 16-hex identity is fixed: stored plans now use a full digest over source/AST/effects/estimates/Session/principal plus a unique object suffix, bind approval to immutable content, expire in memory, and never replace identical objects. Remaining lifecycle work is to specify deletion/retention across very long-lived kernels, decide whether policy/security generations belong in invalidation, and add larger cross-principal stress/fault-injection suites.
 
-- random 128/256-bit unguessable IDs plus stored full content hash; or
-- full collision-resistant digest over protocol version, canonical AST/source, effects, estimates, session, principal, and policy generation.
+### Evolve the unified child execution context
 
-Also:
+All production child-evaluator routes now build through one explicit context carrying identity,
+policy, Reef, filesystem/watch ports, echo behavior, and cancellation, with an inventory test preventing
+direct construction. Remaining evolution should add/clarify:
 
-- make map insertion non-overwriting;
-- scope lookup keys by session/principal where appropriate;
-- bind approval to immutable plan version;
-- define expiration and deletion;
-- return a distinct collision/internal error rather than replacing state.
-
-Acceptance includes thousands of concurrent same-effect/different-source plans across principals with zero overwrites, plus a deliberately injected hash collision test at the storage abstraction.
-
-### Propagate execution context to child evaluators
-
-Every evaluator creation path must receive a single explicit context object containing:
-
-- principal and Leash policy;
-- resolved sandbox/enforcement request;
-- Reef resolver/manifests/lock policy;
-- cwd/environment/session identity;
-- journal attribution;
-- cancellation/deadline/task lineage;
-- ports and event bridge.
+- explicit deadline/task lineage across every nested worker;
+- whether nested journal rows should exist (today the outer statement owns journaling);
+- end-to-end restrictive-policy tests for every future child factory.
 
 Audit and test `spawn`, `.shl` runner execution, `parallel`, channel handlers, module/function workers, and future evaluator factories. Make construction without a context impossible or limited to tests through an explicit untrusted/default-deny constructor.
 
@@ -152,24 +138,28 @@ Acceptance:
 
 ### Socket identity and mandatory authentication
 
-Add deployable modes:
+Deployable named-listener modes now implemented:
 
-- verify Unix peer UID (`SO_PEERCRED`/platform equivalent) against owner/allowlist;
-- `--require-token` to reject tokenless attach;
+- `--require-peer-uid` verifies the Unix peer UID (`SO_PEERCRED`/`getpeereid`) against the kernel effective UID before worker allocation;
+- `--require-token` rejects tokenless public attachment;
+
+Remaining transport designs:
+
+- configurable peer-UID allowlists beyond the exact kernel UID;
 - optional separate human and agent sockets;
 - refuse insecure socket directory ownership/modes rather than relying only on file mode;
 - rotate/revoke connection authorization intentionally.
 
-Tokenless local-human behavior can remain a convenient default for a clearly local single-user mode, but it must be impossible in hardened mode.
+Public tokenless attachment already becomes restricted `agent:mcp`, while asserted local-human auth
+is rejected. The local-human trust root is the server-selected anonymous descriptor of a private
+interactive kernel. A hardened public mode can still add mandatory bearers and peer-UID binding.
 
-### Formalize session membership
+### Extend principal-private Session membership
 
-Choose and implement one model:
-
-- private session per principal by default with explicit invitations; or
-- shared collaboration sessions with ACL/membership/capabilities.
-
-Transcript values, bindings, cwd/env, tasks, PTYs, user channels, Reef state, and journal views must all apply the same membership rule. Store principal ownership where currently only session ID is checked.
+The implemented model is private Session per principal and visible name. Transcript values,
+bindings, cwd/env, tasks, PTYs, subscriptions, quotas, Reef state, plans, and journal views use the
+same exact owner. Future work is an explicit invitation/ACL design if collaboration rooms are ever
+added; matching visible names must never imply sharing.
 
 ## P0 completion gate
 
@@ -189,15 +179,13 @@ The matrix must run over raw kernel and MCP, on Linux and macOS where platform b
 
 ## P1 — agent protocol and lifecycle
 
-### Live token management
+### Live token management — implemented core
 
-- Add atomic token-store reload or an authenticated kernel token-admin API.
-- Make revocation terminate/disable existing token-backed connections according to policy.
-- Expose expiry/revocation in `shoal-token list` without secrets.
-- Make profile/capability semantics either enforced or rename them clearly as labels.
-- Unify `SHOAL_TOKEN_STORE` and kernel state-dir selection.
-
-Acceptance: create/revoke becomes visible without restart; revoked token cannot reconnect and, in strict mode, existing connection loses authority promptly.
+Token create/revoke and validation serialize with fd locks and fresh reads. The kernel revalidates a
+bearer before each attached request, so create is visible immediately and revocation, expiry, or a
+store failure clears the live attachment without restart. `shoal-token list` exposes metadata but not
+bearers. Profile/cap strings remain descriptive labels; principal policy is authoritative. Remaining
+cleanup is vocabulary/path configuration consistency, not serving-state correctness.
 
 ### Stable protocol/version negotiation
 
@@ -218,16 +206,16 @@ Acceptance: create/revoke becomes visible without restart; revoked token cannot 
 
 Acceptance: no single request can force an unbounded response or full blob allocation beyond configured server limits.
 
-### Multiplex MCP subscriptions
+### Delivered: multiplex MCP subscriptions
 
-Replace one kernel connection/thread per resource subscription with one managed event connection and registry:
+One managed event connection and registry now replaces the former connection/thread per resource:
 
 - real `resources/unsubscribe`;
 - idempotent duplicate subscription;
-- connection cleanup and subscription count metrics;
-- cursor replay on reconnect;
+- connection cleanup and subscription counts;
+- explicit resubscribe/cursor reconciliation after a disconnected hub;
 - bounded queue/drop reporting preserved;
-- no writer/thread leaks in long-lived MCP hosts.
+- no URI-proportional writer/thread growth in long-lived MCP hosts.
 
 ### Live session resources
 
@@ -238,12 +226,13 @@ Replace one kernel connection/thread per resource subscription with one managed 
 
 ### Task and process-tree lifecycle
 
-- Track process group/tree ownership per task.
-- Give cancel a defined grace/kill escalation and terminal guarantee.
-- Implement raw kernel suspend/resume only when it controls the real group; otherwise remove/stabilize explicit unsupported capability.
-- Add deadline distinct from “wait timeout.”
-- Add task TTL/reaping and maximum counts.
+- Process-group ownership per task, cancel escalation, truthful suspend/resume, bounded active/retained task counts, and a bounded `task.await` worker wait are implemented.
+
+Remaining work:
+
+- Hard `deadline_ms` distinct from the caller wait timeout is implemented with a 24-hour server ceiling and observable expiry.
 - Add incremental output cursor where a child produces streams.
+- Extend descendant-tree guarantees beyond owned process groups on platforms where children can escape them.
 
 ### PTY lifecycle
 
@@ -267,19 +256,21 @@ Expose structured metrics/health and reasons for quota rejection.
 
 ## P1 — execution consistency
 
-### Unify command resolution
+### Unified command resolution — implemented core
 
-Create one resolver result covering:
+One canonical resolver result now covers:
 
 ```text
 lexical function / alias / builtin / Reef tool / adapter / PATH external / interpreter runner
 ```
 
-It should record why a candidate won, its provider/path/hash/adapter/schema, and how `^`/`run` alter resolution. Use it for evaluator dispatch, `which`, completion, highlighting, planning, diagnostics, and LSP.
+Evaluator dispatch/planning, completion, highlighting, and LSP consume the same source kinds and
+precedence table. A future explanation surface may record why a candidate won and its provider/path;
+it must consume this resolver rather than introduce a second list.
 
 Acceptance:
 
-- one precedence table and trace object;
+- one precedence table (implemented) and optional trace object;
 - no separate hand-copied head lists;
 - forced-head tests at each collision pair;
 - resolution explanation exposed to users/agents.
@@ -291,14 +282,17 @@ Acceptance:
 - Include runner path/version/hash in plan and Reef/Leash checks.
 - Test shebang, extension, executable bit, spaces/non-UTF-8 paths, and project adapters.
 
-### Make method metadata authoritative
+### Keep method metadata and dispatch aligned
 
-Generate dispatch, completion, docs inventory, receiver validation, arity, and signatures from one registry—or test the registry exhaustively against dispatch. Fix current table/range `get` false positives and bool string/display omissions.
+The known table/range `.get()` and boolean conversion drift is fixed and covered by owning
+behavioral fixtures. The remaining evolution path is to generate richer signature/arity metadata
+from one registry, or add a bidirectional executable fixture for every advertised receiver-method
+pair as the surface grows.
 
 ### Stream semantics
 
 - Decide whether `buffer(n)` remains a documented synchronous no-op or becomes real bounded prefetch.
-- Add an explicitly bounded distinct variant (`distinct(max:)` or eviction policy).
+- Keep exact `distinct(max_values)` limits and retained-byte accounting aligned with the session resource model.
 - Make live overflow marker types part of a stable schema.
 - Expose stream chunks over kernel protocol with cancellation/backpressure.
 - Add deterministic virtual-clock/filesystem tests for live operators.
@@ -350,7 +344,8 @@ Evaluate platform-appropriate mechanisms (Linux namespaces/seccomp/eBPF/cgroups,
 
 - Version migrations with backup/rollback testing.
 - Define retention/archival/export/import.
-- Distinguish coarse submission rows and fine per-statement rows explicitly in schema/API.
+- Continue evolving schema-v2 execution identity with optional statement ordinals/host vocabulary;
+  coarse exec and fine statement rows are already explicit and parent-linked.
 - Preserve principal attribution across shared/nested execution.
 - Add query indexes/streaming for large stores and scoped access.
 
@@ -360,7 +355,7 @@ Evaluate platform-appropriate mechanisms (Linux namespaces/seccomp/eBPF/cgroups,
 - Install all companion binaries and place sandbox helper correctly.
 - Checksums/signatures/SBOM/provenance.
 - User services for systemd/launchd with private socket/state modes.
-- Upgrade/rollback and token-store restart behavior documented/automated.
+- Upgrade/rollback and live token-store revalidation behavior documented/automated.
 
 ### Documentation automation
 
@@ -375,10 +370,10 @@ Evaluate platform-appropriate mechanisms (Linux namespaces/seccomp/eBPF/cgroups,
 ### LSP semantic depth
 
 - Real parser/semantic scopes for completion.
-- Definitions/references/rename across modules.
+- Extend the implemented local/direct-module definition lookup into references and rename across a workspace graph.
 - Signature help and type/method receiver diagnostics.
 - Semantic tokens, document/workspace symbols, code actions.
-- Incremental sync and project/manifest awareness.
+- Add project/manifest awareness and a reusable cross-document index; incremental sync is already implemented.
 - Formatter configuration and range formatting where semantics permit.
 
 ### Interactive shell maturity
@@ -451,7 +446,7 @@ These happen alongside priority waves:
 
 ### Conformance growth
 
-The current 1,310 cases exceed the original 1,000-case target, but every bug fix/feature needs a minimal regression. Focus new cases on:
+The current 1,364 cases exceed the original 1,000-case target, but every bug fix/feature needs a minimal regression. Focus new cases on:
 
 - precedence and command-resolution collisions;
 - error spans/hints and method receiver boundaries;

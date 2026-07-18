@@ -1,9 +1,12 @@
 use super::*;
 use crate::cas::TRUNCATION_MARKER;
 use crate::schema::CURRENT_SCHEMA_VERSION;
+use std::io::Read as _;
 
 fn rec(session: &str, principal: &str, ts_ns: i64, src: &str) -> EntryRecord {
     EntryRecord {
+        kind: EntryKind::Statement,
+        parent_id: None,
         session: session.to_string(),
         principal: principal.to_string(),
         ts_ns,
@@ -13,6 +16,140 @@ fn rec(session: &str, principal: &str, ts_ns: i64, src: &str) -> EntryRecord {
         effects_json: r#"["opaque"]"#.to_string(),
         opaque: true,
     }
+}
+
+#[test]
+fn append_completed_persists_a_finished_row_atomically() {
+    let journal = Journal::in_memory().unwrap();
+    let id = journal
+        .append_completed(
+            &rec("audit", "supervisor", 7, "# approval p"),
+            Some(0),
+            true,
+            0,
+        )
+        .unwrap();
+    let rows = journal.entries_by_id(&[id]).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, Some(0));
+    assert_eq!(rows[0].ok, Some(true));
+    assert_eq!(rows[0].dur_ns, Some(0));
+}
+
+#[test]
+fn cas_verified_reader_streams_large_content_without_materializing_api() {
+    let journal = Journal::in_memory().unwrap();
+    let id = journal
+        .append(&rec("cas", "human", 1, "large output"))
+        .unwrap();
+    let payload = (0..(2 * 1024 * 1024 + 17))
+        .map(|i| (i % 251) as u8)
+        .collect::<Vec<_>>();
+    let hash = journal.record_output(id, "stdout", &payload).unwrap();
+    let mut reader = journal.cas().open_verified(&hash).unwrap();
+    let mut observed = Vec::new();
+    let mut chunk = [0u8; 31 * 1024];
+    loop {
+        let n = reader.read(&mut chunk).unwrap();
+        if n == 0 {
+            break;
+        }
+        observed.extend_from_slice(&chunk[..n]);
+    }
+    assert_eq!(observed, payload);
+}
+
+#[test]
+fn read_blob_range_is_exact_bounded_and_overflow_safe() {
+    let journal = Journal::in_memory().unwrap();
+    let id = journal
+        .append(&rec("cas", "human", 1, "paged output"))
+        .unwrap();
+    let payload = (0..(256 * 1024 + 31))
+        .map(|i| (i % 251) as u8)
+        .collect::<Vec<_>>();
+    let hash = journal.record_output(id, "stdout", &payload).unwrap();
+
+    let (total, middle) = journal
+        .read_blob_range(&hash, 12_345, 8_192)
+        .unwrap()
+        .unwrap();
+    assert_eq!(total, payload.len() as u64);
+    assert_eq!(middle, payload[12_345..12_345 + 8_192]);
+
+    let (_, boundary) = journal
+        .read_blob_range(&hash, payload.len() as u64 - 17, 17)
+        .unwrap()
+        .unwrap();
+    assert_eq!(boundary, payload[payload.len() - 17..]);
+
+    let (_, past_end) = journal
+        .read_blob_range(&hash, u64::MAX, usize::MAX)
+        .unwrap()
+        .unwrap();
+    assert!(past_end.is_empty());
+}
+
+#[test]
+fn verified_page_cache_serves_exact_hits_without_redecompression() {
+    let journal = Journal::in_memory().unwrap();
+    let id = journal
+        .append(&rec("cas", "human", 1, "cached output"))
+        .unwrap();
+    let payload = (0..(256 * 1024 + 31))
+        .map(|i| (i % 251) as u8)
+        .collect::<Vec<_>>();
+    let hash = journal.record_output(id, "stdout", &payload).unwrap();
+    let offset = 192 * 1024;
+    let expected = payload[offset..offset + 8192].to_vec();
+    assert_eq!(
+        journal
+            .read_blob_range(&hash, offset as u64, 8192)
+            .unwrap()
+            .unwrap()
+            .1,
+        expected
+    );
+
+    // Damage the legacy single-stream backing file after the verified page is
+    // cached. The exact hit remains trusted and needs no decompression, while
+    // a distinct distant page must reopen, reverify, and reject corruption.
+    fs::write(journal.blob_path(&hash), b"not a zstd stream").unwrap();
+    assert_eq!(
+        journal
+            .cached_blob_range(&hash, offset as u64, 8192)
+            .unwrap()
+            .unwrap()
+            .1,
+        expected
+    );
+    assert!(journal.read_blob_range(&hash, 0, 8192).is_err());
+}
+
+#[test]
+fn page_cache_enforces_byte_and_entry_bounds() {
+    let mut cache = BlobPageCache::default();
+    for index in 0..(BLOB_PAGE_CACHE_MAX_ENTRIES + 20) {
+        cache.insert(BlobPageCacheEntry {
+            hash: format!("{index:064x}"),
+            offset: 0,
+            length: 8192,
+            total: 8192,
+            bytes: vec![index as u8; 8192],
+        });
+    }
+    assert!(cache.entries.len() <= BLOB_PAGE_CACHE_MAX_ENTRIES);
+    assert!(cache.bytes <= BLOB_PAGE_CACHE_MAX_BYTES);
+    assert!(cache.get(&format!("{:064x}", 0), 0, 8192).is_none());
+    assert!(
+        cache
+            .get(
+                &format!("{:064x}", BLOB_PAGE_CACHE_MAX_ENTRIES + 19),
+                0,
+                8192,
+            )
+            .is_some()
+    );
 }
 
 /// Count regular files under `dir`, recursively.
@@ -70,6 +207,103 @@ fn finish_unknown_id_errors() {
 }
 
 #[test]
+fn completion_outputs_transcript_and_marker_commit_together() {
+    let j = Journal::in_memory().unwrap();
+    let id = j.append(&rec("s", "human", 1, "return 42")).unwrap();
+    let payload = r#"{"n":0,"summary":{"type":"int"}}"#;
+
+    j.complete_with_outputs(
+        id,
+        &[("value", b"42"), ("render", b"42\n")],
+        Some((2, payload)),
+        Some(0),
+        true,
+        17,
+    )
+    .unwrap();
+
+    let rows = j.entries_by_id(&[id]).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, Some(0));
+    assert_eq!(rows[0].ok, Some(true));
+    assert_eq!(rows[0].dur_ns, Some(17));
+    assert_eq!(
+        rows[0]
+            .outputs
+            .iter()
+            .map(|output| output.kind.as_str())
+            .collect::<Vec<_>>(),
+        ["value", "render"]
+    );
+    let events = j.transcript_events_by_entry(&[id]).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].ts_ns, 2);
+    assert_eq!(events[0].payload_json, payload);
+}
+
+#[test]
+fn late_completion_failure_rolls_back_outputs_and_marker() {
+    let j = Journal::in_memory().unwrap();
+    let id = j.append(&rec("s", "human", 1, "return 42")).unwrap();
+    j.record_transcript_event(id, 1, r#"{"existing":true}"#)
+        .unwrap();
+
+    let error = j
+        .complete_with_outputs(
+            id,
+            &[("value", b"must not become visible")],
+            Some((2, r#"{"duplicate":true}"#)),
+            Some(0),
+            true,
+            17,
+        )
+        .unwrap_err();
+    assert!(matches!(error, rusqlite::Error::SqliteFailure(_, _)));
+
+    let rows = j.entries_by_id(&[id]).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, None);
+    assert_eq!(rows[0].ok, None);
+    assert_eq!(rows[0].dur_ns, None);
+    assert!(rows[0].outputs.is_empty());
+    let events = j.transcript_events_by_entry(&[id]).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].ts_ns, 1);
+    assert_eq!(events[0].payload_json, r#"{"existing":true}"#);
+}
+
+#[test]
+fn aggregate_completion_preparation_is_bounded_before_writing() {
+    let j = Journal::in_memory_with_options(JournalOptions {
+        output_hard_cap: 8,
+        ..Default::default()
+    })
+    .unwrap();
+    let id = j.append(&rec("s", "human", 1, "return 42")).unwrap();
+
+    assert!(
+        j.complete_with_outputs(
+            id,
+            &[("value", b"12345"), ("render", b"67890")],
+            None,
+            Some(0),
+            true,
+            17,
+        )
+        .is_err()
+    );
+    let too_many = vec![("value", b"x".as_slice()); 17];
+    assert!(
+        j.complete_with_outputs(id, &too_many, None, Some(0), true, 17)
+            .is_err()
+    );
+
+    let rows = j.entries_by_id(&[id]).unwrap();
+    assert_eq!(rows[0].ok, None);
+    assert!(rows[0].outputs.is_empty());
+}
+
+#[test]
 fn unfinished_entry_survives_reopen_with_null_status() {
     // WAL crash-tolerance smoke: append, drop without finish, reopen.
     let dir = tempfile::tempdir().unwrap();
@@ -99,6 +333,7 @@ fn open_creates_tree_and_wal_mode() {
     }
     assert!(state.join("journal.db").is_file());
     assert!(state.join("cas").is_dir());
+    assert!(state.join("leases").is_dir());
     // WAL mode is persisted in the database header.
     let conn = Connection::open(state.join("journal.db")).unwrap();
     let mode: String = conn
@@ -193,6 +428,82 @@ fn legacy_zero_version_db_is_adopted_without_losing_rows() {
         version, CURRENT_SCHEMA_VERSION,
         "adoption must stamp the current version"
     );
+}
+
+#[test]
+fn version_one_entry_metadata_migration_preserves_and_classifies_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("journal.db");
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE entry(
+                 id INTEGER PRIMARY KEY, session TEXT NOT NULL, principal TEXT NOT NULL,
+                 ts INTEGER NOT NULL, dur_ns INTEGER, cwd BLOB NOT NULL, env_hash BLOB,
+                 src TEXT NOT NULL, ast BLOB NOT NULL, effects TEXT NOT NULL,
+                 status INTEGER, ok BOOL, opaque BOOL NOT NULL
+             );
+             INSERT INTO entry(session,principal,ts,cwd,src,ast,effects,opaque)
+                 VALUES ('s','human',1,X'2f','statement','{}','[]',0);
+             INSERT INTO entry(session,principal,ts,cwd,src,ast,effects,opaque)
+                 VALUES ('s','human',2,X'2f','exec','{\"stmts\":[]}','[]',0);
+             INSERT INTO entry(session,principal,ts,cwd,src,ast,effects,opaque)
+                 VALUES ('s','human',3,X'2f','approval','null','[{\"kind\":\"approval\"}]',0);
+             INSERT INTO entry(session,principal,ts,cwd,src,ast,effects,opaque)
+                 VALUES ('s','human',4,X'2f','malformed','not json','also not json',0);
+             PRAGMA user_version=1;",
+        )
+        .unwrap();
+    }
+
+    let journal = Journal::open(dir.path()).expect("v1 journal must migrate without data loss");
+    let rows = journal.query(&JournalQuery::default()).unwrap();
+    assert_eq!(rows.len(), 4);
+    let kind_for = |src: &str| rows.iter().find(|row| row.src == src).unwrap().kind;
+    assert_eq!(kind_for("statement"), EntryKind::Statement);
+    assert_eq!(kind_for("exec"), EntryKind::Exec);
+    assert_eq!(kind_for("approval"), EntryKind::Approval);
+    assert_eq!(kind_for("malformed"), EntryKind::Statement);
+    assert!(rows.iter().all(|row| row.parent_id.is_none()));
+    let version: i64 = journal
+        .conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, CURRENT_SCHEMA_VERSION);
+}
+
+#[test]
+fn version_two_migration_adds_leases_without_touching_permanent_pins() {
+    let dir = tempfile::tempdir().unwrap();
+    let hash;
+    {
+        let journal = Journal::open(dir.path()).unwrap();
+        let id = journal.append(&rec("s", "human", 1, "pinned")).unwrap();
+        hash = journal.record_output(id, "stdout", b"keep me").unwrap();
+        journal.pin(&hash).unwrap();
+    }
+    {
+        let conn = Connection::open(dir.path().join("journal.db")).unwrap();
+        conn.execute_batch("DROP TABLE pin_lease; PRAGMA user_version=2;")
+            .unwrap();
+    }
+
+    let journal = Journal::open(dir.path()).expect("v2 journal must gain lease storage");
+    assert_eq!(journal.pins().unwrap(), vec![hash]);
+    let version: i64 = journal
+        .conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, CURRENT_SCHEMA_VERSION);
+    let lease_table: i64 = journal
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='pin_lease'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(lease_table, 1);
 }
 
 #[test]
@@ -330,6 +641,36 @@ fn read_blob_missing_returns_none() {
 }
 
 #[test]
+fn every_public_cas_entry_rejects_non_blake3_keys_without_panicking() {
+    let j = Journal::in_memory().unwrap();
+    let spill = tempfile::NamedTempFile::new().unwrap();
+    for malformed in ["", "00", "abcd", "zzzz", "../00"] {
+        assert!(j.read_blob(malformed).unwrap().is_none());
+        assert!(j.blob_len(malformed).unwrap().is_none());
+        assert!(j.pin(malformed).is_err());
+        assert!(j.unpin(malformed).is_err());
+        assert!(j.ingest_spill(spill.path(), malformed, 0, false).is_err());
+        assert_eq!(
+            j.cas().read(malformed).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+}
+
+#[test]
+fn corrupted_output_hash_is_a_typed_query_error() {
+    let j = Journal::in_memory().unwrap();
+    let id = j.append(&rec("s", "human", 1, "echo")).unwrap();
+    j.conn
+        .execute(
+            "INSERT INTO output(entry_id,kind,hash,len) VALUES(?1,'stdout',?2,0)",
+            rusqlite::params![id, vec![0u8]],
+        )
+        .unwrap();
+    assert!(j.query(&JournalQuery::default()).is_err());
+}
+
+#[test]
 fn query_head_filter() {
     let j = Journal::in_memory().unwrap();
     j.append(&rec("s", "human", 1, "git push origin main"))
@@ -364,6 +705,50 @@ fn query_principal_filter() {
     let rows = j.query(&q).unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].src, "cargo test");
+}
+
+#[test]
+fn entry_kind_and_parent_round_trip_and_filter_explicitly() {
+    let j = Journal::in_memory().unwrap();
+    let mut exec = rec("s", "human", 1, "whole program");
+    exec.kind = EntryKind::Exec;
+    let exec_id = j.append(&exec).unwrap();
+    let mut statement = rec("s", "human", 2, "one statement");
+    statement.parent_id = Some(exec_id);
+    let statement_id = j.append(&statement).unwrap();
+
+    let rows = j
+        .query(&JournalQuery {
+            kind: Some(EntryKind::Statement),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, statement_id);
+    assert_eq!(rows[0].kind, EntryKind::Statement);
+    assert_eq!(rows[0].parent_id, Some(exec_id));
+
+    let exec_row = j.entries_by_id(&[exec_id]).unwrap().pop().unwrap();
+    assert_eq!(exec_row.kind, EntryKind::Exec);
+    assert_eq!(exec_row.parent_id, None);
+}
+
+#[test]
+fn query_session_filter_is_exact() {
+    let j = Journal::in_memory().unwrap();
+    j.append(&rec("alpha", "human", 1, "first")).unwrap();
+    j.append(&rec("beta", "human", 2, "second")).unwrap();
+    j.append(&rec("alpha", "human", 3, "third")).unwrap();
+
+    let rows = j
+        .query(&JournalQuery {
+            session: Some("alpha".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].src, "third");
+    assert_eq!(rows[1].src, "first");
 }
 
 #[test]
@@ -529,6 +914,68 @@ fn entries_by_id_joins_outputs_like_query_does() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].outputs.len(), 1);
     assert_eq!(rows[0].outputs[0].kind, "stdout");
+}
+
+#[test]
+fn durable_event_seed_and_ranges_are_owner_scoped_and_bounded() {
+    let j = Journal::in_memory().unwrap();
+    let mut coarse_ids = Vec::new();
+    for n in 0..6 {
+        let mut entry = rec("s", "human", n, "return");
+        entry.kind = EntryKind::Exec;
+        entry.ast_json = r#"{"stmts":[]}"#.into();
+        let id = j.append(&entry).unwrap();
+        j.finish(id, Some(0), true, 1).unwrap();
+        if n % 2 == 0 {
+            j.record_transcript_event(id, n, "{}").unwrap();
+        }
+        coarse_ids.push(id);
+        // A valid evaluator-style statement row must never consume a journal
+        // channel sequence.
+        let fine = j.append(&rec("s", "human", n, "fine")).unwrap();
+        j.finish(fine, Some(0), true, 1).unwrap();
+    }
+    let mut foreign = rec("s", "agent:other", 99, "return");
+    foreign.kind = EntryKind::Exec;
+    foreign.ast_json = r#"{"stmts":[]}"#.into();
+    j.append(&foreign).unwrap();
+
+    // Semantic type, not incidental JSON shape, defines channel membership.
+    let mut program_shaped_statement = rec("s", "human", 100, "not an exec");
+    program_shaped_statement.ast_json = r#"{"stmts":[]}"#.into();
+    j.append(&program_shaped_statement).unwrap();
+    let mut non_program_shaped_exec = rec("s", "human", 101, "still an exec");
+    non_program_shaped_exec.kind = EntryKind::Exec;
+    non_program_shaped_exec.ast_json = "null".into();
+    let semantic_exec = j.append(&non_program_shaped_exec).unwrap();
+
+    let seed = j.journal_event_seed("human", "s", 2).unwrap();
+    assert_eq!(seed.published, 7);
+    assert_eq!(seed.tail_entry_ids, vec![coarse_ids[5], semantic_exec]);
+    assert_eq!(
+        j.journal_event_entry_ids("human", "s", 1, 3).unwrap(),
+        coarse_ids[1..4]
+    );
+
+    let transcript = j.transcript_event_seed("human", "s", 2).unwrap();
+    assert_eq!(transcript.published, 3);
+    assert_eq!(
+        transcript.tail_entry_ids,
+        vec![coarse_ids[2], coarse_ids[4]]
+    );
+    assert_eq!(
+        j.transcript_event_entry_ids("human", "s", 1, 2).unwrap(),
+        vec![coarse_ids[2], coarse_ids[4]]
+    );
+    assert!(
+        j.journal_event_entry_ids("human", "s", u64::MAX, 1)
+            .is_err(),
+        "sequence offsets must never wrap through an unchecked SQL cast"
+    );
+    assert!(
+        j.journal_event_seed("human", "s", usize::MAX).is_err(),
+        "host-sized limits must be checked before binding to SQLite"
+    );
 }
 
 #[test]
@@ -985,6 +1432,149 @@ fn pins_are_idempotent_and_exempt_from_gc() {
 }
 
 #[test]
+fn live_spill_leases_are_counted_and_release_on_last_value_drop() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::open(dir.path()).unwrap();
+    let payload = b"one deduplicated live capture".repeat(1024);
+    let hash = blake3::hash(&payload).to_hex().to_string();
+    let spill = journal.spill_dir().unwrap();
+
+    let first_path = spill.join("first");
+    fs::write(&first_path, &payload).unwrap();
+    let first = journal
+        .ingest_spill_leased(&first_path, &hash, payload.len() as u64)
+        .unwrap();
+    let second_path = spill.join("second");
+    fs::write(&second_path, &payload).unwrap();
+    let second = journal
+        .ingest_spill_leased(&second_path, &hash, payload.len() as u64)
+        .unwrap();
+
+    assert_eq!(journal.protected_hashes().unwrap(), vec![hash.clone()]);
+    let count: i64 = journal
+        .conn
+        .query_row(
+            "SELECT ref_count FROM pin_lease WHERE hash=?1",
+            [hex_bytes(&hash).unwrap()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 2);
+    assert!(
+        journal
+            .gc(GcOptions {
+                max_bytes: Some(0),
+                ..Default::default()
+            })
+            .unwrap()
+            .deleted
+            .is_empty()
+    );
+
+    drop(first);
+    assert_eq!(journal.protected_hashes().unwrap(), vec![hash.clone()]);
+    drop(second);
+    assert!(journal.protected_hashes().unwrap().is_empty());
+    let report = journal
+        .gc(GcOptions {
+            max_bytes: Some(0),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(report.deleted.len(), 1);
+    assert_eq!(report.deleted[0].hash, hash);
+}
+
+#[test]
+fn gc_reaps_a_crashed_owner_lease_before_selecting_blobs() {
+    let journal = Journal::in_memory().unwrap();
+    let id = journal.append(&rec("s", "human", 1, "spill")).unwrap();
+    let hash = journal
+        .record_output(id, "stdout", b"orphaned lease")
+        .unwrap();
+    journal
+        .conn
+        .execute(
+            "DELETE FROM output WHERE hash=?1",
+            [hex_bytes(&hash).unwrap()],
+        )
+        .unwrap();
+    journal
+        .conn
+        .execute(
+            "INSERT INTO pin_lease(hash,owner,ref_count) VALUES(?1,'dead-beef',1)",
+            [hex_bytes(&hash).unwrap()],
+        )
+        .unwrap();
+
+    let report = journal
+        .gc(GcOptions {
+            max_bytes: Some(0),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(report.deleted.len(), 1);
+    assert_eq!(report.deleted[0].hash, hash);
+    let leases: i64 = journal
+        .conn
+        .query_row("SELECT COUNT(*) FROM pin_lease", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(leases, 0);
+}
+
+#[test]
+fn one_journal_owner_cannot_release_another_owners_live_blob() {
+    let dir = tempfile::tempdir().unwrap();
+    let first_journal = Journal::open(dir.path()).unwrap();
+    let second_journal = Journal::open(dir.path()).unwrap();
+    let payload = b"shared across two live sessions".repeat(1024);
+    let hash = blake3::hash(&payload).to_hex().to_string();
+
+    let first_path = first_journal.spill_dir().unwrap().join("owner-one");
+    fs::write(&first_path, &payload).unwrap();
+    let first = first_journal
+        .ingest_spill_leased(&first_path, &hash, payload.len() as u64)
+        .unwrap();
+    let second_path = second_journal.spill_dir().unwrap().join("owner-two");
+    fs::write(&second_path, &payload).unwrap();
+    let second = second_journal
+        .ingest_spill_leased(&second_path, &hash, payload.len() as u64)
+        .unwrap();
+
+    drop(first);
+    drop(first_journal);
+    assert_eq!(
+        second_journal.protected_hashes().unwrap(),
+        vec![hash.clone()]
+    );
+    assert!(
+        second_journal
+            .gc(GcOptions {
+                max_bytes: Some(0),
+                ..Default::default()
+            })
+            .unwrap()
+            .deleted
+            .is_empty(),
+        "the second owner's OS lock must keep its lease live"
+    );
+
+    drop(second);
+    assert!(second_journal.protected_hashes().unwrap().is_empty());
+    assert_eq!(
+        second_journal
+            .gc(GcOptions {
+                max_bytes: Some(0),
+                ..Default::default()
+            })
+            .unwrap()
+            .deleted
+            .len(),
+        1
+    );
+}
+
+#[test]
 fn gc_prefers_orphans_then_lru_and_dry_run_preserves() {
     let j = Journal::in_memory().unwrap();
     let id = j.append(&rec("s", "human", 1, "outputs")).unwrap();
@@ -1026,6 +1616,23 @@ fn gc_prefers_orphans_then_lru_and_dry_run_preserves() {
         .unwrap();
     assert_eq!(done.deleted[0].hash, orphan);
     assert!(j.read_blob(&orphan).unwrap().is_none());
+}
+
+#[test]
+fn corrupted_blob_hash_is_a_typed_gc_error() {
+    let j = Journal::in_memory().unwrap();
+    j.conn
+        .execute(
+            "INSERT INTO blob(hash,stored_len,created_ns,last_access_ns) VALUES(?1,0,0,0)",
+            [vec![0u8]],
+        )
+        .unwrap();
+    let result = j.gc(GcOptions {
+        ttl: Some(std::time::Duration::ZERO),
+        max_bytes: Some(0),
+        dry_run: false,
+    });
+    assert!(result.is_err());
 }
 
 #[test]
@@ -1121,6 +1728,39 @@ fn read_blob_rejects_corrupted_content() {
         format!("{:?}", err.unwrap_err()).contains("integrity"),
         "error should name the integrity failure"
     );
+    let stream_err = j.cas().open_verified(&hash);
+    assert!(
+        stream_err.is_err(),
+        "streaming reads must verify before exposing corrupt bytes"
+    );
+}
+
+#[test]
+fn concurrent_first_open_waits_through_wal_and_schema_initialization() {
+    let dir = tempfile::tempdir().unwrap();
+    for round in 0..10 {
+        let state = dir.path().join(format!("concurrent-open-{round}"));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles = (0..8)
+            .map(|_| {
+                let state = state.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    Journal::open(&state)
+                })
+            })
+            .collect::<Vec<_>>();
+        let opened = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Result<Vec<_>, _>>();
+        assert!(
+            opened.is_ok(),
+            "concurrent first-open round {round} failed: {:?}",
+            opened.err()
+        );
+    }
 }
 
 #[test]
@@ -1187,4 +1827,253 @@ fn busy_timeout_lets_a_blocked_writer_wait_instead_of_dropping() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].id, id);
     assert_eq!(rows[0].src, "echo survived");
+}
+
+fn storage_admission(error: &rusqlite::Error) -> Option<&StorageAdmissionError> {
+    match error {
+        rusqlite::Error::ToSqlConversionFailure(error) => {
+            error.downcast_ref::<StorageAdmissionError>()
+        }
+        _ => None,
+    }
+}
+
+#[test]
+fn tiny_database_budget_refuses_begin_without_creating_an_audit_row() {
+    let journal = Journal::in_memory_with_options(JournalOptions {
+        database_max_bytes: 1,
+        ..Default::default()
+    })
+    .unwrap();
+    let error = journal
+        .append(&rec("session", "human", 1, "must-not-run"))
+        .unwrap_err();
+    assert_eq!(
+        storage_admission(&error).map(|error| error.domain),
+        Some(StorageDomain::Database)
+    );
+    assert!(journal.query(&JournalQuery::default()).unwrap().is_empty());
+}
+
+#[test]
+fn sqlite_full_is_typed_and_rolls_back_the_begin_row() {
+    let journal = Journal::in_memory().unwrap();
+    let pages: i64 = journal
+        .conn
+        .query_row("PRAGMA page_count", [], |row| row.get(0))
+        .unwrap();
+    journal
+        .conn
+        .pragma_update(None, "max_page_count", pages)
+        .unwrap();
+    let mut record = rec("session", "human", 1, "full");
+    record.src = "x".repeat(1024 * 1024);
+    let error = journal.append(&record).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            rusqlite::Error::SqliteFailure(code, _)
+                if code.code == rusqlite::ErrorCode::DiskFull
+        ),
+        "unexpected SQLite-full error: {error}"
+    );
+    assert!(journal.query(&JournalQuery::default()).unwrap().is_empty());
+}
+
+#[test]
+fn tiny_cas_budget_rejects_output_before_file_or_metadata_commit() {
+    let journal = Journal::in_memory_with_options(JournalOptions {
+        cas_max_bytes: 8,
+        ..Default::default()
+    })
+    .unwrap();
+    let id = journal.append(&rec("s", "human", 1, "capture")).unwrap();
+    let error = journal
+        .record_output(id, "stdout", b"sixteen bytes!!!!")
+        .unwrap_err();
+    assert_eq!(
+        storage_admission(&error).map(|error| error.domain),
+        Some(StorageDomain::Cas)
+    );
+    let rows = journal.query(&JournalQuery::default()).unwrap();
+    assert!(rows[0].outputs.is_empty());
+    let status = journal.storage_status().unwrap();
+    assert_eq!(status.cas_logical_bytes, 0);
+    assert_eq!(status.cas_physical_bytes, 0);
+}
+
+#[test]
+fn concurrent_cas_writers_cannot_both_spend_the_same_remaining_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let options = JournalOptions {
+        cas_max_bytes: 100,
+        ..Default::default()
+    };
+    let journal = Journal::open_with_options(dir.path(), options).unwrap();
+    let ids = [
+        journal.append(&rec("s", "human", 1, "one")).unwrap(),
+        journal.append(&rec("s", "human", 2, "two")).unwrap(),
+    ];
+    drop(journal);
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let workers = ids.map(|id| {
+        let root = dir.path().to_path_buf();
+        let barrier = barrier.clone();
+        std::thread::spawn(move || {
+            let journal = Journal::open_with_options(&root, options).unwrap();
+            barrier.wait();
+            journal.record_output(id, "stdout", &[id as u8; 80])
+        })
+    });
+    barrier.wait();
+    let results = workers.map(|worker| worker.join().unwrap());
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter_map(|result| result.as_ref().err())
+            .filter_map(storage_admission)
+            .filter(|error| error.domain == StorageDomain::Cas)
+            .count(),
+        1
+    );
+    let status = Journal::open_with_options(dir.path(), options)
+        .unwrap()
+        .storage_status()
+        .unwrap();
+    assert_eq!(status.cas_logical_bytes, 80);
+}
+
+#[test]
+fn spill_adoption_verifies_metadata_and_rolls_back_quota_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::open_with_options(
+        dir.path(),
+        JournalOptions {
+            cas_max_bytes: 8,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let spill_dir = journal.spill_dir().unwrap();
+    let source = spill_dir.join("capture-spill-test");
+    let payload = b"larger than budget";
+    fs::write(&source, payload).unwrap();
+    let hash = blake3::hash(payload).to_hex().to_string();
+
+    assert!(
+        journal
+            .ingest_spill(&source, &hash, payload.len() as u64 - 1, true)
+            .is_err()
+    );
+    assert!(source.exists(), "metadata mismatch does not consume source");
+    let wrong_hash = blake3::hash(b"different").to_hex().to_string();
+    assert!(
+        journal
+            .ingest_spill(&source, &wrong_hash, payload.len() as u64, true)
+            .is_err()
+    );
+    assert!(source.exists(), "hash mismatch does not consume source");
+    let error = journal
+        .ingest_spill(&source, &hash, payload.len() as u64, true)
+        .unwrap_err();
+    assert_eq!(
+        storage_admission(&error).map(|error| error.domain),
+        Some(StorageDomain::Cas)
+    );
+    assert!(
+        source.exists(),
+        "quota refusal leaves RAII owner in control"
+    );
+    assert!(journal.pins().unwrap().is_empty());
+    assert_eq!(journal.storage_status().unwrap().cas_logical_bytes, 0);
+}
+
+#[test]
+fn pinned_content_blocks_recovery_until_explicit_unpin_and_gc() {
+    let journal = Journal::in_memory_with_options(JournalOptions {
+        cas_max_bytes: 100,
+        ..Default::default()
+    })
+    .unwrap();
+    let first = journal.append(&rec("s", "human", 1, "one")).unwrap();
+    let hash = journal.record_output(first, "stdout", &[1; 80]).unwrap();
+    journal.pin(&hash).unwrap();
+    let report = journal
+        .gc(GcOptions {
+            max_bytes: Some(0),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(report.deleted.is_empty(), "pins are never auto-evicted");
+    let second = journal.append(&rec("s", "human", 2, "two")).unwrap();
+    assert!(journal.record_output(second, "stdout", &[2; 80]).is_err());
+
+    journal.unpin(&hash).unwrap();
+    let report = journal
+        .gc(GcOptions {
+            max_bytes: Some(0),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(report.reclaimed_bytes, 80);
+    journal.record_output(second, "stdout", &[2; 80]).unwrap();
+}
+
+#[test]
+fn storage_status_reconciles_database_wal_and_cas_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::open(dir.path()).unwrap();
+    let id = journal.append(&rec("s", "human", 1, "persist")).unwrap();
+    journal
+        .record_output(id, "stdout", b"persistent bytes")
+        .unwrap();
+    journal.finish(id, Some(0), true, 1).unwrap();
+    let before = journal.storage_status().unwrap();
+    assert!(before.database_admission_bytes() > 0);
+    assert_eq!(before.cas_logical_bytes, 16);
+    drop(journal);
+
+    let reopened = Journal::open(dir.path()).unwrap();
+    let after = reopened.storage_status().unwrap();
+    assert_eq!(after.cas_logical_bytes, before.cas_logical_bytes);
+    assert_eq!(after.cas_physical_bytes, before.cas_physical_bytes);
+    assert!(after.database_admission_bytes() > 0);
+    assert!(after.database_admission_bytes() <= after.database_max_bytes);
+}
+
+#[test]
+fn long_reader_wal_growth_eventually_refuses_new_begins_with_headroom() {
+    let dir = tempfile::tempdir().unwrap();
+    let options = JournalOptions {
+        database_max_bytes: 512 * 1024,
+        ..Default::default()
+    };
+    let journal = Journal::open_with_options(dir.path(), options).unwrap();
+    let reader = rusqlite::Connection::open(dir.path().join("journal.db")).unwrap();
+    reader.execute_batch("BEGIN").unwrap();
+    let _: i64 = reader
+        .query_row("SELECT COUNT(*) FROM entry", [], |row| row.get(0))
+        .unwrap();
+
+    let mut accepted = 0;
+    let refusal = loop {
+        match journal.append(&rec("s", "human", accepted, "bounded WAL growth")) {
+            Ok(id) => {
+                accepted += 1;
+                journal.finish(id, Some(0), true, 1).unwrap();
+                assert!(accepted < 10_000, "WAL admission never converged");
+            }
+            Err(error) => break error,
+        }
+    };
+    assert!(accepted > 0);
+    assert_eq!(
+        storage_admission(&refusal).map(|error| error.domain),
+        Some(StorageDomain::Database)
+    );
+    let status = journal.storage_status().unwrap();
+    assert!(status.wal_bytes > 0);
+    assert!(status.database_admission_bytes() <= status.database_max_bytes);
+    reader.execute_batch("ROLLBACK").unwrap();
 }

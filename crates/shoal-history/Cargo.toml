@@ -4,9 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 serde_json = "1.0.150"
 shoal-journal = { path = "../shoal-journal" }
+shoal-paths = { path = "../shoal-paths" }
+shoal-config = { path = "../shoal-config" }
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 
 [dev-dependencies]

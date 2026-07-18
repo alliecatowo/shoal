@@ -1,0 +1,17 @@
+#!/usr/bin/env shoal
+# Validate the mise-installed generator, enforce governance, and build the site.
+
+let initial = (reef lock)
+let cargo_lock = initial.find(.name == "cargo")
+assert(cargo_lock != null && cargo_lock.locked, "CI could not lock cargo through Reef: {initial}")
+let zola_lock = initial.find(.name == "zola")
+assert(zola_lock != null && zola_lock.locked, "CI could not lock zola through Reef: {initial}")
+run("site/scripts/check-diagrams.shl")
+run("zola", "--root", "site", "check")
+let base_url = (env SHOAL_PAGES_BASE_URL).out ?? (if (args.is_empty()) { "" } else { args.first().str() })
+if (base_url == "") {
+  run("zola", "--root", "site", "build")
+} else {
+  run("zola", "--root", "site", "build", "--base-url", base_url)
+}
+echo "documentation site built"

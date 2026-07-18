@@ -2,6 +2,57 @@
 //! [`crate::expr`] for the split rationale).
 
 use super::*;
+use std::io::Read as _;
+
+#[derive(Default)]
+enum StreamPumpErrorState {
+    #[default]
+    Empty,
+    Pending(ErrorVal),
+    Delivered,
+}
+
+/// One terminal error handoff from the stream producer to the command-driving
+/// thread. A poisoned cell cannot preserve which error was being committed, so
+/// it reconstructs to one stable synchronization error and clears the poison.
+#[derive(Clone, Default)]
+struct StreamPumpError(Arc<std::sync::Mutex<StreamPumpErrorState>>);
+
+impl StreamPumpError {
+    fn record(&self, error: ErrorVal) {
+        let mut state = match self.0.lock() {
+            Ok(state) => state,
+            Err(poisoned) => self.repair(poisoned),
+        };
+        if matches!(*state, StreamPumpErrorState::Empty) {
+            *state = StreamPumpErrorState::Pending(error);
+        }
+    }
+
+    fn take_terminal(&self) -> Option<ErrorVal> {
+        let mut state = match self.0.lock() {
+            Ok(state) => state,
+            Err(poisoned) => self.repair(poisoned),
+        };
+        match std::mem::replace(&mut *state, StreamPumpErrorState::Delivered) {
+            StreamPumpErrorState::Pending(error) => Some(error),
+            StreamPumpErrorState::Empty | StreamPumpErrorState::Delivered => None,
+        }
+    }
+
+    fn repair<'a>(
+        &'a self,
+        poisoned: std::sync::PoisonError<std::sync::MutexGuard<'a, StreamPumpErrorState>>,
+    ) -> std::sync::MutexGuard<'a, StreamPumpErrorState> {
+        let mut state = poisoned.into_inner();
+        *state = StreamPumpErrorState::Pending(ErrorVal::new(
+            "stream_feed_sync",
+            "stream stdin pump synchronization state was poisoned",
+        ));
+        self.0.clear_poison();
+        state
+    }
+}
 
 impl Evaluator {
     /// Resolve `v.name` as a *field* — the direct, no-fallback accessor set.
@@ -87,7 +138,7 @@ impl Evaluator {
             // `1h.from_now` resolve against the live wall clock into a datetime.
             Value::Duration(ns) => match name {
                 "ago" | "from_now" => {
-                    let base = crate::helpers::now_zoned(self.clock.as_ref());
+                    let base = crate::helpers::now_zoned(self.host.clock.as_ref());
                     let signed = if name == "ago" { -*ns } else { *ns };
                     let span = jiff::SignedDuration::from_nanos(signed);
                     base.checked_add(span)
@@ -312,69 +363,11 @@ impl Evaluator {
             )),
         }
     }
-    /// Filesystem-backed `path` methods (`.read`/`.read_bytes`/`.lines`/
-    /// `.exists`/`.is_dir`/`.is_file`/`.size`/`.modified`, site/content/internals/intercrate-protocol-contracts.md).
-    /// These live in the evaluator rather than `shoal-value::methods` because
-    /// they perform IO — routed through the [`Fs`] port so a fake can interpose
-    /// — and resolve relative paths against the session cwd.
-    pub(crate) fn path_fs_method(&self, p: &Path, name: &str) -> VResult<Value> {
-        let abs = if p.is_absolute() {
-            p.to_path_buf()
-        } else {
-            self.cwd.join(p)
-        };
-        let ioerr = |e: std::io::Error| {
-            let code = if e.kind() == std::io::ErrorKind::NotFound {
-                "not_found"
-            } else {
-                "custom"
-            };
-            ErrorVal::new(code, format!("{}: {e}", abs.display()))
-        };
-        let utf8err = || ErrorVal::new("utf8_error", format!("{}: not valid UTF-8", abs.display()));
-        match name {
-            "read" => {
-                let bytes = self.fs.read(&abs).map_err(ioerr)?;
-                String::from_utf8(bytes)
-                    .map(Value::Str)
-                    .map_err(|_| utf8err())
-            }
-            "read_bytes" => Ok(Value::Bytes(Arc::new(self.fs.read(&abs).map_err(ioerr)?))),
-            "lines" => {
-                let bytes = self.fs.read(&abs).map_err(ioerr)?;
-                let s = String::from_utf8(bytes).map_err(|_| utf8err())?;
-                Ok(Value::List(
-                    s.lines()
-                        .map(|l| Value::Str(l.trim_end_matches('\r').into()))
-                        .collect(),
-                ))
-            }
-            "exists" => Ok(Value::Bool(self.fs.metadata(&abs).is_ok())),
-            "is_dir" => Ok(Value::Bool(
-                self.fs.metadata(&abs).map(|m| m.is_dir()).unwrap_or(false),
-            )),
-            "is_file" => Ok(Value::Bool(
-                self.fs.metadata(&abs).map(|m| m.is_file()).unwrap_or(false),
-            )),
-            "size" => Ok(Value::Size(self.fs.metadata(&abs).map_err(ioerr)?.len())),
-            "modified" => {
-                let m = self.fs.metadata(&abs).map_err(ioerr)?;
-                Ok(m.modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .and_then(|d| jiff::Timestamp::from_nanosecond(d.as_nanos() as i128).ok())
-                    .map(|ts| Value::DateTime(Box::new(ts.to_zoned(jiff::tz::TimeZone::system()))))
-                    .unwrap_or(Value::Null))
-            }
-            _ => unreachable!("path_fs_method called with unexpected name `{name}`"),
-        }
-    }
-
     pub(crate) fn values_from(&mut self, v: Value) -> VResult<Vec<Value>> {
         match v {
             Value::List(xs) => Ok(xs),
             Value::Table(rs) => Ok(rs.into_iter().map(Value::Record).collect()),
-            Value::Range(r) => Ok(r.iter().map(Value::Int).collect()),
+            Value::Range(r) => r.materialize(),
             // Iterating a glob VALUE expands its matches (site/content/internals/language-conformance-contract.md): `for f in
             // glob("*.rs")` walks the sorted `list<path>`. (Passing a glob as a
             // command argument still expands at the callee — that is unchanged.)
@@ -412,35 +405,199 @@ impl Evaluator {
             (recv, arg)
         };
         let value = self.eval_expr(value_expr, Position::Value)?;
-        let bytes = shoal_value::feed_bytes(&value).map_err(|e| e.or_span(span))?;
+        if let Value::Stream(stream) = value {
+            return self.eval_stream_feed(stream, cmd_expr, position, span);
+        }
+        let body = crate::finite_io::FiniteBody::from_value(value, ".feed body")
+            .map_err(|error| error.or_span(span))?;
+        match body
+            .into_feed_input()
+            .map_err(|error| error.or_span(span))?
+        {
+            crate::finite_io::FeedInput::Bytes(bytes) => {
+                self.eval_feed_command(cmd_expr, position, span, StdinSpec::Bytes(bytes))
+            }
+            crate::finite_io::FeedInput::Reader(reader) => {
+                self.eval_reader_feed(reader, cmd_expr, position, span)
+            }
+        }
+    }
+
+    /// Pump a finite reader (shared resident bytes or lazy CAS content) through
+    /// the same bounded child-stdin queue used by streams. This keeps only one
+    /// 64 KiB producer chunk plus the fixed queue resident and never calls the
+    /// CAS full-load interface.
+    fn eval_reader_feed(
+        &mut self,
+        mut reader: Box<dyn std::io::Read + Send>,
+        cmd_expr: &Expr,
+        position: Position,
+        span: Span,
+    ) -> VResult<Value> {
+        let (stdin_sink, stdin) = shoal_exec::stream_stdin(shoal_exec::MAX_STDIN_STREAM_CHUNKS);
+        let parent_cancel = self.cancellation_token();
+        let pump_cancel = CancelToken::linked(&parent_cancel);
+        let error = StreamPumpError::default();
+        let pump_error = error.clone();
+        let worker_cancel = pump_cancel.clone();
+        let worker = std::thread::Builder::new()
+            .name("shoal-finite-feed".into())
+            .spawn(move || {
+                loop {
+                    if worker_cancel.is_cancelled() {
+                        break;
+                    }
+                    let mut chunk = vec![0u8; shoal_exec::MAX_STDIN_STREAM_CHUNK_BYTES];
+                    let count = match reader.read(&mut chunk) {
+                        Ok(count) => count,
+                        Err(error) => {
+                            pump_error.record(ErrorVal::new(
+                                "feed_io",
+                                format!("read finite stdin source: {error}"),
+                            ));
+                            break;
+                        }
+                    };
+                    if count == 0 {
+                        break;
+                    }
+                    chunk.truncate(count);
+                    match send_stdin_chunk(&stdin_sink, &worker_cancel, &parent_cancel, chunk) {
+                        Ok(true) => {}
+                        Ok(false) => break,
+                        Err(error) => {
+                            pump_error.record(error);
+                            break;
+                        }
+                    }
+                }
+            })
+            .map_err(|error| {
+                ErrorVal::new("io_error", format!("spawn finite stdin pump: {error}"))
+            })?;
+
+        let _cancel_on_unwind = CancelPumpOnDrop(pump_cancel.clone());
+        let result = self.eval_feed_command(cmd_expr, position, span, stdin);
+        pump_cancel.cancel();
+        if worker.join().is_err() {
+            error.record(ErrorVal::new(
+                "stream_feed_sync",
+                "finite stdin pump panicked",
+            ));
+        }
+        if let Some(error) = error.take_terminal() {
+            return Err(error.or_span(span));
+        }
+        result
+    }
+
+    fn eval_stream_feed(
+        &mut self,
+        stream: shoal_value::StreamVal,
+        cmd_expr: &Expr,
+        position: Position,
+        span: Span,
+    ) -> VResult<Value> {
+        const PULL_POLL: Duration = Duration::from_millis(25);
+
+        let lease = crate::streams::acquire_stream_pump()?;
+        let mut upstream = stream.take_upstream()?;
+        let (stdin_sink, stdin) = shoal_exec::stream_stdin(shoal_exec::MAX_STDIN_STREAM_CHUNKS);
+        let parent_cancel = self.cancellation_token();
+        let pump_cancel = CancelToken::linked(&parent_cancel);
+        let child = self.child_context();
+        let error = StreamPumpError::default();
+        let pump_error = error.clone();
+        let worker_cancel = pump_cancel.clone();
+        let worker = std::thread::Builder::new()
+            .name("shoal-stream-feed".into())
+            .spawn(move || {
+                let _lease = lease;
+                let mut evaluator = child.build(ChildKind::StreamPump, worker_cancel.clone());
+                loop {
+                    if worker_cancel.is_cancelled() {
+                        break;
+                    }
+                    let item = match upstream.pull(&mut evaluator, Some(PULL_POLL)) {
+                        Ok(shoal_value::Pull::Item(value)) => value,
+                        Ok(shoal_value::Pull::Timeout) => continue,
+                        Ok(shoal_value::Pull::End) => break,
+                        Err(e) => {
+                            pump_error.record(e);
+                            break;
+                        }
+                    };
+                    let sent = match send_stream_item(
+                        &stdin_sink,
+                        &worker_cancel,
+                        &parent_cancel,
+                        &item,
+                    ) {
+                        Ok(sent) => sent,
+                        Err(e) => {
+                            pump_error.record(e);
+                            break;
+                        }
+                    };
+                    if !sent {
+                        break;
+                    }
+                }
+            })
+            .map_err(|e| ErrorVal::new("io_error", format!("spawn stream feed: {e}")))?;
+
+        let _cancel_on_unwind = CancelPumpOnDrop(pump_cancel.clone());
+        let result = self.eval_feed_command(cmd_expr, position, span, stdin);
+        // Wake a pump blocked on an idle live upstream or a full stdin queue
+        // once the process has exited or failed to spawn.
+        pump_cancel.cancel();
+        if worker.join().is_err() {
+            // The sender is dropped during unwind, so a command blocked on
+            // stdin observes EOF and terminates. Commit the panic through the
+            // same first-terminal-error cell rather than bypassing it with a
+            // generic error; if the panic poisoned that cell, `record` repairs
+            // it to the canonical synchronization failure.
+            error.record(ErrorVal::new(
+                "stream_feed_sync",
+                "stream stdin pump panicked",
+            ));
+        }
+        if let Some(e) = error.take_terminal() {
+            return Err(e.or_span(span));
+        }
+        result
+    }
+
+    fn eval_feed_command(
+        &mut self,
+        cmd_expr: &Expr,
+        position: Position,
+        span: Span,
+        stdin: StdinSpec,
+    ) -> VResult<Value> {
         match cmd_expr {
             Expr::LangBlock { tool, src, span } => {
-                self.eval_lang_block(tool, src, StdinSpec::Bytes(bytes), position, *span)
+                self.eval_lang_block(tool, src, stdin, position, *span)
             }
             Expr::Cmd { call, .. } => {
-                let mut argv = vec![OsString::from(&call.head)];
+                let mut argv = crate::args::ArgvBuilder::new(OsString::from(&call.head))?;
                 for a in &call.args {
                     for v in self.expand_arg(a)? {
-                        argv.push(self.argv_value(v)?);
+                        argv.push(self.argv_value(v)?)?;
                     }
                 }
                 self.run_argv(
-                    argv,
+                    argv.finish(),
                     position,
-                    StdinSpec::Bytes(bytes),
+                    stdin,
                     &call.env_prefix,
                     call.span,
                     None,
                 )
             }
-            Expr::Var { name, .. } => self.run_argv(
-                vec![OsString::from(name)],
-                position,
-                StdinSpec::Bytes(bytes),
-                &[],
-                span,
-                None,
-            ),
+            Expr::Var { name, .. } => {
+                self.run_argv(vec![OsString::from(name)], position, stdin, &[], span, None)
+            }
             other => Err(ErrorVal::type_error(format!(
                 ".feed's argument must be a command, not {}",
                 expr_noun(other)
@@ -459,8 +616,104 @@ impl Evaluator {
     fn is_command_expr(&self, e: &Expr) -> bool {
         match e {
             Expr::LangBlock { .. } | Expr::Cmd { .. } => true,
-            Expr::Var { name, .. } => self.env.get(name).is_none(),
+            Expr::Var { name, .. } => self.exec.shell.env.get(name).is_none(),
             _ => false,
+        }
+    }
+}
+
+/// Ensures an unwind in command evaluation cannot detach a live stdin pump.
+/// The worker polls this token while pulling and while applying queue
+/// backpressure, so cancellation bounds its exit even when normal join logic
+/// is skipped by a panic boundary above us.
+struct CancelPumpOnDrop(CancelToken);
+
+impl Drop for CancelPumpOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+fn send_stream_item(
+    sink: &StdinSink,
+    stop: &CancelToken,
+    parent_cancel: &CancelToken,
+    value: &Value,
+) -> VResult<bool> {
+    match value {
+        Value::Bytes(bytes) => {
+            return send_stdin_bytes(sink, stop, parent_cancel, bytes.as_slice());
+        }
+        Value::CasBytes(bytes) => {
+            let mut reader = bytes.open()?;
+            loop {
+                let mut chunk = vec![0u8; shoal_exec::MAX_STDIN_STREAM_CHUNK_BYTES];
+                let n = reader
+                    .read(&mut chunk)
+                    .map_err(|e| ErrorVal::new("io_error", format!("stream feed: {e}")))?;
+                if n == 0 {
+                    return Ok(true);
+                }
+                chunk.truncate(n);
+                if !send_stdin_chunk(sink, stop, parent_cancel, chunk)? {
+                    return Ok(false);
+                }
+            }
+        }
+        _ => {}
+    }
+
+    let raw_chunk = matches!(value, Value::Outcome(_));
+    let mut bytes = shoal_value::feed_bytes(value)?;
+    // Streams of values are line-framed so item boundaries survive the byte
+    // boundary (tail strings become lines; records become NDJSON). Explicit
+    // byte/outcome chunks remain raw for binary and already-framed producers.
+    if !raw_chunk && !bytes.ends_with(b"\n") {
+        bytes.push(b'\n');
+    }
+    send_stdin_bytes(sink, stop, parent_cancel, &bytes)
+}
+
+fn send_stdin_bytes(
+    sink: &StdinSink,
+    stop: &CancelToken,
+    parent_cancel: &CancelToken,
+    bytes: &[u8],
+) -> VResult<bool> {
+    for chunk in bytes.chunks(shoal_exec::MAX_STDIN_STREAM_CHUNK_BYTES) {
+        if !send_stdin_chunk(sink, stop, parent_cancel, chunk.to_vec())? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn send_stdin_chunk(
+    sink: &StdinSink,
+    stop: &CancelToken,
+    parent_cancel: &CancelToken,
+    mut chunk: Vec<u8>,
+) -> VResult<bool> {
+    loop {
+        if stop.is_cancelled() || parent_cancel.is_cancelled() {
+            return Ok(false);
+        }
+        match sink.try_send(chunk) {
+            Ok(()) => return Ok(true),
+            Err(shoal_exec::StdinTrySendError::Disconnected(_)) => return Ok(false),
+            Err(shoal_exec::StdinTrySendError::Full(returned)) => {
+                chunk = returned;
+                std::thread::park_timeout(Duration::from_millis(2));
+            }
+            Err(shoal_exec::StdinTrySendError::ChunkTooLarge(_)) => {
+                return Err(ErrorVal::new(
+                    "stream_stdin_chunk_limit",
+                    format!(
+                        "stream stdin chunks must not exceed {} bytes",
+                        shoal_exec::MAX_STDIN_STREAM_CHUNK_BYTES
+                    ),
+                ));
+            }
         }
     }
 }
@@ -473,5 +726,204 @@ fn expr_noun(e: &Expr) -> &'static str {
         Expr::List { .. } => "a list",
         Expr::Record { .. } => "a record",
         _ => "that value",
+    }
+}
+
+#[cfg(test)]
+mod stream_pump_error_tests {
+    use super::*;
+
+    struct SparseReader {
+        remaining: usize,
+    }
+
+    impl std::io::Read for SparseReader {
+        fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+            let count = self.remaining.min(output.len());
+            output[..count].fill(b'x');
+            self.remaining -= count;
+            Ok(count)
+        }
+    }
+
+    struct FailingReader {
+        delivered: bool,
+    }
+
+    impl std::io::Read for FailingReader {
+        fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+            if self.delivered {
+                return Err(std::io::Error::other("injected CAS read failure"));
+            }
+            self.delivered = true;
+            output[..4].copy_from_slice(b"seed");
+            Ok(4)
+        }
+    }
+
+    #[test]
+    fn poisoned_pump_error_reconstructs_one_stable_terminal_error() {
+        let error = StreamPumpError::default();
+        let poison_target = error.clone();
+        let poisoner = std::thread::Builder::new()
+            .name("poison-stream-pump-error".into())
+            .spawn(move || {
+                let _state = poison_target.0.lock().expect("error cell starts healthy");
+                panic!("inject stream pump error poison");
+            })
+            .expect("spawn stream pump poisoner");
+        assert!(poisoner.join().is_err());
+
+        error.record(ErrorVal::new("upstream", "must not replace sync failure"));
+        let terminal = error
+            .take_terminal()
+            .expect("poison reconstructs one terminal error");
+        assert_eq!(terminal.code, "stream_feed_sync");
+        assert_eq!(
+            terminal.msg,
+            "stream stdin pump synchronization state was poisoned"
+        );
+        assert!(error.take_terminal().is_none());
+        assert!(!error.0.is_poisoned(), "reconstructed state is healthy");
+    }
+
+    #[test]
+    fn concurrent_producers_preserve_exactly_one_first_terminal_error() {
+        let error = StreamPumpError::default();
+        let start = Arc::new(std::sync::Barrier::new(3));
+        let mut producers = Vec::new();
+        for (code, message) in [("first", "one"), ("second", "two")] {
+            let error = error.clone();
+            let start = start.clone();
+            producers.push(
+                std::thread::Builder::new()
+                    .name(format!("stream-pump-{code}"))
+                    .spawn(move || {
+                        start.wait();
+                        error.record(ErrorVal::new(code, message));
+                    })
+                    .unwrap(),
+            );
+        }
+        start.wait();
+        for producer in producers {
+            producer.join().unwrap();
+        }
+
+        let delivered = error.take_terminal().expect("one producer wins");
+        assert!(matches!(delivered.code.as_str(), "first" | "second"));
+        assert!(error.take_terminal().is_none());
+    }
+
+    #[test]
+    fn panicking_real_pump_closes_stdin_and_surfaces_typed_sync_failure() {
+        let stream = shoal_value::StreamVal::from_iter(
+            "int",
+            std::iter::from_fn(|| -> Option<VResult<Value>> {
+                panic!("inject upstream pump panic")
+            }),
+        );
+        let command = Expr::Var {
+            name: "cat".into(),
+            span: Span::default(),
+        };
+        let mut evaluator = Evaluator::new(std::env::current_dir().unwrap());
+        let error = evaluator
+            .eval_stream_feed(stream, &command, Position::Value, Span::default())
+            .unwrap_err();
+        assert_eq!(error.code, "stream_feed_sync");
+        assert_eq!(error.msg, "stream stdin pump panicked");
+    }
+
+    #[test]
+    fn real_pump_preserves_the_upstream_terminal_error() {
+        let stream = shoal_value::StreamVal::from_iter(
+            "int",
+            std::iter::once(Err(ErrorVal::new("upstream_failed", "original failure"))),
+        );
+        let command = Expr::Var {
+            name: "cat".into(),
+            span: Span::default(),
+        };
+        let mut evaluator = Evaluator::new(std::env::current_dir().unwrap());
+        let error = evaluator
+            .eval_stream_feed(stream, &command, Position::Value, Span::default())
+            .unwrap_err();
+        assert_eq!(error.code, "upstream_failed");
+        assert_eq!(error.msg, "original failure");
+    }
+
+    #[test]
+    fn finite_reader_larger_than_http_wall_streams_through_process_stdin() {
+        let length = crate::finite_io::FINITE_BODY_MAX_BYTES + 1;
+        let command = Expr::Cmd {
+            call: Box::new(shoal_ast::CmdCall {
+                head: "wc".into(),
+                forced: false,
+                args: vec![shoal_ast::CmdArg::FlagShort {
+                    chars: "c".into(),
+                    span: Span::default(),
+                }],
+                env_prefix: Vec::new(),
+                redirects: Vec::new(),
+                background: false,
+                trailing: None,
+                span: Span::default(),
+            }),
+            span: Span::default(),
+        };
+        let mut evaluator = Evaluator::new(std::env::current_dir().unwrap());
+        let value = evaluator
+            .eval_reader_feed(
+                Box::new(SparseReader { remaining: length }),
+                &command,
+                Position::Value,
+                Span::default(),
+            )
+            .unwrap();
+        let Value::Outcome(outcome) = value else {
+            panic!("wc should return an outcome")
+        };
+        assert_eq!(
+            String::from_utf8_lossy(&outcome.stdout).trim(),
+            length.to_string()
+        );
+    }
+
+    #[test]
+    fn finite_feed_reader_error_is_typed_and_evaluator_recovers() {
+        let command = Expr::Var {
+            name: "cat".into(),
+            span: Span::default(),
+        };
+        let mut evaluator = Evaluator::new(std::env::current_dir().unwrap());
+        let error = evaluator
+            .eval_reader_feed(
+                Box::new(FailingReader { delivered: false }),
+                &command,
+                Position::Value,
+                Span::default(),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "feed_io");
+        assert!(error.msg.contains("injected CAS read failure"));
+
+        let program = shoal_syntax::parse("40 + 2").unwrap();
+        assert_eq!(evaluator.eval_program(&program).unwrap(), Value::Int(42));
+    }
+
+    #[test]
+    fn production_stream_pump_has_no_panicking_lock_access() {
+        let production = include_str!("expr_access.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source prefix");
+        let compact = production.split_whitespace().collect::<String>();
+        for forbidden in [".lock().unwrap(", ".lock().expect("] {
+            assert!(
+                !compact.contains(forbidden),
+                "production stream-feed synchronization contains `{forbidden}`"
+            );
+        }
     }
 }

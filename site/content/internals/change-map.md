@@ -63,9 +63,12 @@ assert_failed permission recursion_limit overflow
 
 Extensions include Reef (`reef_unlocked`, `reef_drift`, `reef_conflict`, `reef_not_found`,
 `reef_provider`), IO (`feed_error`, `lang_block_unbalanced`, `runner_not_found`), and streams
-(`stream_unbounded`). Implementation also uses boundary-specific values such as `io_error`,
-`net_error`, and `channel_closed`; any corpus-assertable code must be added to the pinned contract
-rather than invented ad hoc at one call site.
+(`stream_unbounded`, `channel_closed`, `channel_poisoned`, `channel_name_limit`,
+`channel_registry_limit`, `channel_subscriber_limit`, `channel_payload_limit`, and
+`channel_payload_type`), and journal integrity (`journal_begin_failed`,
+`journal_commit_indeterminate`, `journal_read_failed`). Implementation also uses boundary-specific
+values such as `io_error` and `net_error`; any corpus-assertable code must be added to the pinned
+contract rather than invented ad hoc at one call site.
 
 `ErrorVal::or_span` preserves the innermost existing span. Higher evaluation layers should add a span
 only when the lower layer had none.
@@ -132,132 +135,129 @@ raised while evaluating valid source; the latter means the method call itself wa
 
 ## Current architecture debt
 
-### Critical: approval mutation and journal reads bypass attachment
+### Closed hardening boundaries that must remain invariant
 
-**Evidence:** `Kernel::dispatch` routes both `cap.request` and `journal.query` without passing the
-connection's `Attachment`. `handle_cap_request` looks up the process-global plan map by ref and sets
-`stored.approved = true` after policy evaluation, but never authenticates or authorizes the caller as
-an approver. `handle_journal_query` returns the shared journal without a caller-principal filter.
-The protocol comment claiming the complete unattached-method set also omits `journal.query`, so the
-comment and router disagree.
+The former approval, journal, plan-identity, named-session, and token-snapshot defects are closed:
 
-**Compounding identity defect:** `Plan::new` derives `plan_ref` from only effects, reversibility, and
-estimates, truncated to 16 hex characters. Kernel storage is `HashMap<plan_ref, StoredPlan>`, so
-equal-effect plans from different source/session/principal records overwrite one another. Apply does
-re-check the currently stored source/session/principal and therefore rejects many confused uses, but
-the ref is not a unique owner-scoped plan identity.
+- every stateful handler uses an attachment; journal reads force the attachment's exact owner;
+- approval reserves a one-shot transition, durably audits it before publication, and binds the
+  consuming execution;
+- plan ids bind full source/AST/effects/Session/principal content plus a unique object suffix;
+- session identity is `(principal, visible Session name)`, with matching exact-owner refs and quotas;
+- token operations use shared/exclusive fd locks and fresh disk reads, while attached requests
+  revalidate live and fail closed on revocation, expiry, or store failure.
 
-**Risk:** a same-user socket client can approve a known or derived non-denied plan without an
-approver identity and inspect journal data across token principals. Equal-shape plans can invalidate
-or replace each other's stored objects.
+Regression work belongs in collision, concurrency, audit-failure, and live-revocation tests. Most
+token labels remain descriptive attach metadata; principal Leash policy plus the exact
+`plan.approve` and `token.admin` handler checks are the authorization boundary.
 
-**Direction:** require attachment plus an explicit approver/journal-read capability, scope queries,
-separate unique stored-object IDs from content fingerprints, and add two-token/two-session collision
-tests. Pin the only genuinely public methods in a router test.
+### Resolved: shared evaluator composition with enforced surface profiles
 
-### High: session identity is weaker than session naming
+**Resolution:** `shoal-host::SessionBootstrap` applies layered config, aliases/environment, config
+snapshot, bundled/configured adapters, WebAssembly plugins, Reef inputs, echo, and configured policy
+to noninteractive, standalone-interactive, private-kernel, and durable-kernel evaluators.
 
-**Evidence:** `Kernel::session(name, principal)` uses `principal` only when first creating a named
-session. Later principals attaching the same name receive the same evaluator and transcript. The
-evaluator journal principal remains the creator's, while coarse exec rows use each current actor.
+`Surface` makes deliberate differences data. Init files run only for `Interactive`; the API itself
+no-ops for other profiles. Only an inherited private-human transport with a real TTY may select that
+profile, so the default private REPL gets init while public/bearer/MCP agent Sessions cannot execute
+terminal startup code. Prompt/editor/history UI remains correctly owned by the CLI.
 
-**Risk:** cross-principal state disclosure/mutation and confused provenance when a name crosses a
-trust boundary.
+**Proof:** host tests apply the same env, aliases, and configured adapter directories across all
+profiles and pin the init omission. Real daemon tests prove private interactive init execution and
+durable public-kernel omission of a configured malformed init file.
 
-**Direction:** key sessions by an authenticated ownership identity or enforce an explicit ACL at
-attach, then migrate journal/transcript scoping and add same-name/two-principal tests.
+### Resolved: live token administration has separate explicit authority
 
-### High: token administration is a stale startup snapshot
+Durable kernels expose metadata list, one-time bearer creation, and ID-based revocation through raw
+RPC. The handlers reuse `TokenStore`'s fresh-load interprocess locks and atomic publication, so the
+standalone CLI and a live kernel cannot overwrite each other's updates. List never exposes bearer or
+digest material, and ephemeral kernels refuse because they have no durable credential store.
 
-**Evidence:** persistent kernel constructors open `TokenStore` once and retain its in-memory token
-vector. The separate `shoal-token` command opens and atomically rewrites the same file, but the kernel
-has no reload/watcher/generation check. Token `profile` and `caps` appear in attach output, while
-authorization evaluates Leash by `principal`; no handler consumes the cap strings.
+Credential administration is deliberately narrower than plan approval and shutdown: public bearer
+attachments require exact `token.admin`. Neither the `supervisor` profile nor `plan.approve` can mint
+credentials. Tests create and attach a worker through the live RPC, revoke it, and require its next
+request to fail existing revalidation; public supervisor denial and embedded-human ephemeral refusal
+cover both trust boundaries.
 
-**Risk:** external revocation does not stop an already-known bearer until kernel restart, newly
-created tokens fail until restart, and operators/clients can mistake descriptive cap strings for
-grants. Concurrent management processes can also replace updates from a stale file snapshot.
+### Resolved: policy and OS containment report sharp trust assumptions
 
-**Direction:** make the kernel own token mutation or add locked generation-aware reload with an
-explicit maximum revocation latency. Define cap/profile values as enforced policy input or rename and
-document them as labels. Test create/revoke against a live serving kernel.
+**Resolution:** a present malformed user Leash policy enters explicit deny-all quarantine (only a
+genuinely missing convenience policy keeps the local permissive default). `session.attach` and
+`exec mode=plan` now return one typed enforcement preview: available tier, deferred activation,
+filesystem request/enforceability, network scope/backend status, spawn-pin atomicity, hermetic
+intent/disposition, and stable limitation labels.
 
-### High: the local shell and kernel are divergent composition roots
+Hermetic filesystem scopes that resolve to no usable root are retained and refused before target
+spawn instead of disappearing. Hermetic principal network allowlists refuse because no network
+backend exists, and hermetic spawn pins refuse because hash-before-exec remains TOCTOU-prone.
+Nonhermetic callers retain compatible best-effort behavior with the limitation surfaced.
 
-**Evidence:** the CLI loads layered config, aliases/env, config snapshot, init files, bundled and extra
-adapters, prompt, and user Reef scope. Kernel session creation installs journal/frecency/event
-forwarding but not those features.
+**Proof:** policy and exec tests cover unresolved scopes plus direct unsupported network/identity
+requests; evaluator integrations drive both configured hermetic limitations through a real external
+command path. Kernel coverage requires attach and plan previews to be identical, protocol
+deserialization keeps older plan results compatible, and the kernel composition-root ceiling forced
+the forecast into its own module rather than growing `lib.rs`.
 
-**Risk:** documentation and tests can claim a universal language feature that agents cannot use—or
-agents can observe defaults different from humans.
+### Resolved: evaluator-owned parser-context parity
 
-**Direction:** extract a host-neutral evaluator builder with explicit profiles, then make deliberate
-differences data rather than copy/pasted setup.
+**Resolution:** `Evaluator::parse_context` is the single read-only snapshot of value-bound and
+callable names. The standalone REPL and both kernel `exec` plan/run paths call it immediately before
+`parse_with_ctx`; the kernel holds the evaluator lock from snapshot through evaluation.
 
-### High: policy and OS containment have sharp trust assumptions
+**Proof:** a real two-request kernel test defines a value, then plans and runs a later expression
+whose head would be an external command under context-free parsing. Local classification tests cover
+value/callable partitioning, and structural guards prohibit either host from rebuilding the scan.
 
-**Evidence:** malformed user Leash policy falls back to permissive in the convenience local loader;
-network grants are plan-only because no network backend exists; executable hash pinning has a
-preflight TOCTOU gap.
+The public `parse` and completion endpoints remain intentionally context-free because they do not
+name an attached evaluator session; that is an explicit API distinction, not exec-host drift.
 
-**Risk:** a caller can mistake a parsed policy or “hermetic” label for stronger enforcement than the
-host actually supplies.
+### Resolved: MCP subscriptions share one connection and worker
 
-**Direction:** require an explicit fail-open/fail-closed loader mode by host, surface enforcement
-dimensions in every relevant attach/plan result, and keep hermetic refusal tests for unsupported
-network/spawn guarantees.
+One facade-owned hub multiplexes its bounded 64-URI routing map over one attached kernel connection
+and one forwarding thread. A wakeup socket makes subscribe/unsubscribe lifecycle commands immediate
+without an idle polling loop. The worker preserves interleaved events while waiting for kernel RPC
+responses, routes one channel notification to every exact subscribed URI in stable order, and calls
+kernel unsubscribe only when the final URI for that channel is removed.
 
-### Medium-high: parser context parity is incomplete
+A live kernel capped at two connections admits the facade's ordinary request transport plus multiple
+resource subscriptions; the former per-URI model fails on the second URI. Repeated idempotent
+subscribe/unsubscribe cycles reuse the hub without retaining URI routes. Facade drop shuts down the
+single socket and joins the worker. A disconnected worker is reported as inactive and rebuilt on the
+next subscription; automatic cursor replay across that disconnect remains a client reconciliation
+concern.
 
-**Evidence:** the local REPL parses with current evaluator bindings; kernel exec uses the context-free
-parse entry point per request.
+### Resolved: explicit dual journal granularity and execution identity
 
-**Risk:** a session binding at statement head can be classified differently across local source and
-multi-request kernel execution.
+**Resolution:** schema v2 stores an explicit `statement|exec|approval` kind and nullable parent exec
+ID. Kernel statement rows name their coarse execution, journal-channel queries filter `kind=exec`,
+and both kernel and standalone REPL consume the evaluator's exact completed entry ID directly.
 
-**Direction:** expose a read-only evaluator parse snapshot or move binding-neutral disambiguation into
-a shared post-parse dispatch, with exact host-parity cases.
+**Proof:** v1 and legacy-v0 migration fixtures preserve data and classify old producer shapes;
+round-trip/query tests cover kind and parent; event tests prove JSON shape cannot enroll a statement
+or exclude an exec; kernel multi-statement/restart tests verify exact parentage and replay counts.
 
-### Medium-high: MCP unsubscribe does not own subscription lifetime
+**Remaining evolution:** historical parent IDs are honestly null because they cannot be reconstructed;
+statement ordinals and host vocabulary can be added if a concrete query needs them.
 
-**Evidence:** subscribe spawns a dedicated connection/thread; the facade stores no handle; MCP
-`resources/unsubscribe` immediately acknowledges without signalling that worker.
+### Medium: WASM ABI evolution
 
-**Risk:** subscriptions and threads persist until connection/process termination, violating client
-expectations and scaling poorly across repeated subscribe/unsubscribe cycles.
-
-**Direction:** registry keyed by subscription URI/client request, cancellation token plus join/close,
-and an end-to-end test that publication stops after unsubscribe.
-
-### Medium-high: dual kernel journal granularity is easy to misquery
-
-**Evidence:** each RPC run appends a coarse entry while the evaluator writes per-top-level-statement
-entries to the same store; the event index tracks only coarse IDs.
-
-**Risk:** counts, “latest” logic, principal attribution, and history UI can double-count or mix row
-kinds without a schema discriminator.
-
-**Direction:** add an entry kind/parent-exec relation or choose one canonical lifecycle. Return IDs
-directly instead of inferring latest rows.
-
-### Medium: incomplete stream, task, PTY, and WASM paths
-
-These are four separate, explicitly unimplemented surfaces:
+The remaining plugin surface is evolutionary rather than a missing execution path:
 
 | Gap | Source evidence | Architectural work required |
 |---|---|---|
-| stream → process stdin | `feed_bytes(Value::Stream)` returns a type error | bounded backpressure/cancellation-aware producer-to-child pipe |
-| wire stream chunks | `WireValue::Stream` carries a label, no pull method | cursor/ref protocol with item/error/end, budgets, ownership and cancellation |
-| language EventBus live backpressure | replay ring is capped at 1,024, but live subscribers use unbounded queues and are cloned/sent under the bus mutex | bounded subscriber queues, explicit overflow/gap markers, and shorter publish critical section |
-| child evaluator authority escape | spawn/parallel/on/.shl children omit parent Leash and broadly omit Reef; some omit ConfigPort | one capability-complete child constructor plus inheritance tests at every site |
-| incomplete filesystem port | direct path metadata/canonicalize/exists/OpenOptions/watch calls coexist with injected `Fs` | expand capability traits and prohibit direct host path access in evaluator/value effect paths |
-| method metadata/dispatch parity | sequence metadata advertises table/range `.get` that dispatch rejects; bool omits valid `.str`/`.display` | generate receiver metadata from executable dispatch tests or pin bidirectional parity fixtures |
-| function type soundness | scalar parameter and return annotations are not consistently enforced; non-string command arguments can bypass coercion | one runtime validator shared by expression/command calls plus return checking and conformance cases |
-| kernel task suspend/resume | handlers return `TASK_CONTROL_UNAVAILABLE` | task runtime that can identify/control owned child groups, or remove verbs |
-| WASM evaluation | `shoal-wasm` has no eval/host dependency or invocation API | effect-scoped host ABI, component lifecycle, value/wire conversion, limits |
-| WASM deadline | `shoal_wasm::Limits` has fuel/memory/table/instance ceilings but no wall-clock timeout | host deadline/interruption design and tests before claiming timeout confinement |
-| Reef runner/options-only scope | scope discovery ignores manifests whose `tools` map is empty | decide whether non-tool Reef configuration constitutes a scope; add discovery tests |
-| companion state-root parity | `shoal-history` and doctor defaults use XDG data while evaluator/kernel use XDG state | one shared root resolver or mandatory explicit state-dir plumbing |
+| WASM ABI evolution | preview ABI v1 is integrated with declared+authorized hostcalls and bounded values | keep new hostcalls effect-scoped, versioned, cancellable, and adversarially tested |
+
+Compilation admission is now closed as a concurrency-amplification gap: at most two component
+compilers run process-wide, callers wait at most a configured two seconds by default (with an
+immutable ten-second ceiling), and Wasmtime's optional parallel-compilation feature is disabled.
+The admitted compiler remains synchronous and cannot be epoch-interrupted; hard per-compilation
+preemption would require an isolated compiler process or trusted precompiled artifacts.
+
+Reef's shipped provider subprocess gap is also closed. Evaluator version probes and `mise install`
+receive an injected bounded runner carrying the session environment, cancellation epoch, and Leash
+filesystem sandbox. A requested provider sandbox is fail-closed when OS enforcement is unavailable;
+probe/install wall time and retained output are bounded. Third-party in-process `Provider`
+implementations remain trusted host code, as do all Rust trait implementations injected by a host.
 
 PTY change subscription is also absent; MCP callers poll rendered screens. Do not paper over these
 gaps with eager materialization or background threads without a lifecycle protocol.
@@ -269,44 +269,64 @@ lost at restart. Journal and CAS remain, but identity-bearing values cannot simp
 A recovery design should explicitly classify reconstructible summaries, immutable CAS data, and
 non-recoverable live objects rather than imply full session durability.
 
-### Medium: lock poisoning and thread-per-subscription scaling
+### Resolved: task records advertise useful control operations
 
-Long-lived kernel state uses many `Mutex::lock().unwrap()` sites. A panic while holding a shared lock
-can poison it and cascade through later requests. Every event subscription adds a blocking writer
-thread; MCP adds another forwarding connection/thread. First remove panic sources inside critical
-sections and add stress/lock-order tests; then consider a supervised task/executor model if scaling
-needs justify it.
+`task.list`, `task.get`, and terminal `task.await` records include an additive `controls` object with
+`cancel`, `suspend`, `resume`, and `active_process_groups`. A process-backed running task advertises
+suspend only after its group is registered; while stopped it advertises resume; evaluator-only and
+terminal work never claims process control. Legacy records decode with all controls false.
 
-### Medium: frame caps are checked after allocation
+The snapshot reads the same cancellation-epoch process registry used by the signal operations. It is
+advisory because a child may exit immediately afterward, so callers still handle
+`TASK_CONTROL_UNAVAILABLE`. Poison reconstruction clears both uncertain group identities and the
+suspended bit; the first inspection fails honestly and the next returns a clean empty snapshot.
 
-Kernel and MCP readers accumulate a full line with `read_line` before applying the 16 MiB check. A
-hostile peer can grow memory with a newline-free frame. Use a bounded `fill_buf`/`take` loop that
-drains or closes once the cap is crossed, and test partial frames plus multiple valid frames.
+### Resolved: subscription threads are bounded by owning connections
 
-### Medium: spill pins lack automatic release
+The kernel uses one bounded dispatcher/writer thread per connection, not per channel subscription;
+all channels on that connection share it while retaining separate bounded queues and slow-consumer
+gap accounting. MCP now likewise uses one connection/thread per facade, not per resource URI.
+Connection, per-session subscription, and facade URI quotas therefore bound both layers without
+thread amplification from adding channels. Disconnect/facade drop owns dispatcher shutdown and join.
 
-Evaluator spill adoption pins CAS blobs, but no evaluator/session/value-drop path unpins them. Manual
-history CLI operations can unpin. Model pins as named leases/owners or persist ref counts so live
-values stay safe without permanent growth.
+### Resolved: spill pins have automatic multi-owner release
 
-### Medium: Reef discovery and identity can hide changes
+Evaluator spill adoption now atomically increments a `(hash, owner)` refcount and returns a guard
+owned by the lazy `CasBytes` loader. The final value clone drops the guard and releases its row;
+identical content leased by another journal owner remains protected. Permanent history pins stay in
+their existing operator-managed table and cannot impersonate or remove a live lease.
 
-Normal scope discovery silently skips malformed/unreadable manifests. Hash caching keys on file
-identity metadata rather than content every time. Together these favor speed/best-effort operation
-over conspicuous failure. Record discovery diagnostics and make strict script/agent mode surface
-them; harden cache identity without hashing every executable on every prompt render.
+Each owner holds an exclusive per-owner lockfile through an `Arc` shared by its journal handle and
+value guards. Applied GC treats a missing/acquirable owner lock as crash-stale, deletes those lease
+rows inside its candidate-selection transaction, then evaluates retention. Tests cover same-owner
+refcounts, two independent owners, evaluator-outliving values, last-value release, and stale-owner
+recovery.
 
-### Medium-low: schema fields exist without runtime wiring
+### Resolved: Reef discovery errors are visible and identity keys detect rewrites
 
-Core config accepts `render.width`, `kernel.*`, `journal.*`, and `leash.policy` without corresponding
-host behavior. Its typed `prompt.template` field is also not passed through, but the rich prompt
-loader independently rereads legacy `template` from system/user and cwd-local prompt files and
-migrates it to `format.left`. Preserve that compatibility while unifying discovery: core config uses
-one nearest ancestor `.shoal.toml`, whereas rich prompt currently checks only `cwd/.shoal.toml`.
+Scope discovery retains at most 64 diagnostics of at most 4 KiB each. Interactive evaluation emits
+them once per unchanged discovery identity and can keep using valid farther scopes; noninteractive
+script/agent execution refuses an external spawn until the malformed or unreadable authority is
+fixed. Repairing a manifest in the same cwd immediately clears that refusal.
+
+Candidate/lock discovery, executable hashing, and system-version probes now include Unix change time
+alongside device, inode, modification time, and length. Tests rewrite files to equal-length content,
+restore the old mtime, and require cache invalidation. Metadata-to-open and hash-to-exec races remain
+honest filesystem/process boundaries; these caches are acceleration, not bearer authority.
+
+### Closed: project and prompt discovery select one project file
+
+The shared host bootstrap consumes render width/color/echo, kernel mode/session, journal
+enablement/state root, Leash policy, adapters, plugins, Reef, aliases, and environment. The rich
+prompt loader still owns its broader schema and legacy `template` migration, but it now calls the
+core loader's exact nearest-ancestor discovery function. Both select one identical project file;
+the core schema treats `[prompt]` as an opaque subsystem-owned table while the bounded prompt parser
+performs detailed validation and removes project executable custom modules.
 
 ### Medium-low: duplicated classifications invite drift
 
-- parser interpreter block names are static while adapters declare an interpreter class;
+- standalone interpreter names and configured adapter classes meet through explicit parser context
+  plus a generated bundled-pack parity test;
 - completer and highlighter reimplement parser/dispatch context heuristics;
 - LSP declarations are token-split rather than semantically indexed;
 - prompt config and core prompt fields are separate;
@@ -317,14 +337,12 @@ solve drift by introducing dependency cycles.
 
 ### Low but concrete maintenance debt
 
-- `shoal-history::entry` scans all journal rows instead of `entries_by_id`.
-- Fuzz targets are shallow and their CI build is allowed to fail.
-- Color/highlighter tests inherit ambient `NO_COLOR` while asserting ANSI output.
-- Workspace lints are declared but member crates do not inherit them.
-- A `JobsSnapshot` comment says suspended is always zero while implementation counts suspended
-  tasks; code is authoritative, but misleading comments make future regressions likely.
-- Some historical root-doc counts and feature-status claims are stale relative to source and the
-  1,310-case corpus.
+- Fuzz targets are shallow; PR compilation is blocking and scheduled runtime fuzzing is the
+  behavioral gate.
+- Color/highlighter tests isolate ambient `NO_COLOR` while asserting ANSI output.
+- Workspace lints are declared at the root and every member crate inherits them with
+  `[lints] workspace = true`.
+- Historical root-doc counts must remain explicitly dated relative to the current 1,364-case corpus.
 
 ## Prioritization map
 

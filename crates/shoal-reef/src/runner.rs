@@ -4,7 +4,7 @@
 //! argv template. The named tool is itself resolved through reef by the caller.
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader};
+use std::io::Read;
 use std::path::Path;
 
 /// A runner binding: the tool to invoke and a leading argv template inserted
@@ -60,7 +60,10 @@ impl RunnerTable {
     }
 
     pub fn insert(&mut self, ext: impl Into<String>, inv: Invocation) {
-        self.map.insert(ext.into(), inv);
+        let ext = ext.into();
+        if self.map.contains_key(&ext) || self.map.len() < crate::input::REEF_MAX_RUNNERS {
+            self.map.insert(ext, inv);
+        }
     }
 
     pub fn get(&self, ext: &str) -> Option<&Invocation> {
@@ -69,6 +72,14 @@ impl RunnerTable {
 
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&String, &Invocation)> {
+        self.map.iter()
     }
 
     /// Overlay `higher` on top of `self`, with `higher` winning ties. Used to
@@ -98,10 +109,18 @@ pub fn resolve_runner(path: &Path, table: &RunnerTable) -> Option<Invocation> {
 /// invocation of the interpreter's basename (handling `/usr/bin/env tool`).
 pub fn sniff_shebang(path: &Path) -> Option<Invocation> {
     let file = std::fs::File::open(path).ok()?;
-    let mut reader = BufReader::new(file);
-    let mut line = String::new();
-    reader.read_line(&mut line).ok()?;
-    let line = line.trim_end();
+    const MAX_SHEBANG_BYTES: usize = 8 * 1024;
+    let mut bytes = Vec::with_capacity(256);
+    file.take((MAX_SHEBANG_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let end = bytes.iter().position(|byte| *byte == b'\n');
+    if end.is_none() && bytes.len() > MAX_SHEBANG_BYTES {
+        return None;
+    }
+    let line = std::str::from_utf8(&bytes[..end.unwrap_or(bytes.len())])
+        .ok()?
+        .trim_end();
     let rest = line.strip_prefix("#!")?.trim();
     if rest.is_empty() {
         return None;
@@ -166,6 +185,16 @@ mod tests {
         writeln!(f, "#!/bin/bash\necho hi").unwrap();
         let inv = sniff_shebang(&p).unwrap();
         assert_eq!(inv.tool, "bash");
+    }
+
+    #[test]
+    fn shebang_first_line_is_bounded_and_binary_body_is_ignored() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("script");
+        std::fs::write(&path, b"#!/usr/bin/env python\n\xff\xfe").unwrap();
+        assert_eq!(sniff_shebang(&path).unwrap().tool, "python");
+        std::fs::write(&path, format!("#!{}", "x".repeat(9 * 1024))).unwrap();
+        assert!(sniff_shebang(&path).is_none());
     }
 
     #[test]

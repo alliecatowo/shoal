@@ -34,7 +34,7 @@ accDescr: Shows the components and relationships described in Shoal architecture
     S --> L["Leash policy"]
 ```
 
-The ordinary `shoal` REPL is a separate host. It does not attach to or spawn `shoal-kernel`; a standalone REPL and a named kernel session do not share live language bindings, `it`, jobs, or current directory merely because their names look related.
+The ordinary interactive `shoal` REPL now spawns a listener-free private `shoal-kernel` child and connects over an inherited anonymous descriptor. That server-selected transport is the only local-human trust root. Each REPL remains isolated: it does not bind or attach to the durable named socket used by MCP/agents, and two REPLs do not share live bindings, `it`/`out`, jobs, or cwd merely because their Session names match. `shoal --standalone` (or `kernel.enabled = false`) selects the older in-process evaluator path.
 
 ## Components
 
@@ -43,7 +43,7 @@ The ordinary `shoal` REPL is a separate host. It does not attach to or spawn `sh
 | `shoal-kernel` | Owns named evaluator sessions, transcript refs, plans, tasks, PTYs, event channels, journal/CAS access, authentication, and policy decisions. |
 | `shoal-mcp` | Presents the kernel through MCP stdio: 13 tools, resources, templates, and subscriptions. |
 | `shoal-token` | Creates, lists, and revokes bearer tokens for agent principals. |
-| `shoal` | Interactive/local CLI; its `mcp` subcommand launches the companion `shoal-mcp` executable from `PATH`. |
+| `shoal` | Interactive CLI backed by an isolated private kernel by default; `--standalone` uses a local evaluator, and `mcp` launches the companion from `PATH`. |
 
 Detailed references:
 
@@ -87,21 +87,30 @@ Any nonempty value disables it; an empty variable does not.
 shoal-kernel \
   --session work \
   --state-dir "$HOME/.local/state/shoal" \
+  --token-store "$HOME/.local/state/shoal/tokens.json" \
   --policy "$HOME/.config/shoal/leash.toml"
 ```
 
 Command-line interface:
 
 ```text
-shoal-kernel [--session NAME] [--socket PATH] [--state-dir PATH] [--policy FILE]
+shoal-kernel [--session NAME] [--socket PATH] [--state-dir PATH] [--token-store PATH] [--policy FILE]
+             [--require-token] [--require-peer-uid] [LIMIT FLAGS]
 ```
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `--session NAME` | `default` | Used only to derive the default socket filename. Clients still name the attached session. |
 | `--socket PATH` | runtime-derived | Unix socket to bind. |
-| `--state-dir PATH` | XDG-derived | Journal, CAS, token store, and supporting durable state. |
+| `--state-dir PATH` | XDG-derived | Journal, CAS, default token-store parent, and supporting durable state. |
+| `--token-store PATH` | environment/state-derived | Exact credential authority file. |
 | `--policy FILE` | none | Load a Leash policy instead of the local-human permissive default. |
+| `--require-token` | off | Remove the restricted tokenless fallback from the public listener. |
+| `--require-peer-uid` | off | Admit only peers whose OS-reported UID matches the kernel effective UID. |
+
+Limit flags cover connections, retained sessions, tasks per owner, PTYs per owner/principal/kernel,
+subscriptions per owner, CAS verification starts/window, and frame-read timeout. See the kernel
+protocol page for defaults and release/eviction semantics.
 
 On startup the process prints `shoal-kernel: ready PATH` to stderr. SIGINT/SIGTERM handling asks the serve loop to stop and the bound-socket guard removes the socket on normal teardown.
 
@@ -159,16 +168,18 @@ A session owns:
 - per-client last-seen transcript bookkeeping;
 - Reef cache/lock state held by that evaluator;
 - an in-language event bus bridged to wire `user.*` channels;
-- task and PTY visibility scoped by session.
+- task and PTY visibility scoped by the exact principal/session owner.
 
-The first attachment to a session name creates it. Later attachments to the same running kernel reuse that evaluator, so state persists across MCP process reconnects:
+The first attachment to a `(principal, session name)` creates it. Later attachments by that same
+principal reuse the evaluator, so state persists across MCP process reconnects:
 
 ```text
 client A: shoal_exec "let project = 'shoal'"
 client B, same session: shoal_exec "project"
 ```
 
-Transcript references are session-scoped. `out:3` in session `work` does not authorize lookup of `out:3` in another session.
+Transcript references are owner-scoped. `out:3` for principal A in session `work` does not authorize
+principal B's same-visible-name session or another session.
 
 Kernel restart recreates evaluator sessions; live bindings, tasks, plans, PTYs, and transcript maps do not survive. The journal/CAS and token store do. The durable `journal` and `session.transcript` event channels rebuild their sequence indices from journal state so replay cursors continue across restart.
 
@@ -176,14 +187,19 @@ Kernel restart recreates evaluator sessions; live bindings, tasks, plans, PTYs, 
 
 Every kernel connection begins with `session.attach` before most other operations. The MCP facade performs this automatically.
 
-Without a token, the connection becomes the local human principal:
+Without a token, a public MCP connection becomes the restricted machine principal:
 
 ```text
-uid:<effective uid>
-profile: local-human
+agent:mcp
+profile: restricted-agent
 ```
 
-With a valid token, principal, profile, and declared token capabilities come from the token store. Invalid, expired, or revoked tokens fail with `AUTH_FAILED` (`-32030`). An ephemeral in-memory kernel has no token store and rejects bearer authentication.
+With a valid token, principal, profile, and declared token capabilities come from the token store.
+Invalid, expired, or revoked tokens fail with `AUTH_FAILED` (`-32030`). The kernel revalidates bearer
+authority from the locked store before every later request. Public clients cannot assert
+`local-human`; that trust exists only on the anonymous descriptor inherited by the private REPL.
+The MCP client verifies restricted auth mode, public connection provenance, principal-private
+session isolation, and the security epoch before exposing tools.
 
 Attachment returns:
 
@@ -221,7 +237,7 @@ $XDG_STATE_HOME/shoal/tokens.json
 # or ~/.local/state/shoal/tokens.json
 ```
 
-Override both the CLI and the kernel's expected location carefully. `shoal-token` honors `SHOAL_TOKEN_STORE`, while `shoal-kernel` always opens `<state-dir>/tokens.json`; if those differ, newly created tokens will not authenticate to that kernel.
+The CLI and kernel both honor nonempty `SHOAL_TOKEN_STORE`. Kernel `--token-store` wins over that environment; without either override the kernel uses `<state-dir>/tokens.json`. Prefer an absolute shared override when the CLI and supervised daemon have different startup directories.
 
 The bearer secret is 32 random bytes encoded URL-safe without padding. The store persists a keyed BLAKE3 digest rather than the secret and forces file mode `0600`. Token IDs are short digest prefixes used for listing/revocation. TTL is seconds and is converted to an absolute nanosecond expiration.
 
@@ -274,7 +290,7 @@ The position distinction does not turn every syntactic statement into an express
 Planning parses source and derives concrete effect records without executing it:
 
 
-Plan references currently hash only the derived effects, reversibility, and estimates, truncated to 16 hex characters after `plan:`. Source, session, and principal are stored as plan metadata but are **not** inputs to that reference. Because the kernel uses one map keyed by the short reference, two same-shape plans can overwrite one another even across sessions or principals. Application rechecks the stored session, principal, and source metadata, which prevents a simple source swap, but the collision can invalidate a caller's plan and combines dangerously with the raw unauthenticated `cap.request` defect documented in [Security and trust boundaries](@/docs/security.md). A caller cannot safely treat `plan_ref` as a globally unique or cryptographic identity.
+Plan references bind the full source/AST, effects, reversibility, estimates, principal, and Session through a full BLAKE3 digest, then add a monotonic per-kernel object suffix so storing identical content twice still creates two objects. Application rechecks the stored identity and source. `cap.request` requires an attachment; by default the requester cannot approve its own plan, and a distinct approver needs the embedded-human trust root or an explicit `supervisor`/`plan.approve` bearer. Plans remain ephemeral object handles rather than durable authorization tokens.
 
 `shoal_cap_request` does not modify a policy file. It marks a stored plan approved when the policy does not deny it and the requested effect-kind scope covers every plan effect. The response reports whether OS enforcement will actually apply.
 
@@ -296,9 +312,14 @@ Plans are in-memory and disappear on kernel restart.
 
 Timeout is a context handoff, not a kill switch. Subscribe to the task resource/channel, await/read it later, or cancel explicitly.
 
-Task states include `running`, `cancelling`, `completed`, `failed`, and `cancelled`. Cancellation signals the evaluator's cancellation token; the final state still reflects what the actual returned outcome/error shows.
+Task states include `running`, `suspended`, `cancelling`, `completed`, `failed`, and `cancelled`.
+Cancellation continues stopped child groups, signals the evaluator's cancellation token, and leaves
+the final state to reflect the actual returned outcome/error.
 
-Kernel `task.suspend` and `task.resume` currently return `TASK_CONTROL_UNAVAILABLE`. A kernel task is a Rust thread recursively dispatching an execution, not one tracked process group. Local REPL job control is a different implementation and can suspend actual foreground process groups.
+Raw kernel `task.suspend` and `task.resume` track capture/PTY process groups owned by the task's
+cancellation epoch. Pure evaluator work has no separate OS owner and returns
+`TASK_CONTROL_UNAVAILABLE`. Local REPL job control additionally owns terminal reattachment;
+kernel task control does not.
 
 ## Stable references
 
@@ -328,7 +349,7 @@ An elided value still carries type, count, table column types, a five-item/row o
 
 Per-call `elide` can tighten or loosen `max_bytes`, `max_rows`, and `max_items`; only the byte budget is clamped to the 64 KiB hard cap. Row/item limits can currently be set arbitrarily high, though encoded-size elision still applies.
 
-Human renders are stripped of ANSI for headless clients and capped to 64 KiB. See [Resources and events](@/docs/mcp-resources-events.md#formats) for caveats, including the current `format=raw` full-base64 bypass.
+Human renders are stripped of ANSI for headless clients and capped to 64 KiB. See [Resources and events](@/docs/mcp-resources-events.md#formats) for the separate 8 KiB pageable raw-transfer contract.
 
 ## PTY surface
 
@@ -371,7 +392,7 @@ Dynamic channels are `task.N` and `user.NAME`. Reef is intentionally not adverti
 
 Native clients use `events.subscribe`; MCP clients subscribe to `shoal://events/CHANNEL` or a task resource. Each event has `{channel, seq, ts, payload}`, with sequence monotonic per channel. Delivery is at least once; consumers deduplicate by `(channel, seq)`.
 
-`journal` and `session.transcript` replay from durable journal data even after their 1024-event rings age out and across kernel restart. Other channels are ring-only. Slow subscribers have a private queue of 256 events; overflow becomes a coalesced `{dropped, latest_seq}` notification and never blocks producers or other subscribers.
+`journal` and `session.transcript` replay from durable journal data even after their count/byte-bounded rings age out and across kernel restart. Other channels are ring-only. Slow subscribers have a private queue bounded at 256 events and 512 KiB; overflow becomes a coalesced `{dropped, dropped_bytes, latest_seq}` notification and never blocks producers or other subscribers.
 
 See [Resources and events](@/docs/mcp-resources-events.md) for payloads, cursors, and subscription semantics.
 
@@ -405,7 +426,11 @@ Kernel errors are deliberately returned as a successful MCP `tools/call` envelop
 
 ## Raw wire clients
 
-Kernel transport is JSON-RPC 2.0, one JSON object per newline, on a Unix stream. The maximum input frame is 16 MiB. A connection that sends malformed JSON directly to the kernel is closed at framing; the MCP stdio bridge instead emits JSON-RPC parse error `-32700` and continues reading subsequent lines.
+Kernel transport is JSON-RPC 2.0, one JSON object per newline, on a Unix stream. JSON content is
+limited to 16 MiB, depth 64, 65,536 values, 16,384 items per container, 64 KiB decoded keys, and 1
+KiB numeric tokens before tree allocation. A connection that sends malformed or over-complex JSON
+directly to the kernel is closed at framing; the MCP stdio bridge instead emits JSON-RPC parse error
+`-32700` and continues reading subsequent lines.
 
 Raw clients must attach, preserve request IDs, and tolerate event notifications interleaved with responses. Pushed events are not ordered before/after the response to the action that produced them; subscription writers are intentionally asynchronous.
 
@@ -413,19 +438,23 @@ The raw method set is broader than MCP tools and includes parsing, completion, e
 
 ## Current boundaries
 
-- The standalone REPL does not use kernel sessions.
+- The default REPL uses its own listener-free private kernel; it does not join the durable MCP/agent kernel. Explicit `--standalone` does not use kernel sessions.
 - Kernel transport is Unix-socket/Unix-API based; Windows is not implemented.
 - Stream values carry only a label; no wire chunk-pull protocol exists.
-- Stream `.feed` is also unavailable inside the language.
+- Language streams can feed captured commands through a bounded incremental stdin queue; streams
+  still have no item-pull representation on the kernel wire.
 - Task output is captured as one value on completion, not incrementally cursor-readable.
-- Task suspend/resume is unavailable on the kernel wire.
-- `format=raw` bytes can currently place full base64 in `structuredContent`, bypassing the nominal 64 KiB wall.
-- Datetime wire values currently contain a decimal Unix-seconds string despite the protocol type comment promising RFC3339.
+- Raw kernel task records advertise and control suspend/resume for process-backed work; evaluator-only
+  work has no stoppable OS owner, and MCP exposes only cancellation.
+- `format=raw` and `blob.get` expose only one 8 KiB decoded-content page at a time; clients must follow `page.next_offset` for complete transfer.
 - Session `cwd` in MCP resources is cached from attach rather than refreshed from the kernel, while env/Reef views are live.
-- `resources/unsubscribe` returns success but does not currently stop the background subscription connection created by `resources/subscribe`; ending the MCP process/connection does.
+- One facade-owned kernel connection and OS thread multiplexes up to 64 MCP resource URIs;
+  `resources/unsubscribe` removes exact routing state, and facade drop shuts down/joins the hub.
 - Plans, tasks, PTYs, transcript maps, and evaluator bindings are in-memory.
 - Per-client last `it` is tracked internally but has no read method.
-- The WebAssembly host crate is not wired into kernel execution.
+- Configured WebAssembly component plugins load through the shared host bootstrap and are callable in
+  kernel sessions. ABI v1 is narrow; fuel, epoch wall deadline, memory/table/instance, value, and
+  hostcall limits apply.
 
 These are captured in [Current status and compatibility](@/docs/status-limits.md#kernel-and-agents), not hidden behind aspirational language.
 

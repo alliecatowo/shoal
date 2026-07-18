@@ -1,10 +1,39 @@
+use shoal_journal::{Journal, JournalQuery};
+use shoal_proto::error_code::AUTH_FAILED;
 use shoal_proto::{AttachParams, ClientInfo, ExecParams, JSONRPC, Request, Response, write_frame};
 use std::io::{BufRead, BufReader, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
-use std::path::Path;
-use std::process::{Command, Stdio};
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+
+fn credentialed_admin_attach_params(token: &str) -> serde_json::Value {
+    serde_json::to_value(AttachParams {
+        session: None,
+        token: Some(token.to_string()),
+        client: ClientInfo {
+            kind: "test".into(),
+            tty: false,
+        },
+    })
+    .unwrap()
+}
+
+fn create_admin_token(state: &Path) -> String {
+    shoal_auth::TokenStore::open(state.join("tokens.json"))
+        .unwrap()
+        .create(
+            format!("uid:{}", unsafe { geteuid() }),
+            "supervisor".into(),
+            vec![],
+            None,
+        )
+        .unwrap()
+        .0
+}
 
 /// Route a spawned daemon's stderr to its own file inside its tempdir
 /// (rather than piping it and never draining it, or inheriting the test
@@ -23,7 +52,8 @@ fn read_daemon_stderr(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|e| format!("<could not read {path:?}: {e}>"))
 }
 
-/// Only one live `shoal-kernel` daemon per test binary at a time.
+/// Serialize tests that signal or intentionally coexist with real kernel
+/// children. Individual tests can still spawn multiple kernels deliberately.
 ///
 /// Both tests below spawn a real daemon child process, talk to it over a
 /// real Unix socket, and signal it directly by PID (`kill(child.id(), ...)`)
@@ -42,20 +72,411 @@ fn read_daemon_stderr(path: &Path) -> String {
 static ONLY_ONE_DAEMON_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[test]
+fn embedded_fd_is_private_trust_without_a_public_listener() {
+    const SIGINT: i32 = 2;
+
+    let _serialize = ONLY_ONE_DAEMON_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state");
+    let runtime = temp.path().join("runtime");
+    let config_root = temp.path().join("config");
+    let config_dir = config_root.join("shoal");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let init = temp.path().join("interactive-init.shoal");
+    std::fs::write(&init, "env.FROM_PRIVATE_INIT = 'yes'\n").unwrap();
+    std::fs::write(
+        config_dir.join("shoal.toml"),
+        format!(
+            "[init]\nfiles = [{}]\n",
+            serde_json::to_string(init.to_str().unwrap()).unwrap()
+        ),
+    )
+    .unwrap();
+    let expected_socket = runtime.join("shoal/default.sock");
+    let (mut child, mut private, stderr_path) =
+        spawn_embedded_kernel(temp.path(), &state, &runtime, Some(&config_root), "single");
+    let mut private_reader = BufReader::new(private.try_clone().unwrap());
+    attach_embedded(&mut private, &mut private_reader, 1, "embedded");
+
+    write_frame(
+        &mut private,
+        &Request {
+            jsonrpc: JSONRPC.into(),
+            id: 2.into(),
+            method: "exec".into(),
+            params: serde_json::json!({
+                "src":"env.FROM_PRIVATE_INIT",
+                "position":"value"
+            }),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        recv(&mut private_reader).result.unwrap()["value"],
+        serde_json::json!({"$":"str","v":"yes"}),
+        "the trusted private interactive profile must run configured init files"
+    );
+
+    assert!(
+        !expected_socket.exists(),
+        "private embedded mode must not create a listener"
+    );
+    assert_eq!(unsafe { kill(child.id() as i32, SIGINT) }, 0);
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "SIGINT killed embedded kernel:\n{}",
+        read_daemon_stderr(&stderr_path)
+    );
+    write_frame(
+        &mut private,
+        &Request {
+            jsonrpc: JSONRPC.into(),
+            id: 3.into(),
+            method: "parse".into(),
+            params: serde_json::json!({"src":"1 + 2"}),
+        },
+    )
+    .unwrap();
+    assert!(recv(&mut private_reader).error.is_none());
+
+    drop(private);
+    drop(private_reader);
+    wait_for_embedded_exit(&mut child, &stderr_path);
+    assert!(!expected_socket.exists());
+}
+
+#[test]
+fn two_private_embedded_kernels_can_share_state_without_contending_on_a_socket() {
+    let _serialize = ONLY_ONE_DAEMON_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state");
+    let runtime = temp.path().join("runtime");
+    let expected_socket = runtime.join("shoal/default.sock");
+    for round in 0..20 {
+        // Spawn both before waiting for either readiness frame. This is real
+        // concurrent state initialization, not two sequential starts whose
+        // lifetimes merely overlap.
+        let label_a = format!("stress-{round}-a");
+        let label_b = format!("stress-{round}-b");
+        let (mut child_a, mut private_a, stderr_a) =
+            spawn_embedded_kernel_unready(temp.path(), &state, &runtime, None, &label_a);
+        let (mut child_b, mut private_b, stderr_b) =
+            spawn_embedded_kernel_unready(temp.path(), &state, &runtime, None, &label_b);
+        await_embedded_ready(&mut child_a, &private_a, &stderr_a);
+        await_embedded_ready(&mut child_b, &private_b, &stderr_b);
+        let mut reader_a = BufReader::new(private_a.try_clone().unwrap());
+        let mut reader_b = BufReader::new(private_b.try_clone().unwrap());
+
+        attach_embedded(&mut private_a, &mut reader_a, 1, "human-a");
+        attach_embedded(&mut private_b, &mut reader_b, 2, "human-b");
+        assert_ne!(child_a.id(), child_b.id());
+        assert!(child_a.try_wait().unwrap().is_none());
+        assert!(child_b.try_wait().unwrap().is_none());
+        assert!(
+            !expected_socket.exists(),
+            "isolated embedded kernels must not contend on a listener"
+        );
+
+        drop(private_a);
+        drop(reader_a);
+        drop(private_b);
+        drop(reader_b);
+        wait_for_embedded_exit(&mut child_a, &stderr_a);
+        wait_for_embedded_exit(&mut child_b, &stderr_b);
+    }
+}
+
+#[test]
+fn private_embedded_kernel_coexists_with_a_durable_public_kernel() {
+    let _serialize = ONLY_ONE_DAEMON_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("run/public.sock");
+    let state = temp.path().join("state");
+    let runtime = temp.path().join("runtime");
+    let admin_token = create_admin_token(&state);
+    let (public_stderr_file, public_stderr_path) = daemon_stderr_file(temp.path());
+    let mut public_child = Command::new(env!("CARGO_BIN_EXE_shoal-kernel"))
+        .args([
+            "--socket",
+            socket.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+        ])
+        .stdout(Stdio::null())
+        .stderr(public_stderr_file)
+        .spawn()
+        .unwrap();
+    wait_for_socket(&socket, &public_stderr_path);
+
+    let mut public = UnixStream::connect(&socket).unwrap();
+    let mut public_reader = BufReader::new(public.try_clone().unwrap());
+    write_frame(
+        &mut public,
+        &Request {
+            jsonrpc: JSONRPC.into(),
+            id: 2.into(),
+            method: "session.attach".into(),
+            params: credentialed_admin_attach_params(&admin_token),
+        },
+    )
+    .unwrap();
+    assert!(recv(&mut public_reader).error.is_none());
+    write_frame(
+        &mut public,
+        &Request {
+            jsonrpc: JSONRPC.into(),
+            id: 3.into(),
+            method: "kernel.status".into(),
+            params: serde_json::json!({}),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        recv(&mut public_reader).result.unwrap()["pid"],
+        public_child.id()
+    );
+    for round in 0..10_u64 {
+        let label = format!("coexist-{round}");
+        let (mut embedded_child, mut private, embedded_stderr) =
+            spawn_embedded_kernel(temp.path(), &state, &runtime, None, &label);
+        let mut private_reader = BufReader::new(private.try_clone().unwrap());
+        attach_embedded(&mut private, &mut private_reader, 10 + round, "human");
+        assert_ne!(public_child.id(), embedded_child.id());
+
+        drop(private);
+        drop(private_reader);
+        wait_for_embedded_exit(&mut embedded_child, &embedded_stderr);
+        write_frame(
+            &mut public,
+            &Request {
+                jsonrpc: JSONRPC.into(),
+                id: (100 + round).into(),
+                method: "kernel.status".into(),
+                params: serde_json::json!({}),
+            },
+        )
+        .unwrap();
+        assert!(recv(&mut public_reader).error.is_none());
+    }
+    write_frame(
+        &mut public,
+        &Request {
+            jsonrpc: JSONRPC.into(),
+            id: 200.into(),
+            method: "kernel.shutdown".into(),
+            params: serde_json::json!({}),
+        },
+    )
+    .unwrap();
+    assert_eq!(recv(&mut public_reader).result.unwrap()["stopping"], true);
+    assert!(
+        public_child.wait().unwrap().success(),
+        "public daemon stderr:\n{}",
+        read_daemon_stderr(&public_stderr_path)
+    );
+}
+
+#[test]
+fn embedded_fd_rejects_a_descriptor_that_was_not_inherited() {
+    let _serialize = ONLY_ONE_DAEMON_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state");
+    let runtime = temp.path().join("runtime");
+    let output = Command::new(env!("CARGO_BIN_EXE_shoal-kernel"))
+        .args([
+            "--embedded-fd",
+            "999999",
+            "--state-dir",
+            state.to_str().unwrap(),
+        ])
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env_remove("SHOAL_SOCKET")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("is not an inherited open descriptor"),
+        "unexpected error: {stderr}"
+    );
+    assert!(!runtime.join("shoal/default.sock").exists());
+}
+
+fn spawn_embedded_kernel(
+    dir: &Path,
+    state: &Path,
+    runtime: &Path,
+    config_root: Option<&Path>,
+    label: &str,
+) -> (Child, UnixStream, PathBuf) {
+    let (mut child, private, stderr_path) =
+        spawn_embedded_kernel_unready(dir, state, runtime, config_root, label);
+    await_embedded_ready(&mut child, &private, &stderr_path);
+    (child, private, stderr_path)
+}
+
+fn spawn_embedded_kernel_unready(
+    dir: &Path,
+    state: &Path,
+    runtime: &Path,
+    config_root: Option<&Path>,
+    label: &str,
+) -> (Child, UnixStream, PathBuf) {
+    let (private, child_end) = UnixStream::pair().unwrap();
+    private
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let inherited_fd = child_end.as_raw_fd();
+    let stderr_path = dir.join(format!("embedded-{label}-stderr.log"));
+    let stderr_file = std::fs::File::create(&stderr_path).unwrap();
+    let inherited_fd_arg = inherited_fd.to_string();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_shoal-kernel"));
+    command
+        .args([
+            "--embedded-fd",
+            &inherited_fd_arg,
+            "--state-dir",
+            state.to_str().unwrap(),
+        ])
+        .env("XDG_RUNTIME_DIR", runtime)
+        .env_remove("SHOAL_SOCKET")
+        .stdout(Stdio::null())
+        .stderr(stderr_file);
+    if let Some(config_root) = config_root {
+        command.env("XDG_CONFIG_HOME", config_root);
+    }
+    // SAFETY: only descriptor syscalls run between fork and exec. Preserve the
+    // socket's actual descriptor instead of duplicating it onto hardcoded fd 3,
+    // which may belong to the platform's process-spawn bookkeeping.
+    unsafe {
+        command.pre_exec(move || {
+            let flags = libc::fcntl(inherited_fd, libc::F_GETFD);
+            if flags == -1
+                || libc::fcntl(inherited_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = command.spawn().unwrap();
+    drop(child_end);
+    (child, private, stderr_path)
+}
+
+fn await_embedded_ready(child: &mut Child, private: &UnixStream, stderr_path: &Path) {
+    let mut ready_reader = BufReader::new(private.try_clone().unwrap());
+    let mut ready_line = String::new();
+    let ready_result = ready_reader.read_line(&mut ready_line);
+    assert!(
+        ready_result.is_ok_and(|bytes| bytes > 0),
+        "embedded child failed before readiness (status {:?}):\n{}",
+        child.try_wait(),
+        read_daemon_stderr(stderr_path)
+    );
+    let ready: serde_json::Value = serde_json::from_str(ready_line.trim_end()).unwrap();
+    assert_eq!(ready["shoal_embedded"]["ready"], true);
+    assert_eq!(ready["shoal_embedded"]["protocol"], 1);
+}
+
+fn attach_embedded(
+    private: &mut UnixStream,
+    reader: &mut BufReader<UnixStream>,
+    id: u64,
+    session: &str,
+) {
+    write_frame(
+        private,
+        &Request {
+            jsonrpc: JSONRPC.into(),
+            id: id.into(),
+            method: "session.attach".into(),
+            params: serde_json::json!({
+                "local_auth":"local-human",
+                "session":session,
+                "client":{"kind":"shoal-repl","tty":true}
+            }),
+        },
+    )
+    .unwrap();
+    let trusted = recv(reader).result.unwrap();
+    assert_eq!(trusted["connection_trust"], "embedded-human");
+}
+
+fn wait_for_socket(socket: &Path, stderr_path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !socket.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        socket.exists(),
+        "daemon did not bind listener:\n{}",
+        read_daemon_stderr(stderr_path)
+    );
+}
+
+fn wait_for_embedded_exit(child: &mut Child, stderr_path: &Path) {
+    let exit_deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < exit_deadline,
+            "embedded kernel did not exit after private endpoint closed:\n{}",
+            read_daemon_stderr(stderr_path)
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(
+        status.success(),
+        "embedded kernel exit: {status}; stderr:\n{}",
+        read_daemon_stderr(stderr_path)
+    );
+}
+
+#[test]
 fn daemon_binds_secure_socket_and_attaches() {
     let _serialize = ONLY_ONE_DAEMON_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().unwrap();
     let socket = temp.path().join("run/session.sock");
+    let state = temp.path().join("state");
+    let admin_token = create_admin_token(&state);
+    let config_root = temp.path().join("config");
+    let config_dir = config_root.join("shoal");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let init = temp.path().join("init.shoal");
+    // `init.files` are an interactive-shell surface. An agent Session must not
+    // evaluate even a configured, malformed init file implicitly.
+    std::fs::write(&init, "\"unterminated\n").unwrap();
+    std::fs::write(
+        config_dir.join("shoal.toml"),
+        format!(
+            "[env]\nFROM_CONFIG = \"config-value\"\n[init]\nfiles = [{}]\n[journal]\nenabled = false\n",
+            serde_json::to_string(init.to_str().unwrap()).unwrap()
+        ),
+    )
+    .unwrap();
     let (stderr_file, stderr_path) = daemon_stderr_file(temp.path());
     let mut child = Command::new(env!("CARGO_BIN_EXE_shoal-kernel"))
         .args([
             "--socket",
             socket.to_str().unwrap(),
             "--state-dir",
-            temp.path().join("state").to_str().unwrap(),
+            state.to_str().unwrap(),
         ])
+        .env("XDG_CONFIG_HOME", &config_root)
         .stdout(Stdio::null())
         .stderr(stderr_file)
         .spawn()
@@ -75,21 +496,33 @@ fn daemon_binds_secure_socket_and_attaches() {
     );
     let mut stream = UnixStream::connect(&socket).unwrap();
     let mut reader = BufReader::new(stream.try_clone().unwrap());
+    // This test process has the exact same effective UID as its daemon child.
+    // Owning the socket file and truthfully claiming a TTY therefore still
+    // must not let an arbitrary sibling process manufacture human authority.
+    write_frame(
+        &mut stream,
+        &Request {
+            jsonrpc: JSONRPC.into(),
+            id: 0.into(),
+            method: "session.attach".into(),
+            params: serde_json::json!({
+                "local_auth": "local-human",
+                "client": {"kind": "same-uid-adversary", "tty": true}
+            }),
+        },
+    )
+    .unwrap();
+    let raw_denial = recv(&mut reader).error.unwrap();
+    assert_eq!(raw_denial.code, AUTH_FAILED);
+    assert_eq!(raw_denial.data.unwrap()["human_presence_supported"], false);
+
     write_frame(
         &mut stream,
         &Request {
             jsonrpc: JSONRPC.into(),
             id: 1.into(),
             method: "session.attach".into(),
-            params: serde_json::to_value(AttachParams {
-                session: None,
-                token: None,
-                client: ClientInfo {
-                    kind: "test".into(),
-                    tty: false,
-                },
-            })
-            .unwrap(),
+            params: credentialed_admin_attach_params(&admin_token),
         },
     )
     .unwrap();
@@ -97,18 +530,172 @@ fn daemon_binds_secure_socket_and_attaches() {
     reader.read_line(&mut line).unwrap();
     let response: Response = serde_json::from_str(&line).unwrap();
     assert!(response.error.is_none());
-    unsafe {
-        kill(child.id() as i32, 2);
-    }
+    write_frame(
+        &mut stream,
+        &Request {
+            jsonrpc: JSONRPC.into(),
+            id: 2.into(),
+            method: "kernel.status".into(),
+            params: serde_json::json!({}),
+        },
+    )
+    .unwrap();
+    let status = recv(&mut reader).result.unwrap();
+    assert_eq!(status["pid"], child.id());
+    assert_eq!(
+        status["security"]["bearer_establishes_human_presence"],
+        false
+    );
+    write_frame(
+        &mut stream,
+        &Request {
+            jsonrpc: JSONRPC.into(),
+            id: 3.into(),
+            method: "exec".into(),
+            params: serde_json::to_value(ExecParams {
+                src: "env.FROM_CONFIG".into(),
+                mode: "run".into(),
+                position: "value".into(),
+                asynchronous: false,
+                timeout_ms: None,
+                deadline_ms: None,
+                elide: None,
+                plan_ref: None,
+            })
+            .unwrap(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        recv(&mut reader).result.unwrap()["value"],
+        serde_json::json!({"$": "str", "v": "config-value"})
+    );
+    write_frame(
+        &mut stream,
+        &Request {
+            jsonrpc: JSONRPC.into(),
+            id: 4.into(),
+            method: "exec".into(),
+            params: serde_json::to_value(ExecParams {
+                src: "journal".into(),
+                mode: "run".into(),
+                position: "value".into(),
+                asynchronous: false,
+                timeout_ms: None,
+                deadline_ms: None,
+                elide: None,
+                plan_ref: None,
+            })
+            .unwrap(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        recv(&mut reader).result.unwrap()["value"],
+        serde_json::json!({"$": "table", "cols": {}, "n": 0}),
+        "journal.enabled=false disables language-facing statement history"
+    );
+    write_frame(
+        &mut stream,
+        &Request {
+            jsonrpc: JSONRPC.into(),
+            id: 5.into(),
+            method: "kernel.shutdown".into(),
+            params: serde_json::json!({}),
+        },
+    )
+    .unwrap();
+    assert_eq!(recv(&mut reader).result.unwrap()["stopping"], true);
     assert!(
         child.wait().unwrap().success(),
         "daemon stderr:\n{}",
         read_daemon_stderr(&stderr_path)
     );
+    let audit_rows = Journal::open(&state)
+        .unwrap()
+        .query(&JournalQuery {
+            limit: 100,
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        audit_rows.iter().any(|row| row.src == "env.FROM_CONFIG"),
+        "kernel security/exec audit remains mandatory when language history is disabled"
+    );
     assert!(!socket.exists());
+}
+
+#[test]
+fn daemon_honors_the_shared_token_store_environment_override() {
+    let _serialize = ONLY_ONE_DAEMON_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("run/override.sock");
+    let state = temp.path().join("state");
+    let authority = temp.path().join("authority/tokens.json");
+    let token = shoal_auth::TokenStore::open(&authority)
+        .unwrap()
+        .create(
+            format!("uid:{}", unsafe { geteuid() }),
+            "supervisor".into(),
+            Vec::new(),
+            None,
+        )
+        .unwrap()
+        .0;
+    let (stderr_file, stderr_path) = daemon_stderr_file(temp.path());
+    let mut child = Command::new(env!("CARGO_BIN_EXE_shoal-kernel"))
+        .args([
+            "--socket",
+            socket.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+        ])
+        .env("SHOAL_TOKEN_STORE", &authority)
+        .stdout(Stdio::null())
+        .stderr(stderr_file)
+        .spawn()
+        .unwrap();
+    wait_for_socket(&socket, &stderr_path);
+    assert!(
+        !state.join("tokens.json").exists(),
+        "daemon opened the fallback authority instead of the shared override"
+    );
+
+    let mut stream = UnixStream::connect(&socket).unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    write_frame(
+        &mut stream,
+        &Request {
+            jsonrpc: JSONRPC.into(),
+            id: 1.into(),
+            method: "session.attach".into(),
+            params: credentialed_admin_attach_params(&token),
+        },
+    )
+    .unwrap();
+    assert!(recv(&mut reader).error.is_none());
+    write_frame(
+        &mut stream,
+        &Request {
+            jsonrpc: JSONRPC.into(),
+            id: 2.into(),
+            method: "kernel.shutdown".into(),
+            params: serde_json::json!({}),
+        },
+    )
+    .unwrap();
+    assert_eq!(recv(&mut reader).result.unwrap()["stopping"], true);
+    assert!(
+        child.wait().unwrap().success(),
+        "daemon stderr:\n{}",
+        read_daemon_stderr(&stderr_path)
+    );
 }
 unsafe extern "C" {
     fn kill(pid: i32, signal: i32) -> i32;
+    fn geteuid() -> u32;
 }
 
 /// Regression test for the accepted-socket non-blocking bug: `serve_until`
@@ -136,13 +723,15 @@ fn daemon_survives_a_paused_gap_between_two_sequential_requests() {
         .unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().unwrap();
     let socket = temp.path().join("run/session.sock");
+    let state = temp.path().join("state");
+    let admin_token = create_admin_token(&state);
     let (stderr_file, stderr_path) = daemon_stderr_file(temp.path());
     let mut child = Command::new(env!("CARGO_BIN_EXE_shoal-kernel"))
         .args([
             "--socket",
             socket.to_str().unwrap(),
             "--state-dir",
-            temp.path().join("state").to_str().unwrap(),
+            state.to_str().unwrap(),
         ])
         .stdout(Stdio::null())
         .stderr(stderr_file)
@@ -171,15 +760,7 @@ fn daemon_survives_a_paused_gap_between_two_sequential_requests() {
             jsonrpc: JSONRPC.into(),
             id: 1.into(),
             method: "session.attach".into(),
-            params: serde_json::to_value(AttachParams {
-                session: None,
-                token: None,
-                client: ClientInfo {
-                    kind: "test".into(),
-                    tty: false,
-                },
-            })
-            .unwrap(),
+            params: credentialed_admin_attach_params(&admin_token),
         },
     )
     .unwrap();
@@ -212,6 +793,7 @@ fn daemon_survives_a_paused_gap_between_two_sequential_requests() {
                 position: "stmt".into(),
                 asynchronous: false,
                 timeout_ms: None,
+                deadline_ms: None,
                 elide: None,
                 plan_ref: None,
             })
@@ -259,6 +841,8 @@ fn live_kernel_elides_a_big_table_over_the_wire() {
         .unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().unwrap();
     let socket = temp.path().join("run/session.sock");
+    let state = temp.path().join("state");
+    let admin_token = create_admin_token(&state);
     let bigdir = temp.path().join("bigdir");
     std::fs::create_dir_all(&bigdir).unwrap();
     for i in 0..150 {
@@ -270,7 +854,7 @@ fn live_kernel_elides_a_big_table_over_the_wire() {
             "--socket",
             socket.to_str().unwrap(),
             "--state-dir",
-            temp.path().join("state").to_str().unwrap(),
+            state.to_str().unwrap(),
         ])
         .stdout(Stdio::null())
         .stderr(stderr_file)
@@ -326,15 +910,7 @@ fn live_kernel_elides_a_big_table_over_the_wire() {
             jsonrpc: JSONRPC.into(),
             id: 1.into(),
             method: "session.attach".into(),
-            params: serde_json::to_value(AttachParams {
-                session: None,
-                token: None,
-                client: ClientInfo {
-                    kind: "test".into(),
-                    tty: false,
-                },
-            })
-            .unwrap(),
+            params: credentialed_admin_attach_params(&admin_token),
         };
         let exec_request = Request {
             jsonrpc: JSONRPC.into(),
@@ -346,6 +922,7 @@ fn live_kernel_elides_a_big_table_over_the_wire() {
                 position: "stmt".into(),
                 asynchronous: false,
                 timeout_ms: None,
+                deadline_ms: None,
                 elide: None,
                 plan_ref: None,
             })

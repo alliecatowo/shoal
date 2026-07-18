@@ -15,8 +15,62 @@
 
 use crate::{Record, Value};
 use std::fs;
-use std::io;
+use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+mod fs_metadata;
+
+static ATOMIC_REPLACE_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// Identity of one directory entry captured without following its final
+/// symbolic link. Unix identities use the kernel `(device, inode, type)`
+/// tuple. Other adapters must refuse guarded mutation unless they can provide
+/// an equivalent conditional guarantee.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FsEntryIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    file_type: u32,
+    #[cfg(not(unix))]
+    len: u64,
+    #[cfg(not(unix))]
+    modified: Option<std::time::SystemTime>,
+}
+
+impl FsEntryIdentity {
+    #[must_use]
+    #[allow(clippy::unnecessary_cast)]
+    pub fn from_metadata(metadata: &fs::Metadata) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            Self {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                file_type: metadata.mode() & libc::S_IFMT as u32,
+            }
+        }
+        #[cfg(not(unix))]
+        Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[allow(clippy::unnecessary_cast)]
+    pub(crate) fn matches_stat(&self, stat: &libc::stat) -> bool {
+        self.device == stat.st_dev as u64
+            && self.inode == stat.st_ino as u64
+            && self.file_type == (stat.st_mode as u32 & libc::S_IFMT as u32)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Fs — filesystem port
@@ -30,6 +84,93 @@ use std::path::{Path, PathBuf};
 /// `std::fs::File`, an in-memory `io::Cursor` in a test) a `ReadSeek` for free.
 pub trait ReadSeek: io::Read + io::Seek {}
 impl<T: io::Read + io::Seek> ReadSeek for T {}
+
+/// Bounded metadata used to detect file replacement and mutation around a
+/// mediated read. `identity` is a stable filesystem object identity on Unix
+/// (`st_dev`, `st_ino`); adapters on other platforms may leave it absent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FsFileSnapshot {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    identity: Option<(u64, u64)>,
+}
+
+impl FsFileSnapshot {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        #[cfg(unix)]
+        let identity = {
+            use std::os::unix::fs::MetadataExt as _;
+            Some((metadata.dev(), metadata.ino()))
+        };
+        #[cfg(not(unix))]
+        let identity = None;
+
+        Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            identity,
+        }
+    }
+
+    /// Length observed with this metadata snapshot.
+    #[must_use]
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// Whether the observed file was empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Whether both snapshots identify the same filesystem object. Platforms
+    /// without a stable object identity conservatively return `true`; callers
+    /// can still detect truncation by comparing [`len`](Self::len).
+    #[must_use]
+    pub fn same_file(&self, other: &Self) -> bool {
+        match (self.identity, other.identity) {
+            (Some(left), Some(right)) => left == right,
+            _ => true,
+        }
+    }
+}
+
+fn snapshot_limit_error(limit: usize) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("file exceeds the {limit}-byte stable-read limit"),
+    )
+}
+
+fn snapshot_changed_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "file changed while its stable snapshot was being read",
+    )
+}
+
+fn collect_bounded_stable(
+    mut reader: impl io::Read,
+    before: &FsFileSnapshot,
+    limit: usize,
+    after: impl FnOnce() -> io::Result<FsFileSnapshot>,
+) -> io::Result<Vec<u8>> {
+    if before.len() > limit as u64 {
+        return Err(snapshot_limit_error(limit));
+    }
+    let mut bytes = Vec::with_capacity((before.len() as usize).min(limit));
+    (&mut reader)
+        .take(limit.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)?;
+    if before != &after()? {
+        return Err(snapshot_changed_error());
+    }
+    if bytes.len() > limit {
+        return Err(snapshot_limit_error(limit));
+    }
+    Ok(bytes)
+}
 
 /// Filesystem effects used by the evaluator's builtins, redirects, script
 /// loading, and journal snapshots. Every method returns [`io::Result`] so the
@@ -48,11 +189,61 @@ pub trait Fs: Send + Sync {
     /// the `tail` source's incremental read loop, which seeks to EOF / a saved
     /// byte offset and then reads whole lines as they arrive.
     fn open_read(&self, path: &Path) -> io::Result<Box<dyn ReadSeek + Send>>;
+    /// Capture bounded metadata for rotation/change detection. The default is
+    /// capability-preserving and uses [`metadata`](Fs::metadata); production
+    /// adapters can supply a stable object identity through `FsFileSnapshot`.
+    fn file_snapshot(&self, path: &Path) -> io::Result<FsFileSnapshot> {
+        self.metadata(path)
+            .map(|metadata| FsFileSnapshot::from_metadata(&metadata))
+    }
+    /// Read at most `limit + 1` bytes and accept the result only when the file
+    /// is unchanged across the read. The compatibility default remains fully
+    /// mediated through this port. It detects a path swap by comparing the
+    /// before/after snapshots; [`StdFs`] strengthens this by taking both main
+    /// snapshots from the opened descriptor.
+    fn read_bounded_stable(&self, path: &Path, limit: usize) -> io::Result<Vec<u8>> {
+        let before = self.file_snapshot(path)?;
+        let reader = self.open_read(path)?;
+        collect_bounded_stable(reader, &before, limit, || self.file_snapshot(path))
+    }
     /// Write bytes to a file, truncating it first (`std::fs::write`).
     fn write(&self, path: &Path, data: &[u8]) -> io::Result<()>;
     /// Append bytes to a file, creating it if absent (`OpenOptions` create +
     /// append + `write_all`).
     fn append(&self, path: &Path, data: &[u8]) -> io::Result<()>;
+    /// Open a file for buffered, **incremental** appends, creating it if absent
+    /// (`OpenOptions::new().create(true).append(true)`). Backs the stream
+    /// `.save`/`.append` sink, which opens the file **once** and writes each
+    /// item as it arrives (live logging) rather than buffering the whole stream
+    /// — so it needs a long-lived writer, not the whole-buffer [`append`] above.
+    ///
+    /// [`StdFs`] returns the real appended `File`, preserving the open-once /
+    /// write-many syscall shape of the pre-port inline `OpenOptions` code. The
+    /// default fails **closed** with [`io::ErrorKind::Unsupported`]: an adapter
+    /// that mediates filesystem effects (a sandbox, a recording/denying test
+    /// fake) must override this to interpose on streamed appends, and one that
+    /// has not yet done so refuses the write rather than letting it escape the
+    /// port.
+    ///
+    /// [`append`]: Fs::append
+    fn open_append(&self, path: &Path) -> io::Result<Box<dyn io::Write + Send>> {
+        let _ = path;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this Fs adapter does not mediate streamed appends (open_append)",
+        ))
+    }
+    /// Open a file for buffered, incremental replacement, creating it if
+    /// absent and truncating it first. This is the overwrite counterpart to
+    /// [`open_append`](Fs::open_append), used when a lazy blob must be copied
+    /// without first materializing it in memory.
+    fn open_write(&self, path: &Path) -> io::Result<Box<dyn io::Write + Send>> {
+        let _ = path;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this Fs adapter does not mediate streamed writes (open_write)",
+        ))
+    }
     /// Create a file if absent, updating its mtime otherwise — the `touch`
     /// builtin's `OpenOptions::new().create(true).append(true).open`.
     fn touch(&self, path: &Path) -> io::Result<()>;
@@ -60,6 +251,12 @@ pub trait Fs: Send + Sync {
     fn metadata(&self, path: &Path) -> io::Result<fs::Metadata>;
     /// Metadata without following symlinks (`std::fs::symlink_metadata`).
     fn symlink_metadata(&self, path: &Path) -> io::Result<fs::Metadata>;
+    /// Whether `path` exists, following symlinks — the port form of
+    /// `Path::exists`. Never errors: a missing path or an IO failure is
+    /// `false`, preserving `Path::exists`' fail-closed behavior.
+    fn exists(&self, path: &Path) -> bool {
+        self.metadata(path).is_ok()
+    }
     /// Whether `path` is an existing regular file, following symlinks — the
     /// port form of `Path::is_file`. Never errors: a missing path or an IO
     /// failure is `false`. The default routes through [`metadata`](Fs::metadata)
@@ -68,21 +265,150 @@ pub trait Fs: Send + Sync {
     fn is_file(&self, path: &Path) -> bool {
         self.metadata(path).map(|m| m.is_file()).unwrap_or(false)
     }
+    /// Whether `path` is an existing directory, following symlinks — the port
+    /// form of `Path::is_dir`. Never errors: a missing path or an IO failure is
+    /// `false`.
+    fn is_dir(&self, path: &Path) -> bool {
+        self.metadata(path).map(|m| m.is_dir()).unwrap_or(false)
+    }
+    /// Resolve symlinks and normalize a path (`std::fs::canonicalize`). The
+    /// default fails closed: an adapter that mediates filesystem probes must
+    /// explicitly interpose on canonicalization rather than letting it escape
+    /// to the ambient filesystem.
+    fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
+        let _ = path;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this Fs adapter does not mediate canonicalization",
+        ))
+    }
+    /// Atomically replace `path` with `data` using a fully-written, fsynced
+    /// temporary file in the same directory. The default fails closed because
+    /// degrading undo restore to truncate-in-place would lose crash safety and
+    /// expose a partial file.
+    fn atomic_replace(&self, path: &Path, data: &[u8]) -> io::Result<()> {
+        let _ = (path, data);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this Fs adapter does not mediate atomic replacement",
+        ))
+    }
     /// The (full) paths of a directory's entries (`std::fs::read_dir`, each
     /// entry's `.path()`). Order is unspecified, exactly as `read_dir` yields.
     fn read_dir(&self, path: &Path) -> io::Result<Vec<PathBuf>>;
+    /// Read at most `max_entries` directory entries, returning `InvalidData`
+    /// if another entry exists. The default preserves compatibility for
+    /// injected adapters; production [`StdFs`] overrides it to enforce the
+    /// wall while iterating rather than after an unbounded collection.
+    fn read_dir_bounded(&self, path: &Path, max_entries: usize) -> io::Result<Vec<PathBuf>> {
+        self.read_dir_limited(path, max_entries, usize::MAX)
+    }
+    /// Read a complete directory only when both its entry count and aggregate
+    /// encoded path bytes fit. `InvalidData` means another entry would cross a
+    /// wall. Production [`StdFs`] checks before retaining each path; the
+    /// compatibility default checks an adapter's already-materialized result.
+    fn read_dir_limited(
+        &self,
+        path: &Path,
+        max_entries: usize,
+        max_path_bytes: usize,
+    ) -> io::Result<Vec<PathBuf>> {
+        let entries = self.read_dir(path)?;
+        if entries.len() > max_entries {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("directory contains more than {max_entries} admitted entries"),
+            ));
+        }
+        let mut path_bytes = 0usize;
+        for entry in &entries {
+            path_bytes = path_bytes
+                .checked_add(entry.as_os_str().as_encoded_bytes().len())
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "directory path accounting overflowed",
+                    )
+                })?;
+            if path_bytes > max_path_bytes {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("directory paths exceed {max_path_bytes} admitted bytes"),
+                ));
+            }
+        }
+        Ok(entries)
+    }
+    /// Read only the first `max_entries` directory entries. Unlike
+    /// [`read_dir_bounded`](Fs::read_dir_bounded), a larger directory is not an
+    /// error: this is for deliberately partial maintenance scans. The default
+    /// preserves adapter compatibility but materializes before truncating;
+    /// production [`StdFs`] overrides it to stop the iterator at the prefix.
+    fn read_dir_prefix(&self, path: &Path, max_entries: usize) -> io::Result<Vec<PathBuf>> {
+        let mut entries = self.read_dir(path)?;
+        entries.truncate(max_entries);
+        Ok(entries)
+    }
     /// Create a single directory (`std::fs::create_dir`).
     fn create_dir(&self, path: &Path) -> io::Result<()>;
     /// Create a directory and all parents (`std::fs::create_dir_all`).
     fn create_dir_all(&self, path: &Path) -> io::Result<()>;
+    /// Create a private directory tree for security-sensitive runtime data.
+    /// Adapters without permission concepts may use ordinary directory
+    /// creation; the production Unix adapter forces mode `0700` for newly
+    /// created directories.
+    fn create_private_dir_all(&self, path: &Path) -> io::Result<()> {
+        self.create_dir_all(path)
+    }
     /// Remove a file (`std::fs::remove_file`).
     fn remove_file(&self, path: &Path) -> io::Result<()>;
     /// Remove a directory and its contents (`std::fs::remove_dir_all`).
     fn remove_dir_all(&self, path: &Path) -> io::Result<()>;
     /// Rename/move a path (`std::fs::rename`).
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
-    /// Copy a file's contents (`std::fs::copy`).
+    /// Move a preflighted entry only when the moved object still has the
+    /// expected no-follow identity. Implementations pin both parents and roll
+    /// back drift (or contain the replacement at `to`). The default refuses;
+    /// check-then-rename would recreate the race this method closes.
+    fn rename_if_unchanged(
+        &self,
+        from: &Path,
+        to: &Path,
+        expected: &FsEntryIdentity,
+    ) -> io::Result<()> {
+        let _ = (from, to, expected);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this Fs adapter does not support identity-guarded rename",
+        ))
+    }
+    /// Copy a file's contents without inheriting source timestamps.
+    /// Portable permissions are applied separately through
+    /// [`Fs::set_permissions`].
     fn copy(&self, from: &Path, to: &Path) -> io::Result<u64>;
+    /// Apply a source node's portable permissions after copying. The default
+    /// fails closed so a filesystem-backed adapter cannot silently claim the
+    /// recursive-copy metadata contract while discarding modes.
+    fn set_permissions(&self, path: &Path, permissions: fs::Permissions) -> io::Result<()> {
+        let _ = (path, permissions);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this Fs adapter does not mediate permission updates",
+        ))
+    }
+    /// Report whether a path carries portable/user extended attributes.
+    /// Recursive copy rejects such nodes because it cannot preserve them.
+    /// Host-managed mandatory labels (for example Linux SELinux labels that
+    /// are recreated by policy on every new file) are not portable metadata
+    /// and the standard adapter excludes them. The default fails closed rather
+    /// than treating an unknown adapter as metadata-free.
+    fn has_extended_attributes(&self, path: &Path) -> io::Result<bool> {
+        let _ = path;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this Fs adapter cannot inspect extended attributes",
+        ))
+    }
     /// Create a hard link (`std::fs::hard_link`).
     fn hard_link(&self, src: &Path, dst: &Path) -> io::Result<()>;
     /// Create a symbolic link (`std::os::unix::fs::symlink`).
@@ -104,6 +430,28 @@ impl Fs for StdFs {
     fn open_read(&self, path: &Path) -> io::Result<Box<dyn ReadSeek + Send>> {
         Ok(Box::new(fs::File::open(path)?))
     }
+    fn read_bounded_stable(&self, path: &Path, limit: usize) -> io::Result<Vec<u8>> {
+        use io::Read as _;
+
+        let mut file = fs::File::open(path)?;
+        let before = FsFileSnapshot::from_metadata(&file.metadata()?);
+        if before.len() > limit as u64 {
+            return Err(snapshot_limit_error(limit));
+        }
+        let mut bytes = Vec::with_capacity((before.len() as usize).min(limit));
+        (&mut file)
+            .take(limit.saturating_add(1) as u64)
+            .read_to_end(&mut bytes)?;
+        let after = FsFileSnapshot::from_metadata(&file.metadata()?);
+        let path_after = self.file_snapshot(path)?;
+        if before != after || !after.same_file(&path_after) || after != path_after {
+            return Err(snapshot_changed_error());
+        }
+        if bytes.len() > limit {
+            return Err(snapshot_limit_error(limit));
+        }
+        Ok(bytes)
+    }
     fn write(&self, path: &Path, data: &[u8]) -> io::Result<()> {
         fs::write(path, data)
     }
@@ -114,6 +462,23 @@ impl Fs for StdFs {
             .append(true)
             .open(path)
             .and_then(|mut f| f.write_all(data))
+    }
+    fn open_append(&self, path: &Path) -> io::Result<Box<dyn io::Write + Send>> {
+        Ok(Box::new(
+            fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)?,
+        ))
+    }
+    fn open_write(&self, path: &Path) -> io::Result<Box<dyn io::Write + Send>> {
+        Ok(Box::new(
+            fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(path)?,
+        ))
     }
     fn touch(&self, path: &Path) -> io::Result<()> {
         fs::OpenOptions::new()
@@ -128,6 +493,70 @@ impl Fs for StdFs {
     fn symlink_metadata(&self, path: &Path) -> io::Result<fs::Metadata> {
         fs::symlink_metadata(path)
     }
+    fn exists(&self, path: &Path) -> bool {
+        path.exists()
+    }
+    fn is_file(&self, path: &Path) -> bool {
+        path.is_file()
+    }
+    fn is_dir(&self, path: &Path) -> bool {
+        path.is_dir()
+    }
+    fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
+        fs::canonicalize(path)
+    }
+    fn atomic_replace(&self, path: &Path, data: &[u8]) -> io::Result<()> {
+        use io::Write as _;
+
+        let parent = path
+            .parent()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))?;
+        let mut last_collision = None;
+        for _ in 0..128 {
+            let seq = ATOMIC_REPLACE_SEQ.fetch_add(1, Ordering::Relaxed);
+            let tmp = parent.join(format!(
+                ".shoal-atomic-replace-{}-{seq}",
+                std::process::id()
+            ));
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                options.mode(0o600);
+            }
+            let mut file = match options.open(&tmp) {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    last_collision = Some(error);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let result = (|| {
+                file.write_all(data)?;
+                file.sync_all()?;
+                drop(file);
+                fs::rename(&tmp, path)?;
+                // Persist the directory entry as well as the file contents.
+                // Unix permits opening a directory for fsync; other platforms
+                // do not expose one uniform directory-sync primitive.
+                #[cfg(unix)]
+                fs::File::open(parent)?.sync_all()?;
+                Ok(())
+            })();
+            if result.is_err() {
+                let _ = fs::remove_file(&tmp);
+            }
+            return result;
+        }
+        Err(last_collision.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "could not allocate atomic replacement temporary file",
+            )
+        }))
+    }
     fn read_dir(&self, path: &Path) -> io::Result<Vec<PathBuf>> {
         let mut out = Vec::new();
         for entry in fs::read_dir(path)? {
@@ -135,10 +564,60 @@ impl Fs for StdFs {
         }
         Ok(out)
     }
+    fn read_dir_limited(
+        &self,
+        path: &Path,
+        max_entries: usize,
+        max_path_bytes: usize,
+    ) -> io::Result<Vec<PathBuf>> {
+        let mut out = Vec::new();
+        let mut path_bytes = 0usize;
+        for entry in fs::read_dir(path)? {
+            if out.len() >= max_entries {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("directory contains more than {max_entries} admitted entries"),
+                ));
+            }
+            let entry = entry?.path();
+            path_bytes = path_bytes
+                .checked_add(entry.as_os_str().as_encoded_bytes().len())
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "directory path accounting overflowed",
+                    )
+                })?;
+            if path_bytes > max_path_bytes {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("directory paths exceed {max_path_bytes} admitted bytes"),
+                ));
+            }
+            out.push(entry);
+        }
+        Ok(out)
+    }
+    fn read_dir_prefix(&self, path: &Path, max_entries: usize) -> io::Result<Vec<PathBuf>> {
+        fs::read_dir(path)?
+            .take(max_entries)
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect()
+    }
     fn create_dir(&self, path: &Path) -> io::Result<()> {
         fs::create_dir(path)
     }
     fn create_dir_all(&self, path: &Path) -> io::Result<()> {
+        fs::create_dir_all(path)
+    }
+    #[cfg(unix)]
+    fn create_private_dir_all(&self, path: &Path) -> io::Result<()> {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700).create(path)
+    }
+    #[cfg(not(unix))]
+    fn create_private_dir_all(&self, path: &Path) -> io::Result<()> {
         fs::create_dir_all(path)
     }
     fn remove_file(&self, path: &Path) -> io::Result<()> {
@@ -150,14 +629,221 @@ impl Fs for StdFs {
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         fs::rename(from, to)
     }
+    #[cfg(unix)]
+    fn rename_if_unchanged(
+        &self,
+        from: &Path,
+        to: &Path,
+        expected: &FsEntryIdentity,
+    ) -> io::Result<()> {
+        crate::fs_mutation::rename_if_unchanged(from, to, expected)
+    }
     fn copy(&self, from: &Path, to: &Path) -> io::Result<u64> {
-        fs::copy(from, to)
+        let mut source = fs::File::open(from)?;
+        let mut destination = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(to)?;
+        io::copy(&mut source, &mut destination)
+    }
+    fn set_permissions(&self, path: &Path, permissions: fs::Permissions) -> io::Result<()> {
+        fs::set_permissions(path, permissions)
+    }
+    fn has_extended_attributes(&self, path: &Path) -> io::Result<bool> {
+        fs_metadata::has_extended_attributes(path)
     }
     fn hard_link(&self, src: &Path, dst: &Path) -> io::Result<()> {
         fs::hard_link(src, dst)
     }
     fn symlink(&self, target: &Path, link: &Path) -> io::Result<()> {
         std::os::unix::fs::symlink(target, link)
+    }
+}
+
+#[cfg(test)]
+mod fs_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    struct GrowingReader {
+        inner: io::Cursor<Vec<u8>>,
+        grew: Arc<AtomicBool>,
+    }
+
+    impl io::Read for GrowingReader {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            self.grew.store(true, Ordering::SeqCst);
+            self.inner.read(bytes)
+        }
+    }
+
+    struct EndlessReader;
+
+    impl io::Read for EndlessReader {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            bytes.fill(b'x');
+            Ok(bytes.len())
+        }
+    }
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            let seq = ATOMIC_REPLACE_SEQ.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "shoal-value-atomic-replace-test-{}-{seq}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).expect("create atomic-replace test directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn replacement_temps(dir: &Path) -> Vec<PathBuf> {
+        fs::read_dir(dir)
+            .expect("read test directory")
+            .map(|entry| entry.expect("read directory entry").path())
+            .filter(|path| {
+                path.file_name().is_some_and(|name| {
+                    name.as_encoded_bytes()
+                        .starts_with(b".shoal-atomic-replace-")
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn atomic_replace_succeeds_and_failed_rename_cleans_its_temp() {
+        let root = TestDir::new();
+        let target = root.0.join("target");
+        fs::write(&target, b"old").expect("write original");
+        StdFs
+            .atomic_replace(&target, b"new")
+            .expect("replace and sync");
+        assert_eq!(fs::read(&target).expect("read replacement"), b"new");
+        assert!(replacement_temps(&root.0).is_empty());
+
+        let directory_target = root.0.join("directory-target");
+        fs::create_dir(&directory_target).expect("create rename-error target");
+        StdFs
+            .atomic_replace(&directory_target, b"must-not-land")
+            .expect_err("a file cannot atomically replace a directory");
+        assert!(directory_target.is_dir());
+        assert!(
+            replacement_temps(&root.0).is_empty(),
+            "failed atomic replacement leaked a temporary file"
+        );
+    }
+
+    #[test]
+    fn stable_bounded_read_accepts_exact_boundary_and_rejects_sparse_length() {
+        let root = TestDir::new();
+        let exact = root.0.join("exact");
+        fs::write(&exact, b"12345678").unwrap();
+        assert_eq!(StdFs.read_bounded_stable(&exact, 8).unwrap(), b"12345678");
+
+        let sparse = root.0.join("sparse");
+        let file = fs::File::create(&sparse).unwrap();
+        file.set_len(9).unwrap();
+        let error = StdFs.read_bounded_stable(&sparse, 8).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("8-byte"));
+    }
+
+    #[test]
+    fn stable_read_bounds_a_hostile_reader_and_rejects_growth_or_stat_read_swap() {
+        let initial = FsFileSnapshot {
+            len: 3,
+            modified: None,
+            identity: Some((7, 11)),
+        };
+        let error =
+            collect_bounded_stable(EndlessReader, &initial, 8, || Ok(initial.clone())).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("8-byte"));
+
+        let grew = Arc::new(AtomicBool::new(false));
+        let reader = GrowingReader {
+            inner: io::Cursor::new(b"abc".to_vec()),
+            grew: grew.clone(),
+        };
+        let error = collect_bounded_stable(reader, &initial, 8, || {
+            assert!(grew.load(Ordering::SeqCst));
+            Ok(FsFileSnapshot {
+                len: 4,
+                ..initial.clone()
+            })
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("changed"));
+
+        let error = collect_bounded_stable(io::Cursor::new(b"abc"), &initial, 8, || {
+            Ok(FsFileSnapshot {
+                identity: Some((7, 12)),
+                ..initial.clone()
+            })
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("changed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_snapshot_identity_detects_longer_inode_replacement() {
+        let root = TestDir::new();
+        let target = root.0.join("target");
+        let replacement = root.0.join("replacement");
+        fs::write(&target, b"old").unwrap();
+        fs::write(&replacement, b"a much longer replacement").unwrap();
+        let before = StdFs.file_snapshot(&target).unwrap();
+        fs::rename(&replacement, &target).unwrap();
+        let after = StdFs.file_snapshot(&target).unwrap();
+        assert!(!before.same_file(&after));
+        assert!(after.len() > before.len());
+    }
+
+    #[test]
+    fn production_directory_reads_enforce_the_limit_while_iterating() {
+        let root = TestDir::new();
+        for name in ["a", "b", "c"] {
+            fs::write(root.0.join(name), name).expect("write directory fixture");
+        }
+        let error = StdFs
+            .read_dir_bounded(&root.0, 2)
+            .expect_err("a third entry must exceed the caller's wall");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            StdFs
+                .read_dir_limited(&root.0, 3, 0)
+                .expect_err("the first nonempty path must cross a zero-byte wall")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            StdFs
+                .read_dir_bounded(&root.0, 3)
+                .expect("the exact wall is admitted")
+                .len(),
+            3
+        );
+        assert_eq!(
+            StdFs
+                .read_dir_prefix(&root.0, 2)
+                .expect("a maintenance prefix is deliberately partial")
+                .len(),
+            2
+        );
     }
 }
 
@@ -198,20 +884,163 @@ pub trait Opener: Send + Sync {
 }
 
 /// The default [`Opener`]: a detached `xdg-open` with null stdio, exactly as the
-/// `open` builtin spawned it inline.
+/// `open` builtin spawned it inline. A bounded background owner reaps the
+/// process (or kills it after a generous dispatch timeout), so repeated opens
+/// cannot accumulate zombies or permanent waiter threads.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StdOpener;
 
+const OPENER_REAPER_TIMEOUT: Duration = Duration::from_secs(30);
+type ChildOwner = Arc<Mutex<Option<std::process::Child>>>;
+
 impl Opener for StdOpener {
     fn open(&self, path: &Path) -> Result<(), String> {
-        std::process::Command::new("xdg-open")
+        let mut command = std::process::Command::new("xdg-open");
+        command
             .arg(path)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .map(|_| ())
-            .map_err(|e| format!("open: {e}"))
+            .stderr(std::process::Stdio::null());
+        spawn_detached_with(&mut command, OPENER_REAPER_TIMEOUT, |owner, timeout| {
+            std::thread::Builder::new()
+                .name("shoal-open-reaper".into())
+                .spawn(move || reap_open_child(&owner, timeout))
+                .map(|_| ())
+        })
+        .map(|_| ())
+    }
+}
+
+fn spawn_detached_with(
+    command: &mut std::process::Command,
+    timeout: Duration,
+    launch_reaper: impl FnOnce(ChildOwner, Duration) -> io::Result<()>,
+) -> Result<u32, String> {
+    let child = command.spawn().map_err(|error| format!("open: {error}"))?;
+    let pid = child.id();
+    let owner = Arc::new(Mutex::new(Some(child)));
+    if let Err(error) = launch_reaper(owner.clone(), timeout) {
+        // A failed thread launch never ran the closure, so ownership remains
+        // here. Kill and reap this exact child synchronously before reporting
+        // failure; dropping Child alone would leave a zombie after it exits.
+        if let Some(mut child) = take_child(&owner) {
+            kill_and_reap_exact(&mut child);
+        }
+        return Err(format!("open: cannot launch child reaper: {error}"));
+    }
+    Ok(pid)
+}
+
+fn reap_open_child(owner: &ChildOwner, timeout: Duration) {
+    let Some(mut child) = take_child(owner) else {
+        return;
+    };
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if start.elapsed() >= timeout => {
+                kill_and_reap_exact(&mut child);
+                return;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(_) => {
+                kill_and_reap_exact(&mut child);
+                return;
+            }
+        }
+    }
+}
+
+fn take_child(owner: &ChildOwner) -> Option<std::process::Child> {
+    match owner.lock() {
+        Ok(mut guard) => guard.take(),
+        Err(poisoned) => poisoned.into_inner().take(),
+    }
+}
+
+fn kill_and_reap_exact(child: &mut std::process::Child) {
+    if child.try_wait().ok().flatten().is_some() {
+        return;
+    }
+    if child.kill().is_ok() {
+        let _ = child.wait();
+    } else {
+        // A refused kill must not turn the bounded reaper into an unbounded
+        // wait. This final nonblocking probe still reaps an exit that raced
+        // the signal attempt.
+        let _ = child.try_wait();
+    }
+}
+
+#[cfg(test)]
+mod opener_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    fn process_is_gone(pid: u32) -> bool {
+        // SAFETY: signal 0 only checks whether the recorded process exists.
+        let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        result == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    }
+
+    fn wait_until_gone(pid: u32) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !process_is_gone(pid) {
+            assert!(
+                Instant::now() < deadline,
+                "opener child {pid} was not reaped"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn quick_exit_is_reaped_by_background_owner() {
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", "exit 0"]);
+        let pid = spawn_detached_with(&mut command, Duration::from_secs(1), |owner, timeout| {
+            std::thread::Builder::new()
+                .spawn(move || reap_open_child(&owner, timeout))
+                .map(|_| ())
+        })
+        .expect("spawn quick opener");
+        wait_until_gone(pid);
+    }
+
+    #[test]
+    fn bounded_reaper_kills_and_reaps_a_hung_opener() {
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", "sleep 30"]);
+        let pid = spawn_detached_with(&mut command, Duration::from_millis(50), |owner, timeout| {
+            std::thread::Builder::new()
+                .spawn(move || reap_open_child(&owner, timeout))
+                .map(|_| ())
+        })
+        .expect("spawn hung opener");
+        wait_until_gone(pid);
+    }
+
+    #[test]
+    fn reaper_launch_failure_kills_and_reaps_exact_spawned_child() {
+        let observed_pid = Arc::new(AtomicU32::new(0));
+        let observer = observed_pid.clone();
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", "sleep 30"]);
+        let error = spawn_detached_with(&mut command, Duration::from_secs(1), move |owner, _| {
+            let pid = match owner.lock() {
+                Ok(guard) => guard.as_ref().map(std::process::Child::id),
+                Err(poisoned) => poisoned.into_inner().as_ref().map(std::process::Child::id),
+            }
+            .expect("launcher observes owned child");
+            observer.store(pid, Ordering::SeqCst);
+            Err(io::Error::other("injected thread exhaustion"))
+        })
+        .expect_err("reaper launch must fail closed");
+        assert!(error.contains("child reaper"));
+        let pid = observed_pid.load(Ordering::SeqCst);
+        assert_ne!(pid, 0);
+        assert!(process_is_gone(pid));
     }
 }
 
@@ -236,8 +1065,9 @@ pub trait SecretPort: Send + Sync {
 /// Loads the full content behind a lazy, CAS-backed [`crate::Value::CasBytes`]
 /// (site/content/internals/language-conformance-contract.md disk-spill). A value produced when a command's captured output
 /// overflowed the RAM cap holds one of these plus a bounded preview; methods
-/// that need the whole bytes (`.str()`, `.save`, indexing, …) call [`load`]
-/// on demand, while `.len` and `render` stay cheap and never load.
+/// that explicitly request resident bytes call [`load`] on demand. Incremental
+/// consumers (`.stream()`, `.save()`, `.append()`, stream feed) call [`open`],
+/// while `.len` and `render` stay cheap and never load.
 ///
 /// The trait lives here so `shoal-value` keeps no dependency on `shoal-journal`;
 /// the concrete adapter (over `shoal_journal::Cas`) lives in `shoal-eval`. It is
@@ -248,6 +1078,39 @@ pub trait BytesLoad: Send + Sync {
     /// Materialize the full content. Errors are I/O or integrity failures
     /// (a missing/corrupt CAS blob); the caller maps them to an `io_error`.
     fn load(&self) -> std::io::Result<Vec<u8>>;
+
+    /// Open a bounded-memory reader over the content. The default fails closed:
+    /// silently implementing an incremental consumer by calling [`load`](Self::load)
+    /// would reintroduce whole-blob materialization at `.feed`, stream, save,
+    /// and HTTP boundaries. Blob-store adapters must provide a real reader.
+    fn open(&self) -> std::io::Result<Box<dyn std::io::Read + Send>> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "this CAS adapter does not provide incremental reads",
+        ))
+    }
+}
+
+#[cfg(test)]
+mod bytes_load_tests {
+    use super::BytesLoad;
+
+    struct MaterializingOnly;
+
+    impl BytesLoad for MaterializingOnly {
+        fn load(&self) -> std::io::Result<Vec<u8>> {
+            Ok(vec![1, 2, 3])
+        }
+    }
+
+    #[test]
+    fn materializing_adapter_cannot_masquerade_as_incremental() {
+        let error = match MaterializingOnly.open() {
+            Ok(_) => panic!("the default reader must fail closed"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    }
 }
 
 // ---------------------------------------------------------------------------

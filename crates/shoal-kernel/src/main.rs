@@ -1,14 +1,27 @@
-use shoal_kernel::Kernel;
+use shoal_kernel::{ConnectionTrust, Kernel, Limits};
 use shoal_leash::Policy;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::io::FromRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+const EMBEDDED_READY_FRAME: &[u8] = b"{\"shoal_embedded\":{\"ready\":true,\"protocol\":1}}\n";
+const HELP: &str = "Shoal resident kernel\n\nUsage: shoal-kernel [OPTIONS]\n\nOptions:\n  --session NAME\n  --socket PATH\n  --state-dir PATH\n  --token-store PATH\n  --policy FILE\n  --embedded-fd FD\n  --require-token             Require a bearer on the public socket\n  --require-peer-uid          Require the public peer UID to match this process\n  --max-connections N\n  --max-sessions N\n  --max-tasks-per-session N\n  --max-ptys-per-session N\n  --max-ptys-per-principal N\n  --max-ptys-global N\n  --max-subscriptions-per-session N\n  --max-blob-decompressions-per-window N\n  --blob-decompression-window-ms N\n  --frame-read-timeout-ms N\n  -h, --help\n  -V, --version";
+
 fn main() {
+    let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if args.as_slice() == ["-h"] || args.as_slice() == ["--help"] {
+        println!("{HELP}");
+        return;
+    }
+    if args.as_slice() == ["-V"] || args.as_slice() == ["--version"] {
+        println!("shoal-kernel {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     if let Err(error) = run() {
         eprintln!("shoal-kernel: {error}");
         std::process::exit(1);
@@ -17,19 +30,110 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse(std::env::args_os().skip(1))?;
-    let socket = args.socket.unwrap_or_else(|| runtime_socket(&args.session));
-    prepare_socket(&socket)?;
-    let state = args.state_dir.unwrap_or_else(state_dir);
+    let limits = args.resolved_limits();
+    let paths = shoal_paths::ShoalPaths::discover();
+    let state = args
+        .state_dir
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(|| paths.state_dir().to_path_buf());
+    let token_store = args
+        .token_store
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(|| paths.token_store(&state));
     let kernel = if let Some(path) = args.policy {
-        Kernel::open_with_policy(&state, Policy::load(&path)?)?
+        Kernel::open_with_policy_and_token_store(&state, &token_store, Policy::load(&path)?)?
     } else {
-        Kernel::open(&state)?
+        Kernel::open_with_token_store(&state, &token_store)?
     };
+    kernel.configure_limits(limits);
+    kernel.configure_listener_security(args.require_token, args.require_peer_uid);
+    if let Some(fd) = args.embedded_fd {
+        if args.socket.is_some() {
+            return Err("--embedded-fd and --socket are mutually exclusive".into());
+        }
+        if fd < 3 {
+            return Err("--embedded-fd must name a non-stdio descriptor".into());
+        }
+        if unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
+            return Err(format!(
+                "--embedded-fd {fd} is not an inherited open descriptor: {}",
+                io::Error::last_os_error()
+            )
+            .into());
+        }
+        validate_embedded_socket(fd).map_err(|error| {
+            format!("--embedded-fd {fd} is not a connected Unix stream socket: {error}")
+        })?;
+        // Keep the private kernel alive when the terminal delivers Ctrl-C to
+        // the foreground process group. This is a caught handler (not
+        // SIG_IGN), so exec restores SIG_DFL in command children.
+        ctrlc::set_handler(|| {})?;
+        // SAFETY: the spawning parent passes ownership of this descriptor
+        // exactly once; fcntl above proved it is open in this process.
+        let mut stream = unsafe { UnixStream::from_raw_fd(fd) };
+        // This transport is private and the host consumes this versioned
+        // prelude before constructing its JSON-RPC client. Emitting it only
+        // after state/configuration and fd validation makes readiness
+        // deterministic and turns early child death into a startup error.
+        stream.write_all(EMBEDDED_READY_FRAME)?;
+        stream.flush()?;
+        kernel.handle_stream_with_trust(stream, ConnectionTrust::EmbeddedHuman)?;
+        return Ok(());
+    }
+
+    let socket = args.socket.unwrap_or_else(|| paths.socket(&args.session));
+    prepare_socket(&socket)?;
     let stop = Arc::new(AtomicBool::new(false));
     let signal = stop.clone();
     ctrlc::set_handler(move || signal.store(true, Ordering::SeqCst))?;
     eprintln!("shoal-kernel: ready {}", socket.display());
     kernel.serve_until(&socket, stop)?;
+    Ok(())
+}
+
+fn validate_embedded_socket(fd: i32) -> io::Result<()> {
+    let mut socket_type: libc::c_int = 0;
+    let mut socket_type_len = std::mem::size_of_val(&socket_type) as libc::socklen_t;
+    // SAFETY: `fd` was proven open above; both output pointers refer to live,
+    // correctly-sized stack values. A non-socket fails with ENOTSOCK.
+    if unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            (&raw mut socket_type).cast(),
+            &raw mut socket_type_len,
+        )
+    } == -1
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if socket_type != libc::SOCK_STREAM {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "descriptor is not a stream socket",
+        ));
+    }
+
+    // `SO_TYPE` alone also accepts listeners and unrelated network sockets.
+    // Requiring a connected AF_UNIX peer pins the private transport shape
+    // before `from_raw_fd` turns it into trusted `UnixStream` ownership.
+    let mut peer = std::mem::MaybeUninit::<libc::sockaddr_storage>::zeroed();
+    let mut peer_len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    // SAFETY: the sockaddr storage and length slots are valid writable outputs.
+    if unsafe { libc::getpeername(fd, peer.as_mut_ptr().cast(), &raw mut peer_len) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: successful getpeername initialized at least the family field.
+    let peer = unsafe { peer.assume_init() };
+    if peer.ss_family as libc::c_int != libc::AF_UNIX {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "descriptor peer is not AF_UNIX",
+        ));
+    }
     Ok(())
 }
 
@@ -97,37 +201,26 @@ unsafe extern "C" {
     fn geteuid() -> u32;
 }
 
-fn runtime_socket(session: &str) -> PathBuf {
-    runtime_dir().join("shoal").join(format!("{session}.sock"))
-}
-
-/// The runtime directory for the kernel socket. `$XDG_RUNTIME_DIR` when set;
-/// otherwise `$TMPDIR/shoal-{uid}` (macOS exports `TMPDIR` but not
-/// `XDG_RUNTIME_DIR`), else the hard `/tmp/shoal-{uid}` fallback. `shoal-mcp`
-/// mirrors this exactly so socket discovery agrees on every platform.
-fn runtime_dir() -> PathBuf {
-    let uid = unsafe { geteuid() };
-    if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR").filter(|s| !s.is_empty()) {
-        return PathBuf::from(xdg);
-    }
-    if let Some(tmp) = std::env::var_os("TMPDIR").filter(|s| !s.is_empty()) {
-        return PathBuf::from(tmp).join(format!("shoal-{uid}"));
-    }
-    PathBuf::from(format!("/tmp/shoal-{uid}"))
-}
-fn state_dir() -> PathBuf {
-    std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("shoal")
-}
-
+#[derive(Debug)]
 struct Args {
     session: String,
     socket: Option<PathBuf>,
     state_dir: Option<PathBuf>,
+    token_store: Option<PathBuf>,
     policy: Option<PathBuf>,
+    embedded_fd: Option<i32>,
+    require_token: bool,
+    require_peer_uid: bool,
+    max_connections: Option<usize>,
+    max_sessions: Option<usize>,
+    max_tasks_per_session: Option<usize>,
+    max_ptys_per_session: Option<usize>,
+    max_ptys_per_principal: Option<usize>,
+    max_ptys_global: Option<usize>,
+    max_subscriptions_per_session: Option<usize>,
+    max_blob_decompressions_per_window: Option<usize>,
+    blob_decompression_window_ms: Option<u64>,
+    frame_read_timeout_ms: Option<u64>,
 }
 impl Args {
     fn parse(mut it: impl Iterator<Item = std::ffi::OsString>) -> Result<Self, String> {
@@ -135,29 +228,291 @@ impl Args {
             session: "default".into(),
             socket: None,
             state_dir: None,
+            token_store: None,
             policy: None,
+            embedded_fd: None,
+            require_token: false,
+            require_peer_uid: false,
+            max_connections: None,
+            max_sessions: None,
+            max_tasks_per_session: None,
+            max_ptys_per_session: None,
+            max_ptys_per_principal: None,
+            max_ptys_global: None,
+            max_subscriptions_per_session: None,
+            max_blob_decompressions_per_window: None,
+            blob_decompression_window_ms: None,
+            frame_read_timeout_ms: None,
+        };
+        let parse_usize = |key: &std::ffi::OsString,
+                           value: std::ffi::OsString|
+         -> Result<usize, String> {
+            value
+                .to_str()
+                .and_then(|text| text.parse().ok())
+                .ok_or_else(|| format!("{} requires a non-negative integer", key.to_string_lossy()))
         };
         while let Some(k) = it.next() {
             let missing = || format!("{} requires a value", k.to_string_lossy());
             match k.to_str() {
-                Some("--session") => a.session = it.next().ok_or_else(&missing)?.into_string().map_err(|_| "invalid session")?,
+                Some("--session") => {
+                    a.session = it
+                        .next()
+                        .ok_or_else(&missing)?
+                        .into_string()
+                        .map_err(|_| "invalid session")?
+                }
                 Some("--socket") => a.socket = Some(it.next().ok_or_else(&missing)?.into()),
                 Some("--state-dir") => a.state_dir = Some(it.next().ok_or_else(&missing)?.into()),
+                Some("--token-store") => {
+                    a.token_store = Some(it.next().ok_or_else(&missing)?.into())
+                }
                 Some("--policy") => a.policy = Some(it.next().ok_or_else(&missing)?.into()),
-                Some("-h" | "--help") => return Err("usage: shoal-kernel [--session NAME] [--socket PATH] [--state-dir PATH] [--policy FILE]".into()),
+                Some("--embedded-fd") => {
+                    let fd = it
+                        .next()
+                        .ok_or_else(&missing)?
+                        .to_str()
+                        .and_then(|text| text.parse().ok())
+                        .ok_or_else(|| "--embedded-fd requires an integer".to_string())?;
+                    if a.embedded_fd.replace(fd).is_some() {
+                        return Err("--embedded-fd may be specified only once".into());
+                    }
+                }
+                Some("--require-token") => a.require_token = true,
+                Some("--require-peer-uid") => a.require_peer_uid = true,
+                Some("--max-connections") => {
+                    a.max_connections = Some(parse_usize(&k, it.next().ok_or_else(&missing)?)?)
+                }
+                Some("--max-sessions") => {
+                    a.max_sessions = Some(parse_usize(&k, it.next().ok_or_else(&missing)?)?)
+                }
+                Some("--max-tasks-per-session") => {
+                    a.max_tasks_per_session =
+                        Some(parse_usize(&k, it.next().ok_or_else(&missing)?)?)
+                }
+                Some("--max-ptys-per-session") => {
+                    a.max_ptys_per_session = Some(parse_usize(&k, it.next().ok_or_else(&missing)?)?)
+                }
+                Some("--max-ptys-per-principal") => {
+                    a.max_ptys_per_principal =
+                        Some(parse_usize(&k, it.next().ok_or_else(&missing)?)?)
+                }
+                Some("--max-ptys-global") => {
+                    a.max_ptys_global = Some(parse_usize(&k, it.next().ok_or_else(&missing)?)?)
+                }
+                Some("--max-subscriptions-per-session") => {
+                    a.max_subscriptions_per_session =
+                        Some(parse_usize(&k, it.next().ok_or_else(&missing)?)?)
+                }
+                Some("--max-blob-decompressions-per-window") => {
+                    a.max_blob_decompressions_per_window =
+                        Some(parse_usize(&k, it.next().ok_or_else(&missing)?)?)
+                }
+                Some("--blob-decompression-window-ms") => {
+                    a.blob_decompression_window_ms = Some(
+                        it.next()
+                            .ok_or_else(&missing)?
+                            .to_str()
+                            .and_then(|text| text.parse().ok())
+                            .ok_or_else(|| {
+                                "--blob-decompression-window-ms requires a non-negative integer"
+                                    .to_string()
+                            })?,
+                    )
+                }
+                Some("--frame-read-timeout-ms") => {
+                    a.frame_read_timeout_ms = Some(
+                        it.next()
+                            .ok_or_else(&missing)?
+                            .to_str()
+                            .and_then(|text| text.parse().ok())
+                            .ok_or_else(|| {
+                                "--frame-read-timeout-ms requires a non-negative integer"
+                                    .to_string()
+                            })?,
+                    )
+                }
                 _ => return Err(format!("unknown argument {}", k.to_string_lossy())),
             }
         }
+        if a.embedded_fd.is_some() && a.socket.is_some() {
+            return Err("--embedded-fd and --socket are mutually exclusive".into());
+        }
+        if a.embedded_fd.is_some() && (a.require_token || a.require_peer_uid) {
+            return Err(
+                "--require-token and --require-peer-uid apply only to a named public socket".into(),
+            );
+        }
         Ok(a)
+    }
+
+    fn resolved_limits(&self) -> Limits {
+        let defaults = Limits::default();
+        Limits {
+            max_connections: self.max_connections.unwrap_or(defaults.max_connections),
+            max_sessions: self.max_sessions.unwrap_or(defaults.max_sessions),
+            max_tasks_per_session: self
+                .max_tasks_per_session
+                .unwrap_or(defaults.max_tasks_per_session),
+            max_ptys_per_session: self
+                .max_ptys_per_session
+                .unwrap_or(defaults.max_ptys_per_session),
+            max_ptys_per_principal: self
+                .max_ptys_per_principal
+                .unwrap_or(defaults.max_ptys_per_principal),
+            max_ptys_global: self.max_ptys_global.unwrap_or(defaults.max_ptys_global),
+            max_subscriptions_per_session: self
+                .max_subscriptions_per_session
+                .unwrap_or(defaults.max_subscriptions_per_session),
+            max_blob_decompressions_per_window: self
+                .max_blob_decompressions_per_window
+                .unwrap_or(defaults.max_blob_decompressions_per_window),
+            blob_decompression_window_ms: self
+                .blob_decompression_window_ms
+                .unwrap_or(defaults.blob_decompression_window_ms),
+            frame_read_timeout_ms: self
+                .frame_read_timeout_ms
+                .unwrap_or(defaults.frame_read_timeout_ms),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::AsRawFd as _;
 
     fn we_are_root() -> bool {
         unsafe { geteuid() == 0 }
+    }
+
+    #[test]
+    fn quota_flags_override_only_the_named_limits() {
+        let args = Args::parse(
+            [
+                "--max-connections",
+                "10",
+                "--max-sessions",
+                "12",
+                "--max-ptys-per-session",
+                "3",
+                "--max-ptys-per-principal",
+                "5",
+                "--max-ptys-global",
+                "20",
+                "--max-blob-decompressions-per-window",
+                "7",
+                "--blob-decompression-window-ms",
+                "9000",
+                "--frame-read-timeout-ms",
+                "2500",
+            ]
+            .into_iter()
+            .map(std::ffi::OsString::from),
+        )
+        .unwrap();
+        let limits = args.resolved_limits();
+        assert_eq!(limits.max_connections, 10);
+        assert_eq!(limits.max_sessions, 12);
+        assert_eq!(limits.max_ptys_per_session, 3);
+        assert_eq!(limits.max_ptys_per_principal, 5);
+        assert_eq!(limits.max_ptys_global, 20);
+        assert_eq!(limits.max_blob_decompressions_per_window, 7);
+        assert_eq!(limits.blob_decompression_window_ms, 9000);
+        assert_eq!(limits.frame_read_timeout_ms, 2500);
+        assert_eq!(
+            limits.max_tasks_per_session,
+            Limits::default().max_tasks_per_session
+        );
+    }
+
+    #[test]
+    fn quota_flags_reject_non_numeric_values() {
+        let result = Args::parse(
+            ["--max-connections", "many"]
+                .into_iter()
+                .map(std::ffi::OsString::from),
+        );
+        assert!(result.unwrap_err().contains("--max-connections"));
+    }
+
+    #[test]
+    fn embedded_fd_may_only_be_supplied_once() {
+        let result = Args::parse(
+            ["--embedded-fd", "3", "--embedded-fd", "4"]
+                .into_iter()
+                .map(std::ffi::OsString::from),
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            "--embedded-fd may be specified only once"
+        );
+    }
+
+    #[test]
+    fn explicit_token_store_is_parsed_without_changing_state_root() {
+        let args = Args::parse(
+            [
+                "--state-dir",
+                "/state",
+                "--token-store",
+                "/authority/tokens.json",
+            ]
+            .into_iter()
+            .map(std::ffi::OsString::from),
+        )
+        .unwrap();
+        assert_eq!(args.state_dir.as_deref(), Some(Path::new("/state")));
+        assert_eq!(
+            args.token_store.as_deref(),
+            Some(Path::new("/authority/tokens.json"))
+        );
+    }
+
+    #[test]
+    fn embedded_fd_excludes_a_named_socket() {
+        let result = Args::parse(
+            ["--embedded-fd", "3", "--socket", "/tmp/shoal.sock"]
+                .into_iter()
+                .map(std::ffi::OsString::from),
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            "--embedded-fd and --socket are mutually exclusive"
+        );
+    }
+
+    #[test]
+    fn named_listener_security_flags_are_explicit_and_exclude_embedded_mode() {
+        let args = Args::parse(
+            ["--require-token", "--require-peer-uid"]
+                .into_iter()
+                .map(std::ffi::OsString::from),
+        )
+        .unwrap();
+        assert!(args.require_token);
+        assert!(args.require_peer_uid);
+
+        let error = Args::parse(
+            ["--embedded-fd", "3", "--require-token"]
+                .into_iter()
+                .map(std::ffi::OsString::from),
+        )
+        .unwrap_err();
+        assert!(error.contains("named public socket"));
+    }
+
+    #[test]
+    fn embedded_fd_requires_a_connected_unix_stream() {
+        let file = tempfile::tempfile().unwrap();
+        assert!(validate_embedded_socket(file.as_raw_fd()).is_err());
+
+        let datagram = std::os::unix::net::UnixDatagram::unbound().unwrap();
+        assert!(validate_embedded_socket(datagram.as_raw_fd()).is_err());
+
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        assert!(validate_embedded_socket(stream.as_raw_fd()).is_ok());
     }
 
     /// The bug: `--socket /tmp/x.sock` puts the socket's parent at `/tmp` —

@@ -72,12 +72,23 @@ rm ./obsolete.txt
 | `cp` | list of destination paths |
 | `mv` | list of destination paths |
 | `ln` | `{target, link, symbolic}` |
-| default `rm` | list of `{path, trash}` records |
+| default `rm` | list of `{path, trash, trash_retention_days}` records, with cleanup warnings when applicable |
 | `rm --permanent` | list of removed paths |
 
 Directories require `cp --recursive` and `rm --recursive` where relevant. An unmatched/empty removal is an error rather than a silently successful destructive command.
 
-Default `rm` moves targets into a process-specific directory under the system temporary directory. It is designed to support same-session journal undo, not as a polished desktop trash with indefinite retention. `rm --permanent` deletes directly and has no restore inverse.
+`cp` is deliberately narrower than archival tools. It copies ordinary file contents and directory
+shape, explicitly preserves ordinary permissions, and gives new nodes fresh ownership/timestamps.
+Its complete preflight rejects live or broken symbolic links, special nodes, sparse allocation,
+extended attributes, Unix special permission bits, and unsafe existing destination aliases before
+the first mutation. Use a metadata-aware archive tool through an adapter when links, sparse extents,
+xattrs, ownership, or timestamps are part of the artifact.
+
+Default `rm` atomically moves targets into a private, process-specific directory beneath Shoal's UID-qualified runtime directory. If that directory is on another filesystem (or is unavailable), Shoal instead uses a private, UID-qualified hidden `.shoal-trash-UID` directory beside the source so the move remains atomic and preserves directories, symlinks, metadata, and journal undo. On Unix, unsafe ownership, symlinks, or group/other permissions are rejected. Before creating trash or deleting anything, Shoal resolves input identity through the active filesystem port and refuses duplicate aliases, Unix hard-link aliases, and any directory-and-descendant overlap, independent of argument order. A final symbolic link remains its own removable directory entry; aliases through a symbolic-link parent resolve to the same entry. Every source and the complete bounded result shape are admitted before the first removal; identity, argument, or report-limit errors therefore remove nothing. Ancestor checks walk bounded path depth rather than comparing every input pair.
+
+The commit step is identity guarded. On Linux and macOS, the standard filesystem adapter opens the canonical source and private target parents as directory file descriptors with no-follow behavior, performs a no-replace fd-relative rename, then verifies the moved entry's device, inode, and file type against preflight. Drift returns `rm_path_changed` and rolls the replacement back; if an attacker also blocks rollback, the replacement is retained at the private target and is never deleted. `rm --permanent` uses the same move into a same-filesystem private quarantine and deletes only after identity verification. An injected adapter, non-Unix platform, or Unix without `renameat2`/`renameatx_np` must provide an equivalent guarded rename or removal refuses as unsupported—Shoal never falls back to racy check-then-mutate. The selected directory entry is pinned; concurrent mutation *inside* a recursively removed directory remains ordinary shared-filesystem concurrency and callers requiring a frozen tree must isolate writers.
+
+A bounded best-effort cleanup pass removes trash sessions older than 30 days. Cleanup failures are deduplicated into one summary of at most 8 KiB on the first result row's `trash_cleanup_warnings`; additional warning occurrences are counted as suppressed rather than cloned into every row. Trash still consumes disk space until that cleanup runs. Use `rm --permanent` when space must be reclaimed immediately; it has no restore inverse.
 
 ## Path methods and save forms
 
@@ -132,6 +143,8 @@ await wait cancel is_done suspend resume is_suspended
 
 `await`/`wait` return the task result or propagate its error. `cancel` requests cancellation. Local suspension methods are meaningful where the task owns controllable local process state.
 
+Native evaluator workers created by `spawn`, each `parallel` lane, and `on` handlers share a 64-worker session budget, including work started by child evaluators. A 512-worker process ceiling also bounds many concurrent sessions. Admission happens before fallible thread creation; `parallel` reserves its entire batch before any closure runs. Exhaustion returns `session_worker_limit` or `process_worker_limit` with a retry hint, and task completion or cancellation releases the slot.
+
 ## Local process-group job control
 
 The interactive Unix REPL gives foreground externals a process group:
@@ -150,7 +163,9 @@ fg %1
 
 `fg task_variable` is rewritten to resume and await a language task. A known preview gap is incomplete asynchronous state refresh for an external resumed with `bg`; after it exits, its table state may stay “running” until foregrounded or session shutdown.
 
-This is local REPL behavior. Kernel task suspend/resume currently returns `TASK_CONTROL_UNAVAILABLE`, and MCP PTY control is a separate rendered-terminal protocol.
+This is local REPL behavior. Raw kernel task control can stop/resume process-backed work but returns
+`TASK_CONTROL_UNAVAILABLE` for evaluator-only tasks; MCP PTY control remains a separate
+rendered-terminal protocol.
 
 ## Line history versus journal
 
@@ -234,7 +249,12 @@ accDescr: Shows the components and relationships described in Undo protocol.
 
 Value-position process output is bounded in memory. The default resident capture cap is 64 MiB and can be changed with `SHOAL_CAPTURE_CAP_BYTES`. In a journaled session, overflow can spill into content-addressed storage up to the spill cap (default 1 GiB, `SHOAL_CAPTURE_SPILL_CAP_BYTES`). A lazy bytes reference preserves the true length and loads content on demand.
 
-The journal also has an output hard cap (default 256 MiB). Prior file content that exceeds the applicable journal cap is deliberately left without an undo inverse; restoring truncated bytes would be worse than refusing undo.
+The journal also has an output hard cap (default 256 MiB). Prior file content first crosses a
+separate 8 MiB stable-snapshot wall: the filesystem port reads at most the wall plus one sentinel and
+requires unchanged metadata around the read (opened-descriptor identity in the production Unix
+adapter). Oversized, sparse, growing, or path-swapped sources are deliberately left without an undo
+inverse. Content that exceeds the applicable journal output cap is likewise non-reversible;
+restoring truncated or stale bytes would be worse than refusing undo.
 
 Large captures and kernel response refs are detailed in [Agents, kernel, and MCP](@/docs/agents-kernel-mcp.md) and [Current status and limits](@/docs/status-limits.md).
 

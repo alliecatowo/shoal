@@ -47,7 +47,7 @@ fn total(...nums: int) -> int {
 total(1, 2, 3)
 ```
 
-Calls reject extra positional arguments without a rest parameter, unknown named arguments, and missing required arguments. Type annotations are not yet sound runtime contracts: command-form calls use them mainly to coerce bare string words (and a non-string expression can pass through unchanged), expression-form calls do not enforce scalar annotations, and return annotations are stored but not checked. Validate important invariants explicitly with `assert` or `match`.
+Calls reject extra positional arguments without a rest parameter, unknown named arguments, and missing required arguments. Parameter annotations are enforced at the shared expression/command call boundary. String inputs use the declared shell conversions, and a UTF-8 `path` can become `str` for path-shaped command words. Other already-typed values must match. `list<T>` is recursive, `T?` accepts `null`, and a rest annotation applies to every collected item. Return annotations are checked exactly and never convert the returned value.
 
 ## Expression calls and command calls
 
@@ -58,7 +58,7 @@ greet("Shoal", excited: true)
 greet Shoal --excited
 ```
 
-In command form, bare string words are coerced using declared parameter types. A boolean long flag means presence; a non-boolean declared flag consumes its next word or an inline `=value`. Already typed non-string values are generally left unchanged even when they disagree with an annotation.
+In command form, bare string words are coerced using declared parameter types. A boolean long flag means presence; a non-boolean declared flag consumes its next word or an inline `=value`. Parenthesized/otherwise already-typed arguments pass through the same validator, so an incompatible value cannot bypass the signature.
 
 ```text
 fn deploy(environment: str, replicas: int = 1, dry_run: bool = false) {
@@ -95,7 +95,7 @@ fn older_than(limit: duration, files: list<path>) {
 older_than 30d *.log
 ```
 
-A `glob` parameter receives the pattern itself; a `list<path>` parameter receives expanded, sorted matches as one list. This distinction lets library authors choose whether expansion is caller- or callee-controlled.
+A `glob` parameter receives the pattern itself; a `list<path>` parameter receives expanded, sorted matches as one list. `list<str>` strictly converts those path matches to UTF-8 strings. This distinction lets library authors choose whether expansion is caller- or callee-controlled.
 
 ## Lambdas and closures
 
@@ -225,6 +225,8 @@ release.tag("candidate")
 - keeps private declarations available to exported closures;
 - rejects circular imports with a cycle diagnostic.
 
+The per-evaluator memo retains at most 1,024 distinct canonical module paths. At the cap, cached modules remain usable, while a new unique module is rejected with `module_cache_limit` before its source is read or any top-level code executes. Start a fresh evaluator session to load a different graph rather than evicting and replaying modules with side effects.
+
 `export let`, `export var`, and `export fn` are accepted at module top level. Exporting mutable state does not turn the module record into a general package manager; prefer function-mediated state where ownership matters.
 
 
@@ -243,6 +245,6 @@ These are deliberately different:
 
 ## Recursion and planning
 
-Runtime function calls carry a recursion guard intended to stop after 10,000 nested calls; plan derivation uses a smaller internal guard. This is a safety ceiling, not a promise that deeply recursive code is portable: native test-thread stack limits may be reached earlier in some builds. Use iterative collection operations or loops for large traversals while the preview runtime lacks tail-call optimization.
+Runtime callable dispatch has a hard maximum depth of 128. The 129th nested call raises `recursion_limit` with `maximum call depth of 128 exceeded`; plan derivation uses a separate, smaller internal guard. The ceiling counts nested callable values, including mutual recursion, and is a safety boundary rather than a tail-recursion feature. Use iterative collection operations or loops for larger traversals while the preview runtime lacks tail-call optimization.
 
 Continue with [Outcomes and errors](@/docs/language-errors-outcomes.md) for recovery and [Reef environments](@/docs/reef.md) for runner/tool resolution.

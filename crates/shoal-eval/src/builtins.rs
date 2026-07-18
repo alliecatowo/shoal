@@ -4,8 +4,14 @@ use shoal_exec::CancelToken;
 use shoal_value::{ErrorVal, Fs, Record, VResult, Value};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, UNIX_EPOCH};
+
+pub(crate) mod admission;
+mod copy;
+mod trash;
+use admission::{
+    MAX_RETAINED_BYTES, OutputBudget, OutputString, OutputValues, output_limit, table_record,
+};
 
 // The canonical builtin command-head registry lives in the leaf `shoal-syntax`
 // crate (`shoal_syntax::commands`) — "is this token a command head?" is a
@@ -13,10 +19,9 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 // already links `shoal-syntax` for, so the LSP needn't pull the whole evaluator
 // in for a name list. Eval keeps its dispatch logic below (`run`/`dispatch`,
 // `eval_command`'s special-head guards) and just sources the name list here.
-// Re-exported so this crate's call sites stay `builtins::is_builtin(…)` etc.
-pub(crate) use shoal_syntax::commands::{builtin_names, is_builtin, is_special_head};
-
-static TRASH_SEQ: AtomicU64 = AtomicU64::new(1);
+pub(crate) use shoal_syntax::commands::builtin_names;
+#[cfg(test)]
+pub(crate) use shoal_syntax::commands::{is_builtin, is_special_head};
 
 /// A builtin signature (defect #12): scalar param types by index, plus an
 /// optional variadic type applied to any remaining positional words. `None`
@@ -51,15 +56,15 @@ pub(super) fn run(ev: &mut Evaluator, call: &CmdCall) -> VResult<Value> {
             .collect::<VResult<Vec<_>>>()
             .map_err(|e| e.or_span(call.span))?;
     }
-    let fs = ev.fs.clone();
+    let fs = ev.host.fs.clone();
     dispatch(
         &call.head,
         fs.as_ref(),
-        &ev.cwd,
-        &ev.process_env,
+        &ev.exec.shell.cwd,
+        &ev.exec.shell.process_env,
         args,
         &flags,
-        &ev.cancel,
+        &ev.exec.control.cancel,
     )
     .map_err(|e| e.or_span(call.span))
 }
@@ -76,9 +81,7 @@ fn dispatch(
     match name {
         // echo renders every value (lists/records/tables/null included), strings
         // unquoted at top level (site/content/internals/pty-job-control.md).
-        "echo" => Ok(Value::Str(
-            args.iter().map(echo_display).collect::<Vec<_>>().join(" "),
-        )),
+        "echo" => echo(args),
         "ls" => ls(fs, cwd, args, has(flags, &["a", "all"])),
         "cat" => cat(fs, cwd, args),
         "mkdir" => mkdir(fs, cwd, args, has(flags, &["p", "parents"])),
@@ -118,6 +121,16 @@ fn echo_display(v: &Value) -> String {
         other => shoal_value::render::render_inline(other),
     }
 }
+fn echo(args: Vec<Value>) -> VResult<Value> {
+    let mut output = OutputString::new();
+    for (index, value) in args.iter().enumerate() {
+        if index > 0 {
+            output.push_str(" ")?;
+        }
+        output.push_str(&echo_display(value))?;
+    }
+    Ok(Value::Str(output.finish()))
+}
 fn display(v: &Value) -> VResult<String> {
     match v {
         Value::Str(s) => Ok(s.clone()),
@@ -146,6 +159,13 @@ fn path(cwd: &Path, v: Value) -> VResult<PathBuf> {
 }
 fn paths(cwd: &Path, args: Vec<Value>) -> VResult<Vec<PathBuf>> {
     args.into_iter().map(|v| path(cwd, v)).collect()
+}
+fn admitted_path_output(paths: &[PathBuf]) -> VResult<OutputValues> {
+    let mut output = OutputValues::new();
+    for path in paths {
+        output.push(Value::Path(path.clone()))?;
+    }
+    Ok(output)
 }
 fn ioerr(op: &str, p: &Path, e: std::io::Error) -> ErrorVal {
     ErrorVal::new("custom", format!("{op} {}: {e}", p.display()))
@@ -202,10 +222,23 @@ fn ls(fs: &dyn Fs, cwd: &Path, args: Vec<Value>, all: bool) -> VResult<Value> {
     } else {
         paths(cwd, args)?
     };
-    let mut rows = Vec::new();
+    let mut rows = OutputValues::new();
     for root in roots {
-        if root.is_dir() {
-            for entry in fs.read_dir(&root).map_err(|e| ioerr("list", &root, e))? {
+        if fs.is_dir(&root) {
+            let entries = fs
+                .read_dir_limited(
+                    &root,
+                    rows.remaining_values(),
+                    rows.remaining_retained_bytes(),
+                )
+                .map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::InvalidData {
+                        output_limit(error.to_string())
+                    } else {
+                        ioerr("list", &root, error)
+                    }
+                })?;
+            for entry in entries {
                 if !all
                     && entry
                         .file_name()
@@ -213,12 +246,15 @@ fn ls(fs: &dyn Fs, cwd: &Path, args: Vec<Value>, all: bool) -> VResult<Value> {
                 {
                     continue;
                 }
-                rows.push(metadata_record(fs, entry)?);
+                rows.push(table_record(metadata_record(fs, entry)?))?;
             }
         } else {
-            rows.push(metadata_record(fs, root)?);
+            rows.push(table_record(metadata_record(fs, root)?))?;
         }
     }
+    let Value::Table(mut rows) = rows.finish_table() else {
+        unreachable!()
+    };
     rows.sort_by(|a, b| match (a.get("path"), b.get("path")) {
         (Some(Value::Path(a)), Some(Value::Path(b))) => a.cmp(b),
         _ => std::cmp::Ordering::Equal,
@@ -232,7 +268,20 @@ fn cat(fs: &dyn Fs, cwd: &Path, args: Vec<Value>) -> VResult<Value> {
     }
     let mut out = Vec::new();
     for p in paths(cwd, args)? {
-        out.extend(fs.read(&p).map_err(|e| ioerr("read", &p, e))?);
+        let remaining = MAX_RETAINED_BYTES.saturating_sub(out.len());
+        let mut reader = fs.open_read(&p).map_err(|e| ioerr("read", &p, e))?;
+        let take = u64::try_from(remaining)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        let mut part = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::Read::take(&mut reader, take), &mut part)
+            .map_err(|e| ioerr("read", &p, e))?;
+        if part.len() > remaining {
+            return Err(output_limit(format!(
+                "cat output exceeds its {MAX_RETAINED_BYTES}-byte limit"
+            )));
+        }
+        out.extend(part);
     }
     Ok(Value::Bytes(std::sync::Arc::new(out)))
 }
@@ -241,6 +290,7 @@ fn mkdir(fs: &dyn Fs, cwd: &Path, args: Vec<Value>, parents: bool) -> VResult<Va
         return Err(ErrorVal::arg_error("mkdir requires at least one path"));
     }
     let ps = paths(cwd, args)?;
+    let output = admitted_path_output(&ps)?;
     for p in &ps {
         if parents {
             fs.create_dir_all(p)
@@ -249,17 +299,18 @@ fn mkdir(fs: &dyn Fs, cwd: &Path, args: Vec<Value>, parents: bool) -> VResult<Va
         }
         .map_err(|e| ioerr("mkdir", p, e))?;
     }
-    Ok(Value::List(ps.into_iter().map(Value::Path).collect()))
+    Ok(output.finish_list())
 }
 fn touch(fs: &dyn Fs, cwd: &Path, args: Vec<Value>) -> VResult<Value> {
     if args.is_empty() {
         return Err(ErrorVal::arg_error("touch requires at least one path"));
     }
     let ps = paths(cwd, args)?;
+    let output = admitted_path_output(&ps)?;
     for p in &ps {
         fs.touch(p).map_err(|e| ioerr("touch", p, e))?;
     }
-    Ok(Value::List(ps.into_iter().map(Value::Path).collect()))
+    Ok(output.finish_list())
 }
 
 fn copy_move(
@@ -278,14 +329,15 @@ fn copy_move(
     }
     let mut ps = paths(cwd, args)?;
     let dest = ps.pop().expect("length checked");
-    if ps.len() > 1 && !dest.is_dir() {
+    if ps.len() > 1 && !fs.is_dir(&dest) {
         return Err(ErrorVal::arg_error(
             "destination must be a directory for multiple sources",
         ));
     }
-    let mut out = Vec::new();
+    let mut jobs = Vec::new();
+    let mut out = OutputValues::new();
     for src in ps {
-        let target = if dest.is_dir() {
+        let target = if fs.is_dir(&dest) {
             dest.join(
                 src.file_name()
                     .ok_or_else(|| ErrorVal::arg_error("source has no name"))?,
@@ -293,36 +345,18 @@ fn copy_move(
         } else {
             dest.clone()
         };
-        if moving {
-            fs.rename(&src, &target)
-                .map_err(|e| ioerr("move", &src, e))?;
-        } else {
-            copy_path(fs, &src, &target, recursive)?;
-        }
-        out.push(Value::Path(target));
+        out.push(Value::Path(target.clone()))?;
+        jobs.push((src, target));
     }
-    Ok(Value::List(out))
-}
-fn copy_path(fs: &dyn Fs, src: &Path, dst: &Path, recursive: bool) -> VResult<()> {
-    let m = fs
-        .symlink_metadata(src)
-        .map_err(|e| ioerr("copy", src, e))?;
-    if m.is_dir() {
-        if !recursive {
-            return Err(ErrorVal::arg_error("cp: directory requires --recursive"));
-        }
-        fs.create_dir_all(dst).map_err(|e| ioerr("copy", dst, e))?;
-        for e in fs.read_dir(src).map_err(|e| ioerr("copy", src, e))? {
-            let name = e
-                .file_name()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(&e));
-            copy_path(fs, &e, &dst.join(name), true)?
+    if moving {
+        for (source, target) in jobs {
+            fs.rename(&source, &target)
+                .map_err(|error| ioerr("move", &source, error))?;
         }
     } else {
-        fs.copy(src, dst).map_err(|e| ioerr("copy", src, e))?;
+        copy::CopyPlan::build(fs, &jobs, recursive)?.execute(fs)?;
     }
-    Ok(())
+    Ok(out.finish_list())
 }
 
 fn rm(
@@ -332,64 +366,25 @@ fn rm(
     permanent: bool,
     recursive: bool,
 ) -> VResult<Value> {
-    if args.is_empty() {
-        return Err(ErrorVal::new(
-            "no_matches",
-            "rm requires at least one path; an empty glob deletes nothing",
-        ));
-    }
-    let ps = paths(cwd, args)?;
-    let trash = std::env::temp_dir()
-        .join("shoal-trash")
-        .join(std::process::id().to_string());
-    if !permanent {
-        fs.create_dir_all(&trash)
-            .map_err(|e| ioerr("trash", &trash, e))?;
-    }
-    let mut out = Vec::new();
-    for p in ps {
-        let meta = fs
-            .symlink_metadata(&p)
-            .map_err(|e| ioerr("remove", &p, e))?;
-        if permanent {
-            if meta.is_dir() {
-                if !recursive {
-                    return Err(ErrorVal::arg_error("rm: directory requires --recursive"));
-                }
-                fs.remove_dir_all(&p)
-            } else {
-                fs.remove_file(&p)
-            }
-            .map_err(|e| ioerr("remove", &p, e))?;
-            out.push(Value::Path(p));
-        } else {
-            let seq = TRASH_SEQ.fetch_add(1, Ordering::Relaxed);
-            let name = p
-                .file_name()
-                .unwrap_or_else(|| OsStr::new("item"))
-                .to_string_lossy();
-            let target = trash.join(format!("{seq}-{name}"));
-            fs.rename(&p, &target).map_err(|e| ioerr("trash", &p, e))?;
-            let mut r = Record::new();
-            r.insert("path".into(), Value::Path(p));
-            r.insert("trash".into(), Value::Path(target));
-            out.push(Value::Record(r));
-        }
-    }
-    Ok(Value::List(out))
+    trash::remove(fs, cwd, args, permanent, recursive)
 }
 fn stat(fs: &dyn Fs, cwd: &Path, args: Vec<Value>) -> VResult<Value> {
     if args.is_empty() {
         return Err(ErrorVal::arg_error("stat requires at least one path"));
     }
-    let rows = paths(cwd, args)?
-        .into_iter()
-        .map(|p| metadata_record(fs, p))
-        .collect::<VResult<Vec<_>>>()?;
-    if rows.len() == 1 {
-        Ok(Value::Record(rows.into_iter().next().expect("one row")))
+    let paths = paths(cwd, args)?;
+    let single = paths.len() == 1;
+    let mut rows = OutputValues::new();
+    for path in paths {
+        rows.push(table_record(metadata_record(fs, path)?))?;
+    }
+    if single {
+        let Value::List(mut rows) = rows.finish_list() else {
+            unreachable!()
+        };
+        Ok(rows.pop().expect("one admitted stat row"))
     } else {
-        Ok(Value::Table(rows))
+        Ok(rows.finish_table())
     }
 }
 /// `head(file, n: int = 10) -> list<str>` (site/content/internals/language-conformance-contract.md): the first `n` lines of a
@@ -413,14 +408,35 @@ fn head(fs: &dyn Fs, cwd: &Path, args: Vec<Value>) -> VResult<Value> {
         }
     };
     let p = path(cwd, args[0].clone())?;
-    let bytes = fs.read(&p).map_err(|e| ioerr("read", &p, e))?;
-    let text = String::from_utf8_lossy(&bytes);
-    let lines = text
-        .lines()
-        .take(n)
-        .map(|l| Value::Str(l.to_string()))
-        .collect();
-    Ok(Value::List(lines))
+    let reader = fs.open_read(&p).map_err(|e| ioerr("read", &p, e))?;
+    let mut reader = std::io::BufReader::new(reader);
+    let mut lines = OutputValues::new();
+    for _ in 0..n.min(admission::MAX_VALUES.saturating_add(1)) {
+        let mut line = Vec::new();
+        let remaining = lines.remaining_retained_bytes();
+        let take = u64::try_from(remaining)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        let mut bounded = std::io::Read::take(&mut reader, take);
+        let read = std::io::BufRead::read_until(&mut bounded, b'\n', &mut line)
+            .map_err(|e| ioerr("read", &p, e))?;
+        if read == 0 {
+            break;
+        }
+        if line.len() > remaining {
+            return Err(output_limit(format!(
+                "head output exceeds its {MAX_RETAINED_BYTES}-byte limit"
+            )));
+        }
+        if line.last() == Some(&b'\n') {
+            line.pop();
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+        }
+        lines.push(Value::Str(String::from_utf8_lossy(&line).into_owned()))?;
+    }
+    Ok(lines.finish_list())
 }
 
 /// `ln(target, link, symbolic: bool = false)` (site/content/internals/language-conformance-contract.md): create a hard link (or a
@@ -473,9 +489,12 @@ fn which(penv: &[(OsString, OsString)], args: Vec<Value>) -> VResult<Value> {
 fn env(penv: &[(OsString, OsString)], args: Vec<Value>) -> VResult<Value> {
     if args.is_empty() {
         let mut r = Record::new();
+        let mut budget = OutputBudget::new();
         for (k, v) in penv {
             if let (Some(k), Some(v)) = (k.to_str(), v.to_str()) {
-                r.insert(k.into(), Value::Str(v.into()));
+                let value = Value::Str(v.into());
+                budget.admit_record_entry(k, &value)?;
+                r.insert(k.into(), value);
             }
         }
         Ok(Value::Record(r))
@@ -522,6 +541,7 @@ fn sleep(args: Vec<Value>, cancel: &CancelToken) -> VResult<Value> {
 
 #[cfg(test)]
 mod tests {
+    use super::trash::{move_to_trash, prune_stale_trash_root, validate_private_trash_dir};
     use super::*;
     use shoal_value::StdFs;
     fn pe() -> Vec<(OsString, OsString)> {
@@ -571,6 +591,100 @@ mod tests {
             panic!()
         };
         assert!(t.exists());
+        assert_eq!(r["trash_retention_days"], Value::Int(30));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let parent = std::fs::symlink_metadata(t.parent().unwrap()).unwrap();
+            assert_eq!(parent.mode() & 0o077, 0);
+            // SAFETY: `geteuid` has no preconditions.
+            assert_eq!(parent.uid(), unsafe { libc::geteuid() });
+        }
+    }
+    #[test]
+    fn trash_falls_back_to_an_atomic_adjacent_rename_on_exdev() {
+        let source = Path::new("/source/item");
+        let primary = PathBuf::from("/runtime/trash/item");
+        let adjacent = PathBuf::from("/source/.shoal-trash/session/item");
+        let mut calls = Vec::new();
+
+        let selected = move_to_trash(
+            source,
+            Some(primary.clone()),
+            |from, to| {
+                calls.push((from.to_path_buf(), to.to_path_buf()));
+                if to == primary {
+                    Err(std::io::Error::from_raw_os_error(libc::EXDEV))
+                } else {
+                    Ok(())
+                }
+            },
+            || Ok(adjacent.clone()),
+        )
+        .unwrap();
+
+        assert_eq!(selected, adjacent);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].1, primary);
+        assert_eq!(calls[1].1, selected);
+    }
+    #[test]
+    fn trash_retention_scan_is_bounded_and_preserves_current_session() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("trash");
+        std::fs::create_dir(&root).unwrap();
+        for name in ["current", "old-a", "old-b", "old-c", "old-d"] {
+            std::fs::create_dir(root.join(name)).unwrap();
+        }
+
+        let warnings = prune_stale_trash_root(&StdFs, &root, "current", Duration::ZERO, 2);
+        assert!(warnings.is_empty());
+        let remaining_after_bounded_scan = std::fs::read_dir(&root).unwrap().count();
+        assert!(
+            remaining_after_bounded_scan >= 3,
+            "a two-entry scan removed too many of five sessions"
+        );
+
+        let warnings = prune_stale_trash_root(&StdFs, &root, "current", Duration::ZERO, usize::MAX);
+        assert!(warnings.is_empty());
+        assert!(root.join("current").is_dir());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+    }
+    #[test]
+    fn trash_retention_failures_are_reported() {
+        let d = tempfile::tempdir().unwrap();
+        let not_a_directory = d.path().join("file");
+        std::fs::write(&not_a_directory, b"x").unwrap();
+
+        let warnings =
+            prune_stale_trash_root(&StdFs, &not_a_directory, "current", Duration::ZERO, 1);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("cannot scan trash retention"));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn trash_rejects_a_symlinked_or_public_directory() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let d = tempfile::tempdir().unwrap();
+        let real = d.path().join("real");
+        let linked = d.path().join("linked");
+        std::fs::create_dir(&real).unwrap();
+        symlink(&real, &linked).unwrap();
+        assert_eq!(
+            validate_private_trash_dir(&StdFs, &linked)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            validate_private_trash_dir(&StdFs, &real)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
     }
     // Linux allows arbitrary bytes in filenames; macOS (APFS/HFS+) rejects
     // non-UTF-8 names at the syscall, so the fixture can't be created there.
@@ -612,6 +726,36 @@ mod tests {
         )
         .unwrap();
         assert!(d.path().join("b").exists());
+    }
+    #[test]
+    fn head_streams_prefixes_and_enforces_the_shared_value_wall() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("lines"), b"a\r\nb\n").unwrap();
+        assert_eq!(
+            head(
+                &StdFs,
+                d.path(),
+                vec![Value::Path("lines".into()), Value::Int(1)]
+            )
+            .unwrap(),
+            Value::List(vec![Value::Str("a".into())])
+        );
+
+        let oversized = "x\n".repeat(admission::MAX_VALUES + 1);
+        std::fs::write(d.path().join("many-lines"), oversized).unwrap();
+        assert_eq!(
+            head(
+                &StdFs,
+                d.path(),
+                vec![
+                    Value::Path("many-lines".into()),
+                    Value::Int((admission::MAX_VALUES + 1) as i64),
+                ],
+            )
+            .unwrap_err()
+            .code,
+            "builtin_output_limit"
+        );
     }
     #[test]
     fn sleep_returns_promptly_when_pre_cancelled() {

@@ -111,7 +111,7 @@ accDescr: Shows the components and relationships described in Evaluation.
   Entry --> Modules["modules.rs / namespaces.rs"]
   Entry --> Journal["journal.rs"]
   Entry --> Plans["plan.rs / plan_derive.rs / plan_effects.rs"]
-  Entry --> Streams["streams.rs / channels.rs"]
+  Entry --> Streams["streams.rs + streams/buffer.rs / channels.rs"]
 ```
 
 This is a tree-walk evaluator. `lib.rs` holds session state and the top-level evaluation loop;
@@ -144,7 +144,8 @@ accDescr: Shows the components and relationships described in Execution and poli
 ### Kernel and agent bridge
 
 The kernel's `dispatch.rs` is a thin method router. Handler modules own session, execution/plan,
-value/event, task, and PTY families. `session.rs` owns shared evaluator/transcript state; `wire.rs`
+value/event, task, and PTY families. `session.rs` owns attachment/session composition while
+`session/state.rs` owns evaluator health, transcript, output-undo, and stream-cursor state; `wire.rs`
 does bounded `Value` conversion; `eventbus.rs` owns rings, durable replay integration, and subscriber
 queues. `lib.rs` owns connection lifecycle and shared maps.
 
@@ -188,7 +189,7 @@ maintainers can tell whether the architecture gained a boundary or only an imple
 | `shoal-auth` | `lib` — token store/verification; `main` — token-management CLI |
 | `shoal-config` | `lib` — typed config/public API; `load` — discovery/merge/env overrides; `schema` — shape validation and suggestions; `error` — located failures |
 | `shoal-doctor` | `lib` — diagnostic checks/results; `main` — standalone diagnostic CLI |
-| `shoal-eval` | `lib` — evaluator state/program loop; `stmt`, `expr`, `expr_access`, `expr_binop`, `pattern` — tree-walk semantics; `call`, `args`, `coerce`, `helpers` — calls/signatures/coercion; `command`, `builtins`, `host` — ordered dispatch and outcome wrapping; `ports` — host capabilities; `journal` — statement lifecycle/undo hooks; `modules`, `namespaces` — imports and namespace values; `plan`, `plan_derive`, `plan_effects` — plan verbs/static effects; `reef`, `reef_builtins`, `reef_resolve`, `script` — tool and script resolution; `streams`, `channels` — language producers/event bridge; `frecency` — jump store integration |
+| `shoal-eval` | `lib` — evaluator state/program loop; `stmt`, `expr`, `expr_access`, `expr_binop`, `pattern` — tree-walk semantics; `call`, `args`, `coerce`, `helpers` — calls/signatures/coercion; `command`, `builtins`, `host` — ordered dispatch and outcome wrapping; `ports` — host capabilities; `journal` — statement lifecycle/undo hooks; `modules`, `namespaces`, `data_codecs` — imports, namespace values, and bounded structured-data conversion; `path_access` — filesystem-backed path methods; `plan`, `plan_derive`, `plan_effects` — plan verbs/static effects; `reef`, `reef_builtins`, `reef_resolve`, `script` — tool and script resolution; `streams`, `channels` — language producers/event bridge; `frecency` — jump store integration |
 | `shoal-exec` | `lib` — `ExecSpec`/`ExecResult` and orchestration; `capture` — pipe capture/spill; `pty` — foreground PTY tee and parked jobs; `pty_session` — long-lived terminal emulator; `cancel` — cancellation token/escalation; `status` — wait status normalization; `watcher` — child lifecycle polling; `sandbox` — pre-exec enforcement selection; `which` — executable lookup; `main` — standalone harness/entrypoint |
 | `shoal-history` | `lib` — journal lookup/render API; `main` — history CLI |
 | `shoal-journal` | `lib` — journal API and entry/output records; `schema` — SQLite schema/version; `query` — filters; `cas` — compressed content store; `gc` — orphan/LRU/TTL collection; `undo` — inverse records and safe apply; `transcript` — durable transcript events; `tests` — crate-internal integration-style tests |
@@ -201,7 +202,7 @@ maintainers can tell whether the architecture gained a boundary or only an imple
 | `shoal-proto` | `lib` — complete JSON-RPC frame/types/error/ref/wire-path contract |
 | `shoal-reef` | `lib` — public resolver model; `manifest` — native manifest; `scope` — native/foreign discovery; `resolve` — constraint/provider/lock policy; `lock` — lockfile; `hashcache` — executable identity cache; `view` — content-addressed PATH view; `runner` — extension/shebang runner table; `version` — constraints/order; `timestamp` — portable metadata time; `report` — resolution explanation; `error` — typed failures; `provider/mod` — provider trait/order; `provider/npm`, `provider/venv`, `provider/mise`, `provider/cargo`, `provider/system` — concrete candidate sources |
 | `shoal-secret` | `lib` — encrypted store and permission checks; `main` — secret CLI |
-| `shoal-syntax` | `lib` — parse/format/status exports; `commands` — canonical builtin registry; `format` — AST formatter; `lexer` with `lexer/number`, `lexer/string` — mode-aware tokenization; `parser` with `parser/stmt`, `parser/expr`, `parser/command`, `parser/pattern`, `parser/block` — grammar implementation |
+| `shoal-syntax` | `lib` — parse/format/status exports; `commands` — canonical builtin registry; `format` — AST formatter; `format_safety` — shared token-aware trivia refusal; `lexer` with `lexer/number`, `lexer/string` — mode-aware tokenization; `parser` with `parser/stmt`, `parser/expr`, `parser/command`, `parser/pattern`, `parser/block` — grammar implementation |
 | `shoal-value` | `lib` — `Value`, equality and stdin conversion; `env` — lexical chain; `value_types` — domain scalar types; `outcome` — command result; `task` — task state/hooks; `ops` — generic operators; `json` — JSON conversion; `render` — human output; `ports` — value-side callback traits; `methods/mod`, `methods/list`, `methods/num`, `methods/outcome`, `methods/path`, `methods/record`, `methods/stream`, `methods/strops`, `methods/task` — method families; `methods/suggest` — did-you-mean; `stream/mod`, `stream/ops`, `stream/tee` — pull state, lazy operators, fan-out |
 | `shoal-wasm` | `lib` — component/manifest validation, resource limits, ambient-import policy |
 | `shoal` | `main` — CLI dispatch and non-interactive host; `args` — action parsing; `repl` — Reedline/evaluator session; `adapters` — bundled/extra catalog host loading; `completer` — context candidates/cache/ranking; `highlight` — editor coloring; `keybindings` — config-to-Reedline mapping; `prompt` — host fact gathering/snapshot adapter |

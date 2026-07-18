@@ -22,15 +22,21 @@ and its receiver modules under
 
 ## Capability boundary
 
-The value crate's `CallCtx` exposes only:
+The value crate's `CallCtx` exposes:
 
 ```text
 call_closure(function, positional_values) -> VResult<Value>
 cwd() -> PathBuf
+fs() -> &dyn Fs        // required: embedding chooses StdFs or an injected adapter
 ```
 
-This is enough for functional collection stages and pure path absolutization. It is not enough to
-spawn a command or inspect a filesystem. Those operations remain evaluator responsibilities.
+This is enough for functional collection stages, pure path absolutization, and the explicit write
+sinks (`.save`/`.append`), which route through the `fs()` port rather than `std::fs` directly. It is
+still not enough to spawn a command or inspect arbitrary filesystem state (reads, stat, globbing);
+those operations remain evaluator responsibilities. `fs()` is compile-required so a new context
+cannot silently acquire ambient real-filesystem authority by forgetting the wire. A plain evaluator
+explicitly returns its configured port, which defaults to `StdFs`; tests can replace it with a
+recording/denying adapter. No production Leash-backed `Fs` adapter exists yet.
 
 ```mermaid
 flowchart LR
@@ -40,8 +46,8 @@ accDescr: Shows the components and relationships described in Capability boundar
   Eval --> Feed["feed / channel / namespace / fs path methods"]
   Eval --> Core["shoal_value::methods::call_method"]
   Core --> Pure["collection / string / record / number"]
-  Core --> Ctx["CallCtx: closure calls + cwd"]
-  Core --> Effects["save / append via direct std::fs::OpenOptions"]
+  Core --> Ctx["CallCtx: closure calls + cwd + fs() port"]
+  Core --> Effects["save / append via CallCtx::fs() Fs port"]
 ```
 
 `call_method` attaches the call span with `or_span`, preserving a more precise error span produced
@@ -89,7 +95,8 @@ outcome rather than only `.out`.
 ## General collection surface
 
 The sequence adapter accepts `List`, `Table`, and `Range`. Tables convert to values containing their
-records; ranges materialize integers. Raw streams are rejected here because stream driving needs
+records; ranges materialize at most 16,384 integers before raising `range_materialization_limit`.
+Raw streams are rejected here because stream driving needs
 context and boundedness rules.
 
 | Method | Contract |
@@ -97,7 +104,7 @@ context and boundedness rules.
 | `len`, `count` | character count for strings; bytes/elements/fields/range length otherwise |
 | `is_empty` | `len == 0` on supported receivers |
 | `first`, `last` | zero args returns value/null; integer arg returns a list slice |
-| `collect` | materializes range; returns list/table unchanged |
+| `collect` | materializes a range up to its 16,384-item wall; returns list/table unchanged |
 | `stream` | finite list/table/range or text lines to a lazy stream |
 | `tee` | split finite sequence into `n` coordinated branches |
 | `map` | call closure once per element, return list |
@@ -164,6 +171,15 @@ default. This prevents calls like `"x".starts_with()` from returning the mislead
 String `len` counts Unicode scalar values (`chars().count()`), not UTF-8 bytes and not user-perceived
 grapheme clusters.
 
+`materialize.rs` is the shared transient admission boundary. Eager collection transforms, record
+projections, string-to-list methods, and list concatenation admit each value against 16,384-value /
+16 MiB walls. Keyed transforms also account for transient keys retained during sorting/grouping.
+Collection and bounded-stream `tee` admit one replay vector and share it across fork cursors instead
+of cloning the whole vector per fork. String concatenation, `join`, case conversion, and
+literal/regex replacement append into a 16 MiB bounded builder. Regex capture references are
+expanded directly into that builder, so a small pattern/replacement cannot allocate an unchecked
+multiplicative intermediate before the environment quota runs.
+
 ## Record and receiver-polymorphic methods
 
 | Method | Receiver | Behavior |
@@ -196,12 +212,16 @@ Filesystem-backed path methods such as read, lines, size, metadata, or existence
 the evaluator because they require the injected `Fs` port. This split is easy to miss when adding
 completion metadata: both sets are language-visible methods on `path`.
 
-The general `save` and `append` methods write a receiver to a supplied path with direct
-`std::fs::OpenOptions` calls in `methods/path.rs`; stream `.save` does likewise in
-`methods/stream.rs`. `CallCtx` is **not** a filesystem capability. Evaluator call sites can surround
-some value saves with journal undo hooks, but the actual I/O bypasses the injected `Fs` port and
-Leash/policy effect boundary. This is architectural debt: fake filesystems and policy enforcement do
-not cover every language-visible write today.
+The general `save` and `append` methods write a receiver to a supplied path through
+`CallCtx::fs().write`/`.append` in `methods/path.rs`; stream `.save`/`.append` opens once through
+`CallCtx::fs().open_append` in `methods/stream.rs` (HR-C1/HR-C2). `CallCtx::fs()` is the filesystem
+capability: every `CallCtx` must explicitly return a port, and the evaluator returns its configured
+`Arc<dyn Fs>` (default `StdFs`; injectable through `set_fs`) so a fake can observe or deny the write.
+Evaluator call sites still surround some value saves with journal undo hooks. The eval-side
+wire is in place: `impl CallCtx for Evaluator` overrides `fs()` to return the evaluator's injected
+`Arc<dyn Fs>` (installed via `set_fs`), so value-method writes are mediated by the session's actual
+port — a denying injected adapter blocks `"x".save(...)` end to end, pinned by
+`value_method_saves_go_through_the_injected_fs_port` in `shoal-eval`.
 
 ## Numeric methods
 
@@ -289,8 +309,9 @@ arguments rather than accidentally ignoring them.
 
 - Dispatch is a hand-ordered chain; moving an arm can change meaning on path, outcome, stream, or
   lazy bytes receivers.
-- `save`/`append` and stream `.save` call `std::fs::OpenOptions` directly, bypassing evaluator `Fs`
-  injection and policy ports; port unification must preserve streaming and append semantics.
+- `save`/`append` and stream `.save` route through the compile-required `CallCtx::fs()`
+  (`.write`/`.append`/`.open_append`), preserving streaming and append semantics. The evaluator wire
+  is complete, but its production default is still ambient `StdFs`, not a Leash enforcement adapter.
 - Some method aliases expand the discoverable surface (`reduce`/`fold`, `where`/`filter`,
   `group`/`group_by`, `tap`/`also`). Registry/help must include both.
 - Unicode string length counts scalar values, not graphemes.
@@ -298,8 +319,7 @@ arguments rather than accidentally ignoring them.
   between structured and raw output.
 - Generic `.json()` on lazy bytes materializes, while nested `value_to_json` is bounded; the call-site
   distinction is intentional but nonobvious.
-- Receiver metadata currently advertises `.get` across the shared sequence family, but dispatch
-  implements only list+integer and record+string lookup; table/range `.get` type-errors. Completion
-  is broader than behavior.
-- Boolean `.str()`/`.display()` succeeds in `strops::to_str`, but bool's receiver-specific method
-  table omits both, so valid calls are absent from completion/unknown-method hints.
+- Receiver metadata and dispatch both cover list/table/range integer `.get` plus record string
+  `.get`; owning fixtures pin negative indexing and default values for the sequence variants.
+- Boolean `.str()`/`.display()` is present in both dispatch and the receiver-specific metadata, so
+  completion and unknown-method hints expose the executable conversion surface.

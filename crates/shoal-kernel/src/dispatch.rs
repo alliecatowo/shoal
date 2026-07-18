@@ -6,6 +6,67 @@
 //! a thin router over the method name.
 use super::*;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachmentClass {
+    /// Establishes or replaces attachment authority.
+    Attach,
+    /// Safe before attachment; an existing bearer is still revalidated.
+    Public,
+    /// Must have a current healthy attachment before handler dispatch.
+    Required,
+    /// Preserve method-not-found independently of attachment state.
+    Unknown,
+}
+
+const ATTACHMENT_REQUIRED_METHODS: &[&str] = &[
+    "session.env",
+    "session.reef",
+    "session.snapshot",
+    "kernel.status",
+    "kernel.shutdown",
+    "auth.token.list",
+    "auth.token.create",
+    "auth.token.revoke",
+    "exec",
+    "value.get",
+    "stream.pull",
+    "stream.close",
+    "task.list",
+    "task.get",
+    "task.await",
+    "task.cancel",
+    "task.suspend",
+    "task.resume",
+    "pty.open",
+    "pty.send",
+    "pty.read",
+    "pty.resize",
+    "pty.close",
+    "pty.list",
+    "plan.get",
+    "plan.list",
+    "plan.apply",
+    "cap.request",
+    "journal.query",
+    "events.read",
+    "events.publish",
+    "events.subscribe",
+    "events.unsubscribe",
+    "blob.get",
+    "explain",
+];
+
+fn attachment_class(method: &str) -> AttachmentClass {
+    match method {
+        "session.attach" => AttachmentClass::Attach,
+        "parse" | "complete" => AttachmentClass::Public,
+        method if ATTACHMENT_REQUIRED_METHODS.contains(&method) => AttachmentClass::Required,
+        #[cfg(test)]
+        "test.panic_evaluator" => AttachmentClass::Required,
+        _ => AttachmentClass::Unknown,
+    }
+}
+
 impl Kernel {
     pub(crate) fn dispatch(
         self: &Arc<Self>,
@@ -13,45 +74,115 @@ impl Kernel {
         client: u64,
         attached: &mut Option<Attachment>,
         conn: Option<&SharedWriter>,
+        trust: ConnectionTrust,
     ) -> Response {
         let id = request.id;
         let params = request.params;
-        let result: Result<Json, RpcError> = match request.method.as_str() {
-            "session.attach" => self.handle_session_attach(params, attached),
-            "session.env" => self.handle_session_env(attached),
-            "session.reef" => self.handle_session_reef(attached),
-            "parse" => self.handle_parse(params),
-            "exec" => self.handle_exec(params, client, attached),
-            "value.get" => self.handle_value_get(params, attached),
-            "task.list" => self.handle_task_list(attached),
-            "task.get" => self.handle_task_get(params, attached),
-            "task.await" => self.handle_task_await(params, attached),
-            "task.cancel" => self.handle_task_cancel(params, attached),
-            "task.suspend" => self.handle_task_suspend(params, attached),
-            "task.resume" => self.handle_task_resume(params, attached),
-            "pty.open" => self.handle_pty_open(params, attached),
-            "pty.send" => self.handle_pty_send(params, attached),
-            "pty.read" => self.handle_pty_read(params, attached),
-            "pty.resize" => self.handle_pty_resize(params, attached),
-            "pty.close" => self.handle_pty_close(params, attached),
-            "pty.list" => self.handle_pty_list(attached),
-            "plan.get" => self.handle_plan_get(params, attached),
-            "plan.list" => self.handle_plan_list(attached),
-            "plan.apply" => self.handle_plan_apply(params, client, attached, conn),
-            "cap.request" => self.handle_cap_request(params),
-            "journal.query" => self.handle_journal_query(params),
-            "events.read" => self.handle_events_read(params, attached),
-            "events.publish" => self.handle_events_publish(params, attached),
-            "events.subscribe" => self.handle_events_subscribe(params, client, attached, conn),
-            "events.unsubscribe" => self.handle_events_unsubscribe(params, client, attached),
-            "blob.get" => self.handle_blob_get(params, attached),
-            "complete" => self.handle_complete(params),
-            "explain" => self.handle_explain(params, attached),
-            _ => Err(RpcError {
-                code: METHOD_NOT_FOUND,
-                message: "method not found".into(),
-                data: None,
-            }),
+        let method = request.method;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || -> Result<Json, RpcError> {
+                let attachment_class = attachment_class(&method);
+                if attachment_class == AttachmentClass::Unknown {
+                    return Err(RpcError {
+                        code: METHOD_NOT_FOUND,
+                        message: "method not found".into(),
+                        data: None,
+                    });
+                }
+                // Reattachment is always available as the recovery path. All
+                // other requests, including pure parse/complete calls, must
+                // revalidate the authority of an established attachment.
+                if method != "session.attach"
+                    && let Some(attachment) = attached.as_ref()
+                    && let Err(error) = self.ensure_attachment_current(attachment)
+                {
+                    self.events.remove_conn(client);
+                    *attached = None;
+                    return Err(error);
+                }
+                if attachment_class == AttachmentClass::Required && attached.is_none() {
+                    return Err(not_attached());
+                }
+                // `parse` and `complete` are session-independent, and
+                // `session.attach` must remain available so this connection
+                // can move to a different healthy session.
+                if !matches!(method.as_str(), "parse" | "complete" | "session.attach")
+                    && let Some(attachment) = attached.as_ref()
+                {
+                    attachment.session.ensure_healthy()?;
+                    attachment.session.touch();
+                }
+                match method.as_str() {
+                    "session.attach" => self.handle_session_attach(params, client, attached, trust),
+                    "session.env" => self.handle_session_env(attached),
+                    "session.reef" => self.handle_session_reef(attached),
+                    "session.snapshot" => self.handle_session_snapshot(attached),
+                    "kernel.status" => self.handle_kernel_status(attached),
+                    "kernel.shutdown" => self.handle_kernel_shutdown(attached),
+                    "auth.token.list" => self.handle_auth_token_list(attached),
+                    "auth.token.create" => self.handle_auth_token_create(params, attached),
+                    "auth.token.revoke" => self.handle_auth_token_revoke(params, attached),
+                    "parse" => self.handle_parse(params),
+                    "exec" => self.handle_exec(params, client, attached),
+                    "value.get" => self.handle_value_get(params, attached),
+                    "stream.pull" => self.handle_stream_pull(params, attached),
+                    "stream.close" => self.handle_stream_close(params, attached),
+                    "task.list" => self.handle_task_list(attached),
+                    "task.get" => self.handle_task_get(params, attached),
+                    "task.await" => self.handle_task_await(params, attached),
+                    "task.cancel" => self.handle_task_cancel(params, attached),
+                    "task.suspend" => self.handle_task_suspend(params, attached),
+                    "task.resume" => self.handle_task_resume(params, attached),
+                    "pty.open" => self.handle_pty_open(params, attached),
+                    "pty.send" => self.handle_pty_send(params, attached),
+                    "pty.read" => self.handle_pty_read(params, attached),
+                    "pty.resize" => self.handle_pty_resize(params, attached),
+                    "pty.close" => self.handle_pty_close(params, attached),
+                    "pty.list" => self.handle_pty_list(attached),
+                    "plan.get" => self.handle_plan_get(params, attached),
+                    "plan.list" => self.handle_plan_list(attached),
+                    "plan.apply" => self.handle_plan_apply(params, client, attached, conn),
+                    "cap.request" => self.handle_cap_request(params, attached),
+                    "journal.query" => self.handle_journal_query(params, attached),
+                    "events.read" => self.handle_events_read(params, attached),
+                    "events.publish" => self.handle_events_publish(params, attached),
+                    "events.subscribe" => {
+                        self.handle_events_subscribe(params, client, attached, conn)
+                    }
+                    "events.unsubscribe" => {
+                        self.handle_events_unsubscribe(params, client, attached)
+                    }
+                    "blob.get" => self.handle_blob_get(params, attached),
+                    "complete" => self.handle_complete(params),
+                    "explain" => self.handle_explain(params, attached),
+                    #[cfg(test)]
+                    "test.panic_evaluator" => {
+                        let attachment = attached.as_ref().ok_or_else(not_attached)?;
+                        let _evaluator = attachment.session.lock_evaluator()?;
+                        panic!("injected evaluator panic")
+                    }
+                    _ => unreachable!("classified RPC method missing from dispatch router"),
+                }
+            },
+        ));
+        let result = match result {
+            Ok(result) => result,
+            Err(_) => {
+                let quarantined = if let Some(attachment) = attached.as_ref() {
+                    attachment.session.quarantine();
+                    true
+                } else {
+                    false
+                };
+                eprintln!(
+                    "shoal-kernel: request handler panicked; session quarantined={quarantined}"
+                );
+                Err(RpcError {
+                    code: INTERNAL_ERROR,
+                    message: "request handler panicked".into(),
+                    data: Some(json!({"session_quarantined": quarantined})),
+                })
+            }
         };
         match result {
             Ok(value) => Response::ok(id, value),
@@ -62,5 +193,116 @@ impl Kernel {
                 error: Some(error),
             },
         }
+    }
+}
+
+impl Kernel {
+    pub(crate) fn ensure_attachment_current(
+        &self,
+        attachment: &Attachment,
+    ) -> Result<(), RpcError> {
+        if attachment.security_epoch != ATTACH_SECURITY_EPOCH {
+            return Err(RpcError {
+                code: AUTH_FAILED,
+                message: "attachment security epoch is no longer accepted".into(),
+                data: Some(json!({
+                    "attached_epoch": attachment.security_epoch,
+                    "required_epoch": ATTACH_SECURITY_EPOCH,
+                })),
+            });
+        }
+        let Some(meta) = &attachment.bearer else {
+            return Ok(());
+        };
+        let valid = self
+            .auth
+            .as_ref()
+            .and_then(|store| store.lock().ok())
+            .and_then(|store| store.refresh_authenticated(meta))
+            .is_some();
+        if valid {
+            Ok(())
+        } else {
+            Err(RpcError {
+                code: AUTH_FAILED,
+                message: "attached bearer is expired, revoked, or unavailable".into(),
+                data: Some(json!({"reauthenticate": true})),
+            })
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(method: &str) -> Request {
+        Request {
+            jsonrpc: JSONRPC.into(),
+            id: json!(1),
+            method: method.into(),
+            params: Json::Null,
+        }
+    }
+
+    #[test]
+    fn every_stateful_route_rejects_before_parameter_decoding() {
+        let kernel = Kernel::new();
+        for &method in ATTACHMENT_REQUIRED_METHODS {
+            let mut attached = None;
+            let response = kernel.dispatch(
+                request(method),
+                1,
+                &mut attached,
+                None,
+                ConnectionTrust::Public,
+            );
+            assert_eq!(
+                response
+                    .error
+                    .unwrap_or_else(|| panic!("{method} succeeded unattached"))
+                    .code,
+                NOT_ATTACHED,
+                "{method} must hit the central attachment boundary before decoding null params"
+            );
+        }
+    }
+
+    #[test]
+    fn route_and_attachment_classification_cannot_drift_silently() {
+        let source = include_str!("dispatch.rs");
+        let router = source
+            .split("match method.as_str()")
+            .nth(1)
+            .expect("dispatch router")
+            .split("_ => unreachable!")
+            .next()
+            .expect("router terminator");
+        let routed = router
+            .lines()
+            .filter(|line| line.contains("=>"))
+            .filter_map(|line| {
+                line.trim_start()
+                    .strip_prefix('"')
+                    .and_then(|line| line.split('"').next())
+            })
+            .collect::<Vec<_>>();
+        for method in &routed {
+            assert_ne!(
+                attachment_class(method),
+                AttachmentClass::Unknown,
+                "routed method {method} has no explicit attachment class"
+            );
+        }
+        for &method in ATTACHMENT_REQUIRED_METHODS {
+            assert!(
+                routed.contains(&method),
+                "classified method {method} is no longer routed"
+            );
+        }
+        assert_eq!(
+            attachment_class("not.a.real.method"),
+            AttachmentClass::Unknown
+        );
     }
 }

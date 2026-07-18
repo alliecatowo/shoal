@@ -3,11 +3,18 @@ name = "shoal-eval"
 version = "0.1.0"
 edition = "2024"
 
+[lints]
+workspace = true
+
 [dependencies]
+blake3 = "1.8.5"
+fd-lock = "4"
 glob = "0.3.3"
+http = "1"
 jiff = "0.2.32"
 libc = "0.2.186"
 serde_json = "1.0.150"
+serde = { version = "1", features = ["derive"] }
 shoal-adapters = { version = "0.1.0", path = "../shoal-adapters" }
 shoal-ast = { version = "0.1.0", path = "../shoal-ast" }
 shoal-exec = { version = "0.1.0", path = "../shoal-exec" }
@@ -15,16 +22,27 @@ shoal-journal = { version = "0.1.0", path = "../shoal-journal" }
 shoal-leash = { version = "0.1.0", path = "../shoal-leash" }
 shoal-syntax = { version = "0.1.0", path = "../shoal-syntax" }
 shoal-value = { version = "0.1.0", path = "../shoal-value" }
+shoal-wasm = { version = "0.1.0", path = "../shoal-wasm" }
 shoal-secret = { path = "../shoal-secret" }
 shoal-picker = { version = "0.1.0", path = "../shoal-picker" }
+shoal-paths = { path = "../shoal-paths" }
 shoal-reef = { version = "0.1.0", path = "../shoal-reef" }
-toml = "1.1"
+toml = "0.9"
 notify = "8.2.0"
 ureq = "3.3.0"
 serde_norway = "0.9.42"
 csv = "1.4.0"
+tempfile = "3.27.0"
 
 [dev-dependencies]
-tempfile = "3.20"
-toml = "1.1"
-serde = { version = "1", features = ["derive"] }
+criterion = "0.8"
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+toml = "0.9"
+wit-component = { version = "0.251", features = ["dummy-module"] }
+wit-parser = "0.251"
+wasmprinter = "0.251"
+wat = "1"
+
+[[bench]]
+name = "pipeline"
+harness = false

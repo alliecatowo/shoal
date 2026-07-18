@@ -160,7 +160,7 @@ The table below reflects the schema and defaults in the current code. An empty �
 | `history.ignore` | string list, empty | Whole-line shell-style `*`/`?` patterns excluded from history. |
 | `history.ignore_space` | boolean, `true` | A line beginning with a space is not recorded. |
 | `render.color` | boolean, `true` | `NO_COLOR` can disable it. |
-| `render.width` | integer or absent | Schema-complete, but not presently applied by the shell renderer. |
+| `render.width` | positive integer or absent | Overrides terminal detection for block tables, prompt context, protocol rendering, wrapping, and pager decisions. |
 | `render.paging` | `"never"` or `"auto"`, `"never"` | Paging is interactive and TTY-sensitive. |
 | `render.pager` | command string or absent | Falls back to `$PAGER`, then `less -R`. |
 | `render.echo` | `"quiet"`, `"commands"`, `"all"`, or absent | Surface default: `all` in the REPL, `quiet` for scripts and `-c`. |
@@ -178,19 +178,22 @@ The table below reflects the schema and defaults in the current code. An empty �
 | `reef.tools` | constraint table, empty | User-scope Reef constraints. |
 | `reef.runners` | runner table, empty | User-scope script runners. |
 | `reef.options.hermetic` | boolean, `false` | Removes the ambient `PATH` tail when engaged. |
-| `kernel.enabled` | boolean, `true` | Present in the schema but does not route the standalone REPL through the kernel. |
-| `kernel.session` | string, `"default"` | Present in the schema but not used to attach the standalone REPL. |
-| `journal.enabled` | boolean, `true` | Not currently honored by the local REPL, which opens its journal directly. |
-| `journal.state_dir` | path or absent | Not currently used by the local REPL journal path. |
-| `leash.policy` | path or absent | Schema-complete; the main shell config does not currently load this policy. |
+| `kernel.enabled` | boolean, `true` | The default interactive REPL runs through an isolated private `shoal-kernel` child. Set false (or pass `--standalone`) for the local evaluator path. |
+| `kernel.session` | string, `"default"` | Names the principal-private Session inside the default REPL's private kernel. It does not attach to a durable public kernel socket. |
+| `journal.enabled` | boolean, `true` | Enables language-facing `history`/`journal`/`undo`; it never disables mandatory kernel security/approval/event audit. |
+| `journal.state_dir` | path or absent | Local language journal/jump and embedded-kernel state root; relative paths resolve from startup cwd. |
+| `leash.policy` | path or absent | Loaded fail-closed by the shared host bootstrap for local/kernel evaluators and passed to the default private REPL kernel. |
 
 `history.dedup` compares with the immediately preceding entry, including the last entry read from a previous session. An environment name that is nonempty but cannot be expressed as a Shoal identifier can pass generic validation yet produce a startup warning when the host tries to apply it.
 
-The standalone REPL and the kernel are distinct hosts. Kernel process flags and token policy are documented in [Agents, kernel, and MCP](@/docs/agents-kernel-mcp.md); durable execution history is covered in [Filesystem, jobs, and history](@/docs/filesystem-jobs-history.md).
+The default interactive REPL spawns a listener-free private kernel and connects over an inherited anonymous descriptor. Each shell gets isolated live bindings, `it`/`out`, cwd, jobs, and policy state; it does not join the named-socket kernel used by MCP/agents. `shoal --standalone` and `kernel.enabled = false` select the in-process evaluator path. Kernel process flags and token policy are documented in [Agents, kernel, and MCP](@/docs/agents-kernel-mcp.md); durable execution history is covered in [Filesystem, jobs, and history](@/docs/filesystem-jobs-history.md).
 
-### Adapter-directory caveat
+### Adapter-directory precedence
 
-`adapters.dirs` is intended as an ordered extension path, and later entries can shadow earlier definitions. In the current implementation, loading a configured directory replaces the evaluator's active adapter catalog at each step. Consequently, the last successfully loaded custom directory can become the active catalog rather than merely augmenting the bundled one. Completion may still show names from all discovered catalogs. Treat a custom directory as a complete catalog until this is corrected, and use `^command` when you deliberately want to bypass adapters.
+`adapters.dirs` is an ordered extension path. The bundled catalog loads first; each configured
+directory overlays it, and a later definition replaces only a matching command head. Shoal warns
+when an overlay shadows an earlier head. Completion and dispatch are assembled from the same ordered
+catalog set. Use `^command` when you deliberately want to bypass the resulting adapter.
 
 ## Environment overrides
 
@@ -274,9 +277,11 @@ format = "%H:%M:%S"
 style = "dim"
 ```
 
+Directory `truncate_style` is exact: `start` removes leading components, `end` removes trailing components, and `middle` retains both edges while favoring the trailing half. Invalid values warn and use `middle`.
+
 Built-in themes are `default`, `minimal`, and `rich`. A theme is the lowest-precedence prompt layer; your explicit settings override it.
 
-### Prompt precedence is slightly different
+### Prompt precedence
 
 The prompt loader merges these sources from low to high:
 
@@ -284,13 +289,19 @@ The prompt loader merges these sources from low to high:
 2. `/etc/shoal/shoal.toml`'s `[prompt]` table
 3. the user `shoal.toml`'s `[prompt]` table
 4. the user `prompt.toml` root
-5. `./.shoal.toml`'s `[prompt]` table in the exact startup directory
+5. the nearest ancestor `.shoal.toml`'s `[prompt]` table
 6. prompt environment overrides
 
-Unlike main project configuration, the prompt loader currently checks only `cwd/.shoal.toml`; it does not walk ancestors. Rich keys placed under `[prompt]` in `shoal.toml` may also trigger false “unknown key” warnings from the generic configuration schema, which formally knows only `prompt.template`. `prompt.toml` avoids both ambiguity and warning noise.
+Prompt and core project configuration use the same nearest-ancestor discovery function and therefore select the same `.shoal.toml`. The core loader treats the rich `[prompt]` subtree as owned by the prompt schema, avoiding false unknown-key warnings; the bounded prompt loader still performs its complete dynamic-key/type validation and strips executable custom modules from this untrusted project layer.
 
 
 The prompt-specific overrides are `SHOAL_PROMPT_LEFT`, `SHOAL_PROMPT_RIGHT`, `SHOAL_PROMPT_THEME`, and `SHOAL_NERD_FONT`. For the font variable, `1` means `always` and `0` means `never`.
+
+Prompt files are advisory and bounded. A missing file is ignored; an unreadable, non-regular,
+non-UTF-8, malformed, or larger-than-1-MiB file produces a warning and is skipped without stopping
+the shell. The loader also rejects excessively deep or wide TOML, strings or recognized prompt
+environment values above 64 KiB, and more than 128 custom or language modules. Other valid prompt
+layers and built-in defaults continue to work.
 
 ## Format placeholders
 
@@ -312,7 +323,6 @@ tool = "rustc"
 symbol = "rs "
 style = "red"
 when = "constrained"
-probe_ttl_s = 30
 format = "${symbol}${version} "
 
 [module.custom.cluster]
@@ -325,7 +335,13 @@ format = "${output} "
 
 These dynamic tables have a sharp type boundary: `language.when`, `custom.command`, `custom.when`, and `custom.cache_ttl` are strings, not arrays or numeric durations. A wrong type makes the rich prompt fail deserialization and fall back to the complete default prompt, with a warning.
 
-The schema is ahead of the host wiring here. Language modules can render an existing Reef binding; only the exact value `when = "constrained"` has distinct behavior, while every other string currently uses the same “resolved or constrained” test. `probe_ttl_s` is not consumed by the host. The host currently supplies no custom-command snapshots and no battery snapshot, so `$custom_NAME` and `$battery` render empty; `custom.command`, `custom.when`, and `custom.cache_ttl` describe planned scheduling rather than an operational background runner. Keep those tables out of a production prompt unless you are testing renderer input directly.
+Language modules render existing Reef bindings rather than launching a second prompt-specific probe. `when = "constrained"` requires a constrained binding; `when = "resolved"` requires a resolved version. Any other value warns and falls back to `constrained`. The former `probe_ttl_s` field was removed because Reef already owns discovery/cache freshness and the prompt had no independent probe to cache.
+
+When the battery module is enabled, the host samples Linux power-supply attributes directly or a bounded `pmset -g batt` call on macOS. Sampling happens outside rendering and is cached for `sample_interval_s` (clamped to one day); zero requests a fresh sample after every command. Multiple batteries are averaged, and unsupported/no-battery systems simply leave the module hidden.
+
+Custom modules are operational in the interactive host and in one-shot `shoal prompt print|explain`. Because they execute with the UI host's ambient filesystem/network authority, executable custom tables are accepted only from trusted system/user configuration; `module.custom` in a project `.shoal.toml` is removed with a warning before layers merge and cannot add or override a command merely by entering a repository.
+
+`command` is split as quoted external argv; it is **not** evaluated by a shell, so redirects, pipelines, substitutions, environment assignments, and shell operators have no special meaning. It admits at most 64 arguments and 4 KiB of command text. `when` is empty for unconditional execution or one exact environment-variable name; the command runs only while that variable has a nonempty value. `cache_ttl` accepts a Shoal duration from zero through one hour. Two background workers run probes after command completion with a 250 ms process-group deadline and a 4 KiB combined-output wall. The first refresh is pending, a successful value is cached, and an expired value remains visible as stale while it refreshes. One-shot inspection waits at most 525 ms for the first bounded results. Nonzero, timed-out, truncated, non-UTF-8, multiline, or terminal-control-bearing output is hidden as an error. Rendering itself remains subprocess-free on every keystroke.
 
 Unknown format module IDs and unknown prompt keys warn rather than preventing the shell from starting. Invalid prompt data falls back to defaults with a warning.
 
@@ -338,11 +354,11 @@ Each static table supports `enabled` plus module-specific keys:
 | `module.character` | `success_symbol`, `error_symbol`, `vicmd_symbol`, and their styles |
 | `module.directory` | `truncate_to`, `truncate_style`, `repo_relative`, `read_only_symbol`, `symbol`, `style`, `home_symbol` |
 | `module.git_branch` | `symbol`, `ascii_symbol`, `style`, `truncate_to`, `truncate_symbol`, `format` |
-| `module.git_status` | `ahead`, `behind`, `diverged`, `staged`, `unstaged`, `untracked`, `conflicted`, `stashed`, `stale_symbol`, `engine`, `style` |
+| `module.git_status` | `ahead`, `behind`, `diverged`, `staged`, `unstaged`, `untracked`, `conflicted`, `stashed`, `stale_symbol`, `style` |
 | `module.git_state` | labels for `rebase`, `merge`, `cherry_pick`, `bisect`, `revert`, plus `style` |
 | `module.cmd_duration` | `min_ms`, `style` |
 | `module.exit_status` | `show_on_success`, `format`, `style` |
-| `module.jobs` | `symbol`, `threshold`, `format`, `style` |
+| `module.jobs` | `symbol`, `threshold`, `format`, `style`; formats may use active `${total}`, `${running}`, `${suspended}`, and bounded-history `${completed}` |
 | `module.time` | `format`, `style` |
 | `module.username` | `show_always`, `style`, `root_style` |
 | `module.hostname` | `show_always`, `symbol`, `style` |
@@ -366,11 +382,11 @@ shoal prompt explain --side right
 shoal prompt bench --side left --n 1000
 ```
 
-If the prompt exceeds `budget.render_deadline_ms`, Shoal can warn when `warn_on_exceed` is enabled. Static/Git/Reef snapshot work should stay cheap. The custom-command/cache configuration is future-shaped and inert in the current host because no custom snapshot scheduler populates it; do not rely on `custom.command`, `custom.when`, or `custom.cache_ttl` executing anything yet.
+If the prompt exceeds `budget.render_deadline_ms`, Shoal warns once per refreshed interactive snapshot when `warn_on_exceed` is enabled. The warning uses Reedline's bounded, nonblocking notice queue; saturation is counted and reported by a later warning instead of delaying input. Static/Git/Reef snapshot work should stay cheap. Custom commands run on the bounded post-command scheduler and never inside the renderer; their 250 ms execution budget is separate from the pure render deadline.
 
 ## Troubleshooting configuration
 
-- If a repository `.shoal.toml` seems ignored, remember that main configuration uses the nearest ancestor but prompt configuration only uses the file in the exact startup directory.
+- If a repository `.shoal.toml` seems ignored, check that it is the nearest ancestor project file; Shoal does not merge multiple ancestor `.shoal.toml` files.
 - If rich prompt keys warn from `shoal.toml`, move them to the root of `prompt.toml`.
 - If a legacy `{cwd}` template appears, migrate it to `format.left = "$directory..."`.
 - If output is unexpectedly silent in a script, set `render.echo = "all"` temporarily; see [CLI and execution modes](@/docs/cli.md).

@@ -77,6 +77,12 @@ bracketed_paste = true
 
 When `completion.menu = false`, the current line-editor integration approximates menu-free completion by inserting unique matches or a shared prefix. If several candidates have no common prefix, the popup can still appear because the editor has no separate cycle-only completion path.
 
+Fuzzy matching accepts non-contiguous subsequences and one adjacent transposition, so a directory
+typed as `exampel` can complete to `example/`. The selected value replaces the current argument; it
+is never appended as a second argument. Directories do not gain a trailing space, and another Tab
+continues completion inside them. Discovery applies `max_results` incrementally and bounds each live
+directory scan to 4,096 entries / 4 MiB of retained candidate text.
+
 ### Custom keybindings
 
 Keybindings map a chord string to a curated action name:
@@ -124,7 +130,9 @@ fg %1
 
 `fg <task-variable>` is rewritten to resume and await that task. Local process-group job control depends on Unix terminal facilities. A known preview limitation is that a stopped external resumed with `bg` may remain displayed as running after it exits until it is foregrounded again or the session ends; background completion tracking is not yet fully event-driven.
 
-Kernel tasks are different: current MCP/kernel suspend and resume operations return `TASK_CONTROL_UNAVAILABLE`, even though local REPL process control works. Do not build remote-agent workflows around the local `Ctrl-Z` model.
+Kernel tasks are different: raw kernel suspend/resume controls process-backed tasks through their
+owned process groups, while evaluator-only work returns `TASK_CONTROL_UNAVAILABLE`. MCP does not
+expose those raw controls. This is not the local REPL's terminal-reattachment/`Ctrl-Z` model.
 
 ## History and journal
 
@@ -159,7 +167,12 @@ popd
 cd -
 ```
 
-`j`/`jump` use an interactive frecency database stored under the Shoal state directory. This is a REPL convenience rather than a portable script primitive.
+`j`/`jump` use an interactive frecency database stored under the Shoal state directory. The local
+human REPL and one-shot local commands retain the same per-user database. Kernel bearer sessions use
+separate authenticated principal/trust/profile partitions, while tokenless restricted sessions do
+not read or write durable jump history. Updates are atomically merged under a bounded advisory lock,
+so concurrent cooperative sessions do not discard one another's visits. This is a REPL convenience
+rather than a portable script primitive.
 
 ## Paging
 

@@ -1,0 +1,24 @@
+.TH SHOAL-MCP 1 "July 2026" "Shoal 0.1.0" "User Commands"
+.SH NAME
+shoal-mcp \- expose Shoal through the Model Context Protocol
+.SH SYNOPSIS
+.B shoal-mcp
+.RI [ options ]
+.SH DESCRIPTION
+Runs an MCP server on standard input and output, connected to a Shoal kernel.
+.SH OPTIONS
+.TP
+.BI \-\-socket " PATH"
+Connect to PATH.
+.TP
+.BI \-\-session " NAME"
+Select a session.
+.TP
+.BI \-\-token " TOKEN"
+Authenticate with a capability token.
+.TP
+.B \-\-local-human
+Use local-human authentication.
+.SH SEE ALSO
+.BR shoal (1),
+.BR shoal-token (1)

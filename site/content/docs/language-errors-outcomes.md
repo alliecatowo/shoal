@@ -56,6 +56,11 @@ let probe = (^false)   # value position: binds a failed outcome
 (^false).ok            # value expression: false
 ```
 
+An unredirected statement can write stdout before it fails. Shoal preserves
+those bytes through the normal output sink and then reports `cmd_failed`, like
+traditional shells. PTY output and redirected stdout are never printed a
+second time.
+
 Parentheses are the clearest way to place a command inside an expression. This rule lets ordinary interactive failures stop the line while allowing probes, retries, fallbacks, and exact status propagation.
 
 Most structured builtins also return successful outcomes so external and builtin transformations can chain similarly. Evaluator-native session operations such as `pwd` can return a bare value.
@@ -155,9 +160,9 @@ Common currently emitted codes include:
 | Family | Codes you will commonly handle |
 |---|---|
 | Syntax/binding | `parse_error`, `undefined_var`, `arg_error`, `type_error` |
-| Data/access | `field_missing`, `index_range`, `utf8_error`, `overflow`, `div_zero` |
+| Data/access | `field_missing`, `index_range`, `utf8_error`, `overflow`, `number_range`, `div_zero`, `collection_materialization_limit`, `string_materialization_limit`, `data_materialization_limit`, `cas_materialization_limit`, `path_read_limit`, `builtin_output_limit`, `builtin_work_limit` |
 | Commands/host | `not_found`, `cmd_failed`, `io_error`, `net_error`, `permission`, `timeout` |
-| Streams/channels | `stream_consumed`, `stream_unbounded`, `channel_closed`, `feed_error` |
+| Streams/channels | `stream_consumed`, `stream_unbounded`, `stream_collect_limit`, `stream_distinct_limit`, `stream_window_limit`, `stream_line_limit`, `range_materialization_limit`, `range_length_overflow`, `channel_closed`, `channel_poisoned`, `channel_name_limit`, `channel_registry_limit`, `channel_subscriber_limit`, `channel_payload_limit`, `channel_payload_type`, `feed_error` |
 | Reef | `reef_unlocked`, `reef_drift`, `reef_conflict`, `reef_not_found`, `reef_provider` |
 | Control | `assert_failed`, `recursion_limit`, `stale_undo` |
 

@@ -14,54 +14,37 @@
 //! - **expr** (anywhere else — after `let x = `, inside `(...)`, a bare
 //!   expression statement): in-scope variable/function names.
 
-use std::collections::{BTreeSet, HashMap};
-use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
 
-use reedline::{Completer, Span as RlSpan, Suggestion};
-use shoal_adapters::{AdapterCatalog, CmdAdapter};
-use shoal_syntax::commands::builtin_names;
-use shoal_syntax::lexer::RESERVED;
-use shoal_syntax::{Lexer, Mode, Tok};
-use shoal_value::{Env, Value, method_names, methods_for};
+use reedline::{Completer, Suggestion};
+use shoal_adapters::AdapterCatalog;
+use shoal_value::Env;
 
-/// Cursor context, resolved from the raw buffer text alone (no full parse —
-/// see `classify`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Ctx {
-    /// Completing the first word of a (candidate) COMMAND statement.
-    Head { start: usize, word: String },
-    /// Completing a later word of a COMMAND statement whose head is `head`.
-    Arg {
-        start: usize,
-        word: String,
-        head: String,
-    },
-    /// Completing an identifier inside an EXPR-dispatched statement.
-    Expr { start: usize, word: String },
-    /// Completing a method/field name immediately after a `.` (`recv.<word>`)
-    /// in EXPR position — offer the value-method vocabulary, not variables.
-    /// `recv` is the inferred receiver type name (a `Value::type_name` string
-    /// understood by `shoal_value::methods_for`) when we could pin it down from
-    /// the token(s) before the `.`, else `None` — meaning "offer the full method
-    /// union" (see [`infer_receiver_type`]).
-    Method {
-        start: usize,
-        word: String,
-        recv: Option<String>,
-    },
-    /// Nothing sensible to complete (e.g. cursor inside a literal).
-    None,
-}
+mod candidates;
+mod context;
+mod discovery;
+mod filesystem;
+mod inference;
+mod matching;
+
+use candidates::finish;
+use context::{Ctx, classify};
+#[cfg(test)]
+use discovery::{MAX_PATH_CACHE_DIRS, PATH_CACHE_REVALIDATE};
+use discovery::{PathDiscovery, adapter_names};
+#[cfg(test)]
+use matching::subsequence_match;
 
 pub struct ShoalCompleter {
     env: Env,
     cwd: Arc<Mutex<PathBuf>>,
+    /// Executable search directories from the session that will execute the
+    /// command. Attached REPLs cannot use the client's process PATH: the
+    /// kernel session may have changed PATH independently.
+    discovery: PathDiscovery,
     adapters: Vec<AdapterCatalog>,
     adapter_names: Vec<String>,
-    path_cache: HashMap<PathBuf, (Option<SystemTime>, Vec<String>)>,
     /// `completion.fuzzy` (site/content/internals/configuration-reference.md): allow typo-tolerant,
     /// non-contiguous matches instead of requiring a strict prefix.
     fuzzy: bool,
@@ -78,7 +61,6 @@ pub struct ShoalCompleter {
 const DEFAULT_FUZZY: bool = true;
 const DEFAULT_CASE_INSENSITIVE: bool = true;
 const DEFAULT_MAX_RESULTS: usize = 100;
-
 impl ShoalCompleter {
     pub fn new(
         env: Env,
@@ -89,9 +71,9 @@ impl ShoalCompleter {
         Self {
             env,
             cwd,
+            discovery: PathDiscovery::new(),
             adapters,
             adapter_names,
-            path_cache: HashMap::new(),
             fuzzy: DEFAULT_FUZZY,
             case_insensitive: DEFAULT_CASE_INSENSITIVE,
             max_results: DEFAULT_MAX_RESULTS,
@@ -108,192 +90,19 @@ impl ShoalCompleter {
         self
     }
 
+    /// Use a live, sanitized session PATH projection. `None` inside the cell
+    /// means an older remote omitted the projection, in which case retaining
+    /// the process-PATH fallback preserves protocol compatibility.
+    pub(crate) fn with_path_dirs(mut self, path_dirs: Arc<Mutex<Option<Vec<PathBuf>>>>) -> Self {
+        self.discovery.set_session_dirs(path_dirs);
+        self
+    }
+
     fn cwd(&self) -> PathBuf {
         self.cwd
             .lock()
             .map(|g| g.clone())
             .unwrap_or_else(|_| PathBuf::from("."))
-    }
-
-    /// Live `PATH` executable names. Each directory is re-scanned only when
-    /// its mtime has changed since the last call (or it hasn't been seen
-    /// before) — cheap enough to call on every Tab press.
-    fn path_names(&mut self) -> Vec<String> {
-        let mut out = Vec::new();
-        let Some(path_var) = std::env::var_os("PATH") else {
-            return out;
-        };
-        for dir in std::env::split_paths(&path_var) {
-            let mtime = fs::metadata(&dir).and_then(|m| m.modified()).ok();
-            let stale = match self.path_cache.get(&dir) {
-                Some((cached, _)) => *cached != mtime,
-                None => true,
-            };
-            if stale {
-                let mut names = Vec::new();
-                if let Ok(entries) = fs::read_dir(&dir) {
-                    for entry in entries.flatten().take(4000) {
-                        if let Some(name) = entry.file_name().to_str() {
-                            names.push(name.to_string());
-                        }
-                    }
-                }
-                self.path_cache.insert(dir.clone(), (mtime, names));
-            }
-            if let Some((_, names)) = self.path_cache.get(&dir) {
-                out.extend(names.iter().cloned());
-            }
-        }
-        out
-    }
-
-    fn adapter_lookup(&self, head: &str) -> Option<&CmdAdapter> {
-        self.adapters.iter().find_map(|c| c.lookup(head))
-    }
-
-    /// Match `name` against `prefix` per `[completion]` config
-    /// (site/content/internals/configuration-reference.md): case-(in)sensitively per `case_insensitive`, and
-    /// via a non-contiguous subsequence test — a strict superset of prefix
-    /// matching, so it's exactly "typo-tolerant / non-contiguous matches,
-    /// not just prefix" — rather than a strict prefix when `fuzzy` is set.
-    fn candidate_matches(&self, name: &str, prefix: &str) -> bool {
-        if prefix.is_empty() {
-            return true;
-        }
-        if self.case_insensitive {
-            let name = name.to_lowercase();
-            let prefix = prefix.to_lowercase();
-            if self.fuzzy {
-                subsequence_match(&name, &prefix)
-            } else {
-                name.starts_with(&prefix)
-            }
-        } else if self.fuzzy {
-            subsequence_match(name, prefix)
-        } else {
-            name.starts_with(prefix)
-        }
-    }
-
-    fn head_candidates(&mut self, prefix: &str) -> Vec<String> {
-        let mut names: BTreeSet<String> = BTreeSet::new();
-        names.extend(RESERVED.iter().map(|s| s.to_string()));
-        names.extend(builtin_names().iter().map(|s| s.to_string()));
-        for name in self.env.visible_names() {
-            if self.env.get(&name).is_some_and(|v| v.is_callable()) {
-                names.insert(name);
-            }
-        }
-        names.extend(self.adapter_names.iter().cloned());
-        names.extend(self.path_names());
-        names.retain(|n| self.candidate_matches(n, prefix));
-        names.into_iter().collect()
-    }
-
-    fn expr_candidates(&self, prefix: &str) -> Vec<String> {
-        let mut names: BTreeSet<String> = self.env.visible_names().into_iter().collect();
-        names.extend(RESERVED.iter().map(|s| s.to_string()));
-        names.retain(|n| self.candidate_matches(n, prefix));
-        names.into_iter().collect()
-    }
-
-    /// Method/field candidates for a `.`-position word (`recv.<prefix>`),
-    /// filtered per `[completion]` config. When the receiver's type was inferred
-    /// (`recv` is `Some`) we offer only that type's methods
-    /// (`shoal_value::methods_for`) — so `[1,2,3].` proposes `where`/`map`/`sum`
-    /// and not `upper`/`split`. When it wasn't (a chained/computed/unknown
-    /// receiver), we fall back to the flat union across every type
-    /// (`method_names`), which is exactly the old, type-agnostic behavior — never
-    /// fewer or wrong candidates than before.
-    fn method_candidates(&self, prefix: &str, recv: Option<&str>) -> Vec<String> {
-        let per_type = recv.and_then(methods_for);
-        let names: &[&str] = per_type.as_deref().unwrap_or_else(|| method_names());
-        names
-            .iter()
-            .filter(|n| self.candidate_matches(n, prefix))
-            .map(|s| s.to_string())
-            .collect()
-    }
-
-    /// `--flag`/`-x` candidates for a known command head: adapter params
-    /// (top-level + all subcommands) and short flags, plus a session
-    /// function's own parameter names (site/content/internals/language-conformance-contract.md: "flag parsing derived from
-    /// the signature").
-    fn flag_candidates(&self, head: &str, prefix: &str) -> Vec<String> {
-        let mut names: BTreeSet<String> = BTreeSet::new();
-        if let Some(adapter) = self.adapter_lookup(head) {
-            for p in &adapter.top.params {
-                names.insert(format!("--{}", p.name));
-            }
-            for short in adapter.top.short_flags.keys() {
-                names.insert(format!("-{short}"));
-            }
-            for sub in adapter.subs.values() {
-                for p in &sub.params {
-                    names.insert(format!("--{}", p.name));
-                }
-                for short in sub.short_flags.keys() {
-                    names.insert(format!("-{short}"));
-                }
-            }
-        }
-        if let Some(Value::Closure(c)) = self.env.get(head) {
-            for p in &c.params {
-                names.insert(format!("--{}", p.name));
-            }
-        }
-        names.retain(|n| self.candidate_matches(n, prefix));
-        names.into_iter().collect()
-    }
-
-    /// Live filesystem candidates for a CMD-mode argument word, resolved
-    /// against the word's own directory prefix — `crates/sho` re-scans
-    /// `crates/` fresh, so newly created files/directories show up.
-    fn fs_candidates(&self, word: &str) -> Vec<String> {
-        let (dir_part, file_prefix) = split_dir_prefix(word);
-        let base_dir = self.resolve_dir(&dir_part);
-        let mut out = Vec::new();
-        let Ok(entries) = fs::read_dir(&base_dir) else {
-            return out;
-        };
-        let show_hidden = file_prefix.starts_with('.');
-        for entry in entries.flatten() {
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                continue;
-            };
-            if !show_hidden && name.starts_with('.') {
-                continue;
-            }
-            if !self.candidate_matches(&name, &file_prefix) {
-                continue;
-            }
-            let is_dir = entry.path().is_dir();
-            let mut value = format!("{dir_part}{name}");
-            if is_dir {
-                value.push('/');
-            }
-            out.push(value);
-        }
-        out
-    }
-
-    fn resolve_dir(&self, dir_part: &str) -> PathBuf {
-        if dir_part.is_empty() {
-            return self.cwd();
-        }
-        let expanded = if let Some(tail) = dir_part.strip_prefix("~/") {
-            match std::env::var_os("HOME") {
-                Some(home) => PathBuf::from(home).join(tail),
-                None => PathBuf::from(dir_part),
-            }
-        } else {
-            PathBuf::from(dir_part)
-        };
-        if expanded.is_absolute() {
-            expanded
-        } else {
-            self.cwd().join(expanded)
-        }
     }
 }
 
@@ -326,371 +135,23 @@ impl Completer for ShoalCompleter {
     }
 }
 
-/// Does every character of `needle` appear in `haystack`, in order, not
-/// necessarily contiguously? Any prefix match is also a subsequence match
-/// (each needle character is trivially found at the next haystack
-/// position), so using this predicate when `completion.fuzzy` is set is a
-/// strict superset of prefix matching — it never *rejects* what plain prefix
-/// matching would accept, only adds typo-tolerant/non-contiguous matches on
-/// top.
-fn subsequence_match(haystack: &str, needle: &str) -> bool {
-    let mut chars = haystack.chars();
-    needle.chars().all(|nc| chars.any(|hc| hc == nc))
-}
-
-/// Sort, dedup, cap to `completion.max_results` (site/content/internals/configuration-reference.md), and
-/// convert to reedline `Suggestion`s.
-fn finish(mut names: Vec<String>, start: usize, pos: usize, max_results: usize) -> Vec<Suggestion> {
-    names.sort();
-    names.dedup();
-    names.truncate(max_results);
-    names
-        .into_iter()
-        .map(|value| {
-            let append_whitespace = !value.ends_with('/');
-            Suggestion {
-                value,
-                span: RlSpan::new(start, pos),
-                append_whitespace,
-                ..Default::default()
-            }
-        })
-        .collect()
-}
-
-fn split_dir_prefix(word: &str) -> (String, String) {
-    match word.rfind('/') {
-        Some(idx) => (word[..=idx].to_string(), word[idx + 1..].to_string()),
-        None => (String::new(), word.to_string()),
-    }
-}
-
-/// Resolve an EXPR-position word to either a plain [`Ctx::Expr`]
-/// (variable/function/keyword completion) or a [`Ctx::Method`] (value-method
-/// completion) depending on whether the identifier is immediately preceded by a
-/// `.` — i.e. it's a method/field on some receiver (`recv.<word>`). A `?.`
-/// optional-chain also ends in `.`, so it's covered too. When it's a method
-/// position we additionally try to infer the receiver's type so completion can
-/// narrow to that type's methods.
-fn expr_or_method(env: &Env, line: &str, pos: usize) -> Ctx {
-    let (start, word) = trailing_ident(line, pos);
-    if start > 0 && line.as_bytes()[start - 1] == b'.' {
-        let recv = infer_receiver_type(env, line, start - 1);
-        Ctx::Method { start, word, recv }
-    } else {
-        Ctx::Expr { start, word }
-    }
-}
-
-/// Infer the receiver type for a `.`-position completion from the token(s)
-/// immediately before the `.` at `dot_pos` (`line[dot_pos] == '.'`). Returns a
-/// `Value::type_name` string understood by [`methods_for`], or `None` — "fall
-/// back to the full method union" — for anything we can't pin down cleanly.
-///
-/// Handled (a strict, receiver-narrowing win over the union):
-/// - literals directly before the `.`: `"…"`/`'…'` → str, an int/float literal,
-///   a size/duration literal, `true`/`false` → bool, a `[…]` list literal, a
-///   `{…}` record literal;
-/// - a simple binding `name.` whose live `Value` in `env` gives its type.
-///
-/// Everything else falls back to `None` (mandatory, so this never regresses):
-/// a chained access `a.b.`, a call/group result `f(x).`/`(…).`, an indexed
-/// element `xs[0].`, a name that isn't a value binding, or a binding whose type
-/// has no dedicated method table (stream/outcome/closure/… — [`methods_for`]
-/// itself returns `None` there, and `method_candidates` then uses the union).
-fn infer_receiver_type(env: &Env, line: &str, dot_pos: usize) -> Option<String> {
-    let stmt_start = statement_start(line, dot_pos);
-    let toks = expr_tokens(line, stmt_start, dot_pos);
-    let (last_tok, _) = toks.last()?;
-    match last_tok {
-        Tok::Str(_) | Tok::StrInterp(_) => Some("str".into()),
-        Tok::Int(_) => Some("int".into()),
-        Tok::Float(_) => Some("float".into()),
-        Tok::Size(_) => Some("size".into()),
-        Tok::Duration(_) => Some("duration".into()),
-        Tok::Time { .. } => Some("time".into()),
-        Tok::DateTime(_) => Some("datetime".into()),
-        Tok::Ident(name) => {
-            match name.as_str() {
-                "true" | "false" => return Some("bool".into()),
-                // A reserved keyword (`if.`, `for.`) is never a receiver, and a
-                // value binding can never shadow one.
-                kw if RESERVED.contains(&kw) => return None,
-                _ => {}
-            }
-            // `a.b.` — the receiver of *this* `.` is the field access `a.b`,
-            // whose type we can't know from text; fall back. (The token before
-            // `b` is a `.`/`?.`.)
-            if matches!(
-                toks.iter().rev().nth(1),
-                Some((Tok::Dot | Tok::QuestionDot, _))
-            ) {
-                return None;
-            }
-            // Simple binding: infer from the live value's variant.
-            Some(env.get(name.as_str())?.type_name().to_string())
-        }
-        // A trailing `]`/`}` is a list/record *literal* only when its matching
-        // opener isn't applied to a preceding value (indexing / a call / a
-        // header block); otherwise fall back.
-        Tok::RBracket => bracket_literal_type(&toks, &Tok::LBracket, "list"),
-        Tok::RBrace => bracket_literal_type(&toks, &Tok::LBrace, "record"),
-        // Call/group result (`)`), or any other token: unknown → union.
-        _ => None,
-    }
-}
-
-/// Lex `line[stmt_start..dot_pos]` in EXPR mode into `(tok, start)` pairs
-/// (trivia dropped), so [`infer_receiver_type`] can inspect the receiver just
-/// before a `.`. Tokens that would overrun `dot_pos` are excluded (e.g. the
-/// `?.` of a `recv?.field` chain, so `recv` remains the last token).
-fn expr_tokens(line: &str, stmt_start: usize, dot_pos: usize) -> Vec<(Tok, usize)> {
-    let lx = Lexer::new(line);
-    let mut out = Vec::new();
-    let mut scan = stmt_start;
-    loop {
-        let next = lx.skip_trivia(scan);
-        if next >= dot_pos {
-            break;
-        }
-        let Ok((tok, span)) = lx.token(next, Mode::Expr) else {
-            break;
-        };
-        let (start, end) = (span.start as usize, span.end as usize);
-        if matches!(tok, Tok::Eof) || start >= dot_pos || end > dot_pos {
-            break;
-        }
-        out.push((tok, start));
-        scan = end.max(next + 1);
-    }
-    out
-}
-
-/// Classify a trailing `]`/`}` (whose matching `opener` and result `ty` are
-/// given): a fresh list/record literal, or postfix application (index/call/
-/// block) that we can't type. Returns `Some(ty)` only for the literal case.
-fn bracket_literal_type(toks: &[(Tok, usize)], opener: &Tok, ty: &str) -> Option<String> {
-    // Walk back to the matching opener by bracket depth.
-    let mut depth = 0i32;
-    let mut open_idx = None;
-    for (i, (tok, _)) in toks.iter().enumerate().rev() {
-        match tok {
-            Tok::RParen | Tok::RBracket | Tok::RBrace => depth += 1,
-            Tok::LParen | Tok::LBracket | Tok::LBrace => {
-                depth -= 1;
-                if depth == 0 {
-                    open_idx = Some(i);
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    let open_idx = open_idx?;
-    // Unbalanced / mismatched (shouldn't happen for a closed receiver): bail.
-    if &toks[open_idx].0 != opener {
-        return None;
-    }
-    // An atom-ending token right before the opener means the brackets are
-    // postfix (`xs[0]`, `f(){…}`) rather than a literal → fall back.
-    let prev = open_idx.checked_sub(1).map(|i| &toks[i].0);
-    if prev.is_some_and(atom_ends) {
-        return None;
-    }
-    Some(ty.to_string())
-}
-
-/// Does `tok` end an atom/value expression? A `[`/`{` right after such a token
-/// is postfix (indexing/call/header block), not the opener of a fresh literal.
-fn atom_ends(tok: &Tok) -> bool {
-    matches!(
-        tok,
-        Tok::Ident(_)
-            | Tok::RParen
-            | Tok::RBracket
-            | Tok::RBrace
-            | Tok::Str(_)
-            | Tok::StrInterp(_)
-            | Tok::Int(_)
-            | Tok::Float(_)
-            | Tok::Size(_)
-            | Tok::Duration(_)
-            | Tok::Time { .. }
-            | Tok::DateTime(_)
-            | Tok::Regex(_)
-    )
-}
-
-/// Backward scan for the identifier ending exactly at `pos` — used for
-/// EXPR-context word boundaries, where the token shapes are plain
-/// identifiers (unlike CMD-mode words, which need the real lexer to handle
-/// paths/flags/globs correctly).
-fn trailing_ident(line: &str, pos: usize) -> (usize, String) {
-    let mut start = pos;
-    for (idx, ch) in line[..pos].char_indices().rev() {
-        if ch.is_alphanumeric() || ch == '_' {
-            start = idx;
-        } else {
-            break;
-        }
-    }
-    (start, line[start..pos].to_string())
-}
-
-/// Find the byte offset where the *current statement* starts, by scanning
-/// `line[..pos]` and tracking bracket depth/quote state — a statement
-/// boundary (`;` or newline) only counts at depth 0, outside quotes. This is
-/// a bookkeeping pass (mirrors `input_is_incomplete` in `main.rs`), not a
-/// parse; the actual word-boundary/token-shape decisions downstream go
-/// through the real lexer.
-fn statement_start(line: &str, pos: usize) -> usize {
-    let bytes = line.as_bytes();
-    let mut depth: i32 = 0;
-    let mut quote: Option<u8> = None;
-    let mut boundary = 0usize;
-    let mut i = 0usize;
-    while i < pos {
-        let b = bytes[i];
-        if let Some(q) = quote {
-            if q == b'"' && b == b'\\' {
-                i += 2;
-                continue;
-            }
-            if b == q {
-                quote = None;
-            }
-            i += 1;
-            continue;
-        }
-        match b {
-            b'"' | b'\'' => quote = Some(b),
-            b'(' | b'[' | b'{' => depth += 1,
-            b')' | b']' | b'}' => depth -= 1,
-            b';' | b'\n' if depth <= 0 => boundary = i + 1,
-            _ => {}
-        }
-        i += 1;
-    }
-    boundary.min(pos)
-}
-
-/// Walk CMD-mode tokens from `scan_pos` (using the lexer's own word
-/// boundaries — site/content/internals/language-conformance-contract.md) to find the word containing `pos`.
-fn cmd_word_at(lx: &Lexer, mut scan_pos: usize, pos: usize, line: &str) -> Option<(usize, String)> {
-    loop {
-        let next_sig = lx.skip_trivia(scan_pos);
-        if next_sig >= pos {
-            return Some((pos, String::new()));
-        }
-        let (tok, span) = lx.token(next_sig, Mode::Cmd).ok()?;
-        if matches!(tok, Tok::Eof) {
-            return Some((pos, String::new()));
-        }
-        let (start, end) = (span.start as usize, span.end as usize);
-        if end >= pos {
-            return Some((start, line[start..pos].to_string()));
-        }
-        scan_pos = end.max(next_sig + 1);
-    }
-}
-
-/// Classify the cursor position per site/content/internals/language-conformance-contract.md statement-dispatch rule,
-/// approximated well enough for completion purposes: keyword / bound-variable
-/// / assignment-target first words dispatch EXPR; everything else dispatches
-/// COMMAND (CMD-mode word boundaries for the rest of the statement).
-fn classify(env: &Env, line: &str, pos: usize) -> Ctx {
-    let pos = pos.min(line.len());
-    let stmt_start = statement_start(line, pos);
-    let lx = Lexer::new(line);
-    let word0 = lx.skip_trivia(stmt_start);
-    if word0 > pos {
-        return Ctx::None;
-    }
-    if word0 >= pos {
-        return Ctx::Head {
-            start: pos,
-            word: String::new(),
-        };
-    }
-    let Ok((tok0, span0)) = lx.token(word0, Mode::Expr) else {
-        return Ctx::None;
-    };
-    let (s0, e0) = (span0.start as usize, span0.end as usize);
-    match tok0 {
-        Tok::Ident(name) => {
-            if pos <= e0 {
-                return Ctx::Head {
-                    start: s0,
-                    word: line[s0..pos].to_string(),
-                };
-            }
-            let is_keyword = RESERVED.contains(&name.as_str());
-            let is_bound = env.is_bound(&name);
-            let is_assign = matches!(
-                lx.token(e0, Mode::Expr),
-                Ok((
-                    Tok::Eq | Tok::PlusEq | Tok::MinusEq | Tok::StarEq | Tok::SlashEq,
-                    _
-                ))
-            );
-            if is_keyword || is_bound || is_assign {
-                expr_or_method(env, line, pos)
-            } else {
-                match cmd_word_at(&lx, e0, pos, line) {
-                    Some((start, word)) => Ctx::Arg {
-                        start,
-                        word,
-                        head: name,
-                    },
-                    None => Ctx::None,
-                }
-            }
-        }
-        _ => {
-            if pos <= e0 {
-                Ctx::None
-            } else {
-                expr_or_method(env, line, pos)
-            }
-        }
-    }
-}
-
 /// Scan adapter config directories for `[cmd.<name>]` table keys — just the
 /// name enumeration `AdapterCatalog` doesn't expose publicly (see
 /// api_changes); flag/subcommand data still goes through the real
 /// `AdapterCatalog::load_dir` + `lookup`.
 pub fn scan_adapter_names(dirs: &[PathBuf]) -> Vec<String> {
-    let mut names: BTreeSet<String> = BTreeSet::new();
-    for dir in dirs {
-        let Ok(entries) = fs::read_dir(dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().is_none_or(|e| e != "toml") {
-                continue;
-            }
-            let Ok(src) = fs::read_to_string(&path) else {
-                continue;
-            };
-            let Ok(doc) = src.parse::<toml::Value>() else {
-                continue;
-            };
-            if let Some(cmds) = doc.get("cmd").and_then(toml::Value::as_table) {
-                names.extend(cmds.keys().cloned());
-            }
-        }
-    }
-    names.into_iter().collect()
+    adapter_names(dirs)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shoal_value::Env;
+    use shoal_value::{Env, Value};
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     fn completer_at(cwd: &Path) -> ShoalCompleter {
         ShoalCompleter::new(
@@ -699,6 +160,11 @@ mod tests {
             Vec::new(),
             Vec::new(),
         )
+    }
+
+    fn declare(env: &Env, name: impl Into<String>, value: Value, mutable: bool) {
+        env.declare(name, value, mutable)
+            .expect("completion test binding stays within the environment quota");
     }
 
     #[test]
@@ -772,7 +238,7 @@ mod tests {
         // A bound receiver followed by `.<word>` is method/field position, not
         // a plain expr reference — so completion offers method names.
         let env = Env::root();
-        env.declare("items", Value::List(vec![Value::Int(1)]), false);
+        declare(&env, "items", Value::List(vec![Value::Int(1)]), false);
         let ctx = classify(&env, "items.le", 8);
         assert_eq!(
             ctx,
@@ -790,7 +256,7 @@ mod tests {
         // The same bound receiver with a trailing space (no `.`) is plain expr
         // position: variable/function/keyword completion, not method names.
         let env = Env::root();
-        env.declare("items", Value::Int(1), false);
+        declare(&env, "items", Value::Int(1), false);
         let ctx = classify(&env, "items ", 6);
         assert_eq!(
             ctx,
@@ -846,7 +312,7 @@ mod tests {
         // method names (`where`); the same prefix in plain expr position
         // (`let x = wh`) offers variables/keywords, never method names.
         let env = Env::root();
-        env.declare("tbl", Value::List(vec![Value::Int(1)]), false);
+        declare(&env, "tbl", Value::List(vec![Value::Int(1)]), false);
         let mut c = ShoalCompleter::new(
             env,
             Arc::new(Mutex::new(PathBuf::from("."))),
@@ -1004,10 +470,26 @@ mod tests {
     }
 
     #[test]
+    fn namespace_completion_uses_the_runtime_signature_registry() {
+        let mut completer = completer_with(Env::root());
+        let json = cands(&mut completer, "json.");
+        assert_eq!(json, vec!["parse", "stringify"]);
+
+        let math = cands(&mut completer, "math.sq");
+        assert_eq!(math, vec!["sqrt"]);
+        assert!(!has(&json, "upper"));
+    }
+
+    #[test]
     fn method_completion_infers_binding_receiver_type() {
         // `xs.` where `xs` is a live list binding → list methods, not str ops.
         let env = Env::root();
-        env.declare("xs", Value::List(vec![Value::Int(1), Value::Int(2)]), false);
+        declare(
+            &env,
+            "xs",
+            Value::List(vec![Value::Int(1), Value::Int(2)]),
+            false,
+        );
         let mut c = completer_with(env);
         let cs = cands(&mut c, "xs.");
         assert!(
@@ -1022,7 +504,7 @@ mod tests {
 
         // A str binding narrows to str methods.
         let env2 = Env::root();
-        env2.declare("name", Value::Str("bob".into()), false);
+        declare(&env2, "name", Value::Str("bob".into()), false);
         let mut c2 = completer_with(env2);
         let cs2 = cands(&mut c2, "name.");
         assert!(
@@ -1041,10 +523,16 @@ mod tests {
         // (`upper`) and a list method (`where`) — the tell-tale of "not
         // narrowed". Every fallback case below must keep that full vocabulary.
         let env = Env::root();
-        env.declare("rec", Value::Record(shoal_value::Record::new()), false);
-        env.declare("xs", Value::List(vec![Value::Int(1)]), false);
+        declare(
+            &env,
+            "rec",
+            Value::Record(shoal_value::Record::new()),
+            false,
+        );
+        declare(&env, "xs", Value::List(vec![Value::Int(1)]), false);
         // A command binding: a type with no dedicated method table → union.
-        env.declare(
+        declare(
+            &env,
             "f",
             Value::CmdRef(Arc::new(shoal_ast::CmdCall {
                 head: "echo".into(),
@@ -1088,8 +576,9 @@ mod tests {
     #[test]
     fn head_candidates_include_callable_session_names_but_not_plain_vars() {
         let env = Env::root();
-        env.declare("mydata", Value::Int(3), false);
-        env.declare(
+        declare(&env, "mydata", Value::Int(3), false);
+        declare(
+            &env,
             "deploy",
             Value::CmdRef(Arc::new(shoal_ast::CmdCall {
                 head: "echo".into(),
@@ -1117,7 +606,7 @@ mod tests {
     #[test]
     fn expr_candidates_include_in_scope_variables() {
         let env = Env::root();
-        env.declare("myvar", Value::Int(1), false);
+        declare(&env, "myvar", Value::Int(1), false);
         let c = completer_at(Path::new("."));
         // Use the completer's own env for this assertion instead.
         let names_env = env.visible_names();
@@ -1169,6 +658,35 @@ mod tests {
     }
 
     #[test]
+    fn misspelled_directory_completion_replaces_the_argument_and_descends() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("example")).unwrap();
+        fs::write(dir.path().join("example/inside.txt"), b"").unwrap();
+        let mut completer = completer_at(dir.path());
+        let line = "ls exampel";
+        let suggestion = completer
+            .complete(line, line.len())
+            .into_iter()
+            .find(|suggestion| suggestion.value == "example/")
+            .expect("adjacent transposition should find the directory");
+        assert_eq!(suggestion.span.start, 3);
+        assert_eq!(suggestion.span.end, line.len());
+        assert!(!suggestion.append_whitespace);
+
+        let completed = format!(
+            "{}{}{}",
+            &line[..suggestion.span.start],
+            suggestion.value,
+            &line[suggestion.span.end..]
+        );
+        assert_eq!(completed, "ls example/");
+        assert_eq!(
+            cands(&mut completer, &completed),
+            vec!["example/inside.txt".to_string()]
+        );
+    }
+
+    #[test]
     fn fs_candidates_hide_dotfiles_unless_prefix_asks() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join(".hidden"), b"").unwrap();
@@ -1182,36 +700,92 @@ mod tests {
     fn path_names_cache_invalidates_on_mtime_change() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("toolone"), b"").unwrap();
+        fs::set_permissions(
+            dir.path().join("toolone"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        fs::write(dir.path().join("not-executable"), b"").unwrap();
+        fs::create_dir(dir.path().join("directory")).unwrap();
         let mut c = completer_at(Path::new("."));
-        // Seed the cache manually against our tempdir (bypassing $PATH so
-        // the test is hermetic), then verify a second scan after a new file
-        // appears picks it up rather than returning the cached snapshot.
-        let scan = |c: &mut ShoalCompleter, dir: &Path| -> Vec<String> {
-            let mtime = fs::metadata(dir).and_then(|m| m.modified()).ok();
-            let stale = match c.path_cache.get(dir) {
-                Some((cached, _)) => *cached != mtime,
-                None => true,
-            };
-            if stale {
-                let mut names = Vec::new();
-                if let Ok(entries) = fs::read_dir(dir) {
-                    for entry in entries.flatten() {
-                        if let Some(name) = entry.file_name().to_str() {
-                            names.push(name.to_string());
-                        }
-                    }
-                }
-                c.path_cache.insert(dir.to_path_buf(), (mtime, names));
-            }
-            c.path_cache.get(dir).unwrap().1.clone()
-        };
-        let first = scan(&mut c, dir.path());
+        // Scan the cache primitive directly so the test is hermetic rather
+        // than mutating process PATH. Non-executable files and directories are
+        // never command-head candidates.
+        let first = c.path_dir_names(dir.path());
         assert_eq!(first, vec!["toolone".to_string()]);
         std::thread::sleep(std::time::Duration::from_millis(1100));
         fs::write(dir.path().join("tooltwo"), b"").unwrap();
-        let mut second = scan(&mut c, dir.path());
+        fs::set_permissions(
+            dir.path().join("tooltwo"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let mut second = c.path_dir_names(dir.path());
         second.sort();
         assert_eq!(second, vec!["toolone".to_string(), "tooltwo".to_string()]);
+    }
+
+    #[test]
+    fn path_names_cache_revalidates_chmod_without_directory_mtime_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = dir.path().join("mode-tool");
+        fs::write(&tool, b"").unwrap();
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o644)).unwrap();
+        let mut c = completer_at(Path::new("."));
+        assert!(c.path_dir_names(dir.path()).is_empty());
+
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+        std::thread::sleep(PATH_CACHE_REVALIDATE + Duration::from_millis(25));
+        assert_eq!(c.path_dir_names(dir.path()), vec!["mode-tool".to_string()]);
+
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o644)).unwrap();
+        std::thread::sleep(PATH_CACHE_REVALIDATE + Duration::from_millis(25));
+        assert!(c.path_dir_names(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn path_cache_churn_clears_at_its_advisory_ceiling() {
+        let root = tempfile::tempdir().unwrap();
+        let mut completer = completer_at(Path::new("."));
+        for index in 0..MAX_PATH_CACHE_DIRS {
+            completer.path_dir_names(&root.path().join(format!("missing-{index}")));
+        }
+        assert_eq!(completer.discovery.cache_len(), MAX_PATH_CACHE_DIRS);
+
+        let current = root.path().join("current");
+        fs::create_dir(&current).unwrap();
+        fs::write(current.join("bounded-tool"), b"").unwrap();
+        fs::set_permissions(
+            current.join("bounded-tool"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        assert_eq!(
+            completer.path_dir_names(&current),
+            vec!["bounded-tool".to_string()]
+        );
+        assert_eq!(completer.discovery.cache_len(), 1);
+        assert!(completer.discovery.cache_contains(&current));
+    }
+
+    #[test]
+    fn path_names_follow_the_executing_session_not_the_client_process() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("remote-only-tool"), b"").unwrap();
+        fs::set_permissions(
+            dir.path().join("remote-only-tool"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let session_dirs = Arc::new(Mutex::new(Some(vec![dir.path().to_path_buf()])));
+        let mut c = completer_at(Path::new(".")).with_path_dirs(session_dirs.clone());
+
+        assert_eq!(c.path_names(), vec!["remote-only-tool".to_string()]);
+
+        // An explicit empty PATH is different from an omitted old-protocol
+        // projection and must not silently fall back to the client's PATH.
+        *session_dirs.lock().unwrap() = Some(Vec::new());
+        assert!(c.path_names().is_empty());
     }
 
     #[test]
@@ -1243,6 +817,36 @@ flags  = { short = { s = "short" } }
     }
 
     #[test]
+    fn callable_shadow_hides_adapter_flags_by_shared_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("tool.toml"),
+            r#"
+[cmd.tool]
+bin = "tool"
+params = { adapter_only = "bool" }
+"#,
+        )
+        .unwrap();
+        let (catalog, warnings) = AdapterCatalog::load_dir(dir.path());
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        let mut evaluator = shoal_eval::Evaluator::new(dir.path().into());
+        evaluator
+            .eval_program(&shoal_syntax::parse("fn tool(session_only: bool) { null }").unwrap())
+            .unwrap();
+        let completer = ShoalCompleter::new(
+            evaluator.env().clone(),
+            Arc::new(Mutex::new(PathBuf::from("."))),
+            vec![catalog],
+            vec!["tool".into()],
+        );
+        let flags = completer.flag_candidates("tool", "--");
+        assert!(flags.iter().any(|flag| flag == "--session_only"));
+        assert!(!flags.iter().any(|flag| flag == "--adapter_only"));
+    }
+
+    #[test]
     fn subsequence_match_is_a_superset_of_prefix_matching() {
         assert!(subsequence_match("shoal-eval", "sho"), "a real prefix");
         assert!(
@@ -1261,7 +865,7 @@ flags  = { short = { s = "short" } }
     #[test]
     fn fuzzy_false_restricts_to_strict_prefix_matches() {
         let fuzzy_env = Env::root();
-        fuzzy_env.declare("myservice", Value::Int(1), false);
+        declare(&fuzzy_env, "myservice", Value::Int(1), false);
         let fuzzy = ShoalCompleter::new(
             fuzzy_env,
             Arc::new(Mutex::new(PathBuf::from("."))),
@@ -1278,7 +882,7 @@ flags  = { short = { s = "short" } }
         );
 
         let strict_env = Env::root();
-        strict_env.declare("myservice", Value::Int(1), false);
+        declare(&strict_env, "myservice", Value::Int(1), false);
         let strict = ShoalCompleter::new(
             strict_env,
             Arc::new(Mutex::new(PathBuf::from("."))),
@@ -1306,7 +910,7 @@ flags  = { short = { s = "short" } }
     #[test]
     fn case_insensitive_false_requires_exact_case() {
         let env = Env::root();
-        env.declare("MyThing", Value::Int(1), false);
+        declare(&env, "MyThing", Value::Int(1), false);
         let c = ShoalCompleter::new(
             env,
             Arc::new(Mutex::new(PathBuf::from("."))),
@@ -1320,7 +924,7 @@ flags  = { short = { s = "short" } }
 
     /// `completion.max_results` caps the candidate list (site/content/internals/configuration-reference.md).
     #[test]
-    fn max_results_caps_the_candidate_list() {
+    fn max_results_bounds_discovery_before_reedline_assembly() {
         let dir = tempfile::tempdir().unwrap();
         for i in 0..10 {
             fs::write(dir.path().join(format!("file{i}.txt")), b"").unwrap();
@@ -1333,8 +937,63 @@ flags  = { short = { s = "short" } }
         )
         .configure(true, true, 3);
         let names = c.fs_candidates("");
-        assert_eq!(names.len(), 10, "fs_candidates itself is uncapped");
+        assert_eq!(
+            names.len(),
+            3,
+            "live filesystem discovery must not materialize beyond the configured result cap"
+        );
         let suggestions = finish(names, 0, 0, 3);
         assert_eq!(suggestions.len(), 3, "finish() truncates to max_results");
+    }
+
+    #[test]
+    fn production_completion_ownership_stays_decomposed() {
+        let root = include_str!("completer.rs");
+        let production_root = root
+            .split_once("\n#[cfg(test)]\nmod tests")
+            .expect("inline completion tests remain after production")
+            .0;
+        let candidates = include_str!("completer/candidates.rs");
+        let context = include_str!("completer/context.rs");
+        let discovery = include_str!("completer/discovery.rs");
+        let filesystem = include_str!("completer/filesystem.rs");
+        let inference = include_str!("completer/inference.rs");
+        let matching = include_str!("completer/matching.rs");
+
+        assert!(
+            production_root.lines().count() <= 180,
+            "completion root must remain Reedline orchestration"
+        );
+        assert!(candidates.lines().count() <= 220);
+        assert!(context.lines().count() <= 190);
+        assert!(discovery.lines().count() <= 230);
+        assert!(filesystem.lines().count() <= 140);
+        assert!(inference.lines().count() <= 150);
+        assert!(matching.lines().count() <= 100);
+
+        for forbidden in [
+            "fs::read_dir",
+            "Lexer::new",
+            "resolve_command_source",
+            "method_names",
+            "PATH_CACHE_REVALIDATE: Duration",
+        ] {
+            assert!(
+                !production_root.contains(forbidden),
+                "responsibility `{forbidden}` leaked back into the root"
+            );
+        }
+
+        let complete = production_root
+            .split_once("fn complete")
+            .expect("Reedline completion entrypoint")
+            .1
+            .split_once("\n    }\n}")
+            .expect("completion impl boundary")
+            .0;
+        assert!(
+            complete.lines().count() <= 35,
+            "Reedline entrypoint should only classify and dispatch"
+        );
     }
 }

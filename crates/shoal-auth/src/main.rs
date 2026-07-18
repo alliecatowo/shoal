@@ -1,5 +1,4 @@
 use shoal_auth::TokenStore;
-use std::path::PathBuf;
 fn main() {
     if let Err(e) = run() {
         eprintln!("shoal-token: {e}");
@@ -9,15 +8,18 @@ fn main() {
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut a = std::env::args().skip(1);
     let cmd = a.next().ok_or("usage: shoal-token create|list|revoke")?;
-    let path = std::env::var_os("SHOAL_TOKEN_STORE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::var_os("XDG_STATE_HOME")
-                .map(PathBuf::from)
-                .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("shoal/tokens.json")
-        });
+    if cmd == "-h" || cmd == "--help" {
+        println!(
+            "Shoal capability tokens\n\nUsage:\n  shoal-token create PRINCIPAL [PROFILE] [--cap CAP] [--ttl SECONDS]\n  shoal-token list\n  shoal-token revoke ID"
+        );
+        return Ok(());
+    }
+    if cmd == "-V" || cmd == "--version" {
+        println!("shoal-token {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    let paths = shoal_paths::ShoalPaths::discover();
+    let path = paths.token_store(paths.state_dir());
     let mut s = TokenStore::open(path)?;
     match cmd.as_str() {
         "create" => {
@@ -51,7 +53,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("created {} (secret shown once)", m.id)
         }
         "list" => {
-            for m in s.list() {
+            for m in s.try_list()? {
                 println!(
                     "{}\t{}\t{}\t{}",
                     m.id,

@@ -1,0 +1,10 @@
+#!/usr/bin/env shoal
+# Apply formatting, architectural, and Clippy policy.
+
+let locks = (reef lock)
+let cargo_lock = locks.find(.name == "cargo")
+assert(cargo_lock != null && cargo_lock.locked, "CI could not lock cargo through Reef: {locks}")
+run("cargo", "fmt", "--all", "--check")
+run("scripts/source-audit.shl")
+run("cargo", "clippy", "--workspace", "--all-targets", "--locked", "--", "-D", "warnings")
+echo "Rust lint gate passed"

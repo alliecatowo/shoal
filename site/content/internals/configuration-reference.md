@@ -59,6 +59,12 @@ Malformed TOML, filesystem errors other than not-found, type mismatches, malform
 values, unsupported versions, and invalid semantic values are hard errors. Unknown keys are
 warnings; they are not silently treated as valid future fields.
 
+Each layered file is a regular-file control-plane input capped at 1 MiB and 64 levels of TOML
+bracket/inline-table nesting. Reads retain at most the limit plus one sentinel byte, so a sparse file
+or a file that grows during startup cannot force an unbounded allocation before rejection. Files
+must be UTF-8; symlinks to regular files remain supported. Each recognized string environment
+override is capped at 64 KiB before it is copied into the merged TOML tree.
+
 ## Discovery and precedence
 
 `LoadOptions::discover(cwd)` proposes these layers, in ascending precedence:
@@ -75,8 +81,8 @@ warnings; they are not silently treated as valid future fields.
 Project discovery stops at the **first** matching ancestor. It does not combine every ancestor
 `.shoal.toml`, and it does not stop at a Git root or home-directory boundary. For a working
 directory `/a/b/c`, the search is `/a/b/c/.shoal.toml`, `/a/b/.shoal.toml`,
-`/a/.shoal.toml`, then `/.shoal.toml`. This differs from Reef's multi-scope tool chain and from the
-prompt loader's current-directory-only project prompt layer.
+`/a/.shoal.toml`, then `/.shoal.toml`. This differs from Reef's multi-scope tool chain; the prompt
+loader deliberately calls this same nearest-project selector.
 
 
 ### Merge semantics
@@ -117,7 +123,7 @@ The following is the exact public `Config` tree. “Default” means the value p
 | `history.dedup` | boolean | `true` | exclude an entry identical to its immediate predecessor |
 | `history.ignore` | string array | empty | host-matched exclusion patterns |
 | `history.ignore_space` | boolean | `true` | exclude lines beginning with a space |
-| `render.width` | optional unsigned integer | absent | requested output width |
+| `render.width` | optional positive integer | absent | output/prompt/pager width override; absent follows the live terminal |
 | `render.color` | boolean | `true` | ANSI color permission |
 | `render.paging` | string enum | `"never"` | `never` or interactive `auto` paging |
 | `render.pager` | optional string | absent | explicit pager command |
@@ -128,8 +134,8 @@ The following is the exact public `Config` tree. “Default” means the value p
 | `kernel.enabled` | boolean | `true` | intended resident-kernel gate |
 | `kernel.session` | string | `"default"` | intended named kernel session |
 | `adapters.dirs` | path-string array | empty | extra adapter directories, in order |
-| `journal.enabled` | boolean | `true` | intended journal gate |
-| `journal.state_dir` | optional path string | absent | intended journal state root |
+| `journal.enabled` | boolean | `true` | language-facing statement history/undo gate; never disables mandatory kernel security audit |
+| `journal.state_dir` | optional path string | absent | local language journal/jump and embedded-kernel state root |
 | `leash.policy` | optional path string | absent | intended Leash policy file |
 | `init.files` | path-string array | empty | interactive startup scripts, in order |
 | `completion.fuzzy` | boolean | `true` | enable fuzzy ranking |
@@ -309,7 +315,7 @@ currently accepts and snapshots the field without applying its intended behavior
 | `render.color` | active | active | applied before diagnostics and rendering |
 | `render.paging`, `pager` | active for final REPL result | not used | pager is explicitly interactive-only |
 | `render.echo` | active | active | host-specific fallback: `all` interactive, `quiet` noninteractive |
-| `render.width` | not consumed | not consumed | **inert typed field**; renderers use terminal/context width |
+| `render.width` | active | active | one resolved override feeds block rendering, prompt context, protocol width, wrapping, and paging; absent follows terminal resize |
 | all `history.*` | active | no history | wraps Reedline history with exclusions/dedup |
 | `editor.mode`, `bracketed_paste`, `keybindings` | active | not applicable | edit-mode and binding builder consume them |
 | `adapters.dirs` | active | active | bundled adapters load first, configured directories later |
@@ -319,9 +325,9 @@ currently accepts and snapshots the field without applying its intended behavior
 | resolved config snapshot | active | active | exposed to language `config` methods |
 | `prompt.template` | parallel path | not applicable | rich prompt loader independently reads and migrates it |
 | `reef.*` | parallel path | parallel path | Reef reparses raw user config with its own schema |
-| `kernel.enabled`, `kernel.session` | not consumed | not consumed | **inert in local `shoal`**; local execution embeds an evaluator |
-| `journal.enabled`, `journal.state_dir` | not honored | no journal | **inert**; REPL opens default journal unconditionally |
-| `leash.policy` | not consumed | not consumed | **inert security field**; local host does not load/set policy |
+| `kernel.enabled`, `kernel.session` | active | not consumed | default interactive execution uses an isolated private kernel; `false` selects local evaluation; session names that private principal-owned Session |
+| `journal.enabled`, `journal.state_dir` | active | no language journal | `enabled` gates language history/undo only; state root feeds local storage and private kernel; kernel security audit remains mandatory |
+| `leash.policy` | active | active | shared bootstrap loads configured policy before evaluation; malformed configured policy fails startup rather than degrading permissively |
 
 ```mermaid
 flowchart TD
@@ -332,10 +338,11 @@ accDescr: Shows the components and relationships described in Host wiring matrix
   Config --> Bindings["aliases / env / ConfigSnapshot"]
   Config --> Adapters["adapter search dirs"]
   Config --> Init["interactive init files"]
-  Config -. "not wired" .-> Kernel["resident kernel settings"]
-  Config -. "not wired" .-> Journal["journal gate / state dir"]
-  Config -. "not wired" .-> Leash["policy load"]
-  Config -. "not wired" .-> Width["render width"]
+  Config --> Kernel["private interactive kernel settings"]
+  Config --> Journal["language history gate / effective state root"]
+  Kernel --> Audit["mandatory security / approval / event audit"]
+  Config --> Leash["fail-closed policy load"]
+  Config --> Width["render / prompt / pager width"]
   Files["raw config files"] --> Prompt["independent rich prompt loader"]
   Files --> Reef["independent Reef parser"]
 ```
@@ -347,10 +354,11 @@ config snapshot, seeds aliases and environment, adds user Reef config, opens jou
 loads adapters, evaluates init files, then builds completion, keybindings, history, and prompt. A
 change on disk is not automatically reloaded into an existing session.
 
-The journal behavior is especially important: interactive startup currently opens the default
-state directory regardless of `journal.enabled` and ignores `journal.state_dir`. Noninteractive
-evaluation does not install a journal. The schema therefore promises configurability that the host
-does not yet implement.
+The journal distinction is important: `journal.enabled` controls the language-facing statement
+journal behind `history`, `journal`, and `undo`. It does not and cannot disable the durable kernel
+security/approval/event audit required for fail-closed authorization. `journal.state_dir` selects
+the local statement/jump store and the private embedded kernel's state root; relative paths resolve
+from startup cwd. Noninteractive evaluation does not install a language journal.
 
 ### Noninteractive assembly
 
@@ -365,13 +373,14 @@ The host serializes the complete typed `Config` to JSON and converts that JSON i
 data for `config.get` and `config.all`. This is a startup snapshot, not a live facade over files or
 environment.
 
-That snapshot exposes inert fields too. A script can observe `config.journal.enabled = false` while
-the interactive host has already opened its journal, or see a Leash path that was never loaded. The
-value accurately describes the resolved schema object but not necessarily effective host behavior.
-Internal diagnostics should eventually expose both `configured` and `effective` state.
+The snapshot's journal gate describes language history, not the kernel's mandatory security audit.
+`render.width` reflects an active override; when absent, the host deliberately follows the current
+terminal width. `shoal doctor` reports effective state root, language-history state, width source,
+and the mandatory audit distinction.
 
-Child evaluators are a second consistency problem. Several child construction paths do not inherit
-the parent's config snapshot at all; others also omit Reef, event bus, or Leash state. See
+Production child evaluators now build through one audited child context and inherit the parent's
+config port/snapshot together with Reef, event bus, filesystem, cancellation, and Leash state. The
+outer statement deliberately owns journaling rather than creating implicit nested rows. See
 [Evaluator state and host injection](@/internals/evaluator-state.md) and
 [Security and authority propagation](@/internals/security-threat-model.md).
 
@@ -383,7 +392,7 @@ host loader assembles these layers:
 1. `/etc/shoal/shoal.toml`'s `[prompt]` table;
 2. user `shoal.toml`'s `[prompt]` table;
 3. user `prompt.toml` as a prompt-root document;
-4. **only** `cwd/.shoal.toml`'s `[prompt]` table, without walking ancestors;
+4. the nearest ancestor `.shoal.toml`'s `[prompt]` table, using core project discovery;
 5. prompt-specific environment overrides.
 
 The rich schema supports left/right/continuation formats, transient mode, rendering budgets,
@@ -448,13 +457,9 @@ the behavioral test must demonstrate the denied/redirected/disabled operation.
 
 | Priority | Gap | Why it matters | Minimum credible repair |
 |---:|---|---|---|
-| P0 | `leash.policy` is accepted but local hosts do not load it | a security-looking setting can create false assurance | load before any evaluation; fail closed on configured-policy errors; add denial integration tests |
-| P0 | child evaluators can lose config and authority state | parent and child observe/enforce different worlds | one audited child-context constructor with inheritance tests |
-| P1 | journal enable/path settings are inert | retention and state-location policy are misleading | honor both during REPL assembly; expose effective path |
 | P1 | rich prompt and core config use different project discovery | prompt can visibly disagree with `config.all` | share a discovered layer set or explicitly separate files |
 | P1 | Reef user config is reparsed independently | schema and precedence drift can surprise users | share raw parsed layers or expose a structured handoff |
-| P2 | `render.width` is inert | configuration claims an output constraint that is ignored | thread an effective width through renderer entry points |
-| P2 | kernel settings are inert in local `shoal` | users cannot infer whether evaluation is local/resident | either wire a kernel-client mode or move settings to kernel client config |
+| P2 | interactive and noninteractive kernel semantics differ | users may assume `-c`/scripts join the private REPL kernel path | keep `kernel.enabled/session`, `--standalone`, and surface boundaries explicit in CLI/config docs |
 | P2 | alias/env name validation differs from source injection | accepted config can fail later | validate exact consumer grammar and environment-name rules |
 | P3 | no live reload | long sessions retain stale configuration | define transactional reload and which state may change safely |
 
@@ -462,6 +467,7 @@ the behavioral test must demonstrate the denied/redirected/disabled operation.
 
 - An absent configuration is a complete, usable configuration.
 - Missing optional files are not errors; unreadable present files are.
+- Oversized, non-UTF-8, non-regular, or excessively nested present files fail before merging.
 - A file's type error cannot be hidden by a later layer.
 - Tables merge deeply; scalars and arrays replace.
 - Only the nearest ancestor project config participates.

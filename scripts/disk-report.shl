@@ -1,0 +1,35 @@
+#!/usr/bin/env shoal
+# Explain filesystem free space and the repository's largest build/state trees.
+
+let filesystem_result = run("df", "-Pk", ".")
+assert(filesystem_result.ok, "df failed: {filesystem_result.stderr}")
+let filesystem_fields = filesystem_result.out.str().lines().last().words()
+assert(filesystem_fields.len() >= 6, "unexpected df output: {filesystem_result.out}")
+
+let requested = if (args.is_empty()) {
+  ["target", "fuzz/target", ".git", "site/public"]
+} else {
+  args.map(.str())
+}
+
+let trees = requested.map(name => {
+  let target = path(name)
+  if (!target.exists) {
+    {path: target, exists: false, kib: 0, bytes: 0}
+  } else {
+    let usage = run("du", "-sk", target)
+    assert(usage.ok, "du failed for {target}: {usage.stderr}")
+    let kib = usage.out.str().words().first().parse_int()
+    {path: target, exists: true, kib: kib, bytes: kib * 1024}
+  }
+}).sort_by(row => -row.bytes)
+
+{
+  filesystem: filesystem_fields[0],
+  mounted_on: filesystem_fields[5],
+  total_kib: filesystem_fields[1].parse_int(),
+  used_kib: filesystem_fields[2].parse_int(),
+  available_kib: filesystem_fields[3].parse_int(),
+  capacity_percent: filesystem_fields[4].replace("%", "").parse_int(),
+  repository_trees: trees,
+}

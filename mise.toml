@@ -1,2 +1,101 @@
 [tools]
-rust = "latest"
+rust = "1.97.0"
+actionlint = "1.7.12"
+zola = "0.22.1"
+"cargo:cargo-audit" = "0.22.2"
+"cargo:cargo-fuzz" = "0.13.2"
+
+[tasks.check]
+description = "Run the exact local CI/release gate"
+depends = ["bootstrap:debug"]
+run = "target/debug/shoal scripts/check.shl"
+
+[tasks."bootstrap:debug"]
+description = "Compile the Shoal executable needed to run repository automation"
+hide = true
+run = "cargo build -p shoal --locked"
+
+[tasks."bootstrap:release"]
+description = "Compile the exact optimized workspace artifacts used for installation"
+hide = true
+run = "cargo build --workspace --release --locked"
+
+[tasks.install]
+description = "Build and transactionally install binaries, man pages, and completions"
+depends = ["bootstrap:release"]
+run = "target/release/shoal scripts/install.shl"
+
+[tasks."install:clean"]
+description = "Remove the managed installed set, then transactionally reinstall it"
+depends = ["bootstrap:release"]
+run = "target/release/shoal scripts/install.shl --clean"
+
+[tasks."install:check"]
+description = "Verify installed binaries, man pages, and completions"
+depends = ["bootstrap:release"]
+run = "target/release/shoal scripts/install.shl --check"
+
+[tasks."install:uninstall"]
+description = "Remove only the managed Shoal installation artifacts"
+depends = ["bootstrap:debug"]
+run = "target/debug/shoal scripts/install.shl --uninstall"
+
+[tasks."install:test"]
+description = "Exercise install/check/rollback/clean/uninstall in a temporary prefix"
+depends = ["bootstrap:release"]
+run = "target/release/shoal scripts/install-test.shl"
+
+[tasks."reef:lock"]
+description = "Resolve and lock the repository toolchain through Reef"
+depends = ["bootstrap:debug"]
+run = "target/debug/shoal -c 'reef lock'"
+
+[tasks."help:audit"]
+description = "Execute every binary help/version contract and validate man pages"
+depends = ["bootstrap:debug"]
+run = "target/debug/shoal scripts/help-audit.shl"
+
+[tasks."audit:docs"]
+description = "Validate every internal documentation link through Shoal"
+depends = ["bootstrap:debug"]
+run = "target/debug/shoal scripts/doc-link-audit.shl"
+
+[tasks."report:workspace"]
+description = "Report crate, source, target, and dependency counts"
+depends = ["bootstrap:debug"]
+run = "target/debug/shoal scripts/workspace-report.shl"
+
+[tasks."report:conformance"]
+description = "Report normative language corpus coverage"
+depends = ["bootstrap:debug"]
+run = "target/debug/shoal scripts/conformance-report.shl"
+
+[tasks."report:dependencies"]
+description = "Report direct dependency edges across workspace crates"
+depends = ["bootstrap:debug"]
+run = "target/debug/shoal scripts/dependency-report.shl"
+
+[tasks."report:disk"]
+description = "Report filesystem capacity and repository disk consumers"
+depends = ["bootstrap:debug"]
+run = "target/debug/shoal scripts/disk-report.shl"
+
+[tasks."report:churn"]
+description = "Report the hottest files in recent Git history"
+depends = ["bootstrap:debug"]
+run = "target/debug/shoal scripts/git-churn-report.shl"
+
+[tasks."report:debt"]
+description = "Inventory explicit TODO/FIXME/HACK debt"
+depends = ["bootstrap:debug"]
+run = "target/debug/shoal scripts/debt-report.shl"
+
+[tasks."report:dashboard"]
+description = "Show a fast operational dashboard for this checkout"
+depends = ["bootstrap:debug"]
+run = "target/debug/shoal scripts/repo-dashboard.shl"
+
+[tasks."release:ready"]
+description = "Run the strict Git/Cargo/Reef/man-page release preflight"
+depends = ["bootstrap:debug"]
+run = "target/debug/shoal scripts/release-readiness.shl --strict"

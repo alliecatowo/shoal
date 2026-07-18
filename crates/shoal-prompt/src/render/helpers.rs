@@ -16,19 +16,34 @@ pub(super) fn collapse_home(ctx: &PromptContext, home_symbol: &str) -> String {
     ctx.cwd.to_string_lossy().into_owned()
 }
 
-/// Keep the last `n` path segments, prefixing an ellipsis when more existed.
-pub(super) fn truncate_path(path: &str, n: usize, ellipsis: &str) -> String {
+/// Retain `n` path segments according to `style`, inserting one ellipsis for
+/// the removed run. `start` removes the prefix, `end` removes the suffix, and
+/// `middle` preserves both ends (favoring the more useful trailing half).
+pub(super) fn truncate_path(path: &str, n: usize, ellipsis: &str, style: &str) -> String {
     let comps: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    let leading_slash = path.starts_with('/');
     if comps.len() <= n {
         return path.to_string();
     }
-    let kept = &comps[comps.len() - n..];
-    // Truncated: the ellipsis stands in for the elided prefix. `leading_slash`
-    // is intentionally dropped here — a truncated absolute path shows the
-    // ellipsis, not the original root.
-    let _ = leading_slash;
-    format!("{ellipsis}/{}", kept.join("/"))
+    match style {
+        "end" => {
+            let prefix = if path.starts_with('/') { "/" } else { "" };
+            format!("{prefix}{}/{ellipsis}", comps[..n].join("/"))
+        }
+        "middle" if n > 1 => {
+            let head = n / 2;
+            let tail = n - head;
+            let prefix = if path.starts_with('/') { "/" } else { "" };
+            format!(
+                "{prefix}{}/{ellipsis}/{}",
+                comps[..head].join("/"),
+                comps[comps.len() - tail..].join("/")
+            )
+        }
+        "start" | "middle" => {
+            format!("{ellipsis}/{}", comps[comps.len() - n..].join("/"))
+        }
+        _ => unreachable!("truncate style is validated by Renderer::new"),
+    }
 }
 
 pub(super) fn truncate_branch(branch: &str, n: usize, symbol: &str) -> String {
@@ -83,8 +98,16 @@ mod tests {
 
     #[test]
     fn truncate_path_keeps_last_n() {
-        assert_eq!(truncate_path("~/a/b/c/d", 2, "…"), "…/c/d");
-        assert_eq!(truncate_path("~/a", 3, "…"), "~/a");
+        assert_eq!(truncate_path("~/a/b/c/d", 2, "…", "start"), "…/c/d");
+        assert_eq!(truncate_path("~/a", 3, "…", "middle"), "~/a");
+    }
+
+    #[test]
+    fn truncate_path_styles_preserve_the_selected_edges() {
+        let path = "/work/a/b/c/d";
+        assert_eq!(truncate_path(path, 3, "…", "start"), "…/b/c/d");
+        assert_eq!(truncate_path(path, 3, "…", "end"), "/work/a/b/…");
+        assert_eq!(truncate_path(path, 3, "…", "middle"), "/work/…/c/d");
     }
 
     #[test]

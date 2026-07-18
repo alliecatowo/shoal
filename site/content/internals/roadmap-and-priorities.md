@@ -12,6 +12,11 @@ audience = "Maintainers, reviewers, and project planners"
 wide = true
 +++
 
+Active remediation work is tracked task-by-task in the
+[hardening roadmap](@/internals/hardening-roadmap.md), which retires every finding of the
+[2026-07-16 deep audit](@/internals/deep-audit-2026-07-16.md); this page keeps the wider
+dependency-ordered picture.
+
 This roadmap starts from the [implementation status ledger](../implementation-status/), not the
 historical feature waves. Its job is to order work so that new surface area is built on explicit
 identity, authority, bounds, and lifecycle contracts. It contains no calendar promise: priorities
@@ -95,9 +100,8 @@ Building it before those contracts would multiply later migration work.
 | Reef strictness and cache identity | P2 | Reef/eval | host builder | changes/errors cannot remain silently stale in strict mode |
 | configuration honesty | P2 | config/hosts/prompt | host builder | every accepted field is consumed or rejected/deprecated |
 | pin leases and durability health | P2 | journal/hosts | journal identity | pins have owners; write failure becomes observable |
-| method metadata and function type soundness | P2 | value/eval/syntax | none | bidirectional method parity and uniform annotations |
 | complete effectful ports | P2 | value/eval | child context | evaluator effect paths stop reaching ambient host directly |
-| stream stdin and wire cursor | P3 | value/eval/proto/kernel/MCP | P0/P1 bounds/lifecycle | bounded pull/cancel/end/error contract is live |
+| wire stream cursor | P3 | value/proto/kernel/MCP | P0/P1 bounds/lifecycle | bounded pull/cancel/end/error contract is live; local stdin feed is already bounded |
 | unified task runtime | P3 | eval/exec/kernel | child context/identity | local and kernel control the same owned task abstraction |
 | semantic editor index | P3 | syntax/eval/LSP | host builder/language metadata | symbols understand modules/scopes and UTF-16 positions |
 | prompt producer completion | P3 | `shoal`, prompt | config honesty | context fields are real or removed; slow data is deferred |
@@ -107,32 +111,28 @@ Building it before those contracts would multiply later migration work.
 
 ## P0 — close authority and input-boundary defects
 
-### P0.0 Authenticate approval and journal reads; fix plan identity
+### P0.0 Authenticate approval and journal reads; fix plan identity — baseline complete
 
-**Problem.** `cap.request` is one of the router's unattached methods. Its handler receives no
-`Attachment`, looks up a global stored plan by ref, evaluates the plan under the plan owner's policy,
-and sets `stored.approved = true`. It never authenticates or authorizes the caller as an approver.
-`journal.query` is also routed without attachment and returns rows from the shared journal without
-caller scoping. The socket is Unix-user protected, but bearer-token principals within that user are
-presented as authority boundaries elsewhere.
+**Resolved baseline.** `cap.request` and `journal.query` require attachments; journal authorization
+also requires the attached principal's explicit `JournalRead` policy grant before query decoding.
+Journal pages are hard-capped and exact-owner scoped. Approval requires a distinct authorized approver by default,
+binds requester/approver/source/plan/Session/scope into a durable audit row, and is consumed once.
+Plan refs use a full caller/content-bound digest plus a unique object suffix, so equal-effect and
+identical repeated plans cannot overwrite one another. Public tokenless clients are restricted and
+cannot assert local-human presence.
 
-Plan identity compounds the issue. `Plan::new` hashes `(effects, reversibility, estimates)` and uses
-only 16 hex characters. It excludes source, session, and principal. The kernel stores one
-`StoredPlan` per ref in a process-global `HashMap`, so two equal-effect plans overwrite each other
-even when their source or owner differs. Later apply/approved-exec checks prevent a simple source
-swap, but refs are not stable owner-scoped plan identities and an old plan can be invalidated by a
-new one.
-
-**Design.** Require an attached authenticated caller for journal reads and capability requests.
-Define an explicit approver capability/profile; ordinary plan ownership is not automatically approval
-authority. Scope journal rows by caller policy, with a separate audited grant for cross-principal
-inspection. Make stored plan IDs unique and opaque (for example a random nonce) or hash a canonical
-record that includes source/AST digest, owner/session identity, and a collision-safe full digest.
-Keep content identity separate from object identity when both are useful.
+**Remaining design.** Method attachment classes are centralized in the dispatcher and checked
+against the routed method inventory, so a new stateful route is unreachable until classified. The
+optional same-UID peer-credential and mandatory-bearer modes are implemented, while configurable
+UID allowlists/separate listener roles remain. Continue to evolve approver routing,
+expiration/reason metadata and cross-principal journal grants without weakening the existing
+exact-owner default. Journal-output `blob.get` and `journal` event reads/subscriptions share the
+direct query's `JournalRead` gate.
 
 **Acceptance tests.** Through raw kernel connections and MCP:
 
 - unattached `cap.request` and `journal.query` return `NOT_ATTACHED`;
+- an attachment without `JournalRead` cannot decode a query or read rows;
 - an attached non-approver cannot approve another principal's plan or query its rows;
 - an authorized supervisor can approve only the exact allowed owner/session/effect/source record;
 - two principals and two sources with identical effect sets receive independent stored plan IDs;
@@ -146,15 +146,14 @@ Keep content identity separate from object identity when both are useful.
 signatures make caller context mandatory for every state read/mutation. Protocol comments and tests
 agree with the router.
 
-### P0.1 One capability-complete child evaluator constructor
+### P0.1 One capability-complete child evaluator constructor — complete
 
-**Problem.** `spawn`, `parallel`, `on`, and `.shl` execution create evaluators through separate
-paths. They do not consistently inherit Leash, Reef state, configuration, ports, cancellation, and
-session-scoped facilities. The policy omission can turn a restricted parent into an unrestricted
-child.
+**Resolved.** `spawn`, parallel, channels, `.shl`, and stream producers now capture one typed child
+context and rebuild through one exhaustive constructor. It carries explicit principal/Leash, Reef,
+ports/config, echo, and cancellation capability without sharing arbitrary mutable evaluator state.
+Production-site inventory tests reject direct `Evaluator::new` at child factories.
 
-**Design.** Introduce a typed `EvaluatorContext` or `ChildProfile` owned by `shoal-eval`. It should
-carry explicit capabilities rather than clone arbitrary mutable evaluator state.
+The implemented shape follows this design intent:
 
 ```rust
 // Shape, not a pinned API.
@@ -184,7 +183,8 @@ accidentally widen capabilities.
 - fake `Fs`, `Exec`, `Clock`, opener, secret, and config ports observe child operations;
 - cancellation reaches a process tree and a waiting stream;
 - child-local cwd/env mutation does not mutate the parent unless the construct promises it;
-- adding a new capability field causes a compile error or a single exhaustive builder update.
+- adding a new capability field requires one explicit child-inheritance audit and, when inherited,
+  one capture plus one exhaustively destructured builder update.
 
 **Exit.** No direct `Evaluator::new` remains at semantic child sites; a repository check enumerates
 and permits only composition-root construction. The security tests run through real `spawn`,
@@ -219,7 +219,14 @@ ID changes, support old clients through a versioned attach response or a deliber
 
 ### P0.3 Bounded frame ingestion and explicit raw retrieval
 
-**Problem.** Kernel and MCP readers call `read_line` before checking the 16 MiB cap. A peer can force
+**Status (2026-07-17): implemented.** Frame readers reject cap-plus-one during bounded ingestion.
+Before tree allocation, the shared request/response scanner also caps depth, node count, container
+width, decoded key bytes, and numeric-token bytes; outbound serialization uses the same limits.
+Raw values now use bounded `slice` pages and CAS blobs use byte `offset`/`length` pages, both with an
+8 KiB decoded-content wall and explicit continuation metadata. The adversarial suite covers resident
+and CAS values, exact boundaries, overflowed requests, owner denial, and MCP context size.
+
+**Original problem.** Kernel and MCP readers called `read_line` before checking the 16 MiB cap. A peer could force
 larger allocation with a newline-free frame. `value.get {format:"raw"}` returns full base64 without
 the ordinary 64 KiB elision clamp, and MCP forwards it.
 
@@ -255,45 +262,26 @@ configured policy cannot be read or parsed. The local REPL may offer a visible r
 through CLI and kernel startup. Attach/capability results must distinguish “policy allowed” from “OS
 dimension enforced.” No test may infer network containment when the backend is absent.
 
-### P0.5 Live token lifecycle and capability meaning
+### P0.5 Live token lifecycle — closed; capability wording remains informational
 
-**Problem.** The persistent kernel opens `tokens.json` once and keeps the resulting token vector in
-memory. The separate `shoal-token` command rewrites that file, but the kernel has no reload path. A
-new token fails until restart; an externally revoked token remains accepted until restart unless its
-already-loaded expiry passes. `PROFILE` and `--cap` values are returned in attach metadata but are not
-consumed by Leash or handler authorization.
+Token create/revoke now takes an exclusive fd lock, reloads fresh disk state inside the lock, and
+atomically replaces it. Validation takes a shared fd lock and reloads fresh state. The kernel
+revalidates every bearer-backed attachment before each request and clears it on revocation, expiry,
+corruption, or I/O/lock failure, so serving state changes without restart and fails closed.
 
-**Design.** Prefer kernel-owned create/list/revoke operations behind a local administrative authority,
-so mutation and validation share one serialized store. If file-based administration remains, add an
-interprocess lock, persisted generation, safe reload before validation or via a watcher, and a stated
-maximum revocation latency. A failed reload should fail closed for tokens changed since the last
-known-good generation without breaking already-established policy deliberately.
-
-Choose one semantic contract for profile/caps:
-
-1. make them enforced restrictions intersected with principal Leash and handler rights; or
-2. rename/version them as descriptive labels and remove capability wording from responses/CLI.
-
-They must never widen principal policy. Established connections also need a revocation decision:
-revocation may block only future attach, or it may terminate/recheck sessions; state that explicitly.
-
-**Acceptance tests.** Against a live kernel, create a token and attach without restart; revoke it and
-prove attach fails within the promised bound; exercise expiry; race two administrators without lost
-updates; corrupt/partially replace the file; and prove cap/profile strings do not grant an operation
-absent principal policy. If live connections are revoked, verify task/PTY/subscription cleanup.
-
-**Exit.** CLI output identifies serving versus disk generation, operational docs no longer require an
-unstated restart, and the status/attach schema says whether token attributes are enforced or merely
-descriptive.
+`PROFILE` and `--cap` values remain descriptive attach metadata. They never widen authority: the
+principal's Leash policy and explicit handler ownership checks decide access. Remaining work is
+naming/schema clarity if those metadata fields continue to use capability vocabulary.
 
 ## P1 — stabilize shared composition, protocol, and persistence
 
-### P1.1 Shared evaluator host builder
+### Delivered: shared evaluator host builder
 
-**Problem.** Local and kernel composition roots install different config, aliases, environment,
-init, adapters, Reef, journal/frecency, event, and prompt-related services.
+`shoal-host::SessionBootstrap` is the host-neutral builder for language-visible configuration.
+Named `Surface` profiles select echo, interactivity, and init eligibility; init eligibility is
+enforced inside the bootstrap API rather than left to a caller comment.
 
-**Design.** Create a host-neutral builder whose inputs are explicit:
+The implemented ownership split is explicit:
 
 | Input | Examples |
 |---|---|
@@ -305,74 +293,64 @@ init, adapters, Reef, journal/frecency, event, and prompt-related services.
 | interaction | terminal/PTY, opener, picker, prompt snapshot producer |
 | agent bridge | EventBus publisher, ref store, output limits |
 
-Define named profiles such as `InteractiveLocal`, `NonInteractiveLocal`, and `KernelSession`. A profile
-must state deliberate omissions; it must not rely on which setter a caller happened to remember.
+Local CLI owns terminal/editor/prompt/history presentation. Kernel owns journals, event forwarding,
+authenticated policy, and protocol refs. Only the inherited private-human TTY can select the
+interactive kernel profile and run init files.
 
-**Acceptance tests.** Feed the same temp config, adapter, Reef manifest, init file, cwd, env, and fake
-ports into local and kernel profiles. Assert equal language-visible bindings where parity is promised
-and exact, documented differences where it is not.
+Tests feed the same config env, aliases, adapter directories, and init input to every profile, plus
+real private and durable kernel processes, and assert both parity and deliberate omissions.
 
-**Exit.** Composition roots primarily parse CLI/protocol inputs and select a profile. Feature wiring
-does not require unrelated edits to two hand-built evaluator sequences.
+Composition roots now primarily parse CLI/protocol inputs, select a profile, and wire their owned
+transport/presentation services.
 
-### P1.2 Subscription ownership and bounded EventBus delivery
+### Delivered: subscription ownership and bounded EventBus delivery
 
-**Current split.** The kernel bus already has the right core backpressure shape: a 1,024-event replay
-ring, a 256-event queue per subscriber, one isolated writer thread, coalesced
-`{dropped, latest_seq}` summaries, and explicit queue closure on kernel unsubscribe/disconnect. Two
-adjacent paths still diverge:
+**Current split.** The kernel bus has a count/byte-bounded replay ring and subscriber queues, one
+isolated writer thread per connection, coalesced `{dropped, dropped_bytes, latest_seq}` summaries,
+and explicit queue closure on kernel unsubscribe/disconnect. The evaluator bus independently bounds
+channel identities, rings, subscribers, queues, and publishable retained values. MCP now multiplexes
+its bounded URI registry over one facade connection/thread. One adjacent coordination gap remains:
 
-- the evaluator's in-language EventBus uses unbounded `mpsc` subscribers and clones/sends while its
-  channel-map mutex is held;
-- MCP `resources/subscribe` creates a dedicated connection/thread, but
-  `resources/unsubscribe` has no facade-side registry or handle with which to stop it.
+- evaluator publication still clones/fans out while holding its global channel-map mutex.
 
-**Design.** Reuse the kernel semantics as the cross-bus vocabulary: owner, subscription ID,
-capacity, overflow/gap marker, cancellation token, and close/join path. Give MCP a URI-keyed registry
-whose unsubscribe closes the dedicated connection and joins or supervises its worker. Give language
-channels finite per-subscriber capacity without blocking a publisher; release the global map lock
-before fan-out where practical.
+**Delivered design.** MCP has a URI-keyed registry whose exact unsubscribe updates a single
+connection-owned worker; last-URI removal unsubscribes the kernel channel, and facade drop
+closes/joins the hub. Release the language bus's global map lock before fan-out where practical.
+Keep the bus implementations' different payload types and admission policies explicit.
 
-**Acceptance tests.** Preserve the existing kernel stalled-consumer, coalesced-gap, unsubscribe, and
-disconnect tests. Add equivalent language-bus pressure tests. Through real MCP stdio, prove that
-unsubscribe stops notifications and the forwarding worker, disconnect cleans all owned
-subscriptions, and repeated cycles return thread/task counts to baseline. A durable-channel gap must
-remain repairable through cursor read.
+**Evidence.** Kernel/language stalled-consumer, bounded-retention, coalesced-gap, unsubscribe, and
+disconnect tests remain. A live kernel with a two-connection ceiling admits the ordinary facade
+transport plus multiple resource URIs, repeated lifecycle churn retains no URI routes, and one event
+fans out to every exact URI mapped to its channel. Durable gaps remain repairable through cursor read.
 
-### P1.3 Parser-context and host parity
+### Delivered: parser-context and host parity
 
-**Problem.** Local parsing can use evaluator bindings through `ParseCtx`; kernel exec parses each
-request context-free. A name bound as a command/function can therefore classify differently.
+`Evaluator::parse_context` now owns the immutable value/callable snapshot. Local REPL and kernel
+plan/run parsing share it, while public parse/completion endpoints remain explicitly context-free.
 
-**Options.** Either expose an immutable parse snapshot from evaluator state, or make initial parsing
-binding-neutral and perform shared post-parse statement-head resolution. Do not place evaluator
-dependencies in the syntax leaf.
+This keeps evaluator dependencies out of the syntax leaf and prevents host copies from drifting.
 
-**Acceptance tests.** Build a table of aliases, functions, module exports, Reef tools, adapters,
-builtins, unknown names, and shadowing cases. Parse/evaluate each through local source, script,
-kernel, and MCP. Pin the same AST or the same documented semantic result.
+Tests cover value/callable partitioning and a real multi-request kernel value binding through both
+plan and run. Structural guards require each host to use the evaluator snapshot.
 
-### P1.4 Explicit journal execution identity
+### Delivered: explicit journal execution identity
 
-**Problem.** Kernel runs add a coarse whole-submission entry while the embedded evaluator adds
-per-statement rows to the same `entry` table. Code reconstructs journal-channel membership by
-inspecting AST shape because there is no row kind or parent relationship.
+Schema v2 now records `kind = exec|statement|approval` and `parent_id`. Journal-channel membership
+uses `kind=exec`, evaluator hosts receive exact completed IDs, and the kernel supplies its coarse
+execution ID as the parent of every statement row.
 
-**Design.** Add stable columns or a related execution table:
+Possible future metadata, if queries justify it:
 
 ```text
-kind       = submission | statement
-parent_id  = NULL for submission; submission id for statements
 ordinal    = statement order inside the submission
 host       = local | kernel | other stable vocabulary
 ```
 
-Choose whether local multi-statement source also receives a submission row. Queries should require
-or clearly default a granularity. Event payloads return IDs directly instead of discovering “latest.”
+Local multi-statement source continues to emit statement rows without a synthetic exec parent.
+Unfiltered queries deliberately return every kind; callers can select a granularity.
 
-**Migration.** Bump `PRAGMA user_version`; migrate in one transaction; preserve v1 rows. AST-shape
-classification may backfill known kernel coarse rows, but ambiguous historical rows must remain
-explicitly unknown rather than guessed as authoritative.
+**Migration.** v1 and unversioned legacy stores migrate transactionally. Known old producer shapes
+backfill kind; unreconstructable historical parent links remain null.
 
 **Acceptance tests.** Create a v1 fixture, migrate, execute multi-statement success/failure/crash
 cases, reopen, query each granularity, replay journal/transcript channels, and verify no duplicate or
@@ -398,16 +376,20 @@ changing only a comment: consumers need a transition story for any previously em
 ### P2.1 Reef strict discovery, cache identity, and probe authority
 
 Add a strict mode for scripts/agents that reports unreadable or malformed ancestor manifests,
-lock-write failure, unavailable providers, and ambiguous `latest` resolution. Decide whether a
-runner/hermetic-only manifest establishes scope even with no tools.
+lock-write failure, unavailable providers, and ambiguous `latest` resolution. Runner/hermetic-only
+manifests now establish scope without tool constraints.
 
-Replace cwd-only evaluator caching with a chain identity that includes discovered manifest paths and
-change tokens. Separate fast metadata caching from security-sensitive executable content identity.
-Version probes execute code; route them through the same Leash/spawn capability path before probing.
+The former cwd-only evaluator cache now uses a fixed-size metadata identity over every candidate and
+adjacent lock, including missing paths. Security-sensitive executable identity remains content-hashed.
+Version probes execute code. Evaluator integration now checks opaque authority and spawn pins before
+execution. Shipped probes and mise installers run through an injected bounded provider-command
+capability carrying the evaluator's environment, cancellation, and Leash filesystem sandbox; a
+requested sandbox remains fail-closed when OS enforcement is unavailable.
 
-**Exit tests.** Modify/create/delete a manifest while cwd stays fixed; replace an executable without
-changing its name; make the lock unwritable; present an empty-tools runner manifest; deny probe spawn;
-restart and prove deterministic lock/view behavior.
+**Evidence.** Same-cwd manifest/lock replacement, lock-write failure, executable/view replacement,
+tool-free runner/hermetic scopes, denied probe/fetch hooks, pinned-provider fetch selection, and live
+Landlock wrapping for allowed probes/installers are covered. Remaining exit evidence is restart-level
+deterministic lock/view behavior under strict mode.
 
 ### P2.2 Configuration contract honesty
 
@@ -431,30 +413,32 @@ Journaling intentionally avoids breaking command execution, but swallowed write 
 observable health channel, diagnostic counter, or degraded status. Align evaluator, kernel,
 history, and doctor on one state-root resolver.
 
-### P2.4 Method metadata parity and function type soundness
+### P2.4 Method metadata parity and function type soundness — implemented core
 
-Generate or validate metadata against dispatch in both directions. The initial fixture must catch the
-current table/range `.get` over-advertisement and bool `.str`/`.display` under-advertisement.
+Receiver metadata now matches table/range `.get` dispatch and boolean `.str`/`.display`, with
+behavioral fixtures in the owning value modules.
 
-Define one runtime annotation checker for expression calls, command-style calls, defaults, variadic
-arguments, closures, module functions, and return values. Decide whether annotations coerce or check
-exactly; encode the decision in corpus cases and diagnostics with spans.
+One runtime annotation checker now owns expression calls, command-style calls, defaults, variadic
+arguments, closures/module functions, and return values. Parameters perform the documented input
+coercions and then validate tags recursively; returns check exactly. The conformance matrix covers
+both surfaces, nested containers, invalid schemas, optionals, and failures with annotation spans.
 
-### P2.5 Complete effectful capability ports
+### P2.5 Complete effectful capability ports — implemented core
 
-Inventory direct `std::fs`, path metadata/canonicalization/existence, `OpenOptions`, and watcher calls
-inside evaluator/value effect paths. Extend `Fs` or introduce narrower traits for metadata, atomic
-write/append, and watch. Keep pure parsing/rendering code free of host traits.
+Language-visible reads, path metadata/canonicalization/existence, directory operations, and writes
+now cross `Fs`; watcher registration crosses `WatchPort`. The default watcher bounds its raw callback
+queue and reports loss explicitly. Structural and denial tests prohibit reacquiring ambient watcher
+authority in stream semantics.
 
-**Exit.** A denied or fake filesystem capability observes `.save`, `.append`, watch, canonicalization,
-and all builtins. A repository lint/check prevents new ambient filesystem calls in restricted modules.
+**Exit met.** Denied/fake capabilities observe `.save`, `.append`, watch/tail registration,
+canonicalization, and builtins. The source audit guards restricted production modules.
 
-### P2.6 Resolution and registry consolidation
+### P2.6 Resolution and registry consolidation — implemented core
 
-Create a typed command-resolution result for builtin, function, alias, adapter, Reef executable,
-ambient executable, and interpreter runner. Preserve current precedence through table-driven tests
-before refactoring. Keep the builtin identity registry in the leaf syntax crate; resolution itself
-belongs in evaluation and must not create a dependency cycle.
+`shoal-syntax` now owns the canonical source kinds, precedence table, and resolution function for
+builtin, function, alias, adapter, Reef/plugin, ambient executable, and interpreter paths. Evaluator
+dispatch/planning, completion, highlighting, and LSP consume the same result. Remaining product work
+is an optional user/agent-facing explanation trace; do not fork another precedence list to add it.
 
 ## P3 — complete deliberately scoped features
 
@@ -476,12 +460,12 @@ unbounded stream to simulate support.
 
 ### P3.2 Unified owned task runtime
 
-Evaluator jobs and kernel async tasks currently expose overlapping but different control. Define one
-task abstraction around owned process groups/async computation, state transitions, output refs,
-cancellation, suspend/resume capability, and terminal association.
-
-If suspend/resume cannot be provided for a task class, capability discovery should say so before the
-operation. Preserve the current honest `TASK_CONTROL_UNAVAILABLE` until a real backend exists.
+Evaluator jobs and kernel async tasks still expose overlapping but different value/identity models.
+Kernel cancellation epochs now own active capture/PTY process groups and provide real
+suspend/resume for process-backed work; evaluator-only work remains cooperatively cancellable but
+cannot be independently stopped while it owns the shared session evaluator. A future unified task
+abstraction should converge identity, output refs, terminal association, and capability discovery
+without pretending pure computation has an OS process-control backend.
 
 ### P3.3 Semantic editor index
 
@@ -632,7 +616,6 @@ fixtures so backward handling is explicit.
 
 | Track | Can run beside | Must coordinate with |
 |---|---|---|
-| method metadata fixtures | journal schema design, policy loader | function type work and completion generation |
 | journal v2 fixture tooling | prompt producer, LSP index exploration | kernel event replay and history CLI |
 | prompt deferred snapshot design | journal, wire reader | shared host/config builder |
 | Windows leaf-crate compile fixes | most Unix hardening | public path/value/proto representation decisions |

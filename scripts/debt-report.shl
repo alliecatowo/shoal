@@ -1,0 +1,29 @@
+#!/usr/bin/env shoal
+# Locate explicit TODO/FIXME/HACK debt with source line numbers.
+
+let roots = if (args.is_empty()) {
+  ["crates/**/*.rs", "scripts/**/*.shl", "site/content/**/*.md"]
+} else {
+  args.map(.str())
+}
+let files = roots.flat_map(pattern => glob(pattern).expand()).uniq().sort()
+let marker = re"(?i)(//|#|<!--)\s*(TODO|FIXME|HACK|XXX)\b"
+let repo_root = path(".").abs().display()
+let repo_prefix = "{repo_root}/"
+
+let findings = files.flat_map(file => file.read.lines().enumerate()
+  .where(pair => pair[1].match(marker) != null)
+  .map(pair => ({
+    path: file.display().replace(repo_prefix, ""),
+    line: pair[0] + 1,
+    text: pair[1].trim(),
+  })))
+
+{
+  files_scanned: files.len(),
+  findings: findings.len(),
+  by_area: findings.group_by(item => item.path.display().split("/").take(2).join("/"))
+    .map(group => ({area: group.key, findings: group.values.len()}))
+    .sort_by(row => -row.findings),
+  locations: findings,
+}

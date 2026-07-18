@@ -31,26 +31,32 @@ pub mod ports;
 pub mod render;
 
 mod env;
+#[cfg(unix)]
+mod fs_mutation;
 mod json;
 mod outcome;
+mod retained;
 mod stream;
 mod task;
 mod value_types;
 
 pub use ports::{
-    BytesLoad, Clock, ConfigPort, ConfigSnapshot, Fs, Opener, ReadSeek, SecretPort, StdClock,
-    StdFs, StdOpener,
+    BytesLoad, Clock, ConfigPort, ConfigSnapshot, Fs, FsEntryIdentity, FsFileSnapshot, Opener,
+    ReadSeek, SecretPort, StdClock, StdFs, StdOpener,
 };
 
 pub use env::{AssignError, Binding, Env};
-pub use json::{json_to_value, value_to_json};
+pub use json::{json_to_value, preflight_json_numbers, value_to_json};
 pub use methods::{method_names, methods_for};
 pub use outcome::OutcomeVal;
-pub use stream::{Pull, StreamVal, Upstream, collect_stream, drive_stream};
+pub use retained::{OpaqueHandling, RetainedError, RetainedLimits, retained_size};
+pub use stream::{
+    Pull, StreamGap, StreamGapReason, StreamVal, Upstream, collect_stream, drive_stream,
+};
 pub use task::{TaskShared, TaskVal};
 pub use value_types::{
-    CasBytesVal, ClosureVal, GlobVal, RangeVal, RegexVal, SecretVal, TimeVal, parse_duration,
-    parse_size, parse_time,
+    CasBytesVal, ClosureVal, GlobVal, RANGE_MATERIALIZATION_MAX_VALUES, RangeVal, RegexVal,
+    SecretVal, TimeVal, parse_duration, parse_size, parse_time,
 };
 
 use indexmap::IndexMap;
@@ -200,7 +206,8 @@ pub fn feed_bytes(v: &Value) -> Result<Vec<u8>, ErrorVal> {
         }
         // table / record / list-of-records (and any other list) → compact JSON.
         Value::Record(_) | Value::Table(_) | Value::List(_) => {
-            Ok(serde_json::to_vec(&value_to_json(v)).unwrap_or_default())
+            serde_json::to_vec(&value_to_json(v)?)
+                .map_err(|error| ErrorVal::new("custom", error.to_string()))
         }
         // outcome → its structured `.out` re-encoded per the rules above when
         // one exists, else its raw stdout bytes (site/content/internals/values-streams-execution.md:
@@ -210,13 +217,14 @@ pub fn feed_bytes(v: &Value) -> Result<Vec<u8>, ErrorVal> {
             Value::Str(_) => Ok(o.stdout.as_ref().clone()),
             structured => feed_bytes(&structured),
         },
-        // stream → site/content/internals/language-conformance-contract.md promises *incremental* feeding as items arrive, which
-        // needs evaluator/exec support (a live child stdin pipe); an honest
-        // error until that lands rather than a buffering fake.
-        Value::Stream(_) => Err(ErrorVal::type_error(
-            "feeding a stream to a command's stdin is not implemented yet",
+        // A stream's evaluator-owned `.feed(command)` path pumps items
+        // incrementally. This finite serializer deliberately cannot own or
+        // drive a stream by itself.
+        Value::Stream(_) => Err(ErrorVal::new(
+            "type_error",
+            "feed_bytes serializes finite values; drive a stream with stream.feed(command)",
         )
-        .with_hint("collect a bounded stream first: stream.collect().feed(cmd)")),
+        .with_hint("use the evaluator-owned `.feed(command)` stream sink")),
         // Deliberately never feedable (site/content/internals/values-streams-execution.md) → `feed_error`.
         Value::Secret(_) => Err(ErrorVal::new(
             "feed_error",
@@ -374,7 +382,26 @@ impl CallArgs {
 
 pub trait CallCtx {
     fn call_closure(&mut self, f: &Value, args: Vec<Value>) -> VResult<Value>;
+    /// Transfer a stream into a context-owned bounded producer pump.
+    ///
+    /// A true `.buffer(n)` must move the upstream and an owned evaluator into
+    /// a producer thread; the value crate cannot manufacture that evaluator.
+    /// Requiring the embedding to provide this seam keeps the public method
+    /// honest and makes missing ownership policy a compile-time error.
+    fn buffer_stream(&mut self, stream: StreamVal, capacity: usize) -> VResult<StreamVal>;
     fn cwd(&self) -> PathBuf;
+    /// The filesystem effect port backing the value-method write sinks —
+    /// `path`/`str`/`bytes` `.save`/`.append` and stream `.save`/`.append`.
+    /// Routing those writes through this port instead of `std::fs` directly is
+    /// what makes an in-process value write observable and deniable at the same
+    /// boundary the read paths (`path.read`, command redirects) already honor
+    /// (HR-C1/HR-C2, site/content/internals/effects-plans-security.md).
+    ///
+    /// This method is deliberately required rather than defaulting to
+    /// [`StdFs`]. A new embedding context must make its ambient-filesystem
+    /// decision explicitly; forgetting to wire the injected port is therefore
+    /// a compile error, not a silent grant of real-host write authority.
+    fn fs(&self) -> &dyn Fs;
 }
 
 #[cfg(test)]
@@ -490,11 +517,16 @@ mod tests {
     }
 
     #[test]
-    fn feed_bytes_stream_is_unimplemented_type_error() {
+    fn finite_feed_serializer_redirects_streams_to_the_owned_sink_without_consuming() {
         let s = StreamVal::from_iter("int", (0..2).map(|i| Ok(Value::Int(i))));
-        let e = feed_bytes(&Value::Stream(s)).unwrap_err();
+        let e = feed_bytes(&Value::Stream(s.clone())).unwrap_err();
         assert_eq!(e.code, "type_error");
-        assert!(e.hint.unwrap().contains("collect"));
+        assert!(e.msg.contains("stream.feed(command)"));
+        assert!(e.hint.unwrap().contains("evaluator-owned"));
+        assert!(
+            s.take_upstream().is_ok(),
+            "rejecting feed must not consume the stream"
+        );
     }
 
     #[test]
@@ -505,10 +537,10 @@ mod tests {
     #[test]
     fn env_scoping() {
         let root = Env::root();
-        root.declare("x", Value::Int(1), false);
+        root.declare("x", Value::Int(1), false).unwrap();
         let child = root.child();
         assert_eq!(child.get("x"), Some(Value::Int(1)));
-        child.declare("x", Value::Int(2), true);
+        child.declare("x", Value::Int(2), true).unwrap();
         assert_eq!(child.get("x"), Some(Value::Int(2)));
         assert_eq!(root.get("x"), Some(Value::Int(1)));
         assert_eq!(root.assign("x", Value::Int(9)), Err(AssignError::Immutable));
@@ -570,6 +602,6 @@ mod tests {
     #[test]
     fn json_uniform_objects_become_table() {
         let j: serde_json::Value = serde_json::from_str(r#"[{"a":1},{"a":2}]"#).unwrap();
-        assert!(matches!(json_to_value(&j), Value::Table(_)));
+        assert!(matches!(json_to_value(&j).unwrap(), Value::Table(_)));
     }
 }

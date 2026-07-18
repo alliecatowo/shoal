@@ -12,6 +12,129 @@
 
 use std::sync::LazyLock;
 
+mod metadata;
+pub use metadata::{
+    BuiltinCommandSpec, CommandFlagSpec, CommandParamSpec, CommandSubcommandSpec, ParamArity,
+    builtin_help, builtin_spec, builtin_specs,
+};
+
+/// The winning layer in command-head resolution, ordered from most local to
+/// most ambient. Consumers add their own payload (the bound value, adapter
+/// schema, executable path, or Reef report) after this common classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CommandSource {
+    SessionCallable,
+    BoundValue,
+    StructuredBuiltin,
+    SpecialBuiltin,
+    Script,
+    Runner,
+    Plugin,
+    Adapter,
+    External,
+}
+
+impl CommandSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SessionCallable => "session_callable",
+            Self::BoundValue => "bound_value",
+            Self::StructuredBuiltin => "structured_builtin",
+            Self::SpecialBuiltin => "special_builtin",
+            Self::Script => "script",
+            Self::Runner => "runner",
+            Self::Plugin => "plugin",
+            Self::Adapter => "adapter",
+            Self::External => "external",
+        }
+    }
+
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::SessionCallable => "an in-scope callable binding has highest precedence",
+            Self::BoundValue => "an eligible bare non-callable binding evaluates as a value",
+            Self::StructuredBuiltin => "the head is a structured Shoal builtin",
+            Self::SpecialBuiltin => "the head is a session or control builtin",
+            Self::Script => "the head names a .shl script",
+            Self::Runner => "explicit run selected an interpreter for a script target",
+            Self::Plugin => "a validated component plugin claims the unforced head",
+            Self::Adapter => "an adapter schema claims the unforced head",
+            Self::External => "no earlier layer won; resolve through Reef or PATH",
+        }
+    }
+}
+
+/// Canonical command precedence. This is intentionally executable data rather
+/// than prose so evaluator, planner, completion, highlighting, and LSP can pin
+/// their presentation and collision tests to the same order.
+pub const COMMAND_PRECEDENCE: &[CommandSource] = &[
+    CommandSource::SessionCallable,
+    CommandSource::BoundValue,
+    CommandSource::StructuredBuiltin,
+    CommandSource::SpecialBuiltin,
+    CommandSource::Script,
+    CommandSource::Runner,
+    CommandSource::Plugin,
+    CommandSource::Adapter,
+    CommandSource::External,
+];
+
+/// Dynamic facts needed to classify a parsed command head. The classifier is
+/// deliberately independent of evaluator/value/adapter crates so every command
+/// consumer can use it without introducing a dependency cycle.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CommandFacts {
+    pub session_callable: bool,
+    pub session_value: bool,
+    pub value_eligible: bool,
+    pub forced: bool,
+    /// `run(name, ...)` deliberately invokes an external command dynamically,
+    /// bypassing lexical, builtin, script, and adapter dispatch.
+    pub dynamic_run: bool,
+    /// The dynamic target is a script/path handled by runner or shebang logic.
+    pub runner: bool,
+    pub plugin: bool,
+    pub adapter: bool,
+}
+
+/// Resolve one command head against the canonical precedence table.
+///
+/// `^` preserves callable and builtin dispatch, but bypasses a non-callable
+/// lexical shadow and adapters. A bound non-callable value wins only for the
+/// argument/redirect/env-prefix-free shape that runtime can evaluate as a
+/// value.
+pub fn resolve_command_source(name: &str, facts: CommandFacts) -> CommandSource {
+    if facts.dynamic_run {
+        return if facts.runner {
+            CommandSource::Runner
+        } else {
+            CommandSource::External
+        };
+    }
+    if facts.session_callable {
+        return CommandSource::SessionCallable;
+    }
+    if facts.session_value && facts.value_eligible && !facts.forced {
+        return CommandSource::BoundValue;
+    }
+    if is_builtin(name) {
+        return CommandSource::StructuredBuiltin;
+    }
+    if is_special_head(name) {
+        return CommandSource::SpecialBuiltin;
+    }
+    if name.ends_with(".shl") {
+        return CommandSource::Script;
+    }
+    if facts.plugin && !facts.forced {
+        return CommandSource::Plugin;
+    }
+    if facts.adapter && !facts.forced {
+        return CommandSource::Adapter;
+    }
+    CommandSource::External
+}
+
 /// Structured builtins dispatched by `shoal-eval`'s `builtins::run`/`dispatch` —
 /// the fs / env / sleep family that produces a typed `Value` from raw CMD words.
 /// This is the set [`is_builtin`] gates the generic dispatch on; keeping it
@@ -39,7 +162,7 @@ const SPECIAL_HEADS: &[&str] = &[
 /// is THE source of truth — the completer, highlighter, and LSP all consume it
 /// (via [`builtin_names`]) instead of hand-maintaining their own drifting copies.
 static BUILTIN_NAMES: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
-    let mut v: Vec<&'static str> = NAMES.iter().chain(SPECIAL_HEADS).copied().collect();
+    let mut v: Vec<&'static str> = builtin_specs().iter().map(|spec| spec.name).collect();
     v.sort_unstable();
     v.dedup();
     v
@@ -120,5 +243,169 @@ mod tests {
                 "`{name}` must be reachable through exactly one predicate"
             );
         }
+    }
+
+    #[test]
+    fn command_precedence_is_explicit_and_complete() {
+        assert_eq!(
+            COMMAND_PRECEDENCE,
+            &[
+                CommandSource::SessionCallable,
+                CommandSource::BoundValue,
+                CommandSource::StructuredBuiltin,
+                CommandSource::SpecialBuiltin,
+                CommandSource::Script,
+                CommandSource::Runner,
+                CommandSource::Plugin,
+                CommandSource::Adapter,
+                CommandSource::External,
+            ]
+        );
+    }
+
+    #[test]
+    fn forced_heads_bypass_only_values_and_adapters() {
+        let forced = CommandFacts {
+            session_value: true,
+            value_eligible: true,
+            forced: true,
+            dynamic_run: false,
+            runner: false,
+            plugin: true,
+            adapter: true,
+            ..CommandFacts::default()
+        };
+        assert_eq!(
+            resolve_command_source("tool", forced),
+            CommandSource::External
+        );
+        assert_eq!(
+            resolve_command_source("ls", forced),
+            CommandSource::StructuredBuiltin
+        );
+        assert_eq!(
+            resolve_command_source(
+                "tool",
+                CommandFacts {
+                    session_callable: true,
+                    ..forced
+                }
+            ),
+            CommandSource::SessionCallable
+        );
+    }
+
+    #[test]
+    fn every_collision_chooses_the_first_precedence_layer() {
+        let all = CommandFacts {
+            session_callable: true,
+            session_value: true,
+            value_eligible: true,
+            forced: false,
+            dynamic_run: false,
+            runner: false,
+            plugin: true,
+            adapter: true,
+        };
+        assert_eq!(
+            resolve_command_source("ls", all),
+            CommandSource::SessionCallable
+        );
+        assert_eq!(
+            resolve_command_source(
+                "ls",
+                CommandFacts {
+                    session_callable: false,
+                    ..all
+                }
+            ),
+            CommandSource::BoundValue
+        );
+        assert_eq!(
+            resolve_command_source(
+                "ls",
+                CommandFacts {
+                    session_callable: false,
+                    session_value: false,
+                    ..all
+                }
+            ),
+            CommandSource::StructuredBuiltin
+        );
+        assert_eq!(
+            resolve_command_source(
+                "cd",
+                CommandFacts {
+                    session_callable: false,
+                    session_value: false,
+                    ..all
+                }
+            ),
+            CommandSource::SpecialBuiltin
+        );
+        assert_eq!(
+            resolve_command_source(
+                "build.shl",
+                CommandFacts {
+                    session_callable: false,
+                    session_value: false,
+                    ..all
+                }
+            ),
+            CommandSource::Script
+        );
+        assert_eq!(
+            resolve_command_source(
+                "tool",
+                CommandFacts {
+                    session_callable: false,
+                    session_value: false,
+                    ..all
+                }
+            ),
+            CommandSource::Plugin
+        );
+        assert_eq!(
+            resolve_command_source(
+                "tool",
+                CommandFacts {
+                    session_callable: false,
+                    session_value: false,
+                    plugin: false,
+                    ..all
+                }
+            ),
+            CommandSource::Adapter
+        );
+    }
+
+    #[test]
+    fn dynamic_run_bypasses_every_named_layer() {
+        let source = resolve_command_source(
+            "ls",
+            CommandFacts {
+                session_callable: true,
+                session_value: true,
+                value_eligible: true,
+                forced: false,
+                dynamic_run: true,
+                runner: false,
+                plugin: true,
+                adapter: true,
+            },
+        );
+        assert_eq!(source, CommandSource::External);
+
+        assert_eq!(
+            resolve_command_source(
+                "script.py",
+                CommandFacts {
+                    dynamic_run: true,
+                    runner: true,
+                    ..CommandFacts::default()
+                }
+            ),
+            CommandSource::Runner
+        );
     }
 }

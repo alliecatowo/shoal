@@ -33,7 +33,7 @@ Plans contain concrete effects from a closed enum:
 | `NetConnect`, `NetListen` | outbound host/port or inbound port |
 | `EnvRead`, `EnvWrite` | session/process environment names |
 | `SecretUse` | named secret access |
-| `SessionWrite` | mutation of session state |
+| `SessionWrite` | mutation of bindings, modules, tasks, channels, handlers, or other session state |
 | `JournalRead` | durable history access |
 | `Time` | clock observation |
 | `Opaque` | behavior cannot be bounded by the static derivation |
@@ -65,9 +65,72 @@ can contribute concrete effect templates. Paths and arguments are resolved as fa
 current evaluator state allow. Dynamic calls, unknown external behavior, or constructs that cannot
 be bounded become `Opaque` and normally make reversibility unknown.
 
+Adapter effect declarations parse against the **full** effect vocabulary — `fs.read`, `fs.write`,
+`fs.delete`, `proc.spawn`, `net.connect`, `net.listen`, `env.read`, `env.write`, `secret.use`,
+`session.write`, `journal.read`, and `time` — in both parenthesized (`proc.spawn(container)`) and
+bare (`session.write`) forms. A declaration whose kind is outside the vocabulary is **never silently
+dropped**: it plans as `Opaque` so an unrecognized adapter effect forces approval rather than
+vanishing from the plan.
 
-Derivation is intentionally conservative. It is safer to require approval for an opaque program
-than to manufacture a precise-looking plan that omits a dynamic effect.
+Derivation is intentionally conservative and fail-closed. The AST walk is structurally exhaustive —
+a match over every statement and expression node with **no wildcard arm**, so a new syntax form
+cannot be added without classifying its effects. Concretely the walk covers: `use` (`SessionWrite`
+for installed exports, module `FsRead`, plus `Opaque` for the module body), binding/function/alias
+declarations and assignment (`SessionWrite`), persistent `env.NAME = …` (`EnvWrite`), command redirects
+(`>`/`>>` → `FsWrite`, `< file` → `FsRead`), the method sinks `.save`/`.append` and the path reads
+`.read`/`.lines`/…, `.feed` (an **external** spawn of the fed command, matching the runtime's
+`run_argv` path rather than builtin dispatch), the effectful builtins `run`/`open`/`save` and the
+bodies of `spawn`/`parallel`/lambda arguments, task registration from `spawn` and background commands,
+channel publish/subscription and stream sinks, event-handler registration, task lifecycle controls,
+and generic external commands (a concrete `ProcSpawn`
+with a resolved binary hash, consistent with adapter spawns). A call that cannot be statically
+expanded — a session-stored closure, or any unrecognized name — becomes an approval-requiring
+`Opaque` effect; an empty effect set is emitted only for forms that are provably effect-free
+(literals, pure constructors, and control-flow scaffolding). It is safer to require approval for an
+opaque program than to manufacture a precise-looking plan that omits a dynamic effect.
+
+Command-head resolution consumes the same canonical builtin registry as runtime dispatch,
+completion, and the LSP. Structured builtins derive their declared filesystem/environment effects;
+special heads derive their runtime meaning (`history`/`journal` → `JournalRead`, directory/session
+mutation → `SessionWrite`, `interact cmd` → the command's `ProcSpawn`). A special head whose behavior
+cannot be bounded, such as a stored-plan `apply` or effectful `reef` subcommand, becomes `Opaque`.
+It never falls through as an external process merely because it has no entry in the structured
+builtin effect table. The HR-A11 regression suite iterates every canonical builtin name and pins all
+original audit probes to their meaningful effect and target.
+
+Builtin `-h`/`--help` is the deliberate exception to the command's ordinary effects. Planning uses
+the same post-resolution, pre-`--` predicate as runtime and emits no effects for builtin help, even
+when extra operands, redirects, or `&` are present. Callable shadows still follow callable planning
+rather than being mistaken for the builtin they shadow.
+
+HTTP namespace calls derive one `NetConnect` from the same `http::Uri` authority representation the
+ureq runtime consumes. Malformed or non-HTTP(S) literals become wildcard authority. Runtime follows
+zero redirects and disables ambient proxy discovery: a `Location` response is returned to the
+program, and a reviewed target must be requested explicitly so every actual socket destination has
+its own plan entry. A two-listener regression proves a redirect target receives zero connections.
+
+Command input lowering is recursive and precedes external/plugin/adapter dispatch: embedded
+expressions in positional arguments, long-flag values, environment prefixes, redirect targets, and
+trailing blocks contribute their own network, filesystem, environment, secret, process, or opaque
+effects. Literal input redirects derive the exact `FsRead`; a dynamic target is `Opaque` after its
+expression subtree is traversed, never an empty effect. The same rule applies to dynamic receivers
+of `read`, `read_bytes`, and `lines`, while literal path receivers retain exact `FsRead` paths.
+Runtime evaluates each supported redirect target once before the owning builtin/plugin/adapter/process
+dispatch and reuses the prepared path for stdin setup or output commit. Structured builtins reject
+input redirects before argument expansion or mutation instead of silently ignoring them.
+
+Planner path attribution and runtime argument coercion share evaluator-scoped tilde expansion:
+`~/x` uses the session process-environment snapshot (including `env.HOME` changes), not a fresh read
+of the ambient host's `HOME`. `secret.get("name")`, a session-bound secret used in an HTTP header,
+`env.NAME`, and `os.env()` derive `SecretUse`/`EnvRead`; a dynamic secret name uses the conservative
+`*` name. `every`, `watch`, and `tail` come from one constructor inventory shared by runtime and the
+planner. They cannot fall through to PATH: `every` derives `Time`, and literal `watch`/`tail` targets
+derive `FsRead` (dynamic targets are `Opaque`).
+
+These guarantees are conservative rather than flow-sensitive. The planner traverses every branch
+and closure body it can see, so effects from an untaken branch may appear. Values whose concrete
+path, secret name, closure body, module body, or dynamic command cannot be proven statically remain
+`Opaque`; approval must narrow or accept that uncertainty rather than relying on a guessed target.
 
 Sources: [`plan_derive.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-eval/src/plan_derive.rs)
 and [`plan_effects.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-eval/src/plan_effects.rs).
@@ -76,7 +139,7 @@ and [`plan_effects.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/sh
 
 Policy is keyed by principal. Each principal can grant path globs, executable names/hashes, network
 destinations, environment names, secrets, session/journal/time access, an opaque mode, hermetic
-intent, and an automatic-apply rule.
+intent, inherited per-process CPU/address-space ceilings, and an automatic-apply rule.
 
 
 Denial dominates approval, which dominates allow. Unknown principals deny at this evaluator. Local
@@ -103,37 +166,68 @@ accDescr: Shows the components and relationships described in Approval lifecycle
   K->>P: derive + evaluate
   K-->>C: plan_ref, effects, verdict
   C->>K: cap.request(plan_ref)
-  K->>K: mark stored plan approved
+  K->>K: reserve transition + append durable grant audit
   C->>K: exec(mode="approved", plan_ref, same src)
-  K->>K: verify session + principal + source + approval/current allow
+  K->>K: verify immutable binding + consume one-shot grant
   K->>P: re-derive and evaluate current plan
-  K-->>C: result or leash error
+  K-->>C: result/audit binding or leash error
 ```
 
-`plan.apply` and approved `exec` re-check the currently stored session, principal, source, and
-approval state. That execution-side check is real. The approval mutation itself is currently unsafe:
-`cap.request` is routed without an attachment, receives no caller principal, and marks a global
-stored plan approved by ref. A direct socket caller therefore does not prove approver authority.
+`cap.request` requires an attached authorized approver and separates requester from approver by
+default. It reserves the exact owner-bound plan transition, appends the grant audit before publishing
+authority, and restores the reservation if audit append fails or unwinds. `plan.apply` and approved
+`exec` re-check the immutable source/AST/effects/Session/principal binding, re-derive the current plan,
+and atomically consume the grant once. The consuming execution id is bound to the audit record.
 
-Plan refs are also not unique stored-object identities. `Plan::new` hashes only effects,
-reversibility, and estimates (first 16 hex characters), while the kernel map is keyed solely by that
-ref. Two plans with equal effect shape but different source/session/principal overwrite the same
-entry. Treat the current ref as a short content-shape fingerprint, not a capability or stable object
-ID, until the [P0 authority work](../roadmap-and-priorities/)
-lands.
+Kernel plan refs use the full binding digest plus a unique per-kernel object suffix, so equal-shape
+and identical repeated plans remain distinct. They are ephemeral object identifiers, never bearer
+permissions or durable ids.
 
 ## Ports
 
-The evaluator holds ports for filesystem, execution, clock, opener, secrets, configuration, and
-CAS-byte loading. Default ports perform real host actions; tests can inject deterministic fakes.
-This is an incomplete seam, not proof that every effect is port-routed: direct `Path::is_dir`,
-`exists`, `canonicalize`, `std::fs::OpenOptions`, and OS watcher setup remain in production paths.
-See the filesystem-boundary ledger in the evaluator-state chapter.
+The evaluator holds ports for filesystem I/O, filesystem event registration, execution, clock,
+opener, secrets, configuration, and CAS-byte loading. Default ports perform real host actions;
+tests can inject deterministic fakes. Language-visible filesystem reads, probes, navigation, and
+writes cross `Fs`; watch and tail registration cross `WatchPort`. The standard adapters are the
+explicit ambient-authority boundary, as inventoried below.
 
-More seriously, fresh evaluators created by `spawn_block`, `.shl` `run_script_file`, `parallel`, and
-`on` do not inherit the parent Leash policy/principal; they also omit Reef state, and some omit
-`ConfigPort`. A child external spawn can therefore resolve no sandbox despite a constrained parent.
-Until one audited child-construction API closes this, Leash is not a transitive authority boundary.
+### In-process filesystem-effect ledger (HR-C3, 2026-07-16)
+
+Inventory of language-visible filesystem operations in `shoal-value` and `shoal-eval`. Ordinary
+filesystem I/O/probes cross `Fs`; event registration crosses the narrower `WatchPort`. Standard
+adapters are the explicit ambient boundary. A new operation adds a routed row and a denial test.
+
+**Routed write/read effects** — mediated by the `Fs` port, so a fake can observe or deny them and a
+sandbox can enforce them:
+
+| Site | Effect | Port route |
+|---|---|---|
+| `shoal-value` `methods/path.rs::save` — value `.save`/`.append`, `save(path, value)` builtin | file write / append | `CallCtx::fs().write` / `.append` (HR-C1) |
+| `shoal-value` `methods/stream.rs::stream_save` — stream `.save`/`.append` | open-once incremental append | `CallCtx::fs().open_append` (HR-C2) |
+| `shoal-value` `ports.rs::StdFs` | every `std::fs` syscall | the port adapter itself — the boundary, not a bypass |
+| `shoal-eval` `path_access.rs::path_fs_method` — path `.read`/`.read_bytes`/`.lines`/`.exists`/`.is_dir`/`.is_file`/`.size`/`.modified` | bounded streaming read / stat | `self.fs.open_read` / `.metadata` |
+| `shoal-eval` `command.rs` redirects `>` and `>>` | file write / append | `self.fs.write` / `.append` |
+| `shoal-eval` `builtins.rs` — `cat`/`ls`/`mkdir`/`touch`/`mv`/`cp`/`rm`/`trash`/`ln` | read / write / dir / rename / link | `self.fs.*`; removal commits use `rename_if_unchanged` |
+| `shoal-eval` `frecency.rs` dir-jump store load/save | read / write / rename | `self.fs.*` |
+| `shoal-eval` `journal.rs` undo snapshot + restore | bounded stable read | `self.fs.read_bounded_stable` |
+| `shoal-eval` `reef_builtins.rs` manifest read | stat / read | `self.fs.is_file` / `.read_to_string` |
+| `shoal-eval` module/script/navigation/plan resolution | stat / canonicalize | `self.host.fs.*` |
+| `shoal-eval` `streams.rs` watch/tail existence and tail reads | stat / seekable reads | `self.host.fs.*` |
+| `shoal-eval` `WatchPort` | watch registration / event delivery | injected `Arc<dyn WatchPort>`; `StdWatchPort` owns `notify` |
+
+The `Fs` port also mediates the `CallCtx::fs()` seam value methods reach through. `CallCtx::fs()` is
+required: an embedding must explicitly return either `StdFs` (real host authority) or an injected
+adapter, so forgetting the wire is a compile error. The evaluator returns its `Arc<dyn Fs>`
+(`set_fs`), and recording/denying tests prove scalar and stream saves reach that adapter end to end.
+Production hosts currently leave the evaluator on `StdFs`; this seam is not itself a Leash-backed
+in-process sandbox.
+
+Child evaluators created by `spawn_block`, `.shl` `run_script_file`, `parallel`, and `on` inherit
+the parent's Leash policy/principal, all ports (including `ConfigPort` and `WatchPort`), Reef state,
+event bus, and cancellation through the single `ChildContext` constructor (HR-B1–B6); cross-route
+propagation is pinned by `child_context_propagation.rs`. Destructuring makes omission of an
+already-captured field a compile error. Adding a new `Evaluator` field still requires an explicit
+inheritance audit because Rust cannot infer that the separate `ChildContext` must grow with it.
 
 ```mermaid
 flowchart LR
@@ -153,8 +247,9 @@ policy behavior, port method, standard implementation, and fake-port test togeth
 ## Lowering grants to an OS sandbox
 
 Filesystem globs are reduced to their longest concrete leading roots. Nonexistent roots are dropped;
-an unrestricted root grant or a grant set that yields no useful existing roots produces no sandbox.
-The plan verdict remains the authority in those cases.
+an unrestricted root grant produces no sandbox. A nonhermetic grant set with no useful existing root
+also preserves that best-effort behavior, while a hermetic unresolved scope reaches the execution
+boundary and refuses before target spawn. The plan verdict remains the authority for modeled effects.
 
 ```mermaid
 flowchart TD
@@ -170,8 +265,8 @@ accDescr: Shows the components and relationships described in Lowering grants to
   Sandbox --> Other["other platform: advisory"]
 ```
 
-The concrete request records filesystem scopes, a coarse network policy, optional spawn hash, and a
-`hermetic` flag. A hermetic request must fail the spawn if any requested dimension cannot be
+The concrete request records filesystem scopes, a coarse network policy, inherited per-process
+ceilings, an optional spawn hash, and a `hermetic` flag. A hermetic request must fail the spawn if any requested dimension cannot be
 enforced; non-hermetic execution uses the strongest available backend and returns an
 `EnforcementStatus` describing what actually happened.
 
@@ -182,12 +277,17 @@ enforced; non-hermetic execution uses the strongest available backend and return
 | filesystem on supported Linux | Landlock backend |
 | filesystem on macOS | Seatbelt backend |
 | executable identity | preflight BLAKE3 check; no exec-time pin |
-| network | plan/policy gate only; no seccomp/network-namespace backend |
+| coarse network deny | Landlock ABI 4+ TCP bind/connect denial; Seatbelt deny-by-default |
+| hostname/port allowlist | plan/policy gate only; no OS backend |
+| child CPU/address space | inherited `RLIMIT_CPU`/`RLIMIT_AS`; per process, not aggregate tree |
 | unsupported OS | advisory policy, no strong OS sandbox |
 
 The spawn hash has a documented time-of-check/time-of-use gap: the path is hashed before `exec`, so
 the file can theoretically change between those events. Enforcement reports this rather than
-claiming an exec-time guarantee.
+claiming an exec-time guarantee. Hermetic principals therefore refuse configured spawn pinning until
+an atomic backend exists. They also refuse configured hostname/port network scoping because the
+current semantic allowlist cannot confine an opaque child; an empty network grant set instead lowers
+to enforceable coarse denial on supported hosts.
 
 Source: [`shoal-leash/src/enforce.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-leash/src/enforce.rs).
 
@@ -200,25 +300,34 @@ capability list as if it directly grants an effect.
 
 The auth store persists a keyed hash, expiry, revocation state, and the keyed-hash secret in the same
 mode-restricted store. It does not persist the original bearer token. Verification uses a
-constant-time comparison. File permissions are part of the threat model; this is local same-user
-infrastructure, not a hardware-backed identity service.
+constant-time comparison. Create/revoke take an exclusive fd lock and reload fresh state; validation
+takes a shared fd lock and reloads fresh state. The kernel revalidates each bearer-backed attachment
+before every request and fails closed on revocation, expiry, or store error. File permissions are
+part of the threat model; this is local same-user infrastructure, not a hardware-backed identity
+service.
 
 ## Secret storage
 
 `shoal-secret` stores a name/value map encrypted with AES-256-GCM. It validates restrictive directory
-and file modes and rewrites the encrypted map on mutation. The master key resides alongside the
-store under the same user-level permission boundary. This protects accidental disclosure and
-detects ciphertext tampering; it does not protect against a process already running as the same
-compromised user. Values of type `Secret` are deliberately not generally renderable/feedable.
+and file modes. Bounded regular-file admission precedes JSON/base64/decryption; the fixed envelope,
+canonical encodings, decrypted map identities, values, aggregate bytes, and JSON shape are all
+checked fail closed without rewriting a bad snapshot. Shared/exclusive fd locks serialize fresh
+reads and whole-map mutation. Master-key, plaintext buffers, parse-error partial maps, and map values
+zeroize on drop; final language/child-process copies remain in the process-memory threat model. The
+master key resides alongside the store under the same user-level permission boundary. This protects
+accidental disclosure and detects ciphertext tampering; it does not protect against a process
+already running as the same compromised user. Values of type `Secret` are deliberately not
+generally renderable/feedable.
 
-## WASM boundary: validated, not integrated
+## WASM boundary: bounded preview runtime
 
-`shoal-wasm` validates component/manifests, rejects ambient imports, and represents fuel, memory,
-table, and instance ceilings. Its `Limits` type has **no wall-clock timeout**. It currently has no
-evaluator or command-dispatch dependency and no invocation
-API wired into normal Shoal execution. Treat it as a prepared isolation component, not a supported
-plugin runtime. Integration must start with an explicit host-capability interface and effects—not by
-calling it directly from a builtin.
+`shoal-wasm` validates components/manifests and retains the validated component rather than rereading
+the path. Plugin commands participate in canonical evaluator resolution and execute through preview
+ABI v1. Only manifest-declared hostcalls that current principal policy authorizes are linked; current
+providers include bounded time and scoped file reading. Fuel, memory/table/instance, byte/count,
+epoch deadline, cancellation, and two-second wall-time limits constrain invocation. Synchronous
+compilation is byte-capped but not epoch-interruptible. Treat every new hostcall as a new authority
+surface requiring canonical effects, scoped inputs, bounded transfer, and adversarial tests.
 
 ## Fail-open local policy is a conscious risk
 
