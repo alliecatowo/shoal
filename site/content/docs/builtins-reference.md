@@ -92,6 +92,12 @@ out = structured builtin result
 
 Their validation or filesystem failures raise an error rather than returning a non-ok outcome. File-operation failures currently often use the broad code `custom`; do not branch only on a platform-specific message.
 
+Structured builtins that eagerly construct strings, bytes, lists, tables, or records share a
+16,384-value / 16 MiB retained-output wall. They raise `builtin_output_limit` before retaining the
+next value or byte. Narrow the input or move repeated processing into a stream when a result can be
+larger. In particular, production `ls` stops directory iteration at the wall, `cat` reads only the
+remaining aggregate byte budget, and `head` reads line prefixes rather than loading the whole file.
+
 ## Filesystem inspection builtins
 
 ### `ls`
@@ -117,7 +123,7 @@ ls --all .
 (ls src).where(.type == "file").sort_by(.size)
 ```
 
-Hidden entries are skipped unless `-a` or `--all` is present. `ls` is not recursive. A missing/unreadable path raises a filesystem error.
+Hidden entries are skipped unless `-a` or `--all` is present. `ls` is not recursive. A missing/unreadable path raises a filesystem error. More than 16,384 admitted rows or 16 MiB of retained row state raises `builtin_output_limit`; directory enumeration is stopped before an extra production entry is retained.
 
 ### `stat`
 
@@ -150,7 +156,7 @@ Reads every file and concatenates the bytes without inserting separators.
 (cat a.bin b.bin).stdout.save("combined.bin")
 ```
 
-It requires at least one path. `.str()` requires valid UTF-8; `.display()` is the lossy conversion.
+It requires at least one path. `.str()` requires valid UTF-8; `.display()` is the lossy conversion. Concatenated output above 16 MiB raises `builtin_output_limit`; files are read incrementally against the shared budget.
 
 ### `head`
 
@@ -167,7 +173,7 @@ head README.md 3
 (head README.md 5).join(" | ")
 ```
 
-Errors include `arg_error` for no path, negative or invalid count, and `type_error` for a count of the wrong type. Extra positional arguments beyond the count are currently ignored; do not rely on that leniency.
+Errors include `arg_error` for no path, negative or invalid count, `type_error` for a count of the wrong type, and `builtin_output_limit` above 16,384 lines or 16 MiB of retained line state. `head` streams the requested prefixes and does not load the whole file. Extra positional arguments beyond the count are currently ignored; do not rely on that leniency.
 
 ## Filesystem mutation builtins
 
@@ -437,6 +443,7 @@ echo ([1, 2, 3]) > values.txt
 ```
 
 `echo` does not append a newline to its structured string value. The external `^printf` remains available for byte-exact formatting.
+An eager result above 16 MiB raises `builtin_output_limit` while the destination string is being built.
 
 ### `env`
 
@@ -454,6 +461,8 @@ env.PATH
 ```
 
 More than one name is `arg_error`. `env.NAME` field syntax reads the session environment through the same evaluator path, and assignment writes it.
+The whole-record form admits entries incrementally and raises `builtin_output_limit` above 16,384
+entries or 16 MiB of retained key/value state.
 
 ### `sleep`
 

@@ -218,6 +218,12 @@ vector across fork cursors instead of multiplying the full allocation. String co
 `string_materialization_limit`; replacement capture expansion is written directly into the bounded
 destination rather than creating an unchecked intermediate.
 
+Structured builtins apply a separate transient result boundary before ordinary outcome wrapping or
+lexical binding. Eager results stop at 16,384 values / 16 MiB retained state with
+`builtin_output_limit`. `ls` bounds production directory iteration, `cat` reads against the
+remaining aggregate byte budget, and `head` streams line prefixes. `echo` and whole-record `env`
+also build through the shared admission layer.
+
 Lazy CAS-backed bytes keep metadata operations allocation-free. `.stream()` reads logical lines on
 demand with a 1 MiB per-line wall, and `.save()`/`.append()` copy through reader/writer ports.
 Implicit resident methods refuse a declared blob above 16 MiB with `cas_materialization_limit`;
@@ -225,7 +231,7 @@ Implicit resident methods refuse a declared blob above 16 MiB with `cas_material
 `stream_line_limit`.
 
 Limit failures are catchable language errors: `binding_name_limit`, `binding_identity_limit`,
-`binding_value_limit`, or `binding_aggregate_limit`. Runtime handles such as closures, tasks, and
+`binding_value_limit`, `binding_aggregate_limit`, or `builtin_output_limit`. Runtime handles such as closures, tasks, and
 streams receive a conservative fixed charge here and remain subject to their own subsystem quotas;
 this is accounting protection, not a complete process-memory meter. Use an OS memory limit for
 mutually hostile workloads.

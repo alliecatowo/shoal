@@ -567,9 +567,6 @@ fn production_evaluator_has_only_explicit_ambient_filesystem_exceptions() {
     #[derive(Clone, Copy)]
     struct ExpectedLine {
         file: &'static str,
-        /// `None` intentionally keys the exception by its exact semantic
-        /// token instead of a formatting-sensitive source line.
-        line: Option<usize>,
         text: &'static str,
     }
 
@@ -581,57 +578,46 @@ fn production_evaluator_has_only_explicit_ambient_filesystem_exceptions() {
     const MEDIATED_METADATA_CLASSIFICATION: &[ExpectedLine] = &[
         ExpectedLine {
             file: "builtins.rs",
-            line: Some(179),
             text: "if m.is_dir() {",
         },
         ExpectedLine {
             file: "builtins.rs",
-            line: Some(183),
             text: "} else if m.is_file() {",
         },
         ExpectedLine {
             file: "builtins.rs",
-            line: Some(315),
             text: "if m.is_dir() {",
         },
         ExpectedLine {
             file: "builtins.rs",
-            line: Some(372),
             text: "if meta.is_dir() {",
         },
         ExpectedLine {
             file: "builtins.rs",
-            line: Some(506),
             text: "if !metadata.is_dir() || metadata.uid() != effective_uid || metadata.mode() & 0o077 != 0 {",
         },
         ExpectedLine {
             file: "builtins.rs",
-            line: Some(520),
             text: "if fs.symlink_metadata(path)?.is_dir() {",
         },
         ExpectedLine {
             file: "builtins.rs",
-            line: Some(567),
             text: "if !metadata.is_dir()",
         },
         ExpectedLine {
             file: "expr_access.rs",
-            line: Some(410),
             text: ".map(|m| m.is_dir())",
         },
         ExpectedLine {
             file: "expr_access.rs",
-            line: Some(417),
             text: ".map(|m| m.is_file())",
         },
         ExpectedLine {
             file: "script.rs",
-            line: None,
             text: "metadata.is_file() && metadata.permissions().mode() & 0o111 != 0",
         },
         ExpectedLine {
             file: "command/external.rs",
-            line: None,
             text: "if !self.host.fs.metadata(&resolved).ok()?.is_file() {",
         },
     ];
@@ -643,22 +629,18 @@ fn production_evaluator_has_only_explicit_ambient_filesystem_exceptions() {
     const AMBIENT_ALLOWLIST: &[ExpectedLine] = &[
         ExpectedLine {
             file: "frecency.rs",
-            line: Some(322),
             text: "let Ok(reader) = StdFs.open_read(path) else {",
         },
         ExpectedLine {
             file: "frecency.rs",
-            line: Some(349),
             text: "StdFs.create_dir_all(parent)?;",
         },
         ExpectedLine {
             file: "frecency.rs",
-            line: Some(353),
             text: "StdFs.atomic_replace(path, output.as_bytes())",
         },
         ExpectedLine {
             file: "script.rs",
-            line: None,
             text: "std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))?;",
         },
     ];
@@ -676,15 +658,14 @@ fn production_evaluator_has_only_explicit_ambient_filesystem_exceptions() {
 
     fn expected_index(
         expected: &[ExpectedLine],
+        seen: &[bool],
         file: &str,
-        line: usize,
         text: &str,
     ) -> Option<usize> {
-        expected.iter().position(|item| {
-            item.file == file
-                && item.line.is_none_or(|expected| expected == line)
-                && item.text == text.trim()
-        })
+        expected
+            .iter()
+            .enumerate()
+            .position(|(index, item)| !seen[index] && item.file == file && item.text == text.trim())
     }
 
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -715,8 +696,8 @@ fn production_evaluator_has_only_explicit_ambient_filesystem_exceptions() {
             if metadata_classification {
                 if let Some(index) = expected_index(
                     MEDIATED_METADATA_CLASSIFICATION,
+                    &seen_metadata,
                     &relative,
-                    line_number,
                     trimmed,
                 ) {
                     seen_metadata[index] = true;
@@ -744,7 +725,7 @@ fn production_evaluator_has_only_explicit_ambient_filesystem_exceptions() {
                 || trimmed.contains("StdFs.");
             if ambient {
                 if let Some(index) =
-                    expected_index(AMBIENT_ALLOWLIST, &relative, line_number, trimmed)
+                    expected_index(AMBIENT_ALLOWLIST, &seen_ambient, &relative, trimmed)
                 {
                     seen_ambient[index] = true;
                 } else {

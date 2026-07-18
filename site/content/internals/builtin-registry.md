@@ -130,6 +130,12 @@ strings/paths specially.
 
 ## Structured builtin return contract
 
+`builtins/admission.rs` is the transient allocation boundary for structured builtin results.
+Builders admit at most 16,384 values and 16 MiB of measured retained state before outcome wrapping;
+strings and byte concatenation use the same 16 MiB wall. Breaches raise `builtin_output_limit` with
+a hint to narrow or stream the input. Production filesystem adapters must override bounded
+directory reads so `ls` enforces the row wall during iteration, not after collecting the directory.
+
 | Head | Key arguments/flags | Raw structured result |
 |---|---|---|
 | `echo` | any values | one `Str`, joined by spaces |

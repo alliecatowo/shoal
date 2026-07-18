@@ -8,6 +8,11 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod admission;
+use admission::{
+    MAX_RETAINED_BYTES, OutputBudget, OutputString, OutputValues, output_limit, table_record,
+};
+
 // The canonical builtin command-head registry lives in the leaf `shoal-syntax`
 // crate (`shoal_syntax::commands`) — "is this token a command head?" is a
 // lexical/syntactic classification every consumer (eval, the shell, the LSP)
@@ -81,9 +86,7 @@ fn dispatch(
     match name {
         // echo renders every value (lists/records/tables/null included), strings
         // unquoted at top level (site/content/internals/pty-job-control.md).
-        "echo" => Ok(Value::Str(
-            args.iter().map(echo_display).collect::<Vec<_>>().join(" "),
-        )),
+        "echo" => echo(args),
         "ls" => ls(fs, cwd, args, has(flags, &["a", "all"])),
         "cat" => cat(fs, cwd, args),
         "mkdir" => mkdir(fs, cwd, args, has(flags, &["p", "parents"])),
@@ -122,6 +125,16 @@ fn echo_display(v: &Value) -> String {
         Value::Null => String::new(),
         other => shoal_value::render::render_inline(other),
     }
+}
+fn echo(args: Vec<Value>) -> VResult<Value> {
+    let mut output = OutputString::new();
+    for (index, value) in args.iter().enumerate() {
+        if index > 0 {
+            output.push_str(" ")?;
+        }
+        output.push_str(&echo_display(value))?;
+    }
+    Ok(Value::Str(output.finish()))
 }
 fn display(v: &Value) -> VResult<String> {
     match v {
@@ -207,10 +220,19 @@ fn ls(fs: &dyn Fs, cwd: &Path, args: Vec<Value>, all: bool) -> VResult<Value> {
     } else {
         paths(cwd, args)?
     };
-    let mut rows = Vec::new();
+    let mut rows = OutputValues::new();
     for root in roots {
         if fs.is_dir(&root) {
-            for entry in fs.read_dir(&root).map_err(|e| ioerr("list", &root, e))? {
+            let entries = fs
+                .read_dir_bounded(&root, rows.remaining_values())
+                .map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::InvalidData {
+                        output_limit(error.to_string())
+                    } else {
+                        ioerr("list", &root, error)
+                    }
+                })?;
+            for entry in entries {
                 if !all
                     && entry
                         .file_name()
@@ -218,12 +240,15 @@ fn ls(fs: &dyn Fs, cwd: &Path, args: Vec<Value>, all: bool) -> VResult<Value> {
                 {
                     continue;
                 }
-                rows.push(metadata_record(fs, entry)?);
+                rows.push(table_record(metadata_record(fs, entry)?))?;
             }
         } else {
-            rows.push(metadata_record(fs, root)?);
+            rows.push(table_record(metadata_record(fs, root)?))?;
         }
     }
+    let Value::Table(mut rows) = rows.finish_table() else {
+        unreachable!()
+    };
     rows.sort_by(|a, b| match (a.get("path"), b.get("path")) {
         (Some(Value::Path(a)), Some(Value::Path(b))) => a.cmp(b),
         _ => std::cmp::Ordering::Equal,
@@ -237,7 +262,20 @@ fn cat(fs: &dyn Fs, cwd: &Path, args: Vec<Value>) -> VResult<Value> {
     }
     let mut out = Vec::new();
     for p in paths(cwd, args)? {
-        out.extend(fs.read(&p).map_err(|e| ioerr("read", &p, e))?);
+        let remaining = MAX_RETAINED_BYTES.saturating_sub(out.len());
+        let mut reader = fs.open_read(&p).map_err(|e| ioerr("read", &p, e))?;
+        let take = u64::try_from(remaining)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        let mut part = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::Read::take(&mut reader, take), &mut part)
+            .map_err(|e| ioerr("read", &p, e))?;
+        if part.len() > remaining {
+            return Err(output_limit(format!(
+                "cat output exceeds its {MAX_RETAINED_BYTES}-byte limit"
+            )));
+        }
+        out.extend(part);
     }
     Ok(Value::Bytes(std::sync::Arc::new(out)))
 }
@@ -617,14 +655,35 @@ fn head(fs: &dyn Fs, cwd: &Path, args: Vec<Value>) -> VResult<Value> {
         }
     };
     let p = path(cwd, args[0].clone())?;
-    let bytes = fs.read(&p).map_err(|e| ioerr("read", &p, e))?;
-    let text = String::from_utf8_lossy(&bytes);
-    let lines = text
-        .lines()
-        .take(n)
-        .map(|l| Value::Str(l.to_string()))
-        .collect();
-    Ok(Value::List(lines))
+    let reader = fs.open_read(&p).map_err(|e| ioerr("read", &p, e))?;
+    let mut reader = std::io::BufReader::new(reader);
+    let mut lines = OutputValues::new();
+    for _ in 0..n.min(admission::MAX_VALUES.saturating_add(1)) {
+        let mut line = Vec::new();
+        let remaining = lines.remaining_retained_bytes();
+        let take = u64::try_from(remaining)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        let mut bounded = std::io::Read::take(&mut reader, take);
+        let read = std::io::BufRead::read_until(&mut bounded, b'\n', &mut line)
+            .map_err(|e| ioerr("read", &p, e))?;
+        if read == 0 {
+            break;
+        }
+        if line.len() > remaining {
+            return Err(output_limit(format!(
+                "head output exceeds its {MAX_RETAINED_BYTES}-byte limit"
+            )));
+        }
+        if line.last() == Some(&b'\n') {
+            line.pop();
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+        }
+        lines.push(Value::Str(String::from_utf8_lossy(&line).into_owned()))?;
+    }
+    Ok(lines.finish_list())
 }
 
 /// `ln(target, link, symbolic: bool = false)` (site/content/internals/language-conformance-contract.md): create a hard link (or a
@@ -677,9 +736,12 @@ fn which(penv: &[(OsString, OsString)], args: Vec<Value>) -> VResult<Value> {
 fn env(penv: &[(OsString, OsString)], args: Vec<Value>) -> VResult<Value> {
     if args.is_empty() {
         let mut r = Record::new();
+        let mut budget = OutputBudget::new();
         for (k, v) in penv {
             if let (Some(k), Some(v)) = (k.to_str(), v.to_str()) {
-                r.insert(k.into(), Value::Str(v.into()));
+                let value = Value::Str(v.into());
+                budget.admit_record_entry(k, &value)?;
+                r.insert(k.into(), value);
             }
         }
         Ok(Value::Record(r))
@@ -910,6 +972,36 @@ mod tests {
         )
         .unwrap();
         assert!(d.path().join("b").exists());
+    }
+    #[test]
+    fn head_streams_prefixes_and_enforces_the_shared_value_wall() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("lines"), b"a\r\nb\n").unwrap();
+        assert_eq!(
+            head(
+                &StdFs,
+                d.path(),
+                vec![Value::Path("lines".into()), Value::Int(1)]
+            )
+            .unwrap(),
+            Value::List(vec![Value::Str("a".into())])
+        );
+
+        let oversized = "x\n".repeat(admission::MAX_VALUES + 1);
+        std::fs::write(d.path().join("many-lines"), oversized).unwrap();
+        assert_eq!(
+            head(
+                &StdFs,
+                d.path(),
+                vec![
+                    Value::Path("many-lines".into()),
+                    Value::Int((admission::MAX_VALUES + 1) as i64),
+                ],
+            )
+            .unwrap_err()
+            .code,
+            "builtin_output_limit"
+        );
     }
     #[test]
     fn sleep_returns_promptly_when_pre_cancelled() {

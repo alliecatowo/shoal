@@ -143,6 +143,20 @@ pub trait Fs: Send + Sync {
     /// The (full) paths of a directory's entries (`std::fs::read_dir`, each
     /// entry's `.path()`). Order is unspecified, exactly as `read_dir` yields.
     fn read_dir(&self, path: &Path) -> io::Result<Vec<PathBuf>>;
+    /// Read at most `max_entries` directory entries, returning `InvalidData`
+    /// if another entry exists. The default preserves compatibility for
+    /// injected adapters; production [`StdFs`] overrides it to enforce the
+    /// wall while iterating rather than after an unbounded collection.
+    fn read_dir_bounded(&self, path: &Path, max_entries: usize) -> io::Result<Vec<PathBuf>> {
+        let entries = self.read_dir(path)?;
+        if entries.len() > max_entries {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("directory contains more than {max_entries} admitted entries"),
+            ));
+        }
+        Ok(entries)
+    }
     /// Create a single directory (`std::fs::create_dir`).
     fn create_dir(&self, path: &Path) -> io::Result<()>;
     /// Create a directory and all parents (`std::fs::create_dir_all`).
@@ -295,6 +309,19 @@ impl Fs for StdFs {
         }
         Ok(out)
     }
+    fn read_dir_bounded(&self, path: &Path, max_entries: usize) -> io::Result<Vec<PathBuf>> {
+        let mut out = Vec::new();
+        for entry in fs::read_dir(path)? {
+            if out.len() >= max_entries {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("directory contains more than {max_entries} admitted entries"),
+                ));
+            }
+            out.push(entry?.path());
+        }
+        Ok(out)
+    }
     fn create_dir(&self, path: &Path) -> io::Result<()> {
         fs::create_dir(path)
     }
@@ -388,6 +415,25 @@ mod fs_tests {
         assert!(
             replacement_temps(&root.0).is_empty(),
             "failed atomic replacement leaked a temporary file"
+        );
+    }
+
+    #[test]
+    fn production_directory_reads_enforce_the_limit_while_iterating() {
+        let root = TestDir::new();
+        for name in ["a", "b", "c"] {
+            fs::write(root.0.join(name), name).expect("write directory fixture");
+        }
+        let error = StdFs
+            .read_dir_bounded(&root.0, 2)
+            .expect_err("a third entry must exceed the caller's wall");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            StdFs
+                .read_dir_bounded(&root.0, 3)
+                .expect("the exact wall is admitted")
+                .len(),
+            3
         );
     }
 }
