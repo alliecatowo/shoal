@@ -3,7 +3,7 @@
 //! Versions are opaque-unknown (npm bin scripts have no stable `--version`
 //! contract worth probing here).
 
-use super::{Candidate, Provider, ProviderCtx, is_executable};
+use super::{Candidate, CandidateDiscovery, Provider, ProviderCtx, ProviderError, is_executable};
 use crate::version::Version;
 
 pub struct NpmLocalProvider;
@@ -25,16 +25,18 @@ impl Provider for NpmLocalProvider {
         "npm-local"
     }
 
-    fn discover(&self, tool: &str, ctx: &ProviderCtx) -> Vec<Candidate> {
+    fn discover(&self, tool: &str, ctx: &ProviderCtx) -> Result<CandidateDiscovery, ProviderError> {
+        let mut discovery = CandidateDiscovery::new(self.name());
         let mut dir = Some(ctx.cwd.as_path());
         while let Some(d) = dir {
             let bin = d.join("node_modules").join(".bin").join(tool);
             if is_executable(&bin) {
-                return vec![Candidate::new(tool, Version::unknown(), bin, "npm-local")];
+                discovery.push(Candidate::new(tool, Version::unknown(), bin, "npm-local"))?;
+                return Ok(discovery);
             }
             dir = d.parent();
         }
-        Vec::new()
+        Ok(discovery)
     }
 }
 
@@ -62,7 +64,10 @@ mod tests {
         let deep = root.path().join("src/components");
         std::fs::create_dir_all(&deep).unwrap();
         let p = NpmLocalProvider::new();
-        let cands = p.discover("eslint", &ProviderCtx::new(deep));
+        let cands = p
+            .discover("eslint", &ProviderCtx::new(deep))
+            .unwrap()
+            .into_candidates();
         assert_eq!(cands.len(), 1);
         assert_eq!(cands[0].provider, "npm-local");
     }
@@ -73,6 +78,8 @@ mod tests {
         let p = NpmLocalProvider::new();
         assert!(
             p.discover("eslint", &ProviderCtx::new(root.path()))
+                .unwrap()
+                .into_candidates()
                 .is_empty()
         );
     }

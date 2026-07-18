@@ -52,6 +52,29 @@ fn which_reports_the_same_winning_source_as_runtime() {
 }
 
 #[test]
+fn reef_tool_name_union_stops_at_the_shared_builtin_output_wall() {
+    let mut chain = shoal_reef::ScopeChain::default();
+    for scope_index in 0..17 {
+        let mut manifest = shoal_reef::ReefManifest::default();
+        for tool_index in 0..shoal_reef::REEF_MAX_TOOLS {
+            manifest.tools.insert(
+                format!("tool-{scope_index:02}-{tool_index:04}"),
+                shoal_reef::ToolReq::new(shoal_reef::Constraint::Any),
+            );
+        }
+        chain.scopes.push(shoal_reef::ScopeEntry {
+            kind: shoal_reef::ManifestKind::Reef,
+            source: PathBuf::from(format!("/scope-{scope_index}/.reef.toml")),
+            manifest,
+            mtime: None,
+        });
+    }
+
+    let error = super::constrained_tool_names(&chain).unwrap_err();
+    assert_eq!(error.code, "builtin_output_limit");
+}
+
+#[test]
 fn which_adapter_trace_includes_schema_and_executable_resolution() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(

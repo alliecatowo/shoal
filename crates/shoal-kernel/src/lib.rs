@@ -1,5 +1,6 @@
 //! Long-lived Unix-socket host for the shoal evaluator (site/content/internals/language-conformance-contract.md).
 
+mod connection_io;
 mod dispatch;
 mod enforcement;
 mod eventbus;
@@ -16,6 +17,7 @@ mod session;
 mod state;
 mod wire;
 
+use connection_io::*;
 use eventbus::*;
 use session::*;
 use state::*;
@@ -495,7 +497,7 @@ impl Kernel {
         // On disconnect, drop this connection's subscriptions so publish never
         // writes to a dead fd.
         self.events.remove_conn(client);
-        result
+        normalize_attached_disconnect(result, attached.is_some())
     }
 
     fn task(&self, task: &Ref) -> Result<Arc<TaskEntry>, RpcError> {
@@ -599,17 +601,6 @@ impl Kernel {
             .append_completed(&record, Some(0), true, 0)
             .map_err(internal)
     }
-}
-
-fn set_read_deadline(stream: &UnixStream, timeout_ms: Option<u64>) -> io::Result<()> {
-    stream.set_read_timeout(timeout_ms.map(std::time::Duration::from_millis))
-}
-
-fn is_read_timeout(error: &io::Error) -> bool {
-    matches!(
-        error.kind(),
-        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-    )
 }
 
 struct BoundSocket(std::path::PathBuf);

@@ -246,6 +246,12 @@ The default provider stack is ordered:
 
 Provider order breaks ties; it does not always choose the winner first. Reef collects satisfying candidates across providers, selects the highest version, then breaks equal-version ties by provider order and path.
 
+Each provider must build an admitted discovery result rather than return a raw vector. One discovery
+is limited to 4,096 candidates and 16 MiB of measured identity/path state; crossing either wall is a
+`reef_provider` error, never silent truncation. This bounds provider enumeration before resolver
+ranking or `which --all` result admission begins. Resolution keeps only the current best satisfying
+candidate instead of cloning every candidate into a second ranking vector.
+
 | Provider | Discovery | Version knowledge | Fetch support |
 | --- | --- | --- | --- |
 | `npm-local` | nearest ancestor `node_modules/.bin/<tool>` | unknown | no |

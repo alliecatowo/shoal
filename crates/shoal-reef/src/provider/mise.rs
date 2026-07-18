@@ -6,7 +6,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use super::{Candidate, Provider, ProviderCtx, ProviderError, is_executable};
+use super::{Candidate, CandidateDiscovery, Provider, ProviderCtx, ProviderError, is_executable};
 use crate::version::{Constraint, Version};
 
 const FETCH_TIMEOUT: Duration = Duration::from_secs(15 * 60);
@@ -74,8 +74,12 @@ impl Provider for MiseProvider {
         "mise"
     }
 
-    fn discover(&self, tool: &str, _ctx: &ProviderCtx) -> Vec<Candidate> {
-        let mut out = Vec::new();
+    fn discover(
+        &self,
+        tool: &str,
+        _ctx: &ProviderCtx,
+    ) -> Result<CandidateDiscovery, ProviderError> {
+        let mut out = CandidateDiscovery::new(self.name());
         for dir in self.install_dirs(tool) {
             let Ok(entries) = std::fs::read_dir(&dir) else {
                 continue;
@@ -90,11 +94,11 @@ impl Provider for MiseProvider {
                 };
                 if let Some(bin) = self.binary_for(tool, &entry.path()) {
                     // Version comes free from the directory name — no probe needed.
-                    out.push(Candidate::new(tool, Version::parse(&name), bin, "mise"));
+                    out.push(Candidate::new(tool, Version::parse(&name), bin, "mise"))?;
                 }
             }
         }
-        out
+        Ok(out)
     }
 
     fn fetch(
@@ -115,11 +119,14 @@ impl Provider for MiseProvider {
         match output {
             Ok(output) if output.status.success() && !output.timed_out => {
                 // Re-discover to pick up the freshly installed candidate.
-                let best = self
-                    .discover(tool, ctx)
-                    .into_iter()
-                    .filter(|c| req.satisfies(&c.version))
-                    .max_by(|a, b| a.version.cmp(&b.version));
+                let best = match self.discover(tool, ctx) {
+                    Ok(discovery) => discovery
+                        .into_candidates()
+                        .into_iter()
+                        .filter(|c| req.satisfies(&c.version))
+                        .max_by(|a, b| a.version.cmp(&b.version)),
+                    Err(error) => return Some(Err(error)),
+                };
                 match best {
                     Some(c) => Some(Ok(c)),
                     None => Some(Err(ProviderError::new(
@@ -221,7 +228,10 @@ mod tests {
         install(data.path(), "node", "22.3.0");
         install(data.path(), "node", "20.11.1");
         let p = MiseProvider::new(data.path().into());
-        let mut cands = p.discover("node", &ProviderCtx::new("/"));
+        let mut cands = p
+            .discover("node", &ProviderCtx::new("/"))
+            .unwrap()
+            .into_candidates();
         cands.sort_by(|a, b| b.version.cmp(&a.version));
         assert_eq!(cands.len(), 2);
         assert_eq!(cands[0].version.raw(), "22.3.0");
@@ -234,7 +244,12 @@ mod tests {
     fn missing_tool_yields_nothing() {
         let data = tempfile::tempdir().unwrap();
         let p = MiseProvider::new(data.path().into());
-        assert!(p.discover("ghost", &ProviderCtx::new("/")).is_empty());
+        assert!(
+            p.discover("ghost", &ProviderCtx::new("/"))
+                .unwrap()
+                .into_candidates()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -296,12 +311,16 @@ mod tests {
         assert_eq!(
             provider
                 .discover("actionlint", &ProviderCtx::new("/"))
+                .unwrap()
+                .into_candidates()
                 .len(),
             1
         );
         assert_eq!(
             provider
                 .discover("cargo-audit", &ProviderCtx::new("/"))
+                .unwrap()
+                .into_candidates()
                 .len(),
             1
         );
@@ -313,6 +332,11 @@ mod tests {
         // Create the version dir but no bin/<tool>.
         std::fs::create_dir_all(data.path().join("installs/node/9.9.9/bin")).unwrap();
         let p = MiseProvider::new(data.path().into());
-        assert!(p.discover("node", &ProviderCtx::new("/")).is_empty());
+        assert!(
+            p.discover("node", &ProviderCtx::new("/"))
+                .unwrap()
+                .into_candidates()
+                .is_empty()
+        );
     }
 }

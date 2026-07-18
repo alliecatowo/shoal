@@ -22,6 +22,37 @@ fn self_ack_env_is_an_explicit_boolean() {
 }
 
 #[test]
+fn attached_peer_disconnect_errors_are_clean_but_pre_auth_errors_remain_visible() {
+    for kind in [
+        io::ErrorKind::BrokenPipe,
+        io::ErrorKind::ConnectionAborted,
+        io::ErrorKind::ConnectionReset,
+        io::ErrorKind::InvalidInput,
+        io::ErrorKind::UnexpectedEof,
+    ] {
+        assert!(
+            normalize_attached_disconnect(Err(io::Error::from(kind)), true).is_ok(),
+            "{kind:?}"
+        );
+        assert_eq!(
+            normalize_attached_disconnect(Err(io::Error::from(kind)), false)
+                .unwrap_err()
+                .kind(),
+            kind
+        );
+    }
+    assert_eq!(
+        normalize_attached_disconnect(
+            Err(io::Error::new(io::ErrorKind::PermissionDenied, "revoked")),
+            true,
+        )
+        .unwrap_err()
+        .kind(),
+        io::ErrorKind::PermissionDenied
+    );
+}
+
+#[test]
 fn connection_quota_reservation_is_atomic_and_released_on_drop() {
     let kernel = Kernel::new();
     kernel.configure_limits(Limits {

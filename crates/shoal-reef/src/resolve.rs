@@ -448,31 +448,36 @@ impl Resolver {
         ctx: &ProviderCtx,
         probe_guard: &mut dyn FnMut(&Candidate) -> ReefResult<()>,
     ) -> ReefResult<Option<Candidate>> {
-        let mut ranked: Vec<(Version, usize, PathBuf, Candidate)> = Vec::new();
+        let mut best: Option<(usize, Candidate)> = None;
         for (idx, provider) in self.providers.iter().enumerate() {
             if let Some(pin) = provider_pin
                 && provider.name() != pin
             {
                 continue;
             }
-            for mut cand in provider.discover(name, ctx) {
+            let discovery = provider
+                .discover(name, ctx)
+                .map_err(|error| ReefError::provider(error.to_string()))?;
+            for mut cand in discovery.into_candidates() {
                 // Probe a version only when the constraint actually needs one.
                 if constraint.needs_version() && cand.version.is_unknown() {
                     probe_guard(&cand)?;
                     cand.version = provider.version_of(&cand, ctx);
                 }
                 if constraint.satisfies(&cand.version) {
-                    ranked.push((cand.version.clone(), idx, cand.path.clone(), cand));
+                    let replace = best.as_ref().is_none_or(|(best_idx, current)| {
+                        cand.version > current.version
+                            || (cand.version == current.version
+                                && (idx < *best_idx
+                                    || (idx == *best_idx && cand.path < current.path)))
+                    });
+                    if replace {
+                        best = Some((idx, cand));
+                    }
                 }
             }
         }
-        Ok(ranked
-            .into_iter()
-            .max_by(|a, b| {
-                // Higher version wins; then lower provider index; then lower path.
-                a.0.cmp(&b.0).then(b.1.cmp(&a.1)).then(b.2.cmp(&a.2))
-            })
-            .map(|(_, _, _, c)| c))
+        Ok(best.map(|(_, candidate)| candidate))
     }
 
     fn chain_decisions(

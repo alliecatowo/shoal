@@ -81,6 +81,9 @@ or over-16-MiB JSON frame ends that connection. The byte limit is applied during
 nonallocating lexical preflight applies the complexity limits before tree decoding. Public
 connections default to a 10-second first-byte/remainder deadline. The MCP stdio facade instead
 reports malformed MCP JSON as `-32700` and uses the same framing preflight for kernel responses.
+Once attached, closing the client socket is a normal disconnect even when the host reports a
+reset/broken-pipe (or macOS timeout-update `EINVAL`) race; the kernel removes that connection's
+subscriptions without treating peer departure as a daemon failure.
 
 Use one writer lock per connection. A subscription writer in the kernel may emit a complete `event` frame while ordinary request handling is active, but the kernel serializes whole frames so bytes do not interleave.
 

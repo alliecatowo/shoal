@@ -156,6 +156,12 @@ constrained in scope; ordinary PATH behavior remains unchanged.
 ## Provider contract and default stack
 
 Providers enumerate candidates without network and, where possible, without running the binary.
+The trait returns `Result<CandidateDiscovery, ProviderError>`, not `Vec<Candidate>`.
+`CandidateDiscovery::push` admits at most 4,096 identities / 16 MiB of tool, version, provider, and
+encoded-path state. Built-in providers use it while enumerating, and external implementations cannot
+construct an accepted discovery without the same admission. Overflow maps to `reef_provider` rather
+than an incomplete candidate set. The resolver folds admitted candidates into one current best
+value; it does not duplicate the discovery into a second ranked collection.
 Version probing is separated so the resolver invokes it only for constraints that require a
 concrete version. Fetch is optional and only explicitly invoked by `reef fetch` today.
 

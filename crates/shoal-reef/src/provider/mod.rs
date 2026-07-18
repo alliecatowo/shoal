@@ -42,6 +42,75 @@ pub struct Candidate {
     pub ambient: bool,
 }
 
+/// An admitted provider-discovery result. Providers cannot hand the resolver
+/// a raw, potentially unbounded vector: candidates enter this collection one
+/// at a time under shared identity and retained-path walls.
+#[derive(Debug)]
+pub struct CandidateDiscovery {
+    provider: &'static str,
+    candidates: Vec<Candidate>,
+    retained_bytes: usize,
+}
+
+pub const MAX_DISCOVERY_CANDIDATES: usize = 4_096;
+pub const MAX_DISCOVERY_RETAINED_BYTES: usize = 16 * 1024 * 1024;
+
+impl CandidateDiscovery {
+    pub fn new(provider: &'static str) -> Self {
+        Self {
+            provider,
+            candidates: Vec::new(),
+            retained_bytes: 0,
+        }
+    }
+
+    pub fn from_candidates(
+        provider: &'static str,
+        candidates: impl IntoIterator<Item = Candidate>,
+    ) -> Result<Self, ProviderError> {
+        let mut discovery = Self::new(provider);
+        for candidate in candidates {
+            discovery.push(candidate)?;
+        }
+        Ok(discovery)
+    }
+
+    pub fn push(&mut self, candidate: Candidate) -> Result<(), ProviderError> {
+        if self.candidates.len() >= MAX_DISCOVERY_CANDIDATES {
+            return Err(ProviderError::new(
+                self.provider,
+                format!("candidate identity limit reached ({MAX_DISCOVERY_CANDIDATES})"),
+            ));
+        }
+        let retained = candidate
+            .tool
+            .len()
+            .checked_add(candidate.version.to_string().len())
+            .and_then(|bytes| {
+                bytes.checked_add(candidate.path.as_os_str().as_encoded_bytes().len())
+            })
+            .and_then(|bytes| bytes.checked_add(candidate.provider.len()))
+            .and_then(|bytes| bytes.checked_add(128))
+            .ok_or_else(|| ProviderError::new(self.provider, "candidate accounting overflowed"))?;
+        let next = self.retained_bytes.checked_add(retained).ok_or_else(|| {
+            ProviderError::new(self.provider, "candidate aggregate accounting overflowed")
+        })?;
+        if next > MAX_DISCOVERY_RETAINED_BYTES {
+            return Err(ProviderError::new(
+                self.provider,
+                format!("candidate retained state exceeds {MAX_DISCOVERY_RETAINED_BYTES} bytes"),
+            ));
+        }
+        self.retained_bytes = next;
+        self.candidates.push(candidate);
+        Ok(())
+    }
+
+    pub fn into_candidates(self) -> Vec<Candidate> {
+        self.candidates
+    }
+}
+
 impl Candidate {
     pub fn new(
         tool: impl Into<String>,
@@ -177,7 +246,7 @@ pub trait Provider: Send + Sync {
     /// Enumerate candidates for `tool`. Must be fast and must **not** probe
     /// `--version` — leave [`Candidate::version`] as [`Version::unknown`] when
     /// the version is not free to compute (e.g. from a directory name).
-    fn discover(&self, tool: &str, ctx: &ProviderCtx) -> Vec<Candidate>;
+    fn discover(&self, tool: &str, ctx: &ProviderCtx) -> Result<CandidateDiscovery, ProviderError>;
 
     /// Resolve the concrete version of a candidate, probing if necessary and
     /// caching the result. Default: return whatever `discover` already knew.
@@ -320,6 +389,32 @@ mod tests {
         assert_eq!(parse_version_token("v22.3.0\n").raw(), "22.3.0");
         assert_eq!(parse_version_token("node (v20.11.1)").raw(), "20.11.1");
         assert!(parse_version_token("no version here").is_unknown());
+    }
+
+    #[test]
+    fn candidate_discovery_rejects_identity_and_retained_byte_overflow() {
+        let candidates = (0..=MAX_DISCOVERY_CANDIDATES).map(|index| {
+            Candidate::new(
+                format!("tool-{index}"),
+                Version::unknown(),
+                PathBuf::from(format!("/bin/tool-{index}")),
+                "fixture",
+            )
+        });
+        let error = CandidateDiscovery::from_candidates("fixture", candidates).unwrap_err();
+        assert!(error.msg.contains("identity limit"));
+
+        let mut discovery = CandidateDiscovery::new("fixture");
+        let error = discovery
+            .push(Candidate::new(
+                "x".repeat(MAX_DISCOVERY_RETAINED_BYTES + 1),
+                Version::unknown(),
+                PathBuf::from("/bin/x"),
+                "fixture",
+            ))
+            .unwrap_err();
+        assert!(error.msg.contains("retained state"));
+        assert!(discovery.into_candidates().is_empty());
     }
 
     #[test]

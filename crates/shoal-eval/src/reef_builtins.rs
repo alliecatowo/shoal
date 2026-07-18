@@ -5,6 +5,8 @@
 //! mechanics these commands call into.
 
 use super::*;
+use crate::builtins::admission::{OutputBudget, OutputValues, table_record};
+use std::collections::HashSet;
 use std::io::Read as _;
 
 use shoal_reef::hashcache::HashCache;
@@ -77,7 +79,7 @@ impl Evaluator {
                     }
                     self.exec.reef.lock = lock;
                 }
-                Ok(report_to_record(&res.report))
+                report_to_record(&res.report)
             }
             // A genuine "nothing anywhere provides this" miss falls back to
             // the ambient PATH lookup so `which` never regresses today's
@@ -162,21 +164,16 @@ impl Evaluator {
                 "class".into(),
                 Value::Str(format!("{:?}", adapter.class).to_ascii_lowercase()),
             );
-            schema.insert(
-                "params".into(),
-                Value::List(
-                    adapter
-                        .top
-                        .params
-                        .iter()
-                        .map(|param| Value::Str(param.name.clone()))
-                        .collect(),
-                ),
-            );
-            schema.insert(
-                "subcommands".into(),
-                Value::List(adapter.subs.keys().cloned().map(Value::Str).collect()),
-            );
+            let mut params = OutputValues::new();
+            for param in &adapter.top.params {
+                params.push(Value::Str(param.name.clone()))?;
+            }
+            schema.insert("params".into(), params.finish_list());
+            let mut subcommands = OutputValues::new();
+            for subcommand in adapter.subs.keys() {
+                subcommands.push(Value::Str(subcommand.clone()))?;
+            }
+            schema.insert("subcommands".into(), subcommands.finish_list());
             record.insert("adapter".into(), Value::Record(schema));
         }
         if let Some(binding) = &resolution.binding {
@@ -204,9 +201,13 @@ impl Evaluator {
     fn which_all(&mut self, name: &str) -> VResult<Value> {
         let resolver = self.reef_resolver();
         let ctx = ProviderCtx::new(self.exec.shell.cwd.clone());
-        let mut rows = Vec::new();
+        let mut rows = OutputValues::new();
         for provider in resolver.providers() {
-            for cand in provider.discover(name, &ctx) {
+            let discovery = provider.discover(name, &ctx).map_err(|error| {
+                ErrorVal::new("reef_provider", error.to_string())
+                    .with_hint("narrow or clean the provider's installed candidate set")
+            })?;
+            for cand in discovery.into_candidates() {
                 let mut r = Record::new();
                 r.insert("tool".into(), Value::Str(cand.tool.clone()));
                 r.insert("version".into(), Value::Str(cand.version.to_string()));
@@ -216,10 +217,10 @@ impl Evaluator {
                     "scope".into(),
                     Value::Str(if cand.ambient { "ambient" } else { "system" }.into()),
                 );
-                rows.push(r);
+                rows.push(table_record(r))?;
             }
         }
-        Ok(Value::Table(rows))
+        Ok(rows.finish_table())
     }
 
     // --- `reef` builtins (site/content/internals/reef-resolution.md) -----------------------------------------
@@ -258,19 +259,11 @@ impl Evaluator {
     /// Bare `reef`: the current binding table for every constrained tool.
     fn reef_binding_table(&mut self) -> VResult<Value> {
         let chain = self.reef_chain_snapshot();
-        let mut names: Vec<String> = Vec::new();
-        for scope in &chain.scopes {
-            for tool in scope.manifest.tools.keys() {
-                if !names.contains(tool) {
-                    names.push(tool.clone());
-                }
-            }
-        }
-        names.sort();
+        let names = constrained_tool_names(&chain)?;
         let resolver = self.reef_resolver();
         let original_lock = self.exec.reef.lock.clone();
         let mut lock = original_lock.clone();
-        let mut rows = Vec::new();
+        let mut rows = OutputValues::new();
         let provider_context = self.reef_provider_context(chain.cwd.clone());
         for name in names {
             let mut r = Record::new();
@@ -311,13 +304,13 @@ impl Evaluator {
                     );
                 }
             }
-            rows.push(r);
+            rows.push(table_record(r))?;
         }
         if lock != original_lock {
             self.persist_reef_lock_value(&lock)?;
         }
         self.exec.reef.lock = lock;
-        Ok(Value::Table(rows))
+        Ok(rows.finish_table())
     }
 
     /// `reef add <tool>@<ver>`: write the target `.reef.toml` and lock the tool.
@@ -459,18 +452,10 @@ impl Evaluator {
                 "reef lock: no manifest in scope",
             ));
         }
-        let mut names: Vec<String> = Vec::new();
-        for scope in &chain.scopes {
-            for tool in scope.manifest.tools.keys() {
-                if !names.contains(tool) {
-                    names.push(tool.clone());
-                }
-            }
-        }
-        names.sort();
+        let names = constrained_tool_names(&chain)?;
         let resolver = self.reef_resolver();
         let mut lock = self.exec.reef.lock.clone();
-        let mut rows = Vec::new();
+        let mut rows = OutputValues::new();
         let provider_context = self.reef_provider_context(chain.cwd.clone());
         for name in names {
             let mut r = Record::new();
@@ -508,11 +493,11 @@ impl Evaluator {
                     r.insert("error".into(), Value::Str(e.code_str().to_string()));
                 }
             }
-            rows.push(r);
+            rows.push(table_record(r))?;
         }
         self.persist_reef_lock_value(&lock)?;
         self.exec.reef.lock = lock;
-        Ok(Value::Table(rows))
+        Ok(rows.finish_table())
     }
 
     /// `reef fetch <tool>`: delegate to the tool's provider(s); may no-op when
@@ -588,20 +573,14 @@ impl Evaluator {
             row.insert("check".into(), Value::Str("lockfile".into()));
             row.insert("status".into(), Value::Str("invalid".into()));
             row.insert("note".into(), Value::Str(error));
-            return Ok(Value::Table(vec![row]));
+            let mut rows = OutputValues::new();
+            rows.push(table_record(row))?;
+            return Ok(rows.finish_table());
         }
-        let mut names: Vec<String> = Vec::new();
-        for scope in &chain.scopes {
-            for tool in scope.manifest.tools.keys() {
-                if !names.contains(tool) {
-                    names.push(tool.clone());
-                }
-            }
-        }
-        names.sort();
+        let names = constrained_tool_names(&chain)?;
 
         let hashes = HashCache::new();
-        let mut rows = Vec::new();
+        let mut rows = OutputValues::new();
 
         for name in &names {
             let mut r = Record::new();
@@ -632,7 +611,7 @@ impl Evaluator {
                     r.insert("current_hash8".into(), Value::Null);
                 }
             }
-            rows.push(r);
+            rows.push(table_record(r))?;
 
             if let Some(entry) = self.exec.reef.lock.get(name)
                 && let Some(ambient) = self.ambient_which(name)
@@ -644,7 +623,7 @@ impl Evaluator {
                 s.insert("status".into(), Value::Str("shadowed".into()));
                 s.insert("path".into(), Value::Path(entry.path.clone()));
                 s.insert("ambient_path".into(), Value::Path(ambient));
-                rows.push(s);
+                rows.push(table_record(s))?;
             }
         }
 
@@ -657,10 +636,10 @@ impl Evaluator {
             r.insert("check".into(), Value::Str("orphan".into()));
             r.insert("status".into(), Value::Str("orphan".into()));
             r.insert("path".into(), Value::Path(entry.path.clone()));
-            rows.push(r);
+            rows.push(table_record(r))?;
         }
 
-        Ok(Value::Table(rows))
+        Ok(rows.finish_table())
     }
 }
 
@@ -704,7 +683,7 @@ fn read_optional_reef_manifest(fs: &dyn Fs, path: &Path) -> VResult<Option<Strin
 }
 
 /// Map a resolved [`ResolutionReport`] to the record `which` renders (site/content/internals/reef-resolution.md).
-fn report_to_record(report: &ResolutionReport) -> Value {
+fn report_to_record(report: &ResolutionReport) -> VResult<Value> {
     let mut r = Record::new();
     r.insert("name".into(), Value::Str(report.name.clone()));
     r.insert("source".into(), Value::Str("external".into()));
@@ -719,23 +698,41 @@ fn report_to_record(report: &ResolutionReport) -> Value {
     r.insert("hash8".into(), Value::Str(short_hash(&report.hash)));
     r.insert("hash".into(), Value::Str(report.hash.clone()));
     r.insert("provider".into(), Value::Str(report.provider.clone()));
-    let chain = report
-        .chain
-        .iter()
-        .map(|d| {
-            let mut row = Record::new();
-            row.insert("scope".into(), Value::Str(d.scope.clone()));
-            row.insert("source".into(), Value::Path(d.source.clone()));
-            row.insert(
-                "constraint".into(),
-                d.constraint.clone().map(Value::Str).unwrap_or(Value::Null),
-            );
-            row.insert("outcome".into(), Value::Str(d.outcome.clone()));
-            row
-        })
-        .collect();
-    r.insert("chain".into(), Value::Table(chain));
-    Value::Record(r)
+    let mut chain = OutputValues::new();
+    for decision in &report.chain {
+        let mut row = Record::new();
+        row.insert("scope".into(), Value::Str(decision.scope.clone()));
+        row.insert("source".into(), Value::Path(decision.source.clone()));
+        row.insert(
+            "constraint".into(),
+            decision
+                .constraint
+                .clone()
+                .map(Value::Str)
+                .unwrap_or(Value::Null),
+        );
+        row.insert("outcome".into(), Value::Str(decision.outcome.clone()));
+        chain.push(table_record(row))?;
+    }
+    r.insert("chain".into(), chain.finish_table());
+    Ok(Value::Record(r))
+}
+
+fn constrained_tool_names(chain: &ScopeChain) -> VResult<Vec<String>> {
+    let mut seen = HashSet::new();
+    let mut names = Vec::new();
+    let mut budget = OutputBudget::new();
+    for scope in &chain.scopes {
+        for tool in scope.manifest.tools.keys() {
+            if seen.insert(tool.as_str()) {
+                let value = Value::Str(tool.clone());
+                budget.admit_value(&value)?;
+                names.push(tool.clone());
+            }
+        }
+    }
+    names.sort();
+    Ok(names)
 }
 
 /// The `which` record for a resolver error that is NOT a plain "not found"

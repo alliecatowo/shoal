@@ -1,7 +1,7 @@
 //! venv provider: a project virtualenv's `.venv/bin/<tool>` when present. Walks
 //! up from the cwd. Versions are opaque-unknown.
 
-use super::{Candidate, Provider, ProviderCtx, is_executable};
+use super::{Candidate, CandidateDiscovery, Provider, ProviderCtx, ProviderError, is_executable};
 use crate::version::Version;
 
 pub struct VenvProvider;
@@ -23,16 +23,18 @@ impl Provider for VenvProvider {
         "venv"
     }
 
-    fn discover(&self, tool: &str, ctx: &ProviderCtx) -> Vec<Candidate> {
+    fn discover(&self, tool: &str, ctx: &ProviderCtx) -> Result<CandidateDiscovery, ProviderError> {
+        let mut discovery = CandidateDiscovery::new(self.name());
         let mut dir = Some(ctx.cwd.as_path());
         while let Some(d) = dir {
             let bin = d.join(".venv").join("bin").join(tool);
             if is_executable(&bin) {
-                return vec![Candidate::new(tool, Version::unknown(), bin, "venv")];
+                discovery.push(Candidate::new(tool, Version::unknown(), bin, "venv"))?;
+                return Ok(discovery);
             }
             dir = d.parent();
         }
-        Vec::new()
+        Ok(discovery)
     }
 }
 
@@ -55,7 +57,10 @@ mod tests {
         let p = VenvProvider::new();
         let sub = root.path().join("pkg");
         std::fs::create_dir_all(&sub).unwrap();
-        let cands = p.discover("black", &ProviderCtx::new(sub));
+        let cands = p
+            .discover("black", &ProviderCtx::new(sub))
+            .unwrap()
+            .into_candidates();
         assert_eq!(cands.len(), 1);
         assert_eq!(cands[0].provider, "venv");
     }

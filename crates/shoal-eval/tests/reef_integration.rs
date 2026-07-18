@@ -13,7 +13,8 @@ use std::sync::Arc;
 use shoal_eval::Evaluator;
 use shoal_leash::Policy as LeashPolicy;
 use shoal_reef::provider::{
-    Candidate, MiseProvider, Provider, ProviderCtx, ProviderError, SystemProvider,
+    Candidate, CandidateDiscovery, MiseProvider, Provider, ProviderCtx, ProviderError,
+    SystemProvider,
 };
 use shoal_reef::{Constraint, Resolver, Version};
 use shoal_value::Value;
@@ -217,8 +218,12 @@ fn restricted_principal_denies_provider_fetch_before_installer_hook() {
             "fetch-fixture"
         }
 
-        fn discover(&self, _tool: &str, _ctx: &ProviderCtx) -> Vec<Candidate> {
-            Vec::new()
+        fn discover(
+            &self,
+            _tool: &str,
+            _ctx: &ProviderCtx,
+        ) -> Result<CandidateDiscovery, ProviderError> {
+            Ok(CandidateDiscovery::new(self.name()))
         }
 
         fn fetch(
@@ -385,8 +390,12 @@ fn provider_pinned_fetch_never_invokes_other_installers() {
             self.name
         }
 
-        fn discover(&self, _tool: &str, _ctx: &ProviderCtx) -> Vec<Candidate> {
-            Vec::new()
+        fn discover(
+            &self,
+            _tool: &str,
+            _ctx: &ProviderCtx,
+        ) -> Result<CandidateDiscovery, ProviderError> {
+            Ok(CandidateDiscovery::new(self.name()))
         }
 
         fn fetch(

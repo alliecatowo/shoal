@@ -1,5 +1,5 @@
 use super::*;
-use crate::provider::{Candidate, ProviderError};
+use crate::provider::{Candidate, CandidateDiscovery, ProviderError};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,12 +13,15 @@ impl Provider for FakeProvider {
     fn name(&self) -> &'static str {
         self.name
     }
-    fn discover(&self, tool: &str, _ctx: &ProviderCtx) -> Vec<Candidate> {
-        self.cands
-            .iter()
-            .filter(|c| c.tool == tool)
-            .cloned()
-            .collect()
+    fn discover(
+        &self,
+        tool: &str,
+        _ctx: &ProviderCtx,
+    ) -> Result<CandidateDiscovery, ProviderError> {
+        CandidateDiscovery::from_candidates(
+            self.name,
+            self.cands.iter().filter(|c| c.tool == tool).cloned(),
+        )
     }
     fn fetch(
         &self,
@@ -64,13 +67,20 @@ fn denied_probe_never_executes_candidate_version_hook() {
             "probe"
         }
 
-        fn discover(&self, tool: &str, _ctx: &ProviderCtx) -> Vec<Candidate> {
-            vec![Candidate::new(
-                tool,
-                Version::unknown(),
-                self.path.clone(),
-                "probe",
-            )]
+        fn discover(
+            &self,
+            tool: &str,
+            _ctx: &ProviderCtx,
+        ) -> Result<CandidateDiscovery, ProviderError> {
+            CandidateDiscovery::from_candidates(
+                self.name(),
+                [Candidate::new(
+                    tool,
+                    Version::unknown(),
+                    self.path.clone(),
+                    "probe",
+                )],
+            )
         }
 
         fn version_of(&self, _candidate: &Candidate, _ctx: &ProviderCtx) -> Version {

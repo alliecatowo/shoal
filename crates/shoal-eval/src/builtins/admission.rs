@@ -3,10 +3,10 @@
 
 use shoal_value::{OpaqueHandling, Record, RetainedLimits, VResult, Value, retained_size};
 
-pub(super) const MAX_VALUES: usize = 16_384;
-pub(super) const MAX_RETAINED_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_VALUES: usize = 16_384;
+pub(crate) const MAX_RETAINED_BYTES: usize = 16 * 1024 * 1024;
 
-pub(super) struct OutputValues {
+pub(crate) struct OutputValues {
     values: Vec<Value>,
     retained_bytes: usize,
     max_values: usize,
@@ -14,11 +14,11 @@ pub(super) struct OutputValues {
 }
 
 impl OutputValues {
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::with_limits(MAX_VALUES, MAX_RETAINED_BYTES)
     }
 
-    pub(super) fn with_limits(max_values: usize, max_retained_bytes: usize) -> Self {
+    pub(crate) fn with_limits(max_values: usize, max_retained_bytes: usize) -> Self {
         Self {
             values: Vec::new(),
             retained_bytes: 0,
@@ -27,15 +27,15 @@ impl OutputValues {
         }
     }
 
-    pub(super) fn remaining_values(&self) -> usize {
+    pub(crate) fn remaining_values(&self) -> usize {
         self.max_values.saturating_sub(self.values.len())
     }
 
-    pub(super) fn remaining_retained_bytes(&self) -> usize {
+    pub(crate) fn remaining_retained_bytes(&self) -> usize {
         self.max_retained_bytes.saturating_sub(self.retained_bytes)
     }
 
-    pub(super) fn push(&mut self, value: Value) -> VResult<()> {
+    pub(crate) fn push(&mut self, value: Value) -> VResult<()> {
         if self.values.len() >= self.max_values {
             return Err(output_limit(format!(
                 "builtin result reached its {}-value limit",
@@ -66,11 +66,11 @@ impl OutputValues {
         Ok(())
     }
 
-    pub(super) fn finish_list(self) -> Value {
+    pub(crate) fn finish_list(self) -> Value {
         Value::List(self.values)
     }
 
-    pub(super) fn finish_table(self) -> Value {
+    pub(crate) fn finish_table(self) -> Value {
         Value::Table(
             self.values
                 .into_iter()
@@ -83,27 +83,27 @@ impl OutputValues {
     }
 }
 
-pub(super) struct OutputBudget {
+pub(crate) struct OutputBudget {
     values: usize,
     retained_bytes: usize,
 }
 
 impl OutputBudget {
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             values: 0,
             retained_bytes: 0,
         }
     }
 
-    pub(super) fn admit_record_entry(&mut self, key: &str, value: &Value) -> VResult<()> {
+    pub(crate) fn admit_value(&mut self, value: &Value) -> VResult<()> {
         if self.values >= MAX_VALUES {
             return Err(output_limit(format!(
                 "builtin result reached its {MAX_VALUES}-value limit"
             )));
         }
         let retained = retained_size(
-            &Value::List(vec![Value::Str(key.to_owned()), value.clone()]),
+            value,
             RetainedLimits {
                 max_bytes: MAX_RETAINED_BYTES.saturating_sub(self.retained_bytes),
                 max_depth: 64,
@@ -123,6 +123,13 @@ impl OutputBudget {
             .ok_or_else(|| output_limit("builtin result accounting overflowed"))?;
         self.values += 1;
         Ok(())
+    }
+
+    pub(crate) fn admit_record_entry(&mut self, key: &str, value: &Value) -> VResult<()> {
+        self.admit_value(&Value::List(vec![
+            Value::Str(key.to_owned()),
+            value.clone(),
+        ]))
     }
 }
 
@@ -164,12 +171,12 @@ impl OutputString {
     }
 }
 
-pub(super) fn output_limit(message: impl Into<String>) -> shoal_value::ErrorVal {
+pub(crate) fn output_limit(message: impl Into<String>) -> shoal_value::ErrorVal {
     shoal_value::ErrorVal::new("builtin_output_limit", message)
         .with_hint("narrow the input, process it as a stream, or request a bounded subset")
 }
 
-pub(super) fn table_record(value: Record) -> Value {
+pub(crate) fn table_record(value: Record) -> Value {
     Value::Record(value)
 }
 

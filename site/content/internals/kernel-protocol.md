@@ -45,6 +45,9 @@ accDescr: Each socket connection authenticates a principal, attaches to that pri
 
 On disconnect, subscriptions associated with that connection are removed. An unattached idle session
 can be evicted after 24 hours or to admit another session under the configured process/principal cap.
+After attachment, peer-close transport errors are normalized to an ordinary disconnect; this includes
+Darwin's `EINVAL` race when the peer closes while the server updates `SO_RCVTIMEO`. Pre-attachment
+framing/admission errors and permission/revocation failures remain observable errors.
 
 Sources: [`shoal-kernel/src/lib.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-kernel/src/lib.rs)
 and [`session.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-kernel/src/session.rs).

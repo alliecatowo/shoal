@@ -96,8 +96,12 @@ impl Provider for SystemProvider {
         "system"
     }
 
-    fn discover(&self, tool: &str, _ctx: &ProviderCtx) -> Vec<Candidate> {
-        let mut out = Vec::new();
+    fn discover(
+        &self,
+        tool: &str,
+        _ctx: &ProviderCtx,
+    ) -> Result<super::CandidateDiscovery, super::ProviderError> {
+        let mut out = super::CandidateDiscovery::new(self.name());
         let mut seen = std::collections::HashSet::new();
         for (dirs, ambient) in [(&self.roots, false), (&self.ambient, true)] {
             for dir in dirs {
@@ -105,11 +109,11 @@ impl Provider for SystemProvider {
                 if is_executable(&path) && seen.insert(path.clone()) {
                     let mut c = Candidate::new(tool, Version::unknown(), path, "system");
                     c.ambient = ambient;
-                    out.push(c);
+                    out.push(c)?;
                 }
             }
         }
-        out
+        Ok(out)
     }
 
     fn version_of(&self, cand: &Candidate, ctx: &ProviderCtx) -> Version {
@@ -174,7 +178,10 @@ mod tests {
         make_exe(root.path(), "mytool", "#!/bin/sh\necho 1.0.0\n");
         make_exe(amb.path(), "mytool", "#!/bin/sh\necho 2.0.0\n");
         let p = SystemProvider::new(vec![root.path().into()], vec![amb.path().into()]);
-        let cands = p.discover("mytool", &ProviderCtx::new("/"));
+        let cands = p
+            .discover("mytool", &ProviderCtx::new("/"))
+            .unwrap()
+            .into_candidates();
         assert_eq!(cands.len(), 2);
         // discover must not probe: versions stay unknown.
         assert!(cands.iter().all(|c| c.version.is_unknown()));
@@ -187,7 +194,10 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         make_exe(root.path(), "probed", "#!/bin/sh\necho 'probed 4.5.6'\n");
         let p = SystemProvider::new(vec![root.path().into()], vec![]);
-        let cands = p.discover("probed", &ProviderCtx::new("/"));
+        let cands = p
+            .discover("probed", &ProviderCtx::new("/"))
+            .unwrap()
+            .into_candidates();
         let v = p.version_of(&cands[0], &ProviderCtx::new("/"));
         assert_eq!(v.raw(), "4.5.6");
         // Cached path present.
@@ -202,7 +212,12 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("plain"), b"not exec").unwrap();
         let p = SystemProvider::new(vec![root.path().into()], vec![]);
-        assert!(p.discover("plain", &ProviderCtx::new("/")).is_empty());
+        assert!(
+            p.discover("plain", &ProviderCtx::new("/"))
+                .unwrap()
+                .into_candidates()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -210,7 +225,11 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         make_exe(root.path(), "probed", "#!/bin/sh\necho 'probed 4.5.6'\n");
         let provider = std::sync::Arc::new(SystemProvider::new(vec![root.path().into()], vec![]));
-        let candidate = provider.discover("probed", &ProviderCtx::new("/"))[0].clone();
+        let candidate = provider
+            .discover("probed", &ProviderCtx::new("/"))
+            .unwrap()
+            .into_candidates()[0]
+            .clone();
         let poison_target = provider.clone();
         let poisoned_path = candidate.path.clone();
         let poisoner = std::thread::Builder::new()
@@ -248,7 +267,11 @@ mod tests {
             "#!/bin/sh\necho 'changing 1.0.0'\n",
         );
         let provider = SystemProvider::new(vec![root.path().into()], vec![]);
-        let candidate = provider.discover("changing", &ProviderCtx::new("/"))[0].clone();
+        let candidate = provider
+            .discover("changing", &ProviderCtx::new("/"))
+            .unwrap()
+            .into_candidates()[0]
+            .clone();
         assert_eq!(
             provider
                 .version_of(&candidate, &ProviderCtx::new("/"))
@@ -282,7 +305,11 @@ mod tests {
         );
         let original_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
         let provider = SystemProvider::new(vec![root.path().into()], vec![]);
-        let candidate = provider.discover("changing", &ProviderCtx::new("/"))[0].clone();
+        let candidate = provider
+            .discover("changing", &ProviderCtx::new("/"))
+            .unwrap()
+            .into_candidates()[0]
+            .clone();
         assert_eq!(
             provider
                 .version_of(&candidate, &ProviderCtx::new("/"))

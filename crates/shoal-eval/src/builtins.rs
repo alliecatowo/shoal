@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-mod admission;
+pub(crate) mod admission;
 mod copy;
 use admission::{
     MAX_RETAINED_BYTES, OutputBudget, OutputString, OutputValues, output_limit, table_record,

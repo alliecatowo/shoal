@@ -506,6 +506,8 @@ which --all python
 ```
 
 `--all` enumerates raw candidates from every provider without making a lock/conflict decision. Exactly one name is required. Protection states such as conflict, drift, or unlocked are represented as an unresolved report rather than silently lying with an ambient path.
+Candidate tables and nested scope/adapter lists use the shared 16,384-value / 16 MiB builtin result
+wall and raise `builtin_output_limit` rather than returning a partial report.
 
 See [Reef environments](@/docs/reef.md) for the report and lock model.
 
@@ -741,6 +743,9 @@ reef doctor
 ```
 
 The detailed discovery, lock, provider, runner, drift, and error contract lives in [Reef environments](@/docs/reef.md).
+Binding, lock, doctor, and candidate tables admit names and rows incrementally against the shared
+16,384-value / 16 MiB builtin result wall. Overflow is `builtin_output_limit`; a mutating lock
+command does not persist its staged lock when result admission fails.
 
 ## Canonical names versus callable builtins
 

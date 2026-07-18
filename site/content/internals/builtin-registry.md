@@ -139,6 +139,9 @@ directory reads so `ls` enforces the row wall during iteration, not after collec
 work stack shares count/byte admission with finalized operations, preventing recursive pending
 vectors from multiplying memory by depth; execution begins only after the complete bounded plan is
 valid.
+The same admission module is crate-visible to `reef_builtins.rs`: `which --all`, binding/lock/doctor
+tables, adapter schema lists, and resolution scope chains cannot bypass the structured-result wall.
+Reef lock updates remain staged until every output row is admitted.
 
 | Head | Key arguments/flags | Raw structured result |
 |---|---|---|
