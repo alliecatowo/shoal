@@ -605,6 +605,10 @@ fn production_evaluator_has_only_explicit_ambient_filesystem_exceptions() {
             text: "if metadata.is_dir() {",
         },
         ExpectedLine {
+            file: "builtins/copy.rs",
+            text: "if source_metadata.is_dir() && canonical_destination.starts_with(&canonical_source) {",
+        },
+        ExpectedLine {
             file: "path_access.rs",
             text: ".map(|m| m.is_dir())",
         },

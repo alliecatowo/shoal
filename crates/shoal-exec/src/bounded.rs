@@ -290,8 +290,18 @@ fn drain_pipe<R: Read>(
     // bounded effort to empty kernel pipe buffers. A continuously writing
     // escaped descendant must not turn cleanup back into an unbounded drain.
     let mut post_stop_budget: usize = 64 * 1024;
+    let mut post_stop_deadline = None;
     loop {
         let stopping = stop.load(Ordering::Acquire);
+        if stopping && post_stop_deadline.is_none() {
+            // Seeing the leader exit and seeing its final pipe writes are not
+            // one scheduler event on every Unix. In particular, macOS can
+            // briefly return EAGAIN to a reader first scheduled after wait
+            // reports the child. Allow a small bounded grace period so the
+            // retained prefix is not lost, while escaped writers still cannot
+            // hold the join indefinitely.
+            post_stop_deadline = Some(Instant::now() + Duration::from_millis(50));
+        }
         if stopping && post_stop_budget == 0 {
             return Ok(());
         }
@@ -317,7 +327,11 @@ fn drain_pipe<R: Read>(
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 if stopping {
-                    return Ok(());
+                    if post_stop_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                        return Ok(());
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                    continue;
                 }
                 thread::sleep(Duration::from_millis(2));
             }

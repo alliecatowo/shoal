@@ -2,6 +2,7 @@
 
 use super::admission::{MAX_RETAINED_BYTES, MAX_VALUES};
 use shoal_value::{ErrorVal, Fs, OpaqueHandling, RetainedLimits, VResult, Value, retained_size};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 const MAX_COPY_DEPTH: usize = 64;
@@ -69,6 +70,7 @@ impl CopyPlan {
         // This is a LIFO work stack. Reverse initial jobs and sorted children
         // so the resulting operation order remains caller/lexical order.
         for (source, destination) in jobs.iter().rev() {
+            validate_root_job(fs, source, destination)?;
             plan.admit_pending(&mut pending, source.clone(), destination.clone(), 0)?;
         }
         while let Some(path) = pending.pop() {
@@ -239,6 +241,130 @@ impl CopyPlan {
     }
 }
 
+/// Refuse aliases of the same file and recursive destinations inside their
+/// source before inventory or execution. Canonicalizing the closest existing
+/// destination ancestor catches symlinked parents even when the leaf does not
+/// exist yet.
+fn validate_root_job(fs: &dyn Fs, source: &Path, destination: &Path) -> VResult<()> {
+    let source_metadata = fs
+        .metadata(source)
+        .map_err(|error| super::ioerr("copy", source, error))?;
+    let canonical_source = fs
+        .canonicalize(source)
+        .map_err(|error| super::ioerr("copy", source, error))?;
+    let canonical_destination = canonicalize_with_missing_tail(fs, destination)?;
+
+    if canonical_source == canonical_destination
+        || existing_files_are_identical(fs, &source_metadata, destination)?
+    {
+        return Err(copy_relation_error(format!(
+            "source and destination are the same file: {}",
+            source.display()
+        )));
+    }
+    if source_metadata.is_dir() && canonical_destination.starts_with(&canonical_source) {
+        return Err(copy_relation_error(format!(
+            "cannot copy directory {} into itself at {}",
+            source.display(),
+            destination.display()
+        )));
+    }
+    Ok(())
+}
+
+fn canonicalize_with_missing_tail(fs: &dyn Fs, path: &Path) -> VResult<PathBuf> {
+    let normalized = normalize_lexically(path);
+    let mut existing = normalized.as_path();
+    let mut missing = Vec::<OsString>::new();
+    loop {
+        match fs.canonicalize(existing) {
+            Ok(mut canonical) => {
+                for component in missing.iter().rev() {
+                    canonical.push(component);
+                }
+                return Ok(canonical);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let name = existing.file_name().ok_or_else(|| {
+                    super::ioerr(
+                        "copy",
+                        path,
+                        std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "destination has no existing ancestor",
+                        ),
+                    )
+                })?;
+                missing.push(name.to_owned());
+                existing = existing.parent().ok_or_else(|| {
+                    super::ioerr(
+                        "copy",
+                        path,
+                        std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "destination has no existing ancestor",
+                        ),
+                    )
+                })?;
+            }
+            Err(error) => return Err(super::ioerr("copy", path, error)),
+        }
+    }
+}
+
+fn normalize_lexically(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(std::path::MAIN_SEPARATOR_STR),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    normalized
+}
+
+fn existing_files_are_identical(
+    fs: &dyn Fs,
+    source: &std::fs::Metadata,
+    destination: &Path,
+) -> VResult<bool> {
+    let destination = match fs.metadata(destination) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(super::ioerr("copy", destination, error)),
+    };
+    Ok(same_file_identity(source, &destination))
+}
+
+#[cfg(unix)]
+fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(windows)]
+fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    left.volume_serial_number() == right.volume_serial_number()
+        && left.file_index() == right.file_index()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_file_identity(_: &std::fs::Metadata, _: &std::fs::Metadata) -> bool {
+    false
+}
+
+fn copy_relation_error(message: impl Into<String>) -> ErrorVal {
+    ErrorVal::arg_error(message).with_hint("choose a destination outside the source tree")
+}
+
 fn map_directory_error(source: &Path, error: std::io::Error) -> ErrorVal {
     if error.kind() == std::io::ErrorKind::InvalidData {
         work_limit(format!(
@@ -321,5 +447,67 @@ mod tests {
             !destination.join("source").exists(),
             "a later preflight failure must leave earlier sources untouched"
         );
+    }
+
+    #[test]
+    fn copy_rejects_the_same_file_before_truncation() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("same");
+        std::fs::write(&source, b"payload").unwrap();
+
+        let error =
+            CopyPlan::build(&StdFs, &[(source.clone(), source.clone())], false).unwrap_err();
+        assert_eq!(error.code, "arg_error");
+        assert!(error.msg.contains("same file"));
+        assert_eq!(std::fs::read(source).unwrap(), b"payload");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_rejects_a_hard_link_alias() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let alias = root.path().join("alias");
+        std::fs::write(&source, b"payload").unwrap();
+        std::fs::hard_link(&source, &alias).unwrap();
+
+        let error = CopyPlan::build(&StdFs, &[(source.clone(), alias)], false).unwrap_err();
+        assert_eq!(error.code, "arg_error");
+        assert!(error.msg.contains("same file"));
+        assert_eq!(std::fs::read(source).unwrap(), b"payload");
+    }
+
+    #[test]
+    fn recursive_copy_rejects_a_missing_destination_inside_source() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let destination = source.join("missing/../backup");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("file"), b"payload").unwrap();
+
+        let error =
+            CopyPlan::build(&StdFs, &[(source.clone(), destination.clone())], true).unwrap_err();
+        assert_eq!(error.code, "arg_error");
+        assert!(error.msg.contains("into itself"));
+        assert!(!source.join("backup").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_copy_rejects_destination_through_a_symlinked_parent() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let alias = root.path().join("alias");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("file"), b"payload").unwrap();
+        symlink(&source, &alias).unwrap();
+        let destination = alias.join("backup");
+
+        let error = CopyPlan::build(&StdFs, &[(source.clone(), destination)], true).unwrap_err();
+        assert_eq!(error.code, "arg_error");
+        assert!(error.msg.contains("into itself"));
+        assert!(!source.join("backup").exists());
     }
 }

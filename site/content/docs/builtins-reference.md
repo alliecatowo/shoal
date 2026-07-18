@@ -229,6 +229,8 @@ Errors include:
 - `arg_error` when fewer than two paths are provided;
 - `arg_error` when multiple sources target a non-directory;
 - `arg_error` when a directory is copied without recursion;
+- `arg_error` when source and destination identify the same file (including a hard-link alias), or
+  when a recursive destination resolves inside its source through lexical or symlinked parents;
 - a filesystem error for read/write failures.
 
 Recursive copy inventories every source before the first filesystem mutation. The shared plan is

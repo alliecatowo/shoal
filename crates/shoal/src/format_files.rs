@@ -22,12 +22,20 @@ struct FormatPlan {
 
 struct FileSnapshot {
     permissions: fs::Permissions,
+    length: u64,
+    modified: Option<std::time::SystemTime>,
     #[cfg(unix)]
     device: u64,
     #[cfg(unix)]
     inode: u64,
     #[cfg(unix)]
     owner: u32,
+    #[cfg(unix)]
+    mode: u32,
+    #[cfg(unix)]
+    changed_seconds: i64,
+    #[cfg(unix)]
+    changed_nanoseconds: i64,
 }
 
 pub(crate) fn run(check: bool, files: Vec<PathBuf>) -> Result<i32, String> {
@@ -228,15 +236,22 @@ impl FileSnapshot {
             use std::os::unix::fs::MetadataExt;
             Self {
                 permissions: metadata.permissions(),
+                length: metadata.len(),
+                modified: metadata.modified().ok(),
                 device: metadata.dev(),
                 inode: metadata.ino(),
                 owner: metadata.uid(),
+                mode: metadata.mode(),
+                changed_seconds: metadata.ctime(),
+                changed_nanoseconds: metadata.ctime_nsec(),
             }
         }
         #[cfg(not(unix))]
         {
             Self {
                 permissions: metadata.permissions(),
+                length: metadata.len(),
+                modified: metadata.modified().ok(),
             }
         }
     }
@@ -248,10 +263,17 @@ impl FileSnapshot {
             self.device == metadata.dev()
                 && self.inode == metadata.ino()
                 && self.owner == metadata.uid()
+                && self.mode == metadata.mode()
+                && self.changed_seconds == metadata.ctime()
+                && self.changed_nanoseconds == metadata.ctime_nsec()
+                && self.length == metadata.len()
+                && self.modified == metadata.modified().ok()
         }
         #[cfg(not(unix))]
         {
             metadata.is_file()
+                && self.length == metadata.len()
+                && self.modified == metadata.modified().ok()
         }
     }
 }
