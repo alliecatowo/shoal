@@ -111,7 +111,7 @@ accDescr: Shows the components and relationships described in Evaluation.
   Entry --> Modules["modules.rs / namespaces.rs"]
   Entry --> Journal["journal.rs"]
   Entry --> Plans["plan.rs / plan_derive.rs / plan_effects.rs"]
-  Entry --> Streams["streams.rs / channels.rs"]
+  Entry --> Streams["streams.rs + streams/buffer.rs / channels.rs"]
 ```
 
 This is a tree-walk evaluator. `lib.rs` holds session state and the top-level evaluation loop;
