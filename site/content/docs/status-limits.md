@@ -225,8 +225,10 @@ constraints. New methods must update metadata and executable coverage together.
 
 ### Stream caveats
 
-- `buffer(n)` creates a bounded asynchronous pump, but each pump consumes a thread and the evaluator
-  admits at most 64 concurrent stream pumps. Drop or consume buffered streams promptly.
+- `buffer(n)` admits capacity 0–4,096 before consuming its source and shares a 16 MiB retained-value
+  budget across queued/pending values. Byte or count pressure paces losslessly; a single value above
+  the byte wall raises `stream_buffer_limit`. Each pump consumes a thread and the evaluator admits at
+  most 64 concurrent stream pumps. Drop or consume buffered streams promptly.
 - `.distinct(limit?)` defaults to 4,096 identities and is exact up to that caller/default limit and a 16 MiB retained-history ceiling, then raises `stream_distinct_limit`; use a smaller limit, finite/taken stream, or `.dedupe()` for adjacent suppression.
 - count and duration `.window(...)` stages retain at most 4,096 items and 16 MiB; count admission rejects larger requests and live duration windows raise `stream_window_limit` rather than evicting within the requested time range.
 - bounded stream collection retains at most 16,384 values and 16 MiB; explicit `.collect()`, bounded exact `.tee()`, `for` over a stream, and eager method fallback share `stream_collect_limit`.
@@ -234,6 +236,12 @@ constraints. New methods must update metadata and executable coverage together.
 - live `.tee(n)` uses 64-entry per-fork queues; overflow drops values and inserts a `{dropped:n}` marker rather than raising.
 - collecting/sorting/grouping a stream marked unbounded raises `stream_unbounded`; inaccurate custom-source boundedness metadata remains an embedder responsibility.
 - live timing/filesystem sources remain host-dependent despite deterministic core combinators.
+
+### Glob expansion
+
+Runtime command/list/loop expansion and static plan path derivation share one boundary: a glob may
+produce at most 16,384 matched paths and 16 MiB of path bytes. Exceeding either wall raises
+`glob_expansion_limit`; narrow the pattern or walk the directory incrementally.
 
 ### Cancellation and process trees
 

@@ -249,7 +249,7 @@ length shrinks; rename/replacement behavior beyond that depends on platform `not
 | `throttle(duration)` | emits first and drops items inside interval |
 | `window(count)` | sliding deque; emits only once full, then every item; count is capped at 4,096 and history at 16 MiB |
 | `window(duration)` | stores timestamp/value pairs; emits current time window per item; fails typed at 4,096 items or 16 MiB |
-| `buffer(n)` | eager owned pump into `sync_channel(n)`; lossless pacing, including a zero-capacity rendezvous |
+| `buffer(n)` | eager owned pump into `sync_channel(n)`; capacity 0–4,096 plus a 16 MiB retained-state wall; lossless pacing, including a zero-capacity rendezvous |
 | `enumerate` | emits `[zero_based_index, value]` |
 | `merge(other)` | nonblocking probes with alternating preference; round-robin when both are ready, free-running when only one is ready |
 | `zip(other)` | positional pairs with at most one pending item per side; ends when either side ends |
@@ -266,9 +266,12 @@ Count and duration windows preserve exact membership up to 4,096 retained items 
 raise `stream_window_limit` rather than silently evicting an item that still belongs to the requested
 window; count requests above the identity ceiling fail before consuming their source.
 
-`.buffer(n)` consumes its input and starts a child evaluator on a producer thread. The channel has
-exactly `n` slots; the producer can additionally hold the item it is currently trying to enqueue.
-Full queues pace in a cancel-aware retry loop and never drop values. Capacity zero is a lossless
+`.buffer(n)` consumes its input and starts a child evaluator on a producer thread. Capacity is
+validated from 0 through 4,096 before consuming the source. The channel has exactly `n` slots; the
+producer can additionally hold the item it is currently trying to enqueue. Queued and pending
+values share a 16 MiB measured retained-state wall; byte pressure paces just like a full count queue,
+while one value larger than the whole wall raises `stream_buffer_limit`. Full queues pace in a
+cancel-aware retry loop and never drop values. Capacity zero is a lossless
 rendezvous: the producer can hold one pending item but no item is queued. The result preserves the
 input's boundedness. Parent cancellation, dropping the returned stream, or receiver disconnection
 stops the pump and releases the upstream. Buffer and stream-feed pumps share a process-wide maximum

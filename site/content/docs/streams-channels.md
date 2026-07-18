@@ -114,7 +114,7 @@ Current stream-specific combinators are:
 | `debounce(duration)` | emit after quiet interval |
 | `throttle(duration)` | rate-limit emissions |
 | `window(count_or_duration)` | collect exact count/time windows; at most 4,096 items and 16 MiB retained history |
-| `buffer(n)` | eager lossless producer queue with capacity `n`; zero is a rendezvous |
+| `buffer(n)` | eager lossless producer queue with capacity `n` (maximum 4,096); zero is a rendezvous; queued state is capped at 16 MiB |
 | `enumerate()` | pair items with sequence positions |
 | `merge(other)` | fair interleave; round-robin while both sides are ready |
 | `zip(other)` | pair positionally, holding at most one unpaired item per side |
@@ -145,7 +145,7 @@ stream.into(channel("user.events"))
 
 For streams, both `.save(path)` and `.append(path)` currently open the file in append mode and write one line per item. Strings and bytes are written as their content; other values become JSON per line. `.save` does not truncate, despite its name—this is an important preview behavior.
 
-`buffer(n)` consumes its input immediately and starts an owned producer pump. The queue holds exactly `n` items and paces rather than dropping; the producer may additionally hold the item it is trying to enqueue. `buffer(0)` is a lossless rendezvous with no queued item. Dropping the buffered stream or canceling its parent stops the pump. Buffer and stream-feed pumps share a process-wide limit of 64 workers with live `every`, `watch`, and `tail` sources; creating another returns `stream_pump_limit` until one finishes or is dropped.
+`buffer(n)` consumes its input immediately and starts an owned producer pump. Capacity is admitted from 0 through 4,096 before the source is consumed. The queue holds exactly `n` items and paces rather than dropping; the producer may additionally hold the item it is trying to enqueue. Queued and pending values share a 16 MiB measured retained-state budget, so byte pressure also paces the producer; a single value beyond that wall raises `stream_buffer_limit`. `buffer(0)` is a lossless rendezvous with no queued item. Dropping the buffered stream or canceling its parent stops the pump. Buffer and stream-feed pumps share a process-wide limit of 64 workers with live `every`, `watch`, and `tail` sources; creating another returns `stream_pump_limit` until one finishes or is dropped.
 
 `tee(n)` returns 1–64 independently drivable streams and rejects a larger count before consuming the source. A bounded stream materializes once for exact replay. A live stream uses a queue of at most 64 pending items and 1 MiB of measured retained state per fork. When a slow fork falls behind—or an individual value cannot fit its byte wall—overflowed values are dropped and later represented in order by a `{marker: "stream_gap", reason: "tee_overflow", dropped: n, from_seq: null, to_seq: null}` record. The marker appears as soon as that fork's queue has room, or after its buffered items drain; overflow does not raise an error and is never silent.
 

@@ -3,6 +3,9 @@
 
 use super::*;
 
+pub(crate) const MAX_GLOB_MATCHES: usize = 16_384;
+pub(crate) const MAX_GLOB_PATH_BYTES: usize = 16 * 1024 * 1024;
+
 impl Evaluator {
     pub(crate) fn cmd_arg_value(&mut self, a: &CmdArg) -> VResult<Value> {
         match a {
@@ -48,19 +51,10 @@ impl Evaluator {
     /// and the glob-value collection methods; it emits no nullglob lint — the
     /// command-argument path adds that itself.
     pub(crate) fn expand_glob(&self, g: &shoal_value::GlobVal) -> VResult<Vec<Value>> {
-        let pat = g.cwd.join(&g.pattern).to_string_lossy().into_owned();
-        // Dotfile exclusion (site/content/internals/language-conformance-contract.md): a plain `*.txt` skips `.hidden.txt`;
-        // dotfiles are only matched when the pattern's own last component
-        // starts with `.`, or the glob was built `hidden: true`.
-        let options = glob::MatchOptions {
-            require_literal_leading_dot: !g.hidden && !pattern_matches_dotfiles(&g.pattern),
-            ..glob::MatchOptions::default()
-        };
-        let mut paths = glob::glob_with(&pat, options)
-            .map_err(|e| ErrorVal::new("arg_error", e.to_string()))?
-            .filter_map(Result::ok)
+        let mut paths: Vec<_> = expand_glob_paths(&g.cwd, &g.pattern, g.hidden)?
+            .into_iter()
             .map(Value::Path)
-            .collect::<Vec<_>>();
+            .collect();
         paths.sort_by_key(shoal_value::render::render_inline);
         Ok(paths)
     }
@@ -135,4 +129,79 @@ fn pattern_matches_dotfiles(pattern: &str) -> bool {
         .rsplit(['/', '\\'])
         .next()
         .is_some_and(|last| last.starts_with('.'))
+}
+
+/// Expand a filesystem glob behind one count/byte admission boundary shared
+/// by runtime argv/list expansion and static plan path derivation.
+pub(crate) fn expand_glob_paths(cwd: &Path, pattern: &str, hidden: bool) -> VResult<Vec<PathBuf>> {
+    expand_glob_paths_with_limits(cwd, pattern, hidden, MAX_GLOB_MATCHES, MAX_GLOB_PATH_BYTES)
+}
+
+fn expand_glob_paths_with_limits(
+    cwd: &Path,
+    pattern: &str,
+    hidden: bool,
+    max_matches: usize,
+    max_path_bytes: usize,
+) -> VResult<Vec<PathBuf>> {
+    let pat = cwd.join(pattern).to_string_lossy().into_owned();
+    // Dotfile exclusion (site/content/internals/language-conformance-contract.md): a plain `*.txt` skips `.hidden.txt`;
+    // dotfiles are only matched when the pattern's own last component starts
+    // with `.`, or the glob was built `hidden: true`.
+    let options = glob::MatchOptions {
+        require_literal_leading_dot: !hidden && !pattern_matches_dotfiles(pattern),
+        ..glob::MatchOptions::default()
+    };
+    let matches = glob::glob_with(&pat, options)
+        .map_err(|error| ErrorVal::new("arg_error", error.to_string()))?;
+    let mut paths = Vec::new();
+    let mut path_bytes = 0usize;
+    for path in matches.filter_map(Result::ok) {
+        if paths.len() >= max_matches {
+            return Err(glob_expansion_limit(format!(
+                "glob matched more than {max_matches} paths"
+            )));
+        }
+        path_bytes = path_bytes
+            .checked_add(path.as_os_str().as_encoded_bytes().len())
+            .ok_or_else(|| glob_expansion_limit("glob path-byte accounting overflowed"))?;
+        if path_bytes > max_path_bytes {
+            return Err(glob_expansion_limit(format!(
+                "glob matches exceed the {max_path_bytes}-byte path limit"
+            )));
+        }
+        paths.push(path);
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn glob_expansion_limit(message: impl Into<String>) -> ErrorVal {
+    ErrorVal::new("glob_expansion_limit", message)
+        .with_hint("narrow the glob pattern or walk the directory incrementally")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn glob_expansion_fails_before_retaining_matches_past_either_wall() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["a", "b", "c"] {
+            std::fs::write(dir.path().join(name), b"").unwrap();
+        }
+        assert_eq!(
+            expand_glob_paths_with_limits(dir.path(), "*", false, 2, 1024)
+                .unwrap_err()
+                .code,
+            "glob_expansion_limit"
+        );
+        assert_eq!(
+            expand_glob_paths_with_limits(dir.path(), "*", false, 8, 1)
+                .unwrap_err()
+                .code,
+            "glob_expansion_limit"
+        );
+    }
 }

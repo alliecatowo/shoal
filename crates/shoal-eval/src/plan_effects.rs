@@ -117,15 +117,7 @@ fn plan_text(arg: &CmdArg) -> VResult<String> {
 }
 fn plan_paths(arg: &CmdArg, cwd: &Path) -> VResult<Vec<PathBuf>> {
     match arg {
-        CmdArg::Glob { pattern, .. } => {
-            let pat = cwd.join(pattern).to_string_lossy().into_owned();
-            let mut ps = glob::glob(&pat)
-                .map_err(|e| ErrorVal::arg_error(e.to_string()))?
-                .filter_map(Result::ok)
-                .collect::<Vec<_>>();
-            ps.sort();
-            Ok(ps)
-        }
+        CmdArg::Glob { pattern, .. } => crate::args::expand_glob_paths(cwd, pattern, false),
         _ => {
             let p = PathBuf::from(plan_text(arg)?);
             Ok(vec![if p.is_absolute() { p } else { cwd.join(p) }])

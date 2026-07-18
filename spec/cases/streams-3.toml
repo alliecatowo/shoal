@@ -8,6 +8,11 @@ src = "[1, 2].stream().buffer(0).collect()"
 value = "[1, 2]"
 
 [[case]]
+name = "stream3-buffer-capacity-has-an-admission-wall"
+src = "[1].stream().buffer(4097).collect()"
+error = "arg_error"
+
+[[case]]
 name = "stream3-window-on-empty-source-is-empty"
 src = "[].stream().window(2).collect()"
 value = "[]"
