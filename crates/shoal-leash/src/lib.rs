@@ -395,6 +395,39 @@ opaque = "ask"
     }
 
     #[test]
+    fn hermetic_unresolved_scope_is_preserved_for_fail_closed_spawn() {
+        let hermetic = Policy::from_toml(
+            "[principal.agent]\nhermetic=true\n\n[principal.agent.fs]\nread=[\"/certainly/missing/shoal/**\"]\n",
+        )
+        .unwrap();
+        let sandbox = hermetic
+            .sandbox_for("agent")
+            .expect("hermetic intent must reach the spawn boundary");
+        assert!(sandbox.hermetic);
+        assert!(sandbox.fs.read.is_empty());
+        assert!(hermetic.filesystem_scoping_active("agent"));
+
+        let best_effort = Policy::from_toml(
+            "[principal.agent]\n\n[principal.agent.fs]\nread=[\"/certainly/missing/shoal/**\"]\n",
+        )
+        .unwrap();
+        assert!(best_effort.sandbox_for("agent").is_none());
+    }
+
+    #[test]
+    fn enforcement_intent_predicates_are_explicit() {
+        let policy = Policy::from_toml(
+            "[principal.agent]\nhermetic=true\nnet_connect=[\"example.com:443\"]\nproc_spawn=[\"tool\"]\n",
+        )
+        .unwrap();
+        assert!(policy.hermetic_active("agent"));
+        assert!(policy.filesystem_scoping_active("agent"));
+        assert!(policy.network_scoping_active("agent"));
+        assert!(policy.spawn_pinning_active("agent"));
+        assert!(!Policy::permissive("human").hermetic_active("human"));
+    }
+
+    #[test]
     fn load_user_or_permissive_reads_file_then_falls_back() {
         let d = tempfile::tempdir().unwrap();
         let cfg = d.path().join("shoal");

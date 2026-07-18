@@ -273,10 +273,11 @@ failure without restart. `profile`/`--cap` values are echoed metadata, not enfor
 | filesystem sandbox | Implemented on supported Linux/macOS paths | enforcement tier reports actual backend result |
 | process hash gate | Implemented preflight | content is checked before exec; TOCTOU remains |
 | network sandbox | Not implemented | network grants are planning/policy only |
-| malformed local policy handling | Risky partial | convenience loader can fall back to permissive |
+| malformed local policy handling | Implemented fail closed | only a genuinely missing convenience file selects the permissive default; present invalid authority quarantines to deny-all |
 | child authority inheritance | Implemented unified constructor | production sites carry principal/policy/Reef/fs/cancellation; future sites are inventory-guarded |
 | secret rendering | Implemented | generic render is redacted; review every new serialization/stdin path |
 | cap-request honesty | Implemented | response uses the same enforcement truth as attach |
+| enforcement preview | Implemented | attach and plan share typed filesystem/network/spawn/hermetic dimensions; activation remains child-local |
 
 
 No documentation should collapse these layers into the sentence “Leash sandboxes commands.” State

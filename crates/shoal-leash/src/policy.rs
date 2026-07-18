@@ -166,6 +166,33 @@ impl Policy {
                 .is_some_and(|p| !p.proc_spawn.is_empty())
     }
 
+    /// Whether this principal asks Leash to restrict filesystem access.
+    /// This intentionally remains true when every configured root is missing:
+    /// a hermetic typo must be distinguishable from an unrestricted policy so
+    /// the spawn boundary can refuse instead of silently dropping the scope.
+    pub fn filesystem_scoping_active(&self, principal: &str) -> bool {
+        self.fail_closed
+            || self
+                .principal(principal)
+                .is_some_and(|p| !p.is_fs_unrestricted())
+    }
+
+    /// Whether a network destination allowlist is configured. Leash can
+    /// authorize declared `net.connect` effects, but no current OS backend can
+    /// confine an opaque child to this allowlist.
+    pub fn network_scoping_active(&self, principal: &str) -> bool {
+        self.fail_closed
+            || self
+                .principal(principal)
+                .is_some_and(|p| !p.net_connect.is_empty())
+    }
+
+    /// Whether this principal requires requested OS dimensions to be hard
+    /// guarantees rather than best-effort constraints.
+    pub fn hermetic_active(&self, principal: &str) -> bool {
+        self.fail_closed || self.principal(principal).is_some_and(|p| p.hermetic)
+    }
+
     pub fn evaluate_effect(&self, principal: &str, effect: &Effect) -> Verdict {
         if self.fail_closed {
             return Verdict::Deny;
@@ -327,10 +354,10 @@ impl PrincipalPolicy {
     /// to confine to.
     ///
     /// `None` is returned when the grants are unrestricted (root subtree — a
-    /// no-op sandbox) or when no filesystem scope resolves to an existing path
-    /// (an empty Landlock/Seatbelt ruleset would only stop the child from
-    /// loading its own binary, not usefully confine it — the plan layer, not
-    /// the OS sandbox, denies those). Otherwise each glob is reduced to its
+    /// no-op sandbox), or when a non-hermetic scope has no existing root. A
+    /// hermetic unresolved scope is retained as an empty request so the exec
+    /// boundary can refuse it explicitly instead of losing the hard
+    /// requirement. Otherwise each glob is reduced to its
     /// longest concrete leading path (`/work/**` → `/work`) and non-existent
     /// roots are dropped so the backend never fails closed on a typo'd path.
     ///
@@ -345,7 +372,7 @@ impl PrincipalPolicy {
         let read = grant_roots(&self.fs_read);
         let write = grant_roots(&self.fs_write);
         let delete = grant_roots(&self.fs_delete);
-        if read.is_empty() && write.is_empty() && delete.is_empty() {
+        if read.is_empty() && write.is_empty() && delete.is_empty() && !self.hermetic {
             return None;
         }
         Some(SandboxPolicy {

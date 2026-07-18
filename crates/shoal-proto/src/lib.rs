@@ -439,6 +439,10 @@ pub struct AttachResult {
     /// learns at attach time if the wall is real (site/content/internals/kernel-protocol.md).
     #[serde(default)]
     pub caps_enforced: bool,
+    /// Spawn-time OS enforcement forecast. This is deliberately separate from
+    /// `caps_enforced`: planning never means a backend is already active.
+    #[serde(default)]
+    pub enforcement: EnforcementPreview,
     /// The kernel's default elision thresholds, so a client knows the budget
     /// before it tightens/loosens per call.
     #[serde(default)]
@@ -578,6 +582,27 @@ pub struct PlanResult {
     pub reversibility: String,
     pub verdict: String,
     pub approval_pending: bool,
+    /// Honest per-dimension forecast for the principal that owns this plan.
+    #[serde(default)]
+    pub enforcement: EnforcementPreview,
+}
+
+/// What the kernel can enforce for a principal's next external spawn. Actual
+/// activation is still returned by the executor after a child is launched.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnforcementPreview {
+    pub available_tier: String,
+    pub activation: String,
+    pub filesystem_requested: bool,
+    pub filesystem_enforceable: bool,
+    pub network_scope_requested: bool,
+    pub network_enforceable: bool,
+    pub spawn_pin_requested: bool,
+    pub spawn_pin_atomic: bool,
+    pub hermetic: bool,
+    pub spawn_disposition: String,
+    #[serde(default)]
+    pub limitations: Vec<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValueGetParams {
@@ -888,6 +913,19 @@ mod tests {
         .unwrap();
         assert_eq!(paged.offset, Some(u64::MAX));
         assert_eq!(paged.length, Some(u64::MAX));
+    }
+
+    #[test]
+    fn legacy_plan_result_defaults_the_enforcement_preview() {
+        let plan: PlanResult = serde_json::from_value(serde_json::json!({
+            "plan_ref": "plan:legacy",
+            "effects": [],
+            "reversibility": "reversible",
+            "verdict": "allow",
+            "approval_pending": false
+        }))
+        .unwrap();
+        assert_eq!(plan.enforcement, EnforcementPreview::default());
     }
 
     /// Locks the wire contract (refactor guard): every named `error_code`

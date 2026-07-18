@@ -210,8 +210,9 @@ policy behavior, port method, standard implementation, and fake-port test togeth
 ## Lowering grants to an OS sandbox
 
 Filesystem globs are reduced to their longest concrete leading roots. Nonexistent roots are dropped;
-an unrestricted root grant or a grant set that yields no useful existing roots produces no sandbox.
-The plan verdict remains the authority in those cases.
+an unrestricted root grant produces no sandbox. A nonhermetic grant set with no useful existing root
+also preserves that best-effort behavior, while a hermetic unresolved scope reaches the execution
+boundary and refuses before target spawn. The plan verdict remains the authority for modeled effects.
 
 ```mermaid
 flowchart TD
@@ -244,7 +245,9 @@ enforced; non-hermetic execution uses the strongest available backend and return
 
 The spawn hash has a documented time-of-check/time-of-use gap: the path is hashed before `exec`, so
 the file can theoretically change between those events. Enforcement reports this rather than
-claiming an exec-time guarantee.
+claiming an exec-time guarantee. Hermetic principals therefore refuse configured spawn pinning until
+an atomic backend exists. They also refuse configured network scoping because the current semantic
+allowlist cannot confine an opaque child.
 
 Source: [`shoal-leash/src/enforce.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-leash/src/enforce.rs).
 

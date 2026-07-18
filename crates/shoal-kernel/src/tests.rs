@@ -4347,6 +4347,55 @@ fn attach_reports_the_honest_detected_tier() {
     assert_eq!(r["caps"]["tier"], expected);
     assert_eq!(r["caps_enforced"], false);
     assert_eq!(r["caps"]["enforced"], false);
+    assert_eq!(r["enforcement"]["available_tier"], expected);
+    assert_eq!(r["enforcement"]["activation"], "deferred-to-spawn");
+    assert_eq!(r["enforcement"]["filesystem_enforceable"], false);
+    assert_eq!(
+        r["enforcement"]["spawn_disposition"],
+        "no-os-scope-requested"
+    );
+    drop(client);
+    drop(reader);
+    thread.join().unwrap();
+}
+
+#[test]
+fn attach_and_plan_share_dimension_level_enforcement_truth() {
+    let who = principal();
+    let policy = Policy::from_toml(&format!(
+        "[principal.\"{who}\"]\nhermetic=true\nopaque='allow'\nauto_apply='in-grant'\n\
+         net_connect=[\"example.com:443\"]\nproc_spawn=[\"cat\"]\n\n\
+         [principal.\"{who}\".fs]\nread=[\"/usr/**\"]\n"
+    ))
+    .unwrap();
+    let kernel = Kernel::with_policy(policy);
+    let (mut client, mut reader, thread) = spawn(&kernel);
+    let attached = attach(&mut client, &mut reader).result.unwrap();
+    let planned = call(
+        &mut client,
+        &mut reader,
+        2,
+        "exec",
+        json!({"src":"1 + 2","mode":"plan"}),
+    )
+    .result
+    .unwrap();
+    assert_eq!(planned["enforcement"], attached["enforcement"]);
+    let enforcement = &planned["enforcement"];
+    assert_eq!(enforcement["filesystem_requested"], true);
+    assert_eq!(enforcement["network_scope_requested"], true);
+    assert_eq!(enforcement["network_enforceable"], false);
+    assert_eq!(enforcement["spawn_pin_requested"], true);
+    assert_eq!(enforcement["spawn_pin_atomic"], false);
+    assert_eq!(enforcement["hermetic"], true);
+    assert_eq!(enforcement["spawn_disposition"], "refuse-unmet-hermetic");
+    assert!(
+        enforcement["limitations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "network-policy-only")
+    );
     drop(client);
     drop(reader);
     thread.join().unwrap();

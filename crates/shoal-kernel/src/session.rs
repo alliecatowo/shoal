@@ -938,7 +938,8 @@ impl Kernel {
         // (a scoped agent), never for the default-permissive human.
         let status = EnforcementStatus::detect();
         let tier = tier_letter(status.available_tier);
-        let caps_enforced = self.caps_enforced_for(&who);
+        let enforcement = self.enforcement_preview(&who);
+        let caps_enforced = enforcement.filesystem_enforceable;
         let mut result = serde_json::to_value(AttachResult {
             session: name,
             principal: who.clone(),
@@ -947,6 +948,7 @@ impl Kernel {
             env_hash: "local".into(),
             ast_version: AST_VERSION,
             caps_enforced,
+            enforcement,
             elide_defaults: elide_defaults_json(),
             channels: STATIC_CHANNELS.iter().map(|s| s.to_string()).collect(),
         })

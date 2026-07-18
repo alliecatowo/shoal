@@ -41,6 +41,7 @@ impl Kernel {
             reversibility: reversibility_from_effects(&plan.effects).into(),
             verdict: verdict_name(verdict).into(),
             approval_pending: verdict == Verdict::ApprovalRequired,
+            enforcement: self.enforcement_preview(actor),
         };
         self.plans.transaction(|plans| -> Result<(), RpcError> {
             plans.retain(|_, stored| !plan_expired(stored));

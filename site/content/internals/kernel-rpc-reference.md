@@ -142,6 +142,7 @@ Result fields:
 | `env_hash` | currently literal `"local"`, not a real environment digest |
 | `ast_version` | currently 2 |
 | `caps_enforced` | whether a real backend and non-permissive policy combine to enforce |
+| `enforcement` | per-dimension spawn forecast; availability and policy intent, never activation |
 | `elide_defaults` | default value budgets |
 | `channels` | static kernel channels: transcript, journal, approval, render |
 | `auth_mode`, `connection_trust` | bearer/restricted/private-human attachment provenance |
@@ -251,8 +252,11 @@ does not cancel work.
 `mode:"plan"` parses, derives effects, evaluates the actor policy, and inserts a `StoredPlan` bound to
 source, canonical AST, effects/estimates, Session, principal, and a unique per-kernel object suffix.
 It publishes an `approval` event for `ApprovalRequired`. The returned `PlanResult` contains ref,
-effects, reversibility, verdict, and `approval_pending`. Identical repeated plans remain distinct and
-cannot overwrite one another; refs are still ephemeral object identifiers, not bearer capabilities.
+effects, reversibility, verdict, `approval_pending`, and the same typed `enforcement` preview returned
+by attach. The preview names requested/enforceable filesystem scope, network backend absence,
+non-atomic spawn pinning, hermetic refusal, and spawn-time activation. Identical repeated plans remain
+distinct and cannot overwrite one another; refs are still ephemeral object identifiers, not bearer
+capabilities.
 
 ### Run and approved modes
 

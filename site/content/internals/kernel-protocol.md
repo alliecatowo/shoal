@@ -67,7 +67,10 @@ does not directly grant language effects: Leash still evaluates the principal. T
 machine-admin exceptions are `supervisor` or `plan.approve`, which permit cross-principal approval.
 
 The response reports the actual available enforcement tier and whether this principal resolves to a
-real sandbox. Token capability metadata is returned separately from the policy principal.
+real sandbox. Its typed `enforcement` preview separately reports filesystem intent/enforceability,
+network-policy-only scope, pre-exec spawn pinning, hermetic disposition, and limitations. Preview
+activation is always `deferred-to-spawn`; only the child execution result can report an active
+backend. Token capability metadata is returned separately from the policy principal.
 
 Every stateful method requires attachment: `journal.query` (HR-D4) and `cap.request` (HR-D1) were the
 last exemptions and now reject an unattached caller with `NOT_ATTACHED`. The only naturally public

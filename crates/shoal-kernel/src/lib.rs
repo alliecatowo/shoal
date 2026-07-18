@@ -1,6 +1,7 @@
 //! Long-lived Unix-socket host for the shoal evaluator (site/content/internals/language-conformance-contract.md).
 
 mod dispatch;
+mod enforcement;
 mod eventbus;
 mod handlers_exec;
 mod handlers_pty;
@@ -490,24 +491,6 @@ impl Kernel {
     /// locks are never held together.
     fn reap_terminal_ptys(&self, owner: &OwnerKey) -> Result<(), RpcError> {
         self.ptys.reap_terminal(owner)
-    }
-
-    /// The real enforcement truth for `principal` (site/content/internals/language-conformance-contract.md tier honesty):
-    /// `true` only when a genuine OS backend (Landlock/Seatbelt) exists on
-    /// this host *and* the policy actually resolves a real sandbox for this
-    /// principal — never for the default-permissive human. Single source of
-    /// truth shared by `session.attach`'s `caps_enforced` and
-    /// `cap.request`'s grant response (see `site/content/internals/security-threat-model.md`): an
-    /// agent that unstuck an `approval_pending` plan via `cap.request` must
-    /// get the SAME honest answer `attach` already gives, not a hardcoded
-    /// `false` that systematically under-reports enforcement it actually has.
-    pub(crate) fn caps_enforced_for(&self, principal: &str) -> bool {
-        let status = EnforcementStatus::detect();
-        let backend_present = matches!(
-            status.available_tier,
-            EnforcementTier::A | EnforcementTier::C
-        );
-        backend_present && self.policy.sandbox_for(principal).is_some()
     }
 
     /// Permit (or forbid) a plan's requester to acknowledge its own plan via

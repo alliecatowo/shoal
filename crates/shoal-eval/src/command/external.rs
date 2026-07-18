@@ -152,6 +152,7 @@ impl Evaluator {
         // policy (and when no policy is installed), so this is a pure no-op on
         // the normal path — the child spawns exactly as before.
         let sandbox = self.resolve_sandbox();
+        self.hermetic_spawn_guarantees(span)?;
         // site/content/internals/language-conformance-contract.md spawn-hash pinning: consult the leash effect evaluator with
         // this spawn's *resolved* binary (post-reef `argv[0]`) before exec. A
         // pure no-op unless the active principal pins `proc_spawn` — see
@@ -364,6 +365,33 @@ impl Evaluator {
             )
             .with_span(span)),
         }
+    }
+
+    /// Refuse configured hard guarantees that the current spawn stack cannot
+    /// honestly provide. Network allowlists are plan-only today, and spawn
+    /// hashes are checked before `exec` with a documented TOCTOU window.
+    fn hermetic_spawn_guarantees(&self, span: Span) -> VResult<()> {
+        let Some((policy, principal)) = self.session.leash.as_ref() else {
+            return Ok(());
+        };
+        if !policy.hermetic_active(principal) {
+            return Ok(());
+        }
+        if policy.network_scoping_active(principal) {
+            return Err(ErrorVal::new(
+                "spawn_denied",
+                "leash: hermetic network scoping is unavailable on this host",
+            )
+            .with_span(span));
+        }
+        if policy.spawn_pinning_active(principal) {
+            return Err(ErrorVal::new(
+                "spawn_denied",
+                "leash: hermetic executable identity is unavailable because hash-before-exec is TOCTOU-prone",
+            )
+            .with_span(span));
+        }
+        Ok(())
     }
 
     /// Content-hash the binary `argv0` resolves to — an absolute path as-is, or

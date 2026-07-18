@@ -286,6 +286,38 @@ fn a_policy_without_proc_spawn_grants_never_blocks_a_spawn() {
     }
 }
 
+#[test]
+fn hermetic_network_scope_refuses_before_an_opaque_child_spawn() {
+    let (d, allowed, _secret) = scene();
+    let policy = Policy::from_toml(
+        "[principal.agent]\nhermetic=true\nopaque='allow'\nnet_connect=[\"example.com:443\"]\n",
+    )
+    .unwrap();
+    let mut ev = Evaluator::new(d.path().to_path_buf());
+    ev.set_leash_policy(policy, "agent");
+    let err = ev
+        .eval_program(&parse(&cat_src(&allowed.join("ok.txt"))))
+        .expect_err("an unenforceable hermetic network allowlist must refuse the spawn");
+    assert_eq!(err.code, "spawn_denied");
+    assert!(err.msg.contains("network scoping"));
+}
+
+#[test]
+fn hermetic_spawn_pin_refuses_its_preexec_toctou_gap() {
+    let (d, allowed, _secret) = scene();
+    let policy = Policy::from_toml(
+        "[principal.agent]\nhermetic=true\nopaque='allow'\nproc_spawn=[\"cat\"]\n",
+    )
+    .unwrap();
+    let mut ev = Evaluator::new(d.path().to_path_buf());
+    ev.set_leash_policy(policy, "agent");
+    let err = ev
+        .eval_program(&parse(&cat_src(&allowed.join("ok.txt"))))
+        .expect_err("a hermetic pre-exec hash pin must not be overstated as atomic");
+    assert_eq!(err.code, "spawn_denied");
+    assert!(err.msg.contains("TOCTOU"));
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn macos_seatbelt_profile_chain_is_exercised_by_the_scoped_policy() {

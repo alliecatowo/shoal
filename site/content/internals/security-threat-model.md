@@ -350,9 +350,10 @@ accDescr: Shows the components and relationships described in Lowering glob poli
   Empty -->|no| Sandbox["SandboxPolicy"]
 ```
 
-Dropping a nonexistent write target is fail-closed at the sandbox grant level, but returning `None`
-when **all** roots disappear means the exec layer receives no confinement. The semantic plan layer
-is expected to deny unauthorized work. This layering must be preserved end-to-end.
+Dropping an individual nonexistent target remains safe. If **all** roots disappear, a nonhermetic
+scope retains the best-effort behavior and reaches no OS wrapper; a hermetic scope is instead carried
+to the exec boundary as an unresolved request and refused before the target spawns. The semantic plan
+layer remains authoritative for modeled effects in both cases.
 
 Network policy from `to_sandbox_policy` is currently `Unrestricted` because there is no enforcing
 backend; network intent remains a semantic plan verdict.
@@ -385,7 +386,9 @@ access; write roots receive the implementation's full filesystem access set; del
 remove-file/remove-dir. Full enforcement is checked after `restrict_self`; partial status is an error.
 
 Landlock does not provide the current network enforcement. A `net.deny` request appends an honest
-caveat. With `hermetic = true`, an unenforced requested network denial makes spawn fail closed.
+caveat. With `hermetic = true`, an unenforced requested network denial makes spawn fail closed. A
+configured principal network allowlist likewise refuses opaque external spawning in hermetic mode;
+nonhermetic mode remains policy-only and the kernel preview reports that limitation.
 
 ## macOS Seatbelt mapping
 
@@ -406,7 +409,9 @@ Seatbelt is reported as tier C filesystem enforcement; network remains unenforce
 `preflight_spawn` reads and BLAKE3-hashes the binary, then matches hash or filename against an
 allowlist. The actual exec happens later. A privileged/competing process can replace the path between
 verification and exec. `EnforcementStatus.detail` explicitly acknowledges this; no BPF-LSM or
-file-descriptor exec pin closes the race.
+file-descriptor exec pin closes the race. Therefore a principal combining `hermetic = true` with a
+spawn allowlist refuses external spawning; treating preflight as an atomic hermetic guarantee would
+be false.
 
 Hash identity still provides valuable drift detection and normal replacement refusal. It is not an
 atomic proof of the executed inode.

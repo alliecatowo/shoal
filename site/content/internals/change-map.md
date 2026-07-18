@@ -166,18 +166,24 @@ terminal startup code. Prompt/editor/history UI remains correctly owned by the C
 profiles and pin the init omission. Real daemon tests prove private interactive init execution and
 durable public-kernel omission of a configured malformed init file.
 
-### High: policy and OS containment have sharp trust assumptions
+### Resolved: policy and OS containment report sharp trust assumptions
 
-**Evidence:** a present malformed user Leash policy now enters explicit deny-all quarantine (only a
-genuinely missing convenience policy keeps the local permissive default). Network grants remain
-plan-only because no network backend exists, and executable hash pinning has a preflight TOCTOU
-gap.
+**Resolution:** a present malformed user Leash policy enters explicit deny-all quarantine (only a
+genuinely missing convenience policy keeps the local permissive default). `session.attach` and
+`exec mode=plan` now return one typed enforcement preview: available tier, deferred activation,
+filesystem request/enforceability, network scope/backend status, spawn-pin atomicity, hermetic
+intent/disposition, and stable limitation labels.
 
-**Risk:** a caller can still mistake a parsed policy or “hermetic” label for stronger OS enforcement
-than the host actually supplies, even though invalid authority input itself now fails closed.
+Hermetic filesystem scopes that resolve to no usable root are retained and refused before target
+spawn instead of disappearing. Hermetic principal network allowlists refuse because no network
+backend exists, and hermetic spawn pins refuse because hash-before-exec remains TOCTOU-prone.
+Nonhermetic callers retain compatible best-effort behavior with the limitation surfaced.
 
-**Direction:** surface enforcement dimensions in every relevant attach/plan result, and keep
-hermetic refusal tests for unsupported network/spawn guarantees.
+**Proof:** policy and exec tests cover unresolved scopes plus direct unsupported network/identity
+requests; evaluator integrations drive both configured hermetic limitations through a real external
+command path. Kernel coverage requires attach and plan previews to be identical, protocol
+deserialization keeps older plan results compatible, and the kernel composition-root ceiling forced
+the forecast into its own module rather than growing `lib.rs`.
 
 ### Resolved: evaluator-owned parser-context parity
 

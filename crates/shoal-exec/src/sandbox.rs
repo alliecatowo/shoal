@@ -24,6 +24,23 @@ pub(crate) fn apply(spec: &mut ExecSpec) -> io::Result<Option<EnforcementStatus>
     let Some(policy) = spec.sandbox.take() else {
         return Ok(None);
     };
+    if policy.hermetic
+        && policy.net != NetPolicy::Deny
+        && policy.fs.read.is_empty()
+        && policy.fs.write.is_empty()
+        && policy.fs.delete.is_empty()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "hermetic filesystem scope resolved to no usable roots",
+        ));
+    }
+    if policy.hermetic && policy.spawn_hash.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "hermetic executable identity is unavailable: hash verification is pre-exec and TOCTOU-prone",
+        ));
+    }
     let program = resolve_program(&spec.argv, &spec.env, &spec.cwd)?;
     if let Some(pin) = &policy.spawn_hash {
         verify_pin(&program, pin)?;

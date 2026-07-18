@@ -191,6 +191,40 @@ fn execspec_sandbox_hermetic_fails_closed_when_net_deny_cannot_be_enforced() {
 }
 
 #[test]
+fn execspec_sandbox_hermetic_refuses_an_unresolved_filesystem_scope() {
+    let policy = SandboxPolicy {
+        fs: FsSandbox::default(),
+        net: NetPolicy::Unrestricted,
+        spawn_hash: None,
+        hermetic: true,
+    };
+    let e = run(
+        sandboxed("true", ExecMode::Capture, policy),
+        &CancelToken::new(),
+    )
+    .unwrap_err();
+    assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(e.to_string().contains("no usable roots"));
+}
+
+#[test]
+fn execspec_sandbox_hermetic_refuses_preexec_identity_pinning() {
+    let policy = SandboxPolicy {
+        fs: grants("/bin/sh".into()),
+        net: NetPolicy::Unrestricted,
+        spawn_hash: Some("00".repeat(32)),
+        hermetic: true,
+    };
+    let e = run(
+        sandboxed("true", ExecMode::Capture, policy),
+        &CancelToken::new(),
+    )
+    .unwrap_err();
+    assert_eq!(e.kind(), std::io::ErrorKind::Unsupported);
+    assert!(e.to_string().contains("TOCTOU"));
+}
+
+#[test]
 fn execspec_sandbox_spawn_hash_pin_matches_and_mismatches() {
     if shoal_leash::landlock_abi().is_none() {
         eprintln!("Landlock unavailable; skipping enforcement assertion");
