@@ -733,14 +733,25 @@ mod tests {
             .send(&named_key("Enter").expect("Enter key"))
             .expect("send enter");
 
-        let snap = read_until(&mut session, "hello-pty", Duration::from_secs(5));
+        let mut snap = read_until(&mut session, "hello-pty", Duration::from_secs(5));
         assert!(
             snap.rows_text.iter().any(|r| r.contains("hello-pty")),
             "rendered screen must show the echoed line: {:?}",
             snap.rows_text
         );
-        // The cursor advanced off row 0 — the emulator tracked the newline.
-        assert!(snap.cursor_row >= 1, "cursor should have moved down");
+        // The terminal may echo the bytes before it processes the Enter key,
+        // so observing the text and observing the newline are two distinct
+        // asynchronous events. Wait for both rather than racing the reader.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while snap.cursor_row < 1 {
+            assert!(
+                Instant::now() < deadline,
+                "cursor should have moved down; screen was {:?}",
+                snap.rows_text
+            );
+            thread::sleep(Duration::from_millis(20));
+            snap = session.read_screen().expect("read newline-rendered screen");
+        }
         assert!(snap.alive, "cat is still running");
 
         let (status, signal) = session.close();

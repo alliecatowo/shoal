@@ -382,7 +382,9 @@ pub trait Fs: Send + Sync {
             "this Fs adapter does not support identity-guarded rename",
         ))
     }
-    /// Copy a file's contents (`std::fs::copy`).
+    /// Copy a file's contents without inheriting source timestamps.
+    /// Portable permissions are applied separately through
+    /// [`Fs::set_permissions`].
     fn copy(&self, from: &Path, to: &Path) -> io::Result<u64>;
     /// Apply a source node's portable permissions after copying. The default
     /// fails closed so a filesystem-backed adapter cannot silently claim the
@@ -637,7 +639,13 @@ impl Fs for StdFs {
         crate::fs_mutation::rename_if_unchanged(from, to, expected)
     }
     fn copy(&self, from: &Path, to: &Path) -> io::Result<u64> {
-        fs::copy(from, to)
+        let mut source = fs::File::open(from)?;
+        let mut destination = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(to)?;
+        io::copy(&mut source, &mut destination)
     }
     fn set_permissions(&self, path: &Path, permissions: fs::Permissions) -> io::Result<()> {
         fs::set_permissions(path, permissions)
