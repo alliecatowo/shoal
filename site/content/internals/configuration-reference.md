@@ -81,8 +81,8 @@ override is capped at 64 KiB before it is copied into the merged TOML tree.
 Project discovery stops at the **first** matching ancestor. It does not combine every ancestor
 `.shoal.toml`, and it does not stop at a Git root or home-directory boundary. For a working
 directory `/a/b/c`, the search is `/a/b/c/.shoal.toml`, `/a/b/.shoal.toml`,
-`/a/.shoal.toml`, then `/.shoal.toml`. This differs from Reef's multi-scope tool chain and from the
-prompt loader's current-directory-only project prompt layer.
+`/a/.shoal.toml`, then `/.shoal.toml`. This differs from Reef's multi-scope tool chain; the prompt
+loader deliberately calls this same nearest-project selector.
 
 
 ### Merge semantics
@@ -392,7 +392,7 @@ host loader assembles these layers:
 1. `/etc/shoal/shoal.toml`'s `[prompt]` table;
 2. user `shoal.toml`'s `[prompt]` table;
 3. user `prompt.toml` as a prompt-root document;
-4. **only** `cwd/.shoal.toml`'s `[prompt]` table, without walking ancestors;
+4. the nearest ancestor `.shoal.toml`'s `[prompt]` table, using core project discovery;
 5. prompt-specific environment overrides.
 
 The rich schema supports left/right/continuation formats, transient mode, rendering budgets,

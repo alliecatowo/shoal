@@ -70,15 +70,16 @@ types, reports unknown keys with suggestions, and returns paths of layers that c
 
 
 The `[reef]` subtree is only shape-checked as opaque by `shoal-config` and parsed independently by
-`shoal-reef`. Prompt rendering likewise has its own richer loader in `shoal/src/prompt.rs`. That
-loader independently reads system/user `[prompt]`, dedicated user `prompt.toml`, and only
-`cwd/.shoal.toml` (not the core loader's nearest-ancestor result), then environment overrides.
+`shoal-reef`. The rich `[prompt]` subtree uses the same ownership pattern: core config shape-checks
+the table, while the bounded loader in `shoal/src/prompt.rs` validates its dynamic schema. It reads
+system/user `[prompt]`, dedicated user `prompt.toml`, and the same nearest-ancestor project file the
+core loader selects, then environment overrides.
 
 The legacy `prompt.template` field is not simply dead: the rich prompt loader sees that key in files
 it independently reads and migrates it to `format.left` (`{cwd}` becomes `$directory`) when no
-`format` is present; when both exist, `format` wins with a warning. What is unwired is the typed
-`shoal_config::Config.prompt.template` value itself. This split can make the same key work from one
-file location but not another nearest-ancestor location.
+`format` is present; when both exist, `format` wins with a warning. The typed
+`shoal_config::Config.prompt.template` projection remains legacy-only, but discovery no longer makes
+the same key behave differently by project depth.
 
 ### Parsed does not always mean wired
 

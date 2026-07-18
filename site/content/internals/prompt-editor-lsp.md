@@ -63,13 +63,13 @@ outside the per-keystroke path.
 
 ## Prompt configuration layers
 
-The rich prompt loader is intentionally more capable than `shoal-config::Prompt`, but its discovery
-is currently independent. Lowest to highest precedence:
+The rich prompt loader is intentionally more capable than `shoal-config::Prompt`. Lowest to highest
+precedence:
 
 1. `/etc/shoal/shoal.toml` `[prompt]`;
 2. user `$XDG_CONFIG_HOME/shoal/shoal.toml` `[prompt]`;
 3. user `$XDG_CONFIG_HOME/shoal/prompt.toml`, whose root is the prompt table;
-4. `cwd/.shoal.toml` `[prompt]`—only the current directory, no ancestor search;
+4. the nearest ancestor `.shoal.toml` `[prompt]`, selected by `shoal_config::find_project_config`;
 5. prompt-specific environment overrides.
 
 After ordinary layers merge, the selected built-in theme is loaded underneath them and the layers
@@ -504,8 +504,9 @@ external editor, enter/submit, no-op, deletion/clear/cut, completion, undo, and 
 parameterized selection/motion commands are not expressible. Bad chord or action entries warn and
 are skipped; they never prevent startup.
 
-The configured Reedline edit mode is active, but—as noted above—the prompt's context is always
-Emacs. There is no state bridge from Reedline's current Vi submode into `PromptContext`.
+The configured Reedline edit mode is active and wrapped by the prompt's lock-free mode tracker.
+Emacs and Vi insert/normal/visual state therefore reach `$character` before each paint without
+mutating or cloning the frozen context.
 
 ## History adapter
 
@@ -542,8 +543,9 @@ presses act. Single-select returns the highlighted candidate or null if none; mu
 list and uses toggled originals when any exist. Escape becomes a typed evaluator cancellation-style
 custom error, while non-TTY use becomes an argument error.
 
-Known UI limit: drawing iterates only the first `height` ranked rows while cursor navigation can move
-beyond that range. There is no viewport offset, so a cursor below the first page is not visible.
+Drawing uses a fixed-height viewport that follows row and page navigation through the complete
+ranked result set. The cursor index and multi-selection identities remain global; scrolling changes
+only the visible slice, so accepting after several page moves still returns the original value.
 
 ## LSP architecture
 
@@ -653,18 +655,16 @@ deliberate audit across consumers.
 | completion | large context/matching/cache test set | Reedline composition | strong heuristic implementation |
 | highlighting | broad token/dispatch tests | environment-sensitive color tests | implemented; PATH repaint cost |
 | keybindings | chord/action/tracked-mode tests | edit-mode construction and live prompt bridge | implemented |
-| picker | pure model/scoring/Unicode tests | terminal loop has no pseudo-TTY integration | implemented with viewport issue |
+| picker | pure model/scoring/Unicode/viewport tests | terminal loop has no pseudo-TTY integration | implemented; restoration integration proof remains thin |
 | LSP | AST scope/definition/incremental/diagnostic unit tests | no editor protocol integration suite | useful local semantic baseline |
 
 ## Prioritized improvements
 
 1. **Keep prompt schema tied to real owners.** New fields need a consuming host path and producer
    tests before being advertised; do not reintroduce speculative engine/probe toggles.
-2. **Unify project prompt discovery with core configuration.** The current-directory-only prompt
-   layer visibly disagrees with nearest-ancestor typed config.
-3. **Move command-resolution checks out of repaint.** Share the completer's cache or a host command
+2. **Move command-resolution checks out of repaint.** Share the completer's cache or a host command
    index with highlighting, including Reef and adapters.
-4. **Give the picker a scrolling viewport** and add pseudo-TTY restoration/cancellation tests.
+3. **Add picker pseudo-TTY restoration/cancellation tests** across accept, cancel, read failure, and panic unwinding.
 7. **Build a syntax-service layer** for incomplete-state, cursor context, declarations, symbols, and
    docs so REPL and LSP stop hand-copying grammar decisions.
 8. **Extend the scoped LSP into a workspace graph** for references/rename and add type/method hover

@@ -42,9 +42,8 @@ pub fn load_prompt_config(cwd: &Path) -> (PromptConfig, Vec<String>) {
             layers.push(v);
         }
     }
-    // project .shoal.toml [prompt] table
-    if let Some(mut v) = read_prompt_table(&cwd.join(".shoal.toml"), &mut warnings) {
-        remove_project_custom_commands(&mut v, &mut warnings);
+    // nearest ancestor project .shoal.toml [prompt] table
+    if let Some(v) = read_project_prompt(cwd, &mut warnings) {
         layers.push(v);
     }
 
@@ -54,6 +53,13 @@ pub fn load_prompt_config(cwd: &Path) -> (PromptConfig, Vec<String>) {
 
     let config = shoal_prompt::load(layers, &mut warnings);
     (config, warnings)
+}
+
+fn read_project_prompt(cwd: &Path, warnings: &mut Vec<String>) -> Option<toml::Value> {
+    let path = shoal_config::find_project_config(cwd)?;
+    let mut prompt = read_prompt_table(&path, warnings)?;
+    remove_project_custom_commands(&mut prompt, warnings);
+    Some(prompt)
 }
 
 /// Project config is discovered merely by entering a directory, so it must
@@ -249,6 +255,25 @@ command = "touch should-not-run"
             layer.get("format").unwrap().get("left").unwrap().as_str(),
             Some("$custom_project")
         );
+    }
+
+    #[test]
+    fn project_prompt_uses_the_nearest_ancestor_config() {
+        let directory = tempfile::tempdir().unwrap();
+        let nested = directory.path().join("a/b");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(
+            directory.path().join(".shoal.toml"),
+            "[prompt.format]\nleft = 'root'",
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("a/.shoal.toml"),
+            "[prompt.format]\nleft = 'nearest'",
+        )
+        .unwrap();
+        let layer = read_project_prompt(&nested, &mut Vec::new()).unwrap();
+        assert_eq!(layer["format"]["left"].as_str(), Some("nearest"));
     }
 
     #[test]

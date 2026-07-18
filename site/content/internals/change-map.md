@@ -314,14 +314,14 @@ alongside device, inode, modification time, and length. Tests rewrite files to e
 restore the old mtime, and require cache invalidation. Metadata-to-open and hash-to-exec races remain
 honest filesystem/process boundaries; these caches are acceleration, not bearer authority.
 
-### Medium-low: configuration discovery still has two prompt paths
+### Closed: project and prompt discovery select one project file
 
-The shared host bootstrap now consumes render width/color/echo, kernel mode/session, journal
-enablement/state root, Leash policy, adapters, plugins, Reef, aliases, and environment. The remaining
-split is prompt-specific: the rich prompt loader independently rereads legacy `template` from
-system/user and cwd-local prompt files and migrates it to `format.left`. Preserve that compatibility
-while converging discovery; core config uses one nearest ancestor `.shoal.toml`, whereas rich prompt
-currently checks only `cwd/.shoal.toml`.
+The shared host bootstrap consumes render width/color/echo, kernel mode/session, journal
+enablement/state root, Leash policy, adapters, plugins, Reef, aliases, and environment. The rich
+prompt loader still owns its broader schema and legacy `template` migration, but it now calls the
+core loader's exact nearest-ancestor discovery function. Both select one identical project file;
+the core schema treats `[prompt]` as an opaque subsystem-owned table while the bounded prompt parser
+performs detailed validation and removes project executable custom modules.
 
 ### Medium-low: duplicated classifications invite drift
 

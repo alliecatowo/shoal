@@ -281,7 +281,7 @@ Directory `truncate_style` is exact: `start` removes leading components, `end` r
 
 Built-in themes are `default`, `minimal`, and `rich`. A theme is the lowest-precedence prompt layer; your explicit settings override it.
 
-### Prompt precedence is slightly different
+### Prompt precedence
 
 The prompt loader merges these sources from low to high:
 
@@ -289,10 +289,10 @@ The prompt loader merges these sources from low to high:
 2. `/etc/shoal/shoal.toml`'s `[prompt]` table
 3. the user `shoal.toml`'s `[prompt]` table
 4. the user `prompt.toml` root
-5. `./.shoal.toml`'s `[prompt]` table in the exact startup directory
+5. the nearest ancestor `.shoal.toml`'s `[prompt]` table
 6. prompt environment overrides
 
-Unlike main project configuration, the prompt loader currently checks only `cwd/.shoal.toml`; it does not walk ancestors. Rich keys placed under `[prompt]` in `shoal.toml` may also trigger false “unknown key” warnings from the generic configuration schema, which formally knows only `prompt.template`. `prompt.toml` avoids both ambiguity and warning noise.
+Prompt and core project configuration use the same nearest-ancestor discovery function and therefore select the same `.shoal.toml`. The core loader treats the rich `[prompt]` subtree as owned by the prompt schema, avoiding false unknown-key warnings; the bounded prompt loader still performs its complete dynamic-key/type validation and strips executable custom modules from this untrusted project layer.
 
 
 The prompt-specific overrides are `SHOAL_PROMPT_LEFT`, `SHOAL_PROMPT_RIGHT`, `SHOAL_PROMPT_THEME`, and `SHOAL_NERD_FONT`. For the font variable, `1` means `always` and `0` means `never`.
@@ -386,7 +386,7 @@ If the prompt exceeds `budget.render_deadline_ms`, Shoal warns once per refreshe
 
 ## Troubleshooting configuration
 
-- If a repository `.shoal.toml` seems ignored, remember that main configuration uses the nearest ancestor but prompt configuration only uses the file in the exact startup directory.
+- If a repository `.shoal.toml` seems ignored, check that it is the nearest ancestor project file; Shoal does not merge multiple ancestor `.shoal.toml` files.
 - If rich prompt keys warn from `shoal.toml`, move them to the root of `prompt.toml`.
 - If a legacy `{cwd}` template appears, migrate it to `format.left = "$directory..."`.
 - If output is unexpectedly silent in a script, set `render.echo = "all"` temporarily; see [CLI and execution modes](@/docs/cli.md).
