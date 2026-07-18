@@ -141,7 +141,7 @@ stream.append(path("events.ndjson"))
 stream.into(channel("user.events"))
 ```
 
-`collect()` rejects an unbounded stream. `each` returns null after completion. `render` sends each value to the evaluator's statement sink.
+`collect()` rejects an unbounded stream. A bounded stream may collect at most 16,384 values and 16 MiB of measured retained state; exceeding either wall raises `stream_collect_limit`. Use `.take(n)` to tighten the bound or an incremental sink for larger flows. `each` returns null after completion. `render` sends each value to the evaluator's statement sink.
 
 For streams, both `.save(path)` and `.append(path)` currently open the file in append mode and write one line per item. Strings and bytes are written as their content; other values become JSON per line. `.save` does not truncate, despite its name—this is an important preview behavior.
 

@@ -84,6 +84,12 @@ src = "(1..1000000).stream().take(3).collect()"
 value = "[1, 2, 3]"
 
 [[case]]
+name = "bounded-stream-collection-has-hard-retention-limit"
+src = "(0..16385).stream().collect()"
+error = "stream_collect_limit"
+error_contains = "16384-value limit"
+
+[[case]]
 name = "stream-flat-map-keeps-range-expansions-lazy"
 src = "[0].stream().flat_map(_ => 1..1000000).take(3).collect()"
 value = "[1, 2, 3]"

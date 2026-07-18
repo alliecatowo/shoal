@@ -112,12 +112,13 @@ language errors.
 
 
 Operators such as mapping/filtering/taking/merging/zipping compose lazy upstreams. `collect` rejects
-an unbounded stream unless the caller first establishes a bound. Sources include iterable values and
+an unbounded stream unless the caller first establishes a bound, then caps retained output at 16,384
+values and 16 MiB. Sources include iterable values and
 runtime channel/time/file producers implemented by the evaluator.
 
 ### Tee behavior
 
-For a bounded stream, tee can materialize once and replay exact values to each branch. A live stream
+For a bounded stream, tee can materialize once within the collection walls and replay exact values to each branch. A live stream
 uses a bounded queue per fork (currently 64 items). A slow fork can lose items and receives an
 explicit dropped marker rather than silently pretending delivery was lossless.
 

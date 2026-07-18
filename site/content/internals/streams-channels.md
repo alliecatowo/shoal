@@ -104,7 +104,9 @@ propagate or alter the bit:
 
 `collect_stream` checks the bit before taking upstream. An unbounded stream immediately returns
 `stream_unbounded` with a hint to use `take`, `take_until`, or `each`; it never enters a potentially
-infinite loop.
+infinite loop. Bounded collection then admits at most 16,384 values and 16 MiB of measured retained
+state. `stream_collect_limit` is shared by explicit `collect`, bounded exact `tee`, `for` over a
+stream, and eager collection-method fallback.
 
 The metadata is conservative. Predicate/signal termination is not recognized as a proof of
 boundedness, so an actually terminating `take_until` chain can still be rejected by `.collect()`
@@ -287,9 +289,9 @@ re-auditing if time budgets become strict RPC cancellation contracts.
 | Sink | Behavior | Result |
 |---|---|---|
 | `.each(f)` | drives every item and calls closure, discarding closure result | `null` |
-| `.collect()` | rejects unbounded metadata, otherwise drains | `List` |
+| `.collect()` | rejects unbounded metadata; otherwise drains up to 16,384 values / 16 MiB | `List` |
 | `.save(path)` / `.append(path)` | appends each item and newline as it arrives | resolved `Path` |
-| `.tee(n)` | exact materialized replay for bounded; lazy bounded queues for live | list of streams |
+| `.tee(n)` | exact materialized replay within collection walls for bounded; lazy bounded queues for live | list of streams |
 | `.into(channel)` | evaluator drives and publishes payloads | `null` |
 | `.render()` | evaluator drives and sends each item to statement sink | `null` |
 | `.feed(command)` | pumps serialized items into bounded child stdin | command outcome |
@@ -318,7 +320,7 @@ being dropped.
 
 ## Tee behavior
 
-Bounded streams are collected once and each fork replays the complete list. Live/unbounded streams
+Bounded streams are collected once within the 16,384-value / 16 MiB walls and each fork replays the complete list. Live/unbounded streams
 share one upstream with one 64-element queue per fork.
 
 ```mermaid

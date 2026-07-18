@@ -233,6 +233,8 @@ impl StreamVal {
     const DISTINCT_MAX_RETAINED_BYTES: usize = 16 * 1024 * 1024;
     pub const WINDOW_MAX_VALUES: usize = 4_096;
     const WINDOW_MAX_RETAINED_BYTES: usize = 16 * 1024 * 1024;
+    pub const COLLECT_MAX_VALUES: usize = 16_384;
+    const COLLECT_MAX_RETAINED_BYTES: usize = 16 * 1024 * 1024;
     /// Build a stream from an in-memory / lazy iterator (a bounded source).
     pub fn from_iter<I>(label: impl Into<String>, iter: I) -> StreamVal
     where
@@ -547,6 +549,20 @@ pub fn drive_stream(
 /// Collect a bounded stream into a `Vec`. Errors `stream_unbounded` on an endless
 /// source (site/content/internals/streams-channels.md) — the caller must `.take`/`.take_until` first.
 pub fn collect_stream(ctx: &mut dyn CallCtx, s: &StreamVal) -> VResult<Vec<Value>> {
+    collect_stream_with_limits(
+        ctx,
+        s,
+        StreamVal::COLLECT_MAX_VALUES,
+        StreamVal::COLLECT_MAX_RETAINED_BYTES,
+    )
+}
+
+fn collect_stream_with_limits(
+    ctx: &mut dyn CallCtx,
+    s: &StreamVal,
+    max_values: usize,
+    max_retained_bytes: usize,
+) -> VResult<Vec<Value>> {
     if !s.bounded {
         return Err(
             ErrorVal::new("stream_unbounded", "this stream has no natural end")
@@ -555,11 +571,40 @@ pub fn collect_stream(ctx: &mut dyn CallCtx, s: &StreamVal) -> VResult<Vec<Value
     }
     let mut up = s.take_upstream()?;
     let mut out = Vec::new();
+    let mut retained_bytes = 0usize;
     drive_stream(ctx, &mut *up, |_ctx, v| {
+        if out.len() >= max_values {
+            return Err(stream_collect_limit(format!(
+                "stream collection reached its {max_values}-value limit"
+            )));
+        }
+        let retained = retained_size(
+            &v,
+            RetainedLimits {
+                max_bytes: max_retained_bytes.saturating_sub(retained_bytes),
+                max_depth: 64,
+                max_nodes: 16_384,
+                opaque: OpaqueHandling::Charge(256),
+                allow_secret: true,
+            },
+        )
+        .map_err(|_| {
+            stream_collect_limit(format!(
+                "stream collection exceeds its {max_retained_bytes}-byte retained-value limit"
+            ))
+        })?;
+        retained_bytes = retained_bytes
+            .checked_add(retained)
+            .ok_or_else(|| stream_collect_limit("stream collection accounting overflowed"))?;
         out.push(v);
         Ok(())
     })?;
     Ok(out)
+}
+
+fn stream_collect_limit(message: impl Into<String>) -> ErrorVal {
+    ErrorVal::new("stream_collect_limit", message)
+        .with_hint("use `.take(n)`, an incremental sink such as `.each(f)`, or stream directly")
 }
 
 #[cfg(test)]
@@ -699,6 +744,20 @@ mod tests {
             "arg_error"
         );
         assert_eq!(drain(&stream), vec![Value::Int(1)]);
+    }
+
+    #[test]
+    fn collection_rejects_identity_and_byte_amplification() {
+        let stream = StreamVal::from_iter(
+            "int",
+            [1, 2, 3].into_iter().map(|value| Ok(Value::Int(value))),
+        );
+        let error = collect_stream_with_limits(&mut C, &stream, 2, 1024).unwrap_err();
+        assert_eq!(error.code, "stream_collect_limit");
+
+        let stream = StreamVal::from_iter("str", [Ok(Value::Str("x".repeat(128)))].into_iter());
+        let error = collect_stream_with_limits(&mut C, &stream, 8, 64).unwrap_err();
+        assert_eq!(error.code, "stream_collect_limit");
     }
 
     #[test]

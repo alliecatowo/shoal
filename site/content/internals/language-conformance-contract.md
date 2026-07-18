@@ -327,7 +327,7 @@ Rules for codes:
 ## Normative conformance corpus
 
 `spec/cases/*.toml` is the behavioral specification. At the 2026-07-16 audit it contained 77 suite
-files and 1,310 globally named cases; the reconciled tree now contains 79 suites and 1,362 cases. A
+files and 1,310 globally named cases; the reconciled tree now contains 79 suites and 1,363 cases. A
 case has this conceptual shape:
 
 ```toml
@@ -382,7 +382,7 @@ explicitly skipped with a reason.
 
 ### Current corpus state
 
-The 2026-07-18 observed result is 1,358 passed, 0 failed, and 4 skipped. The skips cover a native-thread
+The 2026-07-18 observed result is 1,359 passed, 0 failed, and 4 skipped. The skips cover a native-thread
 recursion-stack condition, a Node block, a jq feed composition, and full-chain Reef `which`. Counts
 are evidence from that run, not a permanently hardcoded health claim; release notes must run the
 corpus again.
@@ -390,7 +390,7 @@ corpus again.
 ### Exhaustive suite ledger
 
 Every suite is named below so a language area cannot disappear behind an aggregate count. Counts
-come from `[[case]]` records in the current tree and sum to 1,362. This table should eventually be
+come from `[[case]]` records in the current tree and sum to 1,363. This table should eventually be
 generated and checked in CI; until then, adding, renaming, or splitting a suite requires updating it.
 
 #### Core syntax, control flow, and diagnostics
@@ -500,7 +500,7 @@ generated and checked in CI; until then, adding, renaming, or splitting a suite 
 | `streams-3.toml` | 2 | third-wave stream regressions |
 | `streams-backpressure.toml` | 6 | boundedness, timeout, and pressure behavior |
 | `streams-more.toml` | 7 | additional transformations and consumption rules |
-| `streams.toml` | 43 | source/operator/sink baseline, lazy range expansion, fairness, single consumption, bounded-history and unbounded-source errors |
+| `streams.toml` | 44 | source/operator/sink baseline, lazy range expansion, bounded collection, fairness, single consumption, bounded-history and unbounded-source errors |
 
 ### Two-runner risk
 

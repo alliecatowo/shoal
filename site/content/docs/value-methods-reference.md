@@ -701,7 +701,7 @@ Durations must be non-negative. Window count must be positive. `merge`/`zip` req
 | Method | Result | Notes |
 | --- | --- | --- |
 | `each(f)` | `null` | run callback per item |
-| `collect()` | list | requires a bounded stream |
+| `collect()` | list | requires bounded metadata; capped at 16,384 values / 16 MiB |
 | `save(path)` | path | appends one encoded line per item |
 | `append(path)` | path | same implementation as stream `save` today |
 | `tee(n=2)` | list of streams | bounded replay or live shared queues |
@@ -714,7 +714,7 @@ Like value save, stream file sinks resolve relative paths against the evaluator 
 through the injected `Fs` port. A recording or denying adapter can therefore observe or refuse the
 write, though these sinks still bypass journal undo and the production default remains `StdFs`.
 
-For a bounded stream, unfamiliar eager methods such as `.sort()`, `.sum()`, or `.len()` first collect the entire stream and then dispatch to collection logic. For a live/unbounded stream this raises `stream_unbounded`; bound it explicitly with `.take(n)` or `.take_until(...)`.
+For a bounded stream, unfamiliar eager methods such as `.sort()`, `.sum()`, or `.len()` first collect up to the shared 16,384-value / 16 MiB wall and then dispatch to collection logic. Exceeding it raises `stream_collect_limit`. For a live/unbounded stream this raises `stream_unbounded`; bound it explicitly with `.take(n)` or `.take_until(...)`.
 
 `.feed(command)` incrementally pumps a finite or live stream into captured child stdin. Ordinary
 values are line-framed; bytes and outcome output remain raw. The bounded stdin path holds 16 chunks
@@ -723,7 +723,7 @@ stdin, or a serialization/upstream error. Buffer and feed pumps share a maximum 
 
 ### Live `tee`
 
-Bounded streams materialize once and create independent replay streams. A live stream uses one shared upstream with a queue capped at 64 items for each fork. If a fork is not driven and its queue fills, later values for that fork are dropped and counted. The fork subsequently receives an in-order `{marker: "stream_gap", reason: "tee_overflow", dropped: n, from_seq: null, to_seq: null}` record once space is available or the queue drains; overflow does not raise. All forks still obey single-consumer semantics.
+Bounded streams materialize once within the collection walls and create independent replay streams. A live stream uses one shared upstream with a queue capped at 64 items for each fork. If a fork is not driven and its queue fills, later values for that fork are dropped and counted. The fork subsequently receives an in-order `{marker: "stream_gap", reason: "tee_overflow", dropped: n, from_seq: null, to_seq: null}` record once space is available or the queue drains; overflow does not raise. All forks still obey single-consumer semantics.
 
 ## Channel handle methods
 

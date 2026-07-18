@@ -185,6 +185,10 @@ fn compact_ranges_bound_eager_materialization_but_stream_lazily() {
         rendered("(1..1000000).stream().take(3).collect()"),
         "[1, 2, 3]"
     );
+    assert_eq!(
+        run_err("(0..16385).stream().collect()"),
+        "stream_collect_limit"
+    );
 }
 
 #[test]
