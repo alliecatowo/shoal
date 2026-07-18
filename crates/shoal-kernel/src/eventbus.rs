@@ -920,9 +920,14 @@ impl Kernel {
         // in the successful result rather than turning a committed publish into
         // a retryable RPC error. `try_inject` never re-forwards, so no echo loop
         // is possible. The cached bus avoids waiting on the evaluator lock.
-        let payload = shoal_value::json_to_value(&p.payload);
-        let language_mirror = match attachment.session.lang_bus.try_inject(&p.channel, payload) {
-            Ok(seq) => json!({"ok":true,"seq":seq}),
+        let language_mirror = match shoal_value::json_to_value(&p.payload) {
+            Ok(payload) => match attachment.session.lang_bus.try_inject(&p.channel, payload) {
+                Ok(seq) => json!({"ok":true,"seq":seq}),
+                Err(error) => json!({
+                    "ok":false,
+                    "error":{"code":error.code,"message":error.msg},
+                }),
+            },
             Err(error) => json!({
                 "ok":false,
                 "error":{"code":error.code,"message":error.msg},

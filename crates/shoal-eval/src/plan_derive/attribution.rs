@@ -3,7 +3,7 @@
 use super::*;
 
 impl Evaluator {
-    pub(super) fn plan_abs(&self, value: &str) -> PathBuf {
+    pub(crate) fn plan_abs(&self, value: &str) -> PathBuf {
         let path = PathBuf::from(value);
         if path.is_absolute() {
             path
@@ -13,15 +13,20 @@ impl Evaluator {
     }
 
     pub(super) fn cmd_arg_path_literal(&self, arg: &CmdArg) -> Option<PathBuf> {
-        let value = match arg {
-            CmdArg::Word { text, .. } | CmdArg::Path { text, .. } => text.clone(),
+        let (value, resolve) = match arg {
+            CmdArg::Word { text, .. } => (text.clone(), false),
+            CmdArg::Path { text, .. } => (text.clone(), true),
             CmdArg::Str { expr, .. } | CmdArg::Expr { expr, .. } => match expr {
-                Expr::Str { value, .. } => value.clone(),
+                Expr::Str { value, .. } => (value.clone(), false),
                 _ => return None,
             },
             _ => return None,
         };
-        Some(self.plan_abs(&value))
+        Some(if resolve {
+            self.resolved_abs_path(&value)
+        } else {
+            self.plan_abs(&value)
+        })
     }
 
     /// Resolve the same `.shl` candidate the module loader would inspect,

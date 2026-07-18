@@ -260,8 +260,11 @@ The stream/channel chapter is the source-derived matrix.
 
 ## Builtin and method contract
 
-Names are never pinned by prose lists. The canonical builtin command-head registry is
-`shoal_syntax::commands::builtin_names()`, consumed by parser/host tooling and evaluator dispatch.
+Names are never pinned by prose lists. The canonical builtin command-head registry and typed
+signature/help metadata are exposed by `shoal_syntax::commands::{builtin_names, builtin_specs}` and
+consumed by parser/host tooling and evaluator dispatch. Every registered head has positional arity
+and types, flags, subcommands, result, error, and example metadata; `-h`/`--help` renders that schema
+after command resolution but before argument expansion or effects.
 The discoverable value-method metadata lives in `shoal-value/src/methods/suggest.rs`; actual method
 behavior lives in the dispatch modules. They are intended to agree but currently have known drift,
 so neither may be treated as a generated perfect registry yet.
@@ -275,8 +278,8 @@ Adding a builtin or method requires:
 5. completion/highlighter/LSP audit;
 6. external reference and focused internal ledger update.
 
-Current registry/dispatch drift is documented rather than hidden. Do not “fix” prose to claim they
-match until tests prove it.
+Registry completeness and zero-effect help dispatch are executable invariants. Runtime arity and
+completion consumers are not all schema-driven yet, so remaining drift there stays documented.
 
 ## Canonical render contract
 
@@ -303,7 +306,7 @@ source-emitted families include:
 |---|---|
 | syntax/evaluation | `parse_error`, `type_error`, `arg_error`, `undefined_var`, `field_missing`, `index_range` |
 | execution/filesystem | `not_found`, `cmd_failed`, `io_error`, `permission`, `utf8_error`, `no_matches`, `feed_error` |
-| numeric/control | `div_zero`, `overflow`, `recursion_limit`, `assert_failed` |
+| numeric/control | `div_zero`, `overflow`, `number_range`, `recursion_limit`, `assert_failed` |
 | lexical retention | `binding_name_limit`, `binding_identity_limit`, `binding_value_limit`, `binding_aggregate_limit` |
 | journal integrity | `journal_begin_failed`, `journal_commit_indeterminate`, `journal_read_failed` |
 | streams/events | `stream_consumed`, `stream_unbounded`, `channel_closed`, `channel_poisoned`, `channel_name_limit`, `channel_registry_limit`, `channel_subscriber_limit`, `channel_payload_limit`, `channel_payload_type` |
@@ -327,7 +330,7 @@ Rules for codes:
 ## Normative conformance corpus
 
 `spec/cases/*.toml` is the behavioral specification. At the 2026-07-16 audit it contained 77 suite
-files and 1,310 globally named cases; the reconciled tree now contains 79 suites and 1,364 cases. A
+files and 1,310 globally named cases; the reconciled tree now contains 79 suites and 1,374 cases. A
 case has this conceptual shape:
 
 ```toml

@@ -12,6 +12,12 @@
 
 use std::sync::LazyLock;
 
+mod metadata;
+pub use metadata::{
+    BuiltinCommandSpec, CommandFlagSpec, CommandParamSpec, CommandSubcommandSpec, ParamArity,
+    builtin_help, builtin_spec, builtin_specs,
+};
+
 /// The winning layer in command-head resolution, ordered from most local to
 /// most ambient. Consumers add their own payload (the bound value, adapter
 /// schema, executable path, or Reef report) after this common classification.
@@ -156,7 +162,7 @@ const SPECIAL_HEADS: &[&str] = &[
 /// is THE source of truth — the completer, highlighter, and LSP all consume it
 /// (via [`builtin_names`]) instead of hand-maintaining their own drifting copies.
 static BUILTIN_NAMES: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
-    let mut v: Vec<&'static str> = NAMES.iter().chain(SPECIAL_HEADS).copied().collect();
+    let mut v: Vec<&'static str> = builtin_specs().iter().map(|spec| spec.name).collect();
     v.sort_unstable();
     v.dedup();
     v

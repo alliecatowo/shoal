@@ -77,7 +77,7 @@ rm ./obsolete.txt
 
 Directories require `cp --recursive` and `rm --recursive` where relevant. An unmatched/empty removal is an error rather than a silently successful destructive command.
 
-Default `rm` atomically moves targets into a private, process-specific directory beneath Shoal's UID-qualified runtime directory. If that directory is on another filesystem (or is unavailable), Shoal instead uses a private, UID-qualified hidden `.shoal-trash-UID` directory beside the source so the move remains atomic and preserves directories, symlinks, metadata, and journal undo. On Unix, unsafe ownership, symlinks, or group/other permissions are rejected. Every source and the complete bounded result shape are admitted before the first removal; argument or report-limit errors therefore remove nothing. A bounded best-effort cleanup pass removes trash sessions older than 30 days. Cleanup failures are deduplicated into one summary of at most 8 KiB on the first result row's `trash_cleanup_warnings`; additional warning occurrences are counted as suppressed rather than cloned into every row. Trash still consumes disk space until that cleanup runs. Use `rm --permanent` when space must be reclaimed immediately; it deletes directly and has no restore inverse.
+Default `rm` atomically moves targets into a private, process-specific directory beneath Shoal's UID-qualified runtime directory. If that directory is on another filesystem (or is unavailable), Shoal instead uses a private, UID-qualified hidden `.shoal-trash-UID` directory beside the source so the move remains atomic and preserves directories, symlinks, metadata, and journal undo. On Unix, unsafe ownership, symlinks, or group/other permissions are rejected. Before creating trash or deleting anything, Shoal resolves input identity through the active filesystem port and refuses duplicate aliases, Unix hard-link aliases, and any directory-and-descendant overlap, independent of argument order. A final symbolic link remains its own removable directory entry; aliases through a symbolic-link parent resolve to the same entry. Every source and the complete bounded result shape are admitted before the first removal; identity, argument, or report-limit errors therefore remove nothing. Ancestor checks walk bounded path depth rather than comparing every input pair. A bounded best-effort cleanup pass removes trash sessions older than 30 days. Cleanup failures are deduplicated into one summary of at most 8 KiB on the first result row's `trash_cleanup_warnings`; additional warning occurrences are counted as suppressed rather than cloned into every row. Trash still consumes disk space until that cleanup runs. Use `rm --permanent` when space must be reclaimed immediately; it deletes directly and has no restore inverse. Identity admission cannot make a hostile filesystem immutable: a rename or link change after preflight can still race the later effect, and custom filesystem adapters must mediate canonicalization for this command.
 
 ## Path methods and save forms
 
@@ -238,7 +238,12 @@ accDescr: Shows the components and relationships described in Undo protocol.
 
 Value-position process output is bounded in memory. The default resident capture cap is 64 MiB and can be changed with `SHOAL_CAPTURE_CAP_BYTES`. In a journaled session, overflow can spill into content-addressed storage up to the spill cap (default 1 GiB, `SHOAL_CAPTURE_SPILL_CAP_BYTES`). A lazy bytes reference preserves the true length and loads content on demand.
 
-The journal also has an output hard cap (default 256 MiB). Prior file content that exceeds the applicable journal cap is deliberately left without an undo inverse; restoring truncated bytes would be worse than refusing undo.
+The journal also has an output hard cap (default 256 MiB). Prior file content first crosses a
+separate 8 MiB stable-snapshot wall: the filesystem port reads at most the wall plus one sentinel and
+requires unchanged metadata around the read (opened-descriptor identity in the production Unix
+adapter). Oversized, sparse, growing, or path-swapped sources are deliberately left without an undo
+inverse. Content that exceeds the applicable journal output cap is likewise non-reversible;
+restoring truncated or stale bytes would be worse than refusing undo.
 
 Large captures and kernel response refs are detailed in [Agents, kernel, and MCP](@/docs/agents-kernel-mcp.md) and [Current status and limits](@/docs/status-limits.md).
 

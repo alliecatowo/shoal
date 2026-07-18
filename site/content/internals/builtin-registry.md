@@ -18,6 +18,7 @@ clients share vocabulary without depending on the runtime, but it creates a lock
 between registry membership and dispatch guards.
 
 Sources: [`commands.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-syntax/src/commands.rs),
+`crates/shoal-syntax/src/commands/metadata.rs`,
 [`builtins.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-eval/src/builtins.rs),
 [`command.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-eval/src/command.rs), and
 [`host.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-eval/src/host.rs).
@@ -73,7 +74,10 @@ special-head registry.
 flowchart TD
 accTitle: Command dispatch precedence
 accDescr: Shows the components and relationships described in Command dispatch precedence.
-  Call["CmdCall"] --> BG{"background &?"}
+  Call["CmdCall"] --> Resolve["canonical head resolution"]
+  Resolve --> Help{"resolved builtin + -h/--help?"}
+  Help -->|yes| RenderHelp["render metadata; zero effects"]
+  Help -->|no| BG{"background &?"}
   BG -->|yes| Spawn["desugar to spawn block"]
   BG -->|no| Callable{"bound callable?"}
   Callable -->|yes| CallValue["closure/CmdRef command-call path"]
@@ -108,6 +112,15 @@ types influence parsing of the word list:
 
 `--help` on a closure synthesizes a signature and documentation string and sends it through the
 statement renderer. This behavior is runtime dispatch, not a separate documentation command.
+
+For a head that actually resolves to a builtin, `-h` and `--help` render the canonical typed command
+schema. Resolution happens first, so a callable shadow still receives callable help. Builtin help
+then returns `null` before background desugaring, glob/expression expansion, environment prefixes,
+redirects, Reef/provider work, filesystem access, process launch, or session mutation. Extra operands
+do not weaken this rule (`rm --help FILE` is help, never removal); `--` ends option recognition.
+Planning applies the identical predicate and derives an empty effect set, including when the source
+contains `&` or redirects. An adversarial matrix exercises both help spellings for all 37 heads with
+denying filesystem, execution, clock, and opener ports.
 
 ## Structured builtin input pipeline
 
@@ -294,7 +307,8 @@ command returns `null` so it is not rendered a second time.
 To add a command builtin safely:
 
 1. choose structured or special ownership; never add the same name to both lists;
-2. add the name in `shoal-syntax/src/commands.rs` and update the pinned count;
+2. add typed signature/help metadata in `shoal-syntax/src/commands/metadata.rs`, classify the head in
+   `commands.rs`, and update the pinned count;
 3. for a structured builtin, add its dispatch arm, argument coercion rule, typed return contract,
    flags, cancellation behavior, and error spans;
 4. for a special head, add an explicit `eval_command` branch and keep registry/guard parity tests
@@ -318,5 +332,5 @@ To add a command builtin safely:
   port/event bus in the shown host implementation; child inheritance requires continuing audits.
 - `retry` delay is neither cancellation-aware nor routed through a sleep/clock capability.
 - Builtin outcomes report zero duration and have no invocation span, reducing telemetry fidelity.
-- The registry centralizes names, not signatures or help text; behavioral metadata still lives in
-  multiple evaluator files.
+- Canonical signature/help metadata now exists, but runtime arity validation and every completion/man
+  consumer have not yet been migrated to it.

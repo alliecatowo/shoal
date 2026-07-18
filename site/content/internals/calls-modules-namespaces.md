@@ -250,9 +250,10 @@ the caller to invoke it.
 ## Data namespace conversions
 
 JSON, YAML, and TOML parsing first deserialize into `serde_json::Value`, then use the shared
-`json_to_value` projection. Stringification performs the reverse `value_to_json` projection. That
-common bridge means unsupported or lossy runtime types have the same JSON-shaped fallback concerns
-across all three formats.
+fallible `json_to_value` projection. Stringification performs the reverse `value_to_json`
+projection. Integer values outside Shoal's signed 64-bit range fail with `number_range`; the JSON
+source path additionally checks exact number tokens before serde's generic value representation can
+round them. That common bridge gives all three formats the same non-lossy numeric boundary.
 
 All four data namespaces route through `data_codecs.rs`. Parsing admits no more than 16 MiB of input,
 131,072 structural nodes, depth 128, or 16 MiB of retained Shoal values. JSON, YAML, and CSV encode

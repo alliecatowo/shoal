@@ -2761,10 +2761,21 @@ fn value_get_resolves_cas_backed_bytes_ref() {
         fn load(&self) -> std::io::Result<Vec<u8>> {
             Ok(self.0.clone())
         }
+
+        fn open(&self) -> std::io::Result<Box<dyn std::io::Read + Send>> {
+            Ok(Box::new(std::io::Cursor::new(self.0.clone())))
+        }
     }
     struct FailLoader;
     impl shoal_value::BytesLoad for FailLoader {
         fn load(&self) -> std::io::Result<Vec<u8>> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "blob gone",
+            ))
+        }
+
+        fn open(&self) -> std::io::Result<Box<dyn std::io::Read + Send>> {
             Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 "blob gone",

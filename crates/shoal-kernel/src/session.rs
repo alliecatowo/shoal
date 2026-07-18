@@ -77,13 +77,23 @@ fn validate_attach_wire(params: &Json) -> Result<Option<LocalAuthMode>, RpcError
 pub(crate) struct SessionKey {
     pub(crate) principal: String,
     pub(crate) name: String,
+    /// Server-derived trust/profile scope. It is deliberately absent from the
+    /// wire identity, but prevents one principal from reusing a named
+    /// evaluator created under a different authentication posture.
+    authority_scope: String,
 }
 
 impl SessionKey {
+    #[cfg(test)]
     pub(crate) fn new(principal: &str, name: &str) -> Self {
+        Self::new_scoped(principal, name, "embedded-human/local-human")
+    }
+
+    fn new_scoped(principal: &str, name: &str, authority_scope: &str) -> Self {
         Self {
             principal: principal.to_string(),
             name: name.to_string(),
+            authority_scope: authority_scope.to_string(),
         }
     }
 
@@ -219,12 +229,21 @@ impl Drop for WireStreamCursorEntry {
 
 mod state;
 pub(crate) use state::cursor_quarantined;
+mod frecency;
 
 impl Kernel {
     /// Get-or-create the principal-private named session.
     #[cfg(test)]
     pub(crate) fn session(&self, name: &str, principal: &str) -> Result<Arc<Session>, RpcError> {
-        self.session_with_surface(name, principal, shoal_host::Surface::Kernel)
+        self.session_with_surface(
+            name,
+            principal,
+            shoal_host::Surface::Kernel,
+            // Test-only direct construction historically seeds the same
+            // evaluator later reached by an embedded local-human attach.
+            "embedded-human/local-human",
+            None,
+        )
     }
 
     /// Get-or-create a session under an explicit host profile. Only the
@@ -235,8 +254,10 @@ impl Kernel {
         name: &str,
         principal: &str,
         surface: shoal_host::Surface,
+        authority_scope: &str,
+        jump_store: Option<PathBuf>,
     ) -> Result<Arc<Session>, RpcError> {
-        let key = SessionKey::new(principal, name);
+        let key = SessionKey::new_scoped(principal, name, authority_scope);
         self.sessions.get_or_try_insert_with(
             key.clone(),
             || {
@@ -257,10 +278,16 @@ impl Kernel {
                 // already seeded by `apply`; only the inherited private-human
                 // interactive profile may run `init.files` below.
                 evaluator.set_leash_policy(self.policy.clone(), key.principal.clone());
-                // Long-lived agent/interactive sessions build up `j`/`jump` directory
-                // history against the shared per-user store, same as the REPL (frecency
-                // recording is best-effort and never fails a cd).
-                evaluator.open_default_jump_history();
+                // Durable jump history is a host-owned authority choice. A
+                // stable authenticated scope receives only its partition;
+                // tokenless restricted agents receive no durable reads or
+                // writes. The private local human deliberately retains the
+                // standalone REPL's legacy per-user store.
+                if let Some(path) = &jump_store {
+                    evaluator.set_jump_store(path.clone());
+                } else {
+                    evaluator.disable_jump_history();
+                }
                 // Install a command journal on the session's own evaluator (site/content/internals/language-conformance-contract.md),
                 // mirroring the local REPL's `set_journal` call: without
                 // this, the evaluator's per-statement journal integration
@@ -533,13 +560,21 @@ impl Kernel {
         let can_approve = local_human
             || profile == "supervisor"
             || token_caps.iter().any(|cap| cap == "plan.approve");
+        let (authority_scope, jump_store, jump_history_mode) = self.jump_history_policy(
+            &who,
+            &profile,
+            connection_trust,
+            local_human,
+            bearer.is_some(),
+        );
         let name = params.session.unwrap_or_else(|| "default".into());
         let surface = if local_human && tty && connection_trust == ConnectionTrust::EmbeddedHuman {
             shoal_host::Surface::Interactive
         } else {
             shoal_host::Surface::Kernel
         };
-        let session = self.session_with_surface(&name, &who, surface)?;
+        let session =
+            self.session_with_surface(&name, &who, surface, &authority_scope, jump_store)?;
         session.ensure_healthy()?;
         self.ensure_event_owner(&session.key.owner())?;
         let cwd = session.lock_evaluator()?.cwd().as_os_str().to_owned();
@@ -594,6 +629,10 @@ impl Kernel {
         object.insert(
             "connection_trust".into(),
             Json::String(connection_trust.as_str().into()),
+        );
+        object.insert(
+            "jump_history".into(),
+            Json::String(jump_history_mode.into()),
         );
         Ok(result)
     }

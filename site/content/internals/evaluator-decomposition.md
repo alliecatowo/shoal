@@ -160,11 +160,12 @@ The genuinely mutable state that advances as a program runs. Sub-grouped by fine
 | `journal_parent_entry` | `Option<i64>` | host/journal | coarse host execution owning new rows |
 | `last_completed_entry` | `Option<i64>` | journal | exact final durable row returned to the host |
 
-**Persistence path** (root-only):
+**Persistence paths** (host-selected):
 
 | Field | Type | Mutated by | Lifetime |
 |---|---|---|---|
-| `jump_store` | `Option<PathBuf>` | frecency | frecency persistence target; `None` disables writes |
+| `jump_read_store` | `Option<PathBuf>` | frecency | query partition; `None` explicitly disables durable observation |
+| `jump_write_store` | `Option<PathBuf>` | frecency | update partition; `None` disables recording |
 
 ### What the four child sites copied before HR-J2
 
@@ -262,7 +263,7 @@ a `.shl` script child takes a **fresh root `env`** (intended isolation) but stil
 | modules, module_stack | fresh | a child re-memoizes its own imports |
 | plans | fresh (root-only in practice) | `plan { … }`/`apply` is a REPL/root verb |
 | source, current_entry, journal parent/last entry | fresh | set at the child's own host execution / per-statement |
-| jump_store | **fresh = None** | never write frecency from a background thread; avoids a file race on inherited `cwd` |
+| jump history | inherit `jump_read_store`; **fresh `jump_write_store = None`** | preserve the host's observation boundary without letting a background child mutate navigation history |
 
 ## Invariants the split must enforce
 

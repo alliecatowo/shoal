@@ -227,7 +227,7 @@ pub fn resolve_echo_mode(echo: Option<&str>, default: EchoMode) -> EchoMode {
 
 pub fn config_snapshot_value(config: &Config) -> Value {
     match serde_json::to_value(config) {
-        Ok(json) => json_to_value(&json),
+        Ok(json) => json_to_value(&json).unwrap_or_else(|_| Value::Record(Record::new())),
         Err(_) => Value::Record(Record::new()),
     }
 }

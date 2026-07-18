@@ -39,12 +39,12 @@ mod task;
 mod value_types;
 
 pub use ports::{
-    BytesLoad, Clock, ConfigPort, ConfigSnapshot, Fs, Opener, ReadSeek, SecretPort, StdClock,
-    StdFs, StdOpener,
+    BytesLoad, Clock, ConfigPort, ConfigSnapshot, Fs, FsFileSnapshot, Opener, ReadSeek, SecretPort,
+    StdClock, StdFs, StdOpener,
 };
 
 pub use env::{AssignError, Binding, Env};
-pub use json::{json_to_value, value_to_json};
+pub use json::{json_to_value, preflight_json_numbers, value_to_json};
 pub use methods::{method_names, methods_for};
 pub use outcome::OutcomeVal;
 pub use retained::{OpaqueHandling, RetainedError, RetainedLimits, retained_size};
@@ -600,6 +600,6 @@ mod tests {
     #[test]
     fn json_uniform_objects_become_table() {
         let j: serde_json::Value = serde_json::from_str(r#"[{"a":1},{"a":2}]"#).unwrap();
-        assert!(matches!(json_to_value(&j), Value::Table(_)));
+        assert!(matches!(json_to_value(&j).unwrap(), Value::Table(_)));
     }
 }

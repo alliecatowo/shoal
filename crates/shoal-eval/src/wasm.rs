@@ -209,7 +209,7 @@ fn from_plugin_value(value: PluginValue) -> VResult<Value> {
         )),
         PluginValue::Text(value) => Ok(Value::Str(value)),
         PluginValue::Bytes(value) => Ok(Value::Bytes(Arc::new(value))),
-        PluginValue::Json(value) => Ok(shoal_value::json_to_value(&value)),
+        PluginValue::Json(value) => shoal_value::json_to_value(&value),
     }
 }
 
@@ -494,6 +494,11 @@ mod tests {
     #[test]
     fn plugin_unsigned_overflow_is_not_lossy() {
         assert!(from_plugin_value(PluginValue::Unsigned(u64::MAX)).is_err());
+        let json = PluginValue::Json(serde_json::Value::Number(serde_json::Number::from(
+            u64::MAX,
+        )));
+        let error = from_plugin_value(json).unwrap_err();
+        assert_eq!(error.code, "number_range");
     }
 
     #[test]
@@ -517,6 +522,17 @@ mod tests {
             evaluator.eval_program(&program).unwrap(),
             Value::Null
         ));
+
+        let with_effectful_argument =
+            shoal_syntax::parse(r#"plug (secret.get("PLUGIN_TOKEN"))"#).unwrap();
+        let effects = evaluator
+            .plan_program(&with_effectful_argument)
+            .unwrap()
+            .effects;
+        assert!(effects.contains(&Effect::Time));
+        assert!(effects.contains(&Effect::SecretUse {
+            names: vec!["PLUGIN_TOKEN".into()]
+        }));
 
         evaluator
             .env_mut()

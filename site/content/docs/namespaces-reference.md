@@ -48,8 +48,8 @@ Parses one JSON document and maps it into Shoal values:
 | --- | --- |
 | null | `null` |
 | boolean | `bool` |
-| integer in range | `int` |
-| other number | `float` |
+| signed 64-bit integer | `int` |
+| decimal or exponent number | finite `float` |
 | string | `str` |
 | array | `table` when non-empty and every item is an object; otherwise `list` |
 | object | ordered `record` |
@@ -59,7 +59,10 @@ let doc = json.parse('{"name":"shoal","ports":[80,443]}')
 doc.ports.map(x => x + 1)
 ```
 
-Missing/wrong argument and malformed input raise `arg_error`.
+Missing/wrong argument and malformed input raise `arg_error`. JSON integer tokens outside the
+signed 64-bit range raise `number_range` instead of being rounded through a float; encode larger
+integer identifiers as JSON strings. Decimal and exponent tokens retain the language's ordinary
+finite-float semantics; numbers outside the finite-float range are rejected.
 
 ### `json.stringify`
 
@@ -277,10 +280,14 @@ Every HTTP call returns:
 | `status` | `int` | HTTP status code |
 | `ok` | `bool` | true for 200–299 |
 | `body` | `str` | decoded response body |
-| `json` | value or `null` | parsed JSON when the trimmed body is valid JSON |
+| `json` | value or `null` | parsed JSON when the trimmed body is valid and its numbers fit Shoal |
 | `headers` | `record<str>` | response headers |
 
 HTTP 4xx/5xx statuses are not raised as errors; inspect `.ok` or `.status`. Transport, timeout, and body-read failures raise `net_error`.
+
+The convenience `.json` projection is `null` for a syntactically valid document containing an
+integer outside Shoal's signed 64-bit range. The original, exact response remains available in
+`.body`; parsing that body explicitly with `json.parse` reports the typed `number_range` error.
 
 Redirect responses are returned as ordinary 3xx response records and are never followed. The effect
 plan authorizes only the requested URL authority; following `Location` or an ambient process proxy
@@ -288,14 +295,22 @@ would create an unplanned network connection. Fetch a reviewed redirect target e
 receives its own `net.connect(host:port)` plan entry. Shoal's HTTP transport ignores ambient
 `HTTP_PROXY`/`HTTPS_PROXY` settings for the same reason.
 
-Request body serialization uses the same feedability rules as `.feed`: strings are UTF-8 bytes, bytes are raw, scalar data renders to text, and records/tables/lists become compact JSON. A path is a name, not file content; use `path.read` or `path.read_bytes`.
+Request body serialization uses the same feedability rules as `.feed`: strings are UTF-8 bytes,
+bytes are raw, scalar data renders to text, and records/tables/lists become compact JSON. A path is a
+name, not file content; use `path.read` or `path.read_bytes`. The total request body and eager
+structured encoding are capped at 16 MiB. Resident bytes are read without a whole-body clone and a
+CAS-backed value is opened incrementally; known-oversize CAS metadata raises `http_body_limit`
+before the store is opened or a socket is connected. A reader that grows past its declared length is
+stopped by the same hard wall. Resident bodies retain a sized `Content-Length` request; lazy CAS
+bodies use chunked transfer so the hard-wall sentinel remains enforceable while streaming.
 
 Header values accept strings, secrets, and other renderable values. A secret is intentionally permitted here for authentication header injection, but remains redacted in ordinary output.
 
 Current limitations:
 
 - no custom timeout argument;
-- no streaming request or response body;
+- no language-level live-stream request or response body (finite resident/CAS request data is
+  transported incrementally);
 - no automatic redirects, proxy routing, or custom TLS configuration surface;
 - response body must decode as text for the returned record;
 - repeated response header names collapse into one record key.

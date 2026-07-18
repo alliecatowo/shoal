@@ -373,19 +373,17 @@ fn overlong_and_multiline_paths_are_not_persisted() {
 }
 
 #[test]
-fn concurrent_atomic_saves_leave_one_complete_bounded_store() {
+fn concurrent_recorders_preserve_every_update() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("jump.frecency");
-    let barrier = Arc::new(Barrier::new(4));
+    let barrier = Arc::new(Barrier::new(8));
     let mut workers = Vec::new();
-    for index in 0..4 {
+    for index in 0..8 {
         let path = path.clone();
         let barrier = barrier.clone();
         workers.push(std::thread::spawn(move || {
-            let mut store = FrecencyStore::default();
-            store.add(Path::new(&format!("/worker-{index}")), index);
             barrier.wait();
-            store.save_host(&path)
+            FrecencyStore::record_host(&path, Path::new(&format!("/worker-{index}")), index)
         }));
     }
     for worker in workers {
@@ -393,14 +391,100 @@ fn concurrent_atomic_saves_leave_one_complete_bounded_store() {
     }
 
     let loaded = FrecencyStore::load_host(&path);
-    assert_eq!(loaded.entries.len(), 1);
-    assert!(
-        loaded.entries[0]
-            .path
-            .to_string_lossy()
-            .starts_with("/worker-")
-    );
+    assert_eq!(loaded.entries.len(), 8);
+    for index in 0..8 {
+        let expected = format!("/worker-{index}");
+        assert!(
+            loaded
+                .entries
+                .iter()
+                .any(|entry| entry.path == Path::new(&expected))
+        );
+    }
     assert!(std::fs::metadata(path).unwrap().len() <= MAX_STORE_FILE_BYTES as u64);
+}
+
+#[test]
+fn contended_store_degrades_within_the_bounded_wait() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("jump.frecency");
+    let file = open_lock_file(&path).unwrap();
+    let mut lock = fd_lock::RwLock::new(file);
+    let _guard = lock.write().unwrap();
+
+    let started = std::time::Instant::now();
+    let error = FrecencyStore::record_host(&path, Path::new("/blocked"), 1).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    assert!(started.elapsed() >= LOCK_WAIT);
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    assert!(!path.exists());
+}
+
+#[test]
+fn abandoned_lock_after_panic_does_not_poison_the_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("jump.frecency");
+    let panic_path = path.clone();
+    let worker = std::thread::spawn(move || {
+        let _ = with_store_lock(&panic_path, LockKind::Exclusive, || -> io::Result<()> {
+            panic!("simulated writer panic while lock is held")
+        });
+    });
+    assert!(worker.join().is_err());
+
+    FrecencyStore::record_host(&path, Path::new("/recovered"), 2).unwrap();
+    assert_eq!(
+        FrecencyStore::load_host(&path).entries,
+        vec![entry("/recovered", 1.0, 2)]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_store_is_never_followed_or_replaced() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("human-history");
+    let link = dir.path().join("agent-history");
+    std::fs::write(&target, b"1.000000\t1\t/private/human\n").unwrap();
+    symlink(&target, &link).unwrap();
+
+    assert!(FrecencyStore::load_host(&link).entries.is_empty());
+    assert!(FrecencyStore::record_host(&link, Path::new("/agent"), 2).is_err());
+    assert_eq!(
+        std::fs::read(&target).unwrap(),
+        b"1.000000\t1\t/private/human\n"
+    );
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn store_and_lock_permissions_are_private() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("jump.frecency");
+    FrecencyStore::record_host(&path, Path::new("/private"), 1).unwrap();
+
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        std::fs::metadata(lock_path(&path))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
 }
 
 // --- end-to-end through the evaluator (cd records, j resolves) ----------
@@ -531,6 +615,60 @@ fn history_survives_across_sessions() {
 }
 
 #[test]
+fn isolated_stores_do_not_cross_observe_or_pollute() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let alpha_dir = root.join("alpha-private");
+    let beta_dir = root.join("beta-private");
+    std::fs::create_dir_all(&alpha_dir).unwrap();
+    std::fs::create_dir_all(&beta_dir).unwrap();
+    let alpha_store = root.join("alpha.frecency");
+    let beta_store = root.join("beta.frecency");
+
+    let mut alpha = evaluator_at(&root, &alpha_store, 500);
+    let mut beta = evaluator_at(&root, &beta_store, 500);
+    run(&mut alpha, "cd alpha-private");
+    run(&mut beta, "cd beta-private");
+
+    assert!(alpha.jump_resolve(Some("beta-private")).is_err());
+    assert!(beta.jump_resolve(Some("alpha-private")).is_err());
+    assert_eq!(
+        FrecencyStore::load_host(&alpha_store).entries,
+        vec![entry(alpha_dir.to_str().unwrap(), 1.0, 500)]
+    );
+    assert_eq!(
+        FrecencyStore::load_host(&beta_store).entries,
+        vec![entry(beta_dir.to_str().unwrap(), 1.0, 500)]
+    );
+}
+
+#[test]
+fn disabled_history_cannot_observe_or_update_an_existing_human_store() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let human_dir = root.join("human-secret-project");
+    let agent_dir = root.join("agent-work");
+    std::fs::create_dir_all(&human_dir).unwrap();
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    let store = root.join("human.frecency");
+    FrecencyStore::record_host(&store, &human_dir, 10).unwrap();
+
+    let mut restricted = evaluator_at(&root, &store, 20);
+    restricted.disable_jump_history();
+    assert!(restricted.jump_resolve(Some("human-secret")).is_err());
+    run(&mut restricted, "cd agent-work");
+
+    assert_eq!(
+        FrecencyStore::load_host(&store).entries,
+        vec![entry(human_dir.to_str().unwrap(), 1.0, 10)]
+    );
+    let child = restricted
+        .child_context()
+        .build(ChildKind::Spawn, CancelToken::new());
+    assert!(child.jump_resolve(Some("human-secret")).is_err());
+}
+
+#[test]
 fn corrupt_store_does_not_break_navigation() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
@@ -594,10 +732,6 @@ fn production_evaluator_has_only_explicit_ambient_filesystem_exceptions() {
         },
         ExpectedLine {
             file: "builtins/trash.rs",
-            text: "if metadata.is_dir() && !recursive {",
-        },
-        ExpectedLine {
-            file: "builtins/trash.rs",
             text: "is_dir: metadata.is_dir(),",
         },
         ExpectedLine {
@@ -632,20 +766,36 @@ fn production_evaluator_has_only_explicit_ambient_filesystem_exceptions() {
             file: "command/external.rs",
             text: "if !self.host.fs.metadata(&resolved).ok()?.is_file() {",
         },
+        ExpectedLine {
+            file: "frecency.rs",
+            text: "if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() } || metadata.nlink() != 1",
+        },
+        ExpectedLine {
+            file: "frecency.rs",
+            text: "|| !metadata.is_file()",
+        },
     ];
 
-    // The only ambient filesystem operations in evaluator production:
-    // three calls implement the explicitly host-owned frecency database,
-    // and one sets permissions on a TempDir the Rust-script runner itself
-    // just created. Language-selected paths may not join this inventory.
+    // The only ambient filesystem operations in evaluator production implement
+    // the explicitly host-owned, locked frecency database or set permissions
+    // on a TempDir the Rust-script runner itself created. Language-selected
+    // paths may not join this inventory.
     const AMBIENT_ALLOWLIST: &[ExpectedLine] = &[
         ExpectedLine {
             file: "frecency.rs",
-            text: "let Ok(reader) = StdFs.open_read(path) else {",
+            text: "use std::fs::{self, OpenOptions};",
         },
         ExpectedLine {
             file: "frecency.rs",
             text: "StdFs.create_dir_all(parent)?;",
+        },
+        ExpectedLine {
+            file: "frecency.rs",
+            text: "StdFs.create_dir_all(parent)?;",
+        },
+        ExpectedLine {
+            file: "frecency.rs",
+            text: "let metadata = match StdFs.symlink_metadata(path) {",
         },
         ExpectedLine {
             file: "frecency.rs",

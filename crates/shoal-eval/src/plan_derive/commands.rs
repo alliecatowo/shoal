@@ -19,23 +19,45 @@ impl Evaluator {
                 "planning function recursion exceeded 64",
             ));
         }
-        self.plan_redirects(call, out);
         if let Some(target) = aliases.get(&call.head) {
+            self.plan_command_inputs(call, functions, aliases, out, depth)?;
+            self.plan_redirects(call, out);
             return self.plan_call(target, functions, aliases, out, depth + 1);
         }
         if let Some(body) = functions.get(&call.head) {
+            self.plan_command_inputs(call, functions, aliases, out, depth)?;
+            self.plan_redirects(call, out);
             return self.plan_block(body, functions, aliases, out, depth + 1);
         }
 
         let resolution = self.resolve_command(call);
         match resolution.source {
             CommandSource::SessionCallable => {
+                self.plan_command_inputs(call, functions, aliases, out, depth)?;
+                self.plan_redirects(call, out);
                 push_effect(out, Effect::Opaque);
                 return Ok(());
             }
-            CommandSource::BoundValue => return Ok(()),
+            CommandSource::BoundValue => {
+                self.plan_redirects(call, out);
+                return Ok(());
+            }
             _ => {}
         }
+
+        // Runtime resolves builtin help before every effectful surface. Keep
+        // plans in lockstep: even a normally destructive builtin with extra
+        // operands, a redirect, or `&` has no effects when help was requested.
+        if matches!(
+            resolution.source,
+            CommandSource::StructuredBuiltin | CommandSource::SpecialBuiltin
+        ) && crate::command::call_requests_help(call)
+        {
+            return Ok(());
+        }
+
+        self.plan_command_inputs(call, functions, aliases, out, depth)?;
+        self.plan_redirects(call, out);
 
         if self.plan_intercepted_head(call, resolution.source, out) {
             return Ok(());
@@ -60,27 +82,7 @@ impl Evaluator {
             self.plan_special_builtin(&call.head, out);
             return Ok(());
         }
-        if resolution.source == CommandSource::Plugin {
-            let registry = self
-                .host
-                .wasm
-                .as_ref()
-                .expect("plugin resolution carries a registry");
-            let command = registry
-                .command(&call.head)
-                .expect("plugin resolution carries command metadata");
-            for effect in command.effects {
-                push_effect(out, effect.clone());
-            }
-            return Ok(());
-        }
-        if resolution.source == CommandSource::Adapter {
-            self.plan_adapter_call(call, out)?;
-        } else {
-            debug_assert_eq!(resolution.source, CommandSource::External);
-            self.plan_external_spawn(&call.head, out);
-        }
-        Ok(())
+        self.plan_extension_or_external(call, resolution.source, out)
     }
 
     /// Heads intercepted before ordinary builtin/adapter dispatch.
@@ -148,6 +150,33 @@ impl Evaluator {
         }
     }
 
+    fn plan_extension_or_external(
+        &mut self,
+        call: &CmdCall,
+        source: CommandSource,
+        out: &mut Vec<Effect>,
+    ) -> VResult<()> {
+        if source == CommandSource::Plugin {
+            let registry = self
+                .host
+                .wasm
+                .as_ref()
+                .expect("plugin resolution carries a registry");
+            let command = registry
+                .command(&call.head)
+                .expect("plugin resolution carries command metadata");
+            for effect in command.effects {
+                push_effect(out, effect.clone());
+            }
+        } else if source == CommandSource::Adapter {
+            self.plan_adapter_call(call, out)?;
+        } else {
+            debug_assert_eq!(source, CommandSource::External);
+            self.plan_external_spawn(&call.head, out);
+        }
+        Ok(())
+    }
+
     fn plan_adapter_call(&mut self, call: &CmdCall, out: &mut Vec<Effect>) -> VResult<()> {
         let adapter = self
             .host
@@ -189,11 +218,10 @@ impl Evaluator {
                         None => push_effect(out, Effect::Opaque),
                     }
                 }
-                RedirectKind::In => {
-                    if let Some(path) = self.cmd_arg_path_literal(&redirect.target) {
-                        push_effect(out, Effect::FsRead { paths: vec![path] });
-                    }
-                }
+                RedirectKind::In => match self.cmd_arg_path_literal(&redirect.target) {
+                    Some(path) => push_effect(out, Effect::FsRead { paths: vec![path] }),
+                    None => push_effect(out, Effect::Opaque),
+                },
             }
         }
     }
@@ -246,7 +274,7 @@ impl Evaluator {
                 push_effect(
                     out,
                     Effect::FsRead {
-                        paths: vec![self.plan_abs(&name)],
+                        paths: vec![self.resolved_abs_path(&name)],
                     },
                 );
                 push_effect(out, Effect::Opaque);

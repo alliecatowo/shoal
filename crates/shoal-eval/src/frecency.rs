@@ -57,7 +57,11 @@ use super::*;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::fs::{self, OpenOptions};
+use std::io;
 use std::io::Read as _;
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+use std::time::{Duration, Instant};
 
 /// Recency-bucket boundaries, in seconds.
 const HOUR: i64 = 3_600;
@@ -81,6 +85,10 @@ const MAX_TOTAL_PATH_BYTES: usize = 512 * 1024;
 
 /// Basename of the frecency store within the per-user state dir.
 const STORE_FILE: &str = "jump.frecency";
+
+/// Navigation is latency-sensitive and history is advisory. A stuck
+/// same-user process may delay an update briefly, but cannot hang `cd`.
+const LOCK_WAIT: Duration = Duration::from_millis(250);
 
 /// One visited directory: an accumulated visit `rank` and the `last_access`
 /// time (Unix seconds) used for recency weighting.
@@ -111,8 +119,11 @@ impl Entry {
 
 /// The in-memory directory-frecency table. Cheap to load/serialize; each `cd`
 /// loads it, [`add`](FrecencyStore::add)s the destination, and saves it back.
-/// Publications are atomic; simultaneous load-modify-save cycles are
-/// intentionally last-writer-wins because this is advisory navigation history.
+/// Publications are atomic. Successful navigation takes a bounded advisory
+/// file lock around reload, merge, and replacement, so cooperative concurrent
+/// sessions preserve one another's visits. Lock failure or prolonged
+/// contention degrades to a dropped advisory update rather than blocking
+/// navigation indefinitely.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct FrecencyStore {
     entries: Vec<Entry>,
@@ -319,39 +330,176 @@ impl FrecencyStore {
     /// invalid UTF-8) is treated as an empty store — never an error. Oversized
     /// files contribute only complete lines from their bounded prefix.
     pub(crate) fn load_host(path: &Path) -> Self {
-        let Ok(reader) = StdFs.open_read(path) else {
-            return Self::default();
+        with_store_lock(path, LockKind::Shared, || Self::load_host_unlocked(path))
+            .unwrap_or_default()
+    }
+
+    fn load_host_unlocked(path: &Path) -> io::Result<Self> {
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        let mut reader = match options.open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(error) => return Err(error),
         };
+        harden_private_regular_file(&reader)?;
         let mut bytes = Vec::with_capacity(8192);
         if reader
+            .by_ref()
             .take((MAX_STORE_FILE_BYTES + 1) as u64)
             .read_to_end(&mut bytes)
             .is_err()
         {
-            return Self::default();
+            return Ok(Self::default());
         }
         if bytes.len() > MAX_STORE_FILE_BYTES {
             bytes.truncate(MAX_STORE_FILE_BYTES);
             let Some(last_newline) = bytes.iter().rposition(|byte| *byte == b'\n') else {
-                return Self::default();
+                return Ok(Self::default());
             };
             bytes.truncate(last_newline + 1);
         }
-        std::str::from_utf8(&bytes).map_or_else(|_| Self::default(), Self::parse)
+        Ok(std::str::from_utf8(&bytes).map_or_else(|_| Self::default(), Self::parse))
     }
 
     /// Atomically persist the host-owned database (write to a temp file, then
     /// rename). Candidate directories never use this ambient service; they are
     /// always probed through the evaluator's inherited [`Fs`] below. Returns
     /// the I/O result; callers on the `cd` hot path swallow it (best-effort).
+    #[cfg(test)]
     pub(crate) fn save_host(&self, path: &Path) -> std::io::Result<()> {
+        with_store_lock(path, LockKind::Exclusive, || self.save_host_unlocked(path))
+    }
+
+    fn save_host_unlocked(&self, path: &Path) -> io::Result<()> {
         if let Some(parent) = path.parent() {
             StdFs.create_dir_all(parent)?;
         }
+        reject_symlink_or_unsafe_file(path)?;
         let output = self.serialize();
         debug_assert!(output.len() <= MAX_STORE_FILE_BYTES);
         StdFs.atomic_replace(path, output.as_bytes())
     }
+
+    /// Merge one successful visit while holding the store's exclusive lock.
+    /// Reloading inside the lock is what prevents concurrent evaluators from
+    /// publishing snapshots derived from stale history.
+    fn record_host(path: &Path, dir: &Path, now: i64) -> io::Result<()> {
+        with_store_lock(path, LockKind::Exclusive, || {
+            let mut store = Self::load_host_unlocked(path)?;
+            store.add(dir, now);
+            store.save_host_unlocked(path)
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum LockKind {
+    Shared,
+    Exclusive,
+}
+
+fn lock_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".lock");
+    PathBuf::from(name)
+}
+
+fn open_lock_file(path: &Path) -> io::Result<fs::File> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "jump store needs a parent directory",
+        )
+    })?;
+    StdFs.create_dir_all(parent)?;
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let file = options.open(lock_path(path))?;
+    harden_private_regular_file(&file)?;
+    Ok(file)
+}
+
+fn with_store_lock<T>(
+    path: &Path,
+    kind: LockKind,
+    operation: impl FnOnce() -> io::Result<T>,
+) -> io::Result<T> {
+    let file = open_lock_file(path)?;
+    let mut lock = fd_lock::RwLock::new(file);
+    let deadline = Instant::now() + LOCK_WAIT;
+    match kind {
+        LockKind::Shared => loop {
+            match lock.try_read() {
+                Ok(_guard) => return operation(),
+                Err(error)
+                    if error.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => return Err(error),
+            }
+        },
+        LockKind::Exclusive => loop {
+            match lock.try_write() {
+                Ok(_guard) => return operation(),
+                Err(error)
+                    if error.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => return Err(error),
+            }
+        },
+    }
+}
+
+fn harden_private_regular_file(file: &fs::File) -> io::Result<()> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() } || metadata.nlink() != 1
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "jump history is not a singly-linked regular file owned by this user",
+        ));
+    }
+    // Historical Shoal builds did not promise a mode. Repair an otherwise
+    // safe owned file before consuming potentially sensitive paths.
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    if file.metadata()?.mode() & 0o077 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "jump history permissions could not be restricted",
+        ));
+    }
+    Ok(())
+}
+
+fn reject_symlink_or_unsafe_file(path: &Path) -> io::Result<()> {
+    let metadata = match StdFs.symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.nlink() != 1
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "refusing unsafe jump history path",
+        ));
+    }
+    Ok(())
 }
 
 fn serialized_path_bytes(path: &Path) -> usize {
@@ -402,25 +550,29 @@ impl Evaluator {
     /// once so `cd` builds up jump history; `-c`/scripts/conformance leave it
     /// off and never write.
     pub fn open_default_jump_history(&mut self) {
-        self.exec.shell.jump_store = Some(crate::journal::default_state_dir().join(STORE_FILE));
+        self.set_jump_store(crate::journal::default_state_dir().join(STORE_FILE));
     }
 
     /// Point the frecency store at a specific file (hosts that manage their own
     /// state dir, and hermetic tests). Enables recording, like
     /// [`Evaluator::open_default_jump_history`].
     pub fn set_jump_store(&mut self, path: PathBuf) {
-        self.exec.shell.jump_store = Some(path);
+        self.exec.shell.jump_read_store = Some(path.clone());
+        self.exec.shell.jump_write_store = Some(path);
     }
 
-    /// The store file to *read* for a `j` query: the installed store when
-    /// recording is enabled, else the shared per-user default so a one-shot
-    /// `shoal -c 'j foo'` still resolves against real history.
-    fn jump_read_path(&self) -> PathBuf {
-        self.exec
-            .shell
-            .jump_store
-            .clone()
-            .unwrap_or_else(|| crate::journal::default_state_dir().join(STORE_FILE))
+    /// Disable both durable frecency observation and recording. Hosts use this
+    /// for tokenless/restricted sessions whose identity is not safe to persist.
+    pub fn disable_jump_history(&mut self) {
+        self.exec.shell.jump_read_store = None;
+        self.exec.shell.jump_write_store = None;
+    }
+
+    /// The host-selected store file to read for a `j` query. Fresh standalone
+    /// evaluators start with the per-user default; security-sensitive hosts
+    /// may replace it with a partition or explicitly disable it.
+    fn jump_read_path(&self) -> Option<PathBuf> {
+        self.exec.shell.jump_read_store.clone()
     }
 
     /// Record a successful `cd`/`j` into the frecency store (best-effort). A
@@ -428,13 +580,11 @@ impl Evaluator {
     /// it can never fail the navigation that triggered it. Uses the [`Clock`]
     /// port for "now" so tests can pin recency.
     pub(crate) fn record_cd(&mut self, dir: &Path) {
-        let Some(path) = self.exec.shell.jump_store.clone() else {
+        let Some(path) = self.exec.shell.jump_write_store.clone() else {
             return; // recording disabled (scripts / -c / conformance)
         };
         let now = self.host.clock.now_ns() / 1_000_000_000;
-        let mut store = FrecencyStore::load_host(&path);
-        store.add(dir, now);
-        let _ = store.save_host(&path);
+        let _ = FrecencyStore::record_host(&path, dir, now);
     }
 
     /// The `j`/`jump` builtin: resolve the best matching stored directory for an
@@ -501,7 +651,11 @@ impl Evaluator {
             }
         }
         let now = self.host.clock.now_ns() / 1_000_000_000;
-        let store = FrecencyStore::load_host(&self.jump_read_path());
+        let store = self
+            .jump_read_path()
+            .map_or_else(FrecencyStore::default, |path| {
+                FrecencyStore::load_host(&path)
+            });
         for e in store.ranked(query, now) {
             if self.host.fs.is_dir(&e.path) {
                 return Ok(e.path.clone());

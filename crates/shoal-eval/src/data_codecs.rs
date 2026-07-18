@@ -3,7 +3,7 @@
 use serde::Serialize;
 use shoal_value::{
     CallArgs, ErrorVal, OpaqueHandling, Record, RetainedLimits, VResult, Value, json_to_value,
-    retained_size, value_to_json,
+    preflight_json_numbers, retained_size, value_to_json,
 };
 use std::io::{self, Write};
 
@@ -93,6 +93,7 @@ fn parse_json_text(source: &str, what: &str) -> VResult<Value> {
     }
     let parsed: serde_json::Value = serde_json::from_str(source)
         .map_err(|error| ErrorVal::arg_error(format!("{what}: {error}")))?;
+    preflight_json_numbers(source, what)?;
     checked_json_to_value(&parsed, what)
 }
 
@@ -112,7 +113,10 @@ fn parse_toml(args: &CallArgs) -> VResult<Value> {
 
 fn checked_json_to_value(parsed: &serde_json::Value, what: &str) -> VResult<Value> {
     admit_json_tree(parsed, what)?;
-    let value = json_to_value(parsed);
+    let value = json_to_value(parsed).map_err(|mut error| {
+        error.msg = format!("{what}: {}", error.msg);
+        error
+    })?;
     admit_retained_value(&value, what, OpaqueHandling::Reject, false)?;
     Ok(value)
 }

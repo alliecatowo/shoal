@@ -24,7 +24,9 @@
 mod buffer;
 
 use crate::{Evaluator, WatchKind, WatchPoll, WatchSubscription};
-use shoal_value::{ErrorVal, Fs, Record, StreamGap, StreamGapReason, StreamVal, VResult, Value};
+use shoal_value::{
+    ErrorVal, Fs, FsFileSnapshot, Record, StreamGap, StreamGapReason, StreamVal, VResult, Value,
+};
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -39,6 +41,9 @@ use std::time::{Duration, Instant};
 /// that documented default here for both. `every` instead uses a 1-slot
 /// buffer (site/content/internals/streams-channels.md: ticks coalesce, memory O(1) always).
 const SOURCE_BUF: usize = 64;
+/// A live tail line has the same per-line wall as a lazy CAS line stream.
+/// Framing bytes are not included; admission happens before retaining bytes.
+const MAX_TAIL_LINE_BYTES: usize = 1024 * 1024;
 const PUMP_POLL: Duration = Duration::from_millis(25);
 const MAX_STREAM_PUMPS: usize = 64;
 static ACTIVE_STREAM_PUMPS: AtomicUsize = AtomicUsize::new(0);
@@ -401,6 +406,7 @@ fn tail_loop(
     } else {
         file.seek(SeekFrom::End(0)).unwrap_or(0)
     };
+    let mut snapshot: Option<FsFileSnapshot> = fs.file_snapshot(path).ok();
     // Lines dropped on a full consumer buffer, owed to the consumer as a
     // single `{dropped: n}` marker element once room appears (site/content/internals/streams-channels.md).
     let mut dropped: u64 = 0;
@@ -415,11 +421,18 @@ fn tail_loop(
             WatchPoll::Event(event)
                 if matches!(event.kind, WatchKind::Modified | WatchKind::Created) =>
             {
-                // Truncation/rotation: file shrank → restart from its new EOF.
-                if let Ok(meta) = fs.metadata(path)
-                    && meta.len() < pos
-                {
-                    pos = 0;
+                // Truncation or replacement: restart even when the replacement
+                // inode is longer than the old offset (size alone would skip
+                // its prefix).
+                if let Ok(current) = fs.file_snapshot(path) {
+                    if snapshot
+                        .as_ref()
+                        .is_some_and(|prior| !prior.same_file(&current))
+                        || current.len() < pos
+                    {
+                        pos = 0;
+                    }
+                    snapshot = Some(current);
                 }
                 if !read_new_lines(fs, path, &mut pos, tx, &mut dropped) {
                     break;
@@ -446,7 +459,10 @@ fn tail_loop(
 
 /// Read complete lines from `path` starting at `*pos`, advancing `*pos` to just
 /// past the last full line. A trailing partial line (no `\n`) is left unread.
-/// Returns `false` if the consumer has gone (send failed) so the caller stops.
+/// Each logical line is admitted incrementally against
+/// [`MAX_TAIL_LINE_BYTES`], so an unterminated hostile line cannot make the
+/// worker allocate in proportion to the file. An oversized line emits the
+/// stable `stream_line_limit` error and terminates this tail worker.
 fn read_new_lines(
     fs: &Arc<dyn Fs>,
     path: &Path,
@@ -462,29 +478,50 @@ fn read_new_lines(
         return true;
     }
     let mut reader = BufReader::new(file);
-    let mut buf = Vec::new();
+    let mut line = Vec::new();
     loop {
-        buf.clear();
-        let n = match reader.read_until(b'\n', &mut buf) {
-            Ok(n) => n,
-            Err(_) => return true,
-        };
-        if n == 0 {
+        line.clear();
+        let mut consumed = 0u64;
+        loop {
+            let available = match reader.fill_buf() {
+                Ok(available) => available,
+                Err(_) => return true,
+            };
+            if available.is_empty() {
+                // Partial trailing line: leave `pos` at the beginning so the
+                // next append retries it with its eventual delimiter.
+                return true;
+            }
+            let newline = available.iter().position(|byte| *byte == b'\n');
+            let content_len = newline.unwrap_or(available.len());
+            if line.len().saturating_add(content_len) > MAX_TAIL_LINE_BYTES {
+                let error = ErrorVal::new(
+                    "stream_line_limit",
+                    format!("tail line exceeds its {MAX_TAIL_LINE_BYTES}-byte limit"),
+                )
+                .with_hint("write line-framed records smaller than 1 MiB");
+                let _ = tx.send(Err(error));
+                return false;
+            }
+            line.extend_from_slice(&available[..content_len]);
+            let take = content_len + usize::from(newline.is_some());
+            reader.consume(take);
+            consumed = consumed.saturating_add(take as u64);
+            if newline.is_none() {
+                continue;
+            }
+
+            *pos = pos.saturating_add(consumed);
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            let value = String::from_utf8_lossy(&line).into_owned();
+            if !send_line_bounded(tx, dropped, value) {
+                return false;
+            }
             break;
-        }
-        if buf.last() != Some(&b'\n') {
-            // Partial trailing line — don't advance past it; wait for its newline.
-            break;
-        }
-        *pos += n as u64;
-        let line = String::from_utf8_lossy(&buf)
-            .trim_end_matches(['\n', '\r'])
-            .to_string();
-        if !send_line_bounded(tx, dropped, line) {
-            return false;
         }
     }
-    true
 }
 
 /// Send one tail line into the bounded consumer buffer (site/content/internals/streams-channels.md). A line that
@@ -579,7 +616,7 @@ fn coalesced_event(root: &Path, dropped: u64) -> Value {
 mod tests {
     use super::*;
     use crate::WatchPort;
-    use shoal_value::{CallCtx, Pull, Upstream};
+    use shoal_value::{CallCtx, Pull, StdFs, Upstream};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     struct CountingSource {
@@ -593,6 +630,26 @@ mod tests {
 
     struct DenyWatch {
         calls: AtomicUsize,
+    }
+
+    struct ReplaceOnceSubscription {
+        replacement: PathBuf,
+        target: PathBuf,
+        replaced: bool,
+    }
+
+    impl WatchSubscription for ReplaceOnceSubscription {
+        fn poll(&mut self, _timeout: Duration) -> WatchPoll {
+            if self.replaced {
+                return WatchPoll::Closed;
+            }
+            std::fs::rename(&self.replacement, &self.target).expect("rotate tail fixture");
+            self.replaced = true;
+            WatchPoll::Event(crate::WatchEvent {
+                kind: WatchKind::Modified,
+                paths: vec![self.target.clone()],
+            })
+        }
     }
 
     impl WatchPort for DenyWatch {
@@ -802,6 +859,74 @@ mod tests {
         let source = include_str!("streams.rs");
         assert!(!source.contains(&["notify::", "recommended_watcher"].concat()));
         assert!(!source.contains(&["watcher", ".watch("].concat()));
+    }
+
+    #[test]
+    fn tail_line_is_bounded_before_an_unterminated_file_can_be_retained() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hostile.log");
+        std::fs::write(&path, vec![b'x'; MAX_TAIL_LINE_BYTES + 1]).unwrap();
+        let fs: Arc<dyn Fs> = Arc::new(StdFs);
+        let (tx, rx) = sync_channel(1);
+        let mut pos = 0;
+        let mut dropped = 0;
+
+        assert!(!read_new_lines(&fs, &path, &mut pos, &tx, &mut dropped));
+        let error = rx.recv().unwrap().unwrap_err();
+        assert_eq!(error.code, "stream_line_limit");
+        assert_eq!(pos, 0, "an oversized partial line is never admitted");
+    }
+
+    #[test]
+    fn tail_accepts_the_exact_line_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("boundary.log");
+        let mut bytes = vec![b'x'; MAX_TAIL_LINE_BYTES];
+        bytes.push(b'\n');
+        std::fs::write(&path, bytes).unwrap();
+        let fs: Arc<dyn Fs> = Arc::new(StdFs);
+        let (tx, rx) = sync_channel(1);
+        let mut pos = 0;
+        let mut dropped = 0;
+
+        assert!(read_new_lines(&fs, &path, &mut pos, &tx, &mut dropped));
+        let Value::Str(line) = rx.recv().unwrap().unwrap() else {
+            panic!("expected exact-boundary line");
+        };
+        assert_eq!(line.len(), MAX_TAIL_LINE_BYTES);
+        assert_eq!(pos, (MAX_TAIL_LINE_BYTES + 1) as u64);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tail_restarts_when_a_longer_inode_replaces_the_open_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("app.log");
+        let replacement = dir.path().join("replacement.log");
+        std::fs::write(&target, b"old\n").unwrap();
+        std::fs::write(&replacement, b"new-prefix-is-longer\n").unwrap();
+        let subscription = Box::new(ReplaceOnceSubscription {
+            replacement,
+            target: target.clone(),
+            replaced: false,
+        });
+        let fs: Arc<dyn Fs> = Arc::new(StdFs);
+        let (tx, rx) = sync_channel(4);
+        let stop = AtomicBool::new(false);
+
+        tail_loop(&fs, subscription, &target, true, &tx, &stop);
+        drop(tx);
+        let lines = rx
+            .into_iter()
+            .map(|result| result.unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            lines,
+            vec![
+                Value::Str("old".into()),
+                Value::Str("new-prefix-is-longer".into())
+            ]
+        );
     }
 
     #[test]

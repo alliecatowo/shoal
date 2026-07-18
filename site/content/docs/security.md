@@ -110,6 +110,12 @@ It contains or anchors:
 
 Journal redaction keeps `secret` values out of the typed wire/journal value encoding, but the journal is still sensitive. Source text may reveal filenames, URLs, user-provided literals, and commands; external program output may contain secrets unrelated to Shoal's `secret` type.
 
+Filesystem undo is fail-closed, not a general snapshot facility. Prior bytes are captured through a
+bounded stable-read port (8 MiB plus one sentinel); a sparse, growing, replaced, or otherwise
+unstable source receives no restore inverse. The production Unix adapter validates the opened
+descriptor before/after reading and rechecks path identity. Custom adapters retain authority
+mediation but are responsible for closing any stronger stat/open race their backing store exposes.
+
 Use ordinary private-home permissions, encrypt backups where appropriate, and choose separate state directories when separating trust domains.
 
 ## Bearer tokens

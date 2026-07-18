@@ -41,6 +41,36 @@ src = 'json.parse("3.5")'
 value = "3.5"
 
 [[case]]
+name = "ns-json-parse-integer-above-float-exactness-remains-int"
+src = 'json.parse("9007199254740992")'
+value = "9007199254740992"
+
+[[case]]
+name = "ns-json-parse-max-signed-integer"
+src = 'json.parse("9223372036854775807")'
+value = "9223372036854775807"
+
+[[case]]
+name = "ns-json-parse-integer-above-signed-range-is-number-range"
+src = 'json.parse("9223372036854775808")'
+error = "number_range"
+
+[[case]]
+name = "ns-json-parse-u64-max-is-number-range"
+src = 'json.parse("18446744073709551615")'
+error = "number_range"
+
+[[case]]
+name = "ns-json-parse-below-signed-range-is-number-range"
+src = 'json.parse("-9223372036854775809")'
+error = "number_range"
+
+[[case]]
+name = "ns-json-parse-exponent-remains-float"
+src = 'json.parse("1e3") == 1000.0'
+value = "true"
+
+[[case]]
 name = "ns-json-parse-invalid-is-arg-error"
 # A raw (single-quoted) shoal string, not a double-quoted one: `{`/`}` inside
 # a `"…"` string would start interpolation and this text has no matching

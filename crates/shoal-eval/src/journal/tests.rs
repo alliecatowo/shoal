@@ -660,6 +660,42 @@ fn overwrite_larger_than_cap_records_no_reversible_inverse() {
 }
 
 #[test]
+fn sparse_prior_above_snapshot_wall_is_non_reversible_and_journal_recovers() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir
+        .path()
+        .canonicalize()
+        .unwrap_or_else(|_| dir.path().to_path_buf());
+    let target = root.join("sparse.bin");
+    let file = std::fs::File::create(&target).unwrap();
+    file.set_len((MAX_JOURNAL_UNDO_SNAPSHOT_BYTES + 1) as u64)
+        .unwrap();
+    let mut ev = journaled(&root);
+
+    run_journaled(&mut ev, r#"save("sparse.bin", "replacement")"#).unwrap();
+    assert_eq!(std::fs::read(&target).unwrap(), b"replacement");
+    let rows = ev
+        .session
+        .journal
+        .as_ref()
+        .unwrap()
+        .query(&JournalQuery::default())
+        .unwrap();
+    assert!(
+        ev.session
+            .journal
+            .as_ref()
+            .unwrap()
+            .undos_for(rows[0].id)
+            .unwrap()
+            .is_empty(),
+        "an oversized sparse prior must never receive a truncated inverse"
+    );
+
+    run_journaled(&mut ev, "echo recovered").expect("journal remains usable after refusal");
+}
+
+#[test]
 fn cp_overwrite_records_restore_bytes() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("src"), b"newbytes").unwrap();

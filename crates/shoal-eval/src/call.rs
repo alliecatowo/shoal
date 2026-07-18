@@ -271,6 +271,9 @@ impl Evaluator {
     }
 
     pub(crate) fn call_constructor(&self, name: &str, args: &CallArgs) -> VResult<Option<Value>> {
+        let Some(constructor) = crate::constructors::Constructor::named(name) else {
+            return Ok(None);
+        };
         let one = || {
             if !args.named.is_empty() || args.pos.len() != 1 {
                 Err(ErrorVal::new(
@@ -281,8 +284,8 @@ impl Evaluator {
                 Ok(&args.pos[0])
             }
         };
-        match name {
-            "path" => match one()? {
+        match constructor {
+            crate::constructors::Constructor::Path => match one()? {
                 Value::Str(s) => Ok(Some(Value::Path(PathBuf::from(s)))),
                 Value::Path(p) => Ok(Some(Value::Path(p.clone()))),
                 v => Err(ErrorVal::new(
@@ -290,7 +293,7 @@ impl Evaluator {
                     format!("path expects str, found {}", v.type_name()),
                 )),
             },
-            "glob" => match args.pos.as_slice() {
+            crate::constructors::Constructor::Glob => match args.pos.as_slice() {
                 [Value::Str(pattern)]
                     if args
                         .named
@@ -316,7 +319,7 @@ impl Evaluator {
                     "glob expects one pattern and optional hidden/follow arguments",
                 )),
             },
-            "regex" => match one()? {
+            crate::constructors::Constructor::Regex => match one()? {
                 Value::Str(src) => Ok(Some(Value::Regex(Arc::new(
                     shoal_value::RegexVal::compile(src)?,
                 )))),
@@ -329,14 +332,14 @@ impl Evaluator {
             // yield a lazy `stream<T>` (channels via `.events()`); `channel(name)`
             // itself yields a handle whose `.emit/.events/.latest/.take` the
             // evaluator intercepts.
-            "channel" => match one()? {
+            crate::constructors::Constructor::Channel => match one()? {
                 Value::Str(name) => Ok(Some(crate::channels::channel_handle(name)?)),
                 v => Err(ErrorVal::type_error(format!(
                     "channel expects a str name, found {}",
                     v.type_name()
                 ))),
             },
-            "every" => match one()? {
+            crate::constructors::Constructor::Every => match one()? {
                 Value::Duration(ns) if *ns >= 0 => Ok(Some(
                     self.source_every(std::time::Duration::from_nanos(*ns as u64))?,
                 )),
@@ -345,7 +348,7 @@ impl Evaluator {
                     v.type_name()
                 ))),
             },
-            "watch" => {
+            crate::constructors::Constructor::Watch => {
                 if args.pos.len() != 1 {
                     return Err(ErrorVal::arg_error("watch expects one path or glob"));
                 }
@@ -355,7 +358,7 @@ impl Evaluator {
                     .unwrap_or(true);
                 Ok(Some(self.source_watch(&args.pos[0], recursive)?))
             }
-            "tail" => {
+            crate::constructors::Constructor::Tail => {
                 if args.pos.len() != 1 {
                     return Err(ErrorVal::arg_error("tail expects one file path"));
                 }
@@ -365,7 +368,6 @@ impl Evaluator {
                     .unwrap_or(false);
                 Ok(Some(self.source_tail(&args.pos[0], from_start)?))
             }
-            _ => Ok(None),
         }
     }
 

@@ -465,6 +465,11 @@ pub(crate) mod test_support {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(self.data.clone())
         }
+
+        fn open(&self) -> std::io::Result<Box<dyn std::io::Read + Send>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(std::io::Cursor::new(self.data.clone())))
+        }
     }
 
     /// Build a `CasBytesVal` with `preview` resident and `full` as the

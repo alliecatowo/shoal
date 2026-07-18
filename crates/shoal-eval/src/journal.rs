@@ -659,22 +659,24 @@ impl Evaluator {
     /// referenced (safe from GC).
     ///
     /// Returns `None` when the snapshot could not be recorded *faithfully*: the
-    /// evaluator refuses files above its own bounded-read ceiling, and a file
-    /// above the journal's configured `output_hard_cap` is reported as
-    /// truncated. Keying a replayable `RestoreBytes` inverse on either would
-    /// let `undo` silently overwrite the user's file with partial content.
-    /// Refusing leaves the operation honestly non-reversible.
+    /// evaluator reads through the filesystem port with a `MAX + 1` sentinel
+    /// and refuses a sparse, growing, replaced, or otherwise unstable source.
+    /// A file above the journal's configured `output_hard_cap` is also reported
+    /// as truncated. Keying a replayable `RestoreBytes` inverse on any of those
+    /// would let `undo` silently overwrite the user's file with partial or
+    /// stale content. Refusing leaves the operation honestly non-reversible.
     fn snapshot_prior(&mut self, entry: i64, path: &Path) -> Option<String> {
-        match self.host.fs.metadata(path) {
-            Ok(metadata) if metadata.len() > MAX_JOURNAL_UNDO_SNAPSHOT_BYTES as u64 => return None,
-            Ok(_) => {}
-            Err(error) => {
-                self.note_journal_failure("undo snapshot metadata", error);
-                return None;
-            }
-        }
-        let bytes = match self.host.fs.read(path) {
+        let bytes = match self
+            .host
+            .fs
+            .read_bounded_stable(path, MAX_JOURNAL_UNDO_SNAPSHOT_BYTES)
+        {
             Ok(bytes) => bytes,
+            // Limit/change refusal is an honest "not reversible" result, like
+            // the prior metadata-size preflight. It must not poison the
+            // journal or turn the subsequent successful mutation into an
+            // indeterminate persistence failure.
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => return None,
             Err(error) => {
                 self.note_journal_failure("undo snapshot read", error);
                 return None;

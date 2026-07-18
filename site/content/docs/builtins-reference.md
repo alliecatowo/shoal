@@ -35,6 +35,11 @@ pwd                              # direct path value
 
 Use `^name` to bypass a non-callable value shadow and an adapter. It does **not** bypass a function, alias, other callable binding, or any builtin head; those resolve before the forced flag is consulted. To invoke an external executable that shares a builtin/callable name, use dynamic `run("name", ...)`.
 
+Every canonical head supports `-h` and `--help`. Help includes usage, typed arguments, options,
+subcommands where applicable, result behavior, errors, and examples. It is dispatched only after
+callable-shadow resolution and before expansion or effects, so `rm --help FILE`, `reef --help`, and
+`ls --help > output &` only render help. Use `--` to treat a later `--help` spelling as an operand.
+
 ## Complete inventory
 
 | Head | Signature summary | Primary result |
@@ -277,12 +282,19 @@ rm --permanent --recursive build
 Safety behavior:
 
 - no paths—including an empty glob—raises `no_matches`;
+- duplicate, relative, and intermediate-symlink aliases (plus hard-link aliases on Unix) raise
+  `rm_path_duplicate` before any trash directory or deletion is created;
+- a directory together with any descendant raises `rm_path_overlap` in either argument order;
 - permanent directory removal requires a recursive flag;
 - non-permanent directory removal is implemented as a rename and does not require recursion;
 - journaled trash moves can be undone while the trash target is intact;
 - trash storage is temporary, not a desktop trash protocol and not durable archival storage.
 
 `--permanent` bypasses the trash and is normally irreversible.
+Identity uses the injected filesystem port's canonicalization. The final component of a symbolic
+link is deliberately not followed because `rm link` removes the link, while symbolic-link aliases
+in parent components are resolved. These checks eliminate deterministic input overlap; they do not
+eliminate a hostile filesystem race between preflight and rename/removal.
 
 ### `ln`
 
@@ -780,7 +792,8 @@ The current builtin parsers are intentionally small, and several do not yet enfo
 - `cd`, `source`, `exit`, `quit`, `apply`, and `explain` primarily consume the first value;
 - `head` ignores values after its count;
 - `journal` accepts only literal `--name=value`/recognized long-flag value shapes;
-- builtins do not provide per-head `--help` output.
+- runtime arity checks and completion are not yet fully generated from the canonical signature
+  schema, so the remaining permissive cases above can still drift from displayed help.
 
 Treat these as current gaps, not extension points. Write the documented signature so stricter validation will not break your scripts.
 

@@ -817,6 +817,30 @@ fn wire_publish_reports_language_mirror_degradation_without_duplicate_retry_sign
 }
 
 #[test]
+fn wire_publish_preserves_large_unsigned_json_without_lossy_language_mirror() {
+    let kernel = Kernel::new();
+    let mut attached = attachment(&kernel, "language-mirror-number-range");
+    let payload = Json::Number(serde_json::Number::from(u64::MAX));
+
+    let published = kernel
+        .handle_events_publish(
+            json!({"channel":"user.large-id","payload":payload}),
+            &mut attached,
+        )
+        .expect("the authoritative JSON wire event remains valid");
+    assert_eq!(published["language_mirror"]["ok"], false);
+    assert_eq!(
+        published["language_mirror"]["error"]["code"],
+        "number_range"
+    );
+
+    let read = kernel
+        .handle_events_read(json!({"channel":"user.large-id"}), &mut attached)
+        .unwrap();
+    assert_eq!(read["events"][0]["payload"], payload);
+}
+
+#[test]
 fn user_channel_identity_churn_is_bounded_per_exact_owner() {
     let bus = EventBus::default();
     let alpha = owner("channel-churn-alpha");

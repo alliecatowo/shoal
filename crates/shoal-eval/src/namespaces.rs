@@ -194,26 +194,51 @@ impl Evaluator {
                 args.pos.get(idx)
             })
             .cloned();
-        let body_bytes = if has_body {
-            match args.pos.get(1) {
-                Some(v) => shoal_value::feed_bytes(v)
-                    .map_err(|e| ErrorVal::arg_error(format!("http.{method} body: {e}")))?,
-                None => Vec::new(),
-            }
+        let body_what = format!("http.{method} body");
+        let mut body_input = if has_body {
+            let value = args
+                .pos
+                .get(1)
+                .cloned()
+                .unwrap_or(Value::Str(String::new()));
+            let body = crate::finite_io::FiniteBody::from_value(value, &body_what).map_err(
+                |mut error| {
+                    error.msg = format!("{body_what}: {}", error.msg);
+                    error
+                },
+            )?;
+            Some(body.into_http_input(&body_what)?)
         } else {
-            Vec::new()
+            None
         };
 
         let agent = http_agent();
 
-        let mut resp = match method {
+        let response = match method {
             "get" => with_headers(agent.get(&url), &headers_rec).call(),
             "delete" => with_headers(agent.delete(&url), &headers_rec).call(),
-            "post" => with_headers(agent.post(&url), &headers_rec).send(&body_bytes[..]),
-            "put" => with_headers(agent.put(&url), &headers_rec).send(&body_bytes[..]),
+            "post" => send_http_body(
+                with_headers(agent.post(&url), &headers_rec),
+                body_input.as_mut().expect("POST request body was prepared"),
+            ),
+            "put" => send_http_body(
+                with_headers(agent.put(&url), &headers_rec),
+                body_input.as_mut().expect("PUT request body was prepared"),
+            ),
             _ => unreachable!(),
-        }
-        .map_err(|e| ErrorVal::new("net_error", format!("http.{method}: {e}")))?;
+        };
+        let mut resp = match response {
+            Ok(response) => response,
+            Err(_) if body_input.as_ref().is_some_and(|body| body.exceeded()) => {
+                return Err(crate::finite_io::http_body_limit(&body_what));
+            }
+            Err(error) => {
+                return Err(ErrorVal::new(
+                    "net_error",
+                    format!("http.{method}: {error}"),
+                ));
+            }
+        };
 
         let status = resp.status().as_u16() as i64;
         let ok = (200..300).contains(&status);
@@ -311,6 +336,19 @@ fn with_headers<T>(
         }
     }
     b
+}
+
+fn send_http_body(
+    request: ureq::RequestBuilder<ureq::typestate::WithBody>,
+    body: &mut crate::finite_io::HttpInput,
+) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+    match body {
+        crate::finite_io::HttpInput::Owned(bytes) => request.send(bytes.as_slice()),
+        crate::finite_io::HttpInput::Shared(bytes) => request.send(bytes.as_slice()),
+        crate::finite_io::HttpInput::Reader(reader) => {
+            request.send(ureq::SendBody::from_reader(reader))
+        }
+    }
 }
 
 fn os_hostname() -> String {
@@ -432,5 +470,162 @@ mod os_boundary_tests {
         for thread in threads {
             assert!(thread.join().unwrap().iter().all(|name| name == &expected));
         }
+    }
+}
+
+#[cfg(test)]
+mod http_body_tests {
+    use super::*;
+    use shoal_value::{BytesLoad, CasBytesVal};
+    use std::io::{Read as _, Write as _};
+    use std::sync::Arc;
+
+    struct MustNotOpen;
+
+    impl BytesLoad for MustNotOpen {
+        fn load(&self) -> std::io::Result<Vec<u8>> {
+            panic!("oversized HTTP body must not load its CAS blob")
+        }
+
+        fn open(&self) -> std::io::Result<Box<dyn std::io::Read + Send>> {
+            panic!("oversized HTTP body must not open its CAS blob")
+        }
+    }
+
+    struct StreamingLoader(Vec<u8>);
+
+    impl BytesLoad for StreamingLoader {
+        fn load(&self) -> std::io::Result<Vec<u8>> {
+            panic!("HTTP CAS transport must use open(), not load()")
+        }
+
+        fn open(&self) -> std::io::Result<Box<dyn std::io::Read + Send>> {
+            Ok(Box::new(std::io::Cursor::new(self.0.clone())))
+        }
+    }
+
+    #[test]
+    fn oversized_cas_request_is_denied_before_socket_connection() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = Value::CasBytes(Arc::new(CasBytesVal {
+            hash: "b".repeat(64),
+            len: crate::finite_io::FINITE_BODY_MAX_BYTES as u64 + 1,
+            preview: Arc::new(Vec::new()),
+            truncated: false,
+            loader: Arc::new(MustNotOpen),
+        }));
+        let mut evaluator = Evaluator::new(std::env::current_dir().unwrap());
+        let error = evaluator
+            .http_ns(
+                "post",
+                CallArgs {
+                    pos: vec![Value::Str(format!("http://{address}/")), body],
+                    named: Vec::new(),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "http_body_limit");
+        assert!(matches!(
+            listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+    }
+
+    #[test]
+    fn small_resident_http_body_roundtrips_with_content_length() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !request.windows(b"hello".len()).any(|part| part == b"hello") {
+                let count = socket.read(&mut chunk).unwrap();
+                assert!(count > 0, "request ended before its body arrived");
+                request.extend_from_slice(&chunk[..count]);
+            }
+            let request_text = String::from_utf8_lossy(&request).to_ascii_lowercase();
+            assert!(
+                request_text.contains("content-length: 5"),
+                "resident bodies keep the sized transport path: {request_text}"
+            );
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+        });
+
+        let mut evaluator = Evaluator::new(std::env::current_dir().unwrap());
+        let response = evaluator
+            .http_ns(
+                "post",
+                CallArgs {
+                    pos: vec![
+                        Value::Str(format!("http://{address}/")),
+                        Value::Str("hello".into()),
+                    ],
+                    named: Vec::new(),
+                },
+            )
+            .unwrap();
+        server.join().unwrap();
+        let Value::Record(response) = response else {
+            panic!("HTTP response must be a record")
+        };
+        assert_eq!(response.get("status"), Some(&Value::Int(200)));
+        assert_eq!(response.get("body"), Some(&Value::Str("ok".into())));
+    }
+
+    #[test]
+    fn small_cas_http_body_uses_incremental_chunked_transport() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !request
+                .windows(b"cas-body".len())
+                .any(|part| part == b"cas-body")
+            {
+                let count = socket.read(&mut chunk).unwrap();
+                assert!(count > 0, "request ended before its CAS body arrived");
+                request.extend_from_slice(&chunk[..count]);
+            }
+            let request_text = String::from_utf8_lossy(&request).to_ascii_lowercase();
+            assert!(request_text.contains("transfer-encoding: chunked"));
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+        });
+        let body = Value::CasBytes(Arc::new(CasBytesVal {
+            hash: "c".repeat(64),
+            len: 8,
+            preview: Arc::new(b"cas".to_vec()),
+            truncated: false,
+            loader: Arc::new(StreamingLoader(b"cas-body".to_vec())),
+        }));
+        let mut evaluator = Evaluator::new(std::env::current_dir().unwrap());
+        let response = evaluator
+            .http_ns(
+                "post",
+                CallArgs {
+                    pos: vec![Value::Str(format!("http://{address}/")), body],
+                    named: Vec::new(),
+                },
+            )
+            .unwrap();
+        server.join().unwrap();
+        let Value::Record(response) = response else {
+            panic!("HTTP response must be a record")
+        };
+        assert_eq!(response.get("status"), Some(&Value::Int(200)));
     }
 }

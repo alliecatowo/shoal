@@ -26,6 +26,16 @@ struct RemovalPlan {
     adjacent_root: Option<PathBuf>,
 }
 
+struct RemovalCandidate {
+    path: PathBuf,
+    resolved_entry: PathBuf,
+    is_dir: bool,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
 pub(super) fn remove(
     fs: &dyn Fs,
     cwd: &Path,
@@ -157,19 +167,43 @@ fn preflight(
     primary_session: Option<&Path>,
     budget: &mut OutputBudget,
 ) -> VResult<Vec<RemovalPlan>> {
-    let mut plans = Vec::with_capacity(paths.len());
-    for (index, path) in paths.into_iter().enumerate() {
+    let mut candidates = Vec::with_capacity(paths.len());
+    for path in paths {
         let metadata = fs
             .symlink_metadata(&path)
             .map_err(|error| ioerr("remove", &path, error))?;
-        if metadata.is_dir() && !recursive {
-            return Err(ErrorVal::arg_error("rm: directory requires --recursive"));
+        let resolved_entry = resolve_removal_entry(fs, &path, &metadata)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            candidates.push(RemovalCandidate {
+                path,
+                resolved_entry,
+                is_dir: metadata.is_dir(),
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            });
         }
+        #[cfg(not(unix))]
+        candidates.push(RemovalCandidate {
+            path,
+            resolved_entry,
+            is_dir: metadata.is_dir(),
+        });
+    }
+    validate_removal_set(&candidates)?;
+    if !recursive && candidates.iter().any(|candidate| candidate.is_dir) {
+        return Err(ErrorVal::arg_error("rm: directory requires --recursive"));
+    }
+
+    let mut plans = Vec::with_capacity(candidates.len());
+    for (index, candidate) in candidates.into_iter().enumerate() {
+        let path = candidate.path;
         if permanent {
             budget.admit_value(&Value::Path(path.clone()))?;
             plans.push(RemovalPlan {
                 path,
-                is_dir: metadata.is_dir(),
+                is_dir: candidate.is_dir,
                 entry_name: None,
                 primary_target: None,
                 adjacent_root: None,
@@ -219,13 +253,105 @@ fn preflight(
         budget.admit_value(&Value::Record(report))?;
         plans.push(RemovalPlan {
             path,
-            is_dir: metadata.is_dir(),
+            is_dir: candidate.is_dir,
             entry_name: Some(entry_name),
             primary_target,
             adjacent_root: Some(adjacent_root),
         });
     }
     Ok(plans)
+}
+
+fn resolve_removal_entry(
+    fs: &dyn Fs,
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> VResult<PathBuf> {
+    // `rm link` removes the link directory entry, not its referent. Resolve
+    // only its parent in that case. For every other entry, full
+    // canonicalization collapses `.`, `..`, and intermediate symlink aliases.
+    let resolved = if metadata.file_type().is_symlink() {
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let parent = fs.canonicalize(parent).map_err(|error| {
+            removal_identity_error(path, format!("cannot resolve parent: {error}"))
+        })?;
+        let name = path.file_name().ok_or_else(|| {
+            removal_identity_error(path, "symbolic-link path has no final component")
+        })?;
+        parent.join(name)
+    } else {
+        fs.canonicalize(path)
+            .map_err(|error| removal_identity_error(path, error.to_string()))?
+    };
+    Ok(resolved)
+}
+
+fn validate_removal_set(candidates: &[RemovalCandidate]) -> VResult<()> {
+    let mut by_path = HashMap::<&Path, &RemovalCandidate>::new();
+    #[cfg(unix)]
+    let mut by_inode = HashMap::<(u64, u64), &RemovalCandidate>::new();
+
+    for candidate in candidates {
+        if let Some(first) = by_path.insert(&candidate.resolved_entry, candidate) {
+            return Err(duplicate_removal_error(first, candidate));
+        }
+        #[cfg(unix)]
+        if let Some(first) = by_inode.insert((candidate.device, candidate.inode), candidate) {
+            return Err(duplicate_removal_error(first, candidate));
+        }
+    }
+
+    // Walk each canonical entry's ancestors through the hash map. This is
+    // bounded by aggregate path depth instead of comparing every pair.
+    for candidate in candidates {
+        let mut ancestor = candidate.resolved_entry.parent();
+        while let Some(path) = ancestor {
+            if let Some(parent) = by_path.get(path)
+                && parent.is_dir
+            {
+                return Err(ErrorVal::new(
+                    "rm_path_overlap",
+                    format!(
+                        "rm refuses overlapping inputs {} and {}: one contains the other",
+                        parent.path.display(),
+                        candidate.path.display()
+                    ),
+                )
+                .with_hint(
+                    "remove only the containing directory, or issue separate commands after inspecting each result",
+                ));
+            }
+            ancestor = path.parent();
+        }
+    }
+    Ok(())
+}
+
+fn duplicate_removal_error(first: &RemovalCandidate, duplicate: &RemovalCandidate) -> ErrorVal {
+    ErrorVal::new(
+        "rm_path_duplicate",
+        format!(
+            "rm refuses duplicate or aliased inputs {} and {}",
+            first.path.display(),
+            duplicate.path.display()
+        ),
+    )
+    .with_hint(
+        "pass each filesystem entry once; aliases and hard links are not deduplicated silently",
+    )
+}
+
+fn removal_identity_error(path: &Path, detail: impl std::fmt::Display) -> ErrorVal {
+    ErrorVal::new(
+        "rm_path_identity",
+        format!(
+            "rm cannot establish a stable identity for {}: {detail}",
+            path.display()
+        ),
+    )
+    .with_hint(
+        "use an existing path whose parent can be canonicalized by the active filesystem adapter",
+    )
 }
 
 pub(super) fn move_to_trash(
@@ -502,6 +628,146 @@ mod tests {
         assert_eq!(error.code, "builtin_output_limit");
         assert_eq!(std::fs::read(first).unwrap(), b"first");
         assert_eq!(std::fs::read(second).unwrap(), b"second");
+    }
+
+    #[test]
+    fn duplicate_and_relative_aliases_are_typed_preflight_errors() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("file");
+        let relative_alias = root.path().join(".").join("file");
+        std::fs::write(&file, b"keep").unwrap();
+
+        let error = remove(
+            &StdFs,
+            root.path(),
+            vec![Value::Path(file.clone()), Value::Path(relative_alias)],
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "rm_path_duplicate");
+        assert!(error.hint.is_some());
+        assert_eq!(std::fs::read(&file).unwrap(), b"keep");
+        assert!(!root.path().join(adjacent_trash_name()).exists());
+    }
+
+    #[test]
+    fn identical_permanent_inputs_are_refused_before_deletion() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("file");
+        std::fs::write(&file, b"keep").unwrap();
+
+        let error = remove(
+            &StdFs,
+            root.path(),
+            vec![Value::Path(file.clone()), Value::Path(file.clone())],
+            true,
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "rm_path_duplicate");
+        assert_eq!(std::fs::read(file).unwrap(), b"keep");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_link_aliases_are_not_silently_deduplicated() {
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        std::fs::write(&first, b"keep").unwrap();
+        std::fs::hard_link(&first, &second).unwrap();
+
+        let error = remove(
+            &StdFs,
+            root.path(),
+            vec![Value::Path(first.clone()), Value::Path(second.clone())],
+            true,
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "rm_path_duplicate");
+        assert_eq!(std::fs::read(first).unwrap(), b"keep");
+        assert_eq!(std::fs::read(second).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn directory_and_child_overlap_is_refused_in_both_orders_without_trash() {
+        for child_first in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let directory = root.path().join("directory");
+            let child = directory.join("child");
+            std::fs::create_dir(&directory).unwrap();
+            std::fs::write(&child, b"keep").unwrap();
+            let args = if child_first {
+                vec![Value::Path(child.clone()), Value::Path(directory.clone())]
+            } else {
+                vec![Value::Path(directory.clone()), Value::Path(child.clone())]
+            };
+
+            let error = remove(&StdFs, root.path(), args, false, true).unwrap_err();
+            assert_eq!(error.code, "rm_path_overlap");
+            assert!(error.hint.is_some());
+            assert_eq!(std::fs::read(&child).unwrap(), b"keep");
+            assert!(directory.exists());
+            assert!(!root.path().join(adjacent_trash_name()).exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn intermediate_symlink_aliases_are_duplicate_removal_entries() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real");
+        let alias = root.path().join("alias");
+        let file = real.join("file");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(&file, b"keep").unwrap();
+        symlink(&real, &alias).unwrap();
+
+        let error = remove(
+            &StdFs,
+            root.path(),
+            vec![Value::Path(file.clone()), Value::Path(alias.join("file"))],
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "rm_path_duplicate");
+        assert_eq!(std::fs::read(file).unwrap(), b"keep");
+        assert!(
+            std::fs::symlink_metadata(alias)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(!real.join(adjacent_trash_name()).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_symlink_and_referent_are_distinct_removal_entries() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        let link = root.path().join("link");
+        std::fs::write(&target, b"remove both").unwrap();
+        symlink(&target, &link).unwrap();
+
+        let result = remove(
+            &StdFs,
+            root.path(),
+            vec![Value::Path(link.clone()), Value::Path(target.clone())],
+            true,
+            false,
+        )
+        .unwrap();
+        assert!(matches!(result, Value::List(paths) if paths.len() == 2));
+        assert!(std::fs::symlink_metadata(link).is_err());
+        assert!(!target.exists());
     }
 
     #[test]

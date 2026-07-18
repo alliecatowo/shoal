@@ -103,7 +103,10 @@ impl ChildContext {
         // in_fn_body:      per-evaluator session state; a child gets its own.
         // oldpwd / dir_stack: inherited snapshots, because they are part of the
         //                  caller's dynamic directory context.
-        // jump_store:      None — a child never writes interactive cd frecency.
+        // jump_write_store: None — a child never writes interactive cd
+        //                  frecency. It inherits the parent's read store (or
+        //                  explicit lack of one), so an isolated agent cannot
+        //                  regain shared human history through a child route.
         // echo_mode:       inherited as part of SessionCtx; a Quiet parent
         //                  cannot accidentally create a noisy child.
         child

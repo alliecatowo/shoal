@@ -217,12 +217,16 @@ fn planner_responsibilities_stay_bounded() {
     let commands = include_str!("commands.rs");
     let attribution = include_str!("attribution.rs");
     let statements = include_str!("statements.rs");
+    let inputs = include_str!("inputs.rs");
+    let value_effects = include_str!("value_effects.rs");
 
     for (name, source, ceiling) in [
         ("plan_derive.rs production", production, 320),
         ("commands.rs", commands, 350),
         ("attribution.rs", attribution, 140),
         ("statements.rs", statements, 100),
+        ("inputs.rs", inputs, 100),
+        ("value_effects.rs", value_effects, 140),
     ] {
         let lines = source.lines().count();
         assert!(
@@ -770,4 +774,275 @@ fn original_audit_probes_have_meaningful_effects() {
     // The original function-form save probe also stays pinned: the runtime
     // signature is save(path, value), so the first argument is the target.
     assert!(has_write("save(\"p\", \"x\")", "p"), "save builtin");
+}
+
+fn parsed_expr(source: &str) -> Expr {
+    let program = shoal_syntax::parse(source).unwrap();
+    let [Stmt::Expr { expr, .. }] = program.stmts.as_slice() else {
+        panic!("expected one expression in `{source}`")
+    };
+    expr.clone()
+}
+
+fn command_expr(call: CmdCall) -> Program {
+    Program {
+        stmts: vec![Stmt::Expr {
+            span: call.span,
+            expr: Expr::Cmd {
+                span: call.span,
+                call: Box::new(call),
+            },
+        }],
+    }
+}
+
+fn expression_arg(source: &str) -> CmdArg {
+    CmdArg::Expr {
+        expr: parsed_expr(source),
+        span: Span::default(),
+    }
+}
+
+#[test]
+fn command_inputs_are_recursively_planned_before_external_or_plugin_dispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let span = Span::default();
+    let call = CmdCall {
+        head: "audit-external".into(),
+        forced: false,
+        args: vec![
+            expression_arg(r#"http.get("https://input.example:8443/x")"#),
+            CmdArg::FlagLong {
+                name: "token".into(),
+                value: Some(Box::new(expression_arg(r#"secret.get("ARG_TOKEN")"#))),
+                span,
+            },
+            expression_arg(r#"path("nested.txt").read()"#),
+            expression_arg(r#""response={http.get("https://interp.example/x")}""#),
+            expression_arg(r#"() => secret.get("CLOSURE_TOKEN")"#),
+            expression_arg("dynamic_path.lines()"),
+        ],
+        redirects: vec![],
+        env_prefix: vec![EnvPrefix {
+            name: "AUTH".into(),
+            value: expression_arg(r#"secret.get("ENV_TOKEN")"#),
+            span,
+        }],
+        background: false,
+        trailing: None,
+        span,
+    };
+    let mut evaluator = Evaluator::new(dir.path().into());
+    let effects = evaluator.plan_program(&command_expr(call)).unwrap().effects;
+
+    for expected in [
+        Effect::NetConnect {
+            host: "input.example".into(),
+            port: 8443,
+        },
+        Effect::SecretUse {
+            names: vec!["ARG_TOKEN".into()],
+        },
+        Effect::SecretUse {
+            names: vec!["ENV_TOKEN".into()],
+        },
+        Effect::FsRead {
+            paths: vec![dir.path().join("nested.txt")],
+        },
+        Effect::NetConnect {
+            host: "interp.example".into(),
+            port: 443,
+        },
+        Effect::SecretUse {
+            names: vec!["CLOSURE_TOKEN".into()],
+        },
+    ] {
+        assert!(
+            effects.contains(&expected),
+            "missing {expected:?}: {effects:?}"
+        );
+    }
+    assert!(effects.iter().any(
+        |effect| matches!(effect, Effect::ProcSpawn { argv0, .. } if argv0 == "audit-external")
+    ));
+    assert!(
+        effects.contains(&Effect::Opaque),
+        "a nested dynamic path read must fail closed: {effects:?}"
+    );
+    // Plugin and external calls share `plan_command_inputs` before their
+    // source-specific dispatch; this test deliberately exercises every input
+    // shape without requiring a compiled component fixture.
+}
+
+#[test]
+fn dynamic_redirects_and_path_receivers_fail_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let span = Span::default();
+    let dynamic_redirect = CmdCall {
+        head: "audit-external".into(),
+        forced: false,
+        args: vec![],
+        redirects: vec![Redirect {
+            kind: RedirectKind::In,
+            target: expression_arg("target"),
+            span,
+        }],
+        env_prefix: vec![],
+        background: false,
+        trailing: None,
+        span,
+    };
+    let mut evaluator = Evaluator::new(dir.path().into());
+    let effects = evaluator
+        .plan_program(&command_expr(dynamic_redirect))
+        .unwrap()
+        .effects;
+    assert!(effects.contains(&Effect::Opaque), "{effects:?}");
+
+    for method in ["read", "read_bytes", "lines"] {
+        let effects = effects_at(dir.path(), &format!("let p = path(\"x\")\np.{method}()"));
+        assert!(
+            effects.contains(&Effect::Opaque),
+            "dynamic p.{method} failed open: {effects:?}"
+        );
+    }
+    let precise = effects_at(dir.path(), r#"path("x").read_bytes()"#);
+    assert!(precise.contains(&Effect::FsRead {
+        paths: vec![dir.path().join("x")]
+    }));
+}
+
+#[test]
+fn secret_and_environment_reads_are_attributed_through_headers_and_bindings() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut evaluator = Evaluator::new(dir.path().into());
+    evaluator
+        .env_mut()
+        .declare(
+            "bound_token",
+            Value::Secret(shoal_value::SecretVal {
+                name: "BOUND_TOKEN".into(),
+                value: Arc::from("material"),
+            }),
+            false,
+        )
+        .unwrap();
+    let effects = evaluator
+        .plan_program(
+            &shoal_syntax::parse(
+                r#"http.get("https://example.test", headers: {Authorization: bound_token})
+env.PATH
+os.env()"#,
+            )
+            .unwrap(),
+        )
+        .unwrap()
+        .effects;
+    for expected in [
+        Effect::SecretUse {
+            names: vec!["BOUND_TOKEN".into()],
+        },
+        Effect::EnvRead {
+            names: vec!["PATH".into()],
+        },
+        Effect::EnvRead {
+            names: vec!["*".into()],
+        },
+    ] {
+        assert!(
+            effects.contains(&expected),
+            "missing {expected:?}: {effects:?}"
+        );
+    }
+
+    let policy = LeashPolicy::from_toml(
+        "[principal.agent]\nauto_apply='in-grant'\nnet_connect=['example.test:443']\nenv_read=['PATH', '*']\nsecret_use=[]\n",
+    )
+    .unwrap();
+    let plan = Plan::new(effects, Reversibility::Reversible, Estimates::default());
+    assert_eq!(
+        policy.evaluate_plan("agent", &plan),
+        shoal_leash::Verdict::Deny,
+        "the newly surfaced secret effect must be enforceable"
+    );
+
+    let dynamic = effects_at(
+        dir.path(),
+        "let requested = \"DYNAMIC_TOKEN\"\nsecret.get(requested)",
+    );
+    assert!(dynamic.contains(&Effect::SecretUse {
+        names: vec!["*".into()]
+    }));
+}
+
+#[test]
+fn tilde_paths_use_the_evaluator_environment_in_plans_and_runtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let injected_home = dir.path().join("injected-home");
+    let mut evaluator = Evaluator::new(dir.path().into());
+    evaluator
+        .exec
+        .shell
+        .process_env
+        .retain(|(name, _)| name != "HOME");
+    evaluator.exec.shell.process_env.push((
+        OsString::from("HOME"),
+        injected_home.clone().into_os_string(),
+    ));
+
+    let effects = evaluator
+        .plan_program(&shoal_syntax::parse("cat ~/notes.txt").unwrap())
+        .unwrap()
+        .effects;
+    assert!(effects.contains(&Effect::FsRead {
+        paths: vec![injected_home.join("notes.txt")]
+    }));
+    assert_eq!(
+        evaluator.resolve_path("~/notes.txt"),
+        injected_home.join("notes.txt")
+    );
+
+    let quoted = CmdArg::Str {
+        expr: Expr::Str {
+            value: "~/quoted.txt".into(),
+            span: Span::default(),
+        },
+        span: Span::default(),
+    };
+    let quoted_runtime = evaluator.arg_path(&quoted).unwrap();
+    let quoted_plan = evaluator.cmd_arg_path_literal(&quoted).unwrap();
+    assert_eq!(quoted_runtime, dir.path().join("~/quoted.txt"));
+    assert_eq!(quoted_plan, quoted_runtime);
+}
+
+#[test]
+fn stream_sources_are_canonical_in_process_constructors_in_runtime_and_plans() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("events.log");
+    std::fs::write(&file, "").unwrap();
+    let source = format!(
+        "every(1h)\nwatch(path({path:?}))\ntail(path({path:?}))",
+        path = file.to_string_lossy()
+    );
+    let mut evaluator = Evaluator::new(dir.path().into());
+    let effects = evaluator
+        .plan_program(&shoal_syntax::parse(&source).unwrap())
+        .unwrap()
+        .effects;
+    assert!(effects.contains(&Effect::Time), "{effects:?}");
+    assert!(effects.contains(&Effect::FsRead {
+        paths: vec![file.clone()]
+    }));
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::ProcSpawn { argv0, .. }
+            if matches!(argv0.as_str(), "every" | "watch" | "tail"))),
+        "stream constructors escaped to process resolution: {effects:?}"
+    );
+
+    let runtime = evaluator
+        .eval_program(&shoal_syntax::parse("every(1h)").unwrap())
+        .unwrap();
+    assert!(matches!(runtime, Value::Stream(_)));
 }

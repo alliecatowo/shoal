@@ -87,6 +87,9 @@ In capture mode, byte-input writing ignores `EPIPE` because early child exit is 
 failure occurs before spawn. A `Stream` queue retains at most 16 chunks and rejects chunks above
 64 KiB, capping queued payload bytes at 1 MiB. Its producer owns retry/cancellation policy; evaluator
 `.feed` supplies a cancellation-aware pump and incrementally splits resident or CAS-backed items.
+Owned finite encodings use the direct byte writer, shared resident bytes are chunked without a
+whole-payload clone, and CAS-backed bytes open their verified reader without calling the eager
+full-load interface. Eager structured encoding stops at 16 MiB before spawn.
 PTY mode rejects `Stream` before any effect because a PTY master has no portable input half-close.
 
 ## Capture-mode spawn
@@ -266,8 +269,9 @@ The evaluator's command path requests a spill when a journal/CAS context is avai
 the caller-owned file. A successfully adopted large value becomes lazy `CasBytes`/an outcome stdout
 reference. Because the CAS owns the complete bytes, the evaluator reduces the retained presentation
 preview to 1 MiB before the value enters a lexical environment; this keeps ref-backed values within
-the independent per-binding budget. Redirects and `.feed` must load full content through
-`stdout_bytes`, not write only the resident preview.
+the independent per-binding budget. Redirects use the CAS reader through the filesystem port and
+`.feed` uses the bounded stdin pump; neither writes only the resident preview or eagerly resolves the
+complete blob.
 
 Any error between process return and adoption must clean up the temporary file. Tests should cover
 successful adoption, adoption failure, no-journal behavior, disk-cap truncation, and redirects from

@@ -408,8 +408,87 @@ impl Evaluator {
         if let Value::Stream(stream) = value {
             return self.eval_stream_feed(stream, cmd_expr, position, span);
         }
-        let bytes = shoal_value::feed_bytes(&value).map_err(|e| e.or_span(span))?;
-        self.eval_feed_command(cmd_expr, position, span, StdinSpec::Bytes(bytes))
+        let body = crate::finite_io::FiniteBody::from_value(value, ".feed body")
+            .map_err(|error| error.or_span(span))?;
+        match body
+            .into_feed_input()
+            .map_err(|error| error.or_span(span))?
+        {
+            crate::finite_io::FeedInput::Bytes(bytes) => {
+                self.eval_feed_command(cmd_expr, position, span, StdinSpec::Bytes(bytes))
+            }
+            crate::finite_io::FeedInput::Reader(reader) => {
+                self.eval_reader_feed(reader, cmd_expr, position, span)
+            }
+        }
+    }
+
+    /// Pump a finite reader (shared resident bytes or lazy CAS content) through
+    /// the same bounded child-stdin queue used by streams. This keeps only one
+    /// 64 KiB producer chunk plus the fixed queue resident and never calls the
+    /// CAS full-load interface.
+    fn eval_reader_feed(
+        &mut self,
+        mut reader: Box<dyn std::io::Read + Send>,
+        cmd_expr: &Expr,
+        position: Position,
+        span: Span,
+    ) -> VResult<Value> {
+        let (stdin_sink, stdin) = shoal_exec::stream_stdin(shoal_exec::MAX_STDIN_STREAM_CHUNKS);
+        let parent_cancel = self.cancellation_token();
+        let pump_cancel = CancelToken::linked(&parent_cancel);
+        let error = StreamPumpError::default();
+        let pump_error = error.clone();
+        let worker_cancel = pump_cancel.clone();
+        let worker = std::thread::Builder::new()
+            .name("shoal-finite-feed".into())
+            .spawn(move || {
+                loop {
+                    if worker_cancel.is_cancelled() {
+                        break;
+                    }
+                    let mut chunk = vec![0u8; shoal_exec::MAX_STDIN_STREAM_CHUNK_BYTES];
+                    let count = match reader.read(&mut chunk) {
+                        Ok(count) => count,
+                        Err(error) => {
+                            pump_error.record(ErrorVal::new(
+                                "feed_io",
+                                format!("read finite stdin source: {error}"),
+                            ));
+                            break;
+                        }
+                    };
+                    if count == 0 {
+                        break;
+                    }
+                    chunk.truncate(count);
+                    match send_stdin_chunk(&stdin_sink, &worker_cancel, &parent_cancel, chunk) {
+                        Ok(true) => {}
+                        Ok(false) => break,
+                        Err(error) => {
+                            pump_error.record(error);
+                            break;
+                        }
+                    }
+                }
+            })
+            .map_err(|error| {
+                ErrorVal::new("io_error", format!("spawn finite stdin pump: {error}"))
+            })?;
+
+        let _cancel_on_unwind = CancelPumpOnDrop(pump_cancel.clone());
+        let result = self.eval_feed_command(cmd_expr, position, span, stdin);
+        pump_cancel.cancel();
+        if worker.join().is_err() {
+            error.record(ErrorVal::new(
+                "stream_feed_sync",
+                "finite stdin pump panicked",
+            ));
+        }
+        if let Some(error) = error.take_terminal() {
+            return Err(error.or_span(span));
+        }
+        result
     }
 
     fn eval_stream_feed(
@@ -654,6 +733,34 @@ fn expr_noun(e: &Expr) -> &'static str {
 mod stream_pump_error_tests {
     use super::*;
 
+    struct SparseReader {
+        remaining: usize,
+    }
+
+    impl std::io::Read for SparseReader {
+        fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+            let count = self.remaining.min(output.len());
+            output[..count].fill(b'x');
+            self.remaining -= count;
+            Ok(count)
+        }
+    }
+
+    struct FailingReader {
+        delivered: bool,
+    }
+
+    impl std::io::Read for FailingReader {
+        fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+            if self.delivered {
+                return Err(std::io::Error::other("injected CAS read failure"));
+            }
+            self.delivered = true;
+            output[..4].copy_from_slice(b"seed");
+            Ok(4)
+        }
+    }
+
     #[test]
     fn poisoned_pump_error_reconstructs_one_stable_terminal_error() {
         let error = StreamPumpError::default();
@@ -744,6 +851,65 @@ mod stream_pump_error_tests {
             .unwrap_err();
         assert_eq!(error.code, "upstream_failed");
         assert_eq!(error.msg, "original failure");
+    }
+
+    #[test]
+    fn finite_reader_larger_than_http_wall_streams_through_process_stdin() {
+        let length = crate::finite_io::FINITE_BODY_MAX_BYTES + 1;
+        let command = Expr::Cmd {
+            call: Box::new(shoal_ast::CmdCall {
+                head: "wc".into(),
+                forced: false,
+                args: vec![shoal_ast::CmdArg::FlagShort {
+                    chars: "c".into(),
+                    span: Span::default(),
+                }],
+                env_prefix: Vec::new(),
+                redirects: Vec::new(),
+                background: false,
+                trailing: None,
+                span: Span::default(),
+            }),
+            span: Span::default(),
+        };
+        let mut evaluator = Evaluator::new(std::env::current_dir().unwrap());
+        let value = evaluator
+            .eval_reader_feed(
+                Box::new(SparseReader { remaining: length }),
+                &command,
+                Position::Value,
+                Span::default(),
+            )
+            .unwrap();
+        let Value::Outcome(outcome) = value else {
+            panic!("wc should return an outcome")
+        };
+        assert_eq!(
+            String::from_utf8_lossy(&outcome.stdout).trim(),
+            length.to_string()
+        );
+    }
+
+    #[test]
+    fn finite_feed_reader_error_is_typed_and_evaluator_recovers() {
+        let command = Expr::Var {
+            name: "cat".into(),
+            span: Span::default(),
+        };
+        let mut evaluator = Evaluator::new(std::env::current_dir().unwrap());
+        let error = evaluator
+            .eval_reader_feed(
+                Box::new(FailingReader { delivered: false }),
+                &command,
+                Position::Value,
+                Span::default(),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "feed_io");
+        assert!(error.msg.contains("injected CAS read failure"));
+
+        let program = shoal_syntax::parse("40 + 2").unwrap();
+        assert_eq!(evaluator.eval_program(&program).unwrap(), Value::Int(42));
     }
 
     #[test]

@@ -20,6 +20,21 @@ impl Evaluator {
         // background desugaring, argument evaluation, filesystem mutation, or
         // process spawn so ambiguous redirects can never partially execute.
         validate_redirect_shape(call)?;
+        let resolution = self.resolve_command(call);
+        // Builtin help is a canonical, zero-effect dispatch. Resolve first so
+        // an in-session callable named `ls` still wins over the builtin, then
+        // intercept before background desugaring, argument/glob evaluation,
+        // env-prefix handling, redirects, Reef, filesystem, or process ports.
+        if matches!(
+            resolution.source,
+            CommandSource::StructuredBuiltin | CommandSource::SpecialBuiltin
+        ) && call_requests_help(call)
+        {
+            let help = shoal_syntax::commands::builtin_help(&call.head)
+                .expect("every resolved builtin has canonical help metadata");
+            self.emit(&Value::Str(help));
+            return Ok(Value::Null);
+        }
         // Trailing `&` desugars to `spawn { <call> }` (site/content/internals/language-conformance-contract.md): the command
         // runs on a background task and the statement yields a `task` handle
         // instead of running synchronously.
@@ -38,7 +53,6 @@ impl Evaluator {
             };
             return self.spawn_block(body);
         }
-        let resolution = self.resolve_command(call);
         // Session callables (fns/aliases) resolve as commands even when `^`-forced
         // (defect #3): `^` bypasses only non-callable let/var shadows.
         if resolution.source == CommandSource::SessionCallable {
@@ -362,6 +376,20 @@ impl Evaluator {
         }
         Ok(value)
     }
+}
+
+/// Does this command request standard help before the `--` end-of-flags
+/// marker? Kept on parsed arguments so quoted/path values named `--help` never
+/// acquire option semantics.
+pub(crate) fn call_requests_help(call: &CmdCall) -> bool {
+    call.args
+        .iter()
+        .take_while(|arg| !matches!(arg, CmdArg::DashDash { .. }))
+        .any(|arg| match arg {
+            CmdArg::FlagLong { name, .. } => name == "help",
+            CmdArg::FlagShort { chars, .. } => chars.contains('h'),
+            _ => false,
+        })
 }
 
 fn validate_redirect_shape(call: &CmdCall) -> VResult<()> {

@@ -163,11 +163,35 @@ impl Evaluator {
     }
     pub(crate) fn resolve_path(&self, text: &str) -> PathBuf {
         if let Some(rest) = text.strip_prefix("~/") {
-            std::env::home_dir()
+            self.session_home()
                 .unwrap_or_else(|| self.exec.shell.cwd.clone())
                 .join(rest)
         } else {
             PathBuf::from(text)
+        }
+    }
+
+    /// HOME from the evaluator's process-environment snapshot. This is the
+    /// environment runtime children receive and `env.HOME = ...` mutates; it
+    /// must not be re-read from the ambient host during evaluation/planning.
+    pub(crate) fn session_home(&self) -> Option<PathBuf> {
+        self.exec
+            .shell
+            .process_env
+            .iter()
+            .rev()
+            .find(|(name, value)| name == "HOME" && !value.is_empty())
+            .map(|(_, value)| PathBuf::from(value))
+    }
+
+    /// Resolve a path token exactly as runtime does, then anchor a relative
+    /// result at this evaluator's cwd for concrete effect attribution.
+    pub(crate) fn resolved_abs_path(&self, text: &str) -> PathBuf {
+        let path = self.resolve_path(text);
+        if path.is_absolute() {
+            path
+        } else {
+            self.exec.shell.cwd.join(path)
         }
     }
     pub(crate) fn arg_path(&mut self, a: &CmdArg) -> VResult<PathBuf> {

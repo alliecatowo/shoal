@@ -8,11 +8,11 @@ use crate::plan_effects::push_effect;
 
 mod attribution;
 mod commands;
+mod inputs;
 mod statements;
+mod value_effects;
 
-use attribution::{
-    cmd_arg_str_literal, is_path_read_method, str_literal, url_host_port, url_literal,
-};
+use attribution::{cmd_arg_str_literal, str_literal};
 
 type Functions = std::collections::HashMap<String, Block>;
 type Aliases = std::collections::HashMap<String, CmdCall>;
@@ -86,13 +86,7 @@ impl Evaluator {
             }
             Expr::Unary { expr, .. } => self.plan_expr(expr, functions, aliases, out, depth),
             Expr::Field { recv, name, .. } => {
-                // A bare `path("f").read`/`.lines`/… (no parens) is a filesystem
-                // read of the receiver path (A4).
-                if is_path_read_method(name)
-                    && let Some(p) = self.path_literal(recv)
-                {
-                    push_effect(out, Effect::FsRead { paths: vec![p] });
-                }
+                self.plan_field_effects(recv, name, out);
                 self.plan_expr(recv, functions, aliases, out, depth)
             }
             Expr::Index { recv, index, .. } => {
@@ -109,35 +103,7 @@ impl Evaluator {
                 if name == "feed" && args.pos.len() == 1 && args.named.is_empty() {
                     return self.plan_feed(recv, &args.pos[0], functions, aliases, out, depth);
                 }
-                // `http.get/post/put/delete(url, …)` declares a `net.connect`
-                // effect for leash + plan (site/content/internals/roadmap-and-priorities.md). The host is parsed from a
-                // literal URL argument; a non-literal URL declares an
-                // unknown-host connect (`*`).
-                if let Expr::Var { name: ns, .. } = &**recv
-                    && ns == "http"
-                    && matches!(name.as_str(), "get" | "post" | "put" | "delete")
-                {
-                    let (host, port) = args
-                        .pos
-                        .first()
-                        .and_then(url_literal)
-                        .map(|u| url_host_port(&u))
-                        .unwrap_or_else(|| ("*".into(), 443));
-                    push_effect(out, Effect::NetConnect { host, port });
-                }
-                // `.save`/`.append` write the path argument (A4). A dynamic path
-                // cannot be bounded, so it plans as `Opaque` (approval).
-                if matches!(name.as_str(), "save" | "append") {
-                    let path = args.pos.first().and_then(|a| self.path_literal(a));
-                    self.plan_save(path, out);
-                }
-                // Filesystem-backed path reads (`.read`/`.lines`/…) of a path
-                // literal receiver (A4).
-                if is_path_read_method(name)
-                    && let Some(p) = self.path_literal(recv)
-                {
-                    push_effect(out, Effect::FsRead { paths: vec![p] });
-                }
+                self.plan_method_effects(recv, name, args, out);
                 self.plan_expr(recv, functions, aliases, out, depth)?;
                 for e in &args.pos {
                     self.plan_expr(e, functions, aliases, out, depth)?;
@@ -157,6 +123,9 @@ impl Evaluator {
                 for n in &args.named {
                     self.plan_expr(&n.value, functions, aliases, out, depth)?;
                 }
+                if self.plan_constructor_effects(name, args, out) {
+                    return Ok(());
+                }
                 match name.as_str() {
                     // Effectful builtins invoked as functions (A8).
                     "run" => self.plan_run_target(args.pos.first().and_then(str_literal), out),
@@ -174,8 +143,6 @@ impl Evaluator {
                     // Higher-order builtins: their closure bodies are already
                     // planned above via the Lambda arm; `assert` is pure.
                     "parallel" | "retry" | "on" | "assert" => {}
-                    // Provably pure value constructors (no IO at construction).
-                    "path" | "glob" | "regex" | "channel" => {}
                     other => {
                         if let Some(body) = functions.get(other) {
                             // A function declared in this program: expand it.
@@ -274,8 +241,18 @@ impl Evaluator {
             | Expr::Duration { .. }
             | Expr::Time { .. }
             | Expr::DateTime { .. }
-            | Expr::Regex { .. }
-            | Expr::Var { .. } => Ok(()),
+            | Expr::Regex { .. } => Ok(()),
+            Expr::Var { name, .. } => {
+                if let Some(Value::Secret(secret)) = self.exec.shell.env.get(name) {
+                    push_effect(
+                        out,
+                        Effect::SecretUse {
+                            names: vec![secret.name],
+                        },
+                    );
+                }
+                Ok(())
+            }
         }
     }
 }

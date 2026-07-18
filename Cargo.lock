@@ -2596,6 +2596,7 @@ dependencies = [
  "blake3",
  "criterion",
  "csv",
+ "fd-lock",
  "glob",
  "http",
  "jiff",

@@ -12,7 +12,7 @@ impl Evaluator {
                 arg,
                 CmdArg::FlagLong { .. } | CmdArg::FlagShort { .. } | CmdArg::DashDash { .. }
             ) {
-                ps.extend(plan_paths(arg, &self.exec.shell.cwd)?);
+                ps.extend(self.plan_paths(arg)?);
             }
         }
         let e = match call.head.as_str() {
@@ -100,6 +100,16 @@ impl Evaluator {
         }
         Ok(bindings)
     }
+
+    fn plan_paths(&self, arg: &CmdArg) -> VResult<Vec<PathBuf>> {
+        match arg {
+            CmdArg::Glob { pattern, .. } => {
+                crate::args::expand_glob_paths(&self.exec.shell.cwd, pattern, false)
+            }
+            CmdArg::Path { text, .. } => Ok(vec![self.resolved_abs_path(text)]),
+            _ => Ok(vec![self.plan_abs(&plan_text(arg)?)]),
+        }
+    }
 }
 
 fn plan_text(arg: &CmdArg) -> VResult<String> {
@@ -113,15 +123,6 @@ fn plan_text(arg: &CmdArg) -> VResult<String> {
             _ => Err(ErrorVal::arg_error("planning requires a literal argument")),
         },
         _ => Err(ErrorVal::arg_error("planning requires a value argument")),
-    }
-}
-fn plan_paths(arg: &CmdArg, cwd: &Path) -> VResult<Vec<PathBuf>> {
-    match arg {
-        CmdArg::Glob { pattern, .. } => crate::args::expand_glob_paths(cwd, pattern, false),
-        _ => {
-            let p = PathBuf::from(plan_text(arg)?);
-            Ok(vec![if p.is_absolute() { p } else { cwd.join(p) }])
-        }
     }
 }
 /// Parse one declared adapter effect against the **full** effect vocabulary

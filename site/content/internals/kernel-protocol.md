@@ -117,9 +117,12 @@ lock. The language event bus is cached separately so publishing `user.*` events 
 a long-running evaluation.
 
 Creation uses the shared host bootstrap: layered config, aliases/environment, adapters, WebAssembly
-plugins, Reef inputs, jump frecency, the evaluator journal, and the `user.*` event forwarder. Init
-files run only for an inherited private-human TTY profile; durable/headless agent Sessions skip them.
-Local terminal UI remains deliberately outside the kernel.
+plugins, Reef inputs, the evaluator journal, and the `user.*` event forwarder. Jump frecency is then
+selected from authenticated host facts: the inherited private human keeps the local per-user store,
+bearers receive a digest-named principal/trust/profile partition, and tokenless restricted sessions
+receive no durable query or update path. Init files run only for an inherited private-human TTY
+profile; durable/headless agent Sessions skip them. Local terminal UI remains deliberately outside
+the kernel.
 
 ## RPC surface
 

@@ -167,7 +167,12 @@ popd
 cd -
 ```
 
-`j`/`jump` use an interactive frecency database stored under the Shoal state directory. This is a REPL convenience rather than a portable script primitive.
+`j`/`jump` use an interactive frecency database stored under the Shoal state directory. The local
+human REPL and one-shot local commands retain the same per-user database. Kernel bearer sessions use
+separate authenticated principal/trust/profile partitions, while tokenless restricted sessions do
+not read or write durable jump history. Updates are atomically merged under a bounded advisory lock,
+so concurrent cooperative sessions do not discard one another's visits. This is a REPL convenience
+rather than a portable script primitive.
 
 ## Paging
 

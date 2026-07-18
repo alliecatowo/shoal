@@ -82,8 +82,10 @@ impl OutcomeVal {
         let first = trimmed.trim_start().chars().next();
         if matches!(first, Some('{') | Some('['))
             && let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed)
+            && preflight_json_numbers(trimmed, "command output JSON").is_ok()
+            && let Ok(value) = json_to_value(&json)
         {
-            return json_to_value(&json);
+            return value;
         }
         Value::Str(trimmed.to_string())
     }
@@ -115,5 +117,23 @@ mod tests {
         assert_eq!(bare().span, None);
         let stamped = bare().with_span(Span::new(3, 9));
         assert_eq!(stamped.span, Some(Span::new(3, 9)));
+    }
+
+    #[test]
+    fn structured_stdout_never_substitutes_a_rounded_integer() {
+        let exact = br#"{"id":18446744073709551615}"#.to_vec();
+        let mut outcome = bare();
+        outcome.stdout = Arc::new(exact.clone());
+        assert_eq!(
+            outcome.out_value(),
+            Value::Str(String::from_utf8(exact).unwrap())
+        );
+
+        let underflow = br#"{"id":-9223372036854775809}"#.to_vec();
+        outcome.stdout = Arc::new(underflow.clone());
+        assert_eq!(
+            outcome.out_value(),
+            Value::Str(String::from_utf8(underflow).unwrap())
+        );
     }
 }

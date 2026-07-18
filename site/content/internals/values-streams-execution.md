@@ -77,7 +77,7 @@ or allocate a large blob.
 | Value | Feed encoding |
 |---|---|
 | string | raw UTF-8, no automatic newline |
-| bytes / CAS bytes | raw bytes, loading CAS content on demand |
+| bytes / CAS bytes | raw bytes; resident storage stays shared and CAS content opens incrementally |
 | scalar | canonical textual form |
 | list of strings | newline-delimited with a trailing newline |
 | records, tables, heterogeneous lists | compact JSON |
@@ -87,9 +87,19 @@ or allocate a large blob.
 | stream | `feed_bytes` rejects eager conversion; `.feed(command)` uses the incremental path below |
 
 The scalar helper deliberately rejects streams so a generic conversion cannot silently collect an
-unbounded source. Evaluator `.feed(command)` recognizes a stream before calling this helper and
-drives it through a capture-only queue capped at 16 chunks of 64 KiB each. The queue applies lossless
-backpressure, and cancellation, child exit, upstream end, or an upstream error tears down the pump.
+unbounded source. The evaluator owns a separate finite-body boundary: strings move into owned bytes,
+resident byte vectors stay shared, and CAS-backed bytes/outcome captures open a reader rather than
+calling `resolve`. Structured JSON encoding is admitted against 16 MiB retained/output, depth 128,
+and 131,072-node walls; its explicit transient budget is the source, JSON projection, and output
+(three bounded payload representations), and secrets are rejected recursively. Evaluator
+`.feed(command)` recognizes both
+live streams and finite readers and drives them through a capture-only queue capped at 16 chunks of
+64 KiB each. The queue applies lossless backpressure, and cancellation, child exit, upstream end, or
+an upstream/reader error tears down the pump.
+
+HTTP reuses the finite boundary but imposes a 16 MiB total request wall. Resident bodies preserve
+ureq's sized `Content-Length` path; CAS bodies open the verified reader and use chunked transfer so a
+one-byte sentinel can detect content that exceeds the declared/admitted bound.
 
 
 ## Outcomes unify commands

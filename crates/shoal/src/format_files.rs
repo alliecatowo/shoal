@@ -5,6 +5,10 @@
 //! atomic replacement could silently discard, retain ordinary permissions,
 //! sync file contents, and sync the containing directory entry.
 
+#[cfg(unix)]
+use std::collections::HashMap;
+#[cfg(not(unix))]
+use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -20,6 +24,17 @@ struct FormatPlan {
     snapshot: FileSnapshot,
 }
 
+struct PreparedFile {
+    plan: Option<FormatPlan>,
+    path: PathBuf,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    link_count: u64,
+}
+
 struct FileSnapshot {
     permissions: fs::Permissions,
     length: u64,
@@ -28,6 +43,8 @@ struct FileSnapshot {
     device: u64,
     #[cfg(unix)]
     inode: u64,
+    #[cfg(unix)]
+    link_count: u64,
     #[cfg(unix)]
     owner: u32,
     #[cfg(unix)]
@@ -55,10 +72,15 @@ pub(crate) fn run(check: bool, files: Vec<PathBuf>) -> Result<i32, String> {
 
     // Build the complete plan first. A malformed or unsafe later input must
     // never leave an earlier input rewritten as a side effect.
-    let plans = files
+    let prepared = files
         .iter()
         .map(|path| prepare(path, !check))
         .collect::<Result<Vec<_>, _>>()?;
+    validate_distinct_inputs(&prepared)?;
+    let plans = prepared
+        .into_iter()
+        .map(|prepared| prepared.plan)
+        .collect::<Vec<_>>();
     let changed = plans.iter().any(Option::is_some);
     if check {
         return Ok(i32::from(changed));
@@ -69,23 +91,79 @@ pub(crate) fn run(check: bool, files: Vec<PathBuf>) -> Result<i32, String> {
     Ok(0)
 }
 
-fn prepare(path: &Path, will_replace: bool) -> Result<Option<FormatPlan>, String> {
+fn prepare(path: &Path, will_replace: bool) -> Result<PreparedFile, String> {
     let (file, metadata) = open_regular_no_follow(path)?;
     let snapshot = FileSnapshot::new(&metadata);
     let src = crate::args::read_source_stream(&file, &path.display().to_string())?;
     let ast = parse(&src).map_err(|error| format!("{}: {error}", path.display()))?;
     let formatted = format_source_safely(&src, &ast);
-    if formatted == src {
-        return Ok(None);
-    }
-    if will_replace {
+    let changed = formatted != src;
+    if changed && will_replace {
         validate_replace_metadata(path, &file, &metadata)?;
     }
-    Ok(Some(FormatPlan {
-        path: path.to_owned(),
-        formatted,
-        snapshot,
-    }))
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(PreparedFile {
+            plan: changed.then(|| FormatPlan {
+                path: path.to_owned(),
+                formatted,
+                snapshot,
+            }),
+            path: path.to_owned(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            link_count: metadata.nlink(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(PreparedFile {
+            plan: changed.then(|| FormatPlan {
+                path: path.to_owned(),
+                formatted,
+                snapshot,
+            }),
+            path: fs::canonicalize(path)
+                .map_err(|error| format!("cannot identify {}: {error}", path.display()))?,
+        })
+    }
+}
+
+#[cfg(unix)]
+fn validate_distinct_inputs(files: &[PreparedFile]) -> Result<(), String> {
+    let mut seen = HashMap::<(u64, u64), &Path>::new();
+    for file in files {
+        if file.link_count > 1 {
+            return Err(format!(
+                "cannot format {}: the file has {} hard links; pass a singly-linked copy so atomic replacement cannot silently detach another name",
+                file.path.display(),
+                file.link_count
+            ));
+        }
+        if let Some(first) = seen.insert((file.device, file.inode), &file.path) {
+            return Err(format!(
+                "cannot format {}: it names the same file as {}; remove the duplicate or alias from the argument list",
+                file.path.display(),
+                first.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_distinct_inputs(files: &[PreparedFile]) -> Result<(), String> {
+    let mut seen = HashSet::<&Path>::new();
+    for file in files {
+        if !seen.insert(&file.path) {
+            return Err(format!(
+                "cannot format {} more than once; remove duplicate or alias arguments",
+                file.path.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The AST intentionally omits free comments/trivia. The syntax crate owns
@@ -240,6 +318,7 @@ impl FileSnapshot {
                 modified: metadata.modified().ok(),
                 device: metadata.dev(),
                 inode: metadata.ino(),
+                link_count: metadata.nlink(),
                 owner: metadata.uid(),
                 mode: metadata.mode(),
                 changed_seconds: metadata.ctime(),
@@ -262,6 +341,7 @@ impl FileSnapshot {
             use std::os::unix::fs::MetadataExt;
             self.device == metadata.dev()
                 && self.inode == metadata.ino()
+                && self.link_count == metadata.nlink()
                 && self.owner == metadata.uid()
                 && self.mode == metadata.mode()
                 && self.changed_seconds == metadata.ctime()
@@ -428,6 +508,50 @@ mod tests {
         assert_eq!(fs::read_to_string(first).unwrap(), "let x=1");
     }
 
+    #[test]
+    fn duplicate_and_relative_aliases_are_refused_before_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("same.shl");
+        let relative_alias = dir.path().join(".").join("same.shl");
+        fs::write(&path, "let x=1").unwrap();
+
+        let error = run(false, vec![path.clone(), relative_alias]).unwrap_err();
+        assert!(error.contains("same file") || error.contains("duplicate"));
+        assert!(error.contains("remove"));
+        assert_eq!(fs::read_to_string(path).unwrap(), "let x=1");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn multiply_linked_file_is_refused_even_with_one_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("first.shl");
+        let alias = dir.path().join("second.shl");
+        fs::write(&path, "let x=1").unwrap();
+        fs::hard_link(&path, &alias).unwrap();
+
+        let error = run(false, vec![path.clone()]).unwrap_err();
+        assert!(error.contains("hard links"));
+        assert!(error.contains("singly-linked copy"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "let x=1");
+        assert_eq!(fs::read_to_string(alias).unwrap(), "let x=1");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_link_alias_inputs_are_refused_before_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.shl");
+        let second = dir.path().join("second.shl");
+        fs::write(&first, "let x=1").unwrap();
+        fs::hard_link(&first, &second).unwrap();
+
+        let error = run(false, vec![first.clone(), second.clone()]).unwrap_err();
+        assert!(error.contains("hard links"));
+        assert_eq!(fs::read_to_string(first).unwrap(), "let x=1");
+        assert_eq!(fs::read_to_string(second).unwrap(), "let x=1");
+    }
+
     #[cfg(unix)]
     #[test]
     fn rewrite_preserves_executable_mode() {
@@ -499,7 +623,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("changed.shl");
         fs::write(&path, "let x=1").unwrap();
-        let plan = prepare(&path, true).unwrap().unwrap();
+        let plan = prepare(&path, true).unwrap().plan.unwrap();
         fs::remove_file(&path).unwrap();
         fs::write(&path, "let replacement = 2\n").unwrap();
 

@@ -134,10 +134,14 @@ File rewrites refuse symbolic links instead of replacing the link itself. On Uni
 complete permission mode and refuse files owned by another user or carrying extended metadata that
 atomic replacement would discard (including Linux ACL xattrs and macOS ACLs). Linux security labels
 are accepted only when a replacement created in the same directory receives an identical label.
-Shoal syncs both the replacement contents and its parent directory. These checks are intentionally
-stricter than script execution; pass the regular target path explicitly when a link should be
-formatted. A failure during a later write can still leave already committed earlier files changed,
-because there is no portable transaction spanning multiple directory entries.
+Shoal also refuses duplicate input aliases and, on Unix, any multiply-linked inode: replacing one
+hard-link name would silently detach it from the other names. Identity is established for every
+input before the first rewrite. Shoal syncs both the replacement contents and its parent directory.
+These checks are intentionally stricter than script execution; pass a singly-linked regular target
+path explicitly when a link should be formatted. A failure during a later write can still leave
+already committed earlier files changed, because there is no portable transaction spanning multiple
+directory entries. Filesystem replacement races after identity preflight are detected where the
+platform exposes stable metadata, but this formatter is not a general hostile-directory transaction.
 
 ## Run diagnostics
 

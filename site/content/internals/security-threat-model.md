@@ -59,6 +59,17 @@ client-asserted `local-human` is rejected. Human trust exists only on the server
 descriptor inherited by the private REPL. Durable token auth is available only when the kernel
 opened a state directory; an ephemeral kernel has no `TokenStore` and rejects bearer attachment.
 
+Directory frecency is also authority-scoped. The private embedded human retains the standalone
+per-user `jump.frecency` database. A bearer session receives a separate digest-named store derived
+from its authenticated principal, profile, and server-selected connection trust; that same scope is
+part of the kernel's internal Session key, so a named evaluator cannot be silently reused under a
+different profile/trust posture. Tokenless restricted sessions receive neither a durable read path
+nor a write path, and child evaluators inherit that lack of observation authority. The store and its
+lock reject symlinks and non-owned/hard-linked files, are repaired to mode `0600`, and bound parsing,
+rank, identity count, and serialized bytes. Navigation updates take a bounded advisory lock around
+reload → merge → atomic replace; lock failure or contention drops only advisory history work and
+never fails or indefinitely stalls `cd`.
+
 ## Assets and adversaries
 
 The current design attempts to protect:

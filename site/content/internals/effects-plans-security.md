@@ -95,11 +95,36 @@ It never falls through as an external process merely because it has no entry in 
 builtin effect table. The HR-A11 regression suite iterates every canonical builtin name and pins all
 original audit probes to their meaningful effect and target.
 
+Builtin `-h`/`--help` is the deliberate exception to the command's ordinary effects. Planning uses
+the same post-resolution, pre-`--` predicate as runtime and emits no effects for builtin help, even
+when extra operands, redirects, or `&` are present. Callable shadows still follow callable planning
+rather than being mistaken for the builtin they shadow.
+
 HTTP namespace calls derive one `NetConnect` from the same `http::Uri` authority representation the
 ureq runtime consumes. Malformed or non-HTTP(S) literals become wildcard authority. Runtime follows
 zero redirects and disables ambient proxy discovery: a `Location` response is returned to the
 program, and a reviewed target must be requested explicitly so every actual socket destination has
 its own plan entry. A two-listener regression proves a redirect target receives zero connections.
+
+Command input lowering is recursive and precedes external/plugin/adapter dispatch: embedded
+expressions in positional arguments, long-flag values, environment prefixes, redirect targets, and
+trailing blocks contribute their own network, filesystem, environment, secret, process, or opaque
+effects. Literal input redirects derive the exact `FsRead`; a dynamic target is `Opaque` after its
+expression subtree is traversed, never an empty effect. The same rule applies to dynamic receivers
+of `read`, `read_bytes`, and `lines`, while literal path receivers retain exact `FsRead` paths.
+
+Planner path attribution and runtime argument coercion share evaluator-scoped tilde expansion:
+`~/x` uses the session process-environment snapshot (including `env.HOME` changes), not a fresh read
+of the ambient host's `HOME`. `secret.get("name")`, a session-bound secret used in an HTTP header,
+`env.NAME`, and `os.env()` derive `SecretUse`/`EnvRead`; a dynamic secret name uses the conservative
+`*` name. `every`, `watch`, and `tail` come from one constructor inventory shared by runtime and the
+planner. They cannot fall through to PATH: `every` derives `Time`, and literal `watch`/`tail` targets
+derive `FsRead` (dynamic targets are `Opaque`).
+
+These guarantees are conservative rather than flow-sensitive. The planner traverses every branch
+and closure body it can see, so effects from an untaken branch may appear. Values whose concrete
+path, secret name, closure body, module body, or dynamic command cannot be proven statically remain
+`Opaque`; approval must narrow or accept that uncertainty rather than relying on a guessed target.
 
 Sources: [`plan_derive.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-eval/src/plan_derive.rs)
 and [`plan_effects.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-eval/src/plan_effects.rs).
@@ -178,7 +203,7 @@ sandbox can enforce them:
 | `shoal-eval` `command.rs` redirects `>` and `>>` | file write / append | `self.fs.write` / `.append` |
 | `shoal-eval` `builtins.rs` — `cat`/`ls`/`mkdir`/`touch`/`mv`/`cp`/`rm`/`trash`/`ln` | read / write / dir / rename / link | `self.fs.*` |
 | `shoal-eval` `frecency.rs` dir-jump store load/save | read / write / rename | `self.fs.*` |
-| `shoal-eval` `journal.rs` undo snapshot + restore | read | `self.fs.read` |
+| `shoal-eval` `journal.rs` undo snapshot + restore | bounded stable read | `self.fs.read_bounded_stable` |
 | `shoal-eval` `reef_builtins.rs` manifest read | stat / read | `self.fs.is_file` / `.read_to_string` |
 | `shoal-eval` module/script/navigation/plan resolution | stat / canonicalize | `self.host.fs.*` |
 | `shoal-eval` `streams.rs` watch/tail existence and tail reads | stat / seekable reads | `self.host.fs.*` |

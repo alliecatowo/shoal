@@ -6,7 +6,12 @@ pub(crate) struct ShellState {
     pub(crate) env: Env,
     pub(crate) cwd: PathBuf,
     pub(crate) process_env: Vec<(OsString, OsString)>,
-    pub(crate) jump_store: Option<PathBuf>,
+    /// Host-selected durable history used by `j` queries. `None` is an
+    /// authority decision: do not fall back to another session's store.
+    pub(crate) jump_read_store: Option<PathBuf>,
+    /// Host-selected durable history updated by successful navigation. Child
+    /// evaluators deliberately inherit reads but never this write authority.
+    pub(crate) jump_write_store: Option<PathBuf>,
     pub(crate) oldpwd: Option<PathBuf>,
     pub(crate) dir_stack: Vec<PathBuf>,
 }
@@ -163,6 +168,7 @@ pub(crate) struct ChildExecSeed {
     cwd: PathBuf,
     env: Env,
     process_env: Vec<(OsString, OsString)>,
+    jump_read_store: Option<PathBuf>,
     oldpwd: Option<PathBuf>,
     dir_stack: Vec<PathBuf>,
 }
@@ -175,7 +181,11 @@ impl ExecState {
                 env: Env::root(),
                 cwd,
                 process_env: std::env::vars_os().collect(),
-                jump_store: None,
+                // Preserve the long-standing one-shot `shoal -c 'j query'`
+                // UX. Security-sensitive hosts must call
+                // `disable_jump_history` or install an isolated store.
+                jump_read_store: Some(crate::journal::default_state_dir().join("jump.frecency")),
+                jump_write_store: None,
                 oldpwd: None,
                 dir_stack: Vec::new(),
             },
@@ -210,6 +220,7 @@ impl ExecState {
             cwd: self.shell.cwd.clone(),
             env: self.shell.env.clone(),
             process_env: self.shell.process_env.clone(),
+            jump_read_store: self.shell.jump_read_store.clone(),
             oldpwd: self.shell.oldpwd.clone(),
             dir_stack: self.shell.dir_stack.clone(),
         }
@@ -221,6 +232,7 @@ impl ExecState {
             cwd,
             env,
             process_env,
+            jump_read_store,
             oldpwd,
             dir_stack,
         } = seed;
@@ -232,6 +244,8 @@ impl ExecState {
             child.shell.env = env;
         }
         child.shell.process_env = process_env;
+        child.shell.jump_read_store = jump_read_store;
+        child.shell.jump_write_store = None;
         child.shell.oldpwd = oldpwd;
         child.shell.dir_stack = dir_stack;
         child.control.cancel = cancel;

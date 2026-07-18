@@ -229,6 +229,19 @@ conservative escape/path expansion preflight because its serializer owns table s
 CSV additionally stops at 16,384 rows and 131,072 cells. HTTP only attempts its convenience `.json`
 projection inside the same input/tree walls, so a 64 MiB response body is never accompanied by an
 equally unbounded parsed clone. Any of these walls raises `data_materialization_limit`.
+JSON integer tokens must also fit Shoal's signed 64-bit integer type. Larger integer tokens raise
+`number_range` rather than silently rounding through a float; an HTTP response's convenience
+`.json` projection becomes `null`, while its exact `.body` remains available.
+
+Finite stdin and HTTP request bodies share a 16 MiB eager structured-encoding wall. Strings move
+into the transport, resident bytes remain shared, and CAS-backed captures open an incremental reader
+instead of invoking the full-load interface. Local `.feed` may therefore stream a larger raw/CAS
+payload through its 16-by-64-KiB bounded queue. HTTP request bodies have a separate 16 MiB total wall:
+known-oversize CAS metadata is rejected before opening or connecting, and a plus-one sentinel stops
+an inaccurate/growing reader. Failures are `feed_materialization_limit`, `feed_io`, or
+`http_body_limit`; secret values are never admitted as generic body data. Structured conversion may
+hold the admitted value, its bounded JSON projection, and the bounded output simultaneously (at most
+three 16 MiB payload representations, plus node overhead); it never adds an unbounded final copy.
 
 Structured builtins apply a separate transient result boundary before ordinary outcome wrapping or
 lexical binding. Eager results stop at 16,384 values / 16 MiB retained state with
@@ -246,9 +259,21 @@ Implicit resident methods refuse a declared blob above 16 MiB with `cas_material
 `.load()`/`.bytes()` are the explicit full-allocation escape hatch. Oversized stream lines raise
 `stream_line_limit`.
 
+Live `tail()` applies the same 1 MiB logical-line wall before retaining each line. An oversized or
+unterminated line ends that stream with `stream_line_limit`. Tail rotation uses stable file identity
+on Unix in addition to length, avoiding prefix loss when a longer inode replaces the watched path.
+
+Undo prior-state capture reads at most 8 MiB plus one sentinel byte through the injected filesystem
+port. It accepts only a stable before/after file snapshot; oversized, sparse, growing, or replaced
+files receive no replayable inverse rather than a truncated/stale one. On Unix production reads use
+opened-descriptor metadata and also verify that the path still names that object. Compatibility
+adapters validate path metadata around their mediated `open_read`, leaving the adapter-level
+stat/open race documented rather than escaping the port.
+
 Limit failures are catchable language errors: `binding_name_limit`, `binding_identity_limit`,
 `binding_value_limit`, `binding_aggregate_limit`, `data_materialization_limit`,
-`builtin_output_limit`, or `builtin_work_limit`. Runtime handles such as closures, tasks, and
+`feed_materialization_limit`, `http_body_limit`, `builtin_output_limit`, or `builtin_work_limit`.
+Runtime handles such as closures, tasks, and
 streams receive a conservative fixed charge here and remain subject to their own subsystem quotas;
 this is accounting protection, not a complete process-memory meter. Use an OS memory limit for
 mutually hostile workloads.

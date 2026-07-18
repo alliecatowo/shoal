@@ -1,35 +1,28 @@
-//! JSON conversion (`json_to_value`/`value_to_json`), moved verbatim out of
-//! `lib.rs`.
+//! Fallible JSON conversion plus exact source-token numeric admission.
 
 use super::*;
 
-pub fn json_to_value(j: &serde_json::Value) -> Value {
-    match j {
+mod number_tokens;
+pub use number_tokens::preflight_json_numbers;
+
+pub fn json_to_value(j: &serde_json::Value) -> VResult<Value> {
+    Ok(match j {
         serde_json::Value::Null => Value::Null,
         serde_json::Value::Bool(b) => Value::Bool(*b),
         serde_json::Value::Number(n) => {
-            // KNOWN LIMITATION (a deliberate type-system decision remains): `Value::Int`
-            // is `i64` and shoal has no bignum (site/content/internals/language-conformance-contract.md). A JSON integer in
-            // (i64::MAX, u64::MAX] — e.g. a 64-bit unsigned id like
-            // 18446744073709551615 — does not fit i64, so it falls through to
-            // `Value::Float`, which loses integer precision above 2^53. There
-            // is no lossless representation for it within `Value` today: the
-            // only honest alternatives are this lossy float or an out-of-range
-            // parse error, and neither is a clear win (erroring would reject an
-            // otherwise-valid JSON document). `as_i64()` already accepts every
-            // value that genuinely fits i64, so this is not a missed-case bug —
-            // it is a real type-system limitation left for a deliberate design
-            // call (add a u64/bigint Value variant, or define an explicit
-            // policy) rather than papered over with a hack here.
             if let Some(i) = n.as_i64() {
                 Value::Int(i)
+            } else if n.as_u64().is_some() {
+                return Err(json_number_range(n));
+            } else if let Some(value) = n.as_f64().filter(|value| value.is_finite()) {
+                Value::Float(value)
             } else {
-                Value::Float(n.as_f64().unwrap_or(f64::NAN))
+                return Err(json_number_range(n));
             }
         }
         serde_json::Value::String(s) => Value::Str(s.clone()),
         serde_json::Value::Array(xs) => {
-            let vals: Vec<Value> = xs.iter().map(json_to_value).collect();
+            let vals = xs.iter().map(json_to_value).collect::<VResult<Vec<_>>>()?;
             // A uniform non-empty array of objects is a table.
             if !vals.is_empty() && vals.iter().all(|v| matches!(v, Value::Record(_))) {
                 Value::Table(
@@ -46,10 +39,20 @@ pub fn json_to_value(j: &serde_json::Value) -> Value {
         }
         serde_json::Value::Object(m) => Value::Record(
             m.iter()
-                .map(|(k, v)| (k.clone(), json_to_value(v)))
-                .collect(),
+                .map(|(key, value)| Ok((key.clone(), json_to_value(value)?)))
+                .collect::<VResult<_>>()?,
         ),
-    }
+    })
+}
+
+fn json_number_range(number: &serde_json::Number) -> ErrorVal {
+    ErrorVal::new(
+        "number_range",
+        format!(
+            "JSON number `{number}` is outside Shoal's signed 64-bit integer / finite-float range"
+        ),
+    )
+    .with_hint("encode integer identifiers outside the signed 64-bit range as JSON strings")
 }
 
 pub fn value_to_json(v: &Value) -> VResult<serde_json::Value> {
@@ -171,5 +174,13 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert_eq!(j["$"], "bytes_ref");
         assert_eq!(j["len"], 11);
+    }
+
+    #[test]
+    fn json_to_value_rejects_unsigned_integers_instead_of_rounding() {
+        let number = serde_json::Value::Number(serde_json::Number::from(u64::MAX));
+        let error = json_to_value(&number).unwrap_err();
+        assert_eq!(error.code, "number_range");
+        assert!(error.msg.contains("18446744073709551615"));
     }
 }

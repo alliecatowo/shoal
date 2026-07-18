@@ -211,14 +211,17 @@ accDescr: Shows the components and relationships described in Tail source.
   Positioned --> Read
   Read --> Wait: no complete line
   Wait --> Read: modify/create event
-  Read --> Restart: metadata length < position
+  Read --> Restart: length shrank or file identity changed
   Restart --> Read: position = 0
   Read --> [*]: consumer disconnected
 ```
 
-Line bytes decode with UTF-8 loss replacement and trim trailing newline/CR. On a full 64-slot buffer,
-the line is dropped and a counter increments. Once capacity returns, a common gap record is emitted
-before later lines:
+Line bytes decode with UTF-8 loss replacement and trim trailing newline/CR. A logical line is
+admitted incrementally against a 1 MiB wall; the worker retains at most that wall plus the reader's
+fixed buffer and never calls an allocating unbounded `read_until`. A longer line, including an
+unterminated hostile line, emits `stream_line_limit` and terminates that tail stream. On a full
+64-slot buffer, the line is dropped and a counter increments. Once capacity returns, a common gap
+record is emitted before later lines:
 
 ```text
 { marker: "stream_gap", reason: "tail_overflow", dropped: n,
@@ -229,8 +232,10 @@ Therefore the nominal `stream<str>` widens at runtime to include marker records;
 inspect `marker` or shape if exact type homogeneity matters.
 
 Errors reopening/seeking during later reads are often treated best-effort and can be retried on a
-future event, while watcher setup/errors surface explicitly. Rotation is inferred when metadata
-length shrinks; rename/replacement behavior beyond that depends on platform `notify` semantics.
+future event, while watcher setup/errors surface explicitly. On Unix, rotation compares stable
+device/inode identity as well as length, so a longer replacement restarts at byte zero instead of
+skipping its prefix. Platforms whose filesystem adapter cannot provide stable identity retain the
+length fallback; event delivery still depends on platform `notify` semantics.
 
 ## Lazy combinator ledger
 

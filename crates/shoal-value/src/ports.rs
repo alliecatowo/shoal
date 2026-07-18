@@ -15,7 +15,7 @@
 
 use crate::{Record, Value};
 use std::fs;
-use std::io;
+use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -36,6 +36,93 @@ static ATOMIC_REPLACE_SEQ: AtomicU64 = AtomicU64::new(1);
 pub trait ReadSeek: io::Read + io::Seek {}
 impl<T: io::Read + io::Seek> ReadSeek for T {}
 
+/// Bounded metadata used to detect file replacement and mutation around a
+/// mediated read. `identity` is a stable filesystem object identity on Unix
+/// (`st_dev`, `st_ino`); adapters on other platforms may leave it absent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FsFileSnapshot {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    identity: Option<(u64, u64)>,
+}
+
+impl FsFileSnapshot {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        #[cfg(unix)]
+        let identity = {
+            use std::os::unix::fs::MetadataExt as _;
+            Some((metadata.dev(), metadata.ino()))
+        };
+        #[cfg(not(unix))]
+        let identity = None;
+
+        Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            identity,
+        }
+    }
+
+    /// Length observed with this metadata snapshot.
+    #[must_use]
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// Whether the observed file was empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Whether both snapshots identify the same filesystem object. Platforms
+    /// without a stable object identity conservatively return `true`; callers
+    /// can still detect truncation by comparing [`len`](Self::len).
+    #[must_use]
+    pub fn same_file(&self, other: &Self) -> bool {
+        match (self.identity, other.identity) {
+            (Some(left), Some(right)) => left == right,
+            _ => true,
+        }
+    }
+}
+
+fn snapshot_limit_error(limit: usize) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("file exceeds the {limit}-byte stable-read limit"),
+    )
+}
+
+fn snapshot_changed_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "file changed while its stable snapshot was being read",
+    )
+}
+
+fn collect_bounded_stable(
+    mut reader: impl io::Read,
+    before: &FsFileSnapshot,
+    limit: usize,
+    after: impl FnOnce() -> io::Result<FsFileSnapshot>,
+) -> io::Result<Vec<u8>> {
+    if before.len() > limit as u64 {
+        return Err(snapshot_limit_error(limit));
+    }
+    let mut bytes = Vec::with_capacity((before.len() as usize).min(limit));
+    (&mut reader)
+        .take(limit.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)?;
+    if before != &after()? {
+        return Err(snapshot_changed_error());
+    }
+    if bytes.len() > limit {
+        return Err(snapshot_limit_error(limit));
+    }
+    Ok(bytes)
+}
+
 /// Filesystem effects used by the evaluator's builtins, redirects, script
 /// loading, and journal snapshots. Every method returns [`io::Result`] so the
 /// call-sites keep their existing `io::Error`-based error mapping unchanged.
@@ -53,6 +140,23 @@ pub trait Fs: Send + Sync {
     /// the `tail` source's incremental read loop, which seeks to EOF / a saved
     /// byte offset and then reads whole lines as they arrive.
     fn open_read(&self, path: &Path) -> io::Result<Box<dyn ReadSeek + Send>>;
+    /// Capture bounded metadata for rotation/change detection. The default is
+    /// capability-preserving and uses [`metadata`](Fs::metadata); production
+    /// adapters can supply a stable object identity through `FsFileSnapshot`.
+    fn file_snapshot(&self, path: &Path) -> io::Result<FsFileSnapshot> {
+        self.metadata(path)
+            .map(|metadata| FsFileSnapshot::from_metadata(&metadata))
+    }
+    /// Read at most `limit + 1` bytes and accept the result only when the file
+    /// is unchanged across the read. The compatibility default remains fully
+    /// mediated through this port. It detects a path swap by comparing the
+    /// before/after snapshots; [`StdFs`] strengthens this by taking both main
+    /// snapshots from the opened descriptor.
+    fn read_bounded_stable(&self, path: &Path, limit: usize) -> io::Result<Vec<u8>> {
+        let before = self.file_snapshot(path)?;
+        let reader = self.open_read(path)?;
+        collect_bounded_stable(reader, &before, limit, || self.file_snapshot(path))
+    }
     /// Write bytes to a file, truncating it first (`std::fs::write`).
     fn write(&self, path: &Path, data: &[u8]) -> io::Result<()>;
     /// Append bytes to a file, creating it if absent (`OpenOptions` create +
@@ -235,6 +339,28 @@ impl Fs for StdFs {
     }
     fn open_read(&self, path: &Path) -> io::Result<Box<dyn ReadSeek + Send>> {
         Ok(Box::new(fs::File::open(path)?))
+    }
+    fn read_bounded_stable(&self, path: &Path, limit: usize) -> io::Result<Vec<u8>> {
+        use io::Read as _;
+
+        let mut file = fs::File::open(path)?;
+        let before = FsFileSnapshot::from_metadata(&file.metadata()?);
+        if before.len() > limit as u64 {
+            return Err(snapshot_limit_error(limit));
+        }
+        let mut bytes = Vec::with_capacity((before.len() as usize).min(limit));
+        (&mut file)
+            .take(limit.saturating_add(1) as u64)
+            .read_to_end(&mut bytes)?;
+        let after = FsFileSnapshot::from_metadata(&file.metadata()?);
+        let path_after = self.file_snapshot(path)?;
+        if before != after || !after.same_file(&path_after) || after != path_after {
+            return Err(snapshot_changed_error());
+        }
+        if bytes.len() > limit {
+            return Err(snapshot_limit_error(limit));
+        }
+        Ok(bytes)
     }
     fn write(&self, path: &Path, data: &[u8]) -> io::Result<()> {
         fs::write(path, data)
@@ -427,6 +553,29 @@ impl Fs for StdFs {
 #[cfg(test)]
 mod fs_tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    struct GrowingReader {
+        inner: io::Cursor<Vec<u8>>,
+        grew: Arc<AtomicBool>,
+    }
+
+    impl io::Read for GrowingReader {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            self.grew.store(true, Ordering::SeqCst);
+            self.inner.read(bytes)
+        }
+    }
+
+    struct EndlessReader;
+
+    impl io::Read for EndlessReader {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            bytes.fill(b'x');
+            Ok(bytes.len())
+        }
+    }
 
     struct TestDir(PathBuf);
 
@@ -482,6 +631,75 @@ mod fs_tests {
             replacement_temps(&root.0).is_empty(),
             "failed atomic replacement leaked a temporary file"
         );
+    }
+
+    #[test]
+    fn stable_bounded_read_accepts_exact_boundary_and_rejects_sparse_length() {
+        let root = TestDir::new();
+        let exact = root.0.join("exact");
+        fs::write(&exact, b"12345678").unwrap();
+        assert_eq!(StdFs.read_bounded_stable(&exact, 8).unwrap(), b"12345678");
+
+        let sparse = root.0.join("sparse");
+        let file = fs::File::create(&sparse).unwrap();
+        file.set_len(9).unwrap();
+        let error = StdFs.read_bounded_stable(&sparse, 8).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("8-byte"));
+    }
+
+    #[test]
+    fn stable_read_bounds_a_hostile_reader_and_rejects_growth_or_stat_read_swap() {
+        let initial = FsFileSnapshot {
+            len: 3,
+            modified: None,
+            identity: Some((7, 11)),
+        };
+        let error =
+            collect_bounded_stable(EndlessReader, &initial, 8, || Ok(initial.clone())).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("8-byte"));
+
+        let grew = Arc::new(AtomicBool::new(false));
+        let reader = GrowingReader {
+            inner: io::Cursor::new(b"abc".to_vec()),
+            grew: grew.clone(),
+        };
+        let error = collect_bounded_stable(reader, &initial, 8, || {
+            assert!(grew.load(Ordering::SeqCst));
+            Ok(FsFileSnapshot {
+                len: 4,
+                ..initial.clone()
+            })
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("changed"));
+
+        let error = collect_bounded_stable(io::Cursor::new(b"abc"), &initial, 8, || {
+            Ok(FsFileSnapshot {
+                identity: Some((7, 12)),
+                ..initial.clone()
+            })
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("changed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_snapshot_identity_detects_longer_inode_replacement() {
+        let root = TestDir::new();
+        let target = root.0.join("target");
+        let replacement = root.0.join("replacement");
+        fs::write(&target, b"old").unwrap();
+        fs::write(&replacement, b"a much longer replacement").unwrap();
+        let before = StdFs.file_snapshot(&target).unwrap();
+        fs::rename(&replacement, &target).unwrap();
+        let after = StdFs.file_snapshot(&target).unwrap();
+        assert!(!before.same_file(&after));
+        assert!(after.len() > before.len());
     }
 
     #[test]
@@ -750,12 +968,37 @@ pub trait BytesLoad: Send + Sync {
     /// (a missing/corrupt CAS blob); the caller maps them to an `io_error`.
     fn load(&self) -> std::io::Result<Vec<u8>>;
 
-    /// Open a bounded-memory reader over the content. Adapters backed by a
-    /// real blob store override this to stream; the compatibility default
-    /// materializes once and wraps a cursor, preserving existing embedders.
+    /// Open a bounded-memory reader over the content. The default fails closed:
+    /// silently implementing an incremental consumer by calling [`load`](Self::load)
+    /// would reintroduce whole-blob materialization at `.feed`, stream, save,
+    /// and HTTP boundaries. Blob-store adapters must provide a real reader.
     fn open(&self) -> std::io::Result<Box<dyn std::io::Read + Send>> {
-        self.load()
-            .map(|bytes| Box::new(std::io::Cursor::new(bytes)) as Box<dyn std::io::Read + Send>)
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "this CAS adapter does not provide incremental reads",
+        ))
+    }
+}
+
+#[cfg(test)]
+mod bytes_load_tests {
+    use super::BytesLoad;
+
+    struct MaterializingOnly;
+
+    impl BytesLoad for MaterializingOnly {
+        fn load(&self) -> std::io::Result<Vec<u8>> {
+            Ok(vec![1, 2, 3])
+        }
+    }
+
+    #[test]
+    fn materializing_adapter_cannot_masquerade_as_incremental() {
+        let error = match MaterializingOnly.open() {
+            Ok(_) => panic!("the default reader must fail closed"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
     }
 }
 
