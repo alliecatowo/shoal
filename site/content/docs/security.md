@@ -178,7 +178,7 @@ $SHOAL_TOKEN_STORE
 # otherwise ~/.local/state/shoal/tokens.json
 ```
 
-The kernel does not read `SHOAL_TOKEN_STORE`; it opens `<--state-dir>/tokens.json`. Pointing the CLI at an override does nothing for a kernel using another state directory. Align the paths deliberately.
+The CLI and kernel share the nonempty `SHOAL_TOKEN_STORE` override. The kernel additionally accepts `--token-store`, which wins over the environment; without either override it opens `<--state-dir>/tokens.json`. Empty overrides are ignored. Relative paths resolve from each process's startup directory, so use an absolute override for supervised deployments.
 
 ## Leash policy
 

@@ -134,7 +134,7 @@ Shell, history, and doctor share the XDG state fallback and layered `journal.sta
 | `SHOAL_SESSION` | MCP attachment session. |
 | `SHOAL_TOKEN` | MCP bearer token—secret, never log. |
 | `SHOAL_NO_AUTOSTART` | Nonempty disables MCP's detached kernel startup. |
-| `SHOAL_TOKEN_STORE` | `shoal-token` CLI store override; kernel ignores it. |
+| `SHOAL_TOKEN_STORE` | Shared `shoal-token`/kernel credential-store override; kernel `--token-store` wins. |
 | `SHOAL_KERNEL` | Main config/env compatibility setting for kernel enablement. |
 | `SHOAL_KERNEL_SESSION` | Main config/env compatibility setting for kernel session. |
 | `SHOAL_LEASH_POLICY` | Main configuration override for policy path where supported. |

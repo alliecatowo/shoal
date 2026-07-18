@@ -188,3 +188,37 @@ fn ephemeral_kernel_refuses_token_admin_even_for_embedded_human() {
     drop(reader);
     thread.join().unwrap();
 }
+
+#[test]
+fn durable_kernel_authenticates_against_the_explicit_authority_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let authority = dir.path().join("authority/tokens.json");
+    let mut store = TokenStore::open(&authority).unwrap();
+    let bearer = store
+        .create(
+            "agent:separate-authority".into(),
+            "default".into(),
+            Vec::new(),
+            None,
+        )
+        .unwrap()
+        .0;
+    let kernel = Kernel::open_with_policy_and_token_store(
+        &state,
+        &authority,
+        Policy::permissive("agent:separate-authority"),
+    )
+    .unwrap();
+    let (mut client, mut reader, thread) = spawn_public(&kernel);
+    attach_bearer(&mut client, &mut reader, &bearer);
+    assert!(
+        call(&mut client, &mut reader, 2, "kernel.status", json!({}))
+            .error
+            .is_none()
+    );
+    assert!(!state.join("tokens.json").exists());
+    drop(client);
+    drop(reader);
+    thread.join().unwrap();
+}

@@ -87,20 +87,22 @@ Any nonempty value disables it; an empty variable does not.
 shoal-kernel \
   --session work \
   --state-dir "$HOME/.local/state/shoal" \
+  --token-store "$HOME/.local/state/shoal/tokens.json" \
   --policy "$HOME/.config/shoal/leash.toml"
 ```
 
 Command-line interface:
 
 ```text
-shoal-kernel [--session NAME] [--socket PATH] [--state-dir PATH] [--policy FILE] [LIMIT FLAGS]
+shoal-kernel [--session NAME] [--socket PATH] [--state-dir PATH] [--token-store PATH] [--policy FILE] [LIMIT FLAGS]
 ```
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `--session NAME` | `default` | Used only to derive the default socket filename. Clients still name the attached session. |
 | `--socket PATH` | runtime-derived | Unix socket to bind. |
-| `--state-dir PATH` | XDG-derived | Journal, CAS, token store, and supporting durable state. |
+| `--state-dir PATH` | XDG-derived | Journal, CAS, default token-store parent, and supporting durable state. |
+| `--token-store PATH` | environment/state-derived | Exact credential authority file. |
 | `--policy FILE` | none | Load a Leash policy instead of the local-human permissive default. |
 
 Limit flags cover connections, retained sessions, tasks per owner, PTYs per owner/principal/kernel,
@@ -232,7 +234,7 @@ $XDG_STATE_HOME/shoal/tokens.json
 # or ~/.local/state/shoal/tokens.json
 ```
 
-Override both the CLI and the kernel's expected location carefully. `shoal-token` honors `SHOAL_TOKEN_STORE`, while `shoal-kernel` always opens `<state-dir>/tokens.json`; if those differ, newly created tokens will not authenticate to that kernel.
+The CLI and kernel both honor nonempty `SHOAL_TOKEN_STORE`. Kernel `--token-store` wins over that environment; without either override the kernel uses `<state-dir>/tokens.json`. Prefer an absolute shared override when the CLI and supervised daemon have different startup directories.
 
 The bearer secret is 32 random bytes encoded URL-safe without padding. The store persists a keyed BLAKE3 digest rather than the secret and forces file mode `0600`. Token IDs are short digest prefixes used for listing/revocation. TTL is seconds and is converted to an absolute nanosecond expiration.
 

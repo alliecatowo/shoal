@@ -622,6 +622,75 @@ fn daemon_binds_secure_socket_and_attaches() {
     );
     assert!(!socket.exists());
 }
+
+#[test]
+fn daemon_honors_the_shared_token_store_environment_override() {
+    let _serialize = ONLY_ONE_DAEMON_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("run/override.sock");
+    let state = temp.path().join("state");
+    let authority = temp.path().join("authority/tokens.json");
+    let token = shoal_auth::TokenStore::open(&authority)
+        .unwrap()
+        .create(
+            format!("uid:{}", unsafe { geteuid() }),
+            "supervisor".into(),
+            Vec::new(),
+            None,
+        )
+        .unwrap()
+        .0;
+    let (stderr_file, stderr_path) = daemon_stderr_file(temp.path());
+    let mut child = Command::new(env!("CARGO_BIN_EXE_shoal-kernel"))
+        .args([
+            "--socket",
+            socket.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+        ])
+        .env("SHOAL_TOKEN_STORE", &authority)
+        .stdout(Stdio::null())
+        .stderr(stderr_file)
+        .spawn()
+        .unwrap();
+    wait_for_socket(&socket, &stderr_path);
+    assert!(
+        !state.join("tokens.json").exists(),
+        "daemon opened the fallback authority instead of the shared override"
+    );
+
+    let mut stream = UnixStream::connect(&socket).unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    write_frame(
+        &mut stream,
+        &Request {
+            jsonrpc: JSONRPC.into(),
+            id: 1.into(),
+            method: "session.attach".into(),
+            params: credentialed_admin_attach_params(&token),
+        },
+    )
+    .unwrap();
+    assert!(recv(&mut reader).error.is_none());
+    write_frame(
+        &mut stream,
+        &Request {
+            jsonrpc: JSONRPC.into(),
+            id: 2.into(),
+            method: "kernel.shutdown".into(),
+            params: serde_json::json!({}),
+        },
+    )
+    .unwrap();
+    assert_eq!(recv(&mut reader).result.unwrap()["stopping"], true);
+    assert!(
+        child.wait().unwrap().success(),
+        "daemon stderr:\n{}",
+        read_daemon_stderr(&stderr_path)
+    );
+}
 unsafe extern "C" {
     fn kill(pid: i32, signal: i32) -> i32;
     fn geteuid() -> u32;

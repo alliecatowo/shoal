@@ -1,5 +1,4 @@
 use shoal_auth::TokenStore;
-use std::path::PathBuf;
 fn main() {
     if let Err(e) = run() {
         eprintln!("shoal-token: {e}");
@@ -19,13 +18,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         println!("shoal-token {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
-    let path = std::env::var_os("SHOAL_TOKEN_STORE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            shoal_paths::ShoalPaths::discover()
-                .state_dir()
-                .join("tokens.json")
-        });
+    let paths = shoal_paths::ShoalPaths::discover();
+    let path = paths.token_store(paths.state_dir());
     let mut s = TokenStore::open(path)?;
     match cmd.as_str() {
         "create" => {

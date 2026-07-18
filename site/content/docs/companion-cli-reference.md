@@ -118,14 +118,15 @@ Relative `journal.state_dir` and `SHOAL_SECRET_DIR` values resolve from each pro
 ## `shoal-kernel`
 
 ```text
-shoal-kernel [--session NAME] [--socket PATH] [--state-dir PATH] [--policy FILE]
+shoal-kernel [--session NAME] [--socket PATH] [--state-dir PATH] [--token-store PATH] [--policy FILE]
 ```
 
 | Option | Default | Notes |
 | --- | --- | --- |
 | `--session NAME` | `default` | Derives default socket filename only; clients choose attached session. |
 | `--socket PATH` | runtime discovery | Explicit Unix socket path. |
-| `--state-dir PATH` | XDG state | Journal/CAS/tokens. |
+| `--state-dir PATH` | XDG state | Journal/CAS and the default token-store parent. |
+| `--token-store PATH` | `SHOAL_TOKEN_STORE`, then `<state-dir>/tokens.json` | Exact credential authority file. |
 | `--policy FILE` | permissive local human | Explicit Leash TOML; load/parse failure is fatal. |
 
 Example:
@@ -321,7 +322,7 @@ Create/revoke is visible to a running kernel without restart. Writers take an ex
 reload before mutation; the kernel revalidates an attached bearer from a fresh shared-locked snapshot
 before every request. Revocation or expiry therefore fails the next request and clears the attachment.
 
-The kernel always uses `<--state-dir>/tokens.json`, ignoring `SHOAL_TOKEN_STORE`; align the paths.
+The CLI and kernel share token-store discovery. Kernel precedence is explicit `--token-store`, then nonempty `SHOAL_TOKEN_STORE`, then `<--state-dir>/tokens.json`. The CLI uses the same environment override, then the shared XDG state default. Empty overrides are ignored. Prefer absolute overrides so supervised processes with different startup directories cannot diverge.
 
 ## `shoal-secret`
 

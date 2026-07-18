@@ -176,8 +176,8 @@ Full impact/mitigation: [Security and trust boundaries](@/docs/security.md).
 ## Token and policy limitations
 
 - `shoal-token` profile and `--cap` entries are attachment metadata, not authorization grants; Leash evaluates only the principal's policy entry.
-- The daemon reads `tokens.json` at startup and does not reload it. Create/revoke requires kernel restart; expiry is checked live.
-- `SHOAL_TOKEN_STORE` affects the CLI but not the kernel, which always uses `<state-dir>/tokens.json`.
+- The daemon validates from a fresh shared-locked token snapshot on attach and before every attached request. Create is visible immediately; revoke/expiry invalidates the next request; store corruption or I/O failure clears authority fail-closed.
+- CLI and kernel share nonempty `SHOAL_TOKEN_STORE`; kernel `--token-store` has highest precedence, then the environment, then `<state-dir>/tokens.json`. Relative overrides can still diverge across startup directories.
 - The default no-`--policy` durable kernel gives tokenless public clients the restricted `agent:mcp` identity; the private embedded-human REPL remains a distinct trusted surface.
 - Leash effect analysis describes understood behavior; arbitrary native programs can do more unless an OS boundary prevents it.
 - Filesystem sandboxing can be active on Linux Landlock/macOS Seatbelt. Network enforcement is absent; spawn hash checking has a pre-exec TOCTOU window.

@@ -183,40 +183,11 @@ impl Kernel {
 
     pub fn open(state_dir: impl AsRef<Path>) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
         let state_dir = state_dir.as_ref();
-        let journal = Journal::open(state_dir)?;
-        let events = EventBus::default();
-        let limits = Limits::default();
-        Ok(Arc::new(Self {
-            sessions: SessionRegistry::new(limits.max_sessions),
-            connections: ConnectionRegistry::new(
-                limits.max_connections,
-                limits.frame_read_timeout_ms,
-            ),
-            max_subscriptions_per_session: AtomicUsize::new(limits.max_subscriptions_per_session),
-            max_blob_decompressions_per_window: AtomicUsize::new(
-                limits.max_blob_decompressions_per_window,
-            ),
-            blob_decompression_window_ms: AtomicU64::new(limits.blob_decompression_window_ms),
-            journal: Mutex::new(journal),
-            state_dir: Some(state_dir.to_path_buf()),
-            policy: permissive_policy(),
-            plans: PlanRegistry::new(),
-            tasks: TaskRegistry::new(limits.max_tasks_per_session),
-            ptys: Arc::new(PtyRegistry::new(
-                limits.max_ptys_per_session,
-                limits.max_ptys_per_principal,
-                limits.max_ptys_global,
-            )),
-            events: Arc::new(events),
-            auth: Some(Mutex::new(TokenStore::open(state_dir.join("tokens.json"))?)),
-            shutdown_requested: AtomicBool::new(false),
-            started_at: Instant::now(),
-            allow_self_ack: AtomicBool::new(self_ack_from_env()),
-            #[cfg(test)]
-            fail_approval_audit: AtomicBool::new(false),
-            #[cfg(test)]
-            panic_approval_audit: AtomicBool::new(false),
-        }))
+        Self::open_durable(
+            state_dir,
+            &state_dir.join("tokens.json"),
+            permissive_policy(),
+        )
     }
 
     pub fn open_with_policy(
@@ -224,6 +195,36 @@ impl Kernel {
         policy: Policy,
     ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
         let state_dir = state_dir.as_ref();
+        Self::open_durable(state_dir, &state_dir.join("tokens.json"), policy)
+    }
+
+    /// Open a durable kernel whose credential authority file is deliberately
+    /// separate from the journal/CAS state root.
+    pub fn open_with_token_store(
+        state_dir: impl AsRef<Path>,
+        token_store: impl AsRef<Path>,
+    ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
+        Self::open_durable(
+            state_dir.as_ref(),
+            token_store.as_ref(),
+            permissive_policy(),
+        )
+    }
+
+    /// Policy-bearing counterpart to [`Kernel::open_with_token_store`].
+    pub fn open_with_policy_and_token_store(
+        state_dir: impl AsRef<Path>,
+        token_store: impl AsRef<Path>,
+        policy: Policy,
+    ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
+        Self::open_durable(state_dir.as_ref(), token_store.as_ref(), policy)
+    }
+
+    fn open_durable(
+        state_dir: &Path,
+        token_store: &Path,
+        policy: Policy,
+    ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
         let journal = Journal::open(state_dir)?;
         let events = EventBus::default();
         let limits = Limits::default();
@@ -249,7 +250,7 @@ impl Kernel {
                 limits.max_ptys_global,
             )),
             events: Arc::new(events),
-            auth: Some(Mutex::new(TokenStore::open(state_dir.join("tokens.json"))?)),
+            auth: Some(Mutex::new(TokenStore::open(token_store)?)),
             shutdown_requested: AtomicBool::new(false),
             started_at: Instant::now(),
             allow_self_ack: AtomicBool::new(self_ack_from_env()),

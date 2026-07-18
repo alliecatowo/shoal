@@ -14,6 +14,7 @@ pub struct Inputs {
     pub explicit_state_dir: Option<OsString>,
     pub explicit_socket: Option<OsString>,
     pub explicit_secret_dir: Option<OsString>,
+    pub explicit_token_store: Option<OsString>,
 }
 
 impl Inputs {
@@ -28,6 +29,7 @@ impl Inputs {
             explicit_state_dir: std::env::var_os("SHOAL_STATE_DIR"),
             explicit_socket: std::env::var_os("SHOAL_SOCKET"),
             explicit_secret_dir: std::env::var_os("SHOAL_SECRET_DIR"),
+            explicit_token_store: std::env::var_os("SHOAL_TOKEN_STORE"),
         }
     }
 }
@@ -40,6 +42,7 @@ pub struct ShoalPaths {
     runtime_dir: PathBuf,
     explicit_socket: Option<PathBuf>,
     secret_dir: PathBuf,
+    explicit_token_store: Option<PathBuf>,
 }
 
 impl ShoalPaths {
@@ -105,6 +108,10 @@ impl ShoalPaths {
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from),
             secret_dir,
+            explicit_token_store: inputs
+                .explicit_token_store
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from),
         }
     }
 
@@ -131,6 +138,14 @@ impl ShoalPaths {
     /// accidentally selecting the process working directory.
     pub fn secret_dir(&self) -> &Path {
         &self.secret_dir
+    }
+
+    /// Token authority file for a durable kernel state root. The same
+    /// `SHOAL_TOKEN_STORE` override is consumed by the kernel and `shoal-token`.
+    pub fn token_store(&self, state_dir: &Path) -> PathBuf {
+        self.explicit_token_store
+            .clone()
+            .unwrap_or_else(|| state_dir.join("tokens.json"))
     }
 
     pub fn socket(&self, session: &str) -> PathBuf {
@@ -249,6 +264,27 @@ mod tests {
     }
 
     #[test]
+    fn explicit_token_store_is_shared_and_state_relative_by_default() {
+        let overridden = ShoalPaths::resolve(
+            Inputs {
+                explicit_token_store: Some("relative/token-authority.json".into()),
+                ..Inputs::default()
+            },
+            7,
+        );
+        assert_eq!(
+            overridden.token_store(Path::new("/ignored-state")),
+            Path::new("relative/token-authority.json")
+        );
+
+        let defaulted = ShoalPaths::resolve(Inputs::default(), 7);
+        assert_eq!(
+            defaulted.token_store(Path::new("/kernel-state")),
+            Path::new("/kernel-state/tokens.json")
+        );
+    }
+
+    #[test]
     fn empty_environment_values_do_not_override_fallbacks() {
         let paths = ShoalPaths::resolve(
             Inputs {
@@ -258,6 +294,7 @@ mod tests {
                 tmpdir: Some(OsString::new()),
                 explicit_socket: Some(OsString::new()),
                 explicit_secret_dir: Some(OsString::new()),
+                explicit_token_store: Some(OsString::new()),
                 ..Inputs::default()
             },
             9,
@@ -273,6 +310,10 @@ mod tests {
         assert_eq!(
             paths.secret_dir(),
             Path::new("/home/a/.local/share/shoal/secrets")
+        );
+        assert_eq!(
+            paths.token_store(Path::new("/state")),
+            Path::new("/state/tokens.json")
         );
     }
 }

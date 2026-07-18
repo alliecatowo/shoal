@@ -495,19 +495,18 @@ and start/supervise `shoal-kernel --policy ... --state-dir ...` yourself.
 
 ### New token is rejected
 
-Check store alignment and restart:
+Check store alignment:
 
 ```bash
 printf 'CLI store=%s\n' "${SHOAL_TOKEN_STORE:-${XDG_STATE_HOME:-$HOME/.local/state}/shoal/tokens.json}"
 ```
 
-Kernel validation reads `<--state-dir>/tokens.json` under a shared lock. A newly created token is
-visible immediately; if attach still fails, confirm the CLI and kernel use the same state path.
+Kernel validation reads explicit `--token-store`, then nonempty `SHOAL_TOKEN_STORE`, then `<--state-dir>/tokens.json` under a shared lock. A newly created token is visible immediately; if attach still fails, confirm the CLI and supervised kernel inherited the same absolute override.
 
 ### Revoked token still works
 
 Revocation is checked before every attached request. The next request fails `AUTH_FAILED` and clears
-the attachment; if it does not, the CLI changed a different token-store path.
+the attachment; if it does not, compare the kernel's explicit flag/environment with the CLI override.
 
 ### Token lists `--cap`, but action denied
 

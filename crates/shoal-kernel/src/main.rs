@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 const EMBEDDED_READY_FRAME: &[u8] = b"{\"shoal_embedded\":{\"ready\":true,\"protocol\":1}}\n";
-const HELP: &str = "Shoal resident kernel\n\nUsage: shoal-kernel [OPTIONS]\n\nOptions:\n  --session NAME\n  --socket PATH\n  --state-dir PATH\n  --policy FILE\n  --embedded-fd FD\n  --max-connections N\n  --max-sessions N\n  --max-tasks-per-session N\n  --max-ptys-per-session N\n  --max-ptys-per-principal N\n  --max-ptys-global N\n  --max-subscriptions-per-session N\n  --max-blob-decompressions-per-window N\n  --blob-decompression-window-ms N\n  --frame-read-timeout-ms N\n  -h, --help\n  -V, --version";
+const HELP: &str = "Shoal resident kernel\n\nUsage: shoal-kernel [OPTIONS]\n\nOptions:\n  --session NAME\n  --socket PATH\n  --state-dir PATH\n  --token-store PATH\n  --policy FILE\n  --embedded-fd FD\n  --max-connections N\n  --max-sessions N\n  --max-tasks-per-session N\n  --max-ptys-per-session N\n  --max-ptys-per-principal N\n  --max-ptys-global N\n  --max-subscriptions-per-session N\n  --max-blob-decompressions-per-window N\n  --blob-decompression-window-ms N\n  --frame-read-timeout-ms N\n  -h, --help\n  -V, --version";
 
 fn main() {
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
@@ -34,11 +34,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let paths = shoal_paths::ShoalPaths::discover();
     let state = args
         .state_dir
+        .as_ref()
+        .cloned()
         .unwrap_or_else(|| paths.state_dir().to_path_buf());
+    let token_store = args
+        .token_store
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(|| paths.token_store(&state));
     let kernel = if let Some(path) = args.policy {
-        Kernel::open_with_policy(&state, Policy::load(&path)?)?
+        Kernel::open_with_policy_and_token_store(&state, &token_store, Policy::load(&path)?)?
     } else {
-        Kernel::open(&state)?
+        Kernel::open_with_token_store(&state, &token_store)?
     };
     kernel.configure_limits(limits);
     if let Some(fd) = args.embedded_fd {
@@ -198,6 +205,7 @@ struct Args {
     session: String,
     socket: Option<PathBuf>,
     state_dir: Option<PathBuf>,
+    token_store: Option<PathBuf>,
     policy: Option<PathBuf>,
     embedded_fd: Option<i32>,
     max_connections: Option<usize>,
@@ -217,6 +225,7 @@ impl Args {
             session: "default".into(),
             socket: None,
             state_dir: None,
+            token_store: None,
             policy: None,
             embedded_fd: None,
             max_connections: None,
@@ -250,6 +259,9 @@ impl Args {
                 }
                 Some("--socket") => a.socket = Some(it.next().ok_or_else(&missing)?.into()),
                 Some("--state-dir") => a.state_dir = Some(it.next().ok_or_else(&missing)?.into()),
+                Some("--token-store") => {
+                    a.token_store = Some(it.next().ok_or_else(&missing)?.into())
+                }
                 Some("--policy") => a.policy = Some(it.next().ok_or_else(&missing)?.into()),
                 Some("--embedded-fd") => {
                     let fd = it
@@ -423,6 +435,26 @@ mod tests {
         assert_eq!(
             result.unwrap_err(),
             "--embedded-fd may be specified only once"
+        );
+    }
+
+    #[test]
+    fn explicit_token_store_is_parsed_without_changing_state_root() {
+        let args = Args::parse(
+            [
+                "--state-dir",
+                "/state",
+                "--token-store",
+                "/authority/tokens.json",
+            ]
+            .into_iter()
+            .map(std::ffi::OsString::from),
+        )
+        .unwrap();
+        assert_eq!(args.state_dir.as_deref(), Some(Path::new("/state")));
+        assert_eq!(
+            args.token_store.as_deref(),
+            Some(Path::new("/authority/tokens.json"))
         );
     }
 
