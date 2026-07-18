@@ -160,7 +160,7 @@ Common currently emitted codes include:
 | Family | Codes you will commonly handle |
 |---|---|
 | Syntax/binding | `parse_error`, `undefined_var`, `arg_error`, `type_error` |
-| Data/access | `field_missing`, `index_range`, `utf8_error`, `overflow`, `div_zero`, `collection_materialization_limit`, `string_materialization_limit`, `cas_materialization_limit`, `builtin_output_limit` |
+| Data/access | `field_missing`, `index_range`, `utf8_error`, `overflow`, `div_zero`, `collection_materialization_limit`, `string_materialization_limit`, `cas_materialization_limit`, `builtin_output_limit`, `builtin_work_limit` |
 | Commands/host | `not_found`, `cmd_failed`, `io_error`, `net_error`, `permission`, `timeout` |
 | Streams/channels | `stream_consumed`, `stream_unbounded`, `stream_collect_limit`, `stream_distinct_limit`, `stream_window_limit`, `stream_line_limit`, `range_materialization_limit`, `range_length_overflow`, `channel_closed`, `channel_poisoned`, `channel_name_limit`, `channel_registry_limit`, `channel_subscriber_limit`, `channel_payload_limit`, `channel_payload_type`, `feed_error` |
 | Reef | `reef_unlocked`, `reef_drift`, `reef_conflict`, `reef_not_found`, `reef_provider` |

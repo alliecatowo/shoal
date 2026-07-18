@@ -135,6 +135,10 @@ Builders admit at most 16,384 values and 16 MiB of measured retained state befor
 strings and byte concatenation use the same 16 MiB wall. Breaches raise `builtin_output_limit` with
 a hint to narrow or stream the input. Production filesystem adapters must override bounded
 directory reads so `ls` enforces the row wall during iteration, not after collecting the directory.
+`builtins/copy.rs` separately inventories all recursive-copy sources before effects. Its iterative
+work stack shares count/byte admission with finalized operations, preventing recursive pending
+vectors from multiplying memory by depth; execution begins only after the complete bounded plan is
+valid.
 
 | Head | Key arguments/flags | Raw structured result |
 |---|---|---|

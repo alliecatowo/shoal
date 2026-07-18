@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod admission;
+mod copy;
 use admission::{
     MAX_RETAINED_BYTES, OutputBudget, OutputString, OutputValues, output_limit, table_record,
 };
@@ -165,6 +166,13 @@ fn path(cwd: &Path, v: Value) -> VResult<PathBuf> {
 fn paths(cwd: &Path, args: Vec<Value>) -> VResult<Vec<PathBuf>> {
     args.into_iter().map(|v| path(cwd, v)).collect()
 }
+fn admitted_path_output(paths: &[PathBuf]) -> VResult<OutputValues> {
+    let mut output = OutputValues::new();
+    for path in paths {
+        output.push(Value::Path(path.clone()))?;
+    }
+    Ok(output)
+}
 fn ioerr(op: &str, p: &Path, e: std::io::Error) -> ErrorVal {
     ErrorVal::new("custom", format!("{op} {}: {e}", p.display()))
 }
@@ -224,7 +232,11 @@ fn ls(fs: &dyn Fs, cwd: &Path, args: Vec<Value>, all: bool) -> VResult<Value> {
     for root in roots {
         if fs.is_dir(&root) {
             let entries = fs
-                .read_dir_bounded(&root, rows.remaining_values())
+                .read_dir_limited(
+                    &root,
+                    rows.remaining_values(),
+                    rows.remaining_retained_bytes(),
+                )
                 .map_err(|error| {
                     if error.kind() == std::io::ErrorKind::InvalidData {
                         output_limit(error.to_string())
@@ -284,6 +296,7 @@ fn mkdir(fs: &dyn Fs, cwd: &Path, args: Vec<Value>, parents: bool) -> VResult<Va
         return Err(ErrorVal::arg_error("mkdir requires at least one path"));
     }
     let ps = paths(cwd, args)?;
+    let output = admitted_path_output(&ps)?;
     for p in &ps {
         if parents {
             fs.create_dir_all(p)
@@ -292,17 +305,18 @@ fn mkdir(fs: &dyn Fs, cwd: &Path, args: Vec<Value>, parents: bool) -> VResult<Va
         }
         .map_err(|e| ioerr("mkdir", p, e))?;
     }
-    Ok(Value::List(ps.into_iter().map(Value::Path).collect()))
+    Ok(output.finish_list())
 }
 fn touch(fs: &dyn Fs, cwd: &Path, args: Vec<Value>) -> VResult<Value> {
     if args.is_empty() {
         return Err(ErrorVal::arg_error("touch requires at least one path"));
     }
     let ps = paths(cwd, args)?;
+    let output = admitted_path_output(&ps)?;
     for p in &ps {
         fs.touch(p).map_err(|e| ioerr("touch", p, e))?;
     }
-    Ok(Value::List(ps.into_iter().map(Value::Path).collect()))
+    Ok(output.finish_list())
 }
 
 fn copy_move(
@@ -326,7 +340,8 @@ fn copy_move(
             "destination must be a directory for multiple sources",
         ));
     }
-    let mut out = Vec::new();
+    let mut jobs = Vec::new();
+    let mut out = OutputValues::new();
     for src in ps {
         let target = if fs.is_dir(&dest) {
             dest.join(
@@ -336,36 +351,18 @@ fn copy_move(
         } else {
             dest.clone()
         };
-        if moving {
-            fs.rename(&src, &target)
-                .map_err(|e| ioerr("move", &src, e))?;
-        } else {
-            copy_path(fs, &src, &target, recursive)?;
-        }
-        out.push(Value::Path(target));
+        out.push(Value::Path(target.clone()))?;
+        jobs.push((src, target));
     }
-    Ok(Value::List(out))
-}
-fn copy_path(fs: &dyn Fs, src: &Path, dst: &Path, recursive: bool) -> VResult<()> {
-    let m = fs
-        .symlink_metadata(src)
-        .map_err(|e| ioerr("copy", src, e))?;
-    if m.is_dir() {
-        if !recursive {
-            return Err(ErrorVal::arg_error("cp: directory requires --recursive"));
-        }
-        fs.create_dir_all(dst).map_err(|e| ioerr("copy", dst, e))?;
-        for e in fs.read_dir(src).map_err(|e| ioerr("copy", src, e))? {
-            let name = e
-                .file_name()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(&e));
-            copy_path(fs, &e, &dst.join(name), true)?
+    if moving {
+        for (source, target) in jobs {
+            fs.rename(&source, &target)
+                .map_err(|error| ioerr("move", &source, error))?;
         }
     } else {
-        fs.copy(src, dst).map_err(|e| ioerr("copy", src, e))?;
+        copy::CopyPlan::build(fs, &jobs, recursive)?.execute(fs)?;
     }
-    Ok(())
+    Ok(out.finish_list())
 }
 
 fn rm(
@@ -577,7 +574,7 @@ fn prune_stale_trash_root(
     scan_limit: usize,
 ) -> Vec<String> {
     let mut warnings = Vec::new();
-    let entries = match fs.read_dir(root) {
+    let entries = match fs.read_dir_prefix(root, scan_limit) {
         Ok(entries) => entries,
         Err(error) => {
             warnings.push(format!(
@@ -588,7 +585,7 @@ fn prune_stale_trash_root(
         }
     };
     let now = SystemTime::now();
-    for entry in entries.into_iter().take(scan_limit) {
+    for entry in entries {
         if entry.file_name() == Some(OsStr::new(current_session)) {
             continue;
         }
@@ -624,14 +621,19 @@ fn stat(fs: &dyn Fs, cwd: &Path, args: Vec<Value>) -> VResult<Value> {
     if args.is_empty() {
         return Err(ErrorVal::arg_error("stat requires at least one path"));
     }
-    let rows = paths(cwd, args)?
-        .into_iter()
-        .map(|p| metadata_record(fs, p))
-        .collect::<VResult<Vec<_>>>()?;
-    if rows.len() == 1 {
-        Ok(Value::Record(rows.into_iter().next().expect("one row")))
+    let paths = paths(cwd, args)?;
+    let single = paths.len() == 1;
+    let mut rows = OutputValues::new();
+    for path in paths {
+        rows.push(table_record(metadata_record(fs, path)?))?;
+    }
+    if single {
+        let Value::List(mut rows) = rows.finish_list() else {
+            unreachable!()
+        };
+        Ok(rows.pop().expect("one admitted stat row"))
     } else {
-        Ok(Value::Table(rows))
+        Ok(rows.finish_table())
     }
 }
 /// `head(file, n: int = 10) -> list<str>` (site/content/internals/language-conformance-contract.md): the first `n` lines of a

@@ -231,6 +231,13 @@ Errors include:
 - `arg_error` when a directory is copied without recursion;
 - a filesystem error for read/write failures.
 
+Recursive copy inventories every source before the first filesystem mutation. The shared plan is
+limited to 16,384 pending/final operations, 16 MiB of retained path state, and 64 directory levels;
+`builtin_work_limit` means the tree must be split into bounded subtrees. Directory iteration checks
+both entry count and aggregate encoded path bytes while reading. A preflight failure leaves every
+destination untouched. This is an allocation/effect-order guarantee, not an atomicity guarantee for
+an I/O failure that occurs after execution begins.
+
 When a journaled statement overwrites a file and the complete prior bytes fit the journal limit, Shoal records a restore inverse for `undo`. A too-large prior file is left non-reversible rather than storing a truncated inverse.
 
 ### `mv`

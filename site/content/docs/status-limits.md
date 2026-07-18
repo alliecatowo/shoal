@@ -224,6 +224,10 @@ lexical binding. Eager results stop at 16,384 values / 16 MiB retained state wit
 remaining aggregate byte budget, and `head` streams line prefixes. `echo` and whole-record `env`
 also build through the shared admission layer.
 
+Recursive `cp` has a separate effect-work preflight: at most 16,384 pending/final operations, 16 MiB
+of retained plan paths, and 64 directory levels. It raises `builtin_work_limit` before the first
+mutation. Trash-retention maintenance reads only its configured 64-entry prefix in production.
+
 Lazy CAS-backed bytes keep metadata operations allocation-free. `.stream()` reads logical lines on
 demand with a 1 MiB per-line wall, and `.save()`/`.append()` copy through reader/writer ports.
 Implicit resident methods refuse a declared blob above 16 MiB with `cas_materialization_limit`;
@@ -231,7 +235,7 @@ Implicit resident methods refuse a declared blob above 16 MiB with `cas_material
 `stream_line_limit`.
 
 Limit failures are catchable language errors: `binding_name_limit`, `binding_identity_limit`,
-`binding_value_limit`, `binding_aggregate_limit`, or `builtin_output_limit`. Runtime handles such as closures, tasks, and
+`binding_value_limit`, `binding_aggregate_limit`, `builtin_output_limit`, or `builtin_work_limit`. Runtime handles such as closures, tasks, and
 streams receive a conservative fixed charge here and remain subject to their own subsystem quotas;
 this is accounting protection, not a complete process-memory meter. Use an OS memory limit for
 mutually hostile workloads.

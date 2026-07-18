@@ -148,6 +148,18 @@ pub trait Fs: Send + Sync {
     /// injected adapters; production [`StdFs`] overrides it to enforce the
     /// wall while iterating rather than after an unbounded collection.
     fn read_dir_bounded(&self, path: &Path, max_entries: usize) -> io::Result<Vec<PathBuf>> {
+        self.read_dir_limited(path, max_entries, usize::MAX)
+    }
+    /// Read a complete directory only when both its entry count and aggregate
+    /// encoded path bytes fit. `InvalidData` means another entry would cross a
+    /// wall. Production [`StdFs`] checks before retaining each path; the
+    /// compatibility default checks an adapter's already-materialized result.
+    fn read_dir_limited(
+        &self,
+        path: &Path,
+        max_entries: usize,
+        max_path_bytes: usize,
+    ) -> io::Result<Vec<PathBuf>> {
         let entries = self.read_dir(path)?;
         if entries.len() > max_entries {
             return Err(io::Error::new(
@@ -155,6 +167,33 @@ pub trait Fs: Send + Sync {
                 format!("directory contains more than {max_entries} admitted entries"),
             ));
         }
+        let mut path_bytes = 0usize;
+        for entry in &entries {
+            path_bytes = path_bytes
+                .checked_add(entry.as_os_str().as_encoded_bytes().len())
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "directory path accounting overflowed",
+                    )
+                })?;
+            if path_bytes > max_path_bytes {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("directory paths exceed {max_path_bytes} admitted bytes"),
+                ));
+            }
+        }
+        Ok(entries)
+    }
+    /// Read only the first `max_entries` directory entries. Unlike
+    /// [`read_dir_bounded`](Fs::read_dir_bounded), a larger directory is not an
+    /// error: this is for deliberately partial maintenance scans. The default
+    /// preserves adapter compatibility but materializes before truncating;
+    /// production [`StdFs`] overrides it to stop the iterator at the prefix.
+    fn read_dir_prefix(&self, path: &Path, max_entries: usize) -> io::Result<Vec<PathBuf>> {
+        let mut entries = self.read_dir(path)?;
+        entries.truncate(max_entries);
         Ok(entries)
     }
     /// Create a single directory (`std::fs::create_dir`).
@@ -309,8 +348,14 @@ impl Fs for StdFs {
         }
         Ok(out)
     }
-    fn read_dir_bounded(&self, path: &Path, max_entries: usize) -> io::Result<Vec<PathBuf>> {
+    fn read_dir_limited(
+        &self,
+        path: &Path,
+        max_entries: usize,
+        max_path_bytes: usize,
+    ) -> io::Result<Vec<PathBuf>> {
         let mut out = Vec::new();
+        let mut path_bytes = 0usize;
         for entry in fs::read_dir(path)? {
             if out.len() >= max_entries {
                 return Err(io::Error::new(
@@ -318,9 +363,30 @@ impl Fs for StdFs {
                     format!("directory contains more than {max_entries} admitted entries"),
                 ));
             }
-            out.push(entry?.path());
+            let entry = entry?.path();
+            path_bytes = path_bytes
+                .checked_add(entry.as_os_str().as_encoded_bytes().len())
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "directory path accounting overflowed",
+                    )
+                })?;
+            if path_bytes > max_path_bytes {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("directory paths exceed {max_path_bytes} admitted bytes"),
+                ));
+            }
+            out.push(entry);
         }
         Ok(out)
+    }
+    fn read_dir_prefix(&self, path: &Path, max_entries: usize) -> io::Result<Vec<PathBuf>> {
+        fs::read_dir(path)?
+            .take(max_entries)
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect()
     }
     fn create_dir(&self, path: &Path) -> io::Result<()> {
         fs::create_dir(path)
@@ -430,10 +496,24 @@ mod fs_tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(
             StdFs
+                .read_dir_limited(&root.0, 3, 0)
+                .expect_err("the first nonempty path must cross a zero-byte wall")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            StdFs
                 .read_dir_bounded(&root.0, 3)
                 .expect("the exact wall is admitted")
                 .len(),
             3
+        );
+        assert_eq!(
+            StdFs
+                .read_dir_prefix(&root.0, 2)
+                .expect("a maintenance prefix is deliberately partial")
+                .len(),
+            2
         );
     }
 }

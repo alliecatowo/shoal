@@ -586,10 +586,6 @@ fn production_evaluator_has_only_explicit_ambient_filesystem_exceptions() {
         },
         ExpectedLine {
             file: "builtins.rs",
-            text: "if m.is_dir() {",
-        },
-        ExpectedLine {
-            file: "builtins.rs",
             text: "if meta.is_dir() {",
         },
         ExpectedLine {
@@ -603,6 +599,10 @@ fn production_evaluator_has_only_explicit_ambient_filesystem_exceptions() {
         ExpectedLine {
             file: "builtins.rs",
             text: "if !metadata.is_dir()",
+        },
+        ExpectedLine {
+            file: "builtins/copy.rs",
+            text: "if metadata.is_dir() {",
         },
         ExpectedLine {
             file: "expr_access.rs",
