@@ -194,7 +194,11 @@ mod tests {
             session: "early-exit".into(),
             state_dir: temp.path().join("state"),
             policy: None,
-            program: Some(PathBuf::from("/bin/false")),
+            // `/bin/false` is not present on macOS runners. Both supported
+            // Unix targets provide the utility at this canonical path, which
+            // lets the test exercise a successfully spawned child that exits
+            // before readiness rather than the unrelated spawn-error path.
+            program: Some(PathBuf::from("/usr/bin/false")),
         });
         let error = match result {
             Ok(_) => panic!("a child that never sends readiness must not connect"),
