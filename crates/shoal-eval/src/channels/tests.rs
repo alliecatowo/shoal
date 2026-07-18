@@ -200,15 +200,20 @@ fn cancellation_wakes_an_idle_subscription_promptly() {
     let rx = bus.events("idle", None).unwrap();
     let cancel = CancelToken::new();
     let trip = cancel.clone();
+    let (cancelled_tx, cancelled_rx) = std::sync::mpsc::sync_channel(1);
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(20));
         trip.cancel();
+        let _ = cancelled_tx.send(Instant::now());
     });
 
-    let start = Instant::now();
     assert!(matches!(rx.recv(None, Some(&cancel)), Received::Cancelled));
+    let returned_at = Instant::now();
+    let cancelled_at = cancelled_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("cancellation worker did not report its trip time");
     assert!(
-        start.elapsed() < Duration::from_millis(250),
+        returned_at.saturating_duration_since(cancelled_at) < Duration::from_millis(250),
         "cancelled receive stayed blocked"
     );
 }

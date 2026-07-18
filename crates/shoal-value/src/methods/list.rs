@@ -2,75 +2,12 @@
 //! couple of receiver-polymorphic ones (`.contains`, `.get`) that don't
 //! cleanly belong to any single receiver type.
 
+use super::materialize::{
+    BoundedString, EAGER_COLLECTION_MAX_RETAINED_BYTES, EAGER_COLLECTION_MAX_VALUES,
+    MaterializedCollection,
+};
 use super::*;
 use std::cmp::Ordering;
-
-const EAGER_COLLECTION_MAX_VALUES: usize = 16_384;
-const EAGER_COLLECTION_MAX_RETAINED_BYTES: usize = 16 * 1024 * 1024;
-
-/// Incrementally admit a collection result before retaining each next value.
-/// This protects multiplicative operations (`flat_map`/`flatten`) from
-/// constructing an unbounded transient value before the environment's binding
-/// quota gets a chance to inspect it.
-struct MaterializedCollection {
-    values: Vec<Value>,
-    retained_bytes: usize,
-    max_values: usize,
-    max_retained_bytes: usize,
-}
-
-impl MaterializedCollection {
-    fn new(max_values: usize, max_retained_bytes: usize) -> Self {
-        Self {
-            values: Vec::new(),
-            retained_bytes: 0,
-            max_values,
-            max_retained_bytes,
-        }
-    }
-
-    fn extend(&mut self, values: impl IntoIterator<Item = Value>) -> VResult<()> {
-        for value in values {
-            if self.values.len() >= self.max_values {
-                return Err(collection_materialization_limit(format!(
-                    "eager collection reached its {}-value limit",
-                    self.max_values
-                )));
-            }
-            let retained = retained_size(
-                &value,
-                RetainedLimits {
-                    max_bytes: self.max_retained_bytes.saturating_sub(self.retained_bytes),
-                    max_depth: 64,
-                    max_nodes: 16_384,
-                    opaque: OpaqueHandling::Charge(256),
-                    allow_secret: true,
-                },
-            )
-            .map_err(|_| {
-                collection_materialization_limit(format!(
-                    "eager collection exceeds its {}-byte retained-value limit",
-                    self.max_retained_bytes
-                ))
-            })?;
-            self.retained_bytes = self.retained_bytes.checked_add(retained).ok_or_else(|| {
-                collection_materialization_limit("eager collection accounting overflowed")
-            })?;
-            self.values.push(value);
-        }
-        Ok(())
-    }
-
-    fn finish(self) -> Value {
-        Value::List(self.values)
-    }
-}
-
-fn collection_materialization_limit(message: impl Into<String>) -> ErrorVal {
-    ErrorVal::new("collection_materialization_limit", message).with_hint(
-        "use `.stream()` with incremental transforms/sinks, or reduce the input before flattening",
-    )
-}
 
 pub(crate) fn seq(v: Value) -> VResult<Vec<Value>> {
     match v {
@@ -431,10 +368,13 @@ pub(crate) fn group(ctx: &mut dyn CallCtx, v: Value, f: &Value) -> VResult<Value
     ))
 }
 pub(crate) fn join(v: Value, sep: &str) -> VResult<Value> {
-    let mut out = vec![];
-    for x in seq(v)? {
+    let mut out = BoundedString::eager();
+    for (index, x) in seq(v)?.into_iter().enumerate() {
+        if index > 0 {
+            out.push_str(sep)?;
+        }
         match x {
-            Value::Str(s) => out.push(s),
+            Value::Str(s) => out.push_str(&s)?,
             v => {
                 return Err(ErrorVal::type_error(format!(
                     "join expects str elements, found {}",
@@ -443,7 +383,7 @@ pub(crate) fn join(v: Value, sep: &str) -> VResult<Value> {
             }
         }
     }
-    Ok(Value::Str(out.join(sep)))
+    Ok(out.finish())
 }
 pub(crate) fn contains(v: Value, q: &Value) -> VResult<Value> {
     match v {

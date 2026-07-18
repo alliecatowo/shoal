@@ -194,9 +194,12 @@ Full impact/mitigation: [Security and trust boundaries](@/docs/security.md).
 
 Shoal does not promise Bash/POSIX parsing or expansion. There is no `$var` expansion, backtick substitution, implicit word splitting, globbing identical to Bash, shell function syntax, or drop-in startup-file compatibility. Use `sh { ... }` for an explicit legacy block and migrate deliberately.
 
-### Command resolution is distributed
+### Command resolution is centralized
 
-Builtin identity has a canonical registry used by evaluator/completion/highlighting/LSP, but full resolution across lexical functions, aliases, Reef, adapters, PATH, and interpreter runners still spans multiple evaluator paths. Edge-case precedence/forced-head behavior needs regression tests when changed.
+Execution and static plan derivation both use the evaluator's typed `CommandResolution`, backed by
+the syntax crate's canonical command facts/source resolver. Lexical functions and aliases, Reef,
+adapters, builtins, PATH, and interpreter runners therefore share precedence and forced-head
+behavior. Resolution changes still require execution/plan parity regressions.
 
 ### Lexical environments are bounded
 
@@ -205,6 +208,13 @@ block, script, and module scopes. One name is at most 256 UTF-8 bytes; one value
 state is at most 1 MiB, depth 64, and 16,384 nodes. Separately, eager expansion of a compact range is
 capped at 16,384 integers; larger ranges remain lazily streamable. Replacing an existing binding is still allowed when the
 identity cap is full, and temporary scope charges are reclaimed when that scope is dropped.
+
+Pure value methods also admit their transient results before retaining them. Eager string-to-list
+operations (`lines`, `words`, `chars`, `split`, regex `matches`) and list concatenation stop at
+16,384 values / 16 MiB measured retained state with `collection_materialization_limit`. String
+concatenation, `join`, Unicode case conversion, and literal/regex replacement stop at 16 MiB with
+`string_materialization_limit`; replacement capture expansion is written directly into the bounded
+destination rather than creating an unchecked intermediate.
 
 Limit failures are catchable language errors: `binding_name_limit`, `binding_identity_limit`,
 `binding_value_limit`, or `binding_aggregate_limit`. Runtime handles such as closures, tasks, and

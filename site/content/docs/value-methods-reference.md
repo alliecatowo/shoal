@@ -415,6 +415,11 @@ range.
 
 Regex replacement expands `$1` and named captures. `.matches()` returns every non-overlapping full match, not capture records. `.match()` returns only the first full match.
 
+Eager string partitions and regex matches share the 16,384-value / 16 MiB collection wall.
+Concatenation, `join`, Unicode case conversion, and replacement share a 16 MiB output wall. They
+raise `collection_materialization_limit` or `string_materialization_limit` before retaining the
+next item/chunk; use a stream or chunked processing for larger data.
+
 ## Numeric methods
 
 `int` and `float` implement:

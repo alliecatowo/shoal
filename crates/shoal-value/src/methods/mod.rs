@@ -19,6 +19,7 @@
 //! - [`suggest`] — did-you-mean hints for the unknown-method fall-through.
 
 mod list;
+pub(crate) mod materialize;
 mod num;
 mod outcome;
 mod path;
@@ -177,27 +178,15 @@ fn dispatch(ctx: &mut dyn CallCtx, recv: Value, name: &str, args: CallArgs) -> V
         // concatenation) — unlike the required-argument predicates below, a
         // zero-arg join has one obvious, harmless meaning.
         "join" => list::join(recv, str_arg(&args, 0, "")?),
-        "lines" => strops::string_unary(recv, |s| {
-            Value::List(
-                s.lines()
-                    .map(|x| Value::Str(x.trim_end_matches('\r').into()))
-                    .collect(),
-            )
-        }),
-        "words" => strops::string_unary(recv, |s| {
-            Value::List(s.split_whitespace().map(|x| Value::Str(x.into())).collect())
-        }),
-        "chars" => strops::string_unary(recv, |s| {
-            Value::List(s.chars().map(|x| Value::Str(x.to_string())).collect())
-        }),
+        "lines" => strops::lines_method(recv),
+        "words" => strops::words_method(recv),
+        "chars" => strops::chars_method(recv),
         "trim" => strops::string_unary(recv, |s| Value::Str(s.trim().into())),
-        "upper" => strops::string_unary(recv, |s| Value::Str(s.to_uppercase())),
-        "lower" => strops::string_unary(recv, |s| Value::Str(s.to_lowercase())),
+        "upper" => strops::case_method(recv, true),
+        "lower" => strops::case_method(recv, false),
         "split" => {
             let sep = req_str_arg(&args, 0, ".split requires a separator argument")?;
-            strops::string_unary(recv, |s| {
-                Value::List(s.split(sep).map(|x| Value::Str(x.into())).collect())
-            })
+            strops::split_method(recv, sep)
         }
         "starts_with" => strops::string_pred(
             recv,

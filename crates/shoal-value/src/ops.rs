@@ -4,6 +4,7 @@
 //! promotion). Everything not listed here is a type error. Two non-coercive
 //! overloads ride along: `str + str` and `list + list` concatenation.
 
+use crate::methods::materialize::{BoundedString, MaterializedCollection};
 use crate::{ErrorVal, VResult, Value};
 use shoal_ast::BinOp;
 use std::cmp::Ordering;
@@ -139,11 +140,16 @@ pub fn binop(op: BinOp, lhs: &Value, rhs: &Value) -> VResult<Value> {
         (Float(a), Int(b)) => Ok(float_op(op, *a, *b as f64)),
 
         // --- str/list concatenation (non-coercive overloads) ---
-        (Str(a), Str(b)) if op == Add => Ok(Str(format!("{a}{b}"))),
+        (Str(a), Str(b)) if op == Add => {
+            let mut out = BoundedString::eager();
+            out.push_str(a)?;
+            out.push_str(b)?;
+            Ok(out.finish())
+        }
         (List(a), List(b)) if op == Add => {
-            let mut out = a.clone();
-            out.extend(b.iter().cloned());
-            Ok(List(out))
+            let mut out = MaterializedCollection::eager();
+            out.extend(a.iter().chain(b).cloned())?;
+            Ok(out.finish())
         }
 
         // --- size ---
@@ -375,6 +381,12 @@ mod tests {
         assert_eq!(
             binop(Add, &Value::Str("a".into()), &Value::Str("b".into())).unwrap(),
             Value::Str("ab".into())
+        );
+        let left = Value::List(vec![Value::Null; 8_192]);
+        let right = Value::List(vec![Value::Null; 8_193]);
+        assert_eq!(
+            binop(Add, &left, &right).unwrap_err().code,
+            "collection_materialization_limit"
         );
         assert_eq!(
             binop(Div, &Value::Int(7), &Value::Int(2)).unwrap(),

@@ -171,6 +171,12 @@ default. This prevents calls like `"x".starts_with()` from returning the mislead
 String `len` counts Unicode scalar values (`chars().count()`), not UTF-8 bytes and not user-perceived
 grapheme clusters.
 
+`materialize.rs` is the shared transient admission boundary. String-to-list methods and list
+concatenation admit each value against 16,384-value / 16 MiB walls. String concatenation, `join`,
+case conversion, and literal/regex replacement append into a 16 MiB bounded builder. Regex capture
+references are expanded directly into that builder, so a small pattern/replacement cannot allocate
+an unchecked multiplicative intermediate before the environment quota runs.
+
 ## Record and receiver-polymorphic methods
 
 | Method | Receiver | Behavior |
