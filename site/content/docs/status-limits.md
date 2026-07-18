@@ -14,7 +14,7 @@ toc = true
 
 Shoal is a substantial, working preview—not a production-hardened login shell or multi-tenant agent sandbox. The language, structured shell, adapters, Reef resolver, journal/undo, kernel, MCP tools/resources/events, PTYs, LSP, prompt, and configuration system all execute real code today. The current security model still requires a fully trusted local kernel socket, and several protocol/operational contracts need hardening before consequential unattended deployment.
 
-This page is dated because status prose goes stale. It was checked against the source tree and the 1,357-case conformance corpus on **2026-07-18**.
+This page is dated because status prose goes stale. It was checked against the source tree and the 1,358-case conformance corpus on **2026-07-18**.
 
 ## Readiness in one table
 
@@ -49,8 +49,8 @@ The documentation uses these labels:
 The language contract lives in `spec/cases/*.toml`:
 
 ```text
-1,357 cases
-1,353 passed
+1,358 cases
+1,354 passed
 0 failed
 4 skipped
 ```
@@ -227,6 +227,7 @@ constraints. New methods must update metadata and executable coverage together.
 - `buffer(n)` creates a bounded asynchronous pump, but each pump consumes a thread and the evaluator
   admits at most 64 concurrent stream pumps. Drop or consume buffered streams promptly.
 - `.distinct(limit?)` defaults to 4,096 identities and is exact up to that caller/default limit and a 16 MiB retained-history ceiling, then raises `stream_distinct_limit`; use a smaller limit, finite/taken stream, or `.dedupe()` for adjacent suppression.
+- count and duration `.window(...)` stages retain at most 4,096 items and 16 MiB; count admission rejects larger requests and live duration windows raise `stream_window_limit` rather than evicting within the requested time range.
 - live `.tee(n)` uses 64-entry per-fork queues; overflow drops values and inserts a `{dropped:n}` marker rather than raising.
 - collecting/sorting/grouping an infinite stream without a bound never completes and can exhaust memory.
 - live timing/filesystem sources remain host-dependent despite deterministic core combinators.

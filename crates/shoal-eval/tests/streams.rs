@@ -130,6 +130,7 @@ fn window_slides() {
         rendered("[1,2,3,4].stream().window(2).collect()"),
         "[[1, 2], [2, 3], [3, 4]]"
     );
+    assert_eq!(run_err("[1].stream().window(4097).collect()"), "arg_error");
 }
 
 #[test]

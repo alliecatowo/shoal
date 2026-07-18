@@ -245,8 +245,8 @@ length shrinks; rename/replacement behavior beyond that depends on platform `not
 | `distinct` | hashes into equality-compatible buckets, verifies with `Value` equality, and fails typed at its identity/byte history bounds |
 | `debounce(duration)` | retains latest pending value until quiet deadline |
 | `throttle(duration)` | emits first and drops items inside interval |
-| `window(count)` | sliding deque; emits only once full, then every item |
-| `window(duration)` | stores timestamp/value pairs; emits current time window per item |
+| `window(count)` | sliding deque; emits only once full, then every item; count is capped at 4,096 and history at 16 MiB |
+| `window(duration)` | stores timestamp/value pairs; emits current time window per item; fails typed at 4,096 items or 16 MiB |
 | `buffer(n)` | eager owned pump into `sync_channel(n)`; lossless pacing, including a zero-capacity rendezvous |
 | `enumerate` | emits `[zero_based_index, value]` |
 | `merge(other)` | nonblocking probes with alternating preference; round-robin when both are ready, free-running when only one is ready |
@@ -258,7 +258,9 @@ outer item from being pulled. `distinct` preserves `Value` equality across repre
 confirming candidates within each bucket. Its membership checks are amortized O(1). Exact history
 retains at most the requested/default 4,096 identities and 16 MiB of measured values; reaching
 either bound raises `stream_distinct_limit` instead of evicting and violating distinctness.
-`window(duration)` is bounded only by event rate inside the duration.
+Count and duration windows preserve exact membership up to 4,096 retained items and 16 MiB. They
+raise `stream_window_limit` rather than silently evicting an item that still belongs to the requested
+window; count requests above the identity ceiling fail before consuming their source.
 
 `.buffer(n)` consumes its input and starts a child evaluator on a producer thread. The channel has
 exactly `n` slots; the producer can additionally hold the item it is currently trying to enqueue.

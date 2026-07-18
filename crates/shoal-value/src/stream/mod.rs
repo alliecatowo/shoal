@@ -231,6 +231,8 @@ impl StreamVal {
     /// explicitly at a bound rather than evicting and re-emitting old values.
     pub const DISTINCT_MAX_VALUES: usize = 4_096;
     const DISTINCT_MAX_RETAINED_BYTES: usize = 16 * 1024 * 1024;
+    pub const WINDOW_MAX_VALUES: usize = 4_096;
+    const WINDOW_MAX_RETAINED_BYTES: usize = 16 * 1024 * 1024;
     /// Build a stream from an in-memory / lazy iterator (a bounded source).
     pub fn from_iter<I>(label: impl Into<String>, iter: I) -> StreamVal
     where
@@ -434,12 +436,20 @@ impl StreamVal {
         })
     }
     pub fn window_count(self, n: usize) -> VResult<StreamVal> {
+        if n == 0 || n > Self::WINDOW_MAX_VALUES {
+            return Err(ErrorVal::arg_error(format!(
+                "window count must be between 1 and {}",
+                Self::WINDOW_MAX_VALUES
+            )));
+        }
         let b = self.bounded;
         self.wrap("list", b, |up| {
             Box::new(ops::WindowCount {
                 up,
                 n,
                 buf: std::collections::VecDeque::new(),
+                retained_bytes: 0,
+                max_retained_bytes: Self::WINDOW_MAX_RETAINED_BYTES,
             })
         })
     }
@@ -450,6 +460,9 @@ impl StreamVal {
                 up,
                 dur,
                 buf: Vec::new(),
+                retained_bytes: 0,
+                max_values: Self::WINDOW_MAX_VALUES,
+                max_retained_bytes: Self::WINDOW_MAX_RETAINED_BYTES,
             })
         })
     }
@@ -669,6 +682,20 @@ mod tests {
         let stream = StreamVal::from_iter("int", [Ok(Value::Int(1))].into_iter());
         assert_eq!(
             stream.clone().distinct_bounded(0).unwrap_err().code,
+            "arg_error"
+        );
+        assert_eq!(drain(&stream), vec![Value::Int(1)]);
+    }
+
+    #[test]
+    fn invalid_count_window_does_not_consume_the_source() {
+        let stream = StreamVal::from_iter("int", [Ok(Value::Int(1))].into_iter());
+        assert_eq!(
+            stream
+                .clone()
+                .window_count(StreamVal::WINDOW_MAX_VALUES + 1)
+                .unwrap_err()
+                .code,
             "arg_error"
         );
         assert_eq!(drain(&stream), vec![Value::Int(1)]);

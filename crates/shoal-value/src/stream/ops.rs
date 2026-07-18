@@ -494,19 +494,31 @@ impl Upstream for Throttle {
 pub struct WindowCount {
     pub up: Box<dyn Upstream>,
     pub n: usize,
-    pub buf: VecDeque<Value>,
+    pub buf: VecDeque<(Value, usize)>,
+    pub retained_bytes: usize,
+    pub max_retained_bytes: usize,
 }
 impl Upstream for WindowCount {
     fn pull(&mut self, ctx: &mut dyn CallCtx, t: Option<Duration>) -> VResult<Pull> {
         loop {
             match self.up.pull(ctx, t)? {
                 Pull::Item(v) => {
-                    self.buf.push_back(v);
-                    while self.buf.len() > self.n {
-                        self.buf.pop_front();
+                    if self.buf.len() == self.n
+                        && let Some((_, bytes)) = self.buf.pop_front()
+                    {
+                        self.retained_bytes = self.retained_bytes.saturating_sub(bytes);
                     }
+                    let retained = window_retained_size(
+                        &v,
+                        self.max_retained_bytes.saturating_sub(self.retained_bytes),
+                        self.max_retained_bytes,
+                    )?;
+                    self.retained_bytes += retained;
+                    self.buf.push_back((v, retained));
                     if self.buf.len() == self.n {
-                        return Ok(Pull::Item(Value::List(self.buf.iter().cloned().collect())));
+                        return Ok(Pull::Item(Value::List(
+                            self.buf.iter().map(|(value, _)| value.clone()).collect(),
+                        )));
                     }
                 }
                 other => return Ok(other),
@@ -518,23 +530,74 @@ impl Upstream for WindowCount {
 pub struct WindowDur {
     pub up: Box<dyn Upstream>,
     pub dur: Duration,
-    pub buf: Vec<(Instant, Value)>,
+    pub buf: Vec<(Instant, Value, usize)>,
+    pub retained_bytes: usize,
+    pub max_values: usize,
+    pub max_retained_bytes: usize,
 }
 impl Upstream for WindowDur {
     fn pull(&mut self, ctx: &mut dyn CallCtx, t: Option<Duration>) -> VResult<Pull> {
         match self.up.pull(ctx, t)? {
             Pull::Item(v) => {
                 let now = Instant::now();
-                self.buf.push((now, v));
                 let dur = self.dur;
-                self.buf.retain(|(ts, _)| now.duration_since(*ts) <= dur);
+                let mut retained_bytes = self.retained_bytes;
+                self.buf.retain(|(ts, _, bytes)| {
+                    if now.duration_since(*ts) <= dur {
+                        true
+                    } else {
+                        retained_bytes = retained_bytes.saturating_sub(*bytes);
+                        false
+                    }
+                });
+                self.retained_bytes = retained_bytes;
+                if self.buf.len() >= self.max_values {
+                    return Err(window_limit(format!(
+                        "duration window reached its {}-value limit",
+                        self.max_values
+                    )));
+                }
+                let retained = window_retained_size(
+                    &v,
+                    self.max_retained_bytes.saturating_sub(self.retained_bytes),
+                    self.max_retained_bytes,
+                )?;
+                self.retained_bytes += retained;
+                self.buf.push((now, v, retained));
                 Ok(Pull::Item(Value::List(
-                    self.buf.iter().map(|(_, v)| v.clone()).collect(),
+                    self.buf.iter().map(|(_, value, _)| value.clone()).collect(),
                 )))
             }
             other => Ok(other),
         }
     }
+}
+
+fn window_retained_size(
+    value: &Value,
+    remaining_bytes: usize,
+    max_retained_bytes: usize,
+) -> VResult<usize> {
+    retained_size(
+        value,
+        RetainedLimits {
+            max_bytes: remaining_bytes,
+            max_depth: 64,
+            max_nodes: 16_384,
+            opaque: OpaqueHandling::Charge(256),
+            allow_secret: true,
+        },
+    )
+    .map_err(|_| {
+        window_limit(format!(
+            "window history exceeds its {max_retained_bytes}-byte retained-value limit"
+        ))
+    })
+}
+
+fn window_limit(message: impl Into<String>) -> ErrorVal {
+    ErrorVal::new("stream_window_limit", message)
+        .with_hint("use a smaller count/window duration or reduce the source rate")
 }
 
 pub struct Enumerate {
@@ -904,5 +967,51 @@ mod tests {
         assert_eq!(error.code, "stream_distinct_limit");
         assert_eq!(distinct.seen_values, 0);
         assert_eq!(distinct.retained_bytes, 0);
+    }
+
+    #[test]
+    fn duration_window_rejects_identity_and_byte_amplification() {
+        let values = StreamVal::from_iter(
+            "int",
+            [1, 2, 3].into_iter().map(|value| Ok(Value::Int(value))),
+        );
+        let mut by_count = WindowDur {
+            up: values.take_upstream().unwrap(),
+            dur: Duration::from_secs(60),
+            buf: Vec::new(),
+            retained_bytes: 0,
+            max_values: 2,
+            max_retained_bytes: 1024,
+        };
+        assert!(matches!(
+            by_count.pull(&mut Ctx, None).unwrap(),
+            Pull::Item(_)
+        ));
+        assert!(matches!(
+            by_count.pull(&mut Ctx, None).unwrap(),
+            Pull::Item(_)
+        ));
+        let error = match by_count.pull(&mut Ctx, None) {
+            Err(error) => error,
+            Ok(_) => panic!("a third live value must exceed the duration-window cap"),
+        };
+        assert_eq!(error.code, "stream_window_limit");
+
+        let values = StreamVal::from_iter("str", [Ok(Value::Str("x".repeat(128)))].into_iter());
+        let mut by_bytes = WindowDur {
+            up: values.take_upstream().unwrap(),
+            dur: Duration::from_secs(60),
+            buf: Vec::new(),
+            retained_bytes: 0,
+            max_values: 8,
+            max_retained_bytes: 64,
+        };
+        let error = match by_bytes.pull(&mut Ctx, None) {
+            Err(error) => error,
+            Ok(_) => panic!("an over-budget live value must be rejected"),
+        };
+        assert_eq!(error.code, "stream_window_limit");
+        assert!(by_bytes.buf.is_empty());
+        assert_eq!(by_bytes.retained_bytes, 0);
     }
 }

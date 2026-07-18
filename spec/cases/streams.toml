@@ -41,6 +41,12 @@ src = '[1, 2, 3, 4].stream().window(2).collect()'
 value = "[[1, 2], [2, 3], [3, 4]]"
 
 [[case]]
+name = "stream-window-count-has-hard-retention-limit"
+src = '[1].stream().window(4097).collect()'
+error = "arg_error"
+error_contains = "between 1 and 4096"
+
+[[case]]
 name = "stream-dedupe"
 src = '[1, 1, 2, 2, 2, 3, 1].stream().dedupe().collect()'
 value = "[1, 2, 3, 1]"

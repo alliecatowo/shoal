@@ -113,7 +113,7 @@ Current stream-specific combinators are:
 | `distinct(limit?)` | hash and drop all previously seen equal values; default 4,096, fail typed at the caller/default identity limit or 16 MiB retained history |
 | `debounce(duration)` | emit after quiet interval |
 | `throttle(duration)` | rate-limit emissions |
-| `window(count_or_duration)` | collect count/time windows |
+| `window(count_or_duration)` | collect exact count/time windows; at most 4,096 items and 16 MiB retained history |
 | `buffer(n)` | eager lossless producer queue with capacity `n`; zero is a rendezvous |
 | `enumerate()` | pair items with sequence positions |
 | `merge(other)` | fair interleave; round-robin while both sides are ready |
