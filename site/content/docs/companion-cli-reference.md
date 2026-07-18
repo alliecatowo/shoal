@@ -76,14 +76,31 @@ main binary cannot be updated while its required companions remain stale:
 
 ```bash
 mise install
-mise run install          # incremental release build + verified install
-mise run install:clean    # clean release rebuild + verified install
-mise run install:check    # compare installed binaries/man pages with source artifacts
+mise run install            # staged, verified install with automatic failure rollback
+mise run install:clean      # remove the managed set, then reinstall transactionally
+mise run install:check      # compare binaries, man pages, and completions
+mise run install:test       # exercise the lifecycle under a temporary prefix
+mise run install:uninstall  # remove only managed Shoal artifacts
 ```
 
 Executables go to `${CARGO_HOME:-$HOME/.cargo}/bin` and section-1 man pages to
 the sibling `share/man/man1`; set `SHOAL_INSTALL_DIR` or `SHOAL_MAN_DIR` to
-override either destination. Installation does
+override either destination. Bash, zsh, and fish completions are installed under the prefix's
+standard `share/bash-completion`, `share/zsh/site-functions`, and
+`share/fish/vendor_completions.d` directories. The installer stages and validates every input before
+the first destination mutation, replaces each file through a same-directory rename, and restores
+the complete prior managed set if a commit fails. `--uninstall` is source-independent and leaves
+unrelated prefix files untouched.
+
+Release archives contain `install.shl` beside the binaries and `man/`. From an extracted archive,
+run it through the included executable with explicit destinations when desired:
+
+```bash
+SHOAL_RELEASE_DIR="$PWD" SHOAL_INSTALL_DIR="$HOME/.local/bin" \
+  ./shoal ./install.shl
+```
+
+Installation does
 not restart an existing durable kernel because that would discard its live
 in-memory Sessions. Restart it explicitly after an upgrade when appropriate.
 

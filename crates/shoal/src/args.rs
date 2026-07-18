@@ -10,7 +10,10 @@ use std::path::{Path, PathBuf};
 
 use crate::prompt;
 
-pub(crate) const USAGE: &str = "Shoal language and interactive shell\n\nUsage: shoal [OPTIONS] [SCRIPT [ARGS...]]\n       shoal <COMMAND> [ARGS...]\n\nOptions:\n  -c, --command SOURCE  Evaluate source\n  --standalone          Use an embedded kernel\n  -h, --help            Print help\n  -V, --version         Print version\n\nCommands:\n  kernel      Manage the resident kernel\n  fmt         Format .shl source\n  doctor      Diagnose the installation\n  lsp         Run the language server\n  mcp         Run the MCP server\n  completions Generate shell completions\n  prompt      Inspect and benchmark the prompt";
+#[path = "args/completions.rs"]
+mod completions;
+
+pub(crate) const USAGE: &str = "Shoal language and interactive shell\n\nUsage: shoal [OPTIONS] [SCRIPT [ARGS...]]\n       shoal <COMMAND> [ARGS...]\n\nOptions:\n  -c, --command SOURCE  Evaluate source\n  --standalone          Run in-process without kernel protocol\n  -h, --help            Print help\n  -V, --version         Print version\n\nCommands:\n  kernel      Manage the resident kernel\n  fmt         Format .shl source\n  doctor      Diagnose the installation\n  lsp         Run the language server\n  mcp         Run the MCP server\n  completions Generate shell completions\n  prompt      Inspect and benchmark the prompt";
 pub(crate) const FMT_USAGE: &str = "Format Shoal source\n\nUsage: shoal fmt [--check] [FILE...]\n\nWith no files, reads standard input.";
 pub(crate) const DOCTOR_USAGE: &str =
     "Diagnose the Shoal installation\n\nUsage: shoal doctor [--json]";
@@ -216,21 +219,8 @@ pub(crate) fn run_companion(name: &str) -> Result<i32, String> {
     })?;
     Ok(status.code().unwrap_or(1))
 }
-pub(crate) fn completion_script(shell: &str) -> Result<&'static str, String> {
-    match shell {
-        "bash" => Ok(
-            "_shoal(){ COMPREPLY=( $(compgen -W 'fmt doctor kernel lsp mcp completions --help --version --command --standalone' -- \"${COMP_WORDS[COMP_CWORD]}\") ); }\ncomplete -F _shoal shoal\n",
-        ),
-        "zsh" => Ok(
-            "#compdef shoal\n_arguments '--standalone[run embedded/offline REPL]' '1:command:(fmt doctor kernel lsp mcp completions)' '*:file:_files'\n",
-        ),
-        "fish" => Ok(
-            "complete -c shoal -f -a 'fmt doctor kernel lsp mcp completions'\ncomplete -c shoal -s c -l command -r\ncomplete -c shoal -l standalone\n",
-        ),
-        _ => Err(format!(
-            "unsupported shell `{shell}`; expected bash, zsh, or fish"
-        )),
-    }
+pub(crate) fn completion_script(shell: &str) -> Result<String, String> {
+    completions::generate(shell)
 }
 
 #[cfg(test)]
@@ -251,6 +241,8 @@ mod tests {
 
     #[test]
     fn argument_modes_are_deterministic() {
+        assert!(USAGE.contains("--standalone          Run in-process without kernel protocol"));
+        assert!(!USAGE.contains("embedded kernel"));
         assert!(matches!(
             parse_args(vec![], true).unwrap(),
             Action::Interactive { standalone: false }

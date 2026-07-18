@@ -58,6 +58,7 @@ pub(super) fn classify(env: &Env, line: &str, pos: usize) -> Ctx {
             }
             let is_keyword = RESERVED.contains(&name.as_str());
             let is_bound = env.is_bound(&name);
+            let is_namespace = shoal_eval::namespace_method_names(&name).next().is_some();
             let is_assign = matches!(
                 lexer.token(end0, Mode::Expr),
                 Ok((
@@ -65,7 +66,7 @@ pub(super) fn classify(env: &Env, line: &str, pos: usize) -> Ctx {
                     _
                 ))
             );
-            if is_keyword || is_bound || is_assign {
+            if is_keyword || is_bound || is_namespace || is_assign {
                 expr_or_method(env, line, pos)
             } else {
                 match cmd_word_at(&lexer, end0, pos, line) {

@@ -250,8 +250,12 @@ cargo build --workspace --release
 ```
 
 GitHub CI builds/tests on Ubuntu and macOS with locked dependencies, runs the conformance harness,
-checks fmt/Clippy, and performs release builds. Release automation produces binaries for x86_64 and
-AArch64 on Linux and macOS.
+checks fmt/Clippy, and performs release builds. Each native release-build job also recreates an
+archive-shaped directory, installs it into a disposable prefix, byte-checks all ten executables and
+man pages, exercises the installed Reef command, validates bash/zsh/fish completions, injects a
+mid-commit failure to prove rollback, performs a clean reinstall, and proves scoped uninstall leaves
+unrelated files intact. Release automation produces binaries for x86_64 and AArch64 on Linux and
+macOS; archives carry the same `install.shl` used by this gate.
 
 ### Workflow supply-chain policy
 

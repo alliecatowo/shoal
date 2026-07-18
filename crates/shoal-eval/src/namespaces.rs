@@ -41,6 +41,7 @@ pub(crate) fn call_method(
     method: &str,
     args: CallArgs,
 ) -> VResult<Value> {
+    crate::namespace_signatures::validate(ns, method, &args)?;
     match ns {
         "json" | "yaml" | "toml" | "csv" => crate::data_codecs::call(ns, method, args),
         "math" => math_ns(method, args),
@@ -51,6 +52,53 @@ pub(crate) fn call_method(
             "field_missing",
             format!("unknown namespace `{ns}`"),
         )),
+    }
+}
+
+#[cfg(test)]
+mod signature_tests {
+    use super::*;
+
+    #[test]
+    fn namespace_calls_reject_extra_or_unknown_arguments_before_dispatch() {
+        let mut evaluator = Evaluator::new("/".into());
+        for (namespace, method, args) in [
+            (
+                "math",
+                "sqrt",
+                CallArgs {
+                    pos: vec![Value::Int(4), Value::Int(999)],
+                    named: vec![],
+                },
+            ),
+            (
+                "json",
+                "parse",
+                CallArgs {
+                    pos: vec![Value::Str("1".into()), Value::Int(999)],
+                    named: vec![],
+                },
+            ),
+            (
+                "http",
+                "get",
+                CallArgs {
+                    pos: vec![Value::Str("https://example.invalid".into())],
+                    named: vec![("surprise".into(), Value::Bool(true))],
+                },
+            ),
+            (
+                "config",
+                "all",
+                CallArgs {
+                    pos: vec![Value::Null],
+                    named: vec![],
+                },
+            ),
+        ] {
+            let error = call_method(&mut evaluator, namespace, method, args).unwrap_err();
+            assert_eq!(error.code, "arg_error", "{namespace}.{method}: {error:?}");
+        }
     }
 }
 

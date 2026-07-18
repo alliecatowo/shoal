@@ -1,24 +1,29 @@
 #!/usr/bin/env shoal
-# Build, install, and byte-verify every shipped Shoal executable.
+# Transactionally install, verify, or uninstall every shipped Shoal artifact.
 
 let options = args.map(.str())
-let supported = ["--clean", "--check"]
+let supported = ["--clean", "--check", "--uninstall"]
 let unknown = options.where(option => !(option in supported))
-assert(unknown.is_empty(), "usage: install.shl [--clean|--check]")
-assert(options.len() <= 1, "usage: install.shl [--clean|--check]")
+assert(unknown.is_empty(), "usage: install.shl [--clean|--check|--uninstall]")
+assert(options.len() <= 1, "usage: install.shl [--clean|--check|--uninstall]")
 
 let clean = options.contains("--clean")
 let check_only = options.contains("--check")
+let uninstall = options.contains("--uninstall")
 let home = (env HOME).out
 assert(home != null, "HOME is not set")
 let cargo_home = (env CARGO_HOME).out ?? "{home}/.cargo"
 let install_override = (env SHOAL_INSTALL_DIR).out
 let install_dir = path(install_override ?? "{cargo_home}/bin")
 assert(install_dir.display() != "" && install_dir.display() != "/", "unsafe install directory: {install_dir}")
-let man_override = (env SHOAL_MAN_DIR).out
 let prefix = install_dir.parent ?? path(cargo_home)
+assert(prefix.display() != "" && prefix.display() != "/", "unsafe install prefix: {prefix}")
+let man_override = (env SHOAL_MAN_DIR).out
 let man_dir = path(man_override ?? prefix.join("share/man/man1").display())
 assert(man_dir.display() != "" && man_dir.display() != "/", "unsafe man directory: {man_dir}")
+let bash_dir = prefix.join("share/bash-completion/completions")
+let zsh_dir = prefix.join("share/zsh/site-functions")
+let fish_dir = prefix.join("share/fish/vendor_completions.d")
 
 let binaries = [
   "shoal",
@@ -32,47 +37,220 @@ let binaries = [
   "shoal-sandbox-exec",
   "shoal-landlock-helper",
 ]
+let pages = binaries.map(binary => "{binary}.1")
+let completion_destinations = [
+  bash_dir.join("shoal"),
+  zsh_dir.join("_shoal"),
+  fish_dir.join("shoal.fish"),
+]
+let destinations = binaries.map(binary => install_dir.join(binary)) + pages.map(page => man_dir.join(page)) + completion_destinations
 
-let lock_rows = (reef lock)
-let lock_failures = lock_rows.where(row => row.locked != true)
-assert(lock_failures.is_empty(), "Reef could not lock the repository toolchain: {lock_failures}")
-let pages = glob("man/*.1").expand()
-assert(pages.len() == binaries.len(), "expected {binaries.len()} man pages, found {pages.len()}")
-
-if !check_only {
-  if clean { run("cargo", "clean", "--release") }
-  run("cargo", "build", "--workspace", "--release", "--locked")
-  run("install", "-d", "-m", "0755", install_dir)
-  run("install", "-d", "-m", "0755", man_dir)
-  for binary in binaries {
-    let release = path("target/release").join(binary)
-    let destination = install_dir.join(binary)
-    assert(release.is_file, "missing release artifact: {release}")
-    run("install", "-m", "0755", release, destination)
+# Uninstall is deliberately source-independent: an extracted release can be
+# removed even after its archive/build tree has gone away. Only the exact
+# managed files are touched; shared directory ownership is never assumed.
+if (uninstall) {
+  for destination in destinations {
+    let linked = run("test", "-L", destination).ok
+    if (linked || destination.exists) {
+      assert(linked || destination.is_file, "refusing to uninstall non-file artifact: {destination}")
+      rm --permanent (destination)
+    }
   }
-  for page in pages {
-    run("install", "-m", "0644", page, man_dir.join(page.name))
-  }
+  echo "uninstalled {destinations.len()} managed Shoal artifacts under {prefix}"
+  exit 0
 }
+
+# A release archive points this at its extracted root. Repository/mise installs
+# use target/release and the checked-in man directory.
+let release_override = (env SHOAL_RELEASE_DIR).out
+let release_dir = path(release_override ?? "target/release")
+let archive_man_dir = release_dir.join("man")
+let source_man_dir = if (archive_man_dir.is_dir) { archive_man_dir } else { path("man") }
+let source_shoal = release_dir.join("shoal")
 
 for binary in binaries {
-  let release = path("target/release").join(binary)
-  let installed = install_dir.join(binary)
-  assert(release.is_file, "missing release artifact: {release}")
-  assert(installed.is_file, "missing installed executable: {installed}")
-  let comparison = run("cmp", "-s", release, installed)
-  assert(comparison.ok, "installed executable differs from release artifact: {installed}")
+  let source = release_dir.join(binary)
+  assert(source.is_file, "missing release executable: {source}; run the release build first")
 }
-
 for page in pages {
-  let installed = man_dir.join(page.name)
-  assert(installed.is_file, "missing installed man page: {installed}")
-  let comparison = run("cmp", "-s", page, installed)
-  assert(comparison.ok, "installed man page differs from source: {installed}")
+  let source = source_man_dir.join(page)
+  assert(source.is_file, "missing source man page: {source}")
+}
+for destination in destinations {
+  let linked = run("test", "-L", destination).ok
+  if (linked || destination.exists) {
+    assert(!linked, "refusing symbolic-link managed artifact: {destination}")
+    assert(destination.is_file, "refusing non-file managed artifact: {destination}")
+  }
+}
+if (check_only) {
+  for destination in destinations {
+    assert(destination.is_file, "missing installed artifact: {destination}")
+  }
 }
 
-env.SHOAL_BIN_DIR = install_dir.display()
-run("scripts/help-audit.shl")
+# Every generated/composed artifact is complete before the first destination
+# mutation. The transaction directory is private to this process and removed
+# on success or handled failure.
+run("install", "-d", "-m", "0755", prefix)
+let transaction = prefix.join(".shoal-install-{os.pid()}")
+assert(!transaction.exists, "install transaction already exists: {transaction}")
+let stage = transaction.join("stage")
+let backup = transaction.join("backup")
+run("install", "-d", "-m", "0700", stage, backup)
+
+let binary_artifacts = binaries.map(binary => {
+  name: binary,
+  source: release_dir.join(binary),
+  staged: stage.join("bin").join(binary),
+  backup: backup.join("bin").join(binary),
+  destination: install_dir.join(binary),
+  incoming: install_dir.join(".{binary}.shoal-install-{os.pid()}"),
+  mode: "0755",
+})
+let man_artifacts = pages.map(page => {
+  name: page,
+  source: source_man_dir.join(page),
+  staged: stage.join("man").join(page),
+  backup: backup.join("man").join(page),
+  destination: man_dir.join(page),
+  incoming: man_dir.join(".{page}.shoal-install-{os.pid()}"),
+  mode: "0644",
+})
+let completion_artifacts = [
+  {
+    name: "completion-bash",
+    shell: "bash",
+    staged: stage.join("completion").join("shoal"),
+    backup: backup.join("completion").join("shoal"),
+    destination: bash_dir.join("shoal"),
+    incoming: bash_dir.join(".shoal.shoal-install-{os.pid()}"),
+    mode: "0644",
+  },
+  {
+    name: "completion-zsh",
+    shell: "zsh",
+    staged: stage.join("completion").join("_shoal"),
+    backup: backup.join("completion").join("_shoal"),
+    destination: zsh_dir.join("_shoal"),
+    incoming: zsh_dir.join("._shoal.shoal-install-{os.pid()}"),
+    mode: "0644",
+  },
+  {
+    name: "completion-fish",
+    shell: "fish",
+    staged: stage.join("completion").join("shoal.fish"),
+    backup: backup.join("completion").join("shoal.fish"),
+    destination: fish_dir.join("shoal.fish"),
+    incoming: fish_dir.join(".shoal.fish.shoal-install-{os.pid()}"),
+    mode: "0644",
+  },
+]
+
+for artifact in binary_artifacts + man_artifacts {
+  run("install", "-d", "-m", "0700", artifact.staged.parent, artifact.backup.parent)
+  let copied = run("install", "-m", artifact.mode, artifact.source, artifact.staged)
+  assert(copied.ok, "stage {artifact.name}: {copied.err}")
+}
+run("install", "-d", "-m", "0700", stage.join("completion"), backup.join("completion"))
+for artifact in completion_artifacts {
+  let generated = run(source_shoal, "completions", artifact.shell)
+  assert(generated.ok, "generate {artifact.shell} completion: {generated.err}")
+  assert(generated.stdout.len() > 0, "empty generated completion: {artifact.shell}")
+  generated.stdout.save(artifact.staged)
+  assert(artifact.staged.is_file, "missing generated completion: {artifact.shell}")
+}
+
+let artifacts = binary_artifacts + man_artifacts + completion_artifacts
+
+if (check_only) {
+  var mismatch = null
+  for artifact in artifacts {
+    let comparison = run("cmp", "-s", artifact.staged, artifact.destination)
+    if (mismatch == null && !comparison.ok) {
+      mismatch = "installed artifact differs from release input: {artifact.destination}"
+    }
+  }
+  rm --permanent --recursive (transaction)
+  assert(mismatch == null, mismatch ?? "installed artifact verification failed")
+  echo "verified {artifacts.len()} installed Shoal artifacts under {prefix}"
+  exit 0
+}
+
+# Snapshot every old managed file before mutating any destination. Directories
+# and other surprising types are rejected rather than overwritten.
+for artifact in artifacts {
+  if (artifact.destination.exists) {
+    let saved = run("install", "-m", artifact.mode, artifact.destination, artifact.backup)
+    assert(saved.ok, "backup {artifact.destination}: {saved.err}")
+  }
+}
+
+var failure = null
+if (clean) {
+  for artifact in artifacts {
+    if (failure == null && artifact.destination.exists) {
+      let removed = run("rm", "-f", artifact.destination)
+      if (!removed.ok) { failure = "clean remove {artifact.destination}: {removed.err}" }
+    }
+  }
+}
+
+let injected_text = (env SHOAL_INSTALL_TEST_FAIL_AFTER).out
+let injected_after = if injected_text == null || injected_text == "" { null } else { injected_text.parse_int() }
+if (injected_after != null) {
+  assert(injected_after > 0 && injected_after <= artifacts.len(), "invalid SHOAL_INSTALL_TEST_FAIL_AFTER")
+}
+
+var installed_count = 0
+for artifact in artifacts {
+  if (failure == null) {
+    run("install", "-d", "-m", "0755", artifact.destination.parent)
+    let copied = run("install", "-m", artifact.mode, artifact.staged, artifact.incoming)
+    if (!copied.ok) {
+      failure = "prepare {artifact.destination}: {copied.err}"
+    } else {
+      let replaced = run("mv", "-f", artifact.incoming, artifact.destination)
+      if (!replaced.ok) {
+        failure = "replace {artifact.destination}: {replaced.err}"
+      } else {
+        installed_count += 1
+        if (injected_after != null && installed_count == injected_after) {
+          failure = "injected failure after {installed_count} committed artifacts"
+        }
+      }
+    }
+  }
+}
+
+if (failure != null) {
+  # Restore the complete pre-transaction set, not merely the prefix committed
+  # before failure. This also reverses `--clean` removals.
+  for artifact in artifacts {
+    if (artifact.incoming.exists) { rm --permanent (artifact.incoming) }
+    if (artifact.backup.is_file) {
+      let restored_copy = run("install", "-m", artifact.mode, artifact.backup, artifact.incoming)
+      assert(restored_copy.ok, "rollback prepare {artifact.destination}: {restored_copy.err}")
+      let restored = run("mv", "-f", artifact.incoming, artifact.destination)
+      assert(restored.ok, "rollback replace {artifact.destination}: {restored.err}")
+    } else if (artifact.destination.exists) {
+      rm --permanent (artifact.destination)
+    }
+  }
+  rm --permanent --recursive (transaction)
+  assert(false, "installation failed and was rolled back: {failure}")
+}
+
+var verification_failure = null
+for artifact in artifacts {
+  let comparison = run("cmp", "-s", artifact.staged, artifact.destination)
+  if (verification_failure == null && !comparison.ok) {
+    verification_failure = "post-install verification failed: {artifact.destination}"
+  }
+}
+rm --permanent --recursive (transaction)
+assert(verification_failure == null, verification_failure ?? "post-install verification failed")
+
 let version = run(install_dir.join("shoal"), "--version").out.trim()
-echo "{version}; installed {binaries.len()} executables and man pages under {prefix}"
+echo "{version}; installed {artifacts.len()} artifacts under {prefix}"
 echo "restart an existing durable shoal-kernel when you are ready to discard its in-memory sessions"

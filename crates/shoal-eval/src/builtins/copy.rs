@@ -1,6 +1,9 @@
 //! Bounded, effect-free recursive-copy planning followed by execution.
 
+mod policy;
+
 use super::admission::{MAX_RETAINED_BYTES, MAX_VALUES};
+use policy::{inspect_source, validate_destination};
 use shoal_value::{ErrorVal, Fs, OpaqueHandling, RetainedLimits, VResult, Value, retained_size};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -11,10 +14,12 @@ const MAX_COPY_DEPTH: usize = 64;
 enum CopyOp {
     CreateDir {
         destination: PathBuf,
+        permissions: std::fs::Permissions,
     },
     CopyFile {
         source: PathBuf,
         destination: PathBuf,
+        permissions: std::fs::Permissions,
     },
 }
 
@@ -93,12 +98,15 @@ impl CopyPlan {
         let metadata = fs
             .symlink_metadata(&path.source)
             .map_err(|error| super::ioerr("copy", &path.source, error))?;
-        if metadata.is_dir() {
+        let source = inspect_source(fs, &path.source, &metadata)?;
+        if source.is_dir {
             if !recursive {
                 return Err(ErrorVal::arg_error("cp: directory requires --recursive"));
             }
+            validate_destination(fs, &path.destination, true)?;
             self.admit(CopyOp::CreateDir {
                 destination: path.destination.clone(),
+                permissions: source.permissions,
             })?;
             let remaining = self
                 .max_operations
@@ -130,9 +138,11 @@ impl CopyPlan {
                 )?;
             }
         } else {
+            validate_destination(fs, &path.destination, false)?;
             self.admit(CopyOp::CopyFile {
                 source: path.source,
                 destination: path.destination,
+                permissions: source.permissions,
             })?;
         }
         Ok(())
@@ -179,10 +189,11 @@ impl CopyPlan {
             )));
         }
         let retained = match &operation {
-            CopyOp::CreateDir { destination } => self.measure_paths(destination, None)?,
+            CopyOp::CreateDir { destination, .. } => self.measure_paths(destination, None)?,
             CopyOp::CopyFile {
                 source,
                 destination,
+                ..
             } => self.measure_paths(source, Some(destination))?,
         };
         self.retained_bytes = self
@@ -223,19 +234,35 @@ impl CopyPlan {
     }
 
     pub(super) fn execute(self, fs: &dyn Fs) -> VResult<()> {
+        let mut directories = Vec::new();
         for operation in self.operations {
             match operation {
-                CopyOp::CreateDir { destination } => fs
-                    .create_dir_all(&destination)
-                    .map_err(|error| super::ioerr("copy", &destination, error))?,
+                CopyOp::CreateDir {
+                    destination,
+                    permissions,
+                } => {
+                    fs.create_dir_all(&destination)
+                        .map_err(|error| super::ioerr("copy", &destination, error))?;
+                    directories.push((destination, permissions));
+                }
                 CopyOp::CopyFile {
                     source,
                     destination,
+                    permissions,
                 } => {
                     fs.copy(&source, &destination)
                         .map_err(|error| super::ioerr("copy", &source, error))?;
+                    fs.set_permissions(&destination, permissions)
+                        .map_err(|error| super::ioerr("copy", &destination, error))?;
                 }
             }
+        }
+        // Apply directory modes deepest-first only after children exist. A
+        // read-only source directory must not make its destination
+        // unpopulatable halfway through execution.
+        for (destination, permissions) in directories.into_iter().rev() {
+            fs.set_permissions(&destination, permissions)
+                .map_err(|error| super::ioerr("copy", &destination, error))?;
         }
         Ok(())
     }
@@ -247,8 +274,12 @@ impl CopyPlan {
 /// exist yet.
 fn validate_root_job(fs: &dyn Fs, source: &Path, destination: &Path) -> VResult<()> {
     let source_metadata = fs
-        .metadata(source)
+        .symlink_metadata(source)
         .map_err(|error| super::ioerr("copy", source, error))?;
+    // Root links (especially broken ones) must receive the same typed
+    // preflight refusal as nested links rather than failing incidentally in
+    // canonicalize or during execution.
+    inspect_source(fs, source, &source_metadata)?;
     let canonical_source = fs
         .canonicalize(source)
         .map_err(|error| super::ioerr("copy", source, error))?;
@@ -386,6 +417,51 @@ mod tests {
     use super::*;
     use shoal_value::StdFs;
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn set_xattr(path: &Path) {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let name = CString::new("user.shoal-copy-test").unwrap();
+        let value = b"metadata";
+        // SAFETY: both C strings and the byte slice remain live for the call,
+        // and their explicit lengths match their buffers.
+        let result = unsafe {
+            libc::setxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                value.as_ptr().cast(),
+                value.len(),
+                0,
+            )
+        };
+        assert_eq!(result, 0, "{}", std::io::Error::last_os_error());
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn set_xattr(path: &Path) {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let name = CString::new("user.shoal-copy-test").unwrap();
+        let value = b"metadata";
+        // SAFETY: both C strings and the byte slice remain live for the call,
+        // and their explicit lengths match their buffers.
+        let result = unsafe {
+            libc::setxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                value.as_ptr().cast(),
+                value.len(),
+                0,
+                0,
+            )
+        };
+        assert_eq!(result, 0, "{}", std::io::Error::last_os_error());
+    }
+
     #[test]
     fn copy_plan_rejects_before_mutation_when_the_tree_exceeds_a_wall() {
         let root = tempfile::tempdir().unwrap();
@@ -477,6 +553,23 @@ mod tests {
         assert_eq!(std::fs::read(source).unwrap(), b"payload");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn copy_rejects_an_unrelated_hard_link_destination_before_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let aliased = root.path().join("aliased");
+        let destination = root.path().join("destination");
+        std::fs::write(&source, b"new").unwrap();
+        std::fs::write(&aliased, b"old").unwrap();
+        std::fs::hard_link(&aliased, &destination).unwrap();
+
+        let error = CopyPlan::build(&StdFs, &[(source, destination)], false).unwrap_err();
+        assert_eq!(error.code, "arg_error");
+        assert!(error.msg.contains("hard-linked"));
+        assert_eq!(std::fs::read(aliased).unwrap(), b"old");
+    }
+
     #[test]
     fn recursive_copy_rejects_a_missing_destination_inside_source() {
         let root = tempfile::tempdir().unwrap();
@@ -509,5 +602,188 @@ mod tests {
         assert_eq!(error.code, "arg_error");
         assert!(error.msg.contains("into itself"));
         assert!(!source.join("backup").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_copy_rejects_live_and_broken_symlinks_before_mutation() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let destination = root.path().join("destination");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("ordinary"), b"payload").unwrap();
+        symlink("ordinary", source.join("live-link")).unwrap();
+        symlink("missing", source.join("broken-link")).unwrap();
+
+        let error = CopyPlan::build(&StdFs, &[(source, destination.clone())], true).unwrap_err();
+        assert_eq!(error.code, "arg_error");
+        assert!(error.msg.contains("symbolic links"));
+        assert!(!destination.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_rejects_a_symlink_destination_without_touching_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let target = root.path().join("target");
+        let destination = root.path().join("destination");
+        std::fs::write(&source, b"new").unwrap();
+        std::fs::write(&target, b"old").unwrap();
+        symlink(&target, &destination).unwrap();
+
+        let error = CopyPlan::build(&StdFs, &[(source, destination.clone())], false).unwrap_err();
+        assert_eq!(error.code, "arg_error");
+        assert!(error.msg.contains("destination"));
+        assert_eq!(std::fs::read(&target).unwrap(), b"old");
+        assert!(
+            std::fs::symlink_metadata(destination)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_copy_rejects_sparse_files_before_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let destination = root.path().join("destination");
+        std::fs::create_dir(&source).unwrap();
+        let sparse = std::fs::File::create(source.join("sparse")).unwrap();
+        sparse.set_len(8 * 1024 * 1024).unwrap();
+
+        let error = CopyPlan::build(&StdFs, &[(source, destination.clone())], true).unwrap_err();
+        assert_eq!(error.code, "arg_error");
+        assert!(error.msg.contains("sparse"));
+        assert!(!destination.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_copy_rejects_fifo_without_opening_or_blocking() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let destination = root.path().join("destination");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("ordinary"), b"payload").unwrap();
+        let fifo = CString::new(source.join("fifo").as_os_str().as_bytes()).unwrap();
+        // SAFETY: `fifo` is a live NUL-terminated path and mode contains only
+        // ordinary permission bits.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+
+        let started = std::time::Instant::now();
+        let error = CopyPlan::build(&StdFs, &[(source, destination.clone())], true).unwrap_err();
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(error.code, "arg_error");
+        assert!(error.msg.contains("special files"));
+        assert!(!destination.exists());
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    #[test]
+    fn recursive_copy_rejects_source_and_destination_xattrs_before_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let destination = root.path().join("destination");
+        std::fs::write(&source, b"payload").unwrap();
+        set_xattr(&source);
+        let error =
+            CopyPlan::build(&StdFs, &[(source.clone(), destination.clone())], false).unwrap_err();
+        assert_eq!(error.code, "arg_error");
+        assert!(error.msg.contains("extended attributes"));
+        assert!(!destination.exists());
+
+        std::fs::remove_file(&source).unwrap();
+        std::fs::write(&source, b"new").unwrap();
+        std::fs::write(&destination, b"old").unwrap();
+        set_xattr(&destination);
+        let error = CopyPlan::build(&StdFs, &[(source, destination.clone())], false).unwrap_err();
+        assert_eq!(error.code, "arg_error");
+        assert!(error.msg.contains("destination"));
+        assert_eq!(std::fs::read(destination).unwrap(), b"old");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_preserves_rwx_modes_but_rejects_special_permission_bits() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let destination = root.path().join("destination");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o751)).unwrap();
+        let file = source.join("tool");
+        std::fs::write(&file, b"payload").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        CopyPlan::build(&StdFs, &[(source.clone(), destination.clone())], true)
+            .unwrap()
+            .execute(&StdFs)
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&destination)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o751
+        );
+        assert_eq!(
+            std::fs::metadata(destination.join("tool"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
+
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o4640)).unwrap();
+        let rejected = root.path().join("rejected");
+        let error = CopyPlan::build(&StdFs, &[(file, rejected.clone())], false).unwrap_err();
+        assert_eq!(error.code, "arg_error");
+        assert!(error.msg.contains("setuid"));
+        assert!(!rejected.exists());
+    }
+
+    #[test]
+    fn copy_intentionally_does_not_preserve_modification_times() {
+        use std::fs::FileTimes;
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let destination = root.path().join("destination");
+        std::fs::write(&source, b"payload").unwrap();
+        let old = UNIX_EPOCH + Duration::from_secs(946_684_800);
+        std::fs::File::open(&source)
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(old))
+            .unwrap();
+
+        CopyPlan::build(&StdFs, &[(source.clone(), destination.clone())], false)
+            .unwrap()
+            .execute(&StdFs)
+            .unwrap();
+        assert_eq!(std::fs::metadata(source).unwrap().modified().unwrap(), old);
+        assert_ne!(
+            std::fs::metadata(destination).unwrap().modified().unwrap(),
+            old,
+            "copy timestamps are intentionally publication time, not source metadata"
+        );
     }
 }

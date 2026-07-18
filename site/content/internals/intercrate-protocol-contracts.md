@@ -130,7 +130,8 @@ accDescr: Shows the components and relationships described in Evaluator port con
 The filesystem port covers whole-file read/string read, seekable read, write, append,
 **open-for-append** (`open_append`, the open-once incremental writer backing the stream sink),
 touch, metadata/symlink metadata, regular-file check, directory enumeration, directory
-creation/removal, file removal, rename, copy, hardlink, and symlink. The standard adapter delegates
+creation/removal, file removal, rename, copy, permission updates, extended-attribute inspection,
+hardlink, and symlink. The standard adapter delegates
 to `std::fs`. `open_append`'s trait default fails closed (`ErrorKind::Unsupported`) so an adapter
 that mediates effects must implement it rather than let a streamed append escape.
 

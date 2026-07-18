@@ -2,13 +2,17 @@
 
 use super::admission::OutputBudget;
 use super::{ioerr, paths};
-use shoal_value::{ErrorVal, Fs, Record, VResult, Value};
+use shoal_value::{ErrorVal, Fs, FsEntryIdentity, Record, VResult, Value};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+mod mutation;
+pub(super) use mutation::move_to_trash;
+use mutation::permanently_remove;
 
 static TRASH_SEQ: AtomicU64 = AtomicU64::new(1);
 static TRASH_SESSION: OnceLock<String> = OnceLock::new();
@@ -20,6 +24,8 @@ const WARNING_MAX_MESSAGE_BYTES: usize = 1024;
 
 struct RemovalPlan {
     path: PathBuf,
+    action_path: PathBuf,
+    identity: FsEntryIdentity,
     is_dir: bool,
     entry_name: Option<String>,
     primary_target: Option<PathBuf>,
@@ -29,6 +35,7 @@ struct RemovalPlan {
 struct RemovalCandidate {
     path: PathBuf,
     resolved_entry: PathBuf,
+    identity: FsEntryIdentity,
     is_dir: bool,
     #[cfg(unix)]
     device: u64,
@@ -75,14 +82,7 @@ fn remove_with_budget(
     )?;
 
     if permanent {
-        for plan in &plans {
-            if plan.is_dir {
-                fs.remove_dir_all(&plan.path)
-            } else {
-                fs.remove_file(&plan.path)
-            }
-            .map_err(|error| ioerr("remove", &plan.path, error))?;
-        }
+        permanently_remove(fs, &plans)?;
         return Ok(Value::List(
             plans
                 .into_iter()
@@ -112,11 +112,11 @@ fn remove_with_budget(
             .as_deref()
             .expect("trash plan has entry name");
         let target = move_to_trash(
-            &plan.path,
+            &plan.action_path,
             primary_session
                 .as_ref()
                 .and_then(|_| plan.primary_target.clone()),
-            |source, target| fs.rename(source, target),
+            |source, target| fs.rename_if_unchanged(source, target, &plan.identity),
             || {
                 let root = plan
                     .adjacent_root
@@ -179,6 +179,7 @@ fn preflight(
             candidates.push(RemovalCandidate {
                 path,
                 resolved_entry,
+                identity: FsEntryIdentity::from_metadata(&metadata),
                 is_dir: metadata.is_dir(),
                 device: metadata.dev(),
                 inode: metadata.ino(),
@@ -188,6 +189,7 @@ fn preflight(
         candidates.push(RemovalCandidate {
             path,
             resolved_entry,
+            identity: FsEntryIdentity::from_metadata(&metadata),
             is_dir: metadata.is_dir(),
         });
     }
@@ -199,32 +201,34 @@ fn preflight(
     let mut plans = Vec::with_capacity(candidates.len());
     for (index, candidate) in candidates.into_iter().enumerate() {
         let path = candidate.path;
-        if permanent {
-            budget.admit_value(&Value::Path(path.clone()))?;
-            plans.push(RemovalPlan {
-                path,
-                is_dir: candidate.is_dir,
-                entry_name: None,
-                primary_target: None,
-                adjacent_root: None,
-            });
-            continue;
-        }
-
         let sequence = TRASH_SEQ.fetch_add(1, Ordering::Relaxed);
         let name = path
             .file_name()
             .unwrap_or_else(|| OsStr::new("item"))
             .to_string_lossy();
         let entry_name = format!("{sequence}-{name}");
-        let primary_target = primary_session.map(|session| session.join(&entry_name));
-        let parent = path.parent().ok_or_else(|| {
+        let parent = candidate.resolved_entry.parent().ok_or_else(|| {
             ErrorVal::new(
                 "io_error",
                 format!("trash: {} has no parent directory", path.display()),
             )
         })?;
         let adjacent_root = parent.join(adjacent_trash_name());
+        if permanent {
+            budget.admit_value(&Value::Path(path.clone()))?;
+            plans.push(RemovalPlan {
+                path,
+                action_path: candidate.resolved_entry,
+                identity: candidate.identity,
+                is_dir: candidate.is_dir,
+                entry_name: Some(entry_name),
+                primary_target: None,
+                adjacent_root: Some(adjacent_root),
+            });
+            continue;
+        }
+
+        let primary_target = primary_session.map(|session| session.join(&entry_name));
         let adjacent_target = adjacent_root.join(trash_session_name()).join(&entry_name);
         let widest_target = primary_target
             .as_ref()
@@ -253,6 +257,8 @@ fn preflight(
         budget.admit_value(&Value::Record(report))?;
         plans.push(RemovalPlan {
             path,
+            action_path: candidate.resolved_entry,
+            identity: candidate.identity,
             is_dir: candidate.is_dir,
             entry_name: Some(entry_name),
             primary_target,
@@ -354,26 +360,6 @@ fn removal_identity_error(path: &Path, detail: impl std::fmt::Display) -> ErrorV
     )
 }
 
-pub(super) fn move_to_trash(
-    source: &Path,
-    primary_target: Option<PathBuf>,
-    mut rename: impl FnMut(&Path, &Path) -> std::io::Result<()>,
-    mut adjacent_target: impl FnMut() -> VResult<PathBuf>,
-) -> VResult<PathBuf> {
-    if let Some(target) = primary_target {
-        match rename(source, &target) {
-            Ok(()) => return Ok(target),
-            Err(error) if !is_cross_device(&error) => {
-                return Err(ioerr("trash", source, error));
-            }
-            Err(_) => {}
-        }
-    }
-    let target = adjacent_target()?;
-    rename(source, &target).map_err(|error| ioerr("trash", source, error))?;
-    Ok(target)
-}
-
 fn primary_trash_root() -> PathBuf {
     shoal_paths::ShoalPaths::discover()
         .runtime_dir()
@@ -451,10 +437,6 @@ pub(super) fn validate_private_trash_dir(fs: &dyn Fs, path: &Path) -> std::io::R
             format!("trash directory {} is not a directory", path.display()),
         ))
     }
-}
-
-fn is_cross_device(error: &std::io::Error) -> bool {
-    error.raw_os_error() == Some(libc::EXDEV)
 }
 
 pub(super) fn prune_stale_trash_root(
@@ -804,5 +786,100 @@ mod tests {
                 .iter()
                 .all(|row| !row.contains_key("trash_cleanup_warnings"))
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permanent_remove_refuses_final_entry_replacement_before_deletion() {
+        let root = tempfile::tempdir().unwrap();
+        let victim = root.path().join("victim");
+        let original = root.path().join("original-moved-by-attacker");
+        std::fs::write(&victim, b"expected").unwrap();
+        let mut budget = OutputBudget::new();
+        let plans =
+            preflight(&StdFs, vec![victim.clone()], true, false, None, &mut budget).unwrap();
+
+        std::fs::rename(&victim, &original).unwrap();
+        std::fs::write(&victim, b"replacement").unwrap();
+        let error = permanently_remove(&StdFs, &plans).unwrap_err();
+
+        assert_eq!(error.code, "rm_path_changed");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"replacement");
+        assert_eq!(std::fs::read(&original).unwrap(), b"expected");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permanent_remove_refuses_ancestor_replacement_before_deletion() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("parent");
+        let displaced = root.path().join("displaced-parent");
+        let victim = parent.join("victim");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::write(&victim, b"expected").unwrap();
+        let mut budget = OutputBudget::new();
+        let plans =
+            preflight(&StdFs, vec![victim.clone()], true, false, None, &mut budget).unwrap();
+
+        std::fs::rename(&parent, &displaced).unwrap();
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::write(&victim, b"replacement").unwrap();
+        let error = permanently_remove(&StdFs, &plans).unwrap_err();
+
+        assert_eq!(error.code, "rm_path_changed");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"replacement");
+        assert_eq!(
+            std::fs::read(displaced.join("victim")).unwrap(),
+            b"expected"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trash_move_rolls_back_a_replaced_final_entry() {
+        let root = tempfile::tempdir().unwrap();
+        let victim = root.path().join("victim");
+        let original = root.path().join("original-moved-by-attacker");
+        std::fs::write(&victim, b"expected").unwrap();
+        let mut budget = OutputBudget::new();
+        let mut plans = preflight(
+            &StdFs,
+            vec![victim.clone()],
+            false,
+            false,
+            None,
+            &mut budget,
+        )
+        .unwrap();
+        let plan = plans.pop().unwrap();
+
+        std::fs::rename(&victim, &original).unwrap();
+        std::fs::write(&victim, b"replacement").unwrap();
+        let trash_root = plan.adjacent_root.as_ref().unwrap();
+        let mut warnings = WarningCollector::default();
+        let session = prepare_trash_session(&StdFs, trash_root, &mut warnings).unwrap();
+        let target = session.join(plan.entry_name.as_deref().unwrap());
+        let error = move_to_trash(
+            &plan.action_path,
+            None,
+            |source, target| StdFs.rename_if_unchanged(source, target, &plan.identity),
+            || Ok(target.clone()),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "rm_path_changed");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"replacement");
+        assert_eq!(std::fs::read(&original).unwrap(), b"expected");
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn removal_execution_has_no_unguarded_source_mutation() {
+        let source = include_str!("trash/mutation.rs");
+        let execution = source;
+        assert!(execution.contains("rename_if_unchanged"));
+        assert!(!execution.contains("fs.rename("));
+        assert!(!execution.contains("fs.remove_file(&plan.path)"));
+        assert!(!execution.contains("fs.remove_dir_all(&plan.path)"));
     }
 }

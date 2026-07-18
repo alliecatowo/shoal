@@ -207,7 +207,7 @@ sandbox can enforce them:
 | `shoal-value` `ports.rs::StdFs` | every `std::fs` syscall | the port adapter itself — the boundary, not a bypass |
 | `shoal-eval` `path_access.rs::path_fs_method` — path `.read`/`.read_bytes`/`.lines`/`.exists`/`.is_dir`/`.is_file`/`.size`/`.modified` | bounded streaming read / stat | `self.fs.open_read` / `.metadata` |
 | `shoal-eval` `command.rs` redirects `>` and `>>` | file write / append | `self.fs.write` / `.append` |
-| `shoal-eval` `builtins.rs` — `cat`/`ls`/`mkdir`/`touch`/`mv`/`cp`/`rm`/`trash`/`ln` | read / write / dir / rename / link | `self.fs.*` |
+| `shoal-eval` `builtins.rs` — `cat`/`ls`/`mkdir`/`touch`/`mv`/`cp`/`rm`/`trash`/`ln` | read / write / dir / rename / link | `self.fs.*`; removal commits use `rename_if_unchanged` |
 | `shoal-eval` `frecency.rs` dir-jump store load/save | read / write / rename | `self.fs.*` |
 | `shoal-eval` `journal.rs` undo snapshot + restore | bounded stable read | `self.fs.read_bounded_stable` |
 | `shoal-eval` `reef_builtins.rs` manifest read | stat / read | `self.fs.is_file` / `.read_to_string` |

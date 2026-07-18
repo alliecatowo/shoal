@@ -724,11 +724,19 @@ fn production_evaluator_has_only_explicit_ambient_filesystem_exceptions() {
         },
         ExpectedLine {
             file: "builtins/copy.rs",
-            text: "if metadata.is_dir() {",
+            text: "if source_metadata.is_dir() && canonical_destination.starts_with(&canonical_source) {",
         },
         ExpectedLine {
-            file: "builtins/copy.rs",
-            text: "if source_metadata.is_dir() && canonical_destination.starts_with(&canonical_source) {",
+            file: "builtins/copy/policy.rs",
+            text: "let is_dir = metadata.is_dir();",
+        },
+        ExpectedLine {
+            file: "builtins/copy/policy.rs",
+            text: "if !is_dir && !metadata.is_file() {",
+        },
+        ExpectedLine {
+            file: "builtins/copy/policy.rs",
+            text: "if source_is_dir != metadata.is_dir() || (!source_is_dir && !metadata.is_file()) {",
         },
         ExpectedLine {
             file: "builtins/trash.rs",

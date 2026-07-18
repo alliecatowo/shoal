@@ -1,0 +1,148 @@
+#!/usr/bin/env shoal
+# Exercise the complete install lifecycle inside a disposable prefix.
+
+assert(args.is_empty(), "usage: install-test.shl")
+let temporary = run("mktemp", "-d")
+assert(temporary.ok, "create temporary install prefix: {temporary.err}")
+let prefix = path(temporary.out.trim())
+assert(prefix.is_dir, "temporary install prefix is missing: {prefix}")
+
+let build_dir = path("target/release")
+let release_dir = prefix.join("release-package")
+let release_man_dir = release_dir.join("man")
+let install_dir = prefix.join("bin")
+let man_dir = prefix.join("share/man/man1")
+let binaries = [
+  "shoal",
+  "shoal-kernel",
+  "shoal-mcp",
+  "shoal-lsp",
+  "shoal-token",
+  "shoal-secret",
+  "shoal-history",
+  "shoal-doctor",
+  "shoal-sandbox-exec",
+  "shoal-landlock-helper",
+]
+let completion_files = [
+  prefix.join("share/bash-completion/completions/shoal"),
+  prefix.join("share/zsh/site-functions/_shoal"),
+  prefix.join("share/fish/vendor_completions.d/shoal.fish"),
+]
+
+# Recreate the shape emitted by release-package.shl so this gate covers the
+# prebuilt/archive path rather than accidentally relying on repository fallbacks.
+run("install", "-d", "-m", "0755", release_dir, release_man_dir)
+for binary in binaries {
+  let source = build_dir.join(binary)
+  assert(source.is_file, "missing release executable: {source}")
+  run("install", "-m", "0755", source, release_dir.join(binary))
+  run("install", "-m", "0644", path("man").join("{binary}.1"), release_man_dir.join("{binary}.1"))
+}
+run("install", "-m", "0755", "scripts/install.shl", release_dir.join("install.shl"))
+let source_shoal = release_dir.join("shoal")
+let installer = release_dir.join("install.shl")
+
+env.SHOAL_RELEASE_DIR = release_dir.display()
+env.SHOAL_INSTALL_DIR = install_dir.display()
+env.SHOAL_MAN_DIR = man_dir.display()
+env.XDG_STATE_HOME = prefix.join("state").display()
+env.XDG_DATA_HOME = prefix.join("data").display()
+env.XDG_CONFIG_HOME = prefix.join("config").display()
+env.XDG_CACHE_HOME = prefix.join("cache").display()
+env.SHOAL_SECRET_DIR = prefix.join("data/secrets").display()
+env.SHOAL_INSTALL_TEST_FAIL_AFTER = ""
+
+# Refuse a managed-path symlink during preflight without touching its target
+# or creating transaction state.
+run("install", "-d", "-m", "0755", install_dir)
+let symlink_target = prefix.join("symlink-target")
+"outside-managed-set\n".save(symlink_target)
+let managed_symlink = install_dir.join("shoal")
+ln --symbolic (symlink_target) (managed_symlink)
+let refused_symlink = run(source_shoal, installer)
+assert(!refused_symlink.ok, "installer accepted a managed-path symlink")
+assert(run("test", "-L", managed_symlink).ok, "installer replaced the refused symlink")
+assert(symlink_target.read == "outside-managed-set\n", "installer touched the symlink target")
+assert(glob("{prefix.display()}/.shoal-install-*").expand().is_empty(), "symlink preflight leaked a transaction directory")
+rm --permanent (managed_symlink)
+
+let installed = run(source_shoal, installer)
+assert(installed.ok, "temporary-prefix install failed: {installed.err}")
+
+for binary in binaries {
+  let source = release_dir.join(binary)
+  let destination = install_dir.join(binary)
+  assert(destination.is_file, "missing installed executable: {destination}")
+  let executable = run("test", "-x", destination)
+  assert(executable.ok, "installed executable is not executable: {destination}")
+  let exact = run("cmp", "-s", source, destination)
+  assert(exact.ok, "installed executable differs: {destination}")
+  let version = run(destination, "--version")
+  assert(version.ok, "installed {binary} --version failed: {version.err}")
+}
+
+for binary in binaries {
+  let source = release_man_dir.join("{binary}.1")
+  let destination = man_dir.join("{binary}.1")
+  assert(destination.is_file, "missing installed man page: {destination}")
+  assert(run("cmp", "-s", source, destination).ok, "installed man page differs: {destination}")
+}
+
+for completion in completion_files {
+  assert(completion.is_file, "missing installed completion: {completion}")
+  assert(completion.read.contains("shoal"), "installed completion is empty/malformed: {completion}")
+}
+
+let reef = run(install_dir.join("shoal"), "-c", "reef doctor")
+assert(reef.ok, "installed Shoal cannot execute Reef: {reef.err}")
+let checked = run(source_shoal, installer, "--check")
+assert(checked.ok, "installed artifact check failed: {checked.err}")
+assert(glob("{prefix.display()}/.shoal-install-*").expand().is_empty(), "successful check leaked a transaction directory")
+
+# Corrupt one old managed file, inject failure after two replacements, and
+# prove rollback restores both a normal release artifact and the exact corrupt
+# pre-transaction file. The failure seam is consumed only by this test.
+let false_path = (which false).out.path
+assert(false_path != null, "the host has no `false` executable for rollback fixture")
+let old_kernel = install_dir.join("shoal-kernel")
+run("install", "-m", "0755", false_path, old_kernel)
+env.SHOAL_INSTALL_TEST_FAIL_AFTER = "2"
+let failed = run(source_shoal, installer)
+assert(!failed.ok, "injected install failure unexpectedly succeeded")
+assert(run("cmp", "-s", source_shoal, install_dir.join("shoal")).ok, "rollback did not restore shoal")
+assert(run("cmp", "-s", false_path, old_kernel).ok, "rollback did not restore prior shoal-kernel")
+assert(glob("{prefix.display()}/.shoal-install-*").expand().is_empty(), "rollback leaked a transaction directory")
+
+# A clean install removes the complete managed set before committing the new
+# set. Its removal phase participates in the same rollback contract.
+let failed_clean = run(source_shoal, installer, "--clean")
+assert(!failed_clean.ok, "injected clean-install failure unexpectedly succeeded")
+assert(run("cmp", "-s", false_path, old_kernel).ok, "clean rollback did not restore prior shoal-kernel")
+assert(glob("{prefix.display()}/.shoal-install-*").expand().is_empty(), "clean rollback leaked a transaction directory")
+
+# A successful clean install then replaces the deliberately stale fixture.
+env.SHOAL_INSTALL_TEST_FAIL_AFTER = ""
+let cleaned = run(source_shoal, installer, "--clean")
+assert(cleaned.ok, "clean temporary-prefix install failed: {cleaned.err}")
+assert(run("cmp", "-s", release_dir.join("shoal-kernel"), old_kernel).ok, "clean install retained stale executable")
+let clean_check = run(source_shoal, installer, "--check")
+assert(clean_check.ok, "clean install verification failed: {clean_check.err}")
+
+# Uninstall is scoped to managed files and leaves unrelated prefix content.
+let marker = prefix.join("keep-me")
+"unrelated\n".save(marker)
+let removed = run(source_shoal, installer, "--uninstall")
+assert(removed.ok, "temporary-prefix uninstall failed: {removed.err}")
+for binary in binaries {
+  assert(!install_dir.join(binary).exists, "uninstall retained executable: {binary}")
+  assert(!man_dir.join("{binary}.1").exists, "uninstall retained man page: {binary}")
+}
+for completion in completion_files {
+  assert(!completion.exists, "uninstall retained completion: {completion}")
+}
+assert(marker.is_file && marker.read == "unrelated\n", "uninstall touched unrelated prefix content")
+assert(glob("{prefix.display()}/.shoal-install-*").expand().is_empty(), "uninstall leaked a transaction directory")
+
+rm --permanent --recursive (prefix)
+echo "temporary-prefix install/check/rollback/clean/uninstall gate passed"

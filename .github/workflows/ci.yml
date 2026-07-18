@@ -73,6 +73,8 @@ jobs:
         run: cargo build -p shoal --locked
       - name: Build release through Shoal
         run: target/debug/shoal scripts/ci-release-build.shl
+      - name: Verify temporary-prefix install lifecycle through Shoal
+        run: target/debug/shoal scripts/install-test.shl
 
   fuzz-build:
     name: fuzz targets build

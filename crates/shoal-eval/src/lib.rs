@@ -20,6 +20,7 @@ mod host;
 mod host_services;
 mod journal;
 mod modules;
+mod namespace_signatures;
 mod namespaces;
 mod path_access;
 mod pattern;
@@ -43,6 +44,7 @@ mod watch_port;
 pub use channels::{EventBus, EventForwarder};
 pub(crate) use child_context::ChildKind;
 pub(crate) use coerce::coerce_word;
+pub use namespace_signatures::{all_namespace_method_names, namespace_method_names};
 pub use reef::{PromptReefBinding, PromptReefSnapshot};
 pub use watch_port::{
     StdWatchPort, WatchEvent, WatchKind, WatchPoll, WatchPort, WatchSubscription,

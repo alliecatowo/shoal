@@ -21,19 +21,29 @@ hide = true
 run = "cargo build --workspace --release --locked"
 
 [tasks.install]
-description = "Build and install every Shoal executable"
+description = "Build and transactionally install binaries, man pages, and completions"
 depends = ["bootstrap:release"]
 run = "target/release/shoal scripts/install.shl"
 
 [tasks."install:clean"]
-description = "Remove release artifacts, then rebuild and install every Shoal executable"
+description = "Remove the managed installed set, then transactionally reinstall it"
 depends = ["bootstrap:release"]
 run = "target/release/shoal scripts/install.shl --clean"
 
 [tasks."install:check"]
-description = "Verify installed Shoal executables match the current release artifacts"
+description = "Verify installed binaries, man pages, and completions"
 depends = ["bootstrap:release"]
 run = "target/release/shoal scripts/install.shl --check"
+
+[tasks."install:uninstall"]
+description = "Remove only the managed Shoal installation artifacts"
+depends = ["bootstrap:debug"]
+run = "target/debug/shoal scripts/install.shl --uninstall"
+
+[tasks."install:test"]
+description = "Exercise install/check/rollback/clean/uninstall in a temporary prefix"
+depends = ["bootstrap:release"]
+run = "target/release/shoal scripts/install-test.shl"
 
 [tasks."reef:lock"]
 description = "Resolve and lock the repository toolchain through Reef"

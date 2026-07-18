@@ -31,6 +31,8 @@ pub mod ports;
 pub mod render;
 
 mod env;
+#[cfg(unix)]
+mod fs_mutation;
 mod json;
 mod outcome;
 mod retained;
@@ -39,8 +41,8 @@ mod task;
 mod value_types;
 
 pub use ports::{
-    BytesLoad, Clock, ConfigPort, ConfigSnapshot, Fs, FsFileSnapshot, Opener, ReadSeek, SecretPort,
-    StdClock, StdFs, StdOpener,
+    BytesLoad, Clock, ConfigPort, ConfigSnapshot, Fs, FsEntryIdentity, FsFileSnapshot, Opener,
+    ReadSeek, SecretPort, StdClock, StdFs, StdOpener,
 };
 
 pub use env::{AssignError, Binding, Env};

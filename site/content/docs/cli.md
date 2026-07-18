@@ -164,7 +164,12 @@ shoal completions zsh > ~/.zfunc/_shoal
 shoal completions fish > ~/.config/fish/completions/shoal.fish
 ```
 
-These completions are for invoking the `shoal` executable from another shell. Shoal's own REPL completion engine is configured under `[completion]` and understands language names, builtins, adapters, methods, variables, and `PATH` programs.
+These generated scripts share one checked vocabulary with the CLI help surfaces, including every
+top-level command, root option, kernel/prompt action, and command-specific option. Bash, Zsh, and
+Fish syntax is smoke-tested when the corresponding shell is installed. These completions invoke the
+`shoal` executable from another shell; Shoal's own REPL completion engine is configured under
+`[completion]` and understands language names, builtins, adapters, methods, variables, and `PATH`
+programs.
 
 ## Inspect the prompt
 

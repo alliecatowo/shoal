@@ -27,6 +27,9 @@ pub(super) fn infer_receiver_type(env: &Env, line: &str, dot_pos: usize) -> Opti
                 keyword if RESERVED.contains(&keyword) => return None,
                 _ => {}
             }
+            if shoal_eval::namespace_method_names(name).next().is_some() {
+                return Some(format!("namespace:{name}"));
+            }
             // `a.b.` has a computed receiver whose type is not available from
             // lexical context alone.
             if matches!(

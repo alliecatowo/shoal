@@ -66,7 +66,7 @@ facade are implemented and tested on Linux and macOS.
 deliberate port (see [Current status and limits](https://alliecatowo.github.io/shoal/docs/status-limits/)).
 
 ```bash
-# Install the pinned tools, then all ten binaries and man pages
+# Install the pinned tools, then all binaries, man pages, and host-shell completions
 mise install
 mise run install
 

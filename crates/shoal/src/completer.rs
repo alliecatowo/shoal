@@ -470,6 +470,17 @@ mod tests {
     }
 
     #[test]
+    fn namespace_completion_uses_the_runtime_signature_registry() {
+        let mut completer = completer_with(Env::root());
+        let json = cands(&mut completer, "json.");
+        assert_eq!(json, vec!["parse", "stringify"]);
+
+        let math = cands(&mut completer, "math.sq");
+        assert_eq!(math, vec!["sqrt"]);
+        assert!(!has(&json, "upper"));
+    }
+
+    #[test]
     fn method_completion_infers_binding_receiver_type() {
         // `xs.` where `xs` is a live list binding → list methods, not str ops.
         let env = Env::root();

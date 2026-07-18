@@ -315,12 +315,15 @@ impl LanguageServer for Backend {
                     let facts = symbol_facts(symbol);
                     let source = resolve_command_source(&label, facts);
                     let keyword = is_keyword(&label) && symbol.is_none();
+                    let namespace_method = is_namespace_method(&label) && symbol.is_none();
                     CompletionItem {
                         kind: Some(
                             symbol.map_or_else(|| completion_kind(&label), Symbol::completion_kind),
                         ),
                         detail: Some(if keyword {
                             "language keyword".into()
+                        } else if namespace_method {
+                            "namespace method".into()
                         } else {
                             format!("{} — {}", source.as_str(), source.reason())
                         }),
@@ -526,12 +529,19 @@ mod tests {
         for head in ["cd", "ls", "reef", "jobs", "history", "undo", "plan"] {
             assert!(vocab.contains(&head), "missing builtin `{head}`");
         }
+        for method in ["parse", "stringify", "sqrt", "hostname"] {
+            assert!(
+                vocab.contains(&method),
+                "missing namespace method `{method}`"
+            );
+        }
     }
 
     #[test]
     fn completion_kinds_use_shared_command_classification() {
         assert_eq!(completion_kind("ls"), CompletionItemKind::FUNCTION);
         assert_eq!(completion_kind("cd"), CompletionItemKind::FUNCTION);
+        assert_eq!(completion_kind("sqrt"), CompletionItemKind::FUNCTION);
         assert_eq!(completion_kind("let"), CompletionItemKind::KEYWORD);
     }
 

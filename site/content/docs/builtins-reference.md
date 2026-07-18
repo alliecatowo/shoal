@@ -245,6 +245,29 @@ both entry count and aggregate encoded path bytes while reading. A preflight fai
 destination untouched. This is an allocation/effect-order guarantee, not an atomicity guarantee for
 an I/O failure that occurs after execution begins.
 
+The copy tree has an explicit portable metadata contract:
+
+- ordinary regular files and directories are accepted; symbolic links (live or broken), FIFOs,
+  sockets, device nodes, sparse files, and Unix setuid/setgid/sticky bits are rejected during the
+  complete preflight;
+- portable/user extended attributes are not silently dropped: a source or existing destination
+  carrying any is rejected before mutation. Mandatory host security labels such as SELinux labels,
+  which policy recreates for every new node, are treated as destination policy rather than portable
+  source metadata;
+- existing destinations must have the matching ordinary node type; symbolic links, special nodes,
+  and multiply-linked destination files are rejected rather than followed or modified through an
+  alias;
+- ordinary read/write/execute permissions are explicitly applied to copied files and directories.
+  Directory permissions are finalized deepest-first after their children are populated;
+- ownership and access/modification/birth timestamps are intentionally not preserved. New nodes are
+  owned by the copying process and timestamps describe the copy operation. Sparse allocation must be
+  materialized deliberately outside `cp` before copying.
+
+Filesystem adapters must implement extended-attribute inspection and permission updates to support
+`cp`; an adapter that cannot prove those parts of the contract fails closed. A hostile filesystem can
+still replace an admitted path between preflight and execution, so this is a deterministic metadata
+policy and effect-order guarantee, not a claim that pathname races are eliminated.
+
 When a journaled statement overwrites a file and the complete prior bytes fit the journal limit, Shoal records a restore inverse for `undo`. A too-large prior file is left non-reversible rather than storing a truncated inverse.
 
 ### `mv`

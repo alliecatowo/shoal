@@ -199,7 +199,12 @@ order.
 
 Multiple `cp`/`mv` sources require a directory destination. Copy recurses only with a recursive flag;
 move always uses `Fs::rename`. Recursive copy follows the type information exposed by the `Fs` port
-and creates destination directories as it descends.
+and creates destination directories as it descends. Its portable preflight admits only ordinary
+files/directories without sparse allocation, extended attributes, or Unix special mode bits; it
+rejects links and special nodes rather than inheriting `std::fs::copy`'s follow/open behavior.
+`Fs::has_extended_attributes` and `Fs::set_permissions` make metadata inspection/application explicit
+for adapters. Execution applies file modes after each content copy and directory modes deepest-first;
+ownership and timestamps are intentionally fresh.
 
 `rm` is nonpermanent by default. It creates a per-process temporary trash directory:
 

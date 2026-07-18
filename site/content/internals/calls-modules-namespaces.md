@@ -246,6 +246,12 @@ An environment binding shadows a namespace. This check is explicit: namespace di
 when `env.get(ns).is_none()`. Field access on a function-only namespace returns a diagnostic telling
 the caller to invoke it.
 
+Names and argument shapes live in one evaluator registry shared by runtime admission, the REPL
+completer, and the LSP vocabulary. Every method rejects extra positional arguments and unknown named
+arguments before codec allocation, network setup, configuration access, or other dispatch. Optional
+forms remain explicit: `json.stringify(value, pretty)`/`pretty:`, HTTP's body/header positions, and
+the `headers:` HTTP named argument. This prevents `math.sqrt(4, 999)`-style typos from silently
+changing meaning as implementations evolve.
 
 ## Data namespace conversions
 

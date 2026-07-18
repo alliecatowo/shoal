@@ -222,12 +222,19 @@ pub(super) fn read_source_bounded(path: &std::path::Path) -> Option<String> {
 }
 
 pub(super) fn completion_kind(label: &str) -> CompletionItemKind {
+    if is_namespace_method(label) {
+        return CompletionItemKind::FUNCTION;
+    }
     match resolve_command_source(label, CommandFacts::default()) {
         CommandSource::StructuredBuiltin | CommandSource::SpecialBuiltin => {
             CompletionItemKind::FUNCTION
         }
         _ => CompletionItemKind::KEYWORD,
     }
+}
+
+pub(super) fn is_namespace_method(label: &str) -> bool {
+    shoal_eval::all_namespace_method_names().any(|method| method == label)
 }
 
 pub(super) fn is_keyword(label: &str) -> bool {
@@ -253,6 +260,7 @@ pub(super) fn base_vocabulary() -> impl Iterator<Item = &'static str> {
         .chain(EXTRA_KEYWORDS)
         .chain(shoal_syntax::commands::builtin_names())
         .copied()
+        .chain(shoal_eval::all_namespace_method_names())
 }
 pub(super) fn help(w: &str) -> Option<&'static str> {
     Some(match w {

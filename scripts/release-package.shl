@@ -77,6 +77,7 @@ for license in glob("LICENSE*").expand() {
 if (path("man").is_dir) {
   cp --recursive man (dist.join("man"))
 }
+cp scripts/install.shl (dist.join("install.shl"))
 
 let metadata_result = run("cargo", "metadata", "--locked", "--no-deps", "--format-version", "1")
 let metadata = json.parse(metadata_result.out)

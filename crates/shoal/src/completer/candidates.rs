@@ -90,6 +90,12 @@ impl ShoalCompleter {
     }
 
     pub(super) fn method_candidates(&self, prefix: &str, receiver: Option<&str>) -> Vec<String> {
+        if let Some(namespace) = receiver.and_then(|name| name.strip_prefix("namespace:")) {
+            return shoal_eval::namespace_method_names(namespace)
+                .filter(|name| self.candidate_matches(name, prefix))
+                .map(str::to_string)
+                .collect();
+        }
         let per_type = receiver.and_then(methods_for);
         let names: &[&str] = per_type.as_deref().unwrap_or_else(|| method_names());
         names

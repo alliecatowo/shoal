@@ -537,8 +537,12 @@ mod tests {
 
     #[test]
     fn probe_drains_flooding_output_without_defeating_deadline() {
+        // Exceed supported Unix pipe capacities without making shell-loop
+        // throughput itself the subject of the 300 ms provider deadline.
+        // The former 50,000 built-in calls crossed that wall on macOS CI even
+        // though the concurrent reader was draining correctly.
         let (_dir, tool) = executable_script(
-            "printf 'hostile-tool 1.2.3\\n'; i=0; while [ $i -lt 50000 ]; do printf 0123456789; i=$((i+1)); done",
+            "printf 'hostile-tool 1.2.3\\n'; i=0; while [ $i -lt 10000 ]; do printf 0123456789; i=$((i+1)); done",
         );
         let start = Instant::now();
         let version = probe_version(&tool, &ProviderCtx::new("/"));

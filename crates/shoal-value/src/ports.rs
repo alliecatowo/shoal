@@ -21,7 +21,55 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+mod fs_metadata;
+
 static ATOMIC_REPLACE_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// Identity of one directory entry captured without following its final
+/// symbolic link. Unix identities use the kernel `(device, inode, type)`
+/// tuple. Other adapters must refuse guarded mutation unless they can provide
+/// an equivalent conditional guarantee.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FsEntryIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    file_type: u32,
+    #[cfg(not(unix))]
+    len: u64,
+    #[cfg(not(unix))]
+    modified: Option<std::time::SystemTime>,
+}
+
+impl FsEntryIdentity {
+    #[must_use]
+    pub fn from_metadata(metadata: &fs::Metadata) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            Self {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                file_type: metadata.mode() & libc::S_IFMT,
+            }
+        }
+        #[cfg(not(unix))]
+        Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[allow(clippy::unnecessary_cast)]
+    pub(crate) fn matches_stat(&self, stat: &libc::stat) -> bool {
+        self.device == stat.st_dev as u64
+            && self.inode == stat.st_ino as u64
+            && self.file_type == (stat.st_mode as u32 & libc::S_IFMT)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Fs — filesystem port
@@ -317,8 +365,47 @@ pub trait Fs: Send + Sync {
     fn remove_dir_all(&self, path: &Path) -> io::Result<()>;
     /// Rename/move a path (`std::fs::rename`).
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
+    /// Move a preflighted entry only when the moved object still has the
+    /// expected no-follow identity. Implementations pin both parents and roll
+    /// back drift (or contain the replacement at `to`). The default refuses;
+    /// check-then-rename would recreate the race this method closes.
+    fn rename_if_unchanged(
+        &self,
+        from: &Path,
+        to: &Path,
+        expected: &FsEntryIdentity,
+    ) -> io::Result<()> {
+        let _ = (from, to, expected);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this Fs adapter does not support identity-guarded rename",
+        ))
+    }
     /// Copy a file's contents (`std::fs::copy`).
     fn copy(&self, from: &Path, to: &Path) -> io::Result<u64>;
+    /// Apply a source node's portable permissions after copying. The default
+    /// fails closed so a filesystem-backed adapter cannot silently claim the
+    /// recursive-copy metadata contract while discarding modes.
+    fn set_permissions(&self, path: &Path, permissions: fs::Permissions) -> io::Result<()> {
+        let _ = (path, permissions);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this Fs adapter does not mediate permission updates",
+        ))
+    }
+    /// Report whether a path carries portable/user extended attributes.
+    /// Recursive copy rejects such nodes because it cannot preserve them.
+    /// Host-managed mandatory labels (for example Linux SELinux labels that
+    /// are recreated by policy on every new file) are not portable metadata
+    /// and the standard adapter excludes them. The default fails closed rather
+    /// than treating an unknown adapter as metadata-free.
+    fn has_extended_attributes(&self, path: &Path) -> io::Result<bool> {
+        let _ = path;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this Fs adapter cannot inspect extended attributes",
+        ))
+    }
     /// Create a hard link (`std::fs::hard_link`).
     fn hard_link(&self, src: &Path, dst: &Path) -> io::Result<()>;
     /// Create a symbolic link (`std::os::unix::fs::symlink`).
@@ -539,8 +626,23 @@ impl Fs for StdFs {
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         fs::rename(from, to)
     }
+    #[cfg(unix)]
+    fn rename_if_unchanged(
+        &self,
+        from: &Path,
+        to: &Path,
+        expected: &FsEntryIdentity,
+    ) -> io::Result<()> {
+        crate::fs_mutation::rename_if_unchanged(from, to, expected)
+    }
     fn copy(&self, from: &Path, to: &Path) -> io::Result<u64> {
         fs::copy(from, to)
+    }
+    fn set_permissions(&self, path: &Path, permissions: fs::Permissions) -> io::Result<()> {
+        fs::set_permissions(path, permissions)
+    }
+    fn has_extended_attributes(&self, path: &Path) -> io::Result<bool> {
+        fs_metadata::has_extended_attributes(path)
     }
     fn hard_link(&self, src: &Path, dst: &Path) -> io::Result<()> {
         fs::hard_link(src, dst)
