@@ -100,7 +100,6 @@ Building it before those contracts would multiply later migration work.
 | Reef strictness and cache identity | P2 | Reef/eval | host builder | changes/errors cannot remain silently stale in strict mode |
 | configuration honesty | P2 | config/hosts/prompt | host builder | every accepted field is consumed or rejected/deprecated |
 | pin leases and durability health | P2 | journal/hosts | journal identity | pins have owners; write failure becomes observable |
-| method metadata and function type soundness | P2 | value/eval/syntax | none | bidirectional method parity and uniform annotations |
 | complete effectful ports | P2 | value/eval | child context | evaluator effect paths stop reaching ambient host directly |
 | stream stdin and wire cursor | P3 | value/eval/proto/kernel/MCP | P0/P1 bounds/lifecycle | bounded pull/cancel/end/error contract is live |
 | unified task runtime | P3 | eval/exec/kernel | child context/identity | local and kernel control the same owned task abstraction |
@@ -417,14 +416,15 @@ Journaling intentionally avoids breaking command execution, but swallowed write 
 observable health channel, diagnostic counter, or degraded status. Align evaluator, kernel,
 history, and doctor on one state-root resolver.
 
-### P2.4 Method metadata parity and function type soundness
+### P2.4 Method metadata parity and function type soundness — implemented core
 
-Generate or validate metadata against dispatch in both directions. The initial fixture must catch the
-current table/range `.get` over-advertisement and bool `.str`/`.display` under-advertisement.
+Receiver metadata now matches table/range `.get` dispatch and boolean `.str`/`.display`, with
+behavioral fixtures in the owning value modules.
 
-Define one runtime annotation checker for expression calls, command-style calls, defaults, variadic
-arguments, closures, module functions, and return values. Decide whether annotations coerce or check
-exactly; encode the decision in corpus cases and diagnostics with spans.
+One runtime annotation checker now owns expression calls, command-style calls, defaults, variadic
+arguments, closures/module functions, and return values. Parameters perform the documented input
+coercions and then validate tags recursively; returns check exactly. The conformance matrix covers
+both surfaces, nested containers, invalid schemas, optionals, and failures with annotation spans.
 
 ### P2.5 Complete effectful capability ports
 
@@ -618,7 +618,6 @@ fixtures so backward handling is explicit.
 
 | Track | Can run beside | Must coordinate with |
 |---|---|---|
-| method metadata fixtures | journal schema design, policy loader | function type work and completion generation |
 | journal v2 fixture tooling | prompt producer, LSP index exploration | kernel event replay and history CLI |
 | prompt deferred snapshot design | journal, wire reader | shared host/config builder |
 | Windows leaf-crate compile fixes | most Unix hardening | public path/value/proto representation decisions |

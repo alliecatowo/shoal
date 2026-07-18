@@ -67,6 +67,40 @@ impl Evaluator {
                         format!("unknown argument `{name}`"),
                     ));
                 }
+                for param in &c.params {
+                    if let Some(ty) = &param.ty
+                        && let Err(error) = crate::coerce::validate_annotation(ty)
+                    {
+                        return Err(ErrorVal::new(
+                            error.code,
+                            format!("argument `{}`: {}", param.name, error.msg),
+                        )
+                        .or_span(ty.span));
+                    }
+                }
+                if let Some(rest) = &c.rest
+                    && let Some(ty) = &rest.ty
+                    && let Err(error) = crate::coerce::validate_annotation(ty)
+                {
+                    return Err(ErrorVal::new(
+                        error.code,
+                        format!("variadic argument `{}`: {}", rest.name, error.msg),
+                    )
+                    .or_span(ty.span));
+                }
+                if let Some(ty) = &c.ret
+                    && let Err(error) = crate::coerce::validate_annotation(ty)
+                {
+                    return Err(ErrorVal::new(
+                        error.code,
+                        format!(
+                            "function `{}` return: {}",
+                            c.name.as_deref().unwrap_or("<lambda>"),
+                            error.msg
+                        ),
+                    )
+                    .or_span(ty.span));
+                }
                 let old = self.exec.shell.env.clone();
                 self.exec.shell.env = c.env.child();
                 for (i, p) in c.params.iter().enumerate() {
@@ -78,7 +112,13 @@ impl Evaluator {
                         .or_else(|| args.pos.get(i).cloned());
                     let val = match (val, &p.default) {
                         (Some(v), _) => v,
-                        (None, Some(d)) => self.eval_expr(d, Position::Value)?,
+                        (None, Some(d)) => match self.eval_expr(d, Position::Value) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                self.exec.shell.env = old;
+                                return Err(error);
+                            }
+                        },
                         _ => {
                             self.exec.shell.env = old;
                             return Err(ErrorVal::new(
@@ -87,37 +127,70 @@ impl Evaluator {
                             ));
                         }
                     };
-                    // A `list<T>` annotation coerces per element (site/content/internals/language-conformance-contract.md
-                    // site 2) on the EXPR path too; CMD calls arrive with
-                    // word lists pre-coerced, so this is idempotent there.
-                    let val = match crate::coerce::coerce_list_param(val, p.ty.as_ref()) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            self.exec.shell.env = old;
-                            return Err(e);
+                    let val = if let Some(ty) = &p.ty {
+                        match crate::coerce::coerce_param(val, ty) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                self.exec.shell.env = old;
+                                return Err(ErrorVal::new(
+                                    error.code,
+                                    format!("argument `{}`: {}", p.name, error.msg),
+                                )
+                                .or_span(ty.span));
+                            }
                         }
+                    } else {
+                        val
                     };
                     if let Err(limit) = self.exec.shell.env.declare(p.name.clone(), val, false) {
                         self.exec.shell.env = old;
                         return Err(limit);
                     }
                 }
-                if let Some(rest) = &c.rest
-                    && let Err(limit) = self.exec.shell.env.declare(
-                        rest.name.clone(),
-                        Value::List(args.pos.iter().skip(c.params.len()).cloned().collect()),
-                        false,
-                    )
-                {
-                    self.exec.shell.env = old;
-                    return Err(limit);
+                if let Some(rest) = &c.rest {
+                    let items = args.pos.iter().skip(c.params.len()).cloned().collect();
+                    let value = if let Some(ty) = &rest.ty {
+                        match crate::coerce::coerce_rest(items, ty) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                self.exec.shell.env = old;
+                                return Err(ErrorVal::new(
+                                    error.code,
+                                    format!("variadic argument `{}`: {}", rest.name, error.msg),
+                                )
+                                .or_span(ty.span));
+                            }
+                        }
+                    } else {
+                        Value::List(items)
+                    };
+                    if let Err(limit) = self.exec.shell.env.declare(rest.name.clone(), value, false)
+                    {
+                        self.exec.shell.env = old;
+                        return Err(limit);
+                    }
                 }
                 // Track fn-body nesting so `cd`/env writes can be rejected (#10).
                 self.exec.control.in_fn_body += 1;
                 let out = self.eval_closure_body(&c.body);
                 self.exec.control.in_fn_body -= 1;
                 self.exec.shell.env = old;
-                out
+                let out = out?;
+                if let Some(ty) = &c.ret {
+                    crate::coerce::check_return(out, ty).map_err(|error| {
+                        ErrorVal::new(
+                            error.code,
+                            format!(
+                                "function `{}` return: {}",
+                                c.name.as_deref().unwrap_or("<lambda>"),
+                                error.msg
+                            ),
+                        )
+                        .or_span(ty.span)
+                    })
+                } else {
+                    Ok(out)
+                }
             }
             Value::CmdRef(call) => {
                 let mut call = (**call).clone();

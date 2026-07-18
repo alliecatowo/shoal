@@ -202,17 +202,14 @@ Evaluation is strict and left-to-right. Positional and named arguments bind in s
 defaults are evaluated according to the closure/call implementation; variadic tails collect
 remaining arguments. Adapter signatures can translate long and short flags before argv assembly.
 
-Current implementation does **not** provide complete runtime type soundness for user annotations:
-
-- expression-call paths do not uniformly enforce parameter annotations;
-- command word coercion converts recognized word forms, but already-typed non-string values can
-  pass through;
-- declared return annotations are not enforced.
-
-Annotations are therefore useful call metadata/coercion hints, not a proof of static or dynamic
-type safety. The canonical call chapter documents exact behavior. A future enforcement change is a
-language behavior change and needs corpus coverage for expression calls, command calls, defaults,
-variadics, and return values.
+User-function annotations are runtime contracts at the closure call boundary shared by expression
+and command surfaces. Parameter strings use the declared word conversion; a UTF-8 `path` can
+convert to `str` for path-shaped command words, and all other already-tagged values must match.
+`list<T>` validates recursively, `table<T>` admits record rows, `T?` admits `null`, and defaults and
+variadic items use the same path. Declared returns are checked exactly, without output conversion.
+Invalid type names or generic shapes fail with `type_error` when the callable is invoked. The
+`function-type-soundness.toml` corpus pins expression/command calls, named arguments, defaults,
+variadics, nested containers, optionals, invalid annotations, and return failures.
 
 ## Scope, modules, cwd, and environment
 
@@ -330,7 +327,7 @@ Rules for codes:
 ## Normative conformance corpus
 
 `spec/cases/*.toml` is the behavioral specification. At the 2026-07-16 audit it contained 77 suite
-files and 1,310 globally named cases; the reconciled tree now contains 78 suites and 1,331 cases. A
+files and 1,310 globally named cases; the reconciled tree now contains 79 suites and 1,355 cases. A
 case has this conceptual shape:
 
 ```toml
@@ -385,7 +382,7 @@ explicitly skipped with a reason.
 
 ### Current corpus state
 
-The 2026-07-17 observed result is 1,327 passed, 0 failed, and 4 skipped. The skips cover a native-thread
+The 2026-07-17 observed result is 1,351 passed, 0 failed, and 4 skipped. The skips cover a native-thread
 recursion-stack condition, a Node block, a jq feed composition, and full-chain Reef `which`. Counts
 are evidence from that run, not a permanently hardcoded health claim; release notes must run the
 corpus again.
@@ -393,7 +390,7 @@ corpus again.
 ### Exhaustive suite ledger
 
 Every suite is named below so a language area cannot disappear behind an aggregate count. Counts
-come from `[[case]]` records in the current tree and sum to 1,331. This table should eventually be
+come from `[[case]]` records in the current tree and sum to 1,355. This table should eventually be
 generated and checked in CI; until then, adding, renaming, or splitting a suite requires updating it.
 
 #### Core syntax, control flow, and diagnostics
@@ -411,6 +408,7 @@ generated and checked in CI; until then, adding, renaming, or splitting a suite 
 | `desugar.toml` | 13 | primary background/env/redirect/implicit/catch desugaring |
 | `edges.toml` | 18 | boundary cases and stable error behavior |
 | `fn-param-binding-more.toml` | 7 | function parameter/default/named binding extensions |
+| `function-type-soundness.toml` | 24 | parameter coercion/checking, variadics, optionals, and exact returns |
 | `iife.toml` | 6 | immediately invoked function/lambda forms |
 | `lambda-and-record-strict.toml` | 17 | lambda parsing and strict record access |
 | `match-guard-lambda.toml` | 6 | guarded arms and lambda interaction |

@@ -80,8 +80,8 @@ cargo run -p shoal -- -c $'let answer = 6 * 7\nanswer'
 cargo run -p shoal -- examples/example.shl
 ```
 
-The repository currently ships **49 declarative adapters** and a normative corpus of **1,331
-cases across 78 suites**. The corpus is the executable language contract.
+The repository currently ships **49 declarative adapters** and a normative corpus of **1,355
+cases across 79 suites**. The corpus is the executable language contract.
 
 ## The model
 

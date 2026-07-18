@@ -140,7 +140,9 @@ calls `process::exit` from the evaluator, because that would kill an embedding k
 Expressions are tree-walk evaluated. Access and binary operations are split into dedicated modules;
 patterns bind through a separate matcher. Calls use `CallArgs` with positional and named values.
 Declared parameters are coerced at the call boundary rather than causing ambient coercion across
-the language.
+the language. That boundary is shared by expression and command calls: string inputs may use the
+declared word conversion, while incompatible already-tagged values fail. Return annotations reuse
+the validator in exact mode and do not convert the result.
 
 Conditions are intentionally strict: boolean values and command outcomes have truth semantics;
 arbitrary strings, numbers, and containers do not become truthy or falsy. This prevents empty-string

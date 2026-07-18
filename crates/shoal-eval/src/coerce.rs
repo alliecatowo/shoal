@@ -82,61 +82,169 @@ pub(crate) fn expected_param_ty<'a>(
     })
 }
 
-/// Coerce positional + named CMD-word arguments against a function's parameters
-/// (`site/content/internals/language-conformance-contract.md`). Variadic tails
-/// accumulate: every
-/// positional word beyond the fixed params is coerced to the rest param's
-/// element type before `call_value_inner` collects them into a `list`.
-pub(crate) fn coerce_call_args(
-    params: &[Param],
-    rest: Option<&RestParam>,
-    pos: &mut [Value],
-    named: &mut [(String, Value)],
-) -> VResult<()> {
-    for (i, p) in params.iter().enumerate() {
-        let Some(ty) = &p.ty else { continue };
-        let slot = if let Some(slot) = named.iter_mut().find(|(n, _)| n == &p.name) {
-            &mut slot.1
-        } else if let Some(slot) = pos.get_mut(i) {
-            slot
-        } else {
-            continue;
-        };
-        let v = std::mem::replace(slot, Value::Null);
-        *slot = if ty.name == "list" {
-            // `list<T>`: coerce each element to `T`. The CMD word path
-            // assembles+coerces word lists before this runs; an
-            // expression-valued list lands here verbatim.
-            coerce_list_param(v, Some(ty))?
-        } else {
-            coerce_word(v, &ty.name)?
-        };
+/// Apply a parameter annotation at the one closure-call boundary shared by
+/// expression and command-form calls. String values keep Shoal's deliberate
+/// shell-word coercions, while already-tagged values must match (apart from
+/// strict UTF-8 `path` -> `str`, which supports path-shaped command words).
+pub(crate) fn coerce_param(v: Value, ty: &Type) -> VResult<Value> {
+    apply_annotation(v, ty, true)
+}
+
+/// Enforce a return annotation without parsing or widening the function's
+/// result. A declared return is a runtime guarantee, not an output conversion.
+pub(crate) fn check_return(v: Value, ty: &Type) -> VResult<Value> {
+    apply_annotation(v, ty, false)
+}
+
+/// Validate an annotation's name/generic shape before evaluating defaults or a
+/// function body. Calls repeat this cheaply inside value validation so
+/// programmatically constructed closures cannot bypass admission.
+pub(crate) fn validate_annotation(ty: &Type) -> VResult<()> {
+    valid_type_shape(ty)
+}
+
+/// Coerce and collect a variadic tail. `...xs: T` and `...xs: list<T>` both
+/// mean that the closure binding is a list whose individual items satisfy `T`.
+pub(crate) fn coerce_rest(items: Vec<Value>, ty: &Type) -> VResult<Value> {
+    valid_type_shape(ty)?;
+    let item_ty = if ty.name == "list" {
+        ty.args.first()
+    } else {
+        Some(ty)
+    };
+    let items = match item_ty {
+        Some(item_ty) => items
+            .into_iter()
+            .map(|item| coerce_param(item, item_ty))
+            .collect::<VResult<Vec<_>>>()?,
+        None => items,
+    };
+    Ok(Value::List(items))
+}
+
+fn apply_annotation(v: Value, ty: &Type, coerce_input: bool) -> VResult<Value> {
+    valid_type_shape(ty)?;
+    if ty.optional && v == Value::Null {
+        return Ok(v);
     }
-    if rest.is_some()
-        && let Some(item_ty) = expected_param_ty(params, rest, params.len())
-    {
-        for slot in pos.iter_mut().skip(params.len()) {
-            *slot = coerce_word(std::mem::replace(slot, Value::Null), item_ty)?;
+    match (&*ty.name, v) {
+        ("list", Value::List(items)) => {
+            let Some(elem) = ty.args.first() else {
+                return Ok(Value::List(items));
+            };
+            Ok(Value::List(
+                items
+                    .into_iter()
+                    .map(|item| apply_annotation(item, elem, coerce_input))
+                    .collect::<VResult<Vec<_>>>()?,
+            ))
         }
+        ("table", Value::Table(rows)) => {
+            let Some(elem) = ty.args.first() else {
+                return Ok(Value::Table(rows));
+            };
+            let rows = rows
+                .into_iter()
+                .map(
+                    |row| match apply_annotation(Value::Record(row), elem, coerce_input)? {
+                        Value::Record(row) => Ok(row),
+                        _ => unreachable!("a table row can only satisfy a record annotation"),
+                    },
+                )
+                .collect::<VResult<Vec<_>>>()?;
+            Ok(Value::Table(rows))
+        }
+        ("str", Value::Path(path)) if coerce_input => path
+            .into_os_string()
+            .into_string()
+            .map(Value::Str)
+            .map_err(|_| ErrorVal::type_error("expected UTF-8 str, found non-UTF-8 path")),
+        (name, value) if value_matches_name(&value, name) => Ok(value),
+        (name, Value::Str(value)) if coerce_input && word_coercible(name) => {
+            coerce_word(Value::Str(value), name)
+        }
+        (_, value) => Err(ErrorVal::type_error(format!(
+            "expected {}, found {}",
+            render_type(ty),
+            value.type_name()
+        ))),
+    }
+}
+
+fn word_coercible(name: &str) -> bool {
+    matches!(
+        name,
+        "str"
+            | "int"
+            | "float"
+            | "size"
+            | "duration"
+            | "time"
+            | "datetime"
+            | "bool"
+            | "path"
+            | "glob"
+    )
+}
+
+fn valid_type_shape(ty: &Type) -> VResult<()> {
+    let max_args = match ty.name.as_str() {
+        "list" | "table" => 1,
+        "null" | "bool" | "int" | "float" | "str" | "path" | "glob" | "regex" | "size"
+        | "duration" | "datetime" | "time" | "bytes" | "record" | "range" | "stream" | "error"
+        | "outcome" | "task" | "closure" | "command" | "secret" => 0,
+        name => {
+            return Err(ErrorVal::type_error(format!(
+                "unknown type annotation `{name}`"
+            )));
+        }
+    };
+    if ty.args.len() > max_args {
+        return Err(ErrorVal::type_error(format!(
+            "type `{}` accepts at most {max_args} type argument{}",
+            ty.name,
+            if max_args == 1 { "" } else { "s" }
+        )));
+    }
+    if ty.name == "table"
+        && let Some(elem) = ty.args.first()
+        && elem.name != "record"
+    {
+        return Err(ErrorVal::type_error(
+            "table element annotation must be `record`",
+        ));
+    }
+    for arg in &ty.args {
+        valid_type_shape(arg)?;
     }
     Ok(())
 }
 
-/// Coerce each element of a `list<T>`-annotated argument (the language contract's
-/// `list<T>` row): a bound `list` value gets per-element word coercion to `T`;
-/// any other value — or a non-`list` annotation — passes through verbatim.
-pub(crate) fn coerce_list_param(v: Value, ty: Option<&Type>) -> VResult<Value> {
-    let Some(ty) = ty.filter(|t| t.name == "list") else {
-        return Ok(v);
-    };
-    let Value::List(items) = v else { return Ok(v) };
-    let elem = ty.args.first().map(|a| a.name.as_str()).unwrap_or("str");
-    Ok(Value::List(
-        items
-            .into_iter()
-            .map(|x| coerce_word(x, elem))
-            .collect::<VResult<_>>()?,
-    ))
+fn value_matches_name(value: &Value, name: &str) -> bool {
+    match (name, value) {
+        ("bytes", Value::Bytes(_) | Value::CasBytes(_)) => true,
+        ("null", Value::Null) => true,
+        _ => value.type_name() == name,
+    }
+}
+
+fn render_type(ty: &Type) -> String {
+    let mut rendered = ty.name.clone();
+    if !ty.args.is_empty() {
+        rendered.push('<');
+        rendered.push_str(
+            &ty.args
+                .iter()
+                .map(render_type)
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        rendered.push('>');
+    }
+    if ty.optional {
+        rendered.push('?');
+    }
+    rendered
 }
 
 pub(crate) fn signature(spec: &SubSpec) -> String {

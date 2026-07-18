@@ -8,7 +8,7 @@ description: Complete operating manual for driving shoal — the agent-first str
 shoal is a **typed value graph over one session kernel**, not a text-stream router. You never pipe
 bytes between processes and re-parse them; you get back **structured values** with **addressable refs**,
 and you drill into them by field path. This card is derived from the stable Zola sources under
-`site/content/docs/` and `site/content/internals/`, the 1,331-case corpus across 78 suites at
+`site/content/docs/` and `site/content/internals/`, the 1,355-case corpus across 79 suites at
 `spec/cases/*.toml`, and the current `shoal-mcp`/`shoal-proto`/`shoal-kernel` source. When prose and
 the corpus disagree, the corpus is the behavioral authority.
 
@@ -993,7 +993,7 @@ pins it — just verify empirically if you hit an edge).
 
 ## 6. Implementation status — what works, what to skip
 
-This snapshot is grounded in current source and the 1,331-case/78-suite corpus. The structured MCP
+This snapshot is grounded in current source and the 1,355-case/79-suite corpus. The structured MCP
 surface, resources, PTYs, channels, CAS-backed refs, spawn pin gate, and platform filesystem
 sandboxes are shipped. Important boundaries remain: `task.suspend` is not implemented; network
 sandboxing is not enforced; some in-process filesystem effects bypass the child-process sandbox;
@@ -1069,5 +1069,5 @@ and non-hermetic policies degrade honestly when a requested OS dimension is unav
 ---
 
 *Canonical prose lives in `site/content/docs/` and `site/content/internals/`; executable semantics
-live in the 1,331 cases across `spec/cases/*.toml`. Re-check the current source and corpus when this
+live in the 1,355 cases across `spec/cases/*.toml`. Re-check the current source and corpus when this
 card and a running binary disagree.*

@@ -3,7 +3,7 @@
 //! adapter argv construction, and the exec-spawning core (`run_argv`).
 
 use super::*;
-use crate::coerce::{coerce_call_args, signature, validate_adapter_value};
+use crate::coerce::{signature, validate_adapter_value};
 use crate::host::builtin_outcome;
 use shoal_syntax::commands::CommandSource;
 
@@ -108,33 +108,19 @@ impl Evaluator {
                     // expansion as one list (site/content/internals/language-conformance-contract.md): `showpaths *.txt` binds
                     // every sorted match to `paths: list<path>`, not just the
                     // first. Element type coercion (`path`/`str`/…) applies per
-                    // item; `coerce_call_args` leaves the assembled list intact.
+                    // item at the shared closure-call boundary.
                     CmdArg::Glob { .. } | CmdArg::Word { .. } | CmdArg::Path { .. }
                         if closure_sig
                             .and_then(|(params, _)| params.get(pos.len()))
                             .and_then(|p| p.ty.as_ref())
                             .is_some_and(|t| t.name == "list") =>
                     {
-                        let elem = closure_sig
-                            .and_then(|(params, _)| params.get(pos.len()))
-                            .and_then(|p| p.ty.as_ref())
-                            .and_then(|t| t.args.first())
-                            .map(|t| t.name.clone())
-                            .unwrap_or_else(|| "str".into());
-                        let items = self
-                            .expand_arg(a)?
-                            .into_iter()
-                            .map(|v| crate::coerce::coerce_word(v, &elem))
-                            .collect::<VResult<Vec<_>>>()?;
+                        let items = self.expand_arg(a)?;
                         pos.push(Value::List(items));
                     }
                     _ => pos.extend(self.expand_arg(a)?),
                 }
                 i += 1;
-            }
-            // Coerce CMD words to the callee's declared param types (defect #12).
-            if let Value::Closure(c) = &bound {
-                coerce_call_args(&c.params, c.rest.as_ref(), &mut pos, &mut named)?;
             }
             return self.call_value(&bound, CallArgs { pos, named });
         }

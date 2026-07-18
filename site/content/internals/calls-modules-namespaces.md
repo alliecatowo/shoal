@@ -87,16 +87,17 @@ parameters have been declared. They can therefore reference earlier parameters a
 bindings. On binding/coercion failure, the previous evaluator environment is restored before the
 error returns.
 
-`list<T>` is special: the evaluator coerces each element through `coerce_list_param`. This applies
-to expression calls too, while command-originated typed words may already have been coerced. Scalar
-parameter annotations are **not** validated by `call_value_inner` on expression calls. Even on the
-command path, `coerce_word` parses strings but passes an already non-string runtime value through, so
-an expression-valued argument can bypass a declared scalar type. Return annotations are stored in
-the closure but are likewise not enforced. Types are therefore parsing/coercion hints today, not a
-sound runtime contract.
+`call_value_inner` is the authoritative annotation boundary for both expression and command calls.
+It applies shell-word parsing to string inputs and strict UTF-8 `path` to `str` conversion for
+path-shaped command words; every other already-tagged value must match its declared runtime type.
+`list<T>` is checked/coerced recursively, `table<T>` is restricted to record rows, optional `T?`
+accepts `null`, defaults pass through the same path, and invalid annotation names/shapes fail closed.
+Declared returns reuse the validator in exact-check mode: no string parsing or numeric widening is
+performed after the body returns.
 
 The rest parameter receives a `List` of positional values after the fixed parameter count. Named
-arguments never flow into rest.
+arguments never flow into rest. Both `...xs: T` and `...xs: list<T>` apply `T` to every collected
+item, including expression-valued arguments.
 
 ## Closure environment lifecycle
 
@@ -280,9 +281,6 @@ type projects into `Value`; do not expose arbitrary internal configuration seria
 
 ## Known sharp edges
 
-- Return type annotations are carried by closures but not enforced in the core call path.
-- Scalar parameter annotations are not soundly enforced: expression calls skip them and command
-  coercion accepts already non-string values without validating the target type.
 - Namespace functions are not first-class values.
 - `glob(..., follow: ...)` is accepted by constructor validation, but the stored `GlobVal` shown in
   `call.rs` only records `hidden`; contributors should verify the intended follow-symlink contract.
