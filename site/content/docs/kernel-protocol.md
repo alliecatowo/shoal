@@ -177,7 +177,7 @@ unattached caller before approval or storage access.
 | `explain` | yes | Parse/accept AST and derive effects without storing/applying. |
 | `exec` | yes | Run, plan, or internally apply source. |
 | `value.get` | yes | Select/slice/render a transcript value. |
-| `blob.get` | yes | Read CAS content by hash. |
+| `blob.get` | yes | Read exact-owner journal CAS content; requires `JournalRead`. |
 | `journal.query` | yes | Query the attached principal/session's durable journal view. |
 | `task.list` | yes | List session tasks. |
 | `task.get` | yes | Snapshot a task. |
@@ -387,6 +387,10 @@ Formats:
 - `raw`: `{ref, raw}` for strings or `{ref, raw_base64}` for bytes/CAS bytes.
 
 `raw` returns at most 8 KiB of decoded content plus `page` metadata. String slice offsets and `total_len` use Unicode scalar units; bytes/CAS values use byte units. Follow `page.next_offset` until `page.done`. CAS pages are integrity-verified and streamed without materializing the full blob. Verification/decompression starts are rate-limited per exact principal/session; the default is 64 per 10 seconds. Other types reject raw format with `BAD_PATH_OR_SLICE`.
+
+`blob.get` hashes are authorized only through output rows owned by the exact attached
+principal/Session and require the same `JournalRead` grant as `journal.query`, before hash/offset
+parameters are decoded. Live transcript content remains addressed through owner-scoped `value.get`.
 
 ### `blob.get`
 

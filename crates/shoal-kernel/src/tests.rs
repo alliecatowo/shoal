@@ -5396,6 +5396,18 @@ fn journal_query_requires_policy_before_decoding_filters() {
     assert_eq!(denied.code, LEASH_DENIED);
     assert_eq!(denied.data.unwrap()["effect"], "journal.read");
 
+    let blob_denied = call(
+        &mut client,
+        &mut reader,
+        3,
+        "blob.get",
+        Json::String("also-invalid-before-decode".into()),
+    )
+    .error
+    .expect("journal-backed blob reads require the same grant");
+    assert_eq!(blob_denied.code, LEASH_DENIED);
+    assert_eq!(blob_denied.data.unwrap()["effect"], "journal.read");
+
     drop(client);
     drop(reader);
     thread.join().unwrap();

@@ -87,7 +87,7 @@ error messages never quote the rejected URI, tool name, path, body, or bearer.
 | `explain` | `handlers_session.rs` | yes | parser + evaluator plan derivation |
 | `exec` | `handlers_exec.rs` | yes | evaluator, journal, transcript, tasks |
 | `value.get`, `stream.pull/close` | value/stream handlers | yes | owner transcript/CAS/live-stream read |
-| `blob.get` | `handlers_session.rs` | yes | shared CAS read |
+| `blob.get` | `handlers_session.rs` | yes | `JournalRead` + exact-owner journal CAS read |
 | `task.list/get/await/cancel/suspend/resume` | `handlers_task.rs` | yes | principal/session-owned task registry |
 | `pty.open/send/read/resize/close/list` | `handlers_pty.rs` | yes | principal/session-owned PTY registry |
 | `plan.get/list/apply` | `handlers_task.rs` | yes | session/principal-scoped plan registry |

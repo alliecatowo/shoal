@@ -488,7 +488,7 @@ Connections, retained principal Sessions, active tasks, PTYs (per Session/princi
 Before describing Shoal as safe for mutually untrusted agents, the remaining minimum work is:
 
 1. add optional peer-credential binding beyond the current public machine-only attach contract;
-2. align separately addressed output/CAS and durable replay reads with explicit journal policy;
+2. align durable journal-event replay reads with explicit journal policy;
 3. add stronger network/process/CPU/memory enforcement while preserving per-dimension truth;
 4. add a portable OS-keyring backend only with explicit migration and unavailable-backend behavior;
 5. extend adversarial multi-principal, fault-injection, and long-duration lifecycle testing.

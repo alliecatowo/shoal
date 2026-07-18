@@ -79,17 +79,17 @@ Include malformed params tests so decoding cannot occur before the authorization
 
 The direct query baseline is implemented: `journal.query` checks attachment and `JournalRead`
 before decoding filters, then forces the attached principal-private Session and caps the page.
-Remaining work is to define broader administration and align adjacent read surfaces:
+Remaining work is to define broader administration and align durable replay:
 
 - supervisor/admin cross-principal query through a distinct grant;
-- output/CAS access aligned with the same policy.
+- durable journal-event replay aligned with the same policy.
 
 Acceptance:
 
 - unauthenticated query denied;
 - principal A cannot search principal B by omitting filters;
 - filtering cannot widen scope;
-- output hashes/blobs inherit entry authorization;
+- output hashes/blobs inherit entry authorization; **implemented for `blob.get`**;
 - durable event replay does not bypass query policy;
 - tests include same session/different principal and different session/same principal.
 

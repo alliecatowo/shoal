@@ -76,6 +76,10 @@ impl Kernel {
         attached: &mut Option<Attachment>,
     ) -> Result<Json, RpcError> {
         let attachment = attached.as_ref().ok_or_else(not_attached)?;
+        // A content hash learned out of band must not bypass the policy that
+        // protects the exact journal row authorizing it. Live transcript refs
+        // use `value.get`; this route is exclusively journal-output CAS.
+        self.require_journal_read(attachment)?;
         let params: BlobGetParams = decode(params)?;
         let hash = params.hash;
         let journal = self
