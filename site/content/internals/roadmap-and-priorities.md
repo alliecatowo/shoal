@@ -101,7 +101,7 @@ Building it before those contracts would multiply later migration work.
 | configuration honesty | P2 | config/hosts/prompt | host builder | every accepted field is consumed or rejected/deprecated |
 | pin leases and durability health | P2 | journal/hosts | journal identity | pins have owners; write failure becomes observable |
 | complete effectful ports | P2 | value/eval | child context | evaluator effect paths stop reaching ambient host directly |
-| stream stdin and wire cursor | P3 | value/eval/proto/kernel/MCP | P0/P1 bounds/lifecycle | bounded pull/cancel/end/error contract is live |
+| wire stream cursor | P3 | value/proto/kernel/MCP | P0/P1 bounds/lifecycle | bounded pull/cancel/end/error contract is live; local stdin feed is already bounded |
 | unified task runtime | P3 | eval/exec/kernel | child context/identity | local and kernel control the same owned task abstraction |
 | semantic editor index | P3 | syntax/eval/LSP | host builder/language metadata | symbols understand modules/scopes and UTF-16 positions |
 | prompt producer completion | P3 | `shoal`, prompt | config honesty | context fields are real or removed; slow data is deferred |

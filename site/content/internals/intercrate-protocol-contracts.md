@@ -179,7 +179,8 @@ CAS adapter lives above `shoal-value` to preserve the leaf boundary.
 
 `ConfigPort::snapshot` returns the already-resolved value tree. No-config evaluators return `{}` and
 `config.get` returns null. This is intentionally not a file reader. Child evaluators must inherit the
-same Arc/snapshot when semantic continuity is required; several current constructors fail to do so.
+same Arc/snapshot when semantic continuity is required; the authoritative `ChildContext` constructor
+does so for spawn, script, parallel, channel-handler, and stream-pump children.
 
 ### `Exec`
 
@@ -193,7 +194,7 @@ The exact public types live in `crates/shoal-exec/src/lib.rs`; the stable behavi
 
 - `ExecSpec.argv[0]` identifies the program; no shell is implicitly inserted;
 - cwd and environment are complete inputs, not ambient deltas;
-- stdin is null, inherited, bytes, or file;
+- stdin is null, inherited, bytes, file, or a one-shot bounded chunk stream (capture mode only);
 - mode is pipe capture or PTY tee;
 - optional sandbox policy is lowered before exec and actual enforcement is reported honestly;
 - optional spill directory enables bounded-memory stdout spill in capture mode;

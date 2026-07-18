@@ -4,11 +4,6 @@
 use super::*;
 use std::io::Read as _;
 
-/// Maximum chunk admitted to the bounded child-stdin queue. Combined with the
-/// 16-slot queue below, stream feed owns at most 1 MiB of queued byte buffers,
-/// independent of the size of a resident or CAS-backed item.
-const STREAM_STDIN_CHUNK_BYTES: usize = 64 * 1024;
-
 #[derive(Default)]
 enum StreamPumpErrorState {
     #[default]
@@ -494,12 +489,11 @@ impl Evaluator {
         position: Position,
         span: Span,
     ) -> VResult<Value> {
-        const STDIN_CHUNKS: usize = 16;
         const PULL_POLL: Duration = Duration::from_millis(25);
 
         let lease = crate::streams::acquire_stream_pump()?;
         let mut upstream = stream.take_upstream()?;
-        let (stdin_sink, stdin) = shoal_exec::stream_stdin(STDIN_CHUNKS);
+        let (stdin_sink, stdin) = shoal_exec::stream_stdin(shoal_exec::MAX_STDIN_STREAM_CHUNKS);
         let parent_cancel = self.cancellation_token();
         let pump_cancel = CancelToken::linked(&parent_cancel);
         let child = self.child_context();
@@ -632,17 +626,12 @@ fn send_stream_item(
 ) -> VResult<bool> {
     match value {
         Value::Bytes(bytes) => {
-            return Ok(send_stdin_bytes(
-                sink,
-                stop,
-                parent_cancel,
-                bytes.as_slice(),
-            ));
+            return send_stdin_bytes(sink, stop, parent_cancel, bytes.as_slice());
         }
         Value::CasBytes(bytes) => {
             let mut reader = bytes.open()?;
             loop {
-                let mut chunk = vec![0u8; STREAM_STDIN_CHUNK_BYTES];
+                let mut chunk = vec![0u8; shoal_exec::MAX_STDIN_STREAM_CHUNK_BYTES];
                 let n = reader
                     .read(&mut chunk)
                     .map_err(|e| ErrorVal::new("io_error", format!("stream feed: {e}")))?;
@@ -650,7 +639,7 @@ fn send_stream_item(
                     return Ok(true);
                 }
                 chunk.truncate(n);
-                if !send_stdin_chunk(sink, stop, parent_cancel, chunk) {
+                if !send_stdin_chunk(sink, stop, parent_cancel, chunk)? {
                     return Ok(false);
                 }
             }
@@ -666,7 +655,7 @@ fn send_stream_item(
     if !raw_chunk && !bytes.ends_with(b"\n") {
         bytes.push(b'\n');
     }
-    Ok(send_stdin_bytes(sink, stop, parent_cancel, &bytes))
+    send_stdin_bytes(sink, stop, parent_cancel, &bytes)
 }
 
 fn send_stdin_bytes(
@@ -674,13 +663,13 @@ fn send_stdin_bytes(
     stop: &CancelToken,
     parent_cancel: &CancelToken,
     bytes: &[u8],
-) -> bool {
-    for chunk in bytes.chunks(STREAM_STDIN_CHUNK_BYTES) {
-        if !send_stdin_chunk(sink, stop, parent_cancel, chunk.to_vec()) {
-            return false;
+) -> VResult<bool> {
+    for chunk in bytes.chunks(shoal_exec::MAX_STDIN_STREAM_CHUNK_BYTES) {
+        if !send_stdin_chunk(sink, stop, parent_cancel, chunk.to_vec())? {
+            return Ok(false);
         }
     }
-    true
+    Ok(true)
 }
 
 fn send_stdin_chunk(
@@ -688,17 +677,26 @@ fn send_stdin_chunk(
     stop: &CancelToken,
     parent_cancel: &CancelToken,
     mut chunk: Vec<u8>,
-) -> bool {
+) -> VResult<bool> {
     loop {
         if stop.is_cancelled() || parent_cancel.is_cancelled() {
-            return false;
+            return Ok(false);
         }
         match sink.try_send(chunk) {
-            Ok(()) => return true,
-            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return false,
-            Err(std::sync::mpsc::TrySendError::Full(returned)) => {
+            Ok(()) => return Ok(true),
+            Err(shoal_exec::StdinTrySendError::Disconnected(_)) => return Ok(false),
+            Err(shoal_exec::StdinTrySendError::Full(returned)) => {
                 chunk = returned;
                 std::thread::park_timeout(Duration::from_millis(2));
+            }
+            Err(shoal_exec::StdinTrySendError::ChunkTooLarge(_)) => {
+                return Err(ErrorVal::new(
+                    "stream_stdin_chunk_limit",
+                    format!(
+                        "stream stdin chunks must not exceed {} bytes",
+                        shoal_exec::MAX_STDIN_STREAM_CHUNK_BYTES
+                    ),
+                ));
             }
         }
     }

@@ -64,7 +64,7 @@ kernel version, every third-party adapter executable, or performance targets on 
 | builtins and namespaces | Implemented | canonical command precedence plus corpus | namespaces are not first-class callable values |
 | process capture | Implemented | real process-group and dual-pipe tests | hash preflight has an exec-time TOCTOU window |
 | interactive PTY execution | Implemented, host-limited | Unix PTY integration and REPL tests | Windows/ConPTY is deferred; kernel PTYs are poll-based |
-| streams and channels | Implemented, host-limited | evaluator stream tests and live kernel bridge | bounded wire pulling exists; incremental stream-to-stdin remains unavailable |
+| streams and channels | Implemented, host-limited | evaluator stream/feed tests and live kernel bridge | local process stdin is bounded; wire stream pulling remains unavailable |
 | effects and plans | Implemented with enforcement limits | static derivation, policy tests, plan/apply handlers | planning cannot describe every native-program effect; network enforcement is absent |
 | Leash filesystem sandbox | Implemented, host-limited | Linux/macOS backend tests and enforcement reporting | network enforcement is unavailable; local malformed-policy mode is permissive |
 | task lifecycle | Partial | evaluator jobs and kernel async task tests | kernel suspend/resume returns `TASK_CONTROL_UNAVAILABLE` |

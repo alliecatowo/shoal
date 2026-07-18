@@ -50,7 +50,7 @@ use std::ffi::OsString;
 use std::io::{self, Read};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 
 pub use bounded::{BoundedCommandOutput, run_bounded_command};
@@ -336,11 +336,45 @@ pub enum StdinSpec {
 #[derive(Debug, Clone)]
 pub struct StdinSink(SyncSender<Vec<u8>>);
 
+/// Maximum number of chunks retained by an incremental stdin queue.
+pub const MAX_STDIN_STREAM_CHUNKS: usize = 16;
+
+/// Maximum admitted size of one incremental stdin chunk.
+pub const MAX_STDIN_STREAM_CHUNK_BYTES: usize = 64 * 1024;
+
+/// A nonblocking incremental-stdin send failure.
+#[derive(Debug)]
+pub enum StdinTrySendError {
+    /// The bounded queue currently has no room; retrying is allowed.
+    Full(Vec<u8>),
+    /// The child side has closed; retrying cannot succeed.
+    Disconnected(Vec<u8>),
+    /// The chunk exceeds [`MAX_STDIN_STREAM_CHUNK_BYTES`].
+    ChunkTooLarge(Vec<u8>),
+}
+
+impl StdinTrySendError {
+    /// Recover ownership of the chunk that was not admitted.
+    pub fn into_inner(self) -> Vec<u8> {
+        match self {
+            Self::Full(chunk) | Self::Disconnected(chunk) | Self::ChunkTooLarge(chunk) => chunk,
+        }
+    }
+}
+
 impl StdinSink {
-    /// Attempt to enqueue one chunk without blocking. The producer owns its
-    /// backpressure/cancellation policy and can retry a returned full chunk.
-    pub fn try_send(&self, chunk: Vec<u8>) -> Result<(), std::sync::mpsc::TrySendError<Vec<u8>>> {
-        self.0.try_send(chunk)
+    /// Attempt to enqueue one bounded chunk without blocking. The producer
+    /// owns its backpressure/cancellation policy and can retry a returned full
+    /// chunk. Oversized chunks fail closed rather than defeating the queue's
+    /// retained-byte bound.
+    pub fn try_send(&self, chunk: Vec<u8>) -> Result<(), StdinTrySendError> {
+        if chunk.len() > MAX_STDIN_STREAM_CHUNK_BYTES {
+            return Err(StdinTrySendError::ChunkTooLarge(chunk));
+        }
+        self.0.try_send(chunk).map_err(|error| match error {
+            TrySendError::Full(chunk) => StdinTrySendError::Full(chunk),
+            TrySendError::Disconnected(chunk) => StdinTrySendError::Disconnected(chunk),
+        })
     }
 }
 
@@ -374,10 +408,11 @@ impl StdinStream {
     }
 }
 
-/// Create a bounded incremental stdin path. `capacity` is clamped to one so
-/// neither side can accidentally request an unbounded queue or rendezvous.
+/// Create a bounded incremental stdin path. `capacity` is clamped to
+/// `1..=`[`MAX_STDIN_STREAM_CHUNKS`] so neither side can accidentally request
+/// an unbounded queue or rendezvous.
 pub fn stream_stdin(capacity: usize) -> (StdinSink, StdinSpec) {
-    let (tx, rx) = sync_channel(capacity.max(1));
+    let (tx, rx) = sync_channel(capacity.clamp(1, MAX_STDIN_STREAM_CHUNKS));
     (
         StdinSink(tx),
         StdinSpec::Stream(StdinStream(Arc::new(Mutex::new(Some(rx))))),

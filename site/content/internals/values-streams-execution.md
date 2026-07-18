@@ -84,11 +84,12 @@ or allocate a large blob.
 | outcome | its structured/parsed output when available, otherwise raw output |
 | path | rejected rather than silently reading the file |
 | secret/task/closure and other unsafe kinds | rejected |
-| stream | **currently rejected**; streaming stdin feed is not implemented |
+| stream | `feed_bytes` rejects eager conversion; `.feed(command)` uses the incremental path below |
 
-The stream case is a known gap, not an implicit eager collect. The error directs callers toward a
-bounded collection, preserving the rule that unbounded streams cannot silently become unbounded
-memory use.
+The scalar helper deliberately rejects streams so a generic conversion cannot silently collect an
+unbounded source. Evaluator `.feed(command)` recognizes a stream before calling this helper and
+drives it through a capture-only queue capped at 16 chunks of 64 KiB each. The queue applies lossless
+backpressure, and cancellation, child exit, upstream end, or an upstream error tears down the pump.
 
 
 ## Outcomes unify commands
@@ -179,8 +180,8 @@ adding direct libc calls, global `chdir`, or ad-hoc signal handlers.
 ## Wire-stream limitation
 
 The kernel wire can encode a stream as a typed `WireValue::Stream` label/ref, but the protocol has no
-follow-up “pull next chunk” RPC. This is separate from the missing process-stdin stream feed: one is a
-wire transport gap, the other a local byte-conversion gap. Until a bounded pull protocol exists,
+follow-up “pull next chunk” RPC. Local `.feed(command)` is incremental and bounded; it does not make
+that process-local upstream addressable across the wire. Until a bounded pull protocol exists,
 agents should receive materialized bounded values or a domain-specific resource/ref.
 
 ## Invariants and failure modes

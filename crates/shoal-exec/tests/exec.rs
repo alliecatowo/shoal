@@ -132,8 +132,29 @@ fn stream_stdin_capacity_applies_before_execution_claims_the_receiver() {
     sink.try_send(vec![1]).unwrap();
     assert!(matches!(
         sink.try_send(vec![2]),
-        Err(std::sync::mpsc::TrySendError::Full(_))
+        Err(shoal_exec::StdinTrySendError::Full(_))
     ));
+}
+
+#[test]
+fn stream_stdin_clamps_capacity_and_rejects_oversized_chunks() {
+    let (sink, _stdin) = stream_stdin(usize::MAX);
+    for _ in 0..shoal_exec::MAX_STDIN_STREAM_CHUNKS {
+        sink.try_send(vec![1]).unwrap();
+    }
+    assert!(matches!(
+        sink.try_send(vec![2]),
+        Err(shoal_exec::StdinTrySendError::Full(_))
+    ));
+
+    let (sink, _stdin) = stream_stdin(1);
+    let oversized = vec![0; shoal_exec::MAX_STDIN_STREAM_CHUNK_BYTES + 1];
+    let error = sink.try_send(oversized).unwrap_err();
+    assert!(matches!(
+        error,
+        shoal_exec::StdinTrySendError::ChunkTooLarge(_)
+    ));
+    sink.try_send(vec![3]).unwrap();
 }
 
 #[test]

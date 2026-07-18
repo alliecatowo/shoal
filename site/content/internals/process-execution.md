@@ -34,7 +34,7 @@ Sources: [`lib.rs`](https://github.com/alliecatowo/shoal/blob/main/crates/shoal-
 | `argv` | `argv[0]` program plus exact argument bytes |
 | `cwd` | child working directory |
 | `env` | complete child environment; spawn calls `env_clear` first |
-| `stdin` | null, inherited, bytes, or file |
+| `stdin` | null, inherited, bytes, file, or a one-shot bounded chunk stream |
 | `mode` | `Capture` or `PtyTee` |
 | `sandbox` | optional requested `shoal_leash::SandboxPolicy` |
 | `spill` | optional directory permitting oversized stdout spill |
@@ -81,10 +81,13 @@ hosts use it to build spawn effects compatible with Reef/Leash pin hashes.
 | `Inherit` | parent stdin | real terminal forwarding when available |
 | `Bytes` | piped writer thread, then close | write into PTY master, then stop writing |
 | `File` | opened and installed as fd 0 | contents written into PTY master |
+| `Stream` | one-shot receiver drained into the stdin pipe | rejected before sandboxing or spawn |
 
 In capture mode, byte-input writing ignores `EPIPE` because early child exit is expected. File open
-failure occurs before spawn. A `Stream` cannot currently become a live stdin producer; evaluator
-`.feed` must materialize a supported value into `Bytes`.
+failure occurs before spawn. A `Stream` queue retains at most 16 chunks and rejects chunks above
+64 KiB, capping queued payload bytes at 1 MiB. Its producer owns retry/cancellation policy; evaluator
+`.feed` supplies a cancellation-aware pump and incrementally splits resident or CAS-backed items.
+PTY mode rejects `Stream` before any effect because a PTY master has no portable input half-close.
 
 ## Capture-mode spawn
 
